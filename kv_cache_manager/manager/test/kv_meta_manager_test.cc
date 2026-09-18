@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -20,19 +21,25 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/cache_config.h"
+#include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
+#include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/config/quota_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/nfs_backend.h"
 #include "kv_cache_manager/manager/cache_manager.h"
+#include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/kv_meta_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
+#include "kv_cache_manager/meta/meta_storage_backend_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
@@ -261,6 +268,61 @@ private:
     std::size_t delete_items_{0};
 };
 
+class FailNextMaintenanceDeleteSyncBackend : public MetaLocalBackend {
+public:
+    void FailNextMaintenanceDeleteSync() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fail_next_delete_sync_ = true;
+    }
+
+    std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         const LocationIdsPerKey &location_ids) noexcept override {
+        auto result = MetaLocalBackend::DeleteLocationsForMaintenance(request_context, keys, location_ids);
+        ArmFailureAfterSuccessfulDelete(result);
+        return result;
+    }
+
+    std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override {
+        auto result = MetaLocalBackend::Delete(request_context, keys);
+        ArmFailureAfterSuccessfulDelete(result);
+        return result;
+    }
+
+    bool Sync(const KeyTypeVec &keys) noexcept override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (fail_next_sync_) {
+                fail_next_sync_ = false;
+                sync_failed_ = true;
+                condition_.notify_all();
+                return false;
+            }
+        }
+        return MetaLocalBackend::Sync(keys);
+    }
+
+    bool WaitForSyncFailure(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, timeout, [&]() { return sync_failed_; });
+    }
+
+private:
+    void ArmFailureAfterSuccessfulDelete(const std::vector<ErrorCode> &result) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (fail_next_delete_sync_ &&
+            std::any_of(result.begin(), result.end(), [](const ErrorCode ec) { return ec == EC_OK; })) {
+            fail_next_delete_sync_ = false;
+            fail_next_sync_ = true;
+        }
+    }
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool fail_next_delete_sync_{false};
+    bool fail_next_sync_{false};
+    bool sync_failed_{false};
+};
+
 } // namespace
 
 class KvMetaManagerTest : public TESTBASE {
@@ -288,6 +350,90 @@ protected:
         cache_manager_.reset();
         registry_manager_.reset();
         metrics_registry_.reset();
+    }
+
+    void CreateReclaimGroup(const std::string &group_name,
+                            const std::string &instance_id,
+                            std::int64_t capacity,
+                            double threshold,
+                            std::int32_t delay_before_delete_ms,
+                            std::size_t max_key_count = MetaIndexerConfig::kDefaultMaxKeyCount,
+                            std::optional<std::int64_t> storage_type_capacity = std::nullopt,
+                            ReclaimPolicy reclaim_policy = ReclaimPolicy::POLICY_LRU) {
+        const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
+        ASSERT_EQ(EC_OK, group_ec);
+        ASSERT_TRUE(default_group);
+        ASSERT_TRUE(default_group->cache_config());
+        ASSERT_TRUE(default_group->cache_config()->reclaim_strategy());
+
+        auto cache_config = std::make_shared<CacheConfig>();
+        ASSERT_TRUE(cache_config->FromJsonString(default_group->cache_config()->ToJsonString()));
+        auto reclaim_strategy = std::make_shared<CacheReclaimStrategy>(*cache_config->reclaim_strategy());
+        TriggerStrategy trigger = reclaim_strategy->trigger_strategy();
+        trigger.set_used_percentage(threshold);
+        reclaim_strategy->set_trigger_strategy(trigger);
+        reclaim_strategy->set_delay_before_delete_ms(delay_before_delete_ms);
+        reclaim_strategy->set_reclaim_policy(reclaim_policy);
+        cache_config->set_reclaim_strategy(reclaim_strategy);
+        auto meta_indexer_config = std::make_shared<MetaIndexerConfig>(*cache_config->meta_indexer_config());
+        meta_indexer_config->SetMaxKeyCount(max_key_count);
+        if (max_key_count != MetaIndexerConfig::kDefaultMaxKeyCount) {
+            std::size_t mutex_shard_num = 1;
+            while (mutex_shard_num <= max_key_count / 2) {
+                mutex_shard_num *= 2;
+            }
+            meta_indexer_config->SetMutexShardNum(mutex_shard_num);
+        }
+        cache_config->set_meta_indexer_config(meta_indexer_config);
+
+        InstanceGroup object_group(*default_group);
+        object_group.set_name(group_name);
+        object_group.set_global_quota_group_name(group_name + "-quota");
+        object_group.set_version(1);
+        object_group.set_cache_config(cache_config);
+        object_group.set_quota(InstanceGroupQuota(
+            capacity, {QuotaConfig(storage_type_capacity.value_or(capacity), DataStorageType::DATA_STORAGE_TYPE_NFS)}));
+        ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, object_group));
+        ASSERT_EQ(EC_OK, manager_->RegisterInstance(&request_context_, group_name, instance_id, "reclaim-test").first);
+    }
+
+    FailNextMaintenanceDeleteSyncBackend *InstallFailingSyncBackend(const std::string &instance_id) {
+        auto indexer =
+            cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(instance_id));
+        if (!indexer || !indexer->backend_manager_) {
+            return nullptr;
+        }
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        auto backend = std::make_unique<FailNextMaintenanceDeleteSyncBackend>();
+        if (backend->Init(KvMetaManager::InternalInstanceId(instance_id), config) != EC_OK ||
+            backend->Open() != EC_OK) {
+            return nullptr;
+        }
+        auto *backend_raw = backend.get();
+        if (indexer->backend_manager_->persistent_backend_) {
+            indexer->backend_manager_->persistent_backend_->Close();
+        }
+        indexer->backend_manager_->persistent_backend_ = std::move(backend);
+        indexer->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    void CommitObject(const std::string &instance_id, const std::string &key, std::uint64_t size) {
+        auto [start_ec, start] = manager_->StartWrite(&request_context_, instance_id, {key}, {size}, 30);
+        ASSERT_EQ(EC_OK, start_ec);
+        ASSERT_EQ(1, start.locations.size());
+        ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, instance_id, start.write_session_id, {true}));
+    }
+
+    static bool WaitUntil(const std::function<bool()> &predicate, std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return predicate();
     }
 
     static constexpr const char *kInstanceId = "embedding-instance";
@@ -1571,6 +1717,436 @@ TEST_F(KvMetaManagerTest, ConcurrentStartsCannotOvershootExactByteQuota) {
         }
     }
     EXPECT_EQ(0, indexer->GetStorageUsage());
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerEvictsTheLeastRecentlyUsedCommittedObjectAtTheByteWatermark) {
+    constexpr const char *kGroup = "reclaim-lru-group";
+    constexpr const char *kInstance = "reclaim-lru-instance";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
+
+    CommitObject(kInstance, "old", 30);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CommitObject(kInstance, "middle", 30);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CommitObject(kInstance, "hot", 30);
+    auto [touch_ec, touch] = manager_->Get(&request_context_, kInstance, {"hot"});
+    ASSERT_EQ(EC_OK, touch_ec);
+    ASSERT_EQ(1, touch.size());
+    ASSERT_TRUE(touch[0].found);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    ASSERT_EQ(90, indexer->GetStorageUsage());
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 60; }, std::chrono::seconds(2)));
+    ASSERT_TRUE(
+        WaitUntil([&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.pending_object_count").Get() == 0; },
+                  std::chrono::seconds(2)));
+
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {"old", "middle", "hot"});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(3, values.size());
+    EXPECT_FALSE(values[0].found);
+    EXPECT_TRUE(values[1].found);
+    EXPECT_TRUE(values[2].found);
+    EXPECT_GE(metrics_registry_->GetCounter("kv_meta_reclaimer.round_count").Get(), 1);
+    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.retired_object_count").Get());
+    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.reclaimed_object_count").Get());
+    EXPECT_EQ(30, metrics_registry_->GetCounter("kv_meta_reclaimer.reclaimed_bytes").Get());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.pending_bytes").Get());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.blocked_group_count").Get());
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerRetiresMetadataBeforeWaitingForTheReadGracePeriod) {
+    constexpr const char *kGroup = "reclaim-grace-group";
+    constexpr const char *kInstance = "reclaim-grace-instance";
+    constexpr const char *kKey = "grace-object";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 250);
+    CommitObject(kInstance, kKey, 90);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    const auto internal_key = KvMetaManager::InternalKey(kKey);
+    const auto location_id = KvMetaManager::StableLocationId(kKey);
+    const auto read_status = [&]() {
+        CacheLocationMapVector maps;
+        const auto result = indexer->GetLocationMapsForMaintenance(&request_context_, {internal_key}, maps);
+        if (result.error_codes.size() != 1 || result.error_codes[0] != EC_OK || maps.size() != 1) {
+            return CLS_NOT_FOUND;
+        }
+        const auto it = maps[0].find(location_id);
+        return it == maps[0].end() || !it->second ? CLS_NOT_FOUND : it->second->status();
+    };
+
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil([&]() { return read_status() == CLS_DELETING; }, std::chrono::seconds(2)));
+
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {kKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_FALSE(values[0].found);
+    EXPECT_EQ(90, indexer->GetStorageUsage());
+    EXPECT_EQ(EC_EXIST, manager_->TrimAll(&request_context_, kInstance, false));
+
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+    EXPECT_EQ(CLS_NOT_FOUND, read_status());
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerNeverEvictsAnActiveWriteButWakesAfterCommit) {
+    constexpr const char *kGroup = "reclaim-active-group";
+    constexpr const char *kInstance = "reclaim-active-instance";
+    constexpr const char *kKey = "active-object";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
+
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstance, {kKey}, {90}, 30);
+    ASSERT_EQ(EC_OK, start_ec);
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    LocationsPerKey locations;
+    auto exact = indexer->GetLocations(
+        &request_context_, {KvMetaManager::InternalKey(kKey)}, {{KvMetaManager::StableLocationId(kKey)}}, locations);
+    ASSERT_EQ(EC_OK, exact.ec);
+    ASSERT_EQ(1, locations.size());
+    ASSERT_EQ(1, locations[0].size());
+    ASSERT_TRUE(locations[0][0]);
+    EXPECT_EQ(CLS_NEW, locations[0][0]->status());
+    EXPECT_GT(locations[0][0]->create_time(), 0);
+    EXPECT_EQ(90, indexer->GetStorageUsage());
+
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, start.write_session_id, {true}));
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerDoesNotReplayAnUncertainPhysicalDelete) {
+    constexpr const char *kGroup = "reclaim-delete-failure-group";
+    constexpr const char *kInstance = "reclaim-delete-failure-instance";
+    constexpr const char *kKey = "delete-failure-object";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
+    CommitObject(kInstance, kKey, 90);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    std::shared_ptr<DataStorageBackend> original;
+    auto faulting =
+        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kError);
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        original = storage_manager->storage_map_.at("nfs_01");
+        storage_manager->storage_map_["nfs_01"] = faulting;
+    }
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(faulting->WaitForDeleteAttempts(1, std::chrono::seconds(2)));
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(1, faulting->DeleteAttempts());
+
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {kKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_FALSE(values[0].found);
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerPendingCreditPreventsOverEvictionDuringTheGracePeriod) {
+    constexpr const char *kGroup = "reclaim-credit-group";
+    constexpr const char *kInstance = "reclaim-credit-instance";
+    const std::vector<std::string> keys{"credit-old", "credit-middle", "credit-new"};
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 1000);
+    for (const auto &key : keys) {
+        CommitObject(kInstance, key, 30);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    const auto retired_count = [&]() {
+        std::size_t count = 0;
+        for (const auto &key : keys) {
+            CacheLocationMapVector maps;
+            const auto result =
+                indexer->GetLocationMapsForMaintenance(&request_context_, {KvMetaManager::InternalKey(key)}, maps);
+            if (result.error_codes.size() != 1 || result.error_codes[0] != EC_OK || maps.size() != 1) {
+                continue;
+            }
+            const auto it = maps[0].find(KvMetaManager::StableLocationId(key));
+            if (it != maps[0].end() && it->second && it->second->status() == CLS_DELETING) {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil([&]() { return retired_count() == 1; }, std::chrono::seconds(2)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(1, retired_count());
+    EXPECT_EQ(90, indexer->GetStorageUsage());
+
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 60; }, std::chrono::seconds(2)));
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, keys);
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(3, values.size());
+    EXPECT_EQ(2, std::count_if(values.begin(), values.end(), [](const auto &value) { return value.found; }));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerGracePeriodForOneGroupDoesNotBlockAnotherGroup) {
+    constexpr const char *kSlowGroup = "reclaim-a-slow-group";
+    constexpr const char *kSlowInstance = "reclaim-a-slow-instance";
+    constexpr const char *kFastGroup = "reclaim-z-fast-group";
+    constexpr const char *kFastInstance = "reclaim-z-fast-instance";
+    constexpr const char *kSlowKey = "slow-object";
+    CreateReclaimGroup(kSlowGroup, kSlowInstance, 100, 0.8, 750);
+    CreateReclaimGroup(kFastGroup, kFastInstance, 100, 0.8, 0);
+    CommitObject(kSlowInstance, kSlowKey, 90);
+    CommitObject(kFastInstance, "fast-object", 90);
+
+    auto slow_indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kSlowInstance));
+    auto fast_indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kFastInstance));
+    ASSERT_TRUE(slow_indexer);
+    ASSERT_TRUE(fast_indexer);
+    const auto slow_is_retired = [&]() {
+        CacheLocationMapVector maps;
+        const auto result = slow_indexer->GetLocationMapsForMaintenance(
+            &request_context_, {KvMetaManager::InternalKey(kSlowKey)}, maps);
+        if (result.error_codes.size() != 1 || result.error_codes[0] != EC_OK || maps.size() != 1) {
+            return false;
+        }
+        const auto it = maps[0].find(KvMetaManager::StableLocationId(kSlowKey));
+        return it != maps[0].end() && it->second && it->second->status() == CLS_DELETING;
+    };
+
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil(slow_is_retired, std::chrono::seconds(2)));
+    ASSERT_TRUE(WaitUntil([&]() { return fast_indexer->GetStorageUsage() == 0; }, std::chrono::milliseconds(250)));
+    EXPECT_EQ(90, slow_indexer->GetStorageUsage());
+    ASSERT_TRUE(WaitUntil([&]() { return slow_indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerRetriesMetadataSyncBeforePhysicalDeleteAndBlocksUnsafeAdmission) {
+    constexpr const char *kGroup = "reclaim-sync-failure-group";
+    constexpr const char *kInstance = "reclaim-sync-failure-instance";
+    constexpr const char *kKey = "sync-failure-object";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
+    auto *meta_backend = InstallFailingSyncBackend(kInstance);
+    ASSERT_NE(nullptr, meta_backend);
+    CommitObject(kInstance, kKey, 90);
+    meta_backend->FailNextMaintenanceDeleteSync();
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    std::shared_ptr<DataStorageBackend> original;
+    auto faulting =
+        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kError);
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        original = storage_manager->storage_map_.at("nfs_01");
+        storage_manager->storage_map_["nfs_01"] = faulting;
+    }
+
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 200);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(meta_backend->WaitForSyncFailure(std::chrono::seconds(2)));
+    ASSERT_TRUE(
+        WaitUntil([&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.blocked_group_count").Get() == 1; },
+                  std::chrono::seconds(2)));
+
+    auto [blocked_ec, blocked] = manager_->StartWrite(&request_context_, kInstance, {"new-object"}, {10}, 30);
+    EXPECT_EQ(EC_EXIST, blocked_ec);
+    EXPECT_TRUE(blocked.locations.empty());
+    EXPECT_EQ(0, faulting->DeleteAttempts());
+
+    ASSERT_TRUE(faulting->WaitForDeleteAttempts(1, std::chrono::seconds(2)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    EXPECT_EQ(1, faulting->DeleteAttempts());
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstance, {"new-object"}, {10}, 30);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(1, start.locations.size());
+    EXPECT_GE(metrics_registry_->GetCounter("kv_meta_reclaimer.retry_count").Get(), 1);
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.blocked_group_count").Get());
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, start.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerHonorsTheIndependentKeyCountWatermark) {
+    constexpr const char *kGroup = "reclaim-key-count-group";
+    constexpr const char *kInstance = "reclaim-key-count-instance";
+    CreateReclaimGroup(kGroup, kInstance, 10'000, 0.8, 0, 4);
+    CommitObject(kInstance, "key-old", 10);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CommitObject(kInstance, "key-middle", 10);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CommitObject(kInstance, "key-new", 10);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CommitObject(kInstance, "key-newest", 10);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    ASSERT_EQ(4, indexer->GetKeyCount());
+    ASSERT_EQ(40, indexer->GetStorageUsage());
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetKeyCount() == 3; }, std::chrono::seconds(2)));
+    EXPECT_EQ(30, indexer->GetStorageUsage());
+
+    auto [get_ec, values] =
+        manager_->Get(&request_context_, kInstance, {"key-old", "key-middle", "key-new", "key-newest"});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(4, values.size());
+    EXPECT_FALSE(values[0].found);
+    EXPECT_TRUE(values[1].found);
+    EXPECT_TRUE(values[2].found);
+    EXPECT_TRUE(values[3].found);
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerHonorsTheStorageTypeByteWatermark) {
+    constexpr const char *kGroup = "reclaim-storage-type-group";
+    constexpr const char *kInstance = "reclaim-storage-type-instance";
+    // Group usage is only 9%, but NFS usage is 90% of its independent quota.
+    CreateReclaimGroup(kGroup, kInstance, 1000, 0.8, 0, MetaIndexerConfig::kDefaultMaxKeyCount, 100);
+    CommitObject(kInstance, "type-pressure", 90);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    ASSERT_EQ(90, indexer->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerSupportsAZeroWatermark) {
+    constexpr const char *kGroup = "reclaim-zero-watermark-group";
+    constexpr const char *kInstance = "reclaim-zero-watermark-instance";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.0, 0);
+    CommitObject(kInstance, "remove-at-zero", 10);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerSharesTheOperationalPauseSwitch) {
+    constexpr const char *kGroup = "reclaim-pause-group";
+    constexpr const char *kInstance = "reclaim-pause-instance";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
+    CommitObject(kInstance, "paused-object", 90);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    cache_manager_->PauseReclaimer();
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(90, indexer->GetStorageUsage());
+
+    cache_manager_->ResumeReclaimer();
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerRotatesAOneKeySampleBudgetAcrossInstances) {
+    constexpr const char *kGroup = "reclaim-sample-rotation-group";
+    constexpr const char *kActiveInstance = "a-reclaim-active-instance";
+    constexpr const char *kCommittedInstance = "z-reclaim-committed-instance";
+    CreateReclaimGroup(kGroup, kActiveInstance, 100, 0.8, 0);
+    ASSERT_EQ(EC_OK, manager_->RegisterInstance(&request_context_, kGroup, kCommittedInstance, "reclaim-test").first);
+
+    auto [active_ec, active] = manager_->StartWrite(&request_context_, kActiveInstance, {"active"}, {45}, 30);
+    ASSERT_EQ(EC_OK, active_ec);
+    CommitObject(kCommittedInstance, "committed", 45);
+
+    auto active_indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kActiveInstance));
+    auto committed_indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kCommittedInstance));
+    ASSERT_TRUE(active_indexer);
+    ASSERT_TRUE(committed_indexer);
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetSamplingSize(&request_context_, 1));
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetBatchingSize(&request_context_, 1));
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+
+    ASSERT_TRUE(WaitUntil([&]() { return committed_indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+    EXPECT_EQ(45, active_indexer->GetStorageUsage());
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kActiveInstance, active.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerFailsClosedForAnUnsupportedPolicy) {
+    constexpr const char *kGroup = "reclaim-unsupported-policy-group";
+    constexpr const char *kInstance = "reclaim-unsupported-policy-instance";
+    CreateReclaimGroup(kGroup,
+                       kInstance,
+                       100,
+                       0.8,
+                       0,
+                       MetaIndexerConfig::kDefaultMaxKeyCount,
+                       std::nullopt,
+                       ReclaimPolicy::POLICY_TTL);
+    CommitObject(kInstance, "must-stay", 90);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(90, indexer->GetStorageUsage());
+}
+
+TEST_F(KvMetaManagerTest, RecoveryCompletesAReclaimerRetirementLeftByDemotion) {
+    constexpr const char *kGroup = "reclaim-recovery-group";
+    constexpr const char *kInstance = "reclaim-recovery-instance";
+    constexpr const char *kKey = "retired-before-demotion";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 250);
+    CommitObject(kInstance, kKey, 90);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    const auto internal_key = KvMetaManager::InternalKey(kKey);
+    const auto location_id = KvMetaManager::StableLocationId(kKey);
+    const auto is_retired = [&]() {
+        CacheLocationMapVector maps;
+        const auto result = indexer->GetLocationMapsForMaintenance(&request_context_, {internal_key}, maps);
+        if (result.error_codes.size() != 1 || result.error_codes[0] != EC_OK || maps.size() != 1) {
+            return false;
+        }
+        const auto it = maps[0].find(location_id);
+        return it != maps[0].end() && it->second && it->second->status() == CLS_DELETING;
+    };
+
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil(is_retired, std::chrono::seconds(2)));
+    manager_->CancelMaintenance();
+    manager_->DoCleanup();
+
+    ASSERT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(0, indexer->GetStorageUsage());
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {kKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_FALSE(values[0].found);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
 }
 
 TEST(KvMetaInstanceMarkerTest, RequiresTheCompleteReservedSchema) {

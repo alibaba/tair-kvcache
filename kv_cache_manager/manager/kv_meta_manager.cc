@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <exception>
@@ -10,6 +11,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -29,6 +31,7 @@
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/manager/cache_manager.h"
+#include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
@@ -55,6 +58,15 @@ bool EncodeLeaseDeadline(std::int64_t now_us, std::int64_t timeout_seconds, std:
         return false;
     }
     encoded_deadline = kLeaseDeadlineTag + now_us + timeout_seconds * kMicrosecondsPerSecond;
+    return true;
+}
+
+bool EncodeTaggedDeadlineUs(std::int64_t now_us, std::int64_t timeout_us, std::int64_t &encoded_deadline) {
+    encoded_deadline = 0;
+    if (now_us <= 0 || timeout_us < 0 || now_us >= kLeaseDeadlineTag || timeout_us > kLeaseDeadlineTag - 1 - now_us) {
+        return false;
+    }
+    encoded_deadline = kLeaseDeadlineTag + now_us + timeout_us;
     return true;
 }
 
@@ -251,6 +263,10 @@ bool IsCommittedObject(const CacheLocation &location) {
     // machinery. A negative create_time is the KVMeta-private commit marker;
     // an in-flight allocation always has a positive wall-clock timestamp.
     return location.status() == CLS_NEW && location.create_time() < 0;
+}
+
+bool IsRetiredObject(const CacheLocation &location) {
+    return location.status() == CLS_DELETING && location.create_time() > kLeaseDeadlineTag;
 }
 
 bool SamePhysicalAllocation(const CacheLocation &lhs, const CacheLocation &rhs) {
@@ -607,6 +623,1289 @@ private:
     std::thread thread_;
 };
 
+// KVMeta deliberately does not enter CacheReclaimer's fixed-block state
+// machine or its shared deletion executor. This worker reuses the same
+// Instance Group watermark/LRU configuration, but samples and retires only
+// reserved KVMeta instances. Keeping the worker here also lets it use the
+// exact-value guards and group admission shards that protect KVMeta's stable
+// location ids from ABA races.
+class KvMetaReclaimer {
+public:
+    explicit KvMetaReclaimer(KvMetaManager *owner) : owner_(owner) { RegisterMetrics(); }
+    ~KvMetaReclaimer() { StopAndJoin(); }
+
+    KvMetaReclaimer(const KvMetaReclaimer &) = delete;
+    KvMetaReclaimer &operator=(const KvMetaReclaimer &) = delete;
+
+    bool Start() {
+        std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (thread_.joinable()) {
+                return !stopping_;
+            }
+            stopping_ = false;
+            wake_requested_ = true;
+        }
+        try {
+            thread_ = std::thread([this]() { Loop(); });
+        } catch (const std::exception &e) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+            KVCM_LOG_ERROR("failed to start KVMeta reclaimer: %s", e.what());
+            return false;
+        }
+        condition_.notify_all();
+        return true;
+    }
+
+    void RequestStop() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        condition_.notify_all();
+    }
+
+    void StopAndJoin() noexcept {
+        std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+        std::thread worker;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+            wake_requested_ = false;
+            if (thread_.joinable()) {
+                worker = std::move(thread_);
+            }
+        }
+        condition_.notify_all();
+        if (worker.joinable()) {
+            worker.join();
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_instances_.clear();
+        pending_locations_.clear();
+        pending_credits_.clear();
+        pending_batches_.clear();
+        sampling_rotation_by_group_.clear();
+        pending_object_count_ = 0;
+        pending_bytes_ = 0;
+        UpdatePendingMetricsLocked();
+    }
+
+    void Wake() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_) {
+                return;
+            }
+            wake_requested_ = true;
+        }
+        condition_.notify_all();
+    }
+
+    bool HasPendingForInstance(const std::string &internal_instance_id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = pending_instances_.find(internal_instance_id);
+        return it != pending_instances_.end() && it->second != 0;
+    }
+
+    bool HasPendingLocation(const std::string &internal_instance_id, const std::string &location_id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = pending_locations_.find({internal_instance_id, location_id});
+        return it != pending_locations_.end() && it->second != 0;
+    }
+
+    bool IsAdmissionBlocked(const std::string &instance_group) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = pending_credits_.find(instance_group);
+        return it != pending_credits_.end() && it->second.blocked_batch_count != 0;
+    }
+
+private:
+    void FailClosedMaintenance() noexcept {
+        if (!owner_) {
+            return;
+        }
+        owner_->maintenance_cancelled_.store(true, std::memory_order_release);
+        if (owner_->write_session_manager_) {
+            // Match demotion semantics: reject publication of any concurrently
+            // allocating session, while sessions already published may still
+            // Finish and release their own allocation safely.
+            owner_->write_session_manager_->RequestStop();
+        }
+    }
+
+    void RegisterMetrics() noexcept {
+        try {
+            const auto registry =
+                owner_ && owner_->cache_manager_ ? owner_->cache_manager_->metrics_registry() : nullptr;
+            if (!registry) {
+                return;
+            }
+            round_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.round_count");
+            retired_object_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.retired_object_count");
+            reclaimed_object_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.reclaimed_object_count");
+            reclaimed_bytes_metrics_ = registry->GetCounter("kv_meta_reclaimer.reclaimed_bytes");
+            retry_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.retry_count");
+            error_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.error_count");
+            pending_object_count_metrics_ = registry->GetGauge("kv_meta_reclaimer.pending_object_count");
+            pending_bytes_metrics_ = registry->GetGauge("kv_meta_reclaimer.pending_bytes");
+            blocked_group_count_metrics_ = registry->GetGauge("kv_meta_reclaimer.blocked_group_count");
+            UpdatePendingMetricsLocked();
+        } catch (const std::exception &e) {
+            KVCM_LOG_WARN("failed to register KVMeta reclaimer metrics: %s", e.what());
+        } catch (...) {
+            KVCM_LOG_WARN("failed to register KVMeta reclaimer metrics with unknown exception");
+        }
+    }
+
+    void UpdatePendingMetricsLocked() noexcept {
+        pending_object_count_metrics_ = static_cast<double>(pending_object_count_);
+        pending_bytes_metrics_ = static_cast<double>(pending_bytes_);
+        const auto blocked_groups =
+            std::count_if(pending_credits_.begin(), pending_credits_.end(), [](const auto &entry) {
+                return entry.second.blocked_batch_count != 0;
+            });
+        blocked_group_count_metrics_ = static_cast<double>(blocked_groups);
+    }
+
+    struct Pressure {
+        std::uint64_t group_bytes = 0;
+        std::uint64_t keys = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type{};
+
+        bool Any() const noexcept {
+            if (group_bytes != 0 || keys != 0) {
+                return true;
+            }
+            return std::any_of(
+                bytes_by_type.begin(), bytes_by_type.end(), [](std::uint64_t value) { return value != 0; });
+        }
+
+        bool Relevant(DataStorageType type, bool removes_key) const noexcept {
+            const std::size_t type_index = ToIndex(ToBaseType(type));
+            return group_bytes != 0 || (keys != 0 && removes_key) ||
+                   (type_index < bytes_by_type.size() && bytes_by_type[type_index] != 0);
+        }
+
+        void Consume(DataStorageType type, std::uint64_t bytes) noexcept {
+            group_bytes = bytes >= group_bytes ? 0 : group_bytes - bytes;
+            const std::size_t type_index = ToIndex(ToBaseType(type));
+            if (type_index < bytes_by_type.size()) {
+                bytes_by_type[type_index] = bytes >= bytes_by_type[type_index] ? 0 : bytes_by_type[type_index] - bytes;
+            }
+        }
+    };
+
+    struct Candidate {
+        std::string internal_instance_id;
+        std::int64_t internal_key = 0;
+        std::string location_id;
+        CacheLocationConstPtr location;
+        std::uint64_t value_size = 0;
+        bool removes_metadata_key = false;
+    };
+
+    struct CandidateKey {
+        std::string internal_instance_id;
+        std::int64_t internal_key = 0;
+        std::int64_t last_access_time_us = 0;
+        bool all_locations_committed = false;
+        std::vector<Candidate> objects;
+    };
+
+    struct RetiredItem {
+        std::string internal_instance_id;
+        KvMetaManager::SessionItem item;
+        bool removes_metadata_key = false;
+        bool metadata_durable = false;
+    };
+
+    struct PendingCredit {
+        std::uint64_t bytes = 0;
+        std::uint64_t keys = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type{};
+        // The entry is created when the batch is enqueued, before a metadata
+        // cleanup can fail. Finalization can therefore close admission without
+        // allocating memory on the error path.
+        std::size_t blocked_batch_count = 0;
+    };
+
+    struct PendingBatch {
+        std::string instance_group;
+        std::size_t quota_shard = 0;
+        std::chrono::steady_clock::time_point deadline;
+        std::uint64_t sequence = 0;
+        std::vector<RetiredItem> items;
+        std::vector<std::string> instances;
+        std::vector<std::pair<std::string, std::string>> locations;
+        bool admission_blocked = false;
+        std::uint32_t retry_count = 0;
+    };
+
+    using PendingDeadline = std::pair<std::chrono::steady_clock::time_point, std::uint64_t>;
+
+    static constexpr std::uint64_t kPendingBatchLimit = 1024;
+    static constexpr std::uint64_t kPendingObjectLimit = 20'000;
+    static constexpr std::uint64_t kPendingBytesLimit = 4ULL * 1024 * 1024 * 1024 * 1024;
+    static constexpr long double kWatermarkEpsilon = 1e-9L;
+
+    static std::uint64_t SaturatingAdd(std::uint64_t lhs, std::uint64_t rhs) noexcept {
+        return rhs > std::numeric_limits<std::uint64_t>::max() - lhs ? std::numeric_limits<std::uint64_t>::max()
+                                                                     : lhs + rhs;
+    }
+
+    static std::uint64_t SaturatingSub(std::uint64_t lhs, std::uint64_t rhs) noexcept {
+        return rhs >= lhs ? 0 : lhs - rhs;
+    }
+
+    static std::uint64_t BytesToFree(std::int64_t capacity, double threshold, std::uint64_t used) noexcept {
+        if (used == 0) {
+            return 0;
+        }
+        if (capacity <= 0) {
+            return used;
+        }
+        // Match CacheReclaimer's ratio + 1e-9 > threshold trigger. A
+        // successful round must settle at or below threshold - epsilon instead
+        // of continuously firing at an equal (or epsilon-close) boundary.
+        const long double adjusted_threshold =
+            std::max<long double>(0.0L, static_cast<long double>(threshold) - kWatermarkEpsilon);
+        const long double raw_allowed = static_cast<long double>(capacity) * adjusted_threshold;
+        const std::uint64_t allowed =
+            raw_allowed <= 0
+                ? 0
+                : static_cast<std::uint64_t>(std::min<long double>(
+                      std::floor(raw_allowed), static_cast<long double>(std::numeric_limits<std::uint64_t>::max())));
+        return used > allowed ? used - allowed : 0;
+    }
+
+    bool ShouldStop() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return stopping_ || !owner_ || owner_->maintenance_cancelled_.load(std::memory_order_acquire);
+    }
+
+    std::uint32_t IdleIntervalMs() const noexcept {
+        try {
+            if (!owner_ || !owner_->cache_manager_ || !owner_->cache_manager_->cache_reclaimer()) {
+                return 100;
+            }
+            RequestContext request_context("kv_meta_reclaimer_config");
+            return std::max<std::uint32_t>(
+                1, owner_->cache_manager_->cache_reclaimer()->GetSleepIntervalMs(&request_context));
+        } catch (...) {
+            return 100;
+        }
+    }
+
+    std::pair<std::size_t, std::size_t> SamplingAndBatchSize() const noexcept {
+        try {
+            if (!owner_ || !owner_->cache_manager_ || !owner_->cache_manager_->cache_reclaimer()) {
+                return {100, 100};
+            }
+            RequestContext request_context("kv_meta_reclaimer_config");
+            return {owner_->cache_manager_->cache_reclaimer()->GetSamplingSize(&request_context),
+                    owner_->cache_manager_->cache_reclaimer()->GetBatchingSize(&request_context)};
+        } catch (...) {
+            return {100, 100};
+        }
+    }
+
+    PendingCredit GetPendingCredit(const std::string &instance_group) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = pending_credits_.find(instance_group);
+        return it == pending_credits_.end() ? PendingCredit{} : it->second;
+    }
+
+    bool HasPendingCapacity(const std::vector<Candidate> &candidates) const {
+        std::uint64_t candidate_bytes = 0;
+        for (const auto &candidate : candidates) {
+            candidate_bytes = SaturatingAdd(candidate_bytes, candidate.value_size);
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pending_batches_.size() < kPendingBatchLimit && candidates.size() <= kPendingObjectLimit &&
+               pending_object_count_ <= kPendingObjectLimit - candidates.size() &&
+               candidate_bytes <= kPendingBytesLimit && pending_bytes_ <= kPendingBytesLimit - candidate_bytes;
+    }
+
+    bool ReadPressure(RequestContext *request_context,
+                      const InstanceGroup &group,
+                      const std::vector<InstanceInfoConstPtr> &instances,
+                      double threshold,
+                      Pressure &out) const {
+        out = {};
+        std::uint64_t group_usage = 0;
+        std::uint64_t key_count = 0;
+        std::uint64_t max_key_count = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> usage_by_type{};
+        for (const auto &instance : instances) {
+            if (!instance || !IsKvMetaInstance(*instance)) {
+                AddError(request_context, "KVMeta reclaimer requires a dedicated generic-object instance group");
+                return false;
+            }
+            const auto indexer =
+                owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance->instance_id());
+            if (!indexer) {
+                AddError(request_context, "KVMeta reclaimer could not read an instance indexer");
+                return false;
+            }
+            group_usage = SaturatingAdd(group_usage, indexer->GetStorageUsage());
+            key_count = SaturatingAdd(key_count, static_cast<std::uint64_t>(indexer->GetKeyCount()));
+            max_key_count = SaturatingAdd(max_key_count, static_cast<std::uint64_t>(indexer->GetMaxKeyCount()));
+            for (std::size_t i = 1; i < usage_by_type.size(); ++i) {
+                const auto type = static_cast<DataStorageType>(i);
+                if (ToBaseType(type) != type) {
+                    continue;
+                }
+                usage_by_type[i] = SaturatingAdd(usage_by_type[i], indexer->GetStorageUsageByType(type));
+            }
+        }
+
+        const PendingCredit credit = GetPendingCredit(group.name());
+        group_usage = SaturatingSub(group_usage, credit.bytes);
+        key_count = SaturatingSub(key_count, credit.keys);
+        for (std::size_t i = 0; i < usage_by_type.size(); ++i) {
+            usage_by_type[i] = SaturatingSub(usage_by_type[i], credit.bytes_by_type[i]);
+        }
+
+        out.group_bytes = BytesToFree(group.quota().capacity(), threshold, group_usage);
+        out.keys = BytesToFree(max_key_count > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
+                                   ? std::numeric_limits<std::int64_t>::max()
+                                   : static_cast<std::int64_t>(max_key_count),
+                               threshold,
+                               key_count);
+        for (const auto &quota : group.quota().quota_config()) {
+            const auto base_type = ToBaseType(quota.storage_spec());
+            const std::size_t type_index = ToIndex(base_type);
+            if (base_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN || type_index >= usage_by_type.size()) {
+                continue;
+            }
+            out.bytes_by_type[type_index] = std::max(
+                out.bytes_by_type[type_index], BytesToFree(quota.capacity(), threshold, usage_by_type[type_index]));
+        }
+        return true;
+    }
+
+    bool CollectCandidates(RequestContext *request_context,
+                           const std::string &instance_group,
+                           const std::vector<InstanceInfoConstPtr> &instances,
+                           std::size_t sampling_size,
+                           std::vector<CandidateKey> &out) const {
+        out.clear();
+        std::vector<std::pair<InstanceInfoConstPtr, std::size_t>> eligible;
+        std::uint64_t total_key_count = 0;
+        for (const auto &instance : instances) {
+            if (!instance) {
+                return false;
+            }
+            const auto indexer =
+                owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance->instance_id());
+            if (!indexer) {
+                return false;
+            }
+            const std::size_t count = indexer->GetKeyCount();
+            if (count != 0) {
+                eligible.emplace_back(instance, count);
+            }
+        }
+        if (eligible.empty() || sampling_size == 0) {
+            return true;
+        }
+
+        std::sort(eligible.begin(), eligible.end(), [](const auto &lhs, const auto &rhs) {
+            return lhs.first->instance_id() < rhs.first->instance_id();
+        });
+        const std::size_t instance_budget = std::min(sampling_size, eligible.size());
+        const std::size_t rotation = sampling_rotation_by_group_[instance_group] % eligible.size();
+        std::vector<std::pair<InstanceInfoConstPtr, std::size_t>> selected_instances;
+        selected_instances.reserve(instance_budget);
+        for (std::size_t offset = 0; offset < instance_budget; ++offset) {
+            selected_instances.push_back(eligible[(rotation + offset) % eligible.size()]);
+            total_key_count = SaturatingAdd(total_key_count, selected_instances.back().second);
+        }
+        sampling_rotation_by_group_[instance_group] = (rotation + instance_budget) % eligible.size();
+
+        // Give each selected instance one slot, then distribute the remaining
+        // strict per-round budget by key count. Rotation prevents groups with
+        // more instances than sampling slots from starving their tail.
+        const std::size_t total_budget = sampling_size;
+        std::size_t remaining_budget = total_budget;
+        std::uint64_t remaining_weight = total_key_count;
+        std::set<std::tuple<std::string, std::int64_t>> sampled_keys;
+        for (std::size_t instance_index = 0; instance_index < selected_instances.size(); ++instance_index) {
+            const auto &[instance, key_count_for_instance] = selected_instances[instance_index];
+            const std::size_t instances_left = selected_instances.size() - instance_index;
+            std::size_t key_budget = 1;
+            if (remaining_budget > instances_left && remaining_weight != 0) {
+                const long double weighted = static_cast<long double>(remaining_budget) *
+                                             static_cast<long double>(key_count_for_instance) /
+                                             static_cast<long double>(remaining_weight);
+                key_budget = std::max<std::size_t>(1, static_cast<std::size_t>(weighted));
+            }
+            key_budget = std::min({key_budget, key_count_for_instance, remaining_budget - instances_left + 1});
+            remaining_budget -= key_budget;
+            remaining_weight =
+                key_count_for_instance >= remaining_weight ? 0 : remaining_weight - key_count_for_instance;
+
+            const auto indexer =
+                owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance->instance_id());
+            ReclaimCandidateVector sampled;
+            if (indexer->SampleReclaimCandidates(
+                    request_context, static_cast<std::int64_t>(key_budget), sampled, true) != EC_OK) {
+                return false;
+            }
+            KeyVector keys;
+            std::vector<std::int64_t> access_times;
+            keys.reserve(sampled.size());
+            access_times.reserve(sampled.size());
+            for (const auto &candidate : sampled) {
+                if (sampled_keys.emplace(instance->instance_id(), candidate.key).second) {
+                    keys.push_back(candidate.key);
+                    access_times.push_back(candidate.last_access_time_us);
+                }
+            }
+            if (keys.empty()) {
+                continue;
+            }
+            CacheLocationMapVector location_maps;
+            const auto get_result = indexer->GetLocationMapsForMaintenance(request_context, keys, location_maps);
+            if ((get_result.ec != EC_OK && get_result.ec != EC_PARTIAL_OK) || location_maps.size() != keys.size() ||
+                get_result.error_codes.size() != keys.size()) {
+                return false;
+            }
+            for (std::size_t key_index = 0; key_index < keys.size(); ++key_index) {
+                if (get_result.error_codes[key_index] == EC_NOENT) {
+                    continue;
+                }
+                if (get_result.error_codes[key_index] != EC_OK || location_maps[key_index].empty()) {
+                    return false;
+                }
+                CandidateKey key_candidate;
+                key_candidate.internal_instance_id = instance->instance_id();
+                key_candidate.internal_key = keys[key_index];
+                key_candidate.last_access_time_us = access_times[key_index];
+                key_candidate.all_locations_committed = true;
+                for (const auto &[location_id, location] : location_maps[key_index]) {
+                    if (!location) {
+                        return false;
+                    }
+                    std::uint64_t value_size = 0;
+                    if (owner_->ValidateOwnedLocation(
+                            request_context, keys[key_index], location_id, *location, value_size) != EC_OK) {
+                        return false;
+                    }
+                    if (!IsCommittedObject(*location)) {
+                        key_candidate.all_locations_committed = false;
+                        continue;
+                    }
+                    key_candidate.objects.push_back(
+                        Candidate{instance->instance_id(), keys[key_index], location_id, location, value_size});
+                }
+                if (!key_candidate.objects.empty()) {
+                    out.push_back(std::move(key_candidate));
+                }
+            }
+        }
+        return true;
+    }
+
+    static std::vector<Candidate>
+    SelectCandidates(std::vector<CandidateKey> candidates, Pressure pressure, std::size_t batch_size) {
+        std::sort(candidates.begin(), candidates.end(), [](const CandidateKey &lhs, const CandidateKey &rhs) {
+            return std::tie(lhs.last_access_time_us, lhs.internal_instance_id, lhs.internal_key) <
+                   std::tie(rhs.last_access_time_us, rhs.internal_instance_id, rhs.internal_key);
+        });
+        std::vector<Candidate> selected;
+        selected.reserve(std::min(batch_size, candidates.size()));
+        for (const auto &key_candidate : candidates) {
+            if (!pressure.Any() || selected.size() >= batch_size) {
+                break;
+            }
+            const bool reclaim_whole_key = pressure.keys != 0 && key_candidate.all_locations_committed &&
+                                           key_candidate.objects.size() <= batch_size - selected.size();
+            std::size_t selected_for_key = 0;
+            for (const auto &candidate : key_candidate.objects) {
+                if (selected.size() >= batch_size) {
+                    break;
+                }
+                if (!reclaim_whole_key && !pressure.Relevant(candidate.location->type(), false)) {
+                    continue;
+                }
+                selected.push_back(candidate);
+                ++selected_for_key;
+                pressure.Consume(candidate.location->type(), candidate.value_size);
+            }
+            if (reclaim_whole_key && selected_for_key == key_candidate.objects.size() && pressure.keys != 0) {
+                selected.back().removes_metadata_key = true;
+                --pressure.keys;
+            } else if (key_candidate.all_locations_committed && selected_for_key == key_candidate.objects.size() &&
+                       selected_for_key != 0) {
+                // Byte pressure happened to select the complete metadata key;
+                // credit that key so a concurrent key-count watermark does
+                // not retire an unnecessary additional object.
+                selected.back().removes_metadata_key = true;
+            }
+        }
+        return selected;
+    }
+
+    std::vector<RetiredItem> RetireCandidates(RequestContext *request_context,
+                                              const std::vector<Candidate> &candidates,
+                                              std::int64_t retire_deadline) {
+        std::vector<RetiredItem> retired_items;
+        std::map<std::string, std::vector<std::size_t>> by_instance;
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            by_instance[candidates[i].internal_instance_id].push_back(i);
+        }
+        for (const auto &[internal_instance_id, indices] : by_instance) {
+            const auto indexer = owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(internal_instance_id);
+            if (!indexer) {
+                continue;
+            }
+            std::vector<bool> retired(indices.size(), false);
+            std::vector<std::int64_t> keys;
+            keys.reserve(indices.size());
+            for (const std::size_t index : indices) {
+                keys.push_back(candidates[index].internal_key);
+            }
+            for (const auto &layer : MakeUniqueKeyLayers(keys)) {
+                KeyVector layer_keys;
+                LocationIdsPerKey layer_ids;
+                std::vector<CacheLocationConstPtr> expected;
+                std::vector<CacheLocationConstPtr> replacements;
+                layer_keys.reserve(layer.size());
+                layer_ids.reserve(layer.size());
+                expected.reserve(layer.size());
+                replacements.reserve(layer.size());
+                for (const std::size_t relative_index : layer) {
+                    const Candidate &candidate = candidates[indices[relative_index]];
+                    layer_keys.push_back(candidate.internal_key);
+                    layer_ids.push_back({candidate.location_id});
+                    expected.push_back(candidate.location);
+                    auto replacement = std::make_shared<CacheLocation>(*candidate.location);
+                    replacement->set_status(CLS_DELETING);
+                    replacement->set_create_time(retire_deadline);
+                    replacements.push_back(std::move(replacement));
+                }
+                std::vector<bool> layer_retired(layer.size(), false);
+                auto modifier = [&expected, &replacements, &layer_retired](const std::vector<ErrorCode> &get_ecs,
+                                                                           const LocationIdVector &,
+                                                                           std::size_t key_index,
+                                                                           CacheLocationVector &locations,
+                                                                           PropertyMap &) -> LocationModifierResult {
+                    if (get_ecs.size() != 1 || locations.size() != 1 || key_index >= expected.size()) {
+                        return {MA_FAIL, {EC_MISMATCH}};
+                    }
+                    if (get_ecs[0] != EC_OK) {
+                        return {MA_FAIL, {get_ecs[0]}};
+                    }
+                    if (!locations[0] || locations[0]->ToJsonString() != expected[key_index]->ToJsonString() ||
+                        !IsCommittedObject(*locations[0])) {
+                        return {MA_SKIP, {EC_MISMATCH}};
+                    }
+                    locations[0] = replacements[key_index];
+                    layer_retired[key_index] = true;
+                    return {MA_OK, {EC_OK}};
+                };
+                const auto result = indexer->ReadModifyWriteLocationsForMaintenance(
+                    request_context, layer_keys, layer_ids, modifier, false);
+                if (result.per_location_error_codes.size() != layer.size()) {
+                    continue;
+                }
+                for (std::size_t i = 0; i < layer.size(); ++i) {
+                    if (result.per_location_error_codes[i].size() == 1 &&
+                        result.per_location_error_codes[i][0] == EC_OK && layer_retired[i]) {
+                        retired[layer[i]] = true;
+                    }
+                }
+            }
+
+            KeyVector sync_keys;
+            for (std::size_t i = 0; i < indices.size(); ++i) {
+                if (retired[i]) {
+                    sync_keys.push_back(candidates[indices[i]].internal_key);
+                }
+            }
+            if (sync_keys.empty()) {
+                continue;
+            }
+            std::sort(sync_keys.begin(), sync_keys.end());
+            sync_keys.erase(std::unique(sync_keys.begin(), sync_keys.end()), sync_keys.end());
+            const bool metadata_durable = indexer->Sync(sync_keys);
+            if (!metadata_durable) {
+                // The in-memory view may already be retired, but without a
+                // persistence barrier it is not safe to release the physical
+                // allocation. Keep it in the pending queue and retry only the
+                // persistence barrier; no physical Delete is issued first.
+                KVCM_LOG_WARN("KVMeta reclaimer could not persist retired metadata for instance [%s]",
+                              internal_instance_id.c_str());
+            }
+            std::vector<bool> removes_metadata_key(indices.size(), false);
+            std::map<std::int64_t, std::vector<std::size_t>> retired_by_key;
+            for (std::size_t i = 0; i < indices.size(); ++i) {
+                retired_by_key[candidates[indices[i]].internal_key].push_back(i);
+            }
+            for (const auto &[_, relative_indices] : retired_by_key) {
+                const bool selected_complete_key = std::any_of(
+                    relative_indices.begin(), relative_indices.end(), [&](const std::size_t relative_index) {
+                        return candidates[indices[relative_index]].removes_metadata_key;
+                    });
+                const bool all_retired =
+                    std::all_of(relative_indices.begin(),
+                                relative_indices.end(),
+                                [&](const std::size_t relative_index) { return retired[relative_index]; });
+                if (selected_complete_key && all_retired) {
+                    removes_metadata_key[relative_indices.back()] = true;
+                }
+            }
+            for (std::size_t i = 0; i < indices.size(); ++i) {
+                if (!retired[i]) {
+                    continue;
+                }
+                const Candidate &candidate = candidates[indices[i]];
+                auto retired_location = std::make_shared<CacheLocation>(*candidate.location);
+                retired_location->set_status(CLS_DELETING);
+                retired_location->set_create_time(retire_deadline);
+                retired_items.push_back(RetiredItem{internal_instance_id,
+                                                    KvMetaManager::SessionItem{0,
+                                                                               {},
+                                                                               candidate.internal_key,
+                                                                               candidate.location_id,
+                                                                               retired_location,
+                                                                               retired_location,
+                                                                               candidate.value_size},
+                                                    removes_metadata_key[i],
+                                                    metadata_durable});
+            }
+        }
+        return retired_items;
+    }
+
+    void AddPendingBatch(const std::string &instance_group,
+                         std::size_t quota_shard,
+                         std::chrono::steady_clock::time_point deadline,
+                         std::vector<RetiredItem> items) {
+        auto batch = std::make_shared<PendingBatch>();
+        batch->instance_group = instance_group;
+        batch->quota_shard = quota_shard;
+        batch->deadline = deadline;
+        batch->items = std::move(items);
+        std::set<std::string> instances;
+        for (const auto &item : batch->items) {
+            instances.insert(item.internal_instance_id);
+            batch->locations.emplace_back(item.internal_instance_id, item.item.location_id);
+        }
+        batch->instances.assign(instances.begin(), instances.end());
+        std::uint64_t batch_bytes = 0;
+        for (const auto &item : batch->items) {
+            batch_bytes = SaturatingAdd(batch_bytes, item.item.value_size);
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            batch->sequence = next_pending_sequence_;
+            // Allocate every map node before publishing counters. This gives
+            // the in-memory indexes a strong exception guarantee: either the
+            // complete pending batch is visible, or no zero/partial marker is
+            // left behind.
+            try {
+                for (const auto &instance : batch->instances) {
+                    pending_instances_.try_emplace(instance, 0);
+                }
+                for (const auto &location : batch->locations) {
+                    pending_locations_.try_emplace(location, 0);
+                }
+                pending_credits_.try_emplace(instance_group, PendingCredit{});
+                const auto [_, inserted] =
+                    pending_batches_.emplace(PendingDeadline{batch->deadline, batch->sequence}, batch);
+                if (!inserted) {
+                    throw std::logic_error("duplicate KVMeta pending sequence");
+                }
+            } catch (...) {
+                for (const auto &instance : batch->instances) {
+                    const auto it = pending_instances_.find(instance);
+                    if (it != pending_instances_.end() && it->second == 0) {
+                        pending_instances_.erase(it);
+                    }
+                }
+                for (const auto &location : batch->locations) {
+                    const auto it = pending_locations_.find(location);
+                    if (it != pending_locations_.end() && it->second == 0) {
+                        pending_locations_.erase(it);
+                    }
+                }
+                const auto credit_it = pending_credits_.find(instance_group);
+                if (credit_it != pending_credits_.end() && credit_it->second.bytes == 0 &&
+                    credit_it->second.keys == 0 && credit_it->second.blocked_batch_count == 0 &&
+                    std::none_of(credit_it->second.bytes_by_type.begin(),
+                                 credit_it->second.bytes_by_type.end(),
+                                 [](std::uint64_t value) { return value != 0; })) {
+                    pending_credits_.erase(credit_it);
+                }
+                FailClosedMaintenance();
+                throw;
+            }
+            ++next_pending_sequence_;
+            for (const auto &instance : batch->instances) {
+                ++pending_instances_.find(instance)->second;
+            }
+            for (const auto &location : batch->locations) {
+                ++pending_locations_.find(location)->second;
+            }
+            auto &credit = pending_credits_.find(instance_group)->second;
+            for (const auto &item : batch->items) {
+                credit.bytes = SaturatingAdd(credit.bytes, item.item.value_size);
+                if (item.removes_metadata_key) {
+                    credit.keys = SaturatingAdd(credit.keys, 1);
+                }
+                if (item.item.data_location) {
+                    const std::size_t type_index = ToIndex(ToBaseType(item.item.data_location->type()));
+                    if (type_index < credit.bytes_by_type.size()) {
+                        credit.bytes_by_type[type_index] =
+                            SaturatingAdd(credit.bytes_by_type[type_index], item.item.value_size);
+                    }
+                }
+            }
+            pending_object_count_ = SaturatingAdd(pending_object_count_, batch->items.size());
+            pending_bytes_ = SaturatingAdd(pending_bytes_, batch_bytes);
+            retired_object_count_metrics_ += batch->items.size();
+            UpdatePendingMetricsLocked();
+            wake_requested_ = true;
+        }
+        condition_.notify_all();
+    }
+
+    void CompletePending(const std::shared_ptr<PendingBatch> &batch) noexcept {
+        if (!batch) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto &instance : batch->instances) {
+            const auto it = pending_instances_.find(instance);
+            if (it == pending_instances_.end() || it->second <= 1) {
+                pending_instances_.erase(instance);
+            } else {
+                --it->second;
+            }
+        }
+        for (const auto &location : batch->locations) {
+            const auto it = pending_locations_.find(location);
+            if (it == pending_locations_.end() || it->second <= 1) {
+                pending_locations_.erase(location);
+            } else {
+                --it->second;
+            }
+        }
+        if (batch->admission_blocked) {
+            const auto it = pending_credits_.find(batch->instance_group);
+            if (it != pending_credits_.end() && it->second.blocked_batch_count != 0) {
+                --it->second.blocked_batch_count;
+            }
+            batch->admission_blocked = false;
+        }
+        const auto credit_it = pending_credits_.find(batch->instance_group);
+        if (credit_it != pending_credits_.end()) {
+            auto &credit = credit_it->second;
+            for (const auto &item : batch->items) {
+                credit.bytes = SaturatingSub(credit.bytes, item.item.value_size);
+                if (item.removes_metadata_key) {
+                    credit.keys = SaturatingSub(credit.keys, 1);
+                }
+                if (item.item.data_location) {
+                    const std::size_t type_index = ToIndex(ToBaseType(item.item.data_location->type()));
+                    if (type_index < credit.bytes_by_type.size()) {
+                        credit.bytes_by_type[type_index] =
+                            SaturatingSub(credit.bytes_by_type[type_index], item.item.value_size);
+                    }
+                }
+            }
+            const bool has_type_credit = std::any_of(credit.bytes_by_type.begin(),
+                                                     credit.bytes_by_type.end(),
+                                                     [](std::uint64_t value) { return value != 0; });
+            if (credit.bytes == 0 && credit.keys == 0 && !has_type_credit && credit.blocked_batch_count == 0) {
+                pending_credits_.erase(credit_it);
+            }
+        }
+        pending_object_count_ = SaturatingSub(pending_object_count_, batch->items.size());
+        for (const auto &item : batch->items) {
+            pending_bytes_ = SaturatingSub(pending_bytes_, item.item.value_size);
+        }
+        UpdatePendingMetricsLocked();
+    }
+
+    void BlockAdmission(const std::shared_ptr<PendingBatch> &batch) noexcept {
+        if (!batch) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!batch->admission_blocked) {
+            const auto credit_it = pending_credits_.find(batch->instance_group);
+            if (credit_it == pending_credits_.end()) {
+                // Losing this fence after an ambiguous metadata persistence
+                // outcome could admit a successor allocation and create an ABA
+                // delete race. Fail closed for KVMeta only; ordinary KV-cache
+                // traffic does not consult maintenance_cancelled_.
+                KVCM_LOG_ERROR("KVMeta reclaimer lost pending credit while blocking admission");
+                ++error_count_metrics_;
+                FailClosedMaintenance();
+                return;
+            }
+            batch->admission_blocked = true;
+            if (credit_it->second.blocked_batch_count != std::numeric_limits<std::size_t>::max()) {
+                ++credit_it->second.blocked_batch_count;
+            }
+            UpdatePendingMetricsLocked();
+        }
+    }
+
+    std::vector<std::shared_ptr<PendingBatch>> TakeDueBatches() {
+        std::vector<std::shared_ptr<PendingBatch>> due;
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        std::size_t due_count = 0;
+        for (auto it = pending_batches_.begin(); it != pending_batches_.end() && it->first.first <= now; ++it) {
+            ++due_count;
+        }
+        // Reserve before mutating the queue. If allocation fails, every batch
+        // remains indexed and the outer loop can retry without losing its
+        // pending markers or quota credit.
+        due.reserve(due_count);
+        while (!pending_batches_.empty() && pending_batches_.begin()->first.first <= now) {
+            due.push_back(std::move(pending_batches_.begin()->second));
+            pending_batches_.erase(pending_batches_.begin());
+        }
+        return due;
+    }
+
+    void ReschedulePending(const std::shared_ptr<PendingBatch> &batch) {
+        if (!batch) {
+            return;
+        }
+        constexpr std::uint64_t kMinimumRetryDelayMs = 100;
+        constexpr std::uint64_t kMaximumRetryDelayMs = 30'000;
+        const std::uint64_t base_delay_ms = std::max<std::uint64_t>(kMinimumRetryDelayMs, IdleIntervalMs());
+        const std::uint32_t shift = std::min<std::uint32_t>(batch->retry_count, 8);
+        const std::uint64_t retry_delay_ms = std::min<std::uint64_t>(kMaximumRetryDelayMs, base_delay_ms << shift);
+        const auto retry_delay = std::chrono::milliseconds(retry_delay_ms);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_) {
+                return;
+            }
+            batch->deadline = std::chrono::steady_clock::now() + retry_delay;
+            batch->sequence = next_pending_sequence_++;
+            if (batch->retry_count != std::numeric_limits<std::uint32_t>::max()) {
+                ++batch->retry_count;
+            }
+            pending_batches_.emplace(PendingDeadline{batch->deadline, batch->sequence}, batch);
+            wake_requested_ = true;
+        }
+        condition_.notify_all();
+    }
+
+    bool EnsureRetiredMetadataDurable(const std::shared_ptr<PendingBatch> &batch) {
+        std::map<std::string, KeyVector> keys_by_instance;
+        for (const auto &retired : batch->items) {
+            if (!retired.metadata_durable) {
+                keys_by_instance[retired.internal_instance_id].push_back(retired.item.internal_key);
+            }
+        }
+        for (auto &[internal_instance_id, keys] : keys_by_instance) {
+            std::sort(keys.begin(), keys.end());
+            keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+            const auto indexer = owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(internal_instance_id);
+            if (!indexer || !indexer->Sync(keys)) {
+                return false;
+            }
+            for (auto &retired : batch->items) {
+                if (retired.internal_instance_id == internal_instance_id) {
+                    retired.metadata_durable = true;
+                }
+            }
+        }
+        return true;
+    }
+
+    void FinalizePending(const std::shared_ptr<PendingBatch> &batch) {
+        if (!batch) {
+            return;
+        }
+        if (ShouldStop()) {
+            CompletePending(batch);
+            return;
+        }
+        if (batch->quota_shard >= owner_->quota_admission_mutexes_.size()) {
+            KVCM_LOG_ERROR("KVMeta reclaimer pending batch has an invalid quota shard");
+            CompletePending(batch);
+            return;
+        }
+
+        std::map<std::string, std::vector<KvMetaManager::SessionItem>> items_by_instance;
+        std::vector<KvMetaManager::SessionItem> all_items;
+        all_items.reserve(batch->items.size());
+        for (const auto &retired : batch->items) {
+            items_by_instance[retired.internal_instance_id].push_back(retired.item);
+            all_items.push_back(retired.item);
+        }
+
+        std::unique_lock<std::mutex> quota_lock(owner_->quota_admission_mutexes_[batch->quota_shard]);
+        if (ShouldStop()) {
+            CompletePending(batch);
+            return;
+        }
+        if (!EnsureRetiredMetadataDurable(batch)) {
+            ++retry_count_metrics_;
+            quota_lock.unlock();
+            if (ShouldStop()) {
+                CompletePending(batch);
+            } else {
+                ReschedulePending(batch);
+            }
+            return;
+        }
+
+        try {
+            RequestContext request_context("kv_meta_reclaimer_finalize");
+            for (const auto &[internal_instance_id, items] : items_by_instance) {
+                const ErrorCode ec = owner_->DeleteRetiredMetadata(&request_context, internal_instance_id, items);
+                if (ec != EC_OK) {
+                    ++retry_count_metrics_;
+                    KVCM_LOG_WARN("KVMeta reclaimer metadata cleanup will be retried for instance [%s], "
+                                  "item_count[%zu], ec[%d]",
+                                  internal_instance_id.c_str(),
+                                  items.size(),
+                                  ec);
+                    // The exact delete may already have removed metadata from
+                    // the in-memory view before its Sync failed. Close new
+                    // admission for this KVMeta group before releasing the
+                    // shard; existing sessions may still finish safely.
+                    BlockAdmission(batch);
+                    quota_lock.unlock();
+                    if (ShouldStop()) {
+                        CompletePending(batch);
+                    } else {
+                        ReschedulePending(batch);
+                    }
+                    return;
+                }
+            }
+        } catch (...) {
+            BlockAdmission(batch);
+            throw;
+        }
+
+        // The metadata ownership change is durable for every item. Physical
+        // deletion is intentionally attempted exactly once: a timeout or
+        // provider exception has an uncertain outcome, and replay could delete
+        // a successor allocation if a backend reuses addresses.
+        ErrorCode physical_ec = EC_IO_ERROR;
+        const char *failure_kind = "error_code";
+        try {
+            RequestContext request_context("kv_meta_reclaimer_physical_delete");
+            physical_ec = owner_->DeleteAllocatedLocations(&request_context, all_items);
+        } catch (const std::exception &) {
+            failure_kind = "standard_exception";
+        } catch (...) {
+            failure_kind = "unknown_exception";
+        }
+        if (physical_ec != EC_OK) {
+            ++error_count_metrics_;
+            KVCM_LOG_WARN("KVMeta reclaimer left objects for backend orphan cleanup, item_count[%zu], "
+                          "failure[%s], ec[%d]",
+                          all_items.size(),
+                          failure_kind,
+                          physical_ec);
+        }
+        std::uint64_t reclaimed_bytes = 0;
+        for (const auto &item : batch->items) {
+            reclaimed_bytes = SaturatingAdd(reclaimed_bytes, item.item.value_size);
+        }
+        reclaimed_object_count_metrics_ += batch->items.size();
+        reclaimed_bytes_metrics_ += reclaimed_bytes;
+        CompletePending(batch);
+    }
+
+    bool ReclaimGroup(RequestContext *request_context, const std::shared_ptr<const InstanceGroup> &group) {
+        if (!group || !group->cache_config() || !group->cache_config()->reclaim_strategy()) {
+            return false;
+        }
+        const auto &strategy = group->cache_config()->reclaim_strategy();
+        const double threshold = strategy->trigger_strategy().used_percentage();
+        const std::int64_t max_delete_delay_ms =
+            owner_->limits_.max_write_timeout_seconds > std::numeric_limits<std::int64_t>::max() / 1000
+                ? std::numeric_limits<std::int64_t>::max()
+                : owner_->limits_.max_write_timeout_seconds * 1000;
+        if (strategy->reclaim_policy() != ReclaimPolicy::POLICY_LRU) {
+            KVCM_INTERVAL_LOG_WARN(10,
+                                   "KVMeta reclaimer skipped group [%s]: only LRU is supported, policy[%d]",
+                                   group->name().c_str(),
+                                   static_cast<int>(strategy->reclaim_policy()));
+            return false;
+        }
+        if (!std::isfinite(threshold) || threshold < 0.0 || threshold > 1.0 || strategy->delay_before_delete_ms() < 0 ||
+            strategy->delay_before_delete_ms() > max_delete_delay_ms) {
+            KVCM_INTERVAL_LOG_WARN(10,
+                                   "KVMeta reclaimer skipped group [%s] with invalid watermark or delete delay",
+                                   group->name().c_str());
+            return false;
+        }
+        const auto [instances_ec, all_instances] =
+            owner_->registry_manager_->ListInstanceInfo(request_context, group->name());
+        if (instances_ec != EC_OK || all_instances.empty()) {
+            return false;
+        }
+        std::vector<InstanceInfoConstPtr> instances;
+        instances.reserve(all_instances.size());
+        for (const auto &instance : all_instances) {
+            if (!instance || !IsKvMetaInstance(*instance)) {
+                // Never let the side-path worker scan or delete an ordinary KV
+                // cache group, even if configuration was changed after KVMeta
+                // registration.
+                return false;
+            }
+            instances.push_back(instance);
+        }
+
+        Pressure pressure;
+        if (!ReadPressure(request_context, *group, instances, threshold, pressure) || !pressure.Any()) {
+            return false;
+        }
+        const auto [sampling_size, batch_size] = SamplingAndBatchSize();
+        if (sampling_size == 0 || batch_size == 0) {
+            KVCM_INTERVAL_LOG_WARN(10,
+                                   "KVMeta reclaimer cannot make progress for group [%s]: sample[%zu], batch[%zu]",
+                                   group->name().c_str(),
+                                   sampling_size,
+                                   batch_size);
+            return false;
+        }
+        std::vector<CandidateKey> candidate_keys;
+        if (!CollectCandidates(request_context, group->name(), instances, sampling_size, candidate_keys)) {
+            KVCM_INTERVAL_LOG_WARN(
+                10, "KVMeta reclaimer failed to collect exact LRU candidates for group [%s]", group->name().c_str());
+            return false;
+        }
+        const auto delay = std::chrono::milliseconds(strategy->delay_before_delete_ms());
+        const std::size_t quota_shard =
+            std::hash<std::string>{}(group->name()) % owner_->quota_admission_mutexes_.size();
+        std::vector<RetiredItem> retired;
+        {
+            std::unique_lock<std::mutex> quota_lock(owner_->quota_admission_mutexes_[quota_shard]);
+            if (ShouldStop()) {
+                return false;
+            }
+            // Pressure and admission can change while sampling. Recheck under
+            // the same group shard used by Put/Remove/Trim before changing any
+            // metadata, so a completed concurrent delete cannot cause an
+            // unnecessary retirement.
+            Pressure current_pressure;
+            if (!ReadPressure(request_context, *group, instances, threshold, current_pressure) ||
+                !current_pressure.Any()) {
+                return false;
+            }
+            auto selected = SelectCandidates(std::move(candidate_keys), current_pressure, batch_size);
+            if (selected.empty()) {
+                return false;
+            }
+            if (!HasPendingCapacity(selected)) {
+                KVCM_INTERVAL_LOG_WARN(10,
+                                       "KVMeta reclaimer pending limit reached for group [%s], selected[%zu]",
+                                       group->name().c_str(),
+                                       selected.size());
+                return false;
+            }
+
+            const std::int64_t now_us = TimestampUtil::GetCurrentTimeUs();
+            const auto delay_us = std::chrono::duration_cast<std::chrono::microseconds>(delay).count();
+            std::int64_t retire_deadline = 0;
+            if (!EncodeTaggedDeadlineUs(now_us, delay_us, retire_deadline)) {
+                KVCM_LOG_WARN("KVMeta reclaimer could not encode retire deadline for group [%s]",
+                              group->name().c_str());
+                return false;
+            }
+            try {
+                retired = RetireCandidates(request_context, selected, retire_deadline);
+            } catch (...) {
+                // Retirement may already be durable. Stop only the KVMeta side
+                // before releasing the group shard so another round cannot
+                // over-evict without pending credit; leader recovery owns any
+                // persisted retired record.
+                FailClosedMaintenance();
+                throw;
+            }
+            if (!retired.empty()) {
+                // Publish the pending marker before releasing the same group
+                // shard observed by Trim. Otherwise Trim could see the
+                // durable CLS_DELETING state in the tiny retire/marker window
+                // and bypass the configured read grace period.
+                const auto finalization_deadline = std::chrono::steady_clock::now() + delay;
+                try {
+                    AddPendingBatch(group->name(), quota_shard, finalization_deadline, std::move(retired));
+                } catch (...) {
+                    KVCM_LOG_ERROR("KVMeta reclaimer could not publish pending state for group [%s]; "
+                                   "KVMeta maintenance is now fail-closed",
+                                   group->name().c_str());
+                    throw;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool ReclaimRound() {
+        if (ShouldStop()) {
+            return false;
+        }
+        // Share the existing operational pause switch. A pause stops new
+        // retirements, while already-retired batches still pass through the
+        // metadata/physical finalization path above, matching CacheReclaimer's
+        // handling of accepted deletes.
+        const auto cache_reclaimer = owner_->cache_manager_->cache_reclaimer();
+        if (cache_reclaimer && cache_reclaimer->IsPaused()) {
+            return false;
+        }
+        RequestContext request_context("kv_meta_reclaimer");
+        ++round_count_metrics_;
+        const auto [groups_ec, groups] = owner_->registry_manager_->ListInstanceGroup(&request_context);
+        if (groups_ec != EC_OK) {
+            KVCM_INTERVAL_LOG_WARN(10, "KVMeta reclaimer failed to list instance groups, ec[%d]", groups_ec);
+            return false;
+        }
+        std::set<std::string> active_group_names;
+        for (const auto &group : groups) {
+            if (group) {
+                active_group_names.insert(group->name());
+            }
+        }
+        for (auto it = sampling_rotation_by_group_.begin(); it != sampling_rotation_by_group_.end();) {
+            if (active_group_names.count(it->first) == 0) {
+                it = sampling_rotation_by_group_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        bool made_progress = false;
+        for (const auto &group : groups) {
+            if (ShouldStop()) {
+                break;
+            }
+            try {
+                made_progress = ReclaimGroup(&request_context, group) || made_progress;
+            } catch (const std::exception &) {
+                ++error_count_metrics_;
+                KVCM_LOG_WARN("KVMeta reclaimer contained a standard provider exception for group [%s]",
+                              group ? group->name().c_str() : "<null>");
+            } catch (...) {
+                ++error_count_metrics_;
+                KVCM_LOG_WARN("KVMeta reclaimer contained an unknown provider exception for group [%s]",
+                              group ? group->name().c_str() : "<null>");
+            }
+        }
+        return made_progress;
+    }
+
+    void Loop() noexcept {
+        for (;;) {
+            try {
+                const auto interval = std::chrono::milliseconds(IdleIntervalMs());
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    auto wake_deadline = std::chrono::steady_clock::now() + interval;
+                    if (!pending_batches_.empty()) {
+                        wake_deadline = std::min(wake_deadline, pending_batches_.begin()->first.first);
+                    }
+                    condition_.wait_until(lock, wake_deadline, [this]() { return stopping_ || wake_requested_; });
+                    if (stopping_) {
+                        break;
+                    }
+                    wake_requested_ = false;
+                }
+                for (const auto &batch : TakeDueBatches()) {
+                    try {
+                        FinalizePending(batch);
+                    } catch (const std::exception &) {
+                        ++error_count_metrics_;
+                        KVCM_LOG_WARN("KVMeta reclaimer contained a standard finalization exception");
+                        if (ShouldStop()) {
+                            CompletePending(batch);
+                        } else {
+                            ReschedulePending(batch);
+                        }
+                    } catch (...) {
+                        ++error_count_metrics_;
+                        KVCM_LOG_WARN("KVMeta reclaimer contained an unknown finalization exception");
+                        if (ShouldStop()) {
+                            CompletePending(batch);
+                        } else {
+                            ReschedulePending(batch);
+                        }
+                    }
+                }
+                if (ShouldStop()) {
+                    break;
+                }
+                const bool made_progress = ReclaimRound();
+                if (made_progress) {
+                    // Re-evaluate watermarks immediately after a bounded batch.
+                    Wake();
+                }
+            } catch (const std::exception &) {
+                ++error_count_metrics_;
+                KVCM_LOG_WARN("KVMeta reclaimer loop contained a standard exception");
+                try {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    wake_requested_ = false;
+                    condition_.wait_for(lock, std::chrono::milliseconds(100), [this]() { return stopping_; });
+                    if (stopping_) {
+                        break;
+                    }
+                } catch (...) {
+                    break;
+                }
+            } catch (...) {
+                ++error_count_metrics_;
+                KVCM_LOG_WARN("KVMeta reclaimer loop contained an unknown exception");
+                try {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    wake_requested_ = false;
+                    condition_.wait_for(lock, std::chrono::milliseconds(100), [this]() { return stopping_; });
+                    if (stopping_) {
+                        break;
+                    }
+                } catch (...) {
+                    break;
+                }
+            }
+        }
+    }
+
+    KvMetaManager *owner_ = nullptr;
+    mutable std::mutex lifecycle_mutex_;
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    bool stopping_ = true;
+    bool wake_requested_ = false;
+    std::map<std::string, std::size_t> pending_instances_;
+    std::map<std::pair<std::string, std::string>, std::size_t> pending_locations_;
+    std::map<std::string, PendingCredit> pending_credits_;
+    std::map<PendingDeadline, std::shared_ptr<PendingBatch>> pending_batches_;
+    mutable std::map<std::string, std::size_t> sampling_rotation_by_group_;
+    std::uint64_t next_pending_sequence_ = 0;
+    std::uint64_t pending_object_count_ = 0;
+    std::uint64_t pending_bytes_ = 0;
+    Counter round_count_metrics_;
+    Counter retired_object_count_metrics_;
+    Counter reclaimed_object_count_metrics_;
+    Counter reclaimed_bytes_metrics_;
+    Counter retry_count_metrics_;
+    Counter error_count_metrics_;
+    Gauge pending_object_count_metrics_;
+    Gauge pending_bytes_metrics_;
+    Gauge blocked_group_count_metrics_;
+    std::thread thread_;
+};
+
 KvMetaManager::KvMetaManager(std::shared_ptr<CacheManager> cache_manager,
                              std::shared_ptr<RegistryManager> registry_manager)
     : KvMetaManager(std::move(cache_manager), std::move(registry_manager), Limits{}) {}
@@ -634,9 +1933,11 @@ bool KvMetaManager::Init() {
     }
     data_storage_selector_ =
         std::make_unique<DataStorageSelector>(cache_manager_->meta_indexer_manager(), registry_manager_);
+    reclaimer_ = std::make_unique<KvMetaReclaimer>(this);
     write_session_manager_ = std::make_unique<KvMetaWriteSessionManager>(this, limits_.max_active_write_sessions);
     if (!write_session_manager_->Start()) {
         write_session_manager_.reset();
+        reclaimer_.reset();
         data_storage_selector_.reset();
         return false;
     }
@@ -648,6 +1949,10 @@ bool KvMetaManager::Init() {
 void KvMetaManager::Shutdown() {
     CancelMaintenance();
     initialized_.store(false, std::memory_order_release);
+    if (reclaimer_) {
+        reclaimer_->StopAndJoin();
+        reclaimer_.reset();
+    }
     if (write_session_manager_) {
         write_session_manager_->StopAndDiscard();
         write_session_manager_.reset();
@@ -657,6 +1962,9 @@ void KvMetaManager::Shutdown() {
 
 void KvMetaManager::DoCleanup() {
     CancelMaintenance();
+    if (reclaimer_) {
+        reclaimer_->StopAndJoin();
+    }
     if (write_session_manager_) {
         write_session_manager_->StopAndDiscard();
     }
@@ -667,13 +1975,25 @@ void KvMetaManager::CancelMaintenance() noexcept {
     if (write_session_manager_) {
         write_session_manager_->RequestStop();
     }
+    if (reclaimer_) {
+        reclaimer_->RequestStop();
+    }
 }
 
 bool KvMetaManager::ResumeMaintenance() {
-    if (!initialized_.load(std::memory_order_acquire) || !write_session_manager_ || !write_session_manager_->Start()) {
+    if (!initialized_.load(std::memory_order_acquire) || !write_session_manager_ || !reclaimer_) {
+        return false;
+    }
+    if (!write_session_manager_->Start()) {
         return false;
     }
     maintenance_cancelled_.store(false, std::memory_order_release);
+    if (!reclaimer_->Start()) {
+        maintenance_cancelled_.store(true, std::memory_order_release);
+        write_session_manager_->RequestStop();
+        reclaimer_->RequestStop();
+        return false;
+    }
     return true;
 }
 
@@ -715,9 +2035,9 @@ ErrorCode KvMetaManager::ValidateOwnedLocation(RequestContext *request_context,
                                                const CacheLocation &location,
                                                std::uint64_t &value_size) const {
     const auto data_storage_manager = registry_manager_->data_storage_manager();
-    if (!IsOwnedLocation(internal_key, location_id) || location.id() != location_id || location.status() != CLS_NEW ||
-        location.create_time() == 0 || !HasMatchingStorageBackend(location, data_storage_manager) ||
-        !ReadLogicalSize(location, value_size)) {
+    const bool known_state = (location.status() == CLS_NEW && location.create_time() != 0) || IsRetiredObject(location);
+    if (!IsOwnedLocation(internal_key, location_id) || location.id() != location_id || !known_state ||
+        !HasMatchingStorageBackend(location, data_storage_manager) || !ReadLogicalSize(location, value_size)) {
         AddError(request_context, "KVMeta location does not match its exact key or registered storage backend");
         return EC_CORRUPTION;
     }
@@ -1063,7 +2383,11 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
                                      const std::string &internal_instance_id,
                                      const std::vector<SessionItem> &items,
                                      bool metadata_only,
-                                     bool adjust_storage_usage) {
+                                     bool adjust_storage_usage,
+                                     bool maintenance_no_touch,
+                                     bool delete_if_metadata_absent,
+                                     bool sync_metadata_absent,
+                                     bool restore_usage_on_sync_failure) {
     if (items.empty()) {
         return EC_OK;
     }
@@ -1102,8 +2426,14 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
             continue;
         }
         std::vector<std::vector<ErrorCode>> per_location_ec;
-        const ErrorCode delete_ec = searcher.BatchDeleteLocations(
-            request_context, keys, ids, per_location_ec, expected_values, adjust_storage_usage);
+        const ErrorCode delete_ec = searcher.BatchDeleteLocations(request_context,
+                                                                  keys,
+                                                                  ids,
+                                                                  per_location_ec,
+                                                                  expected_values,
+                                                                  adjust_storage_usage,
+                                                                  true,
+                                                                  maintenance_no_touch);
         overall = FirstHardError(overall, delete_ec);
         if (per_location_ec.size() != layer.size()) {
             overall = FirstHardError(overall, EC_MISMATCH);
@@ -1125,21 +2455,22 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
         }
     }
 
-    KeyVector deleted_keys;
-    std::unordered_set<std::int64_t> unique_deleted_keys;
+    KeyVector keys_to_sync;
+    std::unordered_set<std::int64_t> unique_keys_to_sync;
     for (std::size_t i = 0; i < items.size(); ++i) {
-        if (metadata_deleted[i] && unique_deleted_keys.insert(items[i].internal_key).second) {
-            deleted_keys.push_back(items[i].internal_key);
+        if ((metadata_deleted[i] || (sync_metadata_absent && metadata_already_absent[i])) &&
+            unique_keys_to_sync.insert(items[i].internal_key).second) {
+            keys_to_sync.push_back(items[i].internal_key);
         }
     }
-    const bool metadata_delete_is_durable = deleted_keys.empty() || indexer->Sync(deleted_keys);
+    const bool metadata_delete_is_durable = keys_to_sync.empty() || indexer->Sync(keys_to_sync);
     if (!metadata_delete_is_durable) {
         overall = FirstHardError(overall, EC_TIMEOUT);
         // BatchDeleteLocations adjusts the in-memory counter when the delete
         // is accepted. If its persistence barrier fails, restore a
         // conservative upper bound; the next KVMeta recovery rebuilds the
         // exact value from durable metadata.
-        if (adjust_storage_usage) {
+        if (adjust_storage_usage && restore_usage_on_sync_failure) {
             for (std::size_t i = 0; i < items.size(); ++i) {
                 if (metadata_deleted[i] && items[i].metadata_location) {
                     indexer->AddStorageUsageByType(items[i].metadata_location->type(), items[i].value_size);
@@ -1152,8 +2483,8 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
         std::vector<SessionItem> physical_items;
         physical_items.reserve(items.size());
         for (std::size_t i = 0; i < items.size(); ++i) {
-            const bool safe_to_delete =
-                metadata_already_absent[i] || (metadata_deleted[i] && metadata_delete_is_durable);
+            const bool safe_to_delete = (delete_if_metadata_absent && metadata_already_absent[i]) ||
+                                        (metadata_deleted[i] && metadata_delete_is_durable);
             if (safe_to_delete && items[i].data_location) {
                 physical_items.push_back(items[i]);
             }
@@ -1161,6 +2492,16 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
         overall = FirstHardError(overall, DeleteAllocatedLocations(request_context, physical_items));
     }
     return overall;
+}
+
+ErrorCode KvMetaManager::DeleteRetiredMetadata(RequestContext *request_context,
+                                               const std::string &internal_instance_id,
+                                               const std::vector<SessionItem> &items) {
+    // Reclaimer finalization deliberately separates metadata and physical
+    // deletion. If Sync fails after the in-memory exact delete, a later retry
+    // must Sync the now-absent key before releasing the allocation. Keeping
+    // the already-decremented usage avoids double accounting on that retry.
+    return DeleteItems(request_context, internal_instance_id, items, true, true, true, false, true, false);
 }
 
 std::pair<ErrorCode, KvMetaManager::StartWriteResult>
@@ -1217,6 +2558,25 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         std::hash<std::string>{}(instance_info->instance_group_name()) % quota_admission_mutexes_.size();
     std::unique_lock<std::mutex> quota_lock(quota_admission_mutexes_[quota_shard]);
 
+    // A retired location normally remains visible as CLS_DELETING until its
+    // final persistence barrier succeeds. If that barrier failed after the
+    // in-memory delete, the exact metadata can temporarily be absent. Keep the
+    // same logical key closed until the pending batch either completes or is
+    // handed to leader recovery; otherwise a reusable backend URI could expose
+    // an ABA window between old-object deletion and a new allocation.
+    if (reclaimer_) {
+        if (reclaimer_->IsAdmissionBlocked(instance_info->instance_group_name())) {
+            AddError(request_context, "KVMeta admission is paused while reclaim metadata is being persisted");
+            return {EC_EXIST, StartWriteResult{}};
+        }
+        for (const auto &key : keys) {
+            if (reclaimer_->HasPendingLocation(internal_instance_id, StableLocationId(key))) {
+                AddError(request_context, "KVMeta value is being reclaimed");
+                return {EC_EXIST, StartWriteResult{}};
+            }
+        }
+    }
+
     auto data_storage_manager = registry_manager_->data_storage_manager();
     if (!data_storage_manager) {
         return {EC_ERROR, StartWriteResult{}};
@@ -1240,6 +2600,10 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                                                            existing_size);
                 ec != EC_OK) {
                 return {ec, StartWriteResult{}};
+            }
+            if (IsRetiredObject(*existing[i].location)) {
+                AddError(request_context, "KVMeta value is being reclaimed");
+                return {EC_EXIST, StartWriteResult{}};
             }
             if (existing_size != value_sizes[i]) {
                 AddError(request_context, "KVMeta existing value size does not match PutStart value_sizes");
@@ -1291,6 +2655,9 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                                                        DataStorageType::DATA_STORAGE_TYPE_UNKNOWN,
                                                        missing_bytes);
         ec != EC_OK) {
+        if (ec == EC_NOSPC && reclaimer_) {
+            reclaimer_->Wake();
+        }
         return {ec, StartWriteResult{}};
     }
     const auto selected = data_storage_selector_->SelectCacheWriteDataStorageBackend(
@@ -1301,6 +2668,9 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     if (const ErrorCode ec = CheckDynamicByteAdmission(
             request_context, instance_info->instance_group_name(), selected.type, missing_bytes);
         ec != EC_OK) {
+        if (ec == EC_NOSPC && reclaimer_) {
+            reclaimer_->Wake();
+        }
         return {ec, StartWriteResult{}};
     }
     const auto selected_backend = data_storage_manager->GetDataStorageBackend(selected.name);
@@ -1887,7 +3257,12 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
     if (std::any_of(success_keys.begin(), success_keys.end(), [](bool success) { return !success; })) {
         return cleanup_active_session(EC_OK);
     }
-    return FinishWriteInternal(request_context, session.internal_instance_id, success_keys, session.items);
+    const ErrorCode finish_ec =
+        FinishWriteInternal(request_context, session.internal_instance_id, success_keys, session.items);
+    if (finish_ec == EC_OK && reclaimer_) {
+        reclaimer_->Wake();
+    }
+    return finish_ec;
 }
 
 ErrorCode KvMetaManager::Remove(RequestContext *request_context,
@@ -1972,6 +3347,10 @@ ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::str
         AddError(request_context, "KVMeta cannot trim an instance while a write session is active or finalizing");
         return EC_EXIST;
     }
+    if (reclaimer_ && reclaimer_->HasPendingForInstance(internal_instance_id)) {
+        AddError(request_context, "KVMeta cannot trim an instance while automatic reclaim is pending");
+        return EC_EXIST;
+    }
 
     // Block only new KVMeta allocations in this dedicated group. Existing
     // KV-cache groups never take these locks, and each delete batch remains
@@ -1990,6 +3369,10 @@ ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::str
     // timeout cleanup has completed all metadata and physical-storage I/O.
     if (write_session_manager_ && write_session_manager_->HasSessionForInstance(internal_instance_id)) {
         AddError(request_context, "KVMeta cannot trim an instance while a write session is active or finalizing");
+        return EC_EXIST;
+    }
+    if (reclaimer_ && reclaimer_->HasPendingForInstance(internal_instance_id)) {
+        AddError(request_context, "KVMeta cannot trim an instance while automatic reclaim is pending");
         return EC_EXIST;
     }
 
@@ -2232,6 +3615,39 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                                     instance_recovery_ec = FirstHardError(
                                         instance_recovery_ec, validate_ec == EC_OK ? EC_CORRUPTION : validate_ec);
                                     break;
+                                }
+                                if (IsRetiredObject(*location)) {
+                                    std::int64_t retire_deadline_us = 0;
+                                    if (DecodeLeaseDeadline(location->create_time(), retire_deadline_us) &&
+                                        retire_deadline_us > scan_wall_time_us &&
+                                        scan_steady_time < recovery_force_deadline) {
+                                        const auto force_remaining_us =
+                                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                                recovery_force_deadline - scan_steady_time)
+                                                .count();
+                                        if (force_remaining_us > 0) {
+                                            const std::int64_t wait_us =
+                                                std::min(retire_deadline_us - scan_wall_time_us, force_remaining_us);
+                                            deferred_active_in_pass = true;
+                                            earliest_deferred_deadline =
+                                                std::min(earliest_deferred_deadline,
+                                                         scan_steady_time + std::chrono::microseconds(wait_us));
+                                            continue;
+                                        }
+                                    }
+                                    removed_stale_in_pass = true;
+                                    auto copy = std::make_shared<CacheLocation>(*location);
+                                    stale_batch.push_back(SessionItem{0, {}, keys[i], location_id, copy, copy, size});
+                                    if (stale_batch.size() == kMaintenanceDeleteBatchSize) {
+                                        if (should_abort && should_abort()) {
+                                            return EC_SERVICE_NOT_LEADER;
+                                        }
+                                        instance_recovery_ec = FirstHardError(instance_recovery_ec, flush_stale());
+                                        if (instance_recovery_ec != EC_OK) {
+                                            break;
+                                        }
+                                    }
+                                    continue;
                                 }
                                 if (location->create_time() < 0) {
                                     if (size > std::numeric_limits<std::uint64_t>::max() -

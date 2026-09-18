@@ -38,7 +38,7 @@ ledger 解决安全重试。这样既能降低 singleton 调用放大，也不�
 
 | 层次 | 状态 | 能力与边界 |
 |---|---|---|
-| V1 | 当前代码已实现 | exact-size、singleton allocation、写租约、metadata-first 单次删除、HA 恢复 |
+| V1 | 当前代码已实现 | exact-size、singleton allocation、写租约、独立 LRU Reclaimer、metadata-first 单次删除、HA 恢复 |
 | V1.1 | 建议下一阶段，尚未实现 | KVMeta 独立 QoS、orphan 指标/审计、backend capability 探测；不改变协议语义 |
 | V2 | 目标设计，尚未实现 | generation/fencing、幂等 operation、持久化 ledger、可续约读写 lease、异构批量和 object set |
 
@@ -74,7 +74,7 @@ opaque tensor byte stream，不同请求、不同 tensor，甚至同一批次中
 
 ### 2.3 V1 非目标
 
-- 不提供自动 LRU/TTL 淘汰；对象由业务 release、`Remove` 或 `Trim` 回收；
+- 不提供 TTL/LFU 淘汰；自动容量回收当前只支持 LRU，业务仍可通过 release、`Remove` 或 `Trim` 提前回收；
 - 不承诺一个多 key 写会话在并发 `Get` 看来具有同一瞬间的原子可见性；
 - 不在 KVCM 中保存 tensor shape、dtype、切片顺序或 RTP receipt；KVCM 只保存 opaque bytes；
 - 不改变 `DataStorageBackend::Create(keys, object_size)` 和普通 `TransferClient` 的固定大小接口；
@@ -123,7 +123,7 @@ KVCM 不传递图中的 receipt。RTP 自己在 ViT 与 LLM 之间传递 tensor 
 | 组件 | 职责 | 不负责 |
 |---|---|---|
 | `KvMetaServiceGRpc` / `KvMetaServiceImpl` | 独立 RPC 路由、请求门控、参数边界、错误码映射、响应形状校验 | 不直接搬运对象 bytes |
-| `KvMetaManager` | exact-key metadata、allocation、动态 byte quota、写会话、HA 恢复、Remove/Trim | 不进入 KV cache 写入/淘汰流程 |
+| `KvMetaManager` | exact-key metadata、allocation、动态 byte quota、写会话、独立 LRU 回收、HA 恢复、Remove/Trim | 不进入普通 KV cache 写入/淘汰流程 |
 | `RegistryManager` / `MetaIndexer` | 保存 KVMeta 专用 instance 和 `CacheLocation` | 不理解 tensor 语义 |
 | `DataStorageManager` | 选择 backend，创建/删除物理对象 | 不执行客户端 buffer 搬运 |
 | `KvMetaClient` | metadata RPC、多地址 failover、响应校验 | 不搬运数据 |
@@ -171,7 +171,8 @@ tenant/instance，不能用随机 key 或 token 猜测难度代替服务认证�
 - 公共 `instance_id` 会编码为保留的 KVMeta 内部 instance id，并携带完整 schema marker；
 - KVMeta instance 必须放入专用 Instance Group。注册时若 group 已含普通 instance，服务端拒绝；
 - 如果之后通过普通接口向该 group 混入 KV cache instance，新的 KVMeta byte admission 会 fail closed；
-- 普通 CacheReclaimer、Migration 和 Cache GC 跳过 KVMeta instance；
+- 普通 CacheReclaimer、Migration 和 Cache GC 跳过 KVMeta instance；KVMeta 由自己的 Reclaimer 线程处理，二者不
+  共用删除 executor、pending budget 或 group admission lock；
 - KVMeta 使用对象真实字节数维护 group/type quota，不把 marker `block_size=1` 当作对象用量。
 
 ### 4.3 代码路径隔离
@@ -185,11 +186,11 @@ tenant/instance，不能用随机 key 或 token 猜测难度代替服务认证�
 ### 4.4 Leader 生命周期隔离
 
 升主时先完成 Registry/CacheManager 的既有恢复、启动 GC/Migration 并开放主服务，再在独立线程恢复 KVMeta。
-恢复成功且 session worker 启动后才开放 KVMeta 请求门。KVMeta 恢复失败不会阻止主服务可用。
+恢复成功且 session worker、KVMeta Reclaimer 启动后才开放 KVMeta 请求门。KVMeta 恢复失败不会阻止主服务可用。
 
-降主或 Stop 时先关闭 KVMeta 请求门、session 准入并取消 Trim，然后按既有顺序排空主服务请求、停止主 GC 和
-Migration，最后 join KVMeta recovery/session worker。内存 session 被丢弃而不是在主清理线程逐个做 storage I/O；
-残留 active metadata 由下一任 leader 恢复。
+降主或 Stop 时先关闭 KVMeta 请求门、session/Reclaimer 准入并取消 Trim，然后按既有顺序排空主服务请求、停止
+主 GC 和 Migration，最后 join KVMeta recovery/session/Reclaimer worker。内存 session 被丢弃而不是在主清理
+线程逐个做 storage I/O；残留 active/retired metadata 由下一任 leader 恢复。
 
 ### 4.5 性能与故障域边界
 
@@ -197,7 +198,7 @@ Migration，最后 join KVMeta recovery/session worker。内存 session 被丢�
 |---|---|---|---|
 | RPC | protobuf service 路由、请求门和 metrics namespace 独立 | listener、gRPC sync worker、进程 CPU/内存 | 在调用方/网关限制 KVMeta 并发；高负载时使用独立进程/cgroup |
 | 锁 | KVMeta group admission shard 只由 KVMeta 获取 | Registry/MetaIndexer 的底层实现 | KVMeta 使用专用 Instance Group 和 metadata namespace |
-| 后台线程 | recovery、session expiry 独立，失败不阻塞主服务放流 | 进程线程数和 CPU quota | 设置独立线程/队列上限，监控 gate 和积压 |
+| 后台线程 | recovery、session expiry、KVMeta Reclaimer 独立，失败不阻塞主服务放流 | 进程线程数和 CPU quota | 监控 gate、pending bytes/object 和重试 |
 | 容量 | 按真实 bytes 使用专用 group/type quota | backend 的真实总容量 | storage candidate 指向专用 pool/namespace |
 | 数据面 | 使用独立 `KvMetaTransferClient` 策略 | NIC、PCIe、SDK connection、存储设备 | 配置 backend 侧带宽/IOPS 限流；强隔离部署使用独立资源池 |
 
@@ -251,6 +252,8 @@ KVMeta 复用 `CacheLocation` 的存储格式，但不复用 KV cache 状态机�
 
 - **active**：`status=CLS_NEW` 且 `create_time` 为带 tag 的正数，编码写租约 wall-clock deadline；Get 不可见；
 - **committed**：仍为 `status=CLS_NEW`，但 `create_time` 为负数；Get 可见；
+- **retired**：`status=CLS_DELETING` 且 `create_time` 为带 tag 的正数，编码 Reclaimer grace deadline；Get
+  不可见，但 metadata 在宽限期结束前仍保留对物理 allocation 的归属证明；
 - **absent**：metadata 不存在。
 
 滚动升级时，旧版本遗留的无 tag 正 marker 按“创建时间 + `max_write_timeout_seconds`”推导保守截止时间。
@@ -304,8 +307,9 @@ sequenceDiagram
 均一致时才分派数据 I/O；任一 miss 或异常 location 都不会产生部分读取。
 
 V1 `Get` 返回的是 location snapshot，不会在服务端创建 read lease 或 pin allocation。object client 可以保证本次
-Load 返回前 caller buffer 不被后台 I/O 继续访问，但不能阻止另一个 client 同时 Remove/Trim 该 URI。上层必须用
-ownership/release 协议协调；RTP 的约束是 consumer 完成后才 release，且 ViT GC timeout 必须覆盖最慢读取。
+Load 返回前 caller buffer 不被后台 I/O 继续访问，但不能阻止另一个 client 的 Remove/Trim 或自动 Reclaimer 在
+之后退休该 URI。上层必须用 ownership/release 协议协调；`delay_before_delete_ms` 必须覆盖已返回 URI 的最慢数据面
+读取，RTP 仍应在 consumer 完成后显式 release。
 
 ### 6.4 删除与 Trim
 
@@ -314,7 +318,29 @@ ownership/release 协议协调；RTP 的约束是 consumer 完成后才 release�
 - `Trim(TS_REMOVE_ALL_CACHE)` 删除 metadata 和可归属的物理对象；
 - `Trim(TS_REMOVE_ALL_META)` 只删 metadata，物理数据保留，仅用于明确的修复场景；
 - `TS_TIMESTAMP` 在 V1 中不支持；
-- 存在 active 或正在 finalization 的 session 时，Trim 整体返回 `WRITE_IN_PROGRESS`。
+- 存在 active/finalizing session 或 pending automatic reclaim 时，Trim 整体返回 `WRITE_IN_PROGRESS`。
+
+### 6.5 自动 LRU 回收
+
+KVMeta 是 Cache，容量水位达到阈值后由独立 `KvMetaReclaimer` 自动回收，而不是只依赖业务 release。它复用
+Instance Group 的 `reclaim_strategy.trigger_strategy.used_percentage`、`delay_before_delete_ms` 以及现有
+CacheReclaimer 的 sampling/batch/idle 参数，但不把 KVMeta 对象塞进固定 block Reclaimer：
+
+1. 汇总专用 group 的真实 bytes、各 storage type bytes 和 key count；已经进入退休流程的 bytes/key 作为
+   pending credit 扣除，避免 grace 期间重复、过量淘汰；
+2. 在严格有界的 sampling budget 内轮转 instance，以 no-touch 方式取得访问时间和完整 location，再按 group
+   全局 LRU 选择 committed 对象；active、已 retired 或 schema 不合法的对象不会成为候选；
+3. 持有 KVMeta 专用 group shard，以完整旧值 CAS 将 `committed` 改为 `retired` 并 `Sync`。从这一步起新的 `Get`
+   返回 miss，同 key `PutStart` 返回 `WRITE_IN_PROGRESS`；
+4. 把对象放入按 deadline 排序的 pending queue。worker 不会 sleep 等待某个 group 的 grace，因此其他 group
+   可以继续回收；
+5. grace 到期后，再次完成 metadata persistence barrier，精确删除 retired metadata 并 `Sync`，最后只发起一次
+   物理 Delete。物理结果不确定时不重放，交给 backend orphan 回收。
+
+metadata delete 已进入内存但 `Sync` 失败时，Reclaimer 会先封闭该 KVMeta group 的新 `PutStart`，再按 100ms 到
+30s 的指数退避重试；这样不会让新一代对象进入“旧 metadata 已消失、旧物理删除尚未安全完成”的 ABA 窗口。现有
+write session 可以继续 finalization。进程内 pending 上限为 1024 个 batch、20000 个对象和 4TiB，达到上限只暂停
+新的退休，不影响普通 KVCache 主链路。
 
 ## 7. 不同 value size 的实现
 
@@ -379,7 +405,17 @@ metadata reservation 使用完整旧值条件保护。跨进程 `PutStart` 竞�
 
 session timeout 和 `PutFinish` finalization 同样计为 in-flight。Trim 不能与它们同时删除相同 allocation。
 
-### 8.3 固定上限
+### 8.3 Reclaimer 并发与配额语义
+
+Reclaimer 与 `PutStart`、`PutFinish`、`Remove`、`Trim` 共用 KVMeta 专用 group shard，因此重新检查水位、退休
+metadata 和建立 pending marker 之间没有 admission 窗口；普通 KVCache 不获取该锁。候选采样在锁外执行，进入
+锁后会重新读取实际 usage，并用 exact-value CAS 防止淘汰已变化的对象。
+
+退休对象在物理删除前仍计入 MetaIndexer usage；Reclaimer 单独维护 pending credit，只用于判断下一轮还需淘汰多少，
+不会改变 `PutStart` 的硬容量准入。若 metadata finalization 的 Sync 失败且内存记录已经消失，整个专用 group 的新
+allocation 会暂时 fail closed，直至 persistence barrier 成功或 leader recovery 接管。
+
+### 8.4 固定上限
 
 以下是生产默认 `KvMetaManager::Limits`，客户端以相同或更严格的值预校验：
 
@@ -457,11 +493,12 @@ KVMeta recovery 只扫描带完整 KVMeta schema 的保留 namespace，并执行
 
 1. 分批扫描 metadata；
 2. 对未到期 active lease 保持请求门关闭并等待，等待可被降主/Stop 以不超过 100ms 粒度取消；
-3. 对已过期、归属可确认的 active metadata 做条件删除并持久化，再对 allocation 做一次物理清理；
-4. metadata 阶段失败则保持 KVMeta 请求门关闭；物理清理失败只产生脱敏 orphan 告警，不重放不确定 Delete；
-5. 完成一个无 metadata 删除、无 metadata 错误的稳定扫描后，按 committed URI 的真实 `size` 重建 KVMeta
+3. 对未到期 retired metadata 等待其持久化 grace deadline；到期后完成 metadata-first 删除；
+4. 对已过期、归属可确认的 active/retired metadata 做条件删除并持久化，再对 allocation 做一次物理清理；
+5. metadata 阶段失败则保持 KVMeta 请求门关闭；物理清理失败只产生脱敏 orphan 告警，不重放不确定 Delete；
+6. 完成一个无 metadata 删除、无 metadata 错误的稳定扫描后，按 committed URI 的真实 `size` 重建 KVMeta
    byte usage；
-6. 启动 session expiry worker，最后开放 KVMeta 请求门。
+7. 启动 session expiry 和 Reclaimer worker，最后开放 KVMeta 请求门。
 
 一次 recovery 从升主开始最多按 `max_write_timeout_seconds` 等待 active lease；损坏或异常远期的持久化 deadline
 不能无限阻塞 KVMeta 侧路恢复。
@@ -483,6 +520,18 @@ kvcm.kv_meta.enabled=true
 
 KVMeta client 的 `addresses` 使用同一个主 RPC endpoint。除此之外，KVMeta 复用现有 Registry、MetaIndexer、
 Instance Group quota 和 storage backend 配置。部署必须提前创建仅供 KVMeta 使用的 Instance Group。
+
+自动回收不增加新的环境变量，直接使用该专用 Instance Group 的现有配置：
+
+- `reclaim_strategy.reclaim_policy` 必须为 `POLICY_LRU`；其他策略 fail closed，不会按错误语义删除；
+- `trigger_strategy.used_percentage` 必须位于 `[0, 1]`，同时应用于 group bytes、各 type bytes 和 group key count；
+- `delay_before_delete_ms` 是已取得 URI 的读宽限期，必须非负且不大于 `max_write_timeout_seconds * 1000`；
+- sampling size、batch size 和 idle interval 复用普通 CacheReclaimer 的运行参数，但 worker 和 pending 状态独立。
+- `PauseReclaimer` 会同时停止新的 KVMeta retirement；已进入 pending 的对象仍会完成 metadata-first
+  finalization，避免长期停在半回收状态。
+
+可观测指标位于 `kv_meta_reclaimer.*` namespace，包括 round、retired/reclaimed object、reclaimed bytes、retry/error
+counter，以及 pending object/bytes 和 blocked group gauge。
 
 ### 11.2 对象客户端
 
@@ -521,9 +570,10 @@ transfer JSON 必须同时满足：
 ## 12. 物理回收和 V1 运维限制
 
 metadata 删除先 `Sync`，再调用 backend Delete，确保仍可读 metadata 不会指向已经提前释放的 URI。该顺序适用
-committed Remove/Trim，也适用 active rollback、expiry 和 recovery。若 metadata 已经持久化删除、随后物理
-Delete 返回错误或抛异常，该 URI 已成为不可达 orphan：同步 API 返回错误，expiry 记录一次脱敏告警，recovery
-则继续完成稳定扫描和 byte usage 重建。三条路径都不自动重放不确定 Delete，因为现有 backend URI 没有
+committed Remove/Trim、automatic reclaim，也适用 active rollback、expiry 和 recovery。Reclaimer 还会在删除
+metadata 前先把 committed 对象持久化为 retired，并等待配置的 read grace。若 metadata 已经持久化删除、随后物理
+Delete 返回错误或抛异常，该 URI 已成为不可达 orphan：同步 API 返回错误，后台 worker 记录一次脱敏告警，recovery
+则继续完成稳定扫描和 byte usage 重建。所有路径都不自动重放不确定 Delete，因为现有 backend URI 没有
 allocation generation，地址复用后重放旧删除可能破坏后继对象。运维需要依赖 backend 的 orphan 清理策略。
 
 KVMeta 自己的 storage wrapper 会把 Create/Delete provider 的标准异常、未知异常和 Delete 结果数量不匹配转换为
@@ -531,11 +581,12 @@ KVMeta 自己的 storage wrapper 会把 Create/Delete provider 的标准异常�
 的前序候选会做一次补偿删除；抛异常的调用若在 provider 端产生了未返回 URI，仍按 orphan 处理，不猜测重试。
 
 backend 的物理回收能力沿用现有实现。例如当前开源 NFS backend 的 Delete 是幂等 no-op；KVMeta 不为它改变
-共享行为。生产上需要结合显式 release、超时清理、namespace 轮换或 `Trim(TS_REMOVE_ALL_CACHE)` 管理容量。
+共享行为。生产上仍需配置 backend orphan 清理/namespace 轮换，并保留显式 release；自动 LRU 只能保证 metadata
+容量收敛，不能把底层 no-op Delete 变成真实空间释放。
 
-V1 也没有 read lease：管理面 Remove/Trim、业务 release 或配置过短的上层 GC 都可能与已经取得 URI 的 Load
-竞争。部署必须把 release 放在消费完成之后，并把全量 Trim 当作需要先排空 consumer 的维护操作；仅等待 KVCM
-请求计数归零并不能观察客户端已经开始的数据面读取。
+V1 也没有 read lease：管理面 Remove/Trim、业务 release 或配置过短的 Reclaimer grace 都可能与已经取得 URI 的
+Load 竞争。部署必须让 `delay_before_delete_ms` 覆盖最慢读取，把 release 放在消费完成之后，并把全量 Trim 当作
+需要先排空 consumer 的维护操作；仅等待 KVCM 请求计数归零并不能观察客户端已经开始的数据面读取。
 
 V1 在 metadata 删除时同步扣减 usage。若后续物理 Delete 失败，orphan 已不可寻址，也不再计入 KVMeta quota，
 因此 metadata usage 仍然准确，但可能低于 backend 实际占用。没有 generation token 时保留 URI 并自动重放同样
@@ -765,7 +816,10 @@ group 内所有 instance；恢复时再用 durable record 校准。cleanup 执�
 
 - Manager/Service UT：注册隔离、exact-key、不同 size、容量、session、Remove/Trim、HA recovery、生命周期，
   以及 rollback、Remove、Trim、expiry、recovery 中物理 Delete 返回错误/短结果/标准或未知异常时的一次性删除、
-  metadata/usage 收敛、worker 存活和恢复继续放流；
+  metadata/usage 收敛、worker 存活和恢复继续放流；独立 Reclaimer 还覆盖 group/type bytes、key-count
+  和零水位、group LRU、active 排除、跨 instance 小样本轮转、pending credit 防过淘汰、跨 group grace
+  隔离、Pause、非 LRU fail-closed、metadata Sync 重试/admission fail-closed、物理删除不重放，以及降主后
+  retired recovery；
 - Client/SDK UT：响应对齐、URI/size/buffer 校验、CPU build 对 GPU buffer 的 fail-closed、failover、超时 drain、
   普通 TransferClient 回归；
 - 内部 TairMempool UT：variable-size policy、严格 URI、禁 fallback、禁 gather/scatter；

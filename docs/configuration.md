@@ -172,14 +172,16 @@ kvcm.event.event_publishers_configs
 
 ### KVMeta 通用对象服务
 
-`kvcm.kv_meta.enabled` 默认是 `false`。此时不会创建 KVMeta manager、写会话线程或 service adapter，主 gRPC
+`kvcm.kv_meta.enabled` 默认是 `false`。此时不会创建 KVMeta manager、写会话/Reclaimer 线程或 service adapter，主 gRPC
 ServerBuilder 的注册集合也保持不变。设为 `true` 后，KVMeta 与固定 block MetaService 共用
 `kvcm.service.rpc_port`，依靠不同的 protobuf service 全名路由，不创建第二个 listener。升主时主服务先完成原有
 恢复并放流，KVMeta 再在可取消的独立线程中恢复，恢复完成前仅 KVMeta 请求返回 not-leader/not-ready。
 
 KVMeta instance 必须注册到专用 Instance Group，不能与普通 KVCache instance 共组。该约束隔离容量统计；
-普通 CacheReclaimer、Migration 和 Cache GC 也不会扫描 KVMeta instance。当前 KVMeta V1 不自动逐出对象，
-容量到限后新写入失败，调用方应使用 `Remove` 或 `TrimAll` 管理生命周期。完整协议、动态长度和 RTP 接入方式见
+普通 CacheReclaimer、Migration 和 Cache GC 也不会扫描 KVMeta instance。KVMeta 使用独立 worker 按专用 group
+现有的 LRU `reclaim_strategy` 自动逐出，并复用 sampling/batch/idle 参数；不占用普通 Reclaimer 的 pending 状态或
+删除 executor。业务仍应在消费结束后用 `Remove` 主动 release，`TrimAll` 用于全量维护。完整协议、动态长度、
+retired/grace/metadata-first 回收语义和 RTP 接入方式见
 [KVMeta 通用对象存储设计](design/kv_meta_object_storage.md)。
 
 ### SchedulePlanExecutor 线程与迁移预算
