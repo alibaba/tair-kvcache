@@ -208,6 +208,8 @@ private:
     struct WriteRoute {
         MetaStorageBackend &primary;
         MetaStorageBackend *secondary;
+        // When true, the local primary result is authoritative; the persistent
+        // secondary is a best-effort backup whose result does not fail the operation.
         bool local_primary;
     };
     WriteRoute GetWriteRoute(bool local_primary) noexcept {

@@ -789,7 +789,7 @@ bool MetaAsyncRedisBackend::Sync(const KeyTypeVec &keys) noexcept {
     for (int qi : touched_queues) {
         SyncBarrierItem item;
         item.barrier_ctx = barrier_ctx;
-        queues_[qi]->Push(QueueItem{std::move(item)});
+        queues_[qi]->PushBarrier(std::move(item));
     }
 
     return barrier_ctx->Wait(std::chrono::milliseconds{sync_timeout_ms_});

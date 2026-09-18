@@ -79,10 +79,13 @@ public:
     MpscWriteQueue(const MpscWriteQueue &) = delete;
     MpscWriteQueue &operator=(const MpscWriteQueue &) = delete;
 
-    void Push(QueueItem item);
+    // Barriers are zero-cost control messages and bypass write-capacity admission.
+    void PushBarrier(SyncBarrierItem item);
     // Reserve bounded key capacity before the caller copies the payload.
     bool TryReserve(int64_t key_count, int64_t capacity) noexcept;
     bool WaitAndReserve(int64_t key_count, int64_t capacity, int64_t timeout_us);
+    // The caller must have reserved exactly key_count capacity units. Metadata
+    // WriteOps have no ordinary keys but deliberately consume one unit.
     void PushReserved(QueueItem item, int64_t key_count);
     std::vector<QueueItem> PopBatch(int64_t max_batch_size, int64_t &out_taken_keys);
     std::vector<QueueItem> PopBatchWait(int64_t max_batch_size, int64_t wait_timeout_us, int64_t &out_taken_keys);
