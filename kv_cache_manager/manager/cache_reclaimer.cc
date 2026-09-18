@@ -1056,15 +1056,19 @@ bool CacheReclaimer::ReclaimByLRUImpl(const std::shared_ptr<RequestContext> &req
     BytesByStorageType bytes_by_type{};
     CountsByStorageType location_counts_by_type{};
     std::uint64_t predicted_deleted_keys = 0;
-    if (!FilterLocID(request_context.get(),
-                     instance_info,
-                     request.block_keys,
-                     water_level_exceed,
-                     request.location_ids,
-                     bytes_by_type,
-                     location_counts_by_type,
-                     predicted_deleted_keys,
-                     create_age_stats)) {
+    const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
+    const bool maintenance_read = indexer && indexer->PreferSingleTaskReclaimSampling();
+    if (!FilterLocIDImpl(request_context.get(),
+                         instance_info,
+                         request.block_keys,
+                         water_level_exceed,
+                         request.location_ids,
+                         bytes_by_type,
+                         location_counts_by_type,
+                         predicted_deleted_keys,
+                         create_age_stats,
+                         false,
+                         maintenance_read)) {
         LOG_WITH_ID(DEBUG, "filter location ID failed");
         return false;
     }

@@ -304,8 +304,6 @@ private:
     }
 
     size_t CollectOldestKeysFromShard(uint32_t shard_id, size_t count, std::vector<KeyType> &out_keys);
-    size_t
-    CollectNextReclaimCandidatesFromShard(uint32_t shard_id, size_t count, ReclaimCandidateVector &out_candidates);
     ErrorCode
     CreateAndInsert(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode
@@ -355,7 +353,6 @@ private:
     std::unique_ptr<std::atomic<int64_t>[]> shard_oldest_access_time_;
     uint32_t shard_mask_ = 0;
     size_t sample_times_ = 0;
-    std::atomic<size_t> reclaim_sample_shard_cursor_{0};
     std::shared_ptr<RevisitIntervalHistogram> revisit_histogram_;
 };
 
