@@ -159,11 +159,10 @@ private:
         EventReportMetadataDelRequest event_report_request;
         std::map<std::string, size_t> executor_reason_counts;
         std::map<std::string, size_t> event_report_reason_counts;
-        MaintenanceScanBatch deferred_batch;
     };
 
     void RunOneTick() noexcept;
-    ErrorCode GetNextMaintenanceBatch(MetaIndexer &indexer, InstanceScanEntry &entry, MaintenanceScanBatch &out);
+    ErrorCode PrepareMaintenanceActions(MetaIndexer &indexer, InstanceScanEntry &entry, ScanDeleteActions &out);
     EventReportBackendRoute LookupEventReportBackend(const std::string &instance_id,
                                                       DataStorageType storage_type) const;
     void PollInflightDeletes() noexcept;
@@ -175,8 +174,8 @@ private:
     BuildSubmittedLocationSummary(const std::map<std::string, size_t> &reason_counts);
     void LogInstanceScanSummary(const InstanceScanEntry &entry) const;
     void AdvanceInstance(bool completed_current) noexcept;
-    ScanDeleteActions
-    BuildDeleteActions(const std::string &instance_id, const MaintenanceScanBatch &batch, int64_t now_us);
+    // Build this tick's requests, leaving only over-budget snapshots in batch.
+    ScanDeleteActions BuildDeleteActions(const std::string &instance_id, MaintenanceScanBatch &batch, int64_t now_us);
     bool
     IsOrphanWriting(const std::string &map_location_id, const CacheLocation &location, int64_t now_us) const noexcept;
     void ResetWorkerState() noexcept;

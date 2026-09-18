@@ -1149,7 +1149,7 @@ TEST_F(CacheGarbageCollectorTest, FixedPredicateIsFailClosedAndRequestIsBounded)
     CacheLocationMap duplicate_locations;
     duplicate_locations["old"] = MakeLocation("old", CLS_WRITING, now_us - grace_us - 1);
 
-    const auto batch = MakeBatch(
+    auto batch = MakeBatch(
         SCAN_BASE_CURSOR, {10, 20, 30, 10}, {first_locations, second_locations, third_locations, duplicate_locations});
     const CacheLocationDelRequest request = gc->BuildDeleteActions("instance_a", batch, now_us).executor_request;
     ASSERT_EQ(2, request.block_keys.size());
@@ -1160,6 +1160,11 @@ TEST_F(CacheGarbageCollectorTest, FixedPredicateIsFailClosedAndRequestIsBounded)
               request.expected_location_values);
     EXPECT_TRUE(request.authoritative_read);
     EXPECT_EQ(3, gc->get_cache_gc_candidate_count_metrics());
+    EXPECT_EQ(SCAN_BASE_CURSOR, batch.next_cursor);
+    EXPECT_EQ((KeyVector{30}), batch.keys);
+    ASSERT_EQ(1u, batch.locations.size());
+    EXPECT_EQ(third_locations, batch.locations.front());
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), batch.location_results);
 
     MaintenanceScanBatch broken_batch = batch;
     broken_batch.location_results.pop_back();
@@ -1203,7 +1208,7 @@ TEST_F(CacheGarbageCollectorTest, ServingMissingSpecIsBatchedAndSubmittedWithExa
     second_locations["second_missing"] =
         MakeStoredLocation("second_missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_b_uri});
 
-    const auto batch = MakeBatch(SCAN_BASE_CURSOR, {10, 20}, {first_locations, second_locations});
+    auto batch = MakeBatch(SCAN_BASE_CURSOR, {10, 20}, {first_locations, second_locations});
     const auto actions = gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs());
     const CacheLocationDelRequest &request = actions.executor_request;
 
@@ -1217,6 +1222,10 @@ TEST_F(CacheGarbageCollectorTest, ServingMissingSpecIsBatchedAndSubmittedWithExa
     EXPECT_EQ((std::set<std::string>{missing_a_uri, missing_b_uri}), request.confirmed_missing_uris);
     EXPECT_EQ(1u, actions.executor_reason_counts.at("orphan_writing"));
     EXPECT_EQ(2u, actions.executor_reason_counts.at("storage_missing"));
+    EXPECT_EQ(SCAN_BASE_CURSOR, batch.next_cursor);
+    EXPECT_TRUE(batch.keys.empty());
+    EXPECT_TRUE(batch.locations.empty());
+    EXPECT_TRUE(batch.location_results.empty());
 
     ASSERT_EQ(2, might_exist_calls.size());
     const auto storage_a_call =
@@ -1260,10 +1269,9 @@ TEST_F(CacheGarbageCollectorTest, ServingProbeErrorsAreUnknownButOtherDefinitive
                            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
                            {"dummy://shape_storage/unknown?size=1", "dummy://missing_storage/missing?size=1"});
 
-    const CacheLocationDelRequest request = gc->BuildDeleteActions("instance_a",
-                                                                   MakeBatch(SCAN_BASE_CURSOR, {10}, {locations}),
-                                                                   TimestampUtil::GetCurrentTimeUs())
-                                                .executor_request;
+    auto batch = MakeBatch(SCAN_BASE_CURSOR, {10}, {locations});
+    const CacheLocationDelRequest request =
+        gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs()).executor_request;
 
     EXPECT_EQ((KeyVector{10}), request.block_keys);
     EXPECT_EQ((std::vector<std::vector<std::string>>{{"missing_and_unknown"}}), request.location_ids);
@@ -1293,10 +1301,9 @@ TEST_F(CacheGarbageCollectorTest, ServingProbeBatchesBoundEachMightExistCall) {
     CacheLocationMap locations;
     locations["serving"] = MakeStoredLocation("serving", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, uris);
 
-    const CacheLocationDelRequest request = gc->BuildDeleteActions("instance_a",
-                                                                   MakeBatch(SCAN_BASE_CURSOR, {10}, {locations}),
-                                                                   TimestampUtil::GetCurrentTimeUs())
-                                                .executor_request;
+    auto batch = MakeBatch(SCAN_BASE_CURSOR, {10}, {locations});
+    const CacheLocationDelRequest request =
+        gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs()).executor_request;
 
     EXPECT_TRUE(request.block_keys.empty());
     ASSERT_EQ(2, might_exist_calls.size());
@@ -1362,10 +1369,9 @@ TEST_F(CacheGarbageCollectorTest, MissingOrMismatchedStorageIsUnknownAndClassifi
     locations["definitive_missing"] =
         MakeStoredLocation("definitive_missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_uri});
 
-    const CacheLocationDelRequest request = gc->BuildDeleteActions("instance_a",
-                                                                   MakeBatch(SCAN_BASE_CURSOR, {10}, {locations}),
-                                                                   TimestampUtil::GetCurrentTimeUs())
-                                                .executor_request;
+    auto batch = MakeBatch(SCAN_BASE_CURSOR, {10}, {locations});
+    const CacheLocationDelRequest request =
+        gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs()).executor_request;
 
     EXPECT_EQ((KeyVector{10}), request.block_keys);
     EXPECT_EQ((std::vector<std::vector<std::string>>{{"definitive_missing"}}), request.location_ids);
@@ -1404,12 +1410,12 @@ TEST_F(CacheGarbageCollectorTest, ActiveMigrationCopyTargetIsNotCollected) {
     orphan_locations["migration_target"] =
         MakeLocation("migration_target", CLS_WRITING, now_us - config.orphan_writing_grace_period_ms * 1000 - 1);
 
-    const auto batch = MakeBatch(SCAN_BASE_CURSOR, {10, 20}, {migration_locations, orphan_locations});
+    auto batch = MakeBatch(SCAN_BASE_CURSOR, {10, 20}, {migration_locations, orphan_locations});
     const CacheLocationDelRequest same_instance_request =
         gc->BuildDeleteActions("instance_a", batch, now_us).executor_request;
+    batch = MakeBatch(SCAN_BASE_CURSOR, {10}, {migration_locations});
     const CacheLocationDelRequest other_instance_request =
-        gc->BuildDeleteActions("instance_b", MakeBatch(SCAN_BASE_CURSOR, {10}, {migration_locations}), now_us)
-            .executor_request;
+        gc->BuildDeleteActions("instance_b", batch, now_us).executor_request;
 
     EXPECT_EQ((KeyVector{20}), same_instance_request.block_keys);
     EXPECT_EQ((std::vector<std::vector<std::string>>{{"migration_target"}}), same_instance_request.location_ids);
@@ -1422,8 +1428,7 @@ TEST_F(CacheGarbageCollectorTest, MissingScannedKeyIsNotCountedAsOperationError)
     auto gc = MakeGc(DefaultConfig());
     PrepareForSingleStep(*gc);
 
-    const auto batch =
-        MakeBatch(SCAN_BASE_CURSOR, {1, 2}, {CacheLocationMap{}, CacheLocationMap{}}, {EC_NOENT, EC_ERROR});
+    auto batch = MakeBatch(SCAN_BASE_CURSOR, {1, 2}, {CacheLocationMap{}, CacheLocationMap{}}, {EC_NOENT, EC_ERROR});
     EXPECT_TRUE(gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs())
                     .executor_request.block_keys.empty());
 
@@ -1793,16 +1798,19 @@ TEST_F(CacheGarbageCollectorTest, PendingTargetDeduplicatesBeforeCasAndKeepsInst
     EXPECT_EQ(1, submitted_requests.size());
     EXPECT_EQ(1, gc->inflight_deletes_.size());
 
-    EXPECT_TRUE(gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs())
+    auto candidate_batch = batch;
+    EXPECT_TRUE(gc->BuildDeleteActions("instance_a", candidate_batch, TimestampUtil::GetCurrentTimeUs())
                     .executor_request.block_keys.empty());
-    EXPECT_FALSE(gc->BuildDeleteActions("instance_b", batch, TimestampUtil::GetCurrentTimeUs())
+    candidate_batch = batch;
+    EXPECT_FALSE(gc->BuildDeleteActions("instance_b", candidate_batch, TimestampUtil::GetCurrentTimeUs())
                      .executor_request.block_keys.empty());
 
     pending_delete_promises.front()->set_value({EC_OK, ""});
     gc->PollInflightDeletes();
     EXPECT_TRUE(gc->inflight_deletes_.empty());
     EXPECT_TRUE(gc->pending_locations_.empty());
-    EXPECT_FALSE(gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs())
+    candidate_batch = batch;
+    EXPECT_FALSE(gc->BuildDeleteActions("instance_a", candidate_batch, TimestampUtil::GetCurrentTimeUs())
                      .executor_request.block_keys.empty());
 }
 

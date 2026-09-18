@@ -344,10 +344,10 @@ void CacheGarbageCollector::ResetWorkerState() noexcept {
     METRICS_(cache_gc, round_duration_ms) = 0;
 }
 
-ErrorCode CacheGarbageCollector::GetNextMaintenanceBatch(MetaIndexer &indexer,
-                                                       InstanceScanEntry &entry,
-                                                       MaintenanceScanBatch &out) {
-    out.Clear();
+ErrorCode CacheGarbageCollector::PrepareMaintenanceActions(MetaIndexer &indexer,
+                                                           InstanceScanEntry &entry,
+                                                           ScanDeleteActions &out) {
+    out = {};
     auto &buffer = entry.buffered_scan;
     if (buffer.keys.empty()) {
         const ErrorCode ec = indexer.ScanLocationsForMaintenance(
@@ -366,10 +366,12 @@ ErrorCode CacheGarbageCollector::GetNextMaintenanceBatch(MetaIndexer &indexer,
         METRICS_(cache_gc, scan_key_count) += buffer.keys.size();
     }
 
-    // Let BuildDeleteActions see the complete batch before applying budgets,
-    // otherwise scan order can hide higher-priority garbage behind a slice.
-    out = std::move(buffer);
-    buffer = {};
+    entry.scan_failure_count = 0;
+    entry.cursor = buffer.next_cursor;
+    if (!stop_requested_.load(std::memory_order_acquire)) {
+        // Apply priorities before budgets; keep leftovers in the same buffer.
+        out = BuildDeleteActions(entry.instance_id, buffer, TimestampUtil::GetCurrentTimeUs());
+    }
     return EC_OK;
 }
 
@@ -419,9 +421,9 @@ void CacheGarbageCollector::RunOneTick() noexcept {
             return;
         }
 
-        MaintenanceScanBatch batch;
+        ScanDeleteActions actions;
         const std::string scan_cursor = entry.cursor;
-        ErrorCode ec = GetNextMaintenanceBatch(*indexer, entry, batch);
+        ErrorCode ec = PrepareMaintenanceActions(*indexer, entry, actions);
         if (ec != EC_OK) {
             RecordOperationError("scan");
             ++entry.scan_failure_count;
@@ -446,13 +448,6 @@ void CacheGarbageCollector::RunOneTick() noexcept {
             return;
         }
 
-        entry.scan_failure_count = 0;
-        entry.cursor = batch.next_cursor;
-        if (stop_requested_.load(std::memory_order_acquire)) {
-            return;
-        }
-        ScanDeleteActions actions = BuildDeleteActions(entry.instance_id, batch, TimestampUtil::GetCurrentTimeUs());
-        entry.buffered_scan = std::move(actions.deferred_batch);
         const std::string instance_id = entry.instance_id;
         const bool scan_completed = entry.cursor == SCAN_BASE_CURSOR && entry.buffered_scan.keys.empty();
 
@@ -836,7 +831,7 @@ void CacheGarbageCollector::AdvanceInstance(bool completed_current) noexcept {
 }
 
 CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActions(const std::string &instance_id,
-                                                                                   const MaintenanceScanBatch &batch,
+                                                                                   MaintenanceScanBatch &batch,
                                                                                    const int64_t now_us) {
     ScanDeleteActions actions;
     actions.executor_request.instance_id = instance_id;
@@ -1186,13 +1181,15 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
         }
         ++selected;
     }
-    // Retain raw snapshots, not cleanup decisions: probe deferred candidates
-    // again on the next tick, and keep the real backend cursor until drained.
-    actions.deferred_batch.next_cursor = batch.next_cursor;
+    // Reuse the input buffer for leftovers without changing its backend cursor.
+    // Keep snapshots, not cleanup decisions: probe them again next tick.
+    batch.keys.clear();
+    batch.locations.clear();
+    batch.location_results.clear();
     for (auto &[block_key, locations] : deferred_locations) {
-        actions.deferred_batch.keys.push_back(block_key);
-        actions.deferred_batch.locations.emplace_back(std::move(locations));
-        actions.deferred_batch.location_results.push_back(EC_OK);
+        batch.keys.push_back(block_key);
+        batch.locations.emplace_back(std::move(locations));
+        batch.location_results.push_back(EC_OK);
     }
     actions.executor_request.block_keys.reserve(executor_targets.size());
     actions.executor_request.location_ids.reserve(executor_targets.size());
