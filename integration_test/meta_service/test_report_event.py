@@ -1027,8 +1027,9 @@ class EventReportFunctionalTest(unittest.TestCase):
         }
         self.assertNotIn("p2p_1_hit_count", resp)
         for host_match in resp.get("hosts", []):
-            self.assertIn("p2p_1_fetch", host_match)
-            self.assertIn("p2p_1_total_match", host_match)
+            self.assertNotIn("p2p_1_fetch", host_match)
+            self.assertNotIn("p2p_1_total_match", host_match)
+            self.assertEqual(int(host_match["local"]), int(host_match["global"]))
         for host, prefix in expected.items():
             self.assertIn(host, actual, f"host {host} not found in response")
             self.assertEqual(actual[host], prefix, f"host {host}: expected prefix={prefix}, got {actual[host]}")

@@ -271,6 +271,54 @@ bool MatchesRequestedSpec(const CacheLocation &loc, std::string_view requested_s
     return requested_spec_name.empty() || FindRequestedSpec(loc, requested_spec_name) != nullptr;
 }
 
+CacheLocationConstPtr SelectBackendLocation(const CacheLocationMap &vmap,
+                                            DataStorageType target_type,
+                                            std::string_view requested_spec_name,
+                                            SelectLocationPolicy *policy) {
+    CacheLocationMap filtered;
+    for (const auto &[id, loc] : vmap) {
+        if (loc->type() == target_type && MatchesRequestedSpec(*loc, requested_spec_name)) {
+            filtered.try_emplace(id, loc);
+        }
+    }
+    if (filtered.empty()) {
+        return nullptr;
+    }
+
+    std::vector<std::string> unused_prune_ids;
+    auto winner = policy->SelectForMatch(filtered, nullptr, unused_prune_ids);
+    if (!winner || winner->id().empty() || winner->location_specs().empty()) {
+        return nullptr;
+    }
+
+    // Merge specs from same data storage (same logic as SelectAndMergeForMatch)
+    std::map<std::string, LocationSpec> merged_specs;
+    for (const auto &[id, loc] : filtered) {
+        if (!policy->IsSameDataStorage(*loc, *winner)) {
+            continue;
+        }
+        for (const auto &spec : loc->location_specs()) {
+            merged_specs.try_emplace(spec.name(), spec);
+        }
+    }
+    if (merged_specs.empty()) {
+        return nullptr;
+    }
+
+    auto merged = std::make_shared<CacheLocation>();
+    merged->set_id(winner->id() + "_merged");
+    merged->set_status(CacheLocationStatus::CLS_SERVING);
+    merged->set_type(winner->type());
+    std::vector<LocationSpec> specs;
+    specs.reserve(merged_specs.size());
+    for (auto &[name, spec] : merged_specs) {
+        specs.push_back(std::move(spec));
+    }
+    merged->set_spec_size(specs.size());
+    merged->set_location_specs(std::move(specs));
+    return merged;
+}
+
 std::string ExtractPeerAddrFromLocation(const CacheLocation &loc, std::string_view requested_spec_name) {
     const auto *spec = FindRequestedSpec(loc, requested_spec_name);
     if (spec == nullptr) {
@@ -287,41 +335,6 @@ struct V6DPeerSelection {
     std::string peer_addr;
     std::vector<size_t> covered_indices;
 };
-
-V6DPeerSelection SelectV6DByPrefix(const std::vector<size_t> &candidate_indices,
-                                   const std::unordered_map<size_t, std::vector<std::string>> &remote_peer_candidates) {
-    if (candidate_indices.empty()) {
-        return {};
-    }
-    size_t first_idx = candidate_indices[0];
-    auto it = remote_peer_candidates.find(first_idx);
-    if (it == remote_peer_candidates.end()) {
-        return {};
-    }
-
-    V6DPeerSelection best;
-    for (const auto &addr : it->second) {
-        std::vector<size_t> prefix_covered;
-        for (size_t ci : candidate_indices) {
-            auto ci_it = remote_peer_candidates.find(ci);
-            if (ci_it == remote_peer_candidates.end()) {
-                break;
-            }
-            const auto &addrs = ci_it->second;
-            if (std::find(addrs.begin(), addrs.end(), addr) == addrs.end()) {
-                break;
-            }
-            prefix_covered.push_back(ci);
-        }
-        if (prefix_covered.size() > best.covered_indices.size() ||
-            (prefix_covered.size() == best.covered_indices.size() &&
-             (best.peer_addr.empty() || addr < best.peer_addr))) {
-            best.peer_addr = addr;
-            best.covered_indices = std::move(prefix_covered);
-        }
-    }
-    return best;
-}
 
 V6DPeerSelection
 SelectV6DByCoverage(const std::vector<size_t> &candidate_indices,
@@ -556,6 +569,12 @@ void VisitHostSpecsForOneKey(const LocationRange &locations,
             continue;
         }
 
+        if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
+            loc->type() == DataStorageType::DATA_STORAGE_TYPE_NFS ||
+            loc->type() == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD) {
+            continue;
+        }
+
         MetaSearcher::HostCacheLocationInfo location_info;
         if (request_check_location) {
             if (!(*request_check_location)(*loc, location_info)) {
@@ -676,11 +695,10 @@ void BuildCandidatePresenceForOneKey(const LocationRange &locations,
 }
 
 using HostToSpecNames = std::map<std::string, std::set<std::string>>;
-using KeyToHostSpecNames = std::vector<HostToSpecNames>; // key -> host -> spec names
 
 std::vector<size_t> SelectTopHostIndicesByLocal(const std::vector<MetaSearcher::HostCacheMatch> &host_matches,
-                                                size_t p2p_host_count) {
-    if (p2p_host_count == 0) {
+                                                size_t global_kvs_host_count) {
+    if (global_kvs_host_count == 0) {
         return {};
     }
     std::vector<size_t> host_indices;
@@ -690,7 +708,7 @@ std::vector<size_t> SelectTopHostIndicesByLocal(const std::vector<MetaSearcher::
             host_indices.push_back(i);
         }
     }
-    const size_t selected_count = std::min(p2p_host_count, host_indices.size());
+    const size_t selected_count = std::min(global_kvs_host_count, host_indices.size());
     std::partial_sort(host_indices.begin(),
                       host_indices.begin() + selected_count,
                       host_indices.end(),
@@ -710,193 +728,26 @@ void BuildHostSpecNamesForOneKey(const LocationRange &locations,
                                  const MetaSearcher::CheckHostCacheLocationFunc *request_check_location,
                                  const MediumViewSet &medium_set,
                                  HostToSpecNames &host_specs,
-                                 HostToSpecNames &vineyard_host_specs) {
+                                 HostToSpecNames &vineyard_host_specs,
+                                 HostToSpecNames *local_peers = nullptr) {
     VisitHostSpecsForOneKey(
         locations,
         check_loc_data_exist,
         request_check_location,
         medium_set,
         true,
-        [&host_specs, &vineyard_host_specs](std::string_view host,
-                                           std::string_view spec_name,
-                                           bool is_vineyard,
-                                           std::string_view physical_reporter) {
+        [&host_specs, &vineyard_host_specs, local_peers](
+            std::string_view host, std::string_view spec_name, bool is_vineyard, std::string_view physical_reporter) {
             auto &local_names = host_specs[std::string(host)];
             local_names.emplace(spec_name);
-            if (is_vineyard) {
+            if (is_vineyard && local_peers) {
                 // Keep one P2P candidate per physical EventReport reporter.
                 // A shared L2 reporter may project onto several logical ranks,
                 // but must not become several Vineyard peers.
                 vineyard_host_specs[std::string(physical_reporter)].emplace(spec_name);
+                (*local_peers)[std::string(host)].emplace(physical_reporter);
             }
         });
-}
-
-bool HasAllLocationSpecGroups(const std::set<std::string> &spec_names,
-                              const std::vector<const LocationSpecGroup *> &groups);
-
-V6DPeerSelection SelectP2PByPrefix(const std::string &target_host,
-                                   const KeyToHostSpecNames &local_specs,
-                                   const KeyToHostSpecNames &vineyard_specs,
-                                   const std::vector<const LocationSpecGroup *> &required_groups = {}) {
-    assert(local_specs.size() == vineyard_specs.size());
-    std::vector<size_t> candidate_indices;
-    std::unordered_map<size_t, std::vector<std::string>> remote_peer_candidates;
-    for (size_t i = 0; i < local_specs.size(); ++i) {
-        auto local_it = local_specs[i].find(target_host);
-        const bool has_local_block = local_it != local_specs[i].end();
-        const bool local_hit = required_groups.empty()
-                                   ? has_local_block
-                                   : has_local_block && HasAllLocationSpecGroups(local_it->second, required_groups);
-        if (local_hit) {
-            continue;
-        }
-
-        std::vector<std::string> candidates;
-        for (const auto &[peer, specs] : vineyard_specs[i]) {
-            if (peer == target_host || specs.empty()) {
-                continue;
-            }
-            if (!required_groups.empty()) {
-                std::set<std::string> merged_specs = specs;
-                if (has_local_block) {
-                    merged_specs.insert(local_it->second.begin(), local_it->second.end());
-                }
-                if (!HasAllLocationSpecGroups(merged_specs, required_groups)) {
-                    continue;
-                }
-            }
-            candidates.push_back(peer);
-        }
-        if (candidates.empty()) {
-            break;
-        }
-        candidate_indices.push_back(i);
-        remote_peer_candidates.emplace(i, std::move(candidates));
-    }
-    return SelectV6DByPrefix(candidate_indices, remote_peer_candidates);
-}
-
-bool HasLocationSpecGroup(const std::set<std::string> &local_specs,
-                          const std::set<std::string> &peer_specs,
-                          const LocationSpecGroup &group) {
-    return std::all_of(group.spec_names().begin(), group.spec_names().end(), [&](const std::string &spec_name) {
-        return local_specs.find(spec_name) != local_specs.end() || peer_specs.find(spec_name) != peer_specs.end();
-    });
-}
-
-V6DPeerSelection SelectP2PGroupByPrefix(const std::string &target_host,
-                                        const KeyToHostSpecNames &local_specs,
-                                        const KeyToHostSpecNames &vineyard_specs,
-                                        const LocationSpecGroup &required_group) {
-    assert(local_specs.size() == vineyard_specs.size());
-    const std::vector<const LocationSpecGroup *> required_groups{&required_group};
-    std::vector<size_t> candidate_indices;
-    std::unordered_map<size_t, std::vector<std::string>> remote_peer_candidates;
-    const std::set<std::string> empty_specs;
-    for (size_t i = 0; i < local_specs.size(); ++i) {
-        const auto local_it = local_specs[i].find(target_host);
-        const auto &target_specs = local_it == local_specs[i].end() ? empty_specs : local_it->second;
-        if (HasAllLocationSpecGroups(target_specs, required_groups)) {
-            continue;
-        }
-
-        std::vector<std::string> candidates;
-        for (const auto &[peer, peer_specs] : vineyard_specs[i]) {
-            if (peer == target_host) {
-                continue;
-            }
-            if (HasLocationSpecGroup(target_specs, peer_specs, required_group)) {
-                candidates.push_back(peer);
-            }
-        }
-        if (candidates.empty()) {
-            break;
-        }
-        candidate_indices.push_back(i);
-        remote_peer_candidates.emplace(i, std::move(candidates));
-    }
-    return SelectV6DByPrefix(candidate_indices, remote_peer_candidates);
-}
-
-struct GroupAwareP2PSelection {
-    V6DPeerSelection selection;
-    std::vector<size_t> query_block_indices;
-    std::vector<const LocationSpecGroup *> query_groups;
-};
-
-GroupAwareP2PSelection SelectP2PGroupsByCoverage(const std::string &target_host,
-                                                 const KeyToHostSpecNames &local_specs,
-                                                 const KeyToHostSpecNames &vineyard_specs,
-                                                 size_t block_count,
-                                                 const std::vector<const LocationSpecGroup *> &required_groups) {
-    assert(local_specs.size() == vineyard_specs.size());
-    std::vector<size_t> candidate_indices;
-    std::unordered_map<size_t, std::vector<std::string>> remote_peer_candidates;
-    std::vector<size_t> query_block_indices;
-    std::vector<const LocationSpecGroup *> query_groups;
-    const std::set<std::string> empty_specs;
-    for (const auto *group : required_groups) {
-        const std::vector<const LocationSpecGroup *> one_group{group};
-        for (size_t block_index = 0; block_index < block_count; ++block_index) {
-            const auto local_it = local_specs[block_index].find(target_host);
-            const auto &target_specs = local_it == local_specs[block_index].end() ? empty_specs : local_it->second;
-            if (HasAllLocationSpecGroups(target_specs, one_group)) {
-                continue;
-            }
-
-            std::vector<std::string> candidates;
-            for (const auto &[peer, peer_specs] : vineyard_specs[block_index]) {
-                if (peer == target_host) {
-                    continue;
-                }
-                if (HasLocationSpecGroup(target_specs, peer_specs, *group)) {
-                    candidates.push_back(peer);
-                }
-            }
-            if (candidates.empty()) {
-                continue;
-            }
-            const size_t query_index = query_block_indices.size();
-            query_block_indices.push_back(block_index);
-            query_groups.push_back(group);
-            candidate_indices.push_back(query_index);
-            remote_peer_candidates.emplace(query_index, std::move(candidates));
-        }
-    }
-    return GroupAwareP2PSelection{SelectV6DByCoverage(candidate_indices, remote_peer_candidates),
-                                  std::move(query_block_indices),
-                                  std::move(query_groups)};
-}
-
-void MergeLocationSpecGroup(std::set<std::string> &target_specs,
-                            const std::set<std::string> &source_specs,
-                            const LocationSpecGroup &group) {
-    for (const auto &spec_name : group.spec_names()) {
-        if (source_specs.find(spec_name) != source_specs.end()) {
-            target_specs.insert(spec_name);
-        }
-    }
-}
-
-std::vector<std::set<std::string>> MergeHostAndP2PSpecs(const std::string &target_host,
-                                                        const KeyToHostSpecNames &local_specs,
-                                                        const KeyToHostSpecNames &vineyard_specs,
-                                                        const V6DPeerSelection &selection) {
-    assert(local_specs.size() == vineyard_specs.size());
-    std::vector<std::set<std::string>> merged_specs(local_specs.size());
-    for (size_t i = 0; i < local_specs.size(); ++i) {
-        if (auto local_it = local_specs[i].find(target_host); local_it != local_specs[i].end()) {
-            merged_specs[i] = local_it->second;
-        }
-    }
-    for (size_t i : selection.covered_indices) {
-        auto peer_it = vineyard_specs[i].find(selection.peer_addr);
-        if (peer_it != vineyard_specs[i].end()) {
-            merged_specs[i].insert(peer_it->second.begin(), peer_it->second.end());
-        }
-    }
-    return merged_specs;
 }
 
 int64_t ComputePrefixMatchBlocks(const std::vector<std::set<std::string>> &specs_by_key, bool use_eagle_pop) {
@@ -997,14 +848,301 @@ int64_t ComputeMambaPrefixMatchBlocks(const std::vector<std::set<std::string>> &
     return 0;
 }
 
-ErrorCode PrefixMatchByHostWithoutP2P(MetaIndexer *meta_indexer,
-                                      const CheckLocDataExistFunc &check_loc_data_exist,
+struct HostCacheProjection {
+    HostToSpecNames hosts;
+    HostToSpecNames peers;
+    HostToSpecNames local_peers;
+};
+
+using SpecsByKey = std::vector<std::set<std::string>>;
+
+SpecsByKey CollectHostSpecs(const std::string &host, const std::vector<HostCacheProjection> &projection) {
+    SpecsByKey specs(projection.size());
+    for (size_t i = 0; i < projection.size(); ++i) {
+        const auto it = projection[i].hosts.find(host);
+        if (it != projection[i].hosts.end()) {
+            specs[i] = it->second;
+        }
+    }
+    return specs;
+}
+
+SpecsByKey SelectBaseSpecs(const LocationsPerKey &locations,
+                           size_t key_count,
+                           const CheckLocDataExistFunc &check_location,
+                           const MetaSearcher::CheckHostCacheLocationFunc *request_check_location,
+                           const std::vector<const LocationSpecGroup *> &full_groups,
+                           const std::vector<const LocationSpecGroup *> &state_groups,
+                           SelectLocationPolicy *policy) {
+    std::set<std::string> requested_specs;
+    for (const auto &groups : {full_groups, state_groups}) {
+        for (const auto *group : groups) {
+            requested_specs.insert(group->spec_names().begin(), group->spec_names().end());
+        }
+    }
+    if (requested_specs.empty()) {
+        requested_specs.emplace(); // Ordinary prefix: any selected block spec is sufficient.
+    }
+    SpecsByKey base_specs(key_count);
+    for (size_t i = 0; i < key_count; ++i) {
+        CacheLocationMap valid;
+        for (const auto &loc : locations[i]) {
+            if (!loc || loc->status() != CacheLocationStatus::CLS_SERVING || loc->location_specs().empty() ||
+                (loc->type() != DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL &&
+                 loc->type() != DataStorageType::DATA_STORAGE_TYPE_NFS)) {
+                continue;
+            }
+            MetaSearcher::HostCacheLocationInfo info;
+            if (request_check_location ? !(*request_check_location)(*loc, info)
+                                       : check_location && !check_location(*loc)) {
+                continue;
+            }
+            valid.emplace(loc->id(), loc);
+        }
+        // medium describes local/reporter media; a Tair/NFS URI path is not a medium.
+        // Select once per key/backend/spec, shared by every selected logical engine.
+        for (auto type : {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_NFS}) {
+            for (const auto &name : requested_specs) {
+                auto selected = SelectBackendLocation(valid, type, name, policy);
+                if (!selected) {
+                    continue;
+                }
+                for (const auto &spec : selected->location_specs()) {
+                    if (name.empty() || spec.name() == name) {
+                        base_specs[i].insert(spec.name());
+                    }
+                }
+            }
+        }
+    }
+    return base_specs;
+}
+
+// Keep the block/spec mapping explicit, just as requested_spec_names does in
+// GetCacheLocationsByBackend. Full groups each use one PREFIX selection;
+// all missing Linear spec positions share one COVERAGE selection.
+void AddPeerSpecs(const std::string &host,
+                  const std::vector<HostCacheProjection> &projection,
+                  const std::set<std::string> &local_peers,
+                  const std::vector<const LocationSpecGroup *> &groups,
+                  size_t block_count,
+                  LocationSelectStrategy strategy,
+                  SpecsByKey &combined) {
+    struct QueryPosition {
+        size_t block;
+        std::string_view spec;
+    };
+    std::vector<QueryPosition> positions;
+    std::vector<bool> base_hits;
+    std::unordered_map<size_t, std::vector<std::string>> candidates;
+    const auto add_position = [&](size_t block, std::string_view name) {
+        const auto contains = [name](const std::set<std::string> &specs) {
+            return name.empty() ? !specs.empty() : specs.find(std::string(name)) != specs.end();
+        };
+        const auto local = projection[block].hosts.find(host);
+        if (local != projection[block].hosts.end() && contains(local->second)) {
+            return;
+        }
+        const size_t index = positions.size();
+        positions.push_back({block, name});
+        base_hits.push_back(contains(combined[block]));
+        for (const auto &[peer, specs] : projection[block].peers) {
+            if (local_peers.find(peer) == local_peers.end() && contains(specs)) {
+                candidates[index].push_back(peer);
+            }
+        }
+    };
+    for (const auto *group : groups) {
+        for (size_t block = 0; block < block_count; ++block) {
+            if (!group) {
+                add_position(block, {});
+                continue;
+            }
+            for (const auto &name : group->spec_names()) {
+                add_position(block, name);
+            }
+        }
+    }
+    const auto selection = strategy == LocationSelectStrategy::LSS_V6D_PREFIX
+                               ? SelectV6DByCombinedPrefix(base_hits, candidates)
+                               : SelectV6DByIncrementalCoverage(base_hits, candidates);
+    for (size_t index : selection.covered_indices) {
+        const auto &position = positions[index];
+        if (position.spec.empty()) {
+            const auto &specs = projection[position.block].peers.at(selection.peer_addr);
+            combined[position.block].insert(specs.begin(), specs.end());
+        } else {
+            combined[position.block].emplace(position.spec);
+        }
+    }
+}
+
+int64_t ComputeHostMatch(const SpecsByKey &specs,
+                         bool use_eagle_pop,
+                         const std::vector<const LocationSpecGroup *> &full_groups,
+                         const std::vector<const LocationSpecGroup *> &state_groups) {
+    return full_groups.empty() ? ComputePrefixMatchBlocks(specs, use_eagle_pop)
+                               : ComputeMambaPrefixMatchBlocks(specs, use_eagle_pop, full_groups, state_groups);
+}
+
+int64_t ComputeRemoteHostMatch(const std::string &host,
+                               const std::vector<HostCacheProjection> &projection,
+                               const SpecsByKey &base_specs,
+                               bool enable_p2p,
+                               bool use_eagle_pop,
+                               const std::vector<const LocationSpecGroup *> &full_groups,
+                               const std::vector<const LocationSpecGroup *> &state_groups) {
+    auto combined = CollectHostSpecs(host, projection);
+    std::set<std::string> local_peers;
+    for (size_t i = 0; i < combined.size(); ++i) {
+        combined[i].insert(base_specs[i].begin(), base_specs[i].end());
+        const auto it = projection[i].local_peers.find(host);
+        if (it != projection[i].local_peers.end()) {
+            local_peers.insert(it->second.begin(), it->second.end());
+        }
+    }
+    if (enable_p2p) {
+        if (full_groups.empty()) {
+            AddPeerSpecs(host,
+                         projection,
+                         local_peers,
+                         {nullptr},
+                         combined.size(),
+                         LocationSelectStrategy::LSS_V6D_PREFIX,
+                         combined);
+        } else {
+            for (const auto *group : full_groups) {
+                AddPeerSpecs(host,
+                             projection,
+                             local_peers,
+                             {group},
+                             combined.size(),
+                             LocationSelectStrategy::LSS_V6D_PREFIX,
+                             combined);
+            }
+            size_t full_prefix = 0;
+            while (full_prefix < combined.size() && HasAllLocationSpecGroups(combined[full_prefix], full_groups)) {
+                ++full_prefix;
+            }
+            if (use_eagle_pop && full_prefix > 0) {
+                --full_prefix;
+            }
+            AddPeerSpecs(host,
+                         projection,
+                         local_peers,
+                         state_groups,
+                         full_prefix,
+                         LocationSelectStrategy::LSS_V6D_COVERAGE,
+                         combined);
+        }
+    }
+    return ComputeHostMatch(combined, use_eagle_pop, full_groups, state_groups);
+}
+
+ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
+                                      const CheckLocDataExistFunc &check_location,
                                       RequestContext *request_context,
                                       const MetaSearcher::KeyVector &keys,
                                       bool use_eagle_pop,
                                       const std::vector<std::string> &medium_filter,
+                                      const std::vector<const LocationSpecGroup *> &full_groups,
+                                      const std::vector<const LocationSpecGroup *> &state_groups,
                                       std::vector<MetaSearcher::HostCacheMatch> &out_matches,
-                                      const MetaSearcher::CheckHostCacheLocationFunc *request_check_location) {
+                                      const MetaSearcher::CheckHostCacheLocationFunc *request_check_location,
+                                      size_t global_kvs_host_count,
+                                      bool enable_p2p,
+                                      SelectLocationPolicy *policy) {
+    if (!policy) {
+        request_context->error_tracer()->AddErrorMsg("remote host evaluation requires a location selection policy");
+        return EC_BADARGS;
+    }
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
+    LocationsPerKey locations;
+    auto result = meta_indexer->GetLocationValues(request_context, keys, locations);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
+    LogErrorCodes("PrefixMatchByHostWithRemote", result.error_codes, keys);
+    size_t key_count = 0;
+    while (key_count < keys.size() && result.error_codes[key_count] == EC_OK) {
+        ++key_count;
+    }
+    if (key_count < keys.size() && result.error_codes[key_count] != EC_NOENT) {
+        request_context->error_tracer()->AddErrorMsg("prefix match metadata read failed");
+        return result.error_codes[key_count];
+    }
+    if (key_count == 0) {
+        return EC_OK;
+    }
+
+    std::vector<HostCacheProjection> projection(key_count);
+    const auto mediums = BuildMediumViewSet(medium_filter);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherHostProjection);
+    const bool projected = meta_indexer->ParallelForQuery(key_count, [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            BuildHostSpecNamesForOneKey(locations[i],
+                                        check_location,
+                                        request_check_location,
+                                        mediums,
+                                        projection[i].hosts,
+                                        projection[i].peers,
+                                        enable_p2p ? &projection[i].local_peers : nullptr);
+        }
+    });
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostProjection);
+    if (!projected) {
+        request_context->error_tracer()->AddErrorMsg("parallel host cache projection failed");
+        return EC_ERROR;
+    }
+
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    for (const auto &[host, specs] : projection.front().hosts) {
+        matches.push_back({host, 0, 0});
+    }
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherHostPrefixReduce);
+    const bool reduced = meta_indexer->ParallelForQuery(matches.size(), [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            matches[i].local = ComputeHostMatch(
+                CollectHostSpecs(matches[i].host_ip_port, projection), use_eagle_pop, full_groups, state_groups);
+            matches[i].global = matches[i].local;
+        }
+    });
+    if (!reduced) {
+        request_context->error_tracer()->AddErrorMsg("parallel host prefix reduction failed");
+        return EC_ERROR;
+    }
+    const auto selected = SelectTopHostIndicesByLocal(matches, global_kvs_host_count);
+    if (!selected.empty()) {
+        const auto base_specs = SelectBaseSpecs(
+            locations, key_count, check_location, request_check_location, full_groups, state_groups, policy);
+        const bool evaluated = meta_indexer->ParallelForQuery(selected.size(), [&](size_t begin, size_t end) {
+            for (size_t i = begin; i < end; ++i) {
+                auto &match = matches[selected[i]];
+                match.global = ComputeRemoteHostMatch(
+                    match.host_ip_port, projection, base_specs, enable_p2p, use_eagle_pop, full_groups, state_groups);
+            }
+        });
+        if (!evaluated) {
+            request_context->error_tracer()->AddErrorMsg("parallel remote host evaluation failed");
+            return EC_ERROR;
+        }
+    }
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostPrefixReduce);
+    for (auto &match : matches) {
+        if (match.local > 0) {
+            out_matches.push_back(std::move(match));
+        }
+    }
+    return EC_OK;
+}
+
+ErrorCode PrefixMatchByHostLocalOnly(MetaIndexer *meta_indexer,
+                                     const CheckLocDataExistFunc &check_loc_data_exist,
+                                     RequestContext *request_context,
+                                     const MetaSearcher::KeyVector &keys,
+                                     bool use_eagle_pop,
+                                     const std::vector<std::string> &medium_filter,
+                                     std::vector<MetaSearcher::HostCacheMatch> &out_matches,
+                                     const MetaSearcher::CheckHostCacheLocationFunc *request_check_location) {
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     const MediumViewSet medium_set = BuildMediumViewSet(medium_filter);
     std::vector<std::string> candidate_hosts;
@@ -1118,23 +1256,23 @@ ErrorCode PrefixMatchByHostWithoutP2P(MetaIndexer *meta_indexer,
         }
         if (prefix_len > 0) {
             out_matches.push_back(
-                MetaSearcher::HostCacheMatch{std::move(candidate_hosts[host_index]), prefix_len, 0, prefix_len});
+                MetaSearcher::HostCacheMatch{std::move(candidate_hosts[host_index]), prefix_len, prefix_len});
         }
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostPrefixReduce);
     return EC_OK;
 }
 
-ErrorCode PrefixMatchWithMambaByHostWithoutP2P(MetaIndexer *meta_indexer,
-                                               const CheckLocDataExistFunc &check_loc_data_exist,
-                                               RequestContext *request_context,
-                                               const MetaSearcher::KeyVector &keys,
-                                               bool use_eagle_pop,
-                                               const std::vector<std::string> &medium_filter,
-                                               const std::vector<const LocationSpecGroup *> &full_groups,
-                                               const std::vector<const LocationSpecGroup *> &mamba_state_groups,
-                                               std::vector<MetaSearcher::HostCacheMatch> &out_matches,
-                                               const MetaSearcher::CheckHostCacheLocationFunc *request_check_location) {
+ErrorCode PrefixMatchWithMambaByHostLocalOnly(MetaIndexer *meta_indexer,
+                                              const CheckLocDataExistFunc &check_loc_data_exist,
+                                              RequestContext *request_context,
+                                              const MetaSearcher::KeyVector &keys,
+                                              bool use_eagle_pop,
+                                              const std::vector<std::string> &medium_filter,
+                                              const std::vector<const LocationSpecGroup *> &full_groups,
+                                              const std::vector<const LocationSpecGroup *> &mamba_state_groups,
+                                              std::vector<MetaSearcher::HostCacheMatch> &out_matches,
+                                              const MetaSearcher::CheckHostCacheLocationFunc *request_check_location) {
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     const MediumViewSet medium_set = BuildMediumViewSet(medium_filter);
 
@@ -1359,7 +1497,7 @@ ErrorCode PrefixMatchWithMambaByHostWithoutP2P(MetaIndexer *meta_indexer,
     for (std::size_t i = 0; i < candidate_hosts.size(); ++i) {
         if (prefix_lengths[i] > 0) {
             out_matches.push_back(
-                MetaSearcher::HostCacheMatch{std::move(candidate_hosts[i]), prefix_lengths[i], 0, prefix_lengths[i]});
+                MetaSearcher::HostCacheMatch{std::move(candidate_hosts[i]), prefix_lengths[i], prefix_lengths[i]});
         }
     }
     return EC_OK;
@@ -1701,48 +1839,10 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
             for (size_t i = 0; i < query_keys.size(); ++i) {
                 const std::string_view requested_spec_name =
                     requested_spec_names.empty() ? std::string_view{} : requested_spec_names[query_to_output_index[i]];
-                const auto &vmap = valid_maps[i];
-                CacheLocationMap filtered;
-                for (const auto &[id, loc] : vmap) {
-                    if (loc->type() == target_type && MatchesRequestedSpec(*loc, requested_spec_name)) {
-                        filtered.try_emplace(id, loc);
-                    }
-                }
-                if (filtered.empty()) {
+                auto merged = SelectBackendLocation(valid_maps[i], target_type, requested_spec_name, policy);
+                if (!merged) {
                     continue;
                 }
-
-                std::vector<std::string> unused_prune_ids;
-                auto winner = policy->SelectForMatch(filtered, nullptr, unused_prune_ids);
-                if (!winner || winner->id().empty() || winner->location_specs().empty()) {
-                    continue;
-                }
-
-                // Merge specs from same data storage (same logic as SelectAndMergeForMatch)
-                std::map<std::string, LocationSpec> merged_specs;
-                for (const auto &[id, loc] : filtered) {
-                    if (!policy->IsSameDataStorage(*loc, *winner)) {
-                        continue;
-                    }
-                    for (const auto &spec : loc->location_specs()) {
-                        merged_specs.try_emplace(spec.name(), spec);
-                    }
-                }
-                if (merged_specs.empty()) {
-                    continue;
-                }
-
-                auto merged = std::make_shared<CacheLocation>();
-                merged->set_id(winner->id() + "_merged");
-                merged->set_status(CacheLocationStatus::CLS_SERVING);
-                merged->set_type(winner->type());
-                std::vector<LocationSpec> specs;
-                specs.reserve(merged_specs.size());
-                for (auto &[name, spec] : merged_specs) {
-                    specs.push_back(std::move(spec));
-                }
-                merged->set_spec_size(specs.size());
-                merged->set_location_specs(std::move(specs));
                 out_locations[query_to_output_index[i]].push_back(std::move(merged));
                 base_hits[i] = true;
             }
@@ -1836,146 +1936,38 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
                                           const std::vector<std::string> &medium_filter,
                                           std::vector<HostCacheMatch> &out_matches,
                                           const CheckHostCacheLocationFunc *request_check_location,
-                                          size_t p2p_host_count) const {
+                                          size_t global_kvs_host_count,
+                                          bool enable_p2p,
+                                          SelectLocationPolicy *policy) const {
     SPAN_TRACER(request_context);
     out_matches.clear();
     if (keys.empty()) {
         return EC_OK;
     }
-    if (p2p_host_count == 0) {
-        return PrefixMatchByHostWithoutP2P(meta_indexer_.get(),
-                                           check_loc_data_exist_func_,
-                                           request_context,
-                                           keys,
-                                           use_eagle_pop,
-                                           medium_filter,
-                                           out_matches,
-                                           request_check_location);
+    if (global_kvs_host_count == 0) {
+        return PrefixMatchByHostLocalOnly(meta_indexer_.get(),
+                                          check_loc_data_exist_func_,
+                                          request_context,
+                                          keys,
+                                          use_eagle_pop,
+                                          medium_filter,
+                                          out_matches,
+                                          request_check_location);
     }
 
-    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
-    LocationsPerKey location_values;
-    auto result = meta_indexer_->GetLocationValues(request_context, keys, location_values);
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
-    LogErrorCodes("PrefixMatchByHost", result.error_codes, keys);
-    assert(keys.size() == location_values.size());
-
-    std::size_t valid_key_count = 0;
-    while (valid_key_count < keys.size() && result.error_codes[valid_key_count] == ErrorCode::EC_OK) {
-        ++valid_key_count;
-    }
-    if (valid_key_count < keys.size()) {
-        KVCM_LOG_DEBUG("prefix match by host end because Get keys[%lu](%lu) return %d",
-                       valid_key_count,
-                       keys[valid_key_count],
-                       result.error_codes[valid_key_count]);
-        if (result.error_codes[valid_key_count] != ErrorCode::EC_NOENT) {
-            request_context->error_tracer()->AddErrorMsg("prefix match metadata read failed");
-            return result.error_codes[valid_key_count];
-        }
-    }
-    if (valid_key_count == 0) {
-        return EC_OK;
-    }
-
-    KeyToHostSpecNames key_to_host_spec_names(valid_key_count);
-    KeyToHostSpecNames key_to_vineyard_spec_names(valid_key_count);
-    const MediumViewSet medium_set = BuildMediumViewSet(medium_filter);
-    const auto &check_loc_data_exist = check_loc_data_exist_func_;
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherHostProjection);
-    const bool projection_ok =
-        meta_indexer_->ParallelForQuery(valid_key_count,
-                                        [&location_values,
-                                         &check_loc_data_exist,
-                                         request_check_location,
-                                         &medium_set,
-                                         &key_to_host_spec_names,
-                                         &key_to_vineyard_spec_names](std::size_t begin, std::size_t end) {
-                                            for (std::size_t i = begin; i < end; ++i) {
-                                                BuildHostSpecNamesForOneKey(location_values[i],
-                                                                            check_loc_data_exist,
-                                                                            request_check_location,
-                                                                            medium_set,
-                                                                            key_to_host_spec_names[i],
-                                                                            key_to_vineyard_spec_names[i]);
-                                            }
-                                        });
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostProjection);
-    if (!projection_ok) {
-        request_context->error_tracer()->AddErrorMsg("parallel host cache projection failed");
-        return EC_ERROR;
-    }
-
-    if (key_to_host_spec_names.front().empty()) {
-        return EC_OK;
-    }
-
-    std::vector<std::string> candidate_hosts;
-    candidate_hosts.reserve(key_to_host_spec_names.front().size());
-    for (const auto &[host, spec_names] : key_to_host_spec_names.front()) {
-        (void)spec_names;
-        candidate_hosts.push_back(host);
-    }
-    std::vector<HostCacheMatch> host_matches(candidate_hosts.size());
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherHostPrefixReduce);
-    bool reduce_ok = meta_indexer_->ParallelForQuery(
-        candidate_hosts.size(),
-        [&candidate_hosts, &key_to_host_spec_names, &key_to_vineyard_spec_names, &host_matches, use_eagle_pop](
-            std::size_t begin, std::size_t end) {
-            for (std::size_t host_index = begin; host_index < end; ++host_index) {
-                const auto &host = candidate_hosts[host_index];
-                const V6DPeerSelection no_p2p;
-                auto local_specs =
-                    MergeHostAndP2PSpecs(host, key_to_host_spec_names, key_to_vineyard_spec_names, no_p2p);
-                const int64_t local = ComputePrefixMatchBlocks(local_specs, use_eagle_pop);
-                host_matches[host_index] = HostCacheMatch{host, local, 0, local};
-            }
-        });
-    if (reduce_ok) {
-        const auto top_host_indices = SelectTopHostIndicesByLocal(host_matches, p2p_host_count);
-        reduce_ok = top_host_indices.empty() ||
-                    meta_indexer_->ParallelForQuery(
-                        top_host_indices.size(),
-                        [&top_host_indices,
-                         &candidate_hosts,
-                         &keys,
-                         &key_to_host_spec_names,
-                         &key_to_vineyard_spec_names,
-                         &host_matches,
-                         use_eagle_pop](std::size_t begin, std::size_t end) {
-                            for (std::size_t selected_index = begin; selected_index < end; ++selected_index) {
-                                const size_t host_index = top_host_indices[selected_index];
-                                const auto &host = candidate_hosts[host_index];
-                                auto p2p_selection =
-                                    SelectP2PByPrefix(host, key_to_host_spec_names, key_to_vineyard_spec_names);
-                                std::unordered_set<int64_t> fetched_block_keys;
-                                for (size_t index : p2p_selection.covered_indices) {
-                                    fetched_block_keys.insert(keys[index]);
-                                }
-                                int64_t total_match = host_matches[host_index].local;
-                                if (!p2p_selection.covered_indices.empty()) {
-                                    auto p2p_specs = MergeHostAndP2PSpecs(
-                                        host, key_to_host_spec_names, key_to_vineyard_spec_names, p2p_selection);
-                                    total_match = ComputePrefixMatchBlocks(p2p_specs, use_eagle_pop);
-                                }
-                                host_matches[host_index].p2p_1_fetch = static_cast<int64_t>(fetched_block_keys.size());
-                                host_matches[host_index].p2p_1_total_match = total_match;
-                            }
-                        });
-    }
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostPrefixReduce);
-    if (!reduce_ok) {
-        request_context->error_tracer()->AddErrorMsg("parallel host prefix reduction failed");
-        return EC_ERROR;
-    }
-    out_matches.reserve(candidate_hosts.size());
-    for (std::size_t i = 0; i < candidate_hosts.size(); ++i) {
-        if (host_matches[i].local > 0) {
-            out_matches.push_back(std::move(host_matches[i]));
-        }
-    }
-    return EC_OK;
+    return PrefixMatchByHostWithRemote(meta_indexer_.get(),
+                                       check_loc_data_exist_func_,
+                                       request_context,
+                                       keys,
+                                       use_eagle_pop,
+                                       medium_filter,
+                                       {},
+                                       {},
+                                       out_matches,
+                                       request_check_location,
+                                       global_kvs_host_count,
+                                       enable_p2p,
+                                       policy);
 }
 
 ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_context,
@@ -1985,7 +1977,9 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
                                                    const std::vector<LocationSpecGroup> &location_spec_groups,
                                                    std::vector<HostCacheMatch> &out_matches,
                                                    const CheckHostCacheLocationFunc *request_check_location,
-                                                   size_t p2p_host_count) const {
+                                                   size_t global_kvs_host_count,
+                                                   bool enable_p2p,
+                                                   SelectLocationPolicy *policy) const {
     SPAN_TRACER(request_context);
     out_matches.clear();
     if (keys.empty()) {
@@ -1998,183 +1992,31 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
     if (ec != EC_OK) {
         return ec;
     }
-    if (p2p_host_count == 0) {
-        return PrefixMatchWithMambaByHostWithoutP2P(meta_indexer_.get(),
-                                                    check_loc_data_exist_func_,
-                                                    request_context,
-                                                    keys,
-                                                    use_eagle_pop,
-                                                    medium_filter,
-                                                    full_groups,
-                                                    mamba_state_groups,
-                                                    out_matches,
-                                                    request_check_location);
+    if (global_kvs_host_count == 0) {
+        return PrefixMatchWithMambaByHostLocalOnly(meta_indexer_.get(),
+                                                   check_loc_data_exist_func_,
+                                                   request_context,
+                                                   keys,
+                                                   use_eagle_pop,
+                                                   medium_filter,
+                                                   full_groups,
+                                                   mamba_state_groups,
+                                                   out_matches,
+                                                   request_check_location);
     }
-    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
-    LocationsPerKey location_values;
-    auto result = meta_indexer_->GetLocationValues(request_context, keys, location_values);
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
-    LogErrorCodes("PrefixMatchWithMambaByHost", result.error_codes, keys);
-    assert(keys.size() == location_values.size());
-
-    std::size_t valid_key_count = 0;
-    while (valid_key_count < keys.size() && result.error_codes[valid_key_count] == ErrorCode::EC_OK) {
-        ++valid_key_count;
-    }
-    if (valid_key_count < keys.size()) {
-        KVCM_LOG_DEBUG("prefix match with mamba by host end because Get keys[%lu](%lu) return %d",
-                       valid_key_count,
-                       keys[valid_key_count],
-                       result.error_codes[valid_key_count]);
-        if (result.error_codes[valid_key_count] != ErrorCode::EC_NOENT) {
-            request_context->error_tracer()->AddErrorMsg("mamba prefix match metadata read failed");
-            return result.error_codes[valid_key_count];
-        }
-    }
-    if (valid_key_count == 0) {
-        return EC_OK;
-    }
-
-    KeyToHostSpecNames key_to_host_spec_names(valid_key_count);
-    KeyToHostSpecNames key_to_vineyard_spec_names(valid_key_count);
-    const MediumViewSet medium_set = BuildMediumViewSet(medium_filter);
-    const auto &check_loc_data_exist = check_loc_data_exist_func_;
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherHostProjection);
-    const bool projection_ok =
-        meta_indexer_->ParallelForQuery(valid_key_count,
-                                        [&location_values,
-                                         &check_loc_data_exist,
-                                         request_check_location,
-                                         &medium_set,
-                                         &key_to_host_spec_names,
-                                         &key_to_vineyard_spec_names](std::size_t begin, std::size_t end) {
-                                            for (std::size_t i = begin; i < end; ++i) {
-                                                BuildHostSpecNamesForOneKey(location_values[i],
-                                                                            check_loc_data_exist,
-                                                                            request_check_location,
-                                                                            medium_set,
-                                                                            key_to_host_spec_names[i],
-                                                                            key_to_vineyard_spec_names[i]);
-                                            }
-                                        });
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostProjection);
-    if (!projection_ok) {
-        request_context->error_tracer()->AddErrorMsg("parallel mamba host cache projection failed");
-        return EC_ERROR;
-    }
-
-    std::vector<std::string> candidate_hosts;
-    candidate_hosts.reserve(key_to_host_spec_names.front().size());
-    for (const auto &[host, spec_names] : key_to_host_spec_names.front()) {
-        (void)spec_names;
-        candidate_hosts.push_back(host);
-    }
-    std::vector<HostCacheMatch> host_matches(candidate_hosts.size());
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherHostPrefixReduce);
-    bool reduce_ok = meta_indexer_->ParallelForQuery(
-        candidate_hosts.size(),
-        [&candidate_hosts,
-         &key_to_host_spec_names,
-         &key_to_vineyard_spec_names,
-         &full_groups,
-         &mamba_state_groups,
-         &host_matches,
-         use_eagle_pop](std::size_t begin, std::size_t end) {
-            for (std::size_t host_index = begin; host_index < end; ++host_index) {
-                const auto &host = candidate_hosts[host_index];
-                const V6DPeerSelection no_p2p;
-                auto combined_specs =
-                    MergeHostAndP2PSpecs(host, key_to_host_spec_names, key_to_vineyard_spec_names, no_p2p);
-                const int64_t local =
-                    ComputeMambaPrefixMatchBlocks(combined_specs, use_eagle_pop, full_groups, mamba_state_groups);
-                host_matches[host_index] = HostCacheMatch{host, local, 0, local};
-            }
-        });
-    if (reduce_ok) {
-        const auto top_host_indices = SelectTopHostIndicesByLocal(host_matches, p2p_host_count);
-        reduce_ok =
-            top_host_indices.empty() ||
-            meta_indexer_->ParallelForQuery(
-                top_host_indices.size(),
-                [&top_host_indices,
-                 &candidate_hosts,
-                 &keys,
-                 &key_to_host_spec_names,
-                 &key_to_vineyard_spec_names,
-                 &full_groups,
-                 &mamba_state_groups,
-                 &host_matches,
-                 use_eagle_pop](std::size_t begin, std::size_t end) {
-                    for (std::size_t selected_index = begin; selected_index < end; ++selected_index) {
-                        const size_t host_index = top_host_indices[selected_index];
-                        const auto &host = candidate_hosts[host_index];
-                        const V6DPeerSelection no_p2p;
-                        auto combined_specs =
-                            MergeHostAndP2PSpecs(host, key_to_host_spec_names, key_to_vineyard_spec_names, no_p2p);
-                        std::unordered_set<int64_t> fetched_block_keys;
-
-                        for (const auto *full_group : full_groups) {
-                            auto full_selection = SelectP2PGroupByPrefix(
-                                host, key_to_host_spec_names, key_to_vineyard_spec_names, *full_group);
-                            for (size_t block_index : full_selection.covered_indices) {
-                                const auto peer_it =
-                                    key_to_vineyard_spec_names[block_index].find(full_selection.peer_addr);
-                                if (peer_it == key_to_vineyard_spec_names[block_index].end()) {
-                                    continue;
-                                }
-                                MergeLocationSpecGroup(combined_specs[block_index], peer_it->second, *full_group);
-                                fetched_block_keys.insert(keys[block_index]);
-                            }
-                        }
-
-                        size_t full_prefix_len = 0;
-                        while (full_prefix_len < combined_specs.size() &&
-                               HasAllLocationSpecGroups(combined_specs[full_prefix_len], full_groups)) {
-                            ++full_prefix_len;
-                        }
-                        if (use_eagle_pop && full_prefix_len > 0) {
-                            --full_prefix_len;
-                        }
-
-                        if (full_prefix_len > 0) {
-                            auto mamba_selection = SelectP2PGroupsByCoverage(host,
-                                                                             key_to_host_spec_names,
-                                                                             key_to_vineyard_spec_names,
-                                                                             full_prefix_len,
-                                                                             mamba_state_groups);
-                            for (size_t query_index : mamba_selection.selection.covered_indices) {
-                                const size_t block_index = mamba_selection.query_block_indices[query_index];
-                                const auto *group = mamba_selection.query_groups[query_index];
-                                const auto peer_it =
-                                    key_to_vineyard_spec_names[block_index].find(mamba_selection.selection.peer_addr);
-                                if (peer_it == key_to_vineyard_spec_names[block_index].end()) {
-                                    continue;
-                                }
-                                MergeLocationSpecGroup(combined_specs[block_index], peer_it->second, *group);
-                                fetched_block_keys.insert(keys[block_index]);
-                            }
-                        }
-
-                        const int64_t total_match = ComputeMambaPrefixMatchBlocks(
-                            combined_specs, use_eagle_pop, full_groups, mamba_state_groups);
-                        host_matches[host_index].p2p_1_fetch = static_cast<int64_t>(fetched_block_keys.size());
-                        host_matches[host_index].p2p_1_total_match = total_match;
-                    }
-                });
-    }
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostPrefixReduce);
-    if (!reduce_ok) {
-        request_context->error_tracer()->AddErrorMsg("parallel mamba host prefix reduction failed");
-        return EC_ERROR;
-    }
-    out_matches.reserve(candidate_hosts.size());
-    for (std::size_t i = 0; i < candidate_hosts.size(); ++i) {
-        if (host_matches[i].local > 0) {
-            out_matches.push_back(std::move(host_matches[i]));
-        }
-    }
-    return EC_OK;
+    return PrefixMatchByHostWithRemote(meta_indexer_.get(),
+                                       check_loc_data_exist_func_,
+                                       request_context,
+                                       keys,
+                                       use_eagle_pop,
+                                       medium_filter,
+                                       full_groups,
+                                       mamba_state_groups,
+                                       out_matches,
+                                       request_check_location,
+                                       global_kvs_host_count,
+                                       enable_p2p,
+                                       policy);
 }
 
 ErrorCode MetaSearcher::BatchGetLocation(RequestContext *request_context,

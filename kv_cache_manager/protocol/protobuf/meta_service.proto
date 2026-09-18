@@ -529,14 +529,14 @@ message GetHostCacheStateRequest {
     QueryType query_type = 3;
     repeated int64 block_cache_keys = 4;   // 请求 prompt 的有序 block cache keys
     repeated string medium = 5;            // 要匹配的介质列表；为空时考虑所有介质
-    int32 p2p_host_count = 6;              // 继续计算 P2P 的 local top host 数；未传或 0 表示只计算 local
+    int32 global_kvs_host_count = 7; // 按 local 降序选前 N 个逻辑引擎计算远端命中；0 表示仅计算本地
+    bool enable_p2p = 8;         // 是否启用 P2P
 }
 
 message HostCacheMatch {
     string host_ip_port = 1;   // 必须与 Master 中 workerStatus.getIpPort() 的格式完全一致
     int64 local = 2;           // 本地前缀匹配的 block 数
-    int64 p2p_1_fetch = 3;     // P2P 实际拉取的 spec 所属的去重 block key 数
-    int64 p2p_1_total_match = 4;   // p2p 后最终的前缀匹配的block数
+    int64 global = 5; // 本地+p2p + tairmempool来源联合后的前缀命中块数，包含 local
 }
 
 message GetHostCacheStateResponse {
