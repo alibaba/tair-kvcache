@@ -50,6 +50,12 @@ constexpr std::size_t kRecoveryScanBatchSize = 1000;
 constexpr std::size_t kMaintenanceDeleteBatchSize = 256;
 constexpr std::int64_t kMicrosecondsPerSecond = 1'000'000;
 constexpr std::int64_t kLeaseDeadlineTag = std::int64_t{1} << 62;
+// The first retirement CAS must stop new readers before a finite grace
+// deadline is chosen.  If leadership changes between the two transitions,
+// recovery treats this tagged far-future value conservatively (subject to its
+// bounded force deadline) instead of deleting an object whose last reader may
+// only just have obtained the URI.
+constexpr std::int64_t kRetirementFenceDeadline = std::numeric_limits<std::int64_t>::max();
 constexpr auto kRecoveryWaitPollInterval = std::chrono::milliseconds(100);
 
 bool EncodeLeaseDeadline(std::int64_t now_us, std::int64_t timeout_seconds, std::int64_t &encoded_deadline) {
@@ -229,7 +235,13 @@ bool UriMatchesStorageBackend(const DataStorageUri &uri,
     return uri_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN && ToBaseType(uri_type) == ToBaseType(storage_type);
 }
 
-bool HasSingletonAllocationShape(const DataStorageUri &uri, DataStorageType storage_type) {
+bool HasOwnedAllocationShape(const DataStorageUri &uri, DataStorageType storage_type) {
+    // Mooncake addresses the physical object exclusively through this query
+    // field.  Scheme/host/size alone do not establish object ownership: an
+    // absent or empty key aliases every malformed URI to the same object.
+    if (storage_type == DataStorageType::DATA_STORAGE_TYPE_MOONCAKE) {
+        return uri.HasParam("key") && !uri.GetParam("key").empty();
+    }
     // NFS/HF3FS/Dummy backends can pack several logical blocks into one file
     // and encode the member offset as blkid. KVMeta deliberately calls Create
     // with one key at a time so accepting a non-zero blkid would reintroduce a
@@ -268,7 +280,7 @@ bool HasMatchingStorageBackend(const CacheLocation &location,
     const auto backend = data_storage_manager->GetDataStorageBackend(uri.GetHostName());
     return backend && backend->GetType() == location.type() &&
            UriMatchesStorageBackend(uri, uri.GetHostName(), location.type()) &&
-           HasSingletonAllocationShape(uri, location.type());
+           HasOwnedAllocationShape(uri, location.type());
 }
 
 bool ToValueLocation(const CacheLocation &location, KvMetaManager::ValueLocation &out) {
@@ -972,6 +984,12 @@ private:
 
     using PendingDeadline = std::pair<std::chrono::steady_clock::time_point, std::uint64_t>;
 
+    struct PendingCapacity {
+        bool batch_available = false;
+        std::size_t object_count = 0;
+        std::uint64_t bytes = 0;
+    };
+
     static constexpr std::uint64_t kPendingBatchLimit = 1024;
     static constexpr std::uint64_t kPendingObjectLimit = 20'000;
     static constexpr std::uint64_t kPendingBytesLimit = 4ULL * 1024 * 1024 * 1024 * 1024;
@@ -1089,6 +1107,19 @@ private:
         return pending_batches_.size() < kPendingBatchLimit && candidates.size() <= kPendingObjectLimit &&
                pending_object_count_ <= kPendingObjectLimit - candidates.size() &&
                candidate_bytes <= kPendingBytesLimit && pending_bytes_ <= kPendingBytesLimit - candidate_bytes;
+    }
+
+    PendingCapacity RemainingPendingCapacity() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        PendingCapacity capacity;
+        capacity.batch_available = pending_batches_.size() < kPendingBatchLimit;
+        if (!capacity.batch_available || pending_object_count_ >= kPendingObjectLimit ||
+            pending_bytes_ >= kPendingBytesLimit) {
+            return capacity;
+        }
+        capacity.object_count = static_cast<std::size_t>(kPendingObjectLimit - pending_object_count_);
+        capacity.bytes = kPendingBytesLimit - pending_bytes_;
+        return capacity;
     }
 
     bool ReadPressure(RequestContext *request_context,
@@ -1357,8 +1388,10 @@ private:
         return true;
     }
 
-    static std::vector<Candidate>
-    SelectCandidates(std::vector<CandidateKey> candidates, Pressure pressure, std::size_t batch_size) {
+    static std::vector<Candidate> SelectCandidates(std::vector<CandidateKey> candidates,
+                                                   Pressure pressure,
+                                                   std::size_t batch_size,
+                                                   std::uint64_t byte_budget) {
         std::sort(candidates.begin(), candidates.end(), [](const CandidateKey &lhs, const CandidateKey &rhs) {
             return std::tie(lhs.last_access_time_us, lhs.internal_instance_id, lhs.internal_key) <
                    std::tie(rhs.last_access_time_us, rhs.internal_instance_id, rhs.internal_key);
@@ -1369,6 +1402,7 @@ private:
         object_selected.reserve(candidates.size());
         std::vector<std::size_t> selected_per_key(candidates.size(), 0);
         std::vector<bool> key_credit_applied(candidates.size(), false);
+        std::uint64_t selected_bytes = 0;
         for (const auto &candidate : candidates) {
             object_selected.emplace_back(candidate.objects.size(), false);
         }
@@ -1384,9 +1418,13 @@ private:
                 return false;
             }
             const Candidate &candidate = candidates[key_index].objects[object_index];
+            if (selected_bytes > byte_budget || candidate.value_size > byte_budget - selected_bytes) {
+                return false;
+            }
             object_selected[key_index][object_index] = true;
             ++selected_per_key[key_index];
             selected.push_back(candidate);
+            selected_bytes += candidate.value_size;
             pressure.Consume(candidate.location->type(), candidate.value_size);
             if (!key_credit_applied[key_index] && candidates[key_index].all_locations_committed &&
                 selected_per_key[key_index] == candidates[key_index].objects.size()) {
@@ -1405,6 +1443,18 @@ private:
                 key_credit_applied[key_index] ||
                 key_candidate.objects.size() - selected_per_key[key_index] > batch_size - selected.size()) {
                 return false;
+            }
+            std::uint64_t remaining_key_bytes = 0;
+            for (std::size_t object_index = 0; object_index < key_candidate.objects.size(); ++object_index) {
+                if (object_selected[key_index][object_index]) {
+                    continue;
+                }
+                const std::uint64_t object_bytes = key_candidate.objects[object_index].value_size;
+                if (selected_bytes > byte_budget || remaining_key_bytes > byte_budget - selected_bytes ||
+                    object_bytes > byte_budget - selected_bytes - remaining_key_bytes) {
+                    return false;
+                }
+                remaining_key_bytes += object_bytes;
             }
             for (std::size_t object_index = 0; object_index < key_candidate.objects.size(); ++object_index) {
                 select_object(key_index, object_index);
@@ -1489,18 +1539,27 @@ private:
 
     std::vector<RetiredItem> RetireCandidates(RequestContext *request_context,
                                               const std::vector<Candidate> &candidates,
-                                              std::int64_t retire_deadline) {
-        std::vector<RetiredItem> retired_items;
+                                              std::chrono::milliseconds delay,
+                                              std::chrono::steady_clock::time_point &finalization_deadline) {
+        finalization_deadline = {};
         std::map<std::string, std::vector<std::size_t>> by_instance;
         for (std::size_t i = 0; i < candidates.size(); ++i) {
             by_instance[candidates[i].internal_instance_id].push_back(i);
         }
+
+        // Phase 1 is the reader fence.  Use a tagged far-future deadline until
+        // every successful candidate has become durably unreadable. A failover
+        // at any point in this phase can retain an object longer, but can never
+        // shorten the grace period for a reader that just received its URI.
+        std::vector<bool> retired(candidates.size(), false);
+        std::vector<CacheLocationConstPtr> fenced_locations(candidates.size());
         for (const auto &[internal_instance_id, indices] : by_instance) {
             const auto indexer = owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(internal_instance_id);
             if (!indexer) {
                 continue;
             }
-            std::vector<bool> retired(indices.size(), false);
+            KeyVector fenced_keys;
+            fenced_keys.reserve(indices.size());
             std::vector<std::int64_t> keys;
             keys.reserve(indices.size());
             for (const std::size_t index : indices) {
@@ -1522,7 +1581,7 @@ private:
                     expected.push_back(candidate.location);
                     auto replacement = std::make_shared<CacheLocation>(*candidate.location);
                     replacement->set_status(CLS_DELETING);
-                    replacement->set_create_time(retire_deadline);
+                    replacement->set_create_time(kRetirementFenceDeadline);
                     replacements.push_back(std::move(replacement));
                 }
                 std::vector<bool> layer_retired(layer.size(), false);
@@ -1548,28 +1607,142 @@ private:
                 const auto result = indexer->ReadModifyWriteLocationsForMaintenance(
                     request_context, layer_keys, layer_ids, modifier, false);
                 if (result.per_location_error_codes.size() != layer.size()) {
-                    continue;
+                    throw std::runtime_error("KVMeta retirement fence returned a malformed result");
                 }
                 for (std::size_t i = 0; i < layer.size(); ++i) {
-                    if (result.per_location_error_codes[i].size() == 1 &&
-                        result.per_location_error_codes[i][0] == EC_OK && layer_retired[i]) {
-                        retired[layer[i]] = true;
+                    if (result.per_location_error_codes[i].size() != 1) {
+                        throw std::runtime_error("KVMeta retirement fence returned a malformed location result");
+                    }
+                    if (result.per_location_error_codes[i][0] == EC_OK && layer_retired[i]) {
+                        const std::size_t candidate_index = indices[layer[i]];
+                        retired[candidate_index] = true;
+                        fenced_locations[candidate_index] = replacements[i];
+                        fenced_keys.push_back(candidates[candidate_index].internal_key);
+                    } else if (result.per_location_error_codes[i][0] == EC_OK || layer_retired[i]) {
+                        // A successful result without a modifier transition, or
+                        // a failed result after the modifier authorized one,
+                        // has an unknown metadata outcome. Never continue toward
+                        // physical deletion from such a response.
+                        throw std::runtime_error("KVMeta retirement fence returned an inconsistent result");
                     }
                 }
             }
-
-            KeyVector sync_keys;
-            for (std::size_t i = 0; i < indices.size(); ++i) {
-                if (retired[i]) {
-                    sync_keys.push_back(candidates[indices[i]].internal_key);
+            if (!fenced_keys.empty()) {
+                std::sort(fenced_keys.begin(), fenced_keys.end());
+                fenced_keys.erase(std::unique(fenced_keys.begin(), fenced_keys.end()), fenced_keys.end());
+                if (!indexer->Sync(fenced_keys)) {
+                    // No finite grace deadline has been published yet. Stop
+                    // KVMeta maintenance and leave the durable/uncertain fence
+                    // to leader recovery; issuing Delete here could race a
+                    // reader admitted by the pre-fence metadata generation.
+                    throw std::runtime_error("could not persist KVMeta retirement fence");
                 }
             }
-            if (sync_keys.empty()) {
+        }
+
+        if (std::none_of(retired.begin(), retired.end(), [](bool value) { return value; })) {
+            return {};
+        }
+
+        // Phase 2 chooses one finite deadline only after phase 1 has stopped
+        // every new reader in this batch and persisted every fence. Capture
+        // wall time first, then steady time, so normal in-process deletion is
+        // not scheduled before the corresponding persisted wall deadline.
+        const std::int64_t now_us = TimestampUtil::GetCurrentTimeUs();
+        const auto steady_anchor = std::chrono::steady_clock::now();
+        const auto delay_us = std::chrono::duration_cast<std::chrono::microseconds>(delay).count();
+        std::int64_t retire_deadline = 0;
+        if (!EncodeTaggedDeadlineUs(now_us, delay_us, retire_deadline)) {
+            throw std::runtime_error("could not encode KVMeta retirement grace deadline");
+        }
+        finalization_deadline = steady_anchor + delay;
+
+        std::vector<CacheLocationConstPtr> finalized_locations(candidates.size());
+        std::map<std::string, bool> metadata_durable_by_instance;
+        for (const auto &[internal_instance_id, indices] : by_instance) {
+            const auto indexer = owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(internal_instance_id);
+            if (!indexer) {
+                if (std::any_of(indices.begin(), indices.end(), [&](std::size_t index) { return retired[index]; })) {
+                    throw std::runtime_error("KVMeta indexer disappeared after retirement fence");
+                }
                 continue;
             }
+
+            std::vector<std::size_t> retired_indices;
+            std::vector<std::int64_t> retired_keys;
+            retired_indices.reserve(indices.size());
+            retired_keys.reserve(indices.size());
+            for (const std::size_t candidate_index : indices) {
+                if (retired[candidate_index]) {
+                    retired_indices.push_back(candidate_index);
+                    retired_keys.push_back(candidates[candidate_index].internal_key);
+                }
+            }
+            if (retired_indices.empty()) {
+                continue;
+            }
+
+            for (const auto &layer : MakeUniqueKeyLayers(retired_keys)) {
+                KeyVector layer_keys;
+                LocationIdsPerKey layer_ids;
+                std::vector<CacheLocationConstPtr> expected;
+                std::vector<CacheLocationConstPtr> replacements;
+                layer_keys.reserve(layer.size());
+                layer_ids.reserve(layer.size());
+                expected.reserve(layer.size());
+                replacements.reserve(layer.size());
+                for (const std::size_t relative_index : layer) {
+                    const std::size_t candidate_index = retired_indices[relative_index];
+                    const Candidate &candidate = candidates[candidate_index];
+                    if (!fenced_locations[candidate_index]) {
+                        throw std::logic_error("missing KVMeta retirement fence location");
+                    }
+                    layer_keys.push_back(candidate.internal_key);
+                    layer_ids.push_back({candidate.location_id});
+                    expected.push_back(fenced_locations[candidate_index]);
+                    auto replacement = std::make_shared<CacheLocation>(*fenced_locations[candidate_index]);
+                    replacement->set_create_time(retire_deadline);
+                    replacements.push_back(std::move(replacement));
+                }
+                std::vector<bool> layer_finalized(layer.size(), false);
+                auto modifier = [&expected, &replacements, &layer_finalized](const std::vector<ErrorCode> &get_ecs,
+                                                                             const LocationIdVector &,
+                                                                             std::size_t key_index,
+                                                                             CacheLocationVector &locations,
+                                                                             PropertyMap &) -> LocationModifierResult {
+                    if (get_ecs.size() != 1 || locations.size() != 1 || key_index >= expected.size()) {
+                        return {MA_FAIL, {EC_MISMATCH}};
+                    }
+                    if (get_ecs[0] != EC_OK) {
+                        return {MA_FAIL, {get_ecs[0]}};
+                    }
+                    if (!locations[0] || locations[0]->ToJsonString() != expected[key_index]->ToJsonString() ||
+                        !IsRetiredObject(*locations[0]) || locations[0]->create_time() != kRetirementFenceDeadline) {
+                        return {MA_FAIL, {EC_MISMATCH}};
+                    }
+                    locations[0] = replacements[key_index];
+                    layer_finalized[key_index] = true;
+                    return {MA_OK, {EC_OK}};
+                };
+                const auto result = indexer->ReadModifyWriteLocationsForMaintenance(
+                    request_context, layer_keys, layer_ids, modifier, false);
+                if (result.per_location_error_codes.size() != layer.size()) {
+                    throw std::runtime_error("KVMeta retirement deadline update returned a malformed result");
+                }
+                for (std::size_t i = 0; i < layer.size(); ++i) {
+                    if (result.per_location_error_codes[i].size() != 1 ||
+                        result.per_location_error_codes[i][0] != EC_OK || !layer_finalized[i]) {
+                        throw std::runtime_error("KVMeta retirement deadline update failed");
+                    }
+                    finalized_locations[retired_indices[layer[i]]] = replacements[i];
+                }
+            }
+
+            KeyVector sync_keys = retired_keys;
             std::sort(sync_keys.begin(), sync_keys.end());
             sync_keys.erase(std::unique(sync_keys.begin(), sync_keys.end()), sync_keys.end());
             const bool metadata_durable = indexer->Sync(sync_keys);
+            metadata_durable_by_instance.emplace(internal_instance_id, metadata_durable);
             if (!metadata_durable) {
                 // The in-memory view may already be retired, but without a
                 // persistence barrier it is not safe to release the physical
@@ -1578,6 +1751,11 @@ private:
                 KVCM_LOG_WARN("KVMeta reclaimer could not persist retired metadata for instance [%s]",
                               internal_instance_id.c_str());
             }
+        }
+
+        std::vector<RetiredItem> retired_items;
+        retired_items.reserve(candidates.size());
+        for (const auto &[internal_instance_id, indices] : by_instance) {
             std::vector<bool> removes_metadata_key(indices.size(), false);
             std::map<std::int64_t, std::vector<std::size_t>> retired_by_key;
             for (std::size_t i = 0; i < indices.size(); ++i) {
@@ -1591,19 +1769,21 @@ private:
                 const bool all_retired =
                     std::all_of(relative_indices.begin(),
                                 relative_indices.end(),
-                                [&](const std::size_t relative_index) { return retired[relative_index]; });
+                                [&](const std::size_t relative_index) { return retired[indices[relative_index]]; });
                 if (selected_complete_key && all_retired) {
                     removes_metadata_key[relative_indices.back()] = true;
                 }
             }
             for (std::size_t i = 0; i < indices.size(); ++i) {
-                if (!retired[i]) {
+                const std::size_t candidate_index = indices[i];
+                if (!retired[candidate_index]) {
                     continue;
                 }
-                const Candidate &candidate = candidates[indices[i]];
-                auto retired_location = std::make_shared<CacheLocation>(*candidate.location);
-                retired_location->set_status(CLS_DELETING);
-                retired_location->set_create_time(retire_deadline);
+                const Candidate &candidate = candidates[candidate_index];
+                const auto retired_location = finalized_locations[candidate_index];
+                if (!retired_location) {
+                    throw std::logic_error("missing finalized KVMeta retirement location");
+                }
                 retired_items.push_back(RetiredItem{internal_instance_id,
                                                     KvMetaManager::SessionItem{0,
                                                                                {},
@@ -1613,7 +1793,7 @@ private:
                                                                                retired_location,
                                                                                candidate.value_size},
                                                     removes_metadata_key[i],
-                                                    metadata_durable});
+                                                    metadata_durable_by_instance.at(internal_instance_id)});
             }
         }
         return retired_items;
@@ -2088,7 +2268,18 @@ private:
                 !current_pressure.Any()) {
                 return false;
             }
-            auto selected = SelectCandidates(std::move(candidate_keys), current_pressure, batch_size);
+            const PendingCapacity pending_capacity = RemainingPendingCapacity();
+            if (!pending_capacity.batch_available || pending_capacity.object_count == 0 ||
+                pending_capacity.bytes == 0) {
+                ++pending_limit_reject_count_metrics_;
+                KVCM_INTERVAL_LOG_WARN(
+                    10, "KVMeta reclaimer pending limit reached for group [%s]", group->name().c_str());
+                return false;
+            }
+            auto selected = SelectCandidates(std::move(candidate_keys),
+                                             current_pressure,
+                                             std::min(batch_size, pending_capacity.object_count),
+                                             pending_capacity.bytes);
             if (selected.empty()) {
                 return false;
             }
@@ -2101,16 +2292,9 @@ private:
                 return false;
             }
 
-            const std::int64_t now_us = TimestampUtil::GetCurrentTimeUs();
-            const auto delay_us = std::chrono::duration_cast<std::chrono::microseconds>(delay).count();
-            std::int64_t retire_deadline = 0;
-            if (!EncodeTaggedDeadlineUs(now_us, delay_us, retire_deadline)) {
-                KVCM_LOG_WARN("KVMeta reclaimer could not encode retire deadline for group [%s]",
-                              group->name().c_str());
-                return false;
-            }
+            std::chrono::steady_clock::time_point finalization_deadline;
             try {
-                retired = RetireCandidates(request_context, selected, retire_deadline);
+                retired = RetireCandidates(request_context, selected, delay, finalization_deadline);
             } catch (...) {
                 // Retirement may already be durable. Stop only the KVMeta side
                 // before releasing the group shard so another round cannot
@@ -2124,7 +2308,6 @@ private:
                 // shard observed by Trim. Otherwise Trim could see the
                 // durable CLS_DELETING state in the tiny retire/marker window
                 // and bypass the configured read grace period.
-                const auto finalization_deadline = std::chrono::steady_clock::now() + delay;
                 try {
                     AddPendingBatch(group->name(), quota_shard, finalization_deadline, std::move(retired));
                 } catch (...) {
@@ -3066,17 +3249,19 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                 AddError(request_context, "KVMeta value is being reclaimed");
                 return {EC_EXIST, StartWriteResult{}};
             }
-            if (existing_size != value_sizes[i]) {
-                AddError(request_context, "KVMeta existing value size does not match PutStart value_sizes");
-                return {EC_MISMATCH, StartWriteResult{}};
-            }
             // Only a committed object is an idempotent cache hit. Treating an
             // active reservation as a hit can make a second object client
             // report SaveObjects success while the first writer later aborts,
-            // leaving no readable value behind.
+            // leaving no readable value behind. Its size is provisional too:
+            // after the writer aborts or expires, a different-size request is
+            // valid, so report the retryable state before any size comparison.
             if (!IsCommittedObject(*existing[i].location)) {
                 AddError(request_context, "KVMeta value is still being written");
                 return {EC_EXIST, StartWriteResult{}};
+            }
+            if (existing_size != value_sizes[i]) {
+                AddError(request_context, "KVMeta existing value size does not match PutStart value_sizes");
+                return {EC_MISMATCH, StartWriteResult{}};
             }
             response.key_mask[i] = true;
         } else {
@@ -3291,7 +3476,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         }
         if (create_result.size() != 1 || create_result[0].first != EC_OK ||
             !UriMatchesStorageBackend(create_result[0].second, selected.name, selected.type) ||
-            !HasSingletonAllocationShape(create_result[0].second, selected.type)) {
+            !HasOwnedAllocationShape(create_result[0].second, selected.type)) {
             const ErrorCode create_ec = create_result.size() == 1 ? create_result[0].first : EC_MISMATCH;
             // A backend contract violation can still carry successful
             // allocations. Release every safely attributable singleton, not
@@ -3304,8 +3489,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                 // to this backend when both its identity and URI scheme prove
                 // that the backend owns them.
                 if (ec == EC_OK && UriMatchesStorageBackend(uri, selected.name, selected.type) &&
-                    HasSingletonAllocationShape(uri, selected.type) &&
-                    seen_allocations.insert(uri.ToUriString()).second) {
+                    HasOwnedAllocationShape(uri, selected.type) && seen_allocations.insert(uri.ToUriString()).second) {
                     malformed_allocations.push_back(uri);
                 }
             }
@@ -3520,19 +3704,21 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                                                                 race_winners[i].location_id,
                                                                 *race_winners[i].location,
                                                                 winner_size);
-            if (validate_ec != EC_OK || winner_size != candidates[candidate_index].value_size) {
-                if (validate_ec == EC_OK) {
-                    AddError(request_context, "KVMeta concurrent winner has a different value size");
-                }
-                return {rollback_start(validate_ec == EC_OK ? EC_MISMATCH : validate_ec), StartWriteResult{}};
+            if (validate_ec != EC_OK) {
+                return {rollback_start(validate_ec), StartWriteResult{}};
             }
             // The conditional insert can lose to a writer whose metadata is
             // valid but not committed yet. Do not turn that transient state
-            // into a successful cache hit: our own candidate allocations must
-            // be rolled back and the caller must retry explicitly.
+            // or its provisional size into a permanent mismatch: our own
+            // candidate allocations must be rolled back and the caller must
+            // retry explicitly after the winner settles.
             if (!IsCommittedObject(*race_winners[i].location)) {
                 AddError(request_context, "KVMeta concurrent winner is still writing");
                 return {rollback_start(EC_EXIST), StartWriteResult{}};
+            }
+            if (winner_size != candidates[candidate_index].value_size) {
+                AddError(request_context, "KVMeta concurrent winner has a different value size");
+                return {rollback_start(EC_MISMATCH), StartWriteResult{}};
             }
         }
     }

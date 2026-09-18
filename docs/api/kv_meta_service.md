@@ -130,7 +130,8 @@ Trim(instance) -> 按策略清理整个 KVMeta instance
 - `locations` 和 `hit_mask.values` 始终与请求 keys 严格等长、同下标；
 - miss 的 `hit_mask=false`，对应 `locations[i]` 为空；
 - active 对象不可读，表现为 miss；
-- hit location 必须包含恰好一个名为 `value` 的 URI，并携带真实 `value_size`。
+- hit location 必须包含恰好一个名为 `value` 的 URI，并携带真实 `value_size`；Mooncake URI 还必须包含非空物理
+  `key`，可打包文件型 backend 的 `blkid` 必须缺失或等于 `0`。
 
 V1 `Get` 不创建 server-side read lease，返回 location 后不会 pin 物理 allocation。调用方必须确保对应数据面 Load
 结束前没有其他 client 执行同对象的 Remove/Trim/GC；数据面读取失败应把整组当作 miss 并重算。需要读删并发保护
@@ -151,7 +152,8 @@ V1 `Get` 不创建 server-side read lease，返回 location 后不会 pin 物理
 - 调用方必须保证同一 key 永远对应相同 bytes；否则同尺寸错误内容会成为无法检测的 false hit；
 - 有任一 miss 时返回非空 session，且每个 location 的 `value_size`、URI `size` 与请求值完全相等；
 - 同 key 的 committed 对象尺寸不同时，整批返回 `SIZE_MISMATCH`，不创建 allocation；
-- 任一 key 仍 active 时，整批返回 `WRITE_IN_PROGRESS`，不把它误报为命中；
+- 任一 key 仍 active 时，无论本次请求尺寸是否相同，整批都返回可重试的 `WRITE_IN_PROGRESS`，不把未提交的 size
+  当成永久冲突，也不把 active 对象误报为命中；
 - 容量、storage type quota 或 active-session 数量不足时，不会返回可用 session；已产生的候选 allocation 或
   reservation 会在返回前进入补偿清理。
 - group reclaim 配置被热更新为非法值时，全部命中的请求仍可幂等返回；包含任一 miss 的请求在 backend allocation
@@ -201,6 +203,18 @@ orphan 清理发现，服务端不会猜测或重放该 Create。
 已经持久化删除的 metadata 不会恢复，旧 URI 也不会在后续 Trim 中被重放。`TS_REMOVE_ALL_META` 则按定义只删除
 metadata，调用方必须提前确认对应物理对象将由 backend/namespace 清理机制回收。
 
+### 5.8 自动 Reclaimer
+
+自动回收在 RPC 主链路之外异步运行。容量不足的 `PutStart` 返回 `RESOURCE_EXHAUSTED` 并唤醒按需回收，调用方按延迟
+预算选择有界重试或直接重算。Reclaimer 先把 committed metadata 持久化为读不可见的过渡 fence；本批全部 fence
+持久化后才设置统一的有限 grace deadline。grace 到期后再持久化删除 metadata、释放逻辑 quota，并对物理对象只
+发起一次 Delete。reader fence barrier 失败或状态转换结果不确定时会关闭 KVMeta maintenance/admission；有限
+deadline 的 `Sync` 暂时失败时则把 batch 标记为未持久化，并在物理删除前重试 barrier。两种情况都不会提前删除
+物理对象；普通 KVCache 请求不经过这条链路。
+
+进程内 pending 队列最多容纳 1024 个 batch、20000 个对象和 4 TiB。候选选择同时受剩余 object/byte budget 约束，
+超出剩余额度的候选会被跳过或裁剪，而不是让一个过大的采样结果永久阻塞后续回收。
+
 ## 6. 错误码和调用方动作
 
 | 错误码 | 含义 | 建议动作 |
@@ -212,9 +226,9 @@ metadata，调用方必须提前确认对应物理对象将由 backend/namespace
 | `INSTANCE_NOT_EXIST` | 未注册或内部 schema 不匹配 | 检查注册和部署配置 |
 | `SERVER_NOT_LEADER` / `SERVICE_NOT_READY` | endpoint 当前不能服务，或 KVMeta group 没有有效 LRU 回收配置 | endpoint 问题可切换地址；配置问题先修复 group，避免无界重试 |
 | `RESOURCE_EXHAUSTED` / `REACH_MAX_ENTITY_CAPACITY` | byte quota、session 或实体容量到限 | 释放对象或扩容后再试 |
-| `WRITE_IN_PROGRESS` | 相同 key 或 instance 正在写/finalize | 等原 session 收敛，不并发覆盖 |
+| `WRITE_IN_PROGRESS` | 相同 key 或 instance 正在写/finalize；active size 仍是临时值 | 等原 session 收敛，不并发覆盖 |
 | `SESSION_NOT_FOUND` | session 过期、不存在或 instance 不匹配 | 查询最终状态，不把它当成功 |
-| `SIZE_MISMATCH` | 已有对象或 location 尺寸不一致 | 使用新 key，或先确认并删除旧对象 |
+| `SIZE_MISMATCH` | 已 committed 对象或 location 尺寸不一致 | 使用新 key，或先确认并删除旧对象 |
 | `NOT_FOUND` | 对象/instance 元数据不存在 | 按业务 miss 处理 |
 | `IO_ERROR` | metadata/storage 操作失败或超时 | 根据操作幂等性判断，避免盲目重放 mutation |
 | `OUTCOME_UNKNOWN` | mutation 后的回滚/对账无法证明唯一最终状态 | 查询最终状态；不得盲目重试 mutation |

@@ -30,7 +30,10 @@ bool UriMatchesStorageType(const DataStorageUri &uri, DataStorageType storage_ty
     return uri_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN && ToBaseType(uri_type) == ToBaseType(storage_type);
 }
 
-bool HasSingletonAllocationShape(const DataStorageUri &uri, DataStorageType storage_type) {
+bool HasOwnedAllocationShape(const DataStorageUri &uri, DataStorageType storage_type) {
+    if (storage_type == DataStorageType::DATA_STORAGE_TYPE_MOONCAKE) {
+        return uri.HasParam("key") && !uri.GetParam("key").empty();
+    }
     switch (storage_type) {
     case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
     case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
@@ -428,9 +431,8 @@ ClientErrorCode SdkWrapper::ValidateKvMetaObjects(const std::vector<DataStorageU
             KVCM_LOG_WARN("KVMeta URI refers to an unknown storage backend: %s", uri.GetHostName().c_str());
             return ER_GETSDK_ERROR;
         }
-        if (!UriMatchesStorageType(uri, storage_type->second) ||
-            !HasSingletonAllocationShape(uri, storage_type->second)) {
-            KVCM_LOG_WARN("KVMeta URI scheme or singleton allocation shape does not match backend: %s",
+        if (!UriMatchesStorageType(uri, storage_type->second) || !HasOwnedAllocationShape(uri, storage_type->second)) {
+            KVCM_LOG_WARN("KVMeta URI scheme or owned allocation shape does not match backend: %s",
                           uri.GetHostName().c_str());
             return ER_INVALID_PARAMS;
         }

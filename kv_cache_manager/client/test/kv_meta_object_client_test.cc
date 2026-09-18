@@ -575,6 +575,21 @@ TEST_F(KvMetaObjectClientTest, LoadsOnlyAfterEveryKeyAndSizeMatches) {
     EXPECT_EQ(2U, transfer_->loaded_buffer_count);
 }
 
+TEST_F(KvMetaObjectClientTest, AcceptsMooncakeLocationsOnlyWithANonEmptyPhysicalKey) {
+    metadata_->get_result.hit_mask = {true, true};
+    auto first = MakeLocation("mooncake://moon/first?key=physical-first&size=5", sizeof(first_));
+    first.type = KvMetaStorageType::MOONCAKE;
+    auto second = MakeLocation("mooncake://moon/second?key=physical-second&size=9", sizeof(second_));
+    second.type = KvMetaStorageType::MOONCAKE;
+    metadata_->get_result.locations = {first, second};
+
+    EXPECT_EQ(ER_OK, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(1, transfer_->load_calls);
+    EXPECT_EQ((UriStrVec{"mooncake://moon/first?key=physical-first&size=5",
+                         "mooncake://moon/second?key=physical-second&size=9"}),
+              transfer_->loaded_uris);
+}
+
 TEST_F(KvMetaObjectClientTest, PropagatesLoadFailureAfterOneExactDataPlaneCall) {
     metadata_->get_result.hit_mask = {true, true};
     metadata_->get_result.locations = {
@@ -664,6 +679,14 @@ TEST_F(KvMetaObjectClientTest, MalformedLocationSchemaIsInternalErrorNotSizeMism
     expect_internal(std::move(malformed));
 
     malformed = MakeLocation("mooncake://nfs/first?size=5", sizeof(first_));
+    expect_internal(std::move(malformed));
+
+    malformed = MakeLocation("mooncake://moon/first?size=5", sizeof(first_));
+    malformed.type = KvMetaStorageType::MOONCAKE;
+    expect_internal(std::move(malformed));
+
+    malformed = MakeLocation("mooncake://moon/first?key=&size=5", sizeof(first_));
+    malformed.type = KvMetaStorageType::MOONCAKE;
     expect_internal(std::move(malformed));
 
     malformed = MakeLocation("file://nfs/first?blkid=1&size=5", sizeof(first_));

@@ -260,9 +260,11 @@ V1.1，而不是当前能力。
 `key` 应是第 2.2 节所述全部语义输入的 canonical digest，而不是只使用图片 URL、请求 id 或容易复用的业务主键。
 
 V1 的不可变规则是：一个 key 一旦 committed，就不能原地覆盖。后续相同 key、相同 size 的 `PutStart` 直接返回
-hit；相同 key、不同 size 返回 `SIZE_MISMATCH`。服务端没有能力判断“相同 key、相同 size、不同内容”，因此 key
-版本化是正确性的组成部分，不是命中率优化。模型热更新、预处理配置变更或 tensor schema 变更时，必须切换
-namespace/key version，而不能依赖 Trim 恰好先完成。
+hit；已 committed 的相同 key、不同 size 返回 `SIZE_MISMATCH`。active reservation 的 size 仍是未提交状态，无论
+竞争请求的 size 是否相同都返回可重试的 `WRITE_IN_PROGRESS`；原 writer 回滚或租约过期后，不同 size 的请求仍可
+取得新 reservation。服务端没有能力判断“相同 key、相同 size、不同内容”，因此 key 版本化是正确性的组成部分，
+不是命中率优化。模型热更新、预处理配置变更或 tensor schema 变更时，必须切换 namespace/key version，而不能
+依赖 Trim 恰好先完成。
 
 ### 5.2 exact-key 与哈希碰撞
 
@@ -287,6 +289,7 @@ namespace/key version，而不能依赖 Trim 恰好先完成。
 | `location_specs[0].uri` | scheme/hostname 必须对应所选 backend |
 | `value_size` | 对象有效字节数，必须大于 0 |
 | URI `size` 参数 | 必须与 `value_size` 完全相等 |
+| backend 所有权字段 | Mooncake URI 必须有非空 `key`；可打包文件型 backend 的 `blkid` 必须缺失或严格等于 `0` |
 
 这里的对象 storage type 只包括 HF3FS/VCNS-HF3FS、Mooncake、TairMempool DRAM/SSD、NFS 和测试用 Dummy。
 EventReport location 是外部 block 的观测记录，不代表 KVMeta 对该物理对象具有独占创建/删除权；proto 与 C++ enum
@@ -304,8 +307,9 @@ KVMeta 复用 `CacheLocation` 的存储格式，但不复用 KV cache 状态机�
 
 - **active**：`status=CLS_NEW` 且 `create_time` 为带 tag 的正数，编码写租约 wall-clock deadline；Get 不可见；
 - **committed**：仍为 `status=CLS_NEW`，但 `create_time` 为负数；Get 可见；
-- **retired**：`status=CLS_DELETING` 且 `create_time` 为带 tag 的正数，编码 Reclaimer grace deadline；Get
-  不可见，但 metadata 在宽限期结束前仍保留对物理 allocation 的归属证明；
+- **retired**：`status=CLS_DELETING` 且 `create_time` 为带 tag 的正数；通常编码 Reclaimer grace deadline；两阶段
+  retirement 的过渡 fence 使用带 tag 的最大值，表示“已读隔离但尚未发布有限 deadline”。两者均对 Get 不可见，
+  metadata 在宽限期结束前仍保留对物理 allocation 的归属证明；
 - **absent**：metadata 不存在。
 
 滚动升级时，旧版本遗留的无 tag 正 marker 按“创建时间 + `max_write_timeout_seconds`”推导保守截止时间。
@@ -424,11 +428,17 @@ group 和 storage type 分别计算；metadata key 准入按**目标 instance**�
 3. 选择候选时先满足目标 instance key、storage type 等更具体的压力，再补 group 通用压力；每一类内部仍按
    `last_access_time` 排序。具体维度释放的 bytes 同时抵扣 group 压力，避免先淘汰一个全局最老但无关的对象，随后
    又淘汰真正受限对象的重复回收；
-4. 持有 KVMeta 专用 group shard，以完整旧值 CAS 将 `committed` 改为 `retired` 并 `Sync`。从这一步起新的 `Get`
-   返回 miss，同 key `PutStart` 返回 `WRITE_IN_PROGRESS`；
-5. 把对象放入按 deadline 排序的 pending queue。worker 不会 sleep 等待某个 group 的 grace，因此其他 group
-   可以继续回收；
-6. grace 到期后，再次完成 metadata persistence barrier，精确删除 retired metadata 并 `Sync`，最后只发起一次
+4. 持有 KVMeta 专用 group shard，以完整旧值 CAS 将 `committed` 改为带远期过渡 marker 的 `retired`，并对每个
+   instance 执行 `Sync`。这是 reader fence：只有本批所有成功转换的 fence 都已持久化后才允许开始计算 grace；从
+   各自 CAS 起新的 `Get` 返回 miss，同 key `PutStart` 返回 `WRITE_IN_PROGRESS`；
+5. 在最后一个 reader fence 持久化之后取得统一时间锚点，再以完整 fence 值 CAS 写入有限 grace deadline 并再次
+   `Sync`。任一阶段结果畸形、fence persistence 失败或 indexer 消失都会立即关闭 KVMeta maintenance/admission，
+   不发布 pending、也不触发物理 Delete；换主 recovery 对过渡 marker 最多按 recovery force deadline 保守等待，
+   因而只可能延迟释放，不能缩短旧 reader 的宽限期。若有限 deadline 的 `Sync` 仅返回失败，batch 会携带
+   `metadata_durable=false` 进入 pending，并在 finalization 前重试该 barrier；
+6. 把对象连同同一个时间锚点放入按 deadline 排序的 pending queue。worker 不会 sleep 等待某个 group 的 grace，
+   因此其他 group 可以继续回收；
+7. grace 到期后，再次完成 metadata persistence barrier，精确删除 retired metadata 并 `Sync`，最后只发起一次
    物理 Delete。物理结果不确定时不重放，交给 backend orphan 回收。
 
 完整状态链是 `committed -> retired(读不可见、仍计账) -> grace -> metadata deleted/quota released -> physical
@@ -436,8 +446,10 @@ Delete attempted`。metadata GC 与物理 GC 是两个阶段；只看到逻辑 u
 
 metadata delete 已进入内存但 `Sync` 失败时，Reclaimer 会先封闭该 KVMeta group 的新 `PutStart`，再按 100ms 到
 30s 的指数退避重试；这样不会让新一代对象进入“旧 metadata 已消失、旧物理删除尚未安全完成”的 ABA 窗口。现有
-write session 可以继续 finalization。进程内 pending 上限为 1024 个 batch、20000 个对象和 4TiB，达到上限只暂停
-新的退休，不影响普通 KVCache 主链路。
+write session 可以继续 finalization。进程内 pending 上限为 1024 个 batch、20000 个对象和 4TiB；每轮选择同时按
+剩余 batch、对象数和 bytes 裁剪，单个候选或完整 key 放不下时跳过并继续寻找可容纳对象，避免同一超限向量永久
+阻塞回收。所有剩余额度仍会在持有 group shard 时再次校验；真正达到上限只暂停新的退休，不影响普通 KVCache
+主链路。
 
 ## 7. 不同 value size 的实现
 
@@ -464,6 +476,7 @@ KVMeta capability adapter 允许支持方一次接收不同 size，同时让不�
 - IOV 非空、非零、不 ignored，地址非空，memory type 只能是 CPU/GPU；
 - URI 合法、hostname 已注册、backend scheme 与 metadata type 一致；
 - 原始 URI 不含 fragment 或重复/空 query key，避免 parser 静默覆盖 `size`、`blkid` 等安全字段；
+- Mooncake 的物理寻址完全依赖 URI `key`，因此该参数必须存在且非空；scheme/host/size 不能单独证明对象所有权；
 - 可打包文件型 backend 的 `blkid` 缺失或严格解析为 `0`，不允许独立 transfer 调用方伪造共享 allocation 偏移；
 - 整个 batch 在任何数据 I/O 前完成校验。
 
@@ -494,7 +507,8 @@ reservation”串在同一容量准入临界区内，防止不同尺寸并发写
 普通 KV cache 不获取。
 
 metadata reservation 使用完整旧值条件保护。跨进程 `PutStart` 竞争失败后，会重新读取赢家并验证 exact key、
-状态、backend、URI 和 size：只有相同尺寸的 committed 对象可视为命中；active 赢家返回
+状态、backend、URI 和 size：只有相同尺寸的 committed 对象可视为命中；不同尺寸的 committed 对象返回
+`SIZE_MISMATCH`；active 赢家的 size 尚未成为不可变对象契约，因此无论尺寸是否相同都返回
 `WRITE_IN_PROGRESS`，本请求的候选 allocation 被回收。
 
 ### 8.2 Remove/新一代写入的 ABA 防护
@@ -618,7 +632,8 @@ KVMeta recovery 只扫描带完整 KVMeta schema 的保留 namespace，并执行
 
 1. 分批扫描 metadata；
 2. 对未到期 active lease 保持请求门关闭并等待，等待可被降主/Stop 以不超过 100ms 粒度取消；
-3. 对未到期 retired metadata 等待其持久化 grace deadline；到期后完成 metadata-first 删除；
+3. 对未到期 retired metadata 等待其持久化 grace deadline；两阶段 retirement 遗留的远期过渡 marker 按
+   recovery force deadline 保守等待；到期后完成 metadata-first 删除；
 4. 对已过期、归属可确认的 active/retired metadata 做条件删除并持久化，再对 allocation 做一次物理清理；
 5. metadata 阶段失败则保持 KVMeta 请求门关闭；物理清理失败只产生脱敏 orphan 告警，不重放不确定 Delete；
 6. 完成一个无 metadata 删除、无 metadata 错误的稳定扫描后，按 committed URI 的真实 `size` 重建 KVMeta
@@ -1009,10 +1024,11 @@ group 内所有 instance；恢复时再用 durable record 校准。cleanup 执�
   metadata/usage 收敛、worker 存活和恢复继续放流；独立 Reclaimer 还覆盖 group/type bytes、key-count
   和零水位、低于水位的大请求按需回收、storage type 按需回收、per-instance key 准入、重叠压力不误伤无关
   Cache、不可能请求不清空有效对象、group LRU、active 排除、跨 instance 小样本轮转、pending credit 防过淘汰、
-  跨 group grace 隔离、Pause、非 LRU 注册拒绝、非法热更新关闭新 allocation、metadata Sync
-  重试/admission fail-closed、物理删除不重放，以及降主后 retired recovery；
-- Client/SDK UT：响应对齐、重复参数/fragment/EventReport/URI size/buffer 校验、CPU build 对 GPU buffer 的
-  fail-closed、failover、超时 drain、
+  跨 group grace 隔离、reader fence 后锚定 deadline、fence Sync 失败关闭准入且不删除、pending object/byte
+  边界裁剪、Pause、非 LRU 注册拒绝、非法热更新关闭新 allocation、metadata Sync 重试/admission fail-closed、
+  物理删除不重放，以及降主后有限 deadline/过渡 fence 的 retired recovery；
+- Client/SDK UT：响应对齐、重复参数/fragment/EventReport/Mooncake 空 key/URI size/buffer 校验、CPU build 对 GPU
+  buffer 的 fail-closed、failover、超时 drain、
   普通 TransferClient 回归；
 - 内部 TairMempool UT：variable-size policy、严格 URI、禁 fallback、禁 gather/scatter；
 - v6d UT/真实服务测试：CPU/CUDA buffer 封装、不同长度读写和 remove；
