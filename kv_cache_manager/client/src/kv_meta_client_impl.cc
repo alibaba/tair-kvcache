@@ -232,13 +232,28 @@ ClientErrorCode KvMetaClientImpl::Call(Response *response, TransportRetryPolicy 
     ClientErrorCode last_error = ER_INVALID_GRPCSTATUS;
     const auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(config_.call_timeout_ms);
     for (std::size_t attempt = 0; attempt < stubs_.size(); ++attempt) {
-        if (std::chrono::system_clock::now() >= deadline) {
-            break;
+        const auto now = std::chrono::system_clock::now();
+        if (now >= deadline) {
+            // Reaching the overall budget between attempts is a local
+            // pre-dispatch timeout. Unsafe mutations only reach this branch
+            // after explicit not-leader/not-ready responses; an ambiguous
+            // transport result returns immediately below.
+            return ER_SDK_TIMEOUT;
         }
         const std::size_t index = (start + attempt) % stubs_.size();
         response->Clear();
         grpc::ClientContext context;
-        context.set_deadline(deadline);
+        auto attempt_deadline = deadline;
+        if (transport_retry_policy == TransportRetryPolicy::kSafe && attempt + 1 < stubs_.size()) {
+            // Divide the remaining overall budget among the endpoints still
+            // eligible for safe transport failover. A black-holed preferred
+            // address can no longer consume the healthy secondary's entire
+            // deadline. Fast explicit failures leave their unused share for
+            // subsequent attempts.
+            const auto attempts_left = static_cast<std::int64_t>(stubs_.size() - attempt);
+            attempt_deadline = now + (deadline - now) / attempts_left;
+        }
+        context.set_deadline(attempt_deadline);
         const grpc::Status grpc_status = rpc(*stubs_[index], &context, response);
         if (!grpc_status.ok()) {
             last_error = ER_INVALID_GRPCSTATUS;

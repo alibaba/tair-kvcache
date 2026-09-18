@@ -203,6 +203,7 @@ metadata，调用方必须提前确认对应物理对象将由 backend/namespace
 
 多地址 client 在一个总 `call_timeout_ms` 预算内工作：
 
+- 可安全重试的调用会在尚未尝试的 endpoint 间分配剩余预算，避免黑洞首地址独占总 deadline；
 - `Get`、`GetInstanceInfo` 和同配置 `RegisterInstance` 遇到 transport error 可以尝试下一 endpoint；
 - 所有 RPC 收到明确的 not-leader/not-ready 业务响应时可以 failover；
 - `PutStart`、`PutFinish`、`Remove` 和 `Trim` 的 transport error 具有不确定结果，官方 client 不自动重放；

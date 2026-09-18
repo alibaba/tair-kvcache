@@ -240,6 +240,13 @@ void DataStorageSelector::DoCleanup() {}
 DataStorageSelectResult
 DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_context,
                                                         const std::string &instance_group) const noexcept {
+    return SelectCacheWriteDataStorageBackend(request_context, instance_group, 0);
+}
+
+DataStorageSelectResult
+DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_context,
+                                                        const std::string &instance_group,
+                                                        const std::uint64_t required_bytes) const noexcept {
     SPAN_TRACER(request_context);
     DataStorageSelectResult result{ErrorCode::EC_UNKNOWN, DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, ""};
     if (!request_context) {
@@ -307,7 +314,7 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
     // construct the availability table of each storage type in this
     // instance group
     StorageQuotaAvail storage_quota_avail_table;
-    GenStorageQuotaAvailTable(request_context, quota, instance_infos, storage_quota_avail_table);
+    GenStorageQuotaAvailTable(request_context, quota, instance_infos, required_bytes, storage_quota_avail_table);
 
     // get the configured data storage candidate list of this instance group
     const std::vector<std::string> &configured_candidates = ig->storage_candidates();
@@ -378,8 +385,7 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
         PREFIX_LOG(WARN, "explicit target admission failed to read instance group: %s", instance_group.c_str());
         return results;
     }
-    const auto [instances_ec, instance_infos] =
-        registry_manager_->ListInstanceInfo(request_context, instance_group);
+    const auto [instances_ec, instance_infos] = registry_manager_->ListInstanceInfo(request_context, instance_group);
     if (instances_ec != EC_OK) {
         PREFIX_LOG(WARN, "explicit target admission failed to list instances: %s", instance_group.c_str());
         return results;
@@ -397,9 +403,8 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
     }
 
     auto saturating_add = [](std::uint64_t &sum, const std::uint64_t value) {
-        sum = value > std::numeric_limits<std::uint64_t>::max() - sum
-                  ? std::numeric_limits<std::uint64_t>::max()
-                  : sum + value;
+        sum = value > std::numeric_limits<std::uint64_t>::max() - sum ? std::numeric_limits<std::uint64_t>::max()
+                                                                      : sum + value;
     };
     std::uint64_t group_used_bytes = 0;
     for (const auto &instance_info : instance_infos) {
@@ -507,6 +512,7 @@ void DataStorageSelector::GenStorageQuotaAvailTable(
     RequestContext const *request_context,
     const InstanceGroupQuota &quota,
     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
+    const std::uint64_t required_bytes,
     StorageQuotaAvail &out_storage_quota_avail_table) const noexcept {
     const auto &trace_id = request_context->trace_id();
 
@@ -530,7 +536,17 @@ void DataStorageSelector::GenStorageQuotaAvailTable(
             total_sz += sz;
         }
 
-        if (storage_quota.capacity() <= total_sz) {
+        // The fixed-block path passes required_bytes == 0 and retains its
+        // established reached-capacity check. KVMeta supplies the exact sum
+        // of its variable-size misses, so a type with only partial remaining
+        // capacity is filtered before preference selection and a viable
+        // fallback type can still be chosen.
+        const bool cannot_fit =
+            required_bytes == 0
+                ? storage_quota.capacity() <= total_sz
+                : storage_quota.capacity() < 0 || total_sz > static_cast<std::uint64_t>(storage_quota.capacity()) ||
+                      required_bytes > static_cast<std::uint64_t>(storage_quota.capacity()) - total_sz;
+        if (cannot_fit) {
             out_storage_quota_avail_table.SetStorageQuotaAvailByType(type, false);
         }
     }

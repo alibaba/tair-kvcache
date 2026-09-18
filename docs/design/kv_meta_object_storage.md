@@ -478,7 +478,9 @@ exact-object worker 使用非阻塞入队，因此 `sdk_config.queue_size` 必�
 ### 9.3 多地址与结果不确定
 
 `KvMetaClient` 支持最多 64 个去重 endpoint，单地址最长 1024 bytes，单次调用的总 `call_timeout_ms` 最大
-600000ms。成功 endpoint 会成为后续请求的首选。
+600000ms。成功 endpoint 会成为后续请求的首选。可安全重试的调用会把剩余总预算在尚未尝试的 endpoint 间
+分配，避免首个黑洞地址耗尽全部时间；快速失败未消耗的预算会留给后续地址。mutation 遇到不确定 transport
+结果仍立即返回，不使用这一重试机制。
 
 - `Get`、`GetInstanceInfo` 和同配置的幂等 `RegisterInstance` 遇到 transport error 可以尝试下一地址；
 - 所有 RPC 收到服务端明确的 not-leader/not-ready 响应时可以 failover；
@@ -530,8 +532,18 @@ Instance Group quota 和 storage backend 配置。部署必须提前创建仅供
 - `PauseReclaimer` 会同时停止新的 KVMeta retirement；已进入 pending 的对象仍会完成 metadata-first
   finalization，避免长期停在半回收状态。
 
-可观测指标位于 `kv_meta_reclaimer.*` namespace，包括 round、retired/reclaimed object、reclaimed bytes、retry/error
-counter，以及 pending object/bytes 和 blocked group gauge。
+可观测指标位于 `kv_meta_reclaimer.*` namespace：
+
+- `round_count`、`retired_object_count`、`retry_count`、`error_count`；
+- `reclaimed_object_count`、`reclaimed_bytes` 表示 metadata 已持久化删除后释放的逻辑 quota；
+- `physical_delete_attempted_object_count` 表示已提交给 backend 清理的对象数；
+- `physical_delete_uncertain_object_count`、`physical_delete_uncertain_bytes` 表示 backend 返回错误、结果长度异常或
+  抛异常后，物理删除结果不确定的保守计数；
+- `pending_limit_reject_count` 表示达到独立 pending 硬上限、拒绝新 retirement 的次数；
+- `pending_object_count`、`pending_bytes` 和 `blocked_group_count` 是当前状态 gauge。
+
+因此告警应同时观察逻辑回收和 physical uncertain 指标。backend 明确返回成功但自身实现为 no-op（例如当前开源
+NFS backend）属于 backend 能力边界，无法由上述 uncertain 指标推断真实磁盘释放量。
 
 ### 11.2 对象客户端
 
