@@ -426,10 +426,11 @@ public:
         delay_ = delay;
     }
 
-    void FailSyncAfter(std::size_t successful_syncs) {
+    void FailSyncAfter(std::size_t successful_syncs, std::size_t failure_count = 1) {
         std::lock_guard<std::mutex> lock(mutex_);
-        fail_after_syncs_ = successful_syncs;
-        sync_failed_ = false;
+        fail_after_syncs_ = failure_count == 0 ? std::nullopt : std::optional<std::size_t>{successful_syncs};
+        remaining_failures_ = failure_count;
+        sync_failure_count_ = 0;
     }
 
     bool Sync(const KeyTypeVec &keys) noexcept override {
@@ -448,8 +449,13 @@ public:
             if (fail_after_syncs_) {
                 if (*fail_after_syncs_ == 0) {
                     fail = true;
-                    fail_after_syncs_.reset();
-                    sync_failed_ = true;
+                    ++sync_failure_count_;
+                    if (remaining_failures_ <= 1) {
+                        remaining_failures_ = 0;
+                        fail_after_syncs_.reset();
+                    } else {
+                        --remaining_failures_;
+                    }
                     condition_.notify_all();
                 } else {
                     --*fail_after_syncs_;
@@ -465,9 +471,11 @@ public:
         return MetaLocalBackend::Sync(keys);
     }
 
-    bool WaitForSyncFailure(std::chrono::milliseconds timeout) {
+    bool WaitForSyncFailure(std::chrono::milliseconds timeout) { return WaitForSyncFailures(1, timeout); }
+
+    bool WaitForSyncFailures(std::size_t count, std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(mutex_);
-        return condition_.wait_for(lock, timeout, [&]() { return sync_failed_; });
+        return condition_.wait_for(lock, timeout, [&]() { return sync_failure_count_ >= count; });
     }
 
 private:
@@ -476,7 +484,8 @@ private:
     std::optional<std::size_t> delay_after_syncs_;
     std::optional<std::size_t> fail_after_syncs_;
     std::chrono::milliseconds delay_{0};
-    bool sync_failed_{false};
+    std::size_t remaining_failures_{0};
+    std::size_t sync_failure_count_{0};
 };
 
 class MooncakeIdentityNfsBackend : public NfsBackend {
@@ -1157,6 +1166,65 @@ TEST_F(KvMetaManagerTest, DifferentSizeConcurrentActiveWinnerRemainsRetryableAft
     }
 }
 
+TEST_F(KvMetaManagerTest, ReservationRollbackFailureFailsKvMetaClosedUntilRecovery) {
+    auto *controlled_sync = InstallControlledSyncBackend(kInstanceId);
+    ASSERT_NE(nullptr, controlled_sync);
+    // The first failure makes the newly inserted reservation durability
+    // barrier ambiguous. The second failure prevents the compensating metadata
+    // delete from proving absence, and no write session exists yet to own it.
+    controlled_sync->FailSyncAfter(0, 2);
+
+    auto [start_ec, start] =
+        manager_->StartWrite(&request_context_, kInstanceId, {"reservation-rollback-unknown"}, {17}, 30);
+    EXPECT_EQ(EC_OUTCOME_UNKNOWN, start_ec);
+    EXPECT_TRUE(start.write_session_id.empty());
+    EXPECT_TRUE(start.locations.empty());
+    EXPECT_TRUE(controlled_sync->WaitForSyncFailures(2, std::chrono::seconds(2)));
+
+    auto [closed_ec, closed] =
+        manager_->StartWrite(&request_context_, kInstanceId, {"must-wait-for-recovery"}, {19}, 30);
+    EXPECT_EQ(EC_SERVICE_NOT_LEADER, closed_ec);
+    EXPECT_TRUE(closed.locations.empty());
+
+    manager_->DoCleanup();
+    ASSERT_EQ(EC_OK, manager_->DoRecover());
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, {"after-recovery"}, {23}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, ReservationPhysicalCleanupFailureDoesNotCloseKvMetaAdmission) {
+    auto *controlled_sync = InstallControlledSyncBackend(kInstanceId);
+    ASSERT_NE(nullptr, controlled_sync);
+    controlled_sync->FailSyncAfter(0);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto failing =
+        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kError);
+    ASSERT_EQ(EC_OK, failing->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = failing;
+    }
+
+    // The reservation barrier fails, but its compensating metadata absence is
+    // durable. A failed physical release leaves only an unreachable orphan;
+    // it must not unnecessarily fail-close unrelated KVMeta traffic.
+    auto [failed_ec, failed] =
+        manager_->StartWrite(&request_context_, kInstanceId, {"rollback-physical-orphan"}, {17}, 30);
+    EXPECT_EQ(EC_TIMEOUT, failed_ec);
+    EXPECT_TRUE(failed.locations.empty());
+    EXPECT_EQ(1, failing->DeleteAttempts());
+
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, {"admission-stays-open"}, {19}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {true}));
+}
+
 TEST_F(KvMetaManagerTest, TrimRejectsActiveSessionsWithoutDeletingCommittedValues) {
     auto [committed_ec, committed] = manager_->StartWrite(&request_context_, kInstanceId, {"trim-committed"}, {13}, 30);
     ASSERT_EQ(EC_OK, committed_ec);
@@ -1370,7 +1438,10 @@ TEST_F(KvMetaManagerTest, RemoveContainsPhysicalDeleteExceptionWithoutReplay) {
         storage_manager->storage_map_["nfs_01"] = throwing;
     }
 
-    EXPECT_EQ(EC_IO_ERROR, manager_->Remove(&request_context_, kInstanceId, {kKey}));
+    // Metadata is already durably absent when the provider throws. Surface an
+    // explicitly ambiguous mutation result so a caller cannot treat the
+    // ordinary backend error as safe permission to replay Remove later.
+    EXPECT_EQ(EC_OUTCOME_UNKNOWN, manager_->Remove(&request_context_, kInstanceId, {kKey}));
     EXPECT_EQ(1, throwing->DeleteAttempts());
     auto indexer =
         cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
@@ -1381,8 +1452,8 @@ TEST_F(KvMetaManagerTest, RemoveContainsPhysicalDeleteExceptionWithoutReplay) {
     ASSERT_EQ(1, values.size());
     EXPECT_FALSE(values[0].found);
 
-    // An API retry is idempotent at the metadata layer and must not replay the
-    // uncertain physical delete after the old URI is no longer discoverable.
+    // After an explicit metadata reconciliation, cleanup remains idempotent
+    // and cannot rediscover or replay the old reusable-address URI.
     EXPECT_EQ(EC_OK, manager_->Remove(&request_context_, kInstanceId, {kKey}));
     EXPECT_EQ(1, throwing->DeleteAttempts());
     {
@@ -1394,6 +1465,24 @@ TEST_F(KvMetaManagerTest, RemoveContainsPhysicalDeleteExceptionWithoutReplay) {
     ASSERT_EQ(EC_OK, recreate_ec);
     ASSERT_FALSE(recreated.write_session_id.empty());
     EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, recreated.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, RemoveReturnsUnknownWhenMetadataPersistenceIsAmbiguous) {
+    constexpr const char *kKey = "remove-metadata-sync-fails";
+    auto *meta_backend = InstallFailingSyncBackend(kInstanceId);
+    ASSERT_NE(nullptr, meta_backend);
+    CommitObject(kInstanceId, kKey, 31);
+    meta_backend->FailNextMaintenanceDeleteSync();
+
+    EXPECT_EQ(EC_OUTCOME_UNKNOWN, manager_->Remove(&request_context_, kInstanceId, {kKey}));
+    ASSERT_TRUE(meta_backend->WaitForSyncFailure(std::chrono::seconds(2)));
+
+    // The in-memory view has changed, but the failed barrier means the caller
+    // cannot infer the durable state and must not blindly replay the mutation.
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_FALSE(values.front().found);
 }
 
 TEST_F(KvMetaManagerTest, RollbackFinishesPhysicalDeleteBeforeReadmittingTheKey) {
@@ -2167,14 +2256,14 @@ TEST_F(KvMetaManagerTest, ActiveSessionCountIsBoundedBeforeAllocation) {
     ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
 }
 
-TEST_F(KvMetaManagerTest, RejectsAnInstanceGroupAlreadyUsedByKvCache) {
+TEST_F(KvMetaManagerTest, RejectsOrdinaryRegistrationIntoAKvMetaGroup) {
     ModelDeployment deployment;
     deployment.set_model_name("ordinary-kv-cache");
     deployment.set_dtype("fp16");
     deployment.set_tp_size(1);
     deployment.set_dp_size(1);
     deployment.set_pp_size(1);
-    ASSERT_EQ(EC_OK,
+    EXPECT_EQ(EC_BADARGS,
               cache_manager_
                   ->RegisterInstance(&request_context_,
                                      "default",
@@ -2185,11 +2274,151 @@ TEST_F(KvMetaManagerTest, RejectsAnInstanceGroupAlreadyUsedByKvCache) {
                                      {},
                                      CacheManager::QueryType::QT_BATCH_GET)
                   .first);
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(&request_context_, "ordinary-instance"));
 
+    // A rejected legacy registration cannot poison admission or reclamation
+    // for the already-valid KVMeta group.
+    EXPECT_EQ(EC_OK, manager_->RegisterInstance(&request_context_, "default", "another-object-instance", "").first);
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {"must-not-share-quota"}, {1}, 30);
+    ASSERT_EQ(EC_OK, start_ec);
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, RejectsKvMetaRegistrationIntoAnOrdinaryGroup) {
+    const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(default_group);
+    InstanceGroup ordinary_group(*default_group);
+    ordinary_group.set_name("ordinary-only-group");
+    ordinary_group.set_global_quota_group_name("ordinary-only-quota");
+    ordinary_group.set_version(1);
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, ordinary_group));
+
+    ModelDeployment deployment;
+    deployment.set_model_name("ordinary-kv-cache");
+    deployment.set_dtype("fp16");
+    deployment.set_tp_size(1);
+    deployment.set_dp_size(1);
+    deployment.set_pp_size(1);
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(&request_context_,
+                                     ordinary_group.name(),
+                                     "ordinary-first",
+                                     1,
+                                     {LocationSpecInfo("value", 1)},
+                                     deployment,
+                                     {},
+                                     CacheManager::QueryType::QT_BATCH_GET)
+                  .first);
     EXPECT_EQ(EC_BADARGS,
-              manager_->RegisterInstance(&request_context_, "default", "another-object-instance", "").first);
+              manager_->RegisterInstance(&request_context_, ordinary_group.name(), "kvmeta-must-not-mix", "").first);
+}
+
+TEST_F(KvMetaManagerTest, ExistingOrdinaryInstanceInLegacyMixedGroupCanStillRecover) {
+    ModelDeployment deployment;
+    deployment.set_model_name("legacy-ordinary-kv-cache");
+    deployment.set_dtype("fp16");
+    deployment.set_tp_size(1);
+    deployment.set_dp_size(1);
+    deployment.set_pp_size(1);
+    const std::vector<LocationSpecInfo> specs{LocationSpecInfo("value", 1)};
+
+    // Simulate persisted state produced before bidirectional group reservation
+    // existed. Recovery must recreate the ordinary indexer without performing
+    // another registry mutation or making the main KV-cache path unavailable.
+    ASSERT_EQ(EC_OK,
+              registry_manager_->RegisterInstance(&request_context_,
+                                                  "default",
+                                                  "legacy-ordinary",
+                                                  1,
+                                                  specs,
+                                                  deployment,
+                                                  {},
+                                                  static_cast<std::int32_t>(CacheManager::QueryType::QT_BATCH_GET)));
+    EXPECT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(&request_context_,
+                                     "default",
+                                     "legacy-ordinary",
+                                     1,
+                                     specs,
+                                     deployment,
+                                     {},
+                                     CacheManager::QueryType::QT_BATCH_GET)
+                  .first);
+    EXPECT_NE(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("legacy-ordinary"));
+
+    // Only the optional KVMeta side fails closed until operators repair the
+    // historical group; a new member of either type is still rejected.
+    EXPECT_EQ(EC_BADARGS, manager_->StartWrite(&request_context_, kInstanceId, {"mixed-group"}, {1}, 30).first);
     EXPECT_EQ(EC_BADARGS,
-              manager_->StartWrite(&request_context_, kInstanceId, {"must-not-share-quota"}, {1}, 30).first);
+              cache_manager_
+                  ->RegisterInstance(&request_context_,
+                                     "default",
+                                     "new-ordinary-must-not-extend-mixed-group",
+                                     1,
+                                     specs,
+                                     deployment,
+                                     {},
+                                     CacheManager::QueryType::QT_BATCH_GET)
+                  .first);
+    EXPECT_EQ(
+        EC_BADARGS,
+        manager_->RegisterInstance(&request_context_, "default", "new-kvmeta-must-not-extend-mixed-group", "").first);
+}
+
+TEST_F(KvMetaManagerTest, ConcurrentMixedRegistrationCannotCreateAMixedGroup) {
+    const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(default_group);
+    InstanceGroup empty_group(*default_group);
+    empty_group.set_name("concurrent-group-kind-reservation");
+    empty_group.set_global_quota_group_name("concurrent-group-kind-quota");
+    empty_group.set_version(1);
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, empty_group));
+
+    ModelDeployment deployment;
+    deployment.set_model_name("ordinary-kv-cache");
+    deployment.set_dtype("fp16");
+    deployment.set_tp_size(1);
+    deployment.set_dp_size(1);
+    deployment.set_pp_size(1);
+
+    std::promise<void> start_signal;
+    const auto start_gate = start_signal.get_future().share();
+    auto ordinary = std::async(std::launch::async, [&, start_gate]() {
+        start_gate.wait();
+        RequestContext context("concurrent-ordinary-registration");
+        return cache_manager_
+            ->RegisterInstance(&context,
+                               empty_group.name(),
+                               "concurrent-ordinary-instance",
+                               1,
+                               {LocationSpecInfo("value", 1)},
+                               deployment,
+                               {},
+                               CacheManager::QueryType::QT_BATCH_GET)
+            .first;
+    });
+    auto kv_meta = std::async(std::launch::async, [&, start_gate]() {
+        start_gate.wait();
+        RequestContext context("concurrent-kvmeta-registration");
+        return manager_->RegisterInstance(&context, empty_group.name(), "concurrent-kvmeta-instance", "").first;
+    });
+    start_signal.set_value();
+
+    const ErrorCode ordinary_ec = ordinary.get();
+    const ErrorCode kv_meta_ec = kv_meta.get();
+    EXPECT_EQ(1, static_cast<int>(ordinary_ec == EC_OK) + static_cast<int>(kv_meta_ec == EC_OK));
+    EXPECT_TRUE((ordinary_ec == EC_OK && kv_meta_ec == EC_BADARGS) ||
+                (ordinary_ec == EC_BADARGS && kv_meta_ec == EC_OK));
+
+    const auto [instances_ec, instances] = registry_manager_->ListInstanceInfo(&request_context_, empty_group.name());
+    ASSERT_EQ(EC_OK, instances_ec);
+    ASSERT_EQ(1, instances.size());
+    ASSERT_TRUE(instances.front());
+    EXPECT_EQ(kv_meta_ec == EC_OK, HasKvMetaReservedInstancePrefix(instances.front()->instance_id()));
 }
 
 TEST_F(KvMetaManagerTest, ExactValueSizesAreIncludedInByteAdmission) {

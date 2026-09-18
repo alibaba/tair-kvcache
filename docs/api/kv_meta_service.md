@@ -111,6 +111,8 @@ Trim(instance) -> 按策略清理整个 KVMeta instance
 输入 `instance_group`、`instance_id` 和可选 `user_data`：
 
 - group 必须已存在并且只包含 KVMeta instance；
+- group 类型由已持久化的成员派生；KVMeta 与普通 KVCache 的注册在同一控制面临界区内双向互斥，任一方先注册后，
+  另一类 instance 再加入同 group 都会在 registry mutation 前被拒绝；
 - group 必须有当前 KVMeta Reclaimer 可执行的 LRU 配置，且进程级 sampling/batching 非零；无配置、非 LRU、
   非法 watermark/read grace 或关闭采样/批量回收均返回 `SERVICE_NOT_READY`，且不会创建 instance；
 - `storage_candidates` 必须唯一并全部指向已注册的 exact-object backend；EventReport 只表示外部 block 观测，不授予
@@ -156,6 +158,8 @@ V1 `Get` 不创建 server-side read lease，返回 location 后不会 pin 物理
   当成永久冲突，也不把 active 对象误报为命中；
 - 容量、storage type quota 或 active-session 数量不足时，不会返回可用 session；已产生的候选 allocation 或
   reservation 会在返回前进入补偿清理。
+- 新 reservation 的持久化 barrier 失败后，只有补偿删除也完成持久化才能返回普通超时；若补偿结果无法证明，
+  返回 `OUTCOME_UNKNOWN` 并关闭 KVMeta admission/maintenance，直到 leader recovery 完成，不影响普通 KVCache。
 - group reclaim 配置被热更新为非法值时，全部命中的请求仍可幂等返回；包含任一 miss 的请求在 backend allocation
   前返回 `SERVICE_NOT_READY`。Remove/Trim 仍可用于安全排空已有对象。
 
@@ -186,8 +190,9 @@ orphan 清理发现，服务端不会猜测或重放该 Create。
 - 任一 key 仍有 active write 时，整批返回 `WRITE_IN_PROGRESS`，不删除任何 key；
 - 服务端先条件删除 metadata 并 `Sync`，随后调用 backend Delete；
 - 显式 Remove 不等待自动 Reclaimer 的 `delay_before_delete_ms`，调用方必须先排空 consumer；
-- 若物理删除失败，接口返回错误，但已经删除的 metadata 不会重新暴露该 URI，也不会自动重放结果不确定的
-  Delete；该 allocation 进入 backend orphan 清理范围。
+- metadata 已经部分/全部改变后，若后续 metadata barrier 或物理删除失败，接口返回 `OUTCOME_UNKNOWN`，调用方必须
+  查询/审计最终状态，不能盲目重放；已经删除的 metadata 不会重新暴露该 URI，服务端也不会自动重放结果不确定的
+  Delete，该 allocation 进入 backend orphan 清理范围。只有能证明 metadata 未改变的前置失败才保留具体普通错误。
 
 ### 5.7 `Trim`
 

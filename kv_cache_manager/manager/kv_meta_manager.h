@@ -159,7 +159,9 @@ private:
                           bool maintenance_no_touch = false,
                           bool delete_if_metadata_absent = true,
                           bool sync_metadata_absent = false,
-                          bool restore_usage_on_sync_failure = true);
+                          bool restore_usage_on_sync_failure = true,
+                          bool *metadata_outcome_changed = nullptr,
+                          bool *metadata_cleanup_complete = nullptr);
     ErrorCode DeleteRetiredMetadata(RequestContext *request_context,
                                     const std::string &internal_instance_id,
                                     const std::vector<SessionItem> &items);
