@@ -207,8 +207,9 @@ tenant/instance，不能用随机 key 或 token 猜测难度代替服务认证�
 - 整个 `__kv_meta_v1__` 前缀都由 KVMeta 保留。旧 Meta/Admin handler 和 CacheManager 旧接口在读取、写入、删除、
   Trim、Migration 或事件任务入队前拒绝该 namespace；Admin instance 列表过滤内部实例，避免绕过 KVMeta 的事务和
   回收不变量；
-- KVMeta instance 必须放入专用 Instance Group。注册时若 group 已含普通 instance，服务端拒绝；
-- 如果之后通过普通接口向该 group 混入 KV cache instance，新的 KVMeta byte admission 会 fail closed；
+- KVMeta instance 必须放入专用 Instance Group。group 类型从其持久化成员的保留 namespace 派生，KVMeta 和普通
+  KVCache 注册共用同一个 `CacheManager` 控制面临界区：空 group 由第一类成功注册决定类型，之后反向混入会在
+  registry mutation 前被拒绝。运行期校验仍会对旁路写 registry 或 split-brain 造成的混合状态 fail closed；
 - 普通 CacheReclaimer、Migration 和 Cache GC 跳过 KVMeta instance；KVMeta 由自己的 Reclaimer 线程处理，二者不
   共用删除 executor、pending budget 或 group admission lock；
 - KVMeta 使用对象真实字节数维护 group/type quota，不把 marker `block_size=1` 当作对象用量。
@@ -324,6 +325,11 @@ HA 节点必须保持时钟同步，并把可能的最大漂移计入写租约�
 schema 不一致则失败。注册同时验证 group 已配置当前实现能够执行的 LRU 回收策略，并且每个
 `storage_candidates` 都唯一、已注册且具备 exact-object ownership；没有有效 Reclaimer、候选缺失/重复或混入
 EventReport 的 group 返回 `SERVICE_NOT_READY`，不会先创建一个只能靠人工删除维持的“对象库”。
+KVMeta 与普通 KVCache 的注册都会在 mutation 前读取同 group 的持久化成员，并在同一进程内串行化检查；因此已有
+KVMeta group 不能被后续 legacy 注册污染，已有普通 group 也不能被 KVMeta 占用。单 leader 是该控制面串行化的部署
+前提。已有持久化 instance 的幂等重注册/恢复不执行新的 mutation，因此不会被历史 mixed group 阻断，保证普通
+KVCache indexer 仍能恢复；运行期的全量 group schema 校验只让 KVMeta side path 对 out-of-band registry mutation
+保守 fail closed。
 
 ### 6.2 写入
 
@@ -359,7 +365,10 @@ sequenceDiagram
 - 数据写入返回的实际 URI 必须与服务端给出的 URI 语义一致（允许 query 参数重排）；URI
   无法解析、参数重复或任一 canonical component 改变都会整批回滚；
 - `PutFinish.success_keys` 与紧凑 `locations` 对齐。任一 `false` 会回滚本 session 的全部新对象；
-- commit/rollback 逐 key 执行并带失败补偿，不承诺多 key 同时可见。
+- commit/rollback 逐 key 执行并带失败补偿，不承诺多 key 同时可见；
+- reservation 的首次 `Sync` 失败时，服务端先做 metadata-first 补偿。补偿也失败意味着尚无 write session 接管的
+  active generation 结果不确定，此时返回 `OUTCOME_UNKNOWN` 并只关闭 KVMeta admission/maintenance，交由 leader
+  recovery 对账；固定 block KVCache 主链路不读取该 gate。
 
 ### 6.3 读取
 
@@ -381,6 +390,8 @@ Load 返回前 caller buffer 不被后台 I/O 继续访问，但不能阻止另�
 
 - `Remove(keys)` 精确删除 committed metadata，`Sync` 后再删除物理 allocation；不存在的 key 幂等成功；
 - 任一 key 仍 active 时，整批 `Remove` 返回 `WRITE_IN_PROGRESS`，不产生删除副作用；
+- 多 key 删除中只要 metadata 已有任一项改变，后续 metadata/物理步骤再失败就返回 `OUTCOME_UNKNOWN`，而不是可被
+  误解为“完全未执行”的普通 I/O 错误；调用方必须先查询/审计，不能在新 generation 可能出现后盲目重放；
 - `Trim(TS_REMOVE_ALL_CACHE)` 删除 metadata 和可归属的物理对象；
 - `Trim(TS_REMOVE_ALL_META)` 只删 metadata，物理数据保留，仅用于明确的修复场景；
 - `TS_TIMESTAMP` 在 V1 中不支持；
@@ -1019,9 +1030,11 @@ group 内所有 instance；恢复时再用 durable record 校准。cleanup 执�
 
 测试按层覆盖：
 
-- Manager/Service UT：注册隔离、exact-key、不同 size、容量、session、Remove/Trim、HA recovery、生命周期，
+- Manager/Service UT：注册隔离（含双向和并发混合注册）、exact-key、不同 size、容量、session、Remove/Trim、HA
+  recovery、生命周期，
   以及 rollback、Remove、Trim、expiry、recovery 中物理 Delete 返回错误/短结果/标准或未知异常时的一次性删除、
-  metadata/usage 收敛、worker 存活和恢复继续放流；独立 Reclaimer 还覆盖 group/type bytes、key-count
+  Remove 已改变 metadata 后的 `OUTCOME_UNKNOWN`、reservation rollback 双重 Sync 失败时的 KVMeta-only
+  fail-closed、metadata/usage 收敛、worker 存活和恢复继续放流；独立 Reclaimer 还覆盖 group/type bytes、key-count
   和零水位、低于水位的大请求按需回收、storage type 按需回收、per-instance key 准入、重叠压力不误伤无关
   Cache、不可能请求不清空有效对象、group LRU、active 排除、跨 instance 小样本轮转、pending credit 防过淘汰、
   跨 group grace 隔离、reader fence 后锚定 deadline、fence Sync 失败关闭准入且不删除、pending object/byte

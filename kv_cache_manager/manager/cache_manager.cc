@@ -606,8 +606,16 @@ CacheManager::RegisterInstance(RequestContext *request_context,
                                const std::vector<LocationSpecGroup> &location_spec_groups,
                                QueryType default_query_type) {
     SPAN_TRACER(request_context);
-    // TODO : not thread safe now
     const auto &trace_id = request_context->trace_id();
+
+    // Group kind is derived from its persisted members, so no registry schema
+    // change is required. Keep the check and a *new* RegisterInstance mutation
+    // in one process-local critical section. Re-registering an existing
+    // persisted instance deliberately remains recoverable: an old deployment
+    // or out-of-band writer may already have produced a mixed group, and that
+    // must fail closed only on the optional KVMeta path rather than preventing
+    // ordinary KV-cache indexers from recovering.
+    std::lock_guard<std::mutex> registration_lock(instance_registration_mutex_);
     auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     if (instance_info) {
         auto mismatched = instance_info->MismatchFields(block_size,
@@ -632,6 +640,27 @@ CacheManager::RegisterInstance(RequestContext *request_context,
         PREFIX_LOG(INFO, "register instance OK");
         return {ec, GetStorageConfigStr(request_context, instance_id)};
     }
+
+    const auto [members_ec, group_members] = registry_manager_->ListInstanceInfo(request_context, instance_group);
+    if (members_ec != EC_OK) {
+        PREFIX_LOG(WARN, "register instance failed to inspect instance group, ec[%d]", members_ec);
+        return {members_ec, {}};
+    }
+    const bool registering_kv_meta = HasKvMetaReservedInstancePrefix(instance_id);
+    for (const auto &member : group_members) {
+        if (!member) {
+            request_context->error_tracer()->AddErrorMsg(
+                "register instance failed: instance group contains a null member");
+            return {EC_CORRUPTION, {}};
+        }
+        if (HasKvMetaReservedInstancePrefix(member->instance_id()) != registering_kv_meta) {
+            request_context->error_tracer()->AddErrorMsg(
+                "register instance failed: KVMeta and ordinary KV-cache instances require separate groups");
+            PREFIX_LOG(WARN, "register instance failed: mixed KVMeta/KV-cache group is forbidden");
+            return {EC_BADARGS, {}};
+        }
+    }
+
     auto ec = registry_manager_->RegisterInstance(request_context,
                                                   instance_group,
                                                   instance_id,

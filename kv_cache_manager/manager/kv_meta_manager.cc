@@ -3027,8 +3027,19 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
                                      bool maintenance_no_touch,
                                      bool delete_if_metadata_absent,
                                      bool sync_metadata_absent,
-                                     bool restore_usage_on_sync_failure) {
+                                     bool restore_usage_on_sync_failure,
+                                     bool *metadata_outcome_changed,
+                                     bool *metadata_cleanup_complete) {
+    if (metadata_outcome_changed) {
+        *metadata_outcome_changed = false;
+    }
+    if (metadata_cleanup_complete) {
+        *metadata_cleanup_complete = false;
+    }
     if (items.empty()) {
+        if (metadata_cleanup_complete) {
+            *metadata_cleanup_complete = true;
+        }
         return EC_OK;
     }
     auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(internal_instance_id);
@@ -3087,8 +3098,14 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
             const ErrorCode ec = per_location_ec[i][0];
             if (ec == EC_OK) {
                 metadata_deleted[layer[i]] = true;
+                if (metadata_outcome_changed) {
+                    *metadata_outcome_changed = true;
+                }
             } else if (ec == EC_NOENT) {
                 metadata_already_absent[layer[i]] = true;
+                if (metadata_outcome_changed) {
+                    *metadata_outcome_changed = true;
+                }
             } else {
                 overall = FirstHardError(overall, ec);
             }
@@ -3118,12 +3135,20 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
             }
         }
     }
+    if (metadata_cleanup_complete) {
+        // Capture the metadata-only result before physical deletion can add a
+        // provider error. Callers rolling back an unpublished reservation
+        // must fail closed only when ownership is unresolved; a proven
+        // metadata absence plus an orphaned allocation is safe to admit past.
+        *metadata_cleanup_complete = overall == EC_OK && metadata_delete_is_durable;
+    }
 
     if (!metadata_only) {
         std::vector<SessionItem> physical_items;
         physical_items.reserve(items.size());
         for (std::size_t i = 0; i < items.size(); ++i) {
-            const bool safe_to_delete = (delete_if_metadata_absent && metadata_already_absent[i]) ||
+            const bool safe_to_delete = (delete_if_metadata_absent && metadata_already_absent[i] &&
+                                         (!sync_metadata_absent || metadata_delete_is_durable)) ||
                                         (metadata_deleted[i] && metadata_delete_is_durable);
             if (safe_to_delete && items[i].data_location) {
                 physical_items.push_back(items[i]);
@@ -3749,7 +3774,36 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         inserted_keys.push_back(item.internal_key);
     }
     if (!indexer->Sync(inserted_keys)) {
-        DeleteItems(request_context, internal_instance_id, session_items, false, false);
+        bool metadata_cleanup_complete = false;
+        const ErrorCode cleanup_ec = DeleteItems(request_context,
+                                                 internal_instance_id,
+                                                 session_items,
+                                                 /*metadata_only=*/false,
+                                                 /*adjust_storage_usage=*/false,
+                                                 /*maintenance_no_touch=*/false,
+                                                 /*delete_if_metadata_absent=*/true,
+                                                 /*sync_metadata_absent=*/true,
+                                                 /*restore_usage_on_sync_failure=*/false,
+                                                 /*metadata_outcome_changed=*/nullptr,
+                                                 &metadata_cleanup_complete);
+        if (!metadata_cleanup_complete) {
+            // No write session owns these reservations yet. If their
+            // compensating delete cannot be proven durable, only leader
+            // recovery can safely reconcile the active metadata generation.
+            // Close the optional KVMeta path without affecting fixed-block
+            // KVCache admission.
+            AddError(request_context,
+                     "KVMeta reservation rollback was incomplete; maintenance is fail-closed until recovery");
+            CancelMaintenance();
+            return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
+        }
+        if (cleanup_ec != EC_OK) {
+            // The ownership record is durably absent, so a failed physical
+            // release is an unreachable backend orphan rather than a reason
+            // to disable otherwise healthy KVMeta traffic.
+            KVCM_LOG_WARN("KVMeta reservation rollback left an allocation for backend orphan cleanup, ec[%d]",
+                          cleanup_ec);
+        }
         AddError(request_context, "KVMeta metadata reservation did not reach its persistence barrier");
         return {EC_TIMEOUT, StartWriteResult{}};
     }
@@ -4086,7 +4140,26 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
         items.push_back(SessionItem{
             i, keys[i], exact[i].internal_key, exact[i].location_id, exact[i].location, exact[i].location, size});
     }
-    return DeleteItems(request_context, internal_instance_id, items, false, true);
+    bool metadata_outcome_changed = false;
+    const ErrorCode delete_ec = DeleteItems(request_context,
+                                            internal_instance_id,
+                                            items,
+                                            /*metadata_only=*/false,
+                                            /*adjust_storage_usage=*/true,
+                                            /*maintenance_no_touch=*/false,
+                                            /*delete_if_metadata_absent=*/true,
+                                            /*sync_metadata_absent=*/false,
+                                            /*restore_usage_on_sync_failure=*/true,
+                                            &metadata_outcome_changed);
+    if (delete_ec != EC_OK && metadata_outcome_changed) {
+        // Some keys are already absent or durably/in-memory deleted, while a
+        // later metadata or physical step failed. Returning the underlying
+        // ordinary error would invite an unsafe blind retry that can delete a
+        // successor generation created for one of those keys.
+        AddError(request_context, "KVMeta Remove partially applied; final outcome must be reconciled");
+        return EC_OUTCOME_UNKNOWN;
+    }
+    return delete_ec;
 }
 
 ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::string &instance_id, bool metadata_only) {
