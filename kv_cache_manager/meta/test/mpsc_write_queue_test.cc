@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -31,6 +32,8 @@ protected:
         return true;
     }
 
+    void PushWriteOp(WriteOp op) { ASSERT_TRUE(TryPushBounded(std::move(op), std::numeric_limits<int64_t>::max())); }
+
     std::unique_ptr<MpscWriteQueue> queue_;
     int64_t taken_keys_ = 0;
 };
@@ -43,8 +46,8 @@ TEST_F(MpscWriteQueueTest, TestEmptyPopBatch) {
 }
 
 TEST_F(MpscWriteQueueTest, TestPushAndPopBatch) {
-    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {1, 2, 3})});
-    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kDelete, {4, 5})});
+    PushWriteOp(MakeWriteOp(WriteOpType::kPut, {1, 2, 3}));
+    PushWriteOp(MakeWriteOp(WriteOpType::kDelete, {4, 5}));
     ASSERT_EQ(5, queue_->GetKeySize());
 
     auto items = queue_->PopBatch(10, taken_keys_);
@@ -64,9 +67,9 @@ TEST_F(MpscWriteQueueTest, TestPushAndPopBatch) {
 }
 
 TEST_F(MpscWriteQueueTest, TestPopBatchLimited) {
-    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {1})});
-    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {2})});
-    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {3})});
+    PushWriteOp(MakeWriteOp(WriteOpType::kPut, {1}));
+    PushWriteOp(MakeWriteOp(WriteOpType::kPut, {2}));
+    PushWriteOp(MakeWriteOp(WriteOpType::kPut, {3}));
     ASSERT_EQ(3, queue_->GetKeySize());
 
     // Pop with limit 2 — remaining item stays in consumer-local buffer, still counted in GetKeySize
@@ -84,7 +87,7 @@ TEST_F(MpscWriteQueueTest, TestPopBatchLimited) {
 
 TEST_F(MpscWriteQueueTest, TestRepeatedPopBatchClearsConsumerLeftover) {
     for (int i = 0; i < 6; ++i) {
-        queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {i})});
+        PushWriteOp(MakeWriteOp(WriteOpType::kPut, {i}));
     }
     ASSERT_EQ(6, queue_->GetKeySize());
 
@@ -130,7 +133,7 @@ TEST_F(MpscWriteQueueTest, TestPopBatchWaitWakeup) {
 
     // Give consumer time to enter wait
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {42})});
+    PushWriteOp(MakeWriteOp(WriteOpType::kPut, {42}));
     queue_->NotifyConsumer();
 
     consumer.join();
@@ -160,7 +163,7 @@ TEST_F(MpscWriteQueueTest, TestBarrierItem) {
 
     SyncBarrierItem barrier;
     barrier.barrier_ctx = ctx;
-    queue_->Push(QueueItem{std::move(barrier)});
+    queue_->PushBarrier(std::move(barrier));
     ASSERT_EQ(0, queue_->GetKeySize());
 
     auto items = queue_->PopBatch(10, taken_keys_);
@@ -184,7 +187,7 @@ TEST_F(MpscWriteQueueTest, TestMultiProducerSingleConsumer) {
         producers.emplace_back([&, p] {
             for (int i = 0; i < kOpsPerProducer; ++i) {
                 KeyType key = p * kOpsPerProducer + i;
-                queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {key})});
+                PushWriteOp(MakeWriteOp(WriteOpType::kPut, {key}));
             }
         });
     }
@@ -217,16 +220,16 @@ TEST_F(MpscWriteQueueTest, TestMultiProducerSingleConsumer) {
 }
 
 TEST_F(MpscWriteQueueTest, TestMixedWriteOpsAndBarriers) {
-    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {1})});
-    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kUpsert, {2})});
+    PushWriteOp(MakeWriteOp(WriteOpType::kPut, {1}));
+    PushWriteOp(MakeWriteOp(WriteOpType::kUpsert, {2}));
 
     auto ctx = std::make_shared<BarrierContext>();
     ctx->remain.store(1);
     SyncBarrierItem barrier;
     barrier.barrier_ctx = ctx;
-    queue_->Push(QueueItem{std::move(barrier)});
+    queue_->PushBarrier(std::move(barrier));
 
-    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kDelete, {3})});
+    PushWriteOp(MakeWriteOp(WriteOpType::kDelete, {3}));
     ASSERT_EQ(3, queue_->GetKeySize());
 
     auto items = queue_->PopBatch(100, taken_keys_);
@@ -318,6 +321,21 @@ TEST_F(MpscWriteQueueTest, TestWaitAndReserveWakesAfterKeysReleased) {
     ASSERT_TRUE(reserved.load());
 
     queue_->PopBatch(1, taken_keys_);
+}
+
+TEST_F(MpscWriteQueueTest, TestWaitAndReserveTimesOutWithoutChangingCapacity) {
+    ASSERT_TRUE(TryPushBounded(MakeWriteOp(WriteOpType::kPut, {1}), 1));
+
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(queue_->WaitAndReserve(1, 1, 50000));
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+    EXPECT_GE(elapsed_ms, 40);
+    EXPECT_EQ(1, queue_->GetKeySize());
+    const auto items = queue_->PopBatch(1, taken_keys_);
+    EXPECT_EQ(1, items.size());
+    EXPECT_EQ(0, queue_->GetKeySize());
 }
 
 TEST_F(MpscWriteQueueTest, TestTryReserveEnforcesKeyCapacity) {

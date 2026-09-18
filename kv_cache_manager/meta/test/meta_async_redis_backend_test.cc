@@ -956,7 +956,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStatsPipelineError) {
 
     auto barrier = std::make_shared<BarrierContext>();
     barrier->remain.store(1, std::memory_order_release);
-    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier}});
+    backend_->queues_[0]->PushBarrier(SyncBarrierItem{barrier});
 
     can_proceed.store(true, std::memory_order_release);
 
@@ -1040,7 +1040,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestSyncPartialPipelineFailure) {
 
     auto barrier = std::make_shared<BarrierContext>();
     barrier->remain.store(1, std::memory_order_release);
-    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier}});
+    backend_->queues_[0]->PushBarrier(SyncBarrierItem{barrier});
 
     can_proceed.store(true, std::memory_order_release);
 
@@ -1130,7 +1130,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestBatchFlushMultiSegmentPartialFailure) {
 
     auto barrier1 = std::make_shared<BarrierContext>();
     barrier1->remain.store(1, std::memory_order_release);
-    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier1}});
+    backend_->queues_[0]->PushBarrier(SyncBarrierItem{barrier1});
 
     CacheLocationMapVector locs2(1);
     PropertyMapVector props2 = {{{"f3", "v3"}}};
@@ -1138,7 +1138,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestBatchFlushMultiSegmentPartialFailure) {
 
     auto barrier2 = std::make_shared<BarrierContext>();
     barrier2->remain.store(1, std::memory_order_release);
-    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier2}});
+    backend_->queues_[0]->PushBarrier(SyncBarrierItem{barrier2});
 
     // Release consumer — first batch (seed) succeeds, second batch has partial failure
     can_proceed.store(true, std::memory_order_release);
@@ -1343,7 +1343,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryDrainDropsAreVisibleAndFailBa
     ASSERT_EQ(EC_OK, backend_->PutMetaData({{"key_count", "1"}}));
     auto barrier = std::make_shared<BarrierContext>();
     barrier->remain.store(1);
-    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier}});
+    backend_->queues_[0]->PushBarrier(SyncBarrierItem{barrier});
     backend_->DrainQueue(0);
     EXPECT_FALSE(barrier->Wait(std::chrono::milliseconds(10)));
     auto stats = backend_->GetAsyncWriteStats();

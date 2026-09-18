@@ -17,15 +17,7 @@ MpscWriteQueue::~MpscWriteQueue() {
     }
 }
 
-void MpscWriteQueue::Push(QueueItem item) {
-    int64_t kc = 0;
-    if (auto *op = std::get_if<WriteOp>(&item)) {
-        kc = static_cast<int64_t>(op->keys.size());
-    }
-    Node *new_node = new Node(std::move(item), kc);
-    key_size_.fetch_add(kc, std::memory_order_relaxed);
-    Publish(new_node);
-}
+void MpscWriteQueue::PushBarrier(SyncBarrierItem item) { Publish(new Node(QueueItem{std::move(item)}, 0)); }
 
 bool MpscWriteQueue::TryReserve(int64_t key_count, int64_t capacity) noexcept {
     return TryReserve(key_count, capacity, false);
