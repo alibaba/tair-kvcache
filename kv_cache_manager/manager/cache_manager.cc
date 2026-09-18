@@ -2332,6 +2332,7 @@ ErrorCode CacheManager::GenWriteLocationOnStorage(RequestContext *request_contex
     for (const auto &uris : key_to_uris) {
         auto cache_location = std::make_shared<CacheLocation>();
         cache_location->set_type(storage_type);
+        cache_location->mutable_location_specs().reserve(uris.size());
         for (const auto &[data_storage_uri_idx, location_spec_info] : uris) {
             LocationSpec location_spec;
             location_spec.set_name(location_spec_info->name());
