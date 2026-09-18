@@ -163,6 +163,32 @@ TEST_F(SdkWrapperTest, TestKvMetaPutRejectsNullResultBeforeValidationOrIo) {
     EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.PutKvMetaObjects({}, {}, {}, nullptr));
 }
 
+TEST_F(SdkWrapperTest, TestKvMetaMooncakeValidationRequiresANonEmptyPhysicalKey) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.variable_object_size_enabled_ = true;
+    sdk_wrapper.max_variable_object_bytes_ = 4096;
+    sdk_wrapper.sdk_storage_types_["moon"] = DataStorageType::DATA_STORAGE_TYPE_MOONCAKE;
+
+    char bytes[5]{};
+    Iov iov;
+    iov.type = MemoryType::CPU;
+    iov.base = bytes;
+    iov.size = sizeof(bytes);
+    BlockBuffer buffer;
+    buffer.iovs.push_back(iov);
+    const BlockBuffers buffers{buffer};
+    const std::vector<std::uint64_t> sizes{sizeof(bytes)};
+
+    EXPECT_EQ(ER_INVALID_PARAMS,
+              sdk_wrapper.ValidateKvMetaObjects({DataStorageUri("mooncake://moon/object?size=5")}, sizes, buffers));
+    EXPECT_EQ(
+        ER_INVALID_PARAMS,
+        sdk_wrapper.ValidateKvMetaObjects({DataStorageUri("mooncake://moon/object?key=&size=5")}, sizes, buffers));
+    EXPECT_EQ(ER_OK,
+              sdk_wrapper.ValidateKvMetaObjects(
+                  {DataStorageUri("mooncake://moon/object?key=physical-object&size=5")}, sizes, buffers));
+}
+
 TEST_F(SdkWrapperTest, TestInitWithEmptyWrapperConfig) {
     SdkWrapper sdk_wrapper;
     ASSERT_EQ(ER_INVALID_CLIENT_CONFIG, sdk_wrapper.Init(nullptr, init_params_));

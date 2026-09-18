@@ -411,6 +411,7 @@ TEST_F(KvMetaServiceImplTest, PutStartReportsAnActiveWriterWithoutClaimingACache
 
     proto::kv_meta::PutStartRequest second_request = first_request;
     second_request.set_trace_id("active-put-start-second");
+    second_request.set_value_sizes(0, 99);
     proto::kv_meta::PutStartResponse second_response;
     RequestContext second_context(second_request.trace_id());
     service_->PutStart(&second_context, &second_request, &second_response);
@@ -431,6 +432,7 @@ TEST_F(KvMetaServiceImplTest, PutStartReportsAnActiveWriterWithoutClaimingACache
     service_->PutFinish(&finish_context, &finish_request, &finish_response);
     EXPECT_EQ(proto::kv_meta::OK, finish_response.header().status().code());
 
+    second_request.set_value_sizes(0, 17);
     proto::kv_meta::PutStartResponse committed_response;
     RequestContext committed_context("active-put-start-committed-hit");
     service_->PutStart(&committed_context, &second_request, &committed_response);

@@ -71,7 +71,10 @@ bool UriSchemeMatchesStorageType(KvMetaStorageType type, const DataStorageUri &u
     }
 }
 
-bool HasSingletonAllocationShape(KvMetaStorageType type, const DataStorageUri &uri) {
+bool HasOwnedAllocationShape(KvMetaStorageType type, const DataStorageUri &uri) {
+    if (type == KvMetaStorageType::MOONCAKE) {
+        return uri.HasParam("key") && !uri.GetParam("key").empty();
+    }
     switch (type) {
     case KvMetaStorageType::HF3FS:
     case KvMetaStorageType::VCNS_HF3FS:
@@ -97,7 +100,7 @@ bool ValidateStorageUri(KvMetaStorageType type, const std::string &uri_text, std
     }
     const DataStorageUri uri(uri_text);
     if (!uri.Valid() || uri.GetHostName().empty() || !UriSchemeMatchesStorageType(type, uri) ||
-        !HasSingletonAllocationShape(type, uri) || !uri.HasParam("size")) {
+        !HasOwnedAllocationShape(type, uri) || !uri.HasParam("size")) {
         return false;
     }
     const std::string size_text = uri.GetParam("size");
