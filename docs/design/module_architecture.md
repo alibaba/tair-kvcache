@@ -319,7 +319,9 @@ exact-key 方式复用 `MetaIndexer`；数据 allocation 直接使用注册表�
 缺失 key 按自己的 value size 发起 singleton `Create`。client 侧 `KvMetaObjectClient` 组合元数据事务与
 `KvMetaTransferClient`；后者对每个对象发起 singleton SDK IO 并共享一次 batch 超时。服务端和 client 的两层
 隔离都不会修改 KVCache 的固定 block 分配及 `TransferClient` 策略。普通 Reclaimer、Migration 与 Cache GC
-仅跳过完整 KVMeta schema marker 的内部 instance。完整状态机、配额与失败语义见
+仅跳过完整 KVMeta schema marker 的内部 instance；KVMeta 自己的 Reclaimer 复用 group 水位和 LRU 配置，在独立
+worker、pending queue 和 KVMeta admission shard 上执行 retired/grace/metadata-first 删除，不占用普通
+Reclaimer 的采样、pending 或删除 executor。完整状态机、配额与失败语义见
 [KVMeta 通用对象存储](kv_meta_object_storage.md)。
 
 ---

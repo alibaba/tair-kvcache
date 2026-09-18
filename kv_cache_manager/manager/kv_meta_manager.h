@@ -20,6 +20,7 @@ class CacheManager;
 class CacheLocation;
 class DataStorageSelector;
 class InstanceInfo;
+class KvMetaReclaimer;
 class KvMetaWriteSessionManager;
 class RegistryManager;
 class RequestContext;
@@ -146,7 +147,14 @@ private:
                           const std::string &internal_instance_id,
                           const std::vector<SessionItem> &items,
                           bool metadata_only,
-                          bool adjust_storage_usage = true);
+                          bool adjust_storage_usage = true,
+                          bool maintenance_no_touch = false,
+                          bool delete_if_metadata_absent = true,
+                          bool sync_metadata_absent = false,
+                          bool restore_usage_on_sync_failure = true);
+    ErrorCode DeleteRetiredMetadata(RequestContext *request_context,
+                                    const std::string &internal_instance_id,
+                                    const std::vector<SessionItem> &items);
     ErrorCode FinishWriteInternal(RequestContext *request_context,
                                   const std::string &internal_instance_id,
                                   const std::vector<bool> &success_keys,
@@ -157,11 +165,13 @@ private:
     ErrorCode DeleteAllocatedLocations(RequestContext *request_context, const std::vector<SessionItem> &items) const;
 
 private:
+    friend class KvMetaReclaimer;
     friend class KvMetaWriteSessionManager;
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<RegistryManager> registry_manager_;
     Limits limits_;
     std::unique_ptr<DataStorageSelector> data_storage_selector_;
+    std::unique_ptr<KvMetaReclaimer> reclaimer_;
     std::unique_ptr<KvMetaWriteSessionManager> write_session_manager_;
     mutable std::mutex registration_mutex_;
     // Serializes exact-byte admission and bounded Trim within a KVMeta group.
