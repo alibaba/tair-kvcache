@@ -1817,10 +1817,10 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                 rejected_keys.push_back(batch[i]);
             }
         }
-        // Recheck under the Local cache lock: ordinary and mixed keys rejected
-        // for pending, writing, or storage-scope reasons must not be touched.
+        // Yield keys with no deletable locations so later samples can reach
+        // other cold candidates, regardless of the rejected location types.
         if (const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id); indexer && !rejected_keys.empty()) {
-            indexer->TouchEventReportOnlyKeys(rejected_keys);
+            indexer->TouchKeysForMaintenance(rejected_keys);
         }
     }
     if (create_age_count == 0) {

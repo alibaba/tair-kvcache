@@ -167,7 +167,7 @@ public:
     // metadata is complete only after recovery, not merely when configured.
     bool PreferSingleTaskReclaimSampling() const noexcept;
     // Apply the maintenance yield only to a complete Local reclaim source.
-    size_t TouchEventReportOnlyKeys(const KeyTypeVec &keys) noexcept;
+    size_t TouchKeysForMaintenance(const KeyTypeVec &keys) noexcept;
 
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;

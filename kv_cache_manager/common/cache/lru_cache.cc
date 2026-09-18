@@ -576,27 +576,6 @@ bool LRUCacheShard::ApplyToEntryNoTouch(
     return true;
 }
 
-bool LRUCacheShard::PromoteEntryIf(
-    const std::string_view &key,
-    uint32_t hash,
-    const std::function<bool(Cache::ObjectPtr obj, size_t charge, const Cache::CacheItemHelper *helper)> &callback) {
-    if (!callback) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    LRUHandle *entry = table_.Lookup(key, hash);
-    // A pinned entry is off the LRU list and may be updated through its handle.
-    // Skip it before invoking the callback, preserving conditional semantics.
-    if (!entry || entry->HasRefs() || !callback(entry->value, entry->total_charge, entry->helper)) {
-        return false;
-    }
-    // These helpers also preserve the sampling position and refresh the tail
-    // hint, including singleton shards whose timestamp changed in the callback.
-    LRU_Remove(entry);
-    LRU_Insert(entry);
-    return true;
-}
-
 bool LRUCacheShard::Ref(LRUHandle *e) {
     std::lock_guard<std::mutex> l(mutex_);
     // To create another reference - entry must be already externally referenced.
@@ -1227,13 +1206,6 @@ size_t LRUCache::ApplyToNextOldestEntriesInShard(
         return 0;
     }
     return GetShard(shard_id).ApplyToNextOldestEntries(count, callback);
-}
-
-bool LRUCache::PromoteEntryIf(
-    const std::string_view &key,
-    const std::function<bool(ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> &callback) {
-    const auto hash = LRUCacheShard::ComputeHash(key, hash_seed_);
-    return GetShard(hash).PromoteEntryIf(key, hash, callback);
 }
 
 void LRUCache::SetTailChangeCallback(TailChangeCallback callback) {

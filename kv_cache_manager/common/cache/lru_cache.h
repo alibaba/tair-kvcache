@@ -337,11 +337,6 @@ public: // Function definitions expected as parameter to ShardedCache
         const std::function<ssize_t(Cache::ObjectPtr obj, size_t charge, const Cache::CacheItemHelper *helper)>
             &callback);
 
-    bool PromoteEntryIf(
-        const std::string_view &key,
-        uint32_t hash,
-        const std::function<bool(Cache::ObjectPtr obj, size_t charge, const Cache::CacheItemHelper *helper)> &callback);
-
     bool Release(LRUHandle *handle, bool useful, bool erase_if_last_ref);
     void ReleaseBatch(Cache::Handle *const *handles, const size_t *ordered_indices, size_t count);
     bool Ref(LRUHandle *handle);
@@ -565,10 +560,6 @@ public:
         const std::function<
             void(const std::string_view &key, ObjectPtr value, size_t charge, const CacheItemHelper *helper)> &callback)
         override;
-
-    bool PromoteEntryIf(
-        const std::string_view &key,
-        const std::function<bool(ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> &callback) override;
 
     // Register a callback invoked whenever the LRU tail of any shard changes.
     void SetTailChangeCallback(TailChangeCallback callback) override;

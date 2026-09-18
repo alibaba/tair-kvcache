@@ -284,7 +284,7 @@ public:
     GetLastAccessTimesForMaintenance(RequestContext *request_context,
                                      const KeyTypeVec &keys,
                                      std::vector<int64_t> &out_last_access_times) noexcept override;
-    size_t TouchEventReportOnlyKeys(const KeyTypeVec &keys) noexcept override;
+    size_t TouchKeysForMaintenance(const KeyTypeVec &keys) noexcept override;
 
     // meta data
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;

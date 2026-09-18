@@ -1959,12 +1959,12 @@ bool MetaStorageBackendManager::PreferSingleTaskReclaimSampling() const noexcept
     return source && source->GetStorageType() == META_LOCAL_BACKEND_TYPE_STR;
 }
 
-size_t MetaStorageBackendManager::TouchEventReportOnlyKeys(const KeyTypeVec &keys) noexcept {
+size_t MetaStorageBackendManager::TouchKeysForMaintenance(const KeyTypeVec &keys) noexcept {
     if (keys.empty() || !PreferSingleTaskReclaimSampling()) {
         return 0;
     }
     auto *source = cache_backend_ ? cache_backend_.get() : persistent_backend_.get();
-    return source->TouchEventReportOnlyKeys(keys);
+    return source->TouchKeysForMaintenance(keys);
 }
 
 ErrorCode MetaStorageBackendManager::SampleReclaimCandidates(RequestContext *request_context,

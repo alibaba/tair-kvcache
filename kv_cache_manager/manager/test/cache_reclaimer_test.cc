@@ -4461,8 +4461,8 @@ TEST_F(CacheReclaimerTest, TestRealLocalEventReportPrefixYieldsAcrossBoundedRoun
     ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 3, order));
     EXPECT_EQ((KeyVector{4, 5, 6}), order);
 
-    // The prefix exceeds the entire per-round budget. Only reporter-owned
-    // keys yield, so the next round reaches ordinary cold data without a
+    // The prefix exceeds the entire per-round budget. Rejected keys yield,
+    // so the next round reaches ordinary cold data without a
     // persistent scan cursor or a larger scan cap.
     ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
     const auto selected = GroupLruSubmittedBlocks();
@@ -4474,6 +4474,36 @@ TEST_F(CacheReclaimerTest, TestRealLocalEventReportPrefixYieldsAcrossBoundedRoun
     for (size_t i = 0; i < 5; ++i) {
         EXPECT_GT(times[i], (i + 1) * 100);
     }
+    EXPECT_EQ(600, times[5]);
+    EXPECT_EQ(700, times[6]);
+}
+
+TEST_F(CacheReclaimerTest, TestRealLocalOrdinaryRejectedPrefixYieldsAcrossBoundedRounds) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    auto *backend = UseRealLocalReclaimBackend("a", 5);
+    cache_reclaimer_->sampling_size_.store(3);
+    cache_reclaimer_->batching_size_.store(1);
+    cache_reclaimer_->group_lru_config_.max_sampling_size = 3;
+
+    // Ordinary locations in CLS_DELETING must yield too, not keep blocking
+    // the same cold prefix merely because they are not EventReport-only.
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_TRUE(GroupLruSubmittedBlocks().empty());
+    KeyVector order;
+    ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 3, order));
+    EXPECT_EQ((KeyVector{4, 5, 6}), order);
+
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto selected = GroupLruSubmittedBlocks();
+    ASSERT_EQ(1, selected.size());
+    EXPECT_EQ(6, selected[0].second);
+    std::vector<int64_t> times;
+    ASSERT_EQ(std::vector<ErrorCode>(7, EC_OK),
+              backend->GetLastAccessTimesForMaintenance(nullptr, {1, 2, 3, 4, 5, 6, 7}, times));
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_GT(times[i], (i + 1) * 100);
+    }
+    // Neither a selected victim nor an unscanned key is a maintenance touch.
     EXPECT_EQ(600, times[5]);
     EXPECT_EQ(700, times[6]);
 }

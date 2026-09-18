@@ -1051,13 +1051,13 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimCandidatesDoesNotTouchLruState) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
-TEST_F(MetaLocalBackendTest, TestReclaimTouchOnlyRefreshesEventReportOnlyKeysWithoutHits) {
+TEST_F(MetaLocalBackendTest, TestMaintenanceTouchRefreshesOnlyListedKeysWithoutRevisit) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
     auto *backend = GetLocalBackend();
-    ASSERT_EQ(EC_OK, backend->Init("reporter_yield", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, backend->Init("maintenance_yield", meta_storage_backend_config_));
     auto registry = std::make_shared<MetricsRegistry>();
     auto histogram = std::make_shared<RevisitIntervalHistogram>();
-    ASSERT_TRUE(histogram->Init(registry, {1.0, 10.0}, "reporter_yield"));
+    ASSERT_TRUE(histogram->Init(registry, {1.0, 10.0}, "maintenance_yield"));
     backend->SetRevisitHistogram(histogram);
     auto event = std::make_shared<CacheLocation>();
     event->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
@@ -1065,9 +1065,13 @@ TEST_F(MetaLocalBackendTest, TestReclaimTouchOnlyRefreshesEventReportOnlyKeysWit
     auto ordinary = std::make_shared<CacheLocation>();
     ordinary->set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     ordinary->set_status(CLS_DELETING);
-    const KeyVector keys{1, 2, 3, 4, 5};
-    CacheLocationMapVector locations{
-        {{"event", event}}, {{"ordinary", ordinary}}, {{"event", event}, {"ordinary", ordinary}}, {}, {{"bad", nullptr}}};
+    const KeyVector keys{1, 2, 3, 4, 5, 6};
+    CacheLocationMapVector locations{{{"event", event}},
+                                     {{"ordinary", ordinary}},
+                                     {{"event", event}, {"ordinary", ordinary}},
+                                     {},
+                                     {{"bad", nullptr}},
+                                     {{"ordinary", ordinary}}};
     ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK),
               backend->Put(nullptr, keys, locations, PropertyMapVector(keys.size())));
     for (const KeyType key : keys) {
@@ -1079,39 +1083,32 @@ TEST_F(MetaLocalBackendTest, TestReclaimTouchOnlyRefreshesEventReportOnlyKeysWit
             }));
     }
     backend->shard_oldest_access_time_[0].store(100);
-    EXPECT_EQ(1, backend->TouchEventReportOnlyKeys({1, 2, 3, 4, 5, 6}));
+    // The caller's list, not Location types, decides which keys yield.
+    EXPECT_EQ(5, backend->TouchKeysForMaintenance({1, 2, 3, 4, 5, 99}));
     std::vector<int64_t> times;
     ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK),
               backend->GetLastAccessTimesForMaintenance(nullptr, keys, times));
-    EXPECT_GT(times[0], 100);
-    for (size_t i = 1; i < keys.size(); ++i) {
-        EXPECT_EQ(keys[i] * 100, times[i]);
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_GT(times[i], keys[i] * 100);
     }
+    EXPECT_EQ(600, times[5]);
     KeyVector order;
-    ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 5, order));
-    EXPECT_EQ((KeyVector{2, 3, 4, 5, 1}), order);
-    EXPECT_EQ(200, backend->GetOldestAccessTime());
+    ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 6, order));
+    EXPECT_EQ((KeyVector{6, 1, 2, 3, 4, 5}), order);
+    EXPECT_EQ(600, backend->GetOldestAccessTime());
     EXPECT_EQ(0, histogram->GetCount());
-
-    // A stale rejection must not touch a key that has since become mixed.
-    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
-              backend->Upsert(nullptr, {1}, {{{"ordinary", ordinary}}}, PropertyMapVector(1)));
-    std::vector<int64_t> before, after;
-    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend->GetLastAccessTimesForMaintenance(nullptr, {1}, before));
-    EXPECT_EQ(0, backend->TouchEventReportOnlyKeys({1}));
-    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend->GetLastAccessTimesForMaintenance(nullptr, {1}, after));
-    EXPECT_EQ(before, after);
-    EXPECT_EQ(0, histogram->GetCount());
+    EXPECT_EQ(0, backend->TouchKeysForMaintenance({}));
+    EXPECT_EQ(0, backend->TouchKeysForMaintenance({99}));
     ASSERT_EQ(EC_OK, backend->Close());
 }
 
-TEST_F(MetaLocalBackendTest, TestReclaimTouchRefreshesSingletonShardColdness) {
+TEST_F(MetaLocalBackendTest, TestMaintenanceTouchRefreshesSingletonShardColdness) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
     auto *backend = GetLocalBackend();
-    ASSERT_EQ(EC_OK, backend->Init("singleton_reporter", meta_storage_backend_config_));
-    auto event = std::make_shared<CacheLocation>();
-    event->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
-    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend->Put(nullptr, {1}, {{{"event", event}}}, PropertyMapVector(1)));
+    ASSERT_EQ(EC_OK, backend->Init("singleton_maintenance", meta_storage_backend_config_));
+    auto location = std::make_shared<CacheLocation>();
+    location->set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend->Put(nullptr, {1}, {{{"loc", location}}}, PropertyMapVector(1)));
     ASSERT_TRUE(backend->cache_->ApplyToEntryNoTouch(
         MetaLocalBackend::KeyToView(1),
         [](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
@@ -1119,7 +1116,7 @@ TEST_F(MetaLocalBackendTest, TestReclaimTouchRefreshesSingletonShardColdness) {
             return 0;
         }));
     backend->shard_oldest_access_time_[0].store(100);
-    EXPECT_EQ(1, backend->TouchEventReportOnlyKeys({1}));
+    EXPECT_EQ(1, backend->TouchKeysForMaintenance({1}));
     std::vector<int64_t> times;
     ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend->GetLastAccessTimesForMaintenance(nullptr, {1}, times));
     EXPECT_GT(times[0], 100);
