@@ -323,6 +323,21 @@ private:
     bool sync_failed_{false};
 };
 
+class OversamplingMetaLocalBackend : public MetaLocalBackend {
+public:
+    ErrorCode SampleReclaimCandidates(RequestContext *request_context,
+                                      int64_t count,
+                                      ReclaimCandidateVector &out_candidates,
+                                      bool require_read_success) noexcept override {
+        const auto ec =
+            MetaLocalBackend::SampleReclaimCandidates(request_context, count, out_candidates, require_read_success);
+        if (ec == EC_OK && !out_candidates.empty()) {
+            out_candidates.push_back(out_candidates.front());
+        }
+        return ec;
+    }
+};
+
 } // namespace
 
 class KvMetaManagerTest : public TESTBASE {
@@ -405,6 +420,27 @@ protected:
         }
         auto config = std::make_shared<MetaStorageBackendConfig>();
         auto backend = std::make_unique<FailNextMaintenanceDeleteSyncBackend>();
+        if (backend->Init(KvMetaManager::InternalInstanceId(instance_id), config) != EC_OK ||
+            backend->Open() != EC_OK) {
+            return nullptr;
+        }
+        auto *backend_raw = backend.get();
+        if (indexer->backend_manager_->persistent_backend_) {
+            indexer->backend_manager_->persistent_backend_->Close();
+        }
+        indexer->backend_manager_->persistent_backend_ = std::move(backend);
+        indexer->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    OversamplingMetaLocalBackend *InstallOversamplingBackend(const std::string &instance_id) {
+        auto indexer =
+            cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(instance_id));
+        if (!indexer || !indexer->backend_manager_) {
+            return nullptr;
+        }
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        auto backend = std::make_unique<OversamplingMetaLocalBackend>();
         if (backend->Init(KvMetaManager::InternalInstanceId(instance_id), config) != EC_OK ||
             backend->Open() != EC_OK) {
             return nullptr;
@@ -1754,6 +1790,9 @@ TEST_F(KvMetaManagerTest, ReclaimerEvictsTheLeastRecentlyUsedCommittedObjectAtTh
     EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.retired_object_count").Get());
     EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.reclaimed_object_count").Get());
     EXPECT_EQ(30, metrics_registry_->GetCounter("kv_meta_reclaimer.reclaimed_bytes").Get());
+    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_attempted_object_count").Get());
+    EXPECT_EQ(0, metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_uncertain_object_count").Get());
+    EXPECT_EQ(0, metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_uncertain_bytes").Get());
     EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.pending_bytes").Get());
     EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.blocked_group_count").Get());
 }
@@ -1794,7 +1833,7 @@ TEST_F(KvMetaManagerTest, ReclaimerRetiresMetadataBeforeWaitingForTheReadGracePe
     EXPECT_EQ(CLS_NOT_FOUND, read_status());
 }
 
-TEST_F(KvMetaManagerTest, ReclaimerNeverEvictsAnActiveWriteButWakesAfterCommit) {
+TEST_F(KvMetaManagerTest, ReclaimerNeverEvictsAnActiveWriteAndReclaimsAfterCommit) {
     constexpr const char *kGroup = "reclaim-active-group";
     constexpr const char *kInstance = "reclaim-active-instance";
     constexpr const char *kKey = "active-object";
@@ -1849,6 +1888,9 @@ TEST_F(KvMetaManagerTest, ReclaimerDoesNotReplayAnUncertainPhysicalDelete) {
     ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     EXPECT_EQ(1, faulting->DeleteAttempts());
+    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_attempted_object_count").Get());
+    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_uncertain_object_count").Get());
+    EXPECT_EQ(90, metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_uncertain_bytes").Get());
 
     auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {kKey});
     ASSERT_EQ(EC_OK, get_ec);
@@ -2090,6 +2132,31 @@ TEST_F(KvMetaManagerTest, ReclaimerRotatesAOneKeySampleBudgetAcrossInstances) {
     ASSERT_TRUE(WaitUntil([&]() { return committed_indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
     EXPECT_EQ(45, active_indexer->GetStorageUsage());
     EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kActiveInstance, active.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerRejectsAnOverlongBackendSampleWithoutDeleting) {
+    constexpr const char *kGroup = "reclaim-overlong-sample-group";
+    constexpr const char *kInstance = "reclaim-overlong-sample-instance";
+    constexpr const char *kKey = "must-not-be-deleted";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
+    ASSERT_NE(nullptr, InstallOversamplingBackend(kInstance));
+    CommitObject(kInstance, kKey, 90);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetSamplingSize(&request_context_, 1));
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil([&]() { return metrics_registry_->GetCounter("kv_meta_reclaimer.error_count").Get() != 0; },
+                          std::chrono::seconds(2)));
+    cache_manager_->PauseReclaimer();
+
+    EXPECT_EQ(90, indexer->GetStorageUsage());
+    EXPECT_EQ(0, metrics_registry_->GetCounter("kv_meta_reclaimer.retired_object_count").Get());
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {kKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_TRUE(values.front().found);
 }
 
 TEST_F(KvMetaManagerTest, ReclaimerFailsClosedForAnUnsupportedPolicy) {

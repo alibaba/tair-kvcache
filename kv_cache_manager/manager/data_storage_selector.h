@@ -150,6 +150,21 @@ public:
                                        const std::string &instance_group) const noexcept;
 
     /**
+     * @brief Select a backend whose storage type can admit an exact-size
+     * variable-length allocation.
+     *
+     * This overload is used by KVMeta. The two-argument API above and its
+     * fixed-block selection behavior remain unchanged.
+     *
+     * @param required_bytes Exact additional bytes that the selected storage
+     * type must be able to admit.
+     */
+    [[nodiscard]] DataStorageSelectResult
+    SelectCacheWriteDataStorageBackend(RequestContext *request_context,
+                                       const std::string &instance_group,
+                                       std::uint64_t required_bytes) const noexcept;
+
+    /**
      * @brief Check whether explicitly named write targets may accept new
      * allocations.
      *
@@ -174,6 +189,7 @@ private:
     void GenStorageQuotaAvailTable(RequestContext const *request_context,
                                    const InstanceGroupQuota &quota,
                                    const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
+                                   std::uint64_t required_bytes,
                                    StorageQuotaAvail &out_storage_quota_avail_table) const noexcept;
 
     static void GetCandidates(RequestContext const *request_context,

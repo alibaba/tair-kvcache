@@ -1,8 +1,11 @@
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <grpcpp/grpcpp.h>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -31,6 +34,7 @@ public:
     void set_put_finish_transport_error(bool value) { put_finish_transport_error_.store(value); }
     void set_remove_transport_error(bool value) { remove_transport_error_.store(value); }
     void set_trim_transport_error(bool value) { trim_transport_error_.store(value); }
+    void set_get_delay(std::chrono::milliseconds value) { get_delay_ms_.store(value.count()); }
 
     grpc::Status RegisterInstance(grpc::ServerContext *,
                                   const proto::kv_meta::RegisterInstanceRequest *request,
@@ -65,6 +69,10 @@ public:
                      const proto::kv_meta::GetRequest *request,
                      proto::kv_meta::GetResponse *response) override {
         ++get_calls;
+        const auto delay_ms = get_delay_ms_.load();
+        if (delay_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        }
         if (get_transport_error_.load()) {
             return grpc::Status(grpc::StatusCode::UNAVAILABLE, "injected ambiguous transport error");
         }
@@ -225,6 +233,7 @@ private:
     std::atomic<bool> put_finish_transport_error_{false};
     std::atomic<bool> remove_transport_error_{false};
     std::atomic<bool> trim_transport_error_{false};
+    std::atomic<std::int64_t> get_delay_ms_{0};
     mutable std::mutex mutex_;
     std::vector<std::uint64_t> last_start_sizes;
     std::vector<bool> last_finish_successes;
@@ -356,6 +365,26 @@ TEST(KvMetaClientTest, ReadFailsOverAfterTransportError) {
     ASSERT_EQ(1, get.locations.size());
     EXPECT_EQ(17, get.locations[0].value_size);
     EXPECT_EQ(1, unavailable.get_calls.load());
+    EXPECT_EQ(1, leader.get_calls.load());
+}
+
+TEST(KvMetaClientTest, ReadReservesOverallDeadlineForAHealthySecondary) {
+    FakeKvMetaService black_holed;
+    black_holed.set_get_delay(std::chrono::milliseconds(400));
+    FakeKvMetaService leader;
+    RunningServer black_holed_server(&black_holed);
+    RunningServer leader_server(&leader);
+    ASSERT_TRUE(black_holed_server.valid());
+    ASSERT_TRUE(leader_server.valid());
+
+    auto client = KvMetaClient::Create({{black_holed_server.address(), leader_server.address()}, "emb-instance", 300});
+    ASSERT_TRUE(client);
+    auto [get_ec, get] = client->Get("trace-get", {"a"});
+
+    ASSERT_EQ(ER_OK, get_ec);
+    ASSERT_EQ(1, get.locations.size());
+    EXPECT_EQ(17, get.locations[0].value_size);
+    EXPECT_EQ(1, black_holed.get_calls.load());
     EXPECT_EQ(1, leader.get_calls.load());
 }
 

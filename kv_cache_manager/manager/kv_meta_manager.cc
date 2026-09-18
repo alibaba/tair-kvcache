@@ -749,6 +749,13 @@ private:
             reclaimed_bytes_metrics_ = registry->GetCounter("kv_meta_reclaimer.reclaimed_bytes");
             retry_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.retry_count");
             error_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.error_count");
+            pending_limit_reject_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.pending_limit_reject_count");
+            physical_delete_attempted_object_count_metrics_ =
+                registry->GetCounter("kv_meta_reclaimer.physical_delete_attempted_object_count");
+            physical_delete_uncertain_object_count_metrics_ =
+                registry->GetCounter("kv_meta_reclaimer.physical_delete_uncertain_object_count");
+            physical_delete_uncertain_bytes_metrics_ =
+                registry->GetCounter("kv_meta_reclaimer.physical_delete_uncertain_bytes");
             pending_object_count_metrics_ = registry->GetGauge("kv_meta_reclaimer.pending_object_count");
             pending_bytes_metrics_ = registry->GetGauge("kv_meta_reclaimer.pending_bytes");
             blocked_group_count_metrics_ = registry->GetGauge("kv_meta_reclaimer.blocked_group_count");
@@ -991,7 +998,7 @@ private:
                            const std::string &instance_group,
                            const std::vector<InstanceInfoConstPtr> &instances,
                            std::size_t sampling_size,
-                           std::vector<CandidateKey> &out) const {
+                           std::vector<CandidateKey> &out) {
         out.clear();
         std::vector<std::pair<InstanceInfoConstPtr, std::size_t>> eligible;
         std::uint64_t total_key_count = 0;
@@ -1032,6 +1039,7 @@ private:
         const std::size_t total_budget = sampling_size;
         std::size_t remaining_budget = total_budget;
         std::uint64_t remaining_weight = total_key_count;
+        std::uint64_t observed_location_count = 0;
         std::set<std::tuple<std::string, std::int64_t>> sampled_keys;
         for (std::size_t instance_index = 0; instance_index < selected_instances.size(); ++instance_index) {
             const auto &[instance, key_count_for_instance] = selected_instances[instance_index];
@@ -1053,6 +1061,11 @@ private:
             ReclaimCandidateVector sampled;
             if (indexer->SampleReclaimCandidates(
                     request_context, static_cast<std::int64_t>(key_budget), sampled, true) != EC_OK) {
+                return false;
+            }
+            if (sampled.size() > key_budget) {
+                AddError(request_context, "KVMeta reclaim sampling exceeded its requested bound");
+                ++error_count_metrics_;
                 return false;
             }
             KeyVector keys;
@@ -1086,6 +1099,12 @@ private:
                 key_candidate.internal_key = keys[key_index];
                 key_candidate.last_access_time_us = access_times[key_index];
                 key_candidate.all_locations_committed = true;
+                if (location_maps[key_index].size() > kPendingObjectLimit - observed_location_count) {
+                    AddError(request_context, "KVMeta reclaim candidate locations exceeded the bounded scan limit");
+                    ++error_count_metrics_;
+                    return false;
+                }
+                observed_location_count += location_maps[key_index].size();
                 for (const auto &[location_id, location] : location_maps[key_index]) {
                     if (!location) {
                         return false;
@@ -1497,7 +1516,20 @@ private:
             if (batch->retry_count != std::numeric_limits<std::uint32_t>::max()) {
                 ++batch->retry_count;
             }
-            pending_batches_.emplace(PendingDeadline{batch->deadline, batch->sequence}, batch);
+            try {
+                const auto [_, inserted] =
+                    pending_batches_.emplace(PendingDeadline{batch->deadline, batch->sequence}, batch);
+                if (!inserted) {
+                    throw std::logic_error("duplicate KVMeta retry sequence");
+                }
+            } catch (...) {
+                // The durable retired marker must never be left without an
+                // in-memory finalizer while this leader continues admitting
+                // writes. Recovery on the next leader owns it after this
+                // KVMeta-only fail-closed transition.
+                FailClosedMaintenance();
+                throw;
+            }
             wake_requested_ = true;
         }
         condition_.notify_all();
@@ -1598,6 +1630,11 @@ private:
         // deletion is intentionally attempted exactly once: a timeout or
         // provider exception has an uncertain outcome, and replay could delete
         // a successor allocation if a backend reuses addresses.
+        std::uint64_t reclaimed_bytes = 0;
+        for (const auto &item : batch->items) {
+            reclaimed_bytes = SaturatingAdd(reclaimed_bytes, item.item.value_size);
+        }
+        physical_delete_attempted_object_count_metrics_ += batch->items.size();
         ErrorCode physical_ec = EC_IO_ERROR;
         const char *failure_kind = "error_code";
         try {
@@ -1610,16 +1647,17 @@ private:
         }
         if (physical_ec != EC_OK) {
             ++error_count_metrics_;
+            physical_delete_uncertain_object_count_metrics_ += batch->items.size();
+            physical_delete_uncertain_bytes_metrics_ += reclaimed_bytes;
             KVCM_LOG_WARN("KVMeta reclaimer left objects for backend orphan cleanup, item_count[%zu], "
                           "failure[%s], ec[%d]",
                           all_items.size(),
                           failure_kind,
                           physical_ec);
         }
-        std::uint64_t reclaimed_bytes = 0;
-        for (const auto &item : batch->items) {
-            reclaimed_bytes = SaturatingAdd(reclaimed_bytes, item.item.value_size);
-        }
+        // These counters describe logical cache capacity reclaimed after the
+        // durable metadata delete. The physical-attempt/uncertain counters
+        // above separately expose backend cleanup health.
         reclaimed_object_count_metrics_ += batch->items.size();
         reclaimed_bytes_metrics_ += reclaimed_bytes;
         CompletePending(batch);
@@ -1708,6 +1746,7 @@ private:
                 return false;
             }
             if (!HasPendingCapacity(selected)) {
+                ++pending_limit_reject_count_metrics_;
                 KVCM_INTERVAL_LOG_WARN(10,
                                        "KVMeta reclaimer pending limit reached for group [%s], selected[%zu]",
                                        group->name().c_str(),
@@ -1742,6 +1781,12 @@ private:
                 try {
                     AddPendingBatch(group->name(), quota_shard, finalization_deadline, std::move(retired));
                 } catch (...) {
+                    // AddPendingBatch can allocate before it reaches its
+                    // internally guarded map publication. At this point the
+                    // CAS+Sync retirement may already be durable, so every
+                    // exception must close KVMeta admission before the group
+                    // shard is released.
+                    FailClosedMaintenance();
                     KVCM_LOG_ERROR("KVMeta reclaimer could not publish pending state for group [%s]; "
                                    "KVMeta maintenance is now fail-closed",
                                    group->name().c_str());
@@ -1890,7 +1935,7 @@ private:
     std::map<std::pair<std::string, std::string>, std::size_t> pending_locations_;
     std::map<std::string, PendingCredit> pending_credits_;
     std::map<PendingDeadline, std::shared_ptr<PendingBatch>> pending_batches_;
-    mutable std::map<std::string, std::size_t> sampling_rotation_by_group_;
+    std::map<std::string, std::size_t> sampling_rotation_by_group_;
     std::uint64_t next_pending_sequence_ = 0;
     std::uint64_t pending_object_count_ = 0;
     std::uint64_t pending_bytes_ = 0;
@@ -1900,6 +1945,10 @@ private:
     Counter reclaimed_bytes_metrics_;
     Counter retry_count_metrics_;
     Counter error_count_metrics_;
+    Counter pending_limit_reject_count_metrics_;
+    Counter physical_delete_attempted_object_count_metrics_;
+    Counter physical_delete_uncertain_object_count_metrics_;
+    Counter physical_delete_uncertain_bytes_metrics_;
     Gauge pending_object_count_metrics_;
     Gauge pending_bytes_metrics_;
     Gauge blocked_group_count_metrics_;
@@ -2661,7 +2710,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         return {ec, StartWriteResult{}};
     }
     const auto selected = data_storage_selector_->SelectCacheWriteDataStorageBackend(
-        request_context, instance_info->instance_group_name());
+        request_context, instance_info->instance_group_name(), missing_bytes);
     if (selected.ec != EC_OK || selected.name.empty() || selected.type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
         return {selected.ec == EC_OK ? EC_NOENT : selected.ec, StartWriteResult{}};
     }
@@ -3257,12 +3306,11 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
     if (std::any_of(success_keys.begin(), success_keys.end(), [](bool success) { return !success; })) {
         return cleanup_active_session(EC_OK);
     }
-    const ErrorCode finish_ec =
-        FinishWriteInternal(request_context, session.internal_instance_id, success_keys, session.items);
-    if (finish_ec == EC_OK && reclaimer_) {
-        reclaimer_->Wake();
-    }
-    return finish_ec;
+    // Successful commits are observed by the bounded periodic reclaim round.
+    // Waking on every PutFinish would turn sustained write QPS into registry
+    // scan QPS even when the group is far below its watermark. EC_NOSPC still
+    // wakes the worker immediately from StartWrite's admission path.
+    return FinishWriteInternal(request_context, session.internal_instance_id, success_keys, session.items);
 }
 
 ErrorCode KvMetaManager::Remove(RequestContext *request_context,
