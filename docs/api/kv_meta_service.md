@@ -20,6 +20,11 @@ exact-size 数据面，并为所有 miss/容量/读取故障保留重算路径�
    `kvcm.service.rpc_port`，按不同的 protobuf service 全名路由；
 2. Instance Group 必须只用于 KVMeta，不能混入普通 KV cache instance；group 必须配置 `POLICY_LRU`、
    `used_percentage in [0,1]`、合法的 `delay_before_delete_ms`，且进程级 reclaim sampling/batching 均非零；
+   metadata backend 必须是会在读取时刷新热度的 `local` 或 `cached`（测试环境可用 `dummy`）；`cached` 必须提供
+   非空、合法的 URI，且 hot `cache_type` 为默认/显式 `local`；直连
+   `redis`/`async_redis` 当前不会刷新 `BP#lru_time`，因此 KVMeta 注册会 fail closed，普通 KVCache 不受影响。
+   其中 `local` 是纯进程内状态，不具备 crash/failover 恢复能力；共享 TairMempool/PACE 的生产部署必须使用
+   `cached`，其 persistent 层使用 Redis/async Redis，并同时使用持久化 Registry；
    `storage_candidates` 还必须唯一、已注册并具有 exact-object ownership（EventReport 不满足）；文件型 backend
    配置必须能生成词法规范的绝对 KVMeta namespace（NFS 拼接型 `root_path` 必须带目录分隔符），storage spec 的
    动态类型必须与 backend type 一致，最长 hash/size/blkid 组合后的 URI 也必须处于配置上限内；否则注册或新对象
@@ -32,6 +37,12 @@ exact-size 数据面，并为所有 miss/容量/读取故障保留重算路径�
    tensor schema/version；服务端把“同 key、同 size”视为 hit，但不会比较 value bytes；
 7. miss、`RESOURCE_EXHAUSTED`、`WRITE_IN_PROGRESS`、服务不可用或数据面 Load 失败都必须允许调用方重算。Cache 写回失败
    不应使本次推理失败。
+
+使用内部 TairMempool/PACE 数据面时，KVMeta client 初始化还会校验 PACE 的分层 timeout，并要求
+`TAIR_MEMPOOL_SYNC_TIMEOUT_MS` 严格小于 KVCM SDK 的 Get/Put timeout。该检查不影响普通 fixed-block client，也不代表
+PACE 已经排空 timeout 前提交的 remote RDMA/Commit。服务端因此对失败写额外隔离 180 秒，并在 Delete 后要求完整
+GA snapshot 证明地址不存在。生产前仍必须用故障注入验证 180 秒覆盖真实最坏迟到 I/O；未证明该契约的 legacy
+DRAM/direct-RDMA 配置只允许隔离灰度。
 
 升级说明：遗留的 `kvcm.kv_meta.rpc_port=0` 仅作为无副作用的禁用配置兼容；任何非零旧端口都会使配置解析
 失败，避免服务端切换到主端口后客户端仍误连旧端口。启用时必须同时迁移为
@@ -117,6 +128,10 @@ Trim(instance) -> 按策略清理整个 KVMeta instance
   另一类 instance 再加入同 group 都会在 registry mutation 前被拒绝；
 - group 必须有当前 KVMeta Reclaimer 可执行的 LRU 配置，且进程级 sampling/batching 非零；无配置、非 LRU、
   非法 watermark/read grace 或关闭采样/批量回收均返回 `SERVICE_NOT_READY`，且不会创建 instance；
+- group 的 metadata backend 必须是 `local`、使用 local hot layer 的合法 `cached`，或测试用 `dummy`；直连 Redis 不刷新读热度，不能在
+  `POLICY_LRU` 名义下静默退化为采样/并列顺序淘汰。这个校验只证明回收算法有可信的读热度，不证明 metadata
+  能跨进程恢复：`local`/`dummy` 的 `Sync` 只是进程内 barrier。生产共享 Cache 使用以 Redis/async Redis 为
+  persistent 层的 `cached`，以及持久化 Registry；
 - `storage_candidates` 必须唯一并全部指向已注册的 exact-object backend；配置身份必须与 registry name 一致，文件型
   配置必须能安全生成 `kvmeta/<instance-hash>/<key-hash>/<32-byte nonce>`；EventReport 只表示外部 block 观测，
   不授予 KVCM 创建/删除所有权，因此不能作为 EMB value storage；
@@ -125,6 +140,12 @@ Trim(instance) -> 按策略清理整个 KVMeta instance
 - 成功响应的 `storage_configs` 是后续 transfer client 的权威 backend 配置，并且只包含该 group 已校验的
   `storage_candidates`；普通 KVCache 的 migration source/target 不属于 KVMeta 数据面，不会混入响应导致整个
   exact-object client 初始化失败。
+
+`Sync` 的强度由 metadata backend 决定。对 `cached` 的持久层，它是后续物理 Delete 前的持久化 ownership
+barrier；对纯内存 `local`/`dummy`，它只能排序当前进程中的读写，进程退出后 location、usage 和待回收 owner 都会
+丢失。KVCM 不会扫描 TairMempool 或文件 namespace 来反向重建这些记录。因此 `local` 只适合 UT、单进程临时环境，
+或已经具备独立 namespace TTL/sweeper 且明确接受重启后 cache 全失效和 orphan 的场景，不能作为共享 PACE Cache
+的生产 HA 配置。
 
 ### 5.2 `GetInstanceInfo`
 
@@ -217,7 +238,10 @@ count 成功执行 `PutFinish(false)`，才会返回原始的 `INTERNAL_ERROR`/`
 - 长度错误不会消费仍有效的 session，调用方可用正确 mask 重试；
 - `locations` 字段为未来客户端分配模式保留；当前服务端分配模式以 session 保存的位置为准。
 
-回滚和 session timeout 都先条件删除 active metadata 并完成 `Sync`，再对 allocation 发起一次物理 Delete。服务端
+普通同步 backend 的回滚和 session timeout 会先条件删除 active metadata 并完成 `Sync`，再对 allocation 发起一次
+物理 Delete。TairMempool/PACE 的失败 Finish 不立即释放地址：session 被标为 aborted，active metadata、usage 和
+allocation 继续保留到 client commit deadline 后的 180 秒安全隔离期；重复失败 Finish 幂等，之后的成功 Finish 被
+拒绝。进程重启/换主也从持久化 active deadline 恢复同一隔离期。服务端
 会捕获 storage provider 抛出的异常，避免异常终止 expiry worker 或服务进程。物理结果为错误或不确定时不会自动
 重放 Delete：现有 URI 没有 allocation generation，重放可能误删已经复用该地址的后继对象。此时 metadata 已
 不可见且不会恢复，接口/日志报告 backend orphan，由存储侧清理机制回收。
@@ -285,7 +309,7 @@ replacement owner 会关闭 KVMeta maintenance，且不发起物理 Delete。普
 | `UNSUPPORTED` | V1 不支持该模式 | 改用受支持模式 |
 | `DUPLICATE_ENTITY` | instance 已存在但注册配置不一致 | 对照既有 instance 配置，不覆盖重试 |
 | `INSTANCE_NOT_EXIST` | 未注册或内部 schema 不匹配 | 检查注册和部署配置 |
-| `SERVER_NOT_LEADER` / `SERVICE_NOT_READY` | endpoint 当前不能服务，或 KVMeta group 没有有效 LRU 回收配置 | endpoint 问题可切换地址；配置问题先修复 group，避免无界重试 |
+| `SERVER_NOT_LEADER` / `SERVICE_NOT_READY` | endpoint 当前不能服务，或 KVMeta group 没有有效 LRU/读热度回收配置 | endpoint 问题可切换地址；配置问题先修复 group，避免无界重试 |
 | `RESOURCE_EXHAUSTED` / `REACH_MAX_ENTITY_CAPACITY` | byte quota、session 或实体容量到限 | 释放对象或扩容后再试 |
 | `WRITE_IN_PROGRESS` | 相同 key 或 instance 正在写/finalize；active size 仍是临时值 | 等原 session 收敛，不并发覆盖 |
 | `SESSION_NOT_FOUND` | session 过期、不存在或 instance 不匹配 | 查询最终状态，不把它当成功 |
@@ -332,9 +356,15 @@ C++ 调用方可显式调用幂等的 `KvMetaObjectClient::Close()`；它会拒�
 再释放 metadata/data-plane 资源。之后的合法操作返回 `ER_CLIENT_NOT_EXISTS`。Python `close()` 和 context manager
 会调用同一 native 清理入口。
 
-该 drain 只保护本地 buffer 生命周期，不会续约服务端 V1 write session。所选 backend 必须保证在 write lease
-到期前停止访问 remote allocation，或将 lease 配置为覆盖经过验证的最坏 I/O drain；否则 expiry 可能与越过
-provider timeout 的旧 Put 竞争。可续约/fenced I/O 是设计文档第 13 节的 V2 能力，不是现有保证。
+该 drain 只保护本地 buffer 生命周期，不会续约服务端 client commit deadline。所选 backend 必须保证在物理安全
+清理 deadline 前停止访问 remote allocation；TairMempool adapter 会在 commit deadline 后追加 180 秒 failed-write
+quarantine。若线上 PACE 的最坏迟到 I/O 超过该值，仍不得上线。可续约/fenced I/O 是设计文档第 13 节的 V2 能力，
+不是现有保证。
+
+对 TairMempool，不要把小于 PACE 内部同步 timeout 的 Get/Put override 当作硬 deadline；新 client 会在初始化时拒绝
+这种配置。即使预算层级合法，也必须用 timeout/quarantine/Free/同址复用故障注入证明 180 秒覆盖 remote
+RDMA/Commit。KVMeta 的 TairMempool 物理 GC 只发一次 DELETE，并要求后续完整 GA snapshot 明确证明目标地址不存在；
+HTTP 200、部分 snapshot 或目标仍存在都视为不确定并关闭 KVMeta gate，不会影响固定块 KVCache 的原 Delete 路径。
 
 Python wheel 的推荐入口是：
 

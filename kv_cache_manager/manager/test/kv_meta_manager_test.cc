@@ -38,6 +38,7 @@
 #include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/kv_meta_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
+#include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
@@ -553,6 +554,32 @@ private:
     std::condition_variable condition_;
     bool delete_entered_{false};
     bool release_delete_{false};
+};
+
+class QuarantinedWriteNfsBackend : public NfsBackend, public KvMetaDataStorageBackendExtension {
+public:
+    explicit QuarantinedWriteNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
+        : NfsBackend(std::move(metrics_registry)) {}
+
+    std::int64_t GetFailedWriteCleanupGraceSeconds() const noexcept override { return 1; }
+
+    std::vector<ErrorCode> DeleteAndConfirmAbsent(const std::vector<DataStorageUri> &storage_uris,
+                                                  const std::string &trace_id,
+                                                  std::function<void()> cb) override {
+        return Delete(storage_uris, trace_id, std::move(cb));
+    }
+
+    std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,
+                                  const std::string &trace_id,
+                                  std::function<void()> cb) override {
+        delete_calls_.fetch_add(storage_uris.size(), std::memory_order_relaxed);
+        return NfsBackend::Delete(storage_uris, trace_id, std::move(cb));
+    }
+
+    std::size_t DeleteCalls() const noexcept { return delete_calls_.load(std::memory_order_relaxed); }
+
+private:
+    std::atomic<std::size_t> delete_calls_{0};
 };
 
 class BlockingThenFailDeleteNfsBackend : public NfsBackend {
@@ -3172,6 +3199,54 @@ TEST_F(KvMetaManagerTest, ExpiredSessionIsCleanedBeforeTheKeyCanBeWrittenAgain) 
     EXPECT_EQ(0, indexer->GetStorageUsage());
 }
 
+TEST_F(KvMetaManagerTest, FailedWriteOnQuarantinedBackendKeepsItsAddressUntilCleanupDeadline) {
+    constexpr const char *kKey = "quarantined-failed-write";
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto quarantined = std::make_shared<QuarantinedWriteNfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, quarantined->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = quarantined;
+    }
+
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {37}, 1);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_FALSE(start.write_session_id.empty());
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
+    ASSERT_TRUE(indexer);
+    ASSERT_EQ(37, indexer->GetStorageUsage());
+
+    // A reported transfer failure aborts the session but must not release a
+    // reusable address while the backend's late-I/O quarantine is active.
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {false}));
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {false}));
+    EXPECT_EQ(0, quarantined->DeleteCalls());
+    EXPECT_EQ(EC_EXIST, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}));
+    EXPECT_EQ(EC_EXIST, manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {37}, 30).first);
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_FALSE(values.front().found);
+    EXPECT_EQ(37, indexer->GetStorageUsage());
+
+    ASSERT_TRUE(WaitUntil([&]() { return quarantined->DeleteCalls() == 1 && indexer->GetStorageUsage() == 0; },
+                          std::chrono::seconds(4)));
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {37}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    ASSERT_FALSE(retry.write_session_id.empty());
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {true}));
+    ASSERT_EQ(EC_OK, manager_->Remove(&request_context_, kInstanceId, {kKey}));
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
 TEST_F(KvMetaManagerTest, ExpiryDoesNotReplayFailedPhysicalDelete) {
     constexpr const char *kKey = "expiry-delete-fails";
     auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {29}, 1);
@@ -3580,6 +3655,16 @@ TEST_F(KvMetaManagerTest, RejectsWriteTimeoutLimitOutsideTheProtocolRange) {
     KvMetaManager invalid_manager(cache_manager_, registry_manager_, limits);
 
     EXPECT_FALSE(invalid_manager.Init());
+
+    limits.max_write_timeout_seconds = std::numeric_limits<std::int32_t>::max();
+    limits.max_failed_write_cleanup_grace_seconds = 1;
+    KvMetaManager overflowing_lease_manager(cache_manager_, registry_manager_, limits);
+    EXPECT_FALSE(overflowing_lease_manager.Init());
+
+    limits.max_write_timeout_seconds = 1;
+    limits.max_failed_write_cleanup_grace_seconds = -1;
+    KvMetaManager negative_grace_manager(cache_manager_, registry_manager_, limits);
+    EXPECT_FALSE(negative_grace_manager.Init());
 }
 
 TEST_F(KvMetaManagerTest, RejectsLocationUriLimitOutsideTheClientContract) {
@@ -4381,12 +4466,15 @@ TEST_F(KvMetaManagerTest, ReclaimerEvictsTheLeastRecentlyUsedCommittedObjectAtTh
     constexpr const char *kInstance = "reclaim-lru-instance";
     CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
 
-    CommitObject(kInstance, "old", 30);
+    CommitObject(kInstance, "touched-old", 30);
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    CommitObject(kInstance, "middle", 30);
+    CommitObject(kInstance, "oldest-untouched", 30);
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    CommitObject(kInstance, "hot", 30);
-    auto [touch_ec, touch] = manager_->Get(&request_context_, kInstance, {"hot"});
+    CommitObject(kInstance, "newest", 30);
+    // Touch the object that was oldest before this read. This must move it
+    // behind both untouched objects in the eviction order; touching the
+    // newest object would not prove that Get refreshes LRU heat.
+    auto [touch_ec, touch] = manager_->Get(&request_context_, kInstance, {"touched-old"});
     ASSERT_EQ(EC_OK, touch_ec);
     ASSERT_EQ(1, touch.size());
     ASSERT_TRUE(touch[0].found);
@@ -4401,11 +4489,11 @@ TEST_F(KvMetaManagerTest, ReclaimerEvictsTheLeastRecentlyUsedCommittedObjectAtTh
         WaitUntil([&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.pending_object_count").Get() == 0; },
                   std::chrono::seconds(2)));
 
-    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {"old", "middle", "hot"});
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {"touched-old", "oldest-untouched", "newest"});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(3, values.size());
-    EXPECT_FALSE(values[0].found);
-    EXPECT_TRUE(values[1].found);
+    EXPECT_TRUE(values[0].found);
+    EXPECT_FALSE(values[1].found);
     EXPECT_TRUE(values[2].found);
     EXPECT_GE(metrics_registry_->GetCounter("kv_meta_reclaimer.round_count").Get(), 1);
     EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.retired_object_count").Get());
@@ -5699,6 +5787,83 @@ TEST_F(KvMetaManagerTest, RegistrationRejectsMissingStorageCandidates) {
         "missing-storage-object-group", "missing-storage-object-instance", {"unregistered-kvmeta-storage"});
 }
 
+TEST_F(KvMetaManagerTest, RegistrationRejectsMetadataBackendWithoutReadHeatTracking) {
+    const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(default_group);
+    ASSERT_TRUE(default_group->cache_config());
+    ASSERT_TRUE(default_group->cache_config()->meta_indexer_config());
+
+    auto cache_config = std::make_shared<CacheConfig>();
+    ASSERT_TRUE(cache_config->FromJsonString(default_group->cache_config()->ToJsonString()));
+    auto indexer_config = std::make_shared<MetaIndexerConfig>(*cache_config->meta_indexer_config());
+    auto redis_config = std::make_shared<MetaStorageBackendConfig>(META_REDIS_BACKEND_TYPE_STR);
+    redis_config->SetStorageUri("redis://127.0.0.1:6379");
+    indexer_config->SetMetaStorageBackendConfig(redis_config);
+    cache_config->set_meta_indexer_config(indexer_config);
+
+    InstanceGroup redis_group(*default_group);
+    redis_group.set_name("redis-metadata-object-group");
+    redis_group.set_global_quota_group_name("redis-metadata-object-quota");
+    redis_group.set_cache_config(cache_config);
+    redis_group.set_version(1);
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, redis_group));
+
+    // Direct Redis metadata does not update PROPERTY_LRU_TIME on Get. KVMeta
+    // must reject it instead of advertising POLICY_LRU while evicting by
+    // sampled/tie order. This guard is specific to KVMeta registration.
+    EXPECT_EQ(
+        EC_CONFIG_ERROR,
+        manager_->RegisterInstance(&request_context_, redis_group.name(), "redis-metadata-object-instance", "").first);
+}
+
+TEST_F(KvMetaManagerTest, RegistrationRejectsInvalidCachedMetadataHotLayer) {
+    const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(default_group);
+    ASSERT_TRUE(default_group->cache_config());
+    ASSERT_TRUE(default_group->cache_config()->meta_indexer_config());
+
+    const auto make_group = [&](const std::string &name, const std::string &storage_uri) {
+        auto cache_config = std::make_shared<CacheConfig>();
+        EXPECT_TRUE(cache_config->FromJsonString(default_group->cache_config()->ToJsonString()));
+        auto indexer_config = std::make_shared<MetaIndexerConfig>(*cache_config->meta_indexer_config());
+        auto cached_config = std::make_shared<MetaStorageBackendConfig>(META_CACHED_BACKEND_TYPE_STR);
+        cached_config->SetStorageUri(storage_uri);
+        indexer_config->SetMetaStorageBackendConfig(cached_config);
+        cache_config->set_meta_indexer_config(indexer_config);
+
+        InstanceGroup group(*default_group);
+        group.set_name(name);
+        group.set_global_quota_group_name(name + "-quota");
+        group.set_cache_config(cache_config);
+        group.set_version(1);
+        return group;
+    };
+
+    // Redis requires a real endpoint even when cached mode would otherwise
+    // default to redis/local. An empty URI must not be certified as durable or
+    // as an operational read-heat source.
+    auto empty_uri_group = make_group("cached-empty-uri-object-group", "");
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, empty_uri_group));
+    EXPECT_EQ(
+        EC_CONFIG_ERROR,
+        manager_->RegisterInstance(&request_context_, empty_uri_group.name(), "cached-empty-uri-object-instance", "")
+            .first);
+
+    // MetaStorageBackendFactory supports only a local hot layer. Validate the
+    // nested mode now so a registry hot update cannot leave KVMeta admitting
+    // writes under a configuration the active indexer could not reopen.
+    auto invalid_hot_group =
+        make_group("cached-invalid-hot-object-group", "redis://127.0.0.1:6379?persistent_type=redis&cache_type=redis");
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, invalid_hot_group));
+    EXPECT_EQ(
+        EC_CONFIG_ERROR,
+        manager_
+            ->RegisterInstance(&request_context_, invalid_hot_group.name(), "cached-invalid-hot-object-instance", "")
+            .first);
+}
+
 TEST_F(KvMetaManagerTest, ZeroReclaimerTuningBlocksOnlyNewAllocation) {
     CommitObject(kInstanceId, "existing", 17);
     const auto cache_reclaimer = cache_manager_->cache_reclaimer();
@@ -5770,6 +5935,57 @@ TEST_F(KvMetaManagerTest, InvalidHotUpdatedReclaimPolicyBlocksOnlyNewAllocation)
     EXPECT_FALSE(values.front().found);
 }
 
+TEST_F(KvMetaManagerTest, HotUpdatedMetadataWithoutReadHeatStopsAdmissionAndAutomaticReclaim) {
+    constexpr const char *kGroup = "reclaim-hot-metadata-group";
+    constexpr const char *kInstance = "reclaim-hot-metadata-instance";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
+    CommitObject(kInstance, "existing", 90);
+
+    const auto [group_ec, current_group] = registry_manager_->GetInstanceGroup(&request_context_, kGroup);
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(current_group);
+    ASSERT_TRUE(current_group->cache_config());
+    ASSERT_TRUE(current_group->cache_config()->meta_indexer_config());
+    auto updated_cache_config = std::make_shared<CacheConfig>();
+    ASSERT_TRUE(updated_cache_config->FromJsonString(current_group->cache_config()->ToJsonString()));
+    auto updated_indexer_config = std::make_shared<MetaIndexerConfig>(*updated_cache_config->meta_indexer_config());
+    auto redis_config = std::make_shared<MetaStorageBackendConfig>(META_REDIS_BACKEND_TYPE_STR);
+    redis_config->SetStorageUri("redis://127.0.0.1:6379");
+    updated_indexer_config->SetMetaStorageBackendConfig(redis_config);
+    updated_cache_config->set_meta_indexer_config(updated_indexer_config);
+    InstanceGroup updated_group(*current_group);
+    updated_group.set_cache_config(updated_cache_config);
+    updated_group.set_version(current_group->version() + 1);
+    ASSERT_EQ(EC_OK,
+              registry_manager_->UpdateInstanceGroup(&request_context_, updated_group, current_group->version()));
+
+    auto [hit_ec, hit] = manager_->StartWrite(&request_context_, kInstance, {"existing"}, {90}, 30);
+    ASSERT_EQ(EC_OK, hit_ec);
+    EXPECT_EQ((std::vector<bool>{true}), hit.key_mask);
+    EXPECT_EQ(EC_CONFIG_ERROR, manager_->StartWrite(&request_context_, kInstance, {"new-object"}, {10}, 30).first);
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    const double rounds_before = metrics_registry_->GetCounter("kv_meta_reclaimer.round_count").Get();
+    const double retired_before = metrics_registry_->GetCounter("kv_meta_reclaimer.retired_object_count").Get();
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return metrics_registry_->GetCounter("kv_meta_reclaimer.round_count").Get() > rounds_before; },
+        std::chrono::seconds(2)));
+
+    // The hot update changed only registry configuration; the already-open
+    // local indexer would still be capable of deleting the object. Verify the
+    // Reclaimer consults the current group contract and refuses to pretend
+    // that direct Redis provides LRU read heat.
+    EXPECT_EQ(90, indexer->GetStorageUsage());
+    EXPECT_EQ(retired_before, metrics_registry_->GetCounter("kv_meta_reclaimer.retired_object_count").Get());
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {"existing"});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_TRUE(values.front().found);
+}
+
 TEST_F(KvMetaManagerTest, RecoveryCompletesAReclaimerRetirementLeftByDemotion) {
     constexpr const char *kGroup = "reclaim-recovery-group";
     constexpr const char *kInstance = "reclaim-recovery-instance";
@@ -5804,6 +6020,28 @@ TEST_F(KvMetaManagerTest, RecoveryCompletesAReclaimerRetirementLeftByDemotion) {
     ASSERT_EQ(1, values.size());
     EXPECT_FALSE(values[0].found);
     ASSERT_TRUE(manager_->ResumeMaintenance());
+}
+
+TEST_F(KvMetaManagerTest, RecoveryRebuildsTheBoundedKvMetaReclaimerGroupSet) {
+    constexpr const char *kGroup = "reclaim-recovered-group";
+    constexpr const char *kInstance = "reclaim-recovered-instance";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
+    CommitObject(kInstance, "recovered-object", 90);
+
+    // Model a fresh process: the runtime-only discovery set is empty, while
+    // the reserved KVMeta instance and its committed metadata are durable.
+    manager_->ReplaceKvMetaGroups({});
+    EXPECT_TRUE(manager_->SnapshotKvMetaGroups().empty());
+
+    ASSERT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ((std::vector<std::string>{"default", kGroup}), manager_->SnapshotKvMetaGroups());
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    ASSERT_EQ(90, indexer->GetStorageUsage());
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    EXPECT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
 }
 
 TEST(KvMetaInstanceMarkerTest, RequiresTheCompleteReservedSchema) {

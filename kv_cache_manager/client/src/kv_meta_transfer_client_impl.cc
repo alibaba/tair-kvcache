@@ -74,7 +74,12 @@ ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_con
     // the data plane. Conservatively reserve one metadata timeout for the
     // PutStart response/request hand-off, one for the compatibility Get that
     // verifies masked hits, and one for PutFinish, in addition to the
-    // data-plane timeout. Reject a nominally impossible lease before
+    // data-plane timeout. RunWithTimeoutParallel starts its outer deadline
+    // before enqueueing. A task accepted just before that deadline may still
+    // consume one complete backend Put timeout while the KVMeta path drains
+    // accepted work to protect caller-owned buffers, so reserve two Put
+    // windows: queue/admission plus the backend operation itself. Reject a
+    // nominally impossible lease before
     // RegisterInstance can mutate remote state. A zero pair keeps the
     // standalone KvMetaTransferClient API free of metadata-transaction policy.
     if (write_timeout_seconds != 0 || metadata_call_timeout_ms != 0) {
@@ -84,11 +89,12 @@ ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_con
         }
         const std::uint64_t write_lease_ms = static_cast<std::uint64_t>(write_timeout_seconds) * 1000;
         const std::uint64_t minimum_completion_ms =
-            static_cast<std::uint64_t>(wrapper_config->timeout_config().put_timeout_ms()) +
+            static_cast<std::uint64_t>(wrapper_config->timeout_config().put_timeout_ms()) * 2 +
             static_cast<std::uint64_t>(metadata_call_timeout_ms) * 3;
         if (write_lease_ms <= minimum_completion_ms) {
             KVCM_LOG_WARN(
-                "KVMeta write_timeout_seconds must exceed put_timeout_ms plus three metadata call_timeout_ms windows");
+                "KVMeta write_timeout_seconds must exceed two put_timeout_ms windows plus three metadata "
+                "call_timeout_ms windows");
             return ER_INVALID_CLIENT_CONFIG;
         }
     }

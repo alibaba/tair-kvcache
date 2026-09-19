@@ -44,6 +44,11 @@ public:
         std::uint64_t max_value_bytes = 1ULL * 1024 * 1024 * 1024;
         std::uint64_t max_batch_bytes = 4ULL * 1024 * 1024 * 1024;
         std::int64_t max_write_timeout_seconds = 1800;
+        // Upper bound accepted from a backend that must quarantine a failed
+        // remote write before releasing its reusable allocation. This is
+        // server-side safety time and does not extend the client's commit
+        // deadline. The default covers PACE's 180-second quarantine contract.
+        std::int64_t max_failed_write_cleanup_grace_seconds = 180;
     };
 
     struct ValueLocation {
@@ -193,6 +198,9 @@ private:
                                 const std::string &storage_name,
                                 const std::vector<DataStorageUri> &uris) const;
     ErrorCode DeleteAllocatedLocations(RequestContext *request_context, const std::vector<SessionItem> &items) const;
+    void RememberKvMetaGroup(const std::string &instance_group);
+    std::vector<std::string> SnapshotKvMetaGroups() const;
+    void ReplaceKvMetaGroups(std::unordered_set<std::string> instance_groups);
 
 private:
     friend class KvMetaReclaimer;
@@ -204,6 +212,12 @@ private:
     std::unique_ptr<KvMetaReclaimer> reclaimer_;
     std::unique_ptr<KvMetaWriteSessionManager> write_session_manager_;
     mutable std::mutex registration_mutex_;
+    // Reclaimer rounds must never enumerate every ordinary KV-cache group.
+    // Registration and leader recovery are the only supported discovery
+    // points for the reserved KVMeta instance schema, so retain that bounded
+    // set and keep periodic maintenance entirely on the side path.
+    mutable std::mutex kv_meta_groups_mutex_;
+    std::unordered_set<std::string> kv_meta_groups_;
     // Serializes exact-byte admission and short metadata transitions within a
     // KVMeta group. Long Trim scans publish a per-instance marker under this
     // shard and then release it, so unrelated instances never wait behind

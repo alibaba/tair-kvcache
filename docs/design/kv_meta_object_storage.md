@@ -12,7 +12,7 @@ KVCM 的系统边界、普通 KVCache 主链路、HA 和 GC 职责划分见
 [KVMeta 通用对象 API](../api/kv_meta_service.md)。上层适配器分别见：
 
 - v6d 仓库：`docs/tair-kvcm/kvcm-emb-storage.md`；
-- RTP-LLM 仓库：`docs/multimodal/kvcm_emb_storage.md`。
+- RTP-LLM 仓库：`docs/backend/kvcm_emb_python_client.md`。
 
 ### 1.1 仓库与交付边界
 
@@ -21,18 +21,23 @@ KVCM 的系统边界、普通 KVCache 主链路、HA 和 GC 职责划分见
 | KVCM `github-opensource` | KVMeta 协议、独立服务、manager、object client、通用 exact-size SDK 路径和开源 backend/stub |
 | KVCM 内部父仓 | 固定开源子仓版本，并为真实 TairMempool/PACE SDK 实现 variable-size policy |
 | v6d | 提供可选 Python `KVCMEmbeddingStore`，不改变 v6d 原有 KV cache 传输 |
-| RTP-LLM `github-opensource` | 提供可选 multimodal producer/receipt/reader/release/GC 和构建开关 |
-| RTP-LLM 内部父仓 | 固定包含上述实现的开源子仓版本，不另复制一套 KVCM EMB 状态机 |
+| RTP-LLM `github-opensource` | 当前只提供独立 Python object client、现有 `RECO_*` 配置适配和 client/contract 测试；不改 transport/receipt/推理链路 |
+| RTP-LLM 内部父仓 | 固定包含上述 client 的开源子仓版本，不另复制一套 KVCM EMB 状态机 |
 
 因此“开源 KVCM”和“内部 KVCM”不是两套 KVMeta：通用协议与状态机只有一份；内部仓只补充无法在开源仓实现的
 PACE 数据面。部署时，各父仓必须固定到包含匹配协议和 client API 的子仓 revision。
 
 ### 1.2 结论先行与实现状态
 
-当前 V1 是可用于受控灰度的最小安全方案：它通过独立协议、namespace、请求门和 singleton allocation 支持变长
-对象，并坚持“不能证明归属就不删除”。容量侧同时具备周期水位回收和由失败准入触发的按需回收；一个低于水位、
-但会被大对象顶穿的 cache 不会永久卡在 `NOSPC`。它没有修改固定 block 接口，也不会让 KV cache 请求获取 KVMeta
-的锁。
+当前 V1 是可用于受控灰度的 **分布式 exact-object Cache 存储底座**：它通过独立协议、namespace、请求门和
+singleton allocation 支持变长对象，并坚持“不能证明归属就不删除”。容量侧同时具备周期水位回收和由失败准入
+触发的按需回收；一个低于水位、但会被大对象顶穿的 cache 不会永久卡在 `NOSPC`。它没有修改固定 block 接口，
+也不会让 KV cache 请求获取 KVMeta 的锁。
+
+这不等于 RTP 端到端 Embedding Cache 已经实现。当前 RTP 提交只提供可复用的 object client；稳定语义 key、
+load-before-compute、encoder skip、有界 singleflight、tensor manifest/完整性校验、业务 fallback、命中指标和可选
+本地 L1 仍由 RTP 集成层负责。缺少这些环节时，KVCM 只能被当作变长对象传输/存储服务，不能宣称具备跨请求复用的
+完整 Embedding Cache 语义。
 
 “可用于灰度”不是无条件的生产就绪声明。上线必须同时满足第 12.3 节的语义 key、推理 fallback、真实物理 GC、
 读宽限期、时钟和隔离要求；尤其是物理 `Delete` 为 no-op 且没有外部 TTL/sweeper 的 backend，不能作为有界容量的
@@ -45,13 +50,14 @@ ledger 解决安全重试。这样既能降低 singleton 调用放大，也不�
 
 | 层次 | 状态 | 能力与边界 |
 |---|---|---|
-| V1 | 当前代码已实现 | exact-size、singleton allocation、写租约、周期水位 + 按需准入 LRU Reclaimer、metadata-first 单次删除、HA 恢复 |
-| V1.1 | 建议下一阶段，尚未实现 | KVMeta 独立 QoS、orphan 指标/审计、backend capability 探测；不改变协议语义 |
+| V1 | 当前代码已实现 | exact-size、singleton allocation、写租约与失败写 quarantine、周期水位 + 按需准入 LRU Reclaimer、metadata-first exact-delete/absence confirmation、HA 恢复 |
+| V1.1 | 建议下一阶段，尚未实现 | KVMeta 独立 QoS、持久化 orphan ledger/审计和更多 backend capability；不改变协议语义 |
 | V2 | 目标设计，尚未实现 | generation/fencing、幂等 operation、持久化 ledger、可续约读写 lease、异构批量和 object set |
 
 文中没有标注“V1.1/V2”的流程均描述当前实现；演进章节中的接口和字段是设计草案，不能作为现有 API 使用。
-长期看，EPD 对外应优先暴露“发布并租用一组 tensor chunks”的 object-set API；exact-key API 保留为底层通用能力和
-小对象兼容入口。这样生命周期与一次推理请求对齐，而不是让业务自行拼接大量 key 的回滚和 GC 状态。
+长期看，EPD 对外应优先暴露“以稳定语义 identity 发布并租用一组 tensor chunks”的 object-set API；exact-key API
+保留为底层通用能力和小对象兼容入口。object set 同时提供整组发布边界和可续约读取保护；它既可按稳定 key 复用，
+也可按 fresh key 完成一次请求交接，不能把生命周期硬编码为其中一种模式。
 
 ## 2. 背景、目标与非目标
 
@@ -97,7 +103,51 @@ V1 对“错误命中”的防护边界也必须说清：服务端会验证 key 
 checksum，无法发现 backend 返回了长度正确的静默损坏 bytes。生产 backend 必须提供端到端完整性校验，或由业务
 receipt 携带 digest 并在消费前验证；否则不能宣称满足 false-hit 安全要求。V2 才计划把 digest/ETag 纳入服务契约。
 
-### 2.3 目标
+### 2.3 Cache 与请求级对象交接不是同一种生命周期
+
+同一个 object API 可以承载两种模式，但调用方必须在设计和指标中明确选择，不能把二者混称为 Embedding Cache：
+
+| 模式 | key 与读写顺序 | 删除责任 | 能否跨请求复用 |
+|---|---|---|---|
+| 可复用 Embedding Cache | 以内容与完整模型语义生成稳定 key；先 Load，miss 后才编码并 best-effort Save | 单个 reader 不调用 `Remove`；正常容量退出由 Reclaimer 负责，版本失效优先换 namespace/schema | 可以 |
+| 请求级 E→P 对象交接 | 每个逻辑对象使用不可猜测的新 key；E Save 后由 receipt 把 key/shape/dtype/size 交给有限个 P reader | 明确的最后 consumer 完成后 release；兜底仍依赖 Reclaimer | 不可以，本质是有 GC 的 mailbox/transport |
+
+可复用 Cache 中若每次请求都生成 UUID 并在消费后立即 `Remove`，命中率必然为零；反过来，请求级交接若使用稳定 key
+却没有最后 consumer/租约协议，会让一次请求的 release 删除其他请求正在读取的共享对象。V1 没有 read lease，
+因此共享 Cache 不应执行 per-request `Remove`，必须接受 Reclaimer 竞态表现为 miss 并回退重算；请求级交接则必须由
+RTP receipt 明确唯一/最后 owner。
+
+### 2.4 与业内通用 Embedding Cache 的定位
+
+主流实现把 Embedding Cache 定义为“重复多模态内容命中时跳过 encoder”，通常以内容 hash 或调用方提供的稳定媒体
+ID 做 key，在 CPU/共享内存中按 byte 容量执行 LRU。EPD 下 cache 可以位于 E 或 P；若扩展为跨进程/跨节点远端层，
+还需要本地 L1、inventory/routing、读租约或等价校验以及 cold-key convergence。参考：
+
+- [vLLM Multi-Modal Cache API](https://docs.vllm.ai/en/latest/api/vllm/multimodal/cache/)；
+- [vLLM Multimodal Media UUID Security](https://docs.vllm.ai/en/latest/usage/security/#multimodal-media-uuid-security)；
+- [NVIDIA Dynamo Embedding Cache](https://docs.nvidia.com/dynamo/dev/multimodal/embedding-cache)；
+- [Dynamo shareable multimodal embedding cache proposal](https://github.com/ai-dynamo/dynamo/issues/10563)。
+
+据此，KVMeta V1 的合理定位是 RTP 本地 Cache/调度层下面的共享 L2 object store，而不是直接取代 RTP 的
+`get_or_compute`：
+
+| 完整 Cache 能力 | KVMeta V1 当前状态 | 端到端责任/缺口 |
+|---|---|---|
+| 稳定 identity 与租户隔离 | 服务端强制 exact key/immutable value，但把 key 当 opaque bytes | RTP 生成 canonical digest，并纳入 tenant、encoder/preprocess revision 和 tensor schema |
+| load-before-compute 与 encoder skip | 提供同步 `LoadObjects`/`SaveObjects` 原语 | RTP scheduler/worker 编排 cache-aside；client 本身不会跳过 encoder |
+| tensor 元数据与对象组提交 | 只保存 opaque bytes；单批多 key 也不是原子可见 | RTP receipt/manifest 保存 shape、dtype、role、顺序、size、digest；多批应采用 manifest-last |
+| 抗击穿 | active writer 返回 `WRITE_IN_PROGRESS`，不会发布半成品 | RTP 对同一 semantic key 做有界 singleflight/jitter，超过预算立即重算 |
+| 有界容量和物理回收 | 已实现按真实 bytes 的水位/准入压力近似 LRU、grace 和物理 Delete；KVMeta 对不刷新读热度的直连 Redis metadata fail closed | 运维必须证明 backend Delete/容量真实收敛；应用对超大/低复用对象可 bypass |
+| 准入质量与抗扫描污染 | V1 对任何满足硬配额的 miss 都允许写入，没有频率/收益 admission filter | RTP 对明显一次性或负收益对象 bypass；后续用 size-aware frequency admission 保护热工作集，这属于命中率演进而非正确性前提 |
+| 共享读取生命周期 | 只有 persisted retirement fence + 固定 grace，没有 read lease | V1 reader 把回收竞态当 miss；不能 per-reader Remove；V2 才提供 lease/generation |
+| 内容完整性与坏条目修复 | 校验 key/URI/backend/size，不校验 value bytes；控制面 Get 会先刷新热度 | backend checksum 或 RTP manifest digest 是生产门槛；RTP 还需对确定性损坏做有界、单写者 repair |
+| L1/tiering/路由 | 未实现 | 若远端命中延迟或带宽不可接受，RTP 增加 worker-local L1，并按收益决定 warm-key routing |
+| fail-open、deadline 与业务指标 | KVCM 提供结构化错误和回收指标 | RTP 给 lookup 设置低于重算收益/SLO 的硬预算，任何 Cache 故障回退重算，并记录 hit/byte-hit、重算、encoder skip 和端到端延迟 |
+
+因此，存储与 GC 设计符合共享 L2 Cache 的基本方向；只有当右栏也完成并经过集成验证后，整体系统才是业内通常
+所说的 Embedding Cache Service。仅完成当前 Python client 不满足这个定义。
+
+### 2.5 目标
 
 - 同一请求可以读写不同字节数的对象，且 URI、元数据和 caller buffer 的长度严格一致；
 - 以完整业务 key 精确寻址，即使一级哈希碰撞也不能串读、串删；
@@ -107,13 +157,20 @@ receipt 携带 digest 并在消费前验证；否则不能宣称满足 false-hit
 - 默认关闭；启用后与固定 block MetaService 共享主 gRPC listener，但保持独立 protobuf namespace、请求门、锁和
   后台维护，并明确共享 RPC worker、进程和存储仍需部署 QoS 才能获得性能隔离。
 
-### 2.4 V1 非目标
+### 2.6 V1 非目标
 
 - 不提供 TTL/LFU 淘汰；自动容量回收当前只支持近似 LRU，业务仍可通过 release、`Remove` 或 `Trim` 提前回收；
 - 不承诺一个多 key 写会话在并发 `Get` 看来具有同一瞬间的原子可见性；
 - 不在 KVCM 中保存 tensor shape、dtype、切片顺序或 RTP receipt；KVCM 只保存 opaque bytes；
+- 不在 object client 中实现 RTP 的 `get_or_compute`、本地 L1、warm-key 路由、singleflight 或业务命中指标；
 - 不改变 `DataStorageBackend::Create(keys, object_size)` 和普通 `TransferClient` 的固定大小接口；
-- 不提供 server-side read lease。V1 调用方必须保证 consumer Load 完成前不触发同对象的 Remove/Trim/GC；
+- 不提供 server-side read lease。V1 调用方必须在显式 Remove/Trim 前排空 consumer，并把自动 GC 竞态导致的 Load
+  失败当作 miss 重算；固定 grace 只能降低竞态概率，不能由调用方证明读取期间对象一定存活；
+- 不为直连 `redis`/`async_redis` metadata 伪装 LRU：这些 backend 当前读取时不刷新 `BP#lru_time`，KVMeta 注册和
+  后续新 allocation 会 fail closed；生产 HA 使用带完整 local hot-cache recovery 的 `cached` metadata；
+- 不把纯内存 `local` metadata 的 `Sync` 描述为 crash-durable。它只提供当前进程内的 mutation barrier；进程退出后
+  KVCM 无法从 PACE/NFS 等数据面反向发现 owner。共享远端 Cache 的生产部署必须使用持久化 Registry 和以
+  Redis/async Redis 为 persistent 层的 `cached` metadata；
 - 不为缺少“同步返回即 DMA 完成”或显式 cancel-and-drain 契约的 backend 降级安全性；这类 backend 在
   `RegisterInstance` 和 `InitForKvMeta` 阶段直接 fail closed。普通固定 block TransferClient 的既有行为不变。
 
@@ -129,7 +186,7 @@ KVMeta 把一次对象访问拆成控制面和数据面：
 flowchart LR
     producer["Producer：Encoder / ViT"]
     consumer["Consumer：LLM / Decode"]
-    adapter["RTP 或 v6d 适配器"]
+    adapter["RTP 或 v6d 集成层\n（当前 RTP 提交仅含 object client）"]
     object_client["KvMetaObjectClient"]
     meta_client["KvMetaClient"]
     transfer_client["KvMetaTransferClient"]
@@ -151,8 +208,9 @@ flowchart LR
     consumer --> object_client
 ```
 
-KVCM 不传递图中的 receipt。RTP 自己在 ViT 与 LLM 之间传递 tensor metadata；v6d 也要求调用方在独立控制面
-保存这些信息。RTP 和 v6d 是两个并列的客户端适配器，RTP 生产链路不依赖 v6d。
+KVCM 不传递图中的 receipt。完整 RTP 集成需要在 ViT 与 LLM 之间传递 tensor metadata；v6d 也要求调用方在独立
+控制面保存这些信息。RTP 和 v6d 是两个并列的集成方向，RTP 生产链路不依赖 v6d；当前 RTP 提交只实现 object
+client 和配置适配，没有实现图中的 producer/receipt/consumer 编排。
 
 ### 3.1 组件职责
 
@@ -165,7 +223,7 @@ KVCM 不传递图中的 receipt。RTP 自己在 ViT 与 LLM 之间传递 tensor 
 | `KvMetaClient` | metadata RPC、多地址 failover、响应校验 | 不搬运数据 |
 | `KvMetaTransferClient` | 按 URI 和真实长度执行同步 Get/Put | 不管理写事务 |
 | `KvMetaObjectClient` | 组合注册、Get、PutStart、数据搬运、PutFinish 和回滚 | 不保存 shape/dtype/receipt |
-| RTP/v6d 适配器 | tensor 校验、切片、receipt 或 buffer 封装、业务生命周期 | 不改变 KVCM 一致性语义 |
+| RTP/v6d 集成层（上层，部分尚未实现） | tensor 校验、切片、receipt 或 buffer 封装、业务生命周期 | 不改变 KVCM 一致性语义 |
 
 ### 3.2 代码落点
 
@@ -212,7 +270,8 @@ tenant/instance，不能用随机 key 或 token 猜测难度代替服务认证�
   KVCache 注册共用同一个 `CacheManager` 控制面临界区：空 group 由第一类成功注册决定类型，之后反向混入会在
   registry mutation 前被拒绝。运行期校验仍会对旁路写 registry 或 split-brain 造成的混合状态 fail closed；
 - 普通 CacheReclaimer、Migration 和 Cache GC 跳过 KVMeta instance；KVMeta 由自己的 Reclaimer 线程处理，二者不
-  共用删除 executor、pending budget 或 group admission lock；
+  共用删除 executor、pending budget 或 group admission lock。KVMeta Reclaimer 只巡检由成功注册或升主恢复确认的
+  KVMeta group，不在每个周期枚举/读取普通 KVCache group；
 - KVMeta 使用对象真实字节数维护 group/type quota，不把 marker `block_size=1` 当作对象用量。
 
 ### 4.3 代码路径隔离
@@ -313,15 +372,34 @@ backend URI 形成别名。进程内已有的 metadata size 校验缓存若存�
 
 KVMeta 复用 `CacheLocation` 的存储格式，但不复用 KV cache 状态机：
 
-- **active**：`status=CLS_NEW` 且 `create_time` 为带 tag 的正数，编码写租约 wall-clock deadline；Get 不可见；
+- **active**：`status=CLS_NEW` 且 `create_time` 为带 tag 的正数，编码 allocation 可安全清理的 wall-clock
+  deadline；普通同步 backend 等于 client commit deadline，存在迟到 I/O 的 backend 还包含服务端 quarantine；Get 不可见；
 - **committed**：仍为 `status=CLS_NEW`，但 `create_time` 为负数；Get 可见；
 - **retired**：`status=CLS_DELETING` 且 `create_time` 为带 tag 的正数；通常编码 Reclaimer grace deadline；两阶段
   retirement 的过渡 fence 使用带 tag 的最大值，表示“已读隔离但尚未发布有限 deadline”。两者均对 Get 不可见，
   metadata 在宽限期结束前仍保留对物理 allocation 的归属证明；
 - **absent**：metadata 不存在。
 
-滚动升级时，旧版本遗留的无 tag 正 marker 按“创建时间 + `max_write_timeout_seconds`”推导保守截止时间。
+滚动升级时，旧版本遗留的无 tag 正 marker 按“创建时间 + `max_write_timeout_seconds` +
+`max_failed_write_cleanup_grace_seconds`”推导保守截止时间。
 HA 节点必须保持时钟同步，并把可能的最大漂移计入写租约配置。
+
+### 5.5 Metadata barrier 与重启恢复边界
+
+本文流程中的 `Sync` 表示“metadata backend 已确认该 mutation 可作为后续 ownership 决策的 barrier”。它是否能在
+进程崩溃或换主后恢复，取决于具体 backend，不能从统一接口名字推导：
+
+- `local` 是纯内存 LRU；`PutMetaData` 是 no-op，`GetMetaData` 不返回历史状态，`Sync` 只对当前进程有效；
+- `dummy` 只用于测试，同样不构成生产持久性；
+- `cached` 必须使用非空合法 URI 和 local hot layer；它以本地 LRU 提供读热度，并以 Redis/async Redis persistent backend 保存完整 metadata。恢复期间读取可
+  回退 persistent 层，Reclaimer 也从完整层采样并用已经恢复的本地访问时间覆盖；恢复完成后使用本地 LRU；
+- 直连 Redis/async Redis 虽有持久性，但当前普通读取不刷新 `BP#lru_time`，所以 KVMeta 不接受它作为 LRU metadata。
+
+因此，`local` 可以验证 API、回收状态机和单进程性能，却不适合拥有共享 TairMempool allocation 的生产 Cache：进程
+一旦退出，已提交 URI、active/retired owner、usage 和待物理删除状态都会消失，KVCM 没有数据面反向枚举协议可以
+重建它们。除非 backend 已有经过验证的 namespace TTL/sweeper 和独立硬容量保护，并且业务明确接受整库失效与 orphan，
+否则生产必须同时使用持久化 Registry 和 `cached(local + Redis/async Redis)`。后文的“持久化 fence/删除”均以这一
+生产前提为条件；在 `local` 下只能理解为进程内 fence。
 
 ## 6. 端到端流程
 
@@ -408,7 +486,8 @@ V1 `Get` 返回的是 location snapshot，不会在服务端创建 read lease �
 Load 返回前 caller buffer 不被后台 I/O 继续访问，但不能阻止另一个 client 的 Remove/Trim 或自动 Reclaimer 在
 之后退休该 URI。上层必须用 ownership/release 协议协调；自动回收的 `delay_before_delete_ms` 至少应覆盖
 `P99.99(Get 响应到最后一字节读取完成) + 调度/网络/backend 尾延迟 + 时钟与 failover 裕量`。固定 grace 仍是概率性
-保护，不是读租约证明；读取 URI 失败必须降级为 miss/重算。RTP 仍应在最后一个 consumer 完成后显式 release。
+保护，不是读租约证明；读取 URI 失败必须降级为 miss/重算。请求级交接应在最后一个 consumer 完成后显式 release；
+稳定 key 的可复用 Cache 不得由单个 reader release，正常退出由 Reclaimer 负责。
 
 显式 `Remove` 和 `Trim` 不使用 Reclaimer grace。它们是所有者/运维指令，调用方必须先排空 consumer；不能因为配置
 了 `delay_before_delete_ms` 就假设显式删除也会等待。
@@ -555,6 +634,9 @@ KVCM 内部仓的真实 `TairMempoolSdk` 在 variable-size policy 开启时：
 - 接受 `0 < URI.size <= max_object_bytes`，不再要求 size 命中固定 spec 表；
 - 必须使用服务端预分配的 PACE 地址；地址无效时直接失败，不在 client 侧重新 allocation；
 - 禁用 gather/scatter 分组，按 IOV 原顺序构造一个连续对象，避免按 size 分组改变逻辑 offset；
+- 初始化时要求 PACE 分层 timeout 配置通过其自身不变量校验，并要求
+  `TAIR_MEMPOOL_SYNC_TIMEOUT_MS` 严格小于 KVCM 的 `get_timeout_ms` 和 `put_timeout_ms`；不满足时只拒绝
+  KVMeta client，普通 fixed-block client 保持原行为；
 - `actual_remote_uris` 保持与输入 URI 逐项一致。
 
 KVMeta service serializer、metadata client、object client 和 transfer wrapper 都会检查 backend ownership shape；
@@ -567,6 +649,13 @@ variable-size policy 的注入不会修改 per-type template，也不会污染�
 普通固定 block 模式继续使用原 size 表、lazy allocation fallback 和既有 gather/scatter 行为。开源仓中的
 TairMempool 是无真实 PACE 依赖的 stub，只保留严格、无异常的 URI 字段解析；实际 TairMempool I/O 必须使用
 内部构建。
+
+上述 timeout 校验只保证“外层名义预算不先于 PACE 同步预算耗尽”，不等于 remote allocation 已经 fenced。
+当前 PACE `pace_synchronize` 的 timeout/cancel 路径会排空对 caller buffer 的 memcpy，但源码明确不等待已经提交的
+RDMA/Commit；显式 SSD 路径的 commit lease 会让并发 Free 返回 busy，而 legacy DRAM/direct-RDMA 路径不能据此推导
+相同保证。若写失败后 KVCM 立即回滚 allocation，迟到 RDMA 与地址复用仍需由 PACE 提供 drain、generation/MW
+失效或安全 quarantine 契约。该契约必须用当前线上 PACE revision 做超时 + 立即 Free + 立即复用的故障注入验证；
+验证前，TairMempool DRAM 只能用于隔离的功能灰度，不能作为可复用 EMB Cache 的生产正确性依据。
 
 ## 8. 并发、一致性与容量
 
@@ -645,27 +734,39 @@ session 接管的 active reservation。
 
 ### 9.1 写租约
 
-写租约从服务端开始处理 `PutStart` 时计时，覆盖 allocation、active metadata 持久化、数据面 Put 和
-`PutFinish`。如果 session 登记前租约已经耗尽，服务端回滚候选 allocation 并返回超时。
+客户端提交租约从服务端开始处理 `PutStart` 时计时，覆盖 allocation、active metadata 持久化、数据面 Put 和
+`PutFinish`。如果 session 登记前租约已经耗尽，服务端回滚候选 allocation 并返回超时。它与物理地址的安全清理
+deadline 是两个概念：普通同步 backend 二者相等；声明存在迟到写的 backend 在 commit deadline 后追加服务端
+failed-write quarantine，但不会因此接受迟到的成功 `PutFinish`。
 
 `KvMetaObjectClient` 初始化时要求：
 
 ```text
 write_timeout_seconds * 1000
-    > put_timeout_ms + 3 * metadata.call_timeout_ms
+    > 2 * put_timeout_ms + 3 * metadata.call_timeout_ms
 ```
 
+两个 Put 窗口分别覆盖 `RunWithTimeoutParallel` 的排队/外层截止时间，以及截止时间前刚开始执行的任务仍可使用的
+完整 backend Put 预算；KVMeta 为保护 caller-owned buffer 会 drain 已接纳任务，不能在外层 deadline 到达时提前返回。
 三个 metadata 窗口分别预留给 PutStart 交接、masked-hit 兼容性 Get 和 PutFinish。该检查只证明名义预算可行，
 不是 backend 的强制取消保证。
 
-V1 的正确性前提是 backend 在 write lease 到期前停止访问该 remote allocation。SDK 为保护 caller buffer 会等待
+V1 的正确性前提是 backend 在物理清理 deadline 前停止访问该 remote allocation。SDK 为保护 caller buffer 会等待
 已接纳任务及其 backend 可证明的 I/O completion；仅等待包装层 future 不构成 drain。无法提供硬完成/cancel-and-drain
 契约的 Mooncake 当前在 KVMeta 初始化和服务端注册阶段被拒绝。drain 不会自动续约服务端 session；若 provider
-无视自己的 timeout 并越过 write lease 继续 Put，expiry 物理删除可能与旧 Put 竞争。生产 backend 必须证明 I/O
-有硬 deadline/cancellation，或把
-write lease 配置为覆盖经过验证的最坏 drain 时间；仅满足上面的名义不等式不够。
+无视自己的 timeout 并越过安全清理 deadline 继续 Put，expiry 物理删除仍可能与旧 Put 竞争。生产 backend 必须证明
+I/O 有硬 deadline/cancellation，或声明足以覆盖经过验证最坏迟到 I/O 的 cleanup grace；仅满足上面的名义不等式不够。
 
-回滚和 expiry 始终先完成 exact-value metadata 删除及 `Sync`，然后只尝试一次物理 Delete。expiry worker 会把
+内部 TairMempool KVMeta client 还要求 PACE 的内层 timeout 层级合法，且其同步 timeout 严格落在 KVCM Get/Put
+预算内。这会在初始化阶段拒绝类似“RTP 设 800ms，但 PACE 仍按 10s 同步”的伪 deadline。服务端 TairMempool
+adapter 另声明 180 秒 failed-write quarantine：任一失败 mask 不立即删除，而是原样保留 active metadata、byte usage
+和 allocation；重复失败 Finish 幂等，之后的成功 Finish 被拒绝，expiry/recovery 只在 commit deadline + 180 秒后
+清理。该值必须不小于线上 PACE 可能迟到的 remote RDMA/Commit 上界；修改 PACE quarantine/hardware timeout 时必须
+同步审计该常量，不能只改 client 环境变量。
+
+对无需 quarantine 的同步 backend，显式失败回滚仍立即执行；对声明 quarantine 的 backend，失败 Finish 只原子地
+把内存 session 标记 aborted，持久化 active owner 本身就是跨 crash 的隔离记录，直到安全 deadline 才由 expiry 或
+下一任 leader 清理。真正清理时始终先完成 exact-value metadata 删除及 `Sync`，然后只尝试一次物理 Delete。expiry worker 会把
 provider 的标准/未知异常收敛为脱敏告警，不让可选 KVMeta 侧路异常终止进程；一旦物理结果不确定，它会关闭
 session admission/expiry worker 和 Reclaimer。关闭前已经发布的 session 仍可由 client 显式 `PutFinish`，其余 active
 metadata 留给下一次 recovery，不会在故障 backend 上继续批量清理。物理删除失败后不进入进程内重试队列，因为
@@ -720,8 +821,8 @@ KVMeta recovery 只扫描带完整 KVMeta schema 的保留 namespace，并执行
    byte usage；
 7. 启动 session expiry 和 Reclaimer worker，最后开放 KVMeta 请求门。
 
-一次 recovery 从升主开始最多按 `max_write_timeout_seconds` 等待 active lease；损坏或异常远期的持久化 deadline
-不能无限阻塞 KVMeta 侧路恢复。
+一次 recovery 从升主开始最多按 `max_write_timeout_seconds + max_failed_write_cleanup_grace_seconds` 等待 active
+lease；损坏或异常远期的持久化 deadline 不能无限阻塞 KVMeta 侧路恢复。
 
 active/retired deadline 使用 wall clock 持久化，进程内调度等待使用 steady clock。换主节点若时钟明显超前，可能把
 仍有效的旧写入或读宽限期判断为过期；若明显落后，会延后可用性和回收。因此所有候选 leader 与 backend 节点必须
@@ -756,10 +857,10 @@ Instance Group quota 和 storage backend 配置。部署必须提前创建仅供
   finalization，避免长期停在半回收状态。
 
 `RegisterInstance` 会在写入 registry 前校验上述 group reclaim 配置、storage candidates 和进程级
-sampling/batching；运行中若 group/reclaim/storage 配置被热更新为不支持的值，或 sampling/batching 被关闭，已有
+sampling/batching；运行中若 group/reclaim/storage/read-heat 配置被热更新为不支持的值，或 sampling/batching 被关闭，已有
 committed hit 仍可读、Remove/Trim 仍可用于排空，但任何包含 miss 的新 `PutStart` 都在 storage allocation 前返回
-`SERVICE_NOT_READY`。Reclaimer 对非法 reclaim 配置停止选择新候选并告警。这样配置错误不会继续扩大占用，也不会
-影响普通 KVCache group；修复配置后无需重建已注册 instance。
+`SERVICE_NOT_READY`。Reclaimer 对非法 reclaim 或 read-heat 配置停止选择新候选并告警。这样配置错误不会继续扩大
+占用、也不会按失真的时间戳删除对象，并且不影响普通 KVCache group；修复配置后无需重建已注册 instance。
 
 V1 metadata 只持久化 backend `global_unique_name`，没有持久化 backend config epoch。只要仍存在 KVMeta metadata、
 pending retirement 或可能的 orphan，同一个 unique name 就必须保持绑定到同一物理 namespace 和删除语义；不能把它
@@ -812,7 +913,7 @@ transfer JSON 必须同时满足：
 `block_size=1` 和 `value=1` 只是隔离 schema marker，不代表对象固定为 1 byte；真实长度始终来自每次请求的
 `value_sizes` 和 `ValueLocation.value_size`。
 
-要求 caller-side memory registration 的 backend 必须使用与其注册方式匹配的客户端构造参数。RTP 当前适配器既
+要求 caller-side memory registration 的 backend 必须使用与其注册方式匹配的客户端构造参数。RTP 当前 client 既
 没有提供 `regist_span`，也没有调用 shared-memory overload，因此不能选择要求该能力的 transfer 配置；v6d 暴露了
 `memory_base/memory_size/fd`。
 
@@ -820,7 +921,9 @@ transfer JSON 必须同时满足：
 
 ### 12.1 逻辑 GC 与物理 GC
 
-metadata 删除先 `Sync`，再调用 backend Delete，确保仍可读 metadata 不会指向已经提前释放的 URI。该顺序适用
+metadata 删除先 `Sync`，再调用 backend 的 KVMeta exact-delete 扩展，确保仍可读 metadata 不会指向已经提前释放的
+URI。未实现扩展的同步 backend 兼容委托原 `Delete`；这套能力是独立 side interface，不改变 `DataStorageBackend`
+虚表或固定块 KVCache 的 `Delete` 调用。该顺序适用
 committed Remove/Trim、automatic reclaim，也适用 active rollback、expiry 和 recovery。Reclaimer 还会在删除
 metadata 前先把 committed 对象持久化为 retired，并等待配置的 read grace。
 
@@ -832,6 +935,10 @@ fill/evict 时继续制造 orphan；普通 KVCache gate 不受影响。修复 ba
 没有 allocation generation，地址复用后重放旧删除可能破坏后继对象。这个规则只
 消除“由 KVCM 发起第二次 Delete”的风险；若第一次调用返回后仍可能在 provider 内部晚到执行，V1 同样无法 fence。
 运维必须证明 Delete 终态/地址不复用/条件删除契约，并依赖 backend 的独立 orphan 清理策略处理无法确认的 allocation。
+内部 TairMempool 扩展会且只会发送一次 DELETE，随后用只读 `GET /v1/api/gas?ga=...` 验证完整快照；只有
+`status=success`、`partial=false`、`failed_nodes=[]` 且所有目标地址均不存在才返回成功。DELETE 的 HTTP 200 本身不再
+释放 KVMeta 的熔断条件，因为旧 MetaService 可能跳过未知/非健康节点或异步派发 Free。确认请求失败、返回部分快照、
+目标仍存在或响应缺字段都按物理结果不确定处理，绝不重放 DELETE。
 
 KVMeta 自己的 storage wrapper 会把 Create/Delete provider 的标准异常、未知异常和 Delete 结果数量不匹配转换为
 明确错误码，防止异常越过可选侧路终止服务线程。批量 PutStart 的后续 singleton Create 抛异常时，已经取得 URI
@@ -865,10 +972,10 @@ TTL、定期整 namespace 轮换/sweeper，且底层容量有独立硬保护时�
 
 ### 12.2 读回收竞态与内容完整性
 
-V1 没有 read lease：管理面 Remove/Trim、业务 release 或配置过短的 Reclaimer grace 都可能与已经取得 URI 的
-Load 竞争。部署必须按第 6.3 节的尾延迟公式设置 `delay_before_delete_ms`，把 release 放在最后一个 consumer 完成
-之后，并把全量 Trim 当作需要先排空 consumer 的维护操作；仅等待 KVCM 请求计数归零并不能观察客户端已经开始的
-数据面读取。自动 Reclaimer 有 grace，显式 Remove/Trim 没有。
+V1 没有 read lease：管理面 Remove/Trim、请求交接模式的业务 release 或配置过短的 Reclaimer grace 都可能与已经
+取得 URI 的 Load 竞争。部署必须按第 6.3 节的尾延迟公式设置 `delay_before_delete_ms`；请求交接模式把 release 放在
+最后一个 consumer 完成之后，可复用 Cache 则禁止 per-reader release。全量 Trim 是需要先排空 consumer 的维护操作；
+仅等待 KVCM 请求计数归零并不能观察客户端已经开始的数据面读取。自动 Reclaimer 有 grace，显式 Remove/Trim 没有。
 
 这类竞态的允许结果是 Load 失败并回退重算，而不是读出另一代对象。随机物理 object key、singleton allocation、
 exact-value metadata CAS 和“不重放不确定 Delete”共同降低 ABA 风险；对会立即复用地址且不能校验 generation 的
@@ -880,6 +987,15 @@ V1 只验证 URI identity、scheme、hostname 和逻辑 size，不计算 value c
 RTP receipt 保存基于权威 producer bytes 的 digest，consumer 在使用前验证。仅依赖 TCP/storage “通常可靠”不满足
 embedding Cache 的 false-hit 正确性要求。
 
+还要区分“重算成功”和“Cache 已修复”。当前控制面 `Get` 在返回 location 时刷新 LRU，发生在数据面 Load/digest
+验证之前；因此永久丢失或损坏的物理对象可能被重复失败的 lookup 保持为热条目。随后直接对同一 key 调用 `Save`
+也不会覆盖它：同 key、同 size 的 committed metadata 会按 immutable-key 契约返回 hit。RTP 必须把确定性的
+not-found/checksum failure 送入有界 per-key repair controller，由单一修复者执行 Remove、确认收敛后再允许重建；
+普通 timeout、限流和暂态 I/O 错误只做本次重算，不能触发所有 reader 并发删除。Remove 仍可能让并发 reader 得到
+false miss，但在不可变 key 契约成立时不会改变推理结果。缺少这条 repair 闭环时，V1 只能容忍短暂读取故障，不能
+声称能从 poisoned entry 自动恢复。V2 应提供 generation-bound conditional invalidate，并把热度确认后移到成功
+Load/digest 之后或采用等价的异步 touch。
+
 ### 12.3 生产准入清单
 
 下面各项是上线门槛，不是后续优化项：
@@ -887,20 +1003,29 @@ embedding Cache 的 false-hit 正确性要求。
 | 检查项 | 必须成立的条件 | 不满足时的处理 |
 |---|---|---|
 | 语义 identity | key 覆盖 tenant、模型权重、预处理、输入 digest、tensor schema/version；同 key 永不改变 bytes | 禁止启用读命中 |
+| 生命周期模式 | 可复用 Cache 使用稳定 key 且不由单个 reader Remove；请求级交接使用 fresh key 且只有最后 consumer release | 模式和 ownership 不明确时禁止接入 |
+| 应用闭环 | RTP 集成层已实现 load-before-compute、整组 miss 回退、best-effort write、有界 singleflight 和 encoder skip | 只能按对象存储/交接灰度，不能宣称 Cache 命中收益 |
 | 推理 fallback | miss、`NOSPC`、`WRITE_IN_PROGRESS`、timeout、not-leader、Load/checksum 失败均可在延迟预算内重算 | Cache 不得进入核心推理强依赖 |
+| lookup deadline | metadata/Get/Put budget 来自实测尾延迟，且 cache lookup 在其负收益点和请求 SLO 前终止；不能直接把 100 秒共享上限当作可选 Cache 预算 | 使用 RTP client 的局部 timeout override，超时立即回退；不能靠不可取消的 Python future 包裹 native I/O |
 | 回收闭环 | 专用 group 配置有效 `POLICY_LRU`、合法 watermark、非零 sampling/batch；Reclaimer 未长期暂停 | fail closed 并告警，不能靠手工 Remove 维持 |
+| LRU 热度来源 | metadata 使用能在普通读取时更新热度的 `local` hot view；生产用 `cached(local + Redis/async Redis)`，直连 Redis 不用于 KVMeta | 注册/新 allocation fail closed，不能把随机/并列淘汰宣称为 LRU |
+| Metadata/Registry 恢复 | 共享远端 Cache 使用持久化 Registry 和 `cached` persistent metadata；重启/换主后能扫描 owner 并重建真实 bytes usage | `local`/`dummy` 只允许 UT，或有独立 TTL/sweeper、硬容量保护且明确接受 orphan 的临时环境；不得把其 `Sync` 当持久化成功 |
 | 物理 GC | backend Delete 确实释放资源，或存在已验证的 TTL/sweeper/namespace 轮换和底层硬容量保护 | no-op Delete backend 禁止作为独立生产方案 |
-| 删除终态 | Delete 返回后不会再晚到修改该 allocation，或 URI 不复用/具备 generation 条件删除 | 可复用地址且异步晚到的 backend 禁止上线 |
+| 删除终态 | KVMeta exact-delete 返回后目标在完整 provider snapshot 中已不存在；不确定结果不重放且立即关闭 KVMeta gate | 缺少 absence confirmation、地址复用防护或独立 orphan 审计时禁止上线 |
+| PACE 写入终态 | 当前 PACE revision 已验证 timeout 后 caller buffer 不再访问；服务端 180 秒失败写 quarantine 覆盖 remote RDMA/Commit 最坏迟到时间；显式 SSD busy 和 orphan 路径有容量对账 | 必须完成“timeout → quarantine → Free → 同址复用”故障注入；实测迟到上界超过 180 秒时禁止上线并先调整服务端契约 |
 | backend identity | 每个 `global_unique_name` 在 metadata/orphan 生命周期内不可重绑到不同 namespace/config；变更使用新名称 | 停止 KVMeta、排空并审计后再迁移 |
-| consumer 生命周期 | grace 覆盖读尾延迟，显式 release 在最后消费后，Trim 前排空 consumer | Load 失败只能回退；不可把短 grace 当 read lease |
+| consumer 生命周期 | grace 覆盖读尾延迟；交接模式在最后消费后 release，共享 Cache 不做 per-reader release；Trim 前排空 consumer | Load 失败只能回退；不可把短 grace 当 read lease |
 | 时间与租约 | leader/backend 节点时钟同步，最大漂移计入 write lease、recovery 和 read grace；backend I/O 有可验证 deadline/drain | 扩大安全裕量或停用该 backend |
 | 故障与内容完整性 | provider 异常被隔离；backend checksum 或 receipt digest 可发现静默损坏 | 不允许把“长度正确”视为内容正确 |
+| poisoned entry 修复 | 业务 hit 只在完整 Load + digest 成功后计数；确定性 not-found/损坏进入有界单写者 repair，暂态错误只重算 | 同 key Save 不会覆盖 committed 坏条目；没有 repair 闭环就禁止可复用 Cache 全量 |
 | 主链路隔离 | 专用 Instance Group、namespace、quota/storage pool；KVMeta 并发和资源有上游/网关限制 | 高负载改为独立进程/cgroup/pool |
+| 租户公平性 | 不可信或高噪声租户使用独立 instance/group/quota；共享 group 明确接受全局 LRU 相互驱逐 | key 中的 tenant 字段只做 identity，不提供认证或容量公平 |
 | 安全边界 | 主 RPC 端口仅受信网络可达；tenant/instance/key 不作为认证替代品 | 先完成网络策略/身份隔离 |
 | 可观测与灰度 | 同时观察 hit/byte-hit、重算率、`NOSPC`、demand/pending、回收速率、orphan 和 backend 实际容量 | 先小流量压测与故障注入，不直接全量 |
+| 收益与准入 | 重复内容比例、encoder 节省时间显著高于 lookup/远端 Load 成本；超大或明显一次性对象可 bypass | 若负收益则关闭 Cache 或只保留请求级交接 |
 
 其中 hit ratio、byte-hit ratio、重算和推理延迟是 RTP 侧业务指标；KVCM 的 metadata 命中或逻辑 usage 不能替代它们。
-生产验收必须包含 cache 服务不可用、容量打满、回收暂停、慢读碰到自动回收、物理 Delete 失败、换主和静默损坏
+生产验收必须包含 cache 服务不可用、容量打满、回收暂停、慢读碰到自动回收、进程重启/换主、物理 Delete 失败和静默损坏
 注入，证明最终结果仍由重算保证正确、主 KV cache 链路无延迟/错误回归、底层空间能够长期收敛。
 
 ## 13. 更优的演进设计（尚未实现）
@@ -1099,6 +1224,11 @@ backend IOPS/bytes/s、recovery scan rate。达到上限时在 allocation 前返
 group 内所有 instance；恢复时再用 durable record 校准。cleanup 执行队列可以有界，但 durable ledger 不能因队列满
 而丢弃；队列过载时应暂停新的 allocation，并让 worker 从 ledger 分页续扫。
 
+容量 admission 还应与安全性 admission 分开：前者决定“放得下”，后者决定“值不值得污染 Cache”。V1 只实现前者，
+因此一次性大对象或顺序扫描可能驱逐高价值小对象。V1 接入层应基于对象大小、重复概率和编码/远端加载成本做显式
+bypass；后续可在 KVMeta 专用层增加按 bytes 加权的 TinyLFU/SLRU 类 admission，但不得让概率性统计参与 key
+正确性、对象可见性或物理删除授权。admission 拒绝只表现为不写 Cache，本次推理仍使用权威重算结果。
+
 至少暴露以下脱敏指标：
 
 - request latency/error 和 gate 状态；
@@ -1140,9 +1270,13 @@ group 内所有 instance；恢复时再用 durable record 校准。cleanup 执�
   普通 TransferClient 回归；
 - 内部 TairMempool UT：variable-size policy、严格 URI、禁 fallback、禁 gather/scatter；
 - v6d UT/真实服务测试：CPU/CUDA buffer 封装、不同长度读写和 remove；
-- RTP UT/native 测试：manifest、切片、批处理、回滚、release、GC 和 shutdown；
-- 跨仓 contract test：真实 KVCM 服务 + KVCM wheel 中的 Python object client + RTP producer/receipt，覆盖同一
-  receipt 内不同 size、显式 release 和 deadline GC；C++ reader、完整 RTP 进程和 GPU backend 由 RTP 对应测试层
-  单独验证。
+- RTP client UT：现有 `RECO_*`/`KVCacheConfig` 映射、lazy dependency、配置错误、结构化异常透传、batch facade 和
+  client 生命周期；当前提交没有实现 RTP producer/receipt/reader/release/GC 或推理调度接线；
+- 跨仓 contract test：真实 KVCM 服务 + 实际 wheel + 独立 RTP E/P object client，覆盖 67 个不同 size/dtype 对象、
+  64-object batch 边界、共享端口上的旧 MetaService、size mismatch、显式 Remove 和 Remove 后 miss。它验证的是
+  exact-object 传输契约，不包含 semantic-key cache-aside、encoder skip、singleflight、manifest/digest、deadline GC、
+  C++ reader、完整 RTP 进程或 GPU/PACE 数据面。
 
-硬件相关 backend 和 RTP 全进程 GPU 测试仍需在对应部署镜像/CI 环境中执行；跨仓 contract test 不能替代它们。
+硬件相关 backend 和 RTP 全进程 GPU 测试仍需在对应部署镜像/CI 环境中执行；现有跨仓 contract test 也不能替代
+完整 Embedding Cache 的命中/重算/并发消费者/故障注入测试。第 12.3 节“应用闭环”完成前，只能把当前 RTP client
+作为集成原语交付，不能把未实现的上层行为计入测试覆盖。

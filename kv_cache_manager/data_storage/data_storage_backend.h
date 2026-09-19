@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -82,6 +83,27 @@ protected:
 private:
     std::atomic_bool is_open_ = false;
     std::atomic_bool is_available_ = false;
+};
+
+// Optional side interface for KVMeta exact-object lifecycle semantics. Keeping
+// it separate preserves DataStorageBackend's ABI and the fixed-block KV-cache
+// vtable. Backends that do not implement it retain the historical synchronous
+// Delete contract and a zero failed-write grace.
+class KvMetaDataStorageBackendExtension {
+public:
+    virtual ~KvMetaDataStorageBackendExtension() = default;
+
+    // EC_OK means every named allocation is confirmed absent, not merely that
+    // a delete request was accepted. Reusable/eventually-consistent backends
+    // must fail closed when they cannot prove that terminal state.
+    virtual std::vector<ErrorCode> DeleteAndConfirmAbsent(const std::vector<DataStorageUri> &storage_uris,
+                                                          const std::string &trace_id,
+                                                          std::function<void()> cb) = 0;
+
+    // A transport with already-submitted I/O after a failed write returns a
+    // positive quarantine. Ordinary synchronous backends need no extension and
+    // therefore keep the zero-grace behavior supplied by KVMeta's fallback.
+    virtual std::int64_t GetFailedWriteCleanupGraceSeconds() const noexcept = 0;
 };
 
 } // namespace kv_cache_manager

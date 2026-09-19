@@ -1178,9 +1178,12 @@ TEST(KvMetaObjectClientCreateTest, RejectsWriteLeaseThatCannotCoverStartDataAndC
     })";
     config.transfer_init_params.role_type = RoleType::WORKER;
     config.transfer_init_params.self_location_spec_name = "value";
-    // 10s data I/O + three 3s metadata windows exactly consumes 19s. The
-    // relationship is strict so the session cannot expire on the boundary.
-    config.write_timeout_seconds = 19;
+    // The outer parallel deadline may be consumed while a task waits in the
+    // queue, after which an accepted task can still consume a complete 10s
+    // backend Put budget. Two 10s data windows plus three 3s metadata windows
+    // exactly consume 29s. The relationship is strict so the session cannot
+    // expire on the boundary.
+    config.write_timeout_seconds = 29;
 
     auto [ec, client] = KvMetaObjectClient::Create("trace", config);
     EXPECT_EQ(ER_INVALID_CLIENT_CONFIG, ec);
@@ -1189,7 +1192,7 @@ TEST(KvMetaObjectClientCreateTest, RejectsWriteLeaseThatCannotCoverStartDataAndC
     // One second of lease headroom passes static transfer validation. Empty
     // metadata addresses then fail at the next stage, proving the boundary is
     // not over-rejected and no registration RPC was attempted.
-    config.write_timeout_seconds = 20;
+    config.write_timeout_seconds = 30;
     auto [valid_ec, valid_client] = KvMetaObjectClient::Create("trace", config);
     EXPECT_EQ(ER_METACLIENT_INIT_ERROR, valid_ec);
     EXPECT_EQ(nullptr, valid_client);

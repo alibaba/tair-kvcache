@@ -1090,6 +1090,53 @@ TEST_F(SdkWrapperTest, TestKvMetaSafeDrainWaitsForInflightTaskBeforeRethrow) {
     EXPECT_GE(elapsed_ms, 100);
 }
 
+// The outer timeout is an admission/wait deadline, not a hard completion
+// deadline for KVMeta. A task that starts before it may still be inside its
+// backend budget when the deadline expires, and safe drain must keep the
+// caller blocked until that task relinquishes caller-owned memory. The object
+// client's server-side write lease therefore reserves a second Put window.
+TEST_F(SdkWrapperTest, TestKvMetaSafeDrainCanExtendPastOuterDeadline) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(1, 4, "KvMetaLeaseBudgetTest");
+    ASSERT_TRUE(sdk_wrapper.wait_task_thread_pool_->start());
+
+    std::promise<void> second_started;
+    std::promise<void> release_second;
+    auto release_future = release_second.get_future().share();
+    std::atomic<bool> second_finished{false};
+    std::vector<std::function<ClientErrorCode()>> tasks;
+    tasks.push_back([]() { return ER_OK; });
+    tasks.push_back([&]() {
+        second_started.set_value();
+        release_future.wait();
+        second_finished.store(true);
+        return ER_OK;
+    });
+
+    constexpr int kOuterTimeoutMs = 200;
+    const auto start = std::chrono::steady_clock::now();
+    auto call = std::async(std::launch::async, [&]() {
+        return sdk_wrapper.RunWithTimeoutParallel(
+            SdkWrapper::OpType::PUT, std::move(tasks), kOuterTimeoutMs, /*wait_for_inflight=*/true);
+    });
+
+    const auto started = second_started.get_future().wait_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(std::future_status::ready, started);
+    // Wait beyond the outer deadline while the accepted task remains in
+    // flight. Returning here would release memory that the backend may still
+    // access.
+    std::this_thread::sleep_until(start + std::chrono::milliseconds(kOuterTimeoutMs + 50));
+    EXPECT_EQ(std::future_status::timeout, call.wait_for(std::chrono::milliseconds(0)));
+    release_second.set_value();
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, call.get());
+    EXPECT_TRUE(second_finished.load());
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    EXPECT_GE(elapsed_ms, kOuterTimeoutMs + 40);
+    EXPECT_LT(elapsed_ms, 1000);
+}
+
 // KVMeta submission must not block behind a saturated queue before its
 // deadline wait begins. Work accepted before the rejection is drained with
 // the shared stop flag set, so it never enters the underlying object I/O.
