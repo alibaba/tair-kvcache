@@ -400,18 +400,17 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
         return {ec, {}};
     }
 
-    // A valid service currently generates a short random identifier. Bound an
-    // untrusted/mismatched response before copying it into the public result.
-    // PutFinish deliberately rejects oversized ids too, so there is no safe
-    // rollback RPC to issue for this malformed value; server-side lease expiry
-    // remains the cleanup backstop.
-    if (response.write_session_id().size() > kMaxWriteSessionIdBytes) {
-        return {ER_SERVICE_INTERNAL_ERROR, {}};
-    }
-
-    const auto abort_malformed_session = [&]() {
-        if (response.write_session_id().empty()) {
-            return;
+    // A successful PutStart may already have persisted reservations and
+    // published a session before a malformed response is observed here. The
+    // response is a confirmed rejection only if we can address that session,
+    // derive a candidate cardinality, and PutFinish(false) explicitly
+    // succeeds. Every other cleanup result is mutation ambiguity: returning a
+    // plain INTERNAL_ERROR would let wrappers retry while the first session
+    // might still own allocations.
+    const auto abort_malformed_session = [&](ClientErrorCode original_error) {
+        if (response.write_session_id().empty() || response.write_session_id().size() > kMaxWriteSessionIdBytes) {
+            KVCM_LOG_WARN("cannot address malformed KVMeta write session; start outcome is unknown");
+            return ER_SERVICE_OUTCOME_UNKNOWN;
         }
         std::size_t count = 0;
         if (response.has_key_mask() && response.key_mask().values_size() == static_cast<int>(keys.size())) {
@@ -421,18 +420,41 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
         } else {
             count = static_cast<std::size_t>(response.locations_size());
         }
-        if (count != 0) {
-            const ClientErrorCode abort_ec =
-                FinishWrite(trace_id, response.write_session_id(), std::vector<bool>(count, false));
-            if (abort_ec != ER_OK) {
-                KVCM_LOG_WARN("failed to abort malformed KVMeta write session, ec[%d]", static_cast<int>(abort_ec));
-            }
+        if (count == 0 || count > kMaxBatchItems) {
+            KVCM_LOG_WARN("cannot derive malformed KVMeta write-session cardinality; start outcome is unknown");
+            return ER_SERVICE_OUTCOME_UNKNOWN;
         }
+        ClientErrorCode abort_ec = ER_INVALID_GRPCSTATUS;
+        try {
+            abort_ec = FinishWrite(trace_id, response.write_session_id(), std::vector<bool>(count, false));
+        } catch (...) {
+            KVCM_LOG_WARN("malformed KVMeta write-session abort threw; start outcome is unknown");
+            return ER_INVALID_GRPCSTATUS;
+        }
+        if (abort_ec != ER_OK) {
+            KVCM_LOG_WARN("failed to abort malformed KVMeta write session, ec[%d]", static_cast<int>(abort_ec));
+            if (abort_ec == ER_INVALID_GRPCSTATUS || abort_ec == ER_SERVICE_OUTCOME_UNKNOWN) {
+                return abort_ec;
+            }
+            // A definite abort rejection still does not prove that the
+            // successful PutStart left no live reservation. Normalize it to
+            // the public ambiguity code rather than leaking a misleading
+            // SESSION_NOT_FOUND/SIZE_MISMATCH/etc. from the cleanup attempt.
+            return ER_SERVICE_OUTCOME_UNKNOWN;
+        }
+        return original_error;
     };
 
+    // A valid service currently generates a short random identifier. Bound an
+    // untrusted/mismatched response before copying it into the public result.
+    // An oversized id cannot be passed back through PutFinish, so the lease is
+    // the only cleanup backstop and the mutation outcome is unknown.
+    if (response.write_session_id().size() > kMaxWriteSessionIdBytes) {
+        return {abort_malformed_session(ER_SERVICE_INTERNAL_ERROR), {}};
+    }
+
     if (!response.has_key_mask() || response.key_mask().values_size() != static_cast<int>(keys.size())) {
-        abort_malformed_session();
-        return {ER_SERVICE_INTERNAL_ERROR, {}};
+        return {abort_malformed_session(ER_SERVICE_INTERNAL_ERROR), {}};
     }
     std::size_t expected_locations = 0;
     for (const bool masked : response.key_mask().values()) {
@@ -440,8 +462,7 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
     }
     if (response.locations_size() != static_cast<int>(expected_locations) ||
         (expected_locations == 0) != response.write_session_id().empty()) {
-        abort_malformed_session();
-        return {ER_SERVICE_INTERNAL_ERROR, {}};
+        return {abort_malformed_session(ER_SERVICE_INTERNAL_ERROR), {}};
     }
 
     KvMetaStartWriteResult result;
@@ -457,12 +478,10 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
         }
         KvMetaValueLocation location;
         if (!ToPublicLocation(response.locations(static_cast<int>(location_index)), location)) {
-            abort_malformed_session();
-            return {ER_SERVICE_INTERNAL_ERROR, {}};
+            return {abort_malformed_session(ER_SERVICE_INTERNAL_ERROR), {}};
         }
         if (location.value_size != value_sizes[i]) {
-            abort_malformed_session();
-            return {ER_SERVICE_SIZE_MISMATCH, {}};
+            return {abort_malformed_session(ER_SERVICE_SIZE_MISMATCH), {}};
         }
         result.locations.push_back(std::move(location));
         ++location_index;

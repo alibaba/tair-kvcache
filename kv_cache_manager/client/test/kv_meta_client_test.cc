@@ -36,6 +36,7 @@ public:
     void set_noncanonical_authority(bool value) { noncanonical_authority_.store(value); }
     void set_oversized_uri(bool value) { oversized_uri_.store(value); }
     void set_oversized_session_id(bool value) { oversized_session_id_.store(value); }
+    void set_omit_start_session_id(bool value) { omit_start_session_id_.store(value); }
     void set_omit_last_start_location(bool value) { omit_last_start_location_.store(value); }
     void set_extra_start_mask_value(bool value) { extra_start_mask_value_.store(value); }
     void set_register_transport_error(bool value) { register_transport_error_.store(value); }
@@ -150,7 +151,7 @@ public:
             }
             ++write_count;
         }
-        if (write_count != 0) {
+        if (write_count != 0 && !omit_start_session_id_.load()) {
             response->set_write_session_id(oversized_session_id_.load() ? std::string(513, 's') : "session-1");
         }
         if (extra_start_mask_value_.load()) {
@@ -287,6 +288,7 @@ private:
     std::atomic<bool> noncanonical_authority_{false};
     std::atomic<bool> oversized_uri_{false};
     std::atomic<bool> oversized_session_id_{false};
+    std::atomic<bool> omit_start_session_id_{false};
     std::atomic<bool> omit_last_start_location_{false};
     std::atomic<bool> extra_start_mask_value_{false};
     std::atomic<bool> register_transport_error_{false};
@@ -583,6 +585,69 @@ TEST(KvMetaClientTest, MalformedMaskFallsBackToCompactLocationCountWhenAborting)
     EXPECT_EQ((std::vector<bool>{false, false}), service.FinishSuccesses());
 }
 
+TEST(KvMetaClientTest, MalformedStartPreservesAmbiguousAbortOutcomes) {
+    FakeKvMetaService service;
+    service.set_wrong_start_size(true);
+    RunningServer server(&service);
+    ASSERT_TRUE(server.valid());
+
+    auto client = KvMetaClient::Create({{server.address()}, "emb-instance", 1000});
+    ASSERT_TRUE(client);
+
+    service.set_put_finish_transport_error(true);
+    EXPECT_EQ(ER_INVALID_GRPCSTATUS, client->StartWrite("trace-transport", {"a"}, {17}, 30).first);
+    EXPECT_EQ(1, service.put_finish_calls.load());
+
+    service.set_put_finish_transport_error(false);
+    service.set_put_finish_status(proto::kv_meta::OUTCOME_UNKNOWN);
+    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, client->StartWrite("trace-unknown", {"a"}, {17}, 30).first);
+    EXPECT_EQ(2, service.put_finish_calls.load());
+
+    // Even a definite cleanup rejection does not prove that the successful
+    // PutStart left no live reservation. Do not expose SESSION_NOT_FOUND as a
+    // clean start rejection that an upper layer could blindly retry.
+    service.set_put_finish_status(proto::kv_meta::SESSION_NOT_FOUND);
+    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, client->StartWrite("trace-rejected", {"a"}, {17}, 30).first);
+    EXPECT_EQ(3, service.put_finish_calls.load());
+}
+
+TEST(KvMetaClientTest, MalformedStartWithoutAnAddressableSessionIsOutcomeUnknown) {
+    FakeKvMetaService service;
+    service.set_omit_start_session_id(true);
+    RunningServer server(&service);
+    ASSERT_TRUE(server.valid());
+
+    auto client = KvMetaClient::Create({{server.address()}, "emb-instance", 1000});
+    ASSERT_TRUE(client);
+    const auto [start_ec, start] = client->StartWrite("trace-missing-session", {"a"}, {17}, 30);
+
+    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, start_ec);
+    EXPECT_TRUE(start.write_session_id.empty());
+    EXPECT_TRUE(start.key_mask.empty());
+    EXPECT_TRUE(start.locations.empty());
+    EXPECT_EQ(0, service.put_finish_calls.load());
+}
+
+TEST(KvMetaClientTest, MalformedStartWithoutProvableCardinalityIsOutcomeUnknown) {
+    FakeKvMetaService service;
+    service.set_extra_start_mask_value(true);
+    service.set_omit_last_start_location(true);
+    RunningServer server(&service);
+    ASSERT_TRUE(server.valid());
+
+    auto client = KvMetaClient::Create({{server.address()}, "emb-instance", 1000});
+    ASSERT_TRUE(client);
+    const auto [start_ec, start] = client->StartWrite("trace-missing-cardinality", {"a"}, {17}, 30);
+
+    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, start_ec);
+    EXPECT_TRUE(start.write_session_id.empty());
+    EXPECT_TRUE(start.key_mask.empty());
+    EXPECT_TRUE(start.locations.empty());
+    // A guessed empty success_keys vector is invalid and cannot prove that the
+    // live server session has been aborted. Lease expiry remains the backstop.
+    EXPECT_EQ(0, service.put_finish_calls.load());
+}
+
 TEST(KvMetaClientTest, MalformedAllocationUriIsRejectedAndAborted) {
     FakeKvMetaService service;
     service.set_wrong_uri_size(true);
@@ -721,13 +786,13 @@ TEST(KvMetaClientTest, OversizedSessionIdInStartResponseIsRejected) {
     ASSERT_TRUE(client);
     const auto [start_ec, start] = client->StartWrite("trace-start", {"a"}, {17}, 30);
 
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, start_ec);
+    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, start_ec);
     EXPECT_TRUE(start.write_session_id.empty());
     EXPECT_TRUE(start.key_mask.empty());
     EXPECT_TRUE(start.locations.empty());
     // PutFinish also rejects an oversized id, so the client must not issue an
-    // invalid rollback RPC. A malformed server response is reclaimed by the
-    // server-side write-session timeout.
+    // invalid rollback RPC. The server-side lease is the only cleanup
+    // backstop, and callers must therefore treat the start as ambiguous.
     EXPECT_EQ(0, service.put_finish_calls.load());
 }
 

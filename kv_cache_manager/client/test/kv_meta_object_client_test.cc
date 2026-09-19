@@ -301,6 +301,21 @@ TEST_F(KvMetaObjectClientTest, StartFailureDoesNotReadWriteOrFinish) {
     EXPECT_EQ(0, metadata_->finish_calls);
 }
 
+TEST_F(KvMetaObjectClientTest, AmbiguousStartFailurePropagatesWithoutDataIoOrCleanup) {
+    metadata_->start_ec = ER_SERVICE_OUTCOME_UNKNOWN;
+
+    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, client_->SaveObjects("ambiguous-start", keys_, sizes_, buffers_));
+
+    EXPECT_EQ(1, metadata_->start_calls);
+    EXPECT_EQ("ambiguous-start", metadata_->start_trace);
+    EXPECT_EQ(0, metadata_->get_calls);
+    EXPECT_EQ(0, transfer_->save_calls);
+    // The metadata client already attempted to abort the malformed session.
+    // Retrying cleanup without a validated session shape could target the
+    // wrong cardinality and must remain the metadata client's responsibility.
+    EXPECT_EQ(0, metadata_->finish_calls);
+}
+
 TEST_F(KvMetaObjectClientTest, StartExceptionsBecomeAmbiguousErrorsWithoutDataIo) {
     for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
         SCOPED_TRACE(static_cast<int>(mode));

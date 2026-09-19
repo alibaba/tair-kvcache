@@ -87,9 +87,10 @@ public:
     virtual std::pair<ClientErrorCode, KvMetaGetResult> Get(const std::string &trace_id,
                                                             const std::vector<std::string> &keys) = 0;
 
-    // ER_INVALID_GRPCSTATUS means the server may already have reserved an
-    // active session. Do not blindly retry; query the keys and, for misses,
-    // wait for write_timeout_seconds before attempting another StartWrite.
+    // ER_INVALID_GRPCSTATUS or ER_SERVICE_OUTCOME_UNKNOWN means the server may
+    // already have reserved an active session. Do not blindly retry; query the
+    // keys and, for misses, wait for write_timeout_seconds before attempting
+    // another StartWrite.
     virtual std::pair<ClientErrorCode, KvMetaStartWriteResult> StartWrite(const std::string &trace_id,
                                                                           const std::vector<std::string> &keys,
                                                                           const std::vector<std::uint64_t> &value_sizes,

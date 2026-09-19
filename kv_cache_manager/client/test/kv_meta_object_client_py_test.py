@@ -615,10 +615,15 @@ class KvMetaObjectClientTest(unittest.TestCase):
     def test_ambiguous_mutations_and_native_exceptions_are_marked_unknown(self):
         client, native, _ = _client()
         self.addCleanup(client.close)
-        native.results["SaveObjects"] = [_Code.ER_INVALID_GRPCSTATUS]
-        with self.assertRaises(KvMetaObjectClientError) as save_error:
-            client.save(["key"], [_Tensor()])
-        self.assertTrue(save_error.exception.unknown_outcome)
+        for code in (
+            _Code.ER_INVALID_GRPCSTATUS,
+            _Code.ER_SERVICE_OUTCOME_UNKNOWN,
+        ):
+            with self.subTest(save_code=code):
+                native.results["SaveObjects"] = [code]
+                with self.assertRaises(KvMetaObjectClientError) as save_error:
+                    client.save(["key"], [_Tensor()])
+                self.assertTrue(save_error.exception.unknown_outcome)
 
         def fail_remove(*_args):
             raise OSError("endpoint and key must not leak")

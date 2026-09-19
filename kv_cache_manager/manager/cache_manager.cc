@@ -4341,7 +4341,13 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
     std::set<std::string_view> accessible_storage_names(instance_group->storage_candidates().begin(),
                                                         instance_group->storage_candidates().end());
     const auto cache_config = instance_group->cache_config();
-    if (cache_config != nullptr) {
+    // KVMeta never enters the fixed-block migration state machine. Returning
+    // migration-only configs here can make its exact-object client reject an
+    // otherwise valid registration (for example when a route references an
+    // EventReport backend). Its authoritative data plane is exactly the
+    // validated storage_candidates set. Preserve the established expanded
+    // config set for every ordinary KV-cache instance.
+    if (!IsKvMetaInstance(*instance_info) && cache_config != nullptr) {
         for (const auto &strategy : cache_config->migration_strategies()) {
             if (strategy == nullptr) {
                 continue;

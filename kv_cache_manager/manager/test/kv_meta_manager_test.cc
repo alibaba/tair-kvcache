@@ -26,6 +26,7 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
+#include "kv_cache_manager/config/migration_strategy.h"
 #include "kv_cache_manager/config/quota_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
@@ -5097,6 +5098,60 @@ TEST_F(KvMetaManagerTest, RegistrationRejectsStorageWithoutExactObjectOwnership)
     EXPECT_EQ((std::vector<bool>{true}), hit.key_mask);
     EXPECT_EQ(EC_CONFIG_ERROR, manager_->StartWrite(&request_context_, kHotInstance, {"new-object"}, {17}, 30).first);
     EXPECT_EQ(EC_OK, registry_manager_->data_storage_manager()->UnRegisterStorage(kStorage));
+}
+
+TEST_F(KvMetaManagerTest, RegistrationReturnsOnlyExactObjectStorageCandidates) {
+    constexpr const char *kMigrationOnlyStorage = "external-event-report-migration";
+    auto event_spec = std::make_shared<EventReportStorageSpec>();
+    StorageConfig event_config(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, kMigrationOnlyStorage, event_spec);
+    ASSERT_EQ(EC_OK,
+              registry_manager_->data_storage_manager()->RegisterStorage(
+                  &request_context_, kMigrationOnlyStorage, event_config));
+
+    const auto [group_ec, current_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(current_group);
+    ASSERT_TRUE(current_group->cache_config());
+    auto cache_config = std::make_shared<CacheConfig>();
+    ASSERT_TRUE(cache_config->FromJsonString(current_group->cache_config()->ToJsonString()));
+    auto migration = std::make_shared<MigrationStrategy>();
+    migration->set_source_storage_name("nfs_01");
+    migration->set_target_storage_name(kMigrationOnlyStorage);
+    migration->set_trigger_threshold(0.5);
+    MigrationMethods methods;
+    methods.mutable_mark().set_enabled(true);
+    migration->set_methods(methods);
+    migration->set_retention(MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE);
+    cache_config->set_migration_strategies({migration});
+
+    InstanceGroup updated_group(*current_group);
+    updated_group.set_cache_config(cache_config);
+    updated_group.set_version(current_group->version() + 1);
+    ASSERT_EQ(EC_OK,
+              registry_manager_->UpdateInstanceGroup(&request_context_, updated_group, current_group->version()));
+
+    auto [register_ec, storage_configs] =
+        manager_->RegisterInstance(&request_context_, "default", "second-embedding-instance", "emb-test");
+    ASSERT_EQ(EC_OK, register_ec);
+    std::vector<std::shared_ptr<StorageConfig>> parsed_configs;
+    ASSERT_TRUE(Jsonizable::FromJsonString(storage_configs, parsed_configs));
+    ASSERT_EQ(1, parsed_configs.size());
+    ASSERT_TRUE(parsed_configs.front());
+    EXPECT_EQ("nfs_01", parsed_configs.front()->global_unique_name());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, parsed_configs.front()->type());
+
+    // The idempotent existing-instance path must apply the same filtering;
+    // otherwise a client restart could fail even though initial registration
+    // succeeded with the exact same group configuration.
+    auto [reregister_ec, reregistered_storage_configs] =
+        manager_->RegisterInstance(&request_context_, "default", "second-embedding-instance", "emb-test");
+    ASSERT_EQ(EC_OK, reregister_ec);
+    parsed_configs.clear();
+    ASSERT_TRUE(Jsonizable::FromJsonString(reregistered_storage_configs, parsed_configs));
+    ASSERT_EQ(1, parsed_configs.size());
+    ASSERT_TRUE(parsed_configs.front());
+    EXPECT_EQ("nfs_01", parsed_configs.front()->global_unique_name());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, parsed_configs.front()->type());
 }
 
 TEST_F(KvMetaManagerTest, RegistrationRejectsDuplicateStorageCandidates) {
