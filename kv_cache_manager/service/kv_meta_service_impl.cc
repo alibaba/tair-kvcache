@@ -96,7 +96,7 @@ bool FillLocation(const KvMetaManager::ValueLocation &source, proto::kv_meta::Va
         return false;
     }
     const DataStorageUri uri(source.specs.front().second);
-    if (!uri.Valid() || uri.GetHostName().empty() || !uri.HasParam("size")) {
+    if (!HasCanonicalKvMetaAuthority(uri) || !uri.HasParam("size")) {
         return false;
     }
     const std::string uri_size_text = uri.GetParam("size");
@@ -111,25 +111,7 @@ bool FillLocation(const KvMetaManager::ValueLocation &source, proto::kv_meta::Va
         IsTairMempoolStorageType(source.type)
             ? uri.GetProtocol() == kTairMempoolUriScheme
             : uri_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN && ToBaseType(uri_type) == ToBaseType(source.type);
-    bool singleton_allocation = true;
-    switch (source.type) {
-    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
-    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
-    case DataStorageType::DATA_STORAGE_TYPE_NFS:
-    case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
-        if (uri.HasParam("blkid")) {
-            const std::string block_id_text = uri.GetParam("blkid");
-            std::uint64_t block_id = 0;
-            const auto block_id_parsed =
-                std::from_chars(block_id_text.data(), block_id_text.data() + block_id_text.size(), block_id);
-            singleton_allocation = !block_id_text.empty() && block_id_parsed.ec == std::errc{} &&
-                                   block_id_parsed.ptr == block_id_text.data() + block_id_text.size() && block_id == 0;
-        }
-        break;
-    default:
-        break;
-    }
-    if (uri_size != source.value_size || !scheme_matches || !singleton_allocation) {
+    if (uri_size != source.value_size || !scheme_matches || !HasOwnedKvMetaAllocationShape(uri, source.type)) {
         return false;
     }
     target->Clear();

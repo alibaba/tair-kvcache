@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -14,6 +15,14 @@ namespace kv_cache_manager {
 namespace {
 
 TEST(KvMetaUriTest, EnforcesBoundedUnambiguousCanonicalIdentity) {
+    EXPECT_TRUE(IsCanonicalKvMetaBackendName("nfs_01.prod-a"));
+    EXPECT_FALSE(IsCanonicalKvMetaBackendName(""));
+    EXPECT_FALSE(IsCanonicalKvMetaBackendName("owner@nfs"));
+    EXPECT_FALSE(IsCanonicalKvMetaBackendName("nfs:0"));
+    EXPECT_FALSE(IsCanonicalKvMetaBackendName("nfs name"));
+    EXPECT_TRUE(IsCanonicalKvMetaBackendName(std::string(kMaxKvMetaBackendNameBytes, 'a')));
+    EXPECT_FALSE(IsCanonicalKvMetaBackendName(std::string(kMaxKvMetaBackendNameBytes + 1, 'a')));
+
     std::string maximum_parameter_uri = "file://nfs/object?size=5";
     for (std::size_t i = 1; i < kMaxKvMetaLocationUriQueryParams; ++i) {
         maximum_parameter_uri += "&p" + std::to_string(i) + "=x";
@@ -23,9 +32,85 @@ TEST(KvMetaUriTest, EnforcesBoundedUnambiguousCanonicalIdentity) {
 
     EXPECT_TRUE(HasSameCanonicalKvMetaUri("file://nfs/object?size=5&blkid=0", "file://nfs/object?blkid=0&size=5"));
     EXPECT_FALSE(HasSameCanonicalKvMetaUri("file://nfs/object?size=5", "file://nfs/object?size=5&size=5"));
+    EXPECT_FALSE(HasUnambiguousKvMetaUriText("file://nfs/object?size=5&flag"));
+    EXPECT_TRUE(HasUnambiguousKvMetaUriText("file://nfs/object?size=5&flag="));
+    EXPECT_FALSE(HasSameCanonicalKvMetaUri("file://nfs/object?size=5&flag", "file://nfs/object?flag=&size=5"));
     EXPECT_FALSE(HasSameCanonicalKvMetaUri("file:///object?size=5", "file:///object?size=5"));
+    EXPECT_FALSE(HasUnambiguousKvMetaUriText("file://user@nfs/object?size=5"));
+    EXPECT_FALSE(HasUnambiguousKvMetaUriText("file://nfs:0/object?size=5"));
+    EXPECT_FALSE(HasUnambiguousKvMetaUriText("file://nfs:123/object?size=5"));
     EXPECT_FALSE(HasSameCanonicalKvMetaUri("file://nfs/" + std::string(kMaxKvMetaLocationUriBytes, 'x'),
                                            "file://nfs/" + std::string(kMaxKvMetaLocationUriBytes, 'x')));
+
+    EXPECT_TRUE(HasOwnedKvMetaFilePath(DataStorageUri("file://nfs/object?size=5")));
+    EXPECT_TRUE(HasOwnedKvMetaFilePath(DataStorageUri("file://nfs/dir/object?size=5")));
+    EXPECT_FALSE(HasOwnedKvMetaFilePath(DataStorageUri("file://nfs?size=5")));
+    EXPECT_FALSE(HasOwnedKvMetaFilePath(DataStorageUri("file://nfs/?size=5")));
+    EXPECT_FALSE(HasOwnedKvMetaFilePath(DataStorageUri("file://nfs//object?size=5")));
+    EXPECT_FALSE(HasOwnedKvMetaFilePath(DataStorageUri("file://nfs/dir//object?size=5")));
+    EXPECT_FALSE(HasOwnedKvMetaFilePath(DataStorageUri("file://nfs/./object?size=5")));
+    EXPECT_FALSE(HasOwnedKvMetaFilePath(DataStorageUri("file://nfs/dir/../object?size=5")));
+    EXPECT_FALSE(HasOwnedKvMetaFilePath(DataStorageUri("file://nfs/dir/object/?size=5")));
+    EXPECT_TRUE(HasOwnedKvMetaAllocationShape(DataStorageUri("file://nfs/object?blkid=0&size=5"),
+                                              DataStorageType::DATA_STORAGE_TYPE_NFS));
+    EXPECT_FALSE(HasOwnedKvMetaAllocationShape(DataStorageUri("file://nfs/object?blkid=1&size=5"),
+                                               DataStorageType::DATA_STORAGE_TYPE_NFS));
+    EXPECT_FALSE(HasOwnedKvMetaAllocationShape(DataStorageUri("event_report_l1p5://nfs/object?size=5"),
+                                               DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
+
+    const std::string nonce = "0123456789abcdefghijklmnopqrstuv";
+    EXPECT_TRUE(HasCanonicalKvMetaObjectKey("kvmeta/a/b/" + nonce));
+    EXPECT_TRUE(HasCanonicalKvMetaObjectKey("kvmeta/0/0/" + nonce));
+    EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/01/b/" + nonce));
+    EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/0b/" + nonce));
+    EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/A/b/" + nonce));
+    EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/b/short"));
+    EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/b/" + nonce + "/extra"));
+
+    std::string_view object_key;
+    const std::string canonical_path = "/cache/root/kvmeta/a/b/" + nonce;
+    EXPECT_TRUE(TryGetCanonicalKvMetaObjectKeyFromPath(canonical_path, object_key));
+    EXPECT_EQ("kvmeta/a/b/" + nonce, object_key);
+    const std::string malformed_path = "/cache/root/kvmeta/a/not-hex/" + nonce;
+    EXPECT_FALSE(TryGetCanonicalKvMetaObjectKeyFromPath(malformed_path, object_key));
+    EXPECT_TRUE(object_key.empty());
+}
+
+TEST(KvMetaUriTest, ParsesTairMempoolOffsetWithoutAliasingMalformedPathsToZero) {
+    std::uint64_t offset = 99;
+    EXPECT_TRUE(TryGetExactTairMempoolOffset(DataStorageUri("pace://pace/0?size=1"), offset));
+    EXPECT_EQ(0, offset);
+    EXPECT_TRUE(TryGetExactTairMempoolOffset(DataStorageUri("pace://pace/18446744073709551615?size=1"), offset));
+    EXPECT_EQ(std::numeric_limits<std::uint64_t>::max(), offset);
+    EXPECT_TRUE(
+        HasExactTairMempoolAddress(DataStorageUri("pace://pace/0?media_type=65535&node_id=0&range_id=1&size=1")));
+    EXPECT_TRUE(HasExactTairMempoolAddress(DataStorageUri("pace://pace/0?size=1")));
+
+    for (const std::string &uri : {
+             "pace://pace/0?node_id=&size=1",
+             "pace://pace/0?node_id=-1&size=1",
+             "pace://pace/0?node_id=65536&size=1",
+             "pace://pace/0?media_type=1x&size=1",
+             "pace://pace/0?range_id=+1&size=1",
+         }) {
+        SCOPED_TRACE(uri);
+        EXPECT_FALSE(HasExactTairMempoolAddress(DataStorageUri(uri)));
+    }
+
+    for (const std::string &uri : {
+             "pace://pace?size=1",
+             "pace://pace/?size=1",
+             "pace://pace/-1?size=1",
+             "pace://pace/+1?size=1",
+             "pace://pace/not-a-number?size=1",
+             "pace://pace/12trailing?size=1",
+             "pace://pace/18446744073709551616?size=1",
+         }) {
+        SCOPED_TRACE(uri);
+        offset = 99;
+        EXPECT_FALSE(TryGetExactTairMempoolOffset(DataStorageUri(uri), offset));
+        EXPECT_EQ(99, offset);
+    }
 }
 
 BlockBuffer MakeBuffer(void *base, std::size_t size) {
@@ -63,11 +148,16 @@ protected:
                 "type": "file",
                 "global_unique_name": "test_nfs",
                 "storage_spec": {
-                    "root_path": "/tmp/unused/",
+                    "root_path": ")" + root_path_ +
+                                       R"(",
                     "key_count_per_file": 1
                 }
             }
         ])";
+    }
+
+    std::string ObjectPath(const std::string &key_hash, char nonce) const {
+        return root_path_ + "kvmeta/123456789abcdef/" + key_hash + "/" + std::string(32, nonce);
     }
 
     std::string root_path_;
@@ -81,11 +171,11 @@ TEST_F(KvMetaTransferClientTest, SavesAndLoadsDifferentObjectSizesInOneBatch) {
 
     std::vector<char> first{1, 2, 3, 4, 5};
     std::vector<char> second{9, 8, 7, 6, 5, 4, 3, 2, 1};
-    const std::string first_path = root_path_ + "first";
-    const std::string second_path = root_path_ + "second";
+    const std::string first_path = ObjectPath("1", 'a');
+    const std::string second_path = ObjectPath("2", 'b');
     const UriStrVec uris = {
-        "file://test_nfs/" + first_path + "?size=5&blkid=0",
-        "file://test_nfs/" + second_path + "?blkid=0&size=9",
+        "file://test_nfs" + first_path + "?size=5&blkid=0",
+        "file://test_nfs" + second_path + "?blkid=0&size=9",
     };
     const std::vector<std::uint64_t> sizes = {first.size(), second.size()};
     const BlockBuffers source = {
@@ -96,8 +186,8 @@ TEST_F(KvMetaTransferClientTest, SavesAndLoadsDifferentObjectSizesInOneBatch) {
     auto [save_ec, actual_uris] = client->SaveObjects(uris, sizes, source);
     ASSERT_EQ(ER_OK, save_ec);
     EXPECT_EQ((UriStrVec{
-                  "file://test_nfs/" + first_path + "?blkid=0&size=5",
-                  "file://test_nfs/" + second_path + "?blkid=0&size=9",
+                  "file://test_nfs" + first_path + "?blkid=0&size=5",
+                  "file://test_nfs" + second_path + "?blkid=0&size=9",
               }),
               actual_uris);
     ASSERT_TRUE(std::filesystem::exists(first_path));
@@ -120,8 +210,8 @@ TEST_F(KvMetaTransferClientTest, RejectsUriAndBufferSizeMismatchBeforeIo) {
     auto client = KvMetaTransferClient::Create(client_config_, init_params_, 1024);
     ASSERT_NE(nullptr, client);
     std::vector<char> payload(5, 1);
-    const std::string path = root_path_ + "must_not_exist";
-    const UriStrVec uris = {"file://test_nfs/" + path + "?blkid=0&size=4"};
+    const std::string path = ObjectPath("3", 'c');
+    const UriStrVec uris = {"file://test_nfs" + path + "?blkid=0&size=4"};
 
     auto [ec, actual_uris] = client->SaveObjects(uris, {payload.size()}, {MakeBuffer(payload.data(), payload.size())});
     EXPECT_EQ(ER_INVALID_PARAMS, ec);
@@ -152,6 +242,19 @@ TEST_F(KvMetaTransferClientTest, RejectsStorageWithoutExactObjectOwnership) {
         }
     ])";
     EXPECT_EQ(nullptr, KvMetaTransferClient::Create(client_config_, init_params_, 1024));
+
+    for (const std::string &unsafe_root : {"relative/", "/tmp/no-object-separator", "/tmp/cache/../unsafe/"}) {
+        SCOPED_TRACE(unsafe_root);
+        init_params_.storage_configs = R"([
+            {
+                "type": "file",
+                "global_unique_name": "unsafe_nfs",
+                "storage_spec": {"root_path": ")" +
+                                       unsafe_root + R"(", "key_count_per_file": 1}
+            }
+        ])";
+        EXPECT_EQ(nullptr, KvMetaTransferClient::Create(client_config_, init_params_, 1024));
+    }
 }
 
 TEST_F(KvMetaTransferClientTest, RejectsSchemeMismatchAndNonSingletonBlockIdBeforeIo) {
@@ -159,9 +262,9 @@ TEST_F(KvMetaTransferClientTest, RejectsSchemeMismatchAndNonSingletonBlockIdBefo
     ASSERT_NE(nullptr, client);
     std::vector<char> payload(5, 1);
     auto buffer = MakeBuffer(payload.data(), payload.size());
-    const std::string path = root_path_ + "must_not_dispatch";
+    const std::string path = ObjectPath("4", 'd');
 
-    const UriStrVec wrong_scheme = {"mooncake://test_nfs/" + path + "?blkid=0&size=5"};
+    const UriStrVec wrong_scheme = {"mooncake://test_nfs" + path + "?blkid=0&size=5"};
     const auto [scheme_save_ec, scheme_actual_uris] = client->SaveObjects(wrong_scheme, {payload.size()}, {buffer});
     EXPECT_EQ(ER_INVALID_PARAMS, scheme_save_ec);
     EXPECT_TRUE(scheme_actual_uris.empty());
@@ -169,7 +272,7 @@ TEST_F(KvMetaTransferClientTest, RejectsSchemeMismatchAndNonSingletonBlockIdBefo
 
     for (const std::string &block_id : {"1", "-1", "not-a-number", "18446744073709551616"}) {
         SCOPED_TRACE(block_id);
-        const UriStrVec non_singleton = {"file://test_nfs/" + path + "?blkid=" + block_id + "&size=5"};
+        const UriStrVec non_singleton = {"file://test_nfs" + path + "?blkid=" + block_id + "&size=5"};
         const auto [save_ec, actual_uris] = client->SaveObjects(non_singleton, {payload.size()}, {buffer});
         EXPECT_EQ(ER_INVALID_PARAMS, save_ec);
         EXPECT_TRUE(actual_uris.empty());
@@ -183,19 +286,19 @@ TEST_F(KvMetaTransferClientTest, RejectsAmbiguousRawUriSyntaxBeforeIo) {
     ASSERT_NE(nullptr, client);
     std::vector<char> payload(5, 1);
     const auto buffer = MakeBuffer(payload.data(), payload.size());
-    const std::string path = root_path_ + "ambiguous_must_not_dispatch";
+    const std::string path = ObjectPath("5", 'e');
     UriStrVec ambiguous_uris = {
-        "file://test_nfs/" + path + "?blkid=0&size=1&size=5",
-        "file://test_nfs/" + path + "?blkid=1&blkid=0&size=5",
-        "file://test_nfs/" + path + "?blkid=0&size=5&token=value#fragment",
-        "file://test_nfs/" + path + "?blkid=0&=empty-key&size=5",
-        "file://test_nfs/" + path + "?blkid=0&&size=5",
-        "file://test_nfs/" + path + "?blkid=0&size=5&",
-        "file://test_nfs/" + path + "?blkid=0&token=bad\nvalue&size=5",
+        "file://test_nfs" + path + "?blkid=0&size=1&size=5",
+        "file://test_nfs" + path + "?blkid=1&blkid=0&size=5",
+        "file://test_nfs" + path + "?blkid=0&size=5&token=value#fragment",
+        "file://test_nfs" + path + "?blkid=0&=empty-key&size=5",
+        "file://test_nfs" + path + "?blkid=0&&size=5",
+        "file://test_nfs" + path + "?blkid=0&size=5&",
+        "file://test_nfs" + path + "?blkid=0&token=bad\nvalue&size=5",
         "file://test_nfs/" + std::string(kMaxKvMetaLocationUriBytes, 'x') + "?blkid=0&size=5",
         "file://test_nfs/" + std::string("bad\0path", 8) + "?blkid=0&size=5",
     };
-    std::string too_many_parameters = "file://test_nfs/" + path + "?size=5";
+    std::string too_many_parameters = "file://test_nfs" + path + "?size=5";
     for (std::size_t i = 0; i < kMaxKvMetaLocationUriQueryParams; ++i) {
         too_many_parameters += "&p" + std::to_string(i) + "=x";
     }
@@ -215,19 +318,38 @@ TEST_F(KvMetaTransferClientTest, RejectsIgnoredOrOversizedObjects) {
     auto client = KvMetaTransferClient::Create(client_config_, init_params_, 8);
     ASSERT_NE(nullptr, client);
     std::vector<char> payload(9, 1);
-    const UriStrVec uris = {"file://test_nfs/" + root_path_ + "oversized?blkid=0&size=9"};
+    const std::string oversized_path = ObjectPath("6", 'f');
+    const UriStrVec uris = {"file://test_nfs" + oversized_path + "?blkid=0&size=9"};
     auto buffer = MakeBuffer(payload.data(), payload.size());
     EXPECT_EQ(ER_INVALID_PARAMS, client->LoadObjects(uris, {payload.size()}, {buffer}));
 
     payload.resize(5);
     buffer = MakeBuffer(payload.data(), payload.size());
     buffer.iovs[0].ignore = true;
-    const UriStrVec ignored_uri = {"file://test_nfs/" + root_path_ + "ignored?blkid=0&size=5"};
+    const std::string ignored_path = ObjectPath("7", 'g');
+    const UriStrVec ignored_uri = {"file://test_nfs" + ignored_path + "?blkid=0&size=5"};
     EXPECT_EQ(ER_INVALID_LOCAL_BUFFERS, client->LoadObjects(ignored_uri, {payload.size()}, {buffer}));
 
     auto overflowing_buffer = MakeBuffer(
         reinterpret_cast<void *>(std::numeric_limits<std::uintptr_t>::max() - payload.size() + 1), payload.size());
     EXPECT_EQ(ER_INVALID_LOCAL_BUFFERS, client->LoadObjects(ignored_uri, {payload.size()}, {overflowing_buffer}));
+}
+
+TEST_F(KvMetaTransferClientTest, RejectsConfiguredNamespaceEscapeBeforeIo) {
+    auto client = KvMetaTransferClient::Create(client_config_, init_params_, 1024);
+    ASSERT_NE(nullptr, client);
+
+    std::vector<char> payload(5, 1);
+    const auto buffer = MakeBuffer(payload.data(), payload.size());
+    const std::string foreign_path =
+        GetPrivateTestRuntimeDataPath() + "foreign_objects/kvmeta/123456789abcdef/8/" + std::string(32, 'h');
+    const UriStrVec foreign_uri = {"file://test_nfs" + foreign_path + "?blkid=0&size=5"};
+
+    const auto [save_ec, actual_uris] = client->SaveObjects(foreign_uri, {payload.size()}, {buffer});
+    EXPECT_EQ(ER_INVALID_PARAMS, save_ec);
+    EXPECT_TRUE(actual_uris.empty());
+    EXPECT_EQ(ER_INVALID_PARAMS, client->LoadObjects(foreign_uri, {payload.size()}, {buffer}));
+    EXPECT_FALSE(std::filesystem::exists(foreign_path));
 }
 
 TEST_F(KvMetaTransferClientTest, RejectsMaxObjectSizeAboveTheServiceContract) {
@@ -261,7 +383,7 @@ TEST_F(KvMetaTransferClientTest, RejectsServiceBatchLimitsBeforeDataPlaneIo) {
     std::vector<std::uint64_t> too_many_sizes;
     BlockBuffers too_many_buffers;
     for (std::size_t i = 0; i < 65; ++i) {
-        too_many_uris.push_back("file://test_nfs/" + root_path_ + "too-many-" + std::to_string(i) + "?blkid=0&size=1");
+        too_many_uris.push_back("file://test_nfs" + ObjectPath(std::to_string(i + 16), 'i') + "?blkid=0&size=1");
         too_many_sizes.push_back(1);
         too_many_buffers.push_back(MakeBuffer(&payload, 1));
     }
@@ -272,7 +394,7 @@ TEST_F(KvMetaTransferClientTest, RejectsServiceBatchLimitsBeforeDataPlaneIo) {
     std::vector<std::uint64_t> oversized_batch_sizes;
     BlockBuffers oversized_batch_buffers;
     for (std::size_t i = 0; i < 5; ++i) {
-        oversized_batch_uris.push_back("file://test_nfs/" + root_path_ + "too-large-" + std::to_string(i) +
+        oversized_batch_uris.push_back("file://test_nfs" + ObjectPath(std::to_string(i + 96), 'j') +
                                        "?blkid=0&size=" + std::to_string(kOneGiB));
         oversized_batch_sizes.push_back(kOneGiB);
         oversized_batch_buffers.push_back(MakeBuffer(&payload, kOneGiB));
@@ -282,7 +404,7 @@ TEST_F(KvMetaTransferClientTest, RejectsServiceBatchLimitsBeforeDataPlaneIo) {
     EXPECT_EQ(ER_INVALID_PARAMS, save_ec);
     EXPECT_TRUE(actual_uris.empty());
     for (std::size_t i = 0; i < 5; ++i) {
-        EXPECT_FALSE(std::filesystem::exists(root_path_ + "too-large-" + std::to_string(i)));
+        EXPECT_FALSE(std::filesystem::exists(ObjectPath(std::to_string(i + 96), 'j')));
     }
 }
 
@@ -319,7 +441,7 @@ TEST_F(KvMetaTransferClientTest, RegularTransferClientKeepsFixedSizePolicy) {
     ASSERT_NE(nullptr, client);
     std::vector<char> payload(5, 1);
     const std::string path = root_path_ + "regular_reject";
-    const UriStrVec uris = {"file://test_nfs/" + path + "?blkid=0&size=5"};
+    const UriStrVec uris = {"file://test_nfs" + path + "?blkid=0&size=5"};
     const auto result = client->SaveKvCaches(uris, {MakeBuffer(payload.data(), payload.size())});
     EXPECT_NE(ER_OK, result.first);
 }

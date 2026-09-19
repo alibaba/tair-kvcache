@@ -127,6 +127,32 @@ public:
 private:
     struct SessionItem;
     struct ExactLocation;
+    struct DeleteItemsOptions {
+        // Physical deletion is authorized only by an exact conditional
+        // metadata delete performed by this call. An already-absent record is
+        // never sufficient ownership proof for a reusable backend address.
+        bool delete_physical = true;
+        bool adjust_storage_usage = true;
+        bool maintenance_no_touch = false;
+        // Reclaimer retry is the sole expected already-absent case: its
+        // in-memory pending record fences successor generations while the
+        // previous metadata Sync is retried.
+        bool sync_metadata_absent = false;
+        bool restore_usage_on_sync_failure = true;
+    };
+    struct DeleteItemsResult {
+        ErrorCode ec = EC_OK;
+        bool metadata_outcome_changed = false;
+        bool metadata_cleanup_complete = false;
+        bool metadata_already_absent = false;
+        bool metadata_owner_conflicted = false;
+        // Request-aligned evidence used by the Reclaimer to distinguish its
+        // own post-delete Sync retry from an unexpected missing or replaced
+        // owner.
+        std::vector<bool> metadata_deleted;
+        std::vector<bool> metadata_absent;
+        std::vector<bool> metadata_conflicted;
+    };
 
     static std::string InternalInstanceId(const std::string &instance_id);
     static std::int64_t InternalKey(const std::string &key);
@@ -134,6 +160,7 @@ private:
 
     bool IsOwnedLocation(std::int64_t internal_key, const std::string &location_id) const;
     ErrorCode ValidateOwnedLocation(RequestContext *request_context,
+                                    const std::string &internal_instance_id,
                                     std::int64_t internal_key,
                                     const std::string &location_id,
                                     const CacheLocation &location,
@@ -151,20 +178,13 @@ private:
                                  const std::string &internal_instance_id,
                                  const std::vector<std::string> &keys,
                                  std::vector<ExactLocation> &out) const;
-    ErrorCode DeleteItems(RequestContext *request_context,
-                          const std::string &internal_instance_id,
-                          const std::vector<SessionItem> &items,
-                          bool metadata_only,
-                          bool adjust_storage_usage = true,
-                          bool maintenance_no_touch = false,
-                          bool delete_if_metadata_absent = true,
-                          bool sync_metadata_absent = false,
-                          bool restore_usage_on_sync_failure = true,
-                          bool *metadata_outcome_changed = nullptr,
-                          bool *metadata_cleanup_complete = nullptr);
-    ErrorCode DeleteRetiredMetadata(RequestContext *request_context,
-                                    const std::string &internal_instance_id,
-                                    const std::vector<SessionItem> &items);
+    DeleteItemsResult DeleteItems(RequestContext *request_context,
+                                  const std::string &internal_instance_id,
+                                  const std::vector<SessionItem> &items,
+                                  const DeleteItemsOptions &options);
+    DeleteItemsResult DeleteRetiredMetadata(RequestContext *request_context,
+                                            const std::string &internal_instance_id,
+                                            const std::vector<SessionItem> &items);
     ErrorCode FinishWriteInternal(RequestContext *request_context,
                                   const std::string &internal_instance_id,
                                   const std::vector<bool> &success_keys,

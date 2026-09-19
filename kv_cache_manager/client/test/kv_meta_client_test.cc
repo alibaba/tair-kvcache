@@ -29,6 +29,11 @@ public:
     void set_duplicate_uri_size(bool value) { duplicate_uri_size_.store(value); }
     void set_fragment_uri(bool value) { fragment_uri_.store(value); }
     void set_event_report_location(bool value) { event_report_location_.store(value); }
+    void set_mooncake_without_key(bool value) { mooncake_without_key_.store(value); }
+    void set_tair_with_malformed_offset(bool value) { tair_with_malformed_offset_.store(value); }
+    void set_tair_with_malformed_address(bool value) { tair_with_malformed_address_.store(value); }
+    void set_unsafe_file_path(bool value) { unsafe_file_path_.store(value); }
+    void set_noncanonical_authority(bool value) { noncanonical_authority_.store(value); }
     void set_oversized_uri(bool value) { oversized_uri_.store(value); }
     void set_oversized_session_id(bool value) { oversized_session_id_.store(value); }
     void set_omit_last_start_location(bool value) { omit_last_start_location_.store(value); }
@@ -242,6 +247,24 @@ private:
             location->mutable_location_specs(0)->set_uri("event_report_l1p5://reporter/value?size=" +
                                                          std::to_string(size));
         }
+        if (mooncake_without_key_.load()) {
+            location->set_type(proto::kv_meta::ST_MOONCAKE);
+            location->mutable_location_specs(0)->set_uri("mooncake://moon/value?size=" + std::to_string(size));
+        }
+        if (tair_with_malformed_offset_.load()) {
+            location->set_type(proto::kv_meta::ST_TAIRMEMPOOL);
+            location->mutable_location_specs(0)->set_uri("pace://pace/not-an-offset?size=" + std::to_string(size));
+        }
+        if (tair_with_malformed_address_.load()) {
+            location->set_type(proto::kv_meta::ST_TAIRMEMPOOL);
+            location->mutable_location_specs(0)->set_uri("pace://pace/0?node_id=&size=" + std::to_string(size));
+        }
+        if (unsafe_file_path_.load()) {
+            location->mutable_location_specs(0)->set_uri("file://nfs/?size=" + std::to_string(size));
+        }
+        if (noncanonical_authority_.load()) {
+            location->mutable_location_specs(0)->set_uri("file://owner@nfs/value?size=" + std::to_string(size));
+        }
         if (oversized_uri_.load()) {
             location->mutable_location_specs(0)->set_uri("file://nfs/" + std::string(kMaxKvMetaLocationUriBytes, 'x') +
                                                          "?size=" + std::to_string(size));
@@ -257,6 +280,11 @@ private:
     std::atomic<bool> duplicate_uri_size_{false};
     std::atomic<bool> fragment_uri_{false};
     std::atomic<bool> event_report_location_{false};
+    std::atomic<bool> mooncake_without_key_{false};
+    std::atomic<bool> tair_with_malformed_offset_{false};
+    std::atomic<bool> tair_with_malformed_address_{false};
+    std::atomic<bool> unsafe_file_path_{false};
+    std::atomic<bool> noncanonical_authority_{false};
     std::atomic<bool> oversized_uri_{false};
     std::atomic<bool> oversized_session_id_{false};
     std::atomic<bool> omit_last_start_location_{false};
@@ -598,9 +626,39 @@ TEST(KvMetaClientTest, MalformedAllocationUriIsRejectedAndAborted) {
     EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
 
     service.set_event_report_location(false);
+    service.set_mooncake_without_key(true);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-mooncake-key", {"a"}, {17}, 30).first);
+    EXPECT_EQ(7, service.put_finish_calls.load());
+    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+
+    service.set_mooncake_without_key(false);
+    service.set_tair_with_malformed_offset(true);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-tair-offset", {"a"}, {17}, 30).first);
+    EXPECT_EQ(8, service.put_finish_calls.load());
+    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+
+    service.set_tair_with_malformed_offset(false);
+    service.set_tair_with_malformed_address(true);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-tair-address", {"a"}, {17}, 30).first);
+    EXPECT_EQ(9, service.put_finish_calls.load());
+    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+
+    service.set_tair_with_malformed_address(false);
+    service.set_unsafe_file_path(true);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-file-root", {"a"}, {17}, 30).first);
+    EXPECT_EQ(10, service.put_finish_calls.load());
+    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+
+    service.set_unsafe_file_path(false);
+    service.set_noncanonical_authority(true);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-authority", {"a"}, {17}, 30).first);
+    EXPECT_EQ(11, service.put_finish_calls.load());
+    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+
+    service.set_noncanonical_authority(false);
     service.set_oversized_uri(true);
     EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-oversized-uri", {"a"}, {17}, 30).first);
-    EXPECT_EQ(7, service.put_finish_calls.load());
+    EXPECT_EQ(12, service.put_finish_calls.load());
     EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
 }
 
@@ -621,6 +679,36 @@ TEST(KvMetaClientTest, MalformedReadLocationIsRejectedBeforeExposure) {
     auto [event_ec, event] = client->Get("trace-event", {"a"});
     EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, event_ec);
     EXPECT_TRUE(event.locations.empty());
+
+    service.set_event_report_location(false);
+    service.set_mooncake_without_key(true);
+    auto [mooncake_ec, mooncake] = client->Get("trace-mooncake", {"a"});
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, mooncake_ec);
+    EXPECT_TRUE(mooncake.locations.empty());
+
+    service.set_mooncake_without_key(false);
+    service.set_tair_with_malformed_offset(true);
+    auto [tair_ec, tair] = client->Get("trace-tair", {"a"});
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, tair_ec);
+    EXPECT_TRUE(tair.locations.empty());
+
+    service.set_tair_with_malformed_offset(false);
+    service.set_tair_with_malformed_address(true);
+    auto [address_ec, address] = client->Get("trace-tair-address", {"a"});
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, address_ec);
+    EXPECT_TRUE(address.locations.empty());
+
+    service.set_tair_with_malformed_address(false);
+    service.set_unsafe_file_path(true);
+    auto [path_ec, path] = client->Get("trace-file-root", {"a"});
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, path_ec);
+    EXPECT_TRUE(path.locations.empty());
+
+    service.set_unsafe_file_path(false);
+    service.set_noncanonical_authority(true);
+    auto [authority_ec, authority] = client->Get("trace-authority", {"a"});
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, authority_ec);
+    EXPECT_TRUE(authority.locations.empty());
 }
 
 TEST(KvMetaClientTest, OversizedSessionIdInStartResponseIsRejected) {

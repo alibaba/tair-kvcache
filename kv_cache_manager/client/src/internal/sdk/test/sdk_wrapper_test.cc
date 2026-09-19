@@ -146,8 +146,11 @@ TEST_F(SdkWrapperTest, TestKvMetaRuntimePolicyDoesNotMutateReusableClientConfig)
     const auto kv_meta_backend =
         kv_meta_wrapper.wrapper_config_->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
     ASSERT_TRUE(kv_meta_backend);
-    EXPECT_TRUE(kv_meta_backend->variable_object_size_enabled());
-    EXPECT_EQ(4096, kv_meta_backend->max_variable_object_bytes());
+    // The wrapper clone is now an immutable per-type template. Each storage
+    // candidate receives its own runtime copy, preventing one candidate's
+    // registration fields from poisoning another candidate of the same type.
+    EXPECT_FALSE(kv_meta_backend->variable_object_size_enabled());
+    EXPECT_EQ(0, kv_meta_backend->max_variable_object_bytes());
     EXPECT_FALSE(source_backend->variable_object_size_enabled());
 
     // Reusing the same parsed config for the fixed-block wrapper keeps both
@@ -158,16 +161,181 @@ TEST_F(SdkWrapperTest, TestKvMetaRuntimePolicyDoesNotMutateReusableClientConfig)
     EXPECT_FALSE(source_backend->variable_object_size_enabled());
 }
 
+TEST_F(SdkWrapperTest, TestKvMetaRejectsUriUnsafeBackendNamesWithoutChangingRegularInit) {
+    InitParams init_params = init_params_;
+    init_params.storage_configs = R"([{
+        "type": "file",
+        "global_unique_name": "unsafe:nfs",
+        "storage_spec": {"root_path": "/nfs/", "key_count_per_file": 1}
+    }])";
+
+    SdkWrapper regular_wrapper;
+    EXPECT_EQ(ER_OK, regular_wrapper.Init(client_config_, init_params));
+
+    SdkWrapper kv_meta_wrapper;
+    EXPECT_EQ(ER_INVALID_STORAGE_CONFIG, kv_meta_wrapper.InitForKvMeta(client_config_, init_params, 4096));
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaInitializesMultipleMooncakeCandidatesWithIsolatedRuntimeConfigs) {
+    class CapturingSdk : public SdkInterface {
+    public:
+        ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &,
+                             const std::shared_ptr<StorageConfig> &) override {
+            return ER_OK;
+        }
+        SdkType Type() override { return SdkType::MOONCAKE; }
+        ClientErrorCode Get(const std::vector<DataStorageUri> &, const BlockBuffers &) override { return ER_OK; }
+        ClientErrorCode Put(const std::vector<DataStorageUri> &,
+                            const BlockBuffers &,
+                            std::shared_ptr<std::vector<DataStorageUri>>) override {
+            return ER_OK;
+        }
+
+    protected:
+        ClientErrorCode Alloc(const std::vector<DataStorageUri> &, std::vector<DataStorageUri> &) override {
+            return ER_OK;
+        }
+    };
+    class CapturingFactory : public SdkFactory {
+    public:
+        std::shared_ptr<SdkInterface> CreateSdk(const DataStorageType &type,
+                                                const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
+                                                const std::shared_ptr<StorageConfig> &) override {
+            if (type != DataStorageType::DATA_STORAGE_TYPE_MOONCAKE || !sdk_backend_config) {
+                return nullptr;
+            }
+            configs.push_back(sdk_backend_config);
+            return std::make_shared<CapturingSdk>();
+        }
+
+        std::vector<std::shared_ptr<SdkBackendConfig>> configs;
+    } factory;
+
+    auto client_config = std::make_unique<ClientConfig>();
+    ASSERT_TRUE(client_config->FromJsonString(R"({
+        "instance_group": "group",
+        "instance_id": "instance",
+        "block_size": 1,
+        "sdk_config": {
+            "thread_num": 2,
+            "queue_size": 8,
+            "sdk_backend_configs": [{"type": "mooncake", "location": "*", "put_replica_num": 1}],
+            "timeout_config": {"put_timeout_ms": 2000, "get_timeout_ms": 2000}
+        },
+        "location_spec_infos": {"tp0": 1}
+    })"));
+    InitParams init_params = init_params_;
+    init_params.storage_configs = R"([
+        {"type":"mooncake","global_unique_name":"moon_a","storage_spec":{}},
+        {"type":"mooncake","global_unique_name":"moon_b","storage_spec":{}}
+    ])";
+
+    SdkWrapper wrapper;
+    wrapper.sdk_factory_ = &factory;
+    ASSERT_EQ(ER_OK, wrapper.InitForKvMeta(client_config, init_params, 4096));
+    ASSERT_EQ(2, factory.configs.size());
+    EXPECT_NE(factory.configs[0], factory.configs[1]);
+
+    for (const auto &backend_config : factory.configs) {
+        const auto mooncake = std::dynamic_pointer_cast<MooncakeSdkConfig>(backend_config);
+        ASSERT_TRUE(mooncake);
+        EXPECT_EQ(init_params.regist_span->base, mooncake->local_mem_ptr());
+        EXPECT_EQ(init_params.regist_span->size, mooncake->local_buffer_size());
+        EXPECT_EQ(init_params.self_location_spec_name, mooncake->self_location_spec_name());
+        EXPECT_TRUE(mooncake->variable_object_size_enabled());
+        EXPECT_EQ(4096, mooncake->max_variable_object_bytes());
+    }
+
+    const auto template_config =
+        wrapper.wrapper_config_->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
+    const auto mooncake_template = std::dynamic_pointer_cast<MooncakeSdkConfig>(template_config);
+    ASSERT_TRUE(mooncake_template);
+    EXPECT_EQ(nullptr, mooncake_template->local_mem_ptr());
+    EXPECT_EQ(0, mooncake_template->local_buffer_size());
+    EXPECT_FALSE(mooncake_template->variable_object_size_enabled());
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaClonesLegacyVcnsTemplateAsTheCandidateType) {
+    class CapturingSdk : public SdkInterface {
+    public:
+        ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &,
+                             const std::shared_ptr<StorageConfig> &) override {
+            return ER_OK;
+        }
+        SdkType Type() override { return SdkType::HF3FS; }
+        ClientErrorCode Get(const std::vector<DataStorageUri> &, const BlockBuffers &) override { return ER_OK; }
+        ClientErrorCode Put(const std::vector<DataStorageUri> &,
+                            const BlockBuffers &,
+                            std::shared_ptr<std::vector<DataStorageUri>>) override {
+            return ER_OK;
+        }
+
+    protected:
+        ClientErrorCode Alloc(const std::vector<DataStorageUri> &, std::vector<DataStorageUri> &) override {
+            return ER_OK;
+        }
+    };
+    class CapturingFactory : public SdkFactory {
+    public:
+        std::shared_ptr<SdkInterface> CreateSdk(const DataStorageType &type,
+                                                const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
+                                                const std::shared_ptr<StorageConfig> &) override {
+            if (type != DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS || !sdk_backend_config) {
+                return nullptr;
+            }
+            captured = sdk_backend_config;
+            return std::make_shared<CapturingSdk>();
+        }
+
+        std::shared_ptr<SdkBackendConfig> captured;
+    } factory;
+
+    InitParams init_params = init_params_;
+    init_params.storage_configs = R"([
+        {
+            "type":"vcns_hf3fs",
+            "global_unique_name":"vcns_a",
+            "storage_spec":{
+                "cluster_name":"cluster",
+                "mountpoint":"/mnt/3fs",
+                "root_dir":"kvmeta/",
+                "key_count_per_file":1,
+                "remote_host":"meta",
+                "remote_port":1234,
+                "meta_storage_uri":"redis://meta"
+            }
+        }
+    ])";
+
+    SdkWrapper wrapper;
+    wrapper.sdk_factory_ = &factory;
+    ASSERT_EQ(ER_OK, wrapper.InitForKvMeta(client_config_, init_params, 4096));
+    ASSERT_TRUE(factory.captured);
+    EXPECT_TRUE(std::dynamic_pointer_cast<Hf3fsSdkConfig>(factory.captured));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, factory.captured->type());
+    EXPECT_TRUE(factory.captured->variable_object_size_enabled());
+
+    const auto template_config =
+        wrapper.wrapper_config_->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS);
+    ASSERT_TRUE(template_config);
+    // The compatibility adjustment is per candidate; the shared template is
+    // still the historical HF3FS-typed default and remains unmodified.
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_HF3FS, template_config->type());
+    EXPECT_FALSE(template_config->variable_object_size_enabled());
+}
+
 TEST_F(SdkWrapperTest, TestKvMetaPutRejectsNullResultBeforeValidationOrIo) {
     SdkWrapper sdk_wrapper;
     EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.PutKvMetaObjects({}, {}, {}, nullptr));
 }
 
-TEST_F(SdkWrapperTest, TestKvMetaMooncakeValidationRequiresANonEmptyPhysicalKey) {
+TEST_F(SdkWrapperTest, TestKvMetaMooncakeValidationRequiresACanonicalObjectKey) {
     SdkWrapper sdk_wrapper;
     sdk_wrapper.variable_object_size_enabled_ = true;
     sdk_wrapper.max_variable_object_bytes_ = 4096;
     sdk_wrapper.sdk_storage_types_["moon"] = DataStorageType::DATA_STORAGE_TYPE_MOONCAKE;
+    sdk_wrapper.sdk_storage_configs_["moon"] = std::make_shared<StorageConfig>(
+        DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, "moon", std::make_shared<MooncakeStorageSpec>());
 
     char bytes[5]{};
     Iov iov;
@@ -184,9 +352,102 @@ TEST_F(SdkWrapperTest, TestKvMetaMooncakeValidationRequiresANonEmptyPhysicalKey)
     EXPECT_EQ(
         ER_INVALID_PARAMS,
         sdk_wrapper.ValidateKvMetaObjects({DataStorageUri("mooncake://moon/object?key=&size=5")}, sizes, buffers));
-    EXPECT_EQ(ER_OK,
+    EXPECT_EQ(ER_INVALID_PARAMS,
               sdk_wrapper.ValidateKvMetaObjects(
                   {DataStorageUri("mooncake://moon/object?key=physical-object&size=5")}, sizes, buffers));
+    EXPECT_EQ(ER_OK,
+              sdk_wrapper.ValidateKvMetaObjects(
+                  {DataStorageUri("mooncake://moon/object?key=kvmeta/a/b/0123456789abcdefghijklmnopqrstuv&size=5")},
+                  sizes,
+                  buffers));
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaFileValidationRejectsUnsafePathsAndAuthoritiesBeforeIo) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.variable_object_size_enabled_ = true;
+    sdk_wrapper.max_variable_object_bytes_ = 4096;
+    sdk_wrapper.sdk_storage_types_["nfs"] = DataStorageType::DATA_STORAGE_TYPE_NFS;
+    auto nfs_spec = std::make_shared<NfsStorageSpec>();
+    nfs_spec->set_root_path("/cache/");
+    sdk_wrapper.sdk_storage_configs_["nfs"] =
+        std::make_shared<StorageConfig>(DataStorageType::DATA_STORAGE_TYPE_NFS, "nfs", nfs_spec);
+
+    char bytes[5]{};
+    Iov iov;
+    iov.type = MemoryType::CPU;
+    iov.base = bytes;
+    iov.size = sizeof(bytes);
+    BlockBuffer buffer;
+    buffer.iovs.push_back(iov);
+    const BlockBuffers buffers{buffer};
+    const std::vector<std::uint64_t> sizes{sizeof(bytes)};
+
+    const std::string valid_object = "kvmeta/a/b/0123456789abcdefghijklmnopqrstuv";
+    EXPECT_EQ(ER_OK,
+              sdk_wrapper.ValidateKvMetaObjects(
+                  {DataStorageUri("file://nfs/cache/" + valid_object + "?size=5")}, sizes, buffers));
+    for (const std::string &uri : {
+             "file://nfs?size=5",
+             "file://nfs/?size=5",
+             "file://nfs//object?size=5",
+             "file://nfs/dir/./object?size=5",
+             "file://nfs/dir/../object?size=5",
+             "file://nfs/dir/object/?size=5",
+             "file://nfs name/object?size=5",
+             "file://user@nfs/object?size=5",
+             "file://nfs:123/object?size=5",
+             "file://nfs/foreign/kvmeta/a/b/0123456789abcdefghijklmnopqrstuv?size=5",
+             "file://nfs/cache/kvmeta/a/not-hex/0123456789abcdefghijklmnopqrstuv?size=5",
+             "file://nfs/cache/kvmeta/a/b/0123456789abcdefghijklmnopqrstu?size=5",
+             "file://nfs/cache/kvmeta/a/b/0123456789abcdefghijklmnopqrstuv/extra?size=5",
+         }) {
+        SCOPED_TRACE(uri);
+        EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.ValidateKvMetaObjects({DataStorageUri(uri)}, sizes, buffers));
+    }
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaTairValidationRejectsMalformedOffsetsBeforeIo) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.variable_object_size_enabled_ = true;
+    sdk_wrapper.max_variable_object_bytes_ = 4096;
+
+    char bytes[5]{};
+    Iov iov;
+    iov.type = MemoryType::CPU;
+    iov.base = bytes;
+    iov.size = sizeof(bytes);
+    BlockBuffer buffer;
+    buffer.iovs.push_back(iov);
+    const BlockBuffers buffers{buffer};
+    const std::vector<std::uint64_t> sizes{sizeof(bytes)};
+
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+        SCOPED_TRACE(static_cast<int>(type));
+        sdk_wrapper.sdk_storage_types_["pace"] = type;
+        sdk_wrapper.sdk_storage_configs_["pace"] =
+            std::make_shared<StorageConfig>(type, "pace", std::make_shared<TairMemPoolStorageSpec>());
+        EXPECT_EQ(ER_OK,
+                  sdk_wrapper.ValidateKvMetaObjects(
+                      {DataStorageUri("pace://pace/0?media_type=0&node_id=0&range_id=0&size=5")}, sizes, buffers));
+        for (const std::string &uri : {
+                 "pace://pace?size=5",
+                 "pace://pace/?size=5",
+                 "pace://pace/-1?size=5",
+                 "pace://pace/+1?size=5",
+                 "pace://pace/not-a-number?size=5",
+                 "pace://pace/12trailing?size=5",
+                 "pace://pace/18446744073709551616?size=5",
+                 "pace://pace/0?node_id=&size=5",
+                 "pace://pace/0?node_id=-1&size=5",
+                 "pace://pace/0?node_id=65536&size=5",
+                 "pace://pace/0?media_type=1x&size=5",
+                 "pace://pace/0?range_id=+1&size=5",
+             }) {
+            SCOPED_TRACE(uri);
+            EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.ValidateKvMetaObjects({DataStorageUri(uri)}, sizes, buffers));
+        }
+    }
 }
 
 TEST_F(SdkWrapperTest, TestInitWithEmptyWrapperConfig) {
