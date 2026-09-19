@@ -122,7 +122,9 @@ Trim(instance) -> 按策略清理整个 KVMeta instance
   不授予 KVCM 创建/删除所有权，因此不能作为 EMB value storage；
 - 相同 instance/group、KVMeta schema 和 `user_data` 的重复注册幂等；
 - group、schema 或既有 instance 配置不一致时失败；
-- 成功响应的 `storage_configs` 是后续 transfer client 的权威 backend 配置。
+- 成功响应的 `storage_configs` 是后续 transfer client 的权威 backend 配置，并且只包含该 group 已校验的
+  `storage_candidates`；普通 KVCache 的 migration source/target 不属于 KVMeta 数据面，不会混入响应导致整个
+  exact-object client 初始化失败。
 
 ### 5.2 `GetInstanceInfo`
 
@@ -198,6 +200,12 @@ KVMeta admission/maintenance 并等待 leader recovery。无法定位的 allocat
 PACE V1 URI 只包含 opaque address，不回显本次 Create 的逻辑 object key。因此服务端会校验地址语法并检测同批、
 并发写入的物理地址复用，但最终仍依赖注册 PACE backend 保证 singleton Create 一一对应并返回 fresh exclusive
 allocation；不满足该契约的 backend 不能用于生产 EMB Cache。
+
+官方 client 对成功 `PutStart` 的响应做完整形状校验。响应畸形时，只有使用可寻址 session 和服务端确认的 item
+count 成功执行 `PutFinish(false)`，才会返回原始的 `INTERNAL_ERROR`/`SIZE_MISMATCH`；session id 缺失或超限、无法
+推导 cardinality、abort transport 失败、`OUTCOME_UNKNOWN` 或任何明确 abort 拒绝，都返回 mutation
+`OUTCOME_UNKNOWN`（transport 失败保留对应 ambiguous code）。因此 Python wrapper 会设置 `unknown_outcome=True`，
+调用方不能把一次可能仍持有 reservation 的 PutStart 当作干净拒绝直接重试。
 
 ### 5.5 `PutFinish`
 

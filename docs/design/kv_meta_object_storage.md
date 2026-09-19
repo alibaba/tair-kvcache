@@ -325,7 +325,9 @@ HA 节点必须保持时钟同步，并把可能的最大漂移计入写租约�
 
 `KvMetaObjectClient::Create` 首先通过 `KvMetaClient::RegisterInstance` 注册专用 instance，取得服务端权威
 `storage_configs`，再创建 exact-size transfer client。相同 instance/group/schema/user data 的注册幂等；身份或
-schema 不一致则失败。注册同时验证 group 已配置当前实现能够执行的 LRU 回收策略，并且每个
+schema 不一致则失败。返回配置严格等于已验证的 `storage_candidates`；固定 block KVCache 为迁移读写而附加的
+migration source/target 不属于 KVMeta 数据面，即使 group 同时配置这些 route，也不会把 EventReport 等非
+exact-object backend 交给 KVMeta SDK。注册同时验证 group 已配置当前实现能够执行的 LRU 回收策略，并且每个
 `storage_candidates` 都唯一、已注册且具备 exact-object ownership；storage spec 的动态类型必须与 backend type
 一致，文件型配置还必须能生成词法规范的绝对
 `kvmeta/<instance-hash>/<key-hash>/<32-byte nonce>` namespace（例如 NFS 拼接型 `root_path` 必须保留目录分隔符）。
@@ -372,6 +374,9 @@ sequenceDiagram
   行为的滚动升级版本；这不表示缺少 V1 新字段的原始 proto 实现可以混用；
 - 数据写入返回的实际 URI 必须与服务端给出的 URI 语义一致（允许 query 参数重排）；URI
   无法解析、参数重复或任一 canonical component 改变都会整批回滚；
+- 成功 `PutStart` 的响应若畸形，client 只有在 `PutFinish(false)` 明确成功后才把它分类为普通协议错误；session
+  不可寻址、cardinality 不可证明或 abort 未明确成功时统一保留为 unknown mutation outcome，Python 上层不会把
+  仍可能存活的 reservation 当作可盲重试的干净拒绝；
 - `PutFinish.success_keys` 与紧凑 `locations` 对齐。任一 `false` 会回滚本 session 的全部新对象；
 - commit/rollback 逐 key 执行并带失败补偿，不承诺多 key 同时可见；
 - reservation 已持久化、write session 尚未发布的窗口只使用一条 metadata-first 补偿路径。它覆盖首次
