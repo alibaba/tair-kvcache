@@ -104,6 +104,45 @@ public:
     // positive quarantine. Ordinary synchronous backends need no extension and
     // therefore keep the zero-grace behavior supplied by KVMeta's fallback.
     virtual std::int64_t GetFailedWriteCleanupGraceSeconds() const noexcept = 0;
+
+    // Backends whose safe KVMeta allocation protocol differs from their
+    // legacy fixed-block Create path opt in here. Keeping this on the side
+    // interface prevents EMB rollout requirements from changing ordinary
+    // KV-cache allocation behavior.
+    virtual bool HasDedicatedKvMetaCreate() const noexcept { return false; }
+    virtual std::vector<std::pair<ErrorCode, DataStorageUri>>
+    CreateForKvMeta(const std::vector<std::string> &keys,
+                    std::size_t size_per_key,
+                    const std::string &trace_id,
+                    std::function<void()> cb) {
+        (void)size_per_key;
+        (void)trace_id;
+        (void)cb;
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(
+            keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}});
+    }
+
+    // Some remote allocators return a provisional exact allocation first and
+    // reclaim it automatically unless KVCM acknowledges that its ownership
+    // metadata reached a persistence barrier.  This is deliberately a KVMeta
+    // side capability: ordinary fixed-block Create remains a one-phase API.
+    //
+    // `allocation_keys` are the same server-generated, globally unique keys
+    // passed to CreateForKvMeta. EC_OK means the backend durably accepted the
+    // commit (or had already accepted it). A lost response must therefore be
+    // safe to retry with the same keys.
+    virtual bool RequiresKvMetaCreateCommit() const noexcept { return false; }
+    // Upper bound used by the backend for one exact allocation/commit/delete
+    // control-plane request. A provisional backend must return a positive
+    // value; KVMeta rejects an unbounded value at instance registration so a
+    // stalled RPC cannot silently outlive the Provider allocation lease.
+    virtual std::int64_t GetKvMetaControlRequestTimeoutSeconds() const noexcept { return 0; }
+    virtual std::vector<ErrorCode>
+    CommitKvMetaCreate(const std::vector<std::string> &allocation_keys,
+                       const std::string &trace_id) {
+        (void)trace_id;
+        return std::vector<ErrorCode>(allocation_keys.size(), EC_UNIMPLEMENTED);
+    }
 };
 
 } // namespace kv_cache_manager

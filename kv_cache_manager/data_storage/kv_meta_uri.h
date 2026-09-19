@@ -19,6 +19,27 @@ namespace kv_cache_manager {
 inline constexpr std::size_t kMaxKvMetaLocationUriBytes = 64 * 1024;
 inline constexpr std::size_t kMaxKvMetaLocationUriQueryParams = 64;
 inline constexpr std::size_t kMaxKvMetaBackendNameBytes = 512;
+inline constexpr std::int64_t kKvMetaMaxWriteTimeoutSeconds = 1800;
+inline constexpr std::int64_t kKvMetaMaxFailedWriteCleanupGraceSeconds = 180;
+// Exact remote control calls are bounded separately from the caller's data-I/O
+// lease. StartWrite checks its deadline between singleton commits, so at most
+// one request can cross that boundary; exact rollback is then bounded by the
+// same per-request limit. The Provider's provisional lease must cover that
+// entire reconcile window. These constraints apply only to KVMeta-capable
+// backends and never change the fixed-block KV-cache path.
+inline constexpr std::int64_t kKvMetaMaxExactControlRpcTimeoutSeconds = 120;
+// One exact rollback performs at most two mutation attempts and two
+// authoritative queries after each attempt. Backends may finish earlier, but
+// must not add an unbounded retry loop behind the extension interface.
+inline constexpr std::int64_t kKvMetaMaxExactCleanupControlRequests = 6;
+inline constexpr std::uint64_t kKvMetaMinimumExactAllocationLeaseSeconds = 3600;
+static_assert(kKvMetaMinimumExactAllocationLeaseSeconds >
+              static_cast<std::uint64_t>(kKvMetaMaxWriteTimeoutSeconds +
+                                         kKvMetaMaxFailedWriteCleanupGraceSeconds));
+static_assert(kKvMetaMinimumExactAllocationLeaseSeconds >
+              static_cast<std::uint64_t>(kKvMetaMaxWriteTimeoutSeconds +
+                                         kKvMetaMaxExactControlRpcTimeoutSeconds *
+                                             (1 + kKvMetaMaxExactCleanupControlRequests)));
 inline constexpr std::size_t kKvMetaObjectNonceBytes = 32;
 
 // The authority is an internal DataStorageManager key, not an arbitrary DNS
@@ -274,6 +295,60 @@ inline bool HasExactTairMempoolAddress(const DataStorageUri &uri) {
            HasExactOptionalTairMempoolUint16Param(uri, "range_id");
 }
 
+inline bool HasCanonicalTairMempoolProviderIncarnation(const DataStorageUri &uri) {
+    if (!uri.HasParam("provider_incarnation")) {
+        return false;
+    }
+    const std::string value = uri.GetParam("provider_incarnation");
+    if (value.size() != 36) {
+        return false;
+    }
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (value[i] != '-') return false;
+        } else if (!((value[i] >= '0' && value[i] <= '9') ||
+                     (value[i] >= 'a' && value[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Stable Provider identity is serialized as an unescaped URI query value and
+// is also used as a MetaService cache key. Keep one narrow canonical alphabet
+// across KVCM, MetaService and Provider so percent-decoding, whitespace or
+// delimiter handling cannot make the same route compare differently.
+inline bool IsCanonicalTairMempoolProviderUuid(std::string_view value) noexcept {
+    if (value.empty() || value.size() >= 64) {
+        return false;
+    }
+    return std::all_of(value.begin(), value.end(), [](char ch) {
+        const auto byte = static_cast<unsigned char>(ch);
+        return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+               (byte >= '0' && byte <= '9') || ch == '-' || ch == '_' || ch == '.';
+    });
+}
+
+// New exact-allocation responses persist the Provider's stable routing id so
+// MetaService can route a live durable owner after a numeric node-id change.
+// The UUID is never deletion authority when owner/proof state is missing. The
+// field remains optional only for rolling-upgrade compatibility with already
+// persisted URIs whose durable owner still supplies the route identity.
+inline bool HasSafeOptionalTairMempoolProviderUuid(const DataStorageUri &uri) {
+    if (!uri.HasParam("provider_uuid")) {
+        return true;
+    }
+    return IsCanonicalTairMempoolProviderUuid(uri.GetParam("provider_uuid"));
+}
+
+// The allocation token is the per-object generation capability. Provider GA
+// values may be reused within one process for explicit/local DRAM, so node,
+// offset and process incarnation alone are insufficient to authorize GC.
+inline bool HasCanonicalTairMempoolAllocationToken(const DataStorageUri &uri) {
+    return uri.HasParam("allocation_token") &&
+           HasCanonicalKvMetaObjectKey(uri.GetParam("allocation_token"));
+}
+
 // Validate the backend fields that make one URI an independently deletable
 // KVMeta allocation. Keep this rule in the data-storage layer so the manager,
 // service serializer, and exact-size SDK cannot drift to different ownership
@@ -285,7 +360,9 @@ inline bool HasOwnedKvMetaAllocationShape(const DataStorageUri &uri, DataStorage
         return uri.HasParam("key") && HasCanonicalKvMetaObjectKey(uri.GetParam("key"));
     }
     if (IsTairMempoolStorageType(storage_type)) {
-        return HasExactTairMempoolAddress(uri);
+        return HasExactTairMempoolAddress(uri) && HasCanonicalTairMempoolProviderIncarnation(uri) &&
+               HasSafeOptionalTairMempoolProviderUuid(uri) &&
+               HasCanonicalTairMempoolAllocationToken(uri);
     }
     switch (storage_type) {
     case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
@@ -429,7 +506,10 @@ inline bool HasSafeConfiguredKvMetaNamespace(const StorageConfig &config,
         sample.SetProtocol(kTairMempoolUriScheme);
         sample.SetPath("/" + max_uint64);
         sample.SetParam("node_id", std::to_string(std::numeric_limits<std::uint16_t>::max()));
+        sample.SetParam("provider_uuid", "ffffffff-ffff-4fff-bfff-ffffffffffff");
         sample.SetParam("media_type", std::to_string(spec->media_type()));
+        sample.SetParam("allocation_token", object_key);
+        sample.SetParam("provider_incarnation", "ffffffff-ffff-4fff-bfff-ffffffffffff");
         sample.SetParam("range_id", std::to_string(std::numeric_limits<std::uint16_t>::max()));
         break;
     }
@@ -485,7 +565,7 @@ inline bool HasSafeConfiguredKvMetaNamespace(const StorageConfig &config,
         return parsed.GetPath() == "/" && parsed.GetParam("key") == object_key;
     }
     if (IsTairMempoolStorageType(config.type())) {
-        return HasExactTairMempoolAddress(parsed);
+        return HasOwnedKvMetaAllocationShape(parsed, config.type());
     }
     return HasOwnedKvMetaFilePath(parsed);
 }

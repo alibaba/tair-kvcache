@@ -227,6 +227,77 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
     return create_result;
 }
 
+std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::CreateForKvMeta(
+    RequestContext *request_context,
+    const std::string &unique_name,
+    const std::vector<std::string> &keys,
+    size_t size_per_key,
+    std::function<void()> cb) {
+    SPAN_TRACER(request_context);
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    const std::string &trace_id = request_context->trace_id();
+    const auto iter = storage_map_.find(unique_name);
+    if (iter == storage_map_.end()) {
+        KVCM_LOG_WARN("Storage name: %s not exist", unique_name.c_str());
+        return {};
+    }
+    const auto &storage_backend = iter->second;
+    if (storage_backend == nullptr || !storage_backend->Available()) {
+        KVCM_LOG_WARN("Storage name: %s is unavailable, reject KVMeta create", unique_name.c_str());
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOENT, DataStorageUri{}});
+    }
+    const auto dsmc = storage_backend->GetMetricsCollector();
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);
+    auto extension = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(storage_backend);
+    std::vector<std::pair<ErrorCode, DataStorageUri>> create_result;
+    if (extension && extension->HasDedicatedKvMetaCreate()) {
+        create_result = extension->CreateForKvMeta(keys, size_per_key, trace_id, std::move(cb));
+    } else {
+        create_result = storage_backend->Create(keys, size_per_key, trace_id, std::move(cb));
+    }
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(dsmc, DataStorageCreate);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(dsmc, data_storage, create_keys_qps, keys.size());
+    if (request_context) {
+        request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(dsmc);
+    }
+    std::for_each(create_result.begin(), create_result.end(), [&unique_name](auto &pair) {
+        if (pair.first == EC_OK) {
+            pair.second.SetHostName(unique_name);
+        }
+    });
+    return create_result;
+}
+
+std::vector<ErrorCode> DataStorageManager::CommitKvMetaCreate(
+    RequestContext *request_context,
+    const std::string &unique_name,
+    const std::vector<std::string> &allocation_keys) {
+    SPAN_TRACER(request_context);
+    if (allocation_keys.empty()) {
+        return {};
+    }
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    const auto iter = storage_map_.find(unique_name);
+    if (iter == storage_map_.end() || !iter->second || !iter->second->Available()) {
+        KVCM_LOG_WARN("Storage name: %s is unavailable, reject KVMeta allocation commit", unique_name.c_str());
+        return std::vector<ErrorCode>(allocation_keys.size(), EC_NOENT);
+    }
+    const auto extension = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(iter->second);
+    if (!extension || !extension->RequiresKvMetaCreateCommit()) {
+        KVCM_LOG_WARN("Storage name: %s does not implement the advertised KVMeta allocation commit", unique_name.c_str());
+        return std::vector<ErrorCode>(allocation_keys.size(), EC_UNIMPLEMENTED);
+    }
+    try {
+        return extension->CommitKvMetaCreate(allocation_keys, request_context->trace_id());
+    } catch (const std::exception &) {
+        KVCM_LOG_WARN("Storage name: %s threw while committing KVMeta allocations", unique_name.c_str());
+    } catch (...) {
+        KVCM_LOG_WARN("Storage name: %s threw an unknown exception while committing KVMeta allocations",
+                      unique_name.c_str());
+    }
+    return std::vector<ErrorCode>(allocation_keys.size(), EC_IO_ERROR);
+}
+
 std::vector<ErrorCode> DataStorageManager::Delete(RequestContext *request_context,
                                                   const std::string &unique_name,
                                                   const std::vector<DataStorageUri> &storage_uris,

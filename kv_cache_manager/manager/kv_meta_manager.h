@@ -43,12 +43,12 @@ public:
         std::size_t max_active_write_sessions = 4096;
         std::uint64_t max_value_bytes = 1ULL * 1024 * 1024 * 1024;
         std::uint64_t max_batch_bytes = 4ULL * 1024 * 1024 * 1024;
-        std::int64_t max_write_timeout_seconds = 1800;
+        std::int64_t max_write_timeout_seconds = kKvMetaMaxWriteTimeoutSeconds;
         // Upper bound accepted from a backend that must quarantine a failed
         // remote write before releasing its reusable allocation. This is
         // server-side safety time and does not extend the client's commit
         // deadline. The default covers PACE's 180-second quarantine contract.
-        std::int64_t max_failed_write_cleanup_grace_seconds = 180;
+        std::int64_t max_failed_write_cleanup_grace_seconds = kKvMetaMaxFailedWriteCleanupGraceSeconds;
     };
 
     struct ValueLocation {
@@ -133,9 +133,10 @@ private:
     struct SessionItem;
     struct ExactLocation;
     struct DeleteItemsOptions {
-        // Physical deletion is authorized only by an exact conditional
-        // metadata delete performed by this call. An already-absent record is
-        // never sufficient ownership proof for a reusable backend address.
+        // Physical deletion is authorized only after this call conditionally
+        // replaces the exact owner with a durable generation-bearing
+        // tombstone. An already-absent record is never sufficient ownership
+        // proof for a reusable backend address.
         bool delete_physical = true;
         bool adjust_storage_usage = true;
         bool maintenance_no_touch = false;

@@ -50,7 +50,7 @@ ledger 解决安全重试。这样既能降低 singleton 调用放大，也不�
 
 | 层次 | 状态 | 能力与边界 |
 |---|---|---|
-| V1 | 当前代码已实现 | exact-size、singleton allocation、写租约与失败写 quarantine、周期水位 + 按需准入 LRU Reclaimer、metadata-first exact-delete/absence confirmation、HA 恢复 |
+| V1 | 当前代码已实现 | exact-size、singleton allocation、写租约与失败写 quarantine、周期水位 + 按需准入 LRU Reclaimer、所有物理清理路径统一使用 durable tombstone → exact physical absence → metadata finalization、HA 恢复 |
 | V1.1 | 建议下一阶段，尚未实现 | KVMeta 独立 QoS、持久化 orphan ledger/审计和更多 backend capability；不改变协议语义 |
 | V2 | 目标设计，尚未实现 | generation/fencing、幂等 operation、持久化 ledger、可续约读写 lease、异构批量和 object set |
 
@@ -461,19 +461,23 @@ sequenceDiagram
   仍可能存活的 reservation 当作可盲重试的干净拒绝；
 - `PutFinish.success_keys` 与紧凑 `locations` 对齐。任一 `false` 会回滚本 session 的全部新对象；
 - commit/rollback 逐 key 执行并带失败补偿，不承诺多 key 同时可见；
-- reservation 已持久化、write session 尚未发布的窗口只使用一条 metadata-first 补偿路径。它覆盖首次
-  `Sync` 失败、location 转换失败，以及 `Availability()` 通过后又与其他 group 竞争导致 session 最终发布失败。
-  只有补偿删除已持久化证明 metadata absent，才能返回原始的 timeout/`NOSPC`/not-leader；无法证明时返回
-  `OUTCOME_UNKNOWN` 并只关闭 KVMeta admission/maintenance，交由 leader recovery 对账。显式 abort、session expiry
-  和 partial commit 补偿遵循同一 ownership 规则：在持久化当前视图前不推断 allocation 已无引用，metadata absence
-  无法证明时不创建下一代。固定 block KVCache 主链路不读取该 gate；
+- reservation 已持久化、write session 尚未发布的窗口也使用统一的 cleanup WAL：先把完整 exact owner 条件转换为
+  读不可见、仍计费的 tombstone 并 `Sync`，再证明对应 generation 物理 absent，最后删除 tombstone 并 `Sync`。
+  它覆盖首次 `Sync` 失败、location 转换失败，以及 `Availability()` 通过后又与其他 group 竞争导致 session 最终发布
+  失败。任一步无法证明时返回 `OUTCOME_UNKNOWN`，保留仍可恢复的 owner/tombstone，且只关闭 KVMeta
+  admission/maintenance，交由 leader recovery 对账。显式 abort、session expiry 和 partial commit 补偿遵循同一
+  ownership 规则；在持久化 cleanup ledger 前不推断 allocation 已无引用，也不创建下一代。固定 block KVCache 主链路
+  不读取该 gate；
 - metadata JSON 的 exact match 才授予本请求条件删除权。若 reload 得到一个不属于本请求、但指向相同物理 URI 的
   owner，服务端既不删除该 metadata，也不释放该 URI，而是 fail closed 交给 recovery；物理地址相同不能替代
   generation/owner identity；
-- 只有本次 exact compare-and-delete 成功且 `Sync` 完成，才授予随后的物理 Delete。条件删除返回 absent 不是
-  幂等成功：另一个 actor 可能已释放旧地址并让 backend 把它复用于 successor，因此旧 URI 保留为 orphan，KVMeta
-  gate 关闭并由 recovery 重建 ownership/usage。Reclaimer 的 metadata retry 是唯一预期的 absent：它持有进程内
-  pending fence、阻止 successor，并且仍只在持久化 absent 后进入自己的一次性物理删除阶段。
+- 对显式 Remove/Trim、session rollback/expiry 和写入补偿，只有本次 exact compare-and-replace 成功并把 tombstone
+  `Sync` 持久化，才授予随后的物理 Delete。owner 缺失或不匹配不是删除授权：另一个 actor 可能已经完成或替换
+  ownership，因此旧 URI 不进入物理 Delete，KVMeta gate 关闭并由 recovery 重建 ownership/usage。
+- 自动 Reclaimer 不使用 metadata absence 授予删除权：持久化 `CLS_DELETING` tombstone 本身就是 immutable allocation
+  ledger。它先等待 reader grace，再以 tombstone 中的 exact generation 反复证明物理 absence，最后才条件删除
+  metadata。metadata finalization 重试中的 absent 只有在同一 pending batch 已记录“本次 compare-and-delete 已应用”
+  时才是预期结果；否则按 owner 协议损坏 fail closed。
 
 ### 6.3 读取
 
@@ -517,12 +521,16 @@ KVMeta 是 Cache，独立 `KvMetaReclaimer` 是容量准入闭环的必需组件
 的 `reclaim_strategy.trigger_strategy.used_percentage`、`delay_before_delete_ms` 以及现有 CacheReclaimer 的
 sampling/batch/idle 参数，但不把 KVMeta 对象塞进固定 block Reclaimer。
 
-回收有两个触发源：
+回收有三个触发源：
 
 1. **周期水位压力**：让 group bytes、各 storage type bytes 和聚合 key count 回落到阈值；
 2. **准入需求压力**：`PutStart` 因已有 cache 占用而返回 `NOSPC` 时，记录这个具体请求所需的 group bytes、目标
    storage type bytes 或目标 instance metadata keys，并立即唤醒 worker。它解决 `used < watermark`、但
-   `used + request > hard capacity` 时单纯 `Wake()` 永远无对象可回收的问题。
+   `used + request > hard capacity` 时单纯 `Wake()` 永远无对象可回收的问题；
+3. **后端物理压力**：仅当 exact singleton Create 在未产生 URI 的前提下权威返回 `EC_NOSPC`
+   时，按 storage type 记录本次 object bytes。它用于 KVCM 逻辑 quota 尚有余量、但共享 Provider
+   已满的情况。超时、返回 URI 的失败、错误请求、无可靠路由或未知 allocation outcome 都不得
+   以“回收可能有用”为由驱逐有效 Cache。
 
 对 byte 维度，设硬容量为 `C`、扣除已退休 pending credit 后的有效用量为 `Ueff`、水位为 `T`、被拒请求为 `R`：
 
@@ -560,18 +568,26 @@ group 和 storage type 分别计算；metadata key 准入按**目标 instance**�
    `metadata_durable=false` 进入 pending，并在 finalization 前重试该 barrier；
 6. 把对象连同同一个时间锚点放入按 deadline 排序的 pending queue。worker 不会 sleep 等待某个 group 的 grace，
    因此其他 group 可以继续回收；
-7. grace 到期后，再次完成 metadata persistence barrier，精确删除 retired metadata 并 `Sync`，最后只发起一次
-   物理 Delete。物理结果不确定时不重放，记录 orphan 指标并关闭全局 KVMeta admission/reclaim，避免继续制造
-   不可达 allocation；backend/namespace 对账并完成 recovery 后才能重新开放。
+7. grace 到期后，再次完成 tombstone persistence barrier，然后在不持有 group quota shard 的情况下调用 backend
+   exact-cleanup。每个 URI 都携带不可复用的 allocation generation（PACE 为 provider incarnation + GA + allocation token），因此超时、
+   短响应、部分成功和 provider 异常都保留 tombstone，并按 100ms 到 30s 的指数退避安全重试；已经删除的前缀以
+   absence 作为幂等成功。慢物理 I/O 不阻塞同 group 的其他 instance，当前 key 则继续由 tombstone 和 pending index
+   拒绝复用；
+8. backend 明确证明整批物理对象都不存在后，重新取得 quota shard，以 tombstone 完整旧值做 compare-and-delete，
+   `Sync` 成功后才释放逻辑 quota 和 pending credit。metadata barrier 失败会保留本批已取得的物理 absence 证据，
+   关闭该 KVMeta group 的新 admission 并重试 metadata-only 步骤，不重复调用 backend。
 
-完整状态链是 `committed -> retired(读不可见、仍计账) -> grace -> metadata deleted/quota released -> physical
-Delete attempted`。metadata GC 与物理 GC 是两个阶段；只看到逻辑 usage 下降，不能推导 backend 空间已经释放。
+完整状态链是 `committed -> retired tombstone(读不可见、仍计账) -> grace -> physical absence confirmed -> metadata
+deleted + Sync -> quota released`。tombstone 是 cleanup WAL，而不是可提前丢弃的普通索引：进程退出或换主后 recovery
+会重新发现它，先重放 generation-aware exact Delete，再删除 metadata。这样 crash 只能延迟释放，不能留下没有 owner
+记录的物理 orphan，也不会把逻辑余量提前出售。
 
-metadata delete 已进入内存但 `Sync` 失败时，Reclaimer 会先封闭该 KVMeta group 的新 `PutStart`，再按 100ms 到
-30s 的指数退避重试；这样不会让新一代对象进入“旧 metadata 已消失、旧物理删除尚未安全完成”的 ABA 窗口。现有
-write session 可以继续 finalization。重试中的 `EC_NOENT` 只有在同一 pending batch 先前已取得 exact-delete 成功证据
-时才成立；没有该证据的缺失，或 stable location id 下出现 replacement owner，都会关闭 KVMeta maintenance，且不
-发起物理 Delete。进程内 pending 上限为 1024 个 batch、20000 个对象和 4TiB；每轮选择同时按
+metadata delete 已进入内存但 `Sync` 失败时，Reclaimer 会先封闭该 KVMeta group 的新 `PutStart`，再按相同退避重试；
+现有 write session 可以继续 finalization。重试中的 `EC_NOENT` 只有在同一 pending batch 先前已取得本次 metadata
+compare-and-delete 已应用的证据时才成立；没有该证据的缺失，或 stable location id 下出现 replacement owner，都会
+关闭 KVMeta maintenance。物理删除发生在该校验之前，但它只针对 tombstone 中的不可复用 allocation generation，
+不会命中新 owner；异常 owner 仍意味着 metadata/accounting 协议已损坏，必须 fail closed。进程内 pending 上限为
+1024 个 batch、20000 个对象和 4TiB；每轮选择同时按
 剩余 batch、对象数和 bytes 裁剪，单个候选或完整 key 放不下时跳过并继续寻找可容纳对象，避免同一超限向量永久
 阻塞回收。所有剩余额度仍会在持有 group shard 时再次校验；真正达到上限只暂停新的退休，不影响普通 KVCache
 主链路。
@@ -614,9 +630,12 @@ KVMeta capability adapter 允许支持方一次接收不同 size，同时让不�
 - PACE 的 `node_id`、`media_type`、`range_id` 为兼容旧 URI 可以缺失并按 0 解析；一旦出现就必须是完整、不带
   符号且不溢出的 `uint16`。其中 `media_type` 还必须与注册 backend 的 `TairMemPoolStorageSpec.media_type` 精确
   相等：缺失字段只允许匹配 media 0，不能把默认 0 的旧 URI 路由到 DRAM(2) 或 SSD(5) pool；
-- PACE V1 URI 只携带 opaque address，不回显传给 Create 的逻辑 object key，因此 URI 本身不能证明“本次调用创建”。
-  服务端只能依赖 singleton 调用/响应严格一一对应、注册 backend 的 allocator 独占契约，并检测同批及并发写入的
-  物理地址复用；无法保证每次 Create 返回 fresh exclusive allocation 的 PACE backend 不得上线；
+- PACE exact URI 不依赖数值 GA 单独证明 owner；它必须回显 KVCM 本次生成的 canonical
+  `allocation_token`、Provider process incarnation、stable `provider_uuid` 和 node/media/range，并与 singleton
+  请求/响应一一对应。GA 可以复用，但整个 generation identity 不能复用；缺少 token/incarnation 的 legacy URI
+  不获得 KVMeta Delete 授权。`provider_uuid` 对新 exact allocation 强制存在，仅为滚动升级期间已持久的旧 URI
+  保留 optional 解析。UUID 只能在 node id 改变时找回 Provider，不是删除 capability；任何 URI 的 durable Meta
+  owner/retirement proof 都丢失时必须 fail closed，不会用 UUID + GA 猜测 generation；
 - file/HF3FS/VCNS-HF3FS/Dummy 的 path 必须是词法规范的绝对、非根对象路径；空 path、`/`、空 segment、
   `.`/`..` segment 和尾随 `/` 永远不能被解释成 singleton allocation，更不能进入 Delete；
 - 可打包文件型 backend 的 `blkid` 缺失或严格解析为 `0`，不允许独立 transfer 调用方伪造共享 allocation 偏移；
@@ -673,9 +692,10 @@ metadata reservation 使用完整旧值条件保护。跨进程 `PutStart` 竞�
 ### 8.2 Remove/新一代写入的 ABA 防护
 
 对 committed 对象，`Remove` 从条件删除 metadata、持久化到物理删除结束一直持有同一 group admission shard。
-Reclaimer finalization 也在该 shard 下完成 metadata delete 和本次物理 Delete 调用。下一代同 key `PutStart` 只能在
-Delete 调用返回后进入；当 backend 保证“返回即终态（成功已删除，失败已取消且以后不会继续执行）”时，这能阻止旧
-Delete 与新 allocation 重叠。
+下一代同 key `PutStart` 只能在 Delete 调用返回后进入；当 backend 保证“返回即终态（成功已删除，失败已取消且以后
+不会继续执行）”时，这能阻止旧 Delete 与新 allocation 重叠。Reclaimer 的路径不同：durable tombstone 与 pending
+location 已经拒绝同 key successor，物理 exact Delete 在 shard 外执行，避免慢 backend I/O 阻塞同 group 的其他 key；
+确认物理 absence 后才重新取得 shard，校验并持久化删除 tombstone，然后释放 quota。
 
 必须明确，这把进程内锁不能给 provider 内部仍在运行的超时请求加 fencing。如果 Delete 返回 timeout/抛异常后仍
 可能晚到完成，释放 shard 后的新对象又可能复用同一地址，第一次 Delete 本身仍会误伤后继 generation；“V1 不自动
@@ -692,6 +712,18 @@ shard，因此重新检查水位、退休 metadata 和建立 pending/Trim marker
 普通 KVCache 不获取该锁。候选采样和 Trim 长扫描/物理 I/O 都在锁外执行，Reclaimer 进入锁后会
 重新读取实际 usage、检查 Trim marker，并用 exact-value CAS 防止淘汰已变化的对象。
 
+这里的“实际 usage”特指 **KVMeta 逻辑归属用量**：MetaIndexer 对 active、committed、retired record 的
+`size` 求和，是 group/type quota、Reclaimer 水位和 `PutStart` 准入的唯一账本。active 失败写在 backend
+quarantine 到期前、retired 对象在 metadata finalization 前都继续计账；pending credit 只是 Reclaimer 的调度去重，
+既不修改该账本，也不能提前给 writer 腾出配额。只有一次无错误、无删除副作用的稳定 recovery scan 才能从
+committed record 重建精确逻辑用量。
+
+PACE provider 的 `used_bytes/total_bytes` 是另一张 **后端物理用量** 账：它还可能包含其他 workload、allocator
+碎片及 metadata 已删除但 Delete 未确认的 orphan。物理用量不能代替 per-group 逻辑 quota，否则共享 pool 的一个
+租户会错误驱逐另一个租户；逻辑用量也不能证明底层空间已释放。当前 V1 由 provider allocator/hard capacity
+负责物理兜底，运维必须同时监控两张账。exact Delete 不确定时两张账可能永久分叉，KVCM 立即关闭 KVMeta
+admission/maintenance，不能继续依赖逻辑余量写入；完成 namespace/orphan 对账并成功 recovery 后才重新开放。
+
 退休对象在物理删除前仍计入 MetaIndexer usage；Reclaimer 单独维护 pending credit，只用于判断下一轮还需淘汰多少，
 不会改变 `PutStart` 的硬容量准入。若 metadata finalization 的 Sync 失败且内存记录已经消失，整个专用 group 的新
 allocation 会暂时 fail closed，直至 persistence barrier 成功或 leader recovery 接管。
@@ -705,7 +737,42 @@ sequence 防止较旧的 worker snapshot 清除并发产生的新需求；达到
 让一次退休尽量同时解决多个约束。该顺序会在容量正确性要求下偏离纯全局 LRU，但仍在每个候选集合内部选择最老
 对象；相比为了形式上的全局 LRU 淘汰更多有效 Cache，这是更符合准入目标的策略。
 
-### 8.4 固定上限
+后端物理压力不使用 `U + R - C` 推导，因为 KVCM 不拥有共享 Provider 的全量租户账本。它只维护
+“这次需要证明释放多少本 group/type 对象”的 demand。已退休、正在 grace/Delete 中的 type bytes 充当在途
+credit，防止请求重试反复选新对象；但 demand 只在 backend exact Delete 明确证明物理 absence 后扣减。
+metadata 删除或逻辑 usage 下降都不能替代这个证明。若按 value bytes 估算的一轮释放仍不足以覆盖
+SSD slot/fragment footprint，下一次权威 `EC_NOSPC` 会发布新 demand；不会猜测或伪造 Provider free bytes。
+
+### 8.4 KVCM 与 Provider 的容量账本
+
+容量判断不能依赖一个 `used_bytes`。当前链路维护三类互相校验、但职责不同的账本：
+
+| 账本 | 来源与口径 | 用途 | 何时核销 |
+|---|---|---|---|
+| KVCM 逻辑用量 | MetaIndexer 中 active、committed、retired tombstone 的 `size`；按 instance group 和 storage type 聚合 | 租户/group 硬配额、LRU 水位、`PutStart` 准入 | exact physical absence 和最终 metadata `Sync` 都成功以后 |
+| Provider 已物化用量 | DRAM segment allocator 的实际 used bytes；SSD backend/segment 的物理 footprint | Provider 选址、介质硬水位和最终 OOM 防线 | 对应 allocator/backend 确认释放以后 |
+| Provider pending reservation | 已登记但未物化的 lazy GA，加上其创建临界区内的预留；按逻辑 bytes 计 | 防止并发 lazy allocation 都读取同一旧快照而超卖 DRAM/SSD | 物化成功时转入实际 used，或 allocation/GC 失败回滚时 |
+
+Provider 上报给 MetaService 的 DRAM 口径是饱和加法
+`reported_used = materialized_dram_used + reserved_pending_bytes`，溢出时取 `UINT64_MAX` 而不是回卷。SSD 用量来自
+backend 的实际统计；本地 slot backend 按 `ceil(value_size / slot_size) * slot_size` 计费，key-addressable backend
+按其 `Footprint()`/实际统计计费。进程重启时先扫描持久化 SSD identity：已知对象 footprint 与 backend reported
+usage 取较大者，无法归属的差额作为 conservative baseline 保留，不能在重启后凭空变成 free capacity。
+
+transparent tiering 的 Provider 最终准入使用和 MetaService 相同的水位百分比 `T`。设新对象逻辑长度为 `S`，SSD
+footprint 为 `F`：若 `dram_used + reserved + S <= T * dram_total`，对象可在 DRAM 水位内进入；否则把超出 DRAM
+水位的逻辑量按 `F/S` 折算成 SSD footprint，并要求 `ssd_used + ssd_need <= T * ssd_total`。计算使用 128-bit 定点数，
+避免大容量乘法溢出。lazy 路径通过 CAS 在同一个 `reserved_pending_bytes` 上完成“复查水位 + 计费”，因此 32 个
+并发请求不能都从同一个旧 reservation 快照获得承诺。MetaService 的节点选择只是保守预筛；Provider 本地水位和
+allocator/backend 的原子硬容量检查才是最终授权，过期状态最多造成拒绝或换节点，不能造成物理越界。
+
+这三张账不能互相替代。KVCM 逻辑用量按租户归属，不包含 allocator 碎片和其他 workload；Provider 物理用量无法
+判断应该淘汰哪个 KVMeta group；pending reservation 只是短期/未物化承诺，也不是可回收对象列表。线上必须同时
+监控 KVCM logical usage、Reclaimer pending/uncertain bytes、Provider DRAM/SSD used 和 reservation。逻辑用量下降而
+物理用量不下降说明 backend GC/orphan 收敛失败；Provider 用量增长而 KVCM 用量不增长说明存在其他 workload、
+unattributed recovery baseline 或 ownership 泄漏，不能通过调低 KVCM usage 掩盖。
+
+### 8.5 固定上限
 
 以下是生产默认 `KvMetaManager::Limits`，客户端以相同或更严格的值预校验：
 
@@ -761,18 +828,20 @@ I/O 有硬 deadline/cancellation，或声明足以覆盖经过验证最坏迟到
 预算内。这会在初始化阶段拒绝类似“RTP 设 800ms，但 PACE 仍按 10s 同步”的伪 deadline。服务端 TairMempool
 adapter 另声明 180 秒 failed-write quarantine：任一失败 mask 不立即删除，而是原样保留 active metadata、byte usage
 和 allocation；重复失败 Finish 幂等，之后的成功 Finish 被拒绝，expiry/recovery 只在 commit deadline + 180 秒后
-清理。该值必须不小于线上 PACE 可能迟到的 remote RDMA/Commit 上界；修改 PACE quarantine/hardware timeout 时必须
-同步审计该常量，不能只改 client 环境变量。
+清理。variable-size client 会在初始化时要求实际 `TAIR_MEMPOOL_QUARANTINE_TTL_MS` 为正且不超过 180000；这样
+client buffer quarantine 不会长于服务端地址 quarantine。该值仍必须不小于线上 PACE 可能迟到的 remote
+RDMA/Commit 上界；修改 PACE quarantine/hardware timeout 时必须同步升级两侧协议常量并完成故障注入，不能只改
+client 环境变量。该检查只在 KVMeta variable-size 模式启用，不改变 fixed-block client 的既有策略。
 
 对无需 quarantine 的同步 backend，显式失败回滚仍立即执行；对声明 quarantine 的 backend，失败 Finish 只原子地
 把内存 session 标记 aborted，持久化 active owner 本身就是跨 crash 的隔离记录，直到安全 deadline 才由 expiry 或
-下一任 leader 清理。真正清理时始终先完成 exact-value metadata 删除及 `Sync`，然后只尝试一次物理 Delete。expiry worker 会把
-provider 的标准/未知异常收敛为脱敏告警，不让可选 KVMeta 侧路异常终止进程；一旦物理结果不确定，它会关闭
-session admission/expiry worker 和 Reclaimer。关闭前已经发布的 session 仍可由 client 显式 `PutFinish`，其余 active
-metadata 留给下一次 recovery，不会在故障 backend 上继续批量清理。物理删除失败后不进入进程内重试队列，因为
-现有可复用地址型 URI 没有 allocation generation；不确定结果若被重放，可能删除已经复用同一地址的后继对象。
-条件删除意外返回 absent 时也不发出第一次物理 Delete，因为地址可能已经由外部 actor 释放并复用。这里选择可运维
-回收的 orphan，而不是数据破坏。
+下一任 leader 清理。真正清理时统一执行：exact owner 条件替换为 tombstone、`Sync`、exact physical absence proof、
+条件删除 tombstone、最终 `Sync`。expiry worker 会把 provider 的标准/未知异常收敛为脱敏告警，不让可选 KVMeta
+侧路异常终止进程；一旦物理结果不确定，它保留 tombstone 和 usage，关闭 session admission/expiry worker 与
+Reclaimer。关闭前已经发布的 session 仍可由 client 显式 `PutFinish`，其余 active/tombstone 留给下一次 recovery，
+不会在缺失持久化 ledger 的情况下猜测重放。owner 条件更新意外返回 absent/mismatch 时也不发出第一次物理 Delete，
+因为地址可能已经由外部 actor 完成或复用。若进程在任一阶段退出，下一任 leader 都从 active/tombstone record 恢复
+同一 generation 的清理；crash 只延迟释放，不能制造无 ledger orphan。
 
 独立的 `KvMetaServiceGRpc` adapter 还在每个 handler 最外层覆盖 request-context 创建和 service implementation 调用。
 标准或未知异常都被截断为不含 provider 文本、key 或 endpoint 的固定错误，并返回非 OK gRPC `INTERNAL`；response
@@ -811,14 +880,16 @@ KVMeta recovery 只扫描带完整 KVMeta schema 的保留 namespace，并执行
 1. 分批扫描 metadata；
 2. 对未到期 active lease 保持请求门关闭并等待，等待可被降主/Stop 以不超过 100ms 粒度取消；
 3. 对未到期 retired metadata 等待其持久化 grace deadline；两阶段 retirement 遗留的远期过渡 marker 按
-   recovery force deadline 保守等待；到期后完成 metadata-first 删除；
-4. 对已过期、归属可确认的 active/retired metadata 做条件删除并持久化，再对 allocation 做一次物理清理；条件删除
-   意外发现 owner 已不存在或已变化时 recovery 失败并保持 gate 关闭，不使用旧 URI 清理；
-5. metadata 阶段失败保持 KVMeta 请求门关闭；任一物理清理失败立即终止整个 KVMeta recovery，返回
-   `OUTCOME_UNKNOWN`、保留保守 usage、保持请求门关闭且不重放不确定 Delete，避免继续遍历其他 instance 并放大
-   orphan。运维完成 backend/orphan 对账后再次执行 recovery，稳定扫描才重建精确 usage；
-6. 完成一个无 metadata 删除、无 metadata 错误的稳定扫描后，按 committed URI 的真实 `size` 重建 KVMeta
-   byte usage；
+   recovery force deadline 保守等待；恢复期间请求门始终关闭，因此未到期对象不会被新写复用；
+4. 对已过期、归属可确认的 active/retired record，把现存 metadata 当作 durable cleanup ledger，先以其中不可复用的
+   allocation identity 执行 exact Delete 并证明物理 absence，再以完整旧值条件删除 metadata 并 `Sync`；不能证明
+   absence 时保留 record，后续 recovery 可安全重试同一 generation，不会提前释放 quota；
+5. metadata 删除、owner 校验或 persistence barrier 失败时保持 KVMeta 请求门关闭。普通 exact-cleanup 错误可继续扫描
+   其他 ledger，但本轮 recovery 最终失败且不发布 usage；若 backend 返回 `OUTCOME_UNKNOWN`，则立即停止继续清理，
+   避免在已无法判定终态的 namespace 扩大风险。任何失败后，旧 counter 只能用于诊断；新的 leader/recovery 必须从
+   persistent metadata 重新取得 ledger；
+6. 只有完成一个无删除、无 defer、无 metadata 错误的稳定扫描，才按 committed URI 的真实 `size` 重建 KVMeta
+   byte usage；active/retired record 在收敛前均不会转化为可售 quota；
 7. 启动 session expiry 和 Reclaimer worker，最后开放 KVMeta 请求门。
 
 一次 recovery 从升主开始最多按 `max_write_timeout_seconds + max_failed_write_cleanup_grace_seconds` 等待 active
@@ -853,8 +924,8 @@ Instance Group quota 和 storage backend 配置。部署必须提前创建仅供
 - `trigger_strategy.used_percentage` 必须位于 `[0, 1]`，同时应用于 group bytes、各 type bytes 和 group key count；
 - `delay_before_delete_ms` 是已取得 URI 的读宽限期，必须非负且不大于 `max_write_timeout_seconds * 1000`；
 - sampling size、batch size 和 idle interval 复用普通 CacheReclaimer 的运行参数，但 worker 和 pending 状态独立。
-- `PauseReclaimer` 会同时停止新的 KVMeta retirement；已进入 pending 的对象仍会完成 metadata-first
-  finalization，避免长期停在半回收状态。
+- `PauseReclaimer` 会同时停止新的 KVMeta retirement；已进入 pending 的对象仍会完成 tombstone durability、
+  exact physical absence 和 metadata finalization，避免长期停在半回收状态。
 
 `RegisterInstance` 会在写入 registry 前校验上述 group reclaim 配置、storage candidates 和进程级
 sampling/batching；运行中若 group/reclaim/storage/read-heat 配置被热更新为不支持的值，或 sampling/batching 被关闭，已有
@@ -876,6 +947,8 @@ pending retirement 或可能的 orphan，同一个 unique name 就必须保持�
   抛异常后，物理删除结果不确定的保守计数；
 - `pending_limit_reject_count` 表示达到独立 pending 硬上限、拒绝新 retirement 的次数；
 - `admission_demand_count` 表示因可回收容量不足而发布的按需回收信号数；
+- `backend_capacity_demand_count` 只计权威 backend `EC_NOSPC` 产生的物理压力信号；
+- `backend_capacity_demand_bytes` 是尚未被 exact physical absence 覆盖的物理压力 bytes gauge；
 - `pending_object_count`、`pending_bytes`、`blocked_group_count` 和 `admission_demand_group_count` 是当前状态 gauge。
 
 因此告警应同时观察逻辑回收和 physical uncertain 指标。backend 明确返回成功但自身实现为 no-op（例如当前开源
@@ -921,24 +994,63 @@ transfer JSON 必须同时满足：
 
 ### 12.1 逻辑 GC 与物理 GC
 
-metadata 删除先 `Sync`，再调用 backend 的 KVMeta exact-delete 扩展，确保仍可读 metadata 不会指向已经提前释放的
-URI。未实现扩展的同步 backend 兼容委托原 `Delete`；这套能力是独立 side interface，不改变 `DataStorageBackend`
-虚表或固定块 KVCache 的 `Delete` 调用。该顺序适用
-committed Remove/Trim、automatic reclaim，也适用 active rollback、expiry 和 recovery。Reclaimer 还会在删除
-metadata 前先把 committed 对象持久化为 retired，并等待配置的 read grace。
+所有会触碰物理对象的回收路径共享一条安全状态机：
 
-若 metadata 已经持久化删除、随后物理 Delete 返回错误、结果长度异常或抛异常，该 URI 已成为不可达 orphan：
-Remove/Trim、session rollback/expiry、StartWrite 补偿和 recovery 都把结果提升为 `OUTCOME_UNKNOWN`；自动 Reclaimer
-记录 uncertain 指标。所有前台/后台路径都会立即关闭 KVMeta admission 和后续 reclaim，避免一个持续故障在每次
-fill/evict 时继续制造 orphan；普通 KVCache gate 不受影响。修复 backend 并完成 namespace/orphan 对账后，运维方
-执行 recovery，只有 recovery 成功才允许恢复 KVMeta。所有路径都不自动重放不确定 Delete，因为现有 backend URI
-没有 allocation generation，地址复用后重放旧删除可能破坏后继对象。这个规则只
-消除“由 KVCM 发起第二次 Delete”的风险；若第一次调用返回后仍可能在 provider 内部晚到执行，V1 同样无法 fence。
-运维必须证明 Delete 终态/地址不复用/条件删除契约，并依赖 backend 的独立 orphan 清理策略处理无法确认的 allocation。
-内部 TairMempool 扩展会且只会发送一次 DELETE，随后用只读 `GET /v1/api/gas?ga=...` 验证完整快照；只有
-`status=success`、`partial=false`、`failed_nodes=[]` 且所有目标地址均不存在才返回成功。DELETE 的 HTTP 200 本身不再
-释放 KVMeta 的熔断条件，因为旧 MetaService 可能跳过未知/非健康节点或异步派发 Free。确认请求失败、返回部分快照、
-目标仍存在或响应缺字段都按物理结果不确定处理，绝不重放 DELETE。
+`readable owner -> durable CLS_DELETING tombstone（读不可见、仍计费） -> exact physical absence ->
+metadata compare-and-delete + Sync -> quota released`
+
+- 显式 `Remove`/`Trim`、active rollback/expiry 和写入补偿不等待 reader grace，但调用方必须先排空 consumer；它们仍先
+  持久化 tombstone，不能先丢 ownership ledger。
+- 自动 Reclaimer 在持久化 reader fence 后等待配置的 grace；leader recovery 对已过期 active/retired record 直接从
+  durable ledger 继续。只有物理 absence 和最终 metadata `Sync` 都成功才释放 quota。物理清理不会暴露悬空 hit，
+  因为 tombstone 已读不可见，且 recovery 全程不开请求门。
+
+未实现 KVMeta exact-delete 扩展的同步 backend 兼容委托原 `Delete`；这套能力是独立 side interface，不改变
+`DataStorageBackend` 虚表或固定块 KVCache 的 `Delete` 调用。所有路径能够安全重试的前提是 URI 本身命名不可复用的
+object generation（随机 object key，或 PACE 的 provider incarnation + GA + allocation token），且 backend 把
+absence 作为幂等成功；不能满足该契约的 backend 不得用于生产 EMB Cache。
+
+任一路径遇到物理 Delete 错误、结果长度异常或异常抛出，都保留 tombstone/active record 并继续计费，不能把容量
+提前出售。同步 `Remove`、rollback、expiry 或 Trim 已经消费其易失 owner 时返回 `OUTCOME_UNKNOWN` 并关闭 KVMeta
+admission/maintenance，交给 leader recovery 扫描持久化 ledger；普通 KVCache gate 不受影响。自动 Reclaimer 的
+pending batch 本身仍是完整 owner，因此普通 backend 暂态失败不关闭整个 worker，而是按 100ms～30s 退避重试
+相同 exact identity；只有 metadata owner 异常、持久化 barrier 无法建立或 pending fence 丢失时才 fail closed。
+已经删除的前缀由
+targeted query 证明 absence 后幂等收敛。若最终 metadata barrier 失败，则保存本进程的物理已确认标志、封闭对应
+group admission 并只重试 metadata；若进程退出，recovery 仍可对同一 generation 再做幂等 absence proof。这个统一
+WAL 顺序是 Cache 能在 Delete 故障和 leader restart 后继续 GC、而不是制造不可达 orphan 的基础。
+内部 TairMempool 扩展只接管 KVMeta side interface，不修改 fixed-block `Create/Delete`。exact allocation 逐级使用
+capability-separated 路由：KVCM→Meta 为 `/v1/api/gas/batch/exact`，Meta→Provider 为
+`/api/alloc_batch_exact`；旧节点在 mutation 前返回 404，滚动升级不会把缺少代际身份的 legacy allocation 混入 KVMeta。
+成功 URI 固化 Provider process incarnation。物理 cleanup 按最多 256 个 identity 分片，经同一主端口调用
+`/v1/api/gas/exact/free` 和 `/v1/api/gas/exact/query`；Meta 再用 Provider 的 `/api/free_exact` 与
+`/api/ga_list_exact` 做定向操作，身份是
+`(owner_provider_id, stable_provider_uuid, provider_incarnation, address, allocation_token)`。stable UUID 用于 Provider
+重注册后的路由，owner id/incarnation/token 共同用于防止旧 tombstone 删除 successor generation。
+
+Provider 在进程生命周期内维护 `address -> allocation_token` generation ledger，并在 allocation descriptor 上原子记录
+exact 逻辑释放是否已经应用，因此并发重复请求或响应丢失不会再次扣业务 refcount；物理 Delete 失败则由
+manager-owned pending descriptor 恢复，不重放 refcount mutation。生产 listener 与 Provider allocation table 同生命周期；
+当前实现不支持保留 live allocation table 时单独重建 listener。Meta/KVCM adapter 在 mutation 已确认后只重试只读 query；mutation acknowledgement 丢失时，最多补发一次
+相同 generation 的 exact free。每次 mutation 后都必须取得 targeted absence proof。只有 `status=success`、
+`partial=false`、`failed_nodes=[]` 且所有目标地址均不存在才返回成功；响应部分、目标仍存在、字段重复/缺失/类型错误、
+嵌入 NUL 或超限 body 都按结果不确定处理。一次配置的 reclaim batch 即使大于 256，也由 adapter 分片而不是截断或
+改变公共 Reclaimer 参数；任一 chunk 未证明终态，manager 仍按整个 cleanup 失败并关闭 KVMeta gate。
+
+PACE provisional allocation lease 固定至少 3600 秒。KVCM 最长写租约为 1800 秒，exact 控制 RPC 单次上限
+120 秒；StartWrite 会在 singleton commit 前后检查 deadline，rollback 最多 2 次 mutation 与每次 2 次 query。
+因此协议常量要求 `3600 > 1800 + 120 * (1 + 6)`；这些上限只属于 KVMeta side capability，不改变
+fixed-block KVCache timeout。MetaService 对 exact intent/owner/retirement proof 必须使用 durable Redis；内存 ledger
+会在 Provider mutation 前 fail closed。Provider 的 exact absence query 使用与 mutation 一致的有界长超时，不复用普通
+GA listing 的短超时。
+
+这个证明依赖当前 PACE Provider 的顺序：显式 SSD exact free 只有在 backend Delete 成功后才清掉 pending/residency，
+失败状态在 targeted query 中仍为 present；因此 absent 是保守终态。Provider 重启会生成新 incarnation，持久化 SSD
+entry 标成 recovered orphan，并在开放服务前把 GA sequence 推进到所有 recovered identity 之后；旧 incarnation 只能
+查询/清理这种 orphan，不能触碰新进程 allocation。同一进程内 GA 即使被 allocator 复用，也必须匹配新的
+allocation token；旧 token 被判定为 absent 且不能观察或修改 successor。若 Provider 改成先丢身份再异步释放，或
+绕过这两个 generation fence，必须废止该证明。当前 legacy
+DRAM/direct-RDMA 因同址复用和迟到 I/O 仍只允许隔离灰度，不能据此 exact 协议宣称生产安全。
 
 KVMeta 自己的 storage wrapper 会把 Create/Delete provider 的标准异常、未知异常和 Delete 结果数量不匹配转换为
 明确错误码，防止异常越过可选侧路终止服务线程。批量 PutStart 的后续 singleton Create 抛异常时，已经取得 URI
@@ -958,12 +1070,11 @@ Create 响应数量错误、非 `OK` 结果携带 URI 或 ownership shape 非法
 `INTERNAL_ERROR`，不能伪装成业务对象 `SIZE_MISMATCH`。只有“单一响应、backend identity/ownership shape 完整、
 但声明 size 错误”时归属仍可证明，服务端才对该 allocation 做恰好一次补偿 Delete。
 
-V1 在 metadata 删除时同步扣减 usage。若后续物理 Delete 失败，orphan 已不可寻址，也不再计入 KVMeta quota，
-因此 metadata usage 仍然准确，但可能低于 backend 实际占用。没有 generation token 时保留 URI 并自动重放同样
-不安全；V1 以一次 uncertain 指标、脱敏告警和全局 KVMeta circuit breaker 把容量漂移限制在首个失败批次，再交给
-backend/namespace 对账回收。进程崩溃后的熔断状态本身不持久化，所以生产 backend 仍必须提供可判定的 Delete 终态
-和独立 orphan 审计。V2 用持久化 cleanup ledger 保留安全清理所需身份，并在物理删除成功前继续计费，从根本上
-解决这项容量漂移。
+显式删除、回滚、expiry、自动 Reclaimer 与 recovery 都在 tombstone 最终删除前持续计入 MetaIndexer usage；
+pending credit 只防重复选择、不能售给 writer。只有物理 absence 与最终 metadata barrier 都成功后才增加
+`reclaimed_*` 并释放 quota。因此 Delete 故障不会让逻辑 usage 低报，也不会把尚未物理回收的容量提前出售。
+底层 Provider allocator 仍独立维护物理使用量和硬水位，用于覆盖共享 workload、碎片以及 KVCM metadata 无法观察的
+介质开销。
 
 backend 的物理回收能力沿用现有实现。例如当前开源 NFS backend 的 `Delete` 返回成功但实际是 no-op，KVMeta
 不会为 EMB 侧路改变其共享行为。这种 backend **不能单独作为有界容量的生产 Cache**：自动 LRU 只能让 metadata
@@ -978,9 +1089,9 @@ V1 没有 read lease：管理面 Remove/Trim、请求交接模式的业务 relea
 仅等待 KVCM 请求计数归零并不能观察客户端已经开始的数据面读取。自动 Reclaimer 有 grace，显式 Remove/Trim 没有。
 
 这类竞态的允许结果是 Load 失败并回退重算，而不是读出另一代对象。随机物理 object key、singleton allocation、
-exact-value metadata CAS 和“不重放不确定 Delete”共同降低 ABA 风险；对会立即复用地址且不能校验 generation 的
-backend，V1 仍依赖写租约、单 leader、删除时序以及 Delete 返回终态；provider 可在返回后晚到完成时，这些机制
-不足以保证安全，必须停用该 backend 或等待 V2 fencing。
+exact-value metadata CAS、显式路径不凭易失 URI 重放，以及自动/恢复路径只重放 durable ledger 中的 exact generation，
+共同降低 ABA 风险；对会立即复用地址且不能校验 generation 的 backend，V1 仍依赖写租约、单 leader、删除时序以及
+Delete 返回终态；provider 可在返回后晚到完成时，这些机制不足以保证安全，必须停用该 backend 或等待 V2 fencing。
 
 V1 只验证 URI identity、scheme、hostname 和逻辑 size，不计算 value checksum。backend 若静默返回同长度错误
 数据，KVCM 无法识别。因此生产部署必须至少满足以下之一：backend 自带端到端 checksum 并在读取错误时失败；或
@@ -1011,8 +1122,8 @@ Load/digest 之后或采用等价的异步 touch。
 | LRU 热度来源 | metadata 使用能在普通读取时更新热度的 `local` hot view；生产用 `cached(local + Redis/async Redis)`，直连 Redis 不用于 KVMeta | 注册/新 allocation fail closed，不能把随机/并列淘汰宣称为 LRU |
 | Metadata/Registry 恢复 | 共享远端 Cache 使用持久化 Registry 和 `cached` persistent metadata；重启/换主后能扫描 owner 并重建真实 bytes usage | `local`/`dummy` 只允许 UT，或有独立 TTL/sweeper、硬容量保护且明确接受 orphan 的临时环境；不得把其 `Sync` 当持久化成功 |
 | 物理 GC | backend Delete 确实释放资源，或存在已验证的 TTL/sweeper/namespace 轮换和底层硬容量保护 | no-op Delete backend 禁止作为独立生产方案 |
-| 删除终态 | KVMeta exact-delete 返回后目标在完整 provider snapshot 中已不存在；不确定结果不重放且立即关闭 KVMeta gate | 缺少 absence confirmation、地址复用防护或独立 orphan 审计时禁止上线 |
-| PACE 写入终态 | 当前 PACE revision 已验证 timeout 后 caller buffer 不再访问；服务端 180 秒失败写 quarantine 覆盖 remote RDMA/Commit 最坏迟到时间；显式 SSD busy 和 orphan 路径有容量对账 | 必须完成“timeout → quarantine → Free → 同址复用”故障注入；实测迟到上界超过 180 秒时禁止上线并先调整服务端契约 |
+| 删除终态 | KVMeta exact-delete 返回后目标在 generation-aware targeted provider query 中已不存在；manager 不重发 backend cleanup，不确定结果立即关闭 KVMeta gate | 缺少 incarnation/generation、absence confirmation、地址复用防护或独立 orphan 审计时禁止上线 |
+| PACE 写入终态 | 当前 PACE revision 已验证 timeout 后 caller buffer 不再访问；client quarantine 为正且不超过 180 秒；服务端 180 秒失败写 quarantine 覆盖 remote RDMA/Commit 最坏迟到时间；显式 SSD busy 和 orphan 路径有容量对账 | 必须完成“timeout → quarantine → Free → 同址复用”故障注入；client TTL 大于 180 秒会在 KVMeta 初始化时拒绝，实测迟到上界超过 180 秒时禁止上线并先调整两侧契约 |
 | backend identity | 每个 `global_unique_name` 在 metadata/orphan 生命周期内不可重绑到不同 namespace/config；变更使用新名称 | 停止 KVMeta、排空并审计后再迁移 |
 | consumer 生命周期 | grace 覆盖读尾延迟；交接模式在最后消费后 release，共享 Cache 不做 per-reader release；Trim 前排空 consumer | Load 失败只能回退；不可把短 grace 当 read lease |
 | 时间与租约 | leader/backend 节点时钟同步，最大漂移计入 write lease、recovery 和 read grace；backend I/O 有可验证 deadline/drain | 扩大安全裕量或停用该 backend |
@@ -1241,7 +1352,8 @@ bypass；后续可在 KVMeta 专用层增加按 bytes 加权的 TinyLFU/SLRU 类
 
 1. **V1.1**：先增加指标、独立限流/队列和部署校验；不改变 wire format；
 2. **capability 协商**：Register 响应增加 additive protocol version/capability，client 对语义不兼容版本 fail closed；
-3. **generation + cleanup ledger**：先接入一种内部 backend，双写审计但不重试，再开启条件删除 worker；
+3. **全路径 operation/orphan ledger**：在现有 Reclaimer tombstone WAL 与内部 PACE generation 的基础上，把持久化
+   operation id、cleanup ownership 和审计扩展到显式删除及 reservation 补偿，再逐 backend 开启安全重试；
 4. **异构批量**：在同一 adapter 上启用 `BATCH_VARIABLE_SIZE`，保留 singleton fallback 和对照指标；
 5. **object set**：最后引入 server-side lease，RTP/v6d 按 capability 灰度使用。
 
@@ -1256,15 +1368,17 @@ bypass；后续可在 KVMeta 专用层增加按 bytes 加权的 TinyLFU/SLRU 类
 
 - Manager/Service UT：注册隔离（含双向和并发混合注册）、exact-key、不同 size、容量、session、Remove/Trim、HA
   recovery、生命周期，
-  以及 rollback、Remove、Trim、expiry、recovery 中物理 Delete 返回错误/短结果/标准或未知异常时的一次性删除、
+  以及 rollback、Remove、Trim、expiry 中物理 Delete 返回错误/短结果/标准或未知异常时的一次性删除，以及 recovery
+  保留 durable ledger、exact Delete 失败后可重入、物理成功后才删除 metadata 的顺序、
   Remove 已改变 metadata 后的 `OUTCOME_UNKNOWN`、reservation rollback 双重 Sync 失败时的 KVMeta-only
   fail-closed、metadata/usage 收敛、worker 存活和恢复继续放流；独立 Reclaimer 还覆盖 group/type bytes、key-count
   和零水位、低于水位的大请求按需回收、storage type 按需回收、per-instance key 准入、重叠压力不误伤无关
   Cache、不可能请求不清空有效对象、group LRU、active 排除、跨 instance 小样本轮转、pending credit 防过淘汰、
   跨 group grace 隔离、reader fence 后锚定 deadline、fence Sync 失败关闭准入且不删除、pending object/byte
   边界裁剪、Pause、非 LRU 注册拒绝、非法热更新关闭新 allocation、metadata Sync 重试/admission fail-closed、
-  物理删除不重放、意外 absent owner 不触发物理删除、危险根路径不进入 Reclaimer Delete，以及降主后有限
-  deadline/过渡 fence 的 retired recovery；
+  generation-aware 物理删除的超时/异常/部分成功重试、物理 I/O 不持有 group shard、删除成功后 metadata barrier
+  重试不重复 backend 调用、意外 absent/replacement owner fail closed、危险根路径不进入 Reclaimer Delete，以及
+  降主/重启后从 durable tombstone 重放 exact Delete 的 retired recovery；
 - Client/SDK UT：响应对齐、重复参数/fragment/EventReport/Mooncake 空 key、非 canonical authority、危险文件 path、
   PACE offset/地址字段、URI size/buffer 校验、CPU build 对 GPU buffer 的 fail-closed、failover、超时 drain、
   普通 TransferClient 回归；

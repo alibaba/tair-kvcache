@@ -42,6 +42,14 @@ public:
                                                              const std::vector<std::string> &keys,
                                                              size_t size_per_key,
                                                              std::function<void()> cb);
+    std::vector<std::pair<ErrorCode, DataStorageUri>> CreateForKvMeta(RequestContext *request_context,
+                                                                      const std::string &unique_name,
+                                                                      const std::vector<std::string> &keys,
+                                                                      size_t size_per_key,
+                                                                      std::function<void()> cb);
+    std::vector<ErrorCode> CommitKvMetaCreate(RequestContext *request_context,
+                                               const std::string &unique_name,
+                                               const std::vector<std::string> &allocation_keys);
 
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const std::string &unique_name,

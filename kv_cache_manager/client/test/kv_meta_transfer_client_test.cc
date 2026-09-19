@@ -86,6 +86,51 @@ TEST(KvMetaUriTest, ParsesTairMempoolOffsetWithoutAliasingMalformedPathsToZero) 
         HasExactTairMempoolAddress(DataStorageUri("pace://pace/0?media_type=65535&node_id=0&range_id=1&size=1")));
     EXPECT_TRUE(HasExactTairMempoolAddress(DataStorageUri("pace://pace/0?size=1")));
 
+    constexpr const char *kIncarnation = "01234567-89ab-4def-8abc-0123456789ab";
+    const std::string allocation_token = "kvmeta/a/b/0123456789abcdefghijklmnopqrstuv";
+    EXPECT_TRUE(HasCanonicalTairMempoolProviderIncarnation(
+        DataStorageUri(std::string("pace://pace/1?provider_incarnation=") + kIncarnation + "&size=1")));
+    EXPECT_TRUE(HasOwnedKvMetaAllocationShape(
+        DataStorageUri(std::string("pace://pace/1?allocation_token=") + allocation_token +
+                       "&provider_incarnation=" + kIncarnation +
+                       "&provider_uuid=stable-provider&size=1"),
+        DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    EXPECT_TRUE(HasSafeOptionalTairMempoolProviderUuid(
+        DataStorageUri("pace://pace/1?provider_uuid=stable-provider&size=1")));
+    // Missing is accepted only for rolling-upgrade compatibility with old
+    // persisted exact URIs. New TairMempool allocations require the field in
+    // the internal adapter.
+    EXPECT_TRUE(HasSafeOptionalTairMempoolProviderUuid(
+        DataStorageUri("pace://pace/1?size=1")));
+    EXPECT_FALSE(HasSafeOptionalTairMempoolProviderUuid(
+        DataStorageUri("pace://pace/1?provider_uuid=&size=1")));
+    EXPECT_FALSE(HasSafeOptionalTairMempoolProviderUuid(
+        DataStorageUri("pace://pace/1?provider_uuid=bad#route&size=1")));
+    EXPECT_FALSE(HasSafeOptionalTairMempoolProviderUuid(
+        DataStorageUri("pace://pace/1?provider_uuid=bad%25route&size=1")));
+    EXPECT_FALSE(HasSafeOptionalTairMempoolProviderUuid(
+        DataStorageUri("pace://pace/1?provider_uuid=bad%20route&size=1")));
+    EXPECT_FALSE(HasSafeOptionalTairMempoolProviderUuid(
+        DataStorageUri("pace://pace/1?provider_uuid=bad=route&size=1")));
+    EXPECT_FALSE(HasSafeOptionalTairMempoolProviderUuid(
+        DataStorageUri("pace://pace/1?provider_uuid=" + std::string(64, 'a') + "&size=1")));
+    EXPECT_FALSE(HasOwnedKvMetaAllocationShape(
+        DataStorageUri(std::string("pace://pace/1?provider_incarnation=") + kIncarnation + "&size=1"),
+        DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    EXPECT_FALSE(HasOwnedKvMetaAllocationShape(
+        DataStorageUri("pace://pace/1?size=1"), DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+
+    for (const std::string &incarnation : {
+             "01234567-89AB-4DEF-8ABC-0123456789AB",
+             "0123456789ab-4def-8abc-0123456789ab",
+             "01234567-89ab-4def-8abc-0123456789ag",
+             "01234567-89ab-4def-8abc-0123456789ab-extra",
+         }) {
+        SCOPED_TRACE(incarnation);
+        EXPECT_FALSE(HasCanonicalTairMempoolProviderIncarnation(
+            DataStorageUri("pace://pace/1?provider_incarnation=" + incarnation + "&size=1")));
+    }
+
     for (const std::string &uri : {
              "pace://pace/0?node_id=&size=1",
              "pace://pace/0?node_id=-1&size=1",

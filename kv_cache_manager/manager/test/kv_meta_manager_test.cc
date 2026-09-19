@@ -66,7 +66,7 @@ public:
     explicit OverlongCreateNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
         : NfsBackend(std::move(metrics_registry)) {}
 
-    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &,
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
                                                              size_t size_per_key,
                                                              const std::string &,
                                                              std::function<void()> cb) override {
@@ -191,12 +191,40 @@ public:
     std::size_t delete_calls{0};
 };
 
+class CapacityRejectingNfsBackend : public NfsBackend {
+public:
+    enum class Mode { kOnce, kAlways };
+
+    CapacityRejectingNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry, Mode mode)
+        : NfsBackend(std::move(metrics_registry)), mode_(mode) {}
+
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const std::string &trace_id,
+                                                             std::function<void()> cb) override {
+        const std::size_t attempt = create_attempts_.fetch_add(1, std::memory_order_acq_rel);
+        if (mode_ == Mode::kAlways || attempt == 0) {
+            if (cb) {
+                cb();
+            }
+            return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOSPC, DataStorageUri{}});
+        }
+        return NfsBackend::Create(keys, size_per_key, trace_id, std::move(cb));
+    }
+
+    std::size_t CreateAttempts() const { return create_attempts_.load(std::memory_order_acquire); }
+
+private:
+    Mode mode_;
+    std::atomic<std::size_t> create_attempts_{0};
+};
+
 class AliasedOverlongCreateNfsBackend : public NfsBackend {
 public:
     explicit AliasedOverlongCreateNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
         : NfsBackend(std::move(metrics_registry)) {}
 
-    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &,
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
                                                              size_t size_per_key,
                                                              const std::string &,
                                                              std::function<void()> cb) override {
@@ -317,6 +345,8 @@ public:
 
 class DuplicateSingletonCreateTairMempoolBackend : public DataStorageBackend {
 public:
+    static constexpr const char *kProviderIncarnation = "01234567-89ab-4def-8abc-0123456789ab";
+
     explicit DuplicateSingletonCreateTairMempoolBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
         : DataStorageBackend(std::move(metrics_registry)) {}
 
@@ -336,13 +366,17 @@ public:
         return EC_OK;
     }
 
-    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &,
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
                                                              size_t size_per_key,
                                                              const std::string &,
                                                              std::function<void()> cb) override {
         DataStorageUri uri;
         uri.SetProtocol(kTairMempoolUriScheme);
         uri.SetPath("/424242");
+        if (!keys.empty()) {
+            uri.SetParam("allocation_token", keys.front());
+        }
+        uri.SetParam("provider_incarnation", kProviderIncarnation);
         uri.SetParam("size", std::to_string(size_per_key));
         if (cb) {
             cb();
@@ -397,14 +431,18 @@ public:
         return EC_OK;
     }
 
-    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &,
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
                                                              size_t size_per_key,
                                                              const std::string &,
                                                              std::function<void()> cb) override {
         DataStorageUri uri;
         uri.SetProtocol(kTairMempoolUriScheme);
         uri.SetPath("/424242");
+        if (!keys.empty()) {
+            uri.SetParam("allocation_token", keys.front());
+        }
         uri.SetParam("media_type", std::to_string(returned_media_type_));
+        uri.SetParam("provider_incarnation", DuplicateSingletonCreateTairMempoolBackend::kProviderIncarnation);
         uri.SetParam("size", std::to_string(size_per_key));
         if (cb) {
             cb();
@@ -558,10 +596,19 @@ private:
 
 class QuarantinedWriteNfsBackend : public NfsBackend, public KvMetaDataStorageBackendExtension {
 public:
-    explicit QuarantinedWriteNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
-        : NfsBackend(std::move(metrics_registry)) {}
+    explicit QuarantinedWriteNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry,
+                                        std::int64_t cleanup_grace_seconds = 1)
+        : NfsBackend(std::move(metrics_registry)), cleanup_grace_seconds_(cleanup_grace_seconds) {}
 
-    std::int64_t GetFailedWriteCleanupGraceSeconds() const noexcept override { return 1; }
+    std::int64_t GetFailedWriteCleanupGraceSeconds() const noexcept override { return cleanup_grace_seconds_; }
+
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const std::string &trace_id,
+                                                             std::function<void()> cb) override {
+        create_calls_.fetch_add(keys.size(), std::memory_order_relaxed);
+        return NfsBackend::Create(keys, size_per_key, trace_id, std::move(cb));
+    }
 
     std::vector<ErrorCode> DeleteAndConfirmAbsent(const std::vector<DataStorageUri> &storage_uris,
                                                   const std::string &trace_id,
@@ -577,9 +624,63 @@ public:
     }
 
     std::size_t DeleteCalls() const noexcept { return delete_calls_.load(std::memory_order_relaxed); }
+    std::size_t CreateCalls() const noexcept { return create_calls_.load(std::memory_order_relaxed); }
 
 private:
+    const std::int64_t cleanup_grace_seconds_;
+    std::atomic<std::size_t> create_calls_{0};
     std::atomic<std::size_t> delete_calls_{0};
+};
+
+class ProvisionalCommitNfsBackend : public NfsBackend, public KvMetaDataStorageBackendExtension {
+public:
+    explicit ProvisionalCommitNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
+        : NfsBackend(std::move(metrics_registry)) {}
+
+    bool RequiresKvMetaCreateCommit() const noexcept override { return true; }
+    std::int64_t GetKvMetaControlRequestTimeoutSeconds() const noexcept override {
+        return control_timeout_seconds_;
+    }
+    std::int64_t GetFailedWriteCleanupGraceSeconds() const noexcept override { return 0; }
+
+    std::vector<ErrorCode> CommitKvMetaCreate(const std::vector<std::string> &allocation_keys,
+                                               const std::string &) override {
+        ++commit_calls_;
+        commit_batches_.push_back(allocation_keys);
+        committed_keys_ = allocation_keys;
+        if (commit_delay_.count() != 0) {
+            std::this_thread::sleep_for(commit_delay_);
+        }
+        return std::vector<ErrorCode>(allocation_keys.size(), commit_error_);
+    }
+
+    std::vector<ErrorCode> DeleteAndConfirmAbsent(const std::vector<DataStorageUri> &storage_uris,
+                                                  const std::string &trace_id,
+                                                  std::function<void()> cb) override {
+        return Delete(storage_uris, trace_id, std::move(cb));
+    }
+
+    std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,
+                                  const std::string &trace_id,
+                                  std::function<void()> cb) override {
+        delete_calls_ += storage_uris.size();
+        if (delete_error_ != EC_OK) {
+            if (cb) {
+                cb();
+            }
+            return std::vector<ErrorCode>(storage_uris.size(), delete_error_);
+        }
+        return NfsBackend::Delete(storage_uris, trace_id, std::move(cb));
+    }
+
+    ErrorCode commit_error_{EC_OK};
+    ErrorCode delete_error_{EC_OK};
+    std::size_t commit_calls_{0};
+    std::size_t delete_calls_{0};
+    std::vector<std::string> committed_keys_;
+    std::vector<std::vector<std::string>> commit_batches_;
+    std::chrono::milliseconds commit_delay_{0};
+    std::int64_t control_timeout_seconds_{1};
 };
 
 class BlockingThenFailDeleteNfsBackend : public NfsBackend {
@@ -633,6 +734,7 @@ private:
 class FaultingDeleteNfsBackend : public NfsBackend {
 public:
     enum class Mode {
+        kSuccess,
         kError,
         kShortResult,
         kStandardException,
@@ -644,15 +746,19 @@ public:
 
     std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &, std::function<void()> cb) override {
+        Mode mode;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             ++delete_attempts_;
+            mode = mode_;
             condition_.notify_all();
         }
         if (cb) {
             cb();
         }
-        switch (mode_) {
+        switch (mode) {
+        case Mode::kSuccess:
+            return std::vector<ErrorCode>(storage_uris.size(), EC_OK);
         case Mode::kError:
             return std::vector<ErrorCode>(storage_uris.size(), EC_IO_ERROR);
         case Mode::kShortResult:
@@ -663,6 +769,11 @@ public:
             throw 17;
         }
         throw std::runtime_error("unreachable fault mode");
+    }
+
+    void SetMode(Mode mode) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        mode_ = mode;
     }
 
     bool WaitForDeleteAttempts(std::size_t expected, std::chrono::milliseconds timeout) {
@@ -766,6 +877,28 @@ private:
     bool fail_next_delete_sync_{false};
     bool fail_next_sync_{false};
     bool sync_failed_{false};
+};
+
+class FailNextMaintenanceUpsertBackend : public MetaLocalBackend {
+public:
+    void FailNextUpsert() noexcept { fail_next_upsert_.store(true, std::memory_order_release); }
+
+    std::size_t FailedUpserts() const noexcept { return failed_upserts_.load(std::memory_order_acquire); }
+
+    std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override {
+        if (fail_next_upsert_.exchange(false, std::memory_order_acq_rel)) {
+            failed_upserts_.fetch_add(1, std::memory_order_acq_rel);
+            return std::vector<ErrorCode>(keys.size(), EC_IO_ERROR);
+        }
+        return MetaLocalBackend::Upsert(request_context, keys, locations, properties);
+    }
+
+private:
+    std::atomic<bool> fail_next_upsert_{false};
+    std::atomic<std::size_t> failed_upserts_{0};
 };
 
 class OversamplingMetaLocalBackend : public MetaLocalBackend {
@@ -1061,6 +1194,27 @@ protected:
         }
         auto config = std::make_shared<MetaStorageBackendConfig>();
         auto backend = std::make_unique<FailNextMaintenanceDeleteSyncBackend>();
+        if (backend->Init(KvMetaManager::InternalInstanceId(instance_id), config) != EC_OK ||
+            backend->Open() != EC_OK) {
+            return nullptr;
+        }
+        auto *backend_raw = backend.get();
+        if (indexer->backend_manager_->persistent_backend_) {
+            indexer->backend_manager_->persistent_backend_->Close();
+        }
+        indexer->backend_manager_->persistent_backend_ = std::move(backend);
+        indexer->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    FailNextMaintenanceUpsertBackend *InstallFailingUpsertBackend(const std::string &instance_id) {
+        auto indexer =
+            cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(instance_id));
+        if (!indexer || !indexer->backend_manager_) {
+            return nullptr;
+        }
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        auto backend = std::make_unique<FailNextMaintenanceUpsertBackend>();
         if (backend->Init(KvMetaManager::InternalInstanceId(instance_id), config) != EC_OK ||
             backend->Open() != EC_OK) {
             return nullptr;
@@ -1750,7 +1904,7 @@ TEST_F(KvMetaManagerTest, TrimUsesBoundedMaintenanceBatches) {
     EXPECT_FALSE(values[2].found);
 }
 
-TEST_F(KvMetaManagerTest, TrimDoesNotReplayFailedPhysicalDelete) {
+TEST_F(KvMetaManagerTest, TrimRetainsTombstoneAndRecoveryRetriesFailedPhysicalDelete) {
     constexpr const char *kKey = "trim-delete-fails";
     auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {31}, 30);
     ASSERT_EQ(EC_OK, start_ec);
@@ -1768,35 +1922,36 @@ TEST_F(KvMetaManagerTest, TrimDoesNotReplayFailedPhysicalDelete) {
         storage_manager->storage_map_["nfs_01"] = failing;
     }
 
-    // Metadata is already durably absent when physical deletion fails. The
-    // complete Trim request has therefore changed state and must not surface
-    // an ordinary retryable backend error: replaying an old reusable URI on a
-    // successor leader could delete a newer generation.
+    // The owner first becomes a durable, read-invisible tombstone. A failed
+    // physical delete must retain both that URI ledger and its quota charge.
     EXPECT_EQ(EC_OUTCOME_UNKNOWN, manager_->TrimAll(&request_context_, kInstanceId, false));
     EXPECT_EQ(1, failing->DeleteAttempts());
     auto indexer =
         cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
-    EXPECT_EQ(0, indexer->GetStorageUsage());
+    EXPECT_EQ(31, indexer->GetStorageUsage());
     auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
     EXPECT_FALSE(values[0].found);
 
-    // The retry cannot rediscover or replay the old reusable-address URI, and
-    // the circuit breaker prevents new cache churn from creating more
-    // untracked physical orphans.
+    // The current leader is fail-closed, so normal RPC replay cannot race the
+    // recovery owner. Leader recovery is explicitly allowed to retry the same
+    // immutable allocation generation.
     EXPECT_TRUE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
     EXPECT_EQ(EC_SERVICE_NOT_LEADER, manager_->TrimAll(&request_context_, kInstanceId, false));
     EXPECT_EQ(1, failing->DeleteAttempts());
+    failing->SetMode(FaultingDeleteNfsBackend::Mode::kSuccess);
+    manager_->DoCleanup();
+    ASSERT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(2, failing->DeleteAttempts());
+    EXPECT_EQ(0, indexer->GetStorageUsage());
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    EXPECT_EQ(EC_OK, manager_->TrimAll(&request_context_, kInstanceId, false));
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         storage_manager->storage_map_["nfs_01"] = original;
     }
-    manager_->DoCleanup();
-    ASSERT_EQ(EC_OK, manager_->DoRecover());
-    ASSERT_TRUE(manager_->ResumeMaintenance());
-    EXPECT_EQ(EC_OK, manager_->TrimAll(&request_context_, kInstanceId, false));
 }
 
 TEST_F(KvMetaManagerTest, TrimCancellationAfterACommittedBatchIsOutcomeUnknown) {
@@ -1891,7 +2046,7 @@ TEST_F(KvMetaManagerTest, TrimMetadataPersistenceFailureFailsKvMetaClosedUntilRe
     EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
 }
 
-TEST_F(KvMetaManagerTest, TrimFailsClosedOnAReplacementOwnerWithoutPhysicalDelete) {
+TEST_F(KvMetaManagerTest, TrimDeletesOnlyTheCapturedGenerationBeforeRejectingAReplacementOwner) {
     constexpr const char *kKey = "trim-replacement-owner";
     auto *meta_backend = InstallConflictingTargetedReadBackend(kInstanceId);
     ASSERT_NE(nullptr, meta_backend);
@@ -1909,18 +2064,19 @@ TEST_F(KvMetaManagerTest, TrimFailsClosedOnAReplacementOwnerWithoutPhysicalDelet
         storage_manager->storage_map_["nfs_01"] = tracking;
     }
 
-    // Trim's scan captures the real owner. Return a different exact value to
-    // the following metadata CAS to model a split-brain replacement under the
-    // stable location id. The stale URI must never become Delete authority.
+    // The captured URI contains an immutable allocation generation. Even if
+    // an unsupported actor changes metadata later, deleting that old physical
+    // identity cannot target the replacement; the metadata anomaly still
+    // closes admission.
     meta_backend->ConflictOnTargetedRead(1);
     EXPECT_EQ(EC_OUTCOME_UNKNOWN, manager_->TrimAll(&request_context_, kInstanceId, false));
     EXPECT_TRUE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
-    EXPECT_EQ(0, tracking->DeleteAttempts());
+    EXPECT_EQ(1, tracking->DeleteAttempts());
 
     auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
-    EXPECT_TRUE(values[0].found);
+    EXPECT_FALSE(values[0].found);
     auto indexer =
         cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
@@ -2430,9 +2586,9 @@ TEST_F(KvMetaManagerTest, ReservationPhysicalCleanupFailureFailsKvMetaClosedUnti
         storage_manager->storage_map_["nfs_01"] = failing;
     }
 
-    // The reservation barrier fails, but its compensating metadata absence is
-    // durable. The failed physical release is nevertheless an unaccounted
-    // orphan, so allowing retries could leak one allocation per request.
+    // The reservation barrier fails, then compensation persists an immediate
+    // tombstone. A failed physical release must retain that charged cleanup
+    // ledger and close admission instead of leaking one object per retry.
     auto [failed_ec, failed] =
         manager_->StartWrite(&request_context_, kInstanceId, {"rollback-physical-orphan"}, {17}, 30);
     EXPECT_EQ(EC_OUTCOME_UNKNOWN, failed_ec);
@@ -2650,7 +2806,7 @@ TEST_F(KvMetaManagerTest, RemoveFinishesPhysicalDeleteBeforeReadmittingTheKey) {
     EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, recreated.write_session_id, {false}));
 }
 
-TEST_F(KvMetaManagerTest, RemovePhysicalDeleteExceptionFailsKvMetaClosedWithoutReplay) {
+TEST_F(KvMetaManagerTest, RemovePhysicalDeleteExceptionRetainsARecoveryLedger) {
     constexpr const char *kKey = "remove-delete-throws";
     auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {23}, 30);
     ASSERT_EQ(EC_OK, start_ec);
@@ -2668,37 +2824,79 @@ TEST_F(KvMetaManagerTest, RemovePhysicalDeleteExceptionFailsKvMetaClosedWithoutR
         storage_manager->storage_map_["nfs_01"] = throwing;
     }
 
-    // Metadata is already durably absent when the provider throws. Surface an
-    // explicitly ambiguous mutation result so a caller cannot treat the
-    // ordinary backend error as safe permission to replay Remove later.
+    // The provider exception is contained, but the durable tombstone and its
+    // quota charge remain until recovery confirms physical absence.
     EXPECT_EQ(EC_OUTCOME_UNKNOWN, manager_->Remove(&request_context_, kInstanceId, {kKey}));
     EXPECT_EQ(1, throwing->DeleteAttempts());
     auto indexer =
         cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
-    EXPECT_EQ(0, indexer->GetStorageUsage());
+    EXPECT_EQ(23, indexer->GetStorageUsage());
     auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
     EXPECT_FALSE(values[0].found);
 
-    // The old URI is no longer discoverable and must never be replayed. The
-    // circuit breaker also blocks unrelated mutations until an operator has
-    // reconciled the backend and recovery rebuilds the metadata view.
+    // Ordinary client replay is fenced. Recovery alone retries the immutable
+    // physical identity and erases the tombstone after success.
     EXPECT_EQ(EC_SERVICE_NOT_LEADER, manager_->Remove(&request_context_, kInstanceId, {kKey}));
     EXPECT_EQ(1, throwing->DeleteAttempts());
-    {
-        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
-        storage_manager->storage_map_["nfs_01"] = original;
-    }
-
+    throwing->SetMode(FaultingDeleteNfsBackend::Mode::kSuccess);
     manager_->DoCleanup();
     ASSERT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(2, throwing->DeleteAttempts());
+    EXPECT_EQ(0, indexer->GetStorageUsage());
     ASSERT_TRUE(manager_->ResumeMaintenance());
     auto [recreate_ec, recreated] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {29}, 30);
     ASSERT_EQ(EC_OK, recreate_ec);
     ASSERT_FALSE(recreated.write_session_id.empty());
     EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, recreated.write_session_id, {false}));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, RemoveNeverDeletesPhysicalAllocationWhenTombstoneUpsertFails) {
+    constexpr const char *kKey = "remove-tombstone-upsert-fails";
+    auto *meta_backend = InstallFailingUpsertBackend(kInstanceId);
+    ASSERT_NE(nullptr, meta_backend);
+    CommitObject(kInstanceId, kKey, 29);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto tracking =
+        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kSuccess);
+    ASSERT_EQ(EC_OK, tracking->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = tracking;
+    }
+
+    meta_backend->FailNextUpsert();
+    EXPECT_EQ(EC_OUTCOME_UNKNOWN, manager_->Remove(&request_context_, kInstanceId, {kKey}));
+    EXPECT_EQ(1, meta_backend->FailedUpserts());
+    EXPECT_EQ(0, tracking->DeleteAttempts());
+    EXPECT_TRUE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
+
+    // Observing the expected owner inside the modifier is insufficient: only
+    // an EC_OK tombstone write authorizes physical deletion. The failed write
+    // leaves both the readable owner and its quota charge intact.
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_TRUE(values[0].found);
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
+    ASSERT_TRUE(indexer);
+    EXPECT_EQ(29, indexer->GetStorageUsage());
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
 }
 
 TEST_F(KvMetaManagerTest, RemoveReturnsUnknownWhenMetadataPersistenceIsAmbiguous) {
@@ -2736,7 +2934,7 @@ TEST_F(KvMetaManagerTest, RemoveReturnsUnknownWhenMetadataPersistenceIsAmbiguous
     EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
 }
 
-TEST_F(KvMetaManagerTest, RemoveFailsClosedOnAReplacementOwnerWithoutPhysicalDelete) {
+TEST_F(KvMetaManagerTest, RemoveDeletesOnlyTheCapturedGenerationBeforeRejectingAReplacementOwner) {
     constexpr const char *kKey = "remove-replacement-owner";
     auto *meta_backend = InstallConflictingTargetedReadBackend(kInstanceId);
     ASSERT_NE(nullptr, meta_backend);
@@ -2754,18 +2952,18 @@ TEST_F(KvMetaManagerTest, RemoveFailsClosedOnAReplacementOwnerWithoutPhysicalDel
         storage_manager->storage_map_["nfs_01"] = tracking;
     }
 
-    // The first targeted read is Remove's exact capture; the second is its
-    // compare-and-delete. A different value at the stable id is an ownership
-    // conflict, never permission to delete the captured physical URI.
+    // The first targeted read captures the immutable physical generation. A
+    // later unsupported metadata replacement cannot make exact deletion target
+    // the successor, but it must still fail the metadata transaction closed.
     meta_backend->ConflictOnTargetedRead(2);
     EXPECT_EQ(EC_OUTCOME_UNKNOWN, manager_->Remove(&request_context_, kInstanceId, {kKey}));
     EXPECT_TRUE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
-    EXPECT_EQ(0, tracking->DeleteAttempts());
+    EXPECT_EQ(1, tracking->DeleteAttempts());
 
     auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
-    EXPECT_TRUE(values[0].found);
+    EXPECT_FALSE(values[0].found);
     auto indexer =
         cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
@@ -2798,9 +2996,9 @@ TEST_F(KvMetaManagerTest, RollbackFinishesPhysicalDeleteBeforeReadmittingTheKey)
         RequestContext context("rollback-before-recreate");
         return manager_->FinishWrite(&context, kInstanceId, start.write_session_id, {false});
     });
-    // Metadata is already durably absent when the physical delete blocks, but
-    // the group shard still prevents a new generation from being allocated
-    // until this one-shot delete attempt has returned.
+    // A read-invisible tombstone is already durable when physical delete
+    // blocks. The group shard also prevents a new generation from being
+    // allocated until this generation is confirmed absent and finalized.
     ASSERT_TRUE(blocking->WaitForDelete(std::chrono::seconds(2)));
 
     auto recreate = std::async(std::launch::async, [&]() {
@@ -2819,7 +3017,7 @@ TEST_F(KvMetaManagerTest, RollbackFinishesPhysicalDeleteBeforeReadmittingTheKey)
     EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, recreated.write_session_id, {false}));
 }
 
-TEST_F(KvMetaManagerTest, RollbackContainsPhysicalDeleteExceptionWithoutReplay) {
+TEST_F(KvMetaManagerTest, RollbackContainsPhysicalDeleteExceptionAndRecoveryRetriesIt) {
     constexpr const char *kKey = "rollback-delete-throws";
     auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {23}, 30);
     ASSERT_EQ(EC_OK, start_ec);
@@ -2837,8 +3035,8 @@ TEST_F(KvMetaManagerTest, RollbackContainsPhysicalDeleteExceptionWithoutReplay) 
         storage_manager->storage_map_["nfs_01"] = throwing;
     }
 
-    // The metadata-first rollback contains the provider exception, but its
-    // physical outcome remains ambiguous and must trip the circuit breaker.
+    // The tombstone-first rollback contains the provider exception and trips
+    // the circuit breaker without losing its restart-safe URI ledger.
     EXPECT_EQ(EC_OUTCOME_UNKNOWN,
               manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {false}));
     EXPECT_EQ(1, throwing->DeleteAttempts());
@@ -2847,20 +3045,18 @@ TEST_F(KvMetaManagerTest, RollbackContainsPhysicalDeleteExceptionWithoutReplay) 
     auto indexer =
         cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
-    EXPECT_EQ(0, indexer->GetStorageUsage());
+    EXPECT_EQ(23, indexer->GetStorageUsage());
     auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
     EXPECT_FALSE(values[0].found);
 
-    {
-        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
-        storage_manager->storage_map_["nfs_01"] = original;
-    }
-
     EXPECT_EQ(EC_SERVICE_NOT_LEADER, manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {29}, 30).first);
+    throwing->SetMode(FaultingDeleteNfsBackend::Mode::kSuccess);
     manager_->DoCleanup();
     ASSERT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(2, throwing->DeleteAttempts());
+    EXPECT_EQ(0, indexer->GetStorageUsage());
     ASSERT_TRUE(manager_->ResumeMaintenance());
     auto [recreate_ec, recreated] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {29}, 30);
     ASSERT_EQ(EC_OK, recreate_ec);
@@ -2868,9 +3064,13 @@ TEST_F(KvMetaManagerTest, RollbackContainsPhysicalDeleteExceptionWithoutReplay) 
     ASSERT_FALSE(recreated.write_session_id.empty());
     ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, recreated.write_session_id, {false}));
     EXPECT_EQ(0, indexer->GetStorageUsage());
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
 }
 
-TEST_F(KvMetaManagerTest, RollbackRejectsMalformedPhysicalDeleteResult) {
+TEST_F(KvMetaManagerTest, RollbackRetainsLedgerAfterMalformedPhysicalDeleteResult) {
     constexpr const char *kKey = "rollback-short-delete-result";
     auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {17}, 30);
     ASSERT_EQ(EC_OK, start_ec);
@@ -2895,12 +3095,18 @@ TEST_F(KvMetaManagerTest, RollbackRejectsMalformedPhysicalDeleteResult) {
     auto indexer =
         cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
-    EXPECT_EQ(0, indexer->GetStorageUsage());
+    EXPECT_EQ(17, indexer->GetStorageUsage());
     auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
     EXPECT_FALSE(values[0].found);
 
+    malformed->SetMode(FaultingDeleteNfsBackend::Mode::kSuccess);
+    manager_->DoCleanup();
+    ASSERT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(2, malformed->DeleteAttempts());
+    EXPECT_EQ(0, indexer->GetStorageUsage());
+    ASSERT_TRUE(manager_->ResumeMaintenance());
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         storage_manager->storage_map_["nfs_01"] = original;
@@ -3247,7 +3453,276 @@ TEST_F(KvMetaManagerTest, FailedWriteOnQuarantinedBackendKeepsItsAddressUntilCle
     }
 }
 
-TEST_F(KvMetaManagerTest, ExpiryDoesNotReplayFailedPhysicalDelete) {
+TEST_F(KvMetaManagerTest, ProvisionalBackendCommitsOnlyAfterDurableMetadataReservation) {
+    constexpr const char *kKey = "provisional-commit-success";
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto provisional = std::make_shared<ProvisionalCommitNfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, provisional->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = provisional;
+    }
+
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {41}, 30);
+    ASSERT_EQ(start_ec, EC_OK);
+    ASSERT_FALSE(start.write_session_id.empty());
+    ASSERT_EQ(provisional->commit_calls_, 1u);
+    ASSERT_EQ(provisional->committed_keys_.size(), 1u);
+    EXPECT_TRUE(HasCanonicalKvMetaObjectKey(provisional->committed_keys_.front()));
+    EXPECT_EQ(provisional->delete_calls_, 0u);
+    EXPECT_EQ(manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}), EC_OK);
+    EXPECT_EQ(manager_->Remove(&request_context_, kInstanceId, {kKey}), EC_OK);
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, ProvisionalBackendCommitsBatchAsDeadlineBoundedSingletons) {
+    constexpr const char *kFirstKey = "provisional-batch-commit-first";
+    constexpr const char *kSecondKey = "provisional-batch-commit-second";
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto provisional = std::make_shared<ProvisionalCommitNfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, provisional->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = provisional;
+    }
+
+    auto [start_ec, start] = manager_->StartWrite(
+        &request_context_, kInstanceId, {kFirstKey, kSecondKey}, {31, 37}, 30);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_FALSE(start.write_session_id.empty());
+    ASSERT_EQ(2u, provisional->commit_calls_);
+    ASSERT_EQ(2u, provisional->commit_batches_.size());
+    EXPECT_EQ(1u, provisional->commit_batches_[0].size());
+    EXPECT_EQ(1u, provisional->commit_batches_[1].size());
+    EXPECT_NE(provisional->commit_batches_[0][0], provisional->commit_batches_[1][0]);
+    EXPECT_EQ(EC_OK,
+              manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {false, false}));
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, ProvisionalBatchStopsCommittingWhenTheWriteDeadlineExpires) {
+    constexpr const char *kFirstKey = "provisional-expired-commit-first";
+    constexpr const char *kSecondKey = "provisional-expired-commit-second";
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto provisional = std::make_shared<ProvisionalCommitNfsBackend>(metrics_registry_);
+    provisional->commit_delay_ = std::chrono::milliseconds(1100);
+    ASSERT_EQ(EC_OK, provisional->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = provisional;
+    }
+
+    const auto [start_ec, start] = manager_->StartWrite(
+        &request_context_, kInstanceId, {kFirstKey, kSecondKey}, {31, 37}, 1);
+    EXPECT_EQ(EC_TIMEOUT, start_ec);
+    EXPECT_TRUE(start.write_session_id.empty());
+    EXPECT_EQ(1u, provisional->commit_calls_);
+    EXPECT_EQ(2u, provisional->delete_calls_);
+
+    auto [get_ec, values] = manager_->Get(
+        &request_context_, kInstanceId, {kFirstKey, kSecondKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(2u, values.size());
+    EXPECT_FALSE(values[0].found);
+    EXPECT_FALSE(values[1].found);
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, ProvisionalBackendNeverCommitsBeforeMetadataPersistenceBarrier) {
+    constexpr const char *kKey = "provisional-commit-after-sync";
+    auto *controlled_sync = InstallControlledSyncBackend(kInstanceId);
+    ASSERT_NE(nullptr, controlled_sync);
+    controlled_sync->BlockSyncAfter(0);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto provisional = std::make_shared<ProvisionalCommitNfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, provisional->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = provisional;
+    }
+
+    auto start_future = std::async(std::launch::async, [&]() {
+        RequestContext context("provisional-commit-ordering");
+        return manager_->StartWrite(&context, kInstanceId, {kKey}, {47}, 30);
+    });
+    ASSERT_TRUE(controlled_sync->WaitForBlockedSyncs(1, std::chrono::seconds(3)));
+    // The reservation exists in the in-memory index at this point, but the
+    // persistence barrier has not completed. A commit here would convert a
+    // crash into an unreachable, non-leased physical allocation.
+    EXPECT_EQ(0u, provisional->commit_calls_);
+    controlled_sync->ReleaseBlockedSync();
+
+    ASSERT_EQ(std::future_status::ready, start_future.wait_for(std::chrono::seconds(3)));
+    auto [start_ec, start] = start_future.get();
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_FALSE(start.write_session_id.empty());
+    EXPECT_EQ(1u, provisional->commit_calls_);
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {false}));
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, FailedProvisionalCommitRollsBackMetadataAndPhysicalAllocation) {
+    constexpr const char *kKey = "provisional-commit-failure";
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto provisional = std::make_shared<ProvisionalCommitNfsBackend>(metrics_registry_);
+    provisional->commit_error_ = EC_IO_ERROR;
+    ASSERT_EQ(EC_OK, provisional->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = provisional;
+    }
+
+    const auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {43}, 30);
+    EXPECT_EQ(start_ec, EC_IO_ERROR);
+    EXPECT_TRUE(start.write_session_id.empty());
+    EXPECT_EQ(provisional->commit_calls_, 1u);
+    EXPECT_EQ(provisional->delete_calls_, 1u);
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
+    ASSERT_EQ(get_ec, EC_OK);
+    ASSERT_EQ(values.size(), 1u);
+    EXPECT_FALSE(values.front().found);
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
+        KvMetaManager::InternalInstanceId(kInstanceId));
+    ASSERT_TRUE(indexer);
+    EXPECT_EQ(indexer->GetStorageUsage(), 0u);
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, FailedProvisionalCommitRetainsTombstoneWhenPhysicalRollbackFails) {
+    constexpr const char *kKey = "provisional-commit-and-delete-failure";
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto provisional = std::make_shared<ProvisionalCommitNfsBackend>(metrics_registry_);
+    provisional->commit_error_ = EC_IO_ERROR;
+    provisional->delete_error_ = EC_IO_ERROR;
+    ASSERT_EQ(EC_OK, provisional->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = provisional;
+    }
+
+    const auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {53}, 30);
+    EXPECT_EQ(EC_OUTCOME_UNKNOWN, start_ec);
+    EXPECT_TRUE(start.write_session_id.empty());
+    EXPECT_EQ(1u, provisional->commit_calls_);
+    EXPECT_EQ(1u, provisional->delete_calls_);
+    EXPECT_TRUE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
+        KvMetaManager::InternalInstanceId(kInstanceId));
+    ASSERT_TRUE(indexer);
+    CacheLocationMapVector maps;
+    const auto metadata = indexer->GetLocationMapsForMaintenance(
+        &request_context_, {KvMetaManager::InternalKey(kKey)}, maps);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), metadata.error_codes);
+    ASSERT_EQ(1u, maps.size());
+    const auto location = maps.front().find(KvMetaManager::StableLocationId(kKey));
+    ASSERT_NE(maps.front().end(), location);
+    ASSERT_TRUE(location->second);
+    EXPECT_EQ(CLS_DELETING, location->second->status());
+
+    provisional->delete_error_ = EC_OK;
+    manager_->DoCleanup();
+    ASSERT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(2u, provisional->delete_calls_);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1u, values.size());
+    EXPECT_FALSE(values.front().found);
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, LateSuccessfulFinishOnQuarantinedBackendCannotPublishOrReleaseEarly) {
+    constexpr const char *kKey = "quarantined-late-success";
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto quarantined = std::make_shared<QuarantinedWriteNfsBackend>(metrics_registry_, 2);
+    ASSERT_EQ(EC_OK, quarantined->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = quarantined;
+    }
+
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {43}, 1);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_FALSE(start.write_session_id.empty());
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
+    ASSERT_TRUE(indexer);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    // The data plane may report success after the client-visible commit lease,
+    // but publishing it would violate timeout/recovery ordering. The reusable
+    // allocation remains hidden and charged until the backend grace expires.
+    EXPECT_EQ(EC_TIMEOUT, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}));
+    EXPECT_EQ(EC_EXIST, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}));
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {false}));
+    EXPECT_EQ(0, quarantined->DeleteCalls());
+    EXPECT_EQ(43, indexer->GetStorageUsage());
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_FALSE(values.front().found);
+
+    ASSERT_TRUE(WaitUntil([&]() { return quarantined->DeleteCalls() == 1 && indexer->GetStorageUsage() == 0; },
+                          std::chrono::seconds(5)));
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {43}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {true}));
+    ASSERT_EQ(EC_OK, manager_->Remove(&request_context_, kInstanceId, {kKey}));
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, ExpiryRetainsTombstoneForRecoveryAfterFailedPhysicalDelete) {
     constexpr const char *kKey = "expiry-delete-fails";
     auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {29}, 1);
     ASSERT_EQ(EC_OK, start_ec);
@@ -3266,35 +3741,37 @@ TEST_F(KvMetaManagerTest, ExpiryDoesNotReplayFailedPhysicalDelete) {
     }
 
     ASSERT_TRUE(failing->WaitForDeleteAttempts(1, std::chrono::seconds(3)));
-    // A replay implementation would make a second call after its first short
-    // backoff. Leave enough time to detect that regression without coupling
-    // the production implementation to any retry interval.
+    // The active leader does not spin on the failed delete; it closes EMB and
+    // leaves the durable URI tombstone to the recovery owner.
     std::this_thread::sleep_for(std::chrono::milliseconds(350));
     EXPECT_EQ(1, failing->DeleteAttempts());
     EXPECT_TRUE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
     auto indexer =
         cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
-    EXPECT_EQ(0, indexer->GetStorageUsage());
+    EXPECT_EQ(29, indexer->GetStorageUsage());
     auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kKey});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
     EXPECT_FALSE(values[0].found);
-    {
-        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
-        storage_manager->storage_map_["nfs_01"] = original;
-    }
     EXPECT_EQ(EC_SERVICE_NOT_LEADER, manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {31}, 30).first);
+    failing->SetMode(FaultingDeleteNfsBackend::Mode::kSuccess);
     manager_->DoCleanup();
     ASSERT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(2, failing->DeleteAttempts());
+    EXPECT_EQ(0, indexer->GetStorageUsage());
     ASSERT_TRUE(manager_->ResumeMaintenance());
     auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {31}, 30);
     ASSERT_EQ(EC_OK, retry_ec);
     ASSERT_FALSE(retry.write_session_id.empty());
     EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
 }
 
-TEST_F(KvMetaManagerTest, ExpiryWorkerContainsUnknownDeleteExceptionAndFailsClosed) {
+TEST_F(KvMetaManagerTest, ExpiryWorkerContainsUnknownDeleteExceptionAndRecoveryRetriesIt) {
     auto [first_ec, first] = manager_->StartWrite(&request_context_, kInstanceId, {"expiry-throws-a"}, {37}, 1);
     ASSERT_EQ(EC_OK, first_ec);
     ASSERT_FALSE(first.write_session_id.empty());
@@ -3323,12 +3800,18 @@ TEST_F(KvMetaManagerTest, ExpiryWorkerContainsUnknownDeleteExceptionAndFailsClos
     auto indexer =
         cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
-    EXPECT_EQ(0, indexer->GetStorageUsage());
+    EXPECT_EQ(37, indexer->GetStorageUsage());
     auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {"expiry-throws-a", "expiry-throws-b"});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(2, values.size());
     EXPECT_FALSE(values[0].found);
     EXPECT_FALSE(values[1].found);
+    throwing->SetMode(FaultingDeleteNfsBackend::Mode::kSuccess);
+    manager_->DoCleanup();
+    ASSERT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(2, throwing->DeleteAttempts());
+    EXPECT_EQ(0, indexer->GetStorageUsage());
+    ASSERT_TRUE(manager_->ResumeMaintenance());
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         storage_manager->storage_map_["nfs_01"] = original;
@@ -3667,6 +4150,36 @@ TEST_F(KvMetaManagerTest, RejectsWriteTimeoutLimitOutsideTheProtocolRange) {
     EXPECT_FALSE(negative_grace_manager.Init());
 }
 
+TEST_F(KvMetaManagerTest, RejectsBackendCleanupGraceAboveServerLimitBeforeAllocation) {
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto unsafe = std::make_shared<QuarantinedWriteNfsBackend>(metrics_registry_, 181);
+    ASSERT_EQ(EC_OK, unsafe->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = unsafe;
+    }
+
+    auto [ec, result] = manager_->StartWrite(&request_context_, kInstanceId, {"unsafe-grace"}, {31}, 30);
+    EXPECT_EQ(EC_CORRUPTION, ec);
+    EXPECT_TRUE(result.write_session_id.empty());
+    EXPECT_TRUE(result.locations.empty());
+    EXPECT_EQ(0, unsafe->CreateCalls());
+    EXPECT_EQ(0, unsafe->DeleteCalls());
+
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
+    ASSERT_TRUE(indexer);
+    EXPECT_EQ(0, indexer->GetStorageUsage());
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
 TEST_F(KvMetaManagerTest, RejectsLocationUriLimitOutsideTheClientContract) {
     KvMetaManager::Limits limits;
     limits.max_location_uri_bytes = 0;
@@ -3778,7 +4291,7 @@ TEST_F(KvMetaManagerTest, RecoveryProtectsUntaggedActiveMarkerDuringRollingUpgra
     EXPECT_LT(still_active[0][0]->create_time(), std::int64_t{1} << 62);
 }
 
-TEST_F(KvMetaManagerTest, RecoveryContainsPhysicalDeleteExceptionWithoutReplay) {
+TEST_F(KvMetaManagerTest, RecoveryRetainsItsLedgerAndRetriesAfterPhysicalDeleteException) {
     constexpr const char *kKey = "recovery-delete-throws";
     auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {41}, 1);
     ASSERT_EQ(EC_OK, start_ec);
@@ -3797,7 +4310,7 @@ TEST_F(KvMetaManagerTest, RecoveryContainsPhysicalDeleteExceptionWithoutReplay) 
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         storage_manager->storage_map_["nfs_01"] = throwing;
     }
-    EXPECT_EQ(EC_OUTCOME_UNKNOWN, manager_->DoRecover());
+    EXPECT_EQ(EC_IO_ERROR, manager_->DoRecover());
     EXPECT_EQ(1, throwing->DeleteAttempts());
 
     auto indexer =
@@ -3809,22 +4322,20 @@ TEST_F(KvMetaManagerTest, RecoveryContainsPhysicalDeleteExceptionWithoutReplay) 
                                                      {{KvMetaManager::StableLocationId(kKey)}},
                                                      active_location);
     ASSERT_EQ(1, active_result.per_location_error_codes.size());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT}), active_result.per_location_error_codes[0]);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), active_result.per_location_error_codes[0]);
     ASSERT_EQ(1, active_location.size());
     ASSERT_EQ(1, active_location[0].size());
-    EXPECT_FALSE(active_location[0][0]);
-    // Recovery did durably remove the stale owner, but keeps the conservative
-    // pre-scan usage while physical cleanup is unresolved and the gate is
-    // closed. A subsequent operator-triggered recovery rebuilds it exactly.
+    ASSERT_TRUE(active_location[0][0]);
+    // The stale, read-invisible owner remains the durable URI ledger while
+    // physical cleanup is unresolved. A later recovery safely retries it.
     EXPECT_EQ(41, indexer->GetStorageUsage());
 
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         storage_manager->storage_map_["nfs_01"] = original;
     }
-    // After backend/operator reconciliation, a fresh recovery sees no stale
-    // metadata and never replays the uncertain physical delete against a
-    // reusable URI.
+    // After backend recovery, a fresh pass replays the immutable allocation
+    // identity, confirms absence, and only then removes metadata.
     ASSERT_EQ(EC_OK, manager_->DoRecover());
     EXPECT_EQ(1, throwing->DeleteAttempts());
     EXPECT_EQ(0, indexer->GetStorageUsage());
@@ -3834,7 +4345,7 @@ TEST_F(KvMetaManagerTest, RecoveryContainsPhysicalDeleteExceptionWithoutReplay) 
     ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
 }
 
-TEST_F(KvMetaManagerTest, RecoveryStopsGloballyAfterTheFirstUncertainPhysicalDelete) {
+TEST_F(KvMetaManagerTest, RecoveryRetainsEveryCleanupLedgerAcrossPhysicalFailures) {
     constexpr const char *kPeerInstance = "recovery-physical-failure-peer";
     constexpr const char *kFirstKey = "recovery-physical-failure-first";
     constexpr const char *kPeerKey = "recovery-physical-failure-second";
@@ -3860,8 +4371,8 @@ TEST_F(KvMetaManagerTest, RecoveryStopsGloballyAfterTheFirstUncertainPhysicalDel
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         storage_manager->storage_map_["nfs_01"] = failing;
     }
-    EXPECT_EQ(EC_OUTCOME_UNKNOWN, manager_->DoRecover());
-    EXPECT_EQ(1, failing->DeleteAttempts());
+    EXPECT_EQ(EC_IO_ERROR, manager_->DoRecover());
+    EXPECT_EQ(2, failing->DeleteAttempts());
     EXPECT_TRUE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
 
     const auto metadata_present = [&](const std::string &instance_id, const std::string &key) {
@@ -3889,20 +4400,20 @@ TEST_F(KvMetaManagerTest, RecoveryStopsGloballyAfterTheFirstUncertainPhysicalDel
         return false;
     };
 
-    // Recovery must stop at the namespace-wide circuit breaker. Exactly one
-    // instance loses its stale owner; the other remains durably addressable
-    // for the next operator-triggered pass instead of becoming another
-    // unreachable physical orphan.
+    // Each failed physical cleanup retains its own durable URI ledger; no
+    // instance becomes an unreachable orphan even though recovery scans the
+    // complete namespace.
     const bool first_present = metadata_present(kInstanceId, kFirstKey);
     const bool peer_present = metadata_present(kPeerInstance, kPeerKey);
-    EXPECT_NE(first_present, peer_present);
+    EXPECT_TRUE(first_present);
+    EXPECT_TRUE(peer_present);
 
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         storage_manager->storage_map_["nfs_01"] = original;
     }
     ASSERT_EQ(EC_OK, manager_->DoRecover());
-    EXPECT_EQ(1, failing->DeleteAttempts());
+    EXPECT_EQ(2, failing->DeleteAttempts());
     EXPECT_FALSE(metadata_present(kInstanceId, kFirstKey));
     EXPECT_FALSE(metadata_present(kPeerInstance, kPeerKey));
     ASSERT_TRUE(manager_->ResumeMaintenance());
@@ -4547,7 +5058,7 @@ TEST_F(KvMetaManagerTest, ReclaimerNeverDeletesACorruptRootPathOwnershipRecord) 
     }
 }
 
-TEST_F(KvMetaManagerTest, ReclaimerNeverTreatsAnUnexpectedMissingOwnerAsDeleteAuthority) {
+TEST_F(KvMetaManagerTest, ReclaimerDetectsAnUnexpectedMissingOwnerAfterDeletingTheCapturedGeneration) {
     constexpr const char *kGroup = "reclaim-missing-owner-group";
     constexpr const char *kInstance = "reclaim-missing-owner-instance";
     constexpr const char *kKey = "reclaim-missing-owner-object";
@@ -4559,7 +5070,7 @@ TEST_F(KvMetaManagerTest, ReclaimerNeverTreatsAnUnexpectedMissingOwnerAsDeleteAu
     auto original = storage_manager->GetDataStorageBackend("nfs_01");
     ASSERT_TRUE(original);
     auto tracking =
-        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kError);
+        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kSuccess);
     ASSERT_EQ(EC_OK, tracking->Open(original->GetStorageConfig(), request_context_.trace_id()));
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
@@ -4583,15 +5094,16 @@ TEST_F(KvMetaManagerTest, ReclaimerNeverTreatsAnUnexpectedMissingOwnerAsDeleteAu
     ASSERT_TRUE(WaitUntil(has_finite_retirement_fence, std::chrono::seconds(2)));
 
     // Model an unsupported actor removing the retired owner before this
-    // worker's exact delete. The old address could already have been reused,
-    // so EC_NOENT must stop the worker without any backend Delete.
+    // worker's exact metadata delete. The captured URI identifies an immutable
+    // allocation generation, so physical cleanup remains safe; the unexpected
+    // metadata transition must still fail closed instead of changing usage.
     const auto raw_delete = indexer->Delete(&request_context_, {internal_key});
     ASSERT_EQ(EC_OK, raw_delete.ec);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), raw_delete.error_codes);
     ASSERT_TRUE(indexer->Sync({internal_key}));
     ASSERT_TRUE(WaitUntil([&]() { return manager_->maintenance_cancelled_.load(std::memory_order_acquire); },
                           std::chrono::seconds(2)));
-    EXPECT_EQ(0, tracking->DeleteAttempts());
+    EXPECT_EQ(1, tracking->DeleteAttempts());
 
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
@@ -4603,7 +5115,7 @@ TEST_F(KvMetaManagerTest, ReclaimerNeverTreatsAnUnexpectedMissingOwnerAsDeleteAu
     ASSERT_TRUE(manager_->ResumeMaintenance());
 }
 
-TEST_F(KvMetaManagerTest, ReclaimerFailsClosedOnAReplacementOwnerWithoutDeletingEitherAllocation) {
+TEST_F(KvMetaManagerTest, ReclaimerDeletesOnlyTheCapturedGenerationBeforeRejectingAReplacementOwner) {
     constexpr const char *kGroup = "reclaim-replaced-owner-group";
     constexpr const char *kInstance = "reclaim-replaced-owner-instance";
     constexpr const char *kKey = "reclaim-replaced-owner-object";
@@ -4615,7 +5127,7 @@ TEST_F(KvMetaManagerTest, ReclaimerFailsClosedOnAReplacementOwnerWithoutDeleting
     auto original = storage_manager->GetDataStorageBackend("nfs_01");
     ASSERT_TRUE(original);
     auto tracking =
-        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kError);
+        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kSuccess);
     ASSERT_EQ(EC_OK, tracking->Open(original->GetStorageConfig(), request_context_.trace_id()));
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
@@ -4646,7 +5158,7 @@ TEST_F(KvMetaManagerTest, ReclaimerFailsClosedOnAReplacementOwnerWithoutDeleting
     ASSERT_TRUE(WaitUntil([&]() { return manager_->maintenance_cancelled_.load(std::memory_order_acquire); },
                           std::chrono::seconds(2)));
 
-    EXPECT_EQ(0, tracking->DeleteAttempts());
+    EXPECT_EQ(1, tracking->DeleteAttempts());
     EXPECT_EQ(90, indexer->GetStorageUsage());
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
@@ -4841,7 +5353,7 @@ TEST_F(KvMetaManagerTest, ReclaimerNeverEvictsAnActiveWriteAndReclaimsAfterCommi
     ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
 }
 
-TEST_F(KvMetaManagerTest, ReclaimerDoesNotReplayAnUncertainPhysicalDeleteAndFailsClosed) {
+TEST_F(KvMetaManagerTest, ReclaimerRetainsItsLedgerAndRetriesPhysicalDeleteUntilConfirmedAbsent) {
     constexpr const char *kGroup = "reclaim-delete-failure-group";
     constexpr const char *kInstance = "reclaim-delete-failure-instance";
     constexpr const char *kKey = "delete-failure-object";
@@ -4865,21 +5377,135 @@ TEST_F(KvMetaManagerTest, ReclaimerDoesNotReplayAnUncertainPhysicalDeleteAndFail
     cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
     ASSERT_TRUE(manager_->ResumeMaintenance());
     ASSERT_TRUE(faulting->WaitForDeleteAttempts(1, std::chrono::seconds(2)));
-    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    EXPECT_EQ(1, faulting->DeleteAttempts());
-    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_attempted_object_count").Get());
-    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_uncertain_object_count").Get());
-    EXPECT_EQ(90, metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_uncertain_bytes").Get());
-    EXPECT_TRUE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
-    auto [closed_ec, closed] = manager_->StartWrite(&request_context_, kInstance, {"no-orphan-amplification"}, {7}, 30);
-    EXPECT_EQ(EC_SERVICE_NOT_LEADER, closed_ec);
-    EXPECT_TRUE(closed.locations.empty());
+    ASSERT_TRUE(faulting->WaitForDeleteAttempts(2, std::chrono::seconds(2)));
+
+    // No backend failure can release logical quota or erase the only durable
+    // URI ledger. The value is already hidden by the tombstone, but all 90
+    // bytes remain charged until physical absence is confirmed.
+    EXPECT_EQ(90, indexer->GetStorageUsage());
+    EXPECT_FALSE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
+    CacheLocationMapVector maps;
+    const auto metadata = indexer->GetLocationMapsForMaintenance(
+        &request_context_, {KvMetaManager::InternalKey(kKey)}, maps);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), metadata.error_codes);
+    ASSERT_EQ(1, maps.size());
+    const auto location_it = maps.front().find(KvMetaManager::StableLocationId(kKey));
+    ASSERT_NE(maps.front().end(), location_it);
+    ASSERT_TRUE(location_it->second);
+    EXPECT_EQ(CLS_DELETING, location_it->second->status());
 
     auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {kKey});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
     EXPECT_FALSE(values[0].found);
+
+    faulting->SetMode(FaultingDeleteNfsBackend::Mode::kSuccess);
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(3)));
+    EXPECT_GE(metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_attempted_object_count").Get(), 3);
+    EXPECT_GE(metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_uncertain_object_count").Get(), 2);
+    EXPECT_GE(metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_uncertain_bytes").Get(), 180);
+    auto [open_ec, opened] =
+        manager_->StartWrite(&request_context_, kInstance, {"capacity-is-reusable"}, {7}, 30);
+    ASSERT_EQ(EC_OK, open_ec);
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, opened.write_session_id, {false}));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerPhysicalDeleteDoesNotHoldTheEmbGroupAdmissionShard) {
+    constexpr const char *kGroup = "reclaim-nonblocking-io-group";
+    constexpr const char *kInstance = "reclaim-nonblocking-io-instance";
+    constexpr const char *kRetiredKey = "slow-delete-object";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
+    CommitObject(kInstance, kRetiredKey, 90);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto blocking = std::make_shared<BlockingDeleteNfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, blocking->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = blocking;
+    }
+
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(blocking->WaitForDelete(std::chrono::seconds(2)));
+
+    // The same key is fenced by its durable tombstone, but unrelated capacity
+    // in the group remains usable while the backend is slow. This is the
+    // isolation boundary that keeps GC I/O off the EMB request critical path.
+    auto [same_key_ec, same_key] = manager_->StartWrite(&request_context_, kInstance, {kRetiredKey}, {90}, 30);
+    EXPECT_EQ(EC_EXIST, same_key_ec);
+    EXPECT_TRUE(same_key.locations.empty());
+
+    auto unrelated = std::async(std::launch::async, [&]() {
+        RequestContext context("put-during-reclaim-physical-delete");
+        return manager_->StartWrite(&context, kInstance, {"unrelated-small-object"}, {5}, 30);
+    });
+    ASSERT_EQ(std::future_status::ready, unrelated.wait_for(std::chrono::milliseconds(500)));
+    auto [unrelated_ec, unrelated_start] = unrelated.get();
+    ASSERT_EQ(EC_OK, unrelated_ec);
+    ASSERT_FALSE(unrelated_start.write_session_id.empty());
+
+    blocking->ReleaseDelete();
+    EXPECT_EQ(EC_OK,
+              manager_->FinishWrite(
+                  &request_context_, kInstance, unrelated_start.write_session_id, std::vector<bool>{false}));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, RecoveryResumesAReclaimerPhysicalDeleteFromTheDurableTombstone) {
+    constexpr const char *kGroup = "reclaim-restart-retry-group";
+    constexpr const char *kInstance = "reclaim-restart-retry-instance";
+    constexpr const char *kKey = "reclaim-restart-retry-object";
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
+    CommitObject(kInstance, kKey, 90);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto faulting =
+        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kError);
+    ASSERT_EQ(EC_OK, faulting->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = faulting;
+    }
+
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(faulting->WaitForDeleteAttempts(1, std::chrono::seconds(2)));
+    EXPECT_EQ(90, indexer->GetStorageUsage());
+
+    // Drop every volatile pending queue entry as a demotion/restart would.
+    // Recovery must rediscover the persisted URI and continue the same
+    // idempotent physical-first transaction.
+    manager_->DoCleanup();
+    faulting->SetMode(FaultingDeleteNfsBackend::Mode::kSuccess);
+    ASSERT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_GE(faulting->DeleteAttempts(), 2);
+    EXPECT_EQ(0, indexer->GetStorageUsage());
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {kKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_FALSE(values.front().found);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         storage_manager->storage_map_["nfs_01"] = original;
@@ -5015,7 +5641,7 @@ TEST_F(KvMetaManagerTest, ReclaimerGracePeriodForOneGroupDoesNotBlockAnotherGrou
     ASSERT_TRUE(WaitUntil([&]() { return slow_indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
 }
 
-TEST_F(KvMetaManagerTest, ReclaimerRetriesMetadataSyncBeforePhysicalDeleteAndBlocksUnsafeAdmission) {
+TEST_F(KvMetaManagerTest, ReclaimerDoesNotRepeatConfirmedPhysicalDeleteWhileRetryingMetadataSync) {
     constexpr const char *kGroup = "reclaim-sync-failure-group";
     constexpr const char *kInstance = "reclaim-sync-failure-instance";
     constexpr const char *kKey = "sync-failure-object";
@@ -5028,14 +5654,17 @@ TEST_F(KvMetaManagerTest, ReclaimerRetriesMetadataSyncBeforePhysicalDeleteAndBlo
     auto storage_manager = registry_manager_->data_storage_manager();
     ASSERT_TRUE(storage_manager);
     std::shared_ptr<DataStorageBackend> original;
-    auto faulting =
-        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kError);
+    auto tracking =
+        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kSuccess);
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         original = storage_manager->storage_map_.at("nfs_01");
-        ASSERT_EQ(EC_OK, faulting->Open(original->GetStorageConfig(), request_context_.trace_id()));
-        storage_manager->storage_map_["nfs_01"] = faulting;
+        ASSERT_EQ(EC_OK, tracking->Open(original->GetStorageConfig(), request_context_.trace_id()));
+        storage_manager->storage_map_["nfs_01"] = tracking;
     }
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
 
     cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 200);
     ASSERT_TRUE(manager_->ResumeMaintenance());
@@ -5047,23 +5676,18 @@ TEST_F(KvMetaManagerTest, ReclaimerRetriesMetadataSyncBeforePhysicalDeleteAndBlo
     auto [blocked_ec, blocked] = manager_->StartWrite(&request_context_, kInstance, {"new-object"}, {10}, 30);
     EXPECT_EQ(EC_EXIST, blocked_ec);
     EXPECT_TRUE(blocked.locations.empty());
-    EXPECT_EQ(0, faulting->DeleteAttempts());
+    EXPECT_EQ(1, tracking->DeleteAttempts());
 
-    ASSERT_TRUE(faulting->WaitForDeleteAttempts(1, std::chrono::seconds(2)));
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    EXPECT_EQ(1, faulting->DeleteAttempts());
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.pending_object_count").Get() == 0; },
+        std::chrono::seconds(3)));
+    EXPECT_EQ(1, tracking->DeleteAttempts());
+    EXPECT_EQ(0, indexer->GetStorageUsage());
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         storage_manager->storage_map_["nfs_01"] = original;
     }
 
-    auto [closed_ec, closed] = manager_->StartWrite(&request_context_, kInstance, {"new-object"}, {10}, 30);
-    EXPECT_EQ(EC_SERVICE_NOT_LEADER, closed_ec);
-    EXPECT_TRUE(closed.locations.empty());
-
-    manager_->DoCleanup();
-    ASSERT_EQ(EC_OK, manager_->DoRecover());
-    ASSERT_TRUE(manager_->ResumeMaintenance());
     auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstance, {"new-object"}, {10}, 30);
     ASSERT_EQ(EC_OK, start_ec);
     ASSERT_EQ(1, start.locations.size());
@@ -5165,6 +5789,123 @@ TEST_F(KvMetaManagerTest, ReclaimerCreatesStorageTypeHeadroomBelowTheGroupWaterm
     auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstance, {"new-type-object"}, {40}, 30);
     ASSERT_EQ(EC_OK, retry_ec);
     EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, retry.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerCreatesPhysicalHeadroomAfterAuthoritativeBackendNoSpace) {
+    constexpr const char *kGroup = "reclaim-backend-capacity-group";
+    constexpr const char *kInstance = "reclaim-backend-capacity-instance";
+    CreateReclaimGroup(kGroup, kInstance, 1000, 1.0, 0);
+    CommitObject(kInstance, "old-backend-object", 70);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto capacity = std::make_shared<CapacityRejectingNfsBackend>(
+        metrics_registry_, CapacityRejectingNfsBackend::Mode::kOnce);
+    ASSERT_EQ(EC_OK, capacity->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = capacity;
+    }
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+
+    // Both logical quotas have ample headroom. Only the backend's explicit
+    // EC_NOSPC should trigger this type-targeted eviction.
+    auto [blocked_ec, blocked] = manager_->StartWrite(&request_context_, kInstance, {"new-backend-object"}, {40}, 30);
+    EXPECT_EQ(EC_NOSPC, blocked_ec);
+    EXPECT_TRUE(blocked.locations.empty());
+    EXPECT_EQ(1, capacity->CreateAttempts());
+    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.admission_demand_count").Get());
+    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.backend_capacity_demand_count").Get());
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.admission_demand_group_count").Get() == 0; },
+        std::chrono::seconds(2)));
+
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstance, {"new-backend-object"}, {40}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    ASSERT_EQ(1, retry.locations.size());
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, retry.write_session_id, {false}));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, BackendCapacityRetriesDoNotDuplicateInFlightEviction) {
+    constexpr const char *kGroup = "reclaim-backend-retry-group";
+    constexpr const char *kInstance = "reclaim-backend-retry-instance";
+    constexpr const char *kOldA = "backend-retry-old-a";
+    constexpr const char *kOldB = "backend-retry-old-b";
+    CreateReclaimGroup(kGroup, kInstance, 1000, 1.0, 500);
+    CommitObject(kInstance, kOldA, 30);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CommitObject(kInstance, kOldB, 30);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto capacity = std::make_shared<CapacityRejectingNfsBackend>(
+        metrics_registry_, CapacityRejectingNfsBackend::Mode::kAlways);
+    ASSERT_EQ(EC_OK, capacity->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = capacity;
+    }
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    const auto retired_count = [&]() {
+        std::size_t count = 0;
+        for (const char *key : {kOldA, kOldB}) {
+            CacheLocationMapVector maps;
+            const auto result = indexer->GetLocationMapsForMaintenance(
+                &request_context_, {KvMetaManager::InternalKey(key)}, maps);
+            if (result.error_codes.size() != 1 || result.error_codes[0] != EC_OK || maps.size() != 1) {
+                continue;
+            }
+            const auto it = maps.front().find(KvMetaManager::StableLocationId(key));
+            if (it != maps.front().end() && it->second && it->second->status() == CLS_DELETING) {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    EXPECT_EQ(EC_NOSPC,
+              manager_->StartWrite(&request_context_, kInstance, {"backend-retry-new"}, {20}, 30).first);
+    ASSERT_TRUE(WaitUntil([&]() { return retired_count() == 1; }, std::chrono::seconds(2)));
+    EXPECT_DOUBLE_EQ(20, metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_bytes").Get());
+
+    // Re-publishing the same failure while the first object is inside reader
+    // grace must be covered by its pending bytes, not retire the second key.
+    EXPECT_EQ(EC_NOSPC,
+              manager_->StartWrite(&request_context_, kInstance, {"backend-retry-new"}, {20}, 30).first);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_EQ(1, retired_count());
+    EXPECT_EQ(60, indexer->GetStorageUsage());
+    EXPECT_DOUBLE_EQ(20, metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_bytes").Get());
+
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 30; }, std::chrono::seconds(2)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(30, indexer->GetStorageUsage());
+    EXPECT_EQ(0, retired_count());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_bytes").Get());
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.admission_demand_group_count").Get() == 0; },
+        std::chrono::seconds(2)));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
 }
 
 TEST_F(KvMetaManagerTest, ReclaimerTargetsKeyAdmissionPressureToTheFullInstance) {
@@ -5610,6 +6351,36 @@ TEST_F(KvMetaManagerTest, RegistrationReturnsOnlyExactObjectStorageCandidates) {
     ASSERT_TRUE(parsed_configs.front());
     EXPECT_EQ("nfs_01", parsed_configs.front()->global_unique_name());
     EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, parsed_configs.front()->type());
+}
+
+TEST_F(KvMetaManagerTest, RegistrationRejectsUnboundedProvisionalControlPlaneTimeouts) {
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto provisional = std::make_shared<ProvisionalCommitNfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, provisional->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = provisional;
+    }
+
+    for (const std::int64_t timeout :
+         {std::int64_t{0}, kKvMetaMaxExactControlRpcTimeoutSeconds + 1}) {
+        provisional->control_timeout_seconds_ = timeout;
+        EXPECT_EQ(EC_CONFIG_ERROR,
+                  manager_->RegisterInstance(
+                      &request_context_, "default", "unsafe-provisional-timeout", "").first);
+    }
+    provisional->control_timeout_seconds_ = kKvMetaMaxExactControlRpcTimeoutSeconds;
+    EXPECT_EQ(EC_OK,
+              manager_->RegisterInstance(
+                  &request_context_, "default", "bounded-provisional-timeout", "").first);
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
 }
 
 TEST_F(KvMetaManagerTest, RegistrationRejectsDuplicateStorageCandidates) {
