@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
+#include <memory>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 
 using namespace kv_cache_manager;
@@ -24,6 +26,66 @@ TEST_F(StorageConfigTest, TestNfsStorageSpecJsonize) {
     spec2.FromJsonString(json);
     EXPECT_EQ(spec.root_path(), spec2.root_path());
     EXPECT_EQ(spec.key_count_per_file(), spec2.key_count_per_file());
+}
+
+TEST_F(StorageConfigTest, KvMetaObjectStorageTypesExcludeExternalObservationsAndSentinels) {
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_DUMMY));
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+
+    EXPECT_FALSE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    EXPECT_FALSE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
+    EXPECT_FALSE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    EXPECT_FALSE(IsKvMetaObjectStorageType(DataStorageType::COUNT));
+}
+
+TEST_F(StorageConfigTest, KvMetaCallerBufferLifetimeExcludesMooncakeOnlyFromAdmission) {
+    EXPECT_TRUE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    EXPECT_TRUE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    EXPECT_TRUE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+    EXPECT_TRUE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    EXPECT_TRUE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+    EXPECT_TRUE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_DUMMY));
+
+    // Mooncake remains an owned-object type so recovery can recognize old
+    // metadata, but new KVMeta traffic cannot use it without a DMA drain API.
+    EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    EXPECT_FALSE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    EXPECT_FALSE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+}
+
+TEST_F(StorageConfigTest, KvMetaPaceNamespaceRequiresTheRegisteredMediaPool) {
+    auto ssd_spec = std::make_shared<TairMemPoolStorageSpec>();
+    ssd_spec->set_media_type(kTairMemPoolMediaTypeSsd);
+    const StorageConfig ssd(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace_ssd", ssd_spec);
+    EXPECT_TRUE(HasSafeConfiguredKvMetaNamespace(ssd));
+    EXPECT_TRUE(UriMatchesConfiguredKvMetaNamespace(
+        DataStorageUri("pace://pace_ssd/42?media_type=5&size=17"), ssd.type(), ssd));
+    EXPECT_FALSE(UriMatchesConfiguredKvMetaNamespace(
+        DataStorageUri("pace://pace_ssd/42?media_type=2&size=17"), ssd.type(), ssd));
+    EXPECT_FALSE(UriMatchesConfiguredKvMetaNamespace(DataStorageUri("pace://pace_ssd/42?size=17"), ssd.type(), ssd));
+
+    auto dram_spec = std::make_shared<TairMemPoolStorageSpec>();
+    dram_spec->set_media_type(kTairMemPoolMediaTypeDram);
+    const StorageConfig dram(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "pace_dram", dram_spec);
+    EXPECT_TRUE(UriMatchesConfiguredKvMetaNamespace(
+        DataStorageUri("pace://pace_dram/7?media_type=2&size=1"), dram.type(), dram));
+    EXPECT_FALSE(UriMatchesConfiguredKvMetaNamespace(
+        DataStorageUri("pace://pace_dram/7?media_type=5&size=1"), dram.type(), dram));
+    EXPECT_FALSE(UriMatchesConfiguredKvMetaNamespace(DataStorageUri("pace://pace_dram/7?size=1"), dram.type(), dram));
+
+    auto legacy_spec = std::make_shared<TairMemPoolStorageSpec>();
+    const StorageConfig legacy(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "pace_legacy", legacy_spec);
+    EXPECT_TRUE(
+        UriMatchesConfiguredKvMetaNamespace(DataStorageUri("pace://pace_legacy/0?size=1"), legacy.type(), legacy));
+    EXPECT_TRUE(UriMatchesConfiguredKvMetaNamespace(
+        DataStorageUri("pace://pace_legacy/0?media_type=0&size=1"), legacy.type(), legacy));
+    EXPECT_FALSE(UriMatchesConfiguredKvMetaNamespace(
+        DataStorageUri("pace://pace_legacy/0?media_type=2&size=1"), legacy.type(), legacy));
 }
 
 TEST_F(StorageConfigTest, TestStorageConfigJsonizeNfs) {

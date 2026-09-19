@@ -1,5 +1,6 @@
 #include "kv_cache_manager/client/src/internal/sdk/local_file_sdk.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
@@ -18,6 +19,20 @@
 #include "kv_cache_manager/common/logger.h"
 
 namespace {
+
+#if !defined(USING_CUDA) && !defined(USING_MUSA)
+bool HasActiveGpuBuffer(const kv_cache_manager::BlockBuffers &buffers) {
+    for (const auto &buffer : buffers) {
+        for (const auto &iov : buffer.iovs) {
+            if (!iov.ignore && iov.size > 0 && iov.type == kv_cache_manager::MemoryType::GPU) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+#endif
+
 class MmapHelper {
 public:
     MmapHelper(int fd, void *file_mem, size_t file_size) : fd_(fd), file_mem_(file_mem), file_size_(file_size) {}
@@ -247,6 +262,12 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
         KVCM_LOG_WARN("Init local file sdk failed, spec_byte_sizes_per_block is empty");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
+    variable_object_size_enabled_ = sdk_backend_config->variable_object_size_enabled();
+    max_variable_object_bytes_ = sdk_backend_config->max_variable_object_bytes();
+    if (variable_object_size_enabled_ && max_variable_object_bytes_ == 0) {
+        KVCM_LOG_WARN("Init local file sdk failed, max variable object bytes is zero");
+        return ER_INVALID_SDKBACKEND_CONFIG;
+    }
     timeout_config_ = sdk_backend_config->timeout_config();
 #if defined(USING_CUDA)
     CHECK_CUDA_ERROR_RETURN(cudaStreamCreateWithFlags(&cuda_stream_, cudaStreamNonBlocking),
@@ -285,11 +306,26 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
 SdkType LocalFileSdk::Type() { return SdkType::LOCAL_FILE; }
 
+bool LocalFileSdk::IsAllowedObjectSize(std::size_t size) const {
+    if (variable_object_size_enabled_) {
+        return size > 0 && size <= max_variable_object_bytes_;
+    }
+    return std::any_of(spec_byte_sizes_per_block_.begin(), spec_byte_sizes_per_block_.end(), [size](const auto &entry) {
+        return entry.second > 0 && size == static_cast<std::size_t>(entry.second);
+    });
+}
+
 ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
     if (remote_uris.size() != local_buffers.size()) {
         KVCM_LOG_ERROR("Get failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+#if !defined(USING_CUDA) && !defined(USING_MUSA)
+    if (HasActiveGpuBuffer(local_buffers)) {
+        KVCM_LOG_ERROR("Get failed, GPU buffer requires a CUDA or MUSA client build");
+        return ER_UNSUPPORTED_MEMORY_TYPE;
+    }
+#endif
     // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
     const int64_t deadline_ms = SteadyClockMs() + timeout_config_.get_timeout_ms();
     auto group_map = SplitByPath(remote_uris, local_buffers);
@@ -323,6 +359,12 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
         KVCM_LOG_ERROR("Put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+#if !defined(USING_CUDA) && !defined(USING_MUSA)
+    if (HasActiveGpuBuffer(local_buffers)) {
+        KVCM_LOG_ERROR("Put failed, GPU buffer requires a CUDA or MUSA client build");
+        return ER_UNSUPPORTED_MEMORY_TYPE;
+    }
+#endif
     // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
     const int64_t deadline_ms = SteadyClockMs() + timeout_config_.put_timeout_ms();
     // 预分配并按原始下标回填，保证同序契约：actual_remote_uris[i] 对应 remote_uris[i]。
@@ -495,14 +537,7 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
         auto item = LocalFileItem::FromUri(remote_uri);
 
         // 防御性校验：URI 的 size 必须在允许的 spec 范围内
-        bool size_valid = false;
-        for (const auto &[spec_name, byte_size_per_block] : spec_byte_sizes_per_block_) {
-            if (item.size == byte_size_per_block) {
-                size_valid = true;
-                break;
-            }
-        }
-        if (!size_valid) {
+        if (!IsAllowedObjectSize(item.size)) {
             KVCM_LOG_ERROR("Get failed, URI size [%zu] not in allowed spec_byte_sizes_per_block, uri: %s",
                            item.size,
                            remote_uri.ToUriString().c_str());
@@ -588,14 +623,7 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
         auto item = LocalFileItem::FromUri(remote_uri);
 
         // 防御性校验：URI 的 size 必须在允许的 spec 范围内
-        bool size_valid = false;
-        for (const auto &[spec_name, byte_size_per_block] : spec_byte_sizes_per_block_) {
-            if (item.size == byte_size_per_block) {
-                size_valid = true;
-                break;
-            }
-        }
-        if (!size_valid) {
+        if (!IsAllowedObjectSize(item.size)) {
             KVCM_LOG_ERROR("Put failed, URI size [%zu] not in allowed spec_byte_sizes_per_block, uri: %s",
                            item.size,
                            remote_uri.ToUriString().c_str());

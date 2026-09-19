@@ -22,9 +22,9 @@ cc_library(
         "-fcoroutines",
     ],
     deps = [
-        "//kv_cache_manager/common:build_version",
         ":grpc_wrapper",
         "//kv_cache_manager/common",
+        "//kv_cache_manager/common:build_version",
         "//kv_cache_manager/common:crash_handler",
         "//kv_cache_manager/common:loop_thread",
         "//kv_cache_manager/config:coordination_backend",
@@ -33,6 +33,7 @@ cc_library(
         "//kv_cache_manager/manager:cache_garbage_collector",
         "//kv_cache_manager/manager:cache_location_view",
         "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/manager:kv_meta_manager",
         "//kv_cache_manager/manager:write_location_manager",
         "//kv_cache_manager/metrics:metrics_lifecycle",
         "//kv_cache_manager/metrics:metrics_registry",
@@ -81,6 +82,27 @@ cc_library(
         "//kv_cache_manager/service/util:proto_message_json_util",
         "//kv_cache_manager/service/util:service_call_guard",
         "@rapidjson",
+    ],
+)
+
+cc_library(
+    name = "kv_meta_service_impl",
+    srcs = [
+        "kv_meta_service_impl.cc",
+    ],
+    hdrs = [
+        "kv_meta_service_impl.h",
+    ],
+    deps = [
+        ":service_impl_base",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/data_storage:common_define",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/manager:kv_meta_manager",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/service/util:service_call_guard",
     ],
 )
 

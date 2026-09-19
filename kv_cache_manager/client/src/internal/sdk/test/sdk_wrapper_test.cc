@@ -1,14 +1,17 @@
 #include <atomic>
 #include <chrono>
-#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
 #include <fcntl.h>
 #include <future>
 #include <gtest/gtest.h>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
@@ -42,6 +45,22 @@ public:
     }
 
 private:
+    int CreateAnonymousSharedMemoryFile() const {
+        const std::string filename = root_path_ + "shared-memory-XXXXXX";
+        std::vector<char> path(filename.begin(), filename.end());
+        path.push_back('\0');
+
+        const int fd = mkstemp(path.data());
+        if (fd < 0) {
+            return -1;
+        }
+        if (unlink(path.data()) != 0) {
+            close(fd);
+            return -1;
+        }
+        return fd;
+    }
+
     std::unique_ptr<ClientConfig> CreateTestClientConfig() {
         auto client_config = std::make_unique<ClientConfig>();
         std::string client_config_str = R"({
@@ -116,6 +135,326 @@ TEST_F(SdkWrapperTest, TestInit) {
     ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
 }
 
+TEST_F(SdkWrapperTest, TestKvMetaRuntimePolicyDoesNotMutateReusableClientConfig) {
+    const auto source_wrapper_config = client_config_->sdk_wrapper_config();
+    ASSERT_TRUE(source_wrapper_config);
+    const auto source_backend = source_wrapper_config->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ASSERT_TRUE(source_backend);
+    ASSERT_FALSE(source_backend->variable_object_size_enabled());
+
+    SdkWrapper kv_meta_wrapper;
+    ASSERT_EQ(ER_OK, kv_meta_wrapper.InitForKvMeta(client_config_, init_params_, 4096));
+    ASSERT_NE(kv_meta_wrapper.wrapper_config_, source_wrapper_config);
+    const auto kv_meta_backend =
+        kv_meta_wrapper.wrapper_config_->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ASSERT_TRUE(kv_meta_backend);
+    // The wrapper clone is now an immutable per-type template. Each storage
+    // candidate receives its own runtime copy, preventing one candidate's
+    // registration fields from poisoning another candidate of the same type.
+    EXPECT_FALSE(kv_meta_backend->variable_object_size_enabled());
+    EXPECT_EQ(0, kv_meta_backend->max_variable_object_bytes());
+    EXPECT_FALSE(source_backend->variable_object_size_enabled());
+
+    // Reusing the same parsed config for the fixed-block wrapper keeps both
+    // its original object identity and the disabled variable-size policy.
+    SdkWrapper regular_wrapper;
+    ASSERT_EQ(ER_OK, regular_wrapper.Init(client_config_, init_params_));
+    EXPECT_EQ(regular_wrapper.wrapper_config_, source_wrapper_config);
+    EXPECT_FALSE(source_backend->variable_object_size_enabled());
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaRejectsUriUnsafeBackendNamesWithoutChangingRegularInit) {
+    InitParams init_params = init_params_;
+    init_params.storage_configs = R"([{
+        "type": "file",
+        "global_unique_name": "unsafe:nfs",
+        "storage_spec": {"root_path": "/nfs/", "key_count_per_file": 1}
+    }])";
+
+    SdkWrapper regular_wrapper;
+    EXPECT_EQ(ER_OK, regular_wrapper.Init(client_config_, init_params));
+
+    SdkWrapper kv_meta_wrapper;
+    EXPECT_EQ(ER_INVALID_STORAGE_CONFIG, kv_meta_wrapper.InitForKvMeta(client_config_, init_params, 4096));
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaRejectsMooncakeWithoutDmaDrainButRegularInitIsUnchanged) {
+    class CapturingSdk : public SdkInterface {
+    public:
+        ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &,
+                             const std::shared_ptr<StorageConfig> &) override {
+            return ER_OK;
+        }
+        SdkType Type() override { return SdkType::MOONCAKE; }
+        ClientErrorCode Get(const std::vector<DataStorageUri> &, const BlockBuffers &) override { return ER_OK; }
+        ClientErrorCode Put(const std::vector<DataStorageUri> &,
+                            const BlockBuffers &,
+                            std::shared_ptr<std::vector<DataStorageUri>>) override {
+            return ER_OK;
+        }
+
+    protected:
+        ClientErrorCode Alloc(const std::vector<DataStorageUri> &, std::vector<DataStorageUri> &) override {
+            return ER_OK;
+        }
+    };
+    class CapturingFactory : public SdkFactory {
+    public:
+        std::shared_ptr<SdkInterface> CreateSdk(const DataStorageType &type,
+                                                const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
+                                                const std::shared_ptr<StorageConfig> &) override {
+            if (type != DataStorageType::DATA_STORAGE_TYPE_MOONCAKE || !sdk_backend_config) {
+                return nullptr;
+            }
+            configs.push_back(sdk_backend_config);
+            return std::make_shared<CapturingSdk>();
+        }
+
+        std::vector<std::shared_ptr<SdkBackendConfig>> configs;
+    } factory;
+
+    auto client_config = std::make_unique<ClientConfig>();
+    ASSERT_TRUE(client_config->FromJsonString(R"({
+        "instance_group": "group",
+        "instance_id": "instance",
+        "block_size": 1,
+        "sdk_config": {
+            "thread_num": 2,
+            "queue_size": 8,
+            "sdk_backend_configs": [{"type": "mooncake", "location": "*", "put_replica_num": 1}],
+            "timeout_config": {"put_timeout_ms": 2000, "get_timeout_ms": 2000}
+        },
+        "location_spec_infos": {"tp0": 1}
+    })"));
+    InitParams init_params = init_params_;
+    init_params.storage_configs = R"([{"type":"mooncake","global_unique_name":"moon_a","storage_spec":{}}])";
+
+    SdkWrapper kv_meta_wrapper;
+    kv_meta_wrapper.sdk_factory_ = &factory;
+    EXPECT_EQ(ER_INVALID_STORAGE_CONFIG, kv_meta_wrapper.InitForKvMeta(client_config, init_params, 4096));
+    EXPECT_TRUE(factory.configs.empty());
+
+    // This safety gate is KVMeta-only.  The established fixed-block path
+    // retains its existing Mooncake initialization behavior.
+    SdkWrapper regular_wrapper;
+    regular_wrapper.sdk_factory_ = &factory;
+    ASSERT_EQ(ER_OK, regular_wrapper.Init(client_config, init_params));
+    ASSERT_EQ(1, factory.configs.size());
+    const auto regular_mooncake = std::dynamic_pointer_cast<MooncakeSdkConfig>(factory.configs.front());
+    ASSERT_TRUE(regular_mooncake);
+    EXPECT_FALSE(regular_mooncake->variable_object_size_enabled());
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaClonesLegacyVcnsTemplateAsTheCandidateType) {
+    class CapturingSdk : public SdkInterface {
+    public:
+        ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &,
+                             const std::shared_ptr<StorageConfig> &) override {
+            return ER_OK;
+        }
+        SdkType Type() override { return SdkType::HF3FS; }
+        ClientErrorCode Get(const std::vector<DataStorageUri> &, const BlockBuffers &) override { return ER_OK; }
+        ClientErrorCode Put(const std::vector<DataStorageUri> &,
+                            const BlockBuffers &,
+                            std::shared_ptr<std::vector<DataStorageUri>>) override {
+            return ER_OK;
+        }
+
+    protected:
+        ClientErrorCode Alloc(const std::vector<DataStorageUri> &, std::vector<DataStorageUri> &) override {
+            return ER_OK;
+        }
+    };
+    class CapturingFactory : public SdkFactory {
+    public:
+        std::shared_ptr<SdkInterface> CreateSdk(const DataStorageType &type,
+                                                const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
+                                                const std::shared_ptr<StorageConfig> &) override {
+            if (type != DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS || !sdk_backend_config) {
+                return nullptr;
+            }
+            captured = sdk_backend_config;
+            return std::make_shared<CapturingSdk>();
+        }
+
+        std::shared_ptr<SdkBackendConfig> captured;
+    } factory;
+
+    InitParams init_params = init_params_;
+    init_params.storage_configs = R"([
+        {
+            "type":"vcns_hf3fs",
+            "global_unique_name":"vcns_a",
+            "storage_spec":{
+                "cluster_name":"cluster",
+                "mountpoint":"/mnt/3fs",
+                "root_dir":"kvmeta/",
+                "key_count_per_file":1,
+                "remote_host":"meta",
+                "remote_port":1234,
+                "meta_storage_uri":"redis://meta"
+            }
+        }
+    ])";
+
+    SdkWrapper wrapper;
+    wrapper.sdk_factory_ = &factory;
+    ASSERT_EQ(ER_OK, wrapper.InitForKvMeta(client_config_, init_params, 4096));
+    ASSERT_TRUE(factory.captured);
+    EXPECT_TRUE(std::dynamic_pointer_cast<Hf3fsSdkConfig>(factory.captured));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, factory.captured->type());
+    EXPECT_TRUE(factory.captured->variable_object_size_enabled());
+
+    const auto template_config =
+        wrapper.wrapper_config_->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS);
+    ASSERT_TRUE(template_config);
+    // The compatibility adjustment is per candidate; the shared template is
+    // still the historical HF3FS-typed default and remains unmodified.
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_HF3FS, template_config->type());
+    EXPECT_FALSE(template_config->variable_object_size_enabled());
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaPutRejectsNullResultBeforeValidationOrIo) {
+    SdkWrapper sdk_wrapper;
+    EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.PutKvMetaObjects({}, {}, {}, nullptr));
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaMooncakeValidationFailsClosedEvenWithACanonicalObjectKey) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.variable_object_size_enabled_ = true;
+    sdk_wrapper.max_variable_object_bytes_ = 4096;
+    sdk_wrapper.sdk_storage_types_["moon"] = DataStorageType::DATA_STORAGE_TYPE_MOONCAKE;
+    sdk_wrapper.sdk_storage_configs_["moon"] = std::make_shared<StorageConfig>(
+        DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, "moon", std::make_shared<MooncakeStorageSpec>());
+
+    char bytes[5]{};
+    Iov iov;
+    iov.type = MemoryType::CPU;
+    iov.base = bytes;
+    iov.size = sizeof(bytes);
+    BlockBuffer buffer;
+    buffer.iovs.push_back(iov);
+    const BlockBuffers buffers{buffer};
+    const std::vector<std::uint64_t> sizes{sizeof(bytes)};
+
+    EXPECT_EQ(ER_INVALID_PARAMS,
+              sdk_wrapper.ValidateKvMetaObjects({DataStorageUri("mooncake://moon/object?size=5")}, sizes, buffers));
+    EXPECT_EQ(
+        ER_INVALID_PARAMS,
+        sdk_wrapper.ValidateKvMetaObjects({DataStorageUri("mooncake://moon/object?key=&size=5")}, sizes, buffers));
+    EXPECT_EQ(ER_INVALID_PARAMS,
+              sdk_wrapper.ValidateKvMetaObjects(
+                  {DataStorageUri("mooncake://moon/object?key=physical-object&size=5")}, sizes, buffers));
+    EXPECT_EQ(ER_INVALID_PARAMS,
+              sdk_wrapper.ValidateKvMetaObjects(
+                  {DataStorageUri("mooncake://moon/object?key=kvmeta/a/b/0123456789abcdefghijklmnopqrstuv&size=5")},
+                  sizes,
+                  buffers));
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaFileValidationRejectsUnsafePathsAndAuthoritiesBeforeIo) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.variable_object_size_enabled_ = true;
+    sdk_wrapper.max_variable_object_bytes_ = 4096;
+    sdk_wrapper.sdk_storage_types_["nfs"] = DataStorageType::DATA_STORAGE_TYPE_NFS;
+    auto nfs_spec = std::make_shared<NfsStorageSpec>();
+    nfs_spec->set_root_path("/cache/");
+    sdk_wrapper.sdk_storage_configs_["nfs"] =
+        std::make_shared<StorageConfig>(DataStorageType::DATA_STORAGE_TYPE_NFS, "nfs", nfs_spec);
+
+    char bytes[5]{};
+    Iov iov;
+    iov.type = MemoryType::CPU;
+    iov.base = bytes;
+    iov.size = sizeof(bytes);
+    BlockBuffer buffer;
+    buffer.iovs.push_back(iov);
+    const BlockBuffers buffers{buffer};
+    const std::vector<std::uint64_t> sizes{sizeof(bytes)};
+
+    const std::string valid_object = "kvmeta/a/b/0123456789abcdefghijklmnopqrstuv";
+    EXPECT_EQ(ER_OK,
+              sdk_wrapper.ValidateKvMetaObjects(
+                  {DataStorageUri("file://nfs/cache/" + valid_object + "?size=5")}, sizes, buffers));
+    for (const std::string &uri : {
+             "file://nfs?size=5",
+             "file://nfs/?size=5",
+             "file://nfs//object?size=5",
+             "file://nfs/dir/./object?size=5",
+             "file://nfs/dir/../object?size=5",
+             "file://nfs/dir/object/?size=5",
+             "file://nfs name/object?size=5",
+             "file://user@nfs/object?size=5",
+             "file://nfs:123/object?size=5",
+             "file://nfs/foreign/kvmeta/a/b/0123456789abcdefghijklmnopqrstuv?size=5",
+             "file://nfs/cache/kvmeta/a/not-hex/0123456789abcdefghijklmnopqrstuv?size=5",
+             "file://nfs/cache/kvmeta/a/b/0123456789abcdefghijklmnopqrstu?size=5",
+             "file://nfs/cache/kvmeta/a/b/0123456789abcdefghijklmnopqrstuv/extra?size=5",
+         }) {
+        SCOPED_TRACE(uri);
+        EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.ValidateKvMetaObjects({DataStorageUri(uri)}, sizes, buffers));
+    }
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaTairValidationRejectsMalformedOrCrossMediaAddressesBeforeIo) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.variable_object_size_enabled_ = true;
+    sdk_wrapper.max_variable_object_bytes_ = 4096;
+
+    char bytes[5]{};
+    Iov iov;
+    iov.type = MemoryType::CPU;
+    iov.base = bytes;
+    iov.size = sizeof(bytes);
+    BlockBuffer buffer;
+    buffer.iovs.push_back(iov);
+    const BlockBuffers buffers{buffer};
+    const std::vector<std::uint64_t> sizes{sizeof(bytes)};
+
+    for (const auto &[type, media_type] : std::vector<std::pair<DataStorageType, std::uint16_t>>{
+             {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, kTairMemPoolMediaTypeUnspecified},
+             {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, kTairMemPoolMediaTypeSsd},
+         }) {
+        SCOPED_TRACE(static_cast<int>(type));
+        sdk_wrapper.sdk_storage_types_["pace"] = type;
+        auto pace_spec = std::make_shared<TairMemPoolStorageSpec>();
+        pace_spec->set_media_type(media_type);
+        sdk_wrapper.sdk_storage_configs_["pace"] = std::make_shared<StorageConfig>(type, "pace", pace_spec);
+        EXPECT_EQ(
+            ER_OK,
+            sdk_wrapper.ValidateKvMetaObjects({DataStorageUri("pace://pace/0?media_type=" + std::to_string(media_type) +
+                                                              "&node_id=0&range_id=0&size=5")},
+                                              sizes,
+                                              buffers));
+        const std::uint16_t other_media =
+            media_type == kTairMemPoolMediaTypeSsd ? kTairMemPoolMediaTypeDram : kTairMemPoolMediaTypeSsd;
+        EXPECT_EQ(ER_INVALID_PARAMS,
+                  sdk_wrapper.ValidateKvMetaObjects(
+                      {DataStorageUri("pace://pace/0?media_type=" + std::to_string(other_media) + "&size=5")},
+                      sizes,
+                      buffers));
+        EXPECT_EQ(media_type == kTairMemPoolMediaTypeUnspecified ? ER_OK : ER_INVALID_PARAMS,
+                  sdk_wrapper.ValidateKvMetaObjects({DataStorageUri("pace://pace/0?size=5")}, sizes, buffers));
+        for (const std::string &uri : {
+                 "pace://pace?size=5",
+                 "pace://pace/?size=5",
+                 "pace://pace/-1?size=5",
+                 "pace://pace/+1?size=5",
+                 "pace://pace/not-a-number?size=5",
+                 "pace://pace/12trailing?size=5",
+                 "pace://pace/18446744073709551616?size=5",
+                 "pace://pace/0?node_id=&size=5",
+                 "pace://pace/0?node_id=-1&size=5",
+                 "pace://pace/0?node_id=65536&size=5",
+                 "pace://pace/0?media_type=1x&size=5",
+                 "pace://pace/0?range_id=+1&size=5",
+             }) {
+            SCOPED_TRACE(uri);
+            EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.ValidateKvMetaObjects({DataStorageUri(uri)}, sizes, buffers));
+        }
+    }
+}
+
 TEST_F(SdkWrapperTest, TestInitWithEmptyWrapperConfig) {
     SdkWrapper sdk_wrapper;
     ASSERT_EQ(ER_INVALID_CLIENT_CONFIG, sdk_wrapper.Init(nullptr, init_params_));
@@ -136,14 +475,14 @@ TEST_F(SdkWrapperTest, TestInitWithInvalidStorageConfigs) {
 }
 
 TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationOwnsFd) {
-    FILE *file = tmpfile();
-    ASSERT_NE(file, nullptr);
-    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+    const int fd = CreateAnonymousSharedMemoryFile();
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(init_params_.regist_span->size)), 0);
 
     SharedMemoryRegistration registration;
     registration.base = init_params_.regist_span->base;
     registration.size = init_params_.regist_span->size;
-    registration.fd = fileno(file);
+    registration.fd = fd;
 
     SdkWrapper sdk_wrapper;
     SharedMemoryRegistration prepared_registration;
@@ -153,20 +492,20 @@ TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationOwnsFd) {
     ASSERT_GE(fd_flags, 0);
     EXPECT_NE(fd_flags & FD_CLOEXEC, 0);
 
-    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(close(fd), 0);
     struct stat file_stat{};
     EXPECT_EQ(fstat(prepared_registration.fd, &file_stat), 0);
 }
 
 TEST_F(SdkWrapperTest, TestDestructorKeepsSharedMemoryFdAliveForRunningTasks) {
-    FILE *file = tmpfile();
-    ASSERT_NE(file, nullptr);
-    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+    const int fd = CreateAnonymousSharedMemoryFile();
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(init_params_.regist_span->size)), 0);
 
     SharedMemoryRegistration registration;
     registration.base = init_params_.regist_span->base;
     registration.size = init_params_.regist_span->size;
-    registration.fd = fileno(file);
+    registration.fd = fd;
 
     auto sdk_wrapper = std::make_unique<SdkWrapper>();
     SharedMemoryRegistration prepared_registration;
@@ -204,7 +543,7 @@ TEST_F(SdkWrapperTest, TestDestructorKeepsSharedMemoryFdAliveForRunningTasks) {
     EXPECT_EQ(task_result.get(), ER_OK);
     EXPECT_TRUE(fd_valid_in_task.load());
     EXPECT_EQ(fcntl(owned_fd, F_GETFD), -1);
-    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(close(fd), 0);
 }
 
 TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationRejectsInvalidValues) {
@@ -219,32 +558,32 @@ TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationRejectsInvalidValues) 
     registration.base = init_params_.regist_span->base;
     EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
 
-    FILE *file = tmpfile();
-    ASSERT_NE(file, nullptr);
+    const int fd = CreateAnonymousSharedMemoryFile();
+    ASSERT_GE(fd, 0);
     registration = SharedMemoryRegistration();
     registration.base = init_params_.regist_span->base;
     registration.size = init_params_.regist_span->size;
-    registration.fd = fileno(file);
+    registration.fd = fd;
     EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
-    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(close(fd), 0);
 }
 
 TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
-    FILE *file = tmpfile();
-    ASSERT_NE(file, nullptr);
-    ASSERT_EQ(ftruncate(fileno(file), static_cast<off_t>(init_params_.regist_span->size)), 0);
+    const int fd = CreateAnonymousSharedMemoryFile();
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, static_cast<off_t>(init_params_.regist_span->size)), 0);
 
     SharedMemoryRegistration registration;
     registration.base = init_params_.regist_span->base;
     registration.size = init_params_.regist_span->size;
-    registration.fd = fileno(file);
+    registration.fd = fd;
 
     SdkWrapper sdk_wrapper;
     SharedMemoryRegistration prepared_registration;
     ASSERT_EQ(ER_OK, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
 
-    for (const auto type : {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
-                            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
         SCOPED_TRACE(static_cast<int>(type));
         auto config = std::make_shared<TairMempoolSdkConfig>(type);
         ASSERT_EQ(ER_OK, sdk_wrapper.UpdateTairMempoolSdkConfig(config, &prepared_registration));
@@ -253,7 +592,7 @@ TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
         EXPECT_EQ(config->client_base(), registration.base);
     }
 
-    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(close(fd), 0);
 }
 
 // TODO: mock mooncake
@@ -681,6 +1020,121 @@ TEST_F(SdkWrapperTest, TestNoUnboundedWaitOnTimeout) {
 
     // 等 fake 的睡眠结束，避免线程池/进程退出时任务仍在跑。
     std::this_thread::sleep_for(std::chrono::milliseconds(1600));
+}
+
+// KVMeta buffers are caller-owned and may be destroyed as soon as the API
+// returns. Its opt-in safe drain must therefore wait for an in-flight peer on
+// an error, while TestNoUnboundedWaitOnTimeout above keeps the regular path's
+// existing bounded-return contract unchanged.
+TEST_F(SdkWrapperTest, TestKvMetaSafeDrainWaitsForInflightTask) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(2, 8, "KvMetaSafeDrainTest");
+    ASSERT_TRUE(sdk_wrapper.wait_task_thread_pool_->start());
+
+    std::atomic<bool> slow_started{false};
+    std::atomic<bool> slow_finished{false};
+    std::vector<std::function<ClientErrorCode()>> tasks;
+    tasks.push_back([&]() {
+        while (!slow_started.load()) {
+            std::this_thread::yield();
+        }
+        return ER_SDKREAD_ERROR;
+    });
+    tasks.push_back([&]() {
+        slow_started.store(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        slow_finished.store(true);
+        return ER_OK;
+    });
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto ec = sdk_wrapper.RunWithTimeoutParallel(
+        SdkWrapper::OpType::GET, std::move(tasks), /*timeout_ms=*/1000, /*wait_for_inflight=*/true);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+    EXPECT_EQ(ER_SDKREAD_ERROR, ec);
+    EXPECT_TRUE(slow_finished.load());
+    EXPECT_GE(elapsed_ms, 100);
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaSafeDrainWaitsForInflightTaskBeforeRethrow) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(2, 8, "KvMetaExceptionDrainTest");
+    ASSERT_TRUE(sdk_wrapper.wait_task_thread_pool_->start());
+
+    std::atomic<bool> slow_started{false};
+    std::atomic<bool> slow_finished{false};
+    std::vector<std::function<ClientErrorCode()>> tasks;
+    tasks.push_back([&]() -> ClientErrorCode {
+        while (!slow_started.load()) {
+            std::this_thread::yield();
+        }
+        throw std::runtime_error("injected KVMeta SDK exception");
+    });
+    tasks.push_back([&]() {
+        slow_started.store(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        slow_finished.store(true);
+        return ER_OK;
+    });
+
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_THROW(sdk_wrapper.RunWithTimeoutParallel(
+                     SdkWrapper::OpType::GET, std::move(tasks), /*timeout_ms=*/1000, /*wait_for_inflight=*/true),
+                 std::runtime_error);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+    EXPECT_TRUE(slow_finished.load());
+    EXPECT_GE(elapsed_ms, 100);
+}
+
+// KVMeta submission must not block behind a saturated queue before its
+// deadline wait begins. Work accepted before the rejection is drained with
+// the shared stop flag set, so it never enters the underlying object I/O.
+TEST_F(SdkWrapperTest, TestKvMetaQueuePressureRejectsWithoutStartingIo) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(1, 1, "KvMetaQueueTest");
+    ASSERT_TRUE(sdk_wrapper.wait_task_thread_pool_->start());
+
+    std::promise<void> blocker_started;
+    std::promise<void> release_blocker;
+    auto release_future = release_blocker.get_future().share();
+    auto blocker = sdk_wrapper.wait_task_thread_pool_->async([&]() -> ClientErrorCode {
+        blocker_started.set_value();
+        release_future.wait();
+        return ER_OK;
+    });
+    blocker_started.get_future().wait();
+
+    std::atomic<int> io_calls{0};
+    std::vector<std::function<ClientErrorCode()>> tasks;
+    // autil's queue admits queue_size + 1 items before reporting full, so
+    // three submissions make the third rejection deterministic here.
+    for (size_t i = 0; i < 3; ++i) {
+        tasks.push_back([&]() {
+            io_calls.fetch_add(1);
+            return ER_OK;
+        });
+    }
+
+    std::thread releaser([&]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        release_blocker.set_value();
+    });
+    const auto start = std::chrono::steady_clock::now();
+    const auto ec = sdk_wrapper.RunWithTimeoutParallel(
+        SdkWrapper::OpType::PUT, std::move(tasks), /*timeout_ms=*/1000, /*wait_for_inflight=*/true);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    releaser.join();
+
+    EXPECT_EQ(ER_THREADPOOL_ERROR, ec);
+    EXPECT_EQ(0, io_calls.load());
+    EXPECT_EQ(ER_OK, blocker.get());
+    EXPECT_GE(elapsed_ms, 100);
+    EXPECT_LT(elapsed_ms, 1000);
 }
 
 // 验证静态预算注入：wrapper 在 Init 阶段把自身 timeout_config 注入

@@ -28,6 +28,7 @@
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
+#include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/migration_manager.h"
@@ -791,6 +792,57 @@ TEST_F(CacheManagerTest, TestRegisterInstanceRejectsDifferentInstanceGroup) {
     ASSERT_NE(nullptr, existing);
     EXPECT_EQ("default", existing->instance_group_name());
     EXPECT_NE(std::string::npos, request_context_->error_tracer()->ToJsonString().find("instance_group_name"));
+}
+
+TEST_F(CacheManagerTest, TestLegacyManagerRejectsReservedKvMetaNamespaceBeforeDispatch) {
+    const std::string reserved_instance = std::string(kKvMetaInternalInstancePrefix) + "74657374";
+    const std::string malformed_reserved_instance = std::string(kKvMetaInternalInstancePrefix) + "future-format";
+    EXPECT_TRUE(HasKvMetaReservedInstancePrefix(reserved_instance));
+    EXPECT_TRUE(HasKvMetaReservedInstancePrefix(malformed_reserved_instance));
+    EXPECT_TRUE(HasKvMetaInternalInstanceId(reserved_instance));
+    EXPECT_FALSE(HasKvMetaInternalInstanceId(malformed_reserved_instance));
+
+    auto [info_ec, info] = cache_manager_->GetInstanceInfo(request_context_.get(), reserved_instance);
+    EXPECT_EQ(EC_BADARGS, info_ec);
+    EXPECT_EQ(nullptr, info);
+
+    auto [meta_ec, meta] =
+        cache_manager_->GetCacheMeta(request_context_.get(), reserved_instance, {1}, {}, BlockMask{}, 0);
+    EXPECT_EQ(EC_BADARGS, meta_ec);
+    EXPECT_TRUE(meta.metas().empty());
+
+    auto [start_ec, start] =
+        cache_manager_->StartWriteCache(request_context_.get(), reserved_instance, {1}, {}, {}, 30);
+    EXPECT_EQ(EC_BADARGS, start_ec);
+    EXPECT_TRUE(start.write_session_id().empty());
+
+    EXPECT_EQ(EC_BADARGS,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), reserved_instance, "must-not-be-consumed", BlockMask{}));
+
+    const std::size_t queued_before = cache_manager_->reclaimer_task_supervisor_->cell_queue_.Size();
+    EXPECT_EQ(EC_BADARGS, cache_manager_->RemoveCache(request_context_.get(), reserved_instance, {1}, {}, BlockMask{}));
+    EXPECT_EQ(queued_before, cache_manager_->reclaimer_task_supervisor_->cell_queue_.Size());
+    EXPECT_EQ(
+        EC_BADARGS,
+        cache_manager_->TrimCache(request_context_.get(), reserved_instance, proto::meta::TS_REMOVE_ALL_CACHE, 0, 0));
+
+    const auto migration = cache_manager_->MigrateCache(
+        request_context_.get(), "reserved-migration", reserved_instance, "nfs_01", "nfs_01", true, false, {1}, 1);
+    EXPECT_EQ(EC_BADARGS, migration.ec);
+    EXPECT_EQ(0, migration.accepted);
+
+    proto::meta::ReportEventRequest report_request;
+    report_request.set_instance_id(reserved_instance);
+    proto::meta::ReportEventResponse report_response;
+    EXPECT_EQ(EC_BADARGS, cache_manager_->ReportEvent(request_context_.get(), &report_request, &report_response));
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, report_response.header().status().code());
+
+    auto [host_ec, hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(), reserved_instance, CacheManager::QueryType::QT_PREFIX_MATCH, {1}, {}, 0);
+    EXPECT_EQ(EC_BADARGS, host_ec);
+    EXPECT_TRUE(hosts.empty());
+    EXPECT_EQ(EC_BADARGS, cache_manager_->RemoveInstance(request_context_.get(), "default", reserved_instance));
 }
 
 TEST_F(CacheManagerTest, TestRegisterInstanceReturnsTieredMigrationStorageConfigs) {
@@ -6443,7 +6495,9 @@ TEST_F(CacheManagerTest, TestWriteThenReadRoundTripWithSpecGroups) {
 TEST_F(CacheManagerTest, TestDoRecoverAfterCleanup) {
     // Cleanup then recover
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    EXPECT_FALSE(cache_manager_->IsRecoverComplete());
     ASSERT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+    EXPECT_TRUE(cache_manager_->IsRecoverComplete());
 
     MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_TRUE(meta_searcher);
@@ -6452,6 +6506,7 @@ TEST_F(CacheManagerTest, TestDoRecoverAfterCleanup) {
 
     // Call again - should be idempotent
     ASSERT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+    EXPECT_TRUE(cache_manager_->IsRecoverComplete());
     meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_TRUE(meta_searcher);
     ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
@@ -6495,6 +6550,7 @@ TEST_F(CacheManagerTest, TestDoRecoverOnceWithRegistryPartialFailureThenFix) {
     // CacheManager DoRecoverOnce - should return ERROR because RegistryManager is incomplete
     auto ec = cache_manager_->DoRecoverOnce();
     ASSERT_EQ(EC_ERROR, ec);
+    EXPECT_FALSE(cache_manager_->IsRecoverComplete());
 
     // test_instance MetaSearcher should still have been created (partial progress is retained)
     MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
@@ -6514,6 +6570,7 @@ TEST_F(CacheManagerTest, TestDoRecoverOnceWithRegistryPartialFailureThenFix) {
     // CacheManager DoRecoverOnce - should now succeed
     ec = cache_manager_->DoRecoverOnce();
     ASSERT_EQ(EC_OK, ec);
+    EXPECT_TRUE(cache_manager_->IsRecoverComplete());
 
     // Both instances should have MetaSearcher
     meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
@@ -6539,6 +6596,7 @@ TEST_F(CacheManagerTest, TestRecoverRetryLoopLifecycle) {
     cache_manager_->StartRecoverRetryLoop();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    EXPECT_FALSE(cache_manager_->IsRecoverComplete());
 }
 
 /* ------------ InvalidateInstanceMetrics tests ------------ */

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #if defined(USING_CUDA)
 #include <cuda_runtime.h>
 #elif defined(USING_MUSA)
@@ -29,7 +31,11 @@ private:
     DoPut(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers, int64_t deadline_ms);
 
 private:
+    bool IsAllowedObjectSize(std::size_t size) const;
+
     std::map<std::string, int64_t> spec_byte_sizes_per_block_;
+    bool variable_object_size_enabled_{false};
+    std::uint64_t max_variable_object_bytes_{0};
     SdkTimeoutConfig timeout_config_; // Init 时由 wrapper 注入的静态超时预算
 #if defined(USING_CUDA)
     cudaStream_t cuda_stream_ = nullptr;
