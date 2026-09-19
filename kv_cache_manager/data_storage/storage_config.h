@@ -61,6 +61,16 @@ constexpr bool IsKvMetaObjectStorageType(const DataStorageType &type) noexcept {
     }
 }
 
+// KVMeta transfers return ownership of exact-size caller buffers as soon as a
+// synchronous Get/Put completes.  A backend is admissible only when that
+// return proves that no asynchronous device access can still touch the
+// buffer.  Keep this capability separate from object ownership: Mooncake
+// objects remain recognizable for recovery/deletion, but its current C API
+// has no cancel/drain primitive for an RDMA that outlives a soft timeout.
+constexpr bool SupportsKvMetaCallerOwnedBufferLifetime(const DataStorageType &type) noexcept {
+    return IsKvMetaObjectStorageType(type) && type != DataStorageType::DATA_STORAGE_TYPE_MOONCAKE;
+}
+
 constexpr bool IsTairMempoolStorageType(const DataStorageType &type) noexcept {
     return type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
            type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;

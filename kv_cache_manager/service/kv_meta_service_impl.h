@@ -1,7 +1,10 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
+#include <string>
 
+#include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/protocol/protobuf/kv_meta_service.pb.h"
 #include "kv_cache_manager/service/service_impl_base.h"
 
@@ -46,6 +49,11 @@ public:
               proto::kv_meta::CommonResponse *response);
 
 private:
+    ErrorCode AbortMalformedPutStart(RequestContext *request_context,
+                                     const std::string &instance_id,
+                                     const std::string &write_session_id,
+                                     std::size_t session_item_count) noexcept;
+
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<KvMetaManager> kv_meta_manager_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;

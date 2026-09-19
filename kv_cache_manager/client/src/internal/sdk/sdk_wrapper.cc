@@ -167,12 +167,13 @@ ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &cl
         std::unordered_set<std::string> unique_storage_names;
         unique_storage_names.reserve(storage_configs_.size());
         for (const auto &storage_config : storage_configs_) {
-            if (!storage_config || !IsKvMetaObjectStorageType(storage_config->type()) ||
+            if (!storage_config || !SupportsKvMetaCallerOwnedBufferLifetime(storage_config->type()) ||
                 !IsCanonicalKvMetaBackendName(storage_config->global_unique_name()) ||
                 !unique_storage_names.insert(storage_config->global_unique_name()).second ||
                 !HasSafeConfiguredKvMetaNamespace(*storage_config)) {
                 KVCM_LOG_WARN(
-                    "KVMeta storage configs must use unique URI-safe names and an exact safe object namespace");
+                    "KVMeta storage configs must use unique URI-safe names, a safe object namespace, and a hard "
+                    "caller-buffer lifetime contract");
                 return ER_INVALID_STORAGE_CONFIG;
             }
         }
@@ -486,6 +487,7 @@ ClientErrorCode SdkWrapper::ValidateKvMetaObjects(const std::vector<DataStorageU
         }
         const auto storage_config = sdk_storage_configs_.find(uri.GetHostName());
         if (storage_config == sdk_storage_configs_.end() || !storage_config->second ||
+            !SupportsKvMetaCallerOwnedBufferLifetime(storage_type->second) ||
             !UriMatchesStorageType(uri, storage_type->second) ||
             !HasOwnedKvMetaAllocationShape(uri, storage_type->second) ||
             !UriMatchesConfiguredKvMetaNamespace(uri, storage_type->second, *storage_config->second)) {

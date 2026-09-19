@@ -114,7 +114,8 @@ receipt 携带 digest 并在消费前验证；否则不能宣称满足 false-hit
 - 不在 KVCM 中保存 tensor shape、dtype、切片顺序或 RTP receipt；KVCM 只保存 opaque bytes；
 - 不改变 `DataStorageBackend::Create(keys, object_size)` 和普通 `TransferClient` 的固定大小接口；
 - 不提供 server-side read lease。V1 调用方必须保证 consumer Load 完成前不触发同对象的 Remove/Trim/GC；
-- 不保证取消已经进入不可取消 backend 的 I/O。KVMeta 会在返回前等待它结束，以保护 caller-owned buffer。
+- 不为缺少“同步返回即 DMA 完成”或显式 cancel-and-drain 契约的 backend 降级安全性；这类 backend 在
+  `RegisterInstance` 和 `InitForKvMeta` 阶段直接 fail closed。普通固定 block TransferClient 的既有行为不变。
 
 ## 3. 总体架构
 
@@ -138,7 +139,7 @@ flowchart LR
     registry["Registry / MetaIndexer"]
     storage_manager["DataStorageManager"]
     sdk["SdkWrapper::InitForKvMeta"]
-    backend["NFS / HF3FS / Mooncake / TairMempool ..."]
+    backend["NFS / HF3FS / TairMempool ...<br/>Mooncake 暂不允许 KVMeta admission"]
     receipt["业务控制面 receipt\nkey + size + tensor metadata"]
 
     producer --> adapter --> object_client
@@ -284,16 +285,19 @@ hit；已 committed 的相同 key、不同 size 返回 `SIZE_MISMATCH`。active 
 
 | 字段 | 约束 |
 |---|---|
-| `type` | 必须是已注册、可识别且具备对象所有权语义的 storage type |
+| `type` | 必须是已注册、可识别、具备对象所有权语义且满足 caller-buffer 生命周期契约的 storage type |
 | `spec_size` | 固定为 `1` |
 | `location_specs` | 恰好一个元素，名字固定为 `value` |
 | `location_specs[0].uri` | scheme/hostname 必须对应所选 backend；backend name 不超过 512 bytes，且仅允许字母、数字、`.`、`_`、`-`，authority 不得带 userinfo/port |
 | `value_size` | 对象有效字节数，必须大于 0 |
 | URI `size` 参数 | 必须与 `value_size` 完全相等 |
-| backend 所有权字段 | Mooncake URI `key` 必须是完整 canonical KVMeta object key；TairMempool/PACE path 必须是完整的 `/<uint64 offset>`，可选地址字段必须是 `uint16`；文件型 path 必须是无空/dot segment 和尾随 `/` 的非根绝对路径；可打包文件型 backend 的 `blkid` 必须缺失或严格等于 `0` |
+| backend 所有权字段 | 旧 Mooncake URI `key` 必须是完整 canonical KVMeta object key；TairMempool/PACE path 必须是完整的 `/<uint64 offset>`，地址字段必须是 `uint16`，且 URI `media_type`（缺失按 0）必须精确匹配注册 backend；文件型 path 必须是无空/dot segment 和尾随 `/` 的非根绝对路径；可打包文件型 backend 的 `blkid` 必须缺失或严格等于 `0` |
 | KVMeta namespace | file identity 必须精确等于已注册 backend 配置的 root/mount/root_dir 与 `kvmeta/<instance-hash>/<key-hash>/<32-byte nonce>` 拼出的路径；Mooncake `key` 必须精确对应同一 object key；canonical 或后缀相同但位于其他 root/namespace/key 的 URI 也不是 Delete authority |
 
-这里的对象 storage type 只包括 HF3FS/VCNS-HF3FS、Mooncake、TairMempool DRAM/SSD、NFS 和测试用 Dummy。
+对象所有权解析支持 HF3FS/VCNS-HF3FS、Mooncake、TairMempool DRAM/SSD、NFS 和测试用 Dummy，以便安全识别、
+排空或恢复旧 metadata；但当前 Mooncake C API 没有已提交 RDMA 的 cancel/drain/completion primitive，软超时返回
+不能证明 caller buffer 已不再被访问。因此 V1 的新 instance、allocation 和官方 exact-object client 明确拒绝
+Mooncake，不能把“等待 `mooncake_client_get/put` future 返回”误当作 DMA drain。该限制不影响普通固定 block 路径。
 EventReport location 是外部 block 的观测记录，不代表 KVMeta 对该物理对象具有独占创建/删除权；proto 与 C++ enum
 为 wire compatibility 保留其编号，但服务端和官方 exact-object client 都拒绝把它用于 EMB 对象。
 
@@ -478,7 +482,8 @@ group 和 storage type 分别计算；metadata key 准入按**目标 instance**�
 6. 把对象连同同一个时间锚点放入按 deadline 排序的 pending queue。worker 不会 sleep 等待某个 group 的 grace，
    因此其他 group 可以继续回收；
 7. grace 到期后，再次完成 metadata persistence barrier，精确删除 retired metadata 并 `Sync`，最后只发起一次
-   物理 Delete。物理结果不确定时不重放，交给 backend orphan 回收。
+   物理 Delete。物理结果不确定时不重放，记录 orphan 指标并关闭全局 KVMeta admission/reclaim，避免继续制造
+   不可达 allocation；backend/namespace 对账并完成 recovery 后才能重新开放。
 
 完整状态链是 `committed -> retired(读不可见、仍计账) -> grace -> metadata deleted/quota released -> physical
 Delete attempted`。metadata GC 与物理 GC 是两个阶段；只看到逻辑 usage 下降，不能推导 backend 空间已经释放。
@@ -523,12 +528,13 @@ KVMeta capability adapter 允许支持方一次接收不同 size，同时让不�
   的 path 都在 SDK I/O 前失败；普通固定 block TransferClient 不启用这条侧路规则；
 - 原始 URI authority 不含 userinfo/port，且不含 fragment 或重复/空 query key，避免 parser 规范化或静默覆盖
   `size`、`blkid` 等安全字段；每个 query item 必须显式使用 `key=value`，不能用会被规范化成 `key=` 的裸 key；
-- Mooncake 的物理寻址完全依赖 URI `key`，因此该参数必须是完整 canonical KVMeta object key；任意非空文本或
-  scheme/host/size 不能单独证明对象所有权；
+- 对旧 Mooncake metadata 的恢复/清理仍要求 URI `key` 是完整 canonical KVMeta object key；任意非空文本或
+  scheme/host/size 不能单独证明对象所有权。新 KVMeta client/admission 在 I/O 前拒绝 Mooncake；
 - TairMempool/PACE 的物理 offset 必须是完整可解析、不带符号且不溢出的 `/<uint64>` path；缺失或非法 path
   不得与真实 offset 0 混同，必须在 SDK I/O 之前拒绝；
-- PACE 的 `node_id`、`media_type`、`range_id` 为兼容旧 URI 可以缺失并默认 0；一旦出现就必须是完整、不带符号且
-  不溢出的 `uint16`，不能让空值或坏值静默别名到真实地址 0；
+- PACE 的 `node_id`、`media_type`、`range_id` 为兼容旧 URI 可以缺失并按 0 解析；一旦出现就必须是完整、不带
+  符号且不溢出的 `uint16`。其中 `media_type` 还必须与注册 backend 的 `TairMemPoolStorageSpec.media_type` 精确
+  相等：缺失字段只允许匹配 media 0，不能把默认 0 的旧 URI 路由到 DRAM(2) 或 SSD(5) pool；
 - PACE V1 URI 只携带 opaque address，不回显传给 Create 的逻辑 object key，因此 URI 本身不能证明“本次调用创建”。
   服务端只能依赖 singleton 调用/响应严格一一对应、注册 backend 的 allocator 独占契约，并检测同批及并发写入的
   物理地址复用；无法保证每次 Create 返回 fresh exclusive allocation 的 PACE backend 不得上线；
@@ -553,9 +559,10 @@ KVCM 内部仓的真实 `TairMempoolSdk` 在 variable-size policy 开启时：
 
 KVMeta service serializer、metadata client、object client 和 transfer wrapper 都会检查 backend ownership shape；
 transfer wrapper 在 SDK dispatch 前严格解析 PACE path，只在语法完整时才把解析后的 offset 交给 SDK，因此真实 `/0` 与
-缺 path、负数、带正号、trailing text 或 `uint64` 溢出不会落到同一 allocation。同一 type 配置多个
-Mooncake/TairMempool storage candidate 时，每个 candidate 使用独立 runtime SDK config；注册内存、共享内存、
-timeout 和 variable-size policy 的注入不会修改 per-type template，也不会污染同 type 的后续 candidate。
+缺 path、负数、带正号、trailing text 或 `uint64` 溢出不会落到同一 allocation。PACE URI 的 `media_type` 还会
+在 manager ownership 校验和 client SDK preflight 两侧与注册 storage config 交叉验证。同一 type 配置多个
+TairMempool storage candidate 时，每个 candidate 使用独立 runtime SDK config；共享内存、timeout 和
+variable-size policy 的注入不会修改 per-type template，也不会污染同 type 的后续 candidate。
 
 普通固定 block 模式继续使用原 size 表、lazy allocation fallback 和既有 gather/scatter 行为。开源仓中的
 TairMempool 是无真实 PACE 依赖的 stub，只保留严格、无异常的 URI 字段解析；实际 TairMempool I/O 必须使用
@@ -651,16 +658,20 @@ write_timeout_seconds * 1000
 三个 metadata 窗口分别预留给 PutStart 交接、masked-hit 兼容性 Get 和 PutFinish。该检查只证明名义预算可行，
 不是 backend 的强制取消保证。
 
-V1 的正确性前提是 backend 在 write lease 到期前停止访问该 remote allocation。SDK 为保护 caller buffer 会 drain
-已经开始且不可取消的 I/O，但 drain 不会自动续约服务端 session；若 provider 无视自己的 timeout 并越过 write
-lease 继续 Put，expiry 物理删除可能与旧 Put 竞争。生产 backend 必须证明 I/O 有硬 deadline/cancellation，或把
+V1 的正确性前提是 backend 在 write lease 到期前停止访问该 remote allocation。SDK 为保护 caller buffer 会等待
+已接纳任务及其 backend 可证明的 I/O completion；仅等待包装层 future 不构成 drain。无法提供硬完成/cancel-and-drain
+契约的 Mooncake 当前在 KVMeta 初始化和服务端注册阶段被拒绝。drain 不会自动续约服务端 session；若 provider
+无视自己的 timeout 并越过 write lease 继续 Put，expiry 物理删除可能与旧 Put 竞争。生产 backend 必须证明 I/O
+有硬 deadline/cancellation，或把
 write lease 配置为覆盖经过验证的最坏 drain 时间；仅满足上面的名义不等式不够。
 
 回滚和 expiry 始终先完成 exact-value metadata 删除及 `Sync`，然后只尝试一次物理 Delete。expiry worker 会把
-provider 的标准/未知异常收敛为脱敏告警并继续处理后续 session，不让可选 KVMeta 侧路异常终止进程。物理删除
-失败后不进入进程内重试队列，因为现有可复用地址型 URI 没有 allocation generation；不确定结果若被重放，可能
-删除已经复用同一地址的后继对象。条件删除意外返回 absent 时也不发出第一次物理 Delete，因为地址可能已经由外部
-actor 释放并复用。这里选择可运维回收的 orphan，而不是数据破坏。
+provider 的标准/未知异常收敛为脱敏告警，不让可选 KVMeta 侧路异常终止进程；一旦物理结果不确定，它会关闭
+session admission/expiry worker 和 Reclaimer。关闭前已经发布的 session 仍可由 client 显式 `PutFinish`，其余 active
+metadata 留给下一次 recovery，不会在故障 backend 上继续批量清理。物理删除失败后不进入进程内重试队列，因为
+现有可复用地址型 URI 没有 allocation generation；不确定结果若被重放，可能删除已经复用同一地址的后继对象。
+条件删除意外返回 absent 时也不发出第一次物理 Delete，因为地址可能已经由外部 actor 释放并复用。这里选择可运维
+回收的 orphan，而不是数据破坏。
 
 独立的 `KvMetaServiceGRpc` adapter 还在每个 handler 最外层覆盖 request-context 创建和 service implementation 调用。
 标准或未知异常都被截断为不含 provider 文本、key 或 endpoint 的固定错误，并返回非 OK gRPC `INTERNAL`；response
@@ -672,9 +683,10 @@ actor 释放并复用。这里选择可运维回收的 orphan，而不是数据�
 exact-object worker 使用非阻塞入队，因此 `sdk_config.queue_size` 必须至少为 64。队列压力导致部分任务无法接纳
 时，wrapper 会停止尚未开始的任务并等待已接纳任务结束后返回。
 
-到达数据面 deadline 后，排队任务不再发起 I/O；已经运行的 backend I/O 若不可取消，KVMeta 会安全 drain。
-因此调用耗时可能超过名义 timeout，但返回后 backend 不再访问 caller-owned buffer。普通 TransferClient 保留
-原有超时行为。
+到达数据面 deadline 后，排队任务不再发起 I/O；已经运行的 backend I/O 必须完成，或由 backend 的
+cancel-and-drain primitive 证明停止后，KVMeta 才返回。因此调用耗时可能超过名义 timeout，但返回后 backend
+不再访问 caller-owned buffer。Mooncake 的现有 API 无法证明这一点，故不进入 KVMeta 路径；普通 TransferClient
+保留原有 soft-timeout 行为。
 
 ### 9.3 多地址与结果不确定
 
@@ -701,7 +713,9 @@ KVMeta recovery 只扫描带完整 KVMeta schema 的保留 namespace，并执行
    recovery force deadline 保守等待；到期后完成 metadata-first 删除；
 4. 对已过期、归属可确认的 active/retired metadata 做条件删除并持久化，再对 allocation 做一次物理清理；条件删除
    意外发现 owner 已不存在或已变化时 recovery 失败并保持 gate 关闭，不使用旧 URI 清理；
-5. metadata 阶段失败则保持 KVMeta 请求门关闭；物理清理失败只产生脱敏 orphan 告警，不重放不确定 Delete；
+5. metadata 阶段失败保持 KVMeta 请求门关闭；任一物理清理失败立即终止整个 KVMeta recovery，返回
+   `OUTCOME_UNKNOWN`、保留保守 usage、保持请求门关闭且不重放不确定 Delete，避免继续遍历其他 instance 并放大
+   orphan。运维完成 backend/orphan 对账后再次执行 recovery，稳定扫描才重建精确 usage；
 6. 完成一个无 metadata 删除、无 metadata 错误的稳定扫描后，按 committed URI 的真实 `size` 重建 KVMeta
    byte usage；
 7. 启动 session expiry 和 Reclaimer worker，最后开放 KVMeta 请求门。
@@ -778,7 +792,7 @@ batch 太小、没有可退休 committed 对象，或 backend/metadata finalizat
 - `transfer_init_params.role_type=WORKER`；
 - `transfer_init_params.self_location_spec_name="value"`；
 - `max_object_bytes`、`write_timeout_seconds`；
-- Mooncake 等需要 worker memory span 的 backend，通过 `transfer_init_params.regist_span` 提供 base/size；
+- `transfer_init_params.regist_span` 仍保留给普通 TransferClient；当前 KVMeta 不接受缺少 DMA drain 的 Mooncake；
 - TairMempool/PACE 等需要共享内存映射时，通过 `SharedMemoryRegistration` overload 提供 base/size/fd。
 
 transfer JSON 必须同时满足：
@@ -810,10 +824,12 @@ metadata 删除先 `Sync`，再调用 backend Delete，确保仍可读 metadata 
 committed Remove/Trim、automatic reclaim，也适用 active rollback、expiry 和 recovery。Reclaimer 还会在删除
 metadata 前先把 committed 对象持久化为 retired，并等待配置的 read grace。
 
-若 metadata 已经持久化删除、随后物理 Delete 返回错误或抛异常，该 URI 已成为不可达 orphan：Remove/Trim 等整体
-mutation 返回 `OUTCOME_UNKNOWN`，session abort/expiry 则按其自身契约返回或记录 cleanup 错误；后台 worker 记录一次
-脱敏告警，recovery 则继续完成稳定扫描和 byte usage 重建。所有路径都不自动重放不确定
-Delete，因为现有 backend URI 没有 allocation generation，地址复用后重放旧删除可能破坏后继对象。这个规则只
+若 metadata 已经持久化删除、随后物理 Delete 返回错误、结果长度异常或抛异常，该 URI 已成为不可达 orphan：
+Remove/Trim、session rollback/expiry、StartWrite 补偿和 recovery 都把结果提升为 `OUTCOME_UNKNOWN`；自动 Reclaimer
+记录 uncertain 指标。所有前台/后台路径都会立即关闭 KVMeta admission 和后续 reclaim，避免一个持续故障在每次
+fill/evict 时继续制造 orphan；普通 KVCache gate 不受影响。修复 backend 并完成 namespace/orphan 对账后，运维方
+执行 recovery，只有 recovery 成功才允许恢复 KVMeta。所有路径都不自动重放不确定 Delete，因为现有 backend URI
+没有 allocation generation，地址复用后重放旧删除可能破坏后继对象。这个规则只
 消除“由 KVCM 发起第二次 Delete”的风险；若第一次调用返回后仍可能在 provider 内部晚到执行，V1 同样无法 fence。
 运维必须证明 Delete 终态/地址不复用/条件删除契约，并依赖 backend 的独立 orphan 清理策略处理无法确认的 allocation。
 
@@ -822,6 +838,10 @@ KVMeta 自己的 storage wrapper 会把 Create/Delete provider 的标准异常�
 的前序候选会做一次补偿删除；抛异常的调用若在 provider 端产生了未返回 URI，仍按 orphan 处理，不猜测重试。
 由于该 orphan 无法由 metadata recovery 定位，Create 异常返回 `OUTCOME_UNKNOWN` 并关闭 KVMeta gate，避免故障期间
 每个重试继续泄漏一个 allocation；普通 KVCache gate 不受影响。
+同样，领导权/超时停止 admission 后若已分配候选的补偿 Delete 失败，或 race-loser/rollback 的直接物理清理失败，
+不得返回可触发 endpoint failover 的 `SERVER_NOT_LEADER`、`TIMEOUT` 或原始 provider error；必须返回
+`OUTCOME_UNKNOWN` 并关闭 KVMeta gate，直到 recovery/运维对账。服务层发现 manager 的成功响应形状损坏时也只有在
+精确 abort 明确成功后才返回 `INTERNAL_ERROR`，abort 失败或不可寻址一律保留 `OUTCOME_UNKNOWN`。
 Create 响应数量错误、非 `OK` 结果携带 URI 或 ownership shape 非法时，响应中的 URI 可能指向共享或已有对象，因此
 不能作为 Delete authority。数量正确但 file path/Mooncake key 不对应传给该次 Create 的随机 KVMeta object key，
 或者 file path 只保留相同 `kvmeta/...` 后缀却位于注册 backend 配置之外的 root 时同样处理：canonical URI 和正确
@@ -833,8 +853,10 @@ Create 响应数量错误、非 `OK` 结果携带 URI 或 ownership shape 非法
 
 V1 在 metadata 删除时同步扣减 usage。若后续物理 Delete 失败，orphan 已不可寻址，也不再计入 KVMeta quota，
 因此 metadata usage 仍然准确，但可能低于 backend 实际占用。没有 generation token 时保留 URI 并自动重放同样
-不安全；V1 选择记录脱敏告警并交给 backend/namespace 回收。V2 用持久化 cleanup ledger 保留安全清理所需身份，
-并在物理删除成功前继续计费，从根本上解决这项容量漂移。
+不安全；V1 以一次 uncertain 指标、脱敏告警和全局 KVMeta circuit breaker 把容量漂移限制在首个失败批次，再交给
+backend/namespace 对账回收。进程崩溃后的熔断状态本身不持久化，所以生产 backend 仍必须提供可判定的 Delete 终态
+和独立 orphan 审计。V2 用持久化 cleanup ledger 保留安全清理所需身份，并在物理删除成功前继续计费，从根本上
+解决这项容量漂移。
 
 backend 的物理回收能力沿用现有实现。例如当前开源 NFS backend 的 `Delete` 返回成功但实际是 no-op，KVMeta
 不会为 EMB 侧路改变其共享行为。这种 backend **不能单独作为有界容量的生产 Cache**：自动 LRU 只能让 metadata
@@ -898,7 +920,7 @@ embedding Cache 的 false-hit 正确性要求。
 |---|---|---|---|
 | 放宽固定 KV cache block size | 表面改动少 | 破坏 TransferClient、backend packing、GC/Migration 假设 | 拒绝 |
 | 把 `Create(keys, sizes)` 加到共享 backend 接口 | 能批量变长 allocation | 扩大公共 ABI 和主链路回归面，所有 backend 都要理解新语义 | 不作为演进主线 |
-| 保持 V1 singleton | 风险最小、兼容全部 backend | 调用放大，Delete 失败只能形成 orphan | 保留为 fallback |
+| 保持 V1 singleton | 风险最小、兼容满足 V1 lifetime/delete 契约的 backend | 调用放大，Delete 失败只能形成 orphan | 保留为 fallback |
 | KVMeta capability adapter + generation | 只影响侧路，可批量、可安全重试 | 需要内部 backend/SDK 配合 | 推荐终态 |
 
 推荐方案继续复用 KVCM 的 registry 和 backend 配置，但把“变长批量、allocation 身份、条件删除”封装在 KVMeta 专用

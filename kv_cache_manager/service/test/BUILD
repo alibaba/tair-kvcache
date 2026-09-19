@@ -61,9 +61,11 @@ cc_test(
     srcs = [
         "kv_meta_service_impl_test.cc",
     ],
+    copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/data_storage",
         "//kv_cache_manager/manager:cache_manager",
         "//kv_cache_manager/manager:kv_meta_manager",
         "//kv_cache_manager/manager:startup_config_loader",

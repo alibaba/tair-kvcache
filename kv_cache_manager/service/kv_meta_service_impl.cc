@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -212,6 +213,32 @@ KvMetaServiceImpl::KvMetaServiceImpl(std::shared_ptr<CacheManager> cache_manager
     , kv_meta_manager_(std::move(kv_meta_manager))
     , metrics_reporter_(std::move(metrics_reporter)) {}
 
+ErrorCode KvMetaServiceImpl::AbortMalformedPutStart(RequestContext *request_context,
+                                                    const std::string &instance_id,
+                                                    const std::string &write_session_id,
+                                                    std::size_t session_item_count) noexcept {
+    if (!kv_meta_manager_ || write_session_id.empty() || session_item_count == 0 ||
+        session_item_count > kv_meta_manager_->limits().max_batch_items) {
+        return EC_OUTCOME_UNKNOWN;
+    }
+    try {
+        const ErrorCode abort_ec = kv_meta_manager_->FinishWrite(
+            request_context, instance_id, write_session_id, std::vector<bool>(session_item_count, false));
+        if (abort_ec == EC_OK) {
+            return EC_OK;
+        }
+        KVCM_LOG_ERROR("failed to abort malformed KVMeta PutStart result, ec[%d]", static_cast<int>(abort_ec));
+    } catch (const std::exception &) {
+        KVCM_LOG_ERROR("caught a standard exception while aborting malformed KVMeta PutStart result");
+    } catch (...) {
+        KVCM_LOG_ERROR("caught an unknown exception while aborting malformed KVMeta PutStart result");
+    }
+    // A failed abort cannot prove whether metadata or physical allocations
+    // remain.  Preserve that ambiguity so endpoint failover cannot allocate a
+    // second batch for the same logical PutStart.
+    return EC_OUTCOME_UNKNOWN;
+}
+
 void KvMetaServiceImpl::RegisterInstance(RequestContext *request_context,
                                          const proto::kv_meta::RegisterInstanceRequest *request,
                                          proto::kv_meta::RegisterInstanceResponse *response) {
@@ -330,33 +357,21 @@ void KvMetaServiceImpl::PutStart(RequestContext *request_context,
     }
     const std::size_t write_count =
         static_cast<std::size_t>(std::count(result.key_mask.begin(), result.key_mask.end(), false));
-    const auto abort_session = [&]() {
-        if (result.write_session_id.empty()) {
-            return;
-        }
-        // Never guess from a malformed public shape: an incorrect mask does
-        // not consume the session, leaving allocations active until timeout.
-        // StartWrite records this exact cardinality only after publishing the
-        // compact session.
-        const std::size_t abort_count = result.session_item_count;
-        if (abort_count == 0 || abort_count > kv_meta_manager_->limits().max_batch_items) {
-            return;
-        }
-        const std::vector<bool> failed(abort_count, false);
-        const ErrorCode abort_ec =
-            kv_meta_manager_->FinishWrite(request_context, request->instance_id(), result.write_session_id, failed);
-        if (abort_ec != EC_OK) {
-            KVCM_LOG_ERROR("[traceId: %s] failed to abort malformed KVMeta PutStart result, ec[%d]",
-                           request->trace_id().c_str(),
-                           static_cast<int>(abort_ec));
+    const auto reject_malformed_result = [&](const std::string &message) {
+        // Never guess from a malformed public shape: StartWrite records the
+        // exact compact-session cardinality independently of key_mask.
+        const ErrorCode abort_ec = AbortMalformedPutStart(
+            request_context, request->instance_id(), result.write_session_id, result.session_item_count);
+        if (abort_ec == EC_OK) {
+            SetDirectError(request_context, status, proto::kv_meta::INTERNAL_ERROR, message);
+        } else {
+            SetResult(request_context, status, EC_OUTCOME_UNKNOWN, "PutStart");
         }
     };
     if (result.key_mask.size() != keys.size() || result.locations.size() != write_count ||
         result.session_item_count != write_count || (write_count == 0 && !result.write_session_id.empty()) ||
         (write_count != 0 && result.write_session_id.empty())) {
-        abort_session();
-        SetDirectError(
-            request_context, status, proto::kv_meta::INTERNAL_ERROR, "KVMeta PutStart returned a malformed batch");
+        reject_malformed_result("KVMeta PutStart returned a malformed batch");
         return;
     }
     std::vector<proto::kv_meta::ValueLocation> converted_locations;
@@ -364,11 +379,7 @@ void KvMetaServiceImpl::PutStart(RequestContext *request_context,
     for (const auto &location : result.locations) {
         proto::kv_meta::ValueLocation converted;
         if (!FillLocation(location, &converted)) {
-            abort_session();
-            SetDirectError(request_context,
-                           status,
-                           proto::kv_meta::INTERNAL_ERROR,
-                           "KVMeta PutStart returned an invalid location");
+            reject_malformed_result("KVMeta PutStart returned an invalid location");
             return;
         }
         converted_locations.push_back(std::move(converted));
