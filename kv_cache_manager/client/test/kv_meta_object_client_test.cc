@@ -575,19 +575,19 @@ TEST_F(KvMetaObjectClientTest, LoadsOnlyAfterEveryKeyAndSizeMatches) {
     EXPECT_EQ(2U, transfer_->loaded_buffer_count);
 }
 
-TEST_F(KvMetaObjectClientTest, AcceptsMooncakeLocationsOnlyWithANonEmptyPhysicalKey) {
+TEST_F(KvMetaObjectClientTest, AcceptsMooncakeLocationsOnlyWithACanonicalObjectKey) {
     metadata_->get_result.hit_mask = {true, true};
-    auto first = MakeLocation("mooncake://moon/first?key=physical-first&size=5", sizeof(first_));
+    const std::string first_uri = "mooncake://moon/first?key=kvmeta/a/1/0123456789abcdefghijklmnopqrstuv&size=5";
+    const std::string second_uri = "mooncake://moon/second?key=kvmeta/a/2/0123456789abcdefghijklmnopqrstuv&size=9";
+    auto first = MakeLocation(first_uri, sizeof(first_));
     first.type = KvMetaStorageType::MOONCAKE;
-    auto second = MakeLocation("mooncake://moon/second?key=physical-second&size=9", sizeof(second_));
+    auto second = MakeLocation(second_uri, sizeof(second_));
     second.type = KvMetaStorageType::MOONCAKE;
     metadata_->get_result.locations = {first, second};
 
     EXPECT_EQ(ER_OK, client_->LoadObjects("trace", keys_, sizes_, buffers_));
     EXPECT_EQ(1, transfer_->load_calls);
-    EXPECT_EQ((UriStrVec{"mooncake://moon/first?key=physical-first&size=5",
-                         "mooncake://moon/second?key=physical-second&size=9"}),
-              transfer_->loaded_uris);
+    EXPECT_EQ((UriStrVec{first_uri, second_uri}), transfer_->loaded_uris);
 }
 
 TEST_F(KvMetaObjectClientTest, PropagatesLoadFailureAfterOneExactDataPlaneCall) {
@@ -689,8 +689,47 @@ TEST_F(KvMetaObjectClientTest, MalformedLocationSchemaIsInternalErrorNotSizeMism
     malformed.type = KvMetaStorageType::MOONCAKE;
     expect_internal(std::move(malformed));
 
+    malformed = MakeLocation("mooncake://moon/first?key=arbitrary-nonempty-key&size=5", sizeof(first_));
+    malformed.type = KvMetaStorageType::MOONCAKE;
+    expect_internal(std::move(malformed));
+
     malformed = MakeLocation("file://nfs/first?blkid=1&size=5", sizeof(first_));
     expect_internal(std::move(malformed));
+
+    for (const std::string &invalid_file_uri : {
+             "file://nfs?size=5",
+             "file://nfs/?size=5",
+             "file://nfs//first?size=5",
+             "file://nfs/dir//first?size=5",
+             "file://nfs/dir/./first?size=5",
+             "file://nfs/dir/../first?size=5",
+             "file://nfs/dir/first/?size=5",
+             "file://owner@nfs/first?size=5",
+             "file://nfs:0/first?size=5",
+             "file://nfs:123/first?size=5",
+         }) {
+        SCOPED_TRACE(invalid_file_uri);
+        expect_internal(MakeLocation(invalid_file_uri, sizeof(first_)));
+    }
+
+    for (const std::string &invalid_offset : {"", "/", "/-1", "/+1", "/bad", "/18446744073709551616"}) {
+        malformed = MakeLocation("pace://pace" + invalid_offset + "?size=5", sizeof(first_));
+        malformed.type = KvMetaStorageType::TAIR_MEMPOOL;
+        expect_internal(std::move(malformed));
+    }
+
+    for (const std::string &invalid_address : {
+             "node_id=",
+             "node_id=-1",
+             "node_id=65536",
+             "media_type=1x",
+             "range_id=+1",
+         }) {
+        SCOPED_TRACE(invalid_address);
+        malformed = MakeLocation("pace://pace/0?" + invalid_address + "&size=5", sizeof(first_));
+        malformed.type = KvMetaStorageType::TAIR_MEMPOOL;
+        expect_internal(std::move(malformed));
+    }
 
     // StandardUri keeps the last duplicate value. Reject duplicates before
     // parsing so different components cannot disagree on object identity.

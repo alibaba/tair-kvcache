@@ -71,36 +71,14 @@ bool UriSchemeMatchesStorageType(KvMetaStorageType type, const DataStorageUri &u
     }
 }
 
-bool HasOwnedAllocationShape(KvMetaStorageType type, const DataStorageUri &uri) {
-    if (type == KvMetaStorageType::MOONCAKE) {
-        return uri.HasParam("key") && !uri.GetParam("key").empty();
-    }
-    switch (type) {
-    case KvMetaStorageType::HF3FS:
-    case KvMetaStorageType::VCNS_HF3FS:
-    case KvMetaStorageType::NFS:
-    case KvMetaStorageType::DUMMY:
-        break;
-    default:
-        return true;
-    }
-    if (!uri.HasParam("blkid")) {
-        return true;
-    }
-    const std::string block_id_text = uri.GetParam("blkid");
-    std::uint64_t block_id = 0;
-    const auto parsed = std::from_chars(block_id_text.data(), block_id_text.data() + block_id_text.size(), block_id);
-    return !block_id_text.empty() && parsed.ec == std::errc{} &&
-           parsed.ptr == block_id_text.data() + block_id_text.size() && block_id == 0;
-}
-
 bool ValidateStorageUri(KvMetaStorageType type, const std::string &uri_text, std::uint64_t expected_size) {
     if (uri_text.size() > kMaxKvMetaLocationUriBytes || !HasUnambiguousKvMetaUriText(uri_text)) {
         return false;
     }
     const DataStorageUri uri(uri_text);
-    if (!uri.Valid() || uri.GetHostName().empty() || !UriSchemeMatchesStorageType(type, uri) ||
-        !HasOwnedAllocationShape(type, uri) || !uri.HasParam("size")) {
+    const DataStorageType allocation_type = ToDataStorageType(uri.GetProtocol());
+    if (!HasCanonicalKvMetaAuthority(uri) || !UriSchemeMatchesStorageType(type, uri) ||
+        !HasOwnedKvMetaAllocationShape(uri, allocation_type) || !uri.HasParam("size")) {
         return false;
     }
     const std::string size_text = uri.GetParam("size");

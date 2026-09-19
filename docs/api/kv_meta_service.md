@@ -20,7 +20,9 @@ exact-size 数据面，并为所有 miss/容量/读取故障保留重算路径�
    `kvcm.service.rpc_port`，按不同的 protobuf service 全名路由；
 2. Instance Group 必须只用于 KVMeta，不能混入普通 KV cache instance；group 必须配置 `POLICY_LRU`、
    `used_percentage in [0,1]`、合法的 `delay_before_delete_ms`，且进程级 reclaim sampling/batching 均非零；
-   `storage_candidates` 还必须唯一、已注册并具有 exact-object ownership（EventReport 不满足）；否则注册或新对象
+   `storage_candidates` 还必须唯一、已注册并具有 exact-object ownership（EventReport 不满足）；文件型 backend
+   配置必须能生成词法规范的绝对 KVMeta namespace（NFS 拼接型 `root_path` 必须带目录分隔符），storage spec 的
+   动态类型必须与 backend type 一致，最长 hash/size/blkid 组合后的 URI 也必须处于配置上限内；否则注册或新对象
    allocation 返回 `SERVICE_NOT_READY`；
 3. 调用方先执行 `RegisterInstance`，并使用响应中的权威 `storage_configs` 初始化数据面；
 4. 每次 RPC 都通过 `CommonResponseHeader.status` 判断业务结果，不能只看 gRPC transport status；
@@ -115,8 +117,9 @@ Trim(instance) -> 按策略清理整个 KVMeta instance
   另一类 instance 再加入同 group 都会在 registry mutation 前被拒绝；
 - group 必须有当前 KVMeta Reclaimer 可执行的 LRU 配置，且进程级 sampling/batching 非零；无配置、非 LRU、
   非法 watermark/read grace 或关闭采样/批量回收均返回 `SERVICE_NOT_READY`，且不会创建 instance；
-- `storage_candidates` 必须唯一并全部指向已注册的 exact-object backend；EventReport 只表示外部 block 观测，不授予
-  KVCM 创建/删除所有权，因此不能作为 EMB value storage；
+- `storage_candidates` 必须唯一并全部指向已注册的 exact-object backend；配置身份必须与 registry name 一致，文件型
+  配置必须能安全生成 `kvmeta/<instance-hash>/<key-hash>/<32-byte nonce>`；EventReport 只表示外部 block 观测，
+  不授予 KVCM 创建/删除所有权，因此不能作为 EMB value storage；
 - 相同 instance/group、KVMeta schema 和 `user_data` 的重复注册幂等；
 - group、schema 或既有 instance 配置不一致时失败；
 - 成功响应的 `storage_configs` 是后续 transfer client 的权威 backend 配置。
@@ -132,8 +135,14 @@ Trim(instance) -> 按策略清理整个 KVMeta instance
 - `locations` 和 `hit_mask.values` 始终与请求 keys 严格等长、同下标；
 - miss 的 `hit_mask=false`，对应 `locations[i]` 为空；
 - active 对象不可读，表现为 miss；
-- hit location 必须包含恰好一个名为 `value` 的 URI，并携带真实 `value_size`；Mooncake URI 还必须包含非空物理
-  `key`，可打包文件型 backend 的 `blkid` 必须缺失或等于 `0`。
+- hit location 必须包含恰好一个名为 `value` 的 URI，并携带真实 `value_size`；URI authority 只能是不超过 512 bytes、
+  由字母、数字、`.`、`_`、`-` 组成的非空 backend hostname，不能带 userinfo/port；Mooncake URI `key` 必须是完整
+  canonical KVMeta object key；
+  TairMempool/PACE URI path 必须是完整的
+  `/<uint64 offset>`，可选的 `node_id`/`media_type`/`range_id` 若出现必须是完整 `uint16`；文件型 backend path
+  必须是词法规范的绝对、非根路径（拒绝空 segment、`.`/`..` segment 和尾随 `/`），可打包文件型 backend 的
+  `blkid` 必须缺失或等于 `0`；每个 query item 都必须显式写成 `key=value`，不接受会被 parser 规范化为相同文本的
+  裸 `key`。
 
 V1 `Get` 不创建 server-side read lease，返回 location 后不会 pin 物理 allocation。调用方必须确保对应数据面 Load
 结束前没有其他 client 执行同对象的 Remove/Trim/GC；数据面读取失败应把整组当作 miss 并重算。需要读删并发保护
@@ -153,19 +162,42 @@ V1 `Get` 不创建 server-side read lease，返回 location 后不会 pin 物理
 - 全部命中时 `write_session_id` 和 `locations` 均为空；
 - 调用方必须保证同一 key 永远对应相同 bytes；否则同尺寸错误内容会成为无法检测的 false hit；
 - 有任一 miss 时返回非空 session，且每个 location 的 `value_size`、URI `size` 与请求值完全相等；
+- 每个 miss 必须取得独立的 backend allocation；重复判断使用 backend 的物理 Delete identity，而非包含 `size`
+  等 metadata query 的完整 URI，异常复用会在发布 reservation 前被拒绝；
 - 同 key 的 committed 对象尺寸不同时，整批返回 `SIZE_MISMATCH`，不创建 allocation；
 - 任一 key 仍 active 时，无论本次请求尺寸是否相同，整批都返回可重试的 `WRITE_IN_PROGRESS`，不把未提交的 size
   当成永久冲突，也不把 active 对象误报为命中；
 - 容量、storage type quota 或 active-session 数量不足时，不会返回可用 session；已产生的候选 allocation 或
-  reservation 会在返回前进入补偿清理。
-- 新 reservation 的持久化 barrier 失败后，只有补偿删除也完成持久化才能返回普通超时；若补偿结果无法证明，
+  reservation 会在返回前进入补偿清理。`Availability()` 与最终 session 登记之间被其他 group 抢占容量时，也执行
+  同一条补偿路径；
+- 新 reservation 尚未被 session 接管时，只有补偿删除完成持久化才能返回普通超时、`RESOURCE_EXHAUSTED`
+  或 not-leader；若补偿结果无法证明，
   返回 `OUTCOME_UNKNOWN` 并关闭 KVMeta admission/maintenance，直到 leader recovery 完成，不影响普通 KVCache。
 - group reclaim 配置被热更新为非法值时，全部命中的请求仍可幂等返回；包含任一 miss 的请求在 backend allocation
   前返回 `SERVICE_NOT_READY`。Remove/Trim 仍可用于安全排空已有对象。
 
-storage Create 抛出的标准或未知异常会转换为 `IO_ERROR`，不会穿透服务线程。服务端会对异常前已明确拿到的
+storage Create 抛出的标准或未知异常不会穿透服务线程。因为异常调用可能已经分配对象却没有返回 identity，服务端
+返回 `OUTCOME_UNKNOWN` 并关闭 KVMeta admission/maintenance，避免每次重试都形成一个不可追踪 orphan；异常前已明确拿到的
 singleton allocation 做一次补偿删除；异常调用本身若在 provider 端已经分配但没有返回 URI，则只能由 backend
 orphan 清理发现，服务端不会猜测或重放该 Create。
+
+非 `OK` Create 结果必须携带空 URI；若同时返回 URI，服务端无法证明它是本次新 allocation、诊断信息还是已有对象，
+因此不使用该 URI 做补偿删除，返回 `OUTCOME_UNKNOWN` 并关闭 KVMeta admission。`OK` 的文件型 URI 除了精确匹配
+本次随机 object key，还必须位于已注册 backend 配置的真实 root/mount/root_dir；仅有相同 `kvmeta/...` 后缀不足以
+获得 Delete 权限。
+
+Create 返回数量与单 key 请求不等、URI 不满足 backend 的 singleton ownership shape，或者返回的 file/Mooncake
+identity 不对应本次请求生成的 `kvmeta/<instance-hash>/<key-hash>/<nonce>` 对象及注册 backend root 时，这个响应中的 URI
+**不构成物理 Delete 授权**：它可能是其他对象或共享 allocation。
+服务端只会清理更早的、由独立且形状完整的 singleton Create 响应证明归属的候选对象，随后关闭
+KVMeta admission/maintenance 并等待 leader recovery。无法定位的 allocation 留给 backend orphan 机制，不会为了回收空间而
+冒险删除不属于本次请求的数据。该类 provider 契约损坏返回 `INTERNAL_ERROR`，不是业务对象的
+`SIZE_MISMATCH`。若响应恰好只有一个、URI 可唯一归属，但 URI `size` 与请求值不同，则服务端可以安全地只补偿删除
+该 allocation 一次，随后同样以 `INTERNAL_ERROR` fail closed。
+
+PACE V1 URI 只包含 opaque address，不回显本次 Create 的逻辑 object key。因此服务端会校验地址语法并检测同批、
+并发写入的物理地址复用，但最终仍依赖注册 PACE backend 保证 singleton Create 一一对应并返回 fresh exclusive
+allocation；不满足该契约的 backend 不能用于生产 EMB Cache。
 
 ### 5.5 `PutFinish`
 
@@ -182,6 +214,15 @@ orphan 清理发现，服务端不会猜测或重放该 Create。
 重放 Delete：现有 URI 没有 allocation generation，重放可能误删已经复用该地址的后继对象。此时 metadata 已
 不可见且不会恢复，接口/日志报告 backend orphan，由存储侧清理机制回收。
 
+若 active metadata 的删除无法证明已经持久化，session 已被消费且不能再充当 owner，服务端返回
+`OUTCOME_UNKNOWN`（已过期调用仍保留其 timeout 契约），并关闭 KVMeta admission/maintenance 直到 recovery。
+多 key commit 只成功了一部分时也先持久化当前视图再判定每个 allocation 的 owner；该 barrier、reload 或补偿删除
+不确定时同样 fail closed。gate 关闭后拒绝新的 PutStart、Remove 和 Trim，但允许已发布 session 完成 finalization。
+仅仅 URI 相同不构成删除 metadata 的授权，遇到同 allocation 的意外 owner 会保留它并交由 recovery。
+同理，已经预读到 exact owner、条件删除却返回 `NOT_FOUND` 时，不会再对旧 URI 发物理 Delete：其他 actor 可能已经
+释放并复用了该地址。服务端保留 orphan、返回 `OUTCOME_UNKNOWN` 并关闭 KVMeta gate，而不是用 metadata absence
+猜测物理所有权。
+
 多 key commit/rollback 使用逐 key 条件更新和失败补偿，不承诺并发 `Get` 观察到同一瞬间的全有或全无。
 
 ### 5.6 `Remove`
@@ -192,7 +233,9 @@ orphan 清理发现，服务端不会猜测或重放该 Create。
 - 显式 Remove 不等待自动 Reclaimer 的 `delay_before_delete_ms`，调用方必须先排空 consumer；
 - metadata 已经部分/全部改变后，若后续 metadata barrier 或物理删除失败，接口返回 `OUTCOME_UNKNOWN`，调用方必须
   查询/审计最终状态，不能盲目重放；已经删除的 metadata 不会重新暴露该 URI，服务端也不会自动重放结果不确定的
-  Delete，该 allocation 进入 backend orphan 清理范围。只有能证明 metadata 未改变的前置失败才保留具体普通错误。
+  Delete，该 allocation 进入 backend orphan 清理范围。只有能证明 metadata 未改变的前置失败才保留具体普通错误；
+  若无法证明 metadata absence 已持久化，或 exact delete 发现 stable location id 已被 replacement owner 占用，KVMeta
+  admission/maintenance 同时 fail closed，且旧 URI 不进入物理 Delete，直到 recovery 对账完成。
 
 ### 5.7 `Trim`
 
@@ -204,9 +247,13 @@ orphan 清理发现，服务端不会猜测或重放该 Create。
 | `TS_UNSPECIFIED` | 返回 `INVALID_ARGUMENT` |
 
 存在 active session 或正在提交/回滚的 session 时，Trim 整体返回 `WRITE_IN_PROGRESS`，不产生删除副作用。
-`TS_REMOVE_ALL_CACHE` 与 Remove 使用相同的 metadata-first、单次物理 Delete 语义；若物理删除失败，Trim 返回错误，
-已经持久化删除的 metadata 不会恢复，旧 URI 也不会在后续 Trim 中被重放。`TS_REMOVE_ALL_META` 则按定义只删除
-metadata，调用方必须提前确认对应物理对象将由 backend/namespace 清理机制回收。
+`TS_REMOVE_ALL_CACHE` 与 Remove 使用相同的 metadata-first、单次物理 Delete 语义。Trim 跨 batch 记录是否已经
+改变 metadata；只要任一早期 batch 已经删除 metadata，后续的物理删除失败、scan/校验错误或降主取消都返回
+`OUTCOME_UNKNOWN`，不会返回可整体自动重试的 not-leader/普通 I/O 错误。已经持久化删除的 metadata 不会恢复，
+旧 URI 也不会在后续 Trim 中被重放。`TS_REMOVE_ALL_META` 则按定义只删除 metadata，调用方必须提前确认
+对应物理对象将由 backend/namespace 清理机制回收。任一 batch 的 metadata 删除已进入内存但无法证明持久化时，
+per-instance Trim fence 即使随调用返回而销毁，全局 KVMeta gate 仍保持关闭，直到 recovery。scan 后条件删除发现
+replacement owner 时也遵循相同的 fail-closed 规则，并禁止用旧 URI 发物理 Delete。
 
 ### 5.8 自动 Reclaimer
 
@@ -215,7 +262,8 @@ metadata，调用方必须提前确认对应物理对象将由 backend/namespace
 持久化后才设置统一的有限 grace deadline。grace 到期后再持久化删除 metadata、释放逻辑 quota，并对物理对象只
 发起一次 Delete。reader fence barrier 失败或状态转换结果不确定时会关闭 KVMeta maintenance/admission；有限
 deadline 的 `Sync` 暂时失败时则把 batch 标记为未持久化，并在物理删除前重试 barrier。两种情况都不会提前删除
-物理对象；普通 KVCache 请求不经过这条链路。
+物理对象。`EC_NOENT` 只有在同一 pending batch 已记录本次 exact delete 成功时才可作为 Sync 重试；意外缺失或
+replacement owner 会关闭 KVMeta maintenance，且不发起物理 Delete。普通 KVCache 请求不经过这条链路。
 
 进程内 pending 队列最多容纳 1024 个 batch、20000 个对象和 4 TiB。候选选择同时受剩余 object/byte budget 约束，
 超出剩余额度的候选会被跳过或裁剪，而不是让一个过大的采样结果永久阻塞后续回收。
@@ -264,6 +312,10 @@ deadline 的 `Sync` 暂时失败时则把 batch 标记为未持久化，并在�
 - 校验服务端 location、真实 URI 和 actual URI；
 - 任何写入错误调用失败 mask 回滚；
 - 读取时要求全部命中并在 I/O 前完成 location/size 校验。
+
+exact-size transfer client 会依据注册响应中的权威 storage config 重建文件型对象的完整路径，并校验 canonical
+instance hash、key hash 和 32-byte nonce；仅处于相同 `kvmeta/` 前缀、但跨 root、缺少 segment 或追加 segment 的
+URI 都不会进入 SDK I/O。这项限制只作用于 KVMeta 数据面，不改变普通固定 block `TransferClient`。
 
 数据面保护 caller-owned buffer，可能在名义 timeout 后等待不可取消 I/O 结束。调用方必须在同步方法返回前保持
 buffer 和其 owner 存活。

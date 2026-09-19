@@ -112,7 +112,7 @@ bool ToPublicLocation(const proto::kv_meta::ValueLocation &source, KvMetaValueLo
         return false;
     }
     const DataStorageUri uri(source_spec.uri());
-    if (!uri.Valid() || uri.GetHostName().empty() || !uri.HasParam("size")) {
+    if (!HasCanonicalKvMetaAuthority(uri) || !uri.HasParam("size")) {
         return false;
     }
     const std::string size_text = uri.GetParam("size");
@@ -143,26 +143,9 @@ bool ToPublicLocation(const proto::kv_meta::ValueLocation &source, KvMetaValueLo
             return false;
         }
     };
-    bool singleton_allocation = true;
-    switch (target.type) {
-    case KvMetaStorageType::HF3FS:
-    case KvMetaStorageType::VCNS_HF3FS:
-    case KvMetaStorageType::NFS:
-    case KvMetaStorageType::DUMMY:
-        if (uri.HasParam("blkid")) {
-            const std::string block_id_text = uri.GetParam("blkid");
-            std::uint64_t block_id = 0;
-            const auto parsed =
-                std::from_chars(block_id_text.data(), block_id_text.data() + block_id_text.size(), block_id);
-            singleton_allocation = !block_id_text.empty() && parsed.ec == std::errc{} &&
-                                   parsed.ptr == block_id_text.data() + block_id_text.size() && block_id == 0;
-        }
-        break;
-    default:
-        break;
-    }
+    const DataStorageType allocation_type = ToDataStorageType(uri.GetProtocol());
     if (source_spec.name() != "value" || uri_size != source.value_size() || !scheme_matches() ||
-        !singleton_allocation) {
+        !HasOwnedKvMetaAllocationShape(uri, allocation_type)) {
         target = {};
         return false;
     }

@@ -101,6 +101,10 @@ private:
     // Mirrors sdk_map_ so the KVMeta preflight can verify that an untrusted
     // URI scheme cannot select a backend solely by reusing its hostname.
     std::map<std::string, DataStorageType> sdk_storage_types_;
+    // KVMeta additionally confines file-like URIs to the namespace declared
+    // by the matching server-authoritative storage config. The regular
+    // fixed-block path does not consult this map.
+    std::map<std::string, std::shared_ptr<StorageConfig>> sdk_storage_configs_;
     int owned_shm_fd_{-1};
     bool variable_object_size_enabled_{false};
     std::uint64_t max_variable_object_bytes_{0};

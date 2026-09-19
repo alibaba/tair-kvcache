@@ -225,7 +225,7 @@ bool HasSupportedKvMetaReclaimConfiguration(const InstanceGroup &group,
 bool UriMatchesStorageBackend(const DataStorageUri &uri,
                               const std::string &storage_name,
                               DataStorageType storage_type) {
-    if (!uri.Valid() || uri.GetHostName() != storage_name) {
+    if (!HasCanonicalKvMetaAuthority(uri) || uri.GetHostName() != storage_name) {
         return false;
     }
     if (IsTairMempoolStorageType(storage_type)) {
@@ -235,35 +235,106 @@ bool UriMatchesStorageBackend(const DataStorageUri &uri,
     return uri_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN && ToBaseType(uri_type) == ToBaseType(storage_type);
 }
 
-bool HasOwnedAllocationShape(const DataStorageUri &uri, DataStorageType storage_type) {
-    // Mooncake addresses the physical object exclusively through this query
-    // field.  Scheme/host/size alone do not establish object ownership: an
-    // absent or empty key aliases every malformed URI to the same object.
-    if (storage_type == DataStorageType::DATA_STORAGE_TYPE_MOONCAKE) {
-        return uri.HasParam("key") && !uri.GetParam("key").empty();
+bool UriNamesCreatedKvMetaObject(const DataStorageUri &uri,
+                                 const std::shared_ptr<DataStorageBackend> &backend,
+                                 DataStorageType storage_type,
+                                 std::string_view object_key) {
+    if (!backend || object_key.empty()) {
+        return false;
     }
-    // NFS/HF3FS/Dummy backends can pack several logical blocks into one file
-    // and encode the member offset as blkid. KVMeta deliberately calls Create
-    // with one key at a time so accepting a non-zero blkid would reintroduce a
-    // shared physical deletion boundary. Absence and the canonical value zero
-    // are both produced by existing singleton implementations.
+    const StorageConfig &config = backend->GetStorageConfig();
+    if (backend->GetType() != storage_type || config.type() != storage_type ||
+        config.global_unique_name() != uri.GetHostName()) {
+        return false;
+    }
+    if (storage_type == DataStorageType::DATA_STORAGE_TYPE_MOONCAKE) {
+        return uri.GetParam("key") == object_key;
+    }
+    if (IsTairMempoolStorageType(storage_type)) {
+        // The allocator returns an opaque physical address; current PACE URIs
+        // do not carry the logical allocation key. Address shape and exact
+        // operation cardinality are the strongest V1 ownership evidence.
+        return true;
+    }
     switch (storage_type) {
     case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
     case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
     case DataStorageType::DATA_STORAGE_TYPE_NFS:
-    case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
-        break;
+    case DataStorageType::DATA_STORAGE_TYPE_DUMMY: {
+        std::string expected_path;
+        return BuildConfiguredKvMetaObjectPath(config, object_key, expected_path) && uri.GetPath() == expected_path;
+    }
+    case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2:
+    case DataStorageType::COUNT:
     default:
+        return false;
+    }
+}
+
+bool UriBelongsToKvMetaNamespace(const DataStorageUri &uri,
+                                 const std::shared_ptr<DataStorageBackend> &backend,
+                                 DataStorageType storage_type,
+                                 const std::string &internal_instance_id,
+                                 std::int64_t internal_key) {
+    if (!backend) {
+        return false;
+    }
+    const StorageConfig &config = backend->GetStorageConfig();
+    if (backend->GetType() != storage_type || config.type() != storage_type ||
+        config.global_unique_name() != uri.GetHostName()) {
+        return false;
+    }
+    if (IsTairMempoolStorageType(storage_type)) {
         return true;
     }
-    if (!uri.HasParam("blkid")) {
-        return true;
+    const std::uint64_t instance_path_hash =
+        Hash64(internal_instance_id.data(), internal_instance_id.size(), kInstancePathHashSeed);
+    const std::string object_key_prefix = "kvmeta/" + StringUtil::Uint64ToHex(instance_path_hash) + "/" +
+                                          StringUtil::Uint64ToHex(static_cast<std::uint64_t>(internal_key)) + "/";
+    const auto get_expected_key =
+        [&](std::string_view value, bool require_leading_slash, std::string_view &object_key) {
+            object_key = {};
+            const std::size_t expected_size = object_key_prefix.size() + kKvMetaObjectNonceBytes;
+            if (value.size() < expected_size) {
+                return false;
+            }
+            const std::size_t key_begin = value.size() - expected_size;
+            if ((require_leading_slash && (key_begin == 0 || value[key_begin - 1] != '/')) ||
+                value.compare(key_begin, object_key_prefix.size(), object_key_prefix) != 0) {
+                return false;
+            }
+            if (value.substr(key_begin + object_key_prefix.size()).size() != kKvMetaObjectNonceBytes ||
+                !HasCanonicalKvMetaObjectKey(value.substr(key_begin, expected_size))) {
+                return false;
+            }
+            object_key = value.substr(key_begin, expected_size);
+            return true;
+        };
+    if (storage_type == DataStorageType::DATA_STORAGE_TYPE_MOONCAKE) {
+        const std::string &physical_key = uri.GetParam("key");
+        std::string_view object_key;
+        return get_expected_key(physical_key, false, object_key) && object_key.size() == physical_key.size() &&
+               uri.GetParam("key") == object_key;
     }
-    const std::string block_id_text = uri.GetParam("blkid");
-    std::uint64_t block_id = 0;
-    const auto parsed = std::from_chars(block_id_text.data(), block_id_text.data() + block_id_text.size(), block_id);
-    return !block_id_text.empty() && parsed.ec == std::errc{} &&
-           parsed.ptr == block_id_text.data() + block_id_text.size() && block_id == 0;
+    switch (storage_type) {
+    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_NFS:
+    case DataStorageType::DATA_STORAGE_TYPE_DUMMY: {
+        std::string_view object_key;
+        std::string expected_path;
+        return get_expected_key(uri.GetPath(), true, object_key) &&
+               BuildConfiguredKvMetaObjectPath(config, object_key, expected_path) && uri.GetPath() == expected_path;
+    }
+    case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2:
+    case DataStorageType::COUNT:
+    default:
+        return false;
+    }
 }
 
 bool HasMatchingStorageBackend(const CacheLocation &location,
@@ -274,13 +345,17 @@ bool HasMatchingStorageBackend(const CacheLocation &location,
         return false;
     }
     const DataStorageUri uri(location.location_specs().front().uri());
-    if (!uri.Valid() || uri.GetHostName().empty()) {
+    if (!HasCanonicalKvMetaAuthority(uri)) {
         return false;
     }
     const auto backend = data_storage_manager->GetDataStorageBackend(uri.GetHostName());
-    return backend && backend->GetType() == location.type() &&
+    if (!backend || backend->GetType() != location.type()) {
+        return false;
+    }
+    const StorageConfig &config = backend->GetStorageConfig();
+    return config.type() == location.type() && config.global_unique_name() == uri.GetHostName() &&
            UriMatchesStorageBackend(uri, uri.GetHostName(), location.type()) &&
-           HasOwnedAllocationShape(uri, location.type());
+           HasOwnedKvMetaAllocationShape(uri, location.type());
 }
 
 bool ToValueLocation(const CacheLocation &location, KvMetaManager::ValueLocation &out) {
@@ -309,17 +384,84 @@ bool IsRetiredObject(const CacheLocation &location) {
     return location.status() == CLS_DELETING && location.create_time() > kLeaseDeadlineTag;
 }
 
-bool SamePhysicalAllocation(const CacheLocation &lhs, const CacheLocation &rhs) {
-    if (lhs.type() != rhs.type() || lhs.location_specs().size() != rhs.location_specs().size()) {
+bool GetPhysicalAllocationIdentity(DataStorageType type, const DataStorageUri &uri, std::string &identity) {
+    identity.clear();
+    if (!HasCanonicalKvMetaAuthority(uri)) {
         return false;
     }
-    for (std::size_t i = 0; i < lhs.location_specs().size(); ++i) {
-        if (lhs.location_specs()[i].name() != rhs.location_specs()[i].name() ||
-            lhs.location_specs()[i].uri() != rhs.location_specs()[i].uri()) {
+    const auto append_component = [&identity](std::string_view component) {
+        identity.append(std::to_string(component.size()));
+        identity.push_back(':');
+        identity.append(component.data(), component.size());
+    };
+    identity.append(std::to_string(static_cast<int>(type)));
+    identity.push_back('|');
+    append_component(uri.GetHostName());
+    switch (type) {
+    case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
+        // Mooncake Delete addresses an object only by its key; path and size
+        // are not part of physical identity.
+        if (uri.GetParam("key").empty()) {
             return false;
         }
+        append_component(uri.GetParam("key"));
+        return true;
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD: {
+        std::uint64_t offset = 0;
+        if (!HasExactTairMempoolAddress(uri) || !TryGetExactTairMempoolOffset(uri, offset)) {
+            return false;
+        }
+        std::uint16_t node = 0;
+        std::uint16_t media = 0;
+        std::uint16_t range = 0;
+        uri.GetParamAs("node_id", node);
+        uri.GetParamAs("media_type", media);
+        uri.GetParamAs("range_id", range);
+        identity.push_back('|');
+        identity.append(std::to_string(offset));
+        identity.push_back('|');
+        identity.append(std::to_string(node));
+        identity.push_back('|');
+        identity.append(std::to_string(media));
+        identity.push_back('|');
+        identity.append(std::to_string(range));
+        return true;
     }
-    return true;
+    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_NFS:
+    case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
+        // These backends delete the file/object selected by path. KVMeta only
+        // accepts singleton blkid=0, so query size is metadata, not identity.
+        if (!HasOwnedKvMetaFilePath(uri)) {
+            return false;
+        }
+        append_component(uri.GetPath());
+        return true;
+    case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2:
+    case DataStorageType::COUNT:
+    default:
+        return false;
+    }
+}
+
+bool GetPhysicalAllocationIdentity(const CacheLocation &location, std::string &identity) {
+    if (location.location_specs().size() != 1) {
+        identity.clear();
+        return false;
+    }
+    return GetPhysicalAllocationIdentity(
+        location.type(), DataStorageUri(location.location_specs().front().uri()), identity);
+}
+
+bool SamePhysicalAllocation(const CacheLocation &lhs, const CacheLocation &rhs) {
+    std::string lhs_identity;
+    std::string rhs_identity;
+    return GetPhysicalAllocationIdentity(lhs, lhs_identity) && GetPhysicalAllocationIdentity(rhs, rhs_identity) &&
+           lhs_identity == rhs_identity;
 }
 
 std::shared_ptr<CacheLocation> MakeCommittedLocation(const CacheLocation &location) {
@@ -474,8 +616,25 @@ public:
                 return PutResult::kDuplicate;
             }
             entry->sequence = next_sequence_++;
-            sessions_.emplace(session_id, entry);
-            deadlines_.emplace(DeadlineKey{entry->deadline, entry->sequence}, entry);
+            auto [session_it, session_inserted] = sessions_.emplace(session_id, entry);
+            if (!session_inserted) {
+                return PutResult::kDuplicate;
+            }
+            try {
+                const bool deadline_inserted =
+                    deadlines_.emplace(DeadlineKey{entry->deadline, entry->sequence}, entry).second;
+                if (!deadline_inserted) {
+                    sessions_.erase(session_it);
+                    return PutResult::kDuplicate;
+                }
+            } catch (...) {
+                // Keep publication atomic across the lookup and deadline
+                // indexes. Otherwise an allocation failure here leaves a
+                // session that clients can consume but the expiry worker can
+                // never discover.
+                sessions_.erase(session_it);
+                throw;
+            }
         }
         condition_.notify_all();
         return PutResult::kOk;
@@ -602,17 +761,31 @@ private:
     }
 
     FinalizationGuard BeginFinalizationLocked(const std::string &internal_instance_id) {
+        // Prepare every potentially throwing guard field before publishing the
+        // count. Once incremented, constructing the returned guard is move-only
+        // and noexcept, so an allocation failure cannot leave a permanent
+        // phantom finalizer that blocks Trim.
+        std::string guard_instance_id = internal_instance_id;
         std::lock_guard<std::mutex> lock(finalization_state_->mutex);
         ++finalization_state_->instances[internal_instance_id];
-        return FinalizationGuard(finalization_state_, internal_instance_id);
+        return FinalizationGuard(finalization_state_, std::move(guard_instance_id));
     }
 
     void Expire(Session session) {
-        if (!owner_ || session.items.empty() || owner_->maintenance_cancelled_.load(std::memory_order_acquire)) {
+        if (!owner_) {
+            return;
+        }
+        if (session.items.empty()) {
+            KVCM_LOG_ERROR("KVMeta write-session cleanup found an empty owned session; recovery is required");
+            owner_->CancelMaintenance();
+            return;
+        }
+        if (owner_->maintenance_cancelled_.load(std::memory_order_acquire)) {
             return;
         }
         if (session.quota_shard >= owner_->quota_admission_mutexes_.size()) {
-            KVCM_LOG_ERROR("KVMeta write-session cleanup has an invalid quota shard");
+            KVCM_LOG_ERROR("KVMeta write-session cleanup has an invalid quota shard; recovery is required");
+            owner_->CancelMaintenance();
             return;
         }
         // Serialize metadata removal and physical deletion with the next
@@ -627,12 +800,22 @@ private:
         const std::vector<bool> failed(session.items.size(), false);
         ErrorCode ec = EC_IO_ERROR;
         const char *failure_kind = "error_code";
+        bool cleanup_threw = false;
         try {
             ec = owner_->FinishWriteInternal(&request_context, session.internal_instance_id, failed, session.items);
         } catch (const std::exception &) {
             failure_kind = "standard_exception";
+            cleanup_threw = true;
         } catch (...) {
             failure_kind = "unknown_exception";
+            cleanup_threw = true;
+        }
+        if (cleanup_threw) {
+            // The session has already been removed from the owner table. An
+            // exception can occur on either side of a metadata mutation, so
+            // only recovery may safely classify the allocation now.
+            owner_->CancelMaintenance();
+            ec = EC_OUTCOME_UNKNOWN;
         }
         if (ec != EC_OK) {
             // Never replay an uncertain physical delete. Reusable-address
@@ -950,6 +1133,10 @@ private:
         KvMetaManager::SessionItem item;
         bool removes_metadata_key = false;
         bool metadata_durable = false;
+        // Set only after this pending batch's exact compare-and-delete was
+        // accepted. A subsequent EC_NOENT is then a legitimate Sync retry;
+        // EC_NOENT before this evidence is an unexpected owner transition.
+        bool metadata_delete_applied = false;
     };
 
     struct PendingCredit {
@@ -1361,8 +1548,12 @@ private:
                         break;
                     }
                     std::uint64_t value_size = 0;
-                    if (owner_->ValidateOwnedLocation(
-                            request_context, keys[key_index], location_id, *location, value_size) != EC_OK) {
+                    if (owner_->ValidateOwnedLocation(request_context,
+                                                      instance->instance_id(),
+                                                      keys[key_index],
+                                                      location_id,
+                                                      *location,
+                                                      value_size) != EC_OK) {
                         valid_key = false;
                         break;
                     }
@@ -2097,16 +2288,22 @@ private:
         }
         if (batch->quota_shard >= owner_->quota_admission_mutexes_.size()) {
             KVCM_LOG_ERROR("KVMeta reclaimer pending batch has an invalid quota shard");
+            // This batch already owns durable retired metadata. Dropping its
+            // only finalizer while continuing admission would strand that
+            // ownership transition outside both the pending indexes and the
+            // recovery scan contract. Close only KVMeta and let recovery
+            // rebuild the state from metadata.
+            FailClosedMaintenance();
             CompletePending(batch);
             return;
         }
 
-        std::map<std::string, std::vector<KvMetaManager::SessionItem>> items_by_instance;
+        std::map<std::string, std::vector<std::size_t>> item_indices_by_instance;
         std::vector<KvMetaManager::SessionItem> all_items;
         all_items.reserve(batch->items.size());
-        for (const auto &retired : batch->items) {
-            items_by_instance[retired.internal_instance_id].push_back(retired.item);
-            all_items.push_back(retired.item);
+        for (std::size_t i = 0; i < batch->items.size(); ++i) {
+            item_indices_by_instance[batch->items[i].internal_instance_id].push_back(i);
+            all_items.push_back(batch->items[i].item);
         }
 
         std::unique_lock<std::mutex> quota_lock(owner_->quota_admission_mutexes_[batch->quota_shard]);
@@ -2127,15 +2324,54 @@ private:
 
         try {
             RequestContext request_context("kv_meta_reclaimer_finalize");
-            for (const auto &[internal_instance_id, items] : items_by_instance) {
-                const ErrorCode ec = owner_->DeleteRetiredMetadata(&request_context, internal_instance_id, items);
-                if (ec != EC_OK) {
+            for (const auto &[internal_instance_id, item_indices] : item_indices_by_instance) {
+                std::vector<KvMetaManager::SessionItem> items;
+                items.reserve(item_indices.size());
+                for (const std::size_t index : item_indices) {
+                    items.push_back(batch->items[index].item);
+                }
+                const auto cleanup = owner_->DeleteRetiredMetadata(&request_context, internal_instance_id, items);
+                if (cleanup.metadata_deleted.size() != item_indices.size() ||
+                    cleanup.metadata_absent.size() != item_indices.size() ||
+                    cleanup.metadata_conflicted.size() != item_indices.size()) {
+                    throw std::runtime_error("KVMeta reclaimer metadata cleanup returned malformed evidence");
+                }
+                bool unexpected_owner = false;
+                for (std::size_t i = 0; i < item_indices.size(); ++i) {
+                    auto &retired = batch->items[item_indices[i]];
+                    if (cleanup.metadata_deleted[i]) {
+                        retired.metadata_delete_applied = true;
+                    }
+                    if ((cleanup.metadata_absent[i] && !retired.metadata_delete_applied) ||
+                        cleanup.metadata_conflicted[i]) {
+                        unexpected_owner = true;
+                    }
+                }
+                if (unexpected_owner) {
+                    // The pending fence proves only that this worker retired
+                    // the metadata; it does not prove another actor has not
+                    // since replaced the owner or freed and reused an absent
+                    // address. A definitive compare mismatch is not transient
+                    // and must not turn into an unbounded retry loop.
+                    // Drop the in-memory finalizer only after globally closing
+                    // KVMeta so leader recovery can rebuild the safe state.
+                    ++error_count_metrics_;
+                    KVCM_LOG_ERROR("KVMeta reclaimer observed an unexpected missing or replaced owner for instance "
+                                   "[%s]; "
+                                   "physical deletion was suppressed",
+                                   internal_instance_id.c_str());
+                    FailClosedMaintenance();
+                    quota_lock.unlock();
+                    CompletePending(batch);
+                    return;
+                }
+                if (cleanup.ec != EC_OK || !cleanup.metadata_cleanup_complete) {
                     ++retry_count_metrics_;
                     KVCM_LOG_WARN("KVMeta reclaimer metadata cleanup will be retried for instance [%s], "
                                   "item_count[%zu], ec[%d]",
                                   internal_instance_id.c_str(),
                                   items.size(),
-                                  ec);
+                                  cleanup.ec);
                     // The exact delete may already have removed metadata from
                     // the in-memory view before its Sync failed. Close new
                     // admission for this KVMeta group before releasing the
@@ -2625,20 +2861,27 @@ bool KvMetaManager::IsOwnedLocation(std::int64_t internal_key, const std::string
 }
 
 ErrorCode KvMetaManager::ValidateOwnedLocation(RequestContext *request_context,
+                                               const std::string &internal_instance_id,
                                                std::int64_t internal_key,
                                                const std::string &location_id,
                                                const CacheLocation &location,
                                                std::uint64_t &value_size) const {
     const auto data_storage_manager = registry_manager_->data_storage_manager();
+    const DataStorageUri location_uri(location.location_specs().empty() ? std::string{}
+                                                                        : location.location_specs().front().uri());
+    const auto location_backend =
+        data_storage_manager ? data_storage_manager->GetDataStorageBackend(location_uri.GetHostName()) : nullptr;
     const bool known_state = (location.status() == CLS_NEW && location.create_time() != 0) || IsRetiredObject(location);
     std::uint64_t validated_total_size = 0;
     const bool has_validated_total_size = location.GetValidatedTotalSize(validated_total_size);
     if (!IsOwnedLocation(internal_key, location_id) || location.id() != location_id || !known_state ||
         location.location_specs().size() != 1 ||
         location.location_specs().front().uri().size() > limits_.max_location_uri_bytes ||
-        !HasMatchingStorageBackend(location, data_storage_manager) || !ReadLogicalSize(location, value_size) ||
-        (has_validated_total_size && validated_total_size != value_size) || value_size > limits_.max_value_bytes ||
-        value_size > std::numeric_limits<std::size_t>::max()) {
+        !HasMatchingStorageBackend(location, data_storage_manager) ||
+        !UriBelongsToKvMetaNamespace(
+            location_uri, location_backend, location.type(), internal_instance_id, internal_key) ||
+        !ReadLogicalSize(location, value_size) || (has_validated_total_size && validated_total_size != value_size) ||
+        value_size > limits_.max_value_bytes || value_size > std::numeric_limits<std::size_t>::max()) {
         AddError(request_context, "KVMeta location does not match its exact key or registered storage backend");
         return EC_CORRUPTION;
     }
@@ -2712,8 +2955,11 @@ ErrorCode KvMetaManager::ValidateCacheConfiguration(RequestContext *request_cont
     unique_storage_names.reserve(group->storage_candidates().size());
     for (const auto &storage_name : group->storage_candidates()) {
         const auto backend = data_storage_manager->GetDataStorageBackend(storage_name);
-        if (!unique_storage_names.emplace(storage_name).second || !backend ||
-            !IsKvMetaObjectStorageType(backend->GetType())) {
+        if (!IsCanonicalKvMetaBackendName(storage_name) || !unique_storage_names.emplace(storage_name).second ||
+            !backend || !IsKvMetaObjectStorageType(backend->GetType()) ||
+            backend->GetStorageConfig().type() != backend->GetType() ||
+            backend->GetStorageConfig().global_unique_name() != storage_name ||
+            !HasSafeConfiguredKvMetaNamespace(backend->GetStorageConfig(), limits_.max_location_uri_bytes)) {
             AddError(request_context, "KVMeta storage candidates must be unique registered exact-object backends");
             return EC_CONFIG_ERROR;
         }
@@ -2914,8 +3160,9 @@ std::pair<ErrorCode, std::vector<KvMetaManager::GetResult>> KvMetaManager::Get(
     if (const ErrorCode ec = ValidateKeys(request_context, keys); ec != EC_OK) {
         return {ec, {}};
     }
+    const std::string internal_instance_id = InternalInstanceId(instance_id);
     std::vector<ExactLocation> exact;
-    const ErrorCode load_ec = LoadExactLocations(request_context, InternalInstanceId(instance_id), keys, exact);
+    const ErrorCode load_ec = LoadExactLocations(request_context, internal_instance_id, keys, exact);
     if (load_ec != EC_OK) {
         return {load_ec, {}};
     }
@@ -2928,8 +3175,12 @@ std::pair<ErrorCode, std::vector<KvMetaManager::GetResult>> KvMetaManager::Get(
             return {exact[i].ec == EC_OK ? EC_CORRUPTION : exact[i].ec, {}};
         }
         std::uint64_t value_size = 0;
-        if (const ErrorCode ec = ValidateOwnedLocation(
-                request_context, exact[i].internal_key, exact[i].location_id, *exact[i].location, value_size);
+        if (const ErrorCode ec = ValidateOwnedLocation(request_context,
+                                                       internal_instance_id,
+                                                       exact[i].internal_key,
+                                                       exact[i].location_id,
+                                                       *exact[i].location,
+                                                       value_size);
             ec != EC_OK) {
             return {ec, {}};
         }
@@ -2991,7 +3242,8 @@ ErrorCode KvMetaManager::DeleteAllocatedLocations(RequestContext *request_contex
         return EC_ERROR;
     }
     std::map<std::string, std::vector<DataStorageUri>> uris_by_storage;
-    std::unordered_set<std::string> seen_uris;
+    std::unordered_set<std::string> seen_allocations;
+    seen_allocations.reserve(items.size());
     ErrorCode overall = EC_OK;
     for (const auto &item : items) {
         if (!item.data_location) {
@@ -3001,16 +3253,21 @@ ErrorCode KvMetaManager::DeleteAllocatedLocations(RequestContext *request_contex
             overall = FirstHardError(overall, EC_CORRUPTION);
             continue;
         }
+        std::string allocation_identity;
+        if (!GetPhysicalAllocationIdentity(*item.data_location, allocation_identity)) {
+            overall = FirstHardError(overall, EC_CORRUPTION);
+            continue;
+        }
+        if (!seen_allocations.insert(std::move(allocation_identity)).second) {
+            continue;
+        }
         for (const auto &spec : item.data_location->location_specs()) {
             DataStorageUri uri(spec.uri());
             if (!uri.Valid() || uri.GetHostName().empty()) {
                 overall = FirstHardError(overall, EC_CORRUPTION);
                 continue;
             }
-            const std::string canonical = uri.ToUriString();
-            if (seen_uris.insert(canonical).second) {
-                uris_by_storage[uri.GetHostName()].push_back(std::move(uri));
-            }
+            uris_by_storage[uri.GetHostName()].push_back(std::move(uri));
         }
     }
     for (auto &[storage_name, uris] : uris_by_storage) {
@@ -3019,33 +3276,23 @@ ErrorCode KvMetaManager::DeleteAllocatedLocations(RequestContext *request_contex
     return overall;
 }
 
-ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
-                                     const std::string &internal_instance_id,
-                                     const std::vector<SessionItem> &items,
-                                     bool metadata_only,
-                                     bool adjust_storage_usage,
-                                     bool maintenance_no_touch,
-                                     bool delete_if_metadata_absent,
-                                     bool sync_metadata_absent,
-                                     bool restore_usage_on_sync_failure,
-                                     bool *metadata_outcome_changed,
-                                     bool *metadata_cleanup_complete) {
-    if (metadata_outcome_changed) {
-        *metadata_outcome_changed = false;
-    }
-    if (metadata_cleanup_complete) {
-        *metadata_cleanup_complete = false;
-    }
+KvMetaManager::DeleteItemsResult KvMetaManager::DeleteItems(RequestContext *request_context,
+                                                            const std::string &internal_instance_id,
+                                                            const std::vector<SessionItem> &items,
+                                                            const DeleteItemsOptions &options) {
+    DeleteItemsResult result;
+    result.metadata_deleted.assign(items.size(), false);
+    result.metadata_absent.assign(items.size(), false);
+    result.metadata_conflicted.assign(items.size(), false);
     if (items.empty()) {
-        if (metadata_cleanup_complete) {
-            *metadata_cleanup_complete = true;
-        }
-        return EC_OK;
+        result.metadata_cleanup_complete = true;
+        return result;
     }
     auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(internal_instance_id);
     if (!indexer) {
         AddError(request_context, "KVMeta indexer is unavailable during exact delete");
-        return EC_INSTANCE_NOT_EXIST;
+        result.ec = EC_INSTANCE_NOT_EXIST;
+        return result;
     }
     MetaSearcher searcher(indexer);
     std::vector<std::int64_t> item_keys;
@@ -3054,9 +3301,6 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
         item_keys.push_back(item.internal_key);
     }
 
-    std::vector<bool> metadata_deleted(items.size(), false);
-    std::vector<bool> metadata_already_absent(items.size(), false);
-    ErrorCode overall = EC_OK;
     for (const auto &layer : MakeUniqueKeyLayers(item_keys)) {
         KeyVector keys;
         LocationIdsPerKey ids;
@@ -3066,7 +3310,7 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
         expected_values.reserve(layer.size());
         for (const std::size_t index : layer) {
             if (!items[index].metadata_location) {
-                overall = FirstHardError(overall, EC_BADARGS);
+                result.ec = FirstHardError(result.ec, EC_BADARGS);
                 continue;
             }
             keys.push_back(items[index].internal_key);
@@ -3082,32 +3326,33 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
                                                                   ids,
                                                                   per_location_ec,
                                                                   expected_values,
-                                                                  adjust_storage_usage,
+                                                                  options.adjust_storage_usage,
                                                                   true,
-                                                                  maintenance_no_touch);
-        overall = FirstHardError(overall, delete_ec);
+                                                                  options.maintenance_no_touch);
+        result.ec = FirstHardError(result.ec, delete_ec);
         if (per_location_ec.size() != layer.size()) {
-            overall = FirstHardError(overall, EC_MISMATCH);
+            result.ec = FirstHardError(result.ec, EC_MISMATCH);
             continue;
         }
         for (std::size_t i = 0; i < layer.size(); ++i) {
             if (per_location_ec[i].size() != 1) {
-                overall = FirstHardError(overall, EC_MISMATCH);
+                result.ec = FirstHardError(result.ec, EC_MISMATCH);
                 continue;
             }
             const ErrorCode ec = per_location_ec[i][0];
             if (ec == EC_OK) {
-                metadata_deleted[layer[i]] = true;
-                if (metadata_outcome_changed) {
-                    *metadata_outcome_changed = true;
-                }
+                result.metadata_deleted[layer[i]] = true;
+                result.metadata_outcome_changed = true;
             } else if (ec == EC_NOENT) {
-                metadata_already_absent[layer[i]] = true;
-                if (metadata_outcome_changed) {
-                    *metadata_outcome_changed = true;
-                }
+                result.metadata_absent[layer[i]] = true;
+                result.metadata_already_absent = true;
             } else {
-                overall = FirstHardError(overall, ec);
+                // EC_MISMATCH is positive evidence that the stable location id
+                // now names a different exact value. Reclaimer must fail closed
+                // instead of retrying forever or ever deleting the old URI.
+                result.metadata_conflicted[layer[i]] = ec == EC_MISMATCH;
+                result.metadata_owner_conflicted = result.metadata_owner_conflicted || ec == EC_MISMATCH;
+                result.ec = FirstHardError(result.ec, ec);
             }
         }
     }
@@ -3115,58 +3360,63 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
     KeyVector keys_to_sync;
     std::unordered_set<std::int64_t> unique_keys_to_sync;
     for (std::size_t i = 0; i < items.size(); ++i) {
-        if ((metadata_deleted[i] || (sync_metadata_absent && metadata_already_absent[i])) &&
+        if ((result.metadata_deleted[i] || (options.sync_metadata_absent && result.metadata_absent[i])) &&
             unique_keys_to_sync.insert(items[i].internal_key).second) {
             keys_to_sync.push_back(items[i].internal_key);
         }
     }
     const bool metadata_delete_is_durable = keys_to_sync.empty() || indexer->Sync(keys_to_sync);
     if (!metadata_delete_is_durable) {
-        overall = FirstHardError(overall, EC_TIMEOUT);
+        result.ec = FirstHardError(result.ec, EC_TIMEOUT);
         // BatchDeleteLocations adjusts the in-memory counter when the delete
         // is accepted. If its persistence barrier fails, restore a
         // conservative upper bound; the next KVMeta recovery rebuilds the
         // exact value from durable metadata.
-        if (adjust_storage_usage && restore_usage_on_sync_failure) {
+        if (options.adjust_storage_usage && options.restore_usage_on_sync_failure) {
             for (std::size_t i = 0; i < items.size(); ++i) {
-                if (metadata_deleted[i] && items[i].metadata_location) {
+                if (result.metadata_deleted[i] && items[i].metadata_location) {
                     indexer->AddStorageUsageByType(items[i].metadata_location->type(), items[i].value_size);
                 }
             }
         }
     }
-    if (metadata_cleanup_complete) {
-        // Capture the metadata-only result before physical deletion can add a
-        // provider error. Callers rolling back an unpublished reservation
-        // must fail closed only when ownership is unresolved; a proven
-        // metadata absence plus an orphaned allocation is safe to admit past.
-        *metadata_cleanup_complete = overall == EC_OK && metadata_delete_is_durable;
-    }
+    // Capture the metadata-only result before physical deletion can add a
+    // provider error. An already-absent item is complete only for the one
+    // caller that explicitly persisted that absence while holding a pending
+    // ownership fence (the Reclaimer retry path).
+    result.metadata_cleanup_complete = result.ec == EC_OK && metadata_delete_is_durable &&
+                                       (!result.metadata_already_absent || options.sync_metadata_absent);
 
-    if (!metadata_only) {
+    if (options.delete_physical) {
         std::vector<SessionItem> physical_items;
         physical_items.reserve(items.size());
         for (std::size_t i = 0; i < items.size(); ++i) {
-            const bool safe_to_delete = (delete_if_metadata_absent && metadata_already_absent[i] &&
-                                         (!sync_metadata_absent || metadata_delete_is_durable)) ||
-                                        (metadata_deleted[i] && metadata_delete_is_durable);
-            if (safe_to_delete && items[i].data_location) {
+            // EC_NOENT is deliberately excluded. Without a generation token,
+            // absence cannot prove that this URI has not already been freed
+            // and reused by a successor allocation. Only this call's exact
+            // compare-and-delete grants physical deletion authority.
+            if (result.metadata_deleted[i] && metadata_delete_is_durable && items[i].data_location) {
                 physical_items.push_back(items[i]);
             }
         }
-        overall = FirstHardError(overall, DeleteAllocatedLocations(request_context, physical_items));
+        result.ec = FirstHardError(result.ec, DeleteAllocatedLocations(request_context, physical_items));
     }
-    return overall;
+    return result;
 }
 
-ErrorCode KvMetaManager::DeleteRetiredMetadata(RequestContext *request_context,
-                                               const std::string &internal_instance_id,
-                                               const std::vector<SessionItem> &items) {
+KvMetaManager::DeleteItemsResult KvMetaManager::DeleteRetiredMetadata(RequestContext *request_context,
+                                                                      const std::string &internal_instance_id,
+                                                                      const std::vector<SessionItem> &items) {
     // Reclaimer finalization deliberately separates metadata and physical
     // deletion. If Sync fails after the in-memory exact delete, a later retry
     // must Sync the now-absent key before releasing the allocation. Keeping
     // the already-decremented usage avoids double accounting on that retry.
-    return DeleteItems(request_context, internal_instance_id, items, true, true, true, false, true, false);
+    DeleteItemsOptions options;
+    options.delete_physical = false;
+    options.maintenance_no_touch = true;
+    options.sync_metadata_absent = true;
+    options.restore_usage_on_sync_failure = false;
+    return DeleteItems(request_context, internal_instance_id, items, options);
 }
 
 std::pair<ErrorCode, KvMetaManager::StartWriteResult>
@@ -3263,6 +3513,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         } else if (existing[i].ec == EC_OK && existing[i].location) {
             std::uint64_t existing_size = 0;
             if (const ErrorCode ec = ValidateOwnedLocation(request_context,
+                                                           internal_instance_id,
                                                            existing[i].internal_key,
                                                            existing[i].location_id,
                                                            *existing[i].location,
@@ -3454,19 +3705,32 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         AddError(request_context, "KVMeta selected storage backend changed or is not an exact-object backend");
         return {EC_CORRUPTION, StartWriteResult{}};
     }
+    const StorageConfig &selected_config = selected_backend->GetStorageConfig();
+    if (selected_config.type() != selected.type || selected_config.global_unique_name() != selected.name) {
+        AddError(request_context, "KVMeta selected storage backend identity does not match its registration");
+        return {EC_CORRUPTION, StartWriteResult{}};
+    }
 
     // A singleton Create call is intentional. Several existing filesystem
     // backends pack a batch into one file; singleton allocation prevents a
     // later per-key Remove from deleting another generic object.
     std::vector<SessionItem> candidates;
     candidates.reserve(missing_indices.size());
-    std::unordered_set<std::string> candidate_allocation_uris;
-    candidate_allocation_uris.reserve(missing_indices.size());
+    const auto delete_allocated_noexcept = [&](const std::vector<SessionItem> &items) noexcept {
+        try {
+            return DeleteAllocatedLocations(request_context, items);
+        } catch (const std::exception &) {
+            KVCM_LOG_WARN("KVMeta allocation cleanup caught a standard internal exception");
+        } catch (...) {
+            KVCM_LOG_WARN("KVMeta allocation cleanup caught an unknown internal exception");
+        }
+        return EC_IO_ERROR;
+    };
     for (const std::size_t request_index : missing_indices) {
         const bool cancelled = maintenance_cancelled_.load(std::memory_order_acquire);
         const bool expired = KvMetaWriteSessionManager::Clock::now() >= write_deadline;
         if (cancelled || expired) {
-            const ErrorCode cleanup_ec = DeleteAllocatedLocations(request_context, candidates);
+            const ErrorCode cleanup_ec = delete_allocated_noexcept(candidates);
             if (cleanup_ec != EC_OK) {
                 KVCM_LOG_WARN("KVMeta admission stop could not release all uncommitted allocations, ec[%d]",
                               cleanup_ec);
@@ -3489,58 +3753,66 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         } catch (const std::exception &) {
             KVCM_LOG_WARN("KVMeta storage create caught a standard provider exception; "
                           "backend orphan cleanup may be required");
-            DeleteAllocatedLocations(request_context, candidates);
+            if (delete_allocated_noexcept(candidates) != EC_OK) {
+                KVCM_LOG_WARN("KVMeta could not release every allocation preceding a failed Create");
+            }
             AddError(request_context, "KVMeta storage create failed; backend orphan cleanup may be required");
-            return {EC_IO_ERROR, StartWriteResult{}};
+            // The throwing call may already have allocated an object without
+            // returning its identity. Continuing admission would permit one
+            // untraceable leak per retry, so stop KVMeta only and require
+            // operator/recovery reconciliation before another allocation.
+            CancelMaintenance();
+            return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
         } catch (...) {
             KVCM_LOG_WARN("KVMeta storage create caught an unknown provider exception; "
                           "backend orphan cleanup may be required");
-            DeleteAllocatedLocations(request_context, candidates);
+            if (delete_allocated_noexcept(candidates) != EC_OK) {
+                KVCM_LOG_WARN("KVMeta could not release every allocation preceding a failed Create");
+            }
             AddError(request_context, "KVMeta storage create failed; backend orphan cleanup may be required");
-            return {EC_IO_ERROR, StartWriteResult{}};
+            CancelMaintenance();
+            return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
         }
-        if (create_result.size() != 1 || create_result[0].first != EC_OK ||
-            !UriMatchesStorageBackend(create_result[0].second, selected.name, selected.type) ||
-            !HasOwnedAllocationShape(create_result[0].second, selected.type)) {
-            const ErrorCode create_ec = create_result.size() == 1 ? create_result[0].first : EC_MISMATCH;
-            // A backend contract violation can still carry successful
-            // allocations. Release every safely attributable singleton, not
-            // just the first result, or an overlong response would orphan its
-            // physical objects before any metadata/session is recorded.
-            std::vector<DataStorageUri> malformed_allocations;
-            std::unordered_set<std::string> seen_allocations;
-            for (const auto &[ec, uri] : create_result) {
-                // A malformed response is untrusted. Only send locations back
-                // to this backend when both its identity and URI scheme prove
-                // that the backend owns them.
-                if (ec == EC_OK && UriMatchesStorageBackend(uri, selected.name, selected.type) &&
-                    HasOwnedAllocationShape(uri, selected.type) && seen_allocations.insert(uri.ToUriString()).second) {
-                    malformed_allocations.push_back(uri);
-                }
+        if (create_result.size() == 1 && create_result[0].first != EC_OK) {
+            if (delete_allocated_noexcept(candidates) != EC_OK) {
+                KVCM_LOG_WARN("KVMeta could not release every allocation preceding a failed Create");
             }
-            if (!malformed_allocations.empty()) {
-                if (DeleteStorageUris(request_context, selected.name, malformed_allocations) != EC_OK) {
-                    KVCM_LOG_WARN("KVMeta could not release every malformed new allocation");
-                }
+            if (create_result[0].second.Valid()) {
+                // A failed Create must not return an allocation identity. It
+                // is impossible to tell whether this URI was allocated by the
+                // call, is merely diagnostic, or aliases an existing object;
+                // none of those cases grants physical Delete authority.
+                AddError(request_context,
+                         "KVMeta failed storage allocation returned an ambiguous URI; backend cleanup is required");
+                CancelMaintenance();
+                return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
             }
-            DeleteAllocatedLocations(request_context, candidates);
             AddError(request_context, "KVMeta singleton storage allocation failed");
-            return {create_ec == EC_OK ? EC_CORRUPTION : create_ec, StartWriteResult{}};
+            return {create_result[0].first, StartWriteResult{}};
         }
-        const std::string allocation_uri = create_result[0].second.ToUriString();
-        if (!candidate_allocation_uris.insert(allocation_uri).second) {
-            // A singleton call must still return a distinct physical object
-            // for every key. The duplicate URI is already owned by an earlier
-            // candidate, so deleting the deduplicated candidate set releases
-            // it exactly once and no metadata is published for either key.
-            const ErrorCode cleanup_ec = DeleteAllocatedLocations(request_context, candidates);
-            if (cleanup_ec != EC_OK) {
-                KVCM_LOG_WARN("KVMeta duplicate allocation cleanup failed, ec[%d]", cleanup_ec);
+        if (create_result.size() != 1 ||
+            !UriMatchesStorageBackend(create_result[0].second, selected.name, selected.type) ||
+            !HasOwnedKvMetaAllocationShape(create_result[0].second, selected.type) ||
+            !UriNamesCreatedKvMetaObject(create_result[0].second, selected_backend, selected.type, object_key)) {
+            // Once a singleton Create returns the wrong cardinality, no result
+            // can be attributed to this operation strongly enough to authorize
+            // physical deletion. An EC_OK result with the wrong ownership shape
+            // or a different logical object identity is equally unsafe: its
+            // URI may alias shared, pre-existing, or otherwise unrelated data.
+            // Leave this call's unknown allocations to backend orphan cleanup,
+            // while releasing only candidates proven by earlier, independently
+            // well-formed singleton calls.
+            if (delete_allocated_noexcept(candidates) != EC_OK) {
+                KVCM_LOG_WARN("KVMeta could not release every previously validated allocation");
             }
-            AddError(request_context, "KVMeta storage reused one singleton allocation for multiple keys");
+            AddError(request_context,
+                     "KVMeta singleton storage allocation failed; malformed results require backend orphan cleanup");
+            // Continuing to allocate through a provider that violated the
+            // operation/result ownership contract can leak one object per
+            // retry. Close only KVMeta; fixed-block cache traffic is untouched.
+            CancelMaintenance();
             return {EC_CORRUPTION, StartWriteResult{}};
         }
-
         auto location = std::make_shared<CacheLocation>();
         location->set_id(existing[request_index].location_id);
         location->set_status(CLS_NEW);
@@ -3558,19 +3830,45 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         location->set_validated_total_size(value_sizes[request_index]);
         std::uint64_t uri_size = 0;
         const ErrorCode location_ec = ValidateOwnedLocation(request_context,
+                                                            internal_instance_id,
                                                             existing[request_index].internal_key,
                                                             existing[request_index].location_id,
                                                             *location,
                                                             uri_size);
         if (location_ec != EC_OK || uri_size != value_sizes[request_index]) {
-            if (DeleteStorageUris(request_context, selected.name, {create_result[0].second}) != EC_OK) {
-                KVCM_LOG_WARN("KVMeta could not release an invalid-size new allocation");
+            auto cleanup_items = candidates;
+            cleanup_items.push_back(SessionItem{request_index,
+                                                keys[request_index],
+                                                existing[request_index].internal_key,
+                                                existing[request_index].location_id,
+                                                location,
+                                                location,
+                                                value_sizes[request_index]});
+            if (delete_allocated_noexcept(cleanup_items) != EC_OK) {
+                KVCM_LOG_WARN("KVMeta could not release every invalid-size allocation");
             }
-            DeleteAllocatedLocations(request_context, candidates);
             AddError(request_context,
                      location_ec == EC_OK ? "KVMeta storage returned a mismatched allocation size"
                                           : "KVMeta storage returned a malformed allocation URI");
-            return {location_ec == EC_OK ? EC_MISMATCH : location_ec, StartWriteResult{}};
+            CancelMaintenance();
+            return {EC_CORRUPTION, StartWriteResult{}};
+        }
+        const bool allocation_reused =
+            std::any_of(candidates.begin(), candidates.end(), [&](const SessionItem &candidate) {
+                return candidate.data_location && SamePhysicalAllocation(*candidate.data_location, *location);
+            });
+        if (allocation_reused) {
+            // Query fields such as size are metadata, not necessarily part of
+            // the backend's Delete identity. Release the shared allocation
+            // once through the earlier candidate and publish no metadata for
+            // either key.
+            const ErrorCode cleanup_ec = delete_allocated_noexcept(candidates);
+            if (cleanup_ec != EC_OK) {
+                KVCM_LOG_WARN("KVMeta duplicate allocation cleanup failed, ec[%d]", cleanup_ec);
+            }
+            AddError(request_context, "KVMeta storage reused one singleton allocation for multiple keys");
+            CancelMaintenance();
+            return {EC_CORRUPTION, StartWriteResult{}};
         }
         candidates.push_back(SessionItem{request_index,
                                          keys[request_index],
@@ -3583,7 +3881,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
 
     const bool cancelled_after_allocation = maintenance_cancelled_.load(std::memory_order_acquire);
     if (cancelled_after_allocation || KvMetaWriteSessionManager::Clock::now() >= write_deadline) {
-        const ErrorCode cleanup_ec = DeleteAllocatedLocations(request_context, candidates);
+        const ErrorCode cleanup_ec = delete_allocated_noexcept(candidates);
         if (cleanup_ec != EC_OK) {
             KVCM_LOG_WARN("KVMeta stopped allocation cleanup failed, ec[%d]", cleanup_ec);
         }
@@ -3663,33 +3961,100 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         for (const auto &candidate : candidates) {
             candidate_original_keys.push_back(candidate.original_key);
         }
-        indexer->Sync(candidate_keys);
+        // The conditional insert result can be partial or malformed. Before
+        // deciding that an allocation was never published, make the current
+        // metadata view durable. A failed barrier means recovery, not this
+        // request, must decide which generation owns the allocation.
+        if (!indexer->Sync(candidate_keys)) {
+            AddError(request_context,
+                     "KVMeta start rollback could not establish a durable metadata view; maintenance is "
+                     "fail-closed until recovery");
+            CancelMaintenance();
+            return EC_OUTCOME_UNKNOWN;
+        }
         std::vector<ExactLocation> current;
         const ErrorCode reload_ec =
             LoadExactLocations(request_context, internal_instance_id, candidate_original_keys, current);
+        if (reload_ec != EC_OK || current.size() != candidates.size()) {
+            AddError(request_context,
+                     "KVMeta start rollback could not reload exact ownership; maintenance is fail-closed until "
+                     "recovery");
+            CancelMaintenance();
+            return EC_OUTCOME_UNKNOWN;
+        }
         std::vector<SessionItem> exact_deletes;
         std::vector<SessionItem> direct_deletes;
+        bool ownership_uncertain = false;
         for (std::size_t i = 0; i < candidates.size(); ++i) {
-            if (i < current.size() && current[i].ec == EC_OK && current[i].location) {
-                if (current[i].location->ToJsonString() == candidates[i].metadata_location->ToJsonString() ||
-                    SamePhysicalAllocation(*current[i].location, *candidates[i].data_location)) {
+            if (current[i].ec == EC_OK && current[i].location) {
+                std::uint64_t current_size = 0;
+                if (ValidateOwnedLocation(request_context,
+                                          internal_instance_id,
+                                          candidates[i].internal_key,
+                                          candidates[i].location_id,
+                                          *current[i].location,
+                                          current_size) != EC_OK) {
+                    ownership_uncertain = true;
+                    continue;
+                }
+                const bool exact_candidate =
+                    current[i].location->ToJsonString() == candidates[i].metadata_location->ToJsonString();
+                const bool same_allocation = candidates[i].data_location &&
+                                             SamePhysicalAllocation(*current[i].location, *candidates[i].data_location);
+                if (inserted[i] && exact_candidate) {
                     SessionItem item = candidates[i];
                     item.metadata_location = current[i].location;
                     exact_deletes.push_back(std::move(item));
-                } else {
+                } else if (exact_candidate || same_allocation) {
+                    // The URI is still referenced, but the exact metadata is
+                    // either known to have won the conditional insert, or the
+                    // insert result did not prove that this request published
+                    // it. Deleting either side would destroy an owner we
+                    // cannot identify.
+                    ownership_uncertain = true;
+                } else if (lost_race[i]) {
+                    // EC_EXIST proves this candidate was never published.
+                    // Its fresh allocation remains independently owned even
+                    // though the winning metadata changed again before the
+                    // durable reload.
                     direct_deletes.push_back(candidates[i]);
+                } else {
+                    // If this request inserted the owner (or the RMW result
+                    // was too malformed to prove it did not), a replacement
+                    // can also mean that the old URI was freed and reused.
+                    // Keep it as an orphan; absence/different identity is not
+                    // physical-delete authority without a generation token.
+                    ownership_uncertain = true;
                 }
-            } else if (i < current.size() && current[i].ec == EC_NOENT) {
-                direct_deletes.push_back(candidates[i]);
-            } else if (inserted[i]) {
-                exact_deletes.push_back(candidates[i]);
+            } else if (current[i].ec == EC_NOENT) {
+                if (lost_race[i]) {
+                    direct_deletes.push_back(candidates[i]);
+                } else {
+                    ownership_uncertain = true;
+                }
+            } else {
+                ownership_uncertain = true;
             }
         }
-        const ErrorCode meta_cleanup_ec =
-            DeleteItems(request_context, internal_instance_id, exact_deletes, false, false);
-        const ErrorCode direct_cleanup_ec = DeleteAllocatedLocations(request_context, direct_deletes);
-        if (reload_ec != EC_OK || meta_cleanup_ec != EC_OK || direct_cleanup_ec != EC_OK) {
-            AddError(request_context, "KVMeta start rollback was incomplete; uncertain allocations were retained");
+        DeleteItemsOptions cleanup_options;
+        cleanup_options.adjust_storage_usage = false;
+        cleanup_options.restore_usage_on_sync_failure = false;
+        const auto metadata_cleanup =
+            DeleteItems(request_context, internal_instance_id, exact_deletes, cleanup_options);
+        if (metadata_cleanup.ec != EC_OK) {
+            KVCM_LOG_WARN("KVMeta start rollback left exact allocations for backend orphan cleanup, ec[%d]",
+                          metadata_cleanup.ec);
+        }
+        const ErrorCode direct_cleanup_ec = delete_allocated_noexcept(direct_deletes);
+        if (direct_cleanup_ec != EC_OK) {
+            KVCM_LOG_WARN("KVMeta start rollback left unpublished allocations for backend orphan cleanup, ec[%d]",
+                          direct_cleanup_ec);
+        }
+        if (!metadata_cleanup.metadata_cleanup_complete || metadata_cleanup.metadata_already_absent ||
+            ownership_uncertain) {
+            AddError(request_context,
+                     "KVMeta start rollback could not prove exclusive ownership; recovery is required");
+            CancelMaintenance();
             return EC_OUTCOME_UNKNOWN;
         }
         return original_error;
@@ -3725,12 +4090,19 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                         StartWriteResult{}};
             }
             const ErrorCode validate_ec = ValidateOwnedLocation(request_context,
+                                                                internal_instance_id,
                                                                 race_winners[i].internal_key,
                                                                 race_winners[i].location_id,
                                                                 *race_winners[i].location,
                                                                 winner_size);
             if (validate_ec != EC_OK) {
                 return {rollback_start(validate_ec), StartWriteResult{}};
+            }
+            if (candidates[candidate_index].data_location &&
+                SamePhysicalAllocation(*race_winners[i].location, *candidates[candidate_index].data_location)) {
+                AddError(request_context,
+                         "KVMeta storage reused one allocation across concurrent singleton Create calls");
+                return {rollback_start(EC_CORRUPTION), StartWriteResult{}};
             }
             // The conditional insert can lose to a writer whose metadata is
             // valid but not committed yet. Do not turn that transient state
@@ -3754,7 +4126,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             race_losers.push_back(candidates[i]);
         }
     }
-    if (const ErrorCode ec = DeleteAllocatedLocations(request_context, race_losers); ec != EC_OK) {
+    if (const ErrorCode ec = delete_allocated_noexcept(race_losers); ec != EC_OK) {
         KVCM_LOG_WARN("KVMeta failed to release one or more race-loser allocations, ec[%d]", ec);
     }
 
@@ -3773,36 +4145,36 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     for (const auto &item : session_items) {
         inserted_keys.push_back(item.internal_key);
     }
-    if (!indexer->Sync(inserted_keys)) {
-        bool metadata_cleanup_complete = false;
-        const ErrorCode cleanup_ec = DeleteItems(request_context,
-                                                 internal_instance_id,
-                                                 session_items,
-                                                 /*metadata_only=*/false,
-                                                 /*adjust_storage_usage=*/false,
-                                                 /*maintenance_no_touch=*/false,
-                                                 /*delete_if_metadata_absent=*/true,
-                                                 /*sync_metadata_absent=*/true,
-                                                 /*restore_usage_on_sync_failure=*/false,
-                                                 /*metadata_outcome_changed=*/nullptr,
-                                                 &metadata_cleanup_complete);
-        if (!metadata_cleanup_complete) {
-            // No write session owns these reservations yet. If their
-            // compensating delete cannot be proven durable, only leader
-            // recovery can safely reconcile the active metadata generation.
-            // Close the optional KVMeta path without affecting fixed-block
-            // KVCache admission.
+
+    // Until Put() publishes a write session, no owner exists that can finish
+    // or expire these active reservations. Every failure in this interval
+    // must therefore prove their metadata absence before returning an error
+    // that callers may retry. Physical cleanup happens only after that proof;
+    // a failed release is an unreachable backend orphan, while an uncertain
+    // metadata delete requires leader recovery and fail-closes KVMeta alone.
+    const auto rollback_unpublished_reservations = [&](bool adjust_storage_usage) -> ErrorCode {
+        DeleteItemsOptions cleanup_options;
+        cleanup_options.adjust_storage_usage = adjust_storage_usage;
+        cleanup_options.restore_usage_on_sync_failure = adjust_storage_usage;
+        const auto cleanup = DeleteItems(request_context, internal_instance_id, session_items, cleanup_options);
+        if (!cleanup.metadata_cleanup_complete || cleanup.metadata_already_absent) {
             AddError(request_context,
-                     "KVMeta reservation rollback was incomplete; maintenance is fail-closed until recovery");
+                     "KVMeta unpublished reservation rollback was incomplete; maintenance is fail-closed until "
+                     "recovery");
             CancelMaintenance();
-            return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
+            return EC_OUTCOME_UNKNOWN;
         }
-        if (cleanup_ec != EC_OK) {
-            // The ownership record is durably absent, so a failed physical
-            // release is an unreachable backend orphan rather than a reason
-            // to disable otherwise healthy KVMeta traffic.
-            KVCM_LOG_WARN("KVMeta reservation rollback left an allocation for backend orphan cleanup, ec[%d]",
-                          cleanup_ec);
+        if (cleanup.ec != EC_OK) {
+            KVCM_LOG_WARN("KVMeta unpublished reservation rollback left an allocation for backend orphan cleanup, "
+                          "ec[%d]",
+                          cleanup.ec);
+        }
+        return EC_OK;
+    };
+
+    if (!indexer->Sync(inserted_keys)) {
+        if (rollback_unpublished_reservations(/*adjust_storage_usage=*/false) != EC_OK) {
+            return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
         }
         AddError(request_context, "KVMeta metadata reservation did not reach its persistence barrier");
         return {EC_TIMEOUT, StartWriteResult{}};
@@ -3811,7 +4183,9 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     for (const auto &item : session_items) {
         KvMetaManager::ValueLocation location;
         if (!ToValueLocation(*item.metadata_location, location)) {
-            DeleteItems(request_context, internal_instance_id, session_items, false, false);
+            if (rollback_unpublished_reservations(/*adjust_storage_usage=*/false) != EC_OK) {
+                return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
+            }
             return {EC_CORRUPTION, StartWriteResult{}};
         }
         response.locations.push_back(std::move(location));
@@ -3822,18 +4196,36 @@ KvMetaManager::StartWrite(RequestContext *request_context,
 
     std::string session_id;
     auto session_result = KvMetaWriteSessionManager::PutResult::kDuplicate;
-    for (int attempt = 0; attempt < 8 && session_result == KvMetaWriteSessionManager::PutResult::kDuplicate;
-         ++attempt) {
-        session_id = StringUtil::GenerateRandomString(32);
-        auto items_for_attempt = session_items;
-        session_result =
-            write_session_manager_
-                ? write_session_manager_->Put(
-                      session_id, internal_instance_id, quota_shard, std::move(items_for_attempt), write_deadline)
-                : KvMetaWriteSessionManager::PutResult::kStopped;
+    bool session_publication_threw = false;
+    try {
+        for (int attempt = 0; attempt < 8 && session_result == KvMetaWriteSessionManager::PutResult::kDuplicate;
+             ++attempt) {
+            session_id = StringUtil::GenerateRandomString(32);
+            auto items_for_attempt = session_items;
+            session_result =
+                write_session_manager_
+                    ? write_session_manager_->Put(
+                          session_id, internal_instance_id, quota_shard, std::move(items_for_attempt), write_deadline)
+                    : KvMetaWriteSessionManager::PutResult::kStopped;
+        }
+    } catch (const std::exception &) {
+        session_publication_threw = true;
+        KVCM_LOG_WARN("KVMeta write-session publication caught a standard internal exception");
+    } catch (...) {
+        session_publication_threw = true;
+        KVCM_LOG_WARN("KVMeta write-session publication caught an unknown internal exception");
+    }
+    if (session_publication_threw) {
+        if (rollback_unpublished_reservations(/*adjust_storage_usage=*/true) != EC_OK) {
+            return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
+        }
+        AddError(request_context, "KVMeta could not publish the write session");
+        return {EC_ERROR, StartWriteResult{}};
     }
     if (session_result != KvMetaWriteSessionManager::PutResult::kOk) {
-        DeleteItems(request_context, internal_instance_id, session_items, false, true);
+        if (rollback_unpublished_reservations(/*adjust_storage_usage=*/true) != EC_OK) {
+            return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
+        }
         if (session_result == KvMetaWriteSessionManager::PutResult::kFull) {
             AddError(request_context, "KVMeta active write-session limit has been reached");
             return {EC_NOSPC, StartWriteResult{}};
@@ -3868,7 +4260,20 @@ ErrorCode KvMetaManager::FinishWriteInternal(RequestContext *request_context,
     // aborts the complete session, which also makes packed/remote backend
     // semantics unsurprising even though current allocations are singleton.
     if (std::any_of(success_keys.begin(), success_keys.end(), [](bool success) { return !success; })) {
-        return DeleteItems(request_context, internal_instance_id, items, false, true);
+        const auto cleanup = DeleteItems(request_context, internal_instance_id, items, DeleteItemsOptions{});
+        if (!cleanup.metadata_cleanup_complete || cleanup.metadata_already_absent) {
+            // Take/expiry has consumed the only in-memory owner. Do not admit
+            // a successor generation while durable metadata may still refer
+            // to this allocation. An already-absent record is equally unsafe:
+            // the old URI may already have been freed and reused, so it was
+            // intentionally not sent to physical Delete.
+            AddError(request_context,
+                     "KVMeta session rollback did not prove metadata absence; maintenance is fail-closed until "
+                     "recovery");
+            CancelMaintenance();
+            return EC_OUTCOME_UNKNOWN;
+        }
+        return cleanup.ec;
     }
 
     auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(internal_instance_id);
@@ -3888,7 +4293,6 @@ ErrorCode KvMetaManager::FinishWriteInternal(RequestContext *request_context,
         item_keys.push_back(item.internal_key);
     }
 
-    std::vector<bool> committed(items.size(), false);
     ErrorCode commit_error = EC_OK;
     for (const auto &layer : MakeUniqueKeyLayers(item_keys)) {
         KeyVector keys;
@@ -3931,9 +4335,7 @@ ErrorCode KvMetaManager::FinishWriteInternal(RequestContext *request_context,
                 continue;
             }
             const ErrorCode ec = rmw.per_location_error_codes[i][0];
-            if (ec == EC_OK && modifier_committed[i]) {
-                committed[layer[i]] = true;
-            } else {
+            if (ec != EC_OK || !modifier_committed[i]) {
                 // A reservation disappearing before commit is a failed CAS,
                 // not an idempotent absence. FirstHardError intentionally
                 // ignores EC_NOENT for read/remove aggregation, so normalize
@@ -3956,40 +4358,104 @@ ErrorCode KvMetaManager::FinishWriteInternal(RequestContext *request_context,
         return EC_OK;
     }
 
+    // Commit may have changed only a prefix of the session. Persist that
+    // exact current view before classifying any allocation as unreferenced;
+    // otherwise a failed barrier plus an in-memory miss could make rollback
+    // physically delete an allocation still referenced by durable metadata.
+    if (!indexer->Sync(item_keys)) {
+        AddError(request_context,
+                 "KVMeta commit rollback could not establish a durable metadata view; maintenance is fail-closed "
+                 "until recovery");
+        CancelMaintenance();
+        return EC_OUTCOME_UNKNOWN;
+    }
+
     std::vector<std::string> original_keys;
     original_keys.reserve(items.size());
     for (const auto &item : items) {
         original_keys.push_back(item.original_key);
     }
     std::vector<ExactLocation> current;
-    indexer->Sync(item_keys);
     const ErrorCode reload_ec = LoadExactLocations(request_context, internal_instance_id, original_keys, current);
+    if (reload_ec != EC_OK || current.size() != items.size()) {
+        AddError(request_context,
+                 "KVMeta commit rollback could not reload exact ownership; maintenance is fail-closed until "
+                 "recovery");
+        CancelMaintenance();
+        return EC_OUTCOME_UNKNOWN;
+    }
     std::vector<SessionItem> exact_deletes;
-    std::vector<SessionItem> direct_deletes;
+    bool ownership_uncertain = false;
     for (std::size_t i = 0; i < items.size(); ++i) {
-        if (i < current.size() && current[i].ec == EC_OK && current[i].location) {
+        if (current[i].ec == EC_OK && current[i].location) {
+            std::uint64_t current_size = 0;
+            if (ValidateOwnedLocation(request_context,
+                                      internal_instance_id,
+                                      items[i].internal_key,
+                                      items[i].location_id,
+                                      *current[i].location,
+                                      current_size) != EC_OK) {
+                ownership_uncertain = true;
+                continue;
+            }
             const std::string current_value = current[i].location->ToJsonString();
             if (current_value == items[i].metadata_location->ToJsonString() ||
                 current_value == committed_locations[i]->ToJsonString()) {
                 SessionItem item = items[i];
                 item.metadata_location = current[i].location;
                 exact_deletes.push_back(std::move(item));
+            } else if (items[i].data_location &&
+                       SamePhysicalAllocation(*current[i].location, *items[i].data_location)) {
+                // A concurrent actor changed ownership metadata without
+                // changing the URI. It is unsafe both to CAS-delete that
+                // unexpected owner and to physically delete its allocation.
+                ownership_uncertain = true;
             } else {
-                direct_deletes.push_back(items[i]);
+                // Supported KVMeta operations cannot replace an active
+                // session with another allocation. Even though the old URI
+                // is no longer referenced by this metadata, it may already
+                // have been freed and reused. Preserve it as an orphan and
+                // rebuild ownership/counters before admitting mutations.
+                ownership_uncertain = true;
             }
-        } else if (i < current.size() && current[i].ec == EC_NOENT) {
-            direct_deletes.push_back(items[i]);
+        } else if (current[i].ec == EC_NOENT) {
+            // StartWrite charged this session's bytes before publication. An
+            // absent record here can only come from an unsupported concurrent
+            // mutation or an uncertain metadata outcome. It is not authority
+            // to delete a reusable address, and the byte counter is no longer
+            // trustworthy.
+            ownership_uncertain = true;
         } else {
-            SessionItem item = items[i];
-            item.metadata_location = committed[i] ? committed_locations[i] : items[i].metadata_location;
-            exact_deletes.push_back(std::move(item));
+            ownership_uncertain = true;
         }
     }
-    const ErrorCode exact_ec = DeleteItems(request_context, internal_instance_id, exact_deletes, false, true);
-    const ErrorCode direct_ec = DeleteAllocatedLocations(request_context, direct_deletes);
-    if (reload_ec != EC_OK || exact_ec != EC_OK || direct_ec != EC_OK) {
+    const auto exact_cleanup = DeleteItems(request_context, internal_instance_id, exact_deletes, DeleteItemsOptions{});
+    if (!exact_cleanup.metadata_cleanup_complete || exact_cleanup.metadata_already_absent) {
         AddError(request_context,
-                 "KVMeta commit rollback was incomplete; exact metadata guards prevented unsafe deletion");
+                 "KVMeta commit rollback did not prove metadata absence; maintenance is fail-closed until recovery");
+        CancelMaintenance();
+        ownership_uncertain = true;
+    }
+    if (exact_cleanup.ec != EC_OK) {
+        KVCM_LOG_WARN("KVMeta commit rollback left exact allocations for backend orphan cleanup, ec[%d]",
+                      exact_cleanup.ec);
+    }
+    if (ownership_uncertain) {
+        AddError(request_context,
+                 "KVMeta commit rollback observed an unexpected replacement or missing owner; recovery is required");
+        CancelMaintenance();
+    }
+    // Unlike a reservation that never became visible, this path follows a
+    // partially applied commit. Even after metadata absence is durable, a
+    // failed one-shot physical cleanup means the overall batch outcome is no
+    // longer represented by the original CAS/persistence error alone. Keep
+    // admission open (the orphan is unreachable), but force reconciliation
+    // instead of letting the caller treat the original error as replay-safe.
+    if (exact_cleanup.ec != EC_OK) {
+        AddError(request_context, "KVMeta partial commit rollback left an unreachable backend allocation");
+        return EC_OUTCOME_UNKNOWN;
+    }
+    if (ownership_uncertain) {
         return EC_OUTCOME_UNKNOWN;
     }
     return commit_error;
@@ -4022,9 +4488,16 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
     case KvMetaWriteSessionManager::TakeResult::kOk:
         break;
     }
+    if (session.items.empty()) {
+        AddError(request_context, "KVMeta write session is empty; admission is fail-closed until recovery");
+        CancelMaintenance();
+        return EC_OUTCOME_UNKNOWN;
+    }
     if (session.quota_shard >= quota_admission_mutexes_.size()) {
-        AddError(request_context, "KVMeta write session has an invalid quota shard");
-        return EC_CORRUPTION;
+        AddError(request_context,
+                 "KVMeta write session has an invalid quota shard; admission is fail-closed until recovery");
+        CancelMaintenance();
+        return EC_OUTCOME_UNKNOWN;
     }
     // Keep commit/rollback finalization in the same KVMeta-only group critical
     // section as allocation, Remove and Trim. In particular, rollback must
@@ -4039,13 +4512,23 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
     const auto cleanup_active_session = [&](ErrorCode completed_result) {
         ErrorCode cleanup_ec = EC_IO_ERROR;
         const char *failure_kind = "error_code";
+        bool cleanup_threw = false;
         try {
             const std::vector<bool> failed(session.items.size(), false);
             cleanup_ec = FinishWriteInternal(request_context, session.internal_instance_id, failed, session.items);
         } catch (const std::exception &) {
             failure_kind = "standard_exception";
+            cleanup_threw = true;
         } catch (...) {
             failure_kind = "unknown_exception";
+            cleanup_threw = true;
+        }
+        if (cleanup_threw) {
+            // Take() already consumed the only session owner. Preserve an
+            // expired caller's timeout result, but fail-close new mutations
+            // until recovery establishes the durable metadata state.
+            CancelMaintenance();
+            cleanup_ec = EC_OUTCOME_UNKNOWN;
         }
         if (cleanup_ec == EC_OK) {
             return completed_result;
@@ -4079,7 +4562,16 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
     // Waking on every PutFinish would turn sustained write QPS into registry
     // scan QPS even when the group is far below its watermark. EC_NOSPC still
     // wakes the worker immediately from StartWrite's admission path.
-    return FinishWriteInternal(request_context, session.internal_instance_id, success_keys, session.items);
+    try {
+        return FinishWriteInternal(request_context, session.internal_instance_id, success_keys, session.items);
+    } catch (const std::exception &) {
+        KVCM_LOG_WARN("KVMeta commit finalization caught a standard internal exception; recovery is required");
+    } catch (...) {
+        KVCM_LOG_WARN("KVMeta commit finalization caught an unknown internal exception; recovery is required");
+    }
+    AddError(request_context, "KVMeta commit finalization outcome is unknown; recovery is required");
+    CancelMaintenance();
+    return EC_OUTCOME_UNKNOWN;
 }
 
 ErrorCode KvMetaManager::Remove(RequestContext *request_context,
@@ -4087,6 +4579,9 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
                                 const std::vector<std::string> &keys) {
     if (!initialized_.load(std::memory_order_acquire)) {
         return EC_ERROR;
+    }
+    if (maintenance_cancelled_.load(std::memory_order_acquire)) {
+        return EC_SERVICE_NOT_LEADER;
     }
     const auto [instance_ec, instance_info] = GetValidatedInstanceInfo(request_context, instance_id);
     if (instance_ec != EC_OK || !instance_info) {
@@ -4106,6 +4601,9 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
     const std::size_t quota_shard =
         std::hash<std::string>{}(instance_info->instance_group_name()) % quota_admission_mutexes_.size();
     std::unique_lock<std::mutex> quota_lock(quota_admission_mutexes_[quota_shard]);
+    if (maintenance_cancelled_.load(std::memory_order_acquire)) {
+        return EC_SERVICE_NOT_LEADER;
+    }
 
     const std::string internal_instance_id = InternalInstanceId(instance_id);
     if (trimming_instances_[quota_shard].count(internal_instance_id) != 0) {
@@ -4125,8 +4623,12 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
             return exact[i].ec == EC_OK ? EC_CORRUPTION : exact[i].ec;
         }
         std::uint64_t size = 0;
-        if (const ErrorCode ec = ValidateOwnedLocation(
-                request_context, exact[i].internal_key, exact[i].location_id, *exact[i].location, size);
+        if (const ErrorCode ec = ValidateOwnedLocation(request_context,
+                                                       internal_instance_id,
+                                                       exact[i].internal_key,
+                                                       exact[i].location_id,
+                                                       *exact[i].location,
+                                                       size);
             ec != EC_OK) {
             return ec;
         }
@@ -4140,26 +4642,47 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
         items.push_back(SessionItem{
             i, keys[i], exact[i].internal_key, exact[i].location_id, exact[i].location, exact[i].location, size});
     }
-    bool metadata_outcome_changed = false;
-    const ErrorCode delete_ec = DeleteItems(request_context,
-                                            internal_instance_id,
-                                            items,
-                                            /*metadata_only=*/false,
-                                            /*adjust_storage_usage=*/true,
-                                            /*maintenance_no_touch=*/false,
-                                            /*delete_if_metadata_absent=*/true,
-                                            /*sync_metadata_absent=*/false,
-                                            /*restore_usage_on_sync_failure=*/true,
-                                            &metadata_outcome_changed);
-    if (delete_ec != EC_OK && metadata_outcome_changed) {
-        // Some keys are already absent or durably/in-memory deleted, while a
-        // later metadata or physical step failed. Returning the underlying
+    DeleteItemsResult deletion;
+    deletion.ec = EC_IO_ERROR;
+    try {
+        deletion = DeleteItems(request_context, internal_instance_id, items, DeleteItemsOptions{});
+    } catch (const std::exception &) {
+        KVCM_LOG_WARN("KVMeta Remove caught a standard internal exception; recovery is required");
+        AddError(request_context, "KVMeta Remove outcome is unknown after an internal exception");
+        CancelMaintenance();
+        return EC_OUTCOME_UNKNOWN;
+    } catch (...) {
+        KVCM_LOG_WARN("KVMeta Remove caught an unknown internal exception; recovery is required");
+        AddError(request_context, "KVMeta Remove outcome is unknown after an internal exception");
+        CancelMaintenance();
+        return EC_OUTCOME_UNKNOWN;
+    }
+    if (deletion.metadata_already_absent || deletion.metadata_owner_conflicted) {
+        // These items were present in the exact read under the group shard.
+        // Seeing one disappear or change before the compare-and-delete
+        // therefore means an unsupported concurrent mutation (for example,
+        // another leader). Its ownership/usage side effect is unknowable, so
+        // only recovery may rebuild the authoritative state.
+        CancelMaintenance();
+        AddError(request_context,
+                 "KVMeta Remove observed an unexpected missing or replaced owner; recovery is required");
+        return EC_OUTCOME_UNKNOWN;
+    }
+    if (deletion.ec != EC_OK && deletion.metadata_outcome_changed) {
+        // Some keys are durably/in-memory deleted, while a later metadata or
+        // physical step failed. Returning the underlying
         // ordinary error would invite an unsafe blind retry that can delete a
         // successor generation created for one of those keys.
+        if (!deletion.metadata_cleanup_complete) {
+            // In-memory absence without a durable barrier must also block new
+            // generations locally. Outcome-unknown alone is only a caller
+            // contract; it is not an admission fence against other clients.
+            CancelMaintenance();
+        }
         AddError(request_context, "KVMeta Remove partially applied; final outcome must be reconciled");
         return EC_OUTCOME_UNKNOWN;
     }
-    return delete_ec;
+    return deletion.ec;
 }
 
 ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::string &instance_id, bool metadata_only) {
@@ -4241,92 +4764,156 @@ ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::str
     } trim_marker{&quota_admission_mutexes_[quota_shard], &trimming_instances_[quota_shard], &internal_instance_id};
     quota_lock.unlock();
 
-    for (;;) {
-        if (maintenance_cancelled_.load(std::memory_order_acquire)) {
-            return EC_SERVICE_NOT_LEADER;
+    bool trim_metadata_changed = false;
+    bool trim_delete_in_progress = false;
+    bool trim_metadata_uncertain = false;
+    const auto finish_trim = [&](ErrorCode ec) {
+        if (ec != EC_OK && (trim_metadata_changed || trim_metadata_uncertain)) {
+            AddError(request_context, "KVMeta Trim partially applied; final outcome must be reconciled");
+            return EC_OUTCOME_UNKNOWN;
         }
-        std::vector<SessionItem> batch;
-        batch.reserve(kMaintenanceDeleteBatchSize);
-        bool found_any = false;
-        ErrorCode operation_ec = EC_OK;
-        const auto flush = [&]() {
-            if (batch.empty() || operation_ec != EC_OK) {
-                return;
-            }
-            if (maintenance_cancelled_.load(std::memory_order_acquire)) {
-                operation_ec = EC_SERVICE_NOT_LEADER;
-                return;
-            }
-            operation_ec = DeleteItems(request_context, internal_instance_id, batch, metadata_only, true);
-            batch.clear();
-        };
+        return ec;
+    };
 
-        std::string cursor = SCAN_BASE_CURSOR;
-        do {
+    try {
+        for (;;) {
             if (maintenance_cancelled_.load(std::memory_order_acquire)) {
-                return EC_SERVICE_NOT_LEADER;
+                return finish_trim(EC_SERVICE_NOT_LEADER);
             }
-            std::string next_cursor;
-            KeyVector keys;
-            const ErrorCode scan_ec = indexer->Scan(request_context, cursor, kRecoveryScanBatchSize, next_cursor, keys);
-            if (scan_ec != EC_OK || next_cursor.empty()) {
-                return scan_ec == EC_OK ? EC_CORRUPTION : scan_ec;
-            }
-            if (!keys.empty()) {
-                CacheLocationMapVector locations;
-                const auto get_result = indexer->GetLocations(request_context, keys, locations);
-                if (get_result.ec != EC_OK || locations.size() != keys.size() ||
-                    get_result.error_codes.size() != keys.size()) {
-                    return get_result.ec == EC_OK ? EC_MISMATCH : get_result.ec;
+            std::vector<SessionItem> batch;
+            batch.reserve(kMaintenanceDeleteBatchSize);
+            bool found_any = false;
+            ErrorCode operation_ec = EC_OK;
+            const auto flush = [&]() {
+                if (batch.empty() || operation_ec != EC_OK) {
+                    return;
                 }
-                for (std::size_t i = 0; i < keys.size() && operation_ec == EC_OK; ++i) {
-                    if (maintenance_cancelled_.load(std::memory_order_acquire)) {
-                        return EC_SERVICE_NOT_LEADER;
+                if (maintenance_cancelled_.load(std::memory_order_acquire)) {
+                    operation_ec = EC_SERVICE_NOT_LEADER;
+                    return;
+                }
+                // Keep this flag set across stack unwinding. Although normal
+                // backend exceptions are contained below DeleteItems, an
+                // allocation or unexpected metadata exception can otherwise
+                // escape after an in-memory delete without reporting whether
+                // persistence advanced.
+                trim_delete_in_progress = true;
+                DeleteItemsOptions delete_options;
+                delete_options.delete_physical = !metadata_only;
+                const auto deletion = DeleteItems(request_context, internal_instance_id, batch, delete_options);
+                operation_ec = deletion.ec;
+                trim_delete_in_progress = false;
+                trim_metadata_changed = trim_metadata_changed || deletion.metadata_outcome_changed;
+                if (deletion.metadata_already_absent || deletion.metadata_owner_conflicted) {
+                    // The scan captured this exact owner while the per-instance
+                    // trim fence was active. Its disappearance or replacement
+                    // proves an out-of-protocol mutation whose ownership and
+                    // storage-usage delta are unknown. It is deliberately not
+                    // sent to physical Delete because its URI could already
+                    // belong to a successor.
+                    trim_metadata_uncertain = true;
+                    CancelMaintenance();
+                    operation_ec = EC_OUTCOME_UNKNOWN;
+                }
+                if (deletion.metadata_outcome_changed && !deletion.metadata_cleanup_complete) {
+                    // Keep the per-instance trim fence from turning into an
+                    // admission hole when it is removed at function exit.
+                    // The global KVMeta recovery gate is required until the
+                    // in-memory/durable metadata split is reconciled.
+                    CancelMaintenance();
+                }
+                batch.clear();
+            };
+
+            std::string cursor = SCAN_BASE_CURSOR;
+            do {
+                if (maintenance_cancelled_.load(std::memory_order_acquire)) {
+                    return finish_trim(EC_SERVICE_NOT_LEADER);
+                }
+                std::string next_cursor;
+                KeyVector keys;
+                const ErrorCode scan_ec =
+                    indexer->Scan(request_context, cursor, kRecoveryScanBatchSize, next_cursor, keys);
+                if (scan_ec != EC_OK || next_cursor.empty()) {
+                    return finish_trim(scan_ec == EC_OK ? EC_CORRUPTION : scan_ec);
+                }
+                if (!keys.empty()) {
+                    CacheLocationMapVector locations;
+                    const auto get_result = indexer->GetLocations(request_context, keys, locations);
+                    if (get_result.ec != EC_OK || locations.size() != keys.size() ||
+                        get_result.error_codes.size() != keys.size()) {
+                        return finish_trim(get_result.ec == EC_OK ? EC_MISMATCH : get_result.ec);
                     }
-                    if (get_result.error_codes[i] != EC_OK || locations[i].empty()) {
-                        return get_result.error_codes[i] == EC_OK ? EC_CORRUPTION : get_result.error_codes[i];
-                    }
-                    for (const auto &[location_id, location] : locations[i]) {
-                        if (!location) {
-                            operation_ec = EC_CORRUPTION;
-                            break;
+                    for (std::size_t i = 0; i < keys.size() && operation_ec == EC_OK; ++i) {
+                        if (maintenance_cancelled_.load(std::memory_order_acquire)) {
+                            return finish_trim(EC_SERVICE_NOT_LEADER);
                         }
-                        std::uint64_t size = 0;
-                        operation_ec = ValidateOwnedLocation(request_context, keys[i], location_id, *location, size);
-                        if (operation_ec != EC_OK) {
-                            break;
+                        if (get_result.error_codes[i] != EC_OK || locations[i].empty()) {
+                            return finish_trim(get_result.error_codes[i] == EC_OK ? EC_CORRUPTION
+                                                                                  : get_result.error_codes[i]);
                         }
-                        found_any = true;
-                        auto copy = std::make_shared<CacheLocation>(*location);
-                        batch.push_back(SessionItem{0, {}, keys[i], location_id, copy, copy, size});
-                        if (batch.size() == kMaintenanceDeleteBatchSize) {
-                            flush();
-                        }
-                        if (operation_ec != EC_OK) {
-                            break;
+                        for (const auto &[location_id, location] : locations[i]) {
+                            if (!location) {
+                                operation_ec = EC_CORRUPTION;
+                                break;
+                            }
+                            std::uint64_t size = 0;
+                            operation_ec = ValidateOwnedLocation(
+                                request_context, internal_instance_id, keys[i], location_id, *location, size);
+                            if (operation_ec != EC_OK) {
+                                break;
+                            }
+                            found_any = true;
+                            auto copy = std::make_shared<CacheLocation>(*location);
+                            batch.push_back(SessionItem{0, {}, keys[i], location_id, copy, copy, size});
+                            if (batch.size() == kMaintenanceDeleteBatchSize) {
+                                flush();
+                            }
+                            if (operation_ec != EC_OK) {
+                                break;
+                            }
                         }
                     }
                 }
-            }
+                if (operation_ec != EC_OK) {
+                    return finish_trim(operation_ec);
+                }
+                cursor = std::move(next_cursor);
+            } while (cursor != SCAN_BASE_CURSOR);
+
+            flush();
             if (operation_ec != EC_OK) {
-                return operation_ec;
+                return finish_trim(operation_ec);
             }
-            cursor = std::move(next_cursor);
-        } while (cursor != SCAN_BASE_CURSOR);
-
-        flush();
-        if (operation_ec != EC_OK) {
-            return operation_ec;
+            if (maintenance_cancelled_.load(std::memory_order_acquire)) {
+                return finish_trim(EC_SERVICE_NOT_LEADER);
+            }
+            if (!found_any) {
+                return EC_OK;
+            }
+            // Deleting during a cursor scan is safe for a single captured
+            // batch, but some backends provide weak cursor guarantees under
+            // mutation. Restart until a complete pass observes no remaining
+            // locations.
         }
-        if (maintenance_cancelled_.load(std::memory_order_acquire)) {
-            return EC_SERVICE_NOT_LEADER;
+    } catch (const std::exception &) {
+        if (trim_delete_in_progress) {
+            trim_metadata_uncertain = true;
+            CancelMaintenance();
         }
-        if (!found_any) {
-            return EC_OK;
+        KVCM_LOG_WARN("KVMeta Trim caught a standard exception after metadata progress[%d]",
+                      trim_metadata_changed || trim_metadata_uncertain ? 1 : 0);
+        AddError(request_context, "KVMeta Trim failed with a standard internal exception");
+        return finish_trim(EC_ERROR);
+    } catch (...) {
+        if (trim_delete_in_progress) {
+            trim_metadata_uncertain = true;
+            CancelMaintenance();
         }
-        // Deleting during a cursor scan is safe for a single captured batch,
-        // but some backends provide weak cursor guarantees under mutation.
-        // Restart until a complete pass observes no remaining locations.
+        KVCM_LOG_WARN("KVMeta Trim caught an unknown exception after metadata progress[%d]",
+                      trim_metadata_changed || trim_metadata_uncertain ? 1 : 0);
+        AddError(request_context, "KVMeta Trim failed with an unknown internal exception");
+        return finish_trim(EC_ERROR);
     }
 }
 
@@ -4395,9 +4982,14 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                     // Complete and persist the ownership change before any
                     // physical release. A metadata failure must keep the gate
                     // closed because the active record is still authoritative.
-                    ErrorCode metadata_ec = EC_IO_ERROR;
+                    DeleteItemsResult metadata_cleanup;
+                    metadata_cleanup.ec = EC_IO_ERROR;
                     try {
-                        metadata_ec = DeleteItems(&request_context, instance->instance_id(), stale_batch, true, false);
+                        DeleteItemsOptions delete_options;
+                        delete_options.delete_physical = false;
+                        delete_options.adjust_storage_usage = false;
+                        metadata_cleanup =
+                            DeleteItems(&request_context, instance->instance_id(), stale_batch, delete_options);
                     } catch (const std::exception &) {
                         KVCM_LOG_WARN("KVMeta recovery metadata cleanup caught a standard exception; "
                                       "service remains disabled");
@@ -4405,7 +4997,10 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                         KVCM_LOG_WARN("KVMeta recovery metadata cleanup caught an unknown exception; "
                                       "service remains disabled");
                     }
-                    if (metadata_ec != EC_OK) {
+                    if (metadata_cleanup.ec != EC_OK || !metadata_cleanup.metadata_cleanup_complete ||
+                        metadata_cleanup.metadata_already_absent) {
+                        const ErrorCode metadata_ec =
+                            metadata_cleanup.ec == EC_OK ? EC_OUTCOME_UNKNOWN : metadata_cleanup.ec;
                         stale_batch.clear();
                         return metadata_ec;
                     }
@@ -4471,8 +5066,8 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                                     break;
                                 }
                                 std::uint64_t size = 0;
-                                const ErrorCode validate_ec =
-                                    ValidateOwnedLocation(&request_context, keys[i], location_id, *location, size);
+                                const ErrorCode validate_ec = ValidateOwnedLocation(
+                                    &request_context, instance->instance_id(), keys[i], location_id, *location, size);
                                 const DataStorageType base_type = ToBaseType(location->type());
                                 const std::size_t type_index = ToIndex(base_type);
                                 if (validate_ec != EC_OK || base_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN ||

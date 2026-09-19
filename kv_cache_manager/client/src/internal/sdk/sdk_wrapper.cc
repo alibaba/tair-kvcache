@@ -13,6 +13,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 
 namespace kv_cache_manager {
@@ -30,27 +31,60 @@ bool UriMatchesStorageType(const DataStorageUri &uri, DataStorageType storage_ty
     return uri_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN && ToBaseType(uri_type) == ToBaseType(storage_type);
 }
 
-bool HasOwnedAllocationShape(const DataStorageUri &uri, DataStorageType storage_type) {
-    if (storage_type == DataStorageType::DATA_STORAGE_TYPE_MOONCAKE) {
-        return uri.HasParam("key") && !uri.GetParam("key").empty();
+std::shared_ptr<SdkBackendConfig> CloneSdkBackendConfig(const std::shared_ptr<SdkBackendConfig> &source,
+                                                        DataStorageType type) {
+    if (!source) {
+        return nullptr;
     }
-    switch (storage_type) {
+    switch (type) {
     case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
-    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
-    case DataStorageType::DATA_STORAGE_TYPE_NFS:
+    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS: {
+        // SdkWrapperConfig's historical default VCNS entry reuses an
+        // Hf3fsSdkConfig whose embedded type is HF3FS. The regular wrapper
+        // selects the SDK by the StorageConfig map key, so preserve that
+        // compatibility while making the per-candidate clone self-consistent.
+        if (source->type() != type && !(type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS &&
+                                        source->type() == DataStorageType::DATA_STORAGE_TYPE_HF3FS)) {
+            return nullptr;
+        }
+        const auto typed = std::dynamic_pointer_cast<Hf3fsSdkConfig>(source);
+        if (!typed) {
+            return nullptr;
+        }
+        auto cloned = std::make_shared<Hf3fsSdkConfig>(*typed);
+        cloned->set_type(type);
+        return cloned;
+    }
+    case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE: {
+        if (source->type() != type) {
+            return nullptr;
+        }
+        const auto typed = std::dynamic_pointer_cast<MooncakeSdkConfig>(source);
+        return typed ? std::make_shared<MooncakeSdkConfig>(*typed) : nullptr;
+    }
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD: {
+        if (source->type() != type) {
+            return nullptr;
+        }
+        const auto typed = std::dynamic_pointer_cast<TairMempoolSdkConfig>(source);
+        return typed ? std::make_shared<TairMempoolSdkConfig>(*typed) : nullptr;
+    }
+    case DataStorageType::DATA_STORAGE_TYPE_NFS: {
+        if (source->type() != type) {
+            return nullptr;
+        }
+        const auto typed = std::dynamic_pointer_cast<NfsSdkConfig>(source);
+        return typed ? std::make_shared<NfsSdkConfig>(*typed) : nullptr;
+    }
+    case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN:
     case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
-        break;
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2:
+    case DataStorageType::COUNT:
     default:
-        return true;
+        return nullptr;
     }
-    if (!uri.HasParam("blkid")) {
-        return true;
-    }
-    const std::string block_id_text = uri.GetParam("blkid");
-    std::uint64_t block_id = 0;
-    const auto parsed = std::from_chars(block_id_text.data(), block_id_text.data() + block_id_text.size(), block_id);
-    return !block_id_text.empty() && parsed.ec == std::errc{} &&
-           parsed.ptr == block_id_text.data() + block_id_text.size() && block_id == 0;
 }
 
 } // namespace
@@ -63,6 +97,8 @@ SdkWrapper::~SdkWrapper() {
         wait_task_thread_pool_.reset();
     }
     sdk_map_.clear();
+    sdk_storage_types_.clear();
+    sdk_storage_configs_.clear();
     if (owned_shm_fd_ >= 0) {
         close(owned_shm_fd_);
         owned_shm_fd_ = -1;
@@ -132,9 +168,11 @@ ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &cl
         unique_storage_names.reserve(storage_configs_.size());
         for (const auto &storage_config : storage_configs_) {
             if (!storage_config || !IsKvMetaObjectStorageType(storage_config->type()) ||
-                storage_config->global_unique_name().empty() ||
-                !unique_storage_names.insert(storage_config->global_unique_name()).second) {
-                KVCM_LOG_WARN("KVMeta storage configs must be unique named exact-object backends");
+                !IsCanonicalKvMetaBackendName(storage_config->global_unique_name()) ||
+                !unique_storage_names.insert(storage_config->global_unique_name()).second ||
+                !HasSafeConfiguredKvMetaNamespace(*storage_config)) {
+                KVCM_LOG_WARN(
+                    "KVMeta storage configs must use unique URI-safe names and an exact safe object namespace");
                 return ER_INVALID_STORAGE_CONFIG;
             }
         }
@@ -175,10 +213,24 @@ ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &cl
 
     for (const auto &storage_config : storage_configs_) {
         DataStorageType type = storage_config->type();
-        const auto &sdk_backend_config = wrapper_config_->GetSdkBackendConfig(type);
+        auto sdk_backend_config = wrapper_config_->GetSdkBackendConfig(type);
         if (!sdk_backend_config) {
             KVCM_LOG_WARN("sdk backend config is null, storage config: %s", storage_config->ToString().c_str());
             return ER_INVALID_SDKBACKEND_CONFIG;
+        }
+        if (variable_object_size_enabled) {
+            // One storage candidate owns one runtime config. In particular,
+            // Mooncake injects the registered span into its config during
+            // initialization; sharing the per-type template made the second
+            // candidate observe an already-mutated config and fail. Keep this
+            // isolation KVMeta-only so the established fixed-block path and
+            // its caller-owned configuration identity remain unchanged.
+            sdk_backend_config = CloneSdkBackendConfig(sdk_backend_config, type);
+            if (!sdk_backend_config) {
+                KVCM_LOG_WARN("clone sdk backend config for KVMeta failed, storage config: %s",
+                              storage_config->ToString().c_str());
+                return ER_INVALID_SDKBACKEND_CONFIG;
+            }
         }
         auto ec = UpdateMooncakeSdkConfig(sdk_backend_config, regist_span, init_params.self_location_spec_name);
         if (ec != ER_OK) {
@@ -205,6 +257,7 @@ ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &cl
         }
         sdk_map_.insert({storage_config->global_unique_name(), sdk});
         sdk_storage_types_.insert({storage_config->global_unique_name(), type});
+        sdk_storage_configs_.insert({storage_config->global_unique_name(), storage_config});
     }
     return ER_OK;
 }
@@ -421,9 +474,9 @@ ClientErrorCode SdkWrapper::ValidateKvMetaObjects(const std::vector<DataStorageU
         const auto expected_size = value_sizes[i];
         const auto &uri = remote_uris[i];
         const auto &buffer = local_buffers[i];
-        if (expected_size == 0 || expected_size > max_variable_object_bytes_ || !uri.Valid() ||
+        if (expected_size == 0 || expected_size > max_variable_object_bytes_ || !HasCanonicalKvMetaAuthority(uri) ||
             expected_size > kMaxKvMetaBatchBytes || batch_bytes > kMaxKvMetaBatchBytes - expected_size ||
-            uri.GetHostName().empty() || !uri.HasParam("size") || buffer.iovs.empty()) {
+            !uri.HasParam("size") || buffer.iovs.empty()) {
             return ER_INVALID_PARAMS;
         }
         const auto storage_type = sdk_storage_types_.find(uri.GetHostName());
@@ -431,8 +484,12 @@ ClientErrorCode SdkWrapper::ValidateKvMetaObjects(const std::vector<DataStorageU
             KVCM_LOG_WARN("KVMeta URI refers to an unknown storage backend: %s", uri.GetHostName().c_str());
             return ER_GETSDK_ERROR;
         }
-        if (!UriMatchesStorageType(uri, storage_type->second) || !HasOwnedAllocationShape(uri, storage_type->second)) {
-            KVCM_LOG_WARN("KVMeta URI scheme or owned allocation shape does not match backend: %s",
+        const auto storage_config = sdk_storage_configs_.find(uri.GetHostName());
+        if (storage_config == sdk_storage_configs_.end() || !storage_config->second ||
+            !UriMatchesStorageType(uri, storage_type->second) ||
+            !HasOwnedKvMetaAllocationShape(uri, storage_type->second) ||
+            !UriMatchesConfiguredKvMetaNamespace(uri, storage_type->second, *storage_config->second)) {
+            KVCM_LOG_WARN("KVMeta URI scheme, ownership, or configured namespace does not match backend: %s",
                           uri.GetHostName().c_str());
             return ER_INVALID_PARAMS;
         }
