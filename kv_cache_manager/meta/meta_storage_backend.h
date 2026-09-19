@@ -479,6 +479,11 @@ public:
                                               ReclaimCandidateVector &out_candidates,
                                               bool require_read_success = false) noexcept = 0;
 
+    // Refresh timestamps and LRU positions for an explicit maintenance key list
+    // without recording revisit observations. The caller determines eligibility;
+    // unsupported backends leave keys unchanged. Returns the number touched.
+    virtual size_t TouchKeysForMaintenance(const KeyTypeVec & /*keys*/) noexcept { return 0; }
+
     // =====================================================================
     // Metadata APIs — 用于持久化 MetaIndexer 自身的元信息（key_count、storage_usage 等）
     // =====================================================================

@@ -10,6 +10,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 
 namespace kv_cache_manager {
 
@@ -85,7 +86,6 @@ ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
     size_t capacity = META_LOCAL_BACKEND_DEFAULT_CAPACITY;
     int32_t num_shard_bits = META_LOCAL_BACKEND_DEFAULT_NUM_SHARD_BITS;
     sample_times_ = META_LOCAL_BACKEND_DEFAULT_SAMPLE_TIMES;
-    reclaim_sample_shard_cursor_.store(0, std::memory_order_relaxed);
 
     const std::string &storage_uri = config->GetStorageUri();
     if (!storage_uri.empty()) {
@@ -1483,48 +1483,34 @@ ErrorCode MetaLocalBackend::SampleReclaimKeys(RequestContext * /*request_context
     return EC_OK;
 }
 
-ErrorCode MetaLocalBackend::SampleReclaimCandidates(RequestContext * /*request_context*/,
+ErrorCode MetaLocalBackend::SampleReclaimCandidates(RequestContext *request_context,
                                                     const int64_t count,
                                                     ReclaimCandidateVector &out_candidates,
-                                                    bool /*require_read_success*/) noexcept {
+                                                    bool require_read_success) noexcept {
     out_candidates.clear();
-    if (!cache_) {
-        KVCM_LOG_ERROR("local backend not inited");
+    KeyTypeVec keys;
+    const ErrorCode sample_ec = SampleReclaimKeys(request_context, count, keys);
+    if (sample_ec != EC_OK || keys.empty()) {
+        return sample_ec;
+    }
+
+    // Reuse the cold-shard key selection, but never read timestamps through
+    // GetProperties(): that path treats maintenance sampling as business hits.
+    std::vector<int64_t> last_access_times;
+    const auto results = GetLastAccessTimesForMaintenance(request_context, keys, last_access_times);
+    if (results.size() != keys.size() || last_access_times.size() != keys.size()) {
         return EC_ERROR;
     }
-    if (count <= 0) {
-        return EC_OK;
-    }
-
-    const size_t num_shards = shard_mask_ + 1;
-    const size_t num_rounds = std::max(size_t{1}, std::min({sample_times_, num_shards, static_cast<size_t>(count)}));
-    std::vector<std::pair<int64_t, uint32_t>> shard_times;
-    shard_times.reserve(num_shards);
-    for (uint32_t shard_id = 0; shard_id < num_shards; ++shard_id) {
-        const int64_t access_time = shard_oldest_access_time_[shard_id].load(std::memory_order_relaxed);
-        if (access_time < INT64_MAX) {
-            shard_times.emplace_back(access_time, shard_id);
+    out_candidates.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] == EC_NOENT) {
+            continue;
         }
-    }
-    if (shard_times.empty()) {
-        return EC_OK;
-    }
-
-    const size_t select_count = std::min(num_rounds, shard_times.size());
-    // Reserve half the slots for stable shard-ID rotation. Sorting only by
-    // physical tails would detach shard priority from the advancing key cursor.
-    // The remaining slots retain a preference for cold, unselected shards.
-    const size_t rotating = select_count / 2 + select_count % 2;
-    const size_t start =
-        reclaim_sample_shard_cursor_.fetch_add(rotating, std::memory_order_relaxed) % shard_times.size();
-    std::rotate(shard_times.begin(), shard_times.begin() + start, shard_times.end());
-    std::partial_sort(shard_times.begin() + rotating, shard_times.begin() + select_count, shard_times.end());
-    const int64_t per_round_count = (count - 1) / static_cast<int64_t>(select_count) + 1;
-    int64_t remaining = count;
-    for (size_t i = 0; i < select_count && remaining > 0; ++i) {
-        const size_t batch = static_cast<size_t>(std::min(per_round_count, remaining));
-        const size_t collected = CollectNextReclaimCandidatesFromShard(shard_times[i].second, batch, out_candidates);
-        remaining -= static_cast<int64_t>(collected);
+        if (results[i] != EC_OK && require_read_success) {
+            out_candidates.clear();
+            return results[i];
+        }
+        out_candidates.push_back({keys[i], results[i] == EC_OK ? last_access_times[i] : 0});
     }
     return EC_OK;
 }
@@ -1561,6 +1547,27 @@ MetaLocalBackend::GetLastAccessTimesForMaintenance(RequestContext * /*request_co
     return results;
 }
 
+size_t MetaLocalBackend::TouchKeysForMaintenance(const KeyTypeVec &keys) noexcept {
+    if (!cache_) {
+        return 0;
+    }
+    size_t touched = 0;
+    for (const KeyType key : keys) {
+        auto *handle = cache_->Lookup(KeyToView(key));
+        if (!handle) {
+            continue;
+        }
+        if (auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle)); item) {
+            // Bypass GetProperties so maintenance does not record a revisit.
+            // Lookup/Release also promotes the entry in the shared metadata LRU.
+            item->TouchAccessTime(TimestampUtil::GetCurrentTimeUs());
+            ++touched;
+        }
+        cache_->Release(handle);
+    }
+    return touched;
+}
+
 // return OK to avoid error in MetaIndexer::PersistMetaData()
 ErrorCode MetaLocalBackend::PutMetaData(const FieldMap & /*field_maps*/) noexcept { return EC_OK; }
 
@@ -1595,25 +1602,6 @@ size_t MetaLocalBackend::CollectOldestKeysFromShard(uint32_t shard_id, size_t co
         }
     }
     return string_keys.size();
-}
-
-size_t MetaLocalBackend::CollectNextReclaimCandidatesFromShard(const uint32_t shard_id,
-                                                               const size_t count,
-                                                               ReclaimCandidateVector &out_candidates) {
-    const size_t initial_size = out_candidates.size();
-    cache_->ApplyToNextOldestEntriesInShard(shard_id,
-                                            count,
-                                            [&out_candidates](const std::string_view &key,
-                                                              Cache::ObjectPtr value,
-                                                              size_t /*charge*/,
-                                                              const Cache::CacheItemHelper * /*helper*/) {
-                                                if (key.size() != sizeof(KeyType) || value == nullptr) {
-                                                    return;
-                                                }
-                                                const auto *item = static_cast<const MetaMemCacheItem *>(value);
-                                                out_candidates.push_back({ViewToKey(key), item->GetLastAccessTime()});
-                                            });
-    return out_candidates.size() - initial_size;
 }
 
 } // namespace kv_cache_manager

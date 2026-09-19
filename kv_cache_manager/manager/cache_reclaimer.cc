@@ -113,6 +113,7 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(location_del_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(credit_timeout_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(pending_limit_reject_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(maintenance_touch_key_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(delete_submit_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(delete_complete_count);
@@ -660,6 +661,7 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(credit_timeout_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(pending_limit_reject_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(maintenance_touch_key_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_submit_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_complete_count);
@@ -1056,15 +1058,19 @@ bool CacheReclaimer::ReclaimByLRUImpl(const std::shared_ptr<RequestContext> &req
     BytesByStorageType bytes_by_type{};
     CountsByStorageType location_counts_by_type{};
     std::uint64_t predicted_deleted_keys = 0;
-    if (!FilterLocID(request_context.get(),
-                     instance_info,
-                     request.block_keys,
-                     water_level_exceed,
-                     request.location_ids,
-                     bytes_by_type,
-                     location_counts_by_type,
-                     predicted_deleted_keys,
-                     create_age_stats)) {
+    const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
+    const bool maintenance_read = indexer && indexer->PreferSingleTaskReclaimSampling();
+    if (!FilterLocIDImpl(request_context.get(),
+                         instance_info,
+                         request.block_keys,
+                         water_level_exceed,
+                         request.location_ids,
+                         bytes_by_type,
+                         location_counts_by_type,
+                         predicted_deleted_keys,
+                         create_age_stats,
+                         false,
+                         maintenance_read)) {
         LOG_WITH_ID(DEBUG, "filter location ID failed");
         return false;
     }
@@ -1805,6 +1811,19 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
             out_predicted_deleted_keys = SaturatingAdd(out_predicted_deleted_keys, 1);
         }
         out_loc_ids.emplace_back(std::move(loc_id_vec));
+    }
+    if (maintenance_read) {
+        KeyVector rejected_keys;
+        for (size_t i = 0; i < batch.size(); ++i) {
+            if (out_loc_ids[i].empty()) {
+                rejected_keys.push_back(batch[i]);
+            }
+        }
+        // Yield keys with no deletable locations so later samples can reach
+        // other cold candidates, regardless of the rejected location types.
+        if (const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id); indexer && !rejected_keys.empty()) {
+            METRICS_(cache_reclaimer, maintenance_touch_key_count) += indexer->TouchKeysForMaintenance(rejected_keys);
+        }
     }
     if (create_age_count == 0) {
         out_create_age_stats.Clear();
