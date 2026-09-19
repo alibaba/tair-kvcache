@@ -635,7 +635,8 @@ KVMeta capability adapter 允许支持方一次接收不同 size，同时让不�
   请求/响应一一对应。GA 可以复用，但整个 generation identity 不能复用；缺少 token/incarnation 的 legacy URI
   不获得 KVMeta Delete 授权。`provider_uuid` 对新 exact allocation 强制存在，仅为滚动升级期间已持久的旧 URI
   保留 optional 解析。UUID 只能在 node id 改变时找回 Provider，不是删除 capability；任何 URI 的 durable Meta
-  owner/retirement proof 都丢失时必须 fail closed，不会用 UUID + GA 猜测 generation；
+  owner/retirement proof 都丢失时，free/retire mutation 必须 fail closed，不会用 UUID + GA 猜测删除权限。只读
+  targeted query 仍可按 UUID 路由；仅其明确的 absent 结果可完成旧 tombstone，present/超时/partial 均继续保留；
 - file/HF3FS/VCNS-HF3FS/Dummy 的 path 必须是词法规范的绝对、非根对象路径；空 path、`/`、空 segment、
   `.`/`..` segment 和尾随 `/` 永远不能被解释成 singleton allocation，更不能进入 Delete；
 - 可打包文件型 backend 的 `blkid` 缺失或严格解析为 `0`，不允许独立 transfer 调用方伪造共享 allocation 偏移；
@@ -1036,6 +1037,11 @@ manager-owned pending descriptor 恢复，不重放 refcount mutation。生产 l
 `partial=false`、`failed_nodes=[]` 且所有目标地址均不存在才返回成功；响应部分、目标仍存在、字段重复/缺失/类型错误、
 嵌入 NUL 或超限 body 都按结果不确定处理。一次配置的 reclaim batch 即使大于 256，也由 adapter 分片而不是截断或
 改变公共 Reclaimer 参数；任一 chunk 未证明终态，manager 仍按整个 cleanup 失败并关闭 KVMeta gate。
+
+MetaService retirement proof 是 free 响应丢失后的有界快速幂等窗口，不是 KVCM tombstone 的最长可恢复窗口。proof
+过期且 owner 已退休时，free 仍 fail closed；同一 adapter 随后的 query 可以使用 stable Provider UUID 做只读
+re-proof。Provider 返回 absent 才收敛，返回 present 时不会把路由 identity 提升为删除 capability。因此 KVCM/leader
+停机超过 proof TTL 后，已完成的物理删除仍能恢复，而未完成删除或结果不确定的对象仍保持计费和 tombstone。
 
 PACE provisional allocation lease 固定至少 3600 秒。KVCM 最长写租约为 1800 秒，exact 控制 RPC 单次上限
 120 秒；StartWrite 会在 singleton commit 前后检查 deadline，rollback 最多 2 次 mutation 与每次 2 次 query。

@@ -254,7 +254,9 @@ tombstone，也不会释放 quota；当前进程关闭 KVMeta admission/maintena
 中的 generation-aware identity 继续收敛。file/object backend 的随机 object key 是 generation；TairMempool 的身份为
 `(owner_provider_id, stable_provider_uuid, provider_incarnation, address, allocation_token)`。backend 必须把“目标已不存在”
 作为幂等成功。stable UUID 只负责在 node id 改变后路由到同一 Provider；若 durable owner 和 retirement
-proof 均缺失，MetaService 不会仅凭 URI 重建删除权限，而是 fail closed。
+proof 均缺失，MetaService 不会仅凭 URI 重建删除权限，任何 free/retire mutation 都 fail closed。此时 adapter 后续的
+targeted query 可以按 stable UUID 做严格只读 absence re-proof：只有 Provider 明确返回该 generation 不存在时才允许
+完成 tombstone；present、超时或 partial 仍按不确定处理。该 fallback 不调用 free，也不重建 owner。
 
 若 active metadata 的删除无法证明已经持久化，session 已被消费且不能再充当 owner，服务端返回
 `OUTCOME_UNKNOWN`（已过期调用仍保留其 timeout 契约），并关闭 KVMeta admission/maintenance 直到 recovery。
