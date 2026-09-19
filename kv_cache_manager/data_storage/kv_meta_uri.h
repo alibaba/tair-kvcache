@@ -244,14 +244,25 @@ inline bool HasExactTairMempoolOffset(const DataStorageUri &uri) noexcept {
     return TryGetExactTairMempoolOffset(uri, ignored);
 }
 
-inline bool HasExactOptionalTairMempoolUint16Param(const DataStorageUri &uri, const std::string &name) {
+inline bool
+TryGetTairMempoolUint16ParamOrDefault(const DataStorageUri &uri, const std::string &name, std::uint16_t &value) {
+    value = 0;
     if (!uri.HasParam(name)) {
         return true;
     }
-    const std::string value = uri.GetParam(name);
+    const std::string text = uri.GetParam(name);
     std::uint16_t parsed_value = 0;
-    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), parsed_value);
-    return !value.empty() && parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size();
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), parsed_value);
+    if (text.empty() || parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+        return false;
+    }
+    value = parsed_value;
+    return true;
+}
+
+inline bool HasExactOptionalTairMempoolUint16Param(const DataStorageUri &uri, const std::string &name) {
+    std::uint16_t ignored = 0;
+    return TryGetTairMempoolUint16ParamOrDefault(uri, name, ignored);
 }
 
 // The three query fields are optional for compatibility and default to zero
@@ -367,9 +378,14 @@ inline bool UriMatchesConfiguredKvMetaNamespace(const DataStorageUri &uri,
         return uri.HasParam("key") && HasCanonicalKvMetaObjectKey(uri.GetParam("key"));
     }
     if (IsTairMempoolStorageType(storage_type)) {
-        // PACE addresses are allocator-owned opaque offsets rather than
-        // paths derived from a configured filesystem namespace.
-        return true;
+        // PACE addresses are allocator-owned opaque offsets, but media_type
+        // is part of their physical pool identity.  Missing legacy URI fields
+        // decode to zero and therefore match only an explicitly unspecified
+        // backend; an SSD/DRAM backend must return its configured media.
+        const auto spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(config.storage_spec());
+        std::uint16_t uri_media_type = 0;
+        return spec && TryGetTairMempoolUint16ParamOrDefault(uri, "media_type", uri_media_type) &&
+               uri_media_type == spec->media_type();
     }
     std::string_view object_key;
     std::string expected_path;
@@ -413,7 +429,7 @@ inline bool HasSafeConfiguredKvMetaNamespace(const StorageConfig &config,
         sample.SetProtocol(kTairMempoolUriScheme);
         sample.SetPath("/" + max_uint64);
         sample.SetParam("node_id", std::to_string(std::numeric_limits<std::uint16_t>::max()));
-        sample.SetParam("media_type", std::to_string(std::numeric_limits<std::uint16_t>::max()));
+        sample.SetParam("media_type", std::to_string(spec->media_type()));
         sample.SetParam("range_id", std::to_string(std::numeric_limits<std::uint16_t>::max()));
         break;
     }

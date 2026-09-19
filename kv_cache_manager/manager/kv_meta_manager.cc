@@ -244,7 +244,8 @@ bool UriNamesCreatedKvMetaObject(const DataStorageUri &uri,
     }
     const StorageConfig &config = backend->GetStorageConfig();
     if (backend->GetType() != storage_type || config.type() != storage_type ||
-        config.global_unique_name() != uri.GetHostName()) {
+        config.global_unique_name() != uri.GetHostName() ||
+        !UriMatchesConfiguredKvMetaNamespace(uri, storage_type, config)) {
         return false;
     }
     if (storage_type == DataStorageType::DATA_STORAGE_TYPE_MOONCAKE) {
@@ -283,7 +284,8 @@ bool UriBelongsToKvMetaNamespace(const DataStorageUri &uri,
     }
     const StorageConfig &config = backend->GetStorageConfig();
     if (backend->GetType() != storage_type || config.type() != storage_type ||
-        config.global_unique_name() != uri.GetHostName()) {
+        config.global_unique_name() != uri.GetHostName() ||
+        !UriMatchesConfiguredKvMetaNamespace(uri, storage_type, config)) {
         return false;
     }
     if (IsTairMempoolStorageType(storage_type)) {
@@ -355,7 +357,8 @@ bool HasMatchingStorageBackend(const CacheLocation &location,
     const StorageConfig &config = backend->GetStorageConfig();
     return config.type() == location.type() && config.global_unique_name() == uri.GetHostName() &&
            UriMatchesStorageBackend(uri, uri.GetHostName(), location.type()) &&
-           HasOwnedKvMetaAllocationShape(uri, location.type());
+           HasOwnedKvMetaAllocationShape(uri, location.type()) &&
+           UriMatchesConfiguredKvMetaNamespace(uri, location.type(), config);
 }
 
 bool ToValueLocation(const CacheLocation &location, KvMetaManager::ValueLocation &out) {
@@ -2419,6 +2422,12 @@ private:
                           all_items.size(),
                           failure_kind,
                           physical_ec);
+            // Metadata is already durably absent, so this allocation cannot
+            // be retried safely without a generation-bearing cleanup ledger.
+            // Stop admission/reclaim after the first uncertain batch instead
+            // of freeing logical quota and leaking one physical batch per
+            // subsequent cache fill.
+            FailClosedMaintenance();
         }
         // These counters describe logical cache capacity reclaimed after the
         // durable metadata delete. The physical-attempt/uncertain counters
@@ -2956,11 +2965,13 @@ ErrorCode KvMetaManager::ValidateCacheConfiguration(RequestContext *request_cont
     for (const auto &storage_name : group->storage_candidates()) {
         const auto backend = data_storage_manager->GetDataStorageBackend(storage_name);
         if (!IsCanonicalKvMetaBackendName(storage_name) || !unique_storage_names.emplace(storage_name).second ||
-            !backend || !IsKvMetaObjectStorageType(backend->GetType()) ||
+            !backend || !SupportsKvMetaCallerOwnedBufferLifetime(backend->GetType()) ||
             backend->GetStorageConfig().type() != backend->GetType() ||
             backend->GetStorageConfig().global_unique_name() != storage_name ||
             !HasSafeConfiguredKvMetaNamespace(backend->GetStorageConfig(), limits_.max_location_uri_bytes)) {
-            AddError(request_context, "KVMeta storage candidates must be unique registered exact-object backends");
+            AddError(request_context,
+                     "KVMeta storage candidates must be unique registered exact-object backends with a hard "
+                     "caller-buffer lifetime contract");
             return EC_CONFIG_ERROR;
         }
     }
@@ -3399,7 +3410,18 @@ KvMetaManager::DeleteItemsResult KvMetaManager::DeleteItems(RequestContext *requ
                 physical_items.push_back(items[i]);
             }
         }
-        result.ec = FirstHardError(result.ec, DeleteAllocatedLocations(request_context, physical_items));
+        const ErrorCode physical_ec = DeleteAllocatedLocations(request_context, physical_items);
+        if (physical_ec != EC_OK) {
+            AddError(request_context,
+                     "KVMeta physical cleanup outcome is unknown; maintenance is fail-closed until recovery");
+            CancelMaintenance();
+            // The exact metadata delete may already be durable. Preserve the
+            // mutation ambiguity rather than exposing a provider error that a
+            // caller could mistake for a safely retryable failure.
+            result.ec = EC_OUTCOME_UNKNOWN;
+        } else {
+            result.ec = FirstHardError(result.ec, physical_ec);
+        }
     }
     return result;
 }
@@ -3701,8 +3723,8 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     }
     const auto selected_backend = data_storage_manager->GetDataStorageBackend(selected.name);
     if (!selected_backend || selected_backend->GetType() != selected.type ||
-        !IsKvMetaObjectStorageType(selected_backend->GetType())) {
-        AddError(request_context, "KVMeta selected storage backend changed or is not an exact-object backend");
+        !SupportsKvMetaCallerOwnedBufferLifetime(selected_backend->GetType())) {
+        AddError(request_context, "KVMeta selected storage backend changed or lacks exact-object/caller-buffer safety");
         return {EC_CORRUPTION, StartWriteResult{}};
     }
     const StorageConfig &selected_config = selected_backend->GetStorageConfig();
@@ -3726,14 +3748,29 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         }
         return EC_IO_ERROR;
     };
+    const auto release_allocated_or_fail_closed = [&](const std::vector<SessionItem> &items,
+                                                      const char *failure_message) noexcept {
+        const ErrorCode cleanup_ec = delete_allocated_noexcept(items);
+        if (cleanup_ec == EC_OK) {
+            return true;
+        }
+        KVCM_LOG_WARN("%s, ec[%d]", failure_message, cleanup_ec);
+        AddError(request_context,
+                 "KVMeta could not prove cleanup of an uncommitted allocation; maintenance is fail-closed until "
+                 "recovery");
+        // Returning a retryable admission error after an unconfirmed Delete
+        // would let client failover allocate another batch.  Stop only the
+        // KVMeta path and surface ambiguity instead.
+        CancelMaintenance();
+        return false;
+    };
     for (const std::size_t request_index : missing_indices) {
         const bool cancelled = maintenance_cancelled_.load(std::memory_order_acquire);
         const bool expired = KvMetaWriteSessionManager::Clock::now() >= write_deadline;
         if (cancelled || expired) {
-            const ErrorCode cleanup_ec = delete_allocated_noexcept(candidates);
-            if (cleanup_ec != EC_OK) {
-                KVCM_LOG_WARN("KVMeta admission stop could not release all uncommitted allocations, ec[%d]",
-                              cleanup_ec);
+            if (!release_allocated_or_fail_closed(
+                    candidates, "KVMeta admission stop could not release all uncommitted allocations")) {
+                return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
             }
             return {cancelled ? EC_SERVICE_NOT_LEADER : EC_TIMEOUT, StartWriteResult{}};
         }
@@ -3753,9 +3790,8 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         } catch (const std::exception &) {
             KVCM_LOG_WARN("KVMeta storage create caught a standard provider exception; "
                           "backend orphan cleanup may be required");
-            if (delete_allocated_noexcept(candidates) != EC_OK) {
-                KVCM_LOG_WARN("KVMeta could not release every allocation preceding a failed Create");
-            }
+            release_allocated_or_fail_closed(candidates,
+                                             "KVMeta could not release every allocation preceding a failed Create");
             AddError(request_context, "KVMeta storage create failed; backend orphan cleanup may be required");
             // The throwing call may already have allocated an object without
             // returning its identity. Continuing admission would permit one
@@ -3766,16 +3802,16 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         } catch (...) {
             KVCM_LOG_WARN("KVMeta storage create caught an unknown provider exception; "
                           "backend orphan cleanup may be required");
-            if (delete_allocated_noexcept(candidates) != EC_OK) {
-                KVCM_LOG_WARN("KVMeta could not release every allocation preceding a failed Create");
-            }
+            release_allocated_or_fail_closed(candidates,
+                                             "KVMeta could not release every allocation preceding a failed Create");
             AddError(request_context, "KVMeta storage create failed; backend orphan cleanup may be required");
             CancelMaintenance();
             return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
         }
         if (create_result.size() == 1 && create_result[0].first != EC_OK) {
-            if (delete_allocated_noexcept(candidates) != EC_OK) {
-                KVCM_LOG_WARN("KVMeta could not release every allocation preceding a failed Create");
+            if (!release_allocated_or_fail_closed(
+                    candidates, "KVMeta could not release every allocation preceding a failed Create")) {
+                return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
             }
             if (create_result[0].second.Valid()) {
                 // A failed Create must not return an allocation identity. It
@@ -3802,16 +3838,15 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             // Leave this call's unknown allocations to backend orphan cleanup,
             // while releasing only candidates proven by earlier, independently
             // well-formed singleton calls.
-            if (delete_allocated_noexcept(candidates) != EC_OK) {
-                KVCM_LOG_WARN("KVMeta could not release every previously validated allocation");
-            }
+            const bool cleanup_complete = release_allocated_or_fail_closed(
+                candidates, "KVMeta could not release every previously validated allocation");
             AddError(request_context,
                      "KVMeta singleton storage allocation failed; malformed results require backend orphan cleanup");
             // Continuing to allocate through a provider that violated the
             // operation/result ownership contract can leak one object per
             // retry. Close only KVMeta; fixed-block cache traffic is untouched.
             CancelMaintenance();
-            return {EC_CORRUPTION, StartWriteResult{}};
+            return {cleanup_complete ? EC_CORRUPTION : EC_OUTCOME_UNKNOWN, StartWriteResult{}};
         }
         auto location = std::make_shared<CacheLocation>();
         location->set_id(existing[request_index].location_id);
@@ -3844,14 +3879,13 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                                                 location,
                                                 location,
                                                 value_sizes[request_index]});
-            if (delete_allocated_noexcept(cleanup_items) != EC_OK) {
-                KVCM_LOG_WARN("KVMeta could not release every invalid-size allocation");
-            }
+            const bool cleanup_complete = release_allocated_or_fail_closed(
+                cleanup_items, "KVMeta could not release every invalid-size allocation");
             AddError(request_context,
                      location_ec == EC_OK ? "KVMeta storage returned a mismatched allocation size"
                                           : "KVMeta storage returned a malformed allocation URI");
             CancelMaintenance();
-            return {EC_CORRUPTION, StartWriteResult{}};
+            return {cleanup_complete ? EC_CORRUPTION : EC_OUTCOME_UNKNOWN, StartWriteResult{}};
         }
         const bool allocation_reused =
             std::any_of(candidates.begin(), candidates.end(), [&](const SessionItem &candidate) {
@@ -3862,13 +3896,11 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             // the backend's Delete identity. Release the shared allocation
             // once through the earlier candidate and publish no metadata for
             // either key.
-            const ErrorCode cleanup_ec = delete_allocated_noexcept(candidates);
-            if (cleanup_ec != EC_OK) {
-                KVCM_LOG_WARN("KVMeta duplicate allocation cleanup failed, ec[%d]", cleanup_ec);
-            }
+            const bool cleanup_complete =
+                release_allocated_or_fail_closed(candidates, "KVMeta duplicate allocation cleanup failed");
             AddError(request_context, "KVMeta storage reused one singleton allocation for multiple keys");
             CancelMaintenance();
-            return {EC_CORRUPTION, StartWriteResult{}};
+            return {cleanup_complete ? EC_CORRUPTION : EC_OUTCOME_UNKNOWN, StartWriteResult{}};
         }
         candidates.push_back(SessionItem{request_index,
                                          keys[request_index],
@@ -3881,9 +3913,8 @@ KvMetaManager::StartWrite(RequestContext *request_context,
 
     const bool cancelled_after_allocation = maintenance_cancelled_.load(std::memory_order_acquire);
     if (cancelled_after_allocation || KvMetaWriteSessionManager::Clock::now() >= write_deadline) {
-        const ErrorCode cleanup_ec = delete_allocated_noexcept(candidates);
-        if (cleanup_ec != EC_OK) {
-            KVCM_LOG_WARN("KVMeta stopped allocation cleanup failed, ec[%d]", cleanup_ec);
+        if (!release_allocated_or_fail_closed(candidates, "KVMeta stopped allocation cleanup failed")) {
+            return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
         }
         return {cancelled_after_allocation ? EC_SERVICE_NOT_LEADER : EC_TIMEOUT, StartWriteResult{}};
     }
@@ -4050,8 +4081,8 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             KVCM_LOG_WARN("KVMeta start rollback left unpublished allocations for backend orphan cleanup, ec[%d]",
                           direct_cleanup_ec);
         }
-        if (!metadata_cleanup.metadata_cleanup_complete || metadata_cleanup.metadata_already_absent ||
-            ownership_uncertain) {
+        if (metadata_cleanup.ec != EC_OK || !metadata_cleanup.metadata_cleanup_complete ||
+            metadata_cleanup.metadata_already_absent || direct_cleanup_ec != EC_OK || ownership_uncertain) {
             AddError(request_context,
                      "KVMeta start rollback could not prove exclusive ownership; recovery is required");
             CancelMaintenance();
@@ -4126,8 +4157,8 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             race_losers.push_back(candidates[i]);
         }
     }
-    if (const ErrorCode ec = delete_allocated_noexcept(race_losers); ec != EC_OK) {
-        KVCM_LOG_WARN("KVMeta failed to release one or more race-loser allocations, ec[%d]", ec);
+    if (!release_allocated_or_fail_closed(race_losers, "KVMeta failed to release one or more race-loser allocations")) {
+        return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
     }
 
     std::vector<SessionItem> session_items;
@@ -4148,10 +4179,9 @@ KvMetaManager::StartWrite(RequestContext *request_context,
 
     // Until Put() publishes a write session, no owner exists that can finish
     // or expire these active reservations. Every failure in this interval
-    // must therefore prove their metadata absence before returning an error
-    // that callers may retry. Physical cleanup happens only after that proof;
-    // a failed release is an unreachable backend orphan, while an uncertain
-    // metadata delete requires leader recovery and fail-closes KVMeta alone.
+    // must therefore prove their metadata absence and physical cleanup before
+    // returning an error that callers may retry. Either uncertainty
+    // fail-closes KVMeta alone.
     const auto rollback_unpublished_reservations = [&](bool adjust_storage_usage) -> ErrorCode {
         DeleteItemsOptions cleanup_options;
         cleanup_options.adjust_storage_usage = adjust_storage_usage;
@@ -4168,6 +4198,8 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             KVCM_LOG_WARN("KVMeta unpublished reservation rollback left an allocation for backend orphan cleanup, "
                           "ec[%d]",
                           cleanup.ec);
+            CancelMaintenance();
+            return EC_OUTCOME_UNKNOWN;
         }
         return EC_OK;
     };
@@ -4448,11 +4480,12 @@ ErrorCode KvMetaManager::FinishWriteInternal(RequestContext *request_context,
     // Unlike a reservation that never became visible, this path follows a
     // partially applied commit. Even after metadata absence is durable, a
     // failed one-shot physical cleanup means the overall batch outcome is no
-    // longer represented by the original CAS/persistence error alone. Keep
-    // admission open (the orphan is unreachable), but force reconciliation
-    // instead of letting the caller treat the original error as replay-safe.
+    // longer represented by the original CAS/persistence error alone. Stop
+    // admission and force reconciliation instead of allowing repeated orphan
+    // creation.
     if (exact_cleanup.ec != EC_OK) {
         AddError(request_context, "KVMeta partial commit rollback left an unreachable backend allocation");
+        CancelMaintenance();
         return EC_OUTCOME_UNKNOWN;
     }
     if (ownership_uncertain) {
@@ -4542,11 +4575,10 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
                       failure_kind,
                       cleanup_ec);
         AddError(request_context, "KVMeta active write cleanup failed; backend orphan cleanup may be required");
-        // Preserve the lease-expired result: cleanup failure can create an
-        // orphan, but it must not hide the fact that the session was already
-        // ineligible to commit. Explicit caller aborts still surface their
-        // cleanup error because completed_result is EC_OK in that path.
-        return completed_result == EC_OK ? cleanup_ec : completed_result;
+        // The session may also have expired, but the cleanup mutation is now
+        // ambiguous and has tripped the KVMeta circuit breaker. Preserve the
+        // stronger outcome so no caller treats this as a replay-safe timeout.
+        return EC_OUTCOME_UNKNOWN;
     };
 
     const bool expired = take_result == KvMetaWriteSessionManager::TakeResult::kExpired ||
@@ -5018,13 +5050,16 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                         // Reusable-address backends do not expose a generation
                         // token. Once metadata is gone, replaying an uncertain
                         // delete could remove an unrelated successor object.
-                        // Keep recovery available and leave this unreachable
-                        // allocation to backend-level orphan reclamation.
+                        // Recovery cannot certify this namespace as clean or
+                        // safely replay the Delete. Keep the service disabled
+                        // and require operator/backend orphan reconciliation.
                         KVCM_LOG_WARN("KVMeta recovery left objects for backend orphan cleanup, "
                                       "item_count[%zu], failure[%s], ec[%d]",
                                       stale_batch.size(),
                                       failure_kind,
                                       physical_ec);
+                        stale_batch.clear();
+                        return EC_OUTCOME_UNKNOWN;
                     }
                     stale_batch.clear();
                     return EC_OK;
@@ -5204,6 +5239,15 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                     indexer->SetStorageUsageByType(type, committed_usage_by_type[type_index]);
                 }
                 indexer->PersistMetaData();
+            }
+            if (instance_recovery_ec == EC_OUTCOME_UNKNOWN) {
+                // An uncertain physical Delete is namespace-wide evidence
+                // that this backend cannot currently provide a safe terminal
+                // cleanup result.  Do not advance into another instance and
+                // manufacture one additional orphan per indexer before the
+                // caller observes the failed recovery.
+                CancelMaintenance();
+                return EC_OUTCOME_UNKNOWN;
             }
             overall = FirstHardError(overall, instance_recovery_ec);
         }

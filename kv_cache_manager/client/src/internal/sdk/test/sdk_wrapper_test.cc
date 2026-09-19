@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <fcntl.h>
 #include <future>
@@ -10,6 +11,7 @@
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
@@ -176,7 +178,7 @@ TEST_F(SdkWrapperTest, TestKvMetaRejectsUriUnsafeBackendNamesWithoutChangingRegu
     EXPECT_EQ(ER_INVALID_STORAGE_CONFIG, kv_meta_wrapper.InitForKvMeta(client_config_, init_params, 4096));
 }
 
-TEST_F(SdkWrapperTest, TestKvMetaInitializesMultipleMooncakeCandidatesWithIsolatedRuntimeConfigs) {
+TEST_F(SdkWrapperTest, TestKvMetaRejectsMooncakeWithoutDmaDrainButRegularInitIsUnchanged) {
     class CapturingSdk : public SdkInterface {
     public:
         ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &,
@@ -225,34 +227,22 @@ TEST_F(SdkWrapperTest, TestKvMetaInitializesMultipleMooncakeCandidatesWithIsolat
         "location_spec_infos": {"tp0": 1}
     })"));
     InitParams init_params = init_params_;
-    init_params.storage_configs = R"([
-        {"type":"mooncake","global_unique_name":"moon_a","storage_spec":{}},
-        {"type":"mooncake","global_unique_name":"moon_b","storage_spec":{}}
-    ])";
+    init_params.storage_configs = R"([{"type":"mooncake","global_unique_name":"moon_a","storage_spec":{}}])";
 
-    SdkWrapper wrapper;
-    wrapper.sdk_factory_ = &factory;
-    ASSERT_EQ(ER_OK, wrapper.InitForKvMeta(client_config, init_params, 4096));
-    ASSERT_EQ(2, factory.configs.size());
-    EXPECT_NE(factory.configs[0], factory.configs[1]);
+    SdkWrapper kv_meta_wrapper;
+    kv_meta_wrapper.sdk_factory_ = &factory;
+    EXPECT_EQ(ER_INVALID_STORAGE_CONFIG, kv_meta_wrapper.InitForKvMeta(client_config, init_params, 4096));
+    EXPECT_TRUE(factory.configs.empty());
 
-    for (const auto &backend_config : factory.configs) {
-        const auto mooncake = std::dynamic_pointer_cast<MooncakeSdkConfig>(backend_config);
-        ASSERT_TRUE(mooncake);
-        EXPECT_EQ(init_params.regist_span->base, mooncake->local_mem_ptr());
-        EXPECT_EQ(init_params.regist_span->size, mooncake->local_buffer_size());
-        EXPECT_EQ(init_params.self_location_spec_name, mooncake->self_location_spec_name());
-        EXPECT_TRUE(mooncake->variable_object_size_enabled());
-        EXPECT_EQ(4096, mooncake->max_variable_object_bytes());
-    }
-
-    const auto template_config =
-        wrapper.wrapper_config_->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
-    const auto mooncake_template = std::dynamic_pointer_cast<MooncakeSdkConfig>(template_config);
-    ASSERT_TRUE(mooncake_template);
-    EXPECT_EQ(nullptr, mooncake_template->local_mem_ptr());
-    EXPECT_EQ(0, mooncake_template->local_buffer_size());
-    EXPECT_FALSE(mooncake_template->variable_object_size_enabled());
+    // This safety gate is KVMeta-only.  The established fixed-block path
+    // retains its existing Mooncake initialization behavior.
+    SdkWrapper regular_wrapper;
+    regular_wrapper.sdk_factory_ = &factory;
+    ASSERT_EQ(ER_OK, regular_wrapper.Init(client_config, init_params));
+    ASSERT_EQ(1, factory.configs.size());
+    const auto regular_mooncake = std::dynamic_pointer_cast<MooncakeSdkConfig>(factory.configs.front());
+    ASSERT_TRUE(regular_mooncake);
+    EXPECT_FALSE(regular_mooncake->variable_object_size_enabled());
 }
 
 TEST_F(SdkWrapperTest, TestKvMetaClonesLegacyVcnsTemplateAsTheCandidateType) {
@@ -329,7 +319,7 @@ TEST_F(SdkWrapperTest, TestKvMetaPutRejectsNullResultBeforeValidationOrIo) {
     EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.PutKvMetaObjects({}, {}, {}, nullptr));
 }
 
-TEST_F(SdkWrapperTest, TestKvMetaMooncakeValidationRequiresACanonicalObjectKey) {
+TEST_F(SdkWrapperTest, TestKvMetaMooncakeValidationFailsClosedEvenWithACanonicalObjectKey) {
     SdkWrapper sdk_wrapper;
     sdk_wrapper.variable_object_size_enabled_ = true;
     sdk_wrapper.max_variable_object_bytes_ = 4096;
@@ -355,7 +345,7 @@ TEST_F(SdkWrapperTest, TestKvMetaMooncakeValidationRequiresACanonicalObjectKey) 
     EXPECT_EQ(ER_INVALID_PARAMS,
               sdk_wrapper.ValidateKvMetaObjects(
                   {DataStorageUri("mooncake://moon/object?key=physical-object&size=5")}, sizes, buffers));
-    EXPECT_EQ(ER_OK,
+    EXPECT_EQ(ER_INVALID_PARAMS,
               sdk_wrapper.ValidateKvMetaObjects(
                   {DataStorageUri("mooncake://moon/object?key=kvmeta/a/b/0123456789abcdefghijklmnopqrstuv&size=5")},
                   sizes,
@@ -406,7 +396,7 @@ TEST_F(SdkWrapperTest, TestKvMetaFileValidationRejectsUnsafePathsAndAuthoritiesB
     }
 }
 
-TEST_F(SdkWrapperTest, TestKvMetaTairValidationRejectsMalformedOffsetsBeforeIo) {
+TEST_F(SdkWrapperTest, TestKvMetaTairValidationRejectsMalformedOrCrossMediaAddressesBeforeIo) {
     SdkWrapper sdk_wrapper;
     sdk_wrapper.variable_object_size_enabled_ = true;
     sdk_wrapper.max_variable_object_bytes_ = 4096;
@@ -421,15 +411,30 @@ TEST_F(SdkWrapperTest, TestKvMetaTairValidationRejectsMalformedOffsetsBeforeIo) 
     const BlockBuffers buffers{buffer};
     const std::vector<std::uint64_t> sizes{sizeof(bytes)};
 
-    for (const auto type :
-         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+    for (const auto &[type, media_type] : std::vector<std::pair<DataStorageType, std::uint16_t>>{
+             {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, kTairMemPoolMediaTypeUnspecified},
+             {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, kTairMemPoolMediaTypeSsd},
+         }) {
         SCOPED_TRACE(static_cast<int>(type));
         sdk_wrapper.sdk_storage_types_["pace"] = type;
-        sdk_wrapper.sdk_storage_configs_["pace"] =
-            std::make_shared<StorageConfig>(type, "pace", std::make_shared<TairMemPoolStorageSpec>());
-        EXPECT_EQ(ER_OK,
+        auto pace_spec = std::make_shared<TairMemPoolStorageSpec>();
+        pace_spec->set_media_type(media_type);
+        sdk_wrapper.sdk_storage_configs_["pace"] = std::make_shared<StorageConfig>(type, "pace", pace_spec);
+        EXPECT_EQ(
+            ER_OK,
+            sdk_wrapper.ValidateKvMetaObjects({DataStorageUri("pace://pace/0?media_type=" + std::to_string(media_type) +
+                                                              "&node_id=0&range_id=0&size=5")},
+                                              sizes,
+                                              buffers));
+        const std::uint16_t other_media =
+            media_type == kTairMemPoolMediaTypeSsd ? kTairMemPoolMediaTypeDram : kTairMemPoolMediaTypeSsd;
+        EXPECT_EQ(ER_INVALID_PARAMS,
                   sdk_wrapper.ValidateKvMetaObjects(
-                      {DataStorageUri("pace://pace/0?media_type=0&node_id=0&range_id=0&size=5")}, sizes, buffers));
+                      {DataStorageUri("pace://pace/0?media_type=" + std::to_string(other_media) + "&size=5")},
+                      sizes,
+                      buffers));
+        EXPECT_EQ(media_type == kTairMemPoolMediaTypeUnspecified ? ER_OK : ER_INVALID_PARAMS,
+                  sdk_wrapper.ValidateKvMetaObjects({DataStorageUri("pace://pace/0?size=5")}, sizes, buffers));
         for (const std::string &uri : {
                  "pace://pace?size=5",
                  "pace://pace/?size=5",

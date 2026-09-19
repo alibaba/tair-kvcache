@@ -1,6 +1,10 @@
 #include <algorithm>
+#include <cstddef>
+#include <functional>
 #include <memory>
+#include <shared_mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/request_context.h"
@@ -9,6 +13,8 @@
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/nfs_backend.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/kv_meta_manager.h"
@@ -21,6 +27,23 @@
 
 namespace kv_cache_manager {
 namespace {
+
+class FailingAbortDeleteNfsBackend : public NfsBackend {
+public:
+    explicit FailingAbortDeleteNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
+        : NfsBackend(std::move(metrics_registry)) {}
+
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &, std::function<void()> cb) override {
+        ++delete_attempts;
+        if (cb) {
+            cb();
+        }
+        return std::vector<ErrorCode>(storage_uris.size(), EC_IO_ERROR);
+    }
+
+    std::size_t delete_attempts{0};
+};
 
 class KvMetaServiceImplTest : public TESTBASE {
 protected:
@@ -149,6 +172,46 @@ TEST_F(KvMetaServiceImplTest, DynamicSizeProtocolIsAlignedAndFinishFailsClosed) 
     EXPECT_EQ(proto::kv_meta::SIZE_MISMATCH, wrong_size_response.header().status().code());
     EXPECT_TRUE(wrong_size_response.write_session_id().empty());
     EXPECT_TRUE(wrong_size_response.locations().empty());
+}
+
+TEST_F(KvMetaServiceImplTest, MalformedPutStartAbortMustCompleteBeforeReportingInternalError) {
+    auto [clean_start_ec, clean_start] =
+        kv_meta_manager_->StartWrite(&setup_context_, kInstanceId, {"malformed-clean-abort"}, {17}, 30);
+    ASSERT_EQ(EC_OK, clean_start_ec);
+    ASSERT_FALSE(clean_start.write_session_id.empty());
+    ASSERT_EQ(1, clean_start.session_item_count);
+    EXPECT_EQ(EC_OK,
+              service_->AbortMalformedPutStart(
+                  &setup_context_, kInstanceId, clean_start.write_session_id, clean_start.session_item_count));
+
+    auto [failed_start_ec, failed_start] =
+        kv_meta_manager_->StartWrite(&setup_context_, kInstanceId, {"malformed-failed-abort"}, {19}, 30);
+    ASSERT_EQ(EC_OK, failed_start_ec);
+    ASSERT_FALSE(failed_start.write_session_id.empty());
+    ASSERT_EQ(1, failed_start.session_item_count);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto failing = std::make_shared<FailingAbortDeleteNfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, failing->Open(original->GetStorageConfig(), setup_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = failing;
+    }
+
+    EXPECT_EQ(EC_OUTCOME_UNKNOWN,
+              service_->AbortMalformedPutStart(
+                  &setup_context_, kInstanceId, failed_start.write_session_id, failed_start.session_item_count));
+    EXPECT_EQ(1, failing->delete_attempts);
+    EXPECT_EQ(EC_OUTCOME_UNKNOWN,
+              service_->AbortMalformedPutStart(&setup_context_, kInstanceId, failed_start.write_session_id, 0));
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
 }
 
 TEST_F(KvMetaServiceImplTest, IndependentLeaderGateRejectsRequests) {
