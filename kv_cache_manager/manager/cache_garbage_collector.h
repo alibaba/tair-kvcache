@@ -109,8 +109,9 @@ private:
         size_t scan_batch_count{0};
         size_t inflight_throttled_tick_count{0};
         std::map<std::string, size_t> submitted_location_counts;
-        // Drain over-budget candidates from one scan before scanning again.
+        // Drain one backend scan result across ticks before scanning again.
         MaintenanceScanBatch buffered_scan;
+        size_t buffered_key_index{0};
 
         bool operator<(const InstanceScanEntry &other) const {
             return std::tie(instance_group, instance_id) < std::tie(other.instance_group, other.instance_id);
@@ -162,7 +163,7 @@ private:
     };
 
     void RunOneTick() noexcept;
-    ErrorCode PrepareMaintenanceActions(MetaIndexer &indexer, InstanceScanEntry &entry, ScanDeleteActions &out);
+    ErrorCode GetNextMaintenanceBatch(MetaIndexer &indexer, InstanceScanEntry &entry, MaintenanceScanBatch &out);
     EventReportBackendRoute LookupEventReportBackend(const std::string &instance_id,
                                                       DataStorageType storage_type) const;
     void PollInflightDeletes() noexcept;
@@ -174,8 +175,8 @@ private:
     BuildSubmittedLocationSummary(const std::map<std::string, size_t> &reason_counts);
     void LogInstanceScanSummary(const InstanceScanEntry &entry) const;
     void AdvanceInstance(bool completed_current) noexcept;
-    // Build this tick's requests, leaving only over-budget snapshots in batch.
-    ScanDeleteActions BuildDeleteActions(const std::string &instance_id, MaintenanceScanBatch &batch, int64_t now_us);
+    ScanDeleteActions
+    BuildDeleteActions(const std::string &instance_id, const MaintenanceScanBatch &batch, int64_t now_us);
     bool
     IsOrphanWriting(const std::string &map_location_id, const CacheLocation &location, int64_t now_us) const noexcept;
     void ResetWorkerState() noexcept;

@@ -3,7 +3,7 @@
 | 项目 | 内容 |
 |---|---|
 | 状态 | V1 已实现并完成相关单测、E2E 与性能冒烟；基线已包含异步删除（#234）、分层存储迁移（#209）和精确值条件删除（#233） |
-| 更新时间 | 2026-09-18 |
+| 更新时间 | 2026-09-19 |
 | 涉及模块 | `manager`、`meta`、`data_storage`、`config`、`metrics`、`service` |
 | 历史参考 | [PR #184](https://github.com/alibaba/tair-kvcache/pull/184) |
 
@@ -174,6 +174,7 @@ struct InstanceScanEntry {
     std::string cursor = SCAN_BASE_CURSOR;
     bool completed = false;
     MaintenanceScanBatch buffered_scan;
+    size_t buffered_key_index = 0;
 };
 
 struct InflightDelete {
@@ -192,7 +193,7 @@ std::set<PendingLocationKey> pending_locations;
 
 `PendingLocationKey` 至少包含 `(instance_id, block_key, location_id)`。在途窗口和 pending 集合只由 `LoopThread` 回调访问，其规模分别受 `max_inflight_delete_requests` 和 `max_inflight_delete_requests * scan_batch_size` 约束。跨线程只保留 GC stop 标志和一个 `LoopThread` handle，不维护自建 condition variable 或通用 task table。
 
-`buffered_scan` 保存当前 backend batch 中因预算或可用 action 槽位不足而暂未选入请求的 Location 快照，不保存已生成的删除请求、probe 判定或 token。正常调度先消费完当前 Instance 的缓存再轮转，避免同时为多个 Instance 保留未消费的 shard 快照；单批返回量仍不受严格的字节上限约束。
+`buffered_scan` 保存当前 backend batch 中尚未取出处理的 key/Location 快照，`buffered_key_index` 记录下一次取出的 key 位置；一个 key 的 Location 可以跨 tick 消费。缓存不保存已生成的删除请求、probe 判定或 token。正常调度先消费完当前 Instance 的缓存再轮转，避免同时为多个 Instance 保留未消费的 shard 快照；单批返回量仍不受严格的字节上限约束。
 
 每次 leader recovery 后重新开始一个 round；降级、重启或重新成为 leader 时不恢复旧 cursor 或缓存。Instance 完成、被跳过或 round 结束时释放相应缓存。重复覆盖由条件 CAS 保证安全。
 
@@ -205,9 +206,9 @@ std::set<PendingLocationKey> pending_locations;
 3. 若在途请求数已达到 `max_inflight_delete_requests`，本 tick 结束，不继续扫描。
 4. 若仍处于 round cooldown，本 tick 结束。
 5. 若没有本轮快照，从 Registry 获取 Group/Instance 列表，按 `(instance_group, instance_id)` 排序；失败时按普通 tick 间隔重试。
-6. `PrepareMaintenanceActions` 优先复用当前 Instance 的 `buffered_scan`；仅缓存为空时调用一次 `ScanLocationsForMaintenance(entry.cursor, scan_batch_size)`，并记录本次实际扫描量。
-7. 保存该 batch 的 next cursor，遍历完整缓存中的 Location 快照：筛选长期 WRITING 并排除活跃 Migration Copy 目标；对普通 SERVING 的合法 URI 按 `(storage unique name, storage type)` 聚合，每次最多取 512 个 URI 调用 `MightExist()`；每个探测分块前后检查 stop。EventReport 扩展开启时在同一 batch 调用其专用三态 probe；所有不确定结果均跳过。复用缓存时同样重新判定、探测，不复用上一 tick 的删除结论或 token。
-8. `BuildDeleteActions` 先对完整 batch 分类、按 `(block_key, location_id)` 去重，再按垃圾原因优先级及 key/location 排序，不能先截取原始扫描前缀。每 tick 选入请求的 Location 总数最多为 `scan_batch_size`；EventReport 扩展另按唯一 Block key 限制 metadata action。因预算不足，或物理请求优先占用最后一个 action 槽位而未选入的候选，直接以 Location 快照写回原 `buffered_scan`；请求为空时不调用 Executor。
+6. `GetNextMaintenanceBatch` 优先复用当前 Instance 的 `buffered_scan`；仅缓存为空时调用一次 `ScanLocationsForMaintenance(entry.cursor, scan_batch_size)`，并记录实际扫描量。随后沿缓存顺序取出小批，每批 key 数和 Location 数均不超过 `scan_batch_size`，EventReport SERVING 的不同 key 数不超过 `event_report_action_batch_size`。只剩一个 action 槽位时，小批只包含可能产生同一类请求的条目；其余快照留在原缓存，后续 tick 继续取。
+7. 保存 backend 返回的 next cursor，只对本 tick 取出的小批调用 `BuildDeleteActions`：筛选长期 WRITING 并排除活跃 Migration Copy 目标；对普通 SERVING 的合法 URI 按 `(storage unique name, storage type)` 聚合，每次最多取 512 个 URI 调用 `MightExist()`；每个探测分块前后检查 stop。EventReport 扩展开启时调用其专用三态 probe；所有不确定结果均跳过。尚未取出的快照不提前 probe，消费时才按当时的规则和 Backend 状态判定。
+8. `BuildDeleteActions` 对输入小批分类、按 `(block_key, location_id)` 去重，再按垃圾原因优先级及 key/location 排序并构造请求；不修改输入 batch，也不返回 deferred 候选。优先级只在本次小批内生效，不保证跨小批、跨 backend batch 的优先顺序。每 tick 最多选入 `scan_batch_size` 个 Location，过滤后可以少于该数，不额外扫描补齐；请求为空时不调用 Executor。
 9. 普通候选和 EventReport 候选分别构造物理删除请求与 metadata-only 请求，并调用对应 `SubmitAsync()`。物理删除优先，因此一个 tick 最多提交两个请求，且不会超过剩余 inflight 槽位：
    - `accepted=true` 且 Future valid：保存 Future，并为最终请求建立 pending target；
    - `accepted=false`：视为正常入队反压，不建立 Future 或 pending；
@@ -218,9 +219,9 @@ std::set<PendingLocationKey> pending_locations;
 
 窗口默认包含 64 个请求。一个慢或卡住的物理删除或 metadata action 只占用一个槽位，其他槽位仍可继续扫描和提交；只有全部槽位被占用时才暂停扫描。这为当前无容量上限的 Executor 队列提供 GC 调用方侧的硬反压，同时利用 #234 已提供的 worker 并发。基础 GC 每 tick 最多提交一个物理删除；EventReport 扩展开启时，同一批最多再提交一个 metadata action。`inflight_delete_count` 和 `inflight_delete_age_ms` 分别表示当前 GC 在途 action 数和最老任务年龄。
 
-`PrepareMaintenanceActions` 内聚缓存复用、必要的 Scan、请求构造及剩余快照保留；`RunOneTick` 负责提交请求、跟踪 Future 和轮转。固定优先级为 orphan WRITING、ordinary storage-missing、EventReport down host、recovery-absent host、stale snapshot；它是垃圾原因优先级，不是 Reclaimer 的 LRU 冷度。
+`GetNextMaintenanceBatch` 只负责缓存复用、必要的 Scan、切片及剩余快照保留；`RunOneTick` 先取小批，再调用 `BuildDeleteActions`，最后提交请求、跟踪 Future 和轮转。固定优先级为 orphan WRITING、ordinary storage-missing、EventReport down host、recovery-absent host、stale snapshot；它只对输入小批排序，不是 Reclaimer 的 LRU 冷度。排在后续小批的 orphan WRITING 可能晚于前面小批的 EventReport 垃圾提交，这是按扫描顺序逐批消费的显式取舍。
 
-cursor 在 SubmitAsync 前已经保存为 backend 返回的 next cursor，但缓存未耗尽时不会用它发起下一次 Scan。已选入请求的 target 若遭遇 rejected、抛异常或 accepted/Future 契约错误，不会重新放回缓存，也不回滚 cursor；仍可见于 maintenance view 的对象由后续 round 重新发现。超预算快照则留在当前缓存内供后续 tick 处理，两者不能混同；这里没有额外的失败重试队列。
+cursor 在 SubmitAsync 前已经保存为 backend 返回的 next cursor，但缓存未耗尽时不会用它发起下一次 Scan。已取出的小批不回填缓存；不符合删除条件的条目正常跳过，已选入请求的 target 若遭遇 rejected、抛异常或 accepted/Future 契约错误，也不回滚 cursor，仍可见于 maintenance view 的对象由后续 round 重新发现。未取出的快照则留在当前缓存内供后续 tick 处理，两者不能混同；这里没有额外的失败重试队列。
 
 ### 3.4 Maintenance scan 语义和成本
 
@@ -234,7 +235,7 @@ Redis SCAN（single-backend）和本地 backend cursor（dual-backend）都不�
 
 V1 只要求重复处理安全；仍存在于 scan view 的对象可由后续 round 重新覆盖。扫描发现不是删除授权：普通物理删除由 Executor 的 authoritative read 和完整 Location 条件 CAS 决定；EventReport 扩展由 worker 内的 Backend token/lease 与 no-touch expected-value RMW 决定。
 
-设 scan view 中某 Instance 有 `N` 个 Block、平均每个 Block 有 `L` 个 Location，单次遍历并判定的基础成本约为 `O(N + N*L)`；超预算快照会在后续 tick 重新探测和排序，所以完整 round 还包含这些重复判定的开销。缓存减少的是对同一 batch 的重复 metadata 扫描，不是取消安全复核。dual-backend 的 `N` 是当前内存 cache 中可见的 key 数，不是 persistent keyspace；`scan_batch_size` 是 backend hint，不保证 Local backend 的单 shard 返回量或缓存内存严格受限。
+设 scan view 中某 Instance 有 `N` 个 Block、平均每个 Block 有 `L` 个 Location，遍历并判定的基础成本约为 `O(N + N*L)`，另有小批内去重、排序开销。每个缓存条目在取出时才判定，不会每 tick 重新探测和排序整个剩余 buffer；执行时的精确值复核仍保留。dual-backend 的 `N` 是当前内存 cache 中可见的 key 数，不是 persistent keyspace；`scan_batch_size` 是 backend hint，不保证 Local backend 的单 shard 返回量或缓存内存严格受限。
 
 设 active round 耗时为 `S`、cooldown 为 `P`，正常候选的最坏发现时间约为：
 
@@ -465,7 +466,7 @@ V1 只保留能回答“是否在扫描、发现了什么、删除是否卡住�
 |---|---|---|
 | `cache_gc.scan_round_count` | Counter | 完整 round 完成次数 |
 | `cache_gc.scan_key_count` | Counter | 实际 backend Scan 返回的 Block 数；复用缓存不重复累计 |
-| `cache_gc.candidate_count{reason}` | Counter | 每次判定得到的候选数；缓存重新判定可能重复累计，不是去重数量。基础 V1 reason 为 `orphan_writing` 或 `storage_missing`，EventReport 扩展增加其业务原因 |
+| `cache_gc.candidate_count{reason}` | Counter | 每个小批判定得到的候选数；只在小批内去重，不是跨轮去重数量。基础 V1 reason 为 `orphan_writing` 或 `storage_missing`，EventReport 扩展增加其业务原因 |
 | `cache_gc.delete_target_count` | Counter | 实际提交的 Location 数 |
 | `cache_gc.delete_result_count{status}` | Counter | Future 终态 |
 | `cache_gc.operation_error_count{stage}` | Counter | Registry/scan/submit/future 等异常；并发 `EC_NOENT`、条件不匹配和 CAS loser 不计入 |
@@ -491,7 +492,7 @@ GC 将 `MightExist` 已确认缺失的 URI 传给 Executor，跳过这些 URI �
 6. 只有状态为 WRITING、字段有效且年龄达到 grace 的 Location 成为 orphan 候选；未来时间、解析失败和边界值 fail-closed。
 7. grace 配置不得小于 1 小时，默认值为 24 小时。
 8. 普通 SERVING 按 storage 批量探测，任一 spec 明确 missing 时选择整个 Location；全 true、无可探测 URI、storage 缺失/type 不符、shape 错误和异常均 fail-closed，EventReport 不进入该布尔规则；单次探测不超过 512 URI。扩展测试另验证 EventReport 与普通候选共享同一次 scan。
-9. 请求保持 Instance 隔离，按 `(block_key, location_id)` 去重，完整 batch 先按原因优先级选优再应用 Location 总预算；EventReport action 另受唯一 Block key 预算约束。超预算 Location 和槽位不足的 EventReport 候选跨 tick 保留快照、重新探测，包含同一 key 部分 Location 被选中的场景；空请求不调用 Executor。
+9. 请求保持 Instance 隔离，按 `(block_key, location_id)` 去重，优先级仅在输入小批内生效，不把后续小批中的高优先级候选提前。取 batch 时同时限制 key/Location 数、EventReport key 数和 action 类型，覆盖单 key 多 Location、单个空闲槽位和缓存等待期间 Backend 状态变化；`BuildDeleteActions` 不修改输入，空请求不调用 Executor。
 10. GC 请求携带与 target 平行的完整序列化 Location；请求排队后 Finish、URI 刷新、DELETING 或 NOENT 均因 expected value 不匹配而不做物理删除。
 11. #209 活跃 Copy reservation 对应的 WRITING 目标不会成为候选；相同 location ID 在其他 Instance/Block 中不被误保护。
 12. GC 与另一个删除者同时提交同一 target 时只有一个 CAS winner。
