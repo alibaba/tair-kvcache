@@ -8,7 +8,7 @@
 
 namespace kv_cache_manager {
 
-enum [[nodiscard]] ClientErrorCode : int32_t {
+enum [[nodiscard]] ClientErrorCode : int32_t{
     // client & sdkwrapper
     ER_OK = 0,
     ER_INVALID_STUB = 1,

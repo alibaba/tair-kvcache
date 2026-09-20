@@ -193,7 +193,10 @@ public:
 
 class CapacityRejectingNfsBackend : public NfsBackend {
 public:
-    enum class Mode { kOnce, kAlways };
+    enum class Mode {
+        kOnce,
+        kAlways
+    };
 
     CapacityRejectingNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry, Mode mode)
         : NfsBackend(std::move(metrics_registry)), mode_(mode) {}
@@ -638,13 +641,11 @@ public:
         : NfsBackend(std::move(metrics_registry)) {}
 
     bool RequiresKvMetaCreateCommit() const noexcept override { return true; }
-    std::int64_t GetKvMetaControlRequestTimeoutSeconds() const noexcept override {
-        return control_timeout_seconds_;
-    }
+    std::int64_t GetKvMetaControlRequestTimeoutSeconds() const noexcept override { return control_timeout_seconds_; }
     std::int64_t GetFailedWriteCleanupGraceSeconds() const noexcept override { return 0; }
 
     std::vector<ErrorCode> CommitKvMetaCreate(const std::vector<std::string> &allocation_keys,
-                                               const std::string &) override {
+                                              const std::string &) override {
         ++commit_calls_;
         commit_batches_.push_back(allocation_keys);
         committed_keys_ = allocation_keys;
@@ -3500,8 +3501,8 @@ TEST_F(KvMetaManagerTest, ProvisionalBackendCommitsBatchAsDeadlineBoundedSinglet
         storage_manager->storage_map_["nfs_01"] = provisional;
     }
 
-    auto [start_ec, start] = manager_->StartWrite(
-        &request_context_, kInstanceId, {kFirstKey, kSecondKey}, {31, 37}, 30);
+    auto [start_ec, start] =
+        manager_->StartWrite(&request_context_, kInstanceId, {kFirstKey, kSecondKey}, {31, 37}, 30);
     ASSERT_EQ(EC_OK, start_ec);
     ASSERT_FALSE(start.write_session_id.empty());
     ASSERT_EQ(2u, provisional->commit_calls_);
@@ -3509,8 +3510,7 @@ TEST_F(KvMetaManagerTest, ProvisionalBackendCommitsBatchAsDeadlineBoundedSinglet
     EXPECT_EQ(1u, provisional->commit_batches_[0].size());
     EXPECT_EQ(1u, provisional->commit_batches_[1].size());
     EXPECT_NE(provisional->commit_batches_[0][0], provisional->commit_batches_[1][0]);
-    EXPECT_EQ(EC_OK,
-              manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {false, false}));
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {false, false}));
 
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
@@ -3533,15 +3533,14 @@ TEST_F(KvMetaManagerTest, ProvisionalBatchStopsCommittingWhenTheWriteDeadlineExp
         storage_manager->storage_map_["nfs_01"] = provisional;
     }
 
-    const auto [start_ec, start] = manager_->StartWrite(
-        &request_context_, kInstanceId, {kFirstKey, kSecondKey}, {31, 37}, 1);
+    const auto [start_ec, start] =
+        manager_->StartWrite(&request_context_, kInstanceId, {kFirstKey, kSecondKey}, {31, 37}, 1);
     EXPECT_EQ(EC_TIMEOUT, start_ec);
     EXPECT_TRUE(start.write_session_id.empty());
     EXPECT_EQ(1u, provisional->commit_calls_);
     EXPECT_EQ(2u, provisional->delete_calls_);
 
-    auto [get_ec, values] = manager_->Get(
-        &request_context_, kInstanceId, {kFirstKey, kSecondKey});
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstanceId, {kFirstKey, kSecondKey});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(2u, values.size());
     EXPECT_FALSE(values[0].found);
@@ -3617,8 +3616,8 @@ TEST_F(KvMetaManagerTest, FailedProvisionalCommitRollsBackMetadataAndPhysicalAll
     ASSERT_EQ(get_ec, EC_OK);
     ASSERT_EQ(values.size(), 1u);
     EXPECT_FALSE(values.front().found);
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstanceId));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
     EXPECT_EQ(indexer->GetStorageUsage(), 0u);
 
@@ -3650,12 +3649,12 @@ TEST_F(KvMetaManagerTest, FailedProvisionalCommitRetainsTombstoneWhenPhysicalRol
     EXPECT_EQ(1u, provisional->delete_calls_);
     EXPECT_TRUE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
 
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstanceId));
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
     CacheLocationMapVector maps;
-    const auto metadata = indexer->GetLocationMapsForMaintenance(
-        &request_context_, {KvMetaManager::InternalKey(kKey)}, maps);
+    const auto metadata =
+        indexer->GetLocationMapsForMaintenance(&request_context_, {KvMetaManager::InternalKey(kKey)}, maps);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), metadata.error_codes);
     ASSERT_EQ(1u, maps.size());
     const auto location = maps.front().find(KvMetaManager::StableLocationId(kKey));
@@ -5389,8 +5388,8 @@ TEST_F(KvMetaManagerTest, ReclaimerRetainsItsLedgerAndRetriesPhysicalDeleteUntil
     EXPECT_EQ(90, indexer->GetStorageUsage());
     EXPECT_FALSE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
     CacheLocationMapVector maps;
-    const auto metadata = indexer->GetLocationMapsForMaintenance(
-        &request_context_, {KvMetaManager::InternalKey(kKey)}, maps);
+    const auto metadata =
+        indexer->GetLocationMapsForMaintenance(&request_context_, {KvMetaManager::InternalKey(kKey)}, maps);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), metadata.error_codes);
     ASSERT_EQ(1, maps.size());
     const auto location_it = maps.front().find(KvMetaManager::StableLocationId(kKey));
@@ -5408,8 +5407,7 @@ TEST_F(KvMetaManagerTest, ReclaimerRetainsItsLedgerAndRetriesPhysicalDeleteUntil
     EXPECT_GE(metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_attempted_object_count").Get(), 3);
     EXPECT_GE(metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_uncertain_object_count").Get(), 2);
     EXPECT_GE(metrics_registry_->GetCounter("kv_meta_reclaimer.physical_delete_uncertain_bytes").Get(), 180);
-    auto [open_ec, opened] =
-        manager_->StartWrite(&request_context_, kInstance, {"capacity-is-reusable"}, {7}, 30);
+    auto [open_ec, opened] = manager_->StartWrite(&request_context_, kInstance, {"capacity-is-reusable"}, {7}, 30);
     ASSERT_EQ(EC_OK, open_ec);
     ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, opened.write_session_id, {false}));
     {
@@ -5460,8 +5458,7 @@ TEST_F(KvMetaManagerTest, ReclaimerPhysicalDeleteDoesNotHoldTheEmbGroupAdmission
     EXPECT_EQ(EC_OK,
               manager_->FinishWrite(
                   &request_context_, kInstance, unrelated_start.write_session_id, std::vector<bool>{false}));
-    auto indexer =
-        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
     ASSERT_TRUE(indexer);
     ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
     {
@@ -5489,8 +5486,7 @@ TEST_F(KvMetaManagerTest, RecoveryResumesAReclaimerPhysicalDeleteFromTheDurableT
         storage_manager->storage_map_["nfs_01"] = faulting;
     }
 
-    auto indexer =
-        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
     ASSERT_TRUE(indexer);
     cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
     ASSERT_TRUE(manager_->ResumeMaintenance());
@@ -5666,8 +5662,7 @@ TEST_F(KvMetaManagerTest, ReclaimerDoesNotRepeatConfirmedPhysicalDeleteWhileRetr
         ASSERT_EQ(EC_OK, tracking->Open(original->GetStorageConfig(), request_context_.trace_id()));
         storage_manager->storage_map_["nfs_01"] = tracking;
     }
-    auto indexer =
-        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
     ASSERT_TRUE(indexer);
 
     cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 200);
@@ -5682,9 +5677,9 @@ TEST_F(KvMetaManagerTest, ReclaimerDoesNotRepeatConfirmedPhysicalDeleteWhileRetr
     EXPECT_TRUE(blocked.locations.empty());
     EXPECT_EQ(1, tracking->DeleteAttempts());
 
-    ASSERT_TRUE(WaitUntil(
-        [&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.pending_object_count").Get() == 0; },
-        std::chrono::seconds(3)));
+    ASSERT_TRUE(
+        WaitUntil([&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.pending_object_count").Get() == 0; },
+                  std::chrono::seconds(3)));
     EXPECT_EQ(1, tracking->DeleteAttempts());
     EXPECT_EQ(0, indexer->GetStorageUsage());
     {
@@ -5805,8 +5800,8 @@ TEST_F(KvMetaManagerTest, ReclaimerCreatesPhysicalHeadroomAfterAuthoritativeBack
     ASSERT_TRUE(storage_manager);
     auto original = storage_manager->GetDataStorageBackend("nfs_01");
     ASSERT_TRUE(original);
-    auto capacity = std::make_shared<CapacityRejectingNfsBackend>(
-        metrics_registry_, CapacityRejectingNfsBackend::Mode::kOnce);
+    auto capacity =
+        std::make_shared<CapacityRejectingNfsBackend>(metrics_registry_, CapacityRejectingNfsBackend::Mode::kOnce);
     ASSERT_EQ(EC_OK, capacity->Open(original->GetStorageConfig(), request_context_.trace_id()));
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
@@ -5862,22 +5857,20 @@ TEST_F(KvMetaManagerTest, BackendCapacityReclaimDoesNotRequireAStorageTypeQuota)
     ASSERT_TRUE(storage_manager);
     auto original = storage_manager->GetDataStorageBackend("nfs_01");
     ASSERT_TRUE(original);
-    auto capacity = std::make_shared<CapacityRejectingNfsBackend>(
-        metrics_registry_, CapacityRejectingNfsBackend::Mode::kOnce);
+    auto capacity =
+        std::make_shared<CapacityRejectingNfsBackend>(metrics_registry_, CapacityRejectingNfsBackend::Mode::kOnce);
     ASSERT_EQ(EC_OK, capacity->Open(original->GetStorageConfig(), request_context_.trace_id()));
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         storage_manager->storage_map_["nfs_01"] = capacity;
     }
 
-    auto indexer =
-        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
     ASSERT_TRUE(indexer);
     cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
     ASSERT_TRUE(manager_->ResumeMaintenance());
 
-    auto [blocked_ec, blocked] =
-        manager_->StartWrite(&request_context_, kInstance, {"new-backend-object"}, {40}, 30);
+    auto [blocked_ec, blocked] = manager_->StartWrite(&request_context_, kInstance, {"new-backend-object"}, {40}, 30);
     EXPECT_EQ(EC_NOSPC, blocked_ec);
     EXPECT_TRUE(blocked.locations.empty());
     EXPECT_EQ(1, capacity->CreateAttempts());
@@ -5886,8 +5879,7 @@ TEST_F(KvMetaManagerTest, BackendCapacityReclaimDoesNotRequireAStorageTypeQuota)
         [&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.admission_demand_group_count").Get() == 0; },
         std::chrono::seconds(2)));
 
-    auto [retry_ec, retry] =
-        manager_->StartWrite(&request_context_, kInstance, {"new-backend-object"}, {40}, 30);
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstance, {"new-backend-object"}, {40}, 30);
     ASSERT_EQ(EC_OK, retry_ec);
     ASSERT_EQ(1, retry.locations.size());
     EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, retry.write_session_id, {false}));
@@ -5911,8 +5903,8 @@ TEST_F(KvMetaManagerTest, BackendCapacityRetriesDoNotDuplicateInFlightEviction) 
     ASSERT_TRUE(storage_manager);
     auto original = storage_manager->GetDataStorageBackend("nfs_01");
     ASSERT_TRUE(original);
-    auto capacity = std::make_shared<CapacityRejectingNfsBackend>(
-        metrics_registry_, CapacityRejectingNfsBackend::Mode::kAlways);
+    auto capacity =
+        std::make_shared<CapacityRejectingNfsBackend>(metrics_registry_, CapacityRejectingNfsBackend::Mode::kAlways);
     ASSERT_EQ(EC_OK, capacity->Open(original->GetStorageConfig(), request_context_.trace_id()));
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
@@ -5925,8 +5917,8 @@ TEST_F(KvMetaManagerTest, BackendCapacityRetriesDoNotDuplicateInFlightEviction) 
         std::size_t count = 0;
         for (const char *key : {kOldA, kOldB}) {
             CacheLocationMapVector maps;
-            const auto result = indexer->GetLocationMapsForMaintenance(
-                &request_context_, {KvMetaManager::InternalKey(key)}, maps);
+            const auto result =
+                indexer->GetLocationMapsForMaintenance(&request_context_, {KvMetaManager::InternalKey(key)}, maps);
             if (result.error_codes.size() != 1 || result.error_codes[0] != EC_OK || maps.size() != 1) {
                 continue;
             }
@@ -5940,15 +5932,13 @@ TEST_F(KvMetaManagerTest, BackendCapacityRetriesDoNotDuplicateInFlightEviction) 
 
     cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
     ASSERT_TRUE(manager_->ResumeMaintenance());
-    EXPECT_EQ(EC_NOSPC,
-              manager_->StartWrite(&request_context_, kInstance, {"backend-retry-new"}, {20}, 30).first);
+    EXPECT_EQ(EC_NOSPC, manager_->StartWrite(&request_context_, kInstance, {"backend-retry-new"}, {20}, 30).first);
     ASSERT_TRUE(WaitUntil([&]() { return retired_count() == 1; }, std::chrono::seconds(2)));
     EXPECT_DOUBLE_EQ(20, metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_bytes").Get());
 
     // Re-publishing the same failure while the first object is inside reader
     // grace must be covered by its pending bytes, not retire the second key.
-    EXPECT_EQ(EC_NOSPC,
-              manager_->StartWrite(&request_context_, kInstance, {"backend-retry-new"}, {20}, 30).first);
+    EXPECT_EQ(EC_NOSPC, manager_->StartWrite(&request_context_, kInstance, {"backend-retry-new"}, {20}, 30).first);
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
     EXPECT_EQ(1, retired_count());
     EXPECT_EQ(60, indexer->GetStorageUsage());
@@ -6425,17 +6415,13 @@ TEST_F(KvMetaManagerTest, RegistrationRejectsUnboundedProvisionalControlPlaneTim
         storage_manager->storage_map_["nfs_01"] = provisional;
     }
 
-    for (const std::int64_t timeout :
-         {std::int64_t{0}, kKvMetaMaxExactControlRpcTimeoutSeconds + 1}) {
+    for (const std::int64_t timeout : {std::int64_t{0}, kKvMetaMaxExactControlRpcTimeoutSeconds + 1}) {
         provisional->control_timeout_seconds_ = timeout;
         EXPECT_EQ(EC_CONFIG_ERROR,
-                  manager_->RegisterInstance(
-                      &request_context_, "default", "unsafe-provisional-timeout", "").first);
+                  manager_->RegisterInstance(&request_context_, "default", "unsafe-provisional-timeout", "").first);
     }
     provisional->control_timeout_seconds_ = kKvMetaMaxExactControlRpcTimeoutSeconds;
-    EXPECT_EQ(EC_OK,
-              manager_->RegisterInstance(
-                  &request_context_, "default", "bounded-provisional-timeout", "").first);
+    EXPECT_EQ(EC_OK, manager_->RegisterInstance(&request_context_, "default", "bounded-provisional-timeout", "").first);
 
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);

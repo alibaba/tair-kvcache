@@ -110,16 +110,14 @@ public:
     // interface prevents EMB rollout requirements from changing ordinary
     // KV-cache allocation behavior.
     virtual bool HasDedicatedKvMetaCreate() const noexcept { return false; }
-    virtual std::vector<std::pair<ErrorCode, DataStorageUri>>
-    CreateForKvMeta(const std::vector<std::string> &keys,
-                    std::size_t size_per_key,
-                    const std::string &trace_id,
-                    std::function<void()> cb) {
+    virtual std::vector<std::pair<ErrorCode, DataStorageUri>> CreateForKvMeta(const std::vector<std::string> &keys,
+                                                                              std::size_t size_per_key,
+                                                                              const std::string &trace_id,
+                                                                              std::function<void()> cb) {
         (void)size_per_key;
         (void)trace_id;
         (void)cb;
-        return std::vector<std::pair<ErrorCode, DataStorageUri>>(
-            keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}});
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}});
     }
 
     // Some remote allocators return a provisional exact allocation first and
@@ -137,9 +135,8 @@ public:
     // value; KVMeta rejects an unbounded value at instance registration so a
     // stalled RPC cannot silently outlive the Provider allocation lease.
     virtual std::int64_t GetKvMetaControlRequestTimeoutSeconds() const noexcept { return 0; }
-    virtual std::vector<ErrorCode>
-    CommitKvMetaCreate(const std::vector<std::string> &allocation_keys,
-                       const std::string &trace_id) {
+    virtual std::vector<ErrorCode> CommitKvMetaCreate(const std::vector<std::string> &allocation_keys,
+                                                      const std::string &trace_id) {
         (void)trace_id;
         return std::vector<ErrorCode>(allocation_keys.size(), EC_UNIMPLEMENTED);
     }

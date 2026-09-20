@@ -265,9 +265,7 @@ void Server::StartKvMetaRecovery() {
                 // provider exception must leave its request gate closed, not
                 // terminate the server process or affect fixed-block KV-cache.
                 KVCM_LOG_ERROR("KVMeta recovery caught a standard exception; service remains disabled");
-            } catch (...) {
-                KVCM_LOG_ERROR("KVMeta recovery caught an unknown exception; service remains disabled");
-            }
+            } catch (...) { KVCM_LOG_ERROR("KVMeta recovery caught an unknown exception; service remains disabled"); }
             bool enabled = false;
             if (ec == EC_OK) {
                 // Serialize the final epoch check and gate opening with
@@ -292,9 +290,7 @@ void Server::StartKvMetaRecovery() {
                                static_cast<int>(ec));
             }
         });
-    } catch (const std::exception &e) {
-        KVCM_LOG_ERROR("failed to start KVMeta recovery thread: %s", e.what());
-    }
+    } catch (const std::exception &e) { KVCM_LOG_ERROR("failed to start KVMeta recovery thread: %s", e.what()); }
 }
 
 void Server::CancelAndJoinKvMetaRecovery() {

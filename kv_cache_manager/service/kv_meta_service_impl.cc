@@ -230,9 +230,7 @@ ErrorCode KvMetaServiceImpl::AbortMalformedPutStart(RequestContext *request_cont
         KVCM_LOG_ERROR("failed to abort malformed KVMeta PutStart result, ec[%d]", static_cast<int>(abort_ec));
     } catch (const std::exception &) {
         KVCM_LOG_ERROR("caught a standard exception while aborting malformed KVMeta PutStart result");
-    } catch (...) {
-        KVCM_LOG_ERROR("caught an unknown exception while aborting malformed KVMeta PutStart result");
-    }
+    } catch (...) { KVCM_LOG_ERROR("caught an unknown exception while aborting malformed KVMeta PutStart result"); }
     // A failed abort cannot prove whether metadata or physical allocations
     // remain.  Preserve that ambiguity so endpoint failover cannot allocate a
     // second batch for the same logical PutStart.

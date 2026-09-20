@@ -34,8 +34,7 @@ inline constexpr std::int64_t kKvMetaMaxExactControlRpcTimeoutSeconds = 120;
 inline constexpr std::int64_t kKvMetaMaxExactCleanupControlRequests = 6;
 inline constexpr std::uint64_t kKvMetaMinimumExactAllocationLeaseSeconds = 3600;
 static_assert(kKvMetaMinimumExactAllocationLeaseSeconds >
-              static_cast<std::uint64_t>(kKvMetaMaxWriteTimeoutSeconds +
-                                         kKvMetaMaxFailedWriteCleanupGraceSeconds));
+              static_cast<std::uint64_t>(kKvMetaMaxWriteTimeoutSeconds + kKvMetaMaxFailedWriteCleanupGraceSeconds));
 static_assert(kKvMetaMinimumExactAllocationLeaseSeconds >
               static_cast<std::uint64_t>(kKvMetaMaxWriteTimeoutSeconds +
                                          kKvMetaMaxExactControlRpcTimeoutSeconds *
@@ -305,9 +304,9 @@ inline bool HasCanonicalTairMempoolProviderIncarnation(const DataStorageUri &uri
     }
     for (std::size_t i = 0; i < value.size(); ++i) {
         if (i == 8 || i == 13 || i == 18 || i == 23) {
-            if (value[i] != '-') return false;
-        } else if (!((value[i] >= '0' && value[i] <= '9') ||
-                     (value[i] >= 'a' && value[i] <= 'f'))) {
+            if (value[i] != '-')
+                return false;
+        } else if (!((value[i] >= '0' && value[i] <= '9') || (value[i] >= 'a' && value[i] <= 'f'))) {
             return false;
         }
     }
@@ -324,8 +323,8 @@ inline bool IsCanonicalTairMempoolProviderUuid(std::string_view value) noexcept 
     }
     return std::all_of(value.begin(), value.end(), [](char ch) {
         const auto byte = static_cast<unsigned char>(ch);
-        return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
-               (byte >= '0' && byte <= '9') || ch == '-' || ch == '_' || ch == '.';
+        return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') ||
+               ch == '-' || ch == '_' || ch == '.';
     });
 }
 
@@ -345,8 +344,7 @@ inline bool HasSafeOptionalTairMempoolProviderUuid(const DataStorageUri &uri) {
 // values may be reused within one process for explicit/local DRAM, so node,
 // offset and process incarnation alone are insufficient to authorize GC.
 inline bool HasCanonicalTairMempoolAllocationToken(const DataStorageUri &uri) {
-    return uri.HasParam("allocation_token") &&
-           HasCanonicalKvMetaObjectKey(uri.GetParam("allocation_token"));
+    return uri.HasParam("allocation_token") && HasCanonicalKvMetaObjectKey(uri.GetParam("allocation_token"));
 }
 
 // Validate the backend fields that make one URI an independently deletable
@@ -361,8 +359,7 @@ inline bool HasOwnedKvMetaAllocationShape(const DataStorageUri &uri, DataStorage
     }
     if (IsTairMempoolStorageType(storage_type)) {
         return HasExactTairMempoolAddress(uri) && HasCanonicalTairMempoolProviderIncarnation(uri) &&
-               HasSafeOptionalTairMempoolProviderUuid(uri) &&
-               HasCanonicalTairMempoolAllocationToken(uri);
+               HasSafeOptionalTairMempoolProviderUuid(uri) && HasCanonicalTairMempoolAllocationToken(uri);
     }
     switch (storage_type) {
     case DataStorageType::DATA_STORAGE_TYPE_HF3FS:

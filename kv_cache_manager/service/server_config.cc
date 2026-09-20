@@ -25,9 +25,7 @@ bool ParseUint32Setting(const std::string &value, uint32_t &out) {
         }
         out = static_cast<uint32_t>(parsed);
         return true;
-    } catch (...) {
-        return false;
-    }
+    } catch (...) { return false; }
 }
 
 } // namespace

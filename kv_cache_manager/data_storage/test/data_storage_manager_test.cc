@@ -18,8 +18,7 @@ public:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
 };
 
-class DedicatedKvMetaCreateBackend final : public DataStorageBackend,
-                                           public KvMetaDataStorageBackendExtension {
+class DedicatedKvMetaCreateBackend final : public DataStorageBackend, public KvMetaDataStorageBackendExtension {
 public:
     explicit DedicatedKvMetaCreateBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
         : DataStorageBackend(std::move(metrics_registry)) {}
@@ -41,30 +40,31 @@ public:
                                                              const std::string &,
                                                              std::function<void()> cb) override {
         ++legacy_create_calls;
-        if (cb) cb();
+        if (cb)
+            cb();
         return MakeResult(keys.size(), size_per_key, "/legacy");
     }
     bool HasDedicatedKvMetaCreate() const noexcept override { return true; }
     bool RequiresKvMetaCreateCommit() const noexcept override { return true; }
-    std::vector<std::pair<ErrorCode, DataStorageUri>> CreateForKvMeta(
-        const std::vector<std::string> &keys,
-        size_t size_per_key,
-        const std::string &,
-        std::function<void()> cb) override {
+    std::vector<std::pair<ErrorCode, DataStorageUri>> CreateForKvMeta(const std::vector<std::string> &keys,
+                                                                      size_t size_per_key,
+                                                                      const std::string &,
+                                                                      std::function<void()> cb) override {
         ++kv_meta_create_calls;
-        if (cb) cb();
+        if (cb)
+            cb();
         return MakeResult(keys.size(), size_per_key, "/kvmeta");
     }
     std::vector<ErrorCode> CommitKvMetaCreate(const std::vector<std::string> &allocation_keys,
-                                               const std::string &) override {
+                                              const std::string &) override {
         committed_keys = allocation_keys;
         return std::vector<ErrorCode>(allocation_keys.size(), EC_OK);
     }
 
-    std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &uris,
-                                  const std::string &,
-                                  std::function<void()> cb) override {
-        if (cb) cb();
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()> cb) override {
+        if (cb)
+            cb();
         return std::vector<ErrorCode>(uris.size(), EC_OK);
     }
     std::vector<ErrorCode> DeleteAndConfirmAbsent(const std::vector<DataStorageUri> &uris,
@@ -184,8 +184,8 @@ TEST_F(DataStorageManagerTest, DedicatedKvMetaCreateDoesNotChangeLegacyCreateRou
     }
 
     bool legacy_callback = false;
-    const auto legacy = data_storage_manager.Create(
-        &request_context, "isolated", {"key"}, 17, [&]() { legacy_callback = true; });
+    const auto legacy =
+        data_storage_manager.Create(&request_context, "isolated", {"key"}, 17, [&]() { legacy_callback = true; });
     ASSERT_EQ(legacy.size(), 1u);
     EXPECT_EQ(legacy[0].first, EC_OK);
     EXPECT_EQ(legacy[0].second.GetPath(), "/legacy");
@@ -205,18 +205,16 @@ TEST_F(DataStorageManagerTest, DedicatedKvMetaCreateDoesNotChangeLegacyCreateRou
     EXPECT_EQ(backend->legacy_create_calls, 1u);
     EXPECT_EQ(backend->kv_meta_create_calls, 1u);
 
-    const auto commit = data_storage_manager.CommitKvMetaCreate(
-        &request_context, "isolated", {"allocation-a", "allocation-b"});
+    const auto commit =
+        data_storage_manager.CommitKvMetaCreate(&request_context, "isolated", {"allocation-a", "allocation-b"});
     EXPECT_EQ(commit, (std::vector<ErrorCode>{EC_OK, EC_OK}));
-    EXPECT_EQ(backend->committed_keys,
-              (std::vector<std::string>{"allocation-a", "allocation-b"}));
+    EXPECT_EQ(backend->committed_keys, (std::vector<std::string>{"allocation-a", "allocation-b"}));
 }
 
 TEST_F(DataStorageManagerTest, KvMetaCommitFailsClosedForMissingOrOnePhaseBackend) {
     DataStorageManager data_storage_manager(metrics_registry_);
     RequestContext request_context("test");
-    EXPECT_EQ(data_storage_manager.CommitKvMetaCreate(
-                  &request_context, "missing", {"allocation"}),
+    EXPECT_EQ(data_storage_manager.CommitKvMetaCreate(&request_context, "missing", {"allocation"}),
               (std::vector<ErrorCode>{EC_NOENT}));
 
     auto backend = std::make_shared<NfsBackend>(metrics_registry_);
@@ -229,8 +227,7 @@ TEST_F(DataStorageManagerTest, KvMetaCommitFailsClosedForMissingOrOnePhaseBacken
         std::unique_lock<std::shared_mutex> lock(data_storage_manager.rw_lock_);
         data_storage_manager.storage_map_["one_phase"] = backend;
     }
-    EXPECT_EQ(data_storage_manager.CommitKvMetaCreate(
-                  &request_context, "one_phase", {"allocation"}),
+    EXPECT_EQ(data_storage_manager.CommitKvMetaCreate(&request_context, "one_phase", {"allocation"}),
               (std::vector<ErrorCode>{EC_UNIMPLEMENTED}));
 }
 

@@ -123,7 +123,7 @@ ClientErrorCode ValidateLocalRegistration(const InitParams &init_params,
         KVCM_LOG_WARN("KVMeta shared-memory registration is incomplete or its address range overflows");
         return ER_INVALID_PARAMS;
     }
-    struct stat file_stat{};
+    struct stat file_stat {};
     if (fstat(registration.fd, &file_stat) != 0 || file_stat.st_size < 0 ||
         static_cast<std::uintmax_t>(file_stat.st_size) < registration.size) {
         KVCM_LOG_WARN("KVMeta shared-memory fd is invalid or smaller than the registered range");

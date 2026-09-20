@@ -454,24 +454,21 @@ TEST_F(SdkWrapperTest, TestKvMetaTairValidationRejectsMalformedOrCrossMediaAddre
                  "pace://pace/0?node_id=65536&size=5",
                  "pace://pace/0?media_type=1x&size=5",
                  "pace://pace/0?range_id=+1&size=5",
-            }) {
+             }) {
             SCOPED_TRACE(uri);
             EXPECT_EQ(ER_INVALID_PARAMS,
-                      sdk_wrapper.ValidateKvMetaObjects(
-                          {DataStorageUri(uri + owner_capability)}, sizes, buffers));
+                      sdk_wrapper.ValidateKvMetaObjects({DataStorageUri(uri + owner_capability)}, sizes, buffers));
         }
         EXPECT_EQ(ER_INVALID_PARAMS,
                   sdk_wrapper.ValidateKvMetaObjects(
                       {DataStorageUri("pace://pace/0?media_type=" + std::to_string(media_type) +
-                                      "&node_id=0&range_id=0&size=5&provider_incarnation=" +
-                                      provider_incarnation)},
+                                      "&node_id=0&range_id=0&size=5&provider_incarnation=" + provider_incarnation)},
                       sizes,
                       buffers));
         EXPECT_EQ(ER_INVALID_PARAMS,
                   sdk_wrapper.ValidateKvMetaObjects(
                       {DataStorageUri("pace://pace/0?allocation_token=" + allocation_token +
-                                      "&media_type=" + std::to_string(media_type) +
-                                      "&node_id=0&range_id=0&size=5")},
+                                      "&media_type=" + std::to_string(media_type) + "&node_id=0&range_id=0&size=5")},
                       sizes,
                       buffers));
     }

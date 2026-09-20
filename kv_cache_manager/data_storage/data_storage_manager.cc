@@ -227,12 +227,12 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
     return create_result;
 }
 
-std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::CreateForKvMeta(
-    RequestContext *request_context,
-    const std::string &unique_name,
-    const std::vector<std::string> &keys,
-    size_t size_per_key,
-    std::function<void()> cb) {
+std::vector<std::pair<ErrorCode, DataStorageUri>>
+DataStorageManager::CreateForKvMeta(RequestContext *request_context,
+                                    const std::string &unique_name,
+                                    const std::vector<std::string> &keys,
+                                    size_t size_per_key,
+                                    std::function<void()> cb) {
     SPAN_TRACER(request_context);
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     const std::string &trace_id = request_context->trace_id();
@@ -268,10 +268,9 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::CreateForK
     return create_result;
 }
 
-std::vector<ErrorCode> DataStorageManager::CommitKvMetaCreate(
-    RequestContext *request_context,
-    const std::string &unique_name,
-    const std::vector<std::string> &allocation_keys) {
+std::vector<ErrorCode> DataStorageManager::CommitKvMetaCreate(RequestContext *request_context,
+                                                              const std::string &unique_name,
+                                                              const std::vector<std::string> &allocation_keys) {
     SPAN_TRACER(request_context);
     if (allocation_keys.empty()) {
         return {};
@@ -284,7 +283,8 @@ std::vector<ErrorCode> DataStorageManager::CommitKvMetaCreate(
     }
     const auto extension = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(iter->second);
     if (!extension || !extension->RequiresKvMetaCreateCommit()) {
-        KVCM_LOG_WARN("Storage name: %s does not implement the advertised KVMeta allocation commit", unique_name.c_str());
+        KVCM_LOG_WARN("Storage name: %s does not implement the advertised KVMeta allocation commit",
+                      unique_name.c_str());
         return std::vector<ErrorCode>(allocation_keys.size(), EC_UNIMPLEMENTED);
     }
     try {

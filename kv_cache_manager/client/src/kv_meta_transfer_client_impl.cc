@@ -92,9 +92,8 @@ ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_con
             static_cast<std::uint64_t>(wrapper_config->timeout_config().put_timeout_ms()) * 2 +
             static_cast<std::uint64_t>(metadata_call_timeout_ms) * 3;
         if (write_lease_ms <= minimum_completion_ms) {
-            KVCM_LOG_WARN(
-                "KVMeta write_timeout_seconds must exceed two put_timeout_ms windows plus three metadata "
-                "call_timeout_ms windows");
+            KVCM_LOG_WARN("KVMeta write_timeout_seconds must exceed two put_timeout_ms windows plus three metadata "
+                          "call_timeout_ms windows");
             return ER_INVALID_CLIENT_CONFIG;
         }
     }
