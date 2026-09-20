@@ -1950,13 +1950,15 @@ ErrorCode MetaStorageBackendManager::SampleReclaimKeys(RequestContext *request_c
 
 bool MetaStorageBackendManager::PreferSingleTaskReclaimSampling() const noexcept {
     auto *source = persistent_backend_.get();
-    if (cache_backend_) {
-        if (recover_state_.load(std::memory_order_acquire) != RecoverState::kRunning) {
-            return false;
-        }
+    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
         source = cache_backend_.get();
     }
-    return source && source->GetStorageType() == META_LOCAL_BACKEND_TYPE_STR;
+    if (!source) {
+        return false;
+    }
+    const std::string type = source->GetStorageType();
+    return type == META_LOCAL_BACKEND_TYPE_STR || type == META_REDIS_BACKEND_TYPE_STR ||
+           type == META_ASYNC_REDIS_BACKEND_TYPE_STR;
 }
 
 size_t MetaStorageBackendManager::TouchKeysForMaintenance(const KeyTypeVec &keys) noexcept {

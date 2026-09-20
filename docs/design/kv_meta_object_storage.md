@@ -556,6 +556,10 @@ group 和 storage type 分别计算；metadata key 准入按**目标 instance**�
 2. 在严格有界的 sampling budget 内轮转 instance，以 no-touch 方式取得访问时间和完整 location。采样得到的是
    **近似 LRU**，不是全量精确 LRU；per-instance 准入需求会优先占用采样 slot，避免 full instance 排在大量 peer
    之后等待多轮 rotation；active、已 retired 或 schema 不合法的对象不会成为候选；
+   当 cached metadata 仍在恢复、完整采样源是 Redis / async Redis 时，公共 sampler 使用按 Instance 前缀过滤的
+   有界 SCAN：游标跨回收轮次保存，单轮工作量和 overflow 均有硬上限，稀疏 Instance 允许多轮收敛。它不依赖
+   全库 `RANDOMKEY` 碰撞；Instance 前缀按 Redis glob 字面量转义，非法物理 key 被隔离跳过，每页扫描独立借还
+   client pool 连接，也不把扫描或属性读取放进 `Get` / `PutStart` 主链路；
 3. 选择候选时先满足目标 instance key、storage type 等更具体的压力，再补 group 通用压力；每一类内部仍按
    `last_access_time` 排序。具体维度释放的 bytes 同时抵扣 group 压力，避免先淘汰一个全局最老但无关的对象，随后
    又淘汰真正受限对象的重复回收；

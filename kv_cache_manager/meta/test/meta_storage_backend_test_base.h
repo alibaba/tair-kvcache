@@ -27,6 +27,10 @@ public:
         out = keys;
         return EC_OK;
     }
+    ErrorCode SampleReclaimKeys(RequestContext *, int64_t, KeyVector &out) noexcept override {
+        out = keys;
+        return EC_OK;
+    }
     std::vector<ErrorCode> GetProperties(RequestContext *,
                                          const KeyVector &,
                                          const std::vector<std::string> &,

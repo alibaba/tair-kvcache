@@ -10,6 +10,7 @@
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 #include "kv_cache_manager/meta/mpsc_write_queue.h"
+#include "kv_cache_manager/meta/redis_reclaim_sampler.h"
 
 namespace kv_cache_manager {
 
@@ -113,6 +114,7 @@ private:
     std::string cache_key_prefix_;
     std::string metadata_key_;
     int64_t timeout_ms_ = 2000;
+    RedisReclaimSampler reclaim_sampler_;
 
     // Async config
     int32_t queue_count_ = 8;

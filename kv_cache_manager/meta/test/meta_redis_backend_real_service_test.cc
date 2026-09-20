@@ -1,4 +1,6 @@
+#include <set>
 #include <thread>
+#include <vector>
 
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -261,11 +263,19 @@ TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentMixedOperations) {
         thread.join();
     }
 
+    KeyTypeVec cleanup_keys;
+    cleanup_keys.reserve(COUNT * 2);
+    for (const auto &keys : keys_vec) {
+        cleanup_keys.insert(cleanup_keys.end(), keys.begin(), keys.end());
+    }
+    for (const ErrorCode ec : meta_redis_backend_->Delete(nullptr, cleanup_keys)) {
+        EXPECT_TRUE(ec == EC_OK || ec == EC_NOENT);
+    }
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
 
-TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentListAndRandomOperations) {
-    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("test_concurrent_list_random", meta_storage_backend_config_));
+TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentListAndReclaimSamplingOperations) {
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("test_concurrent_list_reclaim_sample", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
     auto MyKey = [](int64_t i) { return i; };
@@ -282,7 +292,7 @@ TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentListAndRandomOperations) {
     }
 
     std::atomic<int> operation_count{0};
-    auto list_random_task = [&, this]() {
+    auto list_sample_task = [&, this]() {
         int op_id = operation_count++;
         if (op_id % 2 == 0) {
             std::string next_cursor;
@@ -303,13 +313,81 @@ TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentListAndRandomOperations) {
     };
     std::vector<std::thread> threads;
     for (int i = 0; i < 20; ++i) {
-        threads.emplace_back(list_random_task);
+        threads.emplace_back(list_sample_task);
     }
     for (auto &thread : threads) {
         thread.join();
     }
 
+    KeyTypeVec cleanup_keys;
+    cleanup_keys.reserve(COUNT * 2);
+    for (int key = 0; key < COUNT * 2; ++key) {
+        cleanup_keys.push_back(key);
+    }
+    EXPECT_EQ(std::vector<ErrorCode>(cleanup_keys.size(), EC_OK), meta_redis_backend_->Delete(nullptr, cleanup_keys));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+TEST_F(MetaRedisBackendRealServiceTest, TestReclaimSamplingProgressesThroughSparseTenantKeyspace) {
+    MetaRedisBackend target_backend;
+    MetaRedisBackend noise_backend;
+    ASSERT_EQ(EC_OK, target_backend.Init("test_sparse_reclaim_target", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, noise_backend.Init("test_sparse_reclaim_noise", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, target_backend.Open());
+    ASSERT_EQ(EC_OK, noise_backend.Open());
+
+    constexpr int64_t NOISE_KEY_COUNT = 5000;
+    KeyTypeVec noise_keys;
+    noise_keys.reserve(NOISE_KEY_COUNT);
+    FieldMapVec noise_properties;
+    noise_properties.reserve(NOISE_KEY_COUNT);
+    for (int64_t key = 0; key < NOISE_KEY_COUNT; ++key) {
+        noise_keys.push_back(key);
+        noise_properties.push_back({{"value", std::to_string(key)}});
+    }
+    const KeyTypeVec target_keys{70001, 70002, 70003};
+    const FieldMapVec target_properties(target_keys.size(), FieldMap{{"value", "target"}});
+
+    noise_backend.Delete(nullptr, noise_keys);
+    target_backend.Delete(nullptr, target_keys);
+    ASSERT_EQ(std::vector<ErrorCode>(noise_keys.size(), EC_OK),
+              noise_backend.Put(nullptr, noise_keys, CacheLocationMapVector(noise_keys.size()), noise_properties));
+    ASSERT_EQ(std::vector<ErrorCode>(target_keys.size(), EC_OK),
+              target_backend.Put(nullptr, target_keys, CacheLocationMapVector(target_keys.size()), target_properties));
+
+    std::set<KeyType> sampled;
+    // A call examines at most 16 bounded SCAN pages. Repeated reclaim rounds
+    // retain the Redis cursor, so a sparse tenant still makes eventual
+    // progress without one round scanning the entire shared database.
+    for (int round = 0; round < 32 && sampled.size() < target_keys.size(); ++round) {
+        KeyTypeVec batch;
+        ASSERT_EQ(EC_OK, target_backend.SampleReclaimKeys(nullptr, target_keys.size(), batch));
+        sampled.insert(batch.begin(), batch.end());
+    }
+    EXPECT_EQ(std::set<KeyType>(target_keys.begin(), target_keys.end()), sampled);
+
+    EXPECT_EQ(std::vector<ErrorCode>(target_keys.size(), EC_OK), target_backend.Delete(nullptr, target_keys));
+    EXPECT_EQ(std::vector<ErrorCode>(noise_keys.size(), EC_OK), noise_backend.Delete(nullptr, noise_keys));
+    EXPECT_EQ(EC_OK, target_backend.Close());
+    EXPECT_EQ(EC_OK, noise_backend.Close());
+}
+
+TEST_F(MetaRedisBackendRealServiceTest, TestReclaimSamplingTreatsInstancePrefixAsLiteral) {
+    MetaRedisBackend backend;
+    ASSERT_EQ(EC_OK, backend.Init(R"(test_reclaim_[*?\])", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, backend.Open());
+
+    const KeyTypeVec keys{88001};
+    backend.Delete(nullptr, keys);
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+              backend.Put(nullptr, keys, CacheLocationMapVector(keys.size()), FieldMapVec{{{"value", "target"}}}));
+
+    KeyTypeVec sampled;
+    EXPECT_EQ(EC_OK, backend.SampleReclaimKeys(nullptr, 1, sampled));
+    EXPECT_EQ(keys, sampled);
+
+    EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, backend.Delete(nullptr, keys));
+    EXPECT_EQ(EC_OK, backend.Close());
 }
 
 TEST_F(MetaRedisBackendRealServiceTest, TestScanUntilBaseCursor) {

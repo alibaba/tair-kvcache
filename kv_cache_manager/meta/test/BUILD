@@ -186,6 +186,18 @@ cc_test(
 )
 
 cc_test(
+    name = "redis_reclaim_sampler_test",
+    srcs = [
+        "redis_reclaim_sampler_test.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/common/test:redis_client_testlib",
+        "//kv_cache_manager/meta:redis_reclaim_sampler",
+    ],
+)
+
+cc_test(
     name = "meta_storage_backend_manager_test",
     srcs = [
         "meta_storage_backend_manager_test.cc",
@@ -197,6 +209,7 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/meta:common",
+        "//kv_cache_manager/meta:meta_async_redis_backend",
         "//kv_cache_manager/meta:meta_dummy_backend",
         "//kv_cache_manager/meta:meta_local_backend",
         "//kv_cache_manager/meta:meta_redis_backend",

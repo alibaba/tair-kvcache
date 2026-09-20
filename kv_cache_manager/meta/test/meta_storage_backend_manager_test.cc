@@ -11,6 +11,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
+#include "kv_cache_manager/meta/meta_async_redis_backend.h"
 #include "kv_cache_manager/meta/meta_dummy_backend.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_redis_backend.h"
@@ -517,10 +518,10 @@ TEST_F(MetaStorageBackendManagerTest, TestSingleTaskReclaimSamplingTracksActualS
     MetaStorageBackendManager mgr;
     EXPECT_FALSE(mgr.PreferSingleTaskReclaimSampling());
     mgr.persistent_backend_ = std::make_unique<MetaRedisBackend>();
-    EXPECT_FALSE(mgr.PreferSingleTaskReclaimSampling());
+    EXPECT_TRUE(mgr.PreferSingleTaskReclaimSampling());
     mgr.cache_backend_ = std::make_unique<MetaLocalBackend>();
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
-    EXPECT_FALSE(mgr.PreferSingleTaskReclaimSampling());
+    EXPECT_TRUE(mgr.PreferSingleTaskReclaimSampling());
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
     EXPECT_TRUE(mgr.PreferSingleTaskReclaimSampling());
     class NonLocalCache : public MetaLocalBackend {
@@ -531,6 +532,12 @@ TEST_F(MetaStorageBackendManagerTest, TestSingleTaskReclaimSamplingTracksActualS
     mgr.cache_backend_.reset();
     mgr.persistent_backend_ = std::make_unique<MetaLocalBackend>();
     EXPECT_TRUE(mgr.PreferSingleTaskReclaimSampling());
+    mgr.persistent_backend_ = std::make_unique<MetaAsyncRedisBackend>();
+    EXPECT_TRUE(mgr.PreferSingleTaskReclaimSampling());
+    mgr.persistent_backend_ = std::make_unique<NonLocalCache>();
+    mgr.cache_backend_ = std::make_unique<MetaLocalBackend>();
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    EXPECT_FALSE(mgr.PreferSingleTaskReclaimSampling());
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesUsesHotCacheTimeDuringRecovery) {
