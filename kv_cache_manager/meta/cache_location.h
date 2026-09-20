@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -38,11 +39,19 @@ public:
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
         Put(writer, "name", name_);
         Put(writer, "uri", uri_);
+        if (checksum_present_) {
+            Put(writer, "checksum", checksum_);
+        }
     }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "name", name_, std::string(""));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "uri", uri_, std::string(""));
+        checksum_ = 0;
+        checksum_present_ = rapid_value.HasMember("checksum");
+        if (checksum_present_) {
+            KVCM_JSON_GET_MACRO(rapid_value, "checksum", checksum_);
+        }
         return true;
     }
 
@@ -51,13 +60,27 @@ public:
     void set_name_view(std::string_view name) { name_.assign(name.data(), name.size()); }
     void set_uri(const std::string &uri) { uri_ = uri; }
     void set_uri(std::string &&uri) noexcept { uri_ = std::move(uri); }
+    void set_checksum(int64_t checksum) {
+        checksum_ = checksum;
+        checksum_present_ = true;
+    }
+    void clear_checksum() {
+        checksum_ = 0;
+        checksum_present_ = false;
+    }
 
     inline const std::string &name() const { return name_; }
     inline const std::string &uri() const { return uri_; }
+    [[nodiscard]] int64_t checksum() const { return checksum_; }
+    [[nodiscard]] bool has_checksum() const { return checksum_present_; }
 
 private:
     std::string name_; // 对应LocationSpecInfo中的name
     std::string uri_;  // URI
+    // A spec is an independently stored TP/PP/attention payload, so its
+    // checksum cannot be shared by the enclosing CacheLocation.
+    int64_t checksum_ = 0;
+    bool checksum_present_ = false;
 };
 
 enum CacheLocationStatus : int32_t {
@@ -175,6 +198,27 @@ public:
     }
     [[nodiscard]] bool HasValidatedLocationSpecs() const noexcept {
         return validated_total_size_ != kUnknownValidatedTotalSize;
+    }
+    bool set_location_spec_checksum(std::string_view location_spec_name, int64_t checksum) {
+        const auto it = std::find_if(location_specs_.begin(),
+                                     location_specs_.end(),
+                                     [location_spec_name](const auto &s) { return s.name() == location_spec_name; });
+        if (it == location_specs_.end()) {
+            return false;
+        }
+        it->set_checksum(checksum);
+        return true;
+    }
+    bool set_location_spec_uri(std::string_view location_spec_name, const std::string &uri) {
+        const auto it = std::find_if(location_specs_.begin(),
+                                     location_specs_.end(),
+                                     [location_spec_name](const auto &s) { return s.name() == location_spec_name; });
+        if (it == location_specs_.end()) {
+            return false;
+        }
+        it->set_uri(uri);
+        validated_total_size_ = kUnknownValidatedTotalSize;
+        return true;
     }
 
     [[nodiscard]] const std::vector<LocationSpec> &location_specs() const { return location_specs_; }

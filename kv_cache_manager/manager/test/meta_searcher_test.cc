@@ -167,6 +167,12 @@ class RollbackFaultBackend : public MetaLocalBackend {
 public:
     void SetFailUpsert(bool fail_upsert) { fail_upsert_ = fail_upsert; }
     void SetFailSync(bool fail_sync) { fail_sync_ = fail_sync; }
+    void FailSyncCall(size_t call_index) { fail_sync_call_ = call_index; }
+    void ResetSyncCalls() {
+        sync_call_count_ = 0;
+        fail_sync_call_ = 0;
+    }
+    size_t SyncCallCount() const { return sync_call_count_; }
     void SetGetLocationsFailedKey(std::optional<KeyType> key) { get_locations_failed_key_ = key; }
 
     std::vector<ErrorCode> Upsert(RequestContext *request_context,
@@ -201,11 +207,16 @@ public:
         return results;
     }
 
-    bool Sync(const KeyTypeVec & /*keys*/) noexcept override { return !fail_sync_; }
+    bool Sync(const KeyTypeVec & /*keys*/) noexcept override {
+        ++sync_call_count_;
+        return !fail_sync_ && (fail_sync_call_ == 0 || sync_call_count_ != fail_sync_call_);
+    }
 
 private:
     bool fail_upsert_ = false;
     bool fail_sync_ = false;
+    size_t sync_call_count_ = 0;
+    size_t fail_sync_call_ = 0;
     std::optional<KeyType> get_locations_failed_key_;
 };
 
@@ -697,6 +708,14 @@ TEST_F(MetaSearcherTest, TestBatchMergeSingleSpecReplacementCachesValidatedTotal
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, make_tasks(17), per_key_ec));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> checksum_tasks{
+        {{location_id, CLS_SERVING, {{"tp0", 0}}}},
+    };
+    std::vector<std::vector<ErrorCode>> checksum_results;
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {key}, checksum_tasks, checksum_results));
+    ASSERT_TRUE(meta_indexer_->Sync({key}));
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, make_tasks(23), per_key_ec));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
@@ -709,6 +728,8 @@ TEST_F(MetaSearcherTest, TestBatchMergeSingleSpecReplacementCachesValidatedTotal
     ASSERT_NE(location_maps[0].end(), location_it);
     ASSERT_TRUE(location_it->second);
     ASSERT_EQ(1u, location_it->second->location_specs().size());
+    EXPECT_TRUE(location_it->second->location_specs()[0].has_checksum());
+    EXPECT_EQ(0, location_it->second->location_specs()[0].checksum());
     EXPECT_EQ("event_report://size-hint:8080/mem?size=23", location_it->second->location_specs()[0].uri());
     std::uint64_t total_size = 0;
     ASSERT_TRUE(location_it->second->GetValidatedTotalSize(total_size));
@@ -2010,6 +2031,7 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem?size=7")}},
     }};
+    replace_tasks[0][0].specs[0].set_checksum(0);
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
     EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
@@ -2033,6 +2055,9 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
     ASSERT_EQ(1u, location_maps.front().size());
     const auto &replaced_location = location_maps.front().at(location_id);
     EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, replaced_location->type());
+    ASSERT_EQ(1u, replaced_location->location_specs().size());
+    EXPECT_TRUE(replaced_location->location_specs()[0].has_checksum());
+    EXPECT_EQ(0, replaced_location->location_specs()[0].checksum());
     std::uint64_t validated_size = 0;
     ASSERT_TRUE(replaced_location->GetValidatedTotalSize(validated_size));
     EXPECT_EQ(7u, validated_size);
@@ -2380,6 +2405,9 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
           LocationSpec("linear_1", "event_report://127.0.0.1:8080/mem"),
           LocationSpec("full_3", "event_report://127.0.0.1:8080/mem")}},
     }};
+    merge_tasks[0][0].specs[0].set_checksum(101);
+    merge_tasks[0][0].specs[1].set_checksum(102);
+    merge_tasks[0][0].specs[2].set_checksum(103);
     std::vector<ErrorCode> per_key_ec;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
 
@@ -2398,10 +2426,14 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
     ASSERT_EQ(1u, location_maps.size());
     ASSERT_EQ(1u, location_maps[0].size());
     auto spec_names = std::set<std::string>();
+    auto spec_checksums = std::map<std::string, int64_t>();
     for (const auto &spec : location_maps[0].at(location_id)->location_specs()) {
         spec_names.insert(spec.name());
+        ASSERT_TRUE(spec.has_checksum());
+        spec_checksums.emplace(spec.name(), spec.checksum());
     }
     ASSERT_EQ((std::set<std::string>{"linear_1", "full_3"}), spec_names);
+    EXPECT_EQ((std::map<std::string, int64_t>{{"linear_1", 102}, {"full_3", 103}}), spec_checksums);
     EXPECT_EQ(2u, location_maps[0].at(location_id)->spec_size());
     EXPECT_TRUE(location_maps[0].at(location_id)->HasValidatedLocationSpecs());
 
@@ -3185,6 +3217,271 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatus) {
     EXPECT_EQ(ec, ErrorCode::EC_BADARGS);
 }
 
+// LocationUpdateTask 的 checksum 必须落到对应 LocationSpec，而不是整个 CacheLocation。
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusPersistsPerSpecChecksum) {
+    MetaSearcher::KeyVector keys = {7001, 7002};
+    auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
+    location_specs[0].set_name("tp0");
+    CacheLocationVector locations = {
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs),
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs),
+    };
+    std::vector<std::string> out_location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids));
+    ASSERT_EQ(out_location_ids.size(), keys.size());
+
+    constexpr int64_t kChecksumA = 0x1234567890ABCDEFLL;
+    constexpr int64_t kChecksumB = -42;
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks{
+        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, {{"tp0", kChecksumA}}}},
+        {MetaSearcher::LocationUpdateTask{out_location_ids[1], CLS_SERVING, {{"tp0", kChecksumB}}}},
+    };
+    std::vector<std::vector<ErrorCode>> out_batch_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, out_batch_results));
+
+    std::vector<CacheLocationMap> out_location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps));
+    ASSERT_EQ(out_location_maps.size(), 2u);
+    const auto &first_spec = out_location_maps[0].at(out_location_ids[0])->location_specs()[0];
+    const auto &second_spec = out_location_maps[1].at(out_location_ids[1])->location_specs()[0];
+    EXPECT_EQ(first_spec.checksum(), kChecksumA);
+    EXPECT_EQ(second_spec.checksum(), kChecksumB);
+    EXPECT_TRUE(first_spec.has_checksum());
+    EXPECT_TRUE(second_spec.has_checksum());
+}
+
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusWithoutChecksumPreservesExisting) {
+    MetaSearcher::KeyVector keys = {7100};
+    auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
+    location_specs[0].set_name("tp0");
+    CacheLocationVector locations = {
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs),
+    };
+    std::vector<std::string> out_location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids));
+    // Make the initial add visible before exercising the two update RMWs below.
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+
+    // 先写入一个 checksum
+    constexpr int64_t kInitial = 0xDEADBEEFLL;
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> first_tasks{
+        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, {{"tp0", kInitial}}}},
+    };
+    std::vector<std::vector<ErrorCode>> first_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, first_tasks, first_results));
+    // The test backend queues writes asynchronously. Drain the first update so
+    // the second RMW reads the checksum-bearing value whose preservation is
+    // under test.
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+
+    // 再用 has_checksum=false 调用，原 checksum 应保留。
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> second_tasks{
+        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING}},
+    };
+    std::vector<std::vector<ErrorCode>> second_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, second_tasks, second_results));
+
+    std::vector<CacheLocationMap> out_location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps));
+    const auto &stored_spec = out_location_maps[0].at(out_location_ids[0])->location_specs()[0];
+    EXPECT_EQ(stored_spec.checksum(), kInitial);
+    EXPECT_TRUE(stored_spec.has_checksum());
+}
+
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusPersistsZeroChecksum) {
+    MetaSearcher::KeyVector keys = {7101};
+    auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
+    location_specs[0].set_name("tp0");
+    CacheLocationVector locations = {
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs),
+    };
+    std::vector<std::string> out_location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids));
+
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks{
+        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, {{"tp0", 0}}}},
+    };
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, tasks, results));
+
+    std::vector<CacheLocationMap> out_location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps));
+    const auto &location = out_location_maps[0].at(out_location_ids[0]);
+    ASSERT_EQ(location->location_specs().size(), 1u);
+    EXPECT_TRUE(location->location_specs()[0].has_checksum());
+    EXPECT_EQ(location->location_specs()[0].checksum(), 0);
+}
+
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationPublishesUriChecksumAndStatusInOneRmw) {
+    const MetaSearcher::KeyVector keys = {7102};
+    const std::string original_uri = "pace://storage-host/100?media_type=1&node_id=2&range_id=3&size=64";
+    const std::string actual_uri = "pace://storage-host/200?media_type=1&node_id=4&range_id=5&size=64";
+    CacheLocationVector locations = {
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                                    1,
+                                                    {MetaSearcherTestHelper::CreateLocationSpec("tp0", original_uri)})};
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, location_ids));
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+
+    MetaSearcher::LocationUpdateTask task{location_ids[0], CLS_SERVING};
+    task.spec_checksums = {{"tp0", 0}};
+    task.spec_uris = {{"tp0", actual_uri}};
+    task.expected_status = CLS_WRITING;
+    std::vector<std::vector<ErrorCode>> results;
+    std::vector<std::vector<std::string>> post_images;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(
+                  request_context_.get(), keys, {{task}}, results, /*authoritative_persistence=*/false, &post_images));
+    ASSERT_EQ(1u, results.size());
+    ASSERT_EQ(1u, results[0].size());
+    ASSERT_EQ(EC_OK, results[0][0]);
+    ASSERT_EQ(1u, post_images.size());
+    ASSERT_EQ(1u, post_images[0].size());
+    ASSERT_FALSE(post_images[0][0].empty());
+
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, BlockMask{}, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    const auto &stored = location_maps[0].at(location_ids[0]);
+    ASSERT_EQ(CLS_SERVING, stored->status());
+    ASSERT_EQ(1u, stored->location_specs().size());
+    EXPECT_EQ(actual_uri, stored->location_specs()[0].uri());
+    EXPECT_TRUE(stored->location_specs()[0].has_checksum());
+    EXPECT_EQ(0, stored->location_specs()[0].checksum());
+    EXPECT_EQ(stored->ToJsonString(), post_images[0][0]);
+}
+
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationRejectsUnsafeUriWithoutChangingTuple) {
+    const MetaSearcher::KeyVector keys = {7103};
+    const std::string original_uri = "pace://storage-host/100?media_type=1&node_id=2&range_id=3&size=64";
+    const std::vector<std::string> unsafe_uris = {
+        "pace://other-host/200?media_type=1&node_id=4&range_id=5&size=64",
+        "pace://storage-host/200?media_type=1&node_id=4&range_id=5&size=65",
+        "pace://storage-host/200?media_type=2&node_id=4&range_id=5&size=64",
+        "file://storage-host/200?media_type=1&node_id=4&range_id=5&size=64",
+        "pace://storage-host/not-a-number?media_type=1&node_id=4&range_id=5&size=64",
+        "pace://storage-host/200?media_type=1&range_id=5&size=64",
+        "pace://storage-host/200?media_type=1&node_id=70000&range_id=5&size=64",
+        "pace://storage-host/200?injected=1&media_type=1&node_id=4&range_id=5&size=64",
+    };
+    CacheLocationVector locations = {
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                                    1,
+                                                    {MetaSearcherTestHelper::CreateLocationSpec("tp0", original_uri)})};
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, location_ids));
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+
+    MetaSearcher::LocationUpdateTask task{location_ids[0], CLS_SERVING};
+    task.spec_checksums = {{"tp0", 0x1234}};
+    task.spec_uris = {{"tp0", unsafe_uris[0]}};
+    task.expected_status = CLS_WRITING;
+    for (const auto &unsafe_uri : unsafe_uris) {
+        SCOPED_TRACE(unsafe_uri);
+        task.spec_uris[0].uri = unsafe_uri;
+        std::vector<std::vector<ErrorCode>> results;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, {{task}}, results));
+        ASSERT_EQ(1u, results.size());
+        ASSERT_EQ(1u, results[0].size());
+        EXPECT_EQ(EC_MISMATCH, results[0][0]);
+    }
+    task.spec_uris[0] = {"unknown-spec", "pace://storage-host/200?media_type=1&node_id=4&range_id=5&size=64"};
+    std::vector<std::vector<ErrorCode>> missing_spec_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, {{task}}, missing_spec_results));
+    ASSERT_EQ(1u, missing_spec_results.size());
+    ASSERT_EQ(1u, missing_spec_results[0].size());
+    EXPECT_EQ(EC_MISMATCH, missing_spec_results[0][0]);
+
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, BlockMask{}, location_maps));
+    const auto &stored = location_maps[0].at(location_ids[0]);
+    EXPECT_EQ(CLS_WRITING, stored->status());
+    ASSERT_EQ(1u, stored->location_specs().size());
+    EXPECT_EQ(original_uri, stored->location_specs()[0].uri());
+    EXPECT_FALSE(stored->location_specs()[0].has_checksum());
+}
+
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationRejectsNonPaceRedirectButAcceptsExactUri) {
+    const MetaSearcher::KeyVector keys = {7105};
+    const std::string original_uri = "file://storage-host/tmp/original?size=64";
+    CacheLocationVector locations = {MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, {MetaSearcherTestHelper::CreateLocationSpec("tp0", original_uri)})};
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, location_ids));
+
+    MetaSearcher::LocationUpdateTask task{location_ids[0], CLS_SERVING};
+    task.expected_status = CLS_WRITING;
+    task.spec_checksums = {{"tp0", 17}};
+    task.spec_uris = {{"tp0", "file://storage-host/tmp/other-object?size=64"}};
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, {{task}}, results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), results);
+
+    task.spec_uris = {{"tp0", original_uri}};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, {{task}}, results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, BlockMask{}, location_maps));
+    const auto &stored = location_maps[0].at(location_ids[0]);
+    EXPECT_EQ(CLS_SERVING, stored->status());
+    ASSERT_EQ(1u, stored->location_specs().size());
+    EXPECT_EQ(original_uri, stored->location_specs()[0].uri());
+    EXPECT_TRUE(stored->location_specs()[0].has_checksum());
+    EXPECT_EQ(17, stored->location_specs()[0].checksum());
+}
+
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationExpectedStatusFencesWholeTuple) {
+    const MetaSearcher::KeyVector keys = {7104};
+    const std::string original_uri = "file://storage-host/tmp/original?media_type=1&size=64";
+    const std::string actual_uri = "file://storage-host/tmp/allocated?media_type=1&size=64";
+    CacheLocationVector locations = {MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, {MetaSearcherTestHelper::CreateLocationSpec("tp0", original_uri)})};
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, location_ids));
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+
+    std::vector<std::vector<ErrorCode>> transition_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(
+                  request_context_.get(), keys, {{{location_ids[0], CLS_DELETING}}}, transition_results));
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+
+    MetaSearcher::LocationUpdateTask stale_finish{location_ids[0], CLS_SERVING};
+    stale_finish.spec_checksums = {{"tp0", -7}};
+    stale_finish.spec_uris = {{"tp0", actual_uri}};
+    stale_finish.expected_status = CLS_WRITING;
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, {{stale_finish}}, results));
+    ASSERT_EQ(1u, results.size());
+    ASSERT_EQ(1u, results[0].size());
+    EXPECT_EQ(EC_MISMATCH, results[0][0]);
+
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, BlockMask{}, location_maps));
+    const auto &stored = location_maps[0].at(location_ids[0]);
+    EXPECT_EQ(CLS_DELETING, stored->status());
+    ASSERT_EQ(1u, stored->location_specs().size());
+    EXPECT_EQ(original_uri, stored->location_specs()[0].uri());
+    EXPECT_FALSE(stored->location_specs()[0].has_checksum());
+}
+
 TEST_F(MetaSearcherTest, TestBlockKeyWithMultipleLocations) {
     // 准备测试数据 - 使用相同的key添加多个location
     MetaSearcher::KeyVector keys = {12345}; // 只使用一个key
@@ -3798,6 +4095,168 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatusChecksExactLocationValue) {
     ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
 }
 
+TEST_F(MetaSearcherTest, TestAuthoritativeBatchCASUsesPreAndPostPersistenceBarriers) {
+    auto *backend = ReplaceWithRollbackFaultBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 151;
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), {key}, {location}, location_ids));
+    ASSERT_EQ(1u, location_ids.size());
+
+    backend->ResetSyncCalls();
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchCASLocationStatus(request_context_.get(),
+                                                     {key},
+                                                     {{{location_ids[0], CLS_WRITING, CLS_DELETING}}},
+                                                     results,
+                                                     /*refresh_cache_from_persistent=*/true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+    EXPECT_EQ(2u, backend->SyncCallCount());
+
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, BlockMask{}, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_EQ(CLS_DELETING, location_maps[0].at(location_ids[0])->status());
+}
+
+TEST_F(MetaSearcherTest, TestAuthoritativeBatchCASFailsClosedWhenPreSyncFails) {
+    auto *backend = ReplaceWithRollbackFaultBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 152;
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), {key}, {location}, location_ids));
+
+    backend->ResetSyncCalls();
+    backend->SetFailSync(true);
+    std::vector<std::vector<ErrorCode>> results;
+    EXPECT_EQ(EC_ERROR,
+              meta_searcher_->BatchCASLocationStatus(request_context_.get(),
+                                                     {key},
+                                                     {{{location_ids[0], CLS_WRITING, CLS_DELETING}}},
+                                                     results,
+                                                     /*refresh_cache_from_persistent=*/true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_TIMEOUT}}), results);
+    EXPECT_EQ(3u, backend->SyncCallCount());
+
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, BlockMask{}, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_EQ(CLS_WRITING, location_maps[0].at(location_ids[0])->status());
+}
+
+TEST_F(MetaSearcherTest, TestAuthoritativeBatchCASRetriesTransientPreSyncFailure) {
+    auto *backend = ReplaceWithRollbackFaultBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 154;
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), {key}, {location}, location_ids));
+
+    backend->ResetSyncCalls();
+    backend->FailSyncCall(1);
+    std::vector<std::vector<ErrorCode>> results;
+    EXPECT_EQ(EC_OK,
+              meta_searcher_->BatchCASLocationStatus(request_context_.get(),
+                                                     {key},
+                                                     {{{location_ids[0], CLS_WRITING, CLS_DELETING}}},
+                                                     results,
+                                                     /*refresh_cache_from_persistent=*/true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+    EXPECT_EQ(3u, backend->SyncCallCount());
+
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, BlockMask{}, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_EQ(CLS_DELETING, location_maps[0].at(location_ids[0])->status());
+}
+
+TEST_F(MetaSearcherTest, TestAuthoritativeBatchCASFailsClosedWhenPostSyncFails) {
+    auto *backend = ReplaceWithRollbackFaultBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 153;
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), {key}, {location}, location_ids));
+
+    backend->ResetSyncCalls();
+    backend->FailSyncCall(2);
+    std::vector<std::vector<ErrorCode>> results;
+    EXPECT_EQ(EC_ERROR,
+              meta_searcher_->BatchCASLocationStatus(request_context_.get(),
+                                                     {key},
+                                                     {{{location_ids[0], CLS_WRITING, CLS_DELETING}}},
+                                                     results,
+                                                     /*refresh_cache_from_persistent=*/true));
+    // The in-memory CAS was accepted, but its persistence outcome is unknown;
+    // aggregate EC_ERROR is what keeps the FinishWrite caller fail closed.
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+    EXPECT_EQ(2u, backend->SyncCallCount());
+
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, BlockMask{}, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_EQ(CLS_DELETING, location_maps[0].at(location_ids[0])->status());
+}
+
+TEST_F(MetaSearcherTest, TestAuthoritativeCleanupPublishesActualUriOnlyAsDeleting) {
+    auto *backend = ReplaceWithRollbackFaultBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 155;
+    const std::string original_uri = "pace://storage-host/100?media_type=1&node_id=2&range_id=3&size=64";
+    const std::string actual_uri = "pace://storage-host/200?media_type=1&node_id=4&range_id=5&size=64";
+    auto location =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                                    1,
+                                                    {MetaSearcherTestHelper::CreateLocationSpec("tp0", original_uri)});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), {key}, {location}, location_ids));
+
+    MetaSearcher::LocationUpdateTask task{location_ids[0], CLS_DELETING};
+    task.spec_uris = {{"tp0", actual_uri}};
+    task.allowed_current_statuses = {CLS_WRITING, CLS_SERVING, CLS_DELETING};
+    backend->ResetSyncCalls();
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(),
+                                                        {key},
+                                                        {{task}},
+                                                        results,
+                                                        /*authoritative_persistence=*/true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+    EXPECT_EQ(2u, backend->SyncCallCount());
+
+    std::vector<CacheLocationMap> location_maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, BlockMask{}, location_maps));
+    const auto &stored = location_maps[0].at(location_ids[0]);
+    EXPECT_EQ(CLS_DELETING, stored->status());
+    ASSERT_EQ(1u, stored->location_specs().size());
+    EXPECT_EQ(actual_uri, stored->location_specs()[0].uri());
+
+    task.spec_uris = {{"tp0", "pace://storage-host/300?media_type=1&node_id=6&range_id=7&size=64"}};
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {key}, {{task}}, results));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), results);
+    location_maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, BlockMask{}, location_maps));
+    EXPECT_EQ(actual_uri, location_maps[0].at(location_ids[0])->location_specs()[0].uri());
+}
+
 TEST_F(MetaSearcherTest, TestBatchCADLocationStatus) {
     // 准备测试数据
     MetaSearcher::KeyVector keys = {400, 500, 600};
@@ -4289,6 +4748,90 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
         EXPECT_EQ(loc->location_specs()[0].name(), "tp0");
         EXPECT_EQ(loc->type(), DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
     }
+}
+
+// Specs merged from distinct locations keep their own independent checksum.
+TEST_F(MetaSearcherTest, TestBatchGetBestLocationPreservesPerSpecChecksums) {
+    MetaSearcher::KeyVector keys = {61000};
+    std::vector<LocationSpec> specs_a = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "nfs:///a/tp0")};
+    std::vector<LocationSpec> specs_b = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "nfs:///b/tp1")};
+    CacheLocationConstPtr loc_a =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_a);
+    CacheLocationConstPtr loc_b =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_b);
+
+    constexpr int64_t kTp0Checksum = 0x0123456789ABCDEFLL;
+    constexpr int64_t kTp1Checksum = -17;
+
+    std::vector<std::string> out_ids_a;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, {loc_a}, out_ids_a));
+    std::vector<std::string> out_ids_b;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, {loc_b}, out_ids_b));
+
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks{
+        {{out_ids_a[0], CLS_SERVING, {{"tp0", kTp0Checksum}}}, {out_ids_b[0], CLS_SERVING, {{"tp1", kTp1Checksum}}}},
+    };
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, tasks, results));
+
+    CacheLocationVector out_locations;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetBestLocation(request_context_.get(), keys, out_locations, &policy_));
+    ASSERT_EQ(out_locations.size(), 1u);
+    ASSERT_EQ(out_locations[0]->location_specs().size(), 2u); // both merged
+    EXPECT_EQ(out_locations[0]->location_specs()[0].name(), "tp0");
+    EXPECT_EQ(out_locations[0]->location_specs()[0].checksum(), kTp0Checksum);
+    EXPECT_TRUE(out_locations[0]->location_specs()[0].has_checksum());
+    EXPECT_EQ(out_locations[0]->location_specs()[1].name(), "tp1");
+    EXPECT_EQ(out_locations[0]->location_specs()[1].checksum(), kTp1Checksum);
+    EXPECT_TRUE(out_locations[0]->location_specs()[1].has_checksum());
+}
+
+TEST_F(MetaSearcherTest, TestBatchGetBestLocationByBackendPreservesPerSpecChecksums) {
+    MetaSearcher::KeyVector keys = {61100};
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> upserts = {
+        {
+            {"kvs#event_report_l2#mem#peer_a:8080",
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CLS_SERVING,
+             {
+                 LocationSpec("tp0", "event_report://peer_a:8080/tp0"),
+                 LocationSpec("tp1", "event_report://peer_a:8080/tp1"),
+             }},
+        },
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, upserts, per_key_ec));
+
+    // Attach distinct checksums to both specs via the update path.
+    std::vector<CacheLocationMap> loc_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, empty_mask, loc_maps));
+    ASSERT_EQ(loc_maps.size(), 1u);
+    ASSERT_EQ(loc_maps[0].size(), 1u);
+    constexpr int64_t kTp0Checksum = 0x77AA55BB11CC33DDLL;
+    constexpr int64_t kTp1Checksum = -99;
+    std::vector<MetaSearcher::LocationUpdateTask> per_key_tasks;
+    for (const auto &[id, _loc] : loc_maps[0]) {
+        per_key_tasks.push_back({id, CLS_SERVING, {{"tp0", kTp0Checksum}, {"tp1", kTp1Checksum}}});
+    }
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> update_tasks{per_key_tasks};
+    std::vector<std::vector<ErrorCode>> update_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, update_tasks, update_results));
+
+    std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors));
+    ASSERT_EQ(out.size(), 1u);
+    ASSERT_FALSE(out[0].empty());
+    ASSERT_EQ(out[0].front()->location_specs().size(), 2u);
+    EXPECT_EQ(out[0].front()->location_specs()[0].checksum(), kTp0Checksum);
+    EXPECT_TRUE(out[0].front()->location_specs()[0].has_checksum());
+    EXPECT_EQ(out[0].front()->location_specs()[1].checksum(), kTp1Checksum);
+    EXPECT_TRUE(out[0].front()->location_specs()[1].has_checksum());
 }
 
 // ============================================================

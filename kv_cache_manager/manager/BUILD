@@ -31,6 +31,7 @@ cc_library(
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/event:event_publisher",
+        "//kv_cache_manager/metrics:delete_cleanup_observer",
         "//kv_cache_manager/metrics:metrics_collector",
         "//kv_cache_manager/metrics:metrics_lifecycle",
         "//kv_cache_manager/metrics:metrics_registry",
@@ -147,6 +148,7 @@ cc_library(
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/manager:meta_searcher",
         "//kv_cache_manager/meta",
+        "//kv_cache_manager/metrics:delete_cleanup_observer",
         "//kv_cache_manager/metrics:metrics_registry",
     ],
 )

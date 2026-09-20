@@ -407,7 +407,8 @@ public:
                                                 const std::string &hot_storage,
                                                 bool write_file,
                                                 const std::string &content,
-                                                int64_t create_time = 0) {
+                                                int64_t create_time = 0,
+                                                std::optional<int64_t> checksum = std::nullopt) {
         auto rc = std::make_shared<RequestContext>("create_source");
         std::string key = instance_id + "/TP0/" + StringUtil::Uint64ToHex(block_key);
         auto results = data_storage_manager_->Create(rc.get(), hot_storage, {key}, content.size(), nullptr);
@@ -431,6 +432,9 @@ public:
         if (create_time != 0) {
             loc->set_create_time(create_time);
         }
+        if (checksum.has_value()) {
+            EXPECT_TRUE(loc->set_location_spec_checksum("TP0", *checksum));
+        }
         std::vector<std::string> ids;
         EXPECT_EQ(
             ErrorCode::EC_OK, BatchAddLocationForTest(&meta_searcher, rc.get(), {block_key}, {loc}, ids));
@@ -448,8 +452,10 @@ public:
                                      const std::string &hot_storage,
                                      bool write_file,
                                      const std::string &content,
-                                     int64_t create_time = 0) {
-        return CreateSourceLocationForInstance(kInstance, block_key, hot_storage, write_file, content, create_time);
+                                     int64_t create_time = 0,
+                                     std::optional<int64_t> checksum = std::nullopt) {
+        return CreateSourceLocationForInstance(
+            kInstance, block_key, hot_storage, write_file, content, create_time, checksum);
     }
 
     // 查询某 block_key 下某 location_id 的状态，不存在返回 CLS_NOT_FOUND。
@@ -1066,6 +1072,48 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessDeleteSource) {
     auto stats = mgr.GetStats();
     ASSERT_EQ(1u, stats.copy_submitted);
     ASSERT_EQ(1u, stats.copy_completed);
+}
+
+TEST_F(MigrationManagerTest, TestMigrationPreservesZeroChecksumPresence) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "checksum_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "checksum_cold/"));
+
+    const int64_t block_key = 101;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "checksum-data", 0, int64_t{0});
+    const auto source = GetLocation(block_key, src_loc);
+    ASSERT_NE(nullptr, source);
+    ASSERT_EQ(1u, source->location_specs().size());
+    ASSERT_TRUE(source->location_specs()[0].has_checksum());
+    ASSERT_EQ(0, source->location_specs()[0].checksum());
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    req.retention = MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH;
+
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("checksum_migration", req));
+    const std::string dst_loc = mgr.GetActiveTaskDstLocation(kInstance, block_key);
+    ASSERT_FALSE(dst_loc.empty());
+
+    const auto writing_destination = GetLocation(block_key, dst_loc);
+    ASSERT_NE(nullptr, writing_destination);
+    ASSERT_EQ(1u, writing_destination->location_specs().size());
+    EXPECT_TRUE(writing_destination->location_specs()[0].has_checksum());
+    EXPECT_EQ(0, writing_destination->location_specs()[0].checksum());
+
+    mgr.OnTaskSuccess(kInstance, block_key);
+    const auto serving_destination = GetLocation(block_key, dst_loc);
+    ASSERT_NE(nullptr, serving_destination);
+    EXPECT_EQ(CLS_SERVING, serving_destination->status());
+    ASSERT_EQ(1u, serving_destination->location_specs().size());
+    EXPECT_TRUE(serving_destination->location_specs()[0].has_checksum());
+    EXPECT_EQ(0, serving_destination->location_specs()[0].checksum());
 }
 
 // Copy 只允许消费与自身 destination 一致的 mark。写往 cold_02 的 Copy

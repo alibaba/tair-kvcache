@@ -19,6 +19,7 @@
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/metrics/delete_cleanup_observer.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
@@ -35,6 +36,14 @@ PlanExecuteResult MakeErrorResult(ErrorCode error_code, std::string error_messag
         .status = error_code,
         .error_message = std::move(error_message),
     };
+}
+
+std::uint64_t CountLocationTargets(const CacheLocationDelRequest &request) {
+    std::uint64_t count = 0;
+    for (const auto &ids : request.location_ids) {
+        count += static_cast<std::uint64_t>(ids.size());
+    }
+    return count;
 }
 
 template <typename ResultType, typename... Args>
@@ -105,6 +114,7 @@ SchedulePlanExecutor::SchedulePlanExecutor(unsigned int thread_count,
     REGISTER_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(executing_task_count);
     REGISTER_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_migration_task_count);
     REGISTER_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(executing_migration_task_count);
+    InitializeDeleteCleanupMetrics(metrics_registry_);
 
     if (thread_count == 0)
         thread_count = 1;
@@ -271,11 +281,24 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
     PlanExecuteResult result;
     result.status = ErrorCode::EC_OK;
 
-    if (task.block_keys.size() != task.location_ids.size()) {
+    if (task.block_keys.size() != task.location_ids.size() ||
+        (!task.expected_location_values.empty() && task.block_keys.size() != task.expected_location_values.size())) {
         return MakeErrorResult(ErrorCode::EC_BADARGS,
-                               StringUtil::FormatString("block_keys size %zu != location_ids size %zu",
+                               StringUtil::FormatString("delete request shape mismatch: block_keys[%zu], "
+                                                        "location_ids[%zu], expected_values[%zu]",
                                                         task.block_keys.size(),
-                                                        task.location_ids.size()));
+                                                        task.location_ids.size(),
+                                                        task.expected_location_values.size()));
+    }
+    for (size_t i = 0; i < task.location_ids.size(); ++i) {
+        if (!task.expected_location_values.empty() &&
+            task.location_ids[i].size() != task.expected_location_values[i].size()) {
+            return MakeErrorResult(ErrorCode::EC_BADARGS,
+                                   StringUtil::FormatString("location_ids[%zu] size %zu != expected_values size %zu",
+                                                            i,
+                                                            task.location_ids[i].size(),
+                                                            task.expected_location_values[i].size()));
+        }
     }
 
     std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(task.instance_id);
@@ -288,7 +311,18 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
     std::vector<CacheLocationMap> location_maps;
     BlockMask empty_mask;
     auto ctx = std::make_shared<RequestContext>("schedule_plan_executor_call");
-    ErrorCode get_locations_ec = meta_searcher.BatchGetLocation(ctx.get(), task.block_keys, empty_mask, location_maps);
+    ErrorCode get_locations_ec = EC_OK;
+    if (task.pre_fenced_deleting) {
+        const auto get_result = indexer->GetLocationsFromPersistent(ctx.get(), task.block_keys, location_maps);
+        if (get_result.error_codes.size() != task.block_keys.size() ||
+            std::any_of(get_result.error_codes.begin(), get_result.error_codes.end(), [](ErrorCode ec) {
+                return ec != EC_OK && ec != EC_NOENT;
+            })) {
+            get_locations_ec = EC_ERROR;
+        }
+    } else {
+        get_locations_ec = meta_searcher.BatchGetLocation(ctx.get(), task.block_keys, empty_mask, location_maps);
+    }
     if (get_locations_ec != ErrorCode::EC_OK) {
         return MakeErrorResult(ErrorCode::EC_ERROR,
                                StringUtil::FormatString("Failed to get block locations, ec: %d", get_locations_ec));
@@ -300,19 +334,23 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
                                                         task.block_keys.size()));
     }
 
-    std::vector<int64_t> block_keys_to_delete;
-    std::vector<std::vector<MetaSearcher::LocationCADTask>> batch_cad_tasks;
-    size_t total_locations_to_delete = 0;
-
-    std::map<std::string, std::vector<DataStorageUri>> delete_uris_by_unique_name;
+    struct LocationDeleteCandidate {
+        size_t request_index{0};
+        std::string location_id;
+        std::string expected_location_value;
+        bool storage_delete_ok{true};
+    };
+    struct StorageDeleteBatch {
+        std::vector<DataStorageUri> uris;
+        std::vector<size_t> candidate_indices;
+    };
+    std::vector<LocationDeleteCandidate> candidates;
+    std::map<std::string, StorageDeleteBatch> delete_batches_by_unique_name;
     for (size_t i = 0; i < task.block_keys.size(); i++) {
-        auto &block_key = task.block_keys[i];
         auto &location_map = location_maps[i];
         auto &need_delete_location_ids = task.location_ids[i];
-
-        std::vector<MetaSearcher::LocationCADTask> cad_tasks;
-
-        for (auto &location_id : need_delete_location_ids) {
+        for (size_t location_index = 0; location_index < need_delete_location_ids.size(); ++location_index) {
+            const auto &location_id = need_delete_location_ids[location_index];
             auto iter = location_map.find(location_id);
             if (iter == location_map.end() || !iter->second) {
                 continue;
@@ -320,35 +358,49 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             if (iter->second->status() != CacheLocationStatus::CLS_DELETING) {
                 continue;
             }
+            if (!task.expected_location_values.empty() &&
+                iter->second->ToJsonString() != task.expected_location_values[i][location_index]) {
+                continue;
+            }
+            const size_t candidate_index = candidates.size();
+            candidates.push_back({.request_index = i,
+                                  .location_id = iter->first,
+                                  .expected_location_value = iter->second->ToJsonString()});
             if (!task.metadata_only) {
                 for (const auto &loc_spec : iter->second->location_specs()) {
                     DataStorageUri uri(loc_spec.uri());
-                    if (uri.Valid()) {
-                        if (!task.confirmed_missing_uris.empty() &&
-                            task.confirmed_missing_uris.find(uri.ToUriString()) != task.confirmed_missing_uris.end()) {
-                            continue;
+                    if (!uri.Valid()) {
+                        candidates[candidate_index].storage_delete_ok = false;
+                        result.status = ErrorCode::EC_PARTIAL_OK;
+                        const std::string failure_message = StringUtil::FormatString(
+                            "invalid storage URI prevents location cleanup, instance[%s] key[%ld] location[%s]",
+                            task.instance_id.c_str(),
+                            task.block_keys[i],
+                            iter->first.c_str());
+                        if (result.error_message.empty()) {
+                            result.error_message = failure_message;
                         }
-                        std::string storage_unique_name = uri.GetHostName();
-                        delete_uris_by_unique_name[storage_unique_name].emplace_back(uri);
+                        KVCM_LOG_WARN("%s", failure_message.c_str());
+                        continue;
                     }
+                    if (!task.confirmed_missing_uris.empty() &&
+                        task.confirmed_missing_uris.find(uri.ToUriString()) != task.confirmed_missing_uris.end()) {
+                        continue;
+                    }
+                    auto &batch = delete_batches_by_unique_name[uri.GetHostName()];
+                    batch.uris.emplace_back(std::move(uri));
+                    batch.candidate_indices.push_back(candidate_index);
                 }
             }
-            cad_tasks.push_back({iter->first, CacheLocationStatus::CLS_DELETING});
-        }
-        if (!cad_tasks.empty()) {
-            block_keys_to_delete.push_back(block_key);
-            total_locations_to_delete += cad_tasks.size();
-            batch_cad_tasks.emplace_back(std::move(cad_tasks));
         }
     }
 
-    KVCM_LOG_DEBUG("Found %zu meta location(s) to delete", total_locations_to_delete);
+    KVCM_LOG_DEBUG("Found %zu meta location(s) to delete", candidates.size());
 
     // delete storage uris
     auto request_context = std::make_shared<RequestContext>("location_del_task_trace");
-    for (const auto &storage_uris_pair : delete_uris_by_unique_name) {
-        const std::string &storage_unique_name = storage_uris_pair.first;
-        const std::vector<DataStorageUri> &storage_uris = storage_uris_pair.second;
+    for (const auto &[storage_unique_name, batch] : delete_batches_by_unique_name) {
+        const auto &storage_uris = batch.uris;
         KVCM_LOG_DEBUG("Deleting %zu entries from storage: %s", storage_uris.size(), storage_unique_name.c_str());
         std::vector<ErrorCode> delete_results =
             data_storage_manager_->Delete(request_context.get(), storage_unique_name, storage_uris, nullptr);
@@ -361,44 +413,85 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
                                          task.instance_id.c_str(),
                                          storage_unique_name.c_str());
             KVCM_LOG_WARN("%s", result.error_message.c_str());
+            for (const size_t candidate_index : batch.candidate_indices) {
+                candidates[candidate_index].storage_delete_ok = false;
+            }
         }
         const auto result_count = std::min(delete_results.size(), storage_uris.size());
-        size_t failed_count = 0;
-        size_t first_failed_index = 0;
+        size_t failed_count = storage_uris.size() - result_count;
+        size_t first_failed_index = result_count < storage_uris.size() ? result_count : storage_uris.size();
         for (size_t i = 0; i < result_count; ++i) {
             if (delete_results[i] != ErrorCode::EC_OK && delete_results[i] != ErrorCode::EC_NOENT) {
-                if (failed_count == 0) {
+                if (first_failed_index == storage_uris.size()) {
                     first_failed_index = i;
                 }
                 ++failed_count;
-                KVCM_LOG_WARN("storage delete failed, instance[%s] storage[%s] uri[%s] ec[%d]",
+                const auto &candidate = candidates[batch.candidate_indices[i]];
+                KVCM_LOG_WARN("storage delete failed, instance[%s] storage[%s] key[%ld] location[%s] item[%zu] ec[%d]",
                               task.instance_id.c_str(),
                               storage_unique_name.c_str(),
-                              storage_uris[i].ToUriString().c_str(),
+                              task.block_keys[candidate.request_index],
+                              candidate.location_id.c_str(),
+                              i,
                               static_cast<int>(delete_results[i]));
+                candidates[batch.candidate_indices[i]].storage_delete_ok = false;
             }
+        }
+        for (size_t i = result_count; i < storage_uris.size(); ++i) {
+            candidates[batch.candidate_indices[i]].storage_delete_ok = false;
         }
         if (failed_count > 0) {
             result.status = ErrorCode::EC_PARTIAL_OK;
+            const bool has_returned_failure = first_failed_index < result_count;
+            const auto &first_failed_candidate = candidates[batch.candidate_indices[first_failed_index]];
             const std::string failure_message = StringUtil::FormatString(
-                "storage delete failed, instance[%s] storage[%s] failed[%zu] total[%zu] first_uri[%s] first_ec[%d]",
+                "storage delete failed, instance[%s] storage[%s] failed[%zu] total[%zu] first_key[%ld] "
+                "first_location[%s] first_item[%zu] first_ec[%d]",
                 task.instance_id.c_str(),
                 storage_unique_name.c_str(),
                 failed_count,
                 storage_uris.size(),
-                storage_uris[first_failed_index].ToUriString().c_str(),
-                static_cast<int>(delete_results[first_failed_index]));
+                task.block_keys[first_failed_candidate.request_index],
+                first_failed_candidate.location_id.c_str(),
+                first_failed_index,
+                has_returned_failure ? static_cast<int>(delete_results[first_failed_index])
+                                     : static_cast<int>(ErrorCode::EC_ERROR));
             if (result.error_message.empty()) {
                 result.error_message = failure_message;
             }
         }
     }
 
+    const auto physical_delete_failure_count = static_cast<std::uint64_t>(std::count_if(
+        candidates.begin(), candidates.end(), [](const auto &candidate) { return !candidate.storage_delete_ok; }));
+    RecordDeleteCleanupPermanentFailure(
+        metrics_registry_, DeleteCleanupFailureStage::kPhysicalDelete, physical_delete_failure_count);
+
+    // Retain a DELETING metadata reference whenever any URI for the Location
+    // failed or returned an ambiguous result. Dropping metadata here would
+    // hide the leak; automatic retries are unsafe until the backend supports
+    // a lease or conditional delete that prevents deleting a reused URI.
+    std::vector<std::vector<MetaSearcher::LocationCADTask>> cad_tasks_by_request(task.block_keys.size());
+    for (const auto &candidate : candidates) {
+        if (candidate.storage_delete_ok) {
+            cad_tasks_by_request[candidate.request_index].push_back(
+                {candidate.location_id, CacheLocationStatus::CLS_DELETING, candidate.expected_location_value});
+        }
+    }
+    std::vector<int64_t> block_keys_to_delete;
+    std::vector<std::vector<MetaSearcher::LocationCADTask>> batch_cad_tasks;
+    for (size_t i = 0; i < cad_tasks_by_request.size(); ++i) {
+        if (!cad_tasks_by_request[i].empty()) {
+            block_keys_to_delete.push_back(task.block_keys[i]);
+            batch_cad_tasks.push_back(std::move(cad_tasks_by_request[i]));
+        }
+    }
+
     // delete locations
     if (!batch_cad_tasks.empty()) {
         std::vector<std::vector<ErrorCode>> delete_meta_results;
-        ErrorCode delete_meta_ec =
-            meta_searcher.BatchCADLocationStatus(ctx.get(), block_keys_to_delete, batch_cad_tasks, delete_meta_results);
+        ErrorCode delete_meta_ec = meta_searcher.BatchCADLocationStatus(
+            ctx.get(), block_keys_to_delete, batch_cad_tasks, delete_meta_results, task.pre_fenced_deleting);
         if (delete_meta_ec != ErrorCode::EC_OK || delete_meta_results.size() != batch_cad_tasks.size()) {
             result.status = ErrorCode::EC_PARTIAL_OK;
             result.error_message =
@@ -409,6 +502,28 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
                                          batch_cad_tasks.size());
             KVCM_LOG_WARN("%s", result.error_message.c_str());
         }
+        std::uint64_t cad_failure_count = 0;
+        if (delete_meta_ec != ErrorCode::EC_OK) {
+            for (const auto &tasks : batch_cad_tasks) {
+                cad_failure_count += static_cast<std::uint64_t>(tasks.size());
+            }
+        } else {
+            for (size_t block_key_idx = 0; block_key_idx < batch_cad_tasks.size(); ++block_key_idx) {
+                if (block_key_idx >= delete_meta_results.size()) {
+                    cad_failure_count += static_cast<std::uint64_t>(batch_cad_tasks[block_key_idx].size());
+                    continue;
+                }
+                const auto &results = delete_meta_results[block_key_idx];
+                for (size_t location_idx = 0; location_idx < batch_cad_tasks[block_key_idx].size(); ++location_idx) {
+                    if (location_idx >= results.size() ||
+                        (results[location_idx] != ErrorCode::EC_OK && results[location_idx] != ErrorCode::EC_NOENT)) {
+                        ++cad_failure_count;
+                    }
+                }
+            }
+        }
+        RecordDeleteCleanupPermanentFailure(
+            metrics_registry_, DeleteCleanupFailureStage::kMetadataCad, cad_failure_count);
         const auto block_result_count = std::min(delete_meta_results.size(), batch_cad_tasks.size());
         for (size_t block_key_idx = 0; block_key_idx < block_result_count; ++block_key_idx) {
             auto &results = delete_meta_results[block_key_idx];
@@ -422,7 +537,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             }
             const auto location_result_count = std::min(results.size(), batch_cad_tasks[block_key_idx].size());
             for (size_t location_idx = 0; location_idx < location_result_count; location_idx++) {
-                if (results[location_idx] != ErrorCode::EC_OK) {
+                if (results[location_idx] != ErrorCode::EC_OK && results[location_idx] != ErrorCode::EC_NOENT) {
                     result.status = ErrorCode::EC_PARTIAL_OK;
                     KVCM_LOG_WARN("Failed to CAD meta, instance[%s] key %ld, location: %s, error_code: %d",
                                   task.instance_id.c_str(),
@@ -485,101 +600,10 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const Cach
                    task.block_keys.size());
 
     auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
-    std::future<PlanExecuteResult> future = promise->get_future();
-
-    if (stop_) {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped.");
-        return future;
-    }
-
-    // 1. sync set block status to deleting
-    const std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(task.instance_id);
-    if (indexer == nullptr) {
-        HandleErrorPromise(promise, ErrorCode::EC_NOENT, "MetaIndexer %s not found", task.instance_id.c_str());
-        return future;
-    }
-
-    MetaSearcher meta_searcher(indexer);
-
-    std::vector<CacheLocationMap> location_maps;
-    BlockMask empty_mask;
-    auto request_context = std::make_shared<RequestContext>("schedule_plan_executor_call");
-    ErrorCode get_locations_ec =
-        meta_searcher.BatchGetLocation(request_context.get(), task.block_keys, empty_mask, location_maps);
-    if (get_locations_ec != ErrorCode::EC_OK) {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "Failed to get block locations");
-        return future;
-    }
-
-    std::vector<int64_t> batch_cas_block_keys;
-    std::vector<std::vector<MetaSearcher::LocationCASTask>> batch_cas_tasks;
-    for (size_t block_key_idx = 0; block_key_idx < task.block_keys.size(); ++block_key_idx) {
-        std::vector<MetaSearcher::LocationCASTask> cas_tasks;
-        for (const auto &loc_kv : location_maps[block_key_idx]) {
-            if (!loc_kv.second) {
-                continue;
-            }
-            cas_tasks.push_back({loc_kv.first, loc_kv.second->status(), CLS_DELETING});
-        }
-        if (cas_tasks.empty()) {
-            continue;
-        }
-        batch_cas_block_keys.emplace_back(task.block_keys[block_key_idx]);
-        batch_cas_tasks.emplace_back(std::move(cas_tasks));
-    }
-
-    if (batch_cas_block_keys.empty()) {
-        promise->set_value({ErrorCode::EC_OK, ""});
-        return future;
-    }
-
-    std::vector<std::vector<ErrorCode>> cas_results;
-    ErrorCode update_ec =
-        meta_searcher.BatchCASLocationStatus(request_context.get(), batch_cas_block_keys, batch_cas_tasks, cas_results);
-    if (update_ec != ErrorCode::EC_OK) {
-        KVCM_LOG_DEBUG("Location status BatchCASLocationStatus not ok, ec: %d", update_ec);
-    }
-
-    std::string error_message;
-    CacheLocationDelRequest actual_task{task.instance_id, {}, {}, task.delay};
-    if (!FillActualTask(batch_cas_block_keys, batch_cas_tasks, cas_results, actual_task, error_message)) {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "FillActualTask error: %s", error_message.c_str());
-        return future;
-    }
-    if (actual_task.block_keys.empty()) {
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
-        return future;
-    }
-
-    // Sync: ensure CAS(→DELETING) is persisted before scheduling Phase 2.
-    if (!indexer->Sync(actual_task.block_keys)) {
-        HandleErrorPromise(promise,
-                           ErrorCode::EC_ERROR,
-                           "Sync failed or timed out for location delete, instance[%s]",
-                           task.instance_id.c_str());
-        return future;
-    }
-
-    KVCM_LOG_DEBUG("Location statuses updated, submitting task to worker pool with delay: %lld microseconds",
-                   static_cast<long long>(task.delay.count()));
-
-    auto execute_task = [this, promise, actual_task]() {
-        try {
-            promise->set_value(DoLocationDelTask(actual_task));
-        } catch (const std::exception &e) {
-            HandleErrorPromise(promise, ErrorCode::EC_ERROR, "location delete task threw exception: %s", e.what());
-        } catch (...) {
-            HandleErrorPromise(promise, ErrorCode::EC_ERROR, "location delete task threw unknown exception");
-        }
-    };
-    auto cancel_task = [promise]() {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before task execution.");
-    };
-    bool submit_result = this->SubmitRaw(execute_task, task.delay, cancel_task, task_class);
-    if (!submit_result) {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "submit task failed");
-        return future;
-    }
+    auto future = promise->get_future();
+    auto completion = std::make_shared<PromiseCompletion>(promise);
+    RunDeleteAdmission(
+        completion, task.delay, [this, task]() { return PrepareDeleteTask(task); }, task_class, 0);
     return future;
 }
 
@@ -631,11 +655,30 @@ bool SchedulePlanExecutor::FillActualTask(
 }
 SchedulePlanExecutor::LocationDelAdmissionResult
 SchedulePlanExecutor::PrepareDeleteTask(const CacheMetaDelRequest &task) {
-    return PrepareDeleteTaskImpl(task.instance_id, task.block_keys, nullptr, nullptr, task.delay, false);
+    std::vector<int64_t> unique_block_keys;
+    unique_block_keys.reserve(task.block_keys.size());
+    std::unordered_set<int64_t> seen_block_keys;
+    seen_block_keys.reserve(task.block_keys.size());
+    for (const int64_t block_key : task.block_keys) {
+        if (seen_block_keys.insert(block_key).second) {
+            unique_block_keys.push_back(block_key);
+        }
+    }
+    return PrepareDeleteTaskImpl(task.instance_id, unique_block_keys, nullptr, nullptr, task.delay, false, false);
 }
 
 SchedulePlanExecutor::LocationDelAdmissionResult
 SchedulePlanExecutor::PrepareDeleteTask(const CacheLocationDelRequest &task) {
+    if (task.pre_fenced_deleting &&
+        (!task.authoritative_read || task.block_keys.empty() || task.expected_location_values.empty() ||
+         std::any_of(
+             task.location_ids.begin(), task.location_ids.end(), [](const auto &ids) { return ids.empty(); }))) {
+        LocationDelAdmissionResult admission_result;
+        admission_result.result =
+            MakeErrorResult(ErrorCode::EC_BADARGS,
+                            "pre_fenced_deleting requires authoritative_read, explicit location_ids and exact values");
+        return admission_result;
+    }
     if (task.block_keys.size() != task.location_ids.size() ||
         (!task.expected_location_values.empty() && task.block_keys.size() != task.expected_location_values.size())) {
         LocationDelAdmissionResult admission_result;
@@ -655,15 +698,71 @@ SchedulePlanExecutor::PrepareDeleteTask(const CacheLocationDelRequest &task) {
             }
         }
     }
-    const auto *expected_location_values =
-        task.expected_location_values.empty() ? nullptr : &task.expected_location_values;
+    // Canonicalize caller-controlled targets before either status mutation or
+    // physical I/O. A repeated key/id must never be deleted or accounted
+    // twice; conflicting exact snapshots are an invalid request rather than a
+    // reason to guess which generation the caller intended.
+    std::vector<int64_t> normalized_block_keys;
+    std::vector<std::vector<std::string>> normalized_location_ids;
+    std::vector<std::vector<std::string>> normalized_expected_values;
+    std::unordered_map<int64_t, size_t> key_to_index;
+    std::vector<std::unordered_map<std::string, size_t>> id_to_index;
+    normalized_block_keys.reserve(task.block_keys.size());
+    normalized_location_ids.reserve(task.block_keys.size());
+    id_to_index.reserve(task.block_keys.size());
+    const bool has_expected_values = !task.expected_location_values.empty();
+    if (has_expected_values) {
+        normalized_expected_values.reserve(task.block_keys.size());
+    }
+    for (size_t key_index = 0; key_index < task.block_keys.size(); ++key_index) {
+        const int64_t block_key = task.block_keys[key_index];
+        auto [key_iter, inserted] = key_to_index.emplace(block_key, normalized_block_keys.size());
+        if (inserted) {
+            normalized_block_keys.push_back(block_key);
+            normalized_location_ids.emplace_back();
+            id_to_index.emplace_back();
+            if (has_expected_values) {
+                normalized_expected_values.emplace_back();
+            }
+        }
+        const size_t normalized_key_index = key_iter->second;
+        for (size_t location_index = 0; location_index < task.location_ids[key_index].size(); ++location_index) {
+            const auto &location_id = task.location_ids[key_index][location_index];
+            if (location_id.empty()) {
+                LocationDelAdmissionResult admission_result;
+                admission_result.result = MakeErrorResult(ErrorCode::EC_BADARGS, "location id must not be empty");
+                return admission_result;
+            }
+            auto [id_iter, id_inserted] = id_to_index[normalized_key_index].emplace(
+                location_id, normalized_location_ids[normalized_key_index].size());
+            if (id_inserted) {
+                normalized_location_ids[normalized_key_index].push_back(location_id);
+                if (has_expected_values) {
+                    normalized_expected_values[normalized_key_index].push_back(
+                        task.expected_location_values[key_index][location_index]);
+                }
+                continue;
+            }
+            if (has_expected_values && normalized_expected_values[normalized_key_index][id_iter->second] !=
+                                           task.expected_location_values[key_index][location_index]) {
+                LocationDelAdmissionResult admission_result;
+                admission_result.result =
+                    MakeErrorResult(ErrorCode::EC_BADARGS, "duplicate location target has conflicting expected values");
+                return admission_result;
+            }
+        }
+    }
+    const auto *expected_location_values = has_expected_values ? &normalized_expected_values : nullptr;
     auto result = PrepareDeleteTaskImpl(task.instance_id,
-                                        task.block_keys,
-                                        &task.location_ids,
+                                        normalized_block_keys,
+                                        &normalized_location_ids,
                                         expected_location_values,
                                         task.delay,
-                                        task.authoritative_read);
+                                        task.authoritative_read,
+                                        task.pre_fenced_deleting);
     result.actual_task.metadata_only = task.metadata_only;
+    result.actual_task.authoritative_read = task.authoritative_read;
+    result.actual_task.pre_fenced_deleting = task.pre_fenced_deleting;
     result.actual_task.confirmed_missing_uris = task.confirmed_missing_uris;
     return result;
 }
@@ -674,7 +773,8 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                                             const std::vector<std::vector<std::string>> *target_location_ids,
                                             const std::vector<std::vector<std::string>> *expected_location_values,
                                             std::chrono::microseconds delay,
-                                            bool authoritative_read) {
+                                            bool authoritative_read,
+                                            bool pre_fenced_deleting) {
     LocationDelAdmissionResult admission_result;
     admission_result.actual_task = CacheLocationDelRequest{instance_id, {}, {}, delay};
 
@@ -726,11 +826,6 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
     std::vector<std::vector<MetaSearcher::LocationCASTask>> batch_cas_tasks;
     // A null target list represents CacheMetaDelRequest and selects every non-deleting location.
     for (size_t block_key_idx = 0; block_key_idx < block_keys.size(); ++block_key_idx) {
-        std::unordered_set<std::string> target_ids;
-        if (target_location_ids != nullptr) {
-            target_ids.insert((*target_location_ids)[block_key_idx].begin(),
-                              (*target_location_ids)[block_key_idx].end());
-        }
         std::unordered_map<std::string, std::string> expected_values_by_location;
         if (expected_location_values != nullptr) {
             for (size_t i = 0; i < (*target_location_ids)[block_key_idx].size(); ++i) {
@@ -741,17 +836,22 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
         auto block_key = block_keys[block_key_idx];
         auto &location_map = location_maps[block_key_idx];
         std::vector<MetaSearcher::LocationCASTask> location_cas_tasks;
-        for (const auto &loc_kv : location_map) {
-            if (!loc_kv.second) {
+        std::vector<std::string> selected_location_ids;
+        if (target_location_ids != nullptr) {
+            selected_location_ids = (*target_location_ids)[block_key_idx];
+        } else {
+            selected_location_ids.reserve(location_map.size());
+            for (const auto &[location_id, location] : location_map) {
+                (void)location;
+                selected_location_ids.push_back(location_id);
+            }
+        }
+        for (const auto &selected_location_id : selected_location_ids) {
+            const auto location_iter = location_map.find(selected_location_id);
+            if (location_iter == location_map.end() || !location_iter->second) {
                 continue;
             }
-            const auto &location = *loc_kv.second;
-            if (location.status() == CacheLocationStatus::CLS_DELETING) {
-                continue;
-            }
-            if (target_location_ids != nullptr && target_ids.find(location.id()) == target_ids.end()) {
-                continue;
-            }
+            const auto &location = *location_iter->second;
             std::string expected_location_value;
             if (expected_location_values != nullptr) {
                 const auto expected = expected_values_by_location.find(location.id());
@@ -759,6 +859,27 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                     continue; // stable location was refreshed after the cleanup scan
                 }
                 expected_location_value = expected->second;
+            }
+            if (pre_fenced_deleting) {
+                // The authoritative FinishWrite cleanup has already persisted
+                // both the final URI and CLS_DELETING. Only adopt that exact,
+                // still-hidden generation for physical cleanup. Never turn a
+                // different status into DELETING on this privileged path.
+                if (location.status() != CacheLocationStatus::CLS_DELETING) {
+                    continue;
+                }
+                if (admission_result.actual_task.block_keys.empty() ||
+                    admission_result.actual_task.block_keys.back() != block_key) {
+                    admission_result.actual_task.block_keys.push_back(block_key);
+                    admission_result.actual_task.location_ids.emplace_back();
+                    admission_result.actual_task.expected_location_values.emplace_back();
+                }
+                admission_result.actual_task.location_ids.back().push_back(location.id());
+                admission_result.actual_task.expected_location_values.back().push_back(location.ToJsonString());
+                continue;
+            }
+            if (location.status() == CacheLocationStatus::CLS_DELETING) {
+                continue;
             }
             location_cas_tasks.push_back({location.id(),
                                           location.status(),
@@ -770,6 +891,10 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
         }
         batch_cas_block_keys.push_back(block_key);
         batch_cas_tasks.emplace_back(std::move(location_cas_tasks));
+    }
+    if (pre_fenced_deleting) {
+        admission_result.needs_physical_delete = !admission_result.actual_task.block_keys.empty();
+        return admission_result;
     }
     if (batch_cas_block_keys.empty()) {
         return admission_result;
@@ -808,10 +933,21 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
 void SchedulePlanExecutor::RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                                               std::chrono::microseconds delay,
                                               const std::function<LocationDelAdmissionResult()> &prepare,
-                                              ScheduleTaskClass task_class) {
+                                              ScheduleTaskClass task_class,
+                                              std::uint64_t already_fenced_target_count) {
+    const auto record_dispatch_failure = [this](std::uint64_t count) {
+        RecordDeleteCleanupPermanentFailure(metrics_registry_, DeleteCleanupFailureStage::kDispatchOrWorker, count);
+    };
     try {
         auto admission_result = prepare();
+        const std::uint64_t admitted_target_count = CountLocationTargets(admission_result.actual_task);
         if (admission_result.result.status != ErrorCode::EC_OK || !admission_result.needs_physical_delete) {
+            const std::uint64_t stranded_target_count =
+                admitted_target_count == 0 ? already_fenced_target_count : admitted_target_count;
+            if (admission_result.result.status != ErrorCode::EC_OK && stranded_target_count != 0) {
+                record_dispatch_failure(stranded_target_count);
+                admission_result.result.error_logged = true;
+            }
             completion->Complete(std::move(admission_result.result));
             return;
         }
@@ -819,24 +955,53 @@ void SchedulePlanExecutor::RunDeleteAdmission(const std::shared_ptr<PromiseCompl
         KVCM_LOG_DEBUG("Location statuses updated, submitting task to worker pool with delay: %lld microseconds",
                        static_cast<long long>(delay.count()));
         auto actual_task = std::move(admission_result.actual_task);
-        auto execute_task = [this, completion, actual_task]() {
-            try {
-                completion->Complete(DoLocationDelTask(actual_task));
-            } catch (const std::exception &e) {
-                completion->Complete(ErrorCode::EC_ERROR,
-                                     StringUtil::FormatString("location delete task threw exception: %s", e.what()));
-            } catch (...) { completion->Complete(ErrorCode::EC_ERROR, "location delete task threw unknown exception"); }
-        };
-        auto cancel_task = [completion]() {
-            completion->Complete(ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before physical delete.");
+        auto execute_task =
+            [this, completion, admitted_target_count, actual_task = std::move(actual_task), record_dispatch_failure]() {
+                try {
+                    auto result = DoLocationDelTask(actual_task);
+                    if (result.status != ErrorCode::EC_OK && !result.error_logged) {
+                        record_dispatch_failure(admitted_target_count);
+                        result.error_logged = true;
+                    }
+                    completion->Complete(std::move(result));
+                } catch (const std::exception &e) {
+                    record_dispatch_failure(admitted_target_count);
+                    auto result =
+                        MakeErrorResult(ErrorCode::EC_ERROR,
+                                        StringUtil::FormatString("location delete task threw exception: %s", e.what()));
+                    result.error_logged = true;
+                    completion->Complete(std::move(result));
+                } catch (...) {
+                    record_dispatch_failure(admitted_target_count);
+                    auto result = MakeErrorResult(ErrorCode::EC_ERROR, "location delete task threw unknown exception");
+                    result.error_logged = true;
+                    completion->Complete(std::move(result));
+                }
+            };
+        auto cancel_task = [completion, admitted_target_count, record_dispatch_failure]() {
+            record_dispatch_failure(admitted_target_count);
+            auto result = MakeErrorResult(ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before physical delete.");
+            result.error_logged = true;
+            completion->Complete(std::move(result));
         };
         if (!SubmitRaw(execute_task, delay, cancel_task, task_class)) {
-            completion->Complete(ErrorCode::EC_ERROR, "submit physical delete task failed");
+            record_dispatch_failure(admitted_target_count);
+            auto result = MakeErrorResult(ErrorCode::EC_ERROR, "submit physical delete task failed");
+            result.error_logged = true;
+            completion->Complete(std::move(result));
         }
     } catch (const std::exception &e) {
-        completion->Complete(ErrorCode::EC_ERROR,
-                             StringUtil::FormatString("location delete admission threw exception: %s", e.what()));
-    } catch (...) { completion->Complete(ErrorCode::EC_ERROR, "location delete admission threw unknown exception"); }
+        record_dispatch_failure(already_fenced_target_count);
+        auto result = MakeErrorResult(
+            ErrorCode::EC_ERROR, StringUtil::FormatString("location delete admission threw exception: %s", e.what()));
+        result.error_logged = already_fenced_target_count != 0;
+        completion->Complete(std::move(result));
+    } catch (...) {
+        record_dispatch_failure(already_fenced_target_count);
+        auto result = MakeErrorResult(ErrorCode::EC_ERROR, "location delete admission threw unknown exception");
+        result.error_logged = already_fenced_target_count != 0;
+        completion->Complete(std::move(result));
+    }
 }
 
 std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationDelRequest &task) {
@@ -853,7 +1018,11 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitLocationDelete(const 
     auto future = promise->get_future();
     auto completion = std::make_shared<PromiseCompletion>(promise);
     RunDeleteAdmission(
-        completion, task.delay, [this, &task]() { return PrepareDeleteTask(task); }, task_class);
+        completion,
+        task.delay,
+        [this, &task]() { return PrepareDeleteTask(task); },
+        task_class,
+        task.pre_fenced_deleting ? CountLocationTargets(task) : 0);
     return future;
 }
 
@@ -861,7 +1030,8 @@ AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const CacheMetaDelRequ
     KVCM_LOG_DEBUG("Submitting async meta delete task for instance_id: %s, block_keys count: %zu",
                    task.instance_id.c_str(),
                    task.block_keys.size());
-    return SubmitDeleteTaskAsync(task.delay, [this, task]() { return PrepareDeleteTask(task); });
+    return SubmitDeleteTaskAsync(
+        task.delay, [this, task]() { return PrepareDeleteTask(task); }, 0);
 }
 
 AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const CacheLocationDelRequest &task) {
@@ -869,7 +1039,10 @@ AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const CacheLocationDel
                    task.instance_id.c_str(),
                    task.block_keys.size());
 
-    return SubmitDeleteTaskAsync(task.delay, [this, task]() { return PrepareDeleteTask(task); });
+    return SubmitDeleteTaskAsync(
+        task.delay,
+        [this, task]() { return PrepareDeleteTask(task); },
+        task.pre_fenced_deleting ? CountLocationTargets(task) : 0);
 }
 
 AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const EventReportMetadataDelRequest &task) {
@@ -906,8 +1079,8 @@ AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const EventReportMetad
         try {
             completion->Complete(DoEventReportMetadataDelTask(task));
         } catch (const std::exception &e) {
-            completion->Complete(
-                EC_ERROR, StringUtil::FormatString("EventReport metadata delete threw exception: %s", e.what()));
+            completion->Complete(EC_ERROR,
+                                 StringUtil::FormatString("EventReport metadata delete threw exception: %s", e.what()));
         } catch (...) { completion->Complete(EC_ERROR, "EventReport metadata delete threw unknown exception"); }
     };
     auto cancel_task = [completion]() {
@@ -919,8 +1092,7 @@ AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const EventReportMetad
     return AsyncDeleteSubmitResult{true, std::move(future)};
 }
 
-PlanExecuteResult
-SchedulePlanExecutor::DoEventReportMetadataDelTask(const EventReportMetadataDelRequest &task) {
+PlanExecuteResult SchedulePlanExecutor::DoEventReportMetadataDelTask(const EventReportMetadataDelRequest &task) {
     auto indexer = meta_manager_ ? meta_manager_->GetMetaIndexer(task.instance_id) : nullptr;
     if (!indexer) {
         return MakeErrorResult(EC_NOENT,
@@ -1055,14 +1227,8 @@ SchedulePlanExecutor::DoEventReportMetadataDelTask(const EventReportMetadataDelR
         }
         std::vector<std::vector<ErrorCode>> per_location_ec;
         RequestContext context("event_report_metadata_delete");
-        const ErrorCode ec = meta_searcher.BatchDeleteLocations(&context,
-                                                                 {task.block_keys[key_index]},
-                                                                 location_ids,
-                                                                 per_location_ec,
-                                                                 expected_values,
-                                                                 true,
-                                                                 true,
-                                                                 true);
+        const ErrorCode ec = meta_searcher.BatchDeleteLocations(
+            &context, {task.block_keys[key_index]}, location_ids, per_location_ec, expected_values, true, true, true);
         if (per_location_ec.size() != 1 || per_location_ec.front().size() != targets.size()) {
             hard_error_targets += targets.size();
             for (const auto &target : targets) {
@@ -1075,10 +1241,10 @@ SchedulePlanExecutor::DoEventReportMetadataDelTask(const EventReportMetadataDelR
             const bool hard_error = target_ec != EC_OK && target_ec != EC_NOENT && target_ec != EC_MISMATCH;
             hard_error_targets += static_cast<size_t>(hard_error);
             completed_targets += static_cast<size_t>(!hard_error);
-            const char *status = target_ec == EC_OK       ? "deleted"
-                                 : target_ec == EC_NOENT  ? "noent"
+            const char *status = target_ec == EC_OK         ? "deleted"
+                                 : target_ec == EC_NOENT    ? "noent"
                                  : target_ec == EC_MISMATCH ? "mismatch"
-                                                           : "error";
+                                                            : "error";
             record_delete_result(targets[target_index].cleanup_token.reason, status);
         }
         if (ec != EC_OK && ec != EC_PARTIAL_OK &&
@@ -1094,24 +1260,30 @@ SchedulePlanExecutor::DoEventReportMetadataDelTask(const EventReportMetadataDelR
     if (hard_error_targets == 0) {
         return PlanExecuteResult{EC_OK, ""};
     }
-    return MakeErrorResult(completed_targets == 0 ? EC_ERROR : EC_PARTIAL_OK,
-                           StringUtil::FormatString("EventReport metadata delete hard failures: %zu",
-                                                    hard_error_targets));
+    return MakeErrorResult(
+        completed_targets == 0 ? EC_ERROR : EC_PARTIAL_OK,
+        StringUtil::FormatString("EventReport metadata delete hard failures: %zu", hard_error_targets));
 }
 
-AsyncDeleteSubmitResult
-SchedulePlanExecutor::SubmitDeleteTaskAsync(std::chrono::microseconds delay,
-                                            std::function<LocationDelAdmissionResult()> prepare) {
+AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitDeleteTaskAsync(std::chrono::microseconds delay,
+                                                                    std::function<LocationDelAdmissionResult()> prepare,
+                                                                    std::uint64_t already_fenced_target_count) {
     auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
     auto future = promise->get_future();
     auto completion = std::make_shared<PromiseCompletion>(promise);
-    auto admission_task = [this, completion, delay, prepare = std::move(prepare)]() {
-        RunDeleteAdmission(completion, delay, prepare, ScheduleTaskClass::kReclaim);
+    auto admission_task = [this, completion, delay, prepare = std::move(prepare), already_fenced_target_count]() {
+        RunDeleteAdmission(completion, delay, prepare, ScheduleTaskClass::kReclaim, already_fenced_target_count);
     };
-    auto cancel_task = [completion]() {
-        completion->Complete(ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before delete admission.");
+    auto cancel_task = [this, completion, already_fenced_target_count]() {
+        RecordDeleteCleanupPermanentFailure(
+            metrics_registry_, DeleteCleanupFailureStage::kDispatchOrWorker, already_fenced_target_count);
+        auto result = MakeErrorResult(ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before delete admission.");
+        result.error_logged = already_fenced_target_count != 0;
+        completion->Complete(std::move(result));
     };
     if (!SubmitRaw(admission_task, std::chrono::microseconds::zero(), cancel_task, ScheduleTaskClass::kReclaim)) {
+        RecordDeleteCleanupPermanentFailure(
+            metrics_registry_, DeleteCleanupFailureStage::kDispatchOrWorker, already_fenced_target_count);
         return AsyncDeleteSubmitResult{};
     }
     return AsyncDeleteSubmitResult{true, std::move(future)};

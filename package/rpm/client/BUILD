@@ -51,10 +51,10 @@ pkg_files(
 pkg_files(
     name = "rpm_client_commit_info",
     srcs = [
-        "//package/git_commit:commit_version_file",
+        "//package/git_commit:commit_version_files",
     ],
     attributes = pkg_attributes(
-        mode = "0755",
+        mode = "0644",
     ),
     prefix = "etc",
 )

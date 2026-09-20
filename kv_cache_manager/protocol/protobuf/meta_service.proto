@@ -68,6 +68,31 @@ enum StorageType {
 // component of the block, including
 // full-attention and mamba-state specs.
 
+// Checksum algorithm. CA_CRC32_XOR_INT64 mirrors SdkBufferCheckUtil::GetBlocksHash
+// (CRC32 over each iov's configured head/tail sample -> HashUtil::HashIntArray).
+// Its legacy odd-size/layout semantics are persisted: append a new algorithm
+// for revised behavior; never change or reuse retired values in place.
+enum ChecksumAlgo {
+    CA_UNSPECIFIED = 0;
+    CA_CRC32_XOR_INT64 = 1;
+}
+
+// Data integrity config. All fields default to disabled; specs without this field
+// behave exactly as legacy (verification path is skipped end-to-end).
+message DataIntegrityConfig {
+    // Scheme A: persist per-block, per-LocationSpec checksum in KVCM meta and
+    // verify the independently stored payload on read.
+    bool enable_meta_checksum = 1;
+    // Scheme B: embed a header (block_key + checksum + version) inside the stored
+    // data. Reserved; rejected by Validate / Init when true in this release.
+    bool enable_inline_header = 2;
+    // Layout version for Scheme B; 0 means no inline header (legacy data).
+    uint32 inline_header_version = 3;
+    // Algorithm used by KVCM's built-in compute/verify path. Caller-provided
+    // opaque checksums are not validated against or tagged with this value.
+    ChecksumAlgo algo = 4;
+}
+
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
     // Optional startup signal. A fresh reporter, including one observed after
@@ -172,6 +197,11 @@ message ReportEventResponse {
 message LocationSpec {
     string name = 1; // 对应LocationSpecInfo中的name
     string uri = 2;
+    // Opaque checksum of this spec's independently stored payload. It may be
+    // computed by KVCM or supplied by the caller and is echoed unchanged.
+    int64 checksum = 3;
+    // Explicit presence keeps checksum value 0 distinct from legacy metadata.
+    bool checksum_present = 4;
 }
 
 message CacheLocation {
@@ -282,6 +312,7 @@ message StorageConfig {
         DummyStorageSpec dummy = 9;
     }
     bool check_storage_available_when_open = 8;
+    DataIntegrityConfig integrity = 11; // data integrity config; absent = all disabled
 }
 
 message RegisterInstanceRequest {
@@ -337,6 +368,9 @@ message GetCacheLocationRequest {
     BlockMask block_mask = 6; // 按前缀mask或者bool矩阵mask
     int32 sw_size = 7;        // slide window size, for QT_REVERSE_ROLL_SW_MATCH
     repeated string location_spec_names = 8; // 用于仅返回部分spec。不传则全返回。
+    // Opt in to stored checksum values on returned locations. False avoids the
+    // value copy and protobuf-binary encoding; JSON may still print defaults.
+    bool include_checksums = 9;
 }
 
 message CacheLocationVector {
@@ -365,6 +399,7 @@ message GetCacheLocationsByBackendRequest {
     int32 sw_size = 7;
     repeated string location_spec_names = 8;
     repeated BackendLocationSelector backend_selectors = 9;
+    bool include_checksums = 10;
 }
 
 message GetCacheLocationsByBackendResponse {
@@ -398,6 +433,8 @@ message GetCacheMetaRequest {
     repeated int64 token_ids = 4;
     BlockMask block_mask = 5; // 按前缀mask或者bool矩阵mask
     int32 detail_level = 6;   // 返回数据的详细级别，越大获取的信息越多，暂定为数字
+    // Opt in to checksum fields on returned locations.
+    bool include_checksums = 7;
 }
 
 message GetCacheMetaResponse {
@@ -430,7 +467,26 @@ message StartWriteCacheResponse {
     repeated CacheLocation locations = 4;
 }
 
-// 写入为简单起见, 先设计为原子性接口, 全成功或全失败
+message LocationSpecChecksumBatch {
+    string location_spec_name = 1;
+    // Parallel to the compact keys captured by this StartWrite session. Failed
+    // positions retain a placeholder; positions without this spec are ignored.
+    repeated int64 checksums = 2;
+}
+
+message LocationSpecUriBatch {
+    string location_spec_name = 1;
+    // Parallel to the compact StartWrite session. uri_present=false means the
+    // block does not carry this spec and the corresponding URI placeholder is
+    // ignored. This is separate from deprecated tag 5 so legacy semantics stay
+    // unchanged while actual storage URI overrides can commit atomically.
+    repeated string uris = 2;
+    repeated bool uri_present = 3;
+}
+
+// 单个 location 的 URI/checksum/status 在同一次 metadata RMW 中发布；跨 key
+// batch 不是存储事务。任一槽失败时服务端返回失败，并同步尝试把已发布槽改为
+// DELETING 后提交整批清理。调用方仍须把结果视为 uncertain commit 并隔离。
 // 结束对指定 blockKeys 的写入(要保证所有 blockKeys 对应 value 都已完成写入),
 // 若客户端未调用该接口或写入长时间未完成,
 // 服务端会视为写入失败并将本次Request所有meta清除. 客户端调用完这个接口后,
@@ -440,7 +496,15 @@ message FinishWriteCacheRequest {
     string instance_id = 2;
     string write_session_id = 3;
     BlockMask success_blocks = 4;
-    repeated CacheLocation locations = 5;
+    // Kept for rolling upgrades. Legacy/new clients may still populate it for
+    // old servers; current servers do not use it for checksum alignment.
+    repeated CacheLocation locations = 5 [deprecated = true];
+    // Optional values grouped by independently stored location spec. Values may
+    // be caller-computed; the server stores them without interpreting the
+    // algorithm. Duplicate/empty spec names or malformed batch sizes are rejected
+    // without consuming the write session.
+    repeated LocationSpecChecksumBatch checksum_batches = 6;
+    repeated LocationSpecUriBatch uri_batches = 7;
 }
 
 // 删除指定 blockKeys，用于修复线上用户反馈case说某些提示词会胡言乱语的情况

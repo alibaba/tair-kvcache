@@ -8,6 +8,18 @@ bundle_tar(
         ":inner_package",
     ],
     extension = "tar.gz",
+    mode = "0644",
+    modes = {
+        "bin/admin_service_client.py": "0755",
+        "bin/debug_service_client.py": "0755",
+        "bin/decode_stack_trace.sh": "0755",
+        "bin/kv_cache_manager_bin": "0755",
+        "bin/kv_cache_manager_rpc_client": "0755",
+        "bin/kv_cache_manager_rpc_client.py": "0755",
+        "bin/meta_service_client.py": "0755",
+        "bin/start_server.sh": "0755",
+        "bin/start_server_spectrum.sh": "0755",
+    },
     visibility = ["//visibility:public"],
 )
 

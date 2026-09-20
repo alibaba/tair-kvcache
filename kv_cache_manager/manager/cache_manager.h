@@ -10,6 +10,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -176,12 +177,45 @@ public:
                                                               const std::vector<std::string> &location_spec_group_names,
                                                               int64_t write_timeout_seconds,
                                                               int32_t min_replica_count = 1);
-    ErrorCode
-    FinishWriteCache(RequestContext *request_context,
-                     const std::string &instance_id,
-                     const std::string &write_session_id,
-                     const BlockMask &success_block_mask,
-                     std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal = nullptr);
+    struct FinishWriteCacheOptions {
+        std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal;
+        struct ChecksumBatch {
+            std::string location_spec_name;
+            std::vector<int64_t> checksums;
+        };
+        struct UriBatch {
+            std::string location_spec_name;
+            std::vector<std::string> uris;
+            std::vector<bool> uri_present;
+        };
+        // Each batch is parallel to the compact keys captured by StartWrite.
+        // Empty means no checksum update; failed positions and positions whose
+        // location omits that spec are ignored.
+        std::vector<ChecksumBatch> checksum_batches;
+        // Optional actual storage URIs, aligned to the same compact session as
+        // checksum_batches. These are committed in the same metadata RMW as
+        // checksum and CLS_SERVING so no reader can observe a mixed tuple.
+        std::vector<UriBatch> uri_batches;
+
+        static FinishWriteCacheOptions
+        WithWriteLocationInfo(std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal) {
+            FinishWriteCacheOptions options;
+            options.write_location_info_internal = std::move(write_location_info_internal);
+            return options;
+        }
+
+        static FinishWriteCacheOptions WithChecksumBatches(std::vector<ChecksumBatch> checksum_batches) {
+            FinishWriteCacheOptions options;
+            options.checksum_batches = std::move(checksum_batches);
+            return options;
+        }
+    };
+
+    ErrorCode FinishWriteCache(RequestContext *request_context,
+                               const std::string &instance_id,
+                               const std::string &write_session_id,
+                               const BlockMask &success_block_mask,
+                               FinishWriteCacheOptions options = FinishWriteCacheOptions{});
 
     ErrorCode RemoveCache(RequestContext *request_context,
                           const std::string &instance_id,
@@ -401,7 +435,7 @@ private:
     std::shared_ptr<MetaSearcherManager> meta_searcher_manager_;
     // 需要清理
     std::shared_ptr<DataStorageSelector> data_storage_selector_;
-    // 无需清理 - CacheManager当前没有给MetricsRegistry动态添加新的监控指标
+    // 无需清理 - 仅动态写入进程级、固定枚举标签的删除终态失败指标
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     // 无需清理 - RegistryManager单独进行了清理，不由CacheManager负责
     std::shared_ptr<RegistryManager> registry_manager_;

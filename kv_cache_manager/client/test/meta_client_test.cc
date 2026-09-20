@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <fstream>
 #include <gmock/gmock.h>
+#include <tuple>
 
 #include "kv_cache_manager/client/src/internal/stub/stub.h"
 #include "kv_cache_manager/client/src/meta_client_impl.h"
@@ -79,17 +80,17 @@ public:
                 (const std::string &trace_id, const std::string &instance_id),
                 (override));
 
-    MOCK_METHOD((std::pair<ClientErrorCode, Metas>),
+    MOCK_METHOD((std::pair<ClientErrorCode, MatchMetaResult>),
                 GetCacheMeta,
                 (const std::string &trace_id,
                  const std::string &instance_id,
                  const KeyVector &keys,
                  const TokenIdsVector &tokens,
                  const BlockMask &block_mask,
-                 int32_t detail_level),
+                 const MatchMetaOptions &options),
                 (override));
 
-    MOCK_METHOD((std::pair<ClientErrorCode, Locations>),
+    MOCK_METHOD((std::pair<ClientErrorCode, MatchLocationResult>),
                 GetCacheLocation,
                 (const std::string &trace_id,
                  const std::string &instance_id,
@@ -97,8 +98,8 @@ public:
                  const KeyVector &keys,
                  const TokenIdsVector &tokens,
                  const BlockMask &block_mask,
-                 int32_t sw_size,
-                 const std::vector<std::string> &location_spec_names),
+                 const std::vector<std::string> &location_spec_names,
+                 const MatchLocationOptions &options),
                 (override));
 
     MOCK_METHOD((std::pair<ClientErrorCode, int64_t>),
@@ -108,7 +109,7 @@ public:
                  QueryType query_type,
                  const KeyVector &keys,
                  const TokenIdsVector &tokens,
-                 int32_t sw_size),
+                 const MatchLocationLenOptions &options),
                 (override));
 
     MOCK_METHOD((std::pair<ClientErrorCode, WriteLocation>),
@@ -127,7 +128,18 @@ public:
                  const std::string &instance_id,
                  const std::string write_session_id,
                  const BlockMask &success_block,
-                 const Locations &locations),
+                 const Locations &locations,
+                 const FinishWriteOptions &options),
+                (override));
+
+    MOCK_METHOD(ClientErrorCode,
+                FinishWriteCacheWithIntegrity,
+                (const std::string &trace_id,
+                 const std::string &instance_id,
+                 const std::string write_session_id,
+                 const BlockMask &success_block,
+                 const Locations &locations,
+                 const FinishWriteIntegrityOptions &options),
                 (override));
 
     MOCK_METHOD(ClientErrorCode,
@@ -146,6 +158,30 @@ public:
                 (const std::string &trace_id, const std::string &instance_id),
                 (override));
 };
+
+std::unique_ptr<MetaClientImpl>
+CreateInitializedMetaClient(const std::string &client_config, const InitParams &init_params, MockStub **mock_stub_out) {
+    auto mock_stub = new MockStub();
+    auto client = std::make_unique<MetaClientImpl>();
+    client->stub_.reset(mock_stub);
+
+    EXPECT_CALL(*mock_stub, AddConnection("127.0.0.1:8080", ::testing::_)).Times(1).WillOnce(::testing::Return(ER_OK));
+    EXPECT_CALL(*mock_stub,
+                RegisterInstance(::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_,
+                                 ::testing::_))
+        .Times(1)
+        .WillOnce(::testing::Return(std::make_pair(ER_OK, std::string("{fake_storage_config}"))));
+
+    EXPECT_EQ(ER_OK, client->Init(client_config, init_params));
+    *mock_stub_out = mock_stub;
+    return client;
+}
 
 TEST_F(MetaClientTest, TestCreateSimple) {
     auto mock_stub = new MockStub();
@@ -356,7 +392,13 @@ TEST_F(MetaClientTest, TestMatchLocationLen) {
     const int32_t sw_size = 0;
     const int64_t expected_len = 2;
 
-    EXPECT_CALL(*mock_stub, GetCacheLocationLen(trace_id, "test_instance", query_type, keys, tokens, sw_size))
+    EXPECT_CALL(*mock_stub,
+                GetCacheLocationLen(trace_id,
+                                    "test_instance",
+                                    query_type,
+                                    keys,
+                                    tokens,
+                                    ::testing::Field(&MatchLocationLenOptions::sw_size, sw_size)))
         .Times(1)
         .WillOnce(::testing::Return(std::make_pair(ER_OK, expected_len)));
 
@@ -366,11 +408,199 @@ TEST_F(MetaClientTest, TestMatchLocationLen) {
 
     // Test failed MatchLocationLen call
     const ClientErrorCode expected_error = ER_SERVICE_INTERNAL_ERROR;
-    EXPECT_CALL(*mock_stub, GetCacheLocationLen(trace_id + "_fail", "test_instance", query_type, keys, tokens, sw_size))
+    EXPECT_CALL(*mock_stub,
+                GetCacheLocationLen(trace_id + "_fail",
+                                    "test_instance",
+                                    query_type,
+                                    keys,
+                                    tokens,
+                                    ::testing::Field(&MatchLocationLenOptions::sw_size, sw_size)))
         .Times(1)
         .WillOnce(::testing::Return(std::make_pair(expected_error, int64_t{0})));
 
     auto [fail_result_ec, fail_len] = client->MatchLocationLen(trace_id + "_fail", query_type, keys, tokens, sw_size);
     ASSERT_EQ(fail_result_ec, expected_error);
     // The value of 'len' is not checked when error code is not ER_OK
+}
+TEST_F(MetaClientTest, TestMatchLocationOptionsForwardToStub) {
+    MockStub *mock_stub = nullptr;
+    auto client = CreateInitializedMetaClient(client_config_, init_params_, &mock_stub);
+    ASSERT_NE(mock_stub, nullptr);
+
+    const std::string trace_id = "trace_match_location";
+    const QueryType query_type = QueryType::QT_PREFIX_MATCH;
+    const std::vector<int64_t> keys = {1, 2};
+    const std::vector<int64_t> tokens = {3, 4};
+    const BlockMask block_mask = static_cast<BlockMaskOffset>(0);
+    const int32_t sw_size = 8;
+    const std::vector<std::string> spec_names = {"tp0"};
+    const Locations locations = {{{"tp0", "file://test_nfs/key1"}}};
+
+    EXPECT_CALL(*mock_stub,
+                GetCacheLocation(trace_id,
+                                 "test_instance",
+                                 query_type,
+                                 keys,
+                                 tokens,
+                                 block_mask,
+                                 spec_names,
+                                 ::testing::AllOf(::testing::Field(&MatchLocationOptions::sw_size, sw_size),
+                                                  ::testing::Field(&MatchLocationOptions::include_checksums, false))))
+        .Times(1)
+        .WillOnce(::testing::Return(std::make_pair(ER_OK, MatchLocationResult{locations, {}})));
+
+    auto [ec, result_locations] =
+        client->MatchLocation(trace_id, query_type, keys, tokens, block_mask, sw_size, spec_names);
+    EXPECT_EQ(ER_OK, ec);
+    EXPECT_EQ(locations, result_locations);
+
+    EXPECT_CALL(*mock_stub,
+                GetCacheLocation(trace_id,
+                                 "test_instance",
+                                 query_type,
+                                 keys,
+                                 tokens,
+                                 block_mask,
+                                 spec_names,
+                                 ::testing::AllOf(::testing::Field(&MatchLocationOptions::sw_size, sw_size),
+                                                  ::testing::Field(&MatchLocationOptions::include_checksums, true))))
+        .Times(1)
+        .WillOnce(::testing::Return(std::make_pair(
+            ER_OK, MatchLocationResult{locations, {{"tp0", std::vector<int64_t>{0x11, 0x22}, {true, true}}}})));
+
+    auto [result_ec, result] = client->MatchLocation(
+        trace_id, query_type, keys, tokens, block_mask, spec_names, MatchLocationOptions::WithChecksums(sw_size));
+    ec = result_ec;
+    result_locations = std::move(result.locations);
+    EXPECT_EQ(ER_OK, ec);
+    EXPECT_EQ(locations, result_locations);
+    const auto *tp0_checksums = result.FindChecksums("tp0");
+    ASSERT_NE(nullptr, tp0_checksums);
+    EXPECT_THAT(tp0_checksums->checksums, ::testing::ElementsAre(0x11, 0x22));
+}
+
+TEST_F(MetaClientTest, TestMatchMetaOptionsForwardToStub) {
+    MockStub *mock_stub = nullptr;
+    auto client = CreateInitializedMetaClient(client_config_, init_params_, &mock_stub);
+    ASSERT_NE(mock_stub, nullptr);
+
+    const std::string trace_id = "trace_match_meta";
+    const std::vector<int64_t> keys = {1, 2};
+    const std::vector<int64_t> tokens = {3, 4};
+    const BlockMask block_mask = static_cast<BlockMaskOffset>(0);
+    const int32_t detail_level = 2;
+    Metas metas;
+    metas.locations = {{{"tp0", "file://test_nfs/key1"}}};
+    metas.metas = {"meta1"};
+
+    EXPECT_CALL(*mock_stub,
+                GetCacheMeta(trace_id,
+                             "test_instance",
+                             keys,
+                             tokens,
+                             block_mask,
+                             ::testing::AllOf(::testing::Field(&MatchMetaOptions::detail_level, detail_level),
+                                              ::testing::Field(&MatchMetaOptions::include_checksums, false))))
+        .Times(1)
+        .WillOnce(::testing::Return(std::make_pair(ER_OK, MatchMetaResult{metas, {}})));
+
+    auto [ec, result_metas] = client->MatchMeta(trace_id, keys, tokens, block_mask, detail_level);
+    EXPECT_EQ(ER_OK, ec);
+    EXPECT_EQ(metas.locations, result_metas.locations);
+    EXPECT_EQ(metas.metas, result_metas.metas);
+
+    EXPECT_CALL(*mock_stub,
+                GetCacheMeta(trace_id,
+                             "test_instance",
+                             keys,
+                             tokens,
+                             block_mask,
+                             ::testing::AllOf(::testing::Field(&MatchMetaOptions::detail_level, detail_level),
+                                              ::testing::Field(&MatchMetaOptions::include_checksums, true))))
+        .Times(1)
+        .WillOnce(::testing::Return(
+            std::make_pair(ER_OK, MatchMetaResult{metas, {{"tp0", std::vector<int64_t>{0x33}, {true}}}})));
+
+    auto [result_ec, result] =
+        client->MatchMeta(trace_id, keys, tokens, block_mask, MatchMetaOptions::WithChecksums(detail_level));
+    ec = result_ec;
+    result_metas = std::move(result.metas);
+    EXPECT_EQ(ER_OK, ec);
+    EXPECT_EQ(metas.locations, result_metas.locations);
+    EXPECT_EQ(metas.metas, result_metas.metas);
+    const auto *tp0_checksums = result.FindChecksums("tp0");
+    ASSERT_NE(nullptr, tp0_checksums);
+    EXPECT_THAT(tp0_checksums->checksums, ::testing::ElementsAre(0x33));
+}
+
+TEST_F(MetaClientTest, TestFinishWriteOptionsForwardToStub) {
+    MockStub *mock_stub = nullptr;
+    auto client = CreateInitializedMetaClient(client_config_, init_params_, &mock_stub);
+    ASSERT_NE(mock_stub, nullptr);
+
+    const std::string trace_id = "trace_finish_write";
+    const std::string write_session_id = "write_session";
+    const BlockMask success_block = BlockMaskVector{true, false};
+    const Locations locations = {{{"tp0", "file://test_nfs/key1"}}};
+
+    EXPECT_CALL(*mock_stub,
+                FinishWriteCache(trace_id,
+                                 "test_instance",
+                                 write_session_id,
+                                 success_block,
+                                 locations,
+                                 ::testing::Field(&FinishWriteOptions::checksum_batches, ::testing::IsEmpty())))
+        .Times(1)
+        .WillOnce(::testing::Return(ER_OK));
+
+    EXPECT_EQ(ER_OK, client->FinishWrite(trace_id, write_session_id, success_block, locations));
+
+    std::vector<int64_t> checksums = {0x44, 0};
+    EXPECT_CALL(*mock_stub,
+                FinishWriteCache(
+                    trace_id,
+                    "test_instance",
+                    write_session_id,
+                    success_block,
+                    locations,
+                    ::testing::AllOf(::testing::Field(&FinishWriteOptions::checksum_batches, ::testing::SizeIs(1)),
+                                     ::testing::Truly([](const FinishWriteOptions &options) {
+                                         return options.checksum_batches[0].location_spec_name == "tp0" &&
+                                                options.checksum_batches[0].checksums == std::vector<int64_t>{0x44, 0};
+                                     }))))
+        .Times(1)
+        .WillOnce(::testing::Return(ER_OK));
+
+    EXPECT_EQ(
+        ER_OK,
+        client->FinishWrite(
+            trace_id, write_session_id, success_block, locations, FinishWriteOptions::WithChecksums("tp0", checksums)));
+
+    FinishWriteIntegrityOptions integrity_options;
+    integrity_options.checksum_batches = {{"tp0", {0x44, 0}}};
+    integrity_options.uri_batches = {
+        {"tp0", {"file://test_nfs/actual-key1", ""}, {true, false}},
+    };
+    EXPECT_CALL(*mock_stub,
+                FinishWriteCacheWithIntegrity(
+                    trace_id,
+                    "test_instance",
+                    write_session_id,
+                    success_block,
+                    locations,
+                    ::testing::Truly([](const FinishWriteIntegrityOptions &options) {
+                        return options.checksum_batches.size() == 1 &&
+                               options.checksum_batches[0].location_spec_name == "tp0" &&
+                               options.checksum_batches[0].checksums == std::vector<int64_t>{0x44, 0} &&
+                               options.uri_batches.size() == 1 && options.uri_batches[0].location_spec_name == "tp0" &&
+                               options.uri_batches[0].uris ==
+                                   std::vector<std::string>{"file://test_nfs/actual-key1", ""} &&
+                               options.uri_batches[0].uri_present == std::vector<bool>{true, false};
+                    })))
+        .Times(1)
+        .WillOnce(::testing::Return(ER_OK));
+
+    EXPECT_EQ(
+        ER_OK,
+        client->FinishWriteWithIntegrity(trace_id, write_session_id, success_block, locations, integrity_options));
 }

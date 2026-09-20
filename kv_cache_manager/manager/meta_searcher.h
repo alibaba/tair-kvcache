@@ -313,11 +313,42 @@ public:
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;
+        struct SpecChecksum {
+            std::string location_spec_name;
+            int64_t checksum = 0;
+        };
+        // Optional independently stored spec payload checksums. Unnamed specs
+        // are untouched; zero is a valid value.
+        std::vector<SpecChecksum> spec_checksums;
+        struct SpecUri {
+            std::string location_spec_name;
+            std::string uri;
+        };
+        // Optional actual storage URI replacements. Missing specs are a hard
+        // mismatch; callers must not accidentally publish a URI under the
+        // wrong independently stored payload identity.
+        std::vector<SpecUri> spec_uris;
+        // Optional compare-and-set guard used by FinishWrite so a location
+        // reclaimed after its write session was consumed cannot be revived.
+        std::optional<CacheLocationStatus> expected_status;
+        // Cleanup after a consumed/partially published FinishWrite must fold
+        // both possible authoritative states into DELETING. Empty means no
+        // multi-state guard. Callers should use either this or expected_status,
+        // not both.
+        std::vector<CacheLocationStatus> allowed_current_statuses;
     };
     ErrorCode BatchUpdateLocationStatus(RequestContext *request_context,
                                         const KeyVector &keys,
                                         const std::vector<std::vector<LocationUpdateTask>> &batch_tasks,
-                                        std::vector<std::vector<ErrorCode>> &out_batch_results);
+                                        std::vector<std::vector<ErrorCode>> &out_batch_results,
+                                        bool authoritative_persistence = false,
+                                        // Proposed serialized post-images from
+                                        // the in-lock modifier. A value is
+                                        // trustworthy only when the aggregate
+                                        // return and its parallel slot are both
+                                        // EC_OK; otherwise the caller must
+                                        // discard it.
+                                        std::vector<std::vector<std::string>> *out_updated_location_values = nullptr);
     struct LocationCASTask {
         std::string location_id;
         CacheLocationStatus old_status;
@@ -335,11 +366,16 @@ public:
     struct LocationCADTask {
         std::string location_id;
         CacheLocationStatus expect_status;
+        // Optional exact snapshot read immediately before payload deletion.
+        // It prevents CAD from removing a replacement generation which reused
+        // the same stable location id while backend I/O was in flight.
+        std::string expected_location_value;
     };
     ErrorCode BatchCADLocationStatus(RequestContext *request_context,
                                      const KeyVector &keys,
                                      const std::vector<std::vector<LocationCADTask>> &batch_tasks,
-                                     std::vector<std::vector<ErrorCode>> &out_batch_results);
+                                     std::vector<std::vector<ErrorCode>> &out_batch_results,
+                                     bool authoritative_persistence = false);
     ErrorCode BatchDeleteLocations(RequestContext *request_context,
                                    const KeyVector &keys,
                                    const LocationIdsPerKey &location_ids_per_key,

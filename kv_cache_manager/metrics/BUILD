@@ -18,6 +18,16 @@ cc_library(
 )
 
 cc_library(
+    name = "delete_cleanup_observer",
+    srcs = ["delete_cleanup_observer.cc"],
+    hdrs = ["delete_cleanup_observer.h"],
+    deps = [
+        ":metrics_registry",
+        "//kv_cache_manager/common:logger",
+    ],
+)
+
+cc_library(
     name = "metrics_collector",
     srcs = [
         "metrics_collector.cc",
@@ -41,8 +51,8 @@ cc_library(
         "kmon_param.h",
     ],
     deps = [
-        "//kv_cache_manager/common:utils",
         "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/common:utils",
     ],
 )
 
@@ -61,12 +71,13 @@ cc_library(
         "metrics_reporter.h",
     ],
     deps = [
+        ":delete_cleanup_observer",
         ":kmon_param",
+        ":metrics_collector",
         ":metrics_lifecycle",
         ":metrics_registry",
-        ":metrics_collector",
-        "//kv_cache_manager/common:utils",
         "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/common:utils",
         "//kv_cache_manager/manager:cache_manager",
         "@havenask//aios/kmonitor:kmonitor_client_cpp",
     ],

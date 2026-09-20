@@ -3,7 +3,9 @@ package(default_visibility = ["//visibility:public"])
 cc_binary(
     name = "kv_cache_manager_client.so",
     srcs = [],
+    additional_linker_inputs = ["client_exports.lds"],
     copts = [],
+    linkopts = ["-Wl,--version-script,$(location client_exports.lds)"],
     linkshared = True,
     visibility = ["//visibility:public"],
     deps = [

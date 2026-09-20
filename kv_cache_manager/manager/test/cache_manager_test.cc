@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -16,6 +17,7 @@
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/migration_strategy.h"
@@ -40,6 +42,7 @@
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/utils.h"
+#include "kv_cache_manager/metrics/delete_cleanup_observer.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub.h"
@@ -217,9 +220,12 @@ public:
         control_cv_.notify_all();
     }
 
-    void FailKeyOnNextUpsert(int64_t key) {
+    void FailKeyOnNextUpsert(int64_t key) { FailKeyOnNextUpserts(key, 1); }
+
+    void FailKeyOnNextUpserts(int64_t key, size_t count) {
         std::lock_guard<std::mutex> lock(control_mutex_);
-        fail_key_on_next_upsert_ = key;
+        fail_key_on_upsert_ = count == 0 ? std::nullopt : std::make_optional(key);
+        fail_key_upsert_count_ = count;
     }
 
     size_t GetSyncCallCount() {
@@ -236,8 +242,10 @@ public:
         std::optional<int64_t> failed_key;
         {
             std::lock_guard<std::mutex> lock(control_mutex_);
-            failed_key = fail_key_on_next_upsert_;
-            fail_key_on_next_upsert_.reset();
+            failed_key = fail_key_on_upsert_;
+            if (fail_key_upsert_count_ > 0 && --fail_key_upsert_count_ == 0) {
+                fail_key_on_upsert_.reset();
+            }
         }
         if (!failed_key.has_value()) {
             return MetaLocalBackend::Upsert(request_context, keys, locations, properties);
@@ -340,7 +348,8 @@ private:
     std::thread::id blocked_location_read_thread_;
     bool location_read_entered_ = false;
     bool release_location_read_ = false;
-    std::optional<int64_t> fail_key_on_next_upsert_;
+    std::optional<int64_t> fail_key_on_upsert_;
+    size_t fail_key_upsert_count_ = 0;
     size_t sync_call_count_ = 0;
 };
 
@@ -370,6 +379,12 @@ public:
     }
     std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &uris, const std::string &trace_id, std::function<void()> cb) override {
+        {
+            std::lock_guard<std::mutex> lock(deleted_uris_mutex_);
+            for (const auto &uri : uris) {
+                deleted_uris_.push_back(uri.ToUriString());
+            }
+        }
         deleted_uri_count_.fetch_add(uris.size(), std::memory_order_relaxed);
         return delegate_->Delete(uris, trace_id, std::move(cb));
     }
@@ -381,10 +396,16 @@ public:
     std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override { return delegate_->UnLock(uris); }
 
     size_t DeletedUriCount() const { return deleted_uri_count_.load(std::memory_order_relaxed); }
+    std::vector<std::string> DeletedUris() const {
+        std::lock_guard<std::mutex> lock(deleted_uris_mutex_);
+        return deleted_uris_;
+    }
 
 private:
     std::shared_ptr<DataStorageBackend> delegate_;
     std::atomic<size_t> deleted_uri_count_{0};
+    mutable std::mutex deleted_uris_mutex_;
+    std::vector<std::string> deleted_uris_;
 };
 
 class CacheManagerTest : public TESTBASE {
@@ -1980,8 +2001,14 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
 
         {
             BlockMask block_mask = static_cast<size_t>(2);
-            auto ec = cache_manager_->FinishWriteCache(
-                request_context_.get(), "test_instance", start_write_cache_info.write_session_id(), block_mask);
+            auto ec = cache_manager_->FinishWriteCache(request_context_.get(),
+                                                       "test_instance",
+                                                       start_write_cache_info.write_session_id(),
+                                                       block_mask,
+                                                       CacheManager::FinishWriteCacheOptions::WithChecksumBatches({
+                                                           {"tp0", {0x111, 0, 0x333}},
+                                                           {"tp1", {0xAAA, 0xBBB, 0xCCC}},
+                                                       }));
             ASSERT_EQ(EC_OK, ec);
         }
 
@@ -1998,6 +2025,16 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
             ASSERT_EQ(EC_OK, ec);
             const auto &cache_locations_view = cache_locations.cache_locations_view();
             ASSERT_EQ(2, cache_locations_view.size());
+            ASSERT_GE(cache_locations_view[0].location_specs().size(), 2u);
+            ASSERT_TRUE(cache_locations_view[0].location_specs()[0].has_checksum());
+            EXPECT_EQ(0x111, cache_locations_view[0].location_specs()[0].checksum());
+            ASSERT_TRUE(cache_locations_view[0].location_specs()[1].has_checksum());
+            EXPECT_EQ(0xAAA, cache_locations_view[0].location_specs()[1].checksum());
+            ASSERT_GE(cache_locations_view[1].location_specs().size(), 2u);
+            ASSERT_TRUE(cache_locations_view[1].location_specs()[0].has_checksum());
+            EXPECT_EQ(0, cache_locations_view[1].location_specs()[0].checksum());
+            ASSERT_TRUE(cache_locations_view[1].location_specs()[1].has_checksum());
+            EXPECT_EQ(0xBBB, cache_locations_view[1].location_specs()[1].checksum());
         }
 
         {
@@ -2008,6 +2045,16 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
             const auto &cache_locations_view = cache_metas.cache_locations_view();
             const auto &metas = cache_metas.metas();
             ASSERT_EQ(3, cache_locations_view.size());
+            ASSERT_GE(cache_locations_view[0].location_specs().size(), 2u);
+            ASSERT_TRUE(cache_locations_view[0].location_specs()[0].has_checksum());
+            EXPECT_EQ(0x111, cache_locations_view[0].location_specs()[0].checksum());
+            ASSERT_TRUE(cache_locations_view[0].location_specs()[1].has_checksum());
+            EXPECT_EQ(0xAAA, cache_locations_view[0].location_specs()[1].checksum());
+            ASSERT_GE(cache_locations_view[1].location_specs().size(), 2u);
+            ASSERT_TRUE(cache_locations_view[1].location_specs()[0].has_checksum());
+            EXPECT_EQ(0, cache_locations_view[1].location_specs()[0].checksum());
+            ASSERT_TRUE(cache_locations_view[1].location_specs()[1].has_checksum());
+            EXPECT_EQ(0xBBB, cache_locations_view[1].location_specs()[1].checksum());
             std::map<std::string, std::string> meta;
             ASSERT_TRUE(Jsonizable::FromJsonString(metas[2], meta));
             ASSERT_TRUE(
@@ -2080,6 +2127,339 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
                 CacheLocation::CacheLocationStatusToString(CacheLocationStatus::CLS_NOT_FOUND) == meta.at("status"));
         }
     }
+}
+
+TEST_F(CacheManagerTest, TestFinishWriteMalformedUriBatchDoesNotConsumeSessionAndRetryPublishesTuple) {
+    const auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+    const std::vector<int64_t> keys{8101, 8102};
+    auto [start_ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+    const auto &start_locations = info.locations().cache_locations_view();
+    ASSERT_EQ(keys.size(), start_locations.size());
+
+    std::vector<std::string> actual_uris;
+    actual_uris.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &specs = start_locations[i].location_specs();
+        const auto spec =
+            std::find_if(specs.begin(), specs.end(), [](const auto &value) { return value.name() == "tp0"; });
+        ASSERT_NE(specs.end(), spec);
+        StandardUri actual_uri(spec->uri());
+        ASSERT_TRUE(actual_uri.Valid());
+        actual_uris.push_back(actual_uri.ToUriString());
+    }
+
+    CacheManager::FinishWriteCacheOptions malformed;
+    malformed.uri_batches.push_back({"tp0", actual_uris, {true}});
+    EXPECT_EQ(EC_BADARGS,
+              cache_manager_->FinishWriteCache(request_context_.get(),
+                                               "test_instance",
+                                               info.write_session_id(),
+                                               static_cast<size_t>(keys.size()),
+                                               std::move(malformed)));
+
+    CacheManager::FinishWriteCacheOptions invalid_uri;
+    invalid_uri.uri_batches.push_back({"tp0", {"not-a-uri", "not-a-uri"}, {true, true}});
+    EXPECT_EQ(EC_BADARGS,
+              cache_manager_->FinishWriteCache(request_context_.get(),
+                                               "test_instance",
+                                               info.write_session_id(),
+                                               static_cast<size_t>(keys.size()),
+                                               std::move(invalid_uri)));
+
+    CacheManager::FinishWriteCacheOptions corrected;
+    corrected.checksum_batches.push_back({"tp0", {0, -9}});
+    corrected.uri_batches.push_back({"tp0", actual_uris, {true, true}});
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(request_context_.get(),
+                                               "test_instance",
+                                               info.write_session_id(),
+                                               static_cast<size_t>(keys.size()),
+                                               std::move(corrected)));
+
+    auto [query_ec, locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), "test_instance", CacheManager::QueryType::QT_BATCH_GET, keys, {}, BlockMask{}, 0, {});
+    ASSERT_EQ(EC_OK, query_ec);
+    const auto &stored_locations = locations.cache_locations_view();
+    ASSERT_EQ(keys.size(), stored_locations.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &specs = stored_locations[i].location_specs();
+        const auto spec =
+            std::find_if(specs.begin(), specs.end(), [](const auto &value) { return value.name() == "tp0"; });
+        ASSERT_NE(specs.end(), spec);
+        EXPECT_EQ(actual_uris[i], spec->uri());
+        EXPECT_TRUE(spec->has_checksum());
+        EXPECT_EQ(i == 0 ? 0 : -9, spec->checksum());
+    }
+}
+
+TEST_F(CacheManagerTest, TestFinishWriteGroupsDuplicateBlockKeysIntoOneMetadataRmw) {
+    const auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "duplicate_finish_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+    const std::vector<int64_t> keys{8301, 8301};
+    auto [start_ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "duplicate_finish_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+
+    CacheManager::FinishWriteCacheOptions options;
+    options.checksum_batches.push_back({"tp0", {17, 19}});
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(request_context_.get(),
+                                               "duplicate_finish_instance",
+                                               info.write_session_id(),
+                                               static_cast<size_t>(keys.size()),
+                                               std::move(options)));
+
+    auto *searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("duplicate_finish_instance");
+    ASSERT_NE(nullptr, searcher);
+    std::vector<CacheLocationMap> locations;
+    ASSERT_EQ(EC_OK, searcher->BatchGetLocation(request_context_.get(), {keys.front()}, BlockMask{}, locations));
+    ASSERT_EQ(1u, locations.size());
+    ASSERT_EQ(2u, locations[0].size());
+    std::multiset<int64_t> checksums;
+    for (const auto &[id, location] : locations[0]) {
+        (void)id;
+        ASSERT_TRUE(location);
+        EXPECT_EQ(CLS_SERVING, location->status());
+        const auto spec = std::find_if(location->location_specs().begin(),
+                                       location->location_specs().end(),
+                                       [](const auto &value) { return value.name() == "tp0"; });
+        ASSERT_NE(location->location_specs().end(), spec);
+        ASSERT_TRUE(spec->has_checksum());
+        checksums.insert(spec->checksum());
+    }
+    EXPECT_EQ((std::multiset<int64_t>{17, 19}), checksums);
+}
+
+TEST_F(CacheManagerTest, TestFinishWriteReclaimsSuccessfulCleanupSiblingUnderSameBlockKey) {
+    const auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    const std::vector<int64_t> keys{8401, 8401};
+    auto [start_ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+    const auto &start_locations = info.locations().cache_locations_view();
+    ASSERT_EQ(keys.size(), start_locations.size());
+    const auto &first_location = start_locations[0].cache_location_;
+    const auto &second_location = start_locations[1].cache_location_;
+
+    std::set<std::string> first_location_uris;
+    std::set<std::string> second_location_uris;
+    for (const auto &spec : first_location.location_specs()) {
+        first_location_uris.insert(DataStorageUri(spec.uri()).ToUriString());
+    }
+    for (const auto &spec : second_location.location_specs()) {
+        second_location_uris.insert(DataStorageUri(spec.uri()).ToUriString());
+    }
+    ASSERT_EQ(createLocationSpecInfos().size(), first_location_uris.size());
+    ASSERT_EQ(createLocationSpecInfos().size(), second_location_uris.size());
+    ASSERT_NE(first_location_uris, second_location_uris);
+
+    // StartWrite returns allocation views before the metadata-generated
+    // location IDs are copied back. Resolve each ID from the persisted
+    // Location using its complete canonical URI set.
+    auto *searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, searcher);
+    std::vector<CacheLocationMap> persisted_locations;
+    ASSERT_EQ(EC_OK,
+              searcher->BatchGetLocation(request_context_.get(), {keys.front()}, BlockMask{}, persisted_locations));
+    ASSERT_EQ(1u, persisted_locations.size());
+    ASSERT_EQ(2u, persisted_locations.front().size());
+    std::string first_location_id;
+    std::string second_location_id;
+    for (const auto &[location_id, location] : persisted_locations.front()) {
+        ASSERT_TRUE(location);
+        EXPECT_EQ(CLS_WRITING, location->status());
+        std::set<std::string> persisted_uris;
+        for (const auto &spec : location->location_specs()) {
+            persisted_uris.insert(DataStorageUri(spec.uri()).ToUriString());
+        }
+        if (persisted_uris == first_location_uris) {
+            ASSERT_TRUE(first_location_id.empty());
+            first_location_id = location_id;
+        } else if (persisted_uris == second_location_uris) {
+            ASSERT_TRUE(second_location_id.empty());
+            second_location_id = location_id;
+        } else {
+            ADD_FAILURE() << "unexpected persisted URI set for location " << location_id;
+        }
+    }
+    ASSERT_FALSE(first_location_id.empty());
+    ASSERT_FALSE(second_location_id.empty());
+    ASSERT_NE(first_location_id, second_location_id);
+
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_NE(nullptr, data_storage_manager);
+    auto original_backend = data_storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_NE(nullptr, original_backend);
+    auto recording_backend = std::make_shared<DeleteRecordingBackend>(original_backend);
+    {
+        std::unique_lock<std::shared_mutex> lock(data_storage_manager->rw_lock_);
+        data_storage_manager->storage_map_["nfs_01"] = recording_backend;
+    }
+
+    const auto second_tp0 = std::find_if(second_location.location_specs().begin(),
+                                         second_location.location_specs().end(),
+                                         [](const auto &spec) { return spec.name() == "tp0"; });
+    ASSERT_NE(second_location.location_specs().end(), second_tp0);
+    CacheManager::FinishWriteCacheOptions options;
+    options.uri_batches.push_back({"tp0", {"", second_tp0->uri() + "&redirect=1"}, {false, true}});
+    // Fail the main grouped RMW and all three full cleanup attempts. The
+    // bounded fallback must then split this one key down to individual
+    // locations: the first is durably fenced, while the unsafe second URI is
+    // never adopted or physically deleted.
+    meta_backend->FailKeyOnNextUpserts(keys.front(), 4);
+    EXPECT_EQ(EC_ERROR,
+              cache_manager_->FinishWriteCache(request_context_.get(),
+                                               "test_instance",
+                                               info.write_session_id(),
+                                               static_cast<size_t>(keys.size()),
+                                               std::move(options)));
+    EXPECT_EQ(
+        1u,
+        metrics_registry_->GetCounter(kDeleteCleanupPermanentFailureMetricName, {{"stage", "authoritative_fence"}})
+            .Get());
+
+    const auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool cleanup_completed = false;
+    while (std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::vector<CacheLocationMap> current;
+        if (searcher->BatchGetLocation(request_context_.get(), {keys.front()}, BlockMask{}, current) == EC_OK &&
+            current.size() == 1 && current[0].find(first_location_id) == current[0].end() &&
+            current[0].find(second_location_id) != current[0].end() &&
+            recording_backend->DeletedUriCount() == first_location_uris.size()) {
+            EXPECT_EQ(CLS_WRITING, current[0].at(second_location_id)->status());
+            cleanup_completed = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(cleanup_completed);
+
+    const auto deleted_uris = recording_backend->DeletedUris();
+    EXPECT_EQ(first_location_uris.size(), deleted_uris.size());
+    EXPECT_EQ(first_location_uris, std::set<std::string>(deleted_uris.begin(), deleted_uris.end()));
+    for (const auto &failed_location_uri : second_location_uris) {
+        EXPECT_EQ(0u, static_cast<size_t>(std::count(deleted_uris.begin(), deleted_uris.end(), failed_location_uri)));
+    }
+}
+
+TEST_F(CacheManagerTest, TestFinishWriteSlotFailureReturnsErrorAndQuarantinesPublishedPeers) {
+    const auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+    const std::vector<int64_t> keys{8201, 8202};
+    auto [start_ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, start_ec);
+
+    auto *searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, searcher);
+    std::vector<CacheLocationMap> raw_locations;
+    ASSERT_EQ(EC_OK, searcher->BatchGetLocation(request_context_.get(), keys, BlockMask{}, raw_locations));
+    ASSERT_EQ(keys.size(), raw_locations.size());
+    ASSERT_EQ(1u, raw_locations[0].size());
+    ASSERT_EQ(1u, raw_locations[1].size());
+    const std::string first_location_id = raw_locations[0].begin()->first;
+    const std::string second_location_id = raw_locations[1].begin()->first;
+    ASSERT_FALSE(first_location_id.empty());
+    ASSERT_FALSE(second_location_id.empty());
+
+    // Inject the metadata state left when the reclaimer wins the narrow race
+    // after session consumption and before FinishWrite's RMW. Retaining the
+    // session here lets the test drive the remaining path through the public
+    // FinishWrite boundary: the CAS guard rejects this slot and CacheManager
+    // quarantines the peer slot which did publish.
+    std::vector<std::vector<ErrorCode>> transition_results;
+    ASSERT_EQ(EC_OK,
+              searcher->BatchUpdateLocationStatus(
+                  request_context_.get(), {keys[1]}, {{{second_location_id, CLS_DELETING}}}, transition_results));
+    ASSERT_EQ(1u, transition_results.size());
+    ASSERT_EQ(1u, transition_results[0].size());
+    ASSERT_EQ(EC_OK, transition_results[0][0]);
+    auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    ASSERT_TRUE(indexer->Sync({keys[1]}));
+
+    CacheManager::FinishWriteCacheOptions options;
+    options.checksum_batches.push_back({"tp0", {17, 19}});
+    const auto &second_specs = raw_locations[1].begin()->second->location_specs();
+    const auto second_tp0 =
+        std::find_if(second_specs.begin(), second_specs.end(), [](const auto &spec) { return spec.name() == "tp0"; });
+    ASSERT_NE(second_specs.end(), second_tp0);
+    options.uri_batches.push_back({"tp0", {"", second_tp0->uri() + "&redirect=1"}, {false, true}});
+    EXPECT_EQ(EC_ERROR,
+              cache_manager_->FinishWriteCache(request_context_.get(),
+                                               "test_instance",
+                                               info.write_session_id(),
+                                               static_cast<size_t>(keys.size()),
+                                               std::move(options)));
+    ASSERT_TRUE(indexer->Sync(keys));
+
+    auto [meta_ec, metas] =
+        cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, BlockMask{}, 0);
+    ASSERT_EQ(EC_OK, meta_ec);
+    ASSERT_EQ(keys.size(), metas.metas().size());
+    for (const auto &serialized : metas.metas()) {
+        std::map<std::string, std::string> meta;
+        ASSERT_TRUE(Jsonizable::FromJsonString(serialized, meta));
+        EXPECT_NE(CacheLocation::CacheLocationStatusToString(CLS_SERVING), meta.at("status"));
+    }
+
+    // The unsafe URI keeps the second target unresolved, but slot-level exact
+    // post-image confirmation reclaims the independently fenced first key
+    // instead of leaking the whole failed batch.
+    const auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool first_removed = false;
+    while (std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::vector<CacheLocationMap> current;
+        if (searcher->BatchGetLocation(request_context_.get(), keys, BlockMask{}, current) == EC_OK &&
+            current.size() == keys.size() && current[0].find(first_location_id) == current[0].end()) {
+            first_removed = true;
+            ASSERT_NE(current[1].end(), current[1].find(second_location_id));
+            EXPECT_EQ(CLS_DELETING, current[1].at(second_location_id)->status());
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(first_removed);
+
+    // A failed finish consumed the valid session and initiated cleanup; it must
+    // not be replayable after the caller has been told to isolate its buffers.
+    EXPECT_EQ(EC_ERROR,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", info.write_session_id(), static_cast<size_t>(keys.size())));
 }
 
 TEST_F(CacheManagerTest, TestGetCacheMeta) {
@@ -4764,6 +5144,91 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotReplacesCompleteSpecSetPerBlock)
     EXPECT_TRUE(found_tp1);
     EXPECT_TRUE(found_tp2);
     EXPECT_EQ(2u, QueryRawEventReportUris(key).size());
+}
+
+TEST_F(CacheManagerTest, TestReportEventPreservesCallerProvidedChecksum) {
+    const std::string host = "192.168.10.44:8080";
+    const int64_t key = 9444;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+
+    auto get_tp0_checksum = [&]() -> std::optional<int64_t> {
+        auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+        if (meta_searcher == nullptr) {
+            return std::nullopt;
+        }
+        std::vector<CacheLocationMap> location_maps;
+        BlockMask mask;
+        if (meta_searcher->BatchGetLocation(request_context_.get(), {key}, mask, location_maps) != EC_OK ||
+            location_maps.size() != 1) {
+            return std::nullopt;
+        }
+        for (const auto &[location_id, location] : location_maps[0]) {
+            (void)location_id;
+            if (location == nullptr || location->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2) {
+                continue;
+            }
+            const auto it = std::find_if(location->location_specs().begin(),
+                                         location->location_specs().end(),
+                                         [](const auto &spec) { return spec.name() == "tp0"; });
+            if (it != location->location_specs().end() && it->has_checksum()) {
+                return it->checksum();
+            }
+        }
+        return std::nullopt;
+    };
+
+    auto add = MakeAddRequest(host, key, "checksum_delta");
+    auto *add_spec = add.mutable_events(0)->mutable_block_add()->mutable_specs(0);
+    add_spec->set_checksum(0);
+    add_spec->set_checksum_present(true);
+    ASSERT_EQ(EC_OK, CallReportEvent(add, "caller_checksum_delta").first);
+    const auto delta_checksum = get_tp0_checksum();
+    ASSERT_TRUE(delta_checksum.has_value());
+    EXPECT_EQ(0, *delta_checksum);
+
+    // BLOCK_ADD is a patch. Omitting checksum while refreshing the same spec
+    // must keep the existing zero value and its explicit presence bit.
+    auto add_without_checksum = MakeAddRequest(host, key, "checksum_delta_refresh");
+    ASSERT_EQ(EC_OK, CallReportEvent(add_without_checksum, "caller_checksum_delta_refresh").first);
+    const auto preserved_checksum = get_tp0_checksum();
+    ASSERT_TRUE(preserved_checksum.has_value());
+    EXPECT_EQ(0, *preserved_checksum);
+
+    // The same patch rule also applies while repeated events are folded inside
+    // one RPC.  The second ADD updates the URI but must not discard the value
+    // supplied by the first ADD before either mutation reaches MetaSearcher.
+    auto batched_add = MakeAddRequest(host, key, "checksum_batch_first");
+    auto *batched_first_spec = batched_add.mutable_events(0)->mutable_block_add()->mutable_specs(0);
+    batched_first_spec->set_checksum(12345);
+    batched_first_spec->set_checksum_present(true);
+    *batched_add.add_events() = MakeAddRequest(host, key, "checksum_batch_last").events(0);
+    ASSERT_EQ(EC_OK, CallReportEvent(batched_add, "caller_checksum_batched_patch").first);
+    const auto batched_checksum = get_tp0_checksum();
+    ASSERT_TRUE(batched_checksum.has_value());
+    EXPECT_EQ(12345, *batched_checksum);
+    const auto visible_after_batched_patch = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible_after_batched_patch.size());
+    EXPECT_NE(std::string::npos, visible_after_batched_patch.front().find("source=checksum_batch_last"));
+
+    auto snapshot = MakeSnapshotRequest(host, {{key, "checksum_snapshot"}});
+    auto *snapshot_spec = snapshot.mutable_events(0)->mutable_block_snapshot()->mutable_blocks(0)->mutable_specs(0);
+    snapshot_spec->set_checksum(-42);
+    snapshot_spec->set_checksum_present(true);
+    ASSERT_EQ(EC_OK, CallReportEvent(snapshot, "caller_checksum_snapshot").first);
+    const auto snapshot_checksum = get_tp0_checksum();
+    ASSERT_TRUE(snapshot_checksum.has_value());
+    EXPECT_EQ(-42, *snapshot_checksum);
+
+    // A full snapshot replaces the complete spec state. Omitting checksum here
+    // is the explicit clearing mechanism, unlike the patch-style ADD above.
+    auto clearing_snapshot = MakeSnapshotRequest(host, {{key, "checksum_snapshot_clear"}});
+    ASSERT_EQ(EC_OK, CallReportEvent(clearing_snapshot, "caller_checksum_snapshot_clear").first);
+    const auto visible_after_clear = QueryEventReportUris({key});
+    ASSERT_EQ(1u, visible_after_clear.size());
+    EXPECT_NE(std::string::npos, visible_after_clear.front().find("source=checksum_snapshot_clear"));
+    EXPECT_FALSE(get_tp0_checksum().has_value());
 }
 
 TEST_F(CacheManagerTest, TestReportEventRejectsDuplicatePhysicalSnapshotItemsWithoutStateChange) {
@@ -8469,9 +8934,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
 
     auto find_match = [](const std::vector<CacheManager::HostCacheMatch> &matches,
                          const std::string &host) -> const CacheManager::HostCacheMatch * {
-        const auto it = std::find_if(matches.begin(), matches.end(), [&](const auto &match) {
-            return match.host_ip_port == host;
-        });
+        const auto it =
+            std::find_if(matches.begin(), matches.end(), [&](const auto &match) { return match.host_ip_port == host; });
         return it == matches.end() ? nullptr : &*it;
     };
 
@@ -8483,16 +8947,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
         register_instance(instance_id);
         InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L1P5);
         InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L2);
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L1P5,
-                     host,
-                     100,
-                     "event_report://10.0.8.1:9700/mem");
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L2,
-                     host,
-                     200,
-                     "event_report://10.0.8.1:9600/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, host, 100, "event_report://10.0.8.1:9700/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, host, 200, "event_report://10.0.8.1:9600/mem");
 
         auto [ec, matches] = cache_manager_->GetHostCacheState(
             request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200});
@@ -8514,26 +8970,10 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
         InitializeEventReporter(instance_id, rank0, proto::meta::ST_EVENT_REPORT_L2);
         InitializeEventReporter(instance_id, rank1, proto::meta::ST_EVENT_REPORT_L1P5);
         InitializeEventReporter(instance_id, rank1, proto::meta::ST_EVENT_REPORT_L2);
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L1P5,
-                     rank0,
-                     100,
-                     "event_report://10.0.8.2:9700/mem");
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L2,
-                     rank0,
-                     200,
-                     "event_report://10.0.8.2:9600/mem");
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L1P5,
-                     rank1,
-                     100,
-                     "event_report://10.0.8.2:9701/mem");
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L2,
-                     rank1,
-                     300,
-                     "event_report://10.0.8.2:9601/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, rank0, 100, "event_report://10.0.8.2:9700/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, rank0, 200, "event_report://10.0.8.2:9600/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, rank1, 100, "event_report://10.0.8.2:9701/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, rank1, 300, "event_report://10.0.8.2:9601/mem");
 
         auto [rank0_ec, rank0_matches] = cache_manager_->GetHostCacheState(
             request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200});
@@ -8583,16 +9023,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
 
         const std::string shared_v6d_uri = "event_report://10.0.8.3:9600/mem";
         report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, base, 100, shared_v6d_uri);
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L1P5,
-                     rank0,
-                     200,
-                     "event_report://10.0.8.3:9700/mem");
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L1P5,
-                     rank1,
-                     300,
-                     "event_report://10.0.8.3:9701/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, rank0, 200, "event_report://10.0.8.3:9700/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, rank1, 300, "event_report://10.0.8.3:9701/mem");
 
         auto [rank0_ec, rank0_matches] = cache_manager_->GetHostCacheState(
             request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200});
@@ -8619,15 +9051,16 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
             {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
         };
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [location_ec, locations] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
-                                                                                    instance_id,
-                                                                                    CacheManager::QueryType::QT_BATCH_GET,
-                                                                                    {100},
-                                                                                    {},
-                                                                                    block_mask,
-                                                                                    0,
-                                                                                    {},
-                                                                                    selectors);
+        auto [location_ec, locations] =
+            cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                       instance_id,
+                                                       CacheManager::QueryType::QT_BATCH_GET,
+                                                       {100},
+                                                       {},
+                                                       block_mask,
+                                                       0,
+                                                       {},
+                                                       selectors);
         ASSERT_EQ(EC_OK, location_ec);
         ASSERT_EQ(1u, locations.size());
         ASSERT_EQ(1u, locations[0].cache_locations_view().size());
@@ -10296,8 +10729,12 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheClearsTieredMark) {
     info->keys = {1};
     info->location_ids = {target_ids[0]};
     BlockMask success_mask = static_cast<BlockMaskOffset>(1); // 全部成功
-    auto ec = cache_manager_->FinishWriteCache(
-        request_context_.get(), "placeholder_id", "sess_p5", success_mask, std::move(info));
+    auto ec =
+        cache_manager_->FinishWriteCache(request_context_.get(),
+                                         "placeholder_id",
+                                         "sess_p5",
+                                         success_mask,
+                                         CacheManager::FinishWriteCacheOptions::WithWriteLocationInfo(std::move(info)));
     ASSERT_EQ(EC_OK, ec);
     ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("placeholder_id", 1));
 
@@ -10460,11 +10897,12 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
     partial_info->keys = {1};
     partial_info->location_ids = {partial_ids[0]};
     ASSERT_EQ(EC_OK,
-              cache_manager_->FinishWriteCache(request_context_.get(),
-                                               "full_policy_instance",
-                                               "sess_partial",
-                                               static_cast<BlockMaskOffset>(1),
-                                               std::move(partial_info)));
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(),
+                  "full_policy_instance",
+                  "sess_partial",
+                  static_cast<BlockMaskOffset>(1),
+                  CacheManager::FinishWriteCacheOptions::WithWriteLocationInfo(std::move(partial_info))));
     ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("full_policy_instance", 1));
 
     auto remaining_cold_loc =
@@ -10482,11 +10920,12 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
     remaining_info->keys = {1};
     remaining_info->location_ids = {remaining_ids[0]};
     ASSERT_EQ(EC_OK,
-              cache_manager_->FinishWriteCache(request_context_.get(),
-                                               "full_policy_instance",
-                                               "sess_remaining",
-                                               static_cast<BlockMaskOffset>(1),
-                                               std::move(remaining_info)));
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(),
+                  "full_policy_instance",
+                  "sess_remaining",
+                  static_cast<BlockMaskOffset>(1),
+                  CacheManager::FinishWriteCacheOptions::WithWriteLocationInfo(std::move(remaining_info))));
     ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("full_policy_instance", 1));
 }
 
@@ -10531,8 +10970,12 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheSkipsTieredMarkWhenMigrationDisable
     info->keys = {1};
     info->location_ids = {target_ids[0]};
     BlockMask success_mask = static_cast<BlockMaskOffset>(1);
-    auto ec = cache_manager_->FinishWriteCache(
-        request_context_.get(), "tiered_disabled_finish", "sess_disabled", success_mask, std::move(info));
+    auto ec =
+        cache_manager_->FinishWriteCache(request_context_.get(),
+                                         "tiered_disabled_finish",
+                                         "sess_disabled",
+                                         success_mask,
+                                         CacheManager::FinishWriteCacheOptions::WithWriteLocationInfo(std::move(info)));
     ASSERT_EQ(EC_OK, ec);
     // 关键断言：未启用 migration 的 group，finish 不清标。
     ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("tiered_disabled_finish", 1));

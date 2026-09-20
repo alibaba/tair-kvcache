@@ -72,6 +72,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:schedule_plan_executor",
+        "//kv_cache_manager/metrics:delete_cleanup_observer",
         "@cpp_stub",
     ],
 )
@@ -151,6 +152,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:delete_cleanup_observer",
         "@cpp_stub",
     ],
 )

@@ -260,6 +260,12 @@ bool Server::StartRpcServer() {
     debug_service_->Init();
 
     grpc::ServerBuilder builder;
+    // FinishWrite v4 can carry one actual URI and checksum per compact
+    // key/spec. Keep an explicit finite ceiling above the Manager's 48 MiB URI
+    // plus bounded integrity-cell budgets instead of inheriting gRPC's ~4 MiB
+    // default or making the server unlimited. Do not cap response size here:
+    // existing large metadata queries historically had no such restriction.
+    builder.SetMaxReceiveMessageSize(128 * 1024 * 1024);
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(meta_service_.get());
     if (!use_separate_admin_server) {
