@@ -180,6 +180,17 @@ struct SharedMemoryRegistration {
     int fd{-1};
 };
 
+struct GpuMemorySpan {
+    void *base{nullptr};
+    size_t size{0};
+    int device_id{-1};
+};
+
+struct ClientMemoryRegistrations {
+    SharedMemoryRegistration host;
+    std::vector<GpuMemorySpan> gpu;
+};
+
 struct InitParams {
     RoleType role_type{RoleType::UNKNOWN};
     RegistSpan *regist_span{nullptr};    // used by worker

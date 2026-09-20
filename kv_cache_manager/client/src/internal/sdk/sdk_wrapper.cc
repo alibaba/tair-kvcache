@@ -30,7 +30,7 @@ SdkWrapper::~SdkWrapper() {
 
 ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_config,
                                  const InitParams &init_params,
-                                 const SharedMemoryRegistration *shared_memory_registration) {
+                                 const ClientMemoryRegistrations *memory_registrations) {
     if (!client_config) {
         KVCM_LOG_WARN("client config is null");
         return ER_INVALID_CLIENT_CONFIG;
@@ -52,12 +52,19 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
 
     SharedMemoryRegistration prepared_registration;
     const SharedMemoryRegistration *active_registration = nullptr;
-    if (shared_memory_registration != nullptr) {
-        auto ec = PrepareSharedMemoryRegistration(*shared_memory_registration, prepared_registration);
+    if (memory_registrations != nullptr && memory_registrations->host.fd >= 0) {
+        auto ec = PrepareSharedMemoryRegistration(memory_registrations->host, prepared_registration);
         if (ec != ER_OK) {
             return ec;
         }
         active_registration = &prepared_registration;
+    }
+    ClientMemoryRegistrations prepared_memory_registrations;
+    if (active_registration != nullptr) {
+        prepared_memory_registrations.host = *active_registration;
+    }
+    if (memory_registrations != nullptr) {
+        prepared_memory_registrations.gpu = memory_registrations->gpu;
     }
 
     wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(
@@ -95,7 +102,8 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
             KVCM_LOG_WARN("fill span failed, storage config: %s", storage_config->ToString().c_str());
             return ec;
         }
-        ec = UpdateTairMempoolSdkConfig(sdk_backend_config, active_registration);
+        ec = UpdateTairMempoolSdkConfig(
+            sdk_backend_config, memory_registrations == nullptr ? nullptr : &prepared_memory_registrations);
         if (ec != ER_OK) {
             KVCM_LOG_WARN("fill tair mempool span failed, storage config: %s", storage_config->ToString().c_str());
             return ec;
@@ -419,7 +427,7 @@ ClientErrorCode SdkWrapper::PrepareSharedMemoryRegistration(const SharedMemoryRe
 }
 
 ClientErrorCode SdkWrapper::UpdateTairMempoolSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
-                                                       const SharedMemoryRegistration *shared_memory_registration) {
+                                                       const ClientMemoryRegistrations *memory_registrations) {
     if (!IsTairMempoolStorageType(sdk_backend_config->type())) {
         return ER_OK;
     }
@@ -428,12 +436,15 @@ ClientErrorCode SdkWrapper::UpdateTairMempoolSdkConfig(const std::shared_ptr<Sdk
         KVCM_LOG_WARN("convert to tair mempool config failed");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
-    if (shared_memory_registration == nullptr || shared_memory_registration->fd < 0) {
+    if (memory_registrations == nullptr) {
         return ER_OK;
     }
-    config->set_shm_fd(shared_memory_registration->fd);
-    config->set_shm_size(shared_memory_registration->size);
-    config->set_client_base(shared_memory_registration->base);
+    if (memory_registrations->host.fd >= 0) {
+        config->set_shm_fd(memory_registrations->host.fd);
+        config->set_shm_size(memory_registrations->host.size);
+        config->set_client_base(memory_registrations->host.base);
+    }
+    config->set_gpu_memory_spans(memory_registrations->gpu);
     return ER_OK;
 }
 

@@ -19,6 +19,10 @@ public:
     Create(const std::string &client_config,
            const InitParams &init_params,
            const SharedMemoryRegistration &shared_memory_registration);
+    static std::unique_ptr<TransferClient>
+    Create(const std::string &client_config,
+           const InitParams &init_params,
+           const ClientMemoryRegistrations &memory_registrations);
 
     virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                          const BlockBuffers &block_buffers,
