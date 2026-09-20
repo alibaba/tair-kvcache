@@ -41,6 +41,15 @@ TairMempool backend exists, one KVCM-selected MetaService discovery URL:
 }
 ```
 
+The selected URL keeps the storage's discovery scheme. KVCM supports both
+`spectrum://<virtual_service_id>?port=<port>` and
+`vipserver://<domain>?port=<port>&timeout=<seconds>&use_dns=<0|1>` candidates; it does not translate
+one scheme into the other. Missing `port` defaults to `12348`. For `vipserver://`, `timeout` is in
+seconds and must be in `[1, 3600]`; `use_dns` is optional and must be `0` or `1`. For both schemes,
+`port` must be in `[1, 65535]`, and other well-formed query parameters are preserved. The complete
+canonical URL must not exceed 255 bytes so it fits the TairMempool consumer IPC field. Invalid
+discovery URLs are excluded from selection.
+
 KVCM first finds the lowest valid storage usage ratio among available TairMempool
 `storage_candidates`. Within five percentage points of that minimum, it selects the backend with the
 fewest healthy registered consumers; remaining ties use the lower usage ratio and then the configured

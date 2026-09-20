@@ -61,41 +61,34 @@ namespace {
 
 constexpr double kTairMempoolUsageRatioWindow = 0.05;
 constexpr const char *kDefaultTairMempoolMetaServicePort = "12348";
+constexpr size_t kMaxTairMempoolMetaServiceUrlLength = 255;
+constexpr uint32_t kMinVipserverTimeoutSeconds = 1;
+constexpr uint32_t kMaxVipserverTimeoutSeconds = 3600;
 
-bool IsValidPort(std::string_view value) {
+bool IsUnsignedIntegerInRange(std::string_view value, uint32_t min_value, uint32_t max_value) {
     if (value.empty()) {
         return false;
     }
-    uint32_t port = 0;
+    uint32_t parsed = 0;
     for (const char ch : value) {
         if (ch < '0' || ch > '9') {
             return false;
         }
         const uint32_t digit = static_cast<uint32_t>(ch - '0');
-        if (port > (65535 - digit) / 10) {
+        if (parsed > max_value / 10 || (parsed == max_value / 10 && digit > max_value % 10)) {
             return false;
         }
-        port = port * 10 + digit;
+        parsed = parsed * 10 + digit;
     }
-    return port != 0;
+    return parsed >= min_value;
 }
 
-std::string CanonicalizeTairMempoolMetaServiceUrl(const std::string &url) {
-    if (std::any_of(url.begin(), url.end(), [](unsigned char ch) { return std::isspace(ch) != 0; }) ||
-        url.find('#') != std::string::npos) {
-        return {};
-    }
-
-    ServiceDiscoveryUrl parsed;
-    if (!ServiceDiscoveryUrl::Parse(url, parsed) || parsed.scheme != "spectrum" || parsed.body.empty()) {
-        return {};
-    }
-
+std::string CanonicalizeSpectrumMetaServiceUrl(const ServiceDiscoveryUrl &parsed) {
     std::string virtual_service_id = parsed.body;
     std::string port = kDefaultTairMempoolMetaServicePort;
     const auto port_it = parsed.params.find("port");
     if (port_it != parsed.params.end()) {
-        if (!IsValidPort(port_it->second)) {
+        if (!IsUnsignedIntegerInRange(port_it->second, 1, 65535)) {
             return {};
         }
         port = port_it->second;
@@ -107,7 +100,7 @@ std::string CanonicalizeTairMempoolMetaServiceUrl(const std::string &url) {
             return {};
         }
         const std::string legacy_port = virtual_service_id.substr(colon + 1);
-        if (!IsValidPort(legacy_port)) {
+        if (!IsUnsignedIntegerInRange(legacy_port, 1, 65535)) {
             return {};
         }
         port = legacy_port;
@@ -128,6 +121,71 @@ std::string CanonicalizeTairMempoolMetaServiceUrl(const std::string &url) {
         }
     }
     return canonical;
+}
+
+bool IsValidVipserverDomain(std::string_view domain) {
+    if (domain.empty() || domain.size() > 255 || domain.front() == '.' || domain.front() == '-' ||
+        domain.back() == '.' || domain.back() == '-') {
+        return false;
+    }
+    return std::all_of(domain.begin(), domain.end(), [](unsigned char ch) {
+        return std::isalnum(ch) || ch == '.' || ch == '-' || ch == '_';
+    });
+}
+
+std::string CanonicalizeVipserverMetaServiceUrl(const ServiceDiscoveryUrl &parsed) {
+    if (!IsValidVipserverDomain(parsed.body)) {
+        return {};
+    }
+
+    std::string port = kDefaultTairMempoolMetaServicePort;
+    const auto port_it = parsed.params.find("port");
+    if (port_it != parsed.params.end()) {
+        if (!IsUnsignedIntegerInRange(port_it->second, 1, 65535)) {
+            return {};
+        }
+        port = port_it->second;
+    }
+
+    const auto timeout_it = parsed.params.find("timeout");
+    if (timeout_it != parsed.params.end() &&
+        !IsUnsignedIntegerInRange(timeout_it->second, kMinVipserverTimeoutSeconds, kMaxVipserverTimeoutSeconds)) {
+        return {};
+    }
+    const auto use_dns_it = parsed.params.find("use_dns");
+    if (use_dns_it != parsed.params.end() &&
+        !IsUnsignedIntegerInRange(use_dns_it->second, 0, 1)) {
+        return {};
+    }
+
+    std::string canonical = "vipserver://" + parsed.body + "?port=" + port;
+    for (const auto &[key, value] : parsed.params) {
+        if (key != "port") {
+            canonical += "&" + key + "=" + value;
+        }
+    }
+    return canonical;
+}
+
+std::string CanonicalizeTairMempoolMetaServiceUrl(const std::string &url) {
+    if (std::any_of(url.begin(), url.end(), [](unsigned char ch) { return std::isspace(ch) != 0; }) ||
+        url.find('#') != std::string::npos) {
+        return {};
+    }
+
+    ServiceDiscoveryUrl parsed;
+    if (!ServiceDiscoveryUrl::Parse(url, parsed) || parsed.body.empty()) {
+        return {};
+    }
+    std::string canonical;
+    if (parsed.scheme == "spectrum") {
+        canonical = CanonicalizeSpectrumMetaServiceUrl(parsed);
+    } else if (parsed.scheme == "vipserver") {
+        canonical = CanonicalizeVipserverMetaServiceUrl(parsed);
+    } else {
+        return {};
+    }
+    return canonical.size() <= kMaxTairMempoolMetaServiceUrlLength ? canonical : std::string{};
 }
 
 } // namespace

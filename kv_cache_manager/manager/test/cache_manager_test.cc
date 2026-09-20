@@ -10407,13 +10407,110 @@ TEST_F(CacheManagerTest, RegisterInstanceCanonicalizesDefaultTairMempoolPort) {
     EXPECT_EQ("spectrum://v-default?port=12348", selected_url);
 }
 
+TEST_F(CacheManagerTest, RegisterInstanceCanonicalizesVipserverMetaServiceUrl) {
+    RegisterSchedulingTairStorage("pace_vipserver",
+                                  "vipserver://pace-meta-service.pace1.na130.vipserver?timeout=10&use_dns=0&zone=cn",
+                                  {true, 0.20, 0, 2});
+    CreateSchedulingGroup("scheduling_vipserver", {"pace_vipserver"});
+
+    std::string selected_url;
+    auto [ec, _] = cache_manager_->RegisterInstance(request_context_.get(),
+                                                     "scheduling_vipserver",
+                                                     "scheduling_vipserver_instance",
+                                                     64,
+                                                     createLocationSpecInfos(),
+                                                     createModelDeployment(),
+                                                     {},
+                                                     CacheManager::QueryType::QT_UNSPECIFIED,
+                                                     &selected_url);
+
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ("vipserver://pace-meta-service.pace1.na130.vipserver?port=12348&timeout=10&use_dns=0&zone=cn",
+              selected_url);
+}
+
+TEST_F(CacheManagerTest, RegisterInstanceSelectsVipserverInsideCapacityWindow) {
+    RegisterSchedulingTairStorage("pace_spectrum", "spectrum://v-spectrum?port=12348", {true, 0.20, 10, 2});
+    RegisterSchedulingTairStorage("pace_vipserver",
+                                  "vipserver://pace-meta-service.pace1.na130.vipserver?port=12348",
+                                  {true, 0.23, 2, 2});
+    CreateSchedulingGroup("scheduling_mixed_discovery", {"pace_spectrum", "pace_vipserver"});
+
+    std::string selected_url;
+    auto [ec, _] = cache_manager_->RegisterInstance(request_context_.get(),
+                                                     "scheduling_mixed_discovery",
+                                                     "scheduling_mixed_discovery_instance",
+                                                     64,
+                                                     createLocationSpecInfos(),
+                                                     createModelDeployment(),
+                                                     {},
+                                                     CacheManager::QueryType::QT_UNSPECIFIED,
+                                                     &selected_url);
+
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ("vipserver://pace-meta-service.pace1.na130.vipserver?port=12348", selected_url);
+}
+
+TEST_F(CacheManagerTest, RegisterInstanceIgnoresInvalidVipserverMetaServiceUrls) {
+    RegisterSchedulingTairStorage("pace_valid", "spectrum://v-valid?port=12348", {true, 0.20, 5, 2});
+    RegisterSchedulingTairStorage(
+        "pace_bad_domain", "vipserver://.invalid?port=12348", {true, 0.01, 0, 2});
+    RegisterSchedulingTairStorage(
+        "pace_bad_port", "vipserver://pace-meta-service.vipserver?port=0", {true, 0.01, 0, 2});
+    RegisterSchedulingTairStorage(
+        "pace_bad_timeout", "vipserver://pace-meta-service.vipserver?timeout=3601", {true, 0.01, 0, 2});
+    RegisterSchedulingTairStorage(
+        "pace_bad_use_dns", "vipserver://pace-meta-service.vipserver?use_dns=2", {true, 0.01, 0, 2});
+    CreateSchedulingGroup("scheduling_invalid_vipserver",
+                          {"pace_valid", "pace_bad_domain", "pace_bad_port", "pace_bad_timeout", "pace_bad_use_dns"});
+
+    std::string selected_url;
+    auto [ec, _] = cache_manager_->RegisterInstance(request_context_.get(),
+                                                     "scheduling_invalid_vipserver",
+                                                     "scheduling_invalid_vipserver_instance",
+                                                     64,
+                                                     createLocationSpecInfos(),
+                                                     createModelDeployment(),
+                                                     {},
+                                                     CacheManager::QueryType::QT_UNSPECIFIED,
+                                                     &selected_url);
+
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ("spectrum://v-valid?port=12348", selected_url);
+}
+
+TEST_F(CacheManagerTest, RegisterInstanceEnforcesConsumerMetaServiceUrlLengthLimit) {
+    const std::string max_length_domain(232, 'a');
+    const std::string too_long_domain(233, 'b');
+    RegisterSchedulingTairStorage(
+        "pace_max_length", "vipserver://" + max_length_domain, {true, 0.20, 0, 2});
+    RegisterSchedulingTairStorage(
+        "pace_too_long", "vipserver://" + too_long_domain, {true, 0.01, 0, 2});
+    CreateSchedulingGroup("scheduling_url_length", {"pace_max_length", "pace_too_long"});
+
+    std::string selected_url;
+    auto [ec, _] = cache_manager_->RegisterInstance(request_context_.get(),
+                                                     "scheduling_url_length",
+                                                     "scheduling_url_length_instance",
+                                                     64,
+                                                     createLocationSpecInfos(),
+                                                     createModelDeployment(),
+                                                     {},
+                                                     CacheManager::QueryType::QT_UNSPECIFIED,
+                                                     &selected_url);
+
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ(255u, selected_url.size());
+    EXPECT_EQ("vipserver://" + max_length_domain + "?port=12348", selected_url);
+}
+
 TEST_F(CacheManagerTest, RegisterInstanceIgnoresInvalidUnavailableAndMigrationOnlyCandidates) {
     RegisterSchedulingTairStorage("pace_first", "spectrum://v-first?port=12348", {true, 0.20, 3, 2});
     RegisterSchedulingTairStorage("pace_tie", "spectrum://v-tie?port=12348", {true, 0.20, 3, 2});
     RegisterSchedulingTairStorage("pace_invalid", "spectrum://v-invalid?port=12348", {false, 0.01, 0, 2});
     RegisterSchedulingTairStorage(
         "pace_unavailable", "spectrum://v-unavailable?port=12348", {true, 0.01, 0, 2}, false);
-    RegisterSchedulingTairStorage("pace_bad_url", "vipserver://legacy", {true, 0.01, 0, 2});
+    RegisterSchedulingTairStorage("pace_bad_url", "unsupported://legacy", {true, 0.01, 0, 2});
     RegisterSchedulingTairStorage("pace_migration", "spectrum://v-migration?port=12348", {true, 0.01, 0, 2});
     CreateSchedulingGroup("scheduling_filters",
                           {"pace_first", "pace_tie", "pace_invalid", "pace_unavailable", "pace_bad_url"},
