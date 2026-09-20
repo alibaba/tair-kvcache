@@ -351,6 +351,29 @@ TEST_F(NfsBackendTest, TestKvMetaDeleteConfirmsAllocationThatWasNeverMaterialize
     EXPECT_FALSE(std::filesystem::exists(object_path));
 }
 
+TEST_F(NfsBackendTest, TestKvMetaDeleteDoesNotTreatAMissingConfiguredRootAsRemoteAbsence) {
+    NfsBackend backend(metrics_registry_);
+    auto spec = std::make_shared<NfsStorageSpec>();
+    spec->set_key_count_per_file(1);
+    spec->set_root_path(test_root_);
+    const StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "test_nfs", spec);
+    ASSERT_EQ(EC_OK, backend.Open(storage_config, "open"));
+    ASSERT_FALSE(std::filesystem::exists(test_root_));
+
+    const std::string object_key = "kvmeta/1/2/" + std::string(kKvMetaObjectNonceBytes, 'm');
+    DataStorageUri uri;
+    uri.SetProtocol(ToString(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    uri.SetHostName("test_nfs");
+    uri.SetPath((std::filesystem::path(test_root_) / object_key).string());
+    uri.SetParam("size", "64");
+
+    // An unmounted NFS root can look exactly like an absent local path. Keep
+    // the durable tombstone instead of releasing quota on that observation.
+    EXPECT_EQ((std::vector<ErrorCode>{EC_IO_ERROR}),
+              backend.DeleteAndConfirmAbsent({uri}, "missing_configured_root", nullptr));
+    EXPECT_FALSE(std::filesystem::exists(test_root_));
+}
+
 TEST_F(NfsBackendTest, TestKvMetaDeleteReportsFilesystemFailureWithoutClaimingAbsence) {
     NfsBackend backend(metrics_registry_);
     auto spec = std::make_shared<NfsStorageSpec>();

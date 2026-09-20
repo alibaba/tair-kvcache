@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -50,6 +51,37 @@ bool IsExactObjectBuffer(const kv_cache_manager::BlockBuffer &buffer, const std:
         total_size += iov.size;
     }
     return total_size == expected_size;
+}
+
+bool HasExistingKvMetaNamespaceRoot(const std::string &object_path) noexcept {
+    try {
+        // object = root/kvmeta/instance-hash/key-hash/nonce. The configured
+        // root is a deployment boundary and must already be mounted. Creating
+        // it lazily could write to the local mountpoint after an NFS outage.
+        std::filesystem::path root(object_path);
+        for (int level = 0; level < 4; ++level) {
+            root = root.parent_path();
+        }
+        const std::string root_string = root.string();
+        errno = 0;
+        const int root_fd = ::open(root_string.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (root_fd < 0) {
+            KVCM_LOG_ERROR("KVMeta configured namespace root is unavailable, path: %s, msg: %s",
+                           root_string.c_str(),
+                           std::strerror(errno));
+            return false;
+        }
+        if (::close(root_fd) != 0) {
+            KVCM_LOG_ERROR("KVMeta configured namespace root close failed, path: %s, msg: %s",
+                           root_string.c_str(),
+                           std::strerror(errno));
+            return false;
+        }
+        return true;
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("KVMeta namespace root validation caught exception: %s", e.what());
+    } catch (...) { KVCM_LOG_ERROR("KVMeta namespace root validation caught unknown exception"); }
+    return false;
 }
 
 class MmapHelper {
@@ -828,6 +860,9 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
         return ER_INVALID_PARAMS;
     }
     if (variable_object_size_enabled_) {
+        if (!HasExistingKvMetaNamespaceRoot(file_path)) {
+            return ER_FILE_IO_ERROR;
+        }
         std::error_code directory_ec;
         std::filesystem::create_directories(std::filesystem::path(file_path).parent_path(), directory_ec);
         if (directory_ec) {
@@ -985,6 +1020,13 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
         KVCM_LOG_ERROR("KVMeta Put fsync failed for file %s", file_path.c_str());
         return ER_FILE_IO_ERROR;
     }
+    if (variable_object_size_enabled_ && !SyncKvMetaObjectDirectories(file_path)) {
+        // fsync(file) does not make a newly created directory entry durable.
+        // The nonce file and each lazily-created KVMeta namespace directory
+        // must survive the same crash boundary as the committed metadata.
+        KVCM_LOG_ERROR("KVMeta Put could not persist namespace directories for file %s", file_path.c_str());
+        return ER_FILE_IO_ERROR;
+    }
     if (variable_object_size_enabled_) {
         if (!helper.Close()) {
             KVCM_LOG_ERROR("KVMeta Put could not close the synchronized file %s", file_path.c_str());
@@ -1001,5 +1043,42 @@ bool LocalFileSdk::SyncMappedFile(void *address, const std::size_t length) const
 }
 
 bool LocalFileSdk::SyncFileDescriptor(const int fd) const { return fsync(fd) == 0; }
+
+bool LocalFileSdk::SyncKvMetaObjectDirectories(const std::string &object_path) const noexcept {
+    try {
+        // A canonical object is root/kvmeta/instance-hash/key-hash/nonce.
+        // Persist deepest-first so both the file entry and every directory
+        // entry created on first use are covered before metadata publication.
+        std::filesystem::path directory = std::filesystem::path(object_path).parent_path();
+        for (int level = 0; level < 4; ++level) {
+            const std::string directory_string = directory.string();
+            errno = 0;
+            const int directory_fd = ::open(directory_string.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (directory_fd < 0) {
+                KVCM_LOG_ERROR("KVMeta Put could not open namespace directory %s: %s",
+                               directory_string.c_str(),
+                               std::strerror(errno));
+                return false;
+            }
+            errno = 0;
+            const int sync_result = ::fsync(directory_fd);
+            const int sync_errno = errno;
+            errno = 0;
+            const int close_result = ::close(directory_fd);
+            const int close_errno = errno;
+            if (sync_result != 0 || close_result != 0) {
+                KVCM_LOG_ERROR("KVMeta Put could not persist namespace directory %s: %s",
+                               directory_string.c_str(),
+                               std::strerror(sync_result != 0 ? sync_errno : close_errno));
+                return false;
+            }
+            directory = directory.parent_path();
+        }
+        return true;
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("KVMeta Put namespace sync caught exception: %s", e.what());
+    } catch (...) { KVCM_LOG_ERROR("KVMeta Put namespace sync caught unknown exception"); }
+    return false;
+}
 
 } // namespace kv_cache_manager

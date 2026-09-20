@@ -979,6 +979,40 @@ class KvMetaObjectClientTest(unittest.TestCase):
         self.assertTrue(native.closed)
         self.assertEqual(native.close_calls, 1)
 
+    def test_interrupted_condition_exit_after_detach_restores_live_client(self):
+        class InterruptAfterDetachCondition(threading.Condition):
+            def __init__(self):
+                super().__init__(threading.Lock())
+                self.client = None
+                self.interrupt = True
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                result = super().__exit__(exc_type, exc_value, traceback)
+                if (
+                    self.interrupt
+                    and self.client is not None
+                    and self.client._client is None
+                ):
+                    self.interrupt = False
+                    raise KeyboardInterrupt()
+                return result
+
+        client, native, _ = _client()
+        lifecycle = InterruptAfterDetachCondition()
+        lifecycle.client = client
+        client._lifecycle = lifecycle
+
+        with self.assertRaises(KeyboardInterrupt):
+            client.close()
+        self.assertFalse(client._closing)
+        self.assertFalse(client._closed)
+        self.assertIs(client._client, native)
+
+        client.load(["key"], [_Tensor()])
+        client.close()
+        self.assertTrue(native.closed)
+        self.assertEqual(native.close_calls, 1)
+
     def test_interrupted_operation_admission_does_not_strand_close(self):
         class InterruptAfterAdd(set):
             def add(self, item):

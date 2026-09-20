@@ -667,12 +667,19 @@ test。
 
 NFS 的 KVMeta 写路径把随机 URI 当作不可复用 generation：使用 `O_EXCL|O_NOFOLLOW` 排他创建，已存在路径直接失败，
 不会覆盖 nonce 碰撞或 stale orphan；创建、fallocate、mmap、复制、`msync`、文件 `fsync` 和 close 始终持有同一个
-descriptor，消除 create/close/reopen 的替换窗口。任一阶段失败都不发布 actual URI，并按 inode identity best-effort
+descriptor，随后按 key-hash、instance-hash、`kvmeta/`、配置 root 的顺序 `fsync` 四层目录，确保新文件和首次创建的
+namespace entry 与 committed metadata 使用同一故障边界；目录同步不受支持或失败时同样 fail closed。该顺序消除
+create/close/reopen 的替换窗口。任一阶段失败都不发布 actual URI，并按 inode identity best-effort
 删除本调用创建的半文件；即使本地清理失败，durable session owner/GC 仍持有最终清理责任。读路径同样使用
 `O_NOFOLLOW`，并在搬运前要求 regular file、物理长度、URI size 和完整 caller buffer 精确一致。普通 fixed-block
-LocalFile SDK 仍保留已有的可覆盖与 `msync` best-effort 行为。该 barrier 覆盖文件内容、inode 与 size；NFS
+LocalFile SDK 仍保留已有的可覆盖与 `msync` best-effort 行为。该 barrier 覆盖文件内容、inode、size 与 namespace；NFS
 mount/server 自身的稳定存储语义仍必须在部署验收中验证。Cache 不是权威数据源，重启后极端情况下的对象缺失仍必须
 由 RTP Load-failure fallback/repair 处理。
+
+配置的 NFS root 是部署边界，必须在 KVCM server 与 data client 启动前预创建并确认挂载，exact 路径不会替运维侧
+创建该 root。否则 NFS 未挂载时的本地 `ENOENT` 可能被误判为远端 generation 已不存在，或者 client 误把对象写进
+本机 mountpoint。写入遇到缺失 root 会在创建任何目录前失败；删除/GC 遇到缺失 root 会保留 tombstone 与 logical usage，
+等待挂载恢复后重试，不能把这种状态当成 absence proof。
 
 ### 7.1 内部 TairMempool/PACE 适配
 

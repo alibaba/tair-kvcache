@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstddef>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <shared_mutex>
@@ -58,6 +59,14 @@ protected:
         StartupConfigLoader loader;
         ASSERT_TRUE(loader.Init(registry_manager_));
         ASSERT_TRUE(loader.Load(""));
+
+        const auto nfs_backend = registry_manager_->data_storage_manager()->GetDataStorageBackend("nfs_01");
+        ASSERT_TRUE(nfs_backend);
+        const auto nfs_spec = std::dynamic_pointer_cast<NfsStorageSpec>(nfs_backend->GetStorageConfig().storage_spec());
+        ASSERT_TRUE(nfs_spec);
+        std::error_code nfs_root_ec;
+        std::filesystem::create_directories(nfs_spec->root_path(), nfs_root_ec);
+        ASSERT_FALSE(nfs_root_ec) << nfs_root_ec.message();
 
         kv_meta_manager_ = std::make_shared<KvMetaManager>(cache_manager_, registry_manager_);
         ASSERT_TRUE(kv_meta_manager_->Init());

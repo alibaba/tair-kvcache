@@ -865,43 +865,60 @@ class KvMetaObjectClient:
     def close(self) -> None:
         """Wait for any in-flight call and release the native client once."""
 
-        with self._lifecycle:
-            while self._closing and not self._closed:
-                self._lifecycle.wait_for(
-                    lambda: self._closed or not self._closing
-                )
-            if self._closed:
-                return
-            client = None
-            try:
+        client = None
+        owns_close = False
+        detached = False
+        native_close_started = False
+        try:
+            with self._lifecycle:
+                while self._closing and not self._closed:
+                    self._lifecycle.wait_for(
+                        lambda: self._closed or not self._closing
+                    )
+                if self._closed:
+                    return
+                # Record local ownership before mutating shared state so an
+                # asynchronously injected BaseException at either assignment
+                # can still execute the outer recovery path.
+                owns_close = True
                 self._closing = True
                 self._lifecycle.wait_for(lambda: not self._active_operations)
                 client = self._client
                 self._client = None
-            except BaseException:
-                # A signal or task cancellation must not strand close
-                # ownership. Wake another closer and keep the still-live
-                # client usable after this interrupted attempt.
-                if client is not None and self._client is None:
-                    self._client = client
-                self._closing = False
-                self._lifecycle.notify_all()
-                raise
-        try:
+                detached = True
+
             for method_name in ("close", "Close"):
                 close = getattr(client, method_name, None)
                 if callable(close):
+                    # Once native close has started its result can be
+                    # ambiguous. Never restore that client to the live state.
+                    native_close_started = True
                     close()
                     break
+        except BaseException:
+            if owns_close and not native_close_started:
+                # This also covers an exception raised while leaving the
+                # Condition context after a successful detach. Keeping the
+                # whole ownership transition under the outer try removes the
+                # otherwise unprotected bytecode window before native close.
+                with self._lifecycle:
+                    if client is not None and self._client is None:
+                        self._client = client
+                    detached = False
+                    owns_close = False
+                    self._closing = False
+                    self._lifecycle.notify_all()
+            raise
         finally:
-            # Ensure native destruction happens while registered memory is
-            # still owned, including bindings without an explicit close.
-            client = None
-            with self._lifecycle:
-                self._registration_owner = None
-                self._closed = True
-                self._closing = False
-                self._lifecycle.notify_all()
+            if detached:
+                # Ensure native destruction happens while registered memory
+                # is still owned, including bindings without explicit close.
+                client = None
+                with self._lifecycle:
+                    self._registration_owner = None
+                    self._closed = True
+                    self._closing = False
+                    self._lifecycle.notify_all()
 
     def __enter__(self) -> "KvMetaObjectClient":
         with self._lifecycle:

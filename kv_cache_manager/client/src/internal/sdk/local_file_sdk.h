@@ -32,9 +32,11 @@ private:
 protected:
     // Virtual only to make the two durability failure paths deterministically
     // testable. KVMeta requires both mapped data and the file inode/size to be
-    // synchronous before its caller may publish committed metadata.
+    // synchronous, and its four-level namespace entries durable, before its
+    // caller may publish committed metadata.
     virtual bool SyncMappedFile(void *address, std::size_t length) const;
     virtual bool SyncFileDescriptor(int fd) const;
+    virtual bool SyncKvMetaObjectDirectories(const std::string &object_path) const noexcept;
 
 private:
     bool IsAllowedObjectSize(std::size_t size) const;

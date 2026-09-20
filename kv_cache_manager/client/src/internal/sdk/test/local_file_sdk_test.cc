@@ -10,6 +10,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/local_file_sdk.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #ifdef USING_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -62,6 +63,20 @@ protected:
 
 private:
     mutable std::size_t file_sync_calls_{0};
+};
+
+class FailingDirectorySyncLocalFileSdk final : public LocalFileSdk {
+public:
+    std::size_t directory_sync_calls() const noexcept { return directory_sync_calls_; }
+
+protected:
+    bool SyncKvMetaObjectDirectories(const std::string &) const noexcept override {
+        ++directory_sync_calls_;
+        return false;
+    }
+
+private:
+    mutable std::size_t directory_sync_calls_{0};
 };
 
 DataStorageUri MakeUri(const std::string &file_path, uint64_t blkid, size_t size = 1024) {
@@ -253,6 +268,23 @@ TEST_F(LocalFileSdkTest, TestKvMetaPutFailsClosedWhenFileMetadataSyncFails) {
     FreeBuffers(buffers);
 }
 
+TEST_F(LocalFileSdkTest, TestKvMetaPutFailsClosedWhenNamespaceSyncFails) {
+    FailingDirectorySyncLocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    constexpr std::size_t kObjectSize = 19;
+    const DataStorageUri uri = MakeUri(root_path_ + "/local_file/kvmeta_directory_sync_failure", 0, kObjectSize);
+    BlockBuffers buffers = {MakeCpuBuffer(kObjectSize, 0x6C)};
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    EXPECT_EQ(ER_SDKWRITE_ERROR, sdk.Put({uri}, buffers, actual_remote_uris));
+    EXPECT_EQ(1, sdk.directory_sync_calls());
+    EXPECT_TRUE(actual_remote_uris->empty());
+    EXPECT_FALSE(std::filesystem::exists(uri.GetPath()));
+    FreeBuffers(buffers);
+}
+
 TEST_F(LocalFileSdkTest, TestKvMetaPutAndGetExactObject) {
     LocalFileSdk sdk;
     auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
@@ -400,6 +432,28 @@ TEST_F(LocalFileSdkTest, TestKvMetaPutNeverOverwritesAPreExistingGeneration) {
     ASSERT_TRUE(persisted.good());
     const std::string contents((std::istreambuf_iterator<char>(persisted)), std::istreambuf_iterator<char>());
     EXPECT_EQ(std::string(kObjectSize, 'o'), contents);
+    FreeBuffers(buffers);
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaPutNeverCreatesAMissingConfiguredRoot) {
+    LocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    constexpr std::size_t kObjectSize = 17;
+    const std::filesystem::path missing_root = root_path_ + "/missing_kvmeta_root";
+    std::error_code cleanup_ec;
+    std::filesystem::remove_all(missing_root, cleanup_ec);
+    ASSERT_FALSE(cleanup_ec) << cleanup_ec.message();
+    const std::string object_key = "kvmeta/1/2/" + std::string(kKvMetaObjectNonceBytes, 'r');
+    const DataStorageUri uri = MakeUri((missing_root / object_key).string(), 0, kObjectSize);
+    BlockBuffers buffers = {MakeCpuBuffer(kObjectSize, 0x6D)};
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+
+    EXPECT_EQ(ER_SDKWRITE_ERROR, sdk.Put({uri}, buffers, actual_remote_uris));
+    EXPECT_TRUE(actual_remote_uris->empty());
+    EXPECT_FALSE(std::filesystem::exists(missing_root));
     FreeBuffers(buffers);
 }
 
