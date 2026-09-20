@@ -112,12 +112,14 @@ Group 预算分配完成后，每个计划项分别受单 Instance 配置值和 
 
 这里的“按 LRU”用于从随机候选中选择较老的 victim，不是从全量 key 中直接取全局最老项。不同 Instance 的 LRU 时间不参与统一排序。
 
-候选不要求所有 backend 都实现真随机：Local 使用不触碰业务热度的分片轮转，Redis / async Redis 使用按 Instance
-前缀过滤、跨轮保存进度的有界 SCAN。Redis 单轮最多读取固定数量的 page，稀疏租户允许本轮返回不足并在后续轮次
-继续，不用全库 `RANDOMKEY` 的碰撞概率决定 GC 能否推进。上述采样只在 Reclaimer worker 中执行，不增加 put/get
-主链路操作。
+候选不要求所有 backend 都实现真随机：Local 每次按分片最旧 LRU 提示选择冷分片，并通过只作用于完整 Local
+采样源的 maintenance touch 让不可回收前缀在后续轮次让位；Redis / async Redis 使用按 Instance 前缀过滤、跨轮保存
+进度的有界 SCAN。Redis 单轮最多读取固定数量的 page，稀疏租户允许本轮返回不足并在后续轮次继续，不用全库
+`RANDOMKEY` 的碰撞概率决定 GC 能否推进。Local 和 Redis 系列的状态化采样均按 Instance 使用单个采样任务；cached
+恢复期间按实际完整源选择 Redis，恢复完成后才切换到 Local，Redis key 不会被 touch 到不完整的 Local cache。上述
+采样只在 Reclaimer worker 中执行，不增加 put/get 主链路操作。
 
-公平预算可能集中到大 Instance。为避免一次提交超过 sampling worker 数，采样按 `key_sampling_size_per_task` 拆分为有界波次：每个波次最多占用当前可用 worker，完成后再提交下一波。所有波次共享同一 deadline；任一任务失败、超时、Reclaimer 暂停或 worker pool 已饱和时，本计划项整体失败，不提交部分采样结果。
+公平预算可能集中到大 Instance。对允许拆分的 backend，采样按 `key_sampling_size_per_task` 拆成有界波次：每个波次最多占用当前可用 worker，完成后再提交下一波；Local、Redis 和 async Redis 使用上一段的单任务规则。所有任务共享同一 deadline；任一任务失败、超时、Reclaimer 暂停或 worker pool 已饱和时，本计划项整体失败，不提交部分采样结果。
 
 ## 6. 异步 credit 与提前停止
 

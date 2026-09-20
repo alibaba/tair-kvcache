@@ -559,7 +559,8 @@ group 和 storage type 分别计算；metadata key 准入按**目标 instance**�
    当 cached metadata 仍在恢复、完整采样源是 Redis / async Redis 时，公共 sampler 使用按 Instance 前缀过滤的
    有界 SCAN：游标跨回收轮次保存，单轮工作量和 overflow 均有硬上限，稀疏 Instance 允许多轮收敛。它不依赖
    全库 `RANDOMKEY` 碰撞；Instance 前缀按 Redis glob 字面量转义，非法物理 key 被隔离跳过，每页扫描独立借还
-   client pool 连接，也不把扫描或属性读取放进 `Get` / `PutStart` 主链路；
+   client pool 连接，也不把扫描或属性读取放进 `Get` / `PutStart` 主链路。Local、Redis 和 async Redis 都按实际完整
+   采样源使用单任务；恢复期间不会把持久 Redis 采到的 key maintenance-touch 到尚未完整的 Local cache；
 3. 选择候选时先满足目标 instance key、storage type 等更具体的压力，再补 group 通用压力；每一类内部仍按
    `last_access_time` 排序。具体维度释放的 bytes 同时抵扣 group 压力，避免先淘汰一个全局最老但无关的对象，随后
    又淘汰真正受限对象的重复回收；

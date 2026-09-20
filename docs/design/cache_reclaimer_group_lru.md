@@ -266,7 +266,7 @@ struct GroupLruCandidate {
 
 Group LRU 的候选资格检查和最终准入另通过 `GetLocationMapsForMaintenance` 无副作用读取 Location；cached 恢复期间优先读热缓存，仅对缺 key 回查持久层且不回填。独立测试覆盖重复采样和 Location 读取后业务时间与物理 LRU 顺序不变，避免维护操作把冷数据读热。
 
-完整 Local 回收源在同一轮内使用单个采样任务请求该 Instance 的完整候选预算，不按 `sampling_size_per_task` 拆分，避免多个任务从相同冷前缀重复取样；完整预算是请求量，不保证一定采足。cached 恢复期间仍从持久层采样，允许按任务预算拆分。重复的纯采样调用可以返回相同冷 key，后续覆盖推进依赖业务访问、实际删除以及第 5.5 节的显式维护 touch。
+Local、Redis 和 async Redis 回收源在同一轮内都使用单个采样任务请求该 Instance 的完整候选预算，不按 `sampling_size_per_task` 拆分：Local 需要避免多个任务重复取得相同冷前缀，Redis sampler 则需要按一个串行游标/overflow 状态渐进推进。完整预算是请求量，不保证一定采足。cached 恢复期间实际采样源仍是完整持久层；若它是 Redis / async Redis，同样保持单任务，恢复完成后才切到 Local cache。只有当实际完整采样源是 Local 时，过滤失败的 key 才执行第 5.5 节的 maintenance touch；不能把持久 Redis 采到的 key 重定向 touch 到尚未完整的 Local cache。重复的纯 Local 采样调用可以返回相同冷 key，后续覆盖推进依赖业务访问、实际删除和显式 maintenance touch；Redis 覆盖推进依赖保存的 SCAN 游标。
 
 ### 6.2 Location 资格与删除准入分开
 

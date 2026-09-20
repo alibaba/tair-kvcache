@@ -200,6 +200,10 @@ public:
     bool GetPureLocalCacheHashSeed(uint32_t &out_hash_seed) const noexcept;
 
 private:
+    // Reclaim sampling must use the complete source: persistent while the hot
+    // cache is recovering, then cache after recovery. Keep every operation
+    // that depends on that choice on the same selector.
+    MetaStorageBackend *GetReclaimSamplingSource() const noexcept;
     void AsyncRecoverTask() noexcept;
     int64_t BackfillKeysToCache(const KeyTypeVec &keys,
                                 const CacheLocationMapVector &locations,
