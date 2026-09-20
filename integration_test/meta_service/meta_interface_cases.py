@@ -42,6 +42,16 @@ class MetaServiceClientBase(abc.ABC):
         return {}
 
     @abc.abstractmethod
+    def get_cache_meta(self, data, check_response=True) -> Dict:
+        """Get cache metadata for specified block keys"""
+        return {}
+
+    @abc.abstractmethod
+    def get_cache_locations_by_backend(self, data, check_response=True) -> Dict:
+        """Get cache locations using explicit backend selectors"""
+        return {}
+
+    @abc.abstractmethod
     def start_write_cache(self, data, check_response=True) -> Dict:
         """Start writing cache data"""
         return {}
@@ -176,6 +186,195 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         for i, (start_loc, get_loc) in enumerate(zip(start_write_locations, get_location_locations)):
             self.assertEqual(start_loc, get_loc,
                              f"Location {i} from startWriteCache and getCacheLocation should match")
+
+    def test_caller_checksum_retry_and_query_opt_in(self):
+        block_keys = [91001, 91002, 91003]
+        tp0_checksums = [0, -7, 9223372036854775807]
+        tp1_checksums = [-1, 42, -9223372036854775808]
+        self._client.register_instance({
+            "trace_id": "checksum-register",
+            "instance_group": "default",
+            "instance_id": self._instance_id,
+            "block_size": 128,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [
+                {"name": "tp0", "size": 1024},
+                {"name": "tp1", "size": 2048},
+            ],
+        })
+        peer_instance_id = f"{self._instance_id}-checksum-peer"
+        self._client.register_instance({
+            "trace_id": "checksum-peer-register",
+            "instance_group": "default",
+            "instance_id": peer_instance_id,
+            "block_size": 128,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [
+                {"name": "tp0", "size": 1024},
+                {"name": "tp1", "size": 2048},
+            ],
+        })
+        start = self._client.start_write_cache({
+            "trace_id": "checksum-start",
+            "instance_id": self._instance_id,
+            "block_keys": block_keys,
+            "write_timeout_seconds": 30,
+        })
+        session_id = start["write_session_id"]
+        finish_base = {
+            "instance_id": self._instance_id,
+            "write_session_id": session_id,
+            "success_blocks": {"bool_masks": {"values": [True, True, True]}},
+        }
+
+        # Instance ownership and mask shape are checked before consuming the
+        # write session, including when the caller does not submit checksums.
+        wrong_instance = dict(
+            finish_base,
+            trace_id="checksum-finish-wrong-instance",
+            instance_id=peer_instance_id,
+        )
+        rejected = self._client.finish_write_cache(wrong_instance, check_response=False)
+        self.assertEqual("INVALID_ARGUMENT", rejected["header"]["status"]["code"])
+        invalid_mask = dict(
+            finish_base,
+            trace_id="checksum-finish-invalid-mask",
+            success_blocks={"bool_masks": {"values": [True, True]}},
+        )
+        rejected = self._client.finish_write_cache(invalid_mask, check_response=False)
+        self.assertEqual("INVALID_ARGUMENT", rejected["header"]["status"]["code"])
+
+        malformed = dict(
+            finish_base,
+            trace_id="checksum-finish-malformed",
+            checksum_batches=[{
+                "location_spec_name": "tp0",
+                "checksums": [str(tp0_checksums[0])],
+            }],
+        )
+        rejected = self._client.finish_write_cache(malformed, check_response=False)
+        self.assertEqual("INVALID_ARGUMENT", rejected["header"]["status"]["code"])
+
+        # An unknown spec must also be rejected without consuming the session.
+        unknown_spec = dict(
+            finish_base,
+            trace_id="checksum-finish-unknown-spec",
+            checksum_batches=[{
+                "location_spec_name": "tp-missing",
+                "checksums": [str(value) for value in tp0_checksums],
+            }],
+        )
+        rejected = self._client.finish_write_cache(unknown_spec, check_response=False)
+        self.assertEqual("INVALID_ARGUMENT", rejected["header"]["status"]["code"])
+
+        # Every rejected request above leaves the exact StartWrite session retryable.
+        corrected = dict(
+            finish_base,
+            trace_id="checksum-finish-retry",
+            checksum_batches=[
+                {
+                    "location_spec_name": "tp0",
+                    "checksums": [str(value) for value in tp0_checksums],
+                },
+                {
+                    "location_spec_name": "tp1",
+                    "checksums": [str(value) for value in tp1_checksums],
+                },
+            ],
+        )
+        self._client.finish_write_cache(corrected)
+
+        query = {
+            "trace_id": "checksum-query-default",
+            "instance_id": self._instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": block_keys,
+            "block_mask": {"offset": 0},
+        }
+        default_result = self._client.get_cache_location(query)
+        self.assertEqual(len(block_keys), len(default_result["locations"]))
+        for location in default_result["locations"]:
+            for spec in location["location_specs"]:
+                self.assertFalse(spec.get("checksum_present", False))
+                self.assertEqual(0, int(spec.get("checksum", 0)))
+
+        query["trace_id"] = "checksum-query-opt-in"
+        query["include_checksums"] = True
+        opted_in = self._client.get_cache_location(query)
+        self._assert_spec_checksums(opted_in["locations"], "tp0", tp0_checksums)
+        self._assert_spec_checksums(opted_in["locations"], "tp1", tp1_checksums)
+
+        meta_result = self._client.get_cache_meta({
+            "trace_id": "checksum-meta-opt-in",
+            "instance_id": self._instance_id,
+            "block_keys": block_keys,
+            "block_mask": {"offset": 0},
+            "detail_level": 1,
+            "include_checksums": True,
+        })
+        self._assert_spec_checksums(meta_result["locations"], "tp0", tp0_checksums)
+        self._assert_spec_checksums(meta_result["locations"], "tp1", tp1_checksums)
+
+        backend_result = self._client.get_cache_locations_by_backend({
+            "trace_id": "checksum-backend-opt-in",
+            "instance_id": self._instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": block_keys,
+            "block_mask": {"offset": 0},
+            "backend_selectors": [{"backend_type": "ST_NFS", "strategy": "LSS_WEIGHTED_RANDOM"}],
+            "include_checksums": True,
+        })
+        backend_locations = [per_key["locations"][0] for per_key in backend_result["key_locations"]]
+        self._assert_spec_checksums(backend_locations, "tp0", tp0_checksums)
+        self._assert_spec_checksums(backend_locations, "tp1", tp1_checksums)
+
+        # StartWrite removes already-cached keys from its write session. Finish
+        # checksum vectors align with the two returned locations, never with
+        # this four-key original request.
+        compact_start = self._client.start_write_cache({
+            "trace_id": "checksum-compact-start",
+            "instance_id": self._instance_id,
+            "block_keys": [block_keys[0], 91004, block_keys[1], 91005],
+            "write_timeout_seconds": 30,
+        })
+        self.assertEqual(2, len(compact_start["locations"]))
+        compact_tp0 = [101, 102]
+        compact_tp1 = [201, 202]
+        self._client.finish_write_cache({
+            "trace_id": "checksum-compact-finish",
+            "instance_id": self._instance_id,
+            "write_session_id": compact_start["write_session_id"],
+            "success_blocks": {"bool_masks": {"values": [True, True]}},
+            "checksum_batches": [
+                {
+                    "location_spec_name": "tp0",
+                    "checksums": [str(value) for value in compact_tp0],
+                },
+                {
+                    "location_spec_name": "tp1",
+                    "checksums": [str(value) for value in compact_tp1],
+                },
+            ],
+        })
+        compact_query = self._client.get_cache_location({
+            "trace_id": "checksum-compact-query",
+            "instance_id": self._instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [91004, 91005],
+            "block_mask": {"offset": 0},
+            "include_checksums": True,
+        })
+        self._assert_spec_checksums(compact_query["locations"], "tp0", compact_tp0)
+        self._assert_spec_checksums(compact_query["locations"], "tp1", compact_tp1)
+
+    def _assert_spec_checksums(self, locations, spec_name, expected):
+        actual = []
+        for location in locations:
+            specs = {spec["name"]: spec for spec in location["location_specs"]}
+            self.assertIn(spec_name, specs)
+            self.assertTrue(specs[spec_name]["checksum_present"])
+            actual.append(int(specs[spec_name]["checksum"]))
+        self.assertEqual(expected, actual)
 
     def test_register_instance(self):
         # case: instance_id duplicated

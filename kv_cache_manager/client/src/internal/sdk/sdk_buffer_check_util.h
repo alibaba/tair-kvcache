@@ -52,6 +52,9 @@ private:
 
 class SdkBufferCheckPool {
     static constexpr size_t kDefaultCellNum = 4;
+    // Prevent a malformed environment value from forcing an unbounded host
+    // allocation before Init() has a chance to reject the configuration.
+    static constexpr size_t kMaxCellNum = 1024;
 
 public:
     explicit SdkBufferCheckPool(size_t cell_num = kDefaultCellNum);
@@ -93,6 +96,7 @@ private:
     std::condition_variable cv_;
     std::queue<Cell *> cell_queue_;
     std::vector<Cell> cells_;
+    size_t cell_num_;
     int device_id_ = -1;
 };
 

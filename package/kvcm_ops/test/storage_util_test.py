@@ -11,12 +11,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from kvcm_ops.kvcm.storage.util import (
     add_event_report_sub_parser,
+    add_integrity_args,
     add_pace_sub_parser,
     add_pace_ssd_sub_parser,
     gen_event_report_config_data,
+    gen_integrity_config_data,
     gen_pace_config_data,
     get_pace_storage_type,
 )
+from kvcm_ops.kvcm.storage.add_storage import create_add_storage_data
 from kvcm_ops.kvcm.storage import update_storage
 from kvcm_ops.kvcm.storage.update_storage import create_update_storage_data
 from kvcm_ops.kvcm.instance_group.util import CacheConfig
@@ -124,6 +127,76 @@ class PaceStorageArgsTest(unittest.TestCase):
                 self.assertEqual(expected_type, data["storage"]["storage_type"])
 
 
+class StorageIntegrityArgsTest(unittest.TestCase):
+    def _parse_args(self, method, *args):
+        parser = argparse.ArgumentParser()
+        add_integrity_args(parser, method)
+        return parser.parse_args(list(args))
+
+    def test_add_can_enable_meta_checksum(self):
+        args = self._parse_args("add_storage", "--enable_meta_checksum")
+        args.unique_name = "nfs"
+        args.trace_id = "trace"
+        data = create_add_storage_data(args, "nfs", {"root_path": "/tmp", "key_count_per_file": 8})
+
+        self.assertEqual(
+            {
+                "enable_meta_checksum": True,
+                "algo": "CA_CRC32_XOR_INT64",
+            },
+            data["storage"]["integrity"],
+        )
+
+    def test_update_omission_preserves_complete_integrity_object(self):
+        args = self._parse_args("update_storage")
+        existing = {
+            "enable_meta_checksum": True,
+            "enable_inline_header": False,
+            "inline_header_version": 0,
+            "algo": "CA_CRC32_XOR_INT64",
+        }
+
+        actual = gen_integrity_config_data(args, existing)
+
+        self.assertEqual(existing, actual)
+        self.assertIsNot(existing, actual)
+
+    def test_update_can_disable_without_dropping_other_fields(self):
+        args = self._parse_args("update_storage", "--disable_meta_checksum")
+        existing = {
+            "enable_meta_checksum": True,
+            "enable_inline_header": False,
+            "inline_header_version": 0,
+            "algo": "CA_CRC32_XOR_INT64",
+        }
+
+        actual = gen_integrity_config_data(args, existing)
+
+        self.assertFalse(actual["enable_meta_checksum"])
+        self.assertEqual("CA_CRC32_XOR_INT64", actual["algo"])
+        self.assertIn("inline_header_version", actual)
+
+    def test_update_enable_replaces_unspecified_algorithm_with_default(self):
+        args = self._parse_args("update_storage", "--enable_meta_checksum")
+        existing = {
+            "enable_meta_checksum": False,
+            "algo": "CA_UNSPECIFIED",
+        }
+
+        actual = gen_integrity_config_data(args, existing)
+
+        self.assertTrue(actual["enable_meta_checksum"])
+        self.assertEqual("CA_CRC32_XOR_INT64", actual["algo"])
+
+    def test_update_rejects_conflicting_enable_and_disable(self):
+        with self.assertRaises(SystemExit):
+            self._parse_args(
+                "update_storage",
+                "--enable_meta_checksum",
+                "--disable_meta_checksum",
+            )
+
+
 class PaceStorageUpdateTest(unittest.TestCase):
     def _args(self, media_type=None, storage_type="pace"):
         return SimpleNamespace(
@@ -151,6 +224,10 @@ class PaceStorageUpdateTest(unittest.TestCase):
                         "timeout": 5000,
                         "media_type": media_type,
                     },
+                    "integrity": {
+                        "enable_meta_checksum": True,
+                        "algo": "CA_CRC32_XOR_INT64",
+                    },
                 }
             ],
         }
@@ -165,6 +242,10 @@ class PaceStorageUpdateTest(unittest.TestCase):
         request = mock_post_and_print.call_args.args[1]
         self.assertEqual("ST_TAIRMEMPOOL_SSD", request["storage"]["storage_type"])
         self.assertEqual(5, request["storage"]["tair_mem_pool"]["media_type"])
+        self.assertEqual(
+            {"enable_meta_checksum": True, "algo": "CA_CRC32_XOR_INT64"},
+            request["storage"]["integrity"],
+        )
 
     @patch.object(update_storage, "http_post_and_print")
     @patch.object(update_storage, "http_post")

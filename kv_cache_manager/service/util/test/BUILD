@@ -3,6 +3,18 @@ load("//bazel:tf_proto.bzl", "tf_proto_library_cc")
 package(default_visibility = ["//visibility:private"])
 
 cc_binary(
+    name = "data_integrity_benchmark",
+    srcs = ["data_integrity_benchmark.cc"],
+    tags = ["manual"],
+    deps = [
+        "//kv_cache_manager/client:common",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/service/util:proto_message_json_util",
+        "@com_google_protobuf//:protobuf",
+    ],
+)
+
+cc_binary(
     name = "proto_message_json_benchmark",
     srcs = ["proto_message_json_benchmark.cc"],
     tags = ["manual"],
@@ -21,6 +33,18 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/service/util:access_log_writer",
         "@rapidjson",
+    ],
+)
+
+cc_test(
+    name = "ManagerMessageProtoUtilTest",
+    srcs = [
+        "manager_message_proto_util_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/service/util:manager_message_proto_util",
     ],
 )
 

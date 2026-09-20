@@ -250,8 +250,12 @@ protected:
         }
         {
             BlockMask success_block = static_cast<size_t>(6);
-            EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR,
+            EXPECT_EQ(ER_SERVICE_INVALID_ARGUMENT,
                       client->FinishWrite(prefix + "_4", write_session_id, success_block, {}));
+        }
+        {
+            BlockMask success_block = static_cast<size_t>(4);
+            EXPECT_EQ(ER_OK, client->FinishWrite(prefix + "_5", write_session_id, success_block, {}));
         }
     }
 

@@ -1,12 +1,17 @@
-#include "kv_cache_manager/client/src/internal/sdk/sdk_buffer_check_util.h"
+#include <limits>
+
 #include "kv_cache_manager/client/src/internal/sdk/musa_util.h"
+#include "kv_cache_manager/client/src/internal/sdk/sdk_buffer_check_util.h"
 #include "kv_cache_manager/common/env_util.h"
 
-using musaStream_t = MUstream_st*;
+using musaStream_t = MUstream_st *;
 
 namespace kv_cache_manager {
 
-size_t SdkBufferCheckUtil::min_cal_byte_size_ = EnvUtil::GetEnv("KVCM_CHECK_IOV_BYTE_SIZE", 4);
+size_t SdkBufferCheckUtil::min_cal_byte_size_ = [] {
+    const int64_t configured = EnvUtil::GetEnv<int64_t>("KVCM_CHECK_IOV_BYTE_SIZE", 4);
+    return configured > 0 ? static_cast<size_t>(configured) : 0;
+}();
 
 namespace {
 
@@ -26,15 +31,19 @@ __global__ void GetIovsCrcDevice(const IovDevice *iovs, int iovs_size, uint32_t 
         return;
     }
     const auto &iov = iovs[idx];
+    // Persisted legacy checksum contract: for odd sizes this intentionally
+    // skips the center byte, and the iov size is not part of the CRC input.
+    // Do not "fix" this in place; introduce a versioned algorithm instead.
+    const size_t current_cal_byte_size = cal_byte_size < iov.size / 2 ? cal_byte_size : iov.size / 2;
     const uint8_t *p = nullptr;
     uint8_t data;
     uint32_t crc = 0xFFFFFFFFu;
-    for (int i = 0; i < cal_byte_size; i++) {
+    for (size_t i = 0; i < current_cal_byte_size; i++) {
         p = static_cast<const uint8_t *>(iov.base);
         data = *(p + i);
         crc = Crc32ByteDevice(crc, data);
     }
-    for (int i = iov.size - cal_byte_size; i < iov.size; i++) {
+    for (size_t i = iov.size - current_cal_byte_size; i < iov.size; i++) {
         p = static_cast<const uint8_t *>(iov.base);
         data = *(p + i);
         crc = Crc32ByteDevice(crc, data);
@@ -45,6 +54,7 @@ __global__ void GetIovsCrcDevice(const IovDevice *iovs, int iovs_size, uint32_t 
 constexpr uint32_t kDefaultThreadsPerBlock = 512;
 
 struct ScopedMusaStream {
+    ScopedMusaStream() = default;
     musaStream_t h = nullptr;
     ~ScopedMusaStream() {
         if (h != nullptr) {
@@ -55,13 +65,18 @@ struct ScopedMusaStream {
     ScopedMusaStream &operator=(const ScopedMusaStream &) = delete;
 };
 
-}  // namespace
+} // namespace
 
 std::vector<uint32_t> SdkBufferCheckUtil::GetIovsCrc(
     const IovDevice *iovs_h_ptr, size_t iovs_size, IovDevice *iovs_d, uint32_t *crcs_d, GpuStream_t stream) {
-    size_t cal_byte_size = std::min(min_cal_byte_size_, iovs_h_ptr->size / 2);
-    if (cal_byte_size == 0) {
+    if (iovs_h_ptr == nullptr || iovs_d == nullptr || crcs_d == nullptr || iovs_size == 0 || min_cal_byte_size_ == 0 ||
+        iovs_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
         return {};
+    }
+    for (size_t i = 0; i < iovs_size; ++i) {
+        if (iovs_h_ptr[i].base == nullptr || iovs_h_ptr[i].size < 2) {
+            return {};
+        }
     }
     ScopedMusaStream owned_tmp;
     musaStream_t musa_actual_stream;
@@ -75,18 +90,20 @@ std::vector<uint32_t> SdkBufferCheckUtil::GetIovsCrc(
     }
     auto iovs_byte_size = sizeof(IovDevice) * iovs_size;
     CHECK_MUSA_ERROR_RETURN(
-        musaMemcpyAsync(iovs_d, iovs_h_ptr, iovs_byte_size, musaMemcpyHostToDevice, musa_actual_stream), {},
+        musaMemcpyAsync(iovs_d, iovs_h_ptr, iovs_byte_size, musaMemcpyHostToDevice, musa_actual_stream),
+        {},
         "musaMemcpy iovs_d fail");
     int block_num = (iovs_size + kDefaultThreadsPerBlock - 1) / kDefaultThreadsPerBlock;
-    GetIovsCrcDevice<<<block_num, kDefaultThreadsPerBlock, 0, musa_actual_stream>>>(iovs_d, iovs_size, crcs_d,
-                                                                               cal_byte_size);
+    GetIovsCrcDevice<<<block_num, kDefaultThreadsPerBlock, 0, musa_actual_stream>>>(
+        iovs_d, iovs_size, crcs_d, min_cal_byte_size_);
     std::vector<uint32_t> crcs(iovs_size);
     auto crc_byte_size = sizeof(uint32_t) * iovs_size;
     CHECK_MUSA_ERROR_RETURN(
-        musaMemcpyAsync(crcs.data(), crcs_d, crc_byte_size, musaMemcpyDeviceToHost, musa_actual_stream), {},
+        musaMemcpyAsync(crcs.data(), crcs_d, crc_byte_size, musaMemcpyDeviceToHost, musa_actual_stream),
+        {},
         "musaMemcpy crcs_d fail");
     CHECK_MUSA_ERROR_RETURN(musaStreamSynchronize(musa_actual_stream), {}, "musa stream synchronize fail");
     return crcs;
 }
 
-}  // namespace kv_cache_manager
+} // namespace kv_cache_manager

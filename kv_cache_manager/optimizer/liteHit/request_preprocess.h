@@ -11,8 +11,8 @@ namespace kv_cache_manager {
 // the Jenkins 64-bit variant evaluated with explicit uint64 arithmetic
 // (logical right shift), then reinterpreted as int64. Negative results are
 // valid keys. Note this intentionally follows the trace producer, not the
-// signed-shift HashUtil::HashIntFunc, which diverges for negative
-// intermediate hashes.
+// HashUtil::HashIntFunc's arithmetic-right-shift variant, which diverges for
+// negative intermediate hashes.
 int64_t PrefixHashNext(int64_t previous_hash, int64_t raw_value);
 
 // Converts per-block raw hashes to rolling prefix-chained keys, starting

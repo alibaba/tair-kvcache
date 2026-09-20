@@ -92,6 +92,42 @@ void WriteLocationManager::SessionIdMap::Put(ExpireUnitPtr unit) {
     session_id_map_impl_[unit->write_session_id] = unit->expire_point;
 }
 
+WriteLocationManager::TakeResult
+WriteLocationManager::SessionIdMap::GetAndDeleteForFinish(const std::string &write_session_id,
+                                                          const std::string &instance_id,
+                                                          const BlockMask &success_block_mask,
+                                                          std::optional<size_t> expected_checksum_count,
+                                                          const std::vector<std::string> &location_spec_names,
+                                                          WriteLocationInfo &location_info) {
+    std::unique_lock lock(mux_);
+    auto session_it = session_id_map_impl_.find(write_session_id);
+    if (session_it == session_id_map_impl_.end()) {
+        return TakeResult::NOT_FOUND;
+    }
+    auto unit_it = unit_map_.find(session_it->second);
+    assert(unit_it != unit_map_.end());
+    const auto &stored_info = unit_it->second->write_location_info;
+    if (stored_info.instance_id != instance_id) {
+        return TakeResult::INSTANCE_ID_MISMATCH;
+    }
+    if (!IsBlockMaskValid(success_block_mask, stored_info.keys.size())) {
+        return TakeResult::BLOCK_MASK_MISMATCH;
+    }
+    if (expected_checksum_count.has_value() && stored_info.keys.size() != *expected_checksum_count) {
+        return TakeResult::KEY_COUNT_MISMATCH;
+    }
+    for (const auto &location_spec_name : location_spec_names) {
+        if (stored_info.location_spec_names.count(location_spec_name) == 0) {
+            return TakeResult::SPEC_NAME_MISMATCH;
+        }
+    }
+    RemoveFromLocationIndexUnsafe(stored_info.location_ids);
+    location_info = std::move(unit_it->second->write_location_info);
+    unit_map_.erase(unit_it);
+    session_id_map_impl_.erase(session_it);
+    return TakeResult::SUCCESS;
+}
+
 bool WriteLocationManager::SessionIdMap::GetAndDelete(const std::string &write_session_id,
                                                       WriteLocationInfo &location_info) {
     std::unique_lock lock(mux_);
@@ -176,6 +212,31 @@ void WriteLocationManager::Put(const std::string &write_session_id,
                                std::vector<std::string> &&location_ids,
                                int64_t write_timeout_seconds,
                                CallBack callback) {
+    Put(write_session_id, std::move(keys), std::move(location_ids), {}, write_timeout_seconds, std::move(callback));
+}
+
+void WriteLocationManager::Put(const std::string &write_session_id,
+                               std::vector<int64_t> &&keys,
+                               std::vector<std::string> &&location_ids,
+                               std::unordered_set<std::string> &&location_spec_names,
+                               int64_t write_timeout_seconds,
+                               CallBack callback) {
+    Put(write_session_id,
+        {},
+        std::move(keys),
+        std::move(location_ids),
+        std::move(location_spec_names),
+        write_timeout_seconds,
+        std::move(callback));
+}
+
+void WriteLocationManager::Put(const std::string &write_session_id,
+                               std::string instance_id,
+                               std::vector<int64_t> &&keys,
+                               std::vector<std::string> &&location_ids,
+                               std::unordered_set<std::string> &&location_spec_names,
+                               int64_t write_timeout_seconds,
+                               CallBack callback) {
     KVCM_LOG_DEBUG("Putting session %s with %zu keys and %zu location_ids, timeout: %ld seconds",
                    write_session_id.c_str(),
                    keys.size(),
@@ -186,14 +247,27 @@ void WriteLocationManager::Put(const std::string &write_session_id,
     unit_ptr->write_session_id = write_session_id;
     unit_ptr->expire_point = TimestampUtil::GetSteadyTimeUs() + write_timeout_seconds * 1000 * 1000;
     unit_ptr->callback = std::move(callback);
+    unit_ptr->write_location_info.instance_id = std::move(instance_id);
     unit_ptr->write_location_info.keys = std::move(keys);
     unit_ptr->write_location_info.location_ids = std::move(location_ids);
+    unit_ptr->write_location_info.location_spec_names = std::move(location_spec_names);
     session_id_map_.Put(unit_ptr);
     StoreMinNextSleepTimeUs(write_timeout_seconds * 1000 * 1000);
 }
 
 bool WriteLocationManager::GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info) {
     return session_id_map_.GetAndDelete(write_session_id, location_info);
+}
+
+WriteLocationManager::TakeResult
+WriteLocationManager::GetAndDeleteForFinish(const std::string &write_session_id,
+                                            const std::string &instance_id,
+                                            const BlockMask &success_block_mask,
+                                            std::optional<size_t> expected_checksum_count,
+                                            const std::vector<std::string> &location_spec_names,
+                                            WriteLocationInfo &location_info) {
+    return session_id_map_.GetAndDeleteForFinish(
+        write_session_id, instance_id, success_block_mask, expected_checksum_count, location_spec_names, location_info);
 }
 
 bool WriteLocationManager::SessionIdMap::HasLocationId(const std::string &location_id) const {

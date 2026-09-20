@@ -1230,17 +1230,32 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, PutWriteLocationManager);
     constexpr int64_t kMaxWriteTimeoutSeconds = 1800;
+    std::unordered_set<std::string> write_location_spec_names;
+    for (const auto &location : new_locations) {
+        if (location == nullptr) {
+            continue;
+        }
+        for (const auto &spec : location->location_specs()) {
+            write_location_spec_names.insert(spec.name());
+        }
+    }
     write_location_manager_->Put(
         write_session_id,
+        instance_id,
         std::move(new_keys),
         std::move(location_ids),
+        std::move(write_location_spec_names),
         std::min(kMaxWriteTimeoutSeconds, write_timeout_seconds),
         [this, trace_id, instance_id, write_session_id](
             std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info) {
             RequestContext temp_request_context(trace_id + "_timeout_callback");
             BlockMaskOffset succeed_block = 0;
             auto ec = this->FinishWriteCache(
-                &temp_request_context, instance_id, write_session_id, succeed_block, std::move(write_location_info));
+                &temp_request_context,
+                instance_id,
+                write_session_id,
+                succeed_block,
+                CacheManager::FinishWriteCacheOptions::WithWriteLocationInfo(std::move(write_location_info)));
             static_cast<void>(ec);
         });
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, PutWriteLocationManager);
@@ -1353,22 +1368,79 @@ void CacheManager::RollbackAddLocations(RequestContext *request_context,
     }
 }
 
-ErrorCode
-CacheManager::FinishWriteCache(RequestContext *request_context,
-                               const std::string &instance_id,
-                               const std::string &write_session_id,
-                               const BlockMask &success_block_mask,
-                               std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal) {
+ErrorCode CacheManager::FinishWriteCache(RequestContext *request_context,
+                                         const std::string &instance_id,
+                                         const std::string &write_session_id,
+                                         const BlockMask &success_block_mask,
+                                         CacheManager::FinishWriteCacheOptions options) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    const bool has_checksum_batches = !options.checksum_batches.empty();
+    size_t expected_key_count = 0;
+    std::vector<std::string> checksum_spec_names;
+    if (has_checksum_batches) {
+        expected_key_count = options.checksum_batches.front().checksums.size();
+        checksum_spec_names.reserve(options.checksum_batches.size());
+        std::unordered_set<std::string> seen_spec_names;
+        for (const auto &batch : options.checksum_batches) {
+            if (batch.location_spec_name.empty() || !seen_spec_names.insert(batch.location_spec_name).second) {
+                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
+                                             EC_BADARGS,
+                                             "checksum location spec name is empty or duplicated: %s",
+                                             batch.location_spec_name.c_str());
+            }
+            if (batch.checksums.size() != expected_key_count) {
+                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
+                                             EC_BADARGS,
+                                             "checksum batch size (%zu) does not match peer batch size (%zu)",
+                                             batch.checksums.size(),
+                                             expected_key_count);
+            }
+            checksum_spec_names.push_back(batch.location_spec_name);
+        }
+    }
+    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    if (!meta_searcher) {
+        request_context->error_tracer()->AddErrorMsg("instance not exist");
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "finish write cache failed: meta searcher not found");
+    }
     WriteLocationManager::WriteLocationInfo location_info;
-    if (write_location_info_internal != nullptr) {
-        location_info = std::move(*write_location_info_internal);
-    } else if (!write_location_manager_->GetAndDelete(write_session_id, location_info)) {
-        request_context->error_tracer()->AddErrorMsg("write_session_id has been deleted");
-        RETURN_IF_EC_NOT_OK_WITH_LOG(
-            WARN, EC_ERROR, "finish write cache failed: write_session_id not found: %s", write_session_id.c_str());
+    if (options.write_location_info_internal != nullptr) {
+        location_info = std::move(*options.write_location_info_internal);
+    } else {
+        // Validate every caller-controlled dimension and consume atomically. A
+        // malformed request remains available for a corrected retry; otherwise
+        // its timeout callback remains responsible for cleanup.
+        const auto expected_checksum_count =
+            has_checksum_batches ? std::make_optional(expected_key_count) : std::nullopt;
+        const auto take_result = write_location_manager_->GetAndDeleteForFinish(write_session_id,
+                                                                                instance_id,
+                                                                                success_block_mask,
+                                                                                expected_checksum_count,
+                                                                                checksum_spec_names,
+                                                                                location_info);
+        if (take_result == WriteLocationManager::TakeResult::NOT_FOUND) {
+            request_context->error_tracer()->AddErrorMsg("write_session_id has been deleted");
+            RETURN_IF_EC_NOT_OK_WITH_LOG(
+                WARN, EC_ERROR, "finish write cache failed: write_session_id not found: %s", write_session_id.c_str());
+        }
+        if (take_result == WriteLocationManager::TakeResult::INSTANCE_ID_MISMATCH) {
+            RETURN_IF_EC_NOT_OK_WITH_LOG(
+                WARN, EC_BADARGS, "write session does not belong to instance: %s", instance_id.c_str());
+        }
+        if (take_result == WriteLocationManager::TakeResult::BLOCK_MASK_MISMATCH) {
+            RETURN_IF_EC_NOT_OK_WITH_LOG(
+                WARN, EC_BADARGS, "invalid block mask, mask type: %zu", success_block_mask.index());
+        }
+        if (take_result == WriteLocationManager::TakeResult::KEY_COUNT_MISMATCH) {
+            RETURN_IF_EC_NOT_OK_WITH_LOG(
+                WARN, EC_BADARGS, "checksums size (%zu) does not match write session key count", expected_key_count);
+        }
+        if (take_result == WriteLocationManager::TakeResult::SPEC_NAME_MISMATCH) {
+            RETURN_IF_EC_NOT_OK_WITH_LOG(
+                WARN, EC_BADARGS, "checksum names contain a spec not allocated by this write session");
+        }
     }
     if (!IsBlockMaskValid(success_block_mask, location_info.keys.size())) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
@@ -1377,12 +1449,14 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                                      success_block_mask.index(),
                                      location_info.keys.size());
     }
-
-    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
-    if (!meta_searcher) {
-        request_context->error_tracer()->AddErrorMsg("instance not exist");
-        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "finish write cache failed: meta searcher not found");
+    if (has_checksum_batches && expected_key_count != location_info.keys.size()) {
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
+                                     EC_BADARGS,
+                                     "checksum batch size (%zu) does not match keys size (%zu)",
+                                     expected_key_count,
+                                     location_info.keys.size());
     }
+
     std::vector<KeyType> success_batch_keys;
     std::vector<std::string> success_batch_location_ids;
     std::vector<std::vector<MetaSearcher::LocationUpdateTask>> success_batch_update_tasks;
@@ -1393,8 +1467,15 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
             // success
             success_batch_keys.push_back(location_info.keys[block_key_idx]);
             success_batch_location_ids.push_back(location_info.location_ids[block_key_idx]);
-            success_batch_update_tasks.push_back(
-                {{location_info.location_ids[block_key_idx], CacheLocationStatus::CLS_SERVING}});
+            MetaSearcher::LocationUpdateTask task{
+                .location_id = location_info.location_ids[block_key_idx],
+                .new_status = CacheLocationStatus::CLS_SERVING,
+            };
+            task.spec_checksums.reserve(options.checksum_batches.size());
+            for (const auto &batch : options.checksum_batches) {
+                task.spec_checksums.push_back({batch.location_spec_name, batch.checksums[block_key_idx]});
+            }
+            success_batch_update_tasks.push_back({std::move(task)});
         } else {
             // failed
             failed_del_request.block_keys.push_back(location_info.keys[block_key_idx]);
@@ -2572,6 +2653,8 @@ bool ParseInt64(const std::string &s, int64_t &out) {
 struct ValidatedEventLocationSpec {
     std::string_view name;
     std::string_view raw_uri;
+    int64_t checksum = 0;
+    bool checksum_present = false;
     // Canonical ReportEvent URIs never need the heavyweight StandardUri
     // object. Allocate it only for the compatibility fallback so the common
     // validation result stays small and cheap to move through inline storage.
@@ -2601,6 +2684,10 @@ bool ValidateEventLocationSpec(const proto::meta::LocationSpec &spec, ValidatedE
     }
     out.name = spec.name();
     out.raw_uri = spec.uri();
+    out.checksum = spec.checksum();
+    // Accept non-zero values sent by early checksum clients that predate the
+    // explicit presence bit. New callers should always set both fields.
+    out.checksum_present = spec.checksum_present() || spec.checksum() != 0;
     if (SnapshotUriUtils::ParseCanonicalUriForSnapshotAppend(out.raw_uri, out.canonical_uri)) {
         out.is_canonical_uri = true;
         out.size = out.canonical_uri.size;
@@ -3116,6 +3203,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 if (mutation.spec.name() != spec.name()) {
                     continue;
                 }
+                // BLOCK_ADD is a patch even when multiple events for the same
+                // spec are folded inside one request.  If an earlier ADD in
+                // this batch supplied a checksum and a later ADD only refreshes
+                // the URI, retain the newly supplied checksum instead of
+                // falling back to the value that happened to be persisted
+                // before the request began.
+                if (is_add && mutation.is_add && mutation.spec.has_checksum() && !spec.has_checksum()) {
+                    spec.set_checksum(mutation.spec.checksum());
+                }
                 mutation.is_add = is_add;
                 mutation.spec = std::move(spec);
                 mutation.size = size;
@@ -3267,6 +3363,9 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 LocationSpec versioned_spec;
                 versioned_spec.set_name_view(spec.name);
                 versioned_spec.set_uri(std::move(spec.versioned_uri));
+                if (spec.checksum_present) {
+                    versioned_spec.set_checksum(spec.checksum);
+                }
                 apply_delta_spec(location_mutation, true, std::move(versioned_spec), spec.size);
             }
             if (event_mutation_index == kInvalidDeltaIndex) {
@@ -3434,6 +3533,9 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     LocationSpec versioned_spec;
                     versioned_spec.set_name_view(spec.name);
                     versioned_spec.set_uri(std::move(spec.versioned_uri));
+                    if (spec.checksum_present) {
+                        versioned_spec.set_checksum(spec.checksum);
+                    }
                     versioned_specs.push_back(std::move(versioned_spec));
                 }
                 if (per_item_ec[i] != EC_OK) {
