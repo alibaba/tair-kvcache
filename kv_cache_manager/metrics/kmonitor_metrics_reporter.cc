@@ -15,6 +15,7 @@
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
+#include "kv_cache_manager/metrics/delete_cleanup_observer.h"
 #include "kv_cache_manager/metrics/kmon_param.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -211,6 +212,9 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_gc, event_report_probe_count);
     DECLARE_METRICS(cache_gc, event_report_probe_unknown_count);
     DECLARE_METRICS(cache_gc, event_report_delete_location_count);
+
+    // terminal delete cleanup failures (bounded `stage` labels)
+    DECLARE_METRICS(cache_cleanup, permanent_failure_location_count);
 
     // cache manager
     DECLARE_METRICS(cache_manager, write_location_expire_size);
@@ -525,6 +529,10 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_gc, event_report_probe_count);
     REGISTER_GAUGE_METRIC(cache_gc, event_report_probe_unknown_count);
     REGISTER_GAUGE_METRIC(cache_gc, event_report_delete_location_count);
+
+    // Cumulative counter semantics; KMonitor has no COUNTER type, so publish
+    // the registry value through a gauge as done for cache_gc counters.
+    REGISTER_GAUGE_METRIC(cache_cleanup, permanent_failure_location_count);
 
     // cache manager
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
@@ -1039,8 +1047,7 @@ void KmonitorMetricsReporter::ReportInterval() {
     } while (false);
 
     do {
-        // Cache GC owns both untagged metrics and bounded tagged families
-        // (candidate reason, delete status and error stage). Read the registry
+        // These subsystems own bounded tagged families. Read the registry
         // snapshot so KMonitor preserves the same labels as Prometheus/local
         // reporting instead of maintaining a second hard-coded tag list.
         if (!metrics_registry_) {
@@ -1083,6 +1090,8 @@ void KmonitorMetricsReporter::ReportInterval() {
                                "cache_gc.event_report_probe_unknown_count");
         report_registry_metric(ctx_->cache_gc_event_report_delete_location_count_metrics.get(),
                                "cache_gc.event_report_delete_location_count");
+        report_registry_metric(ctx_->cache_cleanup_permanent_failure_location_count_metrics.get(),
+                               kDeleteCleanupPermanentFailureMetricName);
     } while (false);
 
     do {

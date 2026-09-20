@@ -1,5 +1,7 @@
 #include "stub_source/kv_cache_manager/client/src/internal/sdk/tair_mempool_sdk.h"
 
+#include <charconv>
+
 #include "kv_cache_manager/common/logger.h"
 namespace kv_cache_manager {
 TairMempoolRemoteItem TairMempoolRemoteItem::FromUri(const DataStorageUri &storage_uri) {
@@ -7,7 +9,13 @@ TairMempoolRemoteItem TairMempoolRemoteItem::FromUri(const DataStorageUri &stora
     storage_uri.GetParamAs<uint16_t>("media_type", item.media_type);
     storage_uri.GetParamAs<uint16_t>("node_id", item.node_id);
     std::string path = storage_uri.GetPath();
-    item.offset = (path.size() < 2) ? 0 : std::stoull(path.substr(1));
+    if (path.size() >= 2 && path.front() == '/') {
+        const auto offset = std::string_view(path).substr(1);
+        const auto [end, ec] = std::from_chars(offset.data(), offset.data() + offset.size(), item.offset);
+        if (ec != std::errc{} || end != offset.data() + offset.size()) {
+            item.offset = 0;
+        }
+    }
     storage_uri.GetParamAs<uint16_t>("range_id", item.range_id);
     storage_uri.GetParamAs<uint64_t>("size", item.size);
     return item;

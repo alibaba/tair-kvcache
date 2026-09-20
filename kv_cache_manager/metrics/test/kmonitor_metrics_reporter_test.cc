@@ -117,6 +117,8 @@ TEST_F(KmonitorMetricsReporterTest, TestReportInterval) {
         metrics_registry_->GetCounter("cache_gc.event_report_probe_unknown_count", {{"cause", "malformed"}}) += 1;
         metrics_registry_->GetCounter("cache_gc.event_report_delete_location_count",
                                       {{"reason", "down_host"}, {"status", "deleted"}}) += 2;
+        metrics_registry_->GetCounter("cache_cleanup.permanent_failure_location_count",
+                                      {{"stage", "physical_delete"}}) += 1;
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
     }
 

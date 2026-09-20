@@ -46,12 +46,20 @@ public:
     static std::vector<uint32_t>
     GetIovsCrc(const IovDevice *iovs_h_ptr, size_t iovs_size, IovDevice *iovs_d, uint32_t *crcs_d, GpuStream_t stream);
 
+    // Resolved once by the CUDA/MUSA implementation when the client DSO is
+    // loaded. Exposing that exact value prevents callers from mistaking a
+    // later environment mutation for the kernel's real contract.
+    static size_t ChecksumSampleBytes() { return min_cal_byte_size_; }
+
 private:
     static size_t min_cal_byte_size_;
 };
 
 class SdkBufferCheckPool {
     static constexpr size_t kDefaultCellNum = 4;
+    // Prevent a malformed environment value from forcing an unbounded host
+    // allocation before Init() has a chance to reject the configuration.
+    static constexpr size_t kMaxCellNum = 1024;
 
 public:
     explicit SdkBufferCheckPool(size_t cell_num = kDefaultCellNum);
@@ -93,6 +101,7 @@ private:
     std::condition_variable cv_;
     std::queue<Cell *> cell_queue_;
     std::vector<Cell> cells_;
+    size_t cell_num_;
     int device_id_ = -1;
 };
 

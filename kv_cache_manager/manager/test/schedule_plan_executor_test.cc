@@ -22,6 +22,7 @@
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/metrics/delete_cleanup_observer.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub.h"
 using namespace kv_cache_manager;
@@ -946,6 +947,11 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
     RequestContext context("gc_physical_delete_test");
     SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    const auto cleanup_failure_count = [&](const std::string &stage) {
+        return metrics_registry_->GetCounter(kDeleteCleanupPermanentFailureMetricName, {{"stage", stage}}).Get();
+    };
+    EXPECT_EQ(0u, cleanup_failure_count("physical_delete"));
+    EXPECT_EQ(0u, cleanup_failure_count("dispatch_or_worker"));
 
     const auto add_location =
         [&](int64_t block_key, const std::vector<std::string> &uris, CacheLocationStatus status = CLS_SERVING) {
@@ -975,6 +981,17 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
         ASSERT_EQ(1u, locations.size());
         EXPECT_TRUE(locations.front().empty());
     };
+    const auto expect_location_status =
+        [&](int64_t block_key, const std::string &location_id, CacheLocationStatus expected_status) {
+            std::vector<CacheLocationMap> locations;
+            BlockMask empty_mask;
+            EXPECT_EQ(EC_OK, meta_searcher.BatchGetLocation(&context, {block_key}, empty_mask, locations));
+            ASSERT_EQ(1u, locations.size());
+            const auto it = locations.front().find(location_id);
+            ASSERT_NE(locations.front().end(), it);
+            ASSERT_TRUE(it->second);
+            EXPECT_EQ(expected_status, it->second->status());
+        };
 
     const std::string missing_uri = "dummy://gc_delete_backend/missing?size=1";
     const std::string existing_uri = "dummy://gc_delete_backend/existing?size=1";
@@ -1103,15 +1120,28 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     EXPECT_EQ(EC_PARTIAL_OK, error_result.status);
     EXPECT_TRUE(error_result.error_logged);
     EXPECT_NE(std::string::npos, error_result.error_message.find("failed[2]"));
-    EXPECT_THAT(physical_delete_warnings,
-                UnorderedElementsAre(
-                    "storage delete failed, instance[" + kTestInstanceName + "] storage[gc_delete_backend] uri[" +
-                        error_uri + "] ec[" + std::to_string(EC_ERROR) + "]",
-                    "storage delete failed, instance[" + kTestInstanceName + "] storage[gc_delete_backend] uri[" +
-                        timeout_uri + "] ec[" + std::to_string(EC_TIMEOUT) + "]",
-                    "storage delete failed, instance[" + kTestInstanceName + "] storage[gc_other_backend] uri[" +
-                        other_uri + "] ec[" + std::to_string(EC_ERROR) + "]"));
-    expect_location_deleted(error_block_key);
+    EXPECT_NE(std::string::npos, error_result.error_message.find("first_key[" + std::to_string(error_block_key) + "]"));
+    EXPECT_NE(std::string::npos, error_result.error_message.find("first_location[" + error_location_id + "]"));
+    EXPECT_EQ(std::string::npos, error_result.error_message.find(error_uri));
+    EXPECT_EQ(std::string::npos, error_result.error_message.find(timeout_uri));
+    EXPECT_EQ(std::string::npos, error_result.error_message.find(other_uri));
+    EXPECT_THAT(
+        physical_delete_warnings,
+        UnorderedElementsAre("storage delete failed, instance[" + kTestInstanceName +
+                                 "] storage[gc_delete_backend] key[" + std::to_string(error_block_key) + "] location[" +
+                                 error_location_id + "] item[0] ec[" + std::to_string(EC_ERROR) + "]",
+                             "storage delete failed, instance[" + kTestInstanceName +
+                                 "] storage[gc_delete_backend] key[" + std::to_string(error_block_key) + "] location[" +
+                                 error_location_id + "] item[1] ec[" + std::to_string(EC_TIMEOUT) + "]",
+                             "storage delete failed, instance[" + kTestInstanceName +
+                                 "] storage[gc_other_backend] key[" + std::to_string(error_block_key) + "] location[" +
+                                 error_location_id + "] item[0] ec[" + std::to_string(EC_ERROR) + "]"));
+    // A failed or ambiguous payload delete must retain the DELETING metadata
+    // reference. Backends may reuse an address after a successful Delete whose
+    // response was lost, so KVCM must not blindly retry physical deletion.
+    expect_location_status(error_block_key, error_location_id, CLS_DELETING);
+    // Three failed URIs belong to one Location and must increment once.
+    EXPECT_EQ(1u, cleanup_failure_count("physical_delete"));
 
     // Worker/admission errors have not been diagnosed by DoLocationDelTask.
     // They must remain visible to GC even though ordinary Delete errors are logged.
@@ -1126,9 +1156,10 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     ASSERT_TRUE(exception_submission.accepted);
     const auto exception_result = exception_submission.future.get();
     EXPECT_EQ(EC_ERROR, exception_result.status);
-    EXPECT_FALSE(exception_result.error_logged);
+    EXPECT_TRUE(exception_result.error_logged);
     EXPECT_THAT(exception_result.error_message, HasSubstr("injected storage delete exception"));
     EXPECT_EQ(3u, physical_delete_warnings.size());
+    EXPECT_EQ(1u, cleanup_failure_count("dispatch_or_worker"));
     const auto admission_error = executor
                                      .Submit(CacheLocationDelRequest{
                                          .instance_id = "missing_instance",
@@ -1149,8 +1180,7 @@ TEST_F(SchedulePlanExecutorTest, TestEventReportMetadataDeleteRevalidatesTokenOn
     ASSERT_EQ(EC_OK, backend->RegisterNode(reporter.instance_id, reporter.host_ip_port, {"mem"}));
     uint64_t lifecycle_generation = 0;
     ASSERT_EQ(EC_OK,
-              backend->UnregisterNodeForHostDown(
-                  reporter.instance_id, reporter.host_ip_port, lifecycle_generation));
+              backend->UnregisterNodeForHostDown(reporter.instance_id, reporter.host_ip_port, lifecycle_generation));
 
     const KeyVector keys{703};
     const std::string location_id = backend->BuildLocationId("mem", reporter.host_ip_port);
@@ -1163,9 +1193,7 @@ TEST_F(SchedulePlanExecutorTest, TestEventReportMetadataDeleteRevalidatesTokenOn
          {LocationSpec("tp0", "event_report://127.0.0.1:8080/mem?size=11")}},
     }};
     std::vector<ErrorCode> per_key_ec;
-    ASSERT_EQ(EC_OK,
-              meta_searcher.BatchReplaceLocationSpecs(
-                  &context, keys, replace_tasks, per_key_ec));
+    ASSERT_EQ(EC_OK, meta_searcher.BatchReplaceLocationSpecs(&context, keys, replace_tasks, per_key_ec));
 
     std::vector<CacheLocationMap> locations;
     BlockMask empty_mask;
@@ -1181,11 +1209,12 @@ TEST_F(SchedulePlanExecutorTest, TestEventReportMetadataDeleteRevalidatesTokenOn
             .backend_unique_name = "event_report_l2",
             .storage_type = backend->GetStorageType(),
             .expected_backend = backend,
-            .cleanup_token = EventReportBackend::MaintenanceCleanupToken{
-                .reason = EventReportBackend::MaintenanceCleanupReason::kDownHost,
-                .reporter_key = reporter,
-                .lifecycle_generation = lifecycle_generation,
-            },
+            .cleanup_token =
+                EventReportBackend::MaintenanceCleanupToken{
+                    .reason = EventReportBackend::MaintenanceCleanupReason::kDownHost,
+                    .reporter_key = reporter,
+                    .lifecycle_generation = lifecycle_generation,
+                },
         }}},
     };
 
@@ -1224,8 +1253,7 @@ TEST_F(SchedulePlanExecutorTest, TestEventReportMetadataDeleteSkipsStaleLifecycl
     const ReporterSnapshotKey reporter{kTestInstanceName, "127.0.0.2:8080"};
     ASSERT_EQ(EC_OK, backend->RegisterNode(reporter.instance_id, reporter.host_ip_port, {"mem"}));
     uint64_t old_generation = 0;
-    ASSERT_EQ(EC_OK,
-              backend->UnregisterNodeForHostDown(reporter.instance_id, reporter.host_ip_port, old_generation));
+    ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown(reporter.instance_id, reporter.host_ip_port, old_generation));
 
     const KeyVector keys{704};
     const std::string location_id = backend->BuildLocationId("mem", reporter.host_ip_port);
@@ -1238,9 +1266,7 @@ TEST_F(SchedulePlanExecutorTest, TestEventReportMetadataDeleteSkipsStaleLifecycl
          {LocationSpec("tp0", "event_report://127.0.0.2:8080/mem?size=13")}},
     }};
     std::vector<ErrorCode> per_key_ec;
-    ASSERT_EQ(EC_OK,
-              meta_searcher.BatchReplaceLocationSpecs(
-                  &context, keys, replace_tasks, per_key_ec));
+    ASSERT_EQ(EC_OK, meta_searcher.BatchReplaceLocationSpecs(&context, keys, replace_tasks, per_key_ec));
     std::vector<CacheLocationMap> locations;
     BlockMask empty_mask;
     ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(&context, keys, empty_mask, locations));
@@ -1255,11 +1281,12 @@ TEST_F(SchedulePlanExecutorTest, TestEventReportMetadataDeleteSkipsStaleLifecycl
             .backend_unique_name = "event_report_l2_stale",
             .storage_type = backend->GetStorageType(),
             .expected_backend = backend,
-            .cleanup_token = EventReportBackend::MaintenanceCleanupToken{
-                .reason = EventReportBackend::MaintenanceCleanupReason::kDownHost,
-                .reporter_key = reporter,
-                .lifecycle_generation = old_generation,
-            },
+            .cleanup_token =
+                EventReportBackend::MaintenanceCleanupToken{
+                    .reason = EventReportBackend::MaintenanceCleanupReason::kDownHost,
+                    .reporter_key = reporter,
+                    .lifecycle_generation = old_generation,
+                },
         }}},
     };
 
@@ -2190,4 +2217,167 @@ TEST_F(SchedulePlanExecutorTest, TestAuthoritativeAdmissionRefreshesCachedMetada
     ASSERT_EQ(1u, persistent_results.size());
     ASSERT_EQ(1u, persistent_locations.size());
     EXPECT_TRUE(persistent_results.front() == EC_NOENT || persistent_locations.front().empty());
+}
+
+TEST_F(SchedulePlanExecutorTest, TestPreFencedDeletingAdmissionIsExplicitAndDoesNotAdoptGenericDeletes) {
+    const std::string instance_id = "cached_pre_fenced_delete";
+    const std::string persistent_path = GetPrivateTestRuntimeDataPath() + "schedule_plan_executor_pre_fenced";
+    ASSERT_EQ(EC_OK, CreateCachedMetaIndexer(instance_id, persistent_path));
+    const auto indexer = meta_manager_->GetMetaIndexer(instance_id);
+    WaitForCachedMetaIndexerRunning(indexer);
+
+    auto request_context = std::make_shared<RequestContext>("pre_fenced_delete_test");
+    MetaSearcher meta_searcher(indexer);
+    const auto add_deleting_location = [&](int64_t block_key, const std::string &suffix) {
+        auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+            DataStorageType::DATA_STORAGE_TYPE_NFS,
+            1,
+            {SchedulePlanExecutorTestHelper::CreateLocationSpec("default",
+                                                                "nfs://nfs_01/pre_fenced_" + suffix + "?size=1")});
+        std::vector<std::string> location_ids;
+        EXPECT_EQ(
+            EC_OK,
+            BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {location}, location_ids));
+        EXPECT_EQ(1u, location_ids.size());
+        if (location_ids.empty()) {
+            return std::string{};
+        }
+        std::vector<std::vector<ErrorCode>> update_results;
+        EXPECT_EQ(EC_OK,
+                  meta_searcher.BatchUpdateLocationStatus(
+                      request_context.get(),
+                      {block_key},
+                      {{{.location_id = location_ids.front(),
+                         .new_status = CacheLocationStatus::CLS_DELETING,
+                         .allowed_current_statuses = {CacheLocationStatus::CLS_WRITING}}}},
+                      update_results,
+                      /*authoritative_persistence=*/true));
+        EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), update_results);
+        return location_ids.front();
+    };
+    const auto expect_status =
+        [&](int64_t block_key, const std::string &location_id, std::optional<CacheLocationStatus> status) {
+            CacheLocationMapVector locations;
+            BlockMask empty_mask;
+            EXPECT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, locations));
+            ASSERT_EQ(1u, locations.size());
+            const auto it = locations.front().find(location_id);
+            if (!status.has_value()) {
+                EXPECT_EQ(locations.front().end(), it);
+                return;
+            }
+            ASSERT_NE(locations.front().end(), it);
+            ASSERT_TRUE(it->second);
+            EXPECT_EQ(*status, it->second->status());
+        };
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+
+    const int64_t generic_key = 914;
+    const std::string generic_id = add_deleting_location(generic_key, "generic");
+    ASSERT_FALSE(generic_id.empty());
+    const auto generic_result = executor
+                                    .Submit(CacheLocationDelRequest{
+                                        .instance_id = instance_id,
+                                        .block_keys = {generic_key},
+                                        .location_ids = {{generic_id}},
+                                        .metadata_only = true,
+                                        .authoritative_read = true,
+                                    })
+                                    .get();
+    EXPECT_EQ(EC_OK, generic_result.status);
+    expect_status(generic_key, generic_id, CacheLocationStatus::CLS_DELETING);
+    const auto duplicate_meta_result = executor
+                                           .Submit(CacheMetaDelRequest{
+                                               .instance_id = instance_id,
+                                               .block_keys = {generic_key, generic_key, generic_key},
+                                           })
+                                           .get();
+    EXPECT_EQ(EC_OK, duplicate_meta_result.status);
+    // Generic RemoveCache/Trim must not adopt a retained DELETING record: a
+    // prior Delete response may have been lost and its URI may already have
+    // been reused by the backend.
+    expect_status(generic_key, generic_id, CacheLocationStatus::CLS_DELETING);
+
+    const int64_t invalid_key = 915;
+    const std::string invalid_id = add_deleting_location(invalid_key, "invalid");
+    ASSERT_FALSE(invalid_id.empty());
+    const auto invalid_result = executor
+                                    .Submit(CacheLocationDelRequest{
+                                        .instance_id = instance_id,
+                                        .block_keys = {invalid_key},
+                                        .location_ids = {{invalid_id}},
+                                        .metadata_only = true,
+                                        .pre_fenced_deleting = true,
+                                    })
+                                    .get();
+    EXPECT_EQ(EC_BADARGS, invalid_result.status);
+    expect_status(invalid_key, invalid_id, CacheLocationStatus::CLS_DELETING);
+
+    const int64_t duplicate_key = 917;
+    const std::string duplicate_id_a = add_deleting_location(duplicate_key, "duplicate_a");
+    const std::string duplicate_id_b = add_deleting_location(duplicate_key, "duplicate_b");
+    CacheLocationMapVector duplicate_locations;
+    const auto duplicate_read =
+        indexer->GetLocationsFromPersistent(request_context.get(), {duplicate_key}, duplicate_locations);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), duplicate_read.error_codes);
+    ASSERT_EQ(1u, duplicate_locations.size());
+    const std::string duplicate_value_a = duplicate_locations[0].at(duplicate_id_a)->ToJsonString();
+    const std::string duplicate_value_b = duplicate_locations[0].at(duplicate_id_b)->ToJsonString();
+    const auto canonical = executor.PrepareDeleteTask(CacheLocationDelRequest{
+        .instance_id = instance_id,
+        .block_keys = {duplicate_key, duplicate_key},
+        .location_ids = {{duplicate_id_a, duplicate_id_a}, {duplicate_id_b, duplicate_id_a}},
+        .expected_location_values = {{duplicate_value_a, duplicate_value_a}, {duplicate_value_b, duplicate_value_a}},
+        .metadata_only = true,
+        .authoritative_read = true,
+        .pre_fenced_deleting = true,
+    });
+    ASSERT_EQ(EC_OK, canonical.result.status) << canonical.result.error_message;
+    ASSERT_TRUE(canonical.needs_physical_delete);
+    ASSERT_EQ((std::vector<int64_t>{duplicate_key}), canonical.actual_task.block_keys);
+    ASSERT_EQ((std::vector<std::vector<std::string>>{{duplicate_id_a, duplicate_id_b}}),
+              canonical.actual_task.location_ids);
+    ASSERT_EQ((std::vector<std::vector<std::string>>{{duplicate_value_a, duplicate_value_b}}),
+              canonical.actual_task.expected_location_values);
+
+    const auto conflicting = executor.PrepareDeleteTask(CacheLocationDelRequest{
+        .instance_id = instance_id,
+        .block_keys = {duplicate_key, duplicate_key},
+        .location_ids = {{duplicate_id_a}, {duplicate_id_a}},
+        .expected_location_values = {{duplicate_value_a}, {duplicate_value_b}},
+        .metadata_only = true,
+        .authoritative_read = true,
+        .pre_fenced_deleting = true,
+    });
+    EXPECT_EQ(EC_BADARGS, conflicting.result.status);
+
+    const int64_t pre_fenced_key = 916;
+    const std::string pre_fenced_id = add_deleting_location(pre_fenced_key, "owned");
+    ASSERT_FALSE(pre_fenced_id.empty());
+    CacheLocationMapVector persistent_locations;
+    const auto persistent_result =
+        indexer->GetLocationsFromPersistent(request_context.get(), {pre_fenced_key}, persistent_locations);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), persistent_result.error_codes);
+    ASSERT_EQ(1u, persistent_locations.size());
+    ASSERT_NE(persistent_locations.front().end(), persistent_locations.front().find(pre_fenced_id));
+    const std::string pre_fenced_value = persistent_locations.front().at(pre_fenced_id)->ToJsonString();
+    // The privileged path must carry its authoritative snapshot through both
+    // physical deletion and metadata CAD. A merely persistent read during
+    // admission is insufficient when the hot-cache value was evicted.
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              indexer->backend_manager_->cache_backend_->Delete(nullptr, {pre_fenced_key}));
+    const auto pre_fenced_result = executor
+                                       .Submit(CacheLocationDelRequest{
+                                           .instance_id = instance_id,
+                                           .block_keys = {pre_fenced_key},
+                                           .location_ids = {{pre_fenced_id}},
+                                           .expected_location_values = {{pre_fenced_value}},
+                                           .metadata_only = true,
+                                           .authoritative_read = true,
+                                           .pre_fenced_deleting = true,
+                                       })
+                                       .get();
+    EXPECT_EQ(EC_OK, pre_fenced_result.status) << pre_fenced_result.error_message;
+    expect_status(pre_fenced_key, pre_fenced_id, std::nullopt);
 }

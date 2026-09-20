@@ -68,6 +68,15 @@ struct CacheLocationDelRequest {
     // GC physical deletion revalidates against the persistent source of truth
     // and refreshes candidate keys into the hot cache before CAS.
     bool authoritative_read{false};
+    // The submitter has already durably published every targeted Location as
+    // CLS_DELETING. This is intentionally valid only together with
+    // authoritative_read, an explicit location_ids list, and parallel exact
+    // expected_location_values captured by the RMW that established the
+    // durable fence. Admission then selects only that unchanged
+    // CLS_DELETING generation and does not run another status CAS. Generic
+    // reclamation must leave this false so an unrelated in-flight delete
+    // cannot be adopted accidentally.
+    bool pre_fenced_deleting{false};
     // URIs that the submitter has already confirmed absent. Physical deletion
     // skips these idempotently while still deleting any remaining specs in the
     // same Location.
@@ -202,13 +211,16 @@ private:
                           const std::vector<std::vector<std::string>> *target_location_ids,
                           const std::vector<std::vector<std::string>> *expected_location_values,
                           std::chrono::microseconds delay,
-                          bool authoritative_read = false);
+                          bool authoritative_read = false,
+                          bool pre_fenced_deleting = false);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare,
-                            ScheduleTaskClass task_class);
+                            ScheduleTaskClass task_class,
+                            std::uint64_t already_fenced_target_count);
     AsyncDeleteSubmitResult SubmitDeleteTaskAsync(std::chrono::microseconds delay,
-                                                  std::function<LocationDelAdmissionResult()> prepare);
+                                                  std::function<LocationDelAdmissionResult()> prepare,
+                                                  std::uint64_t already_fenced_target_count);
     std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task, ScheduleTaskClass task_class);
     std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
                                                         ScheduleTaskClass task_class);

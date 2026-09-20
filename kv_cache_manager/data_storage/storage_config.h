@@ -54,6 +54,51 @@ inline constexpr char kTairMempoolUriScheme[] = "pace";
 // must be treated the same as the base type
 DataStorageType ToBaseType(const DataStorageType &type) noexcept;
 
+// Checksum algorithm; values mirror proto::meta::ChecksumAlgo and proto::admin::ChecksumAlgo.
+// CA_CRC32_XOR_INT64 is the persisted legacy contract produced by
+// SdkBufferCheckUtil::GetBlocksHash (CRC32 over each iov's configured head/tail
+// sample, aggregated via HashUtil::HashIntArray). Its odd-size and layout
+// semantics must not change in place; add a new enum for a revised contract.
+enum class ChecksumAlgo : uint8_t {
+    CA_UNSPECIFIED = 0,
+    CA_CRC32_XOR_INT64 = 1,
+};
+
+std::string ToString(ChecksumAlgo algo);
+ChecksumAlgo ToChecksumAlgo(const std::string &name);
+
+// Data integrity config; all fields default to disabled (verification path skipped).
+// See protocol/protobuf/meta_service.proto:DataIntegrityConfig for the wire shape.
+class DataIntegrityConfig : public Jsonizable {
+public:
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool ValidateRequiredFields(std::string &invalid_fields) const;
+    std::string ToString() const;
+    bool IsDefault() const {
+        return !enable_meta_checksum_ && !enable_inline_header_ && inline_header_version_ == 0 &&
+               algo_ == ChecksumAlgo::CA_CRC32_XOR_INT64;
+    }
+
+    bool enable_meta_checksum() const { return enable_meta_checksum_; }
+    bool enable_inline_header() const { return enable_inline_header_; }
+    uint32_t inline_header_version() const { return inline_header_version_; }
+    ChecksumAlgo algo() const { return algo_; }
+
+    void set_enable_meta_checksum(bool v) { enable_meta_checksum_ = v; }
+    void set_enable_inline_header(bool v) { enable_inline_header_ = v; }
+    void set_inline_header_version(uint32_t v) { inline_header_version_ = v; }
+    void set_algo(ChecksumAlgo algo) { algo_ = algo; }
+
+private:
+    bool enable_meta_checksum_ = false;  // Scheme A
+    bool enable_inline_header_ = false;  // Scheme B: reserved; rejected by Validate
+    uint32_t inline_header_version_ = 0; // 0 = no inline header (legacy data)
+    // Selects KVCM's built-in compute/verify implementation. Checksums supplied
+    // directly to FinishWrite remain opaque and are not tagged with this value.
+    ChecksumAlgo algo_ = ChecksumAlgo::CA_CRC32_XOR_INT64;
+};
+
 class StorageSpec : public Jsonizable {
 public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override { return false; }
@@ -274,11 +319,14 @@ public:
     const std::shared_ptr<StorageSpec> &storage_spec() const { return storage_spec_; }
     const bool check_storage_available_when_open() const { return check_storage_available_when_open_; }
     bool is_available() const { return is_available_; }
+    const DataIntegrityConfig &integrity() const { return integrity_; }
+    DataIntegrityConfig &mutable_integrity() { return integrity_; }
     void set_global_unique_name(const std::string &global_unique_name) { global_unique_name_ = global_unique_name; }
     void set_type(DataStorageType type) { type_ = type; }
     void set_storage_spec(const std::shared_ptr<StorageSpec> &storage_spec) { storage_spec_ = storage_spec; }
     void set_check_storage_available_when_open(bool value) { check_storage_available_when_open_ = value; }
     void set_is_available(bool is_available) { is_available_ = is_available; }
+    void set_integrity(const DataIntegrityConfig &integrity) { integrity_ = integrity; }
 
 private:
     DataStorageType type_{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN};
@@ -286,6 +334,7 @@ private:
     std::shared_ptr<StorageSpec> storage_spec_;
     bool check_storage_available_when_open_ = false;
     bool is_available_ = true; // for recover
+    DataIntegrityConfig integrity_;
 };
 
 } // namespace kv_cache_manager

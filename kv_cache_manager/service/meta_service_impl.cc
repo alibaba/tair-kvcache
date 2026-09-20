@@ -507,7 +507,7 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
     } else {
         for (const auto &cache_location : cache_locations_res) {
             auto *location_meta = response->add_locations();
-            ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
+            ProtoConvert::CacheLocationViewToProto(cache_location, location_meta, request->include_checksums());
         }
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
@@ -577,7 +577,8 @@ void MetaServiceImpl::GetCacheLocationsByBackend(RequestContext *request_context
         for (const auto &wrapper : batch_result) {
             auto *key_locs_proto = response->add_key_locations();
             for (const auto &view : wrapper.cache_locations_view()) {
-                ProtoConvert::CacheLocationViewToProto(view, key_locs_proto->add_locations());
+                ProtoConvert::CacheLocationViewToProto(
+                    view, key_locs_proto->add_locations(), request->include_checksums());
             }
         }
         status->set_code(proto::meta::OK);
@@ -676,7 +677,7 @@ void MetaServiceImpl::GetCacheMeta(RequestContext *request_context,
     } else {
         for (const auto &cache_location : cache_locations_res) {
             auto *location_meta = response->add_locations();
-            ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
+            ProtoConvert::CacheLocationViewToProto(cache_location, location_meta, request->include_checksums());
         }
         for (const auto &meta : metas_res) {
             response->add_metas(meta);
@@ -743,7 +744,9 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
         ProtoConvert::BlockMaskToProto(block_mask_res, block_mask_meta);
         for (const auto &cache_location : cache_locations_res.cache_locations_view()) {
             auto *location_meta = response->add_locations();
-            ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
+            // StartWrite returns allocation URIs, not persisted integrity
+            // metadata. Keep this legacy response checksum-free.
+            ProtoConvert::CacheLocationViewToProto(cache_location, location_meta, false);
         }
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
@@ -781,11 +784,33 @@ void MetaServiceImpl::FinishWriteCache(RequestContext *request_context,
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
     }
-    // 调用Manager层完成写入缓存
     BlockMask success_blocks_req;
     ProtoConvert::BlockMaskFromProto(&request->success_blocks(), success_blocks_req);
-    ErrorCode ec_info = cache_manager_->FinishWriteCache(
-        request_context, request->instance_id(), request->write_session_id(), success_blocks_req);
+    std::vector<CacheManager::FinishWriteCacheOptions::ChecksumBatch> checksum_batches;
+    checksum_batches.reserve(request->checksum_batches_size());
+    for (const auto &proto_batch : request->checksum_batches()) {
+        CacheManager::FinishWriteCacheOptions::ChecksumBatch batch;
+        batch.location_spec_name = proto_batch.location_spec_name();
+        batch.checksums.assign(proto_batch.checksums().begin(), proto_batch.checksums().end());
+        checksum_batches.push_back(std::move(batch));
+    }
+    std::vector<CacheManager::FinishWriteCacheOptions::UriBatch> uri_batches;
+    uri_batches.reserve(request->uri_batches_size());
+    for (const auto &proto_batch : request->uri_batches()) {
+        CacheManager::FinishWriteCacheOptions::UriBatch batch;
+        batch.location_spec_name = proto_batch.location_spec_name();
+        batch.uris.assign(proto_batch.uris().begin(), proto_batch.uris().end());
+        batch.uri_present.assign(proto_batch.uri_present().begin(), proto_batch.uri_present().end());
+        uri_batches.push_back(std::move(batch));
+    }
+    CacheManager::FinishWriteCacheOptions finish_options;
+    finish_options.checksum_batches = std::move(checksum_batches);
+    finish_options.uri_batches = std::move(uri_batches);
+    ErrorCode ec_info = cache_manager_->FinishWriteCache(request_context,
+                                                         request->instance_id(),
+                                                         request->write_session_id(),
+                                                         success_blocks_req,
+                                                         std::move(finish_options));
 
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));

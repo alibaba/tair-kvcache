@@ -748,11 +748,34 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         std::vector<ErrorCode> batch_key_get_ecs;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
         std::vector<ErrorCode> refresh_results;
+        bool authoritative_pre_sync_succeeded = !refresh_cache_from_persistent;
         if (refresh_cache_from_persistent) {
-            // Maintenance candidates originate from the persistent scan. Under
-            // the same shard lock as the CAS, replace a missing or stale hot
-            // cache entry with the complete source-of-truth key first.
-            refresh_results = backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
+            // A preceding ordinary RMW may already have updated the hot cache
+            // while its async persistent write is still queued. Drain every
+            // accepted same-key write while the shard lock prevents a newer
+            // mutation from being admitted, then refresh the complete
+            // authoritative value. Without this barrier, a compensating CAS
+            // can observe stale WRITING metadata, report MISMATCH, and allow
+            // the queued SERVING value to become visible afterwards.
+            constexpr size_t kMaxAuthoritativeSyncAttempts = 3;
+            for (size_t attempt = 0; attempt < kMaxAuthoritativeSyncAttempts; ++attempt) {
+                if (backend_manager_->Sync(batch_keys)) {
+                    authoritative_pre_sync_succeeded = true;
+                    break;
+                }
+                PREFIX_INDEXER_LOG(WARN,
+                                   "authoritative refresh pre-Sync attempt[%lu/%lu] failed for keys[%lu]",
+                                   attempt + 1,
+                                   kMaxAuthoritativeSyncAttempts,
+                                   batch_keys.size());
+            }
+            if (!authoritative_pre_sync_succeeded) {
+                PREFIX_INDEXER_LOG(WARN, "authoritative refresh pre-Sync failed for keys[%lu]", batch_keys.size());
+                refresh_results.assign(batch_keys.size(), EC_TIMEOUT);
+            } else {
+                refresh_results =
+                    backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
+            }
         }
         std::vector<std::vector<ErrorCode>> get_ecs_per_key;
         if (track_created_key_count) {
@@ -984,6 +1007,18 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                 if (location_ec == EC_OK) {
                     location_ec = rmw_result.error_codes[global_index];
                 }
+            }
+        }
+        if (refresh_cache_from_persistent && authoritative_pre_sync_succeeded && !backend_manager_->Sync(batch_keys)) {
+            // The caller requested an authoritative CAS (currently used to
+            // fence a partially published FinishWrite). Do not report the
+            // in-memory DELETING value as durable until the persistent queue
+            // has crossed a same-key barrier. A timeout is an unknown outcome
+            // and must keep the aggregate result non-OK so callers continue
+            // fail-closed cleanup instead of treating the slot as quarantined.
+            PREFIX_INDEXER_LOG(WARN, "authoritative refresh post-Sync failed for keys[%lu]", batch_keys.size());
+            for (const int32_t global_idx : batch.global_indices) {
+                key_level_failures[global_idx] = true;
             }
         }
         AdjustKeyCountMeta(put_success_count - (adjust_reclaimed_key_count ? delete_success_count : 0));

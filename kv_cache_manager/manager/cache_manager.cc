@@ -6,6 +6,7 @@
 #include <charconv>
 #include <chrono>
 #include <cinttypes>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -48,6 +49,7 @@
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/meta/types.h"
+#include "kv_cache_manager/metrics/delete_cleanup_observer.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -1230,17 +1232,32 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, PutWriteLocationManager);
     constexpr int64_t kMaxWriteTimeoutSeconds = 1800;
+    std::unordered_set<std::string> write_location_spec_names;
+    for (const auto &location : new_locations) {
+        if (location == nullptr) {
+            continue;
+        }
+        for (const auto &spec : location->location_specs()) {
+            write_location_spec_names.insert(spec.name());
+        }
+    }
     write_location_manager_->Put(
         write_session_id,
+        instance_id,
         std::move(new_keys),
         std::move(location_ids),
+        std::move(write_location_spec_names),
         std::min(kMaxWriteTimeoutSeconds, write_timeout_seconds),
         [this, trace_id, instance_id, write_session_id](
             std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info) {
             RequestContext temp_request_context(trace_id + "_timeout_callback");
             BlockMaskOffset succeed_block = 0;
             auto ec = this->FinishWriteCache(
-                &temp_request_context, instance_id, write_session_id, succeed_block, std::move(write_location_info));
+                &temp_request_context,
+                instance_id,
+                write_session_id,
+                succeed_block,
+                CacheManager::FinishWriteCacheOptions::WithWriteLocationInfo(std::move(write_location_info)));
             static_cast<void>(ec);
         });
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, PutWriteLocationManager);
@@ -1353,22 +1370,141 @@ void CacheManager::RollbackAddLocations(RequestContext *request_context,
     }
 }
 
-ErrorCode
-CacheManager::FinishWriteCache(RequestContext *request_context,
-                               const std::string &instance_id,
-                               const std::string &write_session_id,
-                               const BlockMask &success_block_mask,
-                               std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal) {
+ErrorCode CacheManager::FinishWriteCache(RequestContext *request_context,
+                                         const std::string &instance_id,
+                                         const std::string &write_session_id,
+                                         const BlockMask &success_block_mask,
+                                         CacheManager::FinishWriteCacheOptions options) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    const bool has_checksum_batches = !options.checksum_batches.empty();
+    const bool has_uri_batches = !options.uri_batches.empty();
+    constexpr size_t kMaxIntegritySpecBatches = 4096;
+    constexpr size_t kMaxIntegritySpecNameBytes = 1024;
+    constexpr size_t kMaxIntegrityValueCells = 1ULL << 20;
+    constexpr size_t kMaxFinishUriBytes = 48ULL * 1024 * 1024;
+    constexpr size_t kMaxSingleFinishUriBytes = 16ULL * 1024;
+    if (options.checksum_batches.size() > kMaxIntegritySpecBatches ||
+        options.uri_batches.size() > kMaxIntegritySpecBatches) {
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_BADARGS, "too many FinishWrite integrity spec batches");
+    }
+    std::optional<size_t> expected_key_count;
+    std::vector<std::string> integrity_spec_names;
+    std::unordered_set<std::string> integrity_spec_name_set;
+    auto register_batch_shape = [&](const std::string &spec_name, size_t batch_size) -> ErrorCode {
+        if (spec_name.empty() || spec_name.size() > kMaxIntegritySpecNameBytes) {
+            return EC_BADARGS;
+        }
+        if (expected_key_count.has_value() && *expected_key_count != batch_size) {
+            return EC_BADARGS;
+        }
+        expected_key_count = batch_size;
+        if (integrity_spec_name_set.insert(spec_name).second) {
+            integrity_spec_names.push_back(spec_name);
+        }
+        return EC_OK;
+    };
+    if (has_checksum_batches) {
+        std::unordered_set<std::string> seen_spec_names;
+        size_t total_checksum_values = 0;
+        for (const auto &batch : options.checksum_batches) {
+            if (batch.location_spec_name.empty() || !seen_spec_names.insert(batch.location_spec_name).second) {
+                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
+                                             EC_BADARGS,
+                                             "checksum location spec name is empty or duplicated: %s",
+                                             batch.location_spec_name.c_str());
+            }
+            if (register_batch_shape(batch.location_spec_name, batch.checksums.size()) != EC_OK) {
+                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
+                                             EC_BADARGS,
+                                             "checksum batch size (%zu) does not match peer batch size",
+                                             batch.checksums.size());
+            }
+            if (batch.checksums.size() > kMaxIntegrityValueCells - total_checksum_values) {
+                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_BADARGS, "checksum batches exceed FinishWrite value budget");
+            }
+            total_checksum_values += batch.checksums.size();
+        }
+    }
+    if (has_uri_batches) {
+        std::unordered_set<std::string> seen_spec_names;
+        size_t total_uri_bytes = 0;
+        size_t total_uri_values = 0;
+        for (const auto &batch : options.uri_batches) {
+            if (batch.location_spec_name.empty() || !seen_spec_names.insert(batch.location_spec_name).second) {
+                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
+                                             EC_BADARGS,
+                                             "URI location spec name is empty or duplicated: %s",
+                                             batch.location_spec_name.c_str());
+            }
+            if (batch.uris.size() != batch.uri_present.size() ||
+                register_batch_shape(batch.location_spec_name, batch.uris.size()) != EC_OK) {
+                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
+                                             EC_BADARGS,
+                                             "URI batch shape mismatch, uris (%zu), presence (%zu)",
+                                             batch.uris.size(),
+                                             batch.uri_present.size());
+            }
+            if (batch.uris.size() > kMaxIntegrityValueCells - total_uri_values) {
+                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_BADARGS, "URI batches exceed FinishWrite value budget");
+            }
+            total_uri_values += batch.uris.size();
+            for (size_t i = 0; i < batch.uris.size(); ++i) {
+                if (batch.uri_present[i] == batch.uris[i].empty()) {
+                    RETURN_IF_EC_NOT_OK_WITH_LOG(
+                        WARN, EC_BADARGS, "URI batch has inconsistent presence at index (%zu)", i);
+                }
+                if (batch.uris[i].size() > kMaxSingleFinishUriBytes ||
+                    batch.uris[i].size() > kMaxFinishUriBytes - total_uri_bytes) {
+                    RETURN_IF_EC_NOT_OK_WITH_LOG(
+                        WARN, EC_BADARGS, "URI batch exceeds FinishWrite byte budget at index (%zu)", i);
+                }
+                total_uri_bytes += batch.uris[i].size();
+                if (batch.uri_present[i] && !StandardUri(batch.uris[i]).Valid()) {
+                    RETURN_IF_EC_NOT_OK_WITH_LOG(
+                        WARN, EC_BADARGS, "URI batch contains an invalid URI at index (%zu)", i);
+                }
+            }
+        }
+    }
+    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    if (!meta_searcher) {
+        request_context->error_tracer()->AddErrorMsg("instance not exist");
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "finish write cache failed: meta searcher not found");
+    }
     WriteLocationManager::WriteLocationInfo location_info;
-    if (write_location_info_internal != nullptr) {
-        location_info = std::move(*write_location_info_internal);
-    } else if (!write_location_manager_->GetAndDelete(write_session_id, location_info)) {
-        request_context->error_tracer()->AddErrorMsg("write_session_id has been deleted");
-        RETURN_IF_EC_NOT_OK_WITH_LOG(
-            WARN, EC_ERROR, "finish write cache failed: write_session_id not found: %s", write_session_id.c_str());
+    if (options.write_location_info_internal != nullptr) {
+        location_info = std::move(*options.write_location_info_internal);
+    } else {
+        // Validate every caller-controlled dimension and consume atomically. A
+        // malformed request remains available for a corrected retry; otherwise
+        // its timeout callback remains responsible for cleanup.
+        const auto take_result = write_location_manager_->GetAndDeleteForFinish(
+            write_session_id, instance_id, success_block_mask, expected_key_count, integrity_spec_names, location_info);
+        if (take_result == WriteLocationManager::TakeResult::NOT_FOUND) {
+            request_context->error_tracer()->AddErrorMsg("write_session_id has been deleted");
+            RETURN_IF_EC_NOT_OK_WITH_LOG(
+                WARN, EC_ERROR, "finish write cache failed: write_session_id not found: %s", write_session_id.c_str());
+        }
+        if (take_result == WriteLocationManager::TakeResult::INSTANCE_ID_MISMATCH) {
+            RETURN_IF_EC_NOT_OK_WITH_LOG(
+                WARN, EC_BADARGS, "write session does not belong to instance: %s", instance_id.c_str());
+        }
+        if (take_result == WriteLocationManager::TakeResult::BLOCK_MASK_MISMATCH) {
+            RETURN_IF_EC_NOT_OK_WITH_LOG(
+                WARN, EC_BADARGS, "invalid block mask, mask type: %zu", success_block_mask.index());
+        }
+        if (take_result == WriteLocationManager::TakeResult::KEY_COUNT_MISMATCH) {
+            RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
+                                         EC_BADARGS,
+                                         "integrity batch size (%zu) does not match write session key count",
+                                         expected_key_count.value_or(0));
+        }
+        if (take_result == WriteLocationManager::TakeResult::SPEC_NAME_MISMATCH) {
+            RETURN_IF_EC_NOT_OK_WITH_LOG(
+                WARN, EC_BADARGS, "checksum names contain a spec not allocated by this write session");
+        }
     }
     if (!IsBlockMaskValid(success_block_mask, location_info.keys.size())) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
@@ -1377,60 +1513,420 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                                      success_block_mask.index(),
                                      location_info.keys.size());
     }
-
-    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
-    if (!meta_searcher) {
-        request_context->error_tracer()->AddErrorMsg("instance not exist");
-        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "finish write cache failed: meta searcher not found");
+    if (expected_key_count.has_value() && *expected_key_count != location_info.keys.size()) {
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
+                                     EC_BADARGS,
+                                     "integrity batch size (%zu) does not match keys size (%zu)",
+                                     *expected_key_count,
+                                     location_info.keys.size());
     }
+
     std::vector<KeyType> success_batch_keys;
-    std::vector<std::string> success_batch_location_ids;
+    std::vector<std::vector<std::string>> success_batch_location_ids;
     std::vector<std::vector<MetaSearcher::LocationUpdateTask>> success_batch_update_tasks;
+    std::vector<KeyType> cleanup_batch_keys;
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> cleanup_batch_update_tasks;
     CacheLocationDelRequest failed_del_request{.instance_id = instance_id, .delay = std::chrono::seconds(0)};
+    std::unordered_map<KeyType, size_t> success_key_indices;
+    std::unordered_map<KeyType, size_t> cleanup_key_indices;
+    size_t success_location_count = 0;
+    auto add_cleanup_target =
+        [&](KeyType key, const std::string &location_id, MetaSearcher::LocationUpdateTask cleanup_task) {
+            auto [iter, inserted] = cleanup_key_indices.emplace(key, cleanup_batch_keys.size());
+            if (inserted) {
+                cleanup_batch_keys.push_back(key);
+                cleanup_batch_update_tasks.emplace_back();
+                failed_del_request.block_keys.push_back(key);
+                failed_del_request.location_ids.emplace_back();
+            }
+            const size_t key_index = iter->second;
+            cleanup_batch_update_tasks[key_index].push_back(std::move(cleanup_task));
+            failed_del_request.location_ids[key_index].push_back(location_id);
+        };
 
     for (size_t block_key_idx = 0; block_key_idx < location_info.keys.size(); block_key_idx++) {
         if (IsIndexInMaskRange(success_block_mask, block_key_idx)) {
             // success
-            success_batch_keys.push_back(location_info.keys[block_key_idx]);
-            success_batch_location_ids.push_back(location_info.location_ids[block_key_idx]);
-            success_batch_update_tasks.push_back(
-                {{location_info.location_ids[block_key_idx], CacheLocationStatus::CLS_SERVING}});
+            const KeyType key = location_info.keys[block_key_idx];
+            auto [iter, inserted] = success_key_indices.emplace(key, success_batch_keys.size());
+            if (inserted) {
+                success_batch_keys.push_back(key);
+                success_batch_location_ids.emplace_back();
+                success_batch_update_tasks.emplace_back();
+            }
+            const size_t key_index = iter->second;
+            success_batch_location_ids[key_index].push_back(location_info.location_ids[block_key_idx]);
+            MetaSearcher::LocationUpdateTask task{
+                .location_id = location_info.location_ids[block_key_idx],
+                .new_status = CacheLocationStatus::CLS_SERVING,
+            };
+            task.expected_status = CacheLocationStatus::CLS_WRITING;
+            task.spec_checksums.reserve(options.checksum_batches.size());
+            for (const auto &batch : options.checksum_batches) {
+                task.spec_checksums.push_back({batch.location_spec_name, batch.checksums[block_key_idx]});
+            }
+            task.spec_uris.reserve(options.uri_batches.size());
+            for (const auto &batch : options.uri_batches) {
+                if (batch.uri_present[block_key_idx]) {
+                    task.spec_uris.push_back({batch.location_spec_name, batch.uris[block_key_idx]});
+                }
+            }
+            success_batch_update_tasks[key_index].push_back(std::move(task));
+            ++success_location_count;
         } else {
             // failed
-            failed_del_request.block_keys.push_back(location_info.keys[block_key_idx]);
-            failed_del_request.location_ids.push_back({location_info.location_ids[block_key_idx]});
+            // A client-side backend (notably PACE fallback allocation) may
+            // have resolved a new URI before another spec/transfer in this
+            // block failed. Publish that URI only as DELETING so the standard
+            // reclaimer owns the actual allocation rather than deleting just
+            // the obsolete WRITING URI and leaking the new one.
+            MetaSearcher::LocationUpdateTask cleanup_task{
+                .location_id = location_info.location_ids[block_key_idx],
+                .new_status = CacheLocationStatus::CLS_DELETING,
+            };
+            cleanup_task.spec_uris.reserve(options.uri_batches.size());
+            for (const auto &batch : options.uri_batches) {
+                if (batch.uri_present[block_key_idx]) {
+                    cleanup_task.spec_uris.push_back({batch.location_spec_name, batch.uris[block_key_idx]});
+                }
+            }
+            cleanup_task.allowed_current_statuses = {
+                CacheLocationStatus::CLS_WRITING,
+                CacheLocationStatus::CLS_SERVING,
+                CacheLocationStatus::CLS_DELETING,
+            };
+            add_cleanup_target(
+                location_info.keys[block_key_idx], location_info.location_ids[block_key_idx], std::move(cleanup_task));
         }
     }
 
     ErrorCode ec = ErrorCode::EC_OK;
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, manager, request_key_count, success_batch_keys.size());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, success_location_count);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchUpdateLocation);
     std::vector<std::vector<ErrorCode>> out_batch_results;
     if (!success_batch_keys.empty()) {
         ec = meta_searcher->BatchUpdateLocationStatus(
             request_context, success_batch_keys, success_batch_update_tasks, out_batch_results);
-        if (ec != EC_OK) {
-            std::string detail_ec_str = MetaSearcher::BatchErrorCodeToStr(out_batch_results);
-            PREFIX_LOG(WARN, "update location status failed, ec: %d, ec_batches: %s", ec, detail_ec_str.c_str());
+        // ReadModifyWriteLocation reports semantic failures per slot even when
+        // its aggregate transport succeeded. Validate both dimensions on every
+        // path and never leak EC_NOENT as "instance not found" at the API.
+        bool slot_failure = out_batch_results.size() != success_batch_update_tasks.size();
+        if (!slot_failure) {
+            for (size_t i = 0; i < out_batch_results.size(); ++i) {
+                if (out_batch_results[i].size() != success_batch_update_tasks[i].size() ||
+                    std::any_of(out_batch_results[i].begin(), out_batch_results[i].end(), [](const auto slot_ec) {
+                        return slot_ec != ErrorCode::EC_OK;
+                    })) {
+                    slot_failure = true;
+                    break;
+                }
+            }
+        }
+        if (ec != EC_OK || slot_failure) {
+            for (size_t i = 0; i < success_batch_update_tasks.size(); ++i) {
+                for (size_t j = 0; j < success_batch_update_tasks[i].size(); ++j) {
+                    MetaSearcher::LocationUpdateTask cleanup_task{
+                        .location_id = success_batch_location_ids[i][j],
+                        .new_status = CacheLocationStatus::CLS_DELETING,
+                    };
+                    cleanup_task.spec_uris = success_batch_update_tasks[i][j].spec_uris;
+                    cleanup_task.allowed_current_statuses = {
+                        CacheLocationStatus::CLS_WRITING,
+                        CacheLocationStatus::CLS_SERVING,
+                        CacheLocationStatus::CLS_DELETING,
+                    };
+                    add_cleanup_target(
+                        success_batch_keys[i], success_batch_location_ids[i][j], std::move(cleanup_task));
+                }
+            }
+            ec = ErrorCode::EC_ERROR;
+            request_context->error_tracer()->AddErrorMsg("FinishWrite metadata update was partial or malformed");
+            const std::string detail_ec_str = MetaSearcher::BatchErrorCodeToStr(out_batch_results);
+            PREFIX_LOG(
+                WARN, "update location status was not atomic, ec: %d, ec_batches: %s", ec, detail_ec_str.c_str());
         }
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchUpdateLocation);
+
+    bool cleanup_incomplete = false;
+    std::vector<std::vector<std::string>> confirmed_cleanup_values(cleanup_batch_keys.size());
+    std::vector<std::vector<bool>> cleanup_confirmed(cleanup_batch_keys.size());
+    size_t cleanup_target_count = 0;
+    size_t confirmed_cleanup_target_count = 0;
+    for (size_t i = 0; i < cleanup_batch_update_tasks.size(); ++i) {
+        const size_t target_count = cleanup_batch_update_tasks[i].size();
+        confirmed_cleanup_values[i].resize(target_count);
+        cleanup_confirmed[i].assign(target_count, false);
+        cleanup_target_count += target_count;
+    }
+    if (!cleanup_batch_keys.empty()) {
+        // Cross-key publication is not transactional. Fold every original
+        // failed-mask target and every target from a failed main RMW into one
+        // authoritative cleanup state: {WRITING,SERVING,DELETING} ->
+        // DELETING while persisting any validated actual URI in the same RMW.
+        // This is the only path allowed to establish ownership of a
+        // client-supplied URI before the reclaimer can physically delete it.
+        constexpr size_t kMaxCleanupAttempts = 3;
+        constexpr size_t kMaxCleanupSalvageCalls = 32;
+        ErrorCode cleanup_ec = EC_ERROR;
+        std::vector<std::vector<ErrorCode>> cleanup_results;
+        std::vector<std::vector<std::string>> cleanup_location_values;
+        struct CleanupSlotRef {
+            size_t key_index;
+            size_t slot_index;
+        };
+        auto confirm_cleanup_slots = [&](ErrorCode call_ec,
+                                         const auto &tasks,
+                                         const auto &results,
+                                         auto &values,
+                                         const std::vector<std::vector<CleanupSlotRef>> *slot_refs) {
+            if (call_ec != EC_OK || results.size() != tasks.size() || values.size() != tasks.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < tasks.size(); ++i) {
+                if (results[i].size() != tasks[i].size() || values[i].size() != tasks[i].size() ||
+                    (slot_refs != nullptr &&
+                     (slot_refs->size() != tasks.size() || (*slot_refs)[i].size() != tasks[i].size()))) {
+                    return false;
+                }
+                if (slot_refs != nullptr &&
+                    std::any_of((*slot_refs)[i].begin(), (*slot_refs)[i].end(), [&](const auto &ref) {
+                        return ref.key_index >= cleanup_confirmed.size() ||
+                               ref.slot_index >= cleanup_confirmed[ref.key_index].size();
+                    })) {
+                    return false;
+                }
+            }
+            // EC_OK here includes the authoritative pre-read and post-write
+            // Sync barriers. Per-slot semantic failures do not change that
+            // aggregate result, so retain every independently fenced exact
+            // post-image instead of allowing one sibling under the same block
+            // key to strand all successful locations in CLS_DELETING.
+            for (size_t i = 0; i < tasks.size(); ++i) {
+                for (size_t j = 0; j < tasks[i].size(); ++j) {
+                    if (results[i][j] != ErrorCode::EC_OK || values[i][j].empty()) {
+                        continue;
+                    }
+                    const CleanupSlotRef ref = slot_refs == nullptr ? CleanupSlotRef{i, j} : (*slot_refs)[i][j];
+                    if (!cleanup_confirmed[ref.key_index][ref.slot_index]) {
+                        cleanup_confirmed[ref.key_index][ref.slot_index] = true;
+                        ++confirmed_cleanup_target_count;
+                    }
+                    confirmed_cleanup_values[ref.key_index][ref.slot_index] = std::move(values[i][j]);
+                }
+            }
+            return true;
+        };
+        for (size_t attempt = 0; attempt < kMaxCleanupAttempts; ++attempt) {
+            cleanup_results.clear();
+            cleanup_location_values.clear();
+            cleanup_ec = meta_searcher->BatchUpdateLocationStatus(request_context,
+                                                                  cleanup_batch_keys,
+                                                                  cleanup_batch_update_tasks,
+                                                                  cleanup_results,
+                                                                  /*authoritative_persistence=*/true,
+                                                                  &cleanup_location_values);
+            const bool result_shape_safe = confirm_cleanup_slots(
+                cleanup_ec, cleanup_batch_update_tasks, cleanup_results, cleanup_location_values, nullptr);
+            cleanup_incomplete = confirmed_cleanup_target_count != cleanup_target_count;
+            if (!cleanup_incomplete) {
+                break;
+            }
+            PREFIX_LOG(WARN,
+                       "FinishWrite authoritative cleanup attempt[%zu/%zu] incomplete, ec: %d, shape_safe[%d], "
+                       "confirmed[%zu/%zu], results: %s",
+                       attempt + 1,
+                       kMaxCleanupAttempts,
+                       cleanup_ec,
+                       result_shape_safe,
+                       confirmed_cleanup_target_count,
+                       cleanup_target_count,
+                       MetaSearcher::BatchErrorCodeToStr(cleanup_results).c_str());
+        }
+        if (cleanup_incomplete && cleanup_target_count - confirmed_cleanup_target_count > 1) {
+            // Release the potentially tens-of-MiB full-batch diagnostics
+            // before allocating subrange results on the exceptional salvage
+            // path. clear() alone retains the backing capacity.
+            std::vector<std::vector<ErrorCode>>().swap(cleanup_results);
+            std::vector<std::vector<std::string>>().swap(cleanup_location_values);
+            // One permanently bad slot must not turn every independently
+            // fenced peer into an unbounded leak. On this exceptional path,
+            // recursively split down to individual (key, location) targets.
+            // A sub-call can confirm each successful slot only when its
+            // aggregate authoritative pre/post-Sync result is EC_OK. The call
+            // budget bounds adversarial/error amplification; unresolved slots
+            // remain hidden and are never physically retried.
+            struct CleanupRange {
+                size_t begin;
+                size_t end;
+            };
+            std::vector<CleanupSlotRef> unresolved_slots;
+            unresolved_slots.reserve(cleanup_target_count - confirmed_cleanup_target_count);
+            for (size_t key_index = 0; key_index < cleanup_batch_update_tasks.size(); ++key_index) {
+                for (size_t slot_index = 0; slot_index < cleanup_batch_update_tasks[key_index].size(); ++slot_index) {
+                    if (!cleanup_confirmed[key_index][slot_index]) {
+                        unresolved_slots.push_back({key_index, slot_index});
+                    }
+                }
+            }
+            std::deque<CleanupRange> pending_ranges;
+            const size_t middle = unresolved_slots.size() / 2;
+            pending_ranges.push_back({0, middle});
+            pending_ranges.push_back({middle, unresolved_slots.size()});
+            size_t salvage_calls = 0;
+            while (!pending_ranges.empty() && salvage_calls < kMaxCleanupSalvageCalls) {
+                const CleanupRange range = pending_ranges.front();
+                pending_ranges.pop_front();
+                if (range.begin >= range.end) {
+                    continue;
+                }
+                KeyVector range_keys;
+                std::vector<std::vector<MetaSearcher::LocationUpdateTask>> range_tasks;
+                std::vector<std::vector<CleanupSlotRef>> range_slot_refs;
+                std::unordered_map<size_t, size_t> range_key_indices;
+                range_keys.reserve(range.end - range.begin);
+                range_tasks.reserve(range.end - range.begin);
+                range_slot_refs.reserve(range.end - range.begin);
+                for (size_t slot_ref_index = range.begin; slot_ref_index < range.end; ++slot_ref_index) {
+                    const CleanupSlotRef ref = unresolved_slots[slot_ref_index];
+                    if (cleanup_confirmed[ref.key_index][ref.slot_index]) {
+                        continue;
+                    }
+                    auto [iter, inserted] = range_key_indices.emplace(ref.key_index, range_keys.size());
+                    if (inserted) {
+                        range_keys.push_back(cleanup_batch_keys[ref.key_index]);
+                        range_tasks.emplace_back();
+                        range_slot_refs.emplace_back();
+                    }
+                    const size_t range_key_index = iter->second;
+                    range_tasks[range_key_index].push_back(cleanup_batch_update_tasks[ref.key_index][ref.slot_index]);
+                    range_slot_refs[range_key_index].push_back(ref);
+                }
+                if (range_keys.empty()) {
+                    continue;
+                }
+                std::vector<std::vector<ErrorCode>> range_results;
+                std::vector<std::vector<std::string>> range_values;
+                const ErrorCode range_ec = meta_searcher->BatchUpdateLocationStatus(
+                    request_context, range_keys, range_tasks, range_results, true, &range_values);
+                ++salvage_calls;
+                confirm_cleanup_slots(range_ec, range_tasks, range_results, range_values, &range_slot_refs);
+
+                size_t unresolved_count = 0;
+                for (size_t i = range.begin; i < range.end; ++i) {
+                    const auto ref = unresolved_slots[i];
+                    unresolved_count += cleanup_confirmed[ref.key_index][ref.slot_index] ? 0 : 1;
+                }
+                if (unresolved_count > 1) {
+                    const size_t left_unresolved_count = unresolved_count / 2;
+                    size_t seen_unresolved = 0;
+                    size_t split = range.begin;
+                    for (; split < range.end; ++split) {
+                        const auto ref = unresolved_slots[split];
+                        if (!cleanup_confirmed[ref.key_index][ref.slot_index] &&
+                            ++seen_unresolved == left_unresolved_count) {
+                            ++split;
+                            break;
+                        }
+                    }
+                    pending_ranges.push_back({range.begin, split});
+                    pending_ranges.push_back({split, range.end});
+                }
+            }
+            cleanup_incomplete = confirmed_cleanup_target_count != cleanup_target_count;
+            PREFIX_LOG(WARN,
+                       "FinishWrite cleanup salvage confirmed[%zu/%zu], calls[%zu/%zu], pending_ranges[%zu]",
+                       confirmed_cleanup_target_count,
+                       cleanup_target_count,
+                       salvage_calls,
+                       kMaxCleanupSalvageCalls,
+                       pending_ranges.size());
+        }
+        if (cleanup_incomplete) {
+            request_context->error_tracer()->AddErrorMsg("FinishWrite actual URI cleanup could not be durably fenced");
+            PREFIX_LOG(ERROR,
+                       "failed to durably hide every FinishWrite cleanup target; unbound client URIs are retained");
+            RecordDeleteCleanupPermanentFailure(
+                metrics_registry_,
+                DeleteCleanupFailureStage::kAuthoritativeFence,
+                static_cast<std::uint64_t>(cleanup_target_count - confirmed_cleanup_target_count));
+        }
+    }
+    if (ec == EC_OK && cleanup_incomplete) {
+        ec = EC_ERROR;
+    }
+    if (!cleanup_batch_keys.empty()) {
+        CacheLocationDelRequest exact_del_request{.instance_id = instance_id, .delay = std::chrono::seconds(0)};
+        size_t exact_submit_target_count = 0;
+        const bool request_shape_valid = failed_del_request.block_keys == cleanup_batch_keys &&
+                                         failed_del_request.location_ids.size() == cleanup_batch_keys.size();
+        if (request_shape_valid) {
+            for (size_t i = 0; i < cleanup_batch_keys.size(); ++i) {
+                if (failed_del_request.location_ids[i].size() != confirmed_cleanup_values[i].size() ||
+                    cleanup_confirmed[i].size() != confirmed_cleanup_values[i].size()) {
+                    ec = EC_ERROR;
+                    continue;
+                }
+                std::vector<std::string> confirmed_location_ids;
+                std::vector<std::string> confirmed_location_values;
+                confirmed_location_ids.reserve(failed_del_request.location_ids[i].size());
+                confirmed_location_values.reserve(confirmed_cleanup_values[i].size());
+                for (size_t j = 0; j < failed_del_request.location_ids[i].size(); ++j) {
+                    if (!cleanup_confirmed[i][j] || confirmed_cleanup_values[i][j].empty()) {
+                        continue;
+                    }
+                    confirmed_location_ids.push_back(failed_del_request.location_ids[i][j]);
+                    confirmed_location_values.push_back(std::move(confirmed_cleanup_values[i][j]));
+                }
+                if (!confirmed_location_ids.empty()) {
+                    exact_submit_target_count += confirmed_location_ids.size();
+                    exact_del_request.block_keys.push_back(cleanup_batch_keys[i]);
+                    exact_del_request.location_ids.push_back(std::move(confirmed_location_ids));
+                    exact_del_request.expected_location_values.push_back(std::move(confirmed_location_values));
+                }
+            }
+        } else {
+            ec = EC_ERROR;
+            request_context->error_tracer()->AddErrorMsg("FinishWrite cleanup request shape mismatch");
+        }
+        if (exact_submit_target_count != confirmed_cleanup_target_count) {
+            ec = EC_ERROR;
+            request_context->error_tracer()->AddErrorMsg(
+                "FinishWrite confirmed cleanup targets could not be assembled for exact deletion");
+            RecordDeleteCleanupPermanentFailure(
+                metrics_registry_,
+                DeleteCleanupFailureStage::kDispatchOrWorker,
+                static_cast<std::uint64_t>(confirmed_cleanup_target_count -
+                                           std::min(confirmed_cleanup_target_count, exact_submit_target_count)));
+        }
+        // Bind physical deletion to the exact serialized values produced by
+        // the authoritative cleanup RMW. Admission and final CAD both compare
+        // this snapshot, so a same-id replacement cannot be adopted between
+        // the durable fence and reclaimer execution.
+        exact_del_request.authoritative_read = true;
+        exact_del_request.pre_fenced_deleting = true;
+        failed_del_request = std::move(exact_del_request);
+    }
 
     // 多层存储 Mark 消费完成：仅当本次 target location 成功 SERVING 后，按配置策略清标。
     // 仅处理启用了 tiered migration（配置了 migration_strategies）的 instance group，与
     // FilterWriteCache 的 mark 消费入口保持对称；非分层 group 无 mark 可清（admin 旁路打的标由 timeout 兜底）。
     const auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-    if (!success_batch_keys.empty() && IsTieredMigrationEnabled(request_context, registry_manager_, instance_info)) {
+    if (ec == EC_OK && !success_batch_keys.empty() &&
+        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info)) {
         KeyVector mark_candidate_keys;
         std::vector<std::string> mark_candidate_location_ids;
         for (size_t i = 0; i < success_batch_keys.size(); ++i) {
-            if (i >= out_batch_results.size() || out_batch_results[i].empty() ||
-                out_batch_results[i][0] != ErrorCode::EC_OK) {
+            if (i >= out_batch_results.size() || out_batch_results[i].size() != success_batch_location_ids[i].size()) {
                 continue;
             }
-            mark_candidate_keys.push_back(success_batch_keys[i]);
-            mark_candidate_location_ids.push_back(success_batch_location_ids[i]);
+            for (size_t j = 0; j < success_batch_location_ids[i].size(); ++j) {
+                if (out_batch_results[i][j] != ErrorCode::EC_OK) {
+                    continue;
+                }
+                mark_candidate_keys.push_back(success_batch_keys[i]);
+                mark_candidate_location_ids.push_back(success_batch_location_ids[i][j]);
+            }
         }
         if (!mark_candidate_keys.empty()) {
             std::vector<MigrationManager::MarkQueryResult> tiered_targets;
@@ -2572,6 +3068,8 @@ bool ParseInt64(const std::string &s, int64_t &out) {
 struct ValidatedEventLocationSpec {
     std::string_view name;
     std::string_view raw_uri;
+    int64_t checksum = 0;
+    bool checksum_present = false;
     // Canonical ReportEvent URIs never need the heavyweight StandardUri
     // object. Allocate it only for the compatibility fallback so the common
     // validation result stays small and cheap to move through inline storage.
@@ -2601,6 +3099,10 @@ bool ValidateEventLocationSpec(const proto::meta::LocationSpec &spec, ValidatedE
     }
     out.name = spec.name();
     out.raw_uri = spec.uri();
+    out.checksum = spec.checksum();
+    // Accept non-zero values sent by early checksum clients that predate the
+    // explicit presence bit. New callers should always set both fields.
+    out.checksum_present = spec.checksum_present() || spec.checksum() != 0;
     if (SnapshotUriUtils::ParseCanonicalUriForSnapshotAppend(out.raw_uri, out.canonical_uri)) {
         out.is_canonical_uri = true;
         out.size = out.canonical_uri.size;
@@ -3116,6 +3618,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 if (mutation.spec.name() != spec.name()) {
                     continue;
                 }
+                // BLOCK_ADD is a patch even when multiple events for the same
+                // spec are folded inside one request.  If an earlier ADD in
+                // this batch supplied a checksum and a later ADD only refreshes
+                // the URI, retain the newly supplied checksum instead of
+                // falling back to the value that happened to be persisted
+                // before the request began.
+                if (is_add && mutation.is_add && mutation.spec.has_checksum() && !spec.has_checksum()) {
+                    spec.set_checksum(mutation.spec.checksum());
+                }
                 mutation.is_add = is_add;
                 mutation.spec = std::move(spec);
                 mutation.size = size;
@@ -3267,6 +3778,9 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 LocationSpec versioned_spec;
                 versioned_spec.set_name_view(spec.name);
                 versioned_spec.set_uri(std::move(spec.versioned_uri));
+                if (spec.checksum_present) {
+                    versioned_spec.set_checksum(spec.checksum);
+                }
                 apply_delta_spec(location_mutation, true, std::move(versioned_spec), spec.size);
             }
             if (event_mutation_index == kInvalidDeltaIndex) {
@@ -3434,6 +3948,9 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     LocationSpec versioned_spec;
                     versioned_spec.set_name_view(spec.name);
                     versioned_spec.set_uri(std::move(spec.versioned_uri));
+                    if (spec.checksum_present) {
+                        versioned_spec.set_checksum(spec.checksum);
+                    }
                     versioned_specs.push_back(std::move(versioned_spec));
                 }
                 if (per_item_ec[i] != EC_OK) {
@@ -4649,8 +5166,8 @@ CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance
         }
 
         std::map<std::string, std::vector<std::string>, std::less<>> ranked_hosts_by_base;
-        const auto l1p5_it = event_snapshots->by_storage_type.find(
-            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+        const auto l1p5_it =
+            event_snapshots->by_storage_type.find(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
         if (l1p5_it != event_snapshots->by_storage_type.end()) {
             for (const auto &[reporter, state] : l1p5_it->second.reporters) {
                 (void)state;

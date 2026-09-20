@@ -53,7 +53,7 @@ void ReclaimerTaskSupervisor::Submit(const std::string &trace_id, CacheLocationD
         cell_queue_.Push(cell);
     } else {
         KVCM_LOG_ERROR("Submit CacheLocationDelRequest instance_id[%s] trace_id[%s] failed",
-                       request.instance_id.c_str(),
+                       cell->instance_id.c_str(),
                        trace_id.c_str());
     }
 }
@@ -69,11 +69,19 @@ void ReclaimerTaskSupervisor::WorkLoop() {
             auto status = cell->result.wait_for(kDefaultFutureWaitTime);
             if (status == std::future_status::ready) {
                 auto del_result = cell->result.get();
-                KVCM_LOG_INFO("delete task finish : instance_id[%s] trace_id [%s] ec[%d] message[%s]",
-                              cell->instance_id.c_str(),
-                              cell->trace_id.c_str(),
-                              del_result.status,
-                              del_result.error_message.c_str());
+                if (del_result.status == ErrorCode::EC_OK) {
+                    KVCM_LOG_INFO("delete task finish : instance_id[%s] trace_id [%s] ec[%d] message[%s]",
+                                  cell->instance_id.c_str(),
+                                  cell->trace_id.c_str(),
+                                  del_result.status,
+                                  del_result.error_message.c_str());
+                } else if (!del_result.error_logged) {
+                    KVCM_LOG_ERROR("delete task failed : instance_id[%s] trace_id [%s] ec[%d] message[%s]",
+                                   cell->instance_id.c_str(),
+                                   cell->trace_id.c_str(),
+                                   del_result.status,
+                                   del_result.error_message.c_str());
+                }
             } else {
                 cell_queue_.Push(cell);
             }

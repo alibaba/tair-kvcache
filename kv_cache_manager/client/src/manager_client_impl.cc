@@ -61,8 +61,26 @@ ManagerClientImpl::MatchLocation(const std::string &trace_id,
                                  const BlockMask &block_mask,
                                  int32_t sw_size,
                                  const std::vector<std::string> &location_spec_names) {
+    auto [ec, result] = MatchLocation(trace_id,
+                                      query_type,
+                                      keys,
+                                      tokens,
+                                      block_mask,
+                                      location_spec_names,
+                                      MatchLocationOptions::WithSlideWindowSize(sw_size));
+    return {ec, std::move(result.locations)};
+}
+
+std::pair<ClientErrorCode, MatchLocationResult>
+ManagerClientImpl::MatchLocation(const std::string &trace_id,
+                                 QueryType query_type,
+                                 const std::vector<int64_t> &keys,
+                                 const std::vector<int64_t> &tokens,
+                                 const BlockMask &block_mask,
+                                 const std::vector<std::string> &location_spec_names,
+                                 const MatchLocationOptions &options) {
     CHECK_CLIENT_WITH_TYPE(meta_client_);
-    return meta_client_->MatchLocation(trace_id, query_type, keys, tokens, block_mask, sw_size, location_spec_names);
+    return meta_client_->MatchLocation(trace_id, query_type, keys, tokens, block_mask, location_spec_names, options);
 }
 
 std::pair<ClientErrorCode, WriteLocation>
@@ -79,8 +97,25 @@ ClientErrorCode ManagerClientImpl::FinishWrite(const std::string &trace_id,
                                                const std::string &write_session_id,
                                                const BlockMask &success_block,
                                                const Locations &locations) {
+    return FinishWrite(trace_id, write_session_id, success_block, locations, FinishWriteOptions{});
+}
+
+ClientErrorCode ManagerClientImpl::FinishWrite(const std::string &trace_id,
+                                               const std::string &write_session_id,
+                                               const BlockMask &success_block,
+                                               const Locations &locations,
+                                               const FinishWriteOptions &options) {
     CHECK_CLIENT(meta_client_);
-    return meta_client_->FinishWrite(trace_id, write_session_id, success_block, locations);
+    return meta_client_->FinishWrite(trace_id, write_session_id, success_block, locations, options);
+}
+
+ClientErrorCode ManagerClientImpl::FinishWriteWithIntegrity(const std::string &trace_id,
+                                                            const std::string &write_session_id,
+                                                            const BlockMask &success_block,
+                                                            const Locations &locations,
+                                                            const FinishWriteIntegrityOptions &options) {
+    CHECK_CLIENT(meta_client_);
+    return meta_client_->FinishWriteWithIntegrity(trace_id, write_session_id, success_block, locations, options);
 }
 
 std::pair<ClientErrorCode, Metas> ManagerClientImpl::MatchMeta(const std::string &trace_id,
@@ -88,8 +123,17 @@ std::pair<ClientErrorCode, Metas> ManagerClientImpl::MatchMeta(const std::string
                                                                const std::vector<int64_t> &tokens,
                                                                const BlockMask &block_mask,
                                                                int32_t detail_level) {
+    auto [ec, result] = MatchMeta(trace_id, keys, tokens, block_mask, MatchMetaOptions::WithDetailLevel(detail_level));
+    return {ec, std::move(result.metas)};
+}
+
+std::pair<ClientErrorCode, MatchMetaResult> ManagerClientImpl::MatchMeta(const std::string &trace_id,
+                                                                         const std::vector<int64_t> &keys,
+                                                                         const std::vector<int64_t> &tokens,
+                                                                         const BlockMask &block_mask,
+                                                                         const MatchMetaOptions &options) {
     CHECK_CLIENT_WITH_TYPE(meta_client_);
-    return meta_client_->MatchMeta(trace_id, keys, tokens, block_mask, detail_level);
+    return meta_client_->MatchMeta(trace_id, keys, tokens, block_mask, options);
 }
 
 ClientErrorCode ManagerClientImpl::RemoveCache(const std::string &trace_id,
@@ -101,14 +145,27 @@ ClientErrorCode ManagerClientImpl::RemoveCache(const std::string &trace_id,
 }
 
 ClientErrorCode ManagerClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) {
+    return LoadKvCaches(uri_str_vec, block_buffers, LoadKvCachesOptions{});
+}
+
+ClientErrorCode ManagerClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
+                                                const BlockBuffers &block_buffers,
+                                                const LoadKvCachesOptions &options) {
     CHECK_CLIENT(transfer_client_);
-    return transfer_client_->LoadKvCaches(uri_str_vec, block_buffers);
+    return transfer_client_->LoadKvCaches(uri_str_vec, block_buffers, options);
 }
 
 std::pair<ClientErrorCode, UriStrVec> ManagerClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                       const BlockBuffers &block_buffers) {
+    auto [ec, result] = SaveKvCaches(uri_str_vec, block_buffers, SaveKvCachesOptions{});
+    return {ec, std::move(result.uri_str_vec)};
+}
+
+std::pair<ClientErrorCode, SaveKvCachesResult> ManagerClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                                               const BlockBuffers &block_buffers,
+                                                                               const SaveKvCachesOptions &options) {
     CHECK_CLIENT_WITH_TYPE(transfer_client_);
-    return transfer_client_->SaveKvCaches(uri_str_vec, block_buffers);
+    return transfer_client_->SaveKvCaches(uri_str_vec, block_buffers, options);
 }
 
 std::unique_ptr<ManagerClient> ManagerClient::Create(const std::string &client_config, InitParams &init_params) {

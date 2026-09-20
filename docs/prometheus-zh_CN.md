@@ -32,6 +32,9 @@ rate(kvcm_manager_get_cache_location_hit_block_counter[5m])
 
 # 每个后端的存储使用率
 kvcm_data_storage_storage_usage_ratio
+
+# 过去 5 分钟内需要人工介入的删除终态失败
+increase(kvcm_cache_cleanup_permanent_failure_location_count[5m]) > 0
 ```
 
 ## 配置
@@ -148,6 +151,22 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |
 | `cache_manager_instance.byte_size` | gauge | 单实例 KVCM 配额字节大小（不含 EventReport） |
+
+### 删除终态失败
+
+`cache_cleanup.permanent_failure_location_count` 是累计 counter，按固定低基数
+label `stage` 记录无法自动收敛、需要人工对账的 Location 目标数：
+
+- `physical_delete`：物理删除失败，metadata 保留为 `CLS_DELETING`。
+- `metadata_cad`：物理删除后的 metadata CAD 未确认成功。
+- `authoritative_fence`：FinishWrite cleanup 未能对所有目标建立可持久隔离。
+- `dispatch_or_worker`：Location 已被持久隔离，但精确删除任务未能组装、排队、执行或确认。
+
+该指标不是当前滞留数的 gauge；告警应使用 `increase()` / `rate()`。
+Manager 启动时会为全部固定 `stage` 预置可抓取的零值，避免首次且唯一一次
+失败因缺少 counter 基线而被 `increase()` 漏掉；仍应让 Prometheus 在接流量前
+至少成功抓取一次健康实例。
+标签不包含 URI、key、instance 或自由文本，该路径也不会触发自动物理重试。
 
 完整指标列表取决于当前使用的 `MetricsReporter` 类型。`kmonitor`
 类型的 reporter 会填充最完整的指标集。

@@ -1,6 +1,17 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "DeleteCleanupObserverTest",
+    srcs = ["delete_cleanup_observer_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/metrics:delete_cleanup_observer",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+    ],
+)
+
+cc_test(
     name = "MetricsCollectorTest",
     srcs = [
         "metrics_collector_test.cc",
