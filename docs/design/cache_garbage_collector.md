@@ -3,7 +3,7 @@
 | 项目 | 内容 |
 |---|---|
 | 状态 | V1 已实现并完成相关单测、E2E 与性能冒烟；基线已包含异步删除（#234）、分层存储迁移（#209）和精确值条件删除（#233） |
-| 更新时间 | 2026-09-01 |
+| 更新时间 | 2026-09-19 |
 | 涉及模块 | `manager`、`meta`、`data_storage`、`config`、`metrics`、`service` |
 | 历史参考 | [PR #184](https://github.com/alibaba/tair-kvcache/pull/184) |
 
@@ -82,7 +82,7 @@ V1 不提前抽象通用 Rule Engine、Candidate Source、Action Dispatcher 或 
 
 V1 实现以下六项能力：
 
-1. **低频内存优先巡检**：按 Instance 和 cursor 分批读取 maintenance view；dual-backend 扫描内存 cache backend，single-backend 扫描唯一 backend；每个 tick 最多推进一个 batch，完成一轮后进入 cooldown。
+1. **低频内存优先巡检**：按 Instance 和 cursor 分批读取 maintenance view；dual-backend 扫描内存 cache backend，single-backend 扫描唯一 backend；每个 tick 按预算消费当前 batch，缓存耗尽后才读取下一批，完成一轮后进入 cooldown。
 2. **无副作用读取**：GC 扫描不能更新 LRU/access time、hit count、revisit histogram，也不能改变 online hot cache。
 3. **保守识别长期 WRITING**：只处理状态、创建时间和标识均明确有效，年龄达到 grace，且不属于活跃 Migration Copy 目标的 Location；异常时间、读取错误或活跃迁移一律跳过。
 4. **保守识别普通 SERVING 失效**：按 storage 批量调用低成本 `MightExist()`；任一 spec 明确 missing 时整个 Location 失效，unsupported/unknown/错误均跳过。EventReport 明确排除该规则，但其独立业务判定可复用同一个 scan batch 和统一预算。
@@ -97,7 +97,7 @@ V1 实现以下六项能力：
 
 1. 通用 Rule/Candidate/Action 框架和动态规则注册。
 2. WRITING deadline ZSET、TTL expiry index、CDC 或其他增量候选源。
-3. 动态 pacing、adaptive backoff、每轮预算，以及按容量贡献进行跨 Instance 公平逐出；后台扫描仅按 batch 在 Instance 间轮转。
+3. 动态 pacing、adaptive backoff、每轮预算，以及按容量贡献进行跨 Instance 公平逐出；后台扫描正常按 backend batch 消费完成的边界在 Instance 间轮转，不保证每 tick 轮转。
 4. 动态或大规模并发窗口、多维 bytes/Group 配额、Future deadline 和持久化任务。
 5. `WriteLocationManager` 三元组索引、settling guard，以及 Reclaimer/Finish 竞态修复。
 6. `CLS_DELETING` 自动恢复和 storage version/epoch。
@@ -173,6 +173,8 @@ struct InstanceScanEntry {
     std::string instance_id;
     std::string cursor = SCAN_BASE_CURSOR;
     bool completed = false;
+    MaintenanceScanBatch buffered_scan;
+    size_t buffered_key_index = 0;
 };
 
 struct InflightDelete {
@@ -191,7 +193,9 @@ std::set<PendingLocationKey> pending_locations;
 
 `PendingLocationKey` 至少包含 `(instance_id, block_key, location_id)`。在途窗口和 pending 集合只由 `LoopThread` 回调访问，其规模分别受 `max_inflight_delete_requests` 和 `max_inflight_delete_requests * scan_batch_size` 约束。跨线程只保留 GC stop 标志和一个 `LoopThread` handle，不维护自建 condition variable 或通用 task table。
 
-每次 leader recovery 后重新开始一个 round；降级、重启或重新成为 leader 时不恢复旧 cursor。重复覆盖由条件 CAS 保证安全。
+`buffered_scan` 保存当前 backend batch 中尚未取出处理的 key/Location 快照，`buffered_key_index` 记录下一次取出的 key 位置；一个 key 的 Location 可以跨 tick 消费。缓存不保存已生成的删除请求、probe 判定或 token。正常调度先消费完当前 Instance 的缓存再轮转，避免同时为多个 Instance 保留未消费的 shard 快照；单批返回量仍不受严格的字节上限约束。
+
+每次 leader recovery 后重新开始一个 round；降级、重启或重新成为 leader 时不恢复旧 cursor 或缓存。Instance 完成、被跳过或 round 结束时释放相应缓存。重复覆盖由条件 CAS 保证安全。
 
 ### 3.3 LoopThread 回调
 
@@ -202,26 +206,26 @@ std::set<PendingLocationKey> pending_locations;
 3. 若在途请求数已达到 `max_inflight_delete_requests`，本 tick 结束，不继续扫描。
 4. 若仍处于 round cooldown，本 tick 结束。
 5. 若没有本轮快照，从 Registry 获取 Group/Instance 列表，按 `(instance_group, instance_id)` 排序；失败时按普通 tick 间隔重试。
-6. 对当前 Instance 调用一次 `ScanLocationsForMaintenance(entry.cursor, scan_batch_size)`。
-7. 保存该 Instance 的 next cursor，遍历返回的 Location：筛选长期 WRITING 并排除活跃 Migration Copy 目标；对普通 SERVING 的合法 URI 按 `(storage unique name, storage type)` 聚合，每次最多取 512 个 URI 调用 `MightExist()`；每个探测分块前后检查 stop。EventReport 扩展开启时在同一 batch 调用其专用三态 probe；所有不确定结果均跳过。
-8. 候选按 `(block_key, location_id)` 去重并统一排序，Location 总数最多为 `scan_batch_size`。EventReport 扩展另按唯一 Block key 限制 metadata action；请求为空时不调用 Executor。
+6. `GetNextMaintenanceBatch` 优先复用当前 Instance 的 `buffered_scan`；仅缓存为空时调用一次 `ScanLocationsForMaintenance(entry.cursor, scan_batch_size)`，并记录实际扫描量。随后沿缓存顺序取出小批，每批 key 数和 Location 数均不超过 `scan_batch_size`，EventReport SERVING 的不同 key 数不超过 `event_report_action_batch_size`。只剩一个 action 槽位时，小批只包含可能产生同一类请求的条目；其余快照留在原缓存，后续 tick 继续取。
+7. 保存 backend 返回的 next cursor，只对本 tick 取出的小批调用 `BuildDeleteActions`：筛选长期 WRITING 并排除活跃 Migration Copy 目标；对普通 SERVING 的合法 URI 按 `(storage unique name, storage type)` 聚合，每次最多取 512 个 URI 调用 `MightExist()`；每个探测分块前后检查 stop。EventReport 扩展开启时调用其专用三态 probe；所有不确定结果均跳过。尚未取出的快照不提前 probe，消费时才按当时的规则和 Backend 状态判定。
+8. `BuildDeleteActions` 对输入小批分类、按 `(block_key, location_id)` 去重，再按垃圾原因优先级及 key/location 排序并构造请求；不修改输入 batch，也不返回 deferred 候选。优先级只在本次小批内生效，不保证跨小批、跨 backend batch 的优先顺序。每 tick 最多选入 `scan_batch_size` 个 Location，过滤后可以少于该数，不额外扫描补齐；请求为空时不调用 Executor。
 9. 普通候选和 EventReport 候选分别构造物理删除请求与 metadata-only 请求，并调用对应 `SubmitAsync()`。物理删除优先，因此一个 tick 最多提交两个请求，且不会超过剩余 inflight 槽位：
    - `accepted=true` 且 Future valid：保存 Future，并为最终请求建立 pending target；
    - `accepted=false`：视为正常入队反压，不建立 Future 或 pending；
    - accepted/Future 契约不一致：记录 `submit_contract`，不建立本地状态；
    - 调用抛异常：记录 `submit_exception`，不建立本地状态。
-10. 无论当前 cursor 是否回到 base，下一 tick 都轮转到下一个未完成 Instance；当前 Instance 回到 base 时将其标记完成。单个 Instance 在同一 round 内连续 3 次 Scan 失败后也标记为本轮完成，剩余 keyspace 延迟到下一 round 从 base cursor 重试，避免一个故障 Instance 永久卡住其他 Instance 和 Registry 新快照。全部 Instance 完成后结束 round，并设置 `next_round_at = now + round_pause_ms`。
+10. 当前 `buffered_scan` 非空时，下一 tick 继续消费该 Instance，不发起新 Scan，也不轮转；缓存耗尽后轮转到下一个未完成 Instance，不等待已提交删除的 Future。只有 cursor 回到 base 且缓存为空时，当前 Instance 才正常完成。单个 Instance 在同一 round 内连续 3 次 Scan 失败后也标记为本轮完成，剩余 keyspace 延迟到下一 round 从 base cursor 重试，避免一个故障 Instance 永久卡住其他 Instance 和 Registry 新快照。全部 Instance 完成后结束 round，并设置 `next_round_at = now + round_pause_ms`。
 11. tick 结束后至少等待 `scan_interval_ms`。慢调用返回后不追赶错过的 tick。
 
 窗口默认包含 64 个请求。一个慢或卡住的物理删除或 metadata action 只占用一个槽位，其他槽位仍可继续扫描和提交；只有全部槽位被占用时才暂停扫描。这为当前无容量上限的 Executor 队列提供 GC 调用方侧的硬反压，同时利用 #234 已提供的 worker 并发。基础 GC 每 tick 最多提交一个物理删除；EventReport 扩展开启时，同一批最多再提交一个 metadata action。`inflight_delete_count` 和 `inflight_delete_age_ms` 分别表示当前 GC 在途 action 数和最老任务年龄。
 
-cursor 在 SubmitAsync 前已经推进。rejected、抛异常或 accepted/Future 契约错误时不回滚 cursor，也不保存该批候选；对象仍保留在 metadata 中。若它后续仍可从 maintenance view 观察到，则由后续 round 重新发现；dual-backend 下已被内存淘汰的对象不承诺仅靠 GC 主动重载。这样避免为 V1 引入额外 retry queue。
+`GetNextMaintenanceBatch` 只负责缓存复用、必要的 Scan、切片及剩余快照保留；`RunOneTick` 先取小批，再调用 `BuildDeleteActions`，最后提交请求、跟踪 Future 和轮转。固定优先级为 orphan WRITING、ordinary storage-missing、EventReport down host、recovery-absent host、stale snapshot；它只对输入小批排序，不是 Reclaimer 的 LRU 冷度。排在后续小批的 orphan WRITING 可能晚于前面小批的 EventReport 垃圾提交，这是按扫描顺序逐批消费的显式取舍。
 
-同一 batch 中超过 target 上限的候选不会保存在额外 pending 表中；它们仍留在 metadata 中，并在仍可见于 maintenance view 时由后续 round 再次发现。这会牺牲极端场景的收敛速度，但保持 V1 状态简单。
+cursor 在 SubmitAsync 前已经保存为 backend 返回的 next cursor，但缓存未耗尽时不会用它发起下一次 Scan。已取出的小批不回填缓存；不符合删除条件的条目正常跳过，已选入请求的 target 若遭遇 rejected、抛异常或 accepted/Future 契约错误，也不回滚 cursor，仍可见于 maintenance view 的对象由后续 round 重新发现。未取出的快照则留在当前缓存内供后续 tick 处理，两者不能混同；这里没有额外的失败重试队列。
 
 ### 3.4 Maintenance scan 语义和成本
 
-一个 round 只在开始时获取一次 Registry 快照。每个 Instance 保存独立 cursor；调度器每个 tick 只推进一个 batch，随后轮转到下一个未完成 Instance，直到全部 cursor 回到 base。快照之后新增或删除的 Instance 允许本轮不可见或返回 Indexer 不存在，下一轮重新获取快照后收敛。
+一个 round 只在开始时获取一次 Registry 快照。每个 Instance 保存独立 cursor 和 batch 缓存；正常按“消费完一个 backend batch，再轮转 Instance”的粒度调度，直到所有 Instance 的 cursor 回到 base 且缓存耗尽。Local 一个 shard 返回量较大时，同一个 batch 可能占用多个 tick，因此其他 Instance 的等待会变长，不承诺逐 tick 公平或固定等待上界。快照之后新增或删除的 Instance 允许本轮不可见或返回 Indexer 不存在，下一轮重新获取快照后收敛。
 
 Redis SCAN（single-backend）和本地 backend cursor（dual-backend）都不提供并发 exactly-once：
 
@@ -231,7 +235,7 @@ Redis SCAN（single-backend）和本地 backend cursor（dual-backend）都不�
 
 V1 只要求重复处理安全；仍存在于 scan view 的对象可由后续 round 重新覆盖。扫描发现不是删除授权：普通物理删除由 Executor 的 authoritative read 和完整 Location 条件 CAS 决定；EventReport 扩展由 worker 内的 Backend token/lease 与 no-touch expected-value RMW 决定。
 
-设 scan view 中某 Instance 有 `N` 个 Block、平均每个 Block 有 `L` 个 Location，则一轮判定成本约为 `O(N + N*L)`。dual-backend 的 `N` 是当前内存 cache 中可见的 key 数，不是 persistent keyspace；`scan_batch_size` 是 backend hint，不保证 Local backend 的单 shard 返回量严格受限。
+设 scan view 中某 Instance 有 `N` 个 Block、平均每个 Block 有 `L` 个 Location，遍历并判定的基础成本约为 `O(N + N*L)`，另有小批内去重、排序开销。每个缓存条目在取出时才判定，不会每 tick 重新探测和排序整个剩余 buffer；执行时的精确值复核仍保留。dual-backend 的 `N` 是当前内存 cache 中可见的 key 数，不是 persistent keyspace；`scan_batch_size` 是 backend hint，不保证 Local backend 的单 shard 返回量或缓存内存严格受限。
 
 设 active round 耗时为 `S`、cooldown 为 `P`，正常候选的最坏发现时间约为：
 
@@ -461,8 +465,8 @@ V1 只保留能回答“是否在扫描、发现了什么、删除是否卡住�
 | 指标 | 类型 | 说明 |
 |---|---|---|
 | `cache_gc.scan_round_count` | Counter | 完整 round 完成次数 |
-| `cache_gc.scan_key_count` | Counter | 扫描 Block 数 |
-| `cache_gc.candidate_count{reason}` | Counter | 候选数；基础 V1 reason 为 `orphan_writing` 或 `storage_missing`，EventReport 扩展增加其业务原因 |
+| `cache_gc.scan_key_count` | Counter | 实际 backend Scan 返回的 Block 数；复用缓存不重复累计 |
+| `cache_gc.candidate_count{reason}` | Counter | 每个小批判定得到的候选数；只在小批内去重，不是跨轮去重数量。基础 V1 reason 为 `orphan_writing` 或 `storage_missing`，EventReport 扩展增加其业务原因 |
 | `cache_gc.delete_target_count` | Counter | 实际提交的 Location 数 |
 | `cache_gc.delete_result_count{status}` | Counter | Future 终态 |
 | `cache_gc.operation_error_count{stage}` | Counter | Registry/scan/submit/future 等异常；并发 `EC_NOENT`、条件不匹配和 CAS loser 不计入 |
@@ -481,14 +485,14 @@ GC 将 `MightExist` 已确认缺失的 URI 传给 Executor，跳过这些 URI �
 ### 8.1 单元测试
 
 1. disabled 不创建 `LoopThread`；Start/RequestStop/Join 重复调用安全，重新 Start 从 base cursor 开始。
-2. 每个 tick 最多调用一次 Scan；cursor、Instance 推进和 round cooldown 正确。
+2. 每个 tick 最多调用一次 Scan；缓存未耗尽时不重新 Scan、不轮转 Instance，cursor 到 base 后仍须消费完缓存才结束；cursor、Instance 推进和 round cooldown 正确。
 3. Registry/Scan 失败按普通间隔重试，不推进错误 cursor，也不零间隔空转；单 Instance 重试耗尽不会阻塞 round 完成和后续 Registry 快照。
 4. maintenance scan 在 dual-backend 下只读取 cache backend，不回退 persistent；persistent-only key 不会被本轮发现，single-backend 则扫描唯一 backend。
 5. Local/Dummy maintenance scan 不改变 LRU/access/revisit；扫描不会触发 persistent-to-cache 回填。普通物理删除候选仍由 Executor authoritative re-read 后条件删除；EventReport 候选在 worker 中执行 no-touch expected-value RMW。
 6. 只有状态为 WRITING、字段有效且年龄达到 grace 的 Location 成为 orphan 候选；未来时间、解析失败和边界值 fail-closed。
 7. grace 配置不得小于 1 小时，默认值为 24 小时。
 8. 普通 SERVING 按 storage 批量探测，任一 spec 明确 missing 时选择整个 Location；全 true、无可探测 URI、storage 缺失/type 不符、shape 错误和异常均 fail-closed，EventReport 不进入该布尔规则；单次探测不超过 512 URI。扩展测试另验证 EventReport 与普通候选共享同一次 scan。
-9. 请求保持 Instance 隔离，按 `(block_key, location_id)` 去重并受 Location 总预算约束；EventReport action 另受唯一 Block key 预算约束，空请求不调用 Executor。
+9. 请求保持 Instance 隔离，按 `(block_key, location_id)` 去重，优先级仅在输入小批内生效，不把后续小批中的高优先级候选提前。取 batch 时同时限制 key/Location 数、EventReport key 数和 action 类型，覆盖单 key 多 Location、单个空闲槽位和缓存等待期间 Backend 状态变化；`BuildDeleteActions` 不修改输入，空请求不调用 Executor。
 10. GC 请求携带与 target 平行的完整序列化 Location；请求排队后 Finish、URI 刷新、DELETING 或 NOENT 均因 expected value 不匹配而不做物理删除。
 11. #209 活跃 Copy reservation 对应的 WRITING 目标不会成为候选；相同 location ID 在其他 Instance/Block 中不被误保护。
 12. GC 与另一个删除者同时提交同一 target 时只有一个 CAS winner。
@@ -566,7 +570,7 @@ V1 不修改 `write_location_manager.*`、`cache_reclaimer.*` 或 `migration_man
 | `kvcm.cache_gc.enabled` | `true` | 默认开启；可显式设为 `false` 回退 |
 | `kvcm.cache_gc.scan_interval_ms` | 100 | 相邻 tick 的最小间隔 |
 | `kvcm.cache_gc.round_pause_ms` | 300000 | 完成一个 full round 后的 cooldown；0 表示下一 tick 可开始新 round |
-| `kvcm.cache_gc.scan_batch_size` | 256 | backend key 数 hint，同时作为单请求 target 上限 |
+| `kvcm.cache_gc.scan_batch_size` | 256 | backend key 数 hint，同时作为单 tick 两类请求合计的 Location 上限；不是缓存大小硬上限 |
 | `kvcm.cache_gc.orphan_writing_grace_period_ms` | 86400000 | WRITING 自动清理 grace，必须不小于 3600000 ms |
 | `kvcm.cache_gc.max_inflight_delete_requests` | 64 | 普通删除与 EventReport action 共用的 GC 在途硬上限，必须大于 0 |
 | `kvcm.cache_gc.event_report_cleanup_enabled` | `true` | EventReport shared-round 子开关；仍受 GC 总开关控制，总开关关闭时保留 legacy 路径 |

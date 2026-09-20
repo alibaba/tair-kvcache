@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
+#include <map>
 #include <set>
 #include <thread>
 #include <vector>
@@ -771,7 +773,7 @@ TEST_F(MetaLocalBackendTest, TestMaintenanceTargetReadAndDeleteDoNotTouchAccessT
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
-TEST_F(MetaLocalBackendTest, TestGroupLruMaintenanceSamplingAdvancesWithoutTouchingKeys) {
+TEST_F(MetaLocalBackendTest, TestGroupLruMaintenanceSamplingReselectsColdestWithoutTouchingKeys) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("group_lru_no_touch", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
@@ -801,7 +803,8 @@ TEST_F(MetaLocalBackendTest, TestGroupLruMaintenanceSamplingAdvancesWithoutTouch
                   meta_storage_backend_->GetLocationMapsForMaintenance(nullptr, batch, locations));
         ASSERT_EQ(1, locations[0].size());
     }
-    EXPECT_EQ((KeyVector{1, 2, 3, 1, 2, 3}), sampled);
+    // Independent samples restart at the cold end; sampling is not a hit.
+    EXPECT_EQ((KeyVector{1, 1, 1, 1, 1, 1}), sampled);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
               GetLocalBackend()->GetLastAccessTimesForMaintenance(nullptr, keys, after));
     EXPECT_EQ(before, after);
@@ -818,9 +821,9 @@ TEST_F(MetaLocalBackendTest, TestGroupLruMaintenanceSamplingAdvancesWithoutTouch
     EXPECT_EQ(0, after[1]);
 }
 
-TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithoutTouchingLru) {
+TEST_F(MetaLocalBackendTest, TestGroupLruColdShardSamplingDoesNotSkipIneligiblePrefixes) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=3&sample_times=2");
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("group_lru_shard_rotation", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("group_lru_cold_shards", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
     auto *backend = GetLocalBackend();
     const auto shard_of = [backend](KeyType key) {
@@ -852,6 +855,17 @@ TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithou
         ASSERT_EQ(
             (std::vector<ErrorCode>{EC_OK, EC_OK}),
             backend->Put(nullptr, keys_by_shard[shard], CacheLocationMapVector(2, locations), PropertyMapVector(2)));
+        // Make shard coldness deterministic even if several Puts share a clock tick.
+        const int64_t access_time = (shard + 1) * 100;
+        for (const auto key : keys_by_shard[shard]) {
+            ASSERT_TRUE(backend->cache_->ApplyToEntryNoTouch(
+                MetaLocalBackend::KeyToView(key),
+                [access_time](Cache::ObjectPtr obj, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+                    static_cast<MetaMemCacheItem *>(obj)->last_access_time_.store(access_time);
+                    return 0;
+                }));
+        }
+        backend->shard_oldest_access_time_[shard].store(access_time);
         all_keys.insert(all_keys.end(), keys_by_shard[shard].begin(), keys_by_shard[shard].end());
     }
     std::vector<int64_t> before, after;
@@ -868,12 +882,14 @@ TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithou
             KeyVector sampled;
             ASSERT_EQ(EC_OK, SampleReclaimKeysForTest(backend, count, sampled));
             ASSERT_EQ(count, sampled.size());
-            // The first slot rotates even when all physical LRU tails stay fixed.
-            EXPECT_EQ(round, shard_of(sampled.front()));
+            // Sampling always reselects cold shards; it does not rotate past
+            // ordinary ineligible prefixes or refill from warmer shards.
+            EXPECT_EQ(0, shard_of(sampled.front()));
             std::set<uint32_t> batch_shards;
             for (const auto key : sampled) {
                 covered.insert(shard_of(key));
                 batch_shards.insert(shard_of(key));
+                EXPECT_LT(shard_of(key), count);
             }
             EXPECT_EQ(sampled.size(), batch_shards.size());
             CacheLocationMapVector locations;
@@ -883,8 +899,8 @@ TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithou
                 found_reclaimable = found_reclaimable || !map.empty();
             }
         }
-        EXPECT_EQ(kShards, covered.size());
-        EXPECT_TRUE(found_reclaimable);
+        EXPECT_EQ(count, covered.size());
+        EXPECT_FALSE(found_reclaimable);
     }
     ASSERT_EQ(std::vector<ErrorCode>(all_keys.size(), EC_OK),
               backend->GetLastAccessTimesForMaintenance(nullptr, all_keys, after));
@@ -900,9 +916,9 @@ TEST_F(MetaLocalBackendTest, TestGroupLruShardRotationCoversProtectedTailsWithou
     ASSERT_EQ(EC_OK, backend->Close());
 }
 
-TEST_F(MetaLocalBackendTest, TestGroupLruSamplingCursorSurvivesRemovalAndPromotion) {
+TEST_F(MetaLocalBackendTest, TestGroupLruSamplingReflectsRemovalAndBusinessPromotion) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("group_lru_cursor", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("group_lru_coldest", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
               PutWithFieldMaps(meta_storage_backend_.get(),
@@ -913,8 +929,8 @@ TEST_F(MetaLocalBackendTest, TestGroupLruSamplingCursorSurvivesRemovalAndPromoti
     ASSERT_EQ((KeyVector{1}), sampled);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete(nullptr, {2}));
     ASSERT_EQ(EC_OK, SampleReclaimKeysForTest(meta_storage_backend_.get(), 1, sampled));
-    EXPECT_EQ((KeyVector{3}), sampled);
-    // A business read promotes the node at the cursor; maintenance must not retain a stale link.
+    EXPECT_EQ((KeyVector{1}), sampled);
+    // Removing key 2 leaves key 1 coldest; only a business read promotes it.
     PropertyMapVector props;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
               meta_storage_backend_->GetProperties(nullptr, {1}, {PROPERTY_URI}, props));
@@ -1035,122 +1051,203 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimCandidatesDoesNotTouchLruState) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
-TEST_F(MetaLocalBackendTest, TestSampleReclaimCandidatesAdvancesPastRejectedOldestPrefix) {
+TEST_F(MetaLocalBackendTest, TestMaintenanceTouchRefreshesOnlyListedKeysWithoutRevisit) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_reclaim_candidates_progress", meta_storage_backend_config_));
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    auto *backend = GetLocalBackend();
+    ASSERT_EQ(EC_OK, backend->Init("maintenance_yield", meta_storage_backend_config_));
+    auto registry = std::make_shared<MetricsRegistry>();
+    auto histogram = std::make_shared<RevisitIntervalHistogram>();
+    ASSERT_TRUE(histogram->Init(registry, {1.0, 10.0}, "maintenance_yield"));
+    backend->SetRevisitHistogram(histogram);
+    auto event = std::make_shared<CacheLocation>();
+    event->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    event->set_status(CLS_SERVING);
+    auto ordinary = std::make_shared<CacheLocation>();
+    ordinary->set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ordinary->set_status(CLS_DELETING);
+    const KeyVector keys{1, 2, 3, 4, 5, 6};
+    CacheLocationMapVector locations{{{"event", event}},
+                                     {{"ordinary", ordinary}},
+                                     {{"event", event}, {"ordinary", ordinary}},
+                                     {},
+                                     {{"bad", nullptr}},
+                                     {{"ordinary", ordinary}}};
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK),
+              backend->Put(nullptr, keys, locations, PropertyMapVector(keys.size())));
+    for (const KeyType key : keys) {
+        ASSERT_TRUE(backend->cache_->ApplyToEntryNoTouch(
+            MetaLocalBackend::KeyToView(key),
+            [key](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+                static_cast<MetaMemCacheItem *>(value)->last_access_time_.store(key * 100);
+                return 0;
+            }));
+    }
+    backend->shard_oldest_access_time_[0].store(100);
+    // The caller's list, not Location types, decides which keys yield.
+    EXPECT_EQ(5, backend->TouchKeysForMaintenance({1, 2, 3, 4, 5, 99}));
+    std::vector<int64_t> times;
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK),
+              backend->GetLastAccessTimesForMaintenance(nullptr, keys, times));
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_GT(times[i], keys[i] * 100);
+    }
+    EXPECT_EQ(600, times[5]);
+    KeyVector order;
+    ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 6, order));
+    EXPECT_EQ((KeyVector{6, 1, 2, 3, 4, 5}), order);
+    EXPECT_EQ(600, backend->GetOldestAccessTime());
+    EXPECT_EQ(0, histogram->GetCount());
+    EXPECT_EQ(0, backend->TouchKeysForMaintenance({}));
+    EXPECT_EQ(0, backend->TouchKeysForMaintenance({99}));
+    ASSERT_EQ(EC_OK, backend->Close());
+}
 
-    const KeyTypeVec keys{1, 2, 3, 4, 5, 6};
-    ASSERT_EQ(
-        std::vector<ErrorCode>(keys.size(), EC_OK),
-        meta_storage_backend_->Put(nullptr, keys, CacheLocationMapVector(keys.size()), PropertyMapVector(keys.size())));
+TEST_F(MetaLocalBackendTest, TestMaintenanceTouchRefreshesSingletonShardColdness) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+    auto *backend = GetLocalBackend();
+    ASSERT_EQ(EC_OK, backend->Init("singleton_maintenance", meta_storage_backend_config_));
+    auto location = std::make_shared<CacheLocation>();
+    location->set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend->Put(nullptr, {1}, {{{"loc", location}}}, PropertyMapVector(1)));
+    ASSERT_TRUE(backend->cache_->ApplyToEntryNoTouch(
+        MetaLocalBackend::KeyToView(1),
+        [](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+            static_cast<MetaMemCacheItem *>(value)->last_access_time_.store(100);
+            return 0;
+        }));
+    backend->shard_oldest_access_time_[0].store(100);
+    EXPECT_EQ(1, backend->TouchKeysForMaintenance({1}));
+    std::vector<int64_t> times;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend->GetLastAccessTimesForMaintenance(nullptr, {1}, times));
+    EXPECT_GT(times[0], 100);
+    EXPECT_EQ(times[0], backend->GetOldestAccessTime());
+    ASSERT_EQ(EC_OK, backend->Close());
+}
 
-    // Model FilterLocID rejecting the first result without touching or
-    // deleting it. The next sampling call must still reach later keys.
-    ReclaimCandidateVector candidates;
-    ASSERT_EQ(EC_OK, GetLocalBackend()->SampleReclaimCandidates(nullptr, 2, candidates));
-    ASSERT_EQ(2, candidates.size());
-    EXPECT_EQ(1, candidates[0].key);
-    EXPECT_EQ(2, candidates[1].key);
-
-    ASSERT_EQ(EC_OK, GetLocalBackend()->SampleReclaimCandidates(nullptr, 2, candidates));
-    ASSERT_EQ(2, candidates.size());
-    EXPECT_EQ(3, candidates[0].key);
-    EXPECT_EQ(4, candidates[1].key);
-
-    ASSERT_EQ(EC_OK, GetLocalBackend()->SampleReclaimCandidates(nullptr, 2, candidates));
-    ASSERT_EQ(2, candidates.size());
-    EXPECT_EQ(5, candidates[0].key);
-    EXPECT_EQ(6, candidates[1].key);
-
-    ASSERT_EQ(EC_OK, GetLocalBackend()->SampleReclaimCandidates(nullptr, 2, candidates));
-    ASSERT_EQ(2, candidates.size());
-    EXPECT_EQ(1, candidates[0].key);
-    EXPECT_EQ(2, candidates[1].key);
-
+TEST_F(MetaLocalBackendTest, TestReclaimSampleRestartsAtColdestAfterPartialDeletion) {
+    meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("coldest_first", meta_storage_backend_config_));
+    const KeyVector keys{1, 2, 3, 4, 5, 6};
+    ASSERT_EQ(std::vector<ErrorCode>(6, EC_OK),
+              meta_storage_backend_->Put(nullptr, keys, CacheLocationMapVector(6), PropertyMapVector(6)));
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        ReclaimCandidateVector sample;
+        ASSERT_EQ(EC_OK, GetLocalBackend()->SampleReclaimCandidates(nullptr, 3, sample));
+        ASSERT_EQ(3, sample.size());
+        EXPECT_EQ(1, sample[0].key);
+        EXPECT_EQ(2, sample[1].key);
+        EXPECT_EQ(3, sample[2].key);
+    }
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, meta_storage_backend_->Delete(nullptr, {1}));
+    ReclaimCandidateVector sample;
+    ASSERT_EQ(EC_OK, GetLocalBackend()->SampleReclaimCandidates(nullptr, 3, sample));
+    ASSERT_EQ(3, sample.size());
+    EXPECT_EQ(2, sample[0].key);
+    EXPECT_EQ(3, sample[1].key);
+    EXPECT_EQ(4, sample[2].key);
+    // Business hits, unlike sampling, must change the next sample's order.
+    PropertyMapVector properties;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+              GetLocalBackend()->GetProperties(nullptr, {2}, {PROPERTY_LRU_TIME}, properties));
+    ASSERT_EQ(EC_OK, GetLocalBackend()->SampleReclaimCandidates(nullptr, 1, sample));
+    ASSERT_EQ(1, sample.size());
+    EXPECT_EQ(3, sample[0].key);
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
-TEST_F(MetaLocalBackendTest, TestConcurrentReclaimSamplingTasksCoverDistinctKeys) {
+TEST_F(MetaLocalBackendTest, TestConcurrentReclaimSamplesIndependentlySelectColdest) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_reclaim_candidates_multi_task", meta_storage_backend_config_));
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
-
-    constexpr size_t kTaskCount = 10;
-    constexpr size_t kKeysPerTask = 100;
-    constexpr size_t kKeyCount = kTaskCount * kKeysPerTask;
-    KeyTypeVec keys;
-    keys.reserve(kKeyCount);
-    for (size_t i = 0; i < kKeyCount; ++i) {
-        keys.push_back(static_cast<KeyType>(i + 1));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("concurrent_coldest", meta_storage_backend_config_));
+    KeyVector keys;
+    for (KeyType key = 1; key <= 1000; ++key) {
+        keys.push_back(key);
     }
     ASSERT_EQ(
         std::vector<ErrorCode>(keys.size(), EC_OK),
         meta_storage_backend_->Put(nullptr, keys, CacheLocationMapVector(keys.size()), PropertyMapVector(keys.size())));
-
-    std::vector<ReclaimCandidateVector> task_candidates(kTaskCount);
-    std::vector<ErrorCode> task_results(kTaskCount, EC_ERROR);
+    std::vector<ReclaimCandidateVector> samples(10);
+    std::vector<ErrorCode> results(10, EC_ERROR);
     std::vector<std::thread> tasks;
-    tasks.reserve(kTaskCount);
-    for (size_t i = 0; i < kTaskCount; ++i) {
-        tasks.emplace_back([backend = GetLocalBackend(), &task_candidates, &task_results, i]() {
-            task_results[i] = backend->SampleReclaimCandidates(nullptr, kKeysPerTask, task_candidates[i]);
-        });
+    for (size_t i = 0; i < samples.size(); ++i) {
+        tasks.emplace_back(
+            [&, i] { results[i] = GetLocalBackend()->SampleReclaimCandidates(nullptr, 100, samples[i]); });
     }
     for (auto &task : tasks) {
         task.join();
     }
-
-    std::set<KeyType> unique_keys;
-    for (size_t i = 0; i < kTaskCount; ++i) {
-        EXPECT_EQ(EC_OK, task_results[i]);
-        EXPECT_EQ(kKeysPerTask, task_candidates[i].size());
-        for (const auto &candidate : task_candidates[i]) {
-            unique_keys.insert(candidate.key);
+    for (size_t i = 0; i < samples.size(); ++i) {
+        EXPECT_EQ(EC_OK, results[i]);
+        ASSERT_EQ(100, samples[i].size());
+        for (size_t j = 0; j < samples[i].size(); ++j) {
+            EXPECT_EQ(j + 1, samples[i][j].key);
         }
     }
-    EXPECT_EQ(kKeyCount, unique_keys.size());
-
+    // The reclaimer asks for a single full local sample, without fragmentation.
+    ReclaimCandidateVector full;
+    ASSERT_EQ(EC_OK, GetLocalBackend()->SampleReclaimCandidates(nullptr, 1000, full));
+    EXPECT_EQ(1000, full.size());
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
-TEST_F(MetaLocalBackendTest, TestReclaimSamplingAdvancesAcrossShards) {
+TEST_F(MetaLocalBackendTest, TestReclaimSampleReselectsColdShardsAndRespectsSampleTimes) {
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=2&sample_times=1");
-    ASSERT_EQ(EC_OK,
-              meta_storage_backend_->Init("test_reclaim_candidates_shard_progress", meta_storage_backend_config_));
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
-
-    constexpr size_t kKeyCount = 64;
-    KeyTypeVec keys;
-    keys.reserve(kKeyCount);
-    for (size_t i = 0; i < kKeyCount; ++i) {
-        keys.push_back(static_cast<KeyType>(i + 1));
-    }
-    ASSERT_EQ(
-        std::vector<ErrorCode>(keys.size(), EC_OK),
-        meta_storage_backend_->Put(nullptr, keys, CacheLocationMapVector(keys.size()), PropertyMapVector(keys.size())));
-
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("cold_shards", meta_storage_backend_config_));
     auto *backend = GetLocalBackend();
-    auto shard_for_key = [backend](const KeyType key) {
-        const uint32_t hash =
-            lru_cache::LRUCacheShard::ComputeHash(MetaLocalBackend::KeyToView(key), backend->cache_->GetHashSeed());
-        return hash & backend->shard_mask_;
-    };
-    std::set<uint32_t> populated_shards;
-    for (const KeyType key : keys) {
-        populated_shards.insert(shard_for_key(key));
+    std::map<uint32_t, KeyVector> shards;
+    for (KeyType key = 1; key <= 64; ++key) {
+        ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+                  backend->Put(nullptr, {key}, CacheLocationMapVector(1), PropertyMapVector(1)));
+        ASSERT_TRUE(backend->cache_->ApplyToEntryNoTouch(
+            MetaLocalBackend::KeyToView(key),
+            [key](Cache::ObjectPtr obj, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+                static_cast<MetaMemCacheItem *>(obj)->last_access_time_.store(key * 100);
+                return 0;
+            }));
+        const auto hash = LRUCacheShard::ComputeHash(MetaLocalBackend::KeyToView(key), backend->cache_->GetHashSeed());
+        shards[hash & backend->shard_mask_].push_back(key);
     }
-    ASSERT_EQ(4, populated_shards.size());
-
-    std::set<uint32_t> sampled_shards;
-    for (size_t i = 0; i < populated_shards.size(); ++i) {
-        ReclaimCandidateVector candidates;
-        ASSERT_EQ(EC_OK, backend->SampleReclaimCandidates(nullptr, 1, candidates));
-        ASSERT_EQ(1, candidates.size());
-        sampled_shards.insert(shard_for_key(candidates.front().key));
+    ASSERT_EQ(4, shards.size());
+    std::vector<std::pair<KeyType, uint32_t>> cold_shards;
+    for (const auto &[shard_id, keys] : shards) {
+        ASSERT_GE(keys.size(), 2);
+        // The test overrides item times above; publish the matching tail hint.
+        backend->shard_oldest_access_time_[shard_id].store(keys.front() * 100);
+        cold_shards.emplace_back(keys.front(), shard_id);
     }
-    EXPECT_EQ(populated_shards, sampled_shards);
+    std::sort(cold_shards.begin(), cold_shards.end());
+    const auto &coldest_keys = shards.at(cold_shards[0].second);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        ReclaimCandidateVector sample;
+        ASSERT_EQ(EC_OK, backend->SampleReclaimCandidates(nullptr, 2, sample));
+        ASSERT_EQ(2, sample.size());
+        for (size_t i = 0; i < sample.size(); ++i) {
+            EXPECT_EQ(coldest_keys[i], sample[i].key);
+            EXPECT_EQ(coldest_keys[i] * 100, sample[i].last_access_time_us);
+        }
+    }
 
+    // Increasing sample_times distributes the budget across two cold shards;
+    // it does not globally merge the individual keys from every shard.
+    backend->sample_times_ = 2;
+    ReclaimCandidateVector sample;
+    ASSERT_EQ(EC_OK, backend->SampleReclaimCandidates(nullptr, 4, sample));
+    ASSERT_EQ(4, sample.size());
+    EXPECT_EQ(coldest_keys[0], sample[0].key);
+    EXPECT_EQ(coldest_keys[1], sample[1].key);
+    const auto &next_coldest_keys = shards.at(cold_shards[1].second);
+    EXPECT_EQ(next_coldest_keys[0], sample[2].key);
+    EXPECT_EQ(next_coldest_keys[1], sample[3].key);
+
+    // Business hits make the first shard hot. The next sample re-evaluates
+    // shard coldness rather than reusing either a shard list or a scan offset.
+    backend->sample_times_ = 1;
+    PropertyMapVector properties;
+    ASSERT_EQ(std::vector<ErrorCode>(coldest_keys.size(), EC_OK),
+              backend->GetProperties(nullptr, coldest_keys, {PROPERTY_LRU_TIME}, properties));
+    ASSERT_EQ(EC_OK, backend->SampleReclaimCandidates(nullptr, 2, sample));
+    ASSERT_EQ(2, sample.size());
+    EXPECT_EQ(next_coldest_keys[0], sample[0].key);
+    EXPECT_EQ(next_coldest_keys[1], sample[1].key);
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 

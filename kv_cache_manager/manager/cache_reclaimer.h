@@ -836,6 +836,7 @@ private:
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(credit_timeout_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(pending_limit_reject_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(maintenance_touch_key_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_submit_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_complete_count)
