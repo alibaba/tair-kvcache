@@ -39,9 +39,17 @@ private:
     static constexpr int64_t MAX_SCAN_DURATION_MS = 50;
     static constexpr size_t MAX_SCAN_CALLS = 16;
     static constexpr size_t MAX_PENDING_KEYS = 4096;
+    static constexpr size_t MAX_PROCESSED_KEYS_PER_SCAN_CALL = MAX_PENDING_KEYS + MAX_SCAN_COUNT_HINT;
 
     std::mutex mutex_;
     std::string cursor_{"0"};
+    // Redis SCAN treats COUNT as a hint and can return a page much larger
+    // than requested. Keep bounded, resumable progress within that page and
+    // advance cursor_ only after the complete page has been inspected. A
+    // replay must use the original COUNT hint: Redis is allowed to partition
+    // the same cursor differently when COUNT changes.
+    size_t page_offset_{0};
+    int64_t page_scan_count_{0};
     std::deque<std::string> pending_keys_;
 };
 

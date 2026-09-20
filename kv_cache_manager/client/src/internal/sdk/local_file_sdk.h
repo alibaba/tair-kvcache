@@ -16,8 +16,7 @@ public:
     ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                          const std::shared_ptr<StorageConfig> &storage_config) override;
     SdkType Type() override;
-    ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris,
-                        const BlockBuffers &local_buffers) override;
+    ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) override;
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &local_buffers,
                         std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) override;
@@ -29,6 +28,13 @@ private:
     DoGet(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers, int64_t deadline_ms);
     ClientErrorCode
     DoPut(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers, int64_t deadline_ms);
+
+protected:
+    // Virtual only to make the two durability failure paths deterministically
+    // testable. KVMeta requires both mapped data and the file inode/size to be
+    // synchronous before its caller may publish committed metadata.
+    virtual bool SyncMappedFile(void *address, std::size_t length) const;
+    virtual bool SyncFileDescriptor(int fd) const;
 
 private:
     bool IsAllowedObjectSize(std::size_t size) const;

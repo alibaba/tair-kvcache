@@ -3277,18 +3277,18 @@ ErrorCode KvMetaManager::ValidateCacheConfiguration(RequestContext *request_cont
     unique_storage_names.reserve(group->storage_candidates().size());
     for (const auto &storage_name : group->storage_candidates()) {
         const auto backend = data_storage_manager->GetDataStorageBackend(storage_name);
+        const auto extension = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(backend);
         if (!IsCanonicalKvMetaBackendName(storage_name) || !unique_storage_names.emplace(storage_name).second ||
-            !backend || !SupportsKvMetaCallerOwnedBufferLifetime(backend->GetType()) ||
+            !backend || !SupportsKvMetaAdmission(backend->GetType()) || !extension ||
             backend->GetStorageConfig().type() != backend->GetType() ||
             backend->GetStorageConfig().global_unique_name() != storage_name ||
             !HasSafeConfiguredKvMetaNamespace(backend->GetStorageConfig(), limits_.max_location_uri_bytes)) {
             AddError(request_context,
-                     "KVMeta storage candidates must be unique registered exact-object backends with a hard "
-                     "caller-buffer lifetime contract");
+                     "KVMeta storage candidates must be unique registered backends with hard caller-buffer and "
+                     "exact-object lifecycle contracts");
             return EC_CONFIG_ERROR;
         }
-        const auto extension = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(backend);
-        if (extension && extension->RequiresKvMetaCreateCommit()) {
+        if (extension->RequiresKvMetaCreateCommit()) {
             const std::int64_t timeout_seconds = extension->GetKvMetaControlRequestTimeoutSeconds();
             if (timeout_seconds <= 0 || timeout_seconds > kKvMetaMaxExactControlRpcTimeoutSeconds) {
                 AddError(request_context,
@@ -4208,19 +4208,19 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         return {EC_NOSPC, StartWriteResult{}};
     }
     const auto selected_backend = data_storage_manager->GetDataStorageBackend(selected.name);
+    const auto kv_meta_backend = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(selected_backend);
     if (!selected_backend || selected_backend->GetType() != selected.type ||
-        !SupportsKvMetaCallerOwnedBufferLifetime(selected_backend->GetType())) {
+        !SupportsKvMetaAdmission(selected_backend->GetType()) || !kv_meta_backend) {
         AddError(request_context, "KVMeta selected storage backend changed or lacks exact-object/caller-buffer safety");
         return {EC_CORRUPTION, StartWriteResult{}};
     }
     const StorageConfig &selected_config = selected_backend->GetStorageConfig();
-    if (selected_config.type() != selected.type || selected_config.global_unique_name() != selected.name) {
+    if (selected_config.type() != selected.type || selected_config.global_unique_name() != selected.name ||
+        !HasSafeConfiguredKvMetaNamespace(selected_config, limits_.max_location_uri_bytes)) {
         AddError(request_context, "KVMeta selected storage backend identity does not match its registration");
         return {EC_CORRUPTION, StartWriteResult{}};
     }
-    const auto kv_meta_backend = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(selected_backend);
-    const std::int64_t failed_write_cleanup_grace_seconds =
-        kv_meta_backend ? kv_meta_backend->GetFailedWriteCleanupGraceSeconds() : 0;
+    const std::int64_t failed_write_cleanup_grace_seconds = kv_meta_backend->GetFailedWriteCleanupGraceSeconds();
     if (failed_write_cleanup_grace_seconds < 0 ||
         failed_write_cleanup_grace_seconds > limits_.max_failed_write_cleanup_grace_seconds) {
         AddError(request_context, "KVMeta selected storage backend has an invalid failed-write cleanup grace");

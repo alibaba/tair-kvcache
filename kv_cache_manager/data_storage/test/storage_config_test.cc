@@ -43,7 +43,7 @@ TEST_F(StorageConfigTest, KvMetaObjectStorageTypesExcludeExternalObservationsAnd
     EXPECT_FALSE(IsKvMetaObjectStorageType(DataStorageType::COUNT));
 }
 
-TEST_F(StorageConfigTest, KvMetaCallerBufferLifetimeExcludesMooncakeOnlyFromAdmission) {
+TEST_F(StorageConfigTest, KvMetaCallerBufferLifetimeExcludesOnlyMooncake) {
     EXPECT_TRUE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     EXPECT_TRUE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
     EXPECT_TRUE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
@@ -56,6 +56,20 @@ TEST_F(StorageConfigTest, KvMetaCallerBufferLifetimeExcludesMooncakeOnlyFromAdmi
     EXPECT_TRUE(IsKvMetaObjectStorageType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
     EXPECT_FALSE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
     EXPECT_FALSE(SupportsKvMetaCallerOwnedBufferLifetime(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+}
+
+TEST_F(StorageConfigTest, KvMetaAdmissionRequiresAProvenExactObjectLifecycle) {
+    EXPECT_TRUE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    EXPECT_TRUE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    EXPECT_TRUE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+
+    // These types remain recognizable so an upgraded leader can recover old
+    // ownership records, but new writes are rejected until their adapters
+    // implement a bounded exact create/delete terminal state.
+    EXPECT_FALSE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    EXPECT_FALSE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+    EXPECT_FALSE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    EXPECT_FALSE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_DUMMY));
 }
 
 TEST_F(StorageConfigTest, KvMetaPaceNamespaceRequiresTheRegisteredMediaPool) {
@@ -219,9 +233,8 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecLegacyEnableFalseDoesNotMigr
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecNewSchemaTakesPrecedenceOverLegacy) {
     // 同时有 service_discovery_url 与老字段时，以 service_discovery_url 为准。
-    const std::string json =
-        R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"spectrum://v-yy",)"
-        R"("enable_vipserver":true,"vipserver_domain":"pace.meta.vipserver"})";
+    const std::string json = R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"spectrum://v-yy",)"
+                             R"("enable_vipserver":true,"vipserver_domain":"pace.meta.vipserver"})";
     TairMemPoolStorageSpec spec;
     ASSERT_TRUE(spec.FromJsonString(json));
     EXPECT_EQ(spec.service_discovery_url(), "spectrum://v-yy");

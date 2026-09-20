@@ -2,7 +2,9 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
+#include <iterator>
 #include <unistd.h>
 
 #include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
@@ -33,6 +35,34 @@ private:
 };
 
 namespace {
+
+class FailingSyncLocalFileSdk final : public LocalFileSdk {
+public:
+    std::size_t sync_calls() const noexcept { return sync_calls_; }
+
+protected:
+    bool SyncMappedFile(void *, std::size_t) const override {
+        ++sync_calls_;
+        return false;
+    }
+
+private:
+    mutable std::size_t sync_calls_{0};
+};
+
+class FailingFileSyncLocalFileSdk final : public LocalFileSdk {
+public:
+    std::size_t file_sync_calls() const noexcept { return file_sync_calls_; }
+
+protected:
+    bool SyncFileDescriptor(int) const override {
+        ++file_sync_calls_;
+        return false;
+    }
+
+private:
+    mutable std::size_t file_sync_calls_{0};
+};
 
 DataStorageUri MakeUri(const std::string &file_path, uint64_t blkid, size_t size = 1024) {
     DataStorageUri uri("file://" + file_path);
@@ -149,6 +179,242 @@ TEST_F(LocalFileSdkTest, TestPutGetWithCpu) {
     auto &iov2_res = local_buffers[0].iovs[1];
     ASSERT_EQ(std::memcmp(iov2_res.base, test_data_2, iov2_res.size), 0);
     free(get_buffer);
+}
+
+TEST_F(LocalFileSdkTest, TestPutRejectsNullActualUris) {
+    LocalFileSdk sdk;
+    ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
+
+    const DataStorageUri uri = MakeUri(root_path_ + "/local_file/null_output.txt", 0);
+    BlockBuffers buffers = {MakeCpuBuffer(1024, 0x5A)};
+    EXPECT_EQ(ER_INVALID_PARAMS, sdk.Put({uri}, buffers, nullptr));
+    EXPECT_FALSE(std::filesystem::exists(uri.GetPath()));
+    FreeBuffers(buffers);
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaPutFailsClosedWhenSynchronousFlushFails) {
+    FailingSyncLocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    constexpr std::size_t kObjectSize = 17;
+    const DataStorageUri uri = MakeUri(root_path_ + "/local_file/kvmeta_flush_failure", 0, kObjectSize);
+    BlockBuffers buffers = {MakeCpuBuffer(kObjectSize, 0x5A)};
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    EXPECT_EQ(ER_SDKWRITE_ERROR, sdk.Put({uri}, buffers, actual_remote_uris));
+    EXPECT_EQ(1, sdk.sync_calls());
+    EXPECT_TRUE(actual_remote_uris->empty());
+    EXPECT_FALSE(std::filesystem::exists(uri.GetPath()));
+    FreeBuffers(buffers);
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaPutClearsStaleOutputBeforeValidationFailure) {
+    LocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    constexpr std::size_t kObjectSize = 17;
+    const DataStorageUri uri = MakeUri(root_path_ + "/local_file/kvmeta_stale_output", 0, kObjectSize);
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>(1, uri);
+
+    EXPECT_EQ(ER_INVALID_PARAMS, sdk.Put({uri}, {}, actual_remote_uris));
+    EXPECT_TRUE(actual_remote_uris->empty());
+    EXPECT_FALSE(std::filesystem::exists(uri.GetPath()));
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaRejectsEmptyObjectOperations) {
+    LocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    EXPECT_EQ(ER_INVALID_PARAMS, sdk.Put({}, {}, actual_remote_uris));
+    EXPECT_EQ(ER_INVALID_PARAMS, sdk.Get({}, {}));
+    EXPECT_TRUE(actual_remote_uris->empty());
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaPutFailsClosedWhenFileMetadataSyncFails) {
+    FailingFileSyncLocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    constexpr std::size_t kObjectSize = 19;
+    const DataStorageUri uri = MakeUri(root_path_ + "/local_file/kvmeta_fsync_failure", 0, kObjectSize);
+    BlockBuffers buffers = {MakeCpuBuffer(kObjectSize, 0x6B)};
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    EXPECT_EQ(ER_SDKWRITE_ERROR, sdk.Put({uri}, buffers, actual_remote_uris));
+    EXPECT_EQ(1, sdk.file_sync_calls());
+    EXPECT_TRUE(actual_remote_uris->empty());
+    EXPECT_FALSE(std::filesystem::exists(uri.GetPath()));
+    FreeBuffers(buffers);
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaPutAndGetExactObject) {
+    LocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    constexpr std::size_t kObjectSize = 23;
+    const DataStorageUri uri = MakeUri(root_path_ + "/local_file/kvmeta_exact_object", 0, kObjectSize);
+    BlockBuffers write_buffers = {MakeCpuBuffer(kObjectSize, 0x7C)};
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    ASSERT_EQ(ER_OK, sdk.Put({uri}, write_buffers, actual_remote_uris));
+    ASSERT_EQ(1, actual_remote_uris->size());
+    EXPECT_EQ(uri.ToUriString(), actual_remote_uris->front().ToUriString());
+    ASSERT_EQ(kObjectSize, std::filesystem::file_size(uri.GetPath()));
+
+    BlockBuffers read_buffers = {MakeCpuBuffer(kObjectSize, 0)};
+    ASSERT_EQ(ER_OK, sdk.Get({uri}, read_buffers));
+    AssertBufferAllBytes(read_buffers.front(), 0x7C);
+    FreeBuffers(write_buffers);
+    FreeBuffers(read_buffers);
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaPutRejectsPackedBlocksBeforeCreatingAFile) {
+    LocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    constexpr std::size_t kObjectSize = 23;
+    const std::string path = root_path_ + "/local_file/kvmeta_packed_object";
+    const DataStorageUri first = MakeUri(path, 0, kObjectSize);
+    const DataStorageUri second = MakeUri(path, 1, kObjectSize);
+    BlockBuffers buffers = {
+        MakeCpuBuffer(kObjectSize, 0x31),
+        MakeCpuBuffer(kObjectSize, 0x32),
+    };
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    EXPECT_EQ(ER_SDKWRITE_ERROR, sdk.Put({first, second}, buffers, actual_remote_uris));
+    EXPECT_TRUE(actual_remote_uris->empty());
+    EXPECT_FALSE(std::filesystem::exists(path));
+    FreeBuffers(buffers);
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaPutRejectsIncompleteBufferBeforeCreatingAFile) {
+    LocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    constexpr std::size_t kObjectSize = 23;
+    const DataStorageUri uri = MakeUri(root_path_ + "/local_file/kvmeta_short_buffer", 0, kObjectSize);
+    BlockBuffers buffers = {MakeCpuBuffer(kObjectSize - 1, 0x33)};
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    EXPECT_EQ(ER_SDKWRITE_ERROR, sdk.Put({uri}, buffers, actual_remote_uris));
+    EXPECT_TRUE(actual_remote_uris->empty());
+    EXPECT_FALSE(std::filesystem::exists(uri.GetPath()));
+    FreeBuffers(buffers);
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaGetRejectsPackedReads) {
+    LocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    constexpr std::size_t kObjectSize = 23;
+    const DataStorageUri uri = MakeUri(root_path_ + "/local_file/kvmeta_packed_read", 0, kObjectSize);
+    BlockBuffers write_buffers = {MakeCpuBuffer(kObjectSize, 0x34)};
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    ASSERT_EQ(ER_OK, sdk.Put({uri}, write_buffers, actual_remote_uris));
+
+    BlockBuffers read_buffers = {
+        MakeCpuBuffer(kObjectSize, 0),
+        MakeCpuBuffer(kObjectSize, 0),
+    };
+    EXPECT_EQ(ER_SDKREAD_ERROR, sdk.Get({uri, uri}, read_buffers));
+    FreeBuffers(write_buffers);
+    FreeBuffers(read_buffers);
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaGetRejectsMismatchedPhysicalFileSize) {
+    LocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    constexpr std::size_t kLogicalSize = 23;
+    const DataStorageUri uri = MakeUri(root_path_ + "/local_file/kvmeta_wrong_size", 0, kLogicalSize);
+    std::filesystem::create_directories(std::filesystem::path(uri.GetPath()).parent_path());
+    {
+        std::ofstream output(uri.GetPath(), std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(output.good());
+        output << std::string(kLogicalSize + 1, 'x');
+    }
+
+    BlockBuffers buffers = {MakeCpuBuffer(kLogicalSize, 0)};
+    EXPECT_EQ(ER_SDKREAD_ERROR, sdk.Get({uri}, buffers));
+    FreeBuffers(buffers);
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaGetDoesNotFollowAReplacedGenerationSymlink) {
+    LocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    constexpr std::size_t kObjectSize = 23;
+    const std::filesystem::path target = root_path_ + "/local_file/kvmeta_symlink_target";
+    const DataStorageUri uri = MakeUri(root_path_ + "/local_file/kvmeta_symlink_generation", 0, kObjectSize);
+    std::filesystem::create_directories(target.parent_path());
+    {
+        std::ofstream output(target, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(output.good());
+        output << std::string(kObjectSize, 's');
+    }
+    std::error_code symlink_ec;
+    std::filesystem::create_symlink(target, uri.GetPath(), symlink_ec);
+    ASSERT_FALSE(symlink_ec) << symlink_ec.message();
+
+    BlockBuffers buffers = {MakeCpuBuffer(kObjectSize, 0)};
+    EXPECT_EQ(ER_SDKREAD_ERROR, sdk.Get({uri}, buffers));
+    FreeBuffers(buffers);
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaPutNeverOverwritesAPreExistingGeneration) {
+    LocalFileSdk sdk;
+    auto config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    config->set_variable_object_size_policy(true, 4096);
+    ASSERT_EQ(ER_OK, sdk.Init(config, nullptr));
+
+    constexpr std::size_t kObjectSize = 17;
+    const DataStorageUri uri = MakeUri(root_path_ + "/local_file/kvmeta_existing_generation", 0, kObjectSize);
+    std::filesystem::create_directories(std::filesystem::path(uri.GetPath()).parent_path());
+    {
+        std::ofstream existing(uri.GetPath(), std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(existing.good());
+        existing << std::string(kObjectSize, 'o');
+    }
+    BlockBuffers buffers = {MakeCpuBuffer(kObjectSize, static_cast<unsigned char>('n'))};
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    EXPECT_EQ(ER_SDKWRITE_ERROR, sdk.Put({uri}, buffers, actual_remote_uris));
+    EXPECT_TRUE(actual_remote_uris->empty());
+
+    std::ifstream persisted(uri.GetPath(), std::ios::binary);
+    ASSERT_TRUE(persisted.good());
+    const std::string contents((std::istreambuf_iterator<char>(persisted)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(std::string(kObjectSize, 'o'), contents);
+    FreeBuffers(buffers);
+}
+
+TEST_F(LocalFileSdkTest, TestLegacyPutKeepsHistoricalBestEffortFlushBehavior) {
+    FailingSyncLocalFileSdk sdk;
+    ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
+
+    const DataStorageUri uri = MakeUri(root_path_ + "/local_file/legacy_flush_failure", 0);
+    BlockBuffers buffers = {MakeCpuBuffer(1024, 0xA5)};
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    EXPECT_EQ(ER_OK, sdk.Put({uri}, buffers, actual_remote_uris));
+    EXPECT_EQ(1, sdk.sync_calls());
+    ASSERT_EQ(1, actual_remote_uris->size());
+    EXPECT_EQ(uri.ToUriString(), actual_remote_uris->front().ToUriString());
+    FreeBuffers(buffers);
 }
 
 TEST_F(LocalFileSdkTest, TestPutGetWithGpu) {

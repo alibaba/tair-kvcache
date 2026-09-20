@@ -245,7 +245,7 @@ TEST_F(SdkWrapperTest, TestKvMetaRejectsMooncakeWithoutDmaDrainButRegularInitIsU
     EXPECT_FALSE(regular_mooncake->variable_object_size_enabled());
 }
 
-TEST_F(SdkWrapperTest, TestKvMetaClonesLegacyVcnsTemplateAsTheCandidateType) {
+TEST_F(SdkWrapperTest, TestKvMetaRejectsLegacyVcnsWithoutExactObjectLifecycle) {
     class CapturingSdk : public SdkInterface {
     public:
         ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &,
@@ -299,19 +299,8 @@ TEST_F(SdkWrapperTest, TestKvMetaClonesLegacyVcnsTemplateAsTheCandidateType) {
 
     SdkWrapper wrapper;
     wrapper.sdk_factory_ = &factory;
-    ASSERT_EQ(ER_OK, wrapper.InitForKvMeta(client_config_, init_params, 4096));
-    ASSERT_TRUE(factory.captured);
-    EXPECT_TRUE(std::dynamic_pointer_cast<Hf3fsSdkConfig>(factory.captured));
-    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, factory.captured->type());
-    EXPECT_TRUE(factory.captured->variable_object_size_enabled());
-
-    const auto template_config =
-        wrapper.wrapper_config_->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS);
-    ASSERT_TRUE(template_config);
-    // The compatibility adjustment is per candidate; the shared template is
-    // still the historical HF3FS-typed default and remains unmodified.
-    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_HF3FS, template_config->type());
-    EXPECT_FALSE(template_config->variable_object_size_enabled());
+    EXPECT_EQ(ER_INVALID_STORAGE_CONFIG, wrapper.InitForKvMeta(client_config_, init_params, 4096));
+    EXPECT_FALSE(factory.captured);
 }
 
 TEST_F(SdkWrapperTest, TestKvMetaPutRejectsNullResultBeforeValidationOrIo) {
@@ -512,7 +501,7 @@ TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationOwnsFd) {
     EXPECT_NE(fd_flags & FD_CLOEXEC, 0);
 
     ASSERT_EQ(close(fd), 0);
-    struct stat file_stat{};
+    struct stat file_stat {};
     EXPECT_EQ(fstat(prepared_registration.fd, &file_stat), 0);
 }
 
@@ -542,7 +531,7 @@ TEST_F(SdkWrapperTest, TestDestructorKeepsSharedMemoryFdAliveForRunningTasks) {
     auto task_result = sdk_wrapper->wait_task_thread_pool_->async([&]() {
         task_started.set_value();
         allow_task_finish_future.wait();
-        struct stat file_stat{};
+        struct stat file_stat {};
         fd_valid_in_task.store(fstat(owned_fd, &file_stat) == 0);
         return ER_OK;
     });
@@ -949,8 +938,10 @@ std::unique_ptr<ClientConfig> MakeClientConfigWithTimeouts(int put_timeout_ms, i
             "queue_size": 2000,
             "sdk_backend_configs": [{"type": "file"}],
             "timeout_config": {
-                "put_timeout_ms": )" + std::to_string(put_timeout_ms) + R"(,
-                "get_timeout_ms": )" + std::to_string(get_timeout_ms) + R"(
+                "put_timeout_ms": )" +
+                                    std::to_string(put_timeout_ms) + R"(,
+                "get_timeout_ms": )" +
+                                    std::to_string(get_timeout_ms) + R"(
             }
         },
         "model_deployment": {

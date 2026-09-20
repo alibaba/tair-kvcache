@@ -8,7 +8,7 @@ namespace kv_cache_manager {
 
 class MetricsRegistry;
 
-class NfsBackend : public DataStorageBackend {
+class NfsBackend : public DataStorageBackend, public KvMetaDataStorageBackendExtension {
 public:
     NfsBackend() = delete;
     explicit NfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry);
@@ -28,9 +28,20 @@ public:
     std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,
                                   const std::string &trace_id,
                                   std::function<void()> cb) override;
+    // Keep the legacy Delete behavior unchanged for fixed-block callers. The
+    // KVMeta side interface performs and verifies exact singleton-file removal.
+    std::vector<ErrorCode> DeleteAndConfirmAbsent(const std::vector<DataStorageUri> &storage_uris,
+                                                  const std::string &trace_id,
+                                                  std::function<void()> cb) override;
+    std::int64_t GetFailedWriteCleanupGraceSeconds() const noexcept override { return 0; }
     std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) override;
     std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &storage_uris) override;
     std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &storage_uris) override;
+
+protected:
+    // Persist the namespace mutation before KVMeta is allowed to erase its
+    // durable cleanup ledger. Virtual only for deterministic fault injection.
+    virtual bool SyncKvMetaDeleteDirectory(const std::string &object_path) const noexcept;
 
 private:
     NfsStorageSpec spec_;

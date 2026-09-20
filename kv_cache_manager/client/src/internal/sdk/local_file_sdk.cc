@@ -1,10 +1,13 @@
 #include "kv_cache_manager/client/src/internal/sdk/local_file_sdk.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -32,6 +35,22 @@ bool HasActiveGpuBuffer(const kv_cache_manager::BlockBuffers &buffers) {
     return false;
 }
 #endif
+
+bool IsExactObjectBuffer(const kv_cache_manager::BlockBuffer &buffer, const std::size_t expected_size) {
+    if (buffer.iovs.empty()) {
+        return false;
+    }
+    std::size_t total_size = 0;
+    for (const auto &iov : buffer.iovs) {
+        if (iov.ignore || iov.base == nullptr || iov.size == 0 ||
+            (iov.type != kv_cache_manager::MemoryType::CPU && iov.type != kv_cache_manager::MemoryType::GPU) ||
+            total_size > expected_size || iov.size > expected_size - total_size) {
+            return false;
+        }
+        total_size += iov.size;
+    }
+    return total_size == expected_size;
+}
 
 class MmapHelper {
 public:
@@ -63,19 +82,49 @@ public:
 #endif
     }
 
-    ~MmapHelper() {
+    bool Close() noexcept {
+        bool success = true;
 #if defined(USING_CUDA)
         if (is_mem_registered) {
-            CHECK_CUDA_ERROR(cudaHostUnregister(file_mem_), "unregister host mem [%p] fail", file_mem_);
+            const cudaError_t error = cudaHostUnregister(file_mem_);
+            if (error != cudaSuccess) {
+                KVCM_LOG_WARN("cuda error [%d] [%s] | unregister host mem [%p] fail",
+                              error,
+                              cudaGetErrorString(error),
+                              file_mem_);
+                success = false;
+            }
+            is_mem_registered = false;
         }
 #elif defined(USING_MUSA)
         if (is_mem_registered) {
-            CHECK_MUSA_ERROR(musaHostUnregister(file_mem_), "unregister host mem [%p] fail", file_mem_);
+            const musaError_t error = musaHostUnregister(file_mem_);
+            if (error != musaSuccess) {
+                KVCM_LOG_WARN("musa error [%d] [%s] | unregister host mem [%p] fail",
+                              error,
+                              musaGetErrorString(error),
+                              file_mem_);
+                success = false;
+            }
+            is_mem_registered = false;
         }
 #endif
-        munmap(file_mem_, file_size_);
-        close(fd_);
+        if (file_mem_ != MAP_FAILED) {
+            if (munmap(file_mem_, file_size_) != 0) {
+                success = false;
+            }
+            file_mem_ = MAP_FAILED;
+        }
+        if (fd_ >= 0) {
+            if (close(fd_) != 0) {
+                success = false;
+            }
+            fd_ = -1;
+        }
+        return success;
     }
+
+    ~MmapHelper() { (void)Close(); }
 
 private:
     int fd_;
@@ -84,6 +133,50 @@ private:
 #if defined(USING_CUDA) || defined(USING_MUSA)
     bool is_mem_registered = false;
 #endif
+};
+
+// A variable-size KVMeta path names one immutable allocation generation. If
+// writing that newly created file fails before publication, remove only the
+// inode created by this call. The identity check prevents an abort path from
+// unlinking a replacement installed by another process in a shared namespace.
+class ExclusiveFileCleanupGuard {
+public:
+    explicit ExclusiveFileCleanupGuard(const std::string &path) : path_(path) {}
+
+    ~ExclusiveFileCleanupGuard() {
+        if (!active_) {
+            return;
+        }
+        struct stat current_stat;
+        if (::lstat(path_.c_str(), &current_stat) != 0) {
+            if (errno != ENOENT) {
+                KVCM_LOG_WARN(
+                    "KVMeta failed-write cleanup could not inspect file %s: %s", path_.c_str(), std::strerror(errno));
+            }
+            return;
+        }
+        if (!S_ISREG(current_stat.st_mode) || current_stat.st_dev != device_ || current_stat.st_ino != inode_) {
+            KVCM_LOG_WARN("KVMeta failed-write cleanup retained a replaced path: %s", path_.c_str());
+            return;
+        }
+        if (::unlink(path_.c_str()) != 0 && errno != ENOENT) {
+            KVCM_LOG_WARN(
+                "KVMeta failed-write cleanup could not unlink file %s: %s", path_.c_str(), std::strerror(errno));
+        }
+    }
+
+    void Arm(const struct stat &created_stat) noexcept {
+        device_ = created_stat.st_dev;
+        inode_ = created_stat.st_ino;
+        active_ = true;
+    }
+    void Release() noexcept { active_ = false; }
+
+private:
+    const std::string &path_;
+    dev_t device_{0};
+    ino_t inode_{0};
+    bool active_{false};
 };
 
 // RAII guard：析构时若仍有在飞的 GPU async copy（cudaMemcpyAsync/musaMemcpyAsync 已入队），
@@ -174,9 +267,13 @@ void LogTimeoutAbort(const char *op,
     for (int dev = 0; dev < count; ++dev) {
         int value = 0;
 #if defined(USING_CUDA)
-        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterSupported, dev), false, "get cudaDevAttrHostRegisterSupported failed");
+        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterSupported, dev),
+                                false,
+                                "get cudaDevAttrHostRegisterSupported failed");
 #elif defined(USING_MUSA)
-        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterSupported, dev), false, "get musaDevAttrHostRegisterSupported failed");
+        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterSupported, dev),
+                                false,
+                                "get musaDevAttrHostRegisterSupported failed");
 #endif
         if (value != 1) {
             return false;
@@ -194,9 +291,13 @@ void LogTimeoutAbort(const char *op,
     for (int dev = 0; dev < count; ++dev) {
         int value = 0;
 #if defined(USING_CUDA)
-        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterReadOnlySupported, dev), false, "get cudaDevAttrHostRegisterReadOnlySupported failed");
+        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterReadOnlySupported, dev),
+                                false,
+                                "get cudaDevAttrHostRegisterReadOnlySupported failed");
 #elif defined(USING_MUSA)
-        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterReadOnlySupported, dev), false, "get musaDevAttrHostRegisterReadOnlySupported failed");
+        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterReadOnlySupported, dev),
+                                false,
+                                "get musaDevAttrHostRegisterReadOnlySupported failed");
 #endif
         if (value != 1) {
             return false;
@@ -216,10 +317,14 @@ void LogTimeoutAbort(const char *op,
     for (int dev = 0; dev < count; ++dev) {
         int value = 0;
 #if defined(USING_CUDA)
-        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrPageableMemoryAccess, dev), false, "get cudaDevAttrPageableMemoryAccess failed");
+        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrPageableMemoryAccess, dev),
+                                false,
+                                "get cudaDevAttrPageableMemoryAccess failed");
 #elif defined(USING_MUSA)
         // MUSA equivalent - adjust if needed
-        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrPageableMemoryAccess, dev), false, "get musaDevAttrPageableMemoryAccess failed");
+        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrPageableMemoryAccess, dev),
+                                false,
+                                "get musaDevAttrPageableMemoryAccess failed");
 #endif
         if (value != 1) {
             return false;
@@ -280,7 +385,7 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
     support_register_readonly_ = allGpusSupportHostRegisterReadOnly();
     KVCM_LOG_INFO("gpu support register readonly [%d]", static_cast<int>(support_register_readonly_));
-    
+
     // Check if GPUs support direct pageable memory access
     // If true, we can skip cudaHostRegister for mmap'd memory
     support_pageable_memory_access_ = allGpusSupportPageableMemoryAccess();
@@ -296,7 +401,7 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
     support_register_readonly_ = allGpusSupportHostRegisterReadOnly();
     KVCM_LOG_INFO("gpu support register readonly [%d]", static_cast<int>(support_register_readonly_));
-    
+
     // Check if GPUs support direct pageable memory access
     support_pageable_memory_access_ = allGpusSupportPageableMemoryAccess();
     KVCM_LOG_INFO("gpu support pageable memory access [%d]", static_cast<int>(support_pageable_memory_access_));
@@ -316,8 +421,8 @@ bool LocalFileSdk::IsAllowedObjectSize(std::size_t size) const {
 }
 
 ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
-    if (remote_uris.size() != local_buffers.size()) {
-        KVCM_LOG_ERROR("Get failed, remote_uris size not equal to local_buffers size");
+    if (remote_uris.size() != local_buffers.size() || (variable_object_size_enabled_ && remote_uris.empty())) {
+        KVCM_LOG_ERROR("Get failed, URI/buffer count mismatches or exact-object request is empty");
         return ER_INVALID_PARAMS;
     }
 #if !defined(USING_CUDA) && !defined(USING_MUSA)
@@ -355,8 +460,15 @@ ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris
 ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris,
                                   const BlockBuffers &local_buffers,
                                   std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
-    if (remote_uris.size() != local_buffers.size()) {
-        KVCM_LOG_ERROR("Put failed, remote_uris size not equal to local_buffers size");
+    // A stale URI is unsafe for an exact-object caller: an upper layer could
+    // otherwise publish a prior allocation after this call fails before the
+    // normal resize/rollback path. Keep legacy output behavior unchanged.
+    if (actual_remote_uris && variable_object_size_enabled_) {
+        actual_remote_uris->clear();
+    }
+    if (!actual_remote_uris || remote_uris.size() != local_buffers.size() ||
+        (variable_object_size_enabled_ && remote_uris.empty())) {
+        KVCM_LOG_ERROR("Put failed, output is null, URI/buffer count mismatches, or exact-object request is empty");
         return ER_INVALID_PARAMS;
     }
 #if !defined(USING_CUDA) && !defined(USING_MUSA)
@@ -378,39 +490,72 @@ ClientErrorCode LocalFileSdk::Put(const std::vector<DataStorageUri> &remote_uris
         if (DeadlineExpired(deadline_ms)) {
             LogTimeoutAbort(
                 "put", done_blocks, remote_uris.size(), group.second.indices[0], group.second.local_buffers[0]);
+            if (variable_object_size_enabled_) {
+                actual_remote_uris->clear();
+            }
             return ER_SDK_TIMEOUT;
         }
-        std::string file_path = group.first;
+        const std::string &file_path = group.first;
         const BlockGroup &block_group = group.second;
         std::vector<DataStorageUri> group_actual_uris;
-        if (!std::filesystem::exists(file_path)) {
-            auto ec = Alloc(block_group.remote_uris, group_actual_uris);
-            if (ec != ER_OK) {
-                KVCM_LOG_ERROR("Put failed, alloc failed, errorcode: %d", ec);
-                return ER_SDKALLOC_ERROR;
-            }
-            if (group_actual_uris.size() != block_group.indices.size()) {
-                KVCM_LOG_ERROR("Put failed, alloc returned %zu uris but group has %zu blocks, path: %s",
-                               group_actual_uris.size(),
-                               block_group.indices.size(),
-                               file_path.c_str());
-                return ER_SDKALLOC_ERROR;
-            }
-        } else {
+        // Every KVMeta URI names one immutable allocation generation. Always
+        // create and hold the same descriptor through write+fsync. A separate
+        // create/close/reopen sequence would leave a replacement race. The
+        // fixed-block path deliberately keeps its historical allocation flow.
+        if (variable_object_size_enabled_) {
             group_actual_uris = block_group.remote_uris;
+        } else {
+            std::error_code exists_ec;
+            const bool file_exists = std::filesystem::exists(file_path, exists_ec);
+            if (exists_ec) {
+                KVCM_LOG_ERROR(
+                    "Put failed, cannot inspect file %s: %s", file_path.c_str(), exists_ec.message().c_str());
+                return ER_SDKALLOC_ERROR;
+            }
+            if (!file_exists) {
+                auto ec = Alloc(block_group.remote_uris, group_actual_uris);
+                if (ec != ER_OK) {
+                    KVCM_LOG_ERROR("Put failed, alloc failed, errorcode: %d", ec);
+                    return ER_SDKALLOC_ERROR;
+                }
+                if (group_actual_uris.size() != block_group.indices.size()) {
+                    KVCM_LOG_ERROR("Put failed, alloc returned %zu uris but group has %zu blocks, path: %s",
+                                   group_actual_uris.size(),
+                                   block_group.indices.size(),
+                                   file_path.c_str());
+                    return ER_SDKALLOC_ERROR;
+                }
+            } else {
+                group_actual_uris = block_group.remote_uris;
+            }
         }
-        // 保序回填：indices[k] 是该组第 k 个元素在原始入参中的下标。
-        for (size_t k = 0; k < block_group.indices.size(); ++k) {
-            (*actual_remote_uris)[block_group.indices[k]] = group_actual_uris[k];
+        // Preserve the fixed-block output timing. KVMeta publishes its exact
+        // URI only after the exclusive write has completed successfully.
+        if (!variable_object_size_enabled_) {
+            for (size_t k = 0; k < block_group.indices.size(); ++k) {
+                (*actual_remote_uris)[block_group.indices[k]] = group_actual_uris[k];
+            }
         }
         auto ec = DoPut(block_group.remote_uris, block_group.local_buffers, deadline_ms);
         if (ec == ER_SDK_TIMEOUT) {
+            if (variable_object_size_enabled_) {
+                actual_remote_uris->clear();
+            }
             // 透传超时错误码，供 wrapper 层归因（不要把超时吞成普通写错误）。
             return ER_SDK_TIMEOUT;
         }
         if (ec != ER_OK) {
+            if (variable_object_size_enabled_) {
+                actual_remote_uris->clear();
+            }
             KVCM_LOG_ERROR("Put failed, DoPut failed, errorcode: %d", ec);
             return ER_SDKWRITE_ERROR;
+        }
+        // 保序回填：indices[k] 是该组第 k 个元素在原始入参中的下标。
+        if (variable_object_size_enabled_) {
+            for (size_t k = 0; k < block_group.indices.size(); ++k) {
+                (*actual_remote_uris)[block_group.indices[k]] = group_actual_uris[k];
+            }
         }
         done_blocks += block_group.remote_uris.size();
     }
@@ -451,11 +596,22 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
     }
 
     std::string file_path = remote_uris[0].GetPath();
-    if (!std::filesystem::exists(file_path)) {
+    if (variable_object_size_enabled_ && remote_uris.size() != 1) {
+        KVCM_LOG_ERROR("Get failed, KVMeta local-file allocation must contain exactly one block");
+        return ER_INVALID_PARAMS;
+    }
+    std::error_code exists_ec;
+    const bool file_exists = std::filesystem::exists(file_path, exists_ec);
+    if (exists_ec) {
+        KVCM_LOG_ERROR("Get failed, cannot inspect file %s: %s", file_path.c_str(), exists_ec.message().c_str());
+        return ER_FILE_IO_ERROR;
+    }
+    if (!file_exists) {
         KVCM_LOG_WARN("Get failed, file %s is not exist", file_path.c_str());
         return ER_FILE_IO_ERROR;
     }
-    int fd = ::open(file_path.c_str(), O_RDONLY);
+    const int open_flags = variable_object_size_enabled_ ? O_RDONLY | O_CLOEXEC | O_NOFOLLOW : O_RDONLY;
+    int fd = ::open(file_path.c_str(), open_flags);
     if (fd < 0) {
         KVCM_LOG_ERROR("Get failed, open file %s failed", file_path.c_str());
         return ER_FILE_IO_ERROR;
@@ -467,7 +623,25 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
         close(fd);
         return ER_FILE_IO_ERROR;
     }
-    size_t file_size = st.st_size;
+    if (st.st_size < 0 || static_cast<uintmax_t>(st.st_size) > std::numeric_limits<size_t>::max() ||
+        (variable_object_size_enabled_ && !S_ISREG(st.st_mode))) {
+        KVCM_LOG_ERROR("Get failed, KVMeta path is not a regular file or has an invalid size: %s", file_path.c_str());
+        close(fd);
+        return ER_FILE_IO_ERROR;
+    }
+    size_t file_size = static_cast<size_t>(st.st_size);
+    if (variable_object_size_enabled_) {
+        for (const auto &remote_uri : remote_uris) {
+            const auto item = LocalFileItem::FromUri(remote_uri);
+            if (item.blkid != 0 || !IsAllowedObjectSize(item.size) || item.size != file_size ||
+                !IsExactObjectBuffer(local_buffers.front(), item.size)) {
+                KVCM_LOG_ERROR("Get failed, KVMeta file size or singleton block identity mismatches uri: %s",
+                               remote_uri.ToUriString().c_str());
+                close(fd);
+                return ER_FILE_IO_ERROR;
+            }
+        }
+    }
     KVCM_LOG_DEBUG("Get file path [%s] size [%zu] block buffer [%s]",
                    file_path.c_str(),
                    file_size,
@@ -492,7 +666,8 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
     // If GPU supports direct pageable memory access, skip cudaHostRegister
     // This allows direct DMA transfer between GPU and mmap'd memory without pinning
     if (!support_pageable_memory_access_) {
-        auto register_ec = helper.RegisterGpu(support_register_readonly_ ? cudaHostRegisterReadOnly : cudaHostRegisterDefault);
+        auto register_ec =
+            helper.RegisterGpu(support_register_readonly_ ? cudaHostRegisterReadOnly : cudaHostRegisterDefault);
         if (register_ec != ER_OK) {
             // 此时尚无 async copy 入队，guard 为空操作；helper 析构 unregister/munmap 安全。
             return register_ec;
@@ -504,7 +679,8 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
 #elif defined(USING_MUSA)
     GpuStreamDrainGuard gpu_drain(musa_stream_, &gpu_copy_enqueued);
     if (!support_pageable_memory_access_) {
-        auto register_ec = helper.RegisterGpu(support_register_readonly_ ? musaHostRegisterReadOnly : musaHostRegisterDefault);
+        auto register_ec =
+            helper.RegisterGpu(support_register_readonly_ ? musaHostRegisterReadOnly : musaHostRegisterDefault);
         if (register_ec != ER_OK) {
             // 此时尚无 async copy 入队，guard 为空操作；helper 析构 unregister/munmap 安全。
             return register_ec;
@@ -599,7 +775,7 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
 #endif
 
     return ER_OK;
-} // namespace kv_cache_manager
+}
 
 ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_uris,
                                     const BlockBuffers &local_buffers,
@@ -611,9 +787,9 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
 
     std::string file_path = remote_uris[0].GetPath();
 
-    size_t max_blkid = 0;
     size_t required_size = 0;
     std::vector<LocalFileItem> items;
+    items.reserve(remote_uris.size());
     for (size_t i = 0; i < remote_uris.size(); ++i) {
         auto &remote_uri = remote_uris[i];
         if (remote_uri.GetPath().empty()) {
@@ -629,28 +805,59 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
                            remote_uri.ToUriString().c_str());
             return ER_INVALID_PARAMS;
         }
-
-        max_blkid = std::max(max_blkid, item.blkid);
-        required_size = std::max(required_size, (max_blkid + 1) * item.size);
+        if (variable_object_size_enabled_ && (remote_uris.size() != 1 || item.blkid != 0)) {
+            KVCM_LOG_ERROR("Put failed, KVMeta local-file allocation must contain exactly one block at offset zero");
+            return ER_INVALID_PARAMS;
+        }
+        if (variable_object_size_enabled_ && !IsExactObjectBuffer(local_buffers[i], item.size)) {
+            KVCM_LOG_ERROR("Put failed, KVMeta local buffer does not exactly match the object size");
+            return ER_INVALID_LOCAL_BUFFERS;
+        }
+        if (item.blkid > std::numeric_limits<size_t>::max() - 1 ||
+            item.size > std::numeric_limits<size_t>::max() / (static_cast<size_t>(item.blkid) + 1)) {
+            KVCM_LOG_ERROR("Put failed, URI block range overflows addressable file size: %s",
+                           remote_uri.ToUriString().c_str());
+            return ER_INVALID_PARAMS;
+        }
+        required_size = std::max(required_size, (static_cast<size_t>(item.blkid) + 1) * static_cast<size_t>(item.size));
         items.push_back(item);
     }
 
-    int fd = ::open(file_path.c_str(), O_RDWR, 0644);
+    if (required_size == 0 || required_size > static_cast<std::uintmax_t>(std::numeric_limits<off_t>::max())) {
+        KVCM_LOG_ERROR("Put failed, required file size is invalid: %zu", required_size);
+        return ER_INVALID_PARAMS;
+    }
+    if (variable_object_size_enabled_) {
+        std::error_code directory_ec;
+        std::filesystem::create_directories(std::filesystem::path(file_path).parent_path(), directory_ec);
+        if (directory_ec) {
+            KVCM_LOG_ERROR("Put failed, cannot create KVMeta parent directories for %s: %s",
+                           file_path.c_str(),
+                           directory_ec.message().c_str());
+            return ER_FILE_IO_ERROR;
+        }
+    }
+    const int open_flags = variable_object_size_enabled_ ? O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW : O_RDWR;
+    int fd = ::open(file_path.c_str(), open_flags, 0644);
     if (fd < 0) {
-        KVCM_LOG_ERROR("Put failed, open file %s failed", file_path.c_str());
+        KVCM_LOG_ERROR("Put failed, open file %s failed: %s", file_path.c_str(), std::strerror(errno));
         return ER_FILE_IO_ERROR;
     }
+    ExclusiveFileCleanupGuard failed_write_cleanup(file_path);
+    if (variable_object_size_enabled_) {
+        struct stat opened_file_stat;
+        if (fstat(fd, &opened_file_stat) != 0 || !S_ISREG(opened_file_stat.st_mode)) {
+            KVCM_LOG_ERROR("Put failed, KVMeta path is not a regular file: %s", file_path.c_str());
+            close(fd);
+            return ER_FILE_IO_ERROR;
+        }
+        failed_write_cleanup.Arm(opened_file_stat);
+    }
 
-    if (fallocate(fd, 0, 0, required_size) != 0) {
+    if (fallocate(fd, 0, 0, static_cast<off_t>(required_size)) != 0) {
         KVCM_LOG_ERROR("Put failed, fallocate file %s failed", file_path.c_str());
         close(fd);
         return ER_FILE_IO_ERROR;
-    }
-
-    if (0 == required_size) {
-        KVCM_LOG_ERROR("required size is 0, something is wrong");
-        close(fd);
-        return ER_INVALID_PARAMS;
     }
 
     void *file_mem = mmap(nullptr, required_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -711,10 +918,10 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
         }
         auto &item = items[i];
         auto &local_buffer = local_buffers[i];
-        size_t offset = item.blkid * item.size;
+        size_t offset = static_cast<size_t>(item.blkid) * item.size;
 
         for (auto &iov : local_buffer.iovs) {
-            if (offset + iov.size > required_size) {
+            if (offset > required_size || iov.size > required_size - offset) {
                 KVCM_LOG_ERROR(
                     "Put failed, IOV size [%zu] offset[%zu] exceeds file size [%zu]", iov.size, offset, required_size);
                 return ER_INVALID_PARAMS;
@@ -758,11 +965,41 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
         gpu_copy_enqueued = false;
     }
 #endif
-    if (msync(file_mem, required_size, MS_SYNC) != 0) {
+    if (!SyncMappedFile(file_mem, required_size)) {
+        if (variable_object_size_enabled_) {
+            // KVMeta publishes the location only after Put succeeds. Returning
+            // success here would make an unflushed NFS object durable metadata
+            // and could leave a poisoned cache hit after process or host loss.
+            // Fail closed so the write session is aborted and GC owns cleanup.
+            KVCM_LOG_ERROR("KVMeta Put msync failed for file %s", file_path.c_str());
+            return ER_FILE_IO_ERROR;
+        }
+        // Preserve the established fixed-block behavior. KVMeta enables the
+        // strict branch through its isolated variable-object SDK config.
         KVCM_LOG_WARN("Put msync failed for file %s", file_path.c_str());
+    }
+    if (variable_object_size_enabled_ && !SyncFileDescriptor(fd)) {
+        // msync covers the mapped pages, while fsync also persists inode
+        // metadata such as the fallocated file size. Do not publish a cache hit
+        // when either half of that durability barrier is uncertain.
+        KVCM_LOG_ERROR("KVMeta Put fsync failed for file %s", file_path.c_str());
+        return ER_FILE_IO_ERROR;
+    }
+    if (variable_object_size_enabled_) {
+        if (!helper.Close()) {
+            KVCM_LOG_ERROR("KVMeta Put could not close the synchronized file %s", file_path.c_str());
+            return ER_FILE_IO_ERROR;
+        }
+        failed_write_cleanup.Release();
     }
 
     return ER_OK;
 }
+
+bool LocalFileSdk::SyncMappedFile(void *address, const std::size_t length) const {
+    return msync(address, length, MS_SYNC) == 0;
+}
+
+bool LocalFileSdk::SyncFileDescriptor(const int fd) const { return fsync(fd) == 0; }
 
 } // namespace kv_cache_manager

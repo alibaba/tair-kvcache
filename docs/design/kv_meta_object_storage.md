@@ -40,8 +40,8 @@ load-before-compute、encoder skip、有界 singleflight、tensor manifest/完�
 完整 Embedding Cache 语义。
 
 “可用于灰度”不是无条件的生产就绪声明。上线必须同时满足第 12.3 节的语义 key、推理 fallback、真实物理 GC、
-读宽限期、时钟和隔离要求；尤其是物理 `Delete` 为 no-op 且没有外部 TTL/sweeper 的 backend，不能作为有界容量的
-生产 EMB Cache。
+读宽限期、时钟和隔离要求；尤其是缺少 exact physical-absence capability 的 backend 会被新写准入拒绝，不能把
+legacy `Delete=OK` 或外部 TTL/sweeper 当成在线 quota 已经释放的证明。
 
 V1 不是最终形态。设计复盘后，后续重点不应是把 `vector<size>` 直接塞进共享 `DataStorageBackend::Create`，而应在
 KVMeta 侧增加可选的异构对象 capability adapter，并用 generation-aware allocation 和持久化 retired cleanup
@@ -196,7 +196,7 @@ flowchart LR
     registry["Registry / MetaIndexer"]
     storage_manager["DataStorageManager"]
     sdk["SdkWrapper::InitForKvMeta"]
-    backend["NFS / HF3FS / TairMempool ...<br/>Mooncake 暂不允许 KVMeta admission"]
+    backend["新写准入：NFS / TairMempool DRAM/SSD<br/>其他类型仅保留旧记录识别"]
     receipt["业务控制面 receipt\nkey + size + tensor metadata"]
 
     producer --> adapter --> object_client
@@ -344,7 +344,7 @@ hit；已 committed 的相同 key、不同 size 返回 `SIZE_MISMATCH`。active 
 
 | 字段 | 约束 |
 |---|---|
-| `type` | 必须是已注册、可识别、具备对象所有权语义且满足 caller-buffer 生命周期契约的 storage type |
+| `type` | 必须是已注册、在新写 allowlist 内、实现运行时 KVMeta exact-lifecycle side capability，且满足 caller-buffer 生命周期契约的 storage type |
 | `spec_size` | 固定为 `1` |
 | `location_specs` | 恰好一个元素，名字固定为 `value` |
 | `location_specs[0].uri` | scheme/hostname 必须对应所选 backend；backend name 不超过 512 bytes，且仅允许字母、数字、`.`、`_`、`-`，authority 不得带 userinfo/port |
@@ -353,10 +353,16 @@ hit；已 committed 的相同 key、不同 size 返回 `SIZE_MISMATCH`。active 
 | backend 所有权字段 | 旧 Mooncake URI `key` 必须是完整 canonical KVMeta object key；TairMempool/PACE path 必须是完整的 `/<uint64 offset>`，地址字段必须是 `uint16`，且 URI `media_type`（缺失按 0）必须精确匹配注册 backend；文件型 path 必须是无空/dot segment 和尾随 `/` 的非根绝对路径；可打包文件型 backend 的 `blkid` 必须缺失或严格等于 `0` |
 | KVMeta namespace | file identity 必须精确等于已注册 backend 配置的 root/mount/root_dir 与 `kvmeta/<instance-hash>/<key-hash>/<32-byte nonce>` 拼出的路径；Mooncake `key` 必须精确对应同一 object key；canonical 或后缀相同但位于其他 root/namespace/key 的 URI 也不是 Delete authority |
 
-对象所有权解析支持 HF3FS/VCNS-HF3FS、Mooncake、TairMempool DRAM/SSD、NFS 和测试用 Dummy，以便安全识别、
-排空或恢复旧 metadata；但当前 Mooncake C API 没有已提交 RDMA 的 cancel/drain/completion primitive，软超时返回
-不能证明 caller buffer 已不再被访问。因此 V1 的新 instance、allocation 和官方 exact-object client 明确拒绝
-Mooncake，不能把“等待 `mooncake_client_get/put` future 返回”误当作 DMA drain。该限制不影响普通固定 block 路径。
+对象所有权解析支持 HF3FS/VCNS-HF3FS、Mooncake、TairMempool DRAM/SSD、NFS 和测试用 Dummy，以便校验并保留旧
+metadata 的 owner/cleanup ledger；“能够识别”不等于“允许新写或能够自动删除”。V1 新写 allowlist 只有 NFS、
+TairMempool DRAM/SSD，并且注册时还必须动态取得 `KvMetaDataStorageBackendExtension`。缺少 side capability 的旧记录
+不会退回普通 `Delete`：它继续保留 tombstone 和 usage，直到升级 exact adapter 或由运维证明终态。
+
+HF3FS 的超时 submitted I/O 当前只能泄漏内部 shm 来防 UAF，没有有界 cancel/drain 终态，且成功写路径没有传播
+`fsync` 失败；VCNS-HF3FS 仍使用可打包的 legacy shared-file allocator；Mooncake C API 没有已提交 RDMA 的
+cancel/drain/completion primitive，软超时返回不能证明 caller buffer 已不再被访问。因此这三类和 Dummy 都不能用于
+新 KVMeta instance/allocation，官方 exact-object client 也在 I/O 前拒绝。限制只作用于 KVMeta 侧路，不改变普通固定
+block 路径。
 EventReport location 是外部 block 的观测记录，不代表 KVMeta 对该物理对象具有独占创建/删除权；proto 与 C++ enum
 为 wire compatibility 保留其编号，但服务端和官方 exact-object client 都拒绝把它用于 EMB 对象。
 
@@ -410,13 +416,18 @@ HA 节点必须保持时钟同步，并把可能的最大漂移计入写租约�
 schema 不一致则失败。返回配置严格等于已验证的 `storage_candidates`；固定 block KVCache 为迁移读写而附加的
 migration source/target 不属于 KVMeta 数据面，即使 group 同时配置这些 route，也不会把 EventReport 等非
 exact-object backend 交给 KVMeta SDK。注册同时验证 group 已配置当前实现能够执行的 LRU 回收策略，并且每个
-`storage_candidates` 都唯一、已注册且具备 exact-object ownership；storage spec 的动态类型必须与 backend type
+`storage_candidates` 都唯一、已注册、位于显式 allowlist 且运行时实现 exact-object lifecycle side capability；
+storage spec 的动态类型必须与 backend type
 一致，文件型配置还必须能生成词法规范的绝对
 `kvmeta/<instance-hash>/<key-hash>/<32-byte nonce>` namespace（例如 NFS 拼接型 `root_path` 必须保留目录分隔符）。
 预检按两个 16-digit hash、32-byte nonce、最大 `uint64 size` 和可能出现的 singleton `blkid=0` 计算最坏 URI，避免
 短样例能注册、真实 allocation 却在返回后才超过 URI 上限。
 没有有效 Reclaimer、候选缺失/重复、namespace 不安全或混入 EventReport 的 group 返回 `SERVICE_NOT_READY`，不会先
 创建一个只能靠人工删除维持的“对象库”。
+Manager 的预检不是唯一防线：`DataStorageManager::CreateForKvMeta` 在持有 storage map 读锁、即将调用 provider 前会
+再次校验 allowlist、完整配置 identity、namespace 与 side capability，避免配置热变更的 TOCTOU 退回 legacy `Create`；
+provisional commit 和 KVMeta exact delete 也在最终 dispatch 边界重验配置，exact delete 不再退回 legacy `Delete`。普通
+`Create/Delete` API 和固定块调用链不受这些侧路检查影响。
 KVMeta 与普通 KVCache 的注册都会在 mutation 前读取同 group 的持久化成员，并在同一进程内串行化检查；因此已有
 KVMeta group 不能被后续 legacy 注册污染，已有普通 group 也不能被 KVMeta 占用。单 leader 是该控制面串行化的部署
 前提。已有持久化 instance 的幂等重注册/恢复不执行新的 mutation，因此不会被历史 mixed group 阻断，保证普通
@@ -654,6 +665,15 @@ KVMeta capability adapter 允许支持方一次接收不同 size，同时让不�
 成功。RTP 的 GPU ViT 镜像因此必须使用 GPU-enabled KVCM client artifact，CPU artifact 只用于 CPU contract
 test。
 
+NFS 的 KVMeta 写路径把随机 URI 当作不可复用 generation：使用 `O_EXCL|O_NOFOLLOW` 排他创建，已存在路径直接失败，
+不会覆盖 nonce 碰撞或 stale orphan；创建、fallocate、mmap、复制、`msync`、文件 `fsync` 和 close 始终持有同一个
+descriptor，消除 create/close/reopen 的替换窗口。任一阶段失败都不发布 actual URI，并按 inode identity best-effort
+删除本调用创建的半文件；即使本地清理失败，durable session owner/GC 仍持有最终清理责任。读路径同样使用
+`O_NOFOLLOW`，并在搬运前要求 regular file、物理长度、URI size 和完整 caller buffer 精确一致。普通 fixed-block
+LocalFile SDK 仍保留已有的可覆盖与 `msync` best-effort 行为。该 barrier 覆盖文件内容、inode 与 size；NFS
+mount/server 自身的稳定存储语义仍必须在部署验收中验证。Cache 不是权威数据源，重启后极端情况下的对象缺失仍必须
+由 RTP Load-failure fallback/repair 处理。
+
 ### 7.1 内部 TairMempool/PACE 适配
 
 KVCM 内部仓的真实 `TairMempoolSdk` 在 variable-size policy 开启时：
@@ -696,6 +716,13 @@ metadata reservation 使用完整旧值条件保护。跨进程 `PutStart` 竞�
 状态、backend、URI 和 size：只有相同尺寸的 committed 对象可视为命中；不同尺寸的 committed 对象返回
 `SIZE_MISMATCH`；active 赢家的 size 尚未成为不可变对象契约，因此无论尺寸是否相同都返回
 `WRITE_IN_PROGRESS`，本请求的候选 allocation 被回收。
+
+C++ object client 和 pybind native call 都允许同一个 client 上的独立同步操作并发；pybind 在 I/O 期间释放 GIL。
+通用 Python client 只在生命周期临界区维护唯一 active-operation token 集合，不用全局锁串行化 save/load/remove；token
+让 admission 在紧邻字节码被信号中断时也能幂等撤销，不会把 `close()` 永久卡住。`close()`
+先拒绝新操作、等待所有已进入操作退出，再关闭 native client 和释放 registered-memory owner；多个并发 close 只有
+一个执行 native close。等待若被 Python cancellation/`KeyboardInterrupt` 中断，会交还 close ownership，不能把
+client 永久卡在 closing 状态。RTP 仍应设置进程级并发上限，避免可选 Cache 抢占推理资源。
 
 ### 8.2 Remove/新一代写入的 ABA 防护
 
@@ -846,7 +873,7 @@ write_timeout_seconds * 1000
 
 V1 的正确性前提是 backend 在物理清理 deadline 前停止访问该 remote allocation。SDK 为保护 caller buffer 会等待
 已接纳任务及其 backend 可证明的 I/O completion；仅等待包装层 future 不构成 drain。无法提供硬完成/cancel-and-drain
-契约的 Mooncake 当前在 KVMeta 初始化和服务端注册阶段被拒绝。drain 不会自动续约服务端 session；若 provider
+契约的 HF3FS、VCNS-HF3FS 和 Mooncake 当前在 KVMeta 初始化和服务端注册阶段被拒绝。drain 不会自动续约服务端 session；若 provider
 无视自己的 timeout 并越过安全清理 deadline 继续 Put，expiry 物理删除仍可能与旧 Put 竞争。生产 backend 必须证明
 I/O 有硬 deadline/cancellation，或声明足以覆盖经过验证最坏迟到 I/O 的 cleanup grace；仅满足上面的名义不等式不够。
 
@@ -858,6 +885,11 @@ adapter 另声明 180 秒 failed-write quarantine：任一失败 mask 不立即�
 client buffer quarantine 不会长于服务端地址 quarantine。该值仍必须不小于线上 PACE 可能迟到的 remote
 RDMA/Commit 上界；修改 PACE quarantine/hardware timeout 时必须同步升级两侧协议常量并完成故障注入，不能只改
 client 环境变量。该检查只在 KVMeta variable-size 模式启用，不改变 fixed-block client 的既有策略。
+
+NFS 是同步文件调用路径，没有晚到 DMA/UAF 问题，但阻塞的 mount syscall 缺少进程内 cancel primitive，故可能让
+调用耗时超过名义 timeout。它适合单机/受控灰度和已验证 hard mount timeout 的独占 NFS namespace；要求严格尾延迟
+SLO 的线上 EPD 数据面应使用已完成 exact PACE 契约验证的 TairMempool。这里区分的是可用性风险与所有权安全：KVCM
+宁可等待并保留 ledger，也不会为了按时返回而释放仍可能被访问的 caller buffer 或物理 generation。
 
 对无需 quarantine 的同步 backend，显式失败回滚仍立即执行；对声明 quarantine 的 backend，失败 Finish 只原子地
 把内存 session 标记 aborted，持久化 active owner 本身就是跨 crash 的隔离记录，直到安全 deadline 才由 expiry 或
@@ -881,7 +913,8 @@ exact-object worker 使用非阻塞入队，因此 `sdk_config.queue_size` 必�
 
 到达数据面 deadline 后，排队任务不再发起 I/O；已经运行的 backend I/O 必须完成，或由 backend 的
 cancel-and-drain primitive 证明停止后，KVMeta 才返回。因此调用耗时可能超过名义 timeout，但返回后 backend
-不再访问 caller-owned buffer。Mooncake 的现有 API 无法证明这一点，故不进入 KVMeta 路径；普通 TransferClient
+不再访问 caller-owned buffer。HF3FS/VCNS-HF3FS/Mooncake 的现有组合契约无法完整证明这一点及 exact generation
+lifecycle，故不进入 KVMeta 路径；普通 TransferClient
 保留原有 soft-timeout 行为。
 
 ### 9.3 多地址与结果不确定
@@ -977,8 +1010,9 @@ pending retirement 或可能的 orphan，同一个 unique name 就必须保持�
 - `backend_capacity_demand_bytes` 是尚未被 exact physical absence 覆盖的物理压力 bytes gauge；
 - `pending_object_count`、`pending_bytes`、`blocked_group_count` 和 `admission_demand_group_count` 是当前状态 gauge。
 
-因此告警应同时观察逻辑回收和 physical uncertain 指标。backend 明确返回成功但自身实现为 no-op（例如当前开源
-NFS backend）属于 backend 能力边界，无法由上述 uncertain 指标推断真实磁盘释放量。持续非零的
+因此告警应同时观察逻辑回收和 physical uncertain 指标。KVMeta 不接受缺少 exact side capability 的 backend，也不会
+把 legacy Delete 的 `OK` 解释为物理释放；开源 NFS 的固定块 `Delete` 仍是 no-op，但 KVMeta side delete 会校验
+namespace、删除 singleton file 并确认路径不存在。持续非零的
 `admission_demand_group_count` 与 RTP 连续 `NOSPC`/fallback 同时出现，表示 Reclaimer 被暂停、策略不支持、采样/
 batch 太小、没有可退休 committed 对象，或 backend/metadata finalization 无法推进；不能只扩大重试次数掩盖。
 
@@ -1048,8 +1082,9 @@ WAL 顺序是 Cache 能在 Delete 故障和 leader restart 后继续 GC、而不
 内部 TairMempool 扩展只接管 KVMeta side interface，不修改 fixed-block `Create/Delete`。exact allocation 逐级使用
 capability-separated 路由：KVCM→Meta 为 `/v1/api/gas/batch/exact`，Meta→Provider 为
 `/api/alloc_batch_exact`；旧节点在 mutation 前返回 404，滚动升级不会把缺少代际身份的 legacy allocation 混入 KVMeta。
-成功 URI 固化 Provider process incarnation。物理 cleanup 按最多 256 个 identity 分片，经同一主端口调用
-`/v1/api/gas/exact/free` 和 `/v1/api/gas/exact/query`；Meta 再用 Provider 的 `/api/free_exact` 与
+成功 URI 固化 Provider process incarnation。物理 cleanup 按最多 256 个 identity 分片，经 storage candidate 配置的
+PACE MetaService 主 HTTP listener 调用 `/v1/api/gas/exact/free` 和 `/v1/api/gas/exact/query`；该 provider 控制面与
+KVCM 对外 gRPC 端口不是同一个概念。Meta 再用 Provider 的 `/api/free_exact` 与
 `/api/ga_list_exact` 做定向操作，身份是
 `(owner_provider_id, stable_provider_uuid, provider_incarnation, address, allocation_token)`。stable UUID 用于 Provider
 重注册后的路由，owner id/incarnation/token 共同用于防止旧 tombstone 删除 successor generation。
@@ -1060,7 +1095,9 @@ manager-owned pending descriptor 恢复，不重放 refcount mutation。生产 l
 当前实现不支持保留 live allocation table 时单独重建 listener。Meta/KVCM adapter 在 mutation 已确认后只重试只读 query；mutation acknowledgement 丢失时，最多补发一次
 相同 generation 的 exact free。每次 mutation 后都必须取得 targeted absence proof。只有 `status=success`、
 `partial=false`、`failed_nodes=[]` 且所有目标地址均不存在才返回成功；响应部分、目标仍存在、字段重复/缺失/类型错误、
-嵌入 NUL 或超限 body 都按结果不确定处理。一次配置的 reclaim batch 即使大于 256，也由 adapter 分片而不是截断或
+嵌入 NUL 或超限 body 都按结果不确定处理。exact PACE HTTP 响应在 libcurl write callback 追加前硬限制为 64 KiB，
+不能只信任可缺失或伪造的 `Content-Length`；超限立即终止传输且不保留 partial JSON。该限制只作用于 exact side
+endpoint，legacy endpoint 的响应行为不变。一次配置的 reclaim batch 即使大于 256，也由 adapter 分片而不是截断或
 改变公共 Reclaimer 参数；任一 chunk 未证明终态，manager 仍按整个 cleanup 失败并关闭 KVMeta gate。
 
 MetaService retirement proof 是 free 响应丢失后的有界快速幂等窗口，不是 KVCM tombstone 的最长可恢复窗口。proof
@@ -1112,10 +1149,23 @@ pending credit 只防重复选择、不能售给 writer。只有物理 absence �
 底层 Provider allocator 仍独立维护物理使用量和硬水位，用于覆盖共享 workload、碎片以及 KVCM metadata 无法观察的
 介质开销。
 
-backend 的物理回收能力沿用现有实现。例如当前开源 NFS backend 的 `Delete` 返回成功但实际是 no-op，KVMeta
-不会为 EMB 侧路改变其共享行为。这种 backend **不能单独作为有界容量的生产 Cache**：自动 LRU 只能让 metadata
-容量收敛，真实磁盘会持续增长，而且 `physical_delete_uncertain_*` 也不会报警。只有部署了可证明生效的 namespace
-TTL、定期整 namespace 轮换/sweeper，且底层容量有独立硬保护时才可使用；否则必须换用支持真实物理删除的 backend。
+backend 的物理回收能力必须给出终态证明，不能把“请求已接受”当成“容量已释放”。开源 NFS 的 legacy `Delete`
+仍保持原有 no-op 语义，避免改变普通 fixed-block KV-cache 链路；但 NFS backend 额外实现了 KVMeta side capability：先保留
+legacy hook/fault-injection 行为，再对经过 namespace 校验的 singleton file 执行删除，`fsync` 最近仍存在的对象父目录，
+并确认路径已经不存在。目录持久化屏障失败时即使当前路径已消失也保留 tombstone/usage 并幂等重试，避免 metadata 先
+完成持久化、故障后却留下无 ledger 的孤儿文件。只有该 exact 终态成立后，它还会 best-effort 清理每个对象专属的
+key-hash、instance-hash 两层空目录，保留 `kvmeta/` namespace
+根；并发 generation 使目录非空时安全停止，由最后一个 generation 再清理，避免高基数 cache key 长期泄漏 inode。只有
+exact 结果为 `OK` 时才能移除 tombstone、释放 usage。其他 backend 若不能通过 side capability 明确证明物理 absence，
+不能单独作为有界容量的生产 Cache。当前实现不会从 side capability 退回普通同步 `Delete`；缺少该
+能力的 backend 必须先补齐可测试的 exact absence adapter，或依赖独立 TTL/sweeper 做离线 orphan 治理，但仍禁止进入
+新 KVMeta storage candidates。
+
+NFS 的终态证明是“generation 路径持久化不可达”，不是全局 open-file 引用计数。POSIX/NFS 允许已经打开该 inode 的
+reader 在 `unlink` 后继续持有数据块；自动 Reclaimer 依靠先持久化 reader fence、再等待配置的 read grace，使正常 reader
+在删除前关闭 descriptor。grace 必须覆盖实测最坏读取时延和时钟漂移，挂死 reader/显式无宽限 `Remove` 导致的延迟释放由
+文件系统硬容量兜底，并可能触发额外回收；因此 allocator/statfs 等物理水位仍是真实容量的最后防线，不能只看 KVCM
+logical usage。
 
 ### 12.2 读回收竞态与内容完整性
 

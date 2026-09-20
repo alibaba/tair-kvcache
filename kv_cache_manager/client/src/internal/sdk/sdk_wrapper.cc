@@ -167,7 +167,7 @@ ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &cl
         std::unordered_set<std::string> unique_storage_names;
         unique_storage_names.reserve(storage_configs_.size());
         for (const auto &storage_config : storage_configs_) {
-            if (!storage_config || !SupportsKvMetaCallerOwnedBufferLifetime(storage_config->type()) ||
+            if (!storage_config || !SupportsKvMetaAdmission(storage_config->type()) ||
                 !IsCanonicalKvMetaBackendName(storage_config->global_unique_name()) ||
                 !unique_storage_names.insert(storage_config->global_unique_name()).second ||
                 !HasSafeConfiguredKvMetaNamespace(*storage_config)) {
@@ -341,9 +341,8 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
         auto group_actual_uris = std::make_shared<std::vector<DataStorageUri>>();
         group_results.push_back(group_actual_uris);
         // Capture group by value to prevent use-after-free on timeout
-        tasks.push_back([group, group_actual_uris]() {
-            return group.sdk->Put(group.uris, group.buffers, group_actual_uris);
-        });
+        tasks.push_back(
+            [group, group_actual_uris]() { return group.sdk->Put(group.uris, group.buffers, group_actual_uris); });
     }
 
     // 与 Get 同理：静态预算已在 Init 时注入后端。
@@ -487,8 +486,7 @@ ClientErrorCode SdkWrapper::ValidateKvMetaObjects(const std::vector<DataStorageU
         }
         const auto storage_config = sdk_storage_configs_.find(uri.GetHostName());
         if (storage_config == sdk_storage_configs_.end() || !storage_config->second ||
-            !SupportsKvMetaCallerOwnedBufferLifetime(storage_type->second) ||
-            !UriMatchesStorageType(uri, storage_type->second) ||
+            !SupportsKvMetaAdmission(storage_type->second) || !UriMatchesStorageType(uri, storage_type->second) ||
             !HasOwnedKvMetaAllocationShape(uri, storage_type->second) ||
             !UriMatchesConfiguredKvMetaNamespace(uri, storage_type->second, *storage_config->second)) {
             KVCM_LOG_WARN("KVMeta URI scheme, ownership, or configured namespace does not match backend: %s",
@@ -576,8 +574,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
 
     // Check capacity before submitting any tasks
     if (wait_task_thread_pool_->isFull()) {
-        KVCM_LOG_WARN("run %s parallel failed, wait task thread pool is full",
-                      getOpTypeString(op_type).c_str());
+        KVCM_LOG_WARN("run %s parallel failed, wait task thread pool is full", getOpTypeString(op_type).c_str());
         return ER_THREADPOOL_ERROR;
     }
 
@@ -780,7 +777,7 @@ ClientErrorCode SdkWrapper::PrepareSharedMemoryRegistration(const SharedMemoryRe
         return ER_INVALID_PARAMS;
     }
 
-    struct stat file_stat{};
+    struct stat file_stat {};
     if (fstat(shared_memory_registration.fd, &file_stat) != 0 || file_stat.st_size < 0 ||
         static_cast<uintmax_t>(file_stat.st_size) < shared_memory_registration.size) {
         KVCM_LOG_WARN("shared memory fd is invalid or smaller than the registered range");

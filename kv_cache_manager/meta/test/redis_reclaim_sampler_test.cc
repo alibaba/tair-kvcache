@@ -1,5 +1,6 @@
 #include <chrono>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -147,16 +148,66 @@ TEST_F(RedisReclaimSamplerTest, TestOverflowBufferHasHardLimit) {
     for (int key = 0; key < 5000; ++key) {
         page.emplace_back("instance:" + std::to_string(key));
     }
-    ExpectScan("0", "9", std::move(page));
+    ExpectScan("0", "9", page);
     KeyTypeVec keys;
     ASSERT_EQ(EC_OK, Sample("instance:", 1, keys));
     ASSERT_EQ((KeyTypeVec{0}), keys);
 
-    ExpectScan("9", "0", {}, "904");
+    // The bounded overflow queue must not silently discard the rest of this
+    // Redis page. Resume at the saved page offset, then advance the cursor.
+    // The second caller asks for many more keys, but resuming the saved page
+    // must retain its original COUNT=128 or Redis may repartition the cursor.
+    ExpectScan("0", "9", std::move(page), "128");
+    ExpectScan("9", "0", {}, "128");
     ASSERT_EQ(EC_OK, Sample("instance:", 5000, keys));
-    ASSERT_EQ(4096, keys.size());
+    ASSERT_EQ(4999, keys.size());
     EXPECT_EQ(1, keys.front());
-    EXPECT_EQ(4096, keys.back());
+    EXPECT_EQ(4999, keys.back());
+}
+
+TEST_F(RedisReclaimSamplerTest, TestOversizedScanPageResumesWithoutStarvingTail) {
+    std::vector<std::optional<std::string>> page(8192, "instance:1");
+    page.emplace_back("instance:2");
+    ExpectScan("0", "0", page);
+    KeyTypeVec keys;
+    EXPECT_EQ(EC_OK, Sample("instance:", 2, keys));
+    EXPECT_EQ((KeyTypeVec{1}), keys);
+
+    ExpectScan("0", "0", std::move(page));
+    EXPECT_EQ(EC_OK, Sample("instance:", 1, keys));
+    EXPECT_EQ((KeyTypeVec{2}), keys);
+}
+
+TEST_F(RedisReclaimSamplerTest, TestFailedPageReplayRollsBackSavedOffset) {
+    std::vector<std::string> page(8192, "instance:1");
+    page.emplace_back("instance:2");
+    int scan_calls = 0;
+    const RedisReclaimSampler::ScanCallback scan = [&](const std::string &,
+                                                       const std::string &cursor,
+                                                       const int64_t scan_count,
+                                                       std::string &out_next_cursor,
+                                                       std::vector<std::string> &out_keys) {
+        EXPECT_EQ("0", cursor);
+        EXPECT_EQ(4096, scan_count);
+        ++scan_calls;
+        if (scan_calls == 2) {
+            throw std::runtime_error("injected replay failure");
+        }
+        out_next_cursor = "0";
+        out_keys = page;
+        return EC_OK;
+    };
+
+    KeyTypeVec keys;
+    ASSERT_EQ(EC_OK, sampler_.Sample(scan, "instance:", 4096, keys));
+    ASSERT_EQ((KeyTypeVec{1}), keys);
+
+    EXPECT_EQ(EC_ERROR, sampler_.Sample(scan, "instance:", 1, keys));
+    EXPECT_TRUE(keys.empty());
+
+    EXPECT_EQ(EC_OK, sampler_.Sample(scan, "instance:", 1, keys));
+    EXPECT_EQ((KeyTypeVec{2}), keys);
+    EXPECT_EQ(3, scan_calls);
 }
 
 TEST_F(RedisReclaimSamplerTest, TestMalformedCacheKeyDoesNotBlockValidCandidates) {
@@ -164,6 +215,22 @@ TEST_F(RedisReclaimSamplerTest, TestMalformedCacheKeyDoesNotBlockValidCandidates
     KeyTypeVec keys;
     EXPECT_EQ(EC_OK, Sample("instance:", 2, keys));
     EXPECT_EQ((KeyTypeVec{17}), keys);
+}
+
+TEST_F(RedisReclaimSamplerTest, TestRejectsNonCanonicalAndOutOfRangeCacheKeys) {
+    ExpectScan("0",
+               "0",
+               {"instance:01",
+                "instance:+1",
+                "instance: 1",
+                "instance:-0",
+                "instance:9223372036854775808",
+                "instance:-2",
+                "instance:0",
+                "instance:2"});
+    KeyTypeVec keys;
+    EXPECT_EQ(EC_OK, Sample("instance:", 8, keys));
+    EXPECT_EQ((KeyTypeVec{-2, 0, 2}), keys);
 }
 
 TEST_F(RedisReclaimSamplerTest, TestCompletedCycleRestartsAtBaseCursor) {
@@ -213,6 +280,47 @@ TEST_F(RedisReclaimSamplerTest, TestScanFailureRestoresDrainedOverflow) {
     EXPECT_EQ((KeyTypeVec{3}), keys);
 }
 
+TEST_F(RedisReclaimSamplerTest, TestCallbackExceptionRestoresCursorAndDrainedOverflow) {
+    ExpectScan("0", "9", {"instance:1", "instance:2"});
+    KeyTypeVec keys;
+    ASSERT_EQ(EC_OK, Sample("instance:", 1, keys));
+    ASSERT_EQ((KeyTypeVec{1}), keys);
+
+    const RedisReclaimSampler::ScanCallback throwing_scan = [](const std::string &,
+                                                               const std::string &cursor,
+                                                               const int64_t,
+                                                               std::string &,
+                                                               std::vector<std::string> &) -> ErrorCode {
+        EXPECT_EQ("9", cursor);
+        throw std::runtime_error("injected scan failure");
+    };
+    keys = {999};
+    EXPECT_EQ(EC_ERROR, sampler_.Sample(throwing_scan, "instance:", 2, keys));
+    EXPECT_TRUE(keys.empty());
+
+    EXPECT_EQ(EC_OK, Sample("instance:", 1, keys));
+    EXPECT_EQ((KeyTypeVec{2}), keys);
+
+    ExpectScan("9", "0", {"instance:3"});
+    EXPECT_EQ(EC_OK, Sample("instance:", 1, keys));
+    EXPECT_EQ((KeyTypeVec{3}), keys);
+}
+
+TEST_F(RedisReclaimSamplerTest, TestUnknownCallbackExceptionIsContained) {
+    const RedisReclaimSampler::ScanCallback throwing_scan = [](const std::string &,
+                                                               const std::string &,
+                                                               const int64_t,
+                                                               std::string &,
+                                                               std::vector<std::string> &) -> ErrorCode { throw 7; };
+    KeyTypeVec keys{999};
+    EXPECT_EQ(EC_ERROR, sampler_.Sample(throwing_scan, "instance:", 1, keys));
+    EXPECT_TRUE(keys.empty());
+
+    ExpectScan("0", "0", {"instance:4"});
+    EXPECT_EQ(EC_OK, Sample("instance:", 1, keys));
+    EXPECT_EQ((KeyTypeVec{4}), keys);
+}
+
 TEST_F(RedisReclaimSamplerTest, TestUnexpectedPrefixRollsBackCursor) {
     ExpectScan("0", "5", {"other:1"});
     KeyTypeVec keys;
@@ -259,6 +367,25 @@ TEST_F(RedisReclaimSamplerTest, TestResetDropsCursorAndBufferedKeys) {
     ExpectScan("0", "0", {"instance:9"});
     EXPECT_EQ(EC_OK, Sample("instance:", 1, keys));
     EXPECT_EQ((KeyTypeVec{9}), keys);
+}
+
+TEST_F(RedisReclaimSamplerTest, TestResetDropsPartialPageOffset) {
+    std::vector<std::optional<std::string>> first_page(8192, "instance:1");
+    first_page.emplace_back("instance:2");
+    ExpectScan("0", "0", std::move(first_page), "4096");
+    KeyTypeVec keys;
+    ASSERT_EQ(EC_OK, Sample("instance:", 4096, keys));
+    ASSERT_EQ((KeyTypeVec{1}), keys);
+
+    sampler_.Reset();
+
+    // Keep the replay page large enough that a stale offset would still be in
+    // range and would incorrectly start at the final key instead of index 0.
+    std::vector<std::optional<std::string>> second_page(8192, "instance:3");
+    second_page.emplace_back("instance:4");
+    ExpectScan("0", "0", std::move(second_page));
+    EXPECT_EQ(EC_OK, Sample("instance:", 1, keys));
+    EXPECT_EQ((KeyTypeVec{3}), keys);
 }
 
 } // namespace kv_cache_manager

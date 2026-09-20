@@ -5,6 +5,8 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <limits>
@@ -48,6 +50,18 @@
 namespace kv_cache_manager {
 
 namespace {
+
+class ScopedFilesystemCleanup {
+public:
+    explicit ScopedFilesystemCleanup(std::filesystem::path path) : path_(std::move(path)) {}
+    ~ScopedFilesystemCleanup() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
+
+private:
+    std::filesystem::path path_;
+};
 
 void ReplaceKvMetaObjectNonce(CacheLocation &location, char fill) {
     DataStorageUri uri(location.location_specs().front().uri());
@@ -346,7 +360,7 @@ public:
     std::size_t delete_calls{0};
 };
 
-class DuplicateSingletonCreateTairMempoolBackend : public DataStorageBackend {
+class DuplicateSingletonCreateTairMempoolBackend : public DataStorageBackend, public KvMetaDataStorageBackendExtension {
 public:
     static constexpr const char *kProviderIncarnation = "01234567-89ab-4def-8abc-0123456789ab";
 
@@ -396,6 +410,14 @@ public:
         return std::vector<ErrorCode>(storage_uris.size(), EC_OK);
     }
 
+    std::vector<ErrorCode> DeleteAndConfirmAbsent(const std::vector<DataStorageUri> &storage_uris,
+                                                  const std::string &trace_id,
+                                                  std::function<void()> cb) override {
+        return Delete(storage_uris, trace_id, std::move(cb));
+    }
+
+    std::int64_t GetFailedWriteCleanupGraceSeconds() const noexcept override { return 0; }
+
     std::size_t delete_calls{0};
 
     std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) override {
@@ -411,7 +433,7 @@ public:
     }
 };
 
-class ConfigurableMediaTairMempoolBackend : public DataStorageBackend {
+class ConfigurableMediaTairMempoolBackend : public DataStorageBackend, public KvMetaDataStorageBackendExtension {
 public:
     ConfigurableMediaTairMempoolBackend(std::shared_ptr<MetricsRegistry> metrics_registry,
                                         DataStorageType type,
@@ -461,6 +483,14 @@ public:
         }
         return std::vector<ErrorCode>(storage_uris.size(), EC_OK);
     }
+
+    std::vector<ErrorCode> DeleteAndConfirmAbsent(const std::vector<DataStorageUri> &storage_uris,
+                                                  const std::string &trace_id,
+                                                  std::function<void()> cb) override {
+        return Delete(storage_uris, trace_id, std::move(cb));
+    }
+
+    std::int64_t GetFailedWriteCleanupGraceSeconds() const noexcept override { return 0; }
 
     std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) override {
         return std::vector<bool>(storage_uris.size(), true);
@@ -597,7 +627,7 @@ private:
     bool release_delete_{false};
 };
 
-class QuarantinedWriteNfsBackend : public NfsBackend, public KvMetaDataStorageBackendExtension {
+class QuarantinedWriteNfsBackend : public NfsBackend {
 public:
     explicit QuarantinedWriteNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry,
                                         std::int64_t cleanup_grace_seconds = 1)
@@ -635,7 +665,7 @@ private:
     std::atomic<std::size_t> delete_calls_{0};
 };
 
-class ProvisionalCommitNfsBackend : public NfsBackend, public KvMetaDataStorageBackendExtension {
+class ProvisionalCommitNfsBackend : public NfsBackend {
 public:
     explicit ProvisionalCommitNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
         : NfsBackend(std::move(metrics_registry)) {}
@@ -5020,6 +5050,50 @@ TEST_F(KvMetaManagerTest, ReclaimerEvictsTheLeastRecentlyUsedCommittedObjectAtTh
     EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.blocked_group_count").Get());
 }
 
+TEST_F(KvMetaManagerTest, ReclaimerPhysicallyDeletesNfsObjectBeforeReleasingUsage) {
+    constexpr const char *kGroup = "reclaim-nfs-physical-group";
+    constexpr const char *kInstance = "reclaim-nfs-physical-instance";
+    constexpr const char *kKey = "physical-nfs-object";
+    constexpr std::uint64_t kSize = 90;
+    CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
+
+    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstance, {kKey}, {kSize}, 30);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(1, start.locations.size());
+    ASSERT_EQ(1, start.locations.front().specs.size());
+    const DataStorageUri uri(start.locations.front().specs.front().second);
+    ASSERT_TRUE(uri.Valid());
+    ASSERT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, start.locations.front().type);
+    const std::filesystem::path object_path(uri.GetPath());
+    const ScopedFilesystemCleanup cleanup(object_path);
+    std::error_code mkdir_ec;
+    std::filesystem::create_directories(object_path.parent_path(), mkdir_ec);
+    ASSERT_FALSE(mkdir_ec) << mkdir_ec.message();
+    ASSERT_TRUE(std::filesystem::is_directory(object_path.parent_path()));
+    {
+        std::ofstream output(object_path, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(output.good());
+        output << std::string(kSize, 'e');
+        ASSERT_TRUE(output.good());
+    }
+    ASSERT_EQ(kSize, std::filesystem::file_size(object_path));
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, start.write_session_id, {true}));
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    ASSERT_EQ(kSize, indexer->GetStorageUsage());
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0 && !std::filesystem::exists(object_path); },
+                          std::chrono::seconds(2)));
+
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {kKey});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_FALSE(values.front().found);
+    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.reclaimed_object_count").Get());
+}
+
 TEST_F(KvMetaManagerTest, ReclaimerNeverDeletesACorruptRootPathOwnershipRecord) {
     constexpr const char *kGroup = "reclaim-corrupt-root-group";
     constexpr const char *kInstance = "reclaim-corrupt-root-instance";
@@ -6347,6 +6421,58 @@ TEST_F(KvMetaManagerTest, RegistrationRejectsStorageWithoutExactObjectOwnership)
     EXPECT_EQ((std::vector<bool>{true}), hit.key_mask);
     EXPECT_EQ(EC_CONFIG_ERROR, manager_->StartWrite(&request_context_, kHotInstance, {"new-object"}, {17}, 30).first);
     EXPECT_EQ(EC_OK, registry_manager_->data_storage_manager()->UnRegisterStorage(kStorage));
+}
+
+TEST_F(KvMetaManagerTest, RegistrationAndHotAdmissionRequireRuntimeExactLifecycleCapability) {
+    class LegacyNfsBackend final : public DataStorageBackend {
+    public:
+        explicit LegacyNfsBackend(std::shared_ptr<MetricsRegistry> metrics) : DataStorageBackend(std::move(metrics)) {}
+        DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_NFS; }
+        bool Available() override { return IsOpen() && IsAvailable(); }
+        double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
+        ErrorCode DoOpen(const StorageConfig &, const std::string &) override {
+            SetOpen(true);
+            SetAvailable(true);
+            return EC_OK;
+        }
+        ErrorCode Close() override { return EC_OK; }
+        std::vector<std::pair<ErrorCode, DataStorageUri>>
+        Create(const std::vector<std::string> &keys, size_t, const std::string &, std::function<void()>) override {
+            create_calls += keys.size();
+            return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_OK, DataStorageUri{}});
+        }
+        std::vector<ErrorCode>
+        Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+        std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<bool>(uris.size(), false);
+        }
+        std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+        std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+        std::size_t create_calls{0};
+    };
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    const auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto legacy = std::make_shared<LegacyNfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, legacy->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = legacy;
+    }
+
+    EXPECT_EQ(EC_CONFIG_ERROR,
+              manager_->RegisterInstance(&request_context_, "default", "legacy-nfs-instance", "emb-test").first);
+    EXPECT_EQ(EC_CONFIG_ERROR,
+              manager_->StartWrite(&request_context_, kInstanceId, {"must-not-allocate"}, {17}, 30).first);
+    EXPECT_EQ(0u, legacy->create_calls);
 }
 
 TEST_F(KvMetaManagerTest, RegistrationReturnsOnlyExactObjectStorageCandidates) {

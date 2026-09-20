@@ -14,6 +14,7 @@ import logging
 import threading
 import uuid
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import islice
@@ -460,7 +461,13 @@ class KvMetaObjectClient:
         if not isinstance(config, KvMetaObjectClientConfig):
             raise TypeError("config must be a KvMetaObjectClientConfig")
         self.config = config
-        self._lock = threading.Lock()
+        self._lifecycle = threading.Condition(threading.Lock())
+        # Tokens make admission cleanup idempotent even if Python injects a
+        # BaseException immediately after the reservation is recorded. A
+        # plain counter plus a separately assigned "admitted" flag has a
+        # bytecode-sized interruption window that can strand close forever.
+        self._active_operations = set()
+        self._closing = False
         self._closed = False
         self._registration_owner = registration_owner
         # Assign an injected client before validating the binding module so an
@@ -557,8 +564,26 @@ class KvMetaObjectClient:
         return client
 
     def _check_open_locked(self) -> None:
-        if self._closed or self._client is None:
+        if self._closing or self._closed or self._client is None:
             raise RuntimeError("KvMetaObjectClient is closed")
+
+    @contextmanager
+    def _operation(self):
+        """Keep native state alive without serializing independent I/O."""
+
+        token = object()
+        try:
+            with self._lifecycle:
+                self._check_open_locked()
+                self._active_operations.add(token)
+                client = self._client
+            yield client
+        finally:
+            with self._lifecycle:
+                was_active = token in self._active_operations
+                self._active_operations.discard(token)
+                if was_active and not self._active_operations:
+                    self._lifecycle.notify_all()
 
     def _validate_buffers(self, objects: Any) -> Tuple[KvMetaObjectBuffer, ...]:
         materialized = _snapshot_sequence(objects, "KVMeta object buffers")
@@ -633,8 +658,7 @@ class KvMetaObjectClient:
         resolved_trace_id = self._resolve_trace_id(operation, trace_id)
         method_name = "SaveObjects" if operation == "save" else "LoadObjects"
 
-        with self._lock:
-            self._check_open_locked()
+        with self._operation() as client:
             for batch_index, (begin, end) in enumerate(batches):
                 batch_trace = self._batch_trace_id(
                     resolved_trace_id, batch_index, len(batches)
@@ -644,7 +668,7 @@ class KvMetaObjectClient:
                     # malformed/dynamically proxied binding can throw from
                     # attribute lookup even though it passed initialization
                     # inspection; such provider details must not escape.
-                    native_method = getattr(self._client, method_name)
+                    native_method = getattr(client, method_name)
                     code = native_method(
                         batch_trace,
                         list(keys[begin:end]),
@@ -788,14 +812,13 @@ class KvMetaObjectClient:
         failed_batches = 0
         confirmed_items = 0
         any_unknown = False
-        with self._lock:
-            self._check_open_locked()
+        with self._operation() as client:
             for batch_index, (begin, end) in enumerate(batches):
                 code = None
                 cause = None
                 unknown = False
                 try:
-                    code = self._client.Remove(
+                    code = client.Remove(
                         self._batch_trace_id(
                             resolved_trace_id, batch_index, len(batches)
                         ),
@@ -842,26 +865,46 @@ class KvMetaObjectClient:
     def close(self) -> None:
         """Wait for any in-flight call and release the native client once."""
 
-        with self._lock:
+        with self._lifecycle:
+            while self._closing and not self._closed:
+                self._lifecycle.wait_for(
+                    lambda: self._closed or not self._closing
+                )
             if self._closed:
                 return
-            client = self._client
-            self._client = None
-            self._closed = True
+            client = None
             try:
-                for method_name in ("close", "Close"):
-                    close = getattr(client, method_name, None)
-                    if callable(close):
-                        close()
-                        break
-            finally:
-                # Ensure native destruction happens while registered memory is
-                # still owned, including bindings without an explicit close.
-                client = None
+                self._closing = True
+                self._lifecycle.wait_for(lambda: not self._active_operations)
+                client = self._client
+                self._client = None
+            except BaseException:
+                # A signal or task cancellation must not strand close
+                # ownership. Wake another closer and keep the still-live
+                # client usable after this interrupted attempt.
+                if client is not None and self._client is None:
+                    self._client = client
+                self._closing = False
+                self._lifecycle.notify_all()
+                raise
+        try:
+            for method_name in ("close", "Close"):
+                close = getattr(client, method_name, None)
+                if callable(close):
+                    close()
+                    break
+        finally:
+            # Ensure native destruction happens while registered memory is
+            # still owned, including bindings without an explicit close.
+            client = None
+            with self._lifecycle:
                 self._registration_owner = None
+                self._closed = True
+                self._closing = False
+                self._lifecycle.notify_all()
 
     def __enter__(self) -> "KvMetaObjectClient":
-        with self._lock:
+        with self._lifecycle:
             self._check_open_locked()
         return self
 

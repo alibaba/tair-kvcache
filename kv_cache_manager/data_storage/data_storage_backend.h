@@ -85,10 +85,11 @@ private:
     std::atomic_bool is_available_ = false;
 };
 
-// Optional side interface for KVMeta exact-object lifecycle semantics. Keeping
-// it separate preserves DataStorageBackend's ABI and the fixed-block KV-cache
-// vtable. Backends that do not implement it retain the historical synchronous
-// Delete contract and a zero failed-write grace.
+// Side interface for KVMeta exact-object lifecycle semantics. Keeping it
+// separate preserves DataStorageBackend's ABI and the fixed-block KV-cache
+// vtable. New KVMeta admission requires this interface; a legacy backend that
+// does not implement it may still be recognized while recovering old metadata,
+// but its ordinary Delete result is not proof of physical absence.
 class KvMetaDataStorageBackendExtension {
 public:
     virtual ~KvMetaDataStorageBackendExtension() = default;
@@ -101,8 +102,7 @@ public:
                                                           std::function<void()> cb) = 0;
 
     // A transport with already-submitted I/O after a failed write returns a
-    // positive quarantine. Ordinary synchronous backends need no extension and
-    // therefore keep the zero-grace behavior supplied by KVMeta's fallback.
+    // positive quarantine. Synchronous exact-object backends return zero.
     virtual std::int64_t GetFailedWriteCleanupGraceSeconds() const noexcept = 0;
 
     // Backends whose safe KVMeta allocation protocol differs from their

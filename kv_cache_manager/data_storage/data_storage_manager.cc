@@ -8,6 +8,7 @@
 #include "kv_cache_manager/data_storage/dummy_backend.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/data_storage/hf3fs_backend.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #ifdef ENABLE_MOONCAKE
 #include "kv_cache_manager/data_storage/mooncake_backend.h"
 #endif
@@ -246,11 +247,25 @@ DataStorageManager::CreateForKvMeta(RequestContext *request_context,
         KVCM_LOG_WARN("Storage name: %s is unavailable, reject KVMeta create", unique_name.c_str());
         return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOENT, DataStorageUri{}});
     }
+    const auto extension = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(storage_backend);
+    const StorageConfig &storage_config = storage_backend->GetStorageConfig();
+    if (!SupportsKvMetaAdmission(storage_backend->GetType()) || !extension) {
+        KVCM_LOG_WARN("Storage name: %s lacks the KVMeta exact-object lifecycle capability", unique_name.c_str());
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}});
+    }
+    if (storage_config.type() != storage_backend->GetType() || storage_config.global_unique_name() != unique_name ||
+        !HasSafeConfiguredKvMetaNamespace(storage_config)) {
+        // Revalidate at the final dispatch boundary. The instance group and
+        // selected backend can be changed after manager-side admission; never
+        // let that race silently fall back to a legacy Create implementation
+        // or redirect an exact object outside the registered namespace.
+        KVCM_LOG_WARN("Storage name: %s lacks a safe KVMeta exact-object registration", unique_name.c_str());
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_CORRUPTION, DataStorageUri{}});
+    }
     const auto dsmc = storage_backend->GetMetricsCollector();
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);
-    auto extension = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(storage_backend);
     std::vector<std::pair<ErrorCode, DataStorageUri>> create_result;
-    if (extension && extension->HasDedicatedKvMetaCreate()) {
+    if (extension->HasDedicatedKvMetaCreate()) {
         create_result = extension->CreateForKvMeta(keys, size_per_key, trace_id, std::move(cb));
     } else {
         create_result = storage_backend->Create(keys, size_per_key, trace_id, std::move(cb));
@@ -280,6 +295,12 @@ std::vector<ErrorCode> DataStorageManager::CommitKvMetaCreate(RequestContext *re
     if (iter == storage_map_.end() || !iter->second || !iter->second->Available()) {
         KVCM_LOG_WARN("Storage name: %s is unavailable, reject KVMeta allocation commit", unique_name.c_str());
         return std::vector<ErrorCode>(allocation_keys.size(), EC_NOENT);
+    }
+    const StorageConfig &storage_config = iter->second->GetStorageConfig();
+    if (!SupportsKvMetaAdmission(iter->second->GetType()) || storage_config.type() != iter->second->GetType() ||
+        storage_config.global_unique_name() != unique_name || !HasSafeConfiguredKvMetaNamespace(storage_config)) {
+        KVCM_LOG_WARN("Storage name: %s has a corrupt KVMeta exact-object registration", unique_name.c_str());
+        return std::vector<ErrorCode>(allocation_keys.size(), EC_CORRUPTION);
     }
     const auto extension = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(iter->second);
     if (!extension || !extension->RequiresKvMetaCreateCommit()) {
@@ -333,11 +354,26 @@ std::vector<ErrorCode> DataStorageManager::DeleteAndConfirmAbsent(RequestContext
         return {};
     }
     auto storage_backend = iter->second;
-    auto kv_meta_extension = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(storage_backend);
-    if (kv_meta_extension) {
-        return kv_meta_extension->DeleteAndConfirmAbsent(storage_uris, trace_id, std::move(cb));
+    if (!storage_backend) {
+        KVCM_LOG_WARN("Storage name: %s has a null backend during KVMeta exact delete", unique_name.c_str());
+        return std::vector<ErrorCode>(storage_uris.size(), EC_CORRUPTION);
     }
-    return storage_backend->Delete(storage_uris, trace_id, std::move(cb));
+    auto kv_meta_extension = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(storage_backend);
+    const StorageConfig &storage_config = storage_backend->GetStorageConfig();
+    if (!kv_meta_extension) {
+        // A legacy Delete success can mean only that a request was accepted.
+        // Treating it as confirmed absence would remove the durable tombstone
+        // and release quota while physical bytes may still exist. This method
+        // is KVMeta-only, so failing closed does not alter fixed-block Delete.
+        KVCM_LOG_WARN("Storage name: %s cannot safely prove KVMeta physical absence", unique_name.c_str());
+        return std::vector<ErrorCode>(storage_uris.size(), EC_UNIMPLEMENTED);
+    }
+    if (storage_config.type() != storage_backend->GetType() || storage_config.global_unique_name() != unique_name ||
+        !HasSafeConfiguredKvMetaNamespace(storage_config)) {
+        KVCM_LOG_WARN("Storage name: %s has a corrupt KVMeta exact-object registration", unique_name.c_str());
+        return std::vector<ErrorCode>(storage_uris.size(), EC_CORRUPTION);
+    }
+    return kv_meta_extension->DeleteAndConfirmAbsent(storage_uris, trace_id, std::move(cb));
 }
 
 std::vector<ErrorCode> DataStorageManager::Copy(RequestContext *request_context,
@@ -411,7 +447,8 @@ void DataStorageManager::RecordWriteBytes(const std::string &unique_name, std::u
     auto iter = storage_map_.find(unique_name); // iter->second 指向 DataStorageBackend 对象
     if (iter == storage_map_.end() || iter->second == nullptr) {
         KVCM_LOG_WARN("RecordWriteBytes: storage [%s] not found, drop %llu bytes",
-                      unique_name.c_str(), static_cast<unsigned long long>(bytes));
+                      unique_name.c_str(),
+                      static_cast<unsigned long long>(bytes));
         return;
     }
     const auto collector = iter->second->GetMetricsCollector(); // 指向 DataStorageMetricsCollector 对象

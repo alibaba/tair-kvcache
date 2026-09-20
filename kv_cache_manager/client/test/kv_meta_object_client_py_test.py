@@ -146,11 +146,17 @@ def _config(**overrides):
     return KvMetaObjectClientConfig(**values)
 
 
-def _client(config=None, native=None, pybind=None, registration_owner=None):
+def _client(
+    config=None,
+    native=None,
+    pybind=None,
+    registration_owner=None,
+    client_class=KvMetaObjectClient,
+):
     native = native or _FakeClient()
     pybind = pybind or _FakePybind(native)
     return (
-        KvMetaObjectClient(
+        client_class(
             config or _config(),
             registration_owner=registration_owner,
             _object_client=native,
@@ -814,7 +820,7 @@ class KvMetaObjectClientTest(unittest.TestCase):
                     invoke()
         self.assertEqual(native.calls, [])
 
-    def test_operations_are_serialized_across_threads(self):
+    def test_operations_remain_concurrent_across_threads(self):
         save_entered = threading.Event()
         load_entered = threading.Event()
         release_save = threading.Event()
@@ -840,7 +846,7 @@ class KvMetaObjectClientTest(unittest.TestCase):
         save_thread.start()
         self.assertTrue(save_entered.wait(timeout=2))
         load_thread.start()
-        self.assertFalse(load_entered.wait(timeout=0.1))
+        self.assertTrue(load_entered.wait(timeout=2))
         release_save.set()
         save_thread.join(timeout=2)
         load_thread.join(timeout=2)
@@ -851,6 +857,144 @@ class KvMetaObjectClientTest(unittest.TestCase):
         self.assertEqual(
             [call[0] for call in native.calls], ["SaveObjects", "LoadObjects"]
         )
+
+    def test_close_rejects_new_calls_while_waiting_for_inflight_call(self):
+        entered = threading.Event()
+        release = threading.Event()
+        close_entered = threading.Event()
+
+        class BlockingClient(_FakeClient):
+            def SaveObjects(self, trace_id, keys, sizes, buffers):
+                entered.set()
+                release.wait(timeout=5)
+                return _Code.ER_OK
+
+            def close(self):
+                close_entered.set()
+                super().close()
+
+        native = BlockingClient()
+        client, _, _ = _client(native=native)
+        save_thread = threading.Thread(target=client.save, args=(["key"], [_Tensor()]))
+        close_thread = threading.Thread(target=client.close)
+
+        save_thread.start()
+        self.assertTrue(entered.wait(timeout=2))
+        close_thread.start()
+        with client._lifecycle:
+            self.assertTrue(
+                client._lifecycle.wait_for(lambda: client._closing, timeout=2)
+            )
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            client.load(["later"], [_Tensor()])
+        self.assertFalse(close_entered.is_set())
+
+        release.set()
+        save_thread.join(timeout=2)
+        close_thread.join(timeout=2)
+        self.assertFalse(save_thread.is_alive())
+        self.assertFalse(close_thread.is_alive())
+        self.assertTrue(close_entered.is_set())
+
+    def test_concurrent_close_calls_release_native_client_once(self):
+        close_entered = threading.Event()
+        release_close = threading.Event()
+
+        class BlockingCloseClient(_FakeClient):
+            def close(self):
+                self.close_calls += 1
+                close_entered.set()
+                release_close.wait(timeout=5)
+                self.closed = True
+
+        native = BlockingCloseClient()
+        client, _, _ = _client(native=native)
+        first = threading.Thread(target=client.close)
+        second = threading.Thread(target=client.close)
+
+        first.start()
+        self.assertTrue(close_entered.wait(timeout=2))
+        second.start()
+        second.join(timeout=0.05)
+        self.assertTrue(second.is_alive())
+        release_close.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(native.close_calls, 1)
+
+    def test_interrupted_close_wait_releases_close_ownership(self):
+        class InterruptOnceCondition(threading.Condition):
+            def __init__(self):
+                super().__init__(threading.Lock())
+                self.interrupt = True
+
+            def wait_for(self, predicate, timeout=None):
+                if self.interrupt and not predicate():
+                    self.interrupt = False
+                    raise KeyboardInterrupt()
+                return super().wait_for(predicate, timeout)
+
+        client, native, _ = _client()
+        client._lifecycle = InterruptOnceCondition()
+        active_token = object()
+        client._active_operations.add(active_token)
+
+        with self.assertRaises(KeyboardInterrupt):
+            client.close()
+        self.assertFalse(client._closing)
+        self.assertFalse(client._closed)
+
+        client._active_operations.remove(active_token)
+        client.close()
+        self.assertTrue(native.closed)
+        self.assertEqual(native.close_calls, 1)
+
+    def test_interrupted_native_detach_restores_live_client(self):
+        class InterruptOnDetachClient(KvMetaObjectClient):
+            def __setattr__(self, name, value):
+                if (
+                    name == "_client"
+                    and value is None
+                    and self.__dict__.get("_interrupt_on_detach", False)
+                ):
+                    object.__setattr__(self, name, value)
+                    object.__setattr__(self, "_interrupt_on_detach", False)
+                    raise KeyboardInterrupt()
+                object.__setattr__(self, name, value)
+
+        client, native, _ = _client(client_class=InterruptOnDetachClient)
+        client._interrupt_on_detach = True
+
+        with self.assertRaises(KeyboardInterrupt):
+            client.close()
+        self.assertFalse(client._closing)
+        self.assertFalse(client._closed)
+        self.assertIs(client._client, native)
+
+        client.save(["key"], [_Tensor()])
+        client.close()
+        self.assertTrue(native.closed)
+        self.assertEqual(native.close_calls, 1)
+
+    def test_interrupted_operation_admission_does_not_strand_close(self):
+        class InterruptAfterAdd(set):
+            def add(self, item):
+                super().add(item)
+                raise KeyboardInterrupt()
+
+        client, native, _ = _client()
+        client._active_operations = InterruptAfterAdd()
+
+        with self.assertRaises(KeyboardInterrupt):
+            client.save(["key"], [_Tensor()])
+        self.assertFalse(client._active_operations)
+
+        client.close()
+        self.assertTrue(native.closed)
+        self.assertEqual(native.close_calls, 1)
 
     def test_close_waits_for_inflight_call_and_is_idempotent(self):
         entered = threading.Event()
