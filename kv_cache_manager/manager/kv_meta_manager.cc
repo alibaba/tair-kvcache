@@ -1615,14 +1615,12 @@ private:
             BytesToFit(group.quota().capacity(), group_usage, demand.requested_group_bytes, demand_possible);
         out.group_bytes = std::max(out.group_bytes, group_demand_pressure);
         demand_satisfied = demand_satisfied && group_demand_pressure == 0;
-        std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> visited_types{};
         for (const auto &quota : group.quota().quota_config()) {
             const auto base_type = ToBaseType(quota.storage_spec());
             const std::size_t type_index = ToIndex(base_type);
             if (base_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN || type_index >= usage_by_type.size()) {
                 continue;
             }
-            visited_types[type_index] = true;
             out.bytes_by_type[type_index] = std::max(
                 out.bytes_by_type[type_index], BytesToFree(quota.capacity(), threshold, usage_by_type[type_index]));
             const std::uint64_t type_demand_pressure = BytesToFit(quota.capacity(),
@@ -1631,33 +1629,42 @@ private:
                                                                   demand_possible);
             out.bytes_by_type[type_index] = std::max(out.bytes_by_type[type_index], type_demand_pressure);
             demand_satisfied = demand_satisfied && type_demand_pressure == 0;
-
-            const std::uint64_t backend_remaining = demand.backend_reclaim_bytes_by_type[type_index];
-            if (backend_remaining != 0) {
-                // A retired object is already unavailable to readers but its
-                // bytes do not help a physically full Provider until exact
-                // deletion is confirmed. Treat pending bytes as reserved work
-                // so request retries cannot schedule duplicate eviction.
-                demand_satisfied = false;
-                const std::uint64_t inflight = credit.bytes_by_type[type_index];
-                const std::uint64_t uncovered = SaturatingSub(backend_remaining, inflight);
-                if (uncovered != 0) {
-                    const std::uint64_t reclaimable = std::min(uncovered, usage_by_type[type_index]);
-                    out.bytes_by_type[type_index] =
-                        std::max(out.bytes_by_type[type_index], reclaimable);
-                    if (reclaimable == 0) {
-                        // There is no object of this type left that this KVCM
-                        // group is authorized to delete. A retry may publish a
-                        // fresh demand after external capacity changes.
-                        demand_possible = false;
-                    }
-                }
-            }
         }
-        for (std::size_t i = 0; i < demand.backend_reclaim_bytes_by_type.size(); ++i) {
-            if (demand.backend_reclaim_bytes_by_type[i] != 0 && !visited_types[i]) {
+
+        // Backend capacity is a physical constraint, independent of whether
+        // the group configured an optional logical per-storage-type quota.
+        // A Provider can return an authoritative no-allocation EC_NOSPC while
+        // the group has ample total quota and no type quota at all. Target the
+        // failed physical type in that case too; otherwise the demand would be
+        // discarded and a valid cache could never make progress.
+        for (std::size_t type_index = 1; type_index < demand.backend_reclaim_bytes_by_type.size(); ++type_index) {
+            const std::uint64_t backend_remaining = demand.backend_reclaim_bytes_by_type[type_index];
+            if (backend_remaining == 0) {
+                continue;
+            }
+            const auto type = static_cast<DataStorageType>(type_index);
+            if (ToBaseType(type) != type) {
                 demand_possible = false;
                 demand_satisfied = false;
+                continue;
+            }
+            // A retired object is already unavailable to readers but its
+            // bytes do not help a physically full Provider until exact
+            // deletion is confirmed. Treat pending bytes as reserved work so
+            // request retries cannot schedule duplicate eviction.
+            demand_satisfied = false;
+            const std::uint64_t inflight = credit.bytes_by_type[type_index];
+            const std::uint64_t uncovered = SaturatingSub(backend_remaining, inflight);
+            if (uncovered == 0) {
+                continue;
+            }
+            const std::uint64_t reclaimable = std::min(uncovered, usage_by_type[type_index]);
+            out.bytes_by_type[type_index] = std::max(out.bytes_by_type[type_index], reclaimable);
+            if (reclaimable == 0) {
+                // There is no object of this type left that this KVCM group is
+                // authorized to delete. A retry may publish a fresh demand
+                // after external capacity changes.
+                demand_possible = false;
             }
         }
         for (const auto &[instance_id, requested_keys] : demand.requested_keys_by_instance) {

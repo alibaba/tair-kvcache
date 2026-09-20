@@ -1145,7 +1145,8 @@ protected:
                             ReclaimPolicy reclaim_policy = ReclaimPolicy::POLICY_LRU,
                             ErrorCode expected_registration_ec = EC_OK,
                             DataStorageType storage_type = DataStorageType::DATA_STORAGE_TYPE_NFS,
-                            const std::string &storage_name = "nfs_01") {
+                            const std::string &storage_name = "nfs_01",
+                            bool configure_storage_type_quota = true) {
         const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
         ASSERT_EQ(EC_OK, group_ec);
         ASSERT_TRUE(default_group);
@@ -1179,8 +1180,11 @@ protected:
         object_group.set_global_quota_group_name(group_name + "-quota");
         object_group.set_version(1);
         object_group.set_cache_config(cache_config);
-        object_group.set_quota(
-            InstanceGroupQuota(capacity, {QuotaConfig(storage_type_capacity.value_or(capacity), storage_type)}));
+        std::vector<QuotaConfig> type_quotas;
+        if (configure_storage_type_quota) {
+            type_quotas.emplace_back(storage_type_capacity.value_or(capacity), storage_type);
+        }
+        object_group.set_quota(InstanceGroupQuota(capacity, type_quotas));
         ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, object_group));
         ASSERT_EQ(expected_registration_ec,
                   manager_->RegisterInstance(&request_context_, group_name, instance_id, "reclaim-test").first);
@@ -5828,6 +5832,62 @@ TEST_F(KvMetaManagerTest, ReclaimerCreatesPhysicalHeadroomAfterAuthoritativeBack
         std::chrono::seconds(2)));
 
     auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstance, {"new-backend-object"}, {40}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    ASSERT_EQ(1, retry.locations.size());
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, retry.write_session_id, {false}));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, BackendCapacityReclaimDoesNotRequireAStorageTypeQuota) {
+    constexpr const char *kGroup = "reclaim-backend-capacity-without-type-quota-group";
+    constexpr const char *kInstance = "reclaim-backend-capacity-without-type-quota-instance";
+    CreateReclaimGroup(kGroup,
+                       kInstance,
+                       1000,
+                       1.0,
+                       0,
+                       MetaIndexerConfig::kDefaultMaxKeyCount,
+                       std::nullopt,
+                       ReclaimPolicy::POLICY_LRU,
+                       EC_OK,
+                       DataStorageType::DATA_STORAGE_TYPE_NFS,
+                       "nfs_01",
+                       false);
+    CommitObject(kInstance, "old-backend-object", 70);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto capacity = std::make_shared<CapacityRejectingNfsBackend>(
+        metrics_registry_, CapacityRejectingNfsBackend::Mode::kOnce);
+    ASSERT_EQ(EC_OK, capacity->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = capacity;
+    }
+
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+
+    auto [blocked_ec, blocked] =
+        manager_->StartWrite(&request_context_, kInstance, {"new-backend-object"}, {40}, 30);
+    EXPECT_EQ(EC_NOSPC, blocked_ec);
+    EXPECT_TRUE(blocked.locations.empty());
+    EXPECT_EQ(1, capacity->CreateAttempts());
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.admission_demand_group_count").Get() == 0; },
+        std::chrono::seconds(2)));
+
+    auto [retry_ec, retry] =
+        manager_->StartWrite(&request_context_, kInstance, {"new-backend-object"}, {40}, 30);
     ASSERT_EQ(EC_OK, retry_ec);
     ASSERT_EQ(1, retry.locations.size());
     EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, retry.write_session_id, {false}));

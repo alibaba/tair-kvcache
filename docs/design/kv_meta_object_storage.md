@@ -529,7 +529,8 @@ sampling/batch/idle 参数，但不把 KVMeta 对象塞进固定 block Reclaimer
    `used + request > hard capacity` 时单纯 `Wake()` 永远无对象可回收的问题；
 3. **后端物理压力**：仅当 exact singleton Create 在未产生 URI 的前提下权威返回 `EC_NOSPC`
    时，按 storage type 记录本次 object bytes。它用于 KVCM 逻辑 quota 尚有余量、但共享 Provider
-   已满的情况。超时、返回 URI 的失败、错误请求、无可靠路由或未知 allocation outcome 都不得
+   已满的情况；这项物理压力独立于可选的 storage-type 逻辑子额度，即使 group 只配置总额度也必须按失败的
+   backend type 定向回收。超时、返回 URI 的失败、错误请求、无可靠路由或未知 allocation outcome 都不得
    以“回收可能有用”为由驱逐有效 Cache。
 
 对 byte 维度，设硬容量为 `C`、扣除已退休 pending credit 后的有效用量为 `Ueff`、水位为 `T`、被拒请求为 `R`：
@@ -722,8 +723,10 @@ committed record 重建精确逻辑用量。
 PACE provider 的 `used_bytes/total_bytes` 是另一张 **后端物理用量** 账：它还可能包含其他 workload、allocator
 碎片及 metadata 已删除但 Delete 未确认的 orphan。物理用量不能代替 per-group 逻辑 quota，否则共享 pool 的一个
 租户会错误驱逐另一个租户；逻辑用量也不能证明底层空间已释放。当前 V1 由 provider allocator/hard capacity
-负责物理兜底，运维必须同时监控两张账。exact Delete 不确定时两张账可能永久分叉，KVCM 立即关闭 KVMeta
-admission/maintenance，不能继续依赖逻辑余量写入；完成 namespace/orphan 对账并成功 recovery 后才重新开放。
+负责物理兜底，运维必须同时监控两张账。generation-aware exact Delete 超时、部分成功或暂时无法证明 absence 时，
+KVCM 保留 tombstone、逻辑 usage 和同 key fence，并重试整个幂等 batch；不会把未释放空间提前出售，也不会仅因一次
+可重试的 Provider 故障关闭无关 key。若 URI 缺少精确代际、Create outcome 无法归属，或 metadata owner 出现协议外
+缺失/替换，则无法继续证明安全性，KVMeta 才 fail closed，完成 namespace/orphan 对账并成功 recovery 后重新开放。
 
 退休对象在物理删除前仍计入 MetaIndexer usage；Reclaimer 单独维护 pending credit，只用于判断下一轮还需淘汰多少，
 不会改变 `PutStart` 的硬容量准入。若 metadata finalization 的 Sync 失败且内存记录已经消失，整个专用 group 的新
@@ -743,6 +746,8 @@ sequence 防止较旧的 worker snapshot 清除并发产生的新需求；达到
 credit，防止请求重试反复选新对象；但 demand 只在 backend exact Delete 明确证明物理 absence 后扣减。
 metadata 删除或逻辑 usage 下降都不能替代这个证明。若按 value bytes 估算的一轮释放仍不足以覆盖
 SSD slot/fragment footprint，下一次权威 `EC_NOSPC` 会发布新 demand；不会猜测或伪造 Provider free bytes。
+这个 demand 直接按物理 backend type 与该 type 的逻辑 owner usage 找候选，不要求配置同 type 的逻辑 quota；
+logical type quota 缺失表示“不做该维度的逻辑限额”，不能被解释成“不允许为该物理介质执行 GC”。
 
 ### 8.4 KVCM 与 Provider 的容量账本
 
