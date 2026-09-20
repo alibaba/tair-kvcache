@@ -498,7 +498,8 @@ Load 返回前 caller buffer 不被后台 I/O 继续访问，但不能阻止另�
 
 ### 6.4 删除与 Trim
 
-- `Remove(keys)` 精确删除 committed metadata，`Sync` 后再删除物理 allocation；不存在的 key 幂等成功；
+- `Remove(keys)` 先把 exact committed owner 条件转换并持久化为读不可见 tombstone，再用其中不可复用的
+  allocation generation 证明物理对象 absent，最后条件删除 tombstone 并 `Sync`；不存在的 key 幂等成功；
 - 任一 key 仍 active 时，整批 `Remove` 返回 `WRITE_IN_PROGRESS`，不产生删除副作用；
 - 多 key 删除中只要 metadata 已有任一项改变，后续 metadata/物理步骤再失败就返回 `OUTCOME_UNKNOWN`，而不是可被
   误解为“完全未执行”的普通 I/O 错误；调用方必须先查询/审计，不能在新 generation 可能出现后盲目重放。若
@@ -698,11 +699,12 @@ metadata reservation 使用完整旧值条件保护。跨进程 `PutStart` 竞�
 
 ### 8.2 Remove/新一代写入的 ABA 防护
 
-对 committed 对象，`Remove` 从条件删除 metadata、持久化到物理删除结束一直持有同一 group admission shard。
-下一代同 key `PutStart` 只能在 Delete 调用返回后进入；当 backend 保证“返回即终态（成功已删除，失败已取消且以后
-不会继续执行）”时，这能阻止旧 Delete 与新 allocation 重叠。Reclaimer 的路径不同：durable tombstone 与 pending
-location 已经拒绝同 key successor，物理 exact Delete 在 shard 外执行，避免慢 backend I/O 阻塞同 group 的其他 key；
-确认物理 absence 后才重新取得 shard，校验并持久化删除 tombstone，然后释放 quota。
+对 committed 对象，`Remove` 从 exact owner 条件转换为 tombstone、持久化 reader fence、证明物理 absence 到最终
+删除 tombstone 一直持有同一 group admission shard。下一代同 key `PutStart` 只能在整个 Delete 调用返回后进入；
+当 backend 保证“返回即终态（成功已删除，失败已取消且以后不会继续执行）”时，这能阻止旧 Delete 与新 allocation
+重叠。Reclaimer 的路径不同：durable tombstone 与 pending location 已经拒绝同 key successor，物理 exact Delete
+在 shard 外执行，避免慢 backend I/O 阻塞同 group 的其他 key；确认物理 absence 后才重新取得 shard，校验并持久化
+删除 tombstone，然后释放 quota。
 
 必须明确，这把进程内锁不能给 provider 内部仍在运行的超时请求加 fencing。如果 Delete 返回 timeout/抛异常后仍
 可能晚到完成，释放 shard 后的新对象又可能复用同一地址，第一次 Delete 本身仍会误伤后继 generation；“V1 不自动
