@@ -3604,6 +3604,13 @@ ErrorCode KvMetaManager::DeleteAllocatedLocations(RequestContext *request_contex
     ErrorCode overall = EC_OK;
     for (const auto &item : items) {
         if (!item.data_location) {
+            // A successful physical cleanup is the authorization boundary for
+            // removing the durable tombstone.  Every production SessionItem
+            // that reaches this helper owns a generation-bearing allocation;
+            // silently skipping a missing owner would turn an internal
+            // invariant violation into a leaked object with no recovery
+            // ledger.  Fail closed and retain the tombstone instead.
+            overall = FirstHardError(overall, EC_CORRUPTION);
             continue;
         }
         if (!HasMatchingStorageBackend(*item.data_location, data_storage_manager)) {

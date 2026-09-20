@@ -410,6 +410,10 @@ TEST_F(SdkWrapperTest, TestKvMetaTairValidationRejectsMalformedOrCrossMediaAddre
     buffer.iovs.push_back(iov);
     const BlockBuffers buffers{buffer};
     const std::vector<std::uint64_t> sizes{sizeof(bytes)};
+    const std::string allocation_token = "kvmeta/a/b/0123456789abcdefghijklmnopqrstuv";
+    const std::string provider_incarnation = "00000000-0000-0000-0000-000000000001";
+    const std::string owner_capability =
+        "&allocation_token=" + allocation_token + "&provider_incarnation=" + provider_incarnation;
 
     for (const auto &[type, media_type] : std::vector<std::pair<DataStorageType, std::uint16_t>>{
              {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, kTairMemPoolMediaTypeUnspecified},
@@ -423,18 +427,20 @@ TEST_F(SdkWrapperTest, TestKvMetaTairValidationRejectsMalformedOrCrossMediaAddre
         EXPECT_EQ(
             ER_OK,
             sdk_wrapper.ValidateKvMetaObjects({DataStorageUri("pace://pace/0?media_type=" + std::to_string(media_type) +
-                                                              "&node_id=0&range_id=0&size=5")},
+                                                              "&node_id=0&range_id=0&size=5" + owner_capability)},
                                               sizes,
                                               buffers));
         const std::uint16_t other_media =
             media_type == kTairMemPoolMediaTypeSsd ? kTairMemPoolMediaTypeDram : kTairMemPoolMediaTypeSsd;
         EXPECT_EQ(ER_INVALID_PARAMS,
                   sdk_wrapper.ValidateKvMetaObjects(
-                      {DataStorageUri("pace://pace/0?media_type=" + std::to_string(other_media) + "&size=5")},
+                      {DataStorageUri("pace://pace/0?media_type=" + std::to_string(other_media) + "&size=5" +
+                                      owner_capability)},
                       sizes,
                       buffers));
         EXPECT_EQ(media_type == kTairMemPoolMediaTypeUnspecified ? ER_OK : ER_INVALID_PARAMS,
-                  sdk_wrapper.ValidateKvMetaObjects({DataStorageUri("pace://pace/0?size=5")}, sizes, buffers));
+                  sdk_wrapper.ValidateKvMetaObjects(
+                      {DataStorageUri("pace://pace/0?size=5" + owner_capability)}, sizes, buffers));
         for (const std::string &uri : {
                  "pace://pace?size=5",
                  "pace://pace/?size=5",
@@ -448,10 +454,26 @@ TEST_F(SdkWrapperTest, TestKvMetaTairValidationRejectsMalformedOrCrossMediaAddre
                  "pace://pace/0?node_id=65536&size=5",
                  "pace://pace/0?media_type=1x&size=5",
                  "pace://pace/0?range_id=+1&size=5",
-             }) {
+            }) {
             SCOPED_TRACE(uri);
-            EXPECT_EQ(ER_INVALID_PARAMS, sdk_wrapper.ValidateKvMetaObjects({DataStorageUri(uri)}, sizes, buffers));
+            EXPECT_EQ(ER_INVALID_PARAMS,
+                      sdk_wrapper.ValidateKvMetaObjects(
+                          {DataStorageUri(uri + owner_capability)}, sizes, buffers));
         }
+        EXPECT_EQ(ER_INVALID_PARAMS,
+                  sdk_wrapper.ValidateKvMetaObjects(
+                      {DataStorageUri("pace://pace/0?media_type=" + std::to_string(media_type) +
+                                      "&node_id=0&range_id=0&size=5&provider_incarnation=" +
+                                      provider_incarnation)},
+                      sizes,
+                      buffers));
+        EXPECT_EQ(ER_INVALID_PARAMS,
+                  sdk_wrapper.ValidateKvMetaObjects(
+                      {DataStorageUri("pace://pace/0?allocation_token=" + allocation_token +
+                                      "&media_type=" + std::to_string(media_type) +
+                                      "&node_id=0&range_id=0&size=5")},
+                      sizes,
+                      buffers));
     }
 }
 

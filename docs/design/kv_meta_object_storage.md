@@ -751,28 +751,41 @@ logical type quota 缺失表示“不做该维度的逻辑限额”，不能被�
 
 ### 8.4 KVCM 与 Provider 的容量账本
 
-容量判断不能依赖一个 `used_bytes`。当前链路维护三类互相校验、但职责不同的账本：
+容量判断不能依赖一个 `used_bytes`。当前链路维护下列互相校验、但职责不同的账本：
 
 | 账本 | 来源与口径 | 用途 | 何时核销 |
 |---|---|---|---|
 | KVCM 逻辑用量 | MetaIndexer 中 active、committed、retired tombstone 的 `size`；按 instance group 和 storage type 聚合 | 租户/group 硬配额、LRU 水位、`PutStart` 准入 | exact physical absence 和最终 metadata `Sync` 都成功以后 |
 | Provider 已物化用量 | DRAM segment allocator 的实际 used bytes；SSD backend/segment 的物理 footprint | Provider 选址、介质硬水位和最终 OOM 防线 | 对应 allocator/backend 确认释放以后 |
-| Provider pending reservation | 已登记但未物化的 lazy GA，加上其创建临界区内的预留；按逻辑 bytes 计 | 防止并发 lazy allocation 都读取同一旧快照而超卖 DRAM/SSD | 物化成功时转入实际 used，或 allocation/GC 失败回滚时 |
+| Provider legacy pending | 固定块 lazy GA 及其创建临界区内的预留；按逻辑 bytes 计 | 保持既有 KVCache 并发准入语义 | 物化成功时转入实际 used，或 legacy allocation/Free 时核销 |
+| Provider exact DRAM commitment | EMB exact lazy 对象和 eager allocation 创建临界区的完整逻辑 bytes | 防止 exact 并发共享同一旧快照；不污染 legacy NodeStatus/准入 | eager 物理分配后转为 DRAM used；lazy 物化或 exact GC 时核销 |
+| Provider exact SSD commitment | 需要可溢出保证、但尚未变成 backend 实物的整对象 `Footprint(size)` | 保证变长对象不被按部分 bytes 超卖；覆盖 demote/promote 窗口 | demote 成功后转为 SSD used；promote 删除前重建；exact GC 时核销 |
 
-Provider 上报给 MetaService 的 DRAM 口径是饱和加法
-`reported_used = materialized_dram_used + reserved_pending_bytes`，溢出时取 `UINT64_MAX` 而不是回卷。SSD 用量来自
+Provider 上报给 MetaService 的 legacy DRAM 口径是饱和加法
+`reported_used = materialized_dram_used + legacy_reserved_pending_bytes`，溢出时取 `UINT64_MAX` 而不是回卷。
+exact DRAM/SSD commitment 不混入 NodeStatus 也不进入固定块准入，只通过独立 gauge 暴露；已物化的 exact DRAM/SSD
+自然由 allocator/backend 的实际 used 统计。这个隔离保证 EMB 只创建未物化对象时不会改变主链路容量视图。
+SSD 用量来自
 backend 的实际统计；本地 slot backend 按 `ceil(value_size / slot_size) * slot_size` 计费，key-addressable backend
 按其 `Footprint()`/实际统计计费。进程重启时先扫描持久化 SSD identity：已知对象 footprint 与 backend reported
 usage 取较大者，无法归属的差额作为 conservative baseline 保留，不能在重启后凭空变成 free capacity。
 
-transparent tiering 的 Provider 最终准入使用和 MetaService 相同的水位百分比 `T`。设新对象逻辑长度为 `S`，SSD
-footprint 为 `F`：若 `dram_used + reserved + S <= T * dram_total`，对象可在 DRAM 水位内进入；否则把超出 DRAM
-水位的逻辑量按 `F/S` 折算成 SSD footprint，并要求 `ssd_used + ssd_need <= T * ssd_total`。计算使用 128-bit 定点数，
-避免大容量乘法溢出。lazy 路径通过 CAS 在同一个 `reserved_pending_bytes` 上完成“复查水位 + 计费”，因此 32 个
-并发请求不能都从同一个旧 reservation 快照获得承诺。MetaService 的节点选择只是保守预筛；Provider 本地水位和
-allocator/backend 的原子硬容量检查才是最终授权，过期状态最多造成拒绝或换节点，不能造成物理越界。
+transparent tiering 的 Provider 最终准入使用和 MetaService 相同的水位百分比 `T`。legacy 固定块保留原有的
+部分溢出估算。exact 变长对象是 backend 上的不可分单元：设逻辑长度为 `S`、整对象 SSD footprint 为 `F`，
+若 `dram_used + legacy_pending + exact_dram_reserved + S <= T * dram_total`，只建立独立 DRAM 承诺；否则还要求
+`ssd_used + exact_ssd_reserved + F <= T * ssd_total`，不再用 `F/S` 估算一个对象的“部分 footprint”。计算使用
+128-bit 定点数。两个 exact counter 与 descriptor 的 ownership bit 在同一个 exact 容量锁下转移；失败路径回滚，
+underflow 则恢复 descriptor owner 并将 counter 置为 sticky 损坏哨兵，不能伪装成成功 GC。
 
-这三张账不能互相替代。KVCM 逻辑用量按租户归属，不包含 allocator 碎片和其他 workload；Provider 物理用量无法
+这里的 exact `dram_total` 只统计普通 data DRAM segment；固定块 KVCache 独占的 cache segment 和 local-SSD segment
+都不属于 EMB allocator domain。inactive data segment 仍保留在物理总量中，但按全满计入 `dram_used`。这样 exact
+allocation 既不能借用主链路预留池，也不会把不可分配的 segment 当作可用容量；legacy admission 口径保持不变。
+
+key-addressable backend 的 total/used getter 可以是后台刷新的短期缓存；exact commitment 负责遮住同一 Provider
+进程内的并发准入窗口，backend 硬 quota 仍是线程/进程外竞态的最终授权。MetaService 节点选择只是保守预筛；过期
+状态最多造成拒绝或换节点，不能造成物理越界。
+
+这些账本不能互相替代。KVCM 逻辑用量按租户归属，不包含 allocator 碎片和其他 workload；Provider 物理用量无法
 判断应该淘汰哪个 KVMeta group；pending reservation 只是短期/未物化承诺，也不是可回收对象列表。线上必须同时
 监控 KVCM logical usage、Reclaimer pending/uncertain bytes、Provider DRAM/SSD used 和 reservation。逻辑用量下降而
 物理用量不下降说明 backend GC/orphan 收敛失败；Provider 用量增长而 KVCM 用量不增长说明存在其他 workload、
@@ -1054,6 +1067,11 @@ PACE provisional allocation lease 固定至少 3600 秒。KVCM 最长写租约�
 fixed-block KVCache timeout。MetaService 对 exact intent/owner/retirement proof 必须使用 durable Redis；内存 ledger
 会在 Provider mutation 前 fail closed。Provider 的 exact absence query 使用与 mutation 一致的有界长超时，不复用普通
 GA listing 的短超时。
+
+Provider 在 allocator mutation 前预分配 replay owner、descriptor 容器和 generation ledger 节点；物理 allocation
+成功后先把完整 GA identity 发布到 provisional lease，再执行 JSON/HTTP 响应构造。此后发生的内存异常或畸形
+allocator response 只能得到 `allocation_outcome=unknown`，但 lease reaper 仍持有可回收 owner；绝不能返回
+`none` 或留下永久不可达 allocation。该异常安全要求属于 exact capability，不能为了复用而改变 legacy batch 主路径。
 
 这个证明依赖当前 PACE Provider 的顺序：显式 SSD exact free 只有在 backend Delete 成功后才清掉 pending/residency，
 失败状态在 targeted query 中仍为 present；因此 absent 是保守终态。Provider 重启会生成新 incarnation，持久化 SSD
