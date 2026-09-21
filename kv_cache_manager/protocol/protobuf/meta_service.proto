@@ -80,6 +80,10 @@ enum ReportEventType {
     EVENT_HOST_DOWN = 4;     // Reporter node is going down (graceful or detected)
     EVENT_HEARTBEAT = 5;     // Reporter periodic heartbeat
     EVENT_BLOCK_SNAPSHOT = 6; // Reporter sends one complete all-medium host snapshot
+    // A reader observed that the exact EventReport URI returned by KVCM no
+    // longer exists. This event conditionally removes only still-matching
+    // metadata and never participates in reporter lifecycle or snapshot state.
+    EVENT_BLOCK_READ_FAILED = 7;
 }
 
 message NodeRegisterEventParams {
@@ -117,6 +121,17 @@ message BlockSnapshotEventParams {
     repeated BlockSnapshotItem blocks = 2;
 }
 
+message ObservedReadFailureSpec {
+    string name = 1;
+    // Exact URI returned by KVCM, including its single s_version parameter.
+    string observed_uri = 2;
+}
+
+message BlockReadFailedEventParams {
+    string block_key = 1;
+    repeated ObservedReadFailureSpec specs = 2;
+}
+
 message HostDownEventParams {
 }
 
@@ -134,6 +149,7 @@ message EventItem {
         HostDownEventParams host_down = 5;
         HeartbeatEventParams heartbeat = 6;
         BlockSnapshotEventParams block_snapshot = 7;
+        BlockReadFailedEventParams block_read_failed = 8;
     }
 }
 

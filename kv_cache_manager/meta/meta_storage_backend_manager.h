@@ -109,7 +109,8 @@ public:
     std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *request_context,
                                                                    const KeyVector &keys,
                                                                    const LocationIdsPerKey &location_ids,
-                                                                   LocationsPerKey &out_locations) noexcept;
+                                                                   LocationsPerKey &out_locations,
+                                                                   bool require_consistent_layers = false) noexcept;
     std::vector<std::vector<ErrorCode>> GetLocationsWithKeyStatus(RequestContext *request_context,
                                                                   const KeyVector &keys,
                                                                   const LocationIdsPerKey &location_ids,

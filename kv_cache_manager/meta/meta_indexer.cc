@@ -653,6 +653,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                                        adjust_reclaimed_key_count,
                                        false,
                                        refresh_cache_from_persistent,
+                                       false,
                                        false);
 }
 
@@ -661,16 +662,24 @@ MetaIndexer::ReadModifyWriteLocationsForMaintenance(RequestContext *request_cont
                                                     const KeyVector &keys,
                                                     const LocationIdsPerKey &location_ids,
                                                     const LocationModifierFunc &modifier,
-                                                    bool adjust_reclaimed_key_count) noexcept {
-    return ReadModifyWriteLocationImpl(
-        request_context, keys, location_ids, modifier, adjust_reclaimed_key_count, false, false, true);
+                                                    bool adjust_reclaimed_key_count,
+                                                    bool require_consistent_layers) noexcept {
+    return ReadModifyWriteLocationImpl(request_context,
+                                       keys,
+                                       location_ids,
+                                       modifier,
+                                       adjust_reclaimed_key_count,
+                                       false,
+                                       false,
+                                       true,
+                                       require_consistent_layers);
 }
 
 MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteTargetLocations(RequestContext *request_context,
                                                                         const KeyVector &keys,
                                                                         const LocationIdsPerKey &location_ids,
                                                                         const LocationModifierFunc &modifier) noexcept {
-    return ReadModifyWriteLocationImpl(request_context, keys, location_ids, modifier, false, true, false, false);
+    return ReadModifyWriteLocationImpl(request_context, keys, location_ids, modifier, false, true, false, false, false);
 }
 
 MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestContext *request_context,
@@ -680,7 +689,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                                                      bool adjust_reclaimed_key_count,
                                                                      bool track_created_key_count,
                                                                      bool refresh_cache_from_persistent,
-                                                                     bool maintenance_no_touch) noexcept {
+                                                                     bool maintenance_no_touch,
+                                                                     bool require_consistent_layers) noexcept {
     const auto &trace_id = request_context->trace_id();
     if (keys.empty()) {
         return LocationResult(EC_OK);
@@ -764,8 +774,11 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         } else {
             get_ecs_per_key =
                 maintenance_no_touch
-                    ? backend_manager_->GetLocationsForMaintenance(
-                          ephemeral_request_context.get(), batch_keys, batch_location_ids, batch_locations_per_key)
+                    ? backend_manager_->GetLocationsForMaintenance(ephemeral_request_context.get(),
+                                                                   batch_keys,
+                                                                   batch_location_ids,
+                                                                   batch_locations_per_key,
+                                                                   require_consistent_layers)
                     : backend_manager_->GetLocations(
                           ephemeral_request_context.get(), batch_keys, batch_location_ids, batch_locations_per_key);
         }
@@ -860,6 +873,13 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                    key);
                 location_result.per_location_error_codes[global_idx].assign(loc_ids.size(), EC_MISMATCH);
                 key_level_failures[global_idx] = true;
+                continue;
+            }
+            const bool strict_read_failed =
+                require_consistent_layers &&
+                std::any_of(get_ecs.begin(), get_ecs.end(), [](ErrorCode ec) { return ec != EC_OK && ec != EC_NOENT; });
+            if (strict_read_failed) {
+                location_result.per_location_error_codes[global_idx] = get_ecs;
                 continue;
             }
             PropertyMap upsert_property_map;
@@ -974,6 +994,10 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                 WARN, "maintenance post-delete Sync failed for keys[%lu]", delete_batch.batch_keys.size());
             for (const int32_t global_idx : delete_batch.batch_indexs) {
                 key_level_failures[global_idx] = true;
+                if (global_idx >= 0 &&
+                    static_cast<size_t>(global_idx) < location_result.post_write_error_codes.size()) {
+                    location_result.post_write_error_codes[global_idx] = EC_TIMEOUT;
+                }
             }
         }
         for (const auto &global_index : delete_batch.batch_indexs) {

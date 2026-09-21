@@ -182,11 +182,12 @@ Prometheus 侧存储的是底层 *counter*（单调递增），KMonitor 的
 
 `event_report.*` 按固定标签 `instance_group`、`instance_id`、`type` 和
 `event_type` 拆分。其中 `type` 为 `event_report_l1p5` 或
-`event_report_l2`，`event_type` 为协议定义的六种事件类型之一（未知值
+`event_report_l2`，`event_type` 为协议定义的七种事件类型之一（未知值
 统一记为 `unknown`）。一个批量请求包含某事件类型时，该类型 QPS 计一次；
 同一请求内同类型的多个 event 不重复计数。`event_report.request_rt_us`
 记录整次 `ReportEvent` 请求的端到端耗时；请求失败时
-`event_report.error_qps` 按该请求包含的事件类型分别计一次。
+`event_report.error_qps` 按该请求包含的事件类型分别计一次；READ_FAILED 的逐 spec 结果记录在
+`event_report.read_failure_spec_counter`。
 
 注：`data_storage.create_keys_qps` 在 Prom 侧也会以 gauge 形式
 导出"最近一次批次大小"（不是每秒速率）。每秒速率请使用

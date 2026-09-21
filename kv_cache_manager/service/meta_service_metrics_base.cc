@@ -208,16 +208,22 @@ void MetaServiceMetricsBase::AttachReportEventTypeMetricsCollectors(const proto:
         return;
     }
 
-    static constexpr std::array<const char *, 7> kEventTypeTags = {
-        "unknown", "node_register", "block_add", "block_delete", "host_down", "heartbeat", "block_snapshot"};
+    static constexpr std::array<const char *, 8> kEventTypeTags = {"unknown",
+                                                                   "node_register",
+                                                                   "block_add",
+                                                                   "block_delete",
+                                                                   "host_down",
+                                                                   "heartbeat",
+                                                                   "block_snapshot",
+                                                                   "block_read_failed"};
     static constexpr std::array<bool, kEventTypeTags.size()> kEnableEventTypeMetrics = {
-        false, false, true, true, false, false, true};
+        false, false, true, true, false, false, true, true};
     uint32_t event_type_mask = 0;
     std::array<size_t, kEventTypeTags.size()> request_key_counts{};
     for (const auto &event : request.events()) {
         const int event_type = static_cast<int>(event.event_type());
         const int bounded_event_type =
-            (event_type >= proto::meta::EVENT_NODE_REGISTER && event_type <= proto::meta::EVENT_BLOCK_SNAPSHOT)
+            (event_type >= proto::meta::EVENT_NODE_REGISTER && event_type <= proto::meta::EVENT_BLOCK_READ_FAILED)
                 ? event_type
                 : 0;
         event_type_mask |= 1U << bounded_event_type;
@@ -234,6 +240,9 @@ void MetaServiceMetricsBase::AttachReportEventTypeMetricsCollectors(const proto:
         case proto::meta::EVENT_BLOCK_SNAPSHOT:
             request_key_counts[bounded_event_type] +=
                 event.has_block_snapshot() ? static_cast<size_t>(event.block_snapshot().blocks_size()) : 0;
+            break;
+        case proto::meta::EVENT_BLOCK_READ_FAILED:
+            request_key_counts[bounded_event_type] += event.has_block_read_failed() ? 1 : 0;
             break;
         default:
             break;
