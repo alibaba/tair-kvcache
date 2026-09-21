@@ -240,6 +240,13 @@ void DataStorageSelector::DoCleanup() {}
 DataStorageSelectResult
 DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_context,
                                                         const std::string &instance_group) const noexcept {
+    return SelectCacheWriteDataStorageBackend(request_context, instance_group, 0);
+}
+
+DataStorageSelectResult
+DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_context,
+                                                        const std::string &instance_group,
+                                                        const std::uint64_t required_bytes) const noexcept {
     SPAN_TRACER(request_context);
     DataStorageSelectResult result{ErrorCode::EC_UNKNOWN, DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, ""};
     if (!request_context) {
@@ -307,7 +314,7 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
     // construct the availability table of each storage type in this
     // instance group
     StorageQuotaAvail storage_quota_avail_table;
-    GenStorageQuotaAvailTable(request_context, quota, instance_infos, storage_quota_avail_table);
+    GenStorageQuotaAvailTable(request_context, quota, instance_infos, required_bytes, storage_quota_avail_table);
 
     // get the configured data storage candidate list of this instance group
     const std::vector<std::string> &configured_candidates = ig->storage_candidates();
@@ -355,6 +362,90 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
     return result;
 }
 
+DataStorageSelectResult
+DataStorageSelector::SelectCacheWriteDataStorageBackendForReclaim(RequestContext *request_context,
+                                                                  const std::string &instance_group,
+                                                                  const std::uint64_t required_bytes) const noexcept {
+    SPAN_TRACER(request_context);
+    DataStorageSelectResult result{ErrorCode::EC_UNKNOWN, DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, ""};
+    if (!request_context || instance_group.empty() || required_bytes == 0) {
+        result.ec = ErrorCode::EC_BADARGS;
+        return result;
+    }
+    const auto &trace_id = request_context->trace_id();
+    if (!meta_indexer_manager_ || !registry_manager_) {
+        result.ec = ErrorCode::EC_ERROR;
+        return result;
+    }
+    const auto data_storage_manager = registry_manager_->data_storage_manager();
+    if (!data_storage_manager) {
+        result.ec = ErrorCode::EC_INSTANCE_NOT_EXIST;
+        return result;
+    }
+    const auto [group_ec, group] = registry_manager_->GetInstanceGroup(request_context, instance_group);
+    if (group_ec != ErrorCode::EC_OK || !group) {
+        result.ec = group_ec == ErrorCode::EC_OK ? ErrorCode::EC_INSTANCE_NOT_EXIST : group_ec;
+        return result;
+    }
+    if (group->quota().capacity() < 0 || required_bytes > static_cast<std::uint64_t>(group->quota().capacity())) {
+        // No amount of eviction can make this request fit the hard group
+        // capacity. Do not pick a target that would cause a futile cache wipe.
+        result.ec = ErrorCode::EC_NOSPC;
+        return result;
+    }
+
+    const auto available_backends = data_storage_manager->GetAvailableStorages();
+    if (available_backends.empty()) {
+        result.ec = ErrorCode::EC_NOENT;
+        return result;
+    }
+    const auto &configured_candidates = group->storage_candidates();
+    if (configured_candidates.empty()) {
+        result.ec = ErrorCode::EC_CONFIG_ERROR;
+        return result;
+    }
+
+    auto preference = CachePreferStrategy::CPS_UNSPECIFIED;
+    if (group->cache_config()) {
+        preference = group->cache_config()->cache_prefer_strategy();
+    }
+    StorageQuotaAvail configured_types;
+    std::vector<std::shared_ptr<DataStorageBackend>> configured_available;
+    GetCandidates(request_context, available_backends, configured_candidates, configured_types, configured_available);
+    if (!Select(request_context, configured_available, preference)) {
+        // No backend satisfies the configured candidate/preference policy,
+        // independent of capacity. Reclaim cannot repair discovery/config.
+        result.ec = ErrorCode::EC_NOENT;
+        return result;
+    }
+
+    // Start with the same default type support as normal selection, then
+    // remove types whose hard quota can never contain this request. Current
+    // usage is intentionally ignored: that is precisely what reclaim will
+    // reduce.
+    StorageQuotaAvail reclaimable_types;
+    for (const auto &storage_quota : group->quota().quota_config()) {
+        if (storage_quota.capacity() < 0 || required_bytes > static_cast<std::uint64_t>(storage_quota.capacity())) {
+            reclaimable_types.SetStorageQuotaAvailByType(storage_quota.storage_spec(), false);
+        }
+    }
+    std::vector<std::shared_ptr<DataStorageBackend>> candidates;
+    GetCandidates(request_context, available_backends, configured_candidates, reclaimable_types, candidates);
+
+    const auto chosen_backend = Select(request_context, candidates, preference);
+    if (!chosen_backend) {
+        PREFIX_LOG(WARN,
+                   "no configured backend can fit exact bytes after reclaim, instance group: %s",
+                   instance_group.c_str());
+        result.ec = ErrorCode::EC_NOSPC;
+        return result;
+    }
+    result.ec = ErrorCode::EC_OK;
+    result.type = chosen_backend->GetType();
+    result.name = chosen_backend->GetStorageConfig().global_unique_name();
+    return result;
+}
+
 std::vector<StorageTargetAdmissionResult>
 DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
                                                const std::string &instance_group,
@@ -378,8 +469,7 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
         PREFIX_LOG(WARN, "explicit target admission failed to read instance group: %s", instance_group.c_str());
         return results;
     }
-    const auto [instances_ec, instance_infos] =
-        registry_manager_->ListInstanceInfo(request_context, instance_group);
+    const auto [instances_ec, instance_infos] = registry_manager_->ListInstanceInfo(request_context, instance_group);
     if (instances_ec != EC_OK) {
         PREFIX_LOG(WARN, "explicit target admission failed to list instances: %s", instance_group.c_str());
         return results;
@@ -397,9 +487,8 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
     }
 
     auto saturating_add = [](std::uint64_t &sum, const std::uint64_t value) {
-        sum = value > std::numeric_limits<std::uint64_t>::max() - sum
-                  ? std::numeric_limits<std::uint64_t>::max()
-                  : sum + value;
+        sum = value > std::numeric_limits<std::uint64_t>::max() - sum ? std::numeric_limits<std::uint64_t>::max()
+                                                                      : sum + value;
     };
     std::uint64_t group_used_bytes = 0;
     for (const auto &instance_info : instance_infos) {
@@ -497,7 +586,10 @@ std::size_t DataStorageSelector::CalcGroupUsedSize(
         }
 
         meta_indexer->PersistMetaData();
-        group_used_byte_size += meta_indexer->GetStorageUsage();
+        const std::size_t usage = meta_indexer->GetStorageUsage();
+        group_used_byte_size = usage > std::numeric_limits<std::size_t>::max() - group_used_byte_size
+                                   ? std::numeric_limits<std::size_t>::max()
+                                   : group_used_byte_size + usage;
     }
 
     return group_used_byte_size;
@@ -507,6 +599,7 @@ void DataStorageSelector::GenStorageQuotaAvailTable(
     RequestContext const *request_context,
     const InstanceGroupQuota &quota,
     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
+    const std::uint64_t required_bytes,
     StorageQuotaAvail &out_storage_quota_avail_table) const noexcept {
     const auto &trace_id = request_context->trace_id();
 
@@ -527,10 +620,22 @@ void DataStorageSelector::GenStorageQuotaAvailTable(
             }
             meta_indexer->PersistMetaData();
             const std::uint64_t sz = meta_indexer->GetStorageUsageByType(type);
-            total_sz += sz;
+            total_sz = sz > std::numeric_limits<std::uint64_t>::max() - total_sz
+                           ? std::numeric_limits<std::uint64_t>::max()
+                           : total_sz + sz;
         }
 
-        if (storage_quota.capacity() <= total_sz) {
+        // The fixed-block path passes required_bytes == 0 and retains its
+        // established reached-capacity check. KVMeta supplies the exact sum
+        // of its variable-size misses, so a type with only partial remaining
+        // capacity is filtered before preference selection and a viable
+        // fallback type can still be chosen.
+        const bool cannot_fit =
+            required_bytes == 0
+                ? storage_quota.capacity() <= total_sz
+                : storage_quota.capacity() < 0 || total_sz > static_cast<std::uint64_t>(storage_quota.capacity()) ||
+                      required_bytes > static_cast<std::uint64_t>(storage_quota.capacity()) - total_sz;
+        if (cannot_fit) {
             out_storage_quota_avail_table.SetStorageQuotaAvailByType(type, false);
         }
     }

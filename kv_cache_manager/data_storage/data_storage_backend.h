@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -82,6 +83,54 @@ protected:
 private:
     std::atomic_bool is_open_ = false;
     std::atomic_bool is_available_ = false;
+};
+
+// Side interface for KVMeta object-lifecycle semantics. Keeping it separate
+// preserves DataStorageBackend's ABI and the fixed-block KV-cache vtable.
+// KVMeta uses singleton allocations, but a backend is not required to expose a
+// generation-aware delete API. Backends that cannot safely replay an
+// ambiguous delete must say so explicitly; KVMeta will make at most one
+// attempt and prefer a possible physical orphan over deleting a reused object.
+class KvMetaDataStorageBackendExtension {
+public:
+    virtual ~KvMetaDataStorageBackendExtension() = default;
+
+    // Performs one synchronous KVMeta delete attempt. EC_OK means the backend
+    // reported successful completion of that attempt. It does not, by itself,
+    // make an ambiguous transport failure safe to retry.
+    virtual std::vector<ErrorCode> DeleteForKvMeta(const std::vector<DataStorageUri> &storage_uris,
+                                                   const std::string &trace_id,
+                                                   std::function<void()> cb) = 0;
+
+    // True only when replaying the same URI after an unknown outcome cannot
+    // delete a successor allocation. Non-retry-safe backends (for example a
+    // reusable legacy GA address without a generation token) are attempted at
+    // most once, including across leader recovery.
+    virtual bool IsKvMetaDeleteRetrySafe() const noexcept = 0;
+
+    // A transport with already-submitted I/O after a failed write returns a
+    // positive quarantine. Synchronous exact-object backends return zero.
+    virtual std::int64_t GetFailedWriteCleanupGraceSeconds() const noexcept = 0;
+
+    // Backends whose validation policy differs from their fixed-block Create
+    // path opt in here. The implementation may still use the same existing
+    // storage API; this hook keeps variable-size checks off the main path.
+    // A failed Create that may nevertheless have allocated an object MUST
+    // return EC_OUTCOME_UNKNOWN with an invalid URI. EC_NOSPC, EC_NOENT,
+    // EC_BADARGS, EC_OUT_OF_LIMIT, EC_UNIMPLEMENTED, EC_CONFIG_ERROR, and
+    // EC_CORRUPTION are reserved here for failures known to occur before an
+    // allocation is created. This distinction lets a transient local
+    // dispatch rejection remain retryable without hiding possible orphans.
+    virtual bool HasDedicatedKvMetaCreate() const noexcept { return false; }
+    virtual std::vector<std::pair<ErrorCode, DataStorageUri>> CreateForKvMeta(const std::vector<std::string> &keys,
+                                                                              std::size_t size_per_key,
+                                                                              const std::string &trace_id,
+                                                                              std::function<void()> cb) {
+        (void)size_per_key;
+        (void)trace_id;
+        (void)cb;
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}});
+    }
 };
 
 } // namespace kv_cache_manager

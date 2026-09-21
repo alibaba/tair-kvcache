@@ -8,6 +8,7 @@
 #include "kv_cache_manager/data_storage/dummy_backend.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/data_storage/hf3fs_backend.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #ifdef ENABLE_MOONCAKE
 #include "kv_cache_manager/data_storage/mooncake_backend.h"
 #endif
@@ -227,6 +228,64 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
     return create_result;
 }
 
+std::vector<std::pair<ErrorCode, DataStorageUri>>
+DataStorageManager::CreateForKvMeta(RequestContext *request_context,
+                                    const std::string &unique_name,
+                                    const std::vector<std::string> &keys,
+                                    size_t size_per_key,
+                                    std::function<void()> cb) {
+    if (!request_context || unique_name.empty() || keys.size() != 1 || size_per_key == 0 ||
+        !HasCanonicalKvMetaObjectKey(keys.front())) {
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_BADARGS, DataStorageUri{}});
+    }
+    SPAN_TRACER(request_context);
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    const std::string &trace_id = request_context->trace_id();
+    const auto iter = storage_map_.find(unique_name);
+    if (iter == storage_map_.end()) {
+        KVCM_LOG_WARN("Storage name: %s not exist", unique_name.c_str());
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOENT, DataStorageUri{}});
+    }
+    const auto &storage_backend = iter->second;
+    if (storage_backend == nullptr || !storage_backend->Available()) {
+        KVCM_LOG_WARN("Storage name: %s is unavailable, reject KVMeta create", unique_name.c_str());
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOENT, DataStorageUri{}});
+    }
+    const auto extension = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(storage_backend);
+    const StorageConfig &storage_config = storage_backend->GetStorageConfig();
+    if (!SupportsKvMetaAdmission(storage_backend->GetType()) || !extension) {
+        KVCM_LOG_WARN("Storage name: %s lacks the KVMeta object lifecycle capability", unique_name.c_str());
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}});
+    }
+    if (storage_config.type() != storage_backend->GetType() || storage_config.global_unique_name() != unique_name ||
+        !HasSafeConfiguredKvMetaNamespace(storage_config)) {
+        // Revalidate at the final dispatch boundary. The instance group and
+        // selected backend can be changed after manager-side admission; never
+        // redirect a KVMeta object outside the registered namespace.
+        KVCM_LOG_WARN("Storage name: %s lacks a safe KVMeta object registration", unique_name.c_str());
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_CORRUPTION, DataStorageUri{}});
+    }
+    const auto dsmc = storage_backend->GetMetricsCollector();
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);
+    std::vector<std::pair<ErrorCode, DataStorageUri>> create_result;
+    if (extension->HasDedicatedKvMetaCreate()) {
+        create_result = extension->CreateForKvMeta(keys, size_per_key, trace_id, std::move(cb));
+    } else {
+        create_result = storage_backend->Create(keys, size_per_key, trace_id, std::move(cb));
+    }
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(dsmc, DataStorageCreate);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(dsmc, data_storage, create_keys_qps, keys.size());
+    if (request_context) {
+        request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(dsmc);
+    }
+    std::for_each(create_result.begin(), create_result.end(), [&unique_name](auto &pair) {
+        if (pair.first == EC_OK) {
+            pair.second.SetHostName(unique_name);
+        }
+    });
+    return create_result;
+}
+
 std::vector<ErrorCode> DataStorageManager::Delete(RequestContext *request_context,
                                                   const std::string &unique_name,
                                                   const std::vector<DataStorageUri> &storage_uris,
@@ -244,6 +303,43 @@ std::vector<ErrorCode> DataStorageManager::Delete(RequestContext *request_contex
     }
     auto storage_backend = iter->second;
     return storage_backend->Delete(storage_uris, trace_id, cb);
+}
+
+std::vector<ErrorCode> DataStorageManager::DeleteForKvMeta(RequestContext *request_context,
+                                                           const std::string &unique_name,
+                                                           const std::vector<DataStorageUri> &storage_uris,
+                                                           std::function<void()> cb) {
+    if (storage_uris.empty()) {
+        return {};
+    }
+    if (!request_context || unique_name.empty()) {
+        return std::vector<ErrorCode>(storage_uris.size(), EC_BADARGS);
+    }
+    SPAN_TRACER(request_context);
+    std::shared_lock<std::shared_mutex> lock(rw_lock_);
+    const std::string &trace_id = request_context->trace_id();
+    auto iter = storage_map_.find(unique_name);
+    if (iter == storage_map_.end()) {
+        KVCM_LOG_WARN("Storage name: %s not exist", unique_name.c_str());
+        return {};
+    }
+    auto storage_backend = iter->second;
+    if (!storage_backend) {
+        KVCM_LOG_WARN("Storage name: %s has a null backend during KVMeta delete", unique_name.c_str());
+        return std::vector<ErrorCode>(storage_uris.size(), EC_CORRUPTION);
+    }
+    auto kv_meta_extension = std::dynamic_pointer_cast<KvMetaDataStorageBackendExtension>(storage_backend);
+    const StorageConfig &storage_config = storage_backend->GetStorageConfig();
+    if (!kv_meta_extension) {
+        KVCM_LOG_WARN("Storage name: %s does not implement KVMeta delete semantics", unique_name.c_str());
+        return std::vector<ErrorCode>(storage_uris.size(), EC_UNIMPLEMENTED);
+    }
+    if (storage_config.type() != storage_backend->GetType() || storage_config.global_unique_name() != unique_name ||
+        !HasSafeConfiguredKvMetaNamespace(storage_config)) {
+        KVCM_LOG_WARN("Storage name: %s has a corrupt KVMeta object registration", unique_name.c_str());
+        return std::vector<ErrorCode>(storage_uris.size(), EC_CORRUPTION);
+    }
+    return kv_meta_extension->DeleteForKvMeta(storage_uris, trace_id, std::move(cb));
 }
 
 std::vector<ErrorCode> DataStorageManager::Copy(RequestContext *request_context,
@@ -317,7 +413,8 @@ void DataStorageManager::RecordWriteBytes(const std::string &unique_name, std::u
     auto iter = storage_map_.find(unique_name); // iter->second 指向 DataStorageBackend 对象
     if (iter == storage_map_.end() || iter->second == nullptr) {
         KVCM_LOG_WARN("RecordWriteBytes: storage [%s] not found, drop %llu bytes",
-                      unique_name.c_str(), static_cast<unsigned long long>(bytes));
+                      unique_name.c_str(),
+                      static_cast<unsigned long long>(bytes));
         return;
     }
     const auto collector = iter->second->GetMetricsCollector(); // 指向 DataStorageMetricsCollector 对象

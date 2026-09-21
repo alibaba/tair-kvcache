@@ -103,6 +103,33 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->service_admin_http_port_ = std::stoi(value);
          return true;
      }},
+    {"kvcm.kv_meta.enabled",
+     [](const std::string &value, ServerConfig *config) {
+         config->kv_meta_enabled_ = value == "true";
+         return value == "true" || value == "false";
+     }},
+    {"kvcm.kv_meta.rpc_port",
+     [](const std::string &value, ServerConfig *) {
+         // Keep an old disabled configuration harmless during rollout, but
+         // never silently reinterpret a previously enabled second listener.
+         // Operators must move both the server flag and clients to the primary
+         // RPC endpoint as one explicit deployment change.
+         try {
+             std::size_t parsed_length = 0;
+             const auto port = std::stoll(value, &parsed_length);
+             if (parsed_length == value.size() && port == 0) {
+                 fprintf(stderr,
+                         "Deprecated config kvcm.kv_meta.rpc_port=0 is ignored; "
+                         "use kvcm.kv_meta.enabled=false instead\n");
+                 return true;
+             }
+         } catch (...) {
+         }
+         fprintf(stderr,
+                 "Non-zero kvcm.kv_meta.rpc_port is no longer supported; "
+                 "use kvcm.kv_meta.enabled=true and the primary kvcm.service.rpc_port\n");
+         return false;
+     }},
     {"kvcm.service.enable_debug_service",
      [](const std::string &value, ServerConfig *config) {
          config->enable_debug_service_ = value == "true";
@@ -327,6 +354,7 @@ bool ServerConfig::Parse(const std::string &config_file, const EnvironMap &envir
 }
 
 void ServerConfig::UpdateDefaultConfig() {
+    kv_meta_enabled_ = false;
     metrics_reporter_type_ = "local";
     metrics_report_interval_ms_ = 20000;
     leader_elector_lease_ms_ = 10000;
