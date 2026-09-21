@@ -36,6 +36,8 @@ void AdminServiceGRpc::Init() {
     MAKE_SERVICE_METRICS_COLLECTOR(GetCacheMeta);
     MAKE_SERVICE_METRICS_COLLECTOR(RemoveCache);
     MAKE_SERVICE_METRICS_COLLECTOR(MigrateCache);
+    MAKE_SERVICE_METRICS_COLLECTOR(ListAsyncCopyQuarantine);
+    MAKE_SERVICE_METRICS_COLLECTOR(BreakGlassReleaseAsyncCopy);
 
     // for instance APIs
     MAKE_SERVICE_METRICS_COLLECTOR(RegisterInstance);
@@ -175,6 +177,24 @@ grpc::Status AdminServiceGRpc::MigrateCache(grpc::ServerContext *context,
                                             proto::admin::MigrateCacheResponse *response) {
     API_CONTEXT_INIT_GRPC(MigrateCache)
     admin_service_impl_->MigrateCache(request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status AdminServiceGRpc::ListAsyncCopyQuarantine(
+    grpc::ServerContext *context,
+    const proto::admin::ListAsyncCopyQuarantineRequest *request,
+    proto::admin::ListAsyncCopyQuarantineResponse *response) {
+    API_CONTEXT_INIT_GRPC(ListAsyncCopyQuarantine)
+    admin_service_impl_->ListAsyncCopyQuarantine(request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status AdminServiceGRpc::BreakGlassReleaseAsyncCopy(
+    grpc::ServerContext *context,
+    const proto::admin::BreakGlassReleaseAsyncCopyRequest *request,
+    proto::admin::CommonResponse *response) {
+    API_CONTEXT_INIT_GRPC(BreakGlassReleaseAsyncCopy)
+    admin_service_impl_->BreakGlassReleaseAsyncCopy(request_context, request, response);
     return grpc::Status::OK;
 }
 

@@ -68,6 +68,12 @@ public:
     CachedJsonResponse MigrateCache(coro_http::coro_http_connection *http_conn,
                                     proto::admin::MigrateCacheRequest *request,
                                     proto::admin::MigrateCacheResponse *response);
+    CachedJsonResponse ListAsyncCopyQuarantine(coro_http::coro_http_connection *http_conn,
+                                               proto::admin::ListAsyncCopyQuarantineRequest *request,
+                                               proto::admin::ListAsyncCopyQuarantineResponse *response);
+    CachedJsonResponse BreakGlassReleaseAsyncCopy(coro_http::coro_http_connection *http_conn,
+                                                 proto::admin::BreakGlassReleaseAsyncCopyRequest *request,
+                                                 proto::admin::CommonResponse *response);
 
     CachedJsonResponse RegisterInstance(coro_http::coro_http_connection *http_conn,
                                         proto::admin::RegisterInstanceRequest *request,
@@ -148,6 +154,8 @@ private:
     KVCM_DECLARE_METRICS_COLLECTOR_(GetCacheMeta);
     KVCM_DECLARE_METRICS_COLLECTOR_(RemoveCache);
     KVCM_DECLARE_METRICS_COLLECTOR_(MigrateCache);
+    KVCM_DECLARE_METRICS_COLLECTOR_(ListAsyncCopyQuarantine);
+    KVCM_DECLARE_METRICS_COLLECTOR_(BreakGlassReleaseAsyncCopy);
 
     // for instance APIs
     KVCM_DECLARE_METRICS_COLLECTOR_(RegisterInstance);
