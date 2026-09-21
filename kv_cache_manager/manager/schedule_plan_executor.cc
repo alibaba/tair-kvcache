@@ -15,6 +15,7 @@
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
@@ -324,10 +325,6 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
                 for (const auto &loc_spec : iter->second->location_specs()) {
                     DataStorageUri uri(loc_spec.uri());
                     if (uri.Valid()) {
-                        if (!task.confirmed_missing_uris.empty() &&
-                            task.confirmed_missing_uris.find(uri.ToUriString()) != task.confirmed_missing_uris.end()) {
-                            continue;
-                        }
                         std::string storage_unique_name = uri.GetHostName();
                         delete_uris_by_unique_name[storage_unique_name].emplace_back(uri);
                     }
@@ -346,9 +343,31 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
 
     // delete storage uris
     auto request_context = std::make_shared<RequestContext>("location_del_task_trace");
-    for (const auto &storage_uris_pair : delete_uris_by_unique_name) {
+    for (auto &storage_uris_pair : delete_uris_by_unique_name) {
         const std::string &storage_unique_name = storage_uris_pair.first;
-        const std::vector<DataStorageUri> &storage_uris = storage_uris_pair.second;
+        auto &storage_uris = storage_uris_pair.second;
+        if (!task.confirmed_missing_uris.empty()) {
+            const auto backend = data_storage_manager_->GetDataStorageBackend(storage_unique_name);
+            bool skip_missing = true;
+            if (backend && IsTairMempoolStorageType(backend->GetType())) {
+                const auto spec =
+                    std::dynamic_pointer_cast<TairMemPoolStorageSpec>(backend->GetStorageConfig().storage_spec());
+                // Shared KVCS data can outlive its owner. Keep sending Free by
+                // default even when MightExist has rejected the owner's URI.
+                skip_missing = spec && spec->skip_confirmed_missing_backend_delete();
+            }
+            if (skip_missing) {
+                storage_uris.erase(std::remove_if(storage_uris.begin(),
+                                                  storage_uris.end(),
+                                                  [&](const DataStorageUri &uri) {
+                                                      return task.confirmed_missing_uris.count(uri.ToUriString()) != 0;
+                                                  }),
+                                   storage_uris.end());
+            }
+        }
+        if (storage_uris.empty()) {
+            continue;
+        }
         KVCM_LOG_DEBUG("Deleting %zu entries from storage: %s", storage_uris.size(), storage_unique_name.c_str());
         std::vector<ErrorCode> delete_results =
             data_storage_manager_->Delete(request_context.get(), storage_unique_name, storage_uris, nullptr);
