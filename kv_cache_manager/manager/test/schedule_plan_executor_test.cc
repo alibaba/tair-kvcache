@@ -82,6 +82,71 @@ std::shared_ptr<MetaIndexer> MetaIndexerManager_GetMetaIndexer_throw_stub(void *
     throw std::runtime_error("injected GetMetaIndexer exception");
 }
 
+class RecordingDeleteBackend : public DataStorageBackend {
+public:
+    explicit RecordingDeleteBackend(const std::string &name = "gc_delete_backend",
+                                    DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                    bool skip_missing = false)
+        : DataStorageBackend(nullptr) {
+        config_.set_type(type);
+        if (IsTairMempoolStorageType(type)) {
+            auto spec = std::make_shared<TairMemPoolStorageSpec>();
+            if (skip_missing) {
+                spec->set_skip_confirmed_missing_backend_delete(true);
+            }
+            config_.set_storage_spec(spec);
+        }
+        config_.set_global_unique_name(name);
+        SetOpen(true);
+        SetAvailable(true);
+    }
+    DataStorageType GetType() override { return config_.type(); }
+    bool Available() override { return true; }
+    double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
+    const StorageConfig &GetStorageConfig() override { return config_; }
+    ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
+    ErrorCode Close() override { return EC_OK; }
+    std::vector<std::pair<ErrorCode, DataStorageUri>>
+    Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override {
+        return {};
+    }
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+        delete_batches.push_back(uris);
+        if (throw_on_delete) {
+            throw std::runtime_error("injected storage delete exception");
+        }
+        if (on_delete) {
+            on_delete();
+        }
+        if (short_result) {
+            return {};
+        }
+        std::vector<ErrorCode> results;
+        for (const auto &uri : uris) {
+            const auto it = delete_results_by_uri.find(uri.ToUriString());
+            results.push_back(it == delete_results_by_uri.end() ? delete_result : it->second);
+        }
+        return results;
+    }
+    std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<bool>(uris.size(), true);
+    }
+    std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<ErrorCode>(uris.size(), EC_OK);
+    }
+    std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<ErrorCode>(uris.size(), EC_OK);
+    }
+
+    ErrorCode delete_result{EC_OK};
+    bool throw_on_delete{false};
+    bool short_result{false};
+    std::function<void()> on_delete;
+    std::map<std::string, ErrorCode> delete_results_by_uri;
+    std::vector<std::vector<DataStorageUri>> delete_batches;
+};
+
 class SchedulePlanExecutorTestHelper {
 public:
     static LocationSpec CreateLocationSpec(const std::string &name = "", const std::string &uri = "") {
@@ -217,6 +282,236 @@ public:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     const std::string kTestInstanceName = "test_instance";
 };
+
+class TairMempoolGcDeleteTest : public SchedulePlanExecutorTest {
+public:
+    void SetUp() override {
+        SchedulePlanExecutorTest::SetUp();
+        ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+        indexer = meta_manager_->GetMetaIndexer(kTestInstanceName);
+        searcher = std::make_unique<MetaSearcher>(indexer);
+        executor = std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    }
+
+    std::shared_ptr<RecordingDeleteBackend>
+    AddBackend(const std::string &name, DataStorageType type, bool skip_missing = false) {
+        auto backend = std::make_shared<RecordingDeleteBackend>(name, type, skip_missing);
+        data_storage_manager_->storage_map_[name] = backend;
+        return backend;
+    }
+
+    void SetLocation(int64_t key, const std::string &id, DataStorageType type, const std::vector<std::string> &uris) {
+        std::vector<LocationSpec> specs;
+        for (size_t i = 0; i < uris.size(); ++i) {
+            specs.emplace_back("tp" + std::to_string(i), uris[i]);
+        }
+        std::vector<ErrorCode> results;
+        ASSERT_EQ(EC_OK,
+                  searcher->BatchReplaceLocationSpecs(&context, {key}, {{{id, type, CLS_SERVING, specs}}}, results));
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), results);
+    }
+
+    CacheLocationMap Locations(int64_t key) {
+        CacheLocationMapVector maps;
+        EXPECT_EQ(EC_OK, searcher->BatchGetLocation(&context, {key}, {}, maps));
+        return maps.empty() ? CacheLocationMap{} : maps.front();
+    }
+
+    CacheLocationDelRequest
+    Request(int64_t key, const std::vector<std::string> &ids, const std::set<std::string> &missing) {
+        const auto locations = Locations(key);
+        std::vector<std::string> expected;
+        for (const auto &id : ids) {
+            expected.push_back(locations.at(id)->ToJsonString());
+        }
+        return CacheLocationDelRequest{
+            .instance_id = kTestInstanceName,
+            .block_keys = {key},
+            .location_ids = {ids},
+            .expected_location_values = {expected},
+            .authoritative_read = true,
+            .confirmed_missing_uris = missing,
+        };
+    }
+
+    PlanExecuteResult Run(const CacheLocationDelRequest &request) {
+        auto submitted = executor->SubmitAsync(request);
+        EXPECT_TRUE(submitted.accepted);
+        return submitted.future.get();
+    }
+
+    std::vector<std::string> DeletedUris(const RecordingDeleteBackend &backend) {
+        std::vector<std::string> uris;
+        for (const auto &batch : backend.delete_batches) {
+            for (const auto &uri : batch) {
+                uris.push_back(uri.ToUriString());
+            }
+        }
+        return uris;
+    }
+
+    RequestContext context{"tair_gc_delete_test"};
+    std::shared_ptr<MetaIndexer> indexer;
+    std::unique_ptr<MetaSearcher> searcher;
+    std::unique_ptr<SchedulePlanExecutor> executor;
+};
+
+TEST_F(TairMempoolGcDeleteTest, DefaultAndOptInHandleAllAndPartiallyMissingLocations) {
+    int64_t key = 100;
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+        for (const bool skip : {false, true}) {
+            for (const bool all_missing : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << "type=" << static_cast<int>(type) << " skip=" << skip
+                                                  << " all_missing=" << all_missing);
+                auto backend = AddBackend("pace_gc", type, skip);
+                const std::string first = "pace://pace_gc/1?size=2";
+                const std::string second = "pace://pace_gc/2?size=3";
+                SetLocation(key, "target", type, {first, second});
+                SetLocation(key, "replica", type, {"pace://pace_gc/3?size=11"});
+                const auto replica = Locations(key).at("replica")->ToJsonString();
+                const auto before_usage = indexer->GetStorageUsageByType(type);
+                std::set<std::string> missing{first};
+                if (all_missing) {
+                    missing.insert(second);
+                }
+                const auto result = Run(Request(key, {"target"}, missing));
+                EXPECT_EQ(EC_OK, result.status) << result.error_message;
+                const std::vector<std::string> expected =
+                    !skip ? std::vector<std::string>{first, second}
+                          : (all_missing ? std::vector<std::string>{} : std::vector<std::string>{second});
+                EXPECT_EQ(expected, DeletedUris(*backend));
+                const auto remaining = Locations(key);
+                ASSERT_EQ(1u, remaining.size());
+                EXPECT_EQ(replica, remaining.at("replica")->ToJsonString());
+                EXPECT_EQ(before_usage - 5, indexer->GetStorageUsageByType(type));
+                ++key;
+            }
+        }
+    }
+}
+
+TEST_F(TairMempoolGcDeleteTest, MixedStoragesUseTheirOwnPolicyAndOtherBackendsKeepSkipping) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    auto default_backend = AddBackend("pace_default", type);
+    auto skip_backend = AddBackend("pace_skip", type, true);
+    auto dummy_backend = AddBackend("dummy_gc", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+    const std::string missing_default = "pace://pace_default/1?size=2";
+    const std::string missing_skip = "pace://pace_skip/2?size=3";
+    const std::string existing_skip = "pace://pace_skip/3?size=5";
+    const std::string missing_dummy = "dummy://dummy_gc/missing?size=7";
+    SetLocation(100, "mixed", type, {missing_default, missing_skip, existing_skip});
+    SetLocation(100, "dummy", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_dummy});
+    EXPECT_EQ(EC_OK, Run(Request(100, {"mixed", "dummy"}, {missing_default, missing_skip, missing_dummy})).status);
+    EXPECT_EQ((std::vector<std::string>{missing_default}), DeletedUris(*default_backend));
+    EXPECT_EQ((std::vector<std::string>{existing_skip}), DeletedUris(*skip_backend));
+    EXPECT_TRUE(dummy_backend->delete_batches.empty());
+    EXPECT_TRUE(Locations(100).empty());
+    EXPECT_EQ(0u, indexer->GetStorageUsage());
+
+    // Enabling the optimization never suppresses an ordinary deletion request.
+    SetLocation(101, "ordinary", type, {missing_skip});
+    EXPECT_EQ(EC_OK, Run(Request(101, {"ordinary"}, {})).status);
+    EXPECT_EQ((std::vector<std::string>{existing_skip, missing_skip}), DeletedUris(*skip_backend));
+}
+
+TEST_F(TairMempoolGcDeleteTest, MetadataOnlySkipsDeleteForBothSettings) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    for (const bool skip : {false, true}) {
+        auto backend = AddBackend("pace_gc", type, skip);
+        const std::string uri = "pace://pace_gc/1?size=5";
+        SetLocation(100, "target", type, {uri});
+        auto request = Request(100, {"target"}, {uri});
+        request.metadata_only = true;
+        EXPECT_EQ(EC_OK, Run(request).status);
+        EXPECT_TRUE(backend->delete_batches.empty());
+        EXPECT_TRUE(Locations(100).empty());
+        EXPECT_EQ(0u, indexer->GetStorageUsage());
+    }
+}
+
+TEST_F(TairMempoolGcDeleteTest, RefreshedSnapshotAndCasLoserKeepTheirLocationsAndUsage) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    auto backend = AddBackend("pace_gc", type);
+    const std::string old_uri = "pace://pace_gc/1?size=5";
+    const std::string fresh_uri = "pace://pace_gc/2?size=13";
+    SetLocation(100, "target", type, {old_uri});
+    const auto stale_request = Request(100, {"target"}, {old_uri});
+    SetLocation(100, "target", type, {fresh_uri}); // Same id and SERVING status, different complete value.
+    EXPECT_EQ(EC_OK, Run(stale_request).status);
+    EXPECT_TRUE(backend->delete_batches.empty());
+    EXPECT_EQ(fresh_uri, Locations(100).at("target")->location_specs().front().uri());
+    EXPECT_EQ(13u, indexer->GetStorageUsage());
+
+    SetLocation(101, "unchanged", type, {old_uri});
+    SetLocation(101, "refreshed", type, {fresh_uri});
+    auto request = Request(101, {"unchanged", "refreshed"}, {old_uri, fresh_uri});
+    Stub cas_stub;
+    cas_refresh_stub = &cas_stub;
+    location_to_refresh_during_cas = "refreshed";
+    cas_stub.set(ADDR(MetaSearcher, BatchCASLocationStatus), RefreshLocationBeforeCas);
+    const auto result = Run(request);
+    cas_refresh_stub = nullptr;
+    EXPECT_EQ(EC_OK, result.status);
+    EXPECT_EQ((std::vector<std::string>{old_uri}), DeletedUris(*backend));
+    const auto remaining = Locations(101);
+    ASSERT_EQ(1u, remaining.size());
+    EXPECT_EQ(CLS_WRITING, remaining.at("refreshed")->status());
+    EXPECT_EQ(26u, indexer->GetStorageUsage());
+}
+
+TEST_F(TairMempoolGcDeleteTest, FinalCadKeepsLocationRefreshedDuringBackendDelete) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    auto backend = AddBackend("pace_gc", type);
+    const std::string old_uri = "pace://pace_gc/1?size=5";
+    const std::string fresh_uri = "pace://pace_gc/2?size=13";
+    SetLocation(100, "target", type, {old_uri});
+    backend->on_delete = [&] { SetLocation(100, "target", type, {fresh_uri}); };
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Request(100, {"target"}, {old_uri})).status);
+    EXPECT_EQ((std::vector<std::string>{old_uri}), DeletedUris(*backend));
+    EXPECT_EQ(fresh_uri, Locations(100).at("target")->location_specs().front().uri());
+    EXPECT_EQ(13u, indexer->GetStorageUsage());
+}
+
+TEST_F(TairMempoolGcDeleteTest, DeleteResultsPreserveExistingMetadataUsageAndLogContracts) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    Stub log_stub;
+    log_stub.set(ADDR(LoggerBroker, Log), CapturePhysicalDeleteWarnings);
+    int64_t key = 100;
+    for (const auto ec : {EC_OK, EC_NOENT, EC_ERROR, EC_TIMEOUT}) {
+        SCOPED_TRACE(static_cast<int>(ec));
+        auto backend = AddBackend("pace_gc", type);
+        backend->delete_result = ec;
+        const std::string uri = "pace://pace_gc/" + std::to_string(key) + "?size=5";
+        SetLocation(key, "target", type, {uri});
+        physical_delete_warnings.clear();
+        const auto result = Run(Request(key, {"target"}, {uri}));
+        const bool failed = ec != EC_OK && ec != EC_NOENT;
+        EXPECT_EQ(failed ? EC_PARTIAL_OK : EC_OK, result.status);
+        EXPECT_EQ(failed, result.error_logged);
+        EXPECT_EQ(failed ? 1u : 0u, physical_delete_warnings.size());
+        EXPECT_EQ((std::vector<std::string>{uri}), DeletedUris(*backend));
+        EXPECT_TRUE(Locations(key).empty());
+        EXPECT_EQ(0u, indexer->GetStorageUsage());
+        ++key;
+    }
+
+    auto backend = AddBackend("pace_gc", type);
+    const std::string uri = "pace://pace_gc/200?size=5";
+    SetLocation(200, "target", type, {uri});
+    backend->short_result = true;
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Request(200, {"target"}, {uri})).status);
+    EXPECT_TRUE(Locations(200).empty());
+    EXPECT_EQ(0u, indexer->GetStorageUsage());
+
+    SetLocation(201, "target", type, {uri});
+    backend->throw_on_delete = true;
+    const auto result = Run(Request(201, {"target"}, {uri}));
+    EXPECT_EQ(EC_ERROR, result.status);
+    EXPECT_FALSE(result.error_logged);
+    EXPECT_EQ(CLS_DELETING, Locations(201).at("target")->status());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+}
 
 TEST_F(SchedulePlanExecutorTest, TestSubmit) {
     CreateMetaIndexer(kTestInstanceName, "local");
@@ -887,56 +1182,6 @@ TEST_F(SchedulePlanExecutorTest, TestMetadataOnlyLocationDeleteSkipsPhysicalBack
 
 TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentlyAndLogsRealFailures) {
     ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
-
-    class RecordingDeleteBackend : public DataStorageBackend {
-    public:
-        explicit RecordingDeleteBackend(const std::string &name = "gc_delete_backend") : DataStorageBackend(nullptr) {
-            config_.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
-            config_.set_global_unique_name(name);
-            SetOpen(true);
-            SetAvailable(true);
-        }
-        DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_DUMMY; }
-        bool Available() override { return true; }
-        double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
-        const StorageConfig &GetStorageConfig() override { return config_; }
-        ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
-        ErrorCode Close() override { return EC_OK; }
-        std::vector<std::pair<ErrorCode, DataStorageUri>>
-        Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override {
-            return {};
-        }
-        std::vector<ErrorCode>
-        Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
-            delete_batches.push_back(uris);
-            if (throw_on_delete) {
-                throw std::runtime_error("injected storage delete exception");
-            }
-            std::vector<ErrorCode> results;
-            for (const auto &uri : uris) {
-                const auto it = delete_results_by_uri.find(uri.ToUriString());
-                results.push_back(it == delete_results_by_uri.end() ? delete_result : it->second);
-            }
-            return results;
-        }
-        std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
-            return std::vector<bool>(uris.size(), true);
-        }
-        std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
-            return std::vector<ErrorCode>(uris.size(), EC_OK);
-        }
-        std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override {
-            return std::vector<ErrorCode>(uris.size(), EC_OK);
-        }
-
-        ErrorCode delete_result{EC_OK};
-        bool throw_on_delete{false};
-        std::map<std::string, ErrorCode> delete_results_by_uri;
-        std::vector<std::vector<DataStorageUri>> delete_batches;
-
-    private:
-        StorageConfig config_;
-    };
 
     Stub log_stub;
     physical_delete_warnings.clear();

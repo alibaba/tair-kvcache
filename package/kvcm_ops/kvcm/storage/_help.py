@@ -17,6 +17,8 @@ storage module:
         # add pace storage, given "global_unique_name, domain, timeout"
         python3 -m kvcm_ops add_storage -u common_pace_storage pace -d 'http://pace-meta-service-bj-1.alibaba-inc.com' -t 30 --media_type 2
         python3 -m kvcm_ops add_storage -u common_pace_ssd_storage pace_ssd -d 'http://pace-meta-service-bj-1.alibaba-inc.com' -t 30
+        # PACE GC sends Delete for missing URIs by default; opt in to skipping with:
+        # --skip_confirmed_missing_backend_delete true (also supported by pace_ssd)
 
         # add 3fs storage, given "global_unique_name, cluster_name, mountpoint, root_dir, key_count_per_file, touch_file_when_create(default true)"
         python3 -m kvcm_ops add_storage -u common_3fs_storage 3fs -c '' -m '/3fs/stage/3fs/' -r "common_3fs" -k 16
@@ -33,6 +35,7 @@ storage module:
         python3 -m kvcm_ops update_storage 3fs --help
         python3 -m kvcm_ops update_storage -u test_nfs_1 nfs -r /home/zhaotaonan.ztn/temp -k 64
         # omitting --media_type preserves the current PACE storage type/media, including legacy media_type=5
+        # omitting --skip_confirmed_missing_backend_delete preserves its current value; pass false to disable skipping
         python3 -m kvcm_ops update_storage -u common_pace_storage pace -d 'http://pace-meta-service-bj-1.alibaba-inc.com' -t 60
         # pace and pace_ssd only update storages registered with their respective storage type
         python3 -m kvcm_ops update_storage -u common_pace_ssd_storage pace_ssd -d 'http://pace-meta-service-bj-1.alibaba-inc.com' -t 30

@@ -49,6 +49,12 @@ curl -g -vvv -X POST http://127.0.0.1:6492/api/addStorage \
 }'
 ```
 
+TairMempool Storage（`ST_TAIRMEMPOOL` / `ST_TAIRMEMPOOL_SSD`）可以在 `tair_mem_pool`
+对象中设置 `"skip_confirmed_missing_backend_delete": true`。默认 `false`，即 GC 对已判定
+不存在的 URI 仍发送 Backend Delete；设为 `true` 才跳过这些 URI 的后端删除。
+该字段支持 AddStorage / UpdateStorage / ListStorage，按 `global_unique_name` 生效，
+不影响 `metadata_only` 清理。配置示例和失败处理见 [配置说明](../configuration.md)。
+
 ## Enable Storage
 ```bash
 curl -g -vvv -X POST http://localhost:6492/api/enableStorage \
