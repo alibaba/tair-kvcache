@@ -1925,6 +1925,54 @@ ErrorCode MetaIndexer::Scan(RequestContext *request_context,
     return ec;
 }
 
+ErrorCode MetaIndexer::TrimResidues(RequestContext *request_context, const size_t scan_batch_size) noexcept {
+    if (!backend_manager_->IsMemoryPrimary() ||
+        backend_manager_->GetRecoverState() != MetaStorageBackendManager::RecoverState::kRunning) {
+        return EC_OK;
+    }
+
+    std::string cursor = SCAN_BASE_CURSOR;
+    do {
+        std::string next_cursor;
+        KeyVector keys;
+        const ErrorCode list_ec = backend_manager_->ListPersistentKeys(
+            request_context, cursor, static_cast<int64_t>(scan_batch_size), next_cursor, keys);
+        if (list_ec != EC_OK) {
+            KVCM_LOG_ERROR("instance[%s] list persistent keys failed, cursor[%s], ec[%d]",
+                           instance_id_.c_str(),
+                           cursor.c_str(),
+                           list_ec);
+            return list_ec;
+        }
+
+        KeyVector batch_keys;
+        KeyVector trimmed_keys;
+        KeyVector page_trimmed_keys;
+        page_trimmed_keys.reserve(keys.size());
+        ErrorCode page_ec = EC_OK;
+        for (const auto &batch : MakeBatches(keys)) {
+            FillBatchKeys(batch.global_indices, keys, batch_keys);
+            {
+                ScopedBatchLock lock(*this, batch.shard_indices);
+                page_ec = backend_manager_->TrimPersistentOrphans(request_context, batch_keys, trimmed_keys);
+            }
+            page_trimmed_keys.insert(page_trimmed_keys.end(), trimmed_keys.begin(), trimmed_keys.end());
+            if (page_ec != EC_OK) {
+                break;
+            }
+        }
+        if (!page_trimmed_keys.empty() && !backend_manager_->Sync(page_trimmed_keys)) {
+            KVCM_LOG_ERROR("instance[%s] sync persistent orphan deletes failed", instance_id_.c_str());
+            return EC_ERROR;
+        }
+        if (page_ec != EC_OK) {
+            return page_ec;
+        }
+        cursor = std::move(next_cursor);
+    } while (cursor != SCAN_BASE_CURSOR);
+    return EC_OK;
+}
+
 ErrorCode MetaIndexer::ScanLocationsForMaintenance(RequestContext *request_context,
                                                    const std::string &cursor,
                                                    const size_t limit,
@@ -2017,6 +2065,8 @@ size_t MetaIndexer::GetMaxKeyCount() const noexcept { return max_key_count_; }
 size_t MetaIndexer::GetMemUsage() const noexcept { return backend_manager_->GetMemUsage(); }
 
 bool MetaIndexer::Sync(const KeyVector &keys) noexcept { return backend_manager_->Sync(keys); }
+
+bool MetaIndexer::SyncAll() noexcept { return backend_manager_->SyncAll(); }
 
 MetaStorageBackend::AsyncWriteStats MetaIndexer::GetAsyncWriteStats() noexcept {
     return backend_manager_->GetAsyncWriteStats();

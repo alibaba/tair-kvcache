@@ -1535,9 +1535,9 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
         return ErrorCode::EC_INSTANCE_NOT_EXIST;
     }
 
+    constexpr std::size_t limit = 256;
     std::string cursor = SCAN_BASE_CURSOR;
     do {
-        constexpr std::size_t limit = 256;
         std::string next_cursor;
 
         CacheMetaDelRequest request;
@@ -1549,11 +1549,27 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
             RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "trim cache failed");
         }
 
-        reclaimer_task_supervisor_->Submit(trace_id, std::move(request));
+        if (!request.block_keys.empty()) {
+            const PlanExecuteResult result = schedule_plan_executor_->Submit(request).get();
+            if (result.status != EC_OK) {
+                if (!result.error_logged) {
+                    PREFIX_LOG(WARN,
+                               "trim cache delete failed, ec[%d], message[%s]",
+                               result.status,
+                               result.error_message.c_str());
+                }
+                return result.status;
+            }
+        }
         cursor = next_cursor;
     } while (cursor != SCAN_BASE_CURSOR);
 
-    return ErrorCode::EC_OK;
+    if (!meta_indexer->SyncAll()) {
+        PREFIX_LOG(WARN, "trim cache metadata sync failed");
+        return EC_ERROR;
+    }
+
+    return meta_indexer->TrimResidues(request_context, limit);
 }
 void CacheManager::PauseReclaimer() { cache_reclaimer_->Pause(); }
 void CacheManager::ResumeReclaimer() { cache_reclaimer_->Resume(); }
@@ -4649,8 +4665,8 @@ CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance
         }
 
         std::map<std::string, std::vector<std::string>, std::less<>> ranked_hosts_by_base;
-        const auto l1p5_it = event_snapshots->by_storage_type.find(
-            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+        const auto l1p5_it =
+            event_snapshots->by_storage_type.find(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
         if (l1p5_it != event_snapshots->by_storage_type.end()) {
             for (const auto &[reporter, state] : l1p5_it->second.reporters) {
                 (void)state;

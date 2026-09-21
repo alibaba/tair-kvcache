@@ -104,6 +104,42 @@ public:
 private:
     Shape shape_ = Shape::kShortOuter;
 };
+
+class PagedTrimBackend : public MetaLocalBackend {
+public:
+    ErrorCode ListKeys(RequestContext *,
+                       const std::string &,
+                       int64_t,
+                       std::string &out_next_cursor,
+                       KeyTypeVec &out_keys) noexcept override {
+        ++list_count;
+        out_keys.clear();
+        if (list_count == 1) {
+            out_next_cursor = "1";
+        } else {
+            out_next_cursor = SCAN_BASE_CURSOR;
+            out_keys = {11, 22};
+        }
+        return EC_OK;
+    }
+
+    std::vector<ErrorCode> ForceDelete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override {
+        force_deleted_keys = keys;
+        return MetaLocalBackend::Delete(request_context, keys);
+    }
+
+    bool Sync(const KeyTypeVec &keys) noexcept override {
+        synced_keys = keys;
+        ++sync_count;
+        return sync_result;
+    }
+
+    int list_count = 0;
+    int sync_count = 0;
+    bool sync_result = true;
+    KeyTypeVec force_deleted_keys;
+    KeyTypeVec synced_keys;
+};
 } // namespace
 
 class MetaIndexerTest : public MetaIndexerTestBase, public TESTBASE {
@@ -189,6 +225,91 @@ TEST_F(MetaIndexerTest, TestProcessErrorCodesRejectsAbnormalResultCount) {
                   "trace", {EC_OK, EC_OK, EC_OK, EC_OK}, {}, keys, "test_long_result", long_result));
     EXPECT_EQ(EC_MISMATCH, long_result.ec);
     EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH, EC_MISMATCH, EC_MISMATCH}), long_result.error_codes);
+}
+
+TEST_F(MetaIndexerTest, TestTrimResiduesContinuesAfterEmptyPersistentPage) {
+    const std::string config = R"({
+        "max_key_count" : 100, "mutex_shard_num" : 8,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : {}
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config));
+
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
+    auto persistent = std::make_unique<PagedTrimBackend>();
+    auto *persistent_raw = persistent.get();
+    auto cache = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, persistent->Init("test", backend_config));
+    ASSERT_EQ(EC_OK, persistent->Open());
+    ASSERT_EQ(EC_OK, cache->Init("test", backend_config));
+    ASSERT_EQ(EC_OK, cache->Open());
+
+    KeyVector keys{11, 22};
+    CacheLocationMapVector locations(2);
+    locations[0].emplace("loc_11", MakeLocation("loc_11", "uri_11"));
+    locations[1].emplace("loc_22", MakeLocation("loc_22", "uri_22"));
+    PropertyMapVector properties(2);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), persistent->Put(nullptr, keys, locations, properties));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, cache->Put(nullptr, {11}, {locations[0]}, PropertyMapVector(1)));
+
+    auto &manager = *meta_indexer_->backend_manager_;
+    manager.persistent_backend_ = std::move(persistent);
+    manager.cache_backend_ = std::move(cache);
+    manager.memory_primary_ = true;
+    manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    EXPECT_EQ(EC_OK, meta_indexer_->TrimResidues(request_context_.get(), 1));
+    EXPECT_EQ(0, persistent_raw->list_count);
+
+    manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    persistent_raw->sync_result = false;
+    EXPECT_EQ(EC_ERROR, meta_indexer_->TrimResidues(request_context_.get(), 1));
+    EXPECT_EQ(2, persistent_raw->list_count);
+    EXPECT_EQ(KeyVector{22}, persistent_raw->force_deleted_keys);
+    EXPECT_EQ(KeyVector{22}, persistent_raw->synced_keys);
+
+    persistent_raw->sync_result = true;
+    EXPECT_EQ(EC_OK, meta_indexer_->TrimResidues(request_context_.get(), 1));
+    EXPECT_EQ(3, persistent_raw->list_count);
+    EXPECT_EQ(KeyVector{22}, persistent_raw->force_deleted_keys);
+    EXPECT_EQ(KeyVector{22}, persistent_raw->synced_keys);
+
+    std::vector<bool> exists;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), persistent_raw->Exists(nullptr, keys, exists));
+    EXPECT_EQ((std::vector<bool>{true, false}), exists);
+}
+
+TEST_F(MetaIndexerTest, TestTrimResiduesSyncsOncePerPersistentPage) {
+    const std::string config = R"({
+        "max_key_count" : 100, "mutex_shard_num" : 8, "batch_key_size" : 1,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : {}
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config));
+
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
+    auto persistent = std::make_unique<PagedTrimBackend>();
+    auto *persistent_raw = persistent.get();
+    auto cache = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, persistent->Init("test", backend_config));
+    ASSERT_EQ(EC_OK, persistent->Open());
+    ASSERT_EQ(EC_OK, cache->Init("test", backend_config));
+    ASSERT_EQ(EC_OK, cache->Open());
+
+    KeyVector keys{11, 22};
+    CacheLocationMapVector locations(2);
+    locations[0].emplace("loc_11", MakeLocation("loc_11", "uri_11"));
+    locations[1].emplace("loc_22", MakeLocation("loc_22", "uri_22"));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), persistent->Put(nullptr, keys, locations, PropertyMapVector(2)));
+
+    auto &manager = *meta_indexer_->backend_manager_;
+    manager.persistent_backend_ = std::move(persistent);
+    manager.cache_backend_ = std::move(cache);
+    manager.memory_primary_ = true;
+    manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+
+    EXPECT_EQ(EC_OK, meta_indexer_->TrimResidues(request_context_.get(), 2));
+    EXPECT_EQ(1, persistent_raw->sync_count);
+    EXPECT_THAT(persistent_raw->synced_keys, UnorderedElementsAre(11, 22));
 }
 
 TEST_F(MetaIndexerTest, TestParallelLocalLocationValuesMatchSerialAndPreserveErrors) {

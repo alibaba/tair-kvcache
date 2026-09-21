@@ -78,6 +78,8 @@ public:
                                                          const KeyVector &keys,
                                                          const LocationIdsPerKey &location_ids,
                                                          int32_t &out_reclaimed_count) noexcept;
+    ErrorCode
+    TrimPersistentOrphans(RequestContext *request_context, const KeyVector &keys, KeyVector &out_trimmed_keys) noexcept;
 
     // ----- Read APIs -----
     std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *request_context,
@@ -154,6 +156,11 @@ public:
                        const int64_t limit,
                        std::string &out_next_cursor,
                        KeyTypeVec &out_keys) noexcept;
+    ErrorCode ListPersistentKeys(RequestContext *request_context,
+                                 const std::string &cursor,
+                                 int64_t limit,
+                                 std::string &out_next_cursor,
+                                 KeyTypeVec &out_keys) noexcept;
     // Scan the in-memory cache when dual-backend metadata is configured;
     // single-backend deployments scan their only persistent backend.
     ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,
@@ -178,6 +185,7 @@ public:
     // Synchronously flush pending writes for the given keys to persistent storage.
     // Returns true on success, false on failure/timeout.
     bool Sync(const KeyVector &keys) noexcept;
+    bool SyncAll() noexcept;
     bool SyncBeforeMaintenanceRead(const KeyVector &keys) noexcept { return memory_primary_ || Sync(keys); }
     bool IsMemoryPrimary() const noexcept { return memory_primary_; }
 

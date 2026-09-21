@@ -328,6 +328,18 @@ TEST_F(MetaAsyncRedisBackendTest, TestSyncMultiQueue) {
     ASSERT_TRUE(backend_->Sync(keys));
 }
 
+TEST_F(MetaAsyncRedisBackendTest, TestSyncAll) {
+    ASSERT_EQ(EC_OK, InitAndOpen());
+
+    CacheLocationMapVector locations(1);
+    PropertyMapVector properties = {{{"field", "value"}}};
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Put(nullptr, {10}, locations, properties));
+    EXPECT_TRUE(backend_->SyncAll());
+
+    ASSERT_EQ(EC_OK, backend_->Close());
+    EXPECT_FALSE(backend_->SyncAll());
+}
+
 // ==================== Read Operations (Passthrough) Tests ====================
 
 TEST_F(MetaAsyncRedisBackendTest, TestGetPassthrough) {
@@ -1186,6 +1198,24 @@ TEST_F(MetaAsyncRedisBackendTest, TestForceUpsertBypassesQueueCapacity) {
     EXPECT_EQ(2, taken);
     EXPECT_EQ(WriteOpType::kDelete, std::get<WriteOp>(items[0]).type);
     EXPECT_EQ(WriteOpType::kUpsert, std::get<WriteOp>(items[1]).type);
+    EXPECT_EQ(0, queue->GetKeySize());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestForceDeleteBypassesQueueCapacity) {
+    InitMemoryPrimaryWithoutConsumers(1);
+    const KeyType key = 7;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Delete(nullptr, {key}, {EC_OK}));
+    EXPECT_EQ(std::vector<ErrorCode>{EC_TIMEOUT}, backend_->Delete(nullptr, {key}, {EC_OK}));
+    EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->ForceDelete(nullptr, {key}));
+
+    auto &queue = backend_->queues_[backend_->GetQueueIndexForKey(key)];
+    EXPECT_EQ(2, queue->GetKeySize());
+    int64_t taken = 0;
+    auto items = queue->PopBatch(10, taken);
+    ASSERT_EQ(2, items.size());
+    EXPECT_EQ(2, taken);
+    EXPECT_EQ(WriteOpType::kDelete, std::get<WriteOp>(items[0]).type);
+    EXPECT_EQ(WriteOpType::kDelete, std::get<WriteOp>(items[1]).type);
     EXPECT_EQ(0, queue->GetKeySize());
 }
 

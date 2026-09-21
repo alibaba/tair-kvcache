@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <dlfcn.h>
 #include <filesystem>
 #include <future>
@@ -55,6 +56,7 @@ public:
                 (RequestContext *, const KeyTypeVec &, const CacheLocationMapVector &, const PropertyMapVector &),
                 (noexcept, override));
     MOCK_METHOD(std::vector<ErrorCode>, Delete, (RequestContext *, const KeyTypeVec &), (noexcept, override));
+    MOCK_METHOD(std::vector<ErrorCode>, ForceDelete, (RequestContext *, const KeyTypeVec &), (noexcept, override));
     MOCK_METHOD(std::vector<ErrorCode>,
                 Delete,
                 (RequestContext *, const KeyTypeVec &, const std::vector<ErrorCode> &),
@@ -72,6 +74,7 @@ public:
                 (RequestContext *, const KeyTypeVec &, const LocationIdsPerKey &, const std::vector<ErrorCode> &),
                 (noexcept, override));
     MOCK_METHOD(bool, Sync, (const KeyTypeVec &), (noexcept, override));
+    MOCK_METHOD(bool, SyncAll, (), (noexcept, override));
 };
 
 class PausedRecoverBackend : public MetaLocalBackend {
@@ -572,6 +575,7 @@ protected:
         EXPECT_EQ(EC_OK, backup->Init("test", config));
         EXPECT_EQ(EC_OK, backup->Open());
         ON_CALL(*raw, Sync(_)).WillByDefault(Return(true));
+        ON_CALL(*raw, SyncAll()).WillByDefault(Return(true));
         mgr.cache_backend_ = std::move(local);
         mgr.persistent_backend_ = std::move(backup);
         mgr.memory_primary_ = true;
@@ -635,6 +639,49 @@ TEST_F(MetaStorageBackendManagerTest, TestMemoryPrimaryWritesCommitLocalBeforeFa
     EXPECT_CALL(*backup, Delete(_, KeyVector{11}, std::vector<ErrorCode>{EC_NOENT}))
         .WillOnce(Return(std::vector<ErrorCode>{EC_TIMEOUT}));
     EXPECT_EQ(std::vector<ErrorCode>{EC_NOENT}, mgr.Delete(nullptr, {11}));
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestTrimPersistentOrphansSkipsLiveLocalKeys) {
+    MetaStorageBackendManager mgr;
+    auto *backup = InitMemoryPrimary(mgr);
+    auto batch = MakeBatch({11, 12});
+    ASSERT_EQ(std::vector<ErrorCode>({EC_OK, EC_OK}),
+              backup->MetaLocalBackend::Put(nullptr, batch.batch_keys, batch.batch_locations, batch.batch_properties));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+              mgr.cache_backend_->Put(nullptr,
+                                      KeyVector{11},
+                                      CacheLocationMapVector{batch.batch_locations[0]},
+                                      PropertyMapVector{batch.batch_properties[0]}));
+
+    std::string next_cursor;
+    KeyVector listed_keys;
+    ASSERT_EQ(EC_OK, mgr.ListKeys(nullptr, SCAN_BASE_CURSOR, 100, next_cursor, listed_keys));
+    EXPECT_EQ(KeyVector{11}, listed_keys);
+    listed_keys.clear();
+    ASSERT_EQ(EC_OK, mgr.ListPersistentKeys(nullptr, SCAN_BASE_CURSOR, 100, next_cursor, listed_keys));
+    std::sort(listed_keys.begin(), listed_keys.end());
+    EXPECT_EQ((KeyVector{11, 12}), listed_keys);
+
+    EXPECT_CALL(*backup, ForceDelete(_, KeyVector{12}))
+        .WillOnce(Invoke([backup](RequestContext *ctx, const KeyTypeVec &keys) {
+            return backup->MetaLocalBackend::Delete(ctx, keys);
+        }));
+    KeyVector trimmed_keys;
+    EXPECT_EQ(EC_OK, mgr.TrimPersistentOrphans(nullptr, {11, 12}, trimmed_keys));
+    EXPECT_EQ(KeyVector{12}, trimmed_keys);
+
+    std::vector<bool> persistent_exists;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              backup->MetaLocalBackend::Exists(nullptr, {11, 12}, persistent_exists));
+    EXPECT_EQ((std::vector<bool>{true, false}), persistent_exists);
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestSyncAllUsesPersistentBackend) {
+    MetaStorageBackendManager mgr;
+    auto *backup = InitMemoryPrimary(mgr);
+
+    EXPECT_CALL(*backup, SyncAll()).WillOnce(Return(false));
+    EXPECT_FALSE(mgr.SyncAll());
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestMemoryPrimaryDeletingForceEnqueuesFailedAdmissions) {

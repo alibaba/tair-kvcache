@@ -816,6 +816,55 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
     return route.local_primary || !route.secondary ? std::move(primary_results) : std::move(secondary_results);
 }
 
+ErrorCode MetaStorageBackendManager::TrimPersistentOrphans(RequestContext *request_context,
+                                                           const KeyVector &keys,
+                                                           KeyVector &out_trimmed_keys) noexcept {
+    out_trimmed_keys.clear();
+    std::vector<bool> local_exists;
+    const auto exists_results = cache_backend_->Exists(request_context, keys, local_exists);
+    if (exists_results.size() != keys.size() || local_exists.size() != keys.size()) {
+        KVCM_LOG_ERROR("trim persistent orphan Exists results[%lu] values[%lu] mismatch keys[%lu]",
+                       exists_results.size(),
+                       local_exists.size(),
+                       keys.size());
+        return EC_MISMATCH;
+    }
+
+    out_trimmed_keys.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (exists_results[i] != EC_OK) {
+            out_trimmed_keys.clear();
+            return exists_results[i];
+        }
+        if (!local_exists[i]) {
+            out_trimmed_keys.push_back(keys[i]);
+        }
+    }
+    if (out_trimmed_keys.empty()) {
+        return EC_OK;
+    }
+
+    const auto delete_results = persistent_backend_->ForceDelete(request_context, out_trimmed_keys);
+    if (delete_results.size() != out_trimmed_keys.size()) {
+        KVCM_LOG_ERROR("trim persistent orphan Delete results[%lu] mismatch keys[%lu]",
+                       delete_results.size(),
+                       out_trimmed_keys.size());
+        return EC_MISMATCH;
+    }
+
+    ErrorCode ec = EC_OK;
+    size_t successful_count = 0;
+    for (size_t i = 0; i < delete_results.size(); ++i) {
+        if (delete_results[i] == EC_OK || delete_results[i] == EC_NOENT) {
+            out_trimmed_keys[successful_count++] = out_trimmed_keys[i];
+        } else if (ec == EC_OK) {
+            ec = delete_results[i];
+        }
+    }
+    out_trimmed_keys.resize(successful_count);
+    return ec;
+}
+
 std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(RequestContext *request_context,
                                                                                 const KeyVector &keys,
                                                                                 const LocationIdsPerKey &location_ids,
@@ -1983,6 +2032,14 @@ ErrorCode MetaStorageBackendManager::ListKeys(RequestContext *request_context,
     return persistent_backend_->ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
 }
 
+ErrorCode MetaStorageBackendManager::ListPersistentKeys(RequestContext *request_context,
+                                                        const std::string &cursor,
+                                                        const int64_t limit,
+                                                        std::string &out_next_cursor,
+                                                        KeyTypeVec &out_keys) noexcept {
+    return persistent_backend_->ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
+}
+
 ErrorCode MetaStorageBackendManager::ScanLocationsForMaintenance(RequestContext *request_context,
                                                                  const std::string &cursor,
                                                                  const int64_t limit,
@@ -2138,6 +2195,13 @@ bool MetaStorageBackendManager::Sync(const KeyVector &keys) noexcept {
         return true;
     }
     return persistent_backend_->Sync(keys);
+}
+
+bool MetaStorageBackendManager::SyncAll() noexcept {
+    if (!persistent_backend_) {
+        return true;
+    }
+    return persistent_backend_->SyncAll();
 }
 
 MetaStorageBackend::AsyncWriteStats MetaStorageBackendManager::GetAsyncWriteStats() noexcept {

@@ -138,6 +138,12 @@ public:
     //   - EC_ERROR: 删除失败
     virtual std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept = 0;
 
+    // Capacity-unbounded admission for critical async whole-key deletes.
+    // Synchronous backends keep their ordinary Delete semantics.
+    virtual std::vector<ErrorCode> ForceDelete(RequestContext *request_context, const KeyTypeVec &keys) noexcept {
+        return Delete(request_context, keys);
+    }
+
     virtual std::vector<ErrorCode> Delete(RequestContext * /*request_context*/,
                                           const KeyTypeVec &keys,
                                           const std::vector<ErrorCode> & /*previous_error_codes*/) noexcept {
@@ -550,6 +556,10 @@ public:
     // Returns true if all writes persisted successfully, false on failure/timeout.
     // Default: no-op (sync backends have no pending writes).
     virtual bool Sync(const KeyTypeVec & /*keys*/) noexcept { return true; }
+
+    // Synchronously flush all pending writes. Async backends override this to
+    // place a barrier on every write queue; synchronous backends have no work.
+    virtual bool SyncAll() noexcept { return true; }
 
     struct AsyncWriteStats {
         int64_t max_async_queue_size = 0;

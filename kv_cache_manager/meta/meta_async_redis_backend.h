@@ -48,6 +48,7 @@ public:
                                        const KeyTypeVec &keys,
                                        const CacheLocationMapVector &locations,
                                        const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> ForceDelete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override;
     std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override;
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const KeyTypeVec &keys,
@@ -109,6 +110,7 @@ public:
 
     // ----- Sync -----
     bool Sync(const KeyTypeVec &keys) noexcept override;
+    bool SyncAll() noexcept override;
 
     // ----- Metrics -----
     AsyncWriteStats GetAsyncWriteStats() noexcept override;
@@ -123,6 +125,7 @@ private:
                                           const std::vector<ErrorCode> *previous_error_codes,
                                           bool force_enqueue = false) noexcept;
     bool ReserveQueueCapacity(int queue_id, int64_t key_count, bool best_effort_backup);
+    bool SyncQueues(const std::vector<int> &queue_indices) noexcept;
     void ConsumerLoop(int queue_id);
     void CleanupResources() noexcept;
     void BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys);

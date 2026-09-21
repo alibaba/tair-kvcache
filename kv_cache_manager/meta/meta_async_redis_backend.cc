@@ -358,6 +358,11 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::ForceUpsert(RequestContext * /*req
     return EnqueueWriteOp(nullptr, WriteOpType::kUpsert, keys, &properties, &locations, nullptr, nullptr, true);
 }
 
+std::vector<ErrorCode> MetaAsyncRedisBackend::ForceDelete(RequestContext * /*request_context*/,
+                                                          const KeyTypeVec &keys) noexcept {
+    return EnqueueWriteOp(nullptr, WriteOpType::kDelete, keys, nullptr, nullptr, nullptr, nullptr, true);
+}
+
 std::vector<ErrorCode> MetaAsyncRedisBackend::Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept {
     return EnqueueWriteOp(request_context, WriteOpType::kDelete, keys, nullptr, nullptr, nullptr, nullptr);
 }
@@ -787,19 +792,33 @@ bool MetaAsyncRedisBackend::Sync(const KeyTypeVec &keys) noexcept {
     if (keys.empty()) {
         return true;
     }
-    if (!is_running_.load(std::memory_order_acquire)) {
-        return false;
-    }
 
     std::unordered_set<int> touched_queues;
     for (const auto &key : keys) {
         touched_queues.insert(GetQueueIndexForKey(key));
     }
 
-    auto barrier_ctx = std::make_shared<BarrierContext>();
-    barrier_ctx->remain.store(static_cast<int>(touched_queues.size()), std::memory_order_release);
+    return SyncQueues(std::vector<int>(touched_queues.begin(), touched_queues.end()));
+}
 
-    for (int qi : touched_queues) {
+bool MetaAsyncRedisBackend::SyncAll() noexcept {
+    std::vector<int> queue_indices;
+    queue_indices.reserve(queues_.size());
+    for (size_t i = 0; i < queues_.size(); ++i) {
+        queue_indices.push_back(static_cast<int>(i));
+    }
+    return SyncQueues(queue_indices);
+}
+
+bool MetaAsyncRedisBackend::SyncQueues(const std::vector<int> &queue_indices) noexcept {
+    if (!is_running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    auto barrier_ctx = std::make_shared<BarrierContext>();
+    barrier_ctx->remain.store(static_cast<int>(queue_indices.size()), std::memory_order_release);
+
+    for (const int qi : queue_indices) {
         SyncBarrierItem item;
         item.barrier_ctx = barrier_ctx;
         queues_[qi]->PushBarrier(std::move(item));

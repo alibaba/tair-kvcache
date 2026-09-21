@@ -227,6 +227,21 @@ public:
         return sync_call_count_;
     }
 
+    size_t GetSyncAllCallCount() {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        return sync_all_call_count_;
+    }
+
+    size_t GetListKeysCallCount() {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        return list_keys_call_count_;
+    }
+
+    bool ListedKeysBeforeSyncAll() {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        return listed_keys_before_sync_all_;
+    }
+
     std::vector<ErrorCode> Upsert(RequestContext *request_context,
                                   const KeyTypeVec &keys,
                                   const CacheLocationMapVector &locations,
@@ -306,6 +321,25 @@ public:
         return MetaLocalBackend::Sync(keys);
     }
 
+    bool SyncAll() noexcept override {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        ++sync_all_call_count_;
+        return true;
+    }
+
+    ErrorCode ListKeys(RequestContext *request_context,
+                       const std::string &cursor,
+                       int64_t limit,
+                       std::string &out_next_cursor,
+                       KeyTypeVec &out_keys) noexcept override {
+        {
+            std::lock_guard<std::mutex> lock(control_mutex_);
+            ++list_keys_call_count_;
+            listed_keys_before_sync_all_ |= sync_all_call_count_ == 0;
+        }
+        return MetaLocalBackend::ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
+    }
+
 private:
     void MaybeBlockLocationRead() {
         std::unique_lock<std::mutex> lock(control_mutex_);
@@ -342,6 +376,9 @@ private:
     bool release_location_read_ = false;
     std::optional<int64_t> fail_key_on_next_upsert_;
     size_t sync_call_count_ = 0;
+    size_t sync_all_call_count_ = 0;
+    size_t list_keys_call_count_ = 0;
+    bool listed_keys_before_sync_all_ = false;
 };
 
 class DeleteRecordingBackend : public DataStorageBackend {
@@ -2248,7 +2285,6 @@ TEST_F(CacheManagerTest, TestTrimCache) {
         auto ec1 = cache_manager_->TrimCache(
             request_context_.get(), "placeholder_id", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
         ASSERT_EQ(ErrorCode::EC_OK, ec1);
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
         BlockMask block_mask = static_cast<std::size_t>(0);
 
         auto [ec2, cache_metas] =
@@ -2284,7 +2320,6 @@ TEST_F(CacheManagerTest, TestTrimCache) {
         auto ec1 = cache_manager_->TrimCache(
             request_context_.get(), "placeholder_id", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
         ASSERT_EQ(ErrorCode::EC_OK, ec1);
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
         BlockMask block_mask = static_cast<std::size_t>(0);
 
         auto [ec2, cache_metas] =
@@ -2300,6 +2335,71 @@ TEST_F(CacheManagerTest, TestTrimCache) {
                       meta.at("status"));
         }
     }
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheSyncsMetadataOnceAcrossScanPages) {
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+
+    constexpr size_t key_count = 1024;
+    KeyVector keys;
+    CacheLocationVector locations;
+    keys.reserve(key_count);
+    locations.reserve(key_count);
+    for (size_t i = 0; i < key_count; ++i) {
+        keys.push_back(static_cast<int64_t>(i));
+        locations.push_back(std::make_shared<CacheLocation>(
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/trim_" + std::to_string(i) + "?size=1")}));
+    }
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher, request_context_.get(), keys, locations, location_ids));
+
+    EXPECT_EQ(EC_OK,
+              cache_manager_->TrimCache(
+                  request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
+    EXPECT_GT(meta_backend->GetListKeysCallCount(), 1u);
+    EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheSyncsBeforeCleaningPersistentResidueWithEmptyLocal) {
+    auto *persistent = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, persistent);
+    const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+    auto cache = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, cache->Init("test_instance", backend_config));
+    ASSERT_EQ(EC_OK, cache->Open());
+
+    auto &backend_manager = *indexer->backend_manager_;
+    backend_manager.cache_backend_ = std::move(cache);
+    backend_manager.memory_primary_ = true;
+    backend_manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+
+    constexpr KeyType residue_key = 42;
+    CacheLocationMapVector locations(1);
+    locations[0].emplace("residue",
+                         std::make_shared<CacheLocation>(
+                             DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                             1,
+                             std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/trim_residue?size=1")}));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+              persistent->Put(request_context_.get(), {residue_key}, locations, PropertyMapVector(1)));
+
+    EXPECT_EQ(EC_OK,
+              cache_manager_->TrimCache(
+                  request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
+    EXPECT_EQ(1u, persistent->GetSyncAllCallCount());
+    EXPECT_FALSE(persistent->ListedKeysBeforeSyncAll());
+
+    std::vector<bool> exists;
+    EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, persistent->Exists(request_context_.get(), {residue_key}, exists));
+    EXPECT_EQ(std::vector<bool>{false}, exists);
 }
 
 TEST_F(CacheManagerTest, TestUnavailableStorage) {
@@ -8469,9 +8569,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
 
     auto find_match = [](const std::vector<CacheManager::HostCacheMatch> &matches,
                          const std::string &host) -> const CacheManager::HostCacheMatch * {
-        const auto it = std::find_if(matches.begin(), matches.end(), [&](const auto &match) {
-            return match.host_ip_port == host;
-        });
+        const auto it =
+            std::find_if(matches.begin(), matches.end(), [&](const auto &match) { return match.host_ip_port == host; });
         return it == matches.end() ? nullptr : &*it;
     };
 
@@ -8483,16 +8582,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
         register_instance(instance_id);
         InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L1P5);
         InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L2);
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L1P5,
-                     host,
-                     100,
-                     "event_report://10.0.8.1:9700/mem");
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L2,
-                     host,
-                     200,
-                     "event_report://10.0.8.1:9600/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, host, 100, "event_report://10.0.8.1:9700/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, host, 200, "event_report://10.0.8.1:9600/mem");
 
         auto [ec, matches] = cache_manager_->GetHostCacheState(
             request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200});
@@ -8514,26 +8605,10 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
         InitializeEventReporter(instance_id, rank0, proto::meta::ST_EVENT_REPORT_L2);
         InitializeEventReporter(instance_id, rank1, proto::meta::ST_EVENT_REPORT_L1P5);
         InitializeEventReporter(instance_id, rank1, proto::meta::ST_EVENT_REPORT_L2);
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L1P5,
-                     rank0,
-                     100,
-                     "event_report://10.0.8.2:9700/mem");
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L2,
-                     rank0,
-                     200,
-                     "event_report://10.0.8.2:9600/mem");
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L1P5,
-                     rank1,
-                     100,
-                     "event_report://10.0.8.2:9701/mem");
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L2,
-                     rank1,
-                     300,
-                     "event_report://10.0.8.2:9601/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, rank0, 100, "event_report://10.0.8.2:9700/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, rank0, 200, "event_report://10.0.8.2:9600/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, rank1, 100, "event_report://10.0.8.2:9701/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, rank1, 300, "event_report://10.0.8.2:9601/mem");
 
         auto [rank0_ec, rank0_matches] = cache_manager_->GetHostCacheState(
             request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200});
@@ -8583,16 +8658,8 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
 
         const std::string shared_v6d_uri = "event_report://10.0.8.3:9600/mem";
         report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, base, 100, shared_v6d_uri);
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L1P5,
-                     rank0,
-                     200,
-                     "event_report://10.0.8.3:9700/mem");
-        report_block(instance_id,
-                     proto::meta::ST_EVENT_REPORT_L1P5,
-                     rank1,
-                     300,
-                     "event_report://10.0.8.3:9701/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, rank0, 200, "event_report://10.0.8.3:9700/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, rank1, 300, "event_report://10.0.8.3:9701/mem");
 
         auto [rank0_ec, rank0_matches] = cache_manager_->GetHostCacheState(
             request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200});
@@ -8619,15 +8686,16 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
             {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
         };
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [location_ec, locations] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
-                                                                                    instance_id,
-                                                                                    CacheManager::QueryType::QT_BATCH_GET,
-                                                                                    {100},
-                                                                                    {},
-                                                                                    block_mask,
-                                                                                    0,
-                                                                                    {},
-                                                                                    selectors);
+        auto [location_ec, locations] =
+            cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                       instance_id,
+                                                       CacheManager::QueryType::QT_BATCH_GET,
+                                                       {100},
+                                                       {},
+                                                       block_mask,
+                                                       0,
+                                                       {},
+                                                       selectors);
         ASSERT_EQ(EC_OK, location_ec);
         ASSERT_EQ(1u, locations.size());
         ASSERT_EQ(1u, locations[0].cache_locations_view().size());
