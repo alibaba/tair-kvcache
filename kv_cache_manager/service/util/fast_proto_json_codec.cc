@@ -103,6 +103,7 @@ private:
 
 enum class WrapperKind {
     kNone,
+    kBool,
     kInt32,
     kInt64,
     kUnsupportedWellKnownType,
@@ -110,6 +111,9 @@ enum class WrapperKind {
 
 WrapperKind GetWrapperKind(const Descriptor *descriptor) {
     const std::string &name = descriptor->full_name();
+    if (name == "google.protobuf.BoolValue") {
+        return WrapperKind::kBool;
+    }
     if (name == "google.protobuf.Int32Value") {
         return WrapperKind::kInt32;
     }
@@ -128,7 +132,8 @@ bool SupportsDescriptor(const Descriptor *descriptor, std::unordered_set<const D
     }
 
     const WrapperKind wrapper_kind = GetWrapperKind(descriptor);
-    if (wrapper_kind == WrapperKind::kInt32 || wrapper_kind == WrapperKind::kInt64) {
+    if (wrapper_kind == WrapperKind::kBool || wrapper_kind == WrapperKind::kInt32 ||
+        wrapper_kind == WrapperKind::kInt64) {
         return true;
     }
     if (wrapper_kind == WrapperKind::kUnsupportedWellKnownType || descriptor->extension_range_count() != 0) {
@@ -209,6 +214,10 @@ bool WriteWrapper(const Message &message, WrapperKind kind, JsonWriter &writer) 
     const FieldDescriptor *value_field = message.GetDescriptor()->FindFieldByName("value");
     if (!value_field) {
         return false;
+    }
+    if (kind == WrapperKind::kBool) {
+        writer.Bool(reflection->GetBool(message, value_field));
+        return true;
     }
     if (kind == WrapperKind::kInt32) {
         writer.Int(reflection->GetInt32(message, value_field));
@@ -390,6 +399,13 @@ bool ParseWrapperValue(const rapidjson::Value &value, Message *message, WrapperK
     const FieldDescriptor *field = message->GetDescriptor()->FindFieldByName("value");
     if (!field) {
         return false;
+    }
+    if (kind == WrapperKind::kBool) {
+        if (!value.IsBool()) {
+            return false;
+        }
+        reflection->SetBool(message, field, value.GetBool());
+        return true;
     }
     if (kind == WrapperKind::kInt32) {
         int32_t result = 0;

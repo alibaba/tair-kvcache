@@ -50,6 +50,10 @@ public:
                  const PropertyMapVector &,
                  const std::vector<ErrorCode> &),
                 (noexcept, override));
+    MOCK_METHOD(std::vector<ErrorCode>,
+                ForceUpsert,
+                (RequestContext *, const KeyTypeVec &, const CacheLocationMapVector &, const PropertyMapVector &),
+                (noexcept, override));
     MOCK_METHOD(std::vector<ErrorCode>, Delete, (RequestContext *, const KeyTypeVec &), (noexcept, override));
     MOCK_METHOD(std::vector<ErrorCode>,
                 Delete,
@@ -589,9 +593,11 @@ TEST_F(MetaStorageBackendManagerTest, TestMemoryPrimaryConfigValidationAndForwar
     MetaStorageBackendManager sync_redis;
     EXPECT_EQ(EC_BADARGS, sync_redis.Init("test", config));
     config->SetStorageUri("redis://localhost:6379/?persistent_type=async_redis&cache_type=local");
+    config->SetForceDeletingAsyncEnqueue(false);
     MetaStorageBackendManager valid;
     ASSERT_EQ(EC_OK, valid.Init("test", config));
     EXPECT_TRUE(valid.IsMemoryPrimary());
+    EXPECT_FALSE(valid.force_deleting_async_enqueue_);
     auto *backup = dynamic_cast<MetaAsyncRedisBackend *>(valid.persistent_backend_.get());
     ASSERT_NE(nullptr, backup);
     EXPECT_TRUE(backup->memory_primary_);
@@ -631,25 +637,61 @@ TEST_F(MetaStorageBackendManagerTest, TestMemoryPrimaryWritesCommitLocalBeforeFa
     EXPECT_EQ(std::vector<ErrorCode>{EC_NOENT}, mgr.Delete(nullptr, {11}));
 }
 
-TEST_F(MetaStorageBackendManagerTest, TestMemoryPrimaryDeletingRequiresBackupAdmission) {
+TEST_F(MetaStorageBackendManagerTest, TestMemoryPrimaryDeletingForceEnqueuesFailedAdmissions) {
     MetaStorageBackendManager mgr;
     auto *backup = InitMemoryPrimary(mgr);
-    auto batch = MakeBatch({11, 12});
-    auto deleting_location = std::make_shared<CacheLocation>(*batch.batch_locations[0]["loc_11"]);
+    auto batch = MakeBatch({11, 12, 13, 14});
+    auto set_status = [&batch](size_t key_index, const std::string &location_id, CacheLocationStatus status) {
+        auto location = std::make_shared<CacheLocation>(*batch.batch_locations[key_index].at(location_id));
+        location->set_status(status);
+        batch.batch_locations[key_index][location_id] = std::move(location);
+    };
+    set_status(0, "loc_11", CLS_DELETING);
+    set_status(1, "loc_12", CLS_DELETING);
+    set_status(2, "loc_13", CLS_WRITING);
+    set_status(3, "loc_14", CLS_DELETING);
+    batch.batch_secondary_admission_indices = {0, 1, 3};
+
+    EXPECT_CALL(*backup,
+                Upsert(_, KeyVector({11, 12, 13, 14}), _, _, std::vector<ErrorCode>({EC_OK, EC_OK, EC_OK, EC_OK})))
+        .WillOnce(Return(std::vector<ErrorCode>{EC_TIMEOUT, EC_OK, EC_TIMEOUT, EC_TIMEOUT}));
+    EXPECT_CALL(*backup, ForceUpsert(_, KeyVector({11, 14}), _, _))
+        .WillOnce(Invoke([](auto *, const auto &, const auto &locations, const auto &properties) {
+            EXPECT_EQ(2, locations.size());
+            EXPECT_EQ(CLS_DELETING, locations[0].at("loc_11")->status());
+            EXPECT_EQ("p0_11", properties[0].at("p0"));
+            EXPECT_EQ(CLS_DELETING, locations[1].at("loc_14")->status());
+            return std::vector<ErrorCode>{EC_OK, EC_TIMEOUT};
+        }));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK, EC_TIMEOUT}), mgr.Upsert(nullptr, batch));
+
+    CacheLocationMapVector local;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK, EC_OK}),
+              mgr.GetLocationsFromPrimary(nullptr, {11, 12, 13, 14}, local));
+    EXPECT_EQ(CLS_DELETING, local[0].at("loc_11")->status());
+    EXPECT_EQ(CLS_DELETING, local[1].at("loc_12")->status());
+    EXPECT_EQ(CLS_WRITING, local[2].at("loc_13")->status());
+    EXPECT_EQ(CLS_DELETING, local[3].at("loc_14")->status());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMemoryPrimaryDeletingForceEnqueueDisabledReturnsSecondaryError) {
+    MetaStorageBackendManager mgr;
+    auto *backup = InitMemoryPrimary(mgr);
+    mgr.force_deleting_async_enqueue_ = false;
+    auto batch = MakeBatch({11});
+    auto deleting_location = std::make_shared<CacheLocation>(*batch.batch_locations[0].at("loc_11"));
     deleting_location->set_status(CLS_DELETING);
     batch.batch_locations[0]["loc_11"] = std::move(deleting_location);
     batch.batch_secondary_admission_indices = {0};
 
-    EXPECT_CALL(*backup, Upsert(_, KeyVector({11, 12}), _, _, std::vector<ErrorCode>({EC_OK, EC_OK})))
-        .WillOnce(Return(std::vector<ErrorCode>{EC_TIMEOUT, EC_TIMEOUT}));
-    EXPECT_EQ((std::vector<ErrorCode>{EC_TIMEOUT, EC_OK}), mgr.Upsert(nullptr, batch));
+    EXPECT_CALL(*backup, Upsert(_, KeyVector({11}), _, _, std::vector<ErrorCode>({EC_OK})))
+        .WillOnce(Return(std::vector<ErrorCode>{EC_TIMEOUT}));
+    EXPECT_CALL(*backup, ForceUpsert(_, _, _, _)).Times(0);
+    EXPECT_EQ(std::vector<ErrorCode>{EC_TIMEOUT}, mgr.Upsert(nullptr, batch));
 
     CacheLocationMapVector local;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.GetLocationsFromPrimary(nullptr, {11, 12}, local));
-    ASSERT_EQ(1, local[0].count("loc_11"));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.GetLocationsFromPrimary(nullptr, {11}, local));
     EXPECT_EQ(CLS_DELETING, local[0].at("loc_11")->status());
-    ASSERT_EQ(1, local[1].count("loc_12"));
-    EXPECT_NE(CLS_DELETING, local[1].at("loc_12")->status());
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestMemoryPrimaryBacksUpOnlySuccessfulLocalItems) {

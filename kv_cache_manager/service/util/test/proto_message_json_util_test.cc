@@ -27,18 +27,26 @@ TEST(ProtoConvertTest, MemoryPrimaryRoundTrip) {
         storage->set_storage_type("cached");
         storage->set_storage_uri("redis://backup:6379/?persistent_type=async_redis");
         storage->set_memory_primary(enabled);
+        storage->mutable_force_deleting_async_enqueue()->set_value(!enabled);
         CacheConfig config;
         ProtoConvert::CacheConfigFromProto(&proto_config, config);
         EXPECT_EQ(enabled, config.meta_indexer_config()->GetMetaStorageBackendConfig()->GetMemoryPrimary());
+        EXPECT_EQ(!enabled,
+                  config.meta_indexer_config()->GetMetaStorageBackendConfig()->GetForceDeletingAsyncEnqueue());
         proto::admin::CacheConfig round_trip;
         ProtoConvert::CacheConfigToProto(config, &round_trip);
         EXPECT_EQ(enabled, round_trip.meta_indexer_config().meta_storage_backend_config().memory_primary());
+        ASSERT_TRUE(round_trip.meta_indexer_config().meta_storage_backend_config().has_force_deleting_async_enqueue());
+        EXPECT_EQ(
+            !enabled,
+            round_trip.meta_indexer_config().meta_storage_backend_config().force_deleting_async_enqueue().value());
         EXPECT_EQ(storage->storage_uri(), round_trip.meta_indexer_config().meta_storage_backend_config().storage_uri());
     }
     proto::admin::CacheConfig legacy;
     CacheConfig config;
     ProtoConvert::CacheConfigFromProto(&legacy, config);
     EXPECT_FALSE(config.meta_indexer_config()->GetMetaStorageBackendConfig()->GetMemoryPrimary());
+    EXPECT_TRUE(config.meta_indexer_config()->GetMetaStorageBackendConfig()->GetForceDeletingAsyncEnqueue());
 }
 
 namespace {

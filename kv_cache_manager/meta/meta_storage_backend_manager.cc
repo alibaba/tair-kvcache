@@ -132,6 +132,7 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
         persistent_backend_ = std::move(persistent_backend);
         cache_backend_ = std::move(cache_backend);
         memory_primary_ = config->GetMemoryPrimary();
+        force_deleting_async_enqueue_ = config->GetForceDeletingAsyncEnqueue();
         KVCM_LOG_INFO("meta storage backend manager init ok, instance[%s] cache[%s] persistent[%s]",
                       instance_id_.c_str(),
                       cache_type.c_str(),
@@ -625,6 +626,29 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
         // backup must have entered the secondary queue before this Upsert can
         // report success; ordinary memory-primary writes remain best-effort.
         assert(secondary_results.size() == keys.size());
+        if (force_deleting_async_enqueue_) {
+            KeyVector forced_keys;
+            CacheLocationMapVector forced_locations;
+            PropertyMapVector forced_properties;
+            std::vector<size_t> forced_indices;
+            for (const size_t i : batch.batch_secondary_admission_indices) {
+                assert(i < keys.size());
+                if (primary_results[i] == EC_OK && secondary_results[i] != EC_OK) {
+                    forced_keys.push_back(keys[i]);
+                    forced_locations.push_back(std::move(locations[i]));
+                    forced_properties.push_back(std::move(properties[i]));
+                    forced_indices.push_back(i);
+                }
+            }
+            if (!forced_keys.empty()) {
+                const auto forced_results =
+                    route.secondary->ForceUpsert(request_context, forced_keys, forced_locations, forced_properties);
+                assert(forced_results.size() == forced_indices.size());
+                for (size_t i = 0; i < forced_indices.size(); ++i) {
+                    secondary_results[forced_indices[i]] = forced_results[i];
+                }
+            }
+        }
         for (const size_t i : batch.batch_secondary_admission_indices) {
             assert(i < keys.size());
             if (primary_results[i] == EC_OK && secondary_results[i] != EC_OK) {

@@ -235,14 +235,14 @@ bool MetaAsyncRedisBackend::ReserveQueueCapacity(int queue_id, int64_t key_count
     return reserved;
 }
 
-std::vector<ErrorCode>
-MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *request_context,
-                                      WriteOpType type,
-                                      const KeyTypeVec &keys,
-                                      const FieldMapVec *field_maps,
-                                      const CacheLocationMapVector *locations,
-                                      const LocationIdsPerKey *location_ids,
-                                      const std::vector<ErrorCode> *previous_error_codes) noexcept {
+std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *request_context,
+                                                             WriteOpType type,
+                                                             const KeyTypeVec &keys,
+                                                             const FieldMapVec *field_maps,
+                                                             const CacheLocationMapVector *locations,
+                                                             const LocationIdsPerKey *location_ids,
+                                                             const std::vector<ErrorCode> *previous_error_codes,
+                                                             bool force_enqueue) noexcept {
     if (keys.empty()) {
         return {};
     }
@@ -262,7 +262,7 @@ MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *request_context,
         previous_error_codes ? *previous_error_codes : std::vector<ErrorCode>(keys.size(), EC_OK);
     for (auto &[qi, indices] : queue_to_indices) {
         const int64_t incoming_key_count = static_cast<int64_t>(indices.size());
-        if (!ReserveQueueCapacity(qi, incoming_key_count, best_effort_backup)) {
+        if (!force_enqueue && !ReserveQueueCapacity(qi, incoming_key_count, best_effort_backup)) {
             enqueue_timeout_key_count += incoming_key_count;
             for (size_t idx : indices) {
                 error_codes[idx] = EC_TIMEOUT;
@@ -295,7 +295,11 @@ MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *request_context,
             }
         }
 
-        queues_[qi]->PushReserved(QueueItem{std::move(sub_op)}, incoming_key_count);
+        if (force_enqueue) {
+            queues_[qi]->PushUnbounded(QueueItem{std::move(sub_op)}, incoming_key_count);
+        } else {
+            queues_[qi]->PushReserved(QueueItem{std::move(sub_op)}, incoming_key_count);
+        }
         for (size_t idx : indices) {
             error_codes[idx] = EC_OK;
         }
@@ -343,6 +347,15 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Upsert(RequestContext *request_con
                                                      const std::vector<ErrorCode> &previous_error_codes) noexcept {
     return EnqueueWriteOp(
         request_context, WriteOpType::kUpsert, keys, &properties, &locations, nullptr, &previous_error_codes);
+}
+
+std::vector<ErrorCode> MetaAsyncRedisBackend::ForceUpsert(RequestContext * /*request_context*/,
+                                                          const KeyTypeVec &keys,
+                                                          const CacheLocationMapVector &locations,
+                                                          const PropertyMapVector &properties) noexcept {
+    // Preserve the ordinary admission attempt's per-request timeout metrics;
+    // the force path is already observable through the real queue size.
+    return EnqueueWriteOp(nullptr, WriteOpType::kUpsert, keys, &properties, &locations, nullptr, nullptr, true);
 }
 
 std::vector<ErrorCode> MetaAsyncRedisBackend::Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept {

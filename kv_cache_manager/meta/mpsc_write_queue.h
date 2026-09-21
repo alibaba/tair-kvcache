@@ -87,6 +87,9 @@ public:
     // The caller must have reserved exactly key_count capacity units. Metadata
     // WriteOps have no ordinary keys but deliberately consume one unit.
     void PushReserved(QueueItem item, int64_t key_count);
+    // Publish a critical WriteOp while accounting it against queue size, but
+    // without enforcing the ordinary capacity limit.
+    void PushUnbounded(QueueItem item, int64_t key_count);
     std::vector<QueueItem> PopBatch(int64_t max_batch_size, int64_t &out_taken_keys);
     std::vector<QueueItem> PopBatchWait(int64_t max_batch_size, int64_t wait_timeout_us, int64_t &out_taken_keys);
     int64_t GetKeySize() const { return key_size_.load(std::memory_order_relaxed); }

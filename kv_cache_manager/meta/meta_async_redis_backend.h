@@ -44,6 +44,10 @@ public:
                                   const CacheLocationMapVector &locations,
                                   const PropertyMapVector &properties,
                                   const std::vector<ErrorCode> &previous_error_codes) noexcept override;
+    std::vector<ErrorCode> ForceUpsert(RequestContext *request_context,
+                                       const KeyTypeVec &keys,
+                                       const CacheLocationMapVector &locations,
+                                       const PropertyMapVector &properties) noexcept override;
     std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override;
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const KeyTypeVec &keys,
@@ -116,7 +120,8 @@ private:
                                           const FieldMapVec *field_maps,
                                           const CacheLocationMapVector *locations,
                                           const LocationIdsPerKey *location_ids,
-                                          const std::vector<ErrorCode> *previous_error_codes) noexcept;
+                                          const std::vector<ErrorCode> *previous_error_codes,
+                                          bool force_enqueue = false) noexcept;
     bool ReserveQueueCapacity(int queue_id, int64_t key_count, bool best_effort_backup);
     void ConsumerLoop(int queue_id);
     void CleanupResources() noexcept;
@@ -139,8 +144,8 @@ private:
 
     // Async config
     int32_t queue_count_ = 8;
-    int64_t max_batch_size_ = 51200;
-    int64_t batch_wait_timeout_us_ = 1000;
+    int64_t max_batch_size_ = 102400;
+    int64_t batch_wait_timeout_us_ = 1000000;
     int64_t queue_max_size_ = 102400;
     int64_t enqueue_timeout_ms_ = 100;
     int64_t sync_timeout_ms_ = 1000;

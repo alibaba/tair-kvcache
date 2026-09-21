@@ -52,7 +52,8 @@ curl -g -vvv -X POST http://localhost:56040/api/createInstanceGroup \
                 "meta_storage_backend_config": {
                     "storage_type": "local",
                     "storage_uri": "",
-                    "memory_primary": False
+                    "memory_primary": False,
+                    "force_deleting_async_enqueue": True
                 },
                 "meta_cache_policy_config": {
                     "type": "LRU",

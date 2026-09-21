@@ -1171,6 +1171,24 @@ TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryFullQueueDoesNotWait) {
     EXPECT_EQ(4, stats.dropped_key_count);
 }
 
+TEST_F(MetaAsyncRedisBackendTest, TestForceUpsertBypassesQueueCapacity) {
+    InitMemoryPrimaryWithoutConsumers(1);
+    const KeyType key = 7;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Delete(nullptr, {key}, {EC_OK}));
+    EXPECT_EQ(std::vector<ErrorCode>{EC_TIMEOUT}, backend_->Upsert(nullptr, {key}, {{}}, {{{"p", "v"}}}, {EC_OK}));
+    EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->ForceUpsert(nullptr, {key}, {{}}, {{{"p", "v"}}}));
+
+    auto &queue = backend_->queues_[backend_->GetQueueIndexForKey(key)];
+    EXPECT_EQ(2, queue->GetKeySize());
+    int64_t taken = 0;
+    auto items = queue->PopBatch(10, taken);
+    ASSERT_EQ(2, items.size());
+    EXPECT_EQ(2, taken);
+    EXPECT_EQ(WriteOpType::kDelete, std::get<WriteOp>(items[0]).type);
+    EXPECT_EQ(WriteOpType::kUpsert, std::get<WriteOp>(items[1]).type);
+    EXPECT_EQ(0, queue->GetKeySize());
+}
+
 TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryPrimaryWriteKeepsOriginalBackpressure) {
     InitMemoryPrimaryWithoutConsumers(1);
     backend_->enqueue_timeout_ms_ = 0;

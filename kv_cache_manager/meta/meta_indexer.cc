@@ -389,8 +389,8 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
                 existing_update_positions.push_back(i);
                 existing_update_batch.batch_keys.push_back(upsert_batch.batch_keys[i]);
                 existing_update_batch.batch_indexs.push_back(global_index);
-                existing_update_batch.batch_locations.push_back(upsert_batch.batch_locations[i]);
-                existing_update_batch.batch_properties.push_back(upsert_batch.batch_properties[i]);
+                existing_update_batch.batch_locations.push_back(std::move(upsert_batch.batch_locations[i]));
+                existing_update_batch.batch_properties.push_back(std::move(upsert_batch.batch_properties[i]));
                 if (requires_secondary_admission) {
                     existing_update_batch.batch_secondary_admission_indices.push_back(filtered_index);
                 }

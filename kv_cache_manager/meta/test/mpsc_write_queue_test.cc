@@ -349,6 +349,19 @@ TEST_F(MpscWriteQueueTest, TestTryReserveEnforcesKeyCapacity) {
     EXPECT_EQ(0, queue_->GetKeySize());
 }
 
+TEST_F(MpscWriteQueueTest, TestPushUnboundedKeepsCapacityAccounting) {
+    ASSERT_TRUE(TryPushBounded(MakeWriteOp(WriteOpType::kPut, {1}), 1));
+    ASSERT_FALSE(queue_->TryReserve(1, 1));
+    queue_->PushUnbounded(QueueItem{MakeWriteOp(WriteOpType::kUpsert, {2, 3})}, 2);
+    EXPECT_EQ(3, queue_->GetKeySize());
+    EXPECT_FALSE(queue_->TryReserve(1, 1));
+
+    auto items = queue_->PopBatch(10, taken_keys_);
+    ASSERT_EQ(2, items.size());
+    EXPECT_EQ(3, taken_keys_);
+    EXPECT_EQ(0, queue_->GetKeySize());
+}
+
 TEST_F(MpscWriteQueueTest, TestConcurrentTryReserveNeverExceedsCapacity) {
     constexpr int64_t capacity = 101;
     std::atomic<int64_t> accepted{0};

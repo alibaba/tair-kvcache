@@ -195,7 +195,7 @@ class UpdateInstanceGroupTest(unittest.TestCase):
         response = _get_response()
         storage = response["instance_group"]["cache_config"]["meta_indexer_config"]["meta_storage_backend_config"]
         storage.update(storage_type="cached", storage_uri="redis://backup:6379/?persistent_type=async_redis",
-                       memory_primary=True)
+                       memory_primary=True, force_deleting_async_enqueue=False)
         with patch("sys.argv", ["prog", "--name", "g1", "--user_data", "changed"]), \
              patch.object(update_instance_group, "http_post") as post:
             post.side_effect = [response, {"header": {"status": {"code": "OK"}}}]
@@ -229,11 +229,15 @@ class UpdateInstanceGroupTest(unittest.TestCase):
 
 class MemoryPrimaryConfigTest(unittest.TestCase):
     def test_defaults_and_round_trip(self):
-        self.assertFalse(MetaStorageBackendConfig().to_json_data()["memory_primary"])
+        defaults = MetaStorageBackendConfig().to_json_data()
+        self.assertFalse(defaults["memory_primary"])
+        self.assertTrue(defaults["force_deleting_async_enqueue"])
         legacy = {"storage_type": "local", "storage_uri": ""}
-        self.assertFalse(MetaStorageBackendConfig.from_json_data(legacy).to_json_data()["memory_primary"])
+        restored_legacy = MetaStorageBackendConfig.from_json_data(legacy).to_json_data()
+        self.assertFalse(restored_legacy["memory_primary"])
+        self.assertTrue(restored_legacy["force_deleting_async_enqueue"])
         data = {"storage_type": "cached", "storage_uri": "redis://backup:6379/?persistent_type=async_redis",
-                "memory_primary": True}
+                "memory_primary": True, "force_deleting_async_enqueue": False}
         self.assertEqual(data, MetaStorageBackendConfig.from_json_data(data).to_json_data())
 
     def test_cli(self):
@@ -241,10 +245,16 @@ class MemoryPrimaryConfigTest(unittest.TestCase):
             self.assertFalse(meta_storage_backend_config_value(value).to_json_data()["memory_primary"])
         self.assertTrue(meta_storage_backend_config_value(
             "cached,redis://backup:6379/?persistent_type=async_redis,true").to_json_data()["memory_primary"])
+        forced_disabled = meta_storage_backend_config_value(
+            "cached,redis://backup:6379/?persistent_type=async_redis,true,false").to_json_data()
+        self.assertTrue(forced_disabled["memory_primary"])
+        self.assertFalse(forced_disabled["force_deleting_async_enqueue"])
         with self.assertRaises(argparse.ArgumentTypeError):
             meta_storage_backend_config_value("cached,redis://backup:6379/,maybe")
         with self.assertRaises(RuntimeError):
             MetaStorageBackendConfig(memory_primary="false")
+        with self.assertRaises(RuntimeError):
+            MetaStorageBackendConfig(force_deleting_async_enqueue="false")
 
 
 if __name__ == "__main__":

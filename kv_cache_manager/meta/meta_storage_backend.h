@@ -99,6 +99,15 @@ public:
         return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
     }
 
+    // Capacity-unbounded admission for critical async backup writes. Only the
+    // async Redis backend supports this operation.
+    virtual std::vector<ErrorCode> ForceUpsert(RequestContext * /*request_context*/,
+                                               const KeyTypeVec &keys,
+                                               const CacheLocationMapVector & /*locations*/,
+                                               const PropertyMapVector & /*properties*/) noexcept {
+        return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
+    }
+
     // Allocation-light one-location upsert used by pure-local targeted RMW.
     // The default adapter preserves backend semantics; local memory overrides
     // it to avoid constructing one temporary unordered_map per key.

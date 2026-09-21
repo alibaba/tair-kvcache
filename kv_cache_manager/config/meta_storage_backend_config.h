@@ -19,12 +19,14 @@ public:
         Put(writer, "storage_type", storage_type_);
         Put(writer, "storage_uri", storage_uri_);
         Put(writer, "memory_primary", memory_primary_);
+        Put(writer, "force_deleting_async_enqueue", force_deleting_async_enqueue_);
     }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "storage_type", storage_type_, std::string("local"));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "storage_uri", storage_uri_, std::string(""));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "memory_primary", memory_primary_, false);
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "force_deleting_async_enqueue", force_deleting_async_enqueue_, true);
         return true;
     }
     bool ValidateRequiredFields(std::string &invalid_fields) const {
@@ -42,14 +44,19 @@ public:
     const std::string &GetStorageType() const { return storage_type_; }
     const std::string &GetStorageUri() const { return storage_uri_; }
     bool GetMemoryPrimary() const { return memory_primary_; }
+    bool GetForceDeletingAsyncEnqueue() const { return force_deleting_async_enqueue_; }
 
     void SetStorageType(const std::string &storage_type) { storage_type_ = storage_type; }
     void SetStorageUri(const std::string &storage_uri) { storage_uri_ = storage_uri; }
     void SetMemoryPrimary(bool memory_primary) { memory_primary_ = memory_primary; }
+    void SetForceDeletingAsyncEnqueue(bool force_deleting_async_enqueue) {
+        force_deleting_async_enqueue_ = force_deleting_async_enqueue;
+    }
 
 private:
     std::string storage_type_ = "local";
     std::string storage_uri_ = "";
     bool memory_primary_ = false;
+    bool force_deleting_async_enqueue_ = true;
 };
 } // namespace kv_cache_manager

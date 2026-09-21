@@ -63,6 +63,12 @@ bool MpscWriteQueue::WaitAndReserve(int64_t key_count, int64_t capacity, int64_t
 
 void MpscWriteQueue::PushReserved(QueueItem item, int64_t key_count) { Publish(new Node(std::move(item), key_count)); }
 
+void MpscWriteQueue::PushUnbounded(QueueItem item, int64_t key_count) {
+    auto *node = new Node(std::move(item), key_count);
+    key_size_.fetch_add(key_count, std::memory_order_acq_rel);
+    Publish(node);
+}
+
 void MpscWriteQueue::NotifyCapacityWaiters() noexcept {
     std::lock_guard<std::mutex> lock(capacity_mutex_);
     capacity_cv_.notify_all();

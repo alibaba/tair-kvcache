@@ -240,6 +240,8 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
             meta_storage_backend_config->set_storage_type(origin_meta_storage_backend_config->GetStorageType());
             meta_storage_backend_config->set_storage_uri(origin_meta_storage_backend_config->GetStorageUri());
             meta_storage_backend_config->set_memory_primary(origin_meta_storage_backend_config->GetMemoryPrimary());
+            meta_storage_backend_config->mutable_force_deleting_async_enqueue()->set_value(
+                origin_meta_storage_backend_config->GetForceDeletingAsyncEnqueue());
         }
 
         // 转换meta_cache_policy_config
@@ -325,13 +327,16 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     }
 
     // 转换meta_storage_backend_config
+    const auto &proto_meta_storage_backend_config =
+        proto_cache_config->meta_indexer_config().meta_storage_backend_config();
     auto meta_storage_backend_config = std::make_shared<MetaStorageBackendConfig>();
-    meta_storage_backend_config->SetStorageType(
-        proto_cache_config->meta_indexer_config().meta_storage_backend_config().storage_type());
-    meta_storage_backend_config->SetStorageUri(
-        proto_cache_config->meta_indexer_config().meta_storage_backend_config().storage_uri());
-    meta_storage_backend_config->SetMemoryPrimary(
-        proto_cache_config->meta_indexer_config().meta_storage_backend_config().memory_primary());
+    meta_storage_backend_config->SetStorageType(proto_meta_storage_backend_config.storage_type());
+    meta_storage_backend_config->SetStorageUri(proto_meta_storage_backend_config.storage_uri());
+    meta_storage_backend_config->SetMemoryPrimary(proto_meta_storage_backend_config.memory_primary());
+    if (proto_meta_storage_backend_config.has_force_deleting_async_enqueue()) {
+        meta_storage_backend_config->SetForceDeletingAsyncEnqueue(
+            proto_meta_storage_backend_config.force_deleting_async_enqueue().value());
+    }
     meta_indexer_config->SetMetaStorageBackendConfig(meta_storage_backend_config);
 
     // 转换meta_cache_policy_config（仅当 proto 中实际配置了时才填充）

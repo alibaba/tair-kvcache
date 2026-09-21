@@ -237,6 +237,7 @@ private:
     std::unique_ptr<MetaStorageBackend> persistent_backend_;
     std::unique_ptr<MetaCacheBaseBackend> cache_backend_;
     bool memory_primary_ = false;
+    bool force_deleting_async_enqueue_ = true;
 
     std::atomic<RecoverState> recover_state_{RecoverState::kRecover};
     std::atomic<bool> is_closed_{false};
