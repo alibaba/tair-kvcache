@@ -424,6 +424,72 @@ private:
     std::atomic<size_t> deleted_uri_count_{0};
 };
 
+class BlockingDeleteBackend : public DataStorageBackend {
+public:
+    explicit BlockingDeleteBackend(std::shared_ptr<DataStorageBackend> delegate)
+        : DataStorageBackend(delegate->metrics_registry_), delegate_(std::move(delegate)) {
+        SetOpen(delegate_->IsOpen());
+        SetAvailable(true);
+    }
+
+    DataStorageType GetType() override { return delegate_->GetType(); }
+    bool Available() override { return delegate_->Available(); }
+    double GetStorageUsageRatio(const std::string &trace_id) const override {
+        return delegate_->GetStorageUsageRatio(trace_id);
+    }
+    const StorageConfig &GetStorageConfig() override { return delegate_->GetStorageConfig(); }
+    ErrorCode DoOpen(const StorageConfig &config, const std::string &trace_id) override {
+        return delegate_->DoOpen(config, trace_id);
+    }
+    ErrorCode Close() override { return delegate_->Close(); }
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const std::string &trace_id,
+                                                             std::function<void()> cb) override {
+        return delegate_->Create(keys, size_per_key, trace_id, std::move(cb));
+    }
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++active_deletes_;
+        max_active_deletes_ = std::max(max_active_deletes_, active_deletes_);
+        cv_.notify_all();
+        cv_.wait(lock, [this] { return released_; });
+        --active_deletes_;
+        return std::vector<ErrorCode>(uris.size(), EC_OK);
+    }
+    std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override { return delegate_->Exist(uris); }
+    std::vector<bool> MightExist(const std::vector<DataStorageUri> &uris) override {
+        return delegate_->MightExist(uris);
+    }
+    std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override { return delegate_->Lock(uris); }
+    std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override { return delegate_->UnLock(uris); }
+
+    bool WaitForActiveDeletes(size_t count, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [this, count] { return active_deletes_ >= count; });
+    }
+
+    void ReleaseDeletes() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+    size_t MaxActiveDeletes() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return max_active_deletes_;
+    }
+
+private:
+    std::shared_ptr<DataStorageBackend> delegate_;
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    size_t active_deletes_ = 0;
+    size_t max_active_deletes_ = 0;
+    bool released_ = false;
+};
+
 class CacheManagerTest : public TESTBASE {
 public:
     void SetUp() override {
@@ -632,6 +698,26 @@ public:
         indexer->backend_manager_->persistent_backend_ = std::move(controlled);
         indexer->backend_manager_->cache_backend_.reset();
         return controlled_raw;
+    }
+
+    void AddDummyLocationsForTrim(size_t key_count, const std::string &storage_name) {
+        MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+        ASSERT_NE(nullptr, meta_searcher);
+
+        KeyVector keys;
+        CacheLocationVector locations;
+        keys.reserve(key_count);
+        locations.reserve(key_count);
+        for (size_t i = 0; i < key_count; ++i) {
+            keys.push_back(static_cast<int64_t>(i));
+            locations.push_back(std::make_shared<CacheLocation>(
+                DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                1,
+                std::vector<LocationSpec>{
+                    LocationSpec("tp0", "dummy://" + storage_name + "/trim_" + std::to_string(i) + "?size=1")}));
+        }
+        std::vector<std::string> location_ids;
+        ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher, request_context_.get(), keys, locations, location_ids));
     }
 
     static proto::meta::ReportEventRequest
@@ -2363,6 +2449,95 @@ TEST_F(CacheManagerTest, TestTrimCacheSyncsMetadataOnceAcrossScanPages) {
                   request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
     EXPECT_GT(meta_backend->GetListKeysCallCount(), 1u);
     EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheRunsBoundedConcurrentDeletesBeforeSync) {
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    AddDummyLocationsForTrim(2048, "hot_01");
+
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    auto blocking_backend = std::make_shared<BlockingDeleteBackend>(data_storage_manager->storage_map_.at("hot_01"));
+    data_storage_manager->storage_map_["hot_01"] = blocking_backend;
+
+    auto trim_future = std::async(std::launch::async, [this] {
+        return cache_manager_->TrimCache(
+            request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
+    });
+
+    const size_t worker_count = cache_manager_->schedule_plan_executor_->GetWorkerCount();
+    const bool workers_busy = blocking_backend->WaitForActiveDeletes(worker_count, std::chrono::seconds(5));
+    size_t waiting_tasks = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (workers_busy && std::chrono::steady_clock::now() < deadline) {
+        {
+            std::lock_guard<std::mutex> lock(cache_manager_->schedule_plan_executor_->queue_mutex_);
+            waiting_tasks = cache_manager_->schedule_plan_executor_->WaitingTaskCountLocked();
+        }
+        if (waiting_tasks >= worker_count) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const size_t sync_count_while_deleting = meta_backend->GetSyncAllCallCount();
+    blocking_backend->ReleaseDeletes();
+
+    EXPECT_TRUE(workers_busy);
+    EXPECT_EQ(worker_count, waiting_tasks);
+    EXPECT_EQ(0u, sync_count_while_deleting);
+    EXPECT_EQ(EC_OK, trim_future.get());
+    EXPECT_EQ(worker_count, blocking_backend->MaxActiveDeletes());
+    EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheContinuesAfterPartialDeleteFailure) {
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    AddDummyLocationsForTrim(2048, "missing_storage");
+
+    EXPECT_EQ(EC_ERROR,
+              cache_manager_->TrimCache(
+                  request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
+    EXPECT_GT(meta_backend->GetListKeysCallCount(), 2 * cache_manager_->schedule_plan_executor_->GetWorkerCount());
+    EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheStopsSubmittingAfterExecutorFailure) {
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    AddDummyLocationsForTrim(2048, "hot_01");
+    cache_manager_->schedule_plan_executor_->Stop();
+
+    const size_t max_inflight = 2 * cache_manager_->schedule_plan_executor_->GetWorkerCount();
+    EXPECT_EQ(EC_ERROR,
+              cache_manager_->TrimCache(
+                  request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
+    EXPECT_EQ(max_inflight, meta_backend->GetListKeysCallCount());
+    EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheSkipsPersistentResiduesAfterPartialFailure) {
+    auto *persistent = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, persistent);
+    const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+    auto cache = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, cache->Init("test_instance", backend_config));
+    ASSERT_EQ(EC_OK, cache->Open());
+
+    auto &backend_manager = *indexer->backend_manager_;
+    backend_manager.cache_backend_ = std::move(cache);
+    backend_manager.memory_primary_ = true;
+    backend_manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    AddDummyLocationsForTrim(1024, "missing_storage");
+
+    EXPECT_EQ(EC_ERROR,
+              cache_manager_->TrimCache(
+                  request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
+    EXPECT_EQ(0u, persistent->GetListKeysCallCount());
+    EXPECT_EQ(1u, persistent->GetSyncAllCallCount());
 }
 
 TEST_F(CacheManagerTest, TestTrimCacheSyncsBeforeCleaningPersistentResidueWithEmptyLocal) {

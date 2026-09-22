@@ -320,7 +320,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             if (iter->second->status() != CacheLocationStatus::CLS_DELETING) {
                 continue;
             }
-            if (!task.metadata_only) {
+            if (!task.metadata_only && !IsEventReportStorageType(iter->second->type())) {
                 for (const auto &loc_spec : iter->second->location_specs()) {
                     DataStorageUri uri(loc_spec.uri());
                     if (uri.Valid()) {

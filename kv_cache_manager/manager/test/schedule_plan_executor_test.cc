@@ -367,6 +367,11 @@ TEST_F(SchedulePlanExecutorTest, TestStop) {
     auto future = executor.Submit(request);
     ASSERT_EQ(ErrorCode::EC_ERROR, future.get().status);
 }
+
+TEST_F(SchedulePlanExecutorTest, TestWorkerCountUsesEffectiveThreadCount) {
+    SchedulePlanExecutor executor(0, meta_manager_, data_storage_manager_, metrics_registry_);
+    EXPECT_EQ(1u, executor.GetWorkerCount());
+}
 // 测试设置状态为DELETING功能
 TEST_F(SchedulePlanExecutorTest, TestSetStatusToDeleting) {
     // 创建 MetaIndexer
@@ -957,13 +962,13 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequest) {
     ASSERT_EQ(untouched_location_status, location_maps[0].at(original_location_ids[2])->status());
 }
 
-TEST_F(SchedulePlanExecutorTest, TestMetadataOnlyLocationDeleteSkipsPhysicalBackend) {
+TEST_F(SchedulePlanExecutorTest, TestEventReportLocationDeleteSkipsPhysicalBackend) {
     ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
 
     class CountingDeleteBackend : public DataStorageBackend {
     public:
-        explicit CountingDeleteBackend(std::atomic<size_t> &delete_calls)
-            : DataStorageBackend(nullptr), delete_calls_(delete_calls) {
+        CountingDeleteBackend(std::atomic<size_t> &delete_calls, std::atomic<size_t> &deleted_uris)
+            : DataStorageBackend(nullptr), delete_calls_(delete_calls), deleted_uris_(deleted_uris) {
             config_.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
             config_.set_global_unique_name("external_cache");
             SetOpen(true);
@@ -982,6 +987,7 @@ TEST_F(SchedulePlanExecutorTest, TestMetadataOnlyLocationDeleteSkipsPhysicalBack
         std::vector<ErrorCode>
         Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
             ++delete_calls_;
+            deleted_uris_.fetch_add(uris.size(), std::memory_order_relaxed);
             return std::vector<ErrorCode>(uris.size(), EC_OK);
         }
         std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
@@ -996,11 +1002,14 @@ TEST_F(SchedulePlanExecutorTest, TestMetadataOnlyLocationDeleteSkipsPhysicalBack
 
     private:
         std::atomic<size_t> &delete_calls_;
+        std::atomic<size_t> &deleted_uris_;
         StorageConfig config_;
     };
 
     std::atomic<size_t> delete_calls{0};
-    data_storage_manager_->storage_map_["external_cache"] = std::make_shared<CountingDeleteBackend>(delete_calls);
+    std::atomic<size_t> deleted_uris{0};
+    data_storage_manager_->storage_map_["external_cache"] =
+        std::make_shared<CountingDeleteBackend>(delete_calls, deleted_uris);
 
     auto request_context = std::make_shared<RequestContext>("metadata_only_delete");
     MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
@@ -1045,7 +1054,57 @@ TEST_F(SchedulePlanExecutorTest, TestMetadataOnlyLocationDeleteSkipsPhysicalBack
     };
     const auto control_result = executor.Submit(control_request).get();
     ASSERT_EQ(EC_OK, control_result.status);
+    EXPECT_EQ(0u, delete_calls.load());
+
+    const int64_t ordinary_block_key = 703;
+    auto ordinary_location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("tp0", "dummy://external_cache/cache/block703")});
+    std::vector<std::string> ordinary_location_ids;
+    ASSERT_EQ(
+        EC_OK,
+        BatchAddLocationForTest(
+            &meta_searcher, request_context.get(), {ordinary_block_key}, {ordinary_location}, ordinary_location_ids));
+    ASSERT_EQ(1u, ordinary_location_ids.size());
+    CacheLocationDelRequest ordinary_request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {ordinary_block_key},
+        .location_ids = {{ordinary_location_ids.front()}},
+    };
+    const auto ordinary_result = executor.Submit(ordinary_request).get();
+    ASSERT_EQ(EC_OK, ordinary_result.status);
     EXPECT_EQ(1u, delete_calls.load());
+    EXPECT_EQ(1u, deleted_uris.load());
+
+    const int64_t mixed_block_key = 704;
+    auto mixed_event_location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec(
+            "tp0", "event_report://external_cache/cache/block704?s_version=11111111111111111111111111111111")});
+    auto mixed_ordinary_location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("tp0", "dummy://external_cache/cache/block704")});
+    std::vector<std::string> mixed_location_ids;
+    ASSERT_EQ(
+        EC_OK,
+        BatchAddLocationForTest(
+            &meta_searcher, request_context.get(), {mixed_block_key}, {mixed_event_location}, mixed_location_ids));
+    ASSERT_EQ(
+        EC_OK,
+        BatchAddLocationForTest(
+            &meta_searcher, request_context.get(), {mixed_block_key}, {mixed_ordinary_location}, mixed_location_ids));
+    const auto mixed_result = executor
+                                  .Submit(CacheMetaDelRequest{
+                                      .instance_id = kTestInstanceName,
+                                      .block_keys = {mixed_block_key},
+                                  })
+                                  .get();
+    ASSERT_EQ(EC_OK, mixed_result.status);
+    EXPECT_EQ(2u, delete_calls.load());
+    EXPECT_EQ(2u, deleted_uris.load());
 }
 
 TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentlyAndLogsRealFailures) {
