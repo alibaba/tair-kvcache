@@ -116,6 +116,7 @@ private:
 
     std::mutex wait_mutex_;
     std::condition_variable wait_cv_;
+    bool wake_requested_ = false;
 
     // For producer backpressure: notified when consumer pops items
     std::mutex capacity_mutex_;

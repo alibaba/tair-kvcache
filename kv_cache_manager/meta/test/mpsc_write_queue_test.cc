@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <future>
 #include <limits>
 #include <thread>
 #include <unordered_set>
@@ -134,27 +135,56 @@ TEST_F(MpscWriteQueueTest, TestPopBatchWaitWakeup) {
     // Give consumer time to enter wait
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     PushWriteOp(MakeWriteOp(WriteOpType::kPut, {42}));
-    queue_->NotifyConsumer();
 
     consumer.join();
     ASSERT_TRUE(popped.load());
 }
 
-TEST_F(MpscWriteQueueTest, TestNotifyConsumer) {
-    // NotifyConsumer should wake up waiting PopBatchWait even with empty queue
-    std::atomic<bool> returned{false};
+TEST_F(MpscWriteQueueTest, TestBarrierWakesWaitingConsumer) {
+    auto ctx = std::make_shared<BarrierContext>();
+    ctx->remain.store(1, std::memory_order_release);
 
     std::thread consumer([&] {
         int64_t tk = 0;
-        auto items = queue_->PopBatchWait(10, 5000000, tk); // 5s timeout
-        returned.store(true);
+        auto items = queue_->PopBatchWait(10, 5000000, tk);
+        ASSERT_EQ(1, items.size());
+        ASSERT_EQ(0, tk);
+        auto &barrier = std::get<SyncBarrierItem>(items[0]);
+        barrier.barrier_ctx->Fence();
     });
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    queue_->NotifyConsumer();
+    queue_->PushBarrier(SyncBarrierItem{ctx});
 
+    const bool completed = ctx->Wait(std::chrono::milliseconds{1000});
     consumer.join();
-    ASSERT_TRUE(returned.load());
+    ASSERT_TRUE(completed);
+}
+
+TEST_F(MpscWriteQueueTest, TestNotifyConsumerBeforeWait) {
+    std::promise<void> start;
+    auto start_future = start.get_future();
+    std::promise<void> done;
+    auto done_future = done.get_future();
+
+    std::thread consumer([&, start_future = std::move(start_future)]() mutable {
+        start_future.wait();
+        int64_t tk = 0;
+        queue_->PopBatchWait(10, 30000000, tk);
+        done.set_value();
+    });
+
+    // The wakeup must remain visible when it arrives before the consumer waits.
+    queue_->NotifyConsumer();
+    start.set_value();
+
+    const bool returned = done_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    if (!returned) {
+        // Release the consumer so a failed assertion cannot leave a joinable thread.
+        PushWriteOp(MakeWriteOp(WriteOpType::kPut, {42}));
+    }
+    consumer.join();
+    ASSERT_TRUE(returned);
 }
 
 TEST_F(MpscWriteQueueTest, TestBarrierItem) {

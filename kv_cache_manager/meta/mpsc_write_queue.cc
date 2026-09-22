@@ -79,7 +79,12 @@ void MpscWriteQueue::Publish(Node *new_node) {
     do {
         new_node->next = old_head;
     } while (!head_.compare_exchange_weak(old_head, new_node, std::memory_order_acq_rel, std::memory_order_relaxed));
-    wait_cv_.notify_one();
+    if (old_head == nullptr) {
+        // Pair the empty-to-nonempty transition with the consumer's wait lock,
+        // so publication cannot land between its predicate check and sleep.
+        std::lock_guard<std::mutex> lock(wait_mutex_);
+        wait_cv_.notify_one();
+    }
 }
 
 std::vector<QueueItem> MpscWriteQueue::PopBatch(int64_t max_batch_size, int64_t &out_taken_keys) {
@@ -154,13 +159,20 @@ MpscWriteQueue::PopBatchWait(int64_t max_batch_size, int64_t wait_timeout_us, in
     {
         std::unique_lock<std::mutex> lock(wait_mutex_);
         wait_cv_.wait_for(lock, std::chrono::microseconds(wait_timeout_us), [this] {
-            return head_.load(std::memory_order_acquire) != nullptr;
+            return wake_requested_ || head_.load(std::memory_order_acquire) != nullptr;
         });
+        wake_requested_ = false;
     }
 
     return PopBatch(max_batch_size, out_taken_keys);
 }
 
-void MpscWriteQueue::NotifyConsumer() { wait_cv_.notify_one(); }
+void MpscWriteQueue::NotifyConsumer() {
+    {
+        std::lock_guard<std::mutex> lock(wait_mutex_);
+        wake_requested_ = true;
+    }
+    wait_cv_.notify_one();
+}
 
 } // namespace kv_cache_manager
