@@ -48,38 +48,7 @@ instance_id + storage_type + host_ip_port
 - KVCM 重启不会要求客户端重新 `RegisterInstance`，也不会要求重新发送
   `EVENT_NODE_REGISTER`；下一条合法 ReportEvent 会补齐运行时 reporter 状态。
 
-### 2.2 多 DP 的 reporter 约定
-
-多 DP 使用 `host_ip_port = H@rank` 区分逻辑引擎，`H` 是双方约定的完整基础地址
-（包含端口），例如 `10.0.0.8:8080@0`、`10.0.0.8:8080@1`。
-rank 必须是 uint64 范围内的十进制非负整数，不接受符号、空白、前导零（`0` 除外）或多个 `@`。
-当前不会根据 `ModelDeployment.dp_size` 自动创建 reporter，也不校验 `rank < dp_size`。
-
-| 部署形式 | Subscriber / L1P5 身份 | Vineyard / L2 身份 |
-| --- | --- | --- |
-| 普通单引擎 | `H` | `H` |
-| 多 DP，各自独立 Vineyard | `H@0`、`H@1` | 对应的 `H@0`、`H@1` |
-| 多 DP，共享一个 Vineyard | `H@0`、`H@1` | `H` |
-
-独立 reporter 的完整身份用于快照、增删和生命周期隔离。两个独立 DP 如果使用相同
-`instance_id + storage_type + host_ip_port` 上报，服务端无法再区分它们。
-实际 spec URI 的端口可以不同；URI 地址不用于推导 DP 身份。
-
-`GetHostCacheState` 将共享 L2 `H` 映射到**同一个 instance 内、基础地址完全相同的活跃
-L1P5 ranked reporter**。例如 `10.0.0.8:8080` 不会映射到 `10.0.0.8:8081@0`。
-映射不会复制物理 location 或 URI，也不会把一个共享 Vineyard 变成多个 P2P 候选。
-没有对应活跃 rank 时仍返回普通裸 `H`（前缀命中大于零时）；rank 再次注册后重新映射。
-
-L1P5 与 L2 的生命周期独立：独立部署中，`L1P5/H@0` 下线不会自动使 `L2/H@0` 下线。
-因此查询结果表示缓存可用性，调度端仍须结合 worker 健康状态，并能将返回的完整
-`H@rank` 对应到实际 worker。
-
-多 DP 的 `@rank` 与多机分片 `F0_N0`/`F0_N1` 是两个维度。引擎物理 key
-`{blockkey}_{group_id}@n{id}` 应由适配层拆成逻辑 block key 与 spec name；
-不能将整个物理 key 直接填写到要求十进制整数的 `block_key` 字段。
-多机查询还须完整注册 `location_spec_infos` 和 `location_spec_groups`，见 11.4 节。
-
-### 2.3 Block、medium 与 spec
+### 2.2 Block、medium 与 spec
 
 KVCM 更新的最小逻辑身份是：
 
@@ -714,24 +683,15 @@ HTTP 接口为 `POST /api/getHostCacheState`：
 - `QT_UNSPECIFIED` 使用 RegisterInstance 时配置的 `default_query_type`；
 - 支持 `QT_PREFIX_MATCH` 和 `QT_PREFIX_MATCH_WITH_MAMBA`，其他类型返回参数错误；
 - local 按逻辑 engine 身份汇总，独立 rank 不合并；共享 V6D 沿 reporter 映射贡献给对应 rank；
-- `QT_PREFIX_MATCH` 在 Instance 配置了 `location_spec_groups` 时，要求每个 block 的非 L 类 groups
-  所声明的全部 spec 齐全后才计入前缀。例如两机的 `F0_N0`、`F0_N1` 缺少任意一个即为该 block miss；
-  spec 可以来自同一逻辑 engine 的不同有效 location/backend，但 `local` 不能跨 engine 混合。
-  未配置 spec groups 的旧 Instance 保留“存在有效 spec 即命中”的兼容行为；多机接入必须
-  注册完整 spec groups。L 类 Mamba 状态不要求在普通前缀的每个 block 上存在；
-  `QT_PREFIX_MATCH_WITH_MAMBA` 仍按 F 类连续前缀和 L 类状态匹配。
-- `global` 合并本地、TairMempool/NFS，以及启用 P2P 时选中的远端 Vineyard 分片后，也必须满足
-  上述完整性要求。普通前缀仍最多选择一个远端 Vineyard，不能用多个 peer 拼出完整分片。
-  本接口不会自动把不同物理 reporter 聚合成一个跨机 engine。
 - `local` 包含同一 host 的 subscriber 与 Vineyard 上报；
-- 非混合注意力对缺少必要 spec 的 block 使用 Prefix 选择远端 Vineyard；混合注意力先对
+- 非混合注意力对 full local-miss 使用 Prefix 选择远端 Vineyard；混合注意力先对
   FullAttention group 使用 Prefix，再对 Mamba local-miss spec 使用 Coverage；
 - `global_kvs_host_count`（默认 0，不能为负）控制按 local 降序选出的逻辑 engine 数，同分按 host 升序；
 - 入选 engine 合并本地与 TairMempool/NFS；`enable_p2p`（默认 false）决定是否追加 V6D；
 - 每次最多选择一个 peer；Mamba 各 Full group 分别选一个，Linear 缺失组汇总选一个；
 - `global` 是本地与本次远端评估合并后的可复用前缀，未入选时等于 `local`；
 - `global - local` 是额外可复用块数，不等于实际传输块数；
-- 旧的请求/返回字段已移除，调用方需同步升级；
+- 旧的请求/返回字段已移除并保留编号，调用方需同步升级；
 - 远端 P2P 候选只使用 `ST_EVENT_REPORT_L2`，且不会让 `local` 为 0 的 host 出现在响应中；
 - reporter unavailable 时，该 host 对应的 event-report location 不参与匹配。
 
@@ -812,21 +772,6 @@ inflight count/age 指标观察扫描成本与积压。若后续形成更短的�
 - [ ] metadata 命中后的物理 cache 读取失败按 miss 处理
 
 ## 15. 自动化测试覆盖矩阵
-
-Manager UT 中的多 DP 回归入口（存在用例不代表已执行通过）：
-
-| 用例 | 检查内容 |
-| --- | --- |
-| `CacheManagerTest.TestGetHostCacheStateForV6DAndSubscriberReportingModes` | 普通、独立 Vineyard、共享 Vineyard，rank 隔离及数据 URI 保持不变 |
-| `CacheManagerTest.TestGetHostCacheStateMultiNodeSpecsAcrossSharedV6DAndDPRanks` | 多 DP 与多机分片组合，ADD/DELETE/SNAPSHOT 后的完整性 |
-| `MultiDPHostCacheStateTest.SnapshotAndHostDownAreIsolatedByRankTypeAndInstance` | 相同 URI 下的 rank、storage type、instance 隔离，以及下线后重新注册 |
-| `MultiDPHostCacheStateTest.SharedV6DProjectionUsesExactBaseAndCurrentInstance` | 同 IP 不同端口不映射、跨 instance 不映射、介质过滤、最后一个 rank 下线及恢复、共享快照 |
-| `MultiDPHostCacheStateTest.GlobalTopNCountsLogicalRanksAndExcludesZeroLocalRanks` | 按 DP 计算 Top-N、同分排序、count=0/P2P 关闭、零本地命中不返回、独立 L2 peer 下线 |
-| `MultiDPHostCacheStateTest.ReporterRankValidationRejectsMalformedAndOverflowingRanks` | 非法及溢出 rank 拒绝，uint64 最大值身份可用 |
-
-HTTP 集成用例 `MetaServiceHttpTest.test_multi_dp_host_cache_state_with_shared_v6d_and_node_specs`
-通过真实 KVCM 进程验证 ReportEvent → GetHostCacheState，覆盖共享 Vineyard、多 DP、多机
-spec 完整性、Top-N/P2P 和下线后的结果，检查完整 `H@rank` 经 JSON 返回后保持不变。
 
 以下矩阵是本文接口契约与自动化测试的对应关系。测试文件：
 

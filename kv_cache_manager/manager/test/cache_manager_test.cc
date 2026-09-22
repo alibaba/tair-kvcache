@@ -8417,113 +8417,6 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateConcurrentWithReportEventAndHostDo
     EXPECT_TRUE(hosts.empty());
 }
 
-TEST_F(CacheManagerTest, TestGetHostCacheStateMultiNodeSpecsAcrossSharedV6DAndDPRanks) {
-    const std::string instance_id = "multinode_dp_specs";
-    const std::string base = "10.0.8.4:8080";
-    const std::string rank0 = base + "@0";
-    const std::string rank1 = base + "@1";
-    for (const auto type :
-         {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}) {
-        const std::string name =
-            type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 ? "multinode_l1p5" : "multinode_l2";
-        auto backend = std::make_shared<EventReportBackend>(metrics_registry_);
-        StorageConfig config;
-        config.set_global_unique_name(name);
-        config.set_type(type);
-        config.set_storage_spec(std::make_shared<EventReportStorageSpec>());
-        ASSERT_EQ(EC_OK, backend->Open(config, "multinode_test"));
-        backend->SetSnapshotMinIntervalMsForTest(0);
-        registry_manager_->data_storage_manager_->storage_map_[name] = backend;
-    }
-    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
-        {"multinode_l1p5", "multinode_l2"});
-    ASSERT_EQ(
-        std::make_pair(EC_OK, default_storage_configs),
-        cache_manager_->RegisterInstance(request_context_.get(),
-                                         "default",
-                                         instance_id,
-                                         64,
-                                         {LocationSpecInfo("F0_N0", 512), LocationSpecInfo("F0_N1", 512)},
-                                         createModelDeployment(),
-                                         {LocationSpecGroup("F0_N0", {"F0_N0"}), LocationSpecGroup("F0_N1", {"F0_N1"})},
-                                         CacheManager::QueryType::QT_PREFIX_MATCH));
-    InitializeEventReporter(instance_id, base, proto::meta::ST_EVENT_REPORT_L2);
-    InitializeEventReporter(instance_id, rank0, proto::meta::ST_EVENT_REPORT_L1P5);
-    InitializeEventReporter(instance_id, rank1, proto::meta::ST_EVENT_REPORT_L1P5);
-    auto add = [&](const std::string &reporter, proto::meta::StorageType type, int64_t key, const std::string &name) {
-        proto::meta::ReportEventRequest request;
-        request.set_instance_id(instance_id);
-        request.set_host_ip_port(reporter);
-        request.set_storage_type(type);
-        auto *event = request.add_events();
-        event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
-        auto *block = event->mutable_block_add();
-        block->set_block_key(std::to_string(key));
-        block->set_medium("mem");
-        auto *spec = block->add_specs();
-        spec->set_name(name);
-        spec->set_uri("event_report://10.0.8.4:9600/mem?name=" + name);
-        proto::meta::ReportEventResponse response;
-        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
-    };
-    for (int64_t key : {100, 200, 300}) {
-        add(base, proto::meta::ST_EVENT_REPORT_L2, key, "F0_N0");
-        add(rank0, proto::meta::ST_EVENT_REPORT_L1P5, key, "F0_N1");
-        if (key != 200) {
-            add(rank1, proto::meta::ST_EVENT_REPORT_L1P5, key, "F0_N1");
-        }
-    }
-    auto check = [&](int64_t rank0_local) {
-        for (size_t global_count : {size_t{0}, size_t{2}}) {
-            auto [ec, matches] = cache_manager_->GetHostCacheState(request_context_.get(),
-                                                                   instance_id,
-                                                                   CacheManager::QueryType::QT_UNSPECIFIED,
-                                                                   {100, 200, 300},
-                                                                   {},
-                                                                   global_count,
-                                                                   true);
-            ASSERT_EQ(EC_OK, ec);
-            ASSERT_EQ(2u, matches.size());
-            for (const auto &match : matches) {
-                ASSERT_TRUE(match.host_ip_port == rank0 || match.host_ip_port == rank1);
-                EXPECT_EQ(match.host_ip_port == rank0 ? rank0_local : 1, match.local);
-                EXPECT_EQ(match.local, match.global);
-            }
-        }
-    };
-    check(3);
-    proto::meta::ReportEventRequest request;
-    request.set_instance_id(instance_id);
-    request.set_host_ip_port(rank0);
-    request.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
-    auto *event = request.add_events();
-    event->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
-    auto *block = event->mutable_block_delete();
-    block->set_block_key("200");
-    block->set_medium("mem");
-    block->add_spec_names("F0_N1");
-    proto::meta::ReportEventResponse response;
-    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
-    check(1); // Shared N0 remains; losing N1 must immediately stop the prefix.
-    add(rank0, proto::meta::ST_EVENT_REPORT_L1P5, 200, "F0_N1");
-    check(3);
-
-    request.clear_events();
-    event = request.add_events();
-    event->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
-    auto *item = event->mutable_block_snapshot()->add_blocks();
-    item->set_block_key("100");
-    item->set_medium("mem");
-    auto *spec = item->add_specs();
-    spec->set_name("F0_N1");
-    spec->set_uri("event_report://10.0.8.4:9600/mem?name=F0_N1");
-    response.Clear();
-    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
-    check(1); // A successful snapshot must hide the old N1 generations.
-    registry_manager_->data_storage_manager_->storage_map_.erase("multinode_l1p5");
-    registry_manager_->data_storage_manager_->storage_map_.erase("multinode_l2");
-}
-
 TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes) {
     auto make_backend = [&](const std::string &name, DataStorageType type) {
         auto backend = std::make_shared<EventReportBackend>(metrics_registry_);
@@ -8810,9 +8703,6 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
     registry_manager_->data_storage_manager_->storage_map_.erase("reporting_modes_l2");
 }
 
-// Exercise multi-DP behavior through ReportEvent and GetHostCacheState. All
-// reporters deliberately use the same data endpoint: identity comes from the
-// instance, storage type and reporter address, never from the spec URI.
 class MultiDPHostCacheStateTest : public CacheManagerTest {
 public:
     void SetUp() override {
@@ -8915,6 +8805,107 @@ public:
         EXPECT_EQ(expected, actual);
     }
 };
+
+TEST_F(MultiDPHostCacheStateTest, TensorParallelPrefixUsesAnyRegisteredSpec) {
+    const std::string base = "10.0.9.1:8080";
+    const std::string rank0 = base + "@0";
+    const std::string rank1 = base + "@1";
+    for (bool register_logical_spec : {false, true}) {
+        const std::string instance = register_logical_spec ? "tp_mixed_names" : "tp_shards_only";
+        SCOPED_TRACE(instance);
+        std::vector<LocationSpecInfo> infos = {{"F0_N0", 512}, {"F0_N1", 512}};
+        std::vector<LocationSpecGroup> groups = {{"F0_N0", {"F0_N0"}}, {"F0_N1", {"F0_N1"}}};
+        if (register_logical_spec) {
+            // Mixed reports require every name to be explicitly registered.
+            // QT_PREFIX_MATCH does not add aliases or reconcile registrations.
+            infos.emplace_back("F0", 1024);
+            groups.emplace_back("F0", std::vector<std::string>{"F0"});
+        }
+        auto deployment = createModelDeployment();
+        deployment.set_dp_size(2);
+        deployment.set_tp_size(2);
+        ASSERT_EQ(EC_OK,
+                  cache_manager_
+                      ->RegisterInstance(request_context_.get(),
+                                         "default",
+                                         instance,
+                                         64,
+                                         infos,
+                                         deployment,
+                                         groups,
+                                         CacheManager::QueryType::QT_PREFIX_MATCH)
+                      .first);
+        InitializeEventReporter(instance, base, proto::meta::ST_EVENT_REPORT_L2);
+        InitializeEventReporter(instance, rank0, proto::meta::ST_EVENT_REPORT_L1P5);
+        InitializeEventReporter(instance, rank1, proto::meta::ST_EVENT_REPORT_L1P5);
+        auto report_spec = [&](const std::string &host,
+                               proto::meta::StorageType type,
+                               int64_t key,
+                               const std::string &name,
+                               bool remove = false) {
+            proto::meta::ReportEventRequest request;
+            request.set_instance_id(instance);
+            request.set_host_ip_port(host);
+            request.set_storage_type(type);
+            auto *event = request.add_events();
+            if (remove) {
+                event->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
+                auto *block = event->mutable_block_delete();
+                block->set_block_key(std::to_string(key));
+                block->set_medium("mem");
+                block->add_spec_names(name);
+            } else {
+                event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+                auto *block = event->mutable_block_add();
+                block->set_block_key(std::to_string(key));
+                block->set_medium("mem");
+                auto *spec = block->add_specs();
+                spec->set_name(name);
+                spec->set_uri("event_report://10.0.9.1:9600/mem?name=" + name);
+            }
+            proto::meta::ReportEventResponse response;
+            const auto ec = cache_manager_->ReportEvent(request_context_.get(), &request, &response);
+            if (ec == EC_PARTIAL_OK) {
+                EXPECT_EQ(1, response.item_results_size());
+                EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.item_results(0));
+            }
+            return ec;
+        };
+        auto check = [&](const Matches &expected) {
+            for (size_t count : {size_t{0}, size_t{2}}) {
+                for (bool p2p : {false, true}) {
+                    ExpectMatches(instance, {100, 200, 300}, expected, count, p2p);
+                }
+            }
+        };
+        ASSERT_EQ(EC_OK, report_spec(base, proto::meta::ST_EVENT_REPORT_L2, 100, "F0_N0"));
+        ASSERT_EQ(EC_OK, report_spec(base, proto::meta::ST_EVENT_REPORT_L2, 100, "F0_N1"));
+        ASSERT_EQ(EC_OK, report_spec(base, proto::meta::ST_EVENT_REPORT_L2, 300, "F0_N1"));
+        const std::string subscriber_spec = register_logical_spec ? "F0" : "F0_N0";
+        ASSERT_EQ(EC_OK, report_spec(rank0, proto::meta::ST_EVENT_REPORT_L1P5, 200, subscriber_spec));
+        check({{rank0, {3, 3}}, {rank1, {1, 1}}});
+
+        // One valid V6D spec is enough; TP shards are not a completeness contract.
+        ASSERT_EQ(EC_OK, report_spec(base, proto::meta::ST_EVENT_REPORT_L2, 100, "F0_N1", true));
+        check({{rank0, {3, 3}}, {rank1, {1, 1}}});
+        // Losing every spec in the first block stops both prefixes, despite later hits.
+        ASSERT_EQ(EC_OK, report_spec(base, proto::meta::ST_EVENT_REPORT_L2, 100, "F0_N0", true));
+        check({});
+        ASSERT_EQ(EC_OK, report_spec(base, proto::meta::ST_EVENT_REPORT_L2, 100, "F0_N1"));
+        check({{rank0, {3, 3}}, {rank1, {1, 1}}});
+
+        ASSERT_EQ(EC_OK, report_spec(rank0, proto::meta::ST_EVENT_REPORT_L1P5, 200, subscriber_spec, true));
+        check({{rank0, {1, 1}}, {rank1, {1, 1}}});
+        ASSERT_EQ(EC_OK, report_spec(rank0, proto::meta::ST_EVENT_REPORT_L1P5, 200, subscriber_spec));
+        Report(instance, proto::meta::ST_EVENT_REPORT_L1P5, rank0, proto::meta::EVENT_BLOCK_SNAPSHOT);
+        check({{rank0, {1, 1}}, {rank1, {1, 1}}});
+
+        // The former F0 alias must not bypass ReportEvent's registered-name check.
+        EXPECT_EQ(EC_PARTIAL_OK,
+                  report_spec(rank0, proto::meta::ST_EVENT_REPORT_L1P5, 200, register_logical_spec ? "F1" : "F0"));
+        check({{rank0, {1, 1}}, {rank1, {1, 1}}});
+    }
+}
 
 TEST_F(MultiDPHostCacheStateTest, SnapshotAndHostDownAreIsolatedByRankTypeAndInstance) {
     const std::string rank0 = "10.0.9.1:8080@0";
@@ -10002,21 +9993,14 @@ TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
     expect_mamba_matches(hosts);
 
     // An explicit request query type takes precedence over the registered default.
-    for (size_t global_count : {size_t{0}, size_t{2}}) {
-        auto [explicit_ec, explicit_hosts] = cache_manager_->GetHostCacheState(request_context_.get(),
-                                                                               instance_id,
-                                                                               CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                               keys,
-                                                                               {},
-                                                                               global_count,
-                                                                               true);
-        ASSERT_EQ(EC_OK, explicit_ec);
-        EXPECT_EQ(3, find_prefix(explicit_hosts, host_a));
-        EXPECT_EQ(3, find_prefix(explicit_hosts, host_b));
-        EXPECT_EQ(1, find_prefix(explicit_hosts, host_c));
-        EXPECT_EQ(-1, find_prefix(explicit_hosts, host_d));
-        EXPECT_EQ(2, find_prefix(explicit_hosts, host_e));
-    }
+    auto [explicit_ec, explicit_hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+    ASSERT_EQ(EC_OK, explicit_ec);
+    EXPECT_EQ(3, find_prefix(explicit_hosts, host_a));
+    EXPECT_EQ(3, find_prefix(explicit_hosts, host_b));
+    EXPECT_EQ(1, find_prefix(explicit_hosts, host_c));
+    EXPECT_EQ(-1, find_prefix(explicit_hosts, host_d));
+    EXPECT_EQ(2, find_prefix(explicit_hosts, host_e));
 
     auto [fallback_ec, fallback_hosts] = cache_manager_->GetHostCacheState(
         request_context_.get(), instance_id, CacheManager::QueryType::QT_UNSPECIFIED, keys);

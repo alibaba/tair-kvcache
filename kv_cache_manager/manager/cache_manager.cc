@@ -4809,14 +4809,6 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
     ErrorCode ec = EC_ERROR;
     switch (query_type) {
     case QueryType::QT_PREFIX_MATCH: {
-        // Plain prefix queries require complete cache shards, but not Mamba
-        // checkpoints on every block, even when overriding a hybrid default.
-        std::vector<LocationSpecGroup> prefix_spec_groups;
-        for (const auto &group : instance_info->location_spec_groups()) {
-            if (group.name().empty() || group.name().front() != 'L') {
-                prefix_spec_groups.push_back(group);
-            }
-        }
         ec = meta_searcher->PrefixMatchByHost(request_context,
                                               block_cache_keys,
                                               use_eagle_pop,
@@ -4825,8 +4817,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                               &request_check_location,
                                               global_kvs_host_count,
                                               enable_p2p,
-                                              policy.get(),
-                                              prefix_spec_groups);
+                                              policy.get());
         break;
     }
     case QueryType::QT_PREFIX_MATCH_WITH_MAMBA: {

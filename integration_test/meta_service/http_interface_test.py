@@ -191,8 +191,79 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
         } for block_key in block_keys)
         return events
 
-    def test_multi_dp_host_cache_state_with_shared_v6d_and_node_specs(self):
-        """Keep ranked identities and complete node shards across the HTTP API."""
+    def test_tensor_parallel_prefix_uses_registered_spec_presence(self):
+        """Preserve plain-prefix hints for registered logical and TP spec names."""
+        group_name, instance_id = "http_tp_group", "http_tp_instance"
+        l1_name, l2_name = "http_tp_l1p5", "http_tp_l2"
+        host = "10.10.2.1:8080"
+        for name, storage_type in ((l1_name, "ST_EVENT_REPORT_L1P5"), (l2_name, "ST_EVENT_REPORT_L2")):
+            storage = self._event_report_storage(name)
+            storage["storage_type"] = storage_type
+            self._client.add_storage({"storage": storage})
+        group = self._event_report_instance_group(group_name, l2_name)
+        group["event_report_storage_candidates"] = [l1_name, l2_name]
+        self._client.create_instance_group({"instance_group": group})
+        deployment = self._get_test_model_deployment()
+        deployment.update(dp_size=1, tp_size=2)
+        # This verifies the query contract, not automatic producer registration
+        # compatibility. All reported names must already be in the shared schema.
+        names = ("F0", "F0_N0", "F0_N1")
+        self._client.register_instance({
+            "instance_group": group_name,
+            "instance_id": instance_id,
+            "block_size": 128,
+            "model_deployment": deployment,
+            "default_query_type": "QT_PREFIX_MATCH",
+            "location_spec_infos": [{"name": name, "size": 1024} for name in names],
+            "location_spec_groups": [{"name": name, "spec_names": [name]} for name in names],
+        })
+
+        def report(storage_type, events, check_response=True):
+            request = self._report_events(instance_id, host, events, "http_tp_report")
+            request["storage_type"] = storage_type
+            return self._client.report_event(request, check_response=check_response)
+
+        def delete_spec(storage_type, key, name):
+            report(storage_type, [{
+                "event_type": "EVENT_BLOCK_DELETE",
+                "block_delete": {"block_key": str(key), "medium": "mem", "spec_names": [name]},
+            }])
+
+        def check(expected):
+            for query_type in ("QT_UNSPECIFIED", "QT_PREFIX_MATCH"):
+                for global_count in (0, 1):
+                    response = self._client.get_host_cache_state({
+                        "instance_id": instance_id,
+                        "block_cache_keys": [84000, 84001],
+                        "query_type": query_type,
+                        "global_kvs_host_count": global_count,
+                        "enable_p2p": True,
+                    })
+                    hosts = response.get("hosts", [])
+                    actual = {item["host_ip_port"]: (int(item["local"]), int(item["global"])) for item in hosts}
+                    self.assertEqual(len(hosts), len(actual), response)
+                    self.assertEqual({host: (expected, expected)} if expected else {}, actual, response)
+
+        events = self._node_and_block_events(host, "F0_N0", [84000])
+        events += self._node_and_block_events(host, "F0_N1", [84000])[1:]
+        report("ST_EVENT_REPORT_L2", events)
+        report("ST_EVENT_REPORT_L1P5", self._node_and_block_events(host, "F0", [84001]))
+        check(2)
+        delete_spec("ST_EVENT_REPORT_L2", 84000, "F0_N1")
+        check(2)  # A single valid TP spec is enough for plain-prefix matching.
+        delete_spec("ST_EVENT_REPORT_L2", 84000, "F0_N0")
+        check(0)  # The later Subscriber hit cannot bridge the missing first block.
+        report("ST_EVENT_REPORT_L2", self._node_and_block_events(host, "F0_N1", [84000])[1:])
+        check(2)
+        delete_spec("ST_EVENT_REPORT_L1P5", 84001, "F0")
+        check(1)
+        rejected = report("ST_EVENT_REPORT_L1P5",
+                          self._node_and_block_events(host, "F1", [84001])[1:], check_response=False)
+        self.assertEqual(["INVALID_ARGUMENT"], rejected["item_results"], rejected)
+        check(1)
+
+    def test_multi_dp_host_cache_state_with_shared_v6d(self):
+        """Keep DP identities, shared V6D, Top-N and lifecycle behavior over HTTP."""
         instance_id = "http_multi_dp_instance"
         group_name = "http_multi_dp_group"
         l1_name, l2_name = "http_multi_dp_l1p5", "http_multi_dp_l2"
@@ -209,14 +280,15 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
         self._client.create_instance_group({"instance_group": group})
         deployment = self._get_test_model_deployment()
         deployment["dp_size"] = 2
+        deployment["tp_size"] = 1
         self._client.register_instance({
             "instance_group": group_name,
             "instance_id": instance_id,
             "block_size": 128,
             "model_deployment": deployment,
             "default_query_type": "QT_PREFIX_MATCH",
-            "location_spec_infos": [{"name": name, "size": 1024} for name in ("F0_N0", "F0_N1")],
-            "location_spec_groups": [{"name": "F0", "spec_names": ["F0_N0", "F0_N1"]}],
+            "location_spec_infos": [{"name": "F0", "size": 1024}],
+            "location_spec_groups": [{"name": "F0", "spec_names": ["F0"]}],
         })
 
         def report(host, storage_type, events):
@@ -225,10 +297,10 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
             return self._client.report_event(request)
 
         for host, storage_type, spec, block_keys in (
-                (base, "ST_EVENT_REPORT_L2", "F0_N0", keys),
-                (rank0, "ST_EVENT_REPORT_L1P5", "F0_N1", keys),
-                (rank1, "ST_EVENT_REPORT_L1P5", "F0_N1", keys[::2]),
-                (peer, "ST_EVENT_REPORT_L2", "F0_N1", keys[1:])):
+                (base, "ST_EVENT_REPORT_L2", "F0", keys[:1]),
+                (rank0, "ST_EVENT_REPORT_L1P5", "F0", keys[1:]),
+                (rank1, "ST_EVENT_REPORT_L1P5", "F0", keys[2:]),
+                (peer, "ST_EVENT_REPORT_L2", "F0", keys[1:])):
             # Data endpoints do not encode the reporter's rank.
             report(host, storage_type, self._node_and_block_events(base, spec, block_keys))
 

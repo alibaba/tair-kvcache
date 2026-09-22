@@ -102,8 +102,6 @@ public:
                                           int32_t sw_size,
                                           CacheLocationVector &out_locations,
                                           SelectLocationPolicy *policy) const;
-    // Non-empty required_spec_groups require all configured specs per block.
-    // Empty groups preserve legacy presence-only matching.
     ErrorCode PrefixMatchByHost(RequestContext *request_context,
                                 const KeyVector &keys,
                                 bool use_eagle_pop,
@@ -112,8 +110,7 @@ public:
                                 const CheckHostCacheLocationFunc *request_check_location = nullptr,
                                 size_t global_kvs_host_count = 0,
                                 bool enable_p2p = false,
-                                SelectLocationPolicy *policy = nullptr,
-                                const std::vector<LocationSpecGroup> &required_spec_groups = {}) const;
+                                SelectLocationPolicy *policy = nullptr) const;
     ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
                                          const KeyVector &keys,
                                          bool use_eagle_pop,

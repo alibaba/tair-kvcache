@@ -750,6 +750,20 @@ void BuildHostSpecNamesForOneKey(const LocationRange &locations,
         });
 }
 
+int64_t ComputePrefixMatchBlocks(const std::vector<std::set<std::string>> &specs_by_key, bool use_eagle_pop) {
+    int64_t prefix_len = 0;
+    for (const auto &specs : specs_by_key) {
+        if (specs.empty()) {
+            break;
+        }
+        ++prefix_len;
+    }
+    if (use_eagle_pop) {
+        prefix_len = std::max<int64_t>(prefix_len - 1, 0);
+    }
+    return prefix_len;
+}
+
 ErrorCode ClassifySpecGroups(RequestContext *request_context,
                              const std::vector<LocationSpecGroup> &location_spec_groups,
                              std::vector<const LocationSpecGroup *> &full_groups,
@@ -810,22 +824,6 @@ bool HasAllLocationSpecGroups(const std::set<std::string> &spec_names,
         }
     }
     return true;
-}
-
-int64_t ComputePrefixMatchBlocks(const std::vector<std::set<std::string>> &specs_by_key,
-                                 bool use_eagle_pop,
-                                 const std::vector<const LocationSpecGroup *> &required_groups) {
-    int64_t prefix_len = 0;
-    for (const auto &specs : specs_by_key) {
-        if (specs.empty() || !HasAllLocationSpecGroups(specs, required_groups)) {
-            break;
-        }
-        ++prefix_len;
-    }
-    if (use_eagle_pop) {
-        prefix_len = std::max<int64_t>(prefix_len - 1, 0);
-    }
-    return prefix_len;
 }
 
 int64_t ComputeMambaPrefixMatchBlocks(const std::vector<std::set<std::string>> &specs_by_key,
@@ -954,9 +952,8 @@ void AddPeerSpecs(const std::string &host,
             }
         }
     };
-    // Query positions must follow block order across all required node groups.
-    for (size_t block = 0; block < block_count; ++block) {
-        for (const auto *group : groups) {
+    for (const auto *group : groups) {
+        for (size_t block = 0; block < block_count; ++block) {
             if (!group) {
                 add_position(block, {});
                 continue;
@@ -984,8 +981,8 @@ int64_t ComputeHostMatch(const SpecsByKey &specs,
                          bool use_eagle_pop,
                          const std::vector<const LocationSpecGroup *> &full_groups,
                          const std::vector<const LocationSpecGroup *> &state_groups) {
-    return state_groups.empty() ? ComputePrefixMatchBlocks(specs, use_eagle_pop, full_groups)
-                                : ComputeMambaPrefixMatchBlocks(specs, use_eagle_pop, full_groups, state_groups);
+    return full_groups.empty() ? ComputePrefixMatchBlocks(specs, use_eagle_pop)
+                               : ComputeMambaPrefixMatchBlocks(specs, use_eagle_pop, full_groups, state_groups);
 }
 
 int64_t ComputeRemoteHostMatch(const std::string &host,
@@ -1005,11 +1002,11 @@ int64_t ComputeRemoteHostMatch(const std::string &host,
         }
     }
     if (enable_p2p) {
-        if (state_groups.empty()) {
+        if (full_groups.empty()) {
             AddPeerSpecs(host,
                          projection,
                          local_peers,
-                         full_groups.empty() ? std::vector<const LocationSpecGroup *>{nullptr} : full_groups,
+                         {nullptr},
                          combined.size(),
                          LocationSelectStrategy::LSS_V6D_PREFIX,
                          combined);
@@ -1266,20 +1263,18 @@ ErrorCode PrefixMatchByHostLocalOnly(MetaIndexer *meta_indexer,
     return EC_OK;
 }
 
-ErrorCode
-PrefixMatchWithSpecGroupsByHostLocalOnly(MetaIndexer *meta_indexer,
-                                         const CheckLocDataExistFunc &check_loc_data_exist,
-                                         RequestContext *request_context,
-                                         const MetaSearcher::KeyVector &keys,
-                                         bool use_eagle_pop,
-                                         const std::vector<std::string> &medium_filter,
-                                         const std::vector<const LocationSpecGroup *> &full_groups,
-                                         const std::vector<const LocationSpecGroup *> &mamba_state_groups,
-                                         std::vector<MetaSearcher::HostCacheMatch> &out_matches,
-                                         const MetaSearcher::CheckHostCacheLocationFunc *request_check_location) {
+ErrorCode PrefixMatchWithMambaByHostLocalOnly(MetaIndexer *meta_indexer,
+                                              const CheckLocDataExistFunc &check_loc_data_exist,
+                                              RequestContext *request_context,
+                                              const MetaSearcher::KeyVector &keys,
+                                              bool use_eagle_pop,
+                                              const std::vector<std::string> &medium_filter,
+                                              const std::vector<const LocationSpecGroup *> &full_groups,
+                                              const std::vector<const LocationSpecGroup *> &mamba_state_groups,
+                                              std::vector<MetaSearcher::HostCacheMatch> &out_matches,
+                                              const MetaSearcher::CheckHostCacheLocationFunc *request_check_location) {
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     const MediumViewSet medium_set = BuildMediumViewSet(medium_filter);
-    const bool require_state = !mamba_state_groups.empty();
 
     std::vector<std::string> required_spec_names;
     auto append_required_names = [&required_spec_names](const std::vector<const LocationSpecGroup *> &groups) {
@@ -1326,7 +1321,6 @@ PrefixMatchWithSpecGroupsByHostLocalOnly(MetaIndexer *meta_indexer,
                           &required_spec_names,
                           &full_required,
                           &state_required,
-                          require_state,
                           &full_prefix_stops,
                           &state_present_words,
                           &state_key_word_count,
@@ -1354,9 +1348,7 @@ PrefixMatchWithSpecGroupsByHostLocalOnly(MetaIndexer *meta_indexer,
                 projection_invalid.store(true, std::memory_order_relaxed);
                 return size_t{0};
             }
-            if (require_state) {
-                state_present_words.assign(state_key_word_count * candidate_hosts.size(), 0);
-            }
+            state_present_words.assign(state_key_word_count * candidate_hosts.size(), 0);
         }
 
         std::vector<std::uint64_t> seen_words(candidate_hosts.size() * spec_word_count, 0);
@@ -1409,7 +1401,7 @@ PrefixMatchWithSpecGroupsByHostLocalOnly(MetaIndexer *meta_indexer,
 
             for (size_t host_index = 0; host_index < candidate_hosts.size(); ++host_index) {
                 bool has_full = host_present[host_index] != 0;
-                bool has_state = require_state && has_full;
+                bool has_state = has_full;
                 for (size_t word = 0; word < spec_word_count && (has_full || has_state); ++word) {
                     const auto seen = seen_words[host_index * spec_word_count + word];
                     has_full = has_full && (seen & full_required[word]) == full_required[word];
@@ -1445,7 +1437,7 @@ PrefixMatchWithSpecGroupsByHostLocalOnly(MetaIndexer *meta_indexer,
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, host_projection_time_us, projection_wall_timer.elapsed_us());
     if (projection_invalid.load(std::memory_order_relaxed)) {
-        request_context->error_tracer()->AddErrorMsg("host/spec flag matrix size overflow");
+        request_context->error_tracer()->AddErrorMsg("mamba host/spec flag matrix size overflow");
         return EC_ERROR;
     }
     const std::size_t valid_key_count = result.valid_key_count;
@@ -1471,7 +1463,6 @@ PrefixMatchWithSpecGroupsByHostLocalOnly(MetaIndexer *meta_indexer,
          &state_present_words,
          state_key_word_count,
          valid_key_count,
-         require_state,
          &prefix_lengths,
          use_eagle_pop](std::size_t begin, std::size_t end) {
             for (std::size_t host_index = begin; host_index < end; ++host_index) {
@@ -1479,10 +1470,6 @@ PrefixMatchWithSpecGroupsByHostLocalOnly(MetaIndexer *meta_indexer,
                     std::min(valid_key_count, full_prefix_stops[host_index].load(std::memory_order_relaxed));
                 if (use_eagle_pop && full_prefix_len > 0) {
                     --full_prefix_len;
-                }
-                if (!require_state) {
-                    prefix_lengths[host_index] = static_cast<int64_t>(full_prefix_len);
-                    continue;
                 }
                 while (full_prefix_len > 0) {
                     const size_t last_index = full_prefix_len - 1;
@@ -1951,30 +1938,11 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
                                           const CheckHostCacheLocationFunc *request_check_location,
                                           size_t global_kvs_host_count,
                                           bool enable_p2p,
-                                          SelectLocationPolicy *policy,
-                                          const std::vector<LocationSpecGroup> &required_spec_groups) const {
+                                          SelectLocationPolicy *policy) const {
     SPAN_TRACER(request_context);
     out_matches.clear();
     if (keys.empty()) {
         return EC_OK;
-    }
-    std::vector<const LocationSpecGroup *> required_groups;
-    required_groups.reserve(required_spec_groups.size());
-    for (const auto &group : required_spec_groups) {
-        required_groups.push_back(&group);
-    }
-    if (global_kvs_host_count == 0 && !required_groups.empty()) {
-        // Reuse the streamed spec bitmap matcher without a Mamba state constraint.
-        return PrefixMatchWithSpecGroupsByHostLocalOnly(meta_indexer_.get(),
-                                                        check_loc_data_exist_func_,
-                                                        request_context,
-                                                        keys,
-                                                        use_eagle_pop,
-                                                        medium_filter,
-                                                        required_groups,
-                                                        {},
-                                                        out_matches,
-                                                        request_check_location);
     }
     if (global_kvs_host_count == 0) {
         return PrefixMatchByHostLocalOnly(meta_indexer_.get(),
@@ -1993,7 +1961,7 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
                                        keys,
                                        use_eagle_pop,
                                        medium_filter,
-                                       required_groups,
+                                       {},
                                        {},
                                        out_matches,
                                        request_check_location,
@@ -2025,16 +1993,16 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
         return ec;
     }
     if (global_kvs_host_count == 0) {
-        return PrefixMatchWithSpecGroupsByHostLocalOnly(meta_indexer_.get(),
-                                                        check_loc_data_exist_func_,
-                                                        request_context,
-                                                        keys,
-                                                        use_eagle_pop,
-                                                        medium_filter,
-                                                        full_groups,
-                                                        mamba_state_groups,
-                                                        out_matches,
-                                                        request_check_location);
+        return PrefixMatchWithMambaByHostLocalOnly(meta_indexer_.get(),
+                                                   check_loc_data_exist_func_,
+                                                   request_context,
+                                                   keys,
+                                                   use_eagle_pop,
+                                                   medium_filter,
+                                                   full_groups,
+                                                   mamba_state_groups,
+                                                   out_matches,
+                                                   request_check_location);
     }
     return PrefixMatchByHostWithRemote(meta_indexer_.get(),
                                        check_loc_data_exist_func_,
