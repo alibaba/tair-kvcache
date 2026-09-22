@@ -157,6 +157,18 @@ cc_test(
 )
 
 cc_test(
+    name = "redis_client_ext_test",
+    srcs = [
+        "redis_client_ext_test.cc",
+    ],
+    deps = [
+        ":redis_client_testlib",
+        "//kv_cache_manager/common:redis_client_ext",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
     name = "redis_client_randomkey_batch_num_test",
     srcs = [
         "redis_client_randomkey_batch_num_test.cc",
