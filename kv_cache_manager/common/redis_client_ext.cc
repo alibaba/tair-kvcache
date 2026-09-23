@@ -337,35 +337,38 @@ ErrorCode RedisClientExt::Pexpire(const std::string &key, int64_t ttl_ms) {
     KVCM_LOG_ERROR("PEXPIRE command unexpected reply type: %d", reply->type);
     return EC_ERROR;
 }
-ErrorCode RedisClientExt::FlushAll() {
-    CmdArgs flushall_cmd{"FLUSHALL"};
-    std::vector<ReplyUPtr> flushall_replies;
-    ErrorCode ec = CommandPipeline({flushall_cmd}, flushall_replies);
+ErrorCode RedisClientExt::FlushAll() { return Flush({"FLUSHALL"}); }
+
+ErrorCode RedisClientExt::FlushDb() { return Flush({"FLUSHDB", "ASYNC"}); }
+
+ErrorCode RedisClientExt::Flush(const CmdArgs &command) {
+    const std::string &command_name = command.front();
+    std::vector<ReplyUPtr> replies;
+    ErrorCode ec = CommandPipeline({command}, replies);
     if (ec != EC_OK) {
-        KVCM_LOG_ERROR("redis flushall fail, no reply");
+        KVCM_LOG_ERROR("redis %s fail, no reply", command_name.c_str());
         return ec;
     }
-    if (flushall_replies.size() != 1) {
-        KVCM_LOG_ERROR("redis flushall fail, pipeline [1] != flushall_replies.size[%zu]", flushall_replies.size());
+    if (replies.size() != 1) {
+        KVCM_LOG_ERROR("redis %s fail, pipeline [1] != replies.size[%zu]", command_name.c_str(), replies.size());
         return EC_ERROR;
     }
 
-    const ReplyUPtr &flushall_reply = flushall_replies[0];
-    if (!IsReplyOk(flushall_reply.get())) {
-        KVCM_LOG_ERROR("redis flushall fail");
+    const ReplyUPtr &reply = replies[0];
+    if (!IsReplyOk(reply.get())) {
+        KVCM_LOG_ERROR("redis %s fail", command_name.c_str());
         return EC_ERROR;
     }
 
-    // FLUSHALL 命令返回 "OK" 字符串
-    if (flushall_reply->type != REDIS_REPLY_STATUS) {
-        KVCM_LOG_ERROR("redis flushall fail, unexpected reply type[%d]", flushall_reply->type);
+    if (reply->type != REDIS_REPLY_STATUS) {
+        KVCM_LOG_ERROR("redis %s fail, unexpected reply type[%d]", command_name.c_str(), reply->type);
         return EC_ERROR;
     }
 
     static const std::string ok_str = "OK";
-    if (!flushall_reply->str || std::string(flushall_reply->str) != ok_str) {
-        KVCM_LOG_ERROR("redis flushall fail, reply str[%s] is not OK",
-                       flushall_reply->str ? flushall_reply->str : "nullptr");
+    if (!reply->str || std::string(reply->str) != ok_str) {
+        KVCM_LOG_ERROR(
+            "redis %s fail, reply str[%s] is not OK", command_name.c_str(), reply->str ? reply->str : "nullptr");
         return EC_ERROR;
     }
 

@@ -56,7 +56,7 @@ private:
         if (cmd[0] == "GET") {
             return MakeFakeReply(REDIS_REPLY_STRING, "value");
         }
-        if (cmd[0] == "SET" || cmd[0] == "FLUSHALL") {
+        if (cmd[0] == "SET" || cmd[0] == "FLUSHALL" || cmd[0] == "FLUSHDB") {
             return MakeFakeReply(REDIS_REPLY_STATUS, "OK");
         }
         return MakeFakeReplyInteger(cmd[0] == "PTTL" ? 1000 : 1);
@@ -132,6 +132,10 @@ TEST(RedisClientExtTest, EveryCommandRecoversAStaleConnectionThroughCommandPipel
 
     client.BreakConnection();
     EXPECT_EQ(EC_OK, client.FlushAll());
+    EXPECT_EQ(++expected_reconnect_count, client.ReconnectCount());
+
+    client.BreakConnection();
+    EXPECT_EQ(EC_OK, client.FlushDb());
     EXPECT_EQ(++expected_reconnect_count, client.ReconnectCount());
 }
 

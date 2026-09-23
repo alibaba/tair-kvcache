@@ -143,6 +143,17 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "redis_test_environment",
+    testonly = True,
+    hdrs = ["redis_test_environment.h"],
+    visibility = [
+        "//kv_cache_manager/config/test:__pkg__",
+        "//kv_cache_manager/manager/test:__pkg__",
+        "//kv_cache_manager/meta/test:__pkg__",
+    ],
+)
+
 cc_test(
     name = "redis_client_test",
     srcs = [
@@ -194,6 +205,7 @@ cc_test(
         "redis",
     ],
     deps = [
+        ":redis_test_environment",
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/common:unittest",
     ],

@@ -1,4 +1,5 @@
 #include "kv_cache_manager/common/redis_client.h"
+#include "kv_cache_manager/common/test/redis_test_environment.h"
 #include "kv_cache_manager/common/unittest.h"
 
 namespace kv_cache_manager {
@@ -17,12 +18,8 @@ private:
 };
 
 void RedisClientRealServiceTest::SetUp() {
-    StandardUri storage_uri;
-    storage_uri.user_info_ = "test_user:test_password";
-    storage_uri.hostname_ = "localhost";
-    storage_uri.port_ = 6379;
-    storage_uri.params_["timeout_ms"] = "2000";
-    storage_uri.params_["retry_count"] = "2";
+    StandardUri storage_uri = StandardUri::FromUri(
+        redis_test::Uri("test_user:test_password", redis_test::kRedisClientDb, "timeout_ms=2000&retry_count=2"));
     redis_client_ = std::make_unique<RedisClient>(storage_uri);
 }
 
@@ -310,18 +307,13 @@ TEST_F(RedisClientRealServiceTest, TestKeyAndFieldWithSpace) {
 TEST_F(RedisClientRealServiceTest, TestSelectDb) {
     // build two clients connecting to different redis dbs with the same key
     auto make_client = [](int64_t db) {
-        StandardUri storage_uri;
-        storage_uri.user_info_ = "test_user:test_password";
-        storage_uri.hostname_ = "localhost";
-        storage_uri.port_ = 6379;
-        storage_uri.params_["timeout_ms"] = "2000";
-        storage_uri.params_["retry_count"] = "2";
-        storage_uri.params_["db"] = std::to_string(db);
+        StandardUri storage_uri =
+            StandardUri::FromUri(redis_test::Uri("test_user:test_password", db, "timeout_ms=2000&retry_count=2"));
         return std::make_unique<RedisClient>(storage_uri);
     };
 
-    auto client_db0 = make_client(0);
-    auto client_db1 = make_client(1);
+    auto client_db0 = make_client(redis_test::kRedisClientDb);
+    auto client_db1 = make_client(redis_test::kRedisClientAlternateDb);
     ASSERT_TRUE(client_db0->Open());
     ASSERT_TRUE(client_db1->Open());
 
