@@ -108,6 +108,8 @@ message TairMemPoolStorageSpec {
     //     static://11.22.33.44:8080,33.55.66.77:8080
     string service_discovery_url = 5;
     int32 media_type = 6; // 0=不指定；2=DRAM；5=SSD
+    // GC 是否跳过已判定不存在的 URI 的后端删除；默认 false，仍发送 Delete/Free。
+    bool skip_confirmed_missing_backend_delete = 7;
 }
 
 message NfsStorageSpec {

@@ -105,8 +105,9 @@ bool MooncakeStorageSpec::ValidateRequiredFields(std::string &invalid_fields) co
 }
 std::string TairMemPoolStorageSpec::ToString() const {
     std::ostringstream oss;
-    oss << "domain: " << domain_ << ", timeout: " << timeout_ << ", service_discovery_url: "
-        << service_discovery_url_ << ", media_type: " << media_type_;
+    oss << "domain: " << domain_ << ", timeout: " << timeout_ << ", service_discovery_url: " << service_discovery_url_
+        << ", media_type: " << media_type_
+        << ", skip_confirmed_missing_backend_delete: " << skip_confirmed_missing_backend_delete_;
     return oss.str();
 }
 bool TairMemPoolStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
@@ -277,6 +278,8 @@ bool TairMemPoolStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value)
         return false;
     }
     media_type_ = static_cast<uint16_t>(media_type);
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "skip_confirmed_missing_backend_delete", skip_confirmed_missing_backend_delete_, false);
 
     // 向后兼容：把已废弃的 enable_vipserver / vipserver_domain 自动迁移成 service_discovery_url，
     // 兼容旧 admin 工具 / 旧持久化数据。新字段 service_discovery_url 优先级更高，
@@ -300,6 +303,7 @@ void TairMemPoolStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBu
     Put(writer, "timeout", timeout_);
     Put(writer, "service_discovery_url", service_discovery_url_);
     Put(writer, "media_type", media_type_);
+    Put(writer, "skip_confirmed_missing_backend_delete", skip_confirmed_missing_backend_delete_);
 }
 
 bool NfsStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {

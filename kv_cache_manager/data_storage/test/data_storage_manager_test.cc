@@ -114,3 +114,30 @@ TEST_F(DataStorageManagerTest, TestOptionalBackendsFollowBuildConfig) {
     pace_ssd_backend->config_ = pace_ssd_config;
     EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, pace_ssd_backend->GetType());
 }
+
+TEST_F(DataStorageManagerTest, TestConfirmedMissingDeletePolicies) {
+    DataStorageManager manager(metrics_registry_);
+    std::vector<DataStorageType> skip_types = {
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        DataStorageType::DATA_STORAGE_TYPE_HF3FS,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+    };
+#ifdef ENABLE_MOONCAKE
+    skip_types.push_back(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
+#endif
+#ifdef ENABLE_VCNS
+    skip_types.push_back(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS);
+#endif
+    for (const auto type : skip_types) {
+        const auto backend = manager.CreateStorageBackend(type);
+        ASSERT_NE(nullptr, backend);
+        EXPECT_TRUE(backend->ShouldSkipConfirmedMissingBackendDelete()) << static_cast<int>(type);
+        EXPECT_FALSE(backend->DataStorageBackend::ShouldSkipConfirmedMissingBackendDelete());
+    }
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+        const auto backend = manager.CreateStorageBackend(type);
+        ASSERT_NE(nullptr, backend);
+        EXPECT_FALSE(backend->ShouldSkipConfirmedMissingBackendDelete());
+    }
+}

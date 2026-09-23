@@ -174,12 +174,14 @@ public:
     int64_t timeout() const { return timeout_; }
     const std::string &service_discovery_url() const { return service_discovery_url_; }
     uint16_t media_type() const { return media_type_; }
+    bool skip_confirmed_missing_backend_delete() const { return skip_confirmed_missing_backend_delete_; }
 
     void set_domain(const std::string &domain) { domain_ = domain; }
     void set_cluster_name(const std::string &cluster_name) { cluster_name_ = cluster_name; }
     void set_timeout(int64_t timeout) { timeout_ = timeout; }
     void set_service_discovery_url(const std::string &url) { service_discovery_url_ = url; }
     void set_media_type(uint16_t media_type) { media_type_ = media_type; }
+    void set_skip_confirmed_missing_backend_delete(bool value) { skip_confirmed_missing_backend_delete_ = value; }
 
 private:
     std::string domain_;                // 统一接入
@@ -187,6 +189,8 @@ private:
     std::string service_discovery_url_; // 见类注释
     std::string cluster_name_;          // TODO proto中没有这个字段并且未使用，考虑删除
     uint16_t media_type_{kTairMemPoolMediaTypeUnspecified};
+    // A missing owner does not imply that shared-store data has been freed.
+    bool skip_confirmed_missing_backend_delete_{false};
 };
 
 class NfsStorageSpec : public StorageSpec {

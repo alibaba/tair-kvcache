@@ -21,6 +21,10 @@ public:
 
     virtual ~DataStorageBackend() = default;
     virtual DataStorageType GetType() = 0;
+    // Whether GC may omit Delete for URIs rejected by Exist/MightExist.
+    // Default to deletion: a missing URI does not always imply reclaimed data.
+    // This policy does not affect metadata-only cleanup.
+    virtual bool ShouldSkipConfirmedMissingBackendDelete() const { return false; }
     virtual bool Available() = 0;
     virtual double GetStorageUsageRatio(const std::string &trace_id) const = 0;
     inline bool IsOpen() const { return is_open_.load(std::memory_order_relaxed); }

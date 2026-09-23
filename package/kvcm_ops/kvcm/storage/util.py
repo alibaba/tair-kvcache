@@ -19,6 +19,9 @@ def gen_pace_config_data(args):
         "service_discovery_url": args.service_discovery_url,
         "media_type": args.media_type,
     }
+    skip_missing = getattr(args, "skip_confirmed_missing_backend_delete", None)
+    if skip_missing is not None:
+        storage_spec["skip_confirmed_missing_backend_delete"] = skip_missing
     return storage_spec
 
 
@@ -91,6 +94,12 @@ def add_pace_common_args(parser):
     parser.add_argument('--domain', "-d", required=True, help='pace domain')
     parser.add_argument('--timeout', "-t", required=True, type=int, help='pace time out config')
     parser.add_argument(
+        '--skip_confirmed_missing_backend_delete',
+        type=pace_gc_skip_delete_value,
+        default=None,
+        metavar='{true,false}',
+        help='Skip GC Delete for confirmed-missing URIs; add defaults to false, update omission preserves the value')
+    parser.add_argument(
         '--service_discovery_url',
         default="",
         help=(
@@ -100,6 +109,12 @@ def add_pace_common_args(parser):
             'static://10.0.0.1:8080,10.0.0.2:8080'
         ),
     )
+
+
+def pace_gc_skip_delete_value(value):
+    if value.lower() not in ("true", "false"):
+        raise argparse.ArgumentTypeError("expected true or false")
+    return value.lower() == "true"
 
 
 def add_3fs_sub_parser(subparsers):
