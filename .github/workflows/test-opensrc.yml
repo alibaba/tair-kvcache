@@ -108,7 +108,7 @@ jobs:
           set -e
           ulimit -c unlimited
           # Wildcard target patterns exclude manual tests, so pass matching labels explicitly.
-          redis_test_targets="$(bazelisk query 'attr(tags, "manual", attr(tags, "redis", tests(//kv_cache_manager/...)))' --output=label)"
+          redis_test_targets="$(bazelisk query 'attr(tags, "manual", attr(tags, "redis", tests(//kv_cache_manager/...)))' --output=label --repo_env=PYTHON_BIN_PATH=/usr/bin/python3)"
           test -n "${redis_test_targets}"
           bazelisk test ${{ matrix.test_target }} ${redis_test_targets} ${{ matrix.test_args }} --config=ci_fast --cache_test_results=no --test_output=errors
       - &delete_old_disk_cache_step
