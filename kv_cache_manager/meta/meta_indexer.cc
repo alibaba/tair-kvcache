@@ -190,6 +190,9 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     ec = RecoverMetaData();
     if (ec != EC_OK && ec != EC_NOENT) {
         KVCM_LOG_ERROR("instance[%s] recover metadata failed, ec[%d]", instance_id_.c_str(), ec);
+        // Failed initialization must not persist partial/default counters in
+        // the destructor over the Redis recovery baseline.
+        backend_manager_.reset();
         return ec;
     }
     KVCM_LOG_INFO("instance[%s] meta indexer init success, mutex shard num[%lu], mutex hash seed[%" PRIu64
@@ -378,11 +381,19 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
                     is_new_key[global_index]) {
                     continue;
                 }
+                const bool requires_secondary_admission =
+                    std::binary_search(upsert_batch.batch_secondary_admission_indices.begin(),
+                                       upsert_batch.batch_secondary_admission_indices.end(),
+                                       i);
+                const size_t filtered_index = existing_update_batch.batch_keys.size();
                 existing_update_positions.push_back(i);
                 existing_update_batch.batch_keys.push_back(upsert_batch.batch_keys[i]);
                 existing_update_batch.batch_indexs.push_back(global_index);
-                existing_update_batch.batch_locations.push_back(upsert_batch.batch_locations[i]);
-                existing_update_batch.batch_properties.push_back(upsert_batch.batch_properties[i]);
+                existing_update_batch.batch_locations.push_back(std::move(upsert_batch.batch_locations[i]));
+                existing_update_batch.batch_properties.push_back(std::move(upsert_batch.batch_properties[i]));
+                if (requires_secondary_admission) {
+                    existing_update_batch.batch_secondary_admission_indices.push_back(filtered_index);
+                }
             }
             backend_batch = &existing_update_batch;
         }
@@ -728,7 +739,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         ScopedBatchLock lock(*this, batch.shard_indices, &stats.lock_wait_time_us, &stats.lock_hold_time_us);
 
         // 1. One batched read for every (key, location_id) return deserialised CacheLocation
-        if (maintenance_no_touch && !backend_manager_->Sync(batch_keys)) {
+        if (maintenance_no_touch && !backend_manager_->SyncBeforeMaintenanceRead(batch_keys)) {
             // A single async metadata backend may still have an accepted
             // same-key mutation queued. Reading before that mutation reaches
             // the persistent view could authorize a stale expected-value
@@ -748,7 +759,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         std::vector<ErrorCode> batch_key_get_ecs;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
         std::vector<ErrorCode> refresh_results;
-        if (refresh_cache_from_persistent) {
+        const bool refresh_cache = refresh_cache_from_persistent && !backend_manager_->IsMemoryPrimary();
+        if (refresh_cache) {
             // Maintenance candidates originate from the persistent scan. Under
             // the same shard lock as the CAS, replace a missing or stale hot
             // cache entry with the complete source-of-truth key first.
@@ -780,7 +792,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
 
         if (get_ecs_per_key.size() != batch_keys.size() || batch_locations_per_key.size() != batch_keys.size() ||
             (track_created_key_count && batch_key_get_ecs.size() != batch_keys.size()) ||
-            (refresh_cache_from_persistent && refresh_results.size() != batch_keys.size())) {
+            (refresh_cache && refresh_results.size() != batch_keys.size())) {
             PREFIX_INDEXER_LOG(ERROR,
                                "ReadModifyWriteLocation result size mismatch, keys[%lu], ecs[%lu], locations[%lu], "
                                "key_ecs[%lu]",
@@ -796,7 +808,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             continue;
         }
 
-        if (refresh_cache_from_persistent) {
+        if (refresh_cache) {
             for (size_t i = 0; i < batch_keys.size(); ++i) {
                 if (refresh_results[i] == EC_OK) {
                     continue;
@@ -885,6 +897,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             }
             if (action == MA_OK) {
                 CacheLocationMap upsert_loc_map;
+                bool requires_secondary_admission = false;
                 for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
                     if (modifier_ecs[loc_index] != EC_OK) {
                         location_result.per_location_error_codes[global_idx][loc_index] = modifier_ecs[loc_index];
@@ -897,13 +910,19 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                         key_level_failures[global_idx] = true;
                         continue;
                     }
+                    requires_secondary_admission =
+                        requires_secondary_admission || working_loc->status() == CacheLocationStatus::CLS_DELETING;
                     upsert_loc_map.emplace(loc_id, working_loc);
                 }
                 if (!upsert_loc_map.empty() || !upsert_property_map.empty()) {
+                    const size_t upsert_index = upsert_batch.batch_keys.size();
                     upsert_batch.batch_keys.emplace_back(key);
                     upsert_batch.batch_indexs.emplace_back(global_idx);
                     upsert_batch.batch_locations.emplace_back(std::move(upsert_loc_map));
                     upsert_batch.batch_properties.emplace_back(std::move(upsert_property_map));
+                    if (requires_secondary_admission) {
+                        upsert_batch.batch_secondary_admission_indices.push_back(upsert_index);
+                    }
                     if (track_created_key_count && key_get_ec == EC_NOENT) {
                         put_global_indexs.emplace_back(global_idx);
                     }
@@ -1408,9 +1427,9 @@ MetaIndexer::Result MetaIndexer::GetLocations(RequestContext *request_context,
     return result;
 }
 
-MetaIndexer::Result MetaIndexer::GetLocationsFromPersistent(RequestContext *request_context,
-                                                            const KeyVector &keys,
-                                                            CacheLocationMapVector &out_location_maps) noexcept {
+MetaIndexer::Result MetaIndexer::GetLocationsFromPrimary(RequestContext *request_context,
+                                                         const KeyVector &keys,
+                                                         CacheLocationMapVector &out_location_maps) noexcept {
     if (keys.empty()) {
         out_location_maps.clear();
         return Result(EC_OK);
@@ -1420,7 +1439,7 @@ MetaIndexer::Result MetaIndexer::GetLocationsFromPersistent(RequestContext *requ
     const auto &trace_id = request_context->trace_id();
 
     const int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
-    auto error_codes = backend_manager_->GetLocationsFromPersistent(request_context, keys, out_location_maps);
+    auto error_codes = backend_manager_->GetLocationsFromPrimary(request_context, keys, out_location_maps);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
 
@@ -1906,6 +1925,54 @@ ErrorCode MetaIndexer::Scan(RequestContext *request_context,
     return ec;
 }
 
+ErrorCode MetaIndexer::TrimResidues(RequestContext *request_context, const size_t scan_batch_size) noexcept {
+    if (!backend_manager_->IsMemoryPrimary() ||
+        backend_manager_->GetRecoverState() != MetaStorageBackendManager::RecoverState::kRunning) {
+        return EC_OK;
+    }
+
+    std::string cursor = SCAN_BASE_CURSOR;
+    do {
+        std::string next_cursor;
+        KeyVector keys;
+        const ErrorCode list_ec = backend_manager_->ListPersistentKeys(
+            request_context, cursor, static_cast<int64_t>(scan_batch_size), next_cursor, keys);
+        if (list_ec != EC_OK) {
+            KVCM_LOG_ERROR("instance[%s] list persistent keys failed, cursor[%s], ec[%d]",
+                           instance_id_.c_str(),
+                           cursor.c_str(),
+                           list_ec);
+            return list_ec;
+        }
+
+        KeyVector batch_keys;
+        KeyVector trimmed_keys;
+        KeyVector page_trimmed_keys;
+        page_trimmed_keys.reserve(keys.size());
+        ErrorCode page_ec = EC_OK;
+        for (const auto &batch : MakeBatches(keys)) {
+            FillBatchKeys(batch.global_indices, keys, batch_keys);
+            {
+                ScopedBatchLock lock(*this, batch.shard_indices);
+                page_ec = backend_manager_->TrimPersistentOrphans(request_context, batch_keys, trimmed_keys);
+            }
+            page_trimmed_keys.insert(page_trimmed_keys.end(), trimmed_keys.begin(), trimmed_keys.end());
+            if (page_ec != EC_OK) {
+                break;
+            }
+        }
+        if (!page_trimmed_keys.empty() && !backend_manager_->Sync(page_trimmed_keys)) {
+            KVCM_LOG_ERROR("instance[%s] sync persistent orphan deletes failed", instance_id_.c_str());
+            return EC_ERROR;
+        }
+        if (page_ec != EC_OK) {
+            return page_ec;
+        }
+        cursor = std::move(next_cursor);
+    } while (cursor != SCAN_BASE_CURSOR);
+    return EC_OK;
+}
+
 ErrorCode MetaIndexer::ScanLocationsForMaintenance(RequestContext *request_context,
                                                    const std::string &cursor,
                                                    const size_t limit,
@@ -1998,6 +2065,8 @@ size_t MetaIndexer::GetMaxKeyCount() const noexcept { return max_key_count_; }
 size_t MetaIndexer::GetMemUsage() const noexcept { return backend_manager_->GetMemUsage(); }
 
 bool MetaIndexer::Sync(const KeyVector &keys) noexcept { return backend_manager_->Sync(keys); }
+
+bool MetaIndexer::SyncAll() noexcept { return backend_manager_->SyncAll(); }
 
 MetaStorageBackend::AsyncWriteStats MetaIndexer::GetAsyncWriteStats() noexcept {
     return backend_manager_->GetAsyncWriteStats();

@@ -1207,6 +1207,17 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationIds(RequestContext * /*reque
     return results;
 }
 
+std::vector<ErrorCode> MetaLocalBackend::GetLocationsForMaintenance(RequestContext * /*request_context*/,
+                                                                    const KeyTypeVec &keys,
+                                                                    CacheLocationMapVector &out_locations) noexcept {
+    out_locations.assign(keys.size(), CacheLocationMap{});
+    std::vector<ErrorCode> results(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = GetForOneKeyForMaintenance(keys[i], &out_locations[i], nullptr);
+    }
+    return results;
+}
+
 std::vector<ErrorCode> MetaLocalBackend::GetLocationIdsForMaintenance(RequestContext * /*request_context*/,
                                                                       const KeyTypeVec &keys,
                                                                       LocationIdsPerKey &out_location_ids) noexcept {

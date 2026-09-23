@@ -157,6 +157,8 @@ public:
                     std::chrono::microseconds delay = std::chrono::microseconds(0),
                     std::function<void()> cancel_task = {});
 
+    std::size_t GetWorkerCount() const noexcept { return workers_.size(); }
+
 private:
     struct PromiseCompletion;
     struct LocationDelAdmissionResult {

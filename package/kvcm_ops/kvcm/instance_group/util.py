@@ -195,19 +195,29 @@ def instance_reclaim_budget_policy_value(value: str) -> str:
 class MetaStorageBackendConfig(JsonData):
     def __init__(self,
                  storage_type: str = "local",  # local|redis|cached
-                 storage_uri: str = ""):  # if set empty, no persistence
+                 storage_uri: str = "",  # if set empty, no persistence
+                 memory_primary: bool = False,
+                 force_deleting_async_enqueue: bool = True):
         self._storage_type = storage_type
         self._storage_uri = storage_uri
+        self._memory_primary = memory_primary
+        self._force_deleting_async_enqueue = force_deleting_async_enqueue
         self.check()
 
     def to_json_data(self) -> dict:
         return {
             "storage_type": self._storage_type,
-            "storage_uri": self._storage_uri
+            "storage_uri": self._storage_uri,
+            "memory_primary": self._memory_primary,
+            "force_deleting_async_enqueue": self._force_deleting_async_enqueue
         }
 
     def check(self) -> bool:
         _storage_type = self._storage_type.lower()
+        if not isinstance(self._memory_primary, bool):
+            raise RuntimeError("memory_primary must be a boolean")
+        if not isinstance(self._force_deleting_async_enqueue, bool):
+            raise RuntimeError("force_deleting_async_enqueue must be a boolean")
         if _storage_type not in ["local", "redis", "cached"]:
             raise RuntimeError(f"MetaStorageBackendConfig type {_storage_type} invalid, support local|redis|cached")
         self._storage_type = _storage_type
@@ -218,7 +228,10 @@ class MetaStorageBackendConfig(JsonData):
             storage_type = json_data["storage_type"]
         if JsonData.expect_exist("storage_uri", json_data, str):
             storage_uri = json_data["storage_uri"]
-        return cls(storage_type, storage_uri)
+        return cls(storage_type,
+                   storage_uri,
+                   json_data.get("memory_primary", False),
+                   json_data.get("force_deleting_async_enqueue", True))
 
 
 def meta_storage_backend_config_value(value: str):
@@ -227,7 +240,17 @@ def meta_storage_backend_config_value(value: str):
         return MetaStorageBackendConfig(config_strs[0])
     if len(config_strs) == 2:
         return MetaStorageBackendConfig(config_strs[0], config_strs[1])
-    raise argparse.ArgumentTypeError(f"Invalid config value, expect 'type' or 'type,uri', got '{value}'")
+    if len(config_strs) == 3 and config_strs[2].lower() in ("true", "false"):
+        return MetaStorageBackendConfig(config_strs[0], config_strs[1], config_strs[2].lower() == "true")
+    if (len(config_strs) == 4 and config_strs[2].lower() in ("true", "false")
+            and config_strs[3].lower() in ("true", "false")):
+        return MetaStorageBackendConfig(config_strs[0],
+                                        config_strs[1],
+                                        config_strs[2].lower() == "true",
+                                        config_strs[3].lower() == "true")
+    raise argparse.ArgumentTypeError(
+        "Invalid config value, expect 'type', 'type,uri', 'type,uri,true|false' or "
+        f"'type,uri,true|false,true|false', got '{value}'")
 
 
 class MetaCachePolicyConfig(JsonData):
@@ -606,7 +629,8 @@ def parse_instance_group_args(is_create: bool):
         "--meta_storage_backend_config",
         type=meta_storage_backend_config_value,
         default=MetaStorageBackendConfig() if is_create else argparse.SUPPRESS,
-        help="meta_storage_backend_config, eg. local or local,/tmp/meta_tmp"
+        help="type[,uri[,memory_primary[,force_deleting_async_enqueue]]], e.g. local or "
+             "'cached,redis://host:6379/?persistent_type=async_redis,true,true'"
     )
 
     parser.add_argument(

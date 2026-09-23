@@ -6,6 +6,7 @@
 #include <charconv>
 #include <chrono>
 #include <cinttypes>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -91,6 +92,27 @@ namespace kv_cache_manager {
     } while (0)
 
 namespace {
+bool CollectTrimResult(std::deque<std::future<PlanExecuteResult>> &inflight,
+                       const std::string &trace_id,
+                       const std::string &instance_id,
+                       bool &has_error) {
+    const PlanExecuteResult result = inflight.front().get();
+    inflight.pop_front();
+    if (result.status == EC_OK) {
+        return false;
+    }
+
+    has_error = true;
+    if (!result.error_logged) {
+        KVCM_LOG_WARN("trace_id [%s] instance [%s] | trim cache delete failed, ec[%d], message[%s]",
+                      trace_id.c_str(),
+                      instance_id.c_str(),
+                      result.status,
+                      result.error_message.c_str());
+    }
+    return result.status != EC_PARTIAL_OK;
+}
+
 struct ReporterIdentityView {
     std::string_view base_host;
     std::optional<uint64_t> engine_rank;
@@ -1535,9 +1557,13 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
         return ErrorCode::EC_INSTANCE_NOT_EXIST;
     }
 
+    constexpr std::size_t limit = 256;
+    const std::size_t max_inflight = 2 * schedule_plan_executor_->GetWorkerCount();
+    std::deque<std::future<PlanExecuteResult>> inflight;
+    bool has_error = false;
+    bool stop_submit = false;
     std::string cursor = SCAN_BASE_CURSOR;
     do {
-        constexpr std::size_t limit = 256;
         std::string next_cursor;
 
         CacheMetaDelRequest request;
@@ -1546,14 +1572,33 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
         if (const ErrorCode ec = meta_indexer->Scan(request_context, cursor, limit, next_cursor, request.block_keys);
             ec != ErrorCode::EC_OK) {
             // TODO (rui): cache reclaimer should reclaim the dangling blocks
-            RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "trim cache failed");
+            PREFIX_LOG(WARN, "trim cache scan failed, ec[%d]", ec);
+            has_error = true;
+            break;
         }
 
-        reclaimer_task_supervisor_->Submit(trace_id, std::move(request));
-        cursor = next_cursor;
-    } while (cursor != SCAN_BASE_CURSOR);
+        if (!request.block_keys.empty()) {
+            inflight.emplace_back(schedule_plan_executor_->Submit(request));
+            if (inflight.size() >= max_inflight) {
+                stop_submit = CollectTrimResult(inflight, trace_id, instance_id, has_error);
+            }
+        }
+        cursor = std::move(next_cursor);
+    } while (!stop_submit && cursor != SCAN_BASE_CURSOR);
 
-    return ErrorCode::EC_OK;
+    while (!inflight.empty()) {
+        CollectTrimResult(inflight, trace_id, instance_id, has_error);
+    }
+
+    const bool synced = meta_indexer->SyncAll();
+    if (!synced) {
+        PREFIX_LOG(WARN, "trim cache metadata sync failed");
+    }
+    if (has_error || !synced) {
+        return EC_ERROR;
+    }
+
+    return meta_indexer->TrimResidues(request_context, limit);
 }
 void CacheManager::PauseReclaimer() { cache_reclaimer_->Pause(); }
 void CacheManager::ResumeReclaimer() { cache_reclaimer_->Resume(); }
@@ -4649,8 +4694,8 @@ CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance
         }
 
         std::map<std::string, std::vector<std::string>, std::less<>> ranked_hosts_by_base;
-        const auto l1p5_it = event_snapshots->by_storage_type.find(
-            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+        const auto l1p5_it =
+            event_snapshots->by_storage_type.find(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
         if (l1p5_it != event_snapshots->by_storage_type.end()) {
             for (const auto &[reporter, state] : l1p5_it->second.reporters) {
                 (void)state;

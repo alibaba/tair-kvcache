@@ -196,6 +196,17 @@ client（MetaClient/gRPC）→ service（grpc 适配 → *ServiceImpl）
 
 推理引擎启动时经 client 注册实例，`CacheManager::RegisterInstance` 校验并落库实例配置（block_size、location spec、模型部署等）到 `RegistryManager`（config），并在 `MetaIndexerManager` 中为该 `instance_id` 建立索引。**约束**：KVCache 仅在同一 `instance_id` 内复用，跨 Instance 不匹配。
 
+MetaIndexer/Searcher 保留原创建与清理流程，Indexer Init 完成后即可服务，Redis 全量回填仍异步执行。
+配置 `meta_storage_backend_config.memory_primary=true` 时仅支持 `cached + local + async_redis`：
+Recover 保持原有 Redis-first 条件双写和队列反压，Redis 写未接受时不更新 local；全量回填完成并进入 Running 后，
+普通写才切换为 local-first，Redis 通过 `WriteRoute::secondary` 条件写做有界非等待备份，满队列丢弃新备份。
+Recover 保留未回填 key 的回源、写前补齐与 tombstone；并发读允许按原链路读到旧值，最终由回填和并发写收敛。
+物理删除准入沿用原提交顺序：shard lock 内 CAS local DELETING 并提交异步备份，释放锁后由 executor 执行 `Sync`，
+成功后才调度物理删除。local 写失败的项不会进入 Redis 备份，Reconcile 因而沿用原分类、删除和 Sync 链路，
+不再为 memory-primary 缺失引用增加专属补偿。
+不新增队列级粘性失败状态或锁内 Redis 等待；Redis 启动恢复、原锁外物理删除 Sync 与模块依赖方向均不变，
+不新增模块或依赖边。
+
 ### 4.3 读取（命中并加载 KVCache）
 
 从完整视角看，读取由推理引擎驱动，client 的两条链路依次参与：

@@ -225,6 +225,14 @@ void LocalMetricsReporter::ReportInterval() {
                                  cache_manager_instance,
                                  async_pipeline_error_count,
                                  static_cast<double>(instance_metric.async_pipeline_error_count));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 async_dropped_key_count,
+                                 static_cast<double>(instance_metric.async_dropped_key_count));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 async_dropped_metadata_count,
+                                 static_cast<double>(instance_metric.async_dropped_metadata_count));
                 }
             }
         }

@@ -152,9 +152,9 @@ public:
                                                       const PrefixLocationVisitor &visitor) noexcept;
     // Source-of-truth read used by maintenance admission. It never backfills
     // or touches the optional hot-cache backend.
-    Result GetLocationsFromPersistent(RequestContext *request_context,
-                                      const KeyVector &keys,
-                                      CacheLocationMapVector &out_location_maps) noexcept;
+    Result GetLocationsFromPrimary(RequestContext *request_context,
+                                   const KeyVector &keys,
+                                   CacheLocationMapVector &out_location_maps) noexcept;
     LocationResult GetLocations(RequestContext *request_context,
                                 const KeyVector &keys,
                                 const LocationIdsPerKey &location_ids,
@@ -171,6 +171,7 @@ public:
                    const size_t limit,
                    std::string &out_next_cursor,
                    KeyVector &out_keys) noexcept;
+    ErrorCode TrimResidues(RequestContext *request_context, size_t scan_batch_size) noexcept;
     ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,
                                           const std::string &cursor,
                                           size_t limit,
@@ -199,6 +200,7 @@ public:
 
     // Synchronously flush pending writes for the given keys to persistent storage.
     bool Sync(const KeyVector &keys) noexcept;
+    bool SyncAll() noexcept;
 
     // Returns async write path stats from async backend.
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;

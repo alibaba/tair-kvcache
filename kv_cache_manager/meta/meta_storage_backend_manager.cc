@@ -71,6 +71,9 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
 
         const std::string &storage_uri = config->GetStorageUri();
         if (config->GetStorageType() != META_CACHED_BACKEND_TYPE_STR) {
+            if (config->GetMemoryPrimary()) {
+                return EC_BADARGS;
+            }
             // Single-backend mode: one backend serves every read/write directly.
             auto persistent_backend = MetaStorageBackendFactory::CreateAndInitStorageBackend(instance_id, config);
             if (!persistent_backend) {
@@ -100,9 +103,15 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
         // default to redis / local
         persistent_type = persistent_type.empty() ? META_REDIS_BACKEND_TYPE_STR : persistent_type;
         cache_type = cache_type.empty() ? META_LOCAL_BACKEND_TYPE_STR : cache_type;
+        if (config->GetMemoryPrimary() &&
+            (persistent_type != META_ASYNC_REDIS_BACKEND_TYPE_STR || cache_type != META_LOCAL_BACKEND_TYPE_STR)) {
+            KVCM_LOG_ERROR("memory_primary requires cached local + async_redis");
+            return EC_BADARGS;
+        }
 
         auto persistent_config = std::make_shared<MetaStorageBackendConfig>(persistent_type);
         persistent_config->SetStorageUri(storage_uri);
+        persistent_config->SetMemoryPrimary(config->GetMemoryPrimary());
         auto persistent_backend = MetaStorageBackendFactory::CreatePersistentBackend(instance_id, persistent_config);
         if (!persistent_backend) {
             KVCM_LOG_ERROR("fail to create persistent backend uri[%s]", storage_uri.c_str());
@@ -122,6 +131,8 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
         instance_id_ = instance_id;
         persistent_backend_ = std::move(persistent_backend);
         cache_backend_ = std::move(cache_backend);
+        memory_primary_ = config->GetMemoryPrimary();
+        force_deleting_async_enqueue_ = config->GetForceDeletingAsyncEnqueue();
         KVCM_LOG_INFO("meta storage backend manager init ok, instance[%s] cache[%s] persistent[%s]",
                       instance_id_.c_str(),
                       cache_type.c_str(),
@@ -436,7 +447,6 @@ bool MetaStorageBackendManager::EnsureKeyInCache(RequestContext *request_context
                        missing_keys.size());
         return false;
     }
-
     // PutIfAbsent prevents a stale persistent read from overwriting a newer
     // dual-write that populated the cache after the Exists probe.
     std::vector<ErrorCode> put_results =
@@ -541,26 +551,37 @@ std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_co
     batch.EnsureLocationsAndPropertiesResized();
     CacheLocationMapVector &locations = batch.batch_locations;
     PropertyMapVector &properties = batch.batch_properties;
-    std::vector<ErrorCode> persistent_results = persistent_backend_->Put(request_context, keys, locations, properties);
-    if (persistent_results.size() != keys.size()) {
-        KVCM_LOG_ERROR("persistent Put results[%lu] mismatch keys[%lu]", persistent_results.size(), keys.size());
-        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
-    }
-    if (!cache_backend_) {
-        return persistent_results;
-    }
-    const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
-    auto results = cache_backend_->Put(request_context, keys, locations, properties, persistent_results);
-    if (request_context) {
+    const WriteRoute route =
+        GetWriteRoute(memory_primary_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning);
+    const int64_t cache_begin = route.local_primary ? TimestampUtil::GetCurrentTimeUs() : 0;
+    std::vector<ErrorCode> primary_results = route.primary.Put(request_context, keys, locations, properties);
+    if (route.local_primary && request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
         KVCM_METRICS_COLLECTOR_SET_METRICS(
             mc, meta_indexer, cache_backend_put_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
-    if (results.size() != keys.size()) {
-        KVCM_LOG_ERROR("cache Put results[%lu] mismatch keys[%lu]", results.size(), keys.size());
+    if (primary_results.size() != keys.size()) {
+        KVCM_LOG_ERROR("primary Put results[%lu] mismatch keys[%lu]", primary_results.size(), keys.size());
         return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
-    return results;
+    if (!route.secondary) {
+        return primary_results;
+    }
+    const int64_t secondary_begin = route.local_primary ? 0 : TimestampUtil::GetCurrentTimeUs();
+    auto secondary_results = route.secondary->Put(request_context, keys, locations, properties, primary_results);
+    if (!route.local_primary && request_context) {
+        auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            mc, meta_indexer, cache_backend_put_time_us, TimestampUtil::GetCurrentTimeUs() - secondary_begin);
+    }
+    if (route.local_primary) {
+        return primary_results;
+    }
+    if (secondary_results.size() != keys.size()) {
+        KVCM_LOG_ERROR("secondary Put results[%lu] mismatch keys[%lu]", secondary_results.size(), keys.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    return secondary_results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request_context,
@@ -570,6 +591,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
     CacheLocationMapVector &locations = batch.batch_locations;
     PropertyMapVector &properties = batch.batch_properties;
 
+    const WriteRoute route =
+        GetWriteRoute(memory_primary_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning);
     // Upsert may touch only a subset of fields, so Recover-time hydration
     // is needed to avoid overwriting unmentioned fields with empty values.
     if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
@@ -577,27 +600,68 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
             return std::vector<ErrorCode>(keys.size(), EC_ERROR);
         }
     }
-    std::vector<ErrorCode> persistent_results =
-        persistent_backend_->Upsert(request_context, keys, locations, properties);
-    if (persistent_results.size() != keys.size()) {
-        KVCM_LOG_ERROR("persistent Upsert results[%lu] mismatch keys[%lu]", persistent_results.size(), keys.size());
-        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
-    }
-    if (!cache_backend_) {
-        return persistent_results;
-    }
-    const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
-    auto results = cache_backend_->Upsert(request_context, keys, locations, properties, persistent_results);
-    if (request_context) {
+    const int64_t cache_begin = route.local_primary ? TimestampUtil::GetCurrentTimeUs() : 0;
+    std::vector<ErrorCode> primary_results = route.primary.Upsert(request_context, keys, locations, properties);
+    if (route.local_primary && request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
         KVCM_METRICS_COLLECTOR_SET_METRICS(
             mc, meta_indexer, cache_backend_upsert_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
-    if (results.size() != keys.size()) {
-        KVCM_LOG_ERROR("cache Upsert results[%lu] mismatch keys[%lu]", results.size(), keys.size());
+    if (primary_results.size() != keys.size()) {
+        KVCM_LOG_ERROR("primary Upsert results[%lu] mismatch keys[%lu]", primary_results.size(), keys.size());
         return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
-    return results;
+    if (!route.secondary) {
+        return primary_results;
+    }
+    const int64_t secondary_begin = route.local_primary ? 0 : TimestampUtil::GetCurrentTimeUs();
+    auto secondary_results = route.secondary->Upsert(request_context, keys, locations, properties, primary_results);
+    if (!route.local_primary && request_context) {
+        auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            mc, meta_indexer, cache_backend_upsert_time_us, TimestampUtil::GetCurrentTimeUs() - secondary_begin);
+    }
+    if (route.local_primary) {
+        // A DELETING value authorizes a later physical delete after Sync. Its
+        // backup must have entered the secondary queue before this Upsert can
+        // report success; ordinary memory-primary writes remain best-effort.
+        assert(secondary_results.size() == keys.size());
+        if (force_deleting_async_enqueue_) {
+            KeyVector forced_keys;
+            CacheLocationMapVector forced_locations;
+            PropertyMapVector forced_properties;
+            std::vector<size_t> forced_indices;
+            for (const size_t i : batch.batch_secondary_admission_indices) {
+                assert(i < keys.size());
+                if (primary_results[i] == EC_OK && secondary_results[i] != EC_OK) {
+                    forced_keys.push_back(keys[i]);
+                    forced_locations.push_back(std::move(locations[i]));
+                    forced_properties.push_back(std::move(properties[i]));
+                    forced_indices.push_back(i);
+                }
+            }
+            if (!forced_keys.empty()) {
+                const auto forced_results =
+                    route.secondary->ForceUpsert(request_context, forced_keys, forced_locations, forced_properties);
+                assert(forced_results.size() == forced_indices.size());
+                for (size_t i = 0; i < forced_indices.size(); ++i) {
+                    secondary_results[forced_indices[i]] = forced_results[i];
+                }
+            }
+        }
+        for (const size_t i : batch.batch_secondary_admission_indices) {
+            assert(i < keys.size());
+            if (primary_results[i] == EC_OK && secondary_results[i] != EC_OK) {
+                primary_results[i] = secondary_results[i];
+            }
+        }
+        return primary_results;
+    }
+    if (secondary_results.size() != keys.size()) {
+        KVCM_LOG_ERROR("secondary Upsert results[%lu] mismatch keys[%lu]", secondary_results.size(), keys.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    return secondary_results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::UpsertSingleLocations(RequestContext *request_context,
@@ -655,35 +719,46 @@ void MetaStorageBackendManager::UpsertSingleLocationsUsingRetainedHandlesInto(
 
 std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request_context,
                                                          const KeyVector &keys) noexcept {
-    std::vector<ErrorCode> persistent_results = persistent_backend_->Delete(request_context, keys);
-    if (persistent_results.size() != keys.size()) {
-        KVCM_LOG_ERROR("persistent Delete results[%lu] mismatch keys[%lu]", persistent_results.size(), keys.size());
-        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
-    }
-    if (!cache_backend_) {
-        return persistent_results;
-    }
-    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
-        // Tombstone to prevent Recover backfill from resurrecting deleted keys.
-        std::lock_guard<std::mutex> lock(deleted_keys_mutex_);
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (persistent_results[i] == EC_OK || persistent_results[i] == EC_NOENT) {
-                deleted_keys_.insert(keys[i]);
-            }
-        }
-    }
-    const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
-    auto results = cache_backend_->Delete(request_context, keys, persistent_results);
-    if (request_context) {
+    const WriteRoute route =
+        GetWriteRoute(memory_primary_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning);
+    const int64_t cache_begin = route.local_primary ? TimestampUtil::GetCurrentTimeUs() : 0;
+    std::vector<ErrorCode> primary_results = route.primary.Delete(request_context, keys);
+    if (route.local_primary && request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
         KVCM_METRICS_COLLECTOR_SET_METRICS(
             mc, meta_indexer, cache_backend_delete_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
-    if (results.size() != keys.size()) {
-        KVCM_LOG_ERROR("cache Delete results[%lu] mismatch keys[%lu]", results.size(), keys.size());
+    if (primary_results.size() != keys.size()) {
+        KVCM_LOG_ERROR("primary Delete results[%lu] mismatch keys[%lu]", primary_results.size(), keys.size());
         return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
-    return results;
+    if (cache_backend_ && GetRecoverState() == RecoverState::kRecover) {
+        // Tombstone to prevent Recover backfill from resurrecting deleted keys.
+        std::lock_guard<std::mutex> lock(deleted_keys_mutex_);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (primary_results[i] == EC_OK || primary_results[i] == EC_NOENT) {
+                deleted_keys_.insert(keys[i]);
+            }
+        }
+    }
+    if (!route.secondary) {
+        return primary_results;
+    }
+    const int64_t secondary_begin = route.local_primary ? 0 : TimestampUtil::GetCurrentTimeUs();
+    auto secondary_results = route.secondary->Delete(request_context, keys, primary_results);
+    if (!route.local_primary && request_context) {
+        auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            mc, meta_indexer, cache_backend_delete_time_us, TimestampUtil::GetCurrentTimeUs() - secondary_begin);
+    }
+    if (route.local_primary) {
+        return primary_results;
+    }
+    if (secondary_results.size() != keys.size()) {
+        KVCM_LOG_ERROR("secondary Delete results[%lu] mismatch keys[%lu]", secondary_results.size(), keys.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    return secondary_results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request_context,
@@ -698,6 +773,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
         return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
     }
 
+    const WriteRoute route =
+        GetWriteRoute(memory_primary_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning);
     // Partial-delete during Recover: hydrate cache from persistent first so
     // the conditional mirror write below has the full pre-restart field set
     // to delete against (and async backfill cannot later overwrite us).
@@ -707,32 +784,85 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
         }
     }
 
-    std::vector<ErrorCode> persistent_results =
-        persistent_backend_->DeleteLocations(request_context, keys, location_ids);
-    if (persistent_results.size() != keys.size()) {
-        KVCM_LOG_ERROR(
-            "persistent DeleteLocations results[%lu] mismatch keys[%lu]", persistent_results.size(), keys.size());
+    const int64_t cache_begin = route.local_primary ? TimestampUtil::GetCurrentTimeUs() : 0;
+    std::vector<ErrorCode> primary_results = route.primary.DeleteLocations(request_context, keys, location_ids);
+    if (route.local_primary && request_context) {
+        auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            mc, meta_indexer, cache_backend_delete_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
+    }
+    if (primary_results.size() != keys.size()) {
+        KVCM_LOG_ERROR("primary DeleteLocations results[%lu] mismatch keys[%lu]", primary_results.size(), keys.size());
         return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
-    std::vector<ErrorCode> results;
-    if (!cache_backend_) {
-        results = std::move(persistent_results);
-    } else {
-        const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
-        results = cache_backend_->DeleteLocations(request_context, keys, location_ids, persistent_results);
-        if (request_context) {
+    std::vector<ErrorCode> secondary_results;
+    if (route.secondary) {
+        const int64_t secondary_begin = route.local_primary ? 0 : TimestampUtil::GetCurrentTimeUs();
+        secondary_results = route.secondary->DeleteLocations(request_context, keys, location_ids, primary_results);
+        if (!route.local_primary && request_context) {
             auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
             KVCM_METRICS_COLLECTOR_SET_METRICS(
-                mc, meta_indexer, cache_backend_delete_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
+                mc, meta_indexer, cache_backend_delete_time_us, TimestampUtil::GetCurrentTimeUs() - secondary_begin);
         }
     }
+    const std::vector<ErrorCode> &results =
+        route.local_primary || !route.secondary ? primary_results : secondary_results;
     if (results.size() != keys.size()) {
-        KVCM_LOG_ERROR("cache DeleteLocations results[%lu] mismatch keys[%lu]", results.size(), keys.size());
+        KVCM_LOG_ERROR("DeleteLocations results[%lu] mismatch keys[%lu]", results.size(), keys.size());
         return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
 
     out_reclaimed_count = MaybeReclaimEmptyKeys(request_context, keys, results);
-    return results;
+    return route.local_primary || !route.secondary ? std::move(primary_results) : std::move(secondary_results);
+}
+
+ErrorCode MetaStorageBackendManager::TrimPersistentOrphans(RequestContext *request_context,
+                                                           const KeyVector &keys,
+                                                           KeyVector &out_trimmed_keys) noexcept {
+    out_trimmed_keys.clear();
+    std::vector<bool> local_exists;
+    const auto exists_results = cache_backend_->Exists(request_context, keys, local_exists);
+    if (exists_results.size() != keys.size() || local_exists.size() != keys.size()) {
+        KVCM_LOG_ERROR("trim persistent orphan Exists results[%lu] values[%lu] mismatch keys[%lu]",
+                       exists_results.size(),
+                       local_exists.size(),
+                       keys.size());
+        return EC_MISMATCH;
+    }
+
+    out_trimmed_keys.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (exists_results[i] != EC_OK) {
+            out_trimmed_keys.clear();
+            return exists_results[i];
+        }
+        if (!local_exists[i]) {
+            out_trimmed_keys.push_back(keys[i]);
+        }
+    }
+    if (out_trimmed_keys.empty()) {
+        return EC_OK;
+    }
+
+    const auto delete_results = persistent_backend_->ForceDelete(request_context, out_trimmed_keys);
+    if (delete_results.size() != out_trimmed_keys.size()) {
+        KVCM_LOG_ERROR("trim persistent orphan Delete results[%lu] mismatch keys[%lu]",
+                       delete_results.size(),
+                       out_trimmed_keys.size());
+        return EC_MISMATCH;
+    }
+
+    ErrorCode ec = EC_OK;
+    size_t successful_count = 0;
+    for (size_t i = 0; i < delete_results.size(); ++i) {
+        if (delete_results[i] == EC_OK || delete_results[i] == EC_NOENT) {
+            out_trimmed_keys[successful_count++] = out_trimmed_keys[i];
+        } else if (ec == EC_OK) {
+            ec = delete_results[i];
+        }
+    }
+    out_trimmed_keys.resize(successful_count);
+    return ec;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(RequestContext *request_context,
@@ -757,12 +887,14 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
     // mutating either one. Looking only at the hot cache can erase a newer
     // persistent sibling; deleting targets first and reclaiming the key later
     // can also hide a failed whole-key delete from subsequent GC rounds.
-    LocationIdsPerKey persistent_location_ids;
-    const std::vector<ErrorCode> persistent_id_ecs =
-        persistent_backend_->GetLocationIdsForMaintenance(request_context, keys, persistent_location_ids);
+    const WriteRoute route = GetWriteRoute(memory_primary_);
+    const bool compare_cache = cache_backend_ && !route.local_primary;
+    LocationIdsPerKey primary_location_ids;
+    const std::vector<ErrorCode> primary_id_ecs =
+        route.primary.GetLocationIdsForMaintenance(request_context, keys, primary_location_ids);
     LocationIdsPerKey hot_location_ids;
     std::vector<ErrorCode> hot_id_ecs;
-    if (cache_backend_) {
+    if (compare_cache) {
         hot_id_ecs = cache_backend_->GetLocationIdsForMaintenance(request_context, keys, hot_location_ids);
     }
 
@@ -792,8 +924,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
                 }
             }
         };
-    validate_id_reads("persistent", persistent_id_ecs, persistent_location_ids);
-    if (cache_backend_) {
+    validate_id_reads("primary", primary_id_ecs, primary_location_ids);
+    if (compare_cache) {
         validate_id_reads("cache", hot_id_ecs, hot_location_ids);
     }
 
@@ -811,9 +943,9 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
                 return std::find(location_ids[i].begin(), location_ids[i].end(), existing_id) != location_ids[i].end();
             });
         };
-        const bool persistent_safe = layer_has_only_targets(persistent_id_ecs[i], persistent_location_ids[i]);
-        const bool hot_safe = !cache_backend_ || layer_has_only_targets(hot_id_ecs[i], hot_location_ids[i]);
-        (persistent_safe && hot_safe ? whole_key_indexes : target_only_indexes).push_back(i);
+        const bool primary_safe = layer_has_only_targets(primary_id_ecs[i], primary_location_ids[i]);
+        const bool hot_safe = !compare_cache || layer_has_only_targets(hot_id_ecs[i], hot_location_ids[i]);
+        (primary_safe && hot_safe ? whole_key_indexes : target_only_indexes).push_back(i);
     }
 
     if (!target_only_indexes.empty()) {
@@ -826,27 +958,30 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
             target_location_ids.push_back(location_ids[index]);
         }
 
-        std::vector<ErrorCode> persistent_results =
-            persistent_backend_->DeleteLocationsForMaintenance(request_context, target_keys, target_location_ids);
-        if (persistent_results.size() != target_only_indexes.size()) {
-            KVCM_LOG_ERROR("persistent maintenance target delete results[%lu] mismatch keys[%lu]",
-                           persistent_results.size(),
+        std::vector<ErrorCode> primary_results =
+            route.primary.DeleteLocationsForMaintenance(request_context, target_keys, target_location_ids);
+        if (primary_results.size() != target_only_indexes.size()) {
+            KVCM_LOG_ERROR("primary maintenance target delete results[%lu] mismatch keys[%lu]",
+                           primary_results.size(),
                            target_only_indexes.size());
-            persistent_results.assign(target_only_indexes.size(), EC_ERROR);
+            primary_results.assign(target_only_indexes.size(), EC_ERROR);
         }
-        std::vector<ErrorCode> target_results = persistent_results;
-        if (cache_backend_) {
-            target_results = cache_backend_->DeleteLocationsForMaintenance(
-                request_context, target_keys, target_location_ids, persistent_results);
-            if (target_results.size() != target_only_indexes.size()) {
-                KVCM_LOG_ERROR("cache maintenance target delete results[%lu] mismatch keys[%lu]",
+        std::vector<ErrorCode> target_results = primary_results;
+        if (route.secondary) {
+            auto secondary_results = route.secondary->DeleteLocationsForMaintenance(
+                request_context, target_keys, target_location_ids, primary_results);
+            if (!route.local_primary) {
+                target_results = std::move(secondary_results);
+            }
+            if (!route.local_primary && target_results.size() != target_only_indexes.size()) {
+                KVCM_LOG_ERROR("secondary maintenance target delete results[%lu] mismatch keys[%lu]",
                                target_results.size(),
                                target_only_indexes.size());
                 target_results.assign(target_only_indexes.size(), EC_ERROR);
             }
         }
         for (size_t i = 0; i < target_only_indexes.size(); ++i) {
-            const ErrorCode persistent_ec = persistent_results[i];
+            const ErrorCode persistent_ec = primary_results[i];
             const ErrorCode hot_ec = target_results[i];
             if (persistent_ec != EC_OK && persistent_ec != EC_NOENT) {
                 results[target_only_indexes[i]] = persistent_ec;
@@ -870,26 +1005,32 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
             whole_keys.push_back(keys[index]);
         }
 
-        std::vector<ErrorCode> persistent_results = persistent_backend_->Delete(request_context, whole_keys);
-        if (persistent_results.size() != whole_key_indexes.size()) {
-            KVCM_LOG_ERROR("persistent maintenance whole-key delete results[%lu] mismatch keys[%lu]",
-                           persistent_results.size(),
+        std::vector<ErrorCode> primary_results = route.primary.Delete(request_context, whole_keys);
+        if (primary_results.size() != whole_key_indexes.size()) {
+            KVCM_LOG_ERROR("primary maintenance whole-key delete results[%lu] mismatch keys[%lu]",
+                           primary_results.size(),
                            whole_key_indexes.size());
-            persistent_results.assign(whole_key_indexes.size(), EC_ERROR);
+            primary_results.assign(whole_key_indexes.size(), EC_ERROR);
         }
-        std::vector<ErrorCode> whole_results = persistent_results;
-        if (cache_backend_) {
+        std::vector<ErrorCode> whole_results = primary_results;
+        if (route.secondary) {
             // A key already absent from persistent still needs its hot copy
-            // removed. Normalize only this idempotent maintenance gate.
-            auto cache_gate = persistent_results;
-            for (auto &ec : cache_gate) {
-                if (ec == EC_NOENT) {
-                    ec = EC_OK;
+            // removed in the original mode. Normalize only that local gate;
+            // async Redis accepts NOENT as an idempotent backup delete.
+            auto secondary_gate = primary_results;
+            if (!route.local_primary) {
+                for (auto &ec : secondary_gate) {
+                    if (ec == EC_NOENT) {
+                        ec = EC_OK;
+                    }
                 }
             }
-            whole_results = cache_backend_->Delete(request_context, whole_keys, cache_gate);
-            if (whole_results.size() != whole_key_indexes.size()) {
-                KVCM_LOG_ERROR("cache maintenance whole-key delete results[%lu] mismatch keys[%lu]",
+            auto secondary_results = route.secondary->Delete(request_context, whole_keys, secondary_gate);
+            if (!route.local_primary) {
+                whole_results = std::move(secondary_results);
+            }
+            if (!route.local_primary && whole_results.size() != whole_key_indexes.size()) {
+                KVCM_LOG_ERROR("secondary maintenance whole-key delete results[%lu] mismatch keys[%lu]",
                                whole_results.size(),
                                whole_key_indexes.size());
                 whole_results.assign(whole_key_indexes.size(), EC_ERROR);
@@ -1140,7 +1281,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationValues(RequestConte
     return results;
 }
 
-std::vector<ErrorCode> MetaStorageBackendManager::GetLocationsFromPersistent(
+std::vector<ErrorCode> MetaStorageBackendManager::GetLocationsFromPrimary(
     RequestContext *request_context, const KeyVector &keys, CacheLocationMapVector &out_location_maps) noexcept {
     out_location_maps.clear();
     if (keys.empty()) {
@@ -1151,9 +1292,11 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationsFromPersistent(
         out_location_maps.resize(keys.size());
         return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
-    std::vector<ErrorCode> results = persistent_backend_->GetLocations(request_context, keys, out_location_maps);
+    std::vector<ErrorCode> results =
+        memory_primary_ ? cache_backend_->GetLocationsForMaintenance(request_context, keys, out_location_maps)
+                        : persistent_backend_->GetLocations(request_context, keys, out_location_maps);
     if (results.size() != keys.size() || out_location_maps.size() != keys.size()) {
-        KVCM_LOG_ERROR("persistent GetLocations shape mismatch, instance[%s] keys[%zu] results[%zu] locations[%zu]",
+        KVCM_LOG_ERROR("primary GetLocations shape mismatch, instance[%s] keys[%zu] results[%zu] locations[%zu]",
                        instance_id_.c_str(),
                        keys.size(),
                        results.size(),
@@ -1386,8 +1529,9 @@ MetaStorageBackendManager::GetLocationsForMaintenance(RequestContext *request_co
         out_locations.assign(keys.size(), CacheLocationVector{});
         return std::vector<std::vector<ErrorCode>>(keys.size(), std::vector<ErrorCode>{EC_BADARGS});
     }
-    if (!cache_backend_) {
-        return persistent_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, out_locations);
+    const WriteRoute route = GetWriteRoute(memory_primary_);
+    if (!cache_backend_ || route.local_primary) {
+        return route.primary.GetLocationsForMaintenance(request_context, keys, location_ids, out_locations);
     }
 
     // A unified GC round scans the hot cache, but a stale hot value must not
@@ -1888,6 +2032,14 @@ ErrorCode MetaStorageBackendManager::ListKeys(RequestContext *request_context,
     return persistent_backend_->ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
 }
 
+ErrorCode MetaStorageBackendManager::ListPersistentKeys(RequestContext *request_context,
+                                                        const std::string &cursor,
+                                                        const int64_t limit,
+                                                        std::string &out_next_cursor,
+                                                        KeyTypeVec &out_keys) noexcept {
+    return persistent_backend_->ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
+}
+
 ErrorCode MetaStorageBackendManager::ScanLocationsForMaintenance(RequestContext *request_context,
                                                                  const std::string &cursor,
                                                                  const int64_t limit,
@@ -2043,6 +2195,13 @@ bool MetaStorageBackendManager::Sync(const KeyVector &keys) noexcept {
         return true;
     }
     return persistent_backend_->Sync(keys);
+}
+
+bool MetaStorageBackendManager::SyncAll() noexcept {
+    if (!persistent_backend_) {
+        return true;
+    }
+    return persistent_backend_->SyncAll();
 }
 
 MetaStorageBackend::AsyncWriteStats MetaStorageBackendManager::GetAsyncWriteStats() noexcept {

@@ -230,6 +230,9 @@ public:
                                                  std::vector<ErrorCode> &out_key_error_codes,
                                                  std::vector<ErrorCode> &out_results,
                                                  SingleLocationRmwScratch &scratch) noexcept;
+    std::vector<ErrorCode> GetLocationsForMaintenance(RequestContext *request_context,
+                                                      const KeyTypeVec &keys,
+                                                      CacheLocationMapVector &out_locations) noexcept override;
     std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *request_context,
                                                                    const KeyTypeVec &keys,
                                                                    const LocationIdsPerKey &location_ids,

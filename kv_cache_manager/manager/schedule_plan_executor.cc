@@ -320,7 +320,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             if (iter->second->status() != CacheLocationStatus::CLS_DELETING) {
                 continue;
             }
-            if (!task.metadata_only) {
+            if (!task.metadata_only && !IsEventReportStorageType(iter->second->type())) {
                 for (const auto &loc_spec : iter->second->location_specs()) {
                     DataStorageUri uri(loc_spec.uri());
                     if (uri.Valid()) {
@@ -547,7 +547,14 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const Cach
         return future;
     }
     if (actual_task.block_keys.empty()) {
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        if (update_ec == ErrorCode::EC_OK) {
+            promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        } else {
+            HandleErrorPromise(promise,
+                               update_ec,
+                               "Failed to admit location delete metadata update, instance[%s]",
+                               task.instance_id.c_str());
+        }
         return future;
     }
 
@@ -695,7 +702,7 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
     auto request_context = std::make_shared<RequestContext>("schedule_plan_executor_call");
     ErrorCode get_locations_ec = ErrorCode::EC_OK;
     if (authoritative_read) {
-        const auto get_result = indexer->GetLocationsFromPersistent(request_context.get(), block_keys, location_maps);
+        const auto get_result = indexer->GetLocationsFromPrimary(request_context.get(), block_keys, location_maps);
         if (get_result.error_codes.size() != block_keys.size()) {
             get_locations_ec = ErrorCode::EC_ERROR;
         } else {
@@ -790,6 +797,12 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
         return admission_result;
     }
     if (admission_result.actual_task.block_keys.empty()) {
+        if (update_ec != ErrorCode::EC_OK) {
+            admission_result.result = MakeErrorResult(
+                update_ec,
+                StringUtil::FormatString("Failed to admit location delete metadata update, instance[%s]",
+                                         instance_id.c_str()));
+        }
         return admission_result;
     }
 
