@@ -555,6 +555,7 @@ void MetaServiceImpl::GetCacheLocationsByBackend(RequestContext *request_context
         backend_selectors.push_back({
             backend_type,
             static_cast<LocationSelectStrategy>(sel.strategy()),
+            sel.max_peer_count(),
         });
     }
 

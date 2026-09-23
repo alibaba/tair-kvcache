@@ -999,8 +999,12 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
         request_context->error_tracer()->AddErrorMsg("backend_selectors must not be empty");
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_BADARGS, BatchLocationsView, "backend_selectors must not be empty");
     }
+    auto normalized_backend_selectors = backend_selectors;
     std::unordered_set<DataStorageType> selected_backend_types;
-    for (const auto &selector : backend_selectors) {
+    for (auto &selector : normalized_backend_selectors) {
+        if (selector.max_peer_count <= 0) {
+            selector.max_peer_count = 1;
+        }
         const auto backend_index = ToIndex(selector.backend_type);
         if (selector.backend_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN ||
             backend_index >= ToIndex(DataStorageType::COUNT)) {
@@ -1012,6 +1016,19 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
             request_context->error_tracer()->AddErrorMsg("backend selector contains duplicate backend_type");
             RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
                 WARN, EC_BADARGS, BatchLocationsView, "backend selector contains duplicate backend_type");
+        }
+        const bool supports_multiple_peers =
+            selector.backend_type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 &&
+            (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX ||
+             selector.strategy == LocationSelectStrategy::LSS_V6D_COVERAGE);
+        if (supports_multiple_peers) {
+            selector.max_peer_count = EnvUtil::GetEnv("KVCM_V6D_MAX_PEER_COUNT", selector.max_peer_count);
+        }
+        if (selector.max_peer_count != 1 && !supports_multiple_peers) {
+            request_context->error_tracer()->AddErrorMsg(
+                "backend selector max_peer_count only applies to V6D selection strategies");
+            RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
+                WARN, EC_BADARGS, BatchLocationsView, "backend selector max_peer_count has invalid scope");
         }
         switch (selector.strategy) {
         case LocationSelectStrategy::LSS_WEIGHTED_RANDOM:
@@ -1034,7 +1051,7 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
                                                       query_keys,
                                                       locations_per_key,
                                                       policy.get(),
-                                                      backend_selectors,
+                                                      normalized_backend_selectors,
                                                       location_spec_names,
                                                       block_mask);
     query_scope = ChronoScopeGuard{};
