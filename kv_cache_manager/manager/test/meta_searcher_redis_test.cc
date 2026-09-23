@@ -65,7 +65,8 @@ public:
     std::shared_ptr<MetaStorageBackendConfig> ConstructMetaStorageBackendConfig() {
         auto meta_storage_backend_config = std::make_shared<MetaStorageBackendConfig>();
         meta_storage_backend_config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
-        meta_storage_backend_config->SetStorageUri(redis_test::Uri("", redis_test::kMetaSearcherDb));
+        meta_storage_backend_config->SetStorageUri(
+            redis_test::Uri("test_user:test_password", redis_test::kMetaSearcherDb));
         return meta_storage_backend_config;
     }
 
