@@ -78,6 +78,12 @@ public:
 
     // 执行FLUSHALL命令
     ErrorCode FlushAll();
+
+    // 执行FLUSHDB ASYNC命令
+    ErrorCode FlushDb();
+
+private:
+    ErrorCode Flush(const CmdArgs &command);
 };
 
 } // namespace kv_cache_manager

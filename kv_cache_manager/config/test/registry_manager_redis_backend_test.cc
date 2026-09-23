@@ -2,6 +2,7 @@
 #include <memory>
 
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/test/redis_test_environment.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/account.h"
 #include "kv_cache_manager/config/cache_config.h"
@@ -40,8 +41,9 @@ void RegistryManagerRedisBackendTest::SetUp() {
 }
 
 bool RegistryManagerRedisBackendTest::InitRegistryManager() {
-    std::string uri =
-        "redis://test_redis_user:test_redis_password@localhost:6379/?timeout_ms=1000&retry_count=3&cluster_name=test";
+    std::string uri = redis_test::Uri("test_redis_user:test_redis_password",
+                                      redis_test::kRegistryManagerDb,
+                                      "timeout_ms=1000&retry_count=3&cluster_name=test");
     registry_manager_ = std::make_shared<RegistryManager>(uri, metrics_registry_);
     return registry_manager_->Init();
 }
@@ -95,21 +97,24 @@ TEST_F(RegistryManagerRedisBackendTest, TestInit) {
     ASSERT_FALSE(registry_manager_->Init());
 
     // no cluster name
-    uri = "redis://test_redis_user:test_redis_password@localhost:6379/?timeout_ms=1000&retry_count=3";
+    uri = redis_test::Uri(
+        "test_redis_user:test_redis_password", redis_test::kRegistryManagerDb, "timeout_ms=1000&retry_count=3");
     registry_manager_ = std::make_shared<RegistryManager>(uri, metrics_registry_);
     ASSERT_FALSE(registry_manager_->Init());
 }
 
 TEST_F(RegistryManagerRedisBackendTest, TestRedisDbIsolation) {
-    const std::string uri_prefix =
-        "redis://test_redis_user:test_redis_password@localhost:6379/?timeout_ms=1000&retry_count=3";
     const std::string cluster_name = "registry_db_isolation_test";
     const std::string key = "same_key";
 
-    auto backend_db0 =
-        RegistryStorageBackendFactory::CreateAndInitStorageBackend(uri_prefix + "&db=0&cluster_name=" + cluster_name);
-    auto backend_db1 =
-        RegistryStorageBackendFactory::CreateAndInitStorageBackend(uri_prefix + "&db=1&cluster_name=" + cluster_name);
+    auto backend_db0 = RegistryStorageBackendFactory::CreateAndInitStorageBackend(
+        redis_test::Uri("test_redis_user:test_redis_password",
+                        redis_test::kRegistryManagerDb,
+                        "timeout_ms=1000&retry_count=3&cluster_name=" + cluster_name));
+    auto backend_db1 = RegistryStorageBackendFactory::CreateAndInitStorageBackend(
+        redis_test::Uri("test_redis_user:test_redis_password",
+                        redis_test::kRegistryManagerAlternateDb,
+                        "timeout_ms=1000&retry_count=3&cluster_name=" + cluster_name));
     ASSERT_NE(nullptr, backend_db0);
     ASSERT_NE(nullptr, backend_db1);
 
