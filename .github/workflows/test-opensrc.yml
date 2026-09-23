@@ -33,18 +33,9 @@ jobs:
         include:
           - name: normal_test
             test_target: "//kv_cache_manager/... //integration_test/... //package/kvcm_ops/..."
-            redis_test_targets: &redis_test_targets >-
-              //kv_cache_manager/common/test:redis_client_real_service_test
-              //kv_cache_manager/config/test:coordination_redis_backend_test
-              //kv_cache_manager/config/test:registry_manager_redis_backend_test
-              //kv_cache_manager/manager/test:MetaSearcherRedisTest
-              //kv_cache_manager/meta/test:meta_indexer_redis_test
-              //kv_cache_manager/meta/test:meta_redis_backend_real_service_test
-              //kv_cache_manager/meta/test:meta_storage_backend_manager_real_redis_test
             test_args: "--test_env=KVCM_TEST_REDIS_HOST=valkey"
           - name: asan_test
             test_target: "//kv_cache_manager/... //integration_test/..."
-            redis_test_targets: *redis_test_targets
             test_args: "--config=debug --config=asan --test_env=KVCM_TEST_REDIS_HOST=valkey"
     name: ${{ matrix.name }}
     runs-on: ${{ inputs.runs-on || vars.TEST_OPEN_SRC_RUNS_ON || 'ubuntu-latest' }}
@@ -116,7 +107,10 @@ jobs:
           set -x
           set -e
           ulimit -c unlimited
-          bazelisk test ${{ matrix.test_target }} ${{ matrix.redis_test_targets }} ${{ matrix.test_args }} --config=ci_fast --cache_test_results=no --test_output=errors
+          # Wildcard target patterns exclude manual tests, so pass matching labels explicitly.
+          redis_test_targets="$(bazelisk query 'attr(tags, "manual", attr(tags, "redis", tests(//kv_cache_manager/...)))' --output=label)"
+          test -n "${redis_test_targets}"
+          bazelisk test ${{ matrix.test_target }} ${redis_test_targets} ${{ matrix.test_args }} --config=ci_fast --cache_test_results=no --test_output=errors
       - &delete_old_disk_cache_step
         name: delete_old_disk_cache
         if: ${{ inputs.rebuildDiskCache || false }}
