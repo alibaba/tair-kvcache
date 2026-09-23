@@ -154,12 +154,19 @@ class TestLoadFailure(unittest.TestCase):
 
             # ...and every surviving head block's loaded KV is bit-exact,
             # while any mismatch belongs to a deleted (recomputed) block.
+            # Key sets cover every tp rank: the sabotage deletes one rank's
+            # files, but vLLM's invalid-block truncation is rank-global, so
+            # on the other ranks the tail blocks are loaded and then
+            # recomputed over -- their captures mismatch in low bits (a
+            # different attention kernel path), which is exactly the
+            # "recomputed" disposition, not a transfer failure.
             wait_for_captures(env.capture_dir, "loaded", expected=keep,
                               timeout=180)
-            report = compare_captures(env.capture_dir, tp_size=1)
+            report = compare_captures(env.capture_dir)
             hashes = full_block_hashes(toks, mbs)
-            kept_keys = {("tp0", h) for h in hashes[:keep]}
-            deleted_keys = {("tp0", h) for h in hashes[keep:]}
+            ranks = [f"tp{r}" for r in range(env.tp_size)]
+            kept_keys = {(r, h) for r in ranks for h in hashes[:keep]}
+            deleted_keys = {(r, h) for r in ranks for h in hashes[keep:]}
             failed_keys = {f["key"] for f in report["failures"]}
             self.assertFalse(
                 failed_keys & kept_keys,
@@ -170,8 +177,9 @@ class TestLoadFailure(unittest.TestCase):
                 f"{failed_keys - deleted_keys}")
             matched_kept = kept_keys & set(report["matched_keys"])
             self.assertEqual(
-                len(matched_kept), keep,
-                f"only {len(matched_kept)}/{keep} surviving blocks verified")
+                len(matched_kept), keep * env.tp_size,
+                f"only {len(matched_kept)}/{keep * env.tp_size} surviving "
+                f"blocks verified")
         finally:
             env.stop()
 

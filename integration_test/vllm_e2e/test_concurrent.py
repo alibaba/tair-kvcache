@@ -11,14 +11,14 @@ Works for both full-attention and hybrid models (selected via KVCM_E2E_MODEL).
 
 import unittest
 
-from e2e_lib import run_e2e
+from e2e_lib import run_e2e, scenario_tp_size
 
 
 class TestConcurrent(unittest.TestCase):
     def test_concurrent(self):
         run_e2e(
             scenario="concurrent",
-            tp_size=1,
+            tp_size=scenario_tp_size(),
             num_prompts=4,
             preferred_block_size=0,
         )

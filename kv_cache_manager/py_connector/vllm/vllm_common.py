@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MLAAttentionSpec,
+    MambaSpec,
+)
 
 from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.vllm.transfer_types import (
@@ -110,6 +114,46 @@ class StateGroupMeta(GroupMeta):
     page_size_bytes: int = 0
 
 
+def _check_mla_supported(idx: int, spec: "MLAAttentionSpec") -> None:
+    """Gate the MLA latent-cache variants to the token-granular ones.
+
+    A plain MLAAttentionSpec stores one latent vector per token
+    (kv_lora_rank + qk_rope_head_dim, num_kv_heads == 1), so the
+    token-granular transfer path (per-token sizing, slot-mapped gather /
+    scatter) works unchanged. The variants below look superficially
+    transferable but are not, and each breaks a different assumption:
+
+    * compress_ratio > 1 (DeepSeek V4): one stored row covers multiple
+      tokens -- there is no per-token slot to gather;
+    * cache_dtype_str "fp8_ds_mla" (DeepSeek V3.2/V4): a custom packed
+      byte layout (e.g. 656 B/token) whose per-token byte size is not
+      head_size * dtype_size;
+    * any kv quantization: per-token-head scales live outside the paged
+      tensor (or are packed into it), so a verbatim byte round trip loses
+      them and a load would decode garbage.
+    """
+    if getattr(spec, "compress_ratio", 1) != 1:
+        raise NotImplementedError(
+            f"group {idx}: MLAAttentionSpec compress_ratio="
+            f"{spec.compress_ratio} stores one latent row per "
+            f"{spec.compress_ratio} tokens; compressed MLA KV is not "
+            f"supported by TairKvCacheConnector"
+        )
+    if getattr(spec, "cache_dtype_str", None) == "fp8_ds_mla":
+        raise NotImplementedError(
+            f"group {idx}: MLAAttentionSpec cache_dtype_str=fp8_ds_mla is a "
+            f"custom packed fp8 layout; it is not yet supported by "
+            f"TairKvCacheConnector"
+        )
+    if getattr(spec, "kv_quant_mode", None):
+        raise NotImplementedError(
+            f"group {idx}: MLAAttentionSpec kv_quant_mode={spec.kv_quant_mode} "
+            f"carries scales outside the paged tensor (or packed into it); "
+            f"quantized MLA KV caches are not supported by "
+            f"TairKvCacheConnector"
+        )
+
+
 def parse_groups(
     kv_cache_config: "KVCacheConfig", manager_block_size: int
 ) -> List[GroupMeta]:
@@ -136,6 +180,8 @@ def parse_groups(
                 )
             )
         elif isinstance(spec, FullAttentionSpec):
+            if isinstance(spec, MLAAttentionSpec):
+                _check_mla_supported(idx, spec)
             # FullAttentionSpec doubles as the merged spec of hybrid
             # SWA/chunked-attention models (vLLM merges window layers into
             # it, keeping sliding_window/attention_chunk_size set). Those
@@ -204,6 +250,9 @@ def attn_kv_views(ref: torch.Tensor) -> tuple:
     layouts (see KVLayout for the per-version source links) are detected from
     the tensor shape itself (never from version strings):
 
+    * 3-D ``(num_blocks, block, head_size)`` -- MLA latent cache
+      (``num_kv_heads == 1``: one latent vector per token, no K/V split).
+      One transfer pointer per layer.
     * 4-D ``(num_blocks, H, block, 2*D)``  -- K/V packed into the content dim
       (vLLM >= 0.26.0). One transfer pointer per layer.
     * 5-D ``(num_blocks, 2, block, H, D)`` -- N-first split K/V
@@ -217,6 +266,12 @@ def attn_kv_views(ref: torch.Tensor) -> tuple:
     block stride, data_ptr) is layout-independent -- the layout travels along
     only for traceability. Unrecognized layouts raise.
     """
+    if ref.dim() == 3:
+        # MLA: (num_blocks, block, head_size) is already token-major with a
+        # single implicit head; unsqueeze gives the shared (n, b, 1, d) shape
+        # without copying. Padded MLA pages (block stride != b*d) flow through
+        # the same strided path as the split layouts.
+        return [ref.unsqueeze(2)], KVLayout.MLA_3D
     if ref.dim() == 4:
         # Packed content dim; permute to token-major logical order. The permuted
         # view shares storage, data_ptr() is the storage base.
