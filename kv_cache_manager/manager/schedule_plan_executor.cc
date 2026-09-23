@@ -15,7 +15,6 @@
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
-#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
@@ -348,15 +347,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
         auto &storage_uris = storage_uris_pair.second;
         if (!task.confirmed_missing_uris.empty()) {
             const auto backend = data_storage_manager_->GetDataStorageBackend(storage_unique_name);
-            bool skip_missing = true;
-            if (backend && IsTairMempoolStorageType(backend->GetType())) {
-                const auto spec =
-                    std::dynamic_pointer_cast<TairMemPoolStorageSpec>(backend->GetStorageConfig().storage_spec());
-                // Shared KVCS data can outlive its owner. Keep sending Free by
-                // default even when MightExist has rejected the owner's URI.
-                skip_missing = spec && spec->skip_confirmed_missing_backend_delete();
-            }
-            if (skip_missing) {
+            if (!backend || backend->ShouldSkipConfirmedMissingBackendDelete()) {
                 storage_uris.erase(std::remove_if(storage_uris.begin(),
                                                   storage_uris.end(),
                                                   [&](const DataStorageUri &uri) {

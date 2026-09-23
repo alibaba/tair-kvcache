@@ -14,6 +14,7 @@ public:
     explicit NfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry);
     ~NfsBackend() override = default;
     DataStorageType GetType() override;
+    bool ShouldSkipConfirmedMissingBackendDelete() const override { return true; }
     bool Available() override;
     double GetStorageUsageRatio(const std::string &trace_id) const override;
 

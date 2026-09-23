@@ -25,6 +25,11 @@ TairMempoolBackend::~TairMempoolBackend() { KVCM_LOG_ERROR("no implementation fo
 
 DataStorageType TairMempoolBackend::GetType() { return config_.type(); }
 
+bool TairMempoolBackend::ShouldSkipConfirmedMissingBackendDelete() const {
+    const auto spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(config_.storage_spec());
+    return spec && spec->skip_confirmed_missing_backend_delete();
+}
+
 bool TairMempoolBackend::Available() {
     KVCM_LOG_ERROR("no implementation for TairMempoolBackend");
     return false;
