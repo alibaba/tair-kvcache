@@ -25,11 +25,21 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MambaPool
 
-# MHATokenToKVPoolHost / MambaPoolHost moved in newer sglang versions.
-from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
-    MambaPoolHost,  # ty: ignore[unresolved-import]
-)
+# Host pool implementations moved from memory_pool_host to pool_host.* in
+# sglang v0.5.16+ (mamba only followed in v0.5.18), so fall back per class.
+try:  # sglang >= 0.5.16
+    from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+except ImportError:  # sglang <= 0.5.15
+    from sglang.srt.mem_cache.memory_pool_host import (
+        MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
+    )
+
+try:  # sglang >= 0.5.18
+    from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+except ImportError:  # sglang <= 0.5.17
+    from sglang.srt.mem_cache.memory_pool_host import (
+        MambaPoolHost,  # ty: ignore[unresolved-import]
+    )
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.distributed import (
     init_distributed_environment,
@@ -74,7 +84,10 @@ mamba_head_dim = 16
 mamba_state_size = 16
 mamba_conv_kernel = 4
 
-manager_uri = os.environ.get("KVCM_URI", "http://127.0.0.1:6382")
+# KVCM_URI is the legacy name, still honoured when the new one is unset.
+manager_uri = os.environ.get("KVCM_MANAGER_URI") or os.environ.get(
+    "KVCM_URI", "http://127.0.0.1:6382"
+)
 kvcm_home = os.environ.get("KVCM_HOME", "/home/admin/kv_cache_manager")
 
 # Global process reference

@@ -40,8 +40,9 @@ uv pip install --python .venv/bin/python 'vllm==0.26.0' requests orjson pydantic
 Extra packages per subpackage (install `--no-deps` to keep the pinned
 vLLM intact):
 
-- `sglang/` needs `sglang` (tested with 0.5.19; `--no-deps` avoids it
-  resolving its own vLLM pin).
+- `sglang/` needs `sglang`. The connector targets sglang v0.5.10 ~ v0.5.18;
+  the type environment for `ty check` is built with 0.5.19 (`--no-deps`
+  avoids it resolving its own vLLM pin).
 - `trtllm/` has no pip-installable source distribution: copy the
   `tensorrt_llm` package of a TensorRT-LLM checkout (v1.2.x) into the
   same site-packages
@@ -55,7 +56,7 @@ A few imports cannot be resolved statically and carry inline
 - `_version_info`, generated into the wheel at build time (bazel
   `version_info_py`), absent from a source checkout;
 - version-compatibility branches for older vLLM (0.22 / 0.23 era) and
-  older SGLang import paths.
+  older SGLang releases (metrics module, host pool module layout).
 
 ### pre-commit (optional)
 

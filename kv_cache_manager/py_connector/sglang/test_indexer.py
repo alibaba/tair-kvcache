@@ -26,10 +26,14 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
-# MHATokenToKVPoolHost moved in newer sglang versions.
-from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
-)
+# Host pool implementations moved from memory_pool_host to pool_host.* in
+# sglang v0.5.16.
+try:  # sglang >= 0.5.16
+    from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+except ImportError:  # sglang <= 0.5.15
+    from sglang.srt.mem_cache.memory_pool_host import (
+        MHATokenToKVPoolHost,  # ty: ignore[unresolved-import]
+    )
 from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
@@ -72,7 +76,10 @@ indexer_quant_block_size = 128
 indexer_dtype = torch.uint8
 indexer_page_num = 256
 
-manager_uri = os.environ.get("KVCM_URI", "http://127.0.0.1:6382")
+# KVCM_URI is the legacy name, still honoured when the new one is unset.
+manager_uri = os.environ.get("KVCM_MANAGER_URI") or os.environ.get(
+    "KVCM_URI", "http://127.0.0.1:6382"
+)
 kvcm_home = os.environ.get("KVCM_HOME", "/home/admin/kv_cache_manager")
 
 proc = None
