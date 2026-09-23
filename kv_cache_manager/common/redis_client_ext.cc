@@ -2,6 +2,7 @@
 
 #include <hiredis.h>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "kv_cache_manager/common/logger.h"
@@ -13,11 +14,6 @@ ErrorCode RedisClientExt::Eval(const std::string &script,
                                const std::vector<std::string> &args,
                                std::string &out_result) {
     out_result.clear();
-
-    if (!IsContextOk()) {
-        KVCM_LOG_ERROR("Redis context not ok for EVAL");
-        return EC_IO_ERROR;
-    }
 
     // 构建EVAL命令
     std::vector<std::string> cmd_args;
@@ -38,11 +34,11 @@ ErrorCode RedisClientExt::Eval(const std::string &script,
 
     // 执行命令
     std::vector<CmdArgs> cmds = {cmd_args};
-    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
-
-    if (replies.empty()) {
+    std::vector<ReplyUPtr> replies;
+    ErrorCode ec = CommandPipeline(cmds, replies);
+    if (ec != EC_OK) {
         KVCM_LOG_ERROR("EVAL command failed, no reply");
-        return EC_ERROR;
+        return ec;
     }
 
     const redisReply *reply = replies[0].get();
@@ -80,11 +76,6 @@ ErrorCode RedisClientExt::EvalSha(const std::string &sha1,
                                   std::string &out_result) {
     out_result.clear();
 
-    if (!IsContextOk()) {
-        KVCM_LOG_ERROR("Redis context not ok for EVALSHA");
-        return EC_IO_ERROR;
-    }
-
     // 构建EVALSHA命令
     std::vector<std::string> cmd_args;
     cmd_args.reserve(3 + keys.size() + args.size());
@@ -104,16 +95,27 @@ ErrorCode RedisClientExt::EvalSha(const std::string &sha1,
 
     // 执行命令
     std::vector<CmdArgs> cmds = {cmd_args};
-    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
-
-    if (replies.empty()) {
+    std::vector<ReplyUPtr> replies;
+    ErrorCode ec = CommandPipeline(cmds, replies);
+    if (ec != EC_OK) {
         KVCM_LOG_ERROR("EVALSHA command failed, no reply");
-        return EC_ERROR;
+        return ec;
     }
 
     const redisReply *reply = replies[0].get();
-    if (!IsReplyOk(reply)) {
-        KVCM_LOG_ERROR("EVALSHA command failed: %s", reply ? reply->str : "null reply");
+    if (!reply) {
+        KVCM_LOG_ERROR("EVALSHA command failed: null reply");
+        return EC_ERROR;
+    }
+
+    if (reply->type == REDIS_REPLY_ERROR) {
+        static constexpr std::string_view no_script_error = "NOSCRIPT";
+        if (reply->str &&
+            std::string_view(reply->str, reply->len).compare(0, no_script_error.size(), no_script_error) == 0) {
+            KVCM_LOG_WARN("EVALSHA NOSCRIPT error for sha1: %s", sha1.c_str());
+            return EC_NOSCRIPT;
+        }
+        KVCM_LOG_ERROR("EVALSHA command error: %s", reply->str ? reply->str : "unknown error");
         return EC_ERROR;
     }
 
@@ -131,14 +133,6 @@ ErrorCode RedisClientExt::EvalSha(const std::string &sha1,
     case REDIS_REPLY_STATUS:
         out_result = std::string(reply->str, reply->len);
         return EC_OK;
-    case REDIS_REPLY_ERROR:
-        // 检查是否是NOSCRIPT错误
-        if (reply->str && std::string(reply->str).find("NOSCRIPT") != std::string::npos) {
-            KVCM_LOG_WARN("EVALSHA NOSCRIPT error for sha1: %s", sha1.c_str());
-            return EC_NOSCRIPT;
-        }
-        KVCM_LOG_ERROR("EVALSHA command error: %s", reply->str);
-        return EC_ERROR;
     default:
         KVCM_LOG_ERROR("EVALSHA command unexpected reply type: %d", reply->type);
         return EC_ERROR;
@@ -148,17 +142,12 @@ ErrorCode RedisClientExt::EvalSha(const std::string &sha1,
 ErrorCode RedisClientExt::ScriptLoad(const std::string &script, std::string &out_sha1) {
     out_sha1.clear();
 
-    if (!IsContextOk()) {
-        KVCM_LOG_ERROR("Redis context not ok for SCRIPT LOAD");
-        return EC_IO_ERROR;
-    }
-
     std::vector<CmdArgs> cmds = {{"SCRIPT", "LOAD", script}};
-    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
-
-    if (replies.empty()) {
+    std::vector<ReplyUPtr> replies;
+    ErrorCode ec = CommandPipeline(cmds, replies);
+    if (ec != EC_OK) {
         KVCM_LOG_ERROR("SCRIPT LOAD command failed, no reply");
-        return EC_ERROR;
+        return ec;
     }
 
     const redisReply *reply = replies[0].get();
@@ -179,17 +168,12 @@ ErrorCode RedisClientExt::ScriptLoad(const std::string &script, std::string &out
 ErrorCode RedisClientExt::ScriptExists(const std::string &sha1, bool &out_exists) {
     out_exists = false;
 
-    if (!IsContextOk()) {
-        KVCM_LOG_ERROR("Redis context not ok for SCRIPT EXISTS");
-        return EC_IO_ERROR;
-    }
-
     std::vector<CmdArgs> cmds = {{"SCRIPT", "EXISTS", sha1}};
-    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
-
-    if (replies.empty()) {
+    std::vector<ReplyUPtr> replies;
+    ErrorCode ec = CommandPipeline(cmds, replies);
+    if (ec != EC_OK) {
         KVCM_LOG_ERROR("SCRIPT EXISTS command failed, no reply");
-        return EC_ERROR;
+        return ec;
     }
 
     const redisReply *reply = replies[0].get();
@@ -213,17 +197,12 @@ ErrorCode RedisClientExt::ScriptExists(const std::string &sha1, bool &out_exists
 ErrorCode RedisClientExt::Get(const std::string &key, std::string &out_value) {
     out_value.clear();
 
-    if (!IsContextOk()) {
-        KVCM_LOG_ERROR("Redis context not ok for GET");
-        return EC_IO_ERROR;
-    }
-
     std::vector<CmdArgs> cmds = {{"GET", key}};
-    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
-
-    if (replies.empty()) {
+    std::vector<ReplyUPtr> replies;
+    ErrorCode ec = CommandPipeline(cmds, replies);
+    if (ec != EC_OK) {
         KVCM_LOG_ERROR("GET command failed, no reply");
-        return EC_ERROR;
+        return ec;
     }
 
     const redisReply *reply = replies[0].get();
@@ -247,11 +226,6 @@ ErrorCode RedisClientExt::Get(const std::string &key, std::string &out_value) {
 }
 
 ErrorCode RedisClientExt::Set(const std::string &key, const std::string &value, int64_t ttl_ms) {
-    if (!IsContextOk()) {
-        KVCM_LOG_ERROR("Redis context not ok for SET");
-        return EC_IO_ERROR;
-    }
-
     std::vector<CmdArgs> cmds;
     if (ttl_ms > 0) {
         cmds = {{"SET", key, value, "PX", std::to_string(ttl_ms)}};
@@ -259,11 +233,11 @@ ErrorCode RedisClientExt::Set(const std::string &key, const std::string &value, 
         cmds = {{"SET", key, value}};
     }
 
-    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
-
-    if (replies.empty()) {
+    std::vector<ReplyUPtr> replies;
+    ErrorCode ec = CommandPipeline(cmds, replies);
+    if (ec != EC_OK) {
         KVCM_LOG_ERROR("SET command failed, no reply");
-        return EC_ERROR;
+        return ec;
     }
 
     const redisReply *reply = replies[0].get();
@@ -284,17 +258,12 @@ ErrorCode RedisClientExt::Set(const std::string &key, const std::string &value, 
 ErrorCode RedisClientExt::Pttl(const std::string &key, int64_t &out_ttl_ms) {
     out_ttl_ms = -2; // Redis中-2表示键不存在
 
-    if (!IsContextOk()) {
-        KVCM_LOG_ERROR("Redis context not ok for PTTL");
-        return EC_IO_ERROR;
-    }
-
     std::vector<CmdArgs> cmds = {{"PTTL", key}};
-    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
-
-    if (replies.empty()) {
+    std::vector<ReplyUPtr> replies;
+    ErrorCode ec = CommandPipeline(cmds, replies);
+    if (ec != EC_OK) {
         KVCM_LOG_ERROR("PTTL command failed, no reply");
-        return EC_ERROR;
+        return ec;
     }
 
     const redisReply *reply = replies[0].get();
@@ -313,17 +282,12 @@ ErrorCode RedisClientExt::Pttl(const std::string &key, int64_t &out_ttl_ms) {
 }
 
 ErrorCode RedisClientExt::Del(const std::string &key) {
-    if (!IsContextOk()) {
-        KVCM_LOG_ERROR("Redis context not ok for DEL");
-        return EC_IO_ERROR;
-    }
-
     std::vector<CmdArgs> cmds = {{"DEL", key}};
-    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
-
-    if (replies.empty()) {
+    std::vector<ReplyUPtr> replies;
+    ErrorCode ec = CommandPipeline(cmds, replies);
+    if (ec != EC_OK) {
         KVCM_LOG_ERROR("DEL command failed, no reply");
-        return EC_ERROR;
+        return ec;
     }
 
     const redisReply *reply = replies[0].get();
@@ -342,22 +306,17 @@ ErrorCode RedisClientExt::Del(const std::string &key) {
 }
 
 ErrorCode RedisClientExt::Pexpire(const std::string &key, int64_t ttl_ms) {
-    if (!IsContextOk()) {
-        KVCM_LOG_ERROR("Redis context not ok for PEXPIRE");
-        return EC_IO_ERROR;
-    }
-
     if (ttl_ms <= 0) {
         KVCM_LOG_ERROR("Invalid TTL for PEXPIRE: %ld", ttl_ms);
         return EC_BADARGS;
     }
 
     std::vector<CmdArgs> cmds = {{"PEXPIRE", key, std::to_string(ttl_ms)}};
-    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
-
-    if (replies.empty()) {
+    std::vector<ReplyUPtr> replies;
+    ErrorCode ec = CommandPipeline(cmds, replies);
+    if (ec != EC_OK) {
         KVCM_LOG_ERROR("PEXPIRE command failed, no reply");
-        return EC_ERROR;
+        return ec;
     }
 
     const redisReply *reply = replies[0].get();
@@ -384,8 +343,13 @@ ErrorCode RedisClientExt::FlushDb() { return Flush({"FLUSHDB", "ASYNC"}); }
 
 ErrorCode RedisClientExt::Flush(const CmdArgs &command) {
     const std::string &command_name = command.front();
-    std::vector<ReplyUPtr> replies = CommandPipeline({command});
-    if (1 != replies.size()) {
+    std::vector<ReplyUPtr> replies;
+    ErrorCode ec = CommandPipeline({command}, replies);
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("redis %s fail, no reply", command_name.c_str());
+        return ec;
+    }
+    if (replies.size() != 1) {
         KVCM_LOG_ERROR("redis %s fail, pipeline [1] != replies.size[%zu]", command_name.c_str(), replies.size());
         return EC_ERROR;
     }
@@ -432,27 +396,33 @@ ErrorCode RedisClientExt::ExecuteScriptWithFallback(const std::string &script,
     if (ec == EC_OK) {
         // evalsha成功
         return EC_OK;
-    } else if (ec == EC_NOSCRIPT) {
-        // 脚本未加载，重新加载脚本
-        KVCM_LOG_WARN("Script not loaded in Redis, reloading: %s", in_out_cached_sha1.c_str());
-
-        std::string new_sha1;
-        ec = ScriptLoad(script, new_sha1);
-        if (ec != EC_OK) {
-            KVCM_LOG_ERROR("Failed to reload Lua script: ec=%d", ec);
-            return ec;
-        }
-
-        // 重新尝试evalsha
-        ec = EvalSha(new_sha1, keys, args, out_result);
-        if (ec == EC_OK) {
-            // 更新缓存
-            in_out_cached_sha1 = new_sha1;
-            return EC_OK;
-        }
+    }
+    if (ec != EC_NOSCRIPT) {
+        return ec;
     }
 
-    // 如果evalsha失败且不是NOSCRIPT错误，或者重新加载后仍然失败，回退到eval
+    // 脚本未加载，重新加载脚本
+    KVCM_LOG_WARN("Script not loaded in Redis, reloading: %s", in_out_cached_sha1.c_str());
+
+    std::string new_sha1;
+    ec = ScriptLoad(script, new_sha1);
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("Failed to reload Lua script: ec=%d", ec);
+        return ec;
+    }
+
+    // 重新尝试evalsha
+    ec = EvalSha(new_sha1, keys, args, out_result);
+    if (ec == EC_OK) {
+        // 更新缓存
+        in_out_cached_sha1 = new_sha1;
+        return EC_OK;
+    }
+    if (ec != EC_NOSCRIPT) {
+        return ec;
+    }
+
+    // 脚本在加载后再次丢失，回退到EVAL直接执行脚本
     KVCM_LOG_WARN("Fallback to EVAL for script: %s", in_out_cached_sha1.c_str());
     return Eval(script, keys, args, out_result);
 }
