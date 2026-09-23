@@ -68,9 +68,9 @@ struct CacheLocationDelRequest {
     // GC physical deletion revalidates against the persistent source of truth
     // and refreshes candidate keys into the hot cache before CAS.
     bool authoritative_read{false};
-    // URIs that the submitter has already confirmed absent. TairMempool still
-    // receives Delete unless its storage explicitly enables skipping these
-    // URIs; other backends retain the idempotent skip optimization.
+    // URIs that the submitter has already confirmed absent. Each Backend's
+    // ShouldSkipConfirmedMissingBackendDelete policy determines whether to
+    // omit Delete for these URIs; remaining specs are deleted normally.
     std::set<std::string> confirmed_missing_uris;
 };
 

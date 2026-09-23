@@ -86,21 +86,18 @@ class RecordingDeleteBackend : public DataStorageBackend {
 public:
     explicit RecordingDeleteBackend(const std::string &name = "gc_delete_backend",
                                     DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-                                    bool skip_missing = false)
-        : DataStorageBackend(nullptr) {
+                                    bool skip_missing = true)
+        : DataStorageBackend(nullptr), skip_missing_(skip_missing) {
         config_.set_type(type);
-        if (IsTairMempoolStorageType(type)) {
-            auto spec = std::make_shared<TairMemPoolStorageSpec>();
-            if (skip_missing) {
-                spec->set_skip_confirmed_missing_backend_delete(true);
-            }
-            config_.set_storage_spec(spec);
-        }
         config_.set_global_unique_name(name);
         SetOpen(true);
         SetAvailable(true);
     }
     DataStorageType GetType() override { return config_.type(); }
+    bool ShouldSkipConfirmedMissingBackendDelete() const override {
+        ++policy_queries;
+        return skip_missing_;
+    }
     bool Available() override { return true; }
     double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
     const StorageConfig &GetStorageConfig() override { return config_; }
@@ -139,6 +136,8 @@ public:
         return std::vector<ErrorCode>(uris.size(), EC_OK);
     }
 
+    const bool skip_missing_;
+    mutable size_t policy_queries{0};
     ErrorCode delete_result{EC_OK};
     bool throw_on_delete{false};
     bool short_result{false};
@@ -283,7 +282,7 @@ public:
     const std::string kTestInstanceName = "test_instance";
 };
 
-class TairMempoolGcDeleteTest : public SchedulePlanExecutorTest {
+class BackendGcDeleteTest : public SchedulePlanExecutorTest {
 public:
     void SetUp() override {
         SchedulePlanExecutorTest::SetUp();
@@ -356,10 +355,11 @@ public:
     std::unique_ptr<SchedulePlanExecutor> executor;
 };
 
-TEST_F(TairMempoolGcDeleteTest, DefaultAndOptInHandleAllAndPartiallyMissingLocations) {
+TEST_F(BackendGcDeleteTest, BackendPolicyHandlesAllAndPartiallyMissingLocations) {
     int64_t key = 100;
-    for (const auto type :
-         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+    for (const auto type : {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD,
+                            DataStorageType::DATA_STORAGE_TYPE_DUMMY}) {
         for (const bool skip : {false, true}) {
             for (const bool all_missing : {false, true}) {
                 SCOPED_TRACE(::testing::Message() << "type=" << static_cast<int>(type) << " skip=" << skip
@@ -381,6 +381,7 @@ TEST_F(TairMempoolGcDeleteTest, DefaultAndOptInHandleAllAndPartiallyMissingLocat
                     !skip ? std::vector<std::string>{first, second}
                           : (all_missing ? std::vector<std::string>{} : std::vector<std::string>{second});
                 EXPECT_EQ(expected, DeletedUris(*backend));
+                EXPECT_EQ(1u, backend->policy_queries);
                 const auto remaining = Locations(key);
                 ASSERT_EQ(1u, remaining.size());
                 EXPECT_EQ(replica, remaining.at("replica")->ToJsonString());
@@ -391,11 +392,11 @@ TEST_F(TairMempoolGcDeleteTest, DefaultAndOptInHandleAllAndPartiallyMissingLocat
     }
 }
 
-TEST_F(TairMempoolGcDeleteTest, MixedStoragesUseTheirOwnPolicyAndOtherBackendsKeepSkipping) {
+TEST_F(BackendGcDeleteTest, MixedStoragesUseTheirOwnPolicyAndOtherBackendsKeepSkipping) {
     const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
     auto default_backend = AddBackend("pace_default", type);
     auto skip_backend = AddBackend("pace_skip", type, true);
-    auto dummy_backend = AddBackend("dummy_gc", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+    auto dummy_backend = AddBackend("dummy_gc", DataStorageType::DATA_STORAGE_TYPE_DUMMY, true);
     const std::string missing_default = "pace://pace_default/1?size=2";
     const std::string missing_skip = "pace://pace_skip/2?size=3";
     const std::string existing_skip = "pace://pace_skip/3?size=5";
@@ -415,7 +416,7 @@ TEST_F(TairMempoolGcDeleteTest, MixedStoragesUseTheirOwnPolicyAndOtherBackendsKe
     EXPECT_EQ((std::vector<std::string>{existing_skip, missing_skip}), DeletedUris(*skip_backend));
 }
 
-TEST_F(TairMempoolGcDeleteTest, MetadataOnlySkipsDeleteForBothSettings) {
+TEST_F(BackendGcDeleteTest, MetadataOnlySkipsDeleteForBothSettings) {
     const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
     for (const bool skip : {false, true}) {
         auto backend = AddBackend("pace_gc", type, skip);
@@ -425,12 +426,13 @@ TEST_F(TairMempoolGcDeleteTest, MetadataOnlySkipsDeleteForBothSettings) {
         request.metadata_only = true;
         EXPECT_EQ(EC_OK, Run(request).status);
         EXPECT_TRUE(backend->delete_batches.empty());
+        EXPECT_EQ(0u, backend->policy_queries);
         EXPECT_TRUE(Locations(100).empty());
         EXPECT_EQ(0u, indexer->GetStorageUsage());
     }
 }
 
-TEST_F(TairMempoolGcDeleteTest, RefreshedSnapshotAndCasLoserKeepTheirLocationsAndUsage) {
+TEST_F(BackendGcDeleteTest, RefreshedSnapshotAndCasLoserKeepTheirLocationsAndUsage) {
     const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
     auto backend = AddBackend("pace_gc", type);
     const std::string old_uri = "pace://pace_gc/1?size=5";
@@ -460,7 +462,7 @@ TEST_F(TairMempoolGcDeleteTest, RefreshedSnapshotAndCasLoserKeepTheirLocationsAn
     EXPECT_EQ(26u, indexer->GetStorageUsage());
 }
 
-TEST_F(TairMempoolGcDeleteTest, FinalCadKeepsLocationRefreshedDuringBackendDelete) {
+TEST_F(BackendGcDeleteTest, FinalCadKeepsLocationRefreshedDuringBackendDelete) {
     const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
     auto backend = AddBackend("pace_gc", type);
     const std::string old_uri = "pace://pace_gc/1?size=5";
@@ -473,7 +475,7 @@ TEST_F(TairMempoolGcDeleteTest, FinalCadKeepsLocationRefreshedDuringBackendDelet
     EXPECT_EQ(13u, indexer->GetStorageUsage());
 }
 
-TEST_F(TairMempoolGcDeleteTest, DeleteResultsPreserveExistingMetadataUsageAndLogContracts) {
+TEST_F(BackendGcDeleteTest, DeleteResultsPreserveExistingMetadataUsageAndLogContracts) {
     const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
     Stub log_stub;
     log_stub.set(ADDR(LoggerBroker, Log), CapturePhysicalDeleteWarnings);

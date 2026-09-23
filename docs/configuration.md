@@ -341,23 +341,6 @@ TairMempool DRAM 使用 `pace`（proto `ST_TAIRMEMPOOL`），LocalSSD 使用
 仍使用 `pace://` 数据面 URI，但 quota、类型水位和迁移触发用量分别统计。旧的
 `ST_TAIRMEMPOOL + media_type=5` 配置仍可读取，迁移到新类型后才能获得独立 SSD 水位。
 
-TairMempool 的 `storage_spec.skip_confirmed_missing_backend_delete` 控制 GC 是否跳过
-已判定不存在的 URI 的后端删除，默认 `false`（缺字段也为 `false`）。默认仍走现有
-Backend Delete → Tair Mempool Free 链路：owner 已退役不代表共享 KVCS 数据已删除。
-显式设为 `true` 才跳过 `confirmed_missing_uris` 中的 URI；同一待清理 Location 中的其他
-URI 仍正常删除。该字段仅适用于 `pace` 和 `pace_ssd`，按 `global_unique_name` 生效，
-所有引用该 Storage 的 Instance 共用此设置；不增加进程级或 Instance 级开关。
-
-Admin API 对应字段为 `storage.tair_mem_pool.skip_confirmed_missing_backend_delete`，
-支持通过 AddStorage / UpdateStorage 设置、ListStorage 回读。`kvcm_ops` 的 `pace` 和
-`pace_ssd` 子命令提供 `--skip_confirmed_missing_backend_delete true|false`：创建时省略
-使用默认值，更新时省略保留原值。更新沿用现有 Storage 配置刷新和 Backend 重建流程。
-其他后端的缺失 URI 跳过行为保持不变；EventReport 等 `metadata_only` 清理始终只删元数据。
-
-删除结果仍沿用原约定：`EC_NOENT` 视为成功；其他 Delete 错误码会记录错误并返回部分成功，
-但仍尝试条件删除 Location，成功后扣减逻辑用量。本开关不增加重试机制；若后端删除失败
-而索引已清理，GC 无法再通过该索引发现残留数据。
-
 启用独立 SSD 类型时还需遵守以下配置约束：
 
 - 使用 `kvcm_ops add_storage ... pace_ssd` 创建一个新的、全局唯一的 Storage；不要把已有
