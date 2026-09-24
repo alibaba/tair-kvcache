@@ -18,6 +18,14 @@ namespace {
 
 constexpr size_t kMaxRetainedCompactReadKeys = 16384;
 
+ssize_t UsageDelta(const size_t before, const size_t after) {
+    return after >= before ? static_cast<ssize_t>(after - before) : -static_cast<ssize_t>(before - after);
+}
+
+size_t EstimatePropertyEntryUsage(const std::string &name, const std::string &value) {
+    return sizeof(void *) * 4 + name.capacity() + value.capacity();
+}
+
 struct CompactReadScratch {
     bool in_use = false;
     std::vector<std::string_view> key_views;
@@ -56,6 +64,273 @@ private:
 };
 
 } // namespace
+
+size_t LocalLocationStore::EstimateMapEntryUsage(const LocationId &location_id, const CacheLocationConstPtr &location) {
+    return sizeof(void *) * 4 + location_id.size() + sizeof(CacheLocationConstPtr) + location->EstimateMemUsage();
+}
+
+size_t LocalLocationStore::Size() const {
+    if (multiple_locations_) {
+        return multiple_locations_->size();
+    }
+    return inline_location_ ? 1 : 0;
+}
+
+size_t LocalLocationStore::EstimateUsage() const {
+    if (multiple_locations_) {
+        size_t usage = sizeof(CacheLocationMap);
+        for (const auto &[location_id, location] : *multiple_locations_) {
+            usage += EstimateMapEntryUsage(location_id, location);
+        }
+        return usage;
+    }
+    return inline_location_ ? inline_location_->EstimateMemUsage() : 0;
+}
+
+const CacheLocationConstPtr *LocalLocationStore::Find(const LocationId &location_id) const {
+    if (multiple_locations_) {
+        const auto it = multiple_locations_->find(location_id);
+        return it == multiple_locations_->end() ? nullptr : &it->second;
+    }
+    return inline_location_ && inline_location_->id() == location_id ? &inline_location_ : nullptr;
+}
+
+void LocalLocationStore::CopyTo(CacheLocationMap &out) const {
+    out.clear();
+    out.reserve(Size());
+    ForEach([&out](const LocationId &location_id, const CacheLocationConstPtr &location) {
+        out.emplace(location_id, location);
+    });
+}
+
+ssize_t LocalLocationStore::Merge(const CacheLocationMap &locations) {
+    if (Empty() && locations.size() > 1) {
+        multiple_locations_ = std::make_unique<CacheLocationMap>();
+        multiple_locations_->reserve(locations.size());
+        size_t usage = sizeof(CacheLocationMap);
+        for (const auto &[location_id, location] : locations) {
+            assert(location && location_id == location->id());
+            multiple_locations_->emplace(location_id, location);
+            usage += EstimateMapEntryUsage(location_id, location);
+        }
+        return static_cast<ssize_t>(usage);
+    }
+    ssize_t delta = 0;
+    for (const auto &[location_id, location] : locations) {
+        delta += UpsertImpl(location_id, location, nullptr);
+    }
+    return delta;
+}
+
+ssize_t LocalLocationStore::Upsert(const LocationId &location_id,
+                                   CacheLocationConstPtr location,
+                                   CacheLocationVector *retired_locations) {
+    return UpsertImpl(location_id, std::move(location), retired_locations);
+}
+
+ssize_t LocalLocationStore::UpsertImpl(const LocationId &location_id,
+                                       CacheLocationConstPtr location,
+                                       CacheLocationVector *retired_locations) {
+    assert(location && location_id == location->id());
+    if (multiple_locations_) {
+        auto [it, inserted] = multiple_locations_->try_emplace(location_id, std::move(location));
+        if (inserted) {
+            return static_cast<ssize_t>(EstimateMapEntryUsage(it->first, it->second));
+        }
+        const size_t old_usage = it->second->EstimateMemUsage();
+        if (retired_locations) {
+            assert(retired_locations->size() < retired_locations->capacity());
+            retired_locations->push_back(std::move(it->second));
+        }
+        const size_t new_usage = location->EstimateMemUsage();
+        it->second = std::move(location);
+        return UsageDelta(old_usage, new_usage);
+    }
+
+    if (!inline_location_) {
+        const ssize_t delta = static_cast<ssize_t>(location->EstimateMemUsage());
+        inline_location_ = std::move(location);
+        return delta;
+    }
+    if (inline_location_->id() == location_id) {
+        const size_t old_usage = inline_location_->EstimateMemUsage();
+        if (retired_locations) {
+            assert(retired_locations->size() < retired_locations->capacity());
+            retired_locations->push_back(std::move(inline_location_));
+        }
+        const size_t new_usage = location->EstimateMemUsage();
+        inline_location_ = std::move(location);
+        return UsageDelta(old_usage, new_usage);
+    }
+
+    // Transition inline -> map: the two known entries let us compute the after
+    // usage in O(1) without scanning anything.
+    const size_t before = inline_location_->EstimateMemUsage();
+    const size_t after = sizeof(CacheLocationMap) + EstimateMapEntryUsage(inline_location_->id(), inline_location_) +
+                         EstimateMapEntryUsage(location_id, location);
+    multiple_locations_ = std::make_unique<CacheLocationMap>();
+    multiple_locations_->reserve(2);
+    LocationId previous_id = inline_location_->id();
+    multiple_locations_->emplace(std::move(previous_id), std::move(inline_location_));
+    multiple_locations_->emplace(location_id, std::move(location));
+    return UsageDelta(before, after);
+}
+
+ssize_t LocalLocationStore::NormalizeAfterErase() {
+    if (multiple_locations_->size() > 1) {
+        return 0;
+    }
+    if (multiple_locations_->empty()) {
+        // The map container itself is no longer accounted for.
+        multiple_locations_.reset();
+        return -static_cast<ssize_t>(sizeof(CacheLocationMap));
+    }
+
+    // Collapse the single remaining entry back into the inline slot: it switches
+    // from a map-entry footprint (plus the container) to an inline footprint.
+    auto node = multiple_locations_->extract(multiple_locations_->begin());
+    const size_t before = sizeof(CacheLocationMap) + EstimateMapEntryUsage(node.key(), node.mapped());
+    const size_t after = node.mapped()->EstimateMemUsage();
+    inline_location_ = std::move(node.mapped());
+    multiple_locations_.reset();
+    return UsageDelta(before, after);
+}
+
+ssize_t LocalLocationStore::Erase(const LocationIdVector &location_ids) {
+    ssize_t delta = 0;
+    if (multiple_locations_) {
+        for (const auto &location_id : location_ids) {
+            auto it = multiple_locations_->find(location_id);
+            if (it != multiple_locations_->end()) {
+                delta -= static_cast<ssize_t>(EstimateMapEntryUsage(it->first, it->second));
+                multiple_locations_->erase(it);
+            }
+        }
+        delta += NormalizeAfterErase();
+    } else if (inline_location_) {
+        for (const auto &location_id : location_ids) {
+            if (inline_location_->id() == location_id) {
+                delta -= static_cast<ssize_t>(inline_location_->EstimateMemUsage());
+                inline_location_.reset();
+                break;
+            }
+        }
+    }
+    return delta;
+}
+
+PropertyMap &LocalPropertyStore::EnsureExtraProperties() {
+    if (!extra_properties_) {
+        extra_properties_ = std::make_unique<PropertyMap>();
+    }
+    return *extra_properties_;
+}
+
+ssize_t LocalPropertyStore::ErasePrevKeyFallback() {
+    if (!extra_properties_) {
+        return 0;
+    }
+    const auto it = extra_properties_->find(PROPERTY_PREV_BLOCK_KEY);
+    if (it == extra_properties_->end()) {
+        return 0;
+    }
+    ssize_t delta = -static_cast<ssize_t>(EstimatePropertyEntryUsage(it->first, it->second));
+    extra_properties_->erase(it);
+    if (extra_properties_->empty()) {
+        delta -= static_cast<ssize_t>(sizeof(PropertyMap));
+        extra_properties_.reset();
+    }
+    return delta;
+}
+
+ssize_t LocalPropertyStore::UpsertExtraProperty(const std::string &name, const std::string &value) {
+    const bool created = !extra_properties_;
+    PropertyMap &map = EnsureExtraProperties();
+    auto [it, inserted] = map.try_emplace(name, value);
+    if (inserted) {
+        ssize_t delta = static_cast<ssize_t>(EstimatePropertyEntryUsage(it->first, it->second));
+        if (created) {
+            delta += static_cast<ssize_t>(sizeof(PropertyMap));
+        }
+        return delta;
+    }
+    const size_t old_capacity = it->second.capacity();
+    it->second = value;
+    return UsageDelta(old_capacity, it->second.capacity());
+}
+
+ssize_t LocalPropertyStore::Merge(const PropertyMap &properties) {
+    ssize_t delta = 0;
+    for (const auto &[name, value] : properties) {
+        if (name != PROPERTY_PREV_BLOCK_KEY) {
+            delta += UpsertExtraProperty(name, value);
+            continue;
+        }
+
+        if (value.empty()) {
+            delta += ErasePrevKeyFallback();
+            prev_key_state_ = PrevKeyState::kEmpty;
+            continue;
+        }
+
+        KeyType parsed = 0;
+        if (StringUtil::StrToInt64(value.c_str(), parsed) && std::to_string(parsed) == value) {
+            delta += ErasePrevKeyFallback();
+            prev_key_ = parsed;
+            prev_key_state_ = PrevKeyState::kCanonical;
+            continue;
+        }
+
+        prev_key_state_ = PrevKeyState::kAbsent;
+        delta += UpsertExtraProperty(name, value);
+    }
+    return delta;
+}
+
+void LocalPropertyStore::CopySelected(const std::vector<std::string> &field_names, PropertyMap &out) const {
+    for (const auto &name : field_names) {
+        if (name == PROPERTY_PREV_BLOCK_KEY) {
+            if (prev_key_state_ == PrevKeyState::kEmpty) {
+                out[name] = {};
+                continue;
+            }
+            if (prev_key_state_ == PrevKeyState::kCanonical) {
+                out[name] = std::to_string(prev_key_);
+                continue;
+            }
+        }
+        if (extra_properties_) {
+            const auto it = extra_properties_->find(name);
+            if (it != extra_properties_->end()) {
+                out[name] = it->second;
+            }
+        }
+    }
+}
+
+void LocalPropertyStore::CopyAll(PropertyMap &out) const {
+    if (extra_properties_) {
+        out = *extra_properties_;
+    } else {
+        out.clear();
+    }
+    if (prev_key_state_ == PrevKeyState::kEmpty) {
+        out[PROPERTY_PREV_BLOCK_KEY] = {};
+    } else if (prev_key_state_ == PrevKeyState::kCanonical) {
+        out[PROPERTY_PREV_BLOCK_KEY] = std::to_string(prev_key_);
+    }
+}
+
+size_t LocalPropertyStore::EstimateUsage() const {
+    if (!extra_properties_) {
+        return 0;
+    }
+    size_t usage = sizeof(PropertyMap);
+    for (const auto &[name, value] : *extra_properties_) {
+        usage += EstimatePropertyEntryUsage(name, value);
+    }
+    return usage;
+}
 
 SingleLocationRmwScratch::~SingleLocationRmwScratch() { ReleaseRetainedHandles(); }
 
@@ -217,30 +492,8 @@ ErrorCode MetaLocalBackend::UpdateHandleInPlace(Cache::Handle *handle,
     ssize_t charge_delta = 0;
     {
         std::unique_lock lock(existing->GetMutex());
-        auto &existing_locations = existing->GetMutableLocations();
-        for (const auto &[loc_id, loc_ptr] : locations) {
-            auto it = existing_locations.find(loc_id);
-            if (it != existing_locations.end()) {
-                ssize_t old_usage = it->second ? static_cast<ssize_t>(it->second->EstimateMemUsage()) : 0;
-                it->second = loc_ptr;
-                ssize_t new_usage = loc_ptr ? static_cast<ssize_t>(loc_ptr->EstimateMemUsage()) : 0;
-                charge_delta += new_usage - old_usage;
-            } else {
-                charge_delta += static_cast<ssize_t>(MetaMemCacheItem::EstimateLocationEntryUsage(loc_id, loc_ptr));
-                existing_locations[loc_id] = loc_ptr;
-            }
-        }
-        auto &existing_properties = existing->GetMutableProperties();
-        for (const auto &[prop_name, prop_value] : properties) {
-            auto it = existing_properties.find(prop_name);
-            if (it != existing_properties.end()) {
-                charge_delta += static_cast<ssize_t>(prop_value.size()) - static_cast<ssize_t>(it->second.size());
-                it->second = prop_value;
-            } else {
-                charge_delta += static_cast<ssize_t>(sizeof(void *) * 4 + prop_name.size() + prop_value.size());
-                existing_properties[prop_name] = prop_value;
-            }
-        }
+        charge_delta += existing->GetMutableLocationStore().Merge(locations);
+        charge_delta += existing->GetMutablePropertyStore().Merge(properties);
     }
     if (charge_delta != 0) {
         cache_->AdjustCharge(handle, charge_delta);
@@ -258,31 +511,7 @@ ErrorCode MetaLocalBackend::UpdateHandleInPlaceSingleLocation(Cache::Handle *han
     ssize_t charge_delta = 0;
     {
         std::unique_lock lock(existing->GetMutex());
-        auto &existing_locations = existing->GetMutableLocations();
-        auto it = existing_locations.end();
-        if (existing_locations.size() == 1) {
-            auto only = existing_locations.begin();
-            if (only->first == location_id) {
-                it = only;
-            }
-        } else if (!existing_locations.empty()) {
-            it = existing_locations.find(location_id);
-        }
-        if (it != existing_locations.end()) {
-            const ssize_t old_usage = it->second ? static_cast<ssize_t>(it->second->EstimateMemUsage()) : 0;
-            const ssize_t new_usage = location ? static_cast<ssize_t>(location->EstimateMemUsage()) : 0;
-            if (retired_locations) {
-                assert(retired_locations->size() < retired_locations->capacity());
-                retired_locations->push_back(std::move(it->second));
-                it->second = std::move(location);
-            } else {
-                it->second = std::move(location);
-            }
-            charge_delta = new_usage - old_usage;
-        } else {
-            charge_delta = static_cast<ssize_t>(MetaMemCacheItem::EstimateLocationEntryUsage(location_id, location));
-            existing_locations.emplace(location_id, std::move(location));
-        }
+        charge_delta = existing->GetMutableLocationStore().Upsert(location_id, std::move(location), retired_locations);
     }
     if (charge_delta != 0) {
         cache_->AdjustCharge(handle, charge_delta);
@@ -367,15 +596,7 @@ ErrorCode MetaLocalBackend::DeleteLocationsForOneKey(KeyType key, const std::vec
     ssize_t charge_delta = 0;
     {
         std::unique_lock lock(item->GetMutex());
-        auto &locs = item->GetMutableLocations();
-        for (const auto &loc_id : location_ids) {
-            auto it = locs.find(loc_id);
-            if (it != locs.end()) {
-                charge_delta -=
-                    static_cast<ssize_t>(MetaMemCacheItem::EstimateLocationEntryUsage(it->first, it->second));
-                locs.erase(it);
-            }
-        }
+        charge_delta = item->GetMutableLocationStore().Erase(location_ids);
     }
     if (charge_delta != 0) {
         cache_->AdjustCharge(handle, charge_delta);
@@ -776,32 +997,25 @@ ErrorCode MetaLocalBackend::GetForOneKey(KeyType key,
     {
         std::shared_lock lock(item->GetMutex());
         if (out_location_map || out_location_ids) {
-            const auto &locs = item->GetLocations();
+            const auto &locations = item->GetLocationStore();
             if (out_location_map) {
-                *out_location_map = locs;
+                locations.CopyTo(*out_location_map);
             }
             if (out_location_ids) {
-                out_location_ids->reserve(locs.size());
-                for (const auto &[loc_id, _] : locs) {
-                    out_location_ids->push_back(loc_id);
-                }
+                out_location_ids->reserve(locations.Size());
+                locations.ForEach([out_location_ids](const LocationId &location_id, const CacheLocationConstPtr &) {
+                    out_location_ids->push_back(location_id);
+                });
             }
         }
         if (out_property_map) {
             if (field_names) {
-                const auto &props = item->GetProperties();
-                for (const auto &field_name : *field_names) {
-                    if (field_name == PROPERTY_LRU_TIME) {
-                        (*out_property_map)[PROPERTY_LRU_TIME] = std::to_string(stored_time);
-                        continue;
-                    }
-                    auto it = props.find(field_name);
-                    if (it != props.end()) {
-                        (*out_property_map)[field_name] = it->second;
-                    }
+                item->GetPropertyStore().CopySelected(*field_names, *out_property_map);
+                if (std::find(field_names->begin(), field_names->end(), PROPERTY_LRU_TIME) != field_names->end()) {
+                    (*out_property_map)[PROPERTY_LRU_TIME] = std::to_string(stored_time);
                 }
             } else {
-                *out_property_map = item->GetProperties();
+                item->GetPropertyStore().CopyAll(*out_property_map);
                 (*out_property_map)[PROPERTY_LRU_TIME] = std::to_string(stored_time);
             }
         }
@@ -823,15 +1037,15 @@ ErrorCode MetaLocalBackend::GetForOneKeyForMaintenance(KeyType key,
             }
             const auto *item = static_cast<const MetaMemCacheItem *>(value);
             std::shared_lock lock(item->GetMutex());
-            const auto &locations = item->GetLocations();
+            const auto &locations = item->GetLocationStore();
             if (out_location_map) {
-                *out_location_map = locations;
+                locations.CopyTo(*out_location_map);
             }
             if (out_location_ids) {
-                out_location_ids->reserve(locations.size());
-                for (const auto &[location_id, _] : locations) {
+                out_location_ids->reserve(locations.Size());
+                locations.ForEach([out_location_ids](const LocationId &location_id, const CacheLocationConstPtr &) {
                     out_location_ids->push_back(location_id);
-                }
+                });
             }
             return 0;
         });
@@ -887,13 +1101,11 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationValues(RequestContext * /*re
         item->TouchAccessTime();
         {
             std::shared_lock lock(item->GetMutex());
-            const auto &locations = item->GetLocations();
+            const auto &locations = item->GetLocationStore();
             auto &values = out_locations[i];
-            values.reserve(locations.size());
-            for (const auto &[location_id, location] : locations) {
-                (void)location_id;
-                values.push_back(location);
-            }
+            values.reserve(locations.Size());
+            locations.ForEach(
+                [&values](const LocationId &, const CacheLocationConstPtr &location) { values.push_back(location); });
         }
         cache_->Release(handle);
     }
@@ -953,10 +1165,10 @@ std::vector<ErrorCode> MetaLocalBackend::GetLocationValuesCompact(RequestContext
         item->TouchAccessTime(access_time_us);
         {
             std::shared_lock lock(item->GetMutex());
-            for (const auto &[location_id, location] : item->GetLocations()) {
-                (void)location_id;
-                out_locations.values.push_back(location);
-            }
+            item->GetLocationStore().ForEach(
+                [&out_locations](const LocationId &, const CacheLocationConstPtr &location) {
+                    out_locations.values.push_back(location);
+                });
         }
         out_locations.FinishKey();
     }
@@ -1012,11 +1224,11 @@ MetaLocalBackend::GetLocationsWithKeyStatus(RequestContext * /*request_context*/
         results[i].resize(location_ids[i].size());
         {
             std::shared_lock lock(item->GetMutex());
-            const auto &locs = item->GetLocations();
+            const auto &locations = item->GetLocationStore();
             for (size_t j = 0; j < location_ids[i].size(); ++j) {
-                auto it = locs.find(location_ids[i][j]);
-                if (it != locs.end()) {
-                    out_locations[i][j] = it->second;
+                const auto *location = locations.Find(location_ids[i][j]);
+                if (location) {
+                    out_locations[i][j] = *location;
                     results[i][j] = EC_OK;
                 } else {
                     results[i][j] = EC_NOENT;
@@ -1130,21 +1342,12 @@ void MetaLocalBackend::GetSingleLocationsWithKeyStatusIntoImpl(RequestContext * 
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
         item->TouchAccessTime(access_time_us);
         std::shared_lock lock(item->GetMutex());
-        const auto &locations = item->GetLocations();
-        auto it = locations.end();
-        if (locations.size() == 1) {
-            auto only = locations.begin();
-            if (only->first == *location_ids[i]) {
-                it = only;
-            }
-        } else if (!locations.empty()) {
-            it = locations.find(*location_ids[i]);
-        }
-        if (it != locations.end()) {
+        const auto *location = item->GetLocationStore().Find(*location_ids[i]);
+        if (location) {
             if (out_borrowed_locations) {
-                (*out_borrowed_locations)[i] = it->second.get();
+                (*out_borrowed_locations)[i] = location->get();
             } else {
-                (*out_owned_locations)[i] = it->second;
+                (*out_owned_locations)[i] = *location;
             }
             results[i] = EC_OK;
         }
@@ -1179,12 +1382,12 @@ MetaLocalBackend::GetLocationsForMaintenance(RequestContext * /*request_context*
                 }
                 const auto *item = static_cast<const MetaMemCacheItem *>(value);
                 std::shared_lock lock(item->GetMutex());
-                const auto &locations = item->GetLocations();
+                const auto &locations = item->GetLocationStore();
                 for (size_t j = 0; j < location_ids[i].size(); ++j) {
-                    const auto it = locations.find(location_ids[i][j]);
-                    if (it != locations.end()) {
+                    const auto *location = locations.Find(location_ids[i][j]);
+                    if (location) {
                         results[i][j] = EC_OK;
-                        out_locations[i][j] = it->second;
+                        out_locations[i][j] = *location;
                     }
                 }
                 return 0;
@@ -1260,19 +1463,8 @@ MetaLocalBackend::DeleteLocationsForMaintenance(RequestContext * /*request_conte
                     return 0;
                 }
                 auto *item = static_cast<MetaMemCacheItem *>(value);
-                ssize_t charge_delta = 0;
                 std::unique_lock lock(item->GetMutex());
-                auto &locations = item->GetMutableLocations();
-                for (const auto &location_id : location_ids[i]) {
-                    const auto it = locations.find(location_id);
-                    if (it == locations.end()) {
-                        continue;
-                    }
-                    charge_delta -=
-                        static_cast<ssize_t>(MetaMemCacheItem::EstimateLocationEntryUsage(it->first, it->second));
-                    locations.erase(it);
-                }
-                return charge_delta;
+                return item->GetMutableLocationStore().Erase(location_ids[i]);
             });
         if (!found) {
             results[i] = EC_NOENT;
@@ -1334,7 +1526,7 @@ std::vector<ErrorCode> MetaLocalBackend::ExistsLocation(RequestContext * /*reque
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
         {
             std::shared_lock lock(item->GetMutex());
-            out_exists[i] = !item->GetLocations().empty();
+            out_exists[i] = !item->GetLocationStore().Empty();
         }
         cache_->Release(handle);
     }
