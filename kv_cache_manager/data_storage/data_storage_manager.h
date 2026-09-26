@@ -43,10 +43,19 @@ public:
                                                              size_t size_per_key,
                                                              std::function<void()> cb);
 
+    std::vector<std::pair<ErrorCode, DataStorageUri>> CreateForKvMeta(RequestContext *request_context,
+                                                                      const std::string &unique_name,
+                                                                      const std::vector<std::string> &keys,
+                                                                      size_t size_per_key,
+                                                                      std::function<void()> cb);
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const std::string &unique_name,
                                   const std::vector<DataStorageUri> &storage_uris,
                                   std::function<void()> cb);
+    std::vector<ErrorCode> DeleteForKvMeta(RequestContext *request_context,
+                                           const std::string &unique_name,
+                                           const std::vector<DataStorageUri> &storage_uris,
+                                           std::function<void()> cb);
     // 跨存储层复制：用 unique_name 对应的 backend 执行 src_uris[i] -> dst_uris[i] 的复制。
     // 可选能力，backend 不支持时返回逐项 EC_UNIMPLEMENTED；storage 不存在返回逐项 EC_NOENT。
     std::vector<ErrorCode> Copy(RequestContext *request_context,

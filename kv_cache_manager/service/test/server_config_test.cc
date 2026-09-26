@@ -39,6 +39,7 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(64, config.GetCacheGcMaxInflightDeleteRequests());
         ASSERT_TRUE(config.IsCacheGcEventReportCleanupEnabled());
         ASSERT_EQ(256, config.GetCacheGcEventReportActionBatchSize());
+        ASSERT_FALSE(config.IsKvMetaEnabled());
     }
     // config_file not exist
     {
@@ -122,6 +123,26 @@ TEST_F(ServerConfigTest, TestGroupLruLimits) {
             EXPECT_FALSE(invalid.Parse("", {{key, value}})) << key << "=" << value;
         }
     }
+}
+
+TEST_F(ServerConfigTest, TestKvMetaIsOptInOnPrimaryRpcListener) {
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {{"kvcm.kv_meta.enabled", "true"}}));
+    EXPECT_TRUE(config.Check());
+    EXPECT_TRUE(config.IsKvMetaEnabled());
+
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_TRUE(config.Check());
+    EXPECT_FALSE(config.IsKvMetaEnabled());
+
+    for (const auto *value : {"", "TRUE", "1", "yes", "falsex"}) {
+        ServerConfig invalid;
+        EXPECT_FALSE(invalid.Parse("", {{"kvcm.kv_meta.enabled", value}})) << value;
+    }
+
+    ASSERT_TRUE(config.Parse("", {{"kvcm.kv_meta.enabled", "false"}}));
+    EXPECT_TRUE(config.Check());
+    EXPECT_FALSE(config.IsKvMetaEnabled());
 }
 
 TEST_F(ServerConfigTest, TestMetricsReporterType) {

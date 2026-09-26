@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -82,6 +83,30 @@ protected:
 private:
     std::atomic_bool is_open_ = false;
     std::atomic_bool is_available_ = false;
+};
+
+// Side interface for KVMeta object-lifecycle semantics. Keeping it separate
+// preserves DataStorageBackend's ABI and the fixed-block KV-cache vtable.
+// KVMeta uses singleton allocations, but a backend is not required to expose a
+// generation-aware delete API. Backends that cannot safely replay an
+// ambiguous delete must say so explicitly; KVMeta will make at most one
+// attempt and prefer a possible physical orphan over deleting a reused object.
+class KvMetaDataStorageBackendExtension {
+public:
+    virtual ~KvMetaDataStorageBackendExtension() = default;
+
+    // Performs one synchronous KVMeta delete attempt. EC_OK means the backend
+    // reported successful completion of that attempt. It does not, by itself,
+    // make an ambiguous transport failure safe to retry.
+    virtual std::vector<ErrorCode> DeleteForKvMeta(const std::vector<DataStorageUri> &storage_uris,
+                                                   const std::string &trace_id,
+                                                   std::function<void()> cb) = 0;
+
+    // True only when replaying the same URI after an unknown outcome cannot
+    // delete a successor allocation. Non-retry-safe backends (for example a
+    // reusable legacy GA address without a generation token) are attempted at
+    // most once, including across leader recovery.
+    virtual bool IsKvMetaDeleteRetrySafe() const noexcept = 0;
 };
 
 } // namespace kv_cache_manager
