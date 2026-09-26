@@ -34,10 +34,10 @@ struct KvMetaObjectClientConfig {
     // location spec marker {"value": 1}, and the same instance/group identity.
     InitParams transfer_init_params;
     std::uint64_t max_object_bytes{1024ULL * 1024ULL * 1024ULL};
-    // Must be strictly longer than the configured data-plane put timeout plus
-    // three metadata call-timeout windows (PutStart hand-off, masked-hit Get,
-    // and PutFinish).
-    std::int32_t write_timeout_seconds{30};
+    // Must be strictly longer than two configured data-plane put-timeout
+    // windows plus three metadata call-timeout windows (PutStart hand-off,
+    // masked-hit Get, and PutFinish).
+    std::int32_t write_timeout_seconds{60};
 };
 
 // Composes the KVMeta metadata transaction with its dedicated variable-size
@@ -69,7 +69,12 @@ public:
                                         const std::vector<std::uint64_t> &value_sizes,
                                         const BlockBuffers &object_buffers) = 0;
 
-    // All keys must exist and match expected_value_sizes before any data I/O.
+    // All keys must exist, belong to their exact logical keys, and match
+    // expected_value_sizes before any data I/O. After the synchronous transfer
+    // the client re-reads metadata and returns success only if every committed
+    // generation URI is unchanged. On any error caller buffers may have been
+    // modified and must not be consumed. Users that compose KvMetaClient and
+    // KvMetaTransferClient directly must implement an equivalent fence.
     virtual ClientErrorCode LoadObjects(const std::string &trace_id,
                                         const std::vector<std::string> &keys,
                                         const std::vector<std::uint64_t> &expected_value_sizes,

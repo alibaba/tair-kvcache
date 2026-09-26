@@ -59,11 +59,20 @@ TEST(KvMetaUriTest, EnforcesBoundedUnambiguousCanonicalIdentity) {
                                                DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
 
     const std::string nonce = "0123456789abcdefghijklmnopqrstuv";
+    const std::string fingerprint(kKvMetaObjectFingerprintHexChars, 'a');
     EXPECT_TRUE(HasCanonicalKvMetaObjectKey("kvmeta/a/b/" + nonce));
     EXPECT_TRUE(HasCanonicalKvMetaObjectKey("kvmeta/0/0/" + nonce));
+    EXPECT_TRUE(HasCanonicalKvMetaObjectKey("kvmeta/a/" + fingerprint + "/" + nonce));
     EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/01/b/" + nonce));
     EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/0b/" + nonce));
     EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/A/b/" + nonce));
+    EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/" + std::string(17, 'a') + "/" + nonce));
+    EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/" + std::string(kKvMetaObjectFingerprintHexChars - 1, 'a') +
+                                             "/" + nonce));
+    EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/" + std::string(kKvMetaObjectFingerprintHexChars + 1, 'a') +
+                                             "/" + nonce));
+    EXPECT_FALSE(
+        HasCanonicalKvMetaObjectKey("kvmeta/a/" + std::string(kKvMetaObjectFingerprintHexChars, 'A') + "/" + nonce));
     EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/b/short"));
     EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/b/" + nonce + "/extra"));
 
@@ -74,6 +83,36 @@ TEST(KvMetaUriTest, EnforcesBoundedUnambiguousCanonicalIdentity) {
     const std::string malformed_path = "/cache/root/kvmeta/a/not-hex/" + nonce;
     EXPECT_FALSE(TryGetCanonicalKvMetaObjectKeyFromPath(malformed_path, object_key));
     EXPECT_TRUE(object_key.empty());
+}
+
+TEST(KvMetaIdentityTest, PhysicalFingerprintBindsCompleteInstanceAndLogicalKey) {
+    const std::string first = BuildKvMetaObjectKeyPrefix("instance-a", "logical-key");
+    const std::string repeated = BuildKvMetaObjectKeyPrefix("instance-a", "logical-key");
+    const std::string other_key = BuildKvMetaObjectKeyPrefix("instance-a", "logical-key-2");
+    const std::string other_instance = BuildKvMetaObjectKeyPrefix("instance-b", "logical-key");
+    const std::string embedded_nul_key("logical\0key", 11);
+    const std::string embedded_nul = BuildKvMetaObjectKeyPrefix("instance-a", embedded_nul_key);
+
+    ASSERT_FALSE(first.empty());
+    EXPECT_EQ(first, repeated);
+    EXPECT_NE(first, other_key);
+    EXPECT_NE(first, other_instance);
+    EXPECT_NE(first, embedded_nul);
+    EXPECT_NE(first, BuildKvMetaLegacyObjectKeyPrefix("instance-a", "logical-key"));
+
+    const std::size_t instance_end = first.find('/', std::string("kvmeta/").size());
+    ASSERT_NE(std::string::npos, instance_end);
+    const std::size_t fingerprint_end = first.find('/', instance_end + 1);
+    ASSERT_NE(std::string::npos, fingerprint_end);
+    EXPECT_EQ(kKvMetaObjectFingerprintHexChars, fingerprint_end - instance_end - 1);
+    EXPECT_EQ(fingerprint_end + 1, first.size());
+
+    // This is a protocol invariant, not an accident of the particular hash in
+    // this test: even the longest canonical instance hash must fit PACE's
+    // exact-allocation-token contract.
+    EXPECT_EQ(121u, kKvMetaMaxPhysicalObjectKeyBytes);
+    EXPECT_LE(kKvMetaMaxPhysicalObjectKeyBytes, kKvMetaExactAllocationTokenLimitBytes);
+    EXPECT_LE(first.size() + kKvMetaObjectNonceBytes, kKvMetaMaxPhysicalObjectKeyBytes);
 }
 
 TEST(KvMetaUriTest, ParsesTairMempoolOffsetWithoutAliasingMalformedPathsToZero) {
@@ -199,7 +238,8 @@ protected:
     }
 
     std::string ObjectPath(const std::string &key_hash, char nonce) const {
-        return root_path_ + "kvmeta/123456789abcdef/" + key_hash + "/" + std::string(32, nonce);
+        return root_path_ + "kvmeta/" + BuildKvMetaInstancePathHash("test_instance") + "/" + key_hash + "/" +
+               std::string(32, nonce);
     }
 
     std::string root_path_;
@@ -383,8 +423,8 @@ TEST_F(KvMetaTransferClientTest, RejectsConfiguredNamespaceEscapeBeforeIo) {
 
     std::vector<char> payload(5, 1);
     const auto buffer = MakeBuffer(payload.data(), payload.size());
-    const std::string foreign_path =
-        GetPrivateTestRuntimeDataPath() + "foreign_objects/kvmeta/123456789abcdef/8/" + std::string(32, 'h');
+    const std::string foreign_path = GetPrivateTestRuntimeDataPath() + "foreign_objects/kvmeta/" +
+                                     BuildKvMetaInstancePathHash("test_instance") + "/8/" + std::string(32, 'h');
     const UriStrVec foreign_uri = {"file://test_nfs" + foreign_path + "?blkid=0&size=5"};
 
     const auto [save_ec, actual_uris] = client->SaveObjects(foreign_uri, {payload.size()}, {buffer});

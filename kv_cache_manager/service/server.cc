@@ -1,5 +1,6 @@
 #include "kv_cache_manager/service/server.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <exception>
@@ -251,21 +252,47 @@ void Server::StartKvMetaRecovery() {
                        kv_meta_recovery_epoch_.load(std::memory_order_acquire) != epoch;
             };
             ErrorCode ec = EC_ERROR;
-            try {
-                // CacheManager::DoRecover preserves its historical behavior
-                // of returning EC_OK after deferring a partial failure to a
-                // retry thread. KVMeta requires those indexers, so keep only
-                // this optional service gated until the retry really finishes.
-                while (!should_abort() && !cache_manager_->IsRecoverComplete()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // CacheManager::DoRecover preserves its historical behavior of
+            // returning EC_OK after deferring a partial failure to a retry
+            // thread. KVMeta requires those indexers, so keep only this
+            // optional service gated until the retry really finishes.
+            while (!should_abort() && !cache_manager_->IsRecoverComplete()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            std::uint64_t retry_delay_ms = 100;
+            constexpr std::uint64_t kMaximumRetryDelayMs = 30'000;
+            while (!should_abort()) {
+                try {
+                    ec = kv_meta_manager_->DoRecover(should_abort);
+                } catch (const std::exception &) {
+                    // KVMeta recovery is an isolated optional side path. A
+                    // provider exception leaves its request gate closed and
+                    // is retried without terminating or degrading KV-cache.
+                    ec = EC_ERROR;
+                    KVCM_LOG_ERROR("KVMeta recovery caught a standard exception; retrying while service is gated");
+                } catch (...) {
+                    ec = EC_ERROR;
+                    KVCM_LOG_ERROR("KVMeta recovery caught an unknown exception; retrying while service is gated");
                 }
-                ec = should_abort() ? EC_SERVICE_NOT_LEADER : kv_meta_manager_->DoRecover(should_abort);
-            } catch (const std::exception &) {
-                // KVMeta recovery is an isolated optional side path. A
-                // provider exception must leave its request gate closed, not
-                // terminate the server process or affect fixed-block KV-cache.
-                KVCM_LOG_ERROR("KVMeta recovery caught a standard exception; service remains disabled");
-            } catch (...) { KVCM_LOG_ERROR("KVMeta recovery caught an unknown exception; service remains disabled"); }
+                if (ec == EC_OK || ec == EC_SERVICE_NOT_LEADER || should_abort()) {
+                    break;
+                }
+                KVCM_LOG_WARN("KVMeta recovery failed; retrying while generic object service remains disabled, "
+                              "ec[%d] delay_ms[%llu]",
+                              static_cast<int>(ec),
+                              static_cast<unsigned long long>(retry_delay_ms));
+                const auto retry_deadline =
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(retry_delay_ms);
+                while (!should_abort() && std::chrono::steady_clock::now() < retry_deadline) {
+                    const auto remaining = retry_deadline - std::chrono::steady_clock::now();
+                    std::this_thread::sleep_for(
+                        std::min(remaining, std::chrono::steady_clock::duration(std::chrono::milliseconds(100))));
+                }
+                retry_delay_ms = std::min(kMaximumRetryDelayMs, retry_delay_ms * 2);
+            }
+            if (should_abort() && ec != EC_OK) {
+                ec = EC_SERVICE_NOT_LEADER;
+            }
             bool enabled = false;
             if (ec == EC_OK) {
                 // Serialize the final epoch check and gate opening with
@@ -290,7 +317,9 @@ void Server::StartKvMetaRecovery() {
                                static_cast<int>(ec));
             }
         });
-    } catch (const std::exception &e) { KVCM_LOG_ERROR("failed to start KVMeta recovery thread: %s", e.what()); }
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("failed to start KVMeta recovery thread: %s", e.what());
+    }
 }
 
 void Server::CancelAndJoinKvMetaRecovery() {

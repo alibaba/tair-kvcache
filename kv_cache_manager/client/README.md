@@ -33,6 +33,14 @@ with KvMetaObjectClient(config) as client:
     client.remove(["embedding", "position"])
 ```
 
+`load` 成功返回前会在同步数据搬运后重新读取 metadata，并要求完整 generation URI 仍与搬运前一致；并发回收、
+显式删除或同址复用因此只会得到同一代成功结果，或返回失败。任意 load 异常发生时，caller-owned 输出 buffer 可能已被
+部分或全部写入，必须整体丢弃并重算，不能继续交给推理。V1 没有 server-side read lease。
+
+新 generation 的物理名使用 instance-bound 256-bit logical-key fingerprint 和 kernel CSPRNG 产生的 128-bit generation；
+client 会在 I/O 前独立重算并校验此前缀。为滚动升级排空已持久化对象，client 仍接受与当前完整 key 精确对应的旧
+64-bit key 前缀；这不会放宽 metadata 的完整 key 查找或跨 key 拒绝规则，新写也不会继续生成旧格式。
+
 一次 Python 逻辑调用会先完整校验 keys、真实 byte size、buffer 和对象上限，再按服务端的 64 objects / 4 GiB
 上限分批；不会自动重试或回滚 mutation。RTP 使用每个 receipt 新生成的 UUID key，并由自身 pending/release/GC
 负责跨 batch 清理。CUDA/MUSA producer 在调用 `save` 前仍须由框架侧同步对应 device stream。Python context
@@ -77,3 +85,5 @@ if (start_ec == kv_cache_manager::ER_OK && !write.locations.empty()) {
 
 `KvMetaClient` 只提供 metadata/allocation API。自行编排时，应配套使用 `KvMetaTransferClient`，按返回 URI 和
 `KvMetaValueLocation.value_size` 搬运；不要复用根据普通 KV cache 定长 spec 校验 buffer 的 `TransferClient`。
+底层拆分调用不会自动获得高层 `KvMetaObjectClient` 的 post-transfer generation fence；独立集成必须在搬运后再次
+`Get`，并逐项验证 hit、size 和完整 canonical URI 与搬运前完全相同，否则丢弃全部输出。

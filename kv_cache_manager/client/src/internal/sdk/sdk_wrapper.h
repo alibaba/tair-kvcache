@@ -105,6 +105,9 @@ private:
     // by the matching server-authoritative storage config. The regular
     // fixed-block path does not consult this map.
     std::map<std::string, std::shared_ptr<StorageConfig>> sdk_storage_configs_;
+    // Hash component encoded in every object key owned by this public
+    // instance. An untrusted metadata response must match it before any I/O.
+    std::string kv_meta_instance_path_hash_;
     int owned_shm_fd_{-1};
     bool variable_object_size_enabled_{false};
     std::uint64_t max_variable_object_bytes_{0};

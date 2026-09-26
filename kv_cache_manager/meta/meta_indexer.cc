@@ -146,7 +146,14 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     max_key_count_ = config->GetMaxKeyCount();
     const size_t mutex_shard_num = config->GetMutexShardNum();
     batch_key_size_ = config->GetBatchKeySize();
-    persist_metadata_interval_time_ms_ = config->GetPersistMetaDataIntervalTimeMs();
+    const std::size_t persist_metadata_interval_time_ms = config->GetPersistMetaDataIntervalTimeMs();
+    if (persist_metadata_interval_time_ms > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
+        KVCM_LOG_ERROR("instance[%s] meta indexer init failed, persist metadata interval[%zu] exceeds int64",
+                       instance_id.c_str(),
+                       persist_metadata_interval_time_ms);
+        return EC_CONFIG_ERROR;
+    }
+    persist_metadata_interval_time_ms_ = static_cast<std::int64_t>(persist_metadata_interval_time_ms);
     if (mutex_shard_num > max_key_count_ || (mutex_shard_num & (mutex_shard_num - 1)) || mutex_shard_num <= 0) {
         KVCM_LOG_ERROR(
             "instance[%s] meta indexer init failed, config is invalid, mutex shard num[%lu] max key count[%lu]",
@@ -194,7 +201,8 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     }
     KVCM_LOG_INFO("instance[%s] meta indexer init success, mutex shard num[%lu], mutex hash seed[%" PRIu64
                   "], max key count[%lu], "
-                  "batch key size[%lu], key_count[%lu], persist_metadata_interval_time_ms[%zu], storage usage data[%s]",
+                  "batch key size[%lu], key_count[%lu], persist_metadata_interval_time_ms[%" PRId64
+                  "], storage usage data[%s]",
                   instance_id_.c_str(),
                   mutex_shard_num,
                   mutex_shard_hash_seed_,
@@ -1847,7 +1855,9 @@ bool MetaIndexer::ParallelForQuery(std::size_t count, const QueryExecutor::Range
         return true;
     } catch (const std::exception &e) {
         KVCM_LOG_ERROR("serial query callback threw exception: %s", e.what());
-    } catch (...) { KVCM_LOG_ERROR("serial query callback threw unknown exception"); }
+    } catch (...) {
+        KVCM_LOG_ERROR("serial query callback threw unknown exception");
+    }
     return false;
 }
 
@@ -2060,51 +2070,124 @@ std::vector<MetaIndexer::IndexBatch> MetaIndexer::MakeBatches(const KeyVector &k
 }
 
 ErrorCode MetaIndexer::RecoverMetaData() noexcept {
-    PropertyMap metadata_map;
-    ErrorCode ec = backend_manager_->GetMetaData(metadata_map);
-    if (ec == EC_NOENT) {
-        KVCM_LOG_INFO("there is no metadata key in storage backend, no need to recover metadata");
-        return ec;
-    }
-    if (ec != EC_OK) {
-        KVCM_LOG_ERROR("meta indexer read metadata from storage backend failed, ec[%d]", ec);
-        return ec;
-    }
-
-    // METADATA_PROPERTY_KEY_COUNT *must* always be presented
-    std::string key_count_str = metadata_map[METADATA_PROPERTY_KEY_COUNT];
-    int64_t key_count;
-    bool is_valid = StringUtil::StrToInt64(key_count_str.c_str(), key_count);
-    if (!is_valid) {
-        KVCM_LOG_ERROR("meta indexer convert metadata from string to int64 failed, key_count[%s]",
-                       key_count_str.c_str());
-        return EC_ERROR;
-    }
-    key_count_ = key_count;
-
-    if (const auto it = metadata_map.find(METADATA_PROPERTY_STORAGE_USAGE_DATA); it != metadata_map.end()) {
-        if (storage_usage_data_.Deserialize(it->second) != EC_OK) {
-            KVCM_LOG_ERROR("meta indexer deserialize storage usage data failed, str: [%s]", it->second.c_str());
+    try {
+        if (!backend_manager_) {
+            KVCM_LOG_ERROR("meta indexer recover metadata failed: backend manager is unavailable");
             return EC_ERROR;
         }
+        PropertyMap metadata_map;
+        const ErrorCode ec = backend_manager_->GetMetaData(metadata_map);
+        if (ec == EC_NOENT) {
+            KVCM_LOG_INFO("there is no metadata key in storage backend, no need to recover metadata");
+            return ec;
+        }
+        if (ec != EC_OK) {
+            KVCM_LOG_ERROR("meta indexer read metadata from storage backend failed, ec[%d]", ec);
+            return ec;
+        }
+
+        // METADATA_PROPERTY_KEY_COUNT is mandatory. Avoid operator[] here: a
+        // malformed checkpoint must not be silently converted into an empty
+        // value (or allocate from this noexcept recovery path).
+        const auto key_count_it = metadata_map.find(METADATA_PROPERTY_KEY_COUNT);
+        if (key_count_it == metadata_map.end()) {
+            KVCM_LOG_ERROR("meta indexer recovered metadata without mandatory key count");
+            return EC_ERROR;
+        }
+        int64_t key_count = 0;
+        if (!StringUtil::StrToInt64(key_count_it->second.c_str(), key_count) || key_count < 0) {
+            KVCM_LOG_ERROR("meta indexer recovered invalid key count[%s]", key_count_it->second.c_str());
+            return EC_ERROR;
+        }
+
+        if (const auto it = metadata_map.find(METADATA_PROPERTY_STORAGE_USAGE_DATA); it != metadata_map.end()) {
+            if (storage_usage_data_.Deserialize(it->second) != EC_OK) {
+                KVCM_LOG_ERROR("meta indexer deserialize storage usage data failed, str: [%s]", it->second.c_str());
+                return EC_ERROR;
+            }
+        }
+        key_count_.store(key_count, std::memory_order_release);
+        return EC_OK;
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("meta indexer recover metadata caught exception: %s", e.what());
+    } catch (...) {
+        KVCM_LOG_ERROR("meta indexer recover metadata caught unknown exception");
     }
 
-    return EC_OK;
+    return EC_ERROR;
 }
 
 // 定时持久化key count等meta data，failover时可能因持久化不及时，key count与真实值会发生偏差
 void MetaIndexer::PersistMetaData() noexcept {
-    int64_t current_time = TimestampUtil::GetSteadyTimeMs();
-    if (current_time >= last_persist_metadata_time_ + persist_metadata_interval_time_ms_) {
+    try {
+        if (!backend_manager_) {
+            KVCM_LOG_WARN("meta indexer persist metadata skipped: backend manager is unavailable");
+            return;
+        }
+        const int64_t current_time = TimestampUtil::GetSteadyTimeMs();
+        if (current_time < 0) {
+            KVCM_LOG_WARN("meta indexer persist metadata skipped: steady clock is unavailable");
+            return;
+        }
+        // Keep the established ordinary-path cadence without evaluating a
+        // potentially overflowing `last + interval`. A backwards clock step
+        // simply defers this best-effort checkpoint; KVMeta leader recovery
+        // rebuilds and force-persists its authoritative counters separately.
+        const int64_t elapsed =
+            current_time >= last_persist_metadata_time_ ? current_time - last_persist_metadata_time_ : 0;
+        if (elapsed < persist_metadata_interval_time_ms_) {
+            return;
+        }
         std::map<std::string, std::string> metadata_map;
-        metadata_map[METADATA_PROPERTY_KEY_COUNT] = std::to_string(key_count_);
-        metadata_map[METADATA_PROPERTY_STORAGE_USAGE_DATA] = storage_usage_data_.Serialize();
-        ErrorCode ec = backend_manager_->PutMetaData(metadata_map);
+        metadata_map.emplace(METADATA_PROPERTY_KEY_COUNT, std::to_string(key_count_.load(std::memory_order_acquire)));
+        metadata_map.emplace(METADATA_PROPERTY_STORAGE_USAGE_DATA, storage_usage_data_.Serialize());
+        const ErrorCode ec = backend_manager_->PutMetaData(metadata_map);
         if (ec != EC_OK) {
             KVCM_LOG_WARN("meta indexer persist metadata failed, ec[%d]", ec);
         }
+        // Preserve the historical fixed-block behavior: a failed best-effort
+        // checkpoint consumes this interval instead of adding retry pressure
+        // to every metadata mutation on the main path.
         last_persist_metadata_time_ = current_time;
+    } catch (const std::exception &e) {
+        KVCM_LOG_WARN("meta indexer persist metadata caught exception: %s", e.what());
+    } catch (...) {
+        KVCM_LOG_WARN("meta indexer persist metadata caught unknown exception");
     }
+}
+
+bool MetaIndexer::SetKeyCountForRecovery(std::size_t key_count) noexcept {
+    if (key_count > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
+        KVCM_LOG_ERROR("meta indexer recovery key count exceeds int64, key_count[%zu]", key_count);
+        return false;
+    }
+    key_count_.store(static_cast<std::int64_t>(key_count), std::memory_order_release);
+    return true;
+}
+
+bool MetaIndexer::PersistMetaDataNow() noexcept {
+    try {
+        if (!backend_manager_) {
+            KVCM_LOG_WARN("meta indexer force persist metadata failed: backend manager is unavailable");
+            return false;
+        }
+        std::map<std::string, std::string> metadata_map;
+        metadata_map[METADATA_PROPERTY_KEY_COUNT] = std::to_string(key_count_.load(std::memory_order_acquire));
+        metadata_map[METADATA_PROPERTY_STORAGE_USAGE_DATA] = storage_usage_data_.Serialize();
+        const ErrorCode ec = backend_manager_->PutMetaData(metadata_map);
+        if (ec != EC_OK) {
+            KVCM_LOG_WARN("meta indexer force persist metadata failed, ec[%d]", ec);
+            return false;
+        }
+        const std::int64_t current_time = TimestampUtil::GetSteadyTimeMs();
+        last_persist_metadata_time_ = std::max<std::int64_t>(0, current_time);
+        return true;
+    } catch (const std::exception &e) {
+        KVCM_LOG_WARN("meta indexer force persist metadata caught exception: %s", e.what());
+    } catch (...) {
+        KVCM_LOG_WARN("meta indexer force persist metadata caught unknown exception");
+    }
+    return false;
 }
 
 void MetaIndexer::AdjustKeyCountMeta(const int32_t delta) noexcept {

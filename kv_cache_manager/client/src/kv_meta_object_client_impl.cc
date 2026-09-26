@@ -71,14 +71,23 @@ bool UriSchemeMatchesStorageType(KvMetaStorageType type, const DataStorageUri &u
     }
 }
 
-bool ValidateStorageUri(KvMetaStorageType type, const std::string &uri_text, std::uint64_t expected_size) {
+bool ValidateStorageUri(KvMetaStorageType type,
+                        const std::string &uri_text,
+                        std::uint64_t expected_size,
+                        std::string_view expected_object_key_prefix,
+                        std::string_view legacy_object_key_prefix) {
     if (uri_text.size() > kMaxKvMetaLocationUriBytes || !HasUnambiguousKvMetaUriText(uri_text)) {
         return false;
     }
     const DataStorageUri uri(uri_text);
     const DataStorageType allocation_type = ToDataStorageType(uri.GetProtocol());
     if (!HasCanonicalKvMetaAuthority(uri) || !UriSchemeMatchesStorageType(type, uri) ||
-        !HasOwnedKvMetaAllocationShape(uri, allocation_type) || !uri.HasParam("size")) {
+        !HasOwnedKvMetaAllocationShape(uri, allocation_type) ||
+        (!expected_object_key_prefix.empty() &&
+         !KvMetaUriBelongsToObjectKey(uri, allocation_type, expected_object_key_prefix) &&
+         (legacy_object_key_prefix.empty() ||
+          !KvMetaUriBelongsToObjectKey(uri, allocation_type, legacy_object_key_prefix))) ||
+        !uri.HasParam("size")) {
         return false;
     }
     const std::string size_text = uri.GetParam("size");
@@ -123,7 +132,7 @@ ClientErrorCode ValidateLocalRegistration(const InitParams &init_params,
         KVCM_LOG_WARN("KVMeta shared-memory registration is incomplete or its address range overflows");
         return ER_INVALID_PARAMS;
     }
-    struct stat file_stat {};
+    struct stat file_stat{};
     if (fstat(registration.fd, &file_stat) != 0 || file_stat.st_size < 0 ||
         static_cast<std::uintmax_t>(file_stat.st_size) < registration.size) {
         KVCM_LOG_WARN("KVMeta shared-memory fd is invalid or smaller than the registered range");
@@ -136,9 +145,9 @@ std::pair<ClientErrorCode, std::unique_ptr<KvMetaObjectClient>>
 CreateObjectClient(const std::string &trace_id,
                    const KvMetaObjectClientConfig &config,
                    const SharedMemoryRegistration *shared_memory_registration) {
-    if (config.instance_group.empty() || config.transfer_client_config.empty() || config.max_object_bytes == 0 ||
-        config.max_object_bytes > kMaxServiceObjectBytes || config.write_timeout_seconds <= 0 ||
-        config.write_timeout_seconds > kMaxWriteTimeoutSeconds ||
+    if (config.metadata.instance_id.empty() || config.instance_group.empty() || config.transfer_client_config.empty() ||
+        config.max_object_bytes == 0 || config.max_object_bytes > kMaxServiceObjectBytes ||
+        config.write_timeout_seconds <= 0 || config.write_timeout_seconds > kMaxWriteTimeoutSeconds ||
         !(config.transfer_init_params.role_type & RoleType::WORKER) ||
         config.transfer_init_params.self_location_spec_name != kKvMetaValueSpecName) {
         return {ER_INVALID_PARAMS, nullptr};
@@ -178,8 +187,12 @@ CreateObjectClient(const std::string &trace_id,
     if (!transfer_client) {
         return {ER_TRANSFERCLIENT_INIT_ERROR, nullptr};
     }
-    std::unique_ptr<KvMetaObjectClient> object_client = std::make_unique<KvMetaObjectClientImpl>(
-        std::move(metadata_client), std::move(transfer_client), config.max_object_bytes, config.write_timeout_seconds);
+    std::unique_ptr<KvMetaObjectClient> object_client =
+        std::make_unique<KvMetaObjectClientImpl>(std::move(metadata_client),
+                                                 std::move(transfer_client),
+                                                 config.max_object_bytes,
+                                                 config.write_timeout_seconds,
+                                                 config.metadata.instance_id);
     return {ER_OK, std::move(object_client)};
 }
 
@@ -190,11 +203,13 @@ std::uint32_t GetKvMetaObjectClientApiVersion() noexcept { return kKvMetaObjectC
 KvMetaObjectClientImpl::KvMetaObjectClientImpl(std::unique_ptr<KvMetaClient> metadata_client,
                                                std::unique_ptr<KvMetaTransferClient> transfer_client,
                                                std::uint64_t max_object_bytes,
-                                               std::int32_t write_timeout_seconds)
+                                               std::int32_t write_timeout_seconds,
+                                               std::string instance_id)
     : metadata_client_(std::move(metadata_client))
     , transfer_client_(std::move(transfer_client))
     , max_object_bytes_(max_object_bytes)
-    , write_timeout_seconds_(write_timeout_seconds) {}
+    , write_timeout_seconds_(write_timeout_seconds)
+    , instance_id_(std::move(instance_id)) {}
 
 KvMetaObjectClientImpl::OperationGuard::OperationGuard(KvMetaObjectClientImpl *owner, bool require_transfer)
     : owner_(owner), admitted_(owner_ != nullptr && owner_->TryBeginOperation(require_transfer)) {}
@@ -258,9 +273,10 @@ ClientErrorCode KvMetaObjectClientImpl::ValidateRequest(const std::vector<std::s
 }
 
 ClientErrorCode KvMetaObjectClientImpl::ExtractUris(const std::vector<KvMetaValueLocation> &locations,
+                                                    const std::vector<std::string> &keys,
                                                     const std::vector<std::uint64_t> &value_sizes,
-                                                    UriStrVec &uris) {
-    if (locations.empty() || locations.size() != value_sizes.size()) {
+                                                    UriStrVec &uris) const {
+    if (locations.empty() || locations.size() != keys.size() || locations.size() != value_sizes.size()) {
         return ER_SERVICE_INTERNAL_ERROR;
     }
     uris.clear();
@@ -276,7 +292,16 @@ ClientErrorCode KvMetaObjectClientImpl::ExtractUris(const std::vector<KvMetaValu
             uris.clear();
             return ER_SERVICE_SIZE_MISMATCH;
         }
-        if (!ValidateStorageUri(location.type, location.location_specs[0].uri, value_sizes[i])) {
+        const std::string expected_object_key_prefix =
+            instance_id_.empty() ? std::string{} : BuildKvMetaObjectKeyPrefix(instance_id_, keys[i]);
+        const std::string legacy_object_key_prefix =
+            instance_id_.empty() ? std::string{} : BuildKvMetaLegacyObjectKeyPrefix(instance_id_, keys[i]);
+        if ((!instance_id_.empty() && (expected_object_key_prefix.empty() || legacy_object_key_prefix.empty())) ||
+            !ValidateStorageUri(location.type,
+                                location.location_specs[0].uri,
+                                value_sizes[i],
+                                expected_object_key_prefix,
+                                legacy_object_key_prefix)) {
             uris.clear();
             return ER_SERVICE_INTERNAL_ERROR;
         }
@@ -342,14 +367,17 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjects(const std::string &trace_id,
 
     std::vector<std::uint64_t> missing_sizes;
     BlockBuffers missing_buffers;
+    std::vector<std::string> missing_keys;
     std::vector<std::string> hit_keys;
     std::vector<std::uint64_t> hit_sizes;
     missing_sizes.reserve(start_result.locations.size());
     missing_buffers.reserve(start_result.locations.size());
+    missing_keys.reserve(start_result.locations.size());
     hit_keys.reserve(keys.size());
     hit_sizes.reserve(keys.size());
     for (std::size_t i = 0; i < start_result.key_mask.size(); ++i) {
         if (!start_result.key_mask[i]) {
+            missing_keys.push_back(keys[i]);
             missing_sizes.push_back(value_sizes[i]);
             missing_buffers.push_back(object_buffers[i]);
         } else {
@@ -392,7 +420,7 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjects(const std::string &trace_id,
                 trace_id, start_result.write_session_id, missing_sizes.size(), ER_SERVICE_WRITE_IN_PROGRESS);
         }
         UriStrVec hit_uris;
-        const auto hit_location_ec = ExtractUris(hit_result.locations, hit_sizes, hit_uris);
+        const auto hit_location_ec = ExtractUris(hit_result.locations, hit_keys, hit_sizes, hit_uris);
         if (hit_location_ec != ER_OK) {
             return AbortWrite(trace_id, start_result.write_session_id, missing_sizes.size(), hit_location_ec);
         }
@@ -402,7 +430,7 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjects(const std::string &trace_id,
     }
 
     UriStrVec requested_uris;
-    const auto location_ec = ExtractUris(start_result.locations, missing_sizes, requested_uris);
+    const auto location_ec = ExtractUris(start_result.locations, missing_keys, missing_sizes, requested_uris);
     if (location_ec != ER_OK) {
         return AbortWrite(trace_id, start_result.write_session_id, start_result.locations.size(), location_ec);
     }
@@ -465,16 +493,63 @@ ClientErrorCode KvMetaObjectClientImpl::LoadObjects(const std::string &trace_id,
         }
     }
     UriStrVec uris;
-    const auto location_ec = ExtractUris(get_result.locations, expected_value_sizes, uris);
+    const auto location_ec = ExtractUris(get_result.locations, keys, expected_value_sizes, uris);
     if (location_ec != ER_OK) {
         return location_ec;
     }
+    ClientErrorCode load_ec = ER_SDKREAD_ERROR;
     try {
-        return transfer_client_->LoadObjects(uris, expected_value_sizes, object_buffers);
+        load_ec = transfer_client_->LoadObjects(uris, expected_value_sizes, object_buffers);
     } catch (...) {
         KVCM_LOG_WARN("KVMeta object data-plane load threw");
         return ER_SDKREAD_ERROR;
     }
+    if (load_ec != ER_OK) {
+        return load_ec;
+    }
+
+    // Metadata lookup and physical transfer cannot be covered by one remote
+    // lock.  In particular, a GC may make the old location invisible, delete
+    // it, and let a backend reuse the same address while this client is still
+    // reading.  Exact-free generation tokens prevent an old tombstone from
+    // deleting the successor, but data planes such as PACE historically read
+    // by address alone.  Re-read the committed owner after the synchronous
+    // transfer and publish success only if every complete physical identity
+    // is unchanged.  This is an optimistic read fence: if GC starts after the
+    // second lookup, the bytes have already reached caller-owned memory from
+    // the validated generation; if it starts earlier, the second lookup is a
+    // miss or carries a different generation-bearing URI.
+    KvMetaGetResult validated_result;
+    try {
+        auto result = metadata_client_->Get(trace_id, keys);
+        if (result.first != ER_OK) {
+            return result.first;
+        }
+        validated_result = std::move(result.second);
+    } catch (...) {
+        KVCM_LOG_WARN("KVMeta object post-load generation validation threw");
+        return ER_SERVICE_INTERNAL_ERROR;
+    }
+    if (validated_result.hit_mask.size() != keys.size() || validated_result.locations.size() != keys.size()) {
+        return ER_SERVICE_INTERNAL_ERROR;
+    }
+    for (bool hit : validated_result.hit_mask) {
+        if (!hit) {
+            return ER_SERVICE_NOT_FOUND;
+        }
+    }
+    UriStrVec validated_uris;
+    const auto validated_location_ec =
+        ExtractUris(validated_result.locations, keys, expected_value_sizes, validated_uris);
+    if (validated_location_ec == ER_SERVICE_SIZE_MISMATCH) {
+        // The first lookup already matched these sizes. A different committed
+        // size here is a concurrent generation change, not a caller error.
+        return ER_SERVICE_NOT_FOUND;
+    }
+    if (validated_location_ec != ER_OK) {
+        return validated_location_ec;
+    }
+    return SameStorageUris(uris, validated_uris) ? ER_OK : ER_SERVICE_NOT_FOUND;
 }
 
 ClientErrorCode KvMetaObjectClientImpl::Remove(const std::string &trace_id, const std::vector<std::string> &keys) {

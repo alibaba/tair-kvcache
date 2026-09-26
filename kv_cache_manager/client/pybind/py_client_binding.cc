@@ -48,7 +48,7 @@ struct PyKvMetaObjectClientConfig {
     std::string transfer_client_config;
     PyInitParams transfer_init_params;
     std::uint64_t max_object_bytes{1024ULL * 1024ULL * 1024ULL};
-    std::int32_t write_timeout_seconds{30};
+    std::int32_t write_timeout_seconds{60};
 
     kvcm::KvMetaObjectClientConfig ToCpp() const {
         kvcm::KvMetaObjectClientConfig config;

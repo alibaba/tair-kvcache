@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -27,6 +28,7 @@
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_group_quota.h"
+#include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/config/migration_strategy.h"
 #include "kv_cache_manager/config/quota_config.h"
@@ -236,6 +238,113 @@ private:
     std::atomic<std::size_t> create_attempts_{0};
 };
 
+class BatchPreflightRejectingNfsBackend : public NfsBackend {
+public:
+    BatchPreflightRejectingNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry,
+                                      std::uint64_t reclaim_bytes,
+                                      std::uint64_t reclaim_objects)
+        : NfsBackend(std::move(metrics_registry)), reclaim_bytes_(reclaim_bytes), reclaim_objects_(reclaim_objects) {}
+
+    CreatePreflightResult PreflightKvMetaCreate(const std::vector<CreatePreflightItem> &items) override {
+        std::uint64_t total_bytes = 0;
+        for (const CreatePreflightItem &item : items) {
+            total_bytes += item.value_size;
+        }
+        observed_bytes_.store(total_bytes, std::memory_order_release);
+        observed_objects_.store(items.size(), std::memory_order_release);
+        const std::size_t attempt = preflight_attempts_.fetch_add(1, std::memory_order_acq_rel);
+        if (attempt == 0) {
+            return {EC_NOSPC, reclaim_bytes_, reclaim_objects_};
+        }
+        return NfsBackend::PreflightKvMetaCreate(items);
+    }
+
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const std::string &trace_id,
+                                                             std::function<void()> cb) override {
+        create_attempts_.fetch_add(keys.size(), std::memory_order_relaxed);
+        return NfsBackend::Create(keys, size_per_key, trace_id, std::move(cb));
+    }
+
+    std::uint64_t ObservedBytes() const noexcept { return observed_bytes_.load(std::memory_order_acquire); }
+    std::uint64_t ObservedObjects() const noexcept { return observed_objects_.load(std::memory_order_acquire); }
+    std::size_t CreateAttempts() const noexcept { return create_attempts_.load(std::memory_order_acquire); }
+
+private:
+    const std::uint64_t reclaim_bytes_;
+    const std::uint64_t reclaim_objects_;
+    std::atomic<std::uint64_t> observed_bytes_{0};
+    std::atomic<std::uint64_t> observed_objects_{0};
+    std::atomic<std::size_t> preflight_attempts_{0};
+    std::atomic<std::size_t> create_attempts_{0};
+};
+
+class FaultingPreflightNfsBackend : public NfsBackend {
+public:
+    enum class Mode {
+        kZeroShortage,
+        kException,
+    };
+
+    FaultingPreflightNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry, Mode mode)
+        : NfsBackend(std::move(metrics_registry)), mode_(mode) {}
+
+    CreatePreflightResult PreflightKvMetaCreate(const std::vector<CreatePreflightItem> &items) override {
+        (void)items;
+        ++preflight_attempts_;
+        switch (mode_) {
+        case Mode::kZeroShortage:
+            return {EC_NOSPC, 0, 0};
+        case Mode::kException:
+            throw std::runtime_error("injected preflight failure");
+        }
+        return {EC_ERROR, 0, 0};
+    }
+
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const std::string &trace_id,
+                                                             std::function<void()> cb) override {
+        create_attempts_ += keys.size();
+        return NfsBackend::Create(keys, size_per_key, trace_id, std::move(cb));
+    }
+
+    std::size_t PreflightAttempts() const noexcept { return preflight_attempts_; }
+    std::size_t CreateAttempts() const noexcept { return create_attempts_; }
+
+private:
+    Mode mode_;
+    std::size_t preflight_attempts_{0};
+    std::size_t create_attempts_{0};
+};
+
+class IdentityTrackingPreflightNfsBackend : public NfsBackend {
+public:
+    explicit IdentityTrackingPreflightNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
+        : NfsBackend(std::move(metrics_registry)) {}
+
+    CreatePreflightResult PreflightKvMetaCreate(const std::vector<CreatePreflightItem> &items) override {
+        preflight_calls_.push_back(items);
+        return {};
+    }
+
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const std::string &trace_id,
+                                                             std::function<void()> cb) override {
+        created_keys_.insert(created_keys_.end(), keys.begin(), keys.end());
+        return NfsBackend::Create(keys, size_per_key, trace_id, std::move(cb));
+    }
+
+    const std::vector<std::vector<CreatePreflightItem>> &PreflightCalls() const noexcept { return preflight_calls_; }
+    const std::vector<std::string> &CreatedKeys() const noexcept { return created_keys_; }
+
+private:
+    std::vector<std::vector<CreatePreflightItem>> preflight_calls_;
+    std::vector<std::string> created_keys_;
+};
+
 class AliasedOverlongCreateNfsBackend : public NfsBackend {
 public:
     explicit AliasedOverlongCreateNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
@@ -363,6 +472,7 @@ public:
 class DuplicateSingletonCreateTairMempoolBackend : public DataStorageBackend, public KvMetaDataStorageBackendExtension {
 public:
     static constexpr const char *kProviderIncarnation = "01234567-89ab-4def-8abc-0123456789ab";
+    static constexpr const char *kProviderUuid = "provider-duplicate-singleton";
 
     explicit DuplicateSingletonCreateTairMempoolBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
         : DataStorageBackend(std::move(metrics_registry)) {}
@@ -393,6 +503,7 @@ public:
         if (!keys.empty()) {
             uri.SetParam("allocation_token", keys.front());
         }
+        uri.SetParam("provider_uuid", kProviderUuid);
         uri.SetParam("provider_incarnation", kProviderIncarnation);
         uri.SetParam("size", std::to_string(size_per_key));
         if (cb) {
@@ -467,6 +578,7 @@ public:
             uri.SetParam("allocation_token", keys.front());
         }
         uri.SetParam("media_type", std::to_string(returned_media_type_));
+        uri.SetParam("provider_uuid", DuplicateSingletonCreateTairMempoolBackend::kProviderUuid);
         uri.SetParam("provider_incarnation", DuplicateSingletonCreateTairMempoolBackend::kProviderIncarnation);
         uri.SetParam("size", std::to_string(size_per_key));
         if (cb) {
@@ -947,6 +1059,49 @@ public:
     }
 };
 
+class DuplicateScanMetaLocalBackend : public MetaLocalBackend {
+public:
+    ErrorCode ListKeys(RequestContext *request_context,
+                       const std::string &cursor,
+                       const int64_t limit,
+                       std::string &out_next_cursor,
+                       KeyTypeVec &out_keys) noexcept override {
+        const auto ec = MetaLocalBackend::ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
+        if (ec == EC_OK && !out_keys.empty()) {
+            try {
+                const auto duplicate = out_keys;
+                out_keys.insert(out_keys.end(), duplicate.begin(), duplicate.end());
+            } catch (...) {
+                return EC_ERROR;
+            }
+        }
+        return ec;
+    }
+
+    std::vector<ErrorCode> GetLocations(RequestContext *request_context,
+                                        const KeyTypeVec &keys,
+                                        CacheLocationMapVector &out_locations) noexcept override {
+        online_location_reads_.fetch_add(1, std::memory_order_relaxed);
+        return MetaLocalBackend::GetLocations(request_context, keys, out_locations);
+    }
+
+    std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         CacheLocationMapVector &out_locations) noexcept override {
+        maintenance_location_reads_.fetch_add(1, std::memory_order_relaxed);
+        return MetaLocalBackend::GetLocationMapsForMaintenance(request_context, keys, out_locations);
+    }
+
+    std::size_t OnlineLocationReads() const noexcept { return online_location_reads_.load(std::memory_order_relaxed); }
+    std::size_t MaintenanceLocationReads() const noexcept {
+        return maintenance_location_reads_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<std::size_t> online_location_reads_{0};
+    std::atomic<std::size_t> maintenance_location_reads_{0};
+};
+
 class ControlledSyncMetaLocalBackend : public MetaLocalBackend {
 public:
     void DelaySyncAfter(std::size_t successful_syncs, std::chrono::milliseconds delay) {
@@ -1185,7 +1340,8 @@ protected:
                             ErrorCode expected_registration_ec = EC_OK,
                             DataStorageType storage_type = DataStorageType::DATA_STORAGE_TYPE_NFS,
                             const std::string &storage_name = "nfs_01",
-                            bool configure_storage_type_quota = true) {
+                            bool configure_storage_type_quota = true,
+                            const std::vector<std::string> &storage_candidates = {}) {
         const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
         ASSERT_EQ(EC_OK, group_ec);
         ASSERT_TRUE(default_group);
@@ -1215,7 +1371,8 @@ protected:
 
         InstanceGroup object_group(*default_group);
         object_group.set_name(group_name);
-        object_group.set_storage_candidates({storage_name});
+        object_group.set_storage_candidates(storage_candidates.empty() ? std::vector<std::string>{storage_name}
+                                                                       : storage_candidates);
         object_group.set_global_quota_group_name(group_name + "-quota");
         object_group.set_version(1);
         object_group.set_cache_config(cache_config);
@@ -1279,6 +1436,27 @@ protected:
         }
         auto config = std::make_shared<MetaStorageBackendConfig>();
         auto backend = std::make_unique<OversamplingMetaLocalBackend>();
+        if (backend->Init(KvMetaManager::InternalInstanceId(instance_id), config) != EC_OK ||
+            backend->Open() != EC_OK) {
+            return nullptr;
+        }
+        auto *backend_raw = backend.get();
+        if (indexer->backend_manager_->persistent_backend_) {
+            indexer->backend_manager_->persistent_backend_->Close();
+        }
+        indexer->backend_manager_->persistent_backend_ = std::move(backend);
+        indexer->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    DuplicateScanMetaLocalBackend *InstallDuplicateScanBackend(const std::string &instance_id) {
+        auto indexer =
+            cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(instance_id));
+        if (!indexer || !indexer->backend_manager_) {
+            return nullptr;
+        }
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        auto backend = std::make_unique<DuplicateScanMetaLocalBackend>();
         if (backend->Init(KvMetaManager::InternalInstanceId(instance_id), config) != EC_OK ||
             backend->Open() != EC_OK) {
             return nullptr;
@@ -1392,7 +1570,7 @@ TEST_F(KvMetaManagerTest, DynamicSizesAreIndependentAndInvisibleUntilFinish) {
     const std::vector<std::string> keys{"emb-a", "emb-b"};
     const std::vector<std::uint64_t> sizes{17, 33};
     auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, keys, sizes, 30);
-    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(EC_OK, start_ec) << request_context_.error_tracer()->ToJsonString();
     ASSERT_EQ((std::vector<bool>{false, false}), start.key_mask);
     ASSERT_EQ(2, start.locations.size());
     ASSERT_FALSE(start.write_session_id.empty());
@@ -1461,6 +1639,73 @@ TEST_F(KvMetaManagerTest, DynamicSizesAreIndependentAndInvisibleUntilFinish) {
     EXPECT_FALSE(after_remove[0].found);
     EXPECT_TRUE(after_remove[1].found);
     EXPECT_EQ(33, indexer->GetStorageUsage());
+}
+
+TEST_F(KvMetaManagerTest, WriteSessionCapabilitiesHaveCanonicalUniqueShape) {
+    const auto [first_ec, first] = manager_->StartWrite(&request_context_, kInstanceId, {"session-a"}, {17}, 30);
+    ASSERT_EQ(EC_OK, first_ec) << request_context_.error_tracer()->ToJsonString();
+    const auto [second_ec, second] = manager_->StartWrite(&request_context_, kInstanceId, {"session-b"}, {19}, 30);
+    ASSERT_EQ(EC_OK, second_ec) << request_context_.error_tracer()->ToJsonString();
+
+    const auto has_canonical_capability_shape = [](const std::string &token) {
+        return token.size() == 32 && std::all_of(token.begin(), token.end(), [](char c) {
+                   return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+               });
+    };
+    EXPECT_TRUE(has_canonical_capability_shape(first.write_session_id));
+    EXPECT_TRUE(has_canonical_capability_shape(second.write_session_id));
+    EXPECT_NE(first.write_session_id, second.write_session_id);
+
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, first.write_session_id, {false}));
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, second.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, MissingNfsAdmissionRootNeverCreatesSessionOrConsumesQuota) {
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+
+    const std::string missing_root = GetPrivateTestRuntimeDataPath() + "missing_admission_root/";
+    std::error_code cleanup_ec;
+    std::filesystem::remove_all(missing_root, cleanup_ec);
+    ASSERT_FALSE(cleanup_ec) << cleanup_ec.message();
+    auto spec = std::make_shared<NfsStorageSpec>();
+    spec->set_key_count_per_file(1);
+    spec->set_root_path(missing_root);
+    const StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "nfs_01", spec);
+    auto unavailable = std::make_shared<NfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, unavailable->Open(storage_config, "missing_admission_root"));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = unavailable;
+    }
+
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
+    ASSERT_TRUE(indexer);
+    ASSERT_EQ(0, indexer->GetStorageUsage());
+    auto [failed_ec, failed] = manager_->StartWrite(&request_context_, kInstanceId, {"missing-root"}, {37}, 30);
+    EXPECT_EQ(EC_IO_ERROR, failed_ec);
+    EXPECT_TRUE(failed.write_session_id.empty());
+    EXPECT_TRUE(failed.locations.empty());
+    EXPECT_EQ(0, failed.session_item_count);
+    EXPECT_EQ(0, indexer->GetStorageUsage());
+    EXPECT_FALSE(std::filesystem::exists(missing_root));
+
+    ASSERT_TRUE(std::filesystem::create_directories(missing_root));
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, {"missing-root"}, {37}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    ASSERT_FALSE(retry.write_session_id.empty());
+    ASSERT_EQ(1, retry.session_item_count);
+    ASSERT_EQ(37, indexer->GetStorageUsage());
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
+    EXPECT_EQ(0, indexer->GetStorageUsage());
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
 }
 
 TEST_F(KvMetaManagerTest, MalformedCreateResponseNeverDeletesUnattributableUris) {
@@ -1808,10 +2053,10 @@ TEST_F(KvMetaManagerTest, RejectsAStorageBackendThatReusesOneSingletonForTwoKeys
                        DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
                        kStorage);
 
-    // PACE returns opaque addresses, so unlike file-like backends the URI
-    // cannot echo the generated logical key. `size` is not part of its
-    // physical Delete identity; the reused address must still be rejected
-    // before either metadata record is published.
+    // PACE returns opaque addresses plus per-request allocation tokens. `size`
+    // and token are not part of the reusable physical-slot identity; a broken
+    // allocator that returns one slot with two valid tokens must still be
+    // rejected before either metadata record is published.
     const auto [ec, result] =
         manager_->StartWrite(&request_context_, kInstance, {"duplicate-uri-a", "duplicate-uri-b"}, {17, 29}, 30);
 
@@ -1820,12 +2065,55 @@ TEST_F(KvMetaManagerTest, RejectsAStorageBackendThatReusesOneSingletonForTwoKeys
     EXPECT_TRUE(result.locations.empty());
     EXPECT_TRUE(result.write_session_id.empty());
     EXPECT_TRUE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
-    EXPECT_EQ(1, malformed->delete_calls);
+    // The duplicated address carries two allocation tokens. Both generation
+    // capabilities must be released even though they name one physical slot.
+    EXPECT_EQ(2, malformed->delete_calls);
     const auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {"duplicate-uri-a", "duplicate-uri-b"});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(2, values.size());
     EXPECT_FALSE(values[0].found);
     EXPECT_FALSE(values[1].found);
+}
+
+TEST_F(KvMetaManagerTest, RejectsPersistedPaceTokenOwnedByAnotherLogicalKeyWithoutDeletingIt) {
+    constexpr const char *kGroup = "foreign-pace-token-group";
+    constexpr const char *kInstance = "foreign-pace-token-instance";
+    constexpr const char *kStorage = "foreign_token_pace";
+    constexpr const char *kKey = "owned-key";
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto backend = std::make_shared<DuplicateSingletonCreateTairMempoolBackend>(metrics_registry_);
+    auto pace_spec = std::make_shared<TairMemPoolStorageSpec>();
+    const StorageConfig pace_config(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, kStorage, pace_spec);
+    ASSERT_EQ(EC_OK, backend->Open(pace_config, request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_[kStorage] = backend;
+    }
+    CreateReclaimGroup(kGroup,
+                       kInstance,
+                       1024,
+                       0.8,
+                       0,
+                       MetaIndexerConfig::kDefaultMaxKeyCount,
+                       std::nullopt,
+                       ReclaimPolicy::POLICY_LRU,
+                       EC_OK,
+                       DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                       kStorage);
+    CommitObject(kInstance, kKey, 17);
+
+    MutateObject(kInstance, kKey, [](CacheLocation &location) {
+        auto &spec = location.mutable_location_specs().front();
+        DataStorageUri uri(spec.uri());
+        uri.SetParam("allocation_token", "kvmeta/0/0/0123456789abcdefghijklmnopqrstuv");
+        spec.set_uri(uri.ToUriString());
+    });
+
+    EXPECT_EQ(EC_CORRUPTION, manager_->Get(&request_context_, kInstance, {kKey}).first);
+    EXPECT_EQ(EC_CORRUPTION, manager_->Remove(&request_context_, kInstance, {kKey}));
+    EXPECT_EQ(0, backend->delete_calls)
+        << "a well-formed token is not delete authority when it belongs to another logical owner";
 }
 
 TEST_F(KvMetaManagerTest, AtomicFinishFailureRollsBackEveryValue) {
@@ -1891,11 +2179,40 @@ TEST_F(KvMetaManagerTest, RecoveryRebuildsExactDynamicByteUsage) {
         cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
     indexer->SetStorageUsageByType(start.locations[0].type, 1);
+    ASSERT_TRUE(indexer->SetKeyCountForRecovery(999));
     ASSERT_EQ(1, indexer->GetStorageUsage());
+    ASSERT_EQ(999, indexer->GetKeyCount());
 
     ASSERT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(2, indexer->GetKeyCount());
     EXPECT_EQ(50, indexer->GetStorageUsage());
     EXPECT_EQ(50, indexer->GetStorageUsageByType(start.locations[0].type));
+}
+
+TEST_F(KvMetaManagerTest, RecoveryDeduplicatesCursorKeysAndDoesNotRefreshReadHeat) {
+    auto *backend = InstallDuplicateScanBackend(kInstanceId);
+    ASSERT_NE(nullptr, backend);
+
+    auto [start_ec, start] = manager_->StartWrite(
+        &request_context_, kInstanceId, {"recover-duplicate-a", "recover-duplicate-b"}, {17, 33}, 30);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(2, start.locations.size());
+    ASSERT_EQ(start.locations[0].type, start.locations[1].type);
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true, true}));
+
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
+    ASSERT_TRUE(indexer);
+    indexer->SetStorageUsageByType(start.locations[0].type, 1);
+    ASSERT_TRUE(indexer->SetKeyCountForRecovery(999));
+    const std::size_t online_reads_before = backend->OnlineLocationReads();
+    const std::size_t maintenance_reads_before = backend->MaintenanceLocationReads();
+
+    ASSERT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(2, indexer->GetKeyCount());
+    EXPECT_EQ(50, indexer->GetStorageUsage());
+    EXPECT_EQ(online_reads_before, backend->OnlineLocationReads());
+    EXPECT_GT(backend->MaintenanceLocationReads(), maintenance_reads_before);
 }
 
 TEST_F(KvMetaManagerTest, TrimUsesBoundedMaintenanceBatches) {
@@ -3515,6 +3832,17 @@ TEST_F(KvMetaManagerTest, ProvisionalBackendCommitsOnlyAfterDurableMetadataReser
     ASSERT_EQ(provisional->commit_calls_, 1u);
     ASSERT_EQ(provisional->committed_keys_.size(), 1u);
     EXPECT_TRUE(HasCanonicalKvMetaObjectKey(provisional->committed_keys_.front()));
+    const std::string expected_prefix = BuildKvMetaObjectKeyPrefix(kInstanceId, kKey);
+    const std::string legacy_prefix = BuildKvMetaLegacyObjectKeyPrefix(kInstanceId, kKey);
+    ASSERT_FALSE(expected_prefix.empty());
+    ASSERT_FALSE(legacy_prefix.empty());
+    EXPECT_EQ(0u, provisional->committed_keys_.front().compare(0, expected_prefix.size(), expected_prefix));
+    EXPECT_EQ(expected_prefix.size() + kKvMetaObjectNonceBytes, provisional->committed_keys_.front().size());
+    EXPECT_NE(0u, provisional->committed_keys_.front().compare(0, legacy_prefix.size(), legacy_prefix));
+    const std::string generated_nonce = provisional->committed_keys_.front().substr(expected_prefix.size());
+    EXPECT_TRUE(std::all_of(generated_nonce.begin(), generated_nonce.end(), [](const char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+    }));
     EXPECT_EQ(provisional->delete_calls_, 0u);
     EXPECT_EQ(manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {true}), EC_OK);
     EXPECT_EQ(manager_->Remove(&request_context_, kInstanceId, {kKey}), EC_OK);
@@ -3763,8 +4091,10 @@ TEST_F(KvMetaManagerTest, LateSuccessfulFinishOnQuarantinedBackendCannotPublishO
     }
 }
 
-TEST_F(KvMetaManagerTest, ExpiryRetainsTombstoneForRecoveryAfterFailedPhysicalDelete) {
+TEST_F(KvMetaManagerTest, ExpiryHandsDurableTombstoneToOnlineReclaimerAfterFailedPhysicalDelete) {
     constexpr const char *kKey = "expiry-delete-fails";
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 20);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
     auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {29}, 1);
     ASSERT_EQ(EC_OK, start_ec);
     ASSERT_FALSE(start.write_session_id.empty());
@@ -3782,11 +4112,14 @@ TEST_F(KvMetaManagerTest, ExpiryRetainsTombstoneForRecoveryAfterFailedPhysicalDe
     }
 
     ASSERT_TRUE(failing->WaitForDeleteAttempts(1, std::chrono::seconds(3)));
-    // The active leader does not spin on the failed delete; it closes EMB and
-    // leaves the durable URI tombstone to the recovery owner.
-    std::this_thread::sleep_for(std::chrono::milliseconds(350));
-    EXPECT_EQ(1, failing->DeleteAttempts());
-    EXPECT_TRUE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
+    ASSERT_TRUE(
+        WaitUntil([&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.pending_object_count").Get() == 1; },
+                  std::chrono::seconds(2)));
+    // Session expiry has consumed the in-memory session, but ownership is not
+    // orphaned: the durable tombstone and pending-location fence are now owned
+    // by the online retry scheduler. Unrelated keys remain serviceable while
+    // the same stable location cannot start a successor generation.
+    EXPECT_FALSE(manager_->maintenance_cancelled_.load(std::memory_order_acquire));
     auto indexer =
         cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
     ASSERT_TRUE(indexer);
@@ -3795,17 +4128,25 @@ TEST_F(KvMetaManagerTest, ExpiryRetainsTombstoneForRecoveryAfterFailedPhysicalDe
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
     EXPECT_FALSE(values[0].found);
-    EXPECT_EQ(EC_SERVICE_NOT_LEADER, manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {31}, 30).first);
+    EXPECT_EQ(EC_EXIST, manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {31}, 30).first);
+    auto [peer_ec, peer] = manager_->StartWrite(&request_context_, kInstanceId, {"expiry-peer"}, {7}, 30);
+    ASSERT_EQ(EC_OK, peer_ec);
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, peer.write_session_id, {true}));
+
     failing->SetMode(FaultingDeleteNfsBackend::Mode::kSuccess);
-    manager_->DoCleanup();
-    ASSERT_EQ(EC_OK, manager_->DoRecover());
-    EXPECT_EQ(2, failing->DeleteAttempts());
-    EXPECT_EQ(0, indexer->GetStorageUsage());
-    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil(
+        [&]() {
+            return indexer->GetStorageUsage() == 7 &&
+                   metrics_registry_->GetGauge("kv_meta_reclaimer.pending_object_count").Get() == 0;
+        },
+        std::chrono::seconds(5)));
+    EXPECT_GE(failing->DeleteAttempts(), 2);
     auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {31}, 30);
     ASSERT_EQ(EC_OK, retry_ec);
     ASSERT_FALSE(retry.write_session_id.empty());
     EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
+    EXPECT_EQ(EC_OK, manager_->Remove(&request_context_, kInstanceId, {"expiry-peer"}));
+    EXPECT_EQ(0, indexer->GetStorageUsage());
     {
         std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
         storage_manager->storage_map_["nfs_01"] = original;
@@ -3986,6 +4327,46 @@ TEST_F(KvMetaManagerTest, ExactIdentityAndStorageSchemeAreValidated) {
 
     EXPECT_EQ(EC_CORRUPTION, manager_->Get(&request_context_, kInstanceId, {key}).first);
     EXPECT_EQ(EC_CORRUPTION, manager_->Remove(&request_context_, kInstanceId, {key}));
+}
+
+TEST_F(KvMetaManagerTest, LegacyPhysicalNamesRemainExactKeyBoundDuringRollingUpgrade) {
+    constexpr const char *kOwnedKey = "rolling-legacy-owned";
+    constexpr const char *kForeignKey = "rolling-legacy-foreign";
+    CommitObject(kInstanceId, kOwnedKey, 31);
+    CommitObject(kInstanceId, kForeignKey, 37);
+
+    const auto rewrite_as_legacy = [&](const std::string &metadata_key, const std::string &physical_owner_key) {
+        MutateObject(kInstanceId, metadata_key, [&](CacheLocation &location) {
+            auto &spec = location.mutable_location_specs().front();
+            DataStorageUri uri(spec.uri());
+            std::string_view current_object_key;
+            const bool parsed = TryGetCanonicalKvMetaObjectKeyFromPath(uri.GetPath(), current_object_key);
+            EXPECT_TRUE(parsed);
+            if (!parsed || current_object_key.size() < kKvMetaObjectNonceBytes) {
+                return;
+            }
+            const std::string root = uri.GetPath().substr(0, uri.GetPath().size() - current_object_key.size());
+            const std::string generation =
+                std::string(current_object_key.substr(current_object_key.size() - kKvMetaObjectNonceBytes));
+            uri.SetPath(root + BuildKvMetaLegacyObjectKeyPrefix(kInstanceId, physical_owner_key) + generation);
+            spec.set_uri(uri.ToUriString());
+        });
+    };
+
+    // Persisted V1 objects remain readable and exactly deletable for the same
+    // complete logical key while a rolling deployment drains its old cache.
+    rewrite_as_legacy(kOwnedKey, kOwnedKey);
+    const auto [owned_get_ec, owned_values] = manager_->Get(&request_context_, kInstanceId, {kOwnedKey});
+    ASSERT_EQ(EC_OK, owned_get_ec);
+    ASSERT_EQ(1u, owned_values.size());
+    EXPECT_TRUE(owned_values.front().found);
+    EXPECT_EQ(EC_OK, manager_->Remove(&request_context_, kInstanceId, {kOwnedKey}));
+
+    // A canonical legacy spelling is not enough: the 64-bit component still
+    // has to be derived from the key whose stable metadata location owns it.
+    rewrite_as_legacy(kForeignKey, kOwnedKey);
+    EXPECT_EQ(EC_CORRUPTION, manager_->Get(&request_context_, kInstanceId, {kForeignKey}).first);
+    EXPECT_EQ(EC_CORRUPTION, manager_->Remove(&request_context_, kInstanceId, {kForeignKey}));
 }
 
 TEST_F(KvMetaManagerTest, PersistedObjectUriAndAccountingMustRemainUnambiguous) {
@@ -4191,6 +4572,14 @@ TEST_F(KvMetaManagerTest, RejectsWriteTimeoutLimitOutsideTheProtocolRange) {
     EXPECT_FALSE(negative_grace_manager.Init());
 }
 
+TEST_F(KvMetaManagerTest, RejectsSessionIdLimitBelowTheCapabilityTokenSize) {
+    KvMetaManager::Limits limits;
+    limits.max_write_session_id_bytes = kKvMetaCapabilityTokenHexChars - 1;
+    KvMetaManager invalid_manager(cache_manager_, registry_manager_, limits);
+
+    EXPECT_FALSE(invalid_manager.Init());
+}
+
 TEST_F(KvMetaManagerTest, RejectsBackendCleanupGraceAboveServerLimitBeforeAllocation) {
     auto storage_manager = registry_manager_->data_storage_manager();
     ASSERT_TRUE(storage_manager);
@@ -4384,6 +4773,66 @@ TEST_F(KvMetaManagerTest, RecoveryRetainsItsLedgerAndRetriesAfterPhysicalDeleteE
     auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, {kKey}, {43}, 30);
     ASSERT_EQ(EC_OK, retry_ec);
     ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, RecoveryRetryDoesNotRestartTheForceWaitForATransitionalTombstone) {
+    constexpr const char *kKey = "recovery-force-window";
+    CommitObject(kInstanceId, kKey, 37);
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
+    ASSERT_TRUE(indexer);
+    const auto internal_key = KvMetaManager::InternalKey(kKey);
+    const auto location_id = KvMetaManager::StableLocationId(kKey);
+    auto install_transitional_tombstone = [](const std::vector<ErrorCode> &get_ecs,
+                                             const LocationIdVector &,
+                                             std::size_t,
+                                             CacheLocationVector &locations,
+                                             PropertyMap &) -> LocationModifierResult {
+        if (get_ecs.size() != 1 || get_ecs[0] != EC_OK || locations.size() != 1 || !locations[0]) {
+            return {MA_FAIL, {EC_CORRUPTION}};
+        }
+        auto tombstone = std::make_shared<CacheLocation>(*locations[0]);
+        tombstone->set_status(CLS_DELETING);
+        tombstone->set_create_time(std::numeric_limits<std::int64_t>::max());
+        locations[0] = std::move(tombstone);
+        return {MA_OK, {EC_OK}};
+    };
+    const auto rmw = indexer->ReadModifyWriteTargetLocations(
+        &request_context_, {internal_key}, {{location_id}}, install_transitional_tombstone);
+    ASSERT_EQ(EC_OK, rmw.ec);
+    ASSERT_TRUE(indexer->Sync({internal_key}));
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto faulting =
+        std::make_shared<FaultingDeleteNfsBackend>(metrics_registry_, FaultingDeleteNfsBackend::Mode::kError);
+    ASSERT_EQ(EC_OK, faulting->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    manager_->limits_.max_write_timeout_seconds = 1;
+    manager_->limits_.max_failed_write_cleanup_grace_seconds = 0;
+    manager_->DoCleanup();
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = faulting;
+    }
+
+    EXPECT_EQ(EC_IO_ERROR, manager_->DoRecover());
+    ASSERT_EQ(1u, faulting->DeleteAttempts());
+    faulting->SetMode(FaultingDeleteNfsBackend::Mode::kSuccess);
+    const auto retry_started = std::chrono::steady_clock::now();
+    const auto abort_if_force_wait_restarted = [&]() {
+        return std::chrono::steady_clock::now() - retry_started >= std::chrono::milliseconds(250);
+    };
+    EXPECT_EQ(EC_OK, manager_->DoRecover(abort_if_force_wait_restarted));
+    EXPECT_EQ(2u, faulting->DeleteAttempts());
+    EXPECT_EQ(0, indexer->GetStorageUsage());
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+    ASSERT_TRUE(manager_->ResumeMaintenance());
 }
 
 TEST_F(KvMetaManagerTest, RecoveryRetainsEveryCleanupLedgerAcrossPhysicalFailures) {
@@ -4808,7 +5257,7 @@ TEST_F(KvMetaManagerTest, RejectsKvMetaRegistrationIntoAnOrdinaryGroup) {
               manager_->RegisterInstance(&request_context_, ordinary_group.name(), "kvmeta-must-not-mix", "").first);
 }
 
-TEST_F(KvMetaManagerTest, ExistingOrdinaryInstanceInLegacyMixedGroupCanStillRecover) {
+TEST_F(KvMetaManagerTest, LegacyMixedGroupFailsOnlyKvMetaRecoveryAndLeavesOrdinaryIndexerAvailable) {
     ModelDeployment deployment;
     deployment.set_model_name("legacy-ordinary-kv-cache");
     deployment.set_dtype("fp16");
@@ -4818,17 +5267,24 @@ TEST_F(KvMetaManagerTest, ExistingOrdinaryInstanceInLegacyMixedGroupCanStillReco
     const std::vector<LocationSpecInfo> specs{LocationSpecInfo("value", 1)};
 
     // Simulate persisted state produced before bidirectional group reservation
-    // existed. Recovery must recreate the ordinary indexer without performing
-    // another registry mutation or making the main KV-cache path unavailable.
-    ASSERT_EQ(EC_OK,
-              registry_manager_->RegisterInstance(&request_context_,
-                                                  "default",
-                                                  "legacy-ordinary",
-                                                  1,
-                                                  specs,
-                                                  deployment,
-                                                  {},
-                                                  static_cast<std::int32_t>(CacheManager::QueryType::QT_BATCH_GET)));
+    // existed. Bypass the new registration guard exactly as RegistryManager
+    // recovery would when loading an old snapshot.
+    const auto [group_ec, group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(group);
+    auto legacy_instance =
+        std::make_shared<InstanceInfo>(group->global_quota_group_name(),
+                                       "default",
+                                       "legacy-ordinary",
+                                       1,
+                                       specs,
+                                       deployment,
+                                       std::vector<LocationSpecGroup>{},
+                                       static_cast<std::int32_t>(CacheManager::QueryType::QT_BATCH_GET));
+    {
+        std::unique_lock<std::shared_mutex> registry_lock(registry_manager_->mutex_);
+        registry_manager_->instance_infos_[legacy_instance->instance_id()] = legacy_instance;
+    }
     EXPECT_EQ(EC_OK,
               cache_manager_
                   ->RegisterInstance(&request_context_,
@@ -4859,6 +5315,13 @@ TEST_F(KvMetaManagerTest, ExistingOrdinaryInstanceInLegacyMixedGroupCanStillReco
     EXPECT_EQ(
         EC_BADARGS,
         manager_->RegisterInstance(&request_context_, "default", "new-kvmeta-must-not-extend-mixed-group", "").first);
+
+    // Generic KV-cache is already usable, but the optional KVMeta recovery
+    // must reject this historical accounting ambiguity and leave its RPC gate
+    // closed until operators split the group.
+    manager_->DoCleanup();
+    EXPECT_EQ(EC_CONFIG_ERROR, manager_->DoRecover());
+    EXPECT_NE(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("legacy-ordinary"));
 }
 
 TEST_F(KvMetaManagerTest, ConcurrentMixedRegistrationCannotCreateAMixedGroup) {
@@ -4945,6 +5408,22 @@ TEST_F(KvMetaManagerTest, ExactValueSizesAreIncludedInByteAdmission) {
     auto [full_ec, full] = manager_->StartWrite(&request_context_, "small-object-instance", {"c"}, {1}, 30);
     EXPECT_EQ(EC_NOSPC, full_ec);
     EXPECT_TRUE(full.locations.empty());
+}
+
+TEST_F(KvMetaManagerTest, DynamicByteAdmissionFailsClosedWhenTypeUsageAggregateWouldOverflow) {
+    auto indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstanceId));
+    ASSERT_TRUE(indexer);
+    indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, std::numeric_limits<std::uint64_t>::max());
+    indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1);
+
+    EXPECT_EQ(EC_NOSPC,
+              manager_->CheckDynamicByteAdmission(
+                  &request_context_, "default", DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 1));
+    const auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {"overflow-safe"}, {1}, 30);
+    EXPECT_EQ(EC_NOSPC, start_ec);
+    EXPECT_TRUE(start.locations.empty());
+    EXPECT_TRUE(start.write_session_id.empty());
 }
 
 TEST_F(KvMetaManagerTest, ConcurrentStartsCannotOvershootExactByteQuota) {
@@ -5918,6 +6397,387 @@ TEST_F(KvMetaManagerTest, ReclaimerCreatesPhysicalHeadroomAfterAuthoritativeBack
     }
 }
 
+TEST_F(KvMetaManagerTest, CapacityPreflightExceptionAllocatesNothingAndDoesNotPublishGcDemand) {
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto faulting =
+        std::make_shared<FaultingPreflightNfsBackend>(metrics_registry_, FaultingPreflightNfsBackend::Mode::kException);
+    ASSERT_EQ(EC_OK, faulting->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = faulting;
+    }
+
+    auto [failed_ec, failed] = manager_->StartWrite(&request_context_, kInstanceId, {"preflight-exception"}, {17}, 30);
+    EXPECT_EQ(EC_IO_ERROR, failed_ec);
+    EXPECT_TRUE(failed.locations.empty());
+    EXPECT_EQ(1u, faulting->PreflightAttempts());
+    EXPECT_EQ(0u, faulting->CreateAttempts());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetCounter("kv_meta_reclaimer.backend_capacity_demand_count").Get());
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+    auto [retry_ec, retry] = manager_->StartWrite(&request_context_, kInstanceId, {"preflight-exception"}, {17}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
+}
+
+TEST_F(KvMetaManagerTest, MalformedCapacityPreflightFailsClosedBeforeAllocation) {
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto faulting = std::make_shared<FaultingPreflightNfsBackend>(metrics_registry_,
+                                                                  FaultingPreflightNfsBackend::Mode::kZeroShortage);
+    ASSERT_EQ(EC_OK, faulting->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = faulting;
+    }
+
+    auto [failed_ec, failed] = manager_->StartWrite(&request_context_, kInstanceId, {"malformed-preflight"}, {17}, 30);
+    EXPECT_EQ(EC_CORRUPTION, failed_ec);
+    EXPECT_TRUE(failed.locations.empty());
+    EXPECT_EQ(1u, faulting->PreflightAttempts());
+    EXPECT_EQ(0u, faulting->CreateAttempts());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetCounter("kv_meta_reclaimer.backend_capacity_demand_count").Get());
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+    EXPECT_EQ(EC_SERVICE_NOT_LEADER,
+              manager_->StartWrite(&request_context_, kInstanceId, {"after-malformed-preflight"}, {17}, 30).first);
+}
+
+TEST_F(KvMetaManagerTest, BatchPreflightUsesTheExactGenerationKeysLaterAllocated) {
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto tracking = std::make_shared<IdentityTrackingPreflightNfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, tracking->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = tracking;
+    }
+
+    auto [start_ec, start] = manager_->StartWrite(
+        &request_context_, kInstanceId, {"preflight-a", "preflight-b", "preflight-c"}, {11, 4097, 23}, 30);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_EQ(3u, start.locations.size());
+    ASSERT_FALSE(start.write_session_id.empty());
+
+    const auto &preflight_calls = tracking->PreflightCalls();
+    ASSERT_EQ(4u, preflight_calls.size());
+    ASSERT_EQ(3u, preflight_calls.front().size()) << "the first call must cover the complete admission batch";
+    ASSERT_EQ(3u, tracking->CreatedKeys().size());
+    std::set<std::string> unique_keys;
+    const std::array<std::uint64_t, 3> expected_sizes{11, 4097, 23};
+    for (std::size_t i = 0; i < expected_sizes.size(); ++i) {
+        const auto &batch_item = preflight_calls.front()[i];
+        ASSERT_TRUE(HasCanonicalKvMetaObjectKey(batch_item.allocation_key));
+        EXPECT_EQ(expected_sizes[i], batch_item.value_size);
+        EXPECT_TRUE(unique_keys.insert(batch_item.allocation_key).second);
+        ASSERT_EQ(1u, preflight_calls[i + 1].size());
+        EXPECT_EQ(batch_item.allocation_key, preflight_calls[i + 1].front().allocation_key);
+        EXPECT_EQ(batch_item.value_size, preflight_calls[i + 1].front().value_size);
+        EXPECT_EQ(batch_item.allocation_key, tracking->CreatedKeys()[i]);
+    }
+
+    EXPECT_EQ(EC_OK,
+              manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {false, false, false}));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, BatchPreflightPublishesExactObjectPressureBeforeAnyAllocation) {
+    constexpr const char *kGroup = "reclaim-batch-preflight-group";
+    constexpr const char *kInstance = "reclaim-batch-preflight-instance";
+    CreateReclaimGroup(kGroup, kInstance, 1000, 1.0, 0);
+    CommitObject(kInstance, "large-old-object", 100);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CommitObject(kInstance, "small-newer-object", 1);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto capacity = std::make_shared<BatchPreflightRejectingNfsBackend>(
+        metrics_registry_, /*reclaim_bytes=*/0, /*reclaim_objects=*/2);
+    ASSERT_EQ(EC_OK, capacity->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = capacity;
+    }
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    ASSERT_EQ(101, indexer->GetStorageUsage());
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetSamplingSize(&request_context_, 2));
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetBatchingSize(&request_context_, 2));
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    cache_manager_->PauseReclaimer();
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+
+    auto [blocked_ec, blocked] =
+        manager_->StartWrite(&request_context_, kInstance, {"batch-a", "batch-b", "batch-c"}, {10, 20, 30}, 30);
+    EXPECT_EQ(EC_NOSPC, blocked_ec);
+    EXPECT_TRUE(blocked.locations.empty());
+    EXPECT_EQ(60u, capacity->ObservedBytes());
+    EXPECT_EQ(3u, capacity->ObservedObjects());
+    EXPECT_EQ(0u, capacity->CreateAttempts());
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_bytes").Get());
+    EXPECT_DOUBLE_EQ(2, metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_objects").Get());
+
+    cache_manager_->ResumeReclaimer();
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_objects").Get() == 0; },
+        std::chrono::seconds(2)));
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+}
+
+TEST_F(KvMetaManagerTest, BackendCapacityReclaimIsScopedToTheExactBackendAmongSameTypeCandidates) {
+    constexpr const char *kGroup = "reclaim-exact-backend-capacity-group";
+    constexpr const char *kInstance = "reclaim-exact-backend-capacity-instance";
+    constexpr const char *kSecondStorage = "nfs_02";
+    constexpr const char *kOldSecondObject = "old-object-on-second-nfs";
+    constexpr const char *kNewFirstObject = "new-object-on-first-nfs";
+
+    const std::filesystem::path second_root =
+        std::filesystem::temp_directory_path() / "kvcm-kv-meta-exact-backend-test";
+    ScopedFilesystemCleanup cleanup(second_root);
+    std::error_code root_ec;
+    std::filesystem::create_directories(second_root, root_ec);
+    ASSERT_FALSE(root_ec) << root_ec.message();
+    auto second_spec = std::make_shared<NfsStorageSpec>();
+    second_spec->set_root_path(second_root.string() + "/");
+    second_spec->set_key_count_per_file(1);
+    const StorageConfig second_config(DataStorageType::DATA_STORAGE_TYPE_NFS, kSecondStorage, second_spec);
+    ASSERT_EQ(EC_OK, registry_manager_->AddStorage(&request_context_, second_config));
+
+    CreateReclaimGroup(kGroup,
+                       kInstance,
+                       1000,
+                       1.0,
+                       0,
+                       MetaIndexerConfig::kDefaultMaxKeyCount,
+                       std::nullopt,
+                       ReclaimPolicy::POLICY_LRU,
+                       EC_OK,
+                       DataStorageType::DATA_STORAGE_TYPE_NFS,
+                       "nfs_01",
+                       /*configure_storage_type_quota=*/false,
+                       {"nfs_01", kSecondStorage});
+
+    // Put the globally older object on nfs_02 and the newer object on nfs_01.
+    // A type-only pressure signal would incorrectly evict the older nfs_02
+    // value even though that cannot release one byte for a full nfs_01.
+    ASSERT_EQ(EC_OK, registry_manager_->DisableStorage(&request_context_, "nfs_01"));
+    CommitObject(kInstance, kOldSecondObject, 25);
+    ASSERT_EQ(EC_OK, registry_manager_->EnableStorage(&request_context_, "nfs_01"));
+    ASSERT_EQ(EC_OK, registry_manager_->DisableStorage(&request_context_, kSecondStorage));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    CommitObject(kInstance, kNewFirstObject, 30);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original_first = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original_first);
+    auto capacity =
+        std::make_shared<CapacityRejectingNfsBackend>(metrics_registry_, CapacityRejectingNfsBackend::Mode::kOnce);
+    ASSERT_EQ(EC_OK, capacity->Open(original_first->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = capacity;
+    }
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    ASSERT_EQ(55, indexer->GetStorageUsage());
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetSamplingSize(&request_context_, 1));
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetBatchingSize(&request_context_, 1));
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    EXPECT_EQ(EC_NOSPC,
+              manager_->StartWrite(&request_context_, kInstance, {"new-object-after-nfs-full"}, {20}, 30).first);
+
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 25; }, std::chrono::seconds(3)));
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {kOldSecondObject, kNewFirstObject});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(2, values.size());
+    EXPECT_TRUE(values[0].found);
+    EXPECT_FALSE(values[1].found);
+    EXPECT_DOUBLE_EQ(0, metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_bytes").Get());
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original_first;
+    }
+    ASSERT_EQ(EC_OK, registry_manager_->EnableStorage(&request_context_, kSecondStorage));
+    EXPECT_EQ(EC_OK, manager_->Remove(&request_context_, kInstance, {kOldSecondObject}));
+}
+
+TEST_F(KvMetaManagerTest, BackendCapacityDemandStopsAfterFullScanProvesNoOwnedObject) {
+    constexpr const char *kGroup = "reclaim-unowned-backend-capacity-group";
+    constexpr const char *kInstance = "reclaim-unowned-backend-capacity-instance";
+    constexpr const char *kSecondStorage = "nfs_unowned_02";
+    constexpr const char *kSecondObject = "object-owned-by-second-nfs";
+
+    const std::filesystem::path second_root =
+        std::filesystem::temp_directory_path() / "kvcm-kv-meta-unowned-backend-test";
+    ScopedFilesystemCleanup cleanup(second_root);
+    std::error_code root_ec;
+    std::filesystem::create_directories(second_root, root_ec);
+    ASSERT_FALSE(root_ec) << root_ec.message();
+    auto second_spec = std::make_shared<NfsStorageSpec>();
+    second_spec->set_root_path(second_root.string() + "/");
+    second_spec->set_key_count_per_file(1);
+    ASSERT_EQ(
+        EC_OK,
+        registry_manager_->AddStorage(
+            &request_context_, StorageConfig(DataStorageType::DATA_STORAGE_TYPE_NFS, kSecondStorage, second_spec)));
+
+    CreateReclaimGroup(kGroup,
+                       kInstance,
+                       1000,
+                       1.0,
+                       0,
+                       MetaIndexerConfig::kDefaultMaxKeyCount,
+                       std::nullopt,
+                       ReclaimPolicy::POLICY_LRU,
+                       EC_OK,
+                       DataStorageType::DATA_STORAGE_TYPE_NFS,
+                       "nfs_01",
+                       /*configure_storage_type_quota=*/false,
+                       {"nfs_01", kSecondStorage});
+    ASSERT_EQ(EC_OK, registry_manager_->DisableStorage(&request_context_, "nfs_01"));
+    CommitObject(kInstance, kSecondObject, 25);
+    ASSERT_EQ(EC_OK, registry_manager_->EnableStorage(&request_context_, "nfs_01"));
+    ASSERT_EQ(EC_OK, registry_manager_->DisableStorage(&request_context_, kSecondStorage));
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original_first = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original_first);
+    auto capacity =
+        std::make_shared<CapacityRejectingNfsBackend>(metrics_registry_, CapacityRejectingNfsBackend::Mode::kAlways);
+    ASSERT_EQ(EC_OK, capacity->Open(original_first->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = capacity;
+    }
+
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
+    ASSERT_TRUE(indexer);
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetSamplingSize(&request_context_, 1));
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetBatchingSize(&request_context_, 1));
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    EXPECT_EQ(EC_NOSPC, manager_->StartWrite(&request_context_, kInstance, {"cannot-fit-on-first"}, {20}, 30).first);
+
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_bytes").Get() == 0; },
+        std::chrono::seconds(2)));
+    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.backend_capacity_unowned_demand_count").Get());
+    EXPECT_EQ(25, indexer->GetStorageUsage());
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {kSecondObject});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_TRUE(values.front().found);
+
+    // A later authoritative capacity failure must start a fresh proof epoch.
+    // Otherwise a stale "unowned" conclusion could permanently suppress
+    // backend-specific reclamation after ownership changes.
+    EXPECT_EQ(EC_NOSPC,
+              manager_->StartWrite(&request_context_, kInstance, {"cannot-fit-on-first-again"}, {20}, 30).first);
+    ASSERT_TRUE(WaitUntil(
+        [&]() {
+            return metrics_registry_->GetCounter("kv_meta_reclaimer.backend_capacity_unowned_demand_count").Get() ==
+                       2 &&
+                   metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_bytes").Get() == 0;
+        },
+        std::chrono::seconds(2)));
+    EXPECT_EQ(25, indexer->GetStorageUsage());
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original_first;
+    }
+    ASSERT_EQ(EC_OK, registry_manager_->EnableStorage(&request_context_, kSecondStorage));
+    EXPECT_EQ(EC_OK, manager_->Remove(&request_context_, kInstance, {kSecondObject}));
+}
+
+TEST_F(KvMetaManagerTest, SuccessfulAllocationAloneDoesNotClearBackendCapacityDemand) {
+    constexpr const char *kGroup = "reclaim-stale-backend-demand-group";
+    constexpr const char *kInstance = "reclaim-stale-backend-demand-instance";
+    constexpr const char *kOldObject = "old-object-must-stay";
+    CreateReclaimGroup(kGroup, kInstance, 1000, 1.0, 0);
+    CommitObject(kInstance, kOldObject, 70);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto capacity =
+        std::make_shared<CapacityRejectingNfsBackend>(metrics_registry_, CapacityRejectingNfsBackend::Mode::kOnce);
+    ASSERT_EQ(EC_OK, capacity->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = capacity;
+    }
+
+    cache_manager_->PauseReclaimer();
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    EXPECT_EQ(EC_NOSPC,
+              manager_->StartWrite(&request_context_, kInstance, {"new-after-external-release"}, {20}, 30).first);
+    EXPECT_DOUBLE_EQ(20, metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_bytes").Get());
+
+    // kOnce models capacity becoming available outside this KVCM group. A
+    // successful allocation is not sufficient evidence that the old request's
+    // capacity remains available: another request may have consumed it, or a
+    // smaller object may merely fit in a fragmented provider.
+    auto [retry_ec, retry] =
+        manager_->StartWrite(&request_context_, kInstance, {"new-after-external-release"}, {20}, 30);
+    ASSERT_EQ(EC_OK, retry_ec);
+    EXPECT_DOUBLE_EQ(20, metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_bytes").Get());
+
+    // The aborted retry performs a durable exact delete. Confirmed physical
+    // absence is the evidence that really releases provider capacity, so it
+    // consumes the demand without evicting the unrelated committed object.
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, retry.write_session_id, {false}));
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.backend_capacity_demand_bytes").Get() == 0; },
+        std::chrono::seconds(2)));
+
+    cache_manager_->ResumeReclaimer();
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.admission_demand_group_count").Get() == 0; },
+        std::chrono::seconds(2)));
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {kOldObject});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(1, values.size());
+    EXPECT_TRUE(values.front().found);
+
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
+    EXPECT_EQ(EC_OK, manager_->Remove(&request_context_, kInstance, {kOldObject}));
+}
+
 TEST_F(KvMetaManagerTest, BackendCapacityReclaimDoesNotRequireAStorageTypeQuota) {
     constexpr const char *kGroup = "reclaim-backend-capacity-without-type-quota-group";
     constexpr const char *kInstance = "reclaim-backend-capacity-without-type-quota-instance";
@@ -6421,13 +7281,18 @@ TEST_F(KvMetaManagerTest, RegistrationRejectsStorageWithoutExactObjectOwnership)
     InstanceGroup updated_hot_group(*hot_group);
     updated_hot_group.set_storage_candidates({kStorage});
     updated_hot_group.set_version(hot_group->version() + 1);
-    ASSERT_EQ(EC_OK,
+    // A live KVMeta group cannot swap out a backend that may still own exact
+    // objects. Reject the topology mutation atomically; policy-only updates
+    // remain supported by RegistryManager.
+    ASSERT_EQ(EC_BADARGS,
               registry_manager_->UpdateInstanceGroup(&request_context_, updated_hot_group, hot_group->version()));
 
     auto [hit_ec, hit] = manager_->StartWrite(&request_context_, kHotInstance, {"existing"}, {17}, 30);
     ASSERT_EQ(EC_OK, hit_ec);
     EXPECT_EQ((std::vector<bool>{true}), hit.key_mask);
-    EXPECT_EQ(EC_CONFIG_ERROR, manager_->StartWrite(&request_context_, kHotInstance, {"new-object"}, {17}, 30).first);
+    auto [new_ec, new_write] = manager_->StartWrite(&request_context_, kHotInstance, {"new-object"}, {17}, 30);
+    ASSERT_EQ(EC_OK, new_ec);
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kHotInstance, new_write.write_session_id, {false}));
     EXPECT_EQ(EC_OK, registry_manager_->data_storage_manager()->UnRegisterStorage(kStorage));
 }
 
@@ -6886,7 +7751,7 @@ TEST_F(KvMetaManagerTest, InvalidHotUpdatedReclaimPolicyBlocksOnlyNewAllocation)
     EXPECT_FALSE(values.front().found);
 }
 
-TEST_F(KvMetaManagerTest, HotUpdatedMetadataWithoutReadHeatStopsAdmissionAndAutomaticReclaim) {
+TEST_F(KvMetaManagerTest, HotUpdatedMetadataOwnershipIsRejectedWithoutDisruptingCacheLifecycle) {
     constexpr const char *kGroup = "reclaim-hot-metadata-group";
     constexpr const char *kInstance = "reclaim-hot-metadata-instance";
     CreateReclaimGroup(kGroup, kInstance, 100, 0.8, 0);
@@ -6907,13 +7772,25 @@ TEST_F(KvMetaManagerTest, HotUpdatedMetadataWithoutReadHeatStopsAdmissionAndAuto
     InstanceGroup updated_group(*current_group);
     updated_group.set_cache_config(updated_cache_config);
     updated_group.set_version(current_group->version() + 1);
-    ASSERT_EQ(EC_OK,
+    EXPECT_EQ(EC_BADARGS,
               registry_manager_->UpdateInstanceGroup(&request_context_, updated_group, current_group->version()));
+
+    const auto [unchanged_ec, unchanged_group] = registry_manager_->GetInstanceGroup(&request_context_, kGroup);
+    ASSERT_EQ(EC_OK, unchanged_ec);
+    ASSERT_TRUE(unchanged_group);
+    ASSERT_TRUE(unchanged_group->cache_config());
+    ASSERT_TRUE(unchanged_group->cache_config()->meta_indexer_config());
+    EXPECT_EQ(current_group->ToJsonString(), unchanged_group->ToJsonString());
+    EXPECT_EQ(current_group->version(), unchanged_group->version());
 
     auto [hit_ec, hit] = manager_->StartWrite(&request_context_, kInstance, {"existing"}, {90}, 30);
     ASSERT_EQ(EC_OK, hit_ec);
     EXPECT_EQ((std::vector<bool>{true}), hit.key_mask);
-    EXPECT_EQ(EC_CONFIG_ERROR, manager_->StartWrite(&request_context_, kInstance, {"new-object"}, {10}, 30).first);
+
+    auto [new_ec, new_object] = manager_->StartWrite(&request_context_, kInstance, {"new-object"}, {10}, 30);
+    ASSERT_EQ(EC_OK, new_ec);
+    ASSERT_FALSE(new_object.write_session_id.empty());
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, new_object.write_session_id, {false}));
 
     auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
     ASSERT_TRUE(indexer);
@@ -6925,16 +7802,15 @@ TEST_F(KvMetaManagerTest, HotUpdatedMetadataWithoutReadHeatStopsAdmissionAndAuto
         [&]() { return metrics_registry_->GetCounter("kv_meta_reclaimer.round_count").Get() > rounds_before; },
         std::chrono::seconds(2)));
 
-    // The hot update changed only registry configuration; the already-open
-    // local indexer would still be capable of deleting the object. Verify the
-    // Reclaimer consults the current group contract and refuses to pretend
-    // that direct Redis provides LRU read heat.
-    EXPECT_EQ(90, indexer->GetStorageUsage());
-    EXPECT_EQ(retired_before, metrics_registry_->GetCounter("kv_meta_reclaimer.retired_object_count").Get());
+    // Ownership did not change under the already-open indexer. Admission and
+    // the LRU reclaimer therefore keep using one coherent metadata authority
+    // instead of partially applying a registry-only topology update.
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 0; }, std::chrono::seconds(2)));
+    EXPECT_GT(metrics_registry_->GetCounter("kv_meta_reclaimer.retired_object_count").Get(), retired_before);
     auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {"existing"});
     ASSERT_EQ(EC_OK, get_ec);
     ASSERT_EQ(1, values.size());
-    EXPECT_TRUE(values.front().found);
+    EXPECT_FALSE(values.front().found);
 }
 
 TEST_F(KvMetaManagerTest, RecoveryCompletesAReclaimerRetirementLeftByDemotion) {

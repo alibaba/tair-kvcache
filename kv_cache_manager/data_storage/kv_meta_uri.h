@@ -12,6 +12,7 @@
 #include <string_view>
 
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/kv_meta_identity.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 
 namespace kv_cache_manager {
@@ -39,8 +40,6 @@ static_assert(kKvMetaMinimumExactAllocationLeaseSeconds >
               static_cast<std::uint64_t>(kKvMetaMaxWriteTimeoutSeconds +
                                          kKvMetaMaxExactControlRpcTimeoutSeconds *
                                              (1 + kKvMetaMaxExactCleanupControlRequests)));
-inline constexpr std::size_t kKvMetaObjectNonceBytes = 32;
-
 // The authority is an internal DataStorageManager key, not an arbitrary DNS
 // endpoint. Keep its persisted spelling stable and URI-safe so Create, client
 // dispatch, and Delete cannot parse one backend name in different ways.
@@ -90,6 +89,35 @@ inline bool HasOwnedKvMetaFilePath(const DataStorageUri &uri) noexcept {
     return true;
 }
 
+// An exact-object NFS root is a durable namespace boundary shared by the
+// control plane and every data-plane client. Keep one unambiguous absolute
+// spelling: relative roots depend on process cwd, dot/empty segments alias a
+// different path, and "/" is too broad a deletion boundary for cache-owned
+// objects. The trailing slash remains part of the existing NfsBackend
+// concatenation contract.
+inline bool HasCanonicalKvMetaNfsRootPath(std::string_view root_path) noexcept {
+    if (root_path.size() <= 1 || root_path.front() != '/' || root_path.back() != '/' ||
+        root_path.find('\0') != std::string_view::npos) {
+        return false;
+    }
+    std::size_t segment_begin = 1;
+    while (segment_begin < root_path.size()) {
+        const std::size_t segment_end = root_path.find('/', segment_begin);
+        if (segment_end == std::string_view::npos) {
+            return false;
+        }
+        const std::string_view segment = root_path.substr(segment_begin, segment_end - segment_begin);
+        if (segment.empty() || segment == "." || segment == "..") {
+            return false;
+        }
+        if (segment_end == root_path.size() - 1) {
+            return true;
+        }
+        segment_begin = segment_end + 1;
+    }
+    return false;
+}
+
 // Server-generated object keys are deliberately self-describing and use only
 // canonical lowercase text. Besides reducing accidental namespace overlap,
 // this lets a data-plane client reject a corrupted metadata response before
@@ -107,9 +135,15 @@ inline bool HasCanonicalKvMetaObjectKey(std::string_view object_key) noexcept {
     if (key_end == std::string_view::npos || object_key.find('/', key_end + 1) != std::string_view::npos) {
         return false;
     }
-    const auto is_canonical_hex = [](std::string_view value) {
-        return !value.empty() && value.size() <= 16 && (value.size() == 1 || value.front() != '0') &&
-               std::all_of(value.begin(), value.end(), [](char ch) {
+    const auto is_legacy_canonical_hex = [](std::string_view value) {
+        return !value.empty() && value.size() <= kKvMetaCanonicalUint64MaxHexChars &&
+               (value.size() == 1 || value.front() != '0') && std::all_of(value.begin(), value.end(), [](char ch) {
+                   const auto byte = static_cast<unsigned char>(ch);
+                   return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+               });
+    };
+    const auto is_new_key_fingerprint = [](std::string_view value) {
+        return value.size() == kKvMetaObjectFingerprintHexChars && std::all_of(value.begin(), value.end(), [](char ch) {
                    const auto byte = static_cast<unsigned char>(ch);
                    return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
                });
@@ -117,8 +151,11 @@ inline bool HasCanonicalKvMetaObjectKey(std::string_view object_key) noexcept {
     const std::string_view instance_hash = object_key.substr(kPrefix.size(), instance_end - kPrefix.size());
     const std::string_view key_hash = object_key.substr(instance_end + 1, key_end - instance_end - 1);
     const std::string_view nonce = object_key.substr(key_end + 1);
-    return is_canonical_hex(instance_hash) && is_canonical_hex(key_hash) && nonce.size() == kKvMetaObjectNonceBytes &&
-           std::all_of(nonce.begin(), nonce.end(), [](char ch) {
+    // The short key-hash form is read only for rolling cleanup compatibility.
+    // Every new allocation uses the fixed-width, instance-bound fingerprint.
+    return is_legacy_canonical_hex(instance_hash) &&
+           (is_new_key_fingerprint(key_hash) || is_legacy_canonical_hex(key_hash)) &&
+           nonce.size() == kKvMetaObjectNonceBytes && std::all_of(nonce.begin(), nonce.end(), [](char ch) {
                const auto byte = static_cast<unsigned char>(ch);
                return (byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9');
            });
@@ -340,6 +377,14 @@ inline bool HasSafeOptionalTairMempoolProviderUuid(const DataStorageUri &uri) {
     return IsCanonicalTairMempoolProviderUuid(uri.GetParam("provider_uuid"));
 }
 
+// A newly allocated PACE object must carry a stable route. Persisted objects
+// created by an older version are allowed through the optional validator
+// above and are reconciled using the durable owner service, but accepting a
+// fresh allocation without this field would create new unrouteable GC debt.
+inline bool HasRequiredTairMempoolProviderUuid(const DataStorageUri &uri) {
+    return uri.HasParam("provider_uuid") && IsCanonicalTairMempoolProviderUuid(uri.GetParam("provider_uuid"));
+}
+
 // The allocation token is the per-object generation capability. Provider GA
 // values may be reused within one process for explicit/local DRAM, so node,
 // offset and process incarnation alone are insufficient to authorize GC.
@@ -388,6 +433,156 @@ inline bool HasOwnedKvMetaAllocationShape(const DataStorageUri &uri, DataStorage
 }
 
 inline bool
+TryGetOwnedKvMetaObjectKey(const DataStorageUri &uri, DataStorageType storage_type, std::string &object_key) {
+    object_key.clear();
+    if (storage_type == DataStorageType::DATA_STORAGE_TYPE_MOONCAKE) {
+        if (!uri.HasParam("key")) {
+            return false;
+        }
+        object_key = uri.GetParam("key");
+    } else if (IsTairMempoolStorageType(storage_type)) {
+        if (!uri.HasParam("allocation_token")) {
+            return false;
+        }
+        object_key = uri.GetParam("allocation_token");
+    } else {
+        std::string_view key_view;
+        if (!TryGetCanonicalKvMetaObjectKeyFromPath(uri.GetPath(), key_view)) {
+            return false;
+        }
+        object_key.assign(key_view.data(), key_view.size());
+    }
+    if (!HasCanonicalKvMetaObjectKey(object_key)) {
+        object_key.clear();
+        return false;
+    }
+    return true;
+}
+
+inline bool KvMetaObjectKeyBelongsToInstance(std::string_view object_key,
+                                             std::string_view expected_instance_path_hash) noexcept {
+    constexpr std::string_view kPrefix = "kvmeta/";
+    if (!HasCanonicalKvMetaObjectKey(object_key) || expected_instance_path_hash.empty()) {
+        return false;
+    }
+    const std::size_t instance_end = object_key.find('/', kPrefix.size());
+    return instance_end != std::string_view::npos &&
+           object_key.substr(kPrefix.size(), instance_end - kPrefix.size()) == expected_instance_path_hash;
+}
+
+inline bool KvMetaUriBelongsToInstance(const DataStorageUri &uri,
+                                       DataStorageType storage_type,
+                                       std::string_view expected_instance_path_hash) {
+    std::string object_key;
+    return TryGetOwnedKvMetaObjectKey(uri, storage_type, object_key) &&
+           KvMetaObjectKeyBelongsToInstance(object_key, expected_instance_path_hash);
+}
+
+inline bool KvMetaUriBelongsToObjectKey(const DataStorageUri &uri,
+                                        DataStorageType storage_type,
+                                        std::string_view expected_object_key_prefix) {
+    if (expected_object_key_prefix.empty()) {
+        return false;
+    }
+    std::string object_key;
+    return TryGetOwnedKvMetaObjectKey(uri, storage_type, object_key) &&
+           object_key.size() == expected_object_key_prefix.size() + kKvMetaObjectNonceBytes &&
+           object_key.compare(0, expected_object_key_prefix.size(), expected_object_key_prefix) == 0;
+}
+
+// Physical-slot identity intentionally excludes the PACE allocation token.
+// It detects a provider returning one address to two logical objects in the
+// same operation; generation identity below adds the token for durable delete
+// ownership. Length-prefix textual components to avoid delimiter aliases.
+inline bool
+GetKvMetaPhysicalAllocationIdentity(DataStorageType type, const DataStorageUri &uri, std::string &identity) {
+    identity.clear();
+    if (!HasCanonicalKvMetaAuthority(uri)) {
+        return false;
+    }
+    const auto append_component = [&identity](std::string_view component) {
+        identity.append(std::to_string(component.size()));
+        identity.push_back(':');
+        identity.append(component.data(), component.size());
+    };
+    identity.append(std::to_string(static_cast<int>(type)));
+    identity.push_back('|');
+    append_component(uri.GetHostName());
+    switch (type) {
+    case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
+        if (!uri.HasParam("key") || uri.GetParam("key").empty()) {
+            return false;
+        }
+        append_component(uri.GetParam("key"));
+        return true;
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD: {
+        std::uint64_t offset = 0;
+        if (!HasOwnedKvMetaAllocationShape(uri, type) || !TryGetExactTairMempoolOffset(uri, offset)) {
+            return false;
+        }
+        std::uint16_t node = 0;
+        std::uint16_t media = 0;
+        std::uint16_t range = 0;
+        if (!TryGetTairMempoolUint16ParamOrDefault(uri, "node_id", node) ||
+            !TryGetTairMempoolUint16ParamOrDefault(uri, "media_type", media) ||
+            !TryGetTairMempoolUint16ParamOrDefault(uri, "range_id", range)) {
+            return false;
+        }
+        identity.push_back('|');
+        identity.append(std::to_string(offset));
+        identity.push_back('|');
+        identity.append(std::to_string(node));
+        identity.push_back('|');
+        identity.append(std::to_string(media));
+        identity.push_back('|');
+        identity.append(std::to_string(range));
+        identity.push_back('|');
+        identity.append(uri.GetParam("provider_incarnation"));
+        // Stable provider routing is part of a physical address when present.
+        // Legacy persisted locations may omit it, while every fresh allocation
+        // is validated by HasRequiredTairMempoolProviderUuid before admission.
+        append_component(uri.GetParam("provider_uuid"));
+        return true;
+    }
+    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_NFS:
+    case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
+        if (!HasOwnedKvMetaFilePath(uri)) {
+            return false;
+        }
+        append_component(uri.GetPath());
+        return true;
+    case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2:
+    case DataStorageType::COUNT:
+    default:
+        return false;
+    }
+}
+
+inline bool
+GetKvMetaPhysicalAllocationGenerationIdentity(DataStorageType type, const DataStorageUri &uri, std::string &identity) {
+    if (!GetKvMetaPhysicalAllocationIdentity(type, uri, identity)) {
+        return false;
+    }
+    if (IsTairMempoolStorageType(type)) {
+        if (!HasCanonicalTairMempoolAllocationToken(uri)) {
+            identity.clear();
+            return false;
+        }
+        const std::string token = uri.GetParam("allocation_token");
+        identity.push_back('|');
+        identity.append(std::to_string(token.size()));
+        identity.push_back(':');
+        identity.append(token);
+    }
+    return true;
+}
+
+inline bool
 BuildConfiguredKvMetaObjectPath(const StorageConfig &config, std::string_view object_key, std::string &object_path) {
     object_path.clear();
     if (!HasCanonicalKvMetaObjectKey(object_key)) {
@@ -397,7 +592,7 @@ BuildConfiguredKvMetaObjectPath(const StorageConfig &config, std::string_view ob
     switch (config.type()) {
     case DataStorageType::DATA_STORAGE_TYPE_NFS: {
         const auto spec = std::dynamic_pointer_cast<NfsStorageSpec>(config.storage_spec());
-        if (!spec) {
+        if (!spec || !HasCanonicalKvMetaNfsRootPath(spec->root_path())) {
             return false;
         }
         // NfsBackend uses raw concatenation rather than filesystem::path.
@@ -476,10 +671,15 @@ inline bool HasSafeConfiguredKvMetaNamespace(const StorageConfig &config,
 
     // Exercise the longest URI that KVCM itself can generate rather than a
     // short happy-path sample. This makes registration fail before a backend
-    // allocation when a long configured root fits the sample but not the two
-    // uint64 hashes, size, or singleton blkid in a real location.
-    const std::string object_key =
-        "kvmeta/" + std::string(16, 'f') + "/" + std::string(16, 'f') + "/" + std::string(kKvMetaObjectNonceBytes, 'a');
+    // allocation when a long configured root fits the sample but not the
+    // instance hash, 256-bit key fingerprint, size, or singleton blkid in a
+    // real location.
+    const std::string object_key = "kvmeta/" + std::string(kKvMetaCanonicalUint64MaxHexChars, 'f') + "/" +
+                                   std::string(kKvMetaObjectFingerprintHexChars, 'f') + "/" +
+                                   std::string(kKvMetaObjectNonceBytes, 'a');
+    if (object_key.size() != kKvMetaMaxPhysicalObjectKeyBytes) {
+        return false;
+    }
     const std::string max_uint64 = std::to_string(std::numeric_limits<std::uint64_t>::max());
 
     DataStorageUri sample;

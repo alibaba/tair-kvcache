@@ -104,6 +104,35 @@ public:
 private:
     Shape shape_ = Shape::kShortOuter;
 };
+
+class ScriptedMetadataBackend : public MetaLocalBackend {
+public:
+    void SetMetadata(FieldMap metadata) { metadata_ = std::move(metadata); }
+    void FailNextPuts(int count) { remaining_put_failures_ = count; }
+
+    ErrorCode PutMetaData(const FieldMap &metadata) noexcept override {
+        ++put_calls_;
+        if (remaining_put_failures_ > 0) {
+            --remaining_put_failures_;
+            return EC_IO_ERROR;
+        }
+        metadata_ = metadata;
+        return EC_OK;
+    }
+
+    ErrorCode GetMetaData(FieldMap &out_metadata) noexcept override {
+        out_metadata = metadata_;
+        return metadata_.empty() ? EC_NOENT : EC_OK;
+    }
+
+    int put_calls() const noexcept { return put_calls_; }
+    const FieldMap &metadata() const noexcept { return metadata_; }
+
+private:
+    FieldMap metadata_;
+    int remaining_put_failures_ = 0;
+    int put_calls_ = 0;
+};
 } // namespace
 
 class MetaIndexerTest : public MetaIndexerTestBase, public TESTBASE {
@@ -918,6 +947,83 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
             ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
         }
     }
+}
+
+TEST_F(MetaIndexerTest, RejectsMetadataPersistIntervalThatCannotFitSteadyClockArithmetic) {
+    auto config = std::make_shared<MetaIndexerConfig>();
+    config->SetMaxKeyCount(100);
+    config->SetMutexShardNum(8);
+    config->SetPersistMetaDataIntervalTimeMs(std::numeric_limits<std::size_t>::max());
+    ASSERT_GT(config->GetPersistMetaDataIntervalTimeMs(),
+              static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()));
+
+    meta_indexer_ = std::make_shared<MetaIndexer>();
+    EXPECT_EQ(EC_CONFIG_ERROR, meta_indexer_->Init("overflowing-checkpoint-interval", config));
+    EXPECT_EQ(nullptr, meta_indexer_->backend_manager_);
+}
+
+TEST_F(MetaIndexerTest, TestMetadataPersistFailurePreservesOrdinaryPathCadence) {
+    const std::string config_str = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "persist_metadata_interval_time_ms" : 60000,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    auto backend = std::make_unique<ScriptedMetadataBackend>();
+    auto *backend_ptr = backend.get();
+    meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
+    meta_indexer_->key_count_.store(17);
+    meta_indexer_->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1234);
+    meta_indexer_->last_persist_metadata_time_ = TimestampUtil::GetSteadyTimeMs() - 60001;
+    const int64_t due_timestamp = meta_indexer_->last_persist_metadata_time_;
+    backend_ptr->FailNextPuts(1);
+
+    meta_indexer_->PersistMetaData();
+    EXPECT_EQ(1, backend_ptr->put_calls());
+    EXPECT_GT(meta_indexer_->last_persist_metadata_time_, due_timestamp);
+    const int64_t consumed_timestamp = meta_indexer_->last_persist_metadata_time_;
+
+    // Preserve fixed-block behavior: a best-effort checkpoint failure must
+    // not make every ordinary metadata mutation immediately retry the remote
+    // backend. KVMeta recovery uses PersistMetaDataNow instead.
+    meta_indexer_->PersistMetaData();
+    EXPECT_EQ(1, backend_ptr->put_calls());
+    EXPECT_EQ(consumed_timestamp, meta_indexer_->last_persist_metadata_time_);
+    EXPECT_TRUE(backend_ptr->metadata().empty());
+}
+
+TEST_F(MetaIndexerTest, TestMetadataRecoveryRejectsMissingAndNegativeKeyCountWithoutPublishingIt) {
+    const std::string config_str = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    auto backend = std::make_unique<ScriptedMetadataBackend>();
+    auto *backend_ptr = backend.get();
+    meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
+    meta_indexer_->key_count_.store(9);
+
+    backend_ptr->SetMetadata({{"unrelated", "value"}});
+    EXPECT_EQ(EC_ERROR, meta_indexer_->RecoverMetaData());
+    EXPECT_EQ(9, meta_indexer_->GetKeyCount());
+
+    backend_ptr->SetMetadata({{METADATA_PROPERTY_KEY_COUNT, "-1"}});
+    EXPECT_EQ(EC_ERROR, meta_indexer_->RecoverMetaData());
+    EXPECT_EQ(9, meta_indexer_->GetKeyCount());
+
+    backend_ptr->SetMetadata({{METADATA_PROPERTY_KEY_COUNT, "23"}, {METADATA_PROPERTY_STORAGE_USAGE_DATA, "not-json"}});
+    EXPECT_EQ(EC_ERROR, meta_indexer_->RecoverMetaData());
+    EXPECT_EQ(9, meta_indexer_->GetKeyCount());
+
+    backend_ptr->SetMetadata({{METADATA_PROPERTY_KEY_COUNT, "23"}});
+    EXPECT_EQ(EC_OK, meta_indexer_->RecoverMetaData());
+    EXPECT_EQ(23, meta_indexer_->GetKeyCount());
 }
 
 TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {

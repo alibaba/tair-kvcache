@@ -1,19 +1,24 @@
 #include "kv_cache_manager/manager/kv_meta_manager.h"
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <exception>
+#include <fcntl.h>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string_view>
+#include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -46,8 +51,6 @@ namespace kv_cache_manager {
 
 namespace {
 
-constexpr std::uint64_t kObjectKeyHashSeed = 0x8bc5'1f2d'671a'94e3ULL;
-constexpr std::uint64_t kInstancePathHashSeed = 0x6e91'ca34'0bd7'52f8ULL;
 constexpr std::size_t kRecoveryScanBatchSize = 1000;
 constexpr std::size_t kMaintenanceDeleteBatchSize = 256;
 constexpr std::int64_t kMicrosecondsPerSecond = 1'000'000;
@@ -59,6 +62,65 @@ constexpr std::int64_t kLeaseDeadlineTag = std::int64_t{1} << 62;
 // only just have obtained the URI.
 constexpr std::int64_t kRetirementFenceDeadline = std::numeric_limits<std::int64_t>::max();
 constexpr auto kRecoveryWaitPollInterval = std::chrono::milliseconds(100);
+
+bool GenerateKvMetaCapabilityToken(std::string &token) noexcept {
+    // Physical generations participate in exact-delete fencing and write
+    // session ids authorize a later commit/rollback. Both must remain
+    // unpredictable and unique across process restarts and leader failover; a
+    // process-local PRNG is not an adequate source for either capability.
+    // Sixteen bytes from the kernel CSPRNG produce a 32-character lowercase
+    // token while preserving 128 bits of entropy.
+    std::array<unsigned char, kKvMetaCapabilityTokenEntropyBytes> random_bytes{};
+    errno = 0;
+    const int random_fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (random_fd < 0) {
+        token.clear();
+        return false;
+    }
+    struct stat random_stat{};
+    if (::fstat(random_fd, &random_stat) != 0 || !S_ISCHR(random_stat.st_mode)) {
+        (void)::close(random_fd);
+        token.clear();
+        return false;
+    }
+    std::size_t generated = 0;
+    while (generated < random_bytes.size()) {
+        // The supported build image ships a compatibility sys/random.h whose
+        // inline getrandom() always fails. Read the kernel CSPRNG device
+        // directly instead of allowing that build-time shim to trigger a
+        // weaker userspace fallback.
+        const ssize_t count = ::read(random_fd, random_bytes.data() + generated, random_bytes.size() - generated);
+        if (count > 0) {
+            generated += static_cast<std::size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        (void)::close(random_fd);
+        token.clear();
+        return false;
+    }
+    if (::close(random_fd) != 0) {
+        token.clear();
+        return false;
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::array<char, kKvMetaCapabilityTokenHexChars> encoded{};
+    for (std::size_t i = 0; i < random_bytes.size(); ++i) {
+        encoded[2 * i] = kHex[random_bytes[i] >> 4];
+        encoded[2 * i + 1] = kHex[random_bytes[i] & 0x0fU];
+    }
+    try {
+        token.assign(encoded.data(), encoded.size());
+    } catch (...) {
+        // This helper is deliberately noexcept: memory pressure must reject
+        // admission, never terminate the KVCM process while minting a token.
+        token.clear();
+        return false;
+    }
+    return true;
+}
 
 bool EncodeLeaseDeadline(std::int64_t now_us, std::int64_t timeout_seconds, std::int64_t &encoded_deadline) {
     encoded_deadline = 0;
@@ -161,6 +223,25 @@ ErrorCode FirstHardError(ErrorCode current, ErrorCode candidate) {
         return current;
     }
     return candidate == EC_OK || candidate == EC_NOENT ? EC_OK : candidate;
+}
+
+std::uint64_t GetSaturatedStorageUsage(const std::shared_ptr<MetaIndexer> &indexer) noexcept {
+    if (!indexer) {
+        return 0;
+    }
+    std::uint64_t total = 0;
+    for (std::size_t i = 1; i < static_cast<std::size_t>(DataStorageType::COUNT); ++i) {
+        const auto type = static_cast<DataStorageType>(i);
+        // Match StorageUsageData::GetStorageUsage: aliases and event-report
+        // accounting are not physical cache-capacity domains.
+        if (ToBaseType(type) != type || IsEventReportStorageType(type)) {
+            continue;
+        }
+        const std::uint64_t value = indexer->GetStorageUsageByType(type);
+        total = value > std::numeric_limits<std::uint64_t>::max() - total ? std::numeric_limits<std::uint64_t>::max()
+                                                                          : total + value;
+    }
+    return total;
 }
 
 std::vector<std::vector<std::size_t>> MakeUniqueKeyLayers(const std::vector<std::int64_t> &keys) {
@@ -334,10 +415,11 @@ bool UriNamesCreatedKvMetaObject(const DataStorageUri &uri,
         return uri.GetParam("key") == object_key;
     }
     if (IsTairMempoolStorageType(storage_type)) {
-        // The allocator returns an opaque physical address; current PACE URIs
-        // do not carry the logical allocation key. Address shape and exact
-        // operation cardinality are the strongest V1 ownership evidence.
-        return true;
+        // A fresh response must bind both its generation token and stable
+        // provider route to this exact allocation request. Optional UUID
+        // handling elsewhere exists only for rolling-upgrade recovery of old
+        // persisted locations.
+        return uri.GetParam("allocation_token") == object_key && HasRequiredTairMempoolProviderUuid(uri);
     }
     switch (storage_type) {
     case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
@@ -360,7 +442,7 @@ bool UriBelongsToKvMetaNamespace(const DataStorageUri &uri,
                                  const std::shared_ptr<DataStorageBackend> &backend,
                                  DataStorageType storage_type,
                                  const std::string &internal_instance_id,
-                                 std::int64_t internal_key) {
+                                 std::string_view original_key) {
     if (!backend) {
         return false;
     }
@@ -370,47 +452,43 @@ bool UriBelongsToKvMetaNamespace(const DataStorageUri &uri,
         !UriMatchesConfiguredKvMetaNamespace(uri, storage_type, config)) {
         return false;
     }
-    if (IsTairMempoolStorageType(storage_type)) {
-        return true;
+    const std::string object_key_prefix = BuildKvMetaObjectKeyPrefixFromInternal(internal_instance_id, original_key);
+    const std::string legacy_object_key_prefix =
+        BuildKvMetaLegacyObjectKeyPrefixFromInternal(internal_instance_id, original_key);
+    std::string object_key;
+    if (object_key_prefix.empty() || legacy_object_key_prefix.empty() ||
+        !TryGetOwnedKvMetaObjectKey(uri, storage_type, object_key)) {
+        return false;
     }
-    const std::uint64_t instance_path_hash =
-        Hash64(internal_instance_id.data(), internal_instance_id.size(), kInstancePathHashSeed);
-    const std::string object_key_prefix = "kvmeta/" + StringUtil::Uint64ToHex(instance_path_hash) + "/" +
-                                          StringUtil::Uint64ToHex(static_cast<std::uint64_t>(internal_key)) + "/";
-    const auto get_expected_key =
-        [&](std::string_view value, bool require_leading_slash, std::string_view &object_key) {
-            object_key = {};
-            const std::size_t expected_size = object_key_prefix.size() + kKvMetaObjectNonceBytes;
-            if (value.size() < expected_size) {
-                return false;
-            }
-            const std::size_t key_begin = value.size() - expected_size;
-            if ((require_leading_slash && (key_begin == 0 || value[key_begin - 1] != '/')) ||
-                value.compare(key_begin, object_key_prefix.size(), object_key_prefix) != 0) {
-                return false;
-            }
-            if (value.substr(key_begin + object_key_prefix.size()).size() != kKvMetaObjectNonceBytes ||
-                !HasCanonicalKvMetaObjectKey(value.substr(key_begin, expected_size))) {
-                return false;
-            }
-            object_key = value.substr(key_begin, expected_size);
-            return true;
-        };
+    const auto has_prefix = [&object_key](std::string_view prefix) {
+        return object_key.size() == prefix.size() + kKvMetaObjectNonceBytes &&
+               object_key.compare(0, prefix.size(), prefix.data(), prefix.size()) == 0;
+    };
+    // Legacy 64-bit names remain deletable/recoverable during a rolling
+    // upgrade. New writes always use the instance-bound 256-bit prefix, and
+    // the high-level client prefers that stronger identity. It accepts this
+    // exact key's legacy prefix only while old cache generations drain during
+    // a rolling upgrade; the complete-key metadata identity remains the
+    // authoritative ownership check in both formats.
+    if (!has_prefix(object_key_prefix) && !has_prefix(legacy_object_key_prefix)) {
+        return false;
+    }
     if (storage_type == DataStorageType::DATA_STORAGE_TYPE_MOONCAKE) {
-        const std::string &physical_key = uri.GetParam("key");
-        std::string_view object_key;
-        return get_expected_key(physical_key, false, object_key) && object_key.size() == physical_key.size() &&
-               uri.GetParam("key") == object_key;
+        return uri.GetParam("key") == object_key;
+    }
+    if (IsTairMempoolStorageType(storage_type)) {
+        // The allocation token is both a generation capability and the
+        // logical owner key. Recovery must not accept a well-formed token from
+        // another instance/key merely because its physical address is valid.
+        return uri.GetParam("allocation_token") == object_key;
     }
     switch (storage_type) {
     case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
     case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
     case DataStorageType::DATA_STORAGE_TYPE_NFS:
     case DataStorageType::DATA_STORAGE_TYPE_DUMMY: {
-        std::string_view object_key;
         std::string expected_path;
-        return get_expected_key(uri.GetPath(), true, object_key) &&
-               BuildConfiguredKvMetaObjectPath(config, object_key, expected_path) && uri.GetPath() == expected_path;
+        return BuildConfiguredKvMetaObjectPath(config, object_key, expected_path) && uri.GetPath() == expected_path;
     }
     case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN:
     case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5:
@@ -470,69 +548,7 @@ bool IsRetiredObject(const CacheLocation &location) {
 }
 
 bool GetPhysicalAllocationIdentity(DataStorageType type, const DataStorageUri &uri, std::string &identity) {
-    identity.clear();
-    if (!HasCanonicalKvMetaAuthority(uri)) {
-        return false;
-    }
-    const auto append_component = [&identity](std::string_view component) {
-        identity.append(std::to_string(component.size()));
-        identity.push_back(':');
-        identity.append(component.data(), component.size());
-    };
-    identity.append(std::to_string(static_cast<int>(type)));
-    identity.push_back('|');
-    append_component(uri.GetHostName());
-    switch (type) {
-    case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
-        // Mooncake Delete addresses an object only by its key; path and size
-        // are not part of physical identity.
-        if (uri.GetParam("key").empty()) {
-            return false;
-        }
-        append_component(uri.GetParam("key"));
-        return true;
-    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
-    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD: {
-        std::uint64_t offset = 0;
-        if (!HasOwnedKvMetaAllocationShape(uri, type) || !TryGetExactTairMempoolOffset(uri, offset)) {
-            return false;
-        }
-        std::uint16_t node = 0;
-        std::uint16_t media = 0;
-        std::uint16_t range = 0;
-        uri.GetParamAs("node_id", node);
-        uri.GetParamAs("media_type", media);
-        uri.GetParamAs("range_id", range);
-        identity.push_back('|');
-        identity.append(std::to_string(offset));
-        identity.push_back('|');
-        identity.append(std::to_string(node));
-        identity.push_back('|');
-        identity.append(std::to_string(media));
-        identity.push_back('|');
-        identity.append(std::to_string(range));
-        identity.push_back('|');
-        identity.append(uri.GetParam("provider_incarnation"));
-        return true;
-    }
-    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
-    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
-    case DataStorageType::DATA_STORAGE_TYPE_NFS:
-    case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
-        // These backends delete the file/object selected by path. KVMeta only
-        // accepts singleton blkid=0, so query size is metadata, not identity.
-        if (!HasOwnedKvMetaFilePath(uri)) {
-            return false;
-        }
-        append_component(uri.GetPath());
-        return true;
-    case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN:
-    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5:
-    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2:
-    case DataStorageType::COUNT:
-    default:
-        return false;
-    }
+    return GetKvMetaPhysicalAllocationIdentity(type, uri, identity);
 }
 
 // A physical slot and a deletable allocation generation are deliberately
@@ -541,21 +557,7 @@ bool GetPhysicalAllocationIdentity(DataStorageType type, const DataStorageUri &u
 // carries the token so an old tombstone cannot suppress cleanup of, or be
 // mistaken for, a successor generation at a reused GA.
 bool GetPhysicalAllocationGenerationIdentity(DataStorageType type, const DataStorageUri &uri, std::string &identity) {
-    if (!GetPhysicalAllocationIdentity(type, uri, identity)) {
-        return false;
-    }
-    if (IsTairMempoolStorageType(type)) {
-        if (!HasCanonicalTairMempoolAllocationToken(uri)) {
-            identity.clear();
-            return false;
-        }
-        const std::string token = uri.GetParam("allocation_token");
-        identity.push_back('|');
-        identity.append(std::to_string(token.size()));
-        identity.push_back(':');
-        identity.append(token);
-    }
-    return true;
+    return GetKvMetaPhysicalAllocationGenerationIdentity(type, uri, identity);
 }
 
 bool GetPhysicalAllocationIdentity(const CacheLocation &location, std::string &identity) {
@@ -1000,6 +1002,13 @@ private:
 // exact-value guards and group admission shards that protect KVMeta's stable
 // location ids from ABA races.
 class KvMetaReclaimer {
+    struct BackendCapacityUnits {
+        std::uint64_t bytes = 0;
+        std::uint64_t objects = 0;
+
+        bool Any() const noexcept { return bytes != 0 || objects != 0; }
+    };
+
 public:
     explicit KvMetaReclaimer(KvMetaManager *owner) : owner_(owner) { RegisterMetrics(); }
     ~KvMetaReclaimer() { StopAndJoin(); }
@@ -1059,6 +1068,7 @@ public:
         admission_demands_.clear();
         pending_batches_.clear();
         sampling_rotation_by_group_.clear();
+        backend_scan_cursor_by_instance_.clear();
         pending_object_count_ = 0;
         pending_bytes_ = 0;
         UpdatePendingMetricsLocked();
@@ -1109,12 +1119,14 @@ public:
                                   std::uint64_t requested_bytes,
                                   const std::string &internal_instance_id = {},
                                   std::uint64_t requested_keys = 0,
-                                  bool backend_capacity_failure = false) noexcept {
-        if (instance_group.empty() || (requested_bytes == 0 && requested_keys == 0) ||
+                                  const std::string &backend_name = {},
+                                  std::uint64_t requested_backend_objects = 0) noexcept {
+        const bool backend_capacity_failure = !backend_name.empty();
+        if (instance_group.empty() || (requested_bytes == 0 && requested_keys == 0 && requested_backend_objects == 0) ||
             (requested_keys != 0 && internal_instance_id.empty()) ||
-            (backend_capacity_failure &&
-             (requested_bytes == 0 || storage_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN ||
-              requested_keys != 0))) {
+            (backend_capacity_failure && ((requested_bytes == 0 && requested_backend_objects == 0) ||
+                                          !IsCanonicalKvMetaBackendName(backend_name) || requested_keys != 0)) ||
+            (!backend_capacity_failure && requested_backend_objects != 0)) {
             return;
         }
         try {
@@ -1127,30 +1139,54 @@ public:
                 // demand. A failed allocation must not leave a sequence-zero
                 // entry that can neither be observed as new nor cleared.
                 const auto [demand_it, inserted_group] = admission_demands_.try_emplace(instance_group);
+                bool inserted_instance = false;
+                bool inserted_backend = false;
                 try {
                     if (requested_keys != 0) {
-                        demand_it->second.requested_keys_by_instance.try_emplace(internal_instance_id, 0);
+                        inserted_instance =
+                            demand_it->second.requested_keys_by_instance.try_emplace(internal_instance_id, 0).second;
+                    }
+                    if (backend_capacity_failure) {
+                        inserted_backend = demand_it->second.backend_reclaim_capacity.try_emplace(backend_name).second;
                     }
                 } catch (...) {
                     if (inserted_group) {
                         admission_demands_.erase(demand_it);
+                    } else {
+                        if (inserted_instance) {
+                            demand_it->second.requested_keys_by_instance.erase(internal_instance_id);
+                        }
+                        if (inserted_backend) {
+                            demand_it->second.backend_reclaim_capacity.erase(backend_name);
+                        }
                     }
                     throw;
                 }
                 auto &demand = demand_it->second;
+                if (inserted_backend) {
+                    if (++next_backend_demand_epoch_ == 0) {
+                        ++next_backend_demand_epoch_;
+                    }
+                    demand.backend_reclaim_capacity.find(backend_name)->second.scan_epoch = next_backend_demand_epoch_;
+                }
                 if (!backend_capacity_failure) {
                     demand.requested_group_bytes = std::max(demand.requested_group_bytes, requested_bytes);
                 }
-                if (requested_bytes != 0 && storage_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
+                if (!backend_capacity_failure && requested_bytes != 0 &&
+                    storage_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
                     const std::size_t type_index = ToIndex(ToBaseType(storage_type));
                     if (type_index < demand.requested_bytes_by_type.size()) {
-                        auto &type_bytes = backend_capacity_failure ? demand.backend_reclaim_bytes_by_type[type_index]
-                                                                    : demand.requested_bytes_by_type[type_index];
+                        auto &type_bytes = demand.requested_bytes_by_type[type_index];
                         // A retry burst represents overlapping demand, not
                         // additive capacity. Keep the largest unsatisfied
                         // request so retries cannot evict the entire cache.
                         type_bytes = std::max(type_bytes, requested_bytes);
                     }
+                }
+                if (backend_capacity_failure) {
+                    auto &backend = demand.backend_reclaim_capacity.find(backend_name)->second;
+                    backend.bytes = std::max(backend.bytes, requested_bytes);
+                    backend.objects = std::max(backend.objects, requested_backend_objects);
                 }
                 if (requested_keys != 0) {
                     auto &instance_keys = demand.requested_keys_by_instance.find(internal_instance_id)->second;
@@ -1172,7 +1208,9 @@ public:
             condition_.notify_all();
         } catch (const std::exception &e) {
             KVCM_LOG_WARN("failed to publish KVMeta admission demand: %s", e.what());
-        } catch (...) { KVCM_LOG_WARN("failed to publish KVMeta admission demand with unknown exception"); }
+        } catch (...) {
+            KVCM_LOG_WARN("failed to publish KVMeta admission demand with unknown exception");
+        }
     }
 
     // Publish physical-backend pressure only after a backend has
@@ -1180,9 +1218,147 @@ public:
     // This is deliberately separate from logical quota admission: a shared
     // Provider can be full while this KVCM group remains below its quota.
     void RequestBackendCapacity(const std::string &instance_group,
-                                DataStorageType storage_type,
-                                std::uint64_t requested_bytes) noexcept {
-        RequestAdmissionCapacity(instance_group, storage_type, requested_bytes, {}, 0, true);
+                                const std::string &backend_name,
+                                std::uint64_t requested_bytes,
+                                std::uint64_t requested_objects = 0) noexcept {
+        RequestAdmissionCapacity(instance_group,
+                                 DataStorageType::DATA_STORAGE_TYPE_UNKNOWN,
+                                 requested_bytes,
+                                 {},
+                                 0,
+                                 backend_name,
+                                 requested_objects);
+    }
+
+    // Adopt an already-durable exact-delete tombstone created by a foreground
+    // operation. This closes the ownership gap between consuming a write
+    // session and a transient backend Delete failure: the current leader keeps
+    // retrying online, while the same durable tombstone remains the restart
+    // recovery ledger. Returning true is a strong guarantee that every item
+    // was published in the pending indexes before the caller releases its
+    // group admission shard.
+    bool AdoptDurableCleanup(const std::string &internal_instance_id,
+                             const std::vector<KvMetaManager::SessionItem> &items) noexcept {
+        if (!owner_ || internal_instance_id.empty() || items.empty() ||
+            owner_->maintenance_cancelled_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        try {
+            RequestContext request_context("kv_meta_reclaimer_adopt_cleanup");
+            const auto instance = owner_->registry_manager_->GetInstanceInfo(&request_context, internal_instance_id);
+            if (!instance || !IsKvMetaInstance(*instance) || instance->instance_group_name().empty()) {
+                return false;
+            }
+            std::vector<RetiredItem> retired;
+            retired.reserve(items.size());
+            std::map<std::int64_t, std::vector<std::size_t>> retired_indices_by_key;
+            for (const auto &item : items) {
+                if (!item.metadata_location || !item.data_location || item.location_id.empty() ||
+                    item.value_size == 0 || !IsRetiredObject(*item.metadata_location) ||
+                    !SamePhysicalAllocation(*item.metadata_location, *item.data_location) ||
+                    item.data_location->location_specs().size() != 1) {
+                    return false;
+                }
+                const DataStorageUri uri(item.data_location->location_specs().front().uri());
+                const std::string backend_name = uri.GetHostName();
+                if (!uri.Valid() || !IsCanonicalKvMetaBackendName(backend_name)) {
+                    return false;
+                }
+                retired.push_back(RetiredItem{internal_instance_id,
+                                              item,
+                                              backend_name,
+                                              /*removes_metadata_key=*/false,
+                                              /*metadata_durable=*/true});
+                retired_indices_by_key[item.internal_key].push_back(retired.size() - 1);
+            }
+
+            // Pending key credit must be exact. Hash collisions can place
+            // several user keys under one primary metadata key, so credit it
+            // only when this handoff owns every current location in that
+            // bucket. Failure to prove this is safe: bytes remain credited,
+            // while key pressure may conservatively wait or evict one extra
+            // entry rather than ever over-admit.
+            const auto indexer = owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(internal_instance_id);
+            if (indexer && !retired_indices_by_key.empty()) {
+                KeyVector internal_keys;
+                internal_keys.reserve(retired_indices_by_key.size());
+                for (const auto &[internal_key, _] : retired_indices_by_key) {
+                    internal_keys.push_back(internal_key);
+                }
+                CacheLocationMapVector location_maps;
+                const auto location_result =
+                    indexer->GetLocationMapsForMaintenance(&request_context, internal_keys, location_maps);
+                if (location_result.error_codes.size() == internal_keys.size() &&
+                    location_maps.size() == internal_keys.size()) {
+                    for (std::size_t key_index = 0; key_index < internal_keys.size(); ++key_index) {
+                        if (location_result.error_codes[key_index] != EC_OK) {
+                            continue;
+                        }
+                        const auto &indices = retired_indices_by_key.at(internal_keys[key_index]);
+                        const auto &locations = location_maps[key_index];
+                        const bool owns_complete_key =
+                            locations.size() == indices.size() &&
+                            std::all_of(indices.begin(), indices.end(), [&](const auto i) {
+                                const auto it = locations.find(retired[i].item.location_id);
+                                return it != locations.end() && it->second &&
+                                       it->second->ToJsonString() == retired[i].item.metadata_location->ToJsonString();
+                            });
+                        if (owns_complete_key) {
+                            retired[indices.back()].removes_metadata_key = true;
+                        }
+                    }
+                }
+            }
+            const std::size_t quota_shard =
+                std::hash<std::string>{}(instance->instance_group_name()) % owner_->quota_admission_mutexes_.size();
+            AddPendingBatch(
+                instance->instance_group_name(), quota_shard, std::chrono::steady_clock::now(), std::move(retired));
+            return true;
+        } catch (const std::exception &e) {
+            KVCM_LOG_ERROR("failed to adopt durable KVMeta cleanup for online retry: %s", e.what());
+        } catch (...) {
+            KVCM_LOG_ERROR("failed to adopt durable KVMeta cleanup for online retry");
+        }
+        return false;
+    }
+
+    // A foreground Remove/session-abort/Trim follows the same durable
+    // tombstone -> exact physical absence ordering as background reclaim. If
+    // it confirms absence, those bytes are just as real a capacity release as
+    // a Reclaimer deletion and must consume any outstanding backend ENOSPC
+    // demand. Allocation success alone is deliberately not used as evidence:
+    // a smaller or concurrent allocation can succeed while the rejected
+    // request still cannot fit.
+    void ConfirmOwnedCapacityFreed(const std::string &internal_instance_id,
+                                   const std::vector<KvMetaManager::SessionItem> &items) noexcept {
+        if (!owner_ || internal_instance_id.empty() || items.empty()) {
+            return;
+        }
+        try {
+            RequestContext request_context("kv_meta_reclaimer_confirm_foreground_delete");
+            const auto instance = owner_->registry_manager_->GetInstanceInfo(&request_context, internal_instance_id);
+            if (!instance || !IsKvMetaInstance(*instance) || instance->instance_group_name().empty()) {
+                return;
+            }
+            std::map<std::string, BackendCapacityUnits> freed_by_backend;
+            for (const auto &item : items) {
+                if (!item.data_location || item.value_size == 0 || item.data_location->location_specs().size() != 1) {
+                    continue;
+                }
+                const DataStorageUri uri(item.data_location->location_specs().front().uri());
+                if (!uri.Valid() || !IsCanonicalKvMetaBackendName(uri.GetHostName())) {
+                    continue;
+                }
+                auto &freed = freed_by_backend[uri.GetHostName()];
+                freed.bytes = SaturatingAdd(freed.bytes, item.value_size);
+                freed.objects = SaturatingAdd(freed.objects, 1);
+            }
+            ConfirmBackendCapacityFreed(instance->instance_group_name(), freed_by_backend);
+        } catch (...) {
+            // Capacity demand is advisory and conservative. Missing this
+            // credit can evict extra cache data, but must never terminate a
+            // successful owner deletion or reopen admission unsafely.
+        }
     }
 
 private:
@@ -1216,6 +1392,8 @@ private:
             admission_demand_count_metrics_ = registry->GetCounter("kv_meta_reclaimer.admission_demand_count");
             backend_capacity_demand_count_metrics_ =
                 registry->GetCounter("kv_meta_reclaimer.backend_capacity_demand_count");
+            backend_capacity_unowned_demand_count_metrics_ =
+                registry->GetCounter("kv_meta_reclaimer.backend_capacity_unowned_demand_count");
             physical_delete_attempted_object_count_metrics_ =
                 registry->GetCounter("kv_meta_reclaimer.physical_delete_attempted_object_count");
             physical_delete_uncertain_object_count_metrics_ =
@@ -1229,11 +1407,15 @@ private:
                 registry->GetGauge("kv_meta_reclaimer.admission_demand_group_count");
             backend_capacity_demand_bytes_metrics_ =
                 registry->GetGauge("kv_meta_reclaimer.backend_capacity_demand_bytes");
+            backend_capacity_demand_objects_metrics_ =
+                registry->GetGauge("kv_meta_reclaimer.backend_capacity_demand_objects");
             UpdatePendingMetricsLocked();
             UpdateAdmissionDemandMetricsLocked();
         } catch (const std::exception &e) {
             KVCM_LOG_WARN("failed to register KVMeta reclaimer metrics: %s", e.what());
-        } catch (...) { KVCM_LOG_WARN("failed to register KVMeta reclaimer metrics with unknown exception"); }
+        } catch (...) {
+            KVCM_LOG_WARN("failed to register KVMeta reclaimer metrics with unknown exception");
+        }
     }
 
     void UpdatePendingMetricsLocked() noexcept {
@@ -1249,19 +1431,24 @@ private:
 
     void UpdateAdmissionDemandMetricsLocked() noexcept {
         std::uint64_t backend_bytes = 0;
+        std::uint64_t backend_objects = 0;
         for (const auto &[_, demand] : admission_demands_) {
-            for (const std::uint64_t bytes : demand.backend_reclaim_bytes_by_type) {
-                backend_bytes = SaturatingAdd(backend_bytes, bytes);
+            for (const auto &[backend_name, backend] : demand.backend_reclaim_capacity) {
+                (void)backend_name;
+                backend_bytes = SaturatingAdd(backend_bytes, backend.bytes);
+                backend_objects = SaturatingAdd(backend_objects, backend.objects);
             }
         }
         admission_demand_group_count_metrics_ = static_cast<double>(admission_demands_.size());
         backend_capacity_demand_bytes_metrics_ = static_cast<double>(backend_bytes);
+        backend_capacity_demand_objects_metrics_ = static_cast<double>(backend_objects);
     }
 
     struct Pressure {
         std::uint64_t group_bytes = 0;
         std::uint64_t keys = 0;
         std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type{};
+        std::map<std::string, BackendCapacityUnits> capacity_by_backend;
         std::map<std::string, std::uint64_t> keys_by_instance;
 
         bool Any() const noexcept {
@@ -1270,16 +1457,26 @@ private:
             }
             return std::any_of(
                        bytes_by_type.begin(), bytes_by_type.end(), [](std::uint64_t value) { return value != 0; }) ||
+                   std::any_of(capacity_by_backend.begin(),
+                               capacity_by_backend.end(),
+                               [](const auto &entry) { return entry.second.Any(); }) ||
                    std::any_of(keys_by_instance.begin(), keys_by_instance.end(), [](const auto &entry) {
                        return entry.second != 0;
                    });
         }
 
-        void Consume(DataStorageType type, std::uint64_t bytes) noexcept {
+        void Consume(DataStorageType type, const std::string &backend_name, std::uint64_t bytes) noexcept {
             group_bytes = bytes >= group_bytes ? 0 : group_bytes - bytes;
             const std::size_t type_index = ToIndex(ToBaseType(type));
             if (type_index < bytes_by_type.size()) {
                 bytes_by_type[type_index] = bytes >= bytes_by_type[type_index] ? 0 : bytes_by_type[type_index] - bytes;
+            }
+            const auto backend_it = capacity_by_backend.find(backend_name);
+            if (backend_it != capacity_by_backend.end()) {
+                backend_it->second.bytes = bytes >= backend_it->second.bytes ? 0 : backend_it->second.bytes - bytes;
+                if (backend_it->second.objects != 0) {
+                    --backend_it->second.objects;
+                }
             }
         }
 
@@ -1298,6 +1495,7 @@ private:
         std::string internal_instance_id;
         std::int64_t internal_key = 0;
         std::string location_id;
+        std::string backend_name;
         CacheLocationConstPtr location;
         std::uint64_t value_size = 0;
         bool removes_metadata_key = false;
@@ -1314,6 +1512,7 @@ private:
     struct RetiredItem {
         std::string internal_instance_id;
         KvMetaManager::SessionItem item;
+        std::string backend_name;
         bool removes_metadata_key = false;
         bool metadata_durable = false;
         // Set only after this pending batch's exact compare-and-delete was
@@ -1326,6 +1525,7 @@ private:
         std::uint64_t bytes = 0;
         std::uint64_t keys = 0;
         std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type{};
+        std::map<std::string, BackendCapacityUnits> capacity_by_backend;
         std::map<std::string, std::uint64_t> keys_by_instance;
         // The entry is created when the batch is enqueued, before a metadata
         // cleanup can fail. Finalization can therefore close admission without
@@ -1333,13 +1533,23 @@ private:
         std::size_t blocked_batch_count = 0;
     };
 
+    struct BackendCapacityDemand {
+        std::uint64_t bytes = 0;
+        std::uint64_t objects = 0;
+        // Stable while one outstanding signal remains armed. Repeated client
+        // retries raise bytes/sequence but do not invalidate a bounded full
+        // namespace scan already in progress; after the demand is satisfied
+        // and later re-created, a new epoch requires fresh absence evidence.
+        std::uint64_t scan_epoch = 0;
+    };
+
     struct AdmissionDemand {
         std::uint64_t requested_group_bytes = 0;
         std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> requested_bytes_by_type{};
-        // Remaining bytes that a concrete backend EC_NOSPC asked us to free.
-        // Pending tombstones cover this demand while their physical deletion
-        // is in flight; only confirmed physical absence consumes it.
-        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> backend_reclaim_bytes_by_type{};
+        // Remaining bytes/objects that a concrete backend EC_NOSPC asked us to
+        // free. Pending tombstones cover this demand while their physical
+        // deletion is in flight; only confirmed physical absence consumes it.
+        std::map<std::string, BackendCapacityDemand> backend_reclaim_capacity;
         std::map<std::string, std::uint64_t> requested_keys_by_instance;
         std::uint64_t sequence = 0;
     };
@@ -1432,7 +1642,9 @@ private:
             RequestContext request_context("kv_meta_reclaimer_config");
             return std::max<std::uint32_t>(
                 1, owner_->cache_manager_->cache_reclaimer()->GetSleepIntervalMs(&request_context));
-        } catch (...) { return 100; }
+        } catch (...) {
+            return 100;
+        }
     }
 
     std::pair<std::size_t, std::size_t> SamplingAndBatchSize() const noexcept {
@@ -1443,7 +1655,9 @@ private:
             RequestContext request_context("kv_meta_reclaimer_config");
             return {owner_->cache_manager_->cache_reclaimer()->GetSamplingSize(&request_context),
                     owner_->cache_manager_->cache_reclaimer()->GetBatchingSize(&request_context)};
-        } catch (...) { return {0, 0}; }
+        } catch (...) {
+            return {0, 0};
+        }
     }
 
     PendingCredit GetPendingCredit(const std::string &instance_group) const {
@@ -1476,19 +1690,9 @@ private:
     }
 
     void ConfirmBackendCapacityFreed(const std::string &instance_group,
-                                     const std::vector<RetiredItem> &items) noexcept {
-        if (instance_group.empty() || items.empty()) {
+                                     const std::map<std::string, BackendCapacityUnits> &freed_by_backend) noexcept {
+        if (instance_group.empty() || freed_by_backend.empty()) {
             return;
-        }
-        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> freed_by_type{};
-        for (const auto &item : items) {
-            if (!item.item.data_location) {
-                continue;
-            }
-            const std::size_t type_index = ToIndex(ToBaseType(item.item.data_location->type()));
-            if (type_index < freed_by_type.size()) {
-                freed_by_type[type_index] = SaturatingAdd(freed_by_type[type_index], item.item.value_size);
-            }
         }
         try {
             {
@@ -1497,9 +1701,16 @@ private:
                 if (demand_it == admission_demands_.end()) {
                     return;
                 }
-                for (std::size_t i = 0; i < freed_by_type.size(); ++i) {
-                    demand_it->second.backend_reclaim_bytes_by_type[i] =
-                        SaturatingSub(demand_it->second.backend_reclaim_bytes_by_type[i], freed_by_type[i]);
+                for (const auto &[backend_name, freed] : freed_by_backend) {
+                    const auto backend_it = demand_it->second.backend_reclaim_capacity.find(backend_name);
+                    if (backend_it == demand_it->second.backend_reclaim_capacity.end()) {
+                        continue;
+                    }
+                    backend_it->second.bytes = SaturatingSub(backend_it->second.bytes, freed.bytes);
+                    backend_it->second.objects = SaturatingSub(backend_it->second.objects, freed.objects);
+                    if (backend_it->second.bytes == 0 && backend_it->second.objects == 0) {
+                        demand_it->second.backend_reclaim_capacity.erase(backend_it);
+                    }
                 }
                 UpdateAdmissionDemandMetricsLocked();
                 // Let the worker clear a now-satisfied demand or continue any
@@ -1512,6 +1723,31 @@ private:
             // This path performs no allocation today. If a future container
             // change introduces one, retaining a conservative demand is safe:
             // it may reclaim extra cache, but cannot admit over capacity.
+        }
+    }
+
+    void ConfirmBackendCapacityFreed(const std::string &instance_group,
+                                     const std::vector<RetiredItem> &items) noexcept {
+        if (instance_group.empty() || items.empty()) {
+            return;
+        }
+        try {
+            // Building this aggregate may allocate. Keep it inside the
+            // noexcept boundary so memory pressure cannot terminate KVCM after
+            // physical deletion has already succeeded.
+            std::map<std::string, BackendCapacityUnits> freed_by_backend;
+            for (const auto &item : items) {
+                if (item.backend_name.empty()) {
+                    continue;
+                }
+                auto &freed = freed_by_backend[item.backend_name];
+                freed.bytes = SaturatingAdd(freed.bytes, item.item.value_size);
+                freed.objects = SaturatingAdd(freed.objects, 1);
+            }
+            ConfirmBackendCapacityFreed(instance_group, freed_by_backend);
+        } catch (...) {
+            // Retaining a conservative demand is safe and will be retried by
+            // a later confirmed delete or rejected allocation.
         }
     }
 
@@ -1562,7 +1798,10 @@ private:
                 AddError(request_context, "KVMeta reclaimer could not read an instance indexer");
                 return false;
             }
-            group_usage = SaturatingAdd(group_usage, indexer->GetStorageUsage());
+            // StorageUsageData's legacy aggregate uses ordinary uint64
+            // addition. Keep KVMeta quota/GC fail-closed if several corrupt
+            // or near-limit type counters would wrap that aggregate.
+            group_usage = SaturatingAdd(group_usage, GetSaturatedStorageUsage(indexer));
             key_count = SaturatingAdd(key_count, static_cast<std::uint64_t>(indexer->GetKeyCount()));
             max_key_count = SaturatingAdd(max_key_count, static_cast<std::uint64_t>(indexer->GetMaxKeyCount()));
             key_count_by_instance[instance->instance_id()] = static_cast<std::uint64_t>(indexer->GetKeyCount());
@@ -1624,15 +1863,8 @@ private:
         // the group has ample total quota and no type quota at all. Target the
         // failed physical type in that case too; otherwise the demand would be
         // discarded and a valid cache could never make progress.
-        for (std::size_t type_index = 1; type_index < demand.backend_reclaim_bytes_by_type.size(); ++type_index) {
-            const std::uint64_t backend_remaining = demand.backend_reclaim_bytes_by_type[type_index];
-            if (backend_remaining == 0) {
-                continue;
-            }
-            const auto type = static_cast<DataStorageType>(type_index);
-            if (ToBaseType(type) != type) {
-                demand_possible = false;
-                demand_satisfied = false;
+        for (const auto &[backend_name, backend_demand] : demand.backend_reclaim_capacity) {
+            if (backend_demand.bytes == 0 && backend_demand.objects == 0) {
                 continue;
             }
             // A retired object is already unavailable to readers but its
@@ -1640,19 +1872,22 @@ private:
             // deletion is confirmed. Treat pending bytes as reserved work so
             // request retries cannot schedule duplicate eviction.
             demand_satisfied = false;
-            const std::uint64_t inflight = credit.bytes_by_type[type_index];
-            const std::uint64_t uncovered = SaturatingSub(backend_remaining, inflight);
-            if (uncovered == 0) {
+            const auto credit_it = credit.capacity_by_backend.find(backend_name);
+            const BackendCapacityUnits inflight =
+                credit_it == credit.capacity_by_backend.end() ? BackendCapacityUnits{} : credit_it->second;
+            BackendCapacityUnits uncovered;
+            uncovered.bytes = SaturatingSub(backend_demand.bytes, inflight.bytes);
+            uncovered.objects = SaturatingSub(backend_demand.objects, inflight.objects);
+            if (!uncovered.Any()) {
                 continue;
             }
-            const std::uint64_t reclaimable = std::min(uncovered, usage_by_type[type_index]);
-            out.bytes_by_type[type_index] = std::max(out.bytes_by_type[type_index], reclaimable);
-            if (reclaimable == 0) {
-                // There is no object of this type left that this KVCM group is
-                // authorized to delete. A retry may publish a fresh demand
-                // after external capacity changes.
-                demand_possible = false;
-            }
+            // Exact per-backend usage is intentionally derived from sampled
+            // immutable ownership URIs, not estimated from the type-level
+            // quota ledger. This prevents a full backend from evicting bytes
+            // on a different backend that happens to share its storage type.
+            auto &backend_pressure = out.capacity_by_backend[backend_name];
+            backend_pressure.bytes = std::max(backend_pressure.bytes, uncovered.bytes);
+            backend_pressure.objects = std::max(backend_pressure.objects, uncovered.objects);
         }
         for (const auto &[instance_id, requested_keys] : demand.requested_keys_by_instance) {
             const auto used_it = key_count_by_instance.find(instance_id);
@@ -1675,6 +1910,149 @@ private:
             ClearAdmissionDemandIfCurrent(group.name(), demand.sequence);
         }
         return true;
+    }
+
+    bool ScanReclaimCandidatesForBackendPressure(RequestContext *request_context,
+                                                 const std::string &instance_group,
+                                                 const std::shared_ptr<MetaIndexer> &indexer,
+                                                 const std::string &internal_instance_id,
+                                                 std::size_t key_budget,
+                                                 ReclaimCandidateVector &out) {
+        out.clear();
+        if (!indexer || key_budget == 0) {
+            return false;
+        }
+        const auto cursor_key = std::make_pair(instance_group, internal_instance_id);
+        auto &scan_state = backend_scan_cursor_by_instance_[cursor_key];
+        const auto reset_current_pass = [&scan_state]() {
+            scan_state.pass_started = false;
+            scan_state.pass_valid = true;
+            scan_state.pass_epochs.clear();
+            scan_state.observed_backends_in_pass.clear();
+        };
+        if (scan_state.slice_pending) {
+            // The prior cursor slice was advanced but candidate/location
+            // validation did not reach CommitBackendScanSlice (exception,
+            // malformed response, or backend error). It may still be used for
+            // best-effort discovery, but can never prove whole-pass absence.
+            scan_state.pass_valid = false;
+            const bool completed_invalid_pass = scan_state.pending_completes_pass;
+            scan_state.slice_pending = false;
+            scan_state.pending_completes_pass = false;
+            if (completed_invalid_pass) {
+                reset_current_pass();
+            }
+        }
+        if (scan_state.cursor.empty()) {
+            scan_state.cursor = SCAN_BASE_CURSOR;
+        }
+        if (scan_state.cursor == SCAN_BASE_CURSOR && scan_state.offset == 0 && !scan_state.pass_started) {
+            const AdmissionDemand demand = GetAdmissionDemand(instance_group);
+            scan_state.pass_epochs.clear();
+            for (const auto &[backend_name, backend] : demand.backend_reclaim_capacity) {
+                if ((backend.bytes != 0 || backend.objects != 0) && backend.scan_epoch != 0) {
+                    scan_state.pass_epochs.emplace(backend_name, backend.scan_epoch);
+                }
+            }
+            scan_state.observed_backends_in_pass.clear();
+            scan_state.pass_valid = true;
+            scan_state.pass_started = true;
+        }
+        std::string next_cursor;
+        KeyVector scanned_keys;
+        const ErrorCode scan_ec =
+            indexer->Scan(request_context, scan_state.cursor, key_budget, next_cursor, scanned_keys);
+        if (scan_ec != EC_OK || next_cursor.empty()) {
+            return false;
+        }
+        // Local metadata deliberately finishes a whole mutex shard even when
+        // it exceeds the soft Scan limit. Keep a bounded offset into that
+        // stable batch instead of either allocating an unbounded candidate
+        // vector or skipping the shard tail forever. Redis-like backends
+        // normally return at most the requested count and take this path once.
+        const std::size_t begin = std::min(scan_state.offset, scanned_keys.size());
+        const std::size_t count = std::min(key_budget, scanned_keys.size() - begin);
+        KeyVector keys(scanned_keys.begin() + begin, scanned_keys.begin() + begin + count);
+        if (begin + count < scanned_keys.size()) {
+            scan_state.offset = begin + count;
+        } else {
+            scan_state.cursor = std::move(next_cursor);
+            scan_state.offset = 0;
+        }
+        scan_state.slice_pending = true;
+        scan_state.pending_completes_pass = scan_state.cursor == SCAN_BASE_CURSOR && scan_state.offset == 0;
+
+        PropertyMapVector properties;
+        if (!keys.empty()) {
+            const auto property_result = indexer->GetProperties(request_context, keys, {PROPERTY_LRU_TIME}, properties);
+            if ((property_result.ec != EC_OK && property_result.ec != EC_PARTIAL_OK) ||
+                property_result.error_codes.size() != keys.size() || properties.size() != keys.size()) {
+                return false;
+            }
+            out.reserve(keys.size());
+            for (std::size_t i = 0; i < keys.size(); ++i) {
+                if (property_result.error_codes[i] != EC_OK && property_result.error_codes[i] != EC_NOENT) {
+                    return false;
+                }
+                std::int64_t last_access_time_us = 0;
+                const auto property = properties[i].find(PROPERTY_LRU_TIME);
+                if (property != properties[i].end() &&
+                    !StringUtil::StrToInt64(property->second.c_str(), last_access_time_us)) {
+                    last_access_time_us = 0;
+                }
+                out.push_back({keys[i], last_access_time_us});
+            }
+        }
+        // A physical-capacity demand can target one of several same-type
+        // backends. The ordinary oldest-N sampler may contain no object from
+        // that backend forever. Advance a bounded namespace cursor so every
+        // exact owner is eventually considered, while still ranking each
+        // bounded window by its real LRU timestamp below.
+        return true;
+    }
+
+    void CommitBackendScanSlice(const std::string &instance_group,
+                                const std::string &internal_instance_id,
+                                const std::set<std::string> &observed_backends) {
+        const auto state_it = backend_scan_cursor_by_instance_.find({instance_group, internal_instance_id});
+        if (state_it == backend_scan_cursor_by_instance_.end() || !state_it->second.slice_pending) {
+            return;
+        }
+        auto &state = state_it->second;
+        state.observed_backends_in_pass.insert(observed_backends.begin(), observed_backends.end());
+        const bool completes_pass = state.pending_completes_pass;
+        state.slice_pending = false;
+        state.pending_completes_pass = false;
+        if (!completes_pass) {
+            return;
+        }
+        if (state.pass_started && state.pass_valid) {
+            state.last_completed_epochs = state.pass_epochs;
+            state.last_completed_backends = state.observed_backends_in_pass;
+        }
+        state.pass_started = false;
+        state.pass_valid = true;
+        state.pass_epochs.clear();
+        state.observed_backends_in_pass.clear();
+    }
+
+    void InvalidateBackendScanSlice(const std::string &instance_group,
+                                    const std::string &internal_instance_id) noexcept {
+        const auto state_it = backend_scan_cursor_by_instance_.find({instance_group, internal_instance_id});
+        if (state_it == backend_scan_cursor_by_instance_.end() || !state_it->second.slice_pending) {
+            return;
+        }
+        auto &state = state_it->second;
+        state.pass_valid = false;
+        const bool completes_pass = state.pending_completes_pass;
+        state.slice_pending = false;
+        state.pending_completes_pass = false;
+        if (completes_pass) {
+            state.pass_started = false;
+            state.pass_valid = true;
+            state.pass_epochs.clear();
+            state.observed_backends_in_pass.clear();
+        }
     }
 
     bool CollectCandidates(RequestContext *request_context,
@@ -1762,8 +2140,14 @@ private:
             const auto indexer =
                 owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance->instance_id());
             ReclaimCandidateVector sampled;
-            if (indexer->SampleReclaimCandidates(
-                    request_context, static_cast<std::int64_t>(key_budget), sampled, true) != EC_OK) {
+            const bool backend_scan = !pressure.capacity_by_backend.empty();
+            const bool sampled_ok =
+                backend_scan
+                    ? ScanReclaimCandidatesForBackendPressure(
+                          request_context, instance_group, indexer, instance->instance_id(), key_budget, sampled)
+                    : indexer->SampleReclaimCandidates(
+                          request_context, static_cast<std::int64_t>(key_budget), sampled, true) == EC_OK;
+            if (!sampled_ok) {
                 return false;
             }
             if (sampled.size() > key_budget) {
@@ -1782,6 +2166,9 @@ private:
                 }
             }
             if (keys.empty()) {
+                if (backend_scan) {
+                    CommitBackendScanSlice(instance_group, instance->instance_id(), {});
+                }
                 continue;
             }
             CacheLocationMapVector location_maps;
@@ -1790,6 +2177,8 @@ private:
                 get_result.error_codes.size() != keys.size()) {
                 return false;
             }
+            std::set<std::string> observed_backends;
+            bool backend_scan_slice_valid = true;
             for (std::size_t key_index = 0; key_index < keys.size(); ++key_index) {
                 if (get_result.error_codes[key_index] == EC_NOENT) {
                     continue;
@@ -1824,14 +2213,21 @@ private:
                         valid_key = false;
                         break;
                     }
+                    const DataStorageUri candidate_uri(location->location_specs().front().uri());
+                    observed_backends.insert(candidate_uri.GetHostName());
                     if (!IsCommittedObject(*location)) {
                         key_candidate.all_locations_committed = false;
                         continue;
                     }
-                    key_candidate.objects.push_back(
-                        Candidate{instance->instance_id(), keys[key_index], location_id, location, value_size});
+                    key_candidate.objects.push_back(Candidate{instance->instance_id(),
+                                                              keys[key_index],
+                                                              location_id,
+                                                              candidate_uri.GetHostName(),
+                                                              location,
+                                                              value_size});
                 }
                 if (!valid_key) {
+                    backend_scan_slice_valid = false;
                     ++error_count_metrics_;
                     KVCM_INTERVAL_LOG_WARN(10,
                                            "KVMeta reclaimer skipped a corrupt candidate in instance [%s]",
@@ -1842,8 +2238,92 @@ private:
                     out.push_back(std::move(key_candidate));
                 }
             }
+            if (backend_scan) {
+                if (backend_scan_slice_valid) {
+                    CommitBackendScanSlice(instance_group, instance->instance_id(), observed_backends);
+                } else {
+                    InvalidateBackendScanSlice(instance_group, instance->instance_id());
+                }
+            }
         }
         return true;
+    }
+
+    void ClearBackendDemandsProvenUnowned(const std::string &instance_group,
+                                          const std::vector<InstanceInfoConstPtr> &instances) noexcept {
+        try {
+            const AdmissionDemand snapshot = GetAdmissionDemand(instance_group);
+            if (snapshot.backend_reclaim_capacity.empty()) {
+                return;
+            }
+            std::vector<std::pair<std::string, std::uint64_t>> proven_absent;
+            for (const auto &[backend_name, backend] : snapshot.backend_reclaim_capacity) {
+                if ((backend.bytes == 0 && backend.objects == 0) || backend.scan_epoch == 0) {
+                    continue;
+                }
+                bool absent_from_every_instance = true;
+                for (const auto &instance : instances) {
+                    if (!instance) {
+                        absent_from_every_instance = false;
+                        break;
+                    }
+                    const auto indexer =
+                        owner_->cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance->instance_id());
+                    if (!indexer) {
+                        absent_from_every_instance = false;
+                        break;
+                    }
+                    // Recovery maintains an exact key count. An empty
+                    // namespace needs no cursor evidence.
+                    if (indexer->GetKeyCount() == 0) {
+                        continue;
+                    }
+                    const auto state_it =
+                        backend_scan_cursor_by_instance_.find({instance_group, instance->instance_id()});
+                    if (state_it == backend_scan_cursor_by_instance_.end()) {
+                        absent_from_every_instance = false;
+                        break;
+                    }
+                    const auto epoch_it = state_it->second.last_completed_epochs.find(backend_name);
+                    if (epoch_it == state_it->second.last_completed_epochs.end() ||
+                        epoch_it->second != backend.scan_epoch ||
+                        state_it->second.last_completed_backends.count(backend_name) != 0) {
+                        absent_from_every_instance = false;
+                        break;
+                    }
+                }
+                if (absent_from_every_instance) {
+                    proven_absent.emplace_back(backend_name, backend.scan_epoch);
+                }
+            }
+            if (proven_absent.empty()) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto demand_it = admission_demands_.find(instance_group);
+            if (demand_it == admission_demands_.end()) {
+                return;
+            }
+            for (const auto &[backend_name, epoch] : proven_absent) {
+                const auto backend_it = demand_it->second.backend_reclaim_capacity.find(backend_name);
+                if (backend_it == demand_it->second.backend_reclaim_capacity.end() ||
+                    backend_it->second.scan_epoch != epoch) {
+                    continue;
+                }
+                demand_it->second.backend_reclaim_capacity.erase(backend_it);
+                ++backend_capacity_unowned_demand_count_metrics_;
+                KVCM_INTERVAL_LOG_WARN(10,
+                                       "KVMeta backend capacity demand for group [%s] backend [%s] cannot be "
+                                       "satisfied by this group's cache ownership; wait for the caller's next "
+                                       "authoritative EC_NOSPC retry before scanning again",
+                                       instance_group.c_str(),
+                                       backend_name.c_str());
+            }
+            UpdateAdmissionDemandMetricsLocked();
+        } catch (...) {
+            // This retirement only bounds background scan load. Keeping an
+            // unprovable demand is conservative and cannot weaken exact GC.
+        }
     }
 
     static std::vector<Candidate> SelectCandidates(std::vector<CandidateKey> candidates,
@@ -1865,10 +2345,12 @@ private:
             object_selected.emplace_back(candidate.objects.size(), false);
         }
 
-        const auto has_type_pressure = [&pressure](const CandidateKey &key_candidate) {
+        const auto has_storage_pressure = [&pressure](const CandidateKey &key_candidate) {
             return std::any_of(key_candidate.objects.begin(), key_candidate.objects.end(), [&](const Candidate &item) {
                 const std::size_t type_index = ToIndex(ToBaseType(item.location->type()));
-                return type_index < pressure.bytes_by_type.size() && pressure.bytes_by_type[type_index] != 0;
+                const auto backend_it = pressure.capacity_by_backend.find(item.backend_name);
+                return (type_index < pressure.bytes_by_type.size() && pressure.bytes_by_type[type_index] != 0) ||
+                       (backend_it != pressure.capacity_by_backend.end() && backend_it->second.Any());
             });
         };
         const auto select_object = [&](std::size_t key_index, std::size_t object_index) {
@@ -1883,7 +2365,7 @@ private:
             ++selected_per_key[key_index];
             selected.push_back(candidate);
             selected_bytes += candidate.value_size;
-            pressure.Consume(candidate.location->type(), candidate.value_size);
+            pressure.Consume(candidate.location->type(), candidate.backend_name, candidate.value_size);
             if (!key_credit_applied[key_index] && candidates[key_index].all_locations_committed &&
                 selected_per_key[key_index] == candidates[key_index].objects.size()) {
                 // Whichever constraint selected the last location has removed
@@ -1961,9 +2443,24 @@ private:
             for (std::size_t key_index = 0;
                  pressure.keys != 0 && key_index < candidates.size() && selected.size() < batch_size;
                  ++key_index) {
-                if ((!require_type_overlap || has_type_pressure(candidates[key_index])) &&
+                if ((!require_type_overlap || has_storage_pressure(candidates[key_index])) &&
                     !key_credit_applied[key_index]) {
                     select_key_for_key_pressure(key_index);
+                }
+            }
+        }
+
+        // Physical backend pressure is narrower than type pressure. A full
+        // NFS/PACE provider may be one of several same-type candidates; only
+        // deleting an object owned by that exact backend can free its bytes.
+        for (std::size_t key_index = 0; key_index < candidates.size() && selected.size() < batch_size; ++key_index) {
+            for (std::size_t object_index = 0;
+                 object_index < candidates[key_index].objects.size() && selected.size() < batch_size;
+                 ++object_index) {
+                const auto &candidate = candidates[key_index].objects[object_index];
+                const auto backend_it = pressure.capacity_by_backend.find(candidate.backend_name);
+                if (backend_it != pressure.capacity_by_backend.end() && backend_it->second.Any()) {
+                    select_object(key_index, object_index);
                 }
             }
         }
@@ -2250,6 +2747,7 @@ private:
                                                                                retired_location,
                                                                                retired_location,
                                                                                candidate.value_size},
+                                                    candidate.backend_name,
                                                     removes_metadata_key[i],
                                                     metadata_durable_by_instance.at(internal_instance_id)});
             }
@@ -2261,13 +2759,24 @@ private:
                          std::size_t quota_shard,
                          std::chrono::steady_clock::time_point deadline,
                          std::vector<RetiredItem> items) {
+        if (instance_group.empty() || quota_shard >= owner_->quota_admission_mutexes_.size() || items.empty() ||
+            items.size() > kPendingObjectLimit) {
+            throw std::invalid_argument("invalid KVMeta pending batch identity or size");
+        }
         auto batch = std::make_shared<PendingBatch>();
         batch->instance_group = instance_group;
         batch->quota_shard = quota_shard;
         batch->deadline = deadline;
         batch->items = std::move(items);
         std::set<std::string> instances;
+        std::set<std::pair<std::string, std::string>> unique_locations;
         for (const auto &item : batch->items) {
+            if (item.internal_instance_id.empty() || item.item.location_id.empty() || item.item.value_size == 0 ||
+                !item.item.metadata_location || !item.item.data_location ||
+                !IsCanonicalKvMetaBackendName(item.backend_name) ||
+                !unique_locations.emplace(item.internal_instance_id, item.item.location_id).second) {
+                throw std::invalid_argument("invalid or duplicate KVMeta pending item");
+            }
             instances.insert(item.internal_instance_id);
             batch->locations.emplace_back(item.internal_instance_id, item.item.location_id);
         }
@@ -2276,8 +2785,21 @@ private:
         for (const auto &item : batch->items) {
             batch_bytes = SaturatingAdd(batch_bytes, item.item.value_size);
         }
+        if (batch_bytes == 0 || batch_bytes > kPendingBytesLimit) {
+            throw std::out_of_range("KVMeta pending batch exceeds its byte limit");
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_ || pending_batches_.size() >= kPendingBatchLimit ||
+                pending_object_count_ > kPendingObjectLimit - batch->items.size() ||
+                pending_bytes_ > kPendingBytesLimit - batch_bytes ||
+                std::any_of(batch->locations.begin(), batch->locations.end(), [&](const auto &location) {
+                    const auto it = pending_locations_.find(location);
+                    return it != pending_locations_.end() && it->second != 0;
+                })) {
+                ++pending_limit_reject_count_metrics_;
+                throw std::runtime_error("KVMeta pending ownership capacity is unavailable");
+            }
             batch->sequence = next_pending_sequence_;
             // Allocate every map node before publishing counters. This gives
             // the in-memory indexes a strong exception guarantee: either the
@@ -2295,6 +2817,9 @@ private:
                 for (const auto &item : batch->items) {
                     if (item.removes_metadata_key) {
                         prepared_credit.keys_by_instance.try_emplace(item.internal_instance_id, 0);
+                    }
+                    if (!item.backend_name.empty()) {
+                        prepared_credit.capacity_by_backend.try_emplace(item.backend_name);
                     }
                 }
                 const auto [_, inserted] =
@@ -2325,10 +2850,18 @@ private:
                             ++it;
                         }
                     }
+                    for (auto it = credit_it->second.capacity_by_backend.begin();
+                         it != credit_it->second.capacity_by_backend.end();) {
+                        if (!it->second.Any()) {
+                            it = credit_it->second.capacity_by_backend.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
                 }
                 if (credit_it != pending_credits_.end() && credit_it->second.bytes == 0 &&
                     credit_it->second.keys == 0 && credit_it->second.blocked_batch_count == 0 &&
-                    credit_it->second.keys_by_instance.empty() &&
+                    credit_it->second.keys_by_instance.empty() && credit_it->second.capacity_by_backend.empty() &&
                     std::none_of(credit_it->second.bytes_by_type.begin(),
                                  credit_it->second.bytes_by_type.end(),
                                  [](std::uint64_t value) { return value != 0; })) {
@@ -2363,6 +2896,13 @@ private:
                             SaturatingAdd(credit.bytes_by_type[type_index], item.item.value_size);
                     }
                 }
+                const auto backend_it = credit.capacity_by_backend.find(item.backend_name);
+                if (backend_it == credit.capacity_by_backend.end()) {
+                    FailClosedMaintenance();
+                    throw std::logic_error("missing prepared KVMeta per-backend pending credit");
+                }
+                backend_it->second.bytes = SaturatingAdd(backend_it->second.bytes, item.item.value_size);
+                backend_it->second.objects = SaturatingAdd(backend_it->second.objects, 1);
             }
             pending_object_count_ = SaturatingAdd(pending_object_count_, batch->items.size());
             pending_bytes_ = SaturatingAdd(pending_bytes_, batch_bytes);
@@ -2423,12 +2963,20 @@ private:
                             SaturatingSub(credit.bytes_by_type[type_index], item.item.value_size);
                     }
                 }
+                const auto backend_it = credit.capacity_by_backend.find(item.backend_name);
+                if (backend_it != credit.capacity_by_backend.end()) {
+                    backend_it->second.bytes = SaturatingSub(backend_it->second.bytes, item.item.value_size);
+                    backend_it->second.objects = SaturatingSub(backend_it->second.objects, 1);
+                    if (!backend_it->second.Any()) {
+                        credit.capacity_by_backend.erase(backend_it);
+                    }
+                }
             }
             const bool has_type_credit = std::any_of(credit.bytes_by_type.begin(),
                                                      credit.bytes_by_type.end(),
                                                      [](std::uint64_t value) { return value != 0; });
-            if (credit.bytes == 0 && credit.keys == 0 && credit.keys_by_instance.empty() && !has_type_credit &&
-                credit.blocked_batch_count == 0) {
+            if (credit.bytes == 0 && credit.keys == 0 && credit.keys_by_instance.empty() &&
+                credit.capacity_by_backend.empty() && !has_type_credit && credit.blocked_batch_count == 0) {
                 pending_credits_.erase(credit_it);
             }
         }
@@ -2613,7 +3161,9 @@ private:
             try {
                 RequestContext request_context("kv_meta_reclaimer_physical_delete");
                 physical_ec = owner_->DeleteAllocatedLocations(&request_context, all_items);
-            } catch (const std::exception &) { failure_kind = "standard_exception"; } catch (...) {
+            } catch (const std::exception &) {
+                failure_kind = "standard_exception";
+            } catch (...) {
                 failure_kind = "unknown_exception";
             }
             if (physical_ec != EC_OK) {
@@ -2773,6 +3323,14 @@ private:
                 10, "KVMeta reclaimer failed to collect exact LRU candidates for group [%s]", group->name().c_str());
             return false;
         }
+        if (!pressure.capacity_by_backend.empty()) {
+            // A shared provider can be full because of other tenants. Once a
+            // bounded full scan proves this group owns no object on that exact
+            // backend, continuing to scan cannot release one byte. Retire only
+            // the advisory signal; the caller's next authoritative EC_NOSPC
+            // creates a fresh epoch and scan.
+            ClearBackendDemandsProvenUnowned(group->name(), instances);
+        }
         const auto delay = std::chrono::milliseconds(strategy->delay_before_delete_ms());
         const std::size_t quota_shard =
             std::hash<std::string>{}(group->name()) % owner_->quota_admission_mutexes_.size();
@@ -2880,6 +3438,13 @@ private:
                 ++it;
             }
         }
+        for (auto it = backend_scan_cursor_by_instance_.begin(); it != backend_scan_cursor_by_instance_.end();) {
+            if (active_group_names.count(it->first.first) == 0) {
+                it = backend_scan_cursor_by_instance_.erase(it);
+            } else {
+                ++it;
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (auto it = admission_demands_.begin(); it != admission_demands_.end();) {
@@ -2972,7 +3537,9 @@ private:
                     if (stopping_) {
                         break;
                     }
-                } catch (...) { break; }
+                } catch (...) {
+                    break;
+                }
             } catch (...) {
                 ++error_count_metrics_;
                 KVCM_LOG_WARN("KVMeta reclaimer loop contained an unknown exception");
@@ -2983,7 +3550,9 @@ private:
                     if (stopping_) {
                         break;
                     }
-                } catch (...) { break; }
+                } catch (...) {
+                    break;
+                }
             }
         }
     }
@@ -3000,8 +3569,25 @@ private:
     std::map<std::string, AdmissionDemand> admission_demands_;
     std::map<PendingDeadline, std::shared_ptr<PendingBatch>> pending_batches_;
     std::map<std::string, std::size_t> sampling_rotation_by_group_;
+    // Used only by the single Reclaimer worker when a concrete physical
+    // backend reports EC_NOSPC. It guarantees bounded eventual discovery even
+    // when the ordinary oldest-N sample contains only other same-type stores.
+    struct BackendScanState {
+        std::string cursor = SCAN_BASE_CURSOR;
+        std::size_t offset = 0;
+        bool pass_started = false;
+        bool pass_valid = true;
+        bool slice_pending = false;
+        bool pending_completes_pass = false;
+        std::map<std::string, std::uint64_t> pass_epochs;
+        std::set<std::string> observed_backends_in_pass;
+        std::map<std::string, std::uint64_t> last_completed_epochs;
+        std::set<std::string> last_completed_backends;
+    };
+    std::map<std::pair<std::string, std::string>, BackendScanState> backend_scan_cursor_by_instance_;
     std::uint64_t next_pending_sequence_ = 0;
     std::uint64_t next_admission_demand_sequence_ = 0;
+    std::uint64_t next_backend_demand_epoch_ = 0;
     std::uint64_t pending_object_count_ = 0;
     std::uint64_t pending_bytes_ = 0;
     Counter round_count_metrics_;
@@ -3013,6 +3599,7 @@ private:
     Counter pending_limit_reject_count_metrics_;
     Counter admission_demand_count_metrics_;
     Counter backend_capacity_demand_count_metrics_;
+    Counter backend_capacity_unowned_demand_count_metrics_;
     Counter physical_delete_attempted_object_count_metrics_;
     Counter physical_delete_uncertain_object_count_metrics_;
     Counter physical_delete_uncertain_bytes_metrics_;
@@ -3021,6 +3608,7 @@ private:
     Gauge blocked_group_count_metrics_;
     Gauge admission_demand_group_count_metrics_;
     Gauge backend_capacity_demand_bytes_metrics_;
+    Gauge backend_capacity_demand_objects_metrics_;
     std::thread thread_;
 };
 
@@ -3042,7 +3630,7 @@ bool KvMetaManager::Init() {
     if (!cache_manager_ || !registry_manager_ || !cache_manager_->meta_indexer_manager() ||
         !registry_manager_->data_storage_manager() || limits_.max_batch_items == 0 || limits_.max_key_bytes == 0 ||
         limits_.max_instance_id_bytes == 0 || limits_.max_instance_group_bytes == 0 ||
-        limits_.max_write_session_id_bytes == 0 || limits_.max_user_data_bytes == 0 ||
+        limits_.max_write_session_id_bytes < kKvMetaCapabilityTokenHexChars || limits_.max_user_data_bytes == 0 ||
         limits_.max_location_uri_bytes == 0 || limits_.max_location_uri_bytes > kMaxKvMetaLocationUriBytes ||
         limits_.max_active_write_sessions == 0 || limits_.max_value_bytes == 0 || limits_.max_batch_bytes == 0 ||
         limits_.max_write_timeout_seconds <= 0 || limits_.max_failed_write_cleanup_grace_seconds < 0 ||
@@ -3063,6 +3651,10 @@ bool KvMetaManager::Init() {
         return false;
     }
     maintenance_cancelled_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(recovery_window_mutex_);
+        recovery_force_deadline_.reset();
+    }
     initialized_.store(true, std::memory_order_release);
     return true;
 }
@@ -3079,6 +3671,10 @@ void KvMetaManager::Shutdown() {
         write_session_manager_.reset();
     }
     data_storage_selector_.reset();
+    {
+        std::lock_guard<std::mutex> lock(recovery_window_mutex_);
+        recovery_force_deadline_.reset();
+    }
 }
 
 void KvMetaManager::DoCleanup() {
@@ -3089,6 +3685,10 @@ void KvMetaManager::DoCleanup() {
     if (write_session_manager_) {
         write_session_manager_->StopAndDiscard();
     }
+    // A later promotion is a new recovery epoch and must grant legitimate
+    // writers their configured persisted lease window from that promotion.
+    std::lock_guard<std::mutex> lock(recovery_window_mutex_);
+    recovery_force_deadline_.reset();
 }
 
 void KvMetaManager::CancelMaintenance() noexcept {
@@ -3119,11 +3719,11 @@ bool KvMetaManager::ResumeMaintenance() {
 }
 
 std::string KvMetaManager::InternalInstanceId(const std::string &instance_id) {
-    return std::string(kKvMetaInternalInstancePrefix) + HexEncode(instance_id);
+    return BuildKvMetaInternalInstanceId(instance_id);
 }
 
 std::int64_t KvMetaManager::InternalKey(const std::string &key) {
-    const std::uint64_t hash = Hash64(key.data(), key.size(), kObjectKeyHashSeed);
+    const std::uint64_t hash = Hash64(key.data(), key.size(), kKvMetaObjectKeyHashSeed);
     std::int64_t result = 0;
     static_assert(sizeof(result) == sizeof(hash));
     std::memcpy(&result, &hash, sizeof(result));
@@ -3181,15 +3781,22 @@ ErrorCode KvMetaManager::ValidateOwnedLocation(RequestContext *request_context,
                                                                         : location.location_specs().front().uri());
     const auto location_backend =
         data_storage_manager ? data_storage_manager->GetDataStorageBackend(location_uri.GetHostName()) : nullptr;
+    std::string original_key;
+    const std::string_view encoded_key = location_id.size() > kKvMetaLocationIdPrefix.size()
+                                             ? std::string_view(location_id).substr(kKvMetaLocationIdPrefix.size())
+                                             : std::string_view{};
+    const bool decoded_key = (encoded_key.size() & 1U) == 0 && encoded_key.size() / 2 <= limits_.max_key_bytes &&
+                             HexDecode(encoded_key, original_key) && StableLocationId(original_key) == location_id &&
+                             InternalKey(original_key) == internal_key;
     const bool known_state = (location.status() == CLS_NEW && location.create_time() != 0) || IsRetiredObject(location);
     std::uint64_t validated_total_size = 0;
     const bool has_validated_total_size = location.GetValidatedTotalSize(validated_total_size);
-    if (!IsOwnedLocation(internal_key, location_id) || location.id() != location_id || !known_state ||
+    if (!decoded_key || !IsOwnedLocation(internal_key, location_id) || location.id() != location_id || !known_state ||
         location.location_specs().size() != 1 ||
         location.location_specs().front().uri().size() > limits_.max_location_uri_bytes ||
         !HasMatchingStorageBackend(location, data_storage_manager) ||
         !UriBelongsToKvMetaNamespace(
-            location_uri, location_backend, location.type(), internal_instance_id, internal_key) ||
+            location_uri, location_backend, location.type(), internal_instance_id, original_key) ||
         !ReadLogicalSize(location, value_size) || (has_validated_total_size && validated_total_size != value_size) ||
         value_size > limits_.max_value_bytes || value_size > std::numeric_limits<std::size_t>::max()) {
         AddError(request_context, "KVMeta location does not match its exact key or registered storage backend");
@@ -3339,7 +3946,9 @@ ErrorCode KvMetaManager::CheckDynamicByteAdmission(RequestContext *request_conte
             AddError(request_context, "KVMeta byte admission could not read an instance indexer");
             return EC_INSTANCE_NOT_EXIST;
         }
-        saturating_add(total_usage, indexer->GetStorageUsage());
+        // Do not let independent type counters wrap the legacy aggregate and
+        // turn a corrupt/near-limit ledger into apparent free capacity.
+        saturating_add(total_usage, GetSaturatedStorageUsage(indexer));
         if (check_type_quota) {
             saturating_add(type_usage, indexer->GetStorageUsageByType(base_type));
         }
@@ -3547,7 +4156,9 @@ ErrorCode KvMetaManager::DeleteStorageUris(RequestContext *request_context,
     const char *failure_kind = nullptr;
     try {
         delete_results = data_storage_manager->DeleteAndConfirmAbsent(request_context, storage_name, uris, nullptr);
-    } catch (const std::exception &) { failure_kind = "standard_exception"; } catch (...) {
+    } catch (const std::exception &) {
+        failure_kind = "standard_exception";
+    } catch (...) {
         failure_kind = "unknown_exception";
     }
     if (failure_kind) {
@@ -3774,14 +4385,34 @@ KvMetaManager::DeleteItemsResult KvMetaManager::DeleteItems(RequestContext *requ
                 physical_ec = DeleteAllocatedLocations(request_context, retired_items);
             } catch (const std::exception &) {
                 KVCM_LOG_WARN("KVMeta tombstoned physical cleanup caught a standard internal exception");
-            } catch (...) { KVCM_LOG_WARN("KVMeta tombstoned physical cleanup caught an unknown internal exception"); }
+            } catch (...) {
+                KVCM_LOG_WARN("KVMeta tombstoned physical cleanup caught an unknown internal exception");
+            }
             if (physical_ec != EC_OK) {
                 AddError(request_context,
                          "KVMeta physical cleanup outcome is uncertain; durable tombstones were retained for "
-                         "recovery");
-                CancelMaintenance();
+                         "online retry and recovery");
+                // A successful handoff publishes pending-location fences and
+                // conservative capacity credit before the foreground caller
+                // releases its group shard. The current leader can therefore
+                // keep serving unrelated EMB keys while this exact immutable
+                // allocation identity is retried. If the handoff cannot be
+                // made, fail closed and leave the durable tombstone to the
+                // next leader's recovery scan.
+                const bool complete_handoff_candidate = result.ec == EC_OK && retired_items.size() == items.size() &&
+                                                        !result.metadata_already_absent &&
+                                                        !result.metadata_owner_conflicted;
+                result.online_cleanup_owned = complete_handoff_candidate && reclaimer_ &&
+                                              reclaimer_->AdoptDurableCleanup(internal_instance_id, retired_items);
+                if (!result.online_cleanup_owned) {
+                    CancelMaintenance();
+                }
                 result.ec = EC_OUTCOME_UNKNOWN;
                 return result;
+            }
+
+            if (reclaimer_) {
+                reclaimer_->ConfirmOwnedCapacityFreed(internal_instance_id, retired_items);
             }
 
             DeleteItemsOptions finalize_options = options;
@@ -4226,6 +4857,60 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         AddError(request_context, "KVMeta selected storage backend has an invalid failed-write cleanup grace");
         return {EC_CORRUPTION, StartWriteResult{}};
     }
+    std::vector<KvMetaDataStorageBackendExtension::CreatePreflightItem> preflight_items;
+    try {
+        preflight_items.reserve(missing_indices.size());
+        for (const std::size_t request_index : missing_indices) {
+            const std::string object_key_prefix =
+                BuildKvMetaObjectKeyPrefixFromInternal(internal_instance_id, keys[request_index]);
+            if (object_key_prefix.empty()) {
+                AddError(request_context, "KVMeta could not construct a physical object identity");
+                return {EC_ERROR, StartWriteResult{}};
+            }
+            std::string object_nonce;
+            if (!GenerateKvMetaCapabilityToken(object_nonce)) {
+                AddError(request_context, "KVMeta could not generate a unique physical object generation");
+                return {EC_IO_ERROR, StartWriteResult{}};
+            }
+            preflight_items.push_back({object_key_prefix + object_nonce, value_sizes[request_index]});
+        }
+    } catch (const std::exception &) {
+        AddError(request_context, "KVMeta could not prepare physical object identities");
+        return {EC_ERROR, StartWriteResult{}};
+    } catch (...) {
+        AddError(request_context, "KVMeta physical object identity preparation caught an unknown exception");
+        return {EC_ERROR, StartWriteResult{}};
+    }
+    KvMetaDataStorageBackendExtension::CreatePreflightResult preflight;
+    try {
+        preflight = kv_meta_backend->PreflightKvMetaCreate(preflight_items);
+    } catch (const std::exception &) {
+        AddError(request_context, "KVMeta storage capacity preflight caught a standard provider exception");
+        return {EC_IO_ERROR, StartWriteResult{}};
+    } catch (...) {
+        AddError(request_context, "KVMeta storage capacity preflight caught an unknown provider exception");
+        return {EC_IO_ERROR, StartWriteResult{}};
+    }
+    const bool malformed_preflight =
+        (preflight.ec == EC_OK && (preflight.reclaim_bytes != 0 || preflight.reclaim_objects != 0)) ||
+        (preflight.ec == EC_NOSPC && preflight.reclaim_bytes == 0 && preflight.reclaim_objects == 0) ||
+        (preflight.ec != EC_OK && preflight.ec != EC_NOSPC &&
+         (preflight.reclaim_bytes != 0 || preflight.reclaim_objects != 0)) ||
+        preflight.reclaim_bytes > missing_bytes || preflight.reclaim_objects > missing_indices.size();
+    if (malformed_preflight) {
+        AddError(request_context, "KVMeta storage capacity preflight returned an invalid shortage contract");
+        CancelMaintenance();
+        return {EC_CORRUPTION, StartWriteResult{}};
+    }
+    if (preflight.ec != EC_OK) {
+        if (preflight.ec == EC_NOSPC && reclaimer_) {
+            reclaimer_->RequestBackendCapacity(instance_info->instance_group_name(),
+                                               selected.name,
+                                               preflight.reclaim_bytes,
+                                               preflight.reclaim_objects);
+        }
+        return {preflight.ec, StartWriteResult{}};
+    }
     const std::int64_t persistent_lease_seconds = write_timeout_seconds + failed_write_cleanup_grace_seconds;
     std::int64_t persistent_write_deadline = 0;
     if (!EncodeLeaseDeadline(write_start_time_us, persistent_lease_seconds, persistent_write_deadline)) {
@@ -4244,7 +4929,9 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             return DeleteAllocatedLocations(request_context, items);
         } catch (const std::exception &) {
             KVCM_LOG_WARN("KVMeta allocation cleanup caught a standard internal exception");
-        } catch (...) { KVCM_LOG_WARN("KVMeta allocation cleanup caught an unknown internal exception"); }
+        } catch (...) {
+            KVCM_LOG_WARN("KVMeta allocation cleanup caught an unknown internal exception");
+        }
         return EC_IO_ERROR;
     };
     const auto release_allocated_or_fail_closed = [&](const std::vector<SessionItem> &items,
@@ -4263,7 +4950,8 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         CancelMaintenance();
         return false;
     };
-    for (const std::size_t request_index : missing_indices) {
+    for (std::size_t allocation_index = 0; allocation_index < missing_indices.size(); ++allocation_index) {
+        const std::size_t request_index = missing_indices[allocation_index];
         const bool cancelled = maintenance_cancelled_.load(std::memory_order_acquire);
         const bool expired = KvMetaWriteSessionManager::Clock::now() >= write_deadline;
         if (cancelled || expired) {
@@ -4273,12 +4961,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             }
             return {cancelled ? EC_SERVICE_NOT_LEADER : EC_TIMEOUT, StartWriteResult{}};
         }
-        const std::uint64_t instance_path_hash =
-            Hash64(internal_instance_id.data(), internal_instance_id.size(), kInstancePathHashSeed);
-        const std::string object_key =
-            "kvmeta/" + StringUtil::Uint64ToHex(instance_path_hash) + "/" +
-            StringUtil::Uint64ToHex(static_cast<std::uint64_t>(existing[request_index].internal_key)) + "/" +
-            StringUtil::GenerateRandomString(32);
+        const std::string &object_key = preflight_items[allocation_index].allocation_key;
         std::vector<std::pair<ErrorCode, DataStorageUri>> create_result;
         try {
             create_result = data_storage_manager->CreateForKvMeta(request_context,
@@ -4330,7 +5013,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                 // above, and summing a whole batch here would over-evict on a
                 // burst of equivalent retries.
                 reclaimer_->RequestBackendCapacity(
-                    instance_info->instance_group_name(), selected.type, value_sizes[request_index]);
+                    instance_info->instance_group_name(), selected.name, value_sizes[request_index], 1);
             }
             AddError(request_context, "KVMeta singleton storage allocation failed");
             return {create_result[0].first, StartWriteResult{}};
@@ -4402,12 +5085,23 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                 return candidate.data_location && SamePhysicalAllocation(*candidate.data_location, *location);
             });
         if (allocation_reused) {
-            // Query fields such as size are metadata, not necessarily part of
-            // the backend's Delete identity. Release the shared allocation
-            // once through the earlier candidate and publish no metadata for
-            // either key.
+            // Physical identity deliberately ignores generation capabilities
+            // such as PACE allocation_token. A broken allocator can therefore
+            // return one address with two independently releasable leases.
+            // Retire both the earlier and current generations; the cleanup
+            // helper deduplicates them only when their full delete identities
+            // are identical. Publish no metadata for either key.
+            auto cleanup_items = candidates;
+            cleanup_items.push_back(SessionItem{request_index,
+                                                keys[request_index],
+                                                existing[request_index].internal_key,
+                                                existing[request_index].location_id,
+                                                location,
+                                                location,
+                                                value_sizes[request_index],
+                                                object_key});
             const bool cleanup_complete =
-                release_allocated_or_fail_closed(candidates, "KVMeta duplicate allocation cleanup failed");
+                release_allocated_or_fail_closed(cleanup_items, "KVMeta duplicate allocation cleanup failed");
             AddError(request_context, "KVMeta storage reused one singleton allocation for multiple keys");
             CancelMaintenance();
             return {cleanup_complete ? EC_CORRUPTION : EC_OUTCOME_UNKNOWN, StartWriteResult{}};
@@ -4596,8 +5290,13 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         if (metadata_cleanup.ec != EC_OK || !metadata_cleanup.metadata_cleanup_complete ||
             metadata_cleanup.metadata_already_absent || direct_cleanup_ec != EC_OK || ownership_uncertain) {
             AddError(request_context,
-                     "KVMeta start rollback could not prove exclusive ownership; recovery is required");
-            CancelMaintenance();
+                     "KVMeta start rollback did not complete synchronously; cleanup ownership was preserved");
+            const bool online_retry_is_complete_owner =
+                metadata_cleanup.online_cleanup_owned && !metadata_cleanup.metadata_already_absent &&
+                !metadata_cleanup.metadata_owner_conflicted && direct_cleanup_ec == EC_OK && !ownership_uncertain;
+            if (!online_retry_is_complete_owner) {
+                CancelMaintenance();
+            }
             return EC_OUTCOME_UNKNOWN;
         }
         return original_error;
@@ -4705,16 +5404,22 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         const auto cleanup = DeleteItems(request_context, internal_instance_id, session_items, cleanup_options);
         if (!cleanup.metadata_cleanup_complete || cleanup.metadata_already_absent) {
             AddError(request_context,
-                     "KVMeta unpublished reservation rollback was incomplete; maintenance is fail-closed until "
-                     "recovery");
-            CancelMaintenance();
+                     cleanup.online_cleanup_owned
+                         ? "KVMeta unpublished reservation rollback is owned by online cleanup retry"
+                         : "KVMeta unpublished reservation rollback was incomplete; maintenance is fail-closed "
+                           "until recovery");
+            if (!cleanup.online_cleanup_owned) {
+                CancelMaintenance();
+            }
             return EC_OUTCOME_UNKNOWN;
         }
         if (cleanup.ec != EC_OK) {
             KVCM_LOG_WARN("KVMeta unpublished reservation rollback retained a durable cleanup tombstone, "
                           "ec[%d]",
                           cleanup.ec);
-            CancelMaintenance();
+            if (!cleanup.online_cleanup_owned) {
+                CancelMaintenance();
+            }
             return EC_OUTCOME_UNKNOWN;
         }
         return EC_OK;
@@ -4796,10 +5501,14 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     std::string session_id;
     auto session_result = KvMetaWriteSessionManager::PutResult::kDuplicate;
     bool session_publication_threw = false;
+    bool session_token_generation_failed = false;
     try {
         for (int attempt = 0; attempt < 8 && session_result == KvMetaWriteSessionManager::PutResult::kDuplicate;
              ++attempt) {
-            session_id = StringUtil::GenerateRandomString(32);
+            if (!GenerateKvMetaCapabilityToken(session_id)) {
+                session_token_generation_failed = true;
+                break;
+            }
             auto items_for_attempt = session_items;
             session_result = write_session_manager_
                                  ? write_session_manager_->Put(session_id,
@@ -4824,6 +5533,13 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         }
         AddError(request_context, "KVMeta could not publish the write session");
         return {EC_ERROR, StartWriteResult{}};
+    }
+    if (session_token_generation_failed) {
+        if (rollback_unpublished_reservations(/*adjust_storage_usage=*/true) != EC_OK) {
+            return {EC_OUTCOME_UNKNOWN, StartWriteResult{}};
+        }
+        AddError(request_context, "KVMeta could not generate a secure write-session capability");
+        return {EC_IO_ERROR, StartWriteResult{}};
     }
     if (session_result != KvMetaWriteSessionManager::PutResult::kOk) {
         if (rollback_unpublished_reservations(/*adjust_storage_usage=*/true) != EC_OK) {
@@ -4871,9 +5587,13 @@ ErrorCode KvMetaManager::FinishWriteInternal(RequestContext *request_context,
             // the old URI may already have been freed and reused, so it was
             // intentionally not sent to physical Delete.
             AddError(request_context,
-                     "KVMeta session rollback did not prove metadata absence; maintenance is fail-closed until "
-                     "recovery");
-            CancelMaintenance();
+                     cleanup.online_cleanup_owned
+                         ? "KVMeta session rollback is owned by online cleanup retry"
+                         : "KVMeta session rollback did not prove metadata absence; maintenance is fail-closed "
+                           "until recovery");
+            if (!cleanup.online_cleanup_owned) {
+                CancelMaintenance();
+            }
             return EC_OUTCOME_UNKNOWN;
         }
         return cleanup.ec;
@@ -5035,9 +5755,14 @@ ErrorCode KvMetaManager::FinishWriteInternal(RequestContext *request_context,
     const auto exact_cleanup = DeleteItems(request_context, internal_instance_id, exact_deletes, DeleteItemsOptions{});
     if (!exact_cleanup.metadata_cleanup_complete || exact_cleanup.metadata_already_absent) {
         AddError(request_context,
-                 "KVMeta commit rollback did not prove metadata absence; maintenance is fail-closed until recovery");
-        CancelMaintenance();
-        ownership_uncertain = true;
+                 exact_cleanup.online_cleanup_owned
+                     ? "KVMeta commit rollback is owned by online cleanup retry"
+                     : "KVMeta commit rollback did not prove metadata absence; maintenance is fail-closed until "
+                       "recovery");
+        if (!exact_cleanup.online_cleanup_owned) {
+            CancelMaintenance();
+            ownership_uncertain = true;
+        }
     }
     if (exact_cleanup.ec != EC_OK) {
         KVCM_LOG_WARN("KVMeta commit rollback retained durable cleanup tombstones, ec[%d]", exact_cleanup.ec);
@@ -5053,8 +5778,13 @@ ErrorCode KvMetaManager::FinishWriteInternal(RequestContext *request_context,
     // longer describes the overall batch outcome. Stop admission and force
     // reconciliation before allowing another generation.
     if (exact_cleanup.ec != EC_OK) {
-        AddError(request_context, "KVMeta partial commit rollback retained a recovery tombstone");
-        CancelMaintenance();
+        AddError(request_context,
+                 exact_cleanup.online_cleanup_owned
+                     ? "KVMeta partial commit rollback was handed to online cleanup retry"
+                     : "KVMeta partial commit rollback retained a recovery tombstone");
+        if (!exact_cleanup.online_cleanup_owned) {
+            CancelMaintenance();
+        }
         return EC_OUTCOME_UNKNOWN;
     }
     if (ownership_uncertain) {
@@ -5289,7 +6019,7 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
         // physical step failed. Returning the underlying
         // ordinary error would invite an unsafe blind retry that can delete a
         // successor generation created for one of those keys.
-        if (!deletion.metadata_cleanup_complete) {
+        if (!deletion.metadata_cleanup_complete && !deletion.online_cleanup_owned) {
             // In-memory absence without a durable barrier must also block new
             // generations locally. Outcome-unknown alone is only a caller
             // contract; it is not an admission fence against other clients.
@@ -5431,7 +6161,8 @@ ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::str
                     CancelMaintenance();
                     operation_ec = EC_OUTCOME_UNKNOWN;
                 }
-                if (deletion.metadata_outcome_changed && !deletion.metadata_cleanup_complete) {
+                if (deletion.metadata_outcome_changed && !deletion.metadata_cleanup_complete &&
+                    !deletion.online_cleanup_owned) {
                     // Keep the per-instance trim fence from turning into an
                     // admission hole when it is removed at function exit.
                     // The global KVMeta recovery gate is required until the
@@ -5543,8 +6274,20 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
     // preserves its data-I/O window without affecting main KV-cache recovery.
     const std::int64_t max_persisted_active_lease_seconds =
         limits_.max_write_timeout_seconds + limits_.max_failed_write_cleanup_grace_seconds;
-    const auto recovery_force_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(max_persisted_active_lease_seconds);
+    std::chrono::steady_clock::time_point recovery_force_deadline;
+    {
+        std::lock_guard<std::mutex> lock(recovery_window_mutex_);
+        if (!recovery_force_deadline_) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto remaining_seconds =
+                std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::time_point::max() - now)
+                    .count();
+            recovery_force_deadline_ = max_persisted_active_lease_seconds >= remaining_seconds
+                                           ? std::chrono::steady_clock::time_point::max()
+                                           : now + std::chrono::seconds(max_persisted_active_lease_seconds);
+        }
+        recovery_force_deadline = *recovery_force_deadline_;
+    }
     RequestContext request_context("kv_meta_recover");
     const auto [groups_ec, groups] = registry_manager_->ListInstanceGroup(&request_context);
     if (groups_ec != EC_OK) {
@@ -5565,9 +6308,36 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
             overall = FirstHardError(overall, instances_ec);
             continue;
         }
-        const bool has_kv_meta_instance = std::any_of(instances.begin(), instances.end(), [](const auto &instance) {
-            return instance && IsKvMetaInstance(*instance);
-        });
+        bool has_kv_meta_instance = false;
+        bool has_ordinary_instance = false;
+        bool has_invalid_instance = false;
+        for (const auto &registered_instance : instances) {
+            if (!registered_instance) {
+                has_invalid_instance = true;
+            } else if (IsKvMetaInstance(*registered_instance)) {
+                has_kv_meta_instance = true;
+            } else {
+                has_ordinary_instance = true;
+            }
+        }
+        if (has_invalid_instance) {
+            KVCM_LOG_ERROR("KVMeta recovery found a null instance in group[%s]; optional service remains gated",
+                           group->name().c_str());
+            overall = FirstHardError(overall, EC_CORRUPTION);
+            continue;
+        }
+        if (has_kv_meta_instance && has_ordinary_instance) {
+            // Old deployments could persist a mixed group before registration
+            // reserved KVMeta groups bidirectionally. Generic KV-cache recovery
+            // has already completed before this optional pass, so fail only the
+            // KVMeta gate instead of combining two incompatible quota and GC
+            // accounting domains.
+            KVCM_LOG_ERROR("KVMeta recovery rejected legacy mixed instance group[%s]; "
+                           "move KVMeta and ordinary instances into separate groups",
+                           group->name().c_str());
+            overall = FirstHardError(overall, EC_CONFIG_ERROR);
+            continue;
+        }
         if (has_kv_meta_instance) {
             recovered_kv_meta_groups.insert(group->name());
         }
@@ -5587,6 +6357,7 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
             ErrorCode instance_recovery_ec = EC_OK;
             bool removed_stale_in_pass = false;
             bool deferred_active_in_pass = false;
+            std::size_t recovered_key_count = 0;
             do {
                 removed_stale_in_pass = false;
                 deferred_active_in_pass = false;
@@ -5598,6 +6369,12 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                     break;
                 }
                 committed_usage_by_type.fill(0);
+                recovered_key_count = 0;
+                // Redis SCAN (and compatible cursor backends) may legally
+                // return the same primary key more than once in one complete
+                // iteration. Recovery accounting must be exact, so count and
+                // sum every metadata bucket at most once per stable pass.
+                std::unordered_set<std::int64_t> recovered_keys_in_pass;
                 std::vector<SessionItem> stale_batch;
                 stale_batch.reserve(kMaintenanceDeleteBatchSize);
                 const auto flush_stale = [&]() {
@@ -5613,7 +6390,9 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                     const char *failure_kind = "error_code";
                     try {
                         physical_ec = DeleteAllocatedLocations(&request_context, stale_batch);
-                    } catch (const std::exception &) { failure_kind = "standard_exception"; } catch (...) {
+                    } catch (const std::exception &) {
+                        failure_kind = "standard_exception";
+                    } catch (...) {
                         failure_kind = "unknown_exception";
                     }
                     if (physical_ec != EC_OK) {
@@ -5667,15 +6446,38 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                         break;
                     }
                     if (!keys.empty()) {
+                        KeyVector unique_keys;
+                        unique_keys.reserve(keys.size());
+                        for (const auto key : keys) {
+                            if (recovered_keys_in_pass.insert(key).second) {
+                                unique_keys.push_back(key);
+                            }
+                        }
+                        if (unique_keys.empty()) {
+                            cursor = std::move(next_cursor);
+                            continue;
+                        }
+                        if (unique_keys.size() > std::numeric_limits<std::size_t>::max() - recovered_key_count ||
+                            recovered_key_count + unique_keys.size() >
+                                static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
+                            instance_recovery_ec = FirstHardError(instance_recovery_ec, EC_OUT_OF_LIMIT);
+                            break;
+                        }
+                        recovered_key_count += unique_keys.size();
                         CacheLocationMapVector locations;
-                        const auto get_result = indexer->GetLocations(&request_context, keys, locations);
-                        if (get_result.ec != EC_OK || locations.size() != keys.size() ||
-                            get_result.error_codes.size() != keys.size()) {
+                        // Recovery must not make every cached object appear
+                        // freshly read. Use the maintenance path, which reads
+                        // the authoritative owner map without touching LRU
+                        // heat or scheduling a hot-cache backfill.
+                        const auto get_result =
+                            indexer->GetLocationMapsForMaintenance(&request_context, unique_keys, locations);
+                        if (get_result.ec != EC_OK || locations.size() != unique_keys.size() ||
+                            get_result.error_codes.size() != unique_keys.size()) {
                             instance_recovery_ec = FirstHardError(instance_recovery_ec,
                                                                   get_result.ec == EC_OK ? EC_MISMATCH : get_result.ec);
                             break;
                         }
-                        for (std::size_t i = 0; i < keys.size() && instance_recovery_ec == EC_OK; ++i) {
+                        for (std::size_t i = 0; i < unique_keys.size() && instance_recovery_ec == EC_OK; ++i) {
                             if (get_result.error_codes[i] != EC_OK || locations[i].empty()) {
                                 instance_recovery_ec = FirstHardError(
                                     instance_recovery_ec,
@@ -5688,8 +6490,12 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                                     break;
                                 }
                                 std::uint64_t size = 0;
-                                const ErrorCode validate_ec = ValidateOwnedLocation(
-                                    &request_context, instance->instance_id(), keys[i], location_id, *location, size);
+                                const ErrorCode validate_ec = ValidateOwnedLocation(&request_context,
+                                                                                    instance->instance_id(),
+                                                                                    unique_keys[i],
+                                                                                    location_id,
+                                                                                    *location,
+                                                                                    size);
                                 const DataStorageType base_type = ToBaseType(location->type());
                                 const std::size_t type_index = ToIndex(base_type);
                                 if (validate_ec != EC_OK || base_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN ||
@@ -5719,7 +6525,8 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                                     }
                                     removed_stale_in_pass = true;
                                     auto copy = std::make_shared<CacheLocation>(*location);
-                                    stale_batch.push_back(SessionItem{0, {}, keys[i], location_id, copy, copy, size});
+                                    stale_batch.push_back(
+                                        SessionItem{0, {}, unique_keys[i], location_id, copy, copy, size});
                                     if (stale_batch.size() == kMaintenanceDeleteBatchSize) {
                                         if (should_abort && should_abort()) {
                                             return EC_SERVICE_NOT_LEADER;
@@ -5762,7 +6569,8 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                                 }
                                 removed_stale_in_pass = true;
                                 auto copy = std::make_shared<CacheLocation>(*location);
-                                stale_batch.push_back(SessionItem{0, {}, keys[i], location_id, copy, copy, size});
+                                stale_batch.push_back(
+                                    SessionItem{0, {}, unique_keys[i], location_id, copy, copy, size});
                                 if (stale_batch.size() == kMaintenanceDeleteBatchSize) {
                                     if (should_abort && should_abort()) {
                                         return EC_SERVICE_NOT_LEADER;
@@ -5825,7 +6633,12 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
                     }
                     indexer->SetStorageUsageByType(type, committed_usage_by_type[type_index]);
                 }
-                indexer->PersistMetaData();
+                if (!indexer->SetKeyCountForRecovery(recovered_key_count) || !indexer->PersistMetaDataNow()) {
+                    // Do not open admission on a repaired in-memory ledger
+                    // whose durable checkpoint is still stale. The leader's
+                    // recovery loop retries from a fresh stable scan.
+                    instance_recovery_ec = FirstHardError(instance_recovery_ec, EC_IO_ERROR);
+                }
             }
             if (instance_recovery_ec == EC_OUTCOME_UNKNOWN) {
                 // An uncertain physical Delete is namespace-wide evidence
@@ -5841,6 +6654,8 @@ ErrorCode KvMetaManager::DoRecover(std::function<bool()> should_abort) {
     }
     if (overall == EC_OK) {
         ReplaceKvMetaGroups(std::move(recovered_kv_meta_groups));
+        std::lock_guard<std::mutex> lock(recovery_window_mutex_);
+        recovery_force_deadline_.reset();
     }
     return overall;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 #if defined(USING_CUDA)
 #include <cuda_runtime.h>
@@ -44,6 +45,15 @@ private:
     std::map<std::string, int64_t> spec_byte_sizes_per_block_;
     bool variable_object_size_enabled_{false};
     std::uint64_t max_variable_object_bytes_{0};
+    // Present for production KVMeta NFS clients (SdkWrapper always supplies
+    // StorageConfig). Direct legacy SDK tests may omit StorageConfig and keep
+    // the historical path-based behavior.
+    std::string kv_meta_nfs_root_path_;
+    // Production KVMeta clients pin the configured namespace for their whole
+    // lifetime. Every child open is relative to a duplicate of this descriptor
+    // and each successful operation also verifies that the absolute configured
+    // path still resolves to the same directory before returning its URI/data.
+    int kv_meta_nfs_root_fd_{-1};
     SdkTimeoutConfig timeout_config_; // Init 时由 wrapper 注入的静态超时预算
 #if defined(USING_CUDA)
     cudaStream_t cuda_stream_ = nullptr;

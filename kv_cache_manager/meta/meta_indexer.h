@@ -192,6 +192,11 @@ public:
     bool ParallelForQuery(std::size_t count, const QueryExecutor::RangeFunction &fn) const noexcept;
 
     void PersistMetaData() noexcept;
+    // Recovery has just completed an authoritative, stable namespace scan.
+    // Replace the periodically persisted estimate and force the repaired
+    // metadata to durable storage before the service gate is opened.
+    bool SetKeyCountForRecovery(std::size_t key_count) noexcept;
+    bool PersistMetaDataNow() noexcept;
     size_t GetKeyCount() const noexcept;
     size_t GetMaxKeyCount() const noexcept;
     size_t GetMemUsage() const noexcept;

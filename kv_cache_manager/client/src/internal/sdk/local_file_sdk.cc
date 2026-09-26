@@ -1,6 +1,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/local_file_sdk.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -21,6 +22,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/util/debug_string_util.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 
 namespace {
 
@@ -55,7 +57,7 @@ bool IsExactObjectBuffer(const kv_cache_manager::BlockBuffer &buffer, const std:
 
 bool HasExistingKvMetaNamespaceRoot(const std::string &object_path) noexcept {
     try {
-        // object = root/kvmeta/instance-hash/key-hash/nonce. The configured
+        // object = root/kvmeta/instance-hash/key-fingerprint/generation. The configured
         // root is a deployment boundary and must already be mounted. Creating
         // it lazily could write to the local mountpoint after an NFS outage.
         std::filesystem::path root(object_path);
@@ -80,9 +82,165 @@ bool HasExistingKvMetaNamespaceRoot(const std::string &object_path) noexcept {
         return true;
     } catch (const std::exception &e) {
         KVCM_LOG_ERROR("KVMeta namespace root validation caught exception: %s", e.what());
-    } catch (...) { KVCM_LOG_ERROR("KVMeta namespace root validation caught unknown exception"); }
+    } catch (...) {
+        KVCM_LOG_ERROR("KVMeta namespace root validation caught unknown exception");
+    }
     return false;
 }
+
+// Opens a canonical KVMeta object strictly below one configured NFS root.
+// Child lookup and creation are descriptor-relative and reject symlinks at
+// every component. This keeps a corrupt shared namespace from redirecting a
+// cache read/write outside its backend even if the path is replaced between
+// validation and open.
+class AnchoredKvMetaObject {
+public:
+    AnchoredKvMetaObject() = default;
+    ~AnchoredKvMetaObject() {
+        Close(file_fd_);
+        for (int &fd : directory_fds_) {
+            Close(fd);
+        }
+    }
+
+    AnchoredKvMetaObject(const AnchoredKvMetaObject &) = delete;
+    AnchoredKvMetaObject &operator=(const AnchoredKvMetaObject &) = delete;
+
+    bool Open(const std::string &root_path,
+              const std::string &object_path,
+              bool create_exclusive,
+              int anchored_root_fd = -1) noexcept {
+        try {
+            std::string_view object_key;
+            if (root_path.empty() || root_path.back() != '/' ||
+                !kv_cache_manager::TryGetCanonicalKvMetaObjectKeyFromPath(object_path, object_key) ||
+                object_path != root_path + std::string(object_key)) {
+                return false;
+            }
+            std::array<std::string_view, 4> components;
+            std::size_t component_begin = 0;
+            for (std::size_t i = 0; i < components.size(); ++i) {
+                const std::size_t component_end = object_key.find('/', component_begin);
+                if ((i + 1 < components.size() && component_end == std::string_view::npos) ||
+                    (i + 1 == components.size() && component_end != std::string_view::npos)) {
+                    return false;
+                }
+                const std::size_t end = component_end == std::string_view::npos ? object_key.size() : component_end;
+                components[i] = object_key.substr(component_begin, end - component_begin);
+                component_begin = end + 1;
+            }
+
+            if (anchored_root_fd >= 0) {
+                directory_fds_[0] = ::fcntl(anchored_root_fd, F_DUPFD_CLOEXEC, 0);
+            } else {
+                std::string root = root_path;
+                while (root.size() > 1 && root.back() == '/') {
+                    root.pop_back();
+                }
+                directory_fds_[0] = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            }
+            if (directory_fds_[0] < 0) {
+                return false;
+            }
+            for (std::size_t i = 0; i < 3; ++i) {
+                const std::string component(components[i]);
+                if (create_exclusive) {
+                    errno = 0;
+                    if (::mkdirat(directory_fds_[i], component.c_str(), 0755) != 0 && errno != EEXIST) {
+                        return false;
+                    }
+                }
+                directory_fds_[i + 1] =
+                    ::openat(directory_fds_[i], component.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+                if (directory_fds_[i + 1] < 0) {
+                    return false;
+                }
+            }
+            leaf_.assign(components[3]);
+            const int flags = create_exclusive ? O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW
+                                               : O_RDONLY | O_CLOEXEC | O_NOFOLLOW;
+            file_fd_ = ::openat(directory_fds_[3], leaf_.c_str(), flags, 0644);
+            return file_fd_ >= 0;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    int ReleaseFileFd() noexcept {
+        const int fd = file_fd_;
+        file_fd_ = -1;
+        return fd;
+    }
+
+    bool SyncDirectories() const noexcept {
+        for (auto it = directory_fds_.rbegin(); it != directory_fds_.rend(); ++it) {
+            if (*it < 0 || ::fsync(*it) != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool NamespaceRootStillCurrent(const std::string &root_path) const noexcept {
+        try {
+            if (directory_fds_[0] < 0) {
+                return false;
+            }
+            std::string root = root_path;
+            while (root.size() > 1 && root.back() == '/') {
+                root.pop_back();
+            }
+            const int current_fd = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            if (current_fd < 0) {
+                return false;
+            }
+            struct stat anchored_stat{};
+            struct stat current_stat{};
+            const bool matches = ::fstat(directory_fds_[0], &anchored_stat) == 0 &&
+                                 ::fstat(current_fd, &current_stat) == 0 && S_ISDIR(anchored_stat.st_mode) &&
+                                 S_ISDIR(current_stat.st_mode) && anchored_stat.st_dev == current_stat.st_dev &&
+                                 anchored_stat.st_ino == current_stat.st_ino;
+            (void)::close(current_fd);
+            return matches;
+        } catch (...) {
+            // This method is called after data has already moved. Resource
+            // pressure must fail this operation and trigger rollback, never
+            // escape a noexcept boundary and terminate the client process.
+            return false;
+        }
+    }
+
+    bool RemoveIfSame(dev_t device, ino_t inode) const noexcept {
+        if (directory_fds_[3] < 0 || leaf_.empty()) {
+            return false;
+        }
+        struct stat current{};
+        errno = 0;
+        if (::fstatat(directory_fds_[3], leaf_.c_str(), &current, AT_SYMLINK_NOFOLLOW) != 0) {
+            return errno == ENOENT;
+        }
+        if (!S_ISREG(current.st_mode) || current.st_dev != device || current.st_ino != inode) {
+            return false;
+        }
+        errno = 0;
+        if (::unlinkat(directory_fds_[3], leaf_.c_str(), 0) != 0 && errno != ENOENT) {
+            return false;
+        }
+        return ::fsync(directory_fds_[3]) == 0;
+    }
+
+private:
+    static void Close(int &fd) noexcept {
+        if (fd >= 0) {
+            (void)::close(fd);
+            fd = -1;
+        }
+    }
+
+    std::array<int, 4> directory_fds_{{-1, -1, -1, -1}};
+    int file_fd_{-1};
+    std::string leaf_;
+};
 
 class MmapHelper {
 public:
@@ -173,10 +331,17 @@ private:
 // unlinking a replacement installed by another process in a shared namespace.
 class ExclusiveFileCleanupGuard {
 public:
-    explicit ExclusiveFileCleanupGuard(const std::string &path) : path_(path) {}
+    explicit ExclusiveFileCleanupGuard(const std::string &path, const AnchoredKvMetaObject *anchored = nullptr)
+        : path_(path), anchored_(anchored) {}
 
     ~ExclusiveFileCleanupGuard() {
         if (!active_) {
+            return;
+        }
+        if (anchored_) {
+            if (!anchored_->RemoveIfSame(device_, inode_)) {
+                KVCM_LOG_WARN("KVMeta failed-write cleanup retained an anchored or replaced path: %s", path_.c_str());
+            }
             return;
         }
         struct stat current_stat;
@@ -206,6 +371,7 @@ public:
 
 private:
     const std::string &path_;
+    const AnchoredKvMetaObject *anchored_{nullptr};
     dev_t device_{0};
     ino_t inode_{0};
     bool active_{false};
@@ -370,6 +536,10 @@ void LogTimeoutAbort(const char *op,
 namespace kv_cache_manager {
 
 LocalFileSdk::~LocalFileSdk() {
+    if (kv_meta_nfs_root_fd_ >= 0) {
+        (void)::close(kv_meta_nfs_root_fd_);
+        kv_meta_nfs_root_fd_ = -1;
+    }
 #if defined(USING_CUDA)
     if (cuda_stream_) {
         CHECK_CUDA_ERROR(cudaStreamDestroy(cuda_stream_), "destroy cuda stream error");
@@ -404,6 +574,35 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
     if (variable_object_size_enabled_ && max_variable_object_bytes_ == 0) {
         KVCM_LOG_WARN("Init local file sdk failed, max variable object bytes is zero");
         return ER_INVALID_SDKBACKEND_CONFIG;
+    }
+    kv_meta_nfs_root_path_.clear();
+    if (kv_meta_nfs_root_fd_ >= 0) {
+        (void)::close(kv_meta_nfs_root_fd_);
+        kv_meta_nfs_root_fd_ = -1;
+    }
+    if (variable_object_size_enabled_ && storage_config) {
+        const auto nfs_spec = std::dynamic_pointer_cast<NfsStorageSpec>(storage_config->storage_spec());
+        if (storage_config->type() != DataStorageType::DATA_STORAGE_TYPE_NFS || !nfs_spec ||
+            !HasCanonicalKvMetaNfsRootPath(nfs_spec->root_path())) {
+            KVCM_LOG_WARN("Init local file sdk failed, KVMeta NFS root is not a canonical absolute directory");
+            return ER_INVALID_SDKBACKEND_CONFIG;
+        }
+        kv_meta_nfs_root_path_ = nfs_spec->root_path();
+        std::string root = kv_meta_nfs_root_path_;
+        while (root.size() > 1 && root.back() == '/') {
+            root.pop_back();
+        }
+        kv_meta_nfs_root_fd_ = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        struct stat root_stat{};
+        if (kv_meta_nfs_root_fd_ < 0 || ::fstat(kv_meta_nfs_root_fd_, &root_stat) != 0 || !S_ISDIR(root_stat.st_mode)) {
+            if (kv_meta_nfs_root_fd_ >= 0) {
+                (void)::close(kv_meta_nfs_root_fd_);
+                kv_meta_nfs_root_fd_ = -1;
+            }
+            kv_meta_nfs_root_path_.clear();
+            KVCM_LOG_WARN("Init local file sdk failed, KVMeta NFS root cannot be anchored");
+            return ER_INVALID_STORAGE_CONFIG;
+        }
     }
     timeout_config_ = sdk_backend_config->timeout_config();
 #if defined(USING_CUDA)
@@ -632,18 +831,29 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
         KVCM_LOG_ERROR("Get failed, KVMeta local-file allocation must contain exactly one block");
         return ER_INVALID_PARAMS;
     }
-    std::error_code exists_ec;
-    const bool file_exists = std::filesystem::exists(file_path, exists_ec);
-    if (exists_ec) {
-        KVCM_LOG_ERROR("Get failed, cannot inspect file %s: %s", file_path.c_str(), exists_ec.message().c_str());
-        return ER_FILE_IO_ERROR;
+    AnchoredKvMetaObject anchored_object;
+    int fd = -1;
+    if (variable_object_size_enabled_ && !kv_meta_nfs_root_path_.empty()) {
+        if (!anchored_object.Open(kv_meta_nfs_root_path_, file_path, false, kv_meta_nfs_root_fd_)) {
+            KVCM_LOG_ERROR("Get failed, KVMeta object is absent or escaped its anchored NFS namespace: %s",
+                           file_path.c_str());
+            return ER_FILE_IO_ERROR;
+        }
+        fd = anchored_object.ReleaseFileFd();
+    } else {
+        std::error_code exists_ec;
+        const bool file_exists = std::filesystem::exists(file_path, exists_ec);
+        if (exists_ec) {
+            KVCM_LOG_ERROR("Get failed, cannot inspect file %s: %s", file_path.c_str(), exists_ec.message().c_str());
+            return ER_FILE_IO_ERROR;
+        }
+        if (!file_exists) {
+            KVCM_LOG_WARN("Get failed, file %s is not exist", file_path.c_str());
+            return ER_FILE_IO_ERROR;
+        }
+        const int open_flags = variable_object_size_enabled_ ? O_RDONLY | O_CLOEXEC | O_NOFOLLOW : O_RDONLY;
+        fd = ::open(file_path.c_str(), open_flags);
     }
-    if (!file_exists) {
-        KVCM_LOG_WARN("Get failed, file %s is not exist", file_path.c_str());
-        return ER_FILE_IO_ERROR;
-    }
-    const int open_flags = variable_object_size_enabled_ ? O_RDONLY | O_CLOEXEC | O_NOFOLLOW : O_RDONLY;
-    int fd = ::open(file_path.c_str(), open_flags);
     if (fd < 0) {
         KVCM_LOG_ERROR("Get failed, open file %s failed", file_path.c_str());
         return ER_FILE_IO_ERROR;
@@ -806,6 +1016,12 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
     }
 #endif
 
+    if (variable_object_size_enabled_ && !kv_meta_nfs_root_path_.empty() &&
+        !anchored_object.NamespaceRootStillCurrent(kv_meta_nfs_root_path_)) {
+        KVCM_LOG_ERROR("Get failed, KVMeta NFS namespace root changed during the object read: %s", file_path.c_str());
+        return ER_FILE_IO_ERROR;
+    }
+
     return ER_OK;
 }
 
@@ -859,26 +1075,39 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
         KVCM_LOG_ERROR("Put failed, required file size is invalid: %zu", required_size);
         return ER_INVALID_PARAMS;
     }
-    if (variable_object_size_enabled_) {
-        if (!HasExistingKvMetaNamespaceRoot(file_path)) {
+    AnchoredKvMetaObject anchored_object;
+    int fd = -1;
+    if (variable_object_size_enabled_ && !kv_meta_nfs_root_path_.empty()) {
+        if (!anchored_object.Open(kv_meta_nfs_root_path_, file_path, true, kv_meta_nfs_root_fd_)) {
+            KVCM_LOG_ERROR("Put failed, KVMeta object could not be created in its anchored NFS namespace: %s",
+                           file_path.c_str());
             return ER_FILE_IO_ERROR;
         }
-        std::error_code directory_ec;
-        std::filesystem::create_directories(std::filesystem::path(file_path).parent_path(), directory_ec);
-        if (directory_ec) {
-            KVCM_LOG_ERROR("Put failed, cannot create KVMeta parent directories for %s: %s",
-                           file_path.c_str(),
-                           directory_ec.message().c_str());
-            return ER_FILE_IO_ERROR;
+        fd = anchored_object.ReleaseFileFd();
+    } else {
+        if (variable_object_size_enabled_) {
+            if (!HasExistingKvMetaNamespaceRoot(file_path)) {
+                return ER_FILE_IO_ERROR;
+            }
+            std::error_code directory_ec;
+            std::filesystem::create_directories(std::filesystem::path(file_path).parent_path(), directory_ec);
+            if (directory_ec) {
+                KVCM_LOG_ERROR("Put failed, cannot create KVMeta parent directories for %s: %s",
+                               file_path.c_str(),
+                               directory_ec.message().c_str());
+                return ER_FILE_IO_ERROR;
+            }
         }
+        const int open_flags =
+            variable_object_size_enabled_ ? O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW : O_RDWR;
+        fd = ::open(file_path.c_str(), open_flags, 0644);
     }
-    const int open_flags = variable_object_size_enabled_ ? O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW : O_RDWR;
-    int fd = ::open(file_path.c_str(), open_flags, 0644);
     if (fd < 0) {
         KVCM_LOG_ERROR("Put failed, open file %s failed: %s", file_path.c_str(), std::strerror(errno));
         return ER_FILE_IO_ERROR;
     }
-    ExclusiveFileCleanupGuard failed_write_cleanup(file_path);
+    ExclusiveFileCleanupGuard failed_write_cleanup(
+        file_path, variable_object_size_enabled_ && !kv_meta_nfs_root_path_.empty() ? &anchored_object : nullptr);
     if (variable_object_size_enabled_) {
         struct stat opened_file_stat;
         if (fstat(fd, &opened_file_stat) != 0 || !S_ISREG(opened_file_stat.st_mode)) {
@@ -1020,11 +1249,24 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
         KVCM_LOG_ERROR("KVMeta Put fsync failed for file %s", file_path.c_str());
         return ER_FILE_IO_ERROR;
     }
+    if (variable_object_size_enabled_ && !kv_meta_nfs_root_path_.empty() && !anchored_object.SyncDirectories()) {
+        KVCM_LOG_ERROR("KVMeta Put could not persist anchored namespace directories for file %s", file_path.c_str());
+        return ER_FILE_IO_ERROR;
+    }
     if (variable_object_size_enabled_ && !SyncKvMetaObjectDirectories(file_path)) {
         // fsync(file) does not make a newly created directory entry durable.
         // The nonce file and each lazily-created KVMeta namespace directory
         // must survive the same crash boundary as the committed metadata.
         KVCM_LOG_ERROR("KVMeta Put could not persist namespace directories for file %s", file_path.c_str());
+        return ER_FILE_IO_ERROR;
+    }
+    if (variable_object_size_enabled_ && !kv_meta_nfs_root_path_.empty() &&
+        !anchored_object.NamespaceRootStillCurrent(kv_meta_nfs_root_path_)) {
+        // The write was made relative to the lifetime anchor, but publishing
+        // an absolute URI after the configured namespace was replaced would
+        // point future readers at another tree. The cleanup guard removes the
+        // detached generation before this failure is returned.
+        KVCM_LOG_ERROR("KVMeta Put detected a replaced NFS namespace root for file %s", file_path.c_str());
         return ER_FILE_IO_ERROR;
     }
     if (variable_object_size_enabled_) {
@@ -1046,7 +1288,21 @@ bool LocalFileSdk::SyncFileDescriptor(const int fd) const { return fsync(fd) == 
 
 bool LocalFileSdk::SyncKvMetaObjectDirectories(const std::string &object_path) const noexcept {
     try {
-        // A canonical object is root/kvmeta/instance-hash/key-hash/nonce.
+        if (!kv_meta_nfs_root_path_.empty()) {
+            std::string_view object_key;
+            if (!TryGetCanonicalKvMetaObjectKeyFromPath(object_path, object_key) ||
+                kv_meta_nfs_root_path_.back() != '/' ||
+                object_path != kv_meta_nfs_root_path_ + std::string(object_key)) {
+                return false;
+            }
+            // AnchoredKvMetaObject::SyncDirectories has already fsynced the
+            // held openat chain deepest-first. Keep this virtual method as the
+            // existing deterministic failure seam, but never reopen absolute
+            // child paths whose intermediate components could have become
+            // symlinks after the anchored write.
+            return true;
+        }
+        // A canonical object is root/kvmeta/instance-hash/key-fingerprint/generation.
         // Persist deepest-first so both the file entry and every directory
         // entry created on first use are covered before metadata publication.
         std::filesystem::path directory = std::filesystem::path(object_path).parent_path();
@@ -1077,7 +1333,9 @@ bool LocalFileSdk::SyncKvMetaObjectDirectories(const std::string &object_path) c
         return true;
     } catch (const std::exception &e) {
         KVCM_LOG_ERROR("KVMeta Put namespace sync caught exception: %s", e.what());
-    } catch (...) { KVCM_LOG_ERROR("KVMeta Put namespace sync caught unknown exception"); }
+    } catch (...) {
+        KVCM_LOG_ERROR("KVMeta Put namespace sync caught unknown exception");
+    }
     return false;
 }
 

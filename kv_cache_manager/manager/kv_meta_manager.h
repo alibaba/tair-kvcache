@@ -2,11 +2,13 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -150,6 +152,11 @@ private:
         ErrorCode ec = EC_OK;
         bool metadata_outcome_changed = false;
         bool metadata_cleanup_complete = false;
+        // True only when every unfinished item has a durable CLS_DELETING
+        // owner and the online Reclaimer atomically accepted responsibility
+        // for retrying physical deletion and metadata finalization. Callers
+        // may keep KVMeta admission open in this one incomplete case.
+        bool online_cleanup_owned = false;
         bool metadata_already_absent = false;
         bool metadata_owner_conflicted = false;
         // Request-aligned evidence used by the Reclaimer to distinguish its
@@ -227,6 +234,11 @@ private:
     mutable std::array<std::mutex, 64> quota_admission_mutexes_;
     // Each set is accessed only while holding the matching shard above.
     std::array<std::unordered_set<std::string>, 64> trimming_instances_;
+    // One promotion/recovery epoch has one bounded force deadline. Transient
+    // physical cleanup failures must not restart the full old-writer grace on
+    // every retry; successful recovery or demotion clears the epoch.
+    mutable std::mutex recovery_window_mutex_;
+    std::optional<std::chrono::steady_clock::time_point> recovery_force_deadline_;
     std::atomic<bool> maintenance_cancelled_{false};
     std::atomic<bool> initialized_{false};
 };

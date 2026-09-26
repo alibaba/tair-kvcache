@@ -59,7 +59,10 @@ cc_library(
 cc_library(
     name = "kv_meta_instance",
     hdrs = ["kv_meta_instance.h"],
-    deps = ["//kv_cache_manager/config"],
+    deps = [
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/data_storage:kv_meta_identity",
+    ],
 )
 
 cc_library(

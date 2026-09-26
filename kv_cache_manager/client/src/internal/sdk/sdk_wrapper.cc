@@ -133,6 +133,14 @@ ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &cl
     }
     variable_object_size_enabled_ = variable_object_size_enabled;
     max_variable_object_bytes_ = max_object_bytes;
+    kv_meta_instance_path_hash_.clear();
+    if (variable_object_size_enabled) {
+        kv_meta_instance_path_hash_ = BuildKvMetaInstancePathHash(client_config->instance_id());
+        if (kv_meta_instance_path_hash_.empty()) {
+            KVCM_LOG_WARN("KVMeta instance identity could not be derived");
+            return ER_INVALID_CLIENT_CONFIG;
+        }
+    }
     const auto source_wrapper_config = client_config->sdk_wrapper_config();
     if (!source_wrapper_config) {
         KVCM_LOG_WARN("sdk wrapper config is null");
@@ -470,6 +478,8 @@ ClientErrorCode SdkWrapper::ValidateKvMetaObjects(const std::vector<DataStorageU
         return ER_INVALID_PARAMS;
     }
     std::uint64_t batch_bytes = 0;
+    std::unordered_set<std::string> physical_allocations;
+    physical_allocations.reserve(remote_uris.size());
     for (std::size_t i = 0; i < remote_uris.size(); ++i) {
         const auto expected_size = value_sizes[i];
         const auto &uri = remote_uris[i];
@@ -488,9 +498,16 @@ ClientErrorCode SdkWrapper::ValidateKvMetaObjects(const std::vector<DataStorageU
         if (storage_config == sdk_storage_configs_.end() || !storage_config->second ||
             !SupportsKvMetaAdmission(storage_type->second) || !UriMatchesStorageType(uri, storage_type->second) ||
             !HasOwnedKvMetaAllocationShape(uri, storage_type->second) ||
+            !KvMetaUriBelongsToInstance(uri, storage_type->second, kv_meta_instance_path_hash_) ||
             !UriMatchesConfiguredKvMetaNamespace(uri, storage_type->second, *storage_config->second)) {
             KVCM_LOG_WARN("KVMeta URI scheme, ownership, or configured namespace does not match backend: %s",
                           uri.GetHostName().c_str());
+            return ER_INVALID_PARAMS;
+        }
+        std::string physical_identity;
+        if (!GetKvMetaPhysicalAllocationIdentity(storage_type->second, uri, physical_identity) ||
+            !physical_allocations.insert(std::move(physical_identity)).second) {
+            KVCM_LOG_WARN("KVMeta batch contains an invalid or duplicate physical allocation");
             return ER_INVALID_PARAMS;
         }
         batch_bytes += expected_size;
@@ -777,7 +794,7 @@ ClientErrorCode SdkWrapper::PrepareSharedMemoryRegistration(const SharedMemoryRe
         return ER_INVALID_PARAMS;
     }
 
-    struct stat file_stat {};
+    struct stat file_stat{};
     if (fstat(shared_memory_registration.fd, &file_stat) != 0 || file_stat.st_size < 0 ||
         static_cast<uintmax_t>(file_stat.st_size) < shared_memory_registration.size) {
         KVCM_LOG_WARN("shared memory fd is invalid or smaller than the registered range");

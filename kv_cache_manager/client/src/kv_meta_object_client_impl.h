@@ -17,7 +17,8 @@ public:
     KvMetaObjectClientImpl(std::unique_ptr<KvMetaClient> metadata_client,
                            std::unique_ptr<KvMetaTransferClient> transfer_client,
                            std::uint64_t max_object_bytes,
-                           std::int32_t write_timeout_seconds);
+                           std::int32_t write_timeout_seconds,
+                           std::string instance_id = {});
     ~KvMetaObjectClientImpl() override = default;
 
     ClientErrorCode SaveObjects(const std::string &trace_id,
@@ -51,9 +52,10 @@ private:
                                            const std::vector<std::uint64_t> &value_sizes,
                                            const BlockBuffers &object_buffers,
                                            std::uint64_t max_object_bytes);
-    static ClientErrorCode ExtractUris(const std::vector<KvMetaValueLocation> &locations,
-                                       const std::vector<std::uint64_t> &value_sizes,
-                                       UriStrVec &uris);
+    ClientErrorCode ExtractUris(const std::vector<KvMetaValueLocation> &locations,
+                                const std::vector<std::string> &keys,
+                                const std::vector<std::uint64_t> &value_sizes,
+                                UriStrVec &uris) const;
     ClientErrorCode AbortWrite(const std::string &trace_id,
                                const std::string &write_session_id,
                                std::size_t location_count,
@@ -65,6 +67,9 @@ private:
     std::unique_ptr<KvMetaTransferClient> transfer_client_;
     std::uint64_t max_object_bytes_{0};
     std::int32_t write_timeout_seconds_{0};
+    // Non-empty for every public factory-created client. The empty value is
+    // retained only for isolated implementation tests with synthetic URIs.
+    std::string instance_id_;
     std::mutex mutex_;
     std::condition_variable lifecycle_condition_;
     std::size_t active_operations_{0};

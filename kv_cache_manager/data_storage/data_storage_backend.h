@@ -92,6 +92,23 @@ private:
 // but its ordinary Delete result is not proof of physical absence.
 class KvMetaDataStorageBackendExtension {
 public:
+    struct CreatePreflightResult {
+        ErrorCode ec = EC_OK;
+        // Minimum backend-owned capacity that must become reusable before this
+        // exact batch can fit. Both values are zero on EC_OK. EC_NOSPC must
+        // report at least one non-zero shortage so the reclaimer has a bounded
+        // progress target instead of blindly evicting the cache.
+        std::uint64_t reclaim_bytes = 0;
+        std::uint64_t reclaim_objects = 0;
+    };
+
+    struct CreatePreflightItem {
+        // The immutable, backend-facing generation key that will be passed to
+        // CreateForKvMeta if this zero-allocation check succeeds.
+        std::string allocation_key;
+        std::uint64_t value_size = 0;
+    };
+
     virtual ~KvMetaDataStorageBackendExtension() = default;
 
     // EC_OK means every named allocation is confirmed absent, not merely that
@@ -110,6 +127,18 @@ public:
     // interface prevents EMB rollout requirements from changing ordinary
     // KV-cache allocation behavior.
     virtual bool HasDedicatedKvMetaCreate() const noexcept { return false; }
+    // Read-only, zero-allocation capacity check for the complete StartWrite
+    // batch. Preserve each object's exact value size: physical allocation
+    // units and per-object metadata cannot in general be derived from only an
+    // aggregate byte count. A backend that reserves capacity inside each
+    // Create call can keep the default. Filesystem-like backends should
+    // override it so a batch that fits object-by-object but not in aggregate
+    // cannot livelock through repeated client-side partial writes and
+    // all-or-nothing rollback.
+    virtual CreatePreflightResult PreflightKvMetaCreate(const std::vector<CreatePreflightItem> &items) {
+        (void)items;
+        return {};
+    }
     virtual std::vector<std::pair<ErrorCode, DataStorageUri>> CreateForKvMeta(const std::vector<std::string> &keys,
                                                                               std::size_t size_per_key,
                                                                               const std::string &trace_id,
