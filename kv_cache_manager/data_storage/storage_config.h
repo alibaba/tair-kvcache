@@ -71,13 +71,13 @@ constexpr bool SupportsKvMetaCallerOwnedBufferLifetime(const DataStorageType &ty
     return IsKvMetaObjectStorageType(type) && type != DataStorageType::DATA_STORAGE_TYPE_MOONCAKE;
 }
 
-// Recognizing an ownership record and safely returning a caller buffer are
-// necessary but not sufficient for new cache admission. A writable EMB
-// backend must also provide independently deletable singleton objects and an
-// explicit retry-safety contract. HF3FS lacks a bounded terminal state for
-// timed-out submitted I/O today; VCNS-HF3FS uses the legacy shared-file
-// allocator; Dummy is test-only. Keep them readable for recovery, but do not
-// create new objects there.
+// Recognizing an old ownership record and safely returning a caller buffer
+// are necessary but not sufficient for new cache admission. A writable EMB
+// backend must also provide an independently deletable singleton generation
+// and prove physical absence before KVCM releases logical quota. HF3FS lacks
+// a bounded terminal state for timed-out submitted I/O today; VCNS-HF3FS uses
+// the legacy shared-file allocator; Dummy is test-only. Keep them readable by
+// IsKvMetaObjectStorageType for recovery, but do not create new objects there.
 constexpr bool SupportsKvMetaExactObjectLifecycle(const DataStorageType &type) noexcept {
     return type == DataStorageType::DATA_STORAGE_TYPE_NFS || type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
            type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;

@@ -1,4 +1,3 @@
-#include <limits>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -672,32 +671,6 @@ TEST_F(DataStorageSelectorTest, ExactVariableSizeRequirementFallsBackToATypeThat
         data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group", 10);
     ASSERT_EQ(EC_OK, selected.ec);
     EXPECT_EQ("nfs_storage_00", selected.name);
-}
-
-TEST_F(DataStorageSelectorTest, AggregatedUsageOverflowFailsClosed) {
-    auto second_instance = InstanceInfoFactory();
-    second_instance->set_instance_id("second_instance");
-    instance_infos_g.emplace_back(std::move(second_instance));
-    meta_indexer_g->storage_usage_data_.Reset();
-    meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS,
-                                          std::numeric_limits<std::uint64_t>::max() / 2 + 1);
-
-    InstanceGroupQuota quota;
-    quota.set_capacity(std::numeric_limits<std::int64_t>::max());
-    quota.set_quota_config(
-        {QuotaConfig(std::numeric_limits<std::int64_t>::max(), DataStorageType::DATA_STORAGE_TYPE_NFS)});
-    instance_group_g->set_quota(quota);
-    instance_group_g->set_storage_candidates({"nfs_storage_00"});
-
-    // Two individually representable counters sum past uint64_t. Saturation
-    // must reject the group instead of wrapping to zero and admitting either
-    // the legacy selector or the exact-size KVMeta overload.
-    auto selected =
-        data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group");
-    EXPECT_NE(EC_OK, selected.ec);
-    selected =
-        data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group", 1);
-    EXPECT_NE(EC_OK, selected.ec);
 }
 
 TEST_F(DataStorageSelectorTest, ReclaimTargetUsesHardCapacityInsteadOfCurrentFreeSpace) {

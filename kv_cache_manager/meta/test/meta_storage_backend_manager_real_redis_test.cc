@@ -242,7 +242,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestInitInvalidBackendTypesReject
     // Unknown persistent_type -> EC_ERROR (factory cannot construct bogus).
     {
         auto config = std::make_shared<MetaStorageBackendConfig>();
-        config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
+        config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
         config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
                               "?client_max_pool_size=4&persistent_type=bogus&cache_type=local");
         MetaStorageBackendManager mgr;
@@ -251,7 +251,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestInitInvalidBackendTypesReject
     // Unknown cache_type -> EC_ERROR.
     {
         auto config = std::make_shared<MetaStorageBackendConfig>();
-        config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
+        config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
         config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
                               "?client_max_pool_size=4&persistent_type=redis&cache_type=bogus");
         MetaStorageBackendManager mgr;

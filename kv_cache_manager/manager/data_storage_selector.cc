@@ -586,10 +586,7 @@ std::size_t DataStorageSelector::CalcGroupUsedSize(
         }
 
         meta_indexer->PersistMetaData();
-        const std::size_t usage = meta_indexer->GetStorageUsage();
-        group_used_byte_size = usage > std::numeric_limits<std::size_t>::max() - group_used_byte_size
-                                   ? std::numeric_limits<std::size_t>::max()
-                                   : group_used_byte_size + usage;
+        group_used_byte_size += meta_indexer->GetStorageUsage();
     }
 
     return group_used_byte_size;
@@ -620,9 +617,7 @@ void DataStorageSelector::GenStorageQuotaAvailTable(
             }
             meta_indexer->PersistMetaData();
             const std::uint64_t sz = meta_indexer->GetStorageUsageByType(type);
-            total_sz = sz > std::numeric_limits<std::uint64_t>::max() - total_sz
-                           ? std::numeric_limits<std::uint64_t>::max()
-                           : total_sz + sz;
+            total_sz += sz;
         }
 
         // The fixed-block path passes required_bytes == 0 and retains its

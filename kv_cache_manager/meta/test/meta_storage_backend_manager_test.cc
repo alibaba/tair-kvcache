@@ -11,6 +11,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
+#include "kv_cache_manager/meta/meta_async_redis_backend.h"
 #include "kv_cache_manager/meta/meta_dummy_backend.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_redis_backend.h"
@@ -94,6 +95,18 @@ public:
         out.assign(malformed ? 0 : keys.size(), CacheLocationMap{});
         return std::vector<ErrorCode>(keys.size(), malformed ? EC_OK : EC_ERROR);
     }
+};
+
+class RecordingMaintenanceTouchBackend : public MetaLocalBackend {
+public:
+    size_t TouchKeysForMaintenance(const KeyTypeVec &keys) noexcept override {
+        ++touch_calls;
+        touched_keys = keys;
+        return keys.size();
+    }
+
+    size_t touch_calls{0};
+    KeyTypeVec touched_keys;
 };
 
 class RecoverContractCacheBackend : public MetaLocalBackend {
@@ -517,10 +530,10 @@ TEST_F(MetaStorageBackendManagerTest, TestSingleTaskReclaimSamplingTracksActualS
     MetaStorageBackendManager mgr;
     EXPECT_FALSE(mgr.PreferSingleTaskReclaimSampling());
     mgr.persistent_backend_ = std::make_unique<MetaRedisBackend>();
-    EXPECT_FALSE(mgr.PreferSingleTaskReclaimSampling());
+    EXPECT_TRUE(mgr.PreferSingleTaskReclaimSampling());
     mgr.cache_backend_ = std::make_unique<MetaLocalBackend>();
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
-    EXPECT_FALSE(mgr.PreferSingleTaskReclaimSampling());
+    EXPECT_TRUE(mgr.PreferSingleTaskReclaimSampling());
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
     EXPECT_TRUE(mgr.PreferSingleTaskReclaimSampling());
     class NonLocalCache : public MetaLocalBackend {
@@ -531,6 +544,44 @@ TEST_F(MetaStorageBackendManagerTest, TestSingleTaskReclaimSamplingTracksActualS
     mgr.cache_backend_.reset();
     mgr.persistent_backend_ = std::make_unique<MetaLocalBackend>();
     EXPECT_TRUE(mgr.PreferSingleTaskReclaimSampling());
+    mgr.persistent_backend_ = std::make_unique<MetaAsyncRedisBackend>();
+    EXPECT_TRUE(mgr.PreferSingleTaskReclaimSampling());
+    mgr.persistent_backend_ = std::make_unique<NonLocalCache>();
+    mgr.cache_backend_ = std::make_unique<MetaLocalBackend>();
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    EXPECT_FALSE(mgr.PreferSingleTaskReclaimSampling());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestMaintenanceTouchFollowsCompleteLocalSamplingSource) {
+    MetaStorageBackendManager mgr;
+    KeyTypeVec sampled{9};
+    EXPECT_EQ(EC_ERROR, mgr.SampleReclaimKeys(nullptr, 1, sampled));
+    EXPECT_TRUE(sampled.empty());
+    EXPECT_EQ(0, mgr.TouchKeysForMaintenance({1}));
+
+    auto persistent = std::make_unique<RecordingMaintenanceTouchBackend>();
+    auto *persistent_ptr = persistent.get();
+    auto cache = std::make_unique<RecordingMaintenanceTouchBackend>();
+    auto *cache_ptr = cache.get();
+    mgr.persistent_backend_ = std::move(persistent);
+    mgr.cache_backend_ = std::move(cache);
+
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    EXPECT_EQ(2, mgr.TouchKeysForMaintenance({1, 2}));
+    EXPECT_EQ(1, persistent_ptr->touch_calls);
+    EXPECT_EQ((KeyTypeVec{1, 2}), persistent_ptr->touched_keys);
+    EXPECT_EQ(0, cache_ptr->touch_calls);
+
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    EXPECT_EQ(1, mgr.TouchKeysForMaintenance({3}));
+    EXPECT_EQ(1, persistent_ptr->touch_calls);
+    EXPECT_EQ(1, cache_ptr->touch_calls);
+    EXPECT_EQ((KeyTypeVec{3}), cache_ptr->touched_keys);
+
+    mgr.persistent_backend_ = std::make_unique<MetaRedisBackend>();
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    EXPECT_EQ(0, mgr.TouchKeysForMaintenance({4}));
+    EXPECT_EQ(1, cache_ptr->touch_calls);
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesUsesHotCacheTimeDuringRecovery) {

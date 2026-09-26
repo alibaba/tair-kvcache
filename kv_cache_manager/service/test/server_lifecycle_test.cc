@@ -1,13 +1,20 @@
 #include <chrono>
+#include <filesystem>
 #include <functional>
 #include <future>
 #include <grpcpp/grpcpp.h>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/nfs_backend.h"
 #include "kv_cache_manager/manager/cache_manager.h"
+#include "kv_cache_manager/manager/kv_meta_manager.h"
+#include "kv_cache_manager/manager/startup_config_loader.h"
 #include "kv_cache_manager/protocol/protobuf/kv_meta_service.grpc.pb.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.grpc.pb.h"
 #include "kv_cache_manager/service/kv_meta_service_impl.h"
@@ -17,6 +24,26 @@ using namespace kv_cache_manager;
 using namespace std::chrono_literals;
 
 namespace {
+
+class FailFirstExactDeleteNfsBackend : public NfsBackend {
+public:
+    explicit FailFirstExactDeleteNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
+        : NfsBackend(std::move(metrics_registry)) {}
+
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()> cb) override {
+        const std::size_t attempt = attempts_.fetch_add(1, std::memory_order_acq_rel);
+        if (cb) {
+            cb();
+        }
+        return std::vector<ErrorCode>(uris.size(), attempt == 0 ? EC_IO_ERROR : EC_OK);
+    }
+
+    std::size_t Attempts() const noexcept { return attempts_.load(std::memory_order_acquire); }
+
+private:
+    std::atomic<std::size_t> attempts_{0};
+};
 
 bool WaitUntil(const std::function<bool()> &predicate, std::chrono::steady_clock::duration timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -200,6 +227,57 @@ TEST_F(ServerLifecycleTest, KvMetaRecoveryWaitsForDeferredCacheRecoveryCompletio
     ASSERT_TRUE(WaitUntil(
         [&]() { return server_.kv_meta_impl_->is_accepting_leader_only_requests_.load(std::memory_order_acquire); },
         2s));
+    server_.CancelAndJoinKvMetaRecovery();
+}
+
+TEST_F(ServerLifecycleTest, KvMetaRecoveryRetriesTransientExactCleanupWithoutOpeningTheGate) {
+    ASSERT_TRUE(StartRpcServer(true));
+    ASSERT_TRUE(server_.kv_meta_manager_);
+    ASSERT_TRUE(server_.registry_manager_);
+    ASSERT_TRUE(server_.cache_manager_);
+    StartupConfigLoader loader;
+    ASSERT_TRUE(loader.Init(server_.registry_manager_));
+    ASSERT_TRUE(loader.Load(""));
+    const auto nfs_backend = server_.registry_manager_->data_storage_manager()->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(nfs_backend);
+    const auto nfs_spec = std::dynamic_pointer_cast<NfsStorageSpec>(nfs_backend->GetStorageConfig().storage_spec());
+    ASSERT_TRUE(nfs_spec);
+    std::error_code root_ec;
+    std::filesystem::create_directories(nfs_spec->root_path(), root_ec);
+    ASSERT_FALSE(root_ec) << root_ec.message();
+    RequestContext request_context("kv_meta_recovery_retry_test");
+    constexpr const char *kInstance = "recovery-retry-instance";
+    ASSERT_EQ(EC_OK,
+              server_.kv_meta_manager_->RegisterInstance(&request_context, "default", kInstance, "retry-test").first);
+    auto [start_ec, start] = server_.kv_meta_manager_->StartWrite(&request_context, kInstance, {"expired"}, {17}, 1);
+    ASSERT_EQ(EC_OK, start_ec);
+    ASSERT_FALSE(start.write_session_id.empty());
+
+    // Simulate promotion: volatile write-session ownership is gone, while the
+    // durable active reservation remains for recovery classification. Stop
+    // the local expiry owner before its deadline, then let the persisted lease
+    // expire as it would while no leader owns this optional service.
+    server_.kv_meta_manager_->DoCleanup();
+    std::this_thread::sleep_for(1100ms);
+    auto storage_manager = server_.registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto faulting = std::make_shared<FailFirstExactDeleteNfsBackend>(server_.metrics_registry_);
+    ASSERT_EQ(EC_OK, faulting->Open(original->GetStorageConfig(), request_context.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = faulting;
+    }
+    server_.cache_manager_->recover_complete_.store(true, std::memory_order_release);
+
+    server_.StartKvMetaRecovery();
+    ASSERT_TRUE(WaitUntil([&]() { return faulting->Attempts() >= 1; }, 2s));
+    EXPECT_FALSE(server_.kv_meta_impl_->is_accepting_leader_only_requests_.load(std::memory_order_acquire));
+    ASSERT_TRUE(WaitUntil(
+        [&]() { return server_.kv_meta_impl_->is_accepting_leader_only_requests_.load(std::memory_order_acquire); },
+        4s));
+    EXPECT_GE(faulting->Attempts(), 2);
     server_.CancelAndJoinKvMetaRecovery();
 }
 

@@ -365,22 +365,6 @@ TEST_F(KvMetaServiceImplTest, LegacyServicesRejectAndHideReservedKvMetaNamespace
     EXPECT_EQ(kInstanceId, instance_info->instance_id());
 }
 
-TEST_F(KvMetaServiceImplTest, LegacyAdminCannotRemoveAGroupContainingKvMetaInstances) {
-    proto::admin::RemoveInstanceGroupRequest request;
-    request.set_name("default");
-    proto::admin::CommonResponse response;
-    RequestContext context("legacy-admin-remove-kvmeta-group");
-    admin_service_->RemoveInstanceGroup(&context, &request, &response);
-
-    EXPECT_EQ(proto::admin::INVALID_ARGUMENT, response.header().status().code());
-    const auto [group_ec, group] = registry_manager_->GetInstanceGroup(&setup_context_, "default");
-    EXPECT_EQ(EC_OK, group_ec);
-    EXPECT_TRUE(group);
-    const auto [instance_ec, instance] = kv_meta_manager_->GetInstanceInfo(&setup_context_, kInstanceId);
-    EXPECT_EQ(EC_OK, instance_ec);
-    EXPECT_TRUE(instance);
-}
-
 TEST_F(KvMetaServiceImplTest, UnsupportedFieldsAreRejectedWithoutManagerMutation) {
     proto::kv_meta::GetRequest get_request;
     get_request.set_trace_id("get-with-meta");

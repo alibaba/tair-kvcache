@@ -5,40 +5,15 @@
 #include <string_view>
 
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/data_storage/kv_meta_identity.h"
 
 namespace kv_cache_manager {
 
-inline constexpr std::string_view kKvMetaInternalInstancePrefix = "__kv_meta_v1__";
 inline constexpr std::string_view kKvMetaLocationIdPrefix = "kvmeta:v1:";
 inline constexpr std::string_view kKvMetaValueSpecName = "value";
 inline constexpr std::string_view kKvMetaModelName = "__kv_meta_object__";
 inline constexpr std::string_view kKvMetaDtype = "opaque_bytes";
 inline constexpr std::string_view kKvMetaDeploymentExtra = "kv_meta_v1";
-
-// The complete prefix is reserved for KVMeta. Legacy Meta/Admin callers must
-// not be able to create, inspect, or mutate even a malformed/future version of
-// an internal instance id under this namespace.
-inline bool HasKvMetaReservedInstancePrefix(std::string_view instance_id) noexcept {
-    return instance_id.size() >= kKvMetaInternalInstancePrefix.size() &&
-           instance_id.compare(0, kKvMetaInternalInstancePrefix.size(), kKvMetaInternalInstancePrefix) == 0;
-}
-
-inline bool HasKvMetaInternalInstanceId(const std::string &instance_id) noexcept {
-    if (instance_id.size() <= kKvMetaInternalInstancePrefix.size() || !HasKvMetaReservedInstancePrefix(instance_id)) {
-        return false;
-    }
-    const std::size_t encoded_size = instance_id.size() - kKvMetaInternalInstancePrefix.size();
-    if ((encoded_size & 1U) != 0) {
-        return false;
-    }
-    for (std::size_t i = kKvMetaInternalInstancePrefix.size(); i < instance_id.size(); ++i) {
-        const char c = instance_id[i];
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
-            return false;
-        }
-    }
-    return true;
-}
 
 // A prefix alone is deliberately insufficient: recovery and background
 // maintenance must never treat an ordinary instance as a generic-object

@@ -397,15 +397,11 @@ void AdminServiceImpl::RemoveInstanceGroup(RequestContext *request_context,
     // with the purge below
     std::unique_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
 
-    ErrorCode ec_info = registry_manager_->RemoveInstanceGroupWithMemberGuard(
-        request_context, request->name(), [](const InstanceInfo &instance) {
-            return HasKvMetaReservedInstancePrefix(instance.instance_id()) ? EC_BADARGS : EC_OK;
-        });
+    ErrorCode ec_info = registry_manager_->RemoveInstanceGroup(request_context, request->name());
     if (ec_info != EC_OK) {
-        status->set_code(ec_info == EC_BADARGS ? proto::admin::INVALID_ARGUMENT : proto::admin::INTERNAL_ERROR);
+        status->set_code(proto::admin::INTERNAL_ERROR);
         request_context->set_status_code(status->code());
-        status->set_message(ec_info == EC_BADARGS ? "Cannot remove an instance group while KVMeta instances exist"
-                                                  : "Failed to remove instance group");
+        status->set_message("Failed to remove instance group");
         KVCM_LOG_ERROR("[traceId: %s] RemoveInstanceGroup failed", request->trace_id().c_str());
         return;
     } else {

@@ -237,6 +237,22 @@ cc_library(
 )
 
 cc_library(
+    name = "redis_reclaim_sampler",
+    srcs = [
+        "redis_reclaim_sampler.cc",
+    ],
+    hdrs = [
+        "redis_reclaim_sampler.h",
+    ],
+    deps = [
+        ":types",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/common:string_util",
+    ],
+)
+
+cc_library(
     name = "meta_redis_backend",
     srcs = [
         "meta_redis_backend.cc",
@@ -247,6 +263,7 @@ cc_library(
     deps = [
         ":common",
         ":meta_storage_backend",
+        ":redis_reclaim_sampler",
         ":utils",
         "//kv_cache_manager/common:client_pool",
         "//kv_cache_manager/common:redis_client",
@@ -278,6 +295,7 @@ cc_library(
         ":common",
         ":meta_storage_backend",
         ":mpsc_write_queue",
+        ":redis_reclaim_sampler",
         ":utils",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:client_pool",

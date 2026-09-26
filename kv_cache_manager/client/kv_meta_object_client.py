@@ -156,7 +156,7 @@ class KvMetaObjectClientConfig:
     transfer_client_config: str = field(repr=False)
     user_data: str = field(default="", repr=False)
     call_timeout_ms: int = 3000
-    write_timeout_seconds: int = 30
+    write_timeout_seconds: int = 60
     max_object_bytes: int = KV_META_MAX_OBJECT_BYTES
     memory_base: int = 0
     memory_size: int = 0
@@ -738,7 +738,15 @@ class KvMetaObjectClient:
         *,
         trace_id: Optional[str] = None,
     ) -> None:
-        """Load exact objects into preallocated contiguous CPU/CUDA/MUSA tensors."""
+        """Load exact objects into preallocated contiguous CPU/CUDA/MUSA tensors.
+
+        The native object client validates the exact logical-key identity both
+        before transfer and, after the synchronous transfer, re-reads metadata
+        to verify that the complete generation URI is unchanged.  On any
+        exception the destination tensors may already be partially or fully
+        overwritten and must be discarded; no server-side read lease pins the
+        object while bytes are moving.
+        """
 
         self.load_buffers(self._buffers_from_tensors(keys, tensors), trace_id=trace_id)
 
@@ -780,7 +788,12 @@ class KvMetaObjectClient:
         *,
         trace_id: Optional[str] = None,
     ) -> None:
-        """Load raw exact-size buffers into caller-owned memory."""
+        """Load raw exact-size buffers into caller-owned memory.
+
+        A successful return is generation-fenced.  On failure, treat every
+        supplied destination as modified and invalid even when the reported
+        cause is a miss or a concurrent reclaim.
+        """
 
         self._invoke_buffers("load", objects, trace_id)
 

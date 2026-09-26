@@ -3,11 +3,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fcntl.h>
+#include <filesystem>
 #include <future>
 #include <gtest/gtest.h>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -142,8 +144,18 @@ TEST_F(SdkWrapperTest, TestKvMetaRuntimePolicyDoesNotMutateReusableClientConfig)
     ASSERT_TRUE(source_backend);
     ASSERT_FALSE(source_backend->variable_object_size_enabled());
 
+    // A production KVMeta NFS client must anchor an existing mount root at
+    // initialization. Keep this policy-isolation test independent of the
+    // host's /nfs layout by supplying an existing test-owned root.
+    const std::filesystem::path kv_meta_root = std::filesystem::path(root_path_) / "kvmeta_policy_nfs";
+    ASSERT_TRUE(std::filesystem::create_directories(kv_meta_root));
+    InitParams kv_meta_init_params = init_params_;
+    kv_meta_init_params.storage_configs =
+        R"([{"type":"file","global_unique_name":"nfs_test","storage_spec":{"root_path":")" + kv_meta_root.string() +
+        R"(/","key_count_per_file":2}}])";
+
     SdkWrapper kv_meta_wrapper;
-    ASSERT_EQ(ER_OK, kv_meta_wrapper.InitForKvMeta(client_config_, init_params_, 4096));
+    ASSERT_EQ(ER_OK, kv_meta_wrapper.InitForKvMeta(client_config_, kv_meta_init_params, 4096));
     ASSERT_NE(kv_meta_wrapper.wrapper_config_, source_wrapper_config);
     const auto kv_meta_backend =
         kv_meta_wrapper.wrapper_config_->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
@@ -312,6 +324,7 @@ TEST_F(SdkWrapperTest, TestKvMetaMooncakeValidationFailsClosedEvenWithACanonical
     SdkWrapper sdk_wrapper;
     sdk_wrapper.variable_object_size_enabled_ = true;
     sdk_wrapper.max_variable_object_bytes_ = 4096;
+    sdk_wrapper.kv_meta_instance_path_hash_ = "a";
     sdk_wrapper.sdk_storage_types_["moon"] = DataStorageType::DATA_STORAGE_TYPE_MOONCAKE;
     sdk_wrapper.sdk_storage_configs_["moon"] = std::make_shared<StorageConfig>(
         DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, "moon", std::make_shared<MooncakeStorageSpec>());
@@ -345,6 +358,7 @@ TEST_F(SdkWrapperTest, TestKvMetaFileValidationRejectsUnsafePathsAndAuthoritiesB
     SdkWrapper sdk_wrapper;
     sdk_wrapper.variable_object_size_enabled_ = true;
     sdk_wrapper.max_variable_object_bytes_ = 4096;
+    sdk_wrapper.kv_meta_instance_path_hash_ = "a";
     sdk_wrapper.sdk_storage_types_["nfs"] = DataStorageType::DATA_STORAGE_TYPE_NFS;
     auto nfs_spec = std::make_shared<NfsStorageSpec>();
     nfs_spec->set_root_path("/cache/");
@@ -365,6 +379,10 @@ TEST_F(SdkWrapperTest, TestKvMetaFileValidationRejectsUnsafePathsAndAuthoritiesB
     EXPECT_EQ(ER_OK,
               sdk_wrapper.ValidateKvMetaObjects(
                   {DataStorageUri("file://nfs/cache/" + valid_object + "?size=5")}, sizes, buffers));
+    EXPECT_EQ(
+        ER_INVALID_PARAMS,
+        sdk_wrapper.ValidateKvMetaObjects(
+            {DataStorageUri("file://nfs/cache/kvmeta/c/b/0123456789abcdefghijklmnopqrstuv?size=5")}, sizes, buffers));
     for (const std::string &uri : {
              "file://nfs?size=5",
              "file://nfs/?size=5",
@@ -385,10 +403,34 @@ TEST_F(SdkWrapperTest, TestKvMetaFileValidationRejectsUnsafePathsAndAuthoritiesB
     }
 }
 
-TEST_F(SdkWrapperTest, TestKvMetaTairValidationHandlesAutomaticAndExplicitMediaBeforeIo) {
+TEST_F(SdkWrapperTest, TestKvMetaValidationRejectsDuplicatePhysicalAllocationBeforeIo) {
     SdkWrapper sdk_wrapper;
     sdk_wrapper.variable_object_size_enabled_ = true;
     sdk_wrapper.max_variable_object_bytes_ = 4096;
+    sdk_wrapper.kv_meta_instance_path_hash_ = "a";
+    sdk_wrapper.sdk_storage_types_["nfs"] = DataStorageType::DATA_STORAGE_TYPE_NFS;
+    auto nfs_spec = std::make_shared<NfsStorageSpec>();
+    nfs_spec->set_root_path("/cache/");
+    sdk_wrapper.sdk_storage_configs_["nfs"] =
+        std::make_shared<StorageConfig>(DataStorageType::DATA_STORAGE_TYPE_NFS, "nfs", nfs_spec);
+
+    char first[5]{};
+    char second[5]{};
+    BlockBuffer first_buffer;
+    first_buffer.iovs.push_back(Iov{MemoryType::CPU, first, sizeof(first), false});
+    BlockBuffer second_buffer;
+    second_buffer.iovs.push_back(Iov{MemoryType::CPU, second, sizeof(second), false});
+    const std::string uri = "file://nfs/cache/kvmeta/a/b/0123456789abcdefghijklmnopqrstuv?size=5";
+    EXPECT_EQ(ER_INVALID_PARAMS,
+              sdk_wrapper.ValidateKvMetaObjects(
+                  {DataStorageUri(uri), DataStorageUri(uri)}, {5, 5}, {first_buffer, second_buffer}));
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaTairValidationRejectsMalformedOrCrossMediaAddressesBeforeIo) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.variable_object_size_enabled_ = true;
+    sdk_wrapper.max_variable_object_bytes_ = 4096;
+    sdk_wrapper.kv_meta_instance_path_hash_ = "a";
 
     char bytes[5]{};
     Iov iov;
@@ -399,6 +441,10 @@ TEST_F(SdkWrapperTest, TestKvMetaTairValidationHandlesAutomaticAndExplicitMediaB
     buffer.iovs.push_back(iov);
     const BlockBuffers buffers{buffer};
     const std::vector<std::uint64_t> sizes{sizeof(bytes)};
+    const std::string allocation_token = "kvmeta/a/b/0123456789abcdefghijklmnopqrstuv";
+    const std::string provider_incarnation = "00000000-0000-0000-0000-000000000001";
+    const std::string owner_capability =
+        "&allocation_token=" + allocation_token + "&provider_incarnation=" + provider_incarnation;
 
     for (const auto &[type, media_type] : std::vector<std::pair<DataStorageType, std::uint16_t>>{
              {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, kTairMemPoolMediaTypeUnspecified},
@@ -409,56 +455,96 @@ TEST_F(SdkWrapperTest, TestKvMetaTairValidationHandlesAutomaticAndExplicitMediaB
         auto pace_spec = std::make_shared<TairMemPoolStorageSpec>();
         pace_spec->set_media_type(media_type);
         sdk_wrapper.sdk_storage_configs_["pace"] = std::make_shared<StorageConfig>(type, "pace", pace_spec);
-        const std::string required_fields = "media_type=" + std::to_string(media_type) + "&node_id=1&range_id=0&size=5";
-        EXPECT_EQ(ER_OK,
-                  sdk_wrapper.ValidateKvMetaObjects(
-                      {DataStorageUri("pace://pace/1?" + required_fields)}, sizes, buffers));
-
-        if (media_type == kTairMemPoolMediaTypeUnspecified) {
-            for (const std::uint16_t concrete_media :
-                 {kTairMemPoolMediaTypeDram, kTairMemPoolMediaTypeSsd}) {
-                EXPECT_EQ(ER_OK,
-                          sdk_wrapper.ValidateKvMetaObjects(
-                              {DataStorageUri("pace://pace/1?media_type=" + std::to_string(concrete_media) +
-                                              "&node_id=1&range_id=0&size=5")},
-                              sizes,
-                              buffers));
-            }
-        } else {
-            EXPECT_EQ(ER_INVALID_PARAMS,
-                      sdk_wrapper.ValidateKvMetaObjects(
-                          {DataStorageUri("pace://pace/1?media_type=" +
-                                          std::to_string(kTairMemPoolMediaTypeDram) +
-                                          "&node_id=1&range_id=0&size=5")},
-                          sizes,
-                          buffers));
-        }
+        EXPECT_EQ(
+            ER_OK,
+            sdk_wrapper.ValidateKvMetaObjects({DataStorageUri("pace://pace/0?media_type=" + std::to_string(media_type) +
+                                                              "&node_id=0&range_id=0&size=5" + owner_capability)},
+                                              sizes,
+                                              buffers));
         EXPECT_EQ(ER_INVALID_PARAMS,
                   sdk_wrapper.ValidateKvMetaObjects(
-                      {DataStorageUri("pace://pace/1?media_type=1&node_id=1&range_id=0&size=5")}, sizes, buffers));
+                      {DataStorageUri("pace://pace/0?media_type=" + std::to_string(media_type) +
+                                      "&node_id=0&range_id=0&size=5&allocation_token="
+                                      "kvmeta/c/b/0123456789abcdefghijklmnopqrstuv&provider_incarnation=" +
+                                      provider_incarnation)},
+                      sizes,
+                      buffers));
+        const std::uint16_t other_media =
+            media_type == kTairMemPoolMediaTypeSsd ? kTairMemPoolMediaTypeDram : kTairMemPoolMediaTypeSsd;
+        EXPECT_EQ(ER_INVALID_PARAMS,
+                  sdk_wrapper.ValidateKvMetaObjects(
+                      {DataStorageUri("pace://pace/0?media_type=" + std::to_string(other_media) + "&size=5" +
+                                      owner_capability)},
+                      sizes,
+                      buffers));
+        EXPECT_EQ(media_type == kTairMemPoolMediaTypeUnspecified ? ER_OK : ER_INVALID_PARAMS,
+                  sdk_wrapper.ValidateKvMetaObjects(
+                      {DataStorageUri("pace://pace/0?size=5" + owner_capability)}, sizes, buffers));
         for (const std::string &uri : {
-                 "pace://pace?media_type=0&node_id=1&range_id=0&size=5",
-                 "pace://pace/?media_type=0&node_id=1&range_id=0&size=5",
-                 "pace://pace/0?media_type=0&node_id=1&range_id=0&size=5",
-                 "pace://pace/-1?media_type=0&node_id=1&range_id=0&size=5",
-                 "pace://pace/+1?media_type=0&node_id=1&range_id=0&size=5",
-                 "pace://pace/not-a-number?media_type=0&node_id=1&range_id=0&size=5",
-                 "pace://pace/12trailing?media_type=0&node_id=1&range_id=0&size=5",
-                 "pace://pace/18446744073709551616?media_type=0&node_id=1&range_id=0&size=5",
-                 "pace://pace/1?media_type=0&node_id=&range_id=0&size=5",
-                 "pace://pace/1?media_type=0&node_id=-1&range_id=0&size=5",
-                 "pace://pace/1?media_type=0&node_id=65536&range_id=0&size=5",
-                 "pace://pace/1?media_type=1x&node_id=1&range_id=0&size=5",
-                 "pace://pace/1?media_type=0&node_id=1&range_id=+1&size=5",
-                 "pace://pace/1?node_id=1&range_id=0&size=5",
-                 "pace://pace/1?media_type=0&range_id=0&size=5",
-                 "pace://pace/1?media_type=0&node_id=1&size=5",
+                 "pace://pace?size=5",
+                 "pace://pace/?size=5",
+                 "pace://pace/-1?size=5",
+                 "pace://pace/+1?size=5",
+                 "pace://pace/not-a-number?size=5",
+                 "pace://pace/12trailing?size=5",
+                 "pace://pace/18446744073709551616?size=5",
+                 "pace://pace/0?node_id=&size=5",
+                 "pace://pace/0?node_id=-1&size=5",
+                 "pace://pace/0?node_id=65536&size=5",
+                 "pace://pace/0?media_type=1x&size=5",
+                 "pace://pace/0?range_id=+1&size=5",
              }) {
             SCOPED_TRACE(uri);
             EXPECT_EQ(ER_INVALID_PARAMS,
-                      sdk_wrapper.ValidateKvMetaObjects({DataStorageUri(uri)}, sizes, buffers));
+                      sdk_wrapper.ValidateKvMetaObjects({DataStorageUri(uri + owner_capability)}, sizes, buffers));
         }
+        EXPECT_EQ(ER_INVALID_PARAMS,
+                  sdk_wrapper.ValidateKvMetaObjects(
+                      {DataStorageUri("pace://pace/0?media_type=" + std::to_string(media_type) +
+                                      "&node_id=0&range_id=0&size=5&provider_incarnation=" + provider_incarnation)},
+                      sizes,
+                      buffers));
+        EXPECT_EQ(ER_INVALID_PARAMS,
+                  sdk_wrapper.ValidateKvMetaObjects(
+                      {DataStorageUri("pace://pace/0?allocation_token=" + allocation_token +
+                                      "&media_type=" + std::to_string(media_type) + "&node_id=0&range_id=0&size=5")},
+                      sizes,
+                      buffers));
     }
+}
+
+TEST_F(SdkWrapperTest, TestKvMetaTairValidationUsesProviderRouteInPhysicalAllocationIdentity) {
+    SdkWrapper sdk_wrapper;
+    sdk_wrapper.variable_object_size_enabled_ = true;
+    sdk_wrapper.max_variable_object_bytes_ = 4096;
+    sdk_wrapper.kv_meta_instance_path_hash_ = "a";
+    sdk_wrapper.sdk_storage_types_["pace"] = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    sdk_wrapper.sdk_storage_configs_["pace"] = std::make_shared<StorageConfig>(
+        DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "pace", std::make_shared<TairMemPoolStorageSpec>());
+
+    char first[5]{};
+    char second[5]{};
+    BlockBuffer first_buffer;
+    first_buffer.iovs.push_back(Iov{MemoryType::CPU, first, sizeof(first), false});
+    BlockBuffer second_buffer;
+    second_buffer.iovs.push_back(Iov{MemoryType::CPU, second, sizeof(second), false});
+    const BlockBuffers buffers{first_buffer, second_buffer};
+    const std::vector<std::uint64_t> sizes{5, 5};
+    const std::string incarnation = "00000000-0000-0000-0000-000000000001";
+    const auto make_uri = [&](std::string_view token, std::string_view provider_uuid) {
+        return DataStorageUri(
+            "pace://pace/7?node_id=2&media_type=0&range_id=3&size=5&allocation_token=" + std::string(token) +
+            "&provider_incarnation=" + incarnation + "&provider_uuid=" + std::string(provider_uuid));
+    };
+    const std::string first_token = "kvmeta/a/b/0123456789abcdefghijklmnopqrstuv";
+    const std::string second_token = "kvmeta/a/c/vutsrqponmlkjihgfedcba9876543210";
+
+    EXPECT_EQ(ER_INVALID_PARAMS,
+              sdk_wrapper.ValidateKvMetaObjects(
+                  {make_uri(first_token, "provider-a"), make_uri(second_token, "provider-a")}, sizes, buffers));
+    EXPECT_EQ(ER_OK,
+              sdk_wrapper.ValidateKvMetaObjects(
+                  {make_uri(first_token, "provider-a"), make_uri(second_token, "provider-b")}, sizes, buffers));
 }
 
 TEST_F(SdkWrapperTest, TestInitWithEmptyWrapperConfig) {
@@ -499,7 +585,7 @@ TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationOwnsFd) {
     EXPECT_NE(fd_flags & FD_CLOEXEC, 0);
 
     ASSERT_EQ(close(fd), 0);
-    struct stat file_stat {};
+    struct stat file_stat{};
     EXPECT_EQ(fstat(prepared_registration.fd, &file_stat), 0);
 }
 
@@ -529,7 +615,7 @@ TEST_F(SdkWrapperTest, TestDestructorKeepsSharedMemoryFdAliveForRunningTasks) {
     auto task_result = sdk_wrapper->wait_task_thread_pool_->async([&]() {
         task_started.set_value();
         allow_task_finish_future.wait();
-        struct stat file_stat {};
+        struct stat file_stat{};
         fd_valid_in_task.store(fstat(owned_fd, &file_stat) == 0);
         return ER_OK;
     });

@@ -98,14 +98,8 @@ TEST_F(StorageConfigTest, KvMetaPaceNamespaceRequiresTheRegisteredMediaPool) {
         UriMatchesConfiguredKvMetaNamespace(DataStorageUri("pace://pace_legacy/0?size=1"), legacy.type(), legacy));
     EXPECT_TRUE(UriMatchesConfiguredKvMetaNamespace(
         DataStorageUri("pace://pace_legacy/0?media_type=0&size=1"), legacy.type(), legacy));
-    // Deployed legacy PACE configs use media_type=0 as automatic selection;
-    // the returned allocation still carries its concrete DRAM/SSD medium.
-    EXPECT_TRUE(UriMatchesConfiguredKvMetaNamespace(
-        DataStorageUri("pace://pace_legacy/0?media_type=2&size=1"), legacy.type(), legacy));
-    EXPECT_TRUE(UriMatchesConfiguredKvMetaNamespace(
-        DataStorageUri("pace://pace_legacy/0?media_type=5&size=1"), legacy.type(), legacy));
     EXPECT_FALSE(UriMatchesConfiguredKvMetaNamespace(
-        DataStorageUri("pace://pace_legacy/0?media_type=1&size=1"), legacy.type(), legacy));
+        DataStorageUri("pace://pace_legacy/0?media_type=2&size=1"), legacy.type(), legacy));
 }
 
 TEST_F(StorageConfigTest, TestStorageConfigJsonizeNfs) {

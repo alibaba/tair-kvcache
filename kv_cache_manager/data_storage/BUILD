@@ -68,6 +68,12 @@ cc_library(
 )
 
 cc_library(
+    name = "kv_meta_identity",
+    hdrs = ["kv_meta_identity.h"],
+    deps = ["//kv_cache_manager/common/hash"],
+)
+
+cc_library(
     name = "common_define",
     srcs = [
         "storage_config.cc",
@@ -80,6 +86,7 @@ cc_library(
         "storage_config.h",
     ],
     deps = [
+        ":kv_meta_identity",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:service_discovery",
         "//kv_cache_manager/common:standard_uri",

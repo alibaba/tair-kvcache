@@ -135,6 +135,21 @@ TEST_F(LocalFileSdkTest, TestInit) {
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
 }
 
+TEST_F(LocalFileSdkTest, TestKvMetaInitRejectsAmbiguousOrOverbroadNfsRoots) {
+    auto sdk_config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    sdk_config->set_variable_object_size_policy(true, 4096);
+    for (const std::string &root :
+         {std::string("relative/"), std::string("/"), std::string("/tmp/../cache/"), std::string("/tmp//cache/")}) {
+        auto storage_spec = std::make_shared<NfsStorageSpec>();
+        storage_spec->set_key_count_per_file(1);
+        storage_spec->set_root_path(root);
+        auto storage_config =
+            std::make_shared<StorageConfig>(DataStorageType::DATA_STORAGE_TYPE_NFS, "test_nfs", storage_spec);
+        LocalFileSdk sdk;
+        EXPECT_EQ(ER_INVALID_SDKBACKEND_CONFIG, sdk.Init(sdk_config, storage_config)) << root;
+    }
+}
+
 TEST_F(LocalFileSdkTest, TestPutGetWithCpu) {
     LocalFileSdk sdk;
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
@@ -457,6 +472,104 @@ TEST_F(LocalFileSdkTest, TestKvMetaPutNeverCreatesAMissingConfiguredRoot) {
     FreeBuffers(buffers);
 }
 
+TEST_F(LocalFileSdkTest, TestKvMetaNfsClientNeverTraversesAnIntermediateNamespaceSymlink) {
+    LocalFileSdk sdk;
+    auto sdk_config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    sdk_config->set_variable_object_size_policy(true, 4096);
+
+    const std::string configured_root = (std::filesystem::path(root_path_) / "anchored_nfs_root").string() + "/";
+    const std::filesystem::path outside_root = std::filesystem::path(root_path_) / "outside_nfs_root";
+    ASSERT_TRUE(std::filesystem::create_directories(configured_root));
+    ASSERT_TRUE(std::filesystem::create_directories(outside_root));
+    auto storage_spec = std::make_shared<NfsStorageSpec>();
+    storage_spec->set_key_count_per_file(1);
+    storage_spec->set_root_path(configured_root);
+    auto storage_config =
+        std::make_shared<StorageConfig>(DataStorageType::DATA_STORAGE_TYPE_NFS, "test_nfs", storage_spec);
+    ASSERT_EQ(ER_OK, sdk.Init(sdk_config, storage_config));
+
+    std::error_code symlink_ec;
+    std::filesystem::create_directory_symlink(
+        outside_root, std::filesystem::path(configured_root) / "kvmeta", symlink_ec);
+    ASSERT_FALSE(symlink_ec) << symlink_ec.message();
+    constexpr std::size_t kObjectSize = 17;
+    const std::string nonce(kKvMetaObjectNonceBytes, 's');
+    const std::string object_key = "kvmeta/1/2/" + nonce;
+    const DataStorageUri uri = MakeUri((std::filesystem::path(configured_root) / object_key).string(), 0, kObjectSize);
+    const std::filesystem::path redirected_object = outside_root / "1" / "2" / nonce;
+
+    BlockBuffers write_buffers = {MakeCpuBuffer(kObjectSize, 0x5E)};
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    EXPECT_EQ(ER_SDKWRITE_ERROR, sdk.Put({uri}, write_buffers, actual_remote_uris));
+    EXPECT_TRUE(actual_remote_uris->empty());
+    EXPECT_FALSE(std::filesystem::exists(redirected_object));
+
+    ASSERT_TRUE(std::filesystem::create_directories(redirected_object.parent_path()));
+    {
+        std::ofstream output(redirected_object, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(output.good());
+        output << std::string(kObjectSize, 'x');
+    }
+    BlockBuffers read_buffers = {MakeCpuBuffer(kObjectSize, 0)};
+    EXPECT_EQ(ER_SDKREAD_ERROR, sdk.Get({uri}, read_buffers));
+    AssertBufferAllBytes(read_buffers.front(), 0);
+    FreeBuffers(write_buffers);
+    FreeBuffers(read_buffers);
+}
+
+TEST_F(LocalFileSdkTest, TestKvMetaNfsClientFailsClosedAfterConfiguredRootReplacement) {
+    LocalFileSdk sdk;
+    auto sdk_config = std::make_shared<NfsSdkConfig>(*sdk_backend_config_);
+    sdk_config->set_variable_object_size_policy(true, 4096);
+
+    const std::filesystem::path configured_root = std::filesystem::path(root_path_) / "stable_nfs_root";
+    const std::filesystem::path detached_root = std::filesystem::path(root_path_) / "detached_nfs_root";
+    ASSERT_TRUE(std::filesystem::create_directories(configured_root));
+    auto storage_spec = std::make_shared<NfsStorageSpec>();
+    storage_spec->set_key_count_per_file(1);
+    storage_spec->set_root_path(configured_root.string() + "/");
+    auto storage_config =
+        std::make_shared<StorageConfig>(DataStorageType::DATA_STORAGE_TYPE_NFS, "test_nfs", storage_spec);
+    ASSERT_EQ(ER_OK, sdk.Init(sdk_config, storage_config));
+
+    constexpr std::size_t kObjectSize = 17;
+    const std::string nonce(kKvMetaObjectNonceBytes, 't');
+    const std::string object_key = "kvmeta/1/2/" + nonce;
+    const DataStorageUri uri = MakeUri((configured_root / object_key).string(), 0, kObjectSize);
+    BlockBuffers initial = {MakeCpuBuffer(kObjectSize, 0x41)};
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    ASSERT_EQ(ER_OK, sdk.Put({uri}, initial, actual_remote_uris));
+
+    ASSERT_FALSE(std::filesystem::exists(detached_root));
+    std::filesystem::rename(configured_root, detached_root);
+    ASSERT_TRUE(std::filesystem::create_directories(configured_root / "kvmeta/1/2"));
+    {
+        std::ofstream replacement(configured_root / object_key, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(replacement.good());
+        replacement << std::string(kObjectSize, 'x');
+    }
+
+    BlockBuffers read_buffers = {MakeCpuBuffer(kObjectSize, 0)};
+    EXPECT_EQ(ER_SDKREAD_ERROR, sdk.Get({uri}, read_buffers));
+    // The lifetime descriptor still addresses the original namespace; the
+    // replacement file is never consumed even though the operation is rejected
+    // because its absolute URI is no longer stable.
+    AssertBufferAllBytes(read_buffers.front(), 0x41);
+
+    const std::string second_nonce(kKvMetaObjectNonceBytes, 'u');
+    const DataStorageUri second_uri = MakeUri((configured_root / "kvmeta/1/3" / second_nonce).string(), 0, kObjectSize);
+    BlockBuffers second = {MakeCpuBuffer(kObjectSize, 0x42)};
+    actual_remote_uris->clear();
+    EXPECT_EQ(ER_SDKWRITE_ERROR, sdk.Put({second_uri}, second, actual_remote_uris));
+    EXPECT_TRUE(actual_remote_uris->empty());
+    EXPECT_FALSE(std::filesystem::exists(configured_root / "kvmeta/1/3" / second_nonce));
+    EXPECT_FALSE(std::filesystem::exists(detached_root / "kvmeta/1/3" / second_nonce));
+
+    FreeBuffers(initial);
+    FreeBuffers(read_buffers);
+    FreeBuffers(second);
+}
+
 TEST_F(LocalFileSdkTest, TestLegacyPutKeepsHistoricalBestEffortFlushBehavior) {
     FailingSyncLocalFileSdk sdk;
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
@@ -555,9 +668,6 @@ TEST_F(LocalFileSdkTest, TestPutGetWithGpu) {
 TEST_F(LocalFileSdkTest, TestGpuBuffersFailClosedWithoutGpuBackend) {
 #if !defined(USING_CUDA) && !defined(USING_MUSA)
     LocalFileSdk sdk;
-    // The fail-closed GPU check is part of the KVMeta caller-buffer contract.
-    // Keep the established fixed-block path unchanged in CPU-only builds.
-    sdk_backend_config_->set_variable_object_size_policy(true, 4096);
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
 
     const std::string file_path = root_path_ + "/local_file/unsupported_gpu.txt";

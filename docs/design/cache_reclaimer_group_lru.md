@@ -188,11 +188,26 @@ B_group = E == 0 ? 0 : min(B_theory, max(1, floor(uint128(E) * B_cfg / S)))
 
 ### 5.4 并发、截止时间与局部失败
 
-采样量和采样并发独立控制。`MetaStorageBackendManager` 按与真实采样相同的后端选择规则提供提示：纯 Local，或 cached 恢复完成且采样源为 Local 时，同一 Instance 用一个任务读取完整预算；没有本地后端、恢复未完成或采样源非 Local 时，继续按 `sampling_size_per_task` 拆分。旧两种策略也复用这一任务提示，但其预算计算不变。各 Instance 之间仍可在既有 worker pool 中并行，不把远程 I/O 放到 cron 同步执行；所有任务继续受原有 in-flight 和 deadline 限制。
+采样量和采样并发独立控制。`MetaStorageBackendManager` 按真实采样源提供提示：Local、Redis 和 async Redis
+在同一个 Instance 内都使用一个任务读取完整预算；其他 backend 才继续按 `sampling_size_per_task` 拆分。Local
+需要共享分片轮转状态，Redis 系列需要共享 prefix SCAN 游标；将同一 Instance 拆成多个并发任务会重复候选、覆盖游标进度，
+并放大 metadata Redis 压力。旧两种策略也复用这一任务提示，但其预算计算不变。不同 Instance 之间仍可在既有
+worker pool 中并行，不把远程 I/O 放到 cron 线程同步执行；所有任务继续受原有 in-flight 和 deadline 限制。
+
+Redis 系列的回收采样不再依赖全库 `RANDOMKEY` 后再按 Instance 前缀碰撞。每个 backend 保存独立的 SCAN 游标和
+有界 overflow buffer，使用 `MATCH <instance-prefix>*` 逐页推进：单次最多 16 次 SCAN，COUNT hint 最小 128、最大
+4096，overflow 最多保留 4096 个 key，并设置 50ms 的软时间预算；已开始的 Redis 调用不强行中断，但超时后不再
+发起下一页。单次允许返回少于请求量甚至空结果，未走完的游标会留给下一轮，因此稀疏 Instance 最终仍能被覆盖；
+一轮不会为了稀疏租户扫描完整共享 keyspace。Redis 错误、非法 cursor 或异常前缀会
+回滚本次游标和 overflow 消费，不发布部分候选。Instance 前缀中的 Redis glob 字符会按字面量转义，前缀下不符合
+`int64` block key 格式的脏 key 会限频告警并跳过，不能永久阻塞同页的正常候选。每页 SCAN 单独获取和释放连接，
+同一 Instance 的并发采样先在 sampler 内串行，等待游标锁的任务不预占连接，不会因一次跨页采样长期占住 put/get
+共用的 client pool。该状态只服务
+`SampleReclaimKeys` / `SampleReclaimCandidates`，已有 `RandomSample` API 及 put/get 主链路保持不变。
 
 复用现有采样 worker pool，不创建新线程池。Group 按 Instance 轮流派发采样子任务，优先让各 Instance 获得第一批采样机会。收集器不等待整批任务全部结束：哪个任务完成，就回收哪个任务的名额并继续派发；慢 Instance 不能挡住健康 Instance 的后续分片。
 
-需要拆分的后端，将本轮开始时可用 worker 数除以计划 Instance 数，向下取整且至少为 1，作为每个 Instance 的在途分片上限；所有任务仍受进程级 in-flight 上限约束。这样慢 Instance 不能反复占用健康 Instance 释放的 worker；Local 单任务路径不消耗多份并发额度。这个限制只分配采样并发，不分配删除份额；本轮不动态借用其他 Instance 的并发份额。
+需要拆分的后端，将本轮开始时可用 worker 数除以计划 Instance 数，向下取整且至少为 1，作为每个 Instance 的在途分片上限；所有任务仍受进程级 in-flight 上限约束。这样慢 Instance 不能反复占用健康 Instance 释放的 worker；Local / Redis 单任务路径不消耗多份并发额度。这个限制只分配采样并发，不分配删除份额；本轮不动态借用其他 Instance 的并发份额。
 
 新旧有界路径共用采样任务提交能力，由 Group 收集器统一管理新模式的任务和结果，不能并发调用多个各自认为可以占满整个 pool 的采样循环。同一 Instance 的分片结果按实际完成状态合并，不能跨 Instance 混淆。
 
@@ -247,11 +262,11 @@ struct GroupLruCandidate {
 
 排序统一使用 `PROPERTY_LRU_TIME` 的微秒时间戳升序，时间相同时按 `instance_id`、block key 排序，保证可复现。V1 已确认：成功读取但属性缺失 / 解析失败的单个 key 沿用历史 LRU 的时间 0 退化规则；新模式将非正时间也归一化为 0，并记录异常时间计数。这不是证明异常 key 一定最冷，而是避免它们因时间不可用长期无法回收的兼容性取舍；优先排序范围从原来的 Instance 内扩大到了整个 Group。批量读取错误必须走局部失败，不能当成所有 key 的时间都是 0。LRU 时间可能在采样后更新，V1 不增加阻塞前台访问的全局快照锁，因此只承诺采样时刻的近似次序。
 
-候选采样复用公共 `SampleReclaimCandidates` 接口，一次返回 key 和访问时间；local 在分片锁内读取，不晋升 LRU 或修改业务时间。cached 在恢复期间从完整的持久层采样，再以 no-touch 精确读取的热缓存时间覆盖命中项；恢复完成后使用完整缓存。Group LRU 启用 `require_read_success=true`：批量读取失败时丢弃该 Instance，时间缺失 / 非法仍按 0 保留候选。Redis / async Redis 查询 LRU 字段时，`EC_NOENT` 既可能表示字段缺失，也可能表示 key 已消失，因此不能在采样阶段据此直接丢弃 key；恢复时仍有机会使用内存时间，真正已消失或不可删除的 key 由后续 Location 检查排除，不增加额外的存在性查询。容量比例 / 固定策略保持公共接口默认的 best-effort 读取降级语义。
+候选采样复用公共 `SampleReclaimCandidates` 接口，一次返回 key 和访问时间；local 在分片锁内读取，不晋升 LRU 或修改业务时间。cached 在恢复期间从完整的持久层采样，再以 no-touch 精确读取的热缓存时间覆盖命中项；恢复完成后使用完整缓存。Redis / async Redis 的 key 来源是上一节的有界 prefix SCAN，不把 metadata key 或其他 Instance 的 key 当作候选。Group LRU 启用 `require_read_success=true`：批量读取失败时丢弃该 Instance，时间缺失 / 非法仍按 0 保留候选。Redis / async Redis 查询 LRU 字段时，`EC_NOENT` 既可能表示字段缺失，也可能表示 key 已消失，因此不能在采样阶段据此直接丢弃 key；恢复时仍有机会使用内存时间，真正已消失或不可删除的 key 由后续 Location 检查排除，不增加额外的存在性查询。容量比例 / 固定策略保持公共接口默认的 best-effort 读取降级语义。
 
 Group LRU 的候选资格检查和最终准入另通过 `GetLocationMapsForMaintenance` 无副作用读取 Location；cached 恢复期间优先读热缓存，仅对缺 key 回查持久层且不回填。独立测试覆盖重复采样和 Location 读取后业务时间与物理 LRU 顺序不变，避免维护操作把冷数据读热。
 
-完整 Local 回收源在同一轮内使用单个采样任务请求该 Instance 的完整候选预算，不按 `sampling_size_per_task` 拆分，避免多个任务从相同冷前缀重复取样；完整预算是请求量，不保证一定采足。cached 恢复期间仍从持久层采样，允许按任务预算拆分。重复的纯采样调用可以返回相同冷 key，后续覆盖推进依赖业务访问、实际删除以及第 5.5 节的显式维护 touch。
+Local、Redis 和 async Redis 回收源在同一轮内都使用单个采样任务请求该 Instance 的完整候选预算，不按 `sampling_size_per_task` 拆分：Local 需要避免多个任务重复取得相同冷前缀，Redis sampler 则需要按一个串行游标/overflow 状态渐进推进。完整预算是请求量，不保证一定采足。cached 恢复期间实际采样源仍是完整持久层；若它是 Redis / async Redis，同样保持单任务，恢复完成后才切到 Local cache。只有当实际完整采样源是 Local 时，过滤失败的 key 才执行第 5.5 节的 maintenance touch；不能把持久 Redis 采到的 key 重定向 touch 到尚未完整的 Local cache。重复的纯 Local 采样调用可以返回相同冷 key，后续覆盖推进依赖业务访问、实际删除和显式 maintenance touch；Redis 覆盖推进依赖保存的 SCAN 游标。
 
 ### 6.2 Location 资格与删除准入分开
 
@@ -370,7 +385,7 @@ Group LRU 同时更新已有的 `reclaim_batch_lru_age_{min,max,avg}_us` 和 `re
 2. **低用量采样资格与采样权重**：旧容量算法 raw batch 为 0 的 Instance，在资源足够时仍有基础采样预算；额外预算按 key count 而非 bytes 分配，覆盖 bytes / key count 比例相反、极端倾斜、全零 key 统计和基础池取整。
 3. **身份隔离**：不同 Instance 的相同 key 分别参与比较、过滤和删除；重复采样在 Instance 内去重并采用最新有效时间。
 4. **排序确定性**：LRU 相同、属性缺失 / 非法、采样返回顺序变化，仍按既定规则输出；批量属性错误走失败路径。
-5. **no-touch 与维护例外**：重复采样、维护性时间和 Location 查询不刷新 LRU 或 backend 候选次序；覆盖 local、cached / persistent 组合。过滤后的显式维护 touch 只作用于没有待删 Location 的 key，并核对实际成功计数；覆盖普通 / 混合 / EventReport key、缺失 key 和零成功返回。
+5. **no-touch、维护例外与 Redis 稀疏租户**：重复采样、维护性时间和 Location 查询不刷新业务 LRU；覆盖 local、cached / persistent 组合。过滤后的显式维护 touch 只作用于没有待删 Location 的 key，并核对实际成功计数；覆盖普通 / 混合 / EventReport key、缺失 key 和零成功返回。Redis / async Redis 另覆盖空页跨轮游标推进、overflow 与跨页去重、错误回滚、非法 cursor、glob 前缀转义、脏 key 隔离、未 Open 安全失败、同库大量异租户 key 时最终找到本 Instance，以及单次 SCAN 次数、软时间预算和 buffer 上限。
 6. **先过滤再 Top B**：最旧项全部是不可删 Location 时，后续可删除候选仍能进入 Top B；EventReport、活跃写入、Copy target、 keep_both 与 spec 覆盖规则不变。
 7. **水位维度**：Group bytes、keys、单 / 多 Type、同时超限优先级、范围变化，均使用匹配的 Location 集合和停止逻辑。
 8. **保序拆批**：`A-oldest -> B-older -> A-newer` 不能被归并成 A 全部先提交；每个 accepted 后恢复水位都应停止于对应位置。

@@ -8,6 +8,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -46,6 +47,22 @@ KvMetaValueLocation MakeLocation(const std::string &uri, std::uint64_t size) {
     location.value_size = size;
     location.location_specs.push_back({"value", uri});
     return location;
+}
+
+std::string MakeOwnedNfsUri(const std::string &instance_id,
+                            const std::string &key,
+                            std::uint64_t size,
+                            std::string_view nonce = "0123456789abcdefghijklmnopqrstuv") {
+    return "file://nfs/cache/" + BuildKvMetaObjectKeyPrefix(instance_id, key) + std::string(nonce) +
+           "?size=" + std::to_string(size);
+}
+
+std::string MakeLegacyOwnedNfsUri(const std::string &instance_id,
+                                  const std::string &key,
+                                  std::uint64_t size,
+                                  std::string_view nonce = "0123456789abcdefghijklmnopqrstuv") {
+    return "file://nfs/cache/" + BuildKvMetaLegacyObjectKeyPrefix(instance_id, key) + std::string(nonce) +
+           "?size=" + std::to_string(size);
 }
 
 BlockBuffer MakeBuffer(void *base, std::size_t size) {
@@ -92,10 +109,13 @@ public:
     std::pair<ClientErrorCode, KvMetaGetResult> Get(const std::string &trace_id,
                                                     const std::vector<std::string> &keys) override {
         ++get_calls;
-        ThrowIfRequested(get_throw);
+        ThrowIfRequested(get_throw_on_call == 0 || get_throw_on_call == get_calls ? get_throw : ThrowMode::NONE);
         get_trace = trace_id;
         gotten_keys = keys;
-        return {get_ec, get_result};
+        const std::size_t index = static_cast<std::size_t>(get_calls - 1);
+        const auto ec = index < get_ecs.size() ? get_ecs[index] : get_ec;
+        const auto &result = index < get_results.size() ? get_results[index] : get_result;
+        return {ec, result};
     }
 
     std::pair<ClientErrorCode, KvMetaStartWriteResult> StartWrite(const std::string &trace_id,
@@ -137,10 +157,13 @@ public:
     ClientErrorCode finish_ec{ER_OK};
     ClientErrorCode remove_ec{ER_OK};
     ThrowMode get_throw{ThrowMode::NONE};
+    int get_throw_on_call{0};
     ThrowMode start_throw{ThrowMode::NONE};
     ThrowMode finish_throw{ThrowMode::NONE};
     ThrowMode remove_throw{ThrowMode::NONE};
     KvMetaGetResult get_result;
+    std::vector<ClientErrorCode> get_ecs;
+    std::vector<KvMetaGetResult> get_results;
     KvMetaStartWriteResult start_result;
     int get_calls{0};
     int start_calls{0};
@@ -583,6 +606,7 @@ TEST_F(KvMetaObjectClientTest, LoadsOnlyAfterEveryKeyAndSizeMatches) {
     };
 
     EXPECT_EQ(ER_OK, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(2, metadata_->get_calls);
     EXPECT_EQ(1, transfer_->load_calls);
     EXPECT_EQ((UriStrVec{"file://nfs/first?size=5", "file://nfs/second?size=9"}), transfer_->loaded_uris);
     EXPECT_EQ(sizes_, transfer_->loaded_sizes);
@@ -601,8 +625,181 @@ TEST_F(KvMetaObjectClientTest, AcceptsMooncakeLocationsOnlyWithACanonicalObjectK
     metadata_->get_result.locations = {first, second};
 
     EXPECT_EQ(ER_OK, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(2, metadata_->get_calls);
     EXPECT_EQ(1, transfer_->load_calls);
     EXPECT_EQ((UriStrVec{first_uri, second_uri}), transfer_->loaded_uris);
+}
+
+TEST_F(KvMetaObjectClientTest, RejectsDataWhenCommittedGenerationChangesDuringLoad) {
+    KvMetaGetResult first;
+    first.hit_mask = {true, true};
+    first.locations = {
+        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+    KvMetaGetResult successor = first;
+    successor.locations[0] = MakeLocation("file://nfs/reused?size=5", sizeof(first_));
+    metadata_->get_results = {first, successor};
+
+    EXPECT_EQ(ER_SERVICE_NOT_FOUND, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(2, metadata_->get_calls);
+    EXPECT_EQ(1, transfer_->load_calls);
+}
+
+TEST_F(KvMetaObjectClientTest, ProductionClientRejectsSameSizeUriOwnedByAnotherLogicalKeyBeforeRead) {
+    constexpr std::string_view kInstance = "bound-instance";
+    auto metadata = std::make_unique<FakeKvMetaClient>();
+    auto *metadata_ptr = metadata.get();
+    auto transfer = std::make_unique<FakeKvMetaTransferClient>();
+    auto *transfer_ptr = transfer.get();
+    KvMetaObjectClientImpl bound_client(std::move(metadata), std::move(transfer), 1024, 30, std::string(kInstance));
+    metadata_ptr->get_result.hit_mask = {true};
+    metadata_ptr->get_result.locations = {
+        MakeLocation(MakeOwnedNfsUri(std::string(kInstance), "another-key", sizeof(first_)), sizeof(first_)),
+    };
+
+    EXPECT_EQ(
+        ER_SERVICE_INTERNAL_ERROR,
+        bound_client.LoadObjects("trace", {"requested-key"}, {sizeof(first_)}, {MakeBuffer(first_, sizeof(first_))}));
+    EXPECT_EQ(1, metadata_ptr->get_calls);
+    EXPECT_EQ(0, transfer_ptr->load_calls);
+}
+
+TEST_F(KvMetaObjectClientTest, ProductionClientAcceptsUriOwnedByTheExactLogicalKey) {
+    constexpr std::string_view kInstance = "bound-instance";
+    auto metadata = std::make_unique<FakeKvMetaClient>();
+    auto *metadata_ptr = metadata.get();
+    auto transfer = std::make_unique<FakeKvMetaTransferClient>();
+    auto *transfer_ptr = transfer.get();
+    KvMetaObjectClientImpl bound_client(std::move(metadata), std::move(transfer), 1024, 30, std::string(kInstance));
+    metadata_ptr->get_result.hit_mask = {true};
+    metadata_ptr->get_result.locations = {
+        MakeLocation(MakeOwnedNfsUri(std::string(kInstance), "requested-key", sizeof(first_)), sizeof(first_)),
+    };
+
+    EXPECT_EQ(
+        ER_OK,
+        bound_client.LoadObjects("trace", {"requested-key"}, {sizeof(first_)}, {MakeBuffer(first_, sizeof(first_))}));
+    EXPECT_EQ(2, metadata_ptr->get_calls);
+    EXPECT_EQ(1, transfer_ptr->load_calls);
+}
+
+TEST_F(KvMetaObjectClientTest, ProductionClientAcceptsExactLegacyKeyOnlyForRollingUpgrade) {
+    constexpr std::string_view kInstance = "bound-instance";
+    auto metadata = std::make_unique<FakeKvMetaClient>();
+    auto *metadata_ptr = metadata.get();
+    auto transfer = std::make_unique<FakeKvMetaTransferClient>();
+    auto *transfer_ptr = transfer.get();
+    KvMetaObjectClientImpl bound_client(std::move(metadata), std::move(transfer), 1024, 30, std::string(kInstance));
+    metadata_ptr->get_result.hit_mask = {true};
+    metadata_ptr->get_result.locations = {
+        MakeLocation(MakeLegacyOwnedNfsUri(std::string(kInstance), "requested-key", sizeof(first_)), sizeof(first_)),
+    };
+
+    EXPECT_EQ(
+        ER_OK,
+        bound_client.LoadObjects("trace", {"requested-key"}, {sizeof(first_)}, {MakeBuffer(first_, sizeof(first_))}));
+    EXPECT_EQ(2, metadata_ptr->get_calls);
+    EXPECT_EQ(1, transfer_ptr->load_calls);
+}
+
+TEST_F(KvMetaObjectClientTest, ProductionClientRejectsLegacyUriOwnedByAnotherLogicalKey) {
+    constexpr std::string_view kInstance = "bound-instance";
+    auto metadata = std::make_unique<FakeKvMetaClient>();
+    auto *metadata_ptr = metadata.get();
+    auto transfer = std::make_unique<FakeKvMetaTransferClient>();
+    auto *transfer_ptr = transfer.get();
+    KvMetaObjectClientImpl bound_client(std::move(metadata), std::move(transfer), 1024, 30, std::string(kInstance));
+    metadata_ptr->get_result.hit_mask = {true};
+    metadata_ptr->get_result.locations = {
+        MakeLocation(MakeLegacyOwnedNfsUri(std::string(kInstance), "another-key", sizeof(first_)), sizeof(first_)),
+    };
+
+    EXPECT_EQ(
+        ER_SERVICE_INTERNAL_ERROR,
+        bound_client.LoadObjects("trace", {"requested-key"}, {sizeof(first_)}, {MakeBuffer(first_, sizeof(first_))}));
+    EXPECT_EQ(1, metadata_ptr->get_calls);
+    EXPECT_EQ(0, transfer_ptr->load_calls);
+}
+
+TEST_F(KvMetaObjectClientTest, ProductionClientRejectsCrossKeyAllocationAndAbortsWriteSession) {
+    constexpr std::string_view kInstance = "bound-instance";
+    auto metadata = std::make_unique<FakeKvMetaClient>();
+    auto *metadata_ptr = metadata.get();
+    auto transfer = std::make_unique<FakeKvMetaTransferClient>();
+    auto *transfer_ptr = transfer.get();
+    KvMetaObjectClientImpl bound_client(std::move(metadata), std::move(transfer), 1024, 30, std::string(kInstance));
+    metadata_ptr->start_result.write_session_id = "session";
+    metadata_ptr->start_result.key_mask = {false};
+    metadata_ptr->start_result.locations = {
+        MakeLocation(MakeOwnedNfsUri(std::string(kInstance), "another-key", sizeof(first_)), sizeof(first_)),
+    };
+
+    EXPECT_EQ(
+        ER_SERVICE_INTERNAL_ERROR,
+        bound_client.SaveObjects("trace", {"requested-key"}, {sizeof(first_)}, {MakeBuffer(first_, sizeof(first_))}));
+    EXPECT_EQ(0, transfer_ptr->save_calls);
+    ASSERT_EQ(1, metadata_ptr->finish_calls);
+    EXPECT_EQ((std::vector<bool>{false}), metadata_ptr->finished_keys);
+}
+
+TEST_F(KvMetaObjectClientTest, RejectsDataWhenObjectIsEvictedDuringLoad) {
+    KvMetaGetResult first;
+    first.hit_mask = {true, true};
+    first.locations = {
+        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+    KvMetaGetResult evicted = first;
+    evicted.hit_mask[1] = false;
+    evicted.locations[1] = {};
+    metadata_->get_results = {first, evicted};
+
+    EXPECT_EQ(ER_SERVICE_NOT_FOUND, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(2, metadata_->get_calls);
+    EXPECT_EQ(1, transfer_->load_calls);
+}
+
+TEST_F(KvMetaObjectClientTest, TreatsPostLoadSizeChangeAsConcurrentMiss) {
+    KvMetaGetResult first;
+    first.hit_mask = {true, true};
+    first.locations = {
+        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+    KvMetaGetResult successor = first;
+    successor.locations[0] = MakeLocation("file://nfs/reused?size=4", sizeof(first_) - 1);
+    metadata_->get_results = {first, successor};
+
+    EXPECT_EQ(ER_SERVICE_NOT_FOUND, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(2, metadata_->get_calls);
+    EXPECT_EQ(1, transfer_->load_calls);
+}
+
+TEST_F(KvMetaObjectClientTest, FailsClosedWhenPostLoadValidationIsUnavailableOrMalformed) {
+    KvMetaGetResult valid;
+    valid.hit_mask = {true, true};
+    valid.locations = {
+        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+    };
+    metadata_->get_result = valid;
+    metadata_->get_ecs = {ER_OK, ER_SERVICE_NOT_READY};
+    EXPECT_EQ(ER_SERVICE_NOT_READY, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+
+    metadata_->get_calls = 0;
+    metadata_->get_ecs.clear();
+    KvMetaGetResult malformed = valid;
+    malformed.locations.pop_back();
+    metadata_->get_results = {valid, malformed};
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+
+    metadata_->get_calls = 0;
+    metadata_->get_results.clear();
+    metadata_->get_throw = ThrowMode::STANDARD;
+    metadata_->get_throw_on_call = 2;
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(3, transfer_->load_calls);
 }
 
 TEST_F(KvMetaObjectClientTest, PropagatesLoadFailureAfterOneExactDataPlaneCall) {

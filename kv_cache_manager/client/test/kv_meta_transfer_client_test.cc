@@ -59,11 +59,20 @@ TEST(KvMetaUriTest, EnforcesBoundedUnambiguousCanonicalIdentity) {
                                                DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
 
     const std::string nonce = "0123456789abcdefghijklmnopqrstuv";
+    const std::string fingerprint(kKvMetaObjectFingerprintHexChars, 'a');
     EXPECT_TRUE(HasCanonicalKvMetaObjectKey("kvmeta/a/b/" + nonce));
     EXPECT_TRUE(HasCanonicalKvMetaObjectKey("kvmeta/0/0/" + nonce));
+    EXPECT_TRUE(HasCanonicalKvMetaObjectKey("kvmeta/a/" + fingerprint + "/" + nonce));
     EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/01/b/" + nonce));
     EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/0b/" + nonce));
     EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/A/b/" + nonce));
+    EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/" + std::string(17, 'a') + "/" + nonce));
+    EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/" + std::string(kKvMetaObjectFingerprintHexChars - 1, 'a') +
+                                             "/" + nonce));
+    EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/" + std::string(kKvMetaObjectFingerprintHexChars + 1, 'a') +
+                                             "/" + nonce));
+    EXPECT_FALSE(
+        HasCanonicalKvMetaObjectKey("kvmeta/a/" + std::string(kKvMetaObjectFingerprintHexChars, 'A') + "/" + nonce));
     EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/b/short"));
     EXPECT_FALSE(HasCanonicalKvMetaObjectKey("kvmeta/a/b/" + nonce + "/extra"));
 
@@ -76,31 +85,94 @@ TEST(KvMetaUriTest, EnforcesBoundedUnambiguousCanonicalIdentity) {
     EXPECT_TRUE(object_key.empty());
 }
 
-TEST(KvMetaUriTest, ValidatesLegacyTairMempoolAddressWithoutInventingGenerationFields) {
-    std::uint64_t offset = 99;
-    EXPECT_TRUE(TryGetExactTairMempoolOffset(
-        DataStorageUri("pace://pace/18446744073709551615?media_type=5&node_id=1&range_id=0&size=1"), offset));
-    EXPECT_EQ(std::numeric_limits<std::uint64_t>::max(), offset);
+TEST(KvMetaIdentityTest, PhysicalFingerprintBindsCompleteInstanceAndLogicalKey) {
+    const std::string first = BuildKvMetaObjectKeyPrefix("instance-a", "logical-key");
+    const std::string repeated = BuildKvMetaObjectKeyPrefix("instance-a", "logical-key");
+    const std::string other_key = BuildKvMetaObjectKeyPrefix("instance-a", "logical-key-2");
+    const std::string other_instance = BuildKvMetaObjectKeyPrefix("instance-b", "logical-key");
+    const std::string embedded_nul_key("logical\0key", 11);
+    const std::string embedded_nul = BuildKvMetaObjectKeyPrefix("instance-a", embedded_nul_key);
 
-    const DataStorageUri valid("pace://pace/1?media_type=5&node_id=1&range_id=0&size=1");
-    EXPECT_TRUE(HasExactTairMempoolAddress(valid));
-    EXPECT_TRUE(HasOwnedKvMetaAllocationShape(valid, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
-    EXPECT_FALSE(HasExactTairMempoolAddress(
-        DataStorageUri("pace://pace/0?media_type=5&node_id=1&range_id=0&size=1")));
+    ASSERT_FALSE(first.empty());
+    EXPECT_EQ(first, repeated);
+    EXPECT_NE(first, other_key);
+    EXPECT_NE(first, other_instance);
+    EXPECT_NE(first, embedded_nul);
+    EXPECT_NE(first, BuildKvMetaLegacyObjectKeyPrefix("instance-a", "logical-key"));
+
+    const std::size_t instance_end = first.find('/', std::string("kvmeta/").size());
+    ASSERT_NE(std::string::npos, instance_end);
+    const std::size_t fingerprint_end = first.find('/', instance_end + 1);
+    ASSERT_NE(std::string::npos, fingerprint_end);
+    EXPECT_EQ(kKvMetaObjectFingerprintHexChars, fingerprint_end - instance_end - 1);
+    EXPECT_EQ(fingerprint_end + 1, first.size());
+
+    // This is a protocol invariant, not an accident of the particular hash in
+    // this test: even the longest canonical instance hash must fit PACE's
+    // exact-allocation-token contract.
+    EXPECT_EQ(121u, kKvMetaMaxPhysicalObjectKeyBytes);
+    EXPECT_LE(kKvMetaMaxPhysicalObjectKeyBytes, kKvMetaExactAllocationTokenLimitBytes);
+    EXPECT_LE(first.size() + kKvMetaObjectNonceBytes, kKvMetaMaxPhysicalObjectKeyBytes);
+}
+
+TEST(KvMetaUriTest, ParsesTairMempoolOffsetWithoutAliasingMalformedPathsToZero) {
+    std::uint64_t offset = 99;
+    EXPECT_TRUE(TryGetExactTairMempoolOffset(DataStorageUri("pace://pace/0?size=1"), offset));
+    EXPECT_EQ(0, offset);
+    EXPECT_TRUE(TryGetExactTairMempoolOffset(DataStorageUri("pace://pace/18446744073709551615?size=1"), offset));
+    EXPECT_EQ(std::numeric_limits<std::uint64_t>::max(), offset);
+    EXPECT_TRUE(
+        HasExactTairMempoolAddress(DataStorageUri("pace://pace/0?media_type=65535&node_id=0&range_id=1&size=1")));
+    EXPECT_TRUE(HasExactTairMempoolAddress(DataStorageUri("pace://pace/0?size=1")));
+
+    constexpr const char *kIncarnation = "01234567-89ab-4def-8abc-0123456789ab";
+    const std::string allocation_token = "kvmeta/a/b/0123456789abcdefghijklmnopqrstuv";
+    EXPECT_TRUE(HasCanonicalTairMempoolProviderIncarnation(
+        DataStorageUri(std::string("pace://pace/1?provider_incarnation=") + kIncarnation + "&size=1")));
+    EXPECT_TRUE(HasOwnedKvMetaAllocationShape(
+        DataStorageUri(std::string("pace://pace/1?allocation_token=") + allocation_token +
+                       "&provider_incarnation=" + kIncarnation + "&provider_uuid=stable-provider&size=1"),
+        DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    EXPECT_TRUE(
+        HasSafeOptionalTairMempoolProviderUuid(DataStorageUri("pace://pace/1?provider_uuid=stable-provider&size=1")));
+    // Missing is accepted only for rolling-upgrade compatibility with old
+    // persisted exact URIs. New TairMempool allocations require the field in
+    // the internal adapter.
+    EXPECT_TRUE(HasSafeOptionalTairMempoolProviderUuid(DataStorageUri("pace://pace/1?size=1")));
+    EXPECT_FALSE(HasSafeOptionalTairMempoolProviderUuid(DataStorageUri("pace://pace/1?provider_uuid=&size=1")));
+    EXPECT_FALSE(
+        HasSafeOptionalTairMempoolProviderUuid(DataStorageUri("pace://pace/1?provider_uuid=bad#route&size=1")));
+    EXPECT_FALSE(
+        HasSafeOptionalTairMempoolProviderUuid(DataStorageUri("pace://pace/1?provider_uuid=bad%25route&size=1")));
+    EXPECT_FALSE(
+        HasSafeOptionalTairMempoolProviderUuid(DataStorageUri("pace://pace/1?provider_uuid=bad%20route&size=1")));
+    EXPECT_FALSE(
+        HasSafeOptionalTairMempoolProviderUuid(DataStorageUri("pace://pace/1?provider_uuid=bad=route&size=1")));
+    EXPECT_FALSE(HasSafeOptionalTairMempoolProviderUuid(
+        DataStorageUri("pace://pace/1?provider_uuid=" + std::string(64, 'a') + "&size=1")));
+    EXPECT_FALSE(HasOwnedKvMetaAllocationShape(
+        DataStorageUri(std::string("pace://pace/1?provider_incarnation=") + kIncarnation + "&size=1"),
+        DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    EXPECT_FALSE(HasOwnedKvMetaAllocationShape(DataStorageUri("pace://pace/1?size=1"),
+                                               DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+
+    for (const std::string &incarnation : {
+             "01234567-89AB-4DEF-8ABC-0123456789AB",
+             "0123456789ab-4def-8abc-0123456789ab",
+             "01234567-89ab-4def-8abc-0123456789ag",
+             "01234567-89ab-4def-8abc-0123456789ab-extra",
+         }) {
+        SCOPED_TRACE(incarnation);
+        EXPECT_FALSE(HasCanonicalTairMempoolProviderIncarnation(
+            DataStorageUri("pace://pace/1?provider_incarnation=" + incarnation + "&size=1")));
+    }
 
     for (const std::string &uri : {
-             "pace://pace/1?media_type=5&node_id=1&size=1",
-             "pace://pace/1?media_type=5&range_id=0&size=1",
-             "pace://pace/1?node_id=1&range_id=0&size=1",
-             "pace://pace/1?media_type=5&node_id=0&range_id=0&size=1",
-             "pace://pace/1?media_type=05&node_id=1&range_id=0&size=1",
-             "pace://pace/1?media_type=5&node_id=01&range_id=0&size=1",
-             "pace://pace/1?media_type=5&node_id=1&range_id=00&size=1",
-             "pace://pace/1?media_type=5&node_id=&range_id=0&size=1",
-             "pace://pace/1?media_type=5&node_id=-1&range_id=0&size=1",
-             "pace://pace/1?media_type=5&node_id=65536&range_id=0&size=1",
-             "pace://pace/1?media_type=1x&node_id=1&range_id=0&size=1",
-             "pace://pace/1?media_type=5&node_id=1&range_id=+1&size=1",
+             "pace://pace/0?node_id=&size=1",
+             "pace://pace/0?node_id=-1&size=1",
+             "pace://pace/0?node_id=65536&size=1",
+             "pace://pace/0?media_type=1x&size=1",
+             "pace://pace/0?range_id=+1&size=1",
          }) {
         SCOPED_TRACE(uri);
         EXPECT_FALSE(HasExactTairMempoolAddress(DataStorageUri(uri)));
@@ -111,7 +183,6 @@ TEST(KvMetaUriTest, ValidatesLegacyTairMempoolAddressWithoutInventingGenerationF
              "pace://pace/?size=1",
              "pace://pace/-1?size=1",
              "pace://pace/+1?size=1",
-             "pace://pace/01?size=1",
              "pace://pace/not-a-number?size=1",
              "pace://pace/12trailing?size=1",
              "pace://pace/18446744073709551616?size=1",
@@ -167,7 +238,8 @@ protected:
     }
 
     std::string ObjectPath(const std::string &key_hash, char nonce) const {
-        return root_path_ + "kvmeta/123456789abcdef/" + key_hash + "/" + std::string(32, nonce);
+        return root_path_ + "kvmeta/" + BuildKvMetaInstancePathHash("test_instance") + "/" + key_hash + "/" +
+               std::string(32, nonce);
     }
 
     std::string root_path_;
@@ -351,8 +423,8 @@ TEST_F(KvMetaTransferClientTest, RejectsConfiguredNamespaceEscapeBeforeIo) {
 
     std::vector<char> payload(5, 1);
     const auto buffer = MakeBuffer(payload.data(), payload.size());
-    const std::string foreign_path =
-        GetPrivateTestRuntimeDataPath() + "foreign_objects/kvmeta/123456789abcdef/8/" + std::string(32, 'h');
+    const std::string foreign_path = GetPrivateTestRuntimeDataPath() + "foreign_objects/kvmeta/" +
+                                     BuildKvMetaInstancePathHash("test_instance") + "/8/" + std::string(32, 'h');
     const UriStrVec foreign_uri = {"file://test_nfs" + foreign_path + "?blkid=0&size=5"};
 
     const auto [save_ec, actual_uris] = client->SaveObjects(foreign_uri, {payload.size()}, {buffer});

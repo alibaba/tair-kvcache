@@ -1,5 +1,6 @@
 #include "kv_cache_manager/config/registry_manager.h"
 
+#include <algorithm>
 #include <memory>
 #include <utility>
 
@@ -11,6 +12,7 @@
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/registry_storage_backend_factory.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/kv_meta_identity.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -20,6 +22,21 @@ static constexpr const char *kRegistryStorageKey = "storage";
 static constexpr const char *kRegistryGroupKey = "instance_group";
 static constexpr const char *kRegistryInstanceKey = "instance";
 static constexpr const char *kRegistryAccountKey = "account";
+
+namespace {
+
+bool HasSameKvMetaMetadataOwnershipTopology(const InstanceGroup &lhs, const InstanceGroup &rhs) noexcept {
+    const auto lhs_cache = lhs.cache_config();
+    const auto rhs_cache = rhs.cache_config();
+    const auto lhs_indexer = lhs_cache ? lhs_cache->meta_indexer_config() : nullptr;
+    const auto rhs_indexer = rhs_cache ? rhs_cache->meta_indexer_config() : nullptr;
+    const auto lhs_storage = lhs_indexer ? lhs_indexer->GetMetaStorageBackendConfig() : nullptr;
+    const auto rhs_storage = rhs_indexer ? rhs_indexer->GetMetaStorageBackendConfig() : nullptr;
+    return lhs_storage && rhs_storage && lhs_storage->GetStorageType() == rhs_storage->GetStorageType() &&
+           lhs_storage->GetStorageUri() == rhs_storage->GetStorageUri();
+}
+
+} // namespace
 
 #define PREFIX_LOG_I(LEVEL, format, args...)                                                                           \
     do {                                                                                                               \
@@ -140,6 +157,11 @@ bool RegistryManager::Init() {
 }
 
 ErrorCode RegistryManager::AddStorage(RequestContext *request_context, const StorageConfig &storage_config) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    return AddStorageUnsafe(request_context, storage_config);
+}
+
+ErrorCode RegistryManager::AddStorageUnsafe(RequestContext *request_context, const StorageConfig &storage_config) {
     const auto &trace_id = request_context->request_id();
     const auto &global_unique_name = storage_config.global_unique_name();
     auto ec = LoadAndSave(kRegistryStorageKey, global_unique_name, &storage_config);
@@ -151,6 +173,7 @@ ErrorCode RegistryManager::AddStorage(RequestContext *request_context, const Sto
 }
 
 ErrorCode RegistryManager::EnableStorage(RequestContext *request_context, const std::string &global_unique_name) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     const auto &trace_id = request_context->request_id();
     auto ec = UpdateStorageAvailableStatus(global_unique_name, /*is_available*/ true);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "update storage available status failed");
@@ -161,6 +184,7 @@ ErrorCode RegistryManager::EnableStorage(RequestContext *request_context, const 
 }
 
 ErrorCode RegistryManager::DisableStorage(RequestContext *request_context, const std::string &global_unique_name) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     const auto &trace_id = request_context->request_id();
     auto ec = UpdateStorageAvailableStatus(global_unique_name, /*is_available*/ false);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "update storage available status failed");
@@ -171,7 +195,19 @@ ErrorCode RegistryManager::DisableStorage(RequestContext *request_context, const
 }
 
 ErrorCode RegistryManager::RemoveStorage(RequestContext *request_context, const std::string &global_unique_name) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    return RemoveStorageUnsafe(request_context, global_unique_name);
+}
+
+ErrorCode RegistryManager::RemoveStorageUnsafe(RequestContext *request_context, const std::string &global_unique_name) {
     const auto &trace_id = request_context->request_id();
+    if (StorageHasKvMetaOwnerUnsafe(global_unique_name)) {
+        request_context->error_tracer()->AddErrorMsg(
+            "remove storage rejected: a KVMeta instance can still own exact objects on storage '" + global_unique_name +
+            "'");
+        RETURN_IF_EC_NOT_OK_WITH_LOG_S(
+            WARN, EC_BADARGS, "remove storage rejected: storage is referenced by a live KVMeta instance");
+    }
     auto ec = LoadAndDelete(kRegistryStorageKey, global_unique_name);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "load and delete storage failed");
     ec = data_storage_manager_->UnRegisterStorage(global_unique_name);
@@ -187,6 +223,13 @@ ErrorCode RegistryManager::UpdateStorage(RequestContext *request_context,
     const auto &trace_id = request_context->request_id();
     const auto &global_unique_name = storage_config.global_unique_name();
     const auto current_backend = data_storage_manager_->GetDataStorageBackend(global_unique_name);
+    if (StorageHasKvMetaOwnerUnsafe(global_unique_name)) {
+        request_context->error_tracer()->AddErrorMsg(
+            "update storage rejected: a KVMeta instance can still own exact objects on storage '" + global_unique_name +
+            "'");
+        RETURN_IF_EC_NOT_OK_WITH_LOG_S(
+            WARN, EC_BADARGS, "update storage rejected: storage is referenced by a live KVMeta instance");
+    }
     const auto current_type = current_backend == nullptr ? DataStorageType::DATA_STORAGE_TYPE_UNKNOWN
                                                          : current_backend->GetStorageConfig().type();
     if (current_backend != nullptr && current_type != storage_config.type() &&
@@ -214,9 +257,9 @@ ErrorCode RegistryManager::UpdateStorage(RequestContext *request_context,
         }
     }
     // 重建期间短暂不可用
-    auto ec = RemoveStorage(request_context, global_unique_name);
+    auto ec = RemoveStorageUnsafe(request_context, global_unique_name);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "update storage failed: remove storage failed");
-    ec = AddStorage(request_context, storage_config);
+    ec = AddStorageUnsafe(request_context, storage_config);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "update storage failed: add storage failed");
     PREFIX_LOG_S(INFO, "update storage OK");
     return EC_OK;
@@ -262,6 +305,20 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
                                        instance_group.version(),
                                        iter->second->version());
     }
+    if (GroupHasKvMetaInstanceUnsafe(instance_group_name) &&
+        instance_group.storage_candidates() != iter->second->storage_candidates()) {
+        request_context->error_tracer()->AddErrorMsg(
+            "update instance group rejected: storage_candidates are immutable while KVMeta instances exist");
+        RETURN_IF_EC_NOT_OK_WITH_LOG_G(
+            WARN, EC_BADARGS, "update instance group rejected: live KVMeta owner topology is immutable");
+    }
+    if (GroupHasKvMetaInstanceUnsafe(instance_group_name) &&
+        !HasSameKvMetaMetadataOwnershipTopology(instance_group, *iter->second)) {
+        request_context->error_tracer()->AddErrorMsg(
+            "update instance group rejected: KVMeta metadata storage type/URI is immutable while instances exist");
+        RETURN_IF_EC_NOT_OK_WITH_LOG_G(
+            WARN, EC_BADARGS, "update instance group rejected: live KVMeta metadata ownership is immutable");
+    }
     // save to storage backend
     auto ec = LoadAndSave(kRegistryGroupKey, instance_group_name, &instance_group);
     RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and save instance group failed");
@@ -272,32 +329,17 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
 
 ErrorCode RegistryManager::RemoveInstanceGroup(RequestContext *request_context,
                                                const std::string &instance_group_name) {
-    return RemoveInstanceGroupWithMemberGuard(request_context, instance_group_name, {});
-}
-
-ErrorCode RegistryManager::RemoveInstanceGroupWithMemberGuard(
-    RequestContext *request_context,
-    const std::string &instance_group_name,
-    const std::function<ErrorCode(const InstanceInfo &)> &member_guard) {
     const auto &trace_id = request_context->request_id();
     std::unique_lock<std::shared_mutex> lock(mutex_);
     const auto iter = instance_group_configs_.find(instance_group_name);
     if (iter == instance_group_configs_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_NOENT, "remove instance group failed: instance group not found");
     }
-    if (member_guard) {
-        for (const auto &[_, instance] : instance_infos_) {
-            if (!instance || instance->instance_group_name() != instance_group_name) {
-                continue;
-            }
-            const ErrorCode guard_ec = member_guard(*instance);
-            if (guard_ec != EC_OK) {
-                request_context->error_tracer()->AddErrorMsg(
-                    "remove instance group rejected by its instance lifecycle guard");
-                RETURN_IF_EC_NOT_OK_WITH_LOG_G(
-                    WARN, guard_ec, "remove instance group failed: protected member still exists");
-            }
-        }
+    if (GroupHasKvMetaInstanceUnsafe(instance_group_name)) {
+        request_context->error_tracer()->AddErrorMsg(
+            "remove instance group rejected: KVMeta instances must be drained by the KVMeta lifecycle first");
+        RETURN_IF_EC_NOT_OK_WITH_LOG_G(
+            WARN, EC_BADARGS, "remove instance group rejected: live KVMeta instances still exist");
     }
     // delete from storage backend
     auto ec = LoadAndDelete(kRegistryGroupKey, instance_group_name);
@@ -354,6 +396,19 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
         }
         return EC_OK;
     }
+    const bool registering_kv_meta = HasKvMetaReservedInstancePrefix(instance_id);
+    const bool mixes_instance_kinds =
+        std::any_of(instance_infos_.begin(), instance_infos_.end(), [&](const auto &entry) {
+            const auto &existing = entry.second;
+            return existing && existing->instance_group_name() == instance_group &&
+                   HasKvMetaReservedInstancePrefix(existing->instance_id()) != registering_kv_meta;
+        });
+    if (mixes_instance_kinds) {
+        request_context->error_tracer()->AddErrorMsg(
+            "register instance failed: KVMeta and ordinary KV-cache instances require separate instance groups");
+        RETURN_IF_EC_NOT_OK_WITH_LOG_I(
+            WARN, EC_BADARGS, "register instance failed: KVMeta and ordinary instances cannot share a group");
+    }
     auto instance_info = std::make_shared<InstanceInfo>(instance_group_iter->second->global_quota_group_name(),
                                                         instance_group,
                                                         instance_id,
@@ -387,6 +442,12 @@ ErrorCode RegistryManager::RemoveInstance(RequestContext *request_context,
                                           const std::string &instance_id) {
     const auto &trace_id = request_context->trace_id();
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (HasKvMetaReservedInstancePrefix(instance_id)) {
+        request_context->error_tracer()->AddErrorMsg(
+            "remove instance rejected: KVMeta instances require an exact-object drain lifecycle");
+        RETURN_IF_EC_NOT_OK_WITH_LOG_I(
+            WARN, EC_BADARGS, "remove instance rejected: reserved KVMeta lifecycle cannot use legacy removal");
+    }
     if (instance_infos_.find(instance_id) == instance_infos_.end()) {
         // TODO: 添加错误码
         RETURN_IF_EC_NOT_OK_WITH_LOG_I(
@@ -507,6 +568,30 @@ RegistryManager::GetInstanceGroupConfig(const std::string &instance_group_name) 
 }
 
 std::shared_ptr<DataStorageManager> RegistryManager::data_storage_manager() const { return data_storage_manager_; }
+
+bool RegistryManager::GroupHasKvMetaInstanceUnsafe(const std::string &instance_group_name) const noexcept {
+    for (const auto &[instance_id, instance] : instance_infos_) {
+        (void)instance_id;
+        if (instance && instance->instance_group_name() == instance_group_name &&
+            HasKvMetaReservedInstancePrefix(instance->instance_id())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool RegistryManager::StorageHasKvMetaOwnerUnsafe(const std::string &global_unique_name) const noexcept {
+    for (const auto &[group_name, group] : instance_group_configs_) {
+        if (!group || !GroupHasKvMetaInstanceUnsafe(group_name)) {
+            continue;
+        }
+        const auto &candidates = group->storage_candidates();
+        if (std::find(candidates.begin(), candidates.end(), global_unique_name) != candidates.end()) {
+            return true;
+        }
+    }
+    return false;
+}
 
 ErrorCode RegistryManager::LoadAndSave(const std::string &key, const std::string &id, const Jsonizable *jsonizable) {
     std::map<std::string, std::string> value_map;

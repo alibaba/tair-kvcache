@@ -28,6 +28,7 @@ ErrorCode MetaRedisBackend::Init(const std::string &instance_id,
     instance_id_ = instance_id;
     cache_key_prefix_ = "kvcache:instance_" + instance_id_ + ":cache_";
     metadata_key_ = "kvcache:instance_" + instance_id_ + ":metadata";
+    reclaim_sampler_.Reset();
 
     if (!config) {
         KVCM_LOG_ERROR("fail to init meta redis backend, invalid nullptr config");
@@ -473,7 +474,35 @@ ErrorCode MetaRedisBackend::RandomSample(RequestContext * /*request_context*/,
 ErrorCode MetaRedisBackend::SampleReclaimKeys(RequestContext * /*request_context*/,
                                               const int64_t count,
                                               KeyTypeVec &out_keys) noexcept {
-    return RandomSample(nullptr, count, out_keys);
+    out_keys.clear();
+    if (count <= 0) {
+        return EC_OK;
+    }
+    const auto client_pool = client_pool_;
+    if (!client_pool) {
+        KVCM_LOG_ERROR("sample reclaim keys fail, redis client pool is not open, instance[%s]", instance_id_.c_str());
+        return EC_ERROR;
+    }
+    const auto scan =
+        [client_pool, timeout_ms = timeout_ms_, instance_id = instance_id_](const std::string &matching_prefix,
+                                                                            const std::string &cursor,
+                                                                            const int64_t scan_count,
+                                                                            std::string &out_next_cursor,
+                                                                            std::vector<std::string> &out_full_keys) {
+            auto handle = client_pool->AcquireClient(timeout_ms);
+            if (!handle) {
+                KVCM_INTERVAL_LOG_WARN(
+                    10, "sample reclaim keys fail, fail to acquire redis client, instance[%s]", instance_id.c_str());
+                return EC_TIMEOUT;
+            }
+            return handle->Scan(matching_prefix, cursor, scan_count, out_next_cursor, out_full_keys);
+        };
+    const ErrorCode ec = reclaim_sampler_.Sample(scan, cache_key_prefix_, count, out_keys);
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("sample reclaim keys fail, scan redis fail, instance[%s]", instance_id_.c_str());
+        out_keys.clear();
+    }
+    return ec;
 }
 
 ErrorCode MetaRedisBackend::SampleReclaimCandidates(RequestContext *request_context,
@@ -485,7 +514,7 @@ ErrorCode MetaRedisBackend::SampleReclaimCandidates(RequestContext *request_cont
         return EC_OK;
     }
     KeyTypeVec keys;
-    const ErrorCode sample_ec = RandomSample(request_context, count, keys);
+    const ErrorCode sample_ec = SampleReclaimKeys(request_context, count, keys);
     if (sample_ec != EC_OK || keys.empty()) {
         return sample_ec;
     }

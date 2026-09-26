@@ -39,7 +39,7 @@ private:
 
 class ScriptedReclaimMetaAsyncRedisBackend : public MetaAsyncRedisBackend {
 public:
-    ErrorCode RandomSample(RequestContext *, const int64_t, KeyTypeVec &out_keys) noexcept override {
+    ErrorCode SampleReclaimKeys(RequestContext *, const int64_t, KeyTypeVec &out_keys) noexcept override {
         out_keys = sampled_keys;
         return sample_result;
     }
@@ -123,6 +123,44 @@ protected:
 TEST_F(MetaAsyncRedisBackendTest, TestInit) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
     ASSERT_EQ(META_ASYNC_REDIS_BACKEND_TYPE_STR, backend_->GetStorageType());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestSampleReclaimKeysBeforeOpenFailsSafely) {
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    KeyTypeVec keys{999};
+    EXPECT_EQ(EC_ERROR, backend_->SampleReclaimKeys(nullptr, 1, keys));
+    EXPECT_TRUE(keys.empty());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestSampleReclaimKeysUsesPrefixScan) {
+    int created_clients = 0;
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
+        StandardUri empty_uri;
+        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
+        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
+        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
+        if (created_clients++ == 2) {
+            std::vector<ReplyUPtr> replies;
+            replies.emplace_back(MakeFakeReplyScan(
+                "0", {"kvcache:instance_test_instance:cache_11", "kvcache:instance_test_instance:cache_12"}));
+            EXPECT_CALL(*mock,
+                        TryExecPipeline(ElementsAre(ElementsAre(StrEq("SCAN"),
+                                                                StrEq("0"),
+                                                                StrEq("MATCH"),
+                                                                StrEq("kvcache:instance_test_instance:cache_*"),
+                                                                StrEq("COUNT"),
+                                                                StrEq("128")))))
+                .WillOnce(Return(ByMove(std::move(replies))));
+        }
+        return mock;
+    }));
+
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    ASSERT_EQ(EC_OK, backend_->Open());
+    KeyTypeVec keys;
+    EXPECT_EQ(EC_OK, backend_->SampleReclaimKeys(nullptr, 2, keys));
+    EXPECT_EQ((KeyTypeVec{11, 12}), keys);
+    EXPECT_EQ(3, created_clients);
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestInitInvalidEmptyInstanceId) {

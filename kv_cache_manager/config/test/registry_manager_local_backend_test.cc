@@ -6,6 +6,7 @@
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/kv_meta_identity.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -176,17 +177,14 @@ TEST_F(RegistryManagerLocalBackendTest, TestTairMempoolMediaTypeIsImmutable) {
         current_spec->set_media_type(current_media_type);
         // This open-source test uses an NFS backend as a configured-backend holder because the
         // open-source TairMempool backend is intentionally non-functional.
-        backend->config_ =
-            StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, current_spec);
+        backend->config_ = StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, current_spec);
 
         auto requested_spec = std::make_shared<TairMemPoolStorageSpec>(*current_spec);
         requested_spec->set_media_type(requested_media_type);
-        StorageConfig requested_config(
-            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, requested_spec);
+        StorageConfig requested_config(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, storage_name, requested_spec);
         ASSERT_EQ(EC_BADARGS, registry_manager_->UpdateStorage(request_context_.get(), requested_config, true));
 
-        const auto unchanged_backend =
-            registry_manager_->data_storage_manager()->GetDataStorageBackend(storage_name);
+        const auto unchanged_backend = registry_manager_->data_storage_manager()->GetDataStorageBackend(storage_name);
         ASSERT_EQ(backend, unchanged_backend);
         const auto unchanged_spec =
             std::dynamic_pointer_cast<TairMemPoolStorageSpec>(unchanged_backend->GetStorageConfig().storage_spec());
@@ -194,10 +192,8 @@ TEST_F(RegistryManagerLocalBackendTest, TestTairMempoolMediaTypeIsImmutable) {
         ASSERT_EQ(current_media_type, unchanged_spec->media_type());
     };
 
-    verify_media_type_change_rejected(
-        "pace_dram", kTairMemPoolMediaTypeDram, kTairMemPoolMediaTypeSsd);
-    verify_media_type_change_rejected(
-        "pace_legacy_ssd", kTairMemPoolMediaTypeSsd, kTairMemPoolMediaTypeDram);
+    verify_media_type_change_rejected("pace_dram", kTairMemPoolMediaTypeDram, kTairMemPoolMediaTypeSsd);
+    verify_media_type_change_rejected("pace_legacy_ssd", kTairMemPoolMediaTypeSsd, kTairMemPoolMediaTypeDram);
 }
 
 TEST_F(RegistryManagerLocalBackendTest, TestInstanceGroupManagement) {
@@ -292,6 +288,101 @@ TEST_F(RegistryManagerLocalBackendTest, TestInstanceRegistration) {
         registry_manager_->ListInstanceInfo(request_context_.get(), "group1");
     ASSERT_EQ(EC_OK, ec_list_after_remove);
     ASSERT_EQ(1, instance_infos_after_remove.size());
+}
+
+TEST_F(RegistryManagerLocalBackendTest, KvMetaLiveOwnersProtectGroupAndStorageTopology) {
+    const std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_kv_meta_lifecycle";
+    ASSERT_TRUE(InitRegistryManager("local://" + local_path + "?cluster_name=test"));
+    AddNfsStorage("exact_storage", 1);
+    CreateInstanceGroup("exact_group");
+
+    auto [group_ec, current_group] = registry_manager_->GetInstanceGroup(request_context_.get(), "exact_group");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(current_group);
+    auto configured_group = *current_group;
+    configured_group.set_storage_candidates({"exact_storage"});
+    configured_group.set_version(1);
+    ASSERT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), configured_group, 0));
+
+    const std::string internal_id = BuildKvMetaInternalInstanceId("public-emb-instance");
+    RegisterInstance("exact_group", internal_id);
+
+    EXPECT_EQ(EC_BADARGS, registry_manager_->RemoveStorage(request_context_.get(), "exact_storage"));
+    ASSERT_TRUE(registry_manager_->data_storage_manager()->GetDataStorageBackend("exact_storage"));
+
+    auto replacement_spec = GetDefaultNfsStorageSpec();
+    replacement_spec->set_root_path(GetPrivateTestRuntimeDataPath() + "/replacement_root/");
+    StorageConfig replacement(DataStorageType::DATA_STORAGE_TYPE_NFS, "exact_storage", replacement_spec);
+    EXPECT_EQ(EC_BADARGS, registry_manager_->UpdateStorage(request_context_.get(), replacement, true));
+
+    auto [live_group_ec, live_group] = registry_manager_->GetInstanceGroup(request_context_.get(), "exact_group");
+    ASSERT_EQ(EC_OK, live_group_ec);
+    ASSERT_TRUE(live_group);
+    auto topology_change = *live_group;
+    topology_change.set_storage_candidates({"replacement_storage"});
+    topology_change.set_version(2);
+    EXPECT_EQ(EC_BADARGS, registry_manager_->UpdateInstanceGroup(request_context_.get(), topology_change, 1));
+    EXPECT_EQ(EC_BADARGS, registry_manager_->RemoveInstanceGroup(request_context_.get(), "exact_group"));
+    EXPECT_EQ(EC_BADARGS, registry_manager_->RemoveInstance(request_context_.get(), "exact_group", internal_id));
+    EXPECT_TRUE(registry_manager_->GetInstanceInfo(request_context_.get(), internal_id));
+
+    auto metadata_topology_change = *live_group;
+    auto metadata_cache_config = std::make_shared<CacheConfig>(*metadata_topology_change.cache_config());
+    auto metadata_indexer_config = std::make_shared<MetaIndexerConfig>(*metadata_cache_config->meta_indexer_config());
+    auto metadata_backend_config =
+        std::make_shared<MetaStorageBackendConfig>(*metadata_indexer_config->GetMetaStorageBackendConfig());
+    metadata_backend_config->SetStorageUri("redis://replacement-metadata-ownership");
+    metadata_indexer_config->SetMetaStorageBackendConfig(metadata_backend_config);
+    metadata_cache_config->set_meta_indexer_config(metadata_indexer_config);
+    metadata_topology_change.set_cache_config(metadata_cache_config);
+    metadata_topology_change.set_version(2);
+    EXPECT_EQ(EC_BADARGS, registry_manager_->UpdateInstanceGroup(request_context_.get(), metadata_topology_change, 1));
+
+    // Non-topology policy changes remain available to operators while exact
+    // objects are live; the guard is deliberately scoped to ownership roots.
+    auto policy_change = *live_group;
+    policy_change.set_user_data("updated without changing exact ownership");
+    policy_change.set_version(2);
+    EXPECT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), policy_change, 1));
+}
+
+TEST_F(RegistryManagerLocalBackendTest, KvMetaAndOrdinaryInstancesCannotMixInEitherRegistrationOrder) {
+    const std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_kv_meta_group_kind";
+    ASSERT_TRUE(InitRegistryManager("local://" + local_path + "?cluster_name=test"));
+    CreateInstanceGroup("kvmeta_first");
+    CreateInstanceGroup("ordinary_first");
+
+    LocationSpecInfo info;
+    ModelDeployment deployment;
+    const std::string kvmeta_a = BuildKvMetaInternalInstanceId("emb-a");
+    const std::string kvmeta_b = BuildKvMetaInternalInstanceId("emb-b");
+    ASSERT_FALSE(kvmeta_a.empty());
+    ASSERT_FALSE(kvmeta_b.empty());
+
+    ASSERT_EQ(
+        EC_OK,
+        registry_manager_->RegisterInstance(request_context_.get(), "kvmeta_first", kvmeta_a, 1, {info}, deployment));
+    EXPECT_EQ(EC_BADARGS,
+              registry_manager_->RegisterInstance(
+                  request_context_.get(), "kvmeta_first", "ordinary-after-kvmeta", 1024, {info}, deployment));
+
+    ASSERT_EQ(EC_OK,
+              registry_manager_->RegisterInstance(
+                  request_context_.get(), "ordinary_first", "ordinary-before-kvmeta", 1024, {info}, deployment));
+    EXPECT_EQ(
+        EC_BADARGS,
+        registry_manager_->RegisterInstance(request_context_.get(), "ordinary_first", kvmeta_b, 1, {info}, deployment));
+
+    const auto [kvmeta_ec, kvmeta_instances] =
+        registry_manager_->ListInstanceInfo(request_context_.get(), "kvmeta_first");
+    const auto [ordinary_ec, ordinary_instances] =
+        registry_manager_->ListInstanceInfo(request_context_.get(), "ordinary_first");
+    EXPECT_EQ(EC_OK, kvmeta_ec);
+    EXPECT_EQ(EC_OK, ordinary_ec);
+    ASSERT_EQ(1u, kvmeta_instances.size());
+    ASSERT_EQ(1u, ordinary_instances.size());
+    EXPECT_TRUE(HasKvMetaReservedInstancePrefix(kvmeta_instances.front()->instance_id()));
+    EXPECT_FALSE(HasKvMetaReservedInstancePrefix(ordinary_instances.front()->instance_id()));
 }
 
 TEST_F(RegistryManagerLocalBackendTest, DuplicateInstanceCannotMoveToAnotherGroup) {

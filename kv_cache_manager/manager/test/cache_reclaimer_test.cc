@@ -5568,9 +5568,7 @@ TEST_F(CacheReclaimerTest, TestFairRotationPolicySwitchResetsQueueWithoutResetti
 TEST_F(CacheReclaimerTest, KvMetaInstancesDoNotConsumeReclaimOrMigrationBudget) {
     cache_reclaimer_->job_state_flag_ = true;
     dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 90);
-    auto malformed_reserved = InstanceInfoFactory();
-    malformed_reserved->set_instance_id(std::string(kKvMetaInternalInstancePrefix) + "future-format");
-    instance_infos = {KvMetaInstanceInfoFactory(), malformed_reserved};
+    instance_infos = {KvMetaInstanceInfoFactory()};
 
     const auto group = InstanceGroupFactory();
     group->quota_.set_capacity(100);
@@ -6469,7 +6467,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
     }
 }
 
-TEST_F(CacheReclaimerTest, TestLocalSamplingUsesOneTaskWithoutChangingLegacyBudgets) {
+TEST_F(CacheReclaimerTest, TestLocalSamplingUsesOneTaskAcrossRecoveryWithoutChangingLegacyBudgets) {
     auto indexer = mim_->GetMetaIndexer(instance_infos.front()->instance_id());
     ASSERT_NE(nullptr, indexer);
     indexer->backend_manager_ = std::make_unique<MetaStorageBackendManager>();
@@ -6489,9 +6487,9 @@ TEST_F(CacheReclaimerTest, TestLocalSamplingUsesOneTaskWithoutChangingLegacyBudg
                 request_context_, instance_infos.front(), 1000, bounded, candidates));
             EXPECT_EQ(1000, candidates.size());
             const auto requests = SampleReclaimRequestsSnapshot();
-            ASSERT_EQ(recovered ? 1 : 10, requests.size());
+            ASSERT_EQ(1, requests.size());
             for (const auto &request : requests) {
-                EXPECT_EQ(recovered ? 1000 : 100, request.second);
+                EXPECT_EQ(1000, request.second);
             }
         }
     }

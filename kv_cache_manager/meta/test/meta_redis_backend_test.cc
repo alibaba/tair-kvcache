@@ -1,7 +1,10 @@
 #include <atomic>
 #include <future>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/common/test/mock_redis_client.h"
@@ -13,6 +16,36 @@
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
 
 namespace kv_cache_manager {
+
+namespace {
+
+class RedisReplyFactory : public RedisTestBase {
+public:
+    using RedisTestBase::ReplyUPtr;
+
+    static ReplyUPtr MakeScan(const std::string &next_cursor, const std::vector<std::optional<std::string>> &keys) {
+        return MakeFakeReplyScan(next_cursor, keys);
+    }
+};
+
+void ExpectReclaimScan(MockRedisClient *client,
+                       std::vector<std::optional<std::string>> keys,
+                       const std::string &cursor = "0",
+                       const std::string &next_cursor = "0") {
+    std::vector<RedisReplyFactory::ReplyUPtr> replies;
+    replies.emplace_back(RedisReplyFactory::MakeScan(next_cursor, keys));
+    EXPECT_CALL(*client,
+                TryExecPipeline(ElementsAre(ElementsAre(StrEq("SCAN"),
+                                                        StrEq(cursor),
+                                                        StrEq("MATCH"),
+                                                        StrEq("kvcache:instance_instance_0:cache_*"),
+                                                        StrEq("COUNT"),
+                                                        StrEq("128")))))
+        .WillOnce(Return(ByMove(std::move(replies))));
+}
+
+} // namespace
+
 class MockMetaRedisBackend : public MetaRedisBackend {
 public:
     MOCK_METHOD(std::shared_ptr<RedisClient>, CreateRedisClient, (), (const));
@@ -69,6 +102,13 @@ TEST_F(MetaRedisBackendTest, TestInit) {
         ConstructMetaRedisBackend();
         ASSERT_EQ(EC_BADARGS, meta_redis_backend_->Init(/*instance_id*/ "", meta_storage_backend_config_));
     }
+}
+
+TEST_F(MetaRedisBackendTest, TestSampleReclaimKeysBeforeOpenFailsSafely) {
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    KeyTypeVec keys{999};
+    EXPECT_EQ(EC_ERROR, meta_redis_backend_->SampleReclaimKeys(nullptr, 1, keys));
+    EXPECT_TRUE(keys.empty());
 }
 
 TEST_F(MetaRedisBackendTest, TestInvalidClientPoolSize) {
@@ -211,15 +251,8 @@ TEST_F(MetaRedisBackendTest, TestSimple) {
                                                             StrEq("5")))))
             .WillOnce(Return(ByMove(std::move(list_keys_replies))));
 
-        std::vector<ReplyUPtr> random_replies;
-        for (int i = 0; i < 20; ++i) {
-            random_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, "some_other_key"));
-        }
-        random_replies[0] = MakeFakeReply(REDIS_REPLY_STRING, "kvcache:instance_instance_0:cache_1");
-        random_replies[9] = MakeFakeReply(REDIS_REPLY_STRING, "kvcache:instance_instance_0:cache_2");
-        std::vector<std::vector<std::string>> randomkey_commands(20, {"RANDOMKEY"});
-        EXPECT_CALL(*mock_redis_client, TryExecPipeline(ElementsAreArray(randomkey_commands)))
-            .WillOnce(Return(ByMove(std::move(random_replies))));
+        ExpectReclaimScan(mock_redis_client.get(),
+                          {"kvcache:instance_instance_0:cache_1", "kvcache:instance_instance_0:cache_2"});
 
         // test upsert
         std::vector<ReplyUPtr> upsert_replies;
@@ -285,15 +318,8 @@ TEST_F(MetaRedisBackendTest, TestSampleReclaimCandidatesReadsTimestampsWithoutWr
         EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
         EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
 
-        std::vector<ReplyUPtr> random_replies;
-        for (int i = 0; i < 20; ++i) {
-            random_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, "some_other_key"));
-        }
-        random_replies[0] = MakeFakeReply(REDIS_REPLY_STRING, "kvcache:instance_instance_0:cache_1");
-        random_replies[1] = MakeFakeReply(REDIS_REPLY_STRING, "kvcache:instance_instance_0:cache_2");
-        const std::vector<std::vector<std::string>> randomkey_commands(20, {"RANDOMKEY"});
-        EXPECT_CALL(*mock_redis_client, TryExecPipeline(ElementsAreArray(randomkey_commands)))
-            .WillOnce(Return(ByMove(std::move(random_replies))));
+        ExpectReclaimScan(mock_redis_client.get(),
+                          {"kvcache:instance_instance_0:cache_1", "kvcache:instance_instance_0:cache_2"});
 
         std::vector<ReplyUPtr> property_replies;
         property_replies.emplace_back(MakeFakeReplyArrayString({"101"}));
@@ -326,15 +352,8 @@ TEST_F(MetaRedisBackendTest, TestSampleReclaimCandidatesPropertyFailureDegradesA
         EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
         EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
 
-        std::vector<ReplyUPtr> random_replies;
-        for (int i = 0; i < 20; ++i) {
-            random_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, "some_other_key"));
-        }
-        random_replies[0] = MakeFakeReply(REDIS_REPLY_STRING, "kvcache:instance_instance_0:cache_1");
-        random_replies[1] = MakeFakeReply(REDIS_REPLY_STRING, "kvcache:instance_instance_0:cache_2");
-        const std::vector<std::vector<std::string>> randomkey_commands(20, {"RANDOMKEY"});
-        EXPECT_CALL(*mock_redis_client, TryExecPipeline(ElementsAreArray(randomkey_commands)))
-            .WillOnce(Return(ByMove(std::move(random_replies))));
+        ExpectReclaimScan(mock_redis_client.get(),
+                          {"kvcache:instance_instance_0:cache_1", "kvcache:instance_instance_0:cache_2"});
 
         std::vector<ReplyUPtr> property_replies;
         property_replies.emplace_back(MakeFakeReply(REDIS_REPLY_ERROR, "ERROR"));
@@ -369,15 +388,8 @@ TEST_F(MetaRedisBackendTest, TestGroupLruMissingRedisTimestampRetainsCandidates)
         EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
         EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
 
-        std::vector<ReplyUPtr> random_replies;
-        for (int i = 0; i < 20; ++i) {
-            random_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, "some_other_key"));
-        }
-        random_replies[0] = MakeFakeReply(REDIS_REPLY_STRING, "kvcache:instance_instance_0:cache_1");
-        random_replies[1] = MakeFakeReply(REDIS_REPLY_STRING, "kvcache:instance_instance_0:cache_2");
-        const std::vector<std::vector<std::string>> randomkey_commands(20, {"RANDOMKEY"});
-        EXPECT_CALL(*mock_redis_client, TryExecPipeline(ElementsAreArray(randomkey_commands)))
-            .WillOnce(Return(ByMove(std::move(random_replies))));
+        ExpectReclaimScan(mock_redis_client.get(),
+                          {"kvcache:instance_instance_0:cache_1", "kvcache:instance_instance_0:cache_2"});
 
         // Exercise RedisClient's actual nil/empty-field -> EC_NOENT mapping.
         std::vector<ReplyUPtr> property_replies;

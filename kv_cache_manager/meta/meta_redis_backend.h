@@ -8,6 +8,7 @@
 #include "kv_cache_manager/common/client_pool.h"
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
+#include "kv_cache_manager/meta/redis_reclaim_sampler.h"
 
 namespace kv_cache_manager {
 
@@ -101,5 +102,6 @@ private:
     std::string cache_key_prefix_;
     std::string metadata_key_;
     int64_t timeout_ms_ = 1000;
+    RedisReclaimSampler reclaim_sampler_;
 };
 } // namespace kv_cache_manager

@@ -181,7 +181,7 @@ KVMeta instance 必须注册到专用 Instance Group，不能与普通 KVCache i
 普通 CacheReclaimer、Migration 和 Cache GC 也不会扫描 KVMeta instance。KVMeta 使用独立 worker 按专用 group
 现有的 LRU `reclaim_strategy` 自动逐出，并复用 sampling/batch/idle 参数；不占用普通 Reclaimer 的 pending 状态或
 删除 executor。业务仍应在消费结束后用 `Remove` 主动 release，`TrimAll` 用于全量维护。完整协议、动态长度、
-durable tombstone、reader grace、按 backend 能力执行的物理清理、metadata finalization 回收语义和 RTP 接入方式见
+durable tombstone、reader grace、exact physical absence、metadata finalization 回收语义和 RTP 接入方式见
 [KVMeta 通用对象存储设计](design/kv_meta_object_storage.md)。
 
 ### SchedulePlanExecutor 线程与迁移预算

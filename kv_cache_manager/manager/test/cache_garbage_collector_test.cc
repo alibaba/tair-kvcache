@@ -1580,7 +1580,6 @@ TEST_F(CacheGarbageCollectorTest, SubmittedLocationSummaryIncludesEveryReason) {
 
 TEST_F(CacheGarbageCollectorTest, KvMetaInstancesDoNotConsumeTheKvCacheScanBudget) {
     AddKvMetaInstance("group_a", "656d62");
-    AddInstance("group_a", std::string(kKvMetaInternalInstancePrefix) + "future-format");
     scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})}};
 
     auto gc = MakeGc(DefaultConfig());

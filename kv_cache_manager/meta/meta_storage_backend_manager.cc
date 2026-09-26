@@ -1939,31 +1939,40 @@ ErrorCode MetaStorageBackendManager::SampleReclaimKeys(RequestContext *request_c
     if (count <= 0) {
         return EC_OK;
     }
-    // Until recover finishes, the cache backend has not seen every key yet,
-    // so we still go to persistent to avoid biased reclamation. In single-
-    // backend mode (no cache) we always go to persistent.
-    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
-        return cache_backend_->SampleReclaimKeys(request_context, count, out_keys);
+    auto *source = GetReclaimSamplingSource();
+    if (!source) {
+        out_keys.clear();
+        return EC_ERROR;
     }
-    return persistent_backend_->SampleReclaimKeys(request_context, count, out_keys);
+    return source->SampleReclaimKeys(request_context, count, out_keys);
+}
+
+MetaStorageBackend *MetaStorageBackendManager::GetReclaimSamplingSource() const noexcept {
+    auto *source = persistent_backend_.get();
+    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        source = cache_backend_.get();
+    }
+    return source;
 }
 
 bool MetaStorageBackendManager::PreferSingleTaskReclaimSampling() const noexcept {
-    auto *source = persistent_backend_.get();
-    if (cache_backend_) {
-        if (recover_state_.load(std::memory_order_acquire) != RecoverState::kRunning) {
-            return false;
-        }
-        source = cache_backend_.get();
+    auto *source = GetReclaimSamplingSource();
+    if (!source) {
+        return false;
     }
-    return source && source->GetStorageType() == META_LOCAL_BACKEND_TYPE_STR;
+    const std::string type = source->GetStorageType();
+    return type == META_LOCAL_BACKEND_TYPE_STR || type == META_REDIS_BACKEND_TYPE_STR ||
+           type == META_ASYNC_REDIS_BACKEND_TYPE_STR;
 }
 
 size_t MetaStorageBackendManager::TouchKeysForMaintenance(const KeyTypeVec &keys) noexcept {
-    if (keys.empty() || !PreferSingleTaskReclaimSampling()) {
+    auto *source = GetReclaimSamplingSource();
+    // Redis sampling is also intentionally single-task, but Redis has no
+    // physical LRU prefix to yield. Never redirect a persistent Redis sample
+    // to the configured (and possibly incomplete) Local cache.
+    if (keys.empty() || !source || source->GetStorageType() != META_LOCAL_BACKEND_TYPE_STR) {
         return 0;
     }
-    auto *source = cache_backend_ ? cache_backend_.get() : persistent_backend_.get();
     return source->TouchKeysForMaintenance(keys);
 }
 
