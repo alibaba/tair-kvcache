@@ -39,6 +39,54 @@ constexpr bool IsEventReportStorageType(const DataStorageType &type) noexcept {
            type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
 }
 
+// KVMeta locations must describe objects allocated and exclusively owned by
+// KVCM. Event-report entries only observe externally managed blocks and must
+// never enter exact-object read/delete paths.
+constexpr bool IsKvMetaObjectStorageType(const DataStorageType &type) noexcept {
+    switch (type) {
+    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
+    case DataStorageType::DATA_STORAGE_TYPE_NFS:
+    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD:
+        return true;
+    case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5:
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2:
+    case DataStorageType::COUNT:
+    default:
+        return false;
+    }
+}
+
+// KVMeta transfers return ownership of exact-size caller buffers as soon as a
+// synchronous Get/Put completes.  A backend is admissible only when that
+// return proves that no asynchronous device access can still touch the
+// buffer.  Keep this capability separate from object ownership: Mooncake
+// objects remain recognizable for recovery/deletion, but its current C API
+// has no cancel/drain primitive for an RDMA that outlives a soft timeout.
+constexpr bool SupportsKvMetaCallerOwnedBufferLifetime(const DataStorageType &type) noexcept {
+    return IsKvMetaObjectStorageType(type) && type != DataStorageType::DATA_STORAGE_TYPE_MOONCAKE;
+}
+
+// Recognizing an ownership record and safely returning a caller buffer are
+// necessary but not sufficient for new cache admission. A writable EMB
+// backend must also provide independently deletable singleton objects and an
+// explicit retry-safety contract. HF3FS lacks a bounded terminal state for
+// timed-out submitted I/O today; VCNS-HF3FS uses the legacy shared-file
+// allocator; Dummy is test-only. Keep them readable for recovery, but do not
+// create new objects there.
+constexpr bool SupportsKvMetaExactObjectLifecycle(const DataStorageType &type) noexcept {
+    return type == DataStorageType::DATA_STORAGE_TYPE_NFS || type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
+           type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
+}
+
+constexpr bool SupportsKvMetaAdmission(const DataStorageType &type) noexcept {
+    return SupportsKvMetaCallerOwnedBufferLifetime(type) && SupportsKvMetaExactObjectLifecycle(type);
+}
+
 constexpr bool IsTairMempoolStorageType(const DataStorageType &type) noexcept {
     return type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
            type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;

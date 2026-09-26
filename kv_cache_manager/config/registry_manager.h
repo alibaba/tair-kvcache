@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -52,6 +53,12 @@ public:
     ErrorCode
     UpdateInstanceGroup(RequestContext *request_context, const InstanceGroup &instance_group, int64_t current_version);
     ErrorCode RemoveInstanceGroup(RequestContext *request_context, const std::string &name);
+    // Runs the member guard while holding the same registry write lock as the
+    // group deletion. This closes the list-then-remove race for callers that
+    // own special instance lifecycles without changing the legacy API above.
+    ErrorCode RemoveInstanceGroupWithMemberGuard(RequestContext *request_context,
+                                                 const std::string &name,
+                                                 const std::function<ErrorCode(const InstanceInfo &)> &member_guard);
     std::pair<ErrorCode, std::shared_ptr<const InstanceGroup>> GetInstanceGroup(RequestContext *request_context,
                                                                                 const std::string &name);
     std::pair<ErrorCode, std::vector<std::shared_ptr<const InstanceGroup>>>

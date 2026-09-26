@@ -272,11 +272,32 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
 
 ErrorCode RegistryManager::RemoveInstanceGroup(RequestContext *request_context,
                                                const std::string &instance_group_name) {
+    return RemoveInstanceGroupWithMemberGuard(request_context, instance_group_name, {});
+}
+
+ErrorCode RegistryManager::RemoveInstanceGroupWithMemberGuard(
+    RequestContext *request_context,
+    const std::string &instance_group_name,
+    const std::function<ErrorCode(const InstanceInfo &)> &member_guard) {
     const auto &trace_id = request_context->request_id();
     std::unique_lock<std::shared_mutex> lock(mutex_);
     const auto iter = instance_group_configs_.find(instance_group_name);
     if (iter == instance_group_configs_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_NOENT, "remove instance group failed: instance group not found");
+    }
+    if (member_guard) {
+        for (const auto &[_, instance] : instance_infos_) {
+            if (!instance || instance->instance_group_name() != instance_group_name) {
+                continue;
+            }
+            const ErrorCode guard_ec = member_guard(*instance);
+            if (guard_ec != EC_OK) {
+                request_context->error_tracer()->AddErrorMsg(
+                    "remove instance group rejected by its instance lifecycle guard");
+                RETURN_IF_EC_NOT_OK_WITH_LOG_G(
+                    WARN, guard_ec, "remove instance group failed: protected member still exists");
+            }
+        }
     }
     // delete from storage backend
     auto ec = LoadAndDelete(kRegistryGroupKey, instance_group_name);

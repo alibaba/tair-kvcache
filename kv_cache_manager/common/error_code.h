@@ -27,6 +27,10 @@ enum [[nodiscard]] ErrorCode : int32_t{
     EC_SERVICE_NOT_LEADER = 18,
     EC_NODE_NOT_REGISTERED = 19,
     EC_SNAPSHOT_IN_PROGRESS = 20,
+    // A mutation may have taken effect, but rollback/reconciliation could not
+    // prove one final state. Callers must inspect state and must not blindly
+    // retry the mutation.
+    EC_OUTCOME_UNKNOWN = 21,
     EC_SNAPSHOT_RATE_LIMITED = 22,
     EC_SNAPSHOT_REQUIRED = 23,
     EC_UNKNOWN = 127,

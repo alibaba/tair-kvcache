@@ -105,6 +105,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->service_admin_http_port_ = std::stoi(value);
          return true;
      }},
+    {"kvcm.kv_meta.enabled",
+     [](const std::string &value, ServerConfig *config) {
+         config->kv_meta_enabled_ = value == "true";
+         return value == "true" || value == "false";
+     }},
     {"kvcm.service.enable_debug_service",
      [](const std::string &value, ServerConfig *config) {
          config->enable_debug_service_ = value == "true";
@@ -382,6 +387,7 @@ bool ServerConfig::ResolveMetricsEnvTags() {
 }
 
 void ServerConfig::UpdateDefaultConfig() {
+    kv_meta_enabled_ = false;
     metrics_reporter_type_ = "local";
     metrics_env_tag_mappings_.clear();
     metrics_common_tags_.clear();

@@ -33,6 +33,11 @@
 注：PACE 属跨仓库生产路径，本仓库不修改其实现；注入字段对它是纯增量（不读即无行为
 变化），未来若希望显式对齐可读取 `timeout_config()` 校验自身配置。
 
+该矩阵描述普通固定 block TransferClient 的既有能力。KVMeta/EMB 的 exact-size buffer 在同步调用返回后可立即
+释放或复用，要求更强的 hard lifetime contract；当前 Mooncake C API 没有传输 completion/cancel/drain primitive，
+因此服务端 `RegisterInstance` 与客户端 `InitForKvMeta` 都拒绝 Mooncake。等待包装层调用 future 返回不能替代底层
+RDMA drain，普通 TransferClient 的 Mooncake soft 行为保持不变。
+
 ## 4. Known Limitations
 
 1. **W_q 残留窗口**：后端 deadline 锚定自身起点，排队等待 W_q 使后端可能晚于
@@ -50,6 +55,6 @@
    提交的 I/O 的 iov 缓冲区和 IOR（释放会导致 UAF）。泄漏规模 = 一次超时的读写
    调用涉及的 iov 大小。线上应在 WARN 日志中观测泄漏频率，若高频则需引入 3FS
    取消机制。
-5. **Mooncake 为 soft 级**：超时后在飞的 DMA 无法取消；调用方在收到超时后立即
+5. **Mooncake 为 soft 级**：普通 TransferClient 超时后在飞的 DMA 无法取消；调用方在收到超时后立即
    复用相应 buffer 是文档化的数据竞争。逐 key 准入把暴露面从整批降到 ≤1 个在飞
-   key。
+   key。KVMeta 不接受这一风险并在初始化前 fail closed。
