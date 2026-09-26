@@ -15,6 +15,7 @@
 - [CacheReclaimer Group 级 LRU](design/cache_reclaimer_group_lru.md) - 跨 Instance 统一比较采样候选，默认 Group LRU，也可按配置选择容量比例或固定预算策略
 - [EventReport 主动回收纳入后台扫描 GC](design/event_report_background_gc.md) - 由 EventReportBackend 提供状态驱动的批量判定，复用统一 GC round 回收 stale snapshot 与 down host metadata
 - [Meta 内存主存储与 Redis 异步备份](design/meta_memory_primary_async_backup.md) - Recover 保持持久化优先，Running 切换内存优先异步备份并复用原锁外 Sync
+- [KVMeta 通用对象存储](design/kv_meta_object_storage.md) - 面向 EPD embedding 的变长 exact-key 元数据、事务、主链路隔离与 RTP 接入
 
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置
@@ -24,6 +25,7 @@
 - [构建版本信息](develop/version_stamping.md) - Version Stamping 机制原理与使用方式
 - [API 文档](api/) - API 接口说明和使用示例
 - [ReportEvent 与查询接口行为](api/report_event.md) - 面向调用方的事件上报、全量对账、查询、错误处理和测试覆盖清单
+- [KVMeta 通用对象 API](api/kv_meta_service.md) - embedding 等变长对象的独立 gRPC 接口契约
 
 ### 部署文档
 - [镜像文档](../open_source/docker/README.md) - Docker镜像构建和使用说明

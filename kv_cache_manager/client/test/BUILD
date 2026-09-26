@@ -16,6 +16,38 @@ cc_test(
 )
 
 cc_test(
+    name = "KvMetaClientTest",
+    srcs = ["kv_meta_client_test.cc"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/client:kv_meta_client_impl",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:common_define",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+    ],
+)
+
+cc_test(
+    name = "KvMetaObjectClientTest",
+    srcs = ["kv_meta_object_client_test.cc"],
+    deps = [
+        "//kv_cache_manager/client:kv_meta_object_client_impl",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:common_define",
+    ],
+)
+
+cc_test(
+    name = "KvMetaTransferClientTest",
+    srcs = ["kv_meta_transfer_client_test.cc"],
+    deps = [
+        "//kv_cache_manager/client",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:common_define",
+    ],
+)
+
+cc_test(
     name = "TransferClientTest",
     srcs = [
         "transfer_client_test.cc",
@@ -51,5 +83,23 @@ py_test(
     main = "asan_runner.py",
     deps = [
         "//kv_cache_manager/client/pybind:kvcm_py_client_lib",
+    ],
+)
+
+py_test(
+    name = "KvMetaObjectPythonClientTest",
+    size = "small",
+    srcs = [
+        "asan_runner.py",
+        "kv_meta_object_client_py_test.py",
+    ],
+    args = [
+        "$(location lsan_suppressions.txt)",
+        "$(location kv_meta_object_client_py_test.py)",
+    ],
+    data = ["lsan_suppressions.txt"],
+    main = "asan_runner.py",
+    deps = [
+        "//kv_cache_manager/client:kv_meta_object_py_client",
     ],
 )

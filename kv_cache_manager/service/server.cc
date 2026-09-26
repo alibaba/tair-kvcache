@@ -1,7 +1,10 @@
 #include "kv_cache_manager/service/server.h"
 
+#include <chrono>
 #include <cstdio>
+#include <exception>
 #include <grpcpp/grpcpp.h>
+#include <thread>
 
 #include "kv_cache_manager/common/build_version.h"
 #include "kv_cache_manager/common/loop_thread.h"
@@ -14,6 +17,7 @@
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/log_event_publisher.h"
 #include "kv_cache_manager/manager/cache_manager.h"
+#include "kv_cache_manager/manager/kv_meta_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -24,10 +28,12 @@
 #include "kv_cache_manager/service/debug_service_impl.h"
 #include "kv_cache_manager/service/grpc_service/admin_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/debug_service_grpc.h"
+#include "kv_cache_manager/service/grpc_service/kv_meta_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
 #include "kv_cache_manager/service/http_service/admin_service_http.h"
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
+#include "kv_cache_manager/service/kv_meta_service_impl.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
 
 namespace kv_cache_manager {
@@ -114,6 +120,17 @@ bool Server::Init(const ServerConfig &config) {
         cache_manager_, metrics_reporter_, metrics_registry_, registry_manager_, leader_elector_);
     debug_impl_ = std::make_shared<DebugServiceImpl>(cache_manager_);
 
+    if (config_.IsKvMetaEnabled()) {
+        kv_meta_manager_ = std::make_shared<KvMetaManager>(cache_manager_, registry_manager_);
+        if (!kv_meta_manager_->Init()) {
+            KVCM_LOG_ERROR("KVMeta manager init failed");
+            return false;
+        }
+        kv_meta_impl_ = std::make_shared<KvMetaServiceImpl>(cache_manager_, kv_meta_manager_, metrics_reporter_);
+        kv_meta_impl_->DisableLeaderOnlyRequests();
+        KVCM_LOG_INFO("KVMeta service enabled on the primary RPC port %d", config_.GetServiceRpcPort());
+    }
+
     meta_impl_->DisableLeaderOnlyRequests();
     admin_impl_->DisableLeaderOnlyRequests();
 
@@ -154,6 +171,13 @@ void Server::OnBecomeLeader() {
     meta_impl_->EnableLeaderOnlyRequests();
     admin_impl_->EnableLeaderOnlyRequests();
     KVCM_LOG_INFO("recover end");
+
+    // KVMeta recovery can scan a large object namespace. Run it only after
+    // the existing service has been made available, and never on the leader
+    // transition thread that gates the main lifecycle.
+    if (kv_meta_manager_) {
+        StartKvMetaRecovery();
+    }
 }
 
 void Server::OnNoLongerLeader() {
@@ -163,6 +187,18 @@ void Server::OnNoLongerLeader() {
 
     meta_impl_->DisableLeaderOnlyRequests();
     admin_impl_->DisableLeaderOnlyRequests();
+    if (kv_meta_manager_) {
+        kv_meta_recovery_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        // Serialize close-gate with the recovery thread's final epoch check
+        // and open-gate operation. If recovery already passed its check, this
+        // lock makes demotion close the gate afterwards; otherwise the changed
+        // epoch prevents recovery from opening it at all.
+        {
+            std::lock_guard<std::mutex> lock(kv_meta_recovery_mutex_);
+            kv_meta_impl_->DisableLeaderOnlyRequests();
+        }
+        kv_meta_manager_->CancelMaintenance();
+    }
 
     meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
     admin_impl_->WaitForAllLeaderOnlyRequestsToComplete();
@@ -171,6 +207,20 @@ void Server::OnNoLongerLeader() {
     // Stop migration after leader-only requests drain and after GC has stopped consulting
     // active Copy reservations.
     cache_manager_->StopMigrationManager();
+
+    if (kv_meta_manager_) {
+        // CancelMaintenance already closed session admission and made an
+        // unbounded Trim return at its next bounded checkpoint. Preserve the
+        // original main-service drain/GC/migration ordering above before any
+        // KVMeta join can wait on a backend operation.
+        kv_meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+        // Recovery also mutates the manager's in-memory state. Join it before
+        // clearing sessions so DoRecover and DoCleanup can never race.
+        CancelAndJoinKvMetaRecovery();
+        // Pending sessions are then cleared in memory without per-session
+        // backend I/O; the next leader's recovery reclaims active records.
+        kv_meta_manager_->DoCleanup();
+    }
 
     ErrorCode ec = cache_manager_->DoCleanup();
     if (ec != EC_OK) {
@@ -181,6 +231,85 @@ void Server::OnNoLongerLeader() {
         KVCM_LOG_ERROR("registry_manager DoCleanup failed");
     }
     KVCM_LOG_INFO("Server cleanup completed");
+}
+
+void Server::StartKvMetaRecovery() {
+    CancelAndJoinKvMetaRecovery();
+    if (!kv_meta_manager_ || !kv_meta_impl_ || stop_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    const std::uint64_t epoch = kv_meta_recovery_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    std::lock_guard<std::mutex> lock(kv_meta_recovery_mutex_);
+    if (stop_.load(std::memory_order_acquire) || kv_meta_recovery_epoch_.load(std::memory_order_acquire) != epoch) {
+        return;
+    }
+    try {
+        kv_meta_recovery_thread_ = std::thread([this, epoch]() {
+            const auto should_abort = [this, epoch]() {
+                return stop_.load(std::memory_order_acquire) ||
+                       kv_meta_recovery_epoch_.load(std::memory_order_acquire) != epoch;
+            };
+            ErrorCode ec = EC_ERROR;
+            try {
+                // CacheManager::DoRecover preserves its historical behavior
+                // of returning EC_OK after deferring a partial failure to a
+                // retry thread. KVMeta requires those indexers, so keep only
+                // this optional service gated until the retry really finishes.
+                while (!should_abort() && !cache_manager_->IsRecoverComplete()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                ec = should_abort() ? EC_SERVICE_NOT_LEADER : kv_meta_manager_->DoRecover(should_abort);
+            } catch (const std::exception &) {
+                // KVMeta recovery is an isolated optional side path. A
+                // provider exception must leave its request gate closed, not
+                // terminate the server process or affect fixed-block KV-cache.
+                KVCM_LOG_ERROR("KVMeta recovery caught a standard exception; service remains disabled");
+            } catch (...) { KVCM_LOG_ERROR("KVMeta recovery caught an unknown exception; service remains disabled"); }
+            bool enabled = false;
+            if (ec == EC_OK) {
+                // Serialize the final epoch check and gate opening with
+                // CancelAndJoinKvMetaRecovery. A demotion either invalidates
+                // the epoch before this lock is acquired, or disables the
+                // gate after this block; a standby can therefore never be
+                // re-enabled by a finishing recovery thread.
+                std::lock_guard<std::mutex> lock(kv_meta_recovery_mutex_);
+                if (!should_abort()) {
+                    if (kv_meta_manager_->ResumeMaintenance()) {
+                        kv_meta_impl_->EnableLeaderOnlyRequests();
+                        enabled = true;
+                    } else {
+                        KVCM_LOG_ERROR("KVMeta session worker restart failed; service remains disabled");
+                    }
+                }
+            }
+            if (enabled) {
+                KVCM_LOG_INFO("KVMeta recovery completed; generic object service is ready");
+            } else if (ec != EC_SERVICE_NOT_LEADER && ec != EC_OK) {
+                KVCM_LOG_ERROR("KVMeta recover failed, generic object service remains disabled, ec[%d]",
+                               static_cast<int>(ec));
+            }
+        });
+    } catch (const std::exception &e) { KVCM_LOG_ERROR("failed to start KVMeta recovery thread: %s", e.what()); }
+}
+
+void Server::CancelAndJoinKvMetaRecovery() {
+    kv_meta_recovery_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    // More than one lifecycle callback can request cancellation. Keep the
+    // whole move-and-join sequence serialized: after one caller moves the
+    // std::thread out, another caller must not observe an empty member and
+    // continue into manager cleanup while that worker is still running.
+    std::lock_guard<std::mutex> join_lock(kv_meta_recovery_join_mutex_);
+    std::thread recovery_thread;
+    {
+        std::lock_guard<std::mutex> lock(kv_meta_recovery_mutex_);
+        if (kv_meta_recovery_thread_.joinable()) {
+            recovery_thread = std::move(kv_meta_recovery_thread_);
+        }
+    }
+    if (recovery_thread.joinable()) {
+        recovery_thread.join();
+    }
 }
 
 bool Server::Start() {
@@ -240,6 +369,10 @@ bool Server::Wait() {
     if (debug_http_thread_.joinable()) {
         debug_http_thread_.join();
     }
+    // Wait can be the final lifecycle call after an externally initiated gRPC
+    // shutdown. A finished std::thread remains joinable, and a still-running
+    // recovery must not outlive Server's members.
+    CancelAndJoinKvMetaRecovery();
     return true;
 }
 
@@ -254,14 +387,31 @@ bool Server::StartRpcServer() {
     meta_service_.reset(new MetaServiceGRpc(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_));
     admin_service_.reset(new AdminServiceGRpc(metrics_registry_, admin_impl_));
     debug_service_.reset(new DebugServiceGRpc(metrics_registry_, debug_impl_));
+    if (config_.IsKvMetaEnabled()) {
+        if (!kv_meta_impl_ || !kv_meta_manager_) {
+            KVCM_LOG_ERROR("KVMeta is enabled but its manager is unavailable");
+            return false;
+        }
+        kv_meta_service_ = std::make_shared<KvMetaServiceGRpc>(metrics_registry_, kv_meta_impl_);
+    }
 
     meta_service_->Init();
     admin_service_->Init();
     debug_service_->Init();
+    if (kv_meta_service_) {
+        kv_meta_service_->Init();
+    }
 
     grpc::ServerBuilder builder;
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    int selected_port = 0;
+    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials(), &selected_port);
     builder.RegisterService(meta_service_.get());
+    if (kv_meta_service_) {
+        // The protobuf packages are distinct, so KVMeta and the fixed-block
+        // MetaService have different fully qualified RPC method names even
+        // though both proto services are named MetaService.
+        builder.RegisterService(kv_meta_service_.get());
+    }
     if (!use_separate_admin_server) {
         builder.RegisterService(admin_service_.get());
     }
@@ -273,10 +423,19 @@ bool Server::StartRpcServer() {
         KVCM_LOG_ERROR("Failed to start rpc server");
         return false;
     }
+    if (selected_port <= 0 || selected_port > 65535) {
+        KVCM_LOG_ERROR("RPC server returned invalid selected port %d", selected_port);
+        server->Shutdown();
+        return false;
+    }
     rpc_server_.reset(server.release());
+    bound_rpc_port_ = selected_port;
     KVCM_LOG_INFO("Server listening on %s success", server_address.c_str());
-    if (use_separate_admin_server) {
-        return StartSeparateAdminRpcServer();
+    if (kv_meta_service_) {
+        KVCM_LOG_INFO("KVMeta service registered on primary RPC port %d", bound_rpc_port_);
+    }
+    if (use_separate_admin_server && !StartSeparateAdminRpcServer()) {
+        return false;
     }
     return true;
 }
@@ -456,6 +615,20 @@ void Server::Stop() {
     }
     stop_ = true;
     KVCM_LOG_INFO("server stopping...");
+    if (kv_meta_manager_) {
+        // Pair with the recovery thread's locked final gate transition. This
+        // prevents a recovery that observed the pre-stop state from reopening
+        // KVMeta after shutdown has begun.
+        {
+            std::lock_guard<std::mutex> lock(kv_meta_recovery_mutex_);
+            kv_meta_impl_->DisableLeaderOnlyRequests();
+        }
+        kv_meta_manager_->CancelMaintenance();
+    }
+
+    // Close KVMeta admission before shutting down the shared primary listener.
+    // In-flight KVMeta and fixed-block calls then follow the same existing
+    // graceful gRPC shutdown semantics.
     if (rpc_server_) {
         rpc_server_->Shutdown();
     }
@@ -479,6 +652,15 @@ void Server::Stop() {
         KVCM_LOG_INFO("metrics reporter stopped.");
     }
     KVCM_LOG_INFO("admin http server stopped.");
+
+    if (kv_meta_manager_) {
+        kv_meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+        // DoRecover and DoCleanup both update KVMeta manager state. The stop
+        // signal above makes recovery return at its next bounded checkpoint;
+        // join it before cleanup to avoid concurrent mutation during shutdown.
+        CancelAndJoinKvMetaRecovery();
+        kv_meta_manager_->DoCleanup();
+    }
     KVCM_LOG_INFO("kvcm server stopped, goodbye!");
 }
 
