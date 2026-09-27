@@ -108,8 +108,8 @@ public:
                                 const std::vector<std::string> &medium_filter,
                                 std::vector<HostCacheMatch> &out_matches,
                                 const CheckHostCacheLocationFunc *request_check_location = nullptr,
-                                size_t global_kvs_host_count = 0,
-                                bool enable_p2p = false,
+                                size_t top_k_host_count = 0,
+                                const std::vector<DataStorageType> &backend_types = {},
                                 SelectLocationPolicy *policy = nullptr) const;
     ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
                                          const KeyVector &keys,
@@ -118,8 +118,8 @@ public:
                                          const std::vector<LocationSpecGroup> &location_spec_groups,
                                          std::vector<HostCacheMatch> &out_matches,
                                          const CheckHostCacheLocationFunc *request_check_location = nullptr,
-                                         size_t global_kvs_host_count = 0,
-                                         bool enable_p2p = false,
+                                         size_t top_k_host_count = 0,
+                                         const std::vector<DataStorageType> &backend_types = {},
                                          SelectLocationPolicy *policy = nullptr) const;
     ErrorCode BatchGetLocation(RequestContext *request_context,
                                const KeyVector &keys,

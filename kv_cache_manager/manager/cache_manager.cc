@@ -4758,11 +4758,22 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                 QueryType query_type,
                                 const KeyVector &block_cache_keys,
                                 const std::vector<std::string> &medium_filter,
-                                size_t global_kvs_host_count,
-                                bool enable_p2p) {
+                                size_t top_k_host_count,
+                                const std::vector<DataStorageType> &backend_types) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+
+    for (const auto type : backend_types) {
+        if (type != DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL &&
+            type != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2) {
+            request_context->error_tracer()->AddErrorMsg("unsupported backend_type for GetHostCacheState");
+            return {EC_BADARGS, {}};
+        }
+    }
+    const bool use_tair =
+        std::find(backend_types.begin(), backend_types.end(), DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL) !=
+        backend_types.end();
 
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher) {
@@ -4799,10 +4810,10 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, block_cache_keys.size());
     auto query_scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerPrefixMatch);
     const auto request_check_location = GetHostCacheStateCheckLocDataExistFunc(instance_id);
-    auto policy = global_kvs_host_count > 0
+    auto policy = top_k_host_count > 0 && use_tair
                       ? genSelectLocationPolicy(request_context, instance_id, /*allow_unavailable_storages=*/true)
                       : nullptr;
-    if (global_kvs_host_count > 0 && !policy) {
+    if (top_k_host_count > 0 && use_tair && !policy) {
         return {EC_ERROR, {}};
     }
     std::vector<MetaSearcher::HostCacheMatch> host_matches;
@@ -4815,8 +4826,8 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                               medium_filter,
                                               host_matches,
                                               &request_check_location,
-                                              global_kvs_host_count,
-                                              enable_p2p,
+                                              top_k_host_count,
+                                              backend_types,
                                               policy.get());
         break;
     }
@@ -4828,8 +4839,8 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                                        instance_info->location_spec_groups(),
                                                        host_matches,
                                                        &request_check_location,
-                                                       global_kvs_host_count,
-                                                       enable_p2p,
+                                                       top_k_host_count,
+                                                       backend_types,
                                                        policy.get());
         break;
     }

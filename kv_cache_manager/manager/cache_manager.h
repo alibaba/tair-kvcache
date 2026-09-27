@@ -217,8 +217,8 @@ public:
                       QueryType query_type,
                       const KeyVector &block_cache_keys,
                       const std::vector<std::string> &medium_filter = {},
-                      size_t global_kvs_host_count = 0,
-                      bool enable_p2p = false);
+                      size_t top_k_host_count = 0,
+                      const std::vector<DataStorageType> &backend_types = {});
     ErrorCode TrimCache(RequestContext *request_context,
                         const std::string &instance_id,
                         const proto::meta::TrimStrategy &trim_strategy,

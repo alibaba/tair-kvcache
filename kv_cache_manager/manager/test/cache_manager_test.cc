@@ -8555,13 +8555,14 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
         EXPECT_EQ(nullptr, find_match(rank1_matches, base));
 
         // An independent V6D on another rank is a remote peer, even on the same base host.
-        auto [remote_ec, remote_matches] = cache_manager_->GetHostCacheState(request_context_.get(),
-                                                                             instance_id,
-                                                                             CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                             {100, 200, 300},
-                                                                             {},
-                                                                             1,
-                                                                             true);
+        auto [remote_ec, remote_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(),
+            instance_id,
+            CacheManager::QueryType::QT_PREFIX_MATCH,
+            {100, 200, 300},
+            {},
+            1,
+            {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2});
         ASSERT_EQ(EC_OK, remote_ec);
         ASSERT_NE(nullptr, find_match(remote_matches, rank0));
         ASSERT_NE(nullptr, find_match(remote_matches, rank1));
@@ -8627,13 +8628,14 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes)
         EXPECT_EQ(2, find_match(rank1_matches, rank1)->local);
         EXPECT_EQ(nullptr, find_match(rank1_matches, base));
 
-        auto [remote_ec, remote_matches] = cache_manager_->GetHostCacheState(request_context_.get(),
-                                                                             instance_id,
-                                                                             CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                             {100, 200, 300},
-                                                                             {},
-                                                                             2,
-                                                                             true);
+        auto [remote_ec, remote_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(),
+            instance_id,
+            CacheManager::QueryType::QT_PREFIX_MATCH,
+            {100, 200, 300},
+            {},
+            2,
+            {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2});
         ASSERT_EQ(EC_OK, remote_ec);
         ASSERT_EQ(2u, remote_matches.size());
         EXPECT_EQ(2, find_match(remote_matches, rank0)->global);
@@ -9021,9 +9023,13 @@ protected:
     }
 
     void Verify(CacheManager::QueryType query_type) {
-        const auto query = [&](size_t count, int64_t expected_total) {
+        const std::vector<DataStorageType> tair = {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL};
+        const std::vector<DataStorageType> p2p = {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2};
+        const auto query = [&](size_t count,
+                               const std::vector<DataStorageType> &backend_types,
+                               int64_t expected_total) {
             auto [ec, matches] = cache_manager_->GetHostCacheState(
-                request_context_.get(), instance_id_, query_type, {101, 102, 103, 104}, {"mem"}, count, false);
+                request_context_.get(), instance_id_, query_type, {101, 102, 103, 104}, {"mem"}, count, backend_types);
             ASSERT_EQ(EC_OK, ec);
             ASSERT_EQ(1u, matches.size()); // Neither Tair's address nor a peer missing block 101 is a target.
             EXPECT_EQ(worker_, matches[0].host_ip_port);
@@ -9031,7 +9037,9 @@ protected:
             EXPECT_EQ(expected_total, matches[0].global);
         };
         EXPECT_CALL(*tair_, MightExist(_)).Times(0);
-        query(0, 1);
+        query(0, tair, 1);
+        query(1, {}, 1);
+        query(1, p2p, 1);
         ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(tair_.get()));
 
         for (bool readable : {true, false}) {
@@ -9044,8 +9052,11 @@ protected:
                     }
                     return std::vector<bool>(uris.size(), readable);
                 });
-            query(1, readable ? 3 : 1);
+            query(1, tair, readable ? 3 : 1);
             EXPECT_EQ(tair_uris_, checked_uris); // Exercise the Manager's real location checker.
+            query(1, {tair[0], p2p[0]}, readable ? 4 : 1);
+            query(1, {p2p[0], tair[0]}, readable ? 4 : 1);
+            query(1, {p2p[0], tair[0], p2p[0], tair[0]}, readable ? 4 : 1);
             ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(tair_.get()));
         }
     }
@@ -9081,6 +9092,55 @@ TEST_F(HostCacheStateWithoutP2PTest, MambaPrefixMatchUsesTairWithoutP2P) {
     Verify(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA);
 }
 
+TEST_F(HostCacheStateWithoutP2PTest, P2POnlyPreservesLocalVineyardWithoutBaseStorage) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH, createLocationSpecInfos());
+    InitializeEventReporter(instance_id_, worker_, proto::meta::ST_EVENT_REPORT_L2);
+    auto local_add = MakeAddRequest(worker_, 101, "local_vineyard");
+    local_add.set_instance_id(instance_id_);
+    proto::meta::ReportEventResponse response;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &local_add, &response));
+    Report(102, {"tp0"}, true);
+    AddTair(103, "tp0");
+    registry_manager_->instance_group_configs_["default"]->set_storage_candidates({tair_name_});
+    ON_CALL(*tair_, Available()).WillByDefault(testing::Return(false));
+    EXPECT_CALL(*tair_, MightExist(_)).Times(0);
+    for (const auto &types :
+         std::vector<std::vector<DataStorageType>>{{}, {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}}) {
+        auto [ec, matches] = cache_manager_->GetHostCacheState(request_context_.get(),
+                                                               instance_id_,
+                                                               CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                               {101, 102, 103},
+                                                               {"mem"},
+                                                               1,
+                                                               types);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ(worker_, matches[0].host_ip_port);
+        EXPECT_EQ(1, matches[0].local);
+        EXPECT_EQ(types.empty() ? 1 : 2, matches[0].global);
+    }
+}
+
+TEST_F(HostCacheStateWithoutP2PTest, RejectsUnsupportedHostCacheBackends) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH, createLocationSpecInfos());
+    for (auto type : {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN,
+                      DataStorageType::DATA_STORAGE_TYPE_NFS,
+                      DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD,
+                      DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5}) {
+        for (size_t count : {size_t{0}, size_t{1}}) {
+            auto [ec, matches] = cache_manager_->GetHostCacheState(request_context_.get(),
+                                                                   instance_id_,
+                                                                   CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                                   {101},
+                                                                   {"mem"},
+                                                                   count,
+                                                                   {type});
+            EXPECT_EQ(EC_BADARGS, ec);
+            EXPECT_TRUE(matches.empty());
+        }
+    }
+}
+
 TEST_F(HostCacheStateWithoutP2PTest, UnavailableBaseStoragePreservesLocalAndP2P) {
     Prepare(CacheManager::QueryType::QT_PREFIX_MATCH, createLocationSpecInfos());
     registry_manager_->instance_group_configs_["default"]->set_storage_candidates({tair_name_});
@@ -9092,9 +9152,17 @@ TEST_F(HostCacheStateWithoutP2PTest, UnavailableBaseStoragePreservesLocalAndP2P)
         return std::vector<bool>(uris.size(), true);
     });
     const auto query = [&](size_t count, bool p2p, int64_t expected_global) {
-        auto [ec, matches] = cache_manager_->GetHostCacheState(
-            request_context_.get(), instance_id_, CacheManager::QueryType::QT_PREFIX_MATCH,
-            {101, 102, 103, 104}, {"mem"}, count, p2p);
+        std::vector<DataStorageType> backend_types = {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL};
+        if (p2p) {
+            backend_types.push_back(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+        }
+        auto [ec, matches] = cache_manager_->GetHostCacheState(request_context_.get(),
+                                                               instance_id_,
+                                                               CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                               {101, 102, 103, 104},
+                                                               {"mem"},
+                                                               count,
+                                                               backend_types);
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(1u, matches.size());
         EXPECT_EQ(worker_, matches[0].host_ip_port);
@@ -9125,9 +9193,17 @@ TEST_F(HostCacheStateWithoutP2PTest, UnavailableBaseStoragePreservesMambaLocalAn
         return std::vector<bool>(uris.size(), true);
     });
     const auto query = [&](bool p2p, int64_t expected_global) {
-        auto [ec, matches] = cache_manager_->GetHostCacheState(
-            request_context_.get(), instance_id_, CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
-            {101, 102, 103}, {"mem"}, 1, p2p);
+        std::vector<DataStorageType> backend_types = {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL};
+        if (p2p) {
+            backend_types.push_back(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+        }
+        auto [ec, matches] = cache_manager_->GetHostCacheState(request_context_.get(),
+                                                               instance_id_,
+                                                               CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+                                                               {101, 102, 103},
+                                                               {"mem"},
+                                                               1,
+                                                               backend_types);
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(1u, matches.size());
         EXPECT_EQ(worker_, matches[0].host_ip_port);
@@ -9202,13 +9278,14 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     report_keys(proto::meta::ST_EVENT_REPORT_L2, host_b, {100, 200, 400});
     report_keys(proto::meta::ST_EVENT_REPORT_L2, host_c, {100, 200, 300});
 
-    auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(),
-                                                         instance_id,
-                                                         CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                         {100, 200, 300, 400, 500},
-                                                         {},
-                                                         5,
-                                                         true);
+    auto [ec, hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(),
+        instance_id,
+        CacheManager::QueryType::QT_PREFIX_MATCH,
+        {100, 200, 300, 400, 500},
+        {},
+        5,
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2});
     ASSERT_EQ(EC_OK, ec);
     ASSERT_EQ(3u, hosts.size());
 
@@ -9247,7 +9324,13 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     report_keys(proto::meta::ST_EVENT_REPORT_L1P5, zero_local_host, {top5_keys[1]});
 
     auto [top5_ec, top5_matches] = cache_manager_->GetHostCacheState(
-        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, top5_keys, {}, 5, true);
+        request_context_.get(),
+        instance_id,
+        CacheManager::QueryType::QT_PREFIX_MATCH,
+        top5_keys,
+        {},
+        5,
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2});
     ASSERT_EQ(EC_OK, top5_ec);
     ASSERT_EQ(top5_hosts.size(), top5_matches.size());
     const std::vector<std::pair<int64_t, int64_t>> expected_top5_matches = {
@@ -9269,7 +9352,13 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
               }));
 
     auto [top2_ec, top2_matches] = cache_manager_->GetHostCacheState(
-        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, top5_keys, {}, 2, true);
+        request_context_.get(),
+        instance_id,
+        CacheManager::QueryType::QT_PREFIX_MATCH,
+        top5_keys,
+        {},
+        2,
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2});
     ASSERT_EQ(EC_OK, top2_ec);
     ASSERT_EQ(top5_hosts.size(), top2_matches.size());
     const std::vector<std::pair<int64_t, int64_t>> expected_top2_matches = {
@@ -9288,7 +9377,13 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     }
 
     auto [top0_ec, top0_matches] = cache_manager_->GetHostCacheState(
-        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, top5_keys, {}, 0, true);
+        request_context_.get(),
+        instance_id,
+        CacheManager::QueryType::QT_PREFIX_MATCH,
+        top5_keys,
+        {},
+        0,
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2});
     ASSERT_EQ(EC_OK, top0_ec);
     ASSERT_EQ(top5_hosts.size(), top0_matches.size());
     for (size_t i = 0; i < top5_hosts.size(); ++i) {
@@ -9365,14 +9460,14 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     report_mamba_specs(proto::meta::ST_EVENT_REPORT_L2, mamba_p2p_host, 400, {"L1"});
     report_mamba_specs(proto::meta::ST_EVENT_REPORT_L2, mamba_p2p_host, 500, {"F0", "L0", "L1"});
 
-    auto [mamba_ec, mamba_hosts] =
-        cache_manager_->GetHostCacheState(request_context_.get(),
-                                          mamba_instance_id,
-                                          CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
-                                          {100, 200, 300, 400, 500},
-                                          {},
-                                          5,
-                                          true);
+    auto [mamba_ec, mamba_hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(),
+        mamba_instance_id,
+        CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+        {100, 200, 300, 400, 500},
+        {},
+        5,
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2});
     ASSERT_EQ(EC_OK, mamba_ec);
     ASSERT_EQ(1u, mamba_hosts.size());
     EXPECT_EQ(mamba_host, mamba_hosts[0].host_ip_port);
@@ -9444,14 +9539,14 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, coverage_peer, 300, {"L2"});
     report_coverage_specs(proto::meta::ST_EVENT_REPORT_L2, coverage_peer, 400, {"L2", "L3"});
 
-    auto [coverage_ec, coverage_hosts] =
-        cache_manager_->GetHostCacheState(request_context_.get(),
-                                          coverage_instance_id,
-                                          CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
-                                          {100, 200, 300, 400},
-                                          {},
-                                          5,
-                                          true);
+    auto [coverage_ec, coverage_hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(),
+        coverage_instance_id,
+        CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+        {100, 200, 300, 400},
+        {},
+        5,
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2});
     ASSERT_EQ(EC_OK, coverage_ec);
     ASSERT_EQ(1u, coverage_hosts.size());
     EXPECT_EQ(coverage_host, coverage_hosts[0].host_ip_port);
@@ -9482,14 +9577,14 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
     report_coverage_specs(
         proto::meta::ST_EVENT_REPORT_L1P5, mamba_zero_local_host, mamba_top5_keys[1], all_coverage_specs);
 
-    auto [mamba_top5_ec, mamba_top5_matches] =
-        cache_manager_->GetHostCacheState(request_context_.get(),
-                                          coverage_instance_id,
-                                          CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
-                                          mamba_top5_keys,
-                                          {},
-                                          5,
-                                          true);
+    auto [mamba_top5_ec, mamba_top5_matches] = cache_manager_->GetHostCacheState(
+        request_context_.get(),
+        coverage_instance_id,
+        CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+        mamba_top5_keys,
+        {},
+        5,
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2});
     ASSERT_EQ(EC_OK, mamba_top5_ec);
     ASSERT_EQ(mamba_top5_hosts.size(), mamba_top5_matches.size());
     const std::vector<std::pair<int64_t, int64_t>> expected_mamba_top5_matches = {
@@ -9511,14 +9606,14 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
                   return match.host_ip_port == mamba_zero_local_host;
               }));
 
-    auto [mamba_top2_ec, mamba_top2_matches] =
-        cache_manager_->GetHostCacheState(request_context_.get(),
-                                          coverage_instance_id,
-                                          CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
-                                          mamba_top5_keys,
-                                          {},
-                                          2,
-                                          true);
+    auto [mamba_top2_ec, mamba_top2_matches] = cache_manager_->GetHostCacheState(
+        request_context_.get(),
+        coverage_instance_id,
+        CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+        mamba_top5_keys,
+        {},
+        2,
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2});
     ASSERT_EQ(EC_OK, mamba_top2_ec);
     ASSERT_EQ(mamba_top5_hosts.size(), mamba_top2_matches.size());
     for (size_t i = 0; i < mamba_top5_hosts.size(); ++i) {
@@ -9527,14 +9622,14 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateP2P) {
         EXPECT_EQ(std::get<1>(expected_top2_matches[i]), mamba_top2_matches[i].global);
     }
 
-    auto [mamba_top0_ec, mamba_top0_matches] =
-        cache_manager_->GetHostCacheState(request_context_.get(),
-                                          coverage_instance_id,
-                                          CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
-                                          mamba_top5_keys,
-                                          {},
-                                          0,
-                                          true);
+    auto [mamba_top0_ec, mamba_top0_matches] = cache_manager_->GetHostCacheState(
+        request_context_.get(),
+        coverage_instance_id,
+        CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+        mamba_top5_keys,
+        {},
+        0,
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2});
     ASSERT_EQ(EC_OK, mamba_top0_ec);
     ASSERT_EQ(mamba_top5_hosts.size(), mamba_top0_matches.size());
     for (size_t i = 0; i < mamba_top5_hosts.size(); ++i) {

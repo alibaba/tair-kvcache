@@ -278,10 +278,14 @@ BuildGetHostCacheStateRequestAccessLogSummary(const proto::meta::GetHostCacheSta
     }
     writer.Key("medium_count");
     writer.Int(request->medium_size());
-    writer.Key("global_kvs_host_count");
-    writer.Int(request->global_kvs_host_count());
-    writer.Key("enable_p2p");
-    writer.Bool(request->enable_p2p());
+    writer.Key("top_k_host_count");
+    writer.Int(request->top_k_host_count());
+    writer.Key("backend_types");
+    writer.StartArray();
+    for (const auto type : request->backend_types()) {
+        writer.String(proto::meta::StorageType_Name(static_cast<proto::meta::StorageType>(type)).c_str());
+    }
+    writer.EndArray();
     writer.EndObject();
     return {std::string(sb.GetString(), sb.GetSize()), true};
 }
@@ -990,10 +994,18 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
     }
-    if (request->global_kvs_host_count() < 0) {
-        CHECK_REQUIRED_FIELDS_VALIDATION("GetHostCacheState", "global_kvs_host_count (must be >= 0)", true);
+    if (request->top_k_host_count() < 0) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetHostCacheState", "top_k_host_count (must be >= 0)", true);
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
+    }
+
+    std::vector<DataStorageType> backend_types;
+    backend_types.reserve(request->backend_types_size());
+    for (const auto type : request->backend_types()) {
+        DataStorageType backend_type;
+        ProtoConvert::DataStorageTypeFromProto(static_cast<proto::meta::StorageType>(type), backend_type);
+        backend_types.push_back(backend_type);
     }
 
     CacheManager::KeyVector keys(request->block_cache_keys().begin(), request->block_cache_keys().end());
@@ -1010,8 +1022,8 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
                                           static_cast<CacheManager::QueryType>(request->query_type()),
                                           keys,
                                           mediums,
-                                          static_cast<size_t>(request->global_kvs_host_count()),
-                                          request->enable_p2p());
+                                          static_cast<size_t>(request->top_k_host_count()),
+                                          backend_types);
     if (ec != EC_OK) {
         status->set_code(ToMetaPbError(ec));
         request_context->set_status_code(status->code());
