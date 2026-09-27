@@ -697,8 +697,8 @@ void BuildCandidatePresenceForOneKey(const LocationRange &locations,
 using HostToSpecNames = std::map<std::string, std::set<std::string>>;
 
 std::vector<size_t> SelectTopHostIndicesByLocal(const std::vector<MetaSearcher::HostCacheMatch> &host_matches,
-                                                size_t global_kvs_host_count) {
-    if (global_kvs_host_count == 0) {
+                                                size_t top_k_host_count) {
+    if (top_k_host_count == 0) {
         return {};
     }
     std::vector<size_t> host_indices;
@@ -708,7 +708,7 @@ std::vector<size_t> SelectTopHostIndicesByLocal(const std::vector<MetaSearcher::
             host_indices.push_back(i);
         }
     }
-    const size_t selected_count = std::min(global_kvs_host_count, host_indices.size());
+    const size_t selected_count = std::min(top_k_host_count, host_indices.size());
     std::partial_sort(host_indices.begin(),
                       host_indices.begin() + selected_count,
                       host_indices.end(),
@@ -888,8 +888,7 @@ SpecsByKey SelectBaseSpecs(const LocationsPerKey &locations,
         CacheLocationMap valid;
         for (const auto &loc : locations[i]) {
             if (!loc || loc->status() != CacheLocationStatus::CLS_SERVING || loc->location_specs().empty() ||
-                (loc->type() != DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL &&
-                 loc->type() != DataStorageType::DATA_STORAGE_TYPE_NFS)) {
+                loc->type() != DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL) {
                 continue;
             }
             MetaSearcher::HostCacheLocationInfo info;
@@ -899,18 +898,16 @@ SpecsByKey SelectBaseSpecs(const LocationsPerKey &locations,
             }
             valid.emplace(loc->id(), loc);
         }
-        // medium describes local/reporter media; a Tair/NFS URI path is not a medium.
+        // medium describes local/reporter media; a Tair URI path is not a medium.
         // Select once per key/backend/spec, shared by every selected logical engine.
-        for (auto type : {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_NFS}) {
-            for (const auto &name : requested_specs) {
-                auto selected = SelectBackendLocation(valid, type, name, policy);
-                if (!selected) {
-                    continue;
-                }
-                for (const auto &spec : selected->location_specs()) {
-                    if (name.empty() || spec.name() == name) {
-                        base_specs[i].insert(spec.name());
-                    }
+        for (const auto &name : requested_specs) {
+            auto selected = SelectBackendLocation(valid, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, name, policy);
+            if (!selected) {
+                continue;
+            }
+            for (const auto &spec : selected->location_specs()) {
+                if (name.empty() || spec.name() == name) {
+                    base_specs[i].insert(spec.name());
                 }
             }
         }
@@ -1049,11 +1046,17 @@ ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
                                       const std::vector<const LocationSpecGroup *> &state_groups,
                                       std::vector<MetaSearcher::HostCacheMatch> &out_matches,
                                       const MetaSearcher::CheckHostCacheLocationFunc *request_check_location,
-                                      size_t global_kvs_host_count,
-                                      bool enable_p2p,
+                                      size_t top_k_host_count,
+                                      const std::vector<DataStorageType> &backend_types,
                                       SelectLocationPolicy *policy) {
-    if (!policy) {
-        request_context->error_tracer()->AddErrorMsg("remote host evaluation requires a location selection policy");
+    const bool use_tair =
+        std::find(backend_types.begin(), backend_types.end(), DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL) !=
+        backend_types.end();
+    const bool enable_p2p =
+        std::find(backend_types.begin(), backend_types.end(), DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2) !=
+        backend_types.end();
+    if (use_tair && !policy) {
+        request_context->error_tracer()->AddErrorMsg("Tair host evaluation requires a location selection policy");
         return EC_BADARGS;
     }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -1110,10 +1113,13 @@ ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
         request_context->error_tracer()->AddErrorMsg("parallel host prefix reduction failed");
         return EC_ERROR;
     }
-    const auto selected = SelectTopHostIndicesByLocal(matches, global_kvs_host_count);
+    const auto selected = SelectTopHostIndicesByLocal(matches, top_k_host_count);
     if (!selected.empty()) {
-        const auto base_specs = SelectBaseSpecs(
-            locations, key_count, check_location, request_check_location, full_groups, state_groups, policy);
+        const auto base_specs =
+            use_tair
+                ? SelectBaseSpecs(
+                      locations, key_count, check_location, request_check_location, full_groups, state_groups, policy)
+                : SpecsByKey(key_count);
         const bool evaluated = meta_indexer->ParallelForQuery(selected.size(), [&](size_t begin, size_t end) {
             for (size_t i = begin; i < end; ++i) {
                 auto &match = matches[selected[i]];
@@ -1936,15 +1942,15 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
                                           const std::vector<std::string> &medium_filter,
                                           std::vector<HostCacheMatch> &out_matches,
                                           const CheckHostCacheLocationFunc *request_check_location,
-                                          size_t global_kvs_host_count,
-                                          bool enable_p2p,
+                                          size_t top_k_host_count,
+                                          const std::vector<DataStorageType> &backend_types,
                                           SelectLocationPolicy *policy) const {
     SPAN_TRACER(request_context);
     out_matches.clear();
     if (keys.empty()) {
         return EC_OK;
     }
-    if (global_kvs_host_count == 0) {
+    if (top_k_host_count == 0 || backend_types.empty()) {
         return PrefixMatchByHostLocalOnly(meta_indexer_.get(),
                                           check_loc_data_exist_func_,
                                           request_context,
@@ -1965,8 +1971,8 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
                                        {},
                                        out_matches,
                                        request_check_location,
-                                       global_kvs_host_count,
-                                       enable_p2p,
+                                       top_k_host_count,
+                                       backend_types,
                                        policy);
 }
 
@@ -1977,8 +1983,8 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
                                                    const std::vector<LocationSpecGroup> &location_spec_groups,
                                                    std::vector<HostCacheMatch> &out_matches,
                                                    const CheckHostCacheLocationFunc *request_check_location,
-                                                   size_t global_kvs_host_count,
-                                                   bool enable_p2p,
+                                                   size_t top_k_host_count,
+                                                   const std::vector<DataStorageType> &backend_types,
                                                    SelectLocationPolicy *policy) const {
     SPAN_TRACER(request_context);
     out_matches.clear();
@@ -1992,7 +1998,7 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
     if (ec != EC_OK) {
         return ec;
     }
-    if (global_kvs_host_count == 0) {
+    if (top_k_host_count == 0 || backend_types.empty()) {
         return PrefixMatchWithMambaByHostLocalOnly(meta_indexer_.get(),
                                                    check_loc_data_exist_func_,
                                                    request_context,
@@ -2014,8 +2020,8 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
                                        mamba_state_groups,
                                        out_matches,
                                        request_check_location,
-                                       global_kvs_host_count,
-                                       enable_p2p,
+                                       top_k_host_count,
+                                       backend_types,
                                        policy);
 }
 

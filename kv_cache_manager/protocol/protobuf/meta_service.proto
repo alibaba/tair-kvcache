@@ -529,8 +529,13 @@ message GetHostCacheStateRequest {
     QueryType query_type = 3;
     repeated int64 block_cache_keys = 4;   // 请求 prompt 的有序 block cache keys
     repeated string medium = 5;            // 要匹配的介质列表；为空时考虑所有介质
-    int32 global_kvs_host_count = 7; // 按 local 降序选前 N 个逻辑引擎计算远端命中；0 表示仅计算本地
-    bool enable_p2p = 8;         // 是否启用 P2P
+    int32 top_k_host_count = 7; // 按 local 降序选前 N 个逻辑引擎计算其他cache来源(p2p、tairmempool)；0 表示所有host仅计算local
+    // 对按 local 降序选出的 top_k_host_count 个 host，在本地缓存基础上，
+    // 合并以下类型的缓存，计算联合前缀命中块数 global（包含 local）：
+    // - ST_TAIRMEMPOOL：TairMempool 中的缓存。
+    // - ST_EVENT_REPORT_L2：其他节点可通过 P2P 获取的 Vineyard 缓存。
+    // 仅支持上述类型，可同时选择，顺序无关；本字段不影响 local 的计算。
+    repeated StorageType backend_types = 8;
 }
 
 message HostCacheMatch {

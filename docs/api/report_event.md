@@ -679,15 +679,17 @@ HTTP 接口为 `POST /api/getHostCacheState`：
 - 每个 host 从第一个 key 开始连续计数，遇到第一个 miss 即停止；
 - 第一个 key 就 miss 的 host 不返回；
 - `medium` 为空表示考虑所有 medium；
-- `medium` 非空时只约束本地和 V6D 上报介质，不过滤 TairMempool/NFS 的路径；
+- `medium` 非空时只约束本地和 V6D 上报介质，不过滤 TairMempool 的路径；
 - `QT_UNSPECIFIED` 使用 RegisterInstance 时配置的 `default_query_type`；
 - 支持 `QT_PREFIX_MATCH` 和 `QT_PREFIX_MATCH_WITH_MAMBA`，其他类型返回参数错误；
 - local 按逻辑 engine 身份汇总，独立 rank 不合并；共享 V6D 沿 reporter 映射贡献给对应 rank；
 - `local` 包含同一 host 的 subscriber 与 Vineyard 上报；
 - 非混合注意力对 full local-miss 使用 Prefix 选择远端 Vineyard；混合注意力先对
   FullAttention group 使用 Prefix，再对 Mamba local-miss spec 使用 Coverage；
-- `global_kvs_host_count`（默认 0，不能为负）控制按 local 降序选出的逻辑 engine 数，同分按 host 升序；
-- 入选 engine 合并本地与 TairMempool/NFS；`enable_p2p`（默认 false）决定是否追加 V6D；
+- `top_k_host_count`（默认 0，不能为负）控制按 local 降序选出的逻辑 engine 数，同分按 host 升序；
+- `backend_types` 仅支持 `ST_TAIRMEMPOOL`、`ST_EVENT_REPORT_L2`（P2P），可同时选择，顺序无关；
+- 入选 engine 合并本地与指定后端的缓存；空列表或 `top_k_host_count=0` 时仅计算本地；
+- `backend_types` 不影响 `local`，同机 Vineyard 仍按本地缓存计入；NFS/SSD 不参与本接口的补缺计算；
 - 每次最多选择一个 peer；Mamba 各 Full group 分别选一个，Linear 缺失组汇总选一个；
 - `global` 是本地与本次远端评估合并后的可复用前缀，未入选时等于 `local`；
 - `global - local` 是额外可复用块数，不等于实际传输块数；
