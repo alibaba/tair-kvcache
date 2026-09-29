@@ -116,23 +116,28 @@ FROZEN: Dict[str, Dict[str, Any]] = {
         page_size_padded=None,
         per_block_bytes=8448,
     ),
-    "m3b": dict(  # non-packed per-tensor fp8 (layer-level scales)
+    "m3b": dict(  # non-packed per-tensor fp8 (layer-level scales in the model)
+        # The engine stores this cache as uint8 (1 B/element): the dtype map
+        # (`kv_cache_dtype_str_to_dtype("fp8") == torch.uint8`) feeds
+        # `MLAAttention.get_kv_cache_spec`, so the page is block x 576 x 1 B
+        # (9216 at block 16), not the bf16 18432 02 section 3.2 probed with a
+        # template dtype (01 section 2.3: 576 B/token).
         kwargs=dict(
             block_size=16,
             head_size=576,
-            dtype="bfloat16",
+            dtype="uint8",
             cache_dtype_str="fp8",
             kv_quant_mode="FP8_PER_TENSOR",
             num_kv_heads=1,
         ),
-        itemsize=2,
+        itemsize=1,
         compress_ratio=1,
         mbs=64,
         storage_block_size=16,
-        real_page_size_bytes=18432,
-        unpadded_page_size_bytes=18432,
+        real_page_size_bytes=9216,
+        unpadded_page_size_bytes=9216,
         page_size_padded=None,
-        per_block_bytes=73728,
+        per_block_bytes=36864,  # 576 B/token x 64
     ),
     # --- V4 compressed family (refused: one row per several tokens) ------- #
     "m2a": dict(  # V4 c4a bf16, block 256: alignment holds exactly
