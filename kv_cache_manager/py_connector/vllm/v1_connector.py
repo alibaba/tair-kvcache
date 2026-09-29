@@ -195,25 +195,6 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         )
         host_ip = get_ip()
 
-        register_request = {
-            "trace_id": "register_%s" % extra_config.instance_id,
-            "instance_group": extra_config.instance_group,
-            "instance_id": extra_config.instance_id,
-            "model_deployment": deployment,
-            "block_size": manager_block_size,
-            "location_spec_infos": [
-                {"name": spec_name(rank, meta), "size": meta.per_block_bytes}
-                for rank in range(self._tp_size)
-                for meta in self._group_metas
-            ],
-        }
-        spec_groups = build_spec_groups(self._group_metas, self._tp_size)
-        if spec_groups:
-            # Hybrid models publish per-block spec coverage
-            # (see vllm_common.build_spec_groups).
-            register_request["location_spec_groups"] = spec_groups
-        register_response = self._manager_client.register_instance(register_request)
-
         # One role object per instance; the other slot stays None and every
         # hook asserts the slot it needs.
         self.connector_scheduler: Optional[ConnectorScheduler] = None
@@ -237,6 +218,27 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 len(self._group_metas),
             )
         else:
+            # Worker-only registration: the scheduler's config is a *folded*
+            # view of every packed group, so it would publish a
+            # location_spec_infos the manager rejects as a mismatch.
+            register_request = {
+                "trace_id": "register_%s" % extra_config.instance_id,
+                "instance_group": extra_config.instance_group,
+                "instance_id": extra_config.instance_id,
+                "model_deployment": deployment,
+                "block_size": manager_block_size,
+                "location_spec_infos": [
+                    {"name": spec_name(rank, meta), "size": meta.per_block_bytes}
+                    for rank in range(self._tp_size)
+                    for meta in self._group_metas
+                ],
+            }
+            spec_groups = build_spec_groups(self._group_metas, self._tp_size)
+            if spec_groups:
+                # Hybrid models publish per-block spec coverage
+                # (see vllm_common.build_spec_groups).
+                register_request["location_spec_groups"] = spec_groups
+            register_response = self._manager_client.register_instance(register_request)
             self.connector_worker = ConnectorWorker(
                 extra_config,
                 self._group_metas,
