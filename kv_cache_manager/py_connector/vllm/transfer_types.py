@@ -85,6 +85,10 @@ class AttentionTransferGroup(TransferGroup):
     # Element stride between kernel pages of one pointer; 0 => the pages are
     # contiguous and the kernel uses flat indexing.
     block_stride: int
+    # The bucket's element type, taken from its tensors: one instance may mix
+    # element sizes (V3.2 bf16 main + uint8 indexer), so the staging view must
+    # be built per bucket, never from a global dtype.
+    dtype: torch.dtype
 
 
 @dataclass(frozen=True)
@@ -125,4 +129,6 @@ class KVCacheInfo:
     world_size: int
     groups: List[TransferGroup]
     device: torch.device
+    # Informational (the first attention layer's dtype): staging views are
+    # built per bucket, see AttentionTransferGroup.dtype.
     dtype: torch.dtype

@@ -8,8 +8,8 @@ and the thin connector shell (v1_connector) build on this module; nothing
 here may import them.
 """
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -19,6 +19,19 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 
+try:
+    # vLLM >= 0.22 names; vllm 0.14 has none of them. The sentinels are only
+    # ever used behind a null check (isinstance(x, None) would raise).
+    from vllm.v1.kv_cache_interface import (  # ty: ignore[unresolved-import]
+        KVQuantMode,
+        SlidingWindowMLASpec,
+        UniformTypeKVCacheSpecs,
+    )
+except ImportError:  # pragma: no cover - older vLLM eras
+    KVQuantMode = None  # ty: ignore[invalid-assignment]
+    SlidingWindowMLASpec = None  # ty: ignore[invalid-assignment]
+    UniformTypeKVCacheSpecs = None  # ty: ignore[invalid-assignment]
+
 from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.vllm.transfer_types import (
     KVLayout,
@@ -26,6 +39,30 @@ from kv_cache_manager.py_connector.vllm.transfer_types import (
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
+
+# kv_quant_mode values (vLLM's KVQuantMode). Compared as integers so this
+# module does not depend on the enum being importable; the names below are
+# only used in refusal messages.
+_QUANT_NONE = 0
+_QUANT_FP8_PER_TENSOR = 1
+# INT8 / FP8 / INT4 per-token-head scales: the scales sit in the page budget
+# but outside the rows the gather kernel copies.
+_QUANT_PER_TOKEN_HEAD = (2, 3, 4)
+_QUANT_NVFP4 = 5
+_QUANT_MODE_NAMES = {
+    _QUANT_NONE: "NONE",
+    _QUANT_FP8_PER_TENSOR: "FP8_PER_TENSOR",
+    2: "INT8_PER_TOKEN_HEAD",
+    3: "FP8_PER_TOKEN_HEAD",
+    4: "INT4_PER_TOKEN_HEAD",
+    _QUANT_NVFP4: "NVFP4",
+}
+# cache_dtype_str values that carry no quantization of their own: the cache
+# keeps the model dtype (float16/bfloat16 are legal --kv-cache-dtype values,
+# so they must stay accepted).
+_PLAIN_CACHE_DTYPES = (None, "auto", "float16", "bfloat16")
+# Non-packed per-tensor fp8 cache dtypes: compact pages, layer-level scales.
+_PLAIN_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
 
 # Spec group names advertised at registration and used per key in
 # start_write_cache. See build_spec_groups for the semantics.
@@ -39,9 +76,15 @@ ATTN_ONLY_SPEC_GROUP = "attn"
 ALL_SPEC_GROUP = "full"
 
 
-def spec_name(tp_rank: int, group_idx: int) -> str:
-    """Location spec name for one (tp rank, kv cache group) shard."""
-    return f"tp{tp_rank}_g{group_idx}"
+def spec_name(tp_rank: int, meta: "GroupMeta") -> str:
+    """Wire name for one (tp rank, transfer bucket).
+
+    Buckets of one vLLM group share its group_idx (they share the block
+    table) and differ by spec_suffix: "" for the first bucket, "_b{k}" for
+    the rest. The name is a unique key into the manager's name -> bytes map
+    and never parses back, so the suffixes are additive on the wire.
+    """
+    return f"tp{tp_rank}_g{meta.group_idx}{meta.spec_suffix}"
 
 
 def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict]:
@@ -68,15 +111,13 @@ def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict
     if not state_groups:
         return []
     attn_specs = sorted(
-        spec_name(rank, meta.group_idx)
+        spec_name(rank, meta)
         for rank in range(tp_size)
         for meta in group_metas
         if isinstance(meta, AttentionGroupMeta)
     )
     all_specs = sorted(
-        spec_name(rank, meta.group_idx)
-        for rank in range(tp_size)
-        for meta in group_metas
+        spec_name(rank, meta) for rank in range(tp_size) for meta in group_metas
     )
     return [
         {"name": ATTN_ONLY_SPEC_GROUP, "spec_names": attn_specs},
@@ -86,23 +127,34 @@ def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict
 
 @dataclass(frozen=True)
 class GroupMeta:
-    """Static description of one kv_cache_group, derived from KVCacheConfig
+    """Static description of one *transfer bucket*, derived from KVCacheConfig
     (see parse_groups). Available in both scheduler and worker roles (before
-    tensors exist). Kind-specific subclasses carry the kind-specific sizing."""
+    tensors exist). Kind-specific subclasses carry the kind-specific sizing.
+
+    A bucket is one manager location: one wire name, one per-block byte size,
+    one staging pool. A plain kv_cache_group maps to exactly one bucket; a
+    UniformTypeKVCacheSpecs group maps to one per page layout it packs."""
 
     group_idx: int
     layer_names: List[str]
-    # The group's block table granularity in tokens (spec.block_size).
+    # The bucket's block table granularity in tokens (spec.block_size).
     block_size: int
-    # Bytes stored per manager block for the whole group.
+    # Bytes stored per manager block for the whole bucket.
     per_block_bytes: int
+    # Bucket suffix in the wire name: "" for a group's first bucket (the only
+    # one unless vLLM packs several page layouts into one group).
+    spec_suffix: str = ""
 
 
 @dataclass(frozen=True)
 class AttentionGroupMeta(GroupMeta):
-    """FullAttentionSpec group: token-granular KV, re-blockable to the
-    manager block size. Sizing derives from the *compact* page size (see
-    parse_groups)."""
+    """Attention bucket: token-granular KV, re-blockable to the manager block
+    size. Sizing derives from the *compact* page size (see parse_groups)."""
+
+    # Compact page bytes (spec.real_page_size_bytes): the alignment tail of a
+    # padded page is never copied. Keyword-only because the base class already
+    # carries the defaulted spec_suffix.
+    page_bytes: int = field(kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -216,119 +268,324 @@ def state_kv_view(
     )
 
 
-def _check_mla_supported(idx: int, spec: "MLAAttentionSpec") -> None:
-    """Gate the MLA latent-cache variants to the token-granular ones.
 
-    A plain MLAAttentionSpec stores one latent vector per token
-    (kv_lora_rank + qk_rope_head_dim, num_kv_heads == 1), so the
-    token-granular transfer path (per-token sizing, slot-mapped gather /
-    scatter) works unchanged. The variants below look superficially
-    transferable but are not, and each breaks a different assumption:
+def _quant_mode(spec: Any) -> int:
+    return int(getattr(spec, "kv_quant_mode", _QUANT_NONE) or _QUANT_NONE)
 
-    * compress_ratio > 1 (DeepSeek V4): one stored row covers multiple
-      tokens -- there is no per-token slot to gather;
-    * cache_dtype_str "fp8_ds_mla" (DeepSeek V3.2/V4): a custom packed
-      byte layout (e.g. 656 B/token) whose per-token byte size is not
-      head_size * dtype_size;
-    * any kv quantization: per-token-head scales live outside the paged
-      tensor (or are packed into it), so a verbatim byte round trip loses
-      them and a load would decode garbage.
+
+
+def _quant_mode_name(spec: Any) -> str:
+    """Readable kv_quant_mode for messages: the enum's name where the era has
+    one, else the canonical name of the raw value (stub / plain int)."""
+    mode = getattr(spec, "kv_quant_mode", _QUANT_NONE)
+    name = getattr(mode, "name", None)
+    if isinstance(name, str):
+        return name
+    return _QUANT_MODE_NAMES.get(_quant_mode(spec), f"mode {_quant_mode(spec)}")
+
+
+def _check_mla_variant(
+    origin: str, spec: "MLAAttentionSpec", *, calculate_kv_scales: bool
+) -> None:
+    """Gate one MLAAttentionSpec to the token-granular layouts the transfer
+    path supports, by the (cache_dtype_str, kv_quant_mode) pair.
+
+    Accepted (one latent row per token, self-contained bytes):
+
+    * "fp8_ds_mla" (DeepSeek V3.2/V4 main layers): a packed 656/584 B layout
+      whose fp8 scale lives *inside* each row, so a verbatim round trip keeps
+      it. kv_quant_mode is FP8_PER_TENSOR there -- that alone must not refuse
+      it (a naive quant gate would make every real V3.2 main layer unreachable);
+    * None/auto/float16/bfloat16 with kv_quant_mode NONE: the plain latent
+      cache (GLM, indexer layers, bf16 V3.2 main);
+    * "fp8"/"fp8_e4m3" with kv_quant_mode FP8_PER_TENSOR: layer-level scales
+      live outside the cached bytes, so the round trip is exact -- but only
+      while vLLM does not *calibrate* those scales at runtime
+      (calculate_kv_scales): a reload would then decode with a stale scale.
+
+    Refused: compression (one row per several tokens -- nothing to gather
+    per token), per-token-head / NVFP4 modes (their scales sit in the page
+    budget but outside the transferred rows), unknown cache_dtype_str, and
+    (cds, kv_quant_mode) pairs vLLM cannot produce -- guessing a scale layout
+    is worse than refusing.
     """
-    if getattr(spec, "compress_ratio", 1) != 1:
+    compress_ratio = getattr(spec, "compress_ratio", 1)
+    if compress_ratio != 1:
         raise NotImplementedError(
-            f"group {idx}: MLAAttentionSpec compress_ratio="
-            f"{spec.compress_ratio} stores one latent row per "
-            f"{spec.compress_ratio} tokens; compressed MLA KV is not "
+            f"{origin}: MLAAttentionSpec compress_ratio="
+            f"{compress_ratio} stores one latent row per "
+            f"{compress_ratio} tokens; compressed MLA KV is not "
             f"supported by TairKvCacheConnector"
         )
-    if getattr(spec, "cache_dtype_str", None) == "fp8_ds_mla":
+    cache_dtype_str = getattr(spec, "cache_dtype_str", None)
+    mode = _quant_mode(spec)
+    if cache_dtype_str == "fp8_ds_mla":
+        if mode != _QUANT_FP8_PER_TENSOR:
+            raise NotImplementedError(
+                f"{origin}: MLAAttentionSpec cache_dtype_str={cache_dtype_str!r} "
+                f"with kv_quant_mode={_quant_mode_name(spec)} is an inconsistent "
+                f"spec; the connector refuses to guess the scale layout"
+            )
+        return
+    if mode in _QUANT_PER_TOKEN_HEAD or mode == _QUANT_NVFP4:
         raise NotImplementedError(
-            f"group {idx}: MLAAttentionSpec cache_dtype_str=fp8_ds_mla is a "
-            f"custom packed fp8 layout; it is not yet supported by "
+            f"{origin}: MLAAttentionSpec kv_quant_mode={_quant_mode_name(spec)} "
+            f"keeps per-token-head scales in the page budget but outside the "
+            f"transferable rows, and no MLA backend materializes them; "
+            f"per-token-head / NVFP4 quantized MLA KV is not supported by "
             f"TairKvCacheConnector"
         )
-    if getattr(spec, "kv_quant_mode", None):
+    if cache_dtype_str in _PLAIN_CACHE_DTYPES:
+        if mode != _QUANT_NONE:
+            raise NotImplementedError(
+                f"{origin}: MLAAttentionSpec cache_dtype_str={cache_dtype_str!r} "
+                f"with kv_quant_mode={_quant_mode_name(spec)} is an inconsistent "
+                f"spec (a non-quantized KV cache dtype must carry "
+                f"kv_quant_mode=NONE); the connector refuses to guess the scale "
+                f"layout"
+            )
+        return
+    if cache_dtype_str in _PLAIN_FP8_CACHE_DTYPES:
+        if mode != _QUANT_FP8_PER_TENSOR:
+            raise NotImplementedError(
+                f"{origin}: MLAAttentionSpec cache_dtype_str={cache_dtype_str!r} "
+                f"with kv_quant_mode={_quant_mode_name(spec)} is an inconsistent "
+                f"spec; the connector refuses to guess the scale layout"
+            )
+        if calculate_kv_scales:
+            raise NotImplementedError(
+                f"{origin}: cache_dtype_str={cache_dtype_str} with "
+                f"calculate_kv_scales=True: the per-tensor scales are calibrated "
+                f"at runtime and are not part of the cached bytes, so a reload "
+                f"would decode with the wrong scale; re-run with "
+                f"--calculate-kv-scales off or use bfloat16 KV"
+            )
+        return
+    raise NotImplementedError(
+        f"{origin}: MLAAttentionSpec cache_dtype_str={cache_dtype_str!r} is not a "
+        f"layout this connector knows (expected None/auto/float16/bfloat16, "
+        f'"fp8", "fp8_e4m3", or "fp8_ds_mla")'
+    )
+
+
+def _check_attention_spec_supported(
+    origin: str, spec: Any, *, calculate_kv_scales: bool
+) -> None:
+    """Gate one attention spec to the layouts the transfer path supports.
+
+    MLA variants are decided by the spec's own fields (_check_mla_variant).
+    The other FullAttentionSpec flavours keep the merged-window refusal: vLLM
+    merges SWA / chunked-attention layers into FullAttentionSpec keeping
+    sliding_window / attention_chunk_size set, and those blocks hold windowed
+    KV, not the full prefix -- publishing them as prefix caches would corrupt
+    reuse. SlidingWindowMLASpec is not a FullAttentionSpec subclass and falls
+    through to the unknown-spec refusal.
+    """
+    if not isinstance(spec, FullAttentionSpec):
         raise NotImplementedError(
-            f"group {idx}: MLAAttentionSpec kv_quant_mode={spec.kv_quant_mode} "
-            f"carries scales outside the paged tensor (or packed into it); "
-            f"quantized MLA KV caches are not supported by "
-            f"TairKvCacheConnector"
+            f"Unsupported kv cache spec {type(spec).__name__} in {origin}"
         )
+    if isinstance(spec, MLAAttentionSpec):
+        _check_mla_variant(origin, spec, calculate_kv_scales=calculate_kv_scales)
+    for window_field in ("sliding_window", "attention_chunk_size"):
+        if getattr(spec, window_field, None) is not None:
+            raise NotImplementedError(
+                f"{origin}: FullAttentionSpec has {window_field}="
+                f"{getattr(spec, window_field)}; sliding-window / "
+                f"chunked attention KV is not full-prefix and is "
+                f"not yet supported by TairKvCacheConnector"
+            )
+
+
+def _compact_page_bytes(spec: Any, origin: str) -> int:
+    """Raw KV bytes of one page: the compact page size, i.e. the bytes the
+    gather kernel copies. spec.page_size_bytes returns page_size_padded when
+    set, which includes an allocation-alignment tail the kernel never copies
+    -- sizing locations/staging buffers with it would break the staging
+    view() and waste storage."""
+    page_bytes = getattr(spec, "real_page_size_bytes", None)
+    if page_bytes is None:
+        if getattr(spec, "page_size_padded", None) is not None:
+            raise NotImplementedError(
+                f"{origin}: page_size_padded={spec.page_size_padded} but this "
+                f"vLLM exposes no real_page_size_bytes to recover the compact "
+                f"page size; padded attention layouts are unsupported here"
+            )
+        page_bytes = spec.page_size_bytes
+    return page_bytes
+
+
+class _BucketKey(NamedTuple):
+    """Transfer-shape key of one sub spec: layers can share a bucket only if
+    their class, element type, page size and page stride all agree."""
+
+    class_name: str
+    dtype_name: str
+    page_bytes: int
+    # spec.page_size_padded as vLLM set it (None = no alignment padding).
+    pad: Optional[int]
+
+
+def _bucket_key(spec: Any, origin: str) -> _BucketKey:
+    return _BucketKey(
+        class_name=type(spec).__name__,
+        dtype_name=str(getattr(spec, "dtype", None)),
+        page_bytes=_compact_page_bytes(spec, origin),
+        pad=getattr(spec, "page_size_padded", None),
+    )
+
+
+def _bucket_order(key: _BucketKey) -> Tuple[int, str, str, int]:
+    """Total order over the buckets of one group: biggest page first (so the
+    main layer of a packed group keeps the bare group name), then class,
+    dtype and pad. Only spec-local fields enter, so the suffixes -- and with
+    them the wire names -- are a pure function of the bucket *set*: layer
+    registration order, or a different layer order on another rank, cannot
+    move them."""
+    return (
+        -key.page_bytes,
+        key.class_name,
+        key.dtype_name,
+        key.pad if key.pad is not None else -1,
+    )
+
+
+def _attention_meta(
+    group_idx: int,
+    layer_names: List[str],
+    spec: Any,
+    manager_block_size: int,
+    *,
+    suffix: str,
+    origin: str,
+) -> AttentionGroupMeta:
+    """Size one attention bucket from its spec. The gate already refused
+    compress_ratio > 1, so one token is one storage row and the per-token
+    byte size is exact: compact_page_bytes / block_size."""
+    page_bytes = _compact_page_bytes(spec, origin)
+    if page_bytes % spec.block_size != 0:
+        raise NotImplementedError(
+            f"{origin}: compact page size {page_bytes} is not a multiple of "
+            f"block_size {spec.block_size}; refusing to floor the per-token "
+            f"byte size"
+        )
+    return AttentionGroupMeta(
+        group_idx=group_idx,
+        layer_names=list(layer_names),
+        block_size=spec.block_size,
+        per_block_bytes=(page_bytes // spec.block_size)
+        * manager_block_size
+        * len(layer_names),
+        spec_suffix=suffix,
+        page_bytes=page_bytes,
+    )
+
+
+def _uniform_group_metas(
+    idx: int, wrapper: Any, manager_block_size: int, *, calculate_kv_scales: bool
+) -> List[GroupMeta]:
+    """Split one UniformTypeKVCacheSpecs group into transfer buckets.
+
+    vLLM packs every MLA layer whose specs differ only in page size into one
+    group sharing a single block table (V3.2: a 656 B/token main spec plus a
+    132 B/token indexer spec), so the group maps to one manager location per
+    bucket. Gateway first, bucket second: a refused sub spec refuses the whole
+    instance (never a partial transfer with silently missing layers).
+    """
+    buckets: Dict[_BucketKey, List[Tuple[str, Any]]] = {}
+    for layer_name, spec in wrapper.kv_cache_specs.items():
+        origin = f"group {idx} (UniformTypeKVCacheSpecs, layer {layer_name})"
+        _check_attention_spec_supported(
+            origin, spec, calculate_kv_scales=calculate_kv_scales
+        )
+        buckets.setdefault(_bucket_key(spec, origin), []).append((layer_name, spec))
+    ordered = sorted(buckets.items(), key=lambda item: _bucket_order(item[0]))
+    return [
+        _attention_meta(
+            idx,
+            [layer_name for layer_name, _ in layers],
+            layers[0][1],
+            manager_block_size,
+            suffix="" if i == 0 else f"_b{i}",
+            origin=f"group {idx} (UniformTypeKVCacheSpecs)",
+        )
+        for i, (_, layers) in enumerate(ordered)
+    ]
+
+
+def _parse_group(
+    idx: int, group: Any, manager_block_size: int, *, calculate_kv_scales: bool
+) -> List[GroupMeta]:
+    """One vLLM kv_cache_group -> its transfer buckets (a plain group = one)."""
+    spec = group.kv_cache_spec
+    layers = list(group.layer_names)
+    if isinstance(spec, MambaSpec):
+        return [
+            StateGroupMeta(
+                group_idx=idx,
+                layer_names=layers,
+                block_size=spec.block_size,
+                per_block_bytes=spec.page_size_bytes * len(layers),
+                page_size_bytes=spec.page_size_bytes,
+            )
+        ]
+    if UniformTypeKVCacheSpecs is not None and isinstance(
+        spec, UniformTypeKVCacheSpecs
+    ):
+        return _uniform_group_metas(
+            idx, spec, manager_block_size, calculate_kv_scales=calculate_kv_scales
+        )
+    origin = f"group {idx}"
+    _check_attention_spec_supported(
+        origin, spec, calculate_kv_scales=calculate_kv_scales
+    )
+    return [
+        _attention_meta(idx, layers, spec, manager_block_size, suffix="", origin=origin)
+    ]
+
+
+def _check_unique_names(metas: List[GroupMeta]) -> None:
+    """The manager keys locations by spec name, so two buckets sharing a name
+    would silently merge (or overwrite each other). The rank prefix is not
+    part of the identity: every rank registers the same name set."""
+    names = [f"g{m.group_idx}{m.spec_suffix}" for m in metas]
+    assert len(names) == len(set(names)), f"wire spec name collision: {names}"
 
 
 def parse_groups(
-    kv_cache_config: "KVCacheConfig", manager_block_size: int
+    kv_cache_config: "KVCacheConfig",
+    manager_block_size: int,
+    *,
+    calculate_kv_scales: bool,
 ) -> List[GroupMeta]:
-    """Derive the transferable GroupMeta list from vLLM's KVCacheConfig
+    """Derive the transferable GroupMeta (bucket) list from vLLM's
+    KVCacheConfig
     (https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/v1/kv_cache_interface.py#L952:
     kv_cache_groups holds one KVCacheGroupSpec per block table, each with its
-    kv_cache_spec -- FullAttentionSpec at L227, MambaSpec at L690)."""
-    metas = []
+    kv_cache_spec -- FullAttentionSpec at L227, MambaSpec at L690).
+
+    The input is the *calling process's* view of the config, and the roles do
+    not see the same thing: vLLM folds every UniformTypeKVCacheSpecs group for
+    the scheduler (generate_scheduler_kv_cache_config keeps one sub spec per
+    group), so only the worker's view carries the bucket structure. The
+    scheduler view must never feed the registered location specs -- see
+    v1_connector: registration is worker-only.
+
+    calculate_kv_scales is a mandatory keyword: defaulting it would let a
+    runtime-calibrated scale layout pass as a plain fp8 one.
+    """
+    metas: List[GroupMeta] = []
     for idx, group in enumerate(kv_cache_config.kv_cache_groups):
         if getattr(group, "is_eagle_group", False):
             logger.warning(
                 "skip eagle group %d (%d layers)", idx, len(group.layer_names)
             )
             continue
-        spec = group.kv_cache_spec
-        if isinstance(spec, MambaSpec):
-            metas.append(
-                StateGroupMeta(
-                    group_idx=idx,
-                    layer_names=list(group.layer_names),
-                    block_size=spec.block_size,
-                    per_block_bytes=spec.page_size_bytes * len(group.layer_names),
-                    page_size_bytes=spec.page_size_bytes,
-                )
+        metas.extend(
+            _parse_group(
+                idx, group, manager_block_size, calculate_kv_scales=calculate_kv_scales
             )
-        elif isinstance(spec, FullAttentionSpec):
-            if isinstance(spec, MLAAttentionSpec):
-                _check_mla_supported(idx, spec)
-            # FullAttentionSpec doubles as the merged spec of hybrid
-            # SWA/chunked-attention models (vLLM merges window layers into
-            # it, keeping sliding_window/attention_chunk_size set). Those
-            # blocks hold windowed KV, not the full prefix -- publishing
-            # them as prefix caches would corrupt reuse. Refuse explicitly.
-            for window_field in ("sliding_window", "attention_chunk_size"):
-                if getattr(spec, window_field, None) is not None:
-                    raise NotImplementedError(
-                        f"group {idx}: FullAttentionSpec has {window_field}="
-                        f"{getattr(spec, window_field)}; sliding-window / "
-                        f"chunked attention KV is not full-prefix and is "
-                        f"not yet supported by TairKvCacheConnector"
-                    )
-            # Attention KV is token-granular; scale from the spec's page size
-            # to the manager block size. Use the *compact* page size:
-            # spec.page_size_bytes returns page_size_padded when set, which
-            # includes an allocation-alignment gap the gather kernel never
-            # copies -- sizing locations/staging buffers with it would break
-            # the staging view() and waste storage. real_page_size_bytes is
-            # exactly the raw KV bytes (2 * block * heads * head_dim * dtype).
-            compact_page_bytes = getattr(spec, "real_page_size_bytes", None)
-            if compact_page_bytes is None:
-                if getattr(spec, "page_size_padded", None) is not None:
-                    raise NotImplementedError(
-                        f"group {idx}: page_size_padded="
-                        f"{spec.page_size_padded} but this vLLM exposes no "
-                        f"real_page_size_bytes to recover the compact page "
-                        f"size; padded attention layouts are unsupported here"
-                    )
-                compact_page_bytes = spec.page_size_bytes
-            per_token_bytes = compact_page_bytes // spec.block_size
-            metas.append(
-                AttentionGroupMeta(
-                    group_idx=idx,
-                    layer_names=list(group.layer_names),
-                    block_size=spec.block_size,
-                    per_block_bytes=per_token_bytes
-                    * manager_block_size
-                    * len(group.layer_names),
-                )
-            )
-        else:
-            raise NotImplementedError(
-                f"Unsupported kv cache spec {type(spec).__name__} in group {idx}"
-            )
+        )
     if not metas:
         # Every group was skipped (all-EAGLE config or an empty group list):
         # nothing to transfer, refuse explicitly instead of asserting.
@@ -342,6 +599,7 @@ def parse_groups(
             "TairKvCacheConnector transfers full-attention or hybrid "
             "(attention + mamba) KV caches only"
         )
+    _check_unique_names(metas)
     return metas
 
 
