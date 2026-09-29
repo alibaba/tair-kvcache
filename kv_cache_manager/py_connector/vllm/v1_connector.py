@@ -172,7 +172,13 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 manager_block_size = extra_config.preferred_block_size
         self._manager_block_size = manager_block_size
 
-        self._group_metas = parse_groups(kv_cache_config, manager_block_size)
+        self._group_metas = parse_groups(
+            kv_cache_config,
+            manager_block_size,
+            calculate_kv_scales=getattr(
+                vllm_config.cache_config, "calculate_kv_scales", False
+            ),
+        )
 
         deployment = {
             "model_name": model_config.served_model_name,
@@ -196,7 +202,7 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             "model_deployment": deployment,
             "block_size": manager_block_size,
             "location_spec_infos": [
-                {"name": spec_name(rank, meta.group_idx), "size": meta.per_block_bytes}
+                {"name": spec_name(rank, meta), "size": meta.per_block_bytes}
                 for rank in range(self._tp_size)
                 for meta in self._group_metas
             ],
