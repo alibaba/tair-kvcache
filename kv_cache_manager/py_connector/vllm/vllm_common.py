@@ -6,6 +6,14 @@ registration, the KV layout normalization, the hybrid capability gate and
 the kv_cache_config parsing. The two cores (scheduler_core / worker_core)
 and the thin connector shell (v1_connector) build on this module; nothing
 here may import them.
+
+Every layout the transfer path accepts is one latent row per token; the
+refusals below say why the rest are refused. Compressed MLA
+(compress_ratio > 1) is a documented extension point, not a missing check:
+supporting it needs three dimensions this data model does not carry yet --
+rows per block (spec.storage_block_size), tokens per row (compress_ratio) and
+slots per block -- because vLLM addresses a compressed row by its storage
+block number (see get_compressed_slot_mapping), never by token.
 """
 
 from dataclasses import dataclass, field
@@ -292,11 +300,44 @@ def _quant_mode_name(spec: Any) -> str:
     return _QUANT_MODE_NAMES.get(_quant_mode(spec), f"mode {_quant_mode(spec)}")
 
 
+def _check_mla_structure(origin: str, spec: "MLAAttentionSpec") -> int:
+    """Refuse the compress_ratio / model_version combinations vLLM's own size
+    algebra cannot represent, reading raw fields only (never
+    storage_block_size / real_page_size_bytes / page_size_bytes): a ratio
+    below 1 divides by zero, one that does not divide block_size would be
+    floored silently, and an unknown model_version has no algebra at all.
+    Returns the validated compress_ratio.
+
+    Supporting a compressed layout (c > 1) is a documented extension point,
+    see the module docstring."""
+    compress_ratio = getattr(spec, "compress_ratio", 1)
+    if compress_ratio < 1:
+        raise NotImplementedError(
+            f"{origin}: MLAAttentionSpec compress_ratio={compress_ratio} is "
+            f"invalid (must be >= 1); refusing to size the KV cache from it"
+        )
+    if compress_ratio > 1 and spec.block_size % compress_ratio:
+        raise NotImplementedError(
+            f"{origin}: MLAAttentionSpec block_size={spec.block_size} is not "
+            f"divisible by compress_ratio={compress_ratio}; refusing to "
+            f"silently floor the storage layout"
+        )
+    model_version = getattr(spec, "model_version", None)
+    if model_version not in (None, "deepseek_v4"):
+        raise NotImplementedError(
+            f"{origin}: MLAAttentionSpec model_version={model_version!r} is not "
+            f'a layout this connector knows (expected None or "deepseek_v4")'
+        )
+    return compress_ratio
+
+
 def _check_mla_variant(
     origin: str, spec: "MLAAttentionSpec", *, calculate_kv_scales: bool
 ) -> None:
     """Gate one MLAAttentionSpec to the token-granular layouts the transfer
-    path supports, by the (cache_dtype_str, kv_quant_mode) pair.
+    path supports, by the (cache_dtype_str, kv_quant_mode) pair, after the
+    structural check (_check_mla_structure) that guarantees the ratio is
+    usable.
 
     Accepted (one latent row per token, self-contained bytes):
 
@@ -311,24 +352,24 @@ def _check_mla_variant(
       while vLLM does not *calibrate* those scales at runtime
       (calculate_kv_scales): a reload would then decode with a stale scale.
 
-    Refused: compression (one row per several tokens -- nothing to gather
-    per token), per-token-head / NVFP4 modes (their scales sit in the page
-    budget but outside the transferred rows), unknown cache_dtype_str, and
-    (cds, kv_quant_mode) pairs vLLM cannot produce -- guessing a scale layout
-    is worse than refusing.
+    Refused: compression (a row spans several tokens, and DeepSeek V4 reads
+    those rows together with its sliding-window and compressor-state groups,
+    so a partial transfer would silently corrupt reuse), per-token-head /
+    NVFP4 modes (their scales sit in the page budget but outside the
+    transferred rows), unknown cache_dtype_str, and (cds, kv_quant_mode) pairs
+    vLLM cannot produce -- guessing a scale layout is worse than refusing.
     """
-    compress_ratio = getattr(spec, "compress_ratio", 1)
-    if compress_ratio < 1:
-        raise NotImplementedError(
-            f"{origin}: MLAAttentionSpec compress_ratio={compress_ratio} is "
-            f"invalid (must be >= 1); refusing to size the KV cache from it"
-        )
+    compress_ratio = _check_mla_structure(origin, spec)
     if compress_ratio > 1:
         raise NotImplementedError(
-            f"{origin}: MLAAttentionSpec compress_ratio="
-            f"{compress_ratio} stores one latent row per "
-            f"{compress_ratio} tokens; compressed MLA KV is not "
-            f"supported by TairKvCacheConnector"
+            f"{origin}: MLAAttentionSpec compress_ratio={compress_ratio} stores "
+            f"one latent row per {compress_ratio} tokens; DeepSeek V4 reads "
+            f"those compressed rows together with its sliding-window and "
+            f"compressor-state caches, which live in separate vLLM groups, and "
+            f"the connector must serve a request's KV groups as a whole -- "
+            f"compressed MLA KV is not supported by TairKvCacheConnector; "
+            f"supporting it needs a rows-per-block (storage_block_size) "
+            f"dimension this transfer model does not have"
         )
     cache_dtype_str = getattr(spec, "cache_dtype_str", None)
     mode = _quant_mode(spec)
@@ -385,14 +426,29 @@ def _check_attention_spec_supported(
 ) -> None:
     """Gate one attention spec to the layouts the transfer path supports.
 
+    SlidingWindowMLASpec comes first because it is *not* a FullAttentionSpec
+    subclass: V4 keeps its attention sliding-window cache and its compressor
+    state in those specs (the state is fp32, one row per window step), and
+    both hold windowed or partial state, not the full prefix. V4 couples them
+    with its compressed MLA group, so transferring the MLA group while
+    skipping these would serve hits with uninitialized layers.
+
     MLA variants are decided by the spec's own fields (_check_mla_variant).
     The other FullAttentionSpec flavours keep the merged-window refusal: vLLM
     merges SWA / chunked-attention layers into FullAttentionSpec keeping
     sliding_window / attention_chunk_size set, and those blocks hold windowed
     KV, not the full prefix -- publishing them as prefix caches would corrupt
-    reuse. SlidingWindowMLASpec is not a FullAttentionSpec subclass and falls
-    through to the unknown-spec refusal.
+    reuse.
     """
+    if SlidingWindowMLASpec is not None and isinstance(spec, SlidingWindowMLASpec):
+        raise NotImplementedError(
+            f"{origin}: SlidingWindowMLASpec sliding_window="
+            f"{getattr(spec, 'sliding_window', None)} holds windowed or partial "
+            f"state, not the full prefix, and DeepSeek V4 couples it with the "
+            f"compressed MLA group; skipping it would leave those layers "
+            f"uninitialized after a hit -- sliding-window / compressor-state MLA "
+            f"KV is not supported by TairKvCacheConnector"
+        )
     if not isinstance(spec, FullAttentionSpec):
         raise NotImplementedError(
             f"Unsupported kv cache spec {type(spec).__name__} in {origin}"
