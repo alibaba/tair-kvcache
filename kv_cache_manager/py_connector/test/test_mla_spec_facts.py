@@ -15,19 +15,33 @@ against the table it was built from.
 import unittest
 from typing import Any, Dict
 
-from kv_cache_manager.py_connector.test.mla_variant_facts import FROZEN
+from kv_cache_manager.py_connector.test.mla_variant_facts import (
+    FROZEN,
+    FROZEN_GROUPS,
+)
 
 try:
     import torch
     import vllm
-    from vllm.v1.kv_cache_interface import KVQuantMode, MLAAttentionSpec
+    from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVQuantMode,
+        MLAAttentionSpec,
+        UniformTypeKVCacheSpecs,
+    )
 
     _IMPORT_ERROR = ""
 except ImportError as exc:  # pragma: no cover - environment dependent
     torch = None  # ty: ignore[invalid-assignment]
     vllm = None  # ty: ignore[invalid-assignment]
+    generate_scheduler_kv_cache_config = None  # ty: ignore[invalid-assignment]
+    KVCacheConfig = None  # ty: ignore[invalid-assignment]
+    KVCacheGroupSpec = None  # ty: ignore[invalid-assignment]
     KVQuantMode = None  # ty: ignore[invalid-assignment]
     MLAAttentionSpec = None  # ty: ignore[invalid-assignment]
+    UniformTypeKVCacheSpecs = None  # ty: ignore[invalid-assignment]
     _IMPORT_ERROR = str(exc)
 
 
@@ -88,6 +102,50 @@ class TestRealVLLMFacts(unittest.TestCase):
         spec = MLAAttentionSpec(**_spec_kwargs("m1"))  # ty: ignore[call-non-callable]
         self.assertEqual(spec.kv_quant_mode, KVQuantMode.FP8_PER_TENSOR)
         self.assertNotEqual(spec.kv_quant_mode, KVQuantMode.NONE)
+
+    def test_scheduler_config_folds_a_packed_group(self):
+        """The scheduler's view of a packed group is a *folded* one.
+
+        This is the fact the worker-only registration rests on
+        (v1_connector): the scheduler gets one sub spec while the worker's
+        wrapper still carries every page layout, so the two roles derive
+        different location specs from the same model. If vLLM ever stops
+        folding, the payloads converge and the registration split (plus this
+        expectation) must be revisited."""
+        facts = FROZEN_GROUPS["v32_wrapper_pair"]
+        layer_names = [name for name, _ in facts["layers"]]
+        wrapper = UniformTypeKVCacheSpecs(  # ty: ignore[call-non-callable]
+            block_size=facts["block_size"],
+            kv_cache_specs={
+                name: MLAAttentionSpec(**_spec_kwargs(row))  # ty: ignore[call-non-callable]
+                for name, row in facts["layers"]
+            },
+        )
+        config = KVCacheConfig(  # ty: ignore[call-non-callable]
+            num_blocks=128,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(  # ty: ignore[call-non-callable]
+                    layer_names=layer_names,
+                    kv_cache_spec=wrapper,
+                    is_eagle_group=False,
+                )
+            ],
+        )
+        folded = generate_scheduler_kv_cache_config([config])  # ty: ignore[call-non-callable]
+        group = folded.kv_cache_groups[0]
+        self.assertNotIsInstance(
+            group.kv_cache_spec,
+            UniformTypeKVCacheSpecs,  # ty: ignore[invalid-argument-type]
+        )
+        self.assertIsInstance(group.kv_cache_spec, MLAAttentionSpec)
+        self.assertEqual(group.layer_names, layer_names)
+        # The folded spec is one of the wrapper's sub specs (its first), so
+        # its page size is a single bucket's, not the group total.
+        self.assertEqual(group.kv_cache_spec.page_size_bytes, 41984)
+        self.assertEqual(sorted(wrapper.get_page_sizes()), [8448, 41984])
+        # The worker's own config keeps the wrapper (nothing is folded there).
+        self.assertIs(config.kv_cache_groups[0].kv_cache_spec, wrapper)
 
 
 if __name__ == "__main__":
