@@ -211,7 +211,8 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             logger.warning(
                 "TairKvCacheConnector scheduler inited, extra_config: %r, "
-                "manager block size: %d, vllm block size: %d, groups: %d",
+                "manager block size: %d, vllm block size: %d, "
+                "transfer buckets: %d",
                 extra_config.model_dump(),
                 manager_block_size,
                 self._vllm_block_size,

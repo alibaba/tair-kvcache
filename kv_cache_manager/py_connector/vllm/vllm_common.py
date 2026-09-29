@@ -63,6 +63,14 @@ _QUANT_MODE_NAMES = {
 _PLAIN_CACHE_DTYPES = (None, "auto", "float16", "bfloat16")
 # Non-packed per-tensor fp8 cache dtypes: compact pages, layer-level scales.
 _PLAIN_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+# The accepted cache_dtype_str values, spelled out for refusal messages: derived
+# from the tuples above so the message cannot drift from the gate.
+_KNOWN_CACHE_DTYPES = (
+    "/".join(str(dtype) for dtype in _PLAIN_CACHE_DTYPES)
+    + ", "
+    + ", ".join(f'"{dtype}"' for dtype in _PLAIN_FP8_CACHE_DTYPES)
+    + ', or "fp8_ds_mla"'
+)
 
 # Spec group names advertised at registration and used per key in
 # start_write_cache. See build_spec_groups for the semantics.
@@ -310,7 +318,12 @@ def _check_mla_variant(
     is worse than refusing.
     """
     compress_ratio = getattr(spec, "compress_ratio", 1)
-    if compress_ratio != 1:
+    if compress_ratio < 1:
+        raise NotImplementedError(
+            f"{origin}: MLAAttentionSpec compress_ratio={compress_ratio} is "
+            f"invalid (must be >= 1); refusing to size the KV cache from it"
+        )
+    if compress_ratio > 1:
         raise NotImplementedError(
             f"{origin}: MLAAttentionSpec compress_ratio="
             f"{compress_ratio} stores one latent row per "
@@ -363,8 +376,7 @@ def _check_mla_variant(
         return
     raise NotImplementedError(
         f"{origin}: MLAAttentionSpec cache_dtype_str={cache_dtype_str!r} is not a "
-        f"layout this connector knows (expected None/auto/float16/bfloat16, "
-        f'"fp8", "fp8_e4m3", or "fp8_ds_mla")'
+        f"layout this connector knows (expected {_KNOWN_CACHE_DTYPES})"
     )
 
 

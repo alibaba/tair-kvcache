@@ -153,13 +153,13 @@ class _FakeManagerClient:
         return None
 
 
-def _vllm_config() -> Any:
+def _vllm_config(calculate_kv_scales: bool = False) -> Any:
     return SimpleNamespace(
         model_config=SimpleNamespace(
             served_model_name="tiny", dtype="bfloat16", use_mla=True
         ),
         cache_config=SimpleNamespace(
-            block_size=64, cache_dtype="auto", calculate_kv_scales=False
+            block_size=64, cache_dtype="auto", calculate_kv_scales=calculate_kv_scales
         ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1,
@@ -181,7 +181,9 @@ class TestRegistrationRole(unittest.TestCase):
         _, self.group = _worker_view()
         self.connector = self._build(KVConnectorRole.WORKER)
 
-    def _build(self, role: Any) -> Any:
+    def _build(
+        self, role: Any, group: Any = None, calculate_kv_scales: bool = False
+    ) -> Any:
         with mock.patch.object(
             v1_connector.KvCacheManagerClient,
             "from_connector_config",
@@ -192,9 +194,11 @@ class TestRegistrationRole(unittest.TestCase):
             ):
                 with mock.patch.object(v1_connector, "ConnectorScheduler", _RoleSpy):
                     with mock.patch.object(v1_connector, "ConnectorWorker", _RoleSpy):
-                        config: Any = SimpleNamespace(kv_cache_groups=[self.group])
+                        config: Any = SimpleNamespace(
+                            kv_cache_groups=[group or self.group]
+                        )
                         return v1_connector.TairKvCacheConnector(
-                            _vllm_config(), role, config
+                            _vllm_config(calculate_kv_scales), role, config
                         )
 
     def test_worker_registers_the_bucket_payload(self):
@@ -214,6 +218,27 @@ class TestRegistrationRole(unittest.TestCase):
         # The role object was built with the registration response.
         self.assertEqual(len(_RoleSpy.instances), 1)
         self.assertEqual(_RoleSpy.instances[0].args[-1], {"storage_configs": "[]"})
+
+    def test_calculate_kv_scales_reaches_the_gate(self):
+        # The connector reads the flag from the engine config: with it on, a
+        # layer-level fp8 cache is refused before anything is registered (its
+        # scales would be calibrated per request and stop being reproducible).
+        self.manager.register_requests = []
+        _RoleSpy.instances = []
+        group = SimpleNamespace(
+            layer_names=["l0"], kv_cache_spec=_spec("m3b"), is_eagle_group=False
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._build(KVConnectorRole.WORKER, group=group, calculate_kv_scales=True)
+        self.assertIn("calculate_kv_scales", str(ctx.exception))
+        # Refused at parse time: nothing was registered, no role object built.
+        self.assertEqual(self.manager.register_requests, [])
+        self.assertEqual(_RoleSpy.instances, [])
+        # ...and the same spec is accepted with the flag off (the flag, not
+        # the spec, decides).
+        connector = self._build(KVConnectorRole.WORKER, group=group)
+        self.assertEqual(len(self.manager.register_requests), 1)
+        self.assertIsNotNone(connector.connector_worker)
 
     def test_scheduler_role_does_not_register(self):
         _RoleSpy.instances = []
