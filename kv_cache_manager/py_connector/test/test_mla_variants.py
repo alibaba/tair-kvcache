@@ -125,10 +125,21 @@ class TestMLASizeTranslation(unittest.TestCase):
         self.assertEqual(metas[0].per_block_bytes, 8448)
 
     def test_per_tensor_fp8_spec_is_accepted(self):
-        # M3a: the layer-level scales stay outside the cached bytes.
-        metas = _parse([_group(_spec("m3b"))], mbs=64)
-        self.assertEqual(metas[0].page_bytes, 18432)
-        self.assertEqual(metas[0].per_block_bytes, 73728)
+        # A18: the non-packed fp8 cache dtypes keep layer-level scales outside
+        # the cached bytes, and the engine stores that cache as uint8: 9216
+        # B/page, 576 B/token at block 16 (01 section 2.3; the 18432/bf16 row
+        # 02 section 3.2 probed was a template dtype, never an engine spec).
+        for cache_dtype in ("fp8", "fp8_e4m3"):
+            with self.subTest(cache_dtype=cache_dtype):
+                spec = _spec_from_kwargs(
+                    dict(FROZEN["m3b"]["kwargs"], cache_dtype_str=cache_dtype)
+                )
+                self.assertEqual(str(spec.dtype), "uint8")
+                self.assertIsNone(spec.page_size_padded)
+                self.assertEqual(spec.unpadded_page_size_bytes, 9216)
+                metas = _parse([_group(spec)], mbs=64)
+                self.assertEqual(metas[0].page_bytes, 9216)
+                self.assertEqual(metas[0].per_block_bytes, 576 * 64)
 
     def test_size_invariant_over_accepted_variants(self):
         # A13: per_block_bytes == rows-per-block * row-bytes * layers, and the
@@ -268,28 +279,54 @@ class TestMLAVariantGate(unittest.TestCase):
         self.assertIn("kv_quant_mode", message)
         self.assertIn("FP8_PER_TENSOR", message)
 
-    def test_per_token_head_and_nvfp4_modes_are_refused(self):
-        # D4-D6 (04 keeps the refusal; 06 pins the wording): the mode name is
-        # printed, not the raw integer.
-        for mode in (
-            "INT8_PER_TOKEN_HEAD",
-            "FP8_PER_TOKEN_HEAD",
-            "INT4_PER_TOKEN_HEAD",
-            "NVFP4",
-        ):
+    def test_int4_per_token_head_is_refused_with_the_mode_name(self):
+        # D4: the frozen INT4 row (kv_quant_mode value 4, truthy) must be
+        # refused by the mode *name*, never by a bare "if kv_quant_mode".
+        spec = _spec_from_kwargs(dict(FROZEN["m3"]["kwargs"]))
+        self.assertEqual(
+            vllm_common._quant_mode(spec), int(KVQuantMode.INT4_PER_TOKEN_HEAD)
+        )
+        message = self._refusal(spec)
+        self.assertIn("kv_quant_mode=INT4_PER_TOKEN_HEAD", message)
+        self.assertNotIn("kv_quant_mode=4", message)
+        self.assertIn("per-token-head", message)
+        self.assertIn("outside the transferable rows", message)
+        self.assertIn("TairKvCacheConnector", message)
+        self.assertNotIn("one latent row per", message)
+
+    def test_per_token_head_modes_are_refused_with_the_mode_name(self):
+        # D5: INT8/FP8 per-token-head scales are quant modes, not dtypes.
+        for mode in ("INT8_PER_TOKEN_HEAD", "FP8_PER_TOKEN_HEAD"):
             with self.subTest(mode=mode):
-                spec = _spec_from_kwargs(
-                    dict(
-                        block_size=16,
-                        head_size=576,
-                        dtype="bfloat16",
-                        cache_dtype_str="auto",
-                        kv_quant_mode=mode,
-                    )
+                spec = self._spec_with_quant_mode(mode)
+                self.assertEqual(
+                    vllm_common._quant_mode(spec), int(getattr(KVQuantMode, mode))
                 )
                 message = self._refusal(spec)
-                self.assertIn(mode, message)
-                self.assertIn("kv_quant_mode", message)
+                self.assertIn(f"kv_quant_mode={mode}", message)
+                self.assertNotIn(
+                    f"kv_quant_mode={int(getattr(KVQuantMode, mode))}", message
+                )
+                self.assertIn("per-token-head scales", message)
+
+    def test_nvfp4_mode_is_refused_with_the_mode_name(self):
+        # D6: NVFP4 is not per-token-head but shares the refusal (its scales
+        # sit in the page budget, outside the transferable rows).
+        spec = self._spec_with_quant_mode("NVFP4")
+        message = self._refusal(spec)
+        self.assertIn("kv_quant_mode=NVFP4", message)
+        self.assertIn("NVFP4 quantized MLA KV is not supported", message)
+
+    def _spec_with_quant_mode(self, mode: str) -> Any:
+        return _spec_from_kwargs(
+            dict(
+                block_size=16,
+                head_size=576,
+                dtype="bfloat16",
+                cache_dtype_str="auto",
+                kv_quant_mode=mode,
+            )
+        )
 
     def test_unknown_cache_dtype_is_refused(self):
         spec = _spec_from_kwargs(
@@ -305,15 +342,18 @@ class TestMLAVariantGate(unittest.TestCase):
         self.assertIn("fp8_ds_mla", message)  # the list of known layouts
 
     def test_runtime_calibrated_scales_are_refused(self):
-        # The layer-level fp8 scales are calibrated from the request when
-        # calculate_kv_scales is on: the cached bytes then stop being
-        # reproducible, so the connector refuses instead of storing them.
+        # D7b: with calculate_kv_scales on, vLLM calibrates the layer-level fp8
+        # scales from the request, so the cached bytes stop being
+        # reproducible; the refusal says why and what to do instead.
         spec = _spec("m3b")
         message = self._refusal(spec, calculate_kv_scales=True)
-        self.assertIn("calculate_kv_scales", message)
+        self.assertIn("cache_dtype_str=fp8", message)
+        self.assertIn("calculate_kv_scales=True", message)
+        self.assertIn("wrong scale", message)
+        self.assertIn("--calculate-kv-scales off", message)
         # ...while the same spec stays accepted without calibration.
         metas = _parse([_group(spec)], mbs=64)
-        self.assertEqual(metas[0].per_block_bytes, 73728)
+        self.assertEqual(metas[0].per_block_bytes, 576 * 64)
 
     def test_compressed_mla_is_refused_with_the_v4_coupling_reason(self):
         # D2a: the ratio is named, and the reason is V4's multi-group coupling
@@ -351,6 +391,7 @@ class TestMLAVariantGate(unittest.TestCase):
                 message = self._refusal(spec, mbs=16)
                 self.assertIn("compress_ratio", message)
                 self.assertIn("must be >= 1", message)
+                self.assertIn(f"compress_ratio={compress_ratio} is invalid", message)
 
     def test_non_divisible_compress_ratio_is_refused(self):
         # A16/D10: X2 floors 16 // 3 to 5 rows per block in vLLM's algebra, so

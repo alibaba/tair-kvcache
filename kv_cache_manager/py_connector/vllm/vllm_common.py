@@ -7,13 +7,14 @@ the kv_cache_config parsing. The two cores (scheduler_core / worker_core)
 and the thin connector shell (v1_connector) build on this module; nothing
 here may import them.
 
-Every layout the transfer path accepts is one latent row per token; the
-refusals below say why the rest are refused. Compressed MLA
-(compress_ratio > 1) is a documented extension point, not a missing check:
-supporting it needs three dimensions this data model does not carry yet --
-rows per block (spec.storage_block_size), tokens per row (compress_ratio) and
-slots per block -- because vLLM addresses a compressed row by its storage
-block number (see get_compressed_slot_mapping), never by token.
+Every accepted MLA layout is one latent row per token; the refusals below say
+why the rest are refused. Compressed MLA (compress_ratio > 1) is a documented
+extension point, not a missing check: supporting it needs three dimensions this
+data model does not carry yet -- rows per block (spec.storage_block_size),
+tokens per row (compress_ratio) and slots per block -- plus a manager block that
+stays a whole number of rows (mbs % compress_ratio == 0); vLLM addresses a
+compressed row by (storage block number, row within the storage block) (see
+get_compressed_slot_mapping), never by token.
 """
 
 from dataclasses import dataclass, field
@@ -302,6 +303,9 @@ def _check_mla_variant(
                 f"with kv_quant_mode={_quant_mode_name(spec)} is an inconsistent "
                 f"spec; the connector refuses to guess the scale layout"
             )
+        # MLA-only scope (r1/S5): non-MLA full-attention fp8 KV has the same
+        # calibration risk but does not pass through this gate; flagging it in
+        # the PR body instead of widening this connector change.
         if calculate_kv_scales:
             raise NotImplementedError(
                 f"{origin}: cache_dtype_str={cache_dtype_str} with "
