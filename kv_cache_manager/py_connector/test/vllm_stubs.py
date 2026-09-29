@@ -231,18 +231,30 @@ def _install_stubs():
             self.indexes_kv_by_block_stride = indexes_kv_by_block_stride
             self.page_size_padded = page_size_padded
             self._pinned_page_bytes = page_size_bytes
-            real = (
-                page_size_bytes
-                if page_size_bytes is not None
-                else self._compute_real_page_size_bytes()
-            )
+            try:
+                real = (
+                    page_size_bytes
+                    if page_size_bytes is not None
+                    else self._compute_real_page_size_bytes()
+                )
+            except (ArithmeticError, TypeError, AssertionError):
+                # A malformed spec (compress_ratio < 1, missing head_size, ...)
+                # is the gate's business: vLLM computes these lazily, this stub
+                # eagerly, so keep the derived sizes None instead of failing the
+                # construction and let the gate refuse before any read.
+                real = None
             self.real_page_size_bytes = real
             # Per-token-head modes budget their scale tensors inside the page
             # (vLLM's AttentionSpec.unpadded_page_size_bytes).
-            self.unpadded_page_size_bytes = real + (
-                2 * block_size * num_kv_heads * 4
-                if _quant_mode_value(kv_quant_mode) in (2, 3, 4)
-                else 0
+            self.unpadded_page_size_bytes = (
+                None
+                if real is None
+                else real
+                + (
+                    2 * block_size * num_kv_heads * 4
+                    if _quant_mode_value(kv_quant_mode) in (2, 3, 4)
+                    else 0
+                )
             )
 
         def _compute_real_page_size_bytes(self):
@@ -275,9 +287,6 @@ def _install_stubs():
                 )
                 return self.page_size_padded
             return self.unpadded_page_size_bytes
-
-    def _quant_mode_value(mode: Any) -> int:
-        return int(mode or 0)
 
     def _apply_alignment_padding(spec: Any) -> None:
         """Mirrors vLLM's helper: the alignment rounds the compact page up."""

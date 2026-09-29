@@ -308,6 +308,26 @@ class TestMLAVariantGate(unittest.TestCase):
         # tokens has no per-token slot to gather.
         message = self._refusal(_spec("m2b"), mbs=256)
         self.assertIn("compress_ratio", message)
+        self.assertIn("one latent row per 4 tokens", message)
+
+    def test_negative_compress_ratio_is_refused_as_invalid(self):
+        # c < 1 is not a compression at all -- vLLM would floor it into
+        # garbage (c=0 even divides by zero) -- so it is refused as an invalid
+        # ratio instead of being described as a row-per-N-tokens layout.
+        for compress_ratio in (0, -4):
+            with self.subTest(compress_ratio=compress_ratio):
+                spec = _spec_from_kwargs(
+                    dict(
+                        block_size=16,
+                        head_size=512,
+                        dtype="bfloat16",
+                        cache_dtype_str="auto",
+                        compress_ratio=compress_ratio,
+                    )
+                )
+                message = self._refusal(spec, mbs=16)
+                self.assertIn("compress_ratio", message)
+                self.assertIn("must be >= 1", message)
 
     def test_refusals_are_independent_of_calculate_kv_scales(self):
         # The calibration gate only guards the per-tensor path: a compressed
