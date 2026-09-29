@@ -3638,8 +3638,8 @@ TEST_F(KvMetaManagerTest, FinishRechecksLeaseAfterWaitingForTheGroupShard) {
     auto [instance_ec, instance_info] = manager_->GetValidatedInstanceInfo(&request_context_, kInstanceId);
     ASSERT_EQ(EC_OK, instance_ec);
     ASSERT_TRUE(instance_info);
-    const std::size_t lifecycle_shard = std::hash<std::string>{}(instance_info->instance_group_name()) %
-                                        manager_->group_lifecycle_mutexes_.size();
+    const std::size_t lifecycle_shard =
+        std::hash<std::string>{}(instance_info->instance_group_name()) % manager_->group_lifecycle_mutexes_.size();
 
     std::promise<void> shard_locked;
     auto release_shard = shard_locked.get_future();
@@ -4627,8 +4627,7 @@ TEST_F(KvMetaManagerTest, ConcurrentStartsMayTemporarilyOvershootTheSoftByteTarg
     EXPECT_TRUE(concurrent->OverlapObserved());
     EXPECT_EQ(2, std::count(errors.begin(), errors.end(), EC_OK));
 
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId(kInstance));
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(KvMetaManager::InternalInstanceId(kInstance));
     ASSERT_TRUE(indexer);
     // Capacity is a best-effort cache target. Both requests observed the same
     // pre-write usage and were allowed to reserve their exact bytes.
