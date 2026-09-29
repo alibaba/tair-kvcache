@@ -48,3 +48,40 @@ py_test(
     tags = ["no-remote-exec"],
     deps = [":vllm_stubs"],
 )
+
+# The frozen MLA variant facts (measured on vLLM 0.26.0) shared by the tests
+# below; pure data, no torch/vllm dependency.
+py_library(
+    name = "mla_variant_facts",
+    srcs = ["mla_variant_facts.py"],
+)
+
+py_test(
+    name = "test_mla_variants",
+    srcs = ["test_mla_variants.py"],
+    tags = ["no-remote-exec"],
+    deps = [
+        ":mla_variant_facts",
+        ":vllm_stubs",
+    ],
+)
+
+py_test(
+    name = "test_role_views",
+    srcs = ["test_role_views.py"],
+    tags = ["no-remote-exec"],
+    deps = [
+        ":mla_variant_facts",
+        ":vllm_stubs",
+    ],
+)
+
+# Deliberately NOT dependent on vllm_stubs: this target must see the real
+# vLLM (the stub mirror is anchored separately, in test_mla_variants) and
+# skips itself when vLLM is unavailable.
+py_test(
+    name = "test_mla_spec_facts",
+    srcs = ["test_mla_spec_facts.py"],
+    tags = ["no-remote-exec"],
+    deps = [":mla_variant_facts"],
+)
