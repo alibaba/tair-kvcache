@@ -398,6 +398,18 @@ class TestBuildTransferGroup(unittest.TestCase):
         self.assertEqual(g.per_token_dim, 132)
         self.assertEqual(g.block_stride, 0)
 
+    def test_per_tensor_fp8_layout_stays_flat_uint8(self):
+        # B14/M3a: a non-packed fp8 cache keeps the plain MLA layout with
+        # uint8 elements (the per-tensor scales are layer-level, not in the
+        # page): one pointer, 576-wide rows, 576 B/token, flat pages.
+        kv = {"l0": FakeTensor.contiguous([10, 16, 576], itemsize=1, dtype="uint8")}
+        g, _ = self._build(kv, block_size=16, page_bytes=9216, mbs=64)
+        self.assertEqual(g.num_kv_ptrs, 1)
+        self.assertEqual(g.kernel_block_size, 16)
+        self.assertEqual(g.per_token_dim, 576)
+        self.assertEqual(g.block_stride, 0)
+        self.assertEqual(g.per_block_bytes, 576 * 64)
+
     def test_hnd_layout_rejected(self):
         # HND interleaves heads across tokens: the gather kernel needs NHD.
         kv = {"l0": FakeTensor([10, 16, 576], [18432, 1, 16], itemsize=2)}
