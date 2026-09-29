@@ -94,10 +94,6 @@ class ConnectorWorker:
                 host_ip, port, tp_size, self.on_save_finished
             )
 
-        self._self_spec_names = {
-            meta.group_idx: spec_name(self._tp_rank, meta.group_idx)
-            for meta in self._group_metas
-        }
         max_group_bytes = max(m.per_block_bytes for m in self._group_metas)
         self._iov_size = max_group_bytes * extra_config.hf3fs_concurrent_io_block_count
 
@@ -117,15 +113,15 @@ class ConnectorWorker:
                 },
             },
             "location_spec_infos": {
-                self._self_spec_names[meta.group_idx]: meta.per_block_bytes
+                spec_name(self._tp_rank, meta): meta.per_block_bytes
                 for meta in self._group_metas
             },
         }
         init_params = kvcm_py_client.InitParams()
         init_params.role_type = kvcm_py_client.RoleType.WORKER
-        init_params.self_location_spec_name = self._self_spec_names[
-            self._group_metas[0].group_idx
-        ]
+        init_params.self_location_spec_name = spec_name(
+            self._tp_rank, self._group_metas[0]
+        )
         init_params.storage_configs = f"{self._storage_configs}"
         transfer_client_config = json.dumps(transfer_client_json)
         logger.info("transfer_client_config: %s", transfer_client_config)
@@ -220,7 +216,7 @@ class ConnectorWorker:
     def _build_attention_group(
         self, meta: AttentionGroupMeta, kv_caches: Dict[str, Any]
     ) -> AttentionTransferGroup:
-        spec = self._self_spec_names[meta.group_idx]
+        spec = spec_name(self._tp_rank, meta)
         tensors = [kv_caches[name] for name in meta.layer_names]
         ref = tensors[0]
         for t in tensors:
@@ -248,6 +244,19 @@ class ConnectorWorker:
                 f"kv cache page not token-major: shape={tuple(v.shape)} "
                 f"stride={v.stride()}; set VLLM_KV_CACHE_LAYOUT=NHD"
             )
+        # Cross-check the spec against the tensor: a backend can pack a page
+        # of a different size than the spec declares (e.g. leaving fp8 scales
+        # out of the packed rows), and every location would then mis-size.
+        itemsize = view.element_size()
+        page_bytes = len(ref_views) * kernel_block_size * per_token_dim * itemsize
+        if meta.page_bytes != page_bytes:
+            raise NotImplementedError(
+                f"group {meta.group_idx}{meta.spec_suffix}: spec page_bytes="
+                f"{meta.page_bytes} does not match the tensor: {len(ref_views)} "
+                f"view(s) x {kernel_block_size} rows x {per_token_dim} elements "
+                f"x {itemsize} B = {page_bytes} B; the KV cache layout does not "
+                f"match the spec (unsupported backend packing or mixed layouts)"
+            )
         # Non-flat block layouts (page_size_padded gaps, or split K/V
         # interleaved per block as in the 5-D N-first layout) go through the
         # kernel's strided path. Stride 0 = fast flat indexing.
@@ -273,6 +282,7 @@ class ConnectorWorker:
             per_token_dim=per_token_dim,
             kernel_block_size=kernel_block_size,
             block_stride=block_stride,
+            dtype=ref.dtype,
         )
 
     def _build_state_group(
@@ -280,7 +290,7 @@ class ConnectorWorker:
     ) -> StateTransferGroup:
         # Mamba/state group: each layer is a list[Tensor] sharing one storage;
         # rebuild a (num_blocks, page_size_bytes) byte view for opaque copy.
-        spec = self._self_spec_names[meta.group_idx]
+        spec = spec_name(self._tp_rank, meta)
         block_views = []
         for name in meta.layer_names:
             states = kv_caches[name]

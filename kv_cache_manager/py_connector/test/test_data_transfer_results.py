@@ -11,6 +11,8 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+from unittest import mock
 from unittest.mock import MagicMock
 
 # vllm_stubs must be imported before torch: in the open-source CI (no torch
@@ -170,7 +172,7 @@ class TestNullStateBlocks(unittest.TestCase):
     block (None = "no data of mine here"), and the block's verdict is decided by
     the groups that did carry data -- the missing state is expressed to the
     manager through the block's spec coverage (see
-    v1_connector._spec_groups). These paths do no GPU work, so they run on CPU.
+    vllm_common.build_spec_groups). These paths do no GPU work, so they run on CPU.
     """
 
     @staticmethod
@@ -208,6 +210,7 @@ class TestNullStateBlocks(unittest.TestCase):
             per_token_dim=8,
             kernel_block_size=528,
             block_stride=0,
+            dtype=torch.bfloat16,
         )
 
     def _run(self, method, **kwargs):
@@ -298,6 +301,7 @@ class TestNullStateBlocks(unittest.TestCase):
 
 class TestTaskCrashReporting(unittest.TestCase):
     """A task that dies mid-transfer must still report, all-failed.
+
 
     submit_task drops the future, so an escaping exception is silently
     swallowed: the MultiResult callback never fires, the save session hangs
@@ -527,3 +531,213 @@ class TestPoolByteCap(unittest.TestCase):
     def test_byte_cap_can_only_shrink_not_grow(self):
         # A configured count below the byte cap is authoritative.
         self.assertEqual(self._f(256, 128, 917_504, 2**30), 256)
+
+
+class _FakeStagingBuffer:
+    """Records what the staging path does to the pinned host buffer.
+
+    ``view(dtype)`` is the element reinterpretation, ``view(n, ptrs, slots,
+    dim)`` the block shape; both are what ``torch.Tensor.view`` sees in
+    production, so recording the arguments is enough to pin the contract
+    without torch (the CI has none)."""
+
+    def __init__(self) -> None:
+        self.dtypes = []
+        self.shapes = []
+
+    def view(self, *args):
+        if len(args) == 1:
+            self.dtypes.append(args[0])
+            return self
+        self.shapes.append(args)
+        return "staging-view"
+
+    def data_ptr(self) -> int:
+        return 0
+
+
+class _FakePool:
+    """A staging pool whose one slot is a recording buffer."""
+
+    def __init__(self, block_bytes: int) -> None:
+        self.block_bytes = block_bytes
+        self.buffer = _FakeStagingBuffer()
+        self.released = None
+
+    def acquire(self, n: int) -> int:
+        return 0
+
+    def release(self, start: int, n: int) -> None:
+        self.released = (start, n)
+
+    def cpu_view(self, start: int, n: int) -> _FakeStagingBuffer:
+        return self.buffer
+
+
+def _attn_group(
+    dtype=torch.bfloat16,
+    spec_name="tp0_g0",
+    per_token_dim=656,
+    per_block_bytes=41984,
+    block_size=64,
+    num_kv_ptrs=1,
+):
+    """One attention bucket; the V3.2 fp8 main geometry by default."""
+    from kv_cache_manager.py_connector.vllm.transfer_types import (
+        AttentionTransferGroup,
+    )
+
+    return AttentionTransferGroup(
+        group_idx=0,
+        spec_name=spec_name,
+        layer_names=["l0"],
+        block_size=block_size,
+        per_block_bytes=per_block_bytes,
+        layer_num=1,
+        kv_layout=KVLayout.MLA_3D,
+        # No real device pointers in these plumbing tests.
+        kvcache_ptr_tensor_gpu=None,  # ty: ignore[invalid-argument-type]
+        num_kv_ptrs=num_kv_ptrs,
+        per_token_dim=per_token_dim,
+        kernel_block_size=64,
+        block_stride=0,
+        dtype=dtype,
+    )
+
+
+class TestAttentionStagingView(unittest.TestCase):
+    """E2: one staging view per bucket, shaped by the bucket's own geometry.
+
+    Mixed element sizes are legal in one instance (V3.2 + auto KV: bf16 main
+    next to a uint8 indexer), so the view must take the element type from the
+    group -- a global dtype built a wrong-sized view for the other bucket."""
+
+    MBS = 64
+
+    def _dtm(self) -> Any:
+        dtm: Any = DataTransferManager.__new__(DataTransferManager)
+        dtm._manager_block_size = self.MBS
+        return dtm
+
+    def test_view_shape_and_element_type_per_group(self):
+        dtm = self._dtm()
+        for dtype, itemsize, per_token_dim, per_block_bytes in (
+            (torch.bfloat16, 2, 576, 73728),
+            (torch.uint8, 1, 656, 41984),
+        ):
+            with self.subTest(dtype=dtype):
+                group = _attn_group(
+                    dtype=dtype,
+                    per_token_dim=per_token_dim,
+                    per_block_bytes=per_block_bytes,
+                    block_size=16,
+                )
+                buffer: Any = _FakeStagingBuffer()
+                view = dtm._attn_staging_view(buffer, group, batch=3)
+                self.assertEqual(view, "staging-view")
+                self.assertEqual(buffer.dtypes, [dtype])
+                self.assertEqual(buffer.shapes, [(3, 1, self.MBS, per_token_dim)])
+                # The staged batch consumes exactly its per-block bytes.
+                self.assertEqual(
+                    3 * per_token_dim * self.MBS * itemsize, 3 * per_block_bytes
+                )
+
+    def test_split_kv_rows_keep_both_pointers(self):
+        # A split K/V bucket stages two rows per manager block; the view must
+        # carry them instead of halving the batch.
+        group = _attn_group(num_kv_ptrs=2, per_token_dim=512, per_block_bytes=32768)
+        buffer: Any = _FakeStagingBuffer()
+        self._dtm()._attn_staging_view(buffer, group, batch=2)
+        self.assertEqual(buffer.shapes, [(2, 2, self.MBS, 512)])
+
+
+class TestAttentionTaskWiring(unittest.TestCase):
+    """E4: the task hands the kernel the bucket's geometry and element type."""
+
+    MBS = 64
+
+    def _dtm(self, group) -> Any:
+        dtm: Any = DataTransferManager.__new__(DataTransferManager)
+        dtm._manager_block_size = self.MBS
+        dtm._save_stream = MagicMock()
+        dtm._load_stream = MagicMock()
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]  # ER_OK
+        dtm._transfer_client.LoadKvCaches.return_value = 0  # ER_OK
+        dtm._coordinator_client = MagicMock()
+        dtm._pools = {group.spec_name: _FakePool(group.per_block_bytes)}
+        return dtm
+
+    def _capture(self, method: str, group, n: int = 2):
+        import kv_cache_manager.py_connector.vllm.data_transfer as dt
+
+        dtm = self._dtm(group)
+        buffer = dtm._pools[group.spec_name].buffer
+        results = {}
+        mr = MultiResult(1, lambda flat: results.setdefault("flat", flat))
+        with mock.patch.object(dt, "batch_gather_scatter_helper") as helper:
+            if method == "save_task":
+                dtm.save_task(
+                    mr,
+                    0,
+                    group,
+                    remote_uris=[f"u{i}" for i in range(n)],
+                    block_token_indices=[[i] for i in range(n)],
+                    block_ids=None,
+                    ready_event=MagicMock(),
+                )
+                kernel = helper.batch_gather_kv_caches
+            else:
+                dtm.load_task(
+                    mr,
+                    0,
+                    group,
+                    remote_uris=[f"u{i}" for i in range(n)],
+                    block_token_indices=[[i] for i in range(n)],
+                    block_ids=None,
+                )
+                kernel = helper.batch_scatter_kv_caches
+        return kernel.call_args, buffer, results["flat"]
+
+    def test_save_uses_manager_block_slots(self):
+        # The kernel's NUM_TOKENS_PER_BLOCK is one manager block worth of
+        # tokens: c == 1, so the slots are tokens.
+        group = _attn_group()
+        (args, kwargs), buffer, flat = self._capture("save_task", group, n=2)
+        self.assertEqual(args[4], self.MBS)
+        self.assertEqual(args[5], group.per_token_dim)
+        self.assertEqual(kwargs["block_stride"], group.block_stride)
+        self.assertEqual(kwargs["local_block_size"], group.kernel_block_size)
+        self.assertEqual(buffer.shapes, [(2, 1, self.MBS, group.per_token_dim)])
+        self.assertEqual(flat, [True, True])
+
+    def test_load_uses_manager_block_slots(self):
+        group = _attn_group()
+        (args, kwargs), buffer, flat = self._capture("load_task", group, n=2)
+        self.assertEqual(args[4], self.MBS)
+        self.assertEqual(args[5], group.per_token_dim)
+        self.assertEqual(kwargs["block_stride"], group.block_stride)
+        self.assertEqual(kwargs["local_block_size"], group.kernel_block_size)
+        self.assertEqual(buffer.shapes, [(2, 1, self.MBS, group.per_token_dim)])
+        self.assertEqual(flat, [True, True])
+
+    def test_mixed_element_sizes_use_their_own_dtype(self):
+        # The regression this whole path exists for: one instance, two
+        # buckets, two element sizes -- each stages with its own dtype.
+        bf16 = _attn_group(
+            dtype=torch.bfloat16,
+            per_token_dim=576,
+            per_block_bytes=73728,
+            block_size=16,
+        )
+        self.assertEqual(
+            self._capture("save_task", bf16, n=1)[1].dtypes, [torch.bfloat16]
+        )
+        uint8 = _attn_group(spec_name="tp0_g0_b1", dtype=torch.uint8)
+        self.assertEqual(
+            self._capture("save_task", uint8, n=1)[1].dtypes, [torch.uint8]
+        )
+        self.assertEqual(
+            self._capture("load_task", uint8, n=1)[1].dtypes, [torch.uint8]
+        )
