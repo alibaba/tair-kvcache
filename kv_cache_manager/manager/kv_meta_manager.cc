@@ -866,8 +866,7 @@ private:
         // StartWrite admission. Otherwise timeout cleanup can erase metadata,
         // expose the key as missing, and still be deleting the old allocation
         // while a new generation is admitted for the same group.
-        std::unique_lock<std::shared_mutex> lifecycle_lock(
-            owner_->group_lifecycle_mutexes_[session.lifecycle_shard]);
+        std::unique_lock<std::shared_mutex> lifecycle_lock(owner_->group_lifecycle_mutexes_[session.lifecycle_shard]);
         if (owner_->maintenance_cancelled_.load(std::memory_order_acquire)) {
             return;
         }
@@ -2453,8 +2452,7 @@ private:
             all_items.push_back(batch->items[i].item);
         }
 
-        std::unique_lock<std::shared_mutex> lifecycle_lock(
-            owner_->group_lifecycle_mutexes_[batch->lifecycle_shard]);
+        std::unique_lock<std::shared_mutex> lifecycle_lock(owner_->group_lifecycle_mutexes_[batch->lifecycle_shard]);
         if (ShouldStop()) {
             CompletePending(batch);
             return;
@@ -2678,8 +2676,7 @@ private:
             std::hash<std::string>{}(group->name()) % owner_->group_lifecycle_mutexes_.size();
         std::vector<RetiredItem> retired;
         {
-            std::unique_lock<std::shared_mutex> lifecycle_lock(
-                owner_->group_lifecycle_mutexes_[lifecycle_shard]);
+            std::unique_lock<std::shared_mutex> lifecycle_lock(owner_->group_lifecycle_mutexes_[lifecycle_shard]);
             if (ShouldStop()) {
                 return false;
             }
@@ -4778,15 +4775,12 @@ KvMetaManager::StartWrite(RequestContext *request_context,
              ++attempt) {
             session_id = StringUtil::GenerateRandomString(32);
             auto items_for_attempt = session_items;
-            session_result =
-                write_session_manager_
-                    ? write_session_manager_->Put(
-                          session_id,
-                          internal_instance_id,
-                          lifecycle_shard,
-                          std::move(items_for_attempt),
-                          write_deadline)
-                    : KvMetaWriteSessionManager::PutResult::kStopped;
+            session_result = write_session_manager_ ? write_session_manager_->Put(session_id,
+                                                                                  internal_instance_id,
+                                                                                  lifecycle_shard,
+                                                                                  std::move(items_for_attempt),
+                                                                                  write_deadline)
+                                                    : KvMetaWriteSessionManager::PutResult::kStopped;
         }
     } catch (const std::exception &) {
         session_publication_threw = true;
@@ -5340,9 +5334,8 @@ ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::str
             std::lock_guard<std::shared_mutex> lock(*mutex);
             instances->erase(*instance_id);
         }
-    } trim_marker{&group_lifecycle_mutexes_[lifecycle_shard],
-                  &trimming_instances_[lifecycle_shard],
-                  &internal_instance_id};
+    } trim_marker{
+        &group_lifecycle_mutexes_[lifecycle_shard], &trimming_instances_[lifecycle_shard], &internal_instance_id};
     lifecycle_lock.unlock();
 
     bool trim_metadata_changed = false;
