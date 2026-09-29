@@ -250,6 +250,26 @@ class TestMLAVariantGate(unittest.TestCase):
         self.assertIn("fp8_ds_mla", message)
         self.assertIn("INT4_PER_TOKEN_HEAD", message)
 
+    def test_plain_fp8_requires_the_per_tensor_mode(self):
+        # #6b, second half (defence in depth, symmetric with D18's counter-
+        # example): vLLM maps "fp8"/"fp8_e4m3" to FP8_PER_TENSOR, so a plain
+        # fp8 cache without it cannot occur -- refuse instead of guessing.
+        for cache_dtype in ("fp8", "fp8_e4m3"):
+            with self.subTest(cache_dtype=cache_dtype):
+                spec = _spec_from_kwargs(
+                    dict(
+                        FROZEN["m3b"]["kwargs"],
+                        cache_dtype_str=cache_dtype,
+                        kv_quant_mode=KVQuantMode.NONE,
+                    )
+                )
+                self.assertEqual(spec.kv_quant_mode, KVQuantMode.NONE)
+                self.assertEqual(vllm_common._quant_mode(spec), 0)
+                message = self._refusal(spec)
+                self.assertIn(f"cache_dtype_str='{cache_dtype}'", message)
+                self.assertIn("kv_quant_mode=NONE", message)
+                self.assertIn("is an inconsistent spec", message)
+
     def test_plain_cache_dtypes_accept_only_mode_none(self):
         # D18 (zero regression): float16/bfloat16 are legal --kv-cache-dtype
         # values today and must stay accepted; only an inconsistent mode is
