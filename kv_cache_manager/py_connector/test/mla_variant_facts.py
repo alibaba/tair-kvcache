@@ -26,9 +26,10 @@ row pins the grouped value and records the other one for the golden check.
 ``UniformTypeKVCacheSpecs`` group, what the transfer buckets of that group are,
 and what the scheduler's *folded* view of the same group looks like (the two
 role views differ -- see vllm_common.parse_groups). ``sched_row`` names the sub
-spec ``generate_scheduler_kv_cache_config`` keeps for the scheduler, i.e. the
-folded view of that group; ``V4_TINY_GROUPS`` lists the six V4 groups in golden
-order.
+spec ``generate_scheduler_kv_cache_config`` keeps, i.e. the folded view of that
+group: the *first* entry of the wrapper dict, which is engine registration order
+(indexer before attention), not the golden's sorted ``layer_names``.
+``V4_TINY_GROUPS`` lists the six V4 groups in golden order.
 
 Source of truth: the 01 variant research (vLLM 0.26.0 measurements) and the
 tiny-model golden under ``e2e/mla-cq/golden/tiny_model_specs.json`` (generated
@@ -421,17 +422,26 @@ REJECTED_WINDOW: List[str] = [
 REJECTED_INVALID: List[str] = ["X2"]
 
 #: The V3.2 wrapper group as vLLM builds it: one layer pair per model layer,
-#: all sharing one block table. ``layers`` is (vLLM layer name, FROZEN row).
+#: all sharing one block table. ``layers`` is (vLLM layer name, FROZEN row) in
+#: *engine registration order* (see FROZEN_GROUPS): the indexer registers
+#: before the attention module, so it comes first.
 _V32_LAYERS = [
-    ("model.layers.0.self_attn.attn", "m1"),
     ("model.layers.0.self_attn.indexer.k_cache", "m2c2"),
-    ("model.layers.1.self_attn.attn", "m1"),
+    ("model.layers.0.self_attn.attn", "m1"),
     ("model.layers.1.self_attn.indexer.k_cache", "m2c2"),
+    ("model.layers.1.self_attn.attn", "m1"),
 ]
 
-#: Group-level facts. ``buckets`` = the worker view of a packed group (transfer
-#: buckets in wire-name order); ``folded_row`` marks a row that *is* the folded
-#: view (v32), ``sched_row`` the sub spec a worker-view row folds to.
+#: Group-level facts. ``layers`` is in engine registration order, which is the
+#: order vLLM iterates ``static_forward_context`` in: it is the wrapper's dict
+#: order, the group's ``layer_names`` order, and therefore the order
+#: ``generate_scheduler_kv_cache_config`` folds (it keeps the *first* entry --
+#: vllm 0.26.0 kv_cache_utils.py:1813 -- not an alphabetically first one). For
+#: the DeepSeek families that means the indexer sub spec comes first. The local
+#: golden generator dumps ``layer_names`` sorted, so the drift check sorts.
+#: ``buckets`` = the worker view of a packed group (buckets in wire-name
+#: order); ``folded_row`` marks a row that *is* the folded view (v32),
+#: ``sched_row`` the sub spec a worker-view row folds to.
 FROZEN_GROUPS: Dict[str, Dict[str, Any]] = {
     "v32_wrapper_worker": dict(
         block_size=64,
@@ -439,6 +449,7 @@ FROZEN_GROUPS: Dict[str, Dict[str, Any]] = {
         layers=_V32_LAYERS,
         page_size_bytes=100864,  # 2 x 41984 + 2 x 8448
         page_sizes=[8448, 41984],
+        sched_row="m2c2",  # the indexer registers first -> folded entry
         buckets=[
             dict(suffix="", row="m1", layers=2, per_block_bytes=83968),
             dict(suffix="_b1", row="m2c2", layers=2, per_block_bytes=16896),
@@ -450,25 +461,26 @@ FROZEN_GROUPS: Dict[str, Dict[str, Any]] = {
         layers=_V32_LAYERS[:2],
         page_size_bytes=50432,  # 41984 + 8448
         page_sizes=[8448, 41984],
+        sched_row="m2c2",
         buckets=[
             dict(suffix="", row="m1", layers=1, per_block_bytes=41984),
             dict(suffix="_b1", row="m2c2", layers=1, per_block_bytes=8448),
         ],
     ),
-    "v32_wrapper_sched": dict(  # the folded view: main fields x all layers
+    "v32_wrapper_sched": dict(  # the folded view: the indexer spec x all layers
         block_size=64,
         mbs=64,
-        folded_row="m1",
+        folded_row="m2c2",
         layers=4,
-        page_bytes=41984,
-        per_block_bytes=167936,  # 41984 / 64 * 64 * 4
+        page_bytes=8448,
+        per_block_bytes=33792,  # 132 B/token x 64 x 4 layers
     ),
     "v32_bf16_wrapper": dict(  # bf16 main + uint8 indexer: mixed itemsizes
         block_size=64,
         mbs=64,
         layers=[
-            ("model.layers.0.self_attn.attn", "m0_b64"),
             ("model.layers.0.self_attn.indexer.k_cache", "m2c2"),
+            ("model.layers.0.self_attn.attn", "m0_b64"),
         ],
         page_size_bytes=82176,  # 73728 + 8448
         page_sizes=[8448, 73728],
@@ -479,18 +491,20 @@ FROZEN_GROUPS: Dict[str, Dict[str, Any]] = {
     ),
     # --- DeepSeek V4 tiny: six packed groups, all refused (M2/A case) ------ #
     # The full-MLA group packs two compressed mains (c=4/c=128) and the
-    # compressed indexer; every sub spec of every group is refused.
+    # compressed indexer; every sub spec of every group is refused. The
+    # indexer registers first, so it is the group's first layer and the folded
+    # row the scheduler sees (see the FROZEN_GROUPS comment).
     "v4_full_c4a": dict(
         block_size=256,
         mbs=256,
         layers=[
-            ("model.layers.1.attn", "m2b"),
             ("model.layers.1.attn.indexer.k_cache", "m2c"),
+            ("model.layers.1.attn", "m2b"),
             ("model.layers.2.attn", "m2b2"),
         ],
         page_sizes=[1728, 8640, 37440],
         page_size_bytes=47808,  # 37440 + 8640 + 1728
-        sched_row="m2b",
+        sched_row="m2c",
     ),
     "v4_swa_wrapper_l0": dict(  # one SWA group per layer
         block_size=64,
@@ -520,12 +534,12 @@ FROZEN_GROUPS: Dict[str, Dict[str, Any]] = {
         block_size=4,
         mbs=4,
         layers=[
-            ("model.layers.1.attn.compressor.state_cache", "v4_state_l1"),
             ("model.layers.1.attn.indexer.compressor.state_cache", "v4_state_indexer"),
+            ("model.layers.1.attn.compressor.state_cache", "v4_state_l1"),
         ],
         page_sizes=[8640, 37440],
         page_size_bytes=46080,  # 37440 + 8640
-        sched_row="v4_state_l1",
+        sched_row="v4_state_indexer",
     ),
     "v4_state_wrapper_l2": dict(  # layer-2 compressor state (block 8)
         block_size=8,
