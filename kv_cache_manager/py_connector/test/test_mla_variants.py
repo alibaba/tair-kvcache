@@ -472,13 +472,19 @@ class TestWindowedMLARefusals(unittest.TestCase):
     def test_compressor_state_groups_are_refused_as_windowed_state(self):
         # D2c/D16: the compressor-state caches are SlidingWindowMLASpec too
         # (fp32, one row per window step): windowed *partial state*, and the
-        # state of one group feeds the compressed rows of another.
+        # state of one group feeds the compressed rows of another. The layer
+        # named is the first *registered* one -- for the l1 group that is the
+        # indexer's state, not the attention's (engine registration order).
         for row, layer in (
-            ("v4_state_wrapper_l1", "model.layers.1.attn.compressor.state_cache"),
+            (
+                "v4_state_wrapper_l1",
+                "model.layers.1.attn.indexer.compressor.state_cache",
+            ),
             ("v4_state_wrapper_l2", "model.layers.2.attn.compressor.state_cache"),
         ):
             with self.subTest(group=row):
                 _, group = _wrapper_group(row)
+                self.assertEqual(layer, FROZEN_GROUPS[row]["layers"][0][0])
                 with self.assertRaises(NotImplementedError) as ctx:
                     _parse([group], mbs=FROZEN_GROUPS[row]["mbs"])
                 message = str(ctx.exception)
@@ -554,8 +560,18 @@ class TestV4GroupFacts(unittest.TestCase):
         for row in V4_TINY_GROUPS:
             with self.subTest(group=row):
                 facts = FROZEN_GROUPS[row]
+                wrapper, _ = _wrapper_group(row)
+                # Generate the fold the way the engine does: the first entry of
+                # the wrapper dict, which is registration order (S1). The frozen
+                # sched_row must name exactly that sub spec.
+                self.assertEqual(facts["sched_row"], facts["layers"][0][1])
+                folded_spec = next(iter(wrapper.kv_cache_specs.values()))
+                self.assertEqual(
+                    folded_spec.real_page_size_bytes,
+                    FROZEN[facts["sched_row"]]["real_page_size_bytes"],
+                )
                 layer_names = [name for name, _ in facts["layers"]]
-                folded = _group(_spec(facts["sched_row"]), tuple(layer_names))
+                folded = _group(folded_spec, tuple(layer_names))
                 with self.assertRaises(NotImplementedError) as ctx:
                     _parse([folded], mbs=facts["mbs"])
                 message = str(ctx.exception)
@@ -711,6 +727,30 @@ class TestFrozenFactsAgainstStub(unittest.TestCase):
                     [m.per_block_bytes for m in metas],
                     [b["per_block_bytes"] for b in facts["buckets"]],
                 )
+
+
+class TestFoldRowsAreRegistrationOrdered(unittest.TestCase):
+    """S1: the scheduler fold keeps the wrapper dict's first entry, which is
+    engine registration order (DeepSeek registers the indexer before the
+    attention module) -- never an alphabetically or numerically first one.
+    Every frozen fold row must name exactly that sub spec."""
+
+    def test_sched_and_folded_rows_name_layers_zero(self):
+        for row, facts in FROZEN_GROUPS.items():
+            layers = facts.get("layers")
+            if not isinstance(layers, list):
+                continue  # count-only rows (v32_wrapper_sched): checked below
+            with self.subTest(group=row):
+                for key in ("sched_row", "folded_row"):
+                    if key in facts:
+                        self.assertEqual(facts[key], layers[0][1], key)
+
+    def test_v32_sched_row_names_the_worker_groups_first_layer(self):
+        worker = FROZEN_GROUPS["v32_wrapper_worker"]
+        self.assertEqual(
+            FROZEN_GROUPS["v32_wrapper_sched"]["folded_row"], worker["layers"][0][1]
+        )
+        self.assertEqual(worker["sched_row"], "m2c2")
 
 
 class TestCompressedRowsAreStructuralFacts(unittest.TestCase):

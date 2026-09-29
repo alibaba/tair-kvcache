@@ -2,7 +2,8 @@
 
 vLLM hands the scheduler and the worker two different views of one
 ``UniformTypeKVCacheSpecs`` group: the scheduler gets a *folded* spec
-(``generate_scheduler_kv_cache_config`` keeps one sub spec per group), the
+(``generate_scheduler_kv_cache_config`` keeps the wrapper dict's first entry --
+engine registration order, so the indexer for the DeepSeek families), the
 worker gets the wrapper with every sub spec. Splitting the wrapper into
 transfer buckets is therefore only meaningful on the worker side, and the
 registered ``location_spec_infos`` (name -> bytes) must come from there --
@@ -73,8 +74,9 @@ def _worker_view(row: str = "v32_wrapper_worker") -> Tuple[Any, Any]:
 
 
 def _scheduler_view(wrapper: Any, layer_names: List[str]) -> Any:
-    """What generate_scheduler_kv_cache_config leaves: any one sub spec (the
-    first, in vLLM's implementation) with the group's full layer list."""
+    """What generate_scheduler_kv_cache_config leaves: the wrapper dict's first
+    entry (= engine registration order: indexer before attn) with the group's
+    full layer list."""
     folded = next(iter(wrapper.kv_cache_specs.values()))
     return SimpleNamespace(
         layer_names=list(layer_names),
@@ -110,12 +112,31 @@ class TestRoleViews(unittest.TestCase):
         self.assertEqual([m.per_block_bytes for m in self.worker_metas], [83968, 16896])
 
     def test_scheduler_view_is_folded(self):
-        # The folded spec is the first sub spec with the whole group's layers:
-        # one location whose bytes differ from either worker bucket.
+        # The folded spec is the wrapper dict's first entry -- the engine's
+        # registration order, so for V3.2 the *indexer* spec -- with the whole
+        # group's layers: one location whose bytes differ from either worker
+        # bucket (8448 B/page vs 41984; 33792 vs 83968 per block).
         self.assertEqual(len(self.sched_metas), 1)
-        self.assertEqual(self.sched_metas[0].page_bytes, 41984)
-        self.assertEqual(self.sched_metas[0].per_block_bytes, 167936)
+        self.assertEqual(self.sched_metas[0].page_bytes, 8448)
+        self.assertEqual(self.sched_metas[0].per_block_bytes, 33792)
         self.assertEqual(self.sched_metas[0].layer_names, self.worker_group.layer_names)
+
+    def test_scheduler_fold_matches_the_frozen_row(self):
+        # S1: the fold keeps the first entry of the wrapper dict = engine
+        # registration order (DeepSeek registers the indexer before attn), and
+        # the frozen v32_wrapper_sched row must name exactly that sub spec.
+        facts = FROZEN_GROUPS["v32_wrapper_sched"]
+        self.assertEqual(facts["folded_row"], "m2c2")
+        self.assertIs(
+            self.sched_group.kv_cache_spec,
+            next(iter(self.wrapper.kv_cache_specs.values())),
+        )
+        self.assertEqual(
+            self.sched_metas[0].page_bytes,
+            FROZEN[facts["folded_row"]]["real_page_size_bytes"],
+        )
+        self.assertEqual(self.sched_metas[0].per_block_bytes, facts["per_block_bytes"])
+        self.assertEqual(facts["per_block_bytes"], 132 * 64 * 4)
 
     def test_role_invariant_fields_agree(self):
         # R3: group_idx / block_size / block-table geometry are identical in
@@ -280,8 +301,10 @@ class TestGoldenDrift(unittest.TestCase):
                     golden_group["page_size_bytes_total"], facts["page_size_bytes"]
                 )
                 self.assertEqual(golden_group["page_sizes"], facts["page_sizes"])
+                # The frozen column is registration order; the golden generator
+                # dumps sorted layer_names, so compare as sorted sets.
                 self.assertEqual(
-                    [name for name, _ in facts["layers"]],
+                    sorted(name for name, _ in facts["layers"]),
                     golden_group["layer_names"],
                 )
                 specs = self.golden["models"][model]["specs"]

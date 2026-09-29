@@ -131,40 +131,64 @@ class TestRealVLLMFacts(unittest.TestCase):
         This is the fact the worker-only registration rests on
         (v1_connector): the scheduler gets one sub spec while the worker's
         wrapper still carries every page layout, so the two roles derive
-        different location specs from the same model. If vLLM ever stops
-        folding, the payloads converge and the registration split (plus this
-        expectation) must be revisited."""
-        facts = FROZEN_GROUPS["v32_wrapper_pair"]
-        layer_names = [name for name, _ in facts["layers"]]
-        wrapper = UniformTypeKVCacheSpecs(  # ty: ignore[call-non-callable]
-            block_size=facts["block_size"],
-            kv_cache_specs={name: _spec(row) for name, row in facts["layers"]},
-        )
-        config = KVCacheConfig(  # ty: ignore[call-non-callable]
-            num_blocks=128,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(  # ty: ignore[call-non-callable]
-                    layer_names=layer_names,
-                    kv_cache_spec=wrapper,
-                    is_eagle_group=False,
+        different location specs from the same model. The fold keeps the
+        wrapper dict's *first* entry, which is engine registration order --
+        for DeepSeek the indexer registers before the attention module, so the
+        scheduler sees the indexer spec (S1). If vLLM ever stops folding, the
+        payloads converge and the registration split (plus this expectation)
+        must be revisited."""
+        for row in ("v32_wrapper_pair", "v4_full_c4a", "v4_state_wrapper_l1"):
+            with self.subTest(group=row):
+                facts = FROZEN_GROUPS[row]
+                # FROZEN_GROUPS.layers is registration order, so layers[0] is
+                # the sub spec the engine folds to; sched_row must name it.
+                self.assertEqual(facts["sched_row"], facts["layers"][0][1])
+                layer_names = [name for name, _ in facts["layers"]]
+                wrapper = UniformTypeKVCacheSpecs(  # ty: ignore[call-non-callable]
+                    block_size=facts["block_size"],
+                    kv_cache_specs={
+                        name: _spec(spec_row) for name, spec_row in facts["layers"]
+                    },
                 )
-            ],
-        )
-        folded = generate_scheduler_kv_cache_config([config])  # ty: ignore[call-non-callable]
-        group = folded.kv_cache_groups[0]
-        self.assertNotIsInstance(
-            group.kv_cache_spec,
-            UniformTypeKVCacheSpecs,  # ty: ignore[invalid-argument-type]
-        )
-        self.assertIsInstance(group.kv_cache_spec, MLAAttentionSpec)
-        self.assertEqual(group.layer_names, layer_names)
-        # The folded spec is one of the wrapper's sub specs (its first), so
-        # its page size is a single bucket's, not the group total.
-        self.assertEqual(group.kv_cache_spec.page_size_bytes, 41984)
-        self.assertEqual(sorted(wrapper.get_page_sizes()), [8448, 41984])
-        # The worker's own config keeps the wrapper (nothing is folded there).
-        self.assertIs(config.kv_cache_groups[0].kv_cache_spec, wrapper)
+                self.assertEqual(sorted(wrapper.get_page_sizes()), facts["page_sizes"])
+                config = KVCacheConfig(  # ty: ignore[call-non-callable]
+                    num_blocks=128,
+                    kv_cache_tensors=[],
+                    kv_cache_groups=[
+                        KVCacheGroupSpec(  # ty: ignore[call-non-callable]
+                            layer_names=layer_names,
+                            kv_cache_spec=wrapper,
+                            is_eagle_group=False,
+                        )
+                    ],
+                )
+                folded = generate_scheduler_kv_cache_config([config])  # ty: ignore[call-non-callable]
+                group = folded.kv_cache_groups[0]
+                self.assertNotIsInstance(
+                    group.kv_cache_spec,
+                    UniformTypeKVCacheSpecs,  # ty: ignore[invalid-argument-type]
+                )
+                # The fold deep-copies the config, so compare structurally: the
+                # folded spec equals the first entry (registration order), not
+                # the last one.
+                self.assertEqual(
+                    group.kv_cache_spec, wrapper.kv_cache_specs[layer_names[0]]
+                )
+                self.assertNotEqual(
+                    group.kv_cache_spec, wrapper.kv_cache_specs[layer_names[-1]]
+                )
+                self.assertEqual(group.layer_names, layer_names)
+                # The folded spec is the indexer sub spec, not the group total.
+                frozen = FROZEN[facts["sched_row"]]
+                expected_page = (
+                    frozen["page_size_padded"]
+                    if frozen["page_size_padded"] is not None
+                    else frozen["unpadded_page_size_bytes"]
+                )
+                self.assertEqual(group.kv_cache_spec.page_size_bytes, expected_page)
+                # The worker's own config keeps the wrapper (nothing is folded
+                # there).
+                self.assertIs(config.kv_cache_groups[0].kv_cache_spec, wrapper)
 
 
 if __name__ == "__main__":
