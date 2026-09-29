@@ -132,7 +132,8 @@ class ConnectorWorker:
             "kvcm_py_client.TransferClient.Create failed"
         )
         logger.warning(
-            "TairKvCacheConnector worker inited, tp rank: %d/%d, host: %s:%d, groups: %d",
+            "TairKvCacheConnector worker inited, tp rank: %d/%d, host: %s:%d, "
+            "transfer buckets: %d",
             self._tp_rank,
             self._tp_size,
             host_ip,
@@ -244,17 +245,23 @@ class ConnectorWorker:
                 f"kv cache page not token-major: shape={tuple(v.shape)} "
                 f"stride={v.stride()}; set VLLM_KV_CACHE_LAYOUT=NHD"
             )
-        # Cross-check the spec against the tensor: a backend can pack a page
-        # of a different size than the spec declares (e.g. leaving fp8 scales
-        # out of the packed rows), and every location would then mis-size.
+        # Cross-check the spec against the tensor per *token*: the spec page
+        # covers meta.block_size tokens while the tensor page covers
+        # kernel_block_size rows (a legal vLLM split: the framework block only
+        # needs to be a multiple of the kernel's), so byte-per-token is the
+        # comparable unit. A backend that packs rows differently (e.g. leaving
+        # fp8 scales out) is caught here instead of mis-sizing every location.
         itemsize = view.element_size()
-        page_bytes = len(ref_views) * kernel_block_size * per_token_dim * itemsize
-        if meta.page_bytes != page_bytes:
+        spec_per_token = meta.page_bytes // meta.block_size
+        tensor_per_token = len(ref_views) * per_token_dim * itemsize
+        if spec_per_token != tensor_per_token:
             raise NotImplementedError(
                 f"group {meta.group_idx}{meta.spec_suffix}: spec page_bytes="
-                f"{meta.page_bytes} does not match the tensor: {len(ref_views)} "
-                f"view(s) x {kernel_block_size} rows x {per_token_dim} elements "
-                f"x {itemsize} B = {page_bytes} B; the KV cache layout does not "
+                f"{meta.page_bytes} over block_size={meta.block_size} is "
+                f"{spec_per_token} B/token, but the tensor stores "
+                f"{tensor_per_token} B/token ({len(ref_views)} view(s) x "
+                f"{kernel_block_size} rows x {per_token_dim} elements x "
+                f"{itemsize} B per kernel page); the KV cache layout does not "
                 f"match the spec (unsupported backend packing or mixed layouts)"
             )
         # Non-flat block layouts (page_size_padded gaps, or split K/V
