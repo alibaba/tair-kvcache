@@ -44,7 +44,6 @@ from kv_cache_manager.py_connector.vllm.vllm_common import (
     ALL_SPEC_GROUP,
     GroupMeta,
     StateGroupMeta,
-    build_spec_groups,
     spec_name,
 )
 
@@ -139,10 +138,6 @@ class ConnectorScheduler:
     # ------------------------------------------------------------------ #
     # Hybrid state coverage
     # ------------------------------------------------------------------ #
-    def _spec_groups(self) -> List[dict]:
-        """LocationSpecGroups for registration; see vllm_common.build_spec_groups."""
-        return build_spec_groups(self._group_metas, self._tp_size)
-
     def _group_block_size(self, group_idx: int) -> int:
         for meta in self._group_metas:
             if meta.group_idx == group_idx:
