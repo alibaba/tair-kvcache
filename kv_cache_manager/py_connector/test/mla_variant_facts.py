@@ -481,6 +481,8 @@ FROZEN_GROUPS: Dict[str, Dict[str, Any]] = {
         per_block_bytes=33792,  # 132 B/token x 64 x 4 layers
     ),
     "v32_bf16_wrapper": dict(  # bf16 main + uint8 indexer: mixed itemsizes
+        # Same fold fact as the pair row (the indexer registers first, so the
+        # fold keeps m2c2); this row only pins the mixed element sizes.
         block_size=64,
         mbs=64,
         layers=[

@@ -138,6 +138,28 @@ class TestRealVLLMFacts(unittest.TestCase):
         self.assertEqual(spec.unpadded_page_size_bytes, 9216)
         self.assertEqual(spec.page_size_bytes, 9216)
 
+    def test_real_get_kv_cache_spec_is_uint8(self):
+        # M3a, method level: MLAAttention.get_kv_cache_spec derives the spec
+        # dtype *and* cache_dtype_str from the same cache dtype string, so the
+        # engine can never build the bf16/18432 pair 02 section 3.2 probed.
+        # Unbound call with a stand-in self: the method reads only
+        # self.kv_cache_dtype / self.head_size and cache_config.block_size.
+        from types import SimpleNamespace
+
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+
+        self_ = SimpleNamespace(kv_cache_dtype="fp8", head_size=576)
+        cfg = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=16),
+            model_config=SimpleNamespace(dtype="bfloat16"),
+        )
+        spec: Any = MLAAttention.get_kv_cache_spec(self_, cfg)  # ty: ignore[invalid-argument-type]
+        self.assertEqual(spec.dtype, torch.uint8)
+        self.assertEqual(spec.cache_dtype_str, "fp8")
+        self.assertEqual(spec.kv_quant_mode, KVQuantMode.FP8_PER_TENSOR)
+        self.assertEqual(spec.real_page_size_bytes, 9216)
+        self.assertEqual(spec.page_size_bytes, 9216)
+
     def test_real_sliding_window_specs_are_not_full_attention(self):
         # The step-0 refusal in _check_attention_spec_supported exists because
         # SlidingWindowMLASpec is NOT a FullAttentionSpec subclass; if vLLM ever
