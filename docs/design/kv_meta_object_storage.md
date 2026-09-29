@@ -139,7 +139,7 @@ ID 做 key，在 CPU/共享内存中按 byte 容量执行 LRU。EPD 下 cache �
 | tensor 元数据与对象组提交 | 只保存 opaque bytes；单批多 key 也不是原子可见 | RTP receipt/manifest 保存 shape、dtype、role、顺序、size、digest；多批应采用 manifest-last |
 | 抗击穿 | active writer 返回 `WRITE_IN_PROGRESS`，不会发布半成品 | RTP 对同一 semantic key 做有界 singleflight/jitter，超过预算立即重算 |
 | 有界容量和物理回收 | 已实现按真实 bytes 的水位/准入压力近似 LRU、grace 和物理 Delete；KVMeta 对不刷新读热度的直连 Redis metadata fail closed | 运维必须证明 backend Delete/容量真实收敛；应用对超大/低复用对象可 bypass |
-| 准入质量与抗扫描污染 | V1 对任何满足硬配额的 miss 都允许写入，没有频率/收益 admission filter | RTP 对明显一次性或负收益对象 bypass；后续用 size-aware frequency admission 保护热工作集，这属于命中率演进而非正确性前提 |
+| 准入质量与抗扫描污染 | V1 对任何通过 best-effort 容量检查的 miss 都允许写入，没有频率/收益 admission filter | RTP 对明显一次性或负收益对象 bypass；后续用 size-aware frequency admission 保护热工作集，这属于命中率演进而非正确性前提 |
 | 共享读取生命周期 | 只有 persisted retirement fence + 固定 grace，没有 read lease | V1 reader 把回收竞态当 miss；不能 per-reader Remove；V2 才提供 lease/generation |
 | 内容完整性与坏条目修复 | 校验 key/URI/backend/size，不校验 value bytes；控制面 Get 会先刷新热度 | backend checksum 或 RTP manifest digest 是生产门槛；RTP 还需对确定性损坏做有界、单写者 repair |
 | L1/tiering/路由 | 未实现 | 若远端命中延迟或带宽不可接受，RTP 增加 worker-local L1，并按收益决定 warm-key routing |
@@ -269,7 +269,7 @@ tenant/instance，不能用随机 key 或 token 猜测难度代替服务认证�
   KVCache 注册共用同一个 `CacheManager` 控制面临界区：空 group 由第一类成功注册决定类型，之后反向混入会在
   registry mutation 前被拒绝。运行期校验仍会对旁路写 registry 或 split-brain 造成的混合状态 fail closed；
 - 普通 CacheReclaimer、Migration 和 Cache GC 跳过 KVMeta instance；KVMeta 由自己的 Reclaimer 线程处理，二者不
-  共用删除 executor、pending budget 或 group admission lock。KVMeta Reclaimer 只巡检由成功注册或升主恢复确认的
+  共用删除 executor、pending budget 或 group lifecycle shard。KVMeta Reclaimer 只巡检由成功注册或升主恢复确认的
   KVMeta group，不在每个周期枚举/读取普通 KVCache group；
 - KVMeta 使用对象真实字节数维护 group/type quota，不把 marker `block_size=1` 当作对象用量。
 
@@ -296,7 +296,7 @@ CacheManager 的显式恢复完成信号后恢复 KVMeta（`DoRecover` 的返回
 | 资源 | V1 已隔离 | 仍可能共享的部分 | 生产建议 |
 |---|---|---|---|
 | RPC | protobuf service 路由、请求门和 metrics namespace 独立 | listener、gRPC sync worker、进程 CPU/内存 | 在调用方/网关限制 KVMeta 并发；高负载时使用独立进程/cgroup |
-| 锁 | KVMeta group admission shard 只由 KVMeta 获取 | Registry/MetaIndexer 的底层实现 | KVMeta 使用专用 Instance Group 和 metadata namespace |
+| 锁 | KVMeta group lifecycle shard 只由 KVMeta 获取；`PutStart` 共享进入、破坏性状态切换独占进入 | Registry/MetaIndexer 的底层实现 | KVMeta 使用专用 Instance Group 和 metadata namespace |
 | 后台线程 | recovery、session expiry、KVMeta Reclaimer 独立，失败不阻塞主服务放流 | 进程线程数和 CPU quota | 监控 gate、pending bytes/object 和重试 |
 | 容量 | 按真实 bytes 使用专用 group/type quota | backend 的真实总容量 | storage candidate 指向专用 pool/namespace |
 | 数据面 | 使用独立 `KvMetaTransferClient` 策略 | NIC、PCIe、SDK connection、存储设备 | 配置 backend 侧带宽/IOPS 限流；强隔离部署使用独立资源池 |
@@ -512,7 +512,7 @@ Load 返回前 caller buffer 不被后台 I/O 继续访问，但不能阻止另�
 - `Trim(TS_REMOVE_ALL_META)` 只删 metadata，物理数据保留，仅用于明确的修复场景；
 - `TS_TIMESTAMP` 在 V1 中不支持；
 - 存在 active/finalizing session 或 pending automatic reclaim 时，Trim 整体返回 `WRITE_IN_PROGRESS`；
-- Trim 在 group shard 下发布 per-instance fence 后立即释放 shard，长时间 metadata scan 和物理 Delete
+- Trim 在 group lifecycle shard 下发布 per-instance fence 后立即释放 shard，长时间 metadata scan 和物理 Delete
   不阻塞同 group 的其他 instance。同 instance 的新 `PutStart`/`Remove`/重复 Trim 会在 fence 活跃期间
   fail closed，Reclaimer 也不会退休该 group 的新对象；
 - Trim 跨最多 256 对象的物理删除 batch 累计 metadata 副作用。任一早期 batch 已改变 metadata 后，后续的
@@ -529,14 +529,15 @@ sampling/batch/idle 参数，但不把 KVMeta 对象塞进固定 block Reclaimer
 回收有两个触发源：
 
 1. **周期水位压力**：让 group bytes、各 storage type bytes 和聚合 key count 回落到阈值；
-2. **准入需求压力**：`PutStart` 因已有 cache 占用而返回 `NOSPC` 时，记录这个具体请求所需的 group bytes、目标
-   storage type bytes 或目标 instance metadata keys，并立即唤醒 worker。它解决 `used < watermark`、但
-   `used + request > hard capacity` 时单纯 `Wake()` 永远无对象可回收的问题。
+2. **准入需求压力**：`PutStart` 的 best-effort 容量检查因已有 cache 占用而返回 `NOSPC` 时，记录这个具体请求
+   所需的 group bytes、目标 storage type bytes 或目标 instance metadata keys，并立即唤醒 worker。它解决
+   `used < watermark`、但单个快照中的 `used + request > configured capacity` 时单纯 `Wake()` 永远无对象可回收
+   的问题。
 
 Provider 分配失败不是 KVCM 的回收信号。KVCM 不拥有共享 Provider 的完整租户、碎片和介质账本，
 因此 backend `EC_NOSPC` 原样返回，不会为了猜测物理空间而淘汰本 group 的健康 Cache 对象。
 
-对 byte 维度，设硬容量为 `C`、扣除已退休 pending credit 后的有效用量为 `Ueff`、水位为 `T`、被拒请求为 `R`：
+对 byte 维度，设逻辑容量目标为 `C`、扣除已退休 pending credit 后的有效用量为 `Ueff`、水位为 `T`、被拒请求为 `R`：
 
 ```text
 watermark_pressure = max(0, Ueff - floor(C * (T - epsilon)))
@@ -546,8 +547,13 @@ effective_pressure = max(watermark_pressure, admission_pressure)
 
 group 和 storage type 分别计算；metadata key 准入按**目标 instance**的 `used_keys + requested_keys - max_keys`
 计算，不能用 group 聚合值误淘汰另一个 instance。相同 group 的并发需求按每个维度取最大值而不是求和：这足以让
-至少一个请求在重试时进入，同时避免一批相同重试把整个 Cache 淘空。大于 group/type 硬容量，或单批新 key 数
+至少一个请求在重试时进入，同时避免一批相同重试把整个 Cache 淘空。大于 group/type 配置容量目标，或单批新 key 数
 本身大于 instance `max_key_count` 的不可能请求不会发布回收需求，也不会为永远无法成功的请求清空有效 Cache。
+
+这里的 `C` 不是并发写入的强一致 reservation ledger。多个 `PutStart` 不会为容量计数互斥；它们可能读取同一个
+`U` 并同时成功，使实际逻辑用量短暂超过 `C`。这是 Cache 的预期软配额语义，后续周期 Reclaimer 按真实 usage
+收敛，底层 Provider allocator 仍是物理容量的最终裁决者。顺序请求或已经观察到超限的请求仍可返回 `NOSPC`，
+但 KVCM 不承诺并发下零超调。
 
 被拒绝的 `PutStart` 不在 RPC 主链路等待 GC；它返回 `NOSPC`，由调用方在延迟预算内做有界 jitter/backoff 后重试，
 或直接重算并跳过写回。这样 backend 删除、metadata Sync 和采样延迟都不会阻塞推理主链路。
@@ -565,7 +571,7 @@ group 和 storage type 分别计算；metadata key 准入按**目标 instance**�
 3. 选择候选时先满足目标 instance key、storage type 等更具体的压力，再补 group 通用压力；每一类内部仍按
    `last_access_time` 排序。具体维度释放的 bytes 同时抵扣 group 压力，避免先淘汰一个全局最老但无关的对象，随后
    又淘汰真正受限对象的重复回收；
-4. 持有 KVMeta 专用 group shard，以完整旧值 CAS 将 `committed` 改为带远期过渡 marker 的 `retired`，并对每个
+4. 独占 KVMeta 专用 group lifecycle shard，以完整旧值 CAS 将 `committed` 改为带远期过渡 marker 的 `retired`，并对每个
    instance 执行 `Sync`。这是 reader fence：只有本批所有成功转换的 fence 都已持久化后才允许开始计算 grace；从
    各自 CAS 起新的 `Get` 返回 miss，同 key `PutStart` 返回 `WRITE_IN_PROGRESS`；
 5. 在最后一个 reader fence 持久化之后取得统一时间锚点，再以完整 fence 值 CAS 写入有限 grace deadline 并再次
@@ -575,7 +581,7 @@ group 和 storage type 分别计算；metadata key 准入按**目标 instance**�
    `metadata_durable=false` 进入 pending，并在 finalization 前重试该 barrier；
 6. 把对象连同同一个时间锚点放入按 deadline 排序的 pending queue。worker 不会 sleep 等待某个 group 的 grace，
    因此其他 group 可以继续回收；
-7. grace 到期后，再次完成 tombstone persistence barrier，然后在不持有 group quota shard 的情况下调用 backend
+7. grace 到期后，再次完成 tombstone persistence barrier，然后在不持有 group lifecycle shard 的情况下调用 backend
    cleanup。删除策略由 backend side capability 明确给出：NFS 随机路径不会复用，可以在错误/异常后保留 tombstone，
    按 100ms 到 30s 指数退避重试；PACE URI 只有可复用 GA，没有 generation token，每个 pending batch 只允许一次删除调用。
    同一轮包含两类 backend 时，发布前按 retry-safe/at-most-once 分区，再切成最多 256 个对象的独立 pending batch，并为
@@ -583,7 +589,7 @@ group 和 storage type 分别计算；metadata key 准入按**目标 instance**�
    而被降级，PACE 的未知结果也不会导致已经成功的 NFS 被再次删除。
    PACE 返回错误、短结果或抛异常时记录 attempted/uncertain 对象数和字节，关闭 KVMeta 请求门，并停止本轮，避免一次
    provider 故障把更多 live cache 变成 orphan；
-8. 删除成功后重新取得 quota shard，以 tombstone 完整旧值做 compare-and-delete，`Sync` 成功后才释放逻辑 quota
+8. 删除成功后重新独占 lifecycle shard，以 tombstone 完整旧值做 compare-and-delete，`Sync` 成功后才释放逻辑 quota
    和 pending credit。metadata barrier 失败会保留本进程的 `physical_delete_finished` 证据，只重试 metadata；换主后，
    NFS tombstone可再次安全删除，PACE retired tombstone 只做 metadata finalization，绝不重发可能已释放并复用的 GA。
 
@@ -599,7 +605,7 @@ compare-and-delete 已应用的证据时才成立；没有该证据的缺失，�
 异常 owner 仍意味着 metadata/accounting 协议已损坏，必须 fail closed。进程内 pending 上限为
 1024 个 batch、20000 个对象和 4TiB，单个物理 pending batch 最多 256 个对象；每轮选择同时按
 剩余 batch、对象数和 bytes 裁剪，单个候选或完整 key 放不下时跳过并继续寻找可容纳对象，避免同一超限向量永久
-阻塞回收。所有剩余额度仍会在持有 group shard 时再次校验；真正达到上限只暂停新的退休，不影响普通 KVCache
+阻塞回收。所有剩余额度仍会在独占 group lifecycle shard 时再次校验；真正达到上限只暂停新的退休，不影响普通 KVCache
 主链路。
 
 ## 7. 不同 value size 的实现
@@ -699,9 +705,11 @@ revision 做超时/失败 + synchronize 返回 + 立即 Free + 立即复用的�
 
 ### 8.1 并发写入
 
-KVMeta 按 Instance Group 分片加 admission lock，把“读取实际 usage、选择 backend、allocation、metadata
-reservation”串在同一容量准入临界区内，防止不同尺寸并发写超出 group/type quota。该锁只属于 KVMeta 侧路，
-普通 KV cache 不获取。
+KVMeta 不为逻辑容量串行化 `PutStart`。同一 Instance Group 的写入共享进入 lifecycle shard，各自读取当前 usage
+快照并做 best-effort group/type 检查，然后并行执行 backend allocation 和 metadata reservation。不同尺寸的并发
+请求可以同时通过检查并短暂超过配置容量；`used_percentage` 本来就是异步回收水位，而不是提交屏障。破坏性状态
+切换（Remove、Trim、session cleanup 和 Reclaimer retirement/finalization）独占 lifecycle shard，以保留 tombstone、
+physical owner 和 reader fence 的顺序；普通 KV cache 不获取该 shard。
 
 metadata reservation 使用完整旧值条件保护。跨进程 `PutStart` 竞争失败后，会重新读取赢家并验证 exact key、
 状态、backend、URI 和 size：只有相同尺寸的 committed 对象可视为命中；不同尺寸的 committed 对象返回
@@ -718,7 +726,7 @@ client 永久卡在 closing 状态。RTP 仍应设置进程级并发上限，避
 ### 8.2 Remove/新一代写入的 ABA 防护
 
 对 committed 对象，`Remove` 从 exact owner 条件转换为 tombstone、持久化 reader fence、证明物理 absence 到最终
-删除 tombstone 一直持有同一 group admission shard。下一代同 key `PutStart` 只能在整个 Delete 调用返回后进入；
+删除 tombstone 一直独占同一 group lifecycle shard。下一代同 key `PutStart` 只能在整个 Delete 调用返回后进入；
 当 backend 保证“返回即终态（成功已删除，失败已取消且以后不会继续执行）”时，这能阻止旧 Delete 与新 allocation
 重叠。Reclaimer 的路径不同：durable tombstone 与 pending location 已经拒绝同 key successor，物理 exact Delete
 在 shard 外执行，避免慢 backend I/O 阻塞同 group 的其他 key；确认物理 absence 后才重新取得 shard，校验并持久化
@@ -734,9 +742,10 @@ session timeout 和 `PutFinish` finalization 同样计为 in-flight。Trim 不�
 
 ### 8.3 Reclaimer 并发与配额语义
 
-Reclaimer 与 `PutStart`、`PutFinish`、`Remove`、`Trim` 的短 metadata transition 共用 KVMeta 专用 group
-shard，因此重新检查水位、退休 metadata 和建立 pending/Trim marker 之间没有 admission 窗口；
-普通 KVCache 不获取该锁。候选采样和 Trim 长扫描/物理 I/O 都在锁外执行，Reclaimer 进入锁后会
+Reclaimer 与 `PutStart`、`PutFinish`、`Remove`、`Trim` 共用 KVMeta 专用 group lifecycle shard；`PutStart` 共享进入，
+其余破坏性 metadata transition 独占进入。因此重新检查水位、退休 metadata 和建立 pending/Trim marker 之间没有
+破坏 ownership 的窗口，但容量快照不提供并发 reservation，也不阻止多个 writer 临时超过配置目标；
+普通 KVCache 不获取该 shard。候选采样和 Trim 长扫描/物理 I/O 都在 shard 外执行，Reclaimer 独占进入后会
 重新读取实际 usage、检查 Trim marker，并用 exact-value CAS 防止淘汰已变化的对象。
 
 这里的“实际 usage”特指 **KVMeta 逻辑归属用量**：MetaIndexer 对 active、committed、retired record 的
@@ -755,13 +764,13 @@ PACE provider 的 `used_bytes/total_bytes` 是另一张 **后端物理用量** �
 任何场景都不能用逻辑 usage 下降推导 PACE 空间已释放。
 
 退休对象在物理删除前仍计入 MetaIndexer usage；Reclaimer 单独维护 pending credit，只用于判断下一轮还需淘汰多少，
-不会改变 `PutStart` 的硬容量准入。若 metadata finalization 的 Sync 失败且内存记录已经消失，整个专用 group 的新
+不会改变 `PutStart` 的 best-effort 容量准入。若 metadata finalization 的 Sync 失败且内存记录已经消失，整个专用 group 的新
 allocation 会暂时 fail closed，直至 persistence barrier 成功或 leader recovery 接管。
 
 失败准入发布的 demand 是一个异步“需要多少可用空间”的提示，不是预留，也不向原请求授予下一次写入权。需求以
 sequence 防止较旧的 worker snapshot 清除并发产生的新需求；达到目标、请求被证明不可能或 group 被删除后才清理。
-下一次重试仍在同一个 group shard 下重新读取真实 usage 并执行完整准入，因此不存在“GC 已承诺空间但被其他 writer
-超卖”的旁路。pending credit 只防止 Reclaimer 自己重复退休，不能让 `PutStart` 在 metadata 真正删除前提前使用空间。
+下一次重试重新读取 usage 并执行 best-effort 准入；并发 writer 仍可能临时超调，这是明确接受的 Cache 语义。
+pending credit 只防止 Reclaimer 自己重复退休，不能让 `PutStart` 在 metadata 真正删除前把待回收空间视为已释放。
 
 多个压力维度可能重叠。选择器按“目标 instance key -> 聚合 key 与 type 的交集 -> type bytes -> group bytes”处理，
 让一次退休尽量同时解决多个约束。该顺序会在容量正确性要求下偏离纯全局 LRU，但仍在每个候选集合内部选择最老
@@ -773,7 +782,7 @@ sequence 防止较旧的 worker snapshot 清除并发产生的新需求；达到
 
 | 账本 | 来源与口径 | 用途 | 何时核销 |
 |---|---|---|---|
-| KVCM 逻辑用量 | MetaIndexer 中 active、committed、retired tombstone 的 `size`；按 instance group 和 storage type 聚合 | 租户/group 硬配额、LRU 水位、`PutStart` 准入 | NFS 物理终态 + metadata `Sync`；PACE 一次 Delete 尝试 + metadata `Sync`，未知物理结果另计 orphan |
+| KVCM 逻辑用量 | MetaIndexer 中 active、committed、retired tombstone 的 `size`；按 instance group 和 storage type 聚合 | group 软容量目标、LRU 水位、`PutStart` best-effort 准入 | NFS 物理终态 + metadata `Sync`；PACE 一次 Delete 尝试 + metadata `Sync`，未知物理结果另计 orphan |
 | Provider 已物化用量 | DRAM segment allocator 的实际 used bytes；SSD backend/segment 的物理 footprint | Provider 选址、介质硬水位和最终 OOM 防线 | 对应 allocator/backend 确认释放以后 |
 
 KVCM 不修改 TairMempool 的容量统计，也不把 EMB 逻辑账注入 Provider 主链路。PACE 的 `used_bytes/total_bytes`
@@ -807,8 +816,8 @@ DRAM/SSD used。逻辑用量下降而物理用量不下降说明 backend GC/orph
 结果明确时才返回原始 `NOSPC`；结果不确定则返回 `OUTCOME_UNKNOWN` 并关闭 KVMeta 准入。PACE 的未知补偿可能留下
 由 Provider 物理账观察到、但不再由 metadata 引用的 orphan。
 
-容量规划不能只令 `capacity >= 平均对象大小`。建议同时满足：单个允许请求不大于 group 和至少一个候选 type 的硬
-容量；watermark 以下的空闲 headroom 覆盖常见请求以避免首请求 `NOSPC + retry`；sampling/batch 足以在重试预算内
+容量规划不能只令 `capacity >= 平均对象大小`。建议同时满足：单个允许请求不大于 group 和至少一个候选 type 的配置
+容量目标；watermark 以下的空闲 headroom 覆盖常见请求以避免首请求 `NOSPC + retry`；sampling/batch 足以在重试预算内
 释放尾部大对象；instance `max_key_count` 覆盖业务工作集。按需回收保证最终可进展，不承诺第一次写入的低延迟。
 
 ## 9. 超时、失败与 failover

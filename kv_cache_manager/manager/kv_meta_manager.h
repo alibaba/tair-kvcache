@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -216,12 +217,13 @@ private:
     // set and keep periodic maintenance entirely on the side path.
     mutable std::mutex kv_meta_groups_mutex_;
     std::unordered_set<std::string> kv_meta_groups_;
-    // Serializes exact-byte admission and short metadata transitions within a
-    // KVMeta group. Long Trim scans publish a per-instance marker under this
-    // shard and then release it, so unrelated instances never wait behind
-    // unbounded scan or storage I/O. The existing cache path never takes
-    // these side-path-only locks.
-    mutable std::array<std::mutex, 64> quota_admission_mutexes_;
+    // Coordinates destructive metadata transitions within a KVMeta group.
+    // PutStart takes the shared side, so independent writers are never
+    // serialized by logical-capacity accounting and may temporarily exceed a
+    // configured reclaim target. Remove/Trim/session cleanup/Reclaimer take
+    // the exclusive side to preserve tombstone and physical-owner ordering.
+    // The ordinary fixed-block cache path never enters this side-path gate.
+    mutable std::array<std::shared_mutex, 64> group_lifecycle_mutexes_;
     // Each set is accessed only while holding the matching shard above.
     std::array<std::unordered_set<std::string>, 64> trimming_instances_;
     std::atomic<bool> maintenance_cancelled_{false};
