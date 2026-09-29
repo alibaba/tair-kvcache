@@ -28,6 +28,7 @@ from kv_cache_manager.py_connector.vllm.connector_scheduler import RequestLedger
 from kv_cache_manager.py_connector.vllm.vllm_common import (
     AttentionGroupMeta,
     StateGroupMeta,
+    build_spec_groups,
     parse_groups,
 )
 from kv_cache_manager.py_connector.vllm.metadata import (
@@ -316,15 +317,20 @@ class TestSpecGroups(unittest.TestCase):
     express per-block state sparsity -- and must stay silent for models that
     have no sparsity (byte-identical requests, old-manager compatible).
 
+    Registration is worker-only (the scheduler's config is a folded view), so
+    the builder is exercised directly instead of through the scheduler role.
     """
 
     def test_full_attention_declares_no_groups(self):
         conn = make_connector_scheduler(num_groups=1, tp_size=2)
-        self.assertEqual(conn._spec_groups(), [])
+        self.assertEqual(build_spec_groups(conn._group_metas, conn._tp_size), [])
 
     def test_hybrid_declares_attn_and_full(self):
         conn = make_connector_scheduler(num_groups=1, num_state_groups=2, tp_size=2)
-        groups = {g["name"]: g["spec_names"] for g in conn._spec_groups()}
+        groups = {
+            g["name"]: g["spec_names"]
+            for g in build_spec_groups(conn._group_metas, conn._tp_size)
+        }
         self.assertEqual(sorted(groups), ["attn", "full"])
         # attn: the attention spec of every rank; full: every group of every rank.
         self.assertEqual(groups["attn"], ["tp0_g0", "tp1_g0"])
