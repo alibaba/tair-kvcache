@@ -362,11 +362,13 @@ class TestBuildTransferGroup(unittest.TestCase):
         self.assertEqual(g.dtype, "uint8")
 
     def test_mla_padded_fp8_ds_packed_pages(self):
-        # V4 fp8_ds_mla (584 B/row): real 37376, the 64-byte alignment tail
-        # lives at the end of the page, so the stride must skip it and the
-        # spec page must stay the compact size.
+        # V4 fp8_ds_mla (584 B/row): the compact page is 37376 bytes with the
+        # 64-byte alignment tail at its end, so the stride must skip it and
+        # the spec page must stay the compact size. The bucket's block is the
+        # storage block (compression stores `storage_block_size` rows per
+        # framework block; the c > 1 sizing comes with the V4 work).
         kv = {"l0": FakeTensor([10, 64, 584], [37440, 584, 1], itemsize=1)}
-        g, _ = self._build(kv, block_size=256, page_bytes=37376)
+        g, _ = self._build(kv, block_size=64, page_bytes=37376)
         self.assertEqual(g.kernel_block_size, 64)
         self.assertEqual(g.per_token_dim, 584)
         self.assertEqual(g.block_stride, 37440)
@@ -375,14 +377,14 @@ class TestBuildTransferGroup(unittest.TestCase):
     def test_mla_fp8_ds_c128_pages(self):
         # V4 c128a: two storage rows per page, 560 bytes of pad after them.
         kv = {"l0": FakeTensor([10, 2, 584], [1728, 584, 1], itemsize=1)}
-        g, _ = self._build(kv, block_size=256, page_bytes=1168)
+        g, _ = self._build(kv, block_size=2, page_bytes=1168)
         self.assertEqual(g.kernel_block_size, 2)
         self.assertEqual(g.block_stride, 1728)
 
     def test_mla_indexer_padded_pages(self):
         # V4 indexer: 132 B/row, page padded 8448 -> 8640.
         kv = {"l0": FakeTensor([10, 64, 132], [8640, 132, 1], itemsize=1)}
-        g, _ = self._build(kv, block_size=256, page_bytes=8448)
+        g, _ = self._build(kv, block_size=64, page_bytes=8448)
         self.assertEqual(g.kernel_block_size, 64)
         self.assertEqual(g.per_token_dim, 132)
         self.assertEqual(g.block_stride, 8640)
@@ -415,24 +417,39 @@ class TestBuildTransferGroup(unittest.TestCase):
 
     def test_spec_page_bytes_must_match_the_tensor(self):
         # The gate reads the spec; the tensors are the backend's truth. A
-        # mismatch (here: an X1-style 167936-byte spec against a 18432-byte
-        # bf16 page) must fail at register_kv_caches, not silently mis-size
-        # every location.
+        # mismatch (here: a spec claiming 10496 B/token against the bf16
+        # tensor's 1152 B/token) must fail at register_kv_caches, not
+        # silently mis-size every location.
         kv = {"l0": mla_3d()}
         with self.assertRaises(NotImplementedError) as ctx:
             self._build(kv, page_bytes=167936)
-        self.assertIn("167936", str(ctx.exception))
-        self.assertIn("18432", str(ctx.exception))
+        self.assertIn("10496", str(ctx.exception))
+        self.assertIn("1152", str(ctx.exception))
 
     def test_backend_without_packed_scales_rejected(self):
         # A backend that stores the fp8 rows *without* the in-row scale
-        # (512 B instead of the spec's 584) is a different layout than the
-        # spec declares; refuse instead of transferring misaligned bytes.
-        kv = {"l0": FakeTensor([10, 16, 512], [8192, 512, 1], itemsize=1)}
+        # (512 B instead of the V3.2 main row's 656 B) is a different layout
+        # than the spec declares; refuse instead of transferring misaligned
+        # bytes.
+        kv = {"l0": FakeTensor.contiguous([10, 64, 512], itemsize=1)}
         with self.assertRaises(NotImplementedError) as ctx:
-            self._build(kv, page_bytes=9344)
-        self.assertIn("9344", str(ctx.exception))
-        self.assertIn("8192", str(ctx.exception))
+            self._build(kv, block_size=64, page_bytes=41984)
+        self.assertIn("656", str(ctx.exception))
+        self.assertIn("512", str(ctx.exception))
+
+    def test_kernel_block_below_the_spec_block_is_legal(self):
+        # `--block-size 128` with a backend whose kernel page is 64 tokens is
+        # a legal vLLM configuration (the framework block only has to be a
+        # multiple of the kernel's), so the cross-check must compare per-token
+        # bytes: the spec page spans two kernel pages here.
+        kv = {"l0": FakeTensor.contiguous([10, 64, 576])}
+        g, _ = self._build(kv, block_size=128, page_bytes=147456, mbs=128)
+        self.assertEqual(g.kernel_block_size, 64)
+        self.assertEqual(g.block_size, 128)
+        self.assertEqual(g.per_token_dim, 576)
+        self.assertEqual(g.block_stride, 0)
+        self.assertEqual(g.num_kv_ptrs, 1)
+        self.assertEqual(g.per_block_bytes, 1152 * 128)
 
     def test_split_kv_page_counted_twice(self):
         # Regression: the cross-check must count *both* views of a split K/V
@@ -447,7 +464,13 @@ class TestBuildTransferGroup(unittest.TestCase):
         # block of rows, the bucket's per-token dim and element size.
         for kv, block_size, page_bytes, mbs, itemsize in [
             ({"l0": mla_3d()}, 16, 18432, 16, 2),
-            ({"l0": FakeTensor.contiguous([10, 64, 656], itemsize=1)}, 64, 41984, 64, 1),
+            (
+                {"l0": FakeTensor.contiguous([10, 64, 656], itemsize=1)},
+                64,
+                41984,
+                64,
+                1,
+            ),
             (
                 {"l0": FakeTensor.contiguous([10, 64, 132], itemsize=1)},
                 64,
