@@ -588,7 +588,7 @@ public:
 
     struct Session {
         std::string internal_instance_id;
-        std::size_t quota_shard = 0;
+        std::size_t lifecycle_shard = 0;
         Clock::time_point commit_deadline;
         std::vector<KvMetaManager::SessionItem> items;
     };
@@ -665,14 +665,14 @@ public:
 
     PutResult Put(const std::string &session_id,
                   const std::string &internal_instance_id,
-                  std::size_t quota_shard,
+                  std::size_t lifecycle_shard,
                   std::vector<KvMetaManager::SessionItem> items,
                   Clock::time_point commit_deadline) {
         auto entry = std::make_shared<Entry>();
         entry->session_id = session_id;
         entry->deadline = commit_deadline;
         entry->session.internal_instance_id = internal_instance_id;
-        entry->session.quota_shard = quota_shard;
+        entry->session.lifecycle_shard = lifecycle_shard;
         entry->session.commit_deadline = commit_deadline;
         entry->session.items = std::move(items);
         {
@@ -857,8 +857,8 @@ private:
         if (owner_->maintenance_cancelled_.load(std::memory_order_acquire)) {
             return;
         }
-        if (session.quota_shard >= owner_->quota_admission_mutexes_.size()) {
-            KVCM_LOG_ERROR("KVMeta write-session cleanup has an invalid quota shard; recovery is required");
+        if (session.lifecycle_shard >= owner_->group_lifecycle_mutexes_.size()) {
+            KVCM_LOG_ERROR("KVMeta write-session cleanup has an invalid lifecycle shard; recovery is required");
             owner_->CancelMaintenance();
             return;
         }
@@ -866,7 +866,8 @@ private:
         // StartWrite admission. Otherwise timeout cleanup can erase metadata,
         // expose the key as missing, and still be deleting the old allocation
         // while a new generation is admitted for the same group.
-        std::unique_lock<std::mutex> quota_lock(owner_->quota_admission_mutexes_[session.quota_shard]);
+        std::unique_lock<std::shared_mutex> lifecycle_lock(
+            owner_->group_lifecycle_mutexes_[session.lifecycle_shard]);
         if (owner_->maintenance_cancelled_.load(std::memory_order_acquire)) {
             return;
         }
@@ -1245,7 +1246,7 @@ private:
 
     struct PendingBatch {
         std::string instance_group;
-        std::size_t quota_shard = 0;
+        std::size_t lifecycle_shard = 0;
         std::chrono::steady_clock::time_point deadline;
         std::uint64_t sequence = 0;
         std::vector<RetiredItem> items;
@@ -2117,7 +2118,7 @@ private:
     }
 
     void AddPendingBatch(const std::string &instance_group,
-                         std::size_t quota_shard,
+                         std::size_t lifecycle_shard,
                          std::chrono::steady_clock::time_point deadline,
                          std::vector<RetiredItem> items) {
         if (items.empty()) {
@@ -2125,7 +2126,7 @@ private:
         }
         auto batch = std::make_shared<PendingBatch>();
         batch->instance_group = instance_group;
-        batch->quota_shard = quota_shard;
+        batch->lifecycle_shard = lifecycle_shard;
         batch->deadline = deadline;
         batch->items = std::move(items);
         std::optional<bool> batch_retry_safe;
@@ -2432,8 +2433,8 @@ private:
             CompletePending(batch);
             return;
         }
-        if (batch->quota_shard >= owner_->quota_admission_mutexes_.size()) {
-            KVCM_LOG_ERROR("KVMeta reclaimer pending batch has an invalid quota shard");
+        if (batch->lifecycle_shard >= owner_->group_lifecycle_mutexes_.size()) {
+            KVCM_LOG_ERROR("KVMeta reclaimer pending batch has an invalid lifecycle shard");
             // This batch already owns durable retired metadata. Dropping its
             // only finalizer while continuing admission would strand that
             // ownership transition outside both the pending indexes and the
@@ -2452,7 +2453,8 @@ private:
             all_items.push_back(batch->items[i].item);
         }
 
-        std::unique_lock<std::mutex> quota_lock(owner_->quota_admission_mutexes_[batch->quota_shard]);
+        std::unique_lock<std::shared_mutex> lifecycle_lock(
+            owner_->group_lifecycle_mutexes_[batch->lifecycle_shard]);
         if (ShouldStop()) {
             CompletePending(batch);
             return;
@@ -2467,7 +2469,7 @@ private:
         }
         if (!EnsureRetiredMetadataDurable(batch)) {
             ++retry_count_metrics_;
-            quota_lock.unlock();
+            lifecycle_lock.unlock();
             if (ShouldStop()) {
                 CompletePending(batch);
             } else {
@@ -2491,7 +2493,7 @@ private:
             // index already fences this exact key, and its bytes remain in
             // authoritative usage accounting. Reacquire the shard only for
             // the final exact metadata transition.
-            quota_lock.unlock();
+            lifecycle_lock.unlock();
             physical_delete_attempted_object_count_metrics_ += batch->items.size();
             ErrorCode physical_ec = EC_IO_ERROR;
             const char *failure_kind = "error_code";
@@ -2535,7 +2537,7 @@ private:
             } else {
                 batch->physical_delete_finished = true;
             }
-            quota_lock.lock();
+            lifecycle_lock.lock();
             if (ShouldStop()) {
                 CompletePending(batch);
                 return;
@@ -2579,7 +2581,7 @@ private:
                                    "[%s] after physical cleanup",
                                    internal_instance_id.c_str());
                     FailClosedMaintenance();
-                    quota_lock.unlock();
+                    lifecycle_lock.unlock();
                     CompletePending(batch);
                     return;
                 }
@@ -2595,7 +2597,7 @@ private:
                     // admission for this KVMeta group before releasing the
                     // shard; existing sessions may still finish safely.
                     BlockAdmission(batch);
-                    quota_lock.unlock();
+                    lifecycle_lock.unlock();
                     if (ShouldStop()) {
                         CompletePending(batch);
                     } else {
@@ -2672,15 +2674,16 @@ private:
             return false;
         }
         const auto delay = std::chrono::milliseconds(strategy->delay_before_delete_ms());
-        const std::size_t quota_shard =
-            std::hash<std::string>{}(group->name()) % owner_->quota_admission_mutexes_.size();
+        const std::size_t lifecycle_shard =
+            std::hash<std::string>{}(group->name()) % owner_->group_lifecycle_mutexes_.size();
         std::vector<RetiredItem> retired;
         {
-            std::unique_lock<std::mutex> quota_lock(owner_->quota_admission_mutexes_[quota_shard]);
+            std::unique_lock<std::shared_mutex> lifecycle_lock(
+                owner_->group_lifecycle_mutexes_[lifecycle_shard]);
             if (ShouldStop()) {
                 return false;
             }
-            const auto &trimming = owner_->trimming_instances_[quota_shard];
+            const auto &trimming = owner_->trimming_instances_[lifecycle_shard];
             if (std::any_of(instances.begin(), instances.end(), [&](const auto &instance) {
                     return instance && trimming.count(instance->instance_id()) != 0;
                 })) {
@@ -2783,7 +2786,8 @@ private:
                             for (std::size_t index = begin; index < begin + count; ++index) {
                                 batch_items.push_back(std::move(items[index]));
                             }
-                            AddPendingBatch(group->name(), quota_shard, finalization_deadline, std::move(batch_items));
+                            AddPendingBatch(
+                                group->name(), lifecycle_shard, finalization_deadline, std::move(batch_items));
                         }
                     };
                     // Publish reusable addresses first. If their one allowed
@@ -4009,15 +4013,17 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         return {instance_ec != EC_OK ? instance_ec : EC_INSTANCE_NOT_EXIST, std::move(response)};
     }
 
-    // The existing selector admits based on current usage because KV-cache
-    // blocks have a fixed registered size. KVMeta additionally holds a
-    // side-path-only shard lock and checks used + this request's exact bytes,
-    // so differently sized values cannot overshoot group/type quota through
-    // concurrent PutStart calls.
-    const std::size_t quota_shard =
-        std::hash<std::string>{}(instance_info->instance_group_name()) % quota_admission_mutexes_.size();
-    std::unique_lock<std::mutex> quota_lock(quota_admission_mutexes_[quota_shard]);
-    if (trimming_instances_[quota_shard].count(internal_instance_id) != 0) {
+    // Logical capacity is a soft cache-admission target, not a serialized
+    // allocation ledger. Independent PutStart calls share this lifecycle
+    // gate, read best-effort usage snapshots, and may temporarily overshoot a
+    // group/type target. The Reclaimer converges that excess asynchronously;
+    // the provider remains the final authority for physical capacity. The
+    // shared gate only keeps destructive lifecycle transitions ordered with
+    // an in-flight metadata reservation.
+    const std::size_t lifecycle_shard =
+        std::hash<std::string>{}(instance_info->instance_group_name()) % group_lifecycle_mutexes_.size();
+    std::shared_lock<std::shared_mutex> lifecycle_lock(group_lifecycle_mutexes_[lifecycle_shard]);
+    if (trimming_instances_[lifecycle_shard].count(internal_instance_id) != 0) {
         AddError(request_context, "KVMeta instance is being trimmed");
         return {EC_EXIST, StartWriteResult{}};
     }
@@ -4775,7 +4781,11 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             session_result =
                 write_session_manager_
                     ? write_session_manager_->Put(
-                          session_id, internal_instance_id, quota_shard, std::move(items_for_attempt), write_deadline)
+                          session_id,
+                          internal_instance_id,
+                          lifecycle_shard,
+                          std::move(items_for_attempt),
+                          write_deadline)
                     : KvMetaWriteSessionManager::PutResult::kStopped;
         }
     } catch (const std::exception &) {
@@ -5061,9 +5071,9 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
         CancelMaintenance();
         return EC_OUTCOME_UNKNOWN;
     }
-    if (session.quota_shard >= quota_admission_mutexes_.size()) {
+    if (session.lifecycle_shard >= group_lifecycle_mutexes_.size()) {
         AddError(request_context,
-                 "KVMeta write session has an invalid quota shard; admission is fail-closed until recovery");
+                 "KVMeta write session has an invalid lifecycle shard; admission is fail-closed until recovery");
         CancelMaintenance();
         return EC_OUTCOME_UNKNOWN;
     }
@@ -5071,7 +5081,7 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
     // section as allocation, Remove and Trim. In particular, rollback must
     // finish deleting the old physical object before a new generation can be
     // allocated for the key.
-    std::unique_lock<std::mutex> quota_lock(quota_admission_mutexes_[session.quota_shard]);
+    std::unique_lock<std::shared_mutex> lifecycle_lock(group_lifecycle_mutexes_[session.lifecycle_shard]);
     // Take removes the session before waiting for the group shard. Another
     // KVMeta operation in the same group can hold that shard across backend
     // I/O, so the lease may expire while this finalizer is queued. Recheck
@@ -5166,15 +5176,15 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
     // A backend that quickly reuses allocation URIs would then expose an ABA
     // window in which the old Remove can delete the new generation's object.
     // Regular fixed-block KV-cache operations never take these shard locks.
-    const std::size_t quota_shard =
-        std::hash<std::string>{}(instance_info->instance_group_name()) % quota_admission_mutexes_.size();
-    std::unique_lock<std::mutex> quota_lock(quota_admission_mutexes_[quota_shard]);
+    const std::size_t lifecycle_shard =
+        std::hash<std::string>{}(instance_info->instance_group_name()) % group_lifecycle_mutexes_.size();
+    std::unique_lock<std::shared_mutex> lifecycle_lock(group_lifecycle_mutexes_[lifecycle_shard]);
     if (maintenance_cancelled_.load(std::memory_order_acquire)) {
         return EC_SERVICE_NOT_LEADER;
     }
 
     const std::string internal_instance_id = InternalInstanceId(instance_id);
-    if (trimming_instances_[quota_shard].count(internal_instance_id) != 0) {
+    if (trimming_instances_[lifecycle_shard].count(internal_instance_id) != 0) {
         AddError(request_context, "KVMeta instance is being trimmed");
         return EC_EXIST;
     }
@@ -5288,9 +5298,9 @@ ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::str
     // Remove and reclaim retirement. The fence closes the check-to-lock race,
     // while releasing the shard below prevents an unbounded metadata scan or
     // slow physical delete from stalling unrelated instances in this group.
-    const std::size_t quota_shard =
-        std::hash<std::string>{}(instance_info->instance_group_name()) % quota_admission_mutexes_.size();
-    std::unique_lock<std::mutex> quota_lock(quota_admission_mutexes_[quota_shard]);
+    const std::size_t lifecycle_shard =
+        std::hash<std::string>{}(instance_info->instance_group_name()) % group_lifecycle_mutexes_.size();
+    std::unique_lock<std::shared_mutex> lifecycle_lock(group_lifecycle_mutexes_[lifecycle_shard]);
     if (maintenance_cancelled_.load(std::memory_order_acquire)) {
         return EC_SERVICE_NOT_LEADER;
     }
@@ -5309,7 +5319,7 @@ ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::str
         return EC_EXIST;
     }
     try {
-        if (!trimming_instances_[quota_shard].insert(internal_instance_id).second) {
+        if (!trimming_instances_[lifecycle_shard].insert(internal_instance_id).second) {
             AddError(request_context, "KVMeta instance is already being trimmed");
             return EC_EXIST;
         }
@@ -5319,7 +5329,7 @@ ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::str
     }
 
     struct TrimMarkerGuard {
-        std::mutex *mutex = nullptr;
+        std::shared_mutex *mutex = nullptr;
         std::unordered_set<std::string> *instances = nullptr;
         const std::string *instance_id = nullptr;
 
@@ -5327,11 +5337,13 @@ ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::str
             if (!mutex || !instances || !instance_id) {
                 return;
             }
-            std::lock_guard<std::mutex> lock(*mutex);
+            std::lock_guard<std::shared_mutex> lock(*mutex);
             instances->erase(*instance_id);
         }
-    } trim_marker{&quota_admission_mutexes_[quota_shard], &trimming_instances_[quota_shard], &internal_instance_id};
-    quota_lock.unlock();
+    } trim_marker{&group_lifecycle_mutexes_[lifecycle_shard],
+                  &trimming_instances_[lifecycle_shard],
+                  &internal_instance_id};
+    lifecycle_lock.unlock();
 
     bool trim_metadata_changed = false;
     bool trim_delete_in_progress = false;

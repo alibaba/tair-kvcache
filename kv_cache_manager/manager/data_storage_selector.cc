@@ -388,8 +388,8 @@ DataStorageSelector::SelectCacheWriteDataStorageBackendForReclaim(RequestContext
         return result;
     }
     if (group->quota().capacity() < 0 || required_bytes > static_cast<std::uint64_t>(group->quota().capacity())) {
-        // No amount of eviction can make this request fit the hard group
-        // capacity. Do not pick a target that would cause a futile cache wipe.
+        // No amount of eviction can make this single request fit the configured
+        // group capacity target. Do not trigger a futile cache wipe.
         result.ec = ErrorCode::EC_NOSPC;
         return result;
     }
@@ -420,9 +420,9 @@ DataStorageSelector::SelectCacheWriteDataStorageBackendForReclaim(RequestContext
     }
 
     // Start with the same default type support as normal selection, then
-    // remove types whose hard quota can never contain this request. Current
-    // usage is intentionally ignored: that is precisely what reclaim will
-    // reduce.
+    // remove types whose configured capacity target cannot contain even this
+    // single request. Current usage is intentionally ignored: that is
+    // precisely what reclaim will reduce.
     StorageQuotaAvail reclaimable_types;
     for (const auto &storage_quota : group->quota().quota_config()) {
         if (storage_quota.capacity() < 0 || required_bytes > static_cast<std::uint64_t>(storage_quota.capacity())) {

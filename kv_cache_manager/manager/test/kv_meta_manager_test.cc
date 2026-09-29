@@ -581,6 +581,39 @@ private:
     std::atomic<std::size_t> delete_attempts_{0};
 };
 
+class ConcurrentCreateNfsBackend : public NfsBackend {
+public:
+    explicit ConcurrentCreateNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
+        : NfsBackend(std::move(metrics_registry)) {}
+
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const std::string &trace_id,
+                                                             std::function<void()> cb) override {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            ++entered_;
+            condition_.notify_all();
+            const bool overlapped = condition_.wait_for(
+                lock, std::chrono::seconds(5), [this]() { return entered_ >= kExpectedConcurrentCreates; });
+            overlap_observed_ = overlap_observed_ || overlapped;
+        }
+        return NfsBackend::Create(keys, size_per_key, trace_id, std::move(cb));
+    }
+
+    bool OverlapObserved() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return overlap_observed_;
+    }
+
+private:
+    static constexpr std::size_t kExpectedConcurrentCreates = 2;
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    std::size_t entered_{0};
+    bool overlap_observed_{false};
+};
+
 class HookedReusedSingletonTairMempoolBackend : public DuplicateSingletonCreateTairMempoolBackend {
 public:
     explicit HookedReusedSingletonTairMempoolBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
@@ -3605,13 +3638,13 @@ TEST_F(KvMetaManagerTest, FinishRechecksLeaseAfterWaitingForTheGroupShard) {
     auto [instance_ec, instance_info] = manager_->GetValidatedInstanceInfo(&request_context_, kInstanceId);
     ASSERT_EQ(EC_OK, instance_ec);
     ASSERT_TRUE(instance_info);
-    const std::size_t quota_shard =
-        std::hash<std::string>{}(instance_info->instance_group_name()) % manager_->quota_admission_mutexes_.size();
+    const std::size_t lifecycle_shard = std::hash<std::string>{}(instance_info->instance_group_name()) %
+                                        manager_->group_lifecycle_mutexes_.size();
 
     std::promise<void> shard_locked;
     auto release_shard = shard_locked.get_future();
     std::thread blocker([&]() {
-        std::unique_lock<std::mutex> lock(manager_->quota_admission_mutexes_[quota_shard]);
+        std::unique_lock<std::shared_mutex> lock(manager_->group_lifecycle_mutexes_[lifecycle_shard]);
         shard_locked.set_value();
         std::this_thread::sleep_for(std::chrono::milliseconds(1200));
     });
@@ -4154,7 +4187,7 @@ TEST_F(KvMetaManagerTest, SessionPublicationRaceDurablyRollsBackBeforeReturningN
     manager_ = std::make_unique<KvMetaManager>(cache_manager_, registry_manager_, limits);
     ASSERT_TRUE(manager_->Init());
 
-    const auto shard_count = manager_->quota_admission_mutexes_.size();
+    const auto shard_count = manager_->group_lifecycle_mutexes_.size();
     const auto default_shard = std::hash<std::string>{}("default") % shard_count;
     std::string peer_group;
     for (std::size_t i = 0; i < shard_count * 2 && peer_group.empty(); ++i) {
@@ -4182,7 +4215,7 @@ TEST_F(KvMetaManagerTest, SessionPublicationRaceDurablyRollsBackBeforeReturningN
     ASSERT_TRUE(sync_blocked);
 
     // The first request passed Availability() and persisted its reservation,
-    // but has not published a session. A different quota shard can fill the
+    // but has not published a session. A different lifecycle shard can fill the
     // one-entry global session table in that interval.
     auto [peer_ec, peer] = manager_->StartWrite(&request_context_, kPeerInstance, {"session-table-owner"}, {13}, 30);
     controlled_sync->ReleaseBlockedSync();
@@ -4212,7 +4245,7 @@ TEST_F(KvMetaManagerTest, SessionPublicationRollbackFailureFailsKvMetaClosed) {
     manager_ = std::make_unique<KvMetaManager>(cache_manager_, registry_manager_, limits);
     ASSERT_TRUE(manager_->Init());
 
-    const auto shard_count = manager_->quota_admission_mutexes_.size();
+    const auto shard_count = manager_->group_lifecycle_mutexes_.size();
     const auto default_shard = std::hash<std::string>{}("default") % shard_count;
     std::string peer_group;
     for (std::size_t i = 0; i < shard_count * 2 && peer_group.empty(); ++i) {
@@ -4274,7 +4307,7 @@ TEST_F(KvMetaManagerTest, SessionPublicationPhysicalCleanupFailureFailsKvMetaClo
     manager_ = std::make_unique<KvMetaManager>(cache_manager_, registry_manager_, limits);
     ASSERT_TRUE(manager_->Init());
 
-    const auto shard_count = manager_->quota_admission_mutexes_.size();
+    const auto shard_count = manager_->group_lifecycle_mutexes_.size();
     const auto default_shard = std::hash<std::string>{}("default") % shard_count;
     std::string peer_group;
     for (std::size_t i = 0; i < shard_count * 2 && peer_group.empty(); ++i) {
@@ -4301,7 +4334,7 @@ TEST_F(KvMetaManagerTest, SessionPublicationPhysicalCleanupFailureFailsKvMetaClo
     }
     ASSERT_TRUE(sync_blocked);
 
-    // Fill the one-entry session table from another quota shard after the
+    // Fill the one-entry session table from another lifecycle shard after the
     // raced request has allocated and persisted its reservation. Replace only
     // the physical backend before releasing that barrier, so the compensating
     // metadata delete succeeds but its one-shot allocation release does not.
@@ -4550,19 +4583,21 @@ TEST_F(KvMetaManagerTest, ExactValueSizesAreIncludedInByteAdmission) {
     EXPECT_TRUE(full.locations.empty());
 }
 
-TEST_F(KvMetaManagerTest, ConcurrentStartsCannotOvershootExactByteQuota) {
-    const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
-    ASSERT_EQ(EC_OK, group_ec);
-    ASSERT_TRUE(default_group);
-    InstanceGroup object_group(*default_group);
-    object_group.set_name("concurrent-object-group");
-    object_group.set_global_quota_group_name("concurrent-object-quota");
-    object_group.set_version(1);
-    object_group.set_quota(InstanceGroupQuota(20, {QuotaConfig(20, DataStorageType::DATA_STORAGE_TYPE_NFS)}));
-    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, object_group));
-    ASSERT_EQ(EC_OK,
-              manager_->RegisterInstance(&request_context_, "concurrent-object-group", "concurrent-object-instance", "")
-                  .first);
+TEST_F(KvMetaManagerTest, ConcurrentStartsMayTemporarilyOvershootTheSoftByteTarget) {
+    constexpr const char *kGroup = "concurrent-object-group";
+    constexpr const char *kInstance = "concurrent-object-instance";
+    CreateReclaimGroup(kGroup, kInstance, 20, 0.8, 0);
+
+    auto storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(storage_manager);
+    auto original = storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original);
+    auto concurrent = std::make_shared<ConcurrentCreateNfsBackend>(metrics_registry_);
+    ASSERT_EQ(EC_OK, concurrent->Open(original->GetStorageConfig(), request_context_.trace_id()));
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = concurrent;
+    }
 
     std::atomic<int> ready{0};
     std::atomic<bool> start{false};
@@ -4576,8 +4611,7 @@ TEST_F(KvMetaManagerTest, ConcurrentStartsCannotOvershootExactByteQuota) {
             while (!start.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             }
-            auto [ec, result] =
-                manager_->StartWrite(&context, "concurrent-object-instance", {"key-" + std::to_string(i)}, {15}, 30);
+            auto [ec, result] = manager_->StartWrite(&context, kInstance, {"key-" + std::to_string(i)}, {15}, 30);
             errors[i] = ec;
             results[i] = std::move(result);
         });
@@ -4590,30 +4624,41 @@ TEST_F(KvMetaManagerTest, ConcurrentStartsCannotOvershootExactByteQuota) {
         worker.join();
     }
 
-    const std::size_t success_count = static_cast<std::size_t>(std::count(errors.begin(), errors.end(), EC_OK));
-    const std::size_t quota_failure_count =
-        static_cast<std::size_t>(std::count(errors.begin(), errors.end(), EC_NOSPC));
-    EXPECT_EQ(1, success_count);
-    EXPECT_EQ(1, quota_failure_count);
+    EXPECT_TRUE(concurrent->OverlapObserved());
+    EXPECT_EQ(2, std::count(errors.begin(), errors.end(), EC_OK));
 
     auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(
-        KvMetaManager::InternalInstanceId("concurrent-object-instance"));
+        KvMetaManager::InternalInstanceId(kInstance));
     ASSERT_TRUE(indexer);
-    EXPECT_EQ(15, indexer->GetStorageUsage());
+    // Capacity is a best-effort cache target. Both requests observed the same
+    // pre-write usage and were allowed to reserve their exact bytes.
+    EXPECT_EQ(30, indexer->GetStorageUsage());
     for (std::size_t i = 0; i < errors.size(); ++i) {
-        if (errors[i] == EC_OK) {
-            ASSERT_EQ((std::vector<bool>{false}), results[i].key_mask);
-            ASSERT_EQ(1, results[i].locations.size());
-            EXPECT_EQ(15, results[i].locations.front().value_size);
-            ASSERT_EQ(EC_OK,
-                      manager_->FinishWrite(
-                          &request_context_, "concurrent-object-instance", results[i].write_session_id, {false}));
-        } else {
-            EXPECT_TRUE(results[i].key_mask.empty());
-            EXPECT_TRUE(results[i].locations.empty());
-        }
+        ASSERT_EQ(EC_OK, errors[i]);
+        ASSERT_EQ((std::vector<bool>{false}), results[i].key_mask);
+        ASSERT_EQ(1, results[i].locations.size());
+        EXPECT_EQ(15, results[i].locations.front().value_size);
+        ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstance, results[i].write_session_id, {true}));
     }
-    EXPECT_EQ(0, indexer->GetStorageUsage());
+
+    // The 80% watermark is asynchronous: after both writers commit at 30/20,
+    // reclaim removes one 15-byte object and converges below 16 bytes.
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&request_context_, 5);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil([&]() { return indexer->GetStorageUsage() == 15; }, std::chrono::seconds(2)));
+    ASSERT_TRUE(
+        WaitUntil([&]() { return metrics_registry_->GetGauge("kv_meta_reclaimer.pending_object_count").Get() == 0; },
+                  std::chrono::seconds(2)));
+    auto [get_ec, values] = manager_->Get(&request_context_, kInstance, {"key-0", "key-1"});
+    ASSERT_EQ(EC_OK, get_ec);
+    ASSERT_EQ(2, values.size());
+    EXPECT_EQ(1, std::count_if(values.begin(), values.end(), [](const auto &value) { return value.found; }));
+    EXPECT_EQ(1, metrics_registry_->GetCounter("kv_meta_reclaimer.reclaimed_object_count").Get());
+    EXPECT_EQ(15, metrics_registry_->GetCounter("kv_meta_reclaimer.reclaimed_bytes").Get());
+    {
+        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
+        storage_manager->storage_map_["nfs_01"] = original;
+    }
 }
 
 TEST_F(KvMetaManagerTest, ReclaimerEvictsTheLeastRecentlyUsedCommittedObjectAtTheByteWatermark) {
