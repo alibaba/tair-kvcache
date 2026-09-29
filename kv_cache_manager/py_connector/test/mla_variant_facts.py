@@ -1,9 +1,11 @@
 """Frozen MLA variant facts: the shared ring of truth for the MLA tests.
 
-Every row is one ``MLAAttentionSpec`` as vLLM 0.26.0 materializes it for a real
+Every row is one attention spec as vLLM 0.26.0 materializes it for a real
 model (DeepSeek V3.2 fp8/bfloat16, DeepSeek V4 c4/c128, GLM-4.7-Flash, plus the
 boundary rows the 02/03 designs fixed), together with the page numbers the
-connector sizes its transfers from. Two independent tests re-derive the same
+connector sizes its transfers from. ``kind`` defaults to ``"mla"``
+(``MLAAttentionSpec``); ``kind="swa"`` rows are ``SlidingWindowMLASpec``, the
+V4 windowed / compressor-state caches. Two independent tests re-derive the same
 table:
 
 * ``test_mla_variants.py`` through the ``vllm_stubs`` stand-in (CI, no vllm);
@@ -15,10 +17,18 @@ silently skewing every layout/size assertion downstream.
 ``dtype`` and ``kv_quant_mode`` are stored as *names*: this module stays free
 of torch (the CI has none) and of vLLM's enum. Tests map the names back.
 
+``page_size_padded`` is the page size the connector actually sees -- i.e. after
+vLLM's *grouping* pass; for the V4 state rows that is larger than what the
+spec's own ``alignment`` produces (``page_size_padded_before_grouping``), so the
+row pins the grouped value and records the other one for the golden check.
+
 ``FROZEN_GROUPS`` adds the group-level facts: what vLLM packs into one
 ``UniformTypeKVCacheSpecs`` group, what the transfer buckets of that group are,
 and what the scheduler's *folded* view of the same group looks like (the two
-role views differ -- see vllm_common.parse_groups).
+role views differ -- see vllm_common.parse_groups). ``sched_row`` names the sub
+spec ``generate_scheduler_kv_cache_config`` keeps for the scheduler, i.e. the
+folded view of that group; ``V4_TINY_GROUPS`` lists the six V4 groups in golden
+order.
 
 Source of truth: the 01 variant research (vLLM 0.26.0 measurements) and the
 tiny-model golden under ``e2e/mla-cq/golden/tiny_model_specs.json`` (generated
@@ -28,12 +38,12 @@ the file is readable).
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-#: One MLAAttentionSpec per variant: the constructor kwargs plus the derived
+#: One attention spec per variant: the constructor kwargs plus the derived
 #: numbers of a single layer. ``per_block_bytes`` assumes manager_block_size
-#: == ``mbs`` and is None for the compressed rows (c > 1 is refused, so the
-#: connector never sizes them).
+#: == ``mbs`` and is None for the rows the gate refuses (compressed, windowed),
+#: so the connector never sizes them.
 FROZEN: Dict[str, Dict[str, Any]] = {
     # --- accepted variants: one latent row per token ---------------------- #
     "m0": dict(  # GLM-4.7-Flash bf16 (the regression baseline)
@@ -246,6 +256,96 @@ FROZEN: Dict[str, Dict[str, Any]] = {
         page_size_padded=8640,
         per_block_bytes=None,
     ),
+    # --- V4 windowed / compressor-state rows (refused: not the full prefix) #
+    # They pin the *grouped* spec: page_size_padded is a constructor input
+    # (grouping applied it) and the pre-grouping value is kept for the golden.
+    "v4_swa": dict(  # the V4 attention sliding-window cache (584 B/row)
+        kind="swa",
+        kwargs=dict(
+            block_size=64,
+            sliding_window=128,
+            head_size=512,
+            dtype="uint8",
+            cache_dtype_str="fp8_ds_mla",
+            compress_ratio=1,
+            model_version="deepseek_v4",
+            kv_quant_mode="FP8_PER_TENSOR",
+            page_size_padded=37440,
+            num_kv_heads=1,
+        ),
+        itemsize=1,
+        compress_ratio=1,
+        mbs=64,
+        storage_block_size=64,
+        real_page_size_bytes=37376,
+        unpadded_page_size_bytes=37376,
+        page_size_padded=37440,
+        page_size_padded_before_grouping=37440,
+        per_block_bytes=None,
+    ),
+    "v4_state_l1": dict(  # layer-1 compressor state: fp32, one row per step
+        kind="swa",
+        kwargs=dict(
+            block_size=4,
+            sliding_window=8,
+            head_size=2048,
+            dtype="float32",
+            compress_ratio=1,
+            page_size_padded=37440,
+            num_kv_heads=1,
+        ),
+        itemsize=4,
+        compress_ratio=1,
+        mbs=4,
+        storage_block_size=4,
+        real_page_size_bytes=32768,
+        unpadded_page_size_bytes=32768,
+        page_size_padded=37440,
+        page_size_padded_before_grouping=32832,
+        per_block_bytes=None,
+    ),
+    "v4_state_indexer": dict(  # the indexer's compressor state (head 512)
+        kind="swa",
+        kwargs=dict(
+            block_size=4,
+            sliding_window=8,
+            head_size=512,
+            dtype="float32",
+            compress_ratio=1,
+            page_size_padded=8640,
+            num_kv_heads=1,
+        ),
+        itemsize=4,
+        compress_ratio=1,
+        mbs=4,
+        storage_block_size=4,
+        real_page_size_bytes=8192,
+        unpadded_page_size_bytes=8192,
+        page_size_padded=8640,
+        page_size_padded_before_grouping=8640,
+        per_block_bytes=None,
+    ),
+    "v4_state_l2": dict(  # layer-2 compressor state (block 8, head 1024)
+        kind="swa",
+        kwargs=dict(
+            block_size=8,
+            sliding_window=128,
+            head_size=1024,
+            dtype="float32",
+            compress_ratio=1,
+            page_size_padded=37440,
+            num_kv_heads=1,
+        ),
+        itemsize=4,
+        compress_ratio=1,
+        mbs=8,
+        storage_block_size=8,
+        real_page_size_bytes=32768,
+        unpadded_page_size_bytes=32768,
+        page_size_padded=37440,
+        page_size_padded_before_grouping=32832,
+        per_block_bytes=None,
+    ),
     # --- boundary / refused rows ------------------------------------------ #
     "m3": dict(  # INT4 per-token-head: the scale budget sits inside the page
         kwargs=dict(
@@ -310,6 +410,15 @@ ACCEPTED: List[str] = ["m0", "m0_b64", "m1", "m2c2", "m3b"]
 #: Variants the gate refuses, grouped by the rule that refuses them.
 REJECTED_COMPRESSED: List[str] = ["m2a", "m2a_s", "m2b", "m2b_s", "m2b2", "m2c", "X1"]
 REJECTED_QUANTIZED: List[str] = ["m3"]
+#: SlidingWindowMLASpec rows (V4 SWA / compressor state: not the full prefix).
+REJECTED_WINDOW: List[str] = [
+    "v4_swa",
+    "v4_state_l1",
+    "v4_state_indexer",
+    "v4_state_l2",
+]
+#: Structurally invalid rows (block_size not divisible by compress_ratio).
+REJECTED_INVALID: List[str] = ["X2"]
 
 #: The V3.2 wrapper group as vLLM builds it: one layer pair per model layer,
 #: all sharing one block table. ``layers`` is (vLLM layer name, FROZEN row).
@@ -320,10 +429,9 @@ _V32_LAYERS = [
     ("model.layers.1.self_attn.indexer.k_cache", "m2c2"),
 ]
 
-#: Group-level facts. ``buckets`` = the transfer buckets of the worker view, in
-#: wire-name order (suffix, FROZEN row, layers, per_block_bytes at ``mbs``);
-#: ``folded`` = what generate_scheduler_kv_cache_config leaves for the
-#: scheduler (one sub spec, all layer names).
+#: Group-level facts. ``buckets`` = the worker view of a packed group (transfer
+#: buckets in wire-name order); ``folded_row`` marks a row that *is* the folded
+#: view (v32), ``sched_row`` the sub spec a worker-view row folds to.
 FROZEN_GROUPS: Dict[str, Dict[str, Any]] = {
     "v32_wrapper_worker": dict(
         block_size=64,
@@ -369,14 +477,83 @@ FROZEN_GROUPS: Dict[str, Dict[str, Any]] = {
             dict(suffix="_b1", row="m2c2", layers=1, per_block_bytes=8448),
         ],
     ),
+    # --- DeepSeek V4 tiny: six packed groups, all refused (M2/A case) ------ #
+    # The full-MLA group packs two compressed mains (c=4/c=128) and the
+    # compressed indexer; every sub spec of every group is refused.
+    "v4_full_c4a": dict(
+        block_size=256,
+        mbs=256,
+        layers=[
+            ("model.layers.1.attn", "m2b"),
+            ("model.layers.1.attn.indexer.k_cache", "m2c"),
+            ("model.layers.2.attn", "m2b2"),
+        ],
+        page_sizes=[1728, 8640, 37440],
+        page_size_bytes=47808,  # 37440 + 8640 + 1728
+        sched_row="m2b",
+    ),
+    "v4_swa_wrapper_l0": dict(  # one SWA group per layer
+        block_size=64,
+        mbs=64,
+        layers=[("model.layers.0.attn.swa_cache", "v4_swa")],
+        page_sizes=[37440],
+        page_size_bytes=37440,
+        sched_row="v4_swa",
+    ),
+    "v4_swa_wrapper_l1": dict(
+        block_size=64,
+        mbs=64,
+        layers=[("model.layers.1.attn.swa_cache", "v4_swa")],
+        page_sizes=[37440],
+        page_size_bytes=37440,
+        sched_row="v4_swa",
+    ),
+    "v4_swa_wrapper_l2": dict(
+        block_size=64,
+        mbs=64,
+        layers=[("model.layers.2.attn.swa_cache", "v4_swa")],
+        page_sizes=[37440],
+        page_size_bytes=37440,
+        sched_row="v4_swa",
+    ),
+    "v4_state_wrapper_l1": dict(  # two compressor states share one table
+        block_size=4,
+        mbs=4,
+        layers=[
+            ("model.layers.1.attn.compressor.state_cache", "v4_state_l1"),
+            ("model.layers.1.attn.indexer.compressor.state_cache", "v4_state_indexer"),
+        ],
+        page_sizes=[8640, 37440],
+        page_size_bytes=46080,  # 37440 + 8640
+        sched_row="v4_state_l1",
+    ),
+    "v4_state_wrapper_l2": dict(  # layer-2 compressor state (block 8)
+        block_size=8,
+        mbs=8,
+        layers=[("model.layers.2.attn.compressor.state_cache", "v4_state_l2")],
+        page_sizes=[37440],
+        page_size_bytes=37440,
+        sched_row="v4_state_l2",
+    ),
 }
+
+#: The six V4 groups in golden order (index = golden group index).
+V4_TINY_GROUPS: List[str] = [
+    "v4_state_wrapper_l1",
+    "v4_state_wrapper_l2",
+    "v4_swa_wrapper_l0",
+    "v4_swa_wrapper_l1",
+    "v4_swa_wrapper_l2",
+    "v4_full_c4a",
+]
 
 #: Local tiny-model golden (generated outside this repository; see 07/08) --
 #: only used to reconcile the frozen numbers when the file is readable.
 DEFAULT_GOLDEN_PATH = "/root/ws/kv/e2e/mla-cq/golden/tiny_model_specs.json"
 #: Key order: variant name -> (golden model, golden group index).
-GOLDEN_GROUPS = {
+GOLDEN_GROUPS: Dict[str, Tuple[str, int]] = {
     "v32_wrapper_worker": ("dsv32_tiny", 0),
+    **{row: ("dsv4_tiny", index) for index, row in enumerate(V4_TINY_GROUPS)},
 }
 
 

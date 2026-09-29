@@ -13,7 +13,9 @@ instance with mismatched fields. These tests pin both halves:
 * only the worker role calls register_instance, with the worker payload.
 
 They also reconcile the frozen group facts with the local tiny-model golden
-when it is readable (it is generated outside this repository).
+when it is readable (it is generated outside this repository): the V3.2
+wrapper and all six DeepSeek V4 groups, i.e. the groups the M2 refusals are
+frozen on.
 """
 
 import unittest
@@ -266,7 +268,9 @@ class TestGoldenDrift(unittest.TestCase):
                 "tiny-model golden not available (set KVCM_MLA_GOLDEN to enable)"
             )
 
-    def test_v32_group_matches_the_golden(self):
+    def test_frozen_groups_match_the_golden(self):
+        # Seven rows: the V3.2 wrapper plus the six V4 groups (whose page sizes
+        # record vLLM's post-grouping padding).
         for row, (model, index) in GOLDEN_GROUPS.items():
             with self.subTest(group=row):
                 facts = FROZEN_GROUPS[row]
@@ -305,6 +309,13 @@ class TestGoldenDrift(unittest.TestCase):
                             frozen["real_page_size_bytes"]
                             // frozen["storage_block_size"],
                         )
+                        if "page_size_padded_before_grouping" in frozen:
+                            # The V4 state rows record the *grouped* padding
+                            # (37440) while their own alignment gives 32832.
+                            self.assertEqual(
+                                golden_spec["page_size_padded_before_grouping"],
+                                frozen["page_size_padded_before_grouping"],
+                            )
 
     def test_golden_block_size_matches_the_group_fixture(self):
         # The V3.2 engine block size (64) is what the manager block size
