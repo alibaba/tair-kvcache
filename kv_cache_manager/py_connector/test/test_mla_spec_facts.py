@@ -25,10 +25,12 @@ try:
     import vllm
     from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
     from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
         KVCacheConfig,
         KVCacheGroupSpec,
         KVQuantMode,
         MLAAttentionSpec,
+        SlidingWindowMLASpec,
         UniformTypeKVCacheSpecs,
     )
 
@@ -37,10 +39,12 @@ except ImportError as exc:  # pragma: no cover - environment dependent
     torch = None  # ty: ignore[invalid-assignment]
     vllm = None  # ty: ignore[invalid-assignment]
     generate_scheduler_kv_cache_config = None  # ty: ignore[invalid-assignment]
+    FullAttentionSpec = None  # ty: ignore[invalid-assignment]
     KVCacheConfig = None  # ty: ignore[invalid-assignment]
     KVCacheGroupSpec = None  # ty: ignore[invalid-assignment]
     KVQuantMode = None  # ty: ignore[invalid-assignment]
     MLAAttentionSpec = None  # ty: ignore[invalid-assignment]
+    SlidingWindowMLASpec = None  # ty: ignore[invalid-assignment]
     UniformTypeKVCacheSpecs = None  # ty: ignore[invalid-assignment]
     _IMPORT_ERROR = str(exc)
 
@@ -53,6 +57,14 @@ def _skip_reason() -> str:
     ):
         return "vLLM is shadowed by the test stubs in this process"
     return ""
+
+
+def _spec(row: str) -> Any:
+    """The real spec of one FROZEN row (``kind`` selects the spec class)."""
+    kwargs = _spec_kwargs(row)
+    if FROZEN[row].get("kind") == "swa":
+        return SlidingWindowMLASpec(**kwargs)  # ty: ignore[call-non-callable]
+    return MLAAttentionSpec(**kwargs)  # ty: ignore[call-non-callable]
 
 
 def _spec_kwargs(row: str) -> Dict[str, Any]:
@@ -79,7 +91,7 @@ class TestRealVLLMFacts(unittest.TestCase):
     def test_real_spec_reproduces_frozen(self):
         for row, facts in FROZEN.items():
             with self.subTest(variant=row):
-                spec = MLAAttentionSpec(**_spec_kwargs(row))  # ty: ignore[call-non-callable]
+                spec = _spec(row)
                 expected_page = (
                     facts["page_size_padded"]
                     if facts["page_size_padded"] is not None
@@ -99,9 +111,19 @@ class TestRealVLLMFacts(unittest.TestCase):
     def test_real_fp8_ds_mla_carries_the_per_tensor_mode(self):
         # F-n: every real fp8_ds_mla spec is built with kv_quant_mode set (the
         # connector must not read it as "quantized, refuse").
-        spec = MLAAttentionSpec(**_spec_kwargs("m1"))  # ty: ignore[call-non-callable]
+        spec = _spec("m1")
         self.assertEqual(spec.kv_quant_mode, KVQuantMode.FP8_PER_TENSOR)
         self.assertNotEqual(spec.kv_quant_mode, KVQuantMode.NONE)
+
+    def test_real_sliding_window_specs_are_not_full_attention(self):
+        # The step-0 refusal in _check_attention_spec_supported exists because
+        # SlidingWindowMLASpec is NOT a FullAttentionSpec subclass; if vLLM ever
+        # makes it one, the gate (and this guard) must be revisited.
+        for row in ("v4_swa", "v4_state_l1"):
+            with self.subTest(variant=row):
+                spec = _spec(row)
+                self.assertIsInstance(spec, SlidingWindowMLASpec)  # ty: ignore[invalid-argument-type]
+                self.assertNotIsInstance(spec, FullAttentionSpec)  # ty: ignore[invalid-argument-type]
 
     def test_scheduler_config_folds_a_packed_group(self):
         """The scheduler's view of a packed group is a *folded* one.
@@ -116,10 +138,7 @@ class TestRealVLLMFacts(unittest.TestCase):
         layer_names = [name for name, _ in facts["layers"]]
         wrapper = UniformTypeKVCacheSpecs(  # ty: ignore[call-non-callable]
             block_size=facts["block_size"],
-            kv_cache_specs={
-                name: MLAAttentionSpec(**_spec_kwargs(row))  # ty: ignore[call-non-callable]
-                for name, row in facts["layers"]
-            },
+            kv_cache_specs={name: _spec(row) for name, row in facts["layers"]},
         )
         config = KVCacheConfig(  # ty: ignore[call-non-callable]
             num_blocks=128,
