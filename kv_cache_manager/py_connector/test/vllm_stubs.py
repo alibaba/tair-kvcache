@@ -13,6 +13,7 @@ import importlib.util
 import json
 import sys
 import types
+from enum import IntEnum
 from typing import Any, Optional
 from unittest.mock import MagicMock
 
@@ -165,42 +166,320 @@ def _install_stubs():
     v1 = _module("vllm.v1")
     kv_cache_interface = _module("vllm.v1.kv_cache_interface")
 
-    class FullAttentionSpec:
-        def __init__(self, block_size, page_size_bytes, page_size_padded=None):
-            self.block_size = block_size
-            self.page_size_padded = page_size_padded
-            self.real_page_size_bytes = page_size_bytes
-            # Mirror vLLM's AttentionSpec: page_size_bytes returns the padded
-            # size when padding is set.
-            self.page_size_bytes = (
-                page_size_padded if page_size_padded is not None else page_size_bytes
-            )
+    class KVQuantMode(IntEnum):
+        """Mirrors vLLM's KVQuantMode: the values are the spec contract."""
 
-    class MLAAttentionSpec(FullAttentionSpec):
-        """Mirrors the real spec's consumed contract: the MLA-only fields
-        parse_groups gates on (see vllm_common._check_mla_supported)."""
+        NONE = 0
+        FP8_PER_TENSOR = 1
+        INT8_PER_TOKEN_HEAD = 2
+        FP8_PER_TOKEN_HEAD = 3
+        INT4_PER_TOKEN_HEAD = 4
+        NVFP4 = 5
+
+    #: Bytes per element, keyed by dtype name. The stub specs accept a real
+    #: torch dtype or its name: the open-source CI has no torch, and the
+    #: connector only ever reads str(spec.dtype).
+    _DTYPE_ITEMSIZE = {
+        "uint8": 1,
+        "float8_e4m3fn": 1,
+        "float16": 2,
+        "bfloat16": 2,
+        "float32": 4,
+    }
+
+    def _dtype_name(dtype: Any) -> str:
+        # A MagicMock stand-in for torch.uint8 remembers the attribute name.
+        mock_name = getattr(dtype, "_mock_name", None)
+        if isinstance(mock_name, str):
+            return mock_name
+        return str(dtype)
+
+    def _dtype_itemsize(dtype: Any) -> int:
+        itemsize = getattr(dtype, "itemsize", None)
+        if isinstance(itemsize, int):
+            return itemsize
+        return _DTYPE_ITEMSIZE[_dtype_name(dtype).rsplit(".", 1)[-1]]
+
+    def _quant_mode_value(mode: Any) -> int:
+        return int(mode or 0)
+
+    class AttentionSpec:
+        """vLLM 0.26 AttentionSpec: the derived page sizes the connector reads
+        are computed from the raw fields (see the real vLLM for the algebra).
+
+        ``page_size_bytes`` is a stub-only shortcut that *pins* the compact
+        page size for hand-built fixtures -- the repo's older tests pass it
+        positionally. Leave it None to exercise the real algebra."""
 
         def __init__(
             self,
             block_size,
-            page_size_bytes,
+            page_size_bytes=None,
             page_size_padded=None,
+            *,
+            num_kv_heads=1,
+            head_size=None,
+            dtype=None,
+            kv_quant_mode=KVQuantMode.NONE,
+            indexes_kv_by_block_stride=False,
+        ):
+            self.block_size = block_size
+            self.num_kv_heads = num_kv_heads
+            self.head_size = head_size
+            self.dtype = dtype
+            self.kv_quant_mode = kv_quant_mode
+            self.indexes_kv_by_block_stride = indexes_kv_by_block_stride
+            self.page_size_padded = page_size_padded
+            self._pinned_page_bytes = page_size_bytes
+            real = (
+                page_size_bytes
+                if page_size_bytes is not None
+                else self._compute_real_page_size_bytes()
+            )
+            self.real_page_size_bytes = real
+            # Per-token-head modes budget their scale tensors inside the page
+            # (vLLM's AttentionSpec.unpadded_page_size_bytes).
+            self.unpadded_page_size_bytes = real + (
+                2 * block_size * num_kv_heads * 4
+                if _quant_mode_value(kv_quant_mode) in (2, 3, 4)
+                else 0
+            )
+
+        def _compute_real_page_size_bytes(self):
+            assert self.head_size is not None, (
+                "the stub spec needs head_size to derive its page size"
+            )
+            head_dim = (
+                self.head_size // 2
+                if _quant_mode_value(self.kv_quant_mode)
+                == KVQuantMode.INT4_PER_TOKEN_HEAD
+                else self.head_size
+            )
+            return (
+                2
+                * self.block_size
+                * self.num_kv_heads
+                * head_dim
+                * _dtype_itemsize(self.dtype)
+            )
+
+        @property
+        def storage_block_size(self):
+            return self.block_size
+
+        @property
+        def page_size_bytes(self):
+            if self.page_size_padded is not None:
+                assert self.page_size_padded >= self.unpadded_page_size_bytes, (
+                    "page_size_padded below the compact page size"
+                )
+                return self.page_size_padded
+            return self.unpadded_page_size_bytes
+
+    def _quant_mode_value(mode: Any) -> int:
+        return int(mode or 0)
+
+    def _apply_alignment_padding(spec: Any) -> None:
+        """Mirrors vLLM's helper: the alignment rounds the compact page up."""
+        if spec.alignment is None:
+            return
+        actual = spec.real_page_size_bytes
+        padded = -(-actual // spec.alignment) * spec.alignment
+        if padded != actual:
+            spec.page_size_padded = padded
+
+    class FullAttentionSpec(AttentionSpec):
+        def __init__(
+            self,
+            block_size,
+            page_size_bytes=None,
+            page_size_padded=None,
+            *,
+            num_kv_heads=1,
+            head_size=None,
+            dtype=None,
+            kv_quant_mode=KVQuantMode.NONE,
+            indexes_kv_by_block_stride=False,
+            head_size_v=None,
+            sliding_window=None,
+            attention_chunk_size=None,
+            non_causal=False,
+        ):
+            super().__init__(
+                block_size,
+                page_size_bytes,
+                page_size_padded,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=dtype,
+                kv_quant_mode=kv_quant_mode,
+                indexes_kv_by_block_stride=indexes_kv_by_block_stride,
+            )
+            self.head_size_v = head_size_v
+            self.sliding_window = sliding_window
+            self.attention_chunk_size = attention_chunk_size
+            self.non_causal = non_causal
+
+    class MLAAttentionSpec(FullAttentionSpec):
+        """Mirrors the real spec's consumed contract: the MLA-only fields the
+        connector gates on plus the byte algebra FROZEN pins down."""
+
+        def __init__(
+            self,
+            block_size,
+            page_size_bytes=None,
+            page_size_padded=None,
+            *,
+            num_kv_heads=1,
+            head_size=None,
+            dtype=None,
+            kv_quant_mode=KVQuantMode.NONE,
+            indexes_kv_by_block_stride=False,
             cache_dtype_str=None,
             compress_ratio=1,
-            kv_quant_mode=0,
+            alignment=None,
+            model_version=None,
         ):
-            super().__init__(block_size, page_size_bytes, page_size_padded)
             self.cache_dtype_str = cache_dtype_str
             self.compress_ratio = compress_ratio
-            self.kv_quant_mode = kv_quant_mode
+            self.alignment = alignment
+            self.model_version = model_version
+            super().__init__(
+                block_size,
+                page_size_bytes,
+                page_size_padded,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=dtype,
+                kv_quant_mode=kv_quant_mode,
+                indexes_kv_by_block_stride=indexes_kv_by_block_stride,
+            )
+            _apply_alignment_padding(self)
+
+        @property
+        def storage_block_size(self):
+            return self.block_size // self.compress_ratio
+
+        def _compute_real_page_size_bytes(self):
+            assert self.head_size is not None, (
+                "the stub spec needs head_size to derive its page size"
+            )
+            if self.cache_dtype_str == "fp8_ds_mla":
+                if self.model_version == "deepseek_v4":
+                    # DeepSeek V4: 448 B NoPE + 128 B RoPE + 8 B scale/token.
+                    return self.storage_block_size * 584
+                # V3.2 main MLA: a 656-byte custom row per token.
+                return self.block_size * 656
+            head_dim = (
+                self.head_size // 2
+                if _quant_mode_value(self.kv_quant_mode)
+                == KVQuantMode.INT4_PER_TOKEN_HEAD
+                else self.head_size
+            )
+            # One latent row per token, no K/V factor of two.
+            return (
+                self.storage_block_size
+                * self.num_kv_heads
+                * head_dim
+                * _dtype_itemsize(self.dtype)
+            )
+
+    class SlidingWindowMLASpec(AttentionSpec):
+        """Windowed / partial-state MLA cache (V4 SWA and compressor state)."""
+
+        def __init__(
+            self,
+            block_size,
+            sliding_window,
+            page_size_bytes=None,
+            page_size_padded=None,
+            *,
+            num_kv_heads=1,
+            head_size=None,
+            dtype=None,
+            kv_quant_mode=KVQuantMode.NONE,
+            cache_dtype_str=None,
+            compress_ratio=1,
+            alignment=None,
+            model_version=None,
+        ):
+            self.sliding_window = sliding_window
+            self.cache_dtype_str = cache_dtype_str
+            self.compress_ratio = compress_ratio
+            self.alignment = alignment
+            self.model_version = model_version
+            super().__init__(
+                block_size,
+                page_size_bytes,
+                page_size_padded,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=dtype,
+                kv_quant_mode=kv_quant_mode,
+            )
+            _apply_alignment_padding(self)
+
+        @property
+        def storage_block_size(self):
+            return self.block_size // self.compress_ratio
+
+        def _compute_real_page_size_bytes(self):
+            assert self.head_size is not None, (
+                "the stub spec needs head_size to derive its page size"
+            )
+            if (
+                self.model_version == "deepseek_v4"
+                and self.cache_dtype_str == "fp8_ds_mla"
+            ):
+                return self.storage_block_size * 584
+            assert self.model_version in (None, "deepseek_v4"), (
+                f"Unsupported model version: {self.model_version}"
+            )
+            return (
+                self.storage_block_size
+                * self.num_kv_heads
+                * self.head_size
+                * _dtype_itemsize(self.dtype)
+            )
+
+    class UniformTypeKVCacheSpecs:
+        """vLLM's wrapper: one group of layers whose specs share a block size
+        but may differ in page size (V3.2 main + indexer)."""
+
+        def __init__(self, block_size, kv_cache_specs):
+            self.block_size = block_size
+            self.kv_cache_specs = kv_cache_specs
+
+        @property
+        def page_size_bytes(self):
+            return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+
+        def get_page_sizes(self):
+            return list(
+                set(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+            )
+
+        @classmethod
+        def from_specs(cls, kv_cache_specs):
+            block_sizes = set(spec.block_size for spec in kv_cache_specs.values())
+            if len(block_sizes) > 1:
+                return None
+            return cls(
+                block_size=next(iter(kv_cache_specs.values())).block_size,
+                kv_cache_specs=kv_cache_specs,
+            )
 
     class MambaSpec:
         def __init__(self, block_size, page_size_bytes):
             self.block_size = block_size
             self.page_size_bytes = page_size_bytes
 
+    kv_cache_interface.KVQuantMode = KVQuantMode
+    kv_cache_interface.AttentionSpec = AttentionSpec
     kv_cache_interface.FullAttentionSpec = FullAttentionSpec
     kv_cache_interface.MLAAttentionSpec = MLAAttentionSpec
+    kv_cache_interface.SlidingWindowMLASpec = SlidingWindowMLASpec
+    kv_cache_interface.UniformTypeKVCacheSpecs = UniformTypeKVCacheSpecs
     kv_cache_interface.MambaSpec = MambaSpec
 
     _module("vllm.v1.core")
@@ -231,7 +510,13 @@ def _make_group_metas(num_groups: int, num_state_groups: int, block_size: int) -
     vLLM group index (what block tables are indexed by)."""
     return [
         AttentionGroupMeta(
-            group_idx=i, layer_names=[f"l{i}"], block_size=block_size, per_block_bytes=0
+            group_idx=i,
+            layer_names=[f"l{i}"],
+            block_size=block_size,
+            per_block_bytes=0,
+            # A positive page size: the tensor-side cross-check rejects 0, and
+            # the translation paths under test never read it.
+            page_bytes=block_size * 8,
         )
         for i in range(num_groups)
     ] + [
@@ -269,7 +554,6 @@ def make_connector(
     )
     conn._tp_size = tp_size
     conn._tp_rank = 0
-    conn._self_spec_names = {}
     conn._device = "cpu"
     conn._group_metas = _make_group_metas(
         num_groups,

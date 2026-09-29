@@ -201,9 +201,10 @@ class ConnectorScheduler:
         """
         names = {spec.get("name") for spec in location.get("location_specs", [])}
         return all(
-            spec_name(rank, group_idx) in names
+            spec_name(rank, meta) in names
             for rank in range(self._tp_size)
-            for group_idx in self._state_group_idxs
+            for meta in self._group_metas
+            if isinstance(meta, StateGroupMeta)
         )
 
     def _external_match_burned(self, req_id: str) -> bool:
