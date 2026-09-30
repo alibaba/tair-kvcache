@@ -4,11 +4,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -75,7 +73,7 @@ public:
 
     bool Init();
     void Shutdown();
-    ErrorCode DoRecover(std::function<bool()> should_abort = nullptr);
+    ErrorCode DoRecover();
     void DoCleanup();
     void CancelMaintenance() noexcept;
     bool ResumeMaintenance();
@@ -118,6 +116,7 @@ private:
     static std::string StableLocationId(const std::string &key);
 
     ErrorCode ValidateInstanceId(RequestContext *request_context, const std::string &instance_id) const;
+    ErrorCode CheckReady(RequestContext *request_context) const;
     ErrorCode ValidateKeys(RequestContext *request_context, const std::vector<std::string> &keys) const;
     ErrorCode ValidateCacheConfiguration(RequestContext *request_context, const std::string &instance_group) const;
     std::pair<ErrorCode, std::shared_ptr<const InstanceInfo>>
@@ -136,15 +135,11 @@ private:
                           const std::vector<SessionItem> &items,
                           bool delete_physical,
                           bool maintenance_read,
-                          std::uint64_t *deleted_bytes = nullptr);
+                          std::vector<SessionItem> *deleted_items = nullptr);
     void DeletePhysicalBestEffort(RequestContext *request_context, const std::vector<SessionItem> &items) const;
     void ExpireSession(const std::string &session_id,
                        const std::string &internal_instance_id,
                        const std::vector<SessionItem> &items) noexcept;
-
-    void RememberKvMetaGroup(const std::string &instance_group);
-    std::vector<std::string> SnapshotKvMetaGroups() const;
-    void ReplaceKvMetaGroups(std::unordered_set<std::string> instance_groups);
 
 private:
     friend class KvMetaReclaimer;
@@ -157,13 +152,11 @@ private:
     std::unique_ptr<KvMetaReclaimer> reclaimer_;
     std::unique_ptr<KvMetaWriteSessionManager> write_session_manager_;
 
-    std::mutex registration_mutex_;
-    mutable std::mutex kv_meta_groups_mutex_;
-    std::unordered_set<std::string> kv_meta_groups_;
     // Serializes only SERVING transitions and deletes so their byte-counter
     // updates cannot cross. PutStart never enters this lock.
     mutable std::array<std::mutex, 64> metadata_mutation_mutexes_;
     std::atomic<bool> maintenance_cancelled_{false};
+    std::atomic<bool> recovery_complete_{false};
     std::atomic<bool> initialized_{false};
 };
 

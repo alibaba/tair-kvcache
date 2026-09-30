@@ -40,6 +40,7 @@ cc_test(
 cc_test(
     name = "KvMetaTransferClientTest",
     srcs = ["kv_meta_transfer_client_test.cc"],
+    copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/client",
         "//kv_cache_manager/common:unittest",

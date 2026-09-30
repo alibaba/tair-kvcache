@@ -1,6 +1,7 @@
 #include "kv_cache_manager/client/src/kv_meta_transfer_client_impl.h"
 
-#include <algorithm>
+#include <limits>
+#include <map>
 #include <utility>
 
 #include "kv_cache_manager/client/src/internal/config/client_config.h"
@@ -15,13 +16,9 @@ namespace kv_cache_manager {
 namespace {
 
 constexpr const char *kKvMetaValueSpecName = "value";
+constexpr std::size_t kMaxKvMetaBatchItems = 64;
 constexpr std::uint64_t kMaxKvMetaObjectBytes = 1ULL * 1024 * 1024 * 1024;
-
-bool HasOnlyUnambiguousUriText(const UriStrVec &uris) {
-    return std::all_of(uris.begin(), uris.end(), [](const std::string &uri) {
-        return uri.size() <= kMaxKvMetaLocationUriBytes && HasUnambiguousKvMetaUriText(uri);
-    });
-}
+constexpr std::uint64_t kMaxKvMetaBatchBytes = 4ULL * 1024 * 1024 * 1024;
 
 } // namespace
 
@@ -76,13 +73,14 @@ ClientErrorCode KvMetaTransferClientImpl::Init(const std::string &client_config,
         return ER_INVALID_CLIENT_CONFIG;
     }
     sdk_wrapper_ = std::make_unique<SdkWrapper>();
-    const auto ec =
-        sdk_wrapper_->InitForKvMeta(client_config_, init_params, max_object_bytes, shared_memory_registration);
+    const auto ec = sdk_wrapper_->Init(client_config_, init_params, shared_memory_registration);
     if (ec != ER_OK) {
         sdk_wrapper_.reset();
         client_config_.reset();
+        return ec;
     }
-    return ec;
+    max_object_bytes_ = max_object_bytes;
+    return ER_OK;
 }
 
 ClientErrorCode KvMetaTransferClientImpl::LoadObjects(const UriStrVec &uri_str_vec,
@@ -91,10 +89,12 @@ ClientErrorCode KvMetaTransferClientImpl::LoadObjects(const UriStrVec &uri_str_v
     if (!sdk_wrapper_) {
         return ER_INVALID_SDKWRAPPER_CONFIG;
     }
-    if (!HasOnlyUnambiguousUriText(uri_str_vec)) {
-        return ER_INVALID_PARAMS;
+    if (const auto ec = ValidateObjects(uri_str_vec, value_sizes, object_buffers); ec != ER_OK) {
+        return ec;
     }
-    return sdk_wrapper_->GetKvMetaObjects(ParseLocations(uri_str_vec), value_sizes, object_buffers);
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    SetAllowedObjectSizes(value_sizes);
+    return sdk_wrapper_->Get(ParseLocations(uri_str_vec), object_buffers);
 }
 
 std::pair<ClientErrorCode, UriStrVec> KvMetaTransferClientImpl::SaveObjects(
@@ -102,26 +102,78 @@ std::pair<ClientErrorCode, UriStrVec> KvMetaTransferClientImpl::SaveObjects(
     if (!sdk_wrapper_) {
         return {ER_INVALID_SDKWRAPPER_CONFIG, {}};
     }
-    if (!HasOnlyUnambiguousUriText(uri_str_vec)) {
-        return {ER_INVALID_PARAMS, {}};
+    if (const auto ec = ValidateObjects(uri_str_vec, value_sizes, object_buffers); ec != ER_OK) {
+        return {ec, {}};
     }
-    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
-    const auto ec =
-        sdk_wrapper_->PutKvMetaObjects(ParseLocations(uri_str_vec), value_sizes, object_buffers, actual_remote_uris);
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    SetAllowedObjectSizes(value_sizes);
+    auto actual_locations = std::make_shared<std::vector<DataStorageUri>>();
+    const auto ec = sdk_wrapper_->Put(ParseLocations(uri_str_vec), object_buffers, actual_locations);
     if (ec != ER_OK) {
         return {ec, {}};
     }
-    UriStrVec actual_uris = ConstructLocations(*actual_remote_uris);
+    auto actual_uris = ConstructLocations(*actual_locations);
     if (actual_uris.size() != uri_str_vec.size()) {
         return {ER_SDKWRITE_ERROR, {}};
     }
     for (std::size_t i = 0; i < uri_str_vec.size(); ++i) {
-        if (!HasSameCanonicalKvMetaUri(uri_str_vec[i], actual_uris[i])) {
+        if (uri_str_vec[i] != actual_uris[i]) {
             KVCM_LOG_WARN("KVMeta SDK rewrote an exact-object allocation URI");
             return {ER_SDKWRITE_ERROR, {}};
         }
     }
     return {ER_OK, std::move(actual_uris)};
+}
+
+ClientErrorCode KvMetaTransferClientImpl::ValidateObjects(const UriStrVec &uri_str_vec,
+                                                          const std::vector<std::uint64_t> &value_sizes,
+                                                          const BlockBuffers &object_buffers) const {
+    if (max_object_bytes_ == 0 || uri_str_vec.empty() || uri_str_vec.size() > kMaxKvMetaBatchItems ||
+        uri_str_vec.size() != value_sizes.size() || uri_str_vec.size() != object_buffers.size()) {
+        return ER_INVALID_PARAMS;
+    }
+    std::uint64_t batch_bytes = 0;
+    for (std::size_t i = 0; i < uri_str_vec.size(); ++i) {
+        const std::uint64_t expected_size = value_sizes[i];
+        std::uint64_t uri_size = 0;
+        if (expected_size == 0 || expected_size > max_object_bytes_ || expected_size > kMaxKvMetaBatchBytes ||
+            batch_bytes > kMaxKvMetaBatchBytes - expected_size ||
+            !IsValidKvMetaLocation(uri_str_vec[i], DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, uri_size) ||
+            uri_size != expected_size || object_buffers[i].iovs.empty()) {
+            return ER_INVALID_PARAMS;
+        }
+        batch_bytes += expected_size;
+
+        std::uint64_t buffer_size = 0;
+        for (const auto &iov : object_buffers[i].iovs) {
+            const auto base = reinterpret_cast<std::uintptr_t>(iov.base);
+            if (iov.ignore || iov.base == nullptr || iov.size == 0 ||
+                (iov.type != MemoryType::CPU && iov.type != MemoryType::GPU) || buffer_size > expected_size ||
+                iov.size > expected_size - buffer_size ||
+                iov.size > std::numeric_limits<std::uintptr_t>::max() - base) {
+                return ER_INVALID_LOCAL_BUFFERS;
+            }
+            buffer_size += iov.size;
+        }
+        if (buffer_size != expected_size) {
+            return ER_INVALID_LOCAL_BUFFERS;
+        }
+    }
+    return ER_OK;
+}
+
+void KvMetaTransferClientImpl::SetAllowedObjectSizes(const std::vector<std::uint64_t> &value_sizes) {
+    std::map<std::string, std::int64_t> sizes;
+    for (const std::uint64_t size : value_sizes) {
+        sizes.emplace(std::to_string(size), static_cast<std::int64_t>(size));
+    }
+    const auto wrapper_config = client_config_->sdk_wrapper_config();
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+        if (const auto config = wrapper_config->GetSdkBackendConfig(type)) {
+            config->set_spec_byte_sizes_per_block(sizes);
+        }
+    }
 }
 
 std::vector<DataStorageUri> KvMetaTransferClientImpl::ParseLocations(const UriStrVec &uri_str_vec) {

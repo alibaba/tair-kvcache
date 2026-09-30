@@ -87,10 +87,8 @@ public:
     virtual std::pair<ClientErrorCode, KvMetaGetResult> Get(const std::string &trace_id,
                                                             const std::vector<std::string> &keys) = 0;
 
-    // ER_INVALID_GRPCSTATUS or ER_SERVICE_OUTCOME_UNKNOWN means the server may
-    // already have reserved an active session. Do not blindly retry; query the
-    // keys and, for misses, wait for write_timeout_seconds before attempting
-    // another StartWrite.
+    // ER_INVALID_GRPCSTATUS means the server may already have reserved a
+    // session. The bounded write lease cleans it if the response was lost.
     virtual std::pair<ClientErrorCode, KvMetaStartWriteResult> StartWrite(const std::string &trace_id,
                                                                           const std::vector<std::string> &keys,
                                                                           const std::vector<std::uint64_t> &value_sizes,
@@ -98,14 +96,12 @@ public:
 
     // success_keys is aligned with StartWriteResult.locations, not with the
     // original request. A single false value aborts the complete session.
-    // ER_INVALID_GRPCSTATUS has an unknown commit outcome; resolve it with Get.
+    // After a transport error, callers may use Get to resolve the cache state.
     virtual ClientErrorCode FinishWrite(const std::string &trace_id,
                                         const std::string &write_session_id,
                                         const std::vector<bool> &success_keys) = 0;
 
-    // Remove and TrimAll also return ER_INVALID_GRPCSTATUS for an unknown
-    // mutation outcome. Their retries must be chosen by the caller so a new
-    // generation created after the first attempt is not deleted implicitly.
+    // Remove and TrimAll do not retry transport failures automatically.
     virtual ClientErrorCode Remove(const std::string &trace_id, const std::vector<std::string> &keys) = 0;
     virtual ClientErrorCode TrimAll(const std::string &trace_id, bool metadata_only = false) = 0;
 };

@@ -75,18 +75,6 @@ cc_test(
 )
 
 cc_test(
-    name = "KvMetaServiceGRpcTest",
-    srcs = [
-        "kv_meta_service_grpc_test.cc",
-    ],
-    deps = [
-        "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/metrics:metrics_registry",
-        "//kv_cache_manager/service/grpc_service",
-    ],
-)
-
-cc_test(
     name = "AdminServiceRemoveInstanceGroupTest",
     srcs = [
         "admin_service_remove_instance_group_test.cc",

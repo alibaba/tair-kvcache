@@ -21,7 +21,7 @@ RTP-LLM
 
 - `KvMetaManager`：实例注册、exact-key 元数据、写会话、实际用量和 LRU 回收。
 - `KvMetaObjectClient`：组合元数据事务和 PACE 数据搬运。
-- `KvMetaTransferClient`：按每个对象的真实长度校验并执行 I/O，不改变普通定长 `TransferClient`。
+- `KvMetaTransferClient`：按每批对象的真实长度配置自己私有的 PACE SDK client，并串行执行该 client 的 I/O；不改变普通定长 `TransferClient` 或 TairMempool provider。
 - `KvMetaReclaimer`：只处理 KVMeta instance，按 group 的真实用量回收。
 
 KVMeta 使用带完整 schema marker 的内部 instance。原 KVCache GC/Reclaimer 跳过这些 instance，防止两套回收逻辑重复处理；普通 KVCache 主链路保持不变。
@@ -49,7 +49,7 @@ URI 中的 `size` 是对象实际字节数。服务端和客户端都会校验 b
 1. `PutStart` 查询所有 key。
 2. 已存在且 size 相同的 `SERVING` 对象返回 hit；size 不同返回 `SIZE_MISMATCH`；`WRITING` 返回 `WRITE_IN_PROGRESS`。
 3. 对 miss，选择当前可写的 PACE backend，逐对象按真实 size 分配空间。
-4. 以条件写创建 `WRITING` metadata，并在内存中保存有期限的 write session。
+4. 每次分配成功后立即以条件写创建对应的 `WRITING` metadata；全部完成后在内存中保存有期限的 write session。
 5. 客户端把 bytes 写入 PACE。
 6. 全部成功后 `PutFinish` 条件地把本 session 的 generation 改为 `SERVING`；任一失败则删除本 session 的全部 metadata，并尽力释放 PACE allocation。
 
@@ -85,23 +85,23 @@ KVMeta Reclaimer 周期处理已注册的 KVMeta group：
 4. 从每个 indexer 采样 LRU candidate，合并后按 `last_access_time` 全局排序。
 5. 选择至多一个 batching size，或预计删除字节达到 `usage - target` 为止。
 6. 按 generation 条件删除 metadata；只有删除成功的 `SERVING` 对象才扣减 usage。
-7. metadata 删除后尽力释放对应 PACE allocation。
+7. metadata 删除后等待现有 `delay_before_delete_ms` grace period，再尽力释放对应 PACE allocation。
 8. 后续轮次继续采样，直到 usage 不高于 target。
 
 条件删除防止 GC 删除已经被新 generation 替换的对象。回收是异步、渐进的；采样不足或 provider 删除失败不会阻塞读写主链路。
 
 ## 恢复与 HA
 
-升主后，原 KVCache 先按既有流程恢复并放流，KVMeta 在独立可取消线程中恢复。KVMeta 恢复完成前只关闭自身 leader gate，不阻塞原 MetaService。
+升主后，原 KVCache 先按既有流程恢复并放流。随后启动 KVMeta 自己的 maintenance worker；worker 在首轮 GC 前完成 metadata 扫描与 usage 重建。恢复期间 KVMeta 请求返回 `SERVICE_NOT_READY`，不阻塞原 MetaService，也不在 Server 中增加第二套恢复线程生命周期。
 
-恢复完成后才启动 session expiry 和 Reclaimer。降主或停服时先关闭 KVMeta 新请求，再停止后台线程并等待恢复线程退出。
+降主或停服时先关闭 KVMeta 新请求，再停止 session expiry 和 maintenance worker。
 
 ## 配置约束
 
 - `kvcm.kv_meta.enabled=true` 才注册服务。
 - KVMeta group 应独立配置，不与普通 KVCache instance 混用。
 - group 必须配置 LRU reclaim policy 和 `[0, 1]` 范围的 `used_percentage`。
-- `storage_candidates` 至少包含一个已注册、可用且 URI-safe 的 PACE backend。
+- `storage_candidates` 非空且全部是已注册的 PACE backend。
 - RTP wrapper 使用现有环境变量，并把普通 `RECO_INSTANCE_GROUP` / instance id 加 `kve_` 前缀形成 KVMeta identity；该前缀规则属于 RTP client，不是服务端协议要求。
 
 ## 失败语义

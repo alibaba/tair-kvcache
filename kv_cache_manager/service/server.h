@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <mutex>
 #include <string>
 #include <thread>
 
@@ -51,8 +50,6 @@ private:
     bool StartMetricsReportThread();
     void CreateAndRegisterEventPublisher();
     bool CreateLeaderElector();
-    void StartKvMetaRecovery();
-    void CancelAndJoinKvMetaRecovery();
 
     void OnBecomeLeader();
     void OnNoLongerLeader();
@@ -80,13 +77,6 @@ private:
     std::thread meta_http_thread_;
     std::thread admin_http_thread_;
     std::thread debug_http_thread_;
-    std::thread kv_meta_recovery_thread_;
-    // Leader callbacks are serialized by LeaderElector. The lifecycle mutex
-    // additionally prevents Stop/Wait from joining the same worker twice;
-    // the gate mutex orders recovery completion against demotion.
-    std::mutex kv_meta_recovery_join_mutex_;
-    std::mutex kv_meta_recovery_mutex_;
-    std::atomic<bool> kv_meta_recovery_stop_{true};
 
     std::shared_ptr<CoordinationBackend> coordination_backend_;
     std::shared_ptr<LeaderElector> leader_elector_;

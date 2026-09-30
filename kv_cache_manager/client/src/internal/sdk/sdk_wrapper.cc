@@ -1,29 +1,18 @@
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
 
-#include <algorithm>
-#include <charconv>
 #include <fcntl.h>
 #include <limits>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
-#include <unordered_set>
 
 #include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 
 namespace kv_cache_manager {
-
-namespace {
-
-constexpr std::size_t kMaxKvMetaBatchItems = 64;
-constexpr std::uint64_t kMaxKvMetaBatchBytes = 4ULL * 1024 * 1024 * 1024;
-
-} // namespace
 
 SdkWrapper::SdkWrapper() : sdk_factory_(SdkFactory::GetInstance()) {}
 
@@ -33,7 +22,6 @@ SdkWrapper::~SdkWrapper() {
         wait_task_thread_pool_.reset();
     }
     sdk_map_.clear();
-    sdk_storage_configs_.clear();
     if (owned_shm_fd_ >= 0) {
         close(owned_shm_fd_);
         owned_shm_fd_ = -1;
@@ -43,37 +31,15 @@ SdkWrapper::~SdkWrapper() {
 ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_config,
                                  const InitParams &init_params,
                                  const SharedMemoryRegistration *shared_memory_registration) {
-    return InitInternal(client_config, init_params, false, 0, shared_memory_registration);
-}
-
-ClientErrorCode SdkWrapper::InitForKvMeta(const std::unique_ptr<ClientConfig> &client_config,
-                                          const InitParams &init_params,
-                                          std::uint64_t max_object_bytes,
-                                          const SharedMemoryRegistration *shared_memory_registration) {
-    if (max_object_bytes == 0 || max_object_bytes > std::numeric_limits<std::size_t>::max()) {
-        KVCM_LOG_WARN("KVMeta max object bytes is invalid: %llu", static_cast<unsigned long long>(max_object_bytes));
-        return ER_INVALID_PARAMS;
-    }
-    return InitInternal(client_config, init_params, true, max_object_bytes, shared_memory_registration);
-}
-
-ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &client_config,
-                                         const InitParams &init_params,
-                                         bool variable_object_size_enabled,
-                                         std::uint64_t max_object_bytes,
-                                         const SharedMemoryRegistration *shared_memory_registration) {
     if (!client_config) {
         KVCM_LOG_WARN("client config is null");
         return ER_INVALID_CLIENT_CONFIG;
     }
-    variable_object_size_enabled_ = variable_object_size_enabled;
-    max_variable_object_bytes_ = max_object_bytes;
-    const auto source_wrapper_config = client_config->sdk_wrapper_config();
-    if (!source_wrapper_config) {
+    wrapper_config_ = client_config->sdk_wrapper_config();
+    if (!wrapper_config_) {
         KVCM_LOG_WARN("sdk wrapper config is null");
         return ER_INVALID_SDKWRAPPER_CONFIG;
     }
-    wrapper_config_ = source_wrapper_config;
     const std::string &storage_configs = init_params.storage_configs;
     if (!Jsonizable::FromJsonString(storage_configs, storage_configs_)) {
         KVCM_LOG_WARN("parse storage config failed, storage config: %s", storage_configs.c_str());
@@ -82,21 +48,6 @@ ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &cl
     if (storage_configs_.empty()) {
         KVCM_LOG_WARN("storage config is empty");
         return ER_INVALID_STORAGE_CONFIG;
-    }
-    if (variable_object_size_enabled) {
-        std::unordered_set<std::string> unique_storage_names;
-        unique_storage_names.reserve(storage_configs_.size());
-        for (const auto &storage_config : storage_configs_) {
-            if (!storage_config || !SupportsKvMetaAdmission(storage_config->type()) ||
-                !IsCanonicalKvMetaBackendName(storage_config->global_unique_name()) ||
-                !unique_storage_names.insert(storage_config->global_unique_name()).second ||
-                !HasSafeConfiguredKvMetaNamespace(*storage_config)) {
-                KVCM_LOG_WARN(
-                    "KVMeta storage configs must use unique URI-safe names, a safe object namespace, and a hard "
-                    "caller-buffer lifetime contract");
-                return ER_INVALID_STORAGE_CONFIG;
-            }
-        }
     }
 
     SharedMemoryRegistration prepared_registration;
@@ -162,9 +113,6 @@ ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &cl
             return ER_CREATESDK_ERROR;
         }
         sdk_map_.insert({storage_config->global_unique_name(), sdk});
-        if (variable_object_size_enabled) {
-            sdk_storage_configs_.insert({storage_config->global_unique_name(), storage_config});
-        }
     }
     return ER_OK;
 }
@@ -273,119 +221,6 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
         }
         for (size_t j = 0; j < group.indices.size(); ++j) {
             (*actual_remote_uris)[group.indices[j]] = (*group_actual_uris)[j];
-        }
-    }
-    return ER_OK;
-}
-
-ClientErrorCode SdkWrapper::GetKvMetaObjects(const std::vector<DataStorageUri> &remote_uris,
-                                             const std::vector<std::uint64_t> &value_sizes,
-                                             const BlockBuffers &local_buffers) {
-    auto ec = ValidateKvMetaObjects(remote_uris, value_sizes, local_buffers);
-    if (ec != ER_OK) {
-        return ec;
-    }
-
-    std::vector<SdkGroup> groups;
-    ec = GroupBySdk(remote_uris, local_buffers, groups);
-    if (ec != ER_OK) {
-        return ec;
-    }
-    // Keep caller-owned buffers alive until every backend call returns. This
-    // path is intentionally separate from the fixed-block timeout executor.
-    for (const auto &group : groups) {
-        if (const auto group_ec = group.sdk->Get(group.uris, group.buffers); group_ec != ER_OK) {
-            return group_ec;
-        }
-    }
-    return ER_OK;
-}
-
-ClientErrorCode SdkWrapper::PutKvMetaObjects(const std::vector<DataStorageUri> &remote_uris,
-                                             const std::vector<std::uint64_t> &value_sizes,
-                                             const BlockBuffers &local_buffers,
-                                             std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) {
-    if (!actual_remote_uris) {
-        return ER_INVALID_PARAMS;
-    }
-    actual_remote_uris->clear();
-    auto ec = ValidateKvMetaObjects(remote_uris, value_sizes, local_buffers);
-    if (ec != ER_OK) {
-        return ec;
-    }
-
-    std::vector<SdkGroup> groups;
-    ec = GroupBySdk(remote_uris, local_buffers, groups);
-    if (ec != ER_OK) {
-        return ec;
-    }
-    actual_remote_uris->resize(remote_uris.size());
-    for (const auto &group : groups) {
-        auto group_result = std::make_shared<std::vector<DataStorageUri>>();
-        ec = group.sdk->Put(group.uris, group.buffers, group_result);
-        if (ec != ER_OK) {
-            actual_remote_uris->clear();
-            return ec;
-        }
-        if (group_result->size() != group.indices.size()) {
-            actual_remote_uris->clear();
-            return ER_SDKWRITE_ERROR;
-        }
-        for (std::size_t i = 0; i < group.indices.size(); ++i) {
-            (*actual_remote_uris)[group.indices[i]] = (*group_result)[i];
-        }
-    }
-    return ER_OK;
-}
-
-ClientErrorCode SdkWrapper::ValidateKvMetaObjects(const std::vector<DataStorageUri> &remote_uris,
-                                                  const std::vector<std::uint64_t> &value_sizes,
-                                                  const BlockBuffers &local_buffers) const {
-    if (!variable_object_size_enabled_ || max_variable_object_bytes_ == 0 || remote_uris.empty() ||
-        remote_uris.size() > kMaxKvMetaBatchItems || remote_uris.size() != value_sizes.size() ||
-        remote_uris.size() != local_buffers.size()) {
-        return ER_INVALID_PARAMS;
-    }
-    std::uint64_t batch_bytes = 0;
-    for (std::size_t i = 0; i < remote_uris.size(); ++i) {
-        const auto expected_size = value_sizes[i];
-        const auto &uri = remote_uris[i];
-        const auto &buffer = local_buffers[i];
-        if (expected_size == 0 || expected_size > max_variable_object_bytes_ || !HasCanonicalKvMetaAuthority(uri) ||
-            expected_size > kMaxKvMetaBatchBytes || batch_bytes > kMaxKvMetaBatchBytes - expected_size ||
-            !uri.HasParam("size") || buffer.iovs.empty()) {
-            return ER_INVALID_PARAMS;
-        }
-        const auto storage_config = sdk_storage_configs_.find(uri.GetHostName());
-        if (storage_config == sdk_storage_configs_.end() || !storage_config->second ||
-            !UriMatchesConfiguredKvMetaNamespace(uri, storage_config->second->type(), *storage_config->second)) {
-            KVCM_LOG_WARN("KVMeta URI scheme, ownership, or configured namespace does not match backend: %s",
-                          uri.GetHostName().c_str());
-            return ER_INVALID_PARAMS;
-        }
-        batch_bytes += expected_size;
-
-        const std::string uri_size_text = uri.GetParam("size");
-        std::uint64_t uri_size = 0;
-        const auto parse_result =
-            std::from_chars(uri_size_text.data(), uri_size_text.data() + uri_size_text.size(), uri_size);
-        if (uri_size_text.empty() || parse_result.ec != std::errc{} ||
-            parse_result.ptr != uri_size_text.data() + uri_size_text.size() || uri_size != expected_size) {
-            return ER_INVALID_PARAMS;
-        }
-
-        std::uint64_t buffer_size = 0;
-        for (const auto &iov : buffer.iovs) {
-            const auto base = reinterpret_cast<std::uintptr_t>(iov.base);
-            if (iov.ignore || iov.size == 0 || buffer_size > expected_size || iov.size > expected_size - buffer_size ||
-                iov.base == nullptr || (iov.type != MemoryType::CPU && iov.type != MemoryType::GPU) ||
-                iov.size > std::numeric_limits<std::uintptr_t>::max() - base) {
-                return ER_INVALID_LOCAL_BUFFERS;
-            }
-            buffer_size += iov.size;
-        }
-        if (buffer_size != expected_size) {
-            return ER_INVALID_LOCAL_BUFFERS;
         }
     }
     return ER_OK;

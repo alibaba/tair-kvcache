@@ -1,6 +1,5 @@
 #include "kv_cache_manager/client/src/kv_meta_object_client_impl.h"
 
-#include <charconv>
 #include <limits>
 #include <sys/stat.h>
 #include <unordered_set>
@@ -8,7 +7,6 @@
 
 #include "kv_cache_manager/client/src/kv_meta_transfer_client_impl.h"
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/kv_meta_uri.h"
 
 namespace kv_cache_manager {
@@ -34,20 +32,14 @@ bool IsKnownStorageType(KvMetaStorageType type) {
 }
 
 bool ValidateStorageUri(KvMetaStorageType type, const std::string &uri_text, std::uint64_t expected_size) {
-    if (uri_text.size() > kMaxKvMetaLocationUriBytes || !HasUnambiguousKvMetaUriText(uri_text)) {
+    if (!IsKnownStorageType(type)) {
         return false;
     }
-    const DataStorageUri uri(uri_text);
-    const DataStorageType allocation_type = ToDataStorageType(uri.GetProtocol());
-    if (!IsKnownStorageType(type) || !HasCanonicalKvMetaAuthority(uri) ||
-        !HasOwnedKvMetaAllocationShape(uri, allocation_type) || !uri.HasParam("size")) {
-        return false;
-    }
-    const std::string size_text = uri.GetParam("size");
     std::uint64_t size = 0;
-    const auto parsed = std::from_chars(size_text.data(), size_text.data() + size_text.size(), size);
-    return !size_text.empty() && parsed.ec == std::errc{} && parsed.ptr == size_text.data() + size_text.size() &&
-           size == expected_size;
+    const auto storage_type = type == KvMetaStorageType::TAIR_MEMPOOL_SSD
+                                  ? DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD
+                                  : DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    return IsValidKvMetaLocation(uri_text, storage_type, size) && size == expected_size;
 }
 
 bool SameStorageUris(const UriStrVec &expected, const UriStrVec &actual) {
@@ -55,7 +47,7 @@ bool SameStorageUris(const UriStrVec &expected, const UriStrVec &actual) {
         return false;
     }
     for (std::size_t i = 0; i < expected.size(); ++i) {
-        if (!HasSameCanonicalKvMetaUri(expected[i], actual[i])) {
+        if (expected[i] != actual[i]) {
             return false;
         }
     }

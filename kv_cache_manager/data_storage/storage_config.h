@@ -39,12 +39,6 @@ constexpr bool IsEventReportStorageType(const DataStorageType &type) noexcept {
            type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
 }
 
-// EMB object storage is opt-in and PACE-only in V1.
-constexpr bool SupportsKvMetaAdmission(const DataStorageType &type) noexcept {
-    return type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
-           type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
-}
-
 constexpr bool IsTairMempoolStorageType(const DataStorageType &type) noexcept {
     return type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL ||
            type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;

@@ -297,9 +297,7 @@ def _is_ok_code(pybind: Any, code: Any) -> bool:
 
 def _mutation_outcome_is_unknown(pybind: Any, code: Any) -> bool:
     try:
-        if _matches_native_code(
-            pybind, code, "ER_INVALID_GRPCSTATUS", 2
-        ) or _matches_native_code(pybind, code, "ER_SERVICE_OUTCOME_UNKNOWN", 65):
+        if _matches_native_code(pybind, code, "ER_INVALID_GRPCSTATUS", 2):
             return True
         members = tuple(pybind.ClientErrorCode.__members__.values())
     except Exception:

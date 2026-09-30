@@ -24,7 +24,6 @@ class _Code(IntEnum):
     ER_OK = 0
     ER_INVALID_GRPCSTATUS = 2
     ER_FAILED = 51
-    ER_SERVICE_OUTCOME_UNKNOWN = 65
 
 
 class _Memory(IntEnum):
@@ -599,15 +598,10 @@ class KvMetaObjectClientTest(unittest.TestCase):
     def test_ambiguous_mutations_and_native_exceptions_are_marked_unknown(self):
         client, native, _ = _client()
         self.addCleanup(client.close)
-        for code in (
-            _Code.ER_INVALID_GRPCSTATUS,
-            _Code.ER_SERVICE_OUTCOME_UNKNOWN,
-        ):
-            with self.subTest(save_code=code):
-                native.results["SaveObjects"] = [code]
-                with self.assertRaises(KvMetaObjectClientError) as save_error:
-                    client.save(["key"], [_Tensor()])
-                self.assertTrue(save_error.exception.unknown_outcome)
+        native.results["SaveObjects"] = [_Code.ER_INVALID_GRPCSTATUS]
+        with self.assertRaises(KvMetaObjectClientError) as save_error:
+            client.save(["key"], [_Tensor()])
+        self.assertTrue(save_error.exception.unknown_outcome)
 
         def fail_remove(*_args):
             raise OSError("endpoint and key must not leak")
@@ -620,7 +614,7 @@ class KvMetaObjectClientTest(unittest.TestCase):
         self.assertNotIn("endpoint", str(remove_error.exception))
 
         native.Remove = _FakeClient.Remove.__get__(native, _FakeClient)
-        native.results["Remove"] = [_Code.ER_SERVICE_OUTCOME_UNKNOWN]
+        native.results["Remove"] = [_Code.ER_INVALID_GRPCSTATUS]
         with self.assertRaises(KvMetaObjectClientError) as service_error:
             client.remove(["key"])
         self.assertTrue(service_error.exception.unknown_outcome)

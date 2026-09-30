@@ -1,8 +1,6 @@
 #include <gtest/gtest.h>
-#include <memory>
 
 #include "kv_cache_manager/common/unittest.h"
-#include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 
 using namespace kv_cache_manager;
@@ -26,34 +24,6 @@ TEST_F(StorageConfigTest, TestNfsStorageSpecJsonize) {
     spec2.FromJsonString(json);
     EXPECT_EQ(spec.root_path(), spec2.root_path());
     EXPECT_EQ(spec.key_count_per_file(), spec2.key_count_per_file());
-}
-
-TEST_F(StorageConfigTest, KvMetaAdmissionIsLimitedToPace) {
-    EXPECT_TRUE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
-    EXPECT_TRUE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
-    EXPECT_FALSE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_NFS));
-    EXPECT_FALSE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-    EXPECT_FALSE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
-    EXPECT_FALSE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
-    EXPECT_FALSE(SupportsKvMetaAdmission(DataStorageType::DATA_STORAGE_TYPE_DUMMY));
-}
-
-TEST_F(StorageConfigTest, KvMetaPaceNamespaceRequiresTheRegisteredMediaPool) {
-    auto ssd_spec = std::make_shared<TairMemPoolStorageSpec>();
-    ssd_spec->set_media_type(kTairMemPoolMediaTypeSsd);
-    const StorageConfig ssd(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace_ssd", ssd_spec);
-    EXPECT_TRUE(HasSafeConfiguredKvMetaNamespace(ssd));
-    EXPECT_TRUE(UriMatchesConfiguredKvMetaNamespace(
-        DataStorageUri("pace://pace_ssd/42?media_type=5&node_id=1&range_id=0&size=17"), ssd.type(), ssd));
-    EXPECT_FALSE(UriMatchesConfiguredKvMetaNamespace(
-        DataStorageUri("pace://pace_ssd/42?media_type=2&node_id=1&range_id=0&size=17"), ssd.type(), ssd));
-
-    auto automatic_spec = std::make_shared<TairMemPoolStorageSpec>();
-    const StorageConfig automatic(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "pace", automatic_spec);
-    EXPECT_TRUE(UriMatchesConfiguredKvMetaNamespace(
-        DataStorageUri("pace://pace/7?media_type=0&node_id=1&range_id=0&size=1"), automatic.type(), automatic));
-    EXPECT_TRUE(UriMatchesConfiguredKvMetaNamespace(
-        DataStorageUri("pace://pace/7?media_type=2&node_id=1&range_id=0&size=1"), automatic.type(), automatic));
 }
 
 TEST_F(StorageConfigTest, TestStorageConfigJsonizeNfs) {
