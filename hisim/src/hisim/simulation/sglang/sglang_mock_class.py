@@ -11,9 +11,6 @@ from functools import wraps
 
 from hisim.utils.logger import get_logger
 from hisim.simulation.manager import StateManager, ConfigManager, Envs
-from sglang.srt.mem_cache.hicache_storage import (
-    HiCacheStorageExtraInfo,
-)
 from hisim.simulation.sglang.version import VersionDispatcher
 
 try:
@@ -916,8 +913,8 @@ class MockTokenToKVPoolHost:
         assert len(host_indices) == len(device_indices)
         num_indices = len(host_indices)
 
-        host = np.asarray(host_indices, dtype=np.int64)
-        dev = np.asarray(device_indices, dtype=np.int64)
+        host = np.asarray(host_indices.cpu(), dtype=np.int64)
+        dev = np.asarray(device_indices.cpu(), dtype=np.int64)
         cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
         cut = np.flatnonzero(~cont) + 1
         starts = np.r_[0, cut]
@@ -944,8 +941,8 @@ class MockTokenToKVPoolHost:
         # update global clock
         num_indices = len(host_indices)
 
-        host = np.asarray(host_indices, dtype=np.int64)
-        dev = np.asarray(device_indices, dtype=np.int64)
+        host = np.asarray(host_indices.cpu(), dtype=np.int64)
+        dev = np.asarray(device_indices.cpu(), dtype=np.int64)
         cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
         cut = np.flatnonzero(~cont) + 1
         starts = np.r_[0, cut]
@@ -1100,7 +1097,7 @@ class MockHiCacheStorage:
         self,
         keys: List[str],
         values: Optional[Any] = None,
-        extra_info: HiCacheStorageExtraInfo = None,
+        extra_info = None,  # HiCacheStorageExtraInfo
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
