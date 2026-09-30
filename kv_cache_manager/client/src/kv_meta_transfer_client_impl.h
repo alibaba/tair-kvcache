@@ -17,9 +17,7 @@ class SdkWrapper;
 ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_config,
                                                    const InitParams &init_params,
                                                    const std::string *expected_instance_group = nullptr,
-                                                   const std::string *expected_instance_id = nullptr,
-                                                   std::int32_t write_timeout_seconds = 0,
-                                                   std::uint32_t metadata_call_timeout_ms = 0);
+                                                   const std::string *expected_instance_id = nullptr);
 
 class KvMetaTransferClientImpl final : public KvMetaTransferClient {
 public:

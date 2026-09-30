@@ -71,27 +71,9 @@ bool IsRetryable(ClientErrorCode error) { return error == ER_SERVICE_NOT_LEADER 
 
 bool ToPublicStorageType(proto::kv_meta::StorageType source, KvMetaStorageType &target) {
     switch (source) {
-    case proto::kv_meta::ST_3FS:
-        target = KvMetaStorageType::HF3FS;
-        return true;
-    case proto::kv_meta::ST_MOONCAKE:
-        target = KvMetaStorageType::MOONCAKE;
-        return true;
     case proto::kv_meta::ST_TAIRMEMPOOL:
         target = KvMetaStorageType::TAIR_MEMPOOL;
         return true;
-    case proto::kv_meta::ST_NFS:
-        target = KvMetaStorageType::NFS;
-        return true;
-    case proto::kv_meta::ST_VCNS_3FS:
-        target = KvMetaStorageType::VCNS_HF3FS;
-        return true;
-    case proto::kv_meta::ST_DUMMY:
-        target = KvMetaStorageType::DUMMY;
-        return true;
-    case proto::kv_meta::ST_EVENT_REPORT_L1P5:
-    case proto::kv_meta::ST_EVENT_REPORT_L2:
-        return false;
     case proto::kv_meta::ST_TAIRMEMPOOL_SSD:
         target = KvMetaStorageType::TAIR_MEMPOOL_SSD;
         return true;
@@ -121,30 +103,8 @@ bool ToPublicLocation(const proto::kv_meta::ValueLocation &source, KvMetaValueLo
     if (size_text.empty() || parsed.ec != std::errc{} || parsed.ptr != size_text.data() + size_text.size()) {
         return false;
     }
-    const auto scheme_matches = [&]() {
-        switch (target.type) {
-        case KvMetaStorageType::HF3FS:
-            return uri.GetProtocol() == "hf3fs";
-        case KvMetaStorageType::VCNS_HF3FS:
-            return uri.GetProtocol() == "hf3fs" || uri.GetProtocol() == "vcns_hf3fs";
-        case KvMetaStorageType::MOONCAKE:
-            return uri.GetProtocol() == "mooncake";
-        case KvMetaStorageType::TAIR_MEMPOOL:
-        case KvMetaStorageType::TAIR_MEMPOOL_SSD:
-            return uri.GetProtocol() == "pace";
-        case KvMetaStorageType::NFS:
-            return uri.GetProtocol() == "file";
-        case KvMetaStorageType::DUMMY:
-            return uri.GetProtocol() == "dummy";
-        case KvMetaStorageType::EVENT_REPORT_L1P5:
-        case KvMetaStorageType::EVENT_REPORT_L2:
-        case KvMetaStorageType::UNSPECIFIED:
-        default:
-            return false;
-        }
-    };
     const DataStorageType allocation_type = ToDataStorageType(uri.GetProtocol());
-    if (source_spec.name() != "value" || uri_size != source.value_size() || !scheme_matches() ||
+    if (source_spec.name() != "value" || uri_size != source.value_size() ||
         !HasOwnedKvMetaAllocationShape(uri, allocation_type)) {
         target = {};
         return false;

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -74,9 +73,6 @@ private:
     std::shared_ptr<KvMetaServiceGRpc> kv_meta_service_;
     std::shared_ptr<grpc::Server> rpc_server_;
     std::shared_ptr<grpc::Server> admin_rpc_server_;
-    // Captures the actual primary RPC port selected by gRPC. It differs from
-    // GetServiceRpcPort() only when an integration test requests port zero.
-    int32_t bound_rpc_port_ = 0;
     std::shared_ptr<MetaServiceHttp> meta_http_service_;
     std::shared_ptr<AdminServiceHttp> admin_http_service_;
     std::shared_ptr<DebugServiceHttp> debug_http_service_;
@@ -85,13 +81,12 @@ private:
     std::thread admin_http_thread_;
     std::thread debug_http_thread_;
     std::thread kv_meta_recovery_thread_;
-    // Serializes the complete move-and-join lifecycle. The recovery mutex
-    // cannot be held across join because the worker takes it before opening
-    // the service gate, while releasing it before join alone would let a
-    // concurrent demotion/Stop proceed to DoCleanup too early.
+    // Leader callbacks are serialized by LeaderElector. The lifecycle mutex
+    // additionally prevents Stop/Wait from joining the same worker twice;
+    // the gate mutex orders recovery completion against demotion.
     std::mutex kv_meta_recovery_join_mutex_;
     std::mutex kv_meta_recovery_mutex_;
-    std::atomic<std::uint64_t> kv_meta_recovery_epoch_{0};
+    std::atomic<bool> kv_meta_recovery_stop_{true};
 
     std::shared_ptr<CoordinationBackend> coordination_backend_;
     std::shared_ptr<LeaderElector> leader_elector_;

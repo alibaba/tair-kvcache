@@ -7,7 +7,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -19,8 +18,8 @@
 
 namespace kv_cache_manager {
 
-class CacheManager;
 class CacheLocation;
+class CacheManager;
 class DataStorageSelector;
 class InstanceInfo;
 class KvMetaReclaimer;
@@ -28,9 +27,8 @@ class KvMetaWriteSessionManager;
 class RegistryManager;
 class RequestContext;
 
-// Generic, exact-key object metadata path used by embedding and other opaque
-// values.  It deliberately does not call StartWriteCache/FinishWriteCache and
-// never changes the fixed-size KV-cache allocation path.
+// Metadata and lifecycle management for variable-size cache objects. This is
+// intentionally independent from the fixed-block KV-cache write path.
 class KvMetaManager {
 public:
     struct Limits {
@@ -60,11 +58,7 @@ public:
 
     struct StartWriteResult {
         std::string write_session_id;
-        // Exact compact-session cardinality recorded only after the session
-        // is published. This is internal rollback metadata and is never sent
-        // on the wire.
-        std::size_t session_item_count = 0;
-        // Request-aligned. true means the caller must not write this key.
+        // Request-aligned. true means an equal-size committed object already exists.
         std::vector<bool> key_mask;
         // Only entries whose key_mask is false, in request-relative order.
         std::vector<ValueLocation> locations;
@@ -81,19 +75,9 @@ public:
 
     bool Init();
     void Shutdown();
-    // Reconciles stale generic-object writes after CacheManager has recreated
-    // all indexers. This only scans instances in the reserved KVMeta namespace.
     ErrorCode DoRecover(std::function<bool()> should_abort = nullptr);
-    // Stops the expiry worker and forgets in-memory sessions. Their invisible
-    // active metadata is reclaimed by the next leader's isolated recovery;
-    // demotion never walks an unbounded session set on the main cleanup path.
     void DoCleanup();
-    // Non-blockingly cancels Trim, closes new session admission, and wakes the
-    // expiry worker. Server demotion can therefore finish the existing
-    // KV-cache drain/GC/migration sequence before joining KVMeta workers.
     void CancelMaintenance() noexcept;
-    // Called only after a successful leader recovery. It also restarts the
-    // write-session expiry worker stopped by DoCleanup.
     bool ResumeMaintenance();
 
     std::pair<ErrorCode, std::string> RegisterInstance(RequestContext *request_context,
@@ -128,75 +112,36 @@ public:
 private:
     struct SessionItem;
     struct ExactLocation;
-    struct DeleteItemsOptions {
-        // Physical deletion is authorized only after this call conditionally
-        // replaces the exact owner with a durable read-invisible tombstone.
-        // A backend without generation-aware delete is attempted at most once.
-        bool delete_physical = true;
-        bool adjust_storage_usage = true;
-        bool maintenance_no_touch = false;
-        // Reclaimer retry is the sole expected already-absent case: its
-        // in-memory pending record fences successor generations while the
-        // previous metadata Sync is retried.
-        bool sync_metadata_absent = false;
-        bool restore_usage_on_sync_failure = true;
-    };
-    struct DeleteItemsResult {
-        ErrorCode ec = EC_OK;
-        bool metadata_outcome_changed = false;
-        bool metadata_cleanup_complete = false;
-        bool metadata_already_absent = false;
-        bool metadata_owner_conflicted = false;
-        // Request-aligned evidence used by the Reclaimer to distinguish its
-        // own post-delete Sync retry from an unexpected missing or replaced
-        // owner.
-        std::vector<bool> metadata_deleted;
-        std::vector<bool> metadata_absent;
-        std::vector<bool> metadata_conflicted;
-    };
 
     static std::string InternalInstanceId(const std::string &instance_id);
     static std::int64_t InternalKey(const std::string &key);
     static std::string StableLocationId(const std::string &key);
 
-    bool IsOwnedLocation(std::int64_t internal_key, const std::string &location_id) const;
-    ErrorCode ValidateOwnedLocation(RequestContext *request_context,
-                                    const std::string &internal_instance_id,
-                                    std::int64_t internal_key,
-                                    const std::string &location_id,
-                                    const CacheLocation &location,
-                                    std::uint64_t &value_size) const;
     ErrorCode ValidateInstanceId(RequestContext *request_context, const std::string &instance_id) const;
-    std::pair<ErrorCode, std::shared_ptr<const InstanceInfo>>
-    GetValidatedInstanceInfo(RequestContext *request_context, const std::string &instance_id) const;
     ErrorCode ValidateKeys(RequestContext *request_context, const std::vector<std::string> &keys) const;
     ErrorCode ValidateCacheConfiguration(RequestContext *request_context, const std::string &instance_group) const;
-    ErrorCode CheckDynamicByteAdmission(RequestContext *request_context,
-                                        const std::string &instance_group,
-                                        DataStorageType storage_type,
-                                        std::uint64_t requested_bytes) const;
+    std::pair<ErrorCode, std::shared_ptr<const InstanceInfo>>
+    GetValidatedInstanceInfo(RequestContext *request_context, const std::string &instance_id) const;
+    ErrorCode ValidateLocation(RequestContext *request_context,
+                               std::int64_t internal_key,
+                               const std::string &location_id,
+                               const CacheLocation &location,
+                               std::uint64_t &value_size) const;
     ErrorCode LoadExactLocations(RequestContext *request_context,
                                  const std::string &internal_instance_id,
                                  const std::vector<std::string> &keys,
                                  std::vector<ExactLocation> &out) const;
-    DeleteItemsResult DeleteItems(RequestContext *request_context,
-                                  const std::string &internal_instance_id,
-                                  const std::vector<SessionItem> &items,
-                                  const DeleteItemsOptions &options);
-    DeleteItemsResult DeleteRetiredMetadata(RequestContext *request_context,
-                                            const std::string &internal_instance_id,
-                                            const std::vector<SessionItem> &items);
-    ErrorCode FinishWriteInternal(RequestContext *request_context,
-                                  const std::string &internal_instance_id,
-                                  const std::vector<bool> &success_keys,
-                                  const std::vector<SessionItem> &items);
-    ErrorCode DeleteStorageUris(RequestContext *request_context,
-                                const std::string &storage_name,
-                                const std::vector<DataStorageUri> &uris) const;
-    ErrorCode DeleteAllocatedLocations(RequestContext *request_context, const std::vector<SessionItem> &items) const;
-    // Returns false when the persisted location cannot be bound to a valid
-    // KVMeta backend. `retry_safe` is meaningful only on true.
-    bool TryGetKvMetaDeleteRetrySafety(const CacheLocation &location, bool &retry_safe) const;
+    ErrorCode DeleteItems(RequestContext *request_context,
+                          const std::string &internal_instance_id,
+                          const std::vector<SessionItem> &items,
+                          bool delete_physical,
+                          bool maintenance_read,
+                          std::uint64_t *deleted_bytes = nullptr);
+    void DeletePhysicalBestEffort(RequestContext *request_context, const std::vector<SessionItem> &items) const;
+    void ExpireSession(const std::string &session_id,
+                       const std::string &internal_instance_id,
+                       const std::vector<SessionItem> &items) noexcept;
+
     void RememberKvMetaGroup(const std::string &instance_group);
     std::vector<std::string> SnapshotKvMetaGroups() const;
     void ReplaceKvMetaGroups(std::unordered_set<std::string> instance_groups);
@@ -204,28 +149,20 @@ private:
 private:
     friend class KvMetaReclaimer;
     friend class KvMetaWriteSessionManager;
+
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<RegistryManager> registry_manager_;
     Limits limits_;
     std::unique_ptr<DataStorageSelector> data_storage_selector_;
     std::unique_ptr<KvMetaReclaimer> reclaimer_;
     std::unique_ptr<KvMetaWriteSessionManager> write_session_manager_;
-    mutable std::mutex registration_mutex_;
-    // Reclaimer rounds must never enumerate every ordinary KV-cache group.
-    // Registration and leader recovery are the only supported discovery
-    // points for the reserved KVMeta instance schema, so retain that bounded
-    // set and keep periodic maintenance entirely on the side path.
+
+    std::mutex registration_mutex_;
     mutable std::mutex kv_meta_groups_mutex_;
     std::unordered_set<std::string> kv_meta_groups_;
-    // Coordinates destructive metadata transitions within a KVMeta group.
-    // PutStart takes the shared side, so independent writers are never
-    // serialized by logical-capacity accounting and may temporarily exceed a
-    // configured reclaim target. Remove/Trim/session cleanup/Reclaimer take
-    // the exclusive side to preserve tombstone and physical-owner ordering.
-    // The ordinary fixed-block cache path never enters this side-path gate.
-    mutable std::array<std::shared_mutex, 64> group_lifecycle_mutexes_;
-    // Each set is accessed only while holding the matching shard above.
-    std::array<std::unordered_set<std::string>, 64> trimming_instances_;
+    // Serializes only SERVING transitions and deletes so their byte-counter
+    // updates cannot cross. PutStart never enters this lock.
+    mutable std::array<std::mutex, 64> metadata_mutation_mutexes_;
     std::atomic<bool> maintenance_cancelled_{false};
     std::atomic<bool> initialized_{false};
 };

@@ -1,8 +1,7 @@
+#include <atomic>
 #include <cstddef>
-#include <filesystem>
 #include <functional>
 #include <memory>
-#include <shared_mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -13,8 +12,8 @@
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
-#include "kv_cache_manager/data_storage/nfs_backend.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/kv_meta_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
@@ -25,21 +24,65 @@
 namespace kv_cache_manager {
 namespace {
 
-class FailingAbortDeleteNfsBackend : public NfsBackend {
+class TestPaceBackend : public DataStorageBackend {
 public:
-    explicit FailingAbortDeleteNfsBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
-        : NfsBackend(std::move(metrics_registry)) {}
+    explicit TestPaceBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
+        : DataStorageBackend(std::move(metrics_registry)) {}
 
-    std::vector<ErrorCode>
-    Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &, std::function<void()> cb) override {
-        ++delete_attempts;
+    DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL; }
+    bool Available() override { return IsOpen() && IsAvailable(); }
+    double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
+    ErrorCode DoOpen(const StorageConfig &, const std::string &) override {
+        SetOpen(true);
+        SetAvailable(true);
+        return EC_OK;
+    }
+    ErrorCode Close() override {
+        SetOpen(false);
+        SetAvailable(false);
+        return EC_OK;
+    }
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             std::size_t size,
+                                                             const std::string &,
+                                                             std::function<void()> cb) override {
+        std::vector<std::pair<ErrorCode, DataStorageUri>> result;
+        result.reserve(keys.size());
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            DataStorageUri uri;
+            uri.SetProtocol(kTairMempoolUriScheme);
+            uri.SetPath("/" + std::to_string(next_offset_.fetch_add(1)));
+            uri.SetParam("media_type", "0");
+            uri.SetParam("node_id", "1");
+            uri.SetParam("range_id", "0");
+            uri.SetParam("size", std::to_string(size));
+            result.emplace_back(EC_OK, std::move(uri));
+        }
         if (cb) {
             cb();
         }
-        return std::vector<ErrorCode>(storage_uris.size(), EC_IO_ERROR);
+        return result;
     }
 
-    std::size_t delete_attempts{0};
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &, std::function<void()> cb) override {
+        if (cb) {
+            cb();
+        }
+        return std::vector<ErrorCode>(storage_uris.size(), EC_OK);
+    }
+    std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<bool>(uris.size(), true);
+    }
+    std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<ErrorCode>(uris.size(), EC_OK);
+    }
+    std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<ErrorCode>(uris.size(), EC_OK);
+    }
+
+private:
+    std::atomic<std::uint64_t> next_offset_{1};
 };
 
 class KvMetaServiceImplTest : public TESTBASE {
@@ -56,13 +99,20 @@ protected:
         ASSERT_TRUE(loader.Init(registry_manager_));
         ASSERT_TRUE(loader.Load(""));
 
-        const auto nfs_backend = registry_manager_->data_storage_manager()->GetDataStorageBackend("nfs_01");
-        ASSERT_TRUE(nfs_backend);
-        const auto nfs_spec = std::dynamic_pointer_cast<NfsStorageSpec>(nfs_backend->GetStorageConfig().storage_spec());
-        ASSERT_TRUE(nfs_spec);
-        std::error_code nfs_root_ec;
-        std::filesystem::create_directories(nfs_spec->root_path(), nfs_root_ec);
-        ASSERT_FALSE(nfs_root_ec) << nfs_root_ec.message();
+        auto pace_spec = std::make_shared<TairMemPoolStorageSpec>();
+        pace_spec->set_domain("test-pace");
+        auto pace = std::make_shared<TestPaceBackend>(metrics_registry_);
+        ASSERT_EQ(EC_OK,
+                  pace->Open(StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, kStorageName, pace_spec),
+                             setup_context_.trace_id()));
+        registry_manager_->data_storage_manager()->storage_map_[kStorageName] = std::move(pace);
+        const auto [group_ec, group] = registry_manager_->GetInstanceGroup(&setup_context_, "default");
+        ASSERT_EQ(EC_OK, group_ec);
+        ASSERT_TRUE(group);
+        InstanceGroup updated(*group);
+        updated.set_storage_candidates({kStorageName});
+        updated.set_version(group->version() + 1);
+        ASSERT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(&setup_context_, updated, group->version()));
 
         kv_meta_manager_ = std::make_shared<KvMetaManager>(cache_manager_, registry_manager_);
         ASSERT_TRUE(kv_meta_manager_->Init());
@@ -81,6 +131,7 @@ protected:
     }
 
     static constexpr const char *kInstanceId = "embedding-service-instance";
+    static constexpr const char *kStorageName = "pace_test";
     RequestContext setup_context_{"kv_meta_service_setup"};
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<RegistryManager> registry_manager_;
@@ -170,44 +221,17 @@ TEST_F(KvMetaServiceImplTest, DynamicSizeProtocolIsAlignedAndFinishFailsClosed) 
     EXPECT_TRUE(wrong_size_response.locations().empty());
 }
 
-TEST_F(KvMetaServiceImplTest, MalformedPutStartAbortMustCompleteBeforeReportingInternalError) {
+TEST_F(KvMetaServiceImplTest, MalformedPutStartCanAbortOnlyABoundedPublishedSession) {
     auto [clean_start_ec, clean_start] =
         kv_meta_manager_->StartWrite(&setup_context_, kInstanceId, {"malformed-clean-abort"}, {17}, 30);
     ASSERT_EQ(EC_OK, clean_start_ec);
     ASSERT_FALSE(clean_start.write_session_id.empty());
-    ASSERT_EQ(1, clean_start.session_item_count);
     EXPECT_EQ(EC_OK,
               service_->AbortMalformedPutStart(
-                  &setup_context_, kInstanceId, clean_start.write_session_id, clean_start.session_item_count));
-
-    auto [failed_start_ec, failed_start] =
-        kv_meta_manager_->StartWrite(&setup_context_, kInstanceId, {"malformed-failed-abort"}, {19}, 30);
-    ASSERT_EQ(EC_OK, failed_start_ec);
-    ASSERT_FALSE(failed_start.write_session_id.empty());
-    ASSERT_EQ(1, failed_start.session_item_count);
-
-    auto storage_manager = registry_manager_->data_storage_manager();
-    ASSERT_TRUE(storage_manager);
-    auto original = storage_manager->GetDataStorageBackend("nfs_01");
-    ASSERT_TRUE(original);
-    auto failing = std::make_shared<FailingAbortDeleteNfsBackend>(metrics_registry_);
-    ASSERT_EQ(EC_OK, failing->Open(original->GetStorageConfig(), setup_context_.trace_id()));
-    {
-        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
-        storage_manager->storage_map_["nfs_01"] = failing;
-    }
+                  &setup_context_, kInstanceId, clean_start.write_session_id, clean_start.locations.size()));
 
     EXPECT_EQ(EC_OUTCOME_UNKNOWN,
-              service_->AbortMalformedPutStart(
-                  &setup_context_, kInstanceId, failed_start.write_session_id, failed_start.session_item_count));
-    EXPECT_EQ(1, failing->delete_attempts);
-    EXPECT_EQ(EC_OUTCOME_UNKNOWN,
-              service_->AbortMalformedPutStart(&setup_context_, kInstanceId, failed_start.write_session_id, 0));
-
-    {
-        std::unique_lock<std::shared_mutex> lock(storage_manager->rw_lock_);
-        storage_manager->storage_map_["nfs_01"] = original;
-    }
+              service_->AbortMalformedPutStart(&setup_context_, kInstanceId, "untrusted-session", 0));
 }
 
 TEST_F(KvMetaServiceImplTest, IndependentLeaderGateRejectsRequests) {
@@ -298,7 +322,7 @@ TEST_F(KvMetaServiceImplTest, OversizedRequestShapesAreRejectedAtTheRpcBoundary)
     EXPECT_EQ(proto::kv_meta::INVALID_ARGUMENT, oversized_session_response.header().status().code());
 }
 
-TEST_F(KvMetaServiceImplTest, RemoveReportsAnActiveWriterWithoutConsumingItsSession) {
+TEST_F(KvMetaServiceImplTest, RemoveCanAbortAnActiveReservation) {
     proto::kv_meta::PutStartRequest start_request;
     start_request.set_trace_id("active-remove-start");
     start_request.set_instance_id(kInstanceId);
@@ -317,7 +341,7 @@ TEST_F(KvMetaServiceImplTest, RemoveReportsAnActiveWriterWithoutConsumingItsSess
     proto::kv_meta::CommonResponse remove_response;
     RequestContext remove_context(remove_request.trace_id());
     service_->Remove(&remove_context, &remove_request, &remove_response);
-    EXPECT_EQ(proto::kv_meta::WRITE_IN_PROGRESS, remove_response.header().status().code());
+    EXPECT_EQ(proto::kv_meta::OK, remove_response.header().status().code());
 
     proto::kv_meta::PutFinishRequest finish_request;
     finish_request.set_trace_id("active-remove-finish");
@@ -377,7 +401,7 @@ TEST_F(KvMetaServiceImplTest, PutStartReportsAnActiveWriterWithoutClaimingACache
     EXPECT_TRUE(committed_response.locations().empty());
 }
 
-TEST_F(KvMetaServiceImplTest, TrimReportsAnActiveWriterWithoutConsumingItsSession) {
+TEST_F(KvMetaServiceImplTest, TrimCanAbortAnActiveReservation) {
     proto::kv_meta::PutStartRequest start_request;
     start_request.set_trace_id("active-trim-start");
     start_request.set_instance_id(kInstanceId);
@@ -396,7 +420,7 @@ TEST_F(KvMetaServiceImplTest, TrimReportsAnActiveWriterWithoutConsumingItsSessio
     proto::kv_meta::CommonResponse trim_response;
     RequestContext trim_context(trim_request.trace_id());
     service_->Trim(&trim_context, &trim_request, &trim_response);
-    EXPECT_EQ(proto::kv_meta::WRITE_IN_PROGRESS, trim_response.header().status().code());
+    EXPECT_EQ(proto::kv_meta::OK, trim_response.header().status().code());
 
     proto::kv_meta::PutFinishRequest finish_request;
     finish_request.set_trace_id("active-trim-finish");

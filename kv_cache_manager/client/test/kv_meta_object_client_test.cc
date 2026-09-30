@@ -42,10 +42,14 @@ void ThrowIfRequested(ThrowMode mode) {
 
 KvMetaValueLocation MakeLocation(const std::string &uri, std::uint64_t size) {
     KvMetaValueLocation location;
-    location.type = KvMetaStorageType::NFS;
+    location.type = uri.rfind("pace://", 0) == 0 ? KvMetaStorageType::TAIR_MEMPOOL : KvMetaStorageType::NFS;
     location.value_size = size;
     location.location_specs.push_back({"value", uri});
     return location;
+}
+
+std::string PaceUri(std::uint64_t offset, std::uint64_t size) {
+    return "pace://pace/" + std::to_string(offset) + "?media_type=0&node_id=1&range_id=0&size=" + std::to_string(size);
 }
 
 BlockBuffer MakeBuffer(void *base, std::size_t size) {
@@ -263,7 +267,7 @@ TEST_F(KvMetaObjectClientTest, SavesOnlyMissingObjectsAndCommits) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {true, false};
     metadata_->start_result.locations = {
-        MakeLocation("file://nfs/object?size=9", sizeof(second_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
 
     EXPECT_EQ(ER_OK, client_->SaveObjects("trace", keys_, sizes_, buffers_));
@@ -273,7 +277,7 @@ TEST_F(KvMetaObjectClientTest, SavesOnlyMissingObjectsAndCommits) {
     EXPECT_EQ(30, metadata_->started_timeout_seconds);
     EXPECT_EQ(0, metadata_->get_calls);
     EXPECT_EQ(1, transfer_->save_calls);
-    EXPECT_EQ((UriStrVec{"file://nfs/object?size=9"}), transfer_->saved_uris);
+    EXPECT_EQ((UriStrVec{PaceUri(2, sizeof(second_))}), transfer_->saved_uris);
     EXPECT_EQ((std::vector<std::uint64_t>{sizeof(second_)}), transfer_->saved_sizes);
     EXPECT_EQ((std::vector<void *>{second_}), transfer_->saved_bases);
     EXPECT_EQ(1U, transfer_->saved_buffer_count);
@@ -368,8 +372,8 @@ TEST_F(KvMetaObjectClientTest, AbortsWholeSessionWhenTransferFails) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
     metadata_->start_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
     transfer_->save_ec = ER_SDKWRITE_ERROR;
 
@@ -382,8 +386,8 @@ TEST_F(KvMetaObjectClientTest, DataPlaneSaveExceptionsAreContainedAndAbortTheSes
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
     metadata_->start_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
 
     for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
@@ -401,12 +405,12 @@ TEST_F(KvMetaObjectClientTest, AbortsWholeSessionWhenBackendRewritesAnyUri) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
     metadata_->start_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
     transfer_->actual_uris = {
-        "file://nfs/first?size=5",
-        "file://nfs/rewritten?size=9",
+        PaceUri(1, sizeof(first_)),
+        PaceUri(3, sizeof(second_)),
     };
 
     EXPECT_EQ(ER_SDKWRITE_ERROR, client_->SaveObjects("trace", keys_, sizes_, buffers_));
@@ -419,14 +423,14 @@ TEST_F(KvMetaObjectClientTest, AcceptsSemanticallyIdenticalCanonicalizedUris) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
     metadata_->start_result.locations = {
-        MakeLocation("file://nfs/first?size=5&blkid=0", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=9&blkid=0", sizeof(second_)),
+        MakeLocation("pace://pace/1?size=5&range_id=0&node_id=1&media_type=0", sizeof(first_)),
+        MakeLocation("pace://pace/2?size=9&range_id=0&node_id=1&media_type=0", sizeof(second_)),
     };
     // SDK results are serialized from StandardUri and therefore sort query
     // keys. Parameter order is not an object-identity change.
     transfer_->actual_uris = {
-        "file://nfs/first?blkid=0&size=5",
-        "file://nfs/second?blkid=0&size=9",
+        PaceUri(1, sizeof(first_)),
+        PaceUri(2, sizeof(second_)),
     };
 
     EXPECT_EQ(ER_OK, client_->SaveObjects("trace", keys_, sizes_, buffers_));
@@ -439,8 +443,8 @@ TEST_F(KvMetaObjectClientTest, PropagatesCommitFailureWithoutRepeatingDataWrite)
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
     metadata_->start_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
     metadata_->finish_ec = ER_INVALID_GRPCSTATUS;
 
@@ -455,8 +459,8 @@ TEST_F(KvMetaObjectClientTest, CommitExceptionsBecomeAmbiguousErrorsWithoutRepea
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
     metadata_->start_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
 
     for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
@@ -473,8 +477,8 @@ TEST_F(KvMetaObjectClientTest, ReturnsRollbackErrorWhenAbortOutcomeIsUnknown) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
     metadata_->start_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
     metadata_->finish_ec = ER_INVALID_GRPCSTATUS;
     transfer_->save_ec = ER_SDKWRITE_ERROR;
@@ -486,8 +490,8 @@ TEST_F(KvMetaObjectClientTest, RollbackExceptionsBecomeAmbiguousErrors) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
     metadata_->start_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
     transfer_->save_ec = ER_SDKWRITE_ERROR;
 
@@ -510,19 +514,19 @@ TEST_F(KvMetaObjectClientTest, RejectsBadBufferBeforeMetadataMutation) {
 TEST_F(KvMetaObjectClientTest, LoadsOnlyAfterEveryKeyAndSizeMatches) {
     metadata_->get_result.hit_mask = {true, true};
     metadata_->get_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
 
     EXPECT_EQ(ER_OK, client_->LoadObjects("trace", keys_, sizes_, buffers_));
     EXPECT_EQ(1, transfer_->load_calls);
-    EXPECT_EQ((UriStrVec{"file://nfs/first?size=5", "file://nfs/second?size=9"}), transfer_->loaded_uris);
+    EXPECT_EQ((UriStrVec{PaceUri(1, sizeof(first_)), PaceUri(2, sizeof(second_))}), transfer_->loaded_uris);
     EXPECT_EQ(sizes_, transfer_->loaded_sizes);
     EXPECT_EQ((std::vector<void *>{first_, second_}), transfer_->loaded_bases);
     EXPECT_EQ(2U, transfer_->loaded_buffer_count);
 }
 
-TEST_F(KvMetaObjectClientTest, AcceptsMooncakeLocationsOnlyWithACanonicalObjectKey) {
+TEST_F(KvMetaObjectClientTest, RejectsUnsupportedMooncakeLocations) {
     metadata_->get_result.hit_mask = {true, true};
     const std::string first_uri = "mooncake://moon/first?key=kvmeta/a/1/0123456789abcdefghijklmnopqrstuv&size=5";
     const std::string second_uri = "mooncake://moon/second?key=kvmeta/a/2/0123456789abcdefghijklmnopqrstuv&size=9";
@@ -532,16 +536,15 @@ TEST_F(KvMetaObjectClientTest, AcceptsMooncakeLocationsOnlyWithACanonicalObjectK
     second.type = KvMetaStorageType::MOONCAKE;
     metadata_->get_result.locations = {first, second};
 
-    EXPECT_EQ(ER_OK, client_->LoadObjects("trace", keys_, sizes_, buffers_));
-    EXPECT_EQ(1, transfer_->load_calls);
-    EXPECT_EQ((UriStrVec{first_uri, second_uri}), transfer_->loaded_uris);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client_->LoadObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(0, transfer_->load_calls);
 }
 
 TEST_F(KvMetaObjectClientTest, PropagatesLoadFailureAfterOneExactDataPlaneCall) {
     metadata_->get_result.hit_mask = {true, true};
     metadata_->get_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
     transfer_->load_ec = ER_SDKREAD_ERROR;
 
@@ -555,8 +558,8 @@ TEST_F(KvMetaObjectClientTest, PropagatesLoadFailureAfterOneExactDataPlaneCall) 
 TEST_F(KvMetaObjectClientTest, MetadataAndDataPlaneLoadExceptionsAreContained) {
     metadata_->get_result.hit_mask = {true, true};
     metadata_->get_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
 
     for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
@@ -578,7 +581,7 @@ TEST_F(KvMetaObjectClientTest, MetadataAndDataPlaneLoadExceptionsAreContained) {
 TEST_F(KvMetaObjectClientTest, DoesNotReadDataForMetadataMiss) {
     metadata_->get_result.hit_mask = {true, false};
     metadata_->get_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
         {},
     };
 
@@ -589,8 +592,8 @@ TEST_F(KvMetaObjectClientTest, DoesNotReadDataForMetadataMiss) {
 TEST_F(KvMetaObjectClientTest, DoesNotReadDataForMetadataSizeMismatch) {
     metadata_->get_result.hit_mask = {true, true};
     metadata_->get_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=8", sizeof(second_) - 1),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_) - 1), sizeof(second_) - 1),
     };
 
     EXPECT_EQ(ER_SERVICE_SIZE_MISMATCH, client_->LoadObjects("trace", keys_, sizes_, buffers_));
@@ -599,7 +602,7 @@ TEST_F(KvMetaObjectClientTest, DoesNotReadDataForMetadataSizeMismatch) {
 
 TEST_F(KvMetaObjectClientTest, MalformedLocationSchemaIsInternalErrorNotSizeMismatch) {
     metadata_->get_result.hit_mask = {true, true};
-    const auto valid_second = MakeLocation("file://nfs/second?size=9", sizeof(second_));
+    const auto valid_second = MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_));
     const auto expect_internal = [&](KvMetaValueLocation malformed) {
         metadata_->get_result.locations = {std::move(malformed), valid_second};
         EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client_->LoadObjects("trace", keys_, sizes_, buffers_));
@@ -696,8 +699,8 @@ TEST_F(KvMetaObjectClientTest, MalformedLocationSchemaIsInternalErrorNotSizeMism
 TEST_F(KvMetaObjectClientTest, DoesNotReadDataForMalformedMetadataAlignment) {
     metadata_->get_result.hit_mask = {true};
     metadata_->get_result.locations = {
-        MakeLocation("file://nfs/first?size=5", sizeof(first_)),
-        MakeLocation("file://nfs/second?size=9", sizeof(second_)),
+        MakeLocation(PaceUri(1, sizeof(first_)), sizeof(first_)),
+        MakeLocation(PaceUri(2, sizeof(second_)), sizeof(second_)),
     };
 
     EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client_->LoadObjects("trace", keys_, sizes_, buffers_));
@@ -1053,81 +1056,6 @@ TEST(KvMetaObjectClientCreateTest, RejectsMissingSdkConfigBeforeMetadataRegistra
     auto [ec, client] = KvMetaObjectClient::Create("trace", config);
     EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, ec);
     EXPECT_EQ(nullptr, client);
-}
-
-TEST(KvMetaObjectClientCreateTest, RejectsUndersizedSdkQueueBeforeMetadataRegistration) {
-    KvMetaObjectClientConfig config;
-    config.metadata.instance_id = "metadata-instance";
-    // Addresses intentionally remain empty. Exact-object static validation
-    // must reject a queue that cannot admit one full service batch before
-    // metadata client setup or remote RegisterInstance can run.
-    config.instance_group = "metadata-group";
-    config.transfer_client_config = R"({
-        "instance_group": "metadata-group",
-        "instance_id": "metadata-instance",
-        "block_size": 1,
-        "sdk_config": {
-            "thread_num": 2,
-            "queue_size": 63,
-            "sdk_backend_configs": [],
-            "timeout_config": {
-                "get_timeout_ms": 10000,
-                "put_timeout_ms": 10000
-            }
-        },
-        "location_spec_infos": {"value": 1}
-    })";
-    config.transfer_init_params.role_type = RoleType::WORKER;
-    config.transfer_init_params.self_location_spec_name = "value";
-
-    auto [ec, client] = KvMetaObjectClient::Create("trace", config);
-    EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, ec);
-    EXPECT_EQ(nullptr, client);
-}
-
-TEST(KvMetaObjectClientCreateTest, RejectsWriteLeaseThatCannotCoverStartDataAndCommitBudgets) {
-    KvMetaObjectClientConfig config;
-    config.metadata.instance_id = "metadata-instance";
-    config.metadata.call_timeout_ms = 3000;
-    // Addresses intentionally remain empty. The timeout relationship must be
-    // rejected by static data-plane validation before metadata client setup or
-    // remote RegisterInstance can run.
-    config.instance_group = "metadata-group";
-    config.transfer_client_config = R"({
-        "instance_group": "metadata-group",
-        "instance_id": "metadata-instance",
-        "block_size": 1,
-        "sdk_config": {
-            "thread_num": 2,
-            "queue_size": 64,
-            "sdk_backend_configs": [],
-            "timeout_config": {
-                "get_timeout_ms": 10000,
-                "put_timeout_ms": 10000
-            }
-        },
-        "location_spec_infos": {"value": 1}
-    })";
-    config.transfer_init_params.role_type = RoleType::WORKER;
-    config.transfer_init_params.self_location_spec_name = "value";
-    // The outer parallel deadline may be consumed while a task waits in the
-    // queue, after which an accepted task can still consume a complete 10s
-    // backend Put budget. Two 10s data windows plus two 3s metadata windows
-    // exactly consume 26s. The relationship is strict so the session cannot
-    // expire on the boundary.
-    config.write_timeout_seconds = 26;
-
-    auto [ec, client] = KvMetaObjectClient::Create("trace", config);
-    EXPECT_EQ(ER_INVALID_CLIENT_CONFIG, ec);
-    EXPECT_EQ(nullptr, client);
-
-    // One second of lease headroom passes static transfer validation. Empty
-    // metadata addresses then fail at the next stage, proving the boundary is
-    // not over-rejected and no registration RPC was attempted.
-    config.write_timeout_seconds = 27;
-    auto [valid_ec, valid_client] = KvMetaObjectClient::Create("trace", config);
-    EXPECT_EQ(ER_METACLIENT_INIT_ERROR, valid_ec);
-    EXPECT_EQ(nullptr, valid_client);
 }
 
 } // namespace

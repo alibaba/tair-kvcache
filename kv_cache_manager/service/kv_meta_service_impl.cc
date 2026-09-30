@@ -65,33 +65,13 @@ PbError ToKvMetaPbError(ErrorCode ec, bool session_lookup = false) {
 }
 
 proto::kv_meta::StorageType ToKvMetaStorageType(DataStorageType type) {
-    switch (type) {
-    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
-        return proto::kv_meta::ST_3FS;
-    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
-        return proto::kv_meta::ST_VCNS_3FS;
-    case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
-        return proto::kv_meta::ST_MOONCAKE;
-    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
-        return proto::kv_meta::ST_TAIRMEMPOOL;
-    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD:
-        return proto::kv_meta::ST_TAIRMEMPOOL_SSD;
-    case DataStorageType::DATA_STORAGE_TYPE_NFS:
-        return proto::kv_meta::ST_NFS;
-    case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
-        return proto::kv_meta::ST_DUMMY;
-    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5:
-        return proto::kv_meta::ST_EVENT_REPORT_L1P5;
-    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2:
-        return proto::kv_meta::ST_EVENT_REPORT_L2;
-    case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN:
-    default:
-        return proto::kv_meta::ST_UNSPECIFIED;
-    }
+    return type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL       ? proto::kv_meta::ST_TAIRMEMPOOL
+           : type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD ? proto::kv_meta::ST_TAIRMEMPOOL_SSD
+                                                                         : proto::kv_meta::ST_UNSPECIFIED;
 }
 
 bool FillLocation(const KvMetaManager::ValueLocation &source, proto::kv_meta::ValueLocation *target) {
-    if (!target || !IsKvMetaObjectStorageType(source.type) || source.value_size == 0 || source.specs.size() != 1 ||
+    if (!target || !SupportsKvMetaAdmission(source.type) || source.value_size == 0 || source.specs.size() != 1 ||
         source.specs.front().first != "value" || source.specs.front().second.size() > kMaxKvMetaLocationUriBytes ||
         !HasUnambiguousKvMetaUriText(source.specs.front().second)) {
         return false;
@@ -107,12 +87,7 @@ bool FillLocation(const KvMetaManager::ValueLocation &source, proto::kv_meta::Va
         parsed.ptr != uri_size_text.data() + uri_size_text.size()) {
         return false;
     }
-    const DataStorageType uri_type = ToDataStorageType(uri.GetProtocol());
-    const bool scheme_matches =
-        IsTairMempoolStorageType(source.type)
-            ? uri.GetProtocol() == kTairMempoolUriScheme
-            : uri_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN && ToBaseType(uri_type) == ToBaseType(source.type);
-    if (uri_size != source.value_size || !scheme_matches || !HasOwnedKvMetaAllocationShape(uri, source.type)) {
+    if (uri_size != source.value_size || !HasOwnedKvMetaAllocationShape(uri, source.type)) {
         return false;
     }
     target->Clear();
@@ -356,10 +331,8 @@ void KvMetaServiceImpl::PutStart(RequestContext *request_context,
     const std::size_t write_count =
         static_cast<std::size_t>(std::count(result.key_mask.begin(), result.key_mask.end(), false));
     const auto reject_malformed_result = [&](const std::string &message) {
-        // Never guess from a malformed public shape: StartWrite records the
-        // exact compact-session cardinality independently of key_mask.
-        const ErrorCode abort_ec = AbortMalformedPutStart(
-            request_context, request->instance_id(), result.write_session_id, result.session_item_count);
+        const ErrorCode abort_ec =
+            AbortMalformedPutStart(request_context, request->instance_id(), result.write_session_id, write_count);
         if (abort_ec == EC_OK) {
             SetDirectError(request_context, status, proto::kv_meta::INTERNAL_ERROR, message);
         } else {
@@ -367,7 +340,7 @@ void KvMetaServiceImpl::PutStart(RequestContext *request_context,
         }
     };
     if (result.key_mask.size() != keys.size() || result.locations.size() != write_count ||
-        result.session_item_count != write_count || (write_count == 0 && !result.write_session_id.empty()) ||
+        (write_count == 0 && !result.write_session_id.empty()) ||
         (write_count != 0 && result.write_session_id.empty())) {
         reject_malformed_result("KVMeta PutStart returned a malformed batch");
         return;
@@ -436,11 +409,6 @@ void KvMetaServiceImpl::Remove(RequestContext *request_context,
     }
     const std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     const ErrorCode ec = kv_meta_manager_->Remove(request_context, request->instance_id(), keys);
-    if (ec == EC_EXIST) {
-        SetDirectError(
-            request_context, status, proto::kv_meta::WRITE_IN_PROGRESS, ErrorMessage("Remove", ec, request_context));
-        return;
-    }
     SetResult(request_context, status, ec, "Remove");
 }
 
@@ -469,11 +437,6 @@ void KvMetaServiceImpl::Trim(RequestContext *request_context,
         return;
     }
     const ErrorCode ec = kv_meta_manager_->TrimAll(request_context, request->instance_id(), metadata_only);
-    if (ec == EC_EXIST) {
-        SetDirectError(
-            request_context, status, proto::kv_meta::WRITE_IN_PROGRESS, ErrorMessage("Trim", ec, request_context));
-        return;
-    }
     SetResult(request_context, status, ec, "Trim");
 }
 

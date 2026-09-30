@@ -188,16 +188,12 @@ void Server::OnNoLongerLeader() {
     meta_impl_->DisableLeaderOnlyRequests();
     admin_impl_->DisableLeaderOnlyRequests();
     if (kv_meta_manager_) {
-        kv_meta_recovery_epoch_.fetch_add(1, std::memory_order_acq_rel);
-        // Serialize close-gate with the recovery thread's final epoch check
-        // and open-gate operation. If recovery already passed its check, this
-        // lock makes demotion close the gate afterwards; otherwise the changed
-        // epoch prevents recovery from opening it at all.
+        kv_meta_recovery_stop_.store(true, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(kv_meta_recovery_mutex_);
             kv_meta_impl_->DisableLeaderOnlyRequests();
+            kv_meta_manager_->CancelMaintenance();
         }
-        kv_meta_manager_->CancelMaintenance();
     }
 
     meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
@@ -234,45 +230,44 @@ void Server::OnNoLongerLeader() {
 }
 
 void Server::StartKvMetaRecovery() {
-    CancelAndJoinKvMetaRecovery();
+    std::lock_guard<std::mutex> lifecycle_lock(kv_meta_recovery_join_mutex_);
+    kv_meta_recovery_stop_.store(true, std::memory_order_release);
+    if (kv_meta_recovery_thread_.joinable()) {
+        kv_meta_recovery_thread_.join();
+    }
     if (!kv_meta_manager_ || !kv_meta_impl_ || stop_.load(std::memory_order_acquire)) {
         return;
     }
 
-    const std::uint64_t epoch = kv_meta_recovery_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
-    std::lock_guard<std::mutex> lock(kv_meta_recovery_mutex_);
-    if (stop_.load(std::memory_order_acquire) || kv_meta_recovery_epoch_.load(std::memory_order_acquire) != epoch) {
-        return;
-    }
+    kv_meta_recovery_stop_.store(false, std::memory_order_release);
     try {
-        kv_meta_recovery_thread_ = std::thread([this, epoch]() {
-            const auto should_abort = [this, epoch]() {
+        kv_meta_recovery_thread_ = std::thread([this]() {
+            const auto should_abort = [this]() {
                 return stop_.load(std::memory_order_acquire) ||
-                       kv_meta_recovery_epoch_.load(std::memory_order_acquire) != epoch;
+                       kv_meta_recovery_stop_.load(std::memory_order_acquire);
             };
             ErrorCode ec = EC_ERROR;
-            try {
-                // CacheManager::DoRecover preserves its historical behavior
-                // of returning EC_OK after deferring a partial failure to a
-                // retry thread. KVMeta requires those indexers, so keep only
-                // this optional service gated until the retry really finishes.
-                while (!should_abort() && !cache_manager_->IsRecoverComplete()) {
+            while (!should_abort()) {
+                try {
+                    ec = kv_meta_manager_->DoRecover(should_abort);
+                } catch (const std::exception &e) {
+                    KVCM_LOG_ERROR("KVMeta recovery exception: %s", e.what());
+                    ec = EC_ERROR;
+                } catch (...) {
+                    KVCM_LOG_ERROR("KVMeta recovery caught an unknown exception");
+                    ec = EC_ERROR;
+                }
+                if (ec == EC_OK || ec == EC_SERVICE_NOT_LEADER) {
+                    break;
+                }
+                KVCM_LOG_WARN("KVMeta recovery failed, retrying, ec[%d]", static_cast<int>(ec));
+                for (int i = 0; i < 10 && !should_abort(); ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
-                ec = should_abort() ? EC_SERVICE_NOT_LEADER : kv_meta_manager_->DoRecover(should_abort);
-            } catch (const std::exception &) {
-                // KVMeta recovery is an isolated optional side path. A
-                // provider exception must leave its request gate closed, not
-                // terminate the server process or affect fixed-block KV-cache.
-                KVCM_LOG_ERROR("KVMeta recovery caught a standard exception; service remains disabled");
-            } catch (...) { KVCM_LOG_ERROR("KVMeta recovery caught an unknown exception; service remains disabled"); }
+            }
+
             bool enabled = false;
             if (ec == EC_OK) {
-                // Serialize the final epoch check and gate opening with
-                // CancelAndJoinKvMetaRecovery. A demotion either invalidates
-                // the epoch before this lock is acquired, or disables the
-                // gate after this block; a standby can therefore never be
-                // re-enabled by a finishing recovery thread.
                 std::lock_guard<std::mutex> lock(kv_meta_recovery_mutex_);
                 if (!should_abort()) {
                     if (kv_meta_manager_->ResumeMaintenance()) {
@@ -294,21 +289,10 @@ void Server::StartKvMetaRecovery() {
 }
 
 void Server::CancelAndJoinKvMetaRecovery() {
-    kv_meta_recovery_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    // More than one lifecycle callback can request cancellation. Keep the
-    // whole move-and-join sequence serialized: after one caller moves the
-    // std::thread out, another caller must not observe an empty member and
-    // continue into manager cleanup while that worker is still running.
+    kv_meta_recovery_stop_.store(true, std::memory_order_release);
     std::lock_guard<std::mutex> join_lock(kv_meta_recovery_join_mutex_);
-    std::thread recovery_thread;
-    {
-        std::lock_guard<std::mutex> lock(kv_meta_recovery_mutex_);
-        if (kv_meta_recovery_thread_.joinable()) {
-            recovery_thread = std::move(kv_meta_recovery_thread_);
-        }
-    }
-    if (recovery_thread.joinable()) {
-        recovery_thread.join();
+    if (kv_meta_recovery_thread_.joinable()) {
+        kv_meta_recovery_thread_.join();
     }
 }
 
@@ -403,8 +387,7 @@ bool Server::StartRpcServer() {
     }
 
     grpc::ServerBuilder builder;
-    int selected_port = 0;
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials(), &selected_port);
+    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(meta_service_.get());
     if (kv_meta_service_) {
         // The protobuf packages are distinct, so KVMeta and the fixed-block
@@ -423,16 +406,10 @@ bool Server::StartRpcServer() {
         KVCM_LOG_ERROR("Failed to start rpc server");
         return false;
     }
-    if (selected_port <= 0 || selected_port > 65535) {
-        KVCM_LOG_ERROR("RPC server returned invalid selected port %d", selected_port);
-        server->Shutdown();
-        return false;
-    }
     rpc_server_.reset(server.release());
-    bound_rpc_port_ = selected_port;
     KVCM_LOG_INFO("Server listening on %s success", server_address.c_str());
     if (kv_meta_service_) {
-        KVCM_LOG_INFO("KVMeta service registered on primary RPC port %d", bound_rpc_port_);
+        KVCM_LOG_INFO("KVMeta service registered on primary RPC port %d", rpc_port);
     }
     if (use_separate_admin_server && !StartSeparateAdminRpcServer()) {
         return false;
@@ -616,14 +593,12 @@ void Server::Stop() {
     stop_ = true;
     KVCM_LOG_INFO("server stopping...");
     if (kv_meta_manager_) {
-        // Pair with the recovery thread's locked final gate transition. This
-        // prevents a recovery that observed the pre-stop state from reopening
-        // KVMeta after shutdown has begun.
+        kv_meta_recovery_stop_.store(true, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(kv_meta_recovery_mutex_);
             kv_meta_impl_->DisableLeaderOnlyRequests();
+            kv_meta_manager_->CancelMaintenance();
         }
-        kv_meta_manager_->CancelMaintenance();
     }
 
     // Close KVMeta admission before shutting down the shared primary listener.

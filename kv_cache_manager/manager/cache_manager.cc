@@ -39,7 +39,6 @@
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/event_report_cleanup_util.h"
 #include "kv_cache_manager/manager/hash_util.h"
-#include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/manager/reclaimer_task_supervisor.h"
@@ -4313,13 +4312,7 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
     std::set<std::string_view> accessible_storage_names(instance_group->storage_candidates().begin(),
                                                         instance_group->storage_candidates().end());
     const auto cache_config = instance_group->cache_config();
-    // KVMeta never enters the fixed-block migration state machine. Returning
-    // migration-only configs here can make its exact-object client reject an
-    // otherwise valid registration (for example when a route references an
-    // EventReport backend). Its authoritative data plane is exactly the
-    // validated storage_candidates set. Preserve the established expanded
-    // config set for every ordinary KV-cache instance.
-    if (!IsKvMetaInstance(*instance_info) && cache_config != nullptr) {
+    if (cache_config != nullptr) {
         for (const auto &strategy : cache_config->migration_strategies()) {
             if (strategy == nullptr) {
                 continue;
@@ -4390,7 +4383,6 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
 }
 
 ErrorCode CacheManager::DoRecoverOnce() {
-    recover_complete_.store(false, std::memory_order_release);
     ActivateEventCleanupCallbacks();
     if (!registry_manager_) {
         KVCM_LOG_ERROR("CacheManager do recover failed, registry_manager is nullptr");
@@ -4444,11 +4436,7 @@ ErrorCode CacheManager::DoRecoverOnce() {
     }
 
     KVCM_LOG_INFO("CacheManager do recover once done, error_count[%lu]", error_count);
-    if (error_count != 0) {
-        return EC_ERROR;
-    }
-    recover_complete_.store(true, std::memory_order_release);
-    return EC_OK;
+    return error_count > 0 ? EC_ERROR : EC_OK;
 }
 
 ErrorCode CacheManager::DoRecover() {
@@ -4520,16 +4508,11 @@ void CacheManager::ActivateEventCleanupCallbacks() {
 }
 
 ErrorCode CacheManager::DoCleanup() {
-    recover_complete_.store(false, std::memory_order_release);
     if (cache_garbage_collector_) {
         cache_garbage_collector_->Stop();
     }
     ClearEventCleanupCallbacks();
     StopRecoverRetryLoop();
-    // A retry already inside DoRecoverOnce may have published true after the
-    // store at cleanup entry. Joining it first and clearing again guarantees
-    // that observers never see cleaned-up indexers as recovery-complete.
-    recover_complete_.store(false, std::memory_order_release);
     DeactivateEventCleanupCallbacks();
     // aborting write session need meta indexer
     if (write_location_manager_) {

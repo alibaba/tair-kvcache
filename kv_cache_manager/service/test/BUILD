@@ -51,7 +51,6 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
         "//kv_cache_manager/service",
     ],
 )

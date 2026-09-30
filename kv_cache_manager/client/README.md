@@ -33,15 +33,11 @@ with KvMetaObjectClient(config) as client:
     client.remove(["embedding", "position"])
 ```
 
-一次 Python 逻辑调用会先完整校验 keys、真实 byte size、buffer 和对象上限，再按服务端的 64 objects / 4 GiB
-上限分批；不会自动重试或回滚 mutation。RTP 使用每个 receipt 新生成的 UUID key，并由自身 pending/release/GC
-负责跨 batch 清理。CUDA/MUSA producer 在调用 `save` 前仍须由框架侧同步对应 device stream。Python context
-manager/`close()` 会调用 native `Close()`，等待该 client 已准入的同步调用并立即释放数据面线程池和注册资源。
+一次 Python 调用会校验 key、真实 byte size 和 buffer，再按 64 objects / 4 GiB 上限分批。它不自动重试 mutation，
+也不回滚已经成功的前序 batch。CUDA/MUSA producer 在调用 `save` 前须同步对应 device stream。
 
-wheel 的 Python package 与 native extension 都导出 `KV_META_OBJECT_API_VERSION=2`；extension 的值来自所链接
-`kv_cache_manager_client.so` 导出的版本查询。高层 client 会在创建任何 native 状态前校验该 capability 及必需枚举/方法；
-部署必须使用同一次 KVCM 构建产出的 Python 源码、extension 与 client library，不能混装。
-mutation 返回 transport error、未知 error code 或畸形 code 时，Python 异常统一标记 `unknown_outcome=True`。
+Python package、native extension 与 `kv_cache_manager_client.so` 必须来自同一次构建；client 会校验
+`KV_META_OBJECT_API_VERSION`。mutation 遇到 transport error 时，异常的 `unknown_outcome=True`。
 
 需要自行编排控制面和数据面时，才直接使用下面的低层 `KvMetaClient`：
 

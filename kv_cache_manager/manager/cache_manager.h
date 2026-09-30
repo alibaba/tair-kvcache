@@ -104,7 +104,6 @@ public:
               CacheReclaimerGroupLruConfig group_lru_config = {});
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
-    [[nodiscard]] bool IsRecoverComplete() const noexcept { return recover_complete_.load(std::memory_order_acquire); }
     void StartRecoverRetryLoop();
     void StopRecoverRetryLoop();
     ErrorCode DoCleanup();
@@ -240,7 +239,6 @@ public:
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor() { return schedule_plan_executor_; }
     std::shared_ptr<CacheReclaimer> cache_reclaimer() { return cache_reclaimer_; }
     std::shared_ptr<CacheGarbageCollector> cache_garbage_collector() { return cache_garbage_collector_; }
-    const std::shared_ptr<MetricsRegistry> &metrics_registry() const noexcept { return metrics_registry_; }
     std::shared_ptr<EventManager> event_manager() { return event_manager_; }
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder() { return metrics_recorder_; }
     std::shared_ptr<MigrationManager> migration_manager() { return migration_manager_; }
@@ -403,8 +401,7 @@ private:
     std::shared_ptr<MetaSearcherManager> meta_searcher_manager_;
     // 需要清理
     std::shared_ptr<DataStorageSelector> data_storage_selector_;
-    // MetricsRegistry is process-owned. Components may register metric handles
-    // dynamically, but CacheManager does not own or remove those shared series.
+    // 无需清理 - CacheManager当前没有给MetricsRegistry动态添加新的监控指标
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     // 无需清理 - RegistryManager单独进行了清理，不由CacheManager负责
     std::shared_ptr<RegistryManager> registry_manager_;
@@ -434,11 +431,6 @@ private:
     // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
     std::thread recover_retry_thread_;
     std::atomic<bool> recover_retry_stop_{false};
-    // DoRecover historically returns EC_OK after handing a partial failure to
-    // its retry thread. Optional subsystems that depend on recreated indexers
-    // use this separate completion signal instead of changing that main-path
-    // contract.
-    std::atomic<bool> recover_complete_{false};
 };
 
 } // namespace kv_cache_manager

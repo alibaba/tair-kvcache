@@ -15,7 +15,6 @@ namespace kv_cache_manager {
 namespace {
 
 constexpr const char *kKvMetaValueSpecName = "value";
-constexpr std::size_t kMaxKvMetaBatchItems = 64;
 constexpr std::uint64_t kMaxKvMetaObjectBytes = 1ULL * 1024 * 1024 * 1024;
 
 bool HasOnlyUnambiguousUriText(const UriStrVec &uris) {
@@ -29,9 +28,7 @@ bool HasOnlyUnambiguousUriText(const UriStrVec &uris) {
 ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_config,
                                                    const InitParams &init_params,
                                                    const std::string *expected_instance_group,
-                                                   const std::string *expected_instance_id,
-                                                   std::int32_t write_timeout_seconds,
-                                                   std::uint32_t metadata_call_timeout_ms) {
+                                                   const std::string *expected_instance_id) {
     if (client_config.empty() || init_params.self_location_spec_name != kKvMetaValueSpecName) {
         return ER_INVALID_PARAMS;
     }
@@ -57,44 +54,6 @@ ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_con
         !wrapper_config->Validate()) {
         KVCM_LOG_WARN("KVMeta sdk wrapper config is invalid");
         return ER_INVALID_SDKWRAPPER_CONFIG;
-    }
-    // One exact-object request may contain the full KVMeta service batch.
-    // RunWithTimeoutParallel deliberately uses non-blocking submission for
-    // caller-owned buffers, so accepting a smaller static queue would make an
-    // otherwise valid 64-object request fail partway through admission. This
-    // check is exclusive to the KVMeta transfer path; the regular fixed-block
-    // TransferClient keeps its existing queue-size behavior.
-    if (wrapper_config->queue_size() < kMaxKvMetaBatchItems) {
-        KVCM_LOG_WARN("KVMeta sdk wrapper queue size must be at least %zu, got %zu",
-                      kMaxKvMetaBatchItems,
-                      wrapper_config->queue_size());
-        return ER_INVALID_SDKWRAPPER_CONFIG;
-    }
-    // KvMetaObjectClient starts the server-side write lease before invoking
-    // the data plane. Conservatively reserve one metadata timeout for the
-    // PutStart response/request hand-off and one for PutFinish, in addition
-    // to the data-plane timeout. RunWithTimeoutParallel starts its outer deadline
-    // before enqueueing. A task accepted just before that deadline may still
-    // consume one complete backend Put timeout while the KVMeta path drains
-    // accepted work to protect caller-owned buffers, so reserve two Put
-    // windows: queue/admission plus the backend operation itself. Reject a
-    // nominally impossible lease before
-    // RegisterInstance can mutate remote state. A zero pair keeps the
-    // standalone KvMetaTransferClient API free of metadata-transaction policy.
-    if (write_timeout_seconds != 0 || metadata_call_timeout_ms != 0) {
-        if (write_timeout_seconds <= 0 || metadata_call_timeout_ms == 0) {
-            KVCM_LOG_WARN("KVMeta write lease and metadata timeout must both be positive");
-            return ER_INVALID_CLIENT_CONFIG;
-        }
-        const std::uint64_t write_lease_ms = static_cast<std::uint64_t>(write_timeout_seconds) * 1000;
-        const std::uint64_t minimum_completion_ms =
-            static_cast<std::uint64_t>(wrapper_config->timeout_config().put_timeout_ms()) * 2 +
-            static_cast<std::uint64_t>(metadata_call_timeout_ms) * 2;
-        if (write_lease_ms <= minimum_completion_ms) {
-            KVCM_LOG_WARN("KVMeta write_timeout_seconds must exceed two put_timeout_ms windows plus two metadata "
-                          "call_timeout_ms windows");
-            return ER_INVALID_CLIENT_CONFIG;
-        }
     }
     return ER_OK;
 }
