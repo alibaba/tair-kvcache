@@ -163,6 +163,7 @@ cc_test(
         "redis",
     ],
     deps = [
+        "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/meta:meta_redis_backend",
     ],
@@ -181,6 +182,7 @@ cc_test(
     ],
     deps = [
         ":meta_indexer_testlib",
+        "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/common:unittest",
     ],
 )
@@ -247,6 +249,7 @@ cc_test(
         "redis",
     ],
     deps = [
+        "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/meta:common",
