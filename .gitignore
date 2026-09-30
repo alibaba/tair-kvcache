@@ -6,6 +6,7 @@ bin/*
 lib/*
 var/*
 logs/*
+/coverage/
 kv_cache_manager/optimizer/analysis/result/*
 kv_cache_manager/optimizer/logs/*
 __pycache__/
