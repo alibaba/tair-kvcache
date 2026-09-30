@@ -1,3 +1,5 @@
+#include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <memory>
 
@@ -114,31 +116,105 @@ TEST_F(NfsBackendTest, TestDeleteReturnsOkAndSameSize) {
     NfsBackend backend(metrics_registry_);
     std::shared_ptr<NfsStorageSpec> spec(new NfsStorageSpec);
     spec->set_key_count_per_file(1);
-    spec->set_root_path("/data/");
+    spec->set_root_path(GetPrivateTestRuntimeDataPath());
     StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "test", spec);
     ASSERT_EQ(EC_OK, backend.Open(storage_config, "fake_trace_id_1"));
-    std::vector<DataStorageUri> uris(3);
-    auto res = backend.Delete(uris, "fake_trace_id_2", []() {});
+
+    const auto file1 = GetPrivateTestRuntimeDataPath() + "delete-1";
+    const auto file2 = GetPrivateTestRuntimeDataPath() + "delete-2";
+    {
+        std::ofstream(file1) << "1";
+        std::ofstream(file2) << "2";
+    }
+    ASSERT_TRUE(std::filesystem::exists(file1));
+    ASSERT_TRUE(std::filesystem::exists(file2));
+    std::vector<DataStorageUri> uris;
+    uris.emplace_back("file://nfs_test" + file1);
+    uris.emplace_back("file://nfs_test" + file2);
+    uris.emplace_back("file://nfs_test" + GetPrivateTestRuntimeDataPath() + "missing");
+
+    bool callback_called = false;
+    auto res = backend.Delete(uris, "fake_trace_id_2", [&callback_called]() { callback_called = true; });
+    ASSERT_TRUE(callback_called);
     ASSERT_EQ(res.size(), uris.size());
     for (auto code : res) {
         ASSERT_EQ(code, EC_OK);
     }
+    ASSERT_FALSE(std::filesystem::exists(file1));
+    ASSERT_FALSE(std::filesystem::exists(file2));
 }
 
-TEST_F(NfsBackendTest, TestExistReturnsTrues) {
+TEST_F(NfsBackendTest, TestDeleteOnlyRemovesMultiBlockFileForBlockZero) {
+    NfsBackend backend(metrics_registry_);
+    std::shared_ptr<NfsStorageSpec> spec(new NfsStorageSpec);
+    spec->set_key_count_per_file(2);
+    spec->set_root_path(GetPrivateTestRuntimeDataPath());
+    StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "test", spec);
+    ASSERT_EQ(EC_OK, backend.Open(storage_config, "fake_trace_id_1"));
+
+    const auto file = GetPrivateTestRuntimeDataPath() + "multi-block-delete";
+    std::ofstream(file) << "shared";
+    ASSERT_TRUE(std::filesystem::exists(file));
+
+    DataStorageUri block_zero("file://nfs_test" + file + "?blkid=0&size=6");
+    DataStorageUri block_one("file://nfs_test" + file + "?blkid=1&size=6");
+    DataStorageUri invalid_block("file://nfs_test" + file + "?blkid=bad&size=6");
+
+    auto skip_res = backend.Delete({block_one}, "fake_trace_id_2", []() {});
+    ASSERT_EQ(skip_res.size(), 1u);
+    ASSERT_EQ(skip_res[0], EC_OK);
+    ASSERT_TRUE(std::filesystem::exists(file));
+
+    auto invalid_res = backend.Delete({invalid_block}, "fake_trace_id_3", []() {});
+    ASSERT_EQ(invalid_res.size(), 1u);
+    ASSERT_EQ(invalid_res[0], EC_ERROR);
+    ASSERT_TRUE(std::filesystem::exists(file));
+
+    DataStorageUri missing_blkid("file://nfs_test" + file + "?size=6");
+    auto missing_blkid_res = backend.Delete({missing_blkid}, "fake_trace_id_4", []() {});
+    ASSERT_EQ(missing_blkid_res.size(), 1u);
+    ASSERT_EQ(missing_blkid_res[0], EC_OK);
+    ASSERT_FALSE(std::filesystem::exists(file));
+
+    std::ofstream(file) << "shared";
+    ASSERT_TRUE(std::filesystem::exists(file));
+    DataStorageUri empty_blkid("file://nfs_test" + file + "?blkid=&size=6");
+    auto empty_blkid_res = backend.Delete({empty_blkid}, "fake_trace_id_5", []() {});
+    ASSERT_EQ(empty_blkid_res.size(), 1u);
+    ASSERT_EQ(empty_blkid_res[0], EC_OK);
+    ASSERT_FALSE(std::filesystem::exists(file));
+
+    std::ofstream(file) << "shared";
+    ASSERT_TRUE(std::filesystem::exists(file));
+    auto delete_res = backend.Delete({block_zero}, "fake_trace_id_6", []() {});
+    ASSERT_EQ(delete_res.size(), 1u);
+    ASSERT_EQ(delete_res[0], EC_OK);
+    ASSERT_FALSE(std::filesystem::exists(file));
+}
+
+TEST_F(NfsBackendTest, TestExistReturnsActualFileState) {
     NfsBackend backend(metrics_registry_);
     std::shared_ptr<NfsStorageSpec> spec(new NfsStorageSpec);
     spec->set_key_count_per_file(1);
-    spec->set_root_path("/data/");
+    spec->set_root_path(GetPrivateTestRuntimeDataPath());
     StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "test", spec);
     ASSERT_EQ(EC_OK, backend.Open(storage_config, "fake_trace_id_1"));
-    // TODO(qisa.cb) 没实现
-    std::vector<DataStorageUri> uris(5);
+
+    const auto file1 = GetPrivateTestRuntimeDataPath() + "exists-1";
+    std::ofstream(file1) << "1";
+    std::vector<DataStorageUri> uris;
+    uris.emplace_back("file://nfs_test" + file1);
+    uris.emplace_back("file://nfs_test" + GetPrivateTestRuntimeDataPath() + "missing");
+
     auto res = backend.Exist(uris);
     ASSERT_EQ(res.size(), uris.size());
-    for (bool flag : res) {
-        ASSERT_TRUE(flag);
-    }
+    ASSERT_TRUE(res[0]);
+    ASSERT_FALSE(res[1]);
+
+    auto might_res = backend.MightExist(uris);
+    ASSERT_EQ(might_res.size(), uris.size());
+    ASSERT_TRUE(might_res[0]);
+    ASSERT_TRUE(might_res[1]);
 }
 
 TEST_F(NfsBackendTest, TestLockAndUnLockReturnOk) {
