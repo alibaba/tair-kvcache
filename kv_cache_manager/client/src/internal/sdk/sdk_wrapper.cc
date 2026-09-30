@@ -152,9 +152,6 @@ ClientErrorCode SdkWrapper::InitInternal(const std::unique_ptr<ClientConfig> &cl
 
         // 将完整的 spec → byte_size_per_block 映射传给 SDK
         sdk_backend_config->set_spec_byte_sizes_per_block(location_spec_infos);
-        if (variable_object_size_enabled) {
-            sdk_backend_config->set_variable_object_size_policy(true, max_object_bytes);
-        }
         // 注入静态超时预算：后端用它从自身任务起点起算 deadline 并自律（内部取消）。
         // 不读取该字段的后端（tair_mempool 等）行为不受影响。
         sdk_backend_config->set_timeout_config(wrapper_config_->timeout_config());

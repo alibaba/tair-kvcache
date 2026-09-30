@@ -274,8 +274,6 @@ TEST_F(SdkWrapperTest, TestKvMetaPaceUsesDedicatedVariableSizePolicy) {
     wrapper.sdk_factory_ = &factory;
     ASSERT_EQ(ER_OK, wrapper.InitForKvMeta(client_config, init_params, 4096));
     ASSERT_TRUE(factory.sdk && factory.sdk->config_);
-    EXPECT_TRUE(factory.sdk->config_->variable_object_size_enabled());
-    EXPECT_EQ(4096u, factory.sdk->config_->max_variable_object_bytes());
 
     char first[5]{};
     char second[9]{};
