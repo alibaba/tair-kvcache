@@ -4536,7 +4536,8 @@ ErrorCode CacheManager::DoCleanup() {
 }
 
 std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(RequestContext *request_context,
-                                                                            const std::string &instance_id) const {
+                                                                            const std::string &instance_id,
+                                                                            bool allow_unavailable_storages) const {
     const auto &trace_id = request_context->trace_id();
     auto all_storages = registry_manager_->data_storage_manager()->GetAllStorageNames();
     auto all_available_storages = registry_manager_->data_storage_manager()->GetAvailableStorages();
@@ -4583,6 +4584,11 @@ std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(Requ
         return std::make_unique<StaticWeightSLPolicy>();
     }
     if (group_available_storages.empty()) {
+        if (allow_unavailable_storages) {
+            // Host cache queries can still use local and V6D data. An empty
+            // named policy excludes every base storage without changing shared weights.
+            return std::make_unique<NamedStorageWeightedSLPolicy>(NamedStorageWeightedSLPolicy::WeightMap{});
+        }
         request_context->error_tracer()->AddErrorMsg("all storages are unavailable");
         KVCM_INTERVAL_LOG_WARN(10, "all storages are unavailable!");
         return nullptr;
@@ -4798,10 +4804,22 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                 QueryType query_type,
                                 const KeyVector &block_cache_keys,
                                 const std::vector<std::string> &medium_filter,
-                                size_t p2p_host_count) {
+                                size_t top_k_host_count,
+                                const std::vector<DataStorageType> &backend_types) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+
+    for (const auto type : backend_types) {
+        if (type != DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL &&
+            type != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2) {
+            request_context->error_tracer()->AddErrorMsg("unsupported backend_type for GetHostCacheState");
+            return {EC_BADARGS, {}};
+        }
+    }
+    const bool use_tair =
+        std::find(backend_types.begin(), backend_types.end(), DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL) !=
+        backend_types.end();
 
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher) {
@@ -4838,6 +4856,12 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, block_cache_keys.size());
     auto query_scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerPrefixMatch);
     const auto request_check_location = GetHostCacheStateCheckLocDataExistFunc(instance_id);
+    auto policy = top_k_host_count > 0 && use_tair
+                      ? genSelectLocationPolicy(request_context, instance_id, /*allow_unavailable_storages=*/true)
+                      : nullptr;
+    if (top_k_host_count > 0 && use_tair && !policy) {
+        return {EC_ERROR, {}};
+    }
     std::vector<MetaSearcher::HostCacheMatch> host_matches;
     ErrorCode ec = EC_ERROR;
     switch (query_type) {
@@ -4848,7 +4872,9 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                               medium_filter,
                                               host_matches,
                                               &request_check_location,
-                                              p2p_host_count);
+                                              top_k_host_count,
+                                              backend_types,
+                                              policy.get());
         break;
     }
     case QueryType::QT_PREFIX_MATCH_WITH_MAMBA: {
@@ -4859,7 +4885,9 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                                        instance_info->location_spec_groups(),
                                                        host_matches,
                                                        &request_check_location,
-                                                       p2p_host_count);
+                                                       top_k_host_count,
+                                                       backend_types,
+                                                       policy.get());
         break;
     }
     default:
@@ -4872,7 +4900,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
     std::vector<HostCacheMatch> result;
     result.reserve(host_matches.size());
     for (const auto &match : host_matches) {
-        result.push_back(HostCacheMatch{match.host_ip_port, match.local, match.p2p_1_fetch, match.p2p_1_total_match});
+        result.push_back(HostCacheMatch{match.host_ip_port, match.local, match.global});
     }
 
     return {EC_OK, std::move(result)};
