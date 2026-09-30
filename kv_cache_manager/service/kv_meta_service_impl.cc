@@ -1,20 +1,15 @@
 #include "kv_cache_manager/service/kv_meta_service_impl.h"
 
 #include <algorithm>
-#include <charconv>
 #include <cstdint>
-#include <exception>
 #include <memory>
 #include <string>
-#include <system_error>
 #include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
-#include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/config/instance_info.h"
-#include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/kv_meta_manager.h"
@@ -55,8 +50,6 @@ PbError ToKvMetaPbError(ErrorCode ec, bool session_lookup = false) {
     case EC_IO_ERROR:
     case EC_TIMEOUT:
         return proto::kv_meta::IO_ERROR;
-    case EC_OUTCOME_UNKNOWN:
-        return proto::kv_meta::OUTCOME_UNKNOWN;
     case EC_UNKNOWN:
         return proto::kv_meta::UNKNOWN_ERROR;
     default:
@@ -71,23 +64,12 @@ proto::kv_meta::StorageType ToKvMetaStorageType(DataStorageType type) {
 }
 
 bool FillLocation(const KvMetaManager::ValueLocation &source, proto::kv_meta::ValueLocation *target) {
-    if (!target || !SupportsKvMetaAdmission(source.type) || source.value_size == 0 || source.specs.size() != 1 ||
-        source.specs.front().first != "value" || source.specs.front().second.size() > kMaxKvMetaLocationUriBytes ||
-        !HasUnambiguousKvMetaUriText(source.specs.front().second)) {
+    if (!target || !IsTairMempoolStorageType(source.type) || source.value_size == 0 || source.specs.size() != 1 ||
+        source.specs.front().first != "value") {
         return false;
     }
-    const DataStorageUri uri(source.specs.front().second);
-    if (!HasCanonicalKvMetaAuthority(uri) || !uri.HasParam("size")) {
-        return false;
-    }
-    const std::string uri_size_text = uri.GetParam("size");
     std::uint64_t uri_size = 0;
-    const auto parsed = std::from_chars(uri_size_text.data(), uri_size_text.data() + uri_size_text.size(), uri_size);
-    if (uri_size_text.empty() || parsed.ec != std::errc{} ||
-        parsed.ptr != uri_size_text.data() + uri_size_text.size()) {
-        return false;
-    }
-    if (uri_size != source.value_size || !HasOwnedKvMetaAllocationShape(uri, source.type)) {
+    if (!IsValidKvMetaLocation(source.specs.front().second, source.type, uri_size) || uri_size != source.value_size) {
         return false;
     }
     target->Clear();
@@ -187,30 +169,6 @@ KvMetaServiceImpl::KvMetaServiceImpl(std::shared_ptr<CacheManager> cache_manager
     : cache_manager_(std::move(cache_manager))
     , kv_meta_manager_(std::move(kv_meta_manager))
     , metrics_reporter_(std::move(metrics_reporter)) {}
-
-ErrorCode KvMetaServiceImpl::AbortMalformedPutStart(RequestContext *request_context,
-                                                    const std::string &instance_id,
-                                                    const std::string &write_session_id,
-                                                    std::size_t session_item_count) noexcept {
-    if (!kv_meta_manager_ || write_session_id.empty() || session_item_count == 0 ||
-        session_item_count > kv_meta_manager_->limits().max_batch_items) {
-        return EC_OUTCOME_UNKNOWN;
-    }
-    try {
-        const ErrorCode abort_ec = kv_meta_manager_->FinishWrite(
-            request_context, instance_id, write_session_id, std::vector<bool>(session_item_count, false));
-        if (abort_ec == EC_OK) {
-            return EC_OK;
-        }
-        KVCM_LOG_ERROR("failed to abort malformed KVMeta PutStart result, ec[%d]", static_cast<int>(abort_ec));
-    } catch (const std::exception &) {
-        KVCM_LOG_ERROR("caught a standard exception while aborting malformed KVMeta PutStart result");
-    } catch (...) { KVCM_LOG_ERROR("caught an unknown exception while aborting malformed KVMeta PutStart result"); }
-    // A failed abort cannot prove whether metadata or physical allocations
-    // remain.  Preserve that ambiguity so endpoint failover cannot allocate a
-    // second batch for the same logical PutStart.
-    return EC_OUTCOME_UNKNOWN;
-}
 
 void KvMetaServiceImpl::RegisterInstance(RequestContext *request_context,
                                          const proto::kv_meta::RegisterInstanceRequest *request,
@@ -330,19 +288,11 @@ void KvMetaServiceImpl::PutStart(RequestContext *request_context,
     }
     const std::size_t write_count =
         static_cast<std::size_t>(std::count(result.key_mask.begin(), result.key_mask.end(), false));
-    const auto reject_malformed_result = [&](const std::string &message) {
-        const ErrorCode abort_ec =
-            AbortMalformedPutStart(request_context, request->instance_id(), result.write_session_id, write_count);
-        if (abort_ec == EC_OK) {
-            SetDirectError(request_context, status, proto::kv_meta::INTERNAL_ERROR, message);
-        } else {
-            SetResult(request_context, status, EC_OUTCOME_UNKNOWN, "PutStart");
-        }
-    };
     if (result.key_mask.size() != keys.size() || result.locations.size() != write_count ||
         (write_count == 0 && !result.write_session_id.empty()) ||
         (write_count != 0 && result.write_session_id.empty())) {
-        reject_malformed_result("KVMeta PutStart returned a malformed batch");
+        SetDirectError(
+            request_context, status, proto::kv_meta::INTERNAL_ERROR, "KVMeta PutStart returned a malformed batch");
         return;
     }
     std::vector<proto::kv_meta::ValueLocation> converted_locations;
@@ -350,7 +300,10 @@ void KvMetaServiceImpl::PutStart(RequestContext *request_context,
     for (const auto &location : result.locations) {
         proto::kv_meta::ValueLocation converted;
         if (!FillLocation(location, &converted)) {
-            reject_malformed_result("KVMeta PutStart returned an invalid location");
+            SetDirectError(request_context,
+                           status,
+                           proto::kv_meta::INTERNAL_ERROR,
+                           "KVMeta PutStart returned an invalid location");
             return;
         }
         converted_locations.push_back(std::move(converted));

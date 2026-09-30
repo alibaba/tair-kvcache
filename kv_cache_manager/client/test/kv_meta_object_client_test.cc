@@ -299,21 +299,6 @@ TEST_F(KvMetaObjectClientTest, StartFailureDoesNotReadWriteOrFinish) {
     EXPECT_EQ(0, metadata_->finish_calls);
 }
 
-TEST_F(KvMetaObjectClientTest, AmbiguousStartFailurePropagatesWithoutDataIoOrCleanup) {
-    metadata_->start_ec = ER_SERVICE_OUTCOME_UNKNOWN;
-
-    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, client_->SaveObjects("ambiguous-start", keys_, sizes_, buffers_));
-
-    EXPECT_EQ(1, metadata_->start_calls);
-    EXPECT_EQ("ambiguous-start", metadata_->start_trace);
-    EXPECT_EQ(0, metadata_->get_calls);
-    EXPECT_EQ(0, transfer_->save_calls);
-    // The metadata client already attempted to abort the malformed session.
-    // Retrying cleanup without a validated session shape could target the
-    // wrong cardinality and must remain the metadata client's responsibility.
-    EXPECT_EQ(0, metadata_->finish_calls);
-}
-
 TEST_F(KvMetaObjectClientTest, StartExceptionsBecomeAmbiguousErrorsWithoutDataIo) {
     for (const auto mode : {ThrowMode::STANDARD, ThrowMode::UNKNOWN}) {
         SCOPED_TRACE(static_cast<int>(mode));
@@ -419,24 +404,22 @@ TEST_F(KvMetaObjectClientTest, AbortsWholeSessionWhenBackendRewritesAnyUri) {
     EXPECT_EQ((std::vector<bool>{false, false}), metadata_->finished_keys);
 }
 
-TEST_F(KvMetaObjectClientTest, AcceptsSemanticallyIdenticalCanonicalizedUris) {
+TEST_F(KvMetaObjectClientTest, RejectsNonCanonicalMetadataUrisBeforeDataIo) {
     metadata_->start_result.write_session_id = "session";
     metadata_->start_result.key_mask = {false, false};
     metadata_->start_result.locations = {
         MakeLocation("pace://pace/1?size=5&range_id=0&node_id=1&media_type=0", sizeof(first_)),
         MakeLocation("pace://pace/2?size=9&range_id=0&node_id=1&media_type=0", sizeof(second_)),
     };
-    // SDK results are serialized from StandardUri and therefore sort query
-    // keys. Parameter order is not an object-identity change.
     transfer_->actual_uris = {
         PaceUri(1, sizeof(first_)),
         PaceUri(2, sizeof(second_)),
     };
 
-    EXPECT_EQ(ER_OK, client_->SaveObjects("trace", keys_, sizes_, buffers_));
-    EXPECT_EQ(1, transfer_->save_calls);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client_->SaveObjects("trace", keys_, sizes_, buffers_));
+    EXPECT_EQ(0, transfer_->save_calls);
     EXPECT_EQ(1, metadata_->finish_calls);
-    EXPECT_EQ((std::vector<bool>{true, true}), metadata_->finished_keys);
+    EXPECT_EQ((std::vector<bool>{false, false}), metadata_->finished_keys);
 }
 
 TEST_F(KvMetaObjectClientTest, PropagatesCommitFailureWithoutRepeatingDataWrite) {
@@ -646,48 +629,6 @@ TEST_F(KvMetaObjectClientTest, MalformedLocationSchemaIsInternalErrorNotSizeMism
     malformed = MakeLocation("file://nfs/first?blkid=1&size=5", sizeof(first_));
     expect_internal(std::move(malformed));
 
-    for (const std::string &invalid_file_uri : {
-             "file://nfs?size=5",
-             "file://nfs/?size=5",
-             "file://nfs//first?size=5",
-             "file://nfs/dir//first?size=5",
-             "file://nfs/dir/./first?size=5",
-             "file://nfs/dir/../first?size=5",
-             "file://nfs/dir/first/?size=5",
-             "file://owner@nfs/first?size=5",
-             "file://nfs:0/first?size=5",
-             "file://nfs:123/first?size=5",
-         }) {
-        SCOPED_TRACE(invalid_file_uri);
-        expect_internal(MakeLocation(invalid_file_uri, sizeof(first_)));
-    }
-
-    for (const std::string &invalid_offset : {"", "/", "/-1", "/+1", "/bad", "/18446744073709551616"}) {
-        malformed = MakeLocation("pace://pace" + invalid_offset + "?size=5", sizeof(first_));
-        malformed.type = KvMetaStorageType::TAIR_MEMPOOL;
-        expect_internal(std::move(malformed));
-    }
-
-    for (const std::string &invalid_address : {
-             "node_id=",
-             "node_id=-1",
-             "node_id=65536",
-             "media_type=1x",
-             "range_id=+1",
-         }) {
-        SCOPED_TRACE(invalid_address);
-        malformed = MakeLocation("pace://pace/0?" + invalid_address + "&size=5", sizeof(first_));
-        malformed.type = KvMetaStorageType::TAIR_MEMPOOL;
-        expect_internal(std::move(malformed));
-    }
-
-    // StandardUri keeps the last duplicate value. Reject duplicates before
-    // parsing so different components cannot disagree on object identity.
-    malformed = MakeLocation("file://nfs/first?size=999&size=5", sizeof(first_));
-    expect_internal(std::move(malformed));
-
-    // Event-report records describe externally observed blocks. They do not
-    // grant exact-object ownership and must never enter the EMB data plane.
     malformed = MakeLocation("event_report_l1p5://reporter/first?size=5", sizeof(first_));
     malformed.type = KvMetaStorageType::EVENT_REPORT_L1P5;
     expect_internal(std::move(malformed));

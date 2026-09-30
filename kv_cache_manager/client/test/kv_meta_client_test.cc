@@ -367,7 +367,7 @@ TEST(KvMetaClientTest, PreservesPerValueSizesAndAlignedResults) {
     EXPECT_EQ(ER_OK, client->TrimAll("trace-trim"));
 }
 
-TEST(KvMetaClientTest, FailsOverAndAbortsAMismatchedAllocation) {
+TEST(KvMetaClientTest, FailsOverAndRejectsAMismatchedAllocation) {
     FakeKvMetaService standby(true);
     FakeKvMetaService leader;
     leader.set_wrong_start_size(true);
@@ -387,8 +387,7 @@ TEST(KvMetaClientTest, FailsOverAndAbortsAMismatchedAllocation) {
     EXPECT_TRUE(start.locations.empty());
     EXPECT_EQ(0, standby.put_start_calls.load());
     EXPECT_EQ(1, leader.put_start_calls.load());
-    EXPECT_EQ(1, leader.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), leader.FinishSuccesses());
+    EXPECT_EQ(0, leader.put_finish_calls.load());
 }
 
 TEST(KvMetaClientTest, MapsWriteInProgressWithoutRetryingAnotherServer) {
@@ -503,22 +502,6 @@ TEST(KvMetaClientTest, AmbiguousWriteTransportErrorsAreNotRetried) {
     EXPECT_EQ(0, fallback.trim_calls.load());
 }
 
-TEST(KvMetaClientTest, ExplicitUnknownMutationOutcomeIsNotRetried) {
-    FakeKvMetaService uncertain;
-    uncertain.set_put_finish_status(proto::kv_meta::OUTCOME_UNKNOWN);
-    FakeKvMetaService fallback;
-    RunningServer uncertain_server(&uncertain);
-    RunningServer fallback_server(&fallback);
-    ASSERT_TRUE(uncertain_server.valid());
-    ASSERT_TRUE(fallback_server.valid());
-
-    auto client = KvMetaClient::Create({{uncertain_server.address(), fallback_server.address()}, "emb-instance", 1000});
-    ASSERT_TRUE(client);
-    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, client->FinishWrite("trace-finish", "uncertain-session", {true}));
-    EXPECT_EQ(1, uncertain.put_finish_calls.load());
-    EXPECT_EQ(0, fallback.put_finish_calls.load());
-}
-
 TEST(KvMetaClientTest, ExplicitStandbyResponsesStillFailOverForWrites) {
     FakeKvMetaService standby(true);
     FakeKvMetaService leader;
@@ -555,7 +538,7 @@ TEST(KvMetaClientTest, ExplicitStandbyResponsesStillFailOverForWrites) {
     EXPECT_EQ(1, leader.trim_calls.load());
 }
 
-TEST(KvMetaClientTest, MalformedCompactLocationsAbortUsingTheRequestAlignedMask) {
+TEST(KvMetaClientTest, RejectsMalformedCompactLocations) {
     FakeKvMetaService service;
     service.set_omit_last_start_location(true);
     RunningServer server(&service);
@@ -566,11 +549,10 @@ TEST(KvMetaClientTest, MalformedCompactLocationsAbortUsingTheRequestAlignedMask)
     auto [start_ec, start] = client->StartWrite("trace-start", {"a", "b"}, {17, 33}, 30);
     EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, start_ec);
     EXPECT_TRUE(start.locations.empty());
-    EXPECT_EQ(1, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false, false}), service.FinishSuccesses());
+    EXPECT_EQ(0, service.put_finish_calls.load());
 }
 
-TEST(KvMetaClientTest, MalformedMaskFallsBackToCompactLocationCountWhenAborting) {
+TEST(KvMetaClientTest, RejectsMalformedMask) {
     FakeKvMetaService service;
     service.set_extra_start_mask_value(true);
     RunningServer server(&service);
@@ -581,37 +563,10 @@ TEST(KvMetaClientTest, MalformedMaskFallsBackToCompactLocationCountWhenAborting)
     auto [start_ec, start] = client->StartWrite("trace-start", {"a", "b"}, {17, 33}, 30);
     EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, start_ec);
     EXPECT_TRUE(start.locations.empty());
-    EXPECT_EQ(1, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false, false}), service.FinishSuccesses());
+    EXPECT_EQ(0, service.put_finish_calls.load());
 }
 
-TEST(KvMetaClientTest, MalformedStartPreservesAmbiguousAbortOutcomes) {
-    FakeKvMetaService service;
-    service.set_wrong_start_size(true);
-    RunningServer server(&service);
-    ASSERT_TRUE(server.valid());
-
-    auto client = KvMetaClient::Create({{server.address()}, "emb-instance", 1000});
-    ASSERT_TRUE(client);
-
-    service.set_put_finish_transport_error(true);
-    EXPECT_EQ(ER_INVALID_GRPCSTATUS, client->StartWrite("trace-transport", {"a"}, {17}, 30).first);
-    EXPECT_EQ(1, service.put_finish_calls.load());
-
-    service.set_put_finish_transport_error(false);
-    service.set_put_finish_status(proto::kv_meta::OUTCOME_UNKNOWN);
-    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, client->StartWrite("trace-unknown", {"a"}, {17}, 30).first);
-    EXPECT_EQ(2, service.put_finish_calls.load());
-
-    // Even a definite cleanup rejection does not prove that the successful
-    // PutStart left no live reservation. Do not expose SESSION_NOT_FOUND as a
-    // clean start rejection that an upper layer could blindly retry.
-    service.set_put_finish_status(proto::kv_meta::SESSION_NOT_FOUND);
-    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, client->StartWrite("trace-rejected", {"a"}, {17}, 30).first);
-    EXPECT_EQ(3, service.put_finish_calls.load());
-}
-
-TEST(KvMetaClientTest, MalformedStartWithoutAnAddressableSessionIsOutcomeUnknown) {
+TEST(KvMetaClientTest, RejectsMalformedStartWithoutSession) {
     FakeKvMetaService service;
     service.set_omit_start_session_id(true);
     RunningServer server(&service);
@@ -621,34 +576,14 @@ TEST(KvMetaClientTest, MalformedStartWithoutAnAddressableSessionIsOutcomeUnknown
     ASSERT_TRUE(client);
     const auto [start_ec, start] = client->StartWrite("trace-missing-session", {"a"}, {17}, 30);
 
-    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, start_ec);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, start_ec);
     EXPECT_TRUE(start.write_session_id.empty());
     EXPECT_TRUE(start.key_mask.empty());
     EXPECT_TRUE(start.locations.empty());
     EXPECT_EQ(0, service.put_finish_calls.load());
 }
 
-TEST(KvMetaClientTest, MalformedStartWithoutProvableCardinalityIsOutcomeUnknown) {
-    FakeKvMetaService service;
-    service.set_extra_start_mask_value(true);
-    service.set_omit_last_start_location(true);
-    RunningServer server(&service);
-    ASSERT_TRUE(server.valid());
-
-    auto client = KvMetaClient::Create({{server.address()}, "emb-instance", 1000});
-    ASSERT_TRUE(client);
-    const auto [start_ec, start] = client->StartWrite("trace-missing-cardinality", {"a"}, {17}, 30);
-
-    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, start_ec);
-    EXPECT_TRUE(start.write_session_id.empty());
-    EXPECT_TRUE(start.key_mask.empty());
-    EXPECT_TRUE(start.locations.empty());
-    // A guessed empty success_keys vector is invalid and cannot prove that the
-    // live server session has been aborted. Lease expiry remains the backstop.
-    EXPECT_EQ(0, service.put_finish_calls.load());
-}
-
-TEST(KvMetaClientTest, MalformedAllocationUriIsRejectedAndAborted) {
+TEST(KvMetaClientTest, RejectsWrongAllocationTypeOrSize) {
     FakeKvMetaService service;
     service.set_wrong_uri_size(true);
     RunningServer server(&service);
@@ -657,123 +592,41 @@ TEST(KvMetaClientTest, MalformedAllocationUriIsRejectedAndAborted) {
     auto client = KvMetaClient::Create({{server.address()}, "emb-instance", 1000});
     ASSERT_TRUE(client);
     EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-size", {"a"}, {17}, 30).first);
-    EXPECT_EQ(1, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+    EXPECT_EQ(0, service.put_finish_calls.load());
 
     service.set_wrong_uri_size(false);
     service.set_wrong_uri_scheme(true);
     EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-scheme", {"a"}, {17}, 30).first);
-    EXPECT_EQ(2, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+    EXPECT_EQ(0, service.put_finish_calls.load());
 
     service.set_wrong_uri_scheme(false);
-    service.set_non_singleton_uri(true);
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-non-singleton", {"a"}, {17}, 30).first);
-    EXPECT_EQ(3, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
-
-    service.set_non_singleton_uri(false);
-    service.set_duplicate_uri_size(true);
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-duplicate-size", {"a"}, {17}, 30).first);
-    EXPECT_EQ(4, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
-
-    service.set_duplicate_uri_size(false);
-    service.set_fragment_uri(true);
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-fragment", {"a"}, {17}, 30).first);
-    EXPECT_EQ(5, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
-
-    service.set_fragment_uri(false);
     service.set_event_report_location(true);
     EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-event-report", {"a"}, {17}, 30).first);
-    EXPECT_EQ(6, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+    EXPECT_EQ(0, service.put_finish_calls.load());
 
     service.set_event_report_location(false);
-    service.set_mooncake_without_key(true);
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-mooncake-key", {"a"}, {17}, 30).first);
-    EXPECT_EQ(7, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
-
-    service.set_mooncake_without_key(false);
-    service.set_tair_with_malformed_offset(true);
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-tair-offset", {"a"}, {17}, 30).first);
-    EXPECT_EQ(8, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
-
-    service.set_tair_with_malformed_offset(false);
-    service.set_tair_with_malformed_address(true);
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-tair-address", {"a"}, {17}, 30).first);
-    EXPECT_EQ(9, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
-
-    service.set_tair_with_malformed_address(false);
-    service.set_unsafe_file_path(true);
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-file-root", {"a"}, {17}, 30).first);
-    EXPECT_EQ(10, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
-
-    service.set_unsafe_file_path(false);
-    service.set_noncanonical_authority(true);
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-authority", {"a"}, {17}, 30).first);
-    EXPECT_EQ(11, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
-
-    service.set_noncanonical_authority(false);
     service.set_oversized_uri(true);
     EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client->StartWrite("trace-oversized-uri", {"a"}, {17}, 30).first);
-    EXPECT_EQ(12, service.put_finish_calls.load());
-    EXPECT_EQ((std::vector<bool>{false}), service.FinishSuccesses());
+    EXPECT_EQ(0, service.put_finish_calls.load());
 }
 
 TEST(KvMetaClientTest, MalformedReadLocationIsRejectedBeforeExposure) {
     FakeKvMetaService service;
-    service.set_duplicate_uri_size(true);
+    service.set_event_report_location(true);
     RunningServer server(&service);
     ASSERT_TRUE(server.valid());
 
     auto client = KvMetaClient::Create({{server.address()}, "emb-instance", 1000});
     ASSERT_TRUE(client);
-    auto [duplicate_ec, duplicate] = client->Get("trace-duplicate", {"a"});
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, duplicate_ec);
-    EXPECT_TRUE(duplicate.locations.empty());
-
-    service.set_duplicate_uri_size(false);
-    service.set_event_report_location(true);
     auto [event_ec, event] = client->Get("trace-event", {"a"});
     EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, event_ec);
     EXPECT_TRUE(event.locations.empty());
 
     service.set_event_report_location(false);
-    service.set_mooncake_without_key(true);
-    auto [mooncake_ec, mooncake] = client->Get("trace-mooncake", {"a"});
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, mooncake_ec);
-    EXPECT_TRUE(mooncake.locations.empty());
-
-    service.set_mooncake_without_key(false);
-    service.set_tair_with_malformed_offset(true);
-    auto [tair_ec, tair] = client->Get("trace-tair", {"a"});
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, tair_ec);
-    EXPECT_TRUE(tair.locations.empty());
-
-    service.set_tair_with_malformed_offset(false);
-    service.set_tair_with_malformed_address(true);
-    auto [address_ec, address] = client->Get("trace-tair-address", {"a"});
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, address_ec);
-    EXPECT_TRUE(address.locations.empty());
-
-    service.set_tair_with_malformed_address(false);
-    service.set_unsafe_file_path(true);
-    auto [path_ec, path] = client->Get("trace-file-root", {"a"});
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, path_ec);
-    EXPECT_TRUE(path.locations.empty());
-
-    service.set_unsafe_file_path(false);
-    service.set_noncanonical_authority(true);
-    auto [authority_ec, authority] = client->Get("trace-authority", {"a"});
-    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, authority_ec);
-    EXPECT_TRUE(authority.locations.empty());
+    service.set_oversized_uri(true);
+    auto [uri_ec, uri] = client->Get("trace-uri", {"a"});
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, uri_ec);
+    EXPECT_TRUE(uri.locations.empty());
 }
 
 TEST(KvMetaClientTest, OversizedSessionIdInStartResponseIsRejected) {
@@ -786,13 +639,10 @@ TEST(KvMetaClientTest, OversizedSessionIdInStartResponseIsRejected) {
     ASSERT_TRUE(client);
     const auto [start_ec, start] = client->StartWrite("trace-start", {"a"}, {17}, 30);
 
-    EXPECT_EQ(ER_SERVICE_OUTCOME_UNKNOWN, start_ec);
+    EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, start_ec);
     EXPECT_TRUE(start.write_session_id.empty());
     EXPECT_TRUE(start.key_mask.empty());
     EXPECT_TRUE(start.locations.empty());
-    // PutFinish also rejects an oversized id, so the client must not issue an
-    // invalid rollback RPC. The server-side lease is the only cleanup
-    // backstop, and callers must therefore treat the start as ambiguous.
     EXPECT_EQ(0, service.put_finish_calls.load());
 }
 

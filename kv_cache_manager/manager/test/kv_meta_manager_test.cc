@@ -71,6 +71,7 @@ public:
     }
     std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()> cb) override {
+        delete_count_.fetch_add(uris.size(), std::memory_order_release);
         if (cb) {
             cb();
         }
@@ -86,8 +87,11 @@ public:
         return std::vector<ErrorCode>(uris.size(), EC_OK);
     }
 
+    std::size_t delete_count() const { return delete_count_.load(std::memory_order_acquire); }
+
 private:
     std::atomic<std::uint64_t> next_offset_{1};
+    std::atomic<std::size_t> delete_count_{0};
 };
 
 } // namespace
@@ -108,11 +112,12 @@ protected:
 
         auto pace_spec = std::make_shared<TairMemPoolStorageSpec>();
         pace_spec->set_domain("test-pace");
-        auto pace = std::make_shared<TestPaceBackend>(metrics_registry_);
-        ASSERT_EQ(EC_OK,
-                  pace->Open(StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, kStorageName, pace_spec),
-                             context_.trace_id()));
-        registry_manager_->data_storage_manager()->storage_map_[kStorageName] = std::move(pace);
+        pace_backend_ = std::make_shared<TestPaceBackend>(metrics_registry_);
+        ASSERT_EQ(
+            EC_OK,
+            pace_backend_->Open(StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, kStorageName, pace_spec),
+                                context_.trace_id()));
+        registry_manager_->data_storage_manager()->storage_map_[kStorageName] = pace_backend_;
         const auto [group_ec, group] = registry_manager_->GetInstanceGroup(&context_, "default");
         ASSERT_EQ(EC_OK, group_ec);
         ASSERT_TRUE(group);
@@ -123,6 +128,7 @@ protected:
 
         manager_ = std::make_unique<KvMetaManager>(cache_manager_, registry_manager_);
         ASSERT_TRUE(manager_->Init());
+        ASSERT_EQ(EC_OK, manager_->DoRecover());
         ASSERT_EQ(EC_OK, manager_->RegisterInstance(&context_, "default", kDefaultInstance, "emb-test").first);
     }
 
@@ -137,7 +143,8 @@ protected:
     void CreateGroup(const std::string &group_name,
                      const std::string &instance_id,
                      std::int64_t capacity,
-                     double threshold) {
+                     double threshold,
+                     std::int32_t delete_delay_ms = 0) {
         const auto [ec, default_group] = registry_manager_->GetInstanceGroup(&context_, "default");
         ASSERT_EQ(EC_OK, ec);
         ASSERT_TRUE(default_group && default_group->cache_config() &&
@@ -150,7 +157,7 @@ protected:
         trigger.set_used_percentage(threshold);
         strategy->set_trigger_strategy(trigger);
         strategy->set_reclaim_policy(ReclaimPolicy::POLICY_LRU);
-        strategy->set_delay_before_delete_ms(0);
+        strategy->set_delay_before_delete_ms(delete_delay_ms);
         cache_config->set_reclaim_strategy(strategy);
 
         InstanceGroup group(*default_group);
@@ -201,6 +208,7 @@ protected:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<CacheManager> cache_manager_;
+    std::shared_ptr<TestPaceBackend> pace_backend_;
     std::unique_ptr<KvMetaManager> manager_;
 };
 
@@ -327,6 +335,25 @@ TEST_F(KvMetaManagerTest, LruReclaimerConvergesActualUsageBelowWatermark) {
     EXPECT_EQ(1, static_cast<int>(values[0].found) + static_cast<int>(values[1].found));
 }
 
+TEST_F(KvMetaManagerTest, ReclaimerHonorsPhysicalDeleteDelay) {
+    constexpr const char *kGroup = "delayed-reclaim-group";
+    constexpr const char *kInstance = "delayed-reclaim-instance";
+    CreateGroup(kGroup, kInstance, 100, 0.8, 200);
+    Commit(kInstance, "old", 45);
+    Commit(kInstance, "new", 45);
+
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&context_, 10);
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetSamplingSize(&context_, 32));
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetBatchingSize(&context_, 8));
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+
+    ASSERT_TRUE(WaitUntil([&]() { return Indexer(kInstance)->GetStorageUsage() <= 80; }, std::chrono::seconds(3)));
+    EXPECT_EQ(0u, pace_backend_->delete_count());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(0u, pace_backend_->delete_count());
+    EXPECT_TRUE(WaitUntil([&]() { return pace_backend_->delete_count() > 0; }, std::chrono::seconds(2)));
+}
+
 TEST_F(KvMetaManagerTest, ExpiredSessionIsInvisibleAndCleaned) {
     auto start = Start(kDefaultInstance, {"expires"}, {29}, 1);
     ASSERT_FALSE(start.write_session_id.empty());
@@ -366,7 +393,9 @@ TEST_F(KvMetaManagerTest, RecoveryDropsIncompleteWritesAndRebuildsUsage) {
     Indexer(kDefaultInstance)->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 999);
 
     manager_->DoCleanup();
-    ASSERT_EQ(EC_OK, manager_->DoRecover());
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil([&]() { return manager_->recovery_complete_.load(std::memory_order_acquire); },
+                          std::chrono::seconds(3)));
     EXPECT_EQ(31u, Indexer(kDefaultInstance)->GetStorageUsage());
 
     auto [ec, values] = manager_->Get(&context_, kDefaultInstance, {"committed", "incomplete"});

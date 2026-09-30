@@ -116,6 +116,7 @@ protected:
 
         kv_meta_manager_ = std::make_shared<KvMetaManager>(cache_manager_, registry_manager_);
         ASSERT_TRUE(kv_meta_manager_->Init());
+        ASSERT_EQ(EC_OK, kv_meta_manager_->DoRecover());
         ASSERT_EQ(EC_OK,
                   kv_meta_manager_->RegisterInstance(&setup_context_, "default", kInstanceId, "service-test").first);
         service_ = std::make_unique<KvMetaServiceImpl>(cache_manager_, kv_meta_manager_, nullptr);
@@ -219,19 +220,6 @@ TEST_F(KvMetaServiceImplTest, DynamicSizeProtocolIsAlignedAndFinishFailsClosed) 
     EXPECT_EQ(proto::kv_meta::SIZE_MISMATCH, wrong_size_response.header().status().code());
     EXPECT_TRUE(wrong_size_response.write_session_id().empty());
     EXPECT_TRUE(wrong_size_response.locations().empty());
-}
-
-TEST_F(KvMetaServiceImplTest, MalformedPutStartCanAbortOnlyABoundedPublishedSession) {
-    auto [clean_start_ec, clean_start] =
-        kv_meta_manager_->StartWrite(&setup_context_, kInstanceId, {"malformed-clean-abort"}, {17}, 30);
-    ASSERT_EQ(EC_OK, clean_start_ec);
-    ASSERT_FALSE(clean_start.write_session_id.empty());
-    EXPECT_EQ(EC_OK,
-              service_->AbortMalformedPutStart(
-                  &setup_context_, kInstanceId, clean_start.write_session_id, clean_start.locations.size()));
-
-    EXPECT_EQ(EC_OUTCOME_UNKNOWN,
-              service_->AbortMalformedPutStart(&setup_context_, kInstanceId, "untrusted-session", 0));
 }
 
 TEST_F(KvMetaServiceImplTest, IndependentLeaderGateRejectsRequests) {

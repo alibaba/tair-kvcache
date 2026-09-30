@@ -1,15 +1,12 @@
 #include "kv_cache_manager/client/src/kv_meta_client_impl.h"
 
-#include <charconv>
 #include <chrono>
 #include <grpcpp/grpcpp.h>
 #include <string>
-#include <system_error>
 #include <unordered_set>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/kv_meta_uri.h"
 
 namespace kv_cache_manager {
@@ -57,8 +54,6 @@ ClientErrorCode ToClientError(proto::kv_meta::ErrorCode error) {
         return ER_SERVICE_SIZE_MISMATCH;
     case proto::kv_meta::IO_ERROR:
         return ER_SERVICE_IO_ERROR;
-    case proto::kv_meta::OUTCOME_UNKNOWN:
-        return ER_SERVICE_OUTCOME_UNKNOWN;
     case proto::kv_meta::UNSPECIFIED:
     case proto::kv_meta::UNKNOWN_ERROR:
     case proto::kv_meta::ERROR_MAX:
@@ -90,22 +85,12 @@ bool ToPublicLocation(const proto::kv_meta::ValueLocation &source, KvMetaValueLo
         return false;
     }
     const auto &source_spec = source.location_specs(0);
-    if (source_spec.uri().size() > kMaxKvMetaLocationUriBytes || !HasUnambiguousKvMetaUriText(source_spec.uri())) {
-        return false;
-    }
-    const DataStorageUri uri(source_spec.uri());
-    if (!HasCanonicalKvMetaAuthority(uri) || !uri.HasParam("size")) {
-        return false;
-    }
-    const std::string size_text = uri.GetParam("size");
     std::uint64_t uri_size = 0;
-    const auto parsed = std::from_chars(size_text.data(), size_text.data() + size_text.size(), uri_size);
-    if (size_text.empty() || parsed.ec != std::errc{} || parsed.ptr != size_text.data() + size_text.size()) {
-        return false;
-    }
-    const DataStorageType allocation_type = ToDataStorageType(uri.GetProtocol());
-    if (source_spec.name() != "value" || uri_size != source.value_size() ||
-        !HasOwnedKvMetaAllocationShape(uri, allocation_type)) {
+    const DataStorageType allocation_type = source.type() == proto::kv_meta::ST_TAIRMEMPOOL_SSD
+                                                ? DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD
+                                                : DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    if (source_spec.name() != "value" || !IsValidKvMetaLocation(source_spec.uri(), allocation_type, uri_size) ||
+        uri_size != source.value_size()) {
         target = {};
         return false;
     }
@@ -360,61 +345,9 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
         return {ec, {}};
     }
 
-    // A successful PutStart may already have persisted reservations and
-    // published a session before a malformed response is observed here. The
-    // response is a confirmed rejection only if we can address that session,
-    // derive a candidate cardinality, and PutFinish(false) explicitly
-    // succeeds. Every other cleanup result is mutation ambiguity: returning a
-    // plain INTERNAL_ERROR would let wrappers retry while the first session
-    // might still own allocations.
-    const auto abort_malformed_session = [&](ClientErrorCode original_error) {
-        if (response.write_session_id().empty() || response.write_session_id().size() > kMaxWriteSessionIdBytes) {
-            KVCM_LOG_WARN("cannot address malformed KVMeta write session; start outcome is unknown");
-            return ER_SERVICE_OUTCOME_UNKNOWN;
-        }
-        std::size_t count = 0;
-        if (response.has_key_mask() && response.key_mask().values_size() == static_cast<int>(keys.size())) {
-            for (const bool masked : response.key_mask().values()) {
-                count += masked ? 0 : 1;
-            }
-        } else {
-            count = static_cast<std::size_t>(response.locations_size());
-        }
-        if (count == 0 || count > kMaxBatchItems) {
-            KVCM_LOG_WARN("cannot derive malformed KVMeta write-session cardinality; start outcome is unknown");
-            return ER_SERVICE_OUTCOME_UNKNOWN;
-        }
-        ClientErrorCode abort_ec = ER_INVALID_GRPCSTATUS;
-        try {
-            abort_ec = FinishWrite(trace_id, response.write_session_id(), std::vector<bool>(count, false));
-        } catch (...) {
-            KVCM_LOG_WARN("malformed KVMeta write-session abort threw; start outcome is unknown");
-            return ER_INVALID_GRPCSTATUS;
-        }
-        if (abort_ec != ER_OK) {
-            KVCM_LOG_WARN("failed to abort malformed KVMeta write session, ec[%d]", static_cast<int>(abort_ec));
-            if (abort_ec == ER_INVALID_GRPCSTATUS || abort_ec == ER_SERVICE_OUTCOME_UNKNOWN) {
-                return abort_ec;
-            }
-            // A definite abort rejection still does not prove that the
-            // successful PutStart left no live reservation. Normalize it to
-            // the public ambiguity code rather than leaking a misleading
-            // SESSION_NOT_FOUND/SIZE_MISMATCH/etc. from the cleanup attempt.
-            return ER_SERVICE_OUTCOME_UNKNOWN;
-        }
-        return original_error;
-    };
-
-    // A valid service currently generates a short random identifier. Bound an
-    // untrusted/mismatched response before copying it into the public result.
-    // An oversized id cannot be passed back through PutFinish, so the lease is
-    // the only cleanup backstop and the mutation outcome is unknown.
-    if (response.write_session_id().size() > kMaxWriteSessionIdBytes) {
-        return {abort_malformed_session(ER_SERVICE_INTERNAL_ERROR), {}};
-    }
-
-    if (!response.has_key_mask() || response.key_mask().values_size() != static_cast<int>(keys.size())) {
-        return {abort_malformed_session(ER_SERVICE_INTERNAL_ERROR), {}};
+    if (response.write_session_id().size() > kMaxWriteSessionIdBytes || !response.has_key_mask() ||
+        response.key_mask().values_size() != static_cast<int>(keys.size())) {
+        return {ER_SERVICE_INTERNAL_ERROR, {}};
     }
     std::size_t expected_locations = 0;
     for (const bool masked : response.key_mask().values()) {
@@ -422,7 +355,7 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
     }
     if (response.locations_size() != static_cast<int>(expected_locations) ||
         (expected_locations == 0) != response.write_session_id().empty()) {
-        return {abort_malformed_session(ER_SERVICE_INTERNAL_ERROR), {}};
+        return {ER_SERVICE_INTERNAL_ERROR, {}};
     }
 
     KvMetaStartWriteResult result;
@@ -438,10 +371,10 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
         }
         KvMetaValueLocation location;
         if (!ToPublicLocation(response.locations(static_cast<int>(location_index)), location)) {
-            return {abort_malformed_session(ER_SERVICE_INTERNAL_ERROR), {}};
+            return {ER_SERVICE_INTERNAL_ERROR, {}};
         }
         if (location.value_size != value_sizes[i]) {
-            return {abort_malformed_session(ER_SERVICE_SIZE_MISMATCH), {}};
+            return {ER_SERVICE_SIZE_MISMATCH, {}};
         }
         result.locations.push_back(std::move(location));
         ++location_index;

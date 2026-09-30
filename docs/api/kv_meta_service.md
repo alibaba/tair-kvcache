@@ -78,7 +78,6 @@ session 超时后服务端会自动清理。transport error 代表结果可能�
 | `SIZE_MISMATCH` | 已有对象 size 与请求不一致 |
 | `RESOURCE_EXHAUSTED` | session 或后端资源不足 |
 | `IO_ERROR` | 存储或超时错误 |
-| `OUTCOME_UNKNOWN` | mutation 是否生效无法确认，必须对账 |
 
 ## 限制
 
