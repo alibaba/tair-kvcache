@@ -31,8 +31,8 @@ exact-size 数据面，并为所有 miss/容量/读取故障保留重算路径�
    allocation 返回 `SERVICE_NOT_READY`；
 3. 调用方先执行 `RegisterInstance`，并使用响应中的权威 `storage_configs` 初始化数据面；
 4. 每次 RPC 都通过 `CommonResponseHeader.status` 判断业务结果，不能只看 gRPC transport status；
-5. 公共 `instance_id` 只能通过本 service 使用。编码后的 `__kv_meta_v1__...` 前缀属于服务端保留 namespace；旧
-   Meta/Admin API 会返回 `INVALID_ARGUMENT`，Admin 列表也不会暴露这些内部实例；
+5. 公共 `instance_id` 只能通过本 service 使用。服务端会编码为 `__kv_meta_v1__...` 内部 instance；本功能不修改旧
+   Meta/Admin API，因此部署和运维必须避免通过旧接口读取或变更这些内部 instance；
 6. 同一 `(instance_id, key)` 必须永久表示相同内容。key 至少纳入 tenant、模型/预处理 revision、输入 digest、
    tensor schema/version；服务端把“同 key、同 size”视为 hit，但不会比较 value bytes；
 7. miss、`RESOURCE_EXHAUSTED`、`WRITE_IN_PROGRESS`、服务不可用或数据面 Load 失败都必须允许调用方重算。Cache 写回失败
@@ -118,8 +118,8 @@ Trim(instance) -> 按策略清理整个 KVMeta instance
 输入 `instance_group`、`instance_id` 和可选 `user_data`：
 
 - group 必须已存在并且只包含 KVMeta instance；
-- group 类型由已持久化的成员派生；KVMeta 与普通 KVCache 的注册在同一控制面临界区内双向互斥，任一方先注册后，
-  另一类 instance 再加入同 group 都会在 registry mutation 前被拒绝；
+- KVMeta 注册会在 mutation 前拒绝已含普通 instance 的 group，并串行化 KVMeta 自身的注册。普通 KVCache 注册和
+  Admin 运维路径不增加额外互斥或 guard；专用 group 的反向隔离由部署配置保证，误混后仅 KVMeta side path fail closed；
 - group 必须有当前 KVMeta Reclaimer 可执行的 LRU 配置，且进程级 sampling/batching 非零；无配置、非 LRU、
   非法 watermark/read grace 或关闭采样/批量回收均返回 `SERVICE_NOT_READY`，且不会创建 instance；
 - group 的 metadata backend 必须是 `local`、使用 local hot layer 的合法 `cached`，或测试用 `dummy`；直连 Redis 不刷新读热度，不能在

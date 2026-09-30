@@ -2747,10 +2747,7 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
     // migration budget sampling those exact-key namespaces.
     instance_infos.erase(std::remove_if(instance_infos.begin(),
                                         instance_infos.end(),
-                                        [](const auto &instance) {
-                                            return instance &&
-                                                   HasKvMetaReservedInstancePrefix(instance->instance_id());
-                                        }),
+                                        [](const auto &instance) { return instance && IsKvMetaInstance(*instance); }),
                          instance_infos.end());
     if (instance_infos.empty()) {
         return result;

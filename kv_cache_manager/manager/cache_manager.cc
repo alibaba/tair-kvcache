@@ -452,17 +452,6 @@ void ResolveUsableTieredWriteTargets(RequestContext *request_context,
     }
 }
 
-ErrorCode RejectLegacyKvMetaNamespace(RequestContext *request_context, const std::string &instance_id) {
-    if (!HasKvMetaReservedInstancePrefix(instance_id)) {
-        return EC_OK;
-    }
-    if (request_context && request_context->error_tracer()) {
-        request_context->error_tracer()->AddErrorMsg(
-            "reserved KVMeta instances are accessible only through KvMetaService");
-    }
-    return EC_BADARGS;
-}
-
 } // namespace
 
 CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -628,16 +617,8 @@ CacheManager::RegisterInstance(RequestContext *request_context,
                                const std::vector<LocationSpecGroup> &location_spec_groups,
                                QueryType default_query_type) {
     SPAN_TRACER(request_context);
+    // TODO : not thread safe now
     const auto &trace_id = request_context->trace_id();
-
-    // Group kind is derived from its persisted members, so no registry schema
-    // change is required. Keep the check and a *new* RegisterInstance mutation
-    // in one process-local critical section. Re-registering an existing
-    // persisted instance deliberately remains recoverable: an old deployment
-    // or out-of-band writer may already have produced a mixed group, and that
-    // must fail closed only on the optional KVMeta path rather than preventing
-    // ordinary KV-cache indexers from recovering.
-    std::lock_guard<std::mutex> registration_lock(instance_registration_mutex_);
     auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     if (instance_info) {
         auto mismatched = instance_info->MismatchFields(block_size,
@@ -662,27 +643,6 @@ CacheManager::RegisterInstance(RequestContext *request_context,
         PREFIX_LOG(INFO, "register instance OK");
         return {ec, GetStorageConfigStr(request_context, instance_id)};
     }
-
-    const auto [members_ec, group_members] = registry_manager_->ListInstanceInfo(request_context, instance_group);
-    if (members_ec != EC_OK) {
-        PREFIX_LOG(WARN, "register instance failed to inspect instance group, ec[%d]", members_ec);
-        return {members_ec, {}};
-    }
-    const bool registering_kv_meta = HasKvMetaReservedInstancePrefix(instance_id);
-    for (const auto &member : group_members) {
-        if (!member) {
-            request_context->error_tracer()->AddErrorMsg(
-                "register instance failed: instance group contains a null member");
-            return {EC_CORRUPTION, {}};
-        }
-        if (HasKvMetaReservedInstancePrefix(member->instance_id()) != registering_kv_meta) {
-            request_context->error_tracer()->AddErrorMsg(
-                "register instance failed: KVMeta and ordinary KV-cache instances require separate groups");
-            PREFIX_LOG(WARN, "register instance failed: mixed KVMeta/KV-cache group is forbidden");
-            return {EC_BADARGS, {}};
-        }
-    }
-
     auto ec = registry_manager_->RegisterInstance(request_context,
                                                   instance_group,
                                                   instance_id,
@@ -703,9 +663,6 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
                                        const std::string &instance_id) {
     SPAN_TRACER(request_context);
     const auto &trace_id = request_context->trace_id();
-    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
-        return ec;
-    }
 
     // drain 活跃迁移 copy 后再 trim，避免 trim 与 backend copy 竞态。
     // （trim 把 active copy 的 WRITING 目标 CAS→DELETING 删掉 / copy 成功后 promote 的 SERVING 目标被 trim 删）。
@@ -796,9 +753,6 @@ std::pair<ErrorCode, InstanceInfoConstPtr> CacheManager::GetInstanceInfo(Request
                                                                          const std::string &instance_id) {
     SPAN_TRACER(request_context);
     const auto &trace_id = request_context->trace_id();
-    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
-        return {ec, nullptr};
-    }
     InstanceInfoConstPtr info_ptr = registry_manager_->GetInstanceInfo(request_context, instance_id);
     if (info_ptr == nullptr) {
         PREFIX_LOG(DEBUG, "get instance info failed");
@@ -1430,9 +1384,6 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                                std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
-    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
-        return ec;
-    }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     WriteLocationManager::WriteLocationInfo location_info;
     if (write_location_info_internal != nullptr) {
@@ -1570,9 +1521,6 @@ ErrorCode CacheManager::RemoveCache(RequestContext *request_context,
                                     const BlockMask &block_mask /*TODO*/) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
-    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
-        return ec;
-    }
     assert(schedule_plan_executor_);
     if (keys.empty() && tokens.empty()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_BADARGS, "remove cache failed: empty input");
@@ -1598,9 +1546,6 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
                                   std::int32_t end_ts) const noexcept {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
-    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
-        return ec;
-    }
 
     if (trim_strategy != proto::meta::TS_REMOVE_ALL_CACHE) {
         PREFIX_LOG(WARN, "trim strategy not implemented");
@@ -1690,12 +1635,6 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
     // 薄 facade：只做前置校验（依赖、instance、target storage 和 migration strategy），
     // 迁移编排（候选/meta/admission/dispatch/计数）下沉 MigrationManager::MigrateCache。
     MigrateCacheResult result;
-
-    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
-        result.ec = ec;
-        result.message = "reserved KVMeta instances are not valid legacy migration targets";
-        return result;
-    }
 
     if (migration_manager_ == nullptr || meta_indexer_manager_ == nullptr) {
         result.ec = EC_ERROR;
@@ -2783,12 +2722,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     const std::string &instance_id = request->instance_id();
     const std::string &host_ip_port = request->host_ip_port();
     auto *response_status = response->mutable_header()->mutable_status();
-
-    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
-        response_status->set_code(proto::meta::INVALID_ARGUMENT);
-        response_status->set_message("reserved KVMeta instances are accessible only through KvMetaService");
-        return ec;
-    }
 
     ReporterIdentityView reporter_identity;
     if (instance_id.empty() || !SnapshotUriUtils::IsValidLocationIdComponent(host_ip_port) ||
@@ -4329,9 +4262,6 @@ std::pair<ErrorCode, MetaSearcher *> CacheManager::CheckInputAndGetMetaSearcher(
                                                                                 const TokenIdsVector &tokens) const {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
-    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
-        return {ec, nullptr};
-    }
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher) {
         PREFIX_LOG(WARN, "meta searcher not found");
@@ -4350,9 +4280,6 @@ std::pair<ErrorCode, int64_t> CacheManager::GetBlockSize(RequestContext *request
                                                          const std::string &instance_id) const {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
-    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
-        return {ec, 0};
-    }
     auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     if (!instance_info) {
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_INSTANCE_NOT_EXIST, int64_t, "instance not found");
@@ -4890,9 +4817,6 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                 size_t p2p_host_count) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
-    if (const ErrorCode ec = RejectLegacyKvMetaNamespace(request_context, instance_id); ec != EC_OK) {
-        return {ec, {}};
-    }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
 
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);

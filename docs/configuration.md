@@ -177,8 +177,9 @@ ServerBuilder 的注册集合也保持不变。设为 `true` 后，KVMeta 与固
 `kvcm.service.rpc_port`，依靠不同的 protobuf service 全名路由，不创建第二个 listener。升主时主服务先完成原有
 恢复并放流，KVMeta 再在可取消的独立线程中恢复，恢复完成前仅 KVMeta 请求返回 not-leader/not-ready。
 
-KVMeta instance 必须注册到专用 Instance Group，不能与普通 KVCache instance 共组。该约束隔离容量统计；
-普通 CacheReclaimer、Migration 和 Cache GC 也不会扫描 KVMeta instance。KVMeta 使用独立 worker 按专用 group
+KVMeta instance 必须注册到专用 Instance Group，不能与普通 KVCache instance 共组。KVMeta 注册和运行期会校验该
+约束，但不改变普通注册或 Admin 运维路径，反向隔离由部署配置保证。普通 CacheReclaimer、Migration 和 Cache GC
+只跳过带完整 KVMeta schema marker 的 instance。KVMeta 使用独立 worker 按专用 group
 现有的 LRU `reclaim_strategy` 自动逐出，并复用 sampling/batch/idle 参数；不占用普通 Reclaimer 的 pending 状态或
 删除 executor。业务仍应在消费结束后用 `Remove` 主动 release，`TrimAll` 用于全量维护。完整协议、动态长度、
 durable tombstone、reader grace、按 backend 能力执行的物理清理、metadata finalization 回收语义和 RTP 接入方式见

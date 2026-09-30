@@ -4385,34 +4385,6 @@ TEST_F(KvMetaManagerTest, SessionPublicationPhysicalCleanupFailureFailsKvMetaClo
     ASSERT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, retry.write_session_id, {false}));
 }
 
-TEST_F(KvMetaManagerTest, RejectsOrdinaryRegistrationIntoAKvMetaGroup) {
-    ModelDeployment deployment;
-    deployment.set_model_name("ordinary-kv-cache");
-    deployment.set_dtype("fp16");
-    deployment.set_tp_size(1);
-    deployment.set_dp_size(1);
-    deployment.set_pp_size(1);
-    EXPECT_EQ(EC_BADARGS,
-              cache_manager_
-                  ->RegisterInstance(&request_context_,
-                                     "default",
-                                     "ordinary-instance",
-                                     1,
-                                     {LocationSpecInfo("value", 1)},
-                                     deployment,
-                                     {},
-                                     CacheManager::QueryType::QT_BATCH_GET)
-                  .first);
-    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(&request_context_, "ordinary-instance"));
-
-    // A rejected legacy registration cannot poison admission or reclamation
-    // for the already-valid KVMeta group.
-    EXPECT_EQ(EC_OK, manager_->RegisterInstance(&request_context_, "default", "another-object-instance", "").first);
-    auto [start_ec, start] = manager_->StartWrite(&request_context_, kInstanceId, {"must-not-share-quota"}, {1}, 30);
-    ASSERT_EQ(EC_OK, start_ec);
-    EXPECT_EQ(EC_OK, manager_->FinishWrite(&request_context_, kInstanceId, start.write_session_id, {false}));
-}
-
 TEST_F(KvMetaManagerTest, RejectsKvMetaRegistrationIntoAnOrdinaryGroup) {
     const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
     ASSERT_EQ(EC_OK, group_ec);
@@ -4444,110 +4416,35 @@ TEST_F(KvMetaManagerTest, RejectsKvMetaRegistrationIntoAnOrdinaryGroup) {
               manager_->RegisterInstance(&request_context_, ordinary_group.name(), "kvmeta-must-not-mix", "").first);
 }
 
-TEST_F(KvMetaManagerTest, ExistingOrdinaryInstanceInLegacyMixedGroupCanStillRecover) {
-    ModelDeployment deployment;
-    deployment.set_model_name("legacy-ordinary-kv-cache");
-    deployment.set_dtype("fp16");
-    deployment.set_tp_size(1);
-    deployment.set_dp_size(1);
-    deployment.set_pp_size(1);
-    const std::vector<LocationSpecInfo> specs{LocationSpecInfo("value", 1)};
-
-    // Simulate persisted state produced before bidirectional group reservation
-    // existed. Recovery must recreate the ordinary indexer without performing
-    // another registry mutation or making the main KV-cache path unavailable.
-    ASSERT_EQ(EC_OK,
-              registry_manager_->RegisterInstance(&request_context_,
-                                                  "default",
-                                                  "legacy-ordinary",
-                                                  1,
-                                                  specs,
-                                                  deployment,
-                                                  {},
-                                                  static_cast<std::int32_t>(CacheManager::QueryType::QT_BATCH_GET)));
-    EXPECT_EQ(EC_OK,
-              cache_manager_
-                  ->RegisterInstance(&request_context_,
-                                     "default",
-                                     "legacy-ordinary",
-                                     1,
-                                     specs,
-                                     deployment,
-                                     {},
-                                     CacheManager::QueryType::QT_BATCH_GET)
-                  .first);
-    EXPECT_NE(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("legacy-ordinary"));
-
-    // Only the optional KVMeta side fails closed until operators repair the
-    // historical group; a new member of either type is still rejected.
-    EXPECT_EQ(EC_BADARGS, manager_->StartWrite(&request_context_, kInstanceId, {"mixed-group"}, {1}, 30).first);
-    EXPECT_EQ(EC_BADARGS,
-              cache_manager_
-                  ->RegisterInstance(&request_context_,
-                                     "default",
-                                     "new-ordinary-must-not-extend-mixed-group",
-                                     1,
-                                     specs,
-                                     deployment,
-                                     {},
-                                     CacheManager::QueryType::QT_BATCH_GET)
-                  .first);
-    EXPECT_EQ(
-        EC_BADARGS,
-        manager_->RegisterInstance(&request_context_, "default", "new-kvmeta-must-not-extend-mixed-group", "").first);
-}
-
-TEST_F(KvMetaManagerTest, ConcurrentMixedRegistrationCannotCreateAMixedGroup) {
-    const auto [group_ec, default_group] = registry_manager_->GetInstanceGroup(&request_context_, "default");
-    ASSERT_EQ(EC_OK, group_ec);
-    ASSERT_TRUE(default_group);
-    InstanceGroup empty_group(*default_group);
-    empty_group.set_name("concurrent-group-kind-reservation");
-    empty_group.set_global_quota_group_name("concurrent-group-kind-quota");
-    empty_group.set_version(1);
-    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&request_context_, empty_group));
-
+TEST_F(KvMetaManagerTest, OrdinaryRegistrationIsUnchangedAndKvMetaFailsClosedOnAMixedGroup) {
     ModelDeployment deployment;
     deployment.set_model_name("ordinary-kv-cache");
     deployment.set_dtype("fp16");
     deployment.set_tp_size(1);
     deployment.set_dp_size(1);
     deployment.set_pp_size(1);
+    const std::vector<LocationSpecInfo> specs{LocationSpecInfo("value", 1)};
 
-    std::promise<void> start_signal;
-    const auto start_gate = start_signal.get_future().share();
-    auto ordinary = std::async(std::launch::async, [&, start_gate]() {
-        start_gate.wait();
-        RequestContext context("concurrent-ordinary-registration");
-        return cache_manager_
-            ->RegisterInstance(&context,
-                               empty_group.name(),
-                               "concurrent-ordinary-instance",
-                               1,
-                               {LocationSpecInfo("value", 1)},
-                               deployment,
-                               {},
-                               CacheManager::QueryType::QT_BATCH_GET)
-            .first;
-    });
-    auto kv_meta = std::async(std::launch::async, [&, start_gate]() {
-        start_gate.wait();
-        RequestContext context("concurrent-kvmeta-registration");
-        return manager_->RegisterInstance(&context, empty_group.name(), "concurrent-kvmeta-instance", "").first;
-    });
-    start_signal.set_value();
+    // Enabling KVMeta must not add policy or locking to the established
+    // CacheManager registration path. If an operator nevertheless mixes the
+    // groups, only the optional KVMeta side fails closed.
+    EXPECT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(&request_context_,
+                                     "default",
+                                     "ordinary-in-kvmeta-group",
+                                     1,
+                                     specs,
+                                     deployment,
+                                     {},
+                                     CacheManager::QueryType::QT_BATCH_GET)
+                  .first);
+    EXPECT_NE(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("ordinary-in-kvmeta-group"));
 
-    const ErrorCode ordinary_ec = ordinary.get();
-    const ErrorCode kv_meta_ec = kv_meta.get();
-    EXPECT_EQ(1, static_cast<int>(ordinary_ec == EC_OK) + static_cast<int>(kv_meta_ec == EC_OK));
-    EXPECT_TRUE((ordinary_ec == EC_OK && kv_meta_ec == EC_BADARGS) ||
-                (ordinary_ec == EC_BADARGS && kv_meta_ec == EC_OK));
-
-    const auto [instances_ec, instances] = registry_manager_->ListInstanceInfo(&request_context_, empty_group.name());
-    ASSERT_EQ(EC_OK, instances_ec);
-    ASSERT_EQ(1, instances.size());
-    ASSERT_TRUE(instances.front());
-    EXPECT_EQ(kv_meta_ec == EC_OK, HasKvMetaReservedInstancePrefix(instances.front()->instance_id()));
+    EXPECT_EQ(EC_BADARGS, manager_->StartWrite(&request_context_, kInstanceId, {"mixed-group"}, {1}, 30).first);
+    EXPECT_EQ(
+        EC_BADARGS,
+        manager_->RegisterInstance(&request_context_, "default", "new-kvmeta-must-not-extend-mixed-group", "").first);
 }
 
 TEST_F(KvMetaManagerTest, ExactValueSizesAreIncludedInByteAdmission) {

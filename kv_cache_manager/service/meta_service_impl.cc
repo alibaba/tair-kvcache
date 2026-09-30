@@ -16,7 +16,6 @@
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_manager.h"
-#include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/write_location_manager.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 #include "kv_cache_manager/service/util/fault_injector.h"
@@ -114,18 +113,6 @@ namespace {
 
 constexpr const char *kReportEventFullAccessLogEnv = "KVCM_REPORT_EVENT_FULL_ACCESS_LOG";
 constexpr const char *kGetHostCacheStateFullAccessLogEnv = "KVCM_GET_HOST_CACHE_STATE_FULL_ACCESS_LOG";
-
-bool RejectReservedKvMetaInstance(RequestContext *request_context,
-                                  const std::string &instance_id,
-                                  proto::meta::Status *status) {
-    if (!HasKvMetaReservedInstancePrefix(instance_id)) {
-        return false;
-    }
-    status->set_code(proto::meta::INVALID_ARGUMENT);
-    status->set_message("reserved KVMeta instances are accessible only through KvMetaService");
-    request_context->set_status_code(status->code());
-    return true;
-}
 
 RequestContext::JsonFragment BuildProtoMessageDebugJson(const google::protobuf::Message *message) {
     RequestContext::JsonFragment fragment;
@@ -338,10 +325,6 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
     API_CALL_GUARD("RegisterInstance", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
-    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
-        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
-        return;
-    }
     CHECK_FAULT_INJECTION("RegisterInstance");
 
     // 参数验证
@@ -439,10 +422,6 @@ void MetaServiceImpl::GetInstanceInfo(RequestContext *request_context,
     API_CALL_GUARD("GetInstanceInfo", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
-    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
-        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
-        return;
-    }
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION("GetInstanceInfo", "instance_id", true);
@@ -488,10 +467,6 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
     API_CALL_GUARD("GetCacheLocation", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
-    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
-        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
-        return;
-    }
     CHECK_FAULT_INJECTION("GetCacheLocation");
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
@@ -551,10 +526,6 @@ void MetaServiceImpl::GetCacheLocationsByBackend(RequestContext *request_context
     API_CALL_GUARD("GetCacheLocationsByBackend", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
-    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
-        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
-        return;
-    }
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION("GetCacheLocationsByBackend", "instance_id", true);
@@ -626,10 +597,6 @@ void MetaServiceImpl::GetCacheLocationLen(RequestContext *request_context,
     API_CALL_GUARD("GetCacheLocationLen", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
-    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
-        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
-        return;
-    }
     CHECK_FAULT_INJECTION("GetCacheLocationLen");
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
@@ -675,10 +642,6 @@ void MetaServiceImpl::GetCacheMeta(RequestContext *request_context,
     API_CALL_GUARD("GetCacheMeta", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
-    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
-        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
-        return;
-    }
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION("GetCacheMeta", "instance_id", true);
@@ -736,10 +699,6 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
     API_CALL_GUARD("StartWriteCache", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
-    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
-        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
-        return;
-    }
     CHECK_FAULT_INJECTION("StartWriteCache");
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
@@ -805,10 +764,6 @@ void MetaServiceImpl::FinishWriteCache(RequestContext *request_context,
     // 设置响应头
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
-    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
-        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
-        return;
-    }
     CHECK_FAULT_INJECTION("FinishWriteCache");
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
@@ -855,10 +810,6 @@ void MetaServiceImpl::RemoveCache(RequestContext *request_context,
     API_CALL_GUARD("RemoveCache", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
-    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
-        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
-        return;
-    }
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION("RemoveCache", "instance_id", true);
@@ -900,10 +851,6 @@ void MetaServiceImpl::TrimCache(RequestContext *request_context,
     API_CALL_GUARD("TrimCache", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
-    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
-        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
-        return;
-    }
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION("TrimCache", "instance_id", true);
@@ -995,11 +942,6 @@ void MetaServiceImpl::ReportEvent(RequestContext *request_context,
                               BuildReportEventResponseAccessLogSummary(response),
                               RequestContext::ResponseJsonKind::kAccessLogSummary);
     auto *header = response->mutable_header();
-    auto *status = header->mutable_status();
-    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
-        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
-        return;
-    }
 
     KVCM_LOG_DEBUG("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
                    request->trace_id().c_str(),
@@ -1033,10 +975,6 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
                               RequestContext::ResponseJsonKind::kAccessLogSummary);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
-    if (RejectReservedKvMetaInstance(request_context, request->instance_id(), status)) {
-        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
-        return;
-    }
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION("GetHostCacheState", "instance_id", true);

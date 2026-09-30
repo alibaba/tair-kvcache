@@ -1,4 +1,3 @@
-#include <algorithm>
 #include <cstddef>
 #include <filesystem>
 #include <functional>
@@ -17,14 +16,11 @@
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/nfs_backend.h"
 #include "kv_cache_manager/manager/cache_manager.h"
-#include "kv_cache_manager/manager/kv_meta_instance.h"
 #include "kv_cache_manager/manager/kv_meta_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/kv_meta_service.pb.h"
-#include "kv_cache_manager/service/admin_service_impl.h"
 #include "kv_cache_manager/service/kv_meta_service_impl.h"
-#include "kv_cache_manager/service/meta_service_impl.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -73,16 +69,9 @@ protected:
         ASSERT_EQ(EC_OK,
                   kv_meta_manager_->RegisterInstance(&setup_context_, "default", kInstanceId, "service-test").first);
         service_ = std::make_unique<KvMetaServiceImpl>(cache_manager_, kv_meta_manager_, nullptr);
-        legacy_meta_service_ = std::make_unique<MetaServiceImpl>(cache_manager_, nullptr, nullptr);
-        legacy_meta_service_->EnableLeaderOnlyRequests();
-        admin_service_ =
-            std::make_unique<AdminServiceImpl>(cache_manager_, nullptr, metrics_registry_, registry_manager_, nullptr);
-        admin_service_->EnableLeaderOnlyRequests();
     }
 
     void TearDown() override {
-        admin_service_.reset();
-        legacy_meta_service_.reset();
         service_.reset();
         kv_meta_manager_->Shutdown();
         kv_meta_manager_.reset();
@@ -98,8 +87,6 @@ protected:
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<KvMetaManager> kv_meta_manager_;
     std::unique_ptr<KvMetaServiceImpl> service_;
-    std::unique_ptr<MetaServiceImpl> legacy_meta_service_;
-    std::unique_ptr<AdminServiceImpl> admin_service_;
 };
 
 TEST_F(KvMetaServiceImplTest, DynamicSizeProtocolIsAlignedAndFinishFailsClosed) {
@@ -238,147 +225,6 @@ TEST_F(KvMetaServiceImplTest, IndependentLeaderGateRejectsRequests) {
     EXPECT_TRUE(response.locations().empty());
 
     service_->WaitForAllLeaderOnlyRequestsToComplete();
-}
-
-TEST_F(KvMetaServiceImplTest, LegacyServicesRejectAndHideReservedKvMetaNamespace) {
-    const auto [list_ec, instances] = registry_manager_->ListInstanceInfo(&setup_context_, "default");
-    ASSERT_EQ(EC_OK, list_ec);
-    const auto internal = std::find_if(instances.begin(), instances.end(), [](const auto &instance) {
-        return instance && IsKvMetaInstance(*instance);
-    });
-    ASSERT_NE(instances.end(), internal);
-    const std::string internal_instance_id = (*internal)->instance_id();
-
-    {
-        proto::meta::RegisterInstanceRequest request;
-        request.set_instance_id(std::string(kKvMetaInternalInstancePrefix) + "future-format");
-        proto::meta::RegisterInstanceResponse response;
-        RequestContext context("legacy-meta-register-reserved");
-        legacy_meta_service_->RegisterInstance(&context, &request, &response);
-        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
-    }
-    {
-        proto::meta::GetInstanceInfoRequest request;
-        request.set_instance_id(internal_instance_id);
-        proto::meta::GetInstanceInfoResponse response;
-        RequestContext context("legacy-meta-get-instance-reserved");
-        legacy_meta_service_->GetInstanceInfo(&context, &request, &response);
-        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
-    }
-    {
-        proto::meta::StartWriteCacheRequest request;
-        request.set_instance_id(internal_instance_id);
-        proto::meta::StartWriteCacheResponse response;
-        RequestContext context("legacy-meta-start-reserved");
-        legacy_meta_service_->StartWriteCache(&context, &request, &response);
-        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
-        EXPECT_TRUE(response.write_session_id().empty());
-    }
-    {
-        proto::meta::FinishWriteCacheRequest request;
-        request.set_instance_id(internal_instance_id);
-        proto::meta::CommonResponse response;
-        RequestContext context("legacy-meta-finish-reserved");
-        legacy_meta_service_->FinishWriteCache(&context, &request, &response);
-        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
-    }
-    {
-        proto::meta::RemoveCacheRequest request;
-        request.set_instance_id(internal_instance_id);
-        proto::meta::CommonResponse response;
-        RequestContext context("legacy-meta-remove-reserved");
-        legacy_meta_service_->RemoveCache(&context, &request, &response);
-        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
-    }
-    {
-        proto::meta::TrimCacheRequest request;
-        request.set_instance_id(internal_instance_id);
-        proto::meta::CommonResponse response;
-        RequestContext context("legacy-meta-trim-reserved");
-        legacy_meta_service_->TrimCache(&context, &request, &response);
-        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
-    }
-    {
-        proto::meta::ReportEventRequest request;
-        request.set_instance_id(internal_instance_id);
-        proto::meta::ReportEventResponse response;
-        RequestContext context("legacy-meta-report-reserved");
-        legacy_meta_service_->ReportEvent(&context, &request, &response);
-        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
-    }
-    {
-        proto::admin::RegisterInstanceRequest request;
-        request.set_instance_id(internal_instance_id);
-        proto::admin::CommonResponse response;
-        RequestContext context("legacy-admin-register-reserved");
-        admin_service_->RegisterInstance(&context, &request, &response);
-        EXPECT_EQ(proto::admin::INVALID_ARGUMENT, response.header().status().code());
-    }
-    {
-        proto::admin::GetInstanceInfoRequest request;
-        request.set_instance_id(internal_instance_id);
-        proto::admin::GetInstanceInfoResponse response;
-        RequestContext context("legacy-admin-get-instance-reserved");
-        admin_service_->GetInstanceInfo(&context, &request, &response);
-        EXPECT_EQ(proto::admin::INVALID_ARGUMENT, response.header().status().code());
-    }
-    {
-        proto::admin::RemoveInstanceRequest request;
-        request.set_instance_id(internal_instance_id);
-        proto::admin::CommonResponse response;
-        RequestContext context("legacy-admin-remove-instance-reserved");
-        admin_service_->RemoveInstance(&context, &request, &response);
-        EXPECT_EQ(proto::admin::INVALID_ARGUMENT, response.header().status().code());
-    }
-    {
-        proto::admin::RemoveCacheRequest request;
-        request.set_instance_id(internal_instance_id);
-        proto::admin::CommonResponse response;
-        RequestContext context("legacy-admin-remove-reserved");
-        admin_service_->RemoveCache(&context, &request, &response);
-        EXPECT_EQ(proto::admin::INVALID_ARGUMENT, response.header().status().code());
-    }
-    {
-        proto::admin::MigrateCacheRequest request;
-        request.set_instance_id(internal_instance_id);
-        proto::admin::MigrateCacheResponse response;
-        RequestContext context("legacy-admin-migrate-reserved");
-        admin_service_->MigrateCache(&context, &request, &response);
-        EXPECT_EQ(proto::admin::INVALID_ARGUMENT, response.header().status().code());
-        EXPECT_EQ(0, response.accepted());
-    }
-    {
-        proto::admin::ListInstanceInfoRequest request;
-        request.set_instance_group_name("default");
-        proto::admin::ListInstanceInfoResponse response;
-        RequestContext context("legacy-admin-list-reserved");
-        admin_service_->ListInstanceInfo(&context, &request, &response);
-        ASSERT_EQ(proto::admin::OK, response.header().status().code());
-        for (const auto &instance : response.instance_info()) {
-            EXPECT_FALSE(HasKvMetaReservedInstancePrefix(instance.instance_id()));
-        }
-    }
-
-    auto [get_ec, instance_info] = kv_meta_manager_->GetInstanceInfo(&setup_context_, kInstanceId);
-    EXPECT_EQ(EC_OK, get_ec);
-    ASSERT_TRUE(instance_info);
-    EXPECT_EQ(kInstanceId, instance_info->instance_id());
-}
-
-TEST_F(KvMetaServiceImplTest, LegacyAdminCannotRemoveAGroupContainingKvMetaInstances) {
-    proto::admin::RemoveInstanceGroupRequest request;
-    request.set_name("default");
-    proto::admin::CommonResponse response;
-    RequestContext context("legacy-admin-remove-kvmeta-group");
-    admin_service_->RemoveInstanceGroup(&context, &request, &response);
-
-    EXPECT_EQ(proto::admin::INVALID_ARGUMENT, response.header().status().code());
-    const auto [group_ec, group] = registry_manager_->GetInstanceGroup(&setup_context_, "default");
-    EXPECT_EQ(EC_OK, group_ec);
-    EXPECT_TRUE(group);
-    const auto [instance_ec, instance] = kv_meta_manager_->GetInstanceInfo(&setup_context_, kInstanceId);
-    EXPECT_EQ(EC_OK, instance_ec);
-    EXPECT_TRUE(instance);
 }
 
 TEST_F(KvMetaServiceImplTest, UnsupportedFieldsAreRejectedWithoutManagerMutation) {

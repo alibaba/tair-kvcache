@@ -262,12 +262,11 @@ tenant/instance，不能用随机 key 或 token 猜测难度代替服务认证�
 ### 4.2 元数据与容量隔离
 
 - 公共 `instance_id` 会编码为保留的 KVMeta 内部 instance id，并携带完整 schema marker；
-- 整个 `__kv_meta_v1__` 前缀都由 KVMeta 保留。旧 Meta/Admin handler 和 CacheManager 旧接口在读取、写入、删除、
-  Trim、Migration 或事件任务入队前拒绝该 namespace；Admin instance 列表过滤内部实例，避免绕过 KVMeta 的事务和
-  回收不变量；
-- KVMeta instance 必须放入专用 Instance Group。group 类型从其持久化成员的保留 namespace 派生，KVMeta 和普通
-  KVCache 注册共用同一个 `CacheManager` 控制面临界区：空 group 由第一类成功注册决定类型，之后反向混入会在
-  registry mutation 前被拒绝。运行期校验仍会对旁路写 registry 或 split-brain 造成的混合状态 fail closed；
+- `__kv_meta_v1__` 是 KVMeta 的内部编码前缀，但本功能不修改旧 Meta/Admin handler 或 CacheManager API，也不按
+  调用方选择的名字前缀改变普通 KVCache 行为。部署和运维必须避免通过旧接口操作 KVMeta 的内部 instance；
+- KVMeta instance 必须放入专用 Instance Group。`KvMetaManager` 注册时拒绝已含普通 instance 的 group，运行期也会
+  对旁路写 Registry 或误操作造成的混合状态 fail closed。普通 KVCache 注册和 Instance Group 运维路径保持原样，
+  不增加全局锁或删除 guard；专用 group 的反向隔离由配置与运维保证；
 - 普通 CacheReclaimer、Migration 和 Cache GC 跳过 KVMeta instance；KVMeta 由自己的 Reclaimer 线程处理，二者不
   共用删除 executor、pending budget 或 group lifecycle shard。KVMeta Reclaimer 只巡检由成功注册或升主恢复确认的
   KVMeta group，不在每个周期枚举/读取普通 KVCache group；
@@ -426,11 +425,10 @@ Manager 的预检不是唯一防线：`DataStorageManager::CreateForKvMeta` 在�
 再次校验 allowlist、完整配置 identity、namespace 与 side capability，通过后复用 backend 现有 `Create`；
 KVMeta delete 也在最终 dispatch 边界重验配置，并调用 side interface，不会悄悄退回普通 `Delete`。普通
 `Create/Delete` API 和固定块调用链不受这些侧路检查影响。
-KVMeta 与普通 KVCache 的注册都会在 mutation 前读取同 group 的持久化成员，并在同一进程内串行化检查；因此已有
-KVMeta group 不能被后续 legacy 注册污染，已有普通 group 也不能被 KVMeta 占用。单 leader 是该控制面串行化的部署
-前提。已有持久化 instance 的幂等重注册/恢复不执行新的 mutation，因此不会被历史 mixed group 阻断，保证普通
-KVCache indexer 仍能恢复；运行期的全量 group schema 校验只让 KVMeta side path 对 out-of-band registry mutation
-保守 fail closed。
+`KvMetaManager` 在注册 mutation 前检查同 group 的持久化成员，并用自己的注册锁串行化 KVMeta 注册；因此已有普通
+group 不能被 KVMeta 占用。它不修改普通 `CacheManager::RegisterInstance`，也不尝试拦截低频 Admin 运维操作。若旧
+接口或旁路 Registry 写入把普通 instance 混入 KVMeta group，普通 KVCache 路径继续保持原行为，而 KVMeta 的注册、
+准入和 Reclaimer 对混合 group 保守 fail closed，直到运维修复配置。
 
 ### 6.2 写入
 
