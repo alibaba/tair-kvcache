@@ -5565,24 +5565,31 @@ TEST_F(CacheReclaimerTest, TestFairRotationPolicySwitchResetsQueueWithoutResetti
     EXPECT_EQ("large", SubmittedDelRequestsSnapshot().back().instance_id);
 }
 
-TEST_F(CacheReclaimerTest, KvMetaInstancesDoNotConsumeReclaimOrMigrationBudget) {
+TEST_F(CacheReclaimerTest, OnlyCompleteKvMetaInstancesAreExcludedFromReclaim) {
     cache_reclaimer_->job_state_flag_ = true;
     dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 90);
     auto malformed_reserved = InstanceInfoFactory();
     malformed_reserved->set_instance_id(std::string(kKvMetaInternalInstancePrefix) + "future-format");
-    instance_infos = {KvMetaInstanceInfoFactory(), malformed_reserved};
 
     const auto group = InstanceGroupFactory();
     group->quota_.set_capacity(100);
     group->quota_.quota_config_.front().set_capacity(100);
     group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
 
-    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
-    EXPECT_FALSE(result.water_level_exceeded);
-    EXPECT_FALSE(result.made_progress);
+    instance_infos = {KvMetaInstanceInfoFactory()};
+    const auto kv_meta_only = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_FALSE(kv_meta_only.water_level_exceeded);
+    EXPECT_FALSE(kv_meta_only.made_progress);
     EXPECT_EQ(0, sample_reclaim_call_counter);
     EXPECT_EQ(0, batch_get_loc_call_counter);
     EXPECT_TRUE(captured_copy_reqs.empty());
+
+    // A caller-selected ordinary instance name must not change legacy
+    // maintenance behavior merely because it shares KVMeta's prefix.
+    instance_infos = {malformed_reserved};
+    const auto ordinary_result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(ordinary_result.water_level_exceeded);
+    EXPECT_GT(sample_reclaim_call_counter, 0);
 }
 
 TEST_F(CacheReclaimerTest, TestFairReclaimUsesWeightedBudgetAndStopsAfterAcceptedCredit) {

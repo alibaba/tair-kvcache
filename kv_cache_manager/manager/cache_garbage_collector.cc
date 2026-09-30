@@ -797,7 +797,7 @@ bool CacheGarbageCollector::BeginRound() {
             // Generic objects have their own exact-key recovery and cleanup
             // lifecycle. Excluding them here prevents a large embedding
             // namespace from consuming the existing KV-cache GC scan budget.
-            if (instance && HasKvMetaReservedInstancePrefix(instance->instance_id())) {
+            if (instance && IsKvMetaInstance(*instance)) {
                 continue;
             }
             if (!instance || instance->instance_id().empty()) {

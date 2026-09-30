@@ -1578,17 +1578,21 @@ TEST_F(CacheGarbageCollectorTest, SubmittedLocationSummaryIncludesEveryReason) {
     EXPECT_EQ("future_reason=10,orphan_writing=90", reason_summary);
 }
 
-TEST_F(CacheGarbageCollectorTest, KvMetaInstancesDoNotConsumeTheKvCacheScanBudget) {
+TEST_F(CacheGarbageCollectorTest, OnlyCompleteKvMetaInstancesAreExcludedFromTheKvCacheScanBudget) {
     AddKvMetaInstance("group_a", "656d62");
-    AddInstance("group_a", std::string(kKvMetaInternalInstancePrefix) + "future-format");
+    const std::string ordinary_reserved_name = std::string(kKvMetaInternalInstancePrefix) + "future-format";
+    AddInstance("group_a", ordinary_reserved_name);
     scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})}};
+    scan_responses[ordinary_reserved_name] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})}};
 
     auto gc = MakeGc(DefaultConfig());
     PrepareForSingleStep(*gc);
     gc->RunOneTick();
+    gc->RunOneTick();
 
-    ASSERT_EQ(1, scan_calls.size());
-    EXPECT_EQ("instance_a", scan_calls.front().first);
+    ASSERT_EQ(2, scan_calls.size());
+    EXPECT_EQ((std::set<std::string>{"instance_a", ordinary_reserved_name}),
+              (std::set<std::string>{scan_calls[0].first, scan_calls[1].first}));
     EXPECT_FALSE(gc->round_active_);
     EXPECT_EQ(1, gc->get_cache_gc_scan_round_count_metrics());
 }
