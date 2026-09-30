@@ -4,10 +4,43 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "kv_cache_manager/common/jsonizable.h"
 
 namespace kv_cache_manager {
+
+class KvcmEventSubscriptionConfig : public Jsonizable {
+public:
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+
+    bool Validate() const;
+
+    const std::string &service_discovery_url() const { return service_discovery_url_; }
+    const std::string &consumer_id() const { return consumer_id_; }
+    int64_t discovery_refresh_interval_ms() const { return discovery_refresh_interval_ms_; }
+    const std::vector<double> &capacity_gb() const { return capacity_gb_; }
+    bool fanout_all_instances() const { return fanout_all_instances_; }
+    const std::vector<int32_t> &linear_steps() const { return linear_steps_; }
+    const std::string &full_location_spec_group_name() const { return full_location_spec_group_name_; }
+    const std::string &linear_location_spec_group_name() const { return linear_location_spec_group_name_; }
+
+private:
+    friend class OnlineOptimizerServerConfig;
+
+    std::string service_discovery_url_;
+    std::string consumer_id_ = "online-optimizer";
+    int64_t discovery_refresh_interval_ms_ = 5000;
+    std::vector<double> capacity_gb_;
+    // Online Event fanout is scoped to the source instance's group. Optional
+    // linear_steps additionally derives comparison instances from every KVCM
+    // source instance; zero keeps the source id and represents Full-only.
+    bool fanout_all_instances_ = false;
+    std::vector<int32_t> linear_steps_;
+    std::string full_location_spec_group_name_;
+    std::string linear_location_spec_group_name_;
+};
 
 class OnlineOptimizerServerConfig : public Jsonizable {
 private:
@@ -30,9 +63,13 @@ public:
     bool enable_prometheus() const { return enable_prometheus_; }
     const std::string &prometheus_prefix() const { return prometheus_prefix_; }
     int32_t io_thread_num() const { return io_thread_num_; }
+    const std::vector<KvcmEventSubscriptionConfig> &kvcm_event_subscriptions() const {
+        return kvcm_event_subscriptions_;
+    }
 
 private:
     void UpdateEnviron(EnvironMap &environ);
+    bool ValidateKvcmEventSubscriptions() const;
 
     int32_t rpc_port_ = 50052;
     int32_t http_port_ = 8082;
@@ -42,6 +79,7 @@ private:
     bool enable_prometheus_ = true;
     std::string prometheus_prefix_ = "kvcm_optimizer";
     int32_t io_thread_num_ = 4;
+    std::vector<KvcmEventSubscriptionConfig> kvcm_event_subscriptions_;
 
     using SettingFunction = std::function<bool(const std::string &, OnlineOptimizerServerConfig *)>;
     static std::unordered_map<std::string, SettingFunction> kSettingsMap;
