@@ -21,7 +21,7 @@ import torch
 
 
 class KVLayout(Enum):
-    """The flash_attn paged-KV tensor layouts this connector understands.
+    """The paged-attention KV tensor layouts this connector understands.
 
     Detected from the tensor *shape* (never from version strings) in
     ``vllm_common.attn_kv_views``. One layout per vLLM era:
@@ -32,12 +32,18 @@ class KVLayout(Enum):
       https://github.com/vllm-project/vllm/blob/v0.23.0/vllm/v1/attention/backends/flash_attn.py#L149
     * vLLM >= 0.26.0 returns the packed 4-D ``(num_blocks, H, block, 2D)``:
       https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/v1/attention/backends/flash_attn.py#L141
+    * MLA backends (all eras) return the 3-D latent cache
+      ``(num_blocks, block, head_size)``:
+      https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/model_executor/layers/attention/mla_attention.py#L1303
+      (one latent vector per token, ``num_kv_heads == 1``; per-layer bytes are
+      head_size * dtype_size -- half of K+V at the same head_size).
 
-    The saved byte layout differs between the split-K/V and packed eras, so
-    KV cache is not portable across vLLM major upgrades; instance_id
-    isolation prevents such mixing in practice.
+    The saved byte layout differs between these families, so KV cache is not
+    portable across vLLM major upgrades; instance_id isolation prevents such
+    mixing in practice.
     """
 
+    MLA_3D = "mla_3d"  # (num_blocks, block, head_size)
     SPLIT_KV_5D_KV_FIRST = "split_kv_5d_kv_first"  # (2, num_blocks, block, H, D)
     SPLIT_KV_5D_N_FIRST = "split_kv_5d_n_first"  # (num_blocks, 2, block, H, D)
     PACKED_4D = "packed_4d"  # (num_blocks, H, block, 2D)
@@ -65,12 +71,12 @@ class AttentionTransferGroup(TransferGroup):
     # Which vLLM-era layout the pointers below were normalized from.
     kv_layout: KVLayout
     # int64 tensor of transfer-pointer bases on the compute device. For the
-    # packed layout one pointer per layer [L0, L1, ...]; for split K/V layouts
-    # two per layer [K0, V0, K1, V1, ...] -- each view's data_ptr() is its own
-    # base, so the kernel never adds a K->V offset.
+    # packed and MLA layouts one pointer per layer [L0, L1, ...]; for split
+    # K/V layouts two per layer [K0, V0, K1, V1, ...] -- each view's
+    # data_ptr() is its own base, so the kernel never adds a K->V offset.
     kvcache_ptr_tensor_gpu: torch.Tensor
     # Number of transfer pointers (staging buffer rows per block):
-    # layer_num for the packed layout, 2 * layer_num for split K/V.
+    # layer_num for the packed / MLA layouts, 2 * layer_num for split K/V.
     num_kv_ptrs: int
     # heads * content dim per pointer (content dim is 2*D packed, D split).
     per_token_dim: int

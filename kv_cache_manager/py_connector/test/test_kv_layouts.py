@@ -69,6 +69,17 @@ class FakeTensor:
             self._base,
         )
 
+    def unsqueeze(self, dim):
+        # Torch gives the inserted size-1 dim the preceding dim's stride
+        # (the whole-tensor extent for dim 0); any value is addressable, but
+        # mirror torch so stride assertions see production values.
+        shape = list(self.shape)
+        strides = list(self._strides)
+        new_stride = shape[0] * strides[0] if dim == 0 else strides[dim - 1]
+        shape.insert(dim, 1)
+        strides.insert(dim, new_stride)
+        return FakeTensor(shape, strides, self._offset, self._base)
+
     def __getitem__(self, idx):
         if isinstance(idx, int):  # t[i]: drop dim 0
             return FakeTensor(
@@ -102,6 +113,12 @@ def kv_first_5d(n=10, b=16, h=4, d=128, base=BASE_PTR):
 def n_first_5d(n=10, b=16, h=4, d=128, base=BASE_PTR):
     """vLLM 0.23.0 - 0.25.x: (n, 2, b, h, d) contiguous."""
     return FakeTensor.contiguous([n, 2, b, h, d], base=base)
+
+
+def mla_3d(n=10, b=16, d=576, base=BASE_PTR):
+    """MLA latent cache (all eras): (n, b, d) contiguous, one latent vector
+    per token (num_kv_heads == 1, no K/V split)."""
+    return FakeTensor.contiguous([n, b, d], base=base)
 
 
 class TestAttnKvViews(unittest.TestCase):
@@ -138,9 +155,30 @@ class TestAttnKvViews(unittest.TestCase):
             self.assertEqual(view.stride(), (2 * 16 * 4 * 128, 4 * 128, 128, 1))
         self.assertEqual(v.data_ptr() - k.data_ptr(), 16 * 4 * 128 * ITEMSIZE)
 
+    def test_mla_3d(self):
+        views, layout = attn_kv_views(mla_3d())
+        self.assertIs(layout, KVLayout.MLA_3D)
+        self.assertEqual(len(views), 1)
+        v = views[0]
+        # Single implicit head: (n, b, 1, d) with the original data_ptr.
+        self.assertEqual(v.shape, (10, 16, 1, 576))
+        self.assertEqual(v.stride(), (16 * 576, 576, 576, 1))
+        self.assertEqual(v.data_ptr(), BASE_PTR)
+
+    def test_mla_3d_padded_pages(self):
+        # Padded MLA pages (page_size_padded): block stride != b*d keeps the
+        # token-major inner page, exactly like the N-first split layout.
+        d, b, n, pad = 576, 16, 10, 3 * 576
+        t = FakeTensor([n, b, d], [b * d + pad, d, 1])
+        views, layout = attn_kv_views(t)  # ty: ignore[invalid-argument-type]
+        self.assertIs(layout, KVLayout.MLA_3D)
+        v = views[0]
+        self.assertEqual(v.shape, (10, 16, 1, 576))
+        self.assertEqual(v.stride(), (b * d + pad, 576, 576, 1))
+
     def test_unrecognized_layouts_fail_fast(self):
         bad = [
-            FakeTensor.contiguous([10, 16, 4]),  # 3-D
+            FakeTensor.contiguous([10, 16]),  # 2-D
             FakeTensor.contiguous([10, 2, 16, 4, 128, 2]),  # 6-D
             FakeTensor.contiguous([10, 16, 2, 4, 128]),  # 5-D, K/V dim misplaced
         ]
@@ -227,9 +265,29 @@ class TestBuildTransferGroup(unittest.TestCase):
         v_off = 16 * 4 * 128 * ITEMSIZE
         self.assertEqual(ptrs, [BASE_PTR, BASE_PTR + v_off])
 
+    def test_mla_one_ptr_per_layer(self):
+        # The latent cache is a single flat (n, b, d) per layer: one pointer,
+        # per-token dim is the full latent vector, flat block stride.
+        kv = {"l0": mla_3d(base=BASE_PTR), "l1": mla_3d(base=2 * BASE_PTR)}
+        g, ptrs = self._build(kv)
+        self.assertEqual(g.num_kv_ptrs, 2)
+        self.assertEqual(g.layer_num, 2)
+        self.assertEqual(g.per_token_dim, 576)
+        self.assertEqual(g.kernel_block_size, 16)
+        self.assertEqual(g.block_stride, 0)  # flat
+        self.assertEqual(g.kv_layout, KVLayout.MLA_3D)
+        self.assertEqual(ptrs, [BASE_PTR, 2 * BASE_PTR])
+
+    def test_mla_padded_pages_strided(self):
+        d, b, n, pad = 576, 16, 10, 3 * 576
+        kv = {"l0": FakeTensor([n, b, d], [b * d + pad, d, 1])}
+        g, _ = self._build(kv)
+        self.assertEqual(g.per_token_dim, 576)
+        self.assertEqual(g.block_stride, b * d + pad)  # skip the pad gap
+
     def test_unrecognized_layout_fails_fast(self):
         with self.assertRaises(NotImplementedError):
-            self._build({"l0": FakeTensor.contiguous([10, 16, 4])})
+            self._build({"l0": FakeTensor.contiguous([10, 16])})
 
 
 class _BlockedScheduler:

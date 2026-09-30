@@ -567,6 +567,70 @@ class TestParseGroups(unittest.TestCase):
             ),
         )
 
+    def _mla_group(
+        self,
+        layers,
+        block_size=16,
+        # bf16 latent: block * (kv_lora_rank + qk_rope_head_dim) * 2 bytes.
+        page_size_bytes=16 * 576 * 2,
+        cache_dtype_str=None,
+        compress_ratio=1,
+        kv_quant_mode=0,
+    ):
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+        return SimpleNamespace(
+            layer_names=layers,
+            kv_cache_spec=MLAAttentionSpec(  # ty: ignore[missing-argument]
+                block_size,
+                page_size_bytes,  # ty: ignore[too-many-positional-arguments]
+                cache_dtype_str=cache_dtype_str,
+                compress_ratio=compress_ratio,
+                kv_quant_mode=kv_quant_mode,  # ty: ignore[invalid-argument-type]
+            ),
+        )
+
+    def test_mla_single_group(self):
+        # Plain MLA (one latent vector per token, num_kv_heads == 1): parses
+        # as an ordinary attention group with the latent-sized per-token bytes
+        # (the spec's real_page_size_bytes has no K+V factor of 2).
+        mbs = 32
+        metas = self._parse([self._mla_group(["l0", "l1"])], mbs)
+        self.assertEqual(len(metas), 1)
+        m = metas[0]
+        self.assertIsInstance(m, AttentionGroupMeta)
+        self.assertEqual(m.block_size, 16)
+        # per_token = 16 * 576 * 2 // 16 = 1152 bytes.
+        self.assertEqual(m.per_block_bytes, 1152 * 32 * 2)
+
+    def test_mla_compressed_rejected(self):
+        # DeepSeek V4 compress_ratio > 1: one stored row covers multiple
+        # tokens; the token-granular slot mapping has nothing to gather.
+        with self.assertRaisesRegex(NotImplementedError, "compress_ratio"):
+            self._parse([self._mla_group(["l0"], compress_ratio=2)], 16)
+
+    def test_mla_fp8_ds_layout_rejected(self):
+        # DeepSeek V3.2 "fp8_ds_mla": custom packed 656 B/token layout, not
+        # head_size * dtype_size.
+        with self.assertRaisesRegex(NotImplementedError, "fp8_ds_mla"):
+            self._parse([self._mla_group(["l0"], cache_dtype_str="fp8_ds_mla")], 16)
+
+    def test_mla_quantized_kv_rejected(self):
+        # Quantized MLA KV: scales live outside the paged tensor, so a byte
+        # round trip would lose them.
+        for mode in (1, 3, 5):  # FP8_PER_TENSOR, FP8_PER_TOKEN_HEAD, NVFP4
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(NotImplementedError, "kv_quant_mode"):
+                    self._parse([self._mla_group(["l0"], kv_quant_mode=mode)], 16)
+
+    def test_mla_windowed_rejected(self):
+        # A windowed MLA spec (e.g. a SWA merged group) is not full-prefix KV
+        # and must be refused like the non-MLA windowed case.
+        group = self._mla_group(["l0"])
+        group.kv_cache_spec.sliding_window = 1024
+        with self.assertRaises(NotImplementedError):
+            self._parse([group], 16)
+
     def test_full_attention_single_group(self):
         mbs = 32
         metas = self._parse(
