@@ -15,6 +15,7 @@ public:
     explicit Hf3fsBackend(std::shared_ptr<MetricsRegistry> metrics_registry);
     ~Hf3fsBackend() override = default;
     DataStorageType GetType() override;
+    bool ShouldSkipConfirmedMissingBackendDelete() const override { return true; }
     bool Available() override;
     double GetStorageUsageRatio(const std::string &trace_id) const override;
 

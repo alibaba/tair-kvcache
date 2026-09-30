@@ -292,6 +292,32 @@ TEST_F(InstanceGroupTest, LegacyTairMempoolProtoWithoutStorageTypeRemainsDramTyp
     const auto restored_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
     ASSERT_NE(nullptr, restored_spec);
     EXPECT_EQ(kTairMemPoolMediaTypeSsd, restored_spec->media_type());
+    EXPECT_FALSE(restored_spec->skip_confirmed_missing_backend_delete());
+}
+
+TEST_F(InstanceGroupTest, TairMempoolGcDeletePolicySurvivesProtoAndRegistryRoundTrip) {
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+        for (const bool skip : {false, true}) {
+            auto spec = std::make_shared<TairMemPoolStorageSpec>();
+            spec->set_domain("pace.meta");
+            spec->set_timeout(5000);
+            spec->set_media_type(kTairMemPoolMediaTypeSsd);
+            spec->set_skip_confirmed_missing_backend_delete(skip);
+            StorageConfig original(type, "pace_gc", spec);
+            proto::admin::StorageConfig proto_config;
+            ProtoConvert::StorageConfigToProto(original, &proto_config);
+            EXPECT_EQ(skip, proto_config.tair_mem_pool().skip_confirmed_missing_backend_delete());
+            StorageConfig converted;
+            ProtoConvert::StorageFromProto(&proto_config, converted);
+            StorageConfig restored;
+            ASSERT_TRUE(restored.FromJsonString(converted.ToJsonString()));
+            EXPECT_EQ(type, restored.type());
+            const auto restored_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+            ASSERT_NE(nullptr, restored_spec);
+            EXPECT_EQ(skip, restored_spec->skip_confirmed_missing_backend_delete());
+        }
+    }
 }
 
 TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyProtoRoundTripPreservesFixedPerInstance) {
