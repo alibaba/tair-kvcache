@@ -259,7 +259,7 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
     support_register_readonly_ = allGpusSupportHostRegisterReadOnly();
     KVCM_LOG_INFO("gpu support register readonly [%d]", static_cast<int>(support_register_readonly_));
-
+    
     // Check if GPUs support direct pageable memory access
     // If true, we can skip cudaHostRegister for mmap'd memory
     support_pageable_memory_access_ = allGpusSupportPageableMemoryAccess();
@@ -275,7 +275,7 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
     support_register_readonly_ = allGpusSupportHostRegisterReadOnly();
     KVCM_LOG_INFO("gpu support register readonly [%d]", static_cast<int>(support_register_readonly_));
-
+    
     // Check if GPUs support direct pageable memory access
     support_pageable_memory_access_ = allGpusSupportPageableMemoryAccess();
     KVCM_LOG_INFO("gpu support pageable memory access [%d]", static_cast<int>(support_pageable_memory_access_));
