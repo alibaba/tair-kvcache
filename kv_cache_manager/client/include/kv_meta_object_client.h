@@ -34,8 +34,7 @@ struct KvMetaObjectClientConfig {
     // location spec marker {"value": 1}, and the same instance/group identity.
     InitParams transfer_init_params;
     std::uint64_t max_object_bytes{1024ULL * 1024ULL * 1024ULL};
-    // Must be strictly longer than two configured data-plane put-timeout
-    // windows plus two metadata call-timeout windows (PutStart and PutFinish).
+    // Server-side lease for one PutStart/data-write/PutFinish transaction.
     std::int32_t write_timeout_seconds{30};
 };
 

@@ -81,8 +81,7 @@ private:
     std::string getOpTypeString(OpType op_type) const;
     ClientErrorCode RunWithTimeoutParallel(OpType op_type,
                                            std::vector<std::function<ClientErrorCode()>> &&tasks,
-                                           int timeout_ms,
-                                           bool wait_for_inflight = false) const;
+                                           int timeout_ms) const;
     ClientErrorCode UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                             RegistSpan *span,
                                             const std::string &self_location_spec_name);
@@ -98,12 +97,7 @@ private:
     std::unique_ptr<LockFreeThreadPool> wait_task_thread_pool_;
     // storage unique name -> storage_sdk
     std::map<std::string, std::shared_ptr<SdkInterface>> sdk_map_;
-    // Mirrors sdk_map_ so the KVMeta preflight can verify that an untrusted
-    // URI scheme cannot select a backend solely by reusing its hostname.
-    std::map<std::string, DataStorageType> sdk_storage_types_;
-    // KVMeta additionally confines file-like URIs to the namespace declared
-    // by the matching server-authoritative storage config. The regular
-    // fixed-block path does not consult this map.
+    // Authoritative PACE config used by the isolated KVMeta preflight.
     std::map<std::string, std::shared_ptr<StorageConfig>> sdk_storage_configs_;
     int owned_shm_fd_{-1};
     bool variable_object_size_enabled_{false};

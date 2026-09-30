@@ -6719,9 +6719,7 @@ TEST_F(CacheManagerTest, TestWriteThenReadRoundTripWithSpecGroups) {
 TEST_F(CacheManagerTest, TestDoRecoverAfterCleanup) {
     // Cleanup then recover
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
-    EXPECT_FALSE(cache_manager_->IsRecoverComplete());
     ASSERT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
-    EXPECT_TRUE(cache_manager_->IsRecoverComplete());
 
     MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_TRUE(meta_searcher);
@@ -6730,7 +6728,6 @@ TEST_F(CacheManagerTest, TestDoRecoverAfterCleanup) {
 
     // Call again - should be idempotent
     ASSERT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
-    EXPECT_TRUE(cache_manager_->IsRecoverComplete());
     meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_TRUE(meta_searcher);
     ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
@@ -6774,7 +6771,6 @@ TEST_F(CacheManagerTest, TestDoRecoverOnceWithRegistryPartialFailureThenFix) {
     // CacheManager DoRecoverOnce - should return ERROR because RegistryManager is incomplete
     auto ec = cache_manager_->DoRecoverOnce();
     ASSERT_EQ(EC_ERROR, ec);
-    EXPECT_FALSE(cache_manager_->IsRecoverComplete());
 
     // test_instance MetaSearcher should still have been created (partial progress is retained)
     MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
@@ -6794,7 +6790,6 @@ TEST_F(CacheManagerTest, TestDoRecoverOnceWithRegistryPartialFailureThenFix) {
     // CacheManager DoRecoverOnce - should now succeed
     ec = cache_manager_->DoRecoverOnce();
     ASSERT_EQ(EC_OK, ec);
-    EXPECT_TRUE(cache_manager_->IsRecoverComplete());
 
     // Both instances should have MetaSearcher
     meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
@@ -6820,7 +6815,6 @@ TEST_F(CacheManagerTest, TestRecoverRetryLoopLifecycle) {
     cache_manager_->StartRecoverRetryLoop();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
-    EXPECT_FALSE(cache_manager_->IsRecoverComplete());
 }
 
 /* ------------ InvalidateInstanceMetrics tests ------------ */

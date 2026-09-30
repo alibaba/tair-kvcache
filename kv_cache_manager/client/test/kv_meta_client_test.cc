@@ -136,15 +136,15 @@ public:
                 auto *location = response->add_locations();
                 FillLocation(size, location);
                 if (wrong_uri_size_.load()) {
-                    location->mutable_location_specs(0)->set_uri("file://nfs/value?offset=0&size=" +
-                                                                 std::to_string(size + 1));
+                    location->mutable_location_specs(0)->set_uri(
+                        "pace://pace/1?media_type=0&node_id=1&range_id=0&size=" + std::to_string(size + 1));
                 }
                 if (wrong_uri_scheme_.load()) {
-                    location->mutable_location_specs(0)->set_uri("dummy://nfs/value?offset=0&size=" +
-                                                                 std::to_string(size));
+                    location->mutable_location_specs(0)->set_uri(
+                        "dummy://pace/1?media_type=0&node_id=1&range_id=0&size=" + std::to_string(size));
                 }
                 if (non_singleton_uri_.load()) {
-                    location->mutable_location_specs(0)->set_uri("file://nfs/value?blkid=1&offset=0&size=" +
+                    location->mutable_location_specs(0)->set_uri("pace://pace/1?media_type=0&node_id=1&size=" +
                                                                  std::to_string(size));
                 }
                 CorruptLocation(size, location);
@@ -226,12 +226,12 @@ private:
     }
 
     static void FillLocation(std::uint64_t size, proto::kv_meta::ValueLocation *location) {
-        location->set_type(proto::kv_meta::ST_NFS);
+        location->set_type(proto::kv_meta::ST_TAIRMEMPOOL);
         location->set_spec_size(1);
         location->set_value_size(size);
         auto *spec = location->add_location_specs();
         spec->set_name("value");
-        spec->set_uri("file://nfs/value?offset=0&size=" + std::to_string(size));
+        spec->set_uri("pace://pace/1?media_type=0&node_id=1&range_id=0&size=" + std::to_string(size));
     }
 
     void CorruptLocation(std::uint64_t size, proto::kv_meta::ValueLocation *location) const {

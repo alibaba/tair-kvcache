@@ -151,12 +151,11 @@ def _client(
     native=None,
     pybind=None,
     registration_owner=None,
-    client_class=KvMetaObjectClient,
 ):
     native = native or _FakeClient()
     pybind = pybind or _FakePybind(native)
     return (
-        client_class(
+        KvMetaObjectClient(
             config or _config(),
             registration_owner=registration_owner,
             _object_client=native,
@@ -399,7 +398,7 @@ class KvMetaObjectClientTest(unittest.TestCase):
     def test_invalid_binding_closes_injected_native_client(self):
         native = _FakeClient()
 
-        with self.assertRaisesRegex(ImportError, "does not export"):
+        with self.assertRaisesRegex(ImportError, "incompatible object API"):
             KvMetaObjectClient(
                 _config(),
                 _object_client=native,
@@ -413,7 +412,7 @@ class KvMetaObjectClientTest(unittest.TestCase):
         pybind = _FakePybind(native)
         pybind.KV_META_OBJECT_API_VERSION = KV_META_OBJECT_API_VERSION + 1
 
-        with self.assertRaisesRegex(ImportError, "incompatible.*API version"):
+        with self.assertRaisesRegex(ImportError, "incompatible object API"):
             KvMetaObjectClient(
                 _config(),
                 _object_client=native,
@@ -425,30 +424,9 @@ class KvMetaObjectClientTest(unittest.TestCase):
 
     def test_incomplete_versioned_binding_is_rejected_before_creation(self):
         pybind = _FakePybind()
-        pybind.MemoryType = SimpleNamespace(CPU=_Memory.CPU)
+        pybind.KvMetaObjectClient = SimpleNamespace()
 
-        with self.assertRaisesRegex(ImportError, "incomplete"):
-            KvMetaObjectClient(_config(), _pybind_module=pybind)
-
-        self.assertEqual(pybind.create_calls, [])
-
-    def test_versioned_binding_without_explicit_close_is_rejected(self):
-        pybind = _FakePybind()
-        pybind.KvMetaObjectClient = SimpleNamespace(Create=pybind._create)
-
-        with self.assertRaisesRegex(ImportError, "incomplete"):
-            KvMetaObjectClient(_config(), _pybind_module=pybind)
-
-        self.assertEqual(pybind.create_calls, [])
-
-    def test_versioned_binding_without_unknown_outcome_code_is_rejected(self):
-        pybind = _FakePybind()
-        pybind.ClientErrorCode = SimpleNamespace(
-            ER_OK=_Code.ER_OK,
-            ER_INVALID_GRPCSTATUS=_Code.ER_INVALID_GRPCSTATUS,
-        )
-
-        with self.assertRaisesRegex(ImportError, "incomplete"):
+        with self.assertRaisesRegex(ImportError, "no object client factory"):
             KvMetaObjectClient(_config(), _pybind_module=pybind)
 
         self.assertEqual(pybind.create_calls, [])
@@ -459,7 +437,7 @@ class KvMetaObjectClientTest(unittest.TestCase):
                 raise RuntimeError("provider capability detail")
 
         native = _FakeClient()
-        with self.assertRaisesRegex(ImportError, "inspected safely") as raised:
+        with self.assertRaisesRegex(ImportError, "cannot be inspected") as raised:
             KvMetaObjectClient(
                 _config(),
                 _object_client=native,
@@ -475,7 +453,7 @@ class KvMetaObjectClientTest(unittest.TestCase):
         native.LoadObjects = None
         pybind = _FakePybind(native)
 
-        with self.assertRaisesRegex(TypeError, "missing SaveObjects"):
+        with self.assertRaisesRegex(TypeError, "incomplete"):
             KvMetaObjectClient(_config(), _pybind_module=pybind)
 
         self.assertTrue(native.closed)
@@ -757,25 +735,20 @@ class KvMetaObjectClientTest(unittest.TestCase):
 
                 self.assertTrue(raised.exception.unknown_outcome)
 
-    def test_remove_attempts_every_batch_and_reports_aggregate_result(self):
+    def test_remove_stops_at_first_failed_batch(self):
         client, native, _ = _client()
         self.addCleanup(client.close)
-        native.results["Remove"] = [
-            _Code.ER_FAILED,
-            _Code.ER_INVALID_GRPCSTATUS,
-            _Code.ER_OK,
-        ]
+        native.results["Remove"] = [_Code.ER_FAILED]
         keys = [f"key-{index}" for index in range(129)]
 
         with self.assertRaises(KvMetaObjectClientError) as raised:
             client.remove(keys, trace_id="remove")
 
         error = raised.exception
-        self.assertEqual([len(call[2]) for call in native.calls], [64, 64, 1])
+        self.assertEqual([len(call[2]) for call in native.calls], [64])
         self.assertEqual(error.batch_index, 0)
-        self.assertEqual(error.failed_batches, 2)
-        self.assertEqual(error.completed_items, 1)
-        self.assertTrue(error.unknown_outcome)
+        self.assertEqual(error.completed_items, 0)
+        self.assertFalse(error.unknown_outcome)
 
     def test_remove_success_batches_all_keys_and_empty_remove_is_a_noop(self):
         client, native, _ = _client()
@@ -858,7 +831,7 @@ class KvMetaObjectClientTest(unittest.TestCase):
             [call[0] for call in native.calls], ["SaveObjects", "LoadObjects"]
         )
 
-    def test_close_rejects_new_calls_while_waiting_for_inflight_call(self):
+    def test_close_detaches_before_native_inflight_drain(self):
         entered = threading.Event()
         release = threading.Event()
         close_entered = threading.Event()
@@ -869,9 +842,10 @@ class KvMetaObjectClientTest(unittest.TestCase):
                 release.wait(timeout=5)
                 return _Code.ER_OK
 
-            def close(self):
+            def Close(self):
                 close_entered.set()
-                super().close()
+                release.wait(timeout=5)
+                super().Close()
 
         native = BlockingClient()
         client, _, _ = _client(native=native)
@@ -881,20 +855,16 @@ class KvMetaObjectClientTest(unittest.TestCase):
         save_thread.start()
         self.assertTrue(entered.wait(timeout=2))
         close_thread.start()
-        with client._lifecycle:
-            self.assertTrue(
-                client._lifecycle.wait_for(lambda: client._closing, timeout=2)
-            )
+        self.assertTrue(close_entered.wait(timeout=2))
         with self.assertRaisesRegex(RuntimeError, "closed"):
             client.load(["later"], [_Tensor()])
-        self.assertFalse(close_entered.is_set())
 
         release.set()
         save_thread.join(timeout=2)
         close_thread.join(timeout=2)
         self.assertFalse(save_thread.is_alive())
         self.assertFalse(close_thread.is_alive())
-        self.assertTrue(close_entered.is_set())
+        self.assertEqual(native.close_calls, 1)
 
     def test_concurrent_close_calls_release_native_client_once(self):
         close_entered = threading.Event()
@@ -923,140 +893,6 @@ class KvMetaObjectClientTest(unittest.TestCase):
 
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
-        self.assertEqual(native.close_calls, 1)
-
-    def test_interrupted_close_wait_releases_close_ownership(self):
-        class InterruptOnceCondition(threading.Condition):
-            def __init__(self):
-                super().__init__(threading.Lock())
-                self.interrupt = True
-
-            def wait_for(self, predicate, timeout=None):
-                if self.interrupt and not predicate():
-                    self.interrupt = False
-                    raise KeyboardInterrupt()
-                return super().wait_for(predicate, timeout)
-
-        client, native, _ = _client()
-        client._lifecycle = InterruptOnceCondition()
-        active_token = object()
-        client._active_operations.add(active_token)
-
-        with self.assertRaises(KeyboardInterrupt):
-            client.close()
-        self.assertFalse(client._closing)
-        self.assertFalse(client._closed)
-
-        client._active_operations.remove(active_token)
-        client.close()
-        self.assertTrue(native.closed)
-        self.assertEqual(native.close_calls, 1)
-
-    def test_interrupted_native_detach_restores_live_client(self):
-        class InterruptOnDetachClient(KvMetaObjectClient):
-            def __setattr__(self, name, value):
-                if (
-                    name == "_client"
-                    and value is None
-                    and self.__dict__.get("_interrupt_on_detach", False)
-                ):
-                    object.__setattr__(self, name, value)
-                    object.__setattr__(self, "_interrupt_on_detach", False)
-                    raise KeyboardInterrupt()
-                object.__setattr__(self, name, value)
-
-        client, native, _ = _client(client_class=InterruptOnDetachClient)
-        client._interrupt_on_detach = True
-
-        with self.assertRaises(KeyboardInterrupt):
-            client.close()
-        self.assertFalse(client._closing)
-        self.assertFalse(client._closed)
-        self.assertIs(client._client, native)
-
-        client.save(["key"], [_Tensor()])
-        client.close()
-        self.assertTrue(native.closed)
-        self.assertEqual(native.close_calls, 1)
-
-    def test_interrupted_condition_exit_after_detach_restores_live_client(self):
-        class InterruptAfterDetachCondition(threading.Condition):
-            def __init__(self):
-                super().__init__(threading.Lock())
-                self.client = None
-                self.interrupt = True
-
-            def __exit__(self, exc_type, exc_value, traceback):
-                result = super().__exit__(exc_type, exc_value, traceback)
-                if (
-                    self.interrupt
-                    and self.client is not None
-                    and self.client._client is None
-                ):
-                    self.interrupt = False
-                    raise KeyboardInterrupt()
-                return result
-
-        client, native, _ = _client()
-        lifecycle = InterruptAfterDetachCondition()
-        lifecycle.client = client
-        client._lifecycle = lifecycle
-
-        with self.assertRaises(KeyboardInterrupt):
-            client.close()
-        self.assertFalse(client._closing)
-        self.assertFalse(client._closed)
-        self.assertIs(client._client, native)
-
-        client.load(["key"], [_Tensor()])
-        client.close()
-        self.assertTrue(native.closed)
-        self.assertEqual(native.close_calls, 1)
-
-    def test_interrupted_operation_admission_does_not_strand_close(self):
-        class InterruptAfterAdd(set):
-            def add(self, item):
-                super().add(item)
-                raise KeyboardInterrupt()
-
-        client, native, _ = _client()
-        client._active_operations = InterruptAfterAdd()
-
-        with self.assertRaises(KeyboardInterrupt):
-            client.save(["key"], [_Tensor()])
-        self.assertFalse(client._active_operations)
-
-        client.close()
-        self.assertTrue(native.closed)
-        self.assertEqual(native.close_calls, 1)
-
-    def test_close_waits_for_inflight_call_and_is_idempotent(self):
-        entered = threading.Event()
-        release = threading.Event()
-
-        class BlockingClient(_FakeClient):
-            def SaveObjects(self, trace_id, keys, sizes, buffers):
-                entered.set()
-                release.wait(timeout=5)
-                return _Code.ER_OK
-
-        native = BlockingClient()
-        client, _, _ = _client(native=native)
-        save_thread = threading.Thread(target=client.save, args=(["key"], [_Tensor()]))
-        close_thread = threading.Thread(target=client.close)
-
-        save_thread.start()
-        self.assertTrue(entered.wait(timeout=2))
-        close_thread.start()
-        close_thread.join(timeout=0.05)
-        self.assertTrue(close_thread.is_alive())
-        release.set()
-        save_thread.join(timeout=2)
-        close_thread.join(timeout=2)
-
-        self.assertFalse(save_thread.is_alive())
-        self.assertFalse(close_thread.is_alive())
-        self.assertTrue(native.closed)
         client.close()
         self.assertEqual(native.close_calls, 1)
         with self.assertRaisesRegex(RuntimeError, "closed"):

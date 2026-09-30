@@ -30,44 +30,7 @@ bool AddressRangeIsRepresentable(const void *base, std::size_t size) {
 }
 
 bool IsKnownStorageType(KvMetaStorageType type) {
-    switch (type) {
-    case KvMetaStorageType::HF3FS:
-    case KvMetaStorageType::MOONCAKE:
-    case KvMetaStorageType::TAIR_MEMPOOL:
-    case KvMetaStorageType::NFS:
-    case KvMetaStorageType::VCNS_HF3FS:
-    case KvMetaStorageType::DUMMY:
-    case KvMetaStorageType::TAIR_MEMPOOL_SSD:
-        return true;
-    case KvMetaStorageType::EVENT_REPORT_L1P5:
-    case KvMetaStorageType::EVENT_REPORT_L2:
-    case KvMetaStorageType::UNSPECIFIED:
-    default:
-        return false;
-    }
-}
-
-bool UriSchemeMatchesStorageType(KvMetaStorageType type, const DataStorageUri &uri) {
-    switch (type) {
-    case KvMetaStorageType::HF3FS:
-        return uri.GetProtocol() == "hf3fs";
-    case KvMetaStorageType::VCNS_HF3FS:
-        return uri.GetProtocol() == "hf3fs" || uri.GetProtocol() == "vcns_hf3fs";
-    case KvMetaStorageType::MOONCAKE:
-        return uri.GetProtocol() == "mooncake";
-    case KvMetaStorageType::TAIR_MEMPOOL:
-    case KvMetaStorageType::TAIR_MEMPOOL_SSD:
-        return uri.GetProtocol() == "pace";
-    case KvMetaStorageType::NFS:
-        return uri.GetProtocol() == "file";
-    case KvMetaStorageType::DUMMY:
-        return uri.GetProtocol() == "dummy";
-    case KvMetaStorageType::EVENT_REPORT_L1P5:
-    case KvMetaStorageType::EVENT_REPORT_L2:
-    case KvMetaStorageType::UNSPECIFIED:
-    default:
-        return false;
-    }
+    return type == KvMetaStorageType::TAIR_MEMPOOL || type == KvMetaStorageType::TAIR_MEMPOOL_SSD;
 }
 
 bool ValidateStorageUri(KvMetaStorageType type, const std::string &uri_text, std::uint64_t expected_size) {
@@ -76,7 +39,7 @@ bool ValidateStorageUri(KvMetaStorageType type, const std::string &uri_text, std
     }
     const DataStorageUri uri(uri_text);
     const DataStorageType allocation_type = ToDataStorageType(uri.GetProtocol());
-    if (!HasCanonicalKvMetaAuthority(uri) || !UriSchemeMatchesStorageType(type, uri) ||
+    if (!IsKnownStorageType(type) || !HasCanonicalKvMetaAuthority(uri) ||
         !HasOwnedKvMetaAllocationShape(uri, allocation_type) || !uri.HasParam("size")) {
         return false;
     }
@@ -149,9 +112,7 @@ CreateObjectClient(const std::string &trace_id,
     const auto transfer_config_ec = ValidateKvMetaTransferClientConfig(config.transfer_client_config,
                                                                        config.transfer_init_params,
                                                                        &config.instance_group,
-                                                                       &config.metadata.instance_id,
-                                                                       config.write_timeout_seconds,
-                                                                       config.metadata.call_timeout_ms);
+                                                                       &config.metadata.instance_id);
     if (transfer_config_ec != ER_OK) {
         return {transfer_config_ec, nullptr};
     }
