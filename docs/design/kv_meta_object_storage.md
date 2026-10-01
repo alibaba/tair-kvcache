@@ -82,7 +82,7 @@ KVMeta Reclaimer 周期处理已注册的 KVMeta group：
 1. 列出 group 内 KVMeta instance，并汇总各自 `MetaIndexer::GetStorageUsage()`。
 2. 计算 `target = floor(group_capacity * used_percentage)`。
 3. usage 不高于 target 时不处理。
-4. 从每个 indexer 采样 LRU candidate，合并后按 `last_access_time` 全局排序。
+4. 从每个 indexer 的 persistent keyspace 采样 candidate，并用命中的 hot-cache access time 覆盖持久层时间；合并后按 `last_access_time` 全局排序。这样 metadata hot cache 淘汰 key 后 GC 仍能继续推进。
 5. 选择至多一个 batching size，或预计删除字节达到 `usage - target` 为止。
 6. 按 generation 条件删除 metadata；只有删除成功的 `SERVING` 对象才扣减 usage。
 7. metadata 删除后等待现有 `delay_before_delete_ms` grace period，再尽力释放对应 PACE allocation；显式 `Remove` 使用相同的 reader grace period。

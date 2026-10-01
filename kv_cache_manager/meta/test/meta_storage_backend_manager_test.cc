@@ -992,6 +992,14 @@ TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesUsesHotCacheTim
     EXPECT_EQ(1, persistent_ptr->calls());
     EXPECT_EQ(1, cache_ptr->calls());
     EXPECT_EQ(1, cache_ptr->timestamp_lookup_calls());
+
+    ASSERT_EQ(EC_OK, mgr.SamplePersistentReclaimCandidates(nullptr, 1, candidates));
+    ASSERT_EQ(1, candidates.size());
+    EXPECT_EQ(11, candidates.front().key);
+    EXPECT_EQ(999, candidates.front().last_access_time_us);
+    EXPECT_EQ(2, persistent_ptr->calls());
+    EXPECT_EQ(1, cache_ptr->calls());
+    EXPECT_EQ(2, cache_ptr->timestamp_lookup_calls());
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestGroupLruStrictReadModeReachesSelectedBackend) {
