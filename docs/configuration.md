@@ -178,7 +178,8 @@ ServerBuilder 的注册集合也保持不变。设为 `true` 后，KVMeta 与固
 恢复并放流；KVMeta maintenance worker 在首轮 GC 前完成自身恢复，完成前仅 KVMeta 请求返回 not-ready。
 
 KVMeta instance 应使用专用 Instance Group。group 必须配置 LRU `reclaim_strategy`、合法的
-`used_percentage`，且所有 storage candidate 都必须是 PACE。`used_percentage` 是异步回收目标，不是写入硬门槛；
+`used_percentage` 和单一 PACE storage tier；非 fallback 的 `CPS_ALWAYS_*` 必须匹配该 tier。
+`used_percentage` 是异步回收目标，不是写入硬门槛；
 `PutStart` 不锁容量或预留请求字节。KVMeta 按已提交对象的真实字节维护 usage，并由独立 Reclaimer 回收到目标水位。
 普通 CacheReclaimer 和 Cache GC 只跳过带完整 KVMeta schema marker 的 instance，不改变普通注册、Admin 或
 固定 block KVCache 写入逻辑。完整语义见
