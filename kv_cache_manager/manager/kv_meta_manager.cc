@@ -18,6 +18,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
+#include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
@@ -140,11 +141,12 @@ std::uint64_t SaturatingAdd(std::uint64_t lhs, std::uint64_t rhs) {
 
 bool GetKvMetaCapacity(const InstanceGroup &group,
                        const std::shared_ptr<DataStorageManager> &storage_manager,
-                       std::int64_t &capacity) {
+                       std::int64_t &capacity,
+                       DataStorageType &storage_type) {
     if (!storage_manager || group.storage_candidates().empty() || group.quota().capacity() <= 0) {
         return false;
     }
-    DataStorageType storage_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+    storage_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
     for (const auto &name : group.storage_candidates()) {
         const auto backend = storage_manager->GetDataStorageBackend(name);
         if (!backend || !IsTairMempoolStorageType(backend->GetType()) ||
@@ -163,6 +165,21 @@ bool GetKvMetaCapacity(const InstanceGroup &group,
         }
     }
     return storage_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+}
+
+bool MatchesKvMetaStoragePreference(CachePreferStrategy preference, DataStorageType storage_type) {
+    switch (preference) {
+    case CachePreferStrategy::CPS_ALWAYS_TAIR_MEMPOOL:
+        return storage_type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    case CachePreferStrategy::CPS_ALWAYS_TAIR_MEMPOOL_SSD:
+        return storage_type == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
+    case CachePreferStrategy::CPS_ALWAYS_3FS:
+    case CachePreferStrategy::CPS_ALWAYS_MOONCAKE:
+    case CachePreferStrategy::CPS_ALWAYS_VCNS_3FS:
+        return false;
+    default:
+        return true; // PREFER strategies explicitly allow fallback.
+    }
 }
 
 } // namespace
@@ -492,7 +509,8 @@ private:
         }
 
         std::int64_t capacity = 0;
-        if (!GetKvMetaCapacity(*group, owner_->registry_manager_->data_storage_manager(), capacity)) {
+        DataStorageType storage_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+        if (!GetKvMetaCapacity(*group, owner_->registry_manager_->data_storage_manager(), capacity, storage_type)) {
             return;
         }
         const std::uint64_t target = static_cast<std::uint64_t>(static_cast<long double>(capacity) * threshold);
@@ -762,8 +780,13 @@ ErrorCode KvMetaManager::ValidateCacheConfiguration(RequestContext *request_cont
         return EC_CONFIG_ERROR;
     }
     std::int64_t effective_capacity = 0;
-    if (!GetKvMetaCapacity(*group, registry_manager_->data_storage_manager(), effective_capacity)) {
+    DataStorageType storage_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+    if (!GetKvMetaCapacity(*group, registry_manager_->data_storage_manager(), effective_capacity, storage_type)) {
         AddError(request_context, "KVMeta requires one positive-capacity PACE storage tier per group");
+        return EC_CONFIG_ERROR;
+    }
+    if (!MatchesKvMetaStoragePreference(cache_config->cache_prefer_strategy(), storage_type)) {
+        AddError(request_context, "KVMeta storage preference must match its PACE storage tier");
         return EC_CONFIG_ERROR;
     }
     return EC_OK;

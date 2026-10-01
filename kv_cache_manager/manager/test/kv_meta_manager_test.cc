@@ -311,6 +311,22 @@ TEST_F(KvMetaManagerTest, MixedPaceTiersAreRejectedInsteadOfStrandingAFullTier) 
     EXPECT_EQ(EC_CONFIG_ERROR, manager_->StartWrite(&context_, kDefaultInstance, {"new"}, {1}, 30).first);
 }
 
+TEST_F(KvMetaManagerTest, StoragePreferenceMustMatchTheSinglePaceTier) {
+    const auto [group_ec, group] = registry_manager_->GetInstanceGroup(&context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(group && group->cache_config());
+
+    auto cache_config = std::make_shared<CacheConfig>();
+    ASSERT_TRUE(cache_config->FromJsonString(group->cache_config()->ToJsonString()));
+    cache_config->set_cache_prefer_strategy(CachePreferStrategy::CPS_ALWAYS_3FS);
+    InstanceGroup updated(*group);
+    updated.set_cache_config(cache_config);
+    updated.set_version(group->version() + 1);
+    ASSERT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(&context_, updated, group->version()));
+
+    EXPECT_EQ(EC_CONFIG_ERROR, manager_->StartWrite(&context_, kDefaultInstance, {"new"}, {1}, 30).first);
+}
+
 TEST_F(KvMetaManagerTest, RemoveIsIdempotentAndUpdatesActualBytes) {
     Commit(kDefaultInstance, "remove", 37);
     ASSERT_EQ(37u, Indexer(kDefaultInstance)->GetStorageUsage());
