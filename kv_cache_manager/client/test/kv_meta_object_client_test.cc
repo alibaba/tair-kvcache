@@ -821,7 +821,7 @@ TEST(KvMetaObjectClientDependencyTest, ExplicitCloseWaitsForAnAdmittedOperation)
     EXPECT_EQ(ER_CLIENT_NOT_EXISTS, client.SaveObjects("after-close", keys, sizes, buffers));
 }
 
-TEST(KvMetaObjectClientDependencyTest, OperationsRemainConcurrentBeforeClose) {
+TEST(KvMetaObjectClientDependencyTest, ConcurrentSavesAreSerializedBeforeStartingTheirWriteLeases) {
     using namespace std::chrono_literals;
     char payload = 0;
     auto control = std::make_shared<BlockingStartControl>();
@@ -834,17 +834,19 @@ TEST(KvMetaObjectClientDependencyTest, OperationsRemainConcurrentBeforeClose) {
 
     auto first = std::async(std::launch::async, [&]() { return client.SaveObjects("first", keys, sizes, buffers); });
     auto second = std::async(std::launch::async, [&]() { return client.SaveObjects("second", keys, sizes, buffers); });
-    bool both_entered = false;
+    bool first_entered = false;
     {
         std::unique_lock<std::mutex> lock(control->mutex);
-        both_entered = control->condition.wait_for(lock, 2s, [&]() { return control->entered_count == 2; });
+        first_entered = control->condition.wait_for(lock, 2s, [&]() { return control->entered_count == 1; });
+        EXPECT_FALSE(control->condition.wait_for(lock, 50ms, [&]() { return control->entered_count == 2; }));
         control->released = true;
         control->condition.notify_all();
     }
 
-    EXPECT_TRUE(both_entered);
+    EXPECT_TRUE(first_entered);
     EXPECT_EQ(ER_SERVICE_NOT_READY, first.get());
     EXPECT_EQ(ER_SERVICE_NOT_READY, second.get());
+    EXPECT_EQ(2, control->entered_count);
 }
 
 TEST(KvMetaObjectClientLimitTest, AcceptsExactBatchByteLimitAndRejectsTheNextObjectBeforeMetadata) {

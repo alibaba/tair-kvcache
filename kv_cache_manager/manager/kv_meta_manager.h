@@ -134,7 +134,8 @@ private:
                           const std::vector<SessionItem> &items,
                           bool delete_physical,
                           bool maintenance_read,
-                          std::vector<SessionItem> *deleted_items = nullptr);
+                          std::vector<SessionItem> *deleted_items = nullptr,
+                          bool refresh_cache_from_persistent = false);
     void DeletePhysicalBestEffort(RequestContext *request_context, const std::vector<SessionItem> &items) const;
     bool ExpireSession(const std::string &session_id,
                        const std::string &internal_instance_id,

@@ -264,6 +264,7 @@ ClientErrorCode KvMetaObjectClientImpl::SaveObjects(const std::string &trace_id,
     if (!operation.admitted()) {
         return ER_CLIENT_NOT_EXISTS;
     }
+    std::lock_guard<std::mutex> save_lock(save_mutex_);
 
     ClientErrorCode start_ec = ER_INVALID_GRPCSTATUS;
     KvMetaStartWriteResult start_result;
