@@ -2742,9 +2742,8 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
         LOG_WITH_GR(WARN, "list instances info failed, error code: [%d]", static_cast<std::int32_t>(ec));
         return result;
     }
-    // KVMeta objects intentionally remain CLS_NEW and are managed by the
-    // isolated generic-object path. Do not spend the KV-cache reclaim or
-    // migration budget sampling those exact-key namespaces.
+    // KVMeta has its own exact-key lifecycle and reclaimer. Do not spend the
+    // fixed-block reclaim or migration budget sampling those namespaces.
     instance_infos.erase(std::remove_if(instance_infos.begin(),
                                         instance_infos.end(),
                                         [](const auto &instance) { return instance && IsKvMetaInstance(*instance); }),
