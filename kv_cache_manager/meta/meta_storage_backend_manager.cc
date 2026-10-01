@@ -2076,6 +2076,27 @@ ErrorCode MetaStorageBackendManager::ScanLocationsForMaintenance(RequestContext 
     return EC_OK;
 }
 
+ErrorCode MetaStorageBackendManager::ScanPersistentLocationsForRecovery(RequestContext *request_context,
+                                                                        const std::string &cursor,
+                                                                        const int64_t limit,
+                                                                        MaintenanceScanBatch &out) noexcept {
+    out.Clear();
+    if (!persistent_backend_) {
+        return EC_ERROR;
+    }
+    const ErrorCode ec = persistent_backend_->ScanLocationsForMaintenance(request_context, cursor, limit, out);
+    if (ec != EC_OK) {
+        out.Clear();
+        return ec;
+    }
+    if (out.next_cursor.empty() || out.keys.size() != out.locations.size() ||
+        out.keys.size() != out.location_results.size()) {
+        out.Clear();
+        return EC_ERROR;
+    }
+    return EC_OK;
+}
+
 ErrorCode MetaStorageBackendManager::RandomSample(RequestContext *request_context,
                                                   const int64_t count,
                                                   KeyTypeVec &out_keys) noexcept {
@@ -2127,29 +2148,41 @@ ErrorCode MetaStorageBackendManager::SampleReclaimCandidates(RequestContext *req
     if (count <= 0) {
         return EC_OK;
     }
-    if (!cache_backend_) {
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        if (cache_backend_) {
+            return cache_backend_->SampleReclaimCandidates(
+                request_context, count, out_candidates, require_read_success);
+        }
         return persistent_backend_->SampleReclaimCandidates(
             request_context, count, out_candidates, require_read_success);
     }
 
-    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
-        return cache_backend_->SampleReclaimCandidates(request_context, count, out_candidates, require_read_success);
+    return SamplePersistentReclaimCandidates(request_context, count, out_candidates, require_read_success);
+}
+
+ErrorCode MetaStorageBackendManager::SamplePersistentReclaimCandidates(RequestContext *request_context,
+                                                                       const int64_t count,
+                                                                       ReclaimCandidateVector &out_candidates,
+                                                                       bool require_read_success) noexcept {
+    out_candidates.clear();
+    if (count <= 0) {
+        return EC_OK;
+    }
+    if (!persistent_backend_) {
+        return EC_ERROR;
     }
 
     // The persistent layer is the only complete key source while recovery is
-    // still backfilling the hot cache. Its timestamps can be stale, however,
-    // so overlay every cache hit with the current in-memory timestamp using a
-    // no-touch exact-key lookup. Cache misses retain the persistent timestamp.
+    // backfilling or after hot-cache eviction. Overlay cache hits with their
+    // current timestamp; misses retain the persistent timestamp.
     ErrorCode ec =
         persistent_backend_->SampleReclaimCandidates(request_context, count, out_candidates, require_read_success);
-    if (ec != EC_OK) {
-        out_candidates.clear();
+    if (ec != EC_OK || out_candidates.empty() || !cache_backend_) {
+        if (ec != EC_OK) {
+            out_candidates.clear();
+        }
         return ec;
     }
-    if (out_candidates.empty()) {
-        return EC_OK;
-    }
-
     KeyTypeVec keys;
     keys.reserve(out_candidates.size());
     for (const auto &candidate : out_candidates) {

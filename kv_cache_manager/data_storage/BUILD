@@ -76,6 +76,7 @@ cc_library(
         "common_define.h",
         "data_storage_backend.h",
         "data_storage_uri.h",
+        "kv_meta_uri.h",
         "storage_config.h",
     ],
     deps = [
