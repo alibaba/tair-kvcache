@@ -176,6 +176,10 @@ public:
                                           const std::string &cursor,
                                           size_t limit,
                                           MaintenanceScanBatch &out) noexcept;
+    ErrorCode ScanPersistentLocationsForRecovery(RequestContext *request_context,
+                                                 const std::string &cursor,
+                                                 size_t limit,
+                                                 MaintenanceScanBatch &out) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
     ErrorCode
     SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept;

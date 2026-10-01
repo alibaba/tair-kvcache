@@ -49,7 +49,7 @@ URI 中的 `size` 是对象实际字节数。服务端和客户端都会校验 b
 1. `PutStart` 查询所有 key。
 2. 已存在且 size 相同的 `SERVING` 对象返回 hit；size 不同返回 `SIZE_MISMATCH`；`WRITING` 返回 `WRITE_IN_PROGRESS`。
 3. 对 miss，选择当前可写的 PACE backend，逐对象按真实 size 分配空间。
-4. 每次分配成功后立即以条件写创建对应的 `WRITING` metadata；全部完成后在内存中保存有期限的 write session。
+4. 每次分配成功后立即以条件写创建对应的 `WRITING` metadata；全部完成后在内存中保存有期限的 write session。启动阶段回滚失败也进入同一个 cleanup worker 重试。
 5. 客户端把 bytes 写入 PACE。
 6. 全部成功后 `PutFinish` 条件地把本 session 的 generation 改为 `SERVING`；任一失败则删除本 session 的全部 metadata，并尽力释放 PACE allocation。metadata 清理遇到暂时错误时会保留内部清理任务重试。
 
@@ -85,14 +85,14 @@ KVMeta Reclaimer 周期处理已注册的 KVMeta group：
 4. 从每个 indexer 采样 LRU candidate，合并后按 `last_access_time` 全局排序。
 5. 选择至多一个 batching size，或预计删除字节达到 `usage - target` 为止。
 6. 按 generation 条件删除 metadata；只有删除成功的 `SERVING` 对象才扣减 usage。
-7. metadata 删除后等待现有 `delay_before_delete_ms` grace period，再尽力释放对应 PACE allocation。
+7. metadata 删除后等待现有 `delay_before_delete_ms` grace period，再尽力释放对应 PACE allocation；显式 `Remove` 使用相同的 reader grace period。
 8. 后续轮次继续采样，直到 usage 不高于 target。
 
 generation 由 allocation 创建时间和完整 PACE URI 共同标识，`WRITING -> SERVING` 不改变它。条件删除因此不会误删已经替换的新 allocation。回收是异步、渐进的；采样不足或 provider 删除失败不会阻塞读写主链路。
 
 ## 恢复与 HA
 
-升主后，原 KVCache 先按既有流程恢复并放流。随后启动 KVMeta 自己的 maintenance worker；worker 在首轮 GC 前完成 metadata 扫描与 usage 重建。恢复期间 KVMeta 请求返回 `SERVICE_NOT_READY`，不阻塞原 MetaService，也不在 Server 中增加第二套恢复线程生命周期。
+升主后，原 KVCache 先按既有流程恢复并放流。随后启动 KVMeta 自己的 maintenance worker；worker 在首轮 GC 前从 persistent metadata source 扫描全部对象并重建 usage，不使用双层 metadata 模式下有界的 hot-cache 视图。恢复期间 KVMeta 请求返回 `SERVICE_NOT_READY`，不阻塞原 MetaService，也不在 Server 中增加第二套恢复线程生命周期。
 
 降主或停服时先关闭 KVMeta 新请求，再停止 session expiry 和 maintenance worker。
 
@@ -101,7 +101,7 @@ generation 由 allocation 创建时间和完整 PACE URI 共同标识，`WRITING
 - `kvcm.kv_meta.enabled=true` 才注册服务。
 - KVMeta group 应独立配置，不与普通 KVCache instance 混用。
 - group 必须配置 LRU reclaim policy 和 `[0, 1)` 范围的 `used_percentage`，为异步回收保留空间。
-- `storage_candidates` 非空且全部是已注册的 PACE backend。
+- `storage_candidates` 非空且全部是同一 PACE storage type；V1 的一个 group 只管理一个 DRAM 或 SSD tier，GC target 取 group capacity 与该 tier quota 的较小值。
 - RTP wrapper 使用现有环境变量，并把普通 `RECO_INSTANCE_GROUP` / instance id 加 `kve_` 前缀形成 KVMeta identity；该前缀规则属于 RTP client，不是服务端协议要求。
 
 ## 失败语义
@@ -111,6 +111,7 @@ generation 由 allocation 创建时间和完整 PACE URI 共同标识，`WRITING
 - 数据面 SDK 超时：client 会先等待已提交给 PACE 的任务退出，再返回超时并关闭该 data-plane client，防止旧 I/O 在 allocation 释放后继续访问。
 - `PutFinish` transport 失败：提交结果可能未知，不能盲目重试；先 `Get` 对账。
 - `Remove` 是幂等 metadata 删除，但遇到同 key 的 `WRITING` 会返回 `WRITE_IN_PROGRESS`；transport 失败后也不能自动重试删除，因为期间可能出现新 generation。
+- 同一 object client 的并发 `save` 在 `PutStart` 前串行，排队时间不会消耗服务端 write lease；不同 client 仍由服务端 generation 条件写协调。
 - `Trim` 仅保留旧 proto 定义，不注册 V1 handler；按 key 删除使用 `Remove`，容量治理使用自动 GC。
 
 ## 非目标

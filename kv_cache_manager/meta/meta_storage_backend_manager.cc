@@ -2076,6 +2076,27 @@ ErrorCode MetaStorageBackendManager::ScanLocationsForMaintenance(RequestContext 
     return EC_OK;
 }
 
+ErrorCode MetaStorageBackendManager::ScanPersistentLocationsForRecovery(RequestContext *request_context,
+                                                                        const std::string &cursor,
+                                                                        const int64_t limit,
+                                                                        MaintenanceScanBatch &out) noexcept {
+    out.Clear();
+    if (!persistent_backend_) {
+        return EC_ERROR;
+    }
+    const ErrorCode ec = persistent_backend_->ScanLocationsForMaintenance(request_context, cursor, limit, out);
+    if (ec != EC_OK) {
+        out.Clear();
+        return ec;
+    }
+    if (out.next_cursor.empty() || out.keys.size() != out.locations.size() ||
+        out.keys.size() != out.location_results.size()) {
+        out.Clear();
+        return EC_ERROR;
+    }
+    return EC_OK;
+}
+
 ErrorCode MetaStorageBackendManager::RandomSample(RequestContext *request_context,
                                                   const int64_t count,
                                                   KeyTypeVec &out_keys) noexcept {

@@ -1761,6 +1761,13 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesCacheWithoutPersist
     ASSERT_EQ(1u, scan_batch.locations.size());
     ASSERT_TRUE(scan_batch.locations[0].count("loc_888") > 0);
 
+    MaintenanceScanBatch recovery_batch;
+    ASSERT_EQ(EC_OK, mgr.ScanPersistentLocationsForRecovery(nullptr, SCAN_BASE_CURSOR, 10, recovery_batch));
+    ASSERT_EQ((KeyVector{777}), recovery_batch.keys);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), recovery_batch.location_results);
+    ASSERT_EQ(1u, recovery_batch.locations.size());
+    ASSERT_TRUE(recovery_batch.locations[0].count("loc_777") > 0);
+
     cache_exists.clear();
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));
     EXPECT_EQ((std::vector<bool>{false}), cache_exists);

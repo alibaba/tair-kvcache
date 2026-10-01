@@ -1997,6 +1997,18 @@ ErrorCode MetaIndexer::ScanLocationsForMaintenance(RequestContext *request_conte
     return ec;
 }
 
+ErrorCode MetaIndexer::ScanPersistentLocationsForRecovery(RequestContext *request_context,
+                                                          const std::string &cursor,
+                                                          const size_t limit,
+                                                          MaintenanceScanBatch &out) noexcept {
+    out.Clear();
+    if (limit == 0 || limit > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        return EC_BADARGS;
+    }
+    return backend_manager_->ScanPersistentLocationsForRecovery(
+        request_context, cursor, static_cast<int64_t>(limit), out);
+}
+
 ErrorCode
 MetaIndexer::RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept {
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());

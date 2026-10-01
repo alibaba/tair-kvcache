@@ -138,6 +138,33 @@ std::uint64_t SaturatingAdd(std::uint64_t lhs, std::uint64_t rhs) {
                                                                  : lhs + rhs;
 }
 
+bool GetKvMetaCapacity(const InstanceGroup &group,
+                       const std::shared_ptr<DataStorageManager> &storage_manager,
+                       std::int64_t &capacity) {
+    if (!storage_manager || group.storage_candidates().empty() || group.quota().capacity() <= 0) {
+        return false;
+    }
+    DataStorageType storage_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+    for (const auto &name : group.storage_candidates()) {
+        const auto backend = storage_manager->GetDataStorageBackend(name);
+        if (!backend || !IsTairMempoolStorageType(backend->GetType()) ||
+            (storage_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN && storage_type != backend->GetType())) {
+            return false;
+        }
+        storage_type = backend->GetType();
+    }
+    capacity = group.quota().capacity();
+    for (const auto &quota : group.quota().quota_config()) {
+        if (quota.storage_spec() == storage_type) {
+            if (quota.capacity() <= 0) {
+                return false;
+            }
+            capacity = std::min(capacity, quota.capacity());
+        }
+    }
+    return storage_type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+}
+
 } // namespace
 
 struct KvMetaManager::SessionItem {
@@ -464,9 +491,11 @@ private:
             indexed_instances.emplace_back(instance, std::move(indexer));
         }
 
-        const std::int64_t capacity = group->quota().capacity();
-        const std::uint64_t target =
-            capacity <= 0 ? 0 : static_cast<std::uint64_t>(static_cast<long double>(capacity) * threshold);
+        std::int64_t capacity = 0;
+        if (!GetKvMetaCapacity(*group, owner_->registry_manager_->data_storage_manager(), capacity)) {
+            return;
+        }
+        const std::uint64_t target = static_cast<std::uint64_t>(static_cast<long double>(capacity) * threshold);
         if (group_usage <= target) {
             return;
         }
@@ -732,17 +761,10 @@ ErrorCode KvMetaManager::ValidateCacheConfiguration(RequestContext *request_cont
         AddError(request_context, "KVMeta does not support storage migration");
         return EC_CONFIG_ERROR;
     }
-    const auto storage_manager = registry_manager_->data_storage_manager();
-    if (!storage_manager || group->storage_candidates().empty()) {
-        AddError(request_context, "KVMeta has no storage candidate");
+    std::int64_t effective_capacity = 0;
+    if (!GetKvMetaCapacity(*group, registry_manager_->data_storage_manager(), effective_capacity)) {
+        AddError(request_context, "KVMeta requires one positive-capacity PACE storage tier per group");
         return EC_CONFIG_ERROR;
-    }
-    for (const auto &name : group->storage_candidates()) {
-        const auto backend = storage_manager->GetDataStorageBackend(name);
-        if (!backend || !IsTairMempoolStorageType(backend->GetType())) {
-            AddError(request_context, "KVMeta storage candidates must all be PACE backends");
-            return EC_CONFIG_ERROR;
-        }
     }
     return EC_OK;
 }
@@ -969,7 +991,8 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
                                      const std::vector<SessionItem> &items,
                                      bool delete_physical,
                                      bool maintenance_read,
-                                     std::vector<SessionItem> *deleted_items) {
+                                     std::vector<SessionItem> *deleted_items,
+                                     bool refresh_cache_from_persistent) {
     if (deleted_items) {
         deleted_items->clear();
     }
@@ -1023,7 +1046,9 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
             return {MA_DELETE, {EC_OK}};
         };
         const auto result =
-            maintenance_read
+            refresh_cache_from_persistent
+                ? indexer->ReadModifyWriteLocation(request_context, layer_keys, layer_ids, modifier, true, true)
+            : maintenance_read
                 ? indexer->ReadModifyWriteLocationsForMaintenance(request_context, layer_keys, layer_ids, modifier)
                 : indexer->ReadModifyWriteLocation(request_context, layer_keys, layer_ids, modifier);
         if (result.per_location_error_codes.size() != layer.size()) {
@@ -1143,7 +1168,9 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     const auto selected =
         data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context, instance->instance_group_name());
     if (selected.ec != EC_OK || selected.name.empty() || selected.type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
-        return {selected.ec == EC_OK ? EC_NOENT : selected.ec, {}};
+        // Configuration was validated above; no selectable candidate here is
+        // normal cache capacity/availability pressure, not missing metadata.
+        return {EC_NOSPC, {}};
     }
 
     const auto storage_manager = registry_manager_->data_storage_manager();
@@ -1153,8 +1180,8 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     }
 
     const auto deadline = KvMetaWriteSessionManager::Clock::now() + std::chrono::seconds(write_timeout_seconds);
-    auto publish_writing = [&](const SessionItem &candidate) {
-        bool inserted = false;
+    auto publish_writing = [&](const SessionItem &candidate, bool &inserted) {
+        inserted = false;
         auto modifier = [&candidate, &inserted](const std::vector<ErrorCode> &get_ecs,
                                                 const LocationIdVector &,
                                                 std::size_t,
@@ -1188,8 +1215,15 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     std::vector<SessionItem> candidates;
     candidates.reserve(missing.size());
     const auto rollback_candidates = [&]() {
-        DeleteItems(request_context, internal_instance_id, candidates, false, false);
-        DeletePhysicalBestEffort(request_context, candidates);
+        if (candidates.empty()) {
+            return;
+        }
+        const ErrorCode cleanup_ec = DeleteItems(request_context, internal_instance_id, candidates, true, false);
+        if (cleanup_ec != EC_OK && write_session_manager_) {
+            KvMetaWriteSessionManager::Session cleanup{
+                internal_instance_id, KvMetaWriteSessionManager::Clock::now(), candidates};
+            write_session_manager_->ScheduleCleanup(StringUtil::GenerateRandomString(32), std::move(cleanup));
+        }
     };
     for (const std::size_t request_index : missing) {
         if (maintenance_cancelled_.load(std::memory_order_acquire) ||
@@ -1221,21 +1255,29 @@ KvMetaManager::StartWrite(RequestContext *request_context,
                              *location,
                              actual_size) != EC_OK ||
             actual_size != value_sizes[request_index]) {
-            candidates.push_back({existing[request_index].internal_key,
-                                  existing[request_index].location_id,
-                                  location,
-                                  value_sizes[request_index]});
+            DeletePhysicalBestEffort(request_context,
+                                     {{existing[request_index].internal_key,
+                                       existing[request_index].location_id,
+                                       location,
+                                       value_sizes[request_index]}});
             rollback_candidates();
             return {EC_CORRUPTION, {}};
         }
-        candidates.push_back({existing[request_index].internal_key,
+        SessionItem candidate{existing[request_index].internal_key,
                               existing[request_index].location_id,
-                              location,
-                              value_sizes[request_index]});
-        if (const ErrorCode ec = publish_writing(candidates.back()); ec != EC_OK) {
+                              std::move(location),
+                              value_sizes[request_index]};
+        bool inserted = false;
+        if (const ErrorCode ec = publish_writing(candidate, inserted); ec != EC_OK) {
+            if (inserted) {
+                candidates.push_back(std::move(candidate));
+            } else {
+                DeletePhysicalBestEffort(request_context, {candidate});
+            }
             rollback_candidates();
             return {ec, {}};
         }
+        candidates.push_back(std::move(candidate));
     }
 
     std::vector<ValueLocation> output_locations;
@@ -1243,7 +1285,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
     for (const auto &candidate : candidates) {
         ValueLocation location;
         if (!candidate.location || !ToValueLocation(*candidate.location, location)) {
-            DeleteItems(request_context, internal_instance_id, candidates, true, false);
+            rollback_candidates();
             return {EC_CORRUPTION, {}};
         }
         output_locations.push_back(std::move(location));
@@ -1257,7 +1299,7 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         put_result = write_session_manager_->Put(session_id, std::move(session));
     }
     if (put_result != KvMetaWriteSessionManager::PutResult::kOk) {
-        DeleteItems(request_context, internal_instance_id, candidates, true, false);
+        rollback_candidates();
         if (put_result == KvMetaWriteSessionManager::PutResult::kStopped) {
             return {EC_SERVICE_NOT_LEADER, {}};
         }
@@ -1395,8 +1437,9 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
     if (const ErrorCode ec = CheckReady(request_context); ec != EC_OK) {
         return ec;
     }
-    if (const auto [ec, _] = GetValidatedInstanceInfo(request_context, instance_id); ec != EC_OK) {
-        return ec;
+    const auto [instance_ec, instance] = GetValidatedInstanceInfo(request_context, instance_id);
+    if (instance_ec != EC_OK) {
+        return instance_ec;
     }
     if (const ErrorCode ec = ValidateKeys(request_context, keys); ec != EC_OK) {
         return ec;
@@ -1426,7 +1469,21 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
         }
         items.push_back({exact[i].internal_key, exact[i].location_id, exact[i].location, size});
     }
-    return DeleteItems(request_context, internal_instance_id, items, true, false);
+    std::vector<SessionItem> deleted;
+    const ErrorCode delete_ec = DeleteItems(request_context, internal_instance_id, items, false, false, &deleted);
+    if (!deleted.empty()) {
+        std::int32_t delay_ms = 0;
+        const auto [group_ec, group] =
+            registry_manager_->GetInstanceGroup(request_context, instance->instance_group_name());
+        if (group_ec == EC_OK && group && group->cache_config() && group->cache_config()->reclaim_strategy()) {
+            delay_ms = std::max<std::int32_t>(0, group->cache_config()->reclaim_strategy()->delay_before_delete_ms());
+        }
+        if (delay_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        }
+        DeletePhysicalBestEffort(request_context, deleted);
+    }
+    return delete_ec;
 }
 
 bool KvMetaManager::ExpireSession(const std::string &session_id,
@@ -1495,35 +1552,29 @@ ErrorCode KvMetaManager::DoRecover() {
                 if (maintenance_cancelled_.load(std::memory_order_acquire)) {
                     return EC_SERVICE_NOT_LEADER;
                 }
-                std::string next_cursor;
-                KeyVector keys;
-                const ErrorCode scan_ec = indexer->Scan(&context, cursor, kScanBatchSize, next_cursor, keys);
-                if (scan_ec != EC_OK || next_cursor.empty()) {
-                    instance_ec = scan_ec == EC_OK ? EC_CORRUPTION : scan_ec;
+                MaintenanceScanBatch batch;
+                const ErrorCode scan_ec =
+                    indexer->ScanPersistentLocationsForRecovery(&context, cursor, kScanBatchSize, batch);
+                if (scan_ec != EC_OK) {
+                    instance_ec = scan_ec;
                     break;
                 }
-                CacheLocationMapVector maps;
-                if (!keys.empty()) {
-                    const auto result = indexer->GetLocationMapsForMaintenance(&context, keys, maps);
-                    if (result.error_codes.size() != keys.size() || maps.size() != keys.size()) {
-                        instance_ec = EC_MISMATCH;
-                        break;
-                    }
+                if (!batch.keys.empty()) {
                     std::vector<SessionItem> stale;
-                    for (std::size_t i = 0; i < keys.size() && instance_ec == EC_OK; ++i) {
-                        if (result.error_codes[i] != EC_OK) {
-                            instance_ec = result.error_codes[i];
+                    for (std::size_t i = 0; i < batch.keys.size() && instance_ec == EC_OK; ++i) {
+                        if (batch.location_results[i] != EC_OK) {
+                            instance_ec = batch.location_results[i];
                             break;
                         }
-                        for (const auto &[location_id, location] : maps[i]) {
+                        for (const auto &[location_id, location] : batch.locations[i]) {
                             std::uint64_t size = 0;
                             if (!location ||
-                                ValidateLocation(&context, keys[i], location_id, *location, size) != EC_OK) {
+                                ValidateLocation(&context, batch.keys[i], location_id, *location, size) != EC_OK) {
                                 instance_ec = EC_CORRUPTION;
                                 break;
                             }
                             if (location->status() == CLS_WRITING) {
-                                stale.push_back({keys[i], location_id, location, size});
+                                stale.push_back({batch.keys[i], location_id, location, size});
                             } else {
                                 const auto base_type = ToBaseType(location->type());
                                 const std::size_t type_index = ToIndex(base_type);
@@ -1536,10 +1587,10 @@ ErrorCode KvMetaManager::DoRecover() {
                         }
                     }
                     if (instance_ec == EC_OK && !stale.empty()) {
-                        instance_ec = DeleteItems(&context, instance->instance_id(), stale, true, true);
+                        instance_ec = DeleteItems(&context, instance->instance_id(), stale, true, true, nullptr, true);
                     }
                 }
-                cursor = std::move(next_cursor);
+                cursor = std::move(batch.next_cursor);
             } while (instance_ec == EC_OK && cursor != SCAN_BASE_CURSOR);
 
             if (instance_ec == EC_OK) {

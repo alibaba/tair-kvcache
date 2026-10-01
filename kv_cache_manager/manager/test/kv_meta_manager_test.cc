@@ -33,10 +33,11 @@ namespace {
 
 class TestPaceBackend : public DataStorageBackend {
 public:
-    explicit TestPaceBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
-        : DataStorageBackend(std::move(metrics_registry)) {}
+    explicit TestPaceBackend(std::shared_ptr<MetricsRegistry> metrics_registry,
+                             DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL)
+        : DataStorageBackend(std::move(metrics_registry)), type_(type) {}
 
-    DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL; }
+    DataStorageType GetType() override { return type_; }
     bool Available() override { return IsOpen() && IsAvailable(); }
     double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
     ErrorCode DoOpen(const StorageConfig &, const std::string &) override {
@@ -91,6 +92,7 @@ public:
     std::size_t delete_count() const { return delete_count_.load(std::memory_order_acquire); }
 
 private:
+    DataStorageType type_;
     std::atomic<std::uint64_t> next_offset_{1};
     std::atomic<std::size_t> delete_count_{0};
 };
@@ -285,6 +287,30 @@ TEST_F(KvMetaManagerTest, ExistingInstanceCanReregisterAfterPolicyBecomesInvalid
     EXPECT_EQ(EC_CONFIG_ERROR, manager_->StartWrite(&context_, kDefaultInstance, {"new"}, {1}, 30).first);
 }
 
+TEST_F(KvMetaManagerTest, MixedPaceTiersAreRejectedInsteadOfStrandingAFullTier) {
+    constexpr const char *kSsdStorage = "pace_ssd_test";
+    auto ssd_spec = std::make_shared<TairMemPoolStorageSpec>();
+    ssd_spec->set_domain("test-pace-ssd");
+    ssd_spec->set_media_type(kTairMemPoolMediaTypeSsd);
+    auto ssd_backend =
+        std::make_shared<TestPaceBackend>(metrics_registry_, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD);
+    ASSERT_EQ(
+        EC_OK,
+        ssd_backend->Open(StorageConfig(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, kSsdStorage, ssd_spec),
+                          context_.trace_id()));
+    registry_manager_->data_storage_manager()->storage_map_[kSsdStorage] = std::move(ssd_backend);
+
+    const auto [group_ec, group] = registry_manager_->GetInstanceGroup(&context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(group);
+    InstanceGroup updated(*group);
+    updated.set_storage_candidates({kStorageName, kSsdStorage});
+    updated.set_version(group->version() + 1);
+    ASSERT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(&context_, updated, group->version()));
+
+    EXPECT_EQ(EC_CONFIG_ERROR, manager_->StartWrite(&context_, kDefaultInstance, {"new"}, {1}, 30).first);
+}
+
 TEST_F(KvMetaManagerTest, RemoveIsIdempotentAndUpdatesActualBytes) {
     Commit(kDefaultInstance, "remove", 37);
     ASSERT_EQ(37u, Indexer(kDefaultInstance)->GetStorageUsage());
@@ -296,6 +322,22 @@ TEST_F(KvMetaManagerTest, RemoveIsIdempotentAndUpdatesActualBytes) {
     ASSERT_EQ(EC_OK, ec);
     ASSERT_EQ(1u, values.size());
     EXPECT_FALSE(values[0].found);
+}
+
+TEST_F(KvMetaManagerTest, RemoveHonorsTheConfiguredReaderGracePeriod) {
+    constexpr const char *kGroup = "remove-delay-group";
+    constexpr const char *kInstance = "remove-delay-instance";
+    CreateGroup(kGroup, kInstance, 100, 0.8, 100);
+    Commit(kInstance, "remove", 17);
+    const std::size_t deletes_before = pace_backend_->delete_count();
+
+    const auto begin = std::chrono::steady_clock::now();
+    EXPECT_EQ(EC_OK, manager_->Remove(&context_, kInstance, {"remove"}));
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+
+    EXPECT_GE(elapsed, std::chrono::milliseconds(80));
+    EXPECT_GT(pace_backend_->delete_count(), deletes_before);
+    EXPECT_EQ(0u, Indexer(kInstance)->GetStorageUsage());
 }
 
 TEST_F(KvMetaManagerTest, RemoveDoesNotFreeAnActiveWrite) {
@@ -353,7 +395,7 @@ TEST_F(KvMetaManagerTest, CapacityCheckIsSoftAndAllowsOneWriteToCrossTheLimit) {
     EXPECT_EQ(103u, Indexer(kInstance)->GetStorageUsage());
 
     // The next selector snapshot sees the already-crossed limit and rejects.
-    EXPECT_NE(EC_OK, manager_->StartWrite(&context_, kInstance, {"third"}, {1}, 30).first);
+    EXPECT_EQ(EC_NOSPC, manager_->StartWrite(&context_, kInstance, {"third"}, {1}, 30).first);
 }
 
 TEST_F(KvMetaManagerTest, LruReclaimerConvergesActualUsageBelowWatermark) {
@@ -377,6 +419,28 @@ TEST_F(KvMetaManagerTest, LruReclaimerConvergesActualUsageBelowWatermark) {
     ASSERT_EQ(EC_OK, ec);
     ASSERT_EQ(2u, values.size());
     EXPECT_EQ(1, static_cast<int>(values[0].found) + static_cast<int>(values[1].found));
+}
+
+TEST_F(KvMetaManagerTest, ReclaimerUsesTheSmallerStorageTierQuota) {
+    constexpr const char *kGroup = "tier-quota-group";
+    constexpr const char *kInstance = "tier-quota-instance";
+    CreateGroup(kGroup, kInstance, 100, 0.8);
+    const auto [group_ec, group] = registry_manager_->GetInstanceGroup(&context_, kGroup);
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(group);
+    InstanceGroup updated(*group);
+    updated.set_quota(InstanceGroupQuota(100, {QuotaConfig(50, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL)}));
+    updated.set_version(group->version() + 1);
+    ASSERT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(&context_, updated, group->version()));
+    Commit(kInstance, "object", 45);
+
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&context_, 10);
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetSamplingSize(&context_, 32));
+    ASSERT_EQ(EC_OK, cache_manager_->cache_reclaimer()->SetBatchingSize(&context_, 8));
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+
+    ASSERT_TRUE(WaitUntil([&]() { return Indexer(kInstance)->GetStorageUsage() <= 40; }, std::chrono::seconds(3)));
+    EXPECT_EQ(0u, Indexer(kInstance)->GetStorageUsage());
 }
 
 TEST_F(KvMetaManagerTest, ReclaimerHonorsPhysicalDeleteDelay) {
