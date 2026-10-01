@@ -1,14 +1,12 @@
 #include "kv_cache_manager/manager/kv_meta_manager.h"
 
 #include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <map>
-#include <optional>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -117,7 +115,7 @@ bool ReadLogicalSize(const CacheLocation &location, std::uint64_t &out_size) {
         return false;
     }
     const std::string &text = location.location_specs().front().uri();
-    return IsValidKvMetaLocation(text, location.type(), out_size);
+    return IsValidKvMetaLocation(text, out_size);
 }
 
 bool ToValueLocation(const CacheLocation &location, KvMetaManager::ValueLocation &out) {

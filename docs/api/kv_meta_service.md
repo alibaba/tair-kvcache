@@ -58,8 +58,8 @@ session 超时后服务端会自动清理。transport error 代表结果可能�
 `Remove` 删除指定 key 的 metadata，并尽力释放 PACE allocation。不存在的 key 按成功处理；目标仍处于
 `WRITING` 时返回 `WRITE_IN_PROGRESS`，不会释放数据面仍可能使用的 allocation。
 
-`Trim` 不属于 embedding cache 的核心数据链路，所有 strategy 均返回 `UNSUPPORTED`。按 key 删除使用
-`Remove`，容量回收由后台 GC 完成。
+`Trim` 仅作为旧 proto 的保留 RPC，V1 client 不暴露该接口，调用时由 gRPC 返回标准
+`UNIMPLEMENTED`。按 key 删除使用 `Remove`，容量回收由后台 GC 完成。
 
 ## 主要状态码
 

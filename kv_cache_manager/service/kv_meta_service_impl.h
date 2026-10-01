@@ -44,9 +44,6 @@ public:
     void Remove(RequestContext *request_context,
                 const proto::kv_meta::RemoveRequest *request,
                 proto::kv_meta::CommonResponse *response);
-    void Trim(RequestContext *request_context,
-              const proto::kv_meta::TrimRequest *request,
-              proto::kv_meta::CommonResponse *response);
 
 private:
     std::shared_ptr<CacheManager> cache_manager_;

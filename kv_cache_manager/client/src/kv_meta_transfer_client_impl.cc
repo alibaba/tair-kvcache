@@ -13,15 +13,6 @@
 
 namespace kv_cache_manager {
 
-namespace {
-
-constexpr const char *kKvMetaValueSpecName = "value";
-constexpr std::size_t kMaxKvMetaBatchItems = 64;
-constexpr std::uint64_t kMaxKvMetaObjectBytes = 1ULL * 1024 * 1024 * 1024;
-constexpr std::uint64_t kMaxKvMetaBatchBytes = 4ULL * 1024 * 1024 * 1024;
-
-} // namespace
-
 ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_config,
                                                    const InitParams &init_params,
                                                    const std::string *expected_instance_group,
@@ -60,7 +51,7 @@ ClientErrorCode KvMetaTransferClientImpl::Init(const std::string &client_config,
                                                std::uint64_t max_object_bytes,
                                                const SharedMemoryRegistration *shared_memory_registration) {
     if (!(init_params.role_type & RoleType::WORKER) || init_params.self_location_spec_name.empty() ||
-        init_params.storage_configs.empty() || max_object_bytes == 0 || max_object_bytes > kMaxKvMetaObjectBytes) {
+        init_params.storage_configs.empty() || max_object_bytes == 0 || max_object_bytes > kKvMetaMaxValueBytes) {
         return ER_INVALID_PARAMS;
     }
     const auto validation_ec = ValidateKvMetaTransferClientConfig(client_config, init_params);
@@ -140,7 +131,7 @@ std::pair<ClientErrorCode, UriStrVec> KvMetaTransferClientImpl::SaveObjects(
 ClientErrorCode KvMetaTransferClientImpl::ValidateObjects(const UriStrVec &uri_str_vec,
                                                           const std::vector<std::uint64_t> &value_sizes,
                                                           const BlockBuffers &object_buffers) const {
-    if (max_object_bytes_ == 0 || uri_str_vec.empty() || uri_str_vec.size() > kMaxKvMetaBatchItems ||
+    if (max_object_bytes_ == 0 || uri_str_vec.empty() || uri_str_vec.size() > kKvMetaMaxBatchItems ||
         uri_str_vec.size() != value_sizes.size() || uri_str_vec.size() != object_buffers.size()) {
         return ER_INVALID_PARAMS;
     }
@@ -148,9 +139,8 @@ ClientErrorCode KvMetaTransferClientImpl::ValidateObjects(const UriStrVec &uri_s
     for (std::size_t i = 0; i < uri_str_vec.size(); ++i) {
         const std::uint64_t expected_size = value_sizes[i];
         std::uint64_t uri_size = 0;
-        if (expected_size == 0 || expected_size > max_object_bytes_ || expected_size > kMaxKvMetaBatchBytes ||
-            batch_bytes > kMaxKvMetaBatchBytes - expected_size ||
-            !IsValidKvMetaLocation(uri_str_vec[i], DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, uri_size) ||
+        if (expected_size == 0 || expected_size > max_object_bytes_ || expected_size > kKvMetaMaxBatchBytes ||
+            batch_bytes > kKvMetaMaxBatchBytes - expected_size || !IsValidKvMetaLocation(uri_str_vec[i], uri_size) ||
             uri_size != expected_size || object_buffers[i].iovs.empty()) {
             return ER_INVALID_PARAMS;
         }

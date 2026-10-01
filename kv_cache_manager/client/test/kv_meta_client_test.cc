@@ -254,7 +254,7 @@ private:
             location->mutable_location_specs(0)->set_uri("file://owner@nfs/value?size=" + std::to_string(size));
         }
         if (oversized_uri_.load()) {
-            location->mutable_location_specs(0)->set_uri("file://nfs/" + std::string(kMaxKvMetaLocationUriBytes, 'x') +
+            location->mutable_location_specs(0)->set_uri("file://nfs/" + std::string(kKvMetaMaxLocationUriBytes, 'x') +
                                                          "?size=" + std::to_string(size));
         }
     }

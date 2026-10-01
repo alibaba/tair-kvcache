@@ -19,16 +19,12 @@ namespace {
 TEST(KvMetaUriTest, ChecksPaceAndExactSize) {
     const std::string uri = "pace://pace/1?media_type=0&node_id=1&range_id=0&size=5";
     std::uint64_t size = 0;
-    EXPECT_TRUE(IsValidKvMetaLocation(uri, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, size));
+    EXPECT_TRUE(IsValidKvMetaLocation(uri, size));
     EXPECT_EQ(5, size);
-    EXPECT_FALSE(IsValidKvMetaLocation(uri, DataStorageType::DATA_STORAGE_TYPE_NFS, size));
-    EXPECT_FALSE(IsValidKvMetaLocation("file://pace/1?size=5", DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, size));
-    EXPECT_FALSE(IsValidKvMetaLocation("pace://pace/not-a-number?media_type=0&node_id=1&range_id=0&size=5",
-                                       DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
-                                       size));
-    EXPECT_FALSE(IsValidKvMetaLocation("pace://pace/1?media_type=0&node_id=1&range_id=0&size=5&size=6",
-                                       DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
-                                       size));
+    EXPECT_TRUE(IsValidKvMetaLocation("pace://pace/0?media_type=0&node_id=0&range_id=0&size=5", size));
+    EXPECT_FALSE(IsValidKvMetaLocation("file://pace/1?size=5", size));
+    EXPECT_FALSE(IsValidKvMetaLocation("pace://pace/not-a-number?media_type=0&node_id=1&range_id=0&size=5", size));
+    EXPECT_FALSE(IsValidKvMetaLocation("pace://pace/1?media_type=0&node_id=1&range_id=0&size=5&size=6", size));
 }
 
 class KvMetaTransferConfigTest : public testing::Test {

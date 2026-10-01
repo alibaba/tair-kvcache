@@ -631,7 +631,7 @@ TEST_F(KvMetaObjectClientTest, MalformedLocationSchemaIsInternalErrorNotSizeMism
     malformed.type = static_cast<KvMetaStorageType>(7);
     expect_internal(std::move(malformed));
 
-    malformed = MakeLocation("file://nfs/" + std::string(kMaxKvMetaLocationUriBytes, 'x') + "?size=5", sizeof(first_));
+    malformed = MakeLocation("file://nfs/" + std::string(kKvMetaMaxLocationUriBytes, 'x') + "?size=5", sizeof(first_));
     expect_internal(std::move(malformed));
 }
 
