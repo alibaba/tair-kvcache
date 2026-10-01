@@ -297,6 +297,40 @@ class TestResponseClassification(unittest.TestCase):
         with self.assertRaises(requests.HTTPError):
             self.client.register_instance({"trace_id": "test"})
 
+    def test_non_json_http_error_preserves_response(self):
+        for check_response in (True, False):
+            with self.subTest(check_response=check_response):
+                response = requests.Response()
+                response.status_code = 502
+                response._content = b"<html>Bad Gateway</html>"
+                self.client.session.post = MagicMock(return_value=response)
+
+                with self.assertRaises(requests.HTTPError) as caught:
+                    self.client.register_instance(
+                        {"trace_id": "test"}, check_response=check_response
+                    )
+
+                self.assertIs(caught.exception.response, response)
+                self.client.session.post.assert_called_once()
+
+    def test_non_json_success_is_protocol_failure(self):
+        for check_response in (True, False):
+            for body in (b"", b"<html>Bad Gateway</html>", b'{"header":'):
+                with self.subTest(check_response=check_response, body=body):
+                    response = requests.Response()
+                    response.status_code = 200
+                    response._content = body
+                    self.client.session.post = MagicMock(return_value=response)
+
+                    with self.assertRaises(KvCacheManagerProtocolError) as caught:
+                        self.client.register_instance(
+                            {"trace_id": "test"}, check_response=check_response
+                        )
+
+                    self.assertIs(caught.exception.response, response)
+                    self.assertIsInstance(caught.exception.__cause__, ValueError)
+                    self.client.session.post.assert_called_once()
+
     def test_malformed_api_envelope_is_protocol_failure(self):
         for payload in ([], {}, {"header": {}}, {"header": {"status": {}}}):
             with self.subTest(payload=payload):

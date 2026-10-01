@@ -335,6 +335,14 @@ class KvCacheManagerClient:
 
         return response
 
+    @staticmethod
+    def _check_http_status(endpoint: str, response: requests.Response) -> None:
+        if response.status_code != 200:
+            raise KvCacheManagerHTTPError(
+                f"Request to {endpoint} failed with status code {response.status_code}",
+                response=response,
+            )
+
     def _check_response(
         self,
         endpoint: str,
@@ -343,11 +351,7 @@ class KvCacheManagerClient:
         check_business_status: bool = True,
     ) -> None:
         """Validate transport/envelope and optionally the Manager status."""
-        if response.status_code != 200:
-            raise KvCacheManagerHTTPError(
-                f"Request to {endpoint} failed with status code {response.status_code}",
-                response=response,
-            )
+        self._check_http_status(endpoint, response)
 
         if not isinstance(response_data, dict):
             raise KvCacheManagerProtocolError(
@@ -394,7 +398,14 @@ class KvCacheManagerClient:
                     self._refresh_event.set()
                 raise
 
-            response_data = response.json()
+            self._check_http_status(endpoint, response)
+            try:
+                response_data = response.json()
+            except ValueError as e:
+                raise KvCacheManagerProtocolError(
+                    f"Response from {endpoint} is not valid JSON",
+                    response=response,
+                ) from e
 
             # Validate transport and the common envelope before inspecting the
             # status for leader routing. This remains mandatory even when callers
