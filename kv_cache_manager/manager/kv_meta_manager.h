@@ -36,7 +36,6 @@ public:
         std::size_t max_instance_group_bytes = 512;
         std::size_t max_write_session_id_bytes = 512;
         std::size_t max_user_data_bytes = 64 * 1024;
-        std::size_t max_location_uri_bytes = kMaxKvMetaLocationUriBytes;
         std::size_t max_active_write_sessions = 4096;
         std::uint64_t max_value_bytes = 1ULL * 1024 * 1024 * 1024;
         std::uint64_t max_batch_bytes = 4ULL * 1024 * 1024 * 1024;
@@ -103,8 +102,6 @@ public:
     ErrorCode
     Remove(RequestContext *request_context, const std::string &instance_id, const std::vector<std::string> &keys);
 
-    ErrorCode TrimAll(RequestContext *request_context, const std::string &instance_id, bool metadata_only);
-
     const Limits &limits() const noexcept { return limits_; }
 
 private:
@@ -114,6 +111,7 @@ private:
     static std::string InternalInstanceId(const std::string &instance_id);
     static std::int64_t InternalKey(const std::string &key);
     static std::string StableLocationId(const std::string &key);
+    static bool SameGeneration(const CacheLocation &lhs, const CacheLocation &rhs);
 
     ErrorCode ValidateInstanceId(RequestContext *request_context, const std::string &instance_id) const;
     ErrorCode CheckReady(RequestContext *request_context) const;
@@ -137,7 +135,7 @@ private:
                           bool maintenance_read,
                           std::vector<SessionItem> *deleted_items = nullptr);
     void DeletePhysicalBestEffort(RequestContext *request_context, const std::vector<SessionItem> &items) const;
-    void ExpireSession(const std::string &session_id,
+    bool ExpireSession(const std::string &session_id,
                        const std::string &internal_instance_id,
                        const std::vector<SessionItem> &items) noexcept;
 

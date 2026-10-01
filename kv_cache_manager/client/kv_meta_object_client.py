@@ -563,24 +563,6 @@ class KvMetaObjectClient:
     ) -> None:
         self.load_buffers(self._buffers_from_tensors(keys, tensors), trace_id=trace_id)
 
-    def save_tensors(
-        self,
-        keys: Sequence[str],
-        tensors: Sequence[Any],
-        *,
-        trace_id: Optional[str] = None,
-    ) -> None:
-        self.save(keys, tensors, trace_id=trace_id)
-
-    def load_tensors(
-        self,
-        keys: Sequence[str],
-        tensors: Sequence[Any],
-        *,
-        trace_id: Optional[str] = None,
-    ) -> None:
-        self.load(keys, tensors, trace_id=trace_id)
-
     def save_buffers(
         self,
         objects: Sequence[KvMetaObjectBuffer],

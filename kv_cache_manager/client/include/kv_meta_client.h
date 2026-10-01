@@ -14,17 +14,7 @@ namespace kv_cache_manager {
 // public client API independent from generated protobuf headers.
 enum class KvMetaStorageType : std::int32_t {
     UNSPECIFIED = 0,
-    HF3FS = 1,
-    MOONCAKE = 2,
     TAIR_MEMPOOL = 3,
-    NFS = 4,
-    VCNS_HF3FS = 5,
-    DUMMY = 6,
-    // Reserved for wire compatibility with the shared storage enum. Event
-    // report locations are external observations, not independently owned
-    // KVMeta objects, and official exact-object clients reject them.
-    EVENT_REPORT_L1P5 = 7,
-    EVENT_REPORT_L2 = 8,
     TAIR_MEMPOOL_SSD = 9,
 };
 
@@ -101,9 +91,8 @@ public:
                                         const std::string &write_session_id,
                                         const std::vector<bool> &success_keys) = 0;
 
-    // Remove and TrimAll do not retry transport failures automatically.
+    // Remove does not retry transport failures automatically.
     virtual ClientErrorCode Remove(const std::string &trace_id, const std::vector<std::string> &keys) = 0;
-    virtual ClientErrorCode TrimAll(const std::string &trace_id, bool metadata_only = false) = 0;
 };
 
 } // namespace kv_cache_manager

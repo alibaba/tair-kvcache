@@ -42,7 +42,7 @@ void ThrowIfRequested(ThrowMode mode) {
 
 KvMetaValueLocation MakeLocation(const std::string &uri, std::uint64_t size) {
     KvMetaValueLocation location;
-    location.type = uri.rfind("pace://", 0) == 0 ? KvMetaStorageType::TAIR_MEMPOOL : KvMetaStorageType::NFS;
+    location.type = uri.rfind("pace://", 0) == 0 ? KvMetaStorageType::TAIR_MEMPOOL : KvMetaStorageType::UNSPECIFIED;
     location.value_size = size;
     location.location_specs.push_back({"value", uri});
     return location;
@@ -133,8 +133,6 @@ public:
         removed_keys = keys;
         return remove_ec;
     }
-
-    ClientErrorCode TrimAll(const std::string &, bool) override { return ER_OK; }
 
     ClientErrorCode get_ec{ER_OK};
     ClientErrorCode start_ec{ER_OK};
@@ -514,9 +512,9 @@ TEST_F(KvMetaObjectClientTest, RejectsUnsupportedMooncakeLocations) {
     const std::string first_uri = "mooncake://moon/first?key=kvmeta/a/1/0123456789abcdefghijklmnopqrstuv&size=5";
     const std::string second_uri = "mooncake://moon/second?key=kvmeta/a/2/0123456789abcdefghijklmnopqrstuv&size=9";
     auto first = MakeLocation(first_uri, sizeof(first_));
-    first.type = KvMetaStorageType::MOONCAKE;
+    first.type = static_cast<KvMetaStorageType>(2);
     auto second = MakeLocation(second_uri, sizeof(second_));
-    second.type = KvMetaStorageType::MOONCAKE;
+    second.type = static_cast<KvMetaStorageType>(2);
     metadata_->get_result.locations = {first, second};
 
     EXPECT_EQ(ER_SERVICE_INTERNAL_ERROR, client_->LoadObjects("trace", keys_, sizes_, buffers_));
@@ -615,22 +613,22 @@ TEST_F(KvMetaObjectClientTest, MalformedLocationSchemaIsInternalErrorNotSizeMism
     expect_internal(std::move(malformed));
 
     malformed = MakeLocation("mooncake://moon/first?size=5", sizeof(first_));
-    malformed.type = KvMetaStorageType::MOONCAKE;
+    malformed.type = static_cast<KvMetaStorageType>(2);
     expect_internal(std::move(malformed));
 
     malformed = MakeLocation("mooncake://moon/first?key=&size=5", sizeof(first_));
-    malformed.type = KvMetaStorageType::MOONCAKE;
+    malformed.type = static_cast<KvMetaStorageType>(2);
     expect_internal(std::move(malformed));
 
     malformed = MakeLocation("mooncake://moon/first?key=arbitrary-nonempty-key&size=5", sizeof(first_));
-    malformed.type = KvMetaStorageType::MOONCAKE;
+    malformed.type = static_cast<KvMetaStorageType>(2);
     expect_internal(std::move(malformed));
 
     malformed = MakeLocation("file://nfs/first?blkid=1&size=5", sizeof(first_));
     expect_internal(std::move(malformed));
 
     malformed = MakeLocation("event_report_l1p5://reporter/first?size=5", sizeof(first_));
-    malformed.type = KvMetaStorageType::EVENT_REPORT_L1P5;
+    malformed.type = static_cast<KvMetaStorageType>(7);
     expect_internal(std::move(malformed));
 
     malformed = MakeLocation("file://nfs/" + std::string(kMaxKvMetaLocationUriBytes, 'x') + "?size=5", sizeof(first_));

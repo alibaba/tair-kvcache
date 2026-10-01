@@ -51,7 +51,7 @@ URI 中的 `size` 是对象实际字节数。服务端和客户端都会校验 b
 3. 对 miss，选择当前可写的 PACE backend，逐对象按真实 size 分配空间。
 4. 每次分配成功后立即以条件写创建对应的 `WRITING` metadata；全部完成后在内存中保存有期限的 write session。
 5. 客户端把 bytes 写入 PACE。
-6. 全部成功后 `PutFinish` 条件地把本 session 的 generation 改为 `SERVING`；任一失败则删除本 session 的全部 metadata，并尽力释放 PACE allocation。
+6. 全部成功后 `PutFinish` 条件地把本 session 的 generation 改为 `SERVING`；任一失败则删除本 session 的全部 metadata，并尽力释放 PACE allocation。metadata 清理遇到暂时错误时会保留内部清理任务重试。
 
 `WRITING` 对 `Get` 不可见。session 到期会走与失败相同的清理。多 key session 是整批成功/失败语义，但不承诺多个 key 在同一时刻线性化可见。
 
@@ -61,8 +61,8 @@ URI 中的 `size` 是对象实际字节数。服务端和客户端都会校验 b
 
 - `PutStart` 不增加 usage，也不预留容量。
 - `PutFinish` 成功把对象从 `WRITING` 改为 `SERVING` 后，增加该对象的真实 size。
-- `Remove`、`Trim` 或 GC 条件删除成功后，减少同样的 size。
-- 物理删除失败不把 metadata 和 usage 加回；cache metadata 已不可见，底层 allocator 负责最终物理容量边界。
+- `Remove` 或 GC 条件删除成功后，减少同样的 size。
+- 物理删除失败不把 metadata 和 usage 加回；cache metadata 已不可见，但会留下需由 PACE 运维观测的孤儿 allocation。
 - Leader 恢复时扫描 KVMeta metadata，删除遗留 `WRITING`，并重新汇总所有 `SERVING` size，覆盖内存计数器。
 
 更新 `SERVING` 状态和 usage 时只使用按 instance 分片的 metadata mutation lock，保证 metadata 与计数器不会交叉更新。`PutStart` 不进入该锁。
@@ -88,7 +88,7 @@ KVMeta Reclaimer 周期处理已注册的 KVMeta group：
 7. metadata 删除后等待现有 `delay_before_delete_ms` grace period，再尽力释放对应 PACE allocation。
 8. 后续轮次继续采样，直到 usage 不高于 target。
 
-条件删除防止 GC 删除已经被新 generation 替换的对象。回收是异步、渐进的；采样不足或 provider 删除失败不会阻塞读写主链路。
+generation 由 allocation 创建时间和完整 PACE URI 共同标识，`WRITING -> SERVING` 不改变它。条件删除因此不会误删已经替换的新 allocation。回收是异步、渐进的；采样不足或 provider 删除失败不会阻塞读写主链路。
 
 ## 恢复与 HA
 
@@ -100,7 +100,7 @@ KVMeta Reclaimer 周期处理已注册的 KVMeta group：
 
 - `kvcm.kv_meta.enabled=true` 才注册服务。
 - KVMeta group 应独立配置，不与普通 KVCache instance 混用。
-- group 必须配置 LRU reclaim policy 和 `[0, 1]` 范围的 `used_percentage`。
+- group 必须配置 LRU reclaim policy 和 `[0, 1)` 范围的 `used_percentage`，为异步回收保留空间。
 - `storage_candidates` 非空且全部是已注册的 PACE backend。
 - RTP wrapper 使用现有环境变量，并把普通 `RECO_INSTANCE_GROUP` / instance id 加 `kve_` 前缀形成 KVMeta identity；该前缀规则属于 RTP client，不是服务端协议要求。
 
@@ -108,9 +108,10 @@ KVMeta Reclaimer 周期处理已注册的 KVMeta group：
 
 - `Get` miss：返回未命中，由调用方重算。
 - PACE allocation 或 I/O 失败：本次 cache write 失败，不影响推理结果。
+- 数据面 SDK 超时：client 会先等待已提交给 PACE 的任务退出，再返回超时并关闭该 data-plane client，防止旧 I/O 在 allocation 释放后继续访问。
 - `PutFinish` transport 失败：提交结果可能未知，不能盲目重试；先 `Get` 对账。
-- `Remove` 是幂等 metadata 删除，但 transport 失败后也不能自动重试删除，因为期间可能出现新 generation。
-- `Trim` 是运维接口；并发写时不提供原子快照语义。
+- `Remove` 是幂等 metadata 删除，但遇到同 key 的 `WRITING` 会返回 `WRITE_IN_PROGRESS`；transport 失败后也不能自动重试删除，因为期间可能出现新 generation。
+- `Trim` 不进入 V1 核心实现，协议层明确返回 `UNSUPPORTED`；按 key 删除使用 `Remove`，容量治理使用自动 GC。
 
 ## 非目标
 

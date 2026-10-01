@@ -29,7 +29,6 @@ public:
                                 const std::string &write_session_id,
                                 const std::vector<bool> &success_keys) override;
     ClientErrorCode Remove(const std::string &trace_id, const std::vector<std::string> &keys) override;
-    ClientErrorCode TrimAll(const std::string &trace_id, bool metadata_only) override;
 
 private:
     enum class TransportRetryPolicy {

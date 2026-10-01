@@ -362,35 +362,22 @@ void KvMetaServiceImpl::Remove(RequestContext *request_context,
     }
     const std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     const ErrorCode ec = kv_meta_manager_->Remove(request_context, request->instance_id(), keys);
+    if (ec == EC_EXIST) {
+        SetDirectError(
+            request_context, status, proto::kv_meta::WRITE_IN_PROGRESS, ErrorMessage("Remove", ec, request_context));
+        return;
+    }
     SetResult(request_context, status, ec, "Remove");
 }
 
 void KvMetaServiceImpl::Trim(RequestContext *request_context,
-                             const proto::kv_meta::TrimRequest *request,
+                             const proto::kv_meta::TrimRequest *,
                              proto::kv_meta::CommonResponse *response) {
     KV_META_API_CALL_GUARD("KvMeta.Trim");
-    if (!kv_meta_manager_) {
-        SetDirectError(request_context, status, proto::kv_meta::SERVICE_NOT_READY, "KVMeta manager is not initialized");
-        return;
-    }
-    bool metadata_only = false;
-    switch (request->strategy()) {
-    case proto::kv_meta::TS_REMOVE_ALL_CACHE:
-        break;
-    case proto::kv_meta::TS_REMOVE_ALL_META:
-        metadata_only = true;
-        break;
-    case proto::kv_meta::TS_TIMESTAMP:
-        SetDirectError(
-            request_context, status, proto::kv_meta::UNSUPPORTED, "Timestamp-based KVMeta trim is not implemented");
-        return;
-    case proto::kv_meta::TS_UNSPECIFIED:
-    default:
-        SetDirectError(request_context, status, proto::kv_meta::INVALID_ARGUMENT, "KVMeta trim strategy is invalid");
-        return;
-    }
-    const ErrorCode ec = kv_meta_manager_->TrimAll(request_context, request->instance_id(), metadata_only);
-    SetResult(request_context, status, ec, "Trim");
+    SetDirectError(request_context,
+                   status,
+                   proto::kv_meta::UNSUPPORTED,
+                   "KVMeta Trim is outside the embedding-cache data path; use Remove or automatic GC");
 }
 
 #undef KV_META_API_CALL_GUARD

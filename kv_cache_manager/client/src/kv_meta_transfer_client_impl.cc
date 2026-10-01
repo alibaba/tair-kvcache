@@ -86,29 +86,41 @@ ClientErrorCode KvMetaTransferClientImpl::Init(const std::string &client_config,
 ClientErrorCode KvMetaTransferClientImpl::LoadObjects(const UriStrVec &uri_str_vec,
                                                       const std::vector<std::uint64_t> &value_sizes,
                                                       const BlockBuffers &object_buffers) {
-    if (!sdk_wrapper_) {
-        return ER_INVALID_SDKWRAPPER_CONFIG;
-    }
     if (const auto ec = ValidateObjects(uri_str_vec, value_sizes, object_buffers); ec != ER_OK) {
         return ec;
     }
     std::lock_guard<std::mutex> lock(io_mutex_);
+    if (!sdk_wrapper_) {
+        return ER_INVALID_SDKWRAPPER_CONFIG;
+    }
     SetAllowedObjectSizes(value_sizes);
-    return sdk_wrapper_->Get(ParseLocations(uri_str_vec), object_buffers);
+    const auto ec = sdk_wrapper_->Get(ParseLocations(uri_str_vec), object_buffers);
+    if (ec == ER_SDK_TIMEOUT) {
+        // SdkWrapper's deadline is advisory: its backend task can still own
+        // the caller's buffer after Get returns. Destroying the private
+        // wrapper joins that task before this API returns and permanently
+        // closes this data-plane client, preventing a later batch from
+        // mutating its size config while the timed-out task is still running.
+        sdk_wrapper_.reset();
+    }
+    return ec;
 }
 
 std::pair<ClientErrorCode, UriStrVec> KvMetaTransferClientImpl::SaveObjects(
     const UriStrVec &uri_str_vec, const std::vector<std::uint64_t> &value_sizes, const BlockBuffers &object_buffers) {
-    if (!sdk_wrapper_) {
-        return {ER_INVALID_SDKWRAPPER_CONFIG, {}};
-    }
     if (const auto ec = ValidateObjects(uri_str_vec, value_sizes, object_buffers); ec != ER_OK) {
         return {ec, {}};
     }
     std::lock_guard<std::mutex> lock(io_mutex_);
+    if (!sdk_wrapper_) {
+        return {ER_INVALID_SDKWRAPPER_CONFIG, {}};
+    }
     SetAllowedObjectSizes(value_sizes);
     auto actual_locations = std::make_shared<std::vector<DataStorageUri>>();
     const auto ec = sdk_wrapper_->Put(ParseLocations(uri_str_vec), object_buffers, actual_locations);
+    if (ec == ER_SDK_TIMEOUT) {
+        sdk_wrapper_.reset();
+    }
     if (ec != ER_OK) {
         return {ec, {}};
     }

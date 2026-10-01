@@ -200,7 +200,7 @@ ClientErrorCode KvMetaClientImpl::Call(Response *response, TransportRetryPolicy 
             // the request before the response was lost. Retrying PutStart can
             // leak the first allocation/session and retrying PutFinish can
             // turn a successful commit into SESSION_NOT_FOUND. Replaying a
-            // Remove/Trim can also delete a new generation created after the
+            // Remove can also delete a new generation created after the
             // first attempt. Only reads and idempotent registration fail over.
             if (transport_retry_policy == TransportRetryPolicy::kUnsafe) {
                 return last_error;
@@ -413,16 +413,6 @@ ClientErrorCode KvMetaClientImpl::Remove(const std::string &trace_id, const std:
     proto::kv_meta::CommonResponse response;
     return Call(&response, TransportRetryPolicy::kUnsafe, [&request](auto &stub, auto *context, auto *output) {
         return stub.Remove(context, request, output);
-    });
-}
-
-ClientErrorCode KvMetaClientImpl::TrimAll(const std::string &trace_id, bool metadata_only) {
-    proto::kv_meta::TrimRequest request;
-    SetCommonRequestFields(request, trace_id, config_.instance_id);
-    request.set_strategy(metadata_only ? proto::kv_meta::TS_REMOVE_ALL_META : proto::kv_meta::TS_REMOVE_ALL_CACHE);
-    proto::kv_meta::CommonResponse response;
-    return Call(&response, TransportRetryPolicy::kUnsafe, [&request](auto &stub, auto *context, auto *output) {
-        return stub.Trim(context, request, output);
     });
 }
 

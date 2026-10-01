@@ -22,6 +22,7 @@
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/kv_meta_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -297,6 +298,49 @@ TEST_F(KvMetaManagerTest, RemoveIsIdempotentAndUpdatesActualBytes) {
     EXPECT_FALSE(values[0].found);
 }
 
+TEST_F(KvMetaManagerTest, RemoveDoesNotFreeAnActiveWrite) {
+    auto start = Start(kDefaultInstance, {"active"}, {23});
+    EXPECT_EQ(EC_EXIST, manager_->Remove(&context_, kDefaultInstance, {"active"}));
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&context_, kDefaultInstance, start.write_session_id, {true}));
+
+    auto [ec, values] = manager_->Get(&context_, kDefaultInstance, {"active"});
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(1u, values.size());
+    EXPECT_TRUE(values[0].found);
+    EXPECT_EQ(23u, Indexer(kDefaultInstance)->GetStorageUsage());
+}
+
+TEST_F(KvMetaManagerTest, GenerationComparisonIncludesCreationTime) {
+    auto start = Start(kDefaultInstance, {"generation"}, {31});
+    const auto internal_key = KvMetaManager::InternalKey("generation");
+    const auto location_id = KvMetaManager::StableLocationId("generation");
+    LocationsPerKey locations;
+    const auto writing_result =
+        Indexer(kDefaultInstance)->GetLocations(&context_, {internal_key}, {{location_id}}, locations);
+    ASSERT_EQ(EC_OK, writing_result.ec);
+    ASSERT_EQ(1u, locations.size());
+    ASSERT_EQ(1u, locations[0].size());
+    ASSERT_TRUE(locations[0][0]);
+    const auto writing_generation = locations[0][0];
+    ASSERT_EQ(CLS_WRITING, writing_generation->status());
+
+    ASSERT_EQ(EC_OK, manager_->FinishWrite(&context_, kDefaultInstance, start.write_session_id, {true}));
+    locations.clear();
+    const auto serving_result =
+        Indexer(kDefaultInstance)->GetLocations(&context_, {internal_key}, {{location_id}}, locations);
+    ASSERT_EQ(EC_OK, serving_result.ec);
+    ASSERT_EQ(1u, locations.size());
+    ASSERT_EQ(1u, locations[0].size());
+    ASSERT_TRUE(locations[0][0]);
+    const auto serving_generation = locations[0][0];
+    EXPECT_EQ(CLS_SERVING, serving_generation->status());
+    EXPECT_TRUE(KvMetaManager::SameGeneration(*writing_generation, *serving_generation));
+
+    auto replacement = std::make_shared<CacheLocation>(*serving_generation);
+    replacement->set_create_time(serving_generation->create_time() + 1);
+    EXPECT_FALSE(KvMetaManager::SameGeneration(*serving_generation, *replacement));
+}
+
 TEST_F(KvMetaManagerTest, CapacityCheckIsSoftAndAllowsOneWriteToCrossTheLimit) {
     constexpr const char *kGroup = "soft-capacity-group";
     constexpr const char *kInstance = "soft-capacity-instance";
@@ -373,19 +417,6 @@ TEST_F(KvMetaManagerTest, ExpiredSessionIsInvisibleAndCleaned) {
     EXPECT_EQ(0u, Indexer(kDefaultInstance)->GetStorageUsage());
 }
 
-TEST_F(KvMetaManagerTest, TrimRemovesAllMetadataAndUsage) {
-    Commit(kDefaultInstance, "trim-a", 13);
-    Commit(kDefaultInstance, "trim-b", 17);
-    ASSERT_EQ(30u, Indexer(kDefaultInstance)->GetStorageUsage());
-    ASSERT_EQ(EC_OK, manager_->TrimAll(&context_, kDefaultInstance, false));
-    EXPECT_EQ(0u, Indexer(kDefaultInstance)->GetStorageUsage());
-
-    auto [ec, values] = manager_->Get(&context_, kDefaultInstance, {"trim-a", "trim-b"});
-    ASSERT_EQ(EC_OK, ec);
-    EXPECT_FALSE(values[0].found);
-    EXPECT_FALSE(values[1].found);
-}
-
 TEST_F(KvMetaManagerTest, RecoveryDropsIncompleteWritesAndRebuildsUsage) {
     Commit(kDefaultInstance, "committed", 31);
     auto incomplete = Start(kDefaultInstance, {"incomplete"}, {47});
@@ -412,6 +443,26 @@ TEST_F(KvMetaManagerTest, RejectsMalformedRequestsWithoutMutation) {
     EXPECT_EQ(EC_OUT_OF_LIMIT, manager_->StartWrite(&context_, kDefaultInstance, {"key"}, {0}, 30).first);
     EXPECT_EQ(EC_BADARGS, manager_->StartWrite(&context_, kDefaultInstance, {"key"}, {1}, 0).first);
     EXPECT_EQ(0u, Indexer(kDefaultInstance)->GetStorageUsage());
+}
+
+TEST_F(KvMetaManagerTest, RejectsAReclaimThresholdWithoutHeadroom) {
+    const auto [group_ec, group] = registry_manager_->GetInstanceGroup(&context_, "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_TRUE(group && group->cache_config() && group->cache_config()->reclaim_strategy());
+
+    auto cache_config = std::make_shared<CacheConfig>();
+    ASSERT_TRUE(cache_config->FromJsonString(group->cache_config()->ToJsonString()));
+    auto strategy = std::make_shared<CacheReclaimStrategy>(*cache_config->reclaim_strategy());
+    TriggerStrategy trigger = strategy->trigger_strategy();
+    trigger.set_used_percentage(1.0);
+    strategy->set_trigger_strategy(trigger);
+    cache_config->set_reclaim_strategy(strategy);
+    InstanceGroup updated(*group);
+    updated.set_cache_config(cache_config);
+    updated.set_version(group->version() + 1);
+    ASSERT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(&context_, updated, group->version()));
+
+    EXPECT_EQ(EC_CONFIG_ERROR, manager_->StartWrite(&context_, kDefaultInstance, {"no-headroom"}, {1}, 30).first);
 }
 
 } // namespace kv_cache_manager

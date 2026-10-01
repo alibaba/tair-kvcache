@@ -467,7 +467,7 @@ class KvMetaObjectClientTest(unittest.TestCase):
         ]
 
         client.save(["embedding", "position"], tensors, trace_id="save-trace")
-        client.load_tensors(["embedding", "position"], tensors, trace_id="load-trace")
+        client.load(["embedding", "position"], tensors, trace_id="load-trace")
 
         save, load = native.calls
         self.assertEqual(
