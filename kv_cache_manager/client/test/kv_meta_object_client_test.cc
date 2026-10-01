@@ -2,6 +2,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <limits>
 #include <memory>
@@ -196,6 +197,9 @@ public:
                                 const BlockBuffers &buffers) override {
         ++load_calls;
         ThrowIfRequested(load_throw);
+        if (load_hook) {
+            load_hook();
+        }
         loaded_uris = uris;
         loaded_sizes = value_sizes;
         loaded_buffer_count = buffers.size();
@@ -225,6 +229,7 @@ public:
     ClientErrorCode save_ec{ER_OK};
     ThrowMode load_throw{ThrowMode::NONE};
     ThrowMode save_throw{ThrowMode::NONE};
+    std::function<void()> load_hook;
     UriStrVec actual_uris;
     int load_calls{0};
     int save_calls{0};
@@ -847,6 +852,49 @@ TEST(KvMetaObjectClientDependencyTest, ConcurrentSavesAreSerializedBeforeStartin
     EXPECT_EQ(ER_SERVICE_NOT_READY, first.get());
     EXPECT_EQ(ER_SERVICE_NOT_READY, second.get());
     EXPECT_EQ(2, control->entered_count);
+}
+
+TEST(KvMetaObjectClientDependencyTest, AQueuedSaveDoesNotStartItsLeaseBehindAnActiveLoad) {
+    using namespace std::chrono_literals;
+    char payload = 0;
+    auto control = std::make_shared<BlockingStartControl>();
+    auto metadata = std::make_unique<FakeKvMetaClient>();
+    metadata->get_result.hit_mask = {true};
+    metadata->get_result.locations = {MakeLocation(PaceUri(1, 1), 1)};
+    metadata->start_ec = ER_SERVICE_NOT_READY;
+    auto transfer = std::make_unique<FakeKvMetaTransferClient>();
+    transfer->load_hook = [control]() {
+        std::unique_lock<std::mutex> lock(control->mutex);
+        control->entered = true;
+        control->condition.notify_all();
+        control->condition.wait(lock, [&]() { return control->released; });
+    };
+    KvMetaObjectClientImpl client(std::move(metadata), std::move(transfer), 1024, 30);
+    const std::vector<std::string> keys{"key"};
+    const std::vector<std::uint64_t> sizes{1};
+    const BlockBuffers buffers{MakeBuffer(&payload, 1)};
+
+    auto load = std::async(std::launch::async, [&]() { return client.LoadObjects("load", keys, sizes, buffers); });
+    bool entered = false;
+    {
+        std::unique_lock<std::mutex> lock(control->mutex);
+        entered = control->condition.wait_for(lock, 2s, [&]() { return control->entered; });
+        if (!entered) {
+            control->released = true;
+            control->condition.notify_all();
+        }
+    }
+    ASSERT_TRUE(entered);
+    auto save = std::async(std::launch::async, [&]() { return client.SaveObjects("save", keys, sizes, buffers); });
+    EXPECT_EQ(std::future_status::timeout, save.wait_for(50ms));
+    {
+        std::lock_guard<std::mutex> lock(control->mutex);
+        control->released = true;
+        control->condition.notify_all();
+    }
+
+    EXPECT_EQ(ER_OK, load.get());
+    EXPECT_EQ(ER_SERVICE_NOT_READY, save.get());
 }
 
 TEST(KvMetaObjectClientLimitTest, AcceptsExactBatchByteLimitAndRejectsTheNextObjectBeforeMetadata) {

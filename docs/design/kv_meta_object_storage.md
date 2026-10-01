@@ -111,7 +111,7 @@ generation 由 allocation 创建时间和完整 PACE URI 共同标识，`WRITING
 - 数据面 SDK 超时：client 会先等待已提交给 PACE 的任务退出，再返回超时并关闭该 data-plane client，防止旧 I/O 在 allocation 释放后继续访问。
 - `PutFinish` transport 失败：提交结果可能未知，不能盲目重试；先 `Get` 对账。
 - `Remove` 是幂等 metadata 删除，但遇到同 key 的 `WRITING` 会返回 `WRITE_IN_PROGRESS`；transport 失败后也不能自动重试删除，因为期间可能出现新 generation。
-- 同一 object client 的并发 `save` 在 `PutStart` 前串行，排队时间不会消耗服务端 write lease；不同 client 仍由服务端 generation 条件写协调。
+- 同一 object client 的 data-plane 操作在 metadata 调用前串行，`save` 的排队时间不会消耗服务端 write lease；不同 client 仍由服务端 generation 条件写协调。
 - `Trim` 仅保留旧 proto 定义，不注册 V1 handler；按 key 删除使用 `Remove`，容量治理使用自动 GC。
 
 ## 非目标
