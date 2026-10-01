@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/common/kv_meta_constants.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/kv_meta_uri.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
@@ -30,15 +31,15 @@ class RequestContext;
 class KvMetaManager {
 public:
     struct Limits {
-        std::size_t max_batch_items = 64;
-        std::size_t max_key_bytes = 512;
-        std::size_t max_instance_id_bytes = 512;
-        std::size_t max_instance_group_bytes = 512;
-        std::size_t max_write_session_id_bytes = 512;
-        std::size_t max_user_data_bytes = 64 * 1024;
-        std::size_t max_active_write_sessions = 4096;
-        std::uint64_t max_value_bytes = 1ULL * 1024 * 1024 * 1024;
-        std::uint64_t max_batch_bytes = 4ULL * 1024 * 1024 * 1024;
+        std::size_t max_batch_items = kKvMetaMaxBatchItems;
+        std::size_t max_key_bytes = kKvMetaMaxKeyBytes;
+        std::size_t max_instance_id_bytes = kKvMetaMaxInstanceIdBytes;
+        std::size_t max_instance_group_bytes = kKvMetaMaxInstanceGroupBytes;
+        std::size_t max_write_session_id_bytes = kKvMetaMaxWriteSessionIdBytes;
+        std::size_t max_user_data_bytes = kKvMetaMaxUserDataBytes;
+        std::size_t max_active_write_sessions = kKvMetaMaxActiveWriteSessions;
+        std::uint64_t max_value_bytes = kKvMetaMaxValueBytes;
+        std::uint64_t max_batch_bytes = kKvMetaMaxBatchBytes;
         std::int64_t max_write_timeout_seconds = kKvMetaMaxWriteTimeoutSeconds;
     };
 

@@ -25,7 +25,6 @@ void KvMetaServiceGRpc::Init() {
     MAKE_KV_META_SERVICE_METRICS_COLLECTOR(PutStart);
     MAKE_KV_META_SERVICE_METRICS_COLLECTOR(PutFinish);
     MAKE_KV_META_SERVICE_METRICS_COLLECTOR(Remove);
-    MAKE_KV_META_SERVICE_METRICS_COLLECTOR(Trim);
 }
 
 grpc::Status KvMetaServiceGRpc::RegisterInstance(grpc::ServerContext *context,
@@ -73,14 +72,6 @@ grpc::Status KvMetaServiceGRpc::Remove(grpc::ServerContext *context,
                                        proto::kv_meta::CommonResponse *response) {
     API_CONTEXT_INIT_GRPC(KvMetaRemove);
     service_impl_->Remove(request_context, request, response);
-    return grpc::Status::OK;
-}
-
-grpc::Status KvMetaServiceGRpc::Trim(grpc::ServerContext *context,
-                                     const proto::kv_meta::TrimRequest *request,
-                                     proto::kv_meta::CommonResponse *response) {
-    API_CONTEXT_INIT_GRPC(KvMetaTrim);
-    service_impl_->Trim(request_context, request, response);
     return grpc::Status::OK;
 }
 

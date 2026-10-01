@@ -36,9 +36,6 @@ public:
     grpc::Status Remove(grpc::ServerContext *context,
                         const proto::kv_meta::RemoveRequest *request,
                         proto::kv_meta::CommonResponse *response) override;
-    grpc::Status Trim(grpc::ServerContext *context,
-                      const proto::kv_meta::TrimRequest *request,
-                      proto::kv_meta::CommonResponse *response) override;
 
 private:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
@@ -52,7 +49,6 @@ private:
     KVCM_DECLARE_METRICS_COLLECTOR_(KvMetaPutStart);
     KVCM_DECLARE_METRICS_COLLECTOR_(KvMetaPutFinish);
     KVCM_DECLARE_METRICS_COLLECTOR_(KvMetaRemove);
-    KVCM_DECLARE_METRICS_COLLECTOR_(KvMetaTrim);
 };
 
 } // namespace kv_cache_manager

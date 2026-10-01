@@ -65,11 +65,11 @@ proto::kv_meta::StorageType ToKvMetaStorageType(DataStorageType type) {
 
 bool FillLocation(const KvMetaManager::ValueLocation &source, proto::kv_meta::ValueLocation *target) {
     if (!target || !IsTairMempoolStorageType(source.type) || source.value_size == 0 || source.specs.size() != 1 ||
-        source.specs.front().first != "value") {
+        source.specs.front().first != kKvMetaValueSpecName) {
         return false;
     }
     std::uint64_t uri_size = 0;
-    if (!IsValidKvMetaLocation(source.specs.front().second, source.type, uri_size) || uri_size != source.value_size) {
+    if (!IsValidKvMetaLocation(source.specs.front().second, uri_size) || uri_size != source.value_size) {
         return false;
     }
     target->Clear();
@@ -368,16 +368,6 @@ void KvMetaServiceImpl::Remove(RequestContext *request_context,
         return;
     }
     SetResult(request_context, status, ec, "Remove");
-}
-
-void KvMetaServiceImpl::Trim(RequestContext *request_context,
-                             const proto::kv_meta::TrimRequest *,
-                             proto::kv_meta::CommonResponse *response) {
-    KV_META_API_CALL_GUARD("KvMeta.Trim");
-    SetDirectError(request_context,
-                   status,
-                   proto::kv_meta::UNSUPPORTED,
-                   "KVMeta Trim is outside the embedding-cache data path; use Remove or automatic GC");
 }
 
 #undef KV_META_API_CALL_GUARD

@@ -4,13 +4,13 @@
 #include <string>
 #include <string_view>
 
+#include "kv_cache_manager/common/kv_meta_constants.h"
 #include "kv_cache_manager/config/instance_info.h"
 
 namespace kv_cache_manager {
 
 inline constexpr std::string_view kKvMetaInternalInstancePrefix = "__kv_meta_v1__";
 inline constexpr std::string_view kKvMetaLocationIdPrefix = "kvmeta:v1:";
-inline constexpr std::string_view kKvMetaValueSpecName = "value";
 inline constexpr std::string_view kKvMetaModelName = "__kv_meta_object__";
 inline constexpr std::string_view kKvMetaDtype = "opaque_bytes";
 inline constexpr std::string_view kKvMetaDeploymentExtra = "kv_meta_v1";

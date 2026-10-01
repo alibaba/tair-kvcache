@@ -239,7 +239,7 @@ TEST_F(KvMetaServiceImplTest, IndependentLeaderGateRejectsRequests) {
     service_->WaitForAllLeaderOnlyRequestsToComplete();
 }
 
-TEST_F(KvMetaServiceImplTest, UnsupportedFieldsAreRejectedWithoutManagerMutation) {
+TEST_F(KvMetaServiceImplTest, UnsupportedGetFieldsAreRejectedWithoutManagerMutation) {
     proto::kv_meta::GetRequest get_request;
     get_request.set_trace_id("get-with-meta");
     get_request.set_instance_id(kInstanceId);
@@ -249,18 +249,6 @@ TEST_F(KvMetaServiceImplTest, UnsupportedFieldsAreRejectedWithoutManagerMutation
     RequestContext get_context(get_request.trace_id());
     service_->Get(&get_context, &get_request, &get_response);
     EXPECT_EQ(proto::kv_meta::UNSUPPORTED, get_response.header().status().code());
-
-    for (const auto strategy :
-         {proto::kv_meta::TS_REMOVE_ALL_CACHE, proto::kv_meta::TS_REMOVE_ALL_META, proto::kv_meta::TS_TIMESTAMP}) {
-        proto::kv_meta::TrimRequest trim_request;
-        trim_request.set_trace_id("unsupported-trim");
-        trim_request.set_instance_id(kInstanceId);
-        trim_request.set_strategy(strategy);
-        proto::kv_meta::CommonResponse trim_response;
-        RequestContext trim_context(trim_request.trace_id());
-        service_->Trim(&trim_context, &trim_request, &trim_response);
-        EXPECT_EQ(proto::kv_meta::UNSUPPORTED, trim_response.header().status().code());
-    }
 }
 
 TEST_F(KvMetaServiceImplTest, OversizedRequestShapesAreRejectedAtTheRpcBoundary) {

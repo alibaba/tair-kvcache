@@ -12,16 +12,6 @@
 namespace kv_cache_manager {
 namespace {
 
-constexpr std::size_t kMaxBatchItems = 64;
-constexpr std::size_t kMaxKeyBytes = 512;
-constexpr std::size_t kMaxInstanceIdBytes = 512;
-constexpr std::size_t kMaxInstanceGroupBytes = 512;
-constexpr std::size_t kMaxWriteSessionIdBytes = 512;
-constexpr std::size_t kMaxUserDataBytes = 64 * 1024;
-constexpr std::uint64_t kMaxValueBytes = 1ULL * 1024 * 1024 * 1024;
-constexpr std::uint64_t kMaxBatchBytes = 4ULL * 1024 * 1024 * 1024;
-constexpr std::int32_t kMaxWriteTimeoutSeconds = 1800;
-
 ClientErrorCode ToClientError(proto::kv_meta::ErrorCode error) {
     switch (error) {
     case proto::kv_meta::OK:
@@ -80,16 +70,13 @@ bool ToPublicStorageType(proto::kv_meta::StorageType source, KvMetaStorageType &
 
 bool ToPublicLocation(const proto::kv_meta::ValueLocation &source, KvMetaValueLocation &target) {
     target = {};
-    if (source.value_size() == 0 || source.value_size() > kMaxValueBytes || source.spec_size() != 1 ||
+    if (source.value_size() == 0 || source.value_size() > kKvMetaMaxValueBytes || source.spec_size() != 1 ||
         source.location_specs_size() != 1 || !ToPublicStorageType(source.type(), target.type)) {
         return false;
     }
     const auto &source_spec = source.location_specs(0);
     std::uint64_t uri_size = 0;
-    const DataStorageType allocation_type = source.type() == proto::kv_meta::ST_TAIRMEMPOOL_SSD
-                                                ? DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD
-                                                : DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
-    if (source_spec.name() != "value" || !IsValidKvMetaLocation(source_spec.uri(), allocation_type, uri_size) ||
+    if (source_spec.name() != kKvMetaValueSpecName || !IsValidKvMetaLocation(source_spec.uri(), uri_size) ||
         uri_size != source.value_size()) {
         target = {};
         return false;
@@ -101,13 +88,13 @@ bool ToPublicLocation(const proto::kv_meta::ValueLocation &source, KvMetaValueLo
 }
 
 bool ValidateKeys(const std::vector<std::string> &keys) {
-    if (keys.empty() || keys.size() > kMaxBatchItems) {
+    if (keys.empty() || keys.size() > kKvMetaMaxBatchItems) {
         return false;
     }
     std::unordered_set<std::string> unique;
     unique.reserve(keys.size());
     for (const auto &key : keys) {
-        if (key.empty() || key.size() > kMaxKeyBytes || !unique.insert(key).second) {
+        if (key.empty() || key.size() > kKvMetaMaxKeyBytes || !unique.insert(key).second) {
             return false;
         }
     }
@@ -123,8 +110,9 @@ void SetCommonRequestFields(Request &request, const std::string &trace_id, const
 } // namespace
 
 ClientErrorCode KvMetaClientImpl::Init(const KvMetaClientConfig &config) {
-    if (config.instance_id.empty() || config.instance_id.size() > kMaxInstanceIdBytes || config.call_timeout_ms == 0 ||
-        config.call_timeout_ms > 600000 || config.addresses.empty() || config.addresses.size() > 64) {
+    if (config.instance_id.empty() || config.instance_id.size() > kKvMetaMaxInstanceIdBytes ||
+        config.call_timeout_ms == 0 || config.call_timeout_ms > 600000 || config.addresses.empty() ||
+        config.addresses.size() > 64) {
         return ER_INVALID_CLIENT_CONFIG;
     }
 
@@ -226,8 +214,8 @@ ClientErrorCode KvMetaClientImpl::Call(Response *response, TransportRetryPolicy 
 std::pair<ClientErrorCode, std::string> KvMetaClientImpl::RegisterInstance(const std::string &trace_id,
                                                                            const std::string &instance_group,
                                                                            const std::string &user_data) {
-    if (instance_group.empty() || instance_group.size() > kMaxInstanceGroupBytes ||
-        user_data.size() > kMaxUserDataBytes) {
+    if (instance_group.empty() || instance_group.size() > kKvMetaMaxInstanceGroupBytes ||
+        user_data.size() > kKvMetaMaxUserDataBytes) {
         return {ER_INVALID_PARAMS, {}};
     }
     proto::kv_meta::RegisterInstanceRequest request;
@@ -318,12 +306,13 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
                              const std::vector<std::uint64_t> &value_sizes,
                              std::int32_t write_timeout_seconds) {
     if (!ValidateKeys(keys) || value_sizes.size() != keys.size() || write_timeout_seconds <= 0 ||
-        write_timeout_seconds > kMaxWriteTimeoutSeconds) {
+        write_timeout_seconds > kKvMetaMaxWriteTimeoutSeconds) {
         return {ER_INVALID_PARAMS, {}};
     }
     std::uint64_t batch_bytes = 0;
     for (const std::uint64_t size : value_sizes) {
-        if (size == 0 || size > kMaxValueBytes || size > kMaxBatchBytes || batch_bytes > kMaxBatchBytes - size) {
+        if (size == 0 || size > kKvMetaMaxValueBytes || size > kKvMetaMaxBatchBytes ||
+            batch_bytes > kKvMetaMaxBatchBytes - size) {
             return {ER_INVALID_PARAMS, {}};
         }
         batch_bytes += size;
@@ -345,7 +334,7 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
         return {ec, {}};
     }
 
-    if (response.write_session_id().size() > kMaxWriteSessionIdBytes || !response.has_key_mask() ||
+    if (response.write_session_id().size() > kKvMetaMaxWriteSessionIdBytes || !response.has_key_mask() ||
         response.key_mask().values_size() != static_cast<int>(keys.size())) {
         return {ER_SERVICE_INTERNAL_ERROR, {}};
     }
@@ -385,8 +374,8 @@ KvMetaClientImpl::StartWrite(const std::string &trace_id,
 ClientErrorCode KvMetaClientImpl::FinishWrite(const std::string &trace_id,
                                               const std::string &write_session_id,
                                               const std::vector<bool> &success_keys) {
-    if (write_session_id.empty() || write_session_id.size() > kMaxWriteSessionIdBytes || success_keys.empty() ||
-        success_keys.size() > kMaxBatchItems) {
+    if (write_session_id.empty() || write_session_id.size() > kKvMetaMaxWriteSessionIdBytes || success_keys.empty() ||
+        success_keys.size() > kKvMetaMaxBatchItems) {
         return ER_INVALID_PARAMS;
     }
     proto::kv_meta::PutFinishRequest request;

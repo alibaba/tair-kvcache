@@ -12,13 +12,6 @@
 namespace kv_cache_manager {
 namespace {
 
-constexpr const char *kKvMetaValueSpecName = "value";
-constexpr std::size_t kMaxBatchItems = 64;
-constexpr std::size_t kMaxKeyBytes = 512;
-constexpr std::uint64_t kMaxServiceObjectBytes = 1ULL * 1024 * 1024 * 1024;
-constexpr std::uint64_t kMaxServiceBatchBytes = 4ULL * 1024 * 1024 * 1024;
-constexpr std::int32_t kMaxWriteTimeoutSeconds = 1800;
-
 bool AddressRangeIsRepresentable(const void *base, std::size_t size) {
     if (base == nullptr) {
         return size == 0;
@@ -36,10 +29,7 @@ bool ValidateStorageUri(KvMetaStorageType type, const std::string &uri_text, std
         return false;
     }
     std::uint64_t size = 0;
-    const auto storage_type = type == KvMetaStorageType::TAIR_MEMPOOL_SSD
-                                  ? DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD
-                                  : DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
-    return IsValidKvMetaLocation(uri_text, storage_type, size) && size == expected_size;
+    return IsValidKvMetaLocation(uri_text, size) && size == expected_size;
 }
 
 bool SameStorageUris(const UriStrVec &expected, const UriStrVec &actual) {
@@ -91,8 +81,8 @@ CreateObjectClient(const std::string &trace_id,
                    const KvMetaObjectClientConfig &config,
                    const SharedMemoryRegistration *shared_memory_registration) {
     if (config.instance_group.empty() || config.transfer_client_config.empty() || config.max_object_bytes == 0 ||
-        config.max_object_bytes > kMaxServiceObjectBytes || config.write_timeout_seconds <= 0 ||
-        config.write_timeout_seconds > kMaxWriteTimeoutSeconds ||
+        config.max_object_bytes > kKvMetaMaxValueBytes || config.write_timeout_seconds <= 0 ||
+        config.write_timeout_seconds > kKvMetaMaxWriteTimeoutSeconds ||
         !(config.transfer_init_params.role_type & RoleType::WORKER) ||
         config.transfer_init_params.self_location_spec_name != kKvMetaValueSpecName) {
         return {ER_INVALID_PARAMS, nullptr};
@@ -177,17 +167,18 @@ ClientErrorCode KvMetaObjectClientImpl::ValidateRequest(const std::vector<std::s
                                                         const std::vector<std::uint64_t> &value_sizes,
                                                         const BlockBuffers &object_buffers,
                                                         std::uint64_t max_object_bytes) {
-    if (max_object_bytes == 0 || max_object_bytes > kMaxServiceObjectBytes || keys.empty() ||
-        keys.size() > kMaxBatchItems || keys.size() != value_sizes.size() || keys.size() != object_buffers.size()) {
+    if (max_object_bytes == 0 || max_object_bytes > kKvMetaMaxValueBytes || keys.empty() ||
+        keys.size() > kKvMetaMaxBatchItems || keys.size() != value_sizes.size() ||
+        keys.size() != object_buffers.size()) {
         return ER_INVALID_PARAMS;
     }
     std::unordered_set<std::string> unique_keys;
     unique_keys.reserve(keys.size());
     std::uint64_t batch_bytes = 0;
     for (std::size_t i = 0; i < keys.size(); ++i) {
-        if (keys[i].empty() || keys[i].size() > kMaxKeyBytes || !unique_keys.insert(keys[i]).second ||
-            value_sizes[i] == 0 || value_sizes[i] > max_object_bytes || value_sizes[i] > kMaxServiceBatchBytes ||
-            batch_bytes > kMaxServiceBatchBytes - value_sizes[i] || object_buffers[i].iovs.empty()) {
+        if (keys[i].empty() || keys[i].size() > kKvMetaMaxKeyBytes || !unique_keys.insert(keys[i]).second ||
+            value_sizes[i] == 0 || value_sizes[i] > max_object_bytes || value_sizes[i] > kKvMetaMaxBatchBytes ||
+            batch_bytes > kKvMetaMaxBatchBytes - value_sizes[i] || object_buffers[i].iovs.empty()) {
             return ER_INVALID_PARAMS;
         }
         batch_bytes += value_sizes[i];
@@ -392,13 +383,13 @@ ClientErrorCode KvMetaObjectClientImpl::LoadObjects(const std::string &trace_id,
 }
 
 ClientErrorCode KvMetaObjectClientImpl::Remove(const std::string &trace_id, const std::vector<std::string> &keys) {
-    if (keys.empty() || keys.size() > kMaxBatchItems) {
+    if (keys.empty() || keys.size() > kKvMetaMaxBatchItems) {
         return ER_INVALID_PARAMS;
     }
     std::unordered_set<std::string> unique_keys;
     unique_keys.reserve(keys.size());
     for (const auto &key : keys) {
-        if (key.empty() || key.size() > kMaxKeyBytes || !unique_keys.insert(key).second) {
+        if (key.empty() || key.size() > kKvMetaMaxKeyBytes || !unique_keys.insert(key).second) {
             return ER_INVALID_PARAMS;
         }
     }
