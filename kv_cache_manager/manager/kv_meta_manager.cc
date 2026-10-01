@@ -120,20 +120,6 @@ bool ReadLogicalSize(const CacheLocation &location, std::uint64_t &out_size) {
     return IsValidKvMetaLocation(text, location.type(), out_size);
 }
 
-bool SameGeneration(const CacheLocation &lhs, const CacheLocation &rhs) {
-    if (lhs.id() != rhs.id() || lhs.type() != rhs.type() || lhs.spec_size() != rhs.spec_size() ||
-        lhs.location_specs().size() != rhs.location_specs().size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < lhs.location_specs().size(); ++i) {
-        if (lhs.location_specs()[i].name() != rhs.location_specs()[i].name() ||
-            lhs.location_specs()[i].uri() != rhs.location_specs()[i].uri()) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool ToValueLocation(const CacheLocation &location, KvMetaManager::ValueLocation &out) {
     std::uint64_t size = 0;
     if (!ReadLogicalSize(location, size)) {
@@ -186,6 +172,7 @@ public:
         std::string internal_instance_id;
         Clock::time_point deadline;
         std::vector<KvMetaManager::SessionItem> items;
+        bool cleanup_only = false;
     };
 
     KvMetaWriteSessionManager(KvMetaManager *owner, std::size_t max_sessions)
@@ -266,12 +253,33 @@ public:
         if (it->second.internal_instance_id != internal_instance_id) {
             return EC_BADARGS;
         }
+        if (it->second.cleanup_only) {
+            return EC_NOENT;
+        }
         if (it->second.items.size() != item_count) {
             return EC_MISMATCH;
         }
         out = std::move(it->second);
         sessions_.erase(it);
         return out.deadline <= Clock::now() ? EC_TIMEOUT : EC_OK;
+    }
+
+    void ScheduleCleanup(const std::string &session_id, Session session) noexcept {
+        try {
+            session.deadline = Clock::now() + std::chrono::seconds(1);
+            session.cleanup_only = true;
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_) {
+                return;
+            }
+            if (!sessions_.emplace(session_id, std::move(session)).second) {
+                KVCM_LOG_ERROR("failed to reschedule KVMeta session cleanup for [%s]", session_id.c_str());
+                return;
+            }
+            condition_.notify_all();
+        } catch (const std::exception &e) {
+            KVCM_LOG_ERROR("failed to schedule KVMeta session cleanup: %s", e.what());
+        } catch (...) { KVCM_LOG_ERROR("failed to schedule KVMeta session cleanup with unknown exception"); }
     }
 
 private:
@@ -306,8 +314,8 @@ private:
                 }
             }
             for (auto &[session_id, session] : expired) {
-                if (owner_) {
-                    owner_->ExpireSession(session_id, session.internal_instance_id, session.items);
+                if (owner_ && !owner_->ExpireSession(session_id, session.internal_instance_id, session.items)) {
+                    ScheduleCleanup(session_id, std::move(session));
                 }
             }
         }
@@ -413,7 +421,7 @@ private:
                             break;
                         }
                         if (group) {
-                            ReclaimGroup(group->name());
+                            ReclaimGroup(group);
                         }
                     }
                 }
@@ -426,19 +434,18 @@ private:
         }
     }
 
-    void ReclaimGroup(const std::string &group_name) {
+    void ReclaimGroup(const std::shared_ptr<const InstanceGroup> &group) {
         RequestContext context("kv_meta_reclaim");
-        const auto [group_ec, group] = owner_->registry_manager_->GetInstanceGroup(&context, group_name);
-        if (group_ec != EC_OK || !group || !group->cache_config() || !group->cache_config()->reclaim_strategy()) {
+        if (!group || !group->cache_config() || !group->cache_config()->reclaim_strategy()) {
             return;
         }
         const auto strategy = group->cache_config()->reclaim_strategy();
         const double threshold = strategy->trigger_strategy().used_percentage();
         if (strategy->reclaim_policy() != ReclaimPolicy::POLICY_LRU || !std::isfinite(threshold) || threshold < 0.0 ||
-            threshold > 1.0 || strategy->delay_before_delete_ms() < 0) {
+            threshold >= 1.0 || strategy->delay_before_delete_ms() < 0) {
             return;
         }
-        const auto [instances_ec, instances] = owner_->registry_manager_->ListInstanceInfo(&context, group_name);
+        const auto [instances_ec, instances] = owner_->registry_manager_->ListInstanceInfo(&context, group->name());
         if (instances_ec != EC_OK || instances.empty()) {
             return;
         }
@@ -653,6 +660,20 @@ std::string KvMetaManager::StableLocationId(const std::string &key) {
     return std::string(kKvMetaLocationIdPrefix) + HexEncode(key);
 }
 
+bool KvMetaManager::SameGeneration(const CacheLocation &lhs, const CacheLocation &rhs) {
+    if (lhs.id() != rhs.id() || lhs.type() != rhs.type() || lhs.spec_size() != rhs.spec_size() ||
+        lhs.create_time() != rhs.create_time() || lhs.location_specs().size() != rhs.location_specs().size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < lhs.location_specs().size(); ++i) {
+        if (lhs.location_specs()[i].name() != rhs.location_specs()[i].name() ||
+            lhs.location_specs()[i].uri() != rhs.location_specs()[i].uri()) {
+            return false;
+        }
+    }
+    return true;
+}
+
 ErrorCode KvMetaManager::ValidateInstanceId(RequestContext *request_context, const std::string &instance_id) const {
     if (!request_context || instance_id.empty() || instance_id.size() > limits_.max_instance_id_bytes) {
         AddError(request_context, "KVMeta instance_id is empty or too long");
@@ -705,8 +726,8 @@ ErrorCode KvMetaManager::ValidateCacheConfiguration(RequestContext *request_cont
     const auto strategy = cache_config ? cache_config->reclaim_strategy() : nullptr;
     const double threshold = strategy ? strategy->trigger_strategy().used_percentage() : -1.0;
     if (!strategy || strategy->reclaim_policy() != ReclaimPolicy::POLICY_LRU || !std::isfinite(threshold) ||
-        threshold < 0.0 || threshold > 1.0 || strategy->delay_before_delete_ms() < 0) {
-        AddError(request_context, "KVMeta requires a valid LRU reclaim percentage");
+        threshold < 0.0 || threshold >= 1.0 || strategy->delay_before_delete_ms() < 0) {
+        AddError(request_context, "KVMeta requires an LRU reclaim percentage in [0, 1)");
         return EC_CONFIG_ERROR;
     }
     if (!cache_config->migration_strategies().empty()) {
@@ -758,8 +779,7 @@ ErrorCode KvMetaManager::ValidateLocation(RequestContext *request_context,
     if (location.id() != location_id || !owned_key ||
         (location.status() != CLS_WRITING && location.status() != CLS_SERVING) ||
         !IsTairMempoolStorageType(location.type()) || !ReadLogicalSize(location, value_size) ||
-        value_size > limits_.max_value_bytes ||
-        location.location_specs().front().uri().size() > limits_.max_location_uri_bytes) {
+        value_size > limits_.max_value_bytes) {
         AddError(request_context, "KVMeta location is malformed");
         return EC_CORRUPTION;
     }
@@ -807,7 +827,7 @@ std::pair<ErrorCode, std::string> KvMetaManager::RegisterInstance(RequestContext
                 return !instance || !IsKvMetaInstance(*instance);
             })) {
             AddError(request_context, "KVMeta requires a dedicated instance group");
-            return {EC_BADARGS, {}};
+            return {EC_CONFIG_ERROR, {}};
         }
     }
     auto result = cache_manager_->RegisterInstance(request_context,
@@ -1196,7 +1216,6 @@ KvMetaManager::StartWrite(RequestContext *request_context,
         location->set_spec_size(1);
         location->set_create_time(TimestampUtil::GetCurrentTimeUs());
         location->push_location_spec(LocationSpec(std::string(kKvMetaValueSpecName), created[0].second.ToUriString()));
-        location->set_validated_total_size(value_sizes[request_index]);
         std::uint64_t actual_size = 0;
         if (ValidateLocation(request_context,
                              existing[request_index].internal_key,
@@ -1272,13 +1291,18 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
         write_session_manager_->Take(write_session_id, internal_instance_id, success_keys.size(), session);
     if (take_ec != EC_OK) {
         if (take_ec == EC_TIMEOUT) {
-            DeleteItems(request_context, internal_instance_id, session.items, true, false);
+            if (DeleteItems(request_context, internal_instance_id, session.items, true, false) != EC_OK) {
+                write_session_manager_->ScheduleCleanup(write_session_id, std::move(session));
+            }
         }
         return take_ec;
     }
     if (std::any_of(success_keys.begin(), success_keys.end(), [](bool success) { return !success; })) {
-        DeleteItems(request_context, internal_instance_id, session.items, true, false);
-        return EC_OK;
+        const ErrorCode cleanup_ec = DeleteItems(request_context, internal_instance_id, session.items, true, false);
+        if (cleanup_ec != EC_OK) {
+            write_session_manager_->ScheduleCleanup(write_session_id, std::move(session));
+        }
+        return cleanup_ec;
     }
 
     auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(internal_instance_id);
@@ -1321,7 +1345,6 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
             }
             auto serving = std::make_shared<CacheLocation>(*locations[0]);
             serving->set_status(CLS_SERVING);
-            serving->set_create_time(TimestampUtil::GetCurrentTimeUs());
             locations[0] = std::move(serving);
             accepted[key_index] = true;
             return {MA_OK, {EC_OK}};
@@ -1361,7 +1384,10 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
         }
     }
     mutation_lock.unlock();
-    DeleteItems(request_context, internal_instance_id, cleanup, true, false);
+    if (DeleteItems(request_context, internal_instance_id, cleanup, true, false) != EC_OK) {
+        session.items = std::move(cleanup);
+        write_session_manager_->ScheduleCleanup(write_session_id, std::move(session));
+    }
     return overall == EC_OK ? EC_ERROR : overall;
 }
 
@@ -1396,83 +1422,25 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
             ec != EC_OK) {
             return ec;
         }
+        if (exact[i].location->status() == CLS_WRITING) {
+            AddError(request_context, "KVMeta object is still being written");
+            return EC_EXIST;
+        }
         items.push_back({exact[i].internal_key, exact[i].location_id, exact[i].location, size});
     }
     return DeleteItems(request_context, internal_instance_id, items, true, false);
 }
 
-ErrorCode KvMetaManager::TrimAll(RequestContext *request_context, const std::string &instance_id, bool metadata_only) {
-    if (const ErrorCode ec = CheckReady(request_context); ec != EC_OK) {
-        return ec;
-    }
-    if (const auto [ec, _] = GetValidatedInstanceInfo(request_context, instance_id); ec != EC_OK) {
-        return ec;
-    }
-    const std::string internal_instance_id = InternalInstanceId(instance_id);
-    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(internal_instance_id);
-    if (!indexer) {
-        return EC_INSTANCE_NOT_EXIST;
-    }
-
-    for (;;) {
-        if (maintenance_cancelled_.load(std::memory_order_acquire)) {
-            return EC_SERVICE_NOT_LEADER;
-        }
-        std::string cursor = SCAN_BASE_CURSOR;
-        std::vector<SessionItem> items;
-        do {
-            if (maintenance_cancelled_.load(std::memory_order_acquire)) {
-                return EC_SERVICE_NOT_LEADER;
-            }
-            std::string next_cursor;
-            KeyVector scan_keys;
-            const ErrorCode scan_ec = indexer->Scan(request_context, cursor, kScanBatchSize, next_cursor, scan_keys);
-            if (scan_ec != EC_OK || next_cursor.empty()) {
-                return scan_ec == EC_OK ? EC_CORRUPTION : scan_ec;
-            }
-            if (!scan_keys.empty()) {
-                CacheLocationMapVector maps;
-                const auto result = indexer->GetLocationMapsForMaintenance(request_context, scan_keys, maps);
-                if (result.error_codes.size() != scan_keys.size() || maps.size() != scan_keys.size()) {
-                    return EC_MISMATCH;
-                }
-                for (std::size_t i = 0; i < scan_keys.size(); ++i) {
-                    if (result.error_codes[i] != EC_OK) {
-                        return result.error_codes[i];
-                    }
-                    for (const auto &[location_id, location] : maps[i]) {
-                        std::uint64_t size = 0;
-                        if (!location ||
-                            ValidateLocation(request_context, scan_keys[i], location_id, *location, size) != EC_OK) {
-                            return EC_CORRUPTION;
-                        }
-                        items.push_back({scan_keys[i], location_id, location, size});
-                    }
-                }
-            }
-            cursor = std::move(next_cursor);
-        } while (cursor != SCAN_BASE_CURSOR && items.size() < kScanBatchSize);
-
-        if (items.empty()) {
-            indexer->PersistMetaData();
-            return EC_OK;
-        }
-        const ErrorCode ec = DeleteItems(request_context, internal_instance_id, items, !metadata_only, true);
-        if (ec != EC_OK) {
-            return ec;
-        }
-    }
-}
-
-void KvMetaManager::ExpireSession(const std::string &session_id,
+bool KvMetaManager::ExpireSession(const std::string &session_id,
                                   const std::string &internal_instance_id,
                                   const std::vector<SessionItem> &items) noexcept {
     try {
         RequestContext context("kv_meta_session_expire_" + session_id);
-        DeleteItems(&context, internal_instance_id, items, true, true);
+        return DeleteItems(&context, internal_instance_id, items, true, true) == EC_OK;
     } catch (const std::exception &e) { KVCM_LOG_WARN("KVMeta session expiry failed: %s", e.what()); } catch (...) {
         KVCM_LOG_WARN("KVMeta session expiry failed with unknown exception");
     }
+    return false;
 }
 
 ErrorCode KvMetaManager::DoRecover() {
@@ -1500,6 +1468,17 @@ ErrorCode KvMetaManager::DoRecover() {
         const auto [instances_ec, instances] = registry_manager_->ListInstanceInfo(&context, group->name());
         if (instances_ec != EC_OK) {
             overall = FirstHardError(overall, instances_ec);
+            continue;
+        }
+        const bool has_kv_meta = std::any_of(instances.begin(), instances.end(), [](const auto &instance) {
+            return instance && IsKvMetaInstance(*instance);
+        });
+        const bool has_other = std::any_of(instances.begin(), instances.end(), [](const auto &instance) {
+            return !instance || !IsKvMetaInstance(*instance);
+        });
+        if (has_kv_meta && has_other) {
+            AddError(&context, "KVMeta instance group contains an ordinary KV-cache instance");
+            overall = FirstHardError(overall, EC_CONFIG_ERROR);
             continue;
         }
         for (const auto &instance : instances) {

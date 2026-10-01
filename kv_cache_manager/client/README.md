@@ -38,6 +38,7 @@ with KvMetaObjectClient(config) as client:
 
 Python package、native extension 与 `kv_cache_manager_client.so` 必须来自同一次构建；client 会校验
 `KV_META_OBJECT_API_VERSION`。mutation 遇到 transport error 时，异常的 `unknown_outcome=True`。
+PACE I/O 超时后 native data-plane client 会先 drain 在飞任务再失效；应销毁并重新创建高层 client。
 
 需要自行编排控制面和数据面时，才直接使用下面的低层 `KvMetaClient`：
 

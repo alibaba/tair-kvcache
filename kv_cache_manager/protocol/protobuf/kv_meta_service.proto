@@ -68,8 +68,7 @@ message ValueLocation {
     StorageType type = 1;
     int32 spec_size = 2;
     repeated LocationSpec location_specs = 3;
-    // 业务 value 的有效字节数。URI 中的 size 是存储分配大小，两者当前相等；
-    // 保留独立字段，便于后续按存储粒度对齐分配而不改变反序列化长度。
+    // 业务 value 的有效字节数；V1 要求与 PACE URI 中的 size 严格相等。
     uint64 value_size = 4;
 }
 
@@ -227,10 +226,9 @@ message PutFinishRequest {
     string trace_id = 1;
     string instance_id = 2;
     string write_session_id = 3;
-    repeated ValueLocation locations = 4; // 有可能location是在客户端分配的，需要传回来
+    // V1 location 由服务端分配并保存在 write session 中；该历史字段不参与提交判断。
+    repeated ValueLocation locations = 4;
     // 与 PutStartResponse.locations 一一对应；true 表示对应 value 已写成功。
-    // 服务端分配的 location 以 write session 中保存的值为准，locations 仅用于兼容
-    // 将来可能出现的客户端分配模式。
     KeyMask success_keys = 5;
 }
 

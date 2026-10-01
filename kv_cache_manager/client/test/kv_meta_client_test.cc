@@ -44,7 +44,6 @@ public:
     void set_put_start_transport_error(bool value) { put_start_transport_error_.store(value); }
     void set_put_finish_transport_error(bool value) { put_finish_transport_error_.store(value); }
     void set_remove_transport_error(bool value) { remove_transport_error_.store(value); }
-    void set_trim_transport_error(bool value) { trim_transport_error_.store(value); }
     void set_get_delay(std::chrono::milliseconds value) { get_delay_ms_.store(value.count()); }
     void set_put_finish_status(proto::kv_meta::ErrorCode value) { put_finish_status_.store(static_cast<int>(value)); }
 
@@ -188,17 +187,6 @@ public:
         return grpc::Status::OK;
     }
 
-    grpc::Status Trim(grpc::ServerContext *,
-                      const proto::kv_meta::TrimRequest *,
-                      proto::kv_meta::CommonResponse *response) override {
-        ++trim_calls;
-        if (trim_transport_error_.load()) {
-            return grpc::Status(grpc::StatusCode::UNAVAILABLE, "injected ambiguous transport error");
-        }
-        SetReadyStatus(response);
-        return grpc::Status::OK;
-    }
-
     std::vector<std::uint64_t> StartSizes() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return last_start_sizes;
@@ -214,7 +202,6 @@ public:
     std::atomic<int> put_start_calls{0};
     std::atomic<int> put_finish_calls{0};
     std::atomic<int> remove_calls{0};
-    std::atomic<int> trim_calls{0};
     std::string last_instance_id;
 
 private:
@@ -296,7 +283,6 @@ private:
     std::atomic<bool> put_start_transport_error_{false};
     std::atomic<bool> put_finish_transport_error_{false};
     std::atomic<bool> remove_transport_error_{false};
-    std::atomic<bool> trim_transport_error_{false};
     std::atomic<std::int64_t> get_delay_ms_{0};
     std::atomic<int> put_finish_status_{static_cast<int>(proto::kv_meta::OK)};
     mutable std::mutex mutex_;
@@ -364,7 +350,6 @@ TEST(KvMetaClientTest, PreservesPerValueSizesAndAlignedResults) {
     EXPECT_EQ(0, get.locations[1].value_size);
     EXPECT_EQ(33, get.locations[2].value_size);
     EXPECT_EQ(ER_OK, client->Remove("trace-remove", {"a"}));
-    EXPECT_EQ(ER_OK, client->TrimAll("trace-trim"));
 }
 
 TEST(KvMetaClientTest, FailsOverAndRejectsAMismatchedAllocation) {
@@ -475,7 +460,6 @@ TEST(KvMetaClientTest, AmbiguousWriteTransportErrorsAreNotRetried) {
     ambiguous.set_put_start_transport_error(true);
     ambiguous.set_put_finish_transport_error(true);
     ambiguous.set_remove_transport_error(true);
-    ambiguous.set_trim_transport_error(true);
     FakeKvMetaService fallback;
     RunningServer ambiguous_server(&ambiguous);
     RunningServer fallback_server(&fallback);
@@ -496,10 +480,6 @@ TEST(KvMetaClientTest, AmbiguousWriteTransportErrorsAreNotRetried) {
     EXPECT_EQ(ER_INVALID_GRPCSTATUS, client->Remove("trace-remove", {"a"}));
     EXPECT_EQ(1, ambiguous.remove_calls.load());
     EXPECT_EQ(0, fallback.remove_calls.load());
-
-    EXPECT_EQ(ER_INVALID_GRPCSTATUS, client->TrimAll("trace-trim"));
-    EXPECT_EQ(1, ambiguous.trim_calls.load());
-    EXPECT_EQ(0, fallback.trim_calls.load());
 }
 
 TEST(KvMetaClientTest, ExplicitStandbyResponsesStillFailOverForWrites) {
@@ -530,12 +510,6 @@ TEST(KvMetaClientTest, ExplicitStandbyResponsesStillFailOverForWrites) {
     EXPECT_EQ(ER_OK, remove_client->Remove("trace-remove", {"a"}));
     EXPECT_EQ(1, standby.remove_calls.load());
     EXPECT_EQ(1, leader.remove_calls.load());
-
-    auto trim_client = KvMetaClient::Create(config);
-    ASSERT_TRUE(trim_client);
-    EXPECT_EQ(ER_OK, trim_client->TrimAll("trace-trim"));
-    EXPECT_EQ(1, standby.trim_calls.load());
-    EXPECT_EQ(1, leader.trim_calls.load());
 }
 
 TEST(KvMetaClientTest, RejectsMalformedCompactLocations) {

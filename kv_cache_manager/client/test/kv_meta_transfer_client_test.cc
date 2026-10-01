@@ -1,7 +1,9 @@
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "kv_cache_manager/client/src/internal/config/client_config.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
@@ -84,6 +86,7 @@ public:
     SdkType Type() override { return SdkType::TAIR_MEMPOOL; }
 
     ClientErrorCode Get(const std::vector<DataStorageUri> &uris, const BlockBuffers &) override {
+        std::this_thread::sleep_for(delay);
         loaded = ToStrings(uris);
         seen_sizes = config_->spec_byte_sizes_per_block();
         return load_result;
@@ -92,6 +95,7 @@ public:
     ClientErrorCode Put(const std::vector<DataStorageUri> &uris,
                         const BlockBuffers &,
                         std::shared_ptr<std::vector<DataStorageUri>> actual_uris) override {
+        std::this_thread::sleep_for(delay);
         saved = ToStrings(uris);
         seen_sizes = config_->spec_byte_sizes_per_block();
         if (save_result == ER_OK) {
@@ -102,6 +106,7 @@ public:
 
     ClientErrorCode load_result = ER_OK;
     ClientErrorCode save_result = ER_OK;
+    std::chrono::milliseconds delay{0};
     UriStrVec loaded;
     UriStrVec saved;
     std::map<std::string, std::int64_t> seen_sizes;
@@ -135,8 +140,10 @@ public:
     std::shared_ptr<RecordingSdk> sdk;
 };
 
-std::unique_ptr<KvMetaTransferClientImpl>
-MakeTransferClient(RecordingSdkFactory &factory, RecordingSdk *&recording, std::uint64_t max_object_bytes = 32) {
+std::unique_ptr<KvMetaTransferClientImpl> MakeTransferClient(RecordingSdkFactory &factory,
+                                                             RecordingSdk *&recording,
+                                                             std::uint64_t max_object_bytes = 32,
+                                                             int timeout_ms = 1000) {
     auto config = std::make_unique<ClientConfig>();
     EXPECT_TRUE(config->FromJsonString(R"({
         "instance_group": "group",
@@ -150,6 +157,10 @@ MakeTransferClient(RecordingSdkFactory &factory, RecordingSdk *&recording, std::
         },
         "location_spec_infos": {"value": 1}
     })"));
+    SdkTimeoutConfig timeout;
+    timeout.set_get_timeout_ms(timeout_ms);
+    timeout.set_put_timeout_ms(timeout_ms);
+    config->sdk_wrapper_config()->set_timeout_config(timeout);
     InitParams params;
     params.self_location_spec_name = "value";
     params.storage_configs = R"([{
@@ -220,6 +231,25 @@ TEST(KvMetaTransferClientTest, PropagatesSdkErrors) {
 
     EXPECT_EQ(ER_SDKREAD_ERROR, client->LoadObjects(uris, {sizeof(value)}, buffers));
     EXPECT_EQ(ER_SDKWRITE_ERROR, client->SaveObjects(uris, {sizeof(value)}, buffers).first);
+}
+
+TEST(KvMetaTransferClientTest, TimeoutDrainsBackendAndClosesDataPlane) {
+    RecordingSdkFactory factory;
+    RecordingSdk *recording = nullptr;
+    auto client = MakeTransferClient(factory, recording, 32, 10);
+    ASSERT_NE(nullptr, recording);
+    recording->delay = std::chrono::milliseconds(50);
+
+    char value[5]{};
+    const UriStrVec uris{"pace://pace/1?media_type=0&node_id=1&range_id=0&size=5"};
+    BlockBuffer buffer;
+    buffer.iovs.push_back({MemoryType::CPU, value, sizeof(value), false});
+    const BlockBuffers buffers{buffer};
+
+    const auto begin = std::chrono::steady_clock::now();
+    EXPECT_EQ(ER_SDK_TIMEOUT, client->SaveObjects(uris, {sizeof(value)}, buffers).first);
+    EXPECT_GE(std::chrono::steady_clock::now() - begin, std::chrono::milliseconds(40));
+    EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, client->LoadObjects(uris, {sizeof(value)}, buffers));
 }
 
 } // namespace
