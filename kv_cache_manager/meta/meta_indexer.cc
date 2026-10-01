@@ -2070,6 +2070,18 @@ ErrorCode MetaIndexer::SampleReclaimCandidates(RequestContext *request_context,
     return ec;
 }
 
+ErrorCode MetaIndexer::SamplePersistentReclaimCandidates(RequestContext *request_context,
+                                                         const int64_t count,
+                                                         ReclaimCandidateVector &out_candidates,
+                                                         bool require_read_success) const noexcept {
+    out_candidates.clear();
+    if (count > 0) {
+        out_candidates.reserve(static_cast<size_t>(count));
+    }
+    return backend_manager_->SamplePersistentReclaimCandidates(
+        request_context, count, out_candidates, require_read_success);
+}
+
 size_t MetaIndexer::GetKeyCount() const noexcept { return key_count_.load(); }
 
 size_t MetaIndexer::GetMaxKeyCount() const noexcept { return max_key_count_; }

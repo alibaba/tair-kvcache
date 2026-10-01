@@ -504,8 +504,8 @@ private:
         std::vector<Candidate> candidates;
         for (const auto &[instance, indexer] : indexed_instances) {
             ReclaimCandidateVector sampled;
-            if (indexer->SampleReclaimCandidates(&context, static_cast<std::int64_t>(sampling_size), sampled, true) !=
-                EC_OK) {
+            if (indexer->SamplePersistentReclaimCandidates(
+                    &context, static_cast<std::int64_t>(sampling_size), sampled, true) != EC_OK) {
                 continue;
             }
             for (const auto &candidate : sampled) {
