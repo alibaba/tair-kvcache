@@ -7,7 +7,7 @@ KVMeta 为 embedding 等变长对象提供独立的 exact-key 元数据协议。
 ## 前提
 
 - 服务端设置 `kvcm.kv_meta.enabled=true`。
-- Instance Group 配置 LRU reclaim policy、合法的 `used_percentage` 和 PACE storage candidate。
+- Instance Group 配置 LRU reclaim policy、合法的 `used_percentage` 和单一 PACE storage tier；非 fallback 的 `CPS_ALWAYS_*` 必须匹配该 tier。
 - 同一 `(instance_id, key)` 始终表示同一种内容和 size；key 应包含 tenant、模型版本、输入摘要和 tensor schema 版本。
 - KVMeta 是 cache。miss、容量不足和 I/O 失败都应回退到重算。
 - 每次同时检查 gRPC status 和 `response.header.status.code`。

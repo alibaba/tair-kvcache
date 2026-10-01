@@ -101,7 +101,7 @@ generation 由 allocation 创建时间和完整 PACE URI 共同标识，`WRITING
 - `kvcm.kv_meta.enabled=true` 才注册服务。
 - KVMeta group 应独立配置，不与普通 KVCache instance 混用。
 - group 必须配置 LRU reclaim policy 和 `[0, 1)` 范围的 `used_percentage`，为异步回收保留空间。
-- `storage_candidates` 非空且全部是同一 PACE storage type；V1 的一个 group 只管理一个 DRAM 或 SSD tier，GC target 取 group capacity 与该 tier quota 的较小值。
+- `storage_candidates` 非空且全部是同一 PACE storage type；非 fallback 的 `CPS_ALWAYS_*` 必须匹配该 DRAM 或 SSD tier。V1 的一个 group 只管理一个 tier，GC target 取 group capacity 与该 tier quota 的较小值。
 - RTP wrapper 使用现有环境变量，并把普通 `RECO_INSTANCE_GROUP` / instance id 加 `kve_` 前缀形成 KVMeta identity；该前缀规则属于 RTP client，不是服务端协议要求。
 
 ## 失败语义
