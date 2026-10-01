@@ -229,6 +229,14 @@ class KvCacheManagerClient:
             )
             return False
 
+        try:
+            self._check_response(
+                "/api/getClusterInfo", resp, data, check_business_status=False
+            )
+        except KvCacheManagerProtocolError as e:
+            logger.warning("Invalid leader discovery response from %s: %s", url, e)
+            return False
+
         if self._get_status_code(data) != "OK":
             msg = data.get("header", {}).get("status", {}).get("message", "unknown")
             logger.warning("Leader discovery from %s returned error: %s", url, msg)
@@ -236,7 +244,7 @@ class KvCacheManagerClient:
 
         leader_ep = data.get("leader_endpoint")
         if (
-            not leader_ep
+            not isinstance(leader_ep, dict)
             or not leader_ep.get("host")
             or not leader_ep.get("meta_http_port")
         ):

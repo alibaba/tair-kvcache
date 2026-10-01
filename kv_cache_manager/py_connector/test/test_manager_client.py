@@ -509,6 +509,65 @@ class TestLeaderDiscoveryInit(unittest.TestCase):
             client.close()
 
 
+class TestLeaderDiscoveryResponses(unittest.TestCase):
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_malformed_response_preserves_route_and_allows_recovery(self, mock_post):
+        mock_post.return_value = _make_mock_response(
+            _cluster_info_response("10.0.0.99", 9090)
+        )
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080",
+            auto_discover_leader=True,
+            discovery_refresh_interval_seconds=60,
+        )
+        self.addCleanup(client.close)
+
+        for payload in (
+            None,
+            [],
+            "unavailable",
+            {},
+            {"header": None},
+            {"header": []},
+            {"header": {"status": None}},
+            {"header": {"status": "OK"}},
+            {"header": {"status": {}}},
+            _ok_response_json({"leader_endpoint": "10.0.0.50:7070"}),
+            _ok_response_json({"leader_endpoint": ["10.0.0.50", 7070]}),
+        ):
+            with self.subTest(payload=payload):
+                mock_post.return_value = _make_mock_response(payload)
+                self.assertFalse(client._refresh_manager_route())
+                self.assertEqual(client.base_url, "http://10.0.0.99:9090")
+
+        mock_post.return_value = _make_mock_response(
+            _cluster_info_response("10.0.0.50", 7070)
+        )
+        self.assertTrue(client._refresh_manager_route())
+        self.assertEqual(client.base_url, "http://10.0.0.50:7070")
+
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_malformed_discovery_does_not_mask_not_leader_status(self, mock_post):
+        mock_post.return_value = _make_mock_response(_cluster_info_response())
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080",
+            auto_discover_leader=True,
+            discovery_refresh_interval_seconds=60,
+            leader_retry_base_interval_seconds=0,
+        )
+        self.addCleanup(client.close)
+        client.session.post = MagicMock(
+            return_value=_make_mock_response(_not_leader_response())
+        )
+        mock_post.return_value = _make_mock_response({"header": None})
+
+        result = client.register_instance({"trace_id": "test"}, check_response=False)
+
+        self.assertEqual(result["header"]["status"]["code"], "SERVER_NOT_LEADER")
+        self.assertEqual(client.base_url, "http://10.0.0.1:8080")
+        client.session.post.assert_called_once()
+
+
 class TestDiscoveryAlwaysUsesSeedUrl(unittest.TestCase):
     """Tests that discovery always queries _discovery_url, never the current base_url."""
 
