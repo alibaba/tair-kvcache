@@ -13,10 +13,85 @@
 
 namespace kv_cache_manager {
 
+ReplicationResources &ReplicationResources::Global() {
+    static ReplicationResources resources;
+    return resources;
+}
+
+bool ReplicationResources::TryRetain(size_t bytes, size_t limit) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (bytes > limit || used_bytes_ > limit - bytes) return false;
+    used_bytes_ += bytes;
+    return true;
+}
+
+void ReplicationResources::Release(size_t bytes) {
+    std::lock_guard<std::mutex> lock(mu_);
+    used_bytes_ -= bytes;
+    cv_.notify_all();
+}
+
+bool ReplicationResources::Acquire(const std::string &instance, const std::string &node,
+    size_t bytes, size_t limit, uint64_t transfer_bytes, uint64_t rate, Clock::time_point deadline,
+    const std::atomic<bool> &stopped) {
+    if (bytes > limit) return false;
+    std::unique_lock<std::mutex> lock(mu_);
+    Waiter waiter{instance};
+    waiters_.push_back(&waiter);
+    auto remove = [&] {
+        waiters_.erase(std::find(waiters_.begin(), waiters_.end(), &waiter));
+        cv_.notify_all();
+    };
+    while (Clock::now() < deadline) {
+        // Preserve FIFO within an instance and rotate when another instance waits.
+        auto selected = std::find_if(waiters_.begin(), waiters_.end(), [&](const auto *w) {
+            return w->instance != last_instance_;
+        });
+        if (selected == waiters_.end()) selected = waiters_.begin();
+        const auto now = Clock::now();
+        if (*selected == &waiter && used_bytes_ <= limit - bytes &&
+            (rate == 0 || next_transfer_[node] <= now)) {
+            used_bytes_ += bytes;
+            last_instance_ = instance;
+            if (rate > 0) {
+                // One transfer burst, then reserve its wire time. Bound arithmetic
+                // before conversion; an oversized transfer expires, never wraps.
+                const long double seconds = static_cast<long double>(transfer_bytes) / rate;
+                if (seconds > 86400) { used_bytes_ -= bytes; remove(); return false; }
+                next_transfer_[node] = now + std::chrono::microseconds(static_cast<int64_t>(seconds * 1000000));
+            }
+            for (auto it = next_transfer_.begin(); it != next_transfer_.end();) {
+                if (it->second <= now) it = next_transfer_.erase(it); else ++it;
+            }
+            remove();
+            return true;
+        }
+        if (stopped.load()) break;
+        cv_.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(10)));
+    }
+    remove();
+    return false;
+}
+
+namespace {
+size_t HintBytes(const ClientReplicationHint &hint) {
+    size_t bytes = 0;
+    auto add = [&](const std::string &uri) {
+        size_t size = 0;
+        StandardUri(uri).GetParamAs<size_t>("size", size);
+        if (size > SIZE_MAX - bytes) bytes = SIZE_MAX; else bytes += size;
+    };
+    if (hint.source_specs.empty()) add(hint.source_uri);
+    else for (const auto &spec : hint.source_specs) add(spec.uri);
+    return bytes;
+}
+} // namespace
+
+
 ReplicationExecutor::ReplicationExecutor(MetaClient *meta_client, TransferClient *transfer_client, int num_workers,
-                                         size_t max_pending_tasks)
+                                         size_t max_pending_tasks, ReplicationOptions options)
     : meta_client_(meta_client), transfer_client_(transfer_client),
-      max_piggyback_queue_(std::max(1, num_workers) * 2), max_pending_tasks_(max_pending_tasks) {
+      max_piggyback_queue_(std::max(1, num_workers) * 2), max_pending_tasks_(max_pending_tasks), options_(std::move(options)) {
     for (int i = 0; i < std::max(1, num_workers); ++i) {
         workers_.emplace_back(&ReplicationExecutor::WorkerLoop, this);
     }
@@ -38,6 +113,9 @@ void ReplicationExecutor::Submit(const std::vector<ClientReplicationHint> &hints
                           queue_.size(), max_pending_tasks_);
             break;
         }
+        const size_t bytes = HintBytes(hint);
+        if (bytes > options_.max_buffer_bytes || bytes > options_.max_pending_bytes ||
+            pending_bytes_ > options_.max_pending_bytes - bytes) continue;
         std::string key = MakeKey(hint.block_key, hint.target_node_id);
         if (inflight_.count(key)) {
             KVCM_LOG_DEBUG("[replication] Submit: block_key [%ld] target [%s] already inflight, skipped",
@@ -47,6 +125,8 @@ void ReplicationExecutor::Submit(const std::vector<ClientReplicationHint> &hints
         }
         inflight_.insert(key);
         queue_.push_back(ReplicationTask{hint});
+        queue_.back().pending_bytes = bytes;
+        pending_bytes_ += bytes;
         KVCM_LOG_INFO("[replication] Submit: block_key [%ld] target [%s] enqueued (queue_size=%zu)",
                       hint.block_key,
                       hint.target_node_id.c_str(),
@@ -92,9 +172,17 @@ void ReplicationExecutor::SubmitWithData(ClientReplicationHint hint,
                       max_piggyback_queue_);
         return;
     }
+    const auto source_bytes = HintBytes(hint);
+    const size_t bytes = std::max(size, source_bytes);
+    if (bytes > options_.max_pending_bytes || pending_bytes_ > options_.max_pending_bytes - bytes ||
+        !ReplicationResources::Global().TryRetain(size, options_.max_buffer_bytes)) return;
+    ReleaseGuard retained([size] { ReplicationResources::Global().Release(size); });
     inflight_.insert(key);
     ++piggyback_queue_size_;
-    queue_.push_front(ReplicationTask{std::move(hint), data, size, std::move(guard)});
+    // FIFO prevents a stream of piggyback tasks from starving ordinary hints.
+    queue_.push_back(ReplicationTask{std::move(hint), data, size, std::move(retained), std::move(guard)});
+    queue_.back().pending_bytes = bytes;
+    pending_bytes_ += bytes;
     KVCM_LOG_INFO("[replication] SubmitWithData: block_key [%ld] target [%s] enqueued (piggyback_queue=%d/%d)",
                   hint.block_key,
                   hint.target_node_id.c_str(),
@@ -132,6 +220,7 @@ void ReplicationExecutor::WorkerLoop() {
             }
             task = std::move(queue_.front());
             queue_.pop_front();
+            pending_bytes_ -= task.pending_bytes;
             if (task.data) {
                 --piggyback_queue_size_;
             }
@@ -149,6 +238,7 @@ void ReplicationExecutor::WorkerLoop() {
 }
 
 void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
+    if (ReplicationResources::Clock::now() >= task.submitted_at + std::chrono::milliseconds(options_.max_age_ms)) return;
     const auto &hint = task.hint;
     const std::string trace_id = "repl_" + StringUtil::GenerateRandomString(16);
     const auto caller = meta_client_->GetCallerNode();
@@ -192,11 +282,28 @@ void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
 
     UriStrVec dest_uris;
     BlockBuffers buffers;
-    std::vector<std::vector<char>> owned_buffers(destinations.size());
     // The existing piggyback API owns one unnamed buffer. It is safe only for
     // a single spec; multi-spec hints use their complete named source set.
     const bool piggyback = task.data != nullptr && task.data_size > 0 && destinations.size() == 1 &&
                            hint.source_specs.size() <= 1;
+    size_t buffer_bytes = 0;
+    for (const auto &dest : destinations) {
+        const auto source = sources.find(dest.spec_name);
+        if (source == sources.end()) return;
+        size_t bytes = task.data_size;
+        if (!piggyback) {
+            bytes = 0;
+            StandardUri(source->second).GetParamAs<size_t>("size", bytes);
+        }
+        if (bytes == 0 || bytes > SIZE_MAX - buffer_bytes) return;
+        buffer_bytes += bytes;
+    }
+    const size_t allocate_bytes = piggyback ? 0 : buffer_bytes;
+    if (!ReplicationResources::Global().Acquire(options_.instance_id, hint.target_node_id,
+            allocate_bytes, options_.max_buffer_bytes, buffer_bytes, options_.node_bytes_per_second,
+            task.submitted_at + std::chrono::milliseconds(options_.max_age_ms), stopped_)) return;
+    ReleaseGuard memory([allocate_bytes] { ReplicationResources::Global().Release(allocate_bytes); });
+    std::vector<std::vector<char>> owned_buffers(destinations.size());
     std::unordered_set<std::string> destination_names;
     for (size_t i = 0; i < destinations.size(); ++i) {
         const auto &dest = destinations[i];
