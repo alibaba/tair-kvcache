@@ -766,3 +766,105 @@ TEST_F(ReplicationExecutorTest, MetricsDistinguishFailedSkippedExpiredAndBudgetD
     EXPECT_EQ(1u, expired.GetStats().dropped_budget);
     EXPECT_EQ(0u, expired.GetStats().failed);
 }
+
+TEST_F(ReplicationExecutorTest, NamedBuffersReuseAllSpecsByNameAndRetainOwnersThroughPublication) {
+    auto location = MakeWriteLocation("named", "kv", "rdma://dest/kv?size=4");
+    location.locations[0].push_back({"state", "rdma://dest/state?size=4"});
+    auto hint = MakeHint(900, "reader", "");
+    hint.source_specs = {{"state", "rdma://src/state?size=4"}, {"kv", "rdma://src/kv?size=4"}};
+    std::atomic<int> released{0};
+    std::shared_ptr<const void> owner(new char[8]{'k','k','k','k','s','s','s','s'},
+        [&](const void *p) { delete[] static_cast<const char *>(p); ++released; });
+    std::weak_ptr<const void> weak = owner;
+    const auto *base = static_cast<const char *>(owner.get());
+    std::vector<ClientReplicationBuffer> buffers{
+        {"state", base + 4, 4, MemoryType::CPU, owner}, {"kv", base, 4, MemoryType::CPU, owner}};
+    owner.reset();
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(0);
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce([&](const auto &, const auto &data, auto) {
+        EXPECT_FALSE(weak.expired());
+        EXPECT_EQ(base, data[0].iovs[0].base);
+        EXPECT_EQ(base + 4, data[1].iovs[0].base);
+        EXPECT_EQ("kkkk", std::string(static_cast<const char *>(data[0].iovs[0].base), 4));
+        return std::make_pair(ER_OK, UriStrVec{});
+    });
+    EXPECT_CALL(mock_meta_, FinishWrite(_, "named", _, _)).WillOnce([&](auto, auto, const auto &mask, const auto &locs) {
+        EXPECT_FALSE(weak.expired());
+        EXPECT_EQ(1u, std::get<BlockMaskOffset>(mask));
+        EXPECT_EQ(2u, locs[0].size());
+        return ER_OK;
+    });
+    auto executor = MakeExecutor();
+    EXPECT_TRUE(executor->SubmitWithBuffers(hint, std::move(buffers)));
+    executor->Shutdown();
+    EXPECT_TRUE(weak.expired()); EXPECT_EQ(1, released.load());
+    EXPECT_EQ(8u, executor->GetStats().copied_bytes);
+}
+
+TEST_F(ReplicationExecutorTest, NamedPartialReuseLoadsOnlyMissingSpecAndPropagatesMemoryType) {
+    auto location = MakeWriteLocation("named", "kv", "rdma://dest/kv?size=4");
+    location.locations[0].push_back({"state", "rdma://dest/state?size=4"});
+    auto hint = MakeHint(901, "reader", "");
+    hint.source_specs = {{"state", "rdma://src/state?size=4"}, {"kv", "rdma://src/kv?size=4"}};
+    auto owner = std::make_shared<std::vector<char>>(4, 'k');
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).WillOnce([](const auto &uris, const auto &data, auto) {
+        EXPECT_EQ((UriStrVec{"rdma://src/state?size=4"}), uris);
+        std::memset(data[0].iovs[0].base, 's', 4);
+        return ER_OK;
+    });
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce([](const auto &, const auto &data, auto) {
+        EXPECT_EQ(MemoryType::GPU, data[0].iovs[0].type);
+        EXPECT_EQ(MemoryType::CPU, data[1].iovs[0].type);
+        EXPECT_EQ("ssss", std::string(static_cast<const char *>(data[1].iovs[0].base), 4));
+        return std::make_pair(ER_OK, UriStrVec{});
+    });
+    EXPECT_CALL(mock_meta_, FinishWrite(_, "named", _, _)).WillOnce(Return(ER_OK));
+    auto executor = MakeExecutor();
+    EXPECT_TRUE(executor->SubmitWithBuffers(hint, {{"kv", owner->data(), 4, MemoryType::GPU, owner}}));
+    executor->Shutdown();
+}
+
+TEST_F(ReplicationExecutorTest, NamedInvalidBuffersRejectBeforeAllocationAndReleaseOwnership) {
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).Times(0);
+    auto hint = MakeHint(902, "reader", "");
+    hint.source_specs = {{"kv", "rdma://src/kv?size=4"}};
+    auto owner = std::make_shared<std::vector<char>>(4);
+    auto executor = MakeExecutor();
+    ClientReplicationBuffer valid{"kv", owner->data(), 4, MemoryType::CPU, owner};
+    EXPECT_FALSE(executor->SubmitWithBuffers(hint, {valid, valid}));
+    auto invalid = valid; invalid.owner.reset();
+    EXPECT_FALSE(executor->SubmitWithBuffers(hint, {invalid}));
+    invalid = valid; invalid.spec_name = "unknown";
+    EXPECT_FALSE(executor->SubmitWithBuffers(hint, {invalid}));
+    invalid = valid; invalid.size = 3;
+    EXPECT_FALSE(executor->SubmitWithBuffers(hint, {invalid}));
+    EXPECT_EQ(4u, executor->GetStats().dropped_invalid);
+    executor->Shutdown();
+    EXPECT_FALSE(executor->SubmitWithBuffers(hint, {valid}));
+    EXPECT_EQ(1u, executor->GetStats().dropped_queue);
+}
+
+TEST_F(ReplicationExecutorTest, NamedTransferExceptionAbortsWholeSessionAndReleasesOwners) {
+    auto hint = MakeHint(903, "reader", "");
+    hint.source_specs = {{"kv", "rdma://src/kv?size=4"}};
+    auto owner = std::make_shared<std::vector<char>>(4);
+    std::weak_ptr<std::vector<char>> weak = owner;
+    std::vector<ClientReplicationBuffer> buffers{{"kv", owner->data(), 4, MemoryType::CPU, owner}};
+    owner.reset();
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(
+        Return(std::make_pair(ER_OK, MakeWriteLocation("named", "kv", "rdma://dest/kv?size=4"))));
+    EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(0);
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce(testing::Throw(std::runtime_error("transfer failure")));
+    EXPECT_CALL(mock_meta_, FinishWrite(_, "named", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &locs) {
+        EXPECT_EQ((BlockMaskVector{false}), std::get<BlockMaskVector>(mask));
+        EXPECT_TRUE(locs.empty());
+        return ER_OK;
+    });
+    auto executor = MakeExecutor();
+    EXPECT_TRUE(executor->SubmitWithBuffers(hint, std::move(buffers)));
+    executor->Shutdown();
+    EXPECT_TRUE(weak.expired()); EXPECT_EQ(1u, executor->GetStats().failed);
+    EXPECT_EQ(0u, executor->GetStats().copied_bytes);
+}

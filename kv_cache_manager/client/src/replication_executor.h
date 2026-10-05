@@ -88,6 +88,7 @@ struct ReplicationTask {
     ReleaseGuard guard;
     size_t pending_bytes = 0;
     ReplicationResources::Clock::time_point submitted_at = ReplicationResources::Clock::now();
+    std::vector<ClientReplicationBuffer> named_buffers;
 
 };
 
@@ -99,6 +100,7 @@ public:
 
     void Submit(const std::vector<ClientReplicationHint> &hints);
     void SubmitWithData(ClientReplicationHint hint, const void *data, size_t size, std::function<void()> release_fn);
+    bool SubmitWithBuffers(ClientReplicationHint hint, std::vector<ClientReplicationBuffer> buffers);
     void Shutdown();
     ReplicationStats GetStats() const;
 
@@ -125,6 +127,7 @@ private:
         std::atomic<uint64_t> expired{0};
         std::atomic<uint64_t> dropped_queue{0};
         std::atomic<uint64_t> dropped_budget{0};
+        std::atomic<uint64_t> dropped_invalid{0};
         std::atomic<uint64_t> duplicates{0};
         std::atomic<uint64_t> copied_bytes{0};
         std::atomic<uint64_t> latency_us{0};

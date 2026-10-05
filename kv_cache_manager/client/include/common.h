@@ -191,6 +191,7 @@ struct ReplicationStats {
     uint64_t expired = 0;
     uint64_t dropped_queue = 0;
     uint64_t dropped_budget = 0;
+    uint64_t dropped_invalid = 0;
     uint64_t duplicates = 0;
     uint64_t copied_bytes = 0;
     uint64_t latency_us = 0;
@@ -227,6 +228,16 @@ struct ClientCallerNode {
     std::string node_id;
     std::string supernode_id;
     uint32_t replication_capabilities = kClientReplicationNamedSpecs;
+};
+
+// The owner keeps immutable bytes alive until transfer completion or rejection.
+// One owner may be shared by several slices. GPU memory uses the same lifetime contract.
+struct ClientReplicationBuffer {
+    std::string spec_name;
+    const void *data = nullptr;
+    size_t size = 0;
+    MemoryType memory_type = MemoryType::CPU;
+    std::shared_ptr<const void> owner;
 };
 
 // Client-side mirror of common/affinity_types.h::ReplicationHint.

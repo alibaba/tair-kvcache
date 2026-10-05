@@ -210,6 +210,56 @@ void ReplicationExecutor::SubmitWithData(ClientReplicationHint hint,
     cv_.notify_one();
 }
 
+bool ReplicationExecutor::SubmitWithBuffers(ClientReplicationHint hint,
+                                             std::vector<ClientReplicationBuffer> buffers) {
+    ++counters_.submitted;
+    size_t retained_bytes = 0;
+    std::set<std::string> names;
+    std::map<std::string, std::string> sources;
+    for (const auto &source : hint.source_specs) {
+        if (source.spec_name.empty() || source.uri.empty() || !sources.emplace(source.spec_name, source.uri).second) {
+            ++counters_.dropped_invalid; return false;
+        }
+    }
+    for (const auto &buffer : buffers) {
+        const auto source = sources.find(buffer.spec_name);
+        size_t source_size = 0;
+        if (source != sources.end()) StandardUri(source->second).GetParamAs<size_t>("size", source_size);
+        if (!buffer.data || !buffer.owner || buffer.size == 0 || buffer.spec_name.empty() ||
+            (buffer.memory_type != MemoryType::CPU && buffer.memory_type != MemoryType::GPU) ||
+            !names.insert(buffer.spec_name).second || source == sources.end() || source_size != buffer.size ||
+            buffer.size > SIZE_MAX - retained_bytes) {
+            ++counters_.dropped_invalid; return false;
+        }
+        retained_bytes += buffer.size;
+    }
+    if (buffers.empty()) { ++counters_.dropped_invalid; return false; }
+    const auto bytes = std::max(retained_bytes, HintBytes(hint));
+    std::lock_guard<std::mutex> lock(mu_);
+    if (stopped_.load() || queue_.size() >= max_pending_tasks_ || piggyback_queue_size_ >= max_piggyback_queue_) {
+        ++counters_.dropped_queue; return false;
+    }
+    const auto key = MakeKey(hint.block_key, hint.target_node_id);
+    if (inflight_.count(key)) { ++counters_.duplicates; return false; }
+    if (bytes > options_.max_pending_bytes || bytes > options_.max_buffer_bytes ||
+        pending_bytes_ > options_.max_pending_bytes - bytes ||
+        !ReplicationResources::Global().TryRetain(retained_bytes, options_.max_buffer_bytes)) {
+        ++counters_.dropped_budget; return false;
+    }
+    ReplicationTask task;
+    task.retained_memory = ReleaseGuard([retained_bytes] { ReplicationResources::Global().Release(retained_bytes); });
+    task.hint = std::move(hint);
+    task.named_buffers = std::move(buffers);
+    task.pending_bytes = bytes;
+    queue_.push_back(std::move(task));
+    inflight_.insert(key);
+    pending_bytes_ += bytes;
+    ++piggyback_queue_size_;
+    ++counters_.admitted;
+    cv_.notify_one();
+    return true;
+}
+
 void ReplicationExecutor::Shutdown() {
     if (stopped_.exchange(true)) {
         return;
@@ -240,7 +290,7 @@ void ReplicationExecutor::WorkerLoop() {
             task = std::move(queue_.front());
             queue_.pop_front();
             pending_bytes_ -= task.pending_bytes;
-            if (task.data) {
+            if (task.data || !task.named_buffers.empty()) {
                 --piggyback_queue_size_;
             }
         }
@@ -284,6 +334,7 @@ ReplicationStats ReplicationExecutor::GetStats() const {
     result.expired = counters_.expired.load(std::memory_order_relaxed);
     result.dropped_queue = counters_.dropped_queue.load(std::memory_order_relaxed);
     result.dropped_budget = counters_.dropped_budget.load(std::memory_order_relaxed);
+    result.dropped_invalid = counters_.dropped_invalid.load(std::memory_order_relaxed);
     result.duplicates = counters_.duplicates.load(std::memory_order_relaxed);
     result.copied_bytes = counters_.copied_bytes.load(std::memory_order_relaxed);
     result.latency_us = counters_.latency_us.load(std::memory_order_relaxed);
@@ -349,7 +400,14 @@ void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
     // a single spec; multi-spec hints use their complete named source set.
     const bool piggyback = task.data != nullptr && task.data_size > 0 && destinations.size() == 1 &&
                            hint.source_specs.size() <= 1;
-    size_t buffer_bytes = 0;
+    std::unordered_map<std::string, const ClientReplicationBuffer *> reused;
+    for (const auto &buffer : task.named_buffers) reused.emplace(buffer.spec_name, &buffer);
+    for (const auto &entry : reused) {
+        if (std::none_of(destinations.begin(), destinations.end(), [&](const auto &dest) {
+                return dest.spec_name == entry.first;
+            })) return;
+    }
+    size_t buffer_bytes = 0, allocate_bytes = 0;
     for (const auto &dest : destinations) {
         const auto source = sources.find(dest.spec_name);
         if (source == sources.end()) return;
@@ -359,9 +417,11 @@ void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
             StandardUri(source->second).GetParamAs<size_t>("size", bytes);
         }
         if (bytes == 0 || bytes > SIZE_MAX - buffer_bytes) return;
+        const auto reuse = reused.find(dest.spec_name);
+        if (reuse != reused.end() && reuse->second->size != bytes) return;
         buffer_bytes += bytes;
+        if (!piggyback && reuse == reused.end()) allocate_bytes += bytes;
     }
-    const size_t allocate_bytes = piggyback ? 0 : buffer_bytes;
     if (!ReplicationResources::Global().Acquire(options_.instance_id, hint.target_node_id,
             allocate_bytes, options_.max_buffer_bytes, buffer_bytes, options_.node_bytes_per_second,
             task.submitted_at + std::chrono::milliseconds(options_.max_age_ms), stopped_)) {
@@ -396,13 +456,19 @@ void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
         if (dest_size != 0 && dest_size != size) {
             return;
         }
-        if (!piggyback) {
+        const auto reuse = reused.find(dest.spec_name);
+        MemoryType memory_type = MemoryType::CPU;
+        if (reuse != reused.end()) {
+            if (reuse->second->size != size) return;
+            data = const_cast<void *>(reuse->second->data);
+            memory_type = reuse->second->memory_type;
+        } else if (!piggyback) {
             owned_buffers[i].resize(size);
             data = owned_buffers[i].data();
         }
         BlockBuffer buffer;
-        buffer.iovs.push_back(Iov{MemoryType::CPU, data, size, false});
-        if (!piggyback && transfer_client_->LoadKvCaches({source->second}, {buffer}) != ER_OK) {
+        buffer.iovs.push_back(Iov{memory_type, data, size, false});
+        if (!piggyback && reuse == reused.end() && transfer_client_->LoadKvCaches({source->second}, {buffer}) != ER_OK) {
             return;
         }
         dest_uris.push_back(dest.uri);

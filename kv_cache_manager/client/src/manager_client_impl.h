@@ -56,6 +56,8 @@ public:
 
     std::string GetCallerNode() const override;
     ReplicationStats GetReplicationStats() const override;
+    bool ReplicateWithBuffers(const ClientReplicationHint &hint,
+                               std::vector<ClientReplicationBuffer> buffers) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, InitParams &init_params) override;

@@ -58,6 +58,11 @@ public:
     virtual std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                const BlockBuffers &block_buffers) = 0;
 
+    // True means queued. Caller must leave all supplied bytes immutable until
+    // its ownership lease is released. Missing specs are loaded from hint sources.
+    virtual bool ReplicateWithBuffers(const ClientReplicationHint &hint,
+                                       std::vector<ClientReplicationBuffer> buffers) { return false; }
+
     virtual ReplicationStats GetReplicationStats() const { return {}; }
 
     // diagnostic: expose caller node id for debugging affinity issues
