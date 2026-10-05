@@ -252,11 +252,13 @@ void MetaIndexerTestBase::DoScanAndSampleReclaimKeysTest() {
     std::sort(keys.begin(), keys.end());
     ASSERT_EQ((KeyVector{0, 1, 2}), keys);
 
-    // 2. SampleReclaimKeys returns a non-empty subset. The requested count is
-    // a hint: a sharded backend may return fewer keys when its per-shard
-    // sampling quota is exhausted.
+    // 2. Sampling must eventually surface a valid subset. Both the count and
+    // non-emptiness are best effort: Redis RANDOMKEY may hit only unrelated
+    // metadata before its bounded retry budget is exhausted.
     KeyVector out_keys;
-    ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(request_context_.get(), key_count, out_keys));
+    for (int attempt = 0; attempt < 100 && out_keys.empty(); ++attempt) {
+        ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(request_context_.get(), key_count, out_keys));
+    }
     ASSERT_FALSE(out_keys.empty());
     ASSERT_LE(out_keys.size(), static_cast<size_t>(key_count));
     for (const auto key : out_keys) {
