@@ -767,4 +767,27 @@ TEST_F(CacheAffinityManagerIntegrationTest, ReplicaLimitsUseStrategyOverridesAnd
     EXPECT_EQ(3u, manager.GetReplicaLimits({}).max_replicas_per_key);
 }
 
+TEST_F(CacheAffinityManagerIntegrationTest, CapabilityNegotiationPreservesLegacyReadsAndUpgradeWindow) {
+    CacheAffinityManager manager;
+    ASSERT_TRUE(manager.LoadProcessStrategyFromJsonString(R"({"type":"local_replica","read":{"on_miss":{
+        "replication_hot_threshold":1,"suppression_window_ms":60000}}})"));
+    LocationSpec kv("kv", "rdma://src/kv?size=4", "source");
+    LocationSpec state("state", "rdma://src/state?size=8", "source");
+    CacheLocation winner;
+    ReadRequest request{123, {{"kv", {&kv}}, {"state", {&state}}}, &winner};
+    AffinityResolveContext ctx;
+    ctx.caller_node.node_id = "reader";
+    auto legacy = manager.ResolveRead(request, ctx);
+    EXPECT_EQ(2u, legacy.picked_specs.size());
+    EXPECT_TRUE(legacy.side_effects.empty());
+    ctx.caller_node.replication_capabilities = 0x80; // Unknown bit is not support.
+    EXPECT_TRUE(manager.ResolveRead(request, ctx).side_effects.empty());
+    ctx.caller_node.replication_capabilities = kReplicationNamedSpecs;
+    EXPECT_EQ(1u, manager.ResolveRead(request, ctx).side_effects.size());
+    ctx.caller_node.replication_capabilities = 0;
+    request.block_key = 124;
+    request.spec_candidates.erase("state");
+    EXPECT_EQ(1u, manager.ResolveRead(request, ctx).side_effects.size());
+}
+
 } // namespace kv_cache_manager

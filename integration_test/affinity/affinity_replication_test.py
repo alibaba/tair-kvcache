@@ -166,7 +166,7 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
             "instance_id": instance_id,
             "query_type": "QT_PREFIX_MATCH",
             "block_keys": block_keys or [BLOCK_KEY],
-            "caller": {"node_id": caller_node_id},
+            "caller": {"node_id": caller_node_id, "replication_capabilities": 1},
         }
         return self._call("GetCacheLocation", GetCacheLocationRequest, data)
 

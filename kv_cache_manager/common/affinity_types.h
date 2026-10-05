@@ -14,9 +14,12 @@ struct ReplicaLimits {
 
 
 // caller 自报节点 (node_id + supernode_id), client / server 共享。
+inline constexpr uint32_t kReplicationNamedSpecs = 1;
+
 struct CallerNode {
     std::string node_id;
     std::string supernode_id;
+    uint32_t replication_capabilities = 0; // Missing capability = legacy single-spec only.
 };
 
 struct ReplicationSourceSpec {

@@ -488,7 +488,8 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
     for (const auto &name : request->location_spec_names()) {
         location_spec_names.push_back(name);
     }
-    request_context->set_caller_node(CallerNode{request->caller().node_id(), request->caller().supernode_id()});
+    request_context->set_caller_node(CallerNode{request->caller().node_id(), request->caller().supernode_id(),
+                                               request->caller().replication_capabilities()});
 
     std::vector<ReplicationHint> hints;
     CacheLocationViewVecWrapper cache_location_view_vec_wrapper;
@@ -514,7 +515,9 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
             auto *location_meta = response->add_locations();
             ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
         }
+        response->set_replication_capabilities(request->caller().replication_capabilities() & kReplicationNamedSpecs);
         for (const auto &h : hints) {
+            if (h.source_specs.size() > 1 && !(response->replication_capabilities() & kReplicationNamedSpecs)) continue;
             auto *pb_hint = response->add_hints();
             pb_hint->set_block_key(h.block_key);
             pb_hint->set_source_uri(h.source_uri);
@@ -739,7 +742,8 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
     // 把调用方推理节点 IP 透传到 RequestContext，CacheManager 写路径在构建
     // AffinityResolveContext 时会读它。空字符串 = 老客户端 / 未启用 affinity，
     // 后端会退化为无亲和性的写放置（行为完全等价于改造前）。
-    request_context->set_caller_node(CallerNode{request->caller().node_id(), request->caller().supernode_id()});
+    request_context->set_caller_node(CallerNode{request->caller().node_id(), request->caller().supernode_id(),
+                                               request->caller().replication_capabilities()});
     request_context->set_is_replication(request->is_replication());
 
     std::pair<ErrorCode, StartWriteCacheInfo> start_write_cache = cache_manager_->StartWriteCache(

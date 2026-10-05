@@ -14,6 +14,7 @@ TEST_F(AffinityPendingContractTest, PartialLocalBlockStillRequestsMissingCompone
     AffinityResolveContext ctx;
     ctx.instance_id = "multi_spec";
     ctx.caller_node.node_id = "reader";
+    ctx.caller_node.replication_capabilities = kReplicationNamedSpecs;
     LocationSpec local_kv("kv", "tair://reader/kv", "reader");
     LocationSpec remote_state("state", "tair://writer/state", "writer");
     CacheLocation winner;
