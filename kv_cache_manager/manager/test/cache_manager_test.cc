@@ -11101,6 +11101,7 @@ TEST_F(CacheManagerAffinityTest, ReplicationWriteBypassesGlobalDedup) {
         CacheManager::KeyVector new_keys;
         std::vector<std::string_view> new_location_spec_group_names;
         BlockMask block_mask = static_cast<size_t>(0);
+        std::vector<std::string> tiered_targets;
 
         auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
                                                    "test_instance",
@@ -11109,7 +11110,7 @@ TEST_F(CacheManagerAffinityTest, ReplicationWriteBypassesGlobalDedup) {
                                                    new_keys,
                                                    {},
                                                    new_location_spec_group_names,
-                                                   block_mask);
+                                                   block_mask, 1, tiered_targets);
         ASSERT_EQ(EC_OK, ec);
 
         // All keys should pass through filter (not deduped) because caller
