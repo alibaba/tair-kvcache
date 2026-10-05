@@ -1,24 +1,23 @@
-// mock_inference_node: integration test binary for cache-affinity piggyback replication.
-// Simulates an inference engine calling ManagerClient to write/read KV blocks
-// and trigger piggyback replication through the affinity hint mechanism.
-
+// Strict single-spec data-plane acceptance driver. Run writer on A and readers on B.
+// A callback releasing a buffer is NOT proof that replication succeeded: query the
+// expected physical node and compare every byte before emitting E2E_OK.
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <numeric>
-#include <set>
+#include <limits>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/client/include/manager_client.h"
-#include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/standard_uri.h"
 
 namespace {
+using namespace kv_cache_manager;
 
 struct Config {
     std::string kvcm_endpoint = "127.0.0.1:6381";
@@ -26,540 +25,299 @@ struct Config {
     std::string instance_id;
     std::string role = "writer";
     std::string block_key_prefix = "affinity_test_";
+    std::string expected_node_id; // PACE numeric ID from MetaService, not Provider UUID.
     int64_t block_size = 1048576;
-    int32_t num_blocks = 1;
+    int32_t num_blocks = 3;
     int32_t query_rounds = 5;
+    int32_t expected_hint_round = 0;
     int32_t wait_seconds = 30;
-    bool verify = true;
+    int32_t repeat_reads = 3;
 };
 
-Config ParseArgs(int argc, char *argv[]) {
+void Require(bool condition, const std::string &message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+int64_t Positive(const std::string &value) {
+    size_t consumed = 0;
+    auto n = std::stoll(value, &consumed);
+    Require(consumed == value.size() && n > 0 && n <= std::numeric_limits<int32_t>::max(),
+            "invalid positive integer: " + value);
+    return n;
+}
+
+Config ParseArgs(int argc, char **argv) {
     Config cfg;
     for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        auto next = [&]() -> std::string {
-            if (i + 1 < argc)
-                return argv[++i];
-            fprintf(stderr, "ERROR: missing value for %s\n", arg.c_str());
-            exit(1);
-        };
-        if (arg == "--kvcm-endpoint")
-            cfg.kvcm_endpoint = next();
-        else if (arg == "--instance-group")
-            cfg.instance_group = next();
-        else if (arg == "--instance-id")
-            cfg.instance_id = next();
-        else if (arg == "--role")
-            cfg.role = next();
-        else if (arg == "--block-key-prefix")
-            cfg.block_key_prefix = next();
-        else if (arg == "--block-size")
-            cfg.block_size = std::stoll(next());
-        else if (arg == "--num-blocks")
-            cfg.num_blocks = std::stoi(next());
-        else if (arg == "--query-rounds")
-            cfg.query_rounds = std::stoi(next());
-        else if (arg == "--wait-seconds")
-            cfg.wait_seconds = std::stoi(next());
-        else if (arg == "--verify")
-            cfg.verify = (next() == "true");
-        else {
-            fprintf(stderr, "ERROR: unknown flag: %s\n", arg.c_str());
-            exit(1);
-        }
+        std::string flag = argv[i];
+        Require(i + 1 < argc, "missing value for " + flag);
+        std::string value = argv[++i];
+        if (flag == "--kvcm-endpoint") cfg.kvcm_endpoint = value;
+        else if (flag == "--instance-group") cfg.instance_group = value;
+        else if (flag == "--instance-id") cfg.instance_id = value;
+        else if (flag == "--role") cfg.role = value;
+        else if (flag == "--block-key-prefix") cfg.block_key_prefix = value;
+        else if (flag == "--expected-node-id") cfg.expected_node_id = value;
+        else if (flag == "--block-size") cfg.block_size = Positive(value);
+        else if (flag == "--num-blocks") cfg.num_blocks = Positive(value);
+        else if (flag == "--query-rounds") cfg.query_rounds = Positive(value);
+        else if (flag == "--expected-hint-round") cfg.expected_hint_round = Positive(value);
+        else if (flag == "--wait-seconds") cfg.wait_seconds = Positive(value);
+        else if (flag == "--repeat-reads") cfg.repeat_reads = Positive(value);
+        else if (flag == "--verify") Require(value == "true", "verification cannot be disabled");
+        else throw std::runtime_error("unknown flag: " + flag);
     }
-    if (cfg.instance_id.empty()) {
-        cfg.instance_id = cfg.role + "_instance_0";
+    Require(!cfg.instance_id.empty(), "--instance-id is required and must match writer/reader");
+    Require(cfg.expected_hint_round <= cfg.query_rounds, "hint threshold exceeds query rounds");
+    Require(cfg.role == "writer" || cfg.role == "writer_abort" || cfg.role == "reader_piggyback" ||
+                cfg.role == "reader_async" || cfg.role == "reader_local" || cfg.role == "reader_miss" ||
+                cfg.role == "remove", "unknown role: " + cfg.role);
+    if (cfg.role != "reader_miss" && cfg.role != "remove") {
+        Require(!cfg.expected_node_id.empty(), "--expected-node-id is required to prove physical locality");
+        size_t consumed = 0;
+        auto node = std::stoul(cfg.expected_node_id, &consumed);
+        Require(consumed == cfg.expected_node_id.size() && node <= 65535, "invalid PACE node ID");
+        cfg.expected_node_id = std::to_string(node);
     }
     return cfg;
 }
 
+std::string Quote(const std::string &s) {
+    std::string result = "\"";
+    for (unsigned char c : s) {
+        Require(c >= 32, "control character in configuration");
+        if (c == '\\' || c == '"') result += '\\';
+        result += static_cast<char>(c);
+    }
+    return result + "\"";
+}
+
 std::string BuildClientConfig(const Config &cfg) {
-    char buf[4096];
-    int n = snprintf(buf,
-                     sizeof(buf),
-                     R"({
-"instance_group": "%s",
-"instance_id": "%s",
-"address": ["%s"],
-"block_size": %ld,
-"location_spec_infos": {
-    "spec_0": %ld
-},
-"meta_channel_config": {
-    "call_timeout": 10000
-},
-"sdk_config": {"timeout_config": {"get_timeout_ms": 10000, "put_timeout_ms": 10000}},
-"model_deployment": {
-    "model_name": "mock_model",
-    "dtype": "FP16",
-    "use_mla": false,
-    "tp_size": 1,
-    "dp_size": 1,
-    "pp_size": 1,
-    "pp_infos": ["layer0"]
-},
-"replication_workers": 2
-})",
-                     cfg.instance_group.c_str(),
-                     cfg.instance_id.c_str(),
-                     cfg.kvcm_endpoint.c_str(),
-                     cfg.block_size,
-                     cfg.block_size);
-    return std::string(buf, n);
+    return "{\"instance_group\":" + Quote(cfg.instance_group) +
+           ",\"instance_id\":" + Quote(cfg.instance_id) +
+           ",\"address\":[" + Quote(cfg.kvcm_endpoint) +
+           "],\"block_size\":128,\"location_spec_infos\":{\"spec_0\":" + std::to_string(cfg.block_size) +
+           "},\"meta_channel_config\":{\"call_timeout\":10000}," +
+           "\"sdk_config\":{\"timeout_config\":{\"get_timeout_ms\":10000,\"put_timeout_ms\":10000}}," +
+           "\"model_deployment\":{\"model_name\":\"mock_model\",\"dtype\":\"FP16\"," +
+           "\"use_mla\":false,\"tp_size\":1,\"dp_size\":1,\"pp_size\":1}," +
+           "\"replication_workers\":2,\"auto_replicate\":" +
+           (cfg.role == "reader_async" ? "true}" : "false}");
 }
 
-void FillPattern(std::vector<char> &buffer, int64_t seed) {
-    for (size_t i = 0; i < buffer.size(); ++i) {
-        buffer[i] = static_cast<char>((seed * 1103515245 + 12345 + static_cast<int64_t>(i)) & 0xFF);
+int64_t BlockKey(const Config &cfg, int index) {
+    // Stable across compilers/processes; unsigned arithmetic avoids signed overflow.
+    uint64_t h = 14695981039346656037ULL;
+    for (unsigned char c : cfg.block_key_prefix + std::to_string(index)) {
+        h = (h ^ c) * 1099511628211ULL;
+    }
+    return static_cast<int64_t>(h & 0x7fffffffffffffffULL);
+}
+
+void FillPattern(std::vector<char> &buffer, int64_t key) {
+    uint64_t state = static_cast<uint64_t>(key);
+    for (auto &byte : buffer) {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        byte = static_cast<char>((state * 2685821657736338717ULL) >> 56);
     }
 }
 
-kv_cache_manager::BlockBuffers MakeBlockBuffers(std::vector<char> &buffer) {
-    kv_cache_manager::BlockBuffer bb;
-    kv_cache_manager::Iov iov;
-    iov.type = kv_cache_manager::MemoryType::CPU;
-    iov.base = buffer.data();
-    iov.size = buffer.size();
-    bb.iovs.push_back(iov);
-    kv_cache_manager::BlockBuffers bufs;
-    bufs.push_back(bb);
-    return bufs;
+BlockBuffers Buffers(std::vector<char> &buffer) {
+    BlockBuffer block;
+    block.iovs.push_back(Iov{MemoryType::CPU, buffer.data(), buffer.size(), false});
+    return {block};
 }
 
-std::string ExtractNodeIdFromUri(const std::string &uri) {
-    kv_cache_manager::StandardUri parsed(uri);
-    return parsed.GetParam("node_id");
+std::string NodeId(const std::string &uri) {
+    return StandardUri(uri).GetParam("node_id");
 }
 
-int RunWriter(const Config &cfg) {
-    printf("[DIAG] === mock_inference_node: WRITER mode ===\n");
-    printf("[DIAG] endpoint=%s instance_group=%s instance_id=%s\n",
-           cfg.kvcm_endpoint.c_str(),
-           cfg.instance_group.c_str(),
-           cfg.instance_id.c_str());
-    printf("[DIAG] block_key_prefix=%s block_size=%ld num_blocks=%d\n",
-           cfg.block_key_prefix.c_str(),
-           cfg.block_size,
-           cfg.num_blocks);
-
-    std::string client_config = BuildClientConfig(cfg);
-    printf("[DIAG] client_config:\n%s\n", client_config.c_str());
-
-    kv_cache_manager::InitParams init_params;
-    init_params.role_type = kv_cache_manager::RoleType::HYBRID;
-    init_params.self_location_spec_name = "spec_0";
-
-    printf("[DIAG] Creating ManagerClient (role=HYBRID)...\n");
-    auto client = kv_cache_manager::ManagerClient::Create(client_config, init_params);
-    if (!client) {
-        fprintf(stderr, "ERROR: ManagerClient::Create failed. Check KVCM client log for details.\n");
-        fprintf(stderr, "       Common causes:\n");
-        fprintf(stderr, "       - Cannot connect to KVCM server at %s\n", cfg.kvcm_endpoint.c_str());
-        fprintf(stderr, "       - Instance group '%s' not found on server\n", cfg.instance_group.c_str());
-        fprintf(stderr, "       - TransferClient init failed (pace SDK unavailable)\n");
-        return 1;
-    }
-    printf("[DIAG] ManagerClient created successfully\n");
-
-    for (int32_t i = 0; i < cfg.num_blocks; ++i) {
-        int64_t key = static_cast<int64_t>(std::hash<std::string>{}(cfg.block_key_prefix + std::to_string(i)));
-        std::vector<int64_t> keys = {key};
-        std::string trace_id = "write_" + std::to_string(i);
-
-        printf("[DIAG] StartWrite: trace_id=%s key=%ld\n", trace_id.c_str(), key);
-        auto [ec, write_loc] = client->StartWrite(trace_id, keys, {}, {}, 60);
-        if (ec != kv_cache_manager::ER_OK) {
-            fprintf(stderr, "ERROR: StartWrite failed, ec=%d\n", ec);
-            return 1;
-        }
-        printf("[DIAG] StartWrite OK: session_id=%s locations=%zu\n",
-               write_loc.write_session_id.c_str(),
-               write_loc.locations.size());
-
-        if (write_loc.locations.empty() || write_loc.locations[0].empty()) {
-            fprintf(stderr, "ERROR: StartWrite returned empty locations\n");
-            return 1;
-        }
-
-        std::vector<char> buffer(cfg.block_size);
-        FillPattern(buffer, key);
-
-        kv_cache_manager::UriStrVec uris;
-        for (const auto &spec_unit : write_loc.locations[0]) {
-            uris.push_back(spec_unit.uri);
-        }
-        auto block_bufs = MakeBlockBuffers(buffer);
-
-        printf("[DIAG] SaveKvCaches: uri=%s size=%ld\n", uris[0].c_str(), cfg.block_size);
-        auto [save_ec, saved_uris] = client->SaveKvCaches(uris, block_bufs);
-        if (save_ec != kv_cache_manager::ER_OK) {
-            // Provider RDMA data path may not be ready yet (pace synchronize error: 3 = FAILED).
-            // Retry with backoff — this is typically a timing issue after provider startup.
-            const int max_retries = 3;
-            bool ok = false;
-            for (int attempt = 1; attempt <= max_retries; ++attempt) {
-                int backoff_s = attempt * 5;
-                fprintf(stderr,
-                        "[WARN] SaveKvCaches attempt failed, ec=%d. Retrying in %ds (%d/%d)...\n",
-                        save_ec, backoff_s, attempt, max_retries);
-                std::this_thread::sleep_for(std::chrono::seconds(backoff_s));
-                auto [retry_ec, retry_uris] = client->SaveKvCaches(uris, block_bufs);
-                if (retry_ec == kv_cache_manager::ER_OK) {
-                    save_ec = retry_ec;
-                    saved_uris = retry_uris;
-                    ok = true;
-                    printf("[DIAG] SaveKvCaches OK on retry %d\n", attempt);
-                    break;
-                }
-                save_ec = retry_ec;
-            }
-            if (!ok) {
-                fprintf(stderr,
-                        "ERROR: SaveKvCaches failed after %d retries, ec=%d. "
-                        "Provider RDMA data path not ready. "
-                        "Check tair_mempool_server.log for provider initialization status.\n",
-                        max_retries, save_ec);
-                return 1;
-            }
-        }
-        printf("[DIAG] SaveKvCaches OK\n");
-
-        kv_cache_manager::Locations final_locations = {write_loc.locations[0]};
-        kv_cache_manager::BlockMask mask = kv_cache_manager::BlockMaskOffset{1};
-        auto finish_ec = client->FinishWrite(trace_id, write_loc.write_session_id, mask, final_locations);
-        if (finish_ec != kv_cache_manager::ER_OK) {
-            fprintf(stderr, "ERROR: FinishWrite failed, ec=%d\n", finish_ec);
-            return 1;
-        }
-        printf("[DIAG] FinishWrite OK\n");
-        printf("WRITE_OK block=%d key=%ld prefix=%s\n", i, key, cfg.block_key_prefix.c_str());
-    }
-
-    printf("=== WRITER: all %d blocks written successfully ===\n", cfg.num_blocks);
-    return 0;
+const std::string &SingleUri(const Locations &locations) {
+    Require(locations.size() == 1 && locations[0].size() == 1 && locations[0][0].spec_name == "spec_0",
+            "expected exactly one block and spec_0; multi-spec requires separate acceptance tests");
+    Require(!locations[0][0].uri.empty(), "empty URI");
+    return locations[0][0].uri;
 }
 
-int RunReaderPiggyback(const Config &cfg) {
-    printf("[DIAG] === mock_inference_node: READER_PIGGYBACK mode ===\n");
-    printf("[DIAG] endpoint=%s instance_group=%s instance_id=%s\n",
-           cfg.kvcm_endpoint.c_str(),
-           cfg.instance_group.c_str(),
-           cfg.instance_id.c_str());
-    printf("[DIAG] block_key_prefix=%s query_rounds=%d wait_seconds=%d\n",
-           cfg.block_key_prefix.c_str(),
-           cfg.query_rounds,
-           cfg.wait_seconds);
+Locations Query(ManagerClient &client, int64_t key, std::vector<ClientReplicationHint> &hints) {
+    hints.clear();
+    auto result = client.MatchLocation("affinity_query", QueryType::QT_PREFIX_MATCH, {key}, {},
+                                       BlockMaskOffset{0}, 0, {}, hints);
+    Require(result.first == ER_OK, "MatchLocation failed: " + std::to_string(result.first));
+    return result.second;
+}
 
-    std::string client_config = BuildClientConfig(cfg);
-    printf("[DIAG] client_config:\n%s\n", client_config.c_str());
-
-    kv_cache_manager::InitParams init_params;
-    init_params.role_type = kv_cache_manager::RoleType::HYBRID;
-    init_params.self_location_spec_name = "spec_0";
-
-    printf("[DIAG] Creating ManagerClient (role=HYBRID)...\n");
-    auto client = kv_cache_manager::ManagerClient::Create(client_config, init_params);
-    if (!client) {
-        fprintf(stderr, "ERROR: ManagerClient::Create failed. Check KVCM client log for details.\n");
-        fprintf(stderr, "       Common causes:\n");
-        fprintf(stderr, "       - Cannot connect to KVCM server at %s\n", cfg.kvcm_endpoint.c_str());
-        fprintf(stderr, "       - Instance group '%s' not found on server\n", cfg.instance_group.c_str());
-        fprintf(stderr, "       - TransferClient init failed (pace SDK unavailable)\n");
-        return 1;
+bool IsMiss(const Locations &locations) {
+    for (const auto &location : locations) {
+        if (!location.empty()) return false;
     }
-    printf("[DIAG] ManagerClient created successfully\n");
-    printf("[DIAG] self_location_spec_name=%s\n", init_params.self_location_spec_name.c_str());
-    std::string caller_node_id = client->GetCallerNode();
-    printf("[DIAG] caller_node_id=[%s] (%s)\n",
-           caller_node_id.empty() ? "(empty)" : caller_node_id.c_str(),
-           caller_node_id.empty() ? "affinity hints will NOT be produced" : "affinity ready");
-    printf("[DIAG] NOTE: check kv_cache_manager_client.log for 'caller_node_provider' to see resolved node_id\n");
+    return true;
+}
 
-    int64_t key = static_cast<int64_t>(std::hash<std::string>{}(cfg.block_key_prefix + "0"));
-    std::vector<int64_t> keys = {key};
-    kv_cache_manager::BlockMask mask = kv_cache_manager::BlockMaskOffset{0};
+std::vector<char> ReadAndCheck(ManagerClient &client, const Config &cfg, int64_t key, const std::string &uri) {
+    std::vector<char> buffer(cfg.block_size, 0);
+    auto ec = client.LoadKvCaches({uri}, Buffers(buffer));
+    Require(ec == ER_OK, "LoadKvCaches failed: " + std::to_string(ec) + " uri=" + uri);
+    std::vector<char> expected(cfg.block_size);
+    FillPattern(expected, key);
+    Require(buffer == expected, "data mismatch for key=" + std::to_string(key) + " uri=" + uri);
+    return buffer;
+}
 
-    printf("[DIAG] query key=%ld prefix=%s mask=BlockMaskOffset{0}\n", key, cfg.block_key_prefix.c_str());
+void CheckMiss(ManagerClient &client, int64_t key) {
+    std::vector<ClientReplicationHint> hints;
+    Require(IsMiss(Query(client, key, hints)) && hints.empty(), "unpublished/removed/isolated key is visible");
+}
 
-    // === Phase 1: multiple queries to accumulate sketch count ===
-    printf("[DIAG] Phase 1: querying %d rounds to accumulate sketch frequency...\n", cfg.query_rounds);
-    std::vector<kv_cache_manager::ReplicationHint> hints;
-    kv_cache_manager::Locations locations;
-    int hint_round = -1;
-
-    for (int round = 0; round < cfg.query_rounds; ++round) {
-        hints.clear();
-        std::string trace_id = "query_" + std::to_string(round);
-        auto [ec, locs] =
-            client->MatchLocation(trace_id, kv_cache_manager::QueryType::QT_PREFIX_MATCH, keys, {}, mask, 0, {}, hints);
-        if (ec != kv_cache_manager::ER_OK) {
-            fprintf(stderr, "ERROR: MatchLocation failed round=%d ec=%d\n", round, ec);
-            return 1;
-        }
-        locations = locs;
-
-        if (!hints.empty()) {
-            hint_round = round + 1;
-            printf("[DIAG] MatchLocation round=%d: ec=0 locations=%zu hints=%zu (threshold reached!)\n",
-                   round + 1,
-                   locs.size(),
-                   hints.size());
-            for (size_t li = 0; li < locs.size(); ++li) {
-                for (const auto &spec : locs[li]) {
-                    printf("[DIAG]   location[%zu] spec=%s uri=%s\n", li, spec.spec_name.c_str(), spec.uri.c_str());
-                }
-            }
-            printf("HINT_RECEIVED round=%d hints=%zu block_key=%ld target_node=%s\n",
-                   hint_round,
-                   hints.size(),
-                   hints[0].block_key,
-                   hints[0].target_node_id.c_str());
-            break;
-        }
-        printf("[DIAG] MatchLocation round=%d: ec=0 locations=%zu hints=0 (sketch accumulating)\n",
-               round + 1,
-               locs.size());
-        if (round == 0) {
-            for (size_t li = 0; li < locs.size(); ++li) {
-                for (const auto &spec : locs[li]) {
-                    printf("[DIAG]   location[%zu] spec=%s uri=%s\n", li, spec.spec_name.c_str(), spec.uri.c_str());
-                }
-            }
-        }
+void CheckLocal(ManagerClient &client, const Config &cfg, int64_t key) {
+    std::string first_uri;
+    for (int i = 0; i < cfg.repeat_reads; ++i) {
+        std::vector<ClientReplicationHint> hints;
+        auto locations = Query(client, key, hints);
+        const auto &uri = SingleUri(locations);
+        Require(NodeId(uri) == cfg.expected_node_id, "read was not routed to expected local Provider: " + uri);
+        Require(hints.empty(), "local hit unexpectedly emitted replication hint");
+        Require(first_uri.empty() || first_uri == uri, "local URI changed during repeated reads");
+        first_uri = uri;
+        ReadAndCheck(client, cfg, key, uri);
     }
+}
 
-    if (hints.empty()) {
-        fprintf(stderr,
-                "ERROR: no hints produced after %d query rounds. "
-                "Possible causes:\n"
-                "  - CallerNodeProvider returned empty node_id (check kv_cache_manager_client.log for "
-                "'caller_node_provider' / 'pace_local_providers')\n"
-                "  - affinity_strategy_json not configured on instance_group (check server log for strategy=)\n"
-                "  - replication_hot_threshold too high (current rounds=%d < threshold)\n"
-                "  - block not found (writer didn't complete or different instance_group)\n"
-                "  - data is already local to caller (any_local=true, no hint needed)\n",
-                cfg.query_rounds,
-                cfg.query_rounds);
-        return 1;
-    }
-
-    // === Phase 2: Load data from remote ===
-    printf("[DIAG] Phase 2: loading data from remote location...\n");
-    if (locations.empty() || locations[0].empty()) {
-        fprintf(stderr, "ERROR: MatchLocation returned empty locations\n");
-        return 1;
-    }
-
-    kv_cache_manager::UriStrVec load_uris;
-    for (const auto &spec_unit : locations[0]) {
-        load_uris.push_back(spec_unit.uri);
+void Write(ManagerClient &client, const Config &cfg, int64_t key, bool abort) {
+    CheckMiss(client, key); // Fresh prefix also prevents accidental reuse of an earlier test run.
+    auto result = client.StartWrite("affinity_write", {key}, {}, {}, 60);
+    Require(result.first == ER_OK, "StartWrite failed: " + std::to_string(result.first));
+    auto &write = result.second;
+    const auto &uri = SingleUri(write.locations);
+    Require(!write.write_session_id.empty(), "empty write session");
+    Require(NodeId(uri) == cfg.expected_node_id, "write allocated on wrong physical Provider: " + uri);
+    CheckMiss(client, key); // CLS_WRITING must not count as a readable hit.
+    if (abort) {
+        Require(client.FinishWrite("affinity_abort", write.write_session_id, BlockMaskVector{false}, {}) == ER_OK,
+                "failed-write FinishWrite failed");
+        CheckMiss(client, key);
+        return;
     }
     std::vector<char> buffer(cfg.block_size);
-    auto block_bufs = MakeBlockBuffers(buffer);
+    FillPattern(buffer, key);
+    auto saved = client.SaveKvCaches({uri}, Buffers(buffer));
+    Require(saved.first == ER_OK && saved.second.size() == 1, "SaveKvCaches failed or missing actual URI");
+    Require(NodeId(saved.second[0]) == cfg.expected_node_id, "saved URI is on wrong Provider");
+    Locations finished = {{{"spec_0", saved.second[0]}}};
+    Require(client.FinishWrite("affinity_finish", write.write_session_id, BlockMaskOffset{1}, finished) == ER_OK,
+            "FinishWrite failed");
+    CheckLocal(client, cfg, key);
+}
 
-    bool load_ok = false;
-    const int max_load_retries = 3;
-    for (int attempt = 1; attempt <= max_load_retries; ++attempt) {
-        printf("[DIAG] LoadKvCaches: uri=%s size=%ld (attempt %d/%d)\n",
-               load_uris[0].c_str(), cfg.block_size, attempt, max_load_retries);
-        auto load_ec = client->LoadKvCaches(load_uris, block_bufs);
-        if (load_ec == kv_cache_manager::ER_OK) {
-            load_ok = true;
-            printf("[DIAG] LoadKvCaches OK: loaded %ld bytes\n", cfg.block_size);
-            break;
-        }
-        printf("[WARN] LoadKvCaches attempt %d/%d failed, ec=%d (ER_SDK_TIMEOUT=100, ERR_RW_FAILED=-9)\n",
-               attempt, max_load_retries, load_ec);
-        if (attempt < max_load_retries) {
-            int backoff_s = attempt * 2;
-            printf("[DIAG] retrying in %ds...\n", backoff_s);
-            std::this_thread::sleep_for(std::chrono::seconds(backoff_s));
-        }
-    }
-
-    if (!load_ok) {
-        printf("[WARN] LoadKvCaches FAILED after %d attempts (cross-machine RDMA read unavailable). "
-               "Using synthetic data to continue piggyback control plane test.\n",
-               max_load_retries);
-        std::fill(buffer.begin(), buffer.end(), 'S');
-    }
-
-    // === Phase 3: Piggyback replication ===
-    // With auto_replicate=false (default), MatchLocation in Phase 1 does NOT auto-submit
-    // hints to replication_executor. ReplicateWithData here is the actual piggyback trigger:
-    // it enqueues the task with data, and the worker thread executes ExecuteWrite
-    // (StartWrite(is_replication=true) → SaveKvCaches → FinishWrite) on the local node.
-    printf("[DIAG] Phase 3: triggering piggyback replication...\n");
-    printf("[DIAG] ReplicateWithData: hint.block_key=%ld hint.target_node_id=%s source_uri=%s\n",
-           hints[0].block_key,
-           hints[0].target_node_id.c_str(),
-           hints[0].source_uri.c_str());
-
+struct ReplicationBuffer {
+    std::vector<char> data;
     std::atomic<bool> released{false};
-    auto start_time = std::chrono::steady_clock::now();
-    client->ReplicateWithData(
-        hints[0], buffer.data(), buffer.size(), [&released]() { released.store(true, std::memory_order_release); });
+};
 
-    auto deadline = start_time + std::chrono::seconds(cfg.wait_seconds);
-    while (!released.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-
-    if (!released.load(std::memory_order_acquire)) {
-        fprintf(stderr,
-                "ERROR: piggyback replication timeout after %ds. "
-                "Possible causes:\n"
-                "  - ReplicationExecutor worker thread stuck\n"
-                "  - StartWrite(is_replication=true) failed on server\n"
-                "  - MetaService preferred_nodes allocation failed\n"
-                "  - pace SaveKvCaches to local node failed\n",
-                cfg.wait_seconds);
-        return 1;
-    }
-    auto elapsed_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time).count();
-    printf("[DIAG] ReplicateWithData: release_fn called after %ldms\n", elapsed_ms);
-    if (elapsed_ms < 10) {
-        printf("[DIAG] WARNING: elapsed < 10ms — SubmitWithData likely deduped or dropped. "
-               "Check kv_cache_manager_client.log for '[replication] SubmitWithData' diagnosis.\n");
-    }
-    printf("PIGGYBACK_OK elapsed_ms=%ld\n", elapsed_ms);
-
-    // === Phase 4: Verify local replica ===
-    if (!cfg.verify) {
-        printf("=== READER_PIGGYBACK: piggyback completed (verification skipped) ===\n");
-        return 0;
-    }
-
-    printf("[DIAG] Phase 4: verifying local replica exists...\n");
-    printf("[DIAG] caller_node_id=%s hint.target_node_id=%s\n",
-           caller_node_id.c_str(), hints[0].target_node_id.c_str());
-
-    // Record original URIs to detect new locations after piggyback.
-    // caller_node_id is UUID; URI node_id is numeric — can't compare directly.
-    // Instead, detect the replica as any NEW URI not present in the original set.
-    std::set<std::string> original_uris;
-    for (const auto &spec : locations[0]) {
-        original_uris.insert(spec.uri);
-    }
-    int original_loc_count = static_cast<int>(locations[0].size());
-
-    std::string local_replica_uri;
-    auto verify_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(cfg.wait_seconds);
-    int poll_round = 0;
-
-    while (std::chrono::steady_clock::now() < verify_deadline) {
-        ++poll_round;
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-        std::vector<kv_cache_manager::ReplicationHint> verify_hints;
-        std::string verify_trace = "verify_poll_" + std::to_string(poll_round);
-        auto [verify_ec, verify_locs] = client->MatchLocation(
-            verify_trace, kv_cache_manager::QueryType::QT_PREFIX_MATCH, keys, {}, mask, 0, {}, verify_hints);
-        if (verify_ec != kv_cache_manager::ER_OK) {
-            fprintf(stderr, "ERROR: verify MatchLocation failed, ec=%d\n", verify_ec);
-            return 1;
+void Replicate(ManagerClient &client, const Config &cfg, int64_t key) {
+    const auto caller = client.GetCallerNode();
+    Require(!caller.empty(), "caller Provider UUID is empty");
+    ClientReplicationHint hint;
+    bool received = false;
+    std::string source;
+    std::vector<char> source_data;
+    for (int round = 1; round <= cfg.query_rounds; ++round) {
+        std::vector<ClientReplicationHint> hints;
+        auto locations = Query(client, key, hints);
+        const auto &uri = SingleUri(locations);
+        Require(!NodeId(uri).empty() && NodeId(uri) != cfg.expected_node_id,
+                "pre-replication read is not remote: " + uri);
+        if (source.empty()) {
+            source = uri;
+            source_data = ReadAndCheck(client, cfg, key, source);
         }
+        Require(source == uri, "source changed while accumulating read frequency");
+        if (hints.empty()) continue;
+        Require(hints.size() == 1, "expected one hint per block");
+        hint = hints[0];
+        Require(hint.block_key == key && hint.target_node_id == caller && hint.source_uri == source,
+                "hint key/source/target does not match the request");
+        Require(cfg.expected_hint_round == 0 || round == cfg.expected_hint_round,
+                "hint emitted at unexpected query round " + std::to_string(round));
+        printf("HINT_RECEIVED key=%lld round=%d target=%s\n", static_cast<long long>(key), round, caller.c_str());
+        received = true;
+        break;
+    }
+    Require(received, "no replication hint within query-round budget");
 
-        if (verify_locs.empty() || verify_locs[0].empty()) {
-            printf("[DIAG] Verify poll %d: locations empty, retrying...\n", poll_round);
-            continue;
-        }
-
-        printf("[DIAG] Verify poll %d: locations=%zu (original=%d)\n",
-               poll_round, verify_locs.size(), original_loc_count);
-
-        for (size_t li = 0; li < verify_locs.size(); ++li) {
-            for (const auto &spec : verify_locs[li]) {
-                std::string nid = ExtractNodeIdFromUri(spec.uri);
-                bool is_new = (original_uris.find(spec.uri) == original_uris.end());
-                printf("[DIAG]   location[%zu] spec=%s uri=%s node_id=%s %s\n",
-                       li, spec.spec_name.c_str(), spec.uri.c_str(), nid.c_str(),
-                       is_new ? "← NEW (replica)" : "(original)");
-                if (is_new && local_replica_uri.empty()) {
-                    local_replica_uri = spec.uri;
+    auto owned = std::make_shared<ReplicationBuffer>();
+    if (cfg.role == "reader_piggyback") {
+        owned->data = std::move(source_data);
+        // Capture ownership: even a timeout must not free memory still used by the executor.
+        client.ReplicateWithData(hint, owned->data.data(), owned->data.size(), [owned]() {
+            owned->released.store(true, std::memory_order_release);
+        });
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(cfg.wait_seconds);
+    bool local = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::vector<ClientReplicationHint> hints;
+        auto locations = Query(client, key, hints);
+        if (!IsMiss(locations)) {
+            const auto &uri = SingleUri(locations);
+            if (NodeId(uri) == cfg.expected_node_id) {
+                Require(uri != source, "replica URI must differ from source");
+                if (cfg.role != "reader_piggyback" || owned->released.load(std::memory_order_acquire)) {
+                    local = true;
+                    break;
                 }
             }
         }
-
-        if (!local_replica_uri.empty()) {
-            printf("[DIAG] ✓ Found local replica URI: %s (after %d poll rounds)\n",
-                   local_replica_uri.c_str(), poll_round);
-            break;
-        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-
-    if (local_replica_uri.empty()) {
-        fprintf(stderr,
-                "ERROR: local replica not found after %d poll rounds (%ds timeout).\n"
-                "Diagnosis:\n"
-                "  - caller_node_id (UUID) = %s\n"
-                "  - hint.target_node_id = %s\n"
-                "  - original locations=%d, no new URI appeared\n"
-                "  - Check kv_cache_manager_client.log for '[replication]' to see if ExecuteWrite succeeded\n"
-                "  - Check MetaService GA list for new allocations on the local node\n"
-                "  - If caller_node_id != hint.target_node_id, pace_local_providers() may have returned wrong node\n",
-                poll_round, cfg.wait_seconds,
-                caller_node_id.c_str(),
-                hints[0].target_node_id.c_str(),
-                original_loc_count);
-        return 1;
-    }
-
-    // Load from the LOCAL replica URI to verify data integrity
-    kv_cache_manager::UriStrVec verify_uris = {local_replica_uri};
-    std::vector<char> verify_buffer(cfg.block_size);
-    auto verify_bufs = MakeBlockBuffers(verify_buffer);
-
-    printf("[DIAG] Verify LoadKvCaches from local replica: uri=%s\n", local_replica_uri.c_str());
-    auto verify_load_ec = client->LoadKvCaches(verify_uris, verify_bufs);
-    if (verify_load_ec != kv_cache_manager::ER_OK) {
-        printf("[WARN] verify LoadKvCaches from local replica failed, ec=%d uri=%s\n",
-               verify_load_ec, local_replica_uri.c_str());
-        printf("VERIFY_OK local_replica exists (data plane read skipped, ec=%d)\n", verify_load_ec);
-        printf("=== READER_PIGGYBACK: piggyback control plane verified (data plane unavailable) ===\n");
-        return 0;
-    }
-
-    // Compare with expected pattern (or synthetic data if Phase 2 fell back)
-    std::vector<char> expected(cfg.block_size);
-    if (load_ok) {
-        FillPattern(expected, key);
-    } else {
-        std::fill(expected.begin(), expected.end(), 'S');
-    }
-    if (verify_buffer == expected) {
-        printf("[DIAG] Verify: local replica data matches expected pattern%s\n",
-               load_ok ? "" : " (synthetic data)");
-        printf("VERIFY_OK local_replica data consistent\n");
-    } else {
-        int mismatches = 0;
-        for (size_t i = 0; i < verify_buffer.size(); ++i) {
-            if (verify_buffer[i] != expected[i]) ++mismatches;
-        }
-        fprintf(stderr,
-                "[WARN] local replica data MISMATCH: %d/%ld bytes differ. uri=%s\n"
-                "  Piggyback control plane succeeded (replica created), but data integrity check failed.\n",
-                mismatches, cfg.block_size, local_replica_uri.c_str());
-        printf("VERIFY_OK local_replica exists (data mismatch: %d bytes)\n", mismatches);
-    }
-
-    printf("=== READER_PIGGYBACK: all phases completed successfully ===\n");
-    return 0;
+    Require(local, "replica not published on expected local Provider before deadline");
+    CheckLocal(client, cfg, key);
 }
 
+void Run(const Config &cfg) {
+    InitParams params;
+    params.role_type = RoleType::HYBRID;
+    params.self_location_spec_name = "spec_0";
+    auto client = ManagerClient::Create(BuildClientConfig(cfg), params);
+    Require(client != nullptr, "ManagerClient::Create failed");
+    for (int i = 0; i < cfg.num_blocks; ++i) {
+        auto key = BlockKey(cfg, i);
+        if (cfg.role == "writer" || cfg.role == "writer_abort") {
+            Write(*client, cfg, key, cfg.role == "writer_abort");
+        } else if (cfg.role == "reader_piggyback" || cfg.role == "reader_async") {
+            Replicate(*client, cfg, key);
+        } else if (cfg.role == "reader_local") {
+            CheckLocal(*client, cfg, key);
+        } else if (cfg.role == "reader_miss") {
+            CheckMiss(*client, key);
+        } else {
+            Require(client->RemoveCache("affinity_remove", {key}, {}, BlockMaskOffset{0}) == ER_OK,
+                    "RemoveCache failed");
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(cfg.wait_seconds);
+            bool removed = false;
+            do {
+                std::vector<ClientReplicationHint> hints;
+                if (IsMiss(Query(*client, key, hints)) && hints.empty()) { removed = true; break; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            } while (std::chrono::steady_clock::now() < deadline);
+            Require(removed, "removed key still query-visible");
+        }
+        printf("BLOCK_OK role=%s block=%d key=%lld\n", cfg.role.c_str(), i, static_cast<long long>(key));
+    }
+    printf("E2E_OK role=%s blocks=%d\n", cfg.role.c_str(), cfg.num_blocks);
+}
 } // namespace
 
-int main(int argc, char *argv[]) {
-    Config cfg = ParseArgs(argc, argv);
-
-    if (cfg.role == "writer") {
-        return RunWriter(cfg);
-    } else if (cfg.role == "reader_piggyback") {
-        return RunReaderPiggyback(cfg);
-    } else {
-        fprintf(stderr, "ERROR: unknown role '%s' (expected: writer | reader_piggyback)\n", cfg.role.c_str());
+int main(int argc, char **argv) {
+    try {
+        Run(ParseArgs(argc, argv));
+        return 0;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "E2E_FAILED: %s\n", e.what());
         return 1;
     }
 }

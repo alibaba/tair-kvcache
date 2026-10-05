@@ -27,6 +27,7 @@ from kv_cache_manager.protocol.protobuf.meta_service_pb2 import (
     GetCacheLocationRequest,
     StartWriteCacheRequest,
     FinishWriteCacheRequest,
+    RemoveCacheRequest,
 )
 from kv_cache_manager.protocol.protobuf.meta_service_pb2_grpc import MetaServiceStub
 from testlib.test_base import TestBase
@@ -65,7 +66,7 @@ def _make_strategy_json(replication_hot_threshold=2):
 
 
 class AffinityReplicationTest(TestBase, unittest.TestCase):
-    """End-to-end tests for write-affinity placement and read replication hints."""
+    """Real-server control-plane tests; physical data uses affinity_piggyback."""
 
     def setUp(self):
         logging.basicConfig(level=logging.INFO)
@@ -102,11 +103,11 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
             preserving_proto_field_name=True,
         )
 
-    def _register_instance(self, strategy_json=None):
+    def _register_instance(self, strategy_json=None, instance_id=INSTANCE_ID, specs=None):
         data = {
             "trace_id": TRACE_ID,
             "instance_group": "default",
-            "instance_id": INSTANCE_ID,
+            "instance_id": instance_id,
             "block_size": 128,
             "model_deployment": {
                 "model_name": "test_model",
@@ -116,7 +117,7 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
                 "dp_size": 1,
                 "pp_size": 1,
             },
-            "location_spec_infos": [
+            "location_spec_infos": specs or [
                 {"name": "tp0", "size": 1024},
             ],
             "affinity_strategy_json": strategy_json or _make_strategy_json(),
@@ -138,13 +139,13 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
         resp = self._call("StartWriteCache", StartWriteCacheRequest, start_data)
         return resp
 
-    def _finish_write(self, session_id, block_count):
+    def _finish_write(self, session_id, block_count, successes=None):
         finish_data = {
             "trace_id": TRACE_ID,
             "instance_id": INSTANCE_ID,
             "write_session_id": session_id,
             "success_blocks": {
-                "bool_masks": {"values": [True] * block_count},
+                "bool_masks": {"values": successes if successes is not None else [True] * block_count},
             },
         }
         resp = self._call("FinishWriteCache", FinishWriteCacheRequest, finish_data)
@@ -159,15 +160,20 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
         self._finish_write(session_id, len(block_keys))
         return resp
 
-    def _get_cache_location(self, caller_node_id, block_keys=None):
+    def _get_cache_location(self, caller_node_id, block_keys=None, instance_id=INSTANCE_ID):
         data = {
             "trace_id": TRACE_ID,
-            "instance_id": INSTANCE_ID,
+            "instance_id": instance_id,
             "query_type": "QT_PREFIX_MATCH",
             "block_keys": block_keys or [BLOCK_KEY],
             "caller": {"node_id": caller_node_id},
         }
         return self._call("GetCacheLocation", GetCacheLocationRequest, data)
+
+    def _assert_miss(self, response):
+        self.assertEqual(response["header"]["status"]["code"], "OK", response)
+        self.assertFalse(any(loc.get("location_specs") for loc in response.get("locations", [])), response)
+        self.assertFalse(response.get("hints"), response)
 
     # ------------------------------------------------------------------- tests
 
@@ -303,6 +309,120 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
             f"Strict write with non-matching caller should fail, but got OK: {resp}",
         )
         logging.info("Strict remote write correctly failed: status=%s", status_code)
+
+    def test_unfinished_and_failed_writes_are_not_readable_then_retry(self):
+        self._register_instance()
+        started = self._start_write([BLOCK_KEY], LOCAL_IP)
+        self.assertEqual(started["header"]["status"]["code"], "OK", started)
+        self._assert_miss(self._get_cache_location(REMOTE_CALLER_NODE_ID))
+        self._finish_write(started["write_session_id"], 1, [False])
+        self._assert_miss(self._get_cache_location(REMOTE_CALLER_NODE_ID))
+        self._write_block(caller_node_id=LOCAL_IP)
+        visible = self._get_cache_location(LOCAL_IP)
+        self.assertEqual(visible["header"]["status"]["code"], "OK", visible)
+        self.assertTrue(visible.get("locations"), visible)
+
+    def test_partial_batch_publication_stops_prefix_at_failed_block(self):
+        self._register_instance()
+        keys = [BLOCK_KEY, BLOCK_KEY + 1, BLOCK_KEY + 2]
+        started = self._start_write(keys, LOCAL_IP)
+        self.assertEqual(started["header"]["status"]["code"], "OK", started)
+        self._finish_write(started["write_session_id"], 3, [True, False, True])
+        response = self._get_cache_location(LOCAL_IP, keys)
+        self.assertEqual(response["header"]["status"]["code"], "OK", response)
+        hits = [loc for loc in response.get("locations", []) if loc.get("location_specs")]
+        self.assertEqual(len(hits), 1, response)
+        self._assert_miss(self._get_cache_location(LOCAL_IP, [keys[1]]))
+        tail = self._get_cache_location(LOCAL_IP, [keys[2]])
+        self.assertEqual(tail["header"]["status"]["code"], "OK", tail)
+        self.assertTrue(tail.get("locations"), tail)
+
+    def test_local_reads_do_not_generate_replication_hints(self):
+        self._register_instance()
+        self._write_block(caller_node_id=LOCAL_IP)
+        for _ in range(8):
+            response = self._get_cache_location(LOCAL_IP)
+            self.assertEqual(response["header"]["status"]["code"], "OK", response)
+            self.assertTrue(response.get("locations"), response)
+            self.assertFalse(response.get("hints"), response)
+            for location in response["locations"]:
+                for spec in location["location_specs"]:
+                    self.assertEqual(spec["node_id"], LOCAL_IP, response)
+
+    def test_hint_suppression_does_not_block_another_key(self):
+        self._register_instance()
+        for key in [BLOCK_KEY, BLOCK_KEY + 1]:
+            self._write_block([key], LOCAL_IP)
+            first = self._get_cache_location(REMOTE_CALLER_NODE_ID, [key])
+            self.assertEqual(first["header"]["status"]["code"], "OK", first)
+            self.assertFalse(first.get("hints"), first)
+            second = self._get_cache_location(REMOTE_CALLER_NODE_ID, [key])
+            self.assertEqual(second["header"]["status"]["code"], "OK", second)
+            self.assertEqual(len(second.get("hints", [])), 1, second)
+            self.assertEqual(second["hints"][0]["block_key"], str(key), second)
+            for _ in range(3):
+                suppressed = self._get_cache_location(REMOTE_CALLER_NODE_ID, [key])
+                self.assertEqual(suppressed["header"]["status"]["code"], "OK", suppressed)
+                self.assertFalse(suppressed.get("hints"), suppressed)
+
+    def test_instance_isolation_for_same_block_key(self):
+        self._register_instance()
+        self._write_block(caller_node_id=LOCAL_IP)
+        other = INSTANCE_ID + "_isolated"
+        self._register_instance(instance_id=other)
+        for _ in range(4):
+            self._assert_miss(self._get_cache_location(REMOTE_CALLER_NODE_ID, instance_id=other))
+        original = self._get_cache_location(LOCAL_IP)
+        self.assertEqual(original["header"]["status"]["code"], "OK", original)
+        self.assertTrue(original.get("locations"), original)
+
+    def test_legacy_caller_can_read_without_replication_hints(self):
+        self._register_instance()
+        self._write_block(caller_node_id=LOCAL_IP)
+        for _ in range(4):
+            response = self._get_cache_location("")
+            self.assertEqual(response["header"]["status"]["code"], "OK", response)
+            self.assertTrue(response.get("locations"), response)
+            self.assertFalse(response.get("hints"), response)
+
+    def test_noop_strategy_preserves_read_write_without_hints(self):
+        self._register_instance(strategy_json=json.dumps({"type": "noop"}))
+        self._write_block(caller_node_id=LOCAL_IP)
+        for _ in range(4):
+            response = self._get_cache_location(REMOTE_CALLER_NODE_ID)
+            self.assertEqual(response["header"]["status"]["code"], "OK", response)
+            self.assertTrue(response.get("locations"), response)
+            self.assertFalse(response.get("hints"), response)
+
+    def test_remove_then_rewrite_restores_query_visibility(self):
+        self._register_instance()
+        self._write_block(caller_node_id=LOCAL_IP)
+        removed = self._call("RemoveCache", RemoveCacheRequest, {
+            "trace_id": TRACE_ID, "instance_id": INSTANCE_ID, "block_keys": [BLOCK_KEY],
+        })
+        self.assertEqual(removed["header"]["status"]["code"], "OK", removed)
+        deadline = time.monotonic() + 10
+        while True:
+            response = self._get_cache_location(LOCAL_IP)
+            if not any(loc.get("location_specs") for loc in response.get("locations", [])):
+                self._assert_miss(response)
+                break
+            self.assertLess(time.monotonic(), deadline, response)
+            time.sleep(0.05)
+        self._write_block(caller_node_id=LOCAL_IP)
+        response = self._get_cache_location(LOCAL_IP)
+        self.assertEqual(response["header"]["status"]["code"], "OK", response)
+        self.assertTrue(response.get("locations"), response)
+
+    def test_multi_spec_publication_returns_all_components(self):
+        self._register_instance(specs=[{"name": "tp0", "size": 1024}, {"name": "tp1", "size": 2048}])
+        self._write_block(caller_node_id=LOCAL_IP)
+        response = self._get_cache_location(LOCAL_IP)
+        self.assertEqual(response["header"]["status"]["code"], "OK", response)
+        specs = [spec for loc in response.get("locations", []) for spec in loc["location_specs"]]
+        self.assertEqual({spec["name"] for spec in specs}, {"tp0", "tp1"}, response)
+        self.assertTrue(all(spec["node_id"] == LOCAL_IP for spec in specs), response)
+        self.assertFalse(response.get("hints"), response)
 
 
 if __name__ == "__main__":
