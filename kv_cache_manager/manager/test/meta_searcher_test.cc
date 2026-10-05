@@ -5330,3 +5330,23 @@ TEST_F(MetaSearcherTest, NodeEvictionRevalidatesMinimumPerSpecWithConcurrentDele
     for (const auto &entry : maps[0]) if (entry.second->status() == CLS_SERVING) ++serving;
     EXPECT_EQ(2, serving);
 }
+
+TEST_F(MetaSearcherTest, ReplicaAdmissionRejectsDuplicateBatchKeysBeforeMutation) {
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+        1, {LocationSpec("tp0", "tair_mempool://store/x?size=64", "a")});
+    ReplicaLimits limits;
+    limits.max_replicas_per_key = 1;
+    std::vector<MetaSearcher::AddLocationResult> results;
+    EXPECT_EQ(EC_BADARGS, meta_searcher_->BatchAddLocation(request_context_.get(), {88004, 88004},
+        {location, location}, results, limits));
+    ASSERT_EQ(2u, results.size());
+    for (const auto &result : results) {
+        EXPECT_EQ(EC_BADARGS, result.ec);
+        EXPECT_TRUE(result.location_id.empty());
+    }
+    EXPECT_EQ(0u, meta_indexer_->GetStorageUsage());
+    EXPECT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {88004}, {location}, results, limits));
+    EXPECT_EQ(64u, meta_indexer_->GetStorageUsage());
+    EXPECT_NE(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {88004}, {location}, results, limits));
+    EXPECT_EQ(64u, meta_indexer_->GetStorageUsage());
+}

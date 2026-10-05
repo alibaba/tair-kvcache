@@ -2300,6 +2300,12 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
         }
         return EC_BADARGS;
     }
+    // RMW reads all entries in a batch before writing them. Repeated keys
+    // would otherwise each observe the same replica count and over-admit.
+    if (limits.max_replicas_per_key > 0 && std::unordered_set<KeyType>(keys.begin(), keys.end()).size() != keys.size()) {
+        for (auto &result : out_results) result.ec = EC_BADARGS;
+        return EC_BADARGS;
+    }
     std::lock_guard<std::mutex> admission_lock(meta_indexer_->LocationAdmissionMutex());
     uint64_t bytes = 0;
     for (const auto &location : locations) {
