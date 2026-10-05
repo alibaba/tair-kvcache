@@ -248,3 +248,7 @@ curl -g -vvv -X POST http://localhost:6382/api/getCacheMeta \
 `source_specs` 与目标按 `spec_name` 匹配，不按数组位置匹配。所有目标 spec 写入成功后才能
 成功 `FinishWriteCache`；中途失败应使用失败 mask 结束会话。既有 `source_uri` 字段仅在
 单 spec 提示中设置。多 spec 复制要求配套升级 SDK，不能让旧客户端忽略新字段后按单 spec 执行。
+
+### 亲和性复制能力协商
+
+`GetCacheLocationRequest.caller.replication_capabilities` 为位图，bit 0（值 1）表示客户端支持按名称复制完整的多 spec 源。响应 `replication_capabilities` 返回双方支持能力的交集。未携带能力的旧客户端仍可读取全部位置，只接收单 spec 提示。新 SDK 默认声明值 1，仅在响应确认后使用多 spec 提示。未知位忽略；升级 SDK 与服务端可分批进行。HTTP/Python 调用方只有实现全部 spec 的原子发布后才应声明该位。

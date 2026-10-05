@@ -345,6 +345,7 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
         auto *proto_caller = request.mutable_caller();
         proto_caller->set_node_id(caller.node_id);
         proto_caller->set_supernode_id(caller.supernode_id);
+        proto_caller->set_replication_capabilities(caller.replication_capabilities);
     }
 
     ProtoConvert::BlockMaskToProto(block_mask, request.mutable_block_mask());
@@ -357,6 +358,8 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
     out_hints.clear();
     out_hints.reserve(response.hints_size());
     for (const auto &h : response.hints()) {
+        if (h.source_specs_size() > 1 &&
+            !(response.replication_capabilities() & caller.replication_capabilities & kClientReplicationNamedSpecs)) continue;
         ClientReplicationHint hint;
         hint.block_key = h.block_key();
         hint.source_uri = h.source_uri();
@@ -414,6 +417,7 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
         auto *proto_caller = request.mutable_caller();
         proto_caller->set_node_id(caller.node_id);
         proto_caller->set_supernode_id(caller.supernode_id);
+        proto_caller->set_replication_capabilities(caller.replication_capabilities);
     }
     request.set_is_replication(is_replication);
     grpc::ClientContext context;

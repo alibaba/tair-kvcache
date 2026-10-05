@@ -221,9 +221,12 @@ struct TransferTraceInfo {
 };
 
 // Client-side mirror of common/affinity_types.h::CallerNode.
+inline constexpr uint32_t kClientReplicationNamedSpecs = 1;
+
 struct ClientCallerNode {
     std::string node_id;
     std::string supernode_id;
+    uint32_t replication_capabilities = kClientReplicationNamedSpecs;
 };
 
 // Client-side mirror of common/affinity_types.h::ReplicationHint.

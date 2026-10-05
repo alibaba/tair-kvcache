@@ -352,3 +352,7 @@ public:
 ### 复制结果观测
 
 `ManagerClient::GetReplicationStats()` 返回当前客户端的累计提交/准入、成功、失败、跳过、过期、队列/预算丢弃、重复提示计数，以及成功复制字节、执行耗时、排队耗时、活动数和队列字节。只有 `FinishWrite` 成功确认后才增加成功次数和字节；已在本地跳过与失败分开统计。`InitParams.replication_metrics_callback` 可接入业务指标系统，完成任务后在执行器锁外调用；导出异常不会终止工作线程。仅发生准入丢弃时可周期读取快照。以上为 SDK 侧实际结果，服务端 hint/StartWrite 计数不能替代它们。
+
+### 分批升级
+
+新 SDK 在 CallerNode 中声明 `replication_capabilities=1`，服务端确认后才传送多 spec 提示。旧客户端（字段缺省/0）保留正常读选路与单 spec 复制。新 SDK 遇到未确认能力的旧服务端会忽略多 spec 提示，不影响正常读取；不支持的提示不会占用服务端的复制抑制窗口。

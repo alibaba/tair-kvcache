@@ -44,6 +44,9 @@ ReadDecision LocalReplicaAffinityStrategy::ResolveRead(const ReadRequest &req, c
     if (all_local || !complete_sources || sources.empty()) {
         return dec;
     }
+    // Gate before frequency/suppression updates so an old client cannot consume
+    // the emission window of a newly upgraded client on the same node.
+    if (sources.size() > 1 && !(ctx.caller_node.replication_capabilities & kReplicationNamedSpecs)) return dec;
     if (req.winner_tier == nullptr) {
         return dec;
     }

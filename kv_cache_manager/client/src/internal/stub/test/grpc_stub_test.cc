@@ -1113,6 +1113,17 @@ TEST_F(GrpcStubTest, TestGetCacheLocationPropagatesReplicationHints) {
 
     // 4. 连续读取直到 hints 被填充。BATCH_GET 每次都会对所有 key 喂 sketch，
     //    threshold=3 时最迟在第 3 次就应出现 hint，留 4 次余量。
+    ClientCallerNode legacy_caller = caller;
+    legacy_caller.replication_capabilities = 0;
+    for (int i = 0; i < 4; ++i) {
+        std::vector<ClientReplicationHint> legacy_hints;
+        auto legacy = stub_->GetCacheLocation("legacy", "instance1", QueryType::QT_BATCH_GET,
+                                              {1, 2, 3}, {}, static_cast<size_t>(0), 0, {},
+                                              legacy_caller, legacy_hints);
+        ASSERT_EQ(ER_OK, legacy.first);
+        ASSERT_EQ(3u, legacy.second.size());
+        EXPECT_TRUE(legacy_hints.empty());
+    }
     bool found_hints = false;
     for (int i = 0; i < 4 && !found_hints; ++i) {
         std::vector<ClientReplicationHint> hints;

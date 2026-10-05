@@ -346,6 +346,8 @@ enum QueryType {
 message CallerNode {
     string node_id = 1;
     string supernode_id = 2;
+    // Bit 0: client can copy a complete named multi-spec source set.
+    uint32 replication_capabilities = 3;
 }
 
 message GetCacheLocationRequest {
@@ -428,6 +430,8 @@ message GetCacheLocationResponse {
     repeated CacheLocation locations = 2; // 多个key的列表
     // Replication hints from server. Old SDKs ignore unknown fields (proto3).
     repeated ReplicationHint hints = 3;
+    // Intersection of server support and the caller capability bitmap.
+    uint32 replication_capabilities = 4;
 }
 
 message GetCacheLocationLenResponse {
