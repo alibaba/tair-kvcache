@@ -368,3 +368,9 @@ public:
 部署时为 KVCM 和 SDK 设置 `KVCM_NODE_TOPOLOGY_FILE`，文件内容为 `{"nodes":{"node_uuid_a":"rack1","node_uuid_b":"rack1"}}`，节点标识必须与存储返回的 node_id 一致。以原子替换方式更新文件；进程每 5 秒刷新。读取失败或 JSON 非法时短期保留上一次映射，30 秒后降级为未知拓扑。空 nodes 可主动清空。SDK 据此填充 CallerNode.supernode_id，服务端也会根据映射补全调用方和 NodeMetrics；后端直接上报的拓扑仍可作为来源。
 
 读优先本机，其次同 supernode，最后沿用远端候选顺序。写流水线使用 `"prefer_local":{"same_supernode":true,"on_miss":"abort"}` 可在没有本机候选时尝试同 supernode；默认 false 保留原先行为。严格复制写仍必须落到调用节点，不会因同 supernode 回退而发布错误的本地副本。
+
+### 按 spec 名称复用缓冲区
+
+`ManagerClient::ReplicateWithBuffers(hint, buffers)` 接受 `ClientReplicationBuffer{spec_name, data, size, memory_type, owner}`，返回是否入队。每个缓冲区必须有非空共享 owner；调用方保持内容不可变，直到 SDK 释放 owner。按 spec 名称匹配源和目标，输入顺序无关，支持 CPU/GPU（具体传输后端须支持该类型）。重复名称、未知名称、无 owner、空地址或源 size 不匹配在分配目标前拒绝。已有旧单缓冲区接口保持可用。
+
+允许只提供部分 spec：已有缓冲区直接写目标，缺失项从提示中的 URI 读取。共享 owner 保活到所有传输与发布结束；失败、超时、队列拒绝同样释放。任何 spec 失败都撤销整个写会话，只有所有 spec 写成功才整体发布。缓冲区按实际字节计入复制预算；无效输入由 `dropped_invalid` 指标统计。

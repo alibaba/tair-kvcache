@@ -73,6 +73,11 @@ ClientErrorCode ManagerClientImpl::Init(const std::string &client_config, InitPa
     return ER_OK;
 }
 
+bool ManagerClientImpl::ReplicateWithBuffers(const ClientReplicationHint &hint,
+                                             std::vector<ClientReplicationBuffer> buffers) {
+    return replication_executor_ && replication_executor_->SubmitWithBuffers(hint, std::move(buffers));
+}
+
 ReplicationStats ManagerClientImpl::GetReplicationStats() const {
     return replication_executor_ ? replication_executor_->GetStats() : ReplicationStats{};
 }
