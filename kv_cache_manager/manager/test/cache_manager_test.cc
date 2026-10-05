@@ -10935,6 +10935,7 @@ public:
 
         cache_manager_ = createCacheManager();
         request_context_ = std::make_shared<RequestContext>("affinity_trace");
+        request_context_->set_caller_node(CallerNode{"", "", kReplicationNamedSpecs});
     }
 
     static constexpr const char *kStrategyJson = R"({
@@ -11066,7 +11067,8 @@ TEST_F(CacheManagerAffinityTest, ReplicationHintEmittedAfterFrequencyThreshold) 
             for (const auto &h : hints) {
                 EXPECT_EQ("node_a", h.target_node_id);
                 EXPECT_NE(0, h.block_key);
-                EXPECT_FALSE(h.source_uri.empty());
+                EXPECT_TRUE(h.source_uri.empty());
+                EXPECT_EQ(4u, h.source_specs.size());
             }
             break;
         }
