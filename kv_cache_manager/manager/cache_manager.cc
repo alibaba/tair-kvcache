@@ -1321,7 +1321,19 @@ CacheManager::StartWriteCache(RequestContext *request_context,
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchAddLocation);
         std::vector<MetaSearcher::AddLocationResult> add_results;
-        ec = meta_searcher->BatchAddLocation(request_context, new_keys, new_locations, add_results);
+        ReplicaLimits limits;
+        if (affinity_manager_) {
+            const auto info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+            if (info) {
+                AffinityResolveContext context;
+                context.instance_id = instance_id;
+                context.instance_strategy_json = info->affinity_strategy_json();
+                context.group_strategy_json = registry_manager_->GetGroupAffinityStrategyJson(
+                    request_context, info->instance_group_name());
+                limits = affinity_manager_->GetReplicaLimits(context);
+            }
+        }
+        ec = meta_searcher->BatchAddLocation(request_context, new_keys, new_locations, add_results, limits);
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchAddLocation);
         if (ec != EC_OK) {
             RollbackAddLocations(request_context, instance_id, new_keys, new_locations, add_results);

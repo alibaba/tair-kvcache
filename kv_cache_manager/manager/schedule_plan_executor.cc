@@ -694,7 +694,7 @@ SchedulePlanExecutor::PrepareDeleteTask(const CacheLocationDelRequest &task) {
                                         &task.location_ids,
                                         expected_location_values,
                                         task.delay,
-                                        task.authoritative_read);
+                                        task.authoritative_read, task.min_retained_replicas);
     result.actual_task.metadata_only = task.metadata_only;
     result.actual_task.confirmed_missing_uris = task.confirmed_missing_uris;
     return result;
@@ -706,7 +706,7 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                                             const std::vector<std::vector<std::string>> *target_location_ids,
                                             const std::vector<std::vector<std::string>> *expected_location_values,
                                             std::chrono::microseconds delay,
-                                            bool authoritative_read) {
+                                            bool authoritative_read, uint32_t min_retained_replicas) {
     LocationDelAdmissionResult admission_result;
     admission_result.actual_task = CacheLocationDelRequest{instance_id, {}, {}, delay};
 
@@ -808,8 +808,11 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
     }
 
     std::vector<std::vector<ErrorCode>> batch_results;
-    ErrorCode update_ec = meta_searcher.BatchCASLocationStatus(
-        request_context.get(), batch_cas_block_keys, batch_cas_tasks, batch_results, authoritative_read);
+    ErrorCode update_ec = min_retained_replicas > 0
+        ? meta_searcher.BatchMarkDeletingWithRetention(request_context.get(), batch_cas_block_keys,
+                                                       batch_cas_tasks, min_retained_replicas, batch_results)
+        : meta_searcher.BatchCASLocationStatus(request_context.get(), batch_cas_block_keys,
+                                               batch_cas_tasks, batch_results, authoritative_read);
     if (update_ec != ErrorCode::EC_OK) {
         KVCM_LOG_DEBUG("Location status BatchCASLocationStatus not ok, ec: %d", update_ec);
     }

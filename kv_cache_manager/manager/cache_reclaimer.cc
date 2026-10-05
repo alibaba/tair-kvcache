@@ -1027,6 +1027,13 @@ bool CacheReclaimer::ReclaimByLRUImpl(const std::shared_ptr<RequestContext> &req
     // here the cache location form of deleting request is used to
     // permit the cache location status aware deleting control
     CacheLocationDelRequest request;
+    if (affinity_manager_) {
+        AffinityResolveContext ctx;
+        ctx.instance_strategy_json = instance_info->affinity_strategy_json();
+        ctx.group_strategy_json = registry_manager_->GetGroupAffinityStrategyJson(
+            request_context.get(), instance_info->instance_group_name());
+        request.min_retained_replicas = affinity_manager_->GetReplicaLimits(ctx).min_retained_replicas;
+    }
     request.instance_id = ins_id;
     request.delay = std::chrono::milliseconds(delay_before_delete_ms);
 
@@ -1763,6 +1770,11 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                 // uses metadata-only conditional deletion instead.
                 continue;
             }
+            if (!node_ids.empty() &&
+                std::none_of(loc.location_specs().begin(), loc.location_specs().end(),
+                             [&node_ids](const auto &spec) { return node_ids.count(spec.node_id()) != 0; })) {
+                continue;
+            }
             if (is_pending_location(block_key, loc.id())) {
                 METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) += 1;
                 continue;
@@ -2156,6 +2168,7 @@ bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
     std::uint64_t blk_count = 0;
     std::uint64_t loc_count = 0;
     CacheLocationDelRequest final_req{ins_id, {}, {}, req.delay};
+    final_req.min_retained_replicas = req.min_retained_replicas;
     std::vector<PendingLocationKey> pending_locations;
     std::set<PendingLocationKey> request_pending_locations;
     for (std::size_t i = 0; i != req.block_keys.size(); ++i) {

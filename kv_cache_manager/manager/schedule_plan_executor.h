@@ -76,6 +76,7 @@ struct CacheLocationDelRequest {
     // skips these idempotently while still deleting any remaining specs in the
     // same Location.
     std::set<std::string> confirmed_missing_uris;
+    uint32_t min_retained_replicas{0};
 };
 
 struct EventReportMetadataDeleteTarget {
@@ -208,7 +209,7 @@ private:
                           const std::vector<std::vector<std::string>> *target_location_ids,
                           const std::vector<std::vector<std::string>> *expected_location_values,
                           std::chrono::microseconds delay,
-                          bool authoritative_read = false);
+                          bool authoritative_read = false, uint32_t min_retained_replicas = 0);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare,

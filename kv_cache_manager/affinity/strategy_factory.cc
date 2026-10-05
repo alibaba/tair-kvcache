@@ -103,6 +103,14 @@ BuildLocalReplicaParams(const rapidjson::Value &target, FrequencySketch *sketch,
     p.sketch = sketch;
     p.suppressor = suppressor;
 
+    if (target.HasMember("replica_limits") && target["replica_limits"].IsObject()) {
+        const auto &limits = target["replica_limits"];
+        ReadUIntField(limits, "max_replicas_per_key", p.replica_limits.max_replicas_per_key);
+        ReadUIntField(limits, "min_retained_replicas", p.replica_limits.min_retained_replicas);
+        if (limits.HasMember("max_instance_bytes") && limits["max_instance_bytes"].IsUint64()) {
+            p.replica_limits.max_instance_bytes = limits["max_instance_bytes"].GetUint64();
+        }
+    }
     // enabled_aspects
     if (target.HasMember(kFieldEnabledAspects) && target[kFieldEnabledAspects].IsObject()) {
         const auto &ea = target[kFieldEnabledAspects];
@@ -168,6 +176,22 @@ std::shared_ptr<AffinityStrategy> StrategyFactory::ParseJsonString(const std::st
         return std::make_shared<NoopAffinityStrategy>();
     }
     if (type == kTypeLocalReplica) {
+        if (target->HasMember("replica_limits")) {
+            const auto &limits = (*target)["replica_limits"];
+            if (!limits.IsObject() ||
+                (limits.HasMember("max_replicas_per_key") && !limits["max_replicas_per_key"].IsUint()) ||
+                (limits.HasMember("min_retained_replicas") && !limits["min_retained_replicas"].IsUint()) ||
+                (limits.HasMember("max_instance_bytes") && !limits["max_instance_bytes"].IsUint64())) {
+                SetErr(error_msg, "replica_limits must contain non-negative integer limits");
+                return nullptr;
+            }
+            const auto params = BuildLocalReplicaParams(*target, sketch, suppressor);
+            if (params.replica_limits.max_replicas_per_key > 0 &&
+                params.replica_limits.min_retained_replicas > params.replica_limits.max_replicas_per_key) {
+                SetErr(error_msg, "min_retained_replicas exceeds max_replicas_per_key");
+                return nullptr;
+            }
+        }
         return std::make_shared<LocalReplicaAffinityStrategy>(BuildLocalReplicaParams(*target, sketch, suppressor));
     }
 

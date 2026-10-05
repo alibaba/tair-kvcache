@@ -32,6 +32,7 @@ struct ReplicationHintSideEffect : public ReadSideEffect, public ReplicationHint
 class LocalReplicaAffinityStrategy : public AffinityStrategy {
 public:
     struct Params {
+        ReplicaLimits replica_limits;
         // === 3 个一级 toggle ===
         bool enable_write = true;
         bool enable_read = true;

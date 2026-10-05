@@ -211,6 +211,7 @@ public:
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
 
     // storage usage interfaces
+    std::mutex &LocationAdmissionMutex() { return location_admission_mutex_; }
     [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
     [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;
     void SetStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
@@ -303,6 +304,7 @@ private:
     size_t batch_key_size_ = MetaIndexerConfig::kDefaultBatchKeySize;
     std::string instance_id_;
     StorageUsageData storage_usage_data_;
+    std::mutex location_admission_mutex_;
 };
 
 } // namespace kv_cache_manager
