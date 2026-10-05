@@ -6,6 +6,13 @@
 
 namespace kv_cache_manager {
 
+struct ReplicaLimits {
+    uint32_t max_replicas_per_key = 0; // 0 = unlimited; counts all location reservations
+    uint64_t max_instance_bytes = 0;  // 0 = unlimited; includes original copies and WRITING
+    uint32_t min_retained_replicas = 1; // Per spec, for node-pressure eviction only
+};
+
+
 // caller 自报节点 (node_id + supernode_id), client / server 共享。
 struct CallerNode {
     std::string node_id;

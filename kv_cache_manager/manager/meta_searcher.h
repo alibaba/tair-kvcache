@@ -143,7 +143,8 @@ public:
     ErrorCode BatchAddLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
-                               std::vector<AddLocationResult> &out_results);
+                               std::vector<AddLocationResult> &out_results,
+                               const ReplicaLimits &limits = {});
     struct AddLocationRollbackPlan {
         // Confirmed-successful items (EC_OK + non-empty location id). The
         // caller submits these to the standard location delete pipeline.
@@ -345,6 +346,10 @@ public:
                                      const std::vector<std::vector<LocationCASTask>> &batch_tasks,
                                      std::vector<std::vector<ErrorCode>> &out_batch_results,
                                      bool refresh_cache_from_persistent = false);
+    ErrorCode BatchMarkDeletingWithRetention(RequestContext *request_context, const KeyVector &keys,
+        const std::vector<std::vector<LocationCASTask>> &tasks, uint32_t minimum,
+        std::vector<std::vector<ErrorCode>> &out_results);
+
     struct LocationCADTask {
         std::string location_id;
         CacheLocationStatus expect_status;

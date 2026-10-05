@@ -749,4 +749,22 @@ TEST_F(CacheAffinityManagerIntegrationTest, PhysicalDeleteCreditIsFencedBySample
     EXPECT_EQ(1u, manager.ResolveEviction({}).size());
 }
 
+TEST_F(CacheAffinityManagerIntegrationTest, ReplicaLimitsUseStrategyOverridesAndRejectInvalidLimits) {
+    CacheAffinityManager manager;
+    ASSERT_TRUE(manager.LoadProcessStrategyFromJsonString(R"({"type":"local_replica","replica_limits":{
+        "max_replicas_per_key":3,"max_instance_bytes":4294967296,"min_retained_replicas":2}})"));
+    auto limits = manager.GetReplicaLimits({});
+    EXPECT_EQ(3u, limits.max_replicas_per_key);
+    EXPECT_EQ(4294967296ULL, limits.max_instance_bytes);
+    EXPECT_EQ(2u, limits.min_retained_replicas);
+    AffinityResolveContext ctx;
+    ctx.instance_strategy_json = R"({"type":"local_replica","replica_limits":{"max_replicas_per_key":5}})";
+    EXPECT_EQ(5u, manager.GetReplicaLimits(ctx).max_replicas_per_key);
+    EXPECT_FALSE(manager.LoadProcessStrategyFromJsonString(R"({"type":"local_replica","replica_limits":{
+        "max_instance_bytes":-1}})"));
+    EXPECT_FALSE(manager.LoadProcessStrategyFromJsonString(R"({"type":"local_replica","replica_limits":{
+        "max_replicas_per_key":1,"min_retained_replicas":2}})"));
+    EXPECT_EQ(3u, manager.GetReplicaLimits({}).max_replicas_per_key);
+}
+
 } // namespace kv_cache_manager

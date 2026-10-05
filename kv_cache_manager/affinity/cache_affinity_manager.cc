@@ -165,6 +165,12 @@ StrategyContext CacheAffinityManager::BuildStrategyContext(const AffinityResolve
     return sctx;
 }
 
+ReplicaLimits CacheAffinityManager::GetReplicaLimits(const AffinityResolveContext &ctx) const {
+    auto strategy = std::dynamic_pointer_cast<LocalReplicaAffinityStrategy>(
+        GetStrategy(ctx.instance_strategy_json, ctx.group_strategy_json));
+    return strategy ? strategy->params().replica_limits : ReplicaLimits{};
+}
+
 WriteDecision CacheAffinityManager::ResolveWrite(const AffinityResolveContext &ctx) {
     auto nodes = SnapshotNodes();
     if (nodes.empty()) {

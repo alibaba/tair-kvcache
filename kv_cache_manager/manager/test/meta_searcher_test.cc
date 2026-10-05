@@ -5276,3 +5276,57 @@ TEST_F(MetaSearcherTest, ReadSelectionWithNoopStrategyDegradesToFirstSeen) {
     const std::string &nid = out[0]->location_specs()[0].node_id();
     EXPECT_TRUE(nid == "node_local" || nid == "node_remote");
 }
+
+TEST_F(MetaSearcherTest, ReplicaAdmissionSerializesCapacityAndCountsWritingReservations) {
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+        1, {LocationSpec("tp0", "tair_mempool://store/x?size=64", "a")});
+    ReplicaLimits limits;
+    limits.max_replicas_per_key = 2;
+    limits.max_instance_bytes = 128;
+    auto add = [&](int64_t key) {
+        RequestContext ctx("concurrent_budget");
+        std::vector<MetaSearcher::AddLocationResult> results;
+        return meta_searcher_->BatchAddLocation(&ctx, {key}, {location}, results, limits);
+    };
+    std::vector<std::future<ErrorCode>> calls;
+    for (int i = 0; i < 8; ++i) calls.push_back(std::async(std::launch::async, add, 88001));
+    int accepted = 0;
+    for (auto &call : calls) if (call.get() == EC_OK) ++accepted;
+    EXPECT_EQ(2, accepted);
+    EXPECT_EQ(128u, meta_indexer_->GetStorageUsage());
+    EXPECT_NE(EC_OK, add(88002)); // Instance budget spans keys, including WRITING.
+    limits.max_instance_bytes = 0;
+    EXPECT_NE(EC_OK, add(88001)); // Per-key budget remains enforced.
+    EXPECT_EQ(EC_OK, add(88002));
+}
+
+TEST_F(MetaSearcherTest, NodeEvictionRevalidatesMinimumPerSpecWithConcurrentDeletes) {
+    const int64_t key = 88003;
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+        2, {LocationSpec("tp0", "tair_mempool://store/x?size=64", "a"),
+            LocationSpec("tp1", "tair_mempool://store/y?size=32", "a")});
+    std::vector<std::string> ids;
+    for (int i = 0; i < 3; ++i) {
+        std::vector<MetaSearcher::AddLocationResult> results;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {key}, {location}, results));
+        ids.push_back(results[0].location_id);
+    }
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {key},
+        {{{ids[0], CLS_SERVING}, {ids[1], CLS_SERVING}, {ids[2], CLS_SERVING}}}, results));
+    auto remove = [&](const std::string &id) {
+        RequestContext ctx("retained_replica");
+        std::vector<std::vector<ErrorCode>> ecs;
+        meta_searcher_->BatchMarkDeletingWithRetention(&ctx, {key}, {{{id, CLS_SERVING, CLS_DELETING}}}, 2, ecs);
+        return ecs.size() == 1 && ecs[0].size() == 1 && ecs[0][0] == EC_OK;
+    };
+    auto a = std::async(std::launch::async, remove, ids[0]);
+    auto b = std::async(std::launch::async, remove, ids[1]);
+    EXPECT_EQ(1, static_cast<int>(a.get()) + static_cast<int>(b.get()));
+    EXPECT_FALSE(remove(ids[2]));
+    CacheLocationMapVector maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, BlockMask{}, maps));
+    int serving = 0;
+    for (const auto &entry : maps[0]) if (entry.second->status() == CLS_SERVING) ++serving;
+    EXPECT_EQ(2, serving);
+}

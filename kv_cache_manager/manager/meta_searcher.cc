@@ -2289,7 +2289,8 @@ ErrorCode MetaSearcher::BatchGetLocation(RequestContext *request_context,
 ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
                                          const KeyVector &keys,
                                          const CacheLocationVector &locations,
-                                         std::vector<AddLocationResult> &out_results) {
+                                         std::vector<AddLocationResult> &out_results,
+                                         const ReplicaLimits &limits) {
     out_results.assign(keys.size(), AddLocationResult{});
     if (keys.size() != locations.size()) {
         for (auto &result : out_results) {
@@ -2297,10 +2298,33 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
         }
         return EC_BADARGS;
     }
+    std::lock_guard<std::mutex> admission_lock(meta_indexer_->LocationAdmissionMutex());
+    uint64_t bytes = 0;
+    for (const auto &location : locations) {
+        if (!location) {
+            for (auto &result : out_results) result.ec = EC_BADARGS;
+            return EC_BADARGS;
+        }
+        for (const auto &spec : location->location_specs()) {
+            uint64_t size = 0;
+            DataStorageUri(spec.uri()).GetParamAs<uint64_t>("size", size);
+            if ((limits.max_instance_bytes > 0 && size == 0) || size > UINT64_MAX - bytes) {
+                for (auto &result : out_results) result.ec = EC_OUT_OF_LIMIT;
+                return EC_OUT_OF_LIMIT;
+            }
+            bytes += size;
+        }
+    }
+    const auto usage = meta_indexer_->GetStorageUsage();
+    if (limits.max_instance_bytes > 0 &&
+        (usage >= limits.max_instance_bytes || bytes > limits.max_instance_bytes - usage)) {
+        for (auto &result : out_results) result.ec = EC_OUT_OF_LIMIT;
+        return EC_OUT_OF_LIMIT;
+    }
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
-    auto modifier = [&locations, &out_results, &keys, &loc_sz, batch_create_time](
+    auto modifier = [&locations, &out_results, &keys, &loc_sz, &limits, batch_create_time](
                         const LocationIdVector &existing_location_ids,
                         ErrorCode get_ec,
                         size_t index,
@@ -2311,6 +2335,9 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
             return {ModifierAction::MA_FAIL, get_ec};
         }
 
+        if (limits.max_replicas_per_key > 0 && existing_location_ids.size() >= limits.max_replicas_per_key) {
+            return {ModifierAction::MA_FAIL, EC_OUT_OF_LIMIT};
+        }
         // first time this block_key is created: record prev_key
         if (get_ec == EC_NOENT) {
             std::string prev_key = index > 0 ? std::to_string(keys[index - 1]) : std::string();
@@ -2336,7 +2363,7 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
         std::uint64_t sz = 0;
         for (const auto &loc_spec : locations[index]->location_specs()) {
             if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
-                std::uint64_t spec_sz;
+                std::uint64_t spec_sz = 0;
                 ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
                 sz += spec_sz;
             }
@@ -3423,6 +3450,70 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
 
     if (result.ec != ErrorCode::EC_OK) {
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
+    }
+    return result.ec;
+}
+
+ErrorCode MetaSearcher::BatchMarkDeletingWithRetention(
+    RequestContext *ctx, const KeyVector &keys, const std::vector<std::vector<LocationCASTask>> &tasks,
+    uint32_t minimum, std::vector<std::vector<ErrorCode>> &out_results) {
+    if (keys.size() != tasks.size() || minimum == 0) return EC_BADARGS;
+    CacheLocationMapVector snapshots;
+    const auto ec = BatchGetLocation(ctx, keys, BlockMask{}, snapshots);
+    if (ec != EC_OK || snapshots.size() != keys.size()) return ec == EC_OK ? EC_ERROR : ec;
+    LocationIdsPerKey ids(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::set<std::string> unique;
+        for (const auto &task : tasks[i]) {
+            if (task.new_status != CLS_DELETING || !unique.insert(task.location_id).second) return EC_BADARGS;
+            ids[i].push_back(task.location_id); // requested IDs first, guards afterwards
+        }
+        for (const auto &entry : snapshots[i]) {
+            if (unique.insert(entry.first).second) ids[i].push_back(entry.first);
+        }
+    }
+    auto modifier = [&](const std::vector<ErrorCode> &ecs, const LocationIdVector &loc_ids, size_t k,
+                        CacheLocationVector &locs, PropertyMap &) -> LocationModifierResult {
+        std::vector<ErrorCode> results(loc_ids.size(), EC_OK);
+        std::map<std::string, uint32_t> copies;
+        bool unreadable = false;
+        for (size_t j = 0; j < locs.size(); ++j) {
+            if (ecs[j] != EC_OK && ecs[j] != EC_NOENT) unreadable = true;
+            if (ecs[j] != EC_OK || !locs[j] || locs[j]->status() != CLS_SERVING) continue;
+            std::set<std::string> specs;
+            for (const auto &spec : locs[j]->location_specs()) specs.insert(spec.name());
+            for (const auto &name : specs) ++copies[name];
+        }
+        bool changed = false;
+        for (size_t j = 0; j < tasks[k].size(); ++j) {
+            const auto &task = tasks[k][j];
+            if (unreadable || ecs[j] != EC_OK || !locs[j] || locs[j]->status() != task.old_status ||
+                (!task.expected_location_value.empty() && locs[j]->ToJsonString() != task.expected_location_value)) {
+                results[j] = EC_MISMATCH;
+                continue;
+            }
+            std::set<std::string> specs;
+            if (locs[j]->status() == CLS_SERVING) {
+                for (const auto &spec : locs[j]->location_specs()) specs.insert(spec.name());
+            }
+            if (std::any_of(specs.begin(), specs.end(), [&](const auto &name) { return copies[name] <= minimum; })) {
+                results[j] = EC_OUT_OF_LIMIT;
+                continue;
+            }
+            for (const auto &name : specs) --copies[name];
+            auto copy = std::make_shared<CacheLocation>(*locs[j]);
+            copy->set_status(CLS_DELETING);
+            locs[j] = std::move(copy);
+            changed = true;
+        }
+        return {changed ? ModifierAction::MA_OK : ModifierAction::MA_SKIP, std::move(results)};
+    };
+    auto result = meta_indexer_->ReadModifyWriteLocation(ctx, keys, ids, modifier);
+    out_results = std::move(result.per_location_error_codes);
+    if (out_results.size() != tasks.size()) return EC_ERROR;
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        if (out_results[i].size() < tasks[i].size()) return EC_ERROR;
+        out_results[i].resize(tasks[i].size());
     }
     return result.ec;
 }

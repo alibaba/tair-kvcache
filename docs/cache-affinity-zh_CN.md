@@ -334,3 +334,11 @@ public:
 ### 删除完成反馈
 
 节点压力回收只在异步删除返回终态后计入释放容量。每个实际删除成功的 URI 按 spec 所属节点累计字节；重复 URI、已不存在、失败、超时和仅删除元数据均不产生释放量。部分成功保留成功部分的反馈，迟到的成功也可反馈。容量采样时间必须早于物理删除开始时间，否则以新采样为准，防止重复扣减。无时间戳的采样不接受异步删除估算，等待后端容量刷新。
+
+### 副本预算与最低保留数
+
+`local_replica.replica_limits` 可配置 `max_replicas_per_key`、`max_instance_bytes`（两者为 0 时不限）和 `min_retained_replicas`（默认 1）。例如 `"replica_limits":{"max_replicas_per_key":3,"max_instance_bytes":10737418240,"min_retained_replicas":1}`。
+
+写入预算在元数据 RMW 时执行：每 key 上限保守统计所有 Location，包括 WRITING/DELETING 和拆分 spec 的 Location；实例容量包含原始副本及正在写入的副本，复用持久化容量统计。这样无需靠可能丢失的 hint 预留计数恢复预算。超限回滚新分配空间并返回容量错误；释放的元数据容量可再次使用。该预算约束 StartWriteCache，外部 ReportEvent 与独立迁移写入仍按各自配额管理。
+
+最低保留数仅用于节点压力淘汰，按每个 spec 的 SERVING 副本重新校验；WRITING、DELETING 和已消失的副本不计入。并发删除在元数据分片锁内扣减候选副本，保留数大于 1 同样有效。普通 TTL/显式删除不受此限制，仍可清空过期数据。

@@ -73,6 +73,8 @@ public:
 
     // ---- Resolve decisions (write / read / eviction) -----------------------
 
+    ReplicaLimits GetReplicaLimits(const AffinityResolveContext &ctx) const;
+
     WriteDecision ResolveWrite(const AffinityResolveContext &ctx);
 
     ReadDecision ResolveRead(const ReadRequest &req, const AffinityResolveContext &ctx);
