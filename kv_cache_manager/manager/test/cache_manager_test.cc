@@ -19,6 +19,7 @@
 #include "kv_cache_manager/affinity/node_metrics.h"
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/net_util.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/migration_strategy.h"
