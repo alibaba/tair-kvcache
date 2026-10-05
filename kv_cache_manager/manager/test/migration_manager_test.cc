@@ -30,6 +30,9 @@
 using namespace kv_cache_manager;
 
 namespace {
+using LegacyCreate = std::vector<std::pair<ErrorCode, DataStorageUri>> (DataStorageManager::*)(
+    RequestContext *, const std::string &, const std::vector<std::string> &, size_t, std::function<void()>);
+constexpr LegacyCreate kLegacyCreate = static_cast<LegacyCreate>(&DataStorageManager::Create);
 ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
                                   RequestContext *request_context,
                                   const KeyVector &keys,
@@ -1641,7 +1644,7 @@ TEST_F(MigrationManagerTest, TestSubmitReservesPreparingBeforeCreate) {
     preparing_reservation_stub::g_manager = &mgr;
     preparing_reservation_stub::g_expected_reservations = {{kInstance, block_key}};
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
+    stub.set(kLegacyCreate, preparing_reservation_stub::Create_stub);
 
     MigrationManager::MigrationRequest req;
     req.instance_id = kInstance;
@@ -1677,7 +1680,7 @@ TEST_F(MigrationManagerTest, TestSubmitCancelDuringPrepareStopsBeforeCopy) {
     preparing_reservation_stub::g_expected_reservations = {{kInstance, block_key}};
     preparing_reservation_stub::g_cancel_first_reservation_on_create = true;
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
+    stub.set(kLegacyCreate, preparing_reservation_stub::Create_stub);
 
     MigrationManager::MigrationRequest req;
     req.instance_id = kInstance;
@@ -1769,7 +1772,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmit) {
     preparing_reservation_stub::g_manager = &mgr;
     preparing_reservation_stub::g_expected_reservations = {{kInstance, 800}, {kInstance, 801}, {kInstance, 802}};
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
+    stub.set(kLegacyCreate, preparing_reservation_stub::Create_stub);
 
     auto results = mgr.BatchSubmit("t", reqs);
     ASSERT_EQ(3u, results.size());
@@ -1794,7 +1797,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitRejectsEmptySourceSpecsBeforeIo) {
     mgr.DebugEnableCopySubmissionsForTest();
     preparing_reservation_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
+    stub.set(kLegacyCreate, preparing_reservation_stub::Create_stub);
 
     MigrationManager::MigrationRequest request;
     request.instance_id = kInstance;
@@ -1817,7 +1820,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitRejectsMixedPreparedBatchBeforeIo) {
     mgr.DebugEnableCopySubmissionsForTest();
     preparing_reservation_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
+    stub.set(kLegacyCreate, preparing_reservation_stub::Create_stub);
 
     MigrationManager::MigrationRequest first;
     first.instance_id = kInstance;
@@ -1874,7 +1877,7 @@ TEST_F(MigrationManagerTest, TestBatchReservesAllBeforeCreateAndDeduplicates) {
     preparing_reservation_stub::g_manager = &mgr;
     preparing_reservation_stub::g_expected_reservations = {{kInstance, 810}, {kInstance, 811}};
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
+    stub.set(kLegacyCreate, preparing_reservation_stub::Create_stub);
 
     auto results = mgr.BatchSubmit(
         "batch_preparing_reservation", {first, duplicate, second}, MigrationManager::CopyConcurrencyLimit{"group_a", 2});
@@ -1964,7 +1967,7 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationPartialFailureKeepsSuccessfulCo
     preparing_reservation_stub::g_manager = &mgr;
     preparing_reservation_stub::g_expected_reservations = {{kInstance, block_keys[0]}, {kInstance, block_keys[1]}};
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
+    stub.set(kLegacyCreate, preparing_reservation_stub::Create_stub);
     stub.set(ADDR(DataStorageManager, Delete), preparing_reservation_stub::Delete_stub);
     stub.set(static_cast<preparing_reservation_stub::CopySubmitLocation>(ADDR(SchedulePlanExecutor, Submit)),
              preparing_reservation_stub::CopySubmitPending_stub);
@@ -2024,7 +2027,7 @@ TEST_F(MigrationManagerTest, TestBatchCancelDuringPrepareStopsBeforeCopy) {
     preparing_reservation_stub::g_expected_reservations = {{kInstance, block_key}};
     preparing_reservation_stub::g_cancel_first_reservation_on_create = true;
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
+    stub.set(kLegacyCreate, preparing_reservation_stub::Create_stub);
 
     const auto results = mgr.BatchSubmit("batch_cancel_preparing", {req});
     ASSERT_EQ(1u, results.size());
@@ -2062,7 +2065,7 @@ TEST_F(MigrationManagerTest, TestSlowCreateDoesNotSerializeOtherInstanceSubmit) 
 
     submission_concurrency_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), submission_concurrency_stub::Create_stub);
+    stub.set(kLegacyCreate, submission_concurrency_stub::Create_stub);
     auto first = std::async(std::launch::async,
                             [&]() { return mgr.Submit("parallel_submit_first", make_req(kInstance, 821, first_src)); });
     const bool first_entered = submission_concurrency_stub::WaitForFirstCreate();
@@ -2109,7 +2112,7 @@ TEST_F(MigrationManagerTest, TestDrainCancelsReservationDuringSlowCreate) {
 
     submission_concurrency_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), submission_concurrency_stub::Create_stub);
+    stub.set(kLegacyCreate, submission_concurrency_stub::Create_stub);
     auto submit = std::async(std::launch::async, [&]() { return mgr.Submit("drain_during_create", req); });
     const bool create_entered = submission_concurrency_stub::WaitForFirstCreate();
     if (!create_entered) {
@@ -2163,7 +2166,7 @@ TEST_F(MigrationManagerTest, TestStopWaitsForSlowSubmitLifecycle) {
 
     submission_concurrency_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), submission_concurrency_stub::Create_stub);
+    stub.set(kLegacyCreate, submission_concurrency_stub::Create_stub);
     auto submit =
         std::async(std::launch::async, [&]() { return mgr.Submit("stop_inflight_submit", make_req(824, first_src)); });
     const bool create_entered = submission_concurrency_stub::WaitForFirstCreate();
@@ -2224,7 +2227,7 @@ TEST_F(MigrationManagerTest, TestConcurrentBatchSubmitDoesNotOverissueGroupLimit
 
     submission_concurrency_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), submission_concurrency_stub::Create_stub);
+    stub.set(kLegacyCreate, submission_concurrency_stub::Create_stub);
     auto first =
         std::async(std::launch::async, [&]() { return mgr.BatchSubmit("concurrent_limit_first", {first_req}, limit); });
     const bool first_entered = submission_concurrency_stub::WaitForFirstCreate();
@@ -2379,7 +2382,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitPartialFailure) {
     mgr.DebugEnableCopySubmissionsForTest();
     prepared_batch_partial_create_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), prepared_batch_partial_create_stub::Create_stub);
+    stub.set(kLegacyCreate, prepared_batch_partial_create_stub::Create_stub);
     auto results = mgr.BatchSubmit("t", reqs);
     ASSERT_EQ(3u, results.size());
     ASSERT_EQ(ErrorCode::EC_OK, results[0]);
@@ -2407,7 +2410,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitHeteroSpecCreateFailNoOrphan) {
     orphan_cleanup_stub::g_deleted_uris.clear();
     orphan_cleanup_stub::g_create_call_count = 0;
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), orphan_cleanup_stub::Create_stub);
+    stub.set(kLegacyCreate, orphan_cleanup_stub::Create_stub);
     stub.set(ADDR(DataStorageManager, Delete), orphan_cleanup_stub::Delete_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
@@ -2469,7 +2472,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitShortCreateResultRollsBackWholeGroup
 
     create_result_shape_stub::Reset(create_result_shape_stub::Shape::kShort);
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), create_result_shape_stub::Create_stub);
+    stub.set(kLegacyCreate, create_result_shape_stub::Create_stub);
     stub.set(ADDR(DataStorageManager, Delete), create_result_shape_stub::Delete_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
@@ -2513,7 +2516,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitLongCreateResultDeletesEveryReturned
 
     create_result_shape_stub::Reset(create_result_shape_stub::Shape::kLong);
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), create_result_shape_stub::Create_stub);
+    stub.set(kLegacyCreate, create_result_shape_stub::Create_stub);
     stub.set(ADDR(DataStorageManager, Delete), create_result_shape_stub::Delete_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
