@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 
 #include <map>
 #include <memory>
@@ -180,11 +181,33 @@ struct SharedMemoryRegistration {
     int fd{-1};
 };
 
+// Monotonic counters for one ManagerClient. Byte success requires FinishWrite acknowledgement.
+struct ReplicationStats {
+    uint64_t submitted = 0;
+    uint64_t admitted = 0;
+    uint64_t succeeded = 0;
+    uint64_t failed = 0;
+    uint64_t skipped = 0;
+    uint64_t expired = 0;
+    uint64_t dropped_queue = 0;
+    uint64_t dropped_budget = 0;
+    uint64_t duplicates = 0;
+    uint64_t copied_bytes = 0;
+    uint64_t latency_us = 0;
+    uint64_t queue_wait_us = 0;
+    uint64_t queued = 0;
+    uint64_t pending_bytes = 0;
+    uint64_t active = 0;
+};
+
 struct InitParams {
+
     RoleType role_type{RoleType::UNKNOWN};
     RegistSpan *regist_span{nullptr};    // used by worker
     std::string self_location_spec_name; // used by worker
     std::string storage_configs;         // used by worker
+    // Optional metrics export callback, invoked outside executor locks.
+    std::function<void(const ReplicationStats &)> replication_metrics_callback;
 };
 
 struct ForwardContext {

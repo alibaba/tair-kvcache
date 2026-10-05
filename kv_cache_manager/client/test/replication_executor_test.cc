@@ -721,3 +721,48 @@ TEST(ReplicationResourcesTest, PacesEachNodeAndCancelsExpiredWorkWithoutLeakingB
     EXPECT_TRUE(resources.TryRetain(2, 2));
     resources.Release(2);
 }
+
+TEST_F(ReplicationExecutorTest, MetricsReportAcknowledgedSuccessAndExporterFailureDoesNotBreakWorker) {
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true))
+        .WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation())));
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce(Return(std::make_pair(ER_OK, UriStrVec{})));
+    EXPECT_CALL(mock_meta_, FinishWrite(_, _, _, _)).WillOnce(Return(ER_OK));
+    ReplicationOptions options;
+    std::atomic<int> exported{0};
+    options.metrics_callback = [&](const auto &stats) {
+        EXPECT_EQ(1u, stats.succeeded);
+        ++exported;
+        throw std::runtime_error("export unavailable");
+    };
+    ReplicationExecutor executor(&mock_meta_, &mock_transfer_, 1, 1024, options);
+    char data[16]{};
+    executor.SubmitWithData(MakeHint(1, "node"), data, sizeof(data), [] {});
+    executor.Shutdown();
+    const auto stats = executor.GetStats();
+    EXPECT_EQ(1u, stats.submitted); EXPECT_EQ(1u, stats.admitted);
+    EXPECT_EQ(1u, stats.succeeded); EXPECT_EQ(16u, stats.copied_bytes);
+    EXPECT_EQ(0u, stats.failed); EXPECT_EQ(0u, stats.active); EXPECT_EQ(0u, stats.queued);
+    EXPECT_EQ(1, exported.load());
+}
+
+TEST_F(ReplicationExecutorTest, MetricsDistinguishFailedSkippedExpiredAndBudgetDrops) {
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _))
+        .WillOnce(Return(std::make_pair(ER_CONNECT_FAIL, WriteLocation{})))
+        .WillOnce(Return(std::make_pair(ER_OK, MakeEmptyWriteLocation())));
+    ReplicationExecutor executor(&mock_meta_, &mock_transfer_, 1);
+    executor.Submit({MakeHint(1, "node"), MakeHint(2, "node")});
+    executor.Shutdown();
+    EXPECT_EQ(1u, executor.GetStats().failed);
+    EXPECT_EQ(1u, executor.GetStats().skipped);
+    EXPECT_EQ(0u, executor.GetStats().copied_bytes);
+    ReplicationOptions options;
+    options.max_age_ms = 0;
+    options.max_buffer_bytes = 8;
+    ReplicationExecutor expired(&mock_meta_, &mock_transfer_, 1, 1024, options);
+    expired.Submit({MakeHint(3, "node", "rdma://src/x?size=4"),
+                    MakeHint(4, "node", "rdma://src/x?size=16")});
+    expired.Shutdown();
+    EXPECT_EQ(1u, expired.GetStats().expired);
+    EXPECT_EQ(1u, expired.GetStats().dropped_budget);
+    EXPECT_EQ(0u, expired.GetStats().failed);
+}

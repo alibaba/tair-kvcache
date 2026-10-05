@@ -53,6 +53,7 @@ struct ReplicationOptions {
     uint64_t node_bytes_per_second = 0; // 0 = unlimited
     uint32_t max_age_ms = 30000;
     std::string instance_id;
+    std::function<void(const ReplicationStats &)> metrics_callback;
 };
 
 // Shared by all SDK executors in a process. Fair admission rotates among
@@ -80,6 +81,9 @@ struct ReplicationTask {
     ClientReplicationHint hint;
     const void *data = nullptr;
     size_t data_size = 0;
+    enum class Outcome { Failed, Succeeded, Skipped, Expired };
+    Outcome outcome = Outcome::Failed;
+    uint64_t copied_bytes = 0;
     ReleaseGuard retained_memory;
     ReleaseGuard guard;
     size_t pending_bytes = 0;
@@ -96,6 +100,7 @@ public:
     void Submit(const std::vector<ClientReplicationHint> &hints);
     void SubmitWithData(ClientReplicationHint hint, const void *data, size_t size, std::function<void()> release_fn);
     void Shutdown();
+    ReplicationStats GetStats() const;
 
 private:
     void WorkerLoop();
@@ -110,7 +115,22 @@ private:
     ReplicationOptions options_;
     size_t pending_bytes_{0};
 
-    std::mutex mu_;
+    mutable std::mutex mu_;
+    struct Counters {
+        std::atomic<uint64_t> submitted{0};
+        std::atomic<uint64_t> admitted{0};
+        std::atomic<uint64_t> succeeded{0};
+        std::atomic<uint64_t> failed{0};
+        std::atomic<uint64_t> skipped{0};
+        std::atomic<uint64_t> expired{0};
+        std::atomic<uint64_t> dropped_queue{0};
+        std::atomic<uint64_t> dropped_budget{0};
+        std::atomic<uint64_t> duplicates{0};
+        std::atomic<uint64_t> copied_bytes{0};
+        std::atomic<uint64_t> latency_us{0};
+        std::atomic<uint64_t> queue_wait_us{0};
+        std::atomic<uint64_t> active{0};
+    } counters_;
     std::condition_variable cv_;
     std::deque<ReplicationTask> queue_;
     std::set<std::string> inflight_;

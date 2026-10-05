@@ -55,6 +55,7 @@ public:
                                                        const BlockBuffers &block_buffers) override;
 
     std::string GetCallerNode() const override;
+    ReplicationStats GetReplicationStats() const override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, InitParams &init_params) override;
