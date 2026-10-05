@@ -97,8 +97,8 @@ bazelisk --output_base=/tmp/bazel-affinity-e2e-os test \
   //integration_test/affinity:affinity_replication_test
 ```
 
-多 spec 复制需同时升级服务端与 SDK。旧 `source_uri` 仅用于单 spec；新 `source_specs`
-不能由旧 SDK 忽略后继续按单 spec 复制。现有单指针缓冲区接口在多 spec 时回退到完整异步读取。
+多 spec 复制通过 `replication_capabilities` 协商，旧客户端保留正常读取和单 spec 提示。
+`ReplicateWithBuffers` 支持按名称复用部分/全部 spec 的有 owner 缓冲区；旧单指针接口在多 spec 时回退到完整异步读取。
 
 ## 与最新主干合并后的回归
 
@@ -118,4 +118,13 @@ bazelisk --output_base=/tmp/bazel-affinity-e2e-os test \
   //kv_cache_manager/meta/test:meta_indexer_node_lru_test
 ```
 
-滞回中的释放字节仍为删除提交成功后的估算值；物理删除完成确认仍属于待完善项。
+滞回仅计入后端确认成功的物理删除字节，并用采样时间校验，失败/超时/NOENT 不算新增释放。
+
+新增回归覆盖：
+
+- `MetaSearcherTest`：并发副本数量/实例容量准入，按 spec 最低保留数的并发删除校验。
+- `SchedulePlanExecutorTest` / `CacheReclaimerTest`：部分成功、重复 URI、晚到反馈与新容量样本竞态。
+- `CacheAffinityManagerIntegrationTest` / `FrequencySketchTest`：能力协商、热度衰减、复制成本、前缀位置和拓扑文件刷新/失效。
+- `ReplicationExecutorTest`：进程内资源预算、实例轮转、每节点限速、结果统计及具名缓冲区所有权。
+
+原生测试中的 GPU 缓冲区用例验证类型传递与所有权，实际 GPU DMA 仍需双机环境执行。
