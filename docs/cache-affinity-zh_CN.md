@@ -330,3 +330,7 @@ public:
 | `prefer_local{on_miss:"abort"}` 找不到本机 | strategy abort 向上传,`Resolve` 返回 `EC_ERROR`。v1 在 `CacheManager::ResolveAffinityHints` 里降级为日志 + 空 hints(写继续走老路径)。如果想升级成硬错误,去掉那段降级即可 |
 | process 级 JSON 格式错(含未注册指标名、`and:[]` 等) | `LoadProcessStrategyFromJson*` 返回 `false`;已有 process 级策略(如果有的话)保持不变;instance / instance_group 级别不受影响 |
 | `node_name.include / exclude` 里有非法正则 | 同上 —— process 级加载失败不会留下半截状态;override 级别则视为该层解析失败、落到下一层 |
+
+### 删除完成反馈
+
+节点压力回收只在异步删除返回终态后计入释放容量。每个实际删除成功的 URI 按 spec 所属节点累计字节；重复 URI、已不存在、失败、超时和仅删除元数据均不产生释放量。部分成功保留成功部分的反馈，迟到的成功也可反馈。容量采样时间必须早于物理删除开始时间，否则以新采样为准，防止重复扣减。无时间戳的采样不接受异步删除估算，等待后端容量刷新。

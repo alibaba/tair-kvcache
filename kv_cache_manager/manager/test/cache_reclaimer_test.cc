@@ -8447,3 +8447,31 @@ TEST_F(CacheReclaimerTest, NodePressureHonorsEachInstanceOverrideAndContinuesAft
     EXPECT_EQ((std::vector<std::string>{"enabled"}), reclaimed);
     stub_.reset(ADDR(CacheReclaimer, ReclaimByNode));
 }
+
+TEST_F(CacheReclaimerTest, NodeCreditWaitsForTerminalPhysicalResultsIncludingLatePartialSuccess) {
+    auto affinity = std::make_shared<CacheAffinityManager>();
+    ASSERT_TRUE(affinity->LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})"));
+    affinity->UpsertNodeMetrics({"node", "node", DataStorageType{}, 80, 0.92, 0, 0, 1});
+    cache_reclaimer_->Stop();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
+        10, 100, 10, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr,
+        CacheReclaimerAsyncDeleteConfig{}, nullptr, CacheReclaimerGroupLruConfig{}, affinity);
+    const auto now = std::chrono::steady_clock::now();
+    std::promise<PlanExecuteResult> promise;
+    cache_reclaimer_->delete_handlers_.emplace_front(
+        request_context_, "test_instance", "test_instance_group", 1, 1,
+        std::vector<CacheReclaimer::PendingLocationKey>{}, CacheReclaimer::BytesByStorageType{},
+        CacheReclaimer::CountsByStorageType{}, 0, now, now, promise.get_future());
+    cache_reclaimer_->AddDeleteHandlerState(cache_reclaimer_->delete_handlers_.front());
+    cache_reclaimer_->HandleDelRes(); // Timed out admission is not freed capacity.
+    EXPECT_EQ(1u, affinity->ResolveEviction({}).size());
+    PlanExecuteResult partial{EC_PARTIAL_OK, "one spec failed"};
+    partial.deleted_bytes_by_node["node"] = 250;
+    partial.physical_delete_started_at_us = 2;
+    promise.set_value(partial);
+    cache_reclaimer_->HandleDelRes();
+    EXPECT_TRUE(affinity->ResolveEviction({}).empty());
+    EXPECT_TRUE(cache_reclaimer_->delete_handlers_.empty());
+    cache_reclaimer_->HandleDelRes(); // A consumed future cannot credit twice.
+    EXPECT_TRUE(affinity->ResolveEviction({}).empty());
+}

@@ -13,6 +13,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
@@ -305,6 +306,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
     size_t total_locations_to_delete = 0;
 
     std::map<std::string, std::vector<DataStorageUri>> delete_uris_by_unique_name;
+    std::map<std::string, std::string> node_by_uri;
     for (size_t i = 0; i < task.block_keys.size(); i++) {
         auto &block_key = task.block_keys[i];
         auto &location_map = location_maps[i];
@@ -329,7 +331,9 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
                             continue;
                         }
                         std::string storage_unique_name = uri.GetHostName();
-                        delete_uris_by_unique_name[storage_unique_name].emplace_back(uri);
+                        if (node_by_uri.emplace(uri.ToUriString(), loc_spec.node_id()).second) {
+                            delete_uris_by_unique_name[storage_unique_name].emplace_back(uri);
+                        }
                     }
                 }
             }
@@ -346,12 +350,24 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
 
     // delete storage uris
     auto request_context = std::make_shared<RequestContext>("location_del_task_trace");
+    result.physical_delete_started_at_us = TimestampUtil::GetCurrentTimeUs();
     for (const auto &storage_uris_pair : delete_uris_by_unique_name) {
         const std::string &storage_unique_name = storage_uris_pair.first;
         const std::vector<DataStorageUri> &storage_uris = storage_uris_pair.second;
         KVCM_LOG_DEBUG("Deleting %zu entries from storage: %s", storage_uris.size(), storage_unique_name.c_str());
-        std::vector<ErrorCode> delete_results =
-            data_storage_manager_->Delete(request_context.get(), storage_unique_name, storage_uris, nullptr);
+        std::vector<ErrorCode> delete_results;
+        try {
+            delete_results = data_storage_manager_->Delete(request_context.get(), storage_unique_name, storage_uris, nullptr);
+        } catch (const std::exception &e) {
+            // Preserve completed physical deletes when a later backend throws.
+            result.status = EC_ERROR;
+            result.error_message = e.what();
+            return result;
+        } catch (...) {
+            result.status = EC_ERROR;
+            result.error_message = "storage delete threw an unknown exception";
+            return result;
+        }
         if (delete_results.size() != storage_uris.size()) {
             result.status = ErrorCode::EC_PARTIAL_OK;
             result.error_message =
@@ -366,6 +382,15 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
         size_t failed_count = 0;
         size_t first_failed_index = 0;
         for (size_t i = 0; i < result_count; ++i) {
+            if (delete_results[i] == EC_OK) {
+                const auto &node = node_by_uri.at(storage_uris[i].ToUriString());
+                int64_t bytes = 0;
+                storage_uris[i].GetParamAs<int64_t>("size", bytes);
+                if (!node.empty() && bytes > 0) {
+                    auto &total = result.deleted_bytes_by_node[node];
+                    total += std::min(bytes, std::numeric_limits<int64_t>::max() - total);
+                }
+            }
             if (delete_results[i] != ErrorCode::EC_OK && delete_results[i] != ErrorCode::EC_NOENT) {
                 if (failed_count == 0) {
                     first_failed_index = i;
