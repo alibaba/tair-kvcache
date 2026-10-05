@@ -790,4 +790,31 @@ TEST_F(CacheAffinityManagerIntegrationTest, CapabilityNegotiationPreservesLegacy
     EXPECT_EQ(1u, manager.ResolveRead(request, ctx).side_effects.size());
 }
 
+TEST_F(CacheAffinityManagerIntegrationTest, AdmissionAccountsForCopyCostPrefixPositionAndHeatDecay) {
+    int64_t now = 1000000;
+    CacheAffinityManager manager(30, [&] { return now; });
+    ASSERT_TRUE(manager.LoadProcessStrategyFromJsonString(R"({"type":"local_replica","read":{"on_miss":{
+        "replication_hot_threshold":1,"suppression_window_ms":0,"heat_half_life_ms":100,
+        "max_replication_bytes":100,"min_benefit_ratio":2,"prefix_bonus":1}}})"));
+    LocationSpec remote("kv", "rdma://src/kv?size=100", "source");
+    CacheLocation winner;
+    ReadRequest request{200, {{"kv", {&remote}}}, &winner};
+    AffinityResolveContext ctx;
+    ctx.caller_node.node_id = "reader";
+    EXPECT_TRUE(manager.ResolveRead(request, ctx).side_effects.empty());
+    EXPECT_EQ(1u, manager.ResolveRead(request, ctx).side_effects.size());
+    now += 200000; // Old heat decays to zero before the next observation.
+    EXPECT_TRUE(manager.ResolveRead(request, ctx).side_effects.empty());
+    request.block_key = 201;
+    request.prefix_position = 0;
+    EXPECT_EQ(1u, manager.ResolveRead(request, ctx).side_effects.size());
+    request.block_key = 202;
+    request.prefix_position = 9;
+    EXPECT_TRUE(manager.ResolveRead(request, ctx).side_effects.empty());
+    LocationSpec oversize("kv", "rdma://src/kv?size=101", "source");
+    request.spec_candidates["kv"] = {&oversize};
+    request.prefix_position = 0;
+    for (int i = 0; i < 5; ++i) EXPECT_TRUE(manager.ResolveRead(request, ctx).side_effects.empty());
+}
+
 } // namespace kv_cache_manager

@@ -2,6 +2,7 @@
 
 #include "kv_cache_manager/affinity/frequency_sketch.h"
 #include "kv_cache_manager/affinity/hint_suppressor.h"
+#include "kv_cache_manager/common/standard_uri.h"
 
 namespace kv_cache_manager {
 
@@ -52,7 +53,24 @@ ReadDecision LocalReplicaAffinityStrategy::ResolveRead(const ReadRequest &req, c
     }
     // 喂 sketch（机制层，永远 active；只在远端命中时累加）
     if (params_.sketch != nullptr) {
-        params_.sketch->Observe(ctx.caller_node.node_id, req.block_key, ctx.instance_id);
+        params_.sketch->Observe(ctx.caller_node.node_id, req.block_key, ctx.instance_id, params_.heat_half_life_ms);
+    }
+    if (params_.max_replication_bytes > 0 || params_.min_benefit_ratio > 0) {
+        uint64_t copied = 0, remote = 0;
+        for (const auto &entry : dec.picked_specs) {
+            uint64_t bytes = 0;
+            StandardUri(entry.second->uri()).GetParamAs<uint64_t>("size", bytes);
+            if (bytes == 0 || bytes > UINT64_MAX - copied) return dec;
+            copied += bytes;
+            if (entry.second->node_id() != ctx.caller_node.node_id) remote += bytes;
+        }
+        if (params_.max_replication_bytes > 0 && copied > params_.max_replication_bytes) return dec;
+        const auto heat = params_.sketch ? params_.sketch->RemoteCount(ctx.caller_node.node_id, req.block_key,
+                                                ctx.instance_id, params_.heat_half_life_ms) : 0;
+        const double prefix_weight = req.prefix_position < 0 ? 1.0 :
+            1.0 + params_.prefix_bonus / (static_cast<double>(req.prefix_position) + 1.0);
+        const long double benefit = static_cast<long double>(remote) * heat * prefix_weight;
+        if (benefit < static_cast<long double>(copied) * params_.min_benefit_ratio) return dec;
     }
     if (ShouldEmitReplicationHint(req.block_key, /*has_local=*/false, req.winner_tier, ctx)) {
         const bool allow = params_.suppressor == nullptr ||
@@ -157,7 +175,7 @@ bool LocalReplicaAffinityStrategy::ShouldEmitReplicationHint(int64_t block_key,
     if (params_.sketch == nullptr) {
         return false; // 没 sketch 拿不到计数，保守不发
     }
-    uint32_t cnt = params_.sketch->RemoteCount(ctx.caller_node.node_id, block_key, ctx.instance_id);
+    uint32_t cnt = params_.sketch->RemoteCount(ctx.caller_node.node_id, block_key, ctx.instance_id, params_.heat_half_life_ms);
     if (cnt < params_.replication_hot_threshold) {
         return false;
     }

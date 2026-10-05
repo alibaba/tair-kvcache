@@ -17,7 +17,8 @@
 namespace kv_cache_manager {
 
 CacheAffinityManager::CacheAffinityManager(uint32_t node_metrics_ttl_seconds, ClockFn clock)
-    : node_metrics_ttl_us_(static_cast<int64_t>(node_metrics_ttl_seconds) * 1000000), clock_(std::move(clock)) {}
+    : node_metrics_ttl_us_(static_cast<int64_t>(node_metrics_ttl_seconds) * 1000000), clock_(std::move(clock)),
+      sketch_(1000000, [this] { return Now() / 1000; }) {}
 
 int64_t CacheAffinityManager::Now() const {
     return clock_ ? clock_() : std::chrono::duration_cast<std::chrono::microseconds>(

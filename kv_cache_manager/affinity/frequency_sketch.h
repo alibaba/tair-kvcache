@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <mutex>
 #include <string>
@@ -27,13 +28,17 @@ namespace kv_cache_manager {
 class FrequencySketch {
 public:
     // 默认容量 100 万条；上限以 LRU 淘汰。
-    explicit FrequencySketch(size_t capacity = 1000000) : capacity_(capacity) {}
+    using ClockFn = std::function<int64_t()>; // monotonic milliseconds
+    explicit FrequencySketch(size_t capacity = 1000000, ClockFn clock = {})
+        : capacity_(capacity), clock_(std::move(clock)) {}
 
     // 记录一次远端命中：counter += 1；若不存在则 init 为 1。
-    void Observe(const std::string &caller_node_id, int64_t block_key, const std::string &instance_id = {});
+    void Observe(const std::string &caller_node_id, int64_t block_key, const std::string &instance_id = {},
+                 uint32_t half_life_ms = 60000);
 
     // 查询当前 counter 值，不存在返回 0。
-    uint32_t RemoteCount(const std::string &caller_node_id, int64_t block_key, const std::string &instance_id = {}) const;
+    uint32_t RemoteCount(const std::string &caller_node_id, int64_t block_key, const std::string &instance_id = {},
+                         uint32_t half_life_ms = 60000) const;
 
     // 显式重置某 entry（例如 hint 已发出 + 进入 dedup 窗口）。
     void Reset(const std::string &caller_node_id, int64_t block_key, const std::string &instance_id = {});
@@ -53,6 +58,8 @@ private:
     };
     struct Entry {
         uint32_t count = 0;
+        int64_t epoch_ms = 0;
+        uint32_t half_life_ms = 60000;
         // 指向 lru_ 中的位置，方便 O(1) 更新
         typename std::list<Key>::iterator lru_it;
     };
@@ -62,6 +69,9 @@ private:
 
     mutable std::mutex mu_;
     size_t capacity_;
+    ClockFn clock_;
+    int64_t Now() const;
+    static uint32_t DecayedCount(const Entry &entry, int64_t now, uint32_t half_life_ms);
     std::unordered_map<Key, Entry, KeyHash> table_;
     std::list<Key> lru_; // 最近访问在 front，淘汰从 back
 };

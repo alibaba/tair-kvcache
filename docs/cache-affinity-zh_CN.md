@@ -356,3 +356,9 @@ public:
 ### 分批升级
 
 新 SDK 在 CallerNode 中声明 `replication_capabilities=1`，服务端确认后才传送多 spec 提示。旧客户端（字段缺省/0）保留正常读选路与单 spec 复制。新 SDK 遇到未确认能力的旧服务端会忽略多 spec 提示，不影响正常读取；不支持的提示不会占用服务端的复制抑制窗口。
+
+### 热度衰减和收益准入
+
+`read.on_miss.heat_half_life_ms` 默认 60000，远端命中热度每个半衰期减半，长期未访问的 key 不再保持高热度。设为 0 可保留累计计数；更改半衰期会重新累积证据。Instance/调用节点隔离不变。
+
+可选 `max_replication_bytes` 限制整个 block 的复制字节，`min_benefit_ratio` 限制“衰减热度 × 每次可避免的远端字节 / 复制总字节”。二者默认 0（关闭）；启用后无法解析 size 的 spec 保守拒绝复制。已本地命中的 spec 仍产生复制成本，但不算远端收益。`prefix_bonus` 默认 0，前缀查询中的收益乘以 `1 + prefix_bonus / (position + 1)`；批量和滑窗查询不加权。这是可调的收益估计，并非在线预测模型。

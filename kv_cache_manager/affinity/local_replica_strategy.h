@@ -44,6 +44,10 @@ public:
 
         // === 读一级 on_miss 子项 (read.on_miss)：复制触发参数 ===
         bool enable_on_miss = true;              // 子开关：关闭后 ResolveRead 不再产出 hints
+        uint32_t heat_half_life_ms = 60000;
+        uint64_t max_replication_bytes = 0;
+        double min_benefit_ratio = 0; // expected avoided remote bytes / copied bytes
+        double prefix_bonus = 0; // weight multiplier = 1 + bonus / (prefix position + 1)
         uint32_t replication_hot_threshold = 3;  // 远端命中次数阈值
         double caller_capacity_threshold = 0.85; // caller 节点 load_ratio 上限
         double caller_capacity_buffer = 0.05;    // 缓冲带

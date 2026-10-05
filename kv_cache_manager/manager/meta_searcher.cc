@@ -199,7 +199,8 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
                                              int64_t block_key,
                                              const AffinityResolveContext *resolve_ctx,
                                              std::vector<std::string> &out_prune_loc_ids,
-                                             std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects) {
+                                             std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects,
+                                             int64_t prefix_position = -1) {
     // Filter valid locations into a shared map.
     CacheLocationMap valid_map;
     for (auto &[id, loc_ptr] : location_map) {
@@ -235,6 +236,7 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     if (affinity_manager != nullptr && resolve_ctx != nullptr) {
         ReadRequest req;
         req.block_key = block_key;
+        req.prefix_position = prefix_position;
         req.winner_tier = winner.get();
         for (const auto &[id, loc_ptr] : valid_map) {
             if (!loc_ptr || !policy->IsSameDataStorage(*loc_ptr, *winner)) {
@@ -1482,7 +1484,7 @@ MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_context,
                                                               keys[i],
                                                               resolve_ctx,
                                                               prune_loc_ids,
-                                                              &out_side_effects);
+                                                              &out_side_effects, static_cast<int64_t>(i));
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);

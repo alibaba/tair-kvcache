@@ -62,6 +62,7 @@ struct ReadRequest {
     std::map<std::string, std::vector<const LocationSpec *>> spec_candidates;
     // SelectForMatch 已选出的 winner tier（决定 backend type）
     const CacheLocation *winner_tier = nullptr;
+    int64_t prefix_position = -1; // -1 = unordered batch/sliding-window query
 };
 
 struct ReadDecision {

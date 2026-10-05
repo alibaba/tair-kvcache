@@ -89,4 +89,24 @@ TEST_F(FrequencySketchTest, InstanceCountersAndResetAreIndependent) {
     EXPECT_EQ(0u, sketch.RemoteCount("c", 7, "a:b"));
 }
 
+TEST_F(FrequencySketchTest, DecaysAcrossIdlePeriodsAndDoesNotRefreshOnRead) {
+    int64_t now = 1000;
+    FrequencySketch sketch(10, [&] { return now; });
+    for (int i = 0; i < 8; ++i) sketch.Observe("a", 1, "instance", 100);
+    now += 100;
+    EXPECT_EQ(4u, sketch.RemoteCount("a", 1, "instance", 100));
+    EXPECT_EQ(4u, sketch.RemoteCount("a", 1, "instance", 100));
+    now += 100;
+    sketch.Observe("a", 1, "instance", 100);
+    EXPECT_EQ(3u, sketch.RemoteCount("a", 1, "instance", 100));
+    now += 3200;
+    EXPECT_EQ(0u, sketch.RemoteCount("a", 1, "instance", 100));
+    sketch.Observe("a", 1, "instance", 100);
+    EXPECT_EQ(1u, sketch.RemoteCount("a", 1, "instance", 100));
+    EXPECT_EQ(0u, sketch.RemoteCount("a", 1, "other", 100));
+    EXPECT_EQ(0u, sketch.RemoteCount("a", 1, "instance", 200));
+    sketch.Observe("a", 1, "instance", 200);
+    EXPECT_EQ(1u, sketch.RemoteCount("a", 1, "instance", 200));
+}
+
 } // namespace kv_cache_manager

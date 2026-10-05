@@ -68,6 +68,11 @@ void ApplyOnMiss(const rapidjson::Value &on_miss, LocalReplicaAffinityStrategy::
     // 子开关：on_miss 路径可单独关停（不影响 read.pick 本地优先）
     ReadBoolField(on_miss, "enabled", p.enable_on_miss);
     ReadUIntField(on_miss, "replication_hot_threshold", p.replication_hot_threshold);
+    ReadUIntField(on_miss, "heat_half_life_ms", p.heat_half_life_ms);
+    ReadDoubleField(on_miss, "min_benefit_ratio", p.min_benefit_ratio);
+    ReadDoubleField(on_miss, "prefix_bonus", p.prefix_bonus);
+    if (on_miss.HasMember("max_replication_bytes") && on_miss["max_replication_bytes"].IsUint64())
+        p.max_replication_bytes = on_miss["max_replication_bytes"].GetUint64();
     ReadDoubleField(on_miss, "caller_capacity_threshold", p.caller_capacity_threshold);
     ReadDoubleField(on_miss, "caller_capacity_buffer", p.caller_capacity_buffer);
     ReadUIntField(on_miss, "suppression_window_ms", p.suppression_window_ms);
@@ -176,6 +181,19 @@ std::shared_ptr<AffinityStrategy> StrategyFactory::ParseJsonString(const std::st
         return std::make_shared<NoopAffinityStrategy>();
     }
     if (type == kTypeLocalReplica) {
+        if (target->HasMember("read") && (*target)["read"].IsObject() &&
+            (*target)["read"].HasMember("on_miss") && (*target)["read"]["on_miss"].IsObject()) {
+            const auto &on_miss = (*target)["read"]["on_miss"];
+            for (const char *name : {"min_benefit_ratio", "prefix_bonus"}) {
+                if (on_miss.HasMember(name) && (!on_miss[name].IsNumber() || on_miss[name].GetDouble() < 0)) {
+                    SetErr(error_msg, std::string(name) + " must be non-negative"); return nullptr;
+                }
+            }
+            if ((on_miss.HasMember("heat_half_life_ms") && !on_miss["heat_half_life_ms"].IsUint()) ||
+                (on_miss.HasMember("max_replication_bytes") && !on_miss["max_replication_bytes"].IsUint64())) {
+                SetErr(error_msg, "heat/copy limits must be non-negative integers"); return nullptr;
+            }
+        }
         if (target->HasMember("replica_limits")) {
             const auto &limits = (*target)["replica_limits"];
             if (!limits.IsObject() ||
