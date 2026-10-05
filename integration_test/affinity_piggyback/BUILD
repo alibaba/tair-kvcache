@@ -5,6 +5,6 @@ cc_binary(
     srcs = ["mock_inference_node.cc"],
     deps = [
         "//kv_cache_manager/client",
-        "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/common:standard_uri",
     ],
 )

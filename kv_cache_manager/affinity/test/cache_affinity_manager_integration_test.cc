@@ -40,6 +40,54 @@ CacheAffinityManager &NewManager() {
 
 class CacheAffinityManagerIntegrationTest : public TESTBASE {};
 
+// Strategy lifecycle only: storage deletion is covered by CacheReclaimerTest,
+// and physical replica publication is checked by mock_inference_node.
+TEST_F(CacheAffinityManagerIntegrationTest, EvictedReplicaCanBeRecreatedAfterCapacityRecovers) {
+    auto &mgr = NewManager();
+    ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
+        "type":"local_replica",
+        "read":{"on_miss":{"replication_hot_threshold":1,"suppression_window_ms":0}},
+        "eviction":{"ops":[{"op":"node_water_level","threshold":0.85,"low":0.70}]}
+    })"));
+    mgr.UpsertNodeMetrics({"a", "a", DataStorageType{}, 800, 0.20, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"b", "b", DataStorageType{}, 800, 0.20, 0, 0, 1});
+    AffinityResolveContext ctx;
+    ctx.instance_id = "lifecycle";
+    ctx.caller_node.node_id = "a";
+    LocationSpec remote("tp0", "tair://b/key", "b");
+    LocationSpec local("tp0", "tair://a/key", "a");
+    CacheLocation winner;
+    winner.push_location_spec(remote);
+    ReadRequest req;
+    req.block_key = 9001;
+    req.winner_tier = &winner;
+    req.spec_candidates["tp0"] = {&remote};
+    ASSERT_EQ(1u, mgr.ResolveRead(req, ctx).side_effects.size());
+
+    req.spec_candidates["tp0"] = {&remote, &local};
+    auto local_read = mgr.ResolveRead(req, ctx);
+    ASSERT_EQ(&local, local_read.picked_specs.at("tp0"));
+    ASSERT_TRUE(local_read.side_effects.empty());
+
+    mgr.UpsertNodeMetrics({"a", "a", DataStorageType{}, 80, 0.92, 0, 0, 2});
+    EXPECT_EQ((std::unordered_set<std::string>{"a"}), mgr.ResolveEviction(ctx));
+    mgr.ReportEvictedBytes("a", 250); // estimated 92% -> 67%, below low watermark
+    EXPECT_TRUE(mgr.ResolveEviction(ctx).empty());
+    req.spec_candidates["tp0"] = {&remote}; // storage has removed the local replica
+    auto remote_read = mgr.ResolveRead(req, ctx);
+    EXPECT_EQ(&remote, remote_read.picked_specs.at("tp0"));
+    EXPECT_TRUE(remote_read.side_effects.empty()); // last observed capacity is still high
+
+    mgr.UpsertNodeMetrics({"a", "a", DataStorageType{}, 400, 0.60, 0, 0, 3});
+    EXPECT_TRUE(mgr.ResolveEviction(ctx).empty());
+    auto retry = mgr.ResolveRead(req, ctx);
+    ASSERT_EQ(1u, retry.side_effects.size());
+    auto *hint = dynamic_cast<ReplicationHintSideEffect *>(retry.side_effects.front().get());
+    ASSERT_NE(nullptr, hint);
+    EXPECT_EQ("a", hint->target_node_id);
+    EXPECT_EQ(remote.uri(), hint->source_uri);
+}
+
 // Full local_replica JSON config used across most tests. Enables all three
 // aspects (write/read/eviction) with the 5-stage pipeline, on_miss replication,
 // and node water level eviction.
