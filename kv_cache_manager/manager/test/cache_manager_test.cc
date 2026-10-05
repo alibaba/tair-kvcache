@@ -11174,4 +11174,17 @@ TEST_F(CacheManagerAffinityTest, WritePathWithAffinityManagerNoCrash) {
     }
 }
 
+TEST_F(CacheManagerAffinityTest, StrictReplicationCannotUseSameSupernodeFallback) {
+    ASSERT_TRUE(affinity_manager_->LoadProcessStrategyFromJsonString(R"({"type":"local_replica","write":{"ops":{
+        "prefer_local":{"same_supernode":true}}}})"));
+    NodeMetrics peer;
+    peer.node_id = NetUtil::GetLocalIp();
+    peer.supernode_id = "rack";
+    affinity_manager_->UpsertNodeMetrics(peer);
+    request_context_->set_caller_node(CallerNode{"missing_caller", "rack"});
+    request_context_->set_is_replication(true);
+    auto result = cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {9981}, {}, {}, 60);
+    EXPECT_NE(EC_OK, result.first);
+}
+
 } // namespace kv_cache_manager

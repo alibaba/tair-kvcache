@@ -37,6 +37,7 @@ struct NodeMetrics {
     int64_t updated_at_us = 0;
     // Explicit capacity avoids inferring total=0 on a completely full node.
     uint64_t total_bytes = 0;
+    std::string supernode_id;
 };
 
 } // namespace kv_cache_manager

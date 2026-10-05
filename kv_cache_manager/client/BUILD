@@ -76,6 +76,7 @@ cc_library(
         "//kv_cache_manager/client/src/internal/sdk",
         "//kv_cache_manager/client/src/internal/stub:grpc_stub",
         "//kv_cache_manager/common:affinity_types",
+        "//kv_cache_manager/common:node_topology",
         "//kv_cache_manager/common:env_util",
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:string_util",

@@ -26,6 +26,11 @@ bool ParsePreferLocal(const rapidjson::Value &v, PreferLocalSpec *out, std::stri
         return false;
     }
     out->on_miss = PreferLocalSpec::OnMiss::kPassthrough;
+    if (auto it = v.FindMember("same_supernode"); it != v.MemberEnd()) {
+        if (!it->value.IsBool()) { SetError(err, "same_supernode must be boolean"); return false; }
+        out->same_supernode = it->value.GetBool();
+    }
+
     auto it = v.FindMember("on_miss");
     if (it != v.MemberEnd()) {
         if (!it->value.IsString()) {
@@ -141,6 +146,8 @@ uint64_t HashTraceId(const std::string &trace_id) {
 void ApplyPreferLocal(const PreferLocalSpec &spec,
                       const std::vector<std::string> &input,
                       const std::string &caller_node_id,
+                      const std::string &supernode_id,
+                      const std::function<const NodeMetrics *(const std::string &)> &find_metrics,
                       CandidatePipeline::ApplyResult *result) {
     bool found = false;
     std::vector<std::string> locals;
@@ -154,6 +161,13 @@ void ApplyPreferLocal(const PreferLocalSpec &spec,
     if (found) {
         result->nodes = std::move(locals);
         return;
+    }
+    if (spec.same_supernode && !supernode_id.empty() && find_metrics) {
+        for (const auto &id : input) {
+            const auto *node = find_metrics(id);
+            if (node && node->supernode_id == supernode_id) locals.push_back(id);
+        }
+        if (!locals.empty()) { result->nodes = std::move(locals); return; }
     }
     if (spec.on_miss == PreferLocalSpec::OnMiss::kAbort) {
         result->status = CandidatePipeline::Status::kAbort;
@@ -339,7 +353,7 @@ CandidatePipeline::Apply(const std::vector<std::string> &candidates,
     }
 
     if (prefer_local.has_value()) {
-        ApplyPreferLocal(*prefer_local, r.nodes, caller.node_id, &r);
+        ApplyPreferLocal(*prefer_local, r.nodes, caller.node_id, caller.supernode_id, find_metrics, &r);
         if (r.status == Status::kAbort) {
             return r;
         }

@@ -362,3 +362,9 @@ public:
 `read.on_miss.heat_half_life_ms` 默认 60000，远端命中热度每个半衰期减半，长期未访问的 key 不再保持高热度。设为 0 可保留累计计数；更改半衰期会重新累积证据。Instance/调用节点隔离不变。
 
 可选 `max_replication_bytes` 限制整个 block 的复制字节，`min_benefit_ratio` 限制“衰减热度 × 每次可避免的远端字节 / 复制总字节”。二者默认 0（关闭）；启用后无法解析 size 的 spec 保守拒绝复制。已本地命中的 spec 仍产生复制成本，但不算远端收益。`prefix_bonus` 默认 0，前缀查询中的收益乘以 `1 + prefix_bonus / (position + 1)`；批量和滑窗查询不加权。这是可调的收益估计，并非在线预测模型。
+
+### 超节点拓扑和选路
+
+部署时为 KVCM 和 SDK 设置 `KVCM_NODE_TOPOLOGY_FILE`，文件内容为 `{"nodes":{"node_uuid_a":"rack1","node_uuid_b":"rack1"}}`，节点标识必须与存储返回的 node_id 一致。以原子替换方式更新文件；进程每 5 秒刷新。读取失败或 JSON 非法时短期保留上一次映射，30 秒后降级为未知拓扑。空 nodes 可主动清空。SDK 据此填充 CallerNode.supernode_id，服务端也会根据映射补全调用方和 NodeMetrics；后端直接上报的拓扑仍可作为来源。
+
+读优先本机，其次同 supernode，最后沿用远端候选顺序。写流水线使用 `"prefer_local":{"same_supernode":true,"on_miss":"abort"}` 可在没有本机候选时尝试同 supernode；默认 false 保留原先行为。严格复制写仍必须落到调用节点，不会因同 supernode 回退而发布错误的本地副本。
