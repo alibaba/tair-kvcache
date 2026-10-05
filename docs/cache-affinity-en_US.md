@@ -372,3 +372,15 @@ implements `CreateWithHints`.
 | `prefer_local{on_miss:"abort"}` finds no local node | Strategy aborts and `Resolve` returns `EC_ERROR`. v1 logs + degrades to empty hints in `CacheManager::ResolveAffinityHints` (write proceeds via legacy path). To turn this into a hard write failure, lift the degradation in that helper |
 | Process-level JSON malformed (unregistered metric, `and:[]`, etc.) | `LoadProcessStrategyFromJson*` returns `false`; existing process-level strategy (if any) is unchanged; instance / instance_group tiers are not affected |
 | Regex compile error in `node_name.include / exclude` | Same as above for process-level loads — no partial state. For an override (instance / instance_group) it is treated as a parse failure for that tier and falls through |
+
+## Replica lifecycle controls
+
+`local_replica.replica_limits` accepts `max_replicas_per_key`, `max_instance_bytes` (0 means unlimited), and `min_retained_replicas` (default 1). Admission checks metadata reservations atomically; the byte budget includes original copies and WRITING locations. The per-key count conservatively includes all locations. Node-pressure deletion retains the requested number of SERVING copies of each spec; explicit and TTL deletion are unaffected. Physical deletion credit counts only successful backend URI deletions and is fenced against newer capacity samples.
+
+`read.on_miss.heat_half_life_ms` defaults to 60000. Optional `max_replication_bytes`, `min_benefit_ratio`, and `prefix_bonus` gate copying by size, decayed heat, avoided remote bytes and prefix position. Their default is 0 (disabled). Unknown sizes are rejected when cost admission is enabled.
+
+Set `KVCM_NODE_TOPOLOGY_FILE` in manager and SDK processes to a JSON file such as `{"nodes":{"uuid-a":"rack1","uuid-b":"rack1"}}`. Replace it atomically. It refreshes every 5 seconds; failed refreshes expire the old mapping after 30 seconds. Reads prefer local, then same-supernode, then existing remote order. Writes can enable `prefer_local.same_supernode`; strict replication still requires the caller node.
+
+Client options `replication_max_buffer_bytes` and `replication_max_pending_bytes` default to 256 MiB; `replication_node_bytes_per_second=0` disables pacing and `replication_max_age_ms=30000` bounds queue lifetime. Executors share in-process memory admission, instance rotation and target-node pacing. Use consistent process budgets across clients; cross-process quotas remain a deployment concern.
+
+The caller advertises `replication_capabilities=1` for complete named sources, and the response confirms the intersection. Legacy clients continue reading and receive only single-spec hints. `ReplicateWithBuffers` accepts named CPU/GPU buffers with shared ownership; missing specs are loaded, and all specs publish together. `GetReplicationStats()` and `InitParams.replication_metrics_callback` expose acknowledged successes, failures, skipped/expired work, queue/budget/invalid drops, bytes, latency and queue state.
