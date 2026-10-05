@@ -33,8 +33,10 @@ struct NodeMetrics {
     double tx_mbps = 0.0;
 
     // Wall-clock timestamp (microseconds) of the last update; used by callers
-    // to drop stale entries before calling UpsertNodeMetrics.
+    // to detect repeated cached samples. Zero means an unstamped fresh observation.
     int64_t updated_at_us = 0;
+    // Explicit capacity avoids inferring total=0 on a completely full node.
+    uint64_t total_bytes = 0;
 };
 
 } // namespace kv_cache_manager

@@ -41,6 +41,8 @@ public:
     std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &storage_uris) override;
     std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &storage_uris) override;
 
+    bool SupportsAffinity() const override { return true; }
+
     // 这里默认上报"本机 IP"作为唯一节点
     std::vector<NodeMetrics> SnapshotPerNodeMetrics() const override;
 

@@ -1,5 +1,30 @@
 # Cache Affinity v1 实现说明
 
+> 当前实现说明（2026-10-05）：写、读、复制、节点淘汰均已接入，mempool 后端支持
+> `CreateWithHints` 与真实节点指标。节点身份使用 Provider UUID；下文历史描述中的
+> `caller_node_ip` 对应当前的 `caller.node_id`。完整开关为 `kvcm.affinity.enabled`，默认 false。
+
+### 已补齐的正确性行为
+
+- 不支持亲和性的后端保持普通写入兼容，strict 分配直接拒绝，避免复制静默落到任意节点。
+- 热度计数与复制提示抑制按 `(instance_id, caller_node_id, block_key)` 隔离，避免跨实例干扰。
+- 只有全部 spec 都在本机时才停止复制；hint 的 `source_specs` 携带按名称组织的完整源列表，
+  来源对应本次读取实际选中的 spec，可能包含已经在本机的组件。
+- SDK 按 spec 名称对齐全部目标，所有读取、写入完成后才成功 Finish。缺少源、读取失败、
+  写入失败或返回 URI 数量不符时，用失败 mask 结束会话；成功 Finish 的响应丢失时不再发送相反的失败确认。
+- 单 spec 保留 `source_uri` 和复用读取缓冲区的复制路径。多 spec 的 `source_uri` 为空，
+  需要配套升级 SDK；现有单缓冲区 `ReplicateWithData` 收到多 spec hint 时回退为按完整源列表读取，
+  不把同一段缓冲区错误地写入多个 spec。尚未提供多 spec 缓冲区复用接口。
+- SDK 后台待执行任务最多 1024 个，复用缓冲区的队列还受 `2 × worker 数` 限制，满时丢弃提示；
+  重复任务去重，关闭后拒绝新任务并释放传入缓冲区。调用节点变化后丢弃旧目标的提示。
+- 节点指标默认 30 秒未出现新采样即过期。相同时间戳的缓存快照不会续期，mempool 时间戳取自
+  成功刷新元信息的时刻。过期节点不参与候选与水位决策；移除节点时清除其删除估算。
+- 节点淘汰消费 instance 级策略；某实例关闭淘汰不会跳过后续实例。新指标仅重置该节点的删除估算。
+  mempool 提供总容量，满水位时不会因除零把微小删除量误算成容量已经恢复。
+
+这些是缓存副本生命周期的正确性补齐；删除估算仍来自任务准入，不等于物理删除已确认完成。
+
+
 **前序文档**：
 - `cache-affinity-v1-zh_CN.md` —— v1 完整设计规范（策略框架 + 数据模型 + 算法决策全集）
 - `cache-affinity-zh_CN.md` / `cache-affinity-en_US.md` —— v0 写时 affinity
@@ -105,7 +130,7 @@ AffinityStrategy (抽象接口)
 | 仅关读亲和 | `{"enabled_aspects": {"read": false}}` |
 | 仅关节点淘汰 | `{"enabled_aspects": {"eviction": false}}` |
 
-总开关 `KVCM_AFFINITY_ENABLED=0` 等价全局 noop。
+总开关 `kvcm.affinity.enabled=false` 等价全局 noop。
 
 ### 2.4 文件结构
 
@@ -291,16 +316,24 @@ CacheReclaimer::TryReclaimOnGroup
 
 算法设计是长期迭代过程。建议以独立 PR 逐点推进，每个 PR 只改策略子类，不动框架。
 
-### 7.2 外部依赖
+### 7.2 已完成的接入与回归
 
-Backend 接口已定义，当前全部走默认空实现。`CreateWithHints` 和 `SnapshotPerNodeMetrics` 需要 mempool 侧实现。**在此之前 node_id 始终为空，整条链路虽通但不生效。**
+mempool 分配偏好、strict 复制分配、UUID 映射和容量采样已实现。
+三个历史缺口验收用例（部分本地命中、热度实例隔离、提示实例隔离）已纳入普通测试。
+多 spec 复制、失败会话清理、有界队列、过期指标、满容量水位和实例淘汰覆盖均有回归用例。
+执行入口见 [亲和性生命周期验收](../integration_test/affinity/README.md)。
 
-### 7.3 工程完善
+### 7.3 仍需完成的能力
 
-| 项 | 说明 |
+| 项 | 当前边界 |
 |---|---|
-| 端到端集成测试 | 当前用 file backend 验证管道正确性。缺基于 mempool 的端到端覆盖 |
-| 内部 metrics | 决策路径缺少 prometheus gauge/counter，上线后排查困难 |
+| 超节点选路 | 仅有 caller 信号，还需存储节点拓扑来源与同超节点优先策略 |
+| 全局副本保护 | 尚无最后一份副本保护、全局副本数量预算和跨节点公平性算法 |
+| 写入收益判断 | 未结合 prefix 热度、复制成本、数据大小决定是否新增副本 |
+| 删除完成反馈 | 当前水位滞回使用删除准入估算，尚未按物理删除终态反馈 |
+| 多 spec 缓冲区复用 | 已支持完整异步复制，直接复用多块具名内存仍需扩展 SDK 接口 |
+| 集群验收 | 自动容量淘汰、重启恢复与真实推理引擎/GPU 链路仍需集群执行 |
+| 指标观测 | 需要完善复制成功/失败、队列丢弃和节点指标过期的专用计数 |
 
 ---
 

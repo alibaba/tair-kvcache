@@ -1,5 +1,9 @@
 # Cache Affinity / 缓存亲和性管理
 
+> 本文保留早期写入流水线说明。当前已包含读取亲和性、热点复制和节点淘汰，
+> 使用 `caller.node_id`（mempool 为 Provider UUID），并已接入指标自动采样。
+> 当前协议、默认开关和完成状态以 [完整设计说明](design-cache-affinity-v1.md) 为准。
+
 KVCacheManager 提供一个可选的亲和性层，用来影响**写入时 block →
 storage 节点的放置**。主要场景是**推理与存储混部**：同一台物理机
 既跑推理 worker 又跑一个 storage 节点,把 KV cache 直接写到本机

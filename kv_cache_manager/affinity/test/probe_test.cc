@@ -225,17 +225,9 @@ TEST_F(AffinityProbeTest, HysteresisWithZeroTimestamp) {
     // Re-insert same metrics with timestamp still 0
     mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 100000, 0.90, 0, 0, 0});
 
-    // With timestamp=0: max_updated_at=0, last_reset=0 → 0 > 0 false
-    // evicted_bytes NOT cleared → still not exceeded
-    // This means metrics at timestamp 0 can never trigger hysteresis reset.
-    {
-        auto ex = mgr.ResolveEviction(ctx);
-        // If this is empty, it means evicted_bytes were NOT cleared
-        // (the hysteresis "sticks" forever with timestamp=0).
-        // Whether this is a bug depends on design intent.
-        EXPECT_TRUE(ex.empty()) << "With updated_at_us=0, evicted_bytes should NOT be cleared"
-                                   " (0 > 0 is false). Document this known edge case.";
-    }
+    // Timestamp-less ingestion is a fresh observation, so deletion credit
+    // must not stick forever after the backend reports the node still full.
+    EXPECT_EQ((std::unordered_set<std::string>{"node_a"}), mgr.ResolveEviction(ctx));
 }
 
 // ===================================================================
@@ -438,30 +430,18 @@ TEST_F(AffinityProbeTest, EvictionAtFullCapacity) {
         ASSERT_EQ(1u, ex.size());
     }
 
-    // Report even 1 byte evicted: total=0, evicted_bytes/total = 1/0 = +inf
-    // estimated = 1.0 - inf = -inf → -inf <= low(0.70) → skip
-    // But the node still has load_ratio > high AND has eviction state...
-    // Line 96: if (node.load_ratio > high || it != ctx.evicted_bytes.end())
-    // Both conditions are true, but we skipped at line 93-95 (estimated <= low).
-    // So the node is NOT reported exceeded. Is this correct?
-    // The node has 100% load and we only evicted 1 byte.
+    // Unknown total capacity must not divide by zero and stop reclaim after
+    // a single byte of deletion credit.
     mgr.ReportEvictedBytes("node_a", 1);
-    {
-        auto ex = mgr.ResolveEviction(ctx);
-        // With total=0 and any eviction, estimated_load becomes -inf.
-        // The skip at `estimated_load <= low` kicks in.
-        // This is arguably a bug: 1 byte evicted from a 100%-full node
-        // shouldn't stop eviction.
-        if (ex.empty()) {
-            // Expected bug: node at 100% capacity with 1 byte evicted
-            // incorrectly considered "below low watermark" due to
-            // total_capacity=0 causing infinite eviction ratio.
-            KVCM_LOG_WARN("KNOWN ISSUE: eviction at load_ratio=1.0 with "
-                          "free_bytes=0 causes total_capacity=0, making any "
-                          "eviction report cause -inf estimated load");
-        }
-        // Document: this test probes the behavior, not asserts correctness
-    }
+    EXPECT_EQ((std::unordered_set<std::string>{"node_a"}), mgr.ResolveEviction(ctx));
+
+    NodeMetrics full{"node_b", "node_b", DataStorageType{}, 0, 1.0, 0, 0, 1};
+    full.total_bytes = 1000;
+    mgr.UpsertNodeMetrics(full);
+    mgr.ReportEvictedBytes("node_b", 1);
+    EXPECT_EQ(1u, mgr.ResolveEviction(ctx).count("node_b"));
+    mgr.ReportEvictedBytes("node_b", 399);
+    EXPECT_EQ(0u, mgr.ResolveEviction(ctx).count("node_b"));
 }
 
 // ===================================================================

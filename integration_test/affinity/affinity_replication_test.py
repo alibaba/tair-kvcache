@@ -125,10 +125,10 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
         resp = self._call("RegisterInstance", RegisterInstanceRequest, data)
         self.assertEqual(resp["header"]["status"]["code"], "OK", resp)
 
-    def _start_write(self, block_keys, caller_node_id=None, is_replication=False):
+    def _start_write(self, block_keys, caller_node_id=None, is_replication=False, instance_id=INSTANCE_ID):
         start_data = {
             "trace_id": TRACE_ID,
-            "instance_id": INSTANCE_ID,
+            "instance_id": instance_id,
             "block_keys": block_keys,
             "token_ids": [456] * len(block_keys),
             "write_timeout_seconds": 30,
@@ -139,10 +139,10 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
         resp = self._call("StartWriteCache", StartWriteCacheRequest, start_data)
         return resp
 
-    def _finish_write(self, session_id, block_count, successes=None):
+    def _finish_write(self, session_id, block_count, successes=None, instance_id=INSTANCE_ID):
         finish_data = {
             "trace_id": TRACE_ID,
-            "instance_id": INSTANCE_ID,
+            "instance_id": instance_id,
             "write_session_id": session_id,
             "success_blocks": {
                 "bool_masks": {"values": successes if successes is not None else [True] * block_count},
@@ -151,13 +151,13 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
         resp = self._call("FinishWriteCache", FinishWriteCacheRequest, finish_data)
         self.assertEqual(resp["header"]["status"]["code"], "OK", resp)
 
-    def _write_block(self, block_keys=None, caller_node_id=None):
+    def _write_block(self, block_keys=None, caller_node_id=None, instance_id=INSTANCE_ID):
         block_keys = block_keys or [BLOCK_KEY]
-        resp = self._start_write(block_keys, caller_node_id)
+        resp = self._start_write(block_keys, caller_node_id, instance_id=instance_id)
         self.assertEqual(resp["header"]["status"]["code"], "OK", resp)
         session_id = resp["write_session_id"]
         self.assertTrue(session_id)
-        self._finish_write(session_id, len(block_keys))
+        self._finish_write(session_id, len(block_keys), instance_id=instance_id)
         return resp
 
     def _get_cache_location(self, caller_node_id, block_keys=None, instance_id=INSTANCE_ID):
@@ -423,6 +423,40 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
         self.assertEqual({spec["name"] for spec in specs}, {"tp0", "tp1"}, response)
         self.assertTrue(all(spec["node_id"] == LOCAL_IP for spec in specs), response)
         self.assertFalse(response.get("hints"), response)
+
+        # The remote hint must preserve every spec name/URI through protobuf.
+        self.assertFalse(self._get_cache_location(REMOTE_CALLER_NODE_ID).get("hints"))
+        remote = self._get_cache_location(REMOTE_CALLER_NODE_ID)
+        self.assertEqual(len(remote.get("hints", [])), 1, remote)
+        hint = remote["hints"][0]
+        self.assertEqual(hint["target_node_id"], REMOTE_CALLER_NODE_ID)
+        self.assertFalse(hint.get("source_uri"), hint)
+        self.assertEqual(
+            {item["spec_name"]: item["uri"] for item in hint["source_specs"]},
+            {item["name"]: item["uri"] for loc in remote["locations"] for item in loc["location_specs"]},
+        )
+
+    def test_remote_frequency_is_independent_between_populated_instances(self):
+        instances = [INSTANCE_ID, INSTANCE_ID + "_second"]
+        for instance in instances:
+            self._register_instance(instance_id=instance)
+            self._write_block(caller_node_id=LOCAL_IP, instance_id=instance)
+            first = self._get_cache_location(REMOTE_CALLER_NODE_ID, instance_id=instance)
+            self.assertEqual(first["header"]["status"]["code"], "OK", first)
+            self.assertFalse(first.get("hints"), first)
+        for instance in instances:
+            second = self._get_cache_location(REMOTE_CALLER_NODE_ID, instance_id=instance)
+            self.assertEqual(len(second.get("hints", [])), 1, second)
+
+    def test_hint_suppression_is_independent_between_populated_instances(self):
+        for instance in [INSTANCE_ID, INSTANCE_ID + "_second"]:
+            self._register_instance(strategy_json=_make_strategy_json(1), instance_id=instance)
+            self._write_block(caller_node_id=LOCAL_IP, instance_id=instance)
+            first = self._get_cache_location(REMOTE_CALLER_NODE_ID, instance_id=instance)
+            self.assertEqual(len(first.get("hints", [])), 1, first)
+            repeated = self._get_cache_location(REMOTE_CALLER_NODE_ID, instance_id=instance)
+            self.assertEqual(repeated["header"]["status"]["code"], "OK", repeated)
+            self.assertFalse(repeated.get("hints"), repeated)
 
 
 if __name__ == "__main__":

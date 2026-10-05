@@ -1135,7 +1135,12 @@ TEST_F(GrpcStubTest, TestGetCacheLocationPropagatesReplicationHints) {
             for (const auto &h : hints) {
                 EXPECT_EQ("node_a", h.target_node_id);
                 EXPECT_NE(0, h.block_key);
-                EXPECT_FALSE(h.source_uri.empty());
+                ASSERT_EQ(2u, h.source_specs.size());
+                EXPECT_TRUE(h.source_uri.empty());
+                EXPECT_NE(h.source_specs[0].spec_name, h.source_specs[1].spec_name);
+                for (const auto &source : h.source_specs) {
+                    EXPECT_FALSE(source.uri.empty());
+                }
             }
         }
     }

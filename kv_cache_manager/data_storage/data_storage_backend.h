@@ -67,31 +67,26 @@ public:
     //                   there (no silent fallback to other nodes).
     //   strict=false -> hints are advisory; backend may fall back to any node
     //                   when the preferred ones are unavailable.
-    // When hints.preferred_node_ids is empty, `strict` is meaningless.
-    //
-    // Contract: this method is pure virtual; every backend MUST override it
-    // explicitly. Backends that don't yet honor affinity should inline the
-    // legacy-Create() adapter directly in their override (delegate to
-    // Create() and wrap each (ec, uri) into a LocationDescriptor with an
-    // empty node_id). Keeping the fallback inlined per backend — rather
-    // than sharing a base-class helper — makes the fact of fallthrough
-    // visible at the call site instead of behind an indirection. We
-    // deliberately do NOT provide a base-class default implementation,
-    // because silent fallthroughs hide which backends have actually been
-    // audited for affinity support.
-    //
-    // SupportsAffinity() lets the manager layer (and DataStorageSelector in
-    // future) detect at runtime whether a backend will act on hints; defaults
-    // to false.
-    //
-    // Returns LocationDescriptor (ec + uri + node_id) so the backend can
-    // report which node actually served the allocation.
+    // Legacy backends keep ordinary Create behavior through this adapter.
+    // They must reject strict placement unless they explicitly implement it.
+    // SupportsAffinity() lets the manager reject strict calls before allocation.
     virtual std::vector<LocationDescriptor> CreateWithHints(const std::vector<std::string> &keys,
                                                             size_t size_per_key,
                                                             const WriteHints &hints,
                                                             bool strict,
                                                             const std::string &trace_id,
-                                                            std::function<void()> cb) = 0;
+                                                            std::function<void()> cb) {
+        if (strict) {
+            return std::vector<LocationDescriptor>(keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}, ""});
+        }
+        auto legacy = Create(keys, size_per_key, trace_id, std::move(cb));
+        std::vector<LocationDescriptor> result;
+        result.reserve(legacy.size());
+        for (auto &item : legacy) {
+            result.push_back({item.first, std::move(item.second), ""});
+        }
+        return result;
+    }
 
     virtual bool SupportsAffinity() const { return false; }
 

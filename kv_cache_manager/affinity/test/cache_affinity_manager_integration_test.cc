@@ -57,7 +57,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, EvictedReplicaCanBeRecreatedAfterCap
     LocationSpec remote("tp0", "tair://b/key", "b");
     LocationSpec local("tp0", "tair://a/key", "a");
     CacheLocation winner;
-    winner.push_location_spec(remote);
+    winner.push_location_spec(LocationSpec(remote));
     ReadRequest req;
     req.block_key = 9001;
     req.winner_tier = &winner;
@@ -675,6 +675,53 @@ TEST_F(CacheAffinityManagerIntegrationTest, WriteAspectDisabledReadEvictionOn) {
     auto exceeded = mgr.ResolveEviction(ctx);
     EXPECT_EQ(1u, exceeded.size());
     EXPECT_TRUE(exceeded.count("node_b"));
+}
+
+TEST_F(CacheAffinityManagerIntegrationTest, NodeSamplesExpireWithoutRefreshingCachedObservations) {
+    int64_t now = 1000000;
+    CacheAffinityManager manager(10, [&] { return now; });
+    ASSERT_TRUE(manager.LoadProcessStrategyFromJsonString(R"({"type":"local_replica",
+        "write":{"ops":{"prefer_local":{"on_miss":"abort"}}}})"));
+    NodeMetrics sample{"reader", "reader", DataStorageType{}, 80, 0.92, 0, 0, 1};
+    manager.UpsertNodeMetrics(sample);
+    AffinityResolveContext ctx;
+    ctx.caller_node.node_id = "reader";
+    ASSERT_EQ(1u, manager.ResolveWrite(ctx).hints.preferred_node_ids.size());
+    ASSERT_EQ(1u, manager.ResolveEviction(ctx).size());
+    now += 9000000;
+    manager.UpsertNodeMetrics(sample); // A backend re-returned the same cached sample.
+    now += 1000000;
+    EXPECT_TRUE(manager.SnapshotNodes().empty());
+    EXPECT_TRUE(manager.ResolveWrite(ctx).hints.preferred_node_ids.empty());
+    EXPECT_TRUE(manager.ResolveEviction(ctx).empty());
+    sample.updated_at_us = 2;
+    manager.UpsertNodeMetrics(sample);
+    EXPECT_EQ(1u, manager.SnapshotNodes().size());
+    manager.RemoveNode("reader");
+    EXPECT_TRUE(manager.ResolveEviction(ctx).empty());
+}
+
+TEST_F(CacheAffinityManagerIntegrationTest, RefreshOnlyResetsDeletionCreditForThatNode) {
+    CacheAffinityManager manager;
+    ASSERT_TRUE(manager.LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})"));
+    NodeMetrics a{"a", "a", DataStorageType{}, 80, 0.92, 0, 0, 1};
+    NodeMetrics b{"b", "b", DataStorageType{}, 80, 0.92, 0, 0, 1};
+    manager.UpsertNodeMetrics(a);
+    manager.UpsertNodeMetrics(b);
+    manager.ReportEvictedBytes("a", 250);
+    manager.ReportEvictedBytes("b", 250);
+    EXPECT_TRUE(manager.ResolveEviction({}).empty());
+    b.updated_at_us = 2;
+    manager.UpsertNodeMetrics(b);
+    EXPECT_EQ((std::unordered_set<std::string>{"b"}), manager.ResolveEviction({}));
+    // Older observations must not discard outstanding deletion credit.
+    manager.ReportEvictedBytes("b", 250);
+    b.updated_at_us = 1;
+    manager.UpsertNodeMetrics(b);
+    EXPECT_TRUE(manager.ResolveEviction({}).empty());
+    manager.RemoveNode("a");
+    manager.UpsertNodeMetrics(a);
+    EXPECT_EQ((std::unordered_set<std::string>{"a"}), manager.ResolveEviction({}));
 }
 
 } // namespace kv_cache_manager

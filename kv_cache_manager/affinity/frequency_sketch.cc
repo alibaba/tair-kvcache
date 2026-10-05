@@ -1,5 +1,7 @@
 #include "kv_cache_manager/affinity/frequency_sketch.h"
 
+#include <limits>
+
 namespace kv_cache_manager {
 
 void FrequencySketch::TouchLocked(const Key &k) {
@@ -20,11 +22,11 @@ void FrequencySketch::EvictIfFullLocked() {
     }
 }
 
-void FrequencySketch::Observe(const std::string &caller_node_id, int64_t block_key) {
+void FrequencySketch::Observe(const std::string &caller_node_id, int64_t block_key, const std::string &instance_id) {
     if (caller_node_id.empty()) {
         return; // 空 caller 不参与 F3
     }
-    Key k{caller_node_id, block_key};
+    Key k{instance_id, caller_node_id, block_key};
     std::lock_guard<std::mutex> lock(mu_);
     auto it = table_.find(k);
     if (it == table_.end()) {
@@ -35,7 +37,9 @@ void FrequencySketch::Observe(const std::string &caller_node_id, int64_t block_k
         table_.emplace(std::move(k), std::move(e));
         EvictIfFullLocked();
     } else {
-        ++it->second.count;
+        if (it->second.count < std::numeric_limits<uint32_t>::max()) {
+            ++it->second.count;
+        }
         // 移到 MRU 位置
         lru_.erase(it->second.lru_it);
         lru_.push_front(it->first);
@@ -43,18 +47,19 @@ void FrequencySketch::Observe(const std::string &caller_node_id, int64_t block_k
     }
 }
 
-uint32_t FrequencySketch::RemoteCount(const std::string &caller_node_id, int64_t block_key) const {
+uint32_t FrequencySketch::RemoteCount(const std::string &caller_node_id, int64_t block_key,
+                                      const std::string &instance_id) const {
     if (caller_node_id.empty()) {
         return 0;
     }
-    Key k{caller_node_id, block_key};
+    Key k{instance_id, caller_node_id, block_key};
     std::lock_guard<std::mutex> lock(mu_);
     auto it = table_.find(k);
     return it == table_.end() ? 0 : it->second.count;
 }
 
-void FrequencySketch::Reset(const std::string &caller_node_id, int64_t block_key) {
-    Key k{caller_node_id, block_key};
+void FrequencySketch::Reset(const std::string &caller_node_id, int64_t block_key, const std::string &instance_id) {
+    Key k{instance_id, caller_node_id, block_key};
     std::lock_guard<std::mutex> lock(mu_);
     auto it = table_.find(k);
     if (it == table_.end()) {

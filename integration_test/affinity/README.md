@@ -5,7 +5,7 @@
 | 层次 | 入口 | 检查内容 |
 | --- | --- | --- |
 | 策略和组件回归 | `//kv_cache_manager/affinity/test:all`、`ReplicationExecutorTest`、`CacheManagerTest`、`MetaSearcherTest`、`CacheReclaimerTest`、`NodeLruReclaimIndexerTest` | 写入路由、复制门限/抑制、异步复制失败处理、元数据发布、淘汰决策及删除组件 |
-| 真实服务的控制面集成 | `//integration_test/affinity:affinity_replication_test` | 13 个用例：本地写、远端读 hint、strict/non-strict 写、未完成/失败写与重试、部分 batch 发布、重复本地命中、逐 key 抑制、实例隔离、空 caller 兼容、noop、删除/重写、多 spec 发布 |
+| 真实服务的控制面集成 | `//integration_test/affinity:affinity_replication_test` | 15 个用例：本地写、远端读 hint、strict/non-strict 写、未完成/失败写与重试、部分 batch 发布、重复本地命中、逐 key 抑制、实例隔离、空 caller 兼容、noop、删除/重写、多 spec 发布 |
 | 双机真实数据链路 | `//integration_test/affinity_piggyback:mock_inference_node` + tair-mempool `.aoneci/kvcm_affinity_test.yaml` | A 写入、B 远端逐字节读、piggyback/async 两种复制、本地物理 Provider 校验、重复读、停 A 后读 B、跨实例 miss、删除和重写 |
 
 `EvictedReplicaCanBeRecreatedAfterCapacityRecovers` 连接策略阶段：远端热读 → hint → 本地候选 → 高水位淘汰 → 滞后估算停止 → 容量恢复 → 再次 hint。它注入候选和节点指标，并不分配内存或执行物理淘汰。真实双机当前测试的是显式删除/重建和源 Provider 停机；容量压满导致自动物理淘汰、进程重启恢复、真实推理引擎/GPU 读写仍需要专门的集群用例，不能据此宣称已验收。
@@ -69,22 +69,36 @@ mock_inference_node --kvcm-endpoint KVCM_IP:6381 \
 
 实例组配置需要同时包含 `write.ops.prefer_local` 和 `read.on_miss`；group override 会整体覆盖 process strategy。测试使用 CPU buffer 和单个 `spec_0`，不需要模型/GPU。禁止关闭校验、读取失败后造数据、将 release callback 当作复制成功。
 
-## 已知未实现功能的验收
+## 正确性补齐回归
 
-`AffinityPendingContractTest` 包含 3 个预期暴露当前缺口的用例：
+`AffinityPendingContractTest` 保留原目标名称，已移除 `manual`，三个历史缺口现为普通回归：
+部分本地命中仍请求完整复制、热度按 instance 隔离、提示抑制按 instance 隔离。
 
-- 一个组件已本地命中时，仍应为缺少的远端组件请求复制。
-- 相同 caller/key 在不同 instance 的访问热度应独立。
-- 一个 instance 的 hint 不应抑制另一个 instance 的复制。
+本轮新增覆盖：
 
-这些断言使用正常失败语义，没有 `skip` 或 `expectedFailure`。target 带 `manual`，需显式运行，不计入默认 CI 的通过用例；实现相关能力后应去掉 manual 并纳入常规验收。
+- `ReplicationExecutorTest`：多 spec 按名称对齐、真实缓冲区内容、所有目标 URI 发布、缺少源、
+  读取/写入失败回滚、成功 Finish 响应失败不重复回滚、单缓冲区回退、调用节点变化、队列上限。
+- `CacheAffinityManagerIntegrationTest`：节点指标 TTL、缓存快照不续期、乱序样本、按节点重置删除估算。
+- `AffinityProbeTest`：零时间戳重新采样、满容量节点不能因除零提前停止淘汰。
+- `CacheReclaimerTest`：instance 策略覆盖实例组，前一个实例 noop 不影响后续实例。
+- `GrpcStubTest` / Python 控制面集成：完整 `source_specs` 协议透传、两个已有数据实例的热度/抑制隔离。
+- `DataStorageManagerTest` / `EventReportBackendTest`：禁用后端、空 strict 目标和不支持亲和性的后端拒绝分配。
+- 内源 `TairMempoolBackendTest`：缓存快照保持原采样时间，刷新失败不能假装容量信息是新数据。
 
 ```bash
 bazelisk --output_base=/tmp/bazel-affinity-e2e-os test \
-  --config=debug --config=asan \
-  --test_env ASAN_OPTIONS=detect_odr_violation=0 --test_output=errors \
-  //integration_test/affinity:AffinityPendingContractTest
+  --config=debug --config=asan --test_output=errors \
+  --test_env ASAN_OPTIONS=detect_odr_violation=0 \
+  //kv_cache_manager/affinity/test:all \
+  //integration_test/affinity:AffinityPendingContractTest \
+  //kv_cache_manager/client/test:ReplicationExecutorTest \
+  //kv_cache_manager/client/src/internal/stub/test:GrpcStubTest \
+  //kv_cache_manager/manager/test:CacheReclaimerTest \
+  //integration_test/affinity:affinity_replication_test
 ```
+
+多 spec 复制需同时升级服务端与 SDK。旧 `source_uri` 仅用于单 spec；新 `source_specs`
+不能由旧 SDK 忽略后继续按单 spec 复制。现有单指针缓冲区接口在多 spec 时回退到完整异步读取。
 
 ## 与最新主干合并后的回归
 

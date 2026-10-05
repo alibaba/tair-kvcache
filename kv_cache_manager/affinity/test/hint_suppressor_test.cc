@@ -156,4 +156,15 @@ TEST_F(HintSuppressorTest, ConcurrentTryEmitIsThreadSafe) {
     EXPECT_LE(s.Size(), kCap);
 }
 
+TEST_F(HintSuppressorTest, SuppressionIsIsolatedByInstance) {
+    MockClock clk;
+    HintSuppressor suppressor(10, clk.Fn());
+    EXPECT_TRUE(suppressor.TryEmit(42, "reader", kWindowMs, "instance:a"));
+    EXPECT_TRUE(suppressor.TryEmit(42, "reader", kWindowMs, "instance:b"));
+    EXPECT_FALSE(suppressor.TryEmit(42, "reader", kWindowMs, "instance:a"));
+    EXPECT_FALSE(suppressor.TryEmit(42, "reader", kWindowMs, "instance:b"));
+    EXPECT_TRUE(suppressor.TryEmit(7, "b:c", kWindowMs, "a"));
+    EXPECT_TRUE(suppressor.TryEmit(7, "c", kWindowMs, "a:b"));
+}
+
 } // namespace kv_cache_manager

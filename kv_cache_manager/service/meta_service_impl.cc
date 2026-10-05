@@ -519,6 +519,11 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
             pb_hint->set_block_key(h.block_key);
             pb_hint->set_source_uri(h.source_uri);
             pb_hint->set_target_node_id(h.target_node_id);
+            for (const auto &source : h.source_specs) {
+                auto *pb_source = pb_hint->add_source_specs();
+                pb_source->set_spec_name(source.spec_name);
+                pb_source->set_uri(source.uri);
+            }
         }
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());

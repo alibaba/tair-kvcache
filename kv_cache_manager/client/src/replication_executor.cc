@@ -1,5 +1,10 @@
 #include "kv_cache_manager/client/src/replication_executor.h"
 
+#include <algorithm>
+#include <exception>
+#include <unordered_map>
+#include <unordered_set>
+
 #include "kv_cache_manager/client/include/meta_client.h"
 #include "kv_cache_manager/client/include/transfer_client.h"
 #include "kv_cache_manager/common/logger.h"
@@ -8,9 +13,11 @@
 
 namespace kv_cache_manager {
 
-ReplicationExecutor::ReplicationExecutor(MetaClient *meta_client, TransferClient *transfer_client, int num_workers)
-    : meta_client_(meta_client), transfer_client_(transfer_client), max_piggyback_queue_(num_workers * 2) {
-    for (int i = 0; i < num_workers; ++i) {
+ReplicationExecutor::ReplicationExecutor(MetaClient *meta_client, TransferClient *transfer_client, int num_workers,
+                                         size_t max_pending_tasks)
+    : meta_client_(meta_client), transfer_client_(transfer_client),
+      max_piggyback_queue_(std::max(1, num_workers) * 2), max_pending_tasks_(max_pending_tasks) {
+    for (int i = 0; i < std::max(1, num_workers); ++i) {
         workers_.emplace_back(&ReplicationExecutor::WorkerLoop, this);
     }
 }
@@ -22,7 +29,15 @@ void ReplicationExecutor::Submit(const std::vector<ClientReplicationHint> &hints
         return;
     }
     std::lock_guard<std::mutex> lk(mu_);
+    if (stopped_.load(std::memory_order_relaxed)) {
+        return;
+    }
     for (const auto &hint : hints) {
+        if (queue_.size() >= max_pending_tasks_) {
+            KVCM_LOG_WARN("[replication] async queue full (%zu/%zu), remaining hints dropped",
+                          queue_.size(), max_pending_tasks_);
+            break;
+        }
         std::string key = MakeKey(hint.block_key, hint.target_node_id);
         if (inflight_.count(key)) {
             KVCM_LOG_DEBUG("[replication] Submit: block_key [%ld] target [%s] already inflight, skipped",
@@ -47,11 +62,18 @@ void ReplicationExecutor::SubmitWithData(ClientReplicationHint hint,
                                          size_t size,
                                          std::function<void()> release_fn) {
     ReleaseGuard guard(std::move(release_fn));
+    if (data == nullptr || size == 0) {
+        Submit({hint});
+        return;
+    }
     if (stopped_.load(std::memory_order_relaxed)) {
         KVCM_LOG_WARN("[replication] SubmitWithData: executor stopped, block_key [%ld] dropped", hint.block_key);
         return;
     }
     std::lock_guard<std::mutex> lk(mu_);
+    if (stopped_.load(std::memory_order_relaxed) || queue_.size() >= max_pending_tasks_) {
+        return;
+    }
     std::string key = MakeKey(hint.block_key, hint.target_node_id);
     if (inflight_.count(key)) {
         KVCM_LOG_INFO("[replication] SubmitWithData: block_key [%ld] target [%s] already inflight "
@@ -114,7 +136,11 @@ void ReplicationExecutor::WorkerLoop() {
                 --piggyback_queue_size_;
             }
         }
-        ExecuteTask(task);
+        try {
+            ExecuteTask(task);
+        } catch (const std::exception &e) {
+            KVCM_LOG_WARN("[replication] block_key [%ld] failed: %s", task.hint.block_key, e.what());
+        }
         {
             std::lock_guard<std::mutex> lk(mu_);
             inflight_.erase(MakeKey(task.hint.block_key, task.hint.target_node_id));
@@ -123,176 +149,108 @@ void ReplicationExecutor::WorkerLoop() {
 }
 
 void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
-    std::string trace_id = "repl_" + StringUtil::GenerateRandomString(16);
-    if (task.data && task.data_size > 0) {
-        ExecuteWrite(trace_id, task.hint, task.data, task.data_size);
-    } else {
-        ExecuteHintAsync(trace_id, task.hint);
+    const auto &hint = task.hint;
+    const std::string trace_id = "repl_" + StringUtil::GenerateRandomString(16);
+    const auto caller = meta_client_->GetCallerNode();
+    if (!caller.empty() && caller != hint.target_node_id) {
+        KVCM_LOG_WARN("[replication] caller changed; dropping hint for node [%s]", hint.target_node_id.c_str());
+        return;
     }
-}
-
-void ReplicationExecutor::ExecuteWrite(const std::string &trace_id,
-                                       const ClientReplicationHint &hint,
-                                       const void *data,
-                                       size_t data_size) {
-    KVCM_LOG_DEBUG("[replication] ExecuteWrite BEGIN trace_id [%s] block_key [%ld] target [%s] data_size [%zu]",
-                   trace_id.c_str(),
-                   hint.block_key,
-                   hint.target_node_id.c_str(),
-                   data_size);
-
     auto [start_ec, write_loc] = meta_client_->StartWrite(
         trace_id, {hint.block_key}, {}, {}, /*write_timeout_seconds=*/60, /*is_replication=*/true);
-    if (start_ec != ER_OK) {
-        KVCM_LOG_WARN("[replication] trace_id [%s] StartWrite failed for block_key [%ld], ec [%d]",
-                      trace_id.c_str(),
-                      hint.block_key,
-                      start_ec);
+    if (start_ec != ER_OK || write_loc.locations.empty()) {
+        return; // Failed allocation, or the replica is already local.
+    }
+
+    // Release allocated destinations on every failure before publication. Once
+    // FinishWrite has been attempted its result may be ambiguous, so never send
+    // a contradictory abort after a failed success acknowledgement.
+    bool finish_attempted = false;
+    ReleaseGuard abort_session([&] {
+        if (!finish_attempted && !write_loc.write_session_id.empty()) {
+            const auto ec = meta_client_->FinishWrite(
+                trace_id, write_loc.write_session_id, BlockMaskVector{false}, {});
+            if (ec != ER_OK) {
+                KVCM_LOG_WARN("[replication] failed to abort session [%s], ec [%d]",
+                              write_loc.write_session_id.c_str(), ec);
+            }
+        }
+    });
+    if (write_loc.locations.size() != 1 || write_loc.locations.front().empty()) {
         return;
     }
-    KVCM_LOG_DEBUG("[replication] ExecuteWrite trace_id [%s] StartWrite OK: session_id [%s] locations=%zu",
-                   trace_id.c_str(),
-                   write_loc.write_session_id.c_str(),
-                   write_loc.locations.size());
+    const auto &destinations = write_loc.locations.front();
+    std::unordered_map<std::string, std::string> sources;
+    for (const auto &source : hint.source_specs) {
+        if (source.uri.empty() || !sources.emplace(source.spec_name, source.uri).second) {
+            return;
+        }
+    }
+    if (sources.empty() && destinations.size() == 1) {
+        sources.emplace(destinations.front().spec_name, hint.source_uri);
+    }
 
-    if (write_loc.locations.empty()) {
-        KVCM_LOG_INFO(
-            "[replication] trace_id [%s] block_key [%ld] already replicated (no locations returned by server)",
-            trace_id.c_str(),
-            hint.block_key);
+    UriStrVec dest_uris;
+    BlockBuffers buffers;
+    std::vector<std::vector<char>> owned_buffers(destinations.size());
+    // The existing piggyback API owns one unnamed buffer. It is safe only for
+    // a single spec; multi-spec hints use their complete named source set.
+    const bool piggyback = task.data != nullptr && task.data_size > 0 && destinations.size() == 1 &&
+                           hint.source_specs.size() <= 1;
+    std::unordered_set<std::string> destination_names;
+    for (size_t i = 0; i < destinations.size(); ++i) {
+        const auto &dest = destinations[i];
+        if (dest.uri.empty() || !destination_names.insert(dest.spec_name).second) {
+            return;
+        }
+        auto source = sources.find(dest.spec_name);
+        if (source == sources.end()) {
+            return; // Never publish a location whose other specs were not copied.
+        }
+        size_t size = task.data_size;
+        void *data = const_cast<void *>(task.data);
+        if (!piggyback) {
+            size = 0;
+            StandardUri(source->second).GetParamAs<size_t>("size", size);
+            if (size == 0) {
+                return;
+            }
+        }
+        size_t dest_size = 0;
+        StandardUri(dest.uri).GetParamAs<size_t>("size", dest_size);
+        if (dest_size != 0 && dest_size != size) {
+            return;
+        }
+        if (!piggyback) {
+            owned_buffers[i].resize(size);
+            data = owned_buffers[i].data();
+        }
+        BlockBuffer buffer;
+        buffer.iovs.push_back(Iov{MemoryType::CPU, data, size, false});
+        if (!piggyback && transfer_client_->LoadKvCaches({source->second}, {buffer}) != ER_OK) {
+            return;
+        }
+        dest_uris.push_back(dest.uri);
+        buffers.push_back(std::move(buffer));
+    }
+
+    auto [save_ec, actual_uris] = transfer_client_->SaveKvCaches(dest_uris, buffers);
+    if (save_ec != ER_OK || (!actual_uris.empty() && actual_uris.size() != destinations.size())) {
         return;
     }
-
-    const auto &location = write_loc.locations[0];
-    if (location.empty()) {
-        KVCM_LOG_WARN("[replication] trace_id [%s] write location has no spec URIs", trace_id.c_str());
-        return;
+    Location finished = destinations;
+    for (size_t i = 0; i < actual_uris.size(); ++i) {
+        if (actual_uris[i].empty()) {
+            return;
+        }
+        finished[i].uri = actual_uris[i];
     }
-    std::string dest_uri = location[0].uri;
-    KVCM_LOG_DEBUG("[replication] ExecuteWrite trace_id [%s] dest_uri [%s] spec_name [%s]",
-                   trace_id.c_str(),
-                   dest_uri.c_str(),
-                   location[0].spec_name.c_str());
-
-    BlockBuffer block_buf;
-    block_buf.iovs.push_back(Iov{MemoryType::CPU, const_cast<void *>(data), data_size, false});
-    BlockBuffers bufs = {block_buf};
-
-    auto [save_ec, actual_uris] = transfer_client_->SaveKvCaches({dest_uri}, bufs);
-    if (save_ec != ER_OK) {
-        KVCM_LOG_WARN("[replication] trace_id [%s] SaveKvCaches to [%s] failed, ec [%d]",
-                      trace_id.c_str(),
-                      dest_uri.c_str(),
-                      save_ec);
-        return;
-    }
-    std::string actual_uri = actual_uris.empty() ? "(empty)" : actual_uris[0];
-    KVCM_LOG_DEBUG("[replication] ExecuteWrite trace_id [%s] SaveKvCaches OK: actual_uri [%s]",
-                   trace_id.c_str(),
-                   actual_uri.c_str());
-
-    Locations finish_locations;
-    if (!actual_uris.empty()) {
-        Location loc;
-        loc.push_back({location[0].spec_name, actual_uris[0]});
-        finish_locations.push_back(std::move(loc));
-    } else {
-        finish_locations.push_back(location);
-    }
-
-    BlockMask success_mask = BlockMaskOffset(1);
-    auto finish_ec = meta_client_->FinishWrite(trace_id, write_loc.write_session_id, success_mask, finish_locations);
+    finish_attempted = true;
+    const auto finish_ec = meta_client_->FinishWrite(
+        trace_id, write_loc.write_session_id, BlockMaskOffset(1), {finished});
     if (finish_ec != ER_OK) {
-        KVCM_LOG_WARN("[replication] trace_id [%s] FinishWrite failed, ec [%d]", trace_id.c_str(), finish_ec);
-        return;
+        KVCM_LOG_WARN("[replication] FinishWrite failed for block_key [%ld], ec [%d]", hint.block_key, finish_ec);
     }
-
-    KVCM_LOG_INFO("[replication] ExecuteWrite DONE trace_id [%s] block_key [%ld] replicated to node [%s] "
-                  "dest_uri [%s] (piggyback)",
-                  trace_id.c_str(),
-                  hint.block_key,
-                  hint.target_node_id.c_str(),
-                  dest_uri.c_str());
-}
-
-void ReplicationExecutor::ExecuteHintAsync(const std::string &trace_id, const ClientReplicationHint &hint) {
-    auto [start_ec, write_loc] = meta_client_->StartWrite(
-        trace_id, {hint.block_key}, {}, {}, /*write_timeout_seconds=*/60, /*is_replication=*/true);
-    if (start_ec != ER_OK) {
-        KVCM_LOG_WARN("[replication] trace_id [%s] StartWrite failed for block_key [%ld], ec [%d]",
-                      trace_id.c_str(),
-                      hint.block_key,
-                      start_ec);
-        return;
-    }
-
-    if (write_loc.locations.empty()) {
-        KVCM_LOG_DEBUG("[replication] trace_id [%s] block_key [%ld] already replicated (no locations returned)",
-                       trace_id.c_str(),
-                       hint.block_key);
-        return;
-    }
-
-    StandardUri source_uri(hint.source_uri);
-    size_t block_size = 0;
-    source_uri.GetParamAs<size_t>("size", block_size);
-    if (block_size == 0) {
-        KVCM_LOG_WARN("[replication] trace_id [%s] cannot determine block size from source_uri [%s]",
-                      trace_id.c_str(),
-                      hint.source_uri.c_str());
-        return;
-    }
-
-    std::vector<char> buffer(block_size);
-    BlockBuffer block_buf;
-    block_buf.iovs.push_back(Iov{MemoryType::CPU, buffer.data(), block_size, false});
-    BlockBuffers bufs = {block_buf};
-
-    auto load_ec = transfer_client_->LoadKvCaches({hint.source_uri}, bufs);
-    if (load_ec != ER_OK) {
-        KVCM_LOG_WARN("[replication] trace_id [%s] LoadKvCaches from [%s] failed, ec [%d]",
-                      trace_id.c_str(),
-                      hint.source_uri.c_str(),
-                      load_ec);
-        return;
-    }
-
-    const auto &location = write_loc.locations[0];
-    if (location.empty()) {
-        KVCM_LOG_WARN("[replication] trace_id [%s] write location has no spec URIs", trace_id.c_str());
-        return;
-    }
-    std::string dest_uri = location[0].uri;
-
-    auto [save_ec, actual_uris] = transfer_client_->SaveKvCaches({dest_uri}, bufs);
-    if (save_ec != ER_OK) {
-        KVCM_LOG_WARN("[replication] trace_id [%s] SaveKvCaches to [%s] failed, ec [%d]",
-                      trace_id.c_str(),
-                      dest_uri.c_str(),
-                      save_ec);
-        return;
-    }
-
-    Locations finish_locations;
-    if (!actual_uris.empty()) {
-        Location loc;
-        loc.push_back({location[0].spec_name, actual_uris[0]});
-        finish_locations.push_back(std::move(loc));
-    } else {
-        finish_locations.push_back(location);
-    }
-
-    BlockMask success_mask = BlockMaskOffset(1);
-    auto finish_ec = meta_client_->FinishWrite(trace_id, write_loc.write_session_id, success_mask, finish_locations);
-    if (finish_ec != ER_OK) {
-        KVCM_LOG_WARN("[replication] trace_id [%s] FinishWrite failed, ec [%d]", trace_id.c_str(), finish_ec);
-        return;
-    }
-
-    KVCM_LOG_INFO("[replication] trace_id [%s] block_key [%ld] replicated to node [%s]",
-                  trace_id.c_str(),
-                  hint.block_key,
-                  hint.target_node_id.c_str());
 }
 
 std::string ReplicationExecutor::MakeKey(int64_t block_key, const std::string &target_node_id) const {

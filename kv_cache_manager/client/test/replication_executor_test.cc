@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <future>
 #include <gmock/gmock.h>
 #include <thread>
@@ -443,4 +444,222 @@ TEST_F(ReplicationExecutorTest, ShutdownReleasesAllBuffers) {
     executor->Shutdown();
 
     EXPECT_EQ(release_count.load(), 3);
+}
+
+TEST_F(ReplicationExecutorTest, MultiSpecCopiesByNameAndPublishesAllActualUris) {
+    auto location = MakeWriteLocation("multi", "kv", "rdma://dest/kv?size=4");
+    location.locations[0].push_back({"state", "rdma://dest/state?size=4"});
+    auto hint = MakeHint(42, "reader", "");
+    hint.source_specs = {{"state", "rdma://src/state?size=4"}, {"kv", "rdma://src/kv?size=4"}};
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(2).WillRepeatedly([](const auto &uris, const auto &bufs, auto) {
+        const char value = uris[0].find("/state?") != std::string::npos ? 's' : 'k';
+        EXPECT_EQ(4u, bufs[0].iovs[0].size);
+        std::memset(bufs[0].iovs[0].base, value, 4);
+        return ER_OK;
+    });
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce([](const auto &uris, const auto &bufs, auto) {
+        EXPECT_EQ((UriStrVec{"rdma://dest/kv?size=4", "rdma://dest/state?size=4"}), uris);
+        EXPECT_EQ("kkkk", std::string(static_cast<const char *>(bufs[0].iovs[0].base), 4));
+        EXPECT_EQ("ssss", std::string(static_cast<const char *>(bufs[1].iovs[0].base), 4));
+        return std::make_pair(ER_OK, UriStrVec{"rdma://actual/kv", "rdma://actual/state"});
+    });
+    EXPECT_CALL(mock_meta_, FinishWrite(_, "multi", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &locs) {
+        EXPECT_EQ(1u, std::get<BlockMaskOffset>(mask));
+        EXPECT_EQ((Locations{{{"kv", "rdma://actual/kv"}, {"state", "rdma://actual/state"}}}), locs);
+        return ER_OK;
+    });
+    auto executor = MakeExecutor();
+    executor->Submit({hint});
+    executor->Shutdown();
+}
+
+TEST_F(ReplicationExecutorTest, MultiSpecLoadFailureAbortsWholeSession) {
+    auto location = MakeWriteLocation("multi", "kv", "rdma://dest/kv");
+    location.locations[0].push_back({"state", "rdma://dest/state"});
+    auto hint = MakeHint(42, "reader", "");
+    hint.source_specs = {{"kv", "rdma://src/kv?size=4"}, {"state", "rdma://src/state?size=4"}};
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).WillOnce(Return(ER_OK)).WillOnce(Return(ER_SDKREAD_ERROR));
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).Times(0);
+    EXPECT_CALL(mock_meta_, FinishWrite(_, "multi", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &locs) {
+        EXPECT_EQ((BlockMaskVector{false}), std::get<BlockMaskVector>(mask));
+        EXPECT_TRUE(locs.empty());
+        return ER_OK;
+    });
+    auto executor = MakeExecutor();
+    executor->Submit({hint});
+    executor->Shutdown();
+}
+
+TEST_F(ReplicationExecutorTest, LegacySingleSourceCannotPublishMultipleSpecs) {
+    auto location = MakeWriteLocation();
+    location.locations[0].push_back({"state", "rdma://dest/state"});
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(0);
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).Times(0);
+    EXPECT_CALL(mock_meta_, FinishWrite(_, "sess_1", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &) {
+        EXPECT_EQ((BlockMaskVector{false}), std::get<BlockMaskVector>(mask));
+        return ER_OK;
+    });
+    auto executor = MakeExecutor();
+    char buffer[16]{};
+    int releases = 0;
+    executor->SubmitWithData(MakeHint(42, "reader"), buffer, sizeof(buffer), [&] { ++releases; });
+    executor->Shutdown();
+    EXPECT_EQ(1, releases);
+}
+
+TEST_F(ReplicationExecutorTest, MultiSpecPiggybackFallsBackToCompleteNamedSources) {
+    auto location = MakeWriteLocation("multi", "kv", "rdma://dest/kv");
+    location.locations[0].push_back({"state", "rdma://dest/state"});
+    auto hint = MakeHint(42, "reader", "");
+    hint.source_specs = {{"kv", "rdma://src/kv?size=4"}, {"state", "rdma://src/state?size=4"}};
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(2).WillRepeatedly(Return(ER_OK));
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce([](const auto &uris, const auto &bufs, auto) {
+        EXPECT_EQ(2u, uris.size());
+        EXPECT_EQ(2u, bufs.size());
+        return std::make_pair(ER_OK, UriStrVec{});
+    });
+    EXPECT_CALL(mock_meta_, FinishWrite(_, "multi", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &locs) {
+        EXPECT_EQ(1u, std::get<BlockMaskOffset>(mask));
+        EXPECT_EQ(2u, locs[0].size());
+        return ER_OK;
+    });
+    auto executor = MakeExecutor();
+    char buffer[4]{};
+    int releases = 0;
+    executor->SubmitWithData(hint, buffer, sizeof(buffer), [&] { ++releases; });
+    executor->Shutdown();
+    EXPECT_EQ(1, releases);
+}
+
+TEST_F(ReplicationExecutorTest, MissingSourceSpecNeverPublishesPartialReplica) {
+    auto location = MakeWriteLocation("multi", "kv", "rdma://dest/kv");
+    location.locations[0].push_back({"state", "rdma://dest/state"});
+    auto hint = MakeHint(42, "reader", "");
+    hint.source_specs = {{"unrelated", "rdma://src/other?size=4"}};
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(0);
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).Times(0);
+    EXPECT_CALL(mock_meta_, FinishWrite(_, "multi", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &) {
+        EXPECT_EQ((BlockMaskVector{false}), std::get<BlockMaskVector>(mask));
+        return ER_OK;
+    });
+    auto executor = MakeExecutor();
+    executor->Submit({hint});
+    executor->Shutdown();
+}
+
+TEST_F(ReplicationExecutorTest, SaveFailureAbortsSessionWithoutPublishing) {
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation())));
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce(Return(std::make_pair(ER_SDKWRITE_ERROR, UriStrVec{})));
+    EXPECT_CALL(mock_meta_, FinishWrite(_, "sess_1", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &locs) {
+        EXPECT_EQ((BlockMaskVector{false}), std::get<BlockMaskVector>(mask));
+        EXPECT_TRUE(locs.empty());
+        return ER_OK;
+    });
+    auto executor = MakeExecutor();
+    char buffer[4]{};
+    executor->SubmitWithData(MakeHint(42, "reader"), buffer, sizeof(buffer), [] {});
+    executor->Shutdown();
+}
+
+TEST_F(ReplicationExecutorTest, FailedPublishAcknowledgementDoesNotSendContradictoryAbort) {
+    SetupSuccessfulWritePath();
+    EXPECT_CALL(mock_meta_, FinishWrite(_, "sess_1", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &) {
+        EXPECT_EQ(1u, std::get<BlockMaskOffset>(mask));
+        return ER_CONNECT_FAIL;
+    });
+    auto executor = MakeExecutor();
+    char buffer[4]{};
+    executor->SubmitWithData(MakeHint(42, "reader"), buffer, sizeof(buffer), [] {});
+    executor->Shutdown();
+}
+
+TEST_F(ReplicationExecutorTest, CallerChangeDropsStaleTargetHint) {
+    EXPECT_CALL(mock_meta_, GetCallerNode()).WillOnce(Return("new_provider"));
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).Times(0);
+    auto executor = MakeExecutor();
+    executor->Submit({MakeHint(42, "old_provider")});
+    executor->Shutdown();
+}
+
+TEST_F(ReplicationExecutorTest, AsyncQueueIsBoundedAndStoppedExecutorReleasesBuffers) {
+    std::promise<void> entered, proceed;
+    auto entered_future = entered.get_future();
+    auto proceed_future = proceed.get_future().share();
+    std::vector<int64_t> executed;
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).WillRepeatedly([&](auto, const auto &keys, auto, auto, auto, auto) {
+        executed.push_back(keys[0]);
+        if (keys[0] == 1) {
+            entered.set_value();
+            proceed_future.wait();
+        }
+        return std::make_pair(ER_OK, MakeEmptyWriteLocation());
+    });
+    auto executor = std::make_unique<ReplicationExecutor>(&mock_meta_, &mock_transfer_, 1, 2);
+    executor->Submit({MakeHint(1, "reader")});
+    const bool ready = entered_future.wait_for(5s) == std::future_status::ready;
+    if (ready) {
+        executor->Submit({MakeHint(2, "reader"), MakeHint(3, "reader"), MakeHint(4, "reader")});
+    }
+    proceed.set_value();
+    executor->Shutdown();
+    ASSERT_TRUE(ready);
+    EXPECT_EQ((std::vector<int64_t>{1, 2, 3}), executed);
+    int releases = 0;
+    char buffer[4]{};
+    executor->SubmitWithData(MakeHint(5, "reader"), buffer, sizeof(buffer), [&] { ++releases; });
+    EXPECT_EQ(1, releases);
+}
+
+TEST_F(ReplicationExecutorTest, PartialActualUriResponseAbortsWholeReplica) {
+    auto location = MakeWriteLocation("multi", "kv", "rdma://dest/kv");
+    location.locations[0].push_back({"state", "rdma://dest/state"});
+    auto hint = MakeHint(42, "reader", "");
+    hint.source_specs = {{"kv", "rdma://src/kv?size=4"}, {"state", "rdma://src/state?size=4"}};
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(2).WillRepeatedly(Return(ER_OK));
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _))
+        .WillOnce(Return(std::make_pair(ER_OK, UriStrVec{"rdma://actual/kv"})));
+    EXPECT_CALL(mock_meta_, FinishWrite(_, "multi", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &locs) {
+        EXPECT_EQ((BlockMaskVector{false}), std::get<BlockMaskVector>(mask));
+        EXPECT_TRUE(locs.empty());
+        return ER_OK;
+    });
+    auto executor = MakeExecutor();
+    executor->Submit({hint});
+    executor->Shutdown();
+}
+
+TEST_F(ReplicationExecutorTest, EmptyBuffersDoNotConsumePiggybackQueueCapacity) {
+    std::promise<void> entered, proceed;
+    auto entered_future = entered.get_future();
+    auto proceed_future = proceed.get_future().share();
+    std::vector<int64_t> executed;
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).WillRepeatedly([&](auto, const auto &keys, auto, auto, auto, auto) {
+        executed.push_back(keys[0]);
+        if (keys[0] == 1) {
+            entered.set_value();
+            proceed_future.wait();
+        }
+        return std::make_pair(ER_OK, MakeEmptyWriteLocation());
+    });
+    auto executor = MakeExecutor();
+    executor->Submit({MakeHint(1, "reader")});
+    const bool ready = entered_future.wait_for(5s) == std::future_status::ready;
+    char buffer[4]{};
+    std::atomic<int> releases{0};
+    if (ready) {
+        executor->SubmitWithData(MakeHint(2, "reader"), nullptr, 0, [&] { ++releases; });
+        executor->SubmitWithData(MakeHint(3, "reader"), nullptr, 0, [&] { ++releases; });
+        executor->SubmitWithData(MakeHint(4, "reader"), buffer, sizeof(buffer), [&] { ++releases; });
+    }
+    proceed.set_value();
+    executor->Shutdown();
+    ASSERT_TRUE(ready);
+    EXPECT_EQ((std::vector<int64_t>{1, 4, 2, 3}), executed);
+    EXPECT_EQ(3, releases.load());
 }

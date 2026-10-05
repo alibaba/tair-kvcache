@@ -41,7 +41,9 @@ public:
                                                     const std::string &trace_id,
                                                     std::function<void()> cb) override {
         (void)hints;
-        (void)strict;
+        if (strict) {
+            return std::vector<LocationDescriptor>(keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}, ""});
+        }
         auto legacy = Create(keys, size_per_key, trace_id, std::move(cb));
         std::vector<LocationDescriptor> out;
         out.reserve(legacy.size());

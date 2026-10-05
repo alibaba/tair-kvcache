@@ -227,3 +227,24 @@ curl -g -vvv -X POST http://localhost:6382/api/getCacheMeta \
     "detail_level": 1
 }'
 ```
+
+
+## 亲和性复制提示
+
+`GetCacheLocationResponse.hints` 为远端热点提供异步复制建议，不改变本次读取返回的 location。
+单个提示包含 `block_key`、目标节点 UUID `target_node_id` 和 `source_specs`：
+
+```json
+{
+  "block_key": "123",
+  "target_node_id": "provider-uuid",
+  "source_specs": [
+    {"spec_name": "kv", "uri": "pace://source/kv?size=1024"},
+    {"spec_name": "state", "uri": "pace://source/state?size=2048"}
+  ]
+}
+```
+
+`source_specs` 与目标按 `spec_name` 匹配，不按数组位置匹配。所有目标 spec 写入成功后才能
+成功 `FinishWriteCache`；中途失败应使用失败 mask 结束会话。既有 `source_uri` 字段仅在
+单 spec 提示中设置。多 spec 复制要求配套升级 SDK，不能让旧客户端忽略新字段后按单 spec 执行。

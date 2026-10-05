@@ -53,7 +53,8 @@ struct ReplicationTask {
 
 class ReplicationExecutor {
 public:
-    ReplicationExecutor(MetaClient *meta_client, TransferClient *transfer_client, int num_workers = 2);
+    ReplicationExecutor(MetaClient *meta_client, TransferClient *transfer_client, int num_workers = 2,
+                        size_t max_pending_tasks = 1024);
     ~ReplicationExecutor();
 
     void Submit(const std::vector<ClientReplicationHint> &hints);
@@ -63,15 +64,13 @@ public:
 private:
     void WorkerLoop();
     void ExecuteTask(ReplicationTask &task);
-    void
-    ExecuteWrite(const std::string &trace_id, const ClientReplicationHint &hint, const void *data, size_t data_size);
-    void ExecuteHintAsync(const std::string &trace_id, const ClientReplicationHint &hint);
     std::string MakeKey(int64_t block_key, const std::string &target_node_id) const;
 
 private:
     MetaClient *meta_client_;
     TransferClient *transfer_client_;
     int max_piggyback_queue_;
+    size_t max_pending_tasks_;
 
     std::mutex mu_;
     std::condition_variable cv_;

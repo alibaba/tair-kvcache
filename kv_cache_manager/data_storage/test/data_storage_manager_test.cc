@@ -47,10 +47,19 @@ TEST_F(DataStorageManagerTest, TestSimple) {
     auto disabled_create = data_storage_manager.Create(&request_context, "storage1", {"disabled_key"}, 128, []() {});
     ASSERT_EQ(1u, disabled_create.size());
     EXPECT_EQ(EC_NOENT, disabled_create[0].first);
+    auto disabled_affinity = data_storage_manager.Create(
+        &request_context, "storage1", {"a", "b"}, 128, WriteHints{{"local"}}, true, [] {});
+    ASSERT_EQ(2u, disabled_affinity.size());
+    EXPECT_EQ(EC_NOENT, disabled_affinity[0].ec);
+    EXPECT_EQ(EC_NOENT, disabled_affinity[1].ec);
 
     // enable storage
     ASSERT_EQ(EC_OK, data_storage_manager.EnableStorage("storage1"));
     EXPECT_TRUE(data_storage_backend->Available());
+    auto empty_strict = data_storage_manager.Create(
+        &request_context, "storage1", {"strict_key"}, 128, WriteHints{}, true, [] {});
+    ASSERT_EQ(1u, empty_strict.size());
+    EXPECT_EQ(EC_UNIMPLEMENTED, empty_strict[0].ec);
     ASSERT_EQ(EC_NOENT, data_storage_manager.EnableStorage("storage2"));
 
     // create exist delete
@@ -113,4 +122,15 @@ TEST_F(DataStorageManagerTest, TestOptionalBackendsFollowBuildConfig) {
     // while the internal PACE backend can initialize successfully.
     pace_ssd_backend->config_ = pace_ssd_config;
     EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, pace_ssd_backend->GetType());
+}
+
+TEST_F(DataStorageManagerTest, StrictPlacementRejectsBackendWithoutAffinity) {
+    DataStorageManager manager(metrics_registry_);
+    RequestContext ctx("strict_unsupported");
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_DUMMY, "dummy", std::make_shared<DummyStorageSpec>());
+    ASSERT_EQ(EC_OK, manager.RegisterStorage(&ctx, "dummy", config));
+    auto result = manager.Create(&ctx, "dummy", {"key"}, 128, WriteHints{{"nodeA"}}, true, [] {});
+    ASSERT_EQ(1u, result.size());
+    EXPECT_EQ(EC_UNIMPLEMENTED, result[0].ec);
+    EXPECT_TRUE(result[0].uri.ToUriString().empty());
 }

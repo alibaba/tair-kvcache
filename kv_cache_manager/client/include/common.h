@@ -208,6 +208,8 @@ struct ClientReplicationHint {
     int64_t block_key{0};
     std::string source_uri;
     std::string target_node_id;
+    // Sources are matched to allocated destinations by spec_name, never position.
+    Location source_specs;
 };
 
 } // namespace kv_cache_manager
