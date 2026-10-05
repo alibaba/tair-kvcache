@@ -936,7 +936,7 @@ ErrorCode CacheManager::GetCacheLocation(RequestContext *request_context,
         }
         KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, match_len);
     }
-    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "get cache location failed");
+    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "get cache location failed");
     // accumulate hit/query block counters for hit-rate monitoring (only on success)
     if (service_metrics_collector) {
         size_t query_count = query_keys.size();

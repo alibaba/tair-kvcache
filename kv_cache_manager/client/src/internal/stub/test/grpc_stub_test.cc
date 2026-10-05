@@ -161,7 +161,7 @@ void GrpcStubTest::StartService(int port) {
     ASSERT_TRUE(affinity_manager_->LoadProcessStrategyFromJsonString(
         R"({"type":"local_replica","write":{"ops":{"prefer_local":{"on_miss":"passthrough"}}}})", &err))
         << err;
-    cache_manager_ = std::make_shared<CacheManager>(metrics_registry_, registry_manager_, affinity_manager_);
+    cache_manager_ = std::make_shared<CacheManager>(metrics_registry_, registry_manager_, nullptr, affinity_manager_);
     // 先 Load 注册 NFS backend, 再 Init, 让 metrics 同步预热能拉到默认节点。
     StartupConfigLoader loader;
     loader.Init(registry_manager_);

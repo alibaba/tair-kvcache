@@ -208,7 +208,7 @@ public:
     [[nodiscard]] size_t EstimateMemUsage() const {
         size_t usage = sizeof(CacheLocation) + id().size();
         for (const auto &spec : location_specs_) {
-            usage += sizeof(LocationSpec) + spec.name().size() + spec.uri().size();
+            usage += sizeof(LocationSpec) + spec.name().size() + spec.uri().size() + spec.node_id().size();
         }
         return usage;
     }

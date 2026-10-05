@@ -866,7 +866,6 @@ public:
         stub_.reset(ADDR(MetaIndexer, GetProperties));
         stub_.reset(ADDR(MetaIndexer, RandomSample));
         stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
-        stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
         stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
         stub_.reset(ADDR(MetaIndexer, GetKeyCount));
         stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
@@ -8371,4 +8370,45 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDWritingColdDoesNotProtectHot) {
 
     stub_.reset(ADDR(RegistryManager, GetInstanceGroup));
     g_cold_ig.reset();
+}
+
+TEST_F(CacheReclaimerTest, NodePressureKeepsHealthyReplicaAndHonorsPendingLimits) {
+    auto pressured = std::make_shared<CacheLocation>(
+        "pressured", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1,
+        std::vector<LocationSpec>{LocationSpec("test_spec", "nfs://store/a?size=64", "nodeA")});
+    auto healthy = std::make_shared<CacheLocation>(
+        "healthy", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1,
+        std::vector<LocationSpec>{LocationSpec("test_spec", "nfs://store/b?size=64", "nodeB")});
+    batch_get_loc_out_maps = {{{"pressured", pressured}, {"healthy", healthy}}};
+    CacheReclaimer::BytesByStorageType bytes{};
+    CacheReclaimer::CountsByStorageType counts{};
+    uint64_t deleted_keys = 0;
+    CacheReclaimer::AgeStats ages;
+    std::vector<std::vector<std::string>> ids;
+    std::unordered_map<std::string, int64_t> node_bytes;
+    const auto filter = [&]() {
+        return cache_reclaimer_->FilterLocIDImpl(
+            request_context_.get(), instance_infos.front(), {42}, CacheReclaimer::WaterLevelExceed{},
+            ids, bytes, counts, deleted_keys, ages, false, false, {"nodeA"}, &node_bytes);
+    };
+    ASSERT_TRUE(filter());
+    ASSERT_EQ((std::vector<std::vector<std::string>>{{"pressured"}}), ids);
+    EXPECT_EQ(0u, deleted_keys); // The healthy replica keeps the key alive.
+    EXPECT_EQ(64, node_bytes["nodeA"]);
+    EXPECT_EQ(0u, node_bytes.count("nodeB"));
+
+    cache_reclaimer_->pending_locations_.insert({instance_infos.front()->instance_id(), 42, "pressured"});
+    ASSERT_TRUE(filter());
+    ASSERT_EQ(1u, ids.size());
+    EXPECT_TRUE(ids.front().empty());
+    EXPECT_TRUE(node_bytes.empty());
+    cache_reclaimer_->pending_locations_.clear();
+
+    CacheReclaimerAsyncDeleteConfig config;
+    config.pending_bytes_limit = 32;
+    ReplaceReclaimer(config);
+    ASSERT_TRUE(filter());
+    ASSERT_EQ(1u, ids.size());
+    EXPECT_TRUE(ids.front().empty());
+    EXPECT_TRUE(node_bytes.empty());
 }

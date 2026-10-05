@@ -800,8 +800,10 @@ public:
 
     std::vector<std::string> QueryEventReportUris(const std::vector<int64_t> &keys) {
         RequestContext context("query_report_event_ordering");
-        auto [ec, locations] = cache_manager_->GetCacheLocation(
-            &context, "test_instance", CacheManager::QueryType::QT_BATCH_GET, keys, {}, BlockMask{}, 0, {});
+        CacheLocationViewVecWrapper locations;
+        std::vector<ReplicationHint> hints;
+        auto ec = cache_manager_->GetCacheLocation(
+            &context, "test_instance", CacheManager::QueryType::QT_BATCH_GET, keys, {}, BlockMask{}, 0, {}, locations, hints);
         EXPECT_EQ(EC_OK, ec);
         std::vector<std::string> uris;
         for (const auto &location : locations.cache_locations_view()) {
@@ -6023,8 +6025,10 @@ TEST_F(CacheManagerTest, TestGetCacheLocationEnforcesReporterLifecycleAndBatchOr
 
     auto query_visibility = [&](const std::vector<int64_t> &keys) {
         RequestContext context("query_reporter_lifecycle");
-        auto [ec, locations] = cache_manager_->GetCacheLocation(
-            &context, "test_instance", CacheManager::QueryType::QT_BATCH_GET, keys, {}, BlockMask{}, 0, {});
+        CacheLocationViewVecWrapper locations;
+        std::vector<ReplicationHint> hints;
+        auto ec = cache_manager_->GetCacheLocation(
+            &context, "test_instance", CacheManager::QueryType::QT_BATCH_GET, keys, {}, BlockMask{}, 0, {}, locations, hints);
         EXPECT_EQ(EC_OK, ec);
         std::vector<std::vector<std::string>> uris_by_key;
         for (const auto &location : locations.cache_locations_view()) {
@@ -10965,7 +10969,7 @@ public:
         registry_manager_->Init();
         registry_manager_->recover_complete_.store(true);
 
-        auto cm = std::make_unique<CacheManager>(metrics_registry, registry_manager_, affinity_manager_);
+        auto cm = std::make_unique<CacheManager>(metrics_registry, registry_manager_, nullptr, affinity_manager_);
         EXPECT_TRUE(cm->Init());
 
         StartupConfigLoader loader;

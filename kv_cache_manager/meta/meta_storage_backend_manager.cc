@@ -155,19 +155,21 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
 }
 
 ErrorCode MetaStorageBackendManager::InitReclaimIndexers(const std::string &types_str) noexcept {
-    if (types_str.empty()) {
-        return EC_OK;
-    }
+    std::unordered_map<std::string, std::unique_ptr<ReclaimIndexer>> indexers;
     auto types = StringUtil::Split(types_str, ";");
     for (const auto &type : types) {
+        if (type.empty()) {
+            continue;
+        }
         auto indexer = ReclaimIndexerFactory::Create(type);
         if (!indexer) {
             KVCM_LOG_ERROR("fail to create reclaim indexer type[%s]", type.c_str());
             return EC_ERROR;
         }
         KVCM_LOG_INFO("reclaim indexer created, type[%s]", type.c_str());
-        reclaim_indexers_[type] = std::move(indexer);
+        indexers[type] = std::move(indexer);
     }
+    reclaim_indexers_.swap(indexers);
     return EC_OK;
 }
 
@@ -1827,7 +1829,8 @@ void MetaStorageBackendManager::GetSingleLocationViewsWithKeyStatusInto(RequestC
 }
 
 bool MetaStorageBackendManager::SupportsConcurrentLocationValueReads() const noexcept {
-    return !cache_backend_ && persistent_backend_ &&
+    // Node indexes need the generic read/write notification hooks.
+    return reclaim_indexers_.empty() && !cache_backend_ && persistent_backend_ &&
            persistent_backend_->GetStorageType() == META_LOCAL_BACKEND_TYPE_STR;
 }
 
@@ -2162,11 +2165,9 @@ ErrorCode MetaStorageBackendManager::SampleReclaimKeys(RequestContext *request_c
         return it->second->Sample(static_cast<size_t>(count), node_ids, out_keys);
     }
 
-    // general lru fallback
-    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
-        return cache_backend_->SampleReclaimKeys(request_context, count, out_keys);
+    if (type == "lru") {
+        return SampleReclaimKeys(request_context, count, out_keys);
     }
-    return persistent_backend_->SampleReclaimKeys(request_context, count, out_keys);
 
     KVCM_LOG_WARN("SampleReclaimKeys: no reclaim indexer for type[%s]", type.c_str());
     return EC_NOENT;
