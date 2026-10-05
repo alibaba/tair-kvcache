@@ -58,6 +58,7 @@ ClientErrorCode ManagerClientImpl::Init(const std::string &client_config, InitPa
         }
         ReplicationOptions options;
         options.instance_id = config.instance_id();
+        options.metrics_callback = init_params.replication_metrics_callback;
         options.max_buffer_bytes = config.replication_max_buffer_bytes();
         options.max_pending_bytes = config.replication_max_pending_bytes();
         options.node_bytes_per_second = config.replication_node_bytes_per_second();
@@ -70,6 +71,10 @@ ClientErrorCode ManagerClientImpl::Init(const std::string &client_config, InitPa
     }
     KVCM_LOG_INFO("manager client init success");
     return ER_OK;
+}
+
+ReplicationStats ManagerClientImpl::GetReplicationStats() const {
+    return replication_executor_ ? replication_executor_->GetStats() : ReplicationStats{};
 }
 
 void ManagerClientImpl::Shutdown() {

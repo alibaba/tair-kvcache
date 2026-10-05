@@ -348,3 +348,7 @@ public:
 客户端配置增加 `replication_max_buffer_bytes`（进程内已保留用户缓冲区与复制缓冲区的总预算，默认 256 MiB）、`replication_max_pending_bytes`（每执行器队列预计字节数，默认 256 MiB）、`replication_node_bytes_per_second`（同一进程向每个目标节点复制的字节速率，0 不限）与 `replication_max_age_ms`（入队后最长存活时间，默认 30 秒）。同一进程中的客户端应配置一致的进程预算。
 
 源 spec 总大小在分配缓冲区前检查；用户缓冲区在入队时预留预算，完成或丢弃时释放。多个实例共享轮转准入和目标节点限速，单实例保持 FIFO，复用缓冲区任务也排队。限速允许一次块传输的突发，之后按该块大小占用传输时间；它限制后台复制，不影响前台读写。进程间的全局带宽由部署侧配额控制。
+
+### 复制结果观测
+
+`ManagerClient::GetReplicationStats()` 返回当前客户端的累计提交/准入、成功、失败、跳过、过期、队列/预算丢弃、重复提示计数，以及成功复制字节、执行耗时、排队耗时、活动数和队列字节。只有 `FinishWrite` 成功确认后才增加成功次数和字节；已在本地跳过与失败分开统计。`InitParams.replication_metrics_callback` 可接入业务指标系统，完成任务后在执行器锁外调用；导出异常不会终止工作线程。仅发生准入丢弃时可周期读取快照。以上为 SDK 侧实际结果，服务端 hint/StartWrite 计数不能替代它们。

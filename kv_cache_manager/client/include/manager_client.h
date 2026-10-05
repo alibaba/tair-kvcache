@@ -58,6 +58,8 @@ public:
     virtual std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                const BlockBuffers &block_buffers) = 0;
 
+    virtual ReplicationStats GetReplicationStats() const { return {}; }
+
     // diagnostic: expose caller node id for debugging affinity issues
     virtual std::string GetCallerNode() const = 0;
 

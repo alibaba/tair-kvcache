@@ -100,29 +100,36 @@ ReplicationExecutor::ReplicationExecutor(MetaClient *meta_client, TransferClient
 ReplicationExecutor::~ReplicationExecutor() { Shutdown(); }
 
 void ReplicationExecutor::Submit(const std::vector<ClientReplicationHint> &hints) {
+    counters_.submitted += hints.size();
     if (hints.empty() || stopped_.load(std::memory_order_relaxed)) {
+        counters_.dropped_queue += hints.size();
         return;
     }
     std::lock_guard<std::mutex> lk(mu_);
     if (stopped_.load(std::memory_order_relaxed)) {
+        counters_.dropped_queue += hints.size();
         return;
     }
-    for (const auto &hint : hints) {
+    for (size_t hint_index = 0; hint_index < hints.size(); ++hint_index) {
+        const auto &hint = hints[hint_index];
         if (queue_.size() >= max_pending_tasks_) {
+            counters_.dropped_queue += hints.size() - hint_index;
             KVCM_LOG_WARN("[replication] async queue full (%zu/%zu), remaining hints dropped",
                           queue_.size(), max_pending_tasks_);
             break;
         }
         const size_t bytes = HintBytes(hint);
         if (bytes > options_.max_buffer_bytes || bytes > options_.max_pending_bytes ||
-            pending_bytes_ > options_.max_pending_bytes - bytes) continue;
+            pending_bytes_ > options_.max_pending_bytes - bytes) { ++counters_.dropped_budget; continue; }
         std::string key = MakeKey(hint.block_key, hint.target_node_id);
         if (inflight_.count(key)) {
+            ++counters_.duplicates;
             KVCM_LOG_DEBUG("[replication] Submit: block_key [%ld] target [%s] already inflight, skipped",
                            hint.block_key,
                            hint.target_node_id.c_str());
             continue;
         }
+        ++counters_.admitted;
         inflight_.insert(key);
         queue_.push_back(ReplicationTask{hint});
         queue_.back().pending_bytes = bytes;
@@ -146,16 +153,20 @@ void ReplicationExecutor::SubmitWithData(ClientReplicationHint hint,
         Submit({hint});
         return;
     }
+    ++counters_.submitted;
     if (stopped_.load(std::memory_order_relaxed)) {
+        ++counters_.dropped_queue;
         KVCM_LOG_WARN("[replication] SubmitWithData: executor stopped, block_key [%ld] dropped", hint.block_key);
         return;
     }
     std::lock_guard<std::mutex> lk(mu_);
     if (stopped_.load(std::memory_order_relaxed) || queue_.size() >= max_pending_tasks_) {
+        ++counters_.dropped_queue;
         return;
     }
     std::string key = MakeKey(hint.block_key, hint.target_node_id);
     if (inflight_.count(key)) {
+        ++counters_.duplicates;
         KVCM_LOG_INFO("[replication] SubmitWithData: block_key [%ld] target [%s] already inflight "
                       "(likely auto-submitted by MatchLocation), piggyback data dropped. "
                       "Async replication via ExecuteHintAsync is in progress.",
@@ -164,6 +175,7 @@ void ReplicationExecutor::SubmitWithData(ClientReplicationHint hint,
         return;
     }
     if (piggyback_queue_size_ >= max_piggyback_queue_) {
+        ++counters_.dropped_queue;
         KVCM_LOG_WARN("[replication] SubmitWithData: block_key [%ld] target [%s] dropped, "
                       "piggyback queue full (%d/%d)",
                       hint.block_key,
@@ -175,12 +187,19 @@ void ReplicationExecutor::SubmitWithData(ClientReplicationHint hint,
     const auto source_bytes = HintBytes(hint);
     const size_t bytes = std::max(size, source_bytes);
     if (bytes > options_.max_pending_bytes || pending_bytes_ > options_.max_pending_bytes - bytes ||
-        !ReplicationResources::Global().TryRetain(size, options_.max_buffer_bytes)) return;
+        !ReplicationResources::Global().TryRetain(size, options_.max_buffer_bytes)) { ++counters_.dropped_budget; return; }
     ReleaseGuard retained([size] { ReplicationResources::Global().Release(size); });
+    ++counters_.admitted;
     inflight_.insert(key);
     ++piggyback_queue_size_;
     // FIFO prevents a stream of piggyback tasks from starving ordinary hints.
-    queue_.push_back(ReplicationTask{std::move(hint), data, size, std::move(retained), std::move(guard)});
+    ReplicationTask task;
+    task.hint = std::move(hint);
+    task.data = data;
+    task.data_size = size;
+    task.retained_memory = std::move(retained);
+    task.guard = std::move(guard);
+    queue_.push_back(std::move(task));
     queue_.back().pending_bytes = bytes;
     pending_bytes_ += bytes;
     KVCM_LOG_INFO("[replication] SubmitWithData: block_key [%ld] target [%s] enqueued (piggyback_queue=%d/%d)",
@@ -225,30 +244,74 @@ void ReplicationExecutor::WorkerLoop() {
                 --piggyback_queue_size_;
             }
         }
+        const auto begin = ReplicationResources::Clock::now();
+        counters_.queue_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(begin - task.submitted_at).count();
+        ++counters_.active;
         try {
             ExecuteTask(task);
         } catch (const std::exception &e) {
             KVCM_LOG_WARN("[replication] block_key [%ld] failed: %s", task.hint.block_key, e.what());
+        } catch (...) {
+            KVCM_LOG_WARN("[replication] unknown worker exception");
+        }
+        --counters_.active;
+        counters_.latency_us += std::chrono::duration_cast<std::chrono::microseconds>(
+            ReplicationResources::Clock::now() - begin).count();
+        switch (task.outcome) {
+        case ReplicationTask::Outcome::Succeeded: ++counters_.succeeded; counters_.copied_bytes += task.copied_bytes; break;
+        case ReplicationTask::Outcome::Skipped: ++counters_.skipped; break;
+        case ReplicationTask::Outcome::Expired: ++counters_.expired; break;
+        case ReplicationTask::Outcome::Failed: ++counters_.failed; break;
         }
         {
             std::lock_guard<std::mutex> lk(mu_);
             inflight_.erase(MakeKey(task.hint.block_key, task.hint.target_node_id));
         }
+        if (options_.metrics_callback) {
+            try { options_.metrics_callback(GetStats()); }
+            catch (...) { KVCM_LOG_WARN("[replication] metrics callback failed"); }
+        }
     }
 }
 
+ReplicationStats ReplicationExecutor::GetStats() const {
+    ReplicationStats result;
+    result.submitted = counters_.submitted.load(std::memory_order_relaxed);
+    result.admitted = counters_.admitted.load(std::memory_order_relaxed);
+    result.succeeded = counters_.succeeded.load(std::memory_order_relaxed);
+    result.failed = counters_.failed.load(std::memory_order_relaxed);
+    result.skipped = counters_.skipped.load(std::memory_order_relaxed);
+    result.expired = counters_.expired.load(std::memory_order_relaxed);
+    result.dropped_queue = counters_.dropped_queue.load(std::memory_order_relaxed);
+    result.dropped_budget = counters_.dropped_budget.load(std::memory_order_relaxed);
+    result.duplicates = counters_.duplicates.load(std::memory_order_relaxed);
+    result.copied_bytes = counters_.copied_bytes.load(std::memory_order_relaxed);
+    result.latency_us = counters_.latency_us.load(std::memory_order_relaxed);
+    result.queue_wait_us = counters_.queue_wait_us.load(std::memory_order_relaxed);
+    result.active = counters_.active.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(mu_);
+    result.queued = queue_.size();
+    result.pending_bytes = pending_bytes_;
+    return result;
+}
+
 void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
-    if (ReplicationResources::Clock::now() >= task.submitted_at + std::chrono::milliseconds(options_.max_age_ms)) return;
+    if (ReplicationResources::Clock::now() >= task.submitted_at + std::chrono::milliseconds(options_.max_age_ms)) {
+        task.outcome = ReplicationTask::Outcome::Expired;
+        return;
+    }
     const auto &hint = task.hint;
     const std::string trace_id = "repl_" + StringUtil::GenerateRandomString(16);
     const auto caller = meta_client_->GetCallerNode();
     if (!caller.empty() && caller != hint.target_node_id) {
+        task.outcome = ReplicationTask::Outcome::Skipped;
         KVCM_LOG_WARN("[replication] caller changed; dropping hint for node [%s]", hint.target_node_id.c_str());
         return;
     }
     auto [start_ec, write_loc] = meta_client_->StartWrite(
         trace_id, {hint.block_key}, {}, {}, /*write_timeout_seconds=*/60, /*is_replication=*/true);
     if (start_ec != ER_OK || write_loc.locations.empty()) {
+        if (start_ec == ER_OK) task.outcome = ReplicationTask::Outcome::Skipped;
         return; // Failed allocation, or the replica is already local.
     }
 
@@ -301,7 +364,12 @@ void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
     const size_t allocate_bytes = piggyback ? 0 : buffer_bytes;
     if (!ReplicationResources::Global().Acquire(options_.instance_id, hint.target_node_id,
             allocate_bytes, options_.max_buffer_bytes, buffer_bytes, options_.node_bytes_per_second,
-            task.submitted_at + std::chrono::milliseconds(options_.max_age_ms), stopped_)) return;
+            task.submitted_at + std::chrono::milliseconds(options_.max_age_ms), stopped_)) {
+        if (ReplicationResources::Clock::now() >= task.submitted_at + std::chrono::milliseconds(options_.max_age_ms))
+            task.outcome = ReplicationTask::Outcome::Expired;
+        else ++counters_.dropped_budget;
+        return;
+    }
     ReleaseGuard memory([allocate_bytes] { ReplicationResources::Global().Release(allocate_bytes); });
     std::vector<std::vector<char>> owned_buffers(destinations.size());
     std::unordered_set<std::string> destination_names;
@@ -355,6 +423,10 @@ void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
     finish_attempted = true;
     const auto finish_ec = meta_client_->FinishWrite(
         trace_id, write_loc.write_session_id, BlockMaskOffset(1), {finished});
+    if (finish_ec == ER_OK) {
+        task.outcome = ReplicationTask::Outcome::Succeeded;
+        task.copied_bytes = buffer_bytes;
+    }
     if (finish_ec != ER_OK) {
         KVCM_LOG_WARN("[replication] FinishWrite failed for block_key [%ld], ec [%d]", hint.block_key, finish_ec);
     }
