@@ -41,7 +41,7 @@ public:
 
     void TearDown() override {}
 
-    ErrorCode InitIndexer() {
+    ErrorCode InitIndexer(bool pure_local = false) {
         // Use cached mode: local (cache) + dummy (persistent) + node_lru reclaim indexer.
         std::string config_str = R"({
             "max_key_count" : 1000,
@@ -50,6 +50,9 @@ public:
         })";
         auto config = std::make_shared<MetaIndexerConfig>();
         config->FromJsonString(config_str);
+        if (pure_local) {
+            config->meta_storage_backend_config_->SetStorageType("local");
+        }
         std::string local_path = GetPrivateTestRuntimeDataPath() + "meta_node_lru_test";
         config->meta_storage_backend_config_->SetStorageUri(
             "file://" + local_path + "?reclaim_indexer_type=node_lru&persistent_type=dummy&cache_type=local");
@@ -161,4 +164,26 @@ TEST_F(MetaIndexerNodeLruTest, GetTouchesLruOrder) {
     ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(request_context_.get(), "node_lru", {"nodeA"}, 1, sampled));
     ASSERT_EQ(1u, sampled.size());
     EXPECT_EQ(2, sampled[0]);
+}
+
+// Main's local metadata RMW optimization must keep the node-index hooks.
+TEST_F(MetaIndexerNodeLruTest, PureLocalTargetedUpsertAndDeleteKeepNodeIndex) {
+    ASSERT_EQ(EC_OK, InitIndexer(true));
+    EXPECT_FALSE(meta_indexer_->SupportsSingleLocationRmw());
+    CacheLocationMapVector locations = {MakeNodeLocation("loc_a", "nodeA")};
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {42}, locations, properties).ec);
+    const auto modifier = [](const std::vector<ErrorCode> &, const LocationIdVector &, size_t,
+                             CacheLocationVector &out, PropertyMap &) -> LocationModifierResult {
+        out = {MakeNodeLocation("loc_b", "nodeB").at("loc_b")};
+        return {MA_OK, {EC_OK}};
+    };
+    ASSERT_EQ(EC_OK, meta_indexer_->ReadModifyWriteTargetLocations(
+                         request_context_.get(), {42}, {{"loc_b"}}, modifier).ec);
+    KeyVector keys;
+    ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(request_context_.get(), "node_lru", {"nodeB"}, 10, keys));
+    EXPECT_EQ((KeyVector{42}), keys);
+    ASSERT_EQ(EC_OK, meta_indexer_->Delete(request_context_.get(), {42}).ec);
+    ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(request_context_.get(), "node_lru", {"nodeB"}, 10, keys));
+    EXPECT_TRUE(keys.empty());
 }

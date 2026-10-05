@@ -266,8 +266,6 @@ private:
                                        const std::vector<ErrorCode> &results) noexcept;
 
     std::string instance_id_;
-    std::string cache_type_;
-    std::string persistent_type_;
     std::unique_ptr<MetaStorageBackend> persistent_backend_;
     std::unique_ptr<MetaCacheBaseBackend> cache_backend_;
     bool memory_primary_ = false;

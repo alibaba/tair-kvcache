@@ -85,3 +85,23 @@ bazelisk --output_base=/tmp/bazel-affinity-e2e-os test \
   --test_env ASAN_OPTIONS=detect_odr_violation=0 --test_output=errors \
   //integration_test/affinity:AffinityPendingContractTest
 ```
+
+## 与最新主干合并后的回归
+
+`kvcm_affinity_merge` 保留主干 Proto 字段编号：实例的 `default_query_type=8`、
+写请求的 `min_replica_count=7` 不变；新增 `affinity_strategy_json` 在实例中为 9、
+实例组中为 12，`StartWriteCacheRequest.caller=10`。旧亲和性分支的二进制需要
+与服务端一起重新生成协议并构建，不能直接混用旧字段编号。
+
+节点压力淘汰复用主干的异步删除准入，保留 pending 限额、重复过滤及迁移保护。
+配置节点索引时使用带索引通知的通用元数据路径。相关回归目标：
+
+```bash
+bazelisk --output_base=/tmp/bazel-affinity-e2e-os test \
+  --config=debug --config=asan --test_output=errors \
+  --test_env ASAN_OPTIONS=detect_odr_violation=0 \
+  //kv_cache_manager/manager/test:CacheReclaimerTest \
+  //kv_cache_manager/meta/test:meta_indexer_node_lru_test
+```
+
+滞回中的释放字节仍为删除提交成功后的估算值；物理删除完成确认仍属于待完善项。

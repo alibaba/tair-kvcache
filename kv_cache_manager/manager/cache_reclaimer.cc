@@ -25,6 +25,7 @@
 #include <variant>
 #include <vector>
 
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -1095,6 +1096,59 @@ bool CacheReclaimer::ReclaimByLRUImpl(const std::shared_ptr<RequestContext> &req
     return submitted;
 }
 
+bool CacheReclaimer::ReclaimByNode(const std::shared_ptr<RequestContext> &request_context,
+                                   const InstanceInfoConstPtr &instance_info,
+                                   const std::unordered_set<std::string> &node_ids,
+                                   std::int32_t delay_before_delete_ms) noexcept {
+    if (!IsRunning() || IsPaused() || !instance_info || node_ids.empty()) {
+        return false;
+    }
+    const auto indexer = meta_indexer_manager_->GetMetaIndexer(instance_info->instance_id());
+    if (!indexer) {
+        return false;
+    }
+    CacheLocationDelRequest request;
+    request.instance_id = instance_info->instance_id();
+    request.delay = std::chrono::milliseconds(delay_before_delete_ms);
+    // The node index supplies the oldest keys on each pressured node. Keep its
+    // per-node sampling quota and cap admission with the normal deletion batch.
+    const auto count = std::min(GetSamplingSize(request_context.get()), GetBatchingSize(request_context.get()));
+    if (indexer->SampleReclaimKeys(request_context.get(), "node_lru", node_ids, count, request.block_keys) != EC_OK) {
+        return false;
+    }
+    std::unordered_set<int64_t> seen;
+    request.block_keys.erase(
+        std::remove_if(request.block_keys.begin(), request.block_keys.end(),
+                       [&seen](int64_t key) { return !seen.insert(key).second; }),
+        request.block_keys.end());
+    if (request.block_keys.empty()) {
+        return false;
+    }
+    BytesByStorageType bytes_by_type{};
+    CountsByStorageType location_counts_by_type{};
+    std::uint64_t predicted_deleted_keys = 0;
+    AgeStats create_age_stats;
+    std::unordered_map<std::string, int64_t> node_bytes;
+    if (!FilterLocIDImpl(request_context.get(), instance_info, request.block_keys, WaterLevelExceed{},
+                         request.location_ids, bytes_by_type, location_counts_by_type, predicted_deleted_keys,
+                         create_age_stats, false, indexer->PreferSingleTaskReclaimSampling(), node_ids, &node_bytes)) {
+        return false;
+    }
+    // Reuse async admission: pending limits, duplicate filtering, migration
+    // protection and delayed deletion all apply to node-pressure eviction.
+    const bool submitted = SubmitDelReq(request_context, instance_info, request, bytes_by_type,
+                                         location_counts_by_type, predicted_deleted_keys);
+    if (submitted) {
+        METRICS_(cache_reclaimer, reclaim_job_count) += 1;
+        if (affinity_manager_) {
+            for (const auto &[node_id, bytes] : node_bytes) {
+                affinity_manager_->ReportEvictedBytes(node_id, bytes);
+            }
+        }
+    }
+    return submitted;
+}
+
 bool CacheReclaimer::ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
                                   const WaterLevelExceed &water_level_exceed,
@@ -1520,7 +1574,9 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                                      std::uint64_t &out_predicted_deleted_keys,
                                      AgeStats &out_create_age_stats,
                                      bool eligibility_only,
-                                     bool maintenance_read) noexcept {
+                                     bool maintenance_read,
+                                     const std::unordered_set<std::string> &node_ids,
+                                     std::unordered_map<std::string, int64_t> *out_node_bytes) noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
@@ -1529,6 +1585,9 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
     out_location_counts_by_type.fill(0);
     out_predicted_deleted_keys = 0;
     out_create_age_stats = AgeStats{};
+    if (out_node_bytes) {
+        out_node_bytes->clear();
+    }
 
     if (!eligibility_only && (pending_delete_handler_count_ >= async_delete_config_.pending_delete_handler_limit ||
                               pending_delete_bytes_ >= async_delete_config_.pending_bytes_limit)) {
@@ -1666,7 +1725,13 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                 if (IsEventReportStorageType(loc.type())) {
                     continue;
                 }
-                if (is_pending_location(block_key, loc.id())) {
+                // A node-pressure pass must never delete a healthy node's replica.
+            if (!node_ids.empty() &&
+                std::none_of(loc.location_specs().begin(), loc.location_specs().end(),
+                             [&node_ids](const auto &spec) { return node_ids.count(spec.node_id()) != 0; })) {
+                continue;
+            }
+            if (is_pending_location(block_key, loc.id())) {
                     continue;
                 }
                 const bool is_active_copy_target =
@@ -1797,6 +1862,21 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                 }
 
                 loc_id_vec.emplace_back(loc.id());
+                if (out_node_bytes) {
+                    for (const auto &spec : loc.location_specs()) {
+                        if (node_ids.count(spec.node_id()) == 0) {
+                            continue;
+                        }
+                        int64_t size = 0;
+                        auto uri = DataStorageUri::FromUri(spec.uri());
+                        if (uri.Valid()) {
+                            uri.GetParamAs<int64_t>("size", size);
+                        }
+                        if (size > 0) {
+                            (*out_node_bytes)[spec.node_id()] += size;
+                        }
+                    }
+                }
                 out_location_counts_by_type[type_idx] = SaturatingAdd(out_location_counts_by_type[type_idx], 1);
                 out_bytes_by_type[type_idx] = SaturatingAdd(out_bytes_by_type[type_idx], location_bytes);
                 selected_total_bytes = SaturatingAdd(selected_total_bytes, location_bytes);
@@ -2757,6 +2837,24 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
         result = TryReclaimOnGroupLru(request_context, instance_group, reclaim_strategy, instance_infos);
     } else {
         LOG_WITH_GR(ERROR, "invalid instance reclaim mode [%d], skip reclaim", static_cast<int>(budget_policy));
+    }
+
+    // Node capacity is independent of group quota. Resolve again after each
+    // instance so accepted deletion credit participates in hysteresis.
+    if (affinity_manager_) {
+        AffinityResolveContext resolve_ctx;
+        resolve_ctx.instance_group_name = ins_gr;
+        resolve_ctx.group_strategy_json = instance_group->affinity_strategy_json();
+        for (const auto &instance_info : instance_infos) {
+            const auto node_ids = affinity_manager_->ResolveEviction(resolve_ctx);
+            if (node_ids.empty()) {
+                break;
+            }
+            result.water_level_exceeded = true;
+            const bool submitted = ReclaimByNode(request_context, instance_info, node_ids,
+                                                  reclaim_strategy->delay_before_delete_ms());
+            result.made_progress = result.made_progress || submitted;
+        }
     }
 
     // Reclaim admission precedes migration preparation in the same cron round. An accepted
