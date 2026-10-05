@@ -81,8 +81,9 @@ public:
     // (with hysteresis applied). Empty set means no node-level eviction needed.
     std::unordered_set<std::string> ResolveEviction(const AffinityResolveContext &ctx);
 
-    // Accumulate evicted bytes for hysteresis estimation.
-    void ReportEvictedBytes(const std::string &node_id, int64_t bytes);
+    // Credit confirmed physical deletes only against a sample taken before
+    // deletion started. Zero timestamp is reserved for direct local accounting.
+    void ReportEvictedBytes(const std::string &node_id, int64_t bytes, int64_t delete_started_at_us = 0);
 
     // Start a background thread that periodically pulls per-node metrics from
     // each backend via DataStorageManager. Idempotent; stopped on destruction.

@@ -47,6 +47,10 @@ struct PlanExecuteResult {
     // True only when every failure in this result has already been logged.
     // Callers can retain result metrics without repeating the diagnostics.
     bool error_logged{false};
+    // Only EC_OK physical deletes contribute, never missing/failed/speculative
+    // deletes. The start timestamp fences against newer capacity samples.
+    std::map<std::string, int64_t> deleted_bytes_by_node;
+    int64_t physical_delete_started_at_us{0};
 };
 
 struct AsyncDeleteSubmitResult {

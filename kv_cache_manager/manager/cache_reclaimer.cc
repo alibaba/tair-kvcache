@@ -1140,11 +1140,6 @@ bool CacheReclaimer::ReclaimByNode(const std::shared_ptr<RequestContext> &reques
                                          location_counts_by_type, predicted_deleted_keys);
     if (submitted) {
         METRICS_(cache_reclaimer, reclaim_job_count) += 1;
-        if (affinity_manager_) {
-            for (const auto &[node_id, bytes] : node_bytes) {
-                affinity_manager_->ReportEvictedBytes(node_id, bytes);
-            }
-        }
     }
     return submitted;
 }
@@ -2345,6 +2340,11 @@ void CacheReclaimer::HandleDelRes() noexcept {
                 const auto ec = result.status;
                 terminal = true;
                 result_code = ec;
+                if (affinity_manager_ && result.physical_delete_started_at_us > 0) {
+                    for (const auto &[node_id, bytes] : result.deleted_bytes_by_node) {
+                        affinity_manager_->ReportEvictedBytes(node_id, bytes, result.physical_delete_started_at_us);
+                    }
+                }
                 if (ec != ErrorCode::EC_OK) {
                     LOG_WITH_ID(WARN,
                                 "reclaim request execute failed, error_code: [%d], error message: [%s]",

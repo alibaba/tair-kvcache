@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -208,11 +209,18 @@ std::unordered_set<std::string> CacheAffinityManager::ResolveEviction(const Affi
     return strategy->ResolveEviction(sctx);
 }
 
-void CacheAffinityManager::ReportEvictedBytes(const std::string &node_id, int64_t bytes) {
+void CacheAffinityManager::ReportEvictedBytes(const std::string &node_id, int64_t bytes, int64_t delete_started_at_us) {
     std::lock_guard<std::mutex> lock(mux_);
-    if (bytes > 0 && nodes_.count(node_id) != 0) {
-        node_evicted_bytes_[node_id] += bytes;
+    const auto it = nodes_.find(node_id);
+    if (bytes <= 0 || it == nodes_.end() || !IsFreshLocked(node_id, Now())) {
+        return;
     }
+    if (delete_started_at_us > 0 &&
+        (it->second.updated_at_us <= 0 || it->second.updated_at_us >= delete_started_at_us)) {
+        return;
+    }
+    auto &total = node_evicted_bytes_[node_id];
+    total += std::min(bytes, std::numeric_limits<int64_t>::max() - total);
 }
 
 std::function<const NodeMetrics *(const std::string &)> CacheAffinityManager::MakeNodeMetricsAccessor() const {

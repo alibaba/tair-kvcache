@@ -724,4 +724,29 @@ TEST_F(CacheAffinityManagerIntegrationTest, RefreshOnlyResetsDeletionCreditForTh
     EXPECT_EQ((std::unordered_set<std::string>{"a"}), manager.ResolveEviction({}));
 }
 
+TEST_F(CacheAffinityManagerIntegrationTest, PhysicalDeleteCreditIsFencedBySampleTime) {
+    int64_t now = 1;
+    CacheAffinityManager manager(1, [&] { return now; });
+    ASSERT_TRUE(manager.LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})"));
+    NodeMetrics node{"a", "a", DataStorageType{}, 80, 0.92, 0, 0, 100};
+    manager.UpsertNodeMetrics(node);
+    manager.ReportEvictedBytes("a", 250, 99); // Completion arrived after a newer sample.
+    manager.ReportEvictedBytes("a", 250, 100);
+    EXPECT_EQ(1u, manager.ResolveEviction({}).size());
+    manager.ReportEvictedBytes("a", 250, 101);
+    EXPECT_TRUE(manager.ResolveEviction({}).empty());
+    node.updated_at_us = 102;
+    manager.UpsertNodeMetrics(node);
+    manager.ReportEvictedBytes("a", 250, 101); // Duplicate late completion is stale.
+    EXPECT_EQ(1u, manager.ResolveEviction({}).size());
+    now += 1000000;
+    manager.ReportEvictedBytes("a", 250, 103); // Expired/unknown nodes get no credit.
+    EXPECT_TRUE(manager.node_evicted_bytes_.empty());
+    manager.RemoveNode("a");
+    node.updated_at_us = 0;
+    manager.UpsertNodeMetrics(node);
+    manager.ReportEvictedBytes("a", 250, 104);
+    EXPECT_EQ(1u, manager.ResolveEviction({}).size());
+}
+
 } // namespace kv_cache_manager
