@@ -40,6 +40,7 @@
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/migration_manager.h"
@@ -8411,4 +8412,38 @@ TEST_F(CacheReclaimerTest, NodePressureKeepsHealthyReplicaAndHonorsPendingLimits
     ASSERT_EQ(1u, ids.size());
     EXPECT_TRUE(ids.front().empty());
     EXPECT_TRUE(node_bytes.empty());
+}
+
+TEST_F(CacheReclaimerTest, NodePressureHonorsEachInstanceOverrideAndContinuesAfterNoop) {
+    cache_reclaimer_->job_state_flag_ = true;
+    auto affinity = std::make_shared<CacheAffinityManager>();
+    ASSERT_TRUE(affinity->LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})"));
+    affinity->UpsertNodeMetrics({"nodeA", "nodeA", DataStorageType{}, 80, 0.92, 0, 0, 1});
+    cache_reclaimer_->Stop();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
+        10, 100, 10, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr,
+        CacheReclaimerAsyncDeleteConfig{}, nullptr, CacheReclaimerGroupLruConfig{}, affinity);
+    cache_reclaimer_->job_state_flag_ = true;
+    auto disabled = InstanceInfoFactory();
+    disabled->set_instance_id("disabled");
+    disabled->set_affinity_strategy_json(R"({"type":"noop"})");
+    auto enabled = InstanceInfoFactory();
+    enabled->set_instance_id("enabled");
+    enabled->set_affinity_strategy_json(R"({"type":"local_replica"})");
+    instance_infos = {disabled, enabled};
+    auto group = InstanceGroupFactory();
+    group->set_affinity_strategy_json(R"({"type":"noop"})");
+    static std::vector<std::string> reclaimed;
+    reclaimed.clear();
+    stub_.set(ADDR(CacheReclaimer, ReclaimByNode),
+              +[](void *, const std::shared_ptr<RequestContext> &, const std::shared_ptr<const InstanceInfo> &instance,
+                  const std::unordered_set<std::string> &nodes, int32_t) -> bool {
+                  reclaimed.push_back(instance->instance_id());
+                  EXPECT_EQ((std::unordered_set<std::string>{"nodeA"}), nodes);
+                  return true;
+              });
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.made_progress);
+    EXPECT_EQ((std::vector<std::string>{"enabled"}), reclaimed);
+    stub_.reset(ADDR(CacheReclaimer, ReclaimByNode));
 }

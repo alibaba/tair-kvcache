@@ -413,6 +413,14 @@ message ReplicationHint {
     int64 block_key = 1;
     string source_uri = 2;
     string target_node_id = 3;
+    // Complete sources for multi-spec replication. Legacy source_uri remains
+    // populated only for a single spec. Multi-spec replication requires a new SDK.
+    repeated ReplicationSourceSpec source_specs = 4;
+}
+
+message ReplicationSourceSpec {
+    string spec_name = 1;
+    string uri = 2;
 }
 
 message GetCacheLocationResponse {

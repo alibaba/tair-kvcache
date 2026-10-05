@@ -9,10 +9,36 @@
 #include "kv_cache_manager/affinity/noop_strategy.h"
 #include "kv_cache_manager/affinity/strategy_factory.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 
 namespace kv_cache_manager {
+
+CacheAffinityManager::CacheAffinityManager(uint32_t node_metrics_ttl_seconds, ClockFn clock)
+    : node_metrics_ttl_us_(static_cast<int64_t>(node_metrics_ttl_seconds) * 1000000), clock_(std::move(clock)) {}
+
+int64_t CacheAffinityManager::Now() const {
+    return clock_ ? clock_() : std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+bool CacheAffinityManager::IsFreshLocked(const std::string &node_id, int64_t now) const {
+    const auto it = node_last_seen_us_.find(node_id);
+    return it != node_last_seen_us_.end() && now - it->second < node_metrics_ttl_us_;
+}
+
+void CacheAffinityManager::PruneExpiredNodesLocked(int64_t now) {
+    for (auto it = nodes_.begin(); it != nodes_.end();) {
+        if (!IsFreshLocked(it->first, now)) {
+            node_last_seen_us_.erase(it->first);
+            node_evicted_bytes_.erase(it->first);
+            it = nodes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
 
 CacheAffinityManager::~CacheAffinityManager() { StopMetricsPullLoop(); }
 
@@ -50,21 +76,38 @@ bool CacheAffinityManager::LoadProcessStrategyFromJsonFile(const std::string &pa
 }
 
 void CacheAffinityManager::UpsertNodeMetrics(const NodeMetrics &metrics) {
+    if (metrics.node_id.empty()) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(mux_);
+    auto it = nodes_.find(metrics.node_id);
+    // Re-polling a cached backend snapshot must not extend its lifetime or
+    // reset deletion credit. Out-of-order samples must not replace newer ones.
+    if (it != nodes_.end() && metrics.updated_at_us != 0 &&
+        metrics.updated_at_us <= it->second.updated_at_us) {
+        return;
+    }
     nodes_[metrics.node_id] = metrics;
+    node_last_seen_us_[metrics.node_id] = Now();
+    node_evicted_bytes_.erase(metrics.node_id);
 }
 
 void CacheAffinityManager::RemoveNode(const std::string &node_id) {
     std::lock_guard<std::mutex> lock(mux_);
     nodes_.erase(node_id);
+    node_last_seen_us_.erase(node_id);
+    node_evicted_bytes_.erase(node_id);
 }
 
 std::vector<NodeMetrics> CacheAffinityManager::SnapshotNodes() const {
     std::lock_guard<std::mutex> lock(mux_);
     std::vector<NodeMetrics> out;
     out.reserve(nodes_.size());
+    const auto now = Now();
     for (const auto &kv : nodes_) {
-        out.push_back(kv.second);
+        if (IsFreshLocked(kv.first, now)) {
+            out.push_back(kv.second);
+        }
     }
     return out;
 }
@@ -149,25 +192,15 @@ std::unordered_set<std::string> CacheAffinityManager::ResolveEviction(const Affi
 
     auto strategy = GetStrategy(ctx.instance_strategy_json, ctx.group_strategy_json);
 
-    StrategyContext sctx;
+    auto sctx = BuildStrategyContext(ctx);
     {
         std::lock_guard<std::mutex> lock(mux_);
-
-        // Reset evicted-bytes accumulator when NodeMetrics refreshes
-        int64_t max_updated_at = 0;
-        for (const auto &kv : nodes_) {
-            if (kv.second.updated_at_us > max_updated_at) {
-                max_updated_at = kv.second.updated_at_us;
-            }
-        }
-        if (max_updated_at > node_metrics_last_reset_us_) {
-            node_evicted_bytes_.clear();
-            node_metrics_last_reset_us_ = max_updated_at;
-        }
-
+        const auto now = Now();
         sctx.all_nodes.reserve(nodes_.size());
         for (const auto &kv : nodes_) {
-            sctx.all_nodes.push_back(kv.second);
+            if (IsFreshLocked(kv.first, now)) {
+                sctx.all_nodes.push_back(kv.second);
+            }
         }
         sctx.evicted_bytes = node_evicted_bytes_;
     }
@@ -177,7 +210,9 @@ std::unordered_set<std::string> CacheAffinityManager::ResolveEviction(const Affi
 
 void CacheAffinityManager::ReportEvictedBytes(const std::string &node_id, int64_t bytes) {
     std::lock_guard<std::mutex> lock(mux_);
-    node_evicted_bytes_[node_id] += bytes;
+    if (bytes > 0 && nodes_.count(node_id) != 0) {
+        node_evicted_bytes_[node_id] += bytes;
+    }
 }
 
 std::function<const NodeMetrics *(const std::string &)> CacheAffinityManager::MakeNodeMetricsAccessor() const {
@@ -203,12 +238,15 @@ void CacheAffinityManager::PullMetricsOnce() {
         }
         auto snap = backend->SnapshotPerNodeMetrics();
         for (auto &m : snap) {
-            if (m.node_id.empty()) {
+            if (m.node_id.empty() ||
+                (m.updated_at_us > 0 && TimestampUtil::GetCurrentTimeUs() - m.updated_at_us >= node_metrics_ttl_us_)) {
                 continue;
             }
             UpsertNodeMetrics(m);
         }
     }
+    std::lock_guard<std::mutex> lock(mux_);
+    PruneExpiredNodesLocked(Now());
 }
 
 void CacheAffinityManager::StartMetricsPullLoop(std::shared_ptr<DataStorageManager> dsm, uint32_t interval_seconds) {

@@ -2,7 +2,7 @@
 
 // affinity v1 §15.1: F3 频率反馈机制层。
 //
-// Per-(caller_node_id, block_key) LRU counter，统计 caller 最近对 key 的
+// Per-(instance_id, caller_node_id, block_key) LRU counter，统计 caller 最近对 key 的
 // 远端命中次数。每次 GetCacheLocation 处理完一个 key：
 //   - 如果 winner 没有 caller 本地的 spec  ⇒ counter += 1
 //   - 如果有                              ⇒ 不变（本地已命中）
@@ -18,6 +18,7 @@
 #include <list>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -29,23 +30,25 @@ public:
     explicit FrequencySketch(size_t capacity = 1000000) : capacity_(capacity) {}
 
     // 记录一次远端命中：counter += 1；若不存在则 init 为 1。
-    void Observe(const std::string &caller_node_id, int64_t block_key);
+    void Observe(const std::string &caller_node_id, int64_t block_key, const std::string &instance_id = {});
 
     // 查询当前 counter 值，不存在返回 0。
-    uint32_t RemoteCount(const std::string &caller_node_id, int64_t block_key) const;
+    uint32_t RemoteCount(const std::string &caller_node_id, int64_t block_key, const std::string &instance_id = {}) const;
 
     // 显式重置某 entry（例如 hint 已发出 + 进入 dedup 窗口）。
-    void Reset(const std::string &caller_node_id, int64_t block_key);
+    void Reset(const std::string &caller_node_id, int64_t block_key, const std::string &instance_id = {});
 
     // 测试 / 调试用
     size_t Size() const;
 
 private:
-    using Key = std::pair<std::string, int64_t>;
+    using Key = std::tuple<std::string, std::string, int64_t>;
     struct KeyHash {
         size_t operator()(const Key &k) const noexcept {
             // 组合 string hash 和 int64 hash
-            return std::hash<std::string>{}(k.first) ^ (std::hash<int64_t>{}(k.second) * 0x9e3779b97f4a7c15ULL);
+            return std::hash<std::string>{}(std::get<0>(k)) ^
+                   (std::hash<std::string>{}(std::get<1>(k)) * 0x9e3779b97f4a7c15ULL) ^
+                   std::hash<int64_t>{}(std::get<2>(k));
         }
     };
     struct Entry {

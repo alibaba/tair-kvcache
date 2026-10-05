@@ -3,11 +3,9 @@ package(default_visibility = ["//integration_test:__subpackages__"])
 cc_test(
     name = "AffinityPendingContractTest",
     srcs = ["affinity_pending_contract_test.cc"],
-    # Explicit acceptance gate for known missing behavior; do not count as passed
-    # merely because wildcard CI omits manual targets.
-    tags = ["manual"],
     deps = [
         "//kv_cache_manager/affinity",
+        "//kv_cache_manager/affinity:local_replica_strategy",
         "//kv_cache_manager/common:unittest",
     ],
 )

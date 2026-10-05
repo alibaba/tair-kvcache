@@ -361,6 +361,9 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
         hint.block_key = h.block_key();
         hint.source_uri = h.source_uri();
         hint.target_node_id = h.target_node_id();
+        for (const auto &source : h.source_specs()) {
+            hint.source_specs.push_back({source.spec_name(), source.uri()});
+        }
         out_hints.push_back(std::move(hint));
     }
     KVCM_LOG_DEBUG("get cache location success, locations: %s, hints: %d",

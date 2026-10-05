@@ -7,7 +7,7 @@ namespace kv_cache_manager {
 HintSuppressor::HintSuppressor(size_t capacity, ClockFn clock)
     : capacity_(capacity == 0 ? 1 : capacity), clock_(std::move(clock)) {}
 
-int64_t HintSuppressor::Now() const { return clock_ ? clock_() : TimestampUtil::GetCurrentTimeUs(); }
+int64_t HintSuppressor::Now() const { return clock_ ? clock_() : TimestampUtil::GetSteadyTimeUs(); }
 
 void HintSuppressor::EvictIfFullLocked() {
     while (table_.size() > capacity_) {
@@ -17,11 +17,12 @@ void HintSuppressor::EvictIfFullLocked() {
     }
 }
 
-bool HintSuppressor::TryEmit(int64_t block_key, const std::string &target_node, uint32_t window_ms) {
+bool HintSuppressor::TryEmit(int64_t block_key, const std::string &target_node, uint32_t window_ms,
+                             const std::string &instance_id) {
     if (target_node.empty()) {
         return true;
     }
-    Key k{block_key, target_node};
+    Key k{instance_id, target_node, block_key};
     const int64_t now = Now();
     std::lock_guard<std::mutex> lock(mu_);
     auto it = table_.find(k);

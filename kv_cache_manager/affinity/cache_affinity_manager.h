@@ -51,7 +51,8 @@ struct AffinityResolveContext {
 // mutex; parsed AffinityStrategy objects are treated as immutable once cached.
 class CacheAffinityManager {
 public:
-    CacheAffinityManager() = default;
+    using ClockFn = std::function<int64_t()>; // monotonic microseconds
+    explicit CacheAffinityManager(uint32_t node_metrics_ttl_seconds = 30, ClockFn clock = nullptr);
     ~CacheAffinityManager();
 
     CacheAffinityManager(const CacheAffinityManager &) = delete;
@@ -65,7 +66,7 @@ public:
     bool LoadProcessStrategyFromJsonFile(const std::string &path, std::string *error_msg = nullptr);
     bool LoadProcessStrategyFromJsonString(const std::string &json, std::string *error_msg = nullptr);
 
-    // ---- Node metrics ingestion (v1: stub; future: registry/heartbeat) ----
+    // ---- Node metrics ingestion; unchanged samples expire after the TTL ----
     void UpsertNodeMetrics(const NodeMetrics &metrics);
     void RemoveNode(const std::string &node_id);
     std::vector<NodeMetrics> SnapshotNodes() const;
@@ -102,13 +103,19 @@ private:
 
     // 拉一次所有后端的 per-node metrics 并 Upsert; 启动循环前同步预热一次。
     void PullMetricsOnce();
+    int64_t Now() const;
+    bool IsFreshLocked(const std::string &node_id, int64_t now) const;
+    void PruneExpiredNodesLocked(int64_t now);
 
     mutable std::mutex mux_;
     std::shared_ptr<AffinityStrategy> process_affinity_strategy_;
     std::unordered_map<std::string, NodeMetrics> nodes_;
+    std::unordered_map<std::string, int64_t> node_last_seen_us_;
+    const int64_t node_metrics_ttl_us_;
+    ClockFn clock_;
     // Memoized parsed strategies keyed by raw JSON text.
     mutable std::unordered_map<std::string, std::shared_ptr<AffinityStrategy>> affinity_strategy_cache_;
-    // Per-(caller, key) frequency sketch; mutable because read path updates it
+    // Per-(instance, caller, key) frequency sketch; mutable because read path updates it
     // even through const methods (GetStrategy etc. remain logically const).
     mutable FrequencySketch sketch_;
     mutable HintSuppressor suppressor_;
@@ -125,7 +132,6 @@ private:
 
     // Node-level eviction hysteresis state (protected by mux_)
     std::unordered_map<std::string, int64_t> node_evicted_bytes_;
-    int64_t node_metrics_last_reset_us_ = 0;
 };
 
 } // namespace kv_cache_manager

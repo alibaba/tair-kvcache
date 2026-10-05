@@ -225,7 +225,11 @@ std::vector<LocationDescriptor> DataStorageManager::Create(RequestContext *reque
     // target cannot become disabled between admission and backend allocation.
     if (storage_backend == nullptr || !storage_backend->Available()) {
         KVCM_LOG_WARN("Storage name: %s is unavailable, reject create", unique_name.c_str());
-        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOENT, DataStorageUri{}});
+        return std::vector<LocationDescriptor>(keys.size(), {EC_NOENT, DataStorageUri{}, ""});
+    }
+    if (strict && (!storage_backend->SupportsAffinity() || hints.preferred_node_ids.empty())) {
+        KVCM_LOG_WARN("Storage name: %s cannot satisfy strict affinity", unique_name.c_str());
+        return std::vector<LocationDescriptor>(keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}, ""});
     }
     const auto dsmc = storage_backend->GetMetricsCollector();
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);

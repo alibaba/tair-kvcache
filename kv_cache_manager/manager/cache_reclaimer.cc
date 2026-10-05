@@ -2846,9 +2846,14 @@ CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request
         resolve_ctx.instance_group_name = ins_gr;
         resolve_ctx.group_strategy_json = instance_group->affinity_strategy_json();
         for (const auto &instance_info : instance_infos) {
+            if (!instance_info) {
+                continue;
+            }
+            resolve_ctx.instance_id = instance_info->instance_id();
+            resolve_ctx.instance_strategy_json = instance_info->affinity_strategy_json();
             const auto node_ids = affinity_manager_->ResolveEviction(resolve_ctx);
             if (node_ids.empty()) {
-                break;
+                continue; // A disabled instance must not suppress later instances.
             }
             result.water_level_exceeded = true;
             const bool submitted = ReclaimByNode(request_context, instance_info, node_ids,

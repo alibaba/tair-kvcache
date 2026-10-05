@@ -1,5 +1,9 @@
 # Cache Affinity
 
+> This page describes the original write-placement pipeline. The current implementation also
+> includes local reads, replication and node eviction, uses provider UUIDs in `caller.node_id`,
+> and pulls backend metrics automatically. See [the current design](design-cache-affinity-v1.md).
+
 KVCacheManager has an optional affinity layer that influences **block →
 storage-node placement** during writes. Its primary use case is the
 **inference + storage co-location** topology: the same physical machine

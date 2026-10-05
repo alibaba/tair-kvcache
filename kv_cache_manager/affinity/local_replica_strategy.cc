@@ -20,14 +20,20 @@ ReadDecision LocalReplicaAffinityStrategy::ResolveRead(const ReadRequest &req, c
     }
 
     // ==== Step 1: 对每个 spec name 选 caller 本地优先的 winner ====
-    bool any_local = false;
+    bool all_local = !req.spec_candidates.empty();
+    std::vector<ReplicationSourceSpec> sources;
+    bool complete_sources = true;
     for (auto &kv : req.spec_candidates) {
         const auto &spec_name = kv.first;
         const auto &cands = kv.second;
         const LocationSpec *picked = PickLocalSpec(cands, ctx);
         dec.picked_specs[spec_name] = picked;
-        if (picked != nullptr && !ctx.caller_node.node_id.empty() && picked->node_id() == ctx.caller_node.node_id) {
-            any_local = true;
+        all_local = all_local && picked != nullptr && !ctx.caller_node.node_id.empty() &&
+                    picked->node_id() == ctx.caller_node.node_id;
+        if (picked == nullptr || picked->uri().empty()) {
+            complete_sources = false;
+        } else {
+            sources.push_back({spec_name, picked->uri()});
         }
     }
 
@@ -35,7 +41,7 @@ ReadDecision LocalReplicaAffinityStrategy::ResolveRead(const ReadRequest &req, c
     if (!params_.enable_on_miss || ctx.caller_node.node_id.empty()) {
         return dec;
     }
-    if (any_local) {
+    if (all_local || !complete_sources || sources.empty()) {
         return dec;
     }
     if (req.winner_tier == nullptr) {
@@ -43,37 +49,23 @@ ReadDecision LocalReplicaAffinityStrategy::ResolveRead(const ReadRequest &req, c
     }
     // 喂 sketch（机制层，永远 active；只在远端命中时累加）
     if (params_.sketch != nullptr) {
-        params_.sketch->Observe(ctx.caller_node.node_id, req.block_key);
+        params_.sketch->Observe(ctx.caller_node.node_id, req.block_key, ctx.instance_id);
     }
     if (ShouldEmitReplicationHint(req.block_key, /*has_local=*/false, req.winner_tier, ctx)) {
-        // TODO: 当前只取 winner_tier 的第一个非空 URI 作为触发信号。
-        // 服务端同时兼容两种 SDK 复制模式：
-        //   1. 立即复制：SDK 读完数据后内存中已有全部 spec，直接发起
-        //      StartWriteCache(is_replication=true)，source_uri 仅作标识/校验。
-        //   2. 延迟复制：SDK 排队异步处理 hint，需从 source_uri 重新读取数据。
-        // 当前 source_uri 是单个 spec 的 URI。对模式 1 无影响（数据已在内存）；
-        // 对模式 2 的多 spec 场景，只能读到第一个 spec 的数据，其余 spec 缺失。
-        // 若需完整支持模式 2 + 多 spec，proto 应改为 repeated SourceSpec
-        // （每个 spec name 一个 URI）。
-        std::string source_uri;
-        for (const auto &spec : req.winner_tier->location_specs()) {
-            if (!spec.uri().empty()) {
-                source_uri = spec.uri();
-                break;
+        const bool allow = params_.suppressor == nullptr ||
+                           params_.suppressor->TryEmit(req.block_key, ctx.caller_node.node_id,
+                                                      params_.suppression_window_ms, ctx.instance_id);
+        if (allow) {
+            auto h = std::make_unique<ReplicationHintSideEffect>();
+            h->block_key = req.block_key;
+            // Legacy SDKs can consume only single-spec hints. Multi-spec clients
+            // must use the named sources, including already-local components.
+            if (sources.size() == 1) {
+                h->source_uri = sources.front().uri;
             }
-        }
-        if (!source_uri.empty()) {
-            const bool allow = params_.suppressor == nullptr
-                                   ? true
-                                   : params_.suppressor->TryEmit(
-                                         req.block_key, ctx.caller_node.node_id, params_.suppression_window_ms);
-            if (allow) {
-                auto h = std::make_unique<ReplicationHintSideEffect>();
-                h->block_key = req.block_key;
-                h->source_uri = std::move(source_uri);
-                h->target_node_id = ctx.caller_node.node_id;
-                dec.side_effects.push_back(std::move(h));
-            }
+            h->source_specs = std::move(sources);
+            h->target_node_id = ctx.caller_node.node_id;
+            dec.side_effects.push_back(std::move(h));
         }
     }
     return dec;
@@ -95,8 +87,11 @@ std::unordered_set<std::string> LocalReplicaAffinityStrategy::ResolveEviction(co
         double estimated_load = node.load_ratio;
         auto it = ctx.evicted_bytes.find(node.node_id);
         if (it != ctx.evicted_bytes.end() && it->second > 0) {
-            double total = node.free_bytes / std::max(1.0 - node.load_ratio, 0.01);
-            estimated_load -= static_cast<double>(it->second) / total;
+            const double total = node.total_bytes > 0 ? static_cast<double>(node.total_bytes) :
+                                node.free_bytes / std::max(1.0 - node.load_ratio, 0.01);
+            if (total > 0) {
+                estimated_load -= static_cast<double>(it->second) / total;
+            }
         }
         if (estimated_load <= low) {
             continue;
@@ -151,7 +146,7 @@ bool LocalReplicaAffinityStrategy::ShouldEmitReplicationHint(int64_t block_key,
     if (ctx.caller_node.node_id.empty()) {
         return false;
     }
-    // gate 2: 没有本地 spec（ResolveRead 已检过）
+    // gate 2: 还没有完整的本地副本（ResolveRead 已检过）
     if (has_local_in_picked) {
         return false;
     }
@@ -159,7 +154,7 @@ bool LocalReplicaAffinityStrategy::ShouldEmitReplicationHint(int64_t block_key,
     if (params_.sketch == nullptr) {
         return false; // 没 sketch 拿不到计数，保守不发
     }
-    uint32_t cnt = params_.sketch->RemoteCount(ctx.caller_node.node_id, block_key);
+    uint32_t cnt = params_.sketch->RemoteCount(ctx.caller_node.node_id, block_key, ctx.instance_id);
     if (cnt < params_.replication_hot_threshold) {
         return false;
     }

@@ -73,4 +73,20 @@ TEST_F(FrequencySketchTest, MRUMovesEntryToFrontKeepingItAlive) {
     EXPECT_EQ(1u, s.RemoteCount("c", 4));
 }
 
+TEST_F(FrequencySketchTest, InstanceCountersAndResetAreIndependent) {
+    FrequencySketch sketch(4);
+    sketch.Observe("reader", 42, "instance:a");
+    sketch.Observe("reader", 42, "instance:a");
+    sketch.Observe("reader", 42, "instance:b");
+    EXPECT_EQ(2u, sketch.RemoteCount("reader", 42, "instance:a"));
+    EXPECT_EQ(1u, sketch.RemoteCount("reader", 42, "instance:b"));
+    EXPECT_EQ(0u, sketch.RemoteCount("reader", 42));
+    sketch.Reset("reader", 42, "instance:a");
+    EXPECT_EQ(0u, sketch.RemoteCount("reader", 42, "instance:a"));
+    EXPECT_EQ(1u, sketch.RemoteCount("reader", 42, "instance:b"));
+    // Delimiters in either identity cannot alias a different tuple.
+    sketch.Observe("b:c", 7, "a");
+    EXPECT_EQ(0u, sketch.RemoteCount("c", 7, "a:b"));
+}
+
 } // namespace kv_cache_manager
