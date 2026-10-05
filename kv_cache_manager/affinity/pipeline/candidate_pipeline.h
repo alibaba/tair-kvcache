@@ -46,6 +46,7 @@ struct PreferLocalSpec {
         kAbort,       // strategy aborts (Resolve returns EC_ERROR)
     };
     OnMiss on_miss = OnMiss::kPassthrough;
+    bool same_supernode = false;
 };
 
 struct SampleSpec {

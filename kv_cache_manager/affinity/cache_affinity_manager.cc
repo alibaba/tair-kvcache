@@ -108,7 +108,10 @@ std::vector<NodeMetrics> CacheAffinityManager::SnapshotNodes() const {
     const auto now = Now();
     for (const auto &kv : nodes_) {
         if (IsFreshLocked(kv.first, now)) {
-            out.push_back(kv.second);
+            auto sample = kv.second;
+            const auto supernode = topology_.Resolve(sample.node_id);
+            if (!supernode.empty()) sample.supernode_id = supernode;
+            out.push_back(std::move(sample));
         }
     }
     return out;
@@ -159,10 +162,16 @@ CacheAffinityManager::GetStrategy(const std::string &instance_strategy_json,
 StrategyContext CacheAffinityManager::BuildStrategyContext(const AffinityResolveContext &ctx) const {
     StrategyContext sctx;
     sctx.caller_node = ctx.caller_node;
+    const auto supernode = topology_.Resolve(ctx.caller_node.node_id);
+    if (!supernode.empty()) sctx.caller_node.supernode_id = supernode;
     sctx.instance_id = ctx.instance_id;
     sctx.instance_group_name = ctx.instance_group_name;
     sctx.trace_id = ctx.trace_id;
     sctx.get_node_metrics = MakeNodeMetricsAccessor();
+    if (sctx.caller_node.supernode_id.empty()) {
+        const auto *caller = sctx.get_node_metrics(ctx.caller_node.node_id);
+        if (caller) sctx.caller_node.supernode_id = caller->supernode_id;
+    }
     return sctx;
 }
 

@@ -156,6 +156,12 @@ const LocationSpec *LocalReplicaAffinityStrategy::PickLocalSpec(const std::vecto
             return s;
         }
     }
+    if (!ctx.caller_node.supernode_id.empty() && ctx.get_node_metrics) {
+        for (const auto *spec : candidates) {
+            const auto *metrics = spec ? ctx.get_node_metrics(spec->node_id()) : nullptr;
+            if (metrics && metrics->supernode_id == ctx.caller_node.supernode_id) return spec;
+        }
+    }
     return candidates.front();
 }
 

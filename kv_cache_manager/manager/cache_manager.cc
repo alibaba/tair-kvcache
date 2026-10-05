@@ -2317,6 +2317,13 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
         }
     }
     const bool strict = request_context->is_replication();
+    if (strict) {
+        const auto &caller = request_context->caller_node_id();
+        write_hints.preferred_node_ids.erase(
+            std::remove_if(write_hints.preferred_node_ids.begin(), write_hints.preferred_node_ids.end(),
+                           [&](const auto &node) { return caller.empty() || node != caller; }),
+            write_hints.preferred_node_ids.end());
+    }
     std::vector<LocationDescriptor> results = data_storage_manager->Create(
         request_context, unique_name, merged_block_keys, common_size, write_hints, strict, []() { /* do nothing */ });
 
@@ -2405,6 +2412,13 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
             }
         }
         const bool strict = request_context->is_replication();
+    if (strict) {
+        const auto &caller = request_context->caller_node_id();
+        write_hints.preferred_node_ids.erase(
+            std::remove_if(write_hints.preferred_node_ids.begin(), write_hints.preferred_node_ids.end(),
+                           [&](const auto &node) { return caller.empty() || node != caller; }),
+            write_hints.preferred_node_ids.end());
+    }
         std::vector<LocationDescriptor> results = data_storage_manager->Create(
             request_context, unique_name, block_keys, spec_info.size(), write_hints, strict, []() { /* do nothing */ });
 

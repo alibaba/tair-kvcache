@@ -289,7 +289,10 @@ void MetaClientImpl::InitCallerNodeProvider(const std::string &storage_config) {
 
 ClientCallerNode MetaClientImpl::CurrentCallerNode() const {
     std::shared_lock read_guard(config_mutex_);
-    return caller_node_provider_ ? caller_node_provider_->GetCallerNode() : ClientCallerNode{};
+    auto caller = caller_node_provider_ ? caller_node_provider_->GetCallerNode() : ClientCallerNode{};
+    const auto supernode = topology_.Resolve(caller.node_id);
+    if (!supernode.empty()) caller.supernode_id = supernode;
+    return caller;
 }
 
 const std::string &MetaClientImpl::GetInstanceId() const {

@@ -817,4 +817,52 @@ TEST_F(CacheAffinityManagerIntegrationTest, AdmissionAccountsForCopyCostPrefixPo
     for (int i = 0; i < 5; ++i) EXPECT_TRUE(manager.ResolveRead(request, ctx).side_effects.empty());
 }
 
+TEST_F(CacheAffinityManagerIntegrationTest, TopologyFileRefreshesAndMalformedSnapshotsExpire) {
+    const auto path = GetPrivateTestRuntimeDataPath() + "topology.json";
+    int64_t now = 1000;
+    { std::ofstream file(path); file << R"({"nodes":{"a":"rack1"}})"; }
+    NodeTopology topology(path, [&] { return now; });
+    EXPECT_EQ("rack1", topology.Resolve("a"));
+    { std::ofstream file(path); file << R"({"nodes":{"a":"rack2","b":"rack2"}})"; }
+    EXPECT_EQ("rack1", topology.Resolve("a"));
+    now += 5000;
+    EXPECT_EQ("rack2", topology.Resolve("a"));
+    { std::ofstream file(path); file << "invalid"; }
+    now += 5000;
+    EXPECT_EQ("rack2", topology.Resolve("a"));
+    now += 30000;
+    EXPECT_TRUE(topology.Resolve("a").empty());
+    { std::ofstream file(path); file << R"({"nodes":{}})"; }
+    now += 5000;
+    EXPECT_TRUE(topology.Resolve("b").empty());
+}
+
+TEST_F(CacheAffinityManagerIntegrationTest, ReadAndWritePreferSameSupernodeWhenCallerIsUnavailable) {
+    CacheAffinityManager manager;
+    ASSERT_TRUE(manager.LoadProcessStrategyFromJsonString(R"({"type":"local_replica","write":{"ops":{
+        "prefer_local":{"same_supernode":true,"on_miss":"abort"}}}})"));
+    NodeMetrics near;
+    near.node_id = "near";
+    near.supernode_id = "rack";
+    manager.UpsertNodeMetrics(near);
+    NodeMetrics far;
+    far.node_id = "far";
+    far.supernode_id = "other";
+    manager.UpsertNodeMetrics(far);
+    AffinityResolveContext ctx;
+    ctx.caller_node = {"caller", "rack"};
+    EXPECT_EQ((std::vector<std::string>{"near"}), manager.ResolveWrite(ctx).hints.preferred_node_ids);
+    LocationSpec remote("kv", "rdma://far/x", "far"), peer("kv", "rdma://near/x", "near");
+    LocationSpec local("kv", "rdma://caller/x", "caller");
+    ReadRequest req;
+    req.spec_candidates["kv"] = {&remote, &peer};
+    EXPECT_EQ(&peer, manager.ResolveRead(req, ctx).picked_specs["kv"]);
+    req.spec_candidates["kv"].push_back(&local);
+    EXPECT_EQ(&local, manager.ResolveRead(req, ctx).picked_specs["kv"]);
+    manager.RemoveNode("near");
+    req.spec_candidates["kv"].pop_back();
+    EXPECT_EQ(&remote, manager.ResolveRead(req, ctx).picked_specs["kv"]);
+    EXPECT_EQ(AffinityStatus::kAbort, manager.ResolveWrite(ctx).status);
+}
+
 } // namespace kv_cache_manager

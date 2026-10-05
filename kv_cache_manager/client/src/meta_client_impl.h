@@ -5,6 +5,7 @@
 #include <string>
 
 #include "kv_cache_manager/client/include/meta_client.h"
+#include "kv_cache_manager/common/node_topology.h"
 
 namespace kv_cache_manager {
 class Stub;
@@ -76,6 +77,7 @@ private:
     std::unique_ptr<Stub> stub_;
     std::string storage_config_;
     std::unique_ptr<CallerNodeProvider> caller_node_provider_;
+    NodeTopology topology_;
     mutable std::shared_mutex config_mutex_;
 };
 } // namespace kv_cache_manager

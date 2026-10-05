@@ -185,6 +185,12 @@ cc_library(
 )
 
 cc_library(
+    name = "node_topology",
+    hdrs = ["node_topology.h"],
+    deps = ["@rapidjson"],
+)
+
+cc_library(
     name = "affinity_types",
     hdrs = [
         "affinity_types.h",

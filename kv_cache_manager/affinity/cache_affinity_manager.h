@@ -18,6 +18,7 @@
 #include "kv_cache_manager/affinity/node_metrics.h"
 #include "kv_cache_manager/common/affinity_types.h"
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/common/node_topology.h"
 #include "kv_cache_manager/data_storage/write_hints.h"
 
 namespace kv_cache_manager {
@@ -116,6 +117,7 @@ private:
     std::unordered_map<std::string, int64_t> node_last_seen_us_;
     const int64_t node_metrics_ttl_us_;
     ClockFn clock_;
+    NodeTopology topology_;
     // Memoized parsed strategies keyed by raw JSON text.
     mutable std::unordered_map<std::string, std::shared_ptr<AffinityStrategy>> affinity_strategy_cache_;
     // Per-(instance, caller, key) frequency sketch; mutable because read path updates it
