@@ -5163,14 +5163,14 @@ TEST_F(MetaSearcherTest, LocalReplicaSpecAtMergeStep) {
     CacheLocationConstPtr loc_remote =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {remote_spec});
 
-    std::vector<std::string> ids_local;
+    std::vector<MetaSearcher::AddLocationResult> ids_local;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_local}, ids_local));
-    std::vector<std::string> ids_remote;
+    std::vector<MetaSearcher::AddLocationResult> ids_remote;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_remote}, ids_remote));
 
     std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks = {{
-        {ids_local[0], CLS_SERVING},
-        {ids_remote[0], CLS_SERVING},
+        {ids_local[0].location_id, CLS_SERVING},
+        {ids_remote[0].location_id, CLS_SERVING},
     }};
     std::vector<std::vector<ErrorCode>> upd;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, upd));
@@ -5202,14 +5202,14 @@ TEST_F(MetaSearcherTest, ReadSelectionViaStrategyPicksLocal) {
     CacheLocationConstPtr loc_remote =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {remote});
 
-    std::vector<std::string> ids_local;
+    std::vector<MetaSearcher::AddLocationResult> ids_local;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_local}, ids_local));
-    std::vector<std::string> ids_remote;
+    std::vector<MetaSearcher::AddLocationResult> ids_remote;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_remote}, ids_remote));
 
     std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks = {{
-        {ids_local[0], CLS_SERVING},
-        {ids_remote[0], CLS_SERVING},
+        {ids_local[0].location_id, CLS_SERVING},
+        {ids_remote[0].location_id, CLS_SERVING},
     }};
     std::vector<std::vector<ErrorCode>> upd;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, upd));
@@ -5219,6 +5219,7 @@ TEST_F(MetaSearcherTest, ReadSelectionViaStrategyPicksLocal) {
     auto mgr = std::make_shared<CacheAffinityManager>();
     mgr->LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})");
     AffinityResolveContext resolve_ctx;
+    resolve_ctx.caller_node.node_id = "node_local";
 
     CacheLocationVector out;
     BlockMask mask;
@@ -5243,14 +5244,14 @@ TEST_F(MetaSearcherTest, ReadSelectionWithNoopStrategyDegradesToFirstSeen) {
     CacheLocationConstPtr loc_remote =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {remote});
 
-    std::vector<std::string> ids_local;
+    std::vector<MetaSearcher::AddLocationResult> ids_local;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_local}, ids_local));
-    std::vector<std::string> ids_remote;
+    std::vector<MetaSearcher::AddLocationResult> ids_remote;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_remote}, ids_remote));
 
     std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks = {{
-        {ids_local[0], CLS_SERVING},
-        {ids_remote[0], CLS_SERVING},
+        {ids_local[0].location_id, CLS_SERVING},
+        {ids_remote[0].location_id, CLS_SERVING},
     }};
     std::vector<std::vector<ErrorCode>> upd;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, upd));
@@ -5260,6 +5261,7 @@ TEST_F(MetaSearcherTest, ReadSelectionWithNoopStrategyDegradesToFirstSeen) {
     auto mgr = std::make_shared<CacheAffinityManager>();
     mgr->LoadProcessStrategyFromJsonString(R"({"type":"noop"})");
     AffinityResolveContext resolve_ctx;
+    resolve_ctx.caller_node.node_id = "node_local";
 
     CacheLocationVector out;
     BlockMask mask;

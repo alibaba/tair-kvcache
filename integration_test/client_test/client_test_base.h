@@ -258,7 +258,7 @@ protected:
     void TestGetCacheLocation(const std::string &prefix, const ClientPtr<ClientType> &client) {
         std::string write_session_id;
         Locations target_locations;
-        std::vector<ReplicationHint> hints; // 集成测试不消费 hints，复用一个出参变量满足必填契约
+        std::vector<ClientReplicationHint> hints; // 集成测试不消费 hints，复用一个出参变量满足必填契约
         {
             auto [success, write_location] = client->StartWrite(prefix + "_1", {1, 2, 3, 4}, {}, {}, 1000000);
             ASSERT_EQ(ER_OK, success);

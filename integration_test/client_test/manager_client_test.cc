@@ -40,7 +40,7 @@ TEST_F(ManagerClientTest, TestEmptyMetaClient) {
         ASSERT_EQ(ER_CLIENT_NOT_EXISTS, success);
     }
     {
-        std::vector<ReplicationHint> hints;
+        std::vector<ClientReplicationHint> hints;
         auto [success, locations_map] = manager_client->MatchLocation(
             prefix + "_2", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {}, hints);
         ASSERT_EQ(ER_CLIENT_NOT_EXISTS, success);
@@ -126,7 +126,7 @@ TEST_F(ManagerClientTest, TestSaveAndLoad) {
         ASSERT_EQ(ER_OK, manager_client->FinishWrite(prefix + "_2", write_session_id, success_block, {}));
     }
     {
-        std::vector<ReplicationHint> hints;
+        std::vector<ClientReplicationHint> hints;
         auto [match_success, read_location] = manager_client->MatchLocation(
             prefix + "_3", QueryType::QT_PREFIX_MATCH, {1, 2}, {}, static_cast<size_t>(0), 0, {}, hints);
         ASSERT_EQ(ER_OK, match_success);
