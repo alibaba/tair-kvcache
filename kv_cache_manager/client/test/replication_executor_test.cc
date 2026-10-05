@@ -311,7 +311,7 @@ TEST_F(ReplicationExecutorTest, SubmitWithDataQueueDepthLimitReleasesBuffer) {
 // SubmitWithData push_front priority
 // ===========================================================================
 
-TEST_F(ReplicationExecutorTest, PiggybackTasksPrioritizedOverAsync) {
+TEST_F(ReplicationExecutorTest, PiggybackTasksPreserveFifoAndDoNotStarveAsync) {
     std::atomic<bool> entered{false};
     std::promise<void> proceed;
     auto proceed_future = proceed.get_future().share();
@@ -351,8 +351,8 @@ TEST_F(ReplicationExecutorTest, PiggybackTasksPrioritizedOverAsync) {
     executor->Shutdown();
 
     ASSERT_GE(execution_order.size(), 2u);
-    EXPECT_EQ(execution_order[0], 200);
-    EXPECT_EQ(execution_order[1], 100);
+    EXPECT_EQ(execution_order[0], 100);
+    EXPECT_EQ(execution_order[1], 200);
 }
 
 // ===========================================================================
@@ -660,6 +660,64 @@ TEST_F(ReplicationExecutorTest, EmptyBuffersDoNotConsumePiggybackQueueCapacity) 
     proceed.set_value();
     executor->Shutdown();
     ASSERT_TRUE(ready);
-    EXPECT_EQ((std::vector<int64_t>{1, 4, 2, 3}), executed);
+    EXPECT_EQ((std::vector<int64_t>{1, 2, 3, 4}), executed);
     EXPECT_EQ(3, releases.load());
+}
+
+TEST(ReplicationResourcesTest, EnforcesAggregateMemoryAndOversizeWithoutWaiting) {
+    ReplicationResources resources;
+    std::atomic<bool> stopped{false};
+    const auto deadline = ReplicationResources::Clock::now() + 1s;
+    EXPECT_TRUE(resources.TryRetain(6, 10));
+    EXPECT_FALSE(resources.TryRetain(5, 10));
+    EXPECT_FALSE(resources.Acquire("a", "node", 11, 10, 11, 0, deadline, stopped));
+    EXPECT_TRUE(resources.Acquire("a", "node", 4, 10, 4, 0, deadline, stopped));
+    resources.Release(10);
+    EXPECT_TRUE(resources.TryRetain(10, 10));
+    resources.Release(10);
+}
+
+TEST(ReplicationResourcesTest, RotatesInstancesWhilePreservingFifoWithinInstance) {
+    ReplicationResources resources;
+    std::atomic<bool> stopped{false};
+    ASSERT_TRUE(resources.TryRetain(1, 1));
+    std::mutex order_mutex;
+    std::vector<std::string> order;
+    auto launch = [&](std::string instance, std::string task) {
+        return std::async(std::launch::async, [&, instance, task] {
+            if (!resources.Acquire(instance, "node", 1, 1, 1, 0,
+                                   ReplicationResources::Clock::now() + 2s, stopped)) return false;
+            { std::lock_guard<std::mutex> lock(order_mutex); order.push_back(task); }
+            resources.Release(1);
+            return true;
+        });
+    };
+    auto wait_count = [&](size_t count) {
+        auto deadline = ReplicationResources::Clock::now() + 1s;
+        while (ReplicationResources::Clock::now() < deadline) {
+            { std::lock_guard<std::mutex> lock(resources.mu_); if (resources.waiters_.size() == count) return true; }
+            std::this_thread::yield();
+        }
+        return false;
+    };
+    auto a1 = launch("a", "a1"); EXPECT_TRUE(wait_count(1));
+    auto a2 = launch("a", "a2"); EXPECT_TRUE(wait_count(2));
+    auto b1 = launch("b", "b1"); EXPECT_TRUE(wait_count(3));
+    resources.Release(1);
+    EXPECT_TRUE(a1.get()); EXPECT_TRUE(a2.get()); EXPECT_TRUE(b1.get());
+    EXPECT_EQ((std::vector<std::string>{"a1", "b1", "a2"}), order);
+}
+
+TEST(ReplicationResourcesTest, PacesEachNodeAndCancelsExpiredWorkWithoutLeakingBytes) {
+    ReplicationResources resources;
+    std::atomic<bool> stopped{false};
+    auto deadline = ReplicationResources::Clock::now() + 100ms;
+    ASSERT_TRUE(resources.Acquire("a", "slow", 1, 2, 1000, 1, deadline, stopped));
+    resources.Release(1);
+    EXPECT_FALSE(resources.Acquire("b", "slow", 1, 2, 1, 1, deadline, stopped));
+    EXPECT_TRUE(resources.Acquire("b", "other", 1, 2, 1, 1,
+                                  ReplicationResources::Clock::now() + 1s, stopped));
+    resources.Release(1);
+    EXPECT_TRUE(resources.TryRetain(2, 2));
+    resources.Release(2);
 }

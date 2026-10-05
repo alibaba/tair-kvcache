@@ -56,8 +56,14 @@ ClientErrorCode ManagerClientImpl::Init(const std::string &client_config, InitPa
             num_workers = std::max(1, static_cast<int>(config.replication_workers()));
             auto_replicate_ = config.auto_replicate();
         }
+        ReplicationOptions options;
+        options.instance_id = config.instance_id();
+        options.max_buffer_bytes = config.replication_max_buffer_bytes();
+        options.max_pending_bytes = config.replication_max_pending_bytes();
+        options.node_bytes_per_second = config.replication_node_bytes_per_second();
+        options.max_age_ms = config.replication_max_age_ms();
         replication_executor_ =
-            std::make_unique<ReplicationExecutor>(meta_client_.get(), transfer_client_.get(), num_workers);
+            std::make_unique<ReplicationExecutor>(meta_client_.get(), transfer_client_.get(), num_workers, 1024, std::move(options));
         KVCM_LOG_INFO("replication executor created: workers=%d auto_replicate=%s",
                       num_workers,
                       auto_replicate_ ? "true" : "false");
