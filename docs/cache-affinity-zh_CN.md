@@ -1,6 +1,6 @@
 # Cache Affinity / 缓存亲和性管理
 
-> 本文保留早期写入流水线说明。当前已包含读取亲和性、热点复制和节点淘汰，
+> 本文说明写入流水线及当前副本生命周期控制。已包含读取亲和性、热点复制和节点淘汰，
 > 使用 `caller.node_id`（mempool 为 Provider UUID），并已接入指标自动采样。
 > 当前协议、默认开关和完成状态以 [完整设计说明](design-cache-affinity-v1.md) 为准。
 
@@ -22,20 +22,20 @@ process** 的优先级选取最先命中的非空策略;任何一层未配置都
 ## 写路径
 
 ```
-StartWriteCacheRequest{caller_node_ip, ...}                          (proto)
+StartWriteCacheRequest{caller.node_id, ...}                          (proto)
     │
     ▼
 MetaServiceImpl::StartWriteCache
-    │  request_context->set_caller_node_ip(...)                       (透传)
+    │  request_context->set_caller_node_id(...)                       (透传)
     ▼
 CacheManager::StartWriteCache  →  CreateBySpec / CreateInSingleBatch
-    │  ResolveAffinityHints(request_context, instance_info, block_count, bytes_per_block)
+    │  AffinityResolveContext{caller_node, instance_id, ...} → ResolveWrite(...)
     │      ├── instance_info.affinity_strategy_json    → 注入 ResolveContext (instance 层)
     │      ├── registry_manager_->GetInstanceGroup(...).affinity_strategy_json
     │      │                                          → 注入 ResolveContext (instance_group 层)
     │      ├── affinity_manager_ == nullptr            → 空 hints (老路径)
     │      ├── 三层都未配置                             → 空 hints
-    │      ├── 策略返回 Abort                          → 日志 + 空 hints (v1)
+    │      ├── 策略返回 Abort                          → 普通写降级；严格复制写失败
     │      └── 策略返回节点列表                         → hints.preferred_node_ids
     ▼
 DataStorageManager::Create(... , hints, strict, cb)                  (manager API)
@@ -43,7 +43,7 @@ DataStorageManager::Create(... , hints, strict, cb)                  (manager AP
     │  strict=false → hints 仅作建议,找不到偏好节点时回退到任意节点
     ▼
 DataStorageBackend::CreateWithHints(... , hints, strict, ...)        (backend API)
-    └── 默认实现:忽略 hints 与 strict,转发到老 Create()
+    └── 默认实现:普通写转发老 Create();strict 写返回不支持
 ```
 
 ## 三层优先级链
@@ -73,8 +73,8 @@ DataStorageBackend::CreateWithHints(... , hints, strict, ...)        (backend AP
 | 2. 加载 process 级策略 JSON(可选) | `LoadProcessStrategyFromJsonFile(path)` 或 `LoadProcessStrategyFromJsonString(json)`;不调用就只剩 instance / instance_group 级生效 |
 | 3. 配置 instance_group 级策略 JSON(可选) | 在创建/更新 `InstanceGroup` 时填 `affinity_strategy_json` |
 | 4. 配置 instance 级策略 JSON(可选) | 在 `RegisterInstanceRequest.affinity_strategy_json` 里下发 |
-| 5. 上报节点指标 | 每个节点调一次 `UpsertNodeMetrics(...)`;v1 没有自动数据源,需要从你的心跳/registry 接进来 |
-| 6. 客户端在请求里带上 `caller_node_ip` | `StartWriteCacheRequest` 新增的字段;老客户端不填,`prefer_local` 直接按"本机不在候选里"处理 |
+| 5. 上报节点指标 | 每个节点调一次 `UpsertNodeMetrics(...)`；服务端周期拉取后端容量快照，也可接入自定义数据源 |
+| 6. 客户端在请求里带上 `caller.node_id` | `StartWriteCacheRequest` 新增的字段;老客户端不填,`prefer_local` 直接按"本机不在候选里"处理 |
 
 ## 执行顺序
 
@@ -170,7 +170,7 @@ filter  →  prefer_local  →  sample  →  sort  →  limit
 | Slot | 必填字段 | 可选字段 | 行为 |
 |---|---|---|---|
 | `filter` | 一棵 `Cond` 表达式(见下) | — | 剔除不满足条件的候选;候选**没有指标**时叶子默认评估为 `true`(permissive) |
-| `prefer_local` | — | `on_miss: "passthrough" \| "abort"`(默认 `passthrough`) | 候选含本机(`node_id == caller_node_ip`)→ 只返回本机;不含 → 由 `on_miss` 决定:`passthrough` 把输入原样传给下一段,`abort` 整段策略 abort |
+| `prefer_local` | — | `on_miss: "passthrough" \| "abort"`(默认 `passthrough`) | 候选含本机(`node_id == caller.node_id`)→ 只返回本机;不含 → 由 `on_miss` 决定:`passthrough` 把输入原样传给下一段,`abort` 整段策略 abort |
 | `sample` | `n: int (>= 1)` | `node_pattern: regex`、`seed: "random" \| "trace_id"`(默认 `random`) | 在(可选 `node_pattern` 命中的)子集里随机抽最多 `n` 个;`seed=trace_id` → 同一 trace 多次调用结果一致;输出顺序未定义 |
 | `sort` | `[ { metric, weight }, ... ]` 非空数组 | — | score = Σ(metric_value × weight);按 score **降序稳定排列**。负权重 = 升序。指标缺失 → 该项贡献 0 |
 | `limit` | `int (>= 1)` | — | 截到前 `n` 个 |
@@ -217,20 +217,19 @@ load、低 latency),把 `weight` 设为负数即可:
 
 | 字段 | 谁使用 |
 |---|---|
-| `node_id` | `prefer_local`(与 `caller_node_ip` 比对);也是 `WriteHints.preferred_node_ids` 写出的值 |
+| `node_id` | `prefer_local`(与 `caller.node_id` 比对);也是 `WriteHints.preferred_node_ids` 写出的值 |
 | `node_name` | `filter` 里的 `node_name` 叶子,以及 `sample.node_pattern`。当作稳定的业务标签用,不要等同于 IP |
 | `free_bytes` | `filter` / `sort` 中名为 `free_bytes` 的指标 |
 | `load_ratio` | `filter` / `sort` 中名为 `load_ratio` 的指标 |
 | `rx_mbps` | `filter` / `sort` 中名为 `rx_mbps` 的指标 |
 | `tx_mbps` | `filter` / `sort` 中名为 `tx_mbps` 的指标 |
-| `updated_at_us` | filter / sort 不读 —— 调用方负责在 `UpsertNodeMetrics` 之前丢掉过期条目 |
+| `updated_at_us` | 由亲和性管理器校验新旧采样并按 TTL 过滤；缓存快照不会续期 |
 
-v1 的混部假设下,`node_id` 就是跑推理 worker 的同一台机器,所以
-`caller_node_ip` 与 `node_id` 用同一种标识(IP / hostname)。
+`caller.node_id` 与后端返回的 `node_id` 必须使用同一套稳定标识：mempool 使用 Provider UUID，NFS 使用本机身份。`total_bytes` 用于容量滞回，`supernode_id` 用于同超节点偏好。`rx_mbps` / `tx_mbps` 仍需外部观测来源提供。
 
 > 已注册指标只有上表中的 `free_bytes / load_ratio / rx_mbps / tx_mbps`
 > 四件套。`filter.metric` / `sort.metric` 名不在这张表里,解析时直接
-> 报错。新增指标需要同时改 `NodeMetrics` 字段和 `metric_registry.cc`
+> 报错。新增指标需要同时改 `NodeMetrics` 字段和 `affinity/pipeline/metric_catalog.cc`
 > 的 `Extract` 表。
 
 ## 与 `SelectLocationPolicy` 的关系
@@ -260,7 +259,7 @@ public:
         std::function<void()> cb);
 
     // 亲和性接口:hints + strict 是一对独立参数。
-    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(
+    std::vector<LocationDescriptor> Create(
         RequestContext *request_context, const std::string &unique_name,
         const std::vector<std::string> &keys, size_t size_per_key,
         const WriteHints &hints,
@@ -275,7 +274,7 @@ public:
         const std::vector<std::string> &keys, size_t size_per_key,
         const std::string &trace_id, std::function<void()> cb) = 0;       // 老接口
 
-    virtual std::vector<std::pair<ErrorCode, DataStorageUri>> CreateWithHints(
+    virtual std::vector<LocationDescriptor> CreateWithHints(
         const std::vector<std::string> &keys, size_t size_per_key,
         const WriteHints &hints,
         bool strict,
@@ -291,15 +290,16 @@ public:
 
 | 参数 | 含义 | 谁来填 |
 |---|---|---|
-| `WriteHints.preferred_node_ids` | **偏好哪些节点**(按优先级) | 亲和性层 (`CacheAffinityManager::Resolve`) 或上层手动构造 |
-| `bool strict` | **能不能放弃这些偏好** | 调用方(v1 由 `CacheManager` 传 `false`,未来可由 strategy / 配置驱动) |
+| `WriteHints.preferred_node_ids` | **偏好哪些节点**(按优先级) | 亲和性层 (`CacheAffinityManager::ResolveWrite`) 或上层手动构造 |
+| `bool strict` | **能不能放弃这些偏好** | `CacheManager` 对复制写传 `true`，普通写传 `false` |
 
 语义对照:
 
 | `hints.preferred_node_ids` | `strict` | 后端行为 |
 |---|---|---|
-| 空 | 任意 | `strict` 被忽略;后端按自己的策略放置 |
-| 非空 | `false` | 优先在 preferred 节点上分配;不可用时**回退到任意节点**,写不会失败 |
+| 空 | `false` | 后端按自己的策略放置 |
+| 空 | `true` | 拒绝分配，不能回退到任意节点 |
+| 非空 | `false` | 优先在 preferred 节点上分配;不可用时**允许回退到其他节点**，仍可能因容量或后端错误失败 |
 | 非空 | `true` | **只能**在 preferred 节点上分配;放不下的 key 在结果里以非 `EC_OK` 返回,调用方自行决定是否重试或降级 |
 
 > 历史注解:`strict` 之前是 `WriteHints` 的一个字段,现已提到接口
@@ -307,27 +307,22 @@ public:
 > 不能不去",分开传可以避免后端只 override `CreateWithHints` 但忘记
 > 看结构体里那个布尔。
 
-### 默认实现 = 兼容降级
+### 后端兼容与严格放置
 
-默认的 `CreateWithHints` 忽略 `hints` 与 `strict`,直接转发到老
-`Create`。能把 key 路由到指定节点的后端可以 override
-`CreateWithHints` 与 `SupportsAffinity()`。v1 阶段所有后端都走默认实
-现 —— 亲和性的端到端链路都通了、可验证,但暂时还没有任何 backend 真
-正消费 hints。
-
-`strict=true` 在这种"全默认"的形态下等价于 `strict=false`(hints 都
-不看,自然也不会"严格遵守 hints")。等到第一个 backend 真正实现
-`CreateWithHints` 时,`strict=true` 才会变成可观察的行为差异。
+默认 `CreateWithHints` 在普通写时转发到旧 `Create`，严格写返回 `EC_UNIMPLEMENTED`。
+`DataStorageManager` 在分配前拒绝空的严格目标或不支持亲和性的后端。
+NFS 与内源 mempool 已实现亲和性放置，并返回包含实际 `node_id` 的 `LocationDescriptor`。
+复制写只允许目标为 caller 本机；即使配置了同超节点回退，也不能把远端副本发布成本地副本。
 
 ## 退化与失败语义
 
 | 条件 | 结果 |
 |---|---|
-| 三层都未加载策略 | `Resolve` 返回 `EC_OK` + 空 hints;后端用自己的放置逻辑 |
+| 三层都未加载策略 | `ResolveWrite` 返回 kOk + 空 hints;后端用自己的放置逻辑 |
 | 高优先级层 JSON 解析失败 | 视为"该层未配置",自动落到下一层;不会让请求失败 |
-| caller IP 为空 | `prefer_local` 把"本机命中"判为 false,按 `on_miss` 走(默认 passthrough) |
-| 候选 NodeMetrics 缺失 | `filter` 叶子默认 true(permissive);`sort` 中该指标贡献 0;`prefer_local` 仍按 node_id 比对 caller IP |
-| `prefer_local{on_miss:"abort"}` 找不到本机 | strategy abort 向上传,`Resolve` 返回 `EC_ERROR`。v1 在 `CacheManager::ResolveAffinityHints` 里降级为日志 + 空 hints(写继续走老路径)。如果想升级成硬错误,去掉那段降级即可 |
+| caller.node_id 为空 | `prefer_local` 把"本机命中"判为 false,按 `on_miss` 走(默认 passthrough) |
+| 候选 NodeMetrics 缺失 | `filter` 叶子默认 true(permissive);`sort` 中该指标贡献 0;`prefer_local` 仍按 node_id 比对 caller.node_id |
+| `prefer_local{on_miss:"abort"}` 找不到本机 | 策略返回 abort；普通写记录日志并降级为空 hints；复制写因严格目标为空而失败 |
 | process 级 JSON 格式错(含未注册指标名、`and:[]` 等) | `LoadProcessStrategyFromJson*` 返回 `false`;已有 process 级策略(如果有的话)保持不变;instance / instance_group 级别不受影响 |
 | `node_name.include / exclude` 里有非法正则 | 同上 —— process 级加载失败不会留下半截状态;override 级别则视为该层解析失败、落到下一层 |
 

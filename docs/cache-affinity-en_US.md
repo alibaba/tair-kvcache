@@ -1,6 +1,6 @@
 # Cache Affinity
 
-> This page describes the original write-placement pipeline. The current implementation also
+> This page describes the write-placement pipeline and replica lifecycle controls. The implementation also
 > includes local reads, replication and node eviction, uses provider UUIDs in `caller.node_id`,
 > and pulls backend metrics automatically. See [the current design](design-cache-affinity-v1.md).
 
@@ -31,20 +31,20 @@ strategy configured (the default) the affinity layer is a silent no-op
 ## Write Path
 
 ```
-StartWriteCacheRequest{caller_node_ip, ...}                          (proto)
+StartWriteCacheRequest{caller.node_id, ...}                          (proto)
     │
     ▼
 MetaServiceImpl::StartWriteCache
-    │  request_context->set_caller_node_ip(...)                       (transport)
+    │  request_context->set_caller_node_id(...)                       (transport)
     ▼
 CacheManager::StartWriteCache  →  CreateBySpec / CreateInSingleBatch
-    │  ResolveAffinityHints(request_context, instance_info, block_count, bytes_per_block)
+    │  AffinityResolveContext{caller_node, instance_id, ...} → ResolveWrite(...)
     │      ├── instance_info.affinity_strategy_json    → injected into ResolveContext (instance tier)
     │      ├── registry_manager_->GetInstanceGroup(...).affinity_strategy_json
     │      │                                          → injected into ResolveContext (instance_group tier)
     │      ├── affinity_manager_ == nullptr            → empty hints (legacy path)
     │      ├── all three tiers empty                   → empty hints
-    │      ├── strategy returns Abort                  → log + empty hints (v1)
+    │      ├── strategy returns Abort                  → ordinary write fallback; strict replication fails
     │      └── strategy returns nodes                  → hints.preferred_node_ids
     ▼
 DataStorageManager::Create(... , hints, strict, cb)                  (manager API)
@@ -53,7 +53,7 @@ DataStorageManager::Create(... , hints, strict, cb)                  (manager AP
     │  strict=false → hints are advisory; backend may fall back to any node
     ▼
 DataStorageBackend::CreateWithHints(... , hints, strict, ...)        (backend API)
-    └── default impl: ignore hints + strict, forward to legacy Create()
+    └── default impl: forward ordinary writes; reject unsupported strict placement
 ```
 
 ## Three-Tier Priority Chain
@@ -94,8 +94,8 @@ below must be in place; any missing tier simply falls through:
 | 2. Load a process-level strategy JSON (optional) | `LoadProcessStrategyFromJsonFile(path)` or `LoadProcessStrategyFromJsonString(json)`; if you skip this, only the instance / instance_group tiers can take effect |
 | 3. Configure the instance_group strategy JSON (optional) | Set `affinity_strategy_json` when creating / updating an `InstanceGroup` |
 | 4. Configure the instance strategy JSON (optional) | Send via `RegisterInstanceRequest.affinity_strategy_json` |
-| 5. Populate node metrics | `UpsertNodeMetrics(...)` per node; v1 ships no automatic source — wire it from your heartbeat / registry |
-| 6. Have the client send `caller_node_ip` | New field on `StartWriteCacheRequest`; old clients leave it empty and `prefer_local` simply treats "local node not in candidates" as a miss |
+| 5. Populate node metrics | The server periodically pulls backend capacity snapshots; `UpsertNodeMetrics(...)` also accepts custom sources |
+| 6. Have the client send `caller.node_id` | New field on `StartWriteCacheRequest`; old clients leave it empty and `prefer_local` simply treats "local node not in candidates" as a miss |
 
 ## Pipeline Order
 
@@ -198,7 +198,7 @@ by ascending load and keep the first 2.
 | Slot | Required | Optional | Behavior |
 |---|---|---|---|
 | `filter` | a `Cond` expression (see below) | — | Drop candidates that fail the condition. A leaf evaluates to `true` (permissive) when the candidate has no metrics — see "missing-metric semantics" |
-| `prefer_local` | — | `on_miss: "passthrough" \| "abort"` (default `passthrough`) | If a candidate has `node_id == caller_node_ip`, **return only that one**; otherwise behave per `on_miss`: `passthrough` hands input through unchanged, `abort` aborts the whole strategy |
+| `prefer_local` | — | `on_miss: "passthrough" \| "abort"` (default `passthrough`) | If a candidate has `node_id == caller.node_id`, **return only that one**; otherwise behave per `on_miss`: `passthrough` hands input through unchanged, `abort` aborts the whole strategy |
 | `sample` | `n: int (>= 1)` | `node_pattern: regex`, `seed: "random" \| "trace_id"` (default `random`) | Sample at most `n` from the (optionally `node_pattern`-matched) subset; `seed=trace_id` makes repeated calls with the same trace deterministic; output ordering is not specified |
 | `sort` | `[ { metric, weight }, ... ]` non-empty | — | score = Σ(metric_value × weight); **stable-sort descending** by score. Negative weight = ascending. Missing metric contributes 0 to that term |
 | `limit` | `int (>= 1)` | — | Truncate to the first `n` |
@@ -253,23 +253,21 @@ current set of fields:
 
 | Field | Used by |
 |---|---|
-| `node_id` | `prefer_local` (matched against `caller_node_ip`); also the value emitted in `WriteHints.preferred_node_ids` |
+| `node_id` | `prefer_local` (matched against `caller.node_id`); also the value emitted in `WriteHints.preferred_node_ids` |
 | `node_name` | `filter`'s `node_name` leaf, and `sample.node_pattern`. Treat it as a stable business label, not an IP |
 | `free_bytes` | `filter` / `sort` term named `free_bytes` |
 | `load_ratio` | `filter` / `sort` term named `load_ratio` |
 | `rx_mbps` | `filter` / `sort` term named `rx_mbps` |
 | `tx_mbps` | `filter` / `sort` term named `tx_mbps` |
-| `updated_at_us` | Not consumed by filter / sort — caller should drop stale entries before `UpsertNodeMetrics` |
+| `updated_at_us` | The affinity manager validates sample order and TTL; cached snapshots do not renew freshness |
 
-Under the v1 co-location assumption `node_id` is the same machine that
-runs the inference worker, so `caller_node_ip` and `node_id` use the
-same identifier (IP/hostname).
+`caller.node_id` must match the stable identity returned by the backend: Provider UUID for mempool, local host identity for NFS. `total_bytes` supports capacity hysteresis; `supernode_id` supports nearby placement. `rx_mbps` / `tx_mbps` still require an external telemetry source.
 
 > The only registered metrics are the four above (`free_bytes /
 > load_ratio / rx_mbps / tx_mbps`). A `filter.metric` or `sort.metric`
 > name not in this list is a parse error. To add a new metric you must
 > extend both `NodeMetrics` and the `Extract` table in
-> `metric_registry.cc`.
+> `affinity/pipeline/metric_catalog.cc`.
 
 ## How It Coexists With `SelectLocationPolicy`
 
@@ -300,7 +298,7 @@ public:
         std::function<void()> cb);
 
     // Affinity-aware overload: hints + strict are independent params.
-    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(
+    std::vector<LocationDescriptor> Create(
         RequestContext *request_context, const std::string &unique_name,
         const std::vector<std::string> &keys, size_t size_per_key,
         const WriteHints &hints,
@@ -315,7 +313,7 @@ public:
         const std::vector<std::string> &keys, size_t size_per_key,
         const std::string &trace_id, std::function<void()> cb) = 0;       // legacy
 
-    virtual std::vector<std::pair<ErrorCode, DataStorageUri>> CreateWithHints(
+    virtual std::vector<LocationDescriptor> CreateWithHints(
         const std::vector<std::string> &keys, size_t size_per_key,
         const WriteHints &hints,
         bool strict,
@@ -331,14 +329,15 @@ The two parameters are deliberately split:
 
 | Param | Meaning | Who fills it |
 |---|---|---|
-| `WriteHints.preferred_node_ids` | **Which nodes to prefer** (priority order) | The affinity layer (`CacheAffinityManager::Resolve`) or a hand-built struct from a higher caller |
-| `bool strict` | **Whether the backend may abandon those preferences** | The caller (in v1, `CacheManager` always passes `false`; future strategies / configs can drive it) |
+| `WriteHints.preferred_node_ids` | **Which nodes to prefer** (priority order) | The affinity layer (`CacheAffinityManager::ResolveWrite`) or a hand-built struct from a higher caller |
+| `bool strict` | **Whether the backend may abandon those preferences** | `CacheManager` passes `true` for replication and `false` for ordinary writes |
 
 Combined semantics:
 
 | `hints.preferred_node_ids` | `strict` | Backend behavior |
 |---|---|---|
-| empty | any | `strict` is ignored; backend uses its own placement |
+| empty | `false` | Backend uses its own placement |
+| empty | `true` | Allocation is rejected; arbitrary-node fallback is forbidden |
 | non-empty | `false` | Try preferred nodes first; **fall back** to any other node when none are usable. Write does not fail |
 | non-empty | `true` | **Only** preferred nodes are usable. Keys that cannot be placed there come back with a non-`EC_OK` status, and the caller decides whether to retry or degrade |
 
@@ -348,28 +347,19 @@ Combined semantics:
 > harder for a backend to override `CreateWithHints` and forget the
 > boolean buried inside the struct.
 
-### Default impl = compatibility shim
+### Backend compatibility and strict placement
 
-The default `CreateWithHints` ignores `hints` and `strict` and forwards
-to legacy `Create`. Backends that can route keys to specific nodes
-override `CreateWithHints` and `SupportsAffinity()`. v1 ships with all
-backends on the default — affinity is plumbed end-to-end and
-verifiable, but no backend acts on it yet.
-
-In the all-default state, `strict=true` is observationally equivalent
-to `strict=false` (hints aren't read at all, so "honor them strictly"
-is a no-op). The flag becomes meaningful only once a backend actually
-implements `CreateWithHints`.
+The default `CreateWithHints` forwards ordinary writes to legacy `Create` and returns `EC_UNIMPLEMENTED` for strict writes. `DataStorageManager` rejects empty strict targets and backends without affinity support before allocation. NFS and the internal mempool backend implement affinity placement and return actual `node_id` values in `LocationDescriptor`. Replication targets must match the caller node; same-supernode fallback cannot publish a remote replica as local.
 
 ## Failure Modes
 
 | Condition | What happens |
 |---|---|
-| No strategy loaded at any tier | `Resolve` returns `EC_OK` + empty hints; backend uses its own placement |
+| No strategy loaded at any tier | `ResolveWrite` returns kOk + empty hints; backend uses its own placement |
 | A higher-priority tier's JSON fails to parse | Treated as "tier unset" and falls through to the next tier; the write does not fail |
-| Caller IP empty | `prefer_local` treats "local node in candidates" as false and applies `on_miss` (default `passthrough`) |
-| Candidate has no `NodeMetrics` | `filter` leaves default to `true` (permissive); the term contributes 0 in `sort`; `prefer_local` still matches `node_id` against `caller_node_ip` |
-| `prefer_local{on_miss:"abort"}` finds no local node | Strategy aborts and `Resolve` returns `EC_ERROR`. v1 logs + degrades to empty hints in `CacheManager::ResolveAffinityHints` (write proceeds via legacy path). To turn this into a hard write failure, lift the degradation in that helper |
+| Caller node ID empty | `prefer_local` treats "local node in candidates" as false and applies `on_miss` (default `passthrough`) |
+| Candidate has no `NodeMetrics` | `filter` leaves default to `true` (permissive); the term contributes 0 in `sort`; `prefer_local` still matches `node_id` against `caller.node_id` |
+| `prefer_local{on_miss:"abort"}` finds no local node | The strategy aborts. Ordinary writes log and fall back to empty hints; replication fails because strict targets are empty |
 | Process-level JSON malformed (unregistered metric, `and:[]`, etc.) | `LoadProcessStrategyFromJson*` returns `false`; existing process-level strategy (if any) is unchanged; instance / instance_group tiers are not affected |
 | Regex compile error in `node_name.include / exclude` | Same as above for process-level loads — no partial state. For an override (instance / instance_group) it is treated as a parse failure for that tier and falls through |
 
