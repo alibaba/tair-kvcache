@@ -32,7 +32,7 @@ CacheLocationConstPtr WeightSLPolicy::SelectForMatch(CacheLocationMap &location_
             }
             std::string host;
             if (!kv.second->location_specs().empty()) {
-                host = std::string(ExtractHostName(kv.second->location_specs().front().uri()));
+                host = StandardUri(kv.second->location_specs().front().uri()).GetHostPort();
             }
             if (!seen_backends.emplace(kv.second->type(), std::move(host)).second) {
                 continue;

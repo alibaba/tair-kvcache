@@ -154,6 +154,21 @@ TEST_F(SelectLocationPolicyTest, BackendDedupByHostname) {
     }
 }
 
+TEST_F(SelectLocationPolicyTest, SameHostDifferentPortsRemainIndependentBackends) {
+    CacheLocationMap locations{{"first", nullptr}, {"second", nullptr}};
+    // Visit the zero-weight endpoint first so hostname-only deduplication
+    // cannot silently suppress the eligible endpoint on a different port.
+    auto it = locations.begin();
+    it->second = GenFakeLocation(it->first, {CLS_SERVING, D_NFS, "cache-host:1001"});
+    ++it;
+    it->second = GenFakeLocation(it->first, {CLS_SERVING, D_NFS, "cache-host:1002"});
+    const auto expected = it->second;
+    NamedStorageWeightedSLPolicy policy({{"cache-host:1001", 0}, {"cache-host:1002", 1}});
+    const auto selected = policy.SelectForMatch(locations, dummy_check_loc_data_exist, dummy_loc_ids);
+    ASSERT_TRUE(selected);
+    EXPECT_EQ(expected->id(), selected->id());
+}
+
 TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatchWithStaleCheck) {
     StaticWeightSLPolicy policy;
     // (a) all CLS_SERVING stale ->
