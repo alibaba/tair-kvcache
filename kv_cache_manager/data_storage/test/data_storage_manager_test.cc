@@ -127,7 +127,9 @@ TEST_F(DataStorageManagerTest, TestOptionalBackendsFollowBuildConfig) {
 TEST_F(DataStorageManagerTest, StrictPlacementRejectsBackendWithoutAffinity) {
     DataStorageManager manager(metrics_registry_);
     RequestContext ctx("strict_unsupported");
-    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_DUMMY, "dummy", std::make_shared<DummyStorageSpec>());
+    auto spec = std::make_shared<DummyStorageSpec>();
+    spec->set_root_path(GetPrivateTestRuntimeDataPath() + "dummy");
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_DUMMY, "dummy", spec);
     ASSERT_EQ(EC_OK, manager.RegisterStorage(&ctx, "dummy", config));
     auto result = manager.Create(&ctx, "dummy", {"key"}, 128, WriteHints{{"nodeA"}}, true, [] {});
     ASSERT_EQ(1u, result.size());
