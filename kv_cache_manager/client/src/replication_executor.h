@@ -24,16 +24,12 @@ class ReleaseGuard {
 public:
     ReleaseGuard() = default;
     explicit ReleaseGuard(std::function<void()> fn) : fn_(std::move(fn)) {}
-    ~ReleaseGuard() {
-        if (fn_)
-            fn_();
-    }
+    ~ReleaseGuard() { Release(); }
 
     ReleaseGuard(ReleaseGuard &&other) noexcept : fn_(std::move(other.fn_)) { other.fn_ = nullptr; }
     ReleaseGuard &operator=(ReleaseGuard &&other) noexcept {
         if (this != &other) {
-            if (fn_)
-                fn_();
+            Release();
             fn_ = std::move(other.fn_);
             other.fn_ = nullptr;
         }
@@ -44,6 +40,17 @@ public:
     ReleaseGuard &operator=(const ReleaseGuard &) = delete;
 
 private:
+    void Release() noexcept {
+        // Cleanup may run while a transfer exception is already unwinding.
+        // A failing user callback or best-effort abort must not terminate the
+        // worker or prevent the remaining ownership guards from running.
+        auto fn = std::move(fn_);
+        fn_ = nullptr;
+        try {
+            if (fn) fn();
+        } catch (...) {
+        }
+    }
     std::function<void()> fn_;
 };
 

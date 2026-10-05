@@ -868,3 +868,37 @@ TEST_F(ReplicationExecutorTest, NamedTransferExceptionAbortsWholeSessionAndRelea
     EXPECT_TRUE(weak.expired()); EXPECT_EQ(1u, executor->GetStats().failed);
     EXPECT_EQ(0u, executor->GetStats().copied_bytes);
 }
+
+TEST_F(ReplicationExecutorTest, TransferAbortAndReleaseExceptionsDoNotTerminateWorker) {
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true))
+        .WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation())))
+        .WillOnce(Return(std::make_pair(ER_OK, MakeEmptyWriteLocation())));
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _))
+        .WillOnce(testing::Throw(std::runtime_error("transfer failure")));
+    EXPECT_CALL(mock_meta_, FinishWrite(_, _, _, _))
+        .WillOnce(testing::Throw(std::runtime_error("abort failure")));
+    char data[16]{};
+    std::atomic<int> releases{0};
+    auto executor = MakeExecutor();
+    executor->SubmitWithData(MakeHint(904, "reader"), data, sizeof(data), [&] {
+        ++releases;
+        throw std::runtime_error("release failure");
+    });
+    executor->Submit({MakeHint(905, "reader")});
+    executor->Shutdown();
+    EXPECT_EQ(1, releases.load());
+    EXPECT_EQ(1u, executor->GetStats().failed);
+    EXPECT_EQ(1u, executor->GetStats().skipped);
+    EXPECT_EQ(0u, executor->GetStats().active);
+}
+
+TEST(ReleaseGuardTest, MoveAssignmentReleasesBothCallbacksExactlyOnceWhenTheyThrow) {
+    int releases = 0;
+    {
+        ReleaseGuard first([&] { ++releases; throw std::runtime_error("first"); });
+        ReleaseGuard second([&] { ++releases; throw std::runtime_error("second"); });
+        first = std::move(second);
+        EXPECT_EQ(1, releases);
+    }
+    EXPECT_EQ(2, releases);
+}
