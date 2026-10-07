@@ -252,3 +252,27 @@ curl -g -vvv -X POST http://localhost:6382/api/getCacheMeta \
 ### 亲和性复制能力协商
 
 `GetCacheLocationRequest.caller.replication_capabilities` 为位图，bit 0（值 1）表示客户端支持按名称复制完整的多 spec 源。响应 `replication_capabilities` 返回双方支持能力的交集。未携带能力的旧客户端仍可读取全部位置，只接收单 spec 提示。新 SDK 默认声明值 1，仅在响应确认后使用多 spec 提示。未知位忽略；升级 SDK 与服务端可分批进行。HTTP/Python 调用方只有实现全部 spec 的原子发布后才应声明该位。
+
+### 服务端复制
+
+新 SDK 对没有现成推理侧 buffer 的提示调用 `ReplicateCache`。服务端按 `target_node_id`
+严格申请目标 GA，调用同一 storage backend 的 CopyGA，并在全部 `source_specs` 成功后发布
+目标元数据。任一 spec 失败都会以失败 mask 结束写会话并回收目标 GA。
+
+```json
+POST /api/replicateCache
+{
+  "trace_id": "replicate_123",
+  "instance_id": "instance_1",
+  "block_key": "123",
+  "target_node_id": "provider-uuid",
+  "write_timeout_seconds": 60,
+  "source_specs": [
+    {"spec_name": "kv", "uri": "pace://storage/ga1?size=1024"}
+  ]
+}
+```
+
+复制写若仍使用 `StartWriteCache`，必须同时设置 `is_replication=true` 和
+`replication_target_node_id`。缺少目标节点会返回 `INVALID_ARGUMENT`；服务端不会再从普通
+`write.ops` 推导复制目标。

@@ -160,18 +160,43 @@ void ReplicationExecutor::SubmitWithData(ClientReplicationHint hint,
         return;
     }
     std::lock_guard<std::mutex> lk(mu_);
-    if (stopped_.load(std::memory_order_relaxed) || queue_.size() >= max_pending_tasks_) {
+    if (stopped_.load(std::memory_order_relaxed)) {
         ++counters_.dropped_queue;
         return;
     }
     std::string key = MakeKey(hint.block_key, hint.target_node_id);
     if (inflight_.count(key)) {
+        auto queued = std::find_if(queue_.begin(), queue_.end(), [&](const auto &task) {
+            return MakeKey(task.hint.block_key, task.hint.target_node_id) == key;
+        });
+        if (queued != queue_.end() && queued->data == nullptr && queued->named_buffers.empty() &&
+            piggyback_queue_size_ < max_piggyback_queue_) {
+            const size_t bytes = std::max(size, HintBytes(hint));
+            const size_t without_old = pending_bytes_ - queued->pending_bytes;
+            if (bytes <= options_.max_pending_bytes && without_old <= options_.max_pending_bytes - bytes &&
+                ReplicationResources::Global().TryRetain(size, options_.max_buffer_bytes)) {
+                queued->hint = std::move(hint);
+                queued->data = data;
+                queued->data_size = size;
+                queued->retained_memory = ReleaseGuard([size] { ReplicationResources::Global().Release(size); });
+                queued->guard = std::move(guard);
+                pending_bytes_ = without_old + bytes;
+                queued->pending_bytes = bytes;
+                ++piggyback_queue_size_;
+                KVCM_LOG_INFO("[replication] upgraded queued automatic copy to piggyback for key [%s]", key.c_str());
+                return;
+            }
+        }
         ++counters_.duplicates;
         KVCM_LOG_INFO("[replication] SubmitWithData: block_key [%ld] target [%s] already inflight "
                       "(likely auto-submitted by MatchLocation), piggyback data dropped. "
                       "Async replication via ExecuteHintAsync is in progress.",
                       hint.block_key,
                       hint.target_node_id.c_str());
+        return;
+    }
+    if (queue_.size() >= max_pending_tasks_) {
+        ++counters_.dropped_queue;
         return;
     }
     if (piggyback_queue_size_ >= max_piggyback_queue_) {
@@ -236,11 +261,34 @@ bool ReplicationExecutor::SubmitWithBuffers(ClientReplicationHint hint,
     if (buffers.empty()) { ++counters_.dropped_invalid; return false; }
     const auto bytes = std::max(retained_bytes, HintBytes(hint));
     std::lock_guard<std::mutex> lock(mu_);
-    if (stopped_.load() || queue_.size() >= max_pending_tasks_ || piggyback_queue_size_ >= max_piggyback_queue_) {
+    if (stopped_.load()) { ++counters_.dropped_queue; return false; }
+    const auto key = MakeKey(hint.block_key, hint.target_node_id);
+    if (inflight_.count(key)) {
+        auto queued = std::find_if(queue_.begin(), queue_.end(), [&](const auto &task) {
+            return MakeKey(task.hint.block_key, task.hint.target_node_id) == key;
+        });
+        if (queued != queue_.end() && queued->data == nullptr && queued->named_buffers.empty() &&
+            piggyback_queue_size_ < max_piggyback_queue_) {
+            const size_t without_old = pending_bytes_ - queued->pending_bytes;
+            if (bytes <= options_.max_pending_bytes && without_old <= options_.max_pending_bytes - bytes &&
+                bytes <= options_.max_buffer_bytes &&
+                ReplicationResources::Global().TryRetain(retained_bytes, options_.max_buffer_bytes)) {
+                queued->retained_memory =
+                    ReleaseGuard([retained_bytes] { ReplicationResources::Global().Release(retained_bytes); });
+                queued->hint = std::move(hint);
+                queued->named_buffers = std::move(buffers);
+                pending_bytes_ = without_old + bytes;
+                queued->pending_bytes = bytes;
+                ++piggyback_queue_size_;
+                return true;
+            }
+        }
+        ++counters_.duplicates;
+        return false;
+    }
+    if (queue_.size() >= max_pending_tasks_ || piggyback_queue_size_ >= max_piggyback_queue_) {
         ++counters_.dropped_queue; return false;
     }
-    const auto key = MakeKey(hint.block_key, hint.target_node_id);
-    if (inflight_.count(key)) { ++counters_.duplicates; return false; }
     if (bytes > options_.max_pending_bytes || bytes > options_.max_buffer_bytes ||
         pending_bytes_ > options_.max_pending_bytes - bytes ||
         !ReplicationResources::Global().TryRetain(retained_bytes, options_.max_buffer_bytes)) {
@@ -359,12 +407,23 @@ void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
         KVCM_LOG_WARN("[replication] caller changed; dropping hint for node [%s]", hint.target_node_id.c_str());
         return;
     }
-    auto [start_ec, write_loc] = meta_client_->StartWrite(
-        trace_id, {hint.block_key}, {}, {}, /*write_timeout_seconds=*/60, /*is_replication=*/true);
-    if (start_ec != ER_OK || write_loc.locations.empty()) {
-        if (start_ec == ER_OK) task.outcome = ReplicationTask::Outcome::Skipped;
-        return; // Failed allocation, or the replica is already local.
+    const bool has_client_buffer = (task.data != nullptr && task.data_size > 0) || !task.named_buffers.empty();
+    if (!has_client_buffer) {
+        const auto server_ec = meta_client_->ReplicateCache(trace_id, hint, /*write_timeout_seconds=*/60);
+        if (server_ec == ER_OK) {
+            task.outcome = ReplicationTask::Outcome::Succeeded;
+            task.copied_bytes = HintBytes(hint);
+            return;
+        }
+        if (server_ec != ER_SERVICE_UNSUPPORTED) {
+            KVCM_LOG_WARN("[replication] server-side copy failed for block_key [%ld], ec [%d]",
+                          hint.block_key, server_ec);
+            return;
+        }
     }
+    auto [start_ec, write_loc] = meta_client_->StartReplicationWrite(
+        trace_id, {hint.block_key}, {}, /*write_timeout_seconds=*/60, hint.target_node_id);
+    if (start_ec != ER_OK) return;
 
     // Release allocated destinations on every failure before publication. Once
     // FinishWrite has been attempted its result may be ambiguous, so never send
@@ -380,6 +439,13 @@ void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
             }
         }
     });
+    if (write_loc.locations.empty()) {
+        finish_attempted = true;
+        const auto ec = meta_client_->FinishWrite(
+            trace_id, write_loc.write_session_id, BlockMaskOffset(0), {});
+        if (ec == ER_OK) task.outcome = ReplicationTask::Outcome::Skipped;
+        return; // The complete replica already exists on the target.
+    }
     if (write_loc.locations.size() != 1 || write_loc.locations.front().empty()) {
         return;
     }

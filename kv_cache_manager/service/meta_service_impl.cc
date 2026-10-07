@@ -745,6 +745,7 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
     request_context->set_caller_node(CallerNode{request->caller().node_id(), request->caller().supernode_id(),
                                                request->caller().replication_capabilities()});
     request_context->set_is_replication(request->is_replication());
+    request_context->set_replication_target_node_id(request->replication_target_node_id());
 
     std::pair<ErrorCode, StartWriteCacheInfo> start_write_cache = cache_manager_->StartWriteCache(
         request_context,
@@ -827,6 +828,40 @@ void MetaServiceImpl::FinishWriteCache(RequestContext *request_context,
                       request->trace_id().c_str(),
                       request->write_session_id().c_str());
     }
+    SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+}
+
+void MetaServiceImpl::ReplicateCache(RequestContext *request_context,
+                                     const proto::meta::ReplicateCacheRequest *request,
+                                     proto::meta::ReplicateCacheResponse *response) {
+    SPAN_TRACER(request_context);
+    API_CALL_GUARD("ReplicateCache", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    if (request->instance_id().empty() || request->target_node_id().empty() ||
+        request->source_specs().empty()) {
+        status->set_code(proto::meta::INVALID_ARGUMENT);
+        status->set_message("instance_id, target_node_id and source_specs are required");
+        request_context->set_status_code(status->code());
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    ReplicationHint hint;
+    hint.block_key = request->block_key();
+    hint.target_node_id = request->target_node_id();
+    hint.source_specs.reserve(request->source_specs_size());
+    for (const auto &source : request->source_specs()) {
+        hint.source_specs.push_back({source.spec_name(), source.uri()});
+    }
+    const int64_t timeout_seconds = request->write_timeout_seconds() > 0
+                                        ? request->write_timeout_seconds()
+                                        : 60;
+    auto [ec, already_exists] =
+        cache_manager_->ReplicateCache(request_context, request->instance_id(), hint, timeout_seconds);
+    status->set_code(ec == EC_OK ? proto::meta::OK : ToMetaPbError(ec));
+    status->set_message(ec == EC_OK ? "Cache replicated successfully" : "Failed to replicate cache");
+    response->set_already_exists(already_exists);
+    request_context->set_status_code(status->code());
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
 

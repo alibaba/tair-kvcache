@@ -477,9 +477,29 @@ message StartWriteCacheRequest {
 
     // Replication write flag.
     //   false = normal write: global dedup via ExistsForWrite, strict=false
-    //   true  = replication write: dedup only on caller node, strict=true
+    //   true  = replication write: dedup only on replication_target_node_id,
+    //           strict=true
     // Server derives the strict parameter from this flag automatically.
     bool is_replication = 8;
+    // Required when is_replication=true. The server allocates the new replica
+    // on this exact storage node instead of re-running the normal write policy.
+    string replication_target_node_id = 9;
+}
+
+// Copy one cache block to an explicit node entirely inside KVCM/storage.
+message ReplicateCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    int64 block_key = 3;
+    repeated ReplicationSourceSpec source_specs = 4;
+    string target_node_id = 5;
+    int32 write_timeout_seconds = 6;
+}
+
+message ReplicateCacheResponse {
+    CommonResponseHeader header = 1;
+    // True means a complete replica already existed on target_node_id.
+    bool already_exists = 2;
 }
 
 message StartWriteCacheResponse {
@@ -564,6 +584,8 @@ service MetaService {
     rpc GetCacheLocationLen(GetCacheLocationLenRequest) returns (GetCacheLocationLenResponse);
     // 准备开始写Cache，尝试获取写的位置，如果返回空，则代表不需要写Cache
     rpc StartWriteCache(StartWriteCacheRequest) returns (StartWriteCacheResponse);
+    // Allocate on target_node_id, invoke backend CopyGA, then publish metadata.
+    rpc ReplicateCache(ReplicateCacheRequest) returns (ReplicateCacheResponse);
     // 不论写Cache成功与否，都调用这个
     rpc FinishWriteCache(FinishWriteCacheRequest) returns (CommonResponse);
     // 删除指定key的cache，用于修复用户反馈的单query异常

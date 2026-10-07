@@ -176,7 +176,8 @@ URI hostname 是集群名，物理节点藏在 query 参数里。让 backend 显
 | 消息 | 字段 | 用途 |
 |---|---|---|
 | `GetCacheLocationRequest` | `caller_node_ip = 9`, `caller_supernode_id = 10` | 调用方自报位置 |
-| `StartWriteCacheRequest` | `caller_node_ip = 7`, `caller_supernode_id = 9`, `is_replication = 8` | 同上 + 复制写标志 |
+| `StartWriteCacheRequest` | `caller`、`is_replication = 8`、`replication_target_node_id = 9` | 调用方拓扑 + 复制写标志和明确目标节点 |
+| `ReplicateCache` | block key、完整 `source_specs`、`target_node_id` | 服务端申请目标 GA 并调用 backend CopyGA |
 | `GetCacheLocationResponse` | `repeated ReplicationHint hints = 3` | 服务端下发复制提示 |
 
 所有新字段 additive，老客户端字段为空时退化为未启用 affinity。
@@ -202,7 +203,11 @@ proto(caller_node_ip, caller_supernode_id)
         → LocationDescriptor.node_id → LocationSpec.node_id（持久化）
 ```
 
-`is_replication=true` 时：跳过全局去重（`ExistsForWrite`），仅检查 caller 节点是否已有副本（`existsOnCallerNode`），`strict=true` 传给 backend。
+`is_replication=true` 时：跳过全局去重（`ExistsForWrite`），仅检查目标节点是否已有副本，
+并要求 `replication_target_node_id` 非空。该目标直接形成唯一的 `WriteHints` 候选，
+`strict=true` 传给 backend，不再依赖普通 `write.ops`。自动复制优先调用服务端
+`ReplicateCache`，由 KVCM 完成目标 GA 申请、backend CopyGA 和原子发布；旧服务返回
+`UNSUPPORTED` 时 SDK 才回退到 Load/Save 路径。
 
 ### 4.2 读路径
 

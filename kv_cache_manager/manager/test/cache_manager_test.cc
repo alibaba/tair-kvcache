@@ -11097,6 +11097,7 @@ TEST_F(CacheManagerAffinityTest, ReplicationWriteBypassesGlobalDedup) {
     {
         request_context_->set_is_replication(true);
         request_context_->set_caller_node_id("node_a");
+        request_context_->set_replication_target_node_id("node_a");
 
         auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
         ASSERT_NE(nullptr, meta_searcher);
@@ -11124,6 +11125,7 @@ TEST_F(CacheManagerAffinityTest, ReplicationWriteBypassesGlobalDedup) {
 
         // Clean up
         request_context_->set_is_replication(false);
+        request_context_->set_replication_target_node_id({});
     }
 }
 
@@ -11186,8 +11188,36 @@ TEST_F(CacheManagerAffinityTest, StrictReplicationCannotUseSameSupernodeFallback
     affinity_manager_->UpsertNodeMetrics(peer);
     request_context_->set_caller_node(CallerNode{"missing_caller", "rack"});
     request_context_->set_is_replication(true);
+    request_context_->set_replication_target_node_id("missing_caller");
     auto result = cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {9981}, {}, {}, 60);
     EXPECT_NE(EC_OK, result.first);
+}
+
+TEST_F(CacheManagerAffinityTest, ServerSideReplicationFailureRollsBackWriteSession) {
+    registerAndWriteKeys({9979});
+    ReplicationHint hint;
+    hint.block_key = 9980;
+    hint.target_node_id = NetUtil::GetLocalIp();
+    for (const auto &name : {"tp0", "tp1", "tp2", "tp3"}) {
+        hint.source_specs.push_back({name, "file://nfs_01/source/" + std::string(name) + "?size=512"});
+    }
+    auto [copy_ec, already_exists] =
+        cache_manager_->ReplicateCache(request_context_.get(), "test_instance", hint, 60);
+    EXPECT_EQ(EC_UNIMPLEMENTED, copy_ec);
+    EXPECT_FALSE(already_exists);
+
+    // NFS deliberately does not implement Copy. A fresh write for the same key
+    // must still allocate, proving the failed replication session was removed.
+    request_context_->set_is_replication(false);
+    request_context_->set_replication_target_node_id({});
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    auto [write_ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {9980}, {}, {}, 60);
+    ASSERT_EQ(EC_OK, write_ec);
+    ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+    EXPECT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", info.write_session_id(), BlockMaskOffset(1)));
 }
 
 } // namespace kv_cache_manager

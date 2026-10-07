@@ -71,9 +71,10 @@ public:
     const std::string &caller_node_id() const { return caller_node_.node_id; }
     const std::string &caller_supernode_id() const { return caller_node_.supernode_id; }
     // Whether the current request is a replication write. When true,
-    // ExistsForWrite checks only the caller node (instead of global dedup)
-    // and backend.Create is called with strict=true.
+    // ExistsForWrite checks only replication_target_node_id (instead of
+    // global dedup) and backend.Create is called with strict=true.
     bool is_replication() const { return is_replication_; }
+    const std::string &replication_target_node_id() const { return replication_target_node_id_; }
     const int status_code() const { return status_code_; }
     const JsonFragment &request_debug_json() const { return request_debug_json_; }
     const JsonFragment &response_debug_json() const { return response_debug_json_.Get(); }
@@ -86,6 +87,7 @@ public:
     void set_caller_node_id(const std::string &value) { caller_node_.node_id = value; }
     void set_caller_supernode_id(const std::string &value) { caller_node_.supernode_id = value; }
     void set_is_replication(bool value) { is_replication_ = value; }
+    void set_replication_target_node_id(std::string value) { replication_target_node_id_ = std::move(value); }
     void set_status_code(int value) { status_code_ = value; }
     void set_request_debug_json(JsonFragment fragment) { request_debug_json_ = std::move(fragment); }
     void set_response_debug_json_generator(ResponseJsonGenerator generator,
@@ -122,6 +124,7 @@ private:
     std::string client_ip_;
     CallerNode caller_node_;
     bool is_replication_{false};
+    std::string replication_target_node_id_;
     int status_code_{0};
     JsonFragment request_debug_json_;
     LazyResponseJsonCache response_debug_json_;

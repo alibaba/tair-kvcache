@@ -424,6 +424,18 @@ TEST_F(GrpcStubTest, TestStartWriteCache) {
     }
 }
 
+TEST_F(GrpcStubTest, ReplicationWriteRequiresExplicitTargetNode) {
+    auto expected = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              stub_->RegisterInstance(
+                  "trace1", "default", "replication_target", 64,
+                  createLocationSpecInfos(), createModelDeployment(), {}));
+    auto [ec, write_location] = stub_->StartReplicationWriteCache(
+        "trace2", "replication_target", {101}, {}, 60, {}, "");
+    EXPECT_EQ(ER_SERVICE_INVALID_ARGUMENT, ec);
+    EXPECT_TRUE(write_location.locations.empty());
+}
+
 TEST_F(GrpcStubTest, TestStartWriteCacheWithLocationSpecGroup) {
     kv_cache_manager::Stub::LocationSpecInfoMap location_spec_info_map = {
         {"tp0_F0", 1024},
