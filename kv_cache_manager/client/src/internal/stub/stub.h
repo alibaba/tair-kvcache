@@ -84,6 +84,18 @@ public:
                                            int32_t write_timeout_seconds) {
         return ER_SERVICE_UNSUPPORTED;
     }
+    virtual std::vector<ClientReplicationRpcResult>
+    ReplicateCaches(const std::string &trace_id,
+                    const std::string &instance_id,
+                    const std::vector<ClientReplicationHint> &hints,
+                    int32_t write_timeout_seconds) {
+        std::vector<ClientReplicationRpcResult> results;
+        results.reserve(hints.size());
+        for (const auto &hint : hints) {
+            results.push_back({ReplicateCache(trace_id, instance_id, hint, write_timeout_seconds), false});
+        }
+        return results;
+    }
     virtual ClientErrorCode FinishWriteCache(const std::string &trace_id,
                                              const std::string &instance_id,
                                              const std::string write_session_id,

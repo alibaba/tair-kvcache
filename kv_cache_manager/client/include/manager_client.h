@@ -53,6 +53,15 @@ public:
                                    size_t size,
                                    std::function<void()> release_fn) = 0;
 
+    virtual bool ReplicateWithDataAsync(const ClientReplicationHint &hint,
+                                        const void *data,
+                                        size_t size,
+                                        std::function<void()> release_fn,
+                                        ReplicationResultCallback result_fn) {
+        ReplicateWithData(hint, data, size, std::move(release_fn));
+        return true;
+    }
+
     // for transfer client
     virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) = 0;
     virtual std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
@@ -62,6 +71,12 @@ public:
     // its ownership lease is released. Missing specs are loaded from hint sources.
     virtual bool ReplicateWithBuffers(const ClientReplicationHint &hint,
                                        std::vector<ClientReplicationBuffer> buffers) { return false; }
+
+    virtual bool ReplicateWithBuffersAsync(const ClientReplicationHint &hint,
+                                            std::vector<ClientReplicationBuffer> buffers,
+                                            ReplicationResultCallback result_fn) {
+        return ReplicateWithBuffers(hint, std::move(buffers));
+    }
 
     virtual ReplicationStats GetReplicationStats() const { return {}; }
 

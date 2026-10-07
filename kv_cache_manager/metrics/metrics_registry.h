@@ -69,8 +69,13 @@ namespace kv_cache_manager {
 #define DEFINE_SET_METRICS_COUNTER_(group, name)                                                                       \
     void set_##group##_##name##_metrics(std::uint64_t) {}
 
+#define DEFINE_ADD_METRICS_COUNTER_(group, name)                                                                       \
+    void add_##group##_##name##_metrics(std::uint64_t v) { METRICS_(group, name) += v; }
+
 #define DEFINE_SET_METRICS_GAUGE_(group, name)                                                                         \
     void set_##group##_##name##_metrics(double v) { METRICS_(group, name) = v; }
+
+#define ADD_METRICS_(ptr, group, name, value) (ptr)->add_##group##_##name##_metrics(value)
 
 #define DEFINE_GET_METRICS_COUNTER_(group, name)                                                                       \
     std::uint64_t get_##group##_##name##_metrics() const { return METRICS_(group, name).Get(); }

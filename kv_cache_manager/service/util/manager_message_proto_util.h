@@ -202,6 +202,9 @@ void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_locat
     static_assert(std::is_same_v<T, proto::meta::CacheLocation> || std::is_same_v<T, proto::admin::CacheLocation>,
                   "T must be either proto::meta::CacheLocation or proto::admin::CacheLocation");
     proto_cache_location->set_spec_size(cache_location_info.spec_size());
+    proto_cache_location->set_id(cache_location_info.id());
+    proto_cache_location->set_status(CacheLocation::CacheLocationStatusToString(cache_location_info.status()));
+    proto_cache_location->set_create_time(cache_location_info.create_time());
     if constexpr (std::is_same_v<T, proto::meta::CacheLocation>) {
         proto::meta::StorageType type;
         DataStorageTypeToProto(cache_location_info.type(), &type);
@@ -548,6 +551,9 @@ template <typename T>
 std::enable_if_t<std::is_same_v<T, proto::meta::CacheLocation> || std::is_same_v<T, proto::admin::CacheLocation>>
 ProtoConvert::CacheLocationToProto(const CacheLocation &cache_location_info, T *proto_cache_location) {
     proto_cache_location->set_spec_size(cache_location_info.spec_size());
+    proto_cache_location->set_id(cache_location_info.id());
+    proto_cache_location->set_status(CacheLocation::CacheLocationStatusToString(cache_location_info.status()));
+    proto_cache_location->set_create_time(cache_location_info.create_time());
     if constexpr (std::is_same_v<T, proto::meta::CacheLocation>) {
         proto::meta::StorageType type;
         DataStorageTypeToProto(cache_location_info.type(), &type);

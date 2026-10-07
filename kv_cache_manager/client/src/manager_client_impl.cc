@@ -75,7 +75,22 @@ ClientErrorCode ManagerClientImpl::Init(const std::string &client_config, InitPa
 
 bool ManagerClientImpl::ReplicateWithBuffers(const ClientReplicationHint &hint,
                                              std::vector<ClientReplicationBuffer> buffers) {
-    return replication_executor_ && replication_executor_->SubmitWithBuffers(hint, std::move(buffers));
+    return ReplicateWithBuffersAsync(hint, std::move(buffers), {});
+}
+
+bool ManagerClientImpl::ReplicateWithBuffersAsync(const ClientReplicationHint &hint,
+                                                  std::vector<ClientReplicationBuffer> buffers,
+                                                  ReplicationResultCallback result_fn) {
+    if (replication_executor_) {
+        return replication_executor_->SubmitWithBuffers(hint, std::move(buffers), std::move(result_fn));
+    }
+    if (result_fn) {
+        result_fn({hint.block_key,
+                   hint.target_node_id,
+                   ReplicationOutcome::REJECTED_STOPPED,
+                   ER_CLIENT_NOT_EXISTS});
+    }
+    return false;
 }
 
 ReplicationStats ManagerClientImpl::GetReplicationStats() const {
@@ -146,18 +161,30 @@ void ManagerClientImpl::ReplicateWithData(const ClientReplicationHint &hint,
                                           const void *data,
                                           size_t size,
                                           std::function<void()> release_fn) {
+    static_cast<void>(ReplicateWithDataAsync(hint, data, size, std::move(release_fn), {}));
+}
+
+bool ManagerClientImpl::ReplicateWithDataAsync(const ClientReplicationHint &hint,
+                                               const void *data,
+                                               size_t size,
+                                               std::function<void()> release_fn,
+                                               ReplicationResultCallback result_fn) {
     if (replication_executor_) {
-        replication_executor_->SubmitWithData(hint, data, size, std::move(release_fn));
-    } else {
-        KVCM_LOG_ERROR("[replication] ReplicateWithData: replication_executor_ is null, "
-                       "block_key [%ld] target [%s] cannot be replicated. "
-                       "Hint was dropped. Check that meta_client_ and transfer_client_ both initialized.",
-                       hint.block_key,
-                       hint.target_node_id.c_str());
-        if (release_fn) {
-            release_fn();
-        }
+        return replication_executor_->SubmitWithData(
+            hint, data, size, std::move(release_fn), std::move(result_fn));
     }
+    KVCM_LOG_ERROR("[replication] ReplicateWithDataAsync: replication_executor_ is null, "
+                   "block_key [%ld] target [%s] cannot be replicated",
+                   hint.block_key,
+                   hint.target_node_id.c_str());
+    if (release_fn) release_fn();
+    if (result_fn) {
+        result_fn({hint.block_key,
+                   hint.target_node_id,
+                   ReplicationOutcome::REJECTED_STOPPED,
+                   ER_CLIENT_NOT_EXISTS});
+    }
+    return false;
 }
 
 ClientErrorCode ManagerClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) {

@@ -58,9 +58,18 @@ CacheLocationViewVecWrapper::CacheLocationViewVecWrapper(CacheLocationVector &&r
 CacheMetaVecWrapper::CacheMetaVecWrapper() = default;
 
 CacheMetaVecWrapper::CacheMetaVecWrapper(CacheMetaVecWrapper &&other)
-    : metas_(std::move(other.metas_)), locations_(std::move(other.locations_)) {}
+    : metas_(std::move(other.metas_))
+    , locations_(std::move(other.locations_))
+    , replica_locations_(std::move(other.replica_locations_)) {}
 
-CacheMetaVecWrapper::CacheMetaVecWrapper(std::vector<std::string> &&metas, CacheLocationVector &&raw_cache_locations)
-    : metas_(std::move(metas)), locations_(std::move(raw_cache_locations)) {}
+CacheMetaVecWrapper::CacheMetaVecWrapper(std::vector<std::string> &&metas,
+                                         CacheLocationVector &&raw_cache_locations,
+                                         std::vector<CacheLocationVector> &&raw_replica_locations)
+    : metas_(std::move(metas)), locations_(std::move(raw_cache_locations)) {
+    replica_locations_.reserve(raw_replica_locations.size());
+    for (auto &replicas : raw_replica_locations) {
+        replica_locations_.emplace_back(std::move(replicas));
+    }
+}
 
 } // namespace kv_cache_manager

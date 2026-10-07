@@ -48,6 +48,11 @@ public:
                            const void *data,
                            size_t size,
                            std::function<void()> release_fn) override;
+    bool ReplicateWithDataAsync(const ClientReplicationHint &hint,
+                                const void *data,
+                                size_t size,
+                                std::function<void()> release_fn,
+                                ReplicationResultCallback result_fn) override;
 
     ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) override;
 
@@ -58,6 +63,9 @@ public:
     ReplicationStats GetReplicationStats() const override;
     bool ReplicateWithBuffers(const ClientReplicationHint &hint,
                                std::vector<ClientReplicationBuffer> buffers) override;
+    bool ReplicateWithBuffersAsync(const ClientReplicationHint &hint,
+                                   std::vector<ClientReplicationBuffer> buffers,
+                                   ReplicationResultCallback result_fn) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, InitParams &init_params) override;

@@ -35,6 +35,9 @@ public:
     explicit CacheLocationView(const CacheLocation &cache_location);
     inline DataStorageType type() const { return cache_location_.type(); }
     inline int32_t spec_size() const { return cache_location_.spec_size(); }
+    inline const std::string &id() const { return cache_location_.id(); }
+    inline CacheLocationStatus status() const { return cache_location_.status(); }
+    inline int64_t create_time() const { return cache_location_.create_time(); }
     inline const LocationSpecViewVec &location_specs() const { return location_specs_view_; }
 
 private:
@@ -67,13 +70,17 @@ class CacheMetaVecWrapper {
 public:
     CacheMetaVecWrapper();
     CacheMetaVecWrapper(CacheMetaVecWrapper &&other);
-    CacheMetaVecWrapper(std::vector<std::string> &&metas, CacheLocationVector &&raw_cache_locations);
+    CacheMetaVecWrapper(std::vector<std::string> &&metas,
+                        CacheLocationVector &&raw_cache_locations,
+                        std::vector<CacheLocationVector> &&raw_replica_locations = {});
     inline const CacheLocationViewVec &cache_locations_view() const { return locations_.cache_locations_view(); }
     inline const std::vector<std::string> &metas() const { return metas_; }
+    inline const BatchLocationsView &replica_locations() const { return replica_locations_; }
 
 private:
     std::vector<std::string> metas_;
     CacheLocationViewVecWrapper locations_;
+    BatchLocationsView replica_locations_;
 };
 
 class StartWriteCacheInfo {
