@@ -47,6 +47,10 @@ public:
     ClientErrorCode ReplicateCache(const std::string &trace_id,
                                    const ClientReplicationHint &hint,
                                    int32_t write_timeout_seconds) override;
+    std::vector<ClientReplicationRpcResult>
+    ReplicateCaches(const std::string &trace_id,
+                    const std::vector<ClientReplicationHint> &hints,
+                    int32_t write_timeout_seconds) override;
     ClientErrorCode FinishWrite(const std::string &trace_id,
                                 const std::string &write_session_id,
                                 const BlockMask &success_block,

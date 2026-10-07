@@ -815,16 +815,20 @@ std::pair<ErrorCode, CacheMetaVecWrapper> CacheManager::GetCacheMeta(RequestCont
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchGetLocation);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(DEBUG, ec, CacheMetaVecWrapper, "get cache meta failed: BatchGetLocation fail");
-    // TODO, 现在BatchGetLocation接口还未返回 location properties 信息, 先置空
-    // 另外现在BatchGetLocation接口返回的是一个block key对应的location map, 和proto定义不同,
-    // 先临时只返回map里的第一个 location(不管是不是在serving状态), 将serving状态保存在meta里 这里现在非常 ugly
     CacheLocationVector cache_locations;
+    std::vector<CacheLocationVector> replica_locations;
+    replica_locations.reserve(location_maps.size());
     std::vector<std::string> metas;
     std::map<std::string, std::string> meta;
     for (CacheLocationMap &location_map : location_maps) {
-        auto iter = location_map.begin();
-        if (iter != location_map.end() && iter->second) {
-            cache_locations.push_back(iter->second);
+        meta.clear();
+        CacheLocationVector replicas;
+        replicas.reserve(location_map.size());
+        for (const auto &[_, location] : location_map) {
+            if (location) replicas.push_back(location);
+        }
+        if (!replicas.empty()) {
+            cache_locations.push_back(replicas.front());
             meta["id"] = cache_locations.back()->id();
         } else {
             auto not_found_loc = std::make_shared<CacheLocation>();
@@ -833,9 +837,12 @@ std::pair<ErrorCode, CacheMetaVecWrapper> CacheManager::GetCacheMeta(RequestCont
         }
         meta["status"] = CacheLocation::CacheLocationStatusToString(cache_locations.back()->status());
         metas.push_back(Jsonizable::ToJsonString(meta));
+        replica_locations.push_back(std::move(replicas));
     }
 
-    return {ec, CacheMetaVecWrapper(std::move(metas), std::move(cache_locations))};
+    return {ec,
+            CacheMetaVecWrapper(
+                std::move(metas), std::move(cache_locations), std::move(replica_locations))};
 }
 
 ErrorCode
@@ -996,10 +1003,12 @@ ErrorCode CacheManager::GetCacheLocation(RequestContext *request_context,
                 }
             }
         }
-        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, affinity, read_local_hit, local_hit);
-        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, affinity, read_remote_hit, remote_hit);
-        KVCM_METRICS_COLLECTOR_SET_METRICS(
-            service_metrics_collector, affinity, hint_emitted, static_cast<double>(out_hints.size()));
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(
+            service_metrics_collector, affinity, read_local_hit, static_cast<uint64_t>(local_hit));
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(
+            service_metrics_collector, affinity, read_remote_hit, static_cast<uint64_t>(remote_hit));
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(
+            service_metrics_collector, affinity, hint_emitted, static_cast<uint64_t>(out_hints.size()));
     }
     out_locations = CacheLocationViewVecWrapper(std::move(cache_locations));
     return ec;
@@ -1373,8 +1382,10 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     if (event_manager_) {
         event_manager_->Publish(start_write_event);
     }
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, affinity, replication_write_count, request_context->is_replication() ? 1.0 : 0.0);
+    if (request_context->is_replication()) {
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(
+            service_metrics_collector, affinity, replication_write_count, uint64_t{1});
+    }
     return {EC_OK,
             StartWriteCacheInfo(std::move(write_session_id),
                                 std::move(block_mask),
@@ -1385,96 +1396,212 @@ std::pair<ErrorCode, bool> CacheManager::ReplicateCache(RequestContext *request_
                                                         const std::string &instance_id,
                                                         const ReplicationHint &hint,
                                                         int64_t write_timeout_seconds) {
-    if (hint.target_node_id.empty() || hint.source_specs.empty()) return {EC_BADARGS, false};
-    request_context->set_is_replication(true);
-    request_context->set_replication_target_node_id(hint.target_node_id);
-    auto [start_ec, write_info] = StartWriteCache(request_context,
-                                                  instance_id,
-                                                  {hint.block_key},
-                                                  {},
-                                                  {},
-                                                  write_timeout_seconds,
-                                                  1);
-    if (start_ec != EC_OK) return {start_ec, false};
+    auto results = ReplicateCaches(request_context, instance_id, {hint}, write_timeout_seconds);
+    return results.empty() ? std::make_pair(EC_ERROR, false) : results.front();
+}
 
-    const auto &session_id = write_info.write_session_id();
-    const auto &locations = write_info.locations().cache_locations_view();
-    auto finish = [&](bool success) {
+std::vector<std::pair<ErrorCode, bool>>
+CacheManager::ReplicateCaches(RequestContext *request_context,
+                              const std::string &instance_id,
+                              const std::vector<ReplicationHint> &hints,
+                              int64_t write_timeout_seconds) {
+    const auto started_at = std::chrono::steady_clock::now();
+    auto *service_metrics_collector =
+        dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    struct State {
+        enum class FailureStage { None, Allocation, Copy, Publish };
+        ErrorCode ec{EC_OK};
+        bool already_exists{false};
+        FailureStage failure_stage{FailureStage::None};
+        std::string session_id;
+        std::string storage_name;
+        std::vector<DataStorageUri> sources;
+        std::vector<DataStorageUri> destinations;
+    };
+    struct CopyBatch {
+        std::vector<DataStorageUri> sources;
+        std::vector<DataStorageUri> destinations;
+        std::vector<size_t> state_indices;
+    };
+
+    std::vector<State> states(hints.size());
+    request_context->set_is_replication(true);
+    auto finish = [&](State &state, bool success) {
+        if (state.session_id.empty()) return EC_OK;
+        auto session_id = std::move(state.session_id);
+        state.session_id.clear();
         return FinishWriteCache(request_context,
                                 instance_id,
                                 session_id,
                                 static_cast<BlockMaskOffset>(success ? 1 : 0));
     };
-    if (locations.empty()) {
-        const auto finish_ec = finish(false);
-        return {finish_ec, finish_ec == EC_OK};
-    }
-    if (locations.size() != 1 || locations.front().location_specs().empty()) {
-        static_cast<void>(finish(false));
-        return {EC_ERROR, false};
+
+    for (size_t i = 0; i < hints.size(); ++i) {
+        const auto &hint = hints[i];
+        auto &state = states[i];
+        if (hint.target_node_id.empty() || hint.source_specs.empty()) {
+            state.ec = EC_BADARGS;
+            state.failure_stage = State::FailureStage::Allocation;
+            continue;
+        }
+        request_context->set_replication_target_node_id(hint.target_node_id);
+        auto [start_ec, write_info] = StartWriteCache(request_context,
+                                                      instance_id,
+                                                      {hint.block_key},
+                                                      {},
+                                                      {},
+                                                      write_timeout_seconds,
+                                                      1);
+        if (start_ec != EC_OK) {
+            state.ec = start_ec;
+            state.failure_stage = State::FailureStage::Allocation;
+            continue;
+        }
+        state.session_id = write_info.write_session_id();
+        const auto &locations = write_info.locations().cache_locations_view();
+        if (locations.empty()) {
+            state.ec = finish(state, false);
+            state.already_exists = state.ec == EC_OK;
+            if (state.ec != EC_OK) state.failure_stage = State::FailureStage::Publish;
+            continue;
+        }
+        if (locations.size() != 1 || locations.front().location_specs().empty()) {
+            static_cast<void>(finish(state, false));
+            state.ec = EC_ERROR;
+            state.failure_stage = State::FailureStage::Allocation;
+            continue;
+        }
+
+        std::unordered_map<std::string, std::string> sources;
+        for (const auto &source : hint.source_specs) {
+            if (source.uri.empty() || !sources.emplace(source.spec_name, source.uri).second) {
+                state.ec = EC_BADARGS;
+                state.failure_stage = State::FailureStage::Copy;
+                break;
+            }
+        }
+        const auto &dest_specs = locations.front().location_specs();
+        if (state.ec == EC_OK && sources.size() == 1 && sources.begin()->first.empty() && dest_specs.size() == 1) {
+            auto uri = std::move(sources.begin()->second);
+            sources.clear();
+            sources.emplace(dest_specs.front().name(), std::move(uri));
+        }
+        if (state.ec == EC_OK && sources.size() != dest_specs.size()) {
+            state.ec = EC_BADARGS;
+            state.failure_stage = State::FailureStage::Copy;
+        }
+        for (const auto &dest : dest_specs) {
+            if (state.ec != EC_OK) break;
+            const auto source = sources.find(dest.name());
+            if (source == sources.end()) {
+                state.ec = EC_BADARGS;
+                state.failure_stage = State::FailureStage::Copy;
+                break;
+            }
+            DataStorageUri src_uri(source->second);
+            DataStorageUri dst_uri(dest.uri());
+            if (!src_uri.Valid() || !dst_uri.Valid() || src_uri.GetHostName().empty() ||
+                src_uri.GetHostName() != dst_uri.GetHostName() ||
+                (!state.storage_name.empty() && state.storage_name != dst_uri.GetHostName())) {
+                state.ec = EC_BADARGS;
+                state.failure_stage = State::FailureStage::Copy;
+                break;
+            }
+            state.storage_name = dst_uri.GetHostName();
+            state.sources.push_back(std::move(src_uri));
+            state.destinations.push_back(std::move(dst_uri));
+        }
+        if (state.ec != EC_OK) static_cast<void>(finish(state, false));
     }
 
-    std::unordered_map<std::string, std::string> sources;
-    for (const auto &source : hint.source_specs) {
-        if (source.uri.empty() || !sources.emplace(source.spec_name, source.uri).second) {
-            static_cast<void>(finish(false));
-            return {EC_BADARGS, false};
-        }
-    }
-    const auto &dest_specs = locations.front().location_specs();
-    if (sources.size() == 1 && sources.begin()->first.empty() && dest_specs.size() == 1) {
-        auto uri = std::move(sources.begin()->second);
-        sources.clear();
-        sources.emplace(dest_specs.front().name(), std::move(uri));
-    }
-    if (sources.size() != dest_specs.size()) {
-        static_cast<void>(finish(false));
-        return {EC_BADARGS, false};
-    }
-
-    std::vector<DataStorageUri> source_uris;
-    std::vector<DataStorageUri> destination_uris;
-    std::string storage_name;
-    source_uris.reserve(dest_specs.size());
-    destination_uris.reserve(dest_specs.size());
-    for (const auto &dest : dest_specs) {
-        const auto source = sources.find(dest.name());
-        if (source == sources.end()) {
-            static_cast<void>(finish(false));
-            return {EC_BADARGS, false};
-        }
-        DataStorageUri src_uri(source->second);
-        DataStorageUri dst_uri(dest.uri());
-        if (!src_uri.Valid() || !dst_uri.Valid() || src_uri.GetHostName().empty() ||
-            src_uri.GetHostName() != dst_uri.GetHostName() ||
-            (!storage_name.empty() && storage_name != dst_uri.GetHostName())) {
-            static_cast<void>(finish(false));
-            return {EC_BADARGS, false};
-        }
-        storage_name = dst_uri.GetHostName();
-        source_uris.push_back(std::move(src_uri));
-        destination_uris.push_back(std::move(dst_uri));
-    }
     auto data_storage_manager = registry_manager_->data_storage_manager();
-    if (!data_storage_manager) {
-        static_cast<void>(finish(false));
-        return {EC_NOENT, false};
+    std::map<std::string, CopyBatch> batches;
+    for (size_t i = 0; i < states.size(); ++i) {
+        auto &state = states[i];
+        if (state.ec != EC_OK || state.already_exists || state.sources.empty()) continue;
+        if (!data_storage_manager) {
+            state.ec = EC_NOENT;
+            state.failure_stage = State::FailureStage::Copy;
+            static_cast<void>(finish(state, false));
+            continue;
+        }
+        auto &batch = batches[state.storage_name];
+        batch.sources.insert(batch.sources.end(), state.sources.begin(), state.sources.end());
+        batch.destinations.insert(batch.destinations.end(), state.destinations.begin(), state.destinations.end());
+        batch.state_indices.insert(batch.state_indices.end(), state.sources.size(), i);
     }
-    const auto copy_results =
-        data_storage_manager->Copy(request_context, storage_name, source_uris, destination_uris);
-    ErrorCode copy_ec = copy_results.size() == source_uris.size() ? EC_OK : EC_ERROR;
-    for (const auto ec : copy_results) {
-        if (ec != EC_OK) {
-            copy_ec = ec;
-            break;
+
+    for (auto &[storage_name, batch] : batches) {
+        const auto copy_results = data_storage_manager->Copy(
+            request_context, storage_name, batch.sources, batch.destinations);
+        if (copy_results.size() != batch.sources.size()) {
+            for (const auto state_index : batch.state_indices) {
+                states[state_index].ec = EC_ERROR;
+                states[state_index].failure_stage = State::FailureStage::Copy;
+            }
+            continue;
+        }
+        for (size_t i = 0; i < copy_results.size(); ++i) {
+            if (copy_results[i] != EC_OK && states[batch.state_indices[i]].ec == EC_OK) {
+                states[batch.state_indices[i]].ec = copy_results[i];
+                states[batch.state_indices[i]].failure_stage = State::FailureStage::Copy;
+            }
         }
     }
-    if (copy_ec != EC_OK) {
-        const auto abort_ec = finish(false);
-        if (abort_ec != EC_OK) return {abort_ec, false};
-        return {copy_ec, false};
+
+    std::vector<std::pair<ErrorCode, bool>> results;
+    results.reserve(states.size());
+    for (auto &state : states) {
+        if (!state.session_id.empty() && !state.already_exists && !state.sources.empty()) {
+            if (state.ec == EC_OK) {
+                state.ec = finish(state, true);
+                if (state.ec != EC_OK) state.failure_stage = State::FailureStage::Publish;
+            } else {
+                const auto abort_ec = finish(state, false);
+                if (abort_ec != EC_OK) {
+                    state.ec = abort_ec;
+                    state.failure_stage = State::FailureStage::Publish;
+                }
+            }
+        }
+        results.emplace_back(state.ec, state.already_exists);
     }
-    return {finish(true), false};
+    uint64_t success_count = 0;
+    uint64_t failure_count = 0;
+    uint64_t allocation_failure_count = 0;
+    uint64_t copy_failure_count = 0;
+    uint64_t publish_failure_count = 0;
+    for (const auto &state : states) {
+        if (state.ec == EC_OK) {
+            if (!state.already_exists) ++success_count;
+            continue;
+        }
+        ++failure_count;
+        switch (state.failure_stage) {
+        case State::FailureStage::Allocation: ++allocation_failure_count; break;
+        case State::FailureStage::Copy: ++copy_failure_count; break;
+        case State::FailureStage::Publish: ++publish_failure_count; break;
+        case State::FailureStage::None: break;
+        }
+    }
+    KVCM_METRICS_COLLECTOR_ADD_METRICS(
+        service_metrics_collector, affinity, replication_server_copy_success, success_count);
+    KVCM_METRICS_COLLECTOR_ADD_METRICS(
+        service_metrics_collector, affinity, replication_server_copy_failure, failure_count);
+    KVCM_METRICS_COLLECTOR_ADD_METRICS(
+        service_metrics_collector, affinity, replication_allocation_failure, allocation_failure_count);
+    KVCM_METRICS_COLLECTOR_ADD_METRICS(
+        service_metrics_collector, affinity, replication_copy_failure, copy_failure_count);
+    KVCM_METRICS_COLLECTOR_ADD_METRICS(
+        service_metrics_collector, affinity, replication_publish_failure, publish_failure_count);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector,
+        affinity,
+        replication_server_copy_latency_us,
+        static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - started_at)
+                                .count()));
+    return results;
 }
 
 void CacheManager::RollbackAddLocations(RequestContext *request_context,

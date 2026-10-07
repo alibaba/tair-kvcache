@@ -72,16 +72,26 @@ enum class QueryType : int {
 };
 
 struct LocationSpecUnit {
-    bool operator==(const LocationSpecUnit &other) const { return spec_name == other.spec_name && uri == other.uri; }
+    bool operator==(const LocationSpecUnit &other) const {
+        return spec_name == other.spec_name && uri == other.uri && node_id == other.node_id;
+    }
     std::string spec_name;
     std::string uri;
+    std::string node_id;
 };
 using Location = std::vector<LocationSpecUnit>; // one block key may have multiple location_specs
 using Locations = std::vector<Location>;
 using UriStrVec = std::vector<std::string>;
 struct Metas {
+    struct Replica {
+        Location location;
+        std::string id;
+        std::string status;
+        int64_t create_time{0};
+    };
     Locations locations;
     std::vector<std::string> metas;
+    std::vector<std::vector<Replica>> replicas;
 };
 
 using BlockMaskVector = std::vector<bool>;
@@ -199,7 +209,40 @@ struct ReplicationStats {
     uint64_t queued = 0;
     uint64_t pending_bytes = 0;
     uint64_t active = 0;
+    uint64_t server_copy_succeeded = 0;
+    uint64_t server_copy_failed = 0;
+    uint64_t client_fallback = 0;
+    uint64_t allocation_failed = 0;
+    uint64_t transfer_failed = 0;
+    uint64_t publish_failed = 0;
 };
+
+enum class ReplicationOutcome : uint8_t {
+    SUCCEEDED = 0,
+    ALREADY_EXISTS = 1,
+    SKIPPED_CALLER_CHANGED = 2,
+    EXPIRED = 3,
+    REJECTED_STOPPED = 4,
+    REJECTED_QUEUE_FULL = 5,
+    REJECTED_BUDGET = 6,
+    REJECTED_INVALID = 7,
+    DUPLICATE = 8,
+    ALLOCATION_FAILED = 9,
+    SERVER_COPY_FAILED = 10,
+    TRANSFER_FAILED = 11,
+    PUBLISH_FAILED = 12,
+};
+
+struct ReplicationResult {
+    int64_t block_key{0};
+    std::string target_node_id;
+    ReplicationOutcome outcome{ReplicationOutcome::SERVER_COPY_FAILED};
+    ClientErrorCode error_code{ER_SERVICE_INTERNAL_ERROR};
+    uint64_t copied_bytes{0};
+    uint64_t latency_us{0};
+};
+
+using ReplicationResultCallback = std::function<void(const ReplicationResult &)>;
 
 struct InitParams {
 
@@ -247,6 +290,11 @@ struct ClientReplicationHint {
     std::string target_node_id;
     // Sources are matched to allocated destinations by spec_name, never position.
     Location source_specs;
+};
+
+struct ClientReplicationRpcResult {
+    ClientErrorCode error_code{ER_SERVICE_INTERNAL_ERROR};
+    bool already_exists{false};
 };
 
 } // namespace kv_cache_manager

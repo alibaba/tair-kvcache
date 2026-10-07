@@ -189,6 +189,11 @@ public:
                                               const std::string &instance_id,
                                               const ReplicationHint &hint,
                                               int64_t write_timeout_seconds);
+    std::vector<std::pair<ErrorCode, bool>>
+    ReplicateCaches(RequestContext *request_context,
+                    const std::string &instance_id,
+                    const std::vector<ReplicationHint> &hints,
+                    int64_t write_timeout_seconds);
     ErrorCode
     FinishWriteCache(RequestContext *request_context,
                      const std::string &instance_id,

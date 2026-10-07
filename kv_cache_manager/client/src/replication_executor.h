@@ -88,9 +88,10 @@ struct ReplicationTask {
     ClientReplicationHint hint;
     const void *data = nullptr;
     size_t data_size = 0;
-    enum class Outcome { Failed, Succeeded, Skipped, Expired };
-    Outcome outcome = Outcome::Failed;
+    ReplicationOutcome outcome = ReplicationOutcome::SERVER_COPY_FAILED;
+    ClientErrorCode error_code = ER_SERVICE_INTERNAL_ERROR;
     uint64_t copied_bytes = 0;
+    ReplicationResultCallback result_callback;
     ReleaseGuard retained_memory;
     ReleaseGuard guard;
     size_t pending_bytes = 0;
@@ -106,14 +107,29 @@ public:
     ~ReplicationExecutor();
 
     void Submit(const std::vector<ClientReplicationHint> &hints);
-    void SubmitWithData(ClientReplicationHint hint, const void *data, size_t size, std::function<void()> release_fn);
-    bool SubmitWithBuffers(ClientReplicationHint hint, std::vector<ClientReplicationBuffer> buffers);
+    bool SubmitWithData(ClientReplicationHint hint,
+                        const void *data,
+                        size_t size,
+                        std::function<void()> release_fn,
+                        ReplicationResultCallback result_callback = {});
+    bool SubmitWithBuffers(ClientReplicationHint hint,
+                           std::vector<ClientReplicationBuffer> buffers,
+                           ReplicationResultCallback result_callback = {});
     void Shutdown();
     ReplicationStats GetStats() const;
 
 private:
     void WorkerLoop();
-    void ExecuteTask(ReplicationTask &task);
+    void ExecuteTask(ReplicationTask &task, bool try_server_copy = true);
+    void ExecuteServerCopyBatch(std::vector<ReplicationTask *> tasks);
+    void CompleteTask(ReplicationTask &task,
+                      ReplicationResources::Clock::time_point started_at);
+    static void Notify(const ClientReplicationHint &hint,
+                       ReplicationResultCallback &callback,
+                       ReplicationOutcome outcome,
+                       ClientErrorCode error_code,
+                       uint64_t copied_bytes = 0,
+                       uint64_t latency_us = 0) noexcept;
     std::string MakeKey(int64_t block_key, const std::string &target_node_id) const;
 
 private:
@@ -140,6 +156,12 @@ private:
         std::atomic<uint64_t> latency_us{0};
         std::atomic<uint64_t> queue_wait_us{0};
         std::atomic<uint64_t> active{0};
+        std::atomic<uint64_t> server_copy_succeeded{0};
+        std::atomic<uint64_t> server_copy_failed{0};
+        std::atomic<uint64_t> client_fallback{0};
+        std::atomic<uint64_t> allocation_failed{0};
+        std::atomic<uint64_t> transfer_failed{0};
+        std::atomic<uint64_t> publish_failed{0};
     } counters_;
     std::condition_variable cv_;
     std::deque<ReplicationTask> queue_;

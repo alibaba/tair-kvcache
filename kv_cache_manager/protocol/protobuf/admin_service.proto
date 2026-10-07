@@ -408,7 +408,12 @@ message CacheLocation {
     StorageType type = 1;
     int32 spec_size = 2;
     repeated LocationSpec location_specs = 3;
+    string id = 4;
+    string status = 5;
+    int64 create_time = 6;
 }
+
+message CacheLocationVector { repeated CacheLocation locations = 1; }
 
 message LocationSpecInfo {
     string name = 1; // 由外部确定，用于描述单个block内的多个分块。举例比如2TP部署，可以是有TP0、TP1。
@@ -424,6 +429,7 @@ message GetCacheMetaResponse {
     CommonResponseHeader header = 1;
     repeated CacheLocation locations = 2; // 多个key的列表
     repeated string metas = 3;            // 与请求key一一对应
+    repeated CacheLocationVector replica_locations = 4;
 }
 
 // 删除指定 block_keys

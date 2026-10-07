@@ -72,7 +72,7 @@ kv_cache_manager::Locations GenLocations(
         locations.push_back({});
         locations.back().reserve(location_specs.size());
         for (const auto &location_spec : location_specs) {
-            locations.back().push_back({location_spec.name(), location_spec.uri()});
+            locations.back().push_back({location_spec.name(), location_spec.uri(), location_spec.node_id()});
         }
     }
     return locations;
@@ -313,13 +313,31 @@ std::pair<ClientErrorCode, Metas> GrpcStub::GetCacheMeta(const std::string &trac
     CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
     CHECK_COMMON_HEADER_WITH_TYPE(response);
     auto locations = GenLocations(response.locations());
+    std::vector<std::vector<Metas::Replica>> replicas;
+    replicas.reserve(response.replica_locations_size());
+    for (const auto &replica_group : response.replica_locations()) {
+        std::vector<Metas::Replica> group;
+        group.reserve(replica_group.locations_size());
+        for (const auto &replica : replica_group.locations()) {
+            Metas::Replica item;
+            item.location.reserve(replica.location_specs_size());
+            for (const auto &spec : replica.location_specs()) {
+                item.location.push_back({spec.name(), spec.uri(), spec.node_id()});
+            }
+            item.id = replica.id();
+            item.status = replica.status();
+            item.create_time = replica.create_time();
+            group.push_back(std::move(item));
+        }
+        replicas.push_back(std::move(group));
+    }
     std::vector<std::string> metas;
     std::for_each(
         response.metas().begin(), response.metas().end(), [&metas](const std::string &meta) { metas.push_back(meta); });
     KVCM_LOG_DEBUG("get cache meta success, locations: %s, metas: %s",
                    DebugStringUtil::ToString(locations).c_str(),
                    DebugStringUtil::ToString(metas).c_str());
-    return {ER_OK, {locations, metas}};
+    return {ER_OK, {std::move(locations), std::move(metas), std::move(replicas)}};
 }
 
 std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::string &trace_id,
@@ -496,6 +514,59 @@ ClientErrorCode GrpcStub::ReplicateCache(const std::string &trace_id,
     }
     CHECK_COMMON_HEADER(response);
     return ER_OK;
+}
+
+std::vector<ClientReplicationRpcResult>
+GrpcStub::ReplicateCaches(const std::string &trace_id,
+                          const std::string &instance_id,
+                          const std::vector<ClientReplicationHint> &hints,
+                          int32_t write_timeout_seconds) {
+    auto stub = GetStub();
+    if (stub == nullptr) {
+        return std::vector<ClientReplicationRpcResult>(hints.size(), {ER_INVALID_STUB, false});
+    }
+    proto::meta::ReplicateCacheRequest request;
+    SetCommonInfo(request, trace_id, instance_id);
+    request.set_write_timeout_seconds(write_timeout_seconds);
+    for (const auto &hint : hints) {
+        auto *item = request.add_items();
+        item->set_block_key(hint.block_key);
+        item->set_target_node_id(hint.target_node_id);
+        for (const auto &source : hint.source_specs) {
+            auto *proto_source = item->add_source_specs();
+            proto_source->set_spec_name(source.spec_name);
+            proto_source->set_uri(source.uri);
+        }
+        if (hint.source_specs.empty() && !hint.source_uri.empty()) {
+            item->add_source_specs()->set_uri(hint.source_uri);
+        }
+    }
+    grpc::ClientContext context;
+    proto::meta::ReplicateCacheResponse response;
+    const auto grpc_status = stub->ReplicateCache(&context, request, &response);
+    if (!grpc_status.ok()) {
+        const auto ec = grpc_status.error_code() == grpc::StatusCode::UNIMPLEMENTED
+                            ? ER_SERVICE_UNSUPPORTED
+                            : ER_INVALID_GRPCSTATUS;
+        return std::vector<ClientReplicationRpcResult>(hints.size(), {ec, false});
+    }
+    if (!response.has_header() || !response.header().has_status()) {
+        return std::vector<ClientReplicationRpcResult>(hints.size(), {ER_SERVICE_NO_STATUS, false});
+    }
+    if (response.header().status().code() != proto::meta::OK) {
+        const auto ec = ToClientError(response.header().status().code());
+        return std::vector<ClientReplicationRpcResult>(hints.size(), {ec, false});
+    }
+    if (response.results_size() != hints.size()) {
+        return std::vector<ClientReplicationRpcResult>(hints.size(), {ER_SERVICE_INTERNAL_ERROR, false});
+    }
+    std::vector<ClientReplicationRpcResult> results;
+    results.reserve(response.results_size());
+    for (const auto &result : response.results()) {
+        results.push_back({result.code() == proto::meta::OK ? ER_OK : ToClientError(result.code()),
+                           result.already_exists()});
+    }
+    return results;
 }
 
 ClientErrorCode GrpcStub::FinishWriteCache(const std::string &trace_id,

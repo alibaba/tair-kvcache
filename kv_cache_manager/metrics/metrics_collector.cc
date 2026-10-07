@@ -120,11 +120,19 @@ DEFINE_METRICS_NAME_FOR_META_INDEXER(cache_backend_delete_time_us);
 #define DEFINE_METRICS_NAME_FOR_AFFINITY(name) DEFINE_METRICS_NAME_(ServiceMetricsCollector, affinity, name)
 #define REGISTER_GAUGE_METRICS_FOR_AFFINITY(name)                                                                      \
     REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, affinity, name, metrics_tags_)
+#define REGISTER_COUNTER_METRICS_FOR_AFFINITY(name)                                                                    \
+    REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, affinity, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_AFFINITY(read_local_hit);
 DEFINE_METRICS_NAME_FOR_AFFINITY(read_remote_hit);
 DEFINE_METRICS_NAME_FOR_AFFINITY(hint_emitted);
 DEFINE_METRICS_NAME_FOR_AFFINITY(replication_write_count);
+DEFINE_METRICS_NAME_FOR_AFFINITY(replication_server_copy_success);
+DEFINE_METRICS_NAME_FOR_AFFINITY(replication_server_copy_failure);
+DEFINE_METRICS_NAME_FOR_AFFINITY(replication_allocation_failure);
+DEFINE_METRICS_NAME_FOR_AFFINITY(replication_copy_failure);
+DEFINE_METRICS_NAME_FOR_AFFINITY(replication_publish_failure);
+DEFINE_METRICS_NAME_FOR_AFFINITY(replication_server_copy_latency_us);
 
 ServiceMetricsCollector::ServiceMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry) noexcept
     : MetricsCollector(std::move(metrics_registry)) {}
@@ -198,10 +206,16 @@ bool ServiceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(cache_backend_delete_time_us);
 
     // affinity metrics
-    REGISTER_GAUGE_METRICS_FOR_AFFINITY(read_local_hit);
-    REGISTER_GAUGE_METRICS_FOR_AFFINITY(read_remote_hit);
-    REGISTER_GAUGE_METRICS_FOR_AFFINITY(hint_emitted);
-    REGISTER_GAUGE_METRICS_FOR_AFFINITY(replication_write_count);
+    REGISTER_COUNTER_METRICS_FOR_AFFINITY(read_local_hit);
+    REGISTER_COUNTER_METRICS_FOR_AFFINITY(read_remote_hit);
+    REGISTER_COUNTER_METRICS_FOR_AFFINITY(hint_emitted);
+    REGISTER_COUNTER_METRICS_FOR_AFFINITY(replication_write_count);
+    REGISTER_COUNTER_METRICS_FOR_AFFINITY(replication_server_copy_success);
+    REGISTER_COUNTER_METRICS_FOR_AFFINITY(replication_server_copy_failure);
+    REGISTER_COUNTER_METRICS_FOR_AFFINITY(replication_allocation_failure);
+    REGISTER_COUNTER_METRICS_FOR_AFFINITY(replication_copy_failure);
+    REGISTER_COUNTER_METRICS_FOR_AFFINITY(replication_publish_failure);
+    REGISTER_GAUGE_METRICS_FOR_AFFINITY(replication_server_copy_latency_us);
 
     return true;
 }

@@ -686,6 +686,7 @@ void MetaServiceImpl::GetCacheMeta(RequestContext *request_context,
     ErrorCode ec_info = get_cache_meta.first;
     CacheMetaVecWrapper cache_meta_vec_wrapper(std::move(get_cache_meta.second));
     CacheLocationViewVec cache_locations_res = cache_meta_vec_wrapper.cache_locations_view();
+    const auto &replica_locations_res = cache_meta_vec_wrapper.replica_locations();
     std::vector<std::string> metas_res = cache_meta_vec_wrapper.metas();
 
     if (ec_info != EC_OK) {
@@ -697,6 +698,12 @@ void MetaServiceImpl::GetCacheMeta(RequestContext *request_context,
         for (const auto &cache_location : cache_locations_res) {
             auto *location_meta = response->add_locations();
             ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
+        }
+        for (const auto &replicas : replica_locations_res) {
+            auto *replicas_proto = response->add_replica_locations();
+            for (const auto &replica : replicas.cache_locations_view()) {
+                ProtoConvert::CacheLocationViewToProto(replica, replicas_proto->add_locations());
+            }
         }
         for (const auto &meta : metas_res) {
             response->add_metas(meta);
@@ -838,29 +845,59 @@ void MetaServiceImpl::ReplicateCache(RequestContext *request_context,
     API_CALL_GUARD("ReplicateCache", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
-    if (request->instance_id().empty() || request->target_node_id().empty() ||
-        request->source_specs().empty()) {
+    const bool is_batch = request->items_size() > 0;
+    if (request->instance_id().empty() ||
+        (!is_batch && (request->target_node_id().empty() || request->source_specs().empty()))) {
         status->set_code(proto::meta::INVALID_ARGUMENT);
         status->set_message("instance_id, target_node_id and source_specs are required");
         request_context->set_status_code(status->code());
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
     }
-    ReplicationHint hint;
-    hint.block_key = request->block_key();
-    hint.target_node_id = request->target_node_id();
-    hint.source_specs.reserve(request->source_specs_size());
-    for (const auto &source : request->source_specs()) {
-        hint.source_specs.push_back({source.spec_name(), source.uri()});
+    std::vector<ReplicationHint> hints;
+    hints.reserve(is_batch ? request->items_size() : 1);
+    auto append_hint = [&](int64_t block_key,
+                           const std::string &target_node_id,
+                           const auto &source_specs) {
+        ReplicationHint hint;
+        hint.block_key = block_key;
+        hint.target_node_id = target_node_id;
+        hint.source_specs.reserve(source_specs.size());
+        for (const auto &source : source_specs) {
+            hint.source_specs.push_back({source.spec_name(), source.uri()});
+        }
+        hints.push_back(std::move(hint));
+    };
+    if (is_batch) {
+        for (const auto &item : request->items()) {
+            append_hint(item.block_key(), item.target_node_id(), item.source_specs());
+        }
+    } else {
+        append_hint(request->block_key(), request->target_node_id(), request->source_specs());
     }
     const int64_t timeout_seconds = request->write_timeout_seconds() > 0
                                         ? request->write_timeout_seconds()
                                         : 60;
-    auto [ec, already_exists] =
-        cache_manager_->ReplicateCache(request_context, request->instance_id(), hint, timeout_seconds);
-    status->set_code(ec == EC_OK ? proto::meta::OK : ToMetaPbError(ec));
-    status->set_message(ec == EC_OK ? "Cache replicated successfully" : "Failed to replicate cache");
-    response->set_already_exists(already_exists);
+    const auto results =
+        cache_manager_->ReplicateCaches(request_context, request->instance_id(), hints, timeout_seconds);
+    if (results.size() != hints.size()) {
+        status->set_code(proto::meta::INTERNAL_ERROR);
+        status->set_message("Replication result count mismatch");
+        request_context->set_status_code(status->code());
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    for (const auto &[ec, already_exists] : results) {
+        auto *result = response->add_results();
+        result->set_code(ec == EC_OK ? proto::meta::OK : ToMetaPbError(ec));
+        result->set_already_exists(already_exists);
+    }
+    const auto [first_ec, first_already_exists] = results.front();
+    response->set_already_exists(first_already_exists);
+    status->set_code(is_batch ? proto::meta::OK
+                              : (first_ec == EC_OK ? proto::meta::OK : ToMetaPbError(first_ec)));
+    status->set_message(is_batch || first_ec == EC_OK ? "Cache replication request processed"
+                                                       : "Failed to replicate cache");
     request_context->set_status_code(status->code());
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }

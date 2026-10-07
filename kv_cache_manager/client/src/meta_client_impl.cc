@@ -210,6 +210,18 @@ ClientErrorCode MetaClientImpl::ReplicateCache(const std::string &trace_id,
     const std::string &instance_id = CHECK_INSTANCE_STUB();
     return stub_->ReplicateCache(trace_id, instance_id, hint, write_timeout_seconds);
 }
+
+std::vector<ClientReplicationRpcResult>
+MetaClientImpl::ReplicateCaches(const std::string &trace_id,
+                                const std::vector<ClientReplicationHint> &hints,
+                                int32_t write_timeout_seconds) {
+    const std::string &instance_id = GetInstanceId();
+    if (instance_id.empty() || stub_ == nullptr) {
+        return std::vector<ClientReplicationRpcResult>(
+            hints.size(), {ER_CLIENT_NOT_EXISTS, false});
+    }
+    return stub_->ReplicateCaches(trace_id, instance_id, hints, write_timeout_seconds);
+}
 ClientErrorCode MetaClientImpl::FinishWrite(const std::string &trace_id,
                                             const std::string &write_session_id,
                                             const BlockMask &success_block,
