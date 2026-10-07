@@ -84,6 +84,13 @@ TEST_F(RequestContextTest, IsReplicationDefaultAndSetter) {
     EXPECT_FALSE(rc.is_replication());
 }
 
+TEST_F(RequestContextTest, ReplicationTargetDefaultsEmptyAndRoundTrips) {
+    RequestContext rc("trace_replication_target");
+    EXPECT_TRUE(rc.replication_target_node_id().empty());
+    rc.set_replication_target_node_id("storage-node-7");
+    EXPECT_EQ("storage-node-7", rc.replication_target_node_id());
+}
+
 // caller_supernode_id defaults to empty; setter round-trips
 TEST_F(RequestContextTest, CallerSupernodeIdDefaultAndSetter) {
     RequestContext rc("trace_supernode");

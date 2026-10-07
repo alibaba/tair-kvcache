@@ -125,7 +125,8 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
         resp = self._call("RegisterInstance", RegisterInstanceRequest, data)
         self.assertEqual(resp["header"]["status"]["code"], "OK", resp)
 
-    def _start_write(self, block_keys, caller_node_id=None, is_replication=False, instance_id=INSTANCE_ID):
+    def _start_write(self, block_keys, caller_node_id=None, is_replication=False,
+                     replication_target_node_id=None, instance_id=INSTANCE_ID):
         start_data = {
             "trace_id": TRACE_ID,
             "instance_id": instance_id,
@@ -136,6 +137,8 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
         }
         if caller_node_id:
             start_data["caller"] = {"node_id": caller_node_id}
+        if replication_target_node_id:
+            start_data["replication_target_node_id"] = replication_target_node_id
         resp = self._call("StartWriteCache", StartWriteCacheRequest, start_data)
         return resp
 
@@ -275,10 +278,7 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
         self._finish_write(session_id, 1)
 
     def test_strict_write_remote_caller_fails(self):
-        """Strict write (is_replication=true) with on_miss=abort strategy and a
-        caller whose node_id does NOT match any backend node should fail —
-        the pipeline aborts (no preferred nodes), so the backend receives an
-        empty preferred list under strict mode and returns EC_ERROR."""
+        """A strict replication write to a node the backend cannot serve fails."""
         # Use on_miss=abort so that prefer_local aborts when caller is remote.
         abort_strategy = json.dumps({
             "type": "local_replica",
@@ -302,6 +302,7 @@ class AffinityReplicationTest(TestBase, unittest.TestCase):
             [BLOCK_KEY + 200],
             caller_node_id=REMOTE_CALLER_NODE_ID,
             is_replication=True,
+            replication_target_node_id=REMOTE_CALLER_NODE_ID,
         )
         status_code = resp["header"]["status"]["code"]
         self.assertNotEqual(

@@ -45,6 +45,9 @@ public:
     CachedJsonResponse StartWriteCache(coro_http::coro_http_connection *http_conn,
                                        proto::meta::StartWriteCacheRequest *request,
                                        proto::meta::StartWriteCacheResponse *response);
+    CachedJsonResponse ReplicateCache(coro_http::coro_http_connection *http_conn,
+                                      proto::meta::ReplicateCacheRequest *request,
+                                      proto::meta::ReplicateCacheResponse *response);
 
     CachedJsonResponse FinishWriteCache(coro_http::coro_http_connection *http_conn,
                                         proto::meta::FinishWriteCacheRequest *request,

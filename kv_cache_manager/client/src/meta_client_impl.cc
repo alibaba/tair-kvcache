@@ -187,6 +187,29 @@ MetaClientImpl::StartWrite(const std::string &trace_id,
                                   CurrentCallerNode(),
                                   is_replication);
 }
+
+std::pair<ClientErrorCode, WriteLocation>
+MetaClientImpl::StartReplicationWrite(const std::string &trace_id,
+                                      const std::vector<int64_t> &keys,
+                                      const std::vector<std::string> &location_spec_group_names,
+                                      int64_t write_timeout_seconds,
+                                      const std::string &target_node_id) {
+    const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
+    return stub_->StartReplicationWriteCache(trace_id,
+                                             instance_id,
+                                             keys,
+                                             location_spec_group_names,
+                                             write_timeout_seconds,
+                                             CurrentCallerNode(),
+                                             target_node_id);
+}
+
+ClientErrorCode MetaClientImpl::ReplicateCache(const std::string &trace_id,
+                                               const ClientReplicationHint &hint,
+                                               int32_t write_timeout_seconds) {
+    const std::string &instance_id = CHECK_INSTANCE_STUB();
+    return stub_->ReplicateCache(trace_id, instance_id, hint, write_timeout_seconds);
+}
 ClientErrorCode MetaClientImpl::FinishWrite(const std::string &trace_id,
                                             const std::string &write_session_id,
                                             const BlockMask &success_block,

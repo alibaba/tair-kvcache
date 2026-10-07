@@ -1242,6 +1242,10 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                               int64_t write_timeout_seconds,
                               int32_t min_replica_count) {
     SPAN_TRACER(request_context);
+    if (request_context->is_replication() && request_context->replication_target_node_id().empty()) {
+        request_context->error_tracer()->AddErrorMsg("replication_target_node_id is required for replication writes");
+        return std::make_pair(EC_BADARGS, StartWriteCacheInfo{});
+    }
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     if (!location_spec_group_names.empty()) {
@@ -1375,6 +1379,102 @@ CacheManager::StartWriteCache(RequestContext *request_context,
             StartWriteCacheInfo(std::move(write_session_id),
                                 std::move(block_mask),
                                 CacheLocationViewVecWrapper(std::move(new_locations)))};
+}
+
+std::pair<ErrorCode, bool> CacheManager::ReplicateCache(RequestContext *request_context,
+                                                        const std::string &instance_id,
+                                                        const ReplicationHint &hint,
+                                                        int64_t write_timeout_seconds) {
+    if (hint.target_node_id.empty() || hint.source_specs.empty()) return {EC_BADARGS, false};
+    request_context->set_is_replication(true);
+    request_context->set_replication_target_node_id(hint.target_node_id);
+    auto [start_ec, write_info] = StartWriteCache(request_context,
+                                                  instance_id,
+                                                  {hint.block_key},
+                                                  {},
+                                                  {},
+                                                  write_timeout_seconds,
+                                                  1);
+    if (start_ec != EC_OK) return {start_ec, false};
+
+    const auto &session_id = write_info.write_session_id();
+    const auto &locations = write_info.locations().cache_locations_view();
+    auto finish = [&](bool success) {
+        return FinishWriteCache(request_context,
+                                instance_id,
+                                session_id,
+                                static_cast<BlockMaskOffset>(success ? 1 : 0));
+    };
+    if (locations.empty()) {
+        const auto finish_ec = finish(false);
+        return {finish_ec, finish_ec == EC_OK};
+    }
+    if (locations.size() != 1 || locations.front().location_specs().empty()) {
+        static_cast<void>(finish(false));
+        return {EC_ERROR, false};
+    }
+
+    std::unordered_map<std::string, std::string> sources;
+    for (const auto &source : hint.source_specs) {
+        if (source.uri.empty() || !sources.emplace(source.spec_name, source.uri).second) {
+            static_cast<void>(finish(false));
+            return {EC_BADARGS, false};
+        }
+    }
+    const auto &dest_specs = locations.front().location_specs();
+    if (sources.size() == 1 && sources.begin()->first.empty() && dest_specs.size() == 1) {
+        auto uri = std::move(sources.begin()->second);
+        sources.clear();
+        sources.emplace(dest_specs.front().name(), std::move(uri));
+    }
+    if (sources.size() != dest_specs.size()) {
+        static_cast<void>(finish(false));
+        return {EC_BADARGS, false};
+    }
+
+    std::vector<DataStorageUri> source_uris;
+    std::vector<DataStorageUri> destination_uris;
+    std::string storage_name;
+    source_uris.reserve(dest_specs.size());
+    destination_uris.reserve(dest_specs.size());
+    for (const auto &dest : dest_specs) {
+        const auto source = sources.find(dest.name());
+        if (source == sources.end()) {
+            static_cast<void>(finish(false));
+            return {EC_BADARGS, false};
+        }
+        DataStorageUri src_uri(source->second);
+        DataStorageUri dst_uri(dest.uri());
+        if (!src_uri.Valid() || !dst_uri.Valid() || src_uri.GetHostName().empty() ||
+            src_uri.GetHostName() != dst_uri.GetHostName() ||
+            (!storage_name.empty() && storage_name != dst_uri.GetHostName())) {
+            static_cast<void>(finish(false));
+            return {EC_BADARGS, false};
+        }
+        storage_name = dst_uri.GetHostName();
+        source_uris.push_back(std::move(src_uri));
+        destination_uris.push_back(std::move(dst_uri));
+    }
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    if (!data_storage_manager) {
+        static_cast<void>(finish(false));
+        return {EC_NOENT, false};
+    }
+    const auto copy_results =
+        data_storage_manager->Copy(request_context, storage_name, source_uris, destination_uris);
+    ErrorCode copy_ec = copy_results.size() == source_uris.size() ? EC_OK : EC_ERROR;
+    for (const auto ec : copy_results) {
+        if (ec != EC_OK) {
+            copy_ec = ec;
+            break;
+        }
+    }
+    if (copy_ec != EC_OK) {
+        const auto abort_ec = finish(false);
+        if (abort_ec != EC_OK) return {abort_ec, false};
+        return {copy_ec, false};
+    }
+    return {finish(true), false};
 }
 
 void CacheManager::RollbackAddLocations(RequestContext *request_context,
@@ -1926,12 +2026,12 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
     const bool is_replication = request_context->is_replication();
-    const CallerNode &caller_node = request_context->caller_node();
-    auto existsOnCallerNode =
-        [&caller_node, &check_loc_data_exist, &instance_info, &location_spec_group_names](
+    const std::string &replication_target_node_id = request_context->replication_target_node_id();
+    auto existsOnReplicationTarget =
+        [&replication_target_node_id, &check_loc_data_exist, &instance_info, &location_spec_group_names](
             size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
         out_prune_loc_ids.clear();
-        if (caller_node.node_id.empty()) {
+        if (replication_target_node_id.empty()) {
             return false;
         }
 
@@ -1953,7 +2053,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
             }
         }
 
-        // Collect spec names that already exist on the caller node.
+        // Collect spec names that already exist on the explicit target node.
         std::set<std::string> local_specs;
         for (const auto &kv : m) {
             if (!kv.second) {
@@ -1967,7 +2067,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
                 continue;
             }
             for (const auto &spec : kv.second->location_specs()) {
-                if (spec.node_id() == caller_node.node_id) {
+                if (spec.node_id() == replication_target_node_id) {
                     local_specs.insert(spec.name());
                 }
             }
@@ -2002,7 +2102,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     auto existsForWrite =
         [&](size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
         if (is_replication) {
-            return existsOnCallerNode(i, m, out_prune_loc_ids);
+            return existsOnReplicationTarget(i, m, out_prune_loc_ids);
         }
         const auto *spec_names = requestedSpecNames(i);
         if (spec_names == nullptr) {
@@ -2317,13 +2417,7 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
         }
     }
     const bool strict = request_context->is_replication();
-    if (strict) {
-        const auto &caller = request_context->caller_node_id();
-        write_hints.preferred_node_ids.erase(
-            std::remove_if(write_hints.preferred_node_ids.begin(), write_hints.preferred_node_ids.end(),
-                           [&](const auto &node) { return caller.empty() || node != caller; }),
-            write_hints.preferred_node_ids.end());
-    }
+    if (strict) write_hints.preferred_node_ids = {request_context->replication_target_node_id()};
     std::vector<LocationDescriptor> results = data_storage_manager->Create(
         request_context, unique_name, merged_block_keys, common_size, write_hints, strict, []() { /* do nothing */ });
 
@@ -2412,13 +2506,7 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
             }
         }
         const bool strict = request_context->is_replication();
-    if (strict) {
-        const auto &caller = request_context->caller_node_id();
-        write_hints.preferred_node_ids.erase(
-            std::remove_if(write_hints.preferred_node_ids.begin(), write_hints.preferred_node_ids.end(),
-                           [&](const auto &node) { return caller.empty() || node != caller; }),
-            write_hints.preferred_node_ids.end());
-    }
+        if (strict) write_hints.preferred_node_ids = {request_context->replication_target_node_id()};
         std::vector<LocationDescriptor> results = data_storage_manager->Create(
             request_context, unique_name, block_keys, spec_info.size(), write_hints, strict, []() { /* do nothing */ });
 

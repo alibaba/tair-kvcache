@@ -32,6 +32,22 @@ public:
                const std::vector<std::string> &location_spec_group_names,
                int64_t write_timeout_seconds,
                bool is_replication = false) = 0;
+    // Explicit-target form used by replication writes. The default preserves
+    // source compatibility for test/custom clients while MetaClientImpl sends
+    // the target through the wire protocol.
+    virtual std::pair<ClientErrorCode, WriteLocation>
+    StartReplicationWrite(const std::string &trace_id,
+                          const std::vector<int64_t> &keys,
+                          const std::vector<std::string> &location_spec_group_names,
+                          int64_t write_timeout_seconds,
+                          const std::string &target_node_id) {
+        return StartWrite(trace_id, keys, {}, location_spec_group_names, write_timeout_seconds, true);
+    }
+    virtual ClientErrorCode ReplicateCache(const std::string &trace_id,
+                                           const ClientReplicationHint &hint,
+                                           int32_t write_timeout_seconds) {
+        return ER_SERVICE_UNSUPPORTED;
+    }
     virtual ClientErrorCode FinishWrite(const std::string &trace_id,
                                         const std::string &write_session_id,
                                         const BlockMask &success_block,

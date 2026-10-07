@@ -183,6 +183,12 @@ public:
                                                               const std::vector<std::string> &location_spec_group_names,
                                                               int64_t write_timeout_seconds,
                                                               int32_t min_replica_count = 1);
+    // Allocate a replica on hint.target_node_id, copy every named spec through
+    // the storage backend, and publish the location only after all copies pass.
+    std::pair<ErrorCode, bool> ReplicateCache(RequestContext *request_context,
+                                              const std::string &instance_id,
+                                              const ReplicationHint &hint,
+                                              int64_t write_timeout_seconds);
     ErrorCode
     FinishWriteCache(RequestContext *request_context,
                      const std::string &instance_id,

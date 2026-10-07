@@ -62,6 +62,19 @@ public:
                                                               int64_t write_timeout_seconds,
                                                               const ClientCallerNode &caller,
                                                               bool is_replication = false) override;
+    std::pair<ClientErrorCode, WriteLocation>
+    StartReplicationWriteCache(const std::string &trace_id,
+                               const std::string &instance_id,
+                               const KeyVector &keys,
+                               const std::vector<std::string> &location_spec_group_names,
+                               int64_t write_timeout_seconds,
+                               const ClientCallerNode &caller,
+                               const std::string &target_node_id) override;
+
+    ClientErrorCode ReplicateCache(const std::string &trace_id,
+                                   const std::string &instance_id,
+                                   const ClientReplicationHint &hint,
+                                   int32_t write_timeout_seconds) override;
 
     ClientErrorCode FinishWriteCache(const std::string &trace_id,
                                      const std::string &instance_id,

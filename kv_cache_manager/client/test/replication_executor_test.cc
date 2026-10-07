@@ -45,6 +45,10 @@ public:
                 FinishWrite,
                 (const std::string &, const std::string &, const BlockMask &, const Locations &),
                 (override));
+    MOCK_METHOD(ClientErrorCode,
+                ReplicateCache,
+                (const std::string &, const ClientReplicationHint &, int32_t),
+                (override));
     MOCK_METHOD(
         (std::pair<ClientErrorCode, Metas>),
         MatchMeta,
@@ -110,7 +114,10 @@ MakeHint(int64_t block_key, const std::string &target, const std::string &source
 
 class ReplicationExecutorTest : public TESTBASE {
 protected:
-    void SetUp() override { LoggerBroker::InitLoggerForClientOnce(); }
+    void SetUp() override {
+        LoggerBroker::InitLoggerForClientOnce();
+        ON_CALL(mock_meta_, ReplicateCache(_, _, _)).WillByDefault(Return(ER_SERVICE_UNSUPPORTED));
+    }
 
     std::unique_ptr<ReplicationExecutor> MakeExecutor(int num_workers = 1) {
         return std::make_unique<ReplicationExecutor>(&mock_meta_, &mock_transfer_, num_workers);
@@ -275,6 +282,37 @@ TEST_F(ReplicationExecutorTest, SubmitWithDataDedupReleasesBuffer) {
     EXPECT_EQ(release1.load(), 1);
 }
 
+TEST_F(ReplicationExecutorTest, SubmitWithDataUpgradesQueuedAutomaticCopy) {
+    std::atomic<int> starts{0};
+    std::atomic<bool> first_entered{false};
+    std::promise<void> proceed;
+    auto proceed_future = proceed.get_future().share();
+    EXPECT_CALL(mock_meta_, ReplicateCache(_, _, _)).Times(0);
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).WillRepeatedly([&](auto...) {
+        if (starts.fetch_add(1) == 0) {
+            first_entered.store(true);
+            proceed_future.wait();
+        }
+        return std::make_pair(ER_OK, MakeEmptyWriteLocation());
+    });
+    EXPECT_CALL(mock_meta_, FinishWrite(_, _, _, _)).WillRepeatedly(Return(ER_OK));
+
+    auto executor = MakeExecutor(1);
+    char first[16]{}, second[16]{};
+    std::atomic<int> first_release{0}, second_release{0};
+    executor->SubmitWithData(MakeHint(10, "nodeA"), first, sizeof(first), [&] { ++first_release; });
+    while (!first_entered.load()) std::this_thread::yield();
+    executor->Submit({MakeHint(11, "nodeA")});
+    executor->SubmitWithData(MakeHint(11, "nodeA"), second, sizeof(second), [&] { ++second_release; });
+    EXPECT_EQ(0, second_release.load());
+
+    proceed.set_value();
+    executor->Shutdown();
+    EXPECT_EQ(2, starts.load());
+    EXPECT_EQ(1, first_release.load());
+    EXPECT_EQ(1, second_release.load());
+}
+
 TEST_F(ReplicationExecutorTest, SubmitWithDataQueueDepthLimitReleasesBuffer) {
     std::atomic<bool> entered{false};
     std::promise<void> proceed;
@@ -405,6 +443,31 @@ TEST_F(ReplicationExecutorTest, ExecuteWriteSaveFailsReleasesBuffer) {
 // ===========================================================================
 // End-to-end: ExecuteHintAsync (async path)
 // ===========================================================================
+
+TEST_F(ReplicationExecutorTest, AutomaticHintUsesServerSideCopyWithoutClientTransfer) {
+    EXPECT_CALL(mock_meta_, ReplicateCache(_, _, 60)).WillOnce(Return(ER_OK));
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).Times(0);
+    EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(0);
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).Times(0);
+
+    auto executor = MakeExecutor(1);
+    executor->Submit({MakeHint(98, "nodeB", "rdma://src/block/0?size=1024")});
+    executor->Shutdown();
+    EXPECT_EQ(1u, executor->GetStats().succeeded);
+    EXPECT_EQ(1024u, executor->GetStats().copied_bytes);
+}
+
+TEST_F(ReplicationExecutorTest, ServerSideCopyFailureDoesNotIssueSecondCopy) {
+    EXPECT_CALL(mock_meta_, ReplicateCache(_, _, 60)).WillOnce(Return(ER_SERVICE_INTERNAL_ERROR));
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).Times(0);
+    EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(0);
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).Times(0);
+
+    auto executor = MakeExecutor(1);
+    executor->Submit({MakeHint(97, "nodeB", "rdma://src/block/0?size=1024")});
+    executor->Shutdown();
+    EXPECT_EQ(1u, executor->GetStats().failed);
+}
 
 TEST_F(ReplicationExecutorTest, ExecuteHintAsyncEndToEnd) {
     EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true))
@@ -876,7 +939,8 @@ TEST_F(ReplicationExecutorTest, TransferAbortAndReleaseExceptionsDoNotTerminateW
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _))
         .WillOnce(testing::Throw(std::runtime_error("transfer failure")));
     EXPECT_CALL(mock_meta_, FinishWrite(_, _, _, _))
-        .WillOnce(testing::Throw(std::runtime_error("abort failure")));
+        .WillOnce(testing::Throw(std::runtime_error("abort failure")))
+        .WillOnce(Return(ER_OK));
     char data[16]{};
     std::atomic<int> releases{0};
     auto executor = MakeExecutor();

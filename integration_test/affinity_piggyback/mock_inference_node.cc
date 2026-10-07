@@ -98,7 +98,8 @@ std::string BuildClientConfig(const Config &cfg) {
     return "{\"instance_group\":" + Quote(cfg.instance_group) +
            ",\"instance_id\":" + Quote(cfg.instance_id) +
            ",\"address\":[" + Quote(cfg.kvcm_endpoint) +
-           "],\"block_size\":128,\"location_spec_infos\":{\"spec_0\":" + std::to_string(cfg.block_size) +
+           "],\"block_size\":" + std::to_string(cfg.block_size) +
+           ",\"location_spec_infos\":{\"spec_0\":" + std::to_string(cfg.block_size) +
            "},\"meta_channel_config\":{\"call_timeout\":10000}," +
            "\"sdk_config\":{\"timeout_config\":{\"get_timeout_ms\":10000,\"put_timeout_ms\":10000}}," +
            "\"model_deployment\":{\"model_name\":\"mock_model\",\"dtype\":\"FP16\"," +
