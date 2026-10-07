@@ -217,6 +217,8 @@ void Write(ManagerClient &client, const Config &cfg, int64_t key, bool abort) {
 struct ReplicationBuffer {
     std::vector<char> data;
     std::atomic<bool> released{false};
+    std::atomic<bool> completed{false};
+    ReplicationResult result;
 };
 
 void Replicate(ManagerClient &client, const Config &cfg, int64_t key) {
@@ -254,9 +256,16 @@ void Replicate(ManagerClient &client, const Config &cfg, int64_t key) {
     if (cfg.role == "reader_piggyback") {
         owned->data = std::move(source_data);
         // Capture ownership: even a timeout must not free memory still used by the executor.
-        client.ReplicateWithData(hint, owned->data.data(), owned->data.size(), [owned]() {
-            owned->released.store(true, std::memory_order_release);
-        });
+        const bool admitted = client.ReplicateWithDataAsync(
+            hint,
+            owned->data.data(),
+            owned->data.size(),
+            [owned]() { owned->released.store(true, std::memory_order_release); },
+            [owned](const ReplicationResult &result) {
+                owned->result = result;
+                owned->completed.store(true, std::memory_order_release);
+            });
+        Require(admitted, "piggyback replication was not admitted");
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(cfg.wait_seconds);
     bool local = false;
@@ -267,7 +276,9 @@ void Replicate(ManagerClient &client, const Config &cfg, int64_t key) {
             const auto &uri = SingleUri(locations);
             if (NodeId(uri) == cfg.expected_node_id) {
                 Require(uri != source, "replica URI must differ from source");
-                if (cfg.role != "reader_piggyback" || owned->released.load(std::memory_order_acquire)) {
+                if (cfg.role != "reader_piggyback" ||
+                    (owned->released.load(std::memory_order_acquire) &&
+                     owned->completed.load(std::memory_order_acquire))) {
                     local = true;
                     break;
                 }
@@ -276,6 +287,22 @@ void Replicate(ManagerClient &client, const Config &cfg, int64_t key) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     Require(local, "replica not published on expected local Provider before deadline");
+    if (cfg.role == "reader_piggyback") {
+        Require(owned->completed.load(std::memory_order_acquire), "replication result callback was not invoked");
+        Require(owned->result.block_key == key && owned->result.target_node_id == caller,
+                "replication result key/target mismatch");
+        Require(owned->result.error_code == ER_OK &&
+                    (owned->result.outcome == ReplicationOutcome::SUCCEEDED ||
+                     owned->result.outcome == ReplicationOutcome::ALREADY_EXISTS),
+                "replication result reported failure: " + std::to_string(owned->result.error_code));
+        Require(owned->result.copied_bytes == static_cast<uint64_t>(cfg.block_size),
+                "replication result copied byte count mismatch");
+        printf("REPLICATION_RESULT key=%lld outcome=%d bytes=%llu latency_us=%llu\n",
+               static_cast<long long>(key),
+               static_cast<int>(owned->result.outcome),
+               static_cast<unsigned long long>(owned->result.copied_bytes),
+               static_cast<unsigned long long>(owned->result.latency_us));
+    }
     CheckLocal(client, cfg, key);
 }
 
