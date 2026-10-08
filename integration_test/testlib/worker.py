@@ -135,8 +135,26 @@ class Worker(ModuleBase):
             return False
         logging.info('finish start [%s] worker at:[%s] with cmd:[%s]', self.worker_name, self.env.workdir, start_cmd)
 
-        time.sleep(2)
-        return True
+        return self._wait_ready()
+
+    def _wait_ready(self, timeout=30):
+        """Daemon launch does not mean its RPC and HTTP listeners are ready."""
+        deadline = time.monotonic() + timeout
+        ports = {self.env.rpc_port, self.env.http_port, self.env.admin_http_port}
+        while time.monotonic() < deadline:
+            ready = True
+            for port in ports:
+                try:
+                    with socket.create_connection((self.env.ip, port), timeout=0.2):
+                        pass
+                except OSError:
+                    ready = False
+                    break
+            if ready:
+                return True
+            time.sleep(0.05)
+        logging.error("worker %s listeners not ready after %ss: %s", self.worker_id, timeout, ports)
+        return False
 
     def start_worker_get_pid(self, **kwargs) -> Optional[int]:
         if not os.path.exists(self.env.workdir):
