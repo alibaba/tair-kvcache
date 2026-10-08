@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -16,15 +17,14 @@ public:
     virtual ~ManagerClient() = default;
     static std::unique_ptr<ManagerClient> Create(const std::string &config, InitParams &init_params);
 
-    // for meta client
-    virtual std::pair<ClientErrorCode, Locations>
-    MatchLocation(const std::string &trace_id,
-                  QueryType query_type,
-                  const std::vector<int64_t> &keys,
-                  const std::vector<int64_t> &tokens,
-                  const BlockMask &block_mask,
-                  int32_t sw_size,
-                  const std::vector<std::string> &location_spec_names) = 0;
+    virtual std::pair<ClientErrorCode, Locations> MatchLocation(const std::string &trace_id,
+                                                                QueryType query_type,
+                                                                const std::vector<int64_t> &keys,
+                                                                const std::vector<int64_t> &tokens,
+                                                                const BlockMask &block_mask,
+                                                                int32_t sw_size,
+                                                                const std::vector<std::string> &location_spec_names,
+                                                                std::vector<ClientReplicationHint> &out_hints) = 0;
 
     virtual std::pair<ClientErrorCode, WriteLocation>
     StartWrite(const std::string &trace_id,
@@ -48,10 +48,40 @@ public:
                                         const std::vector<int64_t> &tokens,
                                         const BlockMask &block_mask) = 0;
 
+    virtual void ReplicateWithData(const ClientReplicationHint &hint,
+                                   const void *data,
+                                   size_t size,
+                                   std::function<void()> release_fn) = 0;
+
+    virtual bool ReplicateWithDataAsync(const ClientReplicationHint &hint,
+                                        const void *data,
+                                        size_t size,
+                                        std::function<void()> release_fn,
+                                        ReplicationResultCallback result_fn) {
+        ReplicateWithData(hint, data, size, std::move(release_fn));
+        return true;
+    }
+
     // for transfer client
     virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) = 0;
     virtual std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                const BlockBuffers &block_buffers) = 0;
+
+    // True means queued. Caller must leave all supplied bytes immutable until
+    // its ownership lease is released. Missing specs are loaded from hint sources.
+    virtual bool ReplicateWithBuffers(const ClientReplicationHint &hint,
+                                       std::vector<ClientReplicationBuffer> buffers) { return false; }
+
+    virtual bool ReplicateWithBuffersAsync(const ClientReplicationHint &hint,
+                                            std::vector<ClientReplicationBuffer> buffers,
+                                            ReplicationResultCallback result_fn) {
+        return ReplicateWithBuffers(hint, std::move(buffers));
+    }
+
+    virtual ReplicationStats GetReplicationStats() const { return {}; }
+
+    // diagnostic: expose caller node id for debugging affinity issues
+    virtual std::string GetCallerNode() const = 0;
 
 protected:
     ManagerClient() = default;

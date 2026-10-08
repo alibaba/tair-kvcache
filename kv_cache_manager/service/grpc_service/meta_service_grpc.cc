@@ -77,6 +77,13 @@ grpc::Status MetaServiceGRpc::StartWriteCache(grpc::ServerContext *context,
     meta_service_impl_->StartWriteCache(request_context, request, response);
     return grpc::Status::OK;
 }
+grpc::Status MetaServiceGRpc::ReplicateCache(grpc::ServerContext *context,
+                                             const proto::meta::ReplicateCacheRequest *request,
+                                             proto::meta::ReplicateCacheResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_GRPC(ReplicateCache, grpc::Status::OK);
+    meta_service_impl_->ReplicateCache(request_context, request, response);
+    return grpc::Status::OK;
+}
 grpc::Status MetaServiceGRpc::FinishWriteCache(grpc::ServerContext *context,
                                                const proto::meta::FinishWriteCacheRequest *request,
                                                proto::meta::CommonResponse *response) {

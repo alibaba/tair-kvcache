@@ -56,6 +56,8 @@ public:
                                                                                 const std::string &name);
     std::pair<ErrorCode, std::vector<std::shared_ptr<const InstanceGroup>>>
     ListInstanceGroup(RequestContext *request_context) const; // list all the instance_groups
+    // affinity_strategy_json: 实例级 cache affinity 策略 JSON，空串表示未覆盖；
+    // 由 CacheAffinityManager 与 instance_group/process 级别一同选取生效项。
     ErrorCode RegisterInstance(RequestContext *request_context,
                                const std::string &instance_group,
                                const std::string &instance_id,
@@ -63,7 +65,8 @@ public:
                                const std::vector<LocationSpecInfo> &location_spec_infos,
                                const ModelDeployment &model_deployment,
                                const std::vector<LocationSpecGroup> &location_spec_groups = {},
-                               int32_t default_query_type = 0);
+                               int32_t default_query_type = 0,
+                               const std::string &affinity_strategy_json = {});
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
@@ -86,6 +89,9 @@ public:
 
     std::shared_ptr<DataStorageManager> data_storage_manager() const;
     std::string GetInstanceGroupName(const std::string &instance_id) const;
+
+    // Returns the per-group affinity strategy JSON (empty if not configured).
+    std::string GetGroupAffinityStrategyJson(RequestContext *request_context, const std::string &group_name);
 
 private:
     ErrorCode LoadAndSave(const std::string &key, const std::string &id, const Jsonizable *jsonizable);

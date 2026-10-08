@@ -49,6 +49,10 @@ public:
                          const proto::meta::StartWriteCacheRequest *request,
                          proto::meta::StartWriteCacheResponse *response);
 
+    void ReplicateCache(RequestContext *request_context,
+                        const proto::meta::ReplicateCacheRequest *request,
+                        proto::meta::ReplicateCacheResponse *response);
+
     void FinishWriteCache(RequestContext *request_context,
                           const proto::meta::FinishWriteCacheRequest *request,
                           proto::meta::CommonResponse *response);

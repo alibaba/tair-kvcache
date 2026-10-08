@@ -1173,7 +1173,7 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
         [&](int64_t block_key, const std::vector<std::string> &uris, CacheLocationStatus status = CLS_SERVING) {
             std::vector<LocationSpec> specs;
             for (size_t i = 0; i < uris.size(); ++i) {
-                specs.emplace_back("tp" + std::to_string(i), uris[i]);
+                specs.emplace_back("tp" + std::to_string(i), uris[i], "delete_node");
             }
             const auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
                 DataStorageType::DATA_STORAGE_TYPE_DUMMY, specs.size(), specs);
@@ -1210,6 +1210,8 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     };
     const auto mixed_result = executor.Submit(mixed_request).get();
     ASSERT_EQ(EC_OK, mixed_result.status) << mixed_result.error_message;
+    EXPECT_EQ((std::map<std::string, int64_t>{{"delete_node", 1}}), mixed_result.deleted_bytes_by_node);
+    EXPECT_GT(mixed_result.physical_delete_started_at_us, 0);
     ASSERT_EQ(1u, backend->delete_batches.size());
     ASSERT_EQ(1u, backend->delete_batches.front().size());
     EXPECT_EQ(existing_uri, backend->delete_batches.front().front().ToUriString());
@@ -1229,6 +1231,7 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
                                     })
                                     .get();
     EXPECT_EQ(EC_OK, missing_result.status);
+    EXPECT_TRUE(missing_result.deleted_bytes_by_node.empty());
     EXPECT_EQ(1u, backend->delete_batches.size());
     EXPECT_TRUE(physical_delete_warnings.empty());
     expect_location_deleted(missing_block_key);
@@ -1301,6 +1304,7 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
                                   })
                                   .get();
     EXPECT_EQ(EC_OK, noent_result.status) << noent_result.error_message;
+    EXPECT_TRUE(noent_result.deleted_bytes_by_node.empty());
     EXPECT_FALSE(noent_result.error_logged);
     EXPECT_TRUE(physical_delete_warnings.empty());
     expect_location_deleted(noent_block_key);
@@ -1314,7 +1318,9 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     other_backend->delete_result = EC_ERROR;
     data_storage_manager_->storage_map_["gc_other_backend"] = other_backend;
     const int64_t error_block_key = 712;
-    const std::string error_location_id = add_location(error_block_key, {error_uri, timeout_uri, other_uri});
+    backend->delete_results_by_uri[existing_uri] = EC_OK;
+    const std::string error_location_id = add_location(error_block_key, {error_uri, timeout_uri, other_uri,
+                                                                       existing_uri, existing_uri});
     const auto error_result = executor
                                   .Submit(CacheLocationDelRequest{
                                       .instance_id = kTestInstanceName,
@@ -1323,6 +1329,8 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
                                   })
                                   .get();
     EXPECT_EQ(EC_PARTIAL_OK, error_result.status);
+    // Partial success counts only successful physical bytes, once per URI.
+    EXPECT_EQ((std::map<std::string, int64_t>{{"delete_node", 1}}), error_result.deleted_bytes_by_node);
     EXPECT_TRUE(error_result.error_logged);
     EXPECT_NE(std::string::npos, error_result.error_message.find("failed[2]"));
     EXPECT_THAT(physical_delete_warnings,

@@ -19,6 +19,10 @@ flowchart TD
     config --> data_storage["data_storage（存储后端）"]
     data_storage --> common["common"]
 
+    service --> affinity["affinity（节点策略/指标/热度）"]
+    manager --> affinity
+    affinity --> data_storage
+
     manager --> event["event"]
     manager --> metrics["metrics"]
     service --> metrics

@@ -40,6 +40,7 @@
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/migration_manager.h"
@@ -866,7 +867,6 @@ public:
         stub_.reset(ADDR(MetaIndexer, GetProperties));
         stub_.reset(ADDR(MetaIndexer, RandomSample));
         stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
-        stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
         stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
         stub_.reset(ADDR(MetaIndexer, GetKeyCount));
         stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
@@ -8371,4 +8371,107 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDWritingColdDoesNotProtectHot) {
 
     stub_.reset(ADDR(RegistryManager, GetInstanceGroup));
     g_cold_ig.reset();
+}
+
+TEST_F(CacheReclaimerTest, NodePressureKeepsHealthyReplicaAndHonorsPendingLimits) {
+    auto pressured = std::make_shared<CacheLocation>(
+        "pressured", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1,
+        std::vector<LocationSpec>{LocationSpec("test_spec", "nfs://store/a?size=64", "nodeA")});
+    auto healthy = std::make_shared<CacheLocation>(
+        "healthy", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1,
+        std::vector<LocationSpec>{LocationSpec("test_spec", "nfs://store/b?size=64", "nodeB")});
+    batch_get_loc_out_maps = {{{"pressured", pressured}, {"healthy", healthy}}};
+    CacheReclaimer::BytesByStorageType bytes{};
+    CacheReclaimer::CountsByStorageType counts{};
+    uint64_t deleted_keys = 0;
+    CacheReclaimer::AgeStats ages;
+    std::vector<std::vector<std::string>> ids;
+    std::unordered_map<std::string, int64_t> node_bytes;
+    const auto filter = [&]() {
+        return cache_reclaimer_->FilterLocIDImpl(
+            request_context_.get(), instance_infos.front(), {42}, CacheReclaimer::WaterLevelExceed{},
+            ids, bytes, counts, deleted_keys, ages, false, false, {"nodeA"}, &node_bytes);
+    };
+    ASSERT_TRUE(filter());
+    ASSERT_EQ((std::vector<std::vector<std::string>>{{"pressured"}}), ids);
+    EXPECT_EQ(0u, deleted_keys); // The healthy replica keeps the key alive.
+    EXPECT_EQ(64, node_bytes["nodeA"]);
+    EXPECT_EQ(0u, node_bytes.count("nodeB"));
+
+    cache_reclaimer_->pending_locations_.insert({instance_infos.front()->instance_id(), 42, "pressured"});
+    ASSERT_TRUE(filter());
+    ASSERT_EQ(1u, ids.size());
+    EXPECT_TRUE(ids.front().empty());
+    EXPECT_TRUE(node_bytes.empty());
+    cache_reclaimer_->pending_locations_.clear();
+
+    CacheReclaimerAsyncDeleteConfig config;
+    config.pending_bytes_limit = 32;
+    ReplaceReclaimer(config);
+    ASSERT_TRUE(filter());
+    ASSERT_EQ(1u, ids.size());
+    EXPECT_TRUE(ids.front().empty());
+    EXPECT_TRUE(node_bytes.empty());
+}
+
+TEST_F(CacheReclaimerTest, NodePressureHonorsEachInstanceOverrideAndContinuesAfterNoop) {
+    cache_reclaimer_->job_state_flag_ = true;
+    auto affinity = std::make_shared<CacheAffinityManager>();
+    ASSERT_TRUE(affinity->LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})"));
+    affinity->UpsertNodeMetrics({"nodeA", "nodeA", DataStorageType{}, 80, 0.92, 0, 0, 1});
+    cache_reclaimer_->Stop();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
+        10, 100, 10, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr,
+        CacheReclaimerAsyncDeleteConfig{}, nullptr, CacheReclaimerGroupLruConfig{}, affinity);
+    cache_reclaimer_->job_state_flag_ = true;
+    auto disabled = InstanceInfoFactory();
+    disabled->set_instance_id("disabled");
+    disabled->set_affinity_strategy_json(R"({"type":"noop"})");
+    auto enabled = InstanceInfoFactory();
+    enabled->set_instance_id("enabled");
+    enabled->set_affinity_strategy_json(R"({"type":"local_replica"})");
+    instance_infos = {disabled, enabled};
+    auto group = InstanceGroupFactory();
+    group->set_affinity_strategy_json(R"({"type":"noop"})");
+    static std::vector<std::string> reclaimed;
+    reclaimed.clear();
+    stub_.set(ADDR(CacheReclaimer, ReclaimByNode),
+              +[](void *, const std::shared_ptr<RequestContext> &, const std::shared_ptr<const InstanceInfo> &instance,
+                  const std::unordered_set<std::string> &nodes, int32_t) -> bool {
+                  reclaimed.push_back(instance->instance_id());
+                  EXPECT_EQ((std::unordered_set<std::string>{"nodeA"}), nodes);
+                  return true;
+              });
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.made_progress);
+    EXPECT_EQ((std::vector<std::string>{"enabled"}), reclaimed);
+    stub_.reset(ADDR(CacheReclaimer, ReclaimByNode));
+}
+
+TEST_F(CacheReclaimerTest, NodeCreditWaitsForTerminalPhysicalResultsIncludingLatePartialSuccess) {
+    auto affinity = std::make_shared<CacheAffinityManager>();
+    ASSERT_TRUE(affinity->LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})"));
+    affinity->UpsertNodeMetrics({"node", "node", DataStorageType{}, 80, 0.92, 0, 0, 1});
+    cache_reclaimer_->Stop();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
+        10, 100, 10, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr,
+        CacheReclaimerAsyncDeleteConfig{}, nullptr, CacheReclaimerGroupLruConfig{}, affinity);
+    const auto now = std::chrono::steady_clock::now();
+    std::promise<PlanExecuteResult> promise;
+    cache_reclaimer_->delete_handlers_.emplace_front(
+        request_context_, "test_instance", "test_instance_group", 1, 1,
+        std::vector<CacheReclaimer::PendingLocationKey>{}, CacheReclaimer::BytesByStorageType{},
+        CacheReclaimer::CountsByStorageType{}, 0, now, now, promise.get_future());
+    cache_reclaimer_->AddDeleteHandlerState(cache_reclaimer_->delete_handlers_.front());
+    cache_reclaimer_->HandleDelRes(); // Timed out admission is not freed capacity.
+    EXPECT_EQ(1u, affinity->ResolveEviction({}).size());
+    PlanExecuteResult partial{EC_PARTIAL_OK, "one spec failed"};
+    partial.deleted_bytes_by_node["node"] = 250;
+    partial.physical_delete_started_at_us = 2;
+    promise.set_value(partial);
+    cache_reclaimer_->HandleDelRes();
+    EXPECT_TRUE(affinity->ResolveEviction({}).empty());
+    EXPECT_TRUE(cache_reclaimer_->delete_handlers_.empty());
+    cache_reclaimer_->HandleDelRes(); // A consumed future cannot credit twice.
+    EXPECT_TRUE(affinity->ResolveEviction({}).empty());
 }

@@ -118,6 +118,13 @@ private:
     } while (0)
 #endif
 
+#ifndef KVCM_METRICS_COLLECTOR_ADD_METRICS
+#define KVCM_METRICS_COLLECTOR_ADD_METRICS(ptr, group, name, value)                                                    \
+    do {                                                                                                               \
+        if (ptr) ADD_METRICS_(ptr, group, name, value);                                                                \
+    } while (0)
+#endif
+
 class MetricsCollector {
 public:
     MetricsCollector() = delete;
@@ -214,6 +221,7 @@ public:                                                                         
     DECLARE_METRICS_NAME_(group, name);                                                                                \
     DEFINE_COPY_METRICS_COUNTER_(group, name)                                                                          \
     DEFINE_SET_METRICS_COUNTER_(group, name)                                                                           \
+    DEFINE_ADD_METRICS_COUNTER_(group, name)                                                                           \
     DEFINE_GET_METRICS_COUNTER_(group, name)                                                                           \
                                                                                                                        \
 private:                                                                                                               \
@@ -312,6 +320,18 @@ class ServiceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(meta_indexer, cache_backend_put_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, cache_backend_upsert_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, cache_backend_delete_time_us)
+
+    // affinity metrics
+    KVCM_COUNTER_METRICS(affinity, read_local_hit)
+    KVCM_COUNTER_METRICS(affinity, read_remote_hit)
+    KVCM_COUNTER_METRICS(affinity, hint_emitted)
+    KVCM_COUNTER_METRICS(affinity, replication_write_count)
+    KVCM_COUNTER_METRICS(affinity, replication_server_copy_success)
+    KVCM_COUNTER_METRICS(affinity, replication_server_copy_failure)
+    KVCM_COUNTER_METRICS(affinity, replication_allocation_failure)
+    KVCM_COUNTER_METRICS(affinity, replication_copy_failure)
+    KVCM_COUNTER_METRICS(affinity, replication_publish_failure)
+    KVCM_GAUGE_METRICS(affinity, replication_server_copy_latency_us)
 
 public:
     ServiceMetricsCollector() = delete;

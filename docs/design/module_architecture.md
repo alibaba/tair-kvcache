@@ -18,7 +18,7 @@
 | **HiSim** | `hisim/` | 独立的 LLM 推理仿真系统，通过回放 trace 预测 TTFT/TPOT/吞吐等指标，不依赖 Manager 运行时。 |
 | **Optimizer** | `kv_cache_manager/optimizer/` | 缓存仿真与优化：既支持离线回放 KVCache 访问 trace，也提供在线 TraceQuery 服务。完整 optimizer 用于策略/容量分析；LiteHit 用最小状态精确计算多容量 full-attention LRU 命中率。 |
 
-KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理（查询、写入、容量管理），推理引擎通过 Client/Connector 接入。
+KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理（查询、写入、容量管理），推理引擎通过 Client/Connector 接入。缓存节点的放置、读副本选择、复制与节点回收见[缓存亲和性整体设计](../design-cache-affinity-v1.md)；这部分不负责推理请求到 worker 的路由。
 
 ---
 
@@ -34,6 +34,7 @@ KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理�
 | **service** | `service/` | 接入层。`Server` 在启动时创建并串联几乎所有组件（整个服务的装配入口）；`*ServiceImpl`（meta/admin/debug）实现与传输无关的业务入口，`grpc_service/`、`http_service/` 是对应传输适配层，`util/` 负责 proto↔领域对象转换、调用守卫与访问日志。 |
 | **manager** | `manager/` | 编排层与业务核心。`CacheManager` 是中心门面，对外提供注册实例、查询/写入/删除 Cache、上报事件、容量回收、后台 GC 与分层迁移等能力，并协调 `MetaSearcher`、`WriteLocationManager`、`DataStorageSelector`、`CacheReclaimer`、`CacheGarbageCollector`、`MigrationManager`、`SchedulePlanExecutor` 等子组件。 |
 | **meta** | `meta/` | 元数据平面。`MetaIndexerManager` 按 `instance_id` 管理 `MetaIndexer`，维护 cache key → `CacheLocation` 的索引；元数据后端可插拔；`meta_search_cache` 做查询缓存。`CacheLocation` 是被广泛共享的核心类型。 |
+| **affinity** | `affinity/` | 节点亲和性策略、节点指标、热度和复制提示抑制。服务启动时装配；manager 在写、读和节点回收时调用，数据复制由 CacheManager 或客户端执行器编排。 |
 | **config** | `config/` | 配置模型 + 注册表 + HA 协调层。定义各类配置对象；`RegistryManager` 持久化实例注册信息；`CoordinationBackend` + `LeaderElector` 提供一主多备的分布式选主。 |
 | **data_storage** | `data_storage/` | 可插拔的 KVCache 数据存储后端。`DataStorageManager` 管理后端集合，`DataStorageBackend` 抽象存储介质，`DataStorageUri` 统一位置描述。 |
 
@@ -55,6 +56,8 @@ KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理�
 
 > **三个面的界定**：本文档区分三个面——**元数据面**指 MetaService 的接口（`GetCacheLocation`/`StartWriteCache`/`FinishWriteCache`/`GetCacheMeta`/`RemoveCache`/`RegisterInstance` 等）及 client 侧调用这些接口的逻辑，是推理引擎读写 KVCache 的热路径；**数据面**指 KVCache 数据在引擎显存/内存与存储后端之间的实际搬运（`TransferClient`，不经过 KVCM）；**管控面**仅指 AdminService 的接口（Storage 增删改、Instance Group 管理、账号、配置快照、运维监控、Leader 运维等），供运维/管理工具使用，不在推理引擎的读写热路径上。
 
+亲和性复制还支持 `MetaClient → ReplicateCache → CacheManager → Backend::Copy`：KVCM 编排分配、复制控制请求和元数据发布，KV 数据由支持 Copy 的存储节点直接传输；不支持时 SDK 可回退 TransferClient。它没有改变“KV 数据不经过 KVCM 服务进程”的边界。
+
 client 覆盖元数据面与数据面两条链路，其对应关系如下（管控面由 AdminService 承载，不属于 client SDK 的常规链路）：
 
 | 链路 | 组件 | 依赖 | 对应 KVCM 服务端接口 |
@@ -67,7 +70,7 @@ client 覆盖元数据面与数据面两条链路，其对应关系如下（管�
 1. **C++ `MetaClient`（gRPC）**：走 `internal/stub:grpc_stub`，供 C++ 侧与经 pybind 的引擎使用。
 2. **Python `KvCacheManagerClient`（HTTP）**：位于 `py_connector/common/manager_client.py`，用 `requests` 覆盖 MetaService 的全部 `/api/*` 端点（`registerInstance`/`getInstanceInfo`/`getCacheMeta`/`getCacheLocation`/`getCacheLocationLen`/`getCacheLocationsByBackend`/`startWriteCache`/`finishWriteCache`/`removeCache`/`trimCache`/`getClusterInfo`/`reportEvent`）。`manager_uri` 可直接使用 HTTP(S) 地址，也可使用通用服务发现 URL；启用 Leader 发现后，客户端以动态发现的 Manager 端点调用 `/api/getClusterInfo`，再根据 `leader_endpoint.meta_http_port` 直连 Leader，并处理 `SERVER_NOT_LEADER` 重试。普通 API 请求使用可配置的 `request_timeout_seconds`（默认 1 秒），Leader 查询保留独立的 5 秒超时。不同连接器按需选用其一。
 
-数据面则统一走 C++ `TransferClient`（经 pybind），与元数据面选哪条通路无关。
+引擎与存储之间的数据搬运走 C++ `TransferClient`（经 pybind），与元数据面选哪条通路无关；服务端编排的后端间 Copy 使用上述独立路径。
 
 client 通过 `InitParams.role_type` 区分角色：**SCHEDULER**（调度节点）只创建 `MetaClient` 做元数据匹配与写地址申请；**WORKER**（推理节点）只创建 `TransferClient` 做数据搬运；**HYBRID** 两者都有。WORKER 的存储配置由 `MetaClient::GetStorageConfig()` 从 KVCM 下发获得，保证与服务端一致。
 
@@ -111,6 +114,7 @@ flowchart TD
 
     subgraph core["编排与业务核心"]
         manager["manager<br/>CacheManager + 子组件"]
+        affinity["affinity<br/>策略 / 指标 / 热度"]
     end
 
     subgraph dataplane["元数据 / 存储 / 配置"]
@@ -137,6 +141,9 @@ flowchart TD
     main --> service --> manager --> meta --> config --> data_storage --> common
 
     %% 通用支撑依赖
+    service --> affinity
+    manager --> affinity
+    affinity --> data_storage
     manager --> event
     manager --> metrics
     service --> metrics

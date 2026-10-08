@@ -84,6 +84,8 @@ public:
     // Default bucket boundaries (seconds) for revisit interval histogram.
     // 13 boundaries → 14 buckets including +Inf.
     static const std::vector<double> &GetDefaultRevisitIntervalBuckets();
+    bool IsAffinityEnabled() const { return affinity_enabled_; }
+    const std::string &GetAffinityStrategyFile() const { return affinity_strategy_file_; }
 
 private:
     void UpdateDefaultConfig();
@@ -140,6 +142,8 @@ private:
     std::string advertised_host_;
     std::string custom_info_;
     std::string revisit_interval_buckets_;
+    bool affinity_enabled_ = false;
+    std::string affinity_strategy_file_;
 
 private:
     using SettingFunction = std::function<bool(const std::string &, ServerConfig *config)>;

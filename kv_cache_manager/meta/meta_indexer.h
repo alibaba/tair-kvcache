@@ -191,6 +191,11 @@ public:
     // Directly constructed test/indexer instances without an executor retain
     // serial behavior.
     bool ParallelForQuery(std::size_t count, const QueryExecutor::RangeFunction &fn) const noexcept;
+    ErrorCode SampleReclaimKeys(RequestContext *request_context,
+                                const std::string &type,
+                                const std::unordered_set<std::string> &node_ids,
+                                const int64_t count,
+                                KeyVector &out_keys) const noexcept;
 
     void PersistMetaData() noexcept;
     size_t GetKeyCount() const noexcept;
@@ -206,6 +211,7 @@ public:
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
 
     // storage usage interfaces
+    std::mutex &LocationAdmissionMutex() { return location_admission_mutex_; }
     [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
     [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;
     void SetStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
@@ -298,6 +304,7 @@ private:
     size_t batch_key_size_ = MetaIndexerConfig::kDefaultBatchKeySize;
     std::string instance_id_;
     StorageUsageData storage_usage_data_;
+    std::mutex location_admission_mutex_;
 };
 
 } // namespace kv_cache_manager

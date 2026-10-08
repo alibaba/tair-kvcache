@@ -47,6 +47,10 @@ struct PlanExecuteResult {
     // True only when every failure in this result has already been logged.
     // Callers can retain result metrics without repeating the diagnostics.
     bool error_logged{false};
+    // Only EC_OK physical deletes contribute, never missing/failed/speculative
+    // deletes. The start timestamp fences against newer capacity samples.
+    std::map<std::string, int64_t> deleted_bytes_by_node;
+    int64_t physical_delete_started_at_us{0};
 };
 
 struct AsyncDeleteSubmitResult {
@@ -72,6 +76,7 @@ struct CacheLocationDelRequest {
     // skips these idempotently while still deleting any remaining specs in the
     // same Location.
     std::set<std::string> confirmed_missing_uris;
+    uint32_t min_retained_replicas{0};
 };
 
 struct EventReportMetadataDeleteTarget {
@@ -204,7 +209,7 @@ private:
                           const std::vector<std::vector<std::string>> *target_location_ids,
                           const std::vector<std::vector<std::string>> *expected_location_values,
                           std::chrono::microseconds delay,
-                          bool authoritative_read = false);
+                          bool authoritative_read = false, uint32_t min_retained_replicas = 0);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare,

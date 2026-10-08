@@ -72,7 +72,7 @@ kv_cache_manager::Locations GenLocations(
         locations.push_back({});
         locations.back().reserve(location_specs.size());
         for (const auto &location_spec : location_specs) {
-            locations.back().push_back({location_spec.name(), location_spec.uri()});
+            locations.back().push_back({location_spec.name(), location_spec.uri(), location_spec.node_id()});
         }
     }
     return locations;
@@ -313,13 +313,31 @@ std::pair<ClientErrorCode, Metas> GrpcStub::GetCacheMeta(const std::string &trac
     CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
     CHECK_COMMON_HEADER_WITH_TYPE(response);
     auto locations = GenLocations(response.locations());
+    std::vector<std::vector<Metas::Replica>> replicas;
+    replicas.reserve(response.replica_locations_size());
+    for (const auto &replica_group : response.replica_locations()) {
+        std::vector<Metas::Replica> group;
+        group.reserve(replica_group.locations_size());
+        for (const auto &replica : replica_group.locations()) {
+            Metas::Replica item;
+            item.location.reserve(replica.location_specs_size());
+            for (const auto &spec : replica.location_specs()) {
+                item.location.push_back({spec.name(), spec.uri(), spec.node_id()});
+            }
+            item.id = replica.id();
+            item.status = replica.status();
+            item.create_time = replica.create_time();
+            group.push_back(std::move(item));
+        }
+        replicas.push_back(std::move(group));
+    }
     std::vector<std::string> metas;
     std::for_each(
         response.metas().begin(), response.metas().end(), [&metas](const std::string &meta) { metas.push_back(meta); });
     KVCM_LOG_DEBUG("get cache meta success, locations: %s, metas: %s",
                    DebugStringUtil::ToString(locations).c_str(),
                    DebugStringUtil::ToString(metas).c_str());
-    return {ER_OK, {locations, metas}};
+    return {ER_OK, {std::move(locations), std::move(metas), std::move(replicas)}};
 }
 
 std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::string &trace_id,
@@ -329,7 +347,9 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
                                                                  const TokenIdsVector &tokens,
                                                                  const BlockMask &block_mask,
                                                                  int32_t sw_size,
-                                                                 const std::vector<std::string> &location_spec_names) {
+                                                                 const std::vector<std::string> &location_spec_names,
+                                                                 const ClientCallerNode &caller,
+                                                                 std::vector<ClientReplicationHint> &out_hints) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::GetCacheLocationRequest request;
     request.set_query_type(static_cast<proto::meta::QueryType>(query_type));
@@ -339,6 +359,12 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
     for (const auto &name : location_spec_names) {
         request.add_location_spec_names(name);
     }
+    if (!caller.node_id.empty() || !caller.supernode_id.empty()) {
+        auto *proto_caller = request.mutable_caller();
+        proto_caller->set_node_id(caller.node_id);
+        proto_caller->set_supernode_id(caller.supernode_id);
+        proto_caller->set_replication_capabilities(caller.replication_capabilities);
+    }
 
     ProtoConvert::BlockMaskToProto(block_mask, request.mutable_block_mask());
     grpc::ClientContext context;
@@ -347,7 +373,23 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
     CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
     CHECK_COMMON_HEADER_WITH_TYPE(response);
     auto locations = GenLocations(response.locations());
-    KVCM_LOG_DEBUG("get cache location success, locations: %s", DebugStringUtil::ToString(locations).c_str());
+    out_hints.clear();
+    out_hints.reserve(response.hints_size());
+    for (const auto &h : response.hints()) {
+        if (h.source_specs_size() > 1 &&
+            !(response.replication_capabilities() & caller.replication_capabilities & kClientReplicationNamedSpecs)) continue;
+        ClientReplicationHint hint;
+        hint.block_key = h.block_key();
+        hint.source_uri = h.source_uri();
+        hint.target_node_id = h.target_node_id();
+        for (const auto &source : h.source_specs()) {
+            hint.source_specs.push_back({source.spec_name(), source.uri()});
+        }
+        out_hints.push_back(std::move(hint));
+    }
+    KVCM_LOG_DEBUG("get cache location success, locations: %s, hints: %d",
+                   DebugStringUtil::ToString(locations).c_str(),
+                   response.hints_size());
     return {ER_OK, locations};
 }
 
@@ -378,7 +420,9 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
                           const KeyVector &keys,
                           const TokenIdsVector &tokens,
                           const std::vector<std::string> &location_spec_group_names,
-                          int64_t write_timeout_seconds) {
+                          int64_t write_timeout_seconds,
+                          const ClientCallerNode &caller,
+                          bool is_replication) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::StartWriteCacheRequest request;
     SetKeysAndTokens(request, trace_id, instance_id, keys, tokens);
@@ -387,6 +431,13 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
         request.add_location_spec_group_names(name);
     }
     request.set_write_timeout_seconds(write_timeout_seconds);
+    if (!caller.node_id.empty() || !caller.supernode_id.empty()) {
+        auto *proto_caller = request.mutable_caller();
+        proto_caller->set_node_id(caller.node_id);
+        proto_caller->set_supernode_id(caller.supernode_id);
+        proto_caller->set_replication_capabilities(caller.replication_capabilities);
+    }
+    request.set_is_replication(is_replication);
     grpc::ClientContext context;
     proto::meta::StartWriteCacheResponse response;
     auto grpc_status = stub->StartWriteCache(&context, request, &response);
@@ -401,6 +452,121 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
                    DebugStringUtil::ToString(block_mask).c_str(),
                    DebugStringUtil::ToString(locations).c_str());
     return {ER_OK, {write_session_id, block_mask, locations}};
+}
+
+std::pair<ClientErrorCode, WriteLocation>
+GrpcStub::StartReplicationWriteCache(const std::string &trace_id,
+                                     const std::string &instance_id,
+                                     const KeyVector &keys,
+                                     const std::vector<std::string> &location_spec_group_names,
+                                     int64_t write_timeout_seconds,
+                                     const ClientCallerNode &caller,
+                                     const std::string &target_node_id) {
+    auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
+    proto::meta::StartWriteCacheRequest request;
+    SetKeysAndTokens(request, trace_id, instance_id, keys, {});
+    for (const auto &name : location_spec_group_names) request.add_location_spec_group_names(name);
+    request.set_write_timeout_seconds(write_timeout_seconds);
+    auto *proto_caller = request.mutable_caller();
+    proto_caller->set_node_id(caller.node_id);
+    proto_caller->set_supernode_id(caller.supernode_id);
+    proto_caller->set_replication_capabilities(caller.replication_capabilities);
+    request.set_is_replication(true);
+    request.set_replication_target_node_id(target_node_id);
+    grpc::ClientContext context;
+    proto::meta::StartWriteCacheResponse response;
+    const auto grpc_status = stub->StartWriteCache(&context, request, &response);
+    CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
+    CHECK_COMMON_HEADER_WITH_TYPE(response);
+    BlockMask block_mask;
+    ProtoConvert::BlockMaskFromProto(&response.block_mask(), block_mask);
+    return {ER_OK, {response.write_session_id(), block_mask, GenLocations(response.locations())}};
+}
+
+ClientErrorCode GrpcStub::ReplicateCache(const std::string &trace_id,
+                                         const std::string &instance_id,
+                                         const ClientReplicationHint &hint,
+                                         int32_t write_timeout_seconds) {
+    auto stub = GET_AND_CHECK_STUB();
+    proto::meta::ReplicateCacheRequest request;
+    SetCommonInfo(request, trace_id, instance_id);
+    request.set_block_key(hint.block_key);
+    request.set_target_node_id(hint.target_node_id);
+    request.set_write_timeout_seconds(write_timeout_seconds);
+    for (const auto &source : hint.source_specs) {
+        auto *proto_source = request.add_source_specs();
+        proto_source->set_spec_name(source.spec_name);
+        proto_source->set_uri(source.uri);
+    }
+    if (hint.source_specs.empty() && !hint.source_uri.empty()) {
+        auto *proto_source = request.add_source_specs();
+        proto_source->set_uri(hint.source_uri);
+    }
+    grpc::ClientContext context;
+    proto::meta::ReplicateCacheResponse response;
+    const auto grpc_status = stub->ReplicateCache(&context, request, &response);
+    if (!grpc_status.ok()) {
+        PREFIX_LOG(WARN, "ReplicateCache grpc error [%s], code [%d]",
+                   grpc_status.error_message().c_str(), grpc_status.error_code());
+        return grpc_status.error_code() == grpc::StatusCode::UNIMPLEMENTED
+                   ? ER_SERVICE_UNSUPPORTED
+                   : ER_INVALID_GRPCSTATUS;
+    }
+    CHECK_COMMON_HEADER(response);
+    return ER_OK;
+}
+
+std::vector<ClientReplicationRpcResult>
+GrpcStub::ReplicateCaches(const std::string &trace_id,
+                          const std::string &instance_id,
+                          const std::vector<ClientReplicationHint> &hints,
+                          int32_t write_timeout_seconds) {
+    auto stub = GetStub();
+    if (stub == nullptr) {
+        return std::vector<ClientReplicationRpcResult>(hints.size(), {ER_INVALID_STUB, false});
+    }
+    proto::meta::ReplicateCacheRequest request;
+    SetCommonInfo(request, trace_id, instance_id);
+    request.set_write_timeout_seconds(write_timeout_seconds);
+    for (const auto &hint : hints) {
+        auto *item = request.add_items();
+        item->set_block_key(hint.block_key);
+        item->set_target_node_id(hint.target_node_id);
+        for (const auto &source : hint.source_specs) {
+            auto *proto_source = item->add_source_specs();
+            proto_source->set_spec_name(source.spec_name);
+            proto_source->set_uri(source.uri);
+        }
+        if (hint.source_specs.empty() && !hint.source_uri.empty()) {
+            item->add_source_specs()->set_uri(hint.source_uri);
+        }
+    }
+    grpc::ClientContext context;
+    proto::meta::ReplicateCacheResponse response;
+    const auto grpc_status = stub->ReplicateCache(&context, request, &response);
+    if (!grpc_status.ok()) {
+        const auto ec = grpc_status.error_code() == grpc::StatusCode::UNIMPLEMENTED
+                            ? ER_SERVICE_UNSUPPORTED
+                            : ER_INVALID_GRPCSTATUS;
+        return std::vector<ClientReplicationRpcResult>(hints.size(), {ec, false});
+    }
+    if (!response.has_header() || !response.header().has_status()) {
+        return std::vector<ClientReplicationRpcResult>(hints.size(), {ER_SERVICE_NO_STATUS, false});
+    }
+    if (response.header().status().code() != proto::meta::OK) {
+        const auto ec = ToClientError(response.header().status().code());
+        return std::vector<ClientReplicationRpcResult>(hints.size(), {ec, false});
+    }
+    if (response.results_size() != hints.size()) {
+        return std::vector<ClientReplicationRpcResult>(hints.size(), {ER_SERVICE_INTERNAL_ERROR, false});
+    }
+    std::vector<ClientReplicationRpcResult> results;
+    results.reserve(response.results_size());
+    for (const auto &result : response.results()) {
+        results.push_back({result.code() == proto::meta::OK ? ER_OK : ToClientError(result.code()),
+                           result.already_exists()});
+    }
+    return results;
 }
 
 ClientErrorCode GrpcStub::FinishWriteCache(const std::string &trace_id,

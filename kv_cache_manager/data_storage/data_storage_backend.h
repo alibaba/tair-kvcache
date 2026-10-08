@@ -6,12 +6,23 @@
 #include <string>
 #include <utility>
 
+#include "kv_cache_manager/affinity/node_metrics.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/common_define.h"
+#include "kv_cache_manager/data_storage/write_hints.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
+
+// Result of a backend Create call. `node_id` is the storage node that
+// actually served the allocation; empty string means the backend does not
+// report per-node placement.
+struct LocationDescriptor {
+    ErrorCode ec = EC_OK;
+    DataStorageUri uri;
+    std::string node_id;
+};
 
 class DataStorageBackend {
 public:
@@ -46,6 +57,42 @@ public:
                                                                      size_t size_per_key,
                                                                      const std::string &trace_id,
                                                                      std::function<void()> cb) = 0;
+
+    // Affinity-aware Create.
+    //
+    // `hints` carries the preferred placement; `strict` controls how the
+    // backend treats those hints:
+    //   strict=true  -> backend MUST allocate on hints.preferred_node_ids only
+    //                   and must surface an error for keys it cannot place
+    //                   there (no silent fallback to other nodes).
+    //   strict=false -> hints are advisory; backend may fall back to any node
+    //                   when the preferred ones are unavailable.
+    // Legacy backends keep ordinary Create behavior through this adapter.
+    // They must reject strict placement unless they explicitly implement it.
+    // SupportsAffinity() lets the manager reject strict calls before allocation.
+    virtual std::vector<LocationDescriptor> CreateWithHints(const std::vector<std::string> &keys,
+                                                            size_t size_per_key,
+                                                            const WriteHints &hints,
+                                                            bool strict,
+                                                            const std::string &trace_id,
+                                                            std::function<void()> cb) {
+        if (strict) {
+            return std::vector<LocationDescriptor>(keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}, ""});
+        }
+        auto legacy = Create(keys, size_per_key, trace_id, std::move(cb));
+        std::vector<LocationDescriptor> result;
+        result.reserve(legacy.size());
+        for (auto &item : legacy) {
+            result.push_back({item.first, std::move(item.second), ""});
+        }
+        return result;
+    }
+
+    virtual bool SupportsAffinity() const { return false; }
+
+    // Returns per-node capacity metrics. Default returns empty (backend does
+    // not report metrics); missing metrics are treated as permissive.
+    virtual std::vector<NodeMetrics> SnapshotPerNodeMetrics() const { return {}; }
     virtual std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &trace_id, std::function<void()> cb) = 0;
     virtual std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) = 0;

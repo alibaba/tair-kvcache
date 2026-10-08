@@ -303,7 +303,8 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                             const std::vector<LocationSpecInfo> &location_spec_infos,
                                             const ModelDeployment &model_deployment,
                                             const std::vector<LocationSpecGroup> &location_spec_groups,
-                                            int32_t default_query_type) {
+                                            int32_t default_query_type,
+                                            const std::string &affinity_strategy_json) {
     const auto &trace_id = request_context->trace_id();
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto instance_group_iter = instance_group_configs_.find(instance_group);
@@ -341,6 +342,7 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                                         model_deployment,
                                                         location_spec_groups,
                                                         default_query_type);
+    instance_info->set_affinity_strategy_json(affinity_strategy_json);
     // save the instance info to storage backend in such a way that one key corresponds to one instance
     auto ec = LoadAndSave(instance_id, instance_id, instance_info.get());
     if (ec != EC_OK) {
@@ -393,6 +395,18 @@ RegistryManager::GetInstanceGroup(RequestContext *request_context, const std::st
     }
     std::shared_ptr<const InstanceGroup> instance_group = iter->second;
     return {EC_OK, instance_group};
+}
+
+std::string RegistryManager::GetGroupAffinityStrategyJson(RequestContext *request_context,
+                                                          const std::string &group_name) {
+    if (group_name.empty()) {
+        return {};
+    }
+    auto [ec, group] = GetInstanceGroup(request_context, group_name);
+    if (ec == EC_OK && group) {
+        return group->affinity_strategy_json();
+    }
+    return {};
 }
 
 InstanceInfoConstPtr RegistryManager::GetInstanceInfo(RequestContext *request_context, const std::string &instance_id) {

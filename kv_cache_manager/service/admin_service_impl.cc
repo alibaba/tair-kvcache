@@ -502,6 +502,7 @@ void AdminServiceImpl::GetCacheMeta(RequestContext *request_context,
     ErrorCode ec_info = get_cache_meta.first;
     CacheMetaVecWrapper cache_meta_vec_wrapper(std::move(get_cache_meta.second));
     CacheLocationViewVec cache_locations_res = cache_meta_vec_wrapper.cache_locations_view();
+    const auto &replica_locations_res = cache_meta_vec_wrapper.replica_locations();
     std::vector<std::string> metas_res = cache_meta_vec_wrapper.metas();
 
     if (ec_info != EC_OK) {
@@ -514,6 +515,12 @@ void AdminServiceImpl::GetCacheMeta(RequestContext *request_context,
         for (const auto &cache_location : cache_locations_res) {
             auto *location_meta = response->add_locations();
             ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
+        }
+        for (const auto &replicas : replica_locations_res) {
+            auto *replicas_proto = response->add_replica_locations();
+            for (const auto &replica : replicas.cache_locations_view()) {
+                ProtoConvert::CacheLocationViewToProto(replica, replicas_proto->add_locations());
+            }
         }
         for (const auto &meta : metas_res) {
             response->add_metas(meta);
@@ -673,7 +680,8 @@ void AdminServiceImpl::RegisterInstance(RequestContext *request_context,
                                                          model_deployment_req,
                                                          location_spec_groups,
                                                          static_cast<CacheManager::QueryType>(
-                                                             request->default_query_type()));
+                                                             request->default_query_type()),
+                                                         request->affinity_strategy_json());
     if (ec_info != EC_OK) {
         status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());

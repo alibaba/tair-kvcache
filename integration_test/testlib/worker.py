@@ -6,6 +6,8 @@ import signal
 import sys
 import time
 import socket
+import http.client
+import json
 
 from typing import List, Optional
 from integration_test.testlib.ranged_port_util import RangedPortUtil
@@ -135,8 +137,43 @@ class Worker(ModuleBase):
             return False
         logging.info('finish start [%s] worker at:[%s] with cmd:[%s]', self.worker_name, self.env.workdir, start_cmd)
 
-        time.sleep(2)
-        return True
+        return self._wait_ready()
+
+    def _wait_ready(self, timeout=30):
+        """Wait for listeners and leader discovery before issuing test writes."""
+        deadline = time.monotonic() + timeout
+        ports = {self.env.rpc_port, self.env.http_port, self.env.admin_http_port}
+        while time.monotonic() < deadline:
+            ready = True
+            for port in ports:
+                try:
+                    with socket.create_connection((self.env.ip, port), timeout=0.2):
+                        pass
+                except OSError:
+                    ready = False
+                    break
+            if ready and self._has_leader():
+                return True
+            time.sleep(0.05)
+        logging.error("worker %s listeners/leader not ready after %ss: %s", self.worker_id, timeout, ports)
+        return False
+
+    def _has_leader(self):
+        connection = http.client.HTTPConnection(self.env.ip, self.env.http_port, timeout=0.2)
+        try:
+            connection.request("POST", "/api/getClusterInfo", body='{"trace_id":"test-readiness"}',
+                               headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            info = json.loads(response.read())
+            # Followers in multi-worker tests may discover another leader;
+            # requiring every worker to become leader would deadlock startup.
+            return (response.status == 200 and
+                    info.get("header", {}).get("status", {}).get("code") == "OK" and
+                    bool(info.get("leader_node_id")))
+        except (OSError, http.client.HTTPException, ValueError):
+            return False
+        finally:
+            connection.close()
 
     def start_worker_get_pid(self, **kwargs) -> Optional[int]:
         if not os.path.exists(self.env.workdir):

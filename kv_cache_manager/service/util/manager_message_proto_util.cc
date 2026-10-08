@@ -409,6 +409,7 @@ void ProtoConvert::InstanceGroupToProto(const InstanceGroup &instance_group_info
         proto_instance_group->add_event_report_storage_candidates(candidate);
     }
     proto_instance_group->set_revisit_interval_buckets(instance_group_info.revisit_interval_buckets_raw());
+    proto_instance_group->set_affinity_strategy_json(instance_group_info.affinity_strategy_json());
 }
 void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *proto_instance_group,
                                           InstanceGroup &instance_group_info) {
@@ -452,6 +453,7 @@ void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *pro
         proto_instance_group->event_report_storage_candidates().end());
     instance_group_info.set_event_report_storage_candidates(event_report_storage_candidates);
     instance_group_info.set_revisit_interval_buckets(proto_instance_group->revisit_interval_buckets());
+    instance_group_info.set_affinity_strategy_json(proto_instance_group->affinity_strategy_json());
 }
 
 void ProtoConvert::AccountFromProto(const proto::admin::Account *proto_account, Account &account_info) {

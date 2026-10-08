@@ -13,6 +13,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include "kv_cache_manager/affinity/affinity_strategy.h"
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/standard_uri.h"
@@ -192,7 +194,13 @@ void MergeLocationSpecsByName(std::vector<LocationSpec> &merged_specs,
 CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
                                              CacheLocationMap &location_map,
                                              CheckLocDataExistFunc check_loc_data_exist,
-                                             std::vector<std::string> &out_prune_loc_ids) {
+                                             const CallerNode &caller,
+                                             CacheAffinityManager *affinity_manager,
+                                             int64_t block_key,
+                                             const AffinityResolveContext *resolve_ctx,
+                                             std::vector<std::string> &out_prune_loc_ids,
+                                             std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects,
+                                             int64_t prefix_position = -1) {
     // Filter valid locations into a shared map.
     CacheLocationMap valid_map;
     for (auto &[id, loc_ptr] : location_map) {
@@ -225,15 +233,52 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     // Collect all specs from every valid location that belongs to the same
     // storage backend as the winner, dedup by spec name.
     std::map<std::string, LocationSpec> merged_specs;
-    for (const auto &[id, loc_ptr] : valid_map) {
-        if (!loc_ptr || !policy->IsSameDataStorage(*loc_ptr, *winner)) {
-            continue;
+    if (affinity_manager != nullptr && resolve_ctx != nullptr) {
+        ReadRequest req;
+        req.block_key = block_key;
+        req.prefix_position = prefix_position;
+        req.winner_tier = winner.get();
+        for (const auto &[id, loc_ptr] : valid_map) {
+            if (!loc_ptr || !policy->IsSameDataStorage(*loc_ptr, *winner)) {
+                continue;
+            }
+            for (const auto &spec : loc_ptr->location_specs()) {
+                req.spec_candidates[spec.name()].push_back(&spec);
+            }
         }
-        for (const auto &spec : loc_ptr->location_specs()) {
-            merged_specs.try_emplace(spec.name(), spec);
+        ReadDecision dec = affinity_manager->ResolveRead(req, *resolve_ctx);
+        for (const auto &[name, candidates] : req.spec_candidates) {
+            if (candidates.empty()) {
+                continue;
+            }
+            auto pick_it = dec.picked_specs.find(name);
+            const LocationSpec *chosen = (pick_it != dec.picked_specs.end() && pick_it->second != nullptr)
+                                             ? pick_it->second
+                                             : candidates.front();
+            merged_specs.emplace(name, *chosen);
+        }
+        if (out_side_effects != nullptr && !dec.side_effects.empty()) {
+            out_side_effects->insert(out_side_effects->end(),
+                                     std::make_move_iterator(dec.side_effects.begin()),
+                                     std::make_move_iterator(dec.side_effects.end()));
+        }
+    } else {
+        for (const auto &[id, loc_ptr] : valid_map) {
+            if (!loc_ptr || !policy->IsSameDataStorage(*loc_ptr, *winner)) {
+                continue;
+            }
+            for (const auto &spec : loc_ptr->location_specs()) {
+                auto [it, inserted] = merged_specs.try_emplace(spec.name(), spec);
+                if (!inserted && !caller.node_id.empty()) {
+                    const bool incumbent_local = (it->second.node_id() == caller.node_id);
+                    const bool challenger_local = (spec.node_id() == caller.node_id);
+                    if (challenger_local && !incumbent_local) {
+                        it->second = spec;
+                    }
+                }
+            }
         }
     }
-
     if (merged_specs.empty()) {
         return std::make_shared<CacheLocation>();
     }
@@ -1400,10 +1445,14 @@ std::string MetaSearcher::BatchErrorCodeToStr(const std::vector<std::vector<Erro
     return result_stream.str();
 }
 
-ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_context,
-                                                    const KeyVector &keys,
-                                                    CacheLocationVector &out_locations,
-                                                    SelectLocationPolicy *policy) const {
+ErrorCode
+MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_context,
+                                          const KeyVector &keys,
+                                          CacheLocationVector &out_locations,
+                                          SelectLocationPolicy *policy,
+                                          const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                          const AffinityResolveContext *resolve_ctx,
+                                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const {
     out_locations.clear();
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -1427,8 +1476,15 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
             break;
         }
         std::vector<std::string> prune_loc_ids;
-        CacheLocationConstPtr merged =
-            SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
+        CacheLocationConstPtr merged = SelectAndMergeForMatch(policy,
+                                                              location_map,
+                                                              check_loc_data_exist_func_,
+                                                              request_context->caller_node(),
+                                                              affinity_manager.get(),
+                                                              keys[i],
+                                                              resolve_ctx,
+                                                              prune_loc_ids,
+                                                              &out_side_effects, static_cast<int64_t>(i));
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
@@ -1469,7 +1525,10 @@ ErrorCode MetaSearcher::PrefixMatch(RequestContext *request_context,
                                     const KeyVector &keys,
                                     const BlockMask &input_mask,
                                     CacheLocationVector &out_locations,
-                                    SelectLocationPolicy *policy) const {
+                                    SelectLocationPolicy *policy,
+                                    const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                    const AffinityResolveContext *resolve_ctx,
+                                    std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const {
     assert(policy != nullptr);
     SPAN_TRACER(request_context);
     KeyVector query_keys;
@@ -1485,7 +1544,8 @@ ErrorCode MetaSearcher::PrefixMatch(RequestContext *request_context,
     }
     // TODO: need to confirm shard lock range
     // TODO: use smaller batch if many prefix missed a lot
-    ErrorCode ec = PrefixMatchBestLocationImpl(request_context, query_keys, out_locations, policy);
+    ErrorCode ec = PrefixMatchBestLocationImpl(
+        request_context, query_keys, out_locations, policy, affinity_manager, resolve_ctx, out_side_effects);
     if (ec != EC_OK) {
         KVCM_LOG_DEBUG("PrefixMatchBestLocationImpl failed");
     }
@@ -1495,7 +1555,10 @@ ErrorCode MetaSearcher::PrefixMatch(RequestContext *request_context,
 ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
                                              const KeyVector &keys,
                                              CacheLocationVector &out_locations,
-                                             SelectLocationPolicy *policy) const {
+                                             SelectLocationPolicy *policy,
+                                             const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                             const AffinityResolveContext *resolve_ctx,
+                                             std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const {
     assert(policy != nullptr);
     SPAN_TRACER(request_context);
     out_locations.clear();
@@ -1523,8 +1586,15 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
             continue;
         }
         std::vector<std::string> prune_loc_ids;
-        CacheLocationConstPtr merged =
-            SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
+        CacheLocationConstPtr merged = SelectAndMergeForMatch(policy,
+                                                              location_map,
+                                                              check_loc_data_exist_func_,
+                                                              request_context->caller_node(),
+                                                              affinity_manager.get(),
+                                                              keys[i],
+                                                              resolve_ctx,
+                                                              prune_loc_ids,
+                                                              &out_side_effects);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
@@ -1756,11 +1826,15 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
     return has_error ? EC_ERROR : EC_OK;
 }
 
-ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_context,
-                                                    const KeyVector &keys,
-                                                    int32_t sw_size,
-                                                    CacheLocationVector &out_locations,
-                                                    SelectLocationPolicy *policy) const {
+ErrorCode
+MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_context,
+                                          const KeyVector &keys,
+                                          int32_t sw_size,
+                                          CacheLocationVector &out_locations,
+                                          SelectLocationPolicy *policy,
+                                          const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                          const AffinityResolveContext *resolve_ctx,
+                                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const {
     assert(policy != nullptr);
     SPAN_TRACER(request_context);
     assert(keys.size() >= sw_size);
@@ -1803,8 +1877,15 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
                 break;
             }
             std::vector<std::string> prune_loc_ids;
-            CacheLocationConstPtr merged =
-                SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
+            CacheLocationConstPtr merged = SelectAndMergeForMatch(policy,
+                                                                  location_map,
+                                                                  check_loc_data_exist_func_,
+                                                                  request_context->caller_node(),
+                                                                  affinity_manager.get(),
+                                                                  keys[base + offset],
+                                                                  resolve_ctx,
+                                                                  prune_loc_ids,
+                                                                  &out_side_effects);
             if (!prune_loc_ids.empty()) {
                 prune_keys.emplace_back(keys[base + offset]);
                 prune_loc_ids_vec.emplace_back(prune_loc_ids);
@@ -2210,7 +2291,8 @@ ErrorCode MetaSearcher::BatchGetLocation(RequestContext *request_context,
 ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
                                          const KeyVector &keys,
                                          const CacheLocationVector &locations,
-                                         std::vector<AddLocationResult> &out_results) {
+                                         std::vector<AddLocationResult> &out_results,
+                                         const ReplicaLimits &limits) {
     out_results.assign(keys.size(), AddLocationResult{});
     if (keys.size() != locations.size()) {
         for (auto &result : out_results) {
@@ -2218,10 +2300,39 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
         }
         return EC_BADARGS;
     }
+    // RMW reads all entries in a batch before writing them. Repeated keys
+    // would otherwise each observe the same replica count and over-admit.
+    if (limits.max_replicas_per_key > 0 && std::unordered_set<KeyType>(keys.begin(), keys.end()).size() != keys.size()) {
+        for (auto &result : out_results) result.ec = EC_BADARGS;
+        return EC_BADARGS;
+    }
+    std::lock_guard<std::mutex> admission_lock(meta_indexer_->LocationAdmissionMutex());
+    uint64_t bytes = 0;
+    for (const auto &location : locations) {
+        if (!location) {
+            for (auto &result : out_results) result.ec = EC_BADARGS;
+            return EC_BADARGS;
+        }
+        for (const auto &spec : location->location_specs()) {
+            uint64_t size = 0;
+            DataStorageUri(spec.uri()).GetParamAs<uint64_t>("size", size);
+            if ((limits.max_instance_bytes > 0 && size == 0) || size > UINT64_MAX - bytes) {
+                for (auto &result : out_results) result.ec = EC_OUT_OF_LIMIT;
+                return EC_OUT_OF_LIMIT;
+            }
+            bytes += size;
+        }
+    }
+    const auto usage = meta_indexer_->GetStorageUsage();
+    if (limits.max_instance_bytes > 0 &&
+        (usage >= limits.max_instance_bytes || bytes > limits.max_instance_bytes - usage)) {
+        for (auto &result : out_results) result.ec = EC_OUT_OF_LIMIT;
+        return EC_OUT_OF_LIMIT;
+    }
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
-    auto modifier = [&locations, &out_results, &keys, &loc_sz, batch_create_time](
+    auto modifier = [&locations, &out_results, &keys, &loc_sz, &limits, batch_create_time](
                         const LocationIdVector &existing_location_ids,
                         ErrorCode get_ec,
                         size_t index,
@@ -2232,6 +2343,9 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
             return {ModifierAction::MA_FAIL, get_ec};
         }
 
+        if (limits.max_replicas_per_key > 0 && existing_location_ids.size() >= limits.max_replicas_per_key) {
+            return {ModifierAction::MA_FAIL, EC_OUT_OF_LIMIT};
+        }
         // first time this block_key is created: record prev_key
         if (get_ec == EC_NOENT) {
             std::string prev_key = index > 0 ? std::to_string(keys[index - 1]) : std::string();
@@ -2257,7 +2371,7 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
         std::uint64_t sz = 0;
         for (const auto &loc_spec : locations[index]->location_specs()) {
             if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
-                std::uint64_t spec_sz;
+                std::uint64_t spec_sz = 0;
                 ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
                 sz += spec_sz;
             }
@@ -3344,6 +3458,70 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
 
     if (result.ec != ErrorCode::EC_OK) {
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
+    }
+    return result.ec;
+}
+
+ErrorCode MetaSearcher::BatchMarkDeletingWithRetention(
+    RequestContext *ctx, const KeyVector &keys, const std::vector<std::vector<LocationCASTask>> &tasks,
+    uint32_t minimum, std::vector<std::vector<ErrorCode>> &out_results) {
+    if (keys.size() != tasks.size() || minimum == 0) return EC_BADARGS;
+    CacheLocationMapVector snapshots;
+    const auto ec = BatchGetLocation(ctx, keys, BlockMask{}, snapshots);
+    if (ec != EC_OK || snapshots.size() != keys.size()) return ec == EC_OK ? EC_ERROR : ec;
+    LocationIdsPerKey ids(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::set<std::string> unique;
+        for (const auto &task : tasks[i]) {
+            if (task.new_status != CLS_DELETING || !unique.insert(task.location_id).second) return EC_BADARGS;
+            ids[i].push_back(task.location_id); // requested IDs first, guards afterwards
+        }
+        for (const auto &entry : snapshots[i]) {
+            if (unique.insert(entry.first).second) ids[i].push_back(entry.first);
+        }
+    }
+    auto modifier = [&](const std::vector<ErrorCode> &ecs, const LocationIdVector &loc_ids, size_t k,
+                        CacheLocationVector &locs, PropertyMap &) -> LocationModifierResult {
+        std::vector<ErrorCode> results(loc_ids.size(), EC_OK);
+        std::map<std::string, uint32_t> copies;
+        bool unreadable = false;
+        for (size_t j = 0; j < locs.size(); ++j) {
+            if (ecs[j] != EC_OK && ecs[j] != EC_NOENT) unreadable = true;
+            if (ecs[j] != EC_OK || !locs[j] || locs[j]->status() != CLS_SERVING) continue;
+            std::set<std::string> specs;
+            for (const auto &spec : locs[j]->location_specs()) specs.insert(spec.name());
+            for (const auto &name : specs) ++copies[name];
+        }
+        bool changed = false;
+        for (size_t j = 0; j < tasks[k].size(); ++j) {
+            const auto &task = tasks[k][j];
+            if (unreadable || ecs[j] != EC_OK || !locs[j] || locs[j]->status() != task.old_status ||
+                (!task.expected_location_value.empty() && locs[j]->ToJsonString() != task.expected_location_value)) {
+                results[j] = EC_MISMATCH;
+                continue;
+            }
+            std::set<std::string> specs;
+            if (locs[j]->status() == CLS_SERVING) {
+                for (const auto &spec : locs[j]->location_specs()) specs.insert(spec.name());
+            }
+            if (std::any_of(specs.begin(), specs.end(), [&](const auto &name) { return copies[name] <= minimum; })) {
+                results[j] = EC_OUT_OF_LIMIT;
+                continue;
+            }
+            for (const auto &name : specs) --copies[name];
+            auto copy = std::make_shared<CacheLocation>(*locs[j]);
+            copy->set_status(CLS_DELETING);
+            locs[j] = std::move(copy);
+            changed = true;
+        }
+        return {changed ? ModifierAction::MA_OK : ModifierAction::MA_SKIP, std::move(results)};
+    };
+    auto result = meta_indexer_->ReadModifyWriteLocation(ctx, keys, ids, modifier);
+    out_results = std::move(result.per_location_error_codes);
+    if (out_results.size() != tasks.size()) return EC_ERROR;
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        if (out_results[i].size() < tasks[i].size()) return EC_ERROR;
+        out_results[i].resize(tasks[i].size());
     }
     return result.ec;
 }

@@ -64,6 +64,19 @@ cc_test(
 )
 
 cc_test(
+    name = "meta_indexer_node_lru_test",
+    srcs = [
+        "meta_indexer_node_lru_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta",
+    ],
+)
+
+cc_test(
     name = "meta_indexer_manager_test",
     srcs = [
         "meta_indexer_manager_test.cc",
@@ -87,6 +100,20 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/meta",
+    ],
+)
+
+# LocationSpec.node_id round-trip
+cc_test(
+    name = "cache_location_node_id_test",
+    srcs = [
+        "cache_location_node_id_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:cache_location",
     ],
 )
 

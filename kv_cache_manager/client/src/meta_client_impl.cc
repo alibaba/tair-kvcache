@@ -1,10 +1,16 @@
 #include "kv_cache_manager/client/src/meta_client_impl.h"
 
+#include <chrono>
+
 #include "kv_cache_manager/client/src/internal/config/client_config.h"
+#include "kv_cache_manager/client/src/internal/sdk/caller_node_provider.h"
+#include "kv_cache_manager/client/src/internal/sdk/caller_node_provider_factory.h"
 #include "kv_cache_manager/client/src/internal/stub/grpc_stub.h"
 #include "kv_cache_manager/client/src/internal/util/debug_string_util.h"
+#include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 
 #define DEFER(...) __VA_ARGS__
 #define CHECK_INSTANCE_STUB_BASE(return_value)                                                                         \
@@ -29,7 +35,7 @@ std::string GenRandomTraceId(const std::string &prefix_log) {
 
 namespace kv_cache_manager {
 
-MetaClientImpl::MetaClientImpl() {}
+MetaClientImpl::MetaClientImpl() : caller_node_provider_(std::make_unique<NoopCallerNodeProvider>()) {}
 
 MetaClientImpl::~MetaClientImpl() { Shutdown(); }
 
@@ -89,22 +95,22 @@ ClientErrorCode MetaClientImpl::Init(const std::string &client_config, const Ini
     }
     if (ec != ER_OK) {
         KVCM_LOG_ERROR("meta client init fail, last errorcode [%d]", ec);
-    } else {
-        KVCM_LOG_INFO("meta client init success");
+        return ec;
     }
+    KVCM_LOG_INFO("meta client init success");
     return ec;
 }
 
 void MetaClientImpl::Shutdown() {}
 
-std::pair<ClientErrorCode, Locations>
-MetaClientImpl::MatchLocation(const std::string &trace_id,
-                              QueryType query_type,
-                              const std::vector<int64_t> &keys,
-                              const std::vector<int64_t> &tokens,
-                              const BlockMask &block_mask,
-                              int32_t sw_size,
-                              const std::vector<std::string> &location_spec_names) {
+std::pair<ClientErrorCode, Locations> MetaClientImpl::MatchLocation(const std::string &trace_id,
+                                                                    QueryType query_type,
+                                                                    const std::vector<int64_t> &keys,
+                                                                    const std::vector<int64_t> &tokens,
+                                                                    const BlockMask &block_mask,
+                                                                    int32_t sw_size,
+                                                                    const std::vector<std::string> &location_spec_names,
+                                                                    std::vector<ClientReplicationHint> &out_hints) {
     KVCM_LOG_DEBUG("match location with trace_id [%s], query_type [%d], keys %s, tokens %s, block_mask %s, sw_size "
                    "[%d], location_spec_names %s",
                    trace_id.c_str(),
@@ -115,8 +121,16 @@ MetaClientImpl::MatchLocation(const std::string &trace_id,
                    sw_size,
                    DebugStringUtil::ToString(location_spec_names).c_str());
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
-    return stub_->GetCacheLocation(
-        trace_id, instance_id, query_type, keys, tokens, block_mask, sw_size, location_spec_names);
+    return stub_->GetCacheLocation(trace_id,
+                                   instance_id,
+                                   query_type,
+                                   keys,
+                                   tokens,
+                                   block_mask,
+                                   sw_size,
+                                   location_spec_names,
+                                   CurrentCallerNode(),
+                                   out_hints);
 }
 
 std::pair<ClientErrorCode, int64_t> MetaClientImpl::MatchLocationLen(const std::string &trace_id,
@@ -154,7 +168,8 @@ MetaClientImpl::StartWrite(const std::string &trace_id,
                            const std::vector<int64_t> &keys,
                            const std::vector<int64_t> &tokens,
                            const std::vector<std::string> &location_spec_group_names,
-                           int64_t write_timeout_seconds) {
+                           int64_t write_timeout_seconds,
+                           bool is_replication) {
     KVCM_LOG_DEBUG("start write with trace_id [%s], keys %s, tokens %s, location_spec_group_names [%s], "
                    "write_timeout_seconds [%ld]",
                    trace_id.c_str(),
@@ -163,8 +178,49 @@ MetaClientImpl::StartWrite(const std::string &trace_id,
                    DebugStringUtil::ToString(location_spec_group_names).c_str(),
                    write_timeout_seconds);
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
-    return stub_->StartWriteCache(
-        trace_id, instance_id, keys, tokens, location_spec_group_names, write_timeout_seconds);
+    return stub_->StartWriteCache(trace_id,
+                                  instance_id,
+                                  keys,
+                                  tokens,
+                                  location_spec_group_names,
+                                  write_timeout_seconds,
+                                  CurrentCallerNode(),
+                                  is_replication);
+}
+
+std::pair<ClientErrorCode, WriteLocation>
+MetaClientImpl::StartReplicationWrite(const std::string &trace_id,
+                                      const std::vector<int64_t> &keys,
+                                      const std::vector<std::string> &location_spec_group_names,
+                                      int64_t write_timeout_seconds,
+                                      const std::string &target_node_id) {
+    const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
+    return stub_->StartReplicationWriteCache(trace_id,
+                                             instance_id,
+                                             keys,
+                                             location_spec_group_names,
+                                             write_timeout_seconds,
+                                             CurrentCallerNode(),
+                                             target_node_id);
+}
+
+ClientErrorCode MetaClientImpl::ReplicateCache(const std::string &trace_id,
+                                               const ClientReplicationHint &hint,
+                                               int32_t write_timeout_seconds) {
+    const std::string &instance_id = CHECK_INSTANCE_STUB();
+    return stub_->ReplicateCache(trace_id, instance_id, hint, write_timeout_seconds);
+}
+
+std::vector<ClientReplicationRpcResult>
+MetaClientImpl::ReplicateCaches(const std::string &trace_id,
+                                const std::vector<ClientReplicationHint> &hints,
+                                int32_t write_timeout_seconds) {
+    const std::string &instance_id = GetInstanceId();
+    if (instance_id.empty() || stub_ == nullptr) {
+        return std::vector<ClientReplicationRpcResult>(
+            hints.size(), {ER_CLIENT_NOT_EXISTS, false});
+    }
+    return stub_->ReplicateCaches(trace_id, instance_id, hints, write_timeout_seconds);
 }
 ClientErrorCode MetaClientImpl::FinishWrite(const std::string &trace_id,
                                             const std::string &write_session_id,
@@ -196,6 +252,8 @@ const std::string &MetaClientImpl::GetStorageConfig() const {
     KVCM_LOG_DEBUG("get storage config");
     return storage_config_;
 }
+
+std::string MetaClientImpl::GetCallerNode() const { return CurrentCallerNode().node_id; }
 
 ClientErrorCode MetaClientImpl::IsValid(const std::unique_ptr<ClientConfig> &client_config) const {
     if (client_config == nullptr) {
@@ -238,6 +296,7 @@ ClientErrorCode MetaClientImpl::Connect(const std::string &address) {
                                                             client_config->default_query_type());
     if (reg_ec == ER_OK) {
         storage_config_ = storage_config;
+        InitCallerNodeProvider(storage_config);
     }
     if (reg_ec == ER_SERVICE_NOT_LEADER) {
         KVCM_LOG_INFO("address %s is not leader, remove all connections", address.c_str());
@@ -248,6 +307,27 @@ ClientErrorCode MetaClientImpl::Connect(const std::string &address) {
                   client_config->instance_id().c_str(),
                   reg_ec == ER_OK ? "success" : "failed");
     return reg_ec;
+}
+
+void MetaClientImpl::InitCallerNodeProvider(const std::string &storage_config) {
+    const auto refresh_interval =
+        std::chrono::seconds(client_config_ ? client_config_->caller_node_refresh_seconds() : 0);
+    std::vector<std::shared_ptr<StorageConfig>> parsed_storage_configs;
+    if (Jsonizable::FromJsonString(storage_config, parsed_storage_configs)) {
+        caller_node_provider_ = CallerNodeProviderFactory::Create(parsed_storage_configs, refresh_interval);
+    } else {
+        KVCM_LOG_WARN("parse storage_config json failed, falling back to noop caller_node_provider: [%s]",
+                      storage_config.c_str());
+        caller_node_provider_ = std::make_unique<NoopCallerNodeProvider>();
+    }
+}
+
+ClientCallerNode MetaClientImpl::CurrentCallerNode() const {
+    std::shared_lock read_guard(config_mutex_);
+    auto caller = caller_node_provider_ ? caller_node_provider_->GetCallerNode() : ClientCallerNode{};
+    const auto supernode = topology_.Resolve(caller.node_id);
+    if (!supernode.empty()) caller.supernode_id = supernode;
+    return caller;
 }
 
 const std::string &MetaClientImpl::GetInstanceId() const {

@@ -168,7 +168,7 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery01) {
 }
 
 TEST_F(LocalMetricsReporterTest, TestReportPerQuery02) {
-    constexpr int kServiceMetricsCount = 3 + 5 + 14 + 6 + 26;
+    constexpr int kServiceMetricsCount = 3 + 5 + 14 + 6 + 26 + 10;
     EXPECT_EQ(3, metrics_registry_->GetSize());
 
     ServiceMetricsCollector collector(metrics_registry_);

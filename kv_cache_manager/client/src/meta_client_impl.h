@@ -2,12 +2,15 @@
 
 #include <memory>
 #include <shared_mutex>
+#include <string>
 
 #include "kv_cache_manager/client/include/meta_client.h"
+#include "kv_cache_manager/common/node_topology.h"
 
 namespace kv_cache_manager {
 class Stub;
 class ClientConfig;
+class CallerNodeProvider;
 
 class MetaClientImpl : public MetaClient {
 public:
@@ -20,7 +23,8 @@ public:
                                                         const std::vector<int64_t> &tokens,
                                                         const BlockMask &block_mask,
                                                         int32_t sw_size,
-                                                        const std::vector<std::string> &location_spec_names) override;
+                                                        const std::vector<std::string> &location_spec_names,
+                                                        std::vector<ClientReplicationHint> &out_hints) override;
 
     std::pair<ClientErrorCode, int64_t> MatchLocationLen(const std::string &trace_id,
                                                          QueryType query_type,
@@ -32,7 +36,21 @@ public:
                                                          const std::vector<int64_t> &keys,
                                                          const std::vector<int64_t> &tokens,
                                                          const std::vector<std::string> &location_spec_group_names,
-                                                         int64_t write_timeout_seconds) override;
+                                                         int64_t write_timeout_seconds,
+                                                         bool is_replication = false) override;
+    std::pair<ClientErrorCode, WriteLocation>
+    StartReplicationWrite(const std::string &trace_id,
+                          const std::vector<int64_t> &keys,
+                          const std::vector<std::string> &location_spec_group_names,
+                          int64_t write_timeout_seconds,
+                          const std::string &target_node_id) override;
+    ClientErrorCode ReplicateCache(const std::string &trace_id,
+                                   const ClientReplicationHint &hint,
+                                   int32_t write_timeout_seconds) override;
+    std::vector<ClientReplicationRpcResult>
+    ReplicateCaches(const std::string &trace_id,
+                    const std::vector<ClientReplicationHint> &hints,
+                    int32_t write_timeout_seconds) override;
     ClientErrorCode FinishWrite(const std::string &trace_id,
                                 const std::string &write_session_id,
                                 const BlockMask &success_block,
@@ -51,6 +69,8 @@ public:
 
     const std::string &GetStorageConfig() const override;
 
+    std::string GetCallerNode() const override;
+
 protected:
     ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) override;
     void Shutdown() override;
@@ -58,15 +78,19 @@ protected:
 private:
     ClientErrorCode IsValid(const std::unique_ptr<ClientConfig> &client_config) const;
     ClientErrorCode Connect(const std::string &address);
+    void InitCallerNodeProvider(const std::string &storage_config);
     const ClientConfig *GetClientConfig() const;
     const ClientConfig *GetClientConfigUnsafe() const;
     const std::string &GetInstanceId() const;
+    ClientCallerNode CurrentCallerNode() const;
 
 private:
     friend class MetaClient;
     std::unique_ptr<ClientConfig> client_config_;
     std::unique_ptr<Stub> stub_;
     std::string storage_config_;
+    std::unique_ptr<CallerNodeProvider> caller_node_provider_;
+    NodeTopology topology_;
     mutable std::shared_mutex config_mutex_;
 };
 } // namespace kv_cache_manager

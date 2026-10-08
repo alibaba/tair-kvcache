@@ -40,15 +40,16 @@ public:
                                                            const BlockMask &block_mask,
                                                            int32_t detail_level) = 0;
 
-    virtual std::pair<ClientErrorCode, Locations>
-    GetCacheLocation(const std::string &trace_id,
-                     const std::string &instance_id,
-                     QueryType query_type,
-                     const KeyVector &keys,
-                     const TokenIdsVector &tokens,
-                     const BlockMask &block_mask,
-                     int32_t sw_size,
-                     const std::vector<std::string> &location_spec_names) = 0;
+    virtual std::pair<ClientErrorCode, Locations> GetCacheLocation(const std::string &trace_id,
+                                                                   const std::string &instance_id,
+                                                                   QueryType query_type,
+                                                                   const KeyVector &keys,
+                                                                   const TokenIdsVector &tokens,
+                                                                   const BlockMask &block_mask,
+                                                                   int32_t sw_size,
+                                                                   const std::vector<std::string> &location_spec_names,
+                                                                   const ClientCallerNode &caller,
+                                                                   std::vector<ClientReplicationHint> &out_hints) = 0;
 
     virtual std::pair<ClientErrorCode, int64_t> GetCacheLocationLen(const std::string &trace_id,
                                                                     const std::string &instance_id,
@@ -63,7 +64,38 @@ public:
                     const KeyVector &keys,
                     const TokenIdsVector &tokens,
                     const std::vector<std::string> &location_spec_group_names,
-                    int64_t write_timeout_seconds) = 0;
+                    int64_t write_timeout_seconds,
+                    const ClientCallerNode &caller,
+                    bool is_replication = false) = 0;
+    virtual std::pair<ClientErrorCode, WriteLocation>
+    StartReplicationWriteCache(const std::string &trace_id,
+                               const std::string &instance_id,
+                               const KeyVector &keys,
+                               const std::vector<std::string> &location_spec_group_names,
+                               int64_t write_timeout_seconds,
+                               const ClientCallerNode &caller,
+                               const std::string &target_node_id) {
+        return StartWriteCache(trace_id, instance_id, keys, {}, location_spec_group_names,
+                               write_timeout_seconds, caller, true);
+    }
+    virtual ClientErrorCode ReplicateCache(const std::string &trace_id,
+                                           const std::string &instance_id,
+                                           const ClientReplicationHint &hint,
+                                           int32_t write_timeout_seconds) {
+        return ER_SERVICE_UNSUPPORTED;
+    }
+    virtual std::vector<ClientReplicationRpcResult>
+    ReplicateCaches(const std::string &trace_id,
+                    const std::string &instance_id,
+                    const std::vector<ClientReplicationHint> &hints,
+                    int32_t write_timeout_seconds) {
+        std::vector<ClientReplicationRpcResult> results;
+        results.reserve(hints.size());
+        for (const auto &hint : hints) {
+            results.push_back({ReplicateCache(trace_id, instance_id, hint, write_timeout_seconds), false});
+        }
+        return results;
+    }
     virtual ClientErrorCode FinishWriteCache(const std::string &trace_id,
                                              const std::string &instance_id,
                                              const std::string write_session_id,

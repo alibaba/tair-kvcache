@@ -4,6 +4,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "kv_cache_manager/common/build_version.h"
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
 #include "kv_cache_manager/common/loop_thread.h"
 #include "kv_cache_manager/common/net_util.h"
 #include "kv_cache_manager/config/coordination_backend.h"
@@ -59,7 +60,51 @@ bool Server::Init(const ServerConfig &config) {
         return false;
     }
 
-    cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_, metrics_lifecycle_));
+    // Create CacheAffinityManager; when kvcm.affinity.enabled is false, all
+    // strategy lookups return Noop (no-op affinity, equivalent to legacy).
+    affinity_manager_ = std::make_shared<CacheAffinityManager>();
+    if (!config_.IsAffinityEnabled()) {
+        affinity_manager_->SetGloballyDisabled(true);
+        KVCM_LOG_INFO("kvcm.affinity.enabled=false, affinity globally disabled (forces Noop)");
+    } else {
+        const std::string &strategy_file = config_.GetAffinityStrategyFile();
+        if (!strategy_file.empty()) {
+            std::string err;
+            if (!affinity_manager_->LoadProcessStrategyFromJsonFile(strategy_file, &err)) {
+                KVCM_LOG_WARN("load process affinity strategy file[%s] failed: %s", strategy_file.c_str(), err.c_str());
+            } else {
+                KVCM_LOG_INFO("loaded process affinity strategy from file[%s]", strategy_file.c_str());
+            }
+        } else {
+            // No explicit strategy file: apply built-in local_replica default.
+            // - write: prefer_local with passthrough on miss (best-effort local placement)
+            // - read:  frequency sketch triggers ReplicationHint after 3 remote reads
+            static constexpr char kDefaultStrategyJson[] = R"({
+                "type": "local_replica",
+                "write": {
+                    "ops": {
+                        "prefer_local": {"on_miss": "abort"},
+                        "limit": 2
+                    }
+                },
+                "read": {
+                    "on_miss": {
+                        "enabled": true,
+                        "replication_hot_threshold": 3,
+                        "caller_capacity_threshold": 0.90,
+                        "caller_capacity_buffer": 0.05
+                    }
+                }
+            })";
+            std::string err;
+            if (!affinity_manager_->LoadProcessStrategyFromJsonString(kDefaultStrategyJson, &err)) {
+                KVCM_LOG_WARN("load default affinity strategy failed: %s", err.c_str());
+            } else {
+                KVCM_LOG_INFO("loaded built-in default affinity strategy (local_replica)");
+            }
+        }
+    }
+    cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_, metrics_lifecycle_, affinity_manager_));
     CacheReclaimerAsyncDeleteConfig async_delete_config;
     async_delete_config.inflight_delete_timeout_ms = config_.GetCacheReclaimerInflightDeleteTimeoutMs();
     async_delete_config.pending_location_limit_per_group_type =

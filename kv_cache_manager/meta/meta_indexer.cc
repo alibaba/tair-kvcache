@@ -2031,6 +2031,25 @@ ErrorCode MetaIndexer::SampleReclaimKeys(RequestContext *request_context,
     return ec;
 }
 
+ErrorCode MetaIndexer::SampleReclaimKeys(RequestContext *request_context,
+                                         const std::string &type,
+                                         const std::unordered_set<std::string> &node_ids,
+                                         const int64_t count,
+                                         KeyVector &out_keys) const noexcept {
+    out_keys.clear();
+    out_keys.reserve(count);
+    ErrorCode ec = backend_manager_->SampleReclaimKeys(request_context, type, node_ids, count, out_keys);
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("instance[%s] meta indexer sample reclaim keys failed, type[%s] count[%lu] sample key "
+                       "size[%lu]",
+                       instance_id_.c_str(),
+                       type.c_str(),
+                       count,
+                       out_keys.size());
+    }
+    return ec;
+}
+
 bool MetaIndexer::PreferSingleTaskReclaimSampling() const noexcept {
     return backend_manager_ && backend_manager_->PreferSingleTaskReclaimSampling();
 }

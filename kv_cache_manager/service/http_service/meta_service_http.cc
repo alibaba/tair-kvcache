@@ -40,6 +40,7 @@ void MetaServiceHttp::RegisterHandler() {
                                            GetCacheLocationsByBackend,
                                            GetCacheLocationsByBackend);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, startWriteCache, StartWriteCache, StartWriteCache, StartWriteCache);
+    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, replicateCache, ReplicateCache, ReplicateCache, ReplicateCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, finishWriteCache, FinishWriteCache, Common, FinishWriteCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, removeCache, RemoveCache, Common, RemoveCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, trimCache, TrimCache, Common, TrimCache);
@@ -145,6 +146,14 @@ CoroHttpService::CachedJsonResponse MetaServiceHttp::FinishWriteCache(coro_http:
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());
     meta_service_impl_->FinishWriteCache(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
+}
+
+CoroHttpService::CachedJsonResponse MetaServiceHttp::ReplicateCache(coro_http::coro_http_connection *http_conn,
+                                                                    proto::meta::ReplicateCacheRequest *request,
+                                                                    proto::meta::ReplicateCacheResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(ReplicateCache, __NOTHING__);
+    meta_service_impl_->ReplicateCache(request_context, request, response);
     return request_context->TakeReusableResponseJson();
 }
 

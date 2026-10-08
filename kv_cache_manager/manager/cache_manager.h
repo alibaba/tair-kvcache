@@ -40,6 +40,10 @@ class CacheManagerMetricsRecorder;
 class EventReportBackend;
 struct MetricsLifecycle;
 class MigrationManager;
+class CacheAffinityManager;
+struct WriteHints;
+struct AffinityResolveContext;
+struct ReplicationHint;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_MIGRATION_WORKER_BUDGET = 1;
 constexpr unsigned int DEFAULT_META_QUERY_WORKER_COUNT = 4;
@@ -86,7 +90,8 @@ public:
 
     CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
                  std::shared_ptr<RegistryManager> registry_manager,
-                 std::shared_ptr<MetricsLifecycle> metrics_lifecycle = nullptr);
+                 std::shared_ptr<MetricsLifecycle> metrics_lifecycle = nullptr,
+                 std::shared_ptr<CacheAffinityManager> affinity_manager = nullptr);
     ~CacheManager();
 
     bool Init(int32_t schedule_plan_executor_thread_count = DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT,
@@ -126,7 +131,8 @@ public:
                                                        const std::vector<LocationSpecInfo> &location_spec_infos,
                                                        const ModelDeployment &model_deployment,
                                                        const std::vector<LocationSpecGroup> &location_spec_groups,
-                                                       QueryType default_query_type = QueryType::QT_UNSPECIFIED);
+                                                       QueryType default_query_type = QueryType::QT_UNSPECIFIED,
+                                                       const std::string &affinity_strategy_json = {});
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
@@ -141,15 +147,16 @@ public:
                                                            const BlockMask &block_mask,
                                                            int32_t detail_level /*TODO*/);
 
-    std::pair<ErrorCode, CacheLocationViewVecWrapper>
-    GetCacheLocation(RequestContext *request_context,
-                     const std::string &instance_id,
-                     QueryType query_type,
-                     const KeyVector &keys,
-                     const TokenIdsVector &tokens,
-                     const BlockMask &block_mask,
-                     int32_t sw_size,
-                     const std::vector<std::string> &location_spec_names);
+    ErrorCode GetCacheLocation(RequestContext *request_context,
+                               const std::string &instance_id,
+                               QueryType query_type,
+                               const KeyVector &keys,
+                               const TokenIdsVector &tokens,
+                               const BlockMask &block_mask,
+                               int32_t sw_size,
+                               const std::vector<std::string> &location_spec_names,
+                               CacheLocationViewVecWrapper &out_locations,
+                               std::vector<ReplicationHint> &out_hints);
 
     std::pair<ErrorCode, BatchLocationsView>
     GetCacheLocationsByBackend(RequestContext *request_context,
@@ -176,6 +183,17 @@ public:
                                                               const std::vector<std::string> &location_spec_group_names,
                                                               int64_t write_timeout_seconds,
                                                               int32_t min_replica_count = 1);
+    // Allocate a replica on hint.target_node_id, copy every named spec through
+    // the storage backend, and publish the location only after all copies pass.
+    std::pair<ErrorCode, bool> ReplicateCache(RequestContext *request_context,
+                                              const std::string &instance_id,
+                                              const ReplicationHint &hint,
+                                              int64_t write_timeout_seconds);
+    std::vector<std::pair<ErrorCode, bool>>
+    ReplicateCaches(RequestContext *request_context,
+                    const std::string &instance_id,
+                    const std::vector<ReplicationHint> &hints,
+                    int64_t write_timeout_seconds);
     ErrorCode
     FinishWriteCache(RequestContext *request_context,
                      const std::string &instance_id,
@@ -310,10 +328,13 @@ private:
                                   const std::shared_ptr<const InstanceInfo> &instance_info,
                                   const std::shared_ptr<DataStorageManager> &data_storage_manager,
                                   const std::string &unique_name,
+                                  const AffinityResolveContext *resolve_ctx,
+                                  int64_t common_size,
                                   std::vector<DataStorageUri> &allocated_uris,
+                                  // node_id reported by backend, parallel to allocated_uris
+                                  std::vector<std::string> &allocated_node_ids,
                                   std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
-                                  bool &is_create_success,
-                                  int64_t common_size);
+                                  bool &is_create_success);
     ErrorCode CreateBySpec(RequestContext *request_context,
                            const std::string &instance_id,
                            const CacheManager::KeyVector &keys,
@@ -321,7 +342,10 @@ private:
                            const std::shared_ptr<const InstanceInfo> &instance_info,
                            const std::shared_ptr<DataStorageManager> &data_storage_manager,
                            const std::string &unique_name,
+                           const AffinityResolveContext *resolve_ctx,
                            std::vector<DataStorageUri> &allocated_uris,
+                           // node_id reported by backend, parallel to allocated_uris
+                           std::vector<std::string> &allocated_node_ids,
                            std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
                            bool &is_create_success);
 
@@ -358,7 +382,10 @@ private:
                                           const KeyVector &keys,
                                           const BlockMask &block_mask,
                                           int32_t sw_size,
-                                          CacheLocationVector &cache_locations) const;
+                                          CacheLocationVector &cache_locations,
+                                          // Read side effects accumulated by meta_searcher;
+                                          // caller downcasts to concrete types (e.g. ReplicationHint).
+                                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
     ErrorCode PerformCacheLocationQuery(RequestContext *request_context,
                                         ServiceMetricsCollector *service_metrics_collector,
                                         MetaSearcher *meta_searcher,
@@ -369,7 +396,8 @@ private:
                                         const BlockMask &block_mask,
                                         int32_t sw_size,
                                         KeyVector &query_keys,
-                                        CacheLocationVector &cache_locations) const;
+                                        CacheLocationVector &cache_locations,
+                                        std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
@@ -405,6 +433,8 @@ private:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     // 无需清理 - RegistryManager单独进行了清理，不由CacheManager负责
     std::shared_ptr<RegistryManager> registry_manager_;
+    // 无需清理 - 注入的依赖，由外部生命周期管理；可空表示未启用亲和性
+    std::shared_ptr<CacheAffinityManager> affinity_manager_;
     // 无需清理 - 让遗留的Plan自行跑完
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor_;
     // leader demotion 和析构时先停止 GC 线程；已接受的删除任务由 Executor best effort 继续执行

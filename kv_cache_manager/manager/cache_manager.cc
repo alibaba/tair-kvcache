@@ -20,6 +20,10 @@
 #include <utility>
 #include <vector>
 
+#include "kv_cache_manager/affinity/affinity_strategy.h"
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
+#include "kv_cache_manager/affinity/local_replica_strategy.h"
+#include "kv_cache_manager/affinity/node_metrics.h"
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
@@ -32,6 +36,7 @@
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
+#include "kv_cache_manager/data_storage/write_hints.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/optimizer_event.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
@@ -451,17 +456,28 @@ void ResolveUsableTieredWriteTargets(RequestContext *request_context,
     }
 }
 
+// Append an 8-char random suffix to storage_key so that multiple writes for
+// the same (instance, spec_name, block_key) produce distinct physical paths.
+// Without this, replication writes (which bypass ExistsForWrite dedup) would
+// silently overwrite the original allocation.
+inline std::string MakeStorageKey(const std::string &instance_id, const std::string &spec_name, int64_t block_key) {
+    return instance_id + "/" + spec_name + "/" + StringUtil::Uint64ToHex(block_key) + "/" +
+           StringUtil::GenerateRandomString(8);
+}
+
 } // namespace
 
 CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
                            std::shared_ptr<RegistryManager> registry_manager,
-                           std::shared_ptr<MetricsLifecycle> metrics_lifecycle)
+                           std::shared_ptr<MetricsLifecycle> metrics_lifecycle,
+                           std::shared_ptr<CacheAffinityManager> affinity_manager)
     : meta_indexer_manager_(std::make_shared<MetaIndexerManager>())
     , write_location_manager_(std::make_shared<WriteLocationManager>())
     , meta_searcher_manager_(std::make_shared<MetaSearcherManager>(registry_manager, meta_indexer_manager_))
     , data_storage_selector_(std::make_shared<DataStorageSelector>(meta_indexer_manager_, registry_manager))
     , metrics_registry_(std::move(metrics_registry))
     , registry_manager_(std::move(registry_manager))
+    , affinity_manager_(std::move(affinity_manager))
     , metrics_lifecycle_(metrics_lifecycle ? std::move(metrics_lifecycle) : std::make_shared<MetricsLifecycle>())
     , metrics_recorder_(std::make_shared<CacheManagerMetricsRecorder>(
           meta_indexer_manager_, write_location_manager_, registry_manager_, metrics_lifecycle_)) {}
@@ -559,6 +575,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
         return false;
     }
 
+    // Inject affinity_manager into CacheReclaimer for node-level eviction.
+    // nullptr => reclaimer falls back to legacy behavior, pull loop not started.
     cache_reclaimer_ = std::make_shared<CacheReclaimer>(cache_reclaimer_key_sampling_size_total,
                                                         cache_reclaimer_key_sampling_size_per_task,
                                                         cache_reclaimer_del_batch_size,
@@ -573,10 +591,14 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                                                         write_location_manager_,
                                                         std::move(cache_reclaimer_async_delete_config),
                                                         migration_manager_,
-                                                        group_lru_config);
+                                                        group_lru_config,
+                                                        affinity_manager_);
     if (cache_reclaimer_->Start() != EC_OK) {
         KVCM_LOG_ERROR("CacheManager init failed");
         return false;
+    }
+    if (affinity_manager_) {
+        affinity_manager_->StartMetricsPullLoop(registry_manager_->data_storage_manager(), /*interval=*/5);
     }
     reclaimer_task_supervisor_ = std::make_unique<ReclaimerTaskSupervisor>(schedule_plan_executor_);
     reclaimer_task_supervisor_->Start();
@@ -614,7 +636,8 @@ CacheManager::RegisterInstance(RequestContext *request_context,
                                const std::vector<LocationSpecInfo> &location_spec_infos,
                                const ModelDeployment &model_deployment,
                                const std::vector<LocationSpecGroup> &location_spec_groups,
-                               QueryType default_query_type) {
+                               QueryType default_query_type,
+                               const std::string &affinity_strategy_json) {
     SPAN_TRACER(request_context);
     // TODO : not thread safe now
     const auto &trace_id = request_context->trace_id();
@@ -649,7 +672,8 @@ CacheManager::RegisterInstance(RequestContext *request_context,
                                                   location_spec_infos,
                                                   model_deployment,
                                                   location_spec_groups,
-                                                  static_cast<int32_t>(default_query_type));
+                                                  static_cast<int32_t>(default_query_type),
+                                                  affinity_strategy_json);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, std::string, "register instance failed with errorcode: %d", ec);
     ec = TryCreateMetaSearcher(request_context, instance_id);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, std::string, "register instance failed with errorcode: %d", ec);
@@ -791,16 +815,20 @@ std::pair<ErrorCode, CacheMetaVecWrapper> CacheManager::GetCacheMeta(RequestCont
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchGetLocation);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(DEBUG, ec, CacheMetaVecWrapper, "get cache meta failed: BatchGetLocation fail");
-    // TODO, 现在BatchGetLocation接口还未返回 location properties 信息, 先置空
-    // 另外现在BatchGetLocation接口返回的是一个block key对应的location map, 和proto定义不同,
-    // 先临时只返回map里的第一个 location(不管是不是在serving状态), 将serving状态保存在meta里 这里现在非常 ugly
     CacheLocationVector cache_locations;
+    std::vector<CacheLocationVector> replica_locations;
+    replica_locations.reserve(location_maps.size());
     std::vector<std::string> metas;
     std::map<std::string, std::string> meta;
     for (CacheLocationMap &location_map : location_maps) {
-        auto iter = location_map.begin();
-        if (iter != location_map.end() && iter->second) {
-            cache_locations.push_back(iter->second);
+        meta.clear();
+        CacheLocationVector replicas;
+        replicas.reserve(location_map.size());
+        for (const auto &[_, location] : location_map) {
+            if (location) replicas.push_back(location);
+        }
+        if (!replicas.empty()) {
+            cache_locations.push_back(replicas.front());
             meta["id"] = cache_locations.back()->id();
         } else {
             auto not_found_loc = std::make_shared<CacheLocation>();
@@ -809,63 +837,88 @@ std::pair<ErrorCode, CacheMetaVecWrapper> CacheManager::GetCacheMeta(RequestCont
         }
         meta["status"] = CacheLocation::CacheLocationStatusToString(cache_locations.back()->status());
         metas.push_back(Jsonizable::ToJsonString(meta));
+        replica_locations.push_back(std::move(replicas));
     }
 
-    return {ec, CacheMetaVecWrapper(std::move(metas), std::move(cache_locations))};
+    return {ec,
+            CacheMetaVecWrapper(
+                std::move(metas), std::move(cache_locations), std::move(replica_locations))};
 }
 
-ErrorCode CacheManager::PerformCacheLocationQuery(RequestContext *request_context,
-                                                  ServiceMetricsCollector *service_metrics_collector,
-                                                  MetaSearcher *meta_searcher,
-                                                  const std::string &instance_id,
-                                                  QueryType query_type,
-                                                  const KeyVector &keys,
-                                                  const TokenIdsVector &tokens,
-                                                  const BlockMask &block_mask,
-                                                  int32_t sw_size,
-                                                  KeyVector &query_keys,
-                                                  CacheLocationVector &cache_locations) const {
+ErrorCode
+CacheManager::PerformCacheLocationQuery(RequestContext *request_context,
+                                        ServiceMetricsCollector *service_metrics_collector,
+                                        MetaSearcher *meta_searcher,
+                                        const std::string &instance_id,
+                                        QueryType query_type,
+                                        const KeyVector &keys,
+                                        const TokenIdsVector &tokens,
+                                        const BlockMask &block_mask,
+                                        int32_t sw_size,
+                                        KeyVector &query_keys,
+                                        CacheLocationVector &cache_locations,
+                                        std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     ErrorCode ec = EC_ERROR;
     if (!keys.empty()) {
         KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, keys.size());
-        ec = GetCacheLocationByQueryType(
-            meta_searcher, request_context, instance_id, query_type, keys, block_mask, sw_size, cache_locations);
+        ec = GetCacheLocationByQueryType(meta_searcher,
+                                         request_context,
+                                         instance_id,
+                                         query_type,
+                                         keys,
+                                         block_mask,
+                                         sw_size,
+                                         cache_locations,
+                                         out_side_effects);
     } else {
         auto [ec_temp, block_size] = GetBlockSize(request_context, instance_id);
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec_temp, "get block_size failed");
         auto gen_keys = GenKeyVector(tokens, block_size);
         KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, gen_keys.size());
         query_keys = gen_keys;
-        ec = GetCacheLocationByQueryType(
-            meta_searcher, request_context, instance_id, query_type, gen_keys, block_mask, sw_size, cache_locations);
+        ec = GetCacheLocationByQueryType(meta_searcher,
+                                         request_context,
+                                         instance_id,
+                                         query_type,
+                                         gen_keys,
+                                         block_mask,
+                                         sw_size,
+                                         cache_locations,
+                                         out_side_effects);
     }
     return ec;
 }
 
-std::pair<ErrorCode, CacheLocationViewVecWrapper>
-CacheManager::GetCacheLocation(RequestContext *request_context,
-                               const std::string &instance_id,
-                               QueryType query_type,
-                               const KeyVector &keys,
-                               const TokenIdsVector &tokens,
-                               const BlockMask &block_mask,
-                               int32_t sw_size,
-                               const std::vector<std::string> &location_spec_names) {
+ErrorCode CacheManager::GetCacheLocation(RequestContext *request_context,
+                                         const std::string &instance_id,
+                                         QueryType query_type,
+                                         const KeyVector &keys,
+                                         const TokenIdsVector &tokens,
+                                         const BlockMask &block_mask,
+                                         int32_t sw_size,
+                                         const std::vector<std::string> &location_spec_names,
+                                         CacheLocationViewVecWrapper &out_locations,
+                                         std::vector<ReplicationHint> &out_hints) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);
-    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "check input or get meta searcher failed");
+    if (ec != EC_OK) {
+        KVCM_LOG_WARN("[traceId: %s] check input or get meta searcher failed, ec: %d", trace_id.c_str(), ec);
+        return ec;
+    }
     if (query_type == QueryType::QT_UNSPECIFIED) {
-        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_ERROR, CacheLocationViewVecWrapper, "unknown query type");
+        KVCM_LOG_WARN("[traceId: %s] unknown query type", trace_id.c_str());
+        return EC_ERROR;
     }
     auto query_scope = (query_type == QueryType::QT_BATCH_GET)
                            ? KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerBatchGet)
                            : KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerPrefixMatch);
     CacheLocationVector cache_locations;
     KeyVector query_keys = keys;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
     ec = PerformCacheLocationQuery(request_context,
                                    service_metrics_collector,
                                    meta_searcher,
@@ -876,7 +929,8 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
                                    block_mask,
                                    sw_size,
                                    query_keys,
-                                   cache_locations);
+                                   cache_locations,
+                                   side_effects);
     query_scope = ChronoScopeGuard{};
     // prefix_match_len: count actual hits (non-empty id), not total returned entries.
     // BatchGet/ReverseRollSW pad misses with empty CacheLocation objects.
@@ -889,7 +943,7 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
         }
         KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, match_len);
     }
-    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "get cache location failed");
+    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "get cache location failed");
     // accumulate hit/query block counters for hit-rate monitoring (only on success)
     if (service_metrics_collector) {
         size_t query_count = query_keys.size();
@@ -920,7 +974,44 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
     if (event_manager_) {
         event_manager_->Publish(cache_get_event);
     }
-    return {ec, CacheLocationViewVecWrapper(std::move(cache_locations))};
+    for (auto &se : side_effects) {
+        if (auto *hint = dynamic_cast<ReplicationHintSideEffect *>(se.get())) {
+            out_hints.push_back(std::move(static_cast<ReplicationHint &>(*hint)));
+        }
+    }
+    if (service_metrics_collector && !request_context->caller_node().node_id.empty()) {
+        const auto &caller_node_id = request_context->caller_node().node_id;
+        double local_hit = 0, remote_hit = 0;
+        for (const auto &loc_ptr : cache_locations) {
+            if (!loc_ptr) {
+                continue;
+            }
+            bool has_uri = false, has_local = false;
+            for (const auto &spec : loc_ptr->location_specs()) {
+                if (!spec.uri().empty()) {
+                    has_uri = true;
+                    if (spec.node_id() == caller_node_id) {
+                        has_local = true;
+                    }
+                }
+            }
+            if (has_uri) {
+                if (has_local) {
+                    ++local_hit;
+                } else {
+                    ++remote_hit;
+                }
+            }
+        }
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(
+            service_metrics_collector, affinity, read_local_hit, static_cast<uint64_t>(local_hit));
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(
+            service_metrics_collector, affinity, read_remote_hit, static_cast<uint64_t>(remote_hit));
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(
+            service_metrics_collector, affinity, hint_emitted, static_cast<uint64_t>(out_hints.size()));
+    }
+    out_locations = CacheLocationViewVecWrapper(std::move(cache_locations));
+    return ec;
 }
 
 void CacheManager::FillEmptyLocationSpecs(const std::vector<LocationSpecInfo> &location_spec_infos,
@@ -1100,6 +1191,7 @@ std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *
     }
     CacheLocationVector cache_locations;
     KeyVector query_keys = keys;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
     ec = PerformCacheLocationQuery(request_context,
                                    service_metrics_collector,
                                    meta_searcher,
@@ -1110,7 +1202,8 @@ std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *
                                    BlockMask(),
                                    sw_size,
                                    query_keys,
-                                   cache_locations);
+                                   cache_locations,
+                                   side_effects);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, int64_t, "get cache location length failed");
     int64_t cache_location_len = 0;
     switch (query_type) {
@@ -1158,6 +1251,10 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                               int64_t write_timeout_seconds,
                               int32_t min_replica_count) {
     SPAN_TRACER(request_context);
+    if (request_context->is_replication() && request_context->replication_target_node_id().empty()) {
+        request_context->error_tracer()->AddErrorMsg("replication_target_node_id is required for replication writes");
+        return std::make_pair(EC_BADARGS, StartWriteCacheInfo{});
+    }
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     if (!location_spec_group_names.empty()) {
@@ -1237,7 +1334,19 @@ CacheManager::StartWriteCache(RequestContext *request_context,
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchAddLocation);
         std::vector<MetaSearcher::AddLocationResult> add_results;
-        ec = meta_searcher->BatchAddLocation(request_context, new_keys, new_locations, add_results);
+        ReplicaLimits limits;
+        if (affinity_manager_) {
+            const auto info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+            if (info) {
+                AffinityResolveContext context;
+                context.instance_id = instance_id;
+                context.instance_strategy_json = info->affinity_strategy_json();
+                context.group_strategy_json = registry_manager_->GetGroupAffinityStrategyJson(
+                    request_context, info->instance_group_name());
+                limits = affinity_manager_->GetReplicaLimits(context);
+            }
+        }
+        ec = meta_searcher->BatchAddLocation(request_context, new_keys, new_locations, add_results, limits);
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchAddLocation);
         if (ec != EC_OK) {
             RollbackAddLocations(request_context, instance_id, new_keys, new_locations, add_results);
@@ -1273,10 +1382,226 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     if (event_manager_) {
         event_manager_->Publish(start_write_event);
     }
+    if (request_context->is_replication()) {
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(
+            service_metrics_collector, affinity, replication_write_count, uint64_t{1});
+    }
     return {EC_OK,
             StartWriteCacheInfo(std::move(write_session_id),
                                 std::move(block_mask),
                                 CacheLocationViewVecWrapper(std::move(new_locations)))};
+}
+
+std::pair<ErrorCode, bool> CacheManager::ReplicateCache(RequestContext *request_context,
+                                                        const std::string &instance_id,
+                                                        const ReplicationHint &hint,
+                                                        int64_t write_timeout_seconds) {
+    auto results = ReplicateCaches(request_context, instance_id, {hint}, write_timeout_seconds);
+    return results.empty() ? std::make_pair(EC_ERROR, false) : results.front();
+}
+
+std::vector<std::pair<ErrorCode, bool>>
+CacheManager::ReplicateCaches(RequestContext *request_context,
+                              const std::string &instance_id,
+                              const std::vector<ReplicationHint> &hints,
+                              int64_t write_timeout_seconds) {
+    const auto started_at = std::chrono::steady_clock::now();
+    auto *service_metrics_collector =
+        dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    struct State {
+        enum class FailureStage { None, Allocation, Copy, Publish };
+        ErrorCode ec{EC_OK};
+        bool already_exists{false};
+        FailureStage failure_stage{FailureStage::None};
+        std::string session_id;
+        std::string storage_name;
+        std::vector<DataStorageUri> sources;
+        std::vector<DataStorageUri> destinations;
+    };
+    struct CopyBatch {
+        std::vector<DataStorageUri> sources;
+        std::vector<DataStorageUri> destinations;
+        std::vector<size_t> state_indices;
+    };
+
+    std::vector<State> states(hints.size());
+    request_context->set_is_replication(true);
+    auto finish = [&](State &state, bool success) {
+        if (state.session_id.empty()) return EC_OK;
+        auto session_id = std::move(state.session_id);
+        state.session_id.clear();
+        return FinishWriteCache(request_context,
+                                instance_id,
+                                session_id,
+                                static_cast<BlockMaskOffset>(success ? 1 : 0));
+    };
+
+    for (size_t i = 0; i < hints.size(); ++i) {
+        const auto &hint = hints[i];
+        auto &state = states[i];
+        if (hint.target_node_id.empty() || hint.source_specs.empty()) {
+            state.ec = EC_BADARGS;
+            state.failure_stage = State::FailureStage::Allocation;
+            continue;
+        }
+        request_context->set_replication_target_node_id(hint.target_node_id);
+        auto [start_ec, write_info] = StartWriteCache(request_context,
+                                                      instance_id,
+                                                      {hint.block_key},
+                                                      {},
+                                                      {},
+                                                      write_timeout_seconds,
+                                                      1);
+        if (start_ec != EC_OK) {
+            state.ec = start_ec;
+            state.failure_stage = State::FailureStage::Allocation;
+            continue;
+        }
+        state.session_id = write_info.write_session_id();
+        const auto &locations = write_info.locations().cache_locations_view();
+        if (locations.empty()) {
+            state.ec = finish(state, false);
+            state.already_exists = state.ec == EC_OK;
+            if (state.ec != EC_OK) state.failure_stage = State::FailureStage::Publish;
+            continue;
+        }
+        if (locations.size() != 1 || locations.front().location_specs().empty()) {
+            static_cast<void>(finish(state, false));
+            state.ec = EC_ERROR;
+            state.failure_stage = State::FailureStage::Allocation;
+            continue;
+        }
+
+        std::unordered_map<std::string, std::string> sources;
+        for (const auto &source : hint.source_specs) {
+            if (source.uri.empty() || !sources.emplace(source.spec_name, source.uri).second) {
+                state.ec = EC_BADARGS;
+                state.failure_stage = State::FailureStage::Copy;
+                break;
+            }
+        }
+        const auto &dest_specs = locations.front().location_specs();
+        if (state.ec == EC_OK && sources.size() == 1 && sources.begin()->first.empty() && dest_specs.size() == 1) {
+            auto uri = std::move(sources.begin()->second);
+            sources.clear();
+            sources.emplace(dest_specs.front().name(), std::move(uri));
+        }
+        if (state.ec == EC_OK && sources.size() != dest_specs.size()) {
+            state.ec = EC_BADARGS;
+            state.failure_stage = State::FailureStage::Copy;
+        }
+        for (const auto &dest : dest_specs) {
+            if (state.ec != EC_OK) break;
+            const auto source = sources.find(dest.name());
+            if (source == sources.end()) {
+                state.ec = EC_BADARGS;
+                state.failure_stage = State::FailureStage::Copy;
+                break;
+            }
+            DataStorageUri src_uri(source->second);
+            DataStorageUri dst_uri(dest.uri());
+            if (!src_uri.Valid() || !dst_uri.Valid() || src_uri.GetHostName().empty() ||
+                src_uri.GetHostName() != dst_uri.GetHostName() ||
+                (!state.storage_name.empty() && state.storage_name != dst_uri.GetHostName())) {
+                state.ec = EC_BADARGS;
+                state.failure_stage = State::FailureStage::Copy;
+                break;
+            }
+            state.storage_name = dst_uri.GetHostName();
+            state.sources.push_back(std::move(src_uri));
+            state.destinations.push_back(std::move(dst_uri));
+        }
+        if (state.ec != EC_OK) static_cast<void>(finish(state, false));
+    }
+
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    std::map<std::string, CopyBatch> batches;
+    for (size_t i = 0; i < states.size(); ++i) {
+        auto &state = states[i];
+        if (state.ec != EC_OK || state.already_exists || state.sources.empty()) continue;
+        if (!data_storage_manager) {
+            state.ec = EC_NOENT;
+            state.failure_stage = State::FailureStage::Copy;
+            static_cast<void>(finish(state, false));
+            continue;
+        }
+        auto &batch = batches[state.storage_name];
+        batch.sources.insert(batch.sources.end(), state.sources.begin(), state.sources.end());
+        batch.destinations.insert(batch.destinations.end(), state.destinations.begin(), state.destinations.end());
+        batch.state_indices.insert(batch.state_indices.end(), state.sources.size(), i);
+    }
+
+    for (auto &[storage_name, batch] : batches) {
+        const auto copy_results = data_storage_manager->Copy(
+            request_context, storage_name, batch.sources, batch.destinations);
+        if (copy_results.size() != batch.sources.size()) {
+            for (const auto state_index : batch.state_indices) {
+                states[state_index].ec = EC_ERROR;
+                states[state_index].failure_stage = State::FailureStage::Copy;
+            }
+            continue;
+        }
+        for (size_t i = 0; i < copy_results.size(); ++i) {
+            if (copy_results[i] != EC_OK && states[batch.state_indices[i]].ec == EC_OK) {
+                states[batch.state_indices[i]].ec = copy_results[i];
+                states[batch.state_indices[i]].failure_stage = State::FailureStage::Copy;
+            }
+        }
+    }
+
+    std::vector<std::pair<ErrorCode, bool>> results;
+    results.reserve(states.size());
+    for (auto &state : states) {
+        if (!state.session_id.empty() && !state.already_exists && !state.sources.empty()) {
+            if (state.ec == EC_OK) {
+                state.ec = finish(state, true);
+                if (state.ec != EC_OK) state.failure_stage = State::FailureStage::Publish;
+            } else {
+                const auto abort_ec = finish(state, false);
+                if (abort_ec != EC_OK) {
+                    state.ec = abort_ec;
+                    state.failure_stage = State::FailureStage::Publish;
+                }
+            }
+        }
+        results.emplace_back(state.ec, state.already_exists);
+    }
+    uint64_t success_count = 0;
+    uint64_t failure_count = 0;
+    uint64_t allocation_failure_count = 0;
+    uint64_t copy_failure_count = 0;
+    uint64_t publish_failure_count = 0;
+    for (const auto &state : states) {
+        if (state.ec == EC_OK) {
+            if (!state.already_exists) ++success_count;
+            continue;
+        }
+        ++failure_count;
+        switch (state.failure_stage) {
+        case State::FailureStage::Allocation: ++allocation_failure_count; break;
+        case State::FailureStage::Copy: ++copy_failure_count; break;
+        case State::FailureStage::Publish: ++publish_failure_count; break;
+        case State::FailureStage::None: break;
+        }
+    }
+    KVCM_METRICS_COLLECTOR_ADD_METRICS(
+        service_metrics_collector, affinity, replication_server_copy_success, success_count);
+    KVCM_METRICS_COLLECTOR_ADD_METRICS(
+        service_metrics_collector, affinity, replication_server_copy_failure, failure_count);
+    KVCM_METRICS_COLLECTOR_ADD_METRICS(
+        service_metrics_collector, affinity, replication_allocation_failure, allocation_failure_count);
+    KVCM_METRICS_COLLECTOR_ADD_METRICS(
+        service_metrics_collector, affinity, replication_copy_failure, copy_failure_count);
+    KVCM_METRICS_COLLECTOR_ADD_METRICS(
+        service_metrics_collector, affinity, replication_publish_failure, publish_failure_count);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector,
+        affinity,
+        replication_server_copy_latency_us,
+        static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - started_at)
+                                .count()));
+    return results;
 }
 
 void CacheManager::RollbackAddLocations(RequestContext *request_context,
@@ -1827,6 +2152,65 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     const bool tiered_migration_enabled = IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
     const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
+    const bool is_replication = request_context->is_replication();
+    const std::string &replication_target_node_id = request_context->replication_target_node_id();
+    auto existsOnReplicationTarget =
+        [&replication_target_node_id, &check_loc_data_exist, &instance_info, &location_spec_group_names](
+            size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
+        out_prune_loc_ids.clear();
+        if (replication_target_node_id.empty()) {
+            return false;
+        }
+
+        // Determine the set of spec names required for this block.
+        std::set<std::string> required_specs;
+        if (instance_info) {
+            if (i < location_spec_group_names.size() && !location_spec_group_names[i].empty()) {
+                for (const auto &g : instance_info->location_spec_groups()) {
+                    if (g.name() == location_spec_group_names[i]) {
+                        required_specs.insert(g.spec_names().begin(), g.spec_names().end());
+                        break;
+                    }
+                }
+            }
+            if (required_specs.empty()) {
+                for (const auto &info : instance_info->location_spec_infos()) {
+                    required_specs.insert(info.name());
+                }
+            }
+        }
+
+        // Collect spec names that already exist on the explicit target node.
+        std::set<std::string> local_specs;
+        for (const auto &kv : m) {
+            if (!kv.second) {
+                continue;
+            }
+            if (kv.second->status() != CacheLocationStatus::CLS_SERVING) {
+                continue;
+            }
+            if (check_loc_data_exist && !check_loc_data_exist(*kv.second)) {
+                out_prune_loc_ids.emplace_back(kv.first);
+                continue;
+            }
+            for (const auto &spec : kv.second->location_specs()) {
+                if (spec.node_id() == replication_target_node_id) {
+                    local_specs.insert(spec.name());
+                }
+            }
+        }
+
+        if (required_specs.empty()) {
+            return !local_specs.empty();
+        }
+        for (const auto &name : required_specs) {
+            if (local_specs.find(name) == local_specs.end()) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     auto requestedSpecNames = [&](size_t i) -> const std::vector<std::string> * {
         if (!instance_info || i >= location_spec_group_names.size() || location_spec_group_names[i].empty()) {
             return nullptr;
@@ -1844,6 +2228,9 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     };
     auto existsForWrite =
         [&](size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
+        if (is_replication) {
+            return existsOnReplicationTarget(i, m, out_prune_loc_ids);
+        }
         const auto *spec_names = requestedSpecNames(i);
         if (spec_names == nullptr) {
             return policy->ExistsForWrite(m, check_loc_data_exist, out_prune_loc_ids);
@@ -2104,10 +2491,12 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
                                   const std::shared_ptr<const InstanceInfo> &instance_info,
                                   const std::shared_ptr<DataStorageManager> &data_storage_manager,
                                   const std::string &unique_name,
+                                  const AffinityResolveContext *resolve_ctx,
+                                  int64_t common_size,
                                   std::vector<DataStorageUri> &allocated_uris,
+                                  std::vector<std::string> &allocated_node_ids,
                                   std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
-                                  bool &is_create_success,
-                                  int64_t common_size) {
+                                  bool &is_create_success) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     std::vector<std::string> merged_block_keys;
@@ -2120,7 +2509,7 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
     for (const auto &spec_info : instance_info->location_spec_infos()) {
         if (location_spec_group_names.empty()) {
             for (size_t i = 0; i < keys.size(); i++) {
-                std::string block_key = instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]);
+                std::string block_key = MakeStorageKey(instance_id, spec_info.name(), keys[i]);
                 merged_block_keys.push_back(block_key);
                 merged_keys_idx.push_back(i);
                 spec_info_mapping.push_back(&spec_info);
@@ -2134,8 +2523,7 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
                                                          instance_info->location_spec_groups());
                 RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "IsSpecNameInSpecGroup failed");
                 if (found) {
-                    std::string block_key =
-                        instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]);
+                    std::string block_key = MakeStorageKey(instance_id, spec_info.name(), keys[i]);
                     merged_block_keys.push_back(block_key);
                     merged_keys_idx.push_back(i);
                     spec_info_mapping.push_back(&spec_info);
@@ -2144,12 +2532,26 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
         }
     }
 
-    std::vector<std::pair<ErrorCode, DataStorageUri>> results = data_storage_manager->Create(
-        request_context, unique_name, merged_block_keys, common_size, []() { /* do nothing */ });
+    WriteHints write_hints;
+    if (affinity_manager_ && resolve_ctx) {
+        auto dec = affinity_manager_->ResolveWrite(*resolve_ctx);
+        if (dec.status == AffinityStatus::kAbort) {
+            KVCM_LOG_WARN("[traceId: %s] affinity write strategy aborted, "
+                          "falling back to no-affinity write",
+                          trace_id.c_str());
+        } else {
+            write_hints = std::move(dec.hints);
+        }
+    }
+    const bool strict = request_context->is_replication();
+    if (strict) write_hints.preferred_node_ids = {request_context->replication_target_node_id()};
+    std::vector<LocationDescriptor> results = data_storage_manager->Create(
+        request_context, unique_name, merged_block_keys, common_size, write_hints, strict, []() { /* do nothing */ });
 
     for (size_t i = 0; i < results.size(); i++) {
-        if (results[i].first == ErrorCode::EC_OK) {
-            allocated_uris.push_back(results[i].second);
+        if (results[i].ec == ErrorCode::EC_OK) {
+            allocated_uris.push_back(results[i].uri);
+            allocated_node_ids.push_back(results[i].node_id);
             key_to_uris[merged_keys_idx[i]].push_back({allocated_uris.size() - 1, spec_info_mapping[i]});
         }
     }
@@ -2162,9 +2564,9 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
                    merged_block_keys.size());
     }
     for (auto &result : results) {
-        if (result.first != ErrorCode::EC_OK) {
+        if (result.ec != ErrorCode::EC_OK) {
             is_create_success = false;
-            PREFIX_LOG(WARN, "create data storage fail, ec_code: %d", result.first);
+            PREFIX_LOG(WARN, "create data storage fail, ec_code: %d", result.ec);
             break;
         }
     }
@@ -2178,7 +2580,9 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
                                      const std::shared_ptr<const InstanceInfo> &instance_info,
                                      const std::shared_ptr<DataStorageManager> &data_storage_manager,
                                      const std::string &unique_name,
+                                     const AffinityResolveContext *resolve_ctx,
                                      std::vector<DataStorageUri> &allocated_uris,
+                                     std::vector<std::string> &allocated_node_ids,
                                      std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
                                      bool &is_create_success) {
     // avoid use file across tp ranks
@@ -2191,7 +2595,7 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
         keys_idx.reserve(keys.size());
         if (location_spec_group_names.empty()) {
             for (size_t i = 0; i < keys.size(); i++) {
-                std::string block_key = instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]);
+                std::string block_key = MakeStorageKey(instance_id, spec_info.name(), keys[i]);
                 block_keys.push_back(block_key);
                 keys_idx.push_back(i);
             }
@@ -2204,8 +2608,7 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
                                                          instance_info->location_spec_groups());
                 RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "IsSpecNameInSpecGroup failed");
                 if (found) {
-                    std::string block_key =
-                        instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]);
+                    std::string block_key = MakeStorageKey(instance_id, spec_info.name(), keys[i]);
                     block_keys.push_back(block_key);
                     keys_idx.push_back(i);
                 }
@@ -2216,12 +2619,28 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
             continue;
         }
 
-        std::vector<std::pair<ErrorCode, DataStorageUri>> results = data_storage_manager->Create(
-            request_context, unique_name, block_keys, spec_info.size(), []() { /* do nothing */ });
+        // TODO: ResolveWrite is called once per spec; if strategy has stateful
+        // side effects in the future, hoist this outside the per-spec loop.
+        WriteHints write_hints;
+        if (affinity_manager_ && resolve_ctx) {
+            auto dec = affinity_manager_->ResolveWrite(*resolve_ctx);
+            if (dec.status == AffinityStatus::kAbort) {
+                KVCM_LOG_WARN("[traceId: %s] affinity write strategy aborted, "
+                              "falling back to no-affinity write",
+                              trace_id.c_str());
+            } else {
+                write_hints = std::move(dec.hints);
+            }
+        }
+        const bool strict = request_context->is_replication();
+        if (strict) write_hints.preferred_node_ids = {request_context->replication_target_node_id()};
+        std::vector<LocationDescriptor> results = data_storage_manager->Create(
+            request_context, unique_name, block_keys, spec_info.size(), write_hints, strict, []() { /* do nothing */ });
 
         for (size_t i = 0; i < results.size(); i++) {
-            if (results[i].first == ErrorCode::EC_OK) {
-                allocated_uris.push_back(results[i].second);
+            if (results[i].ec == ErrorCode::EC_OK) {
+                allocated_uris.push_back(results[i].uri);
+                allocated_node_ids.push_back(results[i].node_id);
                 key_to_uris[keys_idx[i]].push_back({allocated_uris.size() - 1, &spec_info});
             }
         }
@@ -2235,9 +2654,9 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
                        block_keys.size());
         }
         for (auto &result : results) {
-            if (result.first != ErrorCode::EC_OK) {
+            if (result.ec != ErrorCode::EC_OK) {
                 is_create_success = false;
-                PREFIX_LOG(WARN, "create data storage fail, ec_code: %d", result.first);
+                PREFIX_LOG(WARN, "create data storage fail, ec_code: %d", result.ec);
                 break;
             }
         }
@@ -2280,6 +2699,33 @@ ErrorCode CacheManager::GenWriteLocationOnStorage(RequestContext *request_contex
                               ? instance_info->location_spec_infos().front().size()
                               : 0;
 
+    // node_id reported by backend, parallel to allocated_uris;
+    // persisted into LocationSpec.node_id for later affinity decisions.
+    std::vector<std::string> allocated_node_ids;
+    allocated_node_ids.reserve(allocated_uris.capacity());
+
+    AffinityResolveContext resolve_ctx;
+    const AffinityResolveContext *resolve_ctx_ptr = nullptr;
+    if (affinity_manager_) {
+        resolve_ctx.instance_id = instance_id;
+        resolve_ctx.trace_id = trace_id;
+        if (instance_info) {
+            resolve_ctx.instance_strategy_json = instance_info->affinity_strategy_json();
+            resolve_ctx.instance_group_name = instance_info->instance_group_name();
+            // Fetch the per-instance-group JSON. Missing group is treated as
+            // "no override at that tier" -- we leave the field empty and let the
+            // affinity manager fall through to the process-level strategy.
+            if (registry_manager_) {
+                resolve_ctx.group_strategy_json = registry_manager_->GetGroupAffinityStrategyJson(
+                    request_context, instance_info->instance_group_name());
+            }
+        }
+        if (request_context) {
+            resolve_ctx.caller_node = request_context->caller_node();
+        }
+        resolve_ctx_ptr = &resolve_ctx;
+    }
+
     if (merge) {
         auto ec = CreateInSingleBatch(request_context,
                                       instance_id,
@@ -2288,10 +2734,12 @@ ErrorCode CacheManager::GenWriteLocationOnStorage(RequestContext *request_contex
                                       instance_info,
                                       data_storage_manager,
                                       storage_name,
+                                      resolve_ctx_ptr,
+                                      common_size,
                                       allocated_uris,
+                                      allocated_node_ids,
                                       key_to_uris,
-                                      is_create_success,
-                                      common_size);
+                                      is_create_success);
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "CreateInSingleBatch failed");
     } else {
         auto ec = CreateBySpec(request_context,
@@ -2301,7 +2749,9 @@ ErrorCode CacheManager::GenWriteLocationOnStorage(RequestContext *request_contex
                                instance_info,
                                data_storage_manager,
                                storage_name,
+                               resolve_ctx_ptr,
                                allocated_uris,
+                               allocated_node_ids,
                                key_to_uris,
                                is_create_success);
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "CreateBySpec failed");
@@ -2337,6 +2787,10 @@ ErrorCode CacheManager::GenWriteLocationOnStorage(RequestContext *request_contex
             LocationSpec location_spec;
             location_spec.set_name(location_spec_info->name());
             location_spec.set_uri(allocated_uris[data_storage_uri_idx].ToUriString());
+            // Persist node_id from backend; empty = backend not affinity-aware.
+            if (data_storage_uri_idx < allocated_node_ids.size()) {
+                location_spec.set_node_id(allocated_node_ids[data_storage_uri_idx]);
+            }
             cache_location->push_location_spec(std::move(location_spec));
         }
         cache_location->set_spec_size(uris.size());
@@ -4337,28 +4791,54 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
     return Jsonizable::ToJsonString(result);
 }
 
-ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
-                                                    RequestContext *request_context,
-                                                    const std::string &instance_id,
-                                                    QueryType query_type,
-                                                    const KeyVector &keys,
-                                                    const BlockMask &block_mask,
-                                                    int32_t sw_size,
-                                                    CacheLocationVector &cache_locations) const {
+ErrorCode
+CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
+                                          RequestContext *request_context,
+                                          const std::string &instance_id,
+                                          QueryType query_type,
+                                          const KeyVector &keys,
+                                          const BlockMask &block_mask,
+                                          int32_t sw_size,
+                                          CacheLocationVector &cache_locations,
+                                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto policy = genSelectLocationPolicy(request_context, instance_id);
     if (policy == nullptr) {
         return EC_ERROR;
     }
+    AffinityResolveContext resolve_ctx;
+    resolve_ctx.instance_id = instance_id;
+    resolve_ctx.trace_id = trace_id;
+    if (affinity_manager_) {
+        auto info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+        if (info) {
+            resolve_ctx.instance_strategy_json = info->affinity_strategy_json();
+            resolve_ctx.instance_group_name = info->instance_group_name();
+            resolve_ctx.group_strategy_json =
+                registry_manager_->GetGroupAffinityStrategyJson(request_context, info->instance_group_name());
+        }
+        if (request_context) {
+            resolve_ctx.caller_node = request_context->caller_node();
+        }
+    }
+    const AffinityResolveContext *resolve_ctx_ptr = affinity_manager_ ? &resolve_ctx : nullptr;
     ErrorCode ec = EC_ERROR;
     switch (query_type) {
     case QueryType::QT_BATCH_GET: {
-        ec = meta_searcher->BatchGetBestLocation(request_context, keys, cache_locations, policy.get());
+        ec = meta_searcher->BatchGetBestLocation(
+            request_context, keys, cache_locations, policy.get(), affinity_manager_, resolve_ctx_ptr, out_side_effects);
         break;
     }
     case QueryType::QT_PREFIX_MATCH: {
-        ec = meta_searcher->PrefixMatch(request_context, keys, block_mask, cache_locations, policy.get());
+        ec = meta_searcher->PrefixMatch(request_context,
+                                        keys,
+                                        block_mask,
+                                        cache_locations,
+                                        policy.get(),
+                                        affinity_manager_,
+                                        resolve_ctx_ptr,
+                                        out_side_effects);
         break;
     }
     case QueryType::QT_REVERSE_ROLL_SW_MATCH: {
@@ -4366,7 +4846,14 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
             request_context->error_tracer()->AddErrorMsg("QT_REVERSE_ROLL_SW_MATCH bad args");
             RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_BADARGS, "bad keys size: %zu, %d", keys.size(), sw_size);
         }
-        ec = meta_searcher->ReverseRollSlideWindowMatch(request_context, keys, sw_size, cache_locations, policy.get());
+        ec = meta_searcher->ReverseRollSlideWindowMatch(request_context,
+                                                        keys,
+                                                        sw_size,
+                                                        cache_locations,
+                                                        policy.get(),
+                                                        affinity_manager_,
+                                                        resolve_ctx_ptr,
+                                                        out_side_effects);
         break;
     }
     default:
@@ -4414,7 +4901,8 @@ ErrorCode CacheManager::DoRecoverOnce() {
                                                       instance_info->location_spec_infos(),
                                                       instance_info->model_deployment(),
                                                       instance_info->location_spec_groups(),
-                                                      static_cast<QueryType>(instance_info->default_query_type()));
+                                                      static_cast<QueryType>(instance_info->default_query_type()),
+                                                      instance_info->affinity_strategy_json());
             if (ec3 != EC_OK) {
                 KVCM_LOG_WARN("CacheManager RegisterInstance failed when recover, skip. ec[%d] instance_group "
                               "name[%s] instance_id[%s]",

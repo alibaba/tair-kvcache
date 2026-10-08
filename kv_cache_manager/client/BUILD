@@ -33,6 +33,9 @@ cc_library(
         "include/common.h",
     ],
     strip_include_prefix = "include",
+    deps = [
+        "//kv_cache_manager/common:affinity_types",
+    ],
     alwayslink = True,
 )
 
@@ -56,12 +59,14 @@ cc_library(
     srcs = [
         "src/manager_client_impl.cc",
         "src/meta_client_impl.cc",
+        "src/replication_executor.cc",
         "src/rtp_llm_client_impl.cc",
         "src/transfer_client_impl.cc",
     ],
     hdrs = [
         "src/manager_client_impl.h",
         "src/meta_client_impl.h",
+        "src/replication_executor.h",
         "src/rtp_llm_client_impl.h",
         "src/transfer_client_impl.h",
     ],
@@ -70,7 +75,10 @@ cc_library(
         "//kv_cache_manager/client/src/internal/config",
         "//kv_cache_manager/client/src/internal/sdk",
         "//kv_cache_manager/client/src/internal/stub:grpc_stub",
+        "//kv_cache_manager/common:affinity_types",
+        "//kv_cache_manager/common:node_topology",
         "//kv_cache_manager/common:env_util",
+        "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:string_util",
     ],
     alwayslink = True,

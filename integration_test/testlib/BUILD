@@ -24,3 +24,10 @@ py_test(
     main = "test_base_test.py",
     deps = [":test_base"],
 )
+
+py_test(
+    name = "WorkerReadinessTest",
+    srcs = ["worker_test.py"],
+    main = "worker_test.py",
+    deps = [":test_base"],
+)

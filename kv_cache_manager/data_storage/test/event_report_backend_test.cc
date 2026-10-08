@@ -63,6 +63,12 @@ TEST_F(EventReportBackendTest, BasicAccessors) {
     ASSERT_DOUBLE_EQ(1.0, backend.GetStorageUsageRatio("trace"));
 
     auto create_res = backend.Create({"k1", "k2"}, 64, "trace", []() {});
+    for (bool strict : {false, true}) {
+        const auto hinted = backend.CreateWithHints({"k1", "k2"}, 64, WriteHints{{"nodeA"}}, strict, "trace", [] {});
+        ASSERT_EQ(2u, hinted.size());
+        EXPECT_EQ(EC_UNIMPLEMENTED, hinted[0].ec);
+        EXPECT_EQ(EC_UNIMPLEMENTED, hinted[1].ec);
+    }
     ASSERT_EQ(create_res.size(), 2u);
     for (const auto &[ec, uri] : create_res) {
         ASSERT_EQ(ec, ErrorCode::EC_UNIMPLEMENTED);
