@@ -2,13 +2,25 @@
 
 先读[整体设计](design-cache-affinity-v1.md)了解方案。本页供实现和排查时查阅，保留调用链、参数默认值、源码依据、已知缺口和测试边界。
 
+| 要查什么 | 阅读位置 |
+|---|---|
+| 组件如何配合、代码在哪里 | [组件与源码](#components) |
+| 如何识别本地、副本如何表示 | [节点身份、元数据与协议](#identity) |
+| 配置如何覆盖、默认值是什么 | [策略与配置](#configuration) |
+| 写入和读选路的具体条件 | [普通写](#write) / [读与复制提示](#read) |
+| 谁执行复制、资源和失败怎么处理 | [复制执行](#replication) |
+| 何时回收、最低副本与重启限制 | [节点回收与恢复](#eviction) |
+| 还有哪些待办、测试证明了什么 | [后端与待办](#status) / [验证依据](#validation) |
+
+<a id="baseline"></a>
+
 本文描述 `kvcm_affinity_merge` 分支的实际行为，不把设计目标视为已完成能力。源码核对基线为 **2026-10-08，KVCM `f0b9254d917bba8c23df8c91b56e49e321718664`**；下文链接随分支移动，核对历史行为时使用此提交。配置示例见[中文指南](cache-affinity-zh_CN.md) / [English guide](cache-affinity-en_US.md)。
 
-## 1. 目标、边界与组件
+<a id="components"></a>
 
-当前方案围绕调用方所在存储节点组织缓存：普通写尽量就近放置；读取优先选本地、其次同超节点的已有组件；远端读取达到热度条件后返回复制提示；SDK 执行复制；服务端按节点水位触发回收。所有匹配、热度与复制元数据均以 `instance_id` 隔离，不跨 Instance 共享缓存。
+## 1. 组件调用与源码
 
-这里的“调度”是**缓存副本的放置与选择**。KVCM 不把推理请求分派到某个推理 worker，不提供全局推理负载均衡，也没有后台主动寻找热点并预复制的扫描器。复制提示由读请求触发，客户端可以不执行。
+整体职责见[总体方案](design-cache-affinity-v1.md)。下面将职责映射到代码组件；亲和性在读写请求和回收循环中执行，没有后台主动寻找热点并预复制的扫描器。
 
 ```mermaid
 flowchart LR
@@ -40,11 +52,13 @@ flowchart LR
 | SDK 执行器 | [ReplicationExecutor](../kv_cache_manager/client/src/replication_executor.cc)：有界队列、服务端复制、客户端回退、资源与结果统计 |
 | 回收 | [CacheReclaimer](../kv_cache_manager/manager/cache_reclaimer.cc) 和 [SchedulePlanExecutor](../kv_cache_manager/manager/schedule_plan_executor.cc)：候选采样、删除准入、物理删除与元数据清理 |
 
+<a id="identity"></a>
+
 ## 2. 身份、位置与协议
 
 ### 2.1 节点身份
 
-协议使用 `caller.node_id`、`caller.supernode_id`、`caller.replication_capabilities`，不是旧文档中的顶层 `caller_node_ip`。`node_id` 是后端约定的字符串：内源 mempool 使用 **PACE 当前数字 node id 的十进制字符串**；NFS 使用本机 IP。不能用 provider UUID 替换 mempool 的数字 node id。
+协议通过 `caller.node_id`、`caller.supernode_id`、`caller.replication_capabilities` 携带身份和能力。`node_id` 是后端约定的字符串：内源 mempool 使用 **PACE 当前数字 node id 的十进制字符串**；NFS 使用本机 IP。不能用 provider UUID 替换 mempool 的数字 node id。
 
 [CallerNodeProviderFactory](../kv_cache_manager/client/src/internal/sdk/caller_node_provider_factory.cc) 按 storage 配置顺序选择第一个可初始化的 provider。内源 mempool 通过 `pace_local_providers` 查询：仅在恰好一个 provider 且数字 ID 非零时返回身份，否则返回空。默认每次查询；只有显式配置正的 `caller_node_refresh_seconds` 才缓存。该查询不等价于 provider 健康探测。
 
@@ -77,12 +91,14 @@ instance_id → block_key → 多个 CacheLocation（各自有 id / status / cre
 |---|---|
 | `GetCacheLocationRequest.caller` | caller 身份、拓扑及能力；读结果可携带 `replication_hints` 和能力确认 |
 | `StartWriteCacheRequest` | `caller` 影响普通写；`is_replication=true` 时必须带 `replication_target_node_id`，目标独立于 caller |
-| `ReplicationHint` | block key、显式 target、完整具名 `source_specs`；单 spec 还提供兼容的 `source_uri` |
+| `ReplicationHint` | block key、显式 target、本次选中的具名 `source_specs`；单 spec 还提供兼容的 `source_uri`。源集合不保证覆盖实例全部 spec，见第 5、6 节 |
 | `ReplicateCacheRequest` | 支持原单项字段和批量 `items`；每项有独立 target、sources 和结果 |
 | 批量 `ReplicateCacheResponse` | 顶层 OK 表示请求已处理，必须检查每项 `results.code`；`already_exists` 表示目标已具备所需 SERVING 组件 |
 | 旧客户端 | 不带 caller 仍能读写；未声明具名 spec 能力时只会收到单 spec 复制提示 |
 
 多 spec 提示要求 caller 的 `replication_capabilities` 包含具名 spec 能力位（值 `1`）。能力检查在热度观察和抑制之前，旧客户端的多 spec 读不会消耗新协议的热度或抑制窗口。`GetCacheLocationLen`、`GetCacheLocationsByBackend` 没有这一套 caller/hint 接口，不能概括成所有查询都触发复制。
+
+<a id="configuration"></a>
 
 ## 3. 策略选择、开关与配置
 
@@ -129,6 +145,8 @@ instance_id → block_key → 多个 CacheLocation（各自有 id / status / cre
 
 解析器不是完整的严格 schema 校验器：部分字段类型错误会保留默认值，写流水线解析失败也可能仅使 `write_pipeline` 为空，而整个 LocalReplica 策略仍被接受。不能把“加载成功”视为所有配置字段均生效。
 
+<a id="write"></a>
+
 ## 4. 普通写：偏好分配、准入、发布
 
 调用链为 `StartWriteCache → FilterWriteCache → GenWriteLocation → DataStorageManager::Create → MetaSearcher::BatchAddLocation → FinishWriteCache`，见 [CacheManager](../kv_cache_manager/manager/cache_manager.cc)。
@@ -146,6 +164,8 @@ instance_id → block_key → 多个 CacheLocation（各自有 id / status / cre
 - 两项限制也作用于普通 StartWrite，并非只限制读触发的复制；`enabled_aspects.write=false` 不单独关闭 replica limits。
 
 这些是 StartWrite/BatchAddLocation 路径的限制，不是所有写入入口共享的分布式硬配额；ReportEvent、迁移等路径不能自动推定受同一 admission 约束。
+
+<a id="read"></a>
 
 ## 5. 读：先选择已有组件，再决定是否提示复制
 
@@ -170,6 +190,8 @@ instance_id → block_key → 多个 CacheLocation（各自有 id / status / cre
 热度计数发生在**元数据远端命中**时，没有等待或接收 TransferClient Load 成功反馈；查询、轮询也可能增加热度。`prefix_position` 仅 PrefixMatch 传入从 0 开始的 key 位置，BatchGet 和滑窗查询使用默认 -1，所以它们的收益权重为 1。更改半衰期会重建该 key 的计数依据。提示抑制表默认最多 10 万条，LRU 淘汰条目或进程重启都可能使提示早于原窗口再次出现，不能把它当成持久化限频器。
 
 提示发出后没有复制结果反馈来提前解除服务端抑制。任务丢弃或复制失败后，需要后续读取及窗口到期重新触发；没有持久化重试任务或“最终必定复制成功”的保证。
+
+<a id="replication"></a>
 
 ## 6. 复制：服务端 Copy 优先，客户端可回退
 
@@ -255,6 +277,8 @@ sequenceDiagram
 
 回调或统计用于观察执行结果，不能替代 GetCacheMeta 的实际副本状态与后端物理数据校验。上述分类也不是可以任意相加的互斥分区。
 
+<a id="eviction"></a>
+
 ## 7. 节点指标、压力回收与当前接线缺口
 
 ### 7.1 指标新鲜度
@@ -277,7 +301,7 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 
 ### 7.3 最少保留副本并未在节点路径完整生效
 
-这是当前实现与旧文档最关键的差异：
+保护函数与调用者的参数传递关系如下：
 
 - `MetaSearcher::BatchMarkDeletingWithRetention` 已实现 RMW：按 spec 名称统计 SERVING Location 数，若删除会低于 minimum 则拒绝该项。
 - `SchedulePlanExecutor::PrepareDeleteTaskImpl` 在收到正的 `min_retained_replicas` 时调用上述保护，否则走普通 CAS。
@@ -285,7 +309,7 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 - 当前显式设置该字段的调用点在 `ReclaimByLRU`；其他回收、显式删除、TTL/GC 不应据此推定有同等保护。
 - `GetReplicaLimits` 在 Noop/全局关闭时返回 `ReplicaLimits{}`，其中默认保留数仍为 1。因此只要传入 affinity manager，`ReclaimByLRU` 也可能在全局关闭时继续保留最低数量。这是与“仅保护节点压力回收”的参数注释不一致的另一面，不能以注释替代调用链结论。
 
-因此，“保留数参数已解析”和“元数据保护函数已有单测”不等于“节点压力回收全链路受保护”。这里记录实际缺口，本次文档整理不改变回收代码。
+节点压力回收要获得最低副本保护，还需要补齐调用者传参，并验证保护的作用范围；仅有参数解析和元数据函数单测不足以证明这条链路有效。
 
 ### 7.4 重启恢复的范围
 
@@ -298,6 +322,8 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 | 热度、抑制、删除释放量、SDK 队列 | 均在各自进程内，不持久化；各自进程重启后重新采样或触发，不恢复已丢失的复制任务 |
 
 现有 Manager 受控重启测试验证的是元数据及预算恢复，不覆盖任意后端组合的节点索引完整恢复、崩溃瞬间的写会话续传或 provider 物理数据恢复。
+
+<a id="status"></a>
 
 ## 8. 后端支持与待完成项
 
@@ -321,6 +347,8 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 
 若继续开发，优先补节点回收的保留数接线及回归，其次验证身份切换/SSD-only 和真实 PACE 复制回收。高级收益模型、全局调度和自动调参不应先于这些生命周期正确性问题。
 
+<a id="validation"></a>
+
 ## 9. 实现与验证索引
 
 以下测试是对应行为的证据入口；测试存在不代表所有路径或硬件已验证：
@@ -335,6 +363,6 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 
 真实 Manager 集成使用 NFS 和构造的调用方身份，验证控制与元数据链路；其中 Copy 不支持的分支也会被断言。它不是两台 PACE 节点的实际数据复制测试，Manager 重启测试也不是存储 provider 实机重启测试。内源后端及 PACE 适配的源码/依赖基线见父仓库 `docs/cache-affinity-internal.md`（该文件不属于开源 checkout）。
 
-已存在实例的策略更新、部分 spec group / 多 storage 自动复制、单后端节点索引重建、崩溃后用量对账，是本次按调用链核对出的边界。现有 25 个控制面用例不能作为这些组合已端到端验证的证据；补验收时应分别检查返回值、持久化配置/Location、物理数据以及回收候选，不能只断言 RPC 成功。
+已存在实例的策略更新、部分 spec group / 多 storage 自动复制、单后端节点索引重建、崩溃后用量对账仍需补齐并单独验收。现有 25 个控制面用例不能作为这些组合已端到端验证的证据；补验收时应分别检查返回值、持久化配置/Location、物理数据以及回收候选，不能只断言 RPC 成功。
 
 维护本文时，应同时核对调用者是否传参、被调用者是否执行、默认配置是否覆盖、测试使用真实后端还是 mock。新增能力要更新对应流程及边界；只新增字段或单测时，不应直接将待完成项改为已完成。
