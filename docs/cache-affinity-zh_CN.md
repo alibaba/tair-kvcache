@@ -1,7 +1,7 @@
 # Cache Affinity / 缓存亲和性管理
 
 > 本文说明写入流水线及当前副本生命周期控制。已包含读取亲和性、热点复制和节点淘汰，
-> 使用 `caller.node_id`（mempool 为 Provider UUID），并已接入指标自动采样。
+> 使用 `caller.node_id`（mempool 为当前 PACE 数字 node id 的字符串形式），并已接入指标自动采样。
 > 当前协议、默认开关和完成状态以 [完整设计说明](design-cache-affinity-v1.md) 为准。
 
 KVCacheManager 提供一个可选的亲和性层，用来影响**写入时 block →
@@ -225,7 +225,7 @@ load、低 latency),把 `weight` 设为负数即可:
 | `tx_mbps` | `filter` / `sort` 中名为 `tx_mbps` 的指标 |
 | `updated_at_us` | 由亲和性管理器校验新旧采样并按 TTL 过滤；缓存快照不会续期 |
 
-`caller.node_id` 与后端返回的 `node_id` 必须使用同一套稳定标识：mempool 使用 Provider UUID，NFS 使用本机身份。`total_bytes` 用于容量滞回，`supernode_id` 用于同超节点偏好。`rx_mbps` / `tx_mbps` 仍需外部观测来源提供。
+`caller.node_id` 与后端返回的 `node_id` 必须使用同一套标识：mempool 使用当前 PACE 数字 node id 的字符串形式，NFS 使用本机身份。PACE node id 变化表示新的数据状态代际，旧副本不得继续被判为 caller 本地副本。`total_bytes` 用于容量滞回，`supernode_id` 用于同超节点偏好。`rx_mbps` / `tx_mbps` 仍需外部观测来源提供。
 
 > 已注册指标只有上表中的 `free_bytes / load_ratio / rx_mbps / tx_mbps`
 > 四件套。`filter.metric` / `sort.metric` 名不在这张表里,解析时直接
@@ -360,7 +360,7 @@ NFS 与内源 mempool 已实现亲和性放置，并返回包含实际 `node_id`
 
 ### 超节点拓扑和选路
 
-部署时为 KVCM 和 SDK 设置 `KVCM_NODE_TOPOLOGY_FILE`，文件内容为 `{"nodes":{"node_uuid_a":"rack1","node_uuid_b":"rack1"}}`，节点标识必须与存储返回的 node_id 一致。以原子替换方式更新文件；进程每 5 秒刷新。读取失败或 JSON 非法时短期保留上一次映射，30 秒后降级为未知拓扑。空 nodes 可主动清空。SDK 据此填充 CallerNode.supernode_id，服务端也会根据映射补全调用方和 NodeMetrics；后端直接上报的拓扑仍可作为来源。
+部署时为 KVCM 和 SDK 设置 `KVCM_NODE_TOPOLOGY_FILE`，文件内容例如 `{"nodes":{"41":"rack1","42":"rack1"}}`，节点标识必须与存储返回的 node_id 一致。mempool 的 PACE node id 在重注册后可能变化，拓扑控制面需要同步替换成新 ID。以原子替换方式更新文件；进程每 5 秒刷新。读取失败或 JSON 非法时短期保留上一次映射，30 秒后降级为未知拓扑。空 nodes 可主动清空。SDK 据此填充 CallerNode.supernode_id，服务端也会根据映射补全调用方和 NodeMetrics；后端直接上报的拓扑仍可作为来源。
 
 读优先本机，其次同 supernode，最后沿用远端候选顺序。写流水线使用 `"prefer_local":{"same_supernode":true,"on_miss":"abort"}` 可在没有本机候选时尝试同 supernode；默认 false 保留原先行为。严格复制写仍必须落到调用节点，不会因同 supernode 回退而发布错误的本地副本。
 
