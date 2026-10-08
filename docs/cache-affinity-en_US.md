@@ -95,7 +95,7 @@ Task expiry does not forcibly cancel an executing RPC or transfer. Shared memory
 
 Even automatic hints intended for server copying undergo a per-task estimated-size check against `replication_max_buffer_bytes` before queue admission. Shutdown waits for workers, which can continue processing queued tasks; it does not immediately cancel all replication.
 
-For multi-spec copying, check source and destination sets. Filtering read results with `location_spec_names` does not trim hints. Replication allocation omits the spec group and requests all instance specs; a source containing only a smaller spec group, rather than all instance specs, can fail validation and roll back. Server Copy also rejects different source/destination storages. See sections 5 and 6 of the [implementation reference](cache-affinity-implementation.md).
+For multi-spec copying, check source and destination sets. Filtering read results with `location_spec_names` does not trim hints. Replication allocation omits the spec group and requests all instance specs; a source containing only a smaller spec group, rather than all instance specs, can fail validation and roll back. Server Copy also rejects different source/destination storages. See [reads and replication hints](cache-affinity-implementation.md#read) and [replication execution](cache-affinity-implementation.md#replication).
 
 ## 3. Optional supernode topology
 
@@ -116,4 +116,4 @@ The server's file mapping takes precedence over the caller's reported supernode.
 3. Check SDK result callbacks/statistics, then inspect GetCacheMeta's `replica_locations` for complete SERVING components on the target. The compatibility `locations` field contains only the first Location per key. Neither batch-level OK nor `server_copy_succeeded` (which includes already-exists) measures newly created replicas.
 4. Check both physical space and metadata when validating eviction. NFS reports synthetic capacity and has a placeholder Delete implementation, so NFS integration tests do not establish real PACE space reclamation.
 
-Test entry points: [real Manager integration](../integration_test/affinity/affinity_replication_test.py), [SDK replication tests](../kv_cache_manager/client/test/replication_executor_test.cc), [strategy tests](../kv_cache_manager/affinity/test/). See the [implementation reference](cache-affinity-implementation.md) for remaining limitations and development priorities.
+Test entry points: [real Manager integration](../integration_test/affinity/affinity_replication_test.py), [SDK replication tests](../kv_cache_manager/client/test/replication_executor_test.cc), [strategy tests](../kv_cache_manager/affinity/test/). See [backend support and remaining work](cache-affinity-implementation.md#status) for limitations and development priorities.

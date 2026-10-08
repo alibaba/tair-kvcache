@@ -95,7 +95,7 @@ SDK 默认每次读取 PACE 本地身份；设正刷新间隔会允许复用旧�
 
 即使走服务端 Copy，自动 hint 的单任务估算大小也受 `replication_max_buffer_bytes` 的入队检查。`Shutdown` 会等待 worker，队列中已有任务仍可能继续处理，不能视为立即取消所有复制。
 
-多 spec 复制需检查源/目标集合：读结果的 `location_spec_names` 过滤不会裁剪 hint；复制申请未传 spec group，目标按实例全部 spec 分配。源只保存较小 spec group、未覆盖实例全部 spec 时可能失败回滚；多 storage 下，目标 storage 若与源不同，服务端 Copy 也会拒绝。具体边界见[实现参考第 5、6 节](cache-affinity-implementation.md)。
+多 spec 复制需检查源/目标集合：读结果的 `location_spec_names` 过滤不会裁剪 hint；复制申请未传 spec group，目标按实例全部 spec 分配。源只保存较小 spec group、未覆盖实例全部 spec 时可能失败回滚；多 storage 下，目标 storage 若与源不同，服务端 Copy 也会拒绝。具体边界见[读与复制提示](cache-affinity-implementation.md#read)、[复制执行](cache-affinity-implementation.md#replication)。
 
 ## 3. 可选的超节点拓扑
 
@@ -116,4 +116,4 @@ SDK 默认每次读取 PACE 本地身份；设正刷新间隔会允许复用旧�
 3. 通过 SDK 结果回调/统计确认复制结果，再用 GetCacheMeta 的 `replica_locations` 检查目标节点完整的 SERVING 组件；兼容字段 `locations` 仅含每 key 第一个 Location。批量 RPC 顶层 OK、`server_copy_succeeded`（包含 already-exists）均不等于实际新建副本数。
 4. 验证回收时同时核对物理空间与元数据。NFS 指标是合成容量，删除接口仍是占位实现，不能用 NFS 集成测试证明 PACE 真实空间释放。
 
-测试入口：[真实 Manager 集成](../integration_test/affinity/affinity_replication_test.py)、[SDK 复制测试](../kv_cache_manager/client/test/replication_executor_test.cc)、[策略测试](../kv_cache_manager/affinity/test/)。完整限制及后续开发优先级见[实现参考](cache-affinity-implementation.md)。
+测试入口：[真实 Manager 集成](../integration_test/affinity/affinity_replication_test.py)、[SDK 复制测试](../kv_cache_manager/client/test/replication_executor_test.cc)、[策略测试](../kv_cache_manager/affinity/test/)。完整限制及后续开发优先级见[后端与待办](cache-affinity-implementation.md#status)。
