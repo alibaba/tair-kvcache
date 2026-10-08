@@ -34,7 +34,8 @@ Group kinds
   per-token using the three-tier mapping (group logical block -> kernel physical
   block) because the scheduler's group block size may exceed the kernel block
   size.
-* Mamba/linear/gdn groups -> ``list[Tensor]`` (e.g. ``[conv_state, ssm_state]``).
+* Mamba/linear/gdn groups -> typed state views (e.g. conv/SSM) bound to the
+  model by vLLM, independently of the connector's byte view of those states.
   The state is stored **per group block**; we capture the whole state slice for
   the group block that each manager block maps to (mirroring the connector's
   ``_state_block_ids``: a manager block's *last* token selects the block).
@@ -102,12 +103,22 @@ class VerifyingConnector(TairKvCacheConnector):
         # Each entry: (group_idx, is_attention, layer_names, group_block_size,
         # kernel_block_size). kernel_block_size is read straight off the tensor.
         self._cap_groups = []
+        self._state_caches = {}
         for meta in self._group_metas:
             if isinstance(meta, AttentionGroupMeta):
                 ref = kv_caches[meta.layer_names[0]]
                 kernel_bs = attn_kv_views(ref)[0][0].shape[1]
             else:
                 kernel_bs = 0
+                for name in meta.layer_names:
+                    # Use the typed state views bound to the model by vLLM,
+                    # independently of the connector's opaque byte views.
+                    states = kv_caches[name]
+                    if isinstance(states, torch.Tensor):
+                        layers = self._vllm_config.compilation_config.static_forward_context
+                        states = layers[name].kv_cache
+                    assert isinstance(states, (list, tuple)) and states
+                    self._state_caches[name] = states
             self._cap_groups.append(
                 (meta.group_idx, isinstance(meta, AttentionGroupMeta),
                  list(meta.layer_names), meta.block_size, kernel_bs))
@@ -318,7 +329,7 @@ class VerifyingConnector(TairKvCacheConnector):
                 if block_id == 0:
                     continue
                 for layer_name in layer_names:
-                    states = self._kv_caches[layer_name]  # list[Tensor]
+                    states = self._state_caches[layer_name]
                     kv_by_layer[layer_name] = [s[block_id].detach().cpu() for s in states]
 
         token_hash = hashlib.sha256(

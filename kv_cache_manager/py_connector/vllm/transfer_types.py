@@ -86,7 +86,7 @@ class StateTransferGroup(TransferGroup):
     """Per-block opaque state bytes, copied verbatim (mamba/linear/gdn)."""
 
     # Per layer, (num_blocks, page_size_bytes) uint8 views into the state
-    # storage (all of a layer's state tensors share one storage).
+    # storage, preserving the layer offset and possibly interleaved blocks.
     block_view_tensors: List[torch.Tensor] = field(default_factory=list)
     # Bytes per block per state layer (spec.page_size_bytes).
     page_size_bytes: int = 0
