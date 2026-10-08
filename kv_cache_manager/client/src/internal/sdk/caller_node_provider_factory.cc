@@ -13,8 +13,8 @@ namespace kv_cache_manager {
 std::unique_ptr<CallerNodeProvider>
 CallerNodeProviderFactory::Create(const std::vector<std::shared_ptr<StorageConfig>> &storage_configs,
                                   std::chrono::seconds refresh_interval) {
-    if (refresh_interval.count() <= 0) {
-        refresh_interval = std::chrono::seconds(30);
+    if (refresh_interval.count() < 0) {
+        refresh_interval = std::chrono::seconds(0);
     }
     for (const auto &storage_config : storage_configs) {
         if (!storage_config) {
