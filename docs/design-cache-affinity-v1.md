@@ -1,348 +1,280 @@
-# Cache Affinity v1 实现说明
+# 缓存亲和性整体设计：当前实现
 
-> 当前实现说明（2026-10-08）：写、读、复制、节点淘汰均已接入，mempool 后端支持
-> `CreateWithHints` 与真实节点指标。节点身份使用当前 PACE 数字 node id 的字符串形式；下文历史描述中的
-> `caller_node_ip` 对应当前的 `caller.node_id`。完整开关为 `kvcm.affinity.enabled`，默认 false。
+本文描述 `kvcm_affinity_merge` 分支的实际行为，不把设计目标视为已完成能力。源码核对基线为 **2026-10-08，KVCM `f0b9254d917bba8c23df8c91b56e49e321718664`**；下文链接随分支移动，核对历史行为时使用此提交。配置示例见[中文指南](cache-affinity-zh_CN.md) / [English guide](cache-affinity-en_US.md)。
 
-### 已补齐的正确性行为
+## 1. 目标、边界与组件
 
-- 不支持亲和性的后端保持普通写入兼容，strict 分配直接拒绝，避免复制静默落到任意节点。
-- 热度计数与复制提示抑制按 `(instance_id, caller_node_id, block_key)` 隔离，避免跨实例干扰。
-- 只有全部 spec 都在本机时才停止复制；hint 的 `source_specs` 携带按名称组织的完整源列表，
-  来源对应本次读取实际选中的 spec，可能包含已经在本机的组件。
-- SDK 按 spec 名称对齐全部目标，所有读取、写入完成后才成功 Finish。缺少源、读取失败、
-  写入失败或返回 URI 数量不符时，用失败 mask 结束会话；成功 Finish 的响应丢失时不再发送相反的失败确认。
-- 单 spec 保留 `source_uri`；多 spec 使用完整 `source_specs`。CallerNode 能力位与响应确认支持分批升级，旧客户端只接收单 spec 提示。
-- SDK 提供 `ReplicateWithBuffers`，按名称复用有共享 owner 的 CPU/GPU 缓冲区；缺失 spec 从源读取，全部成功后发布。旧单指针接口保持兼容。
-- SDK 队列数量与字节有界，进程内共享缓冲区预算、按实例轮转和按目标节点限速；队列任务过期时释放资源。实际复制结果、字节、延迟与丢弃原因可查询或通过回调导出。
-- 节点指标默认 30 秒未出现新采样即过期。相同时间戳的缓存快照不会续期，mempool 时间戳取自
-  成功刷新元信息的时刻。过期节点不参与候选与水位决策；移除节点时清除其删除估算。
-- 节点淘汰消费 instance 级策略；某实例关闭淘汰不会跳过后续实例。新指标仅重置该节点的删除估算。
-  mempool 提供总容量，满水位时不会因除零把微小删除量误算成容量已经恢复。
+当前方案围绕调用方所在存储节点组织缓存：普通写尽量就近放置；读取优先选本地、其次同超节点的已有组件；远端读取达到热度条件后返回复制提示；SDK 执行复制；服务端按节点水位触发回收。所有匹配、热度与复制元数据均以 `instance_id` 隔离，不跨 Instance 共享缓存。
 
-删除释放量来自存储后端实际成功项，按节点和采样时间校验；部分失败不产生虚假释放。
-`replica_limits` 在元数据写入时限制每 key Location 数量与实例总容量，并在节点压力删除的 RMW 中按 spec 保留最低 SERVING 副本数。
-热度默认每 60 秒减半，可选大小、收益与前缀位置准入；拓扑文件刷新驱动本机/同超节点/远端选路。配置和边界详见 [使用说明](cache-affinity-zh_CN.md)。
+这里的“调度”是**缓存副本的放置与选择**。KVCM 不把推理请求分派到某个推理 worker，不提供全局推理负载均衡，也没有后台主动寻找热点并预复制的扫描器。复制提示由读请求触发，客户端可以不执行。
 
+```mermaid
+flowchart LR
+    engine[推理引擎] --> sdk[ManagerClient / MetaClient]
+    sdk --> service[MetaService / CacheManager]
+    service --> affinity[CacheAffinityManager]
+    affinity --> strategy[LocalReplica / Noop]
+    service --> meta[MetaSearcher / MetaIndexer]
+    service --> backend[DataStorageManager / Backend]
+    backend --> storage[存储节点]
+    sdk --> executor[ReplicationExecutor]
+    executor -->|ReplicateCache 控制请求| service
+    executor -->|客户端回退 Load / Save| transfer[TransferClient]
+    transfer --> storage
+    reclaim[CacheReclaimer] --> affinity
+    reclaim --> deletion[SchedulePlanExecutor]
+    deletion --> meta
+    deletion --> backend
+```
 
-**前序文档**：
-- `cache-affinity-v1-zh_CN.md` —— v1 完整设计规范（策略框架 + 数据模型 + 算法决策全集）
-- `cache-affinity-zh_CN.md` / `cache-affinity-en_US.md` —— v0 写时 affinity
+服务端复制由 KVCM 编排目标分配、后端 Copy 和元数据发布；支持 Copy 的后端在存储节点间传输数据。客户端回退则通过 TransferClient 搬运数据。两种路径都不要求 KV 数据流经 KVCM 服务进程。
 
-**对应分支**：`kvcm_affinity_merge`
-
----
-
-## 目录
-
-**第一部分 范围与核心设计**
-- §1 做了什么 / 没做什么
-- §2 策略框架
-- §3 数据模型变更
-- §4 三条路径接入
-
-**第二部分 具体修改**
-- §5 文件变更索引
-- §6 侵入边界
-
-**第三部分 待做与扩展**
-- §7 待完成项
-- §8 扩展指南
-
----
-
-# 第一部分：范围与核心设计
-
----
-
-## 1. 做了什么 / 没做什么
-
-### 1.1 做了什么
-
-在 KVCM 中建立节点级亲和性框架，打通写/读/淘汰三条路径的完整信号管道。
-
-本次改动分三层：
-
-| 层 | 内容 |
+| 组件 | 当前职责与源码 |
 |---|---|
-| 框架层 | `AffinityStrategy` 抽象接口（3 个对称入口）、`StrategyFactory`（JSON 解析 + memoize）、3 层优先级链（instance > instance_group > process）、全局 kill-switch |
-| 管道层 | `caller_node_ip` / `caller_supernode_id` 从 proto 到策略的全链路透传；`ReplicationHint` 从策略到 response 的全链路回传；`node_id` 从 backend 到 `LocationSpec` 的持久化 |
-| 接入层 | 写路径（`GenWriteLocation` → `ResolveWrite`）、读路径（`SelectAndMergeForMatch` → `ResolveRead`）、淘汰路径（`TryReclaimOnGroup` → `ResolveEviction` → per-node `FilterLocID`） |
+| 策略管理 | [CacheAffinityManager](../kv_cache_manager/affinity/cache_affinity_manager.cc)：选择策略、缓存解析结果、节点指标、热度和提示抑制 |
+| 策略算法 | [LocalReplicaAffinityStrategy](../kv_cache_manager/affinity/local_replica_strategy.cc)：`ResolveWrite`、`ResolveRead`、`ResolveEviction` 三个入口 |
+| 缓存编排 | [CacheManager](../kv_cache_manager/manager/cache_manager.cc)：普通写、严格目标复制、会话发布与回滚 |
+| 元数据 | [MetaSearcher](../kv_cache_manager/manager/meta_searcher.cc)：读选路、Location 准入、保留副本的条件状态修改 |
+| SDK 执行器 | [ReplicationExecutor](../kv_cache_manager/client/src/replication_executor.cc)：有界队列、服务端复制、客户端回退、资源与结果统计 |
+| 回收 | [CacheReclaimer](../kv_cache_manager/manager/cache_reclaimer.cc) 和 [SchedulePlanExecutor](../kv_cache_manager/manager/schedule_plan_executor.cc)：候选采样、删除准入、物理删除与元数据清理 |
 
-其中**节点级淘汰**是本次关键改造点。改造前 `CacheReclaimer` 只能按整 key 淘汰，无法区分同一 key 的不同副本分布在哪些节点。本次把淘汰粒度下沉到 `LocationSpec.node_id`：`ResolveEviction` 输出超水位节点集合，`FilterLocID` 新增 per-node 匹配路径，只淘汰超载节点上的副本。没有节点级淘汰，本地副本只增不减，多副本方案无法闭环。
+## 2. 身份、位置与协议
 
-### 1.2 当前边界
+### 2.1 节点身份
 
-普通写入仍使用可配置候选流水线；复制采用半衰期热度、可选成本/前缀收益判断与写入时预算。全局副本上限保守统计 Location（包括拆分 spec 和 WRITING/DELETING），容量包含原始副本。最低保留数用于节点压力淘汰，不阻止显式删除或 TTL 清理。
+协议使用 `caller.node_id`、`caller.supernode_id`、`caller.replication_capabilities`，不是旧文档中的顶层 `caller_node_ip`。`node_id` 是后端约定的字符串：内源 mempool 使用 **PACE 当前数字 node id 的十进制字符串**；NFS 使用本机 IP。不能用 provider UUID 替换 mempool 的数字 node id。
 
-超节点拓扑来自部署维护的可刷新文件或后端上报。复制资源公平性与限速覆盖同一 SDK 进程，不替代跨进程/跨集群配额。基于父 block 热度的普通写 admission、自适应收益预测、跨节点公平淘汰以及实机容量/重启/GPU 验收仍可继续迭代。
+[CallerNodeProviderFactory](../kv_cache_manager/client/src/internal/sdk/caller_node_provider_factory.cc) 按 storage 配置顺序选择第一个可初始化的 provider。内源 mempool 通过 `pace_local_providers` 查询：仅在恰好一个 provider 且数字 ID 非零时返回身份，否则返回空。默认每次查询；只有显式配置正的 `caller_node_refresh_seconds` 才缓存。该查询不等价于 provider 健康探测。
 
----
+当前工厂处理 `TAIR_MEMPOOL` 和 NFS，**没有 `TAIR_MEMPOOL_SSD` 分支**；仅配置 SSD 类型时不能据此声称 SDK 已自动取得 PACE 身份。多 storage、多 PACE 集群的身份选择也没有按请求重新绑定。
 
-## 2. 策略框架
+[NodeTopology](../kv_cache_manager/common/node_topology.h) 读取环境变量 `KVCM_NODE_TOPOLOGY_FILE` 指定的 JSON：`nodes` 将上述实际 node id 映射到 supernode。按需最多每 5 秒刷新，连续读取失败后旧映射最多保留 30 秒。它与策略文件不同，支持周期重读；不自动发现集群拓扑。
 
-### 2.1 AffinityStrategy 接口
+### 2.2 元数据粒度
 
-一级行为只有 3 个，接口固定不再变化：
+[CacheLocation / LocationSpec](../kv_cache_manager/meta/cache_location.h) 的层次是：
 
+```text
+instance_id → block_key → 多个 CacheLocation（各自有 id / status / create_time）
+                          └→ 多个 LocationSpec（name / uri / node_id）
 ```
-AffinityStrategy (抽象接口)
-├── ResolveWrite()    → WriteDecision {status, hints}
-├── ResolveRead()     → ReadDecision  {picked_specs, side_effects}
-└── ResolveEviction() → unordered_set<node_id>
-```
 
-设计要点：
+一个 CacheLocation 可包含多个 spec，普通非严格分配允许这些组件落在不同节点。`LocationDescriptor.node_id` 必须描述后端**实际分配节点**，随后写入 LocationSpec；不能直接把请求中的偏好节点当作分配结果。
 
-| 点 | 选择 | 原因 |
-|---|---|---|
-| 接口数量 | 3 个一级入口 | 写/读/淘汰覆盖缓存生命周期全部决策点 |
-| toggle | 算法内部 `Params.enable_*` | 关闭的行为由子类 short-circuit 成 no-op，调用方不需 if-else |
-| 上下文 | `StrategyContext`（通用信号）+ `AffinityResolveContext`（管道上下文） | 策略只看通用信号，不依赖管道细节 |
-| 策略选择 | 3 层优先级链 instance > instance_group > process | 支持多租户不同粒度策略覆盖 |
-| 策略创建 | `StrategyFactory` 从 JSON 解析，按 JSON 文本 memoize | 相同 JSON 共享解析结果，热更新换 JSON 即可 |
-| 复制触发 | 读一级的 on_miss 子项，不独立为一级 | `ReplicationHint` 作为 `ReadSideEffect` 子类经 `ReadDecision.side_effects` 透传 |
+读接口可能把同一 storage 的多个 Location 合成为一个返回值，ID 带 `_merged`。这是读视图，不是新增的持久化副本。排查真实副本及 WRITING/SERVING 状态应使用 `GetCacheMeta` 的完整副本结果 `replica_locations`，不能从合成读结果反推 Location 数量。
 
-### 2.2 两个内置策略
+### 2.3 协议与兼容
 
-**LocalReplicaAffinityStrategy**（v1 默认，需显式配置启用）：
+以 [meta_service.proto](../kv_cache_manager/protocol/protobuf/meta_service.proto) 和 [MetaServiceImpl](../kv_cache_manager/service/meta_service_impl.cc) 为准：
 
-基于 caller 节点局部性 + read-miss 反应式复制 + 节点水位 LRU。3 个一级 method 内部分别调用 private helper（`RunWritePipeline` / `PickLocalSpec` + `ShouldEmitReplicationHint` / `ShouldEvictByNodeWaterLevel`），算法细节不出现在通用接口中。
-
-**NoopAffinityStrategy**（兜底 / kill-switch）：
-
-3 个 method 直接返回 no-op 决策。配置 `{"type": "noop"}` 后 KVCM 行为等价 v0。
-
-### 2.3 应急配置
-
-| 场景 | 配置（热加载） |
+| 接口/字段 | 当前语义 |
 |---|---|
-| 整体关闭 | `{"type": "noop"}` |
-| 仅关复制 | `{"read": {"on_miss": {"enabled": false}}}` |
-| 仅关读亲和 | `{"enabled_aspects": {"read": false}}` |
-| 仅关节点淘汰 | `{"enabled_aspects": {"eviction": false}}` |
+| `GetCacheLocationRequest.caller` | caller 身份、拓扑及能力；读结果可携带 `replication_hints` 和能力确认 |
+| `StartWriteCacheRequest` | `caller` 影响普通写；`is_replication=true` 时必须带 `replication_target_node_id`，目标独立于 caller |
+| `ReplicationHint` | block key、显式 target、完整具名 `source_specs`；单 spec 还提供兼容的 `source_uri` |
+| `ReplicateCacheRequest` | 支持原单项字段和批量 `items`；每项有独立 target、sources 和结果 |
+| 批量 `ReplicateCacheResponse` | 顶层 OK 表示请求已处理，必须检查每项 `results.code`；`already_exists` 表示目标已具备所需 SERVING 组件 |
+| 旧客户端 | 不带 caller 仍能读写；未声明具名 spec 能力时只会收到单 spec 复制提示 |
 
-总开关 `kvcm.affinity.enabled=false` 等价全局 noop。
+多 spec 提示要求 caller 的 `replication_capabilities` 包含具名 spec 能力位（值 `1`）。能力检查在热度观察和抑制之前，旧客户端的多 spec 读不会消耗新协议的热度或抑制窗口。`GetCacheLocationLen`、`GetCacheLocationsByBackend` 没有这一套 caller/hint 接口，不能概括成所有查询都触发复制。
 
-### 2.4 文件结构
+## 3. 策略选择、开关与配置
 
-```
-affinity/
-├── affinity_strategy.h           # 抽象接口 + ReadSideEffect + ReadDecision + WriteDecision
-├── noop_strategy.h               # 兜底空实现
-├── local_replica_strategy.{h,cc} # v1 默认策略，含 ReplicationHint
-├── cache_affinity_manager.{h,cc} # 策略持有 + metrics 快照 + 决策分发
-├── frequency_sketch.{h,cc}       # per-(caller, key) 频率计数
-├── strategy_factory.{h,cc}       # JSON → 策略实例
-├── node_metrics.h                # 节点指标数据结构
-└── pipeline/
-    ├── candidate_pipeline.{h,cc} # 写路径 5 段流水线
-    ├── filter_cond.{h,cc}        # 过滤条件
-    └── metric_catalog.{h,cc}     # 指标名注册表
-```
+### 3.1 策略优先级
 
----
+`CacheAffinityManager` 选择 **instance > instance_group > process > noop** 中第一个非空且整体解析成功的策略。高层策略完整替换低层策略，不做字段合并。空串或整体解析失败向下回退；显式 `{"type":"noop"}` 会终止回退链。相同原始 JSON 共享已解析对象。
 
-## 3. 数据模型变更
+实例与实例组策略随 registry 保存、恢复。进程策略由 [Server::Init](../kv_cache_manager/service/server.cc) 在启动时读取；**当前没有策略文件监视或管理 API 的进程策略热加载链路**。管理类虽提供加载函数，也不能据此假定编辑文件即时生效。
 
-### 3.1 LocationSpec.node_id
+`kvcm.affinity.enabled` 默认 `false`，关闭时所有层级返回 Noop。开启且未指定策略文件时安装服务端内置 LocalReplica 策略；指定文件但读取/解析失败时仅记录警告，不另装内置策略，仍可使用实例/实例组策略。
 
-```proto
-message LocationSpec {
-    string name = 1;
-    string uri = 2;
-    string node_id = 3;  // 新增：spec 落在哪个物理节点
-}
-```
+全局开关控制策略决策；**它不禁止显式 `ReplicateCache` RPC，也不会撤销 SDK 已提交的复制任务**。另外，Noop 下 `GetReplicaLimits` 返回的结构仍默认保留数为 1，对 `ReclaimByLRU` 的影响见第 7.3 节，不能把总开关描述成完全恢复旧回收行为。SDK 的 `auto_replicate` 则只控制读结果自动入队，不禁止显式复制 API。
 
-node_id 放在 LocationSpec 而非 CacheLocation 顶层，因为 strict=false 写入时同一 location 的 spec 可能跨节点。
+### 3.2 默认值必须区分两种来源
 
-### 3.2 LocationDescriptor
+默认值来自 [LocalReplica Params](../kv_cache_manager/affinity/local_replica_strategy.h)、[ReplicaLimits](../kv_cache_manager/common/affinity_types.h)；服务端内置 JSON 另有覆盖：
 
-替代原来的 `pair<ErrorCode, DataStorageUri>`：
-
-```cpp
-struct LocationDescriptor {
-    ErrorCode ec = EC_OK;
-    DataStorageUri uri;
-    std::string node_id;  // 空 = backend 未上报
-};
-```
-
-URI hostname 是集群名，物理节点藏在 query 参数里。让 backend 显式回传 node_id，manager 不解析 URI。
-
-### 3.3 Proto 新增字段
-
-| 消息 | 字段 | 用途 |
+| 参数 | 裸 `{"type":"local_replica"}` | 开启 affinity、未指定策略文件 |
 |---|---|---|
-| `GetCacheLocationRequest` | `caller_node_ip = 9`, `caller_supernode_id = 10` | 调用方自报位置 |
-| `StartWriteCacheRequest` | `caller`、`is_replication = 8`、`replication_target_node_id = 9` | 调用方拓扑 + 复制写标志和明确目标节点 |
-| `ReplicateCache` | 单项兼容字段或批量 `items`，每项含 block key、完整 `source_specs`、`target_node_id` | 服务端批量申请目标 GA，并按 storage 合并调用 backend CopyGA |
-| `GetCacheMetaResponse` | `replica_locations` | 按 key 返回完整副本及状态、时间、PACE node id 和 URI |
-| `GetCacheLocationResponse` | `repeated ReplicationHint hints = 3` | 服务端下发复制提示 |
+| `enabled_aspects.write/read/eviction` | 全部 true | 同左 |
+| `write.ops` | 无流水线，不输出写偏好 | `prefer_local.on_miss=abort`，`limit=2` |
+| `read.on_miss.enabled` | true | 同左 |
+| `replication_hot_threshold` | 3 | 同左 |
+| `caller_capacity_threshold` / `caller_capacity_buffer` | 0.85 / 0.05 | **0.90 / 0.05** |
+| `heat_half_life_ms` / `suppression_window_ms` | 60000 / 60000 | 同左 |
+| `max_replication_bytes` / `min_benefit_ratio` / `prefix_bonus` | 0 / 0 / 0 | 同左 |
+| `node_water_level.threshold` / `low` / `critical` | 0.85 / 0.70 / 0.95 | 同左 |
+| `max_replicas_per_key` / `max_instance_bytes` | 0 / 0，均不设上限 | 同左 |
+| `min_retained_replicas` | 1；实际接入范围见第 7 节 | 同左 |
 
-所有新字段 additive，老客户端字段为空时退化为未启用 affinity。
+复制容量门槛是 `threshold - buffer`，因此已知指标下两种配置分别允许到 **0.80** 和 **0.85**，相等仍可通过。`critical` 已解析存储，但目前没有对应的独立决策分支。
 
-### 3.4 storage_key 随机后缀
+[StrategyFactory](../kv_cache_manager/affinity/strategy_factory.cc) 接受裸策略或 `{"strategy":{...}}` 包装，要求 `type` 为 `noop` 或 `local_replica`。写流水线必须放在 **`write.ops` 对象**中。旧版把 `filter/sort/limit` 直接放在 strategy 下的示例不适用。
 
-复制写绕过全局去重后，同一 `(instance, spec_name, block_key)` 可写多份。storage key 末尾追加 8 字符随机后缀避免覆盖。碰撞概率 ~10⁻⁹。
+解析器不是完整的严格 schema 校验器：部分字段类型错误会保留默认值，写流水线解析失败也可能仅使 `write_pipeline` 为空，而整个 LocalReplica 策略仍被接受。不能把“加载成功”视为所有配置字段均生效。
 
----
+## 4. 普通写：偏好分配、准入、发布
 
-## 4. 三条路径接入
+调用链为 `StartWriteCache → FilterWriteCache → GenWriteLocation → DataStorageManager::Create → MetaSearcher::BatchAddLocation → FinishWriteCache`，见 [CacheManager](../kv_cache_manager/manager/cache_manager.cc)。
 
-### 4.1 写路径
+1. 普通写先按已有副本和 `min_replica_count` 去重；选择 storage 的既有逻辑继续负责选后端/层级。
+2. 亲和性从未过期的节点指标中取得候选，依次执行 `filter → prefer_local → sample → sort → limit`。每段可省略，顺序固定。`prefer_local` 命中会缩小候选；无候选时管理器直接给空 hints。
+3. **普通写是 best effort**：策略 Abort 会降级为空 hints，后端可回退到其他节点。`limit=2` 只是最多返回两个偏好候选，不代表创建两个副本。默认不支持 affinity 的后端仍可走旧 Create。
+4. 后端先分配，再将实际 URI/node id 提交元数据准入，生成 WRITING Location 和写会话。准入失败走回滚，不能声称分配前已预留好所有容量。
+5. 客户端完成数据写入后调用 Finish；成功 block 的 Location 转为 SERVING，失败 mask 或会话超时触发清理。批量写允许部分 block 发布，不是整批事务。
 
-```
-proto(caller_node_ip, caller_supernode_id)
-  → MetaServiceImpl::StartWriteCache → RequestContext
-    → CacheManager::GenWriteLocation → 构建 AffinityResolveContext
-      → CreateInSingleBatch / CreateBySpec
-        → CacheAffinityManager::ResolveWrite
-          → strategy.ResolveWrite → WriteDecision.hints
-            → backend.CreateWithHints(hints, strict)
-        → LocationDescriptor.node_id → LocationSpec.node_id（持久化）
-```
+`MetaSearcher::BatchAddLocation` 在同一个 MetaIndexer 的进程内 admission mutex 下检查：
 
-`is_replication=true` 时：跳过全局去重（`ExistsForWrite`），仅检查目标节点是否已有副本，
-并要求 `replication_target_node_id` 非空。该目标直接形成唯一的 `WriteHints` 候选，
-`strict=true` 传给 backend，不再依赖普通 `write.ops`。自动复制优先调用服务端
-`ReplicateCache`，由 KVCM 完成目标 GA 申请、backend CopyGA 和原子发布；旧服务返回
-`UNSUPPORTED` 时 SDK 才回退到 Load/Save 路径。SDK worker 最多聚合 64 个无本地 buffer 的
-任务；服务端再按 storage 合并 source/destination URI，使 TairMempool 的批量 CopyGA 能力
-覆盖多个 block。
+- `max_replicas_per_key` 统计 **Location 条目数**，含 WRITING/DELETING 和分拆 spec 的条目，不是不同物理节点上的完整副本数。
+- `max_instance_bytes` 包含原始副本和 WRITING 预留，按所有 spec URI 的 size 计费；启用字节预算时不能把未知大小当作零成本。
+- 两项限制也作用于普通 StartWrite，并非只限制读触发的复制；`enabled_aspects.write=false` 不单独关闭 replica limits。
 
-### 4.2 读路径
+这些是 StartWrite/BatchAddLocation 路径的限制，不是所有写入入口共享的分布式硬配额；ReportEvent、迁移等路径不能自动推定受同一 admission 约束。
 
-```
-proto(caller_node_ip, caller_supernode_id)
-  → MetaServiceImpl::GetCacheLocation → RequestContext
-    → CacheManager::GetCacheLocationByQueryType
-      → 构建 AffinityResolveContext（含 caller_node_ip + caller_supernode_id）
-      → MetaSearcher::SelectAndMergeForMatch
-        → strategy.ResolveRead → ReadDecision {picked_specs, side_effects}
-          - PickLocalSpec: spec.node_id == caller_node_ip → 本地
-          - ShouldEmitReplicationHint: 远端命中频率超阈值 → ReplicationHint
-      → side_effects 透传到 response.hints
-```
+## 5. 读：先选择已有组件，再决定是否提示复制
 
-亲和性在 merge 步生效，`SelectForMatch` 保留 tier 选择语义不看 caller，避免副本数量稀释 type 权重。
+[meta_searcher.cc 中的 SelectAndMergeForMatch](../kv_cache_manager/manager/meta_searcher.cc) 先过滤 SERVING（以及请求启用时的存储存在性检查），按既有策略选择 storage，再在该 storage 内按 spec 名称收集候选。LocalReplica 对每个 spec 依次偏好：**caller 本节点 → 同 supernode → 第一个候选**。它不为了本地性跨 storage 改选层级，也不把 WRITING 当成可读数据。
 
-`FrequencySketch` 管理 per-(caller, key) 远端命中计数，sketch 由 `CacheAffinityManager` 持有，策略重解析不丢失状态。不持久化，重启有分钟级 warm 期。
+关闭 read 行为时仍可沿既有候选读取，只是不应用本地选择和复制提示。关闭 `read.on_miss.enabled` 只停止产生提示，保留本地优先读取。
 
-### 4.3 淘汰路径
+产生提示需要完整的非空源列表、非空 caller、协议能力满足，并且至少一个选中 spec 不在本地。hint 携带本次选中的全部 spec，包含已在本地的组件，确保目标可成为完整副本。
 
-```
-CacheReclaimer::TryReclaimOnGroup
-  → CacheAffinityManager::ResolveEviction
-    → strategy: 遍历 all_nodes，比较 load_ratio vs 阈值
-    → exceeded_node_ids
-  → IsTriggerReclaiming（general ∨ per-type ∨ per-node）
-  → ReclaimByLRU / LFU / TTL → FilterLocID
-    → 3 条匹配路径:
-       1. general 水位超限 → 任意 loc
-       2. per-type 超限 → 匹配 storage type
-       3. per-node 超限 → 匹配 spec.node_id ∈ exceeded_node_ids（新增）
-    → ReportEvictedBytes（hysteresis 累计）
-```
-
-改造前 `FilterLocID` 只按整 key 淘汰。现在 path 3 配合 `LocationSpec.node_id` 实现节点级定向淘汰。
-
----
-
-# 第二部分：具体修改
-
----
-
-## 5. 文件变更索引
-
-| 模块 | 文件 | 变更 |
-|---|---|---|
-| **策略框架** | `affinity/affinity_strategy.h` | 新增：抽象接口 + ReadSideEffect + 决策结构体 |
-| | `affinity/noop_strategy.h` | 新增：空实现兜底 |
-| | `affinity/local_replica_strategy.{h,cc}` | 新增：v1 默认策略，含 ReplicationHint |
-| | `affinity/strategy_factory.{h,cc}` | 新增：JSON → 策略实例 |
-| | `affinity/frequency_sketch.{h,cc}` | 新增：per-(caller, key) 频率计数 |
-| | `affinity/cache_affinity_manager.{h,cc}` | 重构：3 入口 + metrics pull loop + kill-switch |
-| | `affinity/pipeline/` | 重命名：`strategy.*` → `candidate_pipeline.*` 等 |
-| **数据模型** | `meta/cache_location.h` | `LocationSpec` 加 `node_id` |
-| | `data_storage/data_storage_backend.h` | `LocationDescriptor` + `SnapshotPerNodeMetrics` |
-| | `data_storage/data_storage_manager.{h,cc}` | `Create` 返回 `LocationDescriptor` |
-| **写路径** | `manager/cache_manager.{h,cc}` | `GenWriteLocation` 构建 resolve_ctx；`CreateInSingleBatch/CreateBySpec` 调 `ResolveWrite`；`FilterWriteCache` 加 `existsOnCallerNode` |
-| **读路径** | `manager/meta_searcher.{h,cc}` | `SelectAndMergeForMatch` 接入 `ResolveRead` + side_effects 透传 |
-| | `manager/cache_manager.{h,cc}` | `GetCacheLocationByQueryType` 构建 resolve_ctx（修复 caller_node_ip 缺失）；`GetCacheLocation` 加 `out_hints` |
-| **淘汰路径** | `manager/cache_reclaimer.{h,cc}` | `FilterLocID` 加 per-node 匹配；`IsTriggerReclaiming` 加 `exceeded_node_ids` |
-| **Service** | `service/meta_service_impl.cc` | 注入 caller 信号 + is_replication；hints 回填 response |
-| | `service/server.{h,cc}` | 创建 `CacheAffinityManager`，加载策略文件 |
-| | `service/server_config.{h,cc}` | `kvcm.affinity.enabled` / `strategy_file` |
-| **Proto** | `protocol/protobuf/meta_service.proto` | `LocationSpec.node_id`、`ReplicationHint`、caller 信号、`is_replication`、`response.hints` |
-| **配置** | `config/registry_manager.{h,cc}` | `GetGroupAffinityStrategyJson` |
-| **测试** | `manager/test/` | CacheManagerTest（3 个 affinity 场景）、MetaSearcherTest |
-| | `affinity/test/` | 策略单元测试（7 target） |
-| | `common/test/` | RequestContext getter/setter |
-
----
-
-## 6. 侵入边界
-
-策略框架对主路径的侵入集中在 3 个调用点：
-
-| 调用点 | 文件 | 函数 |
-|---|---|---|
-| write | `cache_manager.cc` | `CreateInSingleBatch` / `CreateBySpec` |
-| read | `meta_searcher.cc` | `SelectAndMergeForMatch` |
-| eviction | `cache_reclaimer.cc` | `FilterLocID` |
-
-每个调用点的模式一致：取策略 → 调对应 Resolve → 用返回值。策略内部 toggle 关闭时返回 no-op 决策，调用方无感知。
-
-不侵入的代码：`SelectForMatch`（tier 选择）、`BatchAddLocation`（元数据写入）、recovery 路径、client SDK 主路径。
-
----
-
-# 第三部分：待做与扩展
-
----
-
-## 7. 待完成项
-
-### 7.1 算法层（最关键）
-
-| 决策点 | 已实现 | 后续方向 |
-|---|---|---|
-| 写 admission | 写入时副本数量和实例容量预算 | 普通写入结合父 block 热度 |
-| 读 on_miss | 热度衰减、水位、复制大小与前缀收益门限 | 在线估计收益与成本 |
-| 淘汰 | 实际删除反馈、按 spec 最低副本保留 | 跨节点公平淘汰 |
-| 超节点亲和性 | 拓扑刷新、本机 > 同超节点 > 远端 | 接入部署拓扑控制面 |
-
-### 7.2 已完成的接入与回归
-
-mempool 分配偏好、strict 复制分配、PACE node id 透传和容量采样已实现。
-三个历史缺口验收用例（部分本地命中、热度实例隔离、提示实例隔离）已纳入普通测试。
-多 spec 复制、失败会话清理、有界队列、过期指标、满容量水位和实例淘汰覆盖均有回归用例。
-执行入口见 [亲和性生命周期验收](../integration_test/affinity/README.md)。
-
-### 7.3 验证与部署待办
-
-| 项 | 当前边界 |
+| 准入条件 | 实际计算 |
 |---|---|
-| 集群验收 | 容量压满、重启恢复与真实推理引擎/GPU 链路须在对应集群执行 |
-| 全局公平性 | SDK 进程内轮转已实现，跨进程的带宽和公平性依赖部署侧控制 |
-| 网络遥测 | mempool 容量为真实采样；NodeMetrics 的 rx_mbps/tx_mbps 尚无集群数据源，SDK 限速独立工作 |
-| 生产调优 | 拓扑文件、容量预算、最低副本数和收益门限需按部署配置 |
+| 热度 | 按 `(instance_id, caller.node_id, block_key)` 计数；每经过一个半衰期做一次二分衰减，`heat_half_life_ms=0` 关闭衰减 |
+| 容量 | 有 caller 指标时，要求 `load_ratio <= threshold - buffer`；**缺失/过期指标不会阻止复制提示** |
+| 大小 | 配置 `max_replication_bytes>0` 时检查全部源 spec 总大小；启用大小或收益门槛时，size 缺失、为零或溢出均拒绝提示 |
+| 收益 | `remote_bytes × decayed_heat × (1 + prefix_bonus / (position + 1)) >= total_copy_bytes × min_benefit_ratio`；没有有效位置时权重为 1 |
+| 抑制 | 按同一 instance/caller/key，默认 60 秒只发一次；0 关闭时间抑制 |
 
+热度在容量/成本门槛判断前累积；收益门槛默认关闭，`prefix_bonus` 只有收益判断开启才影响准入。名为 [FrequencySketch](../kv_cache_manager/affinity/frequency_sketch.cc) 的实现是有容量上限的 LRU 计数表，而非 Count-Min Sketch；管理器注入的容量为 100 万条。热度和 [HintSuppressor](../kv_cache_manager/affinity/hint_suppressor.cc) 都是进程内状态，不持久化。
 
----
+提示发出后没有复制结果反馈来提前解除服务端抑制。任务丢弃或复制失败后，需要后续读取及窗口到期重新触发；没有持久化重试任务或“最终必定复制成功”的保证。
 
-## 8. 扩展指南
+## 6. 复制：服务端 Copy 优先，客户端可回退
 
-### 新增策略算法
+### 6.1 服务端编排
 
-1. 创建 `AffinityStrategy` 子类，实现 `ResolveWrite` / `ResolveRead` / `ResolveEviction`
-2. 在 `StrategyFactory` 中注册 `type` → 构造函数映射
-3. 配置 JSON `{"type": "your_strategy", ...}`
+```mermaid
+sequenceDiagram
+    participant SDK as ReplicationExecutor
+    participant CM as CacheManager
+    participant Meta as MetaSearcher
+    participant DS as Storage Backend
+    SDK->>CM: ReplicateCache(items)
+    loop 每个 block
+        CM->>CM: StartWriteCache(is_replication, explicit target)
+        CM->>DS: 严格目标分配
+        CM->>Meta: 新目标 WRITING / 准入检查
+    end
+    CM->>DS: 按 storage 合并 Copy(source, destination)
+    DS-->>CM: 每个 spec 的结果
+    loop 每个 block
+        CM->>Meta: 所有 spec 成功才发布，否则失败清理
+    end
+    CM-->>SDK: 各项 code / already_exists
+```
 
-不需要改 `CacheAffinityManager`、`CacheManager`、`MetaSearcher` 或任何管道代码。
+复制目标必须显式指定，strict 分配不允许偏好失败后落到别处。不支持 affinity 的后端在严格写上返回不支持。目标节点已在 SERVING Locations 中覆盖所需全部 spec 时可跳过复制；覆盖可以来自多个 Location。
 
-### 新增信号（如 `caller_supernode_id` 的铺设方式）
+[CacheManager::ReplicateCaches](../kv_cache_manager/manager/cache_manager.cc) 校验源/目标 spec 名称一一对应，且 URI 属于同一 storage；不实现跨 storage 的 Copy。按 storage 合并 Copy 调用，每个 block 只有全部组件复制成功才发布，单项失败不取消其他成功项。Copy 结果个数异常按失败处理。
 
-7 处机械性改动：Proto 字段 → `RequestContext` getter/setter → `AffinityResolveContext` 字段 → `StrategyContext` 字段 → `BuildStrategyContext` 拷贝 → Service 层注入 → `GetCacheLocationByQueryType` / `GenWriteLocation` 设到 resolve_ctx。
+### 6.2 SDK 自动与显式复制
+
+[ManagerClientImpl](../kv_cache_manager/client/src/manager_client_impl.cc) 在同时具备 MetaClient 和 TransferClient 的 HYBRID 客户端上创建执行器。`auto_replicate=true` 时，成功 MatchLocation 返回的提示自动提交；默认 false。只使用 MetaClient、长度查询或某个连接器，并不能自动推定复制任务已经接入执行。
+
+无复用 buffer 的任务优先调用批量 ReplicateCache，最多 64 项；配置目标速率后每批降为 1 项，便于逐项排队计费。**仅服务端返回“不支持”才回退客户端复制**；普通分配、复制或发布错误不会被无条件重试。
+
+客户端回退或显式 buffer 复用执行：
+
+1. `StartReplicationWrite` 申请严格目标及会话；若目标已完整存在，结束空会话并返回 already-exists。
+2. 按 spec 名称匹配源、目标及已有 buffer；缺少的组件经 TransferClient Load 到 CPU buffer，再 Save 所有目标组件。
+3. 检查大小、目标 URI 返回完整性；全部成功后 Finish 成功，否则以失败 mask 清理会话。
+4. 成功 Finish 的响应丢失属于发布结果不确定，记录发布失败，**不再发送相反的失败确认**；后续查询/会话清理负责收敛。
+
+`ReplicateWithBuffers[Async]` 允许带共享 owner 的具名 CPU/GPU buffer，内存类型向 TransferClient 透传；这说明接口和 mock 路径存在，不代表所有后端都已通过 GPU 实机验证。旧单指针 API 对多 spec 不能任意猜测名称，改走完整读取。异步接口的 bool 是入队结果；释放回调表示所有权释放，复制成功与否看结果回调 / `GetReplicationStats()`。
+
+执行前若当前 caller **非空且不同于 target**，旧提示会被丢弃；caller 解析为空时没有同样的拒绝条件，不能声称 provider 消失一定撤销旧任务。
+
+### 6.3 资源与时限
+
+[ClientConfig](../kv_cache_manager/client/src/internal/config/client_config.cc) 和执行器的默认值：
+
+| 配置/约束 | 默认与范围 |
+|---|---|
+| `auto_replicate` | false |
+| `replication_workers` | 2，可配置 1–64 |
+| 待处理任务个数 | ManagerClient 使用固定上限 1024，无对应 JSON 配置字段 |
+| `replication_max_pending_bytes` | 256 MiB，执行器待处理队列的字节估算，不含已出队任务 |
+| `replication_max_buffer_bytes` | 256 MiB，进程共享已持有/分配的数据 buffer 预算 |
+| `replication_node_bytes_per_second` | 0，不限速；正值在同一 SDK 进程按 target 共享节奏控制 |
+| `replication_max_age_ms` | 30000，队列/开始执行/资源等待的过期控制 |
+| `caller_node_refresh_seconds` | 0，每次查询；正值允许缓存身份 |
+
+缓冲区复用任务还有 `2 × workers` 的队列名额上限；执行器内按 `(block_key,target)` 去重。共享资源等待队列在实例间轮转，服务端 Copy 也受目标速率约束，但不占用客户端搬运 buffer。计费来自 URI/任务估算；不同 SDK 进程不共享预算或速率，直接 RPC 调用也不受 SDK 队列控制。各执行器应使用一致的进程共享资源配置。
+
+任务过期并非运行中 RPC/Load/Save 的强制取消。复制写会话使用独立超时（SDK 传 60 秒）；队列、热度、抑制和资源等待状态均不做重启恢复。
+
+## 7. 节点指标、压力回收与当前接线缺口
+
+### 7.1 指标新鲜度
+
+CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快照；CacheAffinityManager 默认 30 秒未收到新样本后移除节点。相同或更旧的正 `updated_at_us` 不续期、不重置删除释放量；已过期样本也不因重复拉取恢复新鲜度。时间戳为零的合成指标没有上述真实采样语义。
+
+指标过期会移除写候选和节点水位候选；读复制容量门槛则按“指标未知”处理，仍可能产生提示。节点表以 `node_id` 为键，未加入 storage/集群命名空间，不能默认不同 PACE 集群的同号节点已隔离。
+
+### 7.2 回收链路
+
+`ResolveEviction` 对各实例的有效策略计算超水位节点；某实例关闭 eviction 不会跳过后续实例。节点压力分支独立于实例组配额压力，经 `ReclaimByNode` 使用 `node_lru` 索引采样，再复用异步删除的 pending 限额、重复过滤、活动写/迁移保护和删除流程。
+
+该分支还要求元数据 backend URI 带 `reclaim_indexer_type=node_lru`。[MetaStorageBackendManager](../kv_cache_manager/meta/meta_storage_backend_manager.cc) 不会仅因 affinity 开启就自动创建节点索引；缺少索引时采样返回 `EC_NOENT`，本轮不提交节点回收。索引维护行为见 [meta_indexer_node_lru_test.cc](../kv_cache_manager/meta/test/meta_indexer_node_lru_test.cc)。
+
+超过 `threshold` 开始选择节点；有删除释放量后，按估算水位继续选择，直到达到 `low`。释放量只在后端返回删除成功后记录，并与删除开始时间和指标采样时间校验；新样本只清除该节点的估算。**成功提交异步删除不等于物理空间已经释放。** `critical` 目前不改变此流程。
+
+删除候选虽由 `LocationSpec.node_id` 匹配，提交与删除粒度仍是 **整个 CacheLocation**：只要其中一个 spec 位于压力节点，就可能连同其他节点上的组件一起删除，尚未实现按 spec 拆分删除。
+
+### 7.3 最少保留副本并未在节点路径完整生效
+
+这是当前实现与旧文档最关键的差异：
+
+- `MetaSearcher::BatchMarkDeletingWithRetention` 已实现 RMW：按 spec 名称统计 SERVING Location 数，若删除会低于 minimum 则拒绝该项。
+- `SchedulePlanExecutor::PrepareDeleteTaskImpl` 在收到正的 `min_retained_replicas` 时调用上述保护，否则走普通 CAS。
+- **`ReclaimByNode` 构造请求时没有设置该字段，沿用请求默认 0。** 当前不能保证节点压力回收保留配置的最低副本数。
+- 当前显式设置该字段的调用点在 `ReclaimByLRU`；其他回收、显式删除、TTL/GC 不应据此推定有同等保护。
+- `GetReplicaLimits` 在 Noop/全局关闭时返回 `ReplicaLimits{}`，其中默认保留数仍为 1。因此只要传入 affinity manager，`ReclaimByLRU` 也可能在全局关闭时继续保留最低数量。这是与“仅保护节点压力回收”的参数注释不一致的另一面，不能以注释替代调用链结论。
+
+因此，“保留数参数已解析”和“元数据保护函数已有单测”不等于“节点压力回收全链路受保护”。这里记录实际缺口，本次文档整理不改变回收代码。
+
+## 8. 后端支持与待完成项
+
+| 项目 | 当前状态及实际边界 |
+|---|---|
+| 内源 mempool 严格放置、node id、容量快照 | 已有适配，真实逻辑位于父仓库 `internal_source`；开源同名 stub 不能代表内源能力 |
+| 内源 mempool Copy | 已接 PACE 批量同步 Copy；源/目标须符合 URI、大小及介质约束；成功后才发布 |
+| NFS | 支持本机身份及严格本机分配；容量快照是 free=最大值、load=0 的合成值；Copy 未实现，Delete/Exist/Lock/UnLock 仍为占位行为 |
+| 其他后端 | 默认普通写兼容，严格 affinity 分配拒绝；必须分别核对是否覆盖后端虚函数 |
+| 最少保留副本 | 元数据保护已实现；节点压力未传参数，普通 ReclaimByLRU 却可能在 Noop 下继续保留默认数量，需修正作用范围并补端到端回归 |
+| SSD caller 与多集群节点身份 | SSD-only 自动 provider 选择未接；同号 node id 的跨 storage 隔离待完善 |
+| 进程策略更新与配置校验 | 启动加载已有；文件自动热加载、全字段严格校验未实现 |
+| 回收粒度与 critical 水位 | 当前按 Location 删除；spec 级拆分及 critical 独立策略未实现 |
+| 复制完成反馈、重试与恢复 | SDK 有结果回调/统计；服务端抑制反馈、持久化任务、跨进程资源配额未实现 |
+| 源数据存活保障 | 复制会检查传输结果，但不能把元数据 SERVING 或后端 Lock 接口视为所有后端均有真实数据 pin |
+| 实机验收 | 多节点 PACE 数据正确性、真实压力删除、provider 重启和 GPU buffer 传输仍需专门实机用例 |
+
+若继续开发，优先补节点回收的保留数接线及回归，其次验证身份切换/SSD-only 和真实 PACE 复制回收。高级收益模型、全局调度和自动调参不应先于这些生命周期正确性问题。
+
+## 9. 实现与验证索引
+
+以下测试是对应行为的证据入口；测试存在不代表所有路径或硬件已验证：
+
+| 范围 | 源码/测试入口 | 能证明什么 |
+|---|---|---|
+| 策略与指标 | [affinity/test](../kv_cache_manager/affinity/test/) | 优先级、选路、热度/抑制隔离、指标 TTL、容量估算、成本门槛 |
+| 元数据预算与保留 | [meta_searcher_test.cc](../kv_cache_manager/manager/test/meta_searcher_test.cc) | Location 准入与 RMW 保留函数；不代替 ReclaimByNode 接线验证 |
+| 复制服务编排 | [cache_manager_test.cc](../kv_cache_manager/manager/test/cache_manager_test.cc) | 严格目标、完整 spec、Copy 结果与发布/清理 |
+| SDK 复制 | [replication_executor_test.cc](../kv_cache_manager/client/test/replication_executor_test.cc) | mock 传输的多 spec、buffer 所有权、异常清理、资源预算、限速及结果统计 |
+| 真实 Manager 集成 | [affinity_replication_test.py](../integration_test/affinity/affinity_replication_test.py) | 25 个测试：读写/发布/失败重试、实例隔离、协议升级、并发预算、批量结果、完整元数据、受控 Manager 重启 |
+
+真实 Manager 集成使用 NFS 和构造的调用方身份，验证控制与元数据链路；其中 Copy 不支持的分支也会被断言。它不是两台 PACE 节点的实际数据复制测试，Manager 重启测试也不是存储 provider 实机重启测试。内源后端及 PACE 适配的源码/依赖基线见父仓库 `docs/cache-affinity-internal.md`（该文件不属于开源 checkout）。
+
+维护本文时，应同时核对调用者是否传参、被调用者是否执行、默认配置是否覆盖、测试使用真实后端还是 mock。新增能力要更新对应流程及边界；只新增字段或单测时，不应直接将待完成项改为已完成。

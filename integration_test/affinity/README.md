@@ -1,5 +1,7 @@
 # Cache affinity 生命周期验收
 
+当前算法、配置与限制见[整体设计](../../docs/design-cache-affinity-v1.md)。特别注意：保留副本的元数据 RMW 单测不代表节点回收全链路已受保护；当前 `ReclaimByNode` 未传入 `min_retained_replicas`。节点回收还依赖元数据 URI 的 `reclaim_indexer_type=node_lru` 配置。
+
 测试分为三层；控制面返回 URI、释放复制 buffer、物理数据正确是不同的验收条件。
 
 | 层次 | 入口 | 检查内容 |
