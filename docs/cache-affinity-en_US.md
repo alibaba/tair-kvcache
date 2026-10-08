@@ -265,6 +265,8 @@ current set of fields:
 
 The client option `caller_node_refresh_seconds` defaults to `0`, which resolves the backend identity on every request so a PACE node incarnation change is observed immediately. A positive value reduces lookup frequency but permits an old caller identity to remain cached for up to that interval.
 
+The internal mempool adapter preserves the zero refresh interval and does not cache caller identity by default. A lookup without one valid local provider returns an empty identity. Allocation results and capacity metrics use the same numeric PACE ID. Replicas persisted with UUID identities by earlier experimental versions are not automatically migrated; delete and recreate those replicas in test instances so they participate in locality and node reclamation under the new ID.
+
 > The only registered metrics are the four above (`free_bytes /
 > load_ratio / rx_mbps / tx_mbps`). A `filter.metric` or `sort.metric`
 > name not in this list is a parse error. To add a new metric you must
