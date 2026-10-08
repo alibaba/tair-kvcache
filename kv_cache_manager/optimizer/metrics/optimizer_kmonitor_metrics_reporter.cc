@@ -68,7 +68,11 @@ struct OptimizerKmonitorMetricsReporter::KmonContext {
     DECLARE_METRICS(trace, query_ttl_eviction_count);
     DECLARE_METRICS(trace, query_hit_rate);
     DECLARE_METRICS(trace, query_capacity_efficiency);
-    DECLARE_METRICS(trace, query_hit_age_bucket_ratio);
+    DECLARE_METRICS(trace, query_reuse_interval_min_seconds);
+    DECLARE_METRICS(trace, query_reuse_interval_max_seconds);
+    DECLARE_METRICS(trace, query_reuse_interval_avg_seconds);
+    DECLARE_METRICS(trace, query_reuse_interval_p95_seconds);
+    DECLARE_METRICS(trace, query_reuse_interval_p99_seconds);
 
     std::unique_ptr<kmonitor::MutableMetric> mrc_metrics;
 
@@ -232,7 +236,11 @@ bool OptimizerKmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(trace, query_ttl_eviction_count);
     REGISTER_GAUGE_METRIC(trace, query_hit_rate);
     REGISTER_GAUGE_METRIC(trace, query_capacity_efficiency);
-    REGISTER_GAUGE_METRIC(trace, query_hit_age_bucket_ratio);
+    REGISTER_GAUGE_METRIC(trace, query_reuse_interval_min_seconds);
+    REGISTER_GAUGE_METRIC(trace, query_reuse_interval_max_seconds);
+    REGISTER_GAUGE_METRIC(trace, query_reuse_interval_avg_seconds);
+    REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p95_seconds);
+    REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p99_seconds);
 
     kmon_ctx_->mrc_metrics.reset(reporter->RegisterMetric("mrc", kmonitor::GAUGE, kmonitor::FATAL));
     if (!kmon_ctx_->mrc_metrics) {
@@ -297,7 +305,8 @@ void OptimizerKmonitorMetricsReporter::ReportPerQuery(OptimizerServiceMetricsCol
 
 void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<InstanceSummary> &summaries,
                                                       const std::vector<IntervalMetricInfo> &interval_metrics,
-                                                      const std::vector<MrcMetricInfo> &mrc_metrics) {
+                                                      const std::vector<MrcMetricInfo> &mrc_metrics,
+                                                      const std::vector<ReuseIntervalMetricInfo> &reuse_metrics) {
     if (!kmon_ctx_ || !kmon_ctx_->kmonitor) {
         return;
     }
@@ -331,15 +340,24 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
                                                                            capacity.hit_rate / summary.max_hit_rate);
             }
         }
+    }
 
-        for (const auto &bucket : summary.hit_age_bucket_ratios) {
-            const std::string bucket_label =
-                bucket.threshold_seconds > 0 ? std::to_string(bucket.threshold_seconds) + "s" : "inf";
-            MetricsTags bucket_base_tags = base_tags;
-            bucket_base_tags["age_bucket"] = bucket_label;
-            const auto bucket_tags = kmon_ctx_->GetKmonitorTags(bucket_base_tags);
-            kmon_ctx_->trace_query_hit_age_bucket_ratio_metrics->Report(&bucket_tags, bucket.ratio);
+    for (const auto &metric : reuse_metrics) {
+        // An empty window has no time statistic; do not report a fake zero.
+        if (metric.stats.count == 0) {
+            continue;
         }
+        MetricsTags base_tags = {{"instance_group", metric.instance_group}, {"instance_id", metric.instance_id}};
+        const auto tags = kmon_ctx_->GetKmonitorTags(base_tags);
+        kmon_ctx_->trace_query_reuse_interval_min_seconds_metrics->Report(
+            &tags, static_cast<double>(metric.stats.min_ns) / 1e9);
+        kmon_ctx_->trace_query_reuse_interval_max_seconds_metrics->Report(
+            &tags, static_cast<double>(metric.stats.max_ns) / 1e9);
+        kmon_ctx_->trace_query_reuse_interval_avg_seconds_metrics->Report(&tags, metric.stats.avg_ns / 1e9);
+        kmon_ctx_->trace_query_reuse_interval_p95_seconds_metrics->Report(
+            &tags, static_cast<double>(metric.stats.p95_ns) / 1e9);
+        kmon_ctx_->trace_query_reuse_interval_p99_seconds_metrics->Report(
+            &tags, static_cast<double>(metric.stats.p99_ns) / 1e9);
     }
 
     for (const auto &metric : interval_metrics) {

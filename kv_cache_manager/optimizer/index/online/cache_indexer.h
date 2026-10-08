@@ -7,14 +7,6 @@
 
 namespace kv_cache_manager {
 
-// Per-bucket hit count for cache age distribution.
-// Each bucket covers hits whose age (now - last_access_time) falls within
-// [0, threshold[0]), [threshold[0], threshold[1]), ..., [threshold[N-1], +inf).
-struct HitAgeBucketInfo {
-    int64_t threshold_seconds; // upper bound of this bucket (0 means "+inf")
-    int64_t hit_count;
-};
-
 class CacheIndexer {
 public:
     virtual ~CacheIndexer() = default;
@@ -28,10 +20,8 @@ public:
     // size_full: byte size of a full-only block.
     // size_full_linear: byte size of a full+linear block.
     // linear_step: linear step factor (>=0).
-    virtual void Init(const std::vector<double> &capacity_gb,
-                      int64_t size_full,
-                      int64_t size_full_linear,
-                      int32_t linear_step) = 0;
+    virtual void
+    Init(const std::vector<double> &capacity_gb, int64_t size_full, int64_t size_full_linear, int32_t linear_step) = 0;
 
     // Process a batch of key accesses and compute per-capacity prefix hit count.
     // keys: the block keys in query order.
@@ -81,10 +71,6 @@ public:
     // Called after processing all keys in a query batch.
     // Subclasses may perform eviction, compaction, etc.
     virtual void PostQueryMaintenance() {}
-
-    // Return per-bucket hit counts for cache age distribution.
-    // Default returns empty (no age tracking).
-    virtual std::vector<HitAgeBucketInfo> GetHitAgeBuckets() const { return {}; }
 };
 
 } // namespace kv_cache_manager

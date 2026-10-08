@@ -309,6 +309,42 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionUsesLiteHitTokenRates) {
     EXPECT_DOUBLE_EQ(12.0 / 26.0, summaries[0].max_hit_rate);
 }
 
+TEST_F(OnlineOptimizerManagerTest, FullAttentionReportsReuseIntervalWindow) {
+    constexpr int64_t kSecond = 1000000000LL;
+    auto info = MakeInfo("i1", "g1", 4, 0);
+    auto group = MakeGroup("g1", {FullCapacityGb(3)});
+    RegisterInstanceResult reg_result;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, reg_result));
+
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, 100 * kSecond, result));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, 104 * kSecond, result));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, 140 * kSecond, result));
+
+    // Listing instances is observational: it must not consume the window.
+    std::vector<InstanceSummary> summaries;
+    ASSERT_EQ(EC_OK, mgr_->ListInstances("g1", summaries));
+    ASSERT_EQ(EC_OK, mgr_->ListInstances("g1", summaries));
+    ASSERT_EQ(1, summaries.size());
+    EXPECT_EQ(3, summaries[0].total_queries);
+
+    std::vector<ReuseIntervalMetricInfo> metrics;
+    ASSERT_EQ(EC_OK, mgr_->TakeReuseIntervalMetrics(metrics));
+    ASSERT_EQ(1, metrics.size());
+    EXPECT_EQ("i1", metrics[0].instance_id);
+    EXPECT_EQ("g1", metrics[0].instance_group);
+    EXPECT_EQ(4, metrics[0].stats.count);
+    EXPECT_EQ(4 * kSecond, metrics[0].stats.min_ns);
+    EXPECT_EQ(36 * kSecond, metrics[0].stats.max_ns);
+    EXPECT_DOUBLE_EQ(20.0 * kSecond, metrics[0].stats.avg_ns);
+
+    ASSERT_EQ(EC_OK, mgr_->TakeReuseIntervalMetrics(metrics));
+    ASSERT_EQ(1, metrics.size());
+    EXPECT_EQ(0, metrics[0].stats.count);
+    ASSERT_EQ(EC_OK, mgr_->ListInstances("g1", summaries));
+    EXPECT_EQ(3, summaries[0].total_queries);
+}
+
 TEST_F(OnlineOptimizerManagerTest, TakeIntervalMetrics) {
     auto info = MakeInfo("i1", "g1", 4, 0);
     auto group = MakeGroup("g1", {FullCapacityGb(2), FullCapacityGb(3)}, "lru", true);

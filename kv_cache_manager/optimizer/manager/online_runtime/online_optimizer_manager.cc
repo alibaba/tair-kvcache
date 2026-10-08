@@ -679,26 +679,22 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
                                                                 : 0.0;
                 s.per_capacity_hit_rates.push_back(info);
             }
-
-            // Hit-age is a legacy indexer statistic and is intentionally not
-            // part of LiteHit's full-attention state.
-            auto age_buckets = state->indexer->GetHitAgeBuckets();
-            int64_t bucket_total = 0;
-            for (const auto &bucket : age_buckets) {
-                bucket_total += bucket.hit_count;
-            }
-            int64_t age_denom = s.total_max_hits > 0 ? s.total_max_hits : bucket_total;
-            for (const auto &bucket : age_buckets) {
-                HitAgeBucketRatio ratio_info;
-                ratio_info.threshold_seconds = bucket.threshold_seconds;
-                ratio_info.hit_count = bucket.hit_count;
-                ratio_info.ratio =
-                    age_denom > 0 ? static_cast<double>(bucket.hit_count) / static_cast<double>(age_denom) : 0.0;
-                s.hit_age_bucket_ratios.push_back(ratio_info);
-            }
         }
 
         summaries.push_back(std::move(s));
+    }
+    return EC_OK;
+}
+
+ErrorCode OnlineOptimizerManager::TakeReuseIntervalMetrics(std::vector<ReuseIntervalMetricInfo> &metrics) {
+    std::shared_lock lock(instances_mutex_);
+    metrics.clear();
+    for (const auto &[id, state] : instances_) {
+        std::lock_guard<std::mutex> guard(state->mutex);
+        if (state->linear_step != 0 || !state->lite_hit) {
+            continue;
+        }
+        metrics.push_back({id, state->instance_info->instance_group_name(), state->lite_hit->TakeReuseIntervalStats()});
     }
     return EC_OK;
 }

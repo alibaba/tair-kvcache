@@ -59,6 +59,8 @@ void OptimizerMetricsReporter::ReportInterval() {
     manager_->TakeIntervalMetrics(interval_metrics);
     std::vector<MrcMetricInfo> mrc_metrics;
     manager_->TakeMrcMetrics(mrc_metrics);
+    std::vector<ReuseIntervalMetricInfo> reuse_metrics;
+    manager_->TakeReuseIntervalMetrics(reuse_metrics);
 
     for (const auto &summary : summaries) {
         MetricsTags instance_tags = {{"instance_group", summary.instance_group}, {"instance_id", summary.instance_id}};
@@ -92,14 +94,6 @@ void OptimizerMetricsReporter::ReportInterval() {
                 summary.max_hit_rate > 0 ? capacity.hit_rate / summary.max_hit_rate
                                          : std::numeric_limits<double>::quiet_NaN();
         }
-
-        for (const auto &bucket : summary.hit_age_bucket_ratios) {
-            const std::string bucket_label =
-                bucket.threshold_seconds > 0 ? std::to_string(bucket.threshold_seconds) + "s" : "inf";
-            MetricsTags bucket_tags = instance_tags;
-            bucket_tags["age_bucket"] = bucket_label;
-            metrics_registry_->GetGauge("trace_query_hit_age_bucket_ratio", bucket_tags) = bucket.ratio;
-        }
     }
 
     for (const auto &metric : interval_metrics) {
@@ -125,8 +119,25 @@ void OptimizerMetricsReporter::ReportInterval() {
         metrics_registry_->GetGauge("mrc", tags) = static_cast<double>(metric.capacity_bytes);
     }
 
+    for (const auto &metric : reuse_metrics) {
+        MetricsTags tags = {{"instance_group", metric.instance_group}, {"instance_id", metric.instance_id}};
+        const auto &stats = metric.stats;
+        const double no_samples = std::numeric_limits<double>::quiet_NaN();
+        metrics_registry_->GetGauge("trace_query_reuse_interval_min_seconds", tags) =
+            stats.count > 0 ? static_cast<double>(stats.min_ns) / 1e9 : no_samples;
+        metrics_registry_->GetGauge("trace_query_reuse_interval_max_seconds", tags) =
+            stats.count > 0 ? static_cast<double>(stats.max_ns) / 1e9 : no_samples;
+        metrics_registry_->GetGauge("trace_query_reuse_interval_avg_seconds", tags) =
+            stats.count > 0 ? stats.avg_ns / 1e9 : no_samples;
+        metrics_registry_->GetGauge("trace_query_reuse_interval_p95_seconds", tags) =
+            stats.count > 0 ? static_cast<double>(stats.p95_ns) / 1e9 : no_samples;
+        metrics_registry_->GetGauge("trace_query_reuse_interval_p99_seconds", tags) =
+            stats.count > 0 ? static_cast<double>(stats.p99_ns) / 1e9 : no_samples;
+    }
+
     if (kmonitor_reporter_) {
-        kmonitor_reporter_->ReportInterval(summaries, interval_metrics, mrc_metrics);
+        // Both backends consume the same window; never Take() twice.
+        kmonitor_reporter_->ReportInterval(summaries, interval_metrics, mrc_metrics, reuse_metrics);
     }
 }
 

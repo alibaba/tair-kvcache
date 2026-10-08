@@ -77,10 +77,10 @@ struct PerCapacityHitRateInfo {
     double hit_rate;
 };
 
-struct HitAgeBucketRatio {
-    int64_t threshold_seconds; // upper bound of this bucket (0 means "+inf")
-    int64_t hit_count;
-    double ratio; // hit_count / total_max_hits
+struct ReuseIntervalMetricInfo {
+    std::string instance_id;
+    std::string instance_group;
+    ReuseIntervalStats stats;
 };
 
 struct MrcMetricInfo {
@@ -117,7 +117,6 @@ struct InstanceSummary {
     int64_t kv_cache_usage_bytes = 0;
     int64_t ttl_eviction_count = 0;
     std::vector<PerCapacityHitRateInfo> per_capacity_hit_rates;
-    std::vector<HitAgeBucketRatio> hit_age_bucket_ratios;
 };
 
 class OnlineOptimizerManager {
@@ -150,6 +149,9 @@ public:
 
     // Returns and clears the query metrics accumulated since the previous call.
     ErrorCode TakeIntervalMetrics(std::vector<IntervalMetricInfo> &metrics);
+
+    // Returns and clears only reuse-interval statistics, not access history.
+    ErrorCode TakeReuseIntervalMetrics(std::vector<ReuseIntervalMetricInfo> &metrics);
 
     // Returns and clears the MRC curve accumulated since the previous call.
     ErrorCode TakeMrcMetrics(std::vector<MrcMetricInfo> &metrics);

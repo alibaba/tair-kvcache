@@ -61,6 +61,8 @@ TEST_F(OptimizerMetricsReporterTest, ReportAfterRegistration) {
     MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
     Gauge query_total = registry_->GetGauge("trace_query_total", tags);
     EXPECT_EQ(0.0, query_total.Get());
+    EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_count"));
+    EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_hit_age_bucket_ratio"));
 }
 
 TEST_F(OptimizerMetricsReporterTest, ReportAfterQueries) {
@@ -452,30 +454,76 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalMetrics) {
     EXPECT_TRUE(std::isnan(registry_->GetGauge("interval.query_capacity_efficiency", capacity_tags).Get()));
 }
 
-TEST_F(OptimizerMetricsReporterTest, ReportIntervalHitAgeBucketRatio) {
-    // TTL > 0 triggers TtlCacheIndexerWrapper, enabling age-bucket tracking
-    ASSERT_EQ(EC_OK,
-              RegisterTestInstance("inst1",
-                                   {1.0},
-                                   /*ttl_seconds=*/3600,
-                                   /*enable_theoretical_max_cache=*/false,
-                                   /*linear_step=*/1));
+TEST_F(OptimizerMetricsReporterTest, LegacyIndexerDoesNotReportReuseInterval) {
+    for (int64_t ttl_seconds : {0, 3600}) {
+        registry_ = std::make_shared<MetricsRegistry>();
+        reporter_ = std::make_shared<OptimizerMetricsReporter>(manager_, registry_);
+        const std::string instance_id = "legacy_" + std::to_string(ttl_seconds);
+        ASSERT_EQ(EC_OK, RegisterTestInstance(instance_id, {1.0}, ttl_seconds, false, 1));
+        TraceQueryResult result;
+        ASSERT_EQ(EC_OK, manager_->TraceQuery(instance_id, {1, 2, 3}, 0, 0, result));
+        ASSERT_EQ(EC_OK, manager_->TraceQuery(instance_id, {1, 2, 3}, 0, 0, result));
+        reporter_->ReportInterval();
 
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_count"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_bucket_ratio"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_min_seconds"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_max_seconds"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_avg_seconds"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_p95_seconds"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_p99_seconds"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_hit_age_bucket_ratio"));
+        MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", instance_id}};
+        EXPECT_DOUBLE_EQ(2.0, registry_->GetGauge("trace_query_total", tags).Get());
+    }
+}
+
+TEST_F(OptimizerMetricsReporterTest, ReportFullAttentionReuseIntervalWindow) {
+    constexpr int64_t kSecond = 1000000000LL;
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1"));
     TraceQueryResult result;
-    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result);
-    manager_->TraceQuery("inst1", {1, 2, 3}, 0, 0, result); // all 3 keys hit
-
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2}, 0, 100 * kSecond, result));
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2}, 0, 104 * kSecond, result));
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1}, 0, 140 * kSecond, result));
     reporter_->ReportInterval();
 
-    // With near-zero age, all hits should fall in the first bucket (threshold=5s)
-    MetricsTags bucket_tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}, {"age_bucket", "5s"}};
-    Gauge bucket_ratio = registry_->GetGauge("trace_query_hit_age_bucket_ratio", bucket_tags);
-    EXPECT_GT(bucket_ratio.Get(), 0.0);
+    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_count"));
+    EXPECT_DOUBLE_EQ(4.0, registry_->GetGauge("trace_query_reuse_interval_min_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(36.0, registry_->GetGauge("trace_query_reuse_interval_max_seconds", tags).Get());
+    // Weighted by block samples (4, 4, 36), not by request averages.
+    EXPECT_NEAR(44.0 / 3.0, registry_->GetGauge("trace_query_reuse_interval_avg_seconds", tags).Get(), 1e-9);
+    EXPECT_DOUBLE_EQ(36.0, registry_->GetGauge("trace_query_reuse_interval_p95_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(36.0, registry_->GetGauge("trace_query_reuse_interval_p99_seconds", tags).Get());
+    EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_bucket_ratio"));
 
-    // The "inf" bucket should have ratio = 0 (no hits that old)
-    MetricsTags inf_tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}, {"age_bucket", "inf"}};
-    Gauge inf_ratio = registry_->GetGauge("trace_query_hit_age_bucket_ratio", inf_tags);
-    EXPECT_DOUBLE_EQ(0.0, inf_ratio.Get());
+    reporter_->ReportInterval();
+    for (const auto *name : {"trace_query_reuse_interval_min_seconds",
+                             "trace_query_reuse_interval_max_seconds",
+                             "trace_query_reuse_interval_avg_seconds",
+                             "trace_query_reuse_interval_p95_seconds",
+                             "trace_query_reuse_interval_p99_seconds"}) {
+        EXPECT_TRUE(std::isnan(registry_->GetGauge(name, tags).Get()));
+    }
+    EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_count"));
+
+    // The next window is independent, but last-access history survives.
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1}, 0, 150 * kSecond, result));
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(10.0, registry_->GetGauge("trace_query_reuse_interval_min_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(10.0, registry_->GetGauge("trace_query_reuse_interval_max_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(10.0, registry_->GetGauge("trace_query_reuse_interval_avg_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(10.0, registry_->GetGauge("trace_query_reuse_interval_p95_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(10.0, registry_->GetGauge("trace_query_reuse_interval_p99_seconds", tags).Get());
+
+    // A zero interval is valid and is different from an empty window.
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1}, 0, 150 * kSecond, result));
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("trace_query_reuse_interval_min_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("trace_query_reuse_interval_max_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("trace_query_reuse_interval_avg_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("trace_query_reuse_interval_p95_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("trace_query_reuse_interval_p99_seconds", tags).Get());
 }
 
 TEST_F(OptimizerMetricsReporterTest, RemoveInstanceMetricsCleansUp) {

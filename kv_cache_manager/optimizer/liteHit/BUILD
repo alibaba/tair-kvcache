@@ -48,6 +48,6 @@ cc_library(
     deps = [
         ":dynamic_fenwick_tree",
         ":hit_curve",
+        "//kv_cache_manager/optimizer/metrics:reuse_interval",
     ],
 )
-

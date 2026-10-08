@@ -10,6 +10,12 @@ cc_library(
 )
 
 cc_library(
+    name = "reuse_interval",
+    srcs = ["reuse_interval.cc"],
+    hdrs = ["reuse_interval.h"],
+)
+
+cc_library(
     name = "optimizer_metrics_collector",
     srcs = ["optimizer_metrics_collector.cc"],
     hdrs = ["optimizer_metrics_collector.h"],

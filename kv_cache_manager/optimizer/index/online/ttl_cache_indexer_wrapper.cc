@@ -12,10 +12,7 @@ TtlCacheIndexerWrapper::TtlCacheIndexerWrapper(std::unique_ptr<CacheIndexer> inn
 TtlCacheIndexerWrapper::TtlCacheIndexerWrapper(std::unique_ptr<CacheIndexer> inner,
                                                int64_t ttl_seconds,
                                                ClockFunc clock)
-    : inner_(std::move(inner))
-    , ttl_seconds_(ttl_seconds)
-    , clock_(std::move(clock))
-    , hit_age_bucket_counts_(hit_age_thresholds_.size() + 1, 0) {}
+    : inner_(std::move(inner)), ttl_seconds_(ttl_seconds), clock_(std::move(clock)) {}
 
 void TtlCacheIndexerWrapper::Init(const std::vector<double> &capacity_gb,
                                   int64_t size_full,
@@ -53,22 +50,11 @@ void TtlCacheIndexerWrapper::ProcessKeysAtTime(const std::vector<int64_t> &keys,
     has_process_time_ = true;
     HarvestExpired(now_seconds);
 
-    std::vector<bool> inner_key_hits;
-    inner_->ProcessKeys(keys, hit_count, max_hit_count, &inner_key_hits);
-    if (key_hits) {
-        *key_hits = inner_key_hits;
-    }
+    inner_->ProcessKeys(keys, hit_count, max_hit_count, key_hits);
 
-    for (size_t i = 0; i < keys.size(); ++i) {
-        int64_t key = keys[i];
+    for (int64_t key : keys) {
         auto it = key_access_time_.find(key);
         if (it != key_access_time_.end()) {
-            if (i < inner_key_hits.size() && inner_key_hits[i]) {
-                int64_t age_seconds = now_seconds - it->second;
-                size_t bucket_index = FindAgeBucket(age_seconds);
-                hit_age_bucket_counts_[bucket_index]++;
-            }
-
             expire_set_.erase({it->second + ttl_seconds_, key});
             it->second = now_seconds;
             expire_set_.insert({now_seconds + ttl_seconds_, key});
@@ -121,33 +107,6 @@ bool TtlCacheIndexerWrapper::RemoveKey(int64_t key) {
         key_access_time_.erase(it);
     }
     return inner_->RemoveKey(key);
-}
-
-std::vector<HitAgeBucketInfo> TtlCacheIndexerWrapper::GetHitAgeBuckets() const {
-    std::vector<HitAgeBucketInfo> result;
-    result.reserve(hit_age_bucket_counts_.size());
-    for (size_t i = 0; i < hit_age_thresholds_.size(); i++) {
-        result.push_back({hit_age_thresholds_[i], hit_age_bucket_counts_[i]});
-    }
-    // The last bucket covers [last_threshold, +inf), threshold=0 means infinity
-    result.push_back({0, hit_age_bucket_counts_.back()});
-    return result;
-}
-
-void TtlCacheIndexerWrapper::SetHitAgeBucketThresholds(const std::vector<int64_t> &thresholds) {
-    hit_age_thresholds_ = thresholds;
-    std::sort(hit_age_thresholds_.begin(), hit_age_thresholds_.end());
-    hit_age_bucket_counts_.assign(hit_age_thresholds_.size() + 1, 0);
-}
-
-size_t TtlCacheIndexerWrapper::FindAgeBucket(int64_t age_seconds) const {
-    // Find the first threshold >= age_seconds.
-    // Buckets: [0, t0] (t0+1, t1] ... (t_{n-1}, +inf)
-    // age=3 with thresholds {5,30} → lower_bound → 5 → bucket 0 ("5s")
-    // age=10 with thresholds {5,30} → lower_bound → 30 → bucket 1 ("30s")
-    // age=100 with thresholds {5,30} → lower_bound → end → bucket 2 ("+inf")
-    auto it = std::lower_bound(hit_age_thresholds_.begin(), hit_age_thresholds_.end(), age_seconds);
-    return static_cast<size_t>(it - hit_age_thresholds_.begin());
 }
 
 } // namespace kv_cache_manager

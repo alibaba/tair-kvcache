@@ -286,6 +286,15 @@ cc_test(
 )
 
 cc_test(
+    name = "ReuseIntervalTest",
+    srcs = ["reuse_interval_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/metrics:reuse_interval",
+    ],
+)
+
+cc_test(
     name = "OnlineOptimizerServerConfigTest",
     srcs = [
         "online_optimizer_server_config_test.cc",

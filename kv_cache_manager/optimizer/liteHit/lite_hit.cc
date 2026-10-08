@@ -11,7 +11,14 @@ constexpr std::size_t kCompactionSlackPositions = 4096;
 
 } // namespace
 
+LiteHit::LiteHit(uint64_t ttl_ns) : ttl_ns_(ttl_ns) {}
+
 RequestFact LiteHit::ProcessRequest(const std::vector<int64_t> &block_keys, int64_t now_ns) {
+    if (has_process_timestamp_) {
+        now_ns = std::max(now_ns, last_process_timestamp_ns_);
+    }
+    last_process_timestamp_ns_ = now_ns;
+    has_process_timestamp_ = true;
     if (ttl_ns_ > 0) {
         AdvanceTtlWatermark(now_ns);
     }
@@ -58,9 +65,9 @@ RequestFact LiteHit::BuildHitCurve(const std::vector<int64_t> &block_keys) const
             continue;
         }
         const auto previous = last_positions_.find(block_key);
-        if (previous != last_positions_.end() && previous->second >= dead_below_position_) {
+        if (previous != last_positions_.end() && previous->second.position >= dead_below_position_) {
             entry_it->second.is_resident = true;
-            entry_it->second.required_blocks = ReuseDistance(previous->second) + 1;
+            entry_it->second.required_blocks = ReuseDistance(previous->second.position) + 1;
         }
     }
 
@@ -121,7 +128,10 @@ void LiteHit::CommitRequest(const std::vector<int64_t> &block_keys, int64_t now_
     for (const auto &[block_key, _] : first_occurrence) {
         const auto previous = last_positions_.find(block_key);
         if (previous != last_positions_.end()) {
-            fenwick_.Add(previous->second, -1);
+            if (previous->second.position >= dead_below_position_) {
+                reuse_interval_.Record(static_cast<uint64_t>(now_ns - previous->second.timestamp_ns));
+            }
+            fenwick_.Add(previous->second.position, -1);
             last_positions_.erase(previous);
         }
     }
@@ -134,7 +144,7 @@ void LiteHit::CommitRequest(const std::vector<int64_t> &block_keys, int64_t now_
         fenwick_.AppendZero();
         const std::size_t current_position = fenwick_.size();
         fenwick_.Add(current_position, 1);
-        last_positions_[block_key] = current_position;
+        last_positions_[block_key] = LastAccess{current_position, now_ns};
     }
 }
 
@@ -154,10 +164,10 @@ void LiteHit::MaybeCompactPositions() {
     std::vector<std::pair<std::size_t, int64_t>> ordered_positions;
     ordered_positions.reserve(active_positions);
     for (auto it = last_positions_.begin(); it != last_positions_.end();) {
-        if (it->second < dead_below_position_) {
+        if (it->second.position < dead_below_position_) {
             it = last_positions_.erase(it);
         } else {
-            ordered_positions.emplace_back(it->second, it->first);
+            ordered_positions.emplace_back(it->second.position, it->first);
             ++it;
         }
     }
@@ -208,7 +218,7 @@ void LiteHit::MaybeCompactPositions() {
         compacted_fenwick.AppendZero();
         const std::size_t compacted_position = compacted_fenwick.size();
         compacted_fenwick.Add(compacted_position, 1);
-        last_positions_[block_key] = compacted_position;
+        last_positions_[block_key].position = compacted_position;
     }
     fenwick_ = std::move(compacted_fenwick);
 }
@@ -231,6 +241,9 @@ void LiteHit::Reset() {
     position_epochs_.clear();
     dead_below_position_ = 0;
     ttl_expired_blocks_ = 0;
+    reuse_interval_.Reset();
+    last_process_timestamp_ns_ = 0;
+    has_process_timestamp_ = false;
 }
 
 uint64_t LiteHit::memory_usage_bytes() const {
@@ -238,8 +251,9 @@ uint64_t LiteHit::memory_usage_bytes() const {
     bytes += static_cast<uint64_t>(last_positions_.bucket_count()) * sizeof(void *);
     constexpr uint64_t kEstimatedHashNodeOverhead = sizeof(void *) * 2;
     bytes += static_cast<uint64_t>(last_positions_.size()) *
-             (sizeof(std::pair<const int64_t, std::size_t>) + kEstimatedHashNodeOverhead);
+             (sizeof(std::pair<const int64_t, LastAccess>) + kEstimatedHashNodeOverhead);
     bytes += static_cast<uint64_t>(position_epochs_.size()) * sizeof(PositionEpoch);
+    bytes += sizeof(reuse_interval_);
     return bytes;
 }
 

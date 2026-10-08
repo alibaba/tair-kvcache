@@ -1,41 +1,14 @@
 #include "kv_cache_manager/optimizer/index/online/cache_indexer_factory.h"
 
-#include <algorithm>
-#include <cmath>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <vector>
 
-#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/optimizer/index/online/lru_cache_indexer.h"
 #include "kv_cache_manager/optimizer/index/online/ttl_cache_indexer_wrapper.h"
 
 namespace kv_cache_manager {
-
-static void ApplyHitAgeBucketThresholdsFromEnv(TtlCacheIndexerWrapper *wrapper) {
-    std::string env_value = EnvUtil::GetEnv("KVCM_HIT_AGE_BUCKET_THRESHOLDS", std::string(""));
-    if (env_value.empty()) {
-        return;
-    }
-    std::vector<int64_t> thresholds;
-    std::istringstream stream(env_value);
-    std::string token;
-    while (std::getline(stream, token, ',')) {
-        try {
-            int64_t value = std::stoll(token);
-            if (value > 0) {
-                thresholds.push_back(value);
-            }
-        } catch (...) { KVCM_LOG_WARN("Invalid token in KVCM_HIT_AGE_BUCKET_THRESHOLDS: [%s]", token.c_str()); }
-    }
-    if (!thresholds.empty()) {
-        std::sort(thresholds.begin(), thresholds.end());
-        wrapper->SetHitAgeBucketThresholds(thresholds);
-        KVCM_LOG_INFO("Applied custom hit age bucket thresholds from env, count=%zu", thresholds.size());
-    }
-}
 
 std::unique_ptr<CacheIndexer> CacheIndexerFactory::CreateCacheIndexer(const std::string &eviction_policy,
                                                                       bool enable_theoretical_max_cache,
@@ -57,9 +30,7 @@ std::unique_ptr<CacheIndexer> CacheIndexerFactory::CreateCacheIndexer(const std:
     indexer->Init(capacity_gb, size_full, size_full_linear, linear_step);
 
     if (ttl_seconds > 0) {
-        auto ttl_wrapper = std::make_unique<TtlCacheIndexerWrapper>(std::move(indexer), ttl_seconds);
-        ApplyHitAgeBucketThresholdsFromEnv(ttl_wrapper.get());
-        return ttl_wrapper;
+        return std::make_unique<TtlCacheIndexerWrapper>(std::move(indexer), ttl_seconds);
     }
 
     return indexer;
