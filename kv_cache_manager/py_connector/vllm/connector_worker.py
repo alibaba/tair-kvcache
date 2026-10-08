@@ -280,10 +280,12 @@ class ConnectorWorker:
         self, meta: StateGroupMeta, kv_caches: Dict[str, Any]
     ) -> StateTransferGroup:
         spec = self._self_spec_names[meta.group_idx]
-        block_views = [
-            state_kv_view(kv_caches[name], meta.page_size_bytes)
-            for name in meta.layer_names
-        ]
+        block_views = []
+        for name in meta.layer_names:
+            try:
+                block_views.append(state_kv_view(kv_caches[name], meta.page_size_bytes))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"state layer {name!r}: {exc}") from exc
         return StateTransferGroup(
             group_idx=meta.group_idx,
             spec_name=spec,

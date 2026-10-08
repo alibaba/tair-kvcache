@@ -292,13 +292,92 @@ class TestStateKvViews(unittest.TestCase):
 
     def test_refuse_invalid_state_layouts(self):
         raw = torch.zeros(20, dtype=torch.int8)
-        with self.assertRaisesRegex(AssertionError, "shape"):
+        with self.assertRaisesRegex(ValueError, "shape"):
             state_kv_view(raw, 24)
         # Content fits, but copying the padded page would escape the storage.
-        with self.assertRaisesRegex(AssertionError, "required end"):
+        with self.assertRaisesRegex(ValueError, "required end"):
             state_kv_view(raw.as_strided((1, 1, 1, 20), (24, 20, 20, 1)), 24)
-        with self.assertRaisesRegex(AssertionError, "do not share storage"):
+        self.assertEqual(raw.untyped_storage().nbytes(), 20)
+        with self.assertRaisesRegex(ValueError, "do not share storage"):
             state_kv_view([raw.view(1, 20), raw.clone().view(1, 20)], 20)
+
+    def test_refuse_component_crossing_page_boundary(self):
+        raw = torch.arange(64, dtype=torch.uint8)
+        conv = raw.as_strided((2, 4), (24, 1))
+        ssm = raw.as_strided((2, 8), (24, 1), 20)
+        before = raw.clone()
+        with self.assertRaisesRegex(ValueError, "component 1.*outside page"):
+            state_kv_view([conv, ssm], 24)
+        self.assertTrue(torch.equal(raw, before))
+        self.assertEqual(raw.untyped_storage().nbytes(), 64)
+
+    def test_refuse_strided_component_crossing_page_boundary(self):
+        raw = torch.zeros(128, dtype=torch.uint8)
+        conv = raw.as_strided((2, 2, 2), (64, 4, 1), 16)
+        # Four elements occupy 15 bytes with these inner strides. Bounding
+        # just numel would accept this component, which escapes the page.
+        ssm = raw.as_strided((2, 2, 2), (64, 12, 2), 26)
+        with self.assertRaisesRegex(ValueError, "component 1.*outside page"):
+            state_kv_view((conv, ssm), 24)
+
+    def test_single_block_preserves_offset_without_resizing_storage(self):
+        raw = torch.arange(40, dtype=torch.uint8)
+        cache = raw.view(torch.int8).as_strided((1, 1, 1, 20), (64, 20, 20, 1), 16)
+        view = state_kv_view(cache, 24)
+        self.assertTrue(torch.equal(view[0], raw[16:40]))
+        self.assertEqual(raw.untyped_storage().nbytes(), 40)
+
+    def test_empty_optional_component_fits_at_page_end(self):
+        raw = torch.arange(48, dtype=torch.uint8)
+        conv = raw.as_strided((2, 8), (24, 1))
+        empty = raw.as_strided((2, 0), (24, 1), 24)
+        self.assertTrue(torch.equal(state_kv_view([conv, empty], 24), raw.view(2, 24)))
+
+    def test_refuse_invalid_content_and_block_geometry(self):
+        raw = torch.zeros(64, dtype=torch.uint8)
+        invalid = [
+            (raw.as_strided((2, 1, 1, 10), (24, 20, 20, 2)), 24, "contiguous"),
+            (raw.as_strided((2, 1, 1, 20), (20, 20, 20, 1)), 24, "block stride"),
+            (torch.empty((0, 1, 1, 20), dtype=torch.uint8), 20, "block count"),
+            (raw.view(1, 1, 1, 64), 24, "fit page"),
+            (raw.view(1, 1, 1, 64), 0, "positive"),
+        ]
+        for cache, page_size, message in invalid:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    state_kv_view(cache, page_size)
+
+    def test_refuse_invalid_component_types_and_storage(self):
+        for cache in ([], (), [None]):
+            with self.subTest(cache=cache):
+                with self.assertRaises(TypeError):
+                    state_kv_view(cache, 24)  # ty: ignore[invalid-argument-type]
+        with self.assertRaisesRegex(ValueError, "block dimension"):
+            state_kv_view([torch.tensor(0)], 24)
+        with self.assertRaisesRegex(ValueError, "materialized"):
+            state_kv_view(
+                torch.empty((2, 1, 1, 20), dtype=torch.uint8, device="meta"), 24
+            )
+
+    def test_refuse_inconsistent_legacy_block_geometry(self):
+        raw = torch.zeros(128, dtype=torch.uint8)
+        conv = raw.as_strided((2, 4), (24, 1))
+        for ssm in (
+            raw.as_strided((3, 4), (24, 1), 4),
+            raw.as_strided((2, 4), (32, 1), 4),
+        ):
+            with self.subTest(shape=ssm.shape, stride=ssm.stride()):
+                with self.assertRaisesRegex(ValueError, "share block count"):
+                    state_kv_view([conv, ssm], 24)
+
+    def test_worker_error_identifies_state_layer(self):
+        conn = _make_group_conn()
+        with self.assertRaisesRegex(ValueError, "state layer 'm0'.*shape") as context:
+            conn._build_state_group(
+                StateGroupMeta(0, ["m0"], 16, 24, page_size_bytes=24),
+                {"m0": torch.zeros(24, dtype=torch.uint8)},
+            )
+        self.assertIsInstance(context.exception.__cause__, ValueError)
 
 
 class _BlockedScheduler:

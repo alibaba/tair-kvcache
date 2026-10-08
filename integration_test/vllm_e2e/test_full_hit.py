@@ -62,13 +62,22 @@ class TestFullHit(unittest.TestCase):
                 # state captures. The cap excludes the last prompt block;
                 # only a complete checkpoint before it permits a partial hit.
                 checkpoints = []
+                state_layers = None
                 for token_hash in full_block_hashes(prompt_ids, mbs):
                     path = Path(env.capture_dir) / f"ref_tp0_{token_hash}.pt"
                     record = torch.load(path, map_location="cpu", weights_only=True)
+                    # The registered layer inventory is independent of which
+                    # states happened to be captured at this boundary. Taking
+                    # the union of observations could hide a missing group.
+                    declared_layers = set(record["state_layer_names"])
+                    if state_layers is None:
+                        state_layers = declared_layers
+                    self.assertEqual(declared_layers, state_layers)
                     checkpoints.append({name for name, value in record["kv"].items()
                                         if isinstance(value, (list, tuple))})
-                state_layers = set().union(*checkpoints)
-                self.assertTrue(state_layers, "no recurrent state was captured")
+                self.assertTrue(state_layers, "no recurrent state layers were registered")
+                self.assertEqual(set().union(*checkpoints), state_layers,
+                                 "recurrent state capture is incomplete")
                 expected_hit = max(
                     ((i + 1) * mbs for i, names in enumerate(checkpoints[:-1])
                      if names == state_layers), default=0)
