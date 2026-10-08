@@ -381,8 +381,10 @@ void ReplicationExecutor::WorkerLoop() {
             if (!server_only) {
                 --piggyback_queue_size_;
             } else {
-                constexpr size_t kMaxServerCopyBatch = 64;
-                for (auto it = queue_.begin(); it != queue_.end() && tasks.size() < kMaxServerCopyBatch;) {
+                // With pacing enabled, dispatch an admitted block immediately;
+                // waiting for later blocks must not age the first one in a batch.
+                const size_t max_server_copy_batch = options_.node_bytes_per_second > 0 ? 1 : 64;
+                for (auto it = queue_.begin(); it != queue_.end() && tasks.size() < max_server_copy_batch;) {
                     if (it->data == nullptr && it->named_buffers.empty()) {
                         pending_bytes_ -= it->pending_bytes;
                         tasks.push_back(std::move(*it));
@@ -512,6 +514,25 @@ void ReplicationExecutor::ExecuteServerCopyBatch(std::vector<ReplicationTask *> 
             task->outcome = ReplicationOutcome::SKIPPED_CALLER_CHANGED;
             task->error_code = ER_OK;
             continue;
+        }
+        if (options_.node_bytes_per_second > 0) {
+            const auto bytes = HintBytes(task->hint);
+            if (bytes == 0) {
+                task->outcome = ReplicationOutcome::REJECTED_INVALID;
+                task->error_code = ER_INVALID_PARAMS;
+                ++counters_.dropped_invalid;
+                continue;
+            }
+            // Server-side copy uses no SDK buffer but consumes the same target
+            // bandwidth budget as client-side transfers in this process.
+            if (!ReplicationResources::Global().Acquire(options_.instance_id, task->hint.target_node_id,
+                    0, SIZE_MAX, bytes, options_.node_bytes_per_second,
+                    task->submitted_at + std::chrono::milliseconds(options_.max_age_ms), stopped_)) {
+                task->outcome = ReplicationOutcome::EXPIRED;
+                task->error_code = ER_SDK_TIMEOUT;
+                continue;
+            }
+            task->pacing_reserved = true;
         }
         eligible.push_back(task);
         hints.push_back(task->hint);
@@ -665,7 +686,8 @@ void ReplicationExecutor::ExecuteTask(ReplicationTask &task, bool try_server_cop
         if (!piggyback && reuse == reused.end()) allocate_bytes += bytes;
     }
     if (!ReplicationResources::Global().Acquire(options_.instance_id, hint.target_node_id,
-            allocate_bytes, options_.max_buffer_bytes, buffer_bytes, options_.node_bytes_per_second,
+            allocate_bytes, options_.max_buffer_bytes, buffer_bytes,
+            task.pacing_reserved ? 0 : options_.node_bytes_per_second,
             task.submitted_at + std::chrono::milliseconds(options_.max_age_ms), stopped_)) {
         if (ReplicationResources::Clock::now() >= task.submitted_at + std::chrono::milliseconds(options_.max_age_ms)) {
             task.outcome = ReplicationOutcome::EXPIRED;

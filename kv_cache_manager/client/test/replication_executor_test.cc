@@ -966,3 +966,38 @@ TEST(ReleaseGuardTest, MoveAssignmentReleasesBothCallbacksExactlyOnceWhenTheyThr
     }
     EXPECT_EQ(2, releases);
 }
+
+TEST_F(ReplicationExecutorTest, ServerCopyHonorsTargetRateAcrossAutomaticTasks) {
+    EXPECT_CALL(mock_meta_, ReplicateCache(_, _, 60)).Times(1).WillOnce(Return(ER_OK));
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).Times(0);
+    ReplicationOptions options;
+    options.node_bytes_per_second = 1;
+    options.max_age_ms = 50;
+    std::promise<void> completed;
+    auto done = completed.get_future();
+    options.metrics_callback = [&](const auto &stats) {
+        if (stats.succeeded + stats.expired + stats.failed == 2) completed.set_value();
+    };
+    ReplicationExecutor executor(&mock_meta_, &mock_transfer_, 1, 1024, options);
+    executor.Submit({MakeHint(910, "server_rate", "rdma://src/x?size=16"),
+                     MakeHint(911, "server_rate", "rdma://src/y?size=16")});
+    ASSERT_EQ(std::future_status::ready, done.wait_for(2s));
+    executor.Shutdown();
+    EXPECT_EQ(1u, executor.GetStats().succeeded);
+    EXPECT_EQ(1u, executor.GetStats().expired);
+    EXPECT_EQ(16u, executor.GetStats().copied_bytes);
+}
+
+TEST_F(ReplicationExecutorTest, UnsupportedServerCopyFallbackConsumesOnlyOneRateReservation) {
+    EXPECT_CALL(mock_meta_, ReplicateCache(_, _, 60)).WillOnce(Return(ER_SERVICE_UNSUPPORTED));
+    SetupSuccessfulAsyncPath();
+    ReplicationOptions options;
+    options.node_bytes_per_second = 1;
+    options.max_age_ms = 100;
+    ReplicationExecutor executor(&mock_meta_, &mock_transfer_, 1, 1024, options);
+    executor.Submit({MakeHint(912, "fallback_rate", "rdma://src/x?size=16")});
+    executor.Shutdown();
+    EXPECT_EQ(1u, executor.GetStats().succeeded);
+    EXPECT_EQ(1u, executor.GetStats().client_fallback);
+    EXPECT_EQ(0u, executor.GetStats().expired);
+}
