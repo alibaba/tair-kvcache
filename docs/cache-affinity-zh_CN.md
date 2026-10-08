@@ -229,6 +229,8 @@ load、低 latency),把 `weight` 设为负数即可:
 
 客户端参数 `caller_node_refresh_seconds` 默认是 `0`，表示每次请求都重新查询后端身份，避免 PACE node id 换代后继续使用旧 caller。显式设置正数可以降低查询频率，但会引入最长为该配置值的旧身份窗口。
 
+内源 mempool 适配保留该参数的零值语义，默认不缓存 caller；一次查询没有唯一的有效 Provider 时返回空身份。分配结果与容量指标都使用同一个 PACE 数字 ID。旧实验版本按 UUID 持久化的副本不会自动改写为数字 ID，应在测试实例中删除并重建副本，避免旧副本无法参与按新 ID 的本地命中和节点回收。
+
 > 已注册指标只有上表中的 `free_bytes / load_ratio / rx_mbps / tx_mbps`
 > 四件套。`filter.metric` / `sort.metric` 名不在这张表里,解析时直接
 > 报错。新增指标需要同时改 `NodeMetrics` 字段和 `affinity/pipeline/metric_catalog.cc`

@@ -5,10 +5,10 @@
 | 层次 | 入口 | 检查内容 |
 | --- | --- | --- |
 | 策略和组件回归 | `//kv_cache_manager/affinity/test:all`、`ReplicationExecutorTest`、`CacheManagerTest`、`MetaSearcherTest`、`CacheReclaimerTest`、`NodeLruReclaimIndexerTest` | 写入路由、复制门限/抑制、异步复制失败处理、元数据发布、淘汰决策及删除组件 |
-| 真实服务的控制面集成 | `//integration_test/affinity:affinity_replication_test` | 15 个用例：本地写、远端读 hint、strict/non-strict 写、未完成/失败写与重试、部分 batch 发布、重复本地命中、逐 key 抑制、实例隔离、空 caller 兼容、noop、删除/重写、多 spec 发布 |
+| 真实服务的控制面集成 | `//integration_test/affinity:affinity_replication_test` | 25 个用例：本地写、远端读 hint、strict/non-strict 写、未完成/失败写与重试、部分 batch 发布、重复本地命中、逐 key 抑制、实例隔离、空 caller 兼容、noop、删除/重写、多 spec 发布、并发预算/失败回滚、协议滚动升级、显式目标、gRPC/HTTP 批量复制、重启恢复 |
 | 双机真实数据链路 | `//integration_test/affinity_piggyback:mock_inference_node` + tair-mempool `.aoneci/kvcm_affinity_test.yaml` | A 写入、B 远端逐字节读、piggyback/async 两种复制、本地物理 Provider 校验、重复读、停 A 后读 B、跨实例 miss、删除和重写 |
 
-`EvictedReplicaCanBeRecreatedAfterCapacityRecovers` 连接策略阶段：远端热读 → hint → 本地候选 → 高水位淘汰 → 滞后估算停止 → 容量恢复 → 再次 hint。它注入候选和节点指标，并不分配内存或执行物理淘汰。真实双机当前测试的是显式删除/重建和源 Provider 停机；容量压满导致自动物理淘汰、进程重启恢复、真实推理引擎/GPU 读写仍需要专门的集群用例，不能据此宣称已验收。
+`EvictedReplicaCanBeRecreatedAfterCapacityRecovers` 连接策略阶段：远端热读 → hint → 本地候选 → 高水位淘汰 → 滞后估算停止 → 容量恢复 → 再次 hint。它注入候选和节点指标，并不分配内存或执行物理淘汰。真实双机当前测试的是显式删除/重建和源 Provider 停机；控制面已覆盖 Manager 重启后的元数据与容量预算恢复；容量压满导致自动物理淘汰、PACE Provider 重启后的物理数据恢复、真实推理引擎/GPU 读写仍需要专门的集群用例，不能据此宣称已验收。
 
 ## Bazel 回归
 
@@ -37,6 +37,7 @@ bazelisk --output_base=/tmp/bazel-affinity-e2e-os test \
 --define USER_CLIENT_LOGGER=true
 //stub_source/kv_cache_manager/data_storage/test:TairMempoolBackendTest
 //stub_source/kv_cache_manager/data_storage/test:PaceServiceResponseTest
+//stub_source/kv_cache_manager/client/src/internal/sdk/test:TairMempoolCallerNodeProviderTest
 ```
 
 双机 CI 已将这些内源回归接在构建前，使用 debug/ASAN；数据链路二进制与服务端 package 随后从同一份源码构建。`KVCM_COMMIT`、`KVCM_GITHUB_COMMIT` 必须指向包含相应变更的远端版本，tair-mempool SDK 固定为本次 CI 的 mempool commit。仅创建本地 worktree 不会自动改变远端 CI 使用的代码。
@@ -128,3 +129,19 @@ bazelisk --output_base=/tmp/bazel-affinity-e2e-os test \
 - `ReplicationExecutorTest`：进程内资源预算、实例轮转、每节点限速、结果统计及具名缓冲区所有权。
 
 原生测试中的 GPU 缓冲区用例验证类型传递与所有权，实际 GPU DMA 仍需双机环境执行。
+
+## 并发、升级和故障回归
+
+真实服务的 25 个用例在 gRPC/HTTP 上执行；新增场景验证：
+
+- 并发 WRITING 预留计入实例字节预算，失败清理后容量可重用；多 spec 按总大小计费。
+- 批量请求因单 key 副本上限失败时，不残留其他 key 的半成品。
+- 旧客户端和未知能力位正常读取，只有协商成功的客户端获得多 spec 提示。
+- 显式复制目标校验和同目标去重；gRPC/HTTP 批量复制独立返回已存在、参数错误、后端不支持的结果，失败预留可再次使用。
+- 重复 spec 名拒绝后可重试，元数据保留 WRITING/SERVING 的独立副本身份。
+- 持久化元数据在 Manager 重启后恢复，已有副本继续占用预算，删除后恢复写入准入。
+
+NFS 控制面用例中的复制返回 UNSUPPORTED，并不验证 PACE 物理复制成功。
+SDK 回归另外验证服务端复制遵守节点限速、UNSUPPORTED 回退不重复计费，以及单个回退抛异常不丢失同批其他结果。
+内部适配回归验证 caller、分配结果和容量指标统一使用 PACE 实例 ID；重启换 ID 立即可见，查询失败或 Provider 不唯一时返回空身份。
+测试启动等待 RPC、HTTP 和 Admin 三个监听端口就绪，代替固定休眠。
