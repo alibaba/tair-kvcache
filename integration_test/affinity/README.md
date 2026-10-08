@@ -144,4 +144,4 @@ bazelisk --output_base=/tmp/bazel-affinity-e2e-os test \
 NFS 控制面用例中的复制返回 UNSUPPORTED，并不验证 PACE 物理复制成功。
 SDK 回归另外验证服务端复制遵守节点限速、UNSUPPORTED 回退不重复计费，以及单个回退抛异常不丢失同批其他结果。
 内部适配回归验证 caller、分配结果和容量指标统一使用 PACE 实例 ID；重启换 ID 立即可见，查询失败或 Provider 不唯一时返回空身份。
-测试启动等待 RPC、HTTP 和 Admin 三个监听端口就绪，代替固定休眠。
+测试启动等待 RPC、HTTP 和 Admin 三个监听端口以及 Leader 发现就绪，代替固定休眠；多节点用例允许 follower 发现其他 Leader。
