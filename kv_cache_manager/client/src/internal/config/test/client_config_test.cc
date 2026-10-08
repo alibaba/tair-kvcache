@@ -16,6 +16,28 @@ TEST_F(ClientConfigTest, TestClientConfigSuccess) {
     ASSERT_FALSE(file_content.empty());
     ASSERT_TRUE(client_config.FromJsonString(file_content));
     ASSERT_EQ(QueryType::QT_UNSPECIFIED, client_config.default_query_type());
+    ASSERT_EQ(0, client_config.caller_node_refresh_seconds());
+}
+
+TEST_F(ClientConfigTest, TestCallerNodeRefreshInterval) {
+    std::string file_content = getFileContent("client_config_success.json");
+    ASSERT_FALSE(file_content.empty());
+    const std::string location_spec_infos_field = R"(    "location_spec_infos": {)";
+    const auto pos = file_content.find(location_spec_infos_field);
+    ASSERT_NE(std::string::npos, pos);
+
+    ClientConfig cached_config;
+    std::string cached_content = file_content;
+    cached_content.insert(pos, R"(    "caller_node_refresh_seconds": 5,
+)");
+    ASSERT_TRUE(cached_config.FromJsonString(cached_content));
+    EXPECT_EQ(5, cached_config.caller_node_refresh_seconds());
+
+    ClientConfig invalid_config;
+    std::string invalid_content = file_content;
+    invalid_content.insert(pos, R"(    "caller_node_refresh_seconds": -1,
+)");
+    EXPECT_FALSE(invalid_config.FromJsonString(invalid_content));
 }
 
 TEST_F(ClientConfigTest, TestClientConfigDefaultQueryType) {

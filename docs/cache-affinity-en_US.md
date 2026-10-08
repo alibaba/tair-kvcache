@@ -263,6 +263,8 @@ current set of fields:
 
 `caller.node_id` must use the same identity as the backend result: the current numeric PACE node ID as a string for mempool, and the local host identity for NFS. A PACE node ID change represents a new data-state incarnation, so replicas tagged with the old ID must no longer count as caller-local. `total_bytes` supports capacity hysteresis; `supernode_id` supports nearby placement. `rx_mbps` / `tx_mbps` still require an external telemetry source.
 
+The client option `caller_node_refresh_seconds` defaults to `0`, which resolves the backend identity on every request so a PACE node incarnation change is observed immediately. A positive value reduces lookup frequency but permits an old caller identity to remain cached for up to that interval.
+
 > The only registered metrics are the four above (`free_bytes /
 > load_ratio / rx_mbps / tx_mbps`). A `filter.metric` or `sort.metric`
 > name not in this list is a parse error. To add a new metric you must

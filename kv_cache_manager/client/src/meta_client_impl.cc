@@ -311,7 +311,7 @@ ClientErrorCode MetaClientImpl::Connect(const std::string &address) {
 
 void MetaClientImpl::InitCallerNodeProvider(const std::string &storage_config) {
     const auto refresh_interval =
-        std::chrono::seconds(client_config_ ? client_config_->caller_node_refresh_seconds() : 30);
+        std::chrono::seconds(client_config_ ? client_config_->caller_node_refresh_seconds() : 0);
     std::vector<std::shared_ptr<StorageConfig>> parsed_storage_configs;
     if (Jsonizable::FromJsonString(storage_config, parsed_storage_configs)) {
         caller_node_provider_ = CallerNodeProviderFactory::Create(parsed_storage_configs, refresh_interval);
