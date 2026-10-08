@@ -65,6 +65,8 @@ kvcm.affinity.strategy_file=/path/to/affinity.json
 
 策略整体按 instance、instance_group、process 优先级选择，不按字段合并。实例/实例组通过其 `affinity_strategy_json` 配置；不完整但解析成功的覆盖策略会替换低层配置。解析器对部分错误字段使用默认值，加载成功不等于全部字段有效。
 
+**已有 instance 不能靠再次 RegisterInstance 更新亲和性策略**：该分支不比较或覆盖 `affinity_strategy_json`，可能返回 OK 但继续使用旧值。组策略可通过 `UpdateInstanceGroup` 更新完整配置，需要 `current_version` 匹配且新 `version` 递增；有效的 instance 覆盖仍会遮挡组策略。配置写入 OK 也不代表策略 JSON 的全部字段经过严格校验。
+
 节点压力回收还需要在元数据 backend URI 中配置 `reclaim_indexer_type=node_lru`；仅打开 affinity 不会创建节点索引。未配置时节点采样返回 `EC_NOENT`，不能期待节点回收生效。
 
 ## 2. 配置客户端执行复制
@@ -91,6 +93,10 @@ SDK 默认每次读取 PACE 本地身份；设正刷新间隔会允许复用旧�
 
 队列过期时间不是运行中 RPC/传输的硬截止时间；资源预算和目标限速只在一个 SDK 进程内共享。全局服务端开关与 `auto_replicate` 均不会禁止调用显式复制接口。
 
+即使走服务端 Copy，自动 hint 的单任务估算大小也受 `replication_max_buffer_bytes` 的入队检查。`Shutdown` 会等待 worker，队列中已有任务仍可能继续处理，不能视为立即取消所有复制。
+
+多 spec 复制需检查源/目标集合：读结果的 `location_spec_names` 过滤不会裁剪 hint；复制申请未传 spec group，目标按实例全部 spec 分配。源只保存较小 spec group、未覆盖实例全部 spec 时可能失败回滚；多 storage 下，目标 storage 若与源不同，服务端 Copy 也会拒绝。具体边界见[整体设计第 5、6 节](design-cache-affinity-v1.md)。
+
 ## 3. 可选的超节点拓扑
 
 为 SDK 和服务端设置 `KVCM_NODE_TOPOLOGY_FILE=/path/to/topology.json`，文件内容例如：
@@ -101,11 +107,13 @@ SDK 默认每次读取 PACE 本地身份；设正刷新间隔会允许复用旧�
 
 键须与实际 `LocationSpec.node_id` / caller 一致：mempool 是数字 node id 字符串，NFS 是 IP。建议原子替换文件。拓扑映射按需每 5 秒重读，连续失败后旧数据 30 秒过期；这不表示策略 JSON 文件也会自动刷新。
 
+服务端文件映射优先于 caller 自报的 supernode；同超节点候选还要有新鲜的节点指标。仅提供拓扑文件不会创建指标，也不保证同超节点选路始终有效。
+
 ## 4. 检查实际效果
 
 1. 用 StartWrite/Finish 完成普通写，检查 GetCacheMeta 中各 spec 的实际 node id 和 SERVING 状态；不能只看请求中的 preferred nodes。
-2. 从远端 caller 读取，检查正确的 spec 名称、hint target 和能力位。默认热度阈值为 3，但衰减、抑制、容量及成本门槛都可能改变是否发提示。
-3. 通过 SDK 结果回调/统计确认复制结果，再用 GetCacheMeta 检查目标节点完整的 SERVING 组件；批量 RPC 顶层 OK 不代表每项成功。
+2. 从远端 caller 查询，检查正确的 spec 名称、hint target 和能力位。热度统计元数据远端命中，不等待数据 Load 成功；查询轮询也会增加热度。默认阈值为 3，仍受衰减、抑制、容量及成本门槛约束；前缀加权仅 PrefixMatch 使用实际位置。
+3. 通过 SDK 结果回调/统计确认复制结果，再用 GetCacheMeta 的 `replica_locations` 检查目标节点完整的 SERVING 组件；兼容字段 `locations` 仅含每 key 第一个 Location。批量 RPC 顶层 OK、`server_copy_succeeded`（包含 already-exists）均不等于实际新建副本数。
 4. 验证回收时同时核对物理空间与元数据。NFS 指标是合成容量，删除接口仍是占位实现，不能用 NFS 集成测试证明 PACE 真实空间释放。
 
 测试入口：[真实 Manager 集成](../integration_test/affinity/affinity_replication_test.py)、[SDK 复制测试](../kv_cache_manager/client/test/replication_executor_test.cc)、[策略测试](../kv_cache_manager/affinity/test/)。完整限制及后续开发优先级见[整体设计](design-cache-affinity-v1.md)。
