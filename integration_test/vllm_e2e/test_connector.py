@@ -117,7 +117,8 @@ class VerifyingConnector(TairKvCacheConnector):
                     if isinstance(states, torch.Tensor):
                         layers = self._vllm_config.compilation_config.static_forward_context
                         states = layers[name].kv_cache
-                    assert isinstance(states, (list, tuple)) and states
+                    if not isinstance(states, (list, tuple)) or not states:
+                        raise ValueError(f"state layer {name!r}: vLLM did not bind typed states")
                     self._state_caches[name] = states
             self._cap_groups.append(
                 (meta.group_idx, isinstance(meta, AttentionGroupMeta),
@@ -336,7 +337,8 @@ class VerifyingConnector(TairKvCacheConnector):
             torch.tensor(captured_token_ids, dtype=torch.int64).numpy().tobytes()
         ).hexdigest()[:16]
         path = os.path.join(self._capture_dir, f"{kind}_tp{self._tp_rank}_{token_hash}.pt")
-        torch.save({"token_ids": captured_token_ids, "kv": kv_by_layer}, path)
+        torch.save({"token_ids": captured_token_ids, "kv": kv_by_layer,
+                    "state_layer_names": sorted(self._state_caches)}, path)
         logger.warning(
             "VerifyingConnector captured %s block=%d tokens=%d..%d tp=%s -> %s",
             kind, manager_block_idx, positions[0], positions[-1], self._tp_rank, path)
