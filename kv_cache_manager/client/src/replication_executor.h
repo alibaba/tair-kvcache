@@ -97,6 +97,7 @@ struct ReplicationTask {
     size_t pending_bytes = 0;
     ReplicationResources::Clock::time_point submitted_at = ReplicationResources::Clock::now();
     std::vector<ClientReplicationBuffer> named_buffers;
+    bool pacing_reserved = false;
 
 };
 
