@@ -560,7 +560,16 @@ void ReplicationExecutor::ExecuteServerCopyBatch(std::vector<ReplicationTask *> 
             ++counters_.server_copy_succeeded;
         } else if (result.error_code == ER_SERVICE_UNSUPPORTED) {
             ++counters_.client_fallback;
-            ExecuteTask(task, false);
+            // A failed client fallback must not discard the already returned
+            // results for other blocks in this server batch. ExecuteTask sets
+            // the active failure stage before invoking the transfer backend.
+            try {
+                ExecuteTask(task, false);
+            } catch (const std::exception &e) {
+                KVCM_LOG_WARN("[replication] fallback failed for block [%ld]: %s", task.hint.block_key, e.what());
+            } catch (...) {
+                KVCM_LOG_WARN("[replication] fallback failed for block [%ld]", task.hint.block_key);
+            }
         } else {
             task.outcome = ReplicationOutcome::SERVER_COPY_FAILED;
             task.error_code = result.error_code;
