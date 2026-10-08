@@ -46,6 +46,7 @@ from kv_cache_manager.py_connector.vllm.vllm_common import (
     StateGroupMeta,
     attn_kv_views,
     spec_name,
+    state_kv_view,
 )
 
 if typing.TYPE_CHECKING:
@@ -278,29 +279,11 @@ class ConnectorWorker:
     def _build_state_group(
         self, meta: StateGroupMeta, kv_caches: Dict[str, Any]
     ) -> StateTransferGroup:
-        # Mamba/state group: each layer is a list[Tensor] sharing one storage;
-        # rebuild a (num_blocks, page_size_bytes) byte view for opaque copy.
         spec = self._self_spec_names[meta.group_idx]
-        block_views = []
-        for name in meta.layer_names:
-            states = kv_caches[name]
-            assert isinstance(states, (list, tuple)) and len(states) > 0, (
-                f"state layer {name} should be a list of tensors"
-            )
-            storage = states[0].untyped_storage()
-            for st in states[1:]:
-                assert st.untyped_storage().data_ptr() == storage.data_ptr(), (
-                    f"state layer {name}: tensors do not share storage"
-                )
-            num_blocks = states[0].shape[0]
-            need = num_blocks * meta.page_size_bytes
-            assert storage.nbytes() >= need, (
-                f"state layer {name}: storage {storage.nbytes()} < {need}"
-            )
-            byte_view = torch.tensor([], dtype=torch.uint8, device=self._device).set_(
-                storage
-            )
-            block_views.append(byte_view[:need].view(num_blocks, meta.page_size_bytes))
+        block_views = [
+            state_kv_view(kv_caches[name], meta.page_size_bytes)
+            for name in meta.layer_names
+        ]
         return StateTransferGroup(
             group_idx=meta.group_idx,
             spec_name=spec,

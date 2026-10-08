@@ -110,6 +110,58 @@ class StateGroupMeta(GroupMeta):
     page_size_bytes: int = 0
 
 
+def state_kv_view(
+    cache: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+    page_size_bytes: int,
+) -> torch.Tensor:
+    """View state pages as bytes, preserving layer offsets and block strides.
+
+    Older vLLM supplies typed conv/SSM views sharing storage. Current vLLM
+    supplies a per-layer [B, 1, 1, C] byte view into a shared allocation;
+    C excludes page padding, and consecutive blocks need not be contiguous.
+    """
+    if isinstance(cache, torch.Tensor):
+        assert cache.dtype in (torch.int8, torch.uint8), (
+            f"state cache must be a byte tensor, got {cache.dtype}"
+        )
+        assert cache.dim() == 4 and cache.shape[1:3] == (1, 1), (
+            f"state cache must have shape [B, 1, 1, C], got {tuple(cache.shape)}"
+        )
+        assert cache.stride(-1) == 1 and cache.shape[-1] <= page_size_bytes
+        first = cache
+    else:
+        assert isinstance(cache, (list, tuple)) and len(cache) > 0, (
+            "state cache must be a byte tensor or a nonempty list of state tensors"
+        )
+        first = cache[0]
+
+    storage = first.untyped_storage()
+    num_blocks = first.shape[0]
+    offset = first.storage_offset() * first.element_size()
+    block_stride = first.stride(0) * first.element_size()
+    assert page_size_bytes > 0 and block_stride >= page_size_bytes, (
+        f"state block stride {block_stride} < page size {page_size_bytes}"
+    )
+    if not isinstance(cache, torch.Tensor):
+        for state in cache:
+            assert state.untyped_storage().data_ptr() == storage.data_ptr(), (
+                "state tensors do not share storage"
+            )
+            assert state.shape[0] == num_blocks
+            assert state.stride(0) * state.element_size() == block_stride
+            state_offset = state.storage_offset() * state.element_size()
+            assert offset <= state_offset < offset + page_size_bytes, (
+                "state component lies outside the first page"
+            )
+    end = offset + (num_blocks - 1) * block_stride + page_size_bytes
+    assert num_blocks > 0 and storage.nbytes() >= end, (
+        f"state storage {storage.nbytes()} < required end {end}"
+    )
+    return torch.empty(0, dtype=torch.uint8, device=first.device).set_(
+        storage, offset, (num_blocks, page_size_bytes), (block_stride, 1)
+    )
+
+
 def parse_groups(
     kv_cache_config: "KVCacheConfig", manager_block_size: int
 ) -> List[GroupMeta]:
