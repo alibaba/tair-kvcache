@@ -1,6 +1,6 @@
 # Cache affinity configuration and usage
 
-This guide describes the current `kvcm_affinity_merge` implementation. See the [implementation design](design-cache-affinity-v1.md) for call flows, defaults, backend support and known gaps. [中文](cache-affinity-zh_CN.md)
+This guide describes the current `kvcm_affinity_merge` implementation. Start with the [overall design](design-cache-affinity-v1.md); consult the [implementation reference](cache-affinity-implementation.md) for call flows, defaults, backend support and the full list of known gaps. [中文](cache-affinity-zh_CN.md)
 
 ## 1. Enable the server strategy
 
@@ -95,7 +95,7 @@ Task expiry does not forcibly cancel an executing RPC or transfer. Shared memory
 
 Even automatic hints intended for server copying undergo a per-task estimated-size check against `replication_max_buffer_bytes` before queue admission. Shutdown waits for workers, which can continue processing queued tasks; it does not immediately cancel all replication.
 
-For multi-spec copying, check source and destination sets. Filtering read results with `location_spec_names` does not trim hints. Replication allocation omits the spec group and requests all instance specs; a source containing only a smaller spec group, rather than all instance specs, can fail validation and roll back. Server Copy also rejects different source/destination storages. See sections 5 and 6 of the [implementation design](design-cache-affinity-v1.md).
+For multi-spec copying, check source and destination sets. Filtering read results with `location_spec_names` does not trim hints. Replication allocation omits the spec group and requests all instance specs; a source containing only a smaller spec group, rather than all instance specs, can fail validation and roll back. Server Copy also rejects different source/destination storages. See sections 5 and 6 of the [implementation reference](cache-affinity-implementation.md).
 
 ## 3. Optional supernode topology
 
@@ -116,4 +116,4 @@ The server's file mapping takes precedence over the caller's reported supernode.
 3. Check SDK result callbacks/statistics, then inspect GetCacheMeta's `replica_locations` for complete SERVING components on the target. The compatibility `locations` field contains only the first Location per key. Neither batch-level OK nor `server_copy_succeeded` (which includes already-exists) measures newly created replicas.
 4. Check both physical space and metadata when validating eviction. NFS reports synthetic capacity and has a placeholder Delete implementation, so NFS integration tests do not establish real PACE space reclamation.
 
-Test entry points: [real Manager integration](../integration_test/affinity/affinity_replication_test.py), [SDK replication tests](../kv_cache_manager/client/test/replication_executor_test.cc), [strategy tests](../kv_cache_manager/affinity/test/). See the [implementation design](design-cache-affinity-v1.md) for remaining limitations and development priorities.
+Test entry points: [real Manager integration](../integration_test/affinity/affinity_replication_test.py), [SDK replication tests](../kv_cache_manager/client/test/replication_executor_test.cc), [strategy tests](../kv_cache_manager/affinity/test/). See the [implementation reference](cache-affinity-implementation.md) for remaining limitations and development priorities.
