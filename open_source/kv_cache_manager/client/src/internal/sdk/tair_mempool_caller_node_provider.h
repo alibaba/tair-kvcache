@@ -11,7 +11,7 @@ namespace kv_cache_manager {
 
 class TairMempoolCallerNodeProvider : public CallerNodeProvider {
 public:
-    explicit TairMempoolCallerNodeProvider(std::chrono::seconds = std::chrono::seconds(30)) {}
+    explicit TairMempoolCallerNodeProvider(std::chrono::seconds = std::chrono::seconds(0)) {}
     ~TairMempoolCallerNodeProvider() override = default;
 
     ClientErrorCode Init(const std::shared_ptr<StorageConfig> &) { return ER_SDKINIT_ERROR; }
