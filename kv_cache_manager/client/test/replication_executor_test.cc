@@ -45,6 +45,8 @@ public:
                 FinishWrite,
                 (const std::string &, const std::string &, const BlockMask &, const Locations &),
                 (override));
+    MOCK_METHOD(std::vector<ClientReplicationRpcResult>, ReplicateCaches,
+                (const std::string &, const std::vector<ClientReplicationHint> &, int32_t), (override));
     MOCK_METHOD(ClientErrorCode,
                 ReplicateCache,
                 (const std::string &, const ClientReplicationHint &, int32_t),
@@ -117,6 +119,9 @@ protected:
     void SetUp() override {
         LoggerBroker::InitLoggerForClientOnce();
         ON_CALL(mock_meta_, ReplicateCache(_, _, _)).WillByDefault(Return(ER_SERVICE_UNSUPPORTED));
+        ON_CALL(mock_meta_, ReplicateCaches(_, _, _)).WillByDefault([this](const auto &trace, const auto &hints, auto timeout) {
+            return mock_meta_.MetaClient::ReplicateCaches(trace, hints, timeout);
+        });
     }
 
     std::unique_ptr<ReplicationExecutor> MakeExecutor(int num_workers = 1) {
@@ -1000,4 +1005,41 @@ TEST_F(ReplicationExecutorTest, UnsupportedServerCopyFallbackConsumesOnlyOneRate
     EXPECT_EQ(1u, executor.GetStats().succeeded);
     EXPECT_EQ(1u, executor.GetStats().client_fallback);
     EXPECT_EQ(0u, executor.GetStats().expired);
+}
+
+TEST_F(ReplicationExecutorTest, ThrowingFallbackDoesNotDiscardSuccessfulSiblingInServerBatch) {
+    std::promise<void> entered, release;
+    auto entered_future = entered.get_future();
+    auto release_future = release.get_future();
+    EXPECT_CALL(mock_meta_, ReplicateCaches(_, _, 60))
+        .WillOnce([&](const auto &, const auto &hints, auto) {
+            EXPECT_EQ(1u, hints.size());
+            entered.set_value();
+            release_future.wait();
+            return std::vector<ClientReplicationRpcResult>{{ER_OK, false}};
+        })
+        .WillOnce([](const auto &, const auto &hints, auto) {
+            EXPECT_EQ(2u, hints.size());
+            return std::vector<ClientReplicationRpcResult>{{ER_SERVICE_UNSUPPORTED, false}, {ER_OK, false}};
+        });
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true))
+        .WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation())));
+    EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _))
+        .WillOnce(testing::Throw(std::runtime_error("fallback transfer exception")));
+    EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).Times(0);
+    EXPECT_CALL(mock_meta_, FinishWrite(_, _, _, _)).WillOnce(Return(ER_OK));
+    auto executor = MakeExecutor();
+    executor->Submit({MakeHint(913, "batch_exception")});
+    const auto ready = entered_future.wait_for(2s);
+    if (ready != std::future_status::ready) {
+        release.set_value();
+        FAIL() << "worker did not enter the initial batch";
+    }
+    executor->Submit({MakeHint(914, "batch_exception"), MakeHint(915, "batch_exception")});
+    release.set_value();
+    executor->Shutdown();
+    EXPECT_EQ(2u, executor->GetStats().succeeded);
+    EXPECT_EQ(1u, executor->GetStats().failed);
+    EXPECT_EQ(1u, executor->GetStats().transfer_failed);
+    EXPECT_EQ(0u, executor->GetStats().active);
 }
