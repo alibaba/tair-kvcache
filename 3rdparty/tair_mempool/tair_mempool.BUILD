@@ -75,6 +75,7 @@ cc_library(
         "-L/usr/lib64/",
         "-libverbs",
         "-lrdmacm",
+        "-lrt",
     ] + select({
         ":with_cuda": ["-lcuda"],
         "//conditions:default": [],
