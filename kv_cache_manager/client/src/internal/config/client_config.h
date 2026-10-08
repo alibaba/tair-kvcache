@@ -58,7 +58,9 @@ private:
     uint64_t replication_node_bytes_per_second_ = 0;
     uint32_t replication_max_age_ms_ = 30000;
     bool auto_replicate_ = false;
-    int32_t caller_node_refresh_seconds_ = 30;
+    // 0 refreshes the backend identity on every request. This is the safe
+    // default for backends whose node id also identifies a data incarnation.
+    int32_t caller_node_refresh_seconds_ = 0;
 };
 
 } // namespace kv_cache_manager

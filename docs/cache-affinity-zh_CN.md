@@ -227,6 +227,8 @@ load、低 latency),把 `weight` 设为负数即可:
 
 `caller.node_id` 与后端返回的 `node_id` 必须使用同一套标识：mempool 使用当前 PACE 数字 node id 的字符串形式，NFS 使用本机身份。PACE node id 变化表示新的数据状态代际，旧副本不得继续被判为 caller 本地副本。`total_bytes` 用于容量滞回，`supernode_id` 用于同超节点偏好。`rx_mbps` / `tx_mbps` 仍需外部观测来源提供。
 
+客户端参数 `caller_node_refresh_seconds` 默认是 `0`，表示每次请求都重新查询后端身份，避免 PACE node id 换代后继续使用旧 caller。显式设置正数可以降低查询频率，但会引入最长为该配置值的旧身份窗口。
+
 > 已注册指标只有上表中的 `free_bytes / load_ratio / rx_mbps / tx_mbps`
 > 四件套。`filter.metric` / `sort.metric` 名不在这张表里,解析时直接
 > 报错。新增指标需要同时改 `NodeMetrics` 字段和 `affinity/pipeline/metric_catalog.cc`

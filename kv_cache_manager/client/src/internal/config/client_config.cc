@@ -18,7 +18,7 @@ bool ClientConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "replication_workers", replication_workers_, static_cast<int32_t>(2));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "auto_replicate", auto_replicate_, false);
     KVCM_JSON_GET_DEFAULT_MACRO(
-        rapid_value, "caller_node_refresh_seconds", caller_node_refresh_seconds_, static_cast<int32_t>(30));
+        rapid_value, "caller_node_refresh_seconds", caller_node_refresh_seconds_, static_cast<int32_t>(0));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "replication_max_buffer_bytes", replication_max_buffer_bytes_, static_cast<uint64_t>(256 * 1024 * 1024));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "replication_max_pending_bytes", replication_max_pending_bytes_, static_cast<uint64_t>(256 * 1024 * 1024));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "replication_node_bytes_per_second", replication_node_bytes_per_second_, static_cast<uint64_t>(0));
@@ -61,7 +61,8 @@ bool ClientConfig::operator==(const ClientConfig &other) const {
 }
 
 bool ClientConfig::Check() const {
-    if (replication_workers_ < 1 || replication_workers_ > 64 || replication_max_buffer_bytes_ == 0 ||
+    if (replication_workers_ < 1 || replication_workers_ > 64 || caller_node_refresh_seconds_ < 0 ||
+        replication_max_buffer_bytes_ == 0 ||
         replication_max_pending_bytes_ == 0 || replication_max_age_ms_ == 0) return false;
     if (block_size_ < 1) {
         KVCM_LOG_ERROR("block_size [%d] is invalid", block_size_);
