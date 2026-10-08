@@ -174,8 +174,12 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
 
         # Compare each location
         for i, (start_loc, get_loc) in enumerate(zip(start_write_locations, get_location_locations)):
-            self.assertEqual(start_loc, get_loc,
-                             f"Location {i} from startWriteCache and getCacheLocation should match")
+            # Allocation and read projection have different lifecycle metadata.
+            # URI, component name, and physical node must survive publication.
+            for field in ("type", "spec_size", "location_specs"):
+                self.assertEqual(start_loc[field], get_loc[field], (i, field))
+            self.assertEqual("CLS_SERVING", get_loc["status"])
+            self.assertTrue(get_loc["id"])
 
     def test_register_instance(self):
         # case: instance_id duplicated
