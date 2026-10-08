@@ -230,19 +230,19 @@ curl -g -vvv -X POST http://localhost:6382/api/getCacheMeta \
 
 响应中的旧字段 `locations` 继续按请求 key 返回第一个 location。新增的
 `replica_locations` 与请求 key 一一对应，每一项包含该 key 的全部副本。每个副本返回
-`id`、`status`、`create_time`，每个 spec 返回 Provider UUID `node_id` 和包含 PACE 数字
+`id`、`status`、`create_time`，每个 spec 返回字符串形式的 PACE `node_id` 和包含该数字
 node id/GA 的原始 `uri`。调用方应使用 `replica_locations` 做副本诊断和状态展示。
 
 
 ## 亲和性复制提示
 
 `GetCacheLocationResponse.hints` 为远端热点提供异步复制建议，不改变本次读取返回的 location。
-单个提示包含 `block_key`、目标节点 UUID `target_node_id` 和 `source_specs`：
+单个提示包含 `block_key`、字符串形式的目标 PACE node id `target_node_id` 和 `source_specs`：
 
 ```json
 {
   "block_key": "123",
-  "target_node_id": "provider-uuid",
+  "target_node_id": "42",
   "source_specs": [
     {"spec_name": "kv", "uri": "pace://source/kv?size=1024"},
     {"spec_name": "state", "uri": "pace://source/state?size=2048"}
@@ -272,7 +272,7 @@ POST /api/replicateCache
   "trace_id": "replicate_123",
   "instance_id": "instance_1",
   "block_key": "123",
-  "target_node_id": "provider-uuid",
+  "target_node_id": "42",
   "write_timeout_seconds": 60,
   "source_specs": [
     {"spec_name": "kv", "uri": "pace://storage/ga1?size=1024"}

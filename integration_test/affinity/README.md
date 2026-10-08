@@ -47,11 +47,11 @@ bazelisk --output_base=/tmp/bazel-affinity-e2e-os test \
 
 1. A 执行 `writer_abort`：未 Finish/失败 Finish 的 block 都不可读。
 2. A 执行 `writer`：真实 Save、成功 Finish 后能逐字节读回，URI 的物理 node ID 必须属于 A。
-3. B 执行 `reader_piggyback` 或 `reader_async`：先读远端原始数据，查询到设定门限才获得 hint；hint 的 key、源 URI、目标 UUID 都必须准确。等 B 副本发布后，验证物理 node ID、稳定 URI、无重复 hint 和完整数据。
+3. B 执行 `reader_piggyback` 或 `reader_async`：先读远端原始数据，查询到设定门限才获得 hint；hint 的 key、源 URI、目标 PACE node ID 都必须准确。等 B 副本发布后，验证物理 node ID、稳定 URI、无重复 hint 和完整数据。
 4. CI 停掉 A 的 Provider 容器并确认退出，B 执行 `reader_local` 再读全部 block。
 5. 另一个 instance 对相同 key 执行 `reader_miss`；原 instance 执行 `remove`、`reader_miss`、`writer`、`reader_local`，验证删除和本地重建。
 
-`--expected-node-id` 必须来自 MetaService `/v1/api/memnode` 中本机唯一、健康 Provider 的 **数值 PACE ID**，不能使用 Provider UUID 或从被测 URI 反推期望值。hint 的 `target_node_id` 则使用 SDK caller 的 UUID。
+`--expected-node-id` 必须来自 MetaService `/v1/api/memnode` 中本机唯一、健康 Provider 的 **数值 PACE ID**，不能使用 Provider UUID 或从被测 URI 反推期望值。SDK caller 和 hint 的 `target_node_id` 都使用该 PACE ID 的字符串形式。
 
 ```bash
 # 已部署的双机环境中，在 A/B 各自 Provider 容器内执行。

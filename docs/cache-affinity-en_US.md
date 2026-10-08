@@ -1,7 +1,7 @@
 # Cache Affinity
 
 > This page describes the write-placement pipeline and replica lifecycle controls. The implementation also
-> includes local reads, replication and node eviction, uses provider UUIDs in `caller.node_id`,
+> includes local reads, replication and node eviction, uses the current numeric PACE node ID as a string in `caller.node_id`,
 > and pulls backend metrics automatically. See [the current design](design-cache-affinity-v1.md).
 
 KVCacheManager has an optional affinity layer that influences **block →
@@ -261,7 +261,7 @@ current set of fields:
 | `tx_mbps` | `filter` / `sort` term named `tx_mbps` |
 | `updated_at_us` | The affinity manager validates sample order and TTL; cached snapshots do not renew freshness |
 
-`caller.node_id` must match the stable identity returned by the backend: Provider UUID for mempool, local host identity for NFS. `total_bytes` supports capacity hysteresis; `supernode_id` supports nearby placement. `rx_mbps` / `tx_mbps` still require an external telemetry source.
+`caller.node_id` must use the same identity as the backend result: the current numeric PACE node ID as a string for mempool, and the local host identity for NFS. A PACE node ID change represents a new data-state incarnation, so replicas tagged with the old ID must no longer count as caller-local. `total_bytes` supports capacity hysteresis; `supernode_id` supports nearby placement. `rx_mbps` / `tx_mbps` still require an external telemetry source.
 
 > The only registered metrics are the four above (`free_bytes /
 > load_ratio / rx_mbps / tx_mbps`). A `filter.metric` or `sort.metric`
@@ -369,7 +369,7 @@ The default `CreateWithHints` forwards ordinary writes to legacy `Create` and re
 
 `read.on_miss.heat_half_life_ms` defaults to 60000. Optional `max_replication_bytes`, `min_benefit_ratio`, and `prefix_bonus` gate copying by size, decayed heat, avoided remote bytes and prefix position. Their default is 0 (disabled). Unknown sizes are rejected when cost admission is enabled.
 
-Set `KVCM_NODE_TOPOLOGY_FILE` in manager and SDK processes to a JSON file such as `{"nodes":{"uuid-a":"rack1","uuid-b":"rack1"}}`. Replace it atomically. It refreshes every 5 seconds; failed refreshes expire the old mapping after 30 seconds. Reads prefer local, then same-supernode, then existing remote order. Writes can enable `prefer_local.same_supernode`; strict replication still requires the caller node.
+Set `KVCM_NODE_TOPOLOGY_FILE` in manager and SDK processes to a JSON file such as `{"nodes":{"41":"rack1","42":"rack1"}}`. Node keys must match backend node IDs. Since a mempool Provider can receive a new PACE node ID after re-registration, the topology control plane must replace the old key with the new one. Replace the file atomically. It refreshes every 5 seconds; failed refreshes expire the old mapping after 30 seconds. Reads prefer local, then same-supernode, then existing remote order. Writes can enable `prefer_local.same_supernode`; strict replication still requires the caller node.
 
 Client options `replication_max_buffer_bytes` and `replication_max_pending_bytes` default to 256 MiB; `replication_node_bytes_per_second=0` disables pacing and `replication_max_age_ms=30000` bounds queue lifetime. Executors share in-process memory admission, instance rotation and target-node pacing. Use consistent process budgets across clients; cross-process quotas remain a deployment concern.
 

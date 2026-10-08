@@ -1,7 +1,7 @@
 # Cache Affinity v1 实现说明
 
-> 当前实现说明（2026-10-05）：写、读、复制、节点淘汰均已接入，mempool 后端支持
-> `CreateWithHints` 与真实节点指标。节点身份使用 Provider UUID；下文历史描述中的
+> 当前实现说明（2026-10-08）：写、读、复制、节点淘汰均已接入，mempool 后端支持
+> `CreateWithHints` 与真实节点指标。节点身份使用当前 PACE 数字 node id 的字符串形式；下文历史描述中的
 > `caller_node_ip` 对应当前的 `caller.node_id`。完整开关为 `kvcm.affinity.enabled`，默认 false。
 
 ### 已补齐的正确性行为
@@ -178,7 +178,7 @@ URI hostname 是集群名，物理节点藏在 query 参数里。让 backend 显
 | `GetCacheLocationRequest` | `caller_node_ip = 9`, `caller_supernode_id = 10` | 调用方自报位置 |
 | `StartWriteCacheRequest` | `caller`、`is_replication = 8`、`replication_target_node_id = 9` | 调用方拓扑 + 复制写标志和明确目标节点 |
 | `ReplicateCache` | 单项兼容字段或批量 `items`，每项含 block key、完整 `source_specs`、`target_node_id` | 服务端批量申请目标 GA，并按 storage 合并调用 backend CopyGA |
-| `GetCacheMetaResponse` | `replica_locations` | 按 key 返回完整副本及状态、时间、Provider UUID 和 URI |
+| `GetCacheMetaResponse` | `replica_locations` | 按 key 返回完整副本及状态、时间、PACE node id 和 URI |
 | `GetCacheLocationResponse` | `repeated ReplicationHint hints = 3` | 服务端下发复制提示 |
 
 所有新字段 additive，老客户端字段为空时退化为未启用 affinity。
@@ -316,7 +316,7 @@ CacheReclaimer::TryReclaimOnGroup
 
 ### 7.2 已完成的接入与回归
 
-mempool 分配偏好、strict 复制分配、UUID 映射和容量采样已实现。
+mempool 分配偏好、strict 复制分配、PACE node id 透传和容量采样已实现。
 三个历史缺口验收用例（部分本地命中、热度实例隔离、提示实例隔离）已纳入普通测试。
 多 spec 复制、失败会话清理、有界队列、过期指标、满容量水位和实例淘汰覆盖均有回归用例。
 执行入口见 [亲和性生命周期验收](../integration_test/affinity/README.md)。
