@@ -65,6 +65,8 @@ Key semantics:
 
 Strategies are selected as whole objects in instance, instance_group, process order, without field merging. Instance and group settings use `affinity_strategy_json`. A partial but accepted override replaces the lower-level strategy. Some malformed fields fall back to defaults, so successful loading does not prove every field was applied.
 
+**Registering an existing instance again does not update its affinity strategy.** That branch neither compares nor overwrites `affinity_strategy_json`; it can return OK while retaining the old value. Update a group's complete configuration with `UpdateInstanceGroup`, matching `current_version` and increasing the new `version`. An accepted instance override still takes precedence. A successful configuration write also does not mean every strategy field passed strict validation.
+
 Node-pressure eviction also requires `reclaim_indexer_type=node_lru` in the metadata backend URI. Enabling affinity does not create this index automatically; without it, node sampling returns `EC_NOENT` and no node-pressure deletion is submitted.
 
 ## 2. Enable client replication execution
@@ -91,6 +93,10 @@ Tasks without reusable buffers first call server ReplicateCache and fall back to
 
 Task expiry does not forcibly cancel an executing RPC or transfer. Shared memory budgets and target pacing apply within one SDK process. Neither the server affinity switch nor `auto_replicate` prohibits explicit replication APIs.
 
+Even automatic hints intended for server copying undergo a per-task estimated-size check against `replication_max_buffer_bytes` before queue admission. Shutdown waits for workers, which can continue processing queued tasks; it does not immediately cancel all replication.
+
+For multi-spec copying, check source and destination sets. Filtering read results with `location_spec_names` does not trim hints. Replication allocation omits the spec group and requests all instance specs; a source containing only a smaller spec group, rather than all instance specs, can fail validation and roll back. Server Copy also rejects different source/destination storages. See sections 5 and 6 of the [implementation design](design-cache-affinity-v1.md).
+
 ## 3. Optional supernode topology
 
 Set `KVCM_NODE_TOPOLOGY_FILE=/path/to/topology.json` in SDK and server processes, for example:
@@ -101,11 +107,13 @@ Set `KVCM_NODE_TOPOLOGY_FILE=/path/to/topology.json` in SDK and server processes
 
 Keys must match actual `LocationSpec.node_id` and caller IDs: numeric node ID strings for mempool, IP addresses for NFS. Replace the file atomically. Topology is reread on demand at five-second intervals; stale mappings expire after 30 seconds of unsuccessful reads. This refresh behavior does not apply to the strategy JSON file.
 
+The server's file mapping takes precedence over the caller's reported supernode. Same-supernode candidates also need fresh node metrics; the topology file neither creates metrics nor guarantees that this preference remains available.
+
 ## 4. Verify the resulting behavior
 
 1. Complete an ordinary StartWrite/Finish flow and inspect actual spec node IDs and SERVING states with GetCacheMeta. Preferred-node input alone does not prove placement.
-2. Read from a remote caller and check spec names, hint target and capabilities. The default heat threshold is three, but decay, suppression, capacity and cost gates can affect emission.
-3. Check SDK result callbacks/statistics, then confirm complete SERVING components on the target with GetCacheMeta. A batch RPC's top-level OK does not imply every item succeeded.
+2. Query from a remote caller and check spec names, hint target and capabilities. Heat counts remote metadata matches without waiting for a successful Load; polling also increments it. The default threshold is three, subject to decay, suppression, capacity and cost gates. Only PrefixMatch supplies an actual position for prefix weighting.
+3. Check SDK result callbacks/statistics, then inspect GetCacheMeta's `replica_locations` for complete SERVING components on the target. The compatibility `locations` field contains only the first Location per key. Neither batch-level OK nor `server_copy_succeeded` (which includes already-exists) measures newly created replicas.
 4. Check both physical space and metadata when validating eviction. NFS reports synthetic capacity and has a placeholder Delete implementation, so NFS integration tests do not establish real PACE space reclamation.
 
 Test entry points: [real Manager integration](../integration_test/affinity/affinity_replication_test.py), [SDK replication tests](../kv_cache_manager/client/test/replication_executor_test.cc), [strategy tests](../kv_cache_manager/affinity/test/). See the [implementation design](design-cache-affinity-v1.md) for remaining limitations and development priorities.
