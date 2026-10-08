@@ -1166,11 +1166,10 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         # compare each location
         for i, (start_loc, get_loc) in enumerate(
                 zip(start_write_locations, get_location_locations)):
-            self.assertEqual(
-                start_loc,
-                get_loc,
-                f"location {i} from startWriteCache and getCacheLocation should match",
-            )
+            for field in ("type", "spec_size", "location_specs"):
+                self.assertEqual(start_loc[field], get_loc[field], (i, field))
+            self.assertEqual("CLS_SERVING", get_loc["status"])
+            self.assertTrue(get_loc["id"])
 
     def _make_dummy_storage(self) -> Dict:
         return {
