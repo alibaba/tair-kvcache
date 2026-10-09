@@ -321,7 +321,7 @@ ErrorCode MigrationManager::CheckTargetStorageAdmission(const std::string &trace
     // Test-only/legacy construction may not provide RegistryManager. Availability is still a
     // mandatory target invariant; quota evaluation requires the instance-group context.
     const auto backend = data_storage_manager_->GetDataStorageBackend(target_storage_name);
-    if (backend == nullptr || !backend->Available()) {
+    if (backend == nullptr || !backend->Writable()) {
         return EC_NOENT;
     }
     return EC_OK;
