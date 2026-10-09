@@ -42,7 +42,7 @@ def create_update_storage_data(args, storage_type: str, storage_spec: dict, pace
     }
 
 
-def get_existing_pace_identity(host: str, trace_id: str, unique_name: str, verbose: bool):
+def get_existing_pace_config(host: str, trace_id: str, unique_name: str, verbose: bool):
     result = http_post(host, "/api/listStorage", {"trace_id": trace_id}, verbose)
     status_code = result.get("header", {}).get("status", {}).get("code")
     if status_code not in ("OK", 1):
@@ -60,17 +60,20 @@ def get_existing_pace_identity(host: str, trace_id: str, unique_name: str, verbo
         media_type = storage_spec.get("media_type", 0)
         if type(media_type) is not int or media_type not in (0, 2, 5):
             raise RuntimeError(f"storage '{unique_name}' has invalid PACE media_type: {media_type}")
+        skip_missing = storage_spec.get("skip_confirmed_missing_backend_delete", False)
+        if type(skip_missing) is not bool:
+            raise RuntimeError(f"storage '{unique_name}' has invalid skip_confirmed_missing_backend_delete")
 
         storage_type = storage.get("storage_type", "ST_UNSPECIFIED")
         if storage_type in ("ST_UNSPECIFIED", "ST_TAIRMEMPOOL"):
             # Older Managers may omit the type. Preserve the legacy identity,
             # including the historical ST_TAIRMEMPOOL + media_type=5 form.
-            return media_type, "ST_TAIRMEMPOOL"
+            return media_type, "ST_TAIRMEMPOOL", skip_missing
         if storage_type == "ST_TAIRMEMPOOL_SSD":
             if media_type != 5:
                 raise RuntimeError(
                     f"storage '{unique_name}' has ST_TAIRMEMPOOL_SSD but media_type is {media_type}, expected 5")
-            return media_type, storage_type
+            return media_type, storage_type, skip_missing
         raise RuntimeError(f"storage '{unique_name}' has incompatible storage_type: {storage_type}")
 
     raise RuntimeError(f"PACE storage '{unique_name}' does not exist")
@@ -88,7 +91,7 @@ def handle_nfs(args):
 
 
 def handle_pace(args):
-    media_type, pace_storage_type = get_existing_pace_identity(
+    media_type, pace_storage_type, skip_missing = get_existing_pace_config(
         args.host, args.trace_id, args.unique_name, args.verbose)
     expected_storage_type = (
         "ST_TAIRMEMPOOL_SSD" if args.storage_type == "pace_ssd" else "ST_TAIRMEMPOOL")
@@ -98,10 +101,11 @@ def handle_pace(args):
             f"storage '{args.unique_name}' has storage_type {pace_storage_type}; "
             f"use the '{expected_subcommand}' subcommand to update it")
 
-    resolved_args = args
+    resolved_args = copy.copy(args)
     if args.media_type is None:
-        resolved_args = copy.copy(args)
         resolved_args.media_type = media_type
+    if getattr(args, "skip_confirmed_missing_backend_delete", None) is None:
+        resolved_args.skip_confirmed_missing_backend_delete = skip_missing
     storage_spec = gen_pace_config_data(resolved_args)
     data = create_update_storage_data(
         resolved_args, "tair_mem_pool", storage_spec, pace_storage_type=pace_storage_type)

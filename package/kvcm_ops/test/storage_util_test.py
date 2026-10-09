@@ -106,6 +106,17 @@ class PaceStorageArgsTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self._parse_args("--media_type", "7")
 
+    def test_gc_delete_policy_is_optional_and_accepts_explicit_booleans(self):
+        for parse in (self._parse_args, self._parse_ssd_args):
+            self.assertNotIn("skip_confirmed_missing_backend_delete", gen_pace_config_data(parse()))
+            for value in ("true", "false"):
+                with self.subTest(parser=parse.__name__, value=value):
+                    args = parse("--skip_confirmed_missing_backend_delete", value)
+                    self.assertEqual(
+                        value == "true", gen_pace_config_data(args)["skip_confirmed_missing_backend_delete"])
+            with self.assertRaises(SystemExit):
+                parse("--skip_confirmed_missing_backend_delete", "invalid")
+
     def test_update_can_distinguish_omitted_media_type(self):
         parser = argparse.ArgumentParser()
         subparsers = parser.add_subparsers(dest="storage_type", required=True)
@@ -219,6 +230,28 @@ class PaceStorageUpdateTest(unittest.TestCase):
             update_storage.handle_pace(self._args())
 
         mock_post_and_print.assert_not_called()
+
+    @patch.object(update_storage, "http_post_and_print")
+    @patch.object(update_storage, "http_post")
+    def test_gc_delete_policy_is_preserved_or_explicitly_updated(self, mock_http_post, mock_post_and_print):
+        field = "skip_confirmed_missing_backend_delete"
+        for storage_type, media_type, subcommand in (
+                ("ST_TAIRMEMPOOL", 2, "pace"), ("ST_TAIRMEMPOOL_SSD", 5, "pace_ssd")):
+            for previous in (None, False, True):
+                for requested in (None, False, True):
+                    with self.subTest(storage_type=storage_type, previous=previous, requested=requested):
+                        response = self._list_response(storage_type, media_type)
+                        if previous is not None:
+                            response["storage"][0]["tair_mem_pool"][field] = previous
+                        mock_http_post.return_value = response
+                        args = self._args(storage_type=subcommand)
+                        setattr(args, field, requested)
+                        update_storage.handle_pace(args)
+                        expected = requested if requested is not None else bool(previous)
+                        payload = mock_post_and_print.call_args.args[1]
+                        self.assertEqual(expected, payload["storage"]["tair_mem_pool"][field])
+                        self.assertEqual(media_type, payload["storage"]["tair_mem_pool"]["media_type"])
+                        self.assertIs(requested, getattr(args, field))
 
 
 class TairMempoolSsdPreferenceTest(unittest.TestCase):
