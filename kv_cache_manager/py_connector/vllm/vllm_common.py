@@ -29,16 +29,20 @@ from vllm.v1.kv_cache_interface import (
 )
 
 try:
-    # vLLM >= 0.22 names; vllm 0.14 has none of them. The sentinels are only
-    # ever used behind a null check (isinstance(x, None) would raise).
-    from vllm.v1.kv_cache_interface import (  # ty: ignore[unresolved-import]
-        KVQuantMode,
-        SlidingWindowMLASpec,
-        UniformTypeKVCacheSpecs,
-    )
-except ImportError:  # pragma: no cover - older vLLM eras
+    # Optional compatibility symbols, one import statement each: vLLM 0.14
+    # ships UniformTypeKVCacheSpecs but not KVQuantMode / SlidingWindowMLASpec,
+    # and a shared statement would null all three on that era. The sentinels
+    # are only ever used behind a null check (isinstance(x, None) would raise).
+    from vllm.v1.kv_cache_interface import KVQuantMode  # ty: ignore[unresolved-import]
+except ImportError:  # pragma: no cover - vllm 0.14 has no KVQuantMode
     KVQuantMode = None  # ty: ignore[invalid-assignment]
+try:
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec  # ty: ignore[unresolved-import]
+except ImportError:  # pragma: no cover - vllm 0.14 has no SlidingWindowMLASpec
     SlidingWindowMLASpec = None  # ty: ignore[invalid-assignment]
+try:
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs  # ty: ignore[unresolved-import]
+except ImportError:  # pragma: no cover - older vLLM eras
     UniformTypeKVCacheSpecs = None  # ty: ignore[invalid-assignment]
 
 from kv_cache_manager.py_connector.common.logger import logger
@@ -71,7 +75,9 @@ _QUANT_MODE_NAMES = {
 # so they must stay accepted).
 _PLAIN_CACHE_DTYPES = (None, "auto", "float16", "bfloat16")
 # Non-packed per-tensor fp8 cache dtypes: compact pages, layer-level scales.
-_PLAIN_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+# fp8_e5m2 maps to FP8_PER_TENSOR and uint8 storage like the e4m3 variant
+# (vLLM 0.26 lists it; the ROCm aiter backends accept it).
+_PLAIN_FP8_CACHE_DTYPES = ("fp8", "fp8_e4m3", "fp8_e5m2")
 # The accepted cache_dtype_str values, spelled out for refusal messages: derived
 # from the tuples above so the message cannot drift from the gate.
 _KNOWN_CACHE_DTYPES = (
@@ -285,10 +291,14 @@ def state_kv_view(
     )
 
 
-
 def _quant_mode(spec: Any) -> int:
     return int(getattr(spec, "kv_quant_mode", _QUANT_NONE) or _QUANT_NONE)
 
+
+def _has_quant_mode(spec: Any) -> bool:
+    """vLLM 0.14 specs predate kv_quant_mode: the dtype string alone defines
+    the layout there, so the (cds, mode) consistency rules cannot apply."""
+    return hasattr(spec, "kv_quant_mode")
 
 
 def _quant_mode_name(spec: Any) -> str:
@@ -348,10 +358,13 @@ def _check_mla_variant(
       it (a naive quant gate would make every real V3.2 main layer unreachable);
     * None/auto/float16/bfloat16 with kv_quant_mode NONE: the plain latent
       cache (GLM, indexer layers, bf16 V3.2 main);
-    * "fp8"/"fp8_e4m3" with kv_quant_mode FP8_PER_TENSOR: layer-level scales
-      live outside the cached bytes, so the round trip is exact -- but only
-      while vLLM does not *calibrate* those scales at runtime
-      (calculate_kv_scales): a reload would then decode with a stale scale.
+    * "fp8"/"fp8_e4m3"/"fp8_e5m2" with kv_quant_mode FP8_PER_TENSOR:
+      layer-level scales live outside the cached bytes, so the round trip is
+      exact -- but only while vLLM does not *calibrate* those scales at
+      runtime (calculate_kv_scales): a reload would then decode with a stale
+      scale. vLLM 0.14 specs carry no kv_quant_mode field at all; there the
+      dtype string alone defines the layout, so the consistency rules are
+      skipped, not failed.
 
     Refused: compression (a row spans several tokens, and DeepSeek V4 reads
     those rows together with its sliding-window and compressor-state groups,
@@ -375,7 +388,7 @@ def _check_mla_variant(
     cache_dtype_str = getattr(spec, "cache_dtype_str", None)
     mode = _quant_mode(spec)
     if cache_dtype_str == "fp8_ds_mla":
-        if mode != _QUANT_FP8_PER_TENSOR:
+        if _has_quant_mode(spec) and mode != _QUANT_FP8_PER_TENSOR:
             raise NotImplementedError(
                 f"{origin}: MLAAttentionSpec cache_dtype_str={cache_dtype_str!r} "
                 f"with kv_quant_mode={_quant_mode_name(spec)} is an inconsistent "
@@ -401,7 +414,7 @@ def _check_mla_variant(
             )
         return
     if cache_dtype_str in _PLAIN_FP8_CACHE_DTYPES:
-        if mode != _QUANT_FP8_PER_TENSOR:
+        if _has_quant_mode(spec) and mode != _QUANT_FP8_PER_TENSOR:
             raise NotImplementedError(
                 f"{origin}: MLAAttentionSpec cache_dtype_str={cache_dtype_str!r} "
                 f"with kv_quant_mode={_quant_mode_name(spec)} is an inconsistent "
@@ -496,28 +509,41 @@ class _BucketKey(NamedTuple):
     page_bytes: int
     # spec.page_size_padded as vLLM set it (None = no alignment padding).
     pad: Optional[int]
+    # Head geometry: equal page bytes do not imply equal tensor shapes
+    # (2 heads x 64 and 1 head x 128 share a page), and one bucket must
+    # keep one tensor shape.
+    num_kv_heads: int
+    head_size: int
+    head_size_v: int
 
 
 def _bucket_key(spec: Any, origin: str) -> _BucketKey:
+    head_size = getattr(spec, "head_size", 0)
     return _BucketKey(
         class_name=type(spec).__name__,
         dtype_name=str(getattr(spec, "dtype", None)),
         page_bytes=_compact_page_bytes(spec, origin),
         pad=getattr(spec, "page_size_padded", None),
+        num_kv_heads=getattr(spec, "num_kv_heads", 0),
+        head_size=head_size,
+        head_size_v=getattr(spec, "head_size_v", None) or head_size,
     )
 
 
-def _bucket_order(key: _BucketKey) -> Tuple[int, str, str, int]:
+def _bucket_order(key: _BucketKey) -> Tuple[int, str, str, int, int, int, int]:
     """Total order over the buckets of one group: biggest page first (so the
     main layer of a packed group keeps the bare group name), then class,
-    dtype and pad. Only spec-local fields enter, so the suffixes -- and with
-    them the wire names -- are a pure function of the bucket *set*: layer
-    registration order, or a different layer order on another rank, cannot
-    move them."""
+    dtype, head geometry and pad. Only spec-local fields enter, so the
+    suffixes -- and with them the wire names -- are a pure function of the
+    bucket *set*: layer registration order, or a different layer order on
+    another rank, cannot move them."""
     return (
         -key.page_bytes,
         key.class_name,
         key.dtype_name,
+        key.num_kv_heads,
+        key.head_size,
+        key.head_size_v,
         key.pad if key.pad is not None else -1,
     )
 
