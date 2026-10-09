@@ -79,12 +79,27 @@ from kv_cache_manager.py_connector.sglang import connector as connector_module  
 from kv_cache_manager.py_connector.sglang.connector import HiCacheKVCM  # noqa: E402
 
 PAGE_SIZE = 64
-# One write call: four new blocks, the Manager asks for the last two.
+# One write call: four new blocks, the Manager asks for the last two by default.
 WRITE_KEYS = ["block-0", "block-1", "block-2", "block-3"]
-BLOCK_MASK_OFFSET = 2
+BLOCKS_TO_WRITE = 2
+# One Mamba page is one slot: the pool is page-granular.
+MAMBA_BYTES_PER_TOKEN = 96
 # The process group of the single-process tests.  Only its identity matters:
 # the collectives themselves are scripted below.
 GROUP = object()
+
+
+class _FakeMambaPool:
+    """Only what the v2 write path reads from a Mamba host pool."""
+
+    def __init__(self) -> None:
+        self.page_size = 1
+
+    def get_page_buffer_meta(self, indices: torch.Tensor) -> tuple[list, list]:
+        return (
+            [0x1000_0000 + i for i in indices.tolist()],
+            [MAMBA_BYTES_PER_TOKEN] * len(indices),
+        )
 
 
 class ScriptedConnector(HiCacheKVCM):
@@ -103,10 +118,13 @@ class ScriptedConnector(HiCacheKVCM):
         self,
         *,
         local_init_ok: bool,
+        script: "_CollectiveScript",
         tp_world_size: int = 2,
         tp_rank: int = 1,
         group: Any = GROUP,
         is_mla_model: bool = False,
+        with_mamba: bool = False,
+        blocks_to_write: int = BLOCKS_TO_WRITE,
         on_write_session: Optional[Callable[[], None]] = None,
     ) -> None:
         self.tp_rank = tp_rank
@@ -118,9 +136,13 @@ class ScriptedConnector(HiCacheKVCM):
         self.location_spec_name = f"tp_{tp_rank}"
         self.location_spec_size = 4096
         self.write_timeout_seconds = 5
-        self.has_mamba = False
+        self.has_mamba = with_mamba
         self.has_indexer = False
         self.registered_pools = {}
+        if with_mamba:
+            self.mamba_spec_size = MAMBA_BYTES_PER_TOKEN
+            self.mamba_location_spec_name = f"tp_{tp_rank}_linear"
+            self.registered_pools[PoolName.MAMBA] = _FakeMambaPool()
         self.backup_pgs = []
         self.backup_bandwidth = []
         self._init_lock = threading.Lock()
@@ -129,7 +151,11 @@ class ScriptedConnector(HiCacheKVCM):
         self._tp_init_agreed = False
         self.local_init_ok = local_init_ok
         self.init_attempts = 0
+        self.blocks_to_write = blocks_to_write
         self.on_write_session = on_write_session
+        # The ledger this connector reports its agreement region into (see
+        # _ensure_client_for_write) and that plays the peer's part.
+        self.script = script
 
         self._manager_client = MagicMock()
         self.transfer_client = MagicMock()
@@ -151,57 +177,93 @@ class ScriptedConnector(HiCacheKVCM):
             raise RuntimeError("simulated local initialization failure")
         self._client_ready = True
 
+    def _ensure_client_for_write(self) -> None:
+        """The production gate, with the agreement region marked for the fixture.
+
+        Everything the connector reduces while this method runs *is* the
+        agreement; everything reduced after it belongs to the write path.  That
+        is what makes the fixture's counting exact instead of inferred: the
+        write paths reduce tensors of their own whose shape says nothing about
+        which side they are on (``_batch_set`` reduces one flag per block, so a
+        single-block write is a one-element tensor too, and ``batch_set_v2``
+        reduces a 0-dim flag).  See the tests for both cases.
+        """
+        self.script.in_agreement = True
+        try:
+            super()._ensure_client_for_write()
+        finally:
+            self.script.in_agreement = False
+
     def _start_write_cache(self, request: Any) -> dict:
-        """What a Manager answers for ``WRITE_KEYS``; the last two need writing."""
+        """A Manager's answer: this rank writes ``blocks_to_write`` of the blocks.
+
+        Every location carries this rank's KV spec plus, when the fixture has a
+        Mamba pool, its spec as well -- a real Manager lists every spec of the
+        block, and the v2 path picks its own name out of that list.
+        """
         if self.on_write_session is not None:
             self.on_write_session()
+        specs = [("kv", self.location_spec_name)]
+        if self.has_mamba:
+            specs.append(("linear", self.mamba_location_spec_name))
         return {
             "locations": [
                 {
                     "location_specs": [
-                        {"name": self.location_spec_name, "uri": f"uri-{i}"}
+                        {"name": name, "uri": f"{prefix}-{i}"} for prefix, name in specs
                     ]
                 }
-                for i in range(BLOCK_MASK_OFFSET)
+                for i in range(self.blocks_to_write)
             ],
             "write_session_id": "write-session-1",
-            "block_mask": {"offset": BLOCK_MASK_OFFSET},
+            "block_mask": {"offset": len(request["block_keys"]) - self.blocks_to_write},
         }
 
 
 class _CollectiveScript:
-    """Records this rank's TP collectives and plays the peer's part."""
+    """Records this rank's TP collectives and plays the peer's part.
+
+    Which ``all_reduce`` is the agreement is a *position*, not a shape: it is
+    the one the connector runs inside ``_ensure_client_for_write``, and the
+    fixture learns that from the connector itself (``in_agreement``, set by
+    ``ScriptedConnector`` around the real gate).  Guessing from the tensor
+    would be ambiguous -- the write paths reduce tensors of their own that can
+    be one element (``_batch_set`` with a single block to write) or 0-dim
+    (``batch_set_v2``'s flag) -- so both shapes are covered by tests that
+    assert they are counted on the write-path side.
+    """
 
     def __init__(self, *, peer_ready: bool, peer_wrote: bool = True) -> None:
         # Mutable: a test can let the peer recover between two calls.
         self.peer_ready = peer_ready
         self.peer_wrote = peer_wrote
-        # The agreement rounds: (operator, shape, group).
+        self.in_agreement = False
+        # Agreement rounds: (operator, shape, dtype, group).
         self.agreements: list = []
         # The write path's own collectives, i.e. what must not be reached when
         # the group agreed that it is not ready to write.
         self.broadcasts: list = []
-        self.reduces: list = []
+        self.write_reduces: list = []
 
 
 @contextmanager
 def _patched_tp_collectives(script: _CollectiveScript) -> Iterator[_CollectiveScript]:
     """Run one rank's view of the group's collectives, scripted and recorded.
 
-    The one-element ``all_reduce`` is the agreement under test: the tensor
-    starts as this rank's own outcome and the peer's outcome is folded in with
-    MIN, exactly like the real reduce.  Everything else on the group belongs to
-    the write path -- a real peer would block there, so reaching it is recorded
-    and left for the test to assert on.
+    The agreement reduce folds the peer's readiness in with MIN, exactly like
+    the real reduce.  The write path's own collectives are recorded instead --
+    a real peer would block there, so reaching them is what the tests assert
+    on.  Classification comes from ``script.in_agreement``.
     """
 
     def fake_all_reduce(tensor: Any, op: Any = None, group: Any = None) -> None:
-        if tensor.numel() == 1:
-            script.agreements.append((op, tuple(tensor.shape), group))
+        record = (op, tuple(tensor.shape), tensor.dtype, group)
+        if script.in_agreement:
+            script.agreements.append(record)
             if not script.peer_ready:
                 tensor.fill_(0)
             return
-        script.reduces.append((op, group))
+        script.write_reduces.append(record)
         if not script.peer_wrote:
             tensor.fill_(0)
 
@@ -215,8 +277,12 @@ def _patched_tp_collectives(script: _CollectiveScript) -> Iterator[_CollectiveSc
         yield script
 
 
-def _write_connector(**kwargs: Any) -> ScriptedConnector:
-    return ScriptedConnector(**kwargs)
+def _write_pair(
+    *, peer_ready: bool, peer_wrote: bool = True, **connector: Any
+) -> tuple[ScriptedConnector, _CollectiveScript]:
+    """A connector and the scripted TP group it will agree with."""
+    script = _CollectiveScript(peer_ready=peer_ready, peer_wrote=peer_wrote)
+    return ScriptedConnector(script=script, **connector), script
 
 
 def _transfer() -> PoolTransfer:
@@ -257,7 +323,12 @@ def _storage_config(**overrides: Any) -> HiCacheStorageConfig:
 class TestWritePathsAgreeOnInitialization(unittest.TestCase):
     """Both write paths publish the local outcome before any collective."""
 
-    _ROUND = (torch.distributed.ReduceOp.MIN, (1,), GROUP)
+    _ROUND = (
+        torch.distributed.ReduceOp.MIN,
+        (1,),
+        torch.int32,
+        GROUP,
+    )
 
     def _write_sessions(self, connector: ScriptedConnector) -> Any:
         """The mocked Manager's ``start_write_cache`` (Any: it is a Mock)."""
@@ -280,8 +351,9 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
         """
         for peer_ready in (False, True):
             with self.subTest(peer_ready=peer_ready):
-                connector = _write_connector(local_init_ok=False)
-                script = _CollectiveScript(peer_ready=peer_ready)
+                connector, script = _write_pair(
+                    local_init_ok=False, peer_ready=peer_ready
+                )
 
                 with _patched_tp_collectives(script):
                     v1_result = connector.batch_set_v1(WRITE_KEYS, _host_indices())
@@ -291,7 +363,7 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
                 self.assertEqual(v2_result, {PoolName.MAMBA: [False, False]})
                 self._assert_rounds(script, calls=2)
                 self.assertEqual(script.broadcasts, [])
-                self.assertEqual(script.reduces, [])
+                self.assertEqual(script.write_reduces, [])
                 self.assertFalse(connector._client_ready)
                 self.assertFalse(connector._tp_init_agreed)
                 self.assertEqual(connector.init_attempts, 2, "both paths retried")
@@ -302,8 +374,7 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
 
     def test_peer_failure_stops_a_ready_rank_without_a_collective(self) -> None:
         """A rank that initialized fine also refuses when a peer did not."""
-        connector = _write_connector(local_init_ok=True)
-        script = _CollectiveScript(peer_ready=False)
+        connector, script = _write_pair(local_init_ok=True, peer_ready=False)
 
         with _patched_tp_collectives(script):
             v1_result = connector.batch_set_v1(WRITE_KEYS, _host_indices())
@@ -325,8 +396,7 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
 
     def test_a_failed_round_is_retried_and_recovers(self) -> None:
         """Nothing is sticky: the next call initializes and agrees again."""
-        connector = _write_connector(local_init_ok=False, tp_rank=0)
-        script = _CollectiveScript(peer_ready=True)
+        connector, script = _write_pair(local_init_ok=False, peer_ready=True, tp_rank=0)
 
         with _patched_tp_collectives(script):
             self.assertEqual(
@@ -350,8 +420,7 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
 
     def test_a_ready_group_agrees_once_and_then_writes_as_before(self) -> None:
         """Whole group ready: the write path runs, and the agreement is paid once."""
-        connector = _write_connector(local_init_ok=True, tp_rank=0)
-        script = _CollectiveScript(peer_ready=True)
+        connector, script = _write_pair(local_init_ok=True, peer_ready=True, tp_rank=0)
 
         with _patched_tp_collectives(script):
             first = connector.batch_set_v1(WRITE_KEYS, _host_indices())
@@ -366,18 +435,80 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
             "the steady state must not pay a collective per write call",
         )
         self.assertEqual(len(script.broadcasts), 1, "rank 0's own broadcast only")
-        self.assertEqual(len(script.reduces), 1, "the write path's per-block reduce")
+        self.assertEqual(
+            [shape for _, shape, _, _ in script.write_reduces],
+            [(len(WRITE_KEYS) - BLOCKS_TO_WRITE,)],
+            "the write path's per-block flags, one per block it wrote",
+        )
         self.assertEqual(connector.init_attempts, 1)
+
+    def test_a_one_element_write_reduce_is_not_the_agreement(self) -> None:
+        """The write path may reduce one element too; that is not the agreement.
+
+        ``_batch_set`` reduces one flag per block, so a write session with a
+        single block hands the group a ``(1,)`` tensor -- the same shape and
+        dtype as the readiness vector.  Counting by tensor size (or shape)
+        would report two agreements here and hide a missing agreement behind a
+        write-path reduce, which is why the fixture classifies by the region
+        the connector runs it in (``ScriptedConnector`` marks it).
+        """
+        connector, script = _write_pair(
+            local_init_ok=True, peer_ready=True, tp_rank=0, blocks_to_write=1
+        )
+
+        with _patched_tp_collectives(script):
+            result = connector.batch_set_v1(WRITE_KEYS, _host_indices())
+
+        self.assertEqual(result, [True] * len(WRITE_KEYS))
+        self._assert_rounds(script, calls=1)
+        self.assertEqual(
+            [shape for _, shape, _, _ in script.write_reduces],
+            [(1,)],
+            "the single-block flags belong to the write path",
+        )
+        self.assertEqual(len(script.broadcasts), 1)
+
+    def test_the_v2_write_path_writes_once_the_group_agreed(self) -> None:
+        """The gate must not swallow the v2 path: real session, real reduce.
+
+        A group that agreed has to reach the per-transfer code unchanged:
+        StartWriteCache, SaveKvCaches, the per-transfer broadcast and the flag
+        reduce -- and the agreement is not paid again by the next call.
+        """
+        connector, script = _write_pair(
+            local_init_ok=True, peer_ready=True, tp_rank=0, with_mamba=True
+        )
+
+        with _patched_tp_collectives(script):
+            first = connector.batch_set_v2([_transfer()])
+            second = connector.batch_set_v2([_transfer()])
+
+        expected = {PoolName.MAMBA: [True, True]}
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        self.assertEqual(
+            self._write_sessions(connector).call_count,
+            2,
+            "one write session per v2 call",
+        )
+        self.assertEqual(
+            len(script.agreements), 1, "an agreed group pays the round once"
+        )
+        self.assertEqual(
+            [shape for _, shape, _, _ in script.write_reduces],
+            [(), ()],
+            "the v2 flag is a 0-dim tensor, once per transfer",
+        )
+        self.assertEqual(len(script.broadcasts), 2, "one per transfer on rank 0")
 
 
 class TestPathsThatDoNotJoinTheGroup(unittest.TestCase):
     """No collective is added where the write paths run none themselves."""
 
     def test_single_rank_write_is_unchanged(self) -> None:
-        connector = _write_connector(
-            local_init_ok=True, tp_world_size=1, tp_rank=0, group=None
+        connector, script = _write_pair(
+            local_init_ok=True, peer_ready=True, tp_world_size=1, tp_rank=0, group=None
         )
-        script = _CollectiveScript(peer_ready=True)
 
         with _patched_tp_collectives(script):
             result = connector.batch_set_v1(WRITE_KEYS, _host_indices())
@@ -385,13 +516,16 @@ class TestPathsThatDoNotJoinTheGroup(unittest.TestCase):
         self.assertEqual(result, [True] * len(WRITE_KEYS))
         self.assertEqual(script.agreements, [])
         self.assertEqual(script.broadcasts, [])
-        self.assertEqual(script.reduces, [])
+        self.assertEqual(script.write_reduces, [])
 
     def test_single_rank_failure_stays_local(self) -> None:
-        connector = _write_connector(
-            local_init_ok=False, tp_world_size=1, tp_rank=0, group=None
+        connector, script = _write_pair(
+            local_init_ok=False,
+            peer_ready=True,
+            tp_world_size=1,
+            tp_rank=0,
+            group=None,
         )
-        script = _CollectiveScript(peer_ready=True)
 
         with _patched_tp_collectives(script):
             result = connector.batch_set_v1(WRITE_KEYS, _host_indices())
@@ -403,25 +537,25 @@ class TestPathsThatDoNotJoinTheGroup(unittest.TestCase):
 
     def test_mla_write_does_not_join_the_group(self) -> None:
         """MLA writes from rank 0 only and uses no collective at all."""
-        script = _CollectiveScript(peer_ready=True)
-        with _patched_tp_collectives(script):
-            for tp_rank, expected in (
-                (0, [True] * len(WRITE_KEYS)),
-                (1, [False] * len(WRITE_KEYS)),
-            ):
-                with self.subTest(tp_rank=tp_rank):
-                    connector = _write_connector(
-                        local_init_ok=True,
-                        tp_rank=tp_rank,
-                        is_mla_model=True,
-                    )
+        for tp_rank, expected in (
+            (0, [True] * len(WRITE_KEYS)),
+            (1, [False] * len(WRITE_KEYS)),
+        ):
+            with self.subTest(tp_rank=tp_rank):
+                connector, script = _write_pair(
+                    local_init_ok=True,
+                    peer_ready=True,
+                    tp_rank=tp_rank,
+                    is_mla_model=True,
+                )
+                with _patched_tp_collectives(script):
                     result = connector.batch_set_v1(WRITE_KEYS, _host_indices())
-                    self.assertEqual(result, expected)
-                    self.assertEqual(connector.init_attempts, 1)
 
-        self.assertEqual(script.agreements, [])
-        self.assertEqual(script.broadcasts, [])
-        self.assertEqual(script.reduces, [])
+                self.assertEqual(result, expected)
+                self.assertEqual(connector.init_attempts, 1)
+                self.assertEqual(script.agreements, [])
+                self.assertEqual(script.broadcasts, [])
+                self.assertEqual(script.write_reduces, [])
 
     def test_mla_is_known_before_the_client_exists(self) -> None:
         """The write paths read the model kind before initialization runs.
@@ -439,8 +573,7 @@ class TestPathsThatDoNotJoinTheGroup(unittest.TestCase):
 
     def test_missing_group_is_a_failure_not_a_default_group_collective(self) -> None:
         """``group=None`` would mean torch's default group: refuse instead."""
-        connector = _write_connector(local_init_ok=True, group=None)
-        script = _CollectiveScript(peer_ready=True)
+        connector, script = _write_pair(local_init_ok=True, peer_ready=True, group=None)
 
         with _patched_tp_collectives(script):
             with self.assertLogs(connector_module.__name__, "ERROR") as logs:
@@ -454,9 +587,8 @@ class TestPathsThatDoNotJoinTheGroup(unittest.TestCase):
 
     def test_closed_connector_fails_without_a_collective(self) -> None:
         """close() still wins over the initialization, agreement included."""
-        connector = _write_connector(local_init_ok=True)
+        connector, script = _write_pair(local_init_ok=True, peer_ready=True)
         connector._closed = True
-        script = _CollectiveScript(peer_ready=True)
 
         with _patched_tp_collectives(script):
             with self.assertLogs(connector_module.__name__, "ERROR") as logs:
@@ -541,8 +673,11 @@ def _run_experiment_rank(rank: int, init_file: str, out_dir: str) -> None:
         # A rank walks through the phases quickly; the marker carries the phase
         # so that phase 1's evidence cannot be confused with phase 2's.
         phase = {"current": _PHASE_FIXED}
+        # The child uses the real collectives, so its marker script is only
+        # there to satisfy the fixture (nothing is counted through it).
         connector = ScriptedConnector(
             local_init_ok=(rank == 0),
+            script=_CollectiveScript(peer_ready=True),
             tp_rank=rank,
             group=group,
             on_write_session=lambda: open(
