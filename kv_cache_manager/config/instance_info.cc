@@ -14,6 +14,12 @@ bool InstanceInfo::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "location_spec_groups", location_spec_groups_, std::vector<LocationSpecGroup>());
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "default_query_type", default_query_type_, static_cast<int32_t>(0));
+    std::string state;
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "state", state, std::string("serving"));
+    if (state != "serving" && state != "deleting") {
+        return false;
+    }
+    state_ = state == "serving" ? State::kServing : State::kDeleting;
     SortLocationSpecGroups();
     return true;
 }
@@ -27,6 +33,7 @@ void InstanceInfo::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wri
     Put(writer, "model_deployment", model_deployment_);
     Put(writer, "location_spec_groups", location_spec_groups_);
     Put(writer, "default_query_type", default_query_type_);
+    Put(writer, "state", std::string(state_ == State::kServing ? "serving" : "deleting"));
 }
 
 std::string InstanceInfo::ToString() const { return Jsonizable::ToJsonString(); }

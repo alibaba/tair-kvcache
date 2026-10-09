@@ -153,6 +153,27 @@ TEST_F(InstanceInfoTest, TestSlidingWindowPersistsAndParticipatesInModelIdentity
     EXPECT_EQ((std::vector<std::string>{"model_deployment"}), restored.MismatchFields(64, {}, model, {}, 5));
 }
 
+TEST_F(InstanceInfoTest, TestStateSerializationAndLegacyDefault) {
+    InstanceInfo info("quota_group", "instance_group", "instance_id", 64, {}, {});
+    info.set_state(InstanceInfo::State::kDeleting);
+
+    InstanceInfo parsed;
+    ASSERT_TRUE(parsed.FromJsonString(info.ToJsonString()));
+    EXPECT_EQ(InstanceInfo::State::kDeleting, parsed.state());
+
+    auto legacy_json = info.ToJsonString();
+    const std::string state_field = ",\"state\":\"deleting\"";
+    const auto pos = legacy_json.find(state_field);
+    ASSERT_NE(std::string::npos, pos);
+    legacy_json.erase(pos, state_field.size());
+    ASSERT_TRUE(parsed.FromJsonString(legacy_json));
+    EXPECT_EQ(InstanceInfo::State::kServing, parsed.state());
+
+    auto invalid_json = info.ToJsonString();
+    invalid_json.replace(invalid_json.find("\"deleting\""), sizeof("\"deleting\"") - 1, "\"unknown\"");
+    EXPECT_FALSE(parsed.FromJsonString(invalid_json));
+}
+
 TEST_F(InstanceInfoTest, TestToStringProducesJsonObject) {
     InstanceInfo instance_info("quota_group", "instance_group", "instance_id", 64, {}, {}, {}, 4);
 

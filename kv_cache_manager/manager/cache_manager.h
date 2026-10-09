@@ -30,6 +30,7 @@ namespace kv_cache_manager {
 class RegistryManager;
 class MetaSearcherManager;
 class MetaIndexerManager;
+class MetaIndexer;
 class MetricsRegistry;
 class CacheReclaimer;
 class SchedulePlanExecutor;
@@ -259,6 +260,11 @@ public:
     void SetRevisitHistogramConfig(const std::vector<double> &boundaries);
 
 private:
+    ErrorCode TrimCacheWithIndexer(RequestContext *request_context,
+                                   const std::string &instance_id,
+                                   const std::shared_ptr<MetaIndexer> &meta_indexer,
+                                   bool detached_indexer) const noexcept;
+
     struct EventCleanupCallbackState {
         std::shared_mutex mutex;
         bool accepting = true;
@@ -337,10 +343,11 @@ private:
                            bool &is_create_success);
 
     ErrorCode TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id);
-    std::pair<ErrorCode, MetaSearcher *> CheckInputAndGetMetaSearcher(RequestContext *request_context,
-                                                                      const std::string &instance_id,
-                                                                      const KeyVector &keys,
-                                                                      const TokenIdsVector &tokens) const;
+    std::pair<ErrorCode, std::shared_ptr<MetaSearcher>>
+    CheckInputAndGetMetaSearcher(RequestContext *request_context,
+                                 const std::string &instance_id,
+                                 const KeyVector &keys,
+                                 const TokenIdsVector &tokens) const;
     std::pair<ErrorCode, int64_t> GetBlockSize(RequestContext *request_context, const std::string &instance_id) const;
     void FilterLocationSpecByName(CacheLocationVector &locations, const std::vector<std::string> &location_spec_names);
     ErrorCode CheckLocationSpecGroupNames(RequestContext *request_context,

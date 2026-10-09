@@ -35,6 +35,7 @@ private:                                                                        
 #endif
 
 class MetaIndexerManager;
+class MetaIndexer;
 class DataStorageManager;
 
 struct CacheMetaDelRequest {
@@ -143,6 +144,8 @@ public:
     ~SchedulePlanExecutor();
 
     std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task);
+    // RemoveInstance supplies the indexer after extracting it from MetaIndexerManager.
+    std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task, std::shared_ptr<MetaIndexer> indexer);
     std::future<PlanExecuteResult> Submit(const CacheLocationDelRequest &task);
     std::future<PlanExecuteResult> Submit(const CacheLocationCopyRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheMetaDelRequest &task);
@@ -166,6 +169,7 @@ private:
     struct LocationDelAdmissionResult {
         PlanExecuteResult result{ErrorCode::EC_OK, ""};
         CacheLocationDelRequest actual_task;
+        std::shared_ptr<MetaIndexer> indexer;
         bool needs_physical_delete{false};
     };
 
@@ -222,10 +226,13 @@ private:
                             ScheduleTaskClass task_class);
     AsyncDeleteSubmitResult SubmitDeleteTaskAsync(std::chrono::microseconds delay,
                                                   std::function<LocationDelAdmissionResult()> prepare);
-    std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task, ScheduleTaskClass task_class);
+    std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task,
+                                                    ScheduleTaskClass task_class,
+                                                    std::shared_ptr<MetaIndexer> indexer);
     std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
                                                         ScheduleTaskClass task_class);
-    PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task);
+    PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task,
+                                        const std::shared_ptr<MetaIndexer> &indexer);
     PlanExecuteResult DoEventReportMetadataDelTask(const EventReportMetadataDelRequest &task);
     void DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
                     const CacheLocationCopyRequest &task);

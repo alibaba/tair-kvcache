@@ -4,12 +4,48 @@
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/registry_local_backend.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
+
+class FaultInjectRegistryLocalBackend : public RegistryLocalBackend {
+public:
+    explicit FaultInjectRegistryLocalBackend(std::string instance_id) : instance_id_(std::move(instance_id)) {}
+
+    ErrorCode
+    UpsertField(const std::string &key, const std::string &field, const std::string &value) noexcept override {
+        if (fail_next_marker_upsert && key == "instance" && field == instance_id_ &&
+            value == instance_id_ + ":retired") {
+            fail_next_marker_upsert = false;
+            return EC_ERROR;
+        }
+        if (fail_next_info_upsert && key == instance_id_ && field == instance_id_) {
+            fail_next_info_upsert = false;
+            return EC_ERROR;
+        }
+        return RegistryLocalBackend::UpsertField(key, field, value);
+    }
+
+    ErrorCode DeleteField(const std::string &key, const std::string &field) noexcept override {
+        const ErrorCode ec = RegistryLocalBackend::DeleteField(key, field);
+        if (lose_index_delete_reply && ec == EC_OK && key == "instance" && field == instance_id_) {
+            lose_index_delete_reply = false;
+            return EC_ERROR;
+        }
+        return ec;
+    }
+
+    bool fail_next_info_upsert = false;
+    bool fail_next_marker_upsert = false;
+    bool lose_index_delete_reply = false;
+
+private:
+    std::string instance_id_;
+};
 
 class RegistryManagerLocalBackendTest : public TESTBASE {
 public:
@@ -87,6 +123,157 @@ TEST_F(RegistryManagerLocalBackendTest, TestInit) {
     std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_file1";
     std::string uri = "local://" + local_path + "?cluster_name=test";
     ASSERT_TRUE(InitRegistryManager(uri));
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestRemovingInstanceIntentSurvivesRecover) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_removing_instance_registry";
+    ASSERT_TRUE(InitRegistryManager("local://" + path + "?cluster_name=test"));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "__kvcm_internal_removing_instance_registry__");
+    ASSERT_EQ(EC_OK,
+              registry_manager_->RemoveInstance(
+                  request_context_.get(), "group1", "__kvcm_internal_removing_instance_registry__"));
+    RegisterInstance("group1", "instance1");
+    std::map<std::string, std::string> fields;
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("instance", fields));
+    EXPECT_EQ("instance1", fields.at("instance1"));
+
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "instance1"));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("__kvcm_internal_removing_instance_registry__", fields));
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("instance1", fields));
+    InstanceInfo deleting;
+    ASSERT_TRUE(deleting.FromJsonString(fields.at("instance1")));
+    EXPECT_EQ(InstanceInfo::State::kDeleting, deleting.state());
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("instance", fields));
+    EXPECT_EQ("instance1", fields.at("instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+    ASSERT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("instance1"));
+    EXPECT_NE(EC_OK, registry_manager_->RemoveInstanceGroup(request_context_.get(), "group1"));
+    auto [group_ec, group] = registry_manager_->GetInstanceGroup(request_context_.get(), "group1");
+    ASSERT_EQ(EC_OK, group_ec);
+    auto updated_group = *group;
+    updated_group.set_version(group->version() + 1);
+    EXPECT_NE(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), updated_group, group->version()));
+    EXPECT_NE(EC_OK,
+              registry_manager_->RegisterInstance(
+                  request_context_.get(), "group1", "instance1", 1024, {LocationSpecInfo{}}, ModelDeployment{}));
+
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    ASSERT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "instance1"));
+    ASSERT_EQ(EC_OK, registry_manager_->CompleteRemoveInstance("instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("instance1"));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("instance1", fields));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("instance", fields));
+    RegisterInstance("group1", "instance1");
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestRetiredInstanceRecordRecovery) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_retired_instance_registry";
+    ASSERT_TRUE(InitRegistryManager("local://" + path + "?cluster_name=test"));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "retired_with_info");
+    RegisterInstance("group1", "retired_without_info");
+    RegisterInstance("group1", "serving_instance");
+
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "retired_with_info"));
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "retired_without_info"));
+    ASSERT_EQ(EC_OK,
+              registry_manager_->storage_->UpsertField("instance", "retired_with_info", "retired_with_info:retired"));
+    ASSERT_EQ(EC_OK,
+              registry_manager_->storage_->UpsertField(
+                  "instance", "retired_without_info", "retired_without_info:retired"));
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->DeleteField("retired_without_info", "retired_without_info"));
+
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    std::map<std::string, std::string> fields;
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("retired_with_info", fields));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("retired_without_info", fields));
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("instance", fields));
+    EXPECT_EQ(0, fields.count("retired_with_info"));
+    EXPECT_EQ(0, fields.count("retired_without_info"));
+    EXPECT_EQ(1, fields.count("serving_instance"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("retired_with_info"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("retired_without_info"));
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestAmbiguousFinalIndexDeleteDoesNotRecreateInstanceInfo) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_ambiguous_final_index_delete";
+    const std::string uri = "local://" + path + "?cluster_name=test";
+    const std::string instance_id = "instance1";
+    ASSERT_TRUE(InitRegistryManager(uri));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", instance_id);
+
+    auto backend = std::make_unique<FaultInjectRegistryLocalBackend>(instance_id);
+    ASSERT_EQ(EC_OK, backend->Init(StandardUri::FromUri(uri)));
+    auto *fault_backend = backend.get();
+    backend->fail_next_info_upsert = true;
+    backend->lose_index_delete_reply = true;
+    registry_manager_->storage_ = std::move(backend);
+
+    EXPECT_EQ(EC_ERROR, registry_manager_->BeginRemoveInstance(request_context_.get(), instance_id));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), instance_id));
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), instance_id));
+    std::map<std::string, std::string> fields;
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load(instance_id, fields));
+    InstanceInfo deleting;
+    ASSERT_TRUE(deleting.FromJsonString(fields.at(instance_id)));
+    EXPECT_EQ(InstanceInfo::State::kDeleting, deleting.state());
+    fault_backend->fail_next_info_upsert = true;
+    EXPECT_EQ(EC_ERROR, registry_manager_->BeginRemoveInstance(request_context_.get(), instance_id));
+    EXPECT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), instance_id));
+    EXPECT_EQ(EC_ERROR, registry_manager_->CompleteRemoveInstance(instance_id));
+
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load(instance_id, fields));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("instance", fields));
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), instance_id));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load(instance_id, fields));
+
+    ASSERT_TRUE(InitRegistryManager(uri)); // Simulate a restart before the next CompleteRemoveInstance.
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo(instance_id));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load(instance_id, fields));
+    RegisterInstance("group1", instance_id);
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestRetiredRemovalPhaseSurvivesRegistryRecoveryRetry) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_retired_removal_phase";
+    const std::string uri = "local://" + path + "?cluster_name=test";
+    const std::string instance_id = "instance1";
+    ASSERT_TRUE(InitRegistryManager(uri));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", instance_id);
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), instance_id));
+
+    auto backend = std::make_unique<FaultInjectRegistryLocalBackend>(instance_id);
+    ASSERT_EQ(EC_OK, backend->Init(StandardUri::FromUri(uri)));
+    backend->fail_next_marker_upsert = true;
+    registry_manager_->storage_ = std::move(backend);
+    EXPECT_EQ(EC_ERROR, registry_manager_->CompleteRemoveInstance(instance_id));
+    EXPECT_TRUE(registry_manager_->IsInstanceRemovalRetired(instance_id));
+
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    EXPECT_TRUE(registry_manager_->IsInstanceRemovalRetired(instance_id));
+    EXPECT_EQ(EC_OK, registry_manager_->CompleteRemoveInstance(instance_id));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo(instance_id));
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestMalformedDeletingRecordDoesNotHideServingInstances) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_malformed_deleting_registry";
+    ASSERT_TRUE(InitRegistryManager("local://" + path + "?cluster_name=test"));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "healthy_instance");
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->UpsertField("instance", "broken_instance", "broken_instance"));
+    ASSERT_EQ(EC_OK,
+              registry_manager_->storage_->UpsertField("broken_instance", "broken_instance", "invalid_json"));
+
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+    EXPECT_EQ(EC_ERROR, registry_manager_->DoRecoverOnce());
+    EXPECT_NE(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), "healthy_instance"));
 }
 
 TEST_F(RegistryManagerLocalBackendTest, TestStorageManagement) {

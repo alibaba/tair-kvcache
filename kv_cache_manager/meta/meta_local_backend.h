@@ -340,6 +340,7 @@ public:
     // meta data
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
+    ErrorCode DeleteMetaData() noexcept override;
 
     size_t GetMemUsage() const noexcept override;
     int64_t GetOldestAccessTime() const noexcept override;

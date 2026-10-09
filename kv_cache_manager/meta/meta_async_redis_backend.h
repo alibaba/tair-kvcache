@@ -107,6 +107,7 @@ public:
     // ----- MetaData (startup read; bounded async write in memory-primary mode) -----
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
+    ErrorCode DeleteMetaData() noexcept override;
 
     // ----- Sync -----
     bool Sync(const KeyTypeVec &keys) noexcept override;

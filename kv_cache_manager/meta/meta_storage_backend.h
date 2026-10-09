@@ -552,6 +552,9 @@ public:
     // @return EC_OK 成功；EC_NOENT 无元数据；EC_ERROR 读取失败
     virtual ErrorCode GetMetaData(FieldMap &field_maps) noexcept = 0;
 
+    // Delete the per-instance metadata record. Missing metadata is success.
+    virtual ErrorCode DeleteMetaData() noexcept = 0;
+
     // Synchronously flush pending writes for the given keys.
     // Returns true if all writes persisted successfully, false on failure/timeout.
     // Default: no-op (sync backends have no pending writes).

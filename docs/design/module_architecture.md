@@ -200,7 +200,8 @@ client（MetaClient/gRPC）→ service（grpc 适配 → *ServiceImpl）
 
 推理引擎启动时经 client 注册实例，`CacheManager::RegisterInstance` 校验并落库实例配置（block_size、location spec、模型部署等）到 `RegistryManager`（config），并在 `MetaIndexerManager` 中为该 `instance_id` 建立索引。**约束**：KVCache 仅在同一 `instance_id` 内复用，跨 Instance 不匹配。
 
-MetaIndexer/Searcher 保留原创建与清理流程，Indexer Init 完成后即可服务，Redis 全量回填仍异步执行。
+MetaIndexer/Searcher 的创建流程不变，Indexer Init 完成后即可服务，Redis 全量回填仍异步执行。
+删除 Instance 时，Registry 先持久化删除意图并使该 ID 对普通请求不可见；CacheManager 排空 Searcher 持有者，沿原有 TrimCache/Executor 链路删除缓存数据。全量 Trim 后排空 Indexer 持有者并复扫残留，必要时继续 Trim；确认无残留后同步异步写入、删除独立的持久化 metadata 记录（计数、用量），随后释放后端资源并清除删除意图。失败时保留删除意图供重试，同 ID 注册被拒绝；主备切换或重启后的 Recover 只恢复删除中状态并打印告警，不执行 Trim，需后续重试 RemoveInstance 才能完成清理。
 配置 `meta_storage_backend_config.memory_primary=true` 时仅支持 `cached + local + async_redis`：
 Recover 保持原有 Redis-first 条件双写和队列反压，Redis 写未接受时不更新 local；全量回填完成并进入 Running 后，
 普通写才切换为 local-first，Redis 通过 `WriteRoute::secondary` 条件写做有界非等待备份，满队列丢弃新备份。

@@ -67,6 +67,12 @@ public:
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
+    // Keep a durable deletion intent until cache and persistent metadata have been reclaimed.
+    ErrorCode BeginRemoveInstance(RequestContext *request_context, const std::string &instance_id);
+    ErrorCode CompleteRemoveInstance(const std::string &instance_id);
+    bool IsInstanceRemovalRetired(const std::string &instance_id) const;
+    std::shared_ptr<const InstanceInfo> GetRemovingInstanceInfo(const std::string &instance_id) const;
+    std::vector<std::shared_ptr<const InstanceInfo>> ListRemovingInstanceInfos() const;
     std::shared_ptr<const InstanceInfo> GetInstanceInfo(RequestContext *request_context,
                                                         const std::string &instance_id);
     std::pair<ErrorCode, std::vector<std::shared_ptr<const InstanceInfo>>>
@@ -88,14 +94,15 @@ public:
     std::string GetInstanceGroupName(const std::string &instance_id) const;
 
 private:
-    ErrorCode LoadAndSave(const std::string &key, const std::string &id, const Jsonizable *jsonizable);
-    ErrorCode LoadAndDelete(const std::string &key, const std::string &id);
+    ErrorCode UpsertRegistryField(const std::string &key, const std::string &id, const Jsonizable *jsonizable);
+    ErrorCode DeleteRegistryField(const std::string &key, const std::string &id);
     ErrorCode UpdateStorageAvailableStatus(const std::string &global_unique_name, bool is_available);
     // return error count (0 means success)
     size_t RecoverStorageUnsafe();
     size_t RecoverAccountUnsafe();
     size_t RecoverInstanceGroupUnsafe();
     size_t RecoverInstanceInfoUnsafe();
+    bool HasRemovingInstanceInGroupUnsafe(const std::string &instance_group_name) const;
 
 private:
     /***
@@ -116,6 +123,12 @@ private:
     std::unordered_map<std::string, std::shared_ptr<InstanceGroup>> instance_group_configs_;
     // 需要清理 - 在DoCleanup()中clear()
     std::unordered_map<std::string, std::shared_ptr<InstanceInfo>> instance_infos_;
+    struct RemovingInstanceEntry {
+        std::shared_ptr<InstanceInfo> info;
+        bool retired = false;
+    };
+    // 需要清理 - DoRecoverOnce 从持久化删除意图中恢复。
+    std::unordered_map<std::string, RemovingInstanceEntry> removing_instance_infos_;
     // 需要清理 - 在DoCleanup()中clear()
     std::unordered_map<std::string, std::shared_ptr<Account>> accounts_;
     // 无需清理 - 主备切换不改变到registry后端存储的配置

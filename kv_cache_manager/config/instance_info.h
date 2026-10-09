@@ -115,6 +115,11 @@ private:
 
 class InstanceInfo : public Jsonizable {
 public:
+    enum class State {
+        kServing,
+        kDeleting
+    };
+
     InstanceInfo() = default;
     InstanceInfo(const std::string &quota_group_name,
                  const std::string &instance_group_name,
@@ -149,6 +154,7 @@ public:
     const ModelDeployment &model_deployment() const { return model_deployment_; }
     const std::vector<LocationSpecGroup> &location_spec_groups() const { return location_spec_groups_; }
     int32_t default_query_type() const { return default_query_type_; }
+    State state() const { return state_; }
     void set_quota_group_name(const std::string &quota_group_name) { quota_group_name_ = quota_group_name; }
     void set_instance_group_name(const std::string &instance_group_name) { instance_group_name_ = instance_group_name; }
     void set_instance_id(const std::string &instance_id) { instance_id_ = instance_id; }
@@ -162,6 +168,7 @@ public:
         SortLocationSpecGroups();
     }
     void set_default_query_type(int32_t default_query_type) { default_query_type_ = default_query_type; }
+    void set_state(State state) { state_ = state; }
     // Returns field names that differ from the given values.
     // Returns empty vector if all fields match.
     [[nodiscard]] std::vector<std::string> MismatchFields(int32_t block_size,
@@ -204,6 +211,7 @@ private:
     ModelDeployment model_deployment_;
     std::vector<LocationSpecGroup> location_spec_groups_;
     int32_t default_query_type_{0};
+    State state_{State::kServing};
 };
 
 using InstanceInfoConstPtr = std::shared_ptr<const InstanceInfo>;

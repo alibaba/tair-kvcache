@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -1039,6 +1040,35 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
             ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
         }
     }
+}
+
+TEST_F(MetaIndexerTest, TestRetireDeletesMetadataWithoutDestructorRewrite) {
+    auto config = std::make_shared<MetaIndexerConfig>();
+    config->SetMutexShardNum(8);
+    config->SetMaxKeyCount(100);
+    config->SetPersistMetaDataIntervalTimeMs(1000);
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>("dummy");
+    const std::string path = GetPrivateTestRuntimeDataPath() + "finalize_removal";
+    backend_config->SetStorageUri("file://" + path);
+    config->SetMetaStorageBackendConfig(backend_config);
+
+    auto indexer = std::make_shared<MetaIndexer>();
+    ASSERT_EQ(EC_OK, indexer->Init("finalize_removal", config));
+    indexer->key_count_.store(3);
+    indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
+    indexer->PersistMetaData();
+    indexer->key_count_.store(0);
+    indexer->storage_usage_data_.Reset();
+    ASSERT_EQ(EC_OK, indexer->Retire());
+    indexer.reset();
+    EXPECT_FALSE(std::filesystem::exists(path + "_finalize_removal"));
+
+    auto recovered = std::make_shared<MetaIndexer>();
+    ASSERT_EQ(EC_OK, recovered->Init("finalize_removal", config));
+    EXPECT_EQ(0, recovered->GetKeyCount());
+    EXPECT_EQ(0, recovered->GetStorageUsage());
+    FieldMap metadata;
+    EXPECT_EQ(EC_NOENT, recovered->backend_manager_->GetMetaData(metadata));
 }
 
 TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {

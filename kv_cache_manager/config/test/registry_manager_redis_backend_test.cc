@@ -129,7 +129,38 @@ TEST_F(RegistryManagerRedisBackendTest, TestRedisDbIsolation) {
     ASSERT_EQ(EC_OK, backend_db1->Load(key, actual));
     EXPECT_EQ(expected, actual);
 
+    ASSERT_EQ(EC_OK, backend_db1->UpsertField(key, "other", "preserved"));
+    ASSERT_EQ(EC_OK, backend_db1->DeleteField(key, "field"));
+    ASSERT_EQ(EC_OK, backend_db1->Load(key, actual));
+    EXPECT_EQ((std::map<std::string, std::string>{{"other", "preserved"}}), actual);
+
     EXPECT_EQ(EC_OK, backend_db1->Delete(key));
+}
+
+TEST_F(RegistryManagerRedisBackendTest, TestRemovingInstanceKeepsIndexValueSmall) {
+    ASSERT_TRUE(InitRegistryManager());
+    CreateInstanceGroup("removal_group");
+    RegisterInstance("removal_group", "removal_instance");
+
+    std::map<std::string, std::string> fields;
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("instance", fields));
+    EXPECT_EQ("removal_instance", fields.at("removal_instance"));
+
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "removal_instance"));
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("instance", fields));
+    EXPECT_EQ("removal_instance", fields.at("removal_instance"));
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Load("removal_instance", fields));
+    InstanceInfo deleting;
+    ASSERT_TRUE(deleting.FromJsonString(fields.at("removal_instance")));
+    EXPECT_EQ(InstanceInfo::State::kDeleting, deleting.state());
+
+    ASSERT_EQ(EC_OK, registry_manager_->CompleteRemoveInstance("removal_instance"));
+    EXPECT_EQ(EC_NOENT, registry_manager_->storage_->Load("removal_instance", fields));
+    fields.clear();
+    const auto index_ec = registry_manager_->storage_->Load("instance", fields);
+    EXPECT_TRUE(index_ec == EC_OK || index_ec == EC_NOENT);
+    EXPECT_EQ(0, fields.count("removal_instance"));
+    ASSERT_EQ(EC_OK, registry_manager_->RemoveInstanceGroup(request_context_.get(), "removal_group"));
 }
 
 TEST_F(RegistryManagerRedisBackendTest, TestRecover) {

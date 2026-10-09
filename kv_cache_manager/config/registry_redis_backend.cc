@@ -51,4 +51,15 @@ ErrorCode RegistryRedisBackend::Delete(const std::string &key) noexcept {
     return error_codes[0];
 }
 
+ErrorCode
+RegistryRedisBackend::UpsertField(const std::string &key, const std::string &field, const std::string &value) noexcept {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    return client_->Upsert({config_key_prefix_ + key}, {{{field, value}}})[0];
+}
+
+ErrorCode RegistryRedisBackend::DeleteField(const std::string &key, const std::string &field) noexcept {
+    std::lock_guard<std::mutex> lock(client_mutex_);
+    return client_->DeleteFields({config_key_prefix_ + key}, {{field}})[0];
+}
+
 } // namespace kv_cache_manager

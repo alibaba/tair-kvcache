@@ -20,6 +20,7 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/migration_strategy.h"
 #include "kv_cache_manager/config/model_deployment.h"
+#include "kv_cache_manager/config/registry_local_backend.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
@@ -41,6 +42,7 @@
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/utils.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
+#include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub.h"
 
@@ -53,7 +55,7 @@ static const std::string default_storage_configs(
 namespace kv_cache_manager {
 
 namespace {
-ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
+ErrorCode BatchAddLocationForTest(const std::shared_ptr<MetaSearcher> &meta_searcher,
                                   RequestContext *request_context,
                                   const KeyVector &keys,
                                   const CacheLocationVector &locations,
@@ -96,10 +98,8 @@ void Reset(CacheReclaimer *value) {
     observed_paused = false;
 }
 
-ErrorCode RemoveInstance_stub(void * /*obj*/,
-                              RequestContext * /*request_context*/,
-                              const std::string & /*instance_group*/,
-                              const std::string & /*instance_id*/) {
+ErrorCode
+RemoveInstance_stub(void * /*obj*/, RequestContext * /*request_context*/, const std::string & /*instance_id*/) {
     called = true;
     if (reclaimer != nullptr) {
         observed_paused = reclaimer->IsPaused();
@@ -107,6 +107,51 @@ ErrorCode RemoveInstance_stub(void * /*obj*/,
     return EC_ERROR;
 }
 } // namespace remove_instance_reclaimer_state_stub
+
+namespace remove_instance_retire_stub {
+ErrorCode Fail(void * /*obj*/) { return EC_ERROR; }
+} // namespace remove_instance_retire_stub
+
+namespace remove_instance_trim_stub {
+ErrorCode Fail(void * /*obj*/,
+               RequestContext * /*request_context*/,
+               size_t /*scan_batch_size*/) {
+    return EC_ERROR;
+}
+} // namespace remove_instance_trim_stub
+
+class FailFinalIndexDeleteRegistryBackend : public RegistryLocalBackend {
+public:
+    ErrorCode DeleteField(const std::string &key, const std::string &field) noexcept override {
+        const ErrorCode ec = RegistryLocalBackend::DeleteField(key, field);
+        if (fail_once_ && ec == EC_OK && key == "instance" && field == "test_instance") {
+            fail_once_ = false;
+            return EC_ERROR;
+        }
+        return ec;
+    }
+
+private:
+    bool fail_once_ = true;
+};
+
+class NoOpDeleteMetaLocalBackend : public MetaLocalBackend {
+public:
+    void AllowDeletes() { drop_deletes_ = false; }
+    size_t dropped_deletes() const { return dropped_deletes_; }
+
+    std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override {
+        if (drop_deletes_) {
+            ++dropped_deletes_;
+            return std::vector<ErrorCode>(keys.size(), EC_OK);
+        }
+        return MetaLocalBackend::Delete(request_context, keys);
+    }
+
+private:
+    bool drop_deletes_ = true;
+    size_t dropped_deletes_ = 0;
+};
 
 class MockDataStorageBackend : public DataStorageBackend {
 public:
@@ -700,8 +745,10 @@ public:
         return controlled_raw;
     }
 
-    void AddDummyLocationsForTrim(size_t key_count, const std::string &storage_name) {
-        MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    void AddDummyLocationsForTrim(size_t key_count,
+                                  const std::string &storage_name,
+                                  const std::string &instance_id = "test_instance") {
+        auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
         ASSERT_NE(nullptr, meta_searcher);
 
         KeyVector keys;
@@ -781,7 +828,7 @@ public:
     }
 
     std::vector<std::string> QueryRawEventReportUris(int64_t key) {
-        MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+        auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
         if (!meta_searcher) {
             return {};
         }
@@ -971,9 +1018,12 @@ TEST_F(CacheManagerTest, TestRemoveInstance) {
     auto [ec0, _info] =
         cache_manager_->StartWriteCache(request_context_.get(), "placeholder_id", keys, {}, {}, 100000000);
 
+    std::weak_ptr<MetaIndexer> removed_indexer =
+        cache_manager_->meta_indexer_manager()->GetMetaIndexer("placeholder_id");
+    ASSERT_FALSE(removed_indexer.expired());
+
     auto ec1 = cache_manager_->RemoveInstance(request_context_.get(), "default", "placeholder_id");
     ASSERT_EQ(ErrorCode::EC_OK, ec1);
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     BlockMask block_mask = static_cast<std::size_t>(0);
 
     {
@@ -982,17 +1032,460 @@ TEST_F(CacheManagerTest, TestRemoveInstance) {
         ASSERT_EQ(nullptr, ptr);
     }
 
+    EXPECT_EQ(nullptr, cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id"));
+    EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("placeholder_id"));
+    EXPECT_TRUE(removed_indexer.expired());
+
     auto [ec2, cache_metas] =
         cache_manager_->GetCacheMeta(request_context_.get(), "placeholder_id", keys, {}, block_mask, 0);
-    const auto &cache_locations_view = cache_metas.cache_locations_view();
-    const auto &metas = cache_metas.metas();
-    ASSERT_EQ(65, cache_locations_view.size());
-    ASSERT_EQ(65, metas.size());
-    for (int i = 0; i < 65; ++i) {
-        std::map<std::string, std::string> meta;
-        ASSERT_TRUE(Jsonizable::FromJsonString(metas[i], meta));
-        ASSERT_EQ(CacheLocation::CacheLocationStatusToString(CacheLocationStatus::CLS_NOT_FOUND), meta.at("status"));
+    EXPECT_EQ(ErrorCode::EC_INSTANCE_NOT_EXIST, ec2);
+    EXPECT_TRUE(cache_metas.cache_locations_view().empty());
+    EXPECT_TRUE(cache_metas.metas().empty());
+}
+
+TEST_F(CacheManagerTest, TestRegisterSameInstanceRejectedWhileSearcherDrainsAndRetriesAfterRemoval) {
+    const std::string instance_id = "lifecycle_instance";
+    const auto register_instance = [&]() {
+        RequestContext context("register_lifecycle_instance");
+        return cache_manager_
+            ->RegisterInstance(&context,
+                               "default",
+                               instance_id,
+                               64,
+                               createLocationSpecInfos(),
+                               createModelDeployment(),
+                               std::vector<LocationSpecGroup>())
+            .first;
+    };
+    ASSERT_EQ(EC_OK, register_instance());
+
+    auto old_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    ASSERT_NE(nullptr, old_searcher);
+    std::weak_ptr<MetaIndexer> old_indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance_id);
+
+    auto remove_future = std::async(std::launch::async, [&]() {
+        RequestContext context("remove_lifecycle_instance");
+        return cache_manager_->RemoveInstance(&context, "default", instance_id);
+    });
+    for (int i = 0; i < 3000 && registry_manager_->GetInstanceInfo(request_context_.get(), instance_id); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), instance_id));
+
+    std::atomic<bool> register_started{false};
+    auto register_future = std::async(std::launch::async, [&]() {
+        register_started.store(true, std::memory_order_release);
+        return register_instance();
+    });
+    while (!register_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    const auto register_status = register_future.wait_for(std::chrono::seconds(2));
+    old_searcher.reset();
+    EXPECT_EQ(std::future_status::ready, register_status);
+    EXPECT_EQ(EC_ERROR, register_future.get()); // removal tombstone blocks the same ID without holding the global lock
+    EXPECT_EQ(EC_OK, remove_future.get());
+    EXPECT_EQ(EC_OK, register_instance());
+    EXPECT_TRUE(old_indexer.expired());
+    EXPECT_NE(nullptr, cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id));
+    EXPECT_NE(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance_id));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceSearcherDrainTimeoutRetainsRetryPath) {
+    auto searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, searcher);
+
+    auto remove = std::async(std::launch::async, [this] {
+        RequestContext context("remove_searcher_drain_timeout");
+        return cache_manager_->RemoveInstance(&context, "default", "test_instance");
+    });
+    const auto status = remove.wait_for(std::chrono::seconds(7));
+    EXPECT_EQ(std::future_status::ready, status);
+    EXPECT_EQ(nullptr, cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    EXPECT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    searcher.reset();
+    EXPECT_EQ(EC_TIMEOUT, remove.get());
+
+    RequestContext retry("retry_searcher_drain_timeout");
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(&retry, "default", "test_instance"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceIndexerDrainWaitExceedsDefaultTimeout) {
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+
+    auto remove = std::async(std::launch::async, [this] {
+        RequestContext context("remove_indexer_drain_wait");
+        return cache_manager_->RemoveInstance(&context, "default", "test_instance");
+    });
+    const auto status = remove.wait_for(std::chrono::seconds(7));
+    EXPECT_EQ(std::future_status::timeout, status);
+    EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance"));
+    EXPECT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    indexer.reset();
+    EXPECT_EQ(EC_OK, remove.get());
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceAllowsRegistrationDuringTrimButRejectsDuplicateRemoval) {
+    AddDummyLocationsForTrim(1, "hot_01");
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    auto blocking_backend = std::make_shared<BlockingDeleteBackend>(data_storage_manager->storage_map_.at("hot_01"));
+    data_storage_manager->storage_map_["hot_01"] = blocking_backend;
+
+    auto remove_future = std::async(std::launch::async, [this] {
+        RequestContext context("remove_during_trim");
+        return cache_manager_->RemoveInstance(&context, "default", "test_instance");
+    });
+    if (!blocking_backend->WaitForActiveDeletes(1, std::chrono::seconds(5))) {
+        blocking_backend->ReleaseDeletes();
+        EXPECT_EQ(EC_OK, remove_future.get());
+        FAIL() << "RemoveInstance did not reach storage deletion";
+    }
+    EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance"));
+    RequestContext trim_context("trim_during_remove");
+    EXPECT_EQ(
+        EC_INSTANCE_NOT_EXIST,
+        cache_manager_->TrimCache(&trim_context, "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
+
+    auto register_other = std::async(std::launch::async, [this] {
+        RequestContext context("register_other_during_trim");
+        return cache_manager_
+            ->RegisterInstance(&context,
+                               "default",
+                               "unrelated_instance",
+                               64,
+                               createLocationSpecInfos(),
+                               createModelDeployment(),
+                               std::vector<LocationSpecGroup>())
+            .first;
+    });
+    const auto other_status = register_other.wait_for(std::chrono::seconds(2));
+
+    auto register_same = std::async(std::launch::async, [this] {
+        RequestContext context("register_same_during_trim");
+        return cache_manager_
+            ->RegisterInstance(&context,
+                               "default",
+                               "test_instance",
+                               64,
+                               createLocationSpecInfos(),
+                               createModelDeployment(),
+                               std::vector<LocationSpecGroup>())
+            .first;
+    });
+    const auto same_status = register_same.wait_for(std::chrono::seconds(2));
+
+    std::atomic<bool> duplicate_started{false};
+    auto duplicate_remove = std::async(std::launch::async, [this, &duplicate_started] {
+        duplicate_started.store(true, std::memory_order_release);
+        RequestContext context("duplicate_remove_during_trim");
+        return cache_manager_->RemoveInstance(&context, "default", "test_instance");
+    });
+    while (!duplicate_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    const auto duplicate_status = duplicate_remove.wait_for(std::chrono::seconds(2));
+
+    blocking_backend->ReleaseDeletes();
+    EXPECT_EQ(std::future_status::ready, other_status);
+    EXPECT_EQ(EC_OK, register_other.get());
+    EXPECT_EQ(std::future_status::ready, same_status);
+    EXPECT_NE(EC_OK, register_same.get());
+    EXPECT_EQ(std::future_status::ready, duplicate_status);
+    EXPECT_EQ(EC_OK, remove_future.get());
+    EXPECT_EQ(EC_EXIST, duplicate_remove.get());
+}
+
+TEST_F(CacheManagerTest, TestRemoveDistinctInstancesConcurrentlyButBlockStorageMutation) {
+    const std::string other_instance = "other_instance";
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     other_instance,
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>())
+                  .first);
+    AddDummyLocationsForTrim(1, "hot_01");
+    AddDummyLocationsForTrim(1, "hot_01", other_instance);
+
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    auto blocking_backend = std::make_shared<BlockingDeleteBackend>(data_storage_manager->storage_map_.at("hot_01"));
+    data_storage_manager->storage_map_["hot_01"] = blocking_backend;
+
+    auto remove_first = std::async(std::launch::async, [this] {
+        RequestContext context("remove_first_instance");
+        return cache_manager_->RemoveInstance(&context, "default", "test_instance");
+    });
+    if (!blocking_backend->WaitForActiveDeletes(1, std::chrono::seconds(5))) {
+        blocking_backend->ReleaseDeletes();
+        EXPECT_EQ(EC_OK, remove_first.get());
+        FAIL() << "first removal did not reach storage deletion";
+    }
+
+    auto remove_second = std::async(std::launch::async, [this, &other_instance] {
+        RequestContext context("remove_second_instance");
+        return cache_manager_->RemoveInstance(&context, "default", other_instance);
+    });
+    if (!blocking_backend->WaitForActiveDeletes(2, std::chrono::seconds(5))) {
+        blocking_backend->ReleaseDeletes();
+        EXPECT_EQ(EC_OK, remove_first.get());
+        EXPECT_EQ(EC_OK, remove_second.get());
+        FAIL() << "distinct instance removals did not overlap";
+    }
+
+    std::atomic<bool> storage_mutation_started{false};
+    auto storage_mutation = std::async(std::launch::async, [this, &storage_mutation_started] {
+        storage_mutation_started.store(true, std::memory_order_release);
+        std::unique_lock<std::shared_mutex> guard(cache_manager_->metrics_lifecycle()->removal_mut_);
+    });
+    while (!storage_mutation_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(std::future_status::timeout, storage_mutation.wait_for(std::chrono::milliseconds(50)));
+
+    blocking_backend->ReleaseDeletes();
+    EXPECT_EQ(EC_OK, remove_first.get());
+    EXPECT_EQ(EC_OK, remove_second.get());
+    EXPECT_EQ(std::future_status::ready, storage_mutation.wait_for(std::chrono::seconds(2)));
+    storage_mutation.get();
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceRetriesAfterMetadataDeleteFailure) {
+    {
+        Stub stub;
+        stub.set(ADDR(MetaIndexer, Retire), remove_instance_retire_stub::Fail);
+        RequestContext ctx("remove_finalize_failure");
+        EXPECT_EQ(EC_ERROR, cache_manager_->RemoveInstance(&ctx, "default", "test_instance"));
+    }
+    ASSERT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    ASSERT_NE(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance"));
+    EXPECT_EQ(nullptr, cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    EXPECT_NE(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "test_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>())
+                  .first);
+
+    RequestContext retry_ctx("remove_finalize_retry");
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(&retry_ctx, "default", "test_instance"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceRetainsIndexerAfterTrimFailure) {
+    {
+        Stub stub;
+        stub.set(ADDR(MetaIndexer, TrimResidues), remove_instance_trim_stub::Fail);
+        RequestContext ctx("remove_trim_failure");
+        EXPECT_EQ(EC_ERROR, cache_manager_->RemoveInstance(&ctx, "default", "test_instance"));
+    }
+    ASSERT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    ASSERT_NE(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance"));
+    RequestContext retry_ctx("remove_trim_retry");
+    EXPECT_EQ(EC_OK,
+              cache_manager_->TrimCache(&retry_ctx, "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(&retry_ctx, "default", "test_instance"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceRetriesAfterRegistryCompletionFailure) {
+    auto backend = std::make_unique<FailFinalIndexDeleteRegistryBackend>();
+    ASSERT_EQ(EC_OK, backend->Init(StandardUri::FromUri("local://?cluster_name=test")));
+    registry_manager_->storage_ = std::move(backend);
+    RequestContext ctx("remove_registry_completion_failure");
+    EXPECT_EQ(EC_ERROR, cache_manager_->RemoveInstance(&ctx, "default", "test_instance"));
+    ASSERT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    EXPECT_TRUE(registry_manager_->IsInstanceRemovalRetired("test_instance"));
+    EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance"));
+
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, TrimResidues), remove_instance_trim_stub::Fail);
+    RequestContext retry_ctx("remove_registry_completion_retry");
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(&retry_ctx, "default", "test_instance"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceDeletesEmptyLocationKey) {
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    CacheLocationMapVector locations(1);
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, indexer->Put(request_context_.get(), {123}, locations, properties).ec);
+    indexer.reset();
+
+    RequestContext context("remove_empty_location_key");
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(&context, "default", "test_instance"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceTrimRoundLimitRetainsRetryPath) {
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    auto backend = std::make_unique<NoOpDeleteMetaLocalBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("test_instance", std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    auto *backend_ptr = backend.get();
+    indexer->backend_manager_->persistent_backend_->Close();
+    indexer->backend_manager_->persistent_backend_ = std::move(backend);
+    indexer->backend_manager_->cache_backend_.reset();
+
+    CacheLocationMapVector locations(1);
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, indexer->Put(request_context_.get(), {123}, locations, properties).ec);
+    indexer.reset();
+
+    RequestContext context("remove_trim_round_limit");
+    EXPECT_EQ(EC_ERROR, cache_manager_->RemoveInstance(&context, "default", "test_instance"));
+    ASSERT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    ASSERT_NE(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance"));
+    EXPECT_EQ(5, backend_ptr->dropped_deletes());
+
+    backend_ptr->AllowDeletes();
+    RequestContext retry_context("retry_trim_round_limit");
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(&retry_context, "default", "test_instance"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceDeletesPersistedMetadataBeforeSameIdRegister) {
+    const std::string instance_id = "persistent_remove_instance";
+    auto group = registry_manager_->instance_group_configs_.at("default");
+    auto indexer_config = group->cache_config_->meta_indexer_config_;
+    indexer_config->SetMaxKeyCount(8);
+    indexer_config->SetMutexShardNum(8);
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>("dummy");
+    backend_config->SetStorageUri("file://" + GetPrivateTestRuntimeDataPath() + "persistent_remove");
+    indexer_config->SetMetaStorageBackendConfig(backend_config);
+
+    const auto register_instance = [&]() {
+        return cache_manager_
+            ->RegisterInstance(request_context_.get(),
+                               "default",
+                               instance_id,
+                               64,
+                               createLocationSpecInfos(),
+                               createModelDeployment(),
+                               std::vector<LocationSpecGroup>())
+            .first;
+    };
+    ASSERT_EQ(EC_OK, register_instance());
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance_id);
+    ASSERT_NE(nullptr, indexer);
+    indexer->key_count_.store(8);
+    indexer->PersistMetaData();
+    indexer.reset();
+
+    RequestContext remove_context("remove_persisted_metadata");
+    ASSERT_EQ(EC_OK, cache_manager_->RemoveInstance(&remove_context, "default", instance_id));
+    ASSERT_EQ(EC_OK, register_instance());
+    auto fresh_indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance_id);
+    ASSERT_NE(nullptr, fresh_indexer);
+    EXPECT_EQ(0, fresh_indexer->GetKeyCount());
+    CacheLocationMapVector locations;
+    PropertyMapVector properties;
+    EXPECT_EQ(EC_OK, fresh_indexer->Put(request_context_.get(), {1}, locations, properties).ec);
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceTrimsAllPersistedDummyPages) {
+    const std::string instance_id = "paged_remove_instance";
+    auto group = registry_manager_->instance_group_configs_.at("default");
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>("dummy");
+    backend_config->SetStorageUri("file://" + GetPrivateTestRuntimeDataPath() + "paged_remove");
+    group->cache_config_->meta_indexer_config_->SetMetaStorageBackendConfig(backend_config);
+
+    const auto register_instance = [&]() {
+        return cache_manager_
+            ->RegisterInstance(request_context_.get(),
+                               "default",
+                               instance_id,
+                               64,
+                               createLocationSpecInfos(),
+                               createModelDeployment(),
+                               std::vector<LocationSpecGroup>())
+            .first;
+    };
+    ASSERT_EQ(EC_OK, register_instance());
+    std::vector<std::int64_t> keys;
+    for (std::int64_t key = 0; key < 1400; ++key) {
+        keys.push_back(key);
+    }
+    ASSERT_EQ(EC_OK,
+              cache_manager_->StartWriteCache(request_context_.get(), instance_id, keys, {}, {}, 100000000).first);
+
+    RequestContext remove_context("remove_paged_dummy_cache");
+    ASSERT_EQ(EC_OK, cache_manager_->RemoveInstance(&remove_context, "default", instance_id));
+    ASSERT_EQ(EC_OK, register_instance());
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance_id);
+    ASSERT_NE(nullptr, indexer);
+    KeyVector remaining;
+    std::string cursor;
+    ASSERT_EQ(EC_OK, indexer->Scan(request_context_.get(), SCAN_BASE_CURSOR, 1, cursor, remaining));
+    EXPECT_TRUE(remaining.empty());
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceDuringMetaRecoveryTransition) {
+    class TransitioningScanBackend : public MetaLocalBackend {
+    public:
+        TransitioningScanBackend(MetaStorageBackendManager &manager, bool &transitioned)
+            : manager_(manager), transitioned_(transitioned) {}
+
+        ErrorCode ListKeys(RequestContext *context,
+                           const std::string &cursor,
+                           int64_t limit,
+                           std::string &next_cursor,
+                           KeyTypeVec &keys) noexcept override {
+            if (cursor == "999999") {
+                return MetaLocalBackend::ListKeys(context, saved_cursor_, limit, next_cursor, keys);
+            }
+            const ErrorCode ec = MetaLocalBackend::ListKeys(context, cursor, limit, next_cursor, keys);
+            if (ec == EC_OK && !transitioned_ && cursor == SCAN_BASE_CURSOR && next_cursor != SCAN_BASE_CURSOR) {
+                saved_cursor_ = next_cursor;
+                next_cursor = "999999";
+                manager_.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+                transitioned_ = true;
+            }
+            return ec;
+        }
+
+    private:
+        MetaStorageBackendManager &manager_;
+        bool &transitioned_;
+        std::string saved_cursor_;
+    };
+
+    auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    auto &backend_manager = *indexer->backend_manager_;
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    bool transitioned = false;
+    auto persistent = std::make_unique<TransitioningScanBackend>(backend_manager, transitioned);
+    auto cache = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, persistent->Init("test_instance", config));
+    ASSERT_EQ(EC_OK, persistent->Open());
+    ASSERT_EQ(EC_OK, cache->Init("test_instance", config));
+    ASSERT_EQ(EC_OK, cache->Open());
+    ASSERT_EQ(EC_OK, backend_manager.persistent_backend_->Close());
+    backend_manager.persistent_backend_ = std::move(persistent);
+    backend_manager.cache_backend_ = std::move(cache);
+    backend_manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    indexer.reset();
+
+    AddDummyLocationsForTrim(1024, "hot_01");
+    RequestContext context("remove_during_meta_recovery_transition");
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(&context, "default", "test_instance"));
+    EXPECT_TRUE(transitioned);
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance"));
 }
 
 // RemoveInstance 的 per-instance draining 不得读写全局 Reclaimer pause 状态。
@@ -1000,7 +1493,7 @@ TEST_F(CacheManagerTest, TestRemoveInstance) {
 // 其他 instance；true 场景验证错误返回不会 Resume 掉 Server 生命周期的既有暂停。
 TEST_F(CacheManagerTest, TestRemoveInstanceDoesNotChangeGlobalReclaimerPauseState) {
     Stub stub;
-    stub.set(ADDR(RegistryManager, RemoveInstance), remove_instance_reclaimer_state_stub::RemoveInstance_stub);
+    stub.set(ADDR(RegistryManager, BeginRemoveInstance), remove_instance_reclaimer_state_stub::RemoveInstance_stub);
 
     auto verify_pause_state = [&](bool initially_paused) {
         if (initially_paused) {
@@ -1025,7 +1518,7 @@ TEST_F(CacheManagerTest, TestRemoveInstanceDoesNotChangeGlobalReclaimerPauseStat
 
 TEST_F(CacheManagerTest, TestRecover) {
     auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_TRUE(meta_searcher);
     ASSERT_TRUE(meta_searcher->meta_indexer_);
     ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
@@ -1034,11 +1527,21 @@ TEST_F(CacheManagerTest, TestRecover) {
     ASSERT_EQ("test_instance", meta_indexer->instance_id_);
 }
 
+TEST_F(CacheManagerTest, TestRecoverDoesNotRemovePendingInstance) {
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "test_instance"));
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, TrimResidues), remove_instance_trim_stub::Fail);
+
+    EXPECT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+    EXPECT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    EXPECT_NE(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance"));
+}
+
 TEST_F(CacheManagerTest, TestCleanup) {
     auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
     ASSERT_EQ(EC_OK, cache_manager_->DoRecover());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_TRUE(meta_searcher);
     ASSERT_TRUE(meta_searcher->meta_indexer_);
     ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
@@ -1137,7 +1640,7 @@ TEST_F(CacheManagerTest, TestStartWriteCacheRollsBackPartialBatchAdd) {
     EXPECT_EQ(EC_PARTIAL_OK, ec);
     EXPECT_TRUE(start_write_cache_info.locations().cache_locations_view().empty());
 
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_TRUE(meta_searcher);
     std::vector<CacheLocationMap> location_maps;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -2426,7 +2929,7 @@ TEST_F(CacheManagerTest, TestTrimCache) {
 TEST_F(CacheManagerTest, TestTrimCacheSyncsMetadataOnceAcrossScanPages) {
     auto *meta_backend = InstallControllableMetaBackend();
     ASSERT_NE(nullptr, meta_backend);
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_NE(nullptr, meta_searcher);
 
     constexpr size_t key_count = 1024;
@@ -3709,7 +4212,7 @@ TEST_F(CacheManagerTest, TestReportEventFlatFoldMatchesReferenceAcrossBlocksMedi
     for (size_t i = 0; i < key_count; ++i) {
         keys.push_back(first_key + static_cast<int64_t>(i));
     }
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_NE(nullptr, meta_searcher);
     std::vector<CacheLocationMap> location_maps;
     BlockMask mask;
@@ -3909,7 +4412,7 @@ TEST_F(CacheManagerTest, TestReportEventCrossRequestMultiReporterStateMatchesRef
         for (size_t key_offset = 0; key_offset < key_count; ++key_offset) {
             keys.push_back(first_key + static_cast<int64_t>(key_offset));
         }
-        MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+        auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
         ASSERT_NE(nullptr, meta_searcher);
         std::vector<CacheLocationMap> location_maps;
         BlockMask mask;
@@ -4043,7 +4546,7 @@ TEST_F(CacheManagerTest, TestReportEventRejectsMergeThatOverflowsExistingLocatio
     ASSERT_EQ(1, overflow_response.item_results_size());
     EXPECT_EQ(proto::meta::INVALID_ARGUMENT, overflow_response.item_results(0));
 
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_NE(nullptr, meta_searcher);
     std::vector<CacheLocationMap> location_maps;
     BlockMask mask;
@@ -5357,7 +5860,7 @@ TEST_F(CacheManagerTest, TestSnapshotCleanupPreservesCurrentDeltaBesideLegacySpe
         "event_report://" + host + "/mem?source=current", current_token, current_uri));
     const std::string legacy_uri = "event_report://" + host + "/mem?source=legacy";
 
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_NE(nullptr, meta_searcher);
     std::vector<ErrorCode> merge_results;
     ASSERT_EQ(EC_OK,
@@ -5407,7 +5910,7 @@ TEST_F(CacheManagerTest, TestSnapshotCleanupPreservesInFlightStableLocationUntil
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
         "event_report://" + host + "/mem?source=in_flight", in_flight, in_flight_uri));
 
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_NE(nullptr, meta_searcher);
     std::vector<ErrorCode> replace_results;
     ASSERT_EQ(EC_OK,
@@ -5467,7 +5970,7 @@ TEST_F(CacheManagerTest, TestOldSnapshotCleanupDoesNotDeleteLaterAbortedAttemptW
     std::string failed_attempt_uri;
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
         "event_report://" + host + "/mem?source=partial_failed_attempt", failed_attempt, failed_attempt_uri));
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_NE(nullptr, meta_searcher);
     std::vector<ErrorCode> replace_results;
     ASSERT_EQ(EC_OK,
@@ -5560,7 +6063,7 @@ TEST_F(CacheManagerTest, TestSnapshotCleanupCASPreservesLocationRefreshedAfterSc
     std::string refreshed_uri;
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
         "event_report://" + host + "/mem?source=refreshed", refreshed_token, refreshed_uri));
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_NE(nullptr, meta_searcher);
     std::vector<ErrorCode> replace_results;
     ASSERT_EQ(EC_OK,
@@ -6721,7 +7224,7 @@ TEST_F(CacheManagerTest, TestDoRecoverAfterCleanup) {
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
     ASSERT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
 
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_TRUE(meta_searcher);
     ASSERT_TRUE(meta_searcher->meta_indexer_);
     ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
@@ -6740,7 +7243,7 @@ TEST_F(CacheManagerTest, TestDoRecoverPreservesRegisteredDefaultQueryType) {
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
     ASSERT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
 
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_TRUE(meta_searcher);
     ASSERT_TRUE(meta_searcher->meta_indexer_);
     ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
@@ -6773,7 +7276,7 @@ TEST_F(CacheManagerTest, TestDoRecoverOnceWithRegistryPartialFailureThenFix) {
     ASSERT_EQ(EC_ERROR, ec);
 
     // test_instance MetaSearcher should still have been created (partial progress is retained)
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_TRUE(meta_searcher);
     ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
 
@@ -7566,7 +8069,7 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
             ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
         };
 
-    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
     ASSERT_NE(nullptr, meta_searcher);
 
     auto get_location_map = [&](int64_t key) {
@@ -7770,7 +8273,7 @@ TEST_F(CacheManagerTest, TestReportEventL1P5L2BlockAddAreIsolated) {
     report_one(proto::meta::ST_EVENT_REPORT_L1P5, "linear_0", "event_report://10.0.0.11:8080/l1p5");
     report_one(proto::meta::ST_EVENT_REPORT_L2, "linear_1", "event_report://10.0.0.11:8080/l2");
 
-    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
     ASSERT_NE(nullptr, meta_searcher);
     std::vector<CacheLocationMap> location_maps;
     BlockMask mask = static_cast<size_t>(0);
@@ -7874,7 +8377,7 @@ TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
             ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
         };
 
-    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
     ASSERT_NE(nullptr, meta_searcher);
     auto get_location_map = [&](int64_t key) {
         std::vector<CacheLocationMap> location_maps;
@@ -9261,7 +9764,7 @@ protected:
         const std::string uri = "tair://" + tair_name_ + "/" + std::to_string(key) + "/" + name;
         ASSERT_TRUE(DataStorageUri(uri).Valid());
         tair_uris_.insert(uri);
-        auto *searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id_);
+        auto searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id_);
         ASSERT_NE(nullptr, searcher);
         auto location = std::make_shared<CacheLocation>(
             DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, std::vector<LocationSpec>{LocationSpec(name, uri)});
@@ -10310,7 +10813,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkPropagation) {
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
     ASSERT_TRUE(meta_searcher);
 
     // 持久化打标要求 block 先存在：给 block 1 建一个 location。
@@ -10331,7 +10834,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkPropagation) {
     std::vector<std::string> new_targets;
     auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
                                                "placeholder_id",
-                                               meta_searcher,
+                                               meta_searcher.get(),
                                                keys,
                                                new_keys,
                                                {},
@@ -10360,7 +10863,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheFallsBackToOrdinaryPolicyOnMarkRead
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("mark_read_error");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("mark_read_error");
     ASSERT_TRUE(meta_searcher);
 
     auto hot_loc = std::make_shared<CacheLocation>(
@@ -10384,7 +10887,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheFallsBackToOrdinaryPolicyOnMarkRead
     ASSERT_EQ(EC_OK,
               cache_manager_->FilterWriteCache(request_context_.get(),
                                                "mark_read_error",
-                                               meta_searcher,
+                                               meta_searcher.get(),
                                                {1},
                                                new_keys,
                                                {},
@@ -10406,7 +10909,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheInvalidTieredTargetUsesOrdinaryPoli
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("invalid_tiered_target");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("invalid_tiered_target");
     ASSERT_TRUE(meta_searcher);
 
     auto hot_loc = std::make_shared<CacheLocation>(
@@ -10432,7 +10935,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheInvalidTieredTargetUsesOrdinaryPoli
     ASSERT_EQ(EC_OK,
               cache_manager_->FilterWriteCache(request_context_.get(),
                                                "invalid_tiered_target",
-                                               meta_searcher,
+                                               meta_searcher.get(),
                                                {1},
                                                new_keys,
                                                {},
@@ -10455,7 +10958,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheUnavailableTieredTargetUsesOrdinary
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("unavailable_tiered_target");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("unavailable_tiered_target");
     ASSERT_TRUE(meta_searcher);
 
     auto hot_loc = std::make_shared<CacheLocation>(
@@ -10479,7 +10982,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheUnavailableTieredTargetUsesOrdinary
     ASSERT_EQ(EC_OK,
               cache_manager_->FilterWriteCache(request_context_.get(),
                                                "unavailable_tiered_target",
-                                               meta_searcher,
+                                               meta_searcher.get(),
                                                {1},
                                                new_keys,
                                                {},
@@ -10534,8 +11037,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaFallsBackOnMarkReadEr
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher =
-        cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_mark_read_error");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_mark_read_error");
     ASSERT_TRUE(meta_searcher);
 
     auto make_hot_loc = [](const std::string &uri) {
@@ -10561,7 +11063,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaFallsBackOnMarkReadEr
     ASSERT_EQ(EC_OK,
               cache_manager_->FilterWriteCache(request_context_.get(),
                                                "min_replica_mark_read_error",
-                                               meta_searcher,
+                                               meta_searcher.get(),
                                                {1},
                                                new_keys,
                                                {},
@@ -10584,7 +11086,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaInvalidTieredTargetUs
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_invalid_target");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_invalid_target");
     ASSERT_TRUE(meta_searcher);
 
     auto add_serving_location = [&](int64_t block_key, const std::string &uri) {
@@ -10614,7 +11116,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaInvalidTieredTargetUs
     ASSERT_EQ(EC_OK,
               cache_manager_->FilterWriteCache(request_context_.get(),
                                                "min_replica_invalid_target",
-                                               meta_searcher,
+                                               meta_searcher.get(),
                                                {1, 2},
                                                new_keys,
                                                {},
@@ -10639,7 +11141,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheSkipsTieredMarkWhenMigrationDisable
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("tiered_disabled");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("tiered_disabled");
     ASSERT_TRUE(meta_searcher);
 
     auto hot_loc =
@@ -10656,7 +11158,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheSkipsTieredMarkWhenMigrationDisable
     std::vector<std::string> new_targets;
     auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
                                                "tiered_disabled",
-                                               meta_searcher,
+                                               meta_searcher.get(),
                                                {1},
                                                new_keys,
                                                {},
@@ -10678,7 +11180,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkSkipsExistingTarget) {
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
     ASSERT_TRUE(meta_searcher);
 
     auto writing_loc = std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY,
@@ -10714,7 +11216,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkSkipsExistingTarget) {
     std::vector<std::string> new_targets;
     auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
                                                "placeholder_id",
-                                               meta_searcher,
+                                               meta_searcher.get(),
                                                keys,
                                                new_keys,
                                                {},
@@ -10739,7 +11241,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredStaleTargetTriggersRewrite) {
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("stale_tier_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("stale_tier_instance");
     ASSERT_TRUE(meta_searcher);
 
     // block 1: 冷层 cold_01 上有一个覆盖全 spec 的 SERVING location。
@@ -10774,7 +11276,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredStaleTargetTriggersRewrite) {
     std::vector<std::string> new_targets;
     auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
                                                "stale_tier_instance",
-                                               meta_searcher,
+                                               meta_searcher.get(),
                                                keys,
                                                new_keys,
                                                {},
@@ -10801,7 +11303,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaUsesTieredMarkTarget)
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_tiered");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_tiered");
     ASSERT_TRUE(meta_searcher);
 
     auto hot_loc =
@@ -10818,7 +11320,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaUsesTieredMarkTarget)
     std::vector<std::string> new_targets;
     auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
                                                "min_replica_tiered",
-                                               meta_searcher,
+                                               meta_searcher.get(),
                                                {1},
                                                new_keys,
                                                {},
@@ -10843,8 +11345,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaHonorsTieredMarkWhenR
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher =
-        cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_satisfied_tiered");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_satisfied_tiered");
     ASSERT_TRUE(meta_searcher);
 
     auto make_hot_loc = [](const std::string &uri) {
@@ -10878,7 +11379,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaHonorsTieredMarkWhenR
     std::vector<std::string> new_targets;
     auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
                                                "min_replica_satisfied_tiered",
-                                               meta_searcher,
+                                               meta_searcher.get(),
                                                {1},
                                                new_keys,
                                                {},
@@ -10914,7 +11415,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkChecksSpecGroupOnTarget) 
                                                location_spec_infos,
                                                createModelDeployment(),
                                                location_spec_groups));
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("tiered_spec_group");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("tiered_spec_group");
     ASSERT_TRUE(meta_searcher);
 
     auto cold_f0_loc = std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY,
@@ -10936,7 +11437,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkChecksSpecGroupOnTarget) 
         std::vector<std::string> new_targets;
         auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
                                                    "tiered_spec_group",
-                                                   meta_searcher,
+                                                   meta_searcher.get(),
                                                    {1},
                                                    new_keys,
                                                    location_spec_group_names,
@@ -10957,7 +11458,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkChecksSpecGroupOnTarget) 
         std::vector<std::string> new_targets;
         auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
                                                    "tiered_spec_group",
-                                                   meta_searcher,
+                                                   meta_searcher.get(),
                                                    {1},
                                                    new_keys,
                                                    location_spec_group_names,
@@ -11060,7 +11561,7 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheClearsTieredMark) {
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
     ASSERT_TRUE(meta_searcher);
     std::vector<std::string> source_ids;
     {
@@ -11111,7 +11612,7 @@ TEST_F(CacheManagerTest, TestAdminMarkUsesMatchingStrategyTimeout) {
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("admin_mark_timeout_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("admin_mark_timeout_instance");
     ASSERT_TRUE(meta_searcher);
     auto source_loc =
         std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY,
@@ -11165,7 +11666,7 @@ TEST_F(CacheManagerTest, TestAdminMarkAllowsUnmatchedTargetWithDefaultTimeout) {
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("admin_mark_unmatched_target");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("admin_mark_unmatched_target");
     ASSERT_TRUE(meta_searcher);
     auto source_loc =
         std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY,
@@ -11227,7 +11728,7 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("full_policy_instance");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("full_policy_instance");
     ASSERT_TRUE(meta_searcher);
 
     auto hot_loc =
@@ -11293,7 +11794,7 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheSkipsTieredMarkWhenMigrationDisable
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("tiered_disabled_finish");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("tiered_disabled_finish");
     ASSERT_TRUE(meta_searcher);
 
     auto hot_loc =

@@ -267,7 +267,8 @@ void SchedulePlanExecutor::WorkerRoutine() {
     }
 }
 
-PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDelRequest &task) {
+PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDelRequest &task,
+                                                          const std::shared_ptr<MetaIndexer> &indexer) {
     PlanExecuteResult result;
     result.status = ErrorCode::EC_OK;
 
@@ -276,12 +277,6 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
                                StringUtil::FormatString("block_keys size %zu != location_ids size %zu",
                                                         task.block_keys.size(),
                                                         task.location_ids.size()));
-    }
-
-    std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(task.instance_id);
-    if (!indexer) {
-        return MakeErrorResult(ErrorCode::EC_NOENT,
-                               StringUtil::FormatString("MetaIndexer %s not found", task.instance_id.c_str()));
     }
 
     MetaSearcher meta_searcher(indexer);
@@ -485,11 +480,17 @@ bool SchedulePlanExecutor::SubmitRaw(std::function<void()> task,
 }
 
 std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRequest &task) {
-    return SubmitMetaDelete(task, ScheduleTaskClass::kSystem);
+    return SubmitMetaDelete(task, ScheduleTaskClass::kSystem, meta_manager_->GetMetaIndexer(task.instance_id));
+}
+
+std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRequest &task,
+                                                            std::shared_ptr<MetaIndexer> indexer) {
+    return SubmitMetaDelete(task, ScheduleTaskClass::kSystem, std::move(indexer));
 }
 
 std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const CacheMetaDelRequest &task,
-                                                                      ScheduleTaskClass task_class) {
+                                                                      ScheduleTaskClass task_class,
+                                                                      std::shared_ptr<MetaIndexer> indexer) {
     KVCM_LOG_DEBUG("Submitting meta delete task for instance_id: %s, block_keys count: %zu",
                    task.instance_id.c_str(),
                    task.block_keys.size());
@@ -503,7 +504,6 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const Cach
     }
 
     // 1. sync set block status to deleting
-    const std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(task.instance_id);
     if (indexer == nullptr) {
         HandleErrorPromise(promise, ErrorCode::EC_NOENT, "MetaIndexer %s not found", task.instance_id.c_str());
         return future;
@@ -580,9 +580,9 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const Cach
     KVCM_LOG_DEBUG("Location statuses updated, submitting task to worker pool with delay: %lld microseconds",
                    static_cast<long long>(task.delay.count()));
 
-    auto execute_task = [this, promise, actual_task]() {
+    auto execute_task = [this, promise, actual_task, indexer = std::move(indexer)]() {
         try {
-            promise->set_value(DoLocationDelTask(actual_task));
+            promise->set_value(DoLocationDelTask(actual_task, indexer));
         } catch (const std::exception &e) {
             HandleErrorPromise(promise, ErrorCode::EC_ERROR, "location delete task threw exception: %s", e.what());
         } catch (...) {
@@ -734,7 +734,6 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
             ErrorCode::EC_NOENT, StringUtil::FormatString("MetaIndexer %s not found", instance_id.c_str()));
         return admission_result;
     }
-
     MetaSearcher meta_searcher(indexer);
     std::vector<CacheLocationMap> location_maps;
     BlockMask empty_mask;
@@ -870,6 +869,7 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
         return admission_result;
     }
 
+    admission_result.indexer = std::move(indexer);
     admission_result.needs_physical_delete = true;
     return admission_result;
 }
@@ -888,9 +888,10 @@ void SchedulePlanExecutor::RunDeleteAdmission(const std::shared_ptr<PromiseCompl
         KVCM_LOG_DEBUG("Location statuses updated, submitting task to worker pool with delay: %lld microseconds",
                        static_cast<long long>(delay.count()));
         auto actual_task = std::move(admission_result.actual_task);
-        auto execute_task = [this, completion, actual_task]() {
+        auto indexer = std::move(admission_result.indexer);
+        auto execute_task = [this, completion, actual_task, indexer = std::move(indexer)]() {
             try {
-                completion->Complete(DoLocationDelTask(actual_task));
+                completion->Complete(DoLocationDelTask(actual_task, indexer));
             } catch (const std::exception &e) {
                 completion->Complete(ErrorCode::EC_ERROR,
                                      StringUtil::FormatString("location delete task threw exception: %s", e.what()));
@@ -1188,7 +1189,12 @@ SchedulePlanExecutor::SubmitDeleteTaskAsync(std::chrono::microseconds delay,
 
 bool SchedulePlanExecutor::SubmitNonBlocking(const CacheMetaDelRequest &req, ScheduleTaskClass task_class) {
     return SubmitRaw(
-        [this, req, task_class]() { SubmitMetaDelete(req, task_class); }, std::chrono::microseconds{0}, {}, task_class);
+        [this, req, task_class]() {
+            SubmitMetaDelete(req, task_class, meta_manager_->GetMetaIndexer(req.instance_id));
+        },
+        std::chrono::microseconds{0},
+        {},
+        task_class);
 }
 
 bool SchedulePlanExecutor::SubmitNonBlocking(const CacheLocationDelRequest &req, ScheduleTaskClass task_class) {
