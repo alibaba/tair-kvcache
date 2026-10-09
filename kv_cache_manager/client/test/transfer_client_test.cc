@@ -125,6 +125,12 @@ TEST_F(TransferClientTest, TestCreateWithDisabledSharedMemory) {
     EXPECT_NE(client, nullptr);
 }
 
+TEST_F(TransferClientTest, TestCreateWithMemoryRegistrations) {
+    ClientMemoryRegistrations registrations;
+    auto client = TransferClient::Create(client_config_, init_params_, registrations);
+    EXPECT_NE(client, nullptr);
+}
+
 TEST_F(TransferClientTest, TestRejectsPartialSharedMemoryRegistration) {
     FILE *file = tmpfile();
     ASSERT_NE(file, nullptr);

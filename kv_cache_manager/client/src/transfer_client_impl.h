@@ -35,9 +35,12 @@ private:
     ClientErrorCode InitWithSharedMemory(const std::string &client_config,
                                          const InitParams &init_params,
                                          const SharedMemoryRegistration &shared_memory_registration);
+    ClientErrorCode InitWithMemoryRegistrations(const std::string &client_config,
+                                                const InitParams &init_params,
+                                                const ClientMemoryRegistrations &memory_registrations);
     ClientErrorCode InitInternal(const std::string &client_config,
                                  const InitParams &init_params,
-                                 const SharedMemoryRegistration *shared_memory_registration);
+                                 const ClientMemoryRegistrations *memory_registrations);
     ClientErrorCode IsValid(const std::unique_ptr<ClientConfig> &client_config) const;
     std::vector<DataStorageUri> ParseLocations(const UriStrVec &uri_str_vec);
     UriStrVec ConstructLocations(const std::vector<DataStorageUri> &uris);
