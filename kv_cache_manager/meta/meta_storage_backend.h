@@ -66,6 +66,16 @@ public:
                                        const CacheLocationMapVector &locations,
                                        const PropertyMapVector &properties) noexcept = 0;
 
+    // Conditional second-stage write. Backends used as a secondary override
+    // this and skip entries rejected by the primary stage.
+    virtual std::vector<ErrorCode> Put(RequestContext * /*request_context*/,
+                                       const KeyTypeVec &keys,
+                                       const CacheLocationMapVector & /*locations*/,
+                                       const PropertyMapVector & /*properties*/,
+                                       const std::vector<ErrorCode> & /*previous_error_codes*/) noexcept {
+        return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
+    }
+
     // 若 key 存在则合并 不存在则创建 key 并写入。
     // @param request_context  请求上下文；可为 nullptr
     // @param keys             待操作的 key 列表
@@ -80,6 +90,23 @@ public:
                                           const KeyTypeVec &keys,
                                           const CacheLocationMapVector &locations,
                                           const PropertyMapVector &properties) noexcept = 0;
+
+    virtual std::vector<ErrorCode> Upsert(RequestContext * /*request_context*/,
+                                          const KeyTypeVec &keys,
+                                          const CacheLocationMapVector & /*locations*/,
+                                          const PropertyMapVector & /*properties*/,
+                                          const std::vector<ErrorCode> & /*previous_error_codes*/) noexcept {
+        return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
+    }
+
+    // Capacity-unbounded admission for critical async backup writes. Only the
+    // async Redis backend supports this operation.
+    virtual std::vector<ErrorCode> ForceUpsert(RequestContext * /*request_context*/,
+                                               const KeyTypeVec &keys,
+                                               const CacheLocationMapVector & /*locations*/,
+                                               const PropertyMapVector & /*properties*/) noexcept {
+        return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
+    }
 
     // Allocation-light one-location upsert used by pure-local targeted RMW.
     // The default adapter preserves backend semantics; local memory overrides
@@ -111,6 +138,18 @@ public:
     //   - EC_ERROR: 删除失败
     virtual std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept = 0;
 
+    // Capacity-unbounded admission for critical async whole-key deletes.
+    // Synchronous backends keep their ordinary Delete semantics.
+    virtual std::vector<ErrorCode> ForceDelete(RequestContext *request_context, const KeyTypeVec &keys) noexcept {
+        return Delete(request_context, keys);
+    }
+
+    virtual std::vector<ErrorCode> Delete(RequestContext * /*request_context*/,
+                                          const KeyTypeVec &keys,
+                                          const std::vector<ErrorCode> & /*previous_error_codes*/) noexcept {
+        return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
+    }
+
     // 删除指定 key 下的指定 location。幂等语义：删除不存在的 location 视为成功。
     // 不影响 key 中的 properties 和其他 location。
     // @param request_context  请求上下文；可为 nullptr
@@ -124,6 +163,13 @@ public:
     virtual std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
                                                    const KeyTypeVec &keys,
                                                    const LocationIdsPerKey &location_ids) noexcept = 0;
+
+    virtual std::vector<ErrorCode> DeleteLocations(RequestContext * /*request_context*/,
+                                                   const KeyTypeVec &keys,
+                                                   const LocationIdsPerKey & /*location_ids*/,
+                                                   const std::vector<ErrorCode> & /*previous_error_codes*/) noexcept {
+        return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
+    }
 
     // =====================================================================
     // Read APIs
@@ -331,6 +377,16 @@ public:
         return results;
     }
 
+    // Targeted maintenance read. It must not update access/LRU/revisit state
+    // and must not populate another cache tier. Backends without an online
+    // cache can use the ordinary targeted read implementation.
+    virtual std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *request_context,
+                                                                           const KeyTypeVec &keys,
+                                                                           const LocationIdsPerKey &location_ids,
+                                                                           LocationsPerKey &out_locations) noexcept {
+        return GetLocations(request_context, keys, location_ids, out_locations);
+    }
+
     // 仅获取 key 的 location id 列表（不读取 location body）。
     // @param request_context    请求上下文；可为 nullptr
     // @param keys               待查询的 key 列表
@@ -343,6 +399,15 @@ public:
     virtual std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
                                                   const KeyTypeVec &keys,
                                                   LocationIdsPerKey &out_location_ids) noexcept = 0;
+
+    // Maintenance counterpart of GetLocationIds(). It must not promote or
+    // touch cache entries. Persistent-only backends can use the ordinary
+    // implementation because they have no online LRU state to preserve.
+    virtual std::vector<ErrorCode> GetLocationIdsForMaintenance(RequestContext *request_context,
+                                                                const KeyTypeVec &keys,
+                                                                LocationIdsPerKey &out_location_ids) noexcept {
+        return GetLocationIds(request_context, keys, out_location_ids);
+    }
 
     // 读取指定字段名的 properties。
     // @param request_context  请求上下文；可为 nullptr
@@ -358,6 +423,16 @@ public:
                                                  const KeyTypeVec &keys,
                                                  const std::vector<std::string> &field_names,
                                                  PropertyMapVector &out_properties) noexcept = 0;
+
+    // Maintenance Location reads must not update timestamps, promote entries, observe
+    // revisit intervals, or populate a cache. The default adapter is only for
+    // side-effect-free reads (Redis/async Redis). Backends whose ordinary reads
+    // refresh LRU, including local and dummy, must override this API.
+    virtual std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *request_context,
+                                                                 const KeyTypeVec &keys,
+                                                                 CacheLocationMapVector &out_locations) noexcept {
+        return GetLocations(request_context, keys, out_locations);
+    }
 
     // 检查 key 是否存在。
     // @param request_context   请求上下文；可为 nullptr
@@ -407,6 +482,23 @@ public:
                                                   int64_t limit,
                                                   MaintenanceScanBatch &out) noexcept = 0;
 
+    // Maintenance delete counterpart of GetLocationsForMaintenance(). It
+    // must not promote/touch cache entries. The caller already performed the
+    // expected-value comparison under the MetaIndexer shard lock.
+    virtual std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
+                                                                 const KeyTypeVec &keys,
+                                                                 const LocationIdsPerKey &location_ids) noexcept {
+        return DeleteLocations(request_context, keys, location_ids);
+    }
+
+    virtual std::vector<ErrorCode>
+    DeleteLocationsForMaintenance(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const LocationIdsPerKey &location_ids,
+                                  const std::vector<ErrorCode> &previous_error_codes) noexcept {
+        return DeleteLocations(request_context, keys, location_ids, previous_error_codes);
+    }
+
     // 随机采样 key。
     // @param request_context 请求上下文；可为 nullptr
     // @param count    期望采样数量
@@ -422,6 +514,29 @@ public:
     // @return EC_OK 成功；EC_ERROR 采样失败
     virtual ErrorCode
     SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept = 0;
+
+    // Samples reclaim candidates and returns the timestamp used for LRU
+    // ranking as part of the same logical operation. Implementations must not
+    // update access timestamps, promote entries in an LRU list, or observe a
+    // revisit interval. A composite backend may merge a complete persistent
+    // key sample with newer no-touch cache timestamps. If sampling succeeds
+    // but a timestamp is unavailable or malformed, the candidate is returned
+    // with last_access_time_us == 0 to preserve the reclaimer's historical
+    // best-effort degradation.
+    // require_read_success distinguishes failed backend reads from missing or
+    // malformed timestamp values. In strict mode read failures fail the sample;
+    // missing or invalid values still degrade to zero. Keys known to have
+    // disappeared may be skipped. If a missing field cannot be distinguished
+    // from a missing key, retain the candidate for subsequent Location checks.
+    virtual ErrorCode SampleReclaimCandidates(RequestContext *request_context,
+                                              int64_t count,
+                                              ReclaimCandidateVector &out_candidates,
+                                              bool require_read_success = false) noexcept = 0;
+
+    // Refresh timestamps and LRU positions for an explicit maintenance key list
+    // without recording revisit observations. The caller determines eligibility;
+    // unsupported backends leave keys unchanged. Returns the number touched.
+    virtual size_t TouchKeysForMaintenance(const KeyTypeVec & /*keys*/) noexcept { return 0; }
 
     // =====================================================================
     // Metadata APIs — 用于持久化 MetaIndexer 自身的元信息（key_count、storage_usage 等）
@@ -442,12 +557,18 @@ public:
     // Default: no-op (sync backends have no pending writes).
     virtual bool Sync(const KeyTypeVec & /*keys*/) noexcept { return true; }
 
+    // Synchronously flush all pending writes. Async backends override this to
+    // place a barrier on every write queue; synchronous backends have no work.
+    virtual bool SyncAll() noexcept { return true; }
+
     struct AsyncWriteStats {
         int64_t max_async_queue_size = 0;
         int64_t avg_async_queue_size = 0;
         int64_t flush_key_count = 0;
         int64_t batch_flush_time_us = 0;
         int64_t pipeline_error_count = 0;
+        int64_t dropped_key_count = 0;
+        int64_t dropped_metadata_count = 0;
     };
     virtual AsyncWriteStats GetAsyncWriteStats() noexcept { return {}; }
 

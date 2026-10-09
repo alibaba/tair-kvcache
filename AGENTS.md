@@ -2,6 +2,7 @@
 
 项目文档见 [docs/README.md](docs/README.md)。
 提交前检查和 commit message 格式见 [docs/develop/commit_requirements.md](docs/develop/commit_requirements.md)。
+参与 PR 协作时的可评审性、表达、标题和双语正文要求见 [docs/develop/pull_request_guidelines.md](docs/develop/pull_request_guidelines.md)。
 
 ## 模块关系（缩略图）
 

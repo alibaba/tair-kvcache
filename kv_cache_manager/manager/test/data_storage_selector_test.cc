@@ -626,7 +626,7 @@ TEST_F(DataStorageSelectorTest, TestSelectCacheWriteStorageBackendQuota01) {
         meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 512);
 
         InstanceGroupQuota quota;
-        quota.set_capacity(1025); // quota_capacity > group_used_size
+        quota.set_capacity(1025);                                      // quota_capacity > group_used_size
         QuotaConfig qc(511, DataStorageType::DATA_STORAGE_TYPE_HF3FS); // hf3fs quota 511 < 512
         quota.set_quota_config({qc});
         instance_group_g->set_quota(quota);
@@ -636,6 +636,38 @@ TEST_F(DataStorageSelectorTest, TestSelectCacheWriteStorageBackendQuota01) {
         ASSERT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, result.type);
         ASSERT_EQ("nfs_storage_00", result.name);
     }
+}
+
+TEST_F(DataStorageSelectorTest, TestEventReportUsageDoesNotConsumeGroupQuota) {
+    instance_group_g->set_storage_candidates({"3fs_storage_01"});
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_ALWAYS_3FS);
+    data_storage_manager_g->storage_map_["3fs_storage_01"] = avail_backends_g[1];
+    meta_indexer_g->storage_usage_data_.Reset();
+    meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, 2048);
+    meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 4096);
+
+    InstanceGroupQuota quota;
+    quota.set_capacity(1);
+    instance_group_g->set_quota(quota);
+
+    auto selected =
+        data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group");
+    EXPECT_EQ(ErrorCode::EC_OK, selected.ec);
+    EXPECT_EQ("3fs_storage_01", selected.name);
+
+    auto admissions = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), "default_test_group", {"3fs_storage_01"});
+    ASSERT_EQ(1u, admissions.size());
+    EXPECT_EQ(StorageTargetAdmissionStatus::kAllowed, admissions[0].status);
+
+    meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 1);
+    selected = data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group");
+    EXPECT_NE(ErrorCode::EC_OK, selected.ec);
+
+    admissions = data_storage_selector_->CheckExplicitWriteTargets(
+        request_context_.get(), "default_test_group", {"3fs_storage_01"});
+    ASSERT_EQ(1u, admissions.size());
+    EXPECT_EQ(StorageTargetAdmissionStatus::kGroupQuotaExceeded, admissions[0].status);
 }
 
 TEST_F(DataStorageSelectorTest, TestExplicitWriteTargetAdmissionChecksAvailabilityAndQuota) {

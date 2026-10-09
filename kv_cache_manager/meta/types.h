@@ -35,6 +35,16 @@ using KeyVector = std::vector<KeyType>;
 // still reference the old `KeyTypeVec` spelling.
 using KeyTypeVec = KeyVector;
 
+// A key selected for LRU reclamation together with the access timestamp used
+// to rank it. A zero timestamp means that the backend could not provide a
+// usable value; callers preserve the historical best-effort behavior by
+// treating such candidates as the oldest entries.
+struct ReclaimCandidate {
+    KeyType key = 0;
+    int64_t last_access_time_us = 0;
+};
+using ReclaimCandidateVector = std::vector<ReclaimCandidate>;
+
 using FieldMap = std::map<std::string, std::string>;
 using FieldMapVec = std::vector<FieldMap>;
 
@@ -56,9 +66,9 @@ using LocationsPerKey = std::vector<CacheLocationVector>;
 // explicit handle release. These views must never escape that interval.
 using CacheLocationViewVector = std::vector<const CacheLocation *>;
 
-// A maintenance scan reads keys and their locations from the authoritative
-// backend without updating online access/LRU state. The three vectors are
-// always index-aligned when the scan succeeds.
+// A maintenance scan reads keys and locations from the backend selected by
+// MetaStorageBackendManager without updating online access/LRU state. The
+// three vectors are always index-aligned when the scan succeeds.
 struct MaintenanceScanBatch {
     std::string next_cursor;
     KeyVector keys;
@@ -127,6 +137,9 @@ struct BatchMetaData {
     CacheLocationMapVector batch_locations;  // optional per-key CacheLocations
     LocationIdsPerKey batch_location_ids;    // optional per-key location ids
     PropertyMapVector batch_properties;      // optional per-key properties
+    // Sorted positions in batch_keys that require strict Secondary admission.
+    // Ordinary batches keep this empty and perform no dynamic allocation.
+    std::vector<size_t> batch_secondary_admission_indices;
 
     // Ensure batch_locations and batch_properties are sized to match batch_keys.
     void EnsureLocationsAndPropertiesResized() {

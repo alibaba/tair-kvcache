@@ -27,7 +27,7 @@ namespace {
 
 std::string GenerateSnapshotVersionToken() {
     std::array<unsigned char, 16> bytes{};
-    std::random_device random;
+    thread_local std::random_device random;
     for (auto &byte : bytes) {
         byte = static_cast<unsigned char>(random());
     }
@@ -55,7 +55,10 @@ EventReportBackend::~EventReportBackend() {
 
 std::shared_ptr<EventReportBackend::LifecycleFence>
 EventReportBackend::GetOrCreateLifecycleFence(const ReporterSnapshotKey &reporter_key) {
-    std::lock_guard<std::mutex> lock(lifecycle_fences_mutex_);
+    if (const auto fence = FindLifecycleFence(reporter_key)) {
+        return fence;
+    }
+    std::unique_lock<std::shared_mutex> lock(lifecycle_fences_mutex_);
     auto &fence = lifecycle_fences_[reporter_key];
     if (!fence) {
         fence = std::make_shared<LifecycleFence>();
@@ -65,9 +68,43 @@ EventReportBackend::GetOrCreateLifecycleFence(const ReporterSnapshotKey &reporte
 
 std::shared_ptr<EventReportBackend::LifecycleFence>
 EventReportBackend::FindLifecycleFence(const ReporterSnapshotKey &reporter_key) const {
-    std::lock_guard<std::mutex> lock(lifecycle_fences_mutex_);
+    std::shared_lock<std::shared_mutex> lock(lifecycle_fences_mutex_);
     const auto it = lifecycle_fences_.find(reporter_key);
     return it == lifecycle_fences_.end() ? nullptr : it->second;
+}
+
+std::vector<std::shared_ptr<EventReportBackend::LifecycleFence>> EventReportBackend::GetLifecycleFences() const {
+    std::shared_lock<std::shared_mutex> lock(lifecycle_fences_mutex_);
+    std::vector<std::shared_ptr<LifecycleFence>> fences;
+    fences.reserve(lifecycle_fences_.size());
+    for (const auto &entry : lifecycle_fences_) {
+        if (entry.second) {
+            fences.push_back(entry.second);
+        }
+    }
+    return fences;
+}
+
+std::string EventReportBackend::ReserveSnapshotVersionToken(const ReporterSnapshotKey &reporter_key) {
+    for (;;) {
+        std::string token = GenerateSnapshotVersionToken();
+        std::unique_lock<std::shared_mutex> lock(snapshot_token_owners_mutex_);
+        if (snapshot_token_owners_.emplace(token, reporter_key).second) {
+            return token;
+        }
+    }
+}
+
+void EventReportBackend::ReleaseSnapshotVersionToken(const ReporterSnapshotKey &reporter_key,
+                                                     const std::string &token) {
+    if (token.empty()) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lock(snapshot_token_owners_mutex_);
+    const auto it = snapshot_token_owners_.find(token);
+    if (it != snapshot_token_owners_.end() && it->second == reporter_key) {
+        snapshot_token_owners_.erase(it);
+    }
 }
 
 // --- DataStorageBackend interface ---
@@ -77,9 +114,20 @@ DataStorageType EventReportBackend::GetType() { return config_.type(); }
 bool EventReportBackend::Available() { return IsOpen() && IsAvailable(); }
 
 void EventReportBackend::SetAvailable(bool available) {
+    std::unique_lock<std::shared_mutex> maintenance_lock(maintenance_backend_mutex_);
     DataStorageBackend::SetAvailable(available);
+    if (available) {
+        // Re-enabled Reporters need a complete heartbeat + cleanup-grace
+        // window before recovery-absent cleanup may be authorized.
+        ResetMaintenanceRecoveryGrace();
+    }
     if (!available) {
-        snapshot_state_cv_.notify_all();
+        for (const auto &fence : GetLifecycleFences()) {
+            // Synchronize with the waiter's check-to-wait transition. The
+            // atomic availability flag alone cannot prevent a lost wakeup.
+            std::lock_guard<std::mutex> state_lock(fence->state_mutex);
+            fence->snapshot_state_cv.notify_all();
+        }
     }
 }
 
@@ -172,16 +220,7 @@ ErrorCode EventReportBackend::Close() {
     if (liveness_checker_thread_.joinable()) {
         liveness_checker_thread_.join();
     }
-    std::vector<std::shared_ptr<LifecycleFence>> fence_refs;
-    {
-        std::lock_guard<std::mutex> fences_guard(lifecycle_fences_mutex_);
-        fence_refs.reserve(lifecycle_fences_.size());
-        for (const auto &entry : lifecycle_fences_) {
-            if (entry.second) {
-                fence_refs.push_back(entry.second);
-            }
-        }
-    }
+    auto fence_refs = GetLifecycleFences();
 
     // Never wait for a lifecycle fence while holding lifecycle_fences_mutex_.
     // Cleanup deliberately takes lifecycle -> metadata, while a metadata RMW
@@ -198,16 +237,25 @@ ErrorCode EventReportBackend::Close() {
         std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
         instance_nodes_.clear();
         node_generation_.clear();
-        snapshot_versions_.clear();
+    }
+    for (const auto &fence : fence_refs) {
+        {
+            std::lock_guard<std::mutex> state_lock(fence->state_mutex);
+            fence->registered = false;
+            fence->snapshot_state = {};
+        }
+        fence->snapshot_state_cv.notify_all();
+    }
+    {
+        std::unique_lock<std::shared_mutex> token_lock(snapshot_token_owners_mutex_);
         snapshot_token_owners_.clear();
     }
     {
-        std::lock_guard<std::mutex> fences_guard(lifecycle_fences_mutex_);
+        std::unique_lock<std::shared_mutex> fences_guard(lifecycle_fences_mutex_);
         lifecycle_fences_.clear();
     }
     fence_locks.clear();
     fence_refs.clear();
-    snapshot_state_cv_.notify_all();
     {
         std::lock_guard<std::mutex> lock(cleanup_cb_mutex_);
         cleanup_callback_ = nullptr;
@@ -247,6 +295,7 @@ ErrorCode EventReportBackend::RegisterNode(const std::string &instance_id,
         return EC_INSTANCE_NOT_EXIST;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    std::lock_guard<std::mutex> state_lock(lifecycle_fence->state_mutex);
     auto &host_map = instance_nodes_[instance_id];
     auto it = host_map.find(host_ip_port);
     ++node_generation_[instance_id][host_ip_port];
@@ -255,6 +304,7 @@ ErrorCode EventReportBackend::RegisterNode(const std::string &instance_id,
     int64_t now_ms = NowMillis();
     if (it != host_map.end()) {
         auto &info = *it->second;
+        info.lifecycle_fence = lifecycle_fence;
         for (const auto &m : mediums) {
             if (std::find(info.mediums.begin(), info.mediums.end(), m) == info.mediums.end()) {
                 info.mediums.push_back(m);
@@ -275,6 +325,7 @@ ErrorCode EventReportBackend::RegisterNode(const std::string &instance_id,
     }
 
     auto info = std::make_unique<NodeInfo>();
+    info->lifecycle_fence = lifecycle_fence;
     info->last_heartbeat_ms.store(now_ms, std::memory_order_relaxed);
     info->available.store(true, std::memory_order_relaxed);
     info->unavailable_since_ms.store(0, std::memory_order_relaxed);
@@ -363,11 +414,13 @@ ErrorCode EventReportBackend::EnsureNodeRegistered(const std::string &instance_i
         return EC_INSTANCE_NOT_EXIST;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    std::lock_guard<std::mutex> state_lock(lifecycle_fence->state_mutex);
     auto &host_map = instance_nodes_[instance_id];
     if (auto it = host_map.find(host_ip_port); it != host_map.end()) {
         // Another request may have created the node between the fast-path
         // check and acquiring the lifecycle lock.
         merge_mediums(*it->second);
+        it->second->lifecycle_fence = lifecycle_fence;
         lifecycle_fence->generation = node_generation_[instance_id][host_ip_port];
         lifecycle_fence->registered = true;
         return EC_OK;
@@ -381,6 +434,7 @@ ErrorCode EventReportBackend::EnsureNodeRegistered(const std::string &instance_i
     lifecycle_fence->generation = generation;
     lifecycle_fence->registered = true;
     auto info = std::make_unique<NodeInfo>();
+    info->lifecycle_fence = lifecycle_fence;
     info->last_heartbeat_ms.store(NowMillis(), std::memory_order_relaxed);
     info->available.store(true, std::memory_order_relaxed);
     info->unavailable_since_ms.store(0, std::memory_order_relaxed);
@@ -407,10 +461,7 @@ ErrorCode EventReportBackend::UnregisterNode(const std::string &instance_id, con
         return EC_INSTANCE_NOT_EXIST;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    const ErrorCode ec = UnregisterNodeLocked(instance_id, host_ip_port);
-    lifecycle_fence->generation = node_generation_[instance_id][host_ip_port];
-    lifecycle_fence->registered = false;
-    return ec;
+    return UnregisterNodeLocked(instance_id, host_ip_port, *lifecycle_fence);
 }
 
 ErrorCode EventReportBackend::UnregisterNodeForHostDown(const std::string &instance_id,
@@ -424,15 +475,21 @@ ErrorCode EventReportBackend::UnregisterNodeForHostDown(const std::string &insta
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
     out_generation = node_generation_[instance_id][host_ip_port];
-    lifecycle_fence->generation = out_generation;
-    lifecycle_fence->registered = false;
     const auto instance_it = instance_nodes_.find(instance_id);
     if (instance_it == instance_nodes_.end() || instance_it->second.find(host_ip_port) == instance_it->second.end()) {
         // HOST_DOWN is explicitly idempotent. Keep the tombstone generation
         // above, but do not emit the generic missing-node warning.
+        std::unique_lock<std::mutex> state_lock(lifecycle_fence->state_mutex);
+        lifecycle_fence->generation = out_generation;
+        lifecycle_fence->registered = false;
+        ReleaseSnapshotVersionToken(reporter_key, lifecycle_fence->snapshot_state.committed);
+        ReleaseSnapshotVersionToken(reporter_key, lifecycle_fence->snapshot_state.in_flight);
+        lifecycle_fence->snapshot_state = {};
+        state_lock.unlock();
+        lifecycle_fence->snapshot_state_cv.notify_all();
         return EC_OK;
     }
-    return UnregisterNodeLocked(instance_id, host_ip_port);
+    return UnregisterNodeLocked(instance_id, host_ip_port, *lifecycle_fence);
 }
 
 ErrorCode EventReportBackend::UnregisterNodeIfGeneration(const std::string &instance_id,
@@ -456,14 +513,22 @@ ErrorCode EventReportBackend::UnregisterNodeIfGeneration(const std::string &inst
     if (current_generation != expected_generation) {
         return EC_MISMATCH;
     }
-    const ErrorCode ec = UnregisterNodeLocked(instance_id, host_ip_port);
-    lifecycle_fence->generation = current_generation;
-    lifecycle_fence->registered = false;
-    return ec;
+    return UnregisterNodeLocked(instance_id, host_ip_port, *lifecycle_fence);
 }
 
-ErrorCode EventReportBackend::UnregisterNodeLocked(const std::string &instance_id, const std::string &host_ip_port) {
+ErrorCode EventReportBackend::UnregisterNodeLocked(const std::string &instance_id,
+                                                   const std::string &host_ip_port,
+                                                   LifecycleFence &lifecycle_fence) {
     node_generation_[instance_id].try_emplace(host_ip_port, 0);
+    std::unique_lock<std::mutex> state_lock(lifecycle_fence.state_mutex);
+    lifecycle_fence.generation = node_generation_[instance_id][host_ip_port];
+    lifecycle_fence.registered = false;
+    const ReporterSnapshotKey reporter_key{instance_id, host_ip_port};
+    ReleaseSnapshotVersionToken(reporter_key, lifecycle_fence.snapshot_state.committed);
+    ReleaseSnapshotVersionToken(reporter_key, lifecycle_fence.snapshot_state.in_flight);
+    lifecycle_fence.snapshot_state = {};
+    state_lock.unlock();
+    lifecycle_fence.snapshot_state_cv.notify_all();
     auto inst_it = instance_nodes_.find(instance_id);
     if (inst_it == instance_nodes_.end()) {
         KVCM_LOG_WARN("EventReportBackend: instance [%s] not found for unregister node [%s]",
@@ -489,13 +554,6 @@ ErrorCode EventReportBackend::UnregisterNodeLocked(const std::string &instance_i
         }
     }
     inst_it->second.erase(it);
-    const ReporterSnapshotKey reporter_key{instance_id, host_ip_port};
-    const auto snapshot_it = snapshot_versions_.find(reporter_key);
-    if (snapshot_it != snapshot_versions_.end() && !snapshot_it->second.committed.empty()) {
-        snapshot_token_owners_.erase(snapshot_it->second.committed);
-    }
-    snapshot_versions_.erase(reporter_key);
-    snapshot_state_cv_.notify_all();
     KVCM_LOG_INFO("EventReportBackend: node [%s] unregistered from storage [%s] for instance [%s]",
                   host_ip_port.c_str(),
                   config_.global_unique_name().c_str(),
@@ -511,11 +569,30 @@ ErrorCode EventReportBackend::OnHeartbeat(const std::string &instance_id,
     }
     const ReporterSnapshotKey reporter_key{instance_id, host_ip_port};
     const auto lifecycle_fence = GetOrCreateLifecycleFence(reporter_key);
+
+    // Fast path: a steady HEARTBEAT does not change lifecycle state. Use a
+    // shared lease so same-generation ADD/DELETE can proceed; it still pins
+    // NodeInfo and excludes REGISTER/HOST_DOWN writers.
+    {
+        std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_fence->mutex);
+        if (!AcceptingReports()) {
+            return EC_INSTANCE_NOT_EXIST;
+        }
+        std::unique_lock<std::shared_mutex> nodes_lock(nodes_mutex_);
+        if (TryPublishSteadyHeartbeatLocked(reporter_key, *lifecycle_fence, system_status, nodes_lock)) {
+            return EC_OK;
+        }
+    }
+
+    // Slow path: HEARTBEAT may create or recover a node and change lifecycle
+    // state. Drop the shared lease, acquire it exclusively, and revalidate
+    // because shared_mutex has no atomic lock upgrade.
     std::unique_lock<std::shared_mutex> lifecycle_lock(lifecycle_fence->mutex);
     if (!AcceptingReports()) {
         return EC_INSTANCE_NOT_EXIST;
     }
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    std::unique_lock<std::shared_mutex> nodes_lock(nodes_mutex_);
+    std::unique_lock<std::mutex> state_lock(lifecycle_fence->state_mutex);
     auto &host_map = instance_nodes_[instance_id];
     auto it = host_map.find(host_ip_port);
     if (it == host_map.end()) {
@@ -531,6 +608,7 @@ ErrorCode EventReportBackend::OnHeartbeat(const std::string &instance_id,
         lifecycle_fence->generation = generation;
         lifecycle_fence->registered = true;
         auto new_info = std::make_unique<NodeInfo>();
+        new_info->lifecycle_fence = lifecycle_fence;
         new_info->last_heartbeat_ms.store(NowMillis(), std::memory_order_relaxed);
         new_info->available.store(true, std::memory_order_relaxed);
         new_info->unavailable_since_ms.store(0, std::memory_order_relaxed);
@@ -545,6 +623,7 @@ ErrorCode EventReportBackend::OnHeartbeat(const std::string &instance_id,
                       generation);
     }
     auto &info = *it->second;
+    info.lifecycle_fence = lifecycle_fence;
     int64_t now_ms = NowMillis();
     info.last_heartbeat_ms.store(now_ms, std::memory_order_release);
     bool prev = info.available.exchange(true, std::memory_order_relaxed);
@@ -563,17 +642,47 @@ ErrorCode EventReportBackend::OnHeartbeat(const std::string &instance_id,
     }
     lifecycle_fence->generation = node_generation_[instance_id][host_ip_port];
     lifecycle_fence->registered = true;
-    std::unique_lock<std::mutex> status_lock(info.status_mutex);
-    const std::map<std::string, std::string> previous_system_status = info.last_system_status;
-    info.last_system_status = system_status;
-    const auto metrics_tags = info.metrics_tags;
+    state_lock.unlock();
+    PublishHeartbeatStatus(info, system_status, nodes_lock);
+    return EC_OK;
+}
 
-    // The per-reporter lifecycle writer keeps NodeInfo alive and prevents
-    // HOST_DOWN/REGISTER from crossing gauge publication. The status lock
-    // serializes SetNodeUnavailable's gauge reset. Release the global node
-    // table lock so metric work for one reporter does not block all others.
-    lock.unlock();
+bool EventReportBackend::TryPublishSteadyHeartbeatLocked(const ReporterSnapshotKey &reporter_key,
+                                                         const LifecycleFence &lifecycle_fence,
+                                                         const std::map<std::string, std::string> &system_status,
+                                                         std::unique_lock<std::shared_mutex> &nodes_lock) {
+    if (!lifecycle_fence.registered) {
+        return false;
+    }
+    const auto instance_it = instance_nodes_.find(reporter_key.instance_id);
+    const auto generation_it = node_generation_.find(reporter_key.instance_id);
+    if (instance_it == instance_nodes_.end() || generation_it == node_generation_.end()) {
+        return false;
+    }
+    const auto node_it = instance_it->second.find(reporter_key.host_ip_port);
+    const auto host_generation_it = generation_it->second.find(reporter_key.host_ip_port);
+    if (node_it == instance_it->second.end() || !node_it->second || host_generation_it == generation_it->second.end() ||
+        lifecycle_fence.generation != host_generation_it->second ||
+        !node_it->second->available.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    auto &info = *node_it->second;
+    info.last_heartbeat_ms.store(NowMillis(), std::memory_order_release);
+    PublishHeartbeatStatus(info, system_status, nodes_lock);
+    return true;
+}
+
+void EventReportBackend::PublishHeartbeatStatus(NodeInfo &info,
+                                                const std::map<std::string, std::string> &system_status,
+                                                std::unique_lock<std::shared_mutex> &nodes_lock) {
+    std::unique_lock<std::mutex> status_lock(info.status_mutex);
+
+    // Lock handoff: status_mutex now serializes this publication with
+    // SetNodeUnavailable's gauge reset, while the lifecycle lease pins
+    // NodeInfo. Release the global node-table lock before slower metric work.
+    nodes_lock.unlock();
     if (metrics_registry_) {
+        const auto &metrics_tags = info.metrics_tags;
         const auto parse_gauge = [](const std::string &value, double &out) {
             if (value.empty()) {
                 return false;
@@ -587,7 +696,7 @@ ErrorCode EventReportBackend::OnHeartbeat(const std::string &instance_id,
         // prior numeric gauge when the next heartbeat omits it or changes it
         // to a non-numeric value; otherwise stale values would survive and a
         // later unregister could no longer discover the omitted key.
-        for (const auto &[name, previous_value] : previous_system_status) {
+        for (const auto &[name, previous_value] : info.last_system_status) {
             double ignored_previous = 0.0;
             if (!parse_gauge(previous_value, ignored_previous)) {
                 continue;
@@ -607,7 +716,7 @@ ErrorCode EventReportBackend::OnHeartbeat(const std::string &instance_id,
             }
         }
     }
-    return EC_OK;
+    info.last_system_status = system_status;
 }
 
 void EventReportBackend::SetNodeUnavailable(const std::string &instance_id, const std::string &host_ip_port) {
@@ -805,29 +914,37 @@ std::vector<bool> EventReportBackend::MightExist(const std::vector<DataStorageUr
     }
     std::vector<bool> result;
     result.reserve(storage_uris.size());
-    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
     for (const auto &uri : storage_uris) {
         SnapshotUriInfo info;
         if (!SnapshotUriUtils::ParseSnapshotUriInfo(uri, info)) {
             result.push_back(false);
             continue;
         }
-        const auto owner_it = snapshot_token_owners_.find(info.version);
-        if (owner_it == snapshot_token_owners_.end()) {
-            result.push_back(false);
-            continue;
+        ReporterSnapshotKey reporter_key;
+        {
+            std::shared_lock<std::shared_mutex> token_lock(snapshot_token_owners_mutex_);
+            const auto owner_it = snapshot_token_owners_.find(info.version);
+            if (owner_it == snapshot_token_owners_.end()) {
+                result.push_back(false);
+                continue;
+            }
+            reporter_key = owner_it->second;
         }
-        const ReporterSnapshotKey &reporter_key = owner_it->second;
-        const auto state_it = snapshot_versions_.find(reporter_key);
+        std::shared_lock<std::shared_mutex> nodes_lock(nodes_mutex_);
         const auto instance_it = instance_nodes_.find(reporter_key.instance_id);
-        if (state_it == snapshot_versions_.end() || state_it->second.committed != info.version ||
-            instance_it == instance_nodes_.end()) {
+        if (instance_it == instance_nodes_.end()) {
             result.push_back(false);
             continue;
         }
         const auto node_it = instance_it->second.find(reporter_key.host_ip_port);
-        result.push_back(node_it != instance_it->second.end() && node_it->second &&
-                         node_it->second->available.load(std::memory_order_relaxed));
+        if (node_it == instance_it->second.end() || !node_it->second ||
+            !node_it->second->available.load(std::memory_order_relaxed)) {
+            result.push_back(false);
+            continue;
+        }
+        const auto &lifecycle_fence = *node_it->second->lifecycle_fence;
+        std::lock_guard<std::mutex> state_lock(lifecycle_fence.state_mutex);
+        result.push_back(lifecycle_fence.snapshot_state.committed == info.version);
     }
     return result;
 }
@@ -905,61 +1022,45 @@ ErrorCode EventReportBackend::BeginDeltaMutation(const ReporterSnapshotKey &repo
     if (reporter_key.instance_id.empty() || reporter_key.host_ip_port.empty()) {
         return EC_BADARGS;
     }
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
     if (!AcceptingReports()) {
         return EC_INSTANCE_NOT_EXIST;
     }
+    const auto lifecycle_fence = FindLifecycleFence(reporter_key);
+    if (!lifecycle_fence) {
+        return EC_SNAPSHOT_REQUIRED;
+    }
+    std::unique_lock<std::mutex> lock(lifecycle_fence->state_mutex);
     const int64_t snapshot_wait_timeout_ms = snapshot_delta_drain_timeout_ms_;
     const bool snapshot_finished =
-        snapshot_state_cv_.wait_for(lock, std::chrono::milliseconds(snapshot_wait_timeout_ms), [&] {
-            auto it = snapshot_versions_.find(reporter_key);
-            return !AcceptingReports() || it == snapshot_versions_.end() || it->second.in_flight.empty();
+        lifecycle_fence->snapshot_state_cv.wait_for(lock, std::chrono::milliseconds(snapshot_wait_timeout_ms), [&] {
+            return !AcceptingReports() || !lifecycle_fence->registered ||
+                   lifecycle_fence->snapshot_state.in_flight.empty();
         });
     if (!snapshot_finished) {
         return EC_SNAPSHOT_IN_PROGRESS;
     }
-    // Close()/dynamic disable can wake this waiter by clearing the snapshot
-    // state.  Admission was checked before wait_for() released nodes_mutex_,
-    // so check again before creating or incrementing any mutation state.
+    // Close()/dynamic disable or unregister can wake this waiter. Recheck the
+    // reporter-local predicate before creating or incrementing mutation state.
     if (!AcceptingReports()) {
         return EC_INSTANCE_NOT_EXIST;
     }
-    auto state_it = snapshot_versions_.find(reporter_key);
-    if (state_it == snapshot_versions_.end() || state_it->second.committed.empty()) {
-        const auto instance_it = instance_nodes_.find(reporter_key.instance_id);
-        if (instance_it == instance_nodes_.end() ||
-            instance_it->second.find(reporter_key.host_ip_port) == instance_it->second.end()) {
-            return EC_SNAPSHOT_REQUIRED;
-        }
-
-        auto token_in_use = [this](const std::string &token) {
-            if (snapshot_token_owners_.count(token) > 0) {
-                return true;
-            }
-            return std::any_of(snapshot_versions_.begin(), snapshot_versions_.end(), [&token](const auto &entry) {
-                return entry.second.in_flight == token;
-            });
-        };
-        std::string candidate;
-        do {
-            candidate = GenerateSnapshotVersionToken();
-        } while (token_in_use(candidate));
-        auto &new_state = snapshot_versions_[reporter_key];
-        new_state.committed = candidate;
-        snapshot_token_owners_[candidate] = reporter_key;
-        state_it = snapshot_versions_.find(reporter_key);
+    if (!lifecycle_fence->registered) {
+        return EC_SNAPSHOT_REQUIRED;
+    }
+    auto &state = lifecycle_fence->snapshot_state;
+    if (state.committed.empty()) {
+        state.committed = ReserveSnapshotVersionToken(reporter_key);
         if (out_created_generation) {
             *out_created_generation = true;
         }
     }
-    auto &state = state_it->second;
     if (state.active_delta_mutations == std::numeric_limits<uint64_t>::max()) {
         return EC_ERROR;
     }
     ++state.active_delta_mutations;
     out_committed_version = state.committed;
     if (out_lifecycle_generation) {
-        *out_lifecycle_generation = node_generation_[reporter_key.instance_id][reporter_key.host_ip_port];
+        *out_lifecycle_generation = lifecycle_fence->generation;
     }
     return EC_OK;
 }
@@ -967,10 +1068,17 @@ ErrorCode EventReportBackend::BeginDeltaMutation(const ReporterSnapshotKey &repo
 void EventReportBackend::EndDeltaMutation(const ReporterSnapshotKey &reporter_key,
                                           uint64_t lifecycle_generation,
                                           const std::string &expected_snapshot_version) {
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto it = snapshot_versions_.find(reporter_key);
-    if (it != snapshot_versions_.end() && !expected_snapshot_version.empty() &&
-        it->second.committed != expected_snapshot_version) {
+    const auto lifecycle_fence = FindLifecycleFence(reporter_key);
+    if (!lifecycle_fence) {
+        KVCM_LOG_DEBUG("EventReportBackend: delta mutation lease ended after reporter lifecycle changed, "
+                       "instance [%s] host [%s]",
+                       reporter_key.instance_id.c_str(),
+                       reporter_key.host_ip_port.c_str());
+        return;
+    }
+    std::unique_lock<std::mutex> lock(lifecycle_fence->state_mutex);
+    auto &state = lifecycle_fence->snapshot_state;
+    if (!expected_snapshot_version.empty() && state.committed != expected_snapshot_version) {
         // HOST_DOWN removes snapshot state before an already-admitted delta
         // necessarily reaches its final metadata lease. If the reporter is
         // then registered again, a new delta can recreate state at the same
@@ -980,16 +1088,9 @@ void EventReportBackend::EndDeltaMutation(const ReporterSnapshotKey &reporter_ke
                        reporter_key.host_ip_port.c_str());
         return;
     }
-    if (it == snapshot_versions_.end() || it->second.active_delta_mutations == 0) {
-        const auto generation_it = node_generation_.find(reporter_key.instance_id);
-        const auto node_it = instance_nodes_.find(reporter_key.instance_id);
-        const bool lifecycle_ended =
-            generation_it == node_generation_.end() ||
-            generation_it->second.find(reporter_key.host_ip_port) == generation_it->second.end() ||
-            (lifecycle_generation != 0 &&
-             generation_it->second.at(reporter_key.host_ip_port) != lifecycle_generation) ||
-            node_it == instance_nodes_.end() ||
-            node_it->second.find(reporter_key.host_ip_port) == node_it->second.end();
+    if (state.active_delta_mutations == 0) {
+        const bool lifecycle_ended = !lifecycle_fence->registered ||
+                                     (lifecycle_generation != 0 && lifecycle_fence->generation != lifecycle_generation);
         if (lifecycle_ended) {
             KVCM_LOG_DEBUG("EventReportBackend: delta mutation lease ended after reporter lifecycle changed, "
                            "instance [%s] host [%s]",
@@ -1002,11 +1103,11 @@ void EventReportBackend::EndDeltaMutation(const ReporterSnapshotKey &reporter_ke
                        reporter_key.host_ip_port.c_str());
         return;
     }
-    --it->second.active_delta_mutations;
-    const bool drained = it->second.active_delta_mutations == 0;
+    --state.active_delta_mutations;
+    const bool notify_snapshot = state.active_delta_mutations == 0 && !state.in_flight.empty();
     lock.unlock();
-    if (drained) {
-        snapshot_state_cv_.notify_all();
+    if (notify_snapshot) {
+        lifecycle_fence->snapshot_state_cv.notify_all();
     }
 }
 
@@ -1025,18 +1126,15 @@ ErrorCode EventReportBackend::BeginSnapshot(const ReporterSnapshotKey &reporter_
     // epoch after this transition; it can never delete across the boundary.
     const auto lifecycle_fence = GetOrCreateLifecycleFence(reporter_key);
     std::unique_lock<std::shared_mutex> lifecycle_lock(lifecycle_fence->mutex);
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    std::unique_lock<std::mutex> lock(lifecycle_fence->state_mutex);
     if (!AcceptingReports()) {
         return EC_INSTANCE_NOT_EXIST;
     }
-    const auto instance_it = instance_nodes_.find(reporter_key.instance_id);
-    if (instance_it == instance_nodes_.end() ||
-        instance_it->second.find(reporter_key.host_ip_port) == instance_it->second.end() ||
-        !lifecycle_fence->registered) {
+    if (!lifecycle_fence->registered) {
         return EC_SNAPSHOT_REQUIRED;
     }
     const uint64_t admitted_lifecycle_generation = lifecycle_fence->generation;
-    auto &state = snapshot_versions_[reporter_key];
+    auto &state = lifecycle_fence->snapshot_state;
     if (!state.in_flight.empty()) {
         return EC_SNAPSHOT_IN_PROGRESS;
     }
@@ -1048,17 +1146,7 @@ ErrorCode EventReportBackend::BeginSnapshot(const ReporterSnapshotKey &reporter_
             return EC_SNAPSHOT_RATE_LIMITED;
         }
     }
-    auto token_in_use = [this](const std::string &token) {
-        if (snapshot_token_owners_.count(token) > 0) {
-            return true;
-        }
-        return std::any_of(snapshot_versions_.begin(), snapshot_versions_.end(), [&token](const auto &entry) {
-            return entry.second.in_flight == token;
-        });
-    };
-    do {
-        out_candidate_version = GenerateSnapshotVersionToken();
-    } while (token_in_use(out_candidate_version));
+    out_candidate_version = ReserveSnapshotVersionToken(reporter_key);
     // Close the reporter's write gate before waiting for already admitted
     // deltas. Deltas arriving from this point wait until commit or abort.
     ++state.attempt_epoch;
@@ -1069,35 +1157,34 @@ ErrorCode EventReportBackend::BeginSnapshot(const ReporterSnapshotKey &reporter_
     lifecycle_lock.unlock();
     const int64_t delta_drain_timeout_ms = snapshot_delta_drain_timeout_ms_;
     const bool deltas_drained =
-        snapshot_state_cv_.wait_for(lock, std::chrono::milliseconds(delta_drain_timeout_ms), [&] {
-            auto it = snapshot_versions_.find(reporter_key);
-            return !AcceptingReports() || it == snapshot_versions_.end() ||
-                   it->second.in_flight != out_candidate_version || it->second.active_delta_mutations == 0;
+        lifecycle_fence->snapshot_state_cv.wait_for(lock, std::chrono::milliseconds(delta_drain_timeout_ms), [&] {
+            return !AcceptingReports() || !lifecycle_fence->registered || state.in_flight != out_candidate_version ||
+                   state.active_delta_mutations == 0;
         });
-    // The wait releases nodes_mutex_.  If the backend was retired or disabled
+    // The wait releases the reporter state mutex. If the backend was retired or disabled
     // meanwhile, do not return a usable candidate.  Close() has already
     // cleared the state; for a dynamic disable, reopen the reporter write gate
     // explicitly so a later re-enable is not stuck behind this abandoned
     // candidate.
     if (!AcceptingReports()) {
-        auto it = snapshot_versions_.find(reporter_key);
-        if (it != snapshot_versions_.end() && it->second.in_flight == out_candidate_version) {
-            it->second.in_flight.clear();
+        if (state.in_flight == out_candidate_version) {
+            state.in_flight.clear();
+            ReleaseSnapshotVersionToken(reporter_key, out_candidate_version);
         }
         out_candidate_version.clear();
         lock.unlock();
-        snapshot_state_cv_.notify_all();
+        lifecycle_fence->snapshot_state_cv.notify_all();
         return EC_INSTANCE_NOT_EXIST;
     }
     if (!deltas_drained) {
-        auto it = snapshot_versions_.find(reporter_key);
-        const uint64_t active_delta_mutations = it == snapshot_versions_.end() ? 0 : it->second.active_delta_mutations;
-        if (it != snapshot_versions_.end() && it->second.in_flight == out_candidate_version) {
-            it->second.in_flight.clear();
+        const uint64_t active_delta_mutations = state.active_delta_mutations;
+        if (state.in_flight == out_candidate_version) {
+            state.in_flight.clear();
+            ReleaseSnapshotVersionToken(reporter_key, out_candidate_version);
         }
         out_candidate_version.clear();
         lock.unlock();
-        snapshot_state_cv_.notify_all();
+        lifecycle_fence->snapshot_state_cv.notify_all();
         KVCM_LOG_WARN("EventReportBackend: snapshot admission timed out after %" PRId64 "ms waiting for %" PRIu64
                       " active delta mutation(s), instance [%s] host [%s]; "
                       "candidate aborted and write gate reopened",
@@ -1107,8 +1194,7 @@ ErrorCode EventReportBackend::BeginSnapshot(const ReporterSnapshotKey &reporter_
                       reporter_key.host_ip_port.c_str());
         return EC_SNAPSHOT_IN_PROGRESS;
     }
-    auto it = snapshot_versions_.find(reporter_key);
-    if (it == snapshot_versions_.end() || it->second.in_flight != out_candidate_version) {
+    if (!lifecycle_fence->registered || state.in_flight != out_candidate_version) {
         out_candidate_version.clear();
         return EC_SNAPSHOT_REQUIRED;
     }
@@ -1126,6 +1212,9 @@ ErrorCode EventReportBackend::AcquireLifecycleMutationLease(const ReporterSnapsh
     if (!lifecycle_fence) {
         return EC_NODE_NOT_REGISTERED;
     }
+    // ADD/DELETE mutate metadata, not reporter lifecycle. This shared lease
+    // pins and validates the current registration/generation while the
+    // metadata RMW is in progress.
     auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex, std::try_to_lock);
     if (!lease->owns_lock()) {
         // Do not wait behind a lifecycle writer while the caller may already
@@ -1151,10 +1240,11 @@ ErrorCode EventReportBackend::CommitSnapshotVersionIfGeneration(const ReporterSn
         return EC_NODE_NOT_REGISTERED;
     }
     // Commit runs after the metadata RMW has released its shard locks, so it
-    // can safely wait for a transient HEARTBEAT writer. Using the mutation
+    // can safely wait for a transient lifecycle writer. Using the mutation
     // path's try-lock here would turn harmless lock contention into a failed
-    // snapshot. REGISTER/HOST_DOWN still serialize first and are rejected by
-    // the generation/registered check below.
+    // snapshot. REGISTER/HOST_DOWN and a lifecycle-changing HEARTBEAT still
+    // serialize first and are rejected by the generation/registered check
+    // below.
     std::shared_lock<std::shared_mutex> lifecycle_lease(lifecycle_fence->mutex);
     if (!AcceptingReports()) {
         return EC_INSTANCE_NOT_EXIST;
@@ -1197,46 +1287,277 @@ ErrorCode EventReportBackend::AcquireSnapshotCleanupLease(const ReporterSnapshot
         return EC_MISMATCH;
     }
     // Cleanup acquires this lease before taking metadata locks. It can block
-    // behind a short-lived HEARTBEAT/REGISTER writer without creating the
-    // lifecycle->metadata / metadata->lifecycle inversion that forces delta
-    // mutations to use try_lock.
+    // behind a short-lived REGISTER or lifecycle-changing HEARTBEAT writer
+    // without creating the lifecycle->metadata / metadata->lifecycle
+    // inversion that forces delta mutations to use try_lock.
     auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex);
-    if (!AcceptingReports() || !lifecycle_fence->registered || lifecycle_fence->generation != expected_generation) {
-        return EC_MISMATCH;
-    }
-
     // BeginSnapshot publishes a new attempt epoch under the lifecycle writer
     // before releasing it. Holding the read lease here therefore makes this
     // validation atomic with respect to every later snapshot admission.
-    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
-    const auto state_it = snapshot_versions_.find(reporter_key);
-    if (state_it == snapshot_versions_.end() || state_it->second.committed != expected_snapshot_version ||
-        (expected_attempt_epoch != 0 && state_it->second.attempt_epoch != expected_attempt_epoch)) {
+    std::lock_guard<std::mutex> state_lock(lifecycle_fence->state_mutex);
+    const auto &state = lifecycle_fence->snapshot_state;
+    if (!AcceptingReports() || !lifecycle_fence->registered || lifecycle_fence->generation != expected_generation ||
+        state.committed != expected_snapshot_version ||
+        (expected_attempt_epoch != 0 && state.attempt_epoch != expected_attempt_epoch)) {
         return EC_MISMATCH;
     }
     out_lease = std::move(lease);
     return EC_OK;
 }
 
+EventReportBackend::CleanupLeaseAcquireResult EventReportBackend::AcquireDownLifecycleCleanupLease(
+    const ReporterSnapshotKey &reporter_key, uint64_t expected_generation, LifecycleMutationLease &out_lease) const {
+    out_lease.reset();
+    const auto lifecycle_fence = FindLifecycleFence(reporter_key);
+    if (!lifecycle_fence) {
+        return CleanupLeaseAcquireResult::kStale;
+    }
+    auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex, std::try_to_lock);
+    if (!lease->owns_lock()) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    if (lifecycle_fence->generation != expected_generation) {
+        return CleanupLeaseAcquireResult::kStale;
+    }
+    // Producers publish DownHost only after generation-checked unregister.
+    // Treat an unexpected same-generation active state fail-closed as busy:
+    // retain the candidate and never authorize deletion until down is observed.
+    if (lifecycle_fence->registered) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    out_lease = std::move(lease);
+    return CleanupLeaseAcquireResult::kAcquired;
+}
+
+EventReportBackend::CleanupLeaseAcquireResult EventReportBackend::AcquireAbsentReporterCleanupLease(
+    const ReporterSnapshotKey &reporter_key, uint64_t &out_generation, LifecycleMutationLease &out_lease) {
+    out_generation = 0;
+    out_lease.reset();
+    const auto lifecycle_fence = GetOrCreateLifecycleFence(reporter_key);
+    auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex, std::try_to_lock);
+    if (!lease->owns_lock()) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    if (lifecycle_fence->registered) {
+        return CleanupLeaseAcquireResult::kStale;
+    }
+    out_generation = lifecycle_fence->generation;
+    out_lease = std::move(lease);
+    return CleanupLeaseAcquireResult::kAcquired;
+}
+
+std::vector<EventReportBackend::MaintenanceLocationProbeResult>
+EventReportBackend::ProbeLocationsForMaintenance(const std::vector<MaintenanceLocationProbe> &probes) {
+    std::vector<MaintenanceLocationProbeResult> results(probes.size());
+    if (!AcceptingReports()) {
+        for (auto &result : results) {
+            result.unknown_reason = MaintenanceProbeUnknownReason::kBackendUnavailable;
+        }
+        return results;
+    }
+
+    const int64_t now_ms = NowMillis();
+    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+    for (size_t i = 0; i < probes.size(); ++i) {
+        const auto &probe = probes[i];
+        auto &result = results[i];
+        std::string_view medium;
+        std::string_view reporter_host_view;
+        if (probe.instance_id.empty() || !ParseLocationIdView(probe.location_id, medium, reporter_host_view)) {
+            result.unknown_reason = MaintenanceProbeUnknownReason::kReporterIdentityMalformed;
+            continue;
+        }
+
+        ReporterSnapshotKey reporter_key{probe.instance_id, std::string(reporter_host_view)};
+        const auto instance_it = instance_nodes_.find(probe.instance_id);
+        NodeInfo *node = nullptr;
+        if (instance_it != instance_nodes_.end()) {
+            const auto node_it = instance_it->second.find(reporter_key.host_ip_port);
+            if (node_it != instance_it->second.end() && node_it->second) {
+                node = node_it->second.get();
+            }
+        }
+        if (node) {
+            if (!node->available.load(std::memory_order_relaxed)) {
+                result.decision = MaintenanceCleanupDecision::kKeep;
+                continue;
+            }
+
+            const auto &lifecycle_fence = *node->lifecycle_fence;
+            std::lock_guard<std::mutex> state_lock(lifecycle_fence.state_mutex);
+            const auto &state = lifecycle_fence.snapshot_state;
+            if (state.committed.empty() || !state.strict_query_visibility) {
+                // Before the first successful complete snapshot, after a
+                // failed attempt, or while recovering, historical metadata is
+                // intentionally queryable. Its generation is not a deletion
+                // authorization.
+                result.unknown_reason = MaintenanceProbeUnknownReason::kSnapshotState;
+                continue;
+            }
+
+            bool contains_current = false;
+            bool malformed = false;
+            for (const auto &uri_text : probe.storage_uris) {
+                std::string_view version;
+                if (!SnapshotUriUtils::InspectSnapshotUriForVisibility(uri_text, version)) {
+                    malformed = true;
+                    continue;
+                }
+                // A structurally valid URI without s_version is legacy
+                // metadata. It is stale only when no sibling spec carries the
+                // committed or in-flight generation.
+                if (version == state.committed || (!state.in_flight.empty() && version == state.in_flight)) {
+                    contains_current = true;
+                    break;
+                }
+            }
+            if (contains_current) {
+                result.decision = MaintenanceCleanupDecision::kKeep;
+                continue;
+            }
+            if (malformed) {
+                result.unknown_reason = MaintenanceProbeUnknownReason::kLocationMalformed;
+                continue;
+            }
+
+            result.decision = MaintenanceCleanupDecision::kDeleteMetadata;
+            result.token = MaintenanceCleanupToken{
+                .reason = MaintenanceCleanupReason::kStaleSnapshot,
+                .reporter_key = std::move(reporter_key),
+                .lifecycle_generation = lifecycle_fence.generation,
+                .committed_version = state.committed,
+                .snapshot_attempt_epoch = state.attempt_epoch,
+            };
+            continue;
+        }
+
+        const auto generation_instance_it = node_generation_.find(probe.instance_id);
+        if (generation_instance_it != node_generation_.end()) {
+            const auto generation_it = generation_instance_it->second.find(reporter_key.host_ip_port);
+            if (generation_it != generation_instance_it->second.end()) {
+                result.decision = MaintenanceCleanupDecision::kDeleteMetadata;
+                result.token = MaintenanceCleanupToken{
+                    .reason = MaintenanceCleanupReason::kDownHost,
+                    .reporter_key = std::move(reporter_key),
+                    .lifecycle_generation = generation_it->second,
+                };
+                continue;
+            }
+        }
+
+        if (now_ms < maintenance_recovery_deadline_ms_.load(std::memory_order_acquire)) {
+            result.unknown_reason = MaintenanceProbeUnknownReason::kRecoveryGrace;
+            continue;
+        }
+        result.decision = MaintenanceCleanupDecision::kDeleteMetadata;
+        result.token = MaintenanceCleanupToken{
+            .reason = MaintenanceCleanupReason::kRecoveryAbsentHost,
+            .reporter_key = std::move(reporter_key),
+        };
+    }
+    return results;
+}
+
+void EventReportBackend::ResetMaintenanceRecoveryGrace() noexcept {
+    const int64_t now_ms = NowMillis();
+    const int64_t heartbeat_timeout_ms = std::max<int64_t>(0, heartbeat_timeout_ms_);
+    const int64_t cleanup_grace_ms = std::max<int64_t>(0, cleanup_grace_ms_);
+    const int64_t wait_ms = heartbeat_timeout_ms > std::numeric_limits<int64_t>::max() - cleanup_grace_ms
+                                ? std::numeric_limits<int64_t>::max()
+                                : heartbeat_timeout_ms + cleanup_grace_ms;
+    const int64_t deadline =
+        now_ms > std::numeric_limits<int64_t>::max() - wait_ms ? std::numeric_limits<int64_t>::max() : now_ms + wait_ms;
+    maintenance_recovery_deadline_ms_.store(deadline, std::memory_order_release);
+}
+
+int64_t EventReportBackend::GetMaintenanceRecoveryGraceRemainingMs() const noexcept {
+    const int64_t now_ms = NowMillis();
+    const int64_t deadline = maintenance_recovery_deadline_ms_.load(std::memory_order_acquire);
+    return deadline > now_ms ? deadline - now_ms : 0;
+}
+
+EventReportBackend::CleanupLeaseAcquireResult
+EventReportBackend::AcquireMaintenanceBackendLease(MaintenanceBackendLease &out_lease) const {
+    out_lease.reset();
+    auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(maintenance_backend_mutex_, std::try_to_lock);
+    if (!lease->owns_lock() || !AcceptingReports()) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    out_lease = std::move(lease);
+    return CleanupLeaseAcquireResult::kAcquired;
+}
+
+EventReportBackend::CleanupLeaseAcquireResult
+EventReportBackend::AcquireMaintenanceCleanupLease(const MaintenanceCleanupToken &token,
+                                                   LifecycleMutationLease &out_lease) {
+    out_lease.reset();
+    if (!AcceptingReports()) {
+        return CleanupLeaseAcquireResult::kBusy;
+    }
+    switch (token.reason) {
+    case MaintenanceCleanupReason::kStaleSnapshot: {
+        const auto lifecycle_fence = FindLifecycleFence(token.reporter_key);
+        if (!lifecycle_fence) {
+            return CleanupLeaseAcquireResult::kStale;
+        }
+        auto lease = std::make_shared<std::shared_lock<std::shared_mutex>>(lifecycle_fence->mutex, std::try_to_lock);
+        if (!lease->owns_lock() || !AcceptingReports()) {
+            return CleanupLeaseAcquireResult::kBusy;
+        }
+        if (!lifecycle_fence->registered || lifecycle_fence->generation != token.lifecycle_generation) {
+            return CleanupLeaseAcquireResult::kStale;
+        }
+        std::lock_guard<std::mutex> state_lock(lifecycle_fence->state_mutex);
+        const auto &state = lifecycle_fence->snapshot_state;
+        if (!state.strict_query_visibility || state.committed != token.committed_version ||
+            state.attempt_epoch != token.snapshot_attempt_epoch) {
+            return CleanupLeaseAcquireResult::kStale;
+        }
+        out_lease = std::move(lease);
+        return CleanupLeaseAcquireResult::kAcquired;
+    }
+    case MaintenanceCleanupReason::kDownHost:
+        return AcquireDownLifecycleCleanupLease(token.reporter_key, token.lifecycle_generation, out_lease);
+    case MaintenanceCleanupReason::kRecoveryAbsentHost: {
+        // A queued token may outlive a dynamic disable/re-enable, which starts
+        // a fresh recovery window. The Executor pins backend availability
+        // before this final check, so SetAvailable(true) cannot reset the
+        // deadline between this check and the metadata mutation.
+        if (NowMillis() < maintenance_recovery_deadline_ms_.load(std::memory_order_acquire)) {
+            return CleanupLeaseAcquireResult::kBusy;
+        }
+        uint64_t generation = 0;
+        const auto lease_result = AcquireAbsentReporterCleanupLease(token.reporter_key, generation, out_lease);
+        if (lease_result == CleanupLeaseAcquireResult::kAcquired && generation != token.lifecycle_generation) {
+            out_lease.reset();
+            return CleanupLeaseAcquireResult::kStale;
+        }
+        return lease_result;
+    }
+    }
+    return CleanupLeaseAcquireResult::kStale;
+}
+
 bool EventReportBackend::CommitSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version) {
     if (!SnapshotUriUtils::IsValidSnapshotVersionToken(version)) {
         return false;
     }
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto it = snapshot_versions_.find(reporter_key);
-    if (it == snapshot_versions_.end() || it->second.in_flight != version) {
+    const auto lifecycle_fence = FindLifecycleFence(reporter_key);
+    if (!lifecycle_fence) {
         return false;
     }
-    if (!it->second.committed.empty()) {
-        snapshot_token_owners_.erase(it->second.committed);
+    std::unique_lock<std::mutex> lock(lifecycle_fence->state_mutex);
+    auto &state = lifecycle_fence->snapshot_state;
+    if (state.in_flight != version) {
+        return false;
     }
-    it->second.committed = version;
-    it->second.in_flight.clear();
-    it->second.last_commit_ms = NowMillis();
-    it->second.strict_query_visibility = true;
-    snapshot_token_owners_[version] = reporter_key;
+    ReleaseSnapshotVersionToken(reporter_key, state.committed);
+    state.committed = version;
+    state.in_flight.clear();
+    state.last_commit_ms = NowMillis();
+    state.strict_query_visibility = true;
     lock.unlock();
-    snapshot_state_cv_.notify_all();
+    lifecycle_fence->snapshot_state_cv.notify_all();
     return true;
 }
 
@@ -1245,24 +1566,37 @@ void EventReportBackend::AbortSnapshotVersion(const ReporterSnapshotKey &reporte
         reporter_key.host_ip_port.empty()) {
         return;
     }
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto it = snapshot_versions_.find(reporter_key);
-    if (it != snapshot_versions_.end() && it->second.in_flight == version) {
-        it->second.in_flight.clear();
+    // Cleanup retains a shared lifecycle lease from final token validation
+    // through metadata deletion. Abort changes strict visibility and therefore
+    // must take the matching writer; otherwise an already-authorized cleanup
+    // could delete while the Reporter has moved into soft visibility.
+    const auto lifecycle_fence = FindLifecycleFence(reporter_key);
+    if (!lifecycle_fence) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lifecycle_lock(lifecycle_fence->mutex);
+    std::unique_lock<std::mutex> lock(lifecycle_fence->state_mutex);
+    auto &state = lifecycle_fence->snapshot_state;
+    if (state.in_flight == version) {
+        state.in_flight.clear();
         // Candidate metadata is written in place. Once an admitted attempt
         // aborts, accepting only committed could hide locations already
         // replaced with the failed candidate. Stay soft until a later
         // successful complete snapshot restores an authoritative fence.
-        it->second.strict_query_visibility = false;
+        state.strict_query_visibility = false;
+        ReleaseSnapshotVersionToken(reporter_key, version);
         lock.unlock();
-        snapshot_state_cv_.notify_all();
+        lifecycle_fence->snapshot_state_cv.notify_all();
     }
 }
 
 std::string EventReportBackend::GetSnapshotVersion(const ReporterSnapshotKey &reporter_key) const {
-    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto it = snapshot_versions_.find(reporter_key);
-    return it == snapshot_versions_.end() ? std::string{} : it->second.committed;
+    const auto lifecycle_fence = FindLifecycleFence(reporter_key);
+    if (!lifecycle_fence) {
+        return {};
+    }
+    std::unique_lock<std::mutex> lock(lifecycle_fence->state_mutex);
+    return lifecycle_fence->snapshot_state.committed;
 }
 
 void EventReportBackend::GetSnapshotVersionTokens(const ReporterSnapshotKey &reporter_key,
@@ -1270,12 +1604,13 @@ void EventReportBackend::GetSnapshotVersionTokens(const ReporterSnapshotKey &rep
                                                   std::string &out_in_flight) const {
     out_committed.clear();
     out_in_flight.clear();
-    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
-    const auto it = snapshot_versions_.find(reporter_key);
-    if (it != snapshot_versions_.end()) {
-        out_committed = it->second.committed;
-        out_in_flight = it->second.in_flight;
+    const auto lifecycle_fence = FindLifecycleFence(reporter_key);
+    if (!lifecycle_fence) {
+        return;
     }
+    std::lock_guard<std::mutex> lock(lifecycle_fence->state_mutex);
+    out_committed = lifecycle_fence->snapshot_state.committed;
+    out_in_flight = lifecycle_fence->snapshot_state.in_flight;
 }
 
 bool EventReportBackend::GetQueryVisibilityState(const ReporterSnapshotKey &reporter_key,
@@ -1296,11 +1631,10 @@ bool EventReportBackend::GetQueryVisibilityState(const ReporterSnapshotKey &repo
         !node_it->second->available.load(std::memory_order_relaxed)) {
         return false;
     }
-    const auto state_it = snapshot_versions_.find(reporter_key);
-    if (state_it != snapshot_versions_.end()) {
-        out_strict = state_it->second.strict_query_visibility;
-        out_committed = state_it->second.committed;
-    }
+    const auto &lifecycle_fence = *node_it->second->lifecycle_fence;
+    std::lock_guard<std::mutex> state_lock(lifecycle_fence.state_mutex);
+    out_strict = lifecycle_fence.snapshot_state.strict_query_visibility;
+    out_committed = lifecycle_fence.snapshot_state.committed;
     return true;
 }
 
@@ -1319,20 +1653,24 @@ void EventReportBackend::GetQueryVisibilitySnapshot(const std::string &instance_
         if (!node || !node->available.load(std::memory_order_relaxed)) {
             continue;
         }
+        const auto &lifecycle_fence = *node->lifecycle_fence;
         QueryVisibilityState state;
-        const auto version_it = snapshot_versions_.find({instance_id, host_ip_port});
-        if (version_it != snapshot_versions_.end()) {
-            state.strict = version_it->second.strict_query_visibility;
-            state.committed_version = version_it->second.committed;
+        {
+            std::lock_guard<std::mutex> state_lock(lifecycle_fence.state_mutex);
+            state.strict = lifecycle_fence.snapshot_state.strict_query_visibility;
+            state.committed_version = lifecycle_fence.snapshot_state.committed;
         }
         out_snapshot.emplace(host_ip_port, std::move(state));
     }
 }
 
 uint64_t EventReportBackend::GetSnapshotAttemptEpoch(const ReporterSnapshotKey &reporter_key) const {
-    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
-    const auto it = snapshot_versions_.find(reporter_key);
-    return it == snapshot_versions_.end() ? 0 : it->second.attempt_epoch;
+    const auto lifecycle_fence = FindLifecycleFence(reporter_key);
+    if (!lifecycle_fence) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(lifecycle_fence->state_mutex);
+    return lifecycle_fence->snapshot_state.attempt_epoch;
 }
 
 void EventReportBackend::SetSnapshotMinIntervalMsForTest(int64_t interval_ms) {

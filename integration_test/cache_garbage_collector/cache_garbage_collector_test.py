@@ -116,8 +116,8 @@ class CacheGarbageCollectorTest(TestBase, unittest.TestCase):
             "GC rounds must stop after leader demotion",
         )
 
-    def test_cached_metadata_gc_uses_persistent_backend(self):
-        """Dual-backend GC finds and removes an orphan through persistent metadata."""
+    def test_cached_metadata_gc_scans_recovered_cache(self):
+        """Dual-backend recovery makes an orphan visible to the in-memory GC scan."""
         self._create_topology(meta_storage_type="cached")
         instance_id = "cache_gc_cached_instance"
         self._register_instance(instance_id)
@@ -155,7 +155,7 @@ class CacheGarbageCollectorTest(TestBase, unittest.TestCase):
         rewritten = self._start_write(instance_id, self._block_key)
         self.assertTrue(
             rewritten.get("locations"),
-            "persistent orphan should be collected in cached metadata mode",
+            "orphan restored into cached metadata should be collected",
         )
 
     def test_missing_serving_data_is_collected_without_query(self):
@@ -214,8 +214,113 @@ class CacheGarbageCollectorTest(TestBase, unittest.TestCase):
             "missing SERVING metadata should be removed and become writable",
         )
 
+    def test_event_report_host_down_is_collected_by_shared_round(self):
+        """HOST_DOWN is reconciled by the regular metadata scan."""
+        self.worker_manager.stop_worker(0)
+        self.assertTrue(
+            self.worker_manager.start_worker(
+                0,
+                **{
+                    "kvcm.cache_gc.enabled": "true",
+                    "kvcm.cache_gc.event_report_cleanup_enabled": "true",
+                    "kvcm.cache_gc.scan_interval_ms": 25,
+                    "kvcm.cache_gc.round_pause_ms": 100,
+                    "kvcm.cache_gc.scan_batch_size": 8,
+                    "kvcm.cache_gc.event_report_action_batch_size": 8,
+                    "kvcm.cache_gc.orphan_writing_grace_period_ms": self._GRACE_MS,
+                    "kvcm.cache_gc.max_inflight_delete_requests": 2,
+                },
+            )
+        )
+        self._admin_client.close()
+        self._client.close()
+        self._admin_client, self._client = self._get_manager_clients()
+
+        event_storage_name = "cache_gc_event_report"
+        self._admin_client.add_storage(
+            {
+                "trace_id": f"{self._trace_id}_event_storage",
+                "storage": {
+                    "global_unique_name": event_storage_name,
+                    "storage_type": "ST_EVENT_REPORT_L2",
+                    "event_report": {
+                        # Keep recovery fencing observable without making the
+                        # smoke test wait for production-scale grace.
+                        "heartbeat_timeout_ms": 1_000,
+                        "cleanup_grace_ms": 1_000,
+                        "liveness_check_interval_ms": 100,
+                    },
+                    "check_storage_available_when_open": False,
+                },
+            }
+        )
+        self._create_topology(
+            event_report_storage_candidates=[event_storage_name]
+        )
+        instance_id = "cache_gc_event_report_instance"
+        self._register_instance(instance_id)
+        host = "192.168.80.1:8080"
+        location_uri = f"vineyard://{host}/mem?source=cache_gc_e2e"
+        self._client.report_event(
+            {
+                "trace_id": f"{self._trace_id}_event_add",
+                "instance_id": instance_id,
+                "host_ip_port": host,
+                "storage_type": "ST_EVENT_REPORT_L2",
+                "events": [
+                    {
+                        "event_type": "EVENT_NODE_REGISTER",
+                        "node_register": {"mediums": ["mem"]},
+                    },
+                    {
+                        "event_type": "EVENT_BLOCK_ADD",
+                        "block_add": {
+                            "block_key": str(self._block_key),
+                            "medium": "mem",
+                            "specs": [{"name": "tp0", "uri": location_uri}],
+                        },
+                    },
+                ],
+            }
+        )
+        visible = self._client.get_cache_location(
+            {
+                "trace_id": f"{self._trace_id}_event_visible",
+                "instance_id": instance_id,
+                "query_type": "QT_BATCH_GET",
+                "block_keys": [self._block_key],
+                "block_mask": {"offset": 0},
+            }
+        )
+        self.assertTrue(visible.get("locations"))
+
+        self._client.report_event(
+            {
+                "trace_id": f"{self._trace_id}_event_down",
+                "instance_id": instance_id,
+                "host_ip_port": host,
+                "storage_type": "ST_EVENT_REPORT_L2",
+                "events": [
+                    {"event_type": "EVENT_HOST_DOWN", "host_down": {}}
+                ],
+            }
+        )
+        self._wait_metric_at_least(
+            "cache_gc.event_report_delete_location_count",
+            1,
+            tags={"reason": "down_host", "status": "deleted"},
+            timeout_s=10,
+        )
+        self.assertGreaterEqual(
+            self._metric_value("cache_gc.scan_key_count"), 1
+        )
+        self.assertEqual(1, self._metric_value("cache_gc.delete_target_count"))
+
     def _create_topology(
-        self, meta_storage_type="dummy", data_storage_type="nfs"
+        self,
+        meta_storage_type="dummy",
+        data_storage_type="nfs",
+        event_report_storage_candidates=None,
     ):
         metadata_uri = (
             f"file://{self.get_workdir()}/cache_gc_metadata"
@@ -247,6 +352,9 @@ class CacheGarbageCollectorTest(TestBase, unittest.TestCase):
                 "instance_group": {
                     "name": self._group_name,
                     "storage_candidates": [self._storage_name],
+                    "event_report_storage_candidates": (
+                        event_report_storage_candidates or []
+                    ),
                     "global_quota_group_name": "cache_gc_quota",
                     "max_instance_count": 8,
                     "quota": {

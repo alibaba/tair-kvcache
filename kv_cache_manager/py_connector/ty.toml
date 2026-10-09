@@ -1,0 +1,26 @@
+# Type-check config for the kv_cache_manager Python connectors.
+# Scope: this directory only; run ty from here (`cd kv_cache_manager/py_connector && ty check`)
+# so that this file and the relative paths below resolve as intended.
+#
+# The Python environment is pinned to the repository-root `.venv` (see
+# README.md "Type environment" for how to build it): the checks and the
+# annotations target vLLM 0.26.0's types, and a pinned environment keeps
+# them reproducible regardless of any activated virtualenv.
+[environment]
+extra-paths = ["../.."]
+python = "../../.venv"
+
+# Several inline ignores are deliberately state-dependent: a fresh source
+# checkout and a built worktree resolve different module sets (the
+# build-generated _version_info, the compiled kvcm_py_client, older-vLLM
+# compatibility branches). Reporting unused ignores would make the gate
+# depend on the build state, so the notice is off.
+[rules]
+unused-ignore-comment = "ignore"
+
+# Triton kernels: ty cannot model the @triton.jit DSL -- constexpr
+# parameters, their defaults, and launch options such as num_warps all
+# surface as argument-type noise. Suppress only those rule classes here.
+[[overrides]]
+include = ["kernel/**"]
+rules = { invalid-argument-type = "ignore", invalid-parameter-default = "ignore", unknown-argument = "ignore" }

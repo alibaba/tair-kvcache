@@ -12,6 +12,33 @@ namespace {
 struct OSException {
     int errcode;
 };
+
+struct PyRegistSpan {
+    kvcm::RegistSpan span;
+    int fd{-1};
+    py::object owner{py::none()};
+
+    void set_base_as_uint64(uint64_t base_ptr) { span.set_base_as_uint64(base_ptr); }
+    uint64_t base_as_uint64() const { return span.base_as_uint64(); }
+    void set_size(size_t size) { span.size = size; }
+    size_t size() const { return span.size; }
+};
+
+struct PyInitParams {
+    kvcm::RoleType role_type{kvcm::RoleType::UNKNOWN};
+    std::shared_ptr<PyRegistSpan> regist_span;
+    std::string self_location_spec_name;
+    std::string storage_configs;
+
+    kvcm::InitParams ToCpp() const {
+        kvcm::InitParams params;
+        params.role_type = role_type;
+        params.regist_span = regist_span == nullptr ? nullptr : &regist_span->span;
+        params.self_location_spec_name = self_location_spec_name;
+        params.storage_configs = storage_configs;
+        return params;
+    }
+};
 } // namespace
 
 PYBIND11_MODULE(kvcm_py_client, module) {
@@ -95,17 +122,19 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .def(py::init<>())
         .def_readwrite("iovs", &kvcm::BlockBuffer::iovs);
 
-    py::class_<kvcm::RegistSpan, py::smart_holder>(module, "RegistSpan")
+    py::class_<PyRegistSpan, py::smart_holder>(module, "RegistSpan")
         .def(py::init<>())
-        .def_property("base", &kvcm::RegistSpan::base_as_uint64, &kvcm::RegistSpan::set_base_as_uint64)
-        .def_readwrite("size", &kvcm::RegistSpan::size);
+        .def_property("base", &PyRegistSpan::base_as_uint64, &PyRegistSpan::set_base_as_uint64)
+        .def_property("size", &PyRegistSpan::size, &PyRegistSpan::set_size)
+        .def_readwrite("fd", &PyRegistSpan::fd)
+        .def_readwrite("owner", &PyRegistSpan::owner);
 
-    py::class_<kvcm::InitParams, py::smart_holder>(module, "InitParams")
+    py::class_<PyInitParams, py::smart_holder>(module, "InitParams")
         .def(py::init<>())
-        .def_readwrite("role_type", &kvcm::InitParams::role_type)
-        .def_readwrite("regist_span", &kvcm::InitParams::regist_span)
-        .def_readwrite("self_location_spec_name", &kvcm::InitParams::self_location_spec_name)
-        .def_readwrite("storage_configs", &kvcm::InitParams::storage_configs);
+        .def_readwrite("role_type", &PyInitParams::role_type)
+        .def_readwrite("regist_span", &PyInitParams::regist_span)
+        .def_readwrite("self_location_spec_name", &PyInitParams::self_location_spec_name)
+        .def_readwrite("storage_configs", &PyInitParams::storage_configs);
 
     py::class_<kvcm::ForwardContext, py::smart_holder>(module, "ForwardContext")
         .def(py::init<>())
@@ -122,8 +151,36 @@ PYBIND11_MODULE(kvcm_py_client, module) {
     // 保留这些类型定义以支持C++接口，但使用Python原生类型进行交互
 
     // 绑定TransferClient类
-    py::class_<kvcm::TransferClient, py::smart_holder>(module, "TransferClient")
-        .def_static("Create", &kvcm::TransferClient::Create, py::call_guard<py::gil_scoped_release>())
+    py::class_<kvcm::TransferClient, py::smart_holder>(module, "TransferClient", py::dynamic_attr())
+        .def_static(
+            "Create",
+            [](const std::string &client_config, const PyInitParams &py_init_params) -> py::object {
+                auto init_params = py_init_params.ToCpp();
+                auto captured_span = py_init_params.regist_span;
+                py::object captured_owner = captured_span == nullptr ? py::none() : captured_span->owner;
+                std::unique_ptr<kvcm::TransferClient> client;
+                {
+                    py::gil_scoped_release release;
+                    if (captured_span != nullptr && captured_span->fd != -1) {
+                        kvcm::SharedMemoryRegistration registration;
+                        registration.base = captured_span->span.base;
+                        registration.size = captured_span->span.size;
+                        registration.fd = captured_span->fd;
+                        client = kvcm::TransferClient::Create(client_config, init_params, registration);
+                    } else {
+                        client = kvcm::TransferClient::Create(client_config, init_params);
+                    }
+                }
+                if (client == nullptr) {
+                    return py::none();
+                }
+                auto py_client = py::cast(std::move(client));
+                py_client.attr("_regist_span") = py::cast(captured_span);
+                py_client.attr("_regist_span_owner") = captured_owner;
+                return py_client;
+            },
+            py::arg("client_config"),
+            py::arg("init_params"))
         .def("LoadKvCaches",
              &kvcm::TransferClient::LoadKvCaches,
              py::arg("uri_str_vec"),

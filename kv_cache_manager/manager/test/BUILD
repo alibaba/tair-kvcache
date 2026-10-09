@@ -12,6 +12,8 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_reclaimer",
         "//kv_cache_manager/manager:migration_manager",
+        "//kv_cache_manager/meta:meta_local_backend",
+        "//kv_cache_manager/meta:meta_storage_backend_manager",
         "@cpp_stub",
     ],
 )
@@ -29,6 +31,18 @@ cc_test(
         "//kv_cache_manager/manager:cache_garbage_collector",
         "//kv_cache_manager/manager:migration_manager",
         "@cpp_stub",
+    ],
+)
+
+cc_test(
+    name = "EventReportCleanupUtilTest",
+    srcs = ["event_report_cleanup_util_test.cc"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/manager:cache_garbage_collector",
+        "//kv_cache_manager/meta:cache_location",
     ],
 )
 
@@ -170,6 +184,7 @@ cc_test(
         "redis",
     ],
     deps = [
+        "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:meta_searcher",
         "//kv_cache_manager/meta",

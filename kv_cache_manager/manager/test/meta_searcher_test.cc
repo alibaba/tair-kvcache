@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <filesystem>
 #include <future>
 #include <limits>
@@ -208,6 +209,64 @@ private:
     std::optional<KeyType> get_locations_failed_key_;
 };
 
+class MaintenanceBarrierBackend : public MetaLocalBackend {
+public:
+    void QueueReplacement(KeyType key, CacheLocationConstPtr location) {
+        pending_key_ = key;
+        pending_location_ = std::move(location);
+    }
+
+    void ResetEvents() {
+        events_.clear();
+        sync_call_count_ = 0;
+    }
+
+    void FailSyncCall(size_t call_index) { fail_sync_call_ = call_index; }
+
+    const std::vector<std::string> &Events() const { return events_; }
+
+    bool Sync(const KeyTypeVec & /*keys*/) noexcept override {
+        events_.push_back("sync");
+        ++sync_call_count_;
+        if (!pending_location_) {
+            return sync_call_count_ != fail_sync_call_;
+        }
+        CacheLocationMapVector locations(1);
+        locations.front().emplace(pending_location_->id(), pending_location_);
+        PropertyMapVector properties(1);
+        const auto results = MetaLocalBackend::Upsert(nullptr, {pending_key_}, locations, properties);
+        pending_location_.reset();
+        return results.size() == 1 && results.front() == EC_OK && sync_call_count_ != fail_sync_call_;
+    }
+
+    std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *request_context,
+                                                                   const KeyTypeVec &keys,
+                                                                   const LocationIdsPerKey &location_ids,
+                                                                   LocationsPerKey &out_locations) noexcept override {
+        events_.push_back("read");
+        return MetaLocalBackend::GetLocationsForMaintenance(request_context, keys, location_ids, out_locations);
+    }
+
+    std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         const LocationIdsPerKey &location_ids) noexcept override {
+        events_.push_back("delete_locations");
+        return MetaLocalBackend::DeleteLocationsForMaintenance(request_context, keys, location_ids);
+    }
+
+    std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override {
+        events_.push_back("delete_key");
+        return MetaLocalBackend::Delete(request_context, keys);
+    }
+
+private:
+    KeyType pending_key_{0};
+    CacheLocationConstPtr pending_location_;
+    std::vector<std::string> events_;
+    size_t sync_call_count_{0};
+    size_t fail_sync_call_{0};
+};
+
 class RecordingGetLocationsBackend : public MetaLocalBackend {
 public:
     std::vector<ErrorCode> GetLocations(RequestContext *request_context,
@@ -375,6 +434,30 @@ public:
         meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
         meta_indexer_->backend_manager_->cache_backend_.reset();
         return backend_raw;
+    }
+
+    MaintenanceBarrierBackend *ReplaceWithMaintenanceBarrierBackend() {
+        auto backend_config = ConstructMetaStorageBackendConfig();
+        auto backend = std::make_unique<MaintenanceBarrierBackend>();
+        EXPECT_EQ(EC_OK, backend->Init("test", backend_config));
+        EXPECT_EQ(EC_OK, backend->Open());
+        auto backend_raw = backend.get();
+        meta_indexer_->backend_manager_->persistent_backend_->Close();
+        meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
+        meta_indexer_->backend_manager_->cache_backend_.reset();
+        return backend_raw;
+    }
+
+    MaintenanceBarrierBackend *ReplaceWithCachedMaintenanceBarrierBackend() {
+        auto *backend = ReplaceWithMaintenanceBarrierBackend();
+        auto cache_config = ConstructMetaStorageBackendConfig();
+        auto cache = std::make_unique<MetaLocalBackend>();
+        EXPECT_EQ(EC_OK, cache->Init("test", cache_config));
+        EXPECT_EQ(EC_OK, cache->Open());
+        meta_indexer_->backend_manager_->cache_backend_ = std::move(cache);
+        meta_indexer_->backend_manager_->recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning,
+                                                              std::memory_order_release);
+        return backend;
     }
 
     RecordingGetLocationsBackend *ReplaceWithRecordingGetLocationsBackend() {
@@ -1955,6 +2038,172 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
     EXPECT_EQ(7u, validated_size);
 }
 
+TEST_F(MetaSearcherTest, TestMaintenanceDeleteSyncsPendingWriteBeforeExpectedValueRead) {
+    auto *backend = ReplaceWithMaintenanceBarrierBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 10027;
+    const std::string location_id = "kvs#event_report_l2#mem#barrier:8080";
+    auto make_location = [&location_id](const std::string &source) {
+        auto location = std::make_shared<CacheLocation>();
+        location->set_id(location_id);
+        location->set_status(CLS_SERVING);
+        location->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+        location->set_spec_size(1);
+        location->set_location_specs(
+            {LocationSpec("linear_0", "event_report://barrier:8080/mem?source=" + source + "&size=7")});
+        return location;
+    };
+
+    const auto old_location = make_location("old");
+    CacheLocationMapVector initial_locations(1);
+    initial_locations.front().emplace(location_id, old_location);
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {key}, initial_locations, properties).ec);
+
+    const auto new_location = make_location("new");
+    backend->QueueReplacement(key, new_location);
+    backend->ResetEvents();
+
+    std::vector<std::vector<ErrorCode>> delete_results;
+    EXPECT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocations(request_context_.get(),
+                                                   {key},
+                                                   {{location_id}},
+                                                   delete_results,
+                                                   {{old_location->ToJsonString()}},
+                                                   false,
+                                                   false,
+                                                   true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), delete_results);
+    EXPECT_EQ((std::vector<std::string>{"sync", "read"}), backend->Events());
+
+    LocationsPerKey current_locations;
+    const auto current_results = backend->MetaLocalBackend::GetLocationsForMaintenance(
+        request_context_.get(), {key}, {{location_id}}, current_locations);
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), current_results);
+    ASSERT_EQ(1u, current_locations.size());
+    ASSERT_EQ(1u, current_locations.front().size());
+    ASSERT_TRUE(current_locations.front().front());
+    EXPECT_EQ(new_location->ToJsonString(), current_locations.front().front()->ToJsonString());
+}
+
+TEST_F(MetaSearcherTest, TestMaintenanceDeleteSyncsAcceptedDeleteBeforeShardFenceRelease) {
+    auto *backend = ReplaceWithMaintenanceBarrierBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 10028;
+    const std::string location_id = "kvs#event_report_l2#mem#post-barrier:8080";
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id(location_id);
+    location->set_status(CLS_SERVING);
+    location->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    location->set_spec_size(1);
+    location->set_location_specs(
+        {LocationSpec("linear_0", "event_report://post-barrier:8080/mem?source=current&size=7")});
+    CacheLocationMapVector initial_locations(1);
+    initial_locations.front().emplace(location_id, location);
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {key}, initial_locations, properties).ec);
+    backend->ResetEvents();
+
+    std::vector<std::vector<ErrorCode>> delete_results;
+    EXPECT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocations(request_context_.get(),
+                                                   {key},
+                                                   {{location_id}},
+                                                   delete_results,
+                                                   {{location->ToJsonString()}},
+                                                   false,
+                                                   false,
+                                                   true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
+    EXPECT_EQ((std::vector<std::string>{"sync", "read", "delete_key", "sync"}), backend->Events());
+}
+
+TEST_F(MetaSearcherTest, TestCachedMaintenanceDeleteUsesHotMutationInsteadOfPostSync) {
+    auto *backend = ReplaceWithCachedMaintenanceBarrierBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 10130;
+    const std::string location_id = "kvs#event_report_l2#mem#cached-barrier:8080";
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id(location_id);
+    location->set_status(CLS_SERVING);
+    location->set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    location->set_spec_size(1);
+    location->set_location_specs(
+        {LocationSpec("linear_0", "event_report://cached-barrier:8080/mem?source=current&size=7")});
+    CacheLocationMapVector initial_locations(1);
+    initial_locations.front().emplace(location_id, location);
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {key}, initial_locations, properties).ec);
+    backend->ResetEvents();
+
+    std::vector<std::vector<ErrorCode>> delete_results;
+    EXPECT_EQ(EC_OK,
+              meta_searcher_->BatchDeleteLocations(request_context_.get(),
+                                                   {key},
+                                                   {{location_id}},
+                                                   delete_results,
+                                                   {{location->ToJsonString()}},
+                                                   false,
+                                                   false,
+                                                   true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
+    EXPECT_EQ((std::vector<std::string>{"sync", "read", "delete_key"}), backend->Events());
+}
+
+TEST_F(MetaSearcherTest, TestMaintenanceDeleteAccountsAcceptedMutationWhenPostSyncFails) {
+    auto *backend = ReplaceWithMaintenanceBarrierBackend();
+    ASSERT_NE(nullptr, backend);
+
+    const KeyType key = 10029;
+    const std::string location_id = "kvs#event_report_l2#mem#post-sync-failure:8080";
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", "event_report://post-sync-failure:8080/mem?size=17")}},
+    }};
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, merge_tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    ASSERT_EQ(1u, meta_indexer_->GetKeyCount());
+    ASSERT_EQ(17u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps.front().count(location_id));
+    const std::string expected_value = location_maps.front().at(location_id)->ToJsonString();
+
+    backend->ResetEvents();
+    backend->FailSyncCall(2);
+    std::vector<std::vector<ErrorCode>> delete_results;
+    EXPECT_EQ(
+        EC_ERROR,
+        meta_searcher_->BatchDeleteLocations(
+            request_context_.get(), {key}, {{location_id}}, delete_results, {{expected_value}}, true, true, true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
+    EXPECT_EQ((std::vector<std::string>{"sync", "read", "delete_key", "sync"}), backend->Events());
+    EXPECT_EQ(0u, meta_indexer_->GetKeyCount());
+    EXPECT_EQ(0u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+
+    // The aggregate error asks the caller to retry. Once the accepted delete
+    // is visible, that retry converges as NOENT and must not account twice.
+    backend->FailSyncCall(0);
+    backend->ResetEvents();
+    EXPECT_EQ(
+        EC_OK,
+        meta_searcher_->BatchDeleteLocations(
+            request_context_.get(), {key}, {{location_id}}, delete_results, {{expected_value}}, true, true, true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_NOENT}}), delete_results);
+    EXPECT_EQ(0u, meta_indexer_->GetKeyCount());
+    EXPECT_EQ(0u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
 TEST_F(MetaSearcherTest, TestConditionalDeleteDoesNotRemoveRefreshedStableLocation) {
     const MetaSearcher::KeyVector keys = {10008};
     const std::string location_id = "kvs#event_report_l2#mem#127.0.0.8:8080";
@@ -1983,9 +2232,10 @@ TEST_F(MetaSearcherTest, TestConditionalDeleteDoesNotRemoveRefreshedStableLocati
 
     LocationIdsPerKey location_ids = {{location_id}};
     std::vector<std::vector<ErrorCode>> delete_results;
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->BatchDeleteLocations(
-                  request_context_.get(), keys, location_ids, delete_results, {{stale_expected_value}}));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchDeleteLocations(
+            request_context_.get(), keys, location_ids, delete_results, {{stale_expected_value}}, true, true, true));
     ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), delete_results);
 
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
@@ -1995,11 +2245,18 @@ TEST_F(MetaSearcherTest, TestConditionalDeleteDoesNotRemoveRefreshedStableLocati
 
     const std::string current_expected_value = location_maps[0].at(location_id)->ToJsonString();
     ASSERT_EQ(EC_BADARGS,
-              meta_searcher_->BatchDeleteLocations(
-                  request_context_.get(), keys, location_ids, delete_results, {{current_expected_value}, {}}));
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->BatchDeleteLocations(
-                  request_context_.get(), keys, location_ids, delete_results, {{current_expected_value}}));
+              meta_searcher_->BatchDeleteLocations(request_context_.get(),
+                                                   keys,
+                                                   location_ids,
+                                                   delete_results,
+                                                   {{current_expected_value}, {}},
+                                                   true,
+                                                   true,
+                                                   true));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchDeleteLocations(
+            request_context_.get(), keys, location_ids, delete_results, {{current_expected_value}}, true, true, true));
     ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
 
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
@@ -3217,10 +3474,8 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackClassifiesStates) {
 
     // batch: confirmed success / uncertain with id / failed without id / failed with a ghost id
     const KeyVector keys = {success_key, uncertain_key, no_id_key, ghost_key};
-    std::vector<MetaSearcher::AddLocationResult> add_results = {success_results[0],
-                                                                uncertain_results[0],
-                                                                {EC_ERROR, ""},
-                                                                {EC_ERROR, "ghost_location_id"}};
+    std::vector<MetaSearcher::AddLocationResult> add_results = {
+        success_results[0], uncertain_results[0], {EC_ERROR, ""}, {EC_ERROR, "ghost_location_id"}};
     MetaSearcher::AddLocationRollbackPlan plan;
     ASSERT_EQ(EC_OK, meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), keys, add_results, plan));
 
@@ -3234,10 +3489,82 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackClassifiesStates) {
     // uncertain metadata is deleted; confirmed-success metadata is left for the delete pipeline.
     std::vector<CacheLocationMap> location_maps;
     BlockMask mask;
-    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {success_key, uncertain_key}, mask, location_maps));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->BatchGetLocation(request_context_.get(), {success_key, uncertain_key}, mask, location_maps));
     ASSERT_EQ(2u, location_maps.size());
     EXPECT_EQ(1u, location_maps[0].count(success_results[0].location_id));
     EXPECT_TRUE(location_maps[1].empty());
+}
+
+TEST_F(MetaSearcherTest, TestMemoryPrimaryFailedAddFollowsPhaseWriteOrder) {
+    auto *backup = ReplaceWithRollbackFaultBackend();
+    auto local = std::make_unique<MetaLocalBackend>();
+    auto config = ConstructMetaStorageBackendConfig();
+    config->SetStorageUri("local://cache?capacity=1&num_shard_bits=0");
+    ASSERT_EQ(EC_OK, local->Init("test", config));
+    ASSERT_EQ(EC_OK, local->Open());
+    auto &manager = *meta_indexer_->backend_manager_;
+    manager.cache_backend_ = std::move(local);
+    manager.memory_primary_ = true;
+    manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    auto specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
+    specs[0].set_uri("file:///tmp/rollback?size=1&padding=" + std::string(2 * 1024 * 1024, 'x'));
+    auto location = std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs);
+    std::vector<MetaSearcher::AddLocationResult> added;
+    EXPECT_NE(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {42}, {location}, added));
+    ASSERT_EQ(1, added.size());
+    ASSERT_EQ(EC_NOSPC, added[0].ec);
+    ASSERT_FALSE(added[0].location_id.empty());
+    LocationsPerKey persistent;
+    // Recover retains the original persistent-first order. A local capacity
+    // failure here is a configuration error, not a supported degraded mode.
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}),
+              backup->GetLocations(nullptr, {42}, {{added[0].location_id}}, persistent));
+    manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    std::vector<MetaSearcher::AddLocationResult> running_added;
+    EXPECT_NE(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {43}, {location}, running_added));
+    ASSERT_EQ(EC_NOSPC, running_added[0].ec);
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_NOENT}}),
+              backup->GetLocations(nullptr, {43}, {{running_added[0].location_id}}, persistent));
+    backup->SetFailSync(true);
+    MetaSearcher::AddLocationRollbackPlan plan;
+    running_added.push_back({EC_ERROR, ""});
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), {43, 44}, running_added, plan));
+    // The Running failure never created a metadata reference, so the original
+    // Reconcile path can release both URIs without a persistence barrier.
+    EXPECT_THAT(plan.direct_delete_indices, testing::UnorderedElementsAre(0, 1));
+    EXPECT_EQ(0, meta_indexer_->GetKeyCount());
+}
+
+TEST_F(MetaSearcherTest, TestMemoryPrimaryDestructiveCasDoesNotSyncInsideRmw) {
+    auto *backup = ReplaceWithRollbackFaultBackend();
+    auto local = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, local->Init("test", ConstructMetaStorageBackendConfig()));
+    ASSERT_EQ(EC_OK, local->Open());
+    auto &manager = *meta_indexer_->backend_manager_;
+    manager.cache_backend_ = std::move(local);
+    manager.memory_primary_ = true;
+    auto location = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+    location->set_status(CLS_SERVING);
+    std::vector<MetaSearcher::AddLocationResult> added;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {42}, {location}, added));
+    const auto &id = added[0].location_id;
+    std::vector<std::vector<ErrorCode>> results;
+    backup->SetFailSync(true);
+    // Status CAS only commits metadata. SchedulePlanExecutor performs the
+    // Sync barrier after this RMW releases the shard lock.
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchCASLocationStatus(
+                  request_context_.get(), {42}, {{{id, CLS_WRITING, CLS_SERVING}}}, results));
+    const std::vector<std::vector<MetaSearcher::LocationCASTask>> tasks{{{id, CLS_SERVING, CLS_DELETING}}};
+    EXPECT_EQ(EC_OK, meta_searcher_->BatchCASLocationStatus(request_context_.get(), {42}, tasks, results, true));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+    CacheLocationMapVector maps;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.GetLocationsFromPrimary(nullptr, {42}, maps));
+    EXPECT_EQ(CLS_DELETING, maps[0].at(id)->status());
 }
 
 TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRejectsShapeMismatch) {
@@ -3247,8 +3574,7 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRejectsShapeMismatch) {
     plan.direct_delete_indices = {0};
 
     EXPECT_EQ(EC_BADARGS,
-              meta_searcher_->ReconcileAddLocationRollback(
-                  request_context_.get(), {1, 2}, {{EC_OK, "some_id"}}, plan));
+              meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), {1, 2}, {{EC_OK, "some_id"}}, plan));
     EXPECT_TRUE(plan.pipeline_keys.empty());
     EXPECT_TRUE(plan.pipeline_location_ids.empty());
     EXPECT_TRUE(plan.direct_delete_indices.empty());
@@ -3290,9 +3616,9 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRetainsUrisOnDeleteErro
 
     backend->SetGetLocationsFailedKey(uncertain_key);
     MetaSearcher::AddLocationRollbackPlan plan;
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->ReconcileAddLocationRollback(
-                  request_context_.get(), {uncertain_key}, uncertain_results, plan));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), {uncertain_key}, uncertain_results, plan));
     EXPECT_TRUE(plan.pipeline_keys.empty());
     EXPECT_TRUE(plan.direct_delete_indices.empty());
 
@@ -3322,9 +3648,9 @@ TEST_F(MetaSearcherTest, TestReconcileAddLocationRollbackRetainsUrisWhenSyncFail
 
     backend->SetFailSync(true);
     MetaSearcher::AddLocationRollbackPlan plan;
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->ReconcileAddLocationRollback(
-                  request_context_.get(), {uncertain_key}, uncertain_results, plan));
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->ReconcileAddLocationRollback(request_context_.get(), {uncertain_key}, uncertain_results, plan));
     EXPECT_TRUE(plan.pipeline_keys.empty());
     // metadata was deleted in memory but the delete could not be synced: retain the URI.
     EXPECT_TRUE(plan.direct_delete_indices.empty());
@@ -4052,6 +4378,25 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
 
 class BatchGetBestLocationByBackendTest : public MetaSearcherTest {
 protected:
+    void AddServingLocations(const MetaSearcher::KeyVector &keys, DataStorageType type, const std::string &uri) {
+        for (int64_t key : keys) {
+            auto location = MetaSearcherTestHelper::CreateCacheLocation(
+                type, 1, {MetaSearcherTestHelper::CreateLocationSpec("tp0", uri)});
+            std::vector<std::string> out_ids;
+            ASSERT_EQ(
+                ErrorCode::EC_OK,
+                BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), {key}, {location}, out_ids));
+            std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks = {{{out_ids[0], CLS_SERVING}}};
+            std::vector<std::vector<ErrorCode>> results;
+            ASSERT_EQ(ErrorCode::EC_OK,
+                      meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {key}, tasks, results));
+        }
+    }
+
+    void AddTairLocations(const MetaSearcher::KeyVector &keys) {
+        AddServingLocations(keys, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "tair://host_t:6379/tp0");
+    }
+
     void AddRequestedSpecMatrixEventReportPeer() {
         // The requested spec is deliberately the second spec in the first
         // and third locations. The middle key has the same reporter but only
@@ -4173,19 +4518,7 @@ protected:
         ASSERT_EQ(ec, ErrorCode::EC_OK);
 
         // Tair locations for all 5 keys
-        MetaSearcher::KeyVector tair_keys = {80000, 80001, 80002, 80003, 80004};
-        for (int64_t key : tair_keys) {
-            auto tair_loc = MetaSearcherTestHelper::CreateCacheLocation(
-                DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
-                1,
-                {MetaSearcherTestHelper::CreateLocationSpec("tp0", "tair://host_t:6379/tp0")});
-            std::vector<std::string> out_ids;
-            ec = BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), {key}, {tair_loc}, out_ids);
-            ASSERT_EQ(ec, ErrorCode::EC_OK);
-            std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks = {{{out_ids[0], CLS_SERVING}}};
-            std::vector<std::vector<ErrorCode>> results;
-            meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {key}, tasks, results);
-        }
+        AddTairLocations({80000, 80001, 80002, 80003, 80004});
         recording_backend_->ResetReadLog();
     }
 
@@ -4235,6 +4568,168 @@ TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageStrategy) {
         EXPECT_NE(out[i][0]->location_specs()[0].uri().find("peer_b"), std::string::npos);
     }
     EXPECT_TRUE(out[4].empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixComposesWithTairBaseHits) {
+    const MetaSearcher::KeyVector keys = {80004, 80000, 80001};
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors));
+
+    ASSERT_EQ(keys.size(), out.size());
+    ASSERT_EQ(1u, out[0].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[0][0]->type());
+    for (size_t key_index = 1; key_index < keys.size(); ++key_index) {
+        ASSERT_EQ(2u, out[key_index].size());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[key_index][0]->type());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, out[key_index][1]->type());
+        EXPECT_NE(out[key_index][1]->location_specs()[0].uri().find("peer_a"), std::string::npos);
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixComposesWithIndependentBackendsInEitherSelectorOrder) {
+    AddServingLocations(
+        {80004}, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "pace://host_s/tp0?size=1&media_type=5");
+    AddServingLocations(
+        {80004}, DataStorageType::DATA_STORAGE_TYPE_HF3FS, "hf3fs:///tmp/base-hit?offset=0&length=1&size=1");
+
+    const MetaSearcher::KeyVector keys = {80004, 80000, 80001};
+    for (const DataStorageType base_type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, DataStorageType::DATA_STORAGE_TYPE_HF3FS}) {
+        const std::vector<std::vector<BackendSelector>> selector_orders = {
+            {
+                {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+                {base_type, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+            },
+            {
+                {base_type, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+                {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+            },
+        };
+        for (const auto &selectors : selector_orders) {
+            LocationsPerKey out;
+            ASSERT_EQ(
+                ErrorCode::EC_OK,
+                meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors));
+
+            ASSERT_EQ(keys.size(), out.size());
+            ASSERT_EQ(1u, out[0].size());
+            EXPECT_EQ(base_type, out[0][0]->type());
+            for (size_t key_index = 1; key_index < keys.size(); ++key_index) {
+                ASSERT_EQ(1u, out[key_index].size());
+                EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, out[key_index][0]->type());
+                EXPECT_NE(out[key_index][0]->location_specs()[0].uri().find("peer_a"), std::string::npos);
+            }
+        }
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixDoesNotCountSpecFilteredLocationAsBaseHit) {
+    AddRequestedSpecMatrixEventReportPeer();
+    AddTairLocations({82000, 82001, 82002});
+
+    const MetaSearcher::KeyVector keys = {82000, 82001, 82002};
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(), keys, out, &policy_, selectors, {"linear_1", "linear_1", "linear_1"}));
+
+    ASSERT_EQ(keys.size(), out.size());
+    ASSERT_EQ(1u, out[0].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, out[0][0]->type());
+    EXPECT_TRUE(std::any_of(out[0][0]->location_specs().begin(),
+                            out[0][0]->location_specs().end(),
+                            [](const LocationSpec &spec) { return spec.name() == "linear_1"; }));
+    EXPECT_TRUE(out[1].empty());
+    EXPECT_TRUE(out[2].empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixPreservesV6DHitsBeforeUnfillableGap) {
+    const MetaSearcher::KeyVector keys = {80000, 85000, 80001};
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors));
+
+    ASSERT_EQ(keys.size(), out.size());
+    ASSERT_EQ(2u, out[0].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[0][0]->type());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, out[0][1]->type());
+    EXPECT_NE(out[0][1]->location_specs()[0].uri().find("peer_a"), std::string::npos);
+    EXPECT_TRUE(out[1].empty());
+    ASSERT_EQ(1u, out[2].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[2][0]->type());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageMaximizesHitsBeyondTairBase) {
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> upserts = {
+        {
+            {"kvs#event_report_l2#mem#peer_a:8080",
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CLS_SERVING,
+             {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
+        },
+        {
+            {"kvs#event_report_l2#mem#peer_a:8080",
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CLS_SERVING,
+             {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
+        },
+        {
+            {"kvs#event_report_l2#mem#peer_a:8080",
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CLS_SERVING,
+             {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
+            {"kvs#event_report_l2#mem#peer_b:8080",
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CLS_SERVING,
+             {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
+        },
+        {
+            {"kvs#event_report_l2#mem#peer_b:8080",
+             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+             CLS_SERVING,
+             {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
+        },
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchMergeLocationSpecs(
+                  request_context_.get(), {84000, 84001, 84002, 84003}, upserts, per_key_ec));
+    AddTairLocations({84000, 84001, 84002});
+
+    const MetaSearcher::KeyVector keys = {84000, 84001, 84002, 84003};
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors));
+
+    ASSERT_EQ(keys.size(), out.size());
+    ASSERT_EQ(1u, out[0].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[0][0]->type());
+    ASSERT_EQ(1u, out[1].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[1][0]->type());
+    ASSERT_EQ(2u, out[2].size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, out[2][0]->type());
+    EXPECT_NE(out[2][1]->location_specs()[0].uri().find("peer_b"), std::string::npos);
+    ASSERT_EQ(1u, out[3].size());
+    EXPECT_NE(out[3][0]->location_specs()[0].uri().find("peer_b"), std::string::npos);
 }
 
 TEST_F(BatchGetBestLocationByBackendTest, BlockMaskSkipsMetadataReadsAndPreservesOutputPositions) {

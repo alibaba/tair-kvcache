@@ -23,6 +23,9 @@ struct SingleLocationRmwScratch;
 //   * Dual-backend: persistent (source-of-truth) + cache (hot cache).
 //     Writes go persistent-first then cache; reads are cache-first,
 //     falling back to persistent during Recover.
+//     memory_primary keeps that write order during Recover, then makes local
+//     the ordinary-write primary after recovery; Redis remains the recovery
+//     source and backup.
 //   * Single-backend: persistent only (cache is null, no Recover).
 //
 // Callers must partition requests via MetaIndexer::MakeBatches and hold
@@ -71,8 +74,17 @@ public:
                                   const KeyVector &keys,
                                   const LocationIdsPerKey &location_ids,
                                   int32_t &out_reclaimed_count) noexcept;
+    std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
+                                                         const KeyVector &keys,
+                                                         const LocationIdsPerKey &location_ids,
+                                                         int32_t &out_reclaimed_count) noexcept;
+    ErrorCode
+    TrimPersistentOrphans(RequestContext *request_context, const KeyVector &keys, KeyVector &out_trimmed_keys) noexcept;
 
     // ----- Read APIs -----
+    std::vector<ErrorCode> GetLocationMapsForMaintenance(RequestContext *request_context,
+                                                         const KeyVector &keys,
+                                                         CacheLocationMapVector &out_locations) noexcept;
     std::vector<ErrorCode> Get(RequestContext *request_context,
                                const KeyVector &keys,
                                CacheLocationMapVector &out_locations,
@@ -86,19 +98,23 @@ public:
                                                     const KeyType *keys,
                                                     size_t key_count,
                                                     CompactLocationsPerKey &out_locations) noexcept;
-    // Read the source-of-truth backend directly without touching the hot cache.
-    // Maintenance admission uses this to revalidate a persistent scan result.
-    std::vector<ErrorCode> GetLocationsFromPersistent(RequestContext *request_context,
-                                                      const KeyVector &keys,
-                                                      CacheLocationMapVector &out_location_maps) noexcept;
+    // Read the runtime authority (local in memory-primary mode), without
+    // updating its access/LRU state, for maintenance admission.
+    std::vector<ErrorCode> GetLocationsFromPrimary(RequestContext *request_context,
+                                                   const KeyVector &keys,
+                                                   CacheLocationMapVector &out_location_maps) noexcept;
     // Refresh complete keys from persistent storage into the hot cache before
     // a maintenance RMW. The caller must hold the corresponding shard locks.
-    // In single-backend mode this is a no-op.
+    // Caller skips this in running memory-primary mode, under its shard lock.
     std::vector<ErrorCode> RefreshCacheFromPersistent(RequestContext *request_context, const KeyVector &keys) noexcept;
     std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
                                                      const KeyVector &keys,
                                                      const LocationIdsPerKey &location_ids,
                                                      LocationsPerKey &out_locations) noexcept;
+    std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *request_context,
+                                                                   const KeyVector &keys,
+                                                                   const LocationIdsPerKey &location_ids,
+                                                                   LocationsPerKey &out_locations) noexcept;
     std::vector<std::vector<ErrorCode>> GetLocationsWithKeyStatus(RequestContext *request_context,
                                                                   const KeyVector &keys,
                                                                   const LocationIdsPerKey &location_ids,
@@ -140,12 +156,28 @@ public:
                        const int64_t limit,
                        std::string &out_next_cursor,
                        KeyTypeVec &out_keys) noexcept;
+    ErrorCode ListPersistentKeys(RequestContext *request_context,
+                                 const std::string &cursor,
+                                 int64_t limit,
+                                 std::string &out_next_cursor,
+                                 KeyTypeVec &out_keys) noexcept;
+    // Scan the in-memory cache when dual-backend metadata is configured;
+    // single-backend deployments scan their only persistent backend.
     ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,
                                           const std::string &cursor,
                                           int64_t limit,
                                           MaintenanceScanBatch &out) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
     ErrorCode SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
+    ErrorCode SampleReclaimCandidates(RequestContext *request_context,
+                                      int64_t count,
+                                      ReclaimCandidateVector &out_candidates,
+                                      bool require_read_success = false) noexcept;
+    // Follow the same source selection as SampleReclaimCandidates: cached
+    // metadata is complete only after recovery, not merely when configured.
+    bool PreferSingleTaskReclaimSampling() const noexcept;
+    // Apply the maintenance yield only to a complete Local reclaim source.
+    size_t TouchKeysForMaintenance(const KeyTypeVec &keys) noexcept;
 
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
@@ -153,6 +185,16 @@ public:
     // Synchronously flush pending writes for the given keys to persistent storage.
     // Returns true on success, false on failure/timeout.
     bool Sync(const KeyVector &keys) noexcept;
+    bool SyncAll() noexcept;
+    bool SyncBeforeMaintenanceRead(const KeyVector &keys) noexcept { return memory_primary_ || Sync(keys); }
+    bool IsMemoryPrimary() const noexcept { return memory_primary_; }
+
+    // A persistent-only backend has no synchronous hot view that can expose an
+    // accepted maintenance delete to the next same-key RMW. Conservatively
+    // retain the trailing barrier there (it is a no-op for synchronous
+    // backends). Cached mode updates the hot view under the shard fence and
+    // preserves persistent write order, so it can unlock without that barrier.
+    bool RequiresMaintenancePostDeleteSync() const noexcept { return cache_backend_ == nullptr; }
 
     // Returns async write stats from persistent backend.
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
@@ -171,6 +213,18 @@ public:
     bool GetPureLocalCacheHashSeed(uint32_t &out_hash_seed) const noexcept;
 
 private:
+    struct WriteRoute {
+        MetaStorageBackend &primary;
+        MetaStorageBackend *secondary;
+        // When true, the local primary result is authoritative; the persistent
+        // secondary is a best-effort backup whose result does not fail the operation.
+        bool local_primary;
+    };
+    WriteRoute GetWriteRoute(bool local_primary) noexcept {
+        return {local_primary ? *cache_backend_ : *persistent_backend_,
+                local_primary ? persistent_backend_.get() : cache_backend_.get(),
+                local_primary};
+    }
     void AsyncRecoverTask() noexcept;
     int64_t BackfillKeysToCache(const KeyTypeVec &keys,
                                 const CacheLocationMapVector &locations,
@@ -187,10 +241,11 @@ private:
     int32_t MaybeReclaimEmptyKeys(RequestContext *request_context,
                                   const KeyVector &keys,
                                   const std::vector<ErrorCode> &delete_results) noexcept;
-
     std::string instance_id_;
     std::unique_ptr<MetaStorageBackend> persistent_backend_;
     std::unique_ptr<MetaCacheBaseBackend> cache_backend_;
+    bool memory_primary_ = false;
+    bool force_deleting_async_enqueue_ = true;
 
     std::atomic<RecoverState> recover_state_{RecoverState::kRecover};
     std::atomic<bool> is_closed_{false};

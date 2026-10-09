@@ -4,7 +4,9 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <new>
 #include <set>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -18,8 +20,10 @@
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/event_report_backend.h"
+#include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/manager/cache_garbage_collector.h"
-#include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -36,6 +40,8 @@ namespace {
 using InstanceGroups = std::vector<std::shared_ptr<const InstanceGroup>>;
 using InstanceInfos = std::vector<std::shared_ptr<const InstanceInfo>>;
 using SubmitAsyncLocation = AsyncDeleteSubmitResult (SchedulePlanExecutor::*)(const CacheLocationDelRequest &);
+using SubmitAsyncEventReport =
+    AsyncDeleteSubmitResult (SchedulePlanExecutor::*)(const EventReportMetadataDelRequest &);
 
 struct ScanResponse {
     ErrorCode ec{EC_OK};
@@ -47,6 +53,15 @@ struct MightExistCall {
     std::vector<DataStorageUri> uris;
     bool fastpath{false};
 };
+
+std::atomic<size_t> gc_action_warn_count{0};
+void CountGcActionWarnings(int level, const char *, int, const char *func, const char *, ...) {
+    if (level == Logger::LEVEL_WARN && std::string(func) == "PollInflightDeletes") {
+        ++gc_action_warn_count;
+    }
+}
+
+std::pair<size_t, std::string> ThrowScanSummaryStub(const std::map<std::string, size_t> &) { throw std::bad_alloc(); }
 
 enum class SubmitMode {
     kReadyOk,
@@ -99,6 +114,7 @@ std::set<std::string> missing_indexers;
 std::string active_instance_id;
 std::shared_ptr<MetaIndexer> dummy_indexer;
 std::vector<CacheLocationDelRequest> submitted_requests;
+std::vector<EventReportMetadataDelRequest> submitted_event_report_requests;
 SubmitMode submit_mode = SubmitMode::kReadyOk;
 std::shared_ptr<std::promise<PlanExecuteResult>> pending_delete_promise;
 std::vector<std::shared_ptr<std::promise<PlanExecuteResult>>> pending_delete_promises;
@@ -113,6 +129,9 @@ std::map<std::string, std::vector<bool>> might_exist_result_overrides;
 std::set<std::string> might_exist_throw_storages;
 std::set<std::string> missing_probe_storages;
 std::map<std::string, DataStorageType> probe_storage_type_overrides;
+std::map<std::string, std::shared_ptr<DataStorageBackend>> storage_backends;
+std::map<std::string, std::shared_ptr<const InstanceGroup>> group_configs;
+std::map<std::string, std::string> group_by_instance;
 std::atomic<bool> block_might_exist{false};
 std::atomic<bool> might_exist_block_entered{false};
 std::atomic<bool> release_might_exist{true};
@@ -139,12 +158,25 @@ std::shared_ptr<MetaIndexer> GetMetaIndexerStub(void *, const std::string &insta
 }
 
 std::shared_ptr<DataStorageBackend> GetDataStorageBackendStub(void *, const std::string &storage_name) {
+    if (const auto backend_it = storage_backends.find(storage_name); backend_it != storage_backends.end()) {
+        return backend_it->second;
+    }
     if (missing_probe_storages.count(storage_name) > 0) {
         return nullptr;
     }
     const auto it = probe_storage_type_overrides.find(storage_name);
     const auto type = it == probe_storage_type_overrides.end() ? DataStorageType::DATA_STORAGE_TYPE_DUMMY : it->second;
     return std::make_shared<ProbeTestBackend>(type);
+}
+
+std::shared_ptr<const InstanceGroup> GetInstanceGroupConfigStub(void *, const std::string &group_name) {
+    const auto it = group_configs.find(group_name);
+    return it == group_configs.end() ? nullptr : it->second;
+}
+
+std::string GetInstanceGroupNameStub(void *, const std::string &instance_id) {
+    const auto it = group_by_instance.find(instance_id);
+    return it == group_by_instance.end() ? std::string{} : it->second;
 }
 
 ErrorCode ScanLocationsForMaintenanceStub(
@@ -200,8 +232,35 @@ AsyncDeleteSubmitResult SubmitAsyncStub(void *, const CacheLocationDelRequest &r
     return {true, std::move(future)};
 }
 
+AsyncDeleteSubmitResult SubmitAsyncEventReportStub(void *, const EventReportMetadataDelRequest &request) {
+    submitted_event_report_requests.push_back(request);
+    if (submit_mode == SubmitMode::kThrow) {
+        throw std::runtime_error("injected SubmitAsync exception");
+    }
+    if (submit_mode == SubmitMode::kRejected) {
+        return {};
+    }
+    if (submit_mode == SubmitMode::kAcceptedInvalid) {
+        return {true, {}};
+    }
+
+    auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
+    auto future = promise->get_future();
+    if (submit_mode == SubmitMode::kPending) {
+        pending_delete_promise = promise;
+        pending_delete_promises.push_back(promise);
+    } else if (submit_mode == SubmitMode::kFutureException) {
+        promise->set_exception(std::make_exception_ptr(std::runtime_error("injected Future exception")));
+    } else if (submit_mode == SubmitMode::kReadyPartial) {
+        promise->set_value({EC_PARTIAL_OK, "injected partial"});
+    } else {
+        promise->set_value({EC_OK, ""});
+    }
+    return {true, std::move(future)};
+}
+
 MetaIndexer::Result
-GetLocationsFromPersistentErrorStub(void *, RequestContext *, const KeyVector &, CacheLocationMapVector &) noexcept {
+GetLocationsFromPrimaryErrorStub(void *, RequestContext *, const KeyVector &, CacheLocationMapVector &) noexcept {
     return MetaIndexer::Result(EC_ERROR);
 }
 
@@ -277,7 +336,11 @@ public:
         stub_.set(ADDR(MetaIndexer, ScanLocationsForMaintenance), ScanLocationsForMaintenanceStub);
         stub_.set(ADDR(DataStorageManager, GetDataStorageBackend), GetDataStorageBackendStub);
         stub_.set(ADDR(DataStorageManager, Exist), DataStorageExistStub);
+        stub_.set(ADDR(RegistryManager, GetInstanceGroupConfig), GetInstanceGroupConfigStub);
+        stub_.set(ADDR(RegistryManager, GetInstanceGroupName), GetInstanceGroupNameStub);
         stub_.set(static_cast<SubmitAsyncLocation>(ADDR(SchedulePlanExecutor, SubmitAsync)), SubmitAsyncStub);
+        stub_.set(static_cast<SubmitAsyncEventReport>(ADDR(SchedulePlanExecutor, SubmitAsync)),
+                  SubmitAsyncEventReportStub);
 
         metrics_registry_ = std::make_shared<MetricsRegistry>();
         registry_manager_ = std::make_shared<RegistryManager>("", metrics_registry_);
@@ -298,6 +361,7 @@ public:
         missing_indexers.clear();
         active_instance_id.clear();
         submitted_requests.clear();
+        submitted_event_report_requests.clear();
         submit_mode = SubmitMode::kReadyOk;
         pending_delete_promise.reset();
         pending_delete_promises.clear();
@@ -312,6 +376,9 @@ public:
         might_exist_throw_storages.clear();
         missing_probe_storages.clear();
         probe_storage_type_overrides.clear();
+        storage_backends.clear();
+        group_configs.clear();
+        group_by_instance.clear();
         block_might_exist.store(false, std::memory_order_relaxed);
         might_exist_block_entered.store(false, std::memory_order_relaxed);
         release_might_exist.store(true, std::memory_order_relaxed);
@@ -336,12 +403,14 @@ public:
             auto group = std::make_shared<InstanceGroup>();
             group->set_name(group_name);
             instance_groups.push_back(group);
+            group_configs[group_name] = group;
         }
         auto instance = std::make_shared<InstanceInfo>();
         instance->set_instance_group_name(group_name);
         instance->set_instance_id(instance_id);
         instances_by_group[group_name].first = EC_OK;
         instances_by_group[group_name].second.push_back(instance);
+        group_by_instance[instance_id] = group_name;
     }
 
     CacheGarbageCollector::Config DefaultConfig() const {
@@ -350,6 +419,10 @@ public:
         config.scan_interval_ms = 1000;
         config.round_pause_ms = 1000;
         config.scan_batch_size = 2;
+        // Most fixture cases exercise regular GC only. EventReport-specific
+        // cases opt in explicitly even though the production default is on.
+        config.event_report_cleanup_enabled = false;
+        config.event_report_action_batch_size = 2;
         config.orphan_writing_grace_period_ms = kMinCacheGcOrphanWritingGracePeriodMs;
         return config;
     }
@@ -368,6 +441,23 @@ public:
         gc.RegisterMetrics();
         gc.ResetWorkerState();
         gc.stop_requested_.store(false);
+    }
+
+    std::shared_ptr<EventReportBackend>
+    AddEventReportBackend(const std::string &storage_name,
+                          DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5) {
+        auto spec = std::make_shared<EventReportStorageSpec>();
+        spec->set_snapshot_min_interval_ms(0);
+        // Keep liveness from changing fixture state during deterministic GC
+        // steps. Recovery-grace tests move the deadline explicitly.
+        spec->set_heartbeat_timeout_ms(60000);
+        spec->set_cleanup_grace_ms(60000);
+        auto backend = std::make_shared<EventReportBackend>(metrics_registry_);
+        EXPECT_EQ(EC_OK, backend->Open(StorageConfig(type, storage_name, spec), "test"));
+        storage_backends[storage_name] = backend;
+        auto group = std::const_pointer_cast<InstanceGroup>(group_configs.at("group_a"));
+        group->set_event_report_storage_candidates({storage_name});
+        return backend;
     }
 
     bool WaitForScanCallCount(size_t expected) const {
@@ -397,9 +487,11 @@ protected:
 TEST_F(CacheGarbageCollectorTest, ConfigAndRestartableLifecycle) {
     auto disabled_config = DefaultConfig();
     disabled_config.enabled = false;
+    disabled_config.event_report_cleanup_enabled = true;
     auto disabled_gc = MakeGc(disabled_config);
     EXPECT_EQ(EC_OK, disabled_gc->Start());
     EXPECT_FALSE(disabled_gc->IsRunning());
+    EXPECT_FALSE(disabled_gc->IsEventReportCleanupEnabled());
 
     auto invalid_config = DefaultConfig();
     invalid_config.orphan_writing_grace_period_ms = kMinCacheGcOrphanWritingGracePeriodMs - 1;
@@ -410,6 +502,27 @@ TEST_F(CacheGarbageCollectorTest, ConfigAndRestartableLifecycle) {
     invalid_config.max_inflight_delete_requests = 0;
     invalid_gc = MakeGc(invalid_config);
     EXPECT_EQ(EC_CONFIG_ERROR, invalid_gc->Validate());
+
+    auto zero_round_pause_config = DefaultConfig();
+    zero_round_pause_config.round_pause_ms = 0;
+    EXPECT_EQ(EC_OK, MakeGc(zero_round_pause_config)->Validate());
+
+    invalid_config = DefaultConfig();
+    invalid_config.round_pause_ms = -1;
+    invalid_gc = MakeGc(invalid_config);
+    EXPECT_EQ(EC_CONFIG_ERROR, invalid_gc->Validate());
+
+    invalid_config = DefaultConfig();
+    invalid_config.event_report_cleanup_enabled = true;
+    invalid_config.event_report_action_batch_size = 0;
+    invalid_gc = MakeGc(invalid_config);
+    EXPECT_EQ(EC_CONFIG_ERROR, invalid_gc->Validate());
+
+    invalid_config = DefaultConfig();
+    invalid_config.event_report_cleanup_enabled = true;
+    invalid_config.event_report_action_batch_size = invalid_config.scan_batch_size + 1;
+    invalid_gc = MakeGc(invalid_config);
+    EXPECT_EQ(EC_OK, invalid_gc->Validate());
 
     auto gc = MakeGc(DefaultConfig());
     ASSERT_EQ(EC_OK, gc->Start());
@@ -425,6 +538,616 @@ TEST_F(CacheGarbageCollectorTest, ConfigAndRestartableLifecycle) {
     EXPECT_TRUE(gc->IsRunning());
     gc->Stop();
     EXPECT_FALSE(gc->IsRunning());
+}
+
+TEST_F(CacheGarbageCollectorTest, StartRestoresFullEventReportRecoveryGraceAfterLeaderRecovery) {
+    auto spec = std::make_shared<EventReportStorageSpec>();
+    spec->set_heartbeat_timeout_ms(60000);
+    spec->set_cleanup_grace_ms(60000);
+    spec->set_liveness_check_interval_ms(60000);
+    const std::string storage_name = "event_report_recovery_grace";
+    RequestContext context("register_event_report_recovery_grace");
+    ASSERT_EQ(EC_OK,
+              data_storage_manager_->RegisterStorage(
+                  &context,
+                  storage_name,
+                  StorageConfig(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, storage_name, spec)));
+
+    std::shared_ptr<EventReportBackend> backend;
+    for (const auto &storage : data_storage_manager_->GetAvailableStorages()) {
+        if (storage && storage->GetStorageConfig().global_unique_name() == storage_name) {
+            backend = std::dynamic_pointer_cast<EventReportBackend>(storage);
+            break;
+        }
+    }
+    ASSERT_NE(nullptr, backend);
+    // Simulate a Backend opened before a long leader recovery. GC Start must
+    // grant Reporters a fresh registration/heartbeat window.
+    backend->maintenance_recovery_deadline_ms_.store(0, std::memory_order_release);
+    EXPECT_EQ(0, backend->GetMaintenanceRecoveryGraceRemainingMs());
+
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    config.scan_interval_ms = 60000;
+    auto gc = MakeGc(config);
+    ASSERT_EQ(EC_OK, gc->Start());
+    EXPECT_GT(backend->GetMaintenanceRecoveryGraceRemainingMs(), 0);
+    gc->Stop();
+
+    ASSERT_EQ(EC_OK, data_storage_manager_->UnRegisterStorage(storage_name));
+}
+
+TEST_F(CacheGarbageCollectorTest, EventReportLookupSkipsMissingCandidateAndRejectsAmbiguousOrUnavailableOwner) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto first = AddEventReportBackend("event_report_first");
+    auto second = AddEventReportBackend("event_report_second", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    auto duplicate_second =
+        AddEventReportBackend("event_report_second_duplicate", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    auto group = std::const_pointer_cast<InstanceGroup>(group_configs.at("group_a"));
+    group->set_event_report_storage_candidates({"event_report_second", "event_report_second_duplicate"});
+    auto route = gc->LookupEventReportBackend("instance_a", second->GetStorageType());
+    EXPECT_EQ(CacheGarbageCollector::EventReportBackendRouteStatus::kAmbiguous, route.status);
+
+    group->set_event_report_storage_candidates({"missing_owner", "event_report_second"});
+    route = gc->LookupEventReportBackend("instance_a", second->GetStorageType());
+    ASSERT_EQ(CacheGarbageCollector::EventReportBackendRouteStatus::kResolved, route.status);
+    EXPECT_EQ(second.get(), route.backend.get());
+
+    group->set_event_report_storage_candidates({"event_report_first"});
+    first->SetAvailable(false);
+    route = gc->LookupEventReportBackend("instance_a", first->GetStorageType());
+    EXPECT_EQ(CacheGarbageCollector::EventReportBackendRouteStatus::kUnavailable, route.status);
+    first->Close();
+    second->Close();
+    duplicate_second->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, SharedScanDeletesOnlyStaleSnapshotAndMalformedIsUnknown) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    config.scan_batch_size = 8;
+    config.event_report_action_batch_size = 4;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const ReporterSnapshotKey reporter{"instance_a", "10.0.0.1:9000"};
+    ASSERT_EQ(EC_OK, backend->RegisterNode(reporter.instance_id, reporter.host_ip_port, {"hbm"}));
+
+    uint64_t retry_after_ms = 0;
+    std::string old_version;
+    ASSERT_EQ(EC_OK, backend->BeginSnapshot(reporter, old_version, retry_after_ms));
+    ASSERT_TRUE(backend->CommitSnapshotVersion(reporter, old_version));
+    std::string committed_version;
+    ASSERT_EQ(EC_OK, backend->BeginSnapshot(reporter, committed_version, retry_after_ms));
+    ASSERT_TRUE(backend->CommitSnapshotVersion(reporter, committed_version));
+
+    std::string old_uri;
+    std::string committed_uri;
+    ASSERT_TRUE(
+        SnapshotUriUtils::AddSnapshotVersionToUri("event_report://event_report_l1p5/old", old_version, old_uri));
+    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
+        "event_report://event_report_l1p5/current", committed_version, committed_uri));
+    const std::string malformed_uri = "event_report://event_report_l1p5/malformed?s_version=first&s_version=second";
+    const std::string location_id = backend->BuildLocationId("hbm", reporter.host_ip_port);
+
+    CacheLocationMap old_locations;
+    old_locations.emplace(location_id,
+                          MakeStoredLocation(location_id, CLS_SERVING, backend->GetStorageType(), {old_uri}));
+    CacheLocationMap current_locations;
+    current_locations.emplace(location_id,
+                              MakeStoredLocation(location_id, CLS_SERVING, backend->GetStorageType(), {committed_uri}));
+    CacheLocationMap malformed_locations;
+    malformed_locations.emplace(
+        location_id, MakeStoredLocation(location_id, CLS_SERVING, backend->GetStorageType(), {malformed_uri}));
+    scan_responses[reporter.instance_id] = {
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {101, 102, 103}, {old_locations, current_locations, malformed_locations})}};
+
+    gc->RunOneTick();
+
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{101}), submitted_event_report_requests.front().block_keys);
+    ASSERT_EQ(1u, submitted_event_report_requests.front().targets.size());
+    ASSERT_EQ(1u, submitted_event_report_requests.front().targets.front().size());
+    EXPECT_EQ(location_id, submitted_event_report_requests.front().targets.front().front().location_id);
+    EXPECT_TRUE(submitted_requests.empty());
+    EXPECT_EQ(
+        1, metrics_registry_->GetCounter("cache_gc.event_report_probe_unknown_count", {{"cause", "malformed"}}).Get());
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, DownHostsShareOneRegularScanAndUseKeyBoundedActions) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    config.scan_batch_size = 8;
+    config.event_report_action_batch_size = 4;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    CacheLocationMap first_locations;
+    CacheLocationMap second_locations;
+    const std::vector<std::string> hosts{"10.0.0.1:9000", "10.0.0.2:9000"};
+    for (size_t i = 0; i < hosts.size(); ++i) {
+        ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", hosts[i], {"hbm"}));
+        uint64_t generation = 0;
+        ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", hosts[i], generation));
+        const std::string location_id = backend->BuildLocationId("hbm", hosts[i]);
+        auto location = MakeStoredLocation(location_id,
+                                           CLS_SERVING,
+                                           backend->GetStorageType(),
+                                           {"event_report://event_report_l1p5/object" + std::to_string(i)});
+        (i == 0 ? first_locations : second_locations).emplace(location_id, std::move(location));
+    }
+    scan_responses["instance_a"] = {
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {101, 202}, {first_locations, second_locations})}};
+
+    gc->RunOneTick();
+
+    ASSERT_EQ(1u, scan_calls.size());
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{101, 202}), submitted_event_report_requests.front().block_keys);
+    EXPECT_TRUE(submitted_requests.empty());
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, MaintenanceSlicesDoNotPromoteCandidatesFromLaterSlices) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    config.scan_batch_size = 2;
+    config.event_report_action_batch_size = 1;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const ReporterSnapshotKey reporter{"instance_a", "10.0.0.1:9000"};
+    ASSERT_EQ(EC_OK, backend->RegisterNode(reporter.instance_id, reporter.host_ip_port, {"hbm"}));
+    uint64_t retry_after_ms = 0;
+    std::string old_version;
+    ASSERT_EQ(EC_OK, backend->BeginSnapshot(reporter, old_version, retry_after_ms));
+    ASSERT_TRUE(backend->CommitSnapshotVersion(reporter, old_version));
+    std::string committed_version;
+    ASSERT_EQ(EC_OK, backend->BeginSnapshot(reporter, committed_version, retry_after_ms));
+    ASSERT_TRUE(backend->CommitSnapshotVersion(reporter, committed_version));
+    std::string old_uri;
+    ASSERT_TRUE(
+        SnapshotUriUtils::AddSnapshotVersionToUri("event_report://event_report_l1p5/old", old_version, old_uri));
+
+    const std::string event_location_id = backend->BuildLocationId("hbm", reporter.host_ip_port);
+    CacheLocationMap event_locations;
+    event_locations.emplace(event_location_id,
+                            MakeStoredLocation(event_location_id, CLS_SERVING, backend->GetStorageType(), {old_uri}));
+
+    const std::string missing_uri = "dummy://dummy/missing?size=1";
+    might_exist_by_uri[missing_uri] = false;
+    CacheLocationMap missing_locations;
+    missing_locations.emplace(
+        "missing", MakeStoredLocation("missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_uri}));
+
+    CacheLocationMap orphan_locations;
+    orphan_locations.emplace("orphan", MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1)));
+    scan_responses["instance_a"] = {
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {1, 100, 200}, {event_locations, missing_locations, orphan_locations})}};
+
+    gc->RunOneTick();
+
+    ASSERT_EQ(1u, submitted_requests.size());
+    EXPECT_EQ((KeyVector{100}), submitted_requests.front().block_keys);
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{1}), submitted_event_report_requests.front().block_keys);
+    EXPECT_TRUE(gc->round_active_);
+    EXPECT_EQ(0,
+              metrics_registry_
+                  ->GetCounter("cache_gc.candidate_dropped_count",
+                               {{"reason", "event_report_stale_snapshot"}, {"cause", "total_budget"}})
+                  .Get());
+
+    // The later orphan is not part of the first slice. It is processed next
+    // tick instead of being promoted ahead of this slice's EventReport key.
+    gc->RunOneTick();
+    EXPECT_EQ(1u, scan_calls.size());
+    ASSERT_EQ(2u, submitted_requests.size());
+    EXPECT_EQ((KeyVector{200}), submitted_requests.back().block_keys);
+    EXPECT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_FALSE(gc->round_active_);
+    EXPECT_EQ(3, gc->get_cache_gc_scan_key_count_metrics());
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, BuildDeleteActionsPrioritizesItsInputWithoutMutatingIt) {
+    auto config = DefaultConfig();
+    config.scan_batch_size = 1;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    const std::string missing_uri = "dummy://dummy/missing?size=1";
+    might_exist_by_uri[missing_uri] = false;
+    CacheLocationMap missing_locations{
+        {"missing",
+         MakeStoredLocation("missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_uri})}};
+    CacheLocationMap orphan_locations{{"orphan", MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1))}};
+    const auto batch = MakeBatch("next", {1, 2}, {missing_locations, orphan_locations});
+
+    const auto actions = gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs());
+
+    EXPECT_EQ((KeyVector{2}), actions.executor_request.block_keys);
+    EXPECT_EQ("next", batch.next_cursor);
+    EXPECT_EQ((KeyVector{1, 2}), batch.keys);
+    EXPECT_EQ((CacheLocationMapVector{missing_locations, orphan_locations}), batch.locations);
+    EXPECT_EQ(std::vector<ErrorCode>(2, EC_OK), batch.location_results);
+}
+
+TEST_F(CacheGarbageCollectorTest, BufferedScanSlicesLocationsAndDrainsBeforeAdvancingCursor) {
+    auto config = DefaultConfig();
+    config.scan_batch_size = 1;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    const std::string live_uri = "dummy://dummy/live?size=1";
+    const std::string missing_uri = "dummy://dummy/missing?size=1";
+    might_exist_by_uri[missing_uri] = false;
+    CacheLocationMap live_locations{
+        {"live", MakeStoredLocation("live", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {live_uri})}};
+    CacheLocationMap mixed_locations{
+        {"missing",
+         MakeStoredLocation("missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_uri})},
+        {"orphan", MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1))},
+    };
+    CacheLocationMap orphan_locations{{"another", MakeLocation("another", CLS_WRITING, OldCreateTimeUs(config, 1))}};
+    scan_responses["instance_a"] = {
+        {EC_OK, MakeBatch("after_buffer", {1, 10, 20}, {live_locations, mixed_locations, orphan_locations})},
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})},
+    };
+
+    // The first slice only probes the live Location. Unconsumed snapshots
+    // are not probed early or repeatedly while waiting in the buffer.
+    gc->RunOneTick();
+    EXPECT_TRUE(submitted_requests.empty());
+    ASSERT_EQ(1u, might_exist_calls.size());
+    ASSERT_EQ(1u, might_exist_calls.front().uris.size());
+    EXPECT_EQ(live_uri, might_exist_calls.front().uris.front().ToUriString());
+
+    const KeyVector expected_keys{10, 10, 20};
+    // Locations are held in an unordered map; only key order is preserved.
+    std::set<std::string> remaining_mixed_locations{"missing", "orphan"};
+    for (size_t tick = 0; tick < expected_keys.size(); ++tick) {
+        gc->RunOneTick();
+        EXPECT_EQ(1u, scan_calls.size());
+        ASSERT_EQ(tick + 1, submitted_requests.size());
+        EXPECT_EQ((KeyVector{expected_keys[tick]}), submitted_requests.back().block_keys);
+        const auto &location_ids = submitted_requests.back().location_ids;
+        ASSERT_EQ(1u, location_ids.size());
+        ASSERT_EQ(1u, location_ids.front().size());
+        if (tick < 2) {
+            EXPECT_EQ(1u, remaining_mixed_locations.erase(location_ids.front().front()));
+        } else {
+            EXPECT_EQ("another", location_ids.front().front());
+        }
+        EXPECT_TRUE(gc->round_active_);
+    }
+    EXPECT_TRUE(remaining_mixed_locations.empty());
+    EXPECT_EQ(2u, might_exist_calls.size());
+    EXPECT_EQ(3, gc->get_cache_gc_scan_key_count_metrics());
+    gc->RunOneTick();
+    ASSERT_EQ(2u, scan_calls.size());
+    EXPECT_EQ("after_buffer", scan_calls.back().second);
+    EXPECT_EQ(3u, submitted_requests.size());
+    EXPECT_FALSE(gc->round_active_);
+}
+
+TEST_F(CacheGarbageCollectorTest, SingleInflightSlotKeepsOtherActionTypeForNextTick) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    config.max_inflight_delete_requests = 1;
+    config.scan_batch_size = 4;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::string host = "10.0.0.1:9000";
+    ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", host, {"hbm"}));
+    uint64_t generation = 0;
+    ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", host, generation));
+    const std::string location_id = backend->BuildLocationId("hbm", host);
+    CacheLocationMap event_locations{
+        {location_id,
+         MakeStoredLocation(
+             location_id, CLS_SERVING, backend->GetStorageType(), {"event_report://event_report_l1p5/object"})}};
+    CacheLocationMap orphan_locations{{"orphan", MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1))}};
+    scan_responses["instance_a"] = {
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {1, 100}, {event_locations, orphan_locations})}};
+
+    submit_mode = SubmitMode::kPending;
+    gc->RunOneTick();
+    EXPECT_TRUE(submitted_requests.empty());
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{1}), submitted_event_report_requests.front().block_keys);
+    EXPECT_TRUE(gc->round_active_);
+    gc->RunOneTick();
+    EXPECT_EQ(1u, scan_calls.size());
+    EXPECT_TRUE(submitted_requests.empty());
+    EXPECT_EQ(1u, submitted_event_report_requests.size());
+
+    ASSERT_TRUE(pending_delete_promise);
+    pending_delete_promise->set_value({EC_OK, ""});
+    gc->RunOneTick();
+    EXPECT_EQ(1u, scan_calls.size());
+    ASSERT_EQ(1u, submitted_requests.size());
+    EXPECT_EQ((KeyVector{100}), submitted_requests.front().block_keys);
+    EXPECT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ(1u, gc->inflight_deletes_.size());
+    EXPECT_FALSE(gc->round_active_);
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, FullPhysicalInflightWindowPausesSharedEventReportScan) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    config.max_inflight_delete_requests = 1;
+    config.scan_batch_size = 4;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::string host = "10.0.0.1:9000";
+    ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", host, {"hbm"}));
+    uint64_t generation = 0;
+    ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", host, generation));
+    const std::string event_location_id = backend->BuildLocationId("hbm", host);
+    CacheLocationMap event_locations;
+    event_locations.emplace(
+        event_location_id,
+        MakeStoredLocation(
+            event_location_id, CLS_SERVING, backend->GetStorageType(), {"event_report://event_report_l1p5/object"}));
+
+    CacheLocationMap orphan_locations;
+    orphan_locations.emplace("orphan", MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1)));
+    scan_responses["instance_a"] = {
+        {EC_OK, MakeBatch("next", {100}, {orphan_locations})},
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {200}, {event_locations})},
+    };
+
+    submit_mode = SubmitMode::kPending;
+    gc->RunOneTick();
+    ASSERT_EQ(1u, gc->inflight_deletes_.size());
+    ASSERT_EQ(1u, scan_calls.size());
+
+    gc->RunOneTick();
+    EXPECT_EQ(1u, scan_calls.size());
+    EXPECT_TRUE(submitted_event_report_requests.empty());
+
+    ASSERT_TRUE(pending_delete_promise);
+    pending_delete_promise->set_value({EC_OK, ""});
+    gc->RunOneTick();
+    EXPECT_EQ(2u, scan_calls.size());
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{200}), submitted_event_report_requests.front().block_keys);
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, EventReportActionBudgetCountsKeysAndKeepsLocationsForSelectedKey) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    config.scan_batch_size = 8;
+    config.event_report_action_batch_size = 1;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::vector<std::string> hosts{"10.0.0.1:9000", "10.0.0.2:9000", "10.0.0.3:9000"};
+    CacheLocationMap first_key_locations;
+    CacheLocationMap second_key_locations;
+    for (size_t i = 0; i < hosts.size(); ++i) {
+        ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", hosts[i], {"hbm"}));
+        uint64_t generation = 0;
+        ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", hosts[i], generation));
+        const std::string location_id = backend->BuildLocationId("hbm", hosts[i]);
+        auto location = MakeStoredLocation(location_id,
+                                           CLS_SERVING,
+                                           backend->GetStorageType(),
+                                           {"event_report://event_report_l1p5/object" + std::to_string(i)});
+        (i < 2 ? first_key_locations : second_key_locations).emplace(location_id, std::move(location));
+    }
+    scan_responses["instance_a"] = {
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {100, 200}, {first_key_locations, second_key_locations})}};
+
+    gc->RunOneTick();
+
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{100}), submitted_event_report_requests.front().block_keys);
+    ASSERT_EQ(1u, submitted_event_report_requests.front().targets.size());
+    EXPECT_EQ(2u, submitted_event_report_requests.front().targets.front().size());
+    EXPECT_TRUE(gc->round_active_);
+    EXPECT_EQ(0,
+              metrics_registry_
+                  ->GetCounter("cache_gc.candidate_dropped_count",
+                               {{"reason", "event_report_down_host"}, {"cause", "event_report_budget"}})
+                  .Get());
+
+    gc->RunOneTick();
+    EXPECT_EQ(1u, scan_calls.size());
+    ASSERT_EQ(2u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{200}), submitted_event_report_requests.back().block_keys);
+    ASSERT_EQ(1u, submitted_event_report_requests.back().targets.size());
+    EXPECT_EQ(1u, submitted_event_report_requests.back().targets.front().size());
+    EXPECT_FALSE(gc->round_active_);
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, EventReportActionBudgetDefersInsteadOfDroppingCandidates) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    config.scan_batch_size = 4;
+    config.event_report_action_batch_size = 1;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const ReporterSnapshotKey reporter{"instance_a", "10.0.0.1:9000"};
+    ASSERT_EQ(EC_OK, backend->RegisterNode(reporter.instance_id, reporter.host_ip_port, {"hbm"}));
+    uint64_t retry_after_ms = 0;
+    std::string old_version;
+    ASSERT_EQ(EC_OK, backend->BeginSnapshot(reporter, old_version, retry_after_ms));
+    ASSERT_TRUE(backend->CommitSnapshotVersion(reporter, old_version));
+    std::string committed_version;
+    ASSERT_EQ(EC_OK, backend->BeginSnapshot(reporter, committed_version, retry_after_ms));
+    ASSERT_TRUE(backend->CommitSnapshotVersion(reporter, committed_version));
+    std::string old_uri;
+    ASSERT_TRUE(
+        SnapshotUriUtils::AddSnapshotVersionToUri("event_report://event_report_l1p5/old", old_version, old_uri));
+    const std::string location_id = backend->BuildLocationId("hbm", reporter.host_ip_port);
+    CacheLocationMap first;
+    CacheLocationMap second;
+    first.emplace(location_id, MakeStoredLocation(location_id, CLS_SERVING, backend->GetStorageType(), {old_uri}));
+    second.emplace(location_id, MakeStoredLocation(location_id, CLS_SERVING, backend->GetStorageType(), {old_uri}));
+    scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {101, 202}, {first, second})}};
+
+    gc->RunOneTick();
+
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{101}), submitted_event_report_requests.front().block_keys);
+    EXPECT_TRUE(gc->round_active_);
+    EXPECT_EQ(0,
+              metrics_registry_
+                  ->GetCounter("cache_gc.candidate_dropped_count",
+                               {{"reason", "event_report_stale_snapshot"}, {"cause", "event_report_budget"}})
+                  .Get());
+
+    gc->RunOneTick();
+    EXPECT_EQ(1u, scan_calls.size());
+    ASSERT_EQ(2u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{202}), submitted_event_report_requests.back().block_keys);
+    EXPECT_FALSE(gc->round_active_);
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, BufferedEventReportSnapshotsUseCurrentProbeStateWhenConsumed) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    config.scan_batch_size = 4;
+    config.event_report_action_batch_size = 1;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::string host = "10.0.0.1:9000";
+    ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", host, {"hbm"}));
+    uint64_t generation = 0;
+    ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", host, generation));
+    const std::string location_id = backend->BuildLocationId("hbm", host);
+    CacheLocationMap locations{
+        {location_id,
+         MakeStoredLocation(
+             location_id, CLS_SERVING, backend->GetStorageType(), {"event_report://event_report_l1p5/object"})}};
+    scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {100, 200}, {locations, locations})}};
+
+    gc->RunOneTick();
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{100}), submitted_event_report_requests.front().block_keys);
+    ASSERT_TRUE(gc->round_active_);
+
+    // Probe the remaining snapshot when consumed, after the host recovers.
+    ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", host, {"hbm"}));
+    gc->RunOneTick();
+    EXPECT_EQ(1u, scan_calls.size());
+    EXPECT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_FALSE(gc->round_active_);
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, RejectedEventReportSubmissionDoesNotCreatePendingOrInflight) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::string host = "10.0.0.1:9000";
+    ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", host, {"hbm"}));
+    uint64_t generation = 0;
+    ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", host, generation));
+    const std::string location_id = backend->BuildLocationId("hbm", host);
+    CacheLocationMap locations;
+    locations.emplace(
+        location_id,
+        MakeStoredLocation(
+            location_id, CLS_SERVING, backend->GetStorageType(), {"event_report://event_report_l1p5/object"}));
+    scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {101}, {locations})}};
+
+    submit_mode = SubmitMode::kRejected;
+    gc->RunOneTick();
+
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_TRUE(gc->inflight_deletes_.empty());
+    EXPECT_TRUE(gc->pending_locations_.empty());
+    EXPECT_EQ(0, metrics_registry_->GetCounter("cache_gc.operation_error_count", {{"stage", "submit_rejected"}}).Get());
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, PhysicalAndEventReportActionsShareGcInflightWindow) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    config.scan_batch_size = 4;
+    config.max_inflight_delete_requests = 2;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::string host = "10.0.0.1:9000";
+    ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", host, {"hbm"}));
+    uint64_t generation = 0;
+    ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", host, generation));
+    const std::string event_location_id = backend->BuildLocationId("hbm", host);
+    CacheLocationMap locations;
+    locations.emplace(
+        event_location_id,
+        MakeStoredLocation(
+            event_location_id, CLS_SERVING, backend->GetStorageType(), {"event_report://event_report_l1p5/object"}));
+    locations.emplace("orphan", MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1)));
+    scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {101}, {locations})}};
+
+    submit_mode = SubmitMode::kPending;
+    gc->RunOneTick();
+
+    ASSERT_EQ(1u, submitted_requests.size());
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ(2u, gc->inflight_deletes_.size());
+    EXPECT_EQ(2u, gc->pending_locations_.size());
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, BackendRecoveryGraceDoesNotPauseOrdinaryGcCandidates) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::string host = "10.0.0.1:9000";
+    const std::string location_id = backend->BuildLocationId("hbm", host);
+    CacheLocationMap locations;
+    locations.emplace(
+        location_id,
+        MakeStoredLocation(
+            location_id, CLS_SERVING, backend->GetStorageType(), {"event_report://event_report_l1p5/object"}));
+    locations.emplace("orphan", MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1)));
+    scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {101}, {locations})}};
+
+    gc->RunOneTick();
+
+    ASSERT_EQ(1u, scan_calls.size());
+    ASSERT_EQ(1u, submitted_requests.size());
+    EXPECT_EQ((std::vector<std::vector<std::string>>{{"orphan"}}), submitted_requests.front().location_ids);
+    EXPECT_TRUE(submitted_event_report_requests.empty());
+    EXPECT_EQ(1,
+              metrics_registry_
+                  ->GetCounter("cache_gc.event_report_probe_unknown_count", {{"cause", "recovery_grace"}})
+                  .Get());
+    backend->Close();
 }
 
 TEST_F(CacheGarbageCollectorTest, RestartBeginsScanningFromBaseCursor) {
@@ -472,7 +1195,7 @@ TEST_F(CacheGarbageCollectorTest, FixedPredicateIsFailClosedAndRequestIsBounded)
 
     const auto batch = MakeBatch(
         SCAN_BASE_CURSOR, {10, 20, 30, 10}, {first_locations, second_locations, third_locations, duplicate_locations});
-    const CacheLocationDelRequest request = gc->BuildDeleteRequest("instance_a", batch, now_us);
+    const CacheLocationDelRequest request = gc->BuildDeleteActions("instance_a", batch, now_us).executor_request;
     ASSERT_EQ(2, request.block_keys.size());
     EXPECT_EQ((KeyVector{10, 20}), request.block_keys);
     EXPECT_EQ((std::vector<std::vector<std::string>>{{"old"}, {"another"}}), request.location_ids);
@@ -481,11 +1204,16 @@ TEST_F(CacheGarbageCollectorTest, FixedPredicateIsFailClosedAndRequestIsBounded)
               request.expected_location_values);
     EXPECT_TRUE(request.authoritative_read);
     EXPECT_EQ(3, gc->get_cache_gc_candidate_count_metrics());
+    EXPECT_EQ(SCAN_BASE_CURSOR, batch.next_cursor);
+    EXPECT_EQ((KeyVector{10, 20, 30, 10}), batch.keys);
+    EXPECT_EQ((CacheLocationMapVector{first_locations, second_locations, third_locations, duplicate_locations}),
+              batch.locations);
+    EXPECT_EQ(std::vector<ErrorCode>(4, EC_OK), batch.location_results);
 
     MaintenanceScanBatch broken_batch = batch;
     broken_batch.location_results.pop_back();
-    EXPECT_TRUE(gc->BuildDeleteRequest("instance_a", broken_batch, now_us).block_keys.empty());
-    EXPECT_TRUE(gc->BuildDeleteRequest("", batch, now_us).block_keys.empty());
+    EXPECT_TRUE(gc->BuildDeleteActions("instance_a", broken_batch, now_us).executor_request.block_keys.empty());
+    EXPECT_TRUE(gc->BuildDeleteActions("", batch, now_us).executor_request.block_keys.empty());
 }
 
 TEST_F(CacheGarbageCollectorTest, ServingMissingSpecIsBatchedAndSubmittedWithExactSnapshot) {
@@ -498,11 +1226,15 @@ TEST_F(CacheGarbageCollectorTest, ServingMissingSpecIsBatchedAndSubmittedWithExa
     const std::string existing_a_uri = "dummy://storage_a/existing_a?size=1";
     const std::string existing_b_uri = "dummy://storage_a/existing_b?size=1";
     const std::string missing_b_uri = "dummy://storage_b/missing_b?size=1";
+    const std::string orphan_uri = "dummy://storage_a/orphan?size=1";
     might_exist_by_uri[missing_a_uri] = false;
     might_exist_by_uri[missing_b_uri] = false;
 
     CacheLocationMap first_locations;
-    first_locations["old_writing"] = MakeLocation("old_writing", CLS_WRITING, OldCreateTimeUs(config, /*extra_us=*/1));
+    auto orphan =
+        MakeStoredLocation("old_writing", CLS_WRITING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {orphan_uri});
+    orphan->set_create_time(OldCreateTimeUs(config, /*extra_us=*/1));
+    first_locations["old_writing"] = orphan;
     first_locations["serving_missing"] = MakeStoredLocation(
         "serving_missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_a_uri, existing_a_uri});
     first_locations["serving_existing"] =
@@ -521,8 +1253,8 @@ TEST_F(CacheGarbageCollectorTest, ServingMissingSpecIsBatchedAndSubmittedWithExa
         MakeStoredLocation("second_missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_b_uri});
 
     const auto batch = MakeBatch(SCAN_BASE_CURSOR, {10, 20}, {first_locations, second_locations});
-    const CacheLocationDelRequest request =
-        gc->BuildDeleteRequest("instance_a", batch, TimestampUtil::GetCurrentTimeUs());
+    const auto actions = gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs());
+    const CacheLocationDelRequest &request = actions.executor_request;
 
     EXPECT_EQ((KeyVector{10, 20}), request.block_keys);
     EXPECT_EQ((std::vector<std::vector<std::string>>{{"old_writing", "serving_missing"}, {"second_missing"}}),
@@ -531,6 +1263,13 @@ TEST_F(CacheGarbageCollectorTest, ServingMissingSpecIsBatchedAndSubmittedWithExa
                                                       first_locations.at("serving_missing")->ToJsonString()},
                                                      {second_locations.at("second_missing")->ToJsonString()}}),
               request.expected_location_values);
+    EXPECT_EQ((std::set<std::string>{missing_a_uri, missing_b_uri}), request.confirmed_missing_uris);
+    EXPECT_EQ(1u, actions.executor_reason_counts.at("orphan_writing"));
+    EXPECT_EQ(2u, actions.executor_reason_counts.at("storage_missing"));
+    EXPECT_EQ(SCAN_BASE_CURSOR, batch.next_cursor);
+    EXPECT_EQ((KeyVector{10, 20}), batch.keys);
+    EXPECT_EQ((CacheLocationMapVector{first_locations, second_locations}), batch.locations);
+    EXPECT_EQ(std::vector<ErrorCode>(2, EC_OK), batch.location_results);
 
     ASSERT_EQ(2, might_exist_calls.size());
     const auto storage_a_call =
@@ -574,8 +1313,9 @@ TEST_F(CacheGarbageCollectorTest, ServingProbeErrorsAreUnknownButOtherDefinitive
                            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
                            {"dummy://shape_storage/unknown?size=1", "dummy://missing_storage/missing?size=1"});
 
-    const CacheLocationDelRequest request = gc->BuildDeleteRequest(
-        "instance_a", MakeBatch(SCAN_BASE_CURSOR, {10}, {locations}), TimestampUtil::GetCurrentTimeUs());
+    auto batch = MakeBatch(SCAN_BASE_CURSOR, {10}, {locations});
+    const CacheLocationDelRequest request =
+        gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs()).executor_request;
 
     EXPECT_EQ((KeyVector{10}), request.block_keys);
     EXPECT_EQ((std::vector<std::vector<std::string>>{{"missing_and_unknown"}}), request.location_ids);
@@ -605,8 +1345,9 @@ TEST_F(CacheGarbageCollectorTest, ServingProbeBatchesBoundEachMightExistCall) {
     CacheLocationMap locations;
     locations["serving"] = MakeStoredLocation("serving", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, uris);
 
-    const CacheLocationDelRequest request = gc->BuildDeleteRequest(
-        "instance_a", MakeBatch(SCAN_BASE_CURSOR, {10}, {locations}), TimestampUtil::GetCurrentTimeUs());
+    auto batch = MakeBatch(SCAN_BASE_CURSOR, {10}, {locations});
+    const CacheLocationDelRequest request =
+        gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs()).executor_request;
 
     EXPECT_TRUE(request.block_keys.empty());
     ASSERT_EQ(2, might_exist_calls.size());
@@ -672,8 +1413,9 @@ TEST_F(CacheGarbageCollectorTest, MissingOrMismatchedStorageIsUnknownAndClassifi
     locations["definitive_missing"] =
         MakeStoredLocation("definitive_missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_uri});
 
-    const CacheLocationDelRequest request = gc->BuildDeleteRequest(
-        "instance_a", MakeBatch(SCAN_BASE_CURSOR, {10}, {locations}), TimestampUtil::GetCurrentTimeUs());
+    auto batch = MakeBatch(SCAN_BASE_CURSOR, {10}, {locations});
+    const CacheLocationDelRequest request =
+        gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs()).executor_request;
 
     EXPECT_EQ((KeyVector{10}), request.block_keys);
     EXPECT_EQ((std::vector<std::vector<std::string>>{{"definitive_missing"}}), request.location_ids);
@@ -712,10 +1454,12 @@ TEST_F(CacheGarbageCollectorTest, ActiveMigrationCopyTargetIsNotCollected) {
     orphan_locations["migration_target"] =
         MakeLocation("migration_target", CLS_WRITING, now_us - config.orphan_writing_grace_period_ms * 1000 - 1);
 
-    const auto batch = MakeBatch(SCAN_BASE_CURSOR, {10, 20}, {migration_locations, orphan_locations});
-    const CacheLocationDelRequest same_instance_request = gc->BuildDeleteRequest("instance_a", batch, now_us);
+    auto batch = MakeBatch(SCAN_BASE_CURSOR, {10, 20}, {migration_locations, orphan_locations});
+    const CacheLocationDelRequest same_instance_request =
+        gc->BuildDeleteActions("instance_a", batch, now_us).executor_request;
+    batch = MakeBatch(SCAN_BASE_CURSOR, {10}, {migration_locations});
     const CacheLocationDelRequest other_instance_request =
-        gc->BuildDeleteRequest("instance_b", MakeBatch(SCAN_BASE_CURSOR, {10}, {migration_locations}), now_us);
+        gc->BuildDeleteActions("instance_b", batch, now_us).executor_request;
 
     EXPECT_EQ((KeyVector{20}), same_instance_request.block_keys);
     EXPECT_EQ((std::vector<std::vector<std::string>>{{"migration_target"}}), same_instance_request.location_ids);
@@ -728,9 +1472,9 @@ TEST_F(CacheGarbageCollectorTest, MissingScannedKeyIsNotCountedAsOperationError)
     auto gc = MakeGc(DefaultConfig());
     PrepareForSingleStep(*gc);
 
-    const auto batch =
-        MakeBatch(SCAN_BASE_CURSOR, {1, 2}, {CacheLocationMap{}, CacheLocationMap{}}, {EC_NOENT, EC_ERROR});
-    EXPECT_TRUE(gc->BuildDeleteRequest("instance_a", batch, TimestampUtil::GetCurrentTimeUs()).block_keys.empty());
+    auto batch = MakeBatch(SCAN_BASE_CURSOR, {1, 2}, {CacheLocationMap{}, CacheLocationMap{}}, {EC_NOENT, EC_ERROR});
+    EXPECT_TRUE(gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs())
+                    .executor_request.block_keys.empty());
 
     EXPECT_EQ(
         1, metrics_registry_->GetCounter("cache_gc.operation_error_count", MetricsTags{{"stage", "scan_key"}}).Get());
@@ -760,6 +1504,48 @@ TEST_F(CacheGarbageCollectorTest, TickScansOneBatchAndSubmitsConditionalAsyncDel
     EXPECT_EQ(1, gc->pending_locations_.size());
 }
 
+TEST_F(CacheGarbageCollectorTest, TickTracksPerInstanceScanAndSubmittedReasonSummary) {
+    auto config = DefaultConfig();
+    config.scan_batch_size = 10;
+    config.max_inflight_delete_requests = 1;
+    submit_mode = SubmitMode::kPending;
+    const std::string missing_uri = "dummy://storage_a/missing?size=1";
+    might_exist_by_uri[missing_uri] = false;
+
+    CacheLocationMap locations;
+    locations["old_writing"] = MakeLocation("old_writing", CLS_WRITING, OldCreateTimeUs(config, 1));
+    locations["serving_missing"] =
+        MakeStoredLocation("serving_missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_uri});
+    scan_responses["instance_a"] = {{EC_OK, MakeBatch("next_cursor", {100}, {locations})}};
+
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+    gc->RunOneTick();
+
+    ASSERT_EQ(1u, gc->instances_.size());
+    const auto &entry = gc->instances_.front();
+    EXPECT_EQ(1u, entry.scanned_key_count);
+    EXPECT_EQ(1u, entry.scan_batch_count);
+    EXPECT_EQ(1u, entry.submitted_location_counts.at("orphan_writing"));
+    EXPECT_EQ(1u, entry.submitted_location_counts.at("storage_missing"));
+    EXPECT_EQ(0u, entry.inflight_throttled_tick_count);
+
+    gc->RunOneTick();
+    EXPECT_EQ(1u, gc->instances_.front().inflight_throttled_tick_count);
+    ASSERT_TRUE(pending_delete_promise);
+    pending_delete_promise->set_value({EC_OK, ""});
+}
+
+TEST_F(CacheGarbageCollectorTest, SubmittedLocationSummaryIncludesEveryReason) {
+    const auto [submitted_location_count, reason_summary] = CacheGarbageCollector::BuildSubmittedLocationSummary({
+        {"orphan_writing", 90},
+        {"future_reason", 10},
+    });
+
+    EXPECT_EQ(100u, submitted_location_count);
+    EXPECT_EQ("future_reason=10,orphan_writing=90", reason_summary);
+}
+
 TEST_F(CacheGarbageCollectorTest, ScanFailureRetriesSameCursorWithoutBusyLoop) {
     scan_responses["instance_a"] = {
         {EC_ERROR, {}},
@@ -770,14 +1556,174 @@ TEST_F(CacheGarbageCollectorTest, ScanFailureRetriesSameCursorWithoutBusyLoop) {
 
     gc->RunOneTick();
     ASSERT_EQ(1, scan_calls.size());
-    EXPECT_EQ(SCAN_BASE_CURSOR, gc->cursor_);
+    ASSERT_EQ(1u, gc->instances_.size());
+    EXPECT_EQ(SCAN_BASE_CURSOR, gc->instances_.front().cursor);
     EXPECT_TRUE(gc->inflight_deletes_.empty());
 
     gc->RunOneTick();
     ASSERT_EQ(2, scan_calls.size());
     EXPECT_EQ(SCAN_BASE_CURSOR, scan_calls[0].second);
     EXPECT_EQ(SCAN_BASE_CURSOR, scan_calls[1].second);
-    EXPECT_EQ("next", gc->cursor_);
+    EXPECT_EQ("next", gc->instances_.front().cursor);
+}
+
+TEST_F(CacheGarbageCollectorTest, PersistentlyFailingInstanceIsSkippedAfterBoundedRetriesAndNextRoundProceeds) {
+    AddInstance("group_a", "instance_b");
+    scan_responses["instance_a"] = {
+        {EC_ERROR, {}},
+        {EC_ERROR, {}},
+        {EC_ERROR, {}},
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})},
+    };
+    scan_responses["instance_b"] = {
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})},
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})},
+    };
+    auto gc = MakeGc(DefaultConfig());
+    PrepareForSingleStep(*gc);
+
+    for (size_t i = 0; i < CacheGarbageCollector::kMaxScanFailuresPerInstancePerRound + 1; ++i) {
+        gc->RunOneTick();
+    }
+
+    EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{
+                  {"instance_a", SCAN_BASE_CURSOR},
+                  {"instance_b", SCAN_BASE_CURSOR},
+                  {"instance_a", SCAN_BASE_CURSOR},
+                  {"instance_a", SCAN_BASE_CURSOR},
+              }),
+              scan_calls);
+    EXPECT_FALSE(gc->round_active_);
+    EXPECT_EQ(1, gc->get_cache_gc_scan_round_count_metrics());
+    EXPECT_EQ(
+        1, metrics_registry_->GetCounter("cache_gc.operation_error_count", {{"stage", "scan_retry_exhausted"}}).Get());
+
+    AddInstance("group_a", "instance_c");
+    gc->next_round_at_ = CacheGarbageCollector::Clock::now();
+    for (size_t i = 0; i < 3; ++i) {
+        gc->RunOneTick();
+    }
+
+    ASSERT_GE(scan_calls.size(), 3u);
+    const std::vector<std::pair<std::string, std::string>> second_round_calls(
+        scan_calls.end() - 3, scan_calls.end());
+    EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{
+                  {"instance_a", SCAN_BASE_CURSOR},
+                  {"instance_b", SCAN_BASE_CURSOR},
+                  {"instance_c", SCAN_BASE_CURSOR},
+              }),
+              second_round_calls);
+    EXPECT_FALSE(gc->round_active_);
+    EXPECT_EQ(2, gc->get_cache_gc_scan_round_count_metrics());
+}
+
+TEST_F(CacheGarbageCollectorTest, ActiveRoundRotatesOneBatchPerInstance) {
+    AddInstance("group_a", "instance_b");
+    scan_responses["instance_a"] = {
+        {EC_OK, MakeBatch("a_next", {}, {})},
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})},
+    };
+    scan_responses["instance_b"] = {
+        {EC_OK, MakeBatch("b_next", {}, {})},
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {}, {})},
+    };
+    auto gc = MakeGc(DefaultConfig());
+    PrepareForSingleStep(*gc);
+
+    for (size_t i = 0; i < 4; ++i) {
+        gc->RunOneTick();
+    }
+
+    EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{
+                  {"instance_a", SCAN_BASE_CURSOR},
+                  {"instance_b", SCAN_BASE_CURSOR},
+                  {"instance_a", "a_next"},
+                  {"instance_b", "b_next"},
+              }),
+              scan_calls);
+    EXPECT_FALSE(gc->round_active_);
+}
+
+TEST_F(CacheGarbageCollectorTest, InstanceRotationWaitsForCurrentBufferedBatch) {
+    AddInstance("group_a", "instance_b");
+    auto config = DefaultConfig();
+    config.scan_batch_size = 1;
+    CacheLocationMap locations{{"orphan", MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1))}};
+    for (const auto &instance_id : {"instance_a", "instance_b"}) {
+        scan_responses[instance_id] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {1, 2}, {locations, locations})}};
+    }
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    const std::vector<std::string> expected_instances{"instance_a", "instance_a", "instance_b", "instance_b"};
+    for (size_t tick = 0; tick < expected_instances.size(); ++tick) {
+        gc->RunOneTick();
+        ASSERT_EQ(tick + 1, submitted_requests.size());
+        EXPECT_EQ(expected_instances[tick], submitted_requests.back().instance_id);
+        EXPECT_EQ((KeyVector{static_cast<KeyType>(tick % 2 + 1)}), submitted_requests.back().block_keys);
+        EXPECT_EQ(tick / 2 + 1, scan_calls.size());
+    }
+    EXPECT_FALSE(gc->round_active_);
+    EXPECT_EQ(4, gc->get_cache_gc_scan_key_count_metrics());
+}
+
+TEST_F(CacheGarbageCollectorTest, DrainedBatchRotatesBeforeNextCursorWithoutWaitingForDeletes) {
+    AddInstance("group_a", "instance_b");
+    auto config = DefaultConfig();
+    config.scan_batch_size = 1;
+    config.max_inflight_delete_requests = 4;
+    CacheLocationMap locations{{"orphan", MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1))}};
+    scan_responses["instance_a"] = {
+        {EC_OK, MakeBatch("a_next", {1, 2}, {locations, locations})},
+        {EC_OK, MakeBatch(SCAN_BASE_CURSOR, {3}, {locations})},
+    };
+    scan_responses["instance_b"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {9}, {locations})}};
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+    submit_mode = SubmitMode::kPending;
+
+    const std::vector<std::string> expected_instances{"instance_a", "instance_a", "instance_b", "instance_a"};
+    const KeyVector expected_keys{1, 2, 9, 3};
+    for (size_t tick = 0; tick < expected_instances.size(); ++tick) {
+        gc->RunOneTick();
+        ASSERT_EQ(tick + 1, submitted_requests.size());
+        EXPECT_EQ(expected_instances[tick], submitted_requests.back().instance_id);
+        EXPECT_EQ((KeyVector{expected_keys[tick]}), submitted_requests.back().block_keys);
+        EXPECT_EQ(tick + 1, gc->inflight_deletes_.size());
+    }
+    EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{
+                  {"instance_a", SCAN_BASE_CURSOR},
+                  {"instance_b", SCAN_BASE_CURSOR},
+                  {"instance_a", "a_next"},
+              }),
+              scan_calls);
+    EXPECT_FALSE(gc->round_active_);
+}
+
+TEST_F(CacheGarbageCollectorTest, MissingIndexerDiscardsBufferedBatchAndAdvancesInstance) {
+    AddInstance("group_a", "instance_b");
+    auto config = DefaultConfig();
+    config.scan_batch_size = 1;
+    CacheLocationMap locations{{"orphan", MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1))}};
+    scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {1, 2}, {locations, locations})}};
+    scan_responses["instance_b"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {9}, {locations})}};
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    gc->RunOneTick();
+    ASSERT_EQ(0u, gc->instance_index_);
+    ASSERT_FALSE(gc->instances_.front().buffered_scan.keys.empty());
+    missing_indexers.insert("instance_a");
+    gc->RunOneTick();
+    EXPECT_EQ(1u, gc->instance_index_);
+    EXPECT_TRUE(gc->instances_.front().completed);
+    EXPECT_TRUE(gc->instances_.front().buffered_scan.keys.empty());
+
+    gc->RunOneTick();
+    ASSERT_EQ(2u, submitted_requests.size());
+    EXPECT_EQ("instance_b", submitted_requests.back().instance_id);
+    EXPECT_EQ((KeyVector{9}), submitted_requests.back().block_keys);
+    EXPECT_FALSE(gc->round_active_);
 }
 
 TEST_F(CacheGarbageCollectorTest, RegistryFailureDiscardsIncompleteSnapshot) {
@@ -896,14 +1842,20 @@ TEST_F(CacheGarbageCollectorTest, PendingTargetDeduplicatesBeforeCasAndKeepsInst
     EXPECT_EQ(1, submitted_requests.size());
     EXPECT_EQ(1, gc->inflight_deletes_.size());
 
-    EXPECT_TRUE(gc->BuildDeleteRequest("instance_a", batch, TimestampUtil::GetCurrentTimeUs()).block_keys.empty());
-    EXPECT_FALSE(gc->BuildDeleteRequest("instance_b", batch, TimestampUtil::GetCurrentTimeUs()).block_keys.empty());
+    auto candidate_batch = batch;
+    EXPECT_TRUE(gc->BuildDeleteActions("instance_a", candidate_batch, TimestampUtil::GetCurrentTimeUs())
+                    .executor_request.block_keys.empty());
+    candidate_batch = batch;
+    EXPECT_FALSE(gc->BuildDeleteActions("instance_b", candidate_batch, TimestampUtil::GetCurrentTimeUs())
+                     .executor_request.block_keys.empty());
 
     pending_delete_promises.front()->set_value({EC_OK, ""});
     gc->PollInflightDeletes();
     EXPECT_TRUE(gc->inflight_deletes_.empty());
     EXPECT_TRUE(gc->pending_locations_.empty());
-    EXPECT_FALSE(gc->BuildDeleteRequest("instance_a", batch, TimestampUtil::GetCurrentTimeUs()).block_keys.empty());
+    candidate_batch = batch;
+    EXPECT_FALSE(gc->BuildDeleteActions("instance_a", candidate_batch, TimestampUtil::GetCurrentTimeUs())
+                     .executor_request.block_keys.empty());
 }
 
 TEST_F(CacheGarbageCollectorTest, PendingTargetRemainsDeduplicatedAcrossRoundBoundary) {
@@ -946,7 +1898,7 @@ TEST_F(CacheGarbageCollectorTest, RealExecutorBacklogDoesNotBlockGcSubmitAndStop
     };
 
     stub_.reset(static_cast<SubmitAsyncLocation>(ADDR(SchedulePlanExecutor, SubmitAsync)));
-    stub_.set(ADDR(MetaIndexer, GetLocationsFromPersistent), GetLocationsFromPersistentErrorStub);
+    stub_.set(ADDR(MetaIndexer, GetLocationsFromPrimary), GetLocationsFromPrimaryErrorStub);
 
     std::promise<void> blocker_started;
     std::promise<void> release_blocker;
@@ -1036,6 +1988,71 @@ TEST_F(CacheGarbageCollectorTest, FuturePartialAndExceptionAreTerminal) {
     EXPECT_EQ(3, scan_calls.size());
 }
 
+TEST_F(CacheGarbageCollectorTest, CompletedActionsWarnOnlyForUnloggedErrorsAndAlwaysRecordResults) {
+    auto gc = MakeGc(DefaultConfig());
+    PrepareForSingleStep(*gc);
+    stub_.set(ADDR(LoggerBroker, Log), CountGcActionWarnings);
+    gc_action_warn_count = 0;
+
+    const auto complete_action = [&](const std::string &action_name, PlanExecuteResult result) {
+        std::promise<PlanExecuteResult> promise;
+        auto future = promise.get_future();
+        promise.set_value(std::move(result));
+        const CacheGarbageCollector::PendingLocationKey key{"instance_a", 1, "location"};
+        gc->pending_locations_.insert(key);
+        gc->inflight_deletes_.push_back({
+            .round_id = 1,
+            .instance_id = "instance_a",
+            .action_name = action_name,
+            .target_count = 1,
+            .submitted_at = CacheGarbageCollector::Clock::now(),
+            .pending_locations = {key},
+            .future = std::move(future),
+        });
+        gc->PollInflightDeletes();
+        EXPECT_TRUE(gc->inflight_deletes_.empty());
+        EXPECT_TRUE(gc->pending_locations_.empty());
+        EXPECT_EQ(0, gc->get_cache_gc_inflight_delete_count_metrics());
+    };
+
+    complete_action("physical_delete", {EC_PARTIAL_OK, "storage failure already logged", true});
+    EXPECT_EQ(0u, gc_action_warn_count.load());
+    complete_action("physical_delete", {EC_PARTIAL_OK, "unlogged partial failure"});
+    EXPECT_EQ(1u, gc_action_warn_count.load());
+    complete_action("physical_delete", {EC_ERROR, "worker or admission failure"});
+    EXPECT_EQ(2u, gc_action_warn_count.load());
+    complete_action("event_report_metadata", {EC_ERROR, "metadata cleanup failure"});
+    EXPECT_EQ(3u, gc_action_warn_count.load());
+    complete_action("physical_delete", {EC_OK, ""});
+    EXPECT_EQ(3u, gc_action_warn_count.load());
+    for (const auto &[status, count] :
+         std::vector<std::pair<ErrorCode, size_t>>{{EC_PARTIAL_OK, 2}, {EC_ERROR, 2}, {EC_OK, 1}}) {
+        EXPECT_EQ(count,
+                  metrics_registry_
+                      ->GetCounter("cache_gc.delete_result_count",
+                                   MetricsTags{{"status", std::to_string(static_cast<int>(status))}})
+                      .Get());
+    }
+}
+
+TEST_F(CacheGarbageCollectorTest, ScanSummaryAllocationFailureIsHandledByTick) {
+    auto gc = MakeGc(DefaultConfig());
+    PrepareForSingleStep(*gc);
+    stub_.set(ADDR(CacheGarbageCollector, BuildSubmittedLocationSummary), ThrowScanSummaryStub);
+
+    gc->RunOneTick();
+    EXPECT_EQ(1,
+              metrics_registry_->GetCounter("cache_gc.operation_error_count", MetricsTags{{"stage", "tick_exception"}})
+                  .Get());
+    EXPECT_TRUE(gc->round_active_);
+    EXPECT_EQ(0, gc->get_cache_gc_scan_round_count_metrics());
+
+    stub_.reset(ADDR(CacheGarbageCollector, BuildSubmittedLocationSummary));
+    gc->RunOneTick();
+    EXPECT_FALSE(gc->round_active_);
+    EXPECT_EQ(1, gc->get_cache_gc_scan_round_count_metrics());
+}
+
 TEST_F(CacheGarbageCollectorTest, SnapshotPreservesInstanceIsolationAndCooldown) {
     AddInstance("group_a", "instance_b");
     auto config = DefaultConfig();
@@ -1111,6 +2128,44 @@ TEST_F(CacheGarbageCollectorTest, JoinDetachesPendingDeleteWithoutWaitingForFutu
     EXPECT_TRUE(gc->pending_locations_.empty());
     EXPECT_EQ(0, gc->get_cache_gc_inflight_delete_count_metrics());
     pending_delete_promise->set_value({EC_OK, ""});
+}
+
+TEST_F(CacheGarbageCollectorTest, JoinDetachesPendingEventReportActionWithoutWaitingForFuture) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::string host = "10.0.0.1:9000";
+    ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", host, {"hbm"}));
+    uint64_t generation = 0;
+    ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", host, generation));
+    const std::string location_id = backend->BuildLocationId("hbm", host);
+    CacheLocationMap locations;
+    locations.emplace(
+        location_id,
+        MakeStoredLocation(
+            location_id, CLS_SERVING, backend->GetStorageType(), {"event_report://event_report_l1p5/object"}));
+    scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {101}, {locations})}};
+
+    submit_mode = SubmitMode::kPending;
+    gc->RunOneTick();
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    ASSERT_EQ(1u, gc->inflight_deletes_.size());
+    ASSERT_EQ(1u, gc->pending_locations_.size());
+    ASSERT_TRUE(pending_delete_promise);
+
+    const auto begin = std::chrono::steady_clock::now();
+
+    gc->Join();
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 1);
+    EXPECT_TRUE(gc->inflight_deletes_.empty());
+    EXPECT_TRUE(gc->pending_locations_.empty());
+    pending_delete_promise->set_value({EC_OK, ""});
+    backend->Close();
 }
 
 TEST_F(CacheGarbageCollectorTest, JoinWaitsForActiveMaintenanceScan) {

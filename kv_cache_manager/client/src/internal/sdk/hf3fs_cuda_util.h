@@ -4,6 +4,8 @@
 
 #ifdef USING_CUDA
 #include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
 #define CHECK_CUDA_ERROR(cuda_call)                                                                                    \
     do {                                                                                                               \
         cudaError_t err = (cuda_call);                                                                                 \

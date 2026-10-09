@@ -110,6 +110,11 @@ public:
                                            const LocationModifierFunc &modifier,
                                            bool adjust_reclaimed_key_count = true,
                                            bool refresh_cache_from_persistent = false) noexcept;
+    LocationResult ReadModifyWriteLocationsForMaintenance(RequestContext *request_context,
+                                                          const KeyVector &keys,
+                                                          const LocationIdsPerKey &location_ids,
+                                                          const LocationModifierFunc &modifier,
+                                                          bool adjust_reclaimed_key_count = true) noexcept;
     // Targeted upsert RMW that also distinguishes a brand-new key from an
     // existing key missing the requested location. This lets ReportEvent
     // create or merge locations in one shard-lock/read/write pass while
@@ -127,7 +132,6 @@ public:
                                                               const LocationIdRefVector &location_ids,
                                                               const SingleLocationModifierFunc &modifier) noexcept;
     bool SupportsSingleLocationRmw() const noexcept;
-
     // ---------- READ ----------
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
     Result Get(RequestContext *request_context,
@@ -148,13 +152,16 @@ public:
                                                       const PrefixLocationVisitor &visitor) noexcept;
     // Source-of-truth read used by maintenance admission. It never backfills
     // or touches the optional hot-cache backend.
-    Result GetLocationsFromPersistent(RequestContext *request_context,
-                                      const KeyVector &keys,
-                                      CacheLocationMapVector &out_location_maps) noexcept;
+    Result GetLocationsFromPrimary(RequestContext *request_context,
+                                   const KeyVector &keys,
+                                   CacheLocationMapVector &out_location_maps) noexcept;
     LocationResult GetLocations(RequestContext *request_context,
                                 const KeyVector &keys,
                                 const LocationIdsPerKey &location_ids,
                                 LocationsPerKey &out_locations) noexcept;
+    Result GetLocationMapsForMaintenance(RequestContext *request_context,
+                                         const KeyVector &keys,
+                                         CacheLocationMapVector &out_locations) noexcept;
     Result GetProperties(RequestContext *request_context,
                          const KeyVector &keys,
                          const std::vector<std::string> &property_names,
@@ -164,6 +171,7 @@ public:
                    const size_t limit,
                    std::string &out_next_cursor,
                    KeyVector &out_keys) noexcept;
+    ErrorCode TrimResidues(RequestContext *request_context, size_t scan_batch_size) noexcept;
     ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,
                                           const std::string &cursor,
                                           size_t limit,
@@ -171,6 +179,13 @@ public:
     ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
     ErrorCode
     SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept;
+    ErrorCode SampleReclaimCandidates(RequestContext *request_context,
+                                      int64_t count,
+                                      ReclaimCandidateVector &out_candidates,
+                                      bool require_read_success = false) const noexcept;
+    // A complete local sampling source does not need parallel I/O fragments.
+    bool PreferSingleTaskReclaimSampling() const noexcept;
+    size_t TouchKeysForMaintenance(const KeyVector &keys) const noexcept;
 
     // Reuses the same bounded executor for CPU-only query projection/reduction.
     // Directly constructed test/indexer instances without an executor retain
@@ -185,6 +200,7 @@ public:
 
     // Synchronously flush pending writes for the given keys to persistent storage.
     bool Sync(const KeyVector &keys) noexcept;
+    bool SyncAll() noexcept;
 
     // Returns async write path stats from async backend.
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
@@ -205,14 +221,16 @@ private:
                                                const LocationModifierFunc &modifier,
                                                bool adjust_reclaimed_key_count,
                                                bool track_created_key_count,
-                                               bool refresh_cache_from_persistent) noexcept;
+                                               bool refresh_cache_from_persistent,
+                                               bool maintenance_no_touch) noexcept;
 
 private:
     int32_t GetMutexShardIndex(KeyType key) const noexcept;
-    std::vector<BatchMetaData> MakeBatches(const KeyVector &keys,
-                                           const LocationIdsPerKey &location_ids,
-                                           CacheLocationMapVector &locations,
-                                           PropertyMapVector &properties) const noexcept;
+    struct IndexBatch {
+        std::vector<int32_t> shard_indices;
+        std::vector<int32_t> global_indices;
+    };
+    std::vector<IndexBatch> MakeBatches(const KeyVector &keys) const noexcept;
 
     ErrorCode RecoverMetaData() noexcept;
     void AdjustKeyCountMeta(const int32_t delta) noexcept;
@@ -237,6 +255,7 @@ private:
         int64_t index_deserialize_time_us = 0;
         bool has_index_deserialize = false;
         int64_t lock_wait_time_us = 0; // accumulated time waiting for shard locks
+        int64_t lock_hold_time_us = 0; // accumulated time holding all shard locks in a batch
         int64_t async_enqueue_timeout_key_count = 0;
         int64_t async_enqueue_time_us = 0;
         int64_t cache_backend_upsert_time_us = 0;
@@ -260,7 +279,8 @@ private:
                                                  const BatchMetaData &delete_batch,
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,
-                                                 Result &result) noexcept;
+                                                 Result &result,
+                                                 bool maintenance_no_touch = false) noexcept;
     void
     EmitRmwMetrics(MetricsCollector *metrics_collector, const RmwStats &stats, size_t total_key_count) const noexcept;
 

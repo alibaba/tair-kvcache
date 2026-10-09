@@ -384,8 +384,14 @@ snapshot replace + commit/abort
   lifecycle 写入；BatchMerge 的 block-create 与 targeted-location 两个 RMW 阶段之间同样释放并
   重新获取 lease；
 - mutation 在已经持有 metadata 锁时只做上述非阻塞的 per-reporter lifecycle lease 获取，
-  避免与 cleanup 的 `lifecycle -> metadata` 顺序形成锁序反转；不同 reporter 使用独立 fence，
-  不会因其他 host 的 HEARTBEAT/REGISTER 产生假失败；
+  避免与 cleanup 的 `lifecycle -> metadata` 顺序形成锁序反转。lifecycle fence 不存在、reporter
+  已注销、generation 不匹配，或 `try_lock` 与 REGISTER、HOST_DOWN、unavailable recovery 等
+  unique lifecycle writer 冲突时，返回 `NODE_NOT_REGISTERED`；不同 reporter 使用独立 fence；
+- 已注册且可用的 steady HEARTBEAT 不改变 registration/generation，因此持有 shared lifecycle
+  lease 完成心跳时间、状态与指标发布；同 generation 的 ADD/DELETE 可以同时取得 shared lease，
+  REGISTER、HOST_DOWN 和 unavailable recovery 等 lifecycle transition 则持有 unique lease；
+- 同一 reporter 的 HEARTBEAT 应保持 single-flight。曾评估在等待 status 锁前释放 node-table 锁，
+  但这会允许重叠 HEARTBEAT 乱序发布完整 status snapshot，因此未采用；
 - liveness unregister 的 generation 比较与节点删除在同一把锁内完成；
 - 显式 HOST_DOWN 的 generation 捕获与节点删除同样在同一把锁内完成，Heartbeat/REGISTER
   只能在线性化的 HOST_DOWN 之前或之后生效，不能在中间恢复后又被旧请求删除；
@@ -394,6 +400,8 @@ snapshot replace + commit/abort
 - 不同 reporter 不共享写门。
 
 ## 11. 限流与清理
+
+本节保留 legacy fallback 的行为说明；启用 `kvcm.cache_gc.event_report_cleanup_enabled` 后，系统按 [EventReport 主动回收纳入统一后台 GC](event_report_background_gc.md) 把 per-event 全 Instance 扫描替换为状态驱动的 shared GC round。Snapshot/HOST_DOWN 只更新 `EventReportBackend` 当前状态，不登记 cleanup intent，也不唤醒或增加扫描；两条路径的 Snapshot、generation、lifecycle fencing 和 metadata-only 契约保持一致。
 
 `EventReportStorageSpec.snapshot_min_interval_ms` 提供 per-reporter 最小 snapshot 间隔，默认
 30 秒。完整维度是：
@@ -411,15 +419,15 @@ snapshot 完成。该配置在 backend 级统一设置，对其管理的每个 r
 admission 超时会 abort 当前 candidate；delta 等待超时只拒绝该 delta，不会 abort snapshot，
 两者都不影响其他 reporter。
 
-成功 snapshot 后复用现有任务执行器扫描 instance metadata：
+legacy fallback 在成功 Snapshot/HOST_DOWN 后复用现有任务执行器扫描 Instance metadata。统一 GC 模式不再投递这类任务，而是在 regular metadata batch 上由 `EventReportBackend` 判定：
 
 - 只处理目标 storage type 和 reporter；
 - event-report URI 描述外部 cache，reclaimer 只删除 KVCM metadata，不调用外部 URI
   backend 的物理 DELETE；
 - location 内只要包含任一当前 committed generation 就保留；
 - 下一轮 snapshot 已开始时，location 内只要包含任一 in-flight generation 也保留；
-- 完全由旧 generation 或无 version legacy spec 组成的 location 作为 stale；
-- malformed version 的 location 作为 stale；
+- 完全由旧 generation 或语法合法的无 version legacy spec 组成的 location 作为 stale；
+- malformed/未知 version 或 URI 格式返回 unknown 并告警，周期 GC 不把解析失败作为删除授权；
 - 使用观察值条件删除，避免旧 cleanup 删除刚刷新的新值。
 - cleanup 同时携带 snapshot attempt epoch：epoch 变化后在下一批扫描前退出；对已经扫描的
   location 仍逐条校验 epoch 和 URI generation，批次取消不能替代最终删除条件。
@@ -430,14 +438,9 @@ generation，其他 sibling 仍带旧 generation 或无 version 的 legacy URI�
 location 会造成成功增量的 false negative。保留 mixed-generation location 允许少量 stale
 sibling 暂存，后续完整 snapshot 会替换或回收。
 
-成功 snapshot 进入 strict 后，cleanup 只负责最终空间回收，不是查询正确性的前提。扫描耗时记录为
-`event_report.snapshot_cleanup_scan_latency_ms{instance_id,host,type}`。
+成功 snapshot 进入 strict 后，cleanup 只负责最终空间回收，不是查询正确性的前提。统一模式下多个 Snapshot/HOST_DOWN 事件天然折叠为扫描时的最新 Backend 状态，扫描 key 数不再随事件数线性增长。
 
-容量估算：典型的 1 个 instance、10 个 reporter、每台 5000 个 block 场景中，一次单 reporter
-完整 snapshot 约有 5000 次 metadata replace，并以 1000 key 为批次扫描该 instance 约 5 万
-个 key；10 台同时全量约有 5 万次 replace、累计约 50 万次 key 检查。实际 Redis 命令数取决于
-MetaIndexer backend 的 batching。若清理扫描延迟或 backlog 长期超过运行阈值，应引入
-reporter -> location 反向索引，而不是继续提高全量频率。
+统一模式复用后台 GC 的 round/cursor，默认 5 分钟 cooldown 下 best-effort 最终收敛；指标使用 shared `cache_gc.scan_key_count`、按 reason 的 candidate/drop、EventReport probe/delete 结果和共享 inflight count/age，不再上报 per-event `event_report.snapshot_cleanup_scan_latency_ms{instance_id,host,type}`。若后续需要明显更短的收敛 SLO，可增加独立 cadence 的状态驱动 Candidate Source 或 reporter -> location 索引，但不能恢复每事件一次全表扫描。
 
 ## 12. 测试要求
 

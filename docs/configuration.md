@@ -36,6 +36,8 @@ redis://[auth_token@]host:port/?db=<non-negative-integer>[&param=value...]
 
 ## KVCacheManager Server Config
 
+### 通用服务配置
+
 KVCM server可识别的配置参数列表如下。可通过配置文件、启动参数--env、系统环境变量进行配置。
 CacheReclaimer 异步删除相关参数的生命周期语义见
 [CacheReclaimer 异步删除与过度逐出优化设计](design/cache_reclaimer_async_delete.md)。
@@ -109,31 +111,41 @@ kvcm.meta_query.parallel_threshold=256
 # 每个并行任务一次领取的连续元素数，必须不大于 parallel_threshold。
 kvcm.meta_query.chunk_size=128
 
+# CacheReclaimer 基础采样量，默认 100。GROUP_LRU 按有效 Instance 数计算 Group 预算后重新分配，
+# 该模式下此值不是单个 Instance 的硬上限；各模式的预算规则见下文。
+kvcm.cache_reclaimer.key_sampling_size_total=100
+
 # CacheReclaimer 删除 Future 在 delay 结束后可继续抵扣水位的最长时间；到期只关闭 credit，
 # 不取消底层删除。默认 60000ms。
 kvcm.cache_reclaimer.inflight_delete_timeout_ms=60000
 
 # 单个 Instance Group × BaseStorageType 的未完成 Location 数和 bytes 上限。
-kvcm.cache_reclaimer.pending_location_limit_per_group_type=100000
-kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=68719476736
+kvcm.cache_reclaimer.pending_location_limit_per_group_type=20000
+kvcm.cache_reclaimer.pending_bytes_limit_per_group_type=1099511627776
 
 # 进程级未完成删除请求数和 bytes 上限。Future 终态前始终占用配额，credit 到期不返还。
 kvcm.cache_reclaimer.pending_delete_handler_limit=1024
-kvcm.cache_reclaimer.pending_bytes_limit=274877906944
+kvcm.cache_reclaimer.pending_bytes_limit=4398046511104
 
-# leader 后台 metadata GC，默认关闭。V1 处理超过 grace 的 CLS_WRITING，
-# 以及 MightExist 明确 missing 的普通 CLS_SERVING Location（EventReport 除外）。
-kvcm.cache_gc.enabled=false
+# leader 后台 metadata GC，默认开启。处理超过 grace 的 CLS_WRITING、
+# MightExist 明确 missing 的普通 CLS_SERVING 以及 EventReport metadata 回收。
+kvcm.cache_gc.enabled=true
 # active round 的 tick 间隔；每个 tick 最多推进一个 backend batch。
-kvcm.cache_gc.scan_interval_ms=1000
-# 一个 full round 完成后的 cooldown，默认 24 小时。
-kvcm.cache_gc.round_pause_ms=86400000
-# backend key 数 hint，同时限制单次删除请求的 Location target 数。
+kvcm.cache_gc.scan_interval_ms=100
+# 一个 full round 完成后的 cooldown，默认 5 分钟；0 表示下一 tick 可开始新 round。
+kvcm.cache_gc.round_pause_ms=300000
+# backend key 数 hint，同时限制单 tick 两类 action 合计的 Location target 数。
 kvcm.cache_gc.scan_batch_size=256
 # orphan WRITING grace，最小 1 小时（3600000ms），默认 24 小时。
 kvcm.cache_gc.orphan_writing_grace_period_ms=86400000
-# GC 在途删除请求硬上限；默认 2。一个慢请求只占一个槽位，全部槽位占满后暂停扫描。
-kvcm.cache_gc.max_inflight_delete_requests=2
+# 普通删除与 EventReport metadata action 共用的 GC 在途硬上限；默认 64。
+# 一个慢 action 只占一个槽位，全部槽位占满后暂停扫描。
+kvcm.cache_gc.max_inflight_delete_requests=64
+# 迁移期开关：由常规 GC round 基于 EventReportBackend 当前状态统一回收 metadata；
+# 默认开启，但仍受 kvcm.cache_gc.enabled 总开关控制；总开关关闭时保留 legacy 路径。
+kvcm.cache_gc.event_report_cleanup_enabled=true
+# 每个 GC tick 最多提交的 EventReport metadata Block key 数；Location 总数仍受 scan_batch_size 限制。
+kvcm.cache_gc.event_report_action_batch_size=256
 
 # 可选值有dummy，local，logging，kmonitor；若不配置或配置为空，默认使用local
 kvcm.metrics.reporter_type=local
@@ -201,6 +213,16 @@ p99、CPU 与 ReportEvent RT。设计、指标含义、测试命令见
 完全相同的 source/target route 会被拒绝。重复 route 无法明确选择各自的 threshold、method、retention 和 Mark
 timeout，因此不会使用配置数组顺序作为隐式优先级。
 
+### 恢复阶段的 jemalloc arena 轮换（进程环境变量）
+
+单线程恢复会将缓存对象集中分配到一个 arena，后续请求线程在其他 arena 分配更新对象时，旧 arena 中尚未完全空闲的 slab 难以释放、其中的空洞也难以被新分配复用，可能导致 key 数和业务缓存用量稳定而 RSS 持续上涨。
+
+`KVCM_RECOVER_ARENA_ROTATION_ENABLED` 默认 `true`，设为 `false` 可关闭。
+这是当前单线程恢复的过渡方案：按非空批次轮换 arena，以改善恢复对象的分配分布。
+arena 数量自动读取；未使用 jemalloc、只有一个 arena 或启用 per-CPU arena 模式时不生效。
+本功能不调整 arena 数量，也不整理已有碎片；后续共享业务线程池的演进方向记录在
+[`MetaStorageBackendManager::AsyncRecoverTask`](../kv_cache_manager/meta/meta_storage_backend_manager.cc) 的 TODO 中。
+
 ## CacheManager Initial Config
 
 ```TEXT
@@ -221,7 +243,7 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
         "global_quota_group_name": "default_quota_group", # 暂未使用
         "max_instance_count": 100, # 与该group绑定的instance数量上限
         "quota": { # 该instance group的用量quota配置，该配置与下列行为相关：写入行为，数据回收（逐出）时机
-            "capacity": 30000000000, # 属于该instance group的所有instance可使用的总byte size上限，超过该值后会停止分配存储后端
+            "capacity": 30000000000, # 属于该instance group的所有instance可使用的总byte size上限，超过该值后会停止分配存储后端（除去EventReport）
             "quota_config": [ # 分storage type的quota值，同样由各个instance的用量累加得到，超过该quota后停止往该storage type的后端写入
                 {
                     "storage_type": "file",
@@ -247,7 +269,8 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
                 "trigger_strategy": {
                     "used_percentage": 0.8 # 控制数据用量水位，当用量达到或超过quota * percentage时将触发回收（逐出）
                 },
-                "delay_before_delete_ms": 1000 # 控制从提交删除请求到实际执行删除动作的间隔，类似于租约概念
+                "delay_before_delete_ms": 1000, # 控制从提交删除请求到实际执行删除动作的间隔，类似于租约概念
+                "instance_reclaim_budget_policy": 2 # 2=GROUP_LRU（默认，跨 Instance 按访问时间逐出）；0=USAGE_PROPORTIONAL；1=FIXED_PER_INSTANCE
             },
             # cache_prefer_strategy与storage candidates一起控制storage backend选择策略，可选值如下：
             # enum class CachePreferStrategy {
@@ -268,12 +291,13 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
                 "max_key_count": 1000000, # 单个meta indexer的key数量上限，同样影响reclaimer的逐出水位计算
                 "mutex_shard_num": 16,
                 "batch_key_size": 16,
-                "meta_storage_backend_config": { # 控制meta indexer的storage backend，可选local本地文件或者redis
+                "meta_storage_backend_config": { # 元数据 backend，可选 local / redis / cached
                     # Redis示例：
                     # "storage_type": "redis",
                     # "storage_uri": "redis://your_auth_token@redis-host:6379/?db=3&client_max_pool_size=16"
                     "storage_type": "local",
-                    "storage_uri": ""
+                    "storage_uri": "",
+                    "memory_primary": false # 默认关闭；仅 cached + local + async_redis 可开启
                 },
                 "meta_cache_policy_config": { # 控制 meta indexer数据cache的配置
                     "type": "LRU",
@@ -288,6 +312,51 @@ timeout，因此不会使用配置数组顺序作为隐式优先级。
     }
 }
 ```
+
+`meta_storage_backend_config.memory_primary` 默认 `false`，保持原双写顺序。开启示例：
+
+```json
+{"storage_type":"cached","storage_uri":"redis://redis-backup:6379/?persistent_type=async_redis&cache_type=local&capacity=4096&async_max_size=102400","memory_primary":true}
+```
+
+启动保留 Redis Open 与辅助计数恢复；Init 完成后即可读写，全量回填异步进行。Recover 期间未回填 key 的读取及
+Upsert/部分删除的写前补齐仍可能依赖 Redis；Recover 保持原有 Redis-first 条件双写和队列反压，Redis 写未接受时
+不会更新 local。全量回填完成并进入 Running 后，普通写切换为 local-first，Redis 只做有界异步备份，队列满不等待、
+丢弃新备份。
+`async_max_size` 按每队列 key 操作数计量，metadata 占一个容量单位；不额外估算 payload 字节或维护 in-flight
+字节额度。新模式不使用 `async_enqueue_timeout_ms` 等待 Running 阶段的备份容量；Recover 阶段的 Redis 主写
+仍沿用该超时。Running 阶段备份入队失败不回退 local，也不改变普通写结果。物理删除与回滚复用原有锁外
+`Sync` 和 RedisClient 有限重试，
+不新增队列级粘性失败状态；`Sync` 不占用 MetaIndexer shard mutex。
+观察 `async_dropped_key_count` 和 `async_dropped_metadata_count`；两者按采集周期清零。
+普通写成功不承诺 Redis 持久化，重启可能丢新增、回退逻辑删除。无自动补齐/在线热切换；所有可接管服务和运维工具升级后才可开启。
+开启或关闭前按 [设计文档](design/meta_memory_primary_async_backup.md) 执行停写、备份校准及重建。
+kvcm_ops 的 CLI 参数为 `--meta_storage_backend_config 'cached,redis://redis-backup:6379/?persistent_type=async_redis,true'`，
+旧的一段/两段参数仍可使用，GET→编辑→PUT 会保留该字段。
+
+`instance_reclaim_budget_policy` 选择同一 Group 内如何逐出，Admin API 和 `kvcm_ops` 使用枚举名，Registry JSON 持久化整数：
+
+| 模式 | 值 | 行为 |
+|---|---|---|
+| `GROUP_LRU` | `2` | 默认。各 Instance 提供候选，按访问时间统一排序，优先尝试删除最冷的 block |
+| `USAGE_PROPORTIONAL` | `0` | 按当前超水位维度的用量分配预算，跨轮轮转执行，避免有预算的小 Instance 长期轮不到 |
+| `FIXED_PER_INSTANCE` | `1` | 固定 per-instance 预算，按原注册表顺序执行 |
+
+三种模式都在 Group/Type credit 已使水位恢复后停止，不以清空无流量 Instance 为目标。配置缺字段时进入 `GROUP_LRU`；已有显式 `0`、`1` 不会被默认值覆盖。GET→修改无关字段→UPDATE 应保留返回的模式。`GROUP_LRU` 仅允许 `reclaim_policy=POLICY_LRU` 或 `POLICY_UNSPECIFIED`，不支持与 LFU / TTL 组合。
+
+容量比例模式中，服务级 `key_sampling_size_total` 和 `del_batch_size` 仍限制每个 Instance 的单次采样 / 删除预算，倾斜产生的超额份额留给后续轮次。Group LRU 则将两者作为单 Instance 基准，按有效 Instance 数 `N` 计算理论总量 `S*N`、`B*N`，在 Group 内统一选择 victim；一次请求仍不超过 `B`，同一 Instance 一轮可以收到多次请求。它不承诺每轮必须删满理论预算。
+
+Group LRU 使用以下进程级参数，均须为正整数，仅影响该模式：
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `kvcm.cache_reclaimer.group_lru_max_sampling_size` | `65536` | 单个 Group 一轮的总采样名额上限；不足以覆盖全部 Instance 时按队列轮转采样子集 |
+| `kvcm.cache_reclaimer.group_lru_min_sampling_ratio` | `10` | 采样 / 删除基准的最小倍数；新模式使用 `S=max(S_cfg, B_cfg*ratio)`，不改变旧模式的共享预算。显式设为 `1` 可用于低采样比例对照，但可能提前选中其他 Instance 的较新数据 |
+| `kvcm.cache_reclaimer.group_lru_max_delete_requests_per_round` | `128` | 单个 Group 一轮尝试提交的非空删除请求数上限；Executor 拒绝的请求也计数 |
+
+采样总量受限、部分 Instance 收集失败，或去重及 Location 过滤后有效候选不足时，Group batch 同步缩小以保持采样 / 删除比例；非空候选至少保留一个删除名额，避免小尾部因取整无法清空。单次 Instance 采样仍小于 `65536`。纯 Local 或 cached 恢复完成且实际采样后端为 Local 时，同一 Instance 使用一个采样任务，不因提高采样预算而并行拆分；纯 Redis、恢复中的 cached 保留有界任务拆分，不同 Instance 仍可并行。采样按“一半基础份额、一半按 key 数分配”扩大冷候选覆盖，不是严格全量 LRU。详见 [Group LRU 设计](design/cache_reclaimer_group_lru.md)。
+
+升级和回滚需注意：缺字段的旧 Registry 数据会采用新默认值；希望保持旧模式的 Group 应提前明确配置 `0` 或 `1`。旧 proto3 客户端会省略隐式零值，若需显式选择 `USAGE_PROPORTIONAL`，应升级到支持该字段 oneof 存在性的客户端，或使用明确携带字段的 Admin JSON。旧二进制不保证识别 `2`，回滚前应把新模式切回旧模式并回读确认。历史 LFU / TTL 配置若缺少模式字段，也应先明确选择旧模式或切为 LRU。
 
 TairMempool DRAM 使用 `pace`（proto `ST_TAIRMEMPOOL`），LocalSSD 使用
 `pace_ssd`（proto `ST_TAIRMEMPOOL_SSD`，同时要求 `media_type=5`）。两类 storage

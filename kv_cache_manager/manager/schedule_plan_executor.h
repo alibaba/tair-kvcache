@@ -16,6 +16,7 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -43,6 +44,9 @@ struct CacheMetaDelRequest {
 struct PlanExecuteResult {
     ErrorCode status;
     std::string error_message;
+    // True only when every failure in this result has already been logged.
+    // Callers can retain result metrics without repeating the diagnostics.
+    bool error_logged{false};
 };
 
 struct AsyncDeleteSubmitResult {
@@ -61,9 +65,32 @@ struct CacheLocationDelRequest {
     // Event-report metadata describes externally owned cache. Its reconciliation
     // cleanup must remove only KVCM metadata and never call the URI backend.
     bool metadata_only{false};
-    // Maintenance scans observe the persistent source of truth. Revalidate
-    // admission there and refresh candidate keys into the hot cache before CAS.
+    // GC physical deletion revalidates against the persistent source of truth
+    // and refreshes candidate keys into the hot cache before CAS.
     bool authoritative_read{false};
+    // URIs that the submitter has already confirmed absent. Physical deletion
+    // skips these idempotently while still deleting any remaining specs in the
+    // same Location.
+    std::set<std::string> confirmed_missing_uris;
+};
+
+struct EventReportMetadataDeleteTarget {
+    std::string location_id;
+    std::string expected_location_value;
+    std::string backend_unique_name;
+    DataStorageType storage_type{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN};
+    std::weak_ptr<EventReportBackend> expected_backend;
+    EventReportBackend::MaintenanceCleanupToken cleanup_token;
+};
+
+// Metadata-only reconciliation for externally owned EventReport cache. The
+// Executor revalidates the backend incarnation and cleanup token immediately
+// before an expected-value, no-touch RMW. It never changes Location status or
+// calls the data-storage physical DELETE path.
+struct EventReportMetadataDelRequest {
+    std::string instance_id;
+    std::vector<int64_t> block_keys;
+    std::vector<std::vector<EventReportMetadataDeleteTarget>> targets;
 };
 
 // 单个 block 的跨存储复制请求。URI 由上层（MigrationManager）解析与预分配后传入；
@@ -118,6 +145,7 @@ public:
     std::future<PlanExecuteResult> Submit(const CacheLocationCopyRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheMetaDelRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheLocationDelRequest &task);
+    AsyncDeleteSubmitResult SubmitAsync(const EventReportMetadataDelRequest &task);
 
     bool SubmitNonBlocking(const CacheMetaDelRequest &req, ScheduleTaskClass task_class = ScheduleTaskClass::kSystem);
     bool SubmitNonBlocking(const CacheLocationDelRequest &req,
@@ -128,6 +156,8 @@ public:
                     std::function<void()> task,
                     std::chrono::microseconds delay = std::chrono::microseconds(0),
                     std::function<void()> cancel_task = {});
+
+    std::size_t GetWorkerCount() const noexcept { return workers_.size(); }
 
 private:
     struct PromiseCompletion;
@@ -185,6 +215,7 @@ private:
     std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
                                                         ScheduleTaskClass task_class);
     PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task);
+    PlanExecuteResult DoEventReportMetadataDelTask(const EventReportMetadataDelRequest &task);
     void DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
                     const CacheLocationCopyRequest &task);
 

@@ -2,7 +2,9 @@
 
 
 import abc
+import json
 import logging
+import os
 import time
 import unittest
 
@@ -293,7 +295,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         )
 
     def test_no_over_eviction_same_group_multiple_instances(self):
-        """A Group-wide credit stops admission before the next instance."""
+        """Group credit stops admission after three one-key requests."""
         self.worker_manager.stop_worker(0)
         self.assertTrue(
             self.worker_manager.start_worker(
@@ -358,7 +360,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         })
 
         self._wait_metric_value(
-            "cache_reclaimer.pending_delete_handler_count", 1, timeout_s=5
+            "cache_reclaimer.pending_delete_handler_count", 3, timeout_s=5
         )
         self._wait_metric_value(
             "cache_reclaimer.pending_delete_handler_count", 0, timeout_s=10
@@ -369,19 +371,116 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         )
         self.assertEqual(
             self._metric_value("cache_reclaimer.delete_submit_count"),
-            1,
+            3,
             "Group credit should prevent admission from the next instance",
         )
         self.assertGreaterEqual(
             surviving_blocks,
-            8,
-            "Group credit should limit delayed reclaim to one four-key batch",
+            9,
+            "Group credit should limit delayed reclaim to three one-key requests",
         )
         self.assertLess(
             surviving_blocks,
             12,
             "the delayed reclaim batch should still complete",
         )
+
+    def test_group_lru_prefers_small_cold_instance(self):
+        """Global LRU evicts cold keys, not a per-Instance capacity share."""
+        self.worker_manager.stop_worker(0)
+        self.assertTrue(self.worker_manager.start_worker(0, **{
+            "kvcm.cache_reclaimer.del_batch_size": 2,
+            "kvcm.cache_reclaimer.key_sampling_size_total": 64,
+        }))
+        self._admin_client.close()
+        self._client.close()
+        self._admin_client, self._client = self._get_manager_client()
+        self._admin_client.add_storage({"trace_id": self._trace_id,
+                                        "storage": self._make_dummy_storage()})
+        group = self._make_dummy_instance_group()
+        group["quota"] = {"capacity": 20 * 1024, "quota_config": []}
+        indexer = group["cache_config"]["meta_indexer_config"]
+        indexer["max_key_count"] = 128
+        indexer["meta_storage_backend_config"] = {
+            "storage_type": "local",
+            "storage_uri": "local://?capacity=1024&num_shard_bits=0&sample_times=1",
+        }
+        strategy = group["cache_config"]["reclaim_strategy"]
+        strategy["instance_reclaim_budget_policy"] = "GROUP_LRU"
+        strategy["delay_before_delete_ms"] = 1000
+        self._admin_client.create_instance_group({"trace_id": self._trace_id, "instance_group": group})
+        # Business writes/readbacks establish a strictly older four-key Instance.
+        for instance_id, count in (("old_small", 4), ("new_large", 12)):
+            self._instance_id = instance_id
+            self._client.register_instance(self._make_dummy_ins_req())
+            for key in range(count):
+                self._write(key)
+        current_version = group["version"]
+        group["version"] += 1
+        strategy["trigger_strategy"]["used_percentage"] = 0.71
+        self._admin_client.update_instance_group({
+            "trace_id": self._trace_id, "instance_group": group, "current_version": current_version,
+        })
+        # Do not read keys while waiting: foreground verification would itself refresh LRU.
+        self._wait_metric_value("cache_reclaimer.delete_submit_count", 2, timeout_s=5)
+        self._wait_metric_value("cache_reclaimer.pending_delete_handler_count", 0, timeout_s=10)
+        self.assertEqual(2, self._count_surviving_blocks("old_small", range(4)))
+        self.assertEqual(12, self._count_surviving_blocks("new_large", range(12)))
+        self.assertEqual(2, self._metric_value("cache_reclaimer.delete_submit_count"))
+        self.assertEqual(2, self._metric_value("cache_reclaimer.group_lru_submitted_block_count"))
+
+    def test_group_lru_default_and_explicit_modes_survive_restart(self):
+        """HTTP/Registry preserve explicit zero and apply the new absent-field default."""
+        # The default test Registry is memory-only. Use a private persistence
+        # file so the restart actually exercises Registry recovery.
+        registry_path = os.path.join(self.get_workdir(), "registry_data.json")
+        server_options = {"kvcm.registry_storage.uri": f"local://{registry_path}"}
+        self.worker_manager.stop_worker(0)
+        self.assertTrue(self.worker_manager.start_worker(0, **server_options))
+        self._admin_client.close()
+        self._client.close()
+        self._admin_client, self._client = self._get_manager_client()
+        self._admin_client.add_storage({"trace_id": self._trace_id,
+                                        "storage": self._make_dummy_storage()})
+        expected = {}
+        for index, mode in enumerate((None, 0, "FIXED_PER_INSTANCE", "GROUP_LRU")):
+            group = self._make_dummy_instance_group()
+            group["name"] = f"mode_group_{index}"
+            if mode is not None:
+                group["cache_config"]["reclaim_strategy"]["instance_reclaim_budget_policy"] = mode
+            self._admin_client.create_instance_group({"trace_id": self._trace_id, "instance_group": group})
+            expected[group["name"]] = "USAGE_PROPORTIONAL" if mode == 0 else (mode or "GROUP_LRU")
+        for name, mode in expected.items():
+            response = self._admin_client.get_instance_group({"trace_id": self._trace_id, "name": name})
+            group = response["instance_group"]
+            self.assertEqual(mode, group["cache_config"]["reclaim_strategy"]["instance_reclaim_budget_policy"])
+            version = int(group["version"])
+            group["version"] = version + 1
+            group["user_data"] = "unrelated update preserves eviction mode"
+            self._admin_client.update_instance_group({
+                "trace_id": self._trace_id, "instance_group": group, "current_version": version,
+            })
+        self.worker_manager.stop_worker(0)
+        # Reproduce an older Registry record with no policy field; leave the
+        # other records' explicit 0/1/2 values intact.
+        with open(registry_path) as registry_file:
+            registry = json.load(registry_file)
+        groups = json.loads(registry["instance_group"])
+        # Preserve the exact Registry payload: legacy quota JSON contains
+        # duplicate storage_type fields that a dict round-trip would collapse.
+        policy_field = ',"instance_reclaim_budget_policy":2'
+        self.assertEqual(1, groups["mode_group_0"].count(policy_field))
+        groups["mode_group_0"] = groups["mode_group_0"].replace(policy_field, "", 1)
+        registry["instance_group"] = json.dumps(groups)
+        with open(registry_path, "w") as registry_file:
+            json.dump(registry, registry_file)
+        self.assertTrue(self.worker_manager.start_worker(0, **server_options))
+        self._admin_client.close()
+        self._client.close()
+        self._admin_client, self._client = self._get_manager_client()
+        for name, mode in expected.items():
+            group = self._admin_client.get_instance_group({"trace_id": self._trace_id, "name": name})["instance_group"]
+            self.assertEqual(mode, group["cache_config"]["reclaim_strategy"]["instance_reclaim_budget_policy"])
 
     def test_no_progress_uses_polling_backoff(self):
         """Active writers keep a hot water level from spinning the cron."""
@@ -453,9 +552,9 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
     ):
         """Write 12 blocks, then trigger reclaim with a five-second delay.
 
-        A four-key batch is sufficient to move either configured water level
-        from 60% to 40%. The pending request must therefore credit the water
-        level immediately and prevent a second batch during the delay window.
+        The effective-candidate ratio produces one-key requests in this
+        small pool. Three requests move either water level from 60% to 45%
+        (equality at 50% still triggers). Credit must prevent a fourth request.
         The Future terminal state must release all temporary accounting.
         """
         self.worker_manager.stop_worker(0)
@@ -527,46 +626,46 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             "instance_group": self._instance_group_name,
         }
         inflight_metrics = self._wait_metric_values([
-            ("cache_reclaimer.delete_submit_count", {}, 1),
+            ("cache_reclaimer.delete_submit_count", {}, 3),
             ("cache_reclaimer.delete_complete_count", {}, 0),
-            ("cache_reclaimer.pending_delete_handler_count", {}, 1),
-            ("cache_reclaimer.pending_location_count", {}, 4),
-            ("cache_reclaimer.pending_delete_bytes", {}, 4 * 1024),
-            ("cache_reclaimer.credited_delete_bytes", {}, 4 * 1024),
-            ("cache_reclaimer.predicted_deleted_key_count", {}, 4),
+            ("cache_reclaimer.pending_delete_handler_count", {}, 3),
+            ("cache_reclaimer.pending_location_count", {}, 3),
+            ("cache_reclaimer.pending_delete_bytes", {}, 3 * 1024),
+            ("cache_reclaimer.credited_delete_bytes", {}, 3 * 1024),
+            ("cache_reclaimer.predicted_deleted_key_count", {}, 3),
             (
                 "cache_reclaimer.pending_location_count",
                 expected_group_type_tags,
-                4,
+                3,
             ),
             (
                 "cache_reclaimer.pending_delete_bytes",
                 expected_group_type_tags,
-                4 * 1024,
+                3 * 1024,
             ),
             (
                 "cache_reclaimer.credited_delete_bytes",
                 expected_group_type_tags,
-                4 * 1024,
+                3 * 1024,
             ),
             (
                 "cache_reclaimer.predicted_deleted_key_count",
                 expected_group_tags,
-                4,
+                3,
             ),
         ])
         logging.info("delayed reclaim in-flight metrics: %s", inflight_metrics)
         self._wait_surviving_block_count(
             self._instance_id,
             range(12),
-            expected_count=8,
+            expected_count=9,
             timeout_s=2,
         )
 
         completed_metrics = self._wait_metric_values(
             [
-                ("cache_reclaimer.delete_submit_count", {}, 1),
-                ("cache_reclaimer.delete_complete_count", {}, 1),
+                ("cache_reclaimer.delete_submit_count", {}, 3),
+                ("cache_reclaimer.delete_complete_count", {}, 3),
                 ("cache_reclaimer.pending_delete_handler_count", {}, 0),
                 ("cache_reclaimer.pending_location_count", {}, 0),
                 ("cache_reclaimer.pending_delete_bytes", {}, 0),
@@ -609,8 +708,8 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         )
         self.assertGreaterEqual(
             surviving_blocks,
-            8,
-            "in-flight credit should limit delayed reclaim to one batch",
+            9,
+            "in-flight credit should limit delayed reclaim to three one-key requests",
         )
         self.assertLess(
             surviving_blocks,
@@ -619,8 +718,8 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         )
         self.assertEqual(
             self._metric_value("cache_reclaimer.delete_submit_count"),
-            1,
-            "fresh credit should prevent admission of a second batch",
+            3,
+            "fresh credit should prevent admission of a fourth request",
         )
 
     def _wait_metric_value(

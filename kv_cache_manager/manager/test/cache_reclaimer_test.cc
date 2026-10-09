@@ -4,17 +4,23 @@
 #include <condition_variable>
 #include <cstddef>
 #include <exception>
+#include <functional>
 #include <future>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
@@ -43,6 +49,8 @@
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
+#include "kv_cache_manager/meta/meta_storage_backend_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub.h"
 
@@ -70,12 +78,15 @@ MakeServingLocationMaps(const std::size_t count, const DataStorageType type = Da
 CacheLocationConstPtr MakeCacheLocation(const std::string &location_id,
                                         const CacheLocationStatus status,
                                         const DataStorageType type,
-                                        const std::string &uri) {
+                                        const std::string &uri,
+                                        const std::int64_t create_time = 0) {
     std::vector<LocationSpec> specs;
     if (!uri.empty()) {
         specs.emplace_back("test_spec", uri);
     }
-    return std::make_shared<CacheLocation>(location_id, status, type, specs.size(), std::move(specs));
+    auto location = std::make_shared<CacheLocation>(location_id, status, type, specs.size(), std::move(specs));
+    location->set_create_time(create_time);
+    return location;
 }
 
 class TypedTestBackend : public DataStorageBackend {
@@ -163,6 +174,9 @@ std::shared_ptr<InstanceGroup> InstanceGroupFactory() {
     // create reclaim strategy
     const auto reclaim_strategy = std::make_shared<CacheReclaimStrategy>();
     reclaim_strategy->set_storage_unique_name("3fs_storage_01");
+    // Existing tests exercise the legacy/proportional paths explicitly;
+    // Group LRU tests select the new application default separately.
+    reclaim_strategy->set_instance_reclaim_budget_policy(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL);
     reclaim_strategy->set_reclaim_policy(ReclaimPolicy::POLICY_LRU);
     reclaim_strategy->set_trigger_strategy(trigger_strategy);
     reclaim_strategy->set_trigger_period_seconds(60);
@@ -252,6 +266,8 @@ PlanExecuteResult del_result;
 bool spe_submit_accepted;
 bool spe_submit_auto_complete;
 bool spe_submit_invalid_future;
+std::map<std::string, bool> spe_submit_accepted_by_instance;
+std::function<void(const CacheLocationDelRequest &)> spe_submit_accepted_callback;
 std::vector<CacheLocationDelRequest> submitted_del_requests;
 std::vector<std::shared_ptr<std::promise<PlanExecuteResult>>> submitted_del_promises;
 std::mutex submitted_del_requests_mutex;
@@ -259,16 +275,26 @@ using spe_submit_async_loc = AsyncDeleteSubmitResult (SchedulePlanExecutor::*)(c
 
 AsyncDeleteSubmitResult SchedulePlanExecutor_SubmitAsync_stub(void *obj, const CacheLocationDelRequest &request) {
     const auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
+    bool accepted = spe_submit_accepted;
+    std::function<void(const CacheLocationDelRequest &)> accepted_callback;
     {
         std::lock_guard<std::mutex> lock(submitted_del_requests_mutex);
         submitted_del_requests.emplace_back(request);
-        if (!spe_submit_auto_complete) {
+        const auto accepted_it = spe_submit_accepted_by_instance.find(request.instance_id);
+        if (accepted_it != spe_submit_accepted_by_instance.end()) {
+            accepted = accepted_it->second;
+        }
+        accepted_callback = spe_submit_accepted_callback;
+        if (accepted && !spe_submit_auto_complete) {
             submitted_del_promises.emplace_back(promise);
         }
     }
     std::this_thread::sleep_for(spe_submit_delay);
-    if (!spe_submit_accepted) {
+    if (!accepted) {
         return {};
+    }
+    if (accepted_callback) {
+        accepted_callback(request);
     }
     if (spe_submit_invalid_future) {
         return AsyncDeleteSubmitResult{true, {}};
@@ -284,8 +310,14 @@ AsyncDeleteSubmitResult SchedulePlanExecutor_SubmitAsync_stub(void *obj, const C
 
 // the dummy meta_indexer that the meta_indexer_manager would return
 std::shared_ptr<MetaIndexer> dummy_meta_indexer;
+std::map<std::string, std::shared_ptr<MetaIndexer>> meta_indexers_by_instance;
+std::map<const void *, std::string> instance_id_by_meta_indexer;
 
 std::shared_ptr<MetaIndexer> MetaIndexerManager_GetMetaIndexer_stub(void *obj, const std::string &i) {
+    const auto it = meta_indexers_by_instance.find(i);
+    if (it != meta_indexers_by_instance.end()) {
+        return it->second;
+    }
     return dummy_meta_indexer;
 }
 
@@ -294,12 +326,14 @@ std::shared_ptr<MetaIndexer> MetaIndexerManager_GetMetaIndexer_stub(void *obj, c
 std::chrono::milliseconds mi_getprop_delay{0};
 ErrorCode get_result;
 PropertyMapVector get_out_properties;
+std::atomic<int> mi_getprop_call_count{0};
 
 MetaIndexer::Result MetaIndexer_GetProperties_stub(void *obj,
                                                    RequestContext *rc,
                                                    const KeyVector &k,
                                                    const std::vector<std::string> &p,
                                                    PropertyMapVector &out_properties) noexcept {
+    ++mi_getprop_call_count;
     if (get_result == ErrorCode::EC_OK) {
         if (k.size() == get_out_properties.size()) {
             out_properties = get_out_properties;
@@ -340,36 +374,78 @@ MetaIndexer_RandomSample_stub(void *obj, RequestContext *rc, const std::size_t c
     return random_sample_result;
 }
 
-/* ---------------- MetaIndexer_SampleReclaimKeys_stub ---------------- */
+/* ---------------- MetaIndexer_SampleReclaimCandidates_stub ---------------- */
 
 std::chrono::milliseconds mi_sample_reclaim_delay{0};
 ErrorCode sample_reclaim_result;
+std::vector<ErrorCode> sample_reclaim_results;
+std::vector<std::chrono::milliseconds> mi_sample_reclaim_delays;
+std::size_t sample_reclaim_call_count;
 KeyVector sample_reclaim_keys;
 int sample_reclaim_call_counter;
+std::mutex sample_reclaim_requests_mutex;
+std::vector<std::pair<std::string, std::int64_t>> sample_reclaim_requests;
 
-ErrorCode
-MetaIndexer_SampleReclaimKeys_stub(void *obj, RequestContext *rc, const std::int64_t c, KeyVector &out_keys) noexcept {
+ErrorCode MetaIndexer_SampleReclaimCandidates_stub(void *obj,
+                                                   RequestContext *rc,
+                                                   const std::int64_t c,
+                                                   ReclaimCandidateVector &out_candidates,
+                                                   bool /*require_read_success*/) noexcept {
     ++sample_reclaim_call_counter;
-    if (sample_reclaim_result == ErrorCode::EC_OK) {
-        if (c == static_cast<std::int64_t>(sample_reclaim_keys.size())) {
-            out_keys = sample_reclaim_keys;
-        } else if (c == 11) {
-            // special case
-            out_keys = sample_reclaim_keys;
-        } else {
-            out_keys = KeyVector(c);
+    ErrorCode result = sample_reclaim_result;
+    std::chrono::milliseconds delay = mi_sample_reclaim_delay;
+    {
+        std::lock_guard<std::mutex> lock(sample_reclaim_requests_mutex);
+        const auto it = instance_id_by_meta_indexer.find(obj);
+        sample_reclaim_requests.emplace_back(it == instance_id_by_meta_indexer.end() ? std::string{} : it->second, c);
+        const std::size_t call_index = sample_reclaim_call_count++;
+        if (call_index < sample_reclaim_results.size()) {
+            result = sample_reclaim_results[call_index];
+        }
+        if (call_index < mi_sample_reclaim_delays.size()) {
+            delay = mi_sample_reclaim_delays[call_index];
         }
     }
-    std::this_thread::sleep_for(mi_sample_reclaim_delay);
-    return sample_reclaim_result;
+    if (result == ErrorCode::EC_OK) {
+        KeyVector sampled_keys;
+        if (c == static_cast<std::int64_t>(sample_reclaim_keys.size())) {
+            sampled_keys = sample_reclaim_keys;
+        } else if (c == 11) {
+            // special case
+            sampled_keys = sample_reclaim_keys;
+        } else {
+            sampled_keys = KeyVector(c);
+        }
+        out_candidates.clear();
+        out_candidates.reserve(sampled_keys.size());
+        const bool properties_available =
+            get_result == ErrorCode::EC_OK && sampled_keys.size() == get_out_properties.size();
+        for (size_t i = 0; i < sampled_keys.size(); ++i) {
+            int64_t last_access_time_us = 0;
+            if (properties_available) {
+                const auto it = get_out_properties[i].find(PROPERTY_LRU_TIME);
+                if (it != get_out_properties[i].end()) {
+                    StringUtil::StrToInt64(it->second.c_str(), last_access_time_us);
+                }
+            }
+            out_candidates.push_back({sampled_keys[i], last_access_time_us});
+        }
+    }
+    std::this_thread::sleep_for(delay);
+    std::this_thread::sleep_for(mi_getprop_delay);
+    return result;
 }
 
 /* ---------------- MetaIndexer KeyCount stubs ---------------- */
 
 std::size_t key_count;
 std::size_t max_key_count;
+std::map<const void *, std::size_t> key_count_by_meta_indexer;
 
-size_t MetaIndexer_GetKeyCount_stub(void *obj) noexcept { return key_count; }
+size_t MetaIndexer_GetKeyCount_stub(void *obj) noexcept {
+    const auto it = key_count_by_meta_indexer.find(obj);
+    return it == key_count_by_meta_indexer.end() ? key_count : it->second;
+}
 
 size_t MetaIndexer_GetMaxKeyCount_stub(void *obj) noexcept { return max_key_count; }
 
@@ -411,6 +487,106 @@ std::string captured_copy_trace;
 std::vector<std::int64_t> captured_mark_keys;
 std::string captured_mark_target;
 
+struct GroupLruTestBackend {
+    KeyVector keys;
+    std::map<std::int64_t, std::string> times;
+    std::map<std::int64_t, std::deque<std::string>> time_versions;
+    std::map<std::int64_t, CacheLocationMap> locations;
+    std::size_t cursor{0};
+    std::size_t sampling_calls{0};
+    std::size_t fail_sampling_call{0};
+    ErrorCode property_error{ErrorCode::EC_OK};
+    ErrorCode location_error{ErrorCode::EC_OK};
+    std::chrono::milliseconds sampling_delay{0};
+    std::chrono::milliseconds location_delay{0};
+    std::function<void()> sampling_hook;
+};
+std::mutex group_lru_test_mutex;
+std::map<std::string, GroupLruTestBackend> group_lru_test_backends;
+std::function<void()> group_lru_location_read_hook;
+std::vector<std::string> group_lru_location_reads;
+
+ErrorCode GroupLruSample_stub(void *obj,
+                              RequestContext *request_context,
+                              std::int64_t count,
+                              ReclaimCandidateVector &candidates,
+                              bool require_read_success) noexcept {
+    if (!require_read_success) {
+        return MetaIndexer_SampleReclaimCandidates_stub(obj, request_context, count, candidates, false);
+    }
+    std::chrono::milliseconds delay{0};
+    std::function<void()> sampling_hook;
+    ErrorCode ec = ErrorCode::EC_OK;
+    {
+        std::lock_guard<std::mutex> lock(group_lru_test_mutex);
+        const auto &id = instance_id_by_meta_indexer.at(obj);
+        auto &backend = group_lru_test_backends.at(id);
+        delay = backend.sampling_delay;
+        sampling_hook = backend.sampling_hook;
+        ++backend.sampling_calls;
+        if (backend.sampling_calls == backend.fail_sampling_call) {
+            ec = ErrorCode::EC_ERROR;
+        }
+        candidates.clear();
+        if (ec == ErrorCode::EC_OK && backend.property_error != ErrorCode::EC_NOENT) {
+            ec = backend.property_error;
+        }
+        for (std::size_t i = 0; i < std::min(static_cast<std::size_t>(count), backend.keys.size()); ++i) {
+            const auto key = backend.keys[backend.cursor++ % backend.keys.size()];
+            if (ec != ErrorCode::EC_OK || backend.property_error == ErrorCode::EC_NOENT) {
+                continue;
+            }
+            std::string value;
+            if (const auto it = backend.times.find(key); it != backend.times.end()) {
+                value = it->second;
+            }
+            auto &versions = backend.time_versions[key];
+            if (!versions.empty()) {
+                value = versions.front();
+                if (versions.size() > 1) {
+                    versions.pop_front();
+                }
+            }
+            int64_t time = 0;
+            if (!StringUtil::StrToInt64(value.c_str(), time)) {
+                time = 0;
+            }
+            candidates.push_back({key, time});
+        }
+    }
+    if (sampling_hook) {
+        sampling_hook();
+    }
+    std::this_thread::sleep_for(delay);
+    return ec;
+}
+
+MetaIndexer::Result
+GroupLruLocations_stub(void *obj, RequestContext *, const KeyVector &keys, CacheLocationMapVector &maps) noexcept {
+    MetaIndexer::Result result(keys.size());
+    std::chrono::milliseconds delay{0};
+    {
+        std::lock_guard<std::mutex> lock(group_lru_test_mutex);
+        const auto &id = instance_id_by_meta_indexer.at(obj);
+        auto &backend = group_lru_test_backends.at(id);
+        delay = backend.location_delay;
+        group_lru_location_reads.push_back(id);
+        maps.assign(keys.size(), CacheLocationMap{});
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            result.error_codes[i] = backend.location_error;
+            if (const auto it = backend.locations.find(keys[i]); it != backend.locations.end()) {
+                maps[i] = it->second;
+            }
+        }
+        result.ec = backend.location_error;
+    }
+    if (group_lru_location_read_hook) {
+        group_lru_location_read_hook();
+    }
+    std::this_thread::sleep_for(delay);
+    return result;
+}
+
 class CacheReclaimerTest : public TESTBASE {
 public:
     void SetUp() override {
@@ -422,7 +598,7 @@ public:
         stub_.set(ADDR(MetaIndexerManager, GetMetaIndexer), MetaIndexerManager_GetMetaIndexer_stub);
         stub_.set(ADDR(MetaIndexer, GetProperties), MetaIndexer_GetProperties_stub);
         stub_.set(ADDR(MetaIndexer, RandomSample), MetaIndexer_RandomSample_stub);
-        stub_.set(ADDR(MetaIndexer, SampleReclaimKeys), MetaIndexer_SampleReclaimKeys_stub);
+        stub_.set(ADDR(MetaIndexer, SampleReclaimCandidates), MetaIndexer_SampleReclaimCandidates_stub);
         stub_.set(ADDR(MetaIndexer, GetKeyCount), MetaIndexer_GetKeyCount_stub);
         stub_.set(ADDR(MetaIndexer, GetMaxKeyCount), MetaIndexer_GetMaxKeyCount_stub);
         stub_.set(ADDR(MetaIndexer, PersistMetaData), MetaIndexer_PersistMetaData_stub);
@@ -437,6 +613,19 @@ public:
         list_ins_info_result = ErrorCode::EC_OK;
         instance_infos.emplace_back(InstanceInfoFactory());
 
+        meta_indexers_by_instance.clear();
+        instance_id_by_meta_indexer.clear();
+        key_count_by_meta_indexer.clear();
+        group_lru_test_backends.clear();
+        group_lru_location_read_hook = {};
+        group_lru_location_reads.clear();
+        {
+            std::lock_guard<std::mutex> lock(sample_reclaim_requests_mutex);
+            sample_reclaim_requests.clear();
+            sample_reclaim_results.clear();
+            mi_sample_reclaim_delays.clear();
+            sample_reclaim_call_count = 0;
+        }
         dummy_meta_indexer = std::make_shared<MetaIndexer>();
         dummy_meta_searcher = std::make_shared<MetaSearcher>(nullptr);
 
@@ -450,7 +639,10 @@ public:
         captured_copy_trace.clear();
         captured_mark_keys.clear();
         captured_mark_target.clear();
+        spe_submit_accepted_by_instance.clear();
+        spe_submit_accepted_callback = {};
         get_result = ErrorCode::EC_OK;
+        mi_getprop_call_count.store(0);
         random_sample_result = ErrorCode::EC_OK;
         sample_reclaim_result = ErrorCode::EC_OK;
         batch_get_loc_result = ErrorCode::EC_OK;
@@ -501,6 +693,8 @@ public:
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, pending_limit_reject_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, duplicate_pending_location_filtered_count) = mr_->GetCounter(
             SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, duplicate_pending_location_filtered_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, maintenance_touch_key_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, maintenance_touch_key_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_no_progress_backoff_count) =
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_no_progress_backoff_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, delete_submit_count) =
@@ -513,6 +707,70 @@ public:
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, migration_copy_submitted_total));
         cache_reclaimer_->METRICS_(cache_reclaimer, migration_mark_submitted_total) =
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, migration_mark_submitted_total));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_plan_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_plan_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_planned_batch_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_planned_batch_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_planned_sample_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_planned_sample_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_zero_weight_skip_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_zero_weight_skip_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_plan_truncated_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_plan_truncated_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_plan_truncated_instance_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_plan_truncated_instance_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_item_capped_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_item_capped_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_sampling_size_normalized_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_sampling_size_normalized_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_rotation_resume_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_rotation_resume_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_rotation_advance_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_rotation_advance_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_plan_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_plan_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_partial_plan_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_partial_plan_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_plan_failure_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_plan_failure_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_eligible_instance_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_eligible_instance_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_started_instance_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_started_instance_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_collected_instance_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_collected_instance_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_skipped_instance_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_skipped_instance_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_failed_instance_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_failed_instance_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_sampled_key_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_sampled_key_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_candidate_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_candidate_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_selected_block_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_selected_block_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_submitted_block_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_submitted_block_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_invalid_time_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_invalid_time_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_delete_request_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_delete_request_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_request_limit_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_request_limit_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_watermark_stop_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_watermark_stop_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_scope_change_stop_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_scope_change_stop_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_backpressure_stop_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_backpressure_stop_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_deadline_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_deadline_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_collect_duration_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_collect_duration_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_sort_duration_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_sort_duration_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_submit_duration_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_submit_duration_us));
 
         cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_cron_duration_us) =
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_cron_duration_us));
@@ -526,6 +784,18 @@ public:
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_lru_filter_duration_us));
         cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_lru_submit_duration_us) =
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_lru_submit_duration_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_batch_lru_age_min_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_batch_lru_age_min_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_batch_lru_age_max_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_batch_lru_age_max_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_batch_lru_age_avg_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_batch_lru_age_avg_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_batch_create_age_min_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_batch_create_age_min_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_batch_create_age_max_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_batch_create_age_max_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_batch_create_age_avg_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_batch_create_age_avg_us));
         cache_reclaimer_->METRICS_(cache_reclaimer, pending_delete_handler_count) =
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, pending_delete_handler_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, pending_location_count) =
@@ -538,6 +808,14 @@ public:
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, predicted_deleted_key_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, oldest_pending_request_age_ms) =
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, oldest_pending_request_age_ms));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_effective_instance_count) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_effective_instance_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_planned_instance_count) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_planned_instance_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_sampled_instance_count) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_sampled_instance_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, fair_submitted_instance_count) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, fair_submitted_instance_count));
     }
 
     void TearDown() override {
@@ -547,6 +825,9 @@ public:
         instance_groups.clear();
         instance_infos.clear();
 
+        meta_indexers_by_instance.clear();
+        instance_id_by_meta_indexer.clear();
+        key_count_by_meta_indexer.clear();
         dummy_meta_indexer.reset();
         dummy_meta_searcher.reset();
 
@@ -554,6 +835,8 @@ public:
             std::lock_guard<std::mutex> lock(submitted_del_requests_mutex);
             submitted_del_requests.clear();
             submitted_del_promises.clear();
+            spe_submit_accepted_by_instance.clear();
+            spe_submit_accepted_callback = {};
         }
         captured_copy_reqs.clear();
         captured_copy_req_batches.clear();
@@ -568,6 +851,13 @@ public:
         batch_get_loc_out_maps.clear();
         sample_reclaim_call_counter = 0;
         batch_get_loc_call_counter = 0;
+        {
+            std::lock_guard<std::mutex> lock(sample_reclaim_requests_mutex);
+            sample_reclaim_requests.clear();
+            sample_reclaim_results.clear();
+            mi_sample_reclaim_delays.clear();
+            sample_reclaim_call_count = 0;
+        }
 
         stub_.reset(ADDR(RegistryManager, ListInstanceGroup));
         stub_.reset(ADDR(RegistryManager, ListInstanceInfo));
@@ -575,7 +865,9 @@ public:
         stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
         stub_.reset(ADDR(MetaIndexer, GetProperties));
         stub_.reset(ADDR(MetaIndexer, RandomSample));
+        stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
         stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
+        stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
         stub_.reset(ADDR(MetaIndexer, GetKeyCount));
         stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
         stub_.reset(ADDR(MetaIndexer, PersistMetaData));
@@ -648,6 +940,31 @@ public:
         return submitted_del_requests.size();
     }
 
+    std::vector<std::pair<std::string, std::int64_t>> SampleReclaimRequestsSnapshot() {
+        std::lock_guard<std::mutex> lock(sample_reclaim_requests_mutex);
+        return sample_reclaim_requests;
+    }
+
+    void ClearSampleReclaimRequests() {
+        std::lock_guard<std::mutex> lock(sample_reclaim_requests_mutex);
+        sample_reclaim_requests.clear();
+        sample_reclaim_call_count = 0;
+    }
+
+    std::shared_ptr<MetaIndexer>
+    AddMetaIndexerForInstance(const std::string &instance_id,
+                              const std::uint64_t nfs_usage,
+                              const std::optional<std::size_t> instance_key_count = std::nullopt) {
+        auto meta_indexer = std::make_shared<MetaIndexer>();
+        meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, nfs_usage);
+        meta_indexers_by_instance[instance_id] = meta_indexer;
+        instance_id_by_meta_indexer[meta_indexer.get()] = instance_id;
+        if (instance_key_count.has_value()) {
+            key_count_by_meta_indexer[meta_indexer.get()] = *instance_key_count;
+        }
+        return meta_indexer;
+    }
+
     bool WaitUntilSubmittedDelRequests(std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
         return WaitUntil([this] { return HasSubmittedDelRequests(); }, timeout);
     }
@@ -692,6 +1009,155 @@ public:
         return list_ins_group_call_counter;
     }
 
+    std::shared_ptr<InstanceGroup> SetUpGroupLruScenario(const std::vector<std::string> &ids = {"a", "b"}) {
+        // Existing scheduling/ordering cases specify their own small S/B
+        // budgets. Default-ratio behavior is covered separately below.
+        cache_reclaimer_->group_lru_config_.min_sampling_ratio = 1;
+        stub_.set(ADDR(MetaIndexer, SampleReclaimCandidates), GroupLruSample_stub);
+        stub_.set(ADDR(MetaIndexer, GetLocationMapsForMaintenance), GroupLruLocations_stub);
+        cache_reclaimer_->job_state_flag_ = true;
+        cache_reclaimer_->sampling_size_per_task_.store(2);
+        EXPECT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 10));
+        EXPECT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 2));
+        spe_submit_auto_complete = false;
+        max_key_count = 1000000;
+        instance_infos.clear();
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            auto info = InstanceInfoFactory();
+            info->set_instance_id(ids[i]);
+            instance_infos.push_back(info);
+            AddMetaIndexerForInstance(ids[i], 10000, 32);
+            auto &data = group_lru_test_backends[ids[i]];
+            for (std::int64_t key = 1; key <= 32; ++key) {
+                data.keys.push_back(key);
+                data.times[key] = std::to_string(1000 + i * 1000 + key);
+                data.locations[key] = {{"loc",
+                                        MakeCacheLocation("loc",
+                                                          CacheLocationStatus::CLS_SERVING,
+                                                          DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                          "nfs://store/key?size=1")}};
+            }
+        }
+        auto group = InstanceGroupFactory();
+        group->quota_.set_capacity(100);
+        group->quota_.quota_config_.clear();
+        group->cache_config_->reclaim_strategy_->set_instance_reclaim_budget_policy(
+            InstanceReclaimBudgetPolicy::GROUP_LRU);
+        group->cache_config_->reclaim_strategy_->set_delay_before_delete_ms(1000);
+        instance_groups = {group};
+        rm_->instance_group_configs_[group->name()] = group;
+        return group;
+    }
+
+    std::vector<std::pair<std::string, std::int64_t>> GroupLruSubmittedBlocks() {
+        std::vector<std::pair<std::string, std::int64_t>> result;
+        for (const auto &request : SubmittedDelRequestsSnapshot()) {
+            for (std::size_t i = 0; i < request.block_keys.size(); ++i) {
+                if (!request.location_ids[i].empty()) {
+                    result.emplace_back(request.instance_id, request.block_keys[i]);
+                }
+            }
+        }
+        return result;
+    }
+
+    MetaLocalBackend *UseRealLocalReclaimBackend(const std::string &id,
+                                                KeyType rejected_prefix = 0,
+                                                bool event_report_prefix = false) {
+        stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
+        stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
+        auto &indexer = meta_indexers_by_instance.at(id);
+        indexer->backend_manager_ = std::make_unique<MetaStorageBackendManager>();
+        auto backend = std::make_unique<MetaLocalBackend>();
+        auto *local = backend.get();
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        config->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
+        EXPECT_EQ(EC_OK, local->Init(id, config));
+        EXPECT_EQ(EC_OK, local->Open());
+        for (KeyType key = 1; key <= 32; ++key) {
+            const bool rejected = key <= rejected_prefix;
+            auto location = MakeCacheLocation(
+                "loc",
+                rejected && !event_report_prefix ? CacheLocationStatus::CLS_DELETING : CacheLocationStatus::CLS_SERVING,
+                rejected && event_report_prefix ? DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2
+                                                : DataStorageType::DATA_STORAGE_TYPE_NFS,
+                "nfs://store/key?size=1");
+            EXPECT_EQ(std::vector<ErrorCode>{EC_OK},
+                      local->Put(nullptr, {key}, {{{"loc", location}}}, PropertyMapVector(1)));
+            EXPECT_TRUE(local->cache_->ApplyToEntryNoTouch(
+                MetaLocalBackend::KeyToView(key),
+                [key](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+                    static_cast<MetaMemCacheItem *>(value)->last_access_time_.store(key * 100);
+                    return 0;
+                }));
+        }
+        local->shard_oldest_access_time_[0].store(100);
+        indexer->backend_manager_->persistent_backend_ = std::move(backend);
+        return local;
+    }
+
+    std::array<double, 6> GroupLruAgeMetrics() {
+        return {cache_reclaimer_->get_cache_reclaimer_reclaim_batch_lru_age_min_us_metrics(),
+                cache_reclaimer_->get_cache_reclaimer_reclaim_batch_lru_age_max_us_metrics(),
+                cache_reclaimer_->get_cache_reclaimer_reclaim_batch_lru_age_avg_us_metrics(),
+                cache_reclaimer_->get_cache_reclaimer_reclaim_batch_create_age_min_us_metrics(),
+                cache_reclaimer_->get_cache_reclaimer_reclaim_batch_create_age_max_us_metrics(),
+                cache_reclaimer_->get_cache_reclaimer_reclaim_batch_create_age_avg_us_metrics()};
+    }
+
+    std::shared_ptr<InstanceGroup> SetUpFairRotationScenario() {
+        cache_reclaimer_->job_state_flag_ = true;
+        spe_submit_auto_complete = false;
+        instance_infos.clear();
+        for (const auto &[id, usage] :
+             std::vector<std::pair<std::string, std::uint64_t>>{{"large", 600}, {"medium", 300}, {"small", 100}}) {
+            auto instance = InstanceInfoFactory();
+            instance->set_instance_id(id);
+            instance_infos.push_back(instance);
+            AddMetaIndexerForInstance(id, usage);
+        }
+
+        auto group = InstanceGroupFactory();
+        group->quota_.set_capacity(1200);
+        group->quota_.quota_config_.clear();
+        group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+        instance_groups = {group};
+        EXPECT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 100));
+        EXPECT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 10));
+        // One task per Instance, with duplicate sampled keys collapsing to a single victim.
+        // Its 50-byte credit covers the 40-byte gap; official usage stays fixed between rounds.
+        cache_reclaimer_->sampling_size_per_task_.store(1000);
+        batch_get_loc_out_maps = {CacheLocationMap{
+            {"fifty_bytes",
+             MakeCacheLocation("fifty_bytes",
+                               CacheLocationStatus::CLS_SERVING,
+                               DataStorageType::DATA_STORAGE_TYPE_NFS,
+                               "nfs://store/key?size=50")},
+        }};
+        return group;
+    }
+
+    static CacheReclaimer::FairReclaimPlan MakeFairRotationPlan(const std::vector<std::string> &ids) {
+        CacheReclaimer::FairReclaimPlan plan;
+        for (const auto &id : ids) {
+            CacheReclaimer::FairReclaimPlanItem item;
+            item.instance_id = id;
+            item.batch_size = 1;
+            item.sampling_size = 10;
+            plan.items.push_back(std::move(item));
+        }
+        return plan;
+    }
+
+    std::vector<std::string> FairRotationOrder(const std::string &group) const {
+        const auto it = cache_reclaimer_->fair_rotation_by_group_.find(group);
+        if (it == cache_reclaimer_->fair_rotation_by_group_.end()) {
+            return {};
+        }
+        const auto &ids = it->second.instance_ids;
+        return {ids.begin(), ids.end()};
+    }
+
     Stub stub_;
     std::unique_ptr<CacheReclaimer> cache_reclaimer_;
     std::shared_ptr<RegistryManager> rm_;
@@ -712,7 +1178,7 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
     stub_.reset(ADDR(MetaIndexer, GetProperties));
     stub_.reset(ADDR(MetaIndexer, RandomSample));
-    stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
+    stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
     stub_.reset(ADDR(MetaIndexer, GetKeyCount));
     stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
     stub_.reset(ADDR(MetaIndexer, PersistMetaData));
@@ -1699,7 +2165,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
     }
 }
 
-TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotTriggerStorageTypeWaterLevel) {
+TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotTriggerByteWaterLevel) {
     dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, 90);
     dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 90);
 
@@ -1714,17 +2180,47 @@ TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotTriggerStorageTypeWaterLev
     max_key_count = 100;
 
     cache_reclaimer_->job_state_flag_ = true;
-    const auto water_level = cache_reclaimer_->GetWaterLevelExceed(
-        request_context_.get(),
-        instance_group->name(),
-        instance_group->quota(),
-        instance_group->cache_config()->reclaim_strategy(),
-        instance_infos);
+    const auto water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                                   instance_group->name(),
+                                                                   instance_group->quota(),
+                                                                   instance_group->cache_config()->reclaim_strategy(),
+                                                                   instance_infos);
     ASSERT_NE(nullptr, water_level);
-    EXPECT_TRUE(water_level->GetGeneralWaterLevelExceed());
-    EXPECT_FALSE(
-        water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
+    EXPECT_FALSE(water_level->GetGroupBytesWaterLevelExceed());
+    EXPECT_FALSE(water_level->GetGeneralWaterLevelExceed());
+    EXPECT_FALSE(water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
     EXPECT_FALSE(water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+}
+
+TEST_F(CacheReclaimerTest, TestEventReportUsageDoesNotInflateMixedGroupByteWaterLevel) {
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 40);
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 40);
+
+    const auto instance_group = InstanceGroupFactory();
+    instance_group->quota_.set_capacity(100);
+    instance_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    key_count = 0;
+    max_key_count = 100;
+    cache_reclaimer_->job_state_flag_ = true;
+
+    auto water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                             instance_group->name(),
+                                                             instance_group->quota(),
+                                                             instance_group->cache_config()->reclaim_strategy(),
+                                                             instance_infos);
+    ASSERT_NE(nullptr, water_level);
+    EXPECT_FALSE(water_level->GetGroupBytesWaterLevelExceed());
+    EXPECT_FALSE(CacheReclaimer::IsTriggerReclaiming(water_level));
+
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 80);
+    water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                        instance_group->name(),
+                                                        instance_group->quota(),
+                                                        instance_group->cache_config()->reclaim_strategy(),
+                                                        instance_infos);
+    ASSERT_NE(nullptr, water_level);
+    EXPECT_TRUE(water_level->GetGroupBytesWaterLevelExceed());
+    EXPECT_TRUE(CacheReclaimer::IsTriggerReclaiming(water_level));
 }
 
 TEST_F(CacheReclaimerTest, TestTairMempoolDramAndSsdUseIndependentTypeWaterLevels) {
@@ -1803,9 +2299,12 @@ TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    // batching_size default to 100 which is larger than the size of sampled keys (10)
+    // Fair mode normalizes sampling_size from 10 to batching_size 100.
+    // Use 11-key sampling tasks so the stub returns only the 10 available
+    // keys for each full task, exercising the insufficient-sample path.
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 100));
+    cache_reclaimer_->sampling_size_per_task_.store(11);
     batch_get_loc_out_maps = MakeServingLocationMaps(sample_reclaim_keys.size());
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
@@ -2166,40 +2665,24 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU04) {
     ASSERT_TRUE(VecContains(req.block_keys, 9)); // time point -> 2
 }
 
-TEST_F(CacheReclaimerTest, TestMetaIndexerGetPropertiesFailure) {
-    // set up test data
+TEST_F(CacheReclaimerTest, TestCandidateTimestampFailureDegradesToZeroWithoutGetPropertiesCall) {
     sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
-
-    // configure the GetProperties stub to return an error
     get_result = ErrorCode::EC_ERROR;
+    cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
+    cache_reclaimer_->sampling_size_per_task_.store(sample_reclaim_keys.size());
 
-    // update the trigger strategy to trigger the reclaiming
-
-    // use instance 0 from setup()
-    // construct instance 1
-    const auto ins_info = InstanceInfoFactory();
-    ins_info->set_instance_id("test_instance_id_2");
-    instance_infos.emplace_back(ins_info);
-
-    instance_groups.clear();
-    const auto ins_group = InstanceGroupFactory();
-    ins_group->quota_.set_capacity(2048);
-    instance_groups.emplace_back(ins_group);
-
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(16));
-    ASSERT_TRUE(cache_reclaimer_->IsRunning()); // the worker thread should still be running
-
-    cache_reclaimer_->Stop();
-
-    // no deletion requests should be submitted when GetProperties fails
-    ASSERT_TRUE(HasNoSubmittedDelRequests());
+    ReclaimCandidateVector candidates;
+    ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+    ASSERT_EQ(sample_reclaim_keys.size(), candidates.size());
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        EXPECT_EQ(sample_reclaim_keys[i], candidates[i].key);
+        EXPECT_EQ(0, candidates[i].last_access_time_us);
+    }
+    EXPECT_EQ(0, mi_getprop_call_count.load());
 }
 
-TEST_F(CacheReclaimerTest, TestMetaIndexerSampleReclaimFailure) {
-    // configure the SampleReclaim stub to return an error
+TEST_F(CacheReclaimerTest, TestMetaIndexerSampleReclaimCandidatesFailure) {
+    // configure the SampleReclaimCandidates stub to return an error
     sample_reclaim_result = ErrorCode::EC_ERROR;
 
     // update the trigger strategy to trigger the reclaiming
@@ -2787,9 +3270,8 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
     // on absolute scheduler timing, while still requiring the second round to
     // arrive before the original sleep interval would have elapsed again.
     ASSERT_TRUE(WaitUntilSubmittedDelRequests(initial_sleep_interval + std::chrono::milliseconds(1000)));
-    ASSERT_TRUE(WaitUntil(
-        [this] { return ListInstanceGroupCallCount() > 1 && SubmittedDelRequestCount() > 1; },
-        initial_sleep_interval / 2));
+    ASSERT_TRUE(WaitUntil([this] { return ListInstanceGroupCallCount() > 1 && SubmittedDelRequestCount() > 1; },
+                          initial_sleep_interval / 2));
     cache_reclaimer_->Stop(); // join the worker thread
 
     ASSERT_LT(1, ListInstanceGroupCallCount());
@@ -3246,7 +3728,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocationExcludesEventReportStorage) {
     };
 
     CacheReclaimer::WaterLevelExceed water_level;
-    water_level.SetGeneralWaterLevelExceed(true);
+    water_level.SetGroupBytesWaterLevelExceed(true);
     std::vector<std::vector<std::string>> location_ids;
     CacheReclaimer::BytesByStorageType bytes_by_type{};
     CacheReclaimer::CountsByStorageType counts_by_type{};
@@ -3472,6 +3954,388 @@ TEST_F(CacheReclaimerTest, TestEmptyAndRejectedRequestsLeaveNoAsyncDeleteState) 
     EXPECT_EQ(0, cache_reclaimer_->pending_delete_handler_count_);
 }
 
+TEST_F(CacheReclaimerTest, TestAllocateFairBudgetUsesDeterministicLargestRemainder) {
+    std::vector<std::size_t> allocations;
+    ASSERT_TRUE(CacheReclaimer::AllocateFairBudget(200, {80, 20}, {"large", "small"}, allocations));
+    EXPECT_EQ((std::vector<std::size_t>{160, 40}), allocations);
+
+    // All three raw shares are 1 1/3. The extra slot goes to the
+    // lexicographically smallest instance_id, independent of input order.
+    ASSERT_TRUE(CacheReclaimer::AllocateFairBudget(4, {1, 1, 1}, {"c", "a", "b"}, allocations));
+    EXPECT_EQ((std::vector<std::size_t>{1, 2, 1}), allocations);
+}
+
+TEST_F(CacheReclaimerTest, TestBuildFairPlanAllocatesGroupBudgetByUsage) {
+    const auto large = InstanceInfoFactory();
+    large->set_instance_id("large");
+    const auto small = InstanceInfoFactory();
+    small->set_instance_id("small");
+    AddMetaIndexerForInstance(large->instance_id(), 80);
+    AddMetaIndexerForInstance(small->instance_id(), 20);
+
+    CacheReclaimer::WaterLevelExceed water_level;
+    water_level.SetGroupBytesWaterLevelExceed(true);
+    CacheReclaimer::FairReclaimPlan plan;
+    ASSERT_TRUE(
+        cache_reclaimer_->BuildFairReclaimPlan(request_context_.get(), water_level, {large, small}, 1000, 100, plan));
+
+    EXPECT_EQ(CacheReclaimer::FairWeightDimension::GROUP_BYTES, plan.weight_dimension);
+    EXPECT_EQ(2, plan.effective_instance_count);
+    EXPECT_EQ(200, plan.group_batch_size);
+    EXPECT_EQ(2000, plan.group_sampling_size);
+    ASSERT_EQ(2, plan.items.size());
+    EXPECT_EQ("large", plan.items[0].instance_id);
+    EXPECT_EQ(160, plan.items[0].raw_batch_size);
+    EXPECT_EQ(1600, plan.items[0].raw_sampling_size);
+    EXPECT_EQ(100, plan.items[0].batch_size);
+    EXPECT_EQ(1000, plan.items[0].sampling_size);
+    EXPECT_EQ("small", plan.items[1].instance_id);
+    EXPECT_EQ(40, plan.items[1].raw_batch_size);
+    EXPECT_EQ(400, plan.items[1].raw_sampling_size);
+    EXPECT_EQ(40, plan.items[1].batch_size);
+    EXPECT_EQ(400, plan.items[1].sampling_size);
+    EXPECT_EQ(1, plan.capped_item_count);
+}
+
+TEST_F(CacheReclaimerTest, TestBuildFairPlanDoesNotPropagateSamplingRoundingIntoBatch) {
+    const auto dominant = InstanceInfoFactory();
+    dominant->set_instance_id("dominant");
+    const auto small_a = InstanceInfoFactory();
+    small_a->set_instance_id("small_a");
+    const auto small_b = InstanceInfoFactory();
+    small_b->set_instance_id("small_b");
+    AddMetaIndexerForInstance(dominant->instance_id(), 1000);
+    AddMetaIndexerForInstance(small_a->instance_id(), 3);
+    AddMetaIndexerForInstance(small_b->instance_id(), 3);
+
+    CacheReclaimer::WaterLevelExceed water_level;
+    water_level.SetGroupBytesWaterLevelExceed(true);
+    CacheReclaimer::FairReclaimPlan plan;
+    ASSERT_TRUE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), water_level, {dominant, small_a, small_b}, 1000, 100, plan));
+
+    ASSERT_EQ(3, plan.items.size());
+    EXPECT_EQ("dominant", plan.items[0].instance_id);
+    EXPECT_EQ(298, plan.items[0].raw_batch_size);
+    EXPECT_EQ(2982, plan.items[0].raw_sampling_size);
+    EXPECT_EQ(100, plan.items[0].batch_size);
+    EXPECT_EQ(1000, plan.items[0].sampling_size);
+    EXPECT_EQ("small_a", plan.items[1].instance_id);
+    EXPECT_EQ(1, plan.items[1].raw_batch_size);
+    EXPECT_EQ(9, plan.items[1].raw_sampling_size);
+    EXPECT_EQ(1, plan.items[1].batch_size);
+    EXPECT_EQ(9, plan.items[1].sampling_size);
+    EXPECT_EQ("small_b", plan.items[2].instance_id);
+    EXPECT_EQ(1, plan.items[2].batch_size);
+    EXPECT_EQ(9, plan.items[2].sampling_size);
+    EXPECT_EQ(1, plan.capped_item_count);
+
+    const auto equal_dominant = InstanceInfoFactory();
+    equal_dominant->set_instance_id("equal_dominant");
+    AddMetaIndexerForInstance(equal_dominant->instance_id(), 500);
+    std::vector<std::shared_ptr<const InstanceInfo>> equal_tiny_instances;
+    equal_tiny_instances.reserve(4);
+    for (const std::string instance_id : {"tiny_a", "tiny_b", "tiny_c", "tiny_d"}) {
+        auto instance = InstanceInfoFactory();
+        instance->set_instance_id(instance_id);
+        AddMetaIndexerForInstance(instance_id, 2);
+        equal_tiny_instances.push_back(std::move(instance));
+    }
+    std::vector<std::shared_ptr<const InstanceInfo>> equal_instances{equal_dominant};
+    equal_instances.insert(equal_instances.end(), equal_tiny_instances.begin(), equal_tiny_instances.end());
+    ASSERT_TRUE(
+        cache_reclaimer_->BuildFairReclaimPlan(request_context_.get(), water_level, equal_instances, 1000, 100, plan));
+
+    ASSERT_EQ(5, plan.items.size());
+    EXPECT_EQ("tiny_a", plan.items[1].instance_id);
+    EXPECT_EQ(2, plan.items[1].batch_size);
+    EXPECT_EQ(20, plan.items[1].sampling_size);
+    EXPECT_EQ("tiny_d", plan.items[4].instance_id);
+    EXPECT_EQ(2, plan.items[4].batch_size);
+    EXPECT_EQ(19, plan.items[4].sampling_size);
+    EXPECT_EQ(1, plan.capped_item_count);
+}
+
+TEST_F(CacheReclaimerTest, TestBuildFairPlanAppliesRatioGuardOnlyWhenHardSampleCapClips) {
+    const auto first = InstanceInfoFactory();
+    first->set_instance_id("first");
+    const auto second = InstanceInfoFactory();
+    second->set_instance_id("second");
+    AddMetaIndexerForInstance(first->instance_id(), 1);
+    AddMetaIndexerForInstance(second->instance_id(), 1);
+
+    CacheReclaimer::WaterLevelExceed water_level;
+    water_level.SetGroupBytesWaterLevelExceed(true);
+    CacheReclaimer::FairReclaimPlan plan;
+    ASSERT_TRUE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), water_level, {first, second}, 100000, 100, plan));
+
+    ASSERT_EQ(2, plan.items.size());
+    for (const auto &item : plan.items) {
+        EXPECT_EQ(100, item.raw_batch_size);
+        EXPECT_EQ(100000, item.raw_sampling_size);
+        EXPECT_EQ(65, item.batch_size);
+        EXPECT_EQ(CacheReclaimer::kSizeLimit - 1, item.sampling_size);
+    }
+    EXPECT_EQ(2, plan.capped_item_count);
+
+    ASSERT_TRUE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), water_level, {first}, CacheReclaimer::kSizeLimit, 1, plan));
+    ASSERT_EQ(1, plan.items.size());
+    EXPECT_EQ(1, plan.items.front().raw_batch_size);
+    EXPECT_EQ(CacheReclaimer::kSizeLimit, plan.items.front().raw_sampling_size);
+    EXPECT_EQ(1, plan.items.front().batch_size);
+    EXPECT_EQ(CacheReclaimer::kSizeLimit - 1, plan.items.front().sampling_size);
+    EXPECT_EQ(1, plan.capped_item_count);
+}
+
+TEST_F(CacheReclaimerTest, TestBuildFairPlanExcludesEventReportAndSumsReclaimableByteWeights) {
+    const auto mixed = InstanceInfoFactory();
+    mixed->set_instance_id("mixed");
+    const auto ordinary = InstanceInfoFactory();
+    ordinary->set_instance_id("ordinary");
+    const auto reporter_only = InstanceInfoFactory();
+    reporter_only->set_instance_id("reporter_only");
+
+    auto mixed_indexer = AddMetaIndexerForInstance(mixed->instance_id(), 60);
+    AddMetaIndexerForInstance(ordinary->instance_id(), 20);
+    auto reporter_indexer = AddMetaIndexerForInstance(reporter_only->instance_id(), 0);
+    mixed_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 20);
+    mixed_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, 1000);
+    reporter_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 10000);
+
+    CacheReclaimer::WaterLevelExceed group_water_level;
+    group_water_level.SetGroupBytesWaterLevelExceed(true);
+    CacheReclaimer::FairReclaimPlan plan;
+    ASSERT_TRUE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), group_water_level, {reporter_only, ordinary, mixed}, 1000, 100, plan));
+
+    EXPECT_EQ(CacheReclaimer::FairWeightDimension::GROUP_BYTES, plan.weight_dimension);
+    EXPECT_EQ(2, plan.effective_instance_count);
+    EXPECT_EQ(1, plan.zero_weight_instance_count);
+    ASSERT_EQ(2, plan.items.size());
+    EXPECT_EQ("mixed", plan.items[0].instance_id);
+    EXPECT_EQ(80, plan.items[0].weight);
+    EXPECT_EQ(160, plan.items[0].raw_batch_size);
+    EXPECT_EQ("ordinary", plan.items[1].instance_id);
+    EXPECT_EQ(20, plan.items[1].weight);
+    EXPECT_EQ(40, plan.items[1].raw_batch_size);
+
+    CacheReclaimer::WaterLevelExceed multi_type_water_level;
+    multi_type_water_level.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS, true);
+    multi_type_water_level.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, true);
+    ASSERT_TRUE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), multi_type_water_level, {reporter_only, ordinary, mixed}, 1000, 100, plan));
+    EXPECT_EQ(CacheReclaimer::FairWeightDimension::STORAGE_TYPE_BYTES, plan.weight_dimension);
+    EXPECT_EQ(2, plan.effective_instance_count);
+    EXPECT_EQ(1, plan.zero_weight_instance_count);
+    ASSERT_EQ(2, plan.items.size());
+    EXPECT_EQ("mixed", plan.items[0].instance_id);
+    EXPECT_EQ(80, plan.items[0].weight);
+    EXPECT_EQ("ordinary", plan.items[1].instance_id);
+    EXPECT_EQ(20, plan.items[1].weight);
+
+    CacheReclaimer::WaterLevelExceed reporter_type_water_level;
+    reporter_type_water_level.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, true);
+    EXPECT_FALSE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), reporter_type_water_level, {reporter_only, mixed}, 1000, 100, plan));
+    EXPECT_EQ(CacheReclaimer::FairWeightDimension::STORAGE_TYPE_BYTES, plan.weight_dimension);
+    EXPECT_EQ(2, plan.zero_weight_instance_count);
+}
+
+TEST_F(CacheReclaimerTest, TestBuildFairPlanUsesPerInstanceKeyCountWeight) {
+    const auto key_heavy = InstanceInfoFactory();
+    key_heavy->set_instance_id("key_heavy");
+    const auto byte_heavy = InstanceInfoFactory();
+    byte_heavy->set_instance_id("byte_heavy");
+    AddMetaIndexerForInstance(key_heavy->instance_id(), 20, 80);
+    AddMetaIndexerForInstance(byte_heavy->instance_id(), 80, 20);
+
+    CacheReclaimer::WaterLevelExceed water_level;
+    water_level.SetGroupKeysWaterLevelExceed(true);
+    CacheReclaimer::FairReclaimPlan plan;
+    ASSERT_TRUE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), water_level, {byte_heavy, key_heavy}, 1000, 100, plan));
+
+    EXPECT_EQ(CacheReclaimer::FairWeightDimension::GROUP_KEYS, plan.weight_dimension);
+    ASSERT_EQ(2, plan.items.size());
+    EXPECT_EQ("key_heavy", plan.items[0].instance_id);
+    EXPECT_EQ(80, plan.items[0].weight);
+    EXPECT_EQ(160, plan.items[0].raw_batch_size);
+    EXPECT_EQ(1600, plan.items[0].raw_sampling_size);
+    EXPECT_EQ("byte_heavy", plan.items[1].instance_id);
+    EXPECT_EQ(20, plan.items[1].weight);
+    EXPECT_EQ(40, plan.items[1].raw_batch_size);
+    EXPECT_EQ(400, plan.items[1].raw_sampling_size);
+}
+
+TEST_F(CacheReclaimerTest, TestBuildFairPlanHonorsWeightDimensionPriority) {
+    const auto nfs_heavy = InstanceInfoFactory();
+    nfs_heavy->set_instance_id("nfs_heavy");
+    const auto total_bytes_heavy = InstanceInfoFactory();
+    total_bytes_heavy->set_instance_id("total_bytes_heavy");
+    AddMetaIndexerForInstance(nfs_heavy->instance_id(), 80, 100);
+    auto total_bytes_indexer = AddMetaIndexerForInstance(total_bytes_heavy->instance_id(), 20, 1);
+    total_bytes_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 180);
+
+    CacheReclaimer::WaterLevelExceed all_dimensions;
+    all_dimensions.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS, true);
+    all_dimensions.SetGroupBytesWaterLevelExceed(true);
+    all_dimensions.SetGroupKeysWaterLevelExceed(true);
+    CacheReclaimer::FairReclaimPlan plan;
+    ASSERT_TRUE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), all_dimensions, {total_bytes_heavy, nfs_heavy}, 100, 10, plan));
+    EXPECT_EQ(CacheReclaimer::FairWeightDimension::STORAGE_TYPE_BYTES, plan.weight_dimension);
+    ASSERT_EQ(2, plan.items.size());
+    EXPECT_EQ("nfs_heavy", plan.items[0].instance_id);
+    EXPECT_EQ(80, plan.items[0].weight);
+    EXPECT_EQ("total_bytes_heavy", plan.items[1].instance_id);
+    EXPECT_EQ(20, plan.items[1].weight);
+
+    CacheReclaimer::WaterLevelExceed group_dimensions;
+    group_dimensions.SetGroupBytesWaterLevelExceed(true);
+    group_dimensions.SetGroupKeysWaterLevelExceed(true);
+    ASSERT_TRUE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), group_dimensions, {nfs_heavy, total_bytes_heavy}, 100, 10, plan));
+    EXPECT_EQ(CacheReclaimer::FairWeightDimension::GROUP_BYTES, plan.weight_dimension);
+    ASSERT_EQ(2, plan.items.size());
+    EXPECT_EQ("total_bytes_heavy", plan.items[0].instance_id);
+    EXPECT_EQ(200, plan.items[0].weight);
+    EXPECT_EQ("nfs_heavy", plan.items[1].instance_id);
+    EXPECT_EQ(80, plan.items[1].weight);
+}
+
+TEST_F(CacheReclaimerTest, TestBuildFairPlanUsesExceededStorageTypeAndSkipsZeroWeight) {
+    const auto large_nfs = InstanceInfoFactory();
+    large_nfs->set_instance_id("large_nfs");
+    const auto small_nfs = InstanceInfoFactory();
+    small_nfs->set_instance_id("small_nfs");
+    const auto mooncake_only = InstanceInfoFactory();
+    mooncake_only->set_instance_id("mooncake_only");
+
+    auto large_indexer = AddMetaIndexerForInstance(large_nfs->instance_id(), 80);
+    auto small_indexer = AddMetaIndexerForInstance(small_nfs->instance_id(), 20);
+    auto mooncake_indexer = AddMetaIndexerForInstance(mooncake_only->instance_id(), 0);
+    large_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 1);
+    small_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 1000);
+    mooncake_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 10000);
+
+    CacheReclaimer::WaterLevelExceed water_level;
+    water_level.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS, true);
+    CacheReclaimer::FairReclaimPlan plan;
+    ASSERT_TRUE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), water_level, {small_nfs, mooncake_only, large_nfs}, 1000, 100, plan));
+
+    EXPECT_EQ(CacheReclaimer::FairWeightDimension::STORAGE_TYPE_BYTES, plan.weight_dimension);
+    EXPECT_EQ(2, plan.effective_instance_count);
+    EXPECT_EQ(1, plan.zero_weight_instance_count);
+    ASSERT_EQ(2, plan.items.size());
+    EXPECT_EQ("large_nfs", plan.items[0].instance_id);
+    EXPECT_EQ(80, plan.items[0].weight);
+    EXPECT_EQ("small_nfs", plan.items[1].instance_id);
+    EXPECT_EQ(20, plan.items[1].weight);
+}
+
+TEST_F(CacheReclaimerTest, TestBuildFairPlanAllowsLargeGroupBudgetAndKeepsConfiguredRequestLimits) {
+    std::vector<std::shared_ptr<const InstanceInfo>> many_instances;
+    many_instances.reserve(66);
+    for (std::size_t i = 0; i != 66; ++i) {
+        auto instance = InstanceInfoFactory();
+        instance->set_instance_id("instance_" + std::to_string(i));
+        AddMetaIndexerForInstance(instance->instance_id(), 1);
+        many_instances.push_back(instance);
+    }
+
+    CacheReclaimer::WaterLevelExceed water_level;
+    water_level.SetGroupBytesWaterLevelExceed(true);
+    CacheReclaimer::FairReclaimPlan plan;
+    ASSERT_TRUE(
+        cache_reclaimer_->BuildFairReclaimPlan(request_context_.get(), water_level, many_instances, 1000, 100, plan));
+    EXPECT_EQ(66000, plan.group_sampling_size);
+    EXPECT_EQ(6600, plan.group_batch_size);
+    ASSERT_EQ(66, plan.items.size());
+    for (const auto &item : plan.items) {
+        EXPECT_EQ(1000, item.sampling_size);
+        EXPECT_EQ(100, item.batch_size);
+    }
+
+    meta_indexers_by_instance[many_instances.front()->instance_id()]->SetStorageUsageByType(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, std::numeric_limits<std::uint64_t>::max());
+    ASSERT_TRUE(
+        cache_reclaimer_->BuildFairReclaimPlan(request_context_.get(), water_level, many_instances, 1000, 100, plan));
+    ASSERT_EQ(1, plan.items.size());
+    EXPECT_EQ("instance_0", plan.items.front().instance_id);
+    EXPECT_GT(plan.items.front().raw_batch_size, 100);
+    EXPECT_GT(plan.items.front().raw_sampling_size, 1000);
+    EXPECT_EQ(100, plan.items.front().batch_size);
+    EXPECT_EQ(1000, plan.items.front().sampling_size);
+    EXPECT_EQ(10, plan.items.front().sampling_size / plan.items.front().batch_size);
+    EXPECT_EQ(1, plan.capped_item_count);
+
+    const auto dominant = InstanceInfoFactory();
+    dominant->set_instance_id("dominant");
+    const auto tiny = InstanceInfoFactory();
+    tiny->set_instance_id("tiny");
+    AddMetaIndexerForInstance(dominant->instance_id(), std::numeric_limits<std::uint64_t>::max());
+    AddMetaIndexerForInstance(tiny->instance_id(), 1);
+    ASSERT_TRUE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), water_level, {dominant, tiny}, 65535, 100, plan));
+    ASSERT_EQ(1, plan.items.size());
+    EXPECT_GT(plan.items.front().raw_sampling_size, CacheReclaimer::kSizeLimit - 1);
+    EXPECT_EQ(100, plan.items.front().batch_size);
+    EXPECT_EQ(CacheReclaimer::kSizeLimit - 1, plan.items.front().sampling_size);
+}
+
+TEST_F(CacheReclaimerTest, TestBuildFairPlanNormalizesSamplingAndDoesNotForceMinimumBatch) {
+    const auto dominant = InstanceInfoFactory();
+    dominant->set_instance_id("dominant");
+    const auto tiny = InstanceInfoFactory();
+    tiny->set_instance_id("tiny");
+    AddMetaIndexerForInstance(dominant->instance_id(), 1000);
+    AddMetaIndexerForInstance(tiny->instance_id(), 1);
+
+    CacheReclaimer::WaterLevelExceed water_level;
+    water_level.SetGroupBytesWaterLevelExceed(true);
+    CacheReclaimer::FairReclaimPlan plan;
+    ASSERT_TRUE(
+        cache_reclaimer_->BuildFairReclaimPlan(request_context_.get(), water_level, {dominant, tiny}, 1, 1, plan));
+    EXPECT_EQ(2, plan.effective_instance_count);
+    ASSERT_EQ(1, plan.items.size());
+    EXPECT_EQ("dominant", plan.items.front().instance_id);
+    EXPECT_EQ(2, plan.items.front().raw_batch_size);
+    EXPECT_EQ(1, plan.items.front().batch_size);
+
+    ASSERT_TRUE(
+        cache_reclaimer_->BuildFairReclaimPlan(request_context_.get(), water_level, {dominant, tiny}, 100, 500, plan));
+    EXPECT_TRUE(plan.sampling_size_normalized);
+    EXPECT_EQ(500, plan.normalized_sampling_size);
+    EXPECT_EQ(plan.group_batch_size, plan.group_sampling_size);
+    for (const auto &item : plan.items) {
+        EXPECT_GE(item.sampling_size, item.batch_size);
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestBuildFairPlanRejectsZeroAndOverflowingGroupBudgets) {
+    const auto first = InstanceInfoFactory();
+    first->set_instance_id("first");
+    AddMetaIndexerForInstance(first->instance_id(), 1);
+
+    CacheReclaimer::WaterLevelExceed water_level;
+    water_level.SetGroupBytesWaterLevelExceed(true);
+    CacheReclaimer::FairReclaimPlan plan;
+    EXPECT_FALSE(cache_reclaimer_->BuildFairReclaimPlan(request_context_.get(), water_level, {first}, 0, 1, plan));
+    EXPECT_FALSE(cache_reclaimer_->BuildFairReclaimPlan(request_context_.get(), water_level, {first}, 1, 0, plan));
+
+    const auto second = InstanceInfoFactory();
+    second->set_instance_id("second");
+    AddMetaIndexerForInstance(second->instance_id(), 1);
+    constexpr std::size_t kMaxSize = std::numeric_limits<std::size_t>::max();
+    EXPECT_FALSE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), water_level, {first, second}, kMaxSize, kMaxSize, plan));
+    EXPECT_FALSE(cache_reclaimer_->BuildFairReclaimPlan(
+        request_context_.get(), water_level, {first, second}, kMaxSize, 1, plan));
+}
+
 TEST_F(CacheReclaimerTest, TestWaterLevelCreditsUseSaturatingSubtraction) {
     EXPECT_EQ(0, CacheReclaimer::SaturatingSub(1, 2));
     EXPECT_EQ(0, CacheReclaimer::SaturatingSub(0, std::numeric_limits<std::uint64_t>::max()));
@@ -3517,6 +4381,8 @@ TEST_F(CacheReclaimerTest, TestWaterLevelCreditsUseSaturatingSubtraction) {
                                               instance_infos);
     ASSERT_NE(nullptr, key_water_level);
     EXPECT_TRUE(key_water_level->GetGeneralWaterLevelExceed());
+    EXPECT_FALSE(key_water_level->GetGroupBytesWaterLevelExceed());
+    EXPECT_TRUE(key_water_level->GetGroupKeysWaterLevelExceed());
 
     // The symmetric case must still evaluate byte usage when predicted
     // key credit saturates the effective key count at zero.
@@ -3532,6 +4398,8 @@ TEST_F(CacheReclaimerTest, TestWaterLevelCreditsUseSaturatingSubtraction) {
                                               instance_infos);
     ASSERT_NE(nullptr, byte_water_level);
     EXPECT_TRUE(byte_water_level->GetGeneralWaterLevelExceed());
+    EXPECT_TRUE(byte_water_level->GetGroupBytesWaterLevelExceed());
+    EXPECT_FALSE(byte_water_level->GetGroupKeysWaterLevelExceed());
 
     // A zero-capacity storage type is satisfied once its effective usage
     // has saturated to zero; otherwise credit could never stop eviction.
@@ -3571,6 +4439,8 @@ TEST_F(CacheReclaimerTest, TestSameGroupRechecksCreditBeforeSubmittingNextInstan
     group->quota_.set_capacity(100);
     group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
     group->cache_config_->reclaim_strategy_->set_delay_before_delete_ms(1000);
+    group->cache_config_->reclaim_strategy_->set_instance_reclaim_budget_policy(
+        InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE);
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
 
@@ -3579,6 +4449,1681 @@ TEST_F(CacheReclaimerTest, TestSameGroupRechecksCreditBeforeSubmittingNextInstan
     EXPECT_TRUE(result.made_progress);
     EXPECT_EQ(1, SubmittedDelRequestCount());
     EXPECT_EQ(instance_1->instance_id(), SubmittedDelRequestsSnapshot().front().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestRealLocalEventReportPrefixYieldsAcrossBoundedRounds) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    auto *backend = UseRealLocalReclaimBackend("a", 5, true);
+    cache_reclaimer_->sampling_size_.store(3);
+    cache_reclaimer_->batching_size_.store(1);
+    cache_reclaimer_->group_lru_config_.max_sampling_size = 3;
+    EXPECT_EQ(0, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(3, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
+    EXPECT_TRUE(GroupLruSubmittedBlocks().empty());
+    KeyVector order;
+    ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 3, order));
+    EXPECT_EQ((KeyVector{4, 5, 6}), order);
+
+    // The prefix exceeds the entire per-round budget. Rejected keys yield,
+    // so the next round reaches ordinary cold data without a
+    // persistent scan cursor or a larger scan cap.
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(5, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
+    const auto selected = GroupLruSubmittedBlocks();
+    ASSERT_EQ(1, selected.size());
+    EXPECT_EQ(6, selected[0].second);
+    std::vector<int64_t> times;
+    ASSERT_EQ(std::vector<ErrorCode>(7, EC_OK),
+              backend->GetLastAccessTimesForMaintenance(nullptr, {1, 2, 3, 4, 5, 6, 7}, times));
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_GT(times[i], (i + 1) * 100);
+    }
+    EXPECT_EQ(600, times[5]);
+    EXPECT_EQ(700, times[6]);
+}
+
+TEST_F(CacheReclaimerTest, TestRealLocalOrdinaryRejectedPrefixYieldsAcrossBoundedRounds) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    auto *backend = UseRealLocalReclaimBackend("a", 5);
+    cache_reclaimer_->sampling_size_.store(3);
+    cache_reclaimer_->batching_size_.store(1);
+    cache_reclaimer_->group_lru_config_.max_sampling_size = 3;
+
+    // Ordinary locations in CLS_DELETING must yield too, not keep blocking
+    // the same cold prefix merely because they are not EventReport-only.
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(3, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
+    EXPECT_TRUE(GroupLruSubmittedBlocks().empty());
+    KeyVector order;
+    ASSERT_EQ(EC_OK, backend->SampleReclaimKeys(nullptr, 3, order));
+    EXPECT_EQ((KeyVector{4, 5, 6}), order);
+
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto selected = GroupLruSubmittedBlocks();
+    ASSERT_EQ(1, selected.size());
+    EXPECT_EQ(6, selected[0].second);
+    std::vector<int64_t> times;
+    ASSERT_EQ(std::vector<ErrorCode>(7, EC_OK),
+              backend->GetLastAccessTimesForMaintenance(nullptr, {1, 2, 3, 4, 5, 6, 7}, times));
+    for (size_t i = 0; i < 5; ++i) {
+        EXPECT_GT(times[i], (i + 1) * 100);
+    }
+    // Neither a selected victim nor an unscanned key is a maintenance touch.
+    EXPECT_EQ(5, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
+    EXPECT_EQ(600, times[5]);
+    EXPECT_EQ(700, times[6]);
+}
+
+TEST_F(CacheReclaimerTest, TestMaintenanceTouchCounterCountsOnlyExistingRejectedKeys) {
+    SetUpGroupLruScenario({"a"});
+    UseRealLocalReclaimBackend("a", 1);
+    std::vector<std::vector<std::string>> location_ids;
+    CacheReclaimer::BytesByStorageType bytes_by_type{};
+    CacheReclaimer::CountsByStorageType counts_by_type{};
+    std::uint64_t predicted_keys = 0;
+    CacheReclaimer::AgeStats create_age_stats;
+    const auto filter = [&](const KeyVector &keys) {
+        return cache_reclaimer_->FilterLocIDImpl(request_context_.get(),
+                                                 instance_infos.front(),
+                                                 keys,
+                                                 CacheReclaimer::WaterLevelExceed{},
+                                                 location_ids,
+                                                 bytes_by_type,
+                                                 counts_by_type,
+                                                 predicted_keys,
+                                                 create_age_stats,
+                                                 false,
+                                                 true);
+    };
+
+    // Key 1 is rejected, key 2 is deletable, and key 99 is missing. Only
+    // one of the two rejected keys actually exists and can be touched.
+    ASSERT_TRUE(filter({1, 2, 99}));
+    ASSERT_EQ(3, location_ids.size());
+    EXPECT_TRUE(location_ids[0].empty());
+    EXPECT_FALSE(location_ids[1].empty());
+    EXPECT_TRUE(location_ids[2].empty());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
+    ASSERT_TRUE(filter({2, 99}));
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
+    // Count successful touch operations, not distinct keys or deleted keys.
+    ASSERT_TRUE(filter({1}));
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruDefaultRatioExpandsSamplesWithoutChangingBatch) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->group_lru_config_ = CacheReclaimerGroupLruConfig{};
+    CacheReclaimer::WaterLevelExceed scope;
+    scope.SetGroupBytesWaterLevelExceed(true);
+    CacheReclaimer::GroupLruPlan plan;
+    ASSERT_TRUE(cache_reclaimer_->BuildGroupLruPlan(
+        request_context_.get(), group->name(), scope, instance_infos, 100, 100, plan));
+    EXPECT_EQ(2000, plan.sampling_size);
+    EXPECT_EQ(200, plan.theoretical_batch_size);
+    EXPECT_EQ(200, CacheReclaimer::GroupLruBatchSize(plan, plan.sampling_size));
+    // Explicitly larger shared sampling baselines remain effective.
+    ASSERT_TRUE(cache_reclaimer_->BuildGroupLruPlan(
+        request_context_.get(), group->name(), scope, instance_infos, 2000, 100, plan));
+    EXPECT_EQ(4000, plan.sampling_size);
+    CacheReclaimer::FairReclaimPlan fair;
+    ASSERT_TRUE(cache_reclaimer_->BuildFairReclaimPlan(request_context_.get(), scope, instance_infos, 100, 100, fair));
+    EXPECT_EQ(200, fair.group_sampling_size);
+    EXPECT_EQ(200, fair.group_batch_size);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruSamplingRatioZeroAndOverflowRejected) {
+    const auto group = SetUpGroupLruScenario();
+    CacheReclaimer::WaterLevelExceed scope;
+    scope.SetGroupKeysWaterLevelExceed(true);
+    CacheReclaimer::GroupLruPlan plan;
+    for (const auto ratio : {std::size_t{0}, std::numeric_limits<std::size_t>::max()}) {
+        cache_reclaimer_->group_lru_config_.min_sampling_ratio = ratio;
+        if (ratio == 0) {
+            EXPECT_EQ(ErrorCode::EC_BADARGS, cache_reclaimer_->Start());
+        }
+        EXPECT_FALSE(cache_reclaimer_->BuildGroupLruPlan(
+            request_context_.get(), group->name(), scope, instance_infos, 100, 2, plan));
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruLargerSampleKeepsNewInstanceOutOfTopBatch) {
+    const auto group = SetUpGroupLruScenario();
+    // Equal configured baselines formerly selected the entire sample pool.
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 10));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 10));
+    cache_reclaimer_->group_lru_config_.min_sampling_ratio = 5;
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    ASSERT_TRUE(result.made_progress);
+    const auto blocks = GroupLruSubmittedBlocks();
+    // Each Instance supplies 32 distinct keys; at 5:1 select only 12 of 64,
+    // not 20 based on the requested (partly duplicate) sample count of 100.
+    ASSERT_EQ(12, blocks.size());
+    for (const auto &[id, key] : blocks) {
+        EXPECT_EQ("a", id);
+        EXPECT_LE(key, 12);
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruEffectiveCandidatesPreserveOneKeyProgress) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    auto &backend = group_lru_test_backends.at("a");
+    backend.keys = {1, 1, 2, 3};
+    backend.locations.erase(2);
+    backend.locations.erase(3);
+    cache_reclaimer_->group_lru_config_.min_sampling_ratio = 10;
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto blocks = GroupLruSubmittedBlocks();
+    ASSERT_EQ(1, blocks.size());
+    EXPECT_EQ(1, blocks.front().second);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruLocalSamplerUsesOneTaskPerInstance) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->group_lru_config_.min_sampling_ratio = 10;
+    for (const auto &id : {"a", "b"}) {
+        auto &indexer = meta_indexers_by_instance.at(id);
+        indexer->backend_manager_ = std::make_unique<MetaStorageBackendManager>();
+        indexer->backend_manager_->persistent_backend_ = std::make_unique<MetaLocalBackend>();
+        ASSERT_TRUE(indexer->PreferSingleTaskReclaimSampling());
+    }
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(1, group_lru_test_backends.at("a").sampling_calls);
+    EXPECT_EQ(1, group_lru_test_backends.at("b").sampling_calls);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruSamplingCombinesBaseAndKeyWeightsNotBytes) {
+    const auto group = SetUpGroupLruScenario();
+    AddMetaIndexerForInstance("a", 10000, 1);
+    AddMetaIndexerForInstance("b", 100, 9);
+    CacheReclaimer::WaterLevelExceed scope;
+    scope.SetGroupBytesWaterLevelExceed(true);
+    CacheReclaimer::GroupLruPlan plan;
+    ASSERT_TRUE(cache_reclaimer_->BuildGroupLruPlan(
+        request_context_.get(), group->name(), scope, instance_infos, 100, 10, plan));
+    ASSERT_EQ(2, plan.items.size());
+    EXPECT_EQ("a", plan.items[0].instance_info->instance_id());
+    EXPECT_EQ(60, plan.items[0].sampling_size);
+    EXPECT_EQ(140, plan.items[1].sampling_size);
+    EXPECT_EQ(200, plan.sampling_size);
+    EXPECT_EQ(20, CacheReclaimer::GroupLruBatchSize(plan, plan.sampling_size));
+    EXPECT_EQ(6, CacheReclaimer::GroupLruBatchSize(plan, 60));
+    EXPECT_EQ(1, CacheReclaimer::GroupLruBatchSize(plan, 1));
+    EXPECT_EQ(0, CacheReclaimer::GroupLruBatchSize(plan, 0));
+    AddMetaIndexerForInstance("a", 10000, 0);
+    AddMetaIndexerForInstance("b", 100, 0);
+    ASSERT_TRUE(cache_reclaimer_->BuildGroupLruPlan(
+        request_context_.get(), group->name(), scope, instance_infos, 100, 10, plan));
+    EXPECT_EQ(100, plan.items[0].sampling_size);
+    EXPECT_EQ(100, plan.items[1].sampling_size);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruPlanZeroOverflowAndClamping) {
+    const auto group = SetUpGroupLruScenario();
+    CacheReclaimer::WaterLevelExceed scope;
+    scope.SetGroupKeysWaterLevelExceed(true);
+    CacheReclaimer::GroupLruPlan plan;
+    for (const auto &[sampling, batch] :
+         std::vector<std::pair<std::size_t, std::size_t>>{{0, 10},
+                                                          {10, 0},
+                                                          {std::numeric_limits<std::size_t>::max(), 1},
+                                                          {1, std::numeric_limits<std::size_t>::max()}}) {
+        EXPECT_FALSE(cache_reclaimer_->BuildGroupLruPlan(
+            request_context_.get(), group->name(), scope, instance_infos, sampling, batch, plan));
+    }
+    ASSERT_TRUE(
+        cache_reclaimer_->BuildGroupLruPlan(request_context_.get(), group->name(), scope, instance_infos, 1, 10, plan));
+    EXPECT_EQ(20, plan.sampling_size);
+    EXPECT_EQ(20, CacheReclaimer::GroupLruBatchSize(plan, plan.sampling_size));
+    cache_reclaimer_->group_lru_config_.max_sampling_size = 0;
+    EXPECT_FALSE(cache_reclaimer_->BuildGroupLruPlan(
+        request_context_.get(), group->name(), scope, instance_infos, 100, 10, plan));
+    cache_reclaimer_->group_lru_config_.max_sampling_size = 200000;
+    instance_infos.resize(1);
+    ASSERT_TRUE(cache_reclaimer_->BuildGroupLruPlan(
+        request_context_.get(), group->name(), scope, instance_infos, 100000, 10000, plan));
+    EXPECT_EQ((1u << 16) - 1, plan.sampling_size);
+    EXPECT_EQ(6553, CacheReclaimer::GroupLruBatchSize(plan, plan.sampling_size));
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruScopeExcludesZeroAndEventReportOnlyUsage) {
+    const auto group = SetUpGroupLruScenario({"a", "b", "c"});
+    AddMetaIndexerForInstance("b", 0, 32)
+        ->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 1000);
+    AddMetaIndexerForInstance("c", 0, 0);
+    CacheReclaimer::WaterLevelExceed scope;
+    scope.SetGroupBytesWaterLevelExceed(true);
+    CacheReclaimer::GroupLruPlan plan;
+    ASSERT_TRUE(
+        cache_reclaimer_->BuildGroupLruPlan(request_context_.get(), group->name(), scope, instance_infos, 10, 2, plan));
+    ASSERT_EQ(1, plan.items.size());
+    EXPECT_EQ("a", plan.items.front().instance_info->instance_id());
+    scope.SetGroupBytesWaterLevelExceed(false);
+    scope.SetGroupKeysWaterLevelExceed(true);
+    ASSERT_TRUE(
+        cache_reclaimer_->BuildGroupLruPlan(request_context_.get(), group->name(), scope, instance_infos, 10, 2, plan));
+    EXPECT_EQ(2, plan.items.size());
+    scope.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, true);
+    EXPECT_FALSE(
+        cache_reclaimer_->BuildGroupLruPlan(request_context_.get(), group->name(), scope, instance_infos, 10, 2, plan));
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruLargeGroupUsesIndependentAggregateCap) {
+    std::vector<std::string> ids;
+    for (int i = 0; i < 512; ++i) {
+        ids.push_back("instance_" + std::to_string(i));
+    }
+    const auto group = SetUpGroupLruScenario(ids);
+    CacheReclaimer::WaterLevelExceed scope;
+    scope.SetGroupBytesWaterLevelExceed(true);
+    CacheReclaimer::GroupLruPlan plan;
+    ASSERT_TRUE(cache_reclaimer_->BuildGroupLruPlan(
+        request_context_.get(), group->name(), scope, instance_infos, 1000, 100, plan));
+    EXPECT_FALSE(plan.partial);
+    EXPECT_EQ(512, plan.items.size());
+    EXPECT_EQ(65536, plan.sampling_size);
+    EXPECT_EQ(6553, CacheReclaimer::GroupLruBatchSize(plan, plan.sampling_size));
+    for (const auto &item : plan.items) {
+        EXPECT_EQ(128, item.sampling_size);
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruOversizedGroupRotatesCoveredSubset) {
+    const auto group = SetUpGroupLruScenario({"a", "b", "c"});
+    cache_reclaimer_->group_lru_config_.max_sampling_size = 2;
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    for (int round = 0; round < 3; ++round) {
+        EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    }
+    EXPECT_EQ(3, cache_reclaimer_->get_cache_reclaimer_group_lru_partial_plan_count_metrics());
+    EXPECT_EQ(0, cache_reclaimer_->get_cache_reclaimer_group_lru_plan_failure_count_metrics());
+    for (const auto &id : {"a", "b", "c"}) {
+        EXPECT_EQ(2, group_lru_test_backends.at(id).sampling_calls) << id;
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruAllVictimsMayComeFromSmallColdInstance) {
+    const auto group = SetUpGroupLruScenario();
+    AddMetaIndexerForInstance("a", 10000, 1000);
+    AddMetaIndexerForInstance("b", 100, 10);
+    for (auto &[key, time] : group_lru_test_backends.at("b").times) {
+        time = std::to_string(key);
+    }
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}, {"b", 2}, {"b", 3}, {"b", 4}}),
+              GroupLruSubmittedBlocks());
+    const auto requests = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(2, requests.size());
+    EXPECT_EQ(2, requests[0].block_keys.size());
+    EXPECT_EQ(2, requests[1].block_keys.size());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruPreservesInterleavedOrderAndInstanceKeyIdentity) {
+    const auto group = SetUpGroupLruScenario();
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 2));
+    group_lru_test_backends.at("a").keys = {1, 2};
+    group_lru_test_backends.at("b").keys = {1, 2};
+    group_lru_test_backends.at("a").times = {{1, "1"}, {2, "3"}};
+    group_lru_test_backends.at("b").times = {{1, "2"}, {2, "4"}};
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"a", 1}, {"b", 1}, {"a", 2}, {"b", 2}}),
+              GroupLruSubmittedBlocks());
+    EXPECT_EQ(4, SubmittedDelRequestCount());
+    EXPECT_EQ(4, cache_reclaimer_->get_cache_reclaimer_group_lru_candidate_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruDuplicateUsesNewerTimeAndInvalidTimeRemainsZero) {
+    const auto group = SetUpGroupLruScenario();
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 5));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 4));
+    group_lru_test_backends.at("a").keys = {1, 2};
+    group_lru_test_backends.at("a").time_versions[1] = {"1", "100"};
+    group_lru_test_backends.at("a").times[2] = "50";
+    group_lru_test_backends.at("b").keys = {1, 2, 3};
+    group_lru_test_backends.at("b").times = {{2, "bad"}, {3, "-10"}};
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}, {"b", 2}, {"b", 3}, {"a", 2}}),
+              GroupLruSubmittedBlocks());
+    EXPECT_GT(cache_reclaimer_->get_cache_reclaimer_group_lru_invalid_time_count_metrics(), 0);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruAgeMetricsUseFinalAcceptedLocations) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->sampling_size_ = 5;
+    cache_reclaimer_->batching_size_ = 3;
+    auto &data = group_lru_test_backends.at("a");
+    data.keys = {1, 2, 3, 4, 5};
+    const auto before = TimestampUtil::GetCurrentTimeUs();
+    for (const auto key : data.keys) {
+        data.times[key] = std::to_string(before - 1000000 + key * 100);
+    }
+    data.locations[2] = {{"first",
+                          MakeCacheLocation("first",
+                                            CacheLocationStatus::CLS_SERVING,
+                                            DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                            "nfs://key?size=1",
+                                            before - 300)},
+                         {"second",
+                          MakeCacheLocation("second",
+                                            CacheLocationStatus::CLS_SERVING,
+                                            DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                            "nfs://key?size=1",
+                                            before - 500)}};
+    data.locations[3] = {{"third",
+                          MakeCacheLocation("third",
+                                            CacheLocationStatus::CLS_SERVING,
+                                            DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                            "nfs://key?size=1",
+                                            before - 100)}};
+    // Eligibility sees key 1, but the final admission read no longer does.
+    group_lru_location_read_hook = [&data] {
+        if (group_lru_location_reads.size() == 1) {
+            data.locations.erase(1);
+        }
+    };
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto elapsed = TimestampUtil::GetCurrentTimeUs() - before;
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"a", 2}, {"a", 3}}), GroupLruSubmittedBlocks());
+    const auto ages = GroupLruAgeMetrics();
+    // LRU counts two blocks; creation age counts their three Locations.
+    const std::array<double, 6> expected = {999700, 999800, 999750, 100, 500, 300};
+    for (std::size_t i = 0; i < ages.size(); ++i) {
+        EXPECT_GE(ages[i], expected[i]) << i;
+        EXPECT_LE(ages[i], expected[i] + elapsed) << i;
+    }
+    EXPECT_DOUBLE_EQ(100, ages[1] - ages[0]);
+    EXPECT_DOUBLE_EQ(400, ages[4] - ages[3]);
+    EXPECT_DOUBLE_EQ((ages[3] + ages[4]) / 2, ages[5]);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruAgeMetricsKeepLastAcceptedRequestWhenLaterRequestRejected) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->sampling_size_ = 2;
+    const auto before = TimestampUtil::GetCurrentTimeUs();
+    group_lru_test_backends.at("a").keys = {1, 2};
+    group_lru_test_backends.at("b").keys = {1, 2};
+    group_lru_test_backends.at("a").times = {{1, std::to_string(before - 400)}, {2, std::to_string(before - 200)}};
+    group_lru_test_backends.at("b").times = {{1, std::to_string(before - 300)}, {2, std::to_string(before - 100)}};
+    for (const auto &id : {"a", "b"}) {
+        for (const auto key : {1, 2}) {
+            group_lru_test_backends.at(id).locations[key] = {{"loc",
+                                                              MakeCacheLocation("loc",
+                                                                                CacheLocationStatus::CLS_SERVING,
+                                                                                DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                                                "nfs://key?size=1",
+                                                                                before - key * 1000)}};
+        }
+    }
+    spe_submit_accepted_by_instance["b"] = false;
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto elapsed = TimestampUtil::GetCurrentTimeUs() - before;
+    ASSERT_EQ(4, SubmittedDelRequestCount());
+    const auto ages = GroupLruAgeMetrics();
+    // A1 -> rejected B1 -> A2 -> rejected B2: report A2, not B2 or a round average.
+    for (std::size_t i = 0; i < ages.size(); ++i) {
+        const double expected = i < 3 ? 200 : 2000;
+        EXPECT_GE(ages[i], expected);
+        EXPECT_LE(ages[i], expected + elapsed);
+    }
+    spe_submit_accepted = false;
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(ages, GroupLruAgeMetrics());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruAgeMetricsResetWhenAcceptedBatchHasNoValidTimes) {
+    const auto group = SetUpGroupLruScenario({"a"});
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->sampling_size_ = 2;
+    auto &data = group_lru_test_backends.at("a");
+    data.keys = {1, 2};
+    for (const auto key : data.keys) {
+        data.locations[key] = {{"loc",
+                                MakeCacheLocation("loc",
+                                                  CacheLocationStatus::CLS_SERVING,
+                                                  DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                  "nfs://key?size=1",
+                                                  1000)}};
+    }
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    for (const auto age : GroupLruAgeMetrics()) {
+        ASSERT_GT(age, 0);
+    }
+    data.keys = {3, 4};
+    data.times[3] = "invalid";
+    data.times.erase(4);
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::array<double, 6>{}), GroupLruAgeMetrics());
+    EXPECT_EQ(4, GroupLruSubmittedBlocks().size());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruStopsImmediatelyOnAcceptedCredit) {
+    const auto group = SetUpGroupLruScenario();
+    AddMetaIndexerForInstance("a", 50, 32);
+    AddMetaIndexerForInstance("b", 50, 32);
+    group->quota_.set_capacity(124);
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ("a", SubmittedDelRequestsSnapshot().front().instance_id);
+    EXPECT_EQ(2,
+              cache_reclaimer_->credited_delete_bytes_by_group_.at(
+                  group->name())[static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_watermark_stop_count_metrics());
+    const auto ages = GroupLruAgeMetrics();
+    EXPECT_GT(ages[0], 0);
+    EXPECT_DOUBLE_EQ(1, ages[1] - ages[0]);
+    EXPECT_DOUBLE_EQ(ages[0], ages[2]);
+    EXPECT_DOUBLE_EQ(0, ages[3]);
+    EXPECT_DOUBLE_EQ(0, ages[4]);
+    EXPECT_DOUBLE_EQ(0, ages[5]);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruStopsOnScopeChangeWithGroupStillOverWatermark) {
+    const auto group = SetUpGroupLruScenario();
+    AddMetaIndexerForInstance("a", 50, 32);
+    AddMetaIndexerForInstance("b", 50, 32);
+    group->quota_.set_capacity(50);
+    QuotaConfig type_quota;
+    type_quota.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    type_quota.set_capacity(124);
+    group->quota_.quota_config_.push_back(type_quota);
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_scope_change_stop_count_metrics());
+    EXPECT_EQ(0, cache_reclaimer_->get_cache_reclaimer_group_lru_watermark_stop_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruRejectedRequestsConsumeAttemptLimitNotCredit) {
+    const auto group = SetUpGroupLruScenario();
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 2));
+    group_lru_test_backends.at("a").times = {{1, "1"}, {2, "3"}};
+    group_lru_test_backends.at("b").times = {{1, "2"}, {2, "4"}};
+    group_lru_test_backends.at("a").keys = {1, 2};
+    group_lru_test_backends.at("b").keys = {1, 2};
+    spe_submit_accepted_by_instance["a"] = false;
+    cache_reclaimer_->group_lru_config_.max_delete_requests_per_round = 2;
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(2, SubmittedDelRequestCount());
+    EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+    EXPECT_EQ(1,
+              cache_reclaimer_->credited_delete_bytes_by_group_.at(
+                  group->name())[static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_group_lru_delete_request_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_request_limit_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruFailedShardDiscardsWholeInstanceAndShrinksBatch) {
+    const auto group = SetUpGroupLruScenario();
+    group_lru_test_backends.at("a").fail_sampling_call = 2;
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}, {"b", 2}}), GroupLruSubmittedBlocks());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_failed_instance_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_partial_plan_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruBulkReadFailureIsNotMissingLruTime) {
+    const auto group = SetUpGroupLruScenario({"a", "b", "c"});
+    group_lru_test_backends.at("a").property_error = ErrorCode::EC_ERROR;
+    group_lru_test_backends.at("b").location_error = ErrorCode::EC_ERROR;
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"c", 1}, {"c", 2}}), GroupLruSubmittedBlocks());
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_group_lru_failed_instance_count_metrics());
+    EXPECT_EQ(0, cache_reclaimer_->get_cache_reclaimer_group_lru_invalid_time_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruDeadlineRetainsCompleteInstancesAndRealInflightCount) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->future_timeout_ms_ = 100;
+    group_lru_test_backends.at("a").sampling_delay = std::chrono::milliseconds(300);
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}, {"b", 2}}), GroupLruSubmittedBlocks());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_deadline_count_metrics());
+    EXPECT_GE(cache_reclaimer_->in_flight_sampling_tasks_.load(), 1);
+    EXPECT_LE(cache_reclaimer_->in_flight_sampling_tasks_.load(), cache_reclaimer_->workers_.size());
+    EXPECT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruSlowInstanceDoesNotBlockHealthySamplingFragments) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 1;
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 32));
+    cache_reclaimer_->future_timeout_ms_ = 200;
+    group_lru_test_backends.at("a").sampling_delay = std::chrono::milliseconds(500);
+    const auto slow_task_limit = cache_reclaimer_->workers_.size() / 2;
+
+    // B needs more fragments than fit in one wave, while A's first fragment
+    // outlives the deadline. Free workers must keep processing B, not wait for
+    // A or get filled with more of A's blocked fragments.
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}, {"b", 2}}), GroupLruSubmittedBlocks());
+    {
+        std::lock_guard<std::mutex> lock(group_lru_test_mutex);
+        EXPECT_EQ(slow_task_limit, group_lru_test_backends.at("a").sampling_calls);
+        EXPECT_EQ(32, group_lru_test_backends.at("b").sampling_calls);
+    }
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_collected_instance_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_partial_plan_count_metrics());
+    EXPECT_EQ(slow_task_limit, cache_reclaimer_->in_flight_sampling_tasks_.load());
+    EXPECT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruLocationTimeoutRotatesBeforeFasterSampler) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->future_timeout_ms_ = 100;
+    group_lru_test_backends.at("a").location_delay = std::chrono::milliseconds(200);
+    group_lru_test_backends.at("b").sampling_delay = std::chrono::milliseconds(20);
+
+    // In the first round A must enter its slow Location read before B's
+    // sample completes. Later rounds deliberately keep A's sampler faster.
+    auto location_started = std::make_shared<std::promise<void>>();
+    auto location_ready = location_started->get_future().share();
+    auto signalled = std::make_shared<std::atomic<bool>>(false);
+    group_lru_test_backends.at("b").sampling_hook = [location_ready] {
+        location_ready.wait_for(std::chrono::seconds(1));
+    };
+    group_lru_location_read_hook = [location_started, signalled] {
+        if (!signalled->exchange(true)) {
+            location_started->set_value();
+        }
+    };
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    ASSERT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
+    EXPECT_EQ((std::vector<std::string>{"a"}), group_lru_location_reads);
+    EXPECT_EQ((std::deque<std::string>{"b", "a"}),
+              cache_reclaimer_->group_lru_rotation_by_group_.at(group->name()).instance_ids);
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+
+    group_lru_test_backends.at("b").sampling_hook = {};
+    group_lru_location_read_hook = {};
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE(round);
+        group_lru_location_reads.clear();
+        const auto before = SubmittedDelRequestCount();
+        EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+        ASSERT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
+        ASSERT_FALSE(group_lru_location_reads.empty());
+        EXPECT_EQ("b", group_lru_location_reads.front());
+        const auto requests = SubmittedDelRequestsSnapshot();
+        EXPECT_GT(requests.size(), before);
+        for (std::size_t i = before; i < requests.size(); ++i) {
+            EXPECT_EQ("b", requests[i].instance_id);
+        }
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruSaturatedPoolDoesNotAdvanceSamplingQueue) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->in_flight_sampling_tasks_ = cache_reclaimer_->workers_.size();
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    cache_reclaimer_->in_flight_sampling_tasks_ = 0;
+    EXPECT_EQ(0, group_lru_test_backends.at("a").sampling_calls);
+    EXPECT_EQ((std::deque<std::string>{"a", "b"}),
+              cache_reclaimer_->group_lru_rotation_by_group_.at(group->name()).instance_ids);
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruPriorityWaiterSamplingTimeoutYieldsNextRound) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->future_timeout_ms_ = 100;
+    auto &rotation = cache_reclaimer_->group_lru_rotation_by_group_[group->name()];
+    rotation.instance_ids = {"a", "b"};
+    rotation.prioritize_location_waiter = true;
+    group_lru_test_backends.at("a").sampling_delay = std::chrono::milliseconds(200);
+
+    // The protected waiter cannot complete this round. It must not retain
+    // priority forever while B repeatedly completes sampling without a read.
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    ASSERT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
+    EXPECT_TRUE(group_lru_location_reads.empty());
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+    EXPECT_EQ((std::deque<std::string>{"b", "a"}), rotation.instance_ids);
+    EXPECT_TRUE(rotation.prioritize_location_waiter);
+
+    group_lru_test_backends.at("a").sampling_delay = std::chrono::milliseconds(0);
+    group_lru_test_backends.at("b").sampling_delay = std::chrono::milliseconds(20);
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    ASSERT_FALSE(group_lru_location_reads.empty());
+    EXPECT_EQ("b", group_lru_location_reads.front());
+    EXPECT_FALSE(rotation.prioritize_location_waiter);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruPriorityWaiterSamplingFailureReleasesReadyPeers) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    auto &rotation = cache_reclaimer_->group_lru_rotation_by_group_[group->name()];
+    rotation.instance_ids = {"a", "b"};
+    rotation.prioritize_location_waiter = true;
+    group_lru_test_backends.at("a").fail_sampling_call = 1;
+
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}, {"b", 2}}), GroupLruSubmittedBlocks());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_failed_instance_count_metrics());
+    ASSERT_FALSE(group_lru_location_reads.empty());
+    EXPECT_TRUE(std::all_of(
+        group_lru_location_reads.begin(), group_lru_location_reads.end(), [](const auto &id) { return id == "b"; }));
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruRemovedWaiterPreservesNextLocationPriority) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->sampling_size_per_task_ = 0;
+    cache_reclaimer_->future_timeout_ms_ = 100;
+    auto &rotation = cache_reclaimer_->group_lru_rotation_by_group_[group->name()];
+    rotation.instance_ids = {"removed", "b", "a"};
+    rotation.prioritize_location_waiter = true;
+    group_lru_test_backends.at("a").location_delay = std::chrono::milliseconds(200);
+    group_lru_test_backends.at("b").sampling_delay = std::chrono::milliseconds(20);
+
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    ASSERT_FALSE(group_lru_location_reads.empty());
+    EXPECT_EQ("b", group_lru_location_reads.front());
+    EXPECT_EQ((std::deque<std::string>{"b", "a"}), rotation.instance_ids);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}, {"b", 2}}), GroupLruSubmittedBlocks());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruSaturatedPoolPreservesLocationWaiter) {
+    const auto group = SetUpGroupLruScenario();
+    auto &rotation = cache_reclaimer_->group_lru_rotation_by_group_[group->name()];
+    rotation.instance_ids = {"b", "a"};
+    rotation.prioritize_location_waiter = true;
+    cache_reclaimer_->in_flight_sampling_tasks_ = cache_reclaimer_->workers_.size();
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    cache_reclaimer_->in_flight_sampling_tasks_ = 0;
+    EXPECT_EQ((std::deque<std::string>{"b", "a"}), rotation.instance_ids);
+    EXPECT_TRUE(rotation.prioritize_location_waiter);
+    EXPECT_TRUE(group_lru_location_reads.empty());
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruPauseDuringCollectionDoesNotSubmitPartialResults) {
+    const auto group = SetUpGroupLruScenario();
+    group_lru_location_read_hook = [this] { cache_reclaimer_->Pause(); };
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+    EXPECT_EQ(0, cache_reclaimer_->pending_delete_handler_count_);
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruFullPendingBudgetAvoidsSampling) {
+    const auto group = SetUpGroupLruScenario();
+    cache_reclaimer_->pending_delete_handler_count_ =
+        cache_reclaimer_->async_delete_config_.pending_delete_handler_limit;
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(0, group_lru_test_backends.at("a").sampling_calls);
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_group_lru_backpressure_stop_count_metrics());
+    cache_reclaimer_->pending_delete_handler_count_ = 0;
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruFiltersProtectedLocationsBeforeTopBAndCreditsOnlyDeletedKeys) {
+    const auto group = SetUpGroupLruScenario();
+    auto &data = group_lru_test_backends.at("a");
+    const auto reporter = MakeCacheLocation("reporter",
+                                            CacheLocationStatus::CLS_SERVING,
+                                            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                            "nfs://reporter/key?size=10");
+    data.locations[1] = {{"reporter", reporter}};
+    cache_reclaimer_->pending_locations_.insert({"a", 2, "loc"});
+    data.locations[3] = {{"copy_target",
+                          MakeCacheLocation("copy_target",
+                                            CacheLocationStatus::CLS_WRITING,
+                                            DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                            "nfs://store/target?size=1")}};
+    mm_->DebugInsertActiveCopyTask("a", 3, "copy_target");
+    data.locations[4].emplace("reporter", reporter);
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"a", 4}, {"a", 5}, {"a", 6}}),
+              GroupLruSubmittedBlocks());
+    EXPECT_EQ(2, cache_reclaimer_->GetPredictedDeletedKeys(group->name()));
+    for (const auto &request : SubmittedDelRequestsSnapshot()) {
+        for (const auto &locations : request.location_ids) {
+            EXPECT_EQ((std::vector<std::string>{"loc"}), locations);
+        }
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruZeroTimeCandidatesStillRequireDeletableLocations) {
+    const auto group = SetUpGroupLruScenario();
+    auto &missing = group_lru_test_backends.at("a");
+    missing.times.clear();
+    missing.locations.clear();
+    missing.location_error = ErrorCode::EC_NOENT;
+    group_lru_test_backends.at("b").times.clear();
+    cache_reclaimer_->pending_locations_.insert({"b", 1, "loc"});
+
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 2}}), GroupLruSubmittedBlocks());
+    EXPECT_EQ(1, cache_reclaimer_->GetPredictedDeletedKeys(group->name()));
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruPendingQuotaIsAppliedAfterGlobalOrdering) {
+    const auto group = SetUpGroupLruScenario();
+    for (auto &[key, time] : group_lru_test_backends.at("b").times) {
+        time = std::to_string(key);
+    }
+    auto &quota =
+        cache_reclaimer_->pending_quota_by_group_type_[{group->name(), DataStorageType::DATA_STORAGE_TYPE_NFS}];
+    quota.location_count = cache_reclaimer_->async_delete_config_.pending_location_limit_per_group_type - 1;
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"b", 1}}), GroupLruSubmittedBlocks());
+    EXPECT_EQ(4, cache_reclaimer_->get_cache_reclaimer_group_lru_selected_block_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruDoesNotRefillOutsideTopBAfterLocationChanges) {
+    const auto group = SetUpGroupLruScenario();
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+    int location_reads = 0;
+    group_lru_location_read_hook = [&location_reads] {
+        // Both Instances have now been discovered, but admission re-reads must see the change.
+        if (++location_reads == 2) {
+            group_lru_test_backends.at("a").locations[1].clear();
+            group_lru_test_backends.at("a").locations[2].clear();
+        }
+    };
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_group_lru_selected_block_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruReusesKeepBothColdReplicaProtection) {
+    const auto group = SetUpGroupLruScenario();
+    auto migration = std::make_shared<MigrationStrategy>();
+    migration->set_source_storage_name("hot");
+    migration->set_target_storage_name("cold");
+    group->cache_config_->set_migration_strategies({migration});
+    group_lru_test_backends.at("a").locations[1] = {
+        {"hot",
+         MakeCacheLocation(
+             "hot", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, "nfs://hot/key?size=1")},
+        {"cold",
+         MakeCacheLocation("cold",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://cold/key?size=1")},
+    };
+    // Exercise the eviction path only; migration scheduling has separate coverage.
+    EXPECT_TRUE(
+        cache_reclaimer_
+            ->TryReclaimOnGroupLru(request_context_, group, group->cache_config()->reclaim_strategy(), instance_infos)
+            .made_progress);
+    const auto requests = SubmittedDelRequestsSnapshot();
+    ASSERT_FALSE(requests.empty());
+    ASSERT_EQ(1, requests[0].block_keys.front());
+    EXPECT_EQ((std::vector<std::string>{"hot"}), requests[0].location_ids.front());
+    EXPECT_EQ(3, cache_reclaimer_->GetPredictedDeletedKeys(group->name()));
+}
+
+TEST_F(CacheReclaimerTest, TestGroupLruPolicySwitchPreservesInflightCredit) {
+    const auto group = SetUpGroupLruScenario();
+    AddMetaIndexerForInstance("a", 50, 32);
+    AddMetaIndexerForInstance("b", 50, 32);
+    group->quota_.set_capacity(124);
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto credit = cache_reclaimer_->credited_delete_bytes_by_group_.at(group->name());
+    for (const auto mode :
+         {InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL, InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE}) {
+        group->cache_config_->reclaim_strategy_->set_instance_reclaim_budget_policy(mode);
+        EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+        EXPECT_TRUE(cache_reclaimer_->group_lru_rotation_by_group_.empty());
+        EXPECT_EQ(credit, cache_reclaimer_->credited_delete_bytes_by_group_.at(group->name()));
+        EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationKeepsWaitingOrderAcrossPlanChanges) {
+    const std::string group = "rotation_group";
+    auto plan = MakeFairRotationPlan({"a", "b", "c"});
+    EXPECT_EQ((std::vector<std::size_t>{0, 1, 2}), cache_reclaimer_->PrepareFairExecutionOrder(group, plan));
+    cache_reclaimer_->fair_rotation_by_group_[group].instance_ids = {"b", "c", "a"};
+
+    // A new largest Instance joins last; fresh ranking does not overtake waiting IDs.
+    plan = MakeFairRotationPlan({"new_largest", "a", "b", "c"});
+    plan.items[2].batch_size = 7;
+    const auto order = cache_reclaimer_->PrepareFairExecutionOrder(group, plan);
+    EXPECT_EQ((std::vector<std::size_t>{2, 3, 1, 0}), order);
+    EXPECT_EQ((std::vector<std::string>{"b", "c", "a", "new_largest"}), FairRotationOrder(group));
+    ASSERT_FALSE(order.empty());
+    EXPECT_EQ(7, plan.items[order.front()].batch_size);
+
+    // Absence covers deletion, missing Indexer and zero final budget alike.
+    plan = MakeFairRotationPlan({"new_largest", "a", "c"});
+    EXPECT_EQ((std::vector<std::size_t>{2, 1, 0}), cache_reclaimer_->PrepareFairExecutionOrder(group, plan));
+    EXPECT_EQ((std::vector<std::string>{"c", "a", "new_largest"}), FairRotationOrder(group));
+
+    plan = MakeFairRotationPlan({"b", "new_largest", "a", "c"});
+    EXPECT_EQ((std::vector<std::size_t>{3, 2, 1, 0}), cache_reclaimer_->PrepareFairExecutionOrder(group, plan));
+    const auto waiting_order = FairRotationOrder(group);
+    EXPECT_EQ((std::vector<std::string>{"c", "a", "new_largest", "b"}), waiting_order);
+    EXPECT_TRUE(cache_reclaimer_->PrepareFairExecutionOrder(group, MakeFairRotationPlan({})).empty());
+    EXPECT_EQ(waiting_order, FairRotationOrder(group));
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationIsolatesGroupsAndPrunesDeletedGroups) {
+    const auto group = InstanceGroupFactory();
+    const auto plan = MakeFairRotationPlan({"a", "b"});
+    EXPECT_EQ((std::vector<std::size_t>{0, 1}), cache_reclaimer_->PrepareFairExecutionOrder(group->name(), plan));
+    EXPECT_EQ((std::vector<std::size_t>{0, 1}), cache_reclaimer_->PrepareFairExecutionOrder("deleted_group", plan));
+    cache_reclaimer_->fair_rotation_by_group_[group->name()].instance_ids = {"b", "a"};
+    EXPECT_EQ((std::vector<std::string>{"a", "b"}), FairRotationOrder("deleted_group"));
+
+    cache_reclaimer_->PruneFairRotationStates({group, nullptr});
+    EXPECT_EQ(1, cache_reclaimer_->fair_rotation_by_group_.size());
+    EXPECT_EQ((std::vector<std::string>{"b", "a"}), FairRotationOrder(group->name()));
+    EXPECT_TRUE(FairRotationOrder("deleted_group").empty());
+    cache_reclaimer_->PruneFairRotationStates({});
+    EXPECT_TRUE(cache_reclaimer_->fair_rotation_by_group_.empty());
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationServesSmallInstanceAcrossCreditLimitedRounds) {
+    const auto group = SetUpFairRotationScenario();
+    const std::vector<std::string> expected_order = {"large", "medium", "small", "large", "medium", "small"};
+    for (std::size_t round = 0; round < expected_order.size(); ++round) {
+        const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+        EXPECT_TRUE(result.water_level_exceeded);
+        EXPECT_TRUE(result.made_progress);
+        const auto requests = SubmittedDelRequestsSnapshot();
+        ASSERT_EQ(round + 1, requests.size());
+        EXPECT_EQ(expected_order[round], requests.back().instance_id);
+        EXPECT_EQ(50,
+                  cache_reclaimer_->credited_delete_bytes_by_group_.at(
+                      group->name())[static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+        EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+
+        const auto waiting_order = FairRotationOrder(group->name());
+        for (int idle_round = 0; idle_round < 2; ++idle_round) {
+            const auto idle = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+            EXPECT_FALSE(idle.water_level_exceeded);
+            EXPECT_FALSE(idle.made_progress);
+            EXPECT_EQ(waiting_order, FairRotationOrder(group->name()));
+            EXPECT_EQ(round + 1, SampleReclaimRequestsSnapshot().size());
+        }
+        // Clearing in-flight credit exposes the same pressure without changing usage ranks.
+        CompleteSubmittedDelete(round, {ErrorCode::EC_OK, ""});
+        cache_reclaimer_->HandleDelRes();
+    }
+    EXPECT_EQ(6, cache_reclaimer_->get_cache_reclaimer_fair_rotation_advance_count_metrics());
+    EXPECT_EQ(4, cache_reclaimer_->get_cache_reclaimer_fair_rotation_resume_count_metrics());
+    EXPECT_EQ(6, cache_reclaimer_->get_cache_reclaimer_fair_plan_truncated_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationUsesFreshBudgetWithoutResettingWaitingOrder) {
+    const auto group = SetUpFairRotationScenario();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+
+    // The waiting medium Instance now has a different budget, not last round's 90 samples.
+    meta_indexers_by_instance.at("large")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 200);
+    meta_indexers_by_instance.at("medium")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 700);
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    auto samples = SampleReclaimRequestsSnapshot();
+    ASSERT_EQ(2, samples.size());
+    EXPECT_EQ(std::make_pair(std::string{"medium"}, std::int64_t{100}), samples.back());
+    CompleteSubmittedDelete(1, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+
+    // Swapping the large ranks again cannot move the still-waiting small Instance back.
+    meta_indexers_by_instance.at("large")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 700);
+    meta_indexers_by_instance.at("medium")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 200);
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    samples = SampleReclaimRequestsSnapshot();
+    ASSERT_EQ(3, samples.size());
+    EXPECT_EQ(std::make_pair(std::string{"small"}, std::int64_t{30}), samples.back());
+    ASSERT_EQ(3, SubmittedDelRequestCount());
+    EXPECT_EQ("small", SubmittedDelRequestsSnapshot().back().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationContinuesMultipleItemsAndResumesAtNextItem) {
+    const auto group = SetUpFairRotationScenario();
+    group->quota_.set_capacity(1150); // 80-byte gap requires two 50-byte requests.
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    auto requests = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(2, requests.size());
+    EXPECT_EQ("large", requests[0].instance_id);
+    EXPECT_EQ("medium", requests[1].instance_id);
+    EXPECT_EQ((std::vector<std::string>{"small", "large", "medium"}), FairRotationOrder(group->name()));
+
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    CompleteSubmittedDelete(1, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    requests = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(4, requests.size());
+    EXPECT_EQ("small", requests[2].instance_id);
+    EXPECT_EQ("large", requests[3].instance_id);
+    EXPECT_EQ((std::vector<std::string>{"medium", "small", "large"}), FairRotationOrder(group->name()));
+    EXPECT_EQ(4, SampleReclaimRequestsSnapshot().size());
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationSamplingFailureYieldsToWaitingInstances) {
+    const auto group = SetUpFairRotationScenario();
+    sample_reclaim_results = {ErrorCode::EC_ERROR, ErrorCode::EC_OK};
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto samples = SampleReclaimRequestsSnapshot();
+    ASSERT_EQ(2, samples.size());
+    EXPECT_EQ("large", samples[0].first);
+    EXPECT_EQ("medium", samples[1].first);
+    ASSERT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ("medium", SubmittedDelRequestsSnapshot().front().instance_id);
+    EXPECT_EQ((std::vector<std::string>{"small", "large", "medium"}), FairRotationOrder(group->name()));
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_fair_rotation_advance_count_metrics());
+
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ("small", SubmittedDelRequestsSnapshot().back().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationRejectedRequestYieldsWithoutAddingCredit) {
+    const auto group = SetUpFairRotationScenario();
+    spe_submit_accepted_by_instance["large"] = false;
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto attempts = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(2, attempts.size());
+    EXPECT_EQ("large", attempts[0].instance_id);
+    EXPECT_EQ("medium", attempts[1].instance_id);
+    EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+    EXPECT_EQ(50,
+              cache_reclaimer_->credited_delete_bytes_by_group_.at(
+                  group->name())[static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_NFS)]);
+    EXPECT_EQ((std::vector<std::string>{"small", "large", "medium"}), FairRotationOrder(group->name()));
+
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ("small", SubmittedDelRequestsSnapshot().back().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationEmptyVictimsAreBoundedAndDoNotCountAsProgress) {
+    const auto group = SetUpFairRotationScenario();
+    batch_get_loc_out_maps = {CacheLocationMap{}};
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_FALSE(result.made_progress);
+    EXPECT_EQ(3, SampleReclaimRequestsSnapshot().size());
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+    EXPECT_EQ(0, cache_reclaimer_->pending_delete_handler_count_);
+    EXPECT_TRUE(cache_reclaimer_->credited_delete_bytes_by_group_.empty());
+    EXPECT_EQ(3, cache_reclaimer_->get_cache_reclaimer_fair_rotation_advance_count_metrics());
+    EXPECT_EQ((std::vector<std::string>{"large", "medium", "small"}), FairRotationOrder(group->name()));
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationRetainsPositionWhenPlanningCannotProceed) {
+    const auto group = SetUpFairRotationScenario();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    const auto waiting_order = FairRotationOrder(group->name());
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 0));
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(waiting_order, FairRotationOrder(group->name()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 100));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 0));
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(waiting_order, FairRotationOrder(group->name()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 10));
+    list_ins_info_result = ErrorCode::EC_ERROR;
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(waiting_order, FairRotationOrder(group->name()));
+    EXPECT_EQ(1, SampleReclaimRequestsSnapshot().size());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_rotation_advance_count_metrics());
+
+    list_ins_info_result = ErrorCode::EC_OK;
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ("medium", SubmittedDelRequestsSnapshot().back().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationDropsZeroBudgetAndAppendsReeligibleInstance) {
+    const auto group = SetUpFairRotationScenario();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    meta_indexers_by_instance.at("large")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 699);
+    meta_indexers_by_instance.at("small")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1);
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::string>{"large", "medium"}), FairRotationOrder(group->name()));
+    ASSERT_EQ(2, SampleReclaimRequestsSnapshot().size());
+    EXPECT_EQ("medium", SampleReclaimRequestsSnapshot().back().first);
+
+    CompleteSubmittedDelete(1, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    meta_indexers_by_instance.at("large")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 600);
+    meta_indexers_by_instance.at("small")->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 100);
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ((std::vector<std::string>{"medium", "small", "large"}), FairRotationOrder(group->name()));
+    EXPECT_EQ("large", SubmittedDelRequestsSnapshot().back().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationPausePreservesPositionAndStopClearsOnlyQueue) {
+    const auto group = SetUpFairRotationScenario();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto waiting_order = FairRotationOrder(group->name());
+    const auto credited_bytes = cache_reclaimer_->credited_delete_bytes_by_group_;
+    const auto pending_count = cache_reclaimer_->pending_locations_.size();
+    cache_reclaimer_->Pause();
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    cache_reclaimer_->Resume();
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ(waiting_order, FairRotationOrder(group->name()));
+    EXPECT_EQ(credited_bytes, cache_reclaimer_->credited_delete_bytes_by_group_);
+    EXPECT_EQ(pending_count, cache_reclaimer_->pending_locations_.size());
+
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ("medium", SubmittedDelRequestsSnapshot().back().instance_id);
+    cache_reclaimer_->Stop();
+    EXPECT_TRUE(cache_reclaimer_->fair_rotation_by_group_.empty());
+    EXPECT_EQ(credited_bytes, cache_reclaimer_->credited_delete_bytes_by_group_);
+    EXPECT_EQ(pending_count, cache_reclaimer_->pending_locations_.size());
+    EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+}
+
+TEST_F(CacheReclaimerTest, TestFairRotationPolicySwitchResetsQueueWithoutResettingCredit) {
+    const auto group = SetUpFairRotationScenario();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto credited_bytes = cache_reclaimer_->credited_delete_bytes_by_group_;
+    const auto predicted_keys = cache_reclaimer_->predicted_deleted_keys_by_group_;
+    const auto pending_count = cache_reclaimer_->pending_locations_.size();
+    group->cache_config_->reclaim_strategy_->set_instance_reclaim_budget_policy(
+        InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE);
+    EXPECT_FALSE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_TRUE(cache_reclaimer_->fair_rotation_by_group_.empty());
+    EXPECT_EQ(credited_bytes, cache_reclaimer_->credited_delete_bytes_by_group_);
+    EXPECT_EQ(predicted_keys, cache_reclaimer_->predicted_deleted_keys_by_group_);
+    EXPECT_EQ(pending_count, cache_reclaimer_->pending_locations_.size());
+    EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+
+    group->cache_config_->reclaim_strategy_->set_instance_reclaim_budget_policy(
+        InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL);
+    CompleteSubmittedDelete(0, {ErrorCode::EC_OK, ""});
+    cache_reclaimer_->HandleDelRes();
+    ASSERT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    EXPECT_EQ("large", SubmittedDelRequestsSnapshot().back().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairReclaimUsesWeightedBudgetAndStopsAfterAcceptedCredit) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    get_out_properties.clear();
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"thirty_bytes",
+         MakeCacheLocation("thirty_bytes",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=30")},
+    }};
+
+    const auto small = InstanceInfoFactory();
+    small->set_instance_id("small");
+    const auto large = InstanceInfoFactory();
+    large->set_instance_id("large");
+    AddMetaIndexerForInstance(small->instance_id(), 20);
+    AddMetaIndexerForInstance(large->instance_id(), 80);
+    // Deliberately put the small Instance first; fair execution must
+    // reorder by contribution.
+    instance_infos = {small, large};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(100);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 100));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 10));
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_TRUE(result.made_progress);
+    ASSERT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ("large", SubmittedDelRequestsSnapshot().front().instance_id);
+
+    std::int64_t large_sampling_count = 0;
+    std::int64_t small_sampling_count = 0;
+    for (const auto &[instance_id, sampling_count] : SampleReclaimRequestsSnapshot()) {
+        if (instance_id == "large") {
+            large_sampling_count += sampling_count;
+        } else if (instance_id == "small") {
+            small_sampling_count += sampling_count;
+        }
+    }
+    EXPECT_EQ(100, large_sampling_count);
+    EXPECT_EQ(0, small_sampling_count);
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_plan_count_metrics());
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_fair_effective_instance_count_metrics());
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_fair_planned_instance_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_sampled_instance_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_submitted_instance_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_plan_truncated_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_plan_truncated_instance_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestFairReclaimContinuesUntilAcceptedCreditRestoresWaterLevel) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    sample_reclaim_keys = {1};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"six_bytes",
+         MakeCacheLocation("six_bytes",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=6")},
+    }};
+
+    const auto instance_a = InstanceInfoFactory();
+    instance_a->set_instance_id("a");
+    const auto instance_b = InstanceInfoFactory();
+    instance_b->set_instance_id("b");
+    const auto instance_c = InstanceInfoFactory();
+    instance_c->set_instance_id("c");
+    AddMetaIndexerForInstance(instance_a->instance_id(), 30);
+    AddMetaIndexerForInstance(instance_b->instance_id(), 30);
+    AddMetaIndexerForInstance(instance_c->instance_id(), 30);
+    instance_infos = {instance_c, instance_b, instance_a};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(100);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 100));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 10));
+    cache_reclaimer_->sampling_size_per_task_.store(11);
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_TRUE(result.made_progress);
+    const auto requests = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(2, requests.size());
+    EXPECT_EQ("a", requests[0].instance_id);
+    EXPECT_EQ("b", requests[1].instance_id);
+
+    std::map<std::string, std::int64_t> sampled_by_instance;
+    for (const auto &[instance_id, sampling_count] : SampleReclaimRequestsSnapshot()) {
+        sampled_by_instance[instance_id] += sampling_count;
+    }
+    EXPECT_EQ(100, sampled_by_instance["a"]);
+    EXPECT_EQ(100, sampled_by_instance["b"]);
+    EXPECT_EQ(0, sampled_by_instance["c"]);
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_fair_sampled_instance_count_metrics());
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_fair_submitted_instance_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_plan_truncated_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_plan_truncated_instance_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestFairReclaimStopsWhenTriggerScopeChanges) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    sample_reclaim_keys = {1};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"twenty_one_bytes",
+         MakeCacheLocation("twenty_one_bytes",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=21")},
+    }};
+
+    const auto instance_a = InstanceInfoFactory();
+    instance_a->set_instance_id("a");
+    const auto instance_b = InstanceInfoFactory();
+    instance_b->set_instance_id("b");
+    AddMetaIndexerForInstance(instance_a->instance_id(), 50);
+    AddMetaIndexerForInstance(instance_b->instance_id(), 50);
+    instance_infos = {instance_b, instance_a};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(50);
+    group->quota_.quota_config_.clear();
+    QuotaConfig nfs_quota;
+    nfs_quota.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    nfs_quota.set_capacity(100);
+    group->quota_.quota_config_.push_back(nfs_quota);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_TRUE(result.made_progress);
+    ASSERT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ("a", SubmittedDelRequestsSnapshot().front().instance_id);
+
+    const auto current_water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                                           group->name(),
+                                                                           group->quota(),
+                                                                           group->cache_config()->reclaim_strategy(),
+                                                                           instance_infos);
+    ASSERT_NE(nullptr, current_water_level);
+    EXPECT_TRUE(current_water_level->GetGroupBytesWaterLevelExceed());
+    EXPECT_FALSE(current_water_level->CheckStorageTypeWaterLevelExceed());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_sampled_instance_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_plan_truncated_count_metrics());
+    EXPECT_EQ((std::vector<std::string>{"b", "a"}), FairRotationOrder(group->name()));
+
+    // The next plan uses Group bytes instead of type bytes, without resetting the waiter.
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    const auto requests = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(2, requests.size());
+    EXPECT_EQ("b", requests.back().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairReclaimStopsWhenStorageTypeBecomesExceeded) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    sample_reclaim_keys = {1};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"one_byte",
+         MakeCacheLocation("one_byte",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=1")},
+    }};
+
+    const auto instance_a = InstanceInfoFactory();
+    instance_a->set_instance_id("a");
+    const auto instance_b = InstanceInfoFactory();
+    instance_b->set_instance_id("b");
+    const auto indexer_a = AddMetaIndexerForInstance(instance_a->instance_id(), 50);
+    const auto indexer_b = AddMetaIndexerForInstance(instance_b->instance_id(), 50);
+    instance_infos = {instance_b, instance_a};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(100);
+    group->quota_.set_quota_config({QuotaConfig(1000, DataStorageType::DATA_STORAGE_TYPE_NFS)});
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    spe_submit_accepted_callback = [indexer_a, indexer_b](const CacheLocationDelRequest &) {
+        indexer_a->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 500);
+        indexer_b->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 500);
+    };
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_TRUE(result.made_progress);
+    ASSERT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ("a", SubmittedDelRequestsSnapshot().front().instance_id);
+
+    const auto current_water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                                           group->name(),
+                                                                           group->quota(),
+                                                                           group->cache_config()->reclaim_strategy(),
+                                                                           instance_infos);
+    ASSERT_NE(nullptr, current_water_level);
+    EXPECT_TRUE(current_water_level->GetGroupBytesWaterLevelExceed());
+    EXPECT_TRUE(current_water_level->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_sampled_instance_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_plan_truncated_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestFairReclaimStopsWhenGroupBytesBecomesExceededDuringKeyCountPlan) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    sample_reclaim_keys = {1};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"one_byte",
+         MakeCacheLocation("one_byte",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=1")},
+    }};
+
+    const auto instance_a = InstanceInfoFactory();
+    instance_a->set_instance_id("a");
+    const auto instance_b = InstanceInfoFactory();
+    instance_b->set_instance_id("b");
+    const auto indexer_a = AddMetaIndexerForInstance(instance_a->instance_id(), 1, 90);
+    const auto indexer_b = AddMetaIndexerForInstance(instance_b->instance_id(), 1, 90);
+    instance_infos = {instance_b, instance_a};
+    max_key_count = 100;
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(1000);
+    group->quota_.set_quota_config({QuotaConfig(10000, DataStorageType::DATA_STORAGE_TYPE_NFS)});
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    spe_submit_accepted_callback = [indexer_a, indexer_b](const CacheLocationDelRequest &) {
+        indexer_a->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 500);
+        indexer_b->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 500);
+    };
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_TRUE(result.made_progress);
+    ASSERT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ("a", SubmittedDelRequestsSnapshot().front().instance_id);
+
+    const auto current_water_level = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                                           group->name(),
+                                                                           group->quota(),
+                                                                           group->cache_config()->reclaim_strategy(),
+                                                                           instance_infos);
+    ASSERT_NE(nullptr, current_water_level);
+    EXPECT_TRUE(current_water_level->GetGroupKeysWaterLevelExceed());
+    EXPECT_TRUE(current_water_level->GetGroupBytesWaterLevelExceed());
+    EXPECT_FALSE(current_water_level->CheckStorageTypeWaterLevelExceed());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_sampled_instance_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_plan_truncated_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestFairReclaimPauseDoesNotReportWaterLevelTruncation) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    sample_reclaim_keys = {1};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"one_byte",
+         MakeCacheLocation("one_byte",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=1")},
+    }};
+
+    const auto instance_a = InstanceInfoFactory();
+    instance_a->set_instance_id("a");
+    const auto instance_b = InstanceInfoFactory();
+    instance_b->set_instance_id("b");
+    AddMetaIndexerForInstance(instance_a->instance_id(), 50);
+    AddMetaIndexerForInstance(instance_b->instance_id(), 50);
+    instance_infos = {instance_b, instance_a};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(10);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+    spe_submit_accepted_callback = [this](const CacheLocationDelRequest &) { cache_reclaimer_->Pause(); };
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_TRUE(result.made_progress);
+    EXPECT_TRUE(cache_reclaimer_->IsPaused());
+    EXPECT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_sampled_instance_count_metrics());
+    EXPECT_EQ(0, cache_reclaimer_->get_cache_reclaimer_fair_plan_truncated_count_metrics());
+}
+
+TEST_F(CacheReclaimerTest, TestFairUnsupportedPoliciesFallBackToLRU) {
+    cache_reclaimer_->job_state_flag_ = true;
+    sample_reclaim_keys = {1};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"one_byte",
+         MakeCacheLocation("one_byte",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=1")},
+    }};
+    AddMetaIndexerForInstance(instance_infos.front()->instance_id(), 100);
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(10);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    for (const auto policy : {ReclaimPolicy::POLICY_LFU, ReclaimPolicy::POLICY_TTL}) {
+        group->cache_config_->reclaim_strategy_->set_reclaim_policy(policy);
+        const std::size_t submitted_before = SubmittedDelRequestCount();
+        const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+        EXPECT_TRUE(result.water_level_exceeded);
+        EXPECT_TRUE(result.made_progress);
+        EXPECT_EQ(submitted_before + 1, SubmittedDelRequestCount());
+        cache_reclaimer_->HandleDelRes();
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestFairReclaimContinuesAfterRejectedSubmission) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    spe_submit_accepted_by_instance["a"] = false;
+    sample_reclaim_keys = {1};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"fifty_bytes",
+         MakeCacheLocation("fifty_bytes",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=50")},
+    }};
+
+    const auto instance_a = InstanceInfoFactory();
+    instance_a->set_instance_id("a");
+    const auto instance_b = InstanceInfoFactory();
+    instance_b->set_instance_id("b");
+    AddMetaIndexerForInstance(instance_a->instance_id(), 60);
+    AddMetaIndexerForInstance(instance_b->instance_id(), 60);
+    instance_infos = {instance_b, instance_a};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(100);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_TRUE(result.made_progress);
+    const auto requests = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(2, requests.size());
+    EXPECT_EQ("a", requests[0].instance_id);
+    EXPECT_EQ("b", requests[1].instance_id);
+    EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_fair_sampled_instance_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_submitted_instance_count_metrics());
+    EXPECT_EQ(1, cache_reclaimer_->pending_delete_handler_count_);
+}
+
+TEST_F(CacheReclaimerTest, TestFairReclaimContinuesAfterSamplingFailure) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    sample_reclaim_results = {ErrorCode::EC_ERROR, ErrorCode::EC_OK};
+    sample_reclaim_keys = {1};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"fifty_bytes",
+         MakeCacheLocation("fifty_bytes",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=50")},
+    }};
+
+    const auto instance_a = InstanceInfoFactory();
+    instance_a->set_instance_id("a");
+    const auto instance_b = InstanceInfoFactory();
+    instance_b->set_instance_id("b");
+    AddMetaIndexerForInstance(instance_a->instance_id(), 60);
+    AddMetaIndexerForInstance(instance_b->instance_id(), 60);
+    instance_infos = {instance_b, instance_a};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(100);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_TRUE(result.made_progress);
+    const auto sampled = SampleReclaimRequestsSnapshot();
+    ASSERT_EQ(2, sampled.size());
+    EXPECT_EQ("a", sampled[0].first);
+    EXPECT_EQ("b", sampled[1].first);
+    ASSERT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ("b", SubmittedDelRequestsSnapshot().front().instance_id);
+}
+
+TEST_F(CacheReclaimerTest, TestFairReclaimSnapshotsRuntimeBudgetForCurrentPlan) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    sample_reclaim_keys = {1};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"one_byte",
+         MakeCacheLocation("one_byte",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=1")},
+    }};
+
+    const auto instance_a = InstanceInfoFactory();
+    instance_a->set_instance_id("a");
+    const auto instance_b = InstanceInfoFactory();
+    instance_b->set_instance_id("b");
+    AddMetaIndexerForInstance(instance_a->instance_id(), 50);
+    AddMetaIndexerForInstance(instance_b->instance_id(), 50);
+    instance_infos = {instance_b, instance_a};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(10);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 10));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    ErrorCode sampling_update_result = ErrorCode::EC_ERROR;
+    ErrorCode batching_update_result = ErrorCode::EC_ERROR;
+    std::size_t accepted_count = 0;
+    spe_submit_accepted_callback = [&](const CacheLocationDelRequest &) {
+        if (accepted_count++ == 0) {
+            sampling_update_result = cache_reclaimer_->SetSamplingSize(request_context_.get(), 100);
+            batching_update_result = cache_reclaimer_->SetBatchingSize(request_context_.get(), 10);
+        }
+    };
+
+    const auto first_result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(first_result.made_progress);
+    EXPECT_EQ(ErrorCode::EC_OK, sampling_update_result);
+    EXPECT_EQ(ErrorCode::EC_OK, batching_update_result);
+    std::map<std::string, std::int64_t> first_round_sampling;
+    for (const auto &[instance_id, sampling_count] : SampleReclaimRequestsSnapshot()) {
+        first_round_sampling[instance_id] += sampling_count;
+    }
+    EXPECT_EQ(10, first_round_sampling["a"]);
+    EXPECT_EQ(10, first_round_sampling["b"]);
+
+    spe_submit_accepted_callback = {};
+    ClearSampleReclaimRequests();
+    const auto second_result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(second_result.water_level_exceeded);
+    std::map<std::string, std::int64_t> second_round_sampling;
+    for (const auto &[instance_id, sampling_count] : SampleReclaimRequestsSnapshot()) {
+        second_round_sampling[instance_id] += sampling_count;
+    }
+    EXPECT_EQ(100, second_round_sampling["a"]);
+    EXPECT_EQ(100, second_round_sampling["b"]);
+}
+
+TEST_F(CacheReclaimerTest, TestBudgetPolicySwitchAppliesNextRoundAndPreservesInFlightState) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    sample_reclaim_keys = {1};
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"one_byte",
+         MakeCacheLocation("one_byte",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=1")},
+    }};
+
+    const auto small = InstanceInfoFactory();
+    small->set_instance_id("small");
+    const auto large = InstanceInfoFactory();
+    large->set_instance_id("large");
+    AddMetaIndexerForInstance(small->instance_id(), 20);
+    AddMetaIndexerForInstance(large->instance_id(), 80);
+    instance_infos = {small, large};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(10);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 100));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 10));
+
+    const auto reclaim_strategy = group->cache_config()->reclaim_strategy();
+    spe_submit_accepted_callback = [reclaim_strategy](const CacheLocationDelRequest &request) {
+        if (request.instance_id == "large") {
+            reclaim_strategy->set_instance_reclaim_budget_policy(InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE);
+        }
+    };
+
+    const auto first_result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(first_result.made_progress);
+    EXPECT_EQ(InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE, reclaim_strategy->instance_reclaim_budget_policy());
+    const auto first_requests = SubmittedDelRequestsSnapshot();
+    ASSERT_EQ(2, first_requests.size());
+    EXPECT_EQ("large", first_requests[0].instance_id);
+    EXPECT_EQ("small", first_requests[1].instance_id);
+    std::map<std::string, std::int64_t> fair_sampling;
+    for (const auto &[instance_id, sampling_count] : SampleReclaimRequestsSnapshot()) {
+        fair_sampling[instance_id] += sampling_count;
+    }
+    EXPECT_EQ(100, fair_sampling["large"]);
+    EXPECT_EQ(40, fair_sampling["small"]);
+    EXPECT_EQ((std::vector<std::string>{"large", "small"}), FairRotationOrder(group->name()));
+
+    const std::uint64_t delete_handler_count = cache_reclaimer_->pending_delete_handler_count_;
+    const std::size_t pending_location_count = cache_reclaimer_->pending_locations_.size();
+    const auto credited_bytes = cache_reclaimer_->credited_delete_bytes_by_group_;
+    const auto predicted_keys = cache_reclaimer_->predicted_deleted_keys_by_group_;
+
+    spe_submit_accepted_callback = {};
+    ClearSampleReclaimRequests();
+    const auto second_result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(second_result.water_level_exceeded);
+    const auto legacy_sampling = SampleReclaimRequestsSnapshot();
+    ASSERT_EQ(2, legacy_sampling.size());
+    EXPECT_EQ(std::make_pair(std::string{"small"}, std::int64_t{100}), legacy_sampling[0]);
+    EXPECT_EQ(std::make_pair(std::string{"large"}, std::int64_t{100}), legacy_sampling[1]);
+    EXPECT_EQ(1, cache_reclaimer_->get_cache_reclaimer_fair_plan_count_metrics());
+    EXPECT_EQ(delete_handler_count, cache_reclaimer_->pending_delete_handler_count_);
+    EXPECT_EQ(pending_location_count, cache_reclaimer_->pending_locations_.size());
+    EXPECT_EQ(credited_bytes, cache_reclaimer_->credited_delete_bytes_by_group_);
+    EXPECT_EQ(predicted_keys, cache_reclaimer_->predicted_deleted_keys_by_group_);
+    EXPECT_TRUE(cache_reclaimer_->fair_rotation_by_group_.empty());
+}
+
+TEST_F(CacheReclaimerTest, TestFixedPerInstanceBudgetPolicyUsesLegacyOrderAndBudget) {
+    cache_reclaimer_->job_state_flag_ = true;
+    spe_submit_auto_complete = false;
+    get_out_properties.clear();
+    batch_get_loc_out_maps = {CacheLocationMap{
+        {"thirty_bytes",
+         MakeCacheLocation("thirty_bytes",
+                           CacheLocationStatus::CLS_SERVING,
+                           DataStorageType::DATA_STORAGE_TYPE_NFS,
+                           "nfs://store/key?size=30")},
+    }};
+
+    const auto small = InstanceInfoFactory();
+    small->set_instance_id("small");
+    const auto large = InstanceInfoFactory();
+    large->set_instance_id("large");
+    AddMetaIndexerForInstance(small->instance_id(), 20);
+    AddMetaIndexerForInstance(large->instance_id(), 80);
+    instance_infos = {small, large};
+
+    const auto group = InstanceGroupFactory();
+    group->quota_.set_capacity(100);
+    group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.8);
+    group->cache_config_->reclaim_strategy_->set_instance_reclaim_budget_policy(
+        InstanceReclaimBudgetPolicy::FIXED_PER_INSTANCE);
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 100));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 10));
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.water_level_exceeded);
+    EXPECT_TRUE(result.made_progress);
+    ASSERT_EQ(1, SubmittedDelRequestCount());
+    EXPECT_EQ("small", SubmittedDelRequestsSnapshot().front().instance_id);
+
+    std::int64_t small_sampling_count = 0;
+    std::int64_t large_sampling_count = 0;
+    for (const auto &[instance_id, sampling_count] : SampleReclaimRequestsSnapshot()) {
+        if (instance_id == "small") {
+            small_sampling_count += sampling_count;
+        } else if (instance_id == "large") {
+            large_sampling_count += sampling_count;
+        }
+    }
+    EXPECT_EQ(100, small_sampling_count);
+    EXPECT_EQ(0, large_sampling_count);
+    EXPECT_EQ(0, cache_reclaimer_->get_cache_reclaimer_fair_plan_count_metrics());
 }
 
 TEST_F(CacheReclaimerTest, TestReclaimCronHandlesReadyFutureBeforeReadingOfficialUsage) {
@@ -3791,86 +6336,82 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
         cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(sample_reclaim_keys.size(), keys.size());
-        ASSERT_EQ(get_out_properties.size(), maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(sample_reclaim_keys.size(), candidates.size());
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            EXPECT_EQ(sample_reclaim_keys[i], candidates[i].key);
+            EXPECT_EQ(static_cast<int64_t>(i), candidates[i].last_access_time_us);
+        }
     }
 
     {
         cache_reclaimer_->sampling_size_.store(0);
         cache_reclaimer_->sampling_size_per_task_.store(100);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+        ReclaimCandidateVector candidates;
+        ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
     }
 
     {
         cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
         cache_reclaimer_->sampling_size_per_task_.store(0); // 0 means single thread key sampling
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(sample_reclaim_keys.size(), keys.size());
-        ASSERT_EQ(get_out_properties.size(), maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(sample_reclaim_keys.size(), candidates.size());
     }
     {
         // sampling_size <= sampling_size_per_task means single thread key sampling
         cache_reclaimer_->sampling_size_.store(1000);
         cache_reclaimer_->sampling_size_per_task_.store(1000);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(1000, keys.size());
-        ASSERT_EQ(1000, maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(1000, candidates.size());
     }
 
     {
+        // Keep an explicit non-default value that spans multiple sampling tasks.
+        ClearSampleReclaimRequests();
         cache_reclaimer_->sampling_size_.store(1000);
         cache_reclaimer_->sampling_size_per_task_.store(100);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(1000, keys.size());
-        ASSERT_EQ(1000, maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(1000, candidates.size());
+        const auto requests = SampleReclaimRequestsSnapshot();
+        ASSERT_EQ(10, requests.size());
+        for (const auto &request : requests) {
+            EXPECT_EQ(100, request.second);
+        }
     }
 
     {
         cache_reclaimer_->sampling_size_.store(999);
         cache_reclaimer_->sampling_size_per_task_.store(99);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(999, keys.size());
-        ASSERT_EQ(999, maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(999, candidates.size());
     }
 
     {
         cache_reclaimer_->sampling_size_.store(1001);
         cache_reclaimer_->sampling_size_per_task_.store(100);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(1001, keys.size());
-        ASSERT_EQ(1001, maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(1001, candidates.size());
     }
 
     {
         cache_reclaimer_->sampling_size_.store(1);
         cache_reclaimer_->sampling_size_per_task_.store(999);
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(1, keys.size());
-        ASSERT_EQ(1, maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(1, candidates.size());
     }
 
     {
@@ -3882,16 +6423,112 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
         // the specially crafted size 11 would cause the mock func return 10 sampled keys
         // 10 * 9 + 1 = 91
 
-        std::vector<std::int64_t> keys;
-        std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-        ASSERT_EQ(91, keys.size());
-        ASSERT_EQ(91, maps.size());
+        ReclaimCandidateVector candidates;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+        ASSERT_EQ(91, candidates.size());
     }
 }
 
-TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_SampleReclaimKeysHangs) {
-    // when SampleReclaimKeys blocks longer than the future timeout,
+TEST_F(CacheReclaimerTest, TestLocalSamplingUsesOneTaskWithoutChangingLegacyBudgets) {
+    auto indexer = mim_->GetMetaIndexer(instance_infos.front()->instance_id());
+    ASSERT_NE(nullptr, indexer);
+    indexer->backend_manager_ = std::make_unique<MetaStorageBackendManager>();
+    indexer->backend_manager_->persistent_backend_ = std::make_unique<MetaLocalBackend>();
+    indexer->backend_manager_->cache_backend_ = std::make_unique<MetaLocalBackend>();
+    cache_reclaimer_->job_state_flag_ = true;
+    cache_reclaimer_->sampling_size_.store(1000);
+    cache_reclaimer_->sampling_size_per_task_.store(100);
+
+    for (const bool recovered : {false, true}) {
+        indexer->backend_manager_->recover_state_.store(recovered ? MetaStorageBackendManager::RecoverState::kRunning
+                                                                  : MetaStorageBackendManager::RecoverState::kRecover);
+        for (const bool bounded : {false, true}) {
+            ClearSampleReclaimRequests();
+            ReclaimCandidateVector candidates;
+            ASSERT_TRUE(cache_reclaimer_->DoKeySamplingWithSize(
+                request_context_, instance_infos.front(), 1000, bounded, candidates));
+            EXPECT_EQ(1000, candidates.size());
+            const auto requests = SampleReclaimRequestsSnapshot();
+            ASSERT_EQ(recovered ? 1 : 10, requests.size());
+            for (const auto &request : requests) {
+                EXPECT_EQ(recovered ? 1000 : 100, request.second);
+            }
+        }
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestFairKeySamplingSubmitsBoundedWaves) {
+    cache_reclaimer_->Stop();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(5, 1, 1, 10, 2, rm_, mim_, msm_, spe_, mr_, em_, nullptr);
+    cache_reclaimer_->job_state_flag_ = true;
+    sample_reclaim_keys = {1};
+    get_out_properties = {{{PROPERTY_LRU_TIME, "1"}}};
+    mi_sample_reclaim_delay = std::chrono::milliseconds(300);
+
+    ReclaimCandidateVector candidates;
+    auto sampling_future = std::async(std::launch::async, [&] {
+        return cache_reclaimer_->DoKeySamplingWithSize(request_context_, instance_infos.front(), 5, true, candidates);
+    });
+
+    // Before the first tasks can finish, only one wave (two tasks) may
+    // be admitted. An unbounded submission would report five in-flight
+    // tasks and leave three queued.
+    EXPECT_TRUE(WaitUntil(
+        [this] {
+            std::lock_guard<std::mutex> lock(cache_reclaimer_->task_queue_mutex_);
+            return cache_reclaimer_->in_flight_sampling_tasks_.load() == 2 && cache_reclaimer_->task_queue_.empty();
+        },
+        std::chrono::milliseconds(200)));
+    EXPECT_TRUE(sampling_future.get());
+    EXPECT_EQ(5, candidates.size());
+}
+
+TEST_F(CacheReclaimerTest, TestFairKeySamplingFailureClearsPartialWaveResults) {
+    cache_reclaimer_->Stop();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(5, 1, 1, 10, 2, rm_, mim_, msm_, spe_, mr_, em_, nullptr);
+    cache_reclaimer_->job_state_flag_ = true;
+    sample_reclaim_keys = {1};
+    sample_reclaim_results = {
+        ErrorCode::EC_OK,
+        ErrorCode::EC_OK,
+        ErrorCode::EC_ERROR,
+        ErrorCode::EC_OK,
+    };
+
+    ReclaimCandidateVector candidates = {{999, 999}};
+    EXPECT_FALSE(
+        cache_reclaimer_->DoKeySamplingWithSize(request_context_, instance_infos.front(), 5, true, candidates));
+    EXPECT_TRUE(candidates.empty());
+    EXPECT_EQ(4, SampleReclaimRequestsSnapshot().size());
+    EXPECT_EQ(0, cache_reclaimer_->in_flight_sampling_tasks_.load());
+}
+
+TEST_F(CacheReclaimerTest, TestFairKeySamplingTimeoutClearsPartialWaveResults) {
+    cache_reclaimer_->Stop();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(2, 1, 1, 10, 1, rm_, mim_, msm_, spe_, mr_, em_, nullptr);
+    cache_reclaimer_->job_state_flag_ = true;
+    cache_reclaimer_->future_timeout_ms_.store(50);
+    sample_reclaim_keys = {1};
+    mi_sample_reclaim_delays = {
+        std::chrono::milliseconds{0},
+        std::chrono::milliseconds{500},
+    };
+
+    ReclaimCandidateVector candidates = {{999, 999}};
+    const auto begin = std::chrono::steady_clock::now();
+    EXPECT_FALSE(
+        cache_reclaimer_->DoKeySamplingWithSize(request_context_, instance_infos.front(), 2, true, candidates));
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    EXPECT_LT(elapsed, std::chrono::milliseconds{300});
+    EXPECT_TRUE(candidates.empty());
+    EXPECT_EQ(2, SampleReclaimRequestsSnapshot().size());
+
+    ASSERT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; },
+                          std::chrono::milliseconds{1000}));
+}
+
+TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_SampleReclaimCandidatesHangs) {
+    // when SampleReclaimCandidates blocks longer than the future timeout,
     // DoKeySampling should return false instead of blocking forever
     sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
@@ -3915,11 +6552,10 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_SampleReclaimKeysHangs
     cache_reclaimer_->sampling_size_.store(10);
     cache_reclaimer_->sampling_size_per_task_.store(5);
 
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
+    ReclaimCandidateVector candidates;
 
     const auto t0 = std::chrono::steady_clock::now();
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
     const auto elapsed = std::chrono::steady_clock::now() - t0;
 
     // should return within the timeout budget (~50ms), not wait for the full 500ms task
@@ -3934,8 +6570,9 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_SampleReclaimKeysHangs
     }
 }
 
-TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_GetPropertiesHangs) {
-    // when GetProperties blocks longer than the future timeout,
+TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_CandidateTimestampReadHangs) {
+    // The backend's timestamp read remains covered by the combined candidate
+    // call and must not let DoKeySampling block past its future timeout.
     // DoKeySampling should return false instead of blocking forever
     sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
@@ -3951,18 +6588,17 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_GetPropertiesHangs) {
         {{PROPERTY_LRU_TIME, "9"}},
     };
 
-    // set a very short future timeout (50ms) and a long GetProperties delay (500ms)
+    // set a very short future timeout (50ms) and a long timestamp read delay (500ms)
     cache_reclaimer_->future_timeout_ms_.store(50);
     mi_getprop_delay = std::chrono::milliseconds{500};
 
-    // use multi-thread path with sampling_size > batching_size to trigger GetProperties
+    // use multi-thread path so the candidate calls are bounded by futures
     cache_reclaimer_->sampling_size_.store(10);
     cache_reclaimer_->sampling_size_per_task_.store(5);
     cache_reclaimer_->batching_size_.store(1);
 
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ReclaimCandidateVector candidates;
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
 
     // wait for background tasks to finish naturally
     while (cache_reclaimer_->in_flight_sampling_tasks_.load() > 0) {
@@ -3996,10 +6632,9 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_NoTimeoutOnFastTasks) 
     cache_reclaimer_->sampling_size_.store(10);
     cache_reclaimer_->sampling_size_per_task_.store(5);
 
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
-    ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
-    ASSERT_EQ(10u, keys.size());
+    ReclaimCandidateVector candidates;
+    ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
+    ASSERT_EQ(10u, candidates.size());
 
     // all tasks completed, in-flight should be zero
     ASSERT_EQ(0u, cache_reclaimer_->in_flight_sampling_tasks_.load());
@@ -4030,11 +6665,10 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_DeadlineBoundsAllFutur
     cache_reclaimer_->sampling_size_.store(10);
     cache_reclaimer_->sampling_size_per_task_.store(2); // 5 tasks
 
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
+    ReclaimCandidateVector candidates;
 
     const auto t0 = std::chrono::steady_clock::now();
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
     const auto elapsed = std::chrono::steady_clock::now() - t0;
 
     // should be bounded by ~100ms deadline, not 500ms (5 tasks * 100ms)
@@ -4071,12 +6705,11 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_WorkerSaturationGuard)
     cache_reclaimer_->sampling_size_.store(10);
     cache_reclaimer_->sampling_size_per_task_.store(5);
 
-    std::vector<std::int64_t> keys;
-    std::vector<std::map<std::string, std::string>> maps;
+    ReclaimCandidateVector candidates;
 
     // should immediately return false without submitting new work
     const auto t0 = std::chrono::steady_clock::now();
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), candidates));
     const auto elapsed = std::chrono::steady_clock::now() - t0;
     ASSERT_LT(elapsed, std::chrono::milliseconds(50));
 
@@ -4086,52 +6719,17 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_WorkerSaturationGuard)
 
 TEST_F(CacheReclaimerTest, TestDupKeys) {
     {
-        sample_reclaim_keys = {0, 0, 2, 3, 4, 5, 6, 7, 8, 9};
-        get_out_properties = {
-            {
-                {PROPERTY_LRU_TIME, "1"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "1"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "2"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "3"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "4"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "5"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "6"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "7"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "8"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-        };
-
-        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
+        const ReclaimCandidateVector candidates = {
+            {0, 1}, {0, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}, {6, 6}, {7, 7}, {8, 8}, {9, 9}};
+        cache_reclaimer_->sampling_size_.store(candidates.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
-        cache_reclaimer_->batching_size_.store(sample_reclaim_keys.size());
+        cache_reclaimer_->batching_size_.store(candidates.size());
 
-        std::vector<std::int64_t> keys(sample_reclaim_keys);
-        std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), candidates, batch, lru_age_stats));
         ASSERT_EQ(9, batch.size());
-        // keys 1..10 unique, lru_times 0..9; tp=0 excluded from stats, tp=1..9 included (9 entries)
         // ages: now_us-1, now_us-2, ..., now_us-9 → min=now_us-9, max=now_us-1, diff=8
         EXPECT_GT(lru_age_stats.min_us, 0);
         EXPECT_GT(lru_age_stats.max_us, 0);
@@ -4142,50 +6740,16 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
     }
 
     {
-        sample_reclaim_keys = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
-        get_out_properties = {
-            {
-                {PROPERTY_LRU_TIME, "0"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "1"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "2"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "3"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "4"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "5"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "6"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "7"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "8"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-        };
-
-        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
+        const ReclaimCandidateVector candidates = {
+            {1, 0}, {1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5}, {1, 6}, {1, 7}, {1, 8}, {1, 9}};
+        cache_reclaimer_->sampling_size_.store(candidates.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
         cache_reclaimer_->batching_size_.store(2);
 
-        std::vector<std::int64_t> keys(sample_reclaim_keys);
-        std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), candidates, batch, lru_age_stats));
         ASSERT_EQ(1, batch.size());
         // all keys are 1 (only 1 unique key), first occurrence has tp=0 → excluded
         // age_count=0 → Clear() called → all stats zeroed
@@ -4195,50 +6759,16 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
     }
 
     {
-        sample_reclaim_keys = {1, 1, 1, 1, 1, 1, 1, 2, 1, 1};
-        get_out_properties = {
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "10"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-            {
-                {PROPERTY_LRU_TIME, "9"},
-            },
-        };
-
-        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
+        const ReclaimCandidateVector candidates = {
+            {1, 9}, {1, 9}, {1, 9}, {1, 9}, {1, 9}, {1, 9}, {1, 9}, {2, 10}, {1, 9}, {1, 9}};
+        cache_reclaimer_->sampling_size_.store(candidates.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
         cache_reclaimer_->batching_size_.store(2);
 
-        std::vector<std::int64_t> keys(sample_reclaim_keys);
-        std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), candidates, batch, lru_age_stats));
         ASSERT_EQ(2, batch.size());
         // keys={1*7,2,1,1}, tp={9*7,10,9,9}; sorted → key=1(tp=9) then key=2(tp=10)
         // ages: now_us-9 and now_us-10 → min=now_us-10, max=now_us-9, diff=1
@@ -4262,12 +6792,12 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotSkipActiveMigrationTask) {
 
     auto make_serving_map = [](const std::string &loc_id) {
         CacheLocationMap m;
-        auto loc = std::make_shared<CacheLocation>(
-            loc_id,
-            CacheLocationStatus::CLS_SERVING,
-            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-            1,
-            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
+        auto loc =
+            std::make_shared<CacheLocation>(loc_id,
+                                            CacheLocationStatus::CLS_SERVING,
+                                            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                            1,
+                                            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
         m.emplace(loc_id, loc);
         return m;
     };
@@ -4278,7 +6808,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotSkipActiveMigrationTask) {
         batch_get_loc_result = ErrorCode::EC_OK;
 
         CacheReclaimer::WaterLevelExceed wl;
-        wl.SetGeneralWaterLevelExceed(true);
+        wl.SetGroupBytesWaterLevelExceed(true);
         ASSERT_FALSE(wl.CheckStorageTypeWaterLevelExceed());
 
         std::vector<std::vector<std::string>> out;
@@ -4313,21 +6843,20 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotSkipActiveMigrationTask) {
 
 TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
     auto write_location_manager = std::make_shared<WriteLocationManager>();
-    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
-        10,
-        100,
-        1,
-        10,
-        16,
-        rm_,
-        mim_,
-        msm_,
-        spe_,
-        mr_,
-        em_,
-        write_location_manager,
-        CacheReclaimerAsyncDeleteConfig{},
-        mm_);
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(10,
+                                                        100,
+                                                        1,
+                                                        10,
+                                                        16,
+                                                        rm_,
+                                                        mim_,
+                                                        msm_,
+                                                        spe_,
+                                                        mr_,
+                                                        em_,
+                                                        write_location_manager,
+                                                        CacheReclaimerAsyncDeleteConfig{},
+                                                        mm_);
 
     const auto ins_info = InstanceInfoFactory();
     mm_->DebugInsertActiveCopyTask(ins_info->instance_id(), 42, "migration_writing");
@@ -4340,20 +6869,17 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
         std::lock_guard<std::mutex> lock(mm_->task_mutex_);
         ASSERT_TRUE(mm_->ReservePreparingTaskLocked(preparing_req));
     }
-    write_location_manager->Put("write_session",
-                                {44},
-                                {"client_writing"},
-                                60,
-                                [](std::unique_ptr<WriteLocationManager::WriteLocationInfo>) {});
+    write_location_manager->Put(
+        "write_session", {44}, {"client_writing"}, 60, [](std::unique_ptr<WriteLocationManager::WriteLocationInfo>) {});
 
     auto make_writing_map = [](const std::string &loc_id) {
         CacheLocationMap m;
-        auto loc = std::make_shared<CacheLocation>(
-            loc_id,
-            CacheLocationStatus::CLS_WRITING,
-            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-            1,
-            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
+        auto loc =
+            std::make_shared<CacheLocation>(loc_id,
+                                            CacheLocationStatus::CLS_WRITING,
+                                            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                            1,
+                                            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
         m.emplace(loc_id, loc);
         return m;
     };
@@ -4365,7 +6891,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
     batch_get_loc_result = ErrorCode::EC_OK;
 
     CacheReclaimer::WaterLevelExceed wl;
-    wl.SetGeneralWaterLevelExceed(true);
+    wl.SetGroupBytesWaterLevelExceed(true);
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
@@ -4423,7 +6949,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDKeepColdEvictHot) {
     batch_get_loc_result = ErrorCode::EC_OK;
 
     CacheReclaimer::WaterLevelExceed wl;
-    wl.SetGeneralWaterLevelExceed(true); // 总水位超限分支
+    wl.SetGroupBytesWaterLevelExceed(true); // 总水位超限分支
     ASSERT_FALSE(wl.CheckStorageTypeWaterLevelExceed());
 
     std::vector<std::vector<std::string>> out;
@@ -4484,7 +7010,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDPendingColdDoesNotCompleteCoverage) {
     cache_reclaimer_->pending_locations_.insert({ins_info->instance_id(), block_key, "cold_pending"});
 
     CacheReclaimer::WaterLevelExceed water_level;
-    water_level.SetGeneralWaterLevelExceed(true);
+    water_level.SetGroupBytesWaterLevelExceed(true);
     std::vector<std::vector<std::string>> location_ids;
     CacheReclaimer::AgeStats age_stats;
     ASSERT_TRUE(FilterLocations(ins_info, {block_key}, water_level, location_ids, age_stats));
@@ -4510,15 +7036,14 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotEvictHotWhenColdSpecsIncomplete
     stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
 
     const auto ins_info = InstanceInfoFactory();
-    auto hot_loc = std::make_shared<CacheLocation>(
-        "hot_full",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        2,
-        std::vector<LocationSpec>{
-            LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
-            LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
-        });
+    auto hot_loc = std::make_shared<CacheLocation>("hot_full",
+                                                   CacheLocationStatus::CLS_SERVING,
+                                                   DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                                   2,
+                                                   std::vector<LocationSpec>{
+                                                       LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
+                                                       LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
+                                                   });
     auto partial_cold_loc = std::make_shared<CacheLocation>(
         "cold_partial",
         CacheLocationStatus::CLS_SERVING,
@@ -4543,7 +7068,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotEvictHotWhenColdSpecsIncomplete
     batch_get_loc_result = ErrorCode::EC_OK;
 
     CacheReclaimer::WaterLevelExceed wl;
-    wl.SetGeneralWaterLevelExceed(true);
+    wl.SetGroupBytesWaterLevelExceed(true);
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
@@ -4557,21 +7082,20 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotEvictHotWhenColdSpecsIncomplete
 
 TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotPreserveColdOrphanWriting) {
     auto write_location_manager = std::make_shared<WriteLocationManager>();
-    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
-        10,
-        100,
-        1,
-        10,
-        16,
-        rm_,
-        mim_,
-        msm_,
-        spe_,
-        mr_,
-        em_,
-        write_location_manager,
-        CacheReclaimerAsyncDeleteConfig{},
-        mm_);
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(10,
+                                                        100,
+                                                        1,
+                                                        10,
+                                                        16,
+                                                        rm_,
+                                                        mim_,
+                                                        msm_,
+                                                        spe_,
+                                                        mr_,
+                                                        em_,
+                                                        write_location_manager,
+                                                        CacheReclaimerAsyncDeleteConfig{},
+                                                        mm_);
 
     auto ig = InstanceGroupFactory();
     {
@@ -4602,7 +7126,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotPreserveColdOrphanWriting) {
     batch_get_loc_result = ErrorCode::EC_OK;
 
     CacheReclaimer::WaterLevelExceed wl;
-    wl.SetGeneralWaterLevelExceed(true);
+    wl.SetGroupBytesWaterLevelExceed(true);
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
@@ -4751,10 +7275,8 @@ bool MigrationManager_SubmitAsyncMigrationPrepare_stub(void *obj, MigrationManag
     return true;
 }
 
-static MigrationStrategy MakeStrategy(const std::string &src,
-                                      const std::string &dst,
-                                      bool copy_enabled,
-                                      bool mark_enabled) {
+static MigrationStrategy
+MakeStrategy(const std::string &src, const std::string &dst, bool copy_enabled, bool mark_enabled) {
     MigrationStrategy strategy;
     strategy.set_source_storage_name(src);
     strategy.set_target_storage_name(dst);
@@ -4901,6 +7423,7 @@ TEST_F(CacheReclaimerTest, TestReclaimAdmissionExcludesVictimFromSameRoundMigrat
     auto instance_group = InstanceGroupFactory();
     auto config = std::make_shared<CacheConfig>();
     config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
+    config->reclaim_strategy()->set_instance_reclaim_budget_policy(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL);
     config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
     config->set_migration_copy_max_concurrency(1);
     const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
@@ -4938,6 +7461,53 @@ TEST_F(CacheReclaimerTest, TestReclaimAdmissionExcludesVictimFromSameRoundMigrat
     EXPECT_EQ((std::vector<std::int64_t>{10}), captured_async_prepare_keys);
     ASSERT_EQ(1u, captured_async_prepare_pending_locations.size());
     EXPECT_EQ((std::vector<std::string>{"src_10"}), captured_async_prepare_pending_locations.front());
+
+    stub_.reset(ADDR(MigrationManager, SubmitAsyncMigrationPrepare));
+}
+
+TEST_F(CacheReclaimerTest, TestFairReclaimStillRunsMigrationBelowReclaimThreshold) {
+    stub_.set(ADDR(MigrationManager, SubmitAsyncMigrationPrepare), MigrationManager_SubmitAsyncMigrationPrepare_stub);
+    cache_reclaimer_->job_state_flag_ = true;
+    captured_async_prepare_keys.clear();
+    captured_async_prepare_pending_locations.clear();
+
+    const auto ins_info = InstanceInfoFactory();
+    instance_infos = {ins_info};
+    auto instance_group = InstanceGroupFactory();
+    auto config = std::make_shared<CacheConfig>();
+    config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
+    config->reclaim_strategy()->set_instance_reclaim_budget_policy(InstanceReclaimBudgetPolicy::USAGE_PROPORTIONAL);
+    config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
+    config->set_migration_copy_max_concurrency(1);
+    const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
+    config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
+    instance_group->set_cache_config(config);
+
+    QuotaConfig quota_config;
+    quota_config.set_capacity(100);
+    quota_config.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    InstanceGroupQuota quota;
+    quota.set_capacity(100);
+    quota.set_quota_config({quota_config});
+    instance_group->set_quota(quota);
+    EnableAsyncMigration(instance_group, ins_info);
+
+    // 60% is above the migration threshold (50%) but below the
+    // reclaim threshold (80%).
+    dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 60);
+    sample_reclaim_keys = {10};
+    get_out_properties = {{{PROPERTY_LRU_TIME, "1"}}};
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, instance_group);
+
+    EXPECT_FALSE(result.water_level_exceeded);
+    EXPECT_FALSE(result.made_progress);
+    EXPECT_EQ(0, SubmittedDelRequestCount());
+    EXPECT_EQ((std::vector<std::int64_t>{10}), captured_async_prepare_keys);
+    ASSERT_EQ(1u, captured_async_prepare_pending_locations.size());
+    EXPECT_TRUE(captured_async_prepare_pending_locations.front().empty());
 
     stub_.reset(ADDR(MigrationManager, SubmitAsyncMigrationPrepare));
 }
@@ -5049,8 +7619,8 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareRejectsAmbiguousRoute) {
     config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
     config->set_migration_copy_max_concurrency(1);
     // Direct mutation deliberately bypasses config validation to cover recovered legacy data.
-    config->set_migration_strategies({std::make_shared<MigrationStrategy>(copy_strategy),
-                                      std::make_shared<MigrationStrategy>(mark_strategy)});
+    config->set_migration_strategies(
+        {std::make_shared<MigrationStrategy>(copy_strategy), std::make_shared<MigrationStrategy>(mark_strategy)});
     instance_group->set_cache_config(config);
     EnableAsyncMigration(instance_group, ins_info);
 
@@ -5107,8 +7677,8 @@ TEST_F(CacheReclaimerTest, TestMigrationManagerStopWaitsForRunningAsyncPrepare) 
     bool read_started = false;
     {
         std::unique_lock<std::mutex> lock(async_prepare_read_mutex);
-        read_started = async_prepare_read_cv.wait_for(
-            lock, std::chrono::seconds(3), []() { return async_prepare_read_started; });
+        read_started =
+            async_prepare_read_cv.wait_for(lock, std::chrono::seconds(3), []() { return async_prepare_read_started; });
     }
 
     std::future<void> stop_future;
@@ -5248,8 +7818,7 @@ TEST_F(CacheReclaimerTest, TestExecutorStopCancelsQueuedAsyncMigrationPrepare) {
         release_blocker = true;
     }
     cv.notify_all();
-    const bool stop_completed =
-        stop_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+    const bool stop_completed = stop_future.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
 
     EXPECT_TRUE(started);
     EXPECT_TRUE(accepted);
@@ -5329,19 +7898,16 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupAccountsForPendingPrepareAcrossT
     }
 
     cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {first_instance});
-    const auto pending_after_first_tick =
-        mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
+    const auto pending_after_first_tick = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
 
     sample_reclaim_call_counter = 0;
     cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {second_instance, third_instance});
-    const auto pending_after_second_tick =
-        mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
+    const auto pending_after_second_tick = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
     const auto sampled_on_second_tick = sample_reclaim_call_counter;
 
     sample_reclaim_call_counter = 0;
     cache_reclaimer_->TryMigrateOnGroup(request_context_, instance_group, {third_instance});
-    const auto pending_after_full_tick =
-        mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
+    const auto pending_after_full_tick = mm_->PendingAsyncMigrationPrepareCountForGroup(instance_group->name());
     const auto sampled_when_full = sample_reclaim_call_counter;
 
     {
@@ -5354,8 +7920,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupAccountsForPendingPrepareAcrossT
     EXPECT_TRUE(started);
     EXPECT_EQ(1u, pending_after_first_tick);
     EXPECT_EQ(2u, pending_after_second_tick);
-    EXPECT_EQ(1, sampled_on_second_tick)
-        << "only one remaining copy slot may enqueue one instance prepare job";
+    EXPECT_EQ(1, sampled_on_second_tick) << "only one remaining copy slot may enqueue one instance prepare job";
     EXPECT_EQ(2u, pending_after_full_tick);
     EXPECT_EQ(0, sampled_when_full) << "a full pending budget must prune before candidate sampling";
     EXPECT_TRUE(became_idle);
@@ -5673,27 +8238,26 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDMultiColdUnionCoversHot) {
     stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
     const auto ins_info = InstanceInfoFactory();
 
-    auto hot_loc = std::make_shared<CacheLocation>(
-        "hot_full",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        2,
-        std::vector<LocationSpec>{
-            LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
-            LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
-        });
-    auto cold_a = std::make_shared<CacheLocation>(
-        "cold_a",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_a/tp0")});
-    auto cold_b = std::make_shared<CacheLocation>(
-        "cold_b",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP1", "dummy://cold_01/cold_b/tp1")});
+    auto hot_loc = std::make_shared<CacheLocation>("hot_full",
+                                                   CacheLocationStatus::CLS_SERVING,
+                                                   DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                                   2,
+                                                   std::vector<LocationSpec>{
+                                                       LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
+                                                       LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
+                                                   });
+    auto cold_a =
+        std::make_shared<CacheLocation>("cold_a",
+                                        CacheLocationStatus::CLS_SERVING,
+                                        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_a/tp0")});
+    auto cold_b =
+        std::make_shared<CacheLocation>("cold_b",
+                                        CacheLocationStatus::CLS_SERVING,
+                                        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP1", "dummy://cold_01/cold_b/tp1")});
 
     CacheLocationMap loc_map;
     loc_map.emplace("hot_full", hot_loc);
@@ -5703,7 +8267,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDMultiColdUnionCoversHot) {
     batch_get_loc_result = ErrorCode::EC_OK;
 
     CacheReclaimer::WaterLevelExceed wl;
-    wl.SetGeneralWaterLevelExceed(true);
+    wl.SetGroupBytesWaterLevelExceed(true);
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
@@ -5775,18 +8339,18 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDWritingColdDoesNotProtectHot) {
     const auto ins_info = InstanceInfoFactory();
 
     // hot: SERVING, cold: WRITING(迁移中半成品)
-    auto hot_loc = std::make_shared<CacheLocation>(
-        "hot_a",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://hot_01/hot_a")});
-    auto cold_writing = std::make_shared<CacheLocation>(
-        "cold_w",
-        CacheLocationStatus::CLS_WRITING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_w")});
+    auto hot_loc =
+        std::make_shared<CacheLocation>("hot_a",
+                                        CacheLocationStatus::CLS_SERVING,
+                                        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://hot_01/hot_a")});
+    auto cold_writing =
+        std::make_shared<CacheLocation>("cold_w",
+                                        CacheLocationStatus::CLS_WRITING,
+                                        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_w")});
 
     CacheLocationMap loc_map;
     loc_map.emplace("hot_a", hot_loc);
@@ -5795,7 +8359,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDWritingColdDoesNotProtectHot) {
     batch_get_loc_result = ErrorCode::EC_OK;
 
     CacheReclaimer::WaterLevelExceed wl;
-    wl.SetGeneralWaterLevelExceed(true);
+    wl.SetGroupBytesWaterLevelExceed(true);
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;

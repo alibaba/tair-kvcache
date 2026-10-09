@@ -12,12 +12,14 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional
+from types import TracebackType
+from typing import List, Optional, Type
 
 
 @dataclass
 class ServiceEndpoint:
     """统一的服务端点信息。"""
+
     ip: str
     port: int
     host: str  # f"{ip}:{port}"
@@ -51,9 +53,14 @@ class ServiceDiscovery(ABC):
     def close(self) -> None:
         """释放底层资源；默认无操作，子类按需实现。"""
 
-    def __enter__(self):
+    def __enter__(self) -> "ServiceDiscovery":
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> bool:
         self.close()
         return False

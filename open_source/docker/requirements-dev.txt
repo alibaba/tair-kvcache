@@ -1,0 +1,13 @@
+# Build and formatting tools. Match python_configure.bzl's packaging fallback.
+autopep8==2.3.2
+packaging==25.0
+
+# Python connector quality gates; hook activation remains opt-in.
+pre-commit==4.6.2
+ruff==0.16.7
+ty==0.0.80
+
+# Standalone maintenance and load scripts under tools/scripts/.
+requests==2.32.5
+# Existing maintenance scripts use redis-py to connect to Valkey.
+redis==8.1.0

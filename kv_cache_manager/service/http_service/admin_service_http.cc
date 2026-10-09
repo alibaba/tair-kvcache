@@ -24,10 +24,10 @@ AdminServiceHttp::AdminServiceHttp(std::shared_ptr<MetricsRegistry> metrics_regi
                                    std::shared_ptr<AdminServiceImpl> admin_service_impl,
                                    bool enable_prometheus,
                                    const std::string &prometheus_prefix)
-    : metrics_registry_(std::move(metrics_registry)),
-      admin_service_impl_(std::move(admin_service_impl)),
-      enable_prometheus_(enable_prometheus),
-      prometheus_prefix_(prometheus_prefix) {}
+    : metrics_registry_(std::move(metrics_registry))
+    , admin_service_impl_(std::move(admin_service_impl))
+    , enable_prometheus_(enable_prometheus)
+    , prometheus_prefix_(prometheus_prefix) {}
 
 void AdminServiceHttp::Init() {
     // for storage APIs
@@ -143,11 +143,10 @@ void AdminServiceHttp::RegisterHandler() {
                        [this](coro_http::coro_http_request &req,
                               coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
                            proto::admin::CheckHealthRequest request;
-                           request.set_trace_id("kvcm-healthy-" +
-                                                std::to_string(TimestampUtil::GetCurrentTimeMs()));
+                           request.set_trace_id("kvcm-healthy-" + std::to_string(TimestampUtil::GetCurrentTimeMs()));
                            proto::admin::CheckHealthResponse response;
 
-                           this->CheckHealth(req.get_conn(), &request, &response);
+                           CachedJsonResponse cached_response = this->CheckHealth(req.get_conn(), &request, &response);
 
                            res.add_header("Content-Type", "application/json");
 
@@ -159,11 +158,12 @@ void AdminServiceHttp::RegisterHandler() {
                            }
 
                            std::string body;
-                           if (!ProtoMessageJsonUtil::ToJson(&response, body)) {
+                           if (cached_response.has_value()) {
+                               body = std::move(*cached_response);
+                           } else if (!ProtoMessageJsonUtil::ToJson(&response, body)) {
                                body = R"({"status":"FAIL"})";
                            }
-                           res.set_status_and_content(coro_http::status_type::service_unavailable,
-                                                      std::move(body));
+                           res.set_status_and_content(coro_http::status_type::service_unavailable, std::move(body));
                            co_return;
                        });
 
@@ -181,283 +181,324 @@ void AdminServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, updateLogger, UpdateLogger, Common, UpdateLogger);
 }
 
-void AdminServiceHttp::AddStorage(coro_http::coro_http_connection *http_conn,
-                                  proto::admin::AddStorageRequest *request,
-                                  proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::AddStorage(coro_http::coro_http_connection *http_conn,
+                                                                 proto::admin::AddStorageRequest *request,
+                                                                 proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(AddStorage)
     KVCM_LOG_INFO("[traceId: %s] AddStorage [%s] called.",
                   request->trace_id().c_str(),
                   request->storage().global_unique_name().c_str());
     admin_service_impl_->AddStorage(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::EnableStorage(coro_http::coro_http_connection *http_conn,
-                                     proto::admin::EnableStorageRequest *request,
-                                     proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::EnableStorage(coro_http::coro_http_connection *http_conn,
+                                                                    proto::admin::EnableStorageRequest *request,
+                                                                    proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(EnableStorage)
     KVCM_LOG_INFO("[traceId: %s] EnableStorage [%s] called.",
                   request->trace_id().c_str(),
                   request->storage_unique_name().c_str());
     admin_service_impl_->EnableStorage(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::DisableStorage(coro_http::coro_http_connection *http_conn,
-                                      proto::admin::DisableStorageRequest *request,
-                                      proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::DisableStorage(coro_http::coro_http_connection *http_conn,
+                                                                     proto::admin::DisableStorageRequest *request,
+                                                                     proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(DisableStorage)
     KVCM_LOG_INFO("[traceId: %s] DisableStorage [%s] called.",
                   request->trace_id().c_str(),
                   request->storage_unique_name().c_str());
     admin_service_impl_->DisableStorage(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::RemoveStorage(coro_http::coro_http_connection *http_conn,
-                                     proto::admin::RemoveStorageRequest *request,
-                                     proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::RemoveStorage(coro_http::coro_http_connection *http_conn,
+                                                                    proto::admin::RemoveStorageRequest *request,
+                                                                    proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(RemoveStorage)
     KVCM_LOG_INFO("[traceId: %s] RemoveStorage [%s] called.",
                   request->trace_id().c_str(),
                   request->storage_unique_name().c_str());
     admin_service_impl_->RemoveStorage(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::UpdateStorage(coro_http::coro_http_connection *http_conn,
-                                     proto::admin::UpdateStorageRequest *request,
-                                     proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::UpdateStorage(coro_http::coro_http_connection *http_conn,
+                                                                    proto::admin::UpdateStorageRequest *request,
+                                                                    proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(UpdateStorage)
     KVCM_LOG_INFO("[traceId: %s] UpdateStorage [%s] called.",
                   request->trace_id().c_str(),
                   request->storage().global_unique_name().c_str());
     admin_service_impl_->UpdateStorage(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::ListStorage(coro_http::coro_http_connection *http_conn,
-                                   proto::admin::ListStorageRequest *request,
-                                   proto::admin::ListStorageResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::ListStorage(coro_http::coro_http_connection *http_conn,
+                                                                  proto::admin::ListStorageRequest *request,
+                                                                  proto::admin::ListStorageResponse *response) {
     API_CONTEXT_INIT_HTTP(ListStorage)
     KVCM_LOG_INFO("[traceId: %s] ListStorage called.", request->trace_id().c_str());
     admin_service_impl_->ListStorage(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::CreateInstanceGroup(coro_http::coro_http_connection *http_conn,
-                                           proto::admin::CreateInstanceGroupRequest *request,
-                                           proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse
+AdminServiceHttp::CreateInstanceGroup(coro_http::coro_http_connection *http_conn,
+                                      proto::admin::CreateInstanceGroupRequest *request,
+                                      proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(CreateInstanceGroup)
     KVCM_LOG_INFO("[traceId: %s] CreateInstanceGroup [%s] called.",
                   request->trace_id().c_str(),
                   request->instance_group().name().c_str());
     admin_service_impl_->CreateInstanceGroup(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::UpdateInstanceGroup(coro_http::coro_http_connection *http_conn,
-                                           proto::admin::UpdateInstanceGroupRequest *request,
-                                           proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse
+AdminServiceHttp::UpdateInstanceGroup(coro_http::coro_http_connection *http_conn,
+                                      proto::admin::UpdateInstanceGroupRequest *request,
+                                      proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(UpdateInstanceGroup)
     KVCM_LOG_INFO("[traceId: %s] UpdateInstanceGroup [%s] called.",
                   request->trace_id().c_str(),
                   request->instance_group().name().c_str());
     admin_service_impl_->UpdateInstanceGroup(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::RemoveInstanceGroup(coro_http::coro_http_connection *http_conn,
-                                           proto::admin::RemoveInstanceGroupRequest *request,
-                                           proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse
+AdminServiceHttp::RemoveInstanceGroup(coro_http::coro_http_connection *http_conn,
+                                      proto::admin::RemoveInstanceGroupRequest *request,
+                                      proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(RemoveInstanceGroup)
     KVCM_LOG_INFO(
         "[traceId: %s] RemoveInstanceGroup [%s] called.", request->trace_id().c_str(), request->name().c_str());
     admin_service_impl_->RemoveInstanceGroup(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::GetInstanceGroup(coro_http::coro_http_connection *http_conn,
-                                        proto::admin::GetInstanceGroupRequest *request,
-                                        proto::admin::GetInstanceGroupResponse *response) {
+CoroHttpService::CachedJsonResponse
+AdminServiceHttp::GetInstanceGroup(coro_http::coro_http_connection *http_conn,
+                                   proto::admin::GetInstanceGroupRequest *request,
+                                   proto::admin::GetInstanceGroupResponse *response) {
     API_CONTEXT_INIT_HTTP(GetInstanceGroup)
     KVCM_LOG_INFO("[traceId: %s] GetInstanceGroup [%s] called.", request->trace_id().c_str(), request->name().c_str());
     admin_service_impl_->GetInstanceGroup(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::ListInstanceGroup(coro_http::coro_http_connection *http_conn,
-                                         proto::admin::ListInstanceGroupRequest *request,
-                                         proto::admin::ListInstanceGroupResponse *response) {
+CoroHttpService::CachedJsonResponse
+AdminServiceHttp::ListInstanceGroup(coro_http::coro_http_connection *http_conn,
+                                    proto::admin::ListInstanceGroupRequest *request,
+                                    proto::admin::ListInstanceGroupResponse *response) {
     API_CONTEXT_INIT_HTTP(ListInstanceGroup)
     KVCM_LOG_INFO("[traceId: %s] ListInstanceGroup called.", request->trace_id().c_str());
     admin_service_impl_->ListInstanceGroup(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::GetCacheMeta(coro_http::coro_http_connection *http_conn,
-                                    proto::admin::GetCacheMetaRequest *request,
-                                    proto::admin::GetCacheMetaResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::GetCacheMeta(coro_http::coro_http_connection *http_conn,
+                                                                   proto::admin::GetCacheMetaRequest *request,
+                                                                   proto::admin::GetCacheMetaResponse *response) {
     API_CONTEXT_INIT_HTTP(GetCacheMeta)
     KVCM_LOG_INFO("[traceId: %s] GetCacheMeta for instance [%s] called.",
                   request->trace_id().c_str(),
                   request->instance_id().c_str());
     admin_service_impl_->GetCacheMeta(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::RemoveCache(coro_http::coro_http_connection *http_conn,
-                                   proto::admin::RemoveCacheRequest *request,
-                                   proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::RemoveCache(coro_http::coro_http_connection *http_conn,
+                                                                  proto::admin::RemoveCacheRequest *request,
+                                                                  proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(RemoveCache)
     KVCM_LOG_INFO("[traceId: %s] RemoveCache for instance [%s] called.",
                   request->trace_id().c_str(),
                   request->instance_id().c_str());
 
     admin_service_impl_->RemoveCache(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::MigrateCache(coro_http::coro_http_connection *http_conn,
-                                    proto::admin::MigrateCacheRequest *request,
-                                    proto::admin::MigrateCacheResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::MigrateCache(coro_http::coro_http_connection *http_conn,
+                                                                   proto::admin::MigrateCacheRequest *request,
+                                                                   proto::admin::MigrateCacheResponse *response) {
     API_CONTEXT_INIT_HTTP(MigrateCache)
     KVCM_LOG_INFO("[traceId: %s] MigrateCache for instance [%s] called.",
                   request->trace_id().c_str(),
                   request->instance_id().c_str());
 
     admin_service_impl_->MigrateCache(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_conn,
-                                        proto::admin::RegisterInstanceRequest *request,
-                                        proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_conn,
+                                                                       proto::admin::RegisterInstanceRequest *request,
+                                                                       proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(RegisterInstance)
     KVCM_LOG_INFO("[traceId: %s] RegisterInstance for instance [%s] called.",
                   request->trace_id().c_str(),
                   request->instance_id().c_str());
     admin_service_impl_->RegisterInstance(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::RemoveInstance(coro_http::coro_http_connection *http_conn,
-                                      proto::admin::RemoveInstanceRequest *request,
-                                      proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::RemoveInstance(coro_http::coro_http_connection *http_conn,
+                                                                     proto::admin::RemoveInstanceRequest *request,
+                                                                     proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(RemoveInstance)
     KVCM_LOG_INFO("[traceId: %s] RemoveInstance for instance [%s] called.",
                   request->trace_id().c_str(),
                   request->instance_id().c_str());
     admin_service_impl_->RemoveInstance(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::GetInstanceInfo(coro_http::coro_http_connection *http_conn,
-                                       proto::admin::GetInstanceInfoRequest *request,
-                                       proto::admin::GetInstanceInfoResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::GetInstanceInfo(coro_http::coro_http_connection *http_conn,
+                                                                      proto::admin::GetInstanceInfoRequest *request,
+                                                                      proto::admin::GetInstanceInfoResponse *response) {
     API_CONTEXT_INIT_HTTP(GetInstanceInfo)
     KVCM_LOG_INFO("[traceId: %s] GetInstanceInfo for instance [%s] called.",
                   request->trace_id().c_str(),
                   request->instance_id().c_str());
     admin_service_impl_->GetInstanceInfo(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::ListInstanceInfo(coro_http::coro_http_connection *http_conn,
-                                        proto::admin::ListInstanceInfoRequest *request,
-                                        proto::admin::ListInstanceInfoResponse *response) {
+CoroHttpService::CachedJsonResponse
+AdminServiceHttp::ListInstanceInfo(coro_http::coro_http_connection *http_conn,
+                                   proto::admin::ListInstanceInfoRequest *request,
+                                   proto::admin::ListInstanceInfoResponse *response) {
     API_CONTEXT_INIT_HTTP(ListInstanceInfo)
     KVCM_LOG_INFO("[traceId: %s] ListInstanceInfo for instance_group [%s] called.",
                   request->trace_id().c_str(),
                   request->instance_group_name().c_str());
 
     admin_service_impl_->ListInstanceInfo(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::AddAccount(coro_http::coro_http_connection *http_conn,
-                                  proto::admin::AddAccountRequest *request,
-                                  proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::AddAccount(coro_http::coro_http_connection *http_conn,
+                                                                 proto::admin::AddAccountRequest *request,
+                                                                 proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(AddAccount)
     KVCM_LOG_INFO("[traceId: %s] AddAccount for user_name [%s] called.",
                   request->trace_id().c_str(),
                   request->user_name().c_str());
     admin_service_impl_->AddAccount(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::DeleteAccount(coro_http::coro_http_connection *http_conn,
-                                     proto::admin::DeleteAccountRequest *request,
-                                     proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::DeleteAccount(coro_http::coro_http_connection *http_conn,
+                                                                    proto::admin::DeleteAccountRequest *request,
+                                                                    proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(DeleteAccount)
     KVCM_LOG_INFO("[traceId: %s] DeleteAccount for user_name [%s] called.",
                   request->trace_id().c_str(),
                   request->user_name().c_str());
 
     admin_service_impl_->DeleteAccount(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::ListAccount(coro_http::coro_http_connection *http_conn,
-                                   proto::admin::ListAccountRequest *request,
-                                   proto::admin::ListAccountResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::ListAccount(coro_http::coro_http_connection *http_conn,
+                                                                  proto::admin::ListAccountRequest *request,
+                                                                  proto::admin::ListAccountResponse *response) {
     API_CONTEXT_INIT_HTTP(ListAccount)
     KVCM_LOG_INFO("[traceId: %s] ListAccount called.", request->trace_id().c_str());
 
     admin_service_impl_->ListAccount(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::GenConfigSnapshot(coro_http::coro_http_connection *http_conn,
-                                         proto::admin::GenConfigSnapshotRequest *request,
-                                         proto::admin::ConfigSnapShotResponse *response) {
+CoroHttpService::CachedJsonResponse
+AdminServiceHttp::GenConfigSnapshot(coro_http::coro_http_connection *http_conn,
+                                    proto::admin::GenConfigSnapshotRequest *request,
+                                    proto::admin::ConfigSnapShotResponse *response) {
     API_CONTEXT_INIT_HTTP(GenConfigSnapshot)
     KVCM_LOG_INFO("[traceId: %s] GenConfigSnapshot called.", request->trace_id().c_str());
 
     admin_service_impl_->GenConfigSnapshot(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::LoadConfigSnapshot(coro_http::coro_http_connection *http_conn,
-                                          proto::admin::LoadConfigSnapshotRequest *request,
-                                          proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse
+AdminServiceHttp::LoadConfigSnapshot(coro_http::coro_http_connection *http_conn,
+                                     proto::admin::LoadConfigSnapshotRequest *request,
+                                     proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(LoadConfigSnapshot)
     KVCM_LOG_INFO("[traceId: %s] LoadConfigSnapshot called.", request->trace_id().c_str());
     admin_service_impl_->LoadConfigSnapshot(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::GetMetrics(coro_http::coro_http_connection *http_conn,
-                                  proto::admin::GetMetricsRequest *request,
-                                  proto::admin::GetMetricsResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::GetMetrics(coro_http::coro_http_connection *http_conn,
+                                                                 proto::admin::GetMetricsRequest *request,
+                                                                 proto::admin::GetMetricsResponse *response) {
     API_CONTEXT_INIT_HTTP(GetMetrics)
     KVCM_LOG_INFO("[traceId: %s] GetMetrics called.", request->trace_id().c_str());
     admin_service_impl_->GetMetrics(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::CheckHealth(coro_http::coro_http_connection *http_conn,
-                                   proto::admin::CheckHealthRequest *request,
-                                   proto::admin::CheckHealthResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::CheckHealth(coro_http::coro_http_connection *http_conn,
+                                                                  proto::admin::CheckHealthRequest *request,
+                                                                  proto::admin::CheckHealthResponse *response) {
     API_CONTEXT_INIT_HTTP(CheckHealth)
     KVCM_LOG_DEBUG("[traceId: %s] CheckHealth called.", request->trace_id().c_str());
     admin_service_impl_->CheckHealth(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::GetManagerClusterInfo(coro_http::coro_http_connection *http_conn,
-                                             proto::admin::GetManagerClusterInfoRequest *request,
-                                             proto::admin::GetManagerClusterInfoResponse *response) {
+CoroHttpService::CachedJsonResponse
+AdminServiceHttp::GetManagerClusterInfo(coro_http::coro_http_connection *http_conn,
+                                        proto::admin::GetManagerClusterInfoRequest *request,
+                                        proto::admin::GetManagerClusterInfoResponse *response) {
     API_CONTEXT_INIT_HTTP(GetManagerClusterInfo)
     KVCM_LOG_INFO("[traceId: %s] GetManagerClusterInfo called.", request->trace_id().c_str());
     admin_service_impl_->GetManagerClusterInfo(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::LeaderDemote(coro_http::coro_http_connection *http_conn,
-                                    proto::admin::LeaderDemoteRequest *request,
-                                    proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::LeaderDemote(coro_http::coro_http_connection *http_conn,
+                                                                   proto::admin::LeaderDemoteRequest *request,
+                                                                   proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(LeaderDemote)
     KVCM_LOG_INFO("[traceId: %s] LeaderDemote called.", request->trace_id().c_str());
     admin_service_impl_->LeaderDemote(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::GetLeaderElectorConfig(coro_http::coro_http_connection *http_conn,
-                                              proto::admin::GetLeaderElectorConfigRequest *request,
-                                              proto::admin::GetLeaderElectorConfigResponse *response) {
+CoroHttpService::CachedJsonResponse
+AdminServiceHttp::GetLeaderElectorConfig(coro_http::coro_http_connection *http_conn,
+                                         proto::admin::GetLeaderElectorConfigRequest *request,
+                                         proto::admin::GetLeaderElectorConfigResponse *response) {
     API_CONTEXT_INIT_HTTP(GetLeaderElectorConfig)
     KVCM_LOG_INFO("[traceId: %s] GetLeaderElectorConfig called.", request->trace_id().c_str());
     admin_service_impl_->GetLeaderElectorConfig(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::UpdateLeaderElectorConfig(coro_http::coro_http_connection *http_conn,
-                                                 proto::admin::UpdateLeaderElectorConfigRequest *request,
-                                                 proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse
+AdminServiceHttp::UpdateLeaderElectorConfig(coro_http::coro_http_connection *http_conn,
+                                            proto::admin::UpdateLeaderElectorConfigRequest *request,
+                                            proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(UpdateLeaderElectorConfig)
     KVCM_LOG_INFO("[traceId: %s] UpdateLeaderElectorConfig called.", request->trace_id().c_str());
     admin_service_impl_->UpdateLeaderElectorConfig(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
-void AdminServiceHttp::UpdateLogger(coro_http::coro_http_connection *http_conn,
-                                    proto::admin::UpdateLoggerRequest *request,
-                                    proto::admin::CommonResponse *response) {
+CoroHttpService::CachedJsonResponse AdminServiceHttp::UpdateLogger(coro_http::coro_http_connection *http_conn,
+                                                                   proto::admin::UpdateLoggerRequest *request,
+                                                                   proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_HTTP(UpdateLogger)
     KVCM_LOG_INFO("[traceId: %s] UpdateLogger called.", request->trace_id().c_str());
     admin_service_impl_->UpdateLogger(request_context, request, response);
+    return request_context->TakeReusableResponseJson();
 }
 
 } // namespace kv_cache_manager

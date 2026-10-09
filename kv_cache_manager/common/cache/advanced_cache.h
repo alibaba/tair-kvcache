@@ -52,6 +52,7 @@ public: // types hidden from API client
         std::vector<size_t> shard_offsets;
         std::vector<size_t> cursors;
         std::vector<size_t> ordered_indices;
+        bool lookup_layout_valid = false; // hashes/order/offsets describe the last lookup
     };
 
 public: // types hidden from Cache implementation
@@ -489,6 +490,21 @@ public: // functions
         return 0;
     }
 
+    // Applies a callback to the next `count` entries in one shard's oldest-to-
+    // newest sampling scan. The scan cursor advances independently of LRU
+    // order, so repeated calls make progress without marking entries as hits
+    // or changing their LRU positions. A call may wrap at the newest end but
+    // visits each entry at most once. The callback runs while the shard is
+    // locked and must not call back into this Cache. Returns the number of
+    // entries visited. The default implementation is unsupported.
+    virtual size_t ApplyToNextOldestEntriesInShard(
+        uint32_t /*shard_id*/,
+        size_t /*count*/,
+        const std::function<void(
+            const std::string_view &key, ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> & /*callback*/) {
+        return 0;
+    }
+
     // Apply a callback to every entry in the specified shard. The callback
     // receives the key, object pointer, charge, and helper of each entry.
     // This allows callers to iterate over a single shard without touching
@@ -498,6 +514,17 @@ public: // functions
         uint32_t /*shard_id*/,
         const std::function<void(
             const std::string_view &key, ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> & /*callback*/) {
+    }
+
+    // Applies a callback to one existing entry without marking it as a hit or
+    // changing its LRU position. The callback runs while the cache shard is
+    // locked and returns the entry charge delta caused by an in-place update.
+    // Callers must keep the callback bounded and must not call back into this
+    // Cache. Returns false when the key is absent or unsupported.
+    virtual bool ApplyToEntryNoTouch(
+        const std::string_view & /*key*/,
+        const std::function<ssize_t(ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> & /*callback*/) {
+        return false;
     }
 
     // Insert a mapping from key->object only if the key does not already exist.
@@ -775,6 +802,21 @@ public:
             void(const std::string_view &key, ObjectPtr value, size_t charge, const CacheItemHelper *helper)> &callback)
         override {
         target_->ApplyToSingleShard(shard_id, callback);
+    }
+
+    size_t ApplyToNextOldestEntriesInShard(
+        uint32_t shard_id,
+        size_t count,
+        const std::function<
+            void(const std::string_view &key, ObjectPtr value, size_t charge, const CacheItemHelper *helper)> &callback)
+        override {
+        return target_->ApplyToNextOldestEntriesInShard(shard_id, count, callback);
+    }
+
+    bool ApplyToEntryNoTouch(
+        const std::string_view &key,
+        const std::function<ssize_t(ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> &callback) override {
+        return target_->ApplyToEntryNoTouch(key, callback);
     }
 
     void StartAsyncLookup(AsyncLookupHandle &async_handle) override { target_->StartAsyncLookup(async_handle); }

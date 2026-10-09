@@ -101,6 +101,7 @@ DEFINE_METRICS_NAME_FOR_META_INDEXER(io_data_size);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(put_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(upsert_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(lock_wait_time_us);
+DEFINE_METRICS_NAME_FOR_META_INDEXER(lock_hold_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(delete_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(get_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(rand_io_time_us);
@@ -171,6 +172,7 @@ bool ServiceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(put_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(upsert_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(lock_wait_time_us);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(lock_hold_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(delete_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(get_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(rand_io_time_us);
@@ -389,6 +391,12 @@ DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
                                       cache_manager_instance,
                                       async_pipeline_error_count);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      async_dropped_key_count);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      async_dropped_metadata_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, max_lru_age_us);
 
 CacheManagerInstanceMetricsCollector::CacheManagerInstanceMetricsCollector(
@@ -412,6 +420,8 @@ bool CacheManagerInstanceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_flush_key_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_batch_flush_time_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_pipeline_error_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_dropped_key_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_dropped_metadata_count);
 
     return true;
 }

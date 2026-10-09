@@ -66,6 +66,14 @@ cc_library(
 )
 
 cc_library(
+    name = "scoped_jemalloc_arena_rotation",
+    srcs = ["scoped_jemalloc_arena_rotation.cc"],
+    hdrs = ["scoped_jemalloc_arena_rotation.h"],
+    linkopts = ["-ldl"],
+    deps = [":logger"],
+)
+
+cc_library(
     name = "logger",
     srcs = [
         "logger.cc",

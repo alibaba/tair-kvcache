@@ -67,6 +67,10 @@ bool Server::Init(const ServerConfig &config) {
     async_delete_config.pending_bytes_limit_per_group_type = config_.GetCacheReclaimerPendingBytesLimitPerGroupType();
     async_delete_config.pending_delete_handler_limit = config_.GetCacheReclaimerPendingDeleteHandlerLimit();
     async_delete_config.pending_bytes_limit = config_.GetCacheReclaimerPendingBytesLimit();
+    CacheReclaimerGroupLruConfig group_lru_config;
+    group_lru_config.min_sampling_ratio = config_.GetCacheReclaimerGroupLruMinSamplingRatio();
+    group_lru_config.max_sampling_size = config_.GetCacheReclaimerGroupLruMaxSamplingSize();
+    group_lru_config.max_delete_requests_per_round = config_.GetCacheReclaimerGroupLruMaxDeleteRequestsPerRound();
     CacheGarbageCollector::Config cache_gc_config;
     cache_gc_config.enabled = config_.IsCacheGcEnabled();
     cache_gc_config.scan_interval_ms = config_.GetCacheGcScanIntervalMs();
@@ -74,6 +78,9 @@ bool Server::Init(const ServerConfig &config) {
     cache_gc_config.scan_batch_size = static_cast<size_t>(config_.GetCacheGcScanBatchSize());
     cache_gc_config.orphan_writing_grace_period_ms = config_.GetCacheGcOrphanWritingGracePeriodMs();
     cache_gc_config.max_inflight_delete_requests = static_cast<size_t>(config_.GetCacheGcMaxInflightDeleteRequests());
+    cache_gc_config.event_report_cleanup_enabled = config_.IsCacheGcEventReportCleanupEnabled();
+    cache_gc_config.event_report_action_batch_size =
+        static_cast<size_t>(config_.GetCacheGcEventReportActionBatchSize());
     if (!cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
                               config_.GetCacheReclaimerKeySamplingSizeTotal(),
                               config_.GetCacheReclaimerKeySamplingSizePerTask(),
@@ -85,7 +92,8 @@ bool Server::Init(const ServerConfig &config) {
                               config_.GetMetaQueryWorkerCount(),
                               config_.GetMetaQueryParallelThreshold(),
                               config_.GetMetaQueryChunkSize(),
-                              cache_gc_config)) {
+                              cache_gc_config,
+                              group_lru_config)) {
         KVCM_LOG_ERROR("cache manager init failed");
         return false;
     }

@@ -207,34 +207,35 @@ std::vector<RedisClient::ReplyUPtr> RedisClient::TryExecPipeline(const std::vect
 // return empty vector if failed
 std::vector<RedisClient::ReplyUPtr> RedisClient::CommandPipeline(const std::vector<CmdArgs> &cmds) {
     std::vector<ReplyUPtr> replies;
+    (void)CommandPipeline(cmds, replies);
+    return replies;
+}
+
+ErrorCode RedisClient::CommandPipeline(const std::vector<CmdArgs> &cmds, std::vector<ReplyUPtr> &out_replies) {
+    out_replies.clear();
     if (cmds.empty()) {
-        return replies;
+        return EC_BADARGS;
     }
     for (int32_t count = 0; count < retry_count_; ++count) {
-        if (!IsContextOk()) {
-            if (!Reconnect()) {
-                KVCM_REDIS_LOG_ERROR("fail to reconnect before pipeline, try count[%d]", count);
-                replies.clear();
-                return replies;
-            }
+        if (!IsContextOk() && !Reconnect()) {
+            KVCM_REDIS_LOG_ERROR("fail to reconnect before pipeline, try count[%d]", count);
+            return EC_IO_ERROR;
+        }
+
+        out_replies = TryExecPipeline(cmds);
+        if (!out_replies.empty()) {
+            return EC_OK;
         }
         if (IsContextOk()) {
-            replies = TryExecPipeline(cmds);
-            if (!replies.empty()) {
-                return replies;
-            } else if (IsContextOk()) {
-                KVCM_REDIS_LOG_ERROR("pipeline fail but connection is ok, try count[%d]", count);
-                return replies;
-            } else {
-                KVCM_REDIS_LOG_WARN("pipeline fail, connection not ok, try count[%d]", count);
-            }
+            KVCM_REDIS_LOG_ERROR("pipeline fail but connection is ok, try count[%d]", count);
+            return EC_ERROR;
         }
+        KVCM_REDIS_LOG_WARN("pipeline fail, connection not ok, try count[%d]", count);
         usleep(50 * 1000);
     }
 
     KVCM_REDIS_LOG_ERROR("pipeline all fail, try count[%ld]", retry_count_);
-    replies.clear();
-    return replies;
+    return EC_IO_ERROR;
 }
 
 std::vector<ErrorCode> RedisClient::BatchWrite(const std::vector<CmdArgs> &cmds, bool &out_all_ok) {

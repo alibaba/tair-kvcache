@@ -512,9 +512,7 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
     auto dst_location = std::make_shared<CacheLocation>();
     dst_location->set_type(dst_type);
     dst_location->set_spec_size(dst_specs.size());
-    for (auto &spec : dst_specs) {
-        dst_location->push_location_spec(std::move(spec));
-    }
+    dst_location->set_location_specs(std::move(dst_specs));
     std::vector<MetaSearcher::AddLocationResult> add_results;
     ErrorCode ec = meta_searcher.BatchAddLocation(ctx.get(), {request.block_key}, {dst_location}, add_results);
     if (add_results.size() != 1) {
@@ -899,6 +897,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             continue;
         }
         auto &req = item.request;
+        item.dst_specs.reserve(req.src_specs.size());
         for (std::size_t s = 0; s < req.src_specs.size(); ++s) {
             DataStorageUri src_uri(req.src_specs[s].uri());
             if (!src_uri.Valid()) {
@@ -1011,9 +1010,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         auto dst_loc = std::make_shared<CacheLocation>();
         dst_loc->set_type(dst_type);
         dst_loc->set_spec_size(item.dst_specs.size());
-        for (auto &spec : item.dst_specs) {
-            dst_loc->push_location_spec(std::move(spec));
-        }
+        dst_loc->set_location_specs(std::move(item.dst_specs));
         add_items.push_back(&item);
         add_block_keys.push_back(item.request.block_key);
         add_locations.push_back(std::move(dst_loc));

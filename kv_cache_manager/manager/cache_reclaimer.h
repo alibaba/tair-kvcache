@@ -23,6 +23,7 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
+#include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
@@ -66,10 +67,18 @@ struct PlanExecuteResult;
 
 struct CacheReclaimerAsyncDeleteConfig {
     std::uint64_t inflight_delete_timeout_ms{60000};
-    std::uint64_t pending_location_limit_per_group_type{100000};
-    std::uint64_t pending_bytes_limit_per_group_type{64ULL * 1024 * 1024 * 1024};
+    std::uint64_t pending_location_limit_per_group_type{20000};
+    std::uint64_t pending_bytes_limit_per_group_type{1ULL * 1024 * 1024 * 1024 * 1024};
     std::uint64_t pending_delete_handler_limit{1024};
-    std::uint64_t pending_bytes_limit{256ULL * 1024 * 1024 * 1024};
+    std::uint64_t pending_bytes_limit{4ULL * 1024 * 1024 * 1024 * 1024};
+};
+
+struct CacheReclaimerGroupLruConfig {
+    std::size_t max_sampling_size{65536};
+    std::size_t max_delete_requests_per_round{128};
+    // Group LRU needs more candidates than victims, even when the shared
+    // per-Instance sampling and deletion baselines are configured equally.
+    std::size_t min_sampling_ratio{10};
 };
 
 /**
@@ -163,7 +172,8 @@ public:
                    std::shared_ptr<EventManager> event_manager,
                    std::shared_ptr<WriteLocationManager> write_location_manager,
                    CacheReclaimerAsyncDeleteConfig async_delete_config = {},
-                   std::shared_ptr<MigrationManager> migration_manager = nullptr);
+                   std::shared_ptr<MigrationManager> migration_manager = nullptr,
+                   CacheReclaimerGroupLruConfig group_lru_config = {});
 
     /**
      * @brief Delete copy constructor
@@ -323,6 +333,8 @@ private:
     const std::shared_ptr<WriteLocationManager> write_location_manager_;
     // to query active migration tasks for source-side protection（可为空：未启用迁移时）
     const std::shared_ptr<MigrationManager> migration_manager_;
+    // Startup-only configuration; no public mutation API.
+    CacheReclaimerGroupLruConfig group_lru_config_;
 
     // represents the object of the associated working thread
     std::thread reclaimer_;
@@ -436,16 +448,22 @@ private:
         ~WaterLevelExceed() = default;
 
         [[nodiscard]] bool GetGeneralWaterLevelExceed() const noexcept;
+        [[nodiscard]] bool GetGroupBytesWaterLevelExceed() const noexcept;
+        [[nodiscard]] bool GetGroupKeysWaterLevelExceed() const noexcept;
         [[nodiscard]] bool GetWaterLevelExceedByType(const DataStorageType &type) const noexcept;
-        void SetGeneralWaterLevelExceed(bool value) noexcept;
+        void SetGroupBytesWaterLevelExceed(bool value) noexcept;
+        void SetGroupKeysWaterLevelExceed(bool value) noexcept;
         void SetWaterLevelExceedByType(const DataStorageType &type, bool value) noexcept;
 
         [[nodiscard]] bool CheckGroupWaterLevelExceed() const noexcept;       // general or any storage type exceed
         [[nodiscard]] bool CheckStorageTypeWaterLevelExceed() const noexcept; // any single storage type exceed
 
     private:
-        // group general water level exceed flag
-        bool general_water_level_exceed_;
+        // Group byte usage and key count are independent trigger
+        // dimensions. GetGeneralWaterLevelExceed() remains as the
+        // compatibility view of their logical OR.
+        bool group_bytes_water_level_exceed_;
+        bool group_keys_water_level_exceed_;
 
         using array_t_ = std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)>;
         using size_t_ = array_t_::size_type;
@@ -463,6 +481,81 @@ private:
         // slot 9: DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD exceed flag
         array_t_ water_level_exceed_by_type_;
     };
+
+    enum class FairWeightDimension {
+        NONE,
+        STORAGE_TYPE_BYTES,
+        GROUP_BYTES,
+        GROUP_KEYS,
+    };
+
+    struct FairReclaimPlanItem {
+        std::shared_ptr<const InstanceInfo> instance_info;
+        std::string instance_id;
+        std::uint64_t weight{0};
+        std::size_t raw_batch_size{0};
+        std::size_t raw_sampling_size{0};
+        std::size_t batch_size{0};
+        std::size_t sampling_size{0};
+        std::size_t original_index{0};
+    };
+
+    struct FairReclaimPlan {
+        FairWeightDimension weight_dimension{FairWeightDimension::NONE};
+        std::size_t configured_batch_size{0};
+        std::size_t configured_sampling_size{0};
+        std::size_t normalized_sampling_size{0};
+        std::size_t group_batch_size{0};
+        std::size_t group_sampling_size{0};
+        std::size_t effective_instance_count{0};
+        std::size_t zero_weight_instance_count{0};
+        std::size_t capped_item_count{0};
+        bool sampling_size_normalized{false};
+        std::vector<FairReclaimPlanItem> items;
+    };
+
+    struct FairRotationState {
+        // IDs only: budgets and InstanceInfo are always taken from the current plan.
+        std::deque<std::string> instance_ids;
+    };
+
+    // Owned by the cron thread; Stop() may clear it after joining that thread.
+    std::map<std::string, FairRotationState> fair_rotation_by_group_;
+
+    struct GroupLruPlanItem {
+        std::shared_ptr<const InstanceInfo> instance_info;
+        std::size_t sampling_size{0};
+    };
+
+    struct GroupLruPlan {
+        std::size_t eligible_instance_count{0};
+        std::size_t normalized_sampling_size{0};
+        std::size_t configured_batch_size{0};
+        std::size_t theoretical_batch_size{0};
+        std::size_t sampling_size{0};
+        bool partial{false};
+        std::vector<GroupLruPlanItem> items;
+    };
+
+    struct GroupLruCandidate {
+        std::size_t instance_index;
+        std::int64_t block_key;
+        std::int64_t lru_time_us;
+    };
+
+    struct SamplingResult {
+        ErrorCode ec{ErrorCode::EC_ERROR};
+        ReclaimCandidateVector candidates;
+    };
+
+    struct GroupLruRotationState {
+        std::deque<std::string> instance_ids;
+        // After partial collection, the first waiter gets the next Location
+        // attempt even if another Instance finishes sampling earlier.
+        bool prioritize_location_waiter{false};
+    };
+
+    std::map<std::string, GroupLruRotationState> group_lru_rotation_by_group_;
 
     /**
      * @brief Calculate the group's WaterLevelExceed data
@@ -514,6 +607,21 @@ private:
                       const WaterLevelExceed &water_level_exceed,
                       std::int32_t delay_before_delete_ms) noexcept;
 
+    bool ReclaimByLRUWithBudget(const std::shared_ptr<RequestContext> &request_context,
+                                const std::shared_ptr<const InstanceInfo> &instance_info,
+                                const WaterLevelExceed &water_level_exceed,
+                                std::int32_t delay_before_delete_ms,
+                                std::size_t sampling_size,
+                                std::size_t batching_size) noexcept;
+
+    bool ReclaimByLRUImpl(const std::shared_ptr<RequestContext> &request_context,
+                          const std::shared_ptr<const InstanceInfo> &instance_info,
+                          const WaterLevelExceed &water_level_exceed,
+                          std::int32_t delay_before_delete_ms,
+                          bool use_fair_budget,
+                          std::size_t sampling_size,
+                          std::size_t batching_size) noexcept;
+
     /**
      * @brief Reclaim cache entries using LFU (Least Frequently Used)
      * strategy
@@ -555,6 +663,68 @@ private:
     ReclaimResult TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request_context,
                                     const std::shared_ptr<const InstanceGroup> &instance_group) noexcept;
 
+    ReclaimResult
+    TryReclaimOnGroupLegacy(const std::shared_ptr<RequestContext> &request_context,
+                            const std::shared_ptr<const InstanceGroup> &instance_group,
+                            const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                            const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
+
+    ReclaimResult
+    TryReclaimOnGroupFair(const std::shared_ptr<RequestContext> &request_context,
+                          const std::shared_ptr<const InstanceGroup> &instance_group,
+                          const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                          const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
+
+    [[nodiscard]] bool BuildFairReclaimPlan(const RequestContext *request_context,
+                                            const WaterLevelExceed &water_level_exceed,
+                                            const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
+                                            std::size_t configured_sampling_size,
+                                            std::size_t configured_batch_size,
+                                            FairReclaimPlan &out_plan) const noexcept;
+
+    [[nodiscard]] static bool AllocateFairBudget(std::size_t total_budget,
+                                                 const std::vector<std::uint64_t> &weights,
+                                                 const std::vector<std::string> &instance_ids,
+                                                 std::vector<std::size_t> &out_allocations) noexcept;
+
+    [[nodiscard]] static const char *FairWeightDimensionName(FairWeightDimension dimension) noexcept;
+
+    [[nodiscard]] std::vector<std::size_t> PrepareFairExecutionOrder(const std::string &instance_group,
+                                                                     const FairReclaimPlan &plan) noexcept;
+
+    void PruneFairRotationStates(const std::vector<std::shared_ptr<const InstanceGroup>> &instance_groups) noexcept;
+
+    ReclaimResult TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &request_context,
+                                       const std::shared_ptr<const InstanceGroup> &instance_group,
+                                       const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
+
+    bool BuildGroupLruPlan(const RequestContext *request_context,
+                           const std::string &instance_group,
+                           const WaterLevelExceed &scope,
+                           const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
+                           std::size_t configured_sampling_size,
+                           std::size_t configured_batch_size,
+                           GroupLruPlan &out_plan) noexcept;
+    static std::size_t GroupLruBatchSize(const GroupLruPlan &plan, std::size_t successful_sampling_size) noexcept;
+    static bool SameReclaimScope(const WaterLevelExceed &initial, const WaterLevelExceed &current) noexcept;
+    bool CollectGroupLruCandidates(const std::shared_ptr<RequestContext> &request_context,
+                                   const WaterLevelExceed &scope,
+                                   GroupLruPlan &plan,
+                                   std::vector<GroupLruCandidate> &out_candidates,
+                                   std::size_t &out_successful_sampling_size) noexcept;
+    bool FilterGroupLruCandidates(const std::shared_ptr<RequestContext> &request_context,
+                                  const WaterLevelExceed &scope,
+                                  const GroupLruPlan &plan,
+                                  std::size_t instance_index,
+                                  const std::map<std::int64_t, std::int64_t> &times,
+                                  std::chrono::steady_clock::time_point deadline,
+                                  std::vector<GroupLruCandidate> &out_candidates) noexcept;
+
+    // The sole task-submission primitive for bounded sampling. Each task owns
+    // its results/cancellation token and keeps its in-flight slot until it exits.
+    std::future<SamplingResult> SubmitSamplingTask(std::function<SamplingResult()> sample);
+
     void HandleDelRes() noexcept;
 
     /**
@@ -571,22 +741,33 @@ private:
     // below are helper routines for internal usage
     bool DoKeySampling(const std::shared_ptr<RequestContext> &request_context,
                        const std::shared_ptr<const InstanceInfo> &instance_info,
-                       std::vector<std::int64_t> &out_keys,
-                       std::vector<std::map<std::string, std::string>> &out_maps) noexcept;
+                       ReclaimCandidateVector &out_candidates) noexcept;
+
+    bool DoKeySamplingWithSize(const std::shared_ptr<RequestContext> &request_context,
+                               const std::shared_ptr<const InstanceInfo> &instance_info,
+                               std::size_t total_sampling_size,
+                               bool bounded_waves,
+                               ReclaimCandidateVector &out_candidates) noexcept;
 
     bool MakeBatchByLRU(const RequestContext *request_context,
                         const std::shared_ptr<const InstanceInfo> &instance_info,
-                        const std::vector<std::int64_t> &sampled_keys,
-                        const std::vector<std::map<std::string, std::string>> &property_maps,
+                        const ReclaimCandidateVector &candidates,
                         std::vector<std::int64_t> &out_batch,
                         AgeStats &out_lru_age_stats) const noexcept;
+
+    bool MakeBatchByLRUWithSize(const RequestContext *request_context,
+                                const std::shared_ptr<const InstanceInfo> &instance_info,
+                                const ReclaimCandidateVector &candidates,
+                                std::size_t batching_size,
+                                std::vector<std::int64_t> &out_batch,
+                                AgeStats &out_lru_age_stats) const noexcept;
 
     bool BuildMigrationCandidateBatch(const std::shared_ptr<RequestContext> &request_context,
                                       const std::shared_ptr<const InstanceInfo> &instance_info,
                                       std::vector<std::int64_t> &out_batch) noexcept;
 
-    std::vector<std::vector<std::string>>
-    SnapshotPendingLocations(const std::string &instance_id, const std::vector<std::int64_t> &batch) const;
+    std::vector<std::vector<std::string>> SnapshotPendingLocations(const std::string &instance_id,
+                                                                   const std::vector<std::int64_t> &batch) const;
 
     bool SubmitMigrationPrepareJob(const std::shared_ptr<RequestContext> &request_context,
                                    const std::shared_ptr<const InstanceInfo> &instance_info,
@@ -602,6 +783,18 @@ private:
                      CountsByStorageType &out_location_counts_by_type,
                      std::uint64_t &out_predicted_deleted_keys,
                      AgeStats &out_create_age_stats) noexcept;
+
+    bool FilterLocIDImpl(RequestContext *request_context,
+                         const std::shared_ptr<const InstanceInfo> &instance_info,
+                         const std::vector<std::int64_t> &batch,
+                         const WaterLevelExceed &water_level_exceed,
+                         std::vector<std::vector<std::string>> &out_loc_ids,
+                         BytesByStorageType &out_bytes_by_type,
+                         CountsByStorageType &out_location_counts_by_type,
+                         std::uint64_t &out_predicted_deleted_keys,
+                         AgeStats &out_create_age_stats,
+                         bool eligibility_only,
+                         bool maintenance_read) noexcept;
 
     /**
      * @brief 评估并执行一个 instance group 的多层存储迁移（水位触发）。
@@ -643,12 +836,45 @@ private:
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(credit_timeout_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(pending_limit_reject_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(duplicate_pending_location_filtered_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(maintenance_touch_key_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_no_progress_backoff_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_submit_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_complete_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_fail_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(migration_copy_submitted_total)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(migration_mark_submitted_total)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_plan_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_planned_batch_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_planned_sample_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_zero_weight_skip_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_plan_truncated_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_plan_truncated_instance_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_item_capped_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_sampling_size_normalized_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_rotation_resume_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(fair_rotation_advance_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_plan_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_partial_plan_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_plan_failure_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_eligible_instance_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_started_instance_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_collected_instance_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_skipped_instance_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_failed_instance_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_sampled_key_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_candidate_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_selected_block_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_submitted_block_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_invalid_time_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_delete_request_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_request_limit_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_watermark_stop_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_scope_change_stop_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_backpressure_stop_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_deadline_count)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(group_lru_collect_duration_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(group_lru_sort_duration_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(group_lru_submit_duration_us)
 
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us)
@@ -664,6 +890,10 @@ private:
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(credited_delete_bytes)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(predicted_deleted_key_count)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(oldest_pending_request_age_ms)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(fair_effective_instance_count)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(fair_planned_instance_count)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(fair_sampled_instance_count)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(fair_submitted_instance_count)
 
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_min_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_max_us)

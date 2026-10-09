@@ -111,6 +111,12 @@ TEST_F(KmonitorMetricsReporterTest, TestReportInterval) {
         metrics_registry_->GetCounter("cache_gc.delete_result_count", {{"status", "0"}}) += 1;
         metrics_registry_->GetCounter("cache_gc.operation_error_count", {{"stage", "scan"}}) += 1;
         metrics_registry_->GetGauge("cache_gc.inflight_delete_count") = 2;
+        metrics_registry_->GetCounter("cache_gc.candidate_dropped_count",
+                                      {{"reason", "event_report_down_host"}, {"cause", "total_budget"}}) += 1;
+        metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}) += 2;
+        metrics_registry_->GetCounter("cache_gc.event_report_probe_unknown_count", {{"cause", "malformed"}}) += 1;
+        metrics_registry_->GetCounter("cache_gc.event_report_delete_location_count",
+                                      {{"reason", "down_host"}, {"status", "deleted"}}) += 2;
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
     }
 

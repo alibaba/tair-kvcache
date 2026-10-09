@@ -2,7 +2,9 @@
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
+#include <time.h>
 
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_gpu_util_alias.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_mempool.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_usrbio_api.h"
@@ -74,7 +76,7 @@ TEST_F(Hf3fsUsrbioClientTest, ReadFrom3FS_ReturnFalse_PrepIoFail) {
         .WillOnce(testing::Return(-5));
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_FALSE(client_->ReadFrom3FS(handle, segs));
+    EXPECT_FALSE(client_->ReadFrom3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -83,21 +85,21 @@ TEST_F(Hf3fsUsrbioClientTest, ReadFrom3FS_ReturnFalse_PrepIoFail) {
 // ---------- Read ----------
 TEST_F(Hf3fsUsrbioClientTest, Read_ReturnTrue_ReadLenZero) {
     std::vector<Iov> iovs; // empty
-    EXPECT_TRUE(client_->Read(iovs));
+    EXPECT_TRUE(client_->Read(iovs, /*deadline_ms=*/0));
 
     std::vector<Iov> ignored{{MemoryType::CPU, nullptr, 10, true}};
-    EXPECT_TRUE(client_->Read(ignored));
+    EXPECT_TRUE(client_->Read(ignored, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, Read_ReturnFalse_ZeroSizeNonIgnored) {
     std::vector<Iov> iovs{{MemoryType::CPU, nullptr, 0, false}};
-    EXPECT_FALSE(client_->Read(iovs));
+    EXPECT_FALSE(client_->Read(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, Read_ReturnFalse_FileLengthUnknown) {
     // file not exist, FileLength() returns nullopt
     std::vector<Iov> iovs{{MemoryType::CPU, nullptr, 8, false}};
-    EXPECT_FALSE(client_->Read(iovs));
+    EXPECT_FALSE(client_->Read(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, Read_ReturnFalse_TotalLenExceedFile) {
@@ -108,13 +110,13 @@ TEST_F(Hf3fsUsrbioClientTest, Read_ReturnFalse_TotalLenExceedFile) {
         f.write(blob.data(), blob.size());
     }
     std::vector<Iov> iovs{{MemoryType::CPU, nullptr, 8, false}}; // total_len 8 > file_len 4
-    EXPECT_FALSE(client_->Read(iovs));
+    EXPECT_FALSE(client_->Read(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, Read_ReturnFalse_OpenFail) {
     // path doesn't exist with read-only Open()
     std::vector<Iov> iovs{{MemoryType::CPU, nullptr, 8, false}};
-    EXPECT_FALSE(client_->Read(iovs));
+    EXPECT_FALSE(client_->Read(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, Read_ReturnTrue_Success) {
@@ -142,18 +144,19 @@ TEST_F(Hf3fsUsrbioClientTest, Read_ReturnTrue_Success) {
                     cqes[i].result = 1;
                 return min_results;
             }));
+    // 成功完成：I/O 已排水，析构时正常 Dereg。
     EXPECT_CALL(*api, Hf3fsDeregFd(testing::_)).Times(1);
     EXPECT_CALL(*api, Hf3fsIorDestroy(testing::NotNull())).Times(testing::AtLeast(1));
 
     std::vector<uint8_t> buf(16, 0);
     std::vector<Iov> iovs{{MemoryType::CPU, buf.data(), 16, false}};
-    EXPECT_TRUE(client_->Read(iovs));
+    EXPECT_TRUE(client_->Read(iovs, /*deadline_ms=*/0));
 }
 
 // ---------- DoRead ----------
 TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnFalse_SegmentsEmpty) {
     std::vector<Iov> iovs{{MemoryType::CPU, nullptr, 10, true}};
-    EXPECT_FALSE(client_->DoRead(iovs));
+    EXPECT_FALSE(client_->DoRead(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnFalse_InitIovIorFail) {
@@ -163,7 +166,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnFalse_InitIovIorFail) {
     void *hold = mempool->Alloc(mempool->FreeSize());
     ASSERT_NE(hold, nullptr);
     std::vector<Iov> iovs{{MemoryType::CPU, nullptr, 256, false}};
-    EXPECT_FALSE(client_->DoRead(iovs));
+    EXPECT_FALSE(client_->DoRead(iovs, /*deadline_ms=*/0));
     mempool->Free(hold);
 }
 
@@ -178,10 +181,11 @@ TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnFalse_ReadFrom3FSFail) {
     EXPECT_CALL(*api, Hf3fsSubmitIos(testing::NotNull())).WillRepeatedly(testing::Return(0));
     EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
         .WillRepeatedly(testing::Return(0));
-    EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
+    // 已提交后失败：iov/ior 一律泄漏（提交事实判定），不得 Destroy。
+    EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(0);
 
     std::vector<Iov> iovs{{MemoryType::CPU, nullptr, 128, false}};
-    EXPECT_FALSE(client_->DoRead(iovs));
+    EXPECT_FALSE(client_->DoRead(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnTrue_Success) {
@@ -203,7 +207,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoRead_ReturnTrue_Success) {
 
     std::vector<uint8_t> buf(64, 0);
     std::vector<Iov> iovs{{MemoryType::CPU, buf.data(), 64, false}};
-    EXPECT_TRUE(client_->DoRead(iovs));
+    EXPECT_TRUE(client_->DoRead(iovs, /*deadline_ms=*/0));
 }
 
 // ---------- ReadFrom3FS ----------
@@ -231,7 +235,7 @@ TEST_F(Hf3fsUsrbioClientTest, ReadFrom3FS_ReturnFalse_SubmitFail) {
     }
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_FALSE(client_->ReadFrom3FS(handle, segs));
+    EXPECT_FALSE(client_->ReadFrom3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -266,7 +270,7 @@ TEST_F(Hf3fsUsrbioClientTest, ReadFrom3FS_ReturnFalse_WaitFail) {
     }
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_FALSE(client_->ReadFrom3FS(handle, segs));
+    EXPECT_FALSE(client_->ReadFrom3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -306,7 +310,7 @@ TEST_F(Hf3fsUsrbioClientTest, ReadFrom3FS_ReturnTrue_Success) {
     }
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_TRUE(client_->ReadFrom3FS(handle, segs));
+    EXPECT_TRUE(client_->ReadFrom3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -315,17 +319,17 @@ TEST_F(Hf3fsUsrbioClientTest, ReadFrom3FS_ReturnTrue_Success) {
 // ---------- Write ----------
 TEST_F(Hf3fsUsrbioClientTest, Write_ReturnTrue_WriteLenZero) {
     std::vector<Iov> iovs; // empty
-    EXPECT_TRUE(client_->Write(iovs));
+    EXPECT_TRUE(client_->Write(iovs, /*deadline_ms=*/0));
     // all ignored also returns true
     std::vector<Iov> ignored{{MemoryType::CPU, nullptr, 10, true}, {MemoryType::GPU, nullptr, 20, true}};
-    EXPECT_TRUE(client_->Write(ignored));
+    EXPECT_TRUE(client_->Write(ignored, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, Write_ReturnFalse_OpenFail) {
     auto api = static_cast<MockHf3fsUsrbioApi *>(client_->usrbio_api_.get());
     EXPECT_CALL(*api, Hf3fsRegFd(testing::_, testing::_)).WillOnce(testing::Return(1));
     std::vector<Iov> iovs{{MemoryType::CPU, nullptr, 16, false}};
-    EXPECT_FALSE(client_->Write(iovs));
+    EXPECT_FALSE(client_->Write(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, Write_ReturnFalse_DoWriteFail) {
@@ -348,13 +352,14 @@ TEST_F(Hf3fsUsrbioClientTest, Write_ReturnFalse_DoWriteFail) {
     }
 
     // ReleaseIovIor() happens before Close(), so IorDestroy is expected before DeregFd; allow any order
-    EXPECT_CALL(*api, Hf3fsIorDestroy(testing::NotNull())).Times(testing::AtLeast(1));
-    EXPECT_CALL(*api, Hf3fsDeregFd(testing::_)).Times(1);
+    // 已提交后失败（WaitForIos 返回 0 = 不完整）：iov/ior 与 fd 注册一并泄漏。
+    EXPECT_CALL(*api, Hf3fsIorDestroy(testing::NotNull())).Times(0);
+    EXPECT_CALL(*api, Hf3fsDeregFd(testing::_)).Times(0);
 
     auto buffer1 = std::shared_ptr<uint8_t>((uint8_t *)malloc(64), [](void *ptr) { free(ptr); });
     auto buffer2 = std::shared_ptr<uint8_t>((uint8_t *)malloc(64), [](void *ptr) { free(ptr); });
     std::vector<Iov> iovs{{MemoryType::CPU, buffer1.get(), 64, false}, {MemoryType::CPU, buffer2.get(), 64, false}};
-    EXPECT_FALSE(client_->Write(iovs));
+    EXPECT_FALSE(client_->Write(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, Write_ReturnTrue_Success) {
@@ -387,7 +392,7 @@ TEST_F(Hf3fsUsrbioClientTest, Write_ReturnTrue_Success) {
     auto buffer1 = std::shared_ptr<uint8_t>((uint8_t *)malloc(32), [](void *ptr) { free(ptr); });
     auto buffer2 = std::shared_ptr<uint8_t>((uint8_t *)malloc(16), [](void *ptr) { free(ptr); });
     std::vector<Iov> iovs{{MemoryType::CPU, buffer1.get(), 32, false}, {MemoryType::CPU, buffer2.get(), 16, false}};
-    EXPECT_TRUE(client_->Write(iovs));
+    EXPECT_TRUE(client_->Write(iovs, /*deadline_ms=*/0));
 }
 
 // ---------- DoWrite ----------
@@ -397,7 +402,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnFalse_SegmentsEmpty) {
         {MemoryType::CPU, nullptr, 10, true},
         {MemoryType::GPU, nullptr, 20, true},
     };
-    EXPECT_FALSE(client_->DoWrite(iovs));
+    EXPECT_FALSE(client_->DoWrite(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnFalse_InitIovIorFail_MempoolAlloc) {
@@ -409,7 +414,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnFalse_InitIovIorFail_MempoolAlloc) {
 
     auto buf = std::shared_ptr<uint8_t>((uint8_t *)malloc(128), [](void *p) { free(p); });
     std::vector<Iov> iovs{{MemoryType::CPU, buf.get(), 128, false}};
-    EXPECT_FALSE(client_->DoWrite(iovs));
+    EXPECT_FALSE(client_->DoWrite(iovs, /*deadline_ms=*/0));
 
     mempool->Free(hold);
 }
@@ -426,7 +431,8 @@ TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnFalse_WriteTo3FSFail_Wait) {
     EXPECT_CALL(*api, Hf3fsSubmitIos(testing::NotNull())).WillRepeatedly(testing::Return(0));
     EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
         .WillRepeatedly(testing::Return(0)); // triggers WaitIos false
-    EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
+    // 已提交后失败：iov/ior 泄漏（提交事实判定），不得 Destroy。
+    EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(0);
 
     auto buffer1 = std::shared_ptr<uint8_t>((uint8_t *)malloc(64), [](void *ptr) { free(ptr); });
     auto buffer2 = std::shared_ptr<uint8_t>((uint8_t *)malloc(64), [](void *ptr) { free(ptr); });
@@ -434,7 +440,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnFalse_WriteTo3FSFail_Wait) {
         {MemoryType::CPU, buffer1.get(), 64, false},
         {MemoryType::CPU, buffer2.get(), 64, false},
     };
-    EXPECT_FALSE(client_->DoWrite(iovs));
+    EXPECT_FALSE(client_->DoWrite(iovs, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnTrue_Success) {
@@ -474,7 +480,7 @@ TEST_F(Hf3fsUsrbioClientTest, DoWrite_ReturnTrue_Success) {
         {MemoryType::GPU, buffer3, 16, false}, // type change -> multiple segments
 #endif
     };
-    EXPECT_TRUE(client_->DoWrite(iovs));
+    EXPECT_TRUE(client_->DoWrite(iovs, /*deadline_ms=*/0));
     EXPECT_EQ(client_->write_iov_handle_.iov_mempool->AllocatedSize(), 0); // released
 }
 
@@ -497,7 +503,7 @@ TEST_F(Hf3fsUsrbioClientTest, WriteTo3FS_ReturnFalse_PrepIoFail) {
         .WillOnce(testing::Return(-6));
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_FALSE(client_->WriteTo3FS(handle, segs));
+    EXPECT_FALSE(client_->WriteTo3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -529,7 +535,7 @@ TEST_F(Hf3fsUsrbioClientTest, WriteTo3FS_ReturnFalse_SubmitFail) {
     }
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_FALSE(client_->WriteTo3FS(handle, segs));
+    EXPECT_FALSE(client_->WriteTo3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -563,7 +569,7 @@ TEST_F(Hf3fsUsrbioClientTest, WriteTo3FS_ReturnFalse_WaitIoFail) {
     }
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_FALSE(client_->WriteTo3FS(handle, segs));
+    EXPECT_FALSE(client_->WriteTo3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -607,7 +613,7 @@ TEST_F(Hf3fsUsrbioClientTest, WriteTo3FS_ReturnTrue_Success_WithBatching) {
     }
 
     std::vector<Hf3fsUsrbioClient::Segment> segs{{0, len}};
-    EXPECT_TRUE(client_->WriteTo3FS(handle, segs));
+    EXPECT_TRUE(client_->WriteTo3FS(handle, segs, /*deadline_ms=*/0));
 
     EXPECT_CALL(*api, Hf3fsIorDestroy(::testing::NotNull())).Times(1);
     client_->ReleaseIovIor(handle);
@@ -616,7 +622,7 @@ TEST_F(Hf3fsUsrbioClientTest, WriteTo3FS_ReturnTrue_Success_WithBatching) {
 // ---------- WaitIos ----------
 TEST_F(Hf3fsUsrbioClientTest, WaitIos_ReturnFalse_NullIor) {
     Hf3fsIorHandle ior_handle;
-    EXPECT_FALSE(client_->WaitIos(ior_handle, 2));
+    EXPECT_FALSE(client_->WaitIos(ior_handle, 2, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, WaitIos_ReturnFalse_WaitNegative) {
@@ -624,7 +630,7 @@ TEST_F(Hf3fsUsrbioClientTest, WaitIos_ReturnFalse_WaitNegative) {
     EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
         .WillOnce(testing::Return(-1));
     Hf3fsIorHandle ior_handle = BuildIorHandle();
-    EXPECT_FALSE(client_->WaitIos(ior_handle, 2));
+    EXPECT_FALSE(client_->WaitIos(ior_handle, 2, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, WaitIos_ReturnFalse_CqeResultNegative) {
@@ -641,7 +647,7 @@ TEST_F(Hf3fsUsrbioClientTest, WaitIos_ReturnFalse_CqeResultNegative) {
                 return min_results;      // equals submit count
             }));
     Hf3fsIorHandle ior_handle = BuildIorHandle();
-    EXPECT_FALSE(client_->WaitIos(ior_handle, 2));
+    EXPECT_FALSE(client_->WaitIos(ior_handle, 2, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, WaitIos_ReturnFalse_PartialDone) {
@@ -656,7 +662,7 @@ TEST_F(Hf3fsUsrbioClientTest, WaitIos_ReturnFalse_PartialDone) {
                 return cqec - 1; // less than submit count
             }));
     Hf3fsIorHandle ior_handle = BuildIorHandle();
-    EXPECT_FALSE(client_->WaitIos(ior_handle, 2));
+    EXPECT_FALSE(client_->WaitIos(ior_handle, 2, /*deadline_ms=*/0));
 }
 
 TEST_F(Hf3fsUsrbioClientTest, WaitIos_ReturnTrue_AllDoneAndNonNegative) {
@@ -670,7 +676,179 @@ TEST_F(Hf3fsUsrbioClientTest, WaitIos_ReturnTrue_AllDoneAndNonNegative) {
                 return cqec; // equals submit count
             }));
     Hf3fsIorHandle ior_handle = BuildIorHandle();
-    EXPECT_TRUE(client_->WaitIos(ior_handle, 3));
+    EXPECT_TRUE(client_->WaitIos(ior_handle, 3, /*deadline_ms=*/0));
+}
+
+// ---------- WaitIos abs_timeout ----------
+TEST_F(Hf3fsUsrbioClientTest, TestWaitIosPassesAbsTimeoutWhenDeadlineSet) {
+    auto api = static_cast<MockHf3fsUsrbioApi *>(client_->usrbio_api_.get());
+
+    // 与实现同基准（CLOCK_REALTIME）记录进入前的墙钟时间，用于校验 abs_timeout 大致等于 now + 500ms。
+    struct timespec now{};
+    ASSERT_EQ(clock_gettime(CLOCK_REALTIME, &now), 0);
+
+    struct timespec captured{};
+    bool captured_null = true;
+    EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Invoke(
+            [&](const ::hf3fs_ior *, ::hf3fs_cqe *cqes, int cqec, int min_results, const struct timespec *abs) {
+                captured_null = (abs == nullptr);
+                if (abs != nullptr) {
+                    captured = *abs;
+                }
+                for (int i = 0; i < min_results; ++i) {
+                    cqes[i].result = 1;
+                }
+                return min_results;
+            }));
+
+    {
+        // 设置 deadline = now + 500ms
+        Hf3fsIorHandle ior_handle = BuildIorHandle();
+        EXPECT_TRUE(client_->WaitIos(ior_handle, 2, SteadyClockMs() + 500, true));
+    }
+
+    EXPECT_FALSE(captured_null);
+    // abs 是 CLOCK_REALTIME 绝对时间：不小于进入时的 now，且不超过 now + 500ms + 合理误差
+    const int64_t diff_ms = (captured.tv_sec - now.tv_sec) * 1000 + (captured.tv_nsec - now.tv_nsec) / 1000000;
+    EXPECT_GE(diff_ms, 0);
+    EXPECT_LE(diff_ms, 700);
+}
+
+TEST_F(Hf3fsUsrbioClientTest, TestWaitIosPassesNullptrWhenNoDeadline) {
+    auto api = static_cast<MockHf3fsUsrbioApi *>(client_->usrbio_api_.get());
+
+    bool captured_null = false;
+    EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Invoke(
+            [&](const ::hf3fs_ior *, ::hf3fs_cqe *cqes, int cqec, int min_results, const struct timespec *abs) {
+                captured_null = (abs == nullptr);
+                for (int i = 0; i < min_results; ++i) {
+                    cqes[i].result = 1;
+                }
+                return min_results;
+            }));
+
+    // 不设置 deadline（0）：必须传 nullptr，保持旧行为（无超时等待）
+    Hf3fsIorHandle ior_handle = BuildIorHandle();
+    EXPECT_TRUE(client_->WaitIos(ior_handle, 2, /*deadline_ms=*/0, true));
+    EXPECT_TRUE(captured_null);
+}
+
+// clock_gettime(CLOCK_REALTIME) 失败的防御路径：同样不得回退成 nullptr（那是无限
+// 等待，违反"有 deadline 则等待必须有界"的不变量），而应按已过期处理 —— abs_timeout
+// 恰为当前墙钟之前的零时刻。用已过期的 deadline + mock 直接断言传给 3FS 的 abs 非空
+// 且早于当前 CLOCK_REALTIME（覆盖 zero-timeout 分支的构造逻辑）。
+TEST_F(Hf3fsUsrbioClientTest, TestWaitIosExpiredDeadlinePassesZeroTimeoutNotNullptr) {
+    auto api = static_cast<MockHf3fsUsrbioApi *>(client_->usrbio_api_.get());
+
+    bool captured_null = true;
+    int64_t diff_ms = -1;
+    struct timespec before{};
+    EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Invoke(
+            [&](const ::hf3fs_ior *, ::hf3fs_cqe *cqes, int cqec, int min_results, const struct timespec *abs) {
+                captured_null = (abs == nullptr);
+                if (abs != nullptr) {
+                    diff_ms = (abs->tv_sec - before.tv_sec) * 1000 + (abs->tv_nsec - before.tv_nsec) / 1000000;
+                }
+                // 真实 3FS 会因超时返回 0（不足 min_results）；mock 直接模拟该结果。
+                return 0;
+            }));
+
+    ASSERT_EQ(clock_gettime(CLOCK_REALTIME, &before), 0);
+    // 已过期的 deadline：remaining=0 → abs_timeout = now + 0ms，非空且不晚于进入时刻
+    //（clock_gettime 在两次调用间的推进量），绝不可能是 nullptr（无限等待）。
+    Hf3fsIorHandle ior_handle = BuildIorHandle();
+    EXPECT_FALSE(client_->WaitIos(ior_handle, 2, SteadyClockMs() - 1, true));
+    EXPECT_FALSE(captured_null);
+    EXPECT_LE(diff_ms, 50); // 允许毫秒级时钟噪声，远早于"未来时刻"类的错误构造
+}
+
+TEST_F(Hf3fsUsrbioClientTest, TestReadTimeoutDoesNotCopyToCaller) {
+    // 准备足够大的文件满足 Read() 的 FileLength 检查
+    {
+        std::ofstream f(client_->filepath_, std::ios::binary | std::ios::trunc);
+        std::string blob(32, '\xAB');
+        f.write(blob.data(), blob.size());
+    }
+
+    auto api = static_cast<MockHf3fsUsrbioApi *>(client_->usrbio_api_.get());
+    EXPECT_CALL(*api, Hf3fsRegFd(testing::_, testing::_)).WillOnce(testing::Return(0));
+    EXPECT_CALL(
+        *api, Hf3fsIorCreate(testing::_, testing::_, testing::_, true, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(0));
+    EXPECT_CALL(*api,
+                Hf3fsPrepIo(testing::_, testing::_, true, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(0));
+    EXPECT_CALL(*api, Hf3fsSubmitIos(testing::NotNull())).WillRepeatedly(testing::Return(0));
+    // 模拟超时：返回 0 个完成（少于 min_results）
+    EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(0));
+    // 已提交后超时：iov/ior 与 fd 注册一并泄漏（提交事实判定）。
+    EXPECT_CALL(*api, Hf3fsDeregFd(testing::_)).Times(0);
+    EXPECT_CALL(*api, Hf3fsIorDestroy(testing::NotNull())).Times(0);
+
+    {
+        // 有 deadline（未过期），走超时等待路径
+        std::vector<uint8_t> buf(16, 0xEE); // 哨兵值
+        std::vector<Iov> iovs{{MemoryType::CPU, buf.data(), 16, false}};
+        EXPECT_FALSE(client_->Read(iovs, SteadyClockMs() + 500));
+        // 超时路径不得执行 CopyIovs，caller buffer 必须保持哨兵值未被修改
+        for (const auto b : buf) {
+            EXPECT_EQ(b, 0xEE);
+        }
+    }
+}
+
+// 提交事实生命周期（C1/C2 回归守卫）：成功完成 → 标志复位，析构正常 Dereg；
+// 提交后失败 → iov/ior 与 fd 注册全部泄漏。同一 client 上先后两次 Read 验证
+// 标志在成功路径被复位（否则第二次的失败路径会错误地走释放分支——旧 bug 形态）。
+TEST_F(Hf3fsUsrbioClientTest, SubmittedFlagLifecycle_SuccessResetsThenFailureLeaks) {
+    {
+        std::ofstream f(client_->filepath_, std::ios::binary | std::ios::trunc);
+        std::string blob(32, '\xAB');
+        f.write(blob.data(), blob.size());
+    }
+
+    auto api = static_cast<MockHf3fsUsrbioApi *>(client_->usrbio_api_.get());
+    EXPECT_CALL(*api, Hf3fsRegFd(testing::_, testing::_)).WillOnce(testing::Return(0));
+    EXPECT_CALL(
+        *api, Hf3fsIorCreate(testing::_, testing::_, testing::_, true, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(0));
+    EXPECT_CALL(*api,
+                Hf3fsPrepIo(testing::_, testing::_, true, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(0));
+    EXPECT_CALL(*api, Hf3fsSubmitIos(testing::NotNull())).WillRepeatedly(testing::Return(0));
+    // 第一次调用全部完成（成功），之后全部不完成（失败）。
+    EXPECT_CALL(*api, Hf3fsWaitForIos(testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Invoke(
+            [](const ::hf3fs_ior *, ::hf3fs_cqe *cqes, int cqec, int min_results, const struct timespec *) {
+                for (int i = 0; i < min_results; ++i)
+                    cqes[i].result = 1;
+                return min_results;
+            }))
+        .WillRepeatedly(testing::Return(0));
+    // 释放路径只允许发生在成功调用上（IorDestroy 恰一次）。Dereg 的期望在测试尾部
+    // 断言（第二次失败置位标志后，析构不 Dereg —— 见下）。
+    EXPECT_CALL(*api, Hf3fsIorDestroy(testing::NotNull())).Times(1);
+
+    // 第一次：成功 → 提交标志复位（本断言不直接可见，由第二次调用间接验证）。
+    {
+        std::vector<uint8_t> buf(16, 0);
+        std::vector<Iov> iovs{{MemoryType::CPU, buf.data(), 16, false}};
+        EXPECT_TRUE(client_->Read(iovs, SteadyClockMs() + 5000));
+    }
+    // 第二次：提交后失败 → 若标志未被复位，此处会走释放分支（IorDestroy 二次调用，
+    // 上面的 Times(1) 会捕获）；正确行为是泄漏。
+    {
+        std::vector<uint8_t> buf(16, 0xEE);
+        std::vector<Iov> iovs{{MemoryType::CPU, buf.data(), 16, false}};
+        EXPECT_FALSE(client_->Read(iovs, SteadyClockMs() + 5000));
+    }
+    // 第二次失败将标志重新置位（有在飞请求），析构不 DeregFd —— fd 注册随本次
+    // 失败泄漏（C1 语义：泄漏优于 UAF）。成功那轮的 IorDestroy 已发生（恰一次）。
+    EXPECT_CALL(*api, Hf3fsDeregFd(testing::_)).Times(0);
 }
 
 // ---------- BuildContiguousSegments ----------

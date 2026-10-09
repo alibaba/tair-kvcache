@@ -9,6 +9,30 @@
 
 namespace kv_cache_manager {
 
+void RequestContext::LazyResponseJsonCache::SetGenerator(ResponseJsonGenerator generator, ResponseJsonKind kind) {
+    fragment_ = {};
+    generator_ = std::move(generator);
+    materialized_ = false;
+    kind_ = kind;
+}
+
+const RequestContext::JsonFragment &RequestContext::LazyResponseJsonCache::Get() const {
+    if (!materialized_) {
+        fragment_ = generator_ ? generator_() : JsonFragment{};
+        generator_ = {};
+        materialized_ = true;
+    }
+    return fragment_;
+}
+
+std::optional<std::string> RequestContext::LazyResponseJsonCache::TakeIfReusable() {
+    Get();
+    if (kind_ != ResponseJsonKind::kFullMessage || !fragment_.valid || fragment_.json.empty()) {
+        return std::nullopt;
+    }
+    return std::move(fragment_.json);
+}
+
 RequestContext::RequestContext(const std::string &trace_id) : RequestContext(trace_id, nullptr) {}
 
 RequestContext::RequestContext(const std::string &trace_id, std::shared_ptr<MetricsCollector> metrics_collector)
@@ -31,5 +55,9 @@ std::string RequestContext::EndAndGetSpanTracerDebugStr() const {
     }
     return "";
 }
+
+void RequestContext::MaterializeResponseJson() const { response_debug_json_.Get(); }
+
+std::optional<std::string> RequestContext::TakeReusableResponseJson() { return response_debug_json_.TakeIfReusable(); }
 
 } // namespace kv_cache_manager

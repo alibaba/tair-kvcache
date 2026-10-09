@@ -4,7 +4,7 @@
 
 > **维护提示**：当模块的职责、依赖方向或调用关系发生变化，或新增/删除模块时，请同步更新本文档与文末的 Mermaid 图，并同步更新 [AGENTS.md](../../AGENTS.md) 中的缩略图。
 
-相关文档：[基本概念](basic_concepts.md)、[ReportEvent Snapshot URI 版本方案](report_event_snapshot_uri_version.md)、[高可用与选主机制](ha_leader_elector.md)、[CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)、[后台扫描 GC 设计](cache_garbage_collector.md)、[配置指南](../configuration.md)、[优化器文档](../optimizer.md)。
+相关文档：[基本概念](basic_concepts.md)、[分层存储设计](tiered_storage.md)、[ReportEvent Snapshot URI 版本方案](report_event_snapshot_uri_version.md)、[高可用与选主机制](ha_leader_elector.md)、[CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)、[后台扫描 GC 设计](cache_garbage_collector.md)、[EventReport 主动回收纳入后台 GC](event_report_background_gc.md)、[配置指南](../configuration.md)、[优化器文档](../optimizer.md)。
 
 ---
 
@@ -196,6 +196,17 @@ client（MetaClient/gRPC）→ service（grpc 适配 → *ServiceImpl）
 
 推理引擎启动时经 client 注册实例，`CacheManager::RegisterInstance` 校验并落库实例配置（block_size、location spec、模型部署等）到 `RegistryManager`（config），并在 `MetaIndexerManager` 中为该 `instance_id` 建立索引。**约束**：KVCache 仅在同一 `instance_id` 内复用，跨 Instance 不匹配。
 
+MetaIndexer/Searcher 保留原创建与清理流程，Indexer Init 完成后即可服务，Redis 全量回填仍异步执行。
+配置 `meta_storage_backend_config.memory_primary=true` 时仅支持 `cached + local + async_redis`：
+Recover 保持原有 Redis-first 条件双写和队列反压，Redis 写未接受时不更新 local；全量回填完成并进入 Running 后，
+普通写才切换为 local-first，Redis 通过 `WriteRoute::secondary` 条件写做有界非等待备份，满队列丢弃新备份。
+Recover 保留未回填 key 的回源、写前补齐与 tombstone；并发读允许按原链路读到旧值，最终由回填和并发写收敛。
+物理删除准入沿用原提交顺序：shard lock 内 CAS local DELETING 并提交异步备份，释放锁后由 executor 执行 `Sync`，
+成功后才调度物理删除。local 写失败的项不会进入 Redis 备份，Reconcile 因而沿用原分类、删除和 Sync 链路，
+不再为 memory-primary 缺失引用增加专属补偿。
+不新增队列级粘性失败状态或锁内 Redis 等待；Redis 启动恢复、原锁外物理删除 Sync 与模块依赖方向均不变，
+不新增模块或依赖边。
+
 ### 4.3 读取（命中并加载 KVCache）
 
 从完整视角看，读取由推理引擎驱动，client 的两条链路依次参与：
@@ -246,6 +257,8 @@ sequenceDiagram
 ### 4.5 容量回收（后台异步）
 
 `CacheReclaimer` 依据 Quota 与存储水位选出待逐出的 key，并把 Location 删除作为端到端异步任务提交给 `SchedulePlanExecutor`。Executor worker 完成元数据 Get/CAS/Sync；Sync 成功后通过定时队列等待删除 delay（等待不占 worker），随后删除 `data_storage` 数据并 CAD `meta` 索引。Reclaimer 在任务终态前按 Instance Group 与 BaseStorageType 维护 pending Location、删除 bytes credit 和硬配额，用于去重、避免过度逐出及提供有界反压；回收动作通过 `event` 上报。完整生命周期和异常语义见 [CacheReclaimer 异步删除设计](cache_reclaimer_async_delete.md)。
+
+跨 Instance 逐出由 `instance_reclaim_budget_policy` 选择：三种策略通过 `meta` 的公共 `SampleReclaimCandidates` 接口无副作用地采集 key 和访问时间。`GROUP_LRU` 要求候选读取成功，并通过 no-touch Location 读取做资格过滤，再按 Group 访问时间顺序做删除准入；`USAGE_PROPORTIONAL` 按用量分配预算并跨轮轮转；`FIXED_PER_INSTANCE` 保留原预算和顺序。三者共用 Location 保护规则及上述 Executor 异步生命周期，不改变 Instance 隔离或模块依赖方向。具体配置和采样边界见 [Group LRU 设计](cache_reclaimer_group_lru.md)。
 
 ### 4.6 分层存储迁移（异步 Prepare 与回收协同）
 
@@ -300,7 +313,7 @@ flowchart LR
 
 ### 4.7 后台 metadata GC
 
-`CacheGarbageCollector` 只在 Leader 上运行，复用公共 `LoopThread`，按 Registry 快照和 backend cursor 串行扫描 authoritative metadata；扫描协调不占用共享的删除 worker。维护扫描不更新在线 LRU/revisit，也不向 local hot cache 回填。V1 识别超过 grace、且不属于活跃 Migration Copy 目标的 `CLS_WRITING`，并对普通 `CLS_SERVING` Location 按 storage 批量调用低成本 `MightExist()`，任一 spec 明确 missing 时选择整个 Location；EventReport 和探测不确定项均跳过。两类候选都通过 `SchedulePlanExecutor::SubmitAsync` 提交扫描时的完整序列化 Location，由 Executor worker 重新读取并以精确值条件 CAS 仲裁并发 Finish、Location 刷新和 Reclaimer。GC 使用固定小窗口管理在途 Future，并以 Instance-aware pending target 覆盖 accepted 到 CAS 的重复窗口；每 tick 最多提交一个请求，窗口满后停止扫描，完整 round 后进入长 cooldown。详细边界见 [后台扫描 GC 设计](cache_garbage_collector.md)。
+`CacheGarbageCollector` 只在 Leader 上运行，复用公共 `LoopThread`，按 Registry 快照和 backend cursor 串行推进统一 maintenance scan；扫描协调不占用共享的删除 worker。dual-backend 模式扫描 no-touch 的内存 hot view，single-backend 模式扫描唯一 backend，因此前者对已淘汰的冷 metadata 只提供 best-effort 收敛。基础 V1 识别超过 grace、且不属于活跃 Migration Copy 目标的 `CLS_WRITING`，并对普通 `CLS_SERVING` Location 按 storage 批量调用低成本 `MightExist()`。EventReport 扩展消费同一个 round/cursor 和 metadata batch，由 `EventReportBackend` 基于 Reporter lifecycle 与 Snapshot generation 返回三态 metadata cleanup 判定，不维护事件 intent 或独立扫描 lane。普通候选通过 `SchedulePlanExecutor::SubmitAsync` 在 worker 中重新读取 authoritative metadata，再执行精确值条件 CAS、物理删除和最终 CAD；EventReport 候选也提交到共享 Executor，由 worker 重新校验 Backend/token/lifecycle lease 后执行 expected-value metadata-only RMW。所有规则共用 Instance 隔离、GC inflight 窗口、target budget 和 pending 去重；本模块不为整个 Executor 增加进程级队列容量限制。详细边界见 [后台扫描 GC 设计](cache_garbage_collector.md) 与 [EventReport 主动回收纳入统一后台 GC](event_report_background_gc.md)。
 
 ### 4.8 HA 故障转移
 

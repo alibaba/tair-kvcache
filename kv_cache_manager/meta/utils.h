@@ -31,7 +31,7 @@ inline int32_t GetShardIndex(KeyType key, size_t shard_mask) noexcept {
     return GetShardIndex(key, shard_mask, kDefaultMetaShardHashSeed);
 }
 
-FieldMap SerializeToFieldMap(const CacheLocationMap &locations, const PropertyMap &properties);
+FieldMap SerializeToFieldMap(const CacheLocationMap &locations, PropertyMap properties);
 
 ErrorCode DeserializeFieldMap(const FieldMap &field_map, CacheLocationMap &out_locations, PropertyMap &out_properties);
 

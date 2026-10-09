@@ -72,6 +72,13 @@ parse_args() {
     done
 }
 
+apt_package_available() {
+    LC_ALL=C apt-cache policy "$1" | awk '
+        $1 == "Candidate:" && $2 != "(none)" { found = 1 }
+        END { exit !found }
+    '
+}
+
 install_apt_packages() {
     if ! command -v apt-get >/dev/null 2>&1; then
         echo "apt-get is required by this setup script." >&2
@@ -84,11 +91,15 @@ install_apt_packages() {
         clang-format
         cpio
         curl
+        file
+        gdb
         git
         iproute2
+        jq
         libaio-dev
         libibverbs-dev
         libicu-dev
+        libjemalloc2
         libnuma-dev
         librdmacm-dev
         openssh-client
@@ -100,6 +111,8 @@ install_apt_packages() {
         python3-dev
         python3-packaging
         python3-pip
+        python3-redis
+        python3-requests
         rpm2cpio
         tar
         unzip
@@ -109,6 +122,12 @@ install_apt_packages() {
     )
 
     run_root apt-get update
+    if apt_package_available valkey-server && apt_package_available valkey-tools; then
+        packages+=(valkey-server valkey-tools)
+    else
+        echo "Valkey packages are unavailable; installing redis-server and redis-tools for integration tests."
+        packages+=(redis-server redis-tools)
+    fi
     run_root_env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
 }
 

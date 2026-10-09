@@ -18,26 +18,35 @@ enum class ReclaimPolicy {
     POLICY_TTL = 3,
 };
 
+enum class InstanceReclaimBudgetPolicy {
+    USAGE_PROPORTIONAL = 0,
+    FIXED_PER_INSTANCE = 1,
+    GROUP_LRU = 2,
+};
+
 /**
  * Cache整理策略相关的配置，包括淘汰策略
  */
 class CacheReclaimStrategy : public Jsonizable {
 public:
     CacheReclaimStrategy() = default;
-    CacheReclaimStrategy(const std::string &storage_unique_name,
-                         ReclaimPolicy reclaim_policy,
-                         const TriggerStrategy &trigger_strategy,
-                         int32_t trigger_period_seconds,
-                         int32_t reclaim_step_size,
-                         int32_t reclaim_step_percentage,
-                         int32_t delay_before_delete_ms = 0)
+    CacheReclaimStrategy(
+        const std::string &storage_unique_name,
+        ReclaimPolicy reclaim_policy,
+        const TriggerStrategy &trigger_strategy,
+        int32_t trigger_period_seconds,
+        int32_t reclaim_step_size,
+        int32_t reclaim_step_percentage,
+        int32_t delay_before_delete_ms = 0,
+        InstanceReclaimBudgetPolicy instance_reclaim_budget_policy = InstanceReclaimBudgetPolicy::GROUP_LRU)
         : storage_unique_name_(storage_unique_name)
         , reclaim_policy_(reclaim_policy)
         , trigger_strategy_(trigger_strategy)
         , trigger_period_seconds_(trigger_period_seconds)
         , reclaim_step_size_(reclaim_step_size)
         , reclaim_step_percentage_(reclaim_step_percentage)
-        , delay_before_delete_ms_(delay_before_delete_ms) {}
+        , delay_before_delete_ms_(delay_before_delete_ms)
+        , instance_reclaim_budget_policy_(instance_reclaim_budget_policy) {}
 
     ~CacheReclaimStrategy() override;
 
@@ -52,6 +61,7 @@ public:
     int32_t reclaim_step_size() const { return reclaim_step_size_; }
     int32_t reclaim_step_percentage() const { return reclaim_step_percentage_; }
     int32_t delay_before_delete_ms() const { return delay_before_delete_ms_; }
+    InstanceReclaimBudgetPolicy instance_reclaim_budget_policy() const { return instance_reclaim_budget_policy_; }
 
     // Setters
     void set_storage_unique_name(const std::string &storage_unique_name) { storage_unique_name_ = storage_unique_name; }
@@ -67,6 +77,9 @@ public:
     void set_delay_before_delete_ms(int32_t delay_before_delete_ms) {
         delay_before_delete_ms_ = delay_before_delete_ms;
     }
+    void set_instance_reclaim_budget_policy(InstanceReclaimBudgetPolicy instance_reclaim_budget_policy) {
+        instance_reclaim_budget_policy_ = instance_reclaim_budget_policy;
+    }
 
 public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
@@ -76,12 +89,13 @@ public:
 
 private:
     std::string storage_unique_name_;
-    ReclaimPolicy reclaim_policy_;
+    ReclaimPolicy reclaim_policy_{ReclaimPolicy::POLICY_UNSPECIFIED};
     TriggerStrategy trigger_strategy_;
-    int32_t trigger_period_seconds_;
-    int32_t reclaim_step_size_;
-    int32_t reclaim_step_percentage_;
-    int32_t delay_before_delete_ms_;
+    int32_t trigger_period_seconds_{0};
+    int32_t reclaim_step_size_{0};
+    int32_t reclaim_step_percentage_{0};
+    int32_t delay_before_delete_ms_{0};
+    InstanceReclaimBudgetPolicy instance_reclaim_budget_policy_{InstanceReclaimBudgetPolicy::GROUP_LRU};
 };
 
 } // namespace kv_cache_manager

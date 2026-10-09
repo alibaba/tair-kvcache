@@ -298,6 +298,7 @@ class ServiceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(meta_indexer, put_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, upsert_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, lock_wait_time_us)
+    KVCM_GAUGE_METRICS(meta_indexer, lock_hold_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, delete_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, get_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, rand_io_time_us)
@@ -411,9 +412,7 @@ public:
 
     // Accumulates dispatched write bytes; see the semantic contract on the
     // write_bytes_dispatched_total definition above.
-    void AddWriteBytes(std::uint64_t bytes) {
-        data_storage_write_bytes_dispatched_total_metrics_ += bytes;
-    }
+    void AddWriteBytes(std::uint64_t bytes) { data_storage_write_bytes_dispatched_total_metrics_ += bytes; }
 };
 
 /* --------------- DataStorageIntervalMetricsCollector ---------------- */
@@ -499,6 +498,8 @@ class CacheManagerInstanceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(cache_manager_instance, async_flush_key_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, async_batch_flush_time_us)
     KVCM_GAUGE_METRICS(cache_manager_instance, async_pipeline_error_count)
+    KVCM_GAUGE_METRICS(cache_manager_instance, async_dropped_key_count)
+    KVCM_GAUGE_METRICS(cache_manager_instance, async_dropped_metadata_count)
 
 public:
     CacheManagerInstanceMetricsCollector() = delete;

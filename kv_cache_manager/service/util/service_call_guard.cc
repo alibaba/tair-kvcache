@@ -8,96 +8,7 @@
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
-#include "rapidjson/document.h"
-#include "rapidjson/stringbuffer.h"
-#include "rapidjson/writer.h"
-
-namespace {
-
-/**
- * @brief Builds the access log entry as a valid JSON string.
- *
- * Purpose:
- *  - This access log is primarily used for tracing and observability.
- *  - It captures request/response details so they can be correlated across the system.
- *
- * The output is guaranteed to be standard JSON.
- * Fields `request` and `response` are embedded as nested JSON objects,
- * so external tools like `jq` can parse, pretty‑print, and query fields directly.
- *
- * Notes:
- *  - Any change to the log format should be made in this class only.
- */
-class AccessLogJsonBuilder {
-public:
-    explicit AccessLogJsonBuilder(const kv_cache_manager::RequestContext *request_context)
-        : request_context_(request_context) {}
-
-    std::string Build() const {
-        using namespace rapidjson;
-        StringBuffer sb;
-        Writer<StringBuffer> writer(sb);
-        // TODO  show request and response in debug mode
-        // TODO Data Masking in request and response maybe
-        int64_t cost_us =
-            kv_cache_manager::TimestampUtil::GetCurrentTimeUs() - request_context_->request_begin_time_us();
-
-        writer.StartObject();
-        writer.Key("request_begin_time");
-        writer.String(
-            kv_cache_manager::TimestampUtil::FormatTimestampUs(request_context_->request_begin_time_us()).c_str());
-
-        writer.Key("client_ip");
-        writer.String(request_context_->client_ip().c_str());
-
-        writer.Key("trace_id");
-        writer.String(request_context_->trace_id().c_str());
-
-        writer.Key("request_id");
-        writer.String(request_context_->request_id().c_str());
-
-        writer.Key("api_name");
-        writer.String(request_context_->api_name().c_str());
-
-        writer.Key("status_code");
-        writer.Int(request_context_->status_code());
-
-        writer.Key("request_cost_time_us");
-        writer.Int64(cost_us);
-
-        // other fields
-
-        // 嵌套 request json
-        {
-            Document req_doc;
-            req_doc.Parse(request_context_->request_debug().c_str());
-            if (req_doc.HasParseError()) {
-                req_doc.SetObject();
-            }
-            writer.Key("request");
-            req_doc.Accept(writer);
-        }
-
-        // 嵌套 response json
-        {
-            Document resp_doc;
-            resp_doc.Parse(request_context_->response_debug().c_str());
-            if (resp_doc.HasParseError()) {
-                resp_doc.SetObject();
-            }
-            writer.Key("response");
-            resp_doc.Accept(writer);
-        }
-
-        writer.EndObject();
-        return sb.GetString();
-    }
-
-private:
-    const kv_cache_manager::RequestContext *request_context_;
-};
-
-} // namespace
+#include "kv_cache_manager/service/util/access_log_writer.h"
 
 namespace kv_cache_manager {
 
@@ -112,11 +23,11 @@ ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,
 ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,
                                    RequestContext *request_context,
                                    MetricsReporter *metrics_reporter,
-                                   std::function<void()> response_debug_setter)
+                                   std::function<void()> completion_callback)
     : cache_manager_(cache_manager)
     , request_context_(request_context)
     , metrics_reporter_(metrics_reporter)
-    , response_debug_setter_(std::move(response_debug_setter)) {
+    , completion_callback_(std::move(completion_callback)) {
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     query_scope_ = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ServiceQuery);
 }
@@ -136,8 +47,11 @@ ServiceCallGuard::~ServiceCallGuard() {
     // request, so this gauge is deliberately a 0/1 failure flag rather than
     // the wire enum value (where a successful request is non-zero).
     const double error_code = request_context_->status_code() == RequestContext::kOkStatusCode ? 0.0 : 1.0;
-    if (response_debug_setter_) {
-        response_debug_setter_();
+    // The response must be finalized before materialization. Doing this once
+    // here lets the access log and the HTTP transport share the same bytes.
+    request_context_->MaterializeResponseJson();
+    if (completion_callback_) {
+        completion_callback_();
     }
     if (metrics_reporter_) {
         metrics_reporter_->ReportPerQuery(service_metrics_collector);
@@ -165,8 +79,7 @@ ServiceCallGuard::~ServiceCallGuard() {
 }
 
 void ServiceCallGuard::PrintAccessLog(RequestContext *request_context) {
-    AccessLogJsonBuilder access_log_json_builder(request_context);
-    std::string access_log = access_log_json_builder.Build();
+    std::string access_log = AccessLogWriter::Build(*request_context);
     KVCM_ACCESS_LOG(access_log);
 }
 

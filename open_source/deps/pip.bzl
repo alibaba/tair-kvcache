@@ -2,7 +2,7 @@ load("@rules_python//python:pip.bzl", "pip_parse")
 
 PIP_EXTRA_ARGS = [
     "--cache-dir=~/.cache/pip",
-    "--index-url=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple",
+    "--index-url=https://mirrors.aliyun.com/pypi/simple/",
     "--verbose",
 ]
 

@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cassert>
 #include <exception>
+#include <map>
 #include <memory>
+#include <set>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -44,6 +47,18 @@ void HandleErrorPromise(const std::shared_ptr<std::promise<ResultType>> &promise
         .status = error_code,
         .error_message = std::move(error_message),
     });
+}
+
+const char *EventReportCleanupReasonName(EventReportBackend::MaintenanceCleanupReason reason) {
+    switch (reason) {
+    case EventReportBackend::MaintenanceCleanupReason::kStaleSnapshot:
+        return "stale_snapshot";
+    case EventReportBackend::MaintenanceCleanupReason::kDownHost:
+        return "down_host";
+    case EventReportBackend::MaintenanceCleanupReason::kRecoveryAbsentHost:
+        return "recovery_absent_host";
+    }
+    return "unknown";
 }
 } // namespace
 
@@ -305,10 +320,14 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             if (iter->second->status() != CacheLocationStatus::CLS_DELETING) {
                 continue;
             }
-            if (!task.metadata_only) {
+            if (!task.metadata_only && !IsEventReportStorageType(iter->second->type())) {
                 for (const auto &loc_spec : iter->second->location_specs()) {
                     DataStorageUri uri(loc_spec.uri());
                     if (uri.Valid()) {
+                        if (!task.confirmed_missing_uris.empty() &&
+                            task.confirmed_missing_uris.find(uri.ToUriString()) != task.confirmed_missing_uris.end()) {
+                            continue;
+                        }
                         std::string storage_unique_name = uri.GetHostName();
                         delete_uris_by_unique_name[storage_unique_name].emplace_back(uri);
                     }
@@ -335,20 +354,42 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             data_storage_manager_->Delete(request_context.get(), storage_unique_name, storage_uris, nullptr);
         if (delete_results.size() != storage_uris.size()) {
             result.status = ErrorCode::EC_PARTIAL_OK;
-            result.error_message = StringUtil::FormatString(
-                "storage delete result size %zu != request size %zu", delete_results.size(), storage_uris.size());
+            result.error_message =
+                StringUtil::FormatString("storage delete result size %zu != request size %zu, instance[%s] storage[%s]",
+                                         delete_results.size(),
+                                         storage_uris.size(),
+                                         task.instance_id.c_str(),
+                                         storage_unique_name.c_str());
             KVCM_LOG_WARN("%s", result.error_message.c_str());
         }
         const auto result_count = std::min(delete_results.size(), storage_uris.size());
+        size_t failed_count = 0;
+        size_t first_failed_index = 0;
         for (size_t i = 0; i < result_count; ++i) {
-            if (delete_results[i] != ErrorCode::EC_OK) {
-                // 这里存储删除报错暂且不管，报个warn表示哪个storageUri删失败了
-                result.status = ErrorCode::EC_PARTIAL_OK;
+            if (delete_results[i] != ErrorCode::EC_OK && delete_results[i] != ErrorCode::EC_NOENT) {
+                if (failed_count == 0) {
+                    first_failed_index = i;
+                }
+                ++failed_count;
                 KVCM_LOG_WARN("storage delete failed, instance[%s] storage[%s] uri[%s] ec[%d]",
                               task.instance_id.c_str(),
                               storage_unique_name.c_str(),
                               storage_uris[i].ToUriString().c_str(),
                               static_cast<int>(delete_results[i]));
+            }
+        }
+        if (failed_count > 0) {
+            result.status = ErrorCode::EC_PARTIAL_OK;
+            const std::string failure_message = StringUtil::FormatString(
+                "storage delete failed, instance[%s] storage[%s] failed[%zu] total[%zu] first_uri[%s] first_ec[%d]",
+                task.instance_id.c_str(),
+                storage_unique_name.c_str(),
+                failed_count,
+                storage_uris.size(),
+                storage_uris[first_failed_index].ToUriString().c_str(),
+                static_cast<int>(delete_results[first_failed_index]));
+            if (result.error_message.empty()) {
+                result.error_message = failure_message;
             }
         }
     }
@@ -361,7 +402,8 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
         if (delete_meta_ec != ErrorCode::EC_OK || delete_meta_results.size() != batch_cad_tasks.size()) {
             result.status = ErrorCode::EC_PARTIAL_OK;
             result.error_message =
-                StringUtil::FormatString("location CAD failed, ec: %d, result size %zu != task size %zu",
+                StringUtil::FormatString("location CAD failed, instance[%s] ec: %d, result size %zu != task size %zu",
+                                         task.instance_id.c_str(),
                                          static_cast<int>(delete_meta_ec),
                                          delete_meta_results.size(),
                                          batch_cad_tasks.size());
@@ -372,16 +414,18 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             auto &results = delete_meta_results[block_key_idx];
             if (results.size() != batch_cad_tasks[block_key_idx].size()) {
                 result.status = ErrorCode::EC_PARTIAL_OK;
-                KVCM_LOG_WARN("location CAD result size %zu != task size %zu for block key %ld",
+                KVCM_LOG_WARN("location CAD result size %zu != task size %zu, instance[%s] block key %ld",
                               results.size(),
                               batch_cad_tasks[block_key_idx].size(),
+                              task.instance_id.c_str(),
                               block_keys_to_delete[block_key_idx]);
             }
             const auto location_result_count = std::min(results.size(), batch_cad_tasks[block_key_idx].size());
             for (size_t location_idx = 0; location_idx < location_result_count; location_idx++) {
                 if (results[location_idx] != ErrorCode::EC_OK) {
                     result.status = ErrorCode::EC_PARTIAL_OK;
-                    KVCM_LOG_WARN("Failed to CAD meta key %ld, location: %s, error_code: %d",
+                    KVCM_LOG_WARN("Failed to CAD meta, instance[%s] key %ld, location: %s, error_code: %d",
+                                  task.instance_id.c_str(),
                                   block_keys_to_delete[block_key_idx],
                                   batch_cad_tasks[block_key_idx][location_idx].location_id.c_str(),
                                   static_cast<int>(results[location_idx]));
@@ -389,8 +433,9 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             }
         }
     }
-    KVCM_LOG_DEBUG("DoDelLocationTask completed successfully for instance_id: %s", task.instance_id.c_str());
-
+    // All storage/CAD failures above have detailed diagnostics. Early returns
+    // and worker exceptions keep the default false so callers still log them.
+    result.error_logged = result.status != ErrorCode::EC_OK;
     return result;
 }
 
@@ -502,7 +547,14 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const Cach
         return future;
     }
     if (actual_task.block_keys.empty()) {
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        if (update_ec == ErrorCode::EC_OK) {
+            promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        } else {
+            HandleErrorPromise(promise,
+                               update_ec,
+                               "Failed to admit location delete metadata update, instance[%s]",
+                               task.instance_id.c_str());
+        }
         return future;
     }
 
@@ -619,6 +671,7 @@ SchedulePlanExecutor::PrepareDeleteTask(const CacheLocationDelRequest &task) {
                                         task.delay,
                                         task.authoritative_read);
     result.actual_task.metadata_only = task.metadata_only;
+    result.actual_task.confirmed_missing_uris = task.confirmed_missing_uris;
     return result;
 }
 
@@ -649,7 +702,7 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
     auto request_context = std::make_shared<RequestContext>("schedule_plan_executor_call");
     ErrorCode get_locations_ec = ErrorCode::EC_OK;
     if (authoritative_read) {
-        const auto get_result = indexer->GetLocationsFromPersistent(request_context.get(), block_keys, location_maps);
+        const auto get_result = indexer->GetLocationsFromPrimary(request_context.get(), block_keys, location_maps);
         if (get_result.error_codes.size() != block_keys.size()) {
             get_locations_ec = ErrorCode::EC_ERROR;
         } else {
@@ -744,6 +797,12 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
         return admission_result;
     }
     if (admission_result.actual_task.block_keys.empty()) {
+        if (update_ec != ErrorCode::EC_OK) {
+            admission_result.result = MakeErrorResult(
+                update_ec,
+                StringUtil::FormatString("Failed to admit location delete metadata update, instance[%s]",
+                                         instance_id.c_str()));
+        }
         return admission_result;
     }
 
@@ -824,6 +883,233 @@ AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const CacheLocationDel
                    task.block_keys.size());
 
     return SubmitDeleteTaskAsync(task.delay, [this, task]() { return PrepareDeleteTask(task); });
+}
+
+AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const EventReportMetadataDelRequest &task) {
+    if (task.instance_id.empty() || task.block_keys.empty() || task.block_keys.size() != task.targets.size()) {
+        return {};
+    }
+    std::set<int64_t> unique_block_keys;
+    if (!std::all_of(task.block_keys.begin(), task.block_keys.end(), [&](int64_t block_key) {
+            return unique_block_keys.insert(block_key).second;
+        })) {
+        return {};
+    }
+    for (const auto &targets : task.targets) {
+        if (targets.empty()) {
+            return {};
+        }
+        std::set<std::string> unique_location_ids;
+        for (const auto &target : targets) {
+            if (target.location_id.empty() || target.expected_location_value.empty() ||
+                target.backend_unique_name.empty() || target.expected_backend.expired() ||
+                !IsEventReportStorageType(target.storage_type) ||
+                target.cleanup_token.reporter_key.instance_id != task.instance_id ||
+                target.cleanup_token.reporter_key.host_ip_port.empty() ||
+                !unique_location_ids.insert(target.location_id).second) {
+                return {};
+            }
+        }
+    }
+
+    auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
+    auto future = promise->get_future();
+    auto completion = std::make_shared<PromiseCompletion>(promise);
+    auto execute_task = [this, completion, task]() {
+        try {
+            completion->Complete(DoEventReportMetadataDelTask(task));
+        } catch (const std::exception &e) {
+            completion->Complete(
+                EC_ERROR, StringUtil::FormatString("EventReport metadata delete threw exception: %s", e.what()));
+        } catch (...) { completion->Complete(EC_ERROR, "EventReport metadata delete threw unknown exception"); }
+    };
+    auto cancel_task = [completion]() {
+        completion->Complete(EC_ERROR, "SchedulePlanExecutor stopped before EventReport metadata delete.");
+    };
+    if (!SubmitRaw(execute_task, std::chrono::microseconds::zero(), cancel_task, ScheduleTaskClass::kReclaim)) {
+        return {};
+    }
+    return AsyncDeleteSubmitResult{true, std::move(future)};
+}
+
+PlanExecuteResult
+SchedulePlanExecutor::DoEventReportMetadataDelTask(const EventReportMetadataDelRequest &task) {
+    auto indexer = meta_manager_ ? meta_manager_->GetMetaIndexer(task.instance_id) : nullptr;
+    if (!indexer) {
+        return MakeErrorResult(EC_NOENT,
+                               StringUtil::FormatString("MetaIndexer %s not found", task.instance_id.c_str()));
+    }
+    MetaSearcher meta_searcher(indexer);
+    size_t completed_targets = 0;
+    size_t hard_error_targets = 0;
+    const auto record_delete_result = [this](EventReportBackend::MaintenanceCleanupReason reason,
+                                             const char *status) noexcept {
+        if (!metrics_registry_) {
+            return;
+        }
+        try {
+            metrics_registry_->GetCounter(
+                "cache_gc.event_report_delete_location_count",
+                MetricsTags{{"reason", EventReportCleanupReasonName(reason)}, {"status", status}}) += 1;
+        } catch (const std::exception &e) {
+            KVCM_LOG_ERROR("record EventReport metadata delete metric failed: %s", e.what());
+        } catch (...) { KVCM_LOG_ERROR("record EventReport metadata delete metric failed with unknown exception"); }
+    };
+
+    for (size_t key_index = 0; key_index < task.block_keys.size(); ++key_index) {
+        const auto &targets = task.targets[key_index];
+        using LeaseKey = std::tuple<std::string, std::string, uint64_t, int, std::string, uint64_t>;
+        std::map<std::string, std::shared_ptr<EventReportBackend>> cleanup_backends;
+        std::map<LeaseKey, std::pair<std::shared_ptr<EventReportBackend>, EventReportBackend::MaintenanceCleanupToken>>
+            cleanup_tokens;
+        bool key_stale = false;
+        bool key_busy = false;
+        for (const auto &target : targets) {
+            if (!IsEventReportStorageType(target.storage_type) ||
+                target.cleanup_token.reporter_key.instance_id != task.instance_id) {
+                key_stale = true;
+                break;
+            }
+            auto expected_backend = target.expected_backend.lock();
+            auto current_backend = data_storage_manager_
+                                       ? std::dynamic_pointer_cast<EventReportBackend>(
+                                             data_storage_manager_->GetDataStorageBackend(target.backend_unique_name))
+                                       : nullptr;
+            if (!expected_backend || !current_backend || current_backend.get() != expected_backend.get() ||
+                current_backend->GetStorageConfig().global_unique_name() != target.backend_unique_name ||
+                current_backend->GetStorageType() != target.storage_type) {
+                key_stale = true;
+                break;
+            }
+            if (!current_backend->Available()) {
+                key_busy = true;
+                break;
+            }
+            const auto [backend_it, backend_inserted] =
+                cleanup_backends.emplace(target.backend_unique_name, current_backend);
+            if (!backend_inserted && backend_it->second.get() != current_backend.get()) {
+                key_stale = true;
+                break;
+            }
+            const auto &token = target.cleanup_token;
+            CacheLocation expected_location;
+            std::string reporter_medium;
+            std::string reporter_host;
+            if (!expected_location.FromJsonString(target.expected_location_value) ||
+                expected_location.id() != target.location_id || expected_location.type() != target.storage_type ||
+                expected_location.status() != CLS_SERVING ||
+                !current_backend->ParseLocationId(target.location_id, reporter_medium, reporter_host) ||
+                reporter_host != token.reporter_key.host_ip_port) {
+                key_stale = true;
+                break;
+            }
+            cleanup_tokens.emplace(LeaseKey{target.backend_unique_name,
+                                            token.reporter_key.host_ip_port,
+                                            token.lifecycle_generation,
+                                            static_cast<int>(token.reason),
+                                            token.committed_version,
+                                            token.snapshot_attempt_epoch},
+                                   std::make_pair(std::move(current_backend), token));
+        }
+
+        std::vector<EventReportBackend::MaintenanceBackendLease> backend_leases;
+        if (!key_stale && !key_busy) {
+            backend_leases.reserve(cleanup_backends.size());
+            for (const auto &[_, backend] : cleanup_backends) {
+                EventReportBackend::MaintenanceBackendLease lease;
+                if (backend->AcquireMaintenanceBackendLease(lease) !=
+                    EventReportBackend::CleanupLeaseAcquireResult::kAcquired) {
+                    key_busy = true;
+                    break;
+                }
+                backend_leases.push_back(std::move(lease));
+            }
+        }
+
+        std::vector<EventReportBackend::LifecycleMutationLease> leases;
+        if (!key_stale && !key_busy) {
+            leases.reserve(cleanup_tokens.size());
+            for (const auto &[_, backend_and_token] : cleanup_tokens) {
+                EventReportBackend::LifecycleMutationLease lease;
+                const auto lease_result =
+                    backend_and_token.first->AcquireMaintenanceCleanupLease(backend_and_token.second, lease);
+                if (lease_result == EventReportBackend::CleanupLeaseAcquireResult::kBusy) {
+                    key_busy = true;
+                    break;
+                }
+                if (lease_result == EventReportBackend::CleanupLeaseAcquireResult::kStale) {
+                    key_stale = true;
+                    break;
+                }
+                leases.push_back(std::move(lease));
+            }
+        }
+
+        if (key_stale || key_busy) {
+            const char *status = key_stale ? "mismatch" : "error";
+            for (const auto &target : targets) {
+                record_delete_result(target.cleanup_token.reason, status);
+            }
+            if (key_stale) {
+                completed_targets += targets.size();
+            } else {
+                hard_error_targets += targets.size();
+            }
+            continue;
+        }
+
+        LocationIdsPerKey location_ids(1);
+        std::vector<std::vector<std::string>> expected_values(1);
+        location_ids.front().reserve(targets.size());
+        expected_values.front().reserve(targets.size());
+        for (const auto &target : targets) {
+            location_ids.front().push_back(target.location_id);
+            expected_values.front().push_back(target.expected_location_value);
+        }
+        std::vector<std::vector<ErrorCode>> per_location_ec;
+        RequestContext context("event_report_metadata_delete");
+        const ErrorCode ec = meta_searcher.BatchDeleteLocations(&context,
+                                                                 {task.block_keys[key_index]},
+                                                                 location_ids,
+                                                                 per_location_ec,
+                                                                 expected_values,
+                                                                 true,
+                                                                 true,
+                                                                 true);
+        if (per_location_ec.size() != 1 || per_location_ec.front().size() != targets.size()) {
+            hard_error_targets += targets.size();
+            for (const auto &target : targets) {
+                record_delete_result(target.cleanup_token.reason, "error");
+            }
+            continue;
+        }
+        for (size_t target_index = 0; target_index < targets.size(); ++target_index) {
+            const ErrorCode target_ec = per_location_ec.front()[target_index];
+            const bool hard_error = target_ec != EC_OK && target_ec != EC_NOENT && target_ec != EC_MISMATCH;
+            hard_error_targets += static_cast<size_t>(hard_error);
+            completed_targets += static_cast<size_t>(!hard_error);
+            const char *status = target_ec == EC_OK       ? "deleted"
+                                 : target_ec == EC_NOENT  ? "noent"
+                                 : target_ec == EC_MISMATCH ? "mismatch"
+                                                           : "error";
+            record_delete_result(targets[target_index].cleanup_token.reason, status);
+        }
+        if (ec != EC_OK && ec != EC_PARTIAL_OK &&
+            std::none_of(per_location_ec.front().begin(), per_location_ec.front().end(), [](ErrorCode target_ec) {
+                return target_ec != EC_OK && target_ec != EC_NOENT && target_ec != EC_MISMATCH;
+            })) {
+            // A malformed aggregate result must not be hidden by otherwise
+            // successful per-target values.
+            ++hard_error_targets;
+        }
+    }
+
+    if (hard_error_targets == 0) {
+        return PlanExecuteResult{EC_OK, ""};
+    }
+    return MakeErrorResult(completed_targets == 0 ? EC_ERROR : EC_PARTIAL_OK,
+                           StringUtil::FormatString("EventReport metadata delete hard failures: %zu",
+                                                    hard_error_targets));
 }
 
 AsyncDeleteSubmitResult

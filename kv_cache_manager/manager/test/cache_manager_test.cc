@@ -227,6 +227,21 @@ public:
         return sync_call_count_;
     }
 
+    size_t GetSyncAllCallCount() {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        return sync_all_call_count_;
+    }
+
+    size_t GetListKeysCallCount() {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        return list_keys_call_count_;
+    }
+
+    bool ListedKeysBeforeSyncAll() {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        return listed_keys_before_sync_all_;
+    }
+
     std::vector<ErrorCode> Upsert(RequestContext *request_context,
                                   const KeyTypeVec &keys,
                                   const CacheLocationMapVector &locations,
@@ -306,6 +321,25 @@ public:
         return MetaLocalBackend::Sync(keys);
     }
 
+    bool SyncAll() noexcept override {
+        std::lock_guard<std::mutex> lock(control_mutex_);
+        ++sync_all_call_count_;
+        return true;
+    }
+
+    ErrorCode ListKeys(RequestContext *request_context,
+                       const std::string &cursor,
+                       int64_t limit,
+                       std::string &out_next_cursor,
+                       KeyTypeVec &out_keys) noexcept override {
+        {
+            std::lock_guard<std::mutex> lock(control_mutex_);
+            ++list_keys_call_count_;
+            listed_keys_before_sync_all_ |= sync_all_call_count_ == 0;
+        }
+        return MetaLocalBackend::ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
+    }
+
 private:
     void MaybeBlockLocationRead() {
         std::unique_lock<std::mutex> lock(control_mutex_);
@@ -342,6 +376,9 @@ private:
     bool release_location_read_ = false;
     std::optional<int64_t> fail_key_on_next_upsert_;
     size_t sync_call_count_ = 0;
+    size_t sync_all_call_count_ = 0;
+    size_t list_keys_call_count_ = 0;
+    bool listed_keys_before_sync_all_ = false;
 };
 
 class DeleteRecordingBackend : public DataStorageBackend {
@@ -385,6 +422,72 @@ public:
 private:
     std::shared_ptr<DataStorageBackend> delegate_;
     std::atomic<size_t> deleted_uri_count_{0};
+};
+
+class BlockingDeleteBackend : public DataStorageBackend {
+public:
+    explicit BlockingDeleteBackend(std::shared_ptr<DataStorageBackend> delegate)
+        : DataStorageBackend(delegate->metrics_registry_), delegate_(std::move(delegate)) {
+        SetOpen(delegate_->IsOpen());
+        SetAvailable(true);
+    }
+
+    DataStorageType GetType() override { return delegate_->GetType(); }
+    bool Available() override { return delegate_->Available(); }
+    double GetStorageUsageRatio(const std::string &trace_id) const override {
+        return delegate_->GetStorageUsageRatio(trace_id);
+    }
+    const StorageConfig &GetStorageConfig() override { return delegate_->GetStorageConfig(); }
+    ErrorCode DoOpen(const StorageConfig &config, const std::string &trace_id) override {
+        return delegate_->DoOpen(config, trace_id);
+    }
+    ErrorCode Close() override { return delegate_->Close(); }
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const std::string &trace_id,
+                                                             std::function<void()> cb) override {
+        return delegate_->Create(keys, size_per_key, trace_id, std::move(cb));
+    }
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++active_deletes_;
+        max_active_deletes_ = std::max(max_active_deletes_, active_deletes_);
+        cv_.notify_all();
+        cv_.wait(lock, [this] { return released_; });
+        --active_deletes_;
+        return std::vector<ErrorCode>(uris.size(), EC_OK);
+    }
+    std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override { return delegate_->Exist(uris); }
+    std::vector<bool> MightExist(const std::vector<DataStorageUri> &uris) override {
+        return delegate_->MightExist(uris);
+    }
+    std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override { return delegate_->Lock(uris); }
+    std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override { return delegate_->UnLock(uris); }
+
+    bool WaitForActiveDeletes(size_t count, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, timeout, [this, count] { return active_deletes_ >= count; });
+    }
+
+    void ReleaseDeletes() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+    size_t MaxActiveDeletes() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return max_active_deletes_;
+    }
+
+private:
+    std::shared_ptr<DataStorageBackend> delegate_;
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    size_t active_deletes_ = 0;
+    size_t max_active_deletes_ = 0;
+    bool released_ = false;
 };
 
 class CacheManagerTest : public TESTBASE {
@@ -595,6 +698,26 @@ public:
         indexer->backend_manager_->persistent_backend_ = std::move(controlled);
         indexer->backend_manager_->cache_backend_.reset();
         return controlled_raw;
+    }
+
+    void AddDummyLocationsForTrim(size_t key_count, const std::string &storage_name) {
+        MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+        ASSERT_NE(nullptr, meta_searcher);
+
+        KeyVector keys;
+        CacheLocationVector locations;
+        keys.reserve(key_count);
+        locations.reserve(key_count);
+        for (size_t i = 0; i < key_count; ++i) {
+            keys.push_back(static_cast<int64_t>(i));
+            locations.push_back(std::make_shared<CacheLocation>(
+                DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                1,
+                std::vector<LocationSpec>{
+                    LocationSpec("tp0", "dummy://" + storage_name + "/trim_" + std::to_string(i) + "?size=1")}));
+        }
+        std::vector<std::string> location_ids;
+        ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher, request_context_.get(), keys, locations, location_ids));
     }
 
     static proto::meta::ReportEventRequest
@@ -1079,6 +1202,54 @@ TEST_F(CacheManagerTest, TestStartWriteDuplicateCache) {
     }
 }
 
+// A token-only StartWriteCache (block_keys empty, keys derived from token_ids)
+// must accept per-block location_spec_group_names: the size check has to count
+// blocks, not the empty block_keys vector. Regression for hybrid connectors,
+// which announce per-block spec coverage on token-only writes.
+TEST_F(CacheManagerTest, TestStartWriteCacheSpecGroupNamesWithTokenIdsOnly) {
+    constexpr int64_t kBlockSize = 4;
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("tp0_attn", 512),
+        LocationSpecInfo("tp0_state", 512),
+    };
+    std::vector<LocationSpecGroup> location_spec_groups = {
+        LocationSpecGroup("attn", {"tp0_attn"}),
+        LocationSpecGroup("full", {"tp0_attn", "tp0_state"}),
+    };
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "token_only_sg",
+                                               kBlockSize,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               location_spec_groups));
+
+    // 3 blocks of tokens, no block_keys: the middle block carries no state.
+    CacheManager::TokenIdsVector tokens;
+    for (int64_t i = 0; i < 3 * kBlockSize; ++i) {
+        tokens.push_back(i);
+    }
+    const std::vector<std::string> group_names{"full", "attn", "full"};
+    auto [ec, info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "token_only_sg", {}, tokens, group_names, 100000000);
+    ASSERT_EQ(EC_OK, ec);
+    const auto &locs = info.locations().cache_locations_view();
+    ASSERT_EQ(3u, locs.size());
+    // Each block is allocated exactly the specs of its announced group, so the
+    // state-less block is never published as holding a state.
+    ASSERT_EQ(2, locs[0].spec_size());
+    ASSERT_EQ(1, locs[1].spec_size());
+    ASSERT_EQ(2, locs[2].spec_size());
+    ASSERT_EQ("tp0_attn", locs[1].location_specs()[0].name());
+
+    // A mismatched length must still be rejected.
+    auto [ec_bad, info_bad] =
+        cache_manager_->StartWriteCache(request_context_.get(), "token_only_sg", {}, tokens, {"full"}, 100000000);
+    ASSERT_NE(EC_OK, ec_bad);
+}
+
 TEST_F(CacheManagerTest, TestStartWriteCacheRecordWriteBytes) {
     auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     ASSERT_EQ(expected,
@@ -1091,18 +1262,19 @@ TEST_F(CacheManagerTest, TestStartWriteCacheRecordWriteBytes) {
                                                std::vector<LocationSpecGroup>()));
     // 取出统计的写入量
     auto get_write_bytes = [&]() {
-        return metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total",
-                                             {{"type", ToString(kDefaultStorageType)},
-                                              {"unique_name", "nfs_01"}}).Get();
+        return metrics_registry_
+            ->GetCounter("data_storage.write_bytes_dispatched_total",
+                         {{"type", ToString(kDefaultStorageType)}, {"unique_name", "nfs_01"}})
+            .Get();
     };
     // 成功写入
     std::vector<int64_t> keys{1, 2, 3};
     auto [ec, start_write_cache_info] =
         cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 1000);
     ASSERT_EQ(EC_OK, ec);
-    ASSERT_EQ(3 * 4 * 512, get_write_bytes());  // 验证写入量
+    ASSERT_EQ(3 * 4 * 512, get_write_bytes()); // 验证写入量
 
-    {// 部分写入成功场景，不新增写入量，写入量统计放在 BatchAddLoation 成功之后
+    { // 部分写入成功场景，不新增写入量，写入量统计放在 BatchAddLoation 成功之后
         auto meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
         ASSERT_TRUE(meta_indexer);
 
@@ -1110,11 +1282,10 @@ TEST_F(CacheManagerTest, TestStartWriteCacheRecordWriteBytes) {
         const auto orig_batch_size = meta_indexer->batch_key_size_;
         const auto orig_max_key_count = meta_indexer->max_key_count_;
         meta_indexer->batch_key_size_ = 1;
-        meta_indexer->max_key_count_ = meta_indexer->GetKeyCount() + 1;  // 已写入的key_count + 1，确保已经写入的是成功的
+        meta_indexer->max_key_count_ = meta_indexer->GetKeyCount() + 1; // 已写入的key_count + 1，确保已经写入的是成功的
 
         std::vector<int64_t> keys{1001, 1002};
-        while (GetShardIndex(keys[0], meta_indexer->mutex_shard_mask_) ==
-               GetShardIndex(keys[1], meta_indexer->mutex_shard_mask_)) {
+        while (meta_indexer->GetMutexShardIndex(keys[0]) == meta_indexer->GetMutexShardIndex(keys[1])) {
             ++keys[1];
         }
 
@@ -1122,19 +1293,19 @@ TEST_F(CacheManagerTest, TestStartWriteCacheRecordWriteBytes) {
             cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 1000);
         EXPECT_EQ(EC_PARTIAL_OK, ec);
         EXPECT_TRUE(start_write_cache_info.locations().cache_locations_view().empty());
-        ASSERT_EQ(3 * 4 * 512, get_write_bytes());  // 验证写入量
+        ASSERT_EQ(3 * 4 * 512, get_write_bytes()); // 验证写入量
 
         // 恢复现场
         meta_indexer->batch_key_size_ = orig_batch_size;
         meta_indexer->max_key_count_ = orig_max_key_count;
     }
 
-    {// 重复写入
+    { // 重复写入
         std::vector<int64_t> keys{1, 2};
         auto [ec, start_write_cache_info] =
             cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
         ASSERT_EQ(EC_OK, ec);
-        ASSERT_EQ(3 * 4 * 512, get_write_bytes());  // 验证写入量
+        ASSERT_EQ(3 * 4 * 512, get_write_bytes()); // 验证写入量
     }
 }
 
@@ -2200,7 +2371,6 @@ TEST_F(CacheManagerTest, TestTrimCache) {
         auto ec1 = cache_manager_->TrimCache(
             request_context_.get(), "placeholder_id", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
         ASSERT_EQ(ErrorCode::EC_OK, ec1);
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
         BlockMask block_mask = static_cast<std::size_t>(0);
 
         auto [ec2, cache_metas] =
@@ -2236,7 +2406,6 @@ TEST_F(CacheManagerTest, TestTrimCache) {
         auto ec1 = cache_manager_->TrimCache(
             request_context_.get(), "placeholder_id", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
         ASSERT_EQ(ErrorCode::EC_OK, ec1);
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
         BlockMask block_mask = static_cast<std::size_t>(0);
 
         auto [ec2, cache_metas] =
@@ -2252,6 +2421,161 @@ TEST_F(CacheManagerTest, TestTrimCache) {
                       meta.at("status"));
         }
     }
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheSyncsMetadataOnceAcrossScanPages) {
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+
+    constexpr size_t key_count = 1024;
+    KeyVector keys;
+    CacheLocationVector locations;
+    keys.reserve(key_count);
+    locations.reserve(key_count);
+    for (size_t i = 0; i < key_count; ++i) {
+        keys.push_back(static_cast<int64_t>(i));
+        locations.push_back(std::make_shared<CacheLocation>(
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/trim_" + std::to_string(i) + "?size=1")}));
+    }
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher, request_context_.get(), keys, locations, location_ids));
+
+    EXPECT_EQ(EC_OK,
+              cache_manager_->TrimCache(
+                  request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
+    EXPECT_GT(meta_backend->GetListKeysCallCount(), 1u);
+    EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheRunsBoundedConcurrentDeletesBeforeSync) {
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    AddDummyLocationsForTrim(2048, "hot_01");
+
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    auto blocking_backend = std::make_shared<BlockingDeleteBackend>(data_storage_manager->storage_map_.at("hot_01"));
+    data_storage_manager->storage_map_["hot_01"] = blocking_backend;
+
+    auto trim_future = std::async(std::launch::async, [this] {
+        return cache_manager_->TrimCache(
+            request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
+    });
+
+    const size_t worker_count = cache_manager_->schedule_plan_executor_->GetWorkerCount();
+    const bool workers_busy = blocking_backend->WaitForActiveDeletes(worker_count, std::chrono::seconds(5));
+    size_t waiting_tasks = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (workers_busy && std::chrono::steady_clock::now() < deadline) {
+        {
+            std::lock_guard<std::mutex> lock(cache_manager_->schedule_plan_executor_->queue_mutex_);
+            waiting_tasks = cache_manager_->schedule_plan_executor_->WaitingTaskCountLocked();
+        }
+        if (waiting_tasks >= worker_count) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const size_t sync_count_while_deleting = meta_backend->GetSyncAllCallCount();
+    blocking_backend->ReleaseDeletes();
+
+    EXPECT_TRUE(workers_busy);
+    EXPECT_EQ(worker_count, waiting_tasks);
+    EXPECT_EQ(0u, sync_count_while_deleting);
+    EXPECT_EQ(EC_OK, trim_future.get());
+    EXPECT_EQ(worker_count, blocking_backend->MaxActiveDeletes());
+    EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheContinuesAfterPartialDeleteFailure) {
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    AddDummyLocationsForTrim(2048, "missing_storage");
+
+    EXPECT_EQ(EC_ERROR,
+              cache_manager_->TrimCache(
+                  request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
+    EXPECT_GT(meta_backend->GetListKeysCallCount(), 2 * cache_manager_->schedule_plan_executor_->GetWorkerCount());
+    EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheStopsSubmittingAfterExecutorFailure) {
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    AddDummyLocationsForTrim(2048, "hot_01");
+    cache_manager_->schedule_plan_executor_->Stop();
+
+    const size_t max_inflight = 2 * cache_manager_->schedule_plan_executor_->GetWorkerCount();
+    EXPECT_EQ(EC_ERROR,
+              cache_manager_->TrimCache(
+                  request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
+    EXPECT_EQ(max_inflight, meta_backend->GetListKeysCallCount());
+    EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheSkipsPersistentResiduesAfterPartialFailure) {
+    auto *persistent = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, persistent);
+    const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+    auto cache = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, cache->Init("test_instance", backend_config));
+    ASSERT_EQ(EC_OK, cache->Open());
+
+    auto &backend_manager = *indexer->backend_manager_;
+    backend_manager.cache_backend_ = std::move(cache);
+    backend_manager.memory_primary_ = true;
+    backend_manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    AddDummyLocationsForTrim(1024, "missing_storage");
+
+    EXPECT_EQ(EC_ERROR,
+              cache_manager_->TrimCache(
+                  request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
+    EXPECT_EQ(0u, persistent->GetListKeysCallCount());
+    EXPECT_EQ(1u, persistent->GetSyncAllCallCount());
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheSyncsBeforeCleaningPersistentResidueWithEmptyLocal) {
+    auto *persistent = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, persistent);
+    const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+    auto cache = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, cache->Init("test_instance", backend_config));
+    ASSERT_EQ(EC_OK, cache->Open());
+
+    auto &backend_manager = *indexer->backend_manager_;
+    backend_manager.cache_backend_ = std::move(cache);
+    backend_manager.memory_primary_ = true;
+    backend_manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+
+    constexpr KeyType residue_key = 42;
+    CacheLocationMapVector locations(1);
+    auto residue_location = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/trim_residue?size=1")});
+    residue_location->set_id("residue");
+    locations[0].emplace(residue_location->id(), std::move(residue_location));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+              persistent->Put(request_context_.get(), {residue_key}, locations, PropertyMapVector(1)));
+
+    EXPECT_EQ(EC_OK,
+              cache_manager_->TrimCache(
+                  request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
+    EXPECT_EQ(1u, persistent->GetSyncAllCallCount());
+    EXPECT_FALSE(persistent->ListedKeysBeforeSyncAll());
+
+    std::vector<bool> exists;
+    EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, persistent->Exists(request_context_.get(), {residue_key}, exists));
+    EXPECT_EQ(std::vector<bool>{false}, exists);
 }
 
 TEST_F(CacheManagerTest, TestUnavailableStorage) {
@@ -2724,6 +3048,34 @@ TEST(ReportEventContractTest, SnapshotAndResponseFieldNumbersMatchContract) {
     EXPECT_EQ(4, proto::meta::ReportEventResponse::descriptor()->FindFieldByName("retry_after_ms")->number());
     EXPECT_EQ(5, proto::meta::ReportEventResponse::descriptor()->FindFieldByName("snapshot_required")->number());
     EXPECT_EQ(6, proto::meta::ReportEventResponse::descriptor()->FindFieldByName("extra_info")->number());
+}
+
+TEST_F(CacheManagerTest, TestLegacyEventCleanupCallbackIsSafeAfterCacheManagerDestruction) {
+    auto backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, backend);
+    proto::meta::ReportEventRequest request;
+    request.set_instance_id("test_instance");
+    request.set_host_ip_port("10.0.0.1:9000");
+    request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+    auto *event = request.add_events();
+    event->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+    event->mutable_node_register()->add_mediums("mem");
+    proto::meta::ReportEventResponse response;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+
+    EventReportBackend::CleanupCallback copied_callback;
+    {
+        std::lock_guard<std::mutex> lock(backend->cleanup_cb_mutex_);
+        copied_callback = backend->cleanup_callback_;
+    }
+    ASSERT_TRUE(copied_callback);
+
+    // EventReportBackend invokes a copied callback outside its callback lock.
+    // Model that exact shutdown race: CacheManager clears and destroys GC,
+    // then the already-copied callback returns without touching either object.
+    cache_manager_.reset();
+    EXPECT_NO_THROW(copied_callback("test_instance", "10.0.0.1:9000", 1));
+    backend->Close();
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_MissingEventReportBackendFailsClosed) {
@@ -4077,6 +4429,18 @@ TEST_F(CacheManagerTest, TestReportEventHeartbeatRecoveryCarriesSameRequestMutat
     EXPECT_EQ(0, delete_response.item_results_size());
     EXPECT_TRUE(QueryEventReportUris({delete_key}).empty());
 
+    CacheGarbageCollector::Config gc_config;
+    gc_config.enabled = true;
+    gc_config.event_report_cleanup_enabled = true;
+    auto collector = std::make_shared<CacheGarbageCollector>(gc_config,
+                                                             registry_manager_,
+                                                             cache_manager_->meta_indexer_manager_,
+                                                             registry_manager_->data_storage_manager(),
+                                                             cache_manager_->schedule_plan_executor_,
+                                                             metrics_registry_,
+                                                             cache_manager_->migration_manager_);
+    cache_manager_->cache_garbage_collector_ = collector;
+
     event_backend->SetNodeUnavailable("test_instance", host);
     auto heartbeat_then_snapshot = MakeSnapshotRequest(host, {{snapshot_key, "heartbeat_then_snapshot"}});
     const auto snapshot_event = heartbeat_then_snapshot.events(0);
@@ -4091,6 +4455,9 @@ TEST_F(CacheManagerTest, TestReportEventHeartbeatRecoveryCarriesSameRequestMutat
     EXPECT_EQ(0, snapshot_response.item_results_size());
     EXPECT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(snapshot_response.committed_snapshot_version()));
     ASSERT_EQ(1u, QueryEventReportUris({snapshot_key}).size());
+    EXPECT_EQ(snapshot_response.committed_snapshot_version(),
+              event_backend->GetSnapshotVersion({"test_instance", host}));
+    EXPECT_FALSE(event_backend->IsCleanupCallbackSet());
 }
 
 TEST_F(CacheManagerTest, TestReportEventRegisterThenFirstDeltaInSameRequest) {
@@ -7735,7 +8102,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         }
     }
 
-    // --- Test 2: EVENT_REPORT PREFIX + NFS (NFS on 300,500,700 should not affect event report peer selection) ---
+    // --- Test 2: EVENT_REPORT PREFIX + NFS compose one complete prefix ---
     {
         std::vector<BackendSelector> selectors = {
             {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
@@ -7754,12 +8121,14 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(5u, locs.size());
 
-        // peer_B wins with prefix=4 (keys 300,400,500,600)
+        // Both peer_A and peer_B compose a full prefix with NFS. peer_B wins
+        // because it covers more keys itself (300,400,500,600).
         // key 300 (index 0): event report + NFS = 2
         {
             const auto &kl = locs[0].cache_locations_view();
             ASSERT_EQ(2u, kl.size());
-            EXPECT_NE(std::string::npos, kl[0].location_specs()[0].uri().find("192.168.1.2"));
+            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, kl[0].type());
+            EXPECT_NE(std::string::npos, kl[1].location_specs()[0].uri().find("192.168.1.2"));
         }
         // key 400 (index 1): event report only = 1 (no NFS for 400)
         {
@@ -7772,7 +8141,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         {
             const auto &kl = locs[2].cache_locations_view();
             ASSERT_EQ(2u, kl.size());
-            EXPECT_NE(std::string::npos, kl[0].location_specs()[0].uri().find("192.168.1.2"));
+            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, kl[0].type());
+            EXPECT_NE(std::string::npos, kl[1].location_specs()[0].uri().find("192.168.1.2"));
         }
         // key 600 (index 3): event report only = 1 (no NFS for 600)
         {
@@ -7789,7 +8159,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         }
     }
 
-    // --- Test 3: EVENT_REPORT COVERAGE + NFS (NFS presence does not affect event report coverage selection) ---
+    // --- Test 3: EVENT_REPORT COVERAGE scores only hits beyond the NFS base ---
     {
         std::vector<BackendSelector> selectors = {
             {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
@@ -7808,15 +8178,18 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(5u, locs.size());
 
-        // peer_B covers most keys (300,400,500,600) = 4
+        // peer_A and peer_B each add 400 and 600 beyond the NFS base. peer_B
+        // wins the tie because it covers more keys itself.
         // key 300 (index 0): event report + NFS = 2
         ASSERT_EQ(2u, locs[0].cache_locations_view().size());
-        EXPECT_NE(std::string::npos, locs[0].cache_locations_view()[0].location_specs()[0].uri().find("192.168.1.2"));
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[0].cache_locations_view()[0].type());
+        EXPECT_NE(std::string::npos, locs[0].cache_locations_view()[1].location_specs()[0].uri().find("192.168.1.2"));
         // key 400 (index 1): event report only = 1
         ASSERT_EQ(1u, locs[1].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[1].cache_locations_view()[0].type());
         // key 500 (index 2): event report + NFS = 2
         ASSERT_EQ(2u, locs[2].cache_locations_view().size());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[2].cache_locations_view()[0].type());
         // key 600 (index 3): event report only = 1
         ASSERT_EQ(1u, locs[3].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[3].cache_locations_view()[0].type());
@@ -7857,7 +8230,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[4].cache_locations_view()[0].type());
     }
 
-    // --- Test 5: PREFIX stops when first key has no event report, but NFS still works ---
+    // --- Test 5: NFS at the first key lets PREFIX continue with one peer ---
     // keys = {700, 300, 400}; NFS exists for 700 and 300, not for 400
     {
         std::vector<int64_t> keys_no_er_first = {700, 300, 400};
@@ -7877,15 +8250,18 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackend) {
                                                                      selectors);
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(3u, locs.size());
-        // EVENT_REPORT PREFIX stops at key 700 → no event report for any key
         // key 700 (index 0): NFS only = 1
         ASSERT_EQ(1u, locs[0].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[0].cache_locations_view()[0].type());
-        // key 300 (index 1): NFS only = 1 (event report blocked by prefix)
-        ASSERT_EQ(1u, locs[1].cache_locations_view().size());
+        // key 300 (index 1): peer_A + NFS = 2
+        ASSERT_EQ(2u, locs[1].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[1].cache_locations_view()[0].type());
-        // key 400 (index 2): nothing (no event report from prefix, no NFS written)
-        EXPECT_TRUE(locs[2].cache_locations_view().empty());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[1].cache_locations_view()[1].type());
+        EXPECT_NE(std::string::npos, locs[1].cache_locations_view()[1].location_specs()[0].uri().find("192.168.1.1"));
+        // key 400 (index 2): peer_A continues the combined prefix
+        ASSERT_EQ(1u, locs[2].cache_locations_view().size());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[2].cache_locations_view()[0].type());
+        EXPECT_NE(std::string::npos, locs[2].cache_locations_view()[0].location_specs()[0].uri().find("192.168.1.1"));
     }
 
     // --- Test 6: COVERAGE skips keys with no event report, NFS fills gaps independently ---
@@ -8315,6 +8691,234 @@ TEST_F(CacheManagerTest, TestGetHostCacheStateConcurrentWithReportEventAndHostDo
         request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
     EXPECT_EQ(EC_OK, ec);
     EXPECT_TRUE(hosts.empty());
+}
+
+TEST_F(CacheManagerTest, TestGetHostCacheStateForV6DAndSubscriberReportingModes) {
+    auto make_backend = [&](const std::string &name, DataStorageType type) {
+        auto backend = std::make_shared<EventReportBackend>(metrics_registry_);
+        StorageConfig config;
+        config.set_global_unique_name(name);
+        config.set_type(type);
+        config.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        EXPECT_EQ(EC_OK, backend->Open(config, "v6d_subscriber_reporting_modes"));
+        backend->SetSnapshotMinIntervalMsForTest(0);
+        registry_manager_->data_storage_manager_->storage_map_[name] = backend;
+        return backend;
+    };
+    make_backend("reporting_modes_l1p5", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    make_backend("reporting_modes_l2", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"reporting_modes_l1p5", "reporting_modes_l2"});
+
+    auto register_instance = [&](const std::string &instance_id) {
+        ASSERT_EQ(std::make_pair(EC_OK, default_storage_configs),
+                  cache_manager_->RegisterInstance(request_context_.get(),
+                                                   "default",
+                                                   instance_id,
+                                                   64,
+                                                   createLocationSpecInfos(),
+                                                   createModelDeployment(),
+                                                   std::vector<LocationSpecGroup>(),
+                                                   CacheManager::QueryType::QT_PREFIX_MATCH));
+    };
+
+    auto report_block = [&](const std::string &instance_id,
+                            proto::meta::StorageType storage_type,
+                            const std::string &reporter,
+                            int64_t key,
+                            const std::string &uri) {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id(instance_id);
+        request.set_host_ip_port(reporter);
+        request.set_storage_type(storage_type);
+        auto *event = request.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *block = event->mutable_block_add();
+        block->set_block_key(std::to_string(key));
+        block->set_medium("mem");
+        auto *spec = block->add_specs();
+        spec->set_name("tp0");
+        spec->set_uri(uri);
+        proto::meta::ReportEventResponse response;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+    };
+
+    auto find_match = [](const std::vector<CacheManager::HostCacheMatch> &matches,
+                         const std::string &host) -> const CacheManager::HostCacheMatch * {
+        const auto it =
+            std::find_if(matches.begin(), matches.end(), [&](const auto &match) { return match.host_ip_port == host; });
+        return it == matches.end() ? nullptr : &*it;
+    };
+
+    // Case 1: ordinary mode. V6D and subscriber use the same unranked reporter
+    // identity, preserving the behavior before multi-engine support.
+    {
+        const std::string instance_id = "test_v6d_subscriber_ordinary";
+        const std::string host = "10.0.8.1:8080";
+        register_instance(instance_id);
+        InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L1P5);
+        InitializeEventReporter(instance_id, host, proto::meta::ST_EVENT_REPORT_L2);
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, host, 100, "event_report://10.0.8.1:9700/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, host, 200, "event_report://10.0.8.1:9600/mem");
+
+        auto [ec, matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200});
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ(host, matches[0].host_ip_port);
+        EXPECT_EQ(2, matches[0].local);
+    }
+
+    // Case 2: multi-engine with independent V6D. Both subscriber and V6D use
+    // the engine rank, and cache metadata must not leak between ranks.
+    {
+        const std::string instance_id = "test_v6d_subscriber_multi_engine_independent";
+        const std::string base = "10.0.8.2:8080";
+        const std::string rank0 = base + "@0";
+        const std::string rank1 = base + "@1";
+        register_instance(instance_id);
+        InitializeEventReporter(instance_id, rank0, proto::meta::ST_EVENT_REPORT_L1P5);
+        InitializeEventReporter(instance_id, rank0, proto::meta::ST_EVENT_REPORT_L2);
+        InitializeEventReporter(instance_id, rank1, proto::meta::ST_EVENT_REPORT_L1P5);
+        InitializeEventReporter(instance_id, rank1, proto::meta::ST_EVENT_REPORT_L2);
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, rank0, 100, "event_report://10.0.8.2:9700/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, rank0, 200, "event_report://10.0.8.2:9600/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, rank1, 100, "event_report://10.0.8.2:9701/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, rank1, 300, "event_report://10.0.8.2:9601/mem");
+
+        auto [rank0_ec, rank0_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200});
+        ASSERT_EQ(EC_OK, rank0_ec);
+        ASSERT_EQ(2u, rank0_matches.size());
+        ASSERT_NE(nullptr, find_match(rank0_matches, rank0));
+        ASSERT_NE(nullptr, find_match(rank0_matches, rank1));
+        EXPECT_EQ(2, find_match(rank0_matches, rank0)->local);
+        EXPECT_EQ(1, find_match(rank0_matches, rank1)->local);
+
+        auto [rank1_ec, rank1_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 300});
+        ASSERT_EQ(EC_OK, rank1_ec);
+        ASSERT_EQ(2u, rank1_matches.size());
+        ASSERT_NE(nullptr, find_match(rank1_matches, rank0));
+        ASSERT_NE(nullptr, find_match(rank1_matches, rank1));
+        EXPECT_EQ(1, find_match(rank1_matches, rank0)->local);
+        EXPECT_EQ(2, find_match(rank1_matches, rank1)->local);
+        EXPECT_EQ(nullptr, find_match(rank1_matches, base));
+
+        for (const std::string &invalid_reporter :
+             {base + "@", base + "@-1", base + "@rank", base + "@00", base + "@0@1"}) {
+            proto::meta::ReportEventRequest request;
+            request.set_instance_id(instance_id);
+            request.set_host_ip_port(invalid_reporter);
+            request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+            auto *event = request.add_events();
+            event->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+            event->mutable_node_register()->add_mediums("mem");
+            proto::meta::ReportEventResponse response;
+            EXPECT_EQ(EC_BADARGS, cache_manager_->ReportEvent(request_context_.get(), &request, &response));
+            EXPECT_EQ(proto::meta::INVALID_ARGUMENT, response.header().status().code());
+        }
+    }
+
+    // Case 3: multi-engine with shared V6D. Subscriber reporters are ranked,
+    // while the shared V6D reporter is projected onto every active rank.
+    {
+        const std::string instance_id = "test_v6d_subscriber_multi_engine_shared";
+        const std::string base = "10.0.8.3:8080";
+        const std::string rank0 = base + "@0";
+        const std::string rank1 = base + "@1";
+        register_instance(instance_id);
+        InitializeEventReporter(instance_id, rank0, proto::meta::ST_EVENT_REPORT_L1P5);
+        InitializeEventReporter(instance_id, rank1, proto::meta::ST_EVENT_REPORT_L1P5);
+        InitializeEventReporter(instance_id, base, proto::meta::ST_EVENT_REPORT_L2);
+
+        const std::string shared_v6d_uri = "event_report://10.0.8.3:9600/mem";
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L2, base, 100, shared_v6d_uri);
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, rank0, 200, "event_report://10.0.8.3:9700/mem");
+        report_block(instance_id, proto::meta::ST_EVENT_REPORT_L1P5, rank1, 300, "event_report://10.0.8.3:9701/mem");
+
+        auto [rank0_ec, rank0_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 200});
+        ASSERT_EQ(EC_OK, rank0_ec);
+        ASSERT_EQ(2u, rank0_matches.size());
+        ASSERT_NE(nullptr, find_match(rank0_matches, rank0));
+        ASSERT_NE(nullptr, find_match(rank0_matches, rank1));
+        EXPECT_EQ(2, find_match(rank0_matches, rank0)->local);
+        EXPECT_EQ(1, find_match(rank0_matches, rank1)->local);
+
+        auto [rank1_ec, rank1_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100, 300});
+        ASSERT_EQ(EC_OK, rank1_ec);
+        ASSERT_EQ(2u, rank1_matches.size());
+        ASSERT_NE(nullptr, find_match(rank1_matches, rank0));
+        ASSERT_NE(nullptr, find_match(rank1_matches, rank1));
+        EXPECT_EQ(1, find_match(rank1_matches, rank0)->local);
+        EXPECT_EQ(2, find_match(rank1_matches, rank1)->local);
+        EXPECT_EQ(nullptr, find_match(rank1_matches, base));
+
+        // Query-only rank projection must not duplicate or rewrite the physical
+        // shared V6D location returned by the data-access API.
+        const std::vector<BackendSelector> selectors = {
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
+        };
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [location_ec, locations] =
+            cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                       instance_id,
+                                                       CacheManager::QueryType::QT_BATCH_GET,
+                                                       {100},
+                                                       {},
+                                                       block_mask,
+                                                       0,
+                                                       {},
+                                                       selectors);
+        ASSERT_EQ(EC_OK, location_ec);
+        ASSERT_EQ(1u, locations.size());
+        ASSERT_EQ(1u, locations[0].cache_locations_view().size());
+        const auto &shared_location = locations[0].cache_locations_view()[0];
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, shared_location.type());
+        ASSERT_EQ(1u, shared_location.location_specs().size());
+        EXPECT_NE(std::string::npos, shared_location.location_specs()[0].uri().find(shared_v6d_uri));
+
+        // A rank lifecycle is isolated: after rank 0 goes down, shared L2 is only
+        // projected onto the still-active rank 1.
+        proto::meta::ReportEventRequest rank0_down;
+        rank0_down.set_instance_id(instance_id);
+        rank0_down.set_host_ip_port(rank0);
+        rank0_down.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+        rank0_down.add_events()->set_event_type(proto::meta::EVENT_HOST_DOWN);
+        rank0_down.mutable_events(0)->mutable_host_down();
+        proto::meta::ReportEventResponse rank0_down_response;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &rank0_down, &rank0_down_response));
+
+        auto [rank_down_ec, rank_down_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {100});
+        ASSERT_EQ(EC_OK, rank_down_ec);
+        ASSERT_EQ(1u, rank_down_matches.size());
+        EXPECT_EQ(rank1, rank_down_matches[0].host_ip_port);
+
+        // Shared V6D HOST_DOWN removes only the shared contribution. Rank 1's
+        // subscriber metadata remains visible and rank 0's metadata does not
+        // leak across the rank boundary.
+        proto::meta::ReportEventRequest shared_down;
+        shared_down.set_instance_id(instance_id);
+        shared_down.set_host_ip_port(base);
+        shared_down.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+        shared_down.add_events()->set_event_type(proto::meta::EVENT_HOST_DOWN);
+        shared_down.mutable_events(0)->mutable_host_down();
+        proto::meta::ReportEventResponse shared_down_response;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &shared_down, &shared_down_response));
+
+        auto [shared_down_ec, shared_down_matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {300});
+        ASSERT_EQ(EC_OK, shared_down_ec);
+        ASSERT_EQ(1u, shared_down_matches.size());
+        EXPECT_EQ(rank1, shared_down_matches[0].host_ip_port);
+        EXPECT_EQ(1, shared_down_matches[0].local);
+    }
+
+    registry_manager_->data_storage_manager_->storage_map_.erase("reporting_modes_l1p5");
+    registry_manager_->data_storage_manager_->storage_map_.erase("reporting_modes_l2");
 }
 
 TEST_F(CacheManagerTest, TestGetHostCacheState) {

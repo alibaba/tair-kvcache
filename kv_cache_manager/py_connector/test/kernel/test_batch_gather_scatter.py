@@ -31,7 +31,7 @@ def test_batch_gather_kv_caches():
             total_token_in_kvcache,
             hidden_size_per_token_per_layer,
             device="cuda",
-            dtype=torch.bfloat16
+            dtype=torch.bfloat16,
         )
         # 将K和V分开添加到列表中，这样每个都是单独的指针
         kv_caches.append(cache[0])  # K
@@ -39,9 +39,7 @@ def test_batch_gather_kv_caches():
 
     # 创建KV缓存指针tensor - 现在应该有num_layers * 2个指针
     kv_caches_ptrs_tensor = torch.tensor(
-        [cache.data_ptr() for cache in kv_caches],
-        device="cuda",
-        dtype=torch.int64
+        [cache.data_ptr() for cache in kv_caches], device="cuda", dtype=torch.int64
     )
 
     # 更新num_kvcache_ptrs为正确的值
@@ -56,7 +54,7 @@ def test_batch_gather_kv_caches():
         hidden_size_per_token_per_layer,
         device="cpu",
         dtype=torch.bfloat16,
-        pin_memory=True
+        pin_memory=True,
     )
     dst_tensor.zero_()
 
@@ -65,7 +63,9 @@ def test_batch_gather_kv_caches():
     block_token_indices = []
     for block_idx in range(total_blocks):
         # 每个block的token indices需要在[0, total_token_in_kvcache)范围内
-        block_indices = torch.randperm(total_token_in_kvcache)[:num_tokens_per_block].tolist()
+        block_indices = torch.randperm(total_token_in_kvcache)[
+            :num_tokens_per_block
+        ].tolist()
         block_token_indices.extend(block_indices)
 
     # 生成dst block indices
@@ -96,22 +96,36 @@ def test_batch_gather_kv_caches():
             token_idx = block_token_indices[start_idx + token_pos]
             for layer_idx in range(num_layers):
                 # 检查K值 - K存储在layer_idx*2的位置
-                gathered_k = dst_tensor[dst_block_idx, layer_idx * 2, token_pos, :]  # 当前block，第layer_idx层，K部分
+                gathered_k = dst_tensor[
+                    dst_block_idx, layer_idx * 2, token_pos, :
+                ]  # 当前block，第layer_idx层，K部分
                 # 注意：现在kv_caches是已分离的K和V，K在偶数索引(0, 2, 4...)
                 expected_k = kv_caches_cpu[layer_idx * 2][token_idx, :]  # 对应的原始K值
                 # expected_k = expected_k.to(device=gathered_k.device)
-                torch.testing.assert_close(gathered_k, expected_k,
-                                           msg="Mismatch in K values for block {}, layer {}, token {} {} {}".format(
-                                               block_idx, layer_idx, token_idx, gathered_k, expected_k))
+                torch.testing.assert_close(
+                    gathered_k,
+                    expected_k,
+                    msg="Mismatch in K values for block {}, layer {}, token {} {} {}".format(
+                        block_idx, layer_idx, token_idx, gathered_k, expected_k
+                    ),
+                )
 
                 # 检查V值 - V存储在layer_idx*2+1的位置
-                gathered_v = dst_tensor[dst_block_idx, layer_idx * 2 + 1, token_pos, :]  # 当前block，第layer_idx层，V部分
+                gathered_v = dst_tensor[
+                    dst_block_idx, layer_idx * 2 + 1, token_pos, :
+                ]  # 当前block，第layer_idx层，V部分
                 # 注意：现在kv_caches是已分离的K和V，V在奇数索引(1, 3, 5...)
-                expected_v = kv_caches_cpu[layer_idx * 2 + 1][token_idx, :]  # 对应的原始V值
+                expected_v = kv_caches_cpu[layer_idx * 2 + 1][
+                    token_idx, :
+                ]  # 对应的原始V值
                 # expected_v = expected_v.to(device=gathered_v.device)
-                torch.testing.assert_close(gathered_v, expected_v,
-                                           msg="Mismatch in V values for block {}, layer {}, token {}".format(
-                                               block_idx, layer_idx, token_idx))
+                torch.testing.assert_close(
+                    gathered_v,
+                    expected_v,
+                    msg="Mismatch in V values for block {}, layer {}, token {}".format(
+                        block_idx, layer_idx, token_idx
+                    ),
+                )
 
     print("Batch gather KV caches test passed!")
 
@@ -141,7 +155,7 @@ def test_batch_gather_kv_caches_with_reference():
             total_token_in_kvcache,
             hidden_size_per_token_per_layer,
             device="cuda",
-            dtype=torch.bfloat16
+            dtype=torch.bfloat16,
         )
         original_caches.append(cache.clone())  # 保存原始值用于验证
 
@@ -157,7 +171,7 @@ def test_batch_gather_kv_caches_with_reference():
         num_tokens_per_block,
         hidden_size_per_token_per_layer,
         device="cuda",
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
     )
 
     # 创建目标tensor用于参考实现
@@ -167,14 +181,16 @@ def test_batch_gather_kv_caches_with_reference():
         num_tokens_per_block,
         hidden_size_per_token_per_layer,
         device="cuda",
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
     )
 
     # 为每个block生成token indices
     all_block_token_indices = []
     block_token_indices_per_block = []
     for block_idx in range(total_blocks):
-        block_indices = torch.randperm(total_token_in_kvcache)[:num_tokens_per_block].tolist()
+        block_indices = torch.randperm(total_token_in_kvcache)[
+            :num_tokens_per_block
+        ].tolist()
         all_block_token_indices.extend(block_indices)
         block_token_indices_per_block.append(block_indices)
 
@@ -182,9 +198,7 @@ def test_batch_gather_kv_caches_with_reference():
 
     # 调用批量gather函数
     kv_caches_ptrs_tensor = torch.tensor(
-        [cache.data_ptr() for cache in kv_caches],
-        device="cuda",
-        dtype=torch.int64
+        [cache.data_ptr() for cache in kv_caches], device="cuda", dtype=torch.int64
     )
 
     batch_gather_kv_caches(
@@ -194,7 +208,7 @@ def test_batch_gather_kv_caches_with_reference():
         dst_block_indices,
         num_tokens_per_block,
         hidden_size_per_token_per_layer,
-        num_layers * kv_count  # 修正参数
+        num_layers * kv_count,  # 修正参数
     )
 
     # 使用PyTorch实现参考实现
@@ -205,15 +219,22 @@ def test_batch_gather_kv_caches_with_reference():
             for layer_idx in range(num_layers):
                 # 计算参考实现结果 - K值
                 reference_k = original_caches[layer_idx][0, token_idx, :]
-                reference_dst_tensor[dst_block_idx, layer_idx * 2, token_pos, :] = reference_k
+                reference_dst_tensor[dst_block_idx, layer_idx * 2, token_pos, :] = (
+                    reference_k
+                )
 
                 # 计算参考实现结果 - V值
                 reference_v = original_caches[layer_idx][1, token_idx, :]
-                reference_dst_tensor[dst_block_idx, layer_idx * 2 + 1, token_pos, :] = reference_v
+                reference_dst_tensor[dst_block_idx, layer_idx * 2 + 1, token_pos, :] = (
+                    reference_v
+                )
 
     # 直接比较整个dst_tensor和参考实现的结果
-    torch.testing.assert_close(dst_tensor, reference_dst_tensor,
-                               msg="Mismatch between kernel and reference implementation for dst_tensor")
+    torch.testing.assert_close(
+        dst_tensor,
+        reference_dst_tensor,
+        msg="Mismatch between kernel and reference implementation for dst_tensor",
+    )
 
     print("Batch gather KV caches test with reference passed!")
 
@@ -241,7 +262,7 @@ def test_batch_gather_edge_cases():
             total_token_in_kvcache,
             hidden_size_per_token_per_layer,
             device="cuda",
-            dtype=torch.bfloat16
+            dtype=torch.bfloat16,
         )
         # 将K和V分开添加到列表中，这样每个都是单独的指针
         kv_caches.append(cache[0])  # K
@@ -255,7 +276,7 @@ def test_batch_gather_edge_cases():
         num_tokens_per_block,
         hidden_size_per_token_per_layer,
         device="cuda",
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
     )
 
     # 定义token indices和block indices
@@ -265,15 +286,14 @@ def test_batch_gather_edge_cases():
     # 保存特定位置的原始值用于验证
     # cache[0]是K，cache[1]是V，我们已经将它们分离到不同的tensor中
     original_cache = torch.stack(
-        [kv_caches[0], kv_caches[1]])  # 重新构成[2, total_token_in_kvcache, hidden_size_per_token_per_layer]
+        [kv_caches[0], kv_caches[1]]
+    )  # 重新构成[2, total_token_in_kvcache, hidden_size_per_token_per_layer]
     expected_k = original_cache[0, 5, :].clone()  # 第0层，K部分，位置5
     expected_v = original_cache[1, 5, :].clone()  # 第0层，V部分，位置5
 
     # 调用批量gather函数
     kv_caches_ptrs_tensor = torch.tensor(
-        [cache.data_ptr() for cache in kv_caches],
-        device="cuda",
-        dtype=torch.int64
+        [cache.data_ptr() for cache in kv_caches], device="cuda", dtype=torch.int64
     )
 
     batch_gather_kv_caches(
@@ -283,17 +303,19 @@ def test_batch_gather_edge_cases():
         dst_block_indices,
         num_tokens_per_block,
         hidden_size_per_token_per_layer,
-        num_layers * kv_count  # 修正参数
+        num_layers * kv_count,  # 修正参数
     )
 
     # 验证结果
     actual_k = dst_tensor[0, 0, 0, :]  # 第0个block，第0个指针(K)，第0个token位置
     actual_v = dst_tensor[0, 1, 0, :]  # 第0个block，第1个指针(V)，第0个token位置
 
-    torch.testing.assert_close(expected_k, actual_k,
-                               msg="Mismatch in K values for edge case")
-    torch.testing.assert_close(expected_v, actual_v,
-                               msg="Mismatch in V values for edge case")
+    torch.testing.assert_close(
+        expected_k, actual_k, msg="Mismatch in K values for edge case"
+    )
+    torch.testing.assert_close(
+        expected_v, actual_v, msg="Mismatch in V values for edge case"
+    )
 
     print("Gather edge case test passed!")
 
@@ -322,7 +344,7 @@ def test_batch_scatter_kv_caches():
             total_token_in_kvcache,
             hidden_size_per_token_per_layer,
             device="cuda",
-            dtype=torch.bfloat16
+            dtype=torch.bfloat16,
         )
         original_caches.append(cache.clone())  # 保存零值作为原始状态
         # 将K和V分开添加到列表中，这样每个都是单独的指针
@@ -331,9 +353,7 @@ def test_batch_scatter_kv_caches():
 
     # 创建KV缓存指针tensor
     kv_caches_ptrs_tensor = torch.tensor(
-        [cache.data_ptr() for cache in kv_caches],
-        device="cuda",
-        dtype=torch.int64
+        [cache.data_ptr() for cache in kv_caches], device="cuda", dtype=torch.int64
     )
 
     # 创建源tensor，包含要scatter的数据
@@ -345,12 +365,14 @@ def test_batch_scatter_kv_caches():
         hidden_size_per_token_per_layer,
         device="cpu",  # 注意：scatter函数期望host memory (pinned memory)
         dtype=torch.bfloat16,
-        pin_memory=True  # 设置为pinned memory
+        pin_memory=True,  # 设置为pinned memory
     )
 
     # 生成block token indices
     # 每个block有num_tokens_per_block个token，总共total_blocks个block
-    block_token_indices = torch.randperm(total_token_in_kvcache)[:num_tokens_per_block * total_blocks].tolist()
+    block_token_indices = torch.randperm(total_token_in_kvcache)[
+        : num_tokens_per_block * total_blocks
+    ].tolist()
 
     # 生成src block indices
     src_block_indices = torch.randperm(total_buffer_blocks)[:total_blocks].tolist()
@@ -363,7 +385,7 @@ def test_batch_scatter_kv_caches():
         src_block_indices,
         num_tokens_per_block,
         hidden_size_per_token_per_layer,
-        sm_count=3
+        sm_count=3,
     )
 
     kv_caches_cpu = []
@@ -379,18 +401,34 @@ def test_batch_scatter_kv_caches():
             token_idx = block_token_indices[start_idx + token_pos]
             for layer_idx in range(num_layers):
                 # 检查K值
-                scattered_k = kv_caches_cpu[layer_idx * 2][token_idx, :]  # 层layer_idx的K部分
-                expected_k = src_tensor[src_block_idx, layer_idx * 2, token_pos, :].cpu()  # 对应的源K值
-                torch.testing.assert_close(scattered_k, expected_k,
-                                           msg="Mismatch in K values for block {}, layer {}, token {}".format(
-                                               block_idx, layer_idx, token_idx))
+                scattered_k = kv_caches_cpu[layer_idx * 2][
+                    token_idx, :
+                ]  # 层layer_idx的K部分
+                expected_k = src_tensor[
+                    src_block_idx, layer_idx * 2, token_pos, :
+                ].cpu()  # 对应的源K值
+                torch.testing.assert_close(
+                    scattered_k,
+                    expected_k,
+                    msg="Mismatch in K values for block {}, layer {}, token {}".format(
+                        block_idx, layer_idx, token_idx
+                    ),
+                )
 
                 # 检查V值
-                scattered_v = kv_caches_cpu[layer_idx * 2 + 1][token_idx, :]  # 层layer_idx的V部分
-                expected_v = src_tensor[src_block_idx, layer_idx * 2 + 1, token_pos, :].cpu()  # 对应的源V值
-                torch.testing.assert_close(scattered_v, expected_v,
-                                           msg="Mismatch in V values for block {}, layer {}, token {}".format(
-                                               block_idx, layer_idx, token_idx))
+                scattered_v = kv_caches_cpu[layer_idx * 2 + 1][
+                    token_idx, :
+                ]  # 层layer_idx的V部分
+                expected_v = src_tensor[
+                    src_block_idx, layer_idx * 2 + 1, token_pos, :
+                ].cpu()  # 对应的源V值
+                torch.testing.assert_close(
+                    scattered_v,
+                    expected_v,
+                    msg="Mismatch in V values for block {}, layer {}, token {}".format(
+                        block_idx, layer_idx, token_idx
+                    ),
+                )
 
     print("Batch scatter KV caches test passed!")
 
@@ -419,7 +457,7 @@ def test_batch_scatter_kv_caches_with_reference():
             total_token_in_kvcache,
             hidden_size_per_token_per_layer,
             device="cuda",
-            dtype=torch.bfloat16
+            dtype=torch.bfloat16,
         )
         original_caches.append(cache.clone())  # 保存原始值用于验证
         # 将K和V分开添加到列表中，这样每个都是单独的指针
@@ -434,11 +472,13 @@ def test_batch_scatter_kv_caches_with_reference():
         hidden_size_per_token_per_layer,
         device="cpu",  # scatter函数期望host memory
         dtype=torch.bfloat16,
-        pin_memory=True  # 设置为pinned memory
+        pin_memory=True,  # 设置为pinned memory
     )
 
     # 为每个block生成token indices
-    all_block_token_indices = torch.randperm(total_token_in_kvcache)[:num_tokens_per_block * total_blocks].tolist()
+    all_block_token_indices = torch.randperm(total_token_in_kvcache)[
+        : num_tokens_per_block * total_blocks
+    ].tolist()
 
     src_block_indices = torch.randperm(total_buffer_blocks)[:total_blocks].tolist()
 
@@ -450,7 +490,7 @@ def test_batch_scatter_kv_caches_with_reference():
             total_token_in_kvcache,
             hidden_size_per_token_per_layer,
             device="cuda",
-            dtype=torch.bfloat16
+            dtype=torch.bfloat16,
         )
         # 将K和V分开添加到列表中，这样每个都是单独的指针
         reference_kv_caches.append(cache[0])  # K
@@ -458,9 +498,7 @@ def test_batch_scatter_kv_caches_with_reference():
 
     # 调用批量scatter函数
     kv_caches_ptrs_tensor = torch.tensor(
-        [cache.data_ptr() for cache in kv_caches],
-        device="cuda",
-        dtype=torch.int64
+        [cache.data_ptr() for cache in kv_caches], device="cuda", dtype=torch.int64
     )
 
     batch_scatter_kv_caches(
@@ -470,7 +508,7 @@ def test_batch_scatter_kv_caches_with_reference():
         src_block_indices,
         num_tokens_per_block,
         hidden_size_per_token_per_layer,
-        sm_count=3
+        sm_count=3,
     )
 
     # 使用PyTorch实现参考实现
@@ -481,17 +519,30 @@ def test_batch_scatter_kv_caches_with_reference():
             token_idx = all_block_token_indices[start_idx + token_pos]
             for layer_idx in range(num_layers):
                 # 参考实现 - 更新K值
-                src_k = src_tensor[src_block_idx, layer_idx * 2, token_pos, :].to(device=reference_kv_caches[layer_idx * 2].device, dtype=reference_kv_caches[layer_idx * 2].dtype)
+                src_k = src_tensor[src_block_idx, layer_idx * 2, token_pos, :].to(
+                    device=reference_kv_caches[layer_idx * 2].device,
+                    dtype=reference_kv_caches[layer_idx * 2].dtype,
+                )
                 reference_kv_caches[layer_idx * 2][token_idx, :] = src_k
 
                 # 参考实现 - 更新V值
-                src_v = src_tensor[src_block_idx, layer_idx * 2 + 1, token_pos, :].to(device=reference_kv_caches[layer_idx * 2 + 1].device, dtype=reference_kv_caches[layer_idx * 2 + 1].dtype)
+                src_v = src_tensor[src_block_idx, layer_idx * 2 + 1, token_pos, :].to(
+                    device=reference_kv_caches[layer_idx * 2 + 1].device,
+                    dtype=reference_kv_caches[layer_idx * 2 + 1].dtype,
+                )
                 reference_kv_caches[layer_idx * 2 + 1][token_idx, :] = src_v
 
     # 直接比较整个KV缓存和参考实现的结果
-    for idx, (actual_cache, reference_cache) in enumerate(zip(kv_caches, reference_kv_caches)):
-        torch.testing.assert_close(actual_cache, reference_cache,
-                                   msg="Mismatch between kernel and reference implementation for kvcache index {}".format(idx))
+    for idx, (actual_cache, reference_cache) in enumerate(
+        zip(kv_caches, reference_kv_caches)
+    ):
+        torch.testing.assert_close(
+            actual_cache,
+            reference_cache,
+            msg="Mismatch between kernel and reference implementation for kvcache index {}".format(
+                idx
+            ),
+        )
 
     print("Batch scatter KV caches test with reference passed!")
 
@@ -519,7 +570,7 @@ def test_batch_scatter_edge_cases():
             total_token_in_kvcache,
             hidden_size_per_token_per_layer,
             device="cuda",
-            dtype=torch.bfloat16
+            dtype=torch.bfloat16,
         )
         original_caches.append(cache.clone())  # 保存原始值用于验证
         # 将K和V分开添加到列表中，这样每个都是单独的指针
@@ -534,7 +585,7 @@ def test_batch_scatter_edge_cases():
         hidden_size_per_token_per_layer,
         device="cpu",  # scatter函数期望host memory
         dtype=torch.bfloat16,
-        pin_memory=True  # 设置为pinned memory
+        pin_memory=True,  # 设置为pinned memory
     )
 
     # 定义token indices和block indices
@@ -542,14 +593,16 @@ def test_batch_scatter_edge_cases():
     src_block_indices = [0]  # 只有一个block，位置为0
 
     # 保存源tensor的值用于验证
-    expected_k = src_tensor[0, 0, 0, :].clone()  # 第0个block，第0个指针(K)，第0个token位置
-    expected_v = src_tensor[0, 1, 0, :].clone()  # 第0个block，第1个指针(V)，第0个token位置
+    expected_k = src_tensor[
+        0, 0, 0, :
+    ].clone()  # 第0个block，第0个指针(K)，第0个token位置
+    expected_v = src_tensor[
+        0, 1, 0, :
+    ].clone()  # 第0个block，第1个指针(V)，第0个token位置
 
     # 调用批量scatter函数
     kv_caches_ptrs_tensor = torch.tensor(
-        [cache.data_ptr() for cache in kv_caches],
-        device="cuda",
-        dtype=torch.int64
+        [cache.data_ptr() for cache in kv_caches], device="cuda", dtype=torch.int64
     )
 
     batch_scatter_kv_caches(
@@ -559,20 +612,26 @@ def test_batch_scatter_edge_cases():
         src_block_indices,
         num_tokens_per_block,
         hidden_size_per_token_per_layer,
-        sm_count=3
+        sm_count=3,
     )
 
     # 验证结果
     actual_k = kv_caches[0][5, :]  # 位置5的K值
     actual_v = kv_caches[1][5, :]  # 位置5的V值
 
-    expected_k_converted = expected_k.cpu().to(device=actual_k.device, dtype=actual_k.dtype)
-    expected_v_converted = expected_v.cpu().to(device=actual_v.device, dtype=actual_v.dtype)
+    expected_k_converted = expected_k.cpu().to(
+        device=actual_k.device, dtype=actual_k.dtype
+    )
+    expected_v_converted = expected_v.cpu().to(
+        device=actual_v.device, dtype=actual_v.dtype
+    )
 
-    torch.testing.assert_close(expected_k_converted, actual_k,
-                               msg="Mismatch in K values for edge case")
-    torch.testing.assert_close(expected_v_converted, actual_v,
-                               msg="Mismatch in V values for edge case")
+    torch.testing.assert_close(
+        expected_k_converted, actual_k, msg="Mismatch in K values for edge case"
+    )
+    torch.testing.assert_close(
+        expected_v_converted, actual_v, msg="Mismatch in V values for edge case"
+    )
 
     print("Scatter edge case test passed!")
 

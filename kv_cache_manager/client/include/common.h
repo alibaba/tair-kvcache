@@ -172,6 +172,14 @@ struct RegistSpan {
     [[nodiscard]] uint64_t base_as_uint64() const { return reinterpret_cast<uint64_t>(base); }
 };
 
+// Keep shared-memory metadata separate from RegistSpan so existing callers
+// retain the original ABI.
+struct SharedMemoryRegistration {
+    void *base{nullptr};
+    size_t size{0};
+    int fd{-1};
+};
+
 struct InitParams {
     RoleType role_type{RoleType::UNKNOWN};
     RegistSpan *regist_span{nullptr};    // used by worker

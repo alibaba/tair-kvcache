@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -46,6 +47,37 @@ void MetaDummyBackendTest::ConstructMetaStorageBackendConfig() {
         std::remove(local_path.c_str());
     }
     meta_storage_backend_config_->SetStorageUri("file://" + local_path);
+}
+
+TEST_F(MetaDummyBackendTest, TestGroupLruMaintenanceReadsDoNotRefreshAccessTime) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("maintenance_no_touch", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id("loc");
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK}),
+        meta_storage_backend_->Put(
+            nullptr, {1}, CacheLocationMapVector{{{"loc", location}}}, PropertyMapVector{{{PROPERTY_HIT_COUNT, "3"}}}));
+    ReclaimCandidateVector before, after;
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimCandidates(nullptr, 1, before, true));
+    ASSERT_EQ(1, before.size());
+    EXPECT_EQ(1, before[0].key);
+    for (int repeat = 0; repeat < 5; ++repeat) {
+        KeyVector sampled;
+        ASSERT_EQ(EC_OK, SampleReclaimKeysForTest(meta_storage_backend_.get(), 1, sampled));
+        EXPECT_EQ((KeyVector{1}), sampled);
+        CacheLocationMapVector locations;
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}),
+                  meta_storage_backend_->GetLocationMapsForMaintenance(nullptr, {1, 2}, locations));
+        ASSERT_EQ(2, locations.size());
+        EXPECT_EQ(1, locations[0].count("loc"));
+        EXPECT_TRUE(locations[1].empty());
+        ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimCandidates(nullptr, 1, after, true));
+        ASSERT_EQ(1, after.size());
+        EXPECT_EQ(before[0].key, after[0].key);
+        EXPECT_EQ(before[0].last_access_time_us, after[0].last_access_time_us);
+    }
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
 TEST_F(MetaDummyBackendTest, TestSimple) {
@@ -353,6 +385,50 @@ TEST_F(MetaDummyBackendTest, TestRandomSample) {
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, ErrorCode::EC_OK, {1, 2});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 2, ErrorCode::EC_OK, {1, 2});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 3, ErrorCode::EC_OK, {1, 2});
+
+    auto *backend = static_cast<MetaDummyBackend *>(meta_storage_backend_.get());
+    auto snapshot_lru_times = [backend]() {
+        std::map<KeyType, std::string> lru_times;
+        backend->table_.ForEachKV([&lru_times](const KeyType &key, const DummyItem &item) {
+            lru_times[key] = item.properties.at(PROPERTY_LRU_TIME);
+            return true;
+        });
+        return lru_times;
+    };
+    const auto lru_times_before = snapshot_lru_times();
+    ReclaimCandidateVector candidates;
+    ASSERT_EQ(ErrorCode::EC_OK, backend->SampleReclaimCandidates(nullptr, 2, candidates));
+    ASSERT_EQ(2, candidates.size());
+    for (const auto &candidate : candidates) {
+        ASSERT_TRUE(lru_times_before.count(candidate.key) > 0);
+        EXPECT_EQ(std::stoll(lru_times_before.at(candidate.key)), candidate.last_access_time_us);
+    }
+    EXPECT_EQ(lru_times_before, snapshot_lru_times());
+
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
+}
+
+TEST_F(MetaDummyBackendTest, TestSampleReclaimCandidatesDegradesMalformedTimestampsToZero) {
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_storage_backend_->Init("test_reclaim_timestamp_parse", meta_storage_backend_config_));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
+
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK}),
+              meta_storage_backend_->Put(nullptr, {1, 2, 3}, CacheLocationMapVector(3), PropertyMapVector(3)));
+    auto *backend = static_cast<MetaDummyBackend *>(meta_storage_backend_.get());
+    ASSERT_TRUE(
+        backend->table_.FindAndModify(1, [](DummyItem &item) { item.properties[PROPERTY_LRU_TIME] = "123bad"; }));
+    ASSERT_TRUE(backend->table_.FindAndModify(
+        2, [](DummyItem &item) { item.properties[PROPERTY_LRU_TIME] = "9223372036854775808"; }));
+    ASSERT_TRUE(backend->table_.FindAndModify(
+        3, [](DummyItem &item) { item.properties[PROPERTY_LRU_TIME] = "-9223372036854775809"; }));
+
+    ReclaimCandidateVector candidates;
+    ASSERT_EQ(ErrorCode::EC_OK, backend->SampleReclaimCandidates(nullptr, 3, candidates));
+    ASSERT_EQ(3, candidates.size());
+    for (const auto &candidate : candidates) {
+        EXPECT_EQ(0, candidate.last_access_time_us) << candidate.key;
+    }
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }

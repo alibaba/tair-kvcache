@@ -112,6 +112,9 @@ curl -g -vvv -X POST http://localhost:6492/api/listStorage \
 ```
 
 ## Create Instance Group
+
+`reclaim_strategy.instance_reclaim_budget_policy` 可选 `GROUP_LRU`（默认，跨 Instance 按访问时间逐出）、`USAGE_PROPORTIONAL`（用量比例预算加跨轮轮转）和 `FIXED_PER_INSTANCE`（旧固定预算）。已有显式配置不会被新默认值覆盖。Group LRU 仅支持 `POLICY_LRU` 或 `POLICY_UNSPECIFIED`；升级、旧客户端零值和回滚约束见[配置指南](../configuration.md)。以下示例显式选择容量比例模式。
+
 ```bash
 curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
   -H "Content-Type: application/json" \
@@ -142,7 +145,8 @@ curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
                 },
                 "trigger_period_seconds": 60,
                 "reclaim_step_size": 1073741824,
-                "reclaim_step_percentage": 10
+                "reclaim_step_percentage": 10,
+                "instance_reclaim_budget_policy": "USAGE_PROPORTIONAL"
             },
             "data_storage_strategy": "CPS_PREFER_3FS",
             "meta_indexer_config": {
@@ -193,7 +197,8 @@ curl -g -vvv -X POST http://localhost:6492/api/createInstanceGroup \
                 "trigger_period_seconds": 60,
                 "reclaim_step_size": 1073741824,
                 "reclaim_step_percentage": 10,
-                "delay_before_delete_ms": 1000
+                "delay_before_delete_ms": 1000,
+                "instance_reclaim_budget_policy": "USAGE_PROPORTIONAL"
             },
             "data_storage_strategy": "CPS_PREFER_3FS",
             "meta_indexer_config": {
@@ -249,7 +254,8 @@ curl -g -vvv -X POST http://localhost:6492/api/updateInstanceGroup \
                 "trigger_period_seconds": 60,
                 "reclaim_step_size": 1073741824,
                 "reclaim_step_percentage": 10,
-                "delay_before_delete_ms": 1000
+                "delay_before_delete_ms": 1000,
+                "instance_reclaim_budget_policy": "USAGE_PROPORTIONAL"
             },
             "data_storage_strategy": "CPS_PREFER_3FS",
             "meta_indexer_config": {

@@ -1,5 +1,6 @@
 #include "kv_cache_manager/service/admin_service_impl.h"
 
+#include <map>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -7,6 +8,7 @@
 #include <variant>
 #include <vector>
 
+#include "google/protobuf/message.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -17,6 +19,7 @@
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
@@ -27,15 +30,21 @@
 #include "kv_cache_manager/service/util/proto_message_json_util.h"
 #include "kv_cache_manager/service/util/service_call_guard.h"
 
+namespace {
+
+kv_cache_manager::RequestContext::JsonFragment BuildProtoMessageDebugJson(const google::protobuf::Message *message) {
+    kv_cache_manager::RequestContext::JsonFragment fragment;
+    fragment.valid = kv_cache_manager::ProtoMessageJsonUtil::ToJson(message, fragment.json);
+    return fragment;
+}
+
+} // namespace
+
 // TODO(rui): move into common.h
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
-    {                                                                                                                  \
-        std::string request_debug;                                                                                     \
-        ProtoMessageJsonUtil::ToJson(request, request_debug);                                                          \
-        request_context->set_request_debug(request_debug);                                                             \
-    }                                                                                                                  \
+    request_context->set_request_debug_json(BuildProtoMessageDebugJson(request));                                      \
     if (!CheckAndIncrementRequestCount(is_leader_only)) {                                                              \
         auto *header = response->mutable_header();                                                                     \
         auto *status = header->mutable_status();                                                                       \
@@ -45,13 +54,11 @@
         KVCM_LOG_INFO("[traceId: %s] %s rejected: service not ready", request->trace_id().c_str(), api_name);          \
         return;                                                                                                        \
     }                                                                                                                  \
-    ServiceCallGuard service_call_guard(                                                                               \
-        cache_manager_.get(), request_context, metrics_reporter_.get(), [request_context, response, this]() {          \
-            std::string response_debug;                                                                                \
-            ProtoMessageJsonUtil::ToJson(response, response_debug);                                                    \
-            request_context->set_response_debug(response_debug);                                                       \
-            DecrementRequestCount(is_leader_only);                                                                     \
-        });
+    request_context->set_response_debug_json_generator([response]() { return BuildProtoMessageDebugJson(response); },  \
+                                                       RequestContext::ResponseJsonKind::kFullMessage);                \
+    ServiceCallGuard service_call_guard(cache_manager_.get(), request_context, metrics_reporter_.get(), [this]() {     \
+        DecrementRequestCount(is_leader_only);                                                                         \
+    });
 
 // 这里的字段检测不包含任何基本数据类型，例如int32、int64、bool等
 #define CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN(api_name, manager_req, single_field)                               \
@@ -75,6 +82,29 @@
 namespace {
 kv_cache_manager::proto::admin::ErrorCode ToAdminPbError(kv_cache_manager::ErrorCode ec) {
     return kv_cache_manager::ToPbError<kv_cache_manager::proto::admin::ErrorCode>(ec);
+}
+
+bool HasUniqueEventReportOwnerPerType(const std::shared_ptr<kv_cache_manager::RegistryManager> &registry_manager,
+                                      const kv_cache_manager::InstanceGroup &group,
+                                      std::string &invalid_fields) {
+    const auto storage_manager = registry_manager ? registry_manager->data_storage_manager() : nullptr;
+    if (!storage_manager) {
+        return true;
+    }
+    std::map<kv_cache_manager::DataStorageType, std::string> owner_by_type;
+    for (const auto &storage_name : group.event_report_storage_candidates()) {
+        const auto backend = std::dynamic_pointer_cast<kv_cache_manager::EventReportBackend>(
+            storage_manager->GetDataStorageBackend(storage_name));
+        if (!backend) {
+            continue;
+        }
+        const auto [it, inserted] = owner_by_type.emplace(backend->GetStorageType(), storage_name);
+        if (!inserted && it->second != storage_name) {
+            invalid_fields += "{InstanceGroup: {event_report_storage_candidates_duplicate_type}}";
+            return false;
+        }
+    }
+    return true;
 }
 } // anonymous namespace
 
@@ -285,6 +315,9 @@ void AdminServiceImpl::CreateInstanceGroup(RequestContext *request_context,
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("CreateInstanceGroup", "InstanceGroup", false);
         return;
     }
+    if (!HasUniqueEventReportOwnerPerType(registry_manager_, instance_group_req, invalid_fields)) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("CreateInstanceGroup", "InstanceGroup", false);
+    }
     ErrorCode ec_info = registry_manager_->CreateInstanceGroup(request_context, instance_group_req);
     if (ec_info != EC_OK) {
         status->set_code(proto::admin::INTERNAL_ERROR);
@@ -314,6 +347,9 @@ void AdminServiceImpl::UpdateInstanceGroup(RequestContext *request_context,
     }
     ProtoConvert::InstanceGroupFromProto(&request->instance_group(), instance_group_req);
     if (!instance_group_req.ValidateRequiredFields(invalid_fields)) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("UpdateInstanceGroup", "InstanceGroup", false);
+    }
+    if (!HasUniqueEventReportOwnerPerType(registry_manager_, instance_group_req, invalid_fields)) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("UpdateInstanceGroup", "InstanceGroup", false);
     }
     ErrorCode ec_info =

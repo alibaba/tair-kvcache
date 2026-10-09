@@ -1,6 +1,25 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "scoped_jemalloc_arena_rotation_test",
+    srcs = ["scoped_jemalloc_arena_rotation_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:scoped_jemalloc_arena_rotation",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "scoped_jemalloc_arena_rotation_static_provider_test",
+    srcs = ["scoped_jemalloc_arena_rotation_static_provider_test.cc"],
+    linkopts = ["-rdynamic"],
+    deps = [
+        "//kv_cache_manager/common:scoped_jemalloc_arena_rotation",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "EnvUtilTest",
     srcs = [
         "env_util_test.cc",
@@ -124,6 +143,17 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "redis_test_environment",
+    testonly = True,
+    hdrs = ["redis_test_environment.h"],
+    visibility = [
+        "//kv_cache_manager/config/test:__pkg__",
+        "//kv_cache_manager/manager/test:__pkg__",
+        "//kv_cache_manager/meta/test:__pkg__",
+    ],
+)
+
 cc_test(
     name = "redis_client_test",
     srcs = [
@@ -133,6 +163,18 @@ cc_test(
     data = [],
     deps = [
         ":redis_client_testlib",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
+    name = "redis_client_ext_test",
+    srcs = [
+        "redis_client_ext_test.cc",
+    ],
+    deps = [
+        ":redis_client_testlib",
+        "//kv_cache_manager/common:redis_client_ext",
         "//kv_cache_manager/common:unittest",
     ],
 )
@@ -163,6 +205,7 @@ cc_test(
         "redis",
     ],
     deps = [
+        ":redis_test_environment",
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/common:unittest",
     ],

@@ -65,6 +65,11 @@ public:
         // never retained in output.
         std::string_view reporter_medium;
         std::string_view reporter_host;
+        // Optional request-owned projection of one physical reporter onto one
+        // or more schedulable engine identities. Shared L2 reporters use this
+        // to contribute their specs to every active ranked L1P5 engine without
+        // duplicating the stored CacheLocation or its physical Vineyard URI.
+        const std::vector<std::string> *logical_hosts = nullptr;
     };
     using CheckHostCacheLocationFunc =
         std::function<bool(const CacheLocation &location, HostCacheLocationInfo &out_info)>;
@@ -341,7 +346,8 @@ public:
                                    std::vector<std::vector<ErrorCode>> &out_per_location_ec,
                                    const std::vector<std::vector<std::string>> &expected_location_values = {},
                                    bool adjust_storage_usage = true,
-                                   bool adjust_reclaimed_key_count = true);
+                                   bool adjust_reclaimed_key_count = true,
+                                   bool maintenance_no_touch = false);
     using LocationVisitor =
         std::function<void(KeyType block_key, const std::string &location_id, const CacheLocation &location)>;
     ErrorCode VisitAllLocations(RequestContext *request_context, size_t scan_batch_size, LocationVisitor visitor);

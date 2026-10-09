@@ -1,0 +1,4 @@
+# hf3fs 超时/失败路径的 iov/ior 与 fd 注册是设计内泄漏（提交事实判定：
+# 3FS 无取消语义，in-flight 请求引用这些资源，释放即 UAF）。
+# 见 docs/design/client_sdk_io_contract.md known limitations。
+leak:kv_cache_manager::Hf3fsUsrbioClient::CreateIor

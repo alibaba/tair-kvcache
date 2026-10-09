@@ -90,7 +90,7 @@ public:
     ~CacheManager();
 
     bool Init(int32_t schedule_plan_executor_thread_count = DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT,
-              uint64_t cache_reclaimer_key_sampling_size_total = 1000,
+              uint64_t cache_reclaimer_key_sampling_size_total = 100,
               uint64_t cache_reclaimer_key_sampling_size_per_task = 100,
               uint64_t cache_reclaimer_del_batch_size = 100,
               uint32_t cache_reclaimer_idle_interval_ms = 100,
@@ -100,7 +100,8 @@ public:
               uint32_t meta_query_worker_count = DEFAULT_META_QUERY_WORKER_COUNT,
               std::size_t meta_query_parallel_threshold = DEFAULT_META_QUERY_PARALLEL_THRESHOLD,
               std::size_t meta_query_chunk_size = DEFAULT_META_QUERY_CHUNK_SIZE,
-              CacheGarbageCollector::Config cache_gc_config = {});
+              CacheGarbageCollector::Config cache_gc_config = {},
+              CacheReclaimerGroupLruConfig group_lru_config = {});
     ErrorCode DoRecover();
     ErrorCode DoRecoverOnce();
     void StartRecoverRetryLoop();

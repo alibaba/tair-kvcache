@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_gpu_util_alias.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_mempool.h"
 #include "kv_cache_manager/common/logger.h"
@@ -37,6 +38,7 @@ ClientErrorCode Hf3fsSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_back
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
     config_ = hf3fs_config;
+    timeout_config_ = sdk_backend_config->timeout_config();
 
     auto gpu_util = std::make_shared<Hf3fsGpuUtil>();
     if (!gpu_util->Init()) {
@@ -70,9 +72,27 @@ ClientErrorCode Hf3fsSdk::Get(const std::vector<DataStorageUri> &remote_uris, co
             "get failed, size mismatch, uris size: %lu, buffers size: %lu", remote_uris.size(), local_buffers.size());
         return ER_INVALID_PARAMS;
     }
+    // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
+    const int64_t deadline_ms = SteadyClockMs() + timeout_config_.get_timeout_ms();
 
+    // 逐 block 准入检查：deadline 已过期则不再为后续 block
+    // 创建 Hf3fsUsrbioClient / 发起 I/O。无 deadline（0）时 DeadlineExpired() 恒为 false。
     for (size_t i = 0; i < remote_uris.size(); ++i) {
-        if (Get(remote_uris[i], local_buffers[i]) != ER_OK) {
+        if (DeadlineExpired(deadline_ms)) {
+            KVCM_LOG_WARN("get skipped, deadline expired, path: %s, done blocks: %zu/%zu, remaining blocks skipped "
+                          "to protect caller buffer",
+                          remote_uris[i].GetPath().c_str(),
+                          i,
+                          remote_uris.size());
+            return ER_SDK_TIMEOUT;
+        }
+        auto ec = Get(remote_uris[i], local_buffers[i], deadline_ms);
+        if (ec != ER_OK) {
+            // WaitIos 到点（泄漏路径）导致的失败须归因为超时，不得吞成普通读错误
+            // —— 与 localfile/mooncake 一致，供 wrapper 层归因。
+            if (DeadlineExpired(deadline_ms)) {
+                return ER_SDK_TIMEOUT;
+            }
             return ER_SDKREAD_ERROR;
         }
     }
@@ -80,7 +100,7 @@ ClientErrorCode Hf3fsSdk::Get(const std::vector<DataStorageUri> &remote_uris, co
     return ER_OK;
 }
 
-ClientErrorCode Hf3fsSdk::Get(const DataStorageUri &uri, const BlockBuffer &block_buffer) const {
+ClientErrorCode Hf3fsSdk::Get(const DataStorageUri &uri, const BlockBuffer &block_buffer, int64_t deadline_ms) const {
     if (block_buffer.iovs.empty()) {
         return ER_OK;
     }
@@ -101,7 +121,7 @@ ClientErrorCode Hf3fsSdk::Get(const DataStorageUri &uri, const BlockBuffer &bloc
 
     auto usrbio_client = std::make_shared<Hf3fsUsrbioClient>(
         BuildHf3fsFileConfig(path), read_iov_handle_, write_iov_handle_, usrbio_api_);
-    if (!usrbio_client->Read(iovs)) {
+    if (!usrbio_client->Read(iovs, deadline_ms)) {
         KVCM_LOG_WARN("get failed, read failed, path: %s", path.c_str());
         return ER_SDKREAD_ERROR;
     }
@@ -117,13 +137,30 @@ ClientErrorCode Hf3fsSdk::Put(const std::vector<DataStorageUri> &remote_uris,
             "put failed, size mismatch, uris size: %lu, buffers size: %lu", remote_uris.size(), local_buffers.size());
         return ER_INVALID_PARAMS;
     }
+    // 静态预算：Init 时由 wrapper 注入，从自身任务起点起算 deadline。
+    const int64_t deadline_ms = SteadyClockMs() + timeout_config_.put_timeout_ms();
 
     if (Alloc(remote_uris, *actual_remote_uris) != ER_OK) {
         return ER_SDKALLOC_ERROR;
     }
 
+    // 逐 block 准入检查：deadline 已过期则不再为后续 block
+    // 创建 Hf3fsUsrbioClient / 发起 I/O。无 deadline（0）时 DeadlineExpired() 恒为 false。
     for (size_t i = 0; i < remote_uris.size(); ++i) {
-        if (Put(remote_uris[i], local_buffers[i]) != ER_OK) {
+        if (DeadlineExpired(deadline_ms)) {
+            KVCM_LOG_WARN("put skipped, deadline expired, path: %s, done blocks: %zu/%zu, remaining blocks skipped",
+                          remote_uris[i].GetPath().c_str(),
+                          i,
+                          remote_uris.size());
+            return ER_SDK_TIMEOUT;
+        }
+        auto ec = Put(remote_uris[i], local_buffers[i], deadline_ms);
+        if (ec != ER_OK) {
+            // WaitIos 到点（泄漏路径）导致的失败须归因为超时，不得吞成普通写错误
+            // —— 与 localfile/mooncake 一致，供 wrapper 层归因。
+            if (DeadlineExpired(deadline_ms)) {
+                return ER_SDK_TIMEOUT;
+            }
             return ER_SDKWRITE_ERROR;
         }
     }
@@ -131,7 +168,7 @@ ClientErrorCode Hf3fsSdk::Put(const std::vector<DataStorageUri> &remote_uris,
     return ER_OK;
 }
 
-ClientErrorCode Hf3fsSdk::Put(const DataStorageUri &uri, const BlockBuffer &block_buffer) const {
+ClientErrorCode Hf3fsSdk::Put(const DataStorageUri &uri, const BlockBuffer &block_buffer, int64_t deadline_ms) const {
     if (block_buffer.iovs.empty()) {
         return ER_OK;
     }
@@ -152,7 +189,7 @@ ClientErrorCode Hf3fsSdk::Put(const DataStorageUri &uri, const BlockBuffer &bloc
 
     auto usrbio_client = std::make_shared<Hf3fsUsrbioClient>(
         BuildHf3fsFileConfig(path), read_iov_handle_, write_iov_handle_, usrbio_api_);
-    if (!usrbio_client->Write(iovs)) {
+    if (!usrbio_client->Write(iovs, deadline_ms)) {
         KVCM_LOG_WARN("put failed, write failed, path: %s", path.c_str());
         return ER_SDKWRITE_ERROR;
     }

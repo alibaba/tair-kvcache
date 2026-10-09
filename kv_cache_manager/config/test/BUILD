@@ -51,6 +51,7 @@ cc_test(
         "redis",
     ],
     deps = [
+        "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config",
     ],
@@ -125,6 +126,7 @@ cc_test(
         ":coordination_backend_test_base",
         "//kv_cache_manager/common:redis_client_ext",
         "//kv_cache_manager/common:standard_uri",
+        "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config:coordination_backend",
     ],

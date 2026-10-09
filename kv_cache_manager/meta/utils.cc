@@ -7,15 +7,14 @@
 
 namespace kv_cache_manager {
 
-FieldMap SerializeToFieldMap(const CacheLocationMap &locations, const PropertyMap &properties) {
-    FieldMap field_map;
+FieldMap SerializeToFieldMap(const CacheLocationMap &locations, PropertyMap properties) {
     for (const auto &[loc_id, loc_ptr] : locations) {
-        field_map[PROPERTY_LOCATION_PREFIX + loc_id] = loc_ptr ? loc_ptr->ToJsonString() : "";
+        auto [it, inserted] = properties.try_emplace(PROPERTY_LOCATION_PREFIX + loc_id);
+        if (inserted && loc_ptr) {
+            it->second = loc_ptr->ToJsonString();
+        }
     }
-    for (const auto &[key, value] : properties) {
-        field_map[key] = value;
-    }
-    return field_map;
+    return properties;
 }
 
 ErrorCode DeserializeFieldMap(const FieldMap &field_map, CacheLocationMap &out_locations, PropertyMap &out_properties) {

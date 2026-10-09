@@ -145,9 +145,9 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `data_storage.healthy_status` | gauge | 存储后端健康状态（1/0） |
 | `data_storage.storage_usage_ratio` | gauge | 存储使用率 |
 | `cache_manager.write_location_expire_size` | gauge | 已过期的写入位置数量 |
-| `cache_manager_group.usage_ratio` | gauge | 实例组容量使用率 |
+| `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |
-| `cache_manager_instance.byte_size` | gauge | 单实例字节大小 |
+| `cache_manager_instance.byte_size` | gauge | 单实例 KVCM 配额字节大小（不含 EventReport） |
 
 完整指标列表取决于当前使用的 `MetricsReporter` 类型。`kmonitor`
 类型的 reporter 会填充最完整的指标集。

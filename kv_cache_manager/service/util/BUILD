@@ -7,12 +7,19 @@ config_setting(
 
 cc_library(
     name = "proto_message_json_util",
-    srcs = ["proto_message_json_util.cc"],
-    hdrs = ["proto_message_json_util.h"],
+    srcs = [
+        "fast_proto_json_codec.cc",
+        "proto_message_json_util.cc",
+    ],
+    hdrs = [
+        "fast_proto_json_codec.h",
+        "proto_message_json_util.h",
+    ],
     include_prefix = "service/util",
     deps = [
         ":grpc_wrapper",
         "//kv_cache_manager/common",
+        "@rapidjson",
     ],
 )
 
@@ -44,20 +51,22 @@ cc_library(
 )
 
 cc_library(
-    name = "service_call_guard",
-    srcs = ["service_call_guard.cc"],
-    hdrs = ["service_call_guard.h"],
+    name = "access_log_writer",
+    srcs = ["access_log_writer.cc"],
+    hdrs = ["access_log_writer.h"],
     deps = [
-        "//kv_cache_manager/manager:cache_manager",
-        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/common:request_context",
+        "//kv_cache_manager/common:timestamp_util",
+        "@rapidjson",
     ],
 )
 
 cc_library(
-    name = "service_access_log",
-    srcs = ["service_access_log.cc"],
-    hdrs = ["service_access_log.h"],
+    name = "service_call_guard",
+    srcs = ["service_call_guard.cc"],
+    hdrs = ["service_call_guard.h"],
     deps = [
+        ":access_log_writer",
         "//kv_cache_manager/manager:cache_manager",
         "//kv_cache_manager/metrics:metrics_reporter",
     ],

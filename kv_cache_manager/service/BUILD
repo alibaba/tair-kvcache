@@ -79,7 +79,6 @@ cc_library(
         "//kv_cache_manager/service/util:fault_injector",
         "//kv_cache_manager/service/util:manager_message_proto_util",
         "//kv_cache_manager/service/util:proto_message_json_util",
-        "//kv_cache_manager/service/util:service_access_log",
         "//kv_cache_manager/service/util:service_call_guard",
         "@rapidjson",
     ],
@@ -104,7 +103,6 @@ cc_library(
         "//kv_cache_manager/metrics:metrics_lifecycle",
         "//kv_cache_manager/service/util:manager_message_proto_util",
         "//kv_cache_manager/service/util:proto_message_json_util",
-        "//kv_cache_manager/service/util:service_access_log",
         "//kv_cache_manager/service/util:service_call_guard",
     ],
 )
@@ -125,7 +123,6 @@ cc_library(
         "//kv_cache_manager/manager:cache_manager",
         "//kv_cache_manager/service/util:fault_injector",
         "//kv_cache_manager/service/util:manager_message_proto_util",
-        "//kv_cache_manager/service/util:service_access_log",
         "//kv_cache_manager/service/util:service_call_guard",
     ],
 )

@@ -86,7 +86,6 @@ public:
                                     std::vector<CmdArgs> &out_cmds);
 
 protected:
-
     bool IsReplyOk(const redisReply *reply) const;
     bool CheckReplyInteger(const redisReply *reply) const;
     bool CheckReplyArray(const redisReply *reply) const;
@@ -94,6 +93,7 @@ protected:
     bool Connect();
     void Disconnect();
     std::vector<ReplyUPtr> CommandPipeline(const std::vector<CmdArgs> &cmds);
+    ErrorCode CommandPipeline(const std::vector<CmdArgs> &cmds, std::vector<ReplyUPtr> &out_replies);
 
     // virtual for test
     virtual bool IsContextOk() const;

@@ -1,19 +1,36 @@
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
 
+#include <fcntl.h>
+#include <limits>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_map>
 
 #include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 
 namespace kv_cache_manager {
 
 SdkWrapper::SdkWrapper() : sdk_factory_(SdkFactory::GetInstance()) {}
 
-SdkWrapper::~SdkWrapper() {}
+SdkWrapper::~SdkWrapper() {
+    if (wait_task_thread_pool_) {
+        wait_task_thread_pool_->stop();
+        wait_task_thread_pool_.reset();
+    }
+    sdk_map_.clear();
+    if (owned_shm_fd_ >= 0) {
+        close(owned_shm_fd_);
+        owned_shm_fd_ = -1;
+    }
+}
 
-ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_config, const InitParams &init_params) {
+ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_config,
+                                 const InitParams &init_params,
+                                 const SharedMemoryRegistration *shared_memory_registration) {
     if (!client_config) {
         KVCM_LOG_WARN("client config is null");
         return ER_INVALID_CLIENT_CONFIG;
@@ -31,6 +48,16 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
     if (storage_configs_.empty()) {
         KVCM_LOG_WARN("storage config is empty");
         return ER_INVALID_STORAGE_CONFIG;
+    }
+
+    SharedMemoryRegistration prepared_registration;
+    const SharedMemoryRegistration *active_registration = nullptr;
+    if (shared_memory_registration != nullptr) {
+        auto ec = PrepareSharedMemoryRegistration(*shared_memory_registration, prepared_registration);
+        if (ec != ER_OK) {
+            return ec;
+        }
+        active_registration = &prepared_registration;
     }
 
     wait_task_thread_pool_ = std::make_unique<LockFreeThreadPool>(
@@ -68,9 +95,17 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
             KVCM_LOG_WARN("fill span failed, storage config: %s", storage_config->ToString().c_str());
             return ec;
         }
+        ec = UpdateTairMempoolSdkConfig(sdk_backend_config, active_registration);
+        if (ec != ER_OK) {
+            KVCM_LOG_WARN("fill tair mempool span failed, storage config: %s", storage_config->ToString().c_str());
+            return ec;
+        }
 
         // 将完整的 spec → byte_size_per_block 映射传给 SDK
         sdk_backend_config->set_spec_byte_sizes_per_block(location_spec_infos);
+        // 注入静态超时预算：后端用它从自身任务起点起算 deadline 并自律（内部取消）。
+        // 不读取该字段的后端（tair_mempool 等）行为不受影响。
+        sdk_backend_config->set_timeout_config(wrapper_config_->timeout_config());
 
         auto sdk = sdk_factory_->CreateSdk(type, sdk_backend_config, storage_config);
         if (!sdk) {
@@ -129,6 +164,8 @@ ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, 
         tasks.push_back([group]() { return group.sdk->Get(group.uris, group.buffers); });
     }
 
+    // 静态预算：同一份已在 Init 时注入各后端（SdkBackendConfig::timeout_config），
+    // 后端从自身任务起点起算 deadline 并自律。
     int timeout_ms = wrapper_config_->timeout_config().get_timeout_ms();
     return RunWithTimeoutParallel(OpType::GET, std::move(tasks), timeout_ms);
 }
@@ -163,6 +200,7 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
         });
     }
 
+    // 与 Get 同理：静态预算已在 Init 时注入后端。
     int timeout_ms = wrapper_config_->timeout_config().put_timeout_ms();
     ec = RunWithTimeoutParallel(OpType::PUT, std::move(tasks), timeout_ms);
     if (ec != ER_OK) {
@@ -174,7 +212,7 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
     for (size_t i = 0; i < groups.size(); ++i) {
         const auto &group = groups[i];
         const auto &group_actual_uris = group_results[i];
-        
+
         if (group_actual_uris->size() != group.indices.size()) {
             KVCM_LOG_WARN("sdk returned mismatched actual_uris size: %zu vs %zu",
                           group_actual_uris->size(),
@@ -246,13 +284,26 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     }
 
     // Submit all tasks with shared stop flag
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+    // stop：错误/超时路径置位后，排队中尚未被拾起的任务直接短路，不再发起新的 I/O。
+    // 时间准入（now >= deadline）只覆盖"已到 deadline"的情形；普通错误往往发生在
+    // deadline 之前，若不显式拦截，排在后面的 group 会在 caller 拿到错误返回后
+    // 依旧发起 I/O、写 caller buffer（多后端混布时放大暴露面）。
     auto stop = std::make_shared<std::atomic<bool>>(false);
     std::vector<std::future<ClientErrorCode>> futures;
     futures.reserve(tasks.size());
 
     for (auto &task : tasks) {
-        auto wrapped = [stop, task]() -> ClientErrorCode {
+        auto wrapped = [stop, deadline, task]() -> ClientErrorCode {
             if (stop->load()) {
+                return ER_SDK_TIMEOUT;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                auto overdue_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline)
+                        .count();
+                KVCM_LOG_WARN("deadline passed (overdue_ms=%lld), skip I/O", static_cast<long long>(overdue_ms));
                 return ER_SDK_TIMEOUT;
             }
             return task();
@@ -260,10 +311,10 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
         futures.push_back(wait_task_thread_pool_->async(wrapped));
     }
 
-    // Wait with shared deadline
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-
-    // Drain in-flight tasks with bounded wait to prevent background writes into caller's buffers
+    // 有界 drain：置 stop 拦截排队任务 + 等待其余 future 至多到 deadline（绝不越界）。
+    // 超时路径调用它时 deadline 已过，wait_until 立即返回，保持"超时立即返回"语义；
+    // 普通错误路径则真正等待在飞 peer（此时 deadline 未到，SDK 仍在契约窗口内写
+    // caller buffer，不等就返回会让 caller 在 hard backend 仍在读写时复用/释放 buffer）。
     auto drain = [&](size_t from) {
         stop->store(true);
         for (size_t j = from; j < futures.size(); ++j) {
@@ -272,23 +323,26 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     };
 
     for (size_t i = 0; i < futures.size(); ++i) {
-        auto remaining = deadline - std::chrono::steady_clock::now();
-        if (remaining <= std::chrono::steady_clock::duration::zero()) {
-            remaining = std::chrono::steady_clock::duration::zero();
-        }
-
-        if (futures[i].wait_for(remaining) != std::future_status::ready) {
-            KVCM_LOG_WARN("run %s parallel but timeout: %d ms (group %zu/%zu)",
+        if (futures[i].wait_until(deadline) != std::future_status::ready) {
+            auto overdue_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline)
+                    .count();
+            KVCM_LOG_WARN("run %s parallel but timeout: %d ms (group %zu/%zu), overdue_ms: %lld, "
+                          "return immediately (in-flight I/O is not cancelled and may still write caller buffer)",
                           getOpTypeString(op_type).c_str(),
                           timeout_ms,
                           i + 1,
-                          futures.size());
+                          futures.size(),
+                          static_cast<long long>(overdue_ms));
             drain(i + 1);
             return ER_SDK_TIMEOUT;
         }
 
         auto ec = futures[i].get();
         if (ec != ER_OK) {
+            KVCM_LOG_WARN("run %s parallel failed, error: %d, drain in-flight peers until deadline",
+                          getOpTypeString(op_type).c_str(),
+                          static_cast<int>(ec));
             drain(i + 1);
             return ec;
         }
@@ -319,6 +373,67 @@ ClientErrorCode SdkWrapper::UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBac
     config->set_local_mem_ptr(span->base);
     config->set_local_buffer_size(span->size);
     config->set_self_location_spec_name(self_location_spec_name);
+    return ER_OK;
+}
+
+ClientErrorCode SdkWrapper::PrepareSharedMemoryRegistration(const SharedMemoryRegistration &shared_memory_registration,
+                                                            SharedMemoryRegistration &prepared_registration) {
+    const bool disabled = shared_memory_registration.fd == -1 && shared_memory_registration.base == nullptr &&
+                          shared_memory_registration.size == 0;
+    if (disabled) {
+        prepared_registration = shared_memory_registration;
+        return ER_OK;
+    }
+
+    if (shared_memory_registration.fd < 0 || shared_memory_registration.base == nullptr ||
+        shared_memory_registration.size == 0) {
+        KVCM_LOG_WARN("shared memory registration must provide fd, base and size together");
+        return ER_INVALID_PARAMS;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(shared_memory_registration.base);
+    if (shared_memory_registration.size > std::numeric_limits<uintptr_t>::max() - base) {
+        KVCM_LOG_WARN("shared memory registration address range overflows");
+        return ER_INVALID_PARAMS;
+    }
+
+    struct stat file_stat{};
+    if (fstat(shared_memory_registration.fd, &file_stat) != 0 || file_stat.st_size < 0 ||
+        static_cast<uintmax_t>(file_stat.st_size) < shared_memory_registration.size) {
+        KVCM_LOG_WARN("shared memory fd is invalid or smaller than the registered range");
+        return ER_INVALID_PARAMS;
+    }
+
+    int duplicated_fd = fcntl(shared_memory_registration.fd, F_DUPFD_CLOEXEC, 0);
+    if (duplicated_fd < 0) {
+        KVCM_LOG_WARN("duplicate shared memory fd failed");
+        return ER_INVALID_PARAMS;
+    }
+    if (owned_shm_fd_ >= 0) {
+        close(owned_shm_fd_);
+    }
+    owned_shm_fd_ = duplicated_fd;
+    prepared_registration = shared_memory_registration;
+    prepared_registration.fd = owned_shm_fd_;
+    return ER_OK;
+}
+
+ClientErrorCode SdkWrapper::UpdateTairMempoolSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
+                                                       const SharedMemoryRegistration *shared_memory_registration) {
+    if (!IsTairMempoolStorageType(sdk_backend_config->type())) {
+        return ER_OK;
+    }
+    auto config = std::dynamic_pointer_cast<TairMempoolSdkConfig>(sdk_backend_config);
+    if (!config) {
+        KVCM_LOG_WARN("convert to tair mempool config failed");
+        return ER_INVALID_SDKBACKEND_CONFIG;
+    }
+    if (shared_memory_registration == nullptr || shared_memory_registration->fd < 0) {
+        return ER_OK;
+    }
+    config->set_shm_fd(shared_memory_registration->fd);
+    config->set_shm_size(shared_memory_registration->size);
+    config->set_client_base(shared_memory_registration->base);
     return ER_OK;
 }
 

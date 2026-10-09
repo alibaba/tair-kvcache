@@ -104,6 +104,42 @@ public:
 private:
     Shape shape_ = Shape::kShortOuter;
 };
+
+class PagedTrimBackend : public MetaLocalBackend {
+public:
+    ErrorCode ListKeys(RequestContext *,
+                       const std::string &,
+                       int64_t,
+                       std::string &out_next_cursor,
+                       KeyTypeVec &out_keys) noexcept override {
+        ++list_count;
+        out_keys.clear();
+        if (list_count == 1) {
+            out_next_cursor = "1";
+        } else {
+            out_next_cursor = SCAN_BASE_CURSOR;
+            out_keys = {11, 22};
+        }
+        return EC_OK;
+    }
+
+    std::vector<ErrorCode> ForceDelete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override {
+        force_deleted_keys = keys;
+        return MetaLocalBackend::Delete(request_context, keys);
+    }
+
+    bool Sync(const KeyTypeVec &keys) noexcept override {
+        synced_keys = keys;
+        ++sync_count;
+        return sync_result;
+    }
+
+    int list_count = 0;
+    int sync_count = 0;
+    bool sync_result = true;
+    KeyTypeVec force_deleted_keys;
+    KeyTypeVec synced_keys;
+};
 } // namespace
 
 class MetaIndexerTest : public MetaIndexerTestBase, public TESTBASE {
@@ -189,6 +225,91 @@ TEST_F(MetaIndexerTest, TestProcessErrorCodesRejectsAbnormalResultCount) {
                   "trace", {EC_OK, EC_OK, EC_OK, EC_OK}, {}, keys, "test_long_result", long_result));
     EXPECT_EQ(EC_MISMATCH, long_result.ec);
     EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH, EC_MISMATCH, EC_MISMATCH}), long_result.error_codes);
+}
+
+TEST_F(MetaIndexerTest, TestTrimResiduesContinuesAfterEmptyPersistentPage) {
+    const std::string config = R"({
+        "max_key_count" : 100, "mutex_shard_num" : 8,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : {}
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config));
+
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
+    auto persistent = std::make_unique<PagedTrimBackend>();
+    auto *persistent_raw = persistent.get();
+    auto cache = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, persistent->Init("test", backend_config));
+    ASSERT_EQ(EC_OK, persistent->Open());
+    ASSERT_EQ(EC_OK, cache->Init("test", backend_config));
+    ASSERT_EQ(EC_OK, cache->Open());
+
+    KeyVector keys{11, 22};
+    CacheLocationMapVector locations(2);
+    locations[0].emplace("loc_11", MakeLocation("loc_11", "uri_11"));
+    locations[1].emplace("loc_22", MakeLocation("loc_22", "uri_22"));
+    PropertyMapVector properties(2);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), persistent->Put(nullptr, keys, locations, properties));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, cache->Put(nullptr, {11}, {locations[0]}, PropertyMapVector(1)));
+
+    auto &manager = *meta_indexer_->backend_manager_;
+    manager.persistent_backend_ = std::move(persistent);
+    manager.cache_backend_ = std::move(cache);
+    manager.memory_primary_ = true;
+    manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    EXPECT_EQ(EC_OK, meta_indexer_->TrimResidues(request_context_.get(), 1));
+    EXPECT_EQ(0, persistent_raw->list_count);
+
+    manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    persistent_raw->sync_result = false;
+    EXPECT_EQ(EC_ERROR, meta_indexer_->TrimResidues(request_context_.get(), 1));
+    EXPECT_EQ(2, persistent_raw->list_count);
+    EXPECT_EQ(KeyVector{22}, persistent_raw->force_deleted_keys);
+    EXPECT_EQ(KeyVector{22}, persistent_raw->synced_keys);
+
+    persistent_raw->sync_result = true;
+    EXPECT_EQ(EC_OK, meta_indexer_->TrimResidues(request_context_.get(), 1));
+    EXPECT_EQ(3, persistent_raw->list_count);
+    EXPECT_EQ(KeyVector{22}, persistent_raw->force_deleted_keys);
+    EXPECT_EQ(KeyVector{22}, persistent_raw->synced_keys);
+
+    std::vector<bool> exists;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), persistent_raw->Exists(nullptr, keys, exists));
+    EXPECT_EQ((std::vector<bool>{true, false}), exists);
+}
+
+TEST_F(MetaIndexerTest, TestTrimResiduesSyncsOncePerPersistentPage) {
+    const std::string config = R"({
+        "max_key_count" : 100, "mutex_shard_num" : 8, "batch_key_size" : 1,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : {}
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config));
+
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
+    auto persistent = std::make_unique<PagedTrimBackend>();
+    auto *persistent_raw = persistent.get();
+    auto cache = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, persistent->Init("test", backend_config));
+    ASSERT_EQ(EC_OK, persistent->Open());
+    ASSERT_EQ(EC_OK, cache->Init("test", backend_config));
+    ASSERT_EQ(EC_OK, cache->Open());
+
+    KeyVector keys{11, 22};
+    CacheLocationMapVector locations(2);
+    locations[0].emplace("loc_11", MakeLocation("loc_11", "uri_11"));
+    locations[1].emplace("loc_22", MakeLocation("loc_22", "uri_22"));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), persistent->Put(nullptr, keys, locations, PropertyMapVector(2)));
+
+    auto &manager = *meta_indexer_->backend_manager_;
+    manager.persistent_backend_ = std::move(persistent);
+    manager.cache_backend_ = std::move(cache);
+    manager.memory_primary_ = true;
+    manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+
+    EXPECT_EQ(EC_OK, meta_indexer_->TrimResidues(request_context_.get(), 2));
+    EXPECT_EQ(1, persistent_raw->sync_count);
+    EXPECT_THAT(persistent_raw->synced_keys, UnorderedElementsAre(11, 22));
 }
 
 TEST_F(MetaIndexerTest, TestParallelLocalLocationValuesMatchSerialAndPreserveErrors) {
@@ -436,6 +557,44 @@ TEST_F(MetaIndexerTest, TestCompactPrefixGetIoMetricExcludesPipelinedVisitorTime
     const auto backend_wall_us = metrics_collector->get_meta_indexer_get_io_time_us_metrics();
     EXPECT_GT(backend_wall_us, 0);
     EXPECT_GE(elapsed_us - static_cast<int64_t>(backend_wall_us), 30000);
+}
+
+TEST_F(MetaIndexerTest, TestRmwLockHoldMetricAccumulatesAcrossBatches) {
+    const std::string config_str = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "batch_key_size" : 1,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config_str));
+
+    KeyVector keys = {0};
+    for (KeyType key = 1; key < 100; ++key) {
+        if (meta_indexer_->GetMutexShardIndex(key) != meta_indexer_->GetMutexShardIndex(keys.front())) {
+            keys.push_back(key);
+            break;
+        }
+    }
+    ASSERT_EQ(2u, keys.size());
+
+    auto metrics_registry = std::make_shared<MetricsRegistry>();
+    auto metrics_collector = std::make_shared<ServiceMetricsCollector>(metrics_registry);
+    ASSERT_TRUE(metrics_collector->Init());
+    RequestContext metrics_context("rmw_lock_hold_metric_test", metrics_collector);
+    size_t modifier_calls = 0;
+    const auto result = meta_indexer_->ReadModifyWriteBlock(
+        &metrics_context,
+        keys,
+        [&modifier_calls](const LocationIdVector &, ErrorCode, size_t, PropertyMap &, CacheLocationMap &) {
+            ++modifier_calls;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            return ModifierResult{MA_SKIP, EC_OK};
+        });
+
+    EXPECT_EQ(EC_OK, result.ec);
+    EXPECT_EQ(2u, modifier_calls);
+    EXPECT_GE(metrics_collector->get_meta_indexer_lock_hold_time_us_metrics(), 3000.);
 }
 
 TEST_F(MetaIndexerTest, TestCompactPrefixLocationValuesRejectsMalformedShape) {
@@ -694,9 +853,10 @@ TEST_F(MetaIndexerTest, TestSingleTargetRmwPreservesCapacityAndExistingKeySemant
 // of the exact shard distribution (which is now hash-driven and therefore
 // not deterministic across keys):
 //   * every input key appears in exactly one batch;
-//   * batch_indexs preserves the original positions in `keys`;
-//   * within a batch, all keys belong to the shards listed in batch_shard_indexs;
-//   * each batch_shard_indexs entry is a distinct shard.
+//   * global_indices preserves the original positions in `keys`;
+//   * within a batch, all keys belong to the shards listed in shard_indices;
+//   * each shard_indices entry is a distinct shard;
+//   * no key/location/property payload is copied into the descriptor.
 TEST_F(MetaIndexerTest, TestMakeBatches) {
     std::string configStr = R"({
         "max_key_count" : 100,
@@ -712,27 +872,20 @@ TEST_F(MetaIndexerTest, TestMakeBatches) {
     ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, GetPersistentStorageType(*meta_indexer_));
 
     KeyVector keys = {0, 1, 2, 3, 4, 8, 9, 80, 800};
-    LocationIdsPerKey empty_location_ids;
-    CacheLocationMapVector empty_locations;
-    PropertyMapVector empty_properties;
-    auto batches = meta_indexer_->MakeBatches(keys, empty_location_ids, empty_locations, empty_properties);
+    auto batches = meta_indexer_->MakeBatches(keys);
 
     std::vector<int32_t> covered_indexs;
     for (const auto &batch : batches) {
-        std::set<int32_t> shards_in_batch(batch.batch_shard_indexs.begin(), batch.batch_shard_indexs.end());
-        ASSERT_EQ(shards_in_batch.size(), batch.batch_shard_indexs.size()) << "duplicate shard in one batch";
-        ASSERT_EQ(batch.batch_keys.size(), batch.batch_indexs.size());
-        for (size_t j = 0; j < batch.batch_keys.size(); ++j) {
-            const int32_t origin_idx = batch.batch_indexs[j];
-            ASSERT_EQ(keys[origin_idx], batch.batch_keys[j]);
-            const int32_t shard = meta_indexer_->GetMutexShardIndex(batch.batch_keys[j]);
+        std::set<int32_t> shards_in_batch(batch.shard_indices.begin(), batch.shard_indices.end());
+        ASSERT_EQ(shards_in_batch.size(), batch.shard_indices.size()) << "duplicate shard in one batch";
+        ASSERT_TRUE(std::is_sorted(batch.shard_indices.begin(), batch.shard_indices.end()));
+        for (const int32_t origin_idx : batch.global_indices) {
+            const int32_t shard = meta_indexer_->GetMutexShardIndex(keys[origin_idx]);
             ASSERT_TRUE(shards_in_batch.count(shard) > 0)
-                << "key " << batch.batch_keys[j] << " hashed to shard " << shard
-                << " but the batch only locked shards declared in batch_shard_indexs";
+                << "key " << keys[origin_idx] << " hashed to shard " << shard
+                << " but the batch only locked shards declared in shard_indices";
             covered_indexs.push_back(origin_idx);
         }
-        ASSERT_TRUE(batch.batch_properties.empty());
-        ASSERT_TRUE(batch.batch_locations.empty());
     }
     std::sort(covered_indexs.begin(), covered_indexs.end());
     std::vector<int32_t> expected_indexs(keys.size());
@@ -770,7 +923,7 @@ TEST_F(MetaIndexerTest, TestPureLocalMutexShardsReuseLruHashSeed) {
     }
 }
 
-TEST_F(MetaIndexerTest, TestMakeBatches2) {
+TEST_F(MetaIndexerTest, TestMakeBatchesPreservesOrderWithinEachShard) {
     std::string configStr = R"({
         "max_key_count" : 100,
         "mutex_shard_num" : 16,
@@ -785,35 +938,22 @@ TEST_F(MetaIndexerTest, TestMakeBatches2) {
     ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, GetPersistentStorageType(*meta_indexer_));
 
     KeyVector keys = {0, 4, 7, 16, 20, 32, 33, 34, 35, 64};
-    PropertyMapVector properties = {{{"uri", "0"}},
-                                    {{"uri", "4"}},
-                                    {{"uri", "7"}},
-                                    {{"uri", "16"}},
-                                    {{"uri", "20"}},
-                                    {{"uri", "32"}},
-                                    {{"uri", "33"}},
-                                    {{"uri", "34"}},
-                                    {{"uri", "35"}},
-                                    {{"uri", "64"}}};
-    LocationIdsPerKey empty_location_ids;
-    CacheLocationMapVector empty_locations;
-    auto batches = meta_indexer_->MakeBatches(keys, empty_location_ids, empty_locations, properties);
+    auto batches = meta_indexer_->MakeBatches(keys);
 
     std::vector<int32_t> covered_indexs;
     for (const auto &batch : batches) {
-        std::set<int32_t> shards_in_batch(batch.batch_shard_indexs.begin(), batch.batch_shard_indexs.end());
-        ASSERT_EQ(shards_in_batch.size(), batch.batch_shard_indexs.size()) << "duplicate shard in one batch";
-        ASSERT_EQ(batch.batch_keys.size(), batch.batch_indexs.size());
-        ASSERT_EQ(batch.batch_keys.size(), batch.batch_properties.size());
-        for (size_t j = 0; j < batch.batch_keys.size(); ++j) {
-            const int32_t origin_idx = batch.batch_indexs[j];
-            ASSERT_EQ(keys[origin_idx], batch.batch_keys[j]);
-            const int32_t shard = meta_indexer_->GetMutexShardIndex(batch.batch_keys[j]);
-            ASSERT_TRUE(shards_in_batch.count(shard) > 0);
-            ASSERT_EQ(std::to_string(keys[origin_idx]), batch.batch_properties[j].at("uri"));
+        int32_t previous_shard = -1;
+        int32_t previous_index = -1;
+        for (const int32_t origin_idx : batch.global_indices) {
+            const int32_t shard = meta_indexer_->GetMutexShardIndex(keys[origin_idx]);
+            EXPECT_GE(shard, previous_shard);
+            if (shard == previous_shard) {
+                EXPECT_GT(origin_idx, previous_index);
+            }
+            previous_shard = shard;
+            previous_index = origin_idx;
             covered_indexs.push_back(origin_idx);
         }
-        ASSERT_TRUE(batch.batch_locations.empty());
     }
     std::sort(covered_indexs.begin(), covered_indexs.end());
     std::vector<int32_t> expected_indexs(keys.size());
@@ -918,7 +1058,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         ASSERT_EQ(0, meta_indexer_->GetStorageUsage());
 
         auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 0, 0, 900};
+        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 700, 800, 900};
 
         type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
@@ -930,6 +1070,12 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
 
         type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
 
         type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
@@ -951,13 +1097,22 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         type = DataStorageType::DATA_STORAGE_TYPE_NFS;
         ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
 
+        type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+
         type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
         ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
         ASSERT_EQ(300, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
 
         std::uint64_t expect_usage = 0;
-        for (const auto &v : expected_usage_vec) {
-            expect_usage += v;
+        for (std::size_t i = 0; i < expected_usage_vec.size(); ++i) {
+            const auto usage_type = static_cast<DataStorageType>(i);
+            if (!IsEventReportStorageType(usage_type)) {
+                expect_usage += expected_usage_vec[i];
+            }
         }
         ASSERT_EQ(expect_usage, meta_indexer_->GetStorageUsage());
     }
