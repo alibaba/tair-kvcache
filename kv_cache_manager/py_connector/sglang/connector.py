@@ -17,29 +17,25 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
-StorageMetrics = None
 try:
     from sglang.srt.observability.metrics_collector import StorageMetrics
 except ImportError:
-    pass
-if StorageMetrics is None:
     try:
         # Older sglang versions kept StorageMetrics here.
         from sglang.srt.metrics.collector import StorageMetrics  # ty: ignore[unresolved-import]
-    except ImportError:
+    except ImportError as e:
         raise ImportError(
             "Cannot import StorageMetrics from sglang. "
             "Tried sglang.srt.observability.metrics_collector and "
             "sglang.srt.metrics.collector. "
             "Please check your sglang version is compatible."
-        )
-from sglang.srt.distributed import get_tp_group
+        ) from e
 
-# get_attention_tp_group moved in newer sglang versions.
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,  # ty: ignore[unresolved-import]
-    is_dp_attention_enabled,
-)
+# get_attn_tp_group lives in sglang.srt.distributed since v0.5.9; the old
+# alias sglang.srt.layers.dp_attention.get_attention_tp_group was removed in
+# v0.5.16.
+from sglang.srt.distributed import get_attn_tp_group, get_tp_group
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 
@@ -57,6 +53,11 @@ logger = logging.getLogger(__name__)
 
 
 class HiCacheKVCM(HiCacheStorage):
+    # Pools sglang asked for that this connector does not manage, already
+    # reported as misses. Process-wide so the warning is emitted once per pool
+    # instead of once per block batch, and survives a backend re-creation.
+    _warned_unknown_pools: set = set()
+
     def __init__(self, storage_config: HiCacheStorageConfig, kwargs: Any) -> None:
         logger.warning(
             "KVCM sglang connector version: %s (commit: %s, build: %s)",
@@ -68,7 +69,7 @@ class HiCacheKVCM(HiCacheStorage):
         # --hicache-storage-backend-extra-config '{"k":"v"}'
         # HiCacheStorageConfig types extra_config as Optional; sglang always
         # provides it for a hicache storage backend.
-        self.extra_config: Dict[str, Any] = self.storage_config.extra_config  # ty: ignore[invalid-assignment]
+        self.extra_config: Dict[str, Any] = self.storage_config.extra_config or {}
 
         # deployment
         self.instance_group = self.extra_config["instance_group"]
@@ -102,7 +103,7 @@ class HiCacheKVCM(HiCacheStorage):
         self.pp_size = 1
 
         tp_group = (
-            get_attention_tp_group().cpu_group
+            get_attn_tp_group().cpu_group
             if is_dp_attention_enabled()
             else get_tp_group().cpu_group
         )
@@ -470,8 +471,7 @@ class HiCacheKVCM(HiCacheStorage):
                     results[transfer.name] = [False] * len(keys)
                     continue
 
-                ptr_list, size_list = pool.get_page_buffer_meta(transfer.host_indices)
-                components = self._get_extra_pool_components_per_page(transfer.name)
+                ptr_list, size_list, components = self._page_buffer_meta(pool, transfer)
                 ptr_list = [
                     p
                     for i, p in enumerate(ptr_list)
@@ -915,10 +915,9 @@ class HiCacheKVCM(HiCacheStorage):
                 # Wrapped in try-except so that every rank always reaches the
                 # all_reduce below, preventing cross-rank NCCL/gloo hangs.
                 try:
-                    ptr_list, size_list = pool.get_page_buffer_meta(
-                        transfer.host_indices
+                    ptr_list, size_list, components = self._page_buffer_meta(
+                        pool, transfer
                     )
-                    components = self._get_extra_pool_components_per_page(transfer.name)
                     save_set = set(save_indices)
                     ptr_list = [
                         p
@@ -1079,9 +1078,7 @@ class HiCacheKVCM(HiCacheStorage):
             return PoolTransferResult.empty()
 
     def get_stats(self) -> Any:
-        # StorageMetrics is a class by the time the module finishes its
-        # import fallback chain; ty cannot prove the None path unreachable.
-        storage_metrics = StorageMetrics()  # ty: ignore[call-non-callable]
+        storage_metrics = StorageMetrics()
         storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
         storage_metrics.backup_pgs.extend(self.backup_pgs)
         storage_metrics.prefetch_bandwidth.extend(self.prefetch_bandwidth)
@@ -1113,10 +1110,8 @@ class HiCacheKVCM(HiCacheStorage):
         return str(uuid.uuid1())
 
     def _sha256_to_int64(self, data: str) -> int:
-        data = data.encode("utf-8")  # ty: ignore[invalid-assignment]
-        hash_digest = hashlib.sha256(data).digest()  # ty: ignore[invalid-argument-type]
-        hash_int64 = int.from_bytes(hash_digest[:8], "big", signed=True)
-        return hash_int64
+        hash_digest = hashlib.sha256(data.encode("utf-8")).digest()
+        return int.from_bytes(hash_digest[:8], "big", signed=True)
 
     def _prepare_block_keys(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
@@ -1218,15 +1213,35 @@ class HiCacheKVCM(HiCacheStorage):
                 return spec["uri"]
         return None
 
-    def _get_extra_pool_components_per_page(self, pool_name: str) -> int:
-        """Number of IOV components per logical page for an extra pool."""
-        if pool_name == PoolName.MAMBA:
-            mamba_pool = self.registered_pools.get(PoolName.MAMBA)
-            conv_num = len(getattr(mamba_pool, "conv_buffer", []) or [])
-            return 1 + conv_num  # temporal + N conv
-        if pool_name == PoolName.INDEXER:
-            return 1  # single indexer buffer per page
-        return 1
+    @staticmethod
+    def _page_buffer_meta(
+        pool: Any, transfer: PoolTransfer
+    ) -> tuple[List[int], List[int], int]:
+        """Per-page zero-copy meta of an extra pool plus its IOVs per page.
+
+        The component count is read back from the pool's own output instead of
+        being derived from pool internals: mamba pools emit a temporal IOV only
+        while the model has an SSM state, so conv-only models hand out one IOV
+        per conv buffer.  Each page must also match exactly one key: callers
+        slice the flat IOV list by page position and map it back to key
+        position, so both a wrong component count and a page/key mismatch would
+        silently shift every page's data.  Both are asserted here instead.
+        """
+        host_indices = transfer.host_indices
+        assert host_indices is not None, (
+            f"pool transfer {transfer.name} carries no host indices"
+        )
+        ptr_list, size_list = pool.get_page_buffer_meta(host_indices)
+        num_pages = len(host_indices) // pool.page_size
+        assert num_pages == len(transfer.keys or []), (
+            f"pool transfer {transfer.name} carries {num_pages} host pages "
+            f"(page size {pool.page_size}) for {len(transfer.keys or [])} keys"
+        )
+        assert num_pages > 0 and len(ptr_list) % num_pages == 0, (
+            f"get_page_buffer_meta returned {len(ptr_list)} IOVs for "
+            f"{len(host_indices)} host indices (page size {pool.page_size})"
+        )
+        return ptr_list, size_list, len(ptr_list) // num_pages
 
     def _get_kv_spec_group(self) -> str:
         """Spec group name used in start_write_cache for KV pool."""
@@ -1293,7 +1308,11 @@ class HiCacheKVCM(HiCacheStorage):
         """
         spec_name = self._get_extra_pool_spec_name(transfer.name)
         if spec_name is None:
-            return kv_hit_pages
+            # Unmanaged pool (e.g. a newer sglang side pool such as SWA): its
+            # data is never written, so claiming hits here would only make the
+            # caller move KV pages that batch_get_v2 then reports as misses.
+            self._warn_unknown_pool_once(transfer.name)
+            return 0
 
         def has_spec(loc: dict) -> bool:
             return any(
@@ -1322,6 +1341,18 @@ class HiCacheKVCM(HiCacheStorage):
             transfer.hit_policy,
         )
         return 0
+
+    def _warn_unknown_pool_once(self, pool_name: Any) -> None:
+        """Report once that sglang asked for a pool this connector ignores."""
+        if pool_name in self._warned_unknown_pools:
+            return
+        self._warned_unknown_pools.add(pool_name)
+        logger.warning(
+            "batch_exists_v2: pool %s is not managed by this connector; "
+            "reporting 0 hit pages for it. Its entries are neither written "
+            "nor read from KVCM (check the sglang/connector version pairing).",
+            pool_name,
+        )
 
     ##################################################
 
