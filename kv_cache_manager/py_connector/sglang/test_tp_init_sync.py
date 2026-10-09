@@ -42,7 +42,7 @@ import time
 import types
 import unittest
 from contextlib import contextmanager
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, List, Optional
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -133,15 +133,19 @@ class ScriptedConnector(HiCacheKVCM):
         self.storage_tp_group = group
         self.kv_factor = 2
         self.instance_id = "tp-init-sync-test"
-        self.location_spec_name = f"tp_{tp_rank}"
         self.location_spec_size = 4096
         self.write_timeout_seconds = 5
         self.has_mamba = with_mamba
         self.has_indexer = False
         self.registered_pools = {}
+        # Same names as _init_kvcm_client would pick: the MLA KV pool is
+        # replicated, so every rank uses rank 0's KV spec, while the Mamba pool
+        # is rank-sharded and every rank uses its own linear spec.
+        kv_spec_rank = 0 if is_mla_model else tp_rank
+        self.location_spec_name = self._tp_rank_to_spec_name(kv_spec_rank)
         if with_mamba:
             self.mamba_spec_size = MAMBA_BYTES_PER_TOKEN
-            self.mamba_location_spec_name = f"tp_{tp_rank}_linear"
+            self.mamba_location_spec_name = self._tp_rank_to_linear_spec_name(tp_rank)
             self.registered_pools[PoolName.MAMBA] = _FakeMambaPool()
         self.backup_pgs = []
         self.backup_bandwidth = []
@@ -177,7 +181,9 @@ class ScriptedConnector(HiCacheKVCM):
             raise RuntimeError("simulated local initialization failure")
         self._client_ready = True
 
-    def _ensure_client_for_write(self) -> None:
+    def _ensure_client_for_write(
+        self, pool_transfers: Optional[List[PoolTransfer]] = None
+    ) -> None:
         """The production gate, with the agreement region marked for the fixture.
 
         Everything the connector reduces while this method runs *is* the
@@ -190,34 +196,67 @@ class ScriptedConnector(HiCacheKVCM):
         """
         self.script.in_agreement = True
         try:
-            super()._ensure_client_for_write()
+            super()._ensure_client_for_write(pool_transfers)
         finally:
             self.script.in_agreement = False
 
-    def _start_write_cache(self, request: Any) -> dict:
-        """A Manager's answer: this rank writes ``blocks_to_write`` of the blocks.
+    def session_specs(self, group_names: Any) -> list:
+        """The spec names a Manager lists for a session over ``group_names``.
 
-        Every location carries this rank's KV spec plus, when the fixture has a
-        Mamba pool, its spec as well -- a real Manager lists every spec of the
-        block, and the v2 path picks its own name out of that list.
+        A group session covers every rank of the group, and the connector picks
+        its own name out of the list; a session without a group name is the
+        instance's own spec.
         """
-        if self.on_write_session is not None:
-            self.on_write_session()
-        specs = [("kv", self.location_spec_name)]
-        if self.has_mamba:
-            specs.append(("linear", self.mamba_location_spec_name))
+        if not group_names:
+            return [self.location_spec_name]
+        group = group_names[0]
+        if group == self._get_kv_spec_group():
+            return [
+                self._tp_rank_to_spec_name(rank) for rank in range(self.tp_world_size)
+            ]
+        for pool in (PoolName.MAMBA, PoolName.INDEXER):
+            if group == self._get_extra_pool_spec_group(pool):
+                namer = (
+                    self._tp_rank_to_linear_spec_name
+                    if pool == PoolName.MAMBA
+                    else self._tp_rank_to_indexer_spec_name
+                )
+                return [namer(rank) for rank in range(self.tp_world_size)]
+        raise AssertionError(f"fixture does not know spec group {group!r}")
+
+    def manager_session(self, group_names: Any, block_count: int) -> dict:
+        """A Manager's answer for a session over ``block_count`` requested blocks.
+
+        As for a real write-through session, only the trailing
+        ``blocks_to_write`` blocks need data, so that is how many locations come
+        back and the mask says where they start.
+        """
+        specs = self.session_specs(group_names)
         return {
             "locations": [
                 {
                     "location_specs": [
-                        {"name": name, "uri": f"{prefix}-{i}"} for prefix, name in specs
+                        {"name": name, "uri": f"{name}-{i}"} for name in specs
                     ]
                 }
                 for i in range(self.blocks_to_write)
             ],
             "write_session_id": "write-session-1",
-            "block_mask": {"offset": len(request["block_keys"]) - self.blocks_to_write},
+            "block_mask": {"offset": block_count - self.blocks_to_write},
         }
+
+    def peer_session(self) -> dict:
+        """The session rank 0 opened, as one of its peers receives it."""
+        group = self._get_extra_pool_spec_group(PoolName.MAMBA)
+        return self.manager_session([group], self.blocks_to_write)
+
+    def _start_write_cache(self, request: Any) -> dict:
+        """The session this rank opens for its own write."""
+        if self.on_write_session is not None:
+            self.on_write_session()
+        return self.manager_session(
+            request["location_spec_group_names"], len(request["block_keys"])
+        )
 
 
 class _CollectiveScript:
@@ -238,6 +277,9 @@ class _CollectiveScript:
         self.peer_ready = peer_ready
         self.peer_wrote = peer_wrote
         self.in_agreement = False
+        # What a peer's broadcast delivers: the write session rank 0 opened,
+        # as this rank receives it (set by _write_pair).
+        self.peer_session: Optional[Callable[[], dict]] = None
         # Agreement rounds: (operator, shape, dtype, group).
         self.agreements: list = []
         # The write path's own collectives, i.e. what must not be reached when
@@ -253,7 +295,10 @@ def _patched_tp_collectives(script: _CollectiveScript) -> Iterator[_CollectiveSc
     The agreement reduce folds the peer's readiness in with MIN, exactly like
     the real reduce.  The write path's own collectives are recorded instead --
     a real peer would block there, so reaching them is what the tests assert
-    on.  Classification comes from ``script.in_agreement``.
+    on.  Classification comes from ``script.in_agreement``.  A one-element
+    broadcast is rank 0's write session, so it is delivered like a real peer
+    would receive it; the four-element one is the v1 session and stays empty,
+    which is what the v1 tests want to observe.
     """
 
     def fake_all_reduce(tensor: Any, op: Any = None, group: Any = None) -> None:
@@ -267,8 +312,14 @@ def _patched_tp_collectives(script: _CollectiveScript) -> Iterator[_CollectiveSc
         if not script.peer_wrote:
             tensor.fill_(0)
 
-    def fake_broadcast(*args: Any, **kwargs: Any) -> None:
+    def fake_broadcast(object_list: Any = None, **kwargs: Any) -> None:
         script.broadcasts.append(kwargs.get("group"))
+        if (
+            script.peer_session is not None
+            and isinstance(object_list, list)
+            and len(object_list) == 1
+        ):
+            object_list[0] = script.peer_session()
 
     with (
         mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce),
@@ -282,7 +333,9 @@ def _write_pair(
 ) -> tuple[ScriptedConnector, _CollectiveScript]:
     """A connector and the scripted TP group it will agree with."""
     script = _CollectiveScript(peer_ready=peer_ready, peer_wrote=peer_wrote)
-    return ScriptedConnector(script=script, **connector), script
+    instance = ScriptedConnector(script=script, **connector)
+    script.peer_session = instance.peer_session
+    return instance, script
 
 
 def _transfer() -> PoolTransfer:
@@ -295,6 +348,18 @@ def _transfer() -> PoolTransfer:
 
 def _host_indices() -> torch.Tensor:
     return torch.arange(len(WRITE_KEYS) * PAGE_SIZE)
+
+
+def _write_sessions(connector: ScriptedConnector) -> Any:
+    """The mocked Manager's ``start_write_cache`` (Any: it is a Mock)."""
+    manager: Any = connector._manager_client
+    return manager.start_write_cache
+
+
+def _write_commits(connector: ScriptedConnector) -> Any:
+    """The mocked Manager's ``finish_write_cache`` (Any: it is a Mock)."""
+    manager: Any = connector._manager_client
+    return manager.finish_write_cache
 
 
 def _storage_config(**overrides: Any) -> HiCacheStorageConfig:
@@ -330,11 +395,6 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
         GROUP,
     )
 
-    def _write_sessions(self, connector: ScriptedConnector) -> Any:
-        """The mocked Manager's ``start_write_cache`` (Any: it is a Mock)."""
-        manager: Any = connector._manager_client
-        return manager.start_write_cache
-
     def _assert_rounds(self, script: _CollectiveScript, calls: int) -> None:
         """One agreement per write call, on the write path's own group.
 
@@ -368,7 +428,7 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
                 self.assertFalse(connector._tp_init_agreed)
                 self.assertEqual(connector.init_attempts, 2, "both paths retried")
                 self.assertIsNone(
-                    self._write_sessions(connector).call_args,
+                    _write_sessions(connector).call_args,
                     "no write session may be opened when the group is not ready",
                 )
 
@@ -390,7 +450,7 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
             "a failed round must not be remembered as an agreement",
         )
         self.assertIsNone(
-            self._write_sessions(connector).call_args,
+            _write_sessions(connector).call_args,
             "no write session may be opened when the group is not ready",
         )
 
@@ -414,7 +474,7 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
         self._assert_rounds(script, calls=2)
         self.assertTrue(connector._tp_init_agreed)
         self.assertIsNotNone(
-            self._write_sessions(connector).call_args,
+            _write_sessions(connector).call_args,
             "the recovered call must write like any healthy call",
         )
 
@@ -487,7 +547,7 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
         self.assertEqual(first, expected)
         self.assertEqual(second, expected)
         self.assertEqual(
-            self._write_sessions(connector).call_count,
+            _write_sessions(connector).call_count,
             2,
             "one write session per v2 call",
         )
@@ -500,6 +560,158 @@ class TestWritePathsAgreeOnInitialization(unittest.TestCase):
             "the v2 flag is a 0-dim tensor, once per transfer",
         )
         self.assertEqual(len(script.broadcasts), 2, "one per transfer on rank 0")
+
+
+class TestRankShardedSidecarsAcrossTheGroup(unittest.TestCase):
+    """A rank-sharded sidecar is written by every rank, MLA included.
+
+    sglang hands each TP rank its own Mamba/KDA shard and expects all of them
+    to write it, even when the primary MLA KV is replicated and only rank 0
+    writes that.  The connector used to drop the call on non-zero MLA ranks,
+    which left storage holding rank 0's shard while the group committed the
+    blocks.
+    """
+
+    def _probe(self, value: bool) -> Any:
+        return mock.patch.object(
+            connector_module, "_sidecars_are_written_by_every_rank", lambda: value
+        )
+
+    def test_the_probe_follows_the_hybrid_controller_shape(self) -> None:
+        """The version probe reads the class shape, not a guessed version.
+
+        v0.5.17 gave ``HybridCacheController`` its own ``backup_thread_func``
+        (the base one still gates on ``backup_skip``), and that override is what
+        makes a non-zero MLA rank reach ``batch_set_v2`` at all -- the one
+        signal the connector needs to decide whether its peers will arrive.  An
+        unknown shape must answer "no", because that protocol is the safe one.
+        """
+        probe = connector_module._sidecars_are_written_by_every_rank
+        module = types.ModuleType(
+            "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller"
+        )
+
+        class WithoutTheOverride:
+            """The shape up to v0.5.16."""
+
+        class WithTheOverride:
+            """The shape since v0.5.17."""
+
+            def backup_thread_func(self) -> None:
+                raise NotImplementedError
+
+        with mock.patch.dict(sys.modules, {module.__name__: module}):
+            for hybrid_controller, expected in (
+                (WithoutTheOverride, False),
+                (WithTheOverride, True),
+            ):
+                with self.subTest(shape=hybrid_controller.__name__):
+                    setattr(module, "HybridCacheController", hybrid_controller)
+                    probe.cache_clear()
+                    self.assertEqual(probe(), expected)
+        probe.cache_clear()
+
+    def test_mla_sharded_sidecar_is_written_by_every_rank(self) -> None:
+        """Codex P1: a non-zero MLA rank writes its own shard, collectively."""
+        connector, script = _write_pair(
+            local_init_ok=True,
+            peer_ready=True,
+            tp_rank=1,
+            with_mamba=True,
+            is_mla_model=True,
+        )
+
+        with self._probe(True), _patched_tp_collectives(script):
+            result = connector.batch_set_v2([_transfer()])
+
+        self.assertEqual(result, {PoolName.MAMBA: [True, True]})
+        self.assertTrue(connector._tp_init_agreed)
+        self.assertEqual(len(script.agreements), 1, "the write joins the group")
+        self.assertEqual(script.broadcasts, [GROUP], "rank 0's session is waited for")
+        self.assertIsNone(
+            _write_sessions(connector).call_args,
+            "rank 0 opens the session for the group",
+        )
+        self.assertIsNone(
+            _write_commits(connector).call_args,
+            "rank 0 commits the group's blocks",
+        )
+        uris = connector.transfer_client.SaveKvCaches.call_args.args[0]
+        self.assertEqual(
+            uris,
+            ["tp_1_linear-0", "tp_1_linear-1"],
+            "the rank writes its own slice of the sharded pool",
+        )
+        self.assertEqual(
+            [shape for _, shape, _, _ in script.write_reduces],
+            [()],
+            "the per-block commit waits for every rank's flag",
+        )
+
+    def test_mla_sharded_sidecar_without_peer_writes_is_refused(self) -> None:
+        """Releases that write only rank 0's shard get no collective.
+
+        Before v0.5.17 a non-zero MLA rank never reached ``batch_set_v2``, so
+        waiting for it would hang; the shard it never wrote is reported as a
+        miss instead of loading rank 0's shard into its pool.
+        """
+        connector, script = _write_pair(
+            local_init_ok=True,
+            peer_ready=True,
+            tp_rank=1,
+            with_mamba=True,
+            is_mla_model=True,
+        )
+
+        with self._probe(False), _patched_tp_collectives(script):
+            with self.assertLogs(connector_module.__name__, "WARNING") as logs:
+                result = connector.batch_set_v2([_transfer()])
+
+        self.assertEqual(result, {PoolName.MAMBA: [False, False]})
+        self.assertIn("does not write from this rank", logs.records[0].getMessage())
+        self.assertEqual(script.agreements, [], "no peer would join the round")
+        self.assertEqual(script.broadcasts, [])
+        self.assertEqual(script.write_reduces, [])
+        self.assertIsNone(connector.transfer_client.SaveKvCaches.call_args)
+
+    def test_mla_kv_write_stays_rank0_only(self) -> None:
+        """The replicated MLA KV keeps its rank-0-only write path."""
+        connector, script = _write_pair(
+            local_init_ok=True,
+            peer_ready=True,
+            tp_rank=1,
+            with_mamba=True,
+            is_mla_model=True,
+        )
+
+        with self._probe(True), _patched_tp_collectives(script):
+            with self.assertLogs(connector_module.__name__, "WARNING"):
+                result = connector.batch_set_v1(WRITE_KEYS, _host_indices())
+
+        self.assertEqual(result, [False] * len(WRITE_KEYS))
+        self.assertEqual(
+            script.agreements,
+            [],
+            "a replicated KV write runs rank-0 only, with no peers to agree with",
+        )
+        self.assertEqual(script.broadcasts, [])
+
+    def test_non_mla_rank_writes_its_own_sidecar_through_the_session(self) -> None:
+        """Non-MLA: every rank writes its own spec, as it always did."""
+        connector, script = _write_pair(
+            local_init_ok=True, peer_ready=True, tp_rank=1, with_mamba=True
+        )
+
+        with _patched_tp_collectives(script):
+            result = connector.batch_set_v2([_transfer()])
+
+        self.assertEqual(result, {PoolName.MAMBA: [True, True]})
+        self.assertEqual(len(script.agreements), 1)
+        self.assertEqual(script.broadcasts, [GROUP])
+        self.assertEqual(
+            connector.transfer_client.SaveKvCaches.call_args.args[0],
+            ["tp_1_linear-0", "tp_1_linear-1"],
+        )
 
 
 class TestPathsThatDoNotJoinTheGroup(unittest.TestCase):
