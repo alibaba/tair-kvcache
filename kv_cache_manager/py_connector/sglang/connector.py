@@ -92,6 +92,13 @@ class HiCacheKVCM(HiCacheStorage):
     compressed KV pool anchors on a tensorless ``LogicalHostPool`` that is not
     a host pool -- initialization reports it once and every storage call for
     that instance degrades to a miss.
+
+    The write paths are the only callers of the connector's TP collectives,
+    and those need every rank of the group.  They therefore agree with the
+    group on initialization before entering any of them: a rank that cannot
+    create its client publishes that instead of returning, and the whole group
+    then refuses the write (``_ensure_client_for_write``).  Reads are
+    rank-local and never wait for another rank.
     """
 
     # Pools already reported as unusable -- either unknown to this connector
@@ -108,6 +115,12 @@ class HiCacheKVCM(HiCacheStorage):
     # hand to drive one code path); a real backend sets these in __init__.
     _client_ready: bool = False
     _closed: bool = False
+    # Read by the write paths before the client exists, hence the default; a
+    # real backend sets it from the storage config in __init__.
+    is_mla_model: bool = False
+    # Whether a round of _ensure_client_for_write() has already seen every
+    # rank of the TP group ready (see that method).
+    _tp_init_agreed: bool = False
     # Immutable so hand-built instances (tests bypass __init__) can read it
     # without sharing one mutable object: late names are added by rebinding,
     # never by mutating a shared set.
@@ -130,6 +143,11 @@ class HiCacheKVCM(HiCacheStorage):
         self.instance_group = self.extra_config["instance_group"]
         self.instance_id = self.extra_config["instance_id"]
 
+        # Also read in _init_kvcm_client, but needed earlier: whether the write
+        # paths run TP collectives is decided on the first write call, which is
+        # before the client exists (an MLA write never uses the group).
+        self.is_mla_model = self.storage_config.is_mla_model
+
         self._manager_client = KvCacheManagerClient.from_connector_config(
             self.extra_config
         )
@@ -145,12 +163,13 @@ class HiCacheKVCM(HiCacheStorage):
         # for these names instead of pairing them with a registered spec.
         self._late_pools = set()
 
-        # _init_lock guards the one-time client initialization; the two flags
-        # are instance state (class-level defaults keep hand-built instances
+        # _init_lock guards the one-time client initialization; the flags are
+        # instance state (class-level defaults keep hand-built instances
         # -- tests -- from raising on the first check).
         self._init_lock = threading.Lock()
         self._client_ready = False
         self._closed = False
+        self._tp_init_agreed = False
 
         # SDK handles, created by _ensure_client() and dropped by close().
         self.transfer_client: Any = None
@@ -194,6 +213,14 @@ class HiCacheKVCM(HiCacheStorage):
                 group_ranks, backend="gloo"
             )
 
+    def _raise_if_closed(self) -> None:
+        """Refuse to serve once ``close()`` retired this backend."""
+        if self._closed:
+            raise RuntimeError(
+                "connector was closed; storage stays disabled until the "
+                "backend is re-attached"
+            )
+
     def _ensure_client(self) -> None:
         """Register with the Manager and create the SDK client, once.
 
@@ -203,27 +230,22 @@ class HiCacheKVCM(HiCacheStorage):
         different configuration is rejected and there is no spec update API.
         Pools registered later are degraded, see ``register_mem_host_pool_v2``.
 
-        No collective happens here, so ranks may initialize at different times.
+        No collective happens here, so ranks may initialize at different times
+        and the read paths call this directly.  The write paths must agree on
+        the outcome first, see ``_ensure_client_for_write``.
         Raises on failure: the ``batch_*`` callers turn that into a
         conservative result and retry on their next call.
         """
         # Checked before the ready flag: close() tears the client down, so a
         # late storage call must fail with a clear message instead of using it.
-        if self._closed:
-            raise RuntimeError(
-                "connector was closed; storage stays disabled until the "
-                "backend is re-attached"
-            )
+        self._raise_if_closed()
         if self._client_ready:
             return
         with self._init_lock:
             if self._client_ready:
                 return
-            if self._closed:
-                raise RuntimeError(
-                    "connector was closed; storage stays disabled until the "
-                    "backend is re-attached"
-                )
+            self._raise_if_closed()
+
             kv_pool = self.registered_pools.get(PoolName.KV)
             if kv_pool is None:
                 raise RuntimeError(
@@ -244,10 +266,98 @@ class HiCacheKVCM(HiCacheStorage):
             self._init_kvcm_client()
             self._client_ready = True
 
+    def _write_path_uses_tp_collectives(self) -> bool:
+        """Whether the write paths run collectives over the TP group.
+
+        Exactly the guard around every collective in ``_batch_set`` and
+        ``batch_set_v2``: a single rank has nobody to wait for, and an MLA
+        model writes from rank 0 only, without a collective.  Only
+        rank-independent inputs are read (parallel sizes, model kind), so
+        every rank answers the same -- a rank-dependent answer here would
+        split the group, which is what this whole path exists to prevent.
+        """
+        return getattr(self, "tp_world_size", 1) > 1 and not self.is_mla_model
+
+    def _ensure_client_for_write(self) -> None:
+        """``_ensure_client`` plus the TP-group agreement the write paths need.
+
+        The write paths are the only callers of the connector's TP collectives
+        (``_batch_set``, ``batch_set_v2``), and a collective needs the whole
+        group: a rank whose client cannot be created would otherwise answer
+        conservatively and leave its peers waiting in
+        ``broadcast_object_list`` / ``all_reduce`` for a rank that is already
+        gone.  So the local outcome is published instead of being decided
+        locally:
+
+        * no collective on this path (single rank, or MLA writes from rank 0
+          only) -> plain local initialization, exactly as before;
+        * a previous round already saw every rank ready -> return, so the
+          steady state pays no extra collective;
+        * otherwise one ``all_reduce(MIN)``, which every rank enters *before*
+          the first write collective;
+        * any rank failed -> *every* rank refuses the write, i.e. the callers
+          turn it into their conservative result and no rank enters a write
+          collective that another rank will never reach;
+        * the group is missing -> refuse the write rather than run a
+          collective nobody coordinates (``group=None`` means torch's
+          *default* group, not "no group").
+
+        ``close()`` is checked first, so a retired backend fails here exactly
+        like it does on the read paths, agreement or not.
+
+        The failing rank does not return early: it records the error, joins
+        the round and only then fails with it.  Readiness only ever turns from
+        False to True, so a round that saw the whole group ready is final for
+        this backend instance; until such a round happens every write call
+        repeats it, which is what keeps a rank that failed once from slipping
+        into a later write whose peers would already be waiting for it.
+        Nothing is sticky, so the next call retries initialization.
+        """
+        self._raise_if_closed()
+        if not self._write_path_uses_tp_collectives():
+            self._ensure_client()
+            return
+        if self._tp_init_agreed:
+            return
+
+        local_error: Optional[BaseException] = None
+        try:
+            self._ensure_client()
+        except Exception as e:
+            # Deliberately no early return: the ranks that did initialize are
+            # already on their way to the write collectives and this rank has
+            # to be in the round that tells them to stop.
+            local_error = e
+
+        # The agreement runs on the same group as the collectives it guards;
+        # every rank that would reach them reaches this first.  A missing
+        # group is a failure: peers may be about to wait here, and running the
+        # write collectives on torch's default group instead is never wanted.
+        group = getattr(self, "storage_tp_group", None)
+        if group is None:
+            raise RuntimeError(
+                "the connector has no TP process group to agree on storage "
+                "initialization with; refusing to write, because the write "
+                "collectives would wait for ranks that cannot answer"
+            )
+        ready = torch.tensor([0 if local_error is not None else 1], dtype=torch.int)
+        torch.distributed.all_reduce(
+            ready, op=torch.distributed.ReduceOp.MIN, group=group
+        )
+        if not bool(ready.item()):
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError(
+                "storage initialization failed on at least one rank of the TP "
+                "group; this rank refuses the write so that no rank waits in a "
+                "collective another rank will never reach"
+            )
+        self._tp_init_agreed = True
+
     def _init_kvcm_client(self) -> None:
-        # model
+        # model (is_mla_model is set in __init__ already: the write paths need
+        # it before the client exists)
         self.model_name = self.storage_config.model_name
-        self.is_mla_model = self.storage_config.is_mla_model
         self.kv_factor = 1 if self.is_mla_model else 2
         # The KV pool comes from the v1 hook (plain host pool) or from the v2
         # hook when v1 only carried a HostPoolGroup; _ensure_client rejects an
@@ -999,7 +1109,9 @@ class HiCacheKVCM(HiCacheStorage):
     ) -> List[bool]:
         trace_id = self._get_trace_id()
         try:
-            self._ensure_client()
+            # The group agreement, not just the local init: _batch_set runs
+            # collectives that need every rank (see _ensure_client_for_write).
+            self._ensure_client_for_write()
             result = self._batch_set(
                 keys=keys,
                 host_indices=host_indices,
@@ -1029,7 +1141,9 @@ class HiCacheKVCM(HiCacheStorage):
         results = {}
         trace_id = self._get_trace_id()
         try:
-            self._ensure_client()
+            # Same group agreement as the v1 write path: the per-transfer
+            # broadcasts below need every rank too.
+            self._ensure_client_for_write()
             for transfer in transfers:
                 spec_name = self._get_extra_pool_spec_name(transfer.name)
                 pool = self.registered_pools.get(transfer.name)
