@@ -23,6 +23,8 @@ bool KvcmEventSubscriptionConfig::FromRapidValue(const rapidjson::Value &rapid_v
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_, int64_t(5000));
     KVCM_JSON_GET_MACRO(rapid_value, "capacity_gb", capacity_gb_);
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "full_location_spec_group_name", full_location_spec_group_name_, std::string());
     return Validate();
 }
 
@@ -31,6 +33,7 @@ void KvcmEventSubscriptionConfig::ToRapidWriter(rapidjson::Writer<rapidjson::Str
     Put(writer, "consumer_id", consumer_id_);
     Put(writer, "discovery_refresh_interval_ms", discovery_refresh_interval_ms_);
     Put(writer, "capacity_gb", capacity_gb_);
+    Put(writer, "full_location_spec_group_name", full_location_spec_group_name_);
 }
 
 bool KvcmEventSubscriptionConfig::Validate() const {

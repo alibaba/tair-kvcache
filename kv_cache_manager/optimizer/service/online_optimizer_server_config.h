@@ -21,6 +21,7 @@ public:
     const std::string &consumer_id() const { return consumer_id_; }
     int64_t discovery_refresh_interval_ms() const { return discovery_refresh_interval_ms_; }
     const std::vector<double> &capacity_gb() const { return capacity_gb_; }
+    const std::string &full_location_spec_group_name() const { return full_location_spec_group_name_; }
 
 private:
     friend class OnlineOptimizerServerConfig;
@@ -29,6 +30,8 @@ private:
     std::string consumer_id_ = "online-optimizer";
     int64_t discovery_refresh_interval_ms_ = 5000;
     std::vector<double> capacity_gb_;
+    // Explicitly select the full-attention group for full-only replay of hybrid producers.
+    std::string full_location_spec_group_name_;
 };
 
 class OnlineOptimizerServerConfig : public Jsonizable {

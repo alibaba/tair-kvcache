@@ -306,7 +306,8 @@ void OptimizerServiceImpl::GetInstance(RequestContext *request_context,
 
 ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
                                                        std::unordered_set<std::string> &unsupported_instance_ids,
-                                                       const std::vector<double> &capacity_gb_override) {
+                                                       const std::vector<double> &capacity_gb_override,
+                                                       const std::string &full_location_spec_group_name) {
     unsupported_instance_ids.clear();
     if (!manager_) {
         KVCM_LOG_ERROR("ApplyKvcmConfiguration: optimizer manager is null");
@@ -374,7 +375,7 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
         if (manager_->GetInstanceState(source.instance_id(), [](const InstanceState &) {}) == EC_OK) {
             continue;
         }
-        if (source.location_spec_groups_size() > 1) {
+        if (source.location_spec_groups_size() > 1 && full_location_spec_group_name.empty()) {
             KVCM_LOG_WARN("ApplyKvcmConfiguration: ignore unsupported multi-group instance[%s], groups=%d",
                           source.instance_id().c_str(),
                           source.location_spec_groups_size());
@@ -415,7 +416,7 @@ ErrorCode OptimizerServiceImpl::ApplyKvcmConfiguration(const proto::optimizer::K
                                        spec_infos,
                                        spec_groups,
                                        0,
-                                       OptimizerStateInfo());
+                                       OptimizerStateInfo(full_location_spec_group_name, ""));
         RegisterInstanceResult result;
         const ErrorCode ec = manager_->RegisterInstance(instance, result);
         if (ec != EC_OK) {

@@ -22,6 +22,18 @@ TEST_F(OnlineOptimizerServerConfigTest, DefaultValues) {
     EXPECT_TRUE(config.kvcm_event_subscriptions().empty());
 }
 
+TEST_F(OnlineOptimizerServerConfigTest, FullGroupSelectorRoundTripAndReset) {
+    KvcmEventSubscriptionConfig config;
+    ASSERT_TRUE(config.FromJsonString(R"({"service_discovery_url":"static://127.0.0.1:6381",
+        "full_location_spec_group_name":"full_cache"})"));
+    EXPECT_EQ("full_cache", config.full_location_spec_group_name());
+    KvcmEventSubscriptionConfig roundtrip;
+    ASSERT_TRUE(roundtrip.FromJsonString(config.ToJsonString()));
+    EXPECT_EQ("full_cache", roundtrip.full_location_spec_group_name());
+    ASSERT_TRUE(config.FromJsonString(R"({"service_discovery_url":"static://127.0.0.1:6381"})"));
+    EXPECT_TRUE(config.full_location_spec_group_name().empty());
+}
+
 TEST_F(OnlineOptimizerServerConfigTest, ParseFromJson) {
     std::string json = R"({
         "rpc_port": 50053,

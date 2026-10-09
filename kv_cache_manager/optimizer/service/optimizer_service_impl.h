@@ -63,7 +63,8 @@ public:
     // KVCM ingress
     ErrorCode ApplyKvcmConfiguration(const proto::optimizer::KvcmConfigurationResponse &configuration,
                                      std::unordered_set<std::string> &unsupported_instance_ids,
-                                     const std::vector<double> &capacity_gb_override = {});
+                                     const std::vector<double> &capacity_gb_override = {},
+                                     const std::string &full_location_spec_group_name = "");
 
     // TraceQuery
     ErrorCode ExecuteTraceQuery(const proto::optimizer::TraceQueryRequest &request,

@@ -645,6 +645,47 @@ TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationRejectsInvalidSupportedIn
     EXPECT_NE(EC_OK, manager_->GetInstanceState("invalid-instance", [](const InstanceState &) {}));
 }
 
+TEST_F(OptimizerServiceImplTest, ApplyKvcmConfigurationSelectsFullGroupWithoutLinearState) {
+    proto::optimizer::KvcmConfigurationResponse configuration;
+    auto *group = configuration.add_instance_groups();
+    group->set_name("hybrid-group");
+    group->set_capacity_bytes(1024 * 1024 * 1024);
+    auto *instance = configuration.add_instances();
+    instance->set_instance_group_name("hybrid-group");
+    instance->set_instance_id("hybrid-instance");
+    instance->set_block_size(4);
+    for (const auto *name : {"mamba_state", "full_cache"}) {
+        auto *spec = instance->add_location_spec_infos();
+        spec->set_name(name);
+        spec->set_size(std::string(name) == "full_cache" ? 16 : 1024);
+        auto *spec_group = instance->add_location_spec_groups();
+        spec_group->set_name(name);
+        spec_group->add_spec_names(name);
+    }
+    std::unordered_set<std::string> unsupported;
+    EXPECT_EQ(EC_BADARGS, service_->ApplyKvcmConfiguration(configuration, unsupported, {}, "missing"));
+    EXPECT_NE(EC_OK, manager_->GetInstanceState("hybrid-instance", [](const InstanceState &) {}));
+    ASSERT_EQ(EC_OK, service_->ApplyKvcmConfiguration(configuration, unsupported, {}, "full_cache"));
+    EXPECT_TRUE(unsupported.empty());
+    ASSERT_EQ(EC_OK, manager_->GetInstanceState("hybrid-instance", [](const InstanceState &state) {
+        EXPECT_EQ(0, state.instance_info->linear_step());
+        EXPECT_EQ("full_cache", state.instance_info->optimizer_state_info().full_location_spec_group_name());
+        EXPECT_TRUE(state.instance_info->optimizer_state_info().linear_location_spec_group_name().empty());
+        EXPECT_EQ(16, state.size_full);
+    }));
+    proto::optimizer::TraceQueryRequest request;
+    request.set_instance_id("hybrid-instance");
+    request.set_input_token_len(8);
+    request.add_block_keys(11);
+    request.add_block_keys(22);
+    proto::optimizer::TraceQueryResponse response;
+    ASSERT_EQ(EC_OK, service_->ExecuteTraceQuery(request, &response));
+    EXPECT_EQ(0, response.theoretical_result().max_hit_count());
+    response.Clear();
+    ASSERT_EQ(EC_OK, service_->ExecuteTraceQuery(request, &response));
+    EXPECT_EQ(2, response.theoretical_result().max_hit_count());
+}
+
 TEST_F(OptimizerServiceImplTest, FullAttentionTraceQueryUsesInputTokenLength) {
     CreateTestGroup("grp1");
 

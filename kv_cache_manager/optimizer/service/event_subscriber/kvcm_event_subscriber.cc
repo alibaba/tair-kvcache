@@ -185,8 +185,8 @@ bool KvcmEventSubscriber::SyncConfiguration(const std::string &leader_endpoint) 
     }
 
     std::unordered_set<std::string> unsupported_instance_ids;
-    const ErrorCode ec =
-        optimizer_service_->ApplyKvcmConfiguration(response, unsupported_instance_ids, config_.capacity_gb());
+    const ErrorCode ec = optimizer_service_->ApplyKvcmConfiguration(
+        response, unsupported_instance_ids, config_.capacity_gb(), config_.full_location_spec_group_name());
     if (ec != EC_OK) {
         KVCM_LOG_WARN("KvcmEventSubscriber: apply configuration from leader[%s] failed, ec=%d",
                       leader_endpoint.c_str(),
