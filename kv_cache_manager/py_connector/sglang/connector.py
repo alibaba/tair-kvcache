@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import logging
 import threading
@@ -53,6 +54,44 @@ from kv_cache_manager.py_connector.common._version_info import (  # ty: ignore[u
 logger = logging.getLogger(__name__)
 
 
+# Pools sglang shards across the TP ranks of a hybrid stack: every rank owns a
+# slice and is handed its own transfer, even when the primary KV is replicated
+# (MLA).  Mirrors the upstream filter that decides what a non-zero MLA rank
+# writes: ``HybridCacheController.should_backup()`` from v0.5.18 on (Mamba/KDA
+# only, plus mooncake's MHA draft pools, which this connector does not manage)
+# and v0.5.17's equivalent Mamba filter in ``_page_backup``.
+_RANK_SHARDED_POOLS = (PoolName.MAMBA,)
+
+
+@functools.lru_cache(maxsize=1)
+def _sidecars_are_written_by_every_rank() -> bool:
+    """Whether this sglang hands rank-sharded sidecars to every TP rank.
+
+    ``HybridCacheController`` only started to run the whole backup path on
+    every rank in v0.5.17: from there it defines its own
+    ``backup_thread_func`` (hybrid_cache_controller.py:718 in v0.5.17, :739 in
+    v0.5.19), which no longer inherits the base controller's ``backup_skip``
+    gate (managers/cache_controller.py:1222 in v0.5.16), and filters the
+    transfers down to the rank-owned pools (``should_backup`` since v0.5.18,
+    an inline Mamba filter in v0.5.17).  Before that, a non-zero MLA rank never
+    reached ``batch_set_v2`` at all, so a write that waits for it there would
+    hang.
+
+    Structural probe rather than a version comparison on purpose: an upstream
+    shape we do not recognise falls back to the rank-0-only protocol -- safe,
+    just unable to reuse the sidecar of a sharded pool -- instead of waiting
+    for ranks that may never arrive.  Only a hybrid stack defines this class,
+    and only a hybrid stack has sidecar pools to write.
+    """
+    try:
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+    except ImportError:
+        return False
+    return "backup_thread_func" in vars(HybridCacheController)
+
+
 class _UnsupportedBackendError(RuntimeError):
     """The connector cannot serve this backend, and retrying cannot change it.
 
@@ -99,6 +138,12 @@ class HiCacheKVCM(HiCacheStorage):
     create its client publishes that instead of returning, and the whole group
     then refuses the write (``_ensure_client_for_write``).  Reads are
     rank-local and never wait for another rank.
+
+    Which ranks write what follows sglang's own split: an MLA KV pool is
+    replicated and written by rank 0 alone, while a hybrid model's rank-sharded
+    sidecars (Mamba/KDA state, e.g. Kimi-K3) are handed to every rank, which
+    then each write their own slice into their own rank spec.  A sidecar write
+    that spans the group is committed only for the blocks every rank wrote.
     """
 
     # Pools already reported as unusable -- either unknown to this connector
@@ -266,19 +311,56 @@ class HiCacheKVCM(HiCacheStorage):
             self._init_kvcm_client()
             self._client_ready = True
 
-    def _write_path_uses_tp_collectives(self) -> bool:
-        """Whether the write paths run collectives over the TP group.
+    def _transfer_is_written_by_every_rank(self, transfer: PoolTransfer) -> bool:
+        """Whether sglang hands this transfer to every rank of the TP group.
 
-        Exactly the guard around every collective in ``_batch_set`` and
-        ``batch_set_v2``: a single rank has nobody to wait for, and an MLA
-        model writes from rank 0 only, without a collective.  Only
-        rank-independent inputs are read (parallel sizes, model kind), so
-        every rank answers the same -- a rank-dependent answer here would
-        split the group, which is what this whole path exists to prevent.
+        Non-MLA: yes, ``should_backup()`` answers True on every rank, so every
+        rank writes every pool with its own rank spec.  MLA: only the
+        rank-sharded sidecars (Mamba/KDA state of e.g. Kimi-K3) are written
+        from every rank; the remaining pools are filtered out on non-zero
+        ranks and reach ``batch_set_v2`` from rank 0 alone, so no peer waits
+        for them.  Which of the two protocols the installed sglang implements
+        for those rank-sharded sidecars is decided by
+        ``_sidecars_are_written_by_every_rank``.
         """
-        return getattr(self, "tp_world_size", 1) > 1 and not self.is_mla_model
+        if not self.is_mla_model:
+            return True
+        return (
+            transfer.name in _RANK_SHARDED_POOLS
+            and _sidecars_are_written_by_every_rank()
+        )
 
-    def _ensure_client_for_write(self) -> None:
+    def _write_path_uses_tp_collectives(
+        self, pool_transfers: Optional[List[PoolTransfer]] = None
+    ) -> bool:
+        """Whether this write call runs collectives over the TP group.
+
+        The same condition as the guard in front of every collective the call
+        will run: a single rank has nobody to wait for, the v1 KV write uses
+        the group for a non-MLA model only (an MLA KV pool is replicated and
+        written by rank 0), and the v2 sidecar write joins it for the
+        transfers sglang hands to every rank.  ``pool_transfers`` is what the
+        call was given, so a sidecar write on an MLA model is judged from its
+        own pools instead of from the model kind.
+
+        Only rank-independent inputs are read (parallel sizes, model kind, and
+        for a sidecar write pools whose presence is a property of the tree,
+        not of the rank), so every rank answers the same -- a rank-dependent
+        answer here would split the group, which is what this whole path
+        exists to prevent.
+        """
+        if getattr(self, "tp_world_size", 1) <= 1:
+            return False
+        if not self.is_mla_model:
+            return True
+        return any(
+            self._transfer_is_written_by_every_rank(transfer)
+            for transfer in pool_transfers or []
+        )
+
+    def _ensure_client_for_write(
+        self, pool_transfers: Optional[List[PoolTransfer]] = None
+    ) -> None:
         """``_ensure_client`` plus the TP-group agreement the write paths need.
 
         The write paths are the only callers of the connector's TP collectives
@@ -289,7 +371,7 @@ class HiCacheKVCM(HiCacheStorage):
         gone.  So the local outcome is published instead of being decided
         locally:
 
-        * no collective on this path (single rank, or MLA writes from rank 0
+        * no collective on this path (single rank, or a write that runs rank-0
           only) -> plain local initialization, exactly as before;
         * a previous round already saw every rank ready -> return, so the
           steady state pays no extra collective;
@@ -301,6 +383,11 @@ class HiCacheKVCM(HiCacheStorage):
         * the group is missing -> refuse the write rather than run a
           collective nobody coordinates (``group=None`` means torch's
           *default* group, not "no group").
+
+        ``pool_transfers`` is the sidecar write's transfer list: it decides,
+        together with the model kind, whether this call runs collectives (see
+        ``_write_path_uses_tp_collectives``), and the agreement therefore
+        covers exactly the calls that will reach one.
 
         ``close()`` is checked first, so a retired backend fails here exactly
         like it does on the read paths, agreement or not.
@@ -314,7 +401,7 @@ class HiCacheKVCM(HiCacheStorage):
         Nothing is sticky, so the next call retries initialization.
         """
         self._raise_if_closed()
-        if not self._write_path_uses_tp_collectives():
+        if not self._write_path_uses_tp_collectives(pool_transfers):
             self._ensure_client()
             return
         if self._tp_init_agreed:
@@ -406,9 +493,15 @@ class HiCacheKVCM(HiCacheStorage):
                     {"name": name, "size": self.mamba_spec_size}
                 )
                 linear_spec_names.append(name)
-            mamba_spec_rank = 0 if self.is_mla_model else self.tp_rank
+            # The Mamba/KDA pool is rank-sharded whenever sglang backs it up
+            # from every rank (every non-MLA hybrid, and a hybrid MLA model
+            # with such a sidecar): each rank owns a slice, so each rank writes
+            # and reads its own linear spec.  That is also the honest pair of
+            # the rank-0-only protocol of releases that write only rank 0's
+            # slice: the other ranks then miss instead of loading rank 0's
+            # shard into their own pool.
             self.mamba_location_spec_name = self._tp_rank_to_linear_spec_name(
-                mamba_spec_rank
+                self.tp_rank
             )
             self.location_spec_groups.append(
                 {
@@ -1137,13 +1230,20 @@ class HiCacheKVCM(HiCacheStorage):
         Each PoolTransfer gets its own StartWriteCache -> Save -> FinishWriteCache
         using the pool's spec group, allowing writes to blocks whose KV cache
         was already committed in a separate write session.
+
+        A transfer sglang hands to every rank (``_transfer_is_written_by_every_rank``)
+        is written cooperatively: rank 0 opens the session, every rank writes
+        its own slice with its own rank spec, and the session is only committed
+        for the blocks that every rank reported -- a rank-sharded sidecar is
+        complete in storage only when all of its shards are.  A transfer only
+        rank 0 receives is written here without peers.
         """
         results = {}
         trace_id = self._get_trace_id()
         try:
-            # Same group agreement as the v1 write path: the per-transfer
-            # broadcasts below need every rank too.
-            self._ensure_client_for_write()
+            # The group agreement, for the calls that will reach a collective
+            # below (see _ensure_client_for_write).
+            self._ensure_client_for_write(transfers)
             for transfer in transfers:
                 spec_name = self._get_extra_pool_spec_name(transfer.name)
                 pool = self.registered_pools.get(transfer.name)
@@ -1162,6 +1262,10 @@ class HiCacheKVCM(HiCacheStorage):
 
                 spec_group = self._get_extra_pool_spec_group(transfer.name)
                 block_keys, _, _ = self._prepare_block_keys(keys)
+                # Every rank sglang hands this transfer to takes part in the
+                # session; the others are not called for it at all, so waiting
+                # for them would hang.
+                shared = self._transfer_is_written_by_every_rank(transfer)
 
                 if self.tp_rank == 0:
                     start_trace_id = f"start-v2-{trace_id}"
@@ -1179,23 +1283,24 @@ class HiCacheKVCM(HiCacheStorage):
                             f"start_write_cache failed on rank 0: {trace_id=} {e=}"
                         )
                         write_result = None
-                    if self.tp_world_size > 1 and not self.is_mla_model:
+                    if shared and self.tp_world_size > 1:
                         torch.distributed.broadcast_object_list(
                             [write_result], src=0, group=self.storage_tp_group
                         )
-                elif self.is_mla_model:
-                    logger.warning(
-                        f"batch_set_v2 called on non-rank-0 (tp_rank={self.tp_rank}) "
-                        f"for MLA model; only rank 0 should write. Returning all False."
-                    )
-                    results[transfer.name] = [False] * len(keys)
-                    continue
-                else:
+                elif shared and self.tp_world_size > 1:
                     recv: List[Any] = [None]
                     torch.distributed.broadcast_object_list(
                         recv, src=0, group=self.storage_tp_group
                     )
                     write_result = recv[0]
+                else:
+                    logger.warning(
+                        f"batch_set_v2 called on non-rank-0 (tp_rank={self.tp_rank}) "
+                        f"for pool {transfer.name}, which sglang does not write from "
+                        f"this rank; returning all False."
+                    )
+                    results[transfer.name] = [False] * len(keys)
+                    continue
                 if write_result is None:
                     results[transfer.name] = [False] * len(keys)
                     continue
@@ -1302,7 +1407,9 @@ class HiCacheKVCM(HiCacheStorage):
                     )
                     flag = False
 
-                if self.tp_world_size > 1 and not self.is_mla_model:
+                if shared and self.tp_world_size > 1:
+                    # The block is complete in storage only when every rank
+                    # wrote its slice: commit on the group's minimum.
                     flag_tensor = torch.tensor(flag, dtype=torch.int)
                     torch.distributed.all_reduce(
                         flag_tensor,

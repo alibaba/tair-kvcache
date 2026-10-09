@@ -333,15 +333,30 @@ class TestRegistrationOrders(unittest.TestCase):
         self.assertNotIn("location_spec_groups", payload)
 
     def test_mla_uses_rank0_spec_on_every_rank(self) -> None:
-        """MLA: replicated KV, rank 0 owns every spec, kv_factor stays 1."""
+        """MLA: the replicated KV is rank 0's, a rank-sharded Mamba is not.
+
+        sglang writes a replicated MLA KV pool from rank 0 alone, and hands
+        the rank-sharded Mamba/KDA pool of a hybrid stack to every rank, each
+        owning its own slice.  The two pools therefore disagree on the rank
+        whose spec a rank uses, and both stay as chosen here (see
+        ``test_tp_init_sync.py`` for the write protocol that goes with it).
+        """
         for tp_rank in (0, 1):
             with _patched_parallel_context():
                 connector = _connector(tp_rank=tp_rank, is_mla_model=True)
                 connector.register_mem_pool_host(self._kv_pool())
+                connector.register_mem_host_pool_v2(self._mamba_pool(), PoolName.MAMBA)
                 connector.batch_exists(["block-0"])
 
             self.assertEqual(connector.kv_factor, 1)
-            self.assertEqual(connector.location_spec_name, "tp_0")
+            # Hybrid naming adds the suffix once a sidecar exists; the rank is
+            # what this test is about.
+            self.assertEqual(connector.location_spec_name, "tp_0_full")
+            self.assertEqual(
+                connector.mamba_location_spec_name,
+                f"tp_{tp_rank}_linear",
+                "each rank reads and writes its own Mamba slice",
+            )
 
 
 class TestInitializationTiming(unittest.TestCase):
