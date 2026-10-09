@@ -40,9 +40,14 @@ uv pip install --python .venv/bin/python 'vllm==0.26.0' requests orjson pydantic
 Extra packages per subpackage (install `--no-deps` to keep the pinned
 vLLM intact):
 
-- `sglang/` needs `sglang`. The connector targets sglang v0.5.10 ~ v0.5.18;
-  the type environment for `ty check` is built with 0.5.19 (`--no-deps`
-  avoids it resolving its own vLLM pin).
+- `sglang/` needs `sglang`. The connector targets sglang v0.5.10 ~ v0.5.19.
+  Sidecar pools are stacked through sglang's per-pool
+  `register_mem_host_pool_v2` hook on every supported version (since v0.5.19
+  the v1 hook carries only the KV anchor); the type environment for `ty check`
+  is built with that same 0.5.19 release (`--no-deps` avoids it resolving its
+  own vLLM pin). DeepSeek-V4 compressed KV pools are out of scope: their KV
+  anchor is a tensorless `LogicalHostPool`, so the connector reports it once
+  and degrades every storage call of that instance to a miss.
 - `trtllm/` has no pip-installable source distribution: copy the
   `tensorrt_llm` package of a TensorRT-LLM checkout (v1.2.x) into the
   same site-packages
