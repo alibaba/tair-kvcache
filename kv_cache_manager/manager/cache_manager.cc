@@ -421,7 +421,7 @@ void ResolveUsableTieredWriteTargets(RequestContext *request_context,
             if (backend == nullptr) {
                 admission.status = StorageTargetAdmissionStatus::kNotFound;
                 admission.ec = EC_NOENT;
-            } else if (!backend->Available()) {
+            } else if (!backend->Writable()) {
                 admission.status = StorageTargetAdmissionStatus::kUnavailable;
                 admission.ec = EC_NOENT;
             } else {

@@ -133,8 +133,8 @@ void DataStorageSelector::GetCandidates(RequestContext const *request_context,
                 // is highly likely not to be, though), rather than to
                 // enhance the accuracy of the storage availability
                 // assessment
-                if (!backend->Available()) {
-                    PREFIX_LOG(WARN, "data storage backend is not available: %s", candidate.c_str());
+                if (!backend->Writable()) {
+                    PREFIX_LOG(WARN, "data storage backend is not writable (read-only mode): %s", candidate.c_str());
                     continue;
                 }
                 if (const auto type = backend->GetType(); !storage_quota_avail_table.GetStorageQuotaAvailByType(type)) {
@@ -450,7 +450,7 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
             continue;
         }
         result.type = backend->GetType();
-        if (!backend->Available()) {
+        if (!backend->Writable()) {
             result.status = StorageTargetAdmissionStatus::kUnavailable;
             result.ec = EC_NOENT;
             continue;
