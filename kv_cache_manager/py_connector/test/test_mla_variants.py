@@ -13,6 +13,8 @@ reconciled with the tiny-model golden) -- see that module.
 Runs without torch/CUDA: the specs come from the ``vllm_stubs`` stand-in.
 """
 
+import importlib
+import sys
 import unittest
 from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
@@ -31,6 +33,7 @@ from kv_cache_manager.py_connector.test.mla_variant_facts import (
 )
 from vllm.v1.kv_cache_interface import (
     KVQuantMode,
+    FullAttentionSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
@@ -57,7 +60,20 @@ def _spec_from_kwargs(kwargs: Dict[str, Any], kind: str = "mla") -> Any:
     kwargs.setdefault("num_kv_heads", 1)
     if kind == "swa":
         return SlidingWindowMLASpec(**kwargs)
+    if kind == "full":
+        return FullAttentionSpec(**kwargs)
     return MLAAttentionSpec(**kwargs)
+
+
+def _spec_without_quant_mode(kwargs: Dict[str, Any]) -> Any:
+    """A vLLM 0.14-shaped spec: every 0.26 field except kv_quant_mode."""
+    base = _spec_from_kwargs(dict(kwargs))
+    cls = type("LegacyMLASpec", (type(base),), {})
+    spec = object.__new__(cls)
+    spec.__dict__.update(
+        {k: v for k, v in base.__dict__.items() if k != "kv_quant_mode"}
+    )
+    return spec
 
 
 def _group(spec: Any, layers: Tuple[str, ...] = ("l0",)) -> Any:
@@ -129,7 +145,9 @@ class TestMLASizeTranslation(unittest.TestCase):
         # the cached bytes, and the engine stores that cache as uint8: 9216
         # B/page, 576 B/token at block 16 (01 section 2.3; the 18432/bf16 row
         # 02 section 3.2 probed was a template dtype, never an engine spec).
-        for cache_dtype in ("fp8", "fp8_e4m3"):
+        # fp8_e5m2 maps to FP8_PER_TENSOR and uint8 exactly like the e4m3
+        # variant (anchored in test_mla_spec_facts).
+        for cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2"):
             with self.subTest(cache_dtype=cache_dtype):
                 spec = _spec_from_kwargs(
                     dict(FROZEN["m3b"]["kwargs"], cache_dtype_str=cache_dtype)
@@ -140,6 +158,28 @@ class TestMLASizeTranslation(unittest.TestCase):
                 metas = _parse([_group(spec)], mbs=64)
                 self.assertEqual(metas[0].page_bytes, 9216)
                 self.assertEqual(metas[0].per_block_bytes, 576 * 64)
+
+    def test_legacy_era_packed_fp8_without_quant_mode_is_accepted(self):
+        # vLLM 0.14's MLAAttentionSpec has cache_dtype_str but no
+        # kv_quant_mode field: the dtype string alone defines the layout
+        # there, so the (cds, mode) consistency rule must not refuse the
+        # whole compatibility era. The 656 B packed layout (10496 B/page at
+        # block 16) and the plain fp8 layout (9216 B/page) both transfer.
+        for cache_dtype, page in (("fp8_ds_mla", 10496), ("fp8", 9216)):
+            with self.subTest(cache_dtype=cache_dtype):
+                spec = _spec_without_quant_mode(
+                    dict(
+                        block_size=16,
+                        head_size=576,
+                        dtype="uint8",
+                        cache_dtype_str=cache_dtype,
+                        kv_quant_mode="FP8_PER_TENSOR",
+                    )
+                )
+                self.assertFalse(hasattr(spec, "kv_quant_mode"))
+                metas = _parse([_group(spec)], mbs=64)
+                self.assertEqual(metas[0].page_bytes, page)
+                self.assertEqual(metas[0].per_block_bytes, page // 16 * 64)
 
     def test_size_invariant_over_accepted_variants(self):
         # A13: per_block_bytes == rows-per-block * row-bytes * layers, and the
@@ -187,6 +227,41 @@ class TestUniformGroupBuckets(unittest.TestCase):
         self.assertEqual([m.page_bytes for m in metas], [41984, 8448])
         self.assertEqual([m.per_block_bytes for m in metas], [83968, 16896])
         self.assertEqual([len(m.layer_names) for m in metas], [2, 2])
+
+    def test_same_page_different_geometry_split_into_buckets(self):
+        # A UniformTypeKVCacheSpecs group only guarantees spec type and block
+        # size, not head geometry: 2 heads x 64 and 1 head x 128 share a page
+        # (8192 B here) but not a tensor shape, so they must not share a
+        # transfer bucket.
+        wide = _spec_from_kwargs(
+            dict(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=64,
+                dtype="bfloat16",
+            ),
+            kind="full",
+        )
+        tall = _spec_from_kwargs(
+            dict(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=128,
+                dtype="bfloat16",
+            ),
+            kind="full",
+        )
+        self.assertEqual(wide.real_page_size_bytes, tall.real_page_size_bytes)
+        wrapper = _wrapper([("l0", wide), ("l1", tall)], block_size=16)
+        metas = _parse([_group(wrapper, ("l0", "l1"))], mbs=64)
+        self.assertEqual([m.spec_suffix for m in metas], ["", "_b1"])
+        self.assertEqual([m.group_idx for m in metas], [0, 0])
+        self.assertEqual([m.page_bytes for m in metas], [8192, 8192])
+        self.assertEqual([m.per_block_bytes for m in metas], [8192 // 16 * 64] * 2)
+        self.assertEqual([len(m.layer_names) for m in metas], [1, 1])
+        # Geometry breaks the page tie: fewer heads first, deterministically.
+        self.assertEqual([m.layer_names for m in metas], [["l1"], ["l0"]])
+        self.assertEqual([spec_name(0, m) for m in metas], ["tp0_g0", "tp0_g0_b1"])
 
     def test_bucket_suffixes_ignore_the_layer_order(self):
         # The suffix is a pure function of the bucket *set*: another rank (or
@@ -252,9 +327,10 @@ class TestMLAVariantGate(unittest.TestCase):
 
     def test_plain_fp8_requires_the_per_tensor_mode(self):
         # #6b, second half (defence in depth, symmetric with D18's counter-
-        # example): vLLM maps "fp8"/"fp8_e4m3" to FP8_PER_TENSOR, so a plain
-        # fp8 cache without it cannot occur -- refuse instead of guessing.
-        for cache_dtype in ("fp8", "fp8_e4m3"):
+        # example): vLLM maps the plain fp8 cache dtypes to FP8_PER_TENSOR,
+        # so a plain fp8 cache without it cannot occur -- refuse instead of
+        # guessing.
+        for cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2"):
             with self.subTest(cache_dtype=cache_dtype):
                 spec = _spec_from_kwargs(
                     dict(
@@ -354,12 +430,13 @@ class TestMLAVariantGate(unittest.TestCase):
                 block_size=16,
                 head_size=576,
                 dtype="bfloat16",
-                cache_dtype_str="fp8_e5m2",
+                cache_dtype_str="turboquant_k8v4",
             )
         )
         message = self._refusal(spec)
-        self.assertIn("fp8_e5m2", message)
+        self.assertIn("turboquant_k8v4", message)
         self.assertIn("fp8_ds_mla", message)  # the list of known layouts
+        self.assertIn("fp8_e5m2", message)  # a per-tensor fp8 value, not unknown
 
     def test_runtime_calibrated_scales_are_refused(self):
         # D7b: with calculate_kv_scales on, vLLM calibrates the layer-level fp8
@@ -743,6 +820,36 @@ class TestEraCompatibility(unittest.TestCase):
                 with mock.patch.object(vllm_common, "KVQuantMode", None):
                     metas = _parse([_group(_spec("m0"))], mbs=64)
         self.assertEqual(metas[0].per_block_bytes, 73728)
+
+    def test_partial_symbol_failure_keeps_the_wrapper_path(self):
+        # vLLM 0.14 ships UniformTypeKVCacheSpecs but not KVQuantMode /
+        # SlidingWindowMLASpec: each optional import must fail on its own,
+        # or one missing symbol nulls the wrapper type too and every packed
+        # group dies as an unsupported spec.
+        interface = sys.modules["vllm.v1.kv_cache_interface"]
+        saved_symbols = (
+            getattr(interface, "KVQuantMode"),
+            getattr(interface, "SlidingWindowMLASpec"),
+        )
+        saved_globals = dict(vllm_common.__dict__)
+        delattr(interface, "KVQuantMode")
+        delattr(interface, "SlidingWindowMLASpec")
+        try:
+            importlib.reload(vllm_common)
+            self.assertIsNone(vllm_common.KVQuantMode)
+            self.assertIsNone(vllm_common.SlidingWindowMLASpec)
+            self.assertIsNotNone(vllm_common.UniformTypeKVCacheSpecs)
+            # The wrapper path must still split a packed group.
+            _, group = _wrapper_group("v32_wrapper_pair")
+            metas = _parse([group], mbs=64)
+            self.assertEqual([m.page_bytes for m in metas], [41984, 8448])
+        finally:
+            setattr(interface, "KVQuantMode", saved_symbols[0])
+            setattr(interface, "SlidingWindowMLASpec", saved_symbols[1])
+            # Restore the exact pre-reload objects: a plain reload would
+            # rebind every class and break later isinstance checks.
+            vllm_common.__dict__.clear()
+            vllm_common.__dict__.update(saved_globals)
 
 
 class TestFrozenFactsAgainstStub(unittest.TestCase):
