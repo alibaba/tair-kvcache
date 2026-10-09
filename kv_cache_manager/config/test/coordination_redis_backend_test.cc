@@ -2,16 +2,19 @@
 #include <memory>
 
 #include "kv_cache_manager/common/redis_client_ext.h"
+#include "kv_cache_manager/common/test/redis_test_environment.h"
 #include "kv_cache_manager/config/test/coordination_backend_test_base.h"
 
 namespace kv_cache_manager {
 
-const std::string kRedisUri = "redis://test_redis_user:test_redis_password@localhost:6379/"
-                              "?timeout_ms=1000&retry_count=3&client_max_pool_size=2";
+const std::string kRedisUri = redis_test::Uri("test_redis_user:test_redis_password",
+                                              redis_test::kCoordinationDb,
+                                              "timeout_ms=1000&retry_count=3&client_max_pool_size=2");
 
-const std::string kRedisUriWithClusterName = "redis://test_redis_user:test_redis_password@localhost:6379/"
-                                             "?timeout_ms=1000&retry_count=3&client_max_pool_size=2"
-                                             "&cluster_name=test_cluster";
+const std::string kRedisUriWithClusterName =
+    redis_test::Uri("test_redis_user:test_redis_password",
+                    redis_test::kCoordinationDb,
+                    "timeout_ms=1000&retry_count=3&client_max_pool_size=2&cluster_name=test_cluster");
 
 CoordinationBackendTestConfig redis_backend_config{
     .get_test_uri = [](CoordinationBackendTest *test_base) { return kRedisUri; },
@@ -19,14 +22,14 @@ CoordinationBackendTestConfig redis_backend_config{
         [](CoordinationBackendTest *test_base) {
             RedisClientExt client(StandardUri::FromUri(kRedisUri));
             client.Open();
-            client.FlushAll();
+            client.FlushDb();
             client.Close();
         },
     .tear_down_ =
         [](CoordinationBackendTest *test_base) {
             RedisClientExt client(StandardUri::FromUri(kRedisUri));
             client.Open();
-            client.FlushAll();
+            client.FlushDb();
             client.Close();
         }};
 
@@ -36,14 +39,14 @@ CoordinationBackendTestConfig redis_backend_with_cluster_name_config{
         [](CoordinationBackendTest *test_base) {
             RedisClientExt client(StandardUri::FromUri(kRedisUriWithClusterName));
             client.Open();
-            client.FlushAll();
+            client.FlushDb();
             client.Close();
         },
     .tear_down_ =
         [](CoordinationBackendTest *test_base) {
             RedisClientExt client(StandardUri::FromUri(kRedisUriWithClusterName));
             client.Open();
-            client.FlushAll();
+            client.FlushDb();
             client.Close();
         }};
 
@@ -64,9 +67,10 @@ INSTANTIATE_TEST_SUITE_P(CoordinationBackendRedisWithClusterNameTest,
 //   4. 不同 cluster_name → 隔离（不同 key 前缀）
 // ============================================================
 
-const std::string kRedisUriWithClusterNameB = "redis://test_redis_user:test_redis_password@localhost:6379/"
-                                              "?timeout_ms=1000&retry_count=3&client_max_pool_size=2"
-                                              "&cluster_name=another_cluster";
+const std::string kRedisUriWithClusterNameB =
+    redis_test::Uri("test_redis_user:test_redis_password",
+                    redis_test::kCoordinationDb,
+                    "timeout_ms=1000&retry_count=3&client_max_pool_size=2&cluster_name=another_cluster");
 
 // ---------- 场景1: 一个为空 + 一个非空 → 隔离 ----------
 class CoordinationRedisClusterNameIsolationTest : public TESTBASE {
@@ -74,7 +78,7 @@ protected:
     void SetUp() override {
         RedisClientExt client(StandardUri::FromUri(kRedisUri));
         client.Open();
-        client.FlushAll();
+        client.FlushDb();
         client.Close();
 
         backend_no_cluster_ = CoordinationBackendFactory::CreateAndInitCoordinationBackend(kRedisUri);
@@ -87,7 +91,7 @@ protected:
     void TearDown() override {
         RedisClientExt client(StandardUri::FromUri(kRedisUri));
         client.Open();
-        client.FlushAll();
+        client.FlushDb();
         client.Close();
     }
 
@@ -126,7 +130,7 @@ protected:
     void SetUp() override {
         RedisClientExt client(StandardUri::FromUri(kRedisUri));
         client.Open();
-        client.FlushAll();
+        client.FlushDb();
         client.Close();
 
         backend_a_ = CoordinationBackendFactory::CreateAndInitCoordinationBackend(kRedisUri);
@@ -139,7 +143,7 @@ protected:
     void TearDown() override {
         RedisClientExt client(StandardUri::FromUri(kRedisUri));
         client.Open();
-        client.FlushAll();
+        client.FlushDb();
         client.Close();
     }
 
@@ -179,7 +183,7 @@ protected:
     void SetUp() override {
         RedisClientExt client(StandardUri::FromUri(kRedisUri));
         client.Open();
-        client.FlushAll();
+        client.FlushDb();
         client.Close();
 
         backend_a_ = CoordinationBackendFactory::CreateAndInitCoordinationBackend(kRedisUriWithClusterName);
@@ -192,7 +196,7 @@ protected:
     void TearDown() override {
         RedisClientExt client(StandardUri::FromUri(kRedisUri));
         client.Open();
-        client.FlushAll();
+        client.FlushDb();
         client.Close();
     }
 
@@ -232,7 +236,7 @@ protected:
     void SetUp() override {
         RedisClientExt client(StandardUri::FromUri(kRedisUri));
         client.Open();
-        client.FlushAll();
+        client.FlushDb();
         client.Close();
 
         backend_cluster_a_ = CoordinationBackendFactory::CreateAndInitCoordinationBackend(kRedisUriWithClusterName);
@@ -245,7 +249,7 @@ protected:
     void TearDown() override {
         RedisClientExt client(StandardUri::FromUri(kRedisUri));
         client.Open();
-        client.FlushAll();
+        client.FlushDb();
         client.Close();
     }
 
@@ -301,11 +305,13 @@ TEST_F(CoordinationRedisDiffClusterNameTest, TestLeaderElectionKeyIsolation) {
 }
 
 TEST(CoordinationRedisDbIsolationTest, SameKeysAreIsolatedByDb) {
-    const std::string uri_prefix = "redis://test_redis_user:test_redis_password@localhost:6379/"
-                                   "?timeout_ms=1000&retry_count=3&client_min_pool_size=1&client_max_pool_size=2";
     const std::string cluster_name = "coordination_db_isolation_test";
-    const std::string uri_db0 = uri_prefix + "&db=0&cluster_name=" + cluster_name;
-    const std::string uri_db1 = uri_prefix + "&db=1&cluster_name=" + cluster_name;
+    const std::string params =
+        "timeout_ms=1000&retry_count=3&client_min_pool_size=1&client_max_pool_size=2&cluster_name=" + cluster_name;
+    const std::string uri_db0 =
+        redis_test::Uri("test_redis_user:test_redis_password", redis_test::kCoordinationDb, params);
+    const std::string uri_db1 =
+        redis_test::Uri("test_redis_user:test_redis_password", redis_test::kCoordinationAlternateDb, params);
     const std::string key = "same_key";
     const std::string lock_key = "same_lock";
 
