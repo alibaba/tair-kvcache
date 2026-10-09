@@ -117,26 +117,30 @@ class TestRealVLLMFacts(unittest.TestCase):
 
     def test_real_plain_fp8_cache_is_uint8_storage(self):
         # M3a: the engine derives the spec dtype from the cache dtype string
-        # (`MLAAttention.get_kv_cache_spec` -> kv_cache_dtype_str_to_dtype), and
-        # "fp8" maps to uint8 (1 B/element), so the page is block x 576 x 1 B.
-        # The bf16 18432 row 02 section 3.2 probed was a template dtype the
-        # engine never produces (01 section 2.3: 576 B/token).
+        # (`MLAAttention.get_kv_cache_spec` -> kv_cache_dtype_str_to_dtype),
+        # and every plain fp8 variant maps to uint8 (1 B/element), so the
+        # page is block x 576 x 1 B. The bf16 18432 row 02 section 3.2 probed
+        # was a template dtype the engine never produces (01 section 2.3:
+        # 576 B/token). fp8_e5m2 carries the same FP8_PER_TENSOR mode and
+        # compact layout (the ROCm aiter backends accept it).
         from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
-        # "fp8" is not "auto", so the model_config argument is never read.
-        dtype = kv_cache_dtype_str_to_dtype("fp8", None)  # ty: ignore[invalid-argument-type]
-        self.assertEqual(dtype, torch.uint8)
-        spec = MLAAttentionSpec(  # ty: ignore[call-non-callable]
-            block_size=16,
-            num_kv_heads=1,
-            head_size=576,
-            dtype=dtype,
-            cache_dtype_str="fp8",
-            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
-        )
-        self.assertEqual(spec.real_page_size_bytes, 9216)
-        self.assertEqual(spec.unpadded_page_size_bytes, 9216)
-        self.assertEqual(spec.page_size_bytes, 9216)
+        for cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2"):
+            with self.subTest(cache_dtype=cache_dtype):
+                # Not "auto", so the model_config argument is never read.
+                dtype = kv_cache_dtype_str_to_dtype(cache_dtype, None)  # ty: ignore[invalid-argument-type]
+                self.assertEqual(dtype, torch.uint8)
+                spec = MLAAttentionSpec(  # ty: ignore[call-non-callable]
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=576,
+                    dtype=dtype,
+                    cache_dtype_str=cache_dtype,
+                    kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+                )
+                self.assertEqual(spec.real_page_size_bytes, 9216)
+                self.assertEqual(spec.unpadded_page_size_bytes, 9216)
+                self.assertEqual(spec.page_size_bytes, 9216)
 
     def test_real_get_kv_cache_spec_is_uint8(self):
         # M3a, method level: MLAAttention.get_kv_cache_spec derives the spec
@@ -148,16 +152,18 @@ class TestRealVLLMFacts(unittest.TestCase):
 
         from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
-        self_ = SimpleNamespace(kv_cache_dtype="fp8", head_size=576)
-        cfg = SimpleNamespace(
-            cache_config=SimpleNamespace(block_size=16),
-            model_config=SimpleNamespace(dtype="bfloat16"),
-        )
-        spec: Any = MLAAttention.get_kv_cache_spec(self_, cfg)  # ty: ignore[invalid-argument-type]
-        self.assertEqual(spec.dtype, torch.uint8)
-        self.assertEqual(spec.cache_dtype_str, "fp8")
-        self.assertEqual(spec.kv_quant_mode, KVQuantMode.FP8_PER_TENSOR)
-        self.assertEqual(spec.real_page_size_bytes, 9216)
+        for cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2"):
+            with self.subTest(cache_dtype=cache_dtype):
+                self_ = SimpleNamespace(kv_cache_dtype=cache_dtype, head_size=576)
+                cfg = SimpleNamespace(
+                    cache_config=SimpleNamespace(block_size=16),
+                    model_config=SimpleNamespace(dtype="bfloat16"),
+                )
+                spec: Any = MLAAttention.get_kv_cache_spec(self_, cfg)  # ty: ignore[invalid-argument-type]
+                self.assertEqual(spec.dtype, torch.uint8)
+                self.assertEqual(spec.cache_dtype_str, cache_dtype)
+                self.assertEqual(spec.kv_quant_mode, KVQuantMode.FP8_PER_TENSOR)
+                self.assertEqual(spec.real_page_size_bytes, 9216)
         self.assertEqual(spec.page_size_bytes, 9216)
 
     def test_real_sliding_window_specs_are_not_full_attention(self):
