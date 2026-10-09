@@ -99,10 +99,24 @@ TEST_F(LiteHitTtlTest, ExpiredBlockStopsThePrefixLikeAColdOne) {
 }
 
 TEST_F(LiteHitTtlTest, TtlZeroIsPureLru) {
-    LiteHit core; // default: no TTL, timestamps ignored
+    LiteHit core; // default: no TTL; timestamps only feed observability
     core.ProcessRequest({1, 2, 3}, 1000);
     const RequestFact fact = core.ProcessRequest({1, 2, 3}, 1000000000000);
     EXPECT_EQ((std::vector<HitCurveSegment>{{1, 3}}), fact.hit_curve);
+}
+
+TEST_F(LiteHitTtlTest, ReuseIntervalsOnlyCountBlocksStillAliveAtRequestStart) {
+    LiteHit core(10);
+    core.ProcessRequest({1}, 100);
+    core.ProcessRequest({1}, 109);
+    EXPECT_EQ(1, core.GetReuseIntervalStats().count);
+
+    // The strict TTL deadline makes this a miss, so it does not count as a
+    // reuse sample even though the access revives the block afterwards.
+    core.ProcessRequest({1}, 119);
+    EXPECT_EQ(1, core.GetReuseIntervalStats().count);
+    core.ProcessRequest({1}, 120);
+    EXPECT_EQ(2, core.GetReuseIntervalStats().count);
 }
 
 TEST_F(LiteHitTtlTest, ResetClearsTtlState) {

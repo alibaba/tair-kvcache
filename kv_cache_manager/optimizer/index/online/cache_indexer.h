@@ -7,14 +7,6 @@
 
 namespace kv_cache_manager {
 
-// Per-bucket hit count for cache age distribution.
-// Each bucket covers hits whose age (now - last_access_time) falls within
-// [0, threshold[0]), [threshold[0], threshold[1]), ..., [threshold[N-1], +inf).
-struct HitAgeBucketInfo {
-    int64_t threshold_seconds; // upper bound of this bucket (0 means "+inf")
-    int64_t hit_count;
-};
-
 class CacheIndexer {
 public:
     virtual ~CacheIndexer() = default;
@@ -25,13 +17,11 @@ public:
 
     // Initialize the indexer with capacity and size parameters.
     // capacity_gb: capacity tiers in GB.
-    // size_full_only: byte size of a full-only block.
+    // size_full: byte size of a full-only block.
     // size_full_linear: byte size of a full+linear block.
     // linear_step: linear step factor (>=0).
-    virtual void Init(const std::vector<double> &capacity_gb,
-                      int64_t size_full_only,
-                      int64_t size_full_linear,
-                      int32_t linear_step) = 0;
+    virtual void
+    Init(const std::vector<double> &capacity_gb, int64_t size_full, int64_t size_full_linear, int32_t linear_step) = 0;
 
     // Process a batch of key accesses and compute per-capacity prefix hit count.
     // keys: the block keys in query order.
@@ -44,6 +34,17 @@ public:
                              std::vector<int64_t> &hit_count,
                              int64_t &max_hit_count,
                              std::vector<bool> *key_hits = nullptr) = 0;
+
+    // Process a request at its producer timestamp. Indexers without
+    // time-based behavior use the normal path; TTL wrappers override this so
+    // queueing delay does not shift expiry decisions.
+    virtual void ProcessKeysAtTimestamp(const std::vector<int64_t> &keys,
+                                        int64_t /*timestamp_ns*/,
+                                        std::vector<int64_t> &hit_count,
+                                        int64_t &max_hit_count,
+                                        std::vector<bool> *key_hits = nullptr) {
+        ProcessKeys(keys, hit_count, max_hit_count, key_hits);
+    }
 
     virtual int64_t unique_count() const = 0;
 
@@ -70,10 +71,6 @@ public:
     // Called after processing all keys in a query batch.
     // Subclasses may perform eviction, compaction, etc.
     virtual void PostQueryMaintenance() {}
-
-    // Return per-bucket hit counts for cache age distribution.
-    // Default returns empty (no age tracking).
-    virtual std::vector<HitAgeBucketInfo> GetHitAgeBuckets() const { return {}; }
 };
 
 } // namespace kv_cache_manager
