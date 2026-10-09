@@ -149,6 +149,8 @@ class ScriptedConnector(HiCacheKVCM):
             self.registered_pools[PoolName.MAMBA] = _FakeMambaPool()
         self.backup_pgs = []
         self.backup_bandwidth = []
+        self.prefetch_pgs = []
+        self.prefetch_bandwidth = []
         self._init_lock = threading.Lock()
         self._client_ready = False
         self._closed = False
@@ -171,8 +173,13 @@ class ScriptedConnector(HiCacheKVCM):
             [self.location_spec_size] * (4 * self.kv_factor),
         )
         self._manager_client.start_write_cache.side_effect = self._start_write_cache
+        # The connector compares the load result by value and the save result by
+        # its first element, so the stubs differ in shape.
         self.transfer_client.SaveKvCaches.return_value = (
             _mock_kvcm.ClientErrorCode.ER_OK,
+        )
+        self.transfer_client.LoadKvCaches.return_value = (
+            _mock_kvcm.ClientErrorCode.ER_OK
         )
 
     def _ensure_client(self) -> None:
@@ -673,6 +680,42 @@ class TestRankShardedSidecarsAcrossTheGroup(unittest.TestCase):
         self.assertEqual(script.broadcasts, [])
         self.assertEqual(script.write_reduces, [])
         self.assertIsNone(connector.transfer_client.SaveKvCaches.call_args)
+
+    def test_mla_sharded_sidecar_read_uses_its_own_spec(self) -> None:
+        """The read side matches the write side: a rank loads its own shard.
+
+        Every rank reads the sidecar (``_page_transfer_sidecar`` has no MLA
+        gate) and the group's hit count is the minimum over the ranks, so a
+        rank must read the shard it wrote, not a peer's.
+        """
+        connector, _ = _write_pair(
+            local_init_ok=True,
+            peer_ready=True,
+            tp_rank=1,
+            with_mamba=True,
+            is_mla_model=True,
+        )
+        manager: Any = connector._manager_client
+        manager.get_cache_location.return_value = {
+            "locations": [
+                {
+                    "location_specs": [
+                        {"name": "tp_0_linear", "uri": f"tp_0_linear-{i}"},
+                        {"name": "tp_1_linear", "uri": f"tp_1_linear-{i}"},
+                    ]
+                }
+                for i in range(2)
+            ]
+        }
+
+        result = connector.batch_get_v2([_transfer()])
+
+        self.assertEqual(result, {PoolName.MAMBA: [True, True]})
+        self.assertEqual(
+            connector.transfer_client.LoadKvCaches.call_args.args[0],
+            ["tp_1_linear-0", "tp_1_linear-1"],
+            "a rank reads its own slice of the sharded pool",
+        )
 
     def test_mla_kv_write_stays_rank0_only(self) -> None:
         """The replicated MLA KV keeps its rank-0-only write path."""
