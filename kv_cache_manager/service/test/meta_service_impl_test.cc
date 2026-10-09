@@ -26,17 +26,19 @@ protected:
     std::unique_ptr<MetaServiceImpl> service_;
 };
 
-TEST_F(MetaServiceImplTest, FollowerAllowsReportEventQueryButRejectsWrite) {
+TEST_F(MetaServiceImplTest, FollowerRejectsReportEventQueryAndWrite) {
     RequestContext query_context("follower-query");
     proto::meta::GetHostCacheStateRequest query_request;
     query_request.set_trace_id(query_context.trace_id());
+    query_request.set_instance_id("follower-instance");
+    query_request.set_query_type(proto::meta::QT_PREFIX_MATCH);
+    query_request.add_block_cache_keys(1);
     proto::meta::GetHostCacheStateResponse query_response;
 
     service_->GetHostCacheState(&query_context, &query_request, &query_response);
 
-    // INVALID_ARGUMENT proves the read passed the follower gate and reached
-    // normal request validation instead of being rejected as SERVER_NOT_LEADER.
-    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, query_response.header().status().code());
+    // Reject valid queries before accessing the follower's unrecovered instance state.
+    EXPECT_EQ(proto::meta::SERVER_NOT_LEADER, query_response.header().status().code());
 
     RequestContext write_context("follower-write");
     proto::meta::ReportEventRequest write_request;
