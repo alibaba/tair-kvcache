@@ -6,6 +6,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -54,8 +55,10 @@ ErrorCode MooncakeBackend::DoOpen(const StorageConfig &storage_config, const std
     static std::uniform_int_distribution<std::uint64_t> dis;
     const std::uint64_t rand_val = dis(rng);
 
+    const auto local_hostname = EnvUtil::GetEnv("KVCM_MOONCAKE_LOCAL_HOSTNAME", spec_.local_hostname());
+    const auto rdma_device = EnvUtil::GetEnv("KVCM_MOONCAKE_RDMA_DEVICE", spec_.rdma_device());
     std::stringstream regenerate_local_hostname;
-    regenerate_local_hostname << spec_.local_hostname() << "_"
+    regenerate_local_hostname << local_hostname << "_"
                               << "kvcm"
                               << "_" << rand_val;
 
@@ -63,7 +66,7 @@ ErrorCode MooncakeBackend::DoOpen(const StorageConfig &storage_config, const std
     client_ = mooncake_client_create(regenerate_local_hostname.str().c_str(),
                                      spec_.metadata_connstring().c_str(),
                                      spec_.protocol().c_str(),
-                                     spec_.rdma_device().c_str(),
+                                     rdma_device.c_str(),
                                      spec_.master_server_entry().c_str());
     if (client_ == nullptr) {
         KVCM_LOG_WARN("create mooncake client failed, regenerate_local_hostname: [%s], config: [%s]",

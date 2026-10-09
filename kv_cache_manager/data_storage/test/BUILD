@@ -4,7 +4,10 @@ cc_test(
     name = "MooncakeBackendCloseTest",
     srcs = ["mooncake_backend_close_test.cc"],
     copts = ["-fno-access-control"],
-    linkopts = ["-Wl,--wrap=mooncake_client_destroy"],
+    linkopts = [
+        "-Wl,--wrap=mooncake_client_create",
+        "-Wl,--wrap=mooncake_client_destroy",
+    ],
     linkstatic = True,
     tags = ["manual", "mooncake"],
     deps = [
