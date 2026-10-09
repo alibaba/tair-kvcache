@@ -110,6 +110,108 @@ class StateGroupMeta(GroupMeta):
     page_size_bytes: int = 0
 
 
+def state_kv_view(
+    cache: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+    page_size_bytes: int,
+) -> torch.Tensor:
+    """View state pages as bytes, preserving layer offsets and block strides.
+
+    Older vLLM supplies typed conv/SSM views sharing storage. Current vLLM
+    supplies a per-layer [B, 1, 1, C] byte view into a shared allocation;
+    C excludes page padding, and consecutive blocks need not be contiguous.
+
+    Invalid layouts raise before set_ can resize the shared storage. Checks
+    are explicit so the same safety contract applies under Python -O.
+    """
+    if not isinstance(page_size_bytes, int):
+        raise TypeError(f"state page size must be an integer, got {page_size_bytes!r}")
+    if page_size_bytes <= 0:
+        raise ValueError(f"state page size must be positive, got {page_size_bytes}")
+    byte_cache = isinstance(cache, torch.Tensor)
+    if isinstance(cache, torch.Tensor):
+        states = (cache,)
+    elif isinstance(cache, (list, tuple)) and cache:
+        states = cache
+    else:
+        raise TypeError(
+            "state cache must be a byte tensor or a nonempty sequence of state tensors"
+        )
+
+    for index, state in enumerate(states):
+        if not isinstance(state, torch.Tensor):
+            raise TypeError(f"state component {index} must be a tensor")
+        if state.layout != torch.strided or state.device.type == "meta":
+            raise ValueError(
+                f"state component {index} must have materialized strided storage"
+            )
+        if state.dim() == 0:
+            raise ValueError(f"state component {index} must have a block dimension")
+
+    first = states[0]
+    if byte_cache:
+        if first.dtype not in (torch.int8, torch.uint8):
+            raise ValueError(f"state cache must be a byte tensor, got {first.dtype}")
+        if first.dim() != 4 or first.shape[1:3] != (1, 1):
+            raise ValueError(
+                f"state cache must have shape [B, 1, 1, C], got {tuple(first.shape)}"
+            )
+        if first.stride(-1) != 1 or not 0 < first.shape[-1] <= page_size_bytes:
+            raise ValueError(
+                f"state content must be contiguous and fit page {page_size_bytes}: "
+                f"shape={tuple(first.shape)}, stride={first.stride()}"
+            )
+
+    storage = first.untyped_storage()
+    num_blocks = first.shape[0]
+    if num_blocks <= 0:
+        raise ValueError(
+            f"state cache must have a positive block count, got {num_blocks}"
+        )
+    offset = first.storage_offset() * first.element_size()
+    block_stride = first.stride(0) * first.element_size()
+    if block_stride < page_size_bytes:
+        raise ValueError(
+            f"state block stride {block_stride} < page size {page_size_bytes}"
+        )
+    for index, state in enumerate(states):
+        if (
+            state.device != first.device
+            or state.untyped_storage().data_ptr() != storage.data_ptr()
+        ):
+            raise ValueError(
+                f"state component {index}: state tensors do not share storage"
+            )
+        if (
+            state.shape[0] != num_blocks
+            or state.stride(0) * state.element_size() != block_stride
+        ):
+            raise ValueError(
+                f"state component {index} must share block count {num_blocks} "
+                f"and byte stride {block_stride}"
+            )
+        # Bound the full strided extent, not merely the starting address or
+        # numel: gaps between dimensions are part of the physical page.
+        state_offset = state.storage_offset() * state.element_size()
+        span_elements = 0
+        if state.numel():
+            span_elements = 1 + sum(
+                (size - 1) * stride
+                for size, stride in zip(state.shape[1:], state.stride()[1:])
+            )
+        state_end = state_offset + span_elements * state.element_size()
+        if state_offset < offset or state_end > offset + page_size_bytes:
+            raise ValueError(
+                f"state component {index} byte range [{state_offset}, {state_end}) "
+                f"lies outside page [{offset}, {offset + page_size_bytes})"
+            )
+    end = offset + (num_blocks - 1) * block_stride + page_size_bytes
+    if storage.nbytes() < end:
+        raise ValueError(f"state storage {storage.nbytes()} < required end {end}")
+    return torch.empty(0, dtype=torch.uint8, device=first.device).set_(
+        storage, offset, (num_blocks, page_size_bytes), (block_stride, 1)
+    )
+
+
 def parse_groups(
     kv_cache_config: "KVCacheConfig", manager_block_size: int
 ) -> List[GroupMeta]:

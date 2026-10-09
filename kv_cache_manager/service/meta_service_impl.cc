@@ -968,6 +968,10 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
                                         const proto::meta::GetHostCacheStateRequest *request,
                                         proto::meta::GetHostCacheStateResponse *response) {
     SPAN_TRACER(request_context);
+    // TODO: Enable follower reads only after adding follower state recovery/synchronization
+    // and query lifetime protection during demotion. Followers have no recovered registry
+    // or searchers, and demotion clears them. Keep this request leader-only so
+    // OnNoLongerLeader() drains in-flight queries before cleanup.
     API_CALL_GUARD_WITH_DEBUG("GetHostCacheState",
                               true,
                               BuildGetHostCacheStateRequestAccessLogSummary(request),

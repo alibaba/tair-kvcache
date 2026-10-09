@@ -11,16 +11,18 @@ count 0 and kill the engine.
 Phase 1 saves a prompt of exactly N manager blocks; phase 2 resends the very
 same prompt (as explicit token ids, so tokenization cannot shift the length).
 Asserts: the engine survives, the completion is well-formed, and the connector
-reports 0 < matched < prompt tokens (the cap dropped at least the last block).
+reports the longest reusable prefix below the prompt length. Hybrid models
+may have no earlier recurrent checkpoint, in which case the safe match is 0.
 
 Runs against both full-attention and hybrid models via $KVCM_E2E_MODEL.
 """
 
 import logging
+from pathlib import Path
 import unittest
 
 from e2e_lib import (
-    ScenarioEnv, make_base_prompts, send_completions, tokenize,
+    ScenarioEnv, full_block_hashes, make_base_prompts, send_completions, tokenize,
     wait_for_prefix_cached,
 )
 
@@ -52,7 +54,33 @@ class TestFullHit(unittest.TestCase):
                 env.manager.manager_uri(), env.instance_id, prompt_ids,
                 min_blocks=num_blocks))
 
+            expected_hit = (num_blocks - 1) * mbs
             if env.hybrid:
+                import torch
+
+                # Measure checkpoint coverage independently from vLLM's bound
+                # state captures. The cap excludes the last prompt block;
+                # only a complete checkpoint before it permits a partial hit.
+                checkpoints = []
+                state_layers = None
+                for token_hash in full_block_hashes(prompt_ids, mbs):
+                    path = Path(env.capture_dir) / f"ref_tp0_{token_hash}.pt"
+                    record = torch.load(path, map_location="cpu", weights_only=True)
+                    # The registered layer inventory is independent of which
+                    # states happened to be captured at this boundary. Taking
+                    # the union of observations could hide a missing group.
+                    declared_layers = set(record["state_layer_names"])
+                    if state_layers is None:
+                        state_layers = declared_layers
+                    self.assertEqual(declared_layers, state_layers)
+                    checkpoints.append({name for name, value in record["kv"].items()
+                                        if isinstance(value, (list, tuple))})
+                self.assertTrue(state_layers, "no recurrent state layers were registered")
+                self.assertEqual(set().union(*checkpoints), state_layers,
+                                 "recurrent state capture is incomplete")
+                expected_hit = max(
+                    ((i + 1) * mbs for i, names in enumerate(checkpoints[:-1])
+                     if names == state_layers), default=0)
                 # Clear the local prefix cache so phase 2 goes external.
                 vllm = env.restart_vllm(log_suffix="_p2")
 
@@ -65,14 +93,15 @@ class TestFullHit(unittest.TestCase):
             resp3 = send_completions(vllm.base_url(), ["sanity check prompt"])[0]
             self.assertTrue(resp3["choices"][0]["text"])
 
-            # Connector-side evidence: matched > 0 (external hit happened) and
-            # matched < prompt tokens (the cap left tokens to recompute).
+            # Check the exact safe prefix, including a zero-length fallback
+            # when the only recurrent checkpoint belongs to the capped block.
             matched = [int(g[0]) for g in
                        env.scan_connector_logs(r"matched (\d+) external tokens")]
             self.assertTrue(matched, "no 'matched N external tokens' log found")
-            hit = [m for m in matched if m > 0]
-            self.assertTrue(hit, f"no positive external match in {matched}")
-            self.assertTrue(all(m < len(prompt_ids) for m in hit),
+            self.assertEqual(max(matched), expected_hit)
+            logger.info("full-hit safe prefix: actual=%d expected=%d",
+                        max(matched), expected_hit)
+            self.assertTrue(all(m < len(prompt_ids) for m in matched),
                             f"match not capped below prompt len: {matched}")
         finally:
             env.stop()

@@ -1,6 +1,7 @@
 #include <thread>
 
 #include "kv_cache_manager/common/redis_client.h"
+#include "kv_cache_manager/common/test/redis_test_environment.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
@@ -37,13 +38,13 @@ void MetaRedisBackendRealServiceTest::ConstructMetaRedisBackend() {
 void MetaRedisBackendRealServiceTest::ConstructMetaStorageBackendConfig() {
     meta_storage_backend_config_ = std::make_shared<MetaStorageBackendConfig>();
     meta_storage_backend_config_->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
-    meta_storage_backend_config_->SetStorageUri(
-        "redis://test_redis_user:test_redis_password@localhost:6379/?client_max_pool_size=4");
+    meta_storage_backend_config_->SetStorageUri(redis_test::Uri(
+        "test_redis_user:test_redis_password", redis_test::kMetaRedisBackendDb, "client_max_pool_size=4"));
 }
 
 TEST_F(MetaRedisBackendRealServiceTest, TestOpenAndClose) {
-    meta_storage_backend_config_->SetStorageUri(
-        "redis://test_redis_user:test_redis_password@localhost:6379/?client_max_pool_size=2");
+    meta_storage_backend_config_->SetStorageUri(redis_test::Uri(
+        "test_redis_user:test_redis_password", redis_test::kMetaRedisBackendDb, "client_max_pool_size=2"));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("test_open_and_close", meta_storage_backend_config_));
     // open first
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
@@ -75,16 +76,15 @@ TEST_F(MetaRedisBackendRealServiceTest, TestRedisDbIsolation) {
     auto make_config = [](int64_t db) {
         auto config = std::make_shared<MetaStorageBackendConfig>();
         config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
-        config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
-                              "?client_max_pool_size=2&db=" +
-                              std::to_string(db));
+        config->SetStorageUri(redis_test::Uri("test_redis_user:test_redis_password", db, "client_max_pool_size=2"));
         return config;
     };
 
     MetaRedisBackend backend_db0;
     MetaRedisBackend backend_db1;
-    ASSERT_EQ(EC_OK, backend_db0.Init("test_redis_db_isolation", make_config(0)));
-    ASSERT_EQ(EC_OK, backend_db1.Init("test_redis_db_isolation", make_config(1)));
+    ASSERT_EQ(EC_OK, backend_db0.Init("test_redis_db_isolation", make_config(redis_test::kMetaRedisBackendDb)));
+    ASSERT_EQ(EC_OK,
+              backend_db1.Init("test_redis_db_isolation", make_config(redis_test::kMetaRedisBackendAlternateDb)));
     ASSERT_EQ(EC_OK, backend_db0.Open());
     ASSERT_EQ(EC_OK, backend_db1.Open());
 

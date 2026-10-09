@@ -1,7 +1,9 @@
 HELP_MESSAGE = '''
 instance module:
-    list all instances of one instance_group:
+    list instances (all groups by default; -n filters by instance_group):
         python3 -m kvcm_ops list_instance --help
+        python3 -m kvcm_ops list_instance
+        python3 -m kvcm_ops list_instance -H http://localhost:56040
         python3 -m kvcm_ops list_instance -n default
         python3 -m kvcm_ops list_instance -H http://localhost:56040 -n default
     get instance info:

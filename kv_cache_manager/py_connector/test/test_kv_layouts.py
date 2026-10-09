@@ -13,8 +13,8 @@ normalized views, and ``ensure_hybrid_supported`` must fail fast when the
 installed vLLM's scheduler rejects external KV loads for hybrid models
 (vLLM <= 0.22.x).
 
-Runs without torch: a minimal FakeTensor models the strided-view semantics
-(shape / stride / offset / data_ptr) that the code under test reads.
+Attention tests run without torch using FakeTensor for strided-view semantics.
+State copy tests use real CPU tensors and skip when torch is unavailable.
 """
 
 import sys
@@ -22,8 +22,13 @@ import types
 from typing import Any
 import unittest
 
-from kv_cache_manager.py_connector.test.vllm_stubs import make_connector
-from kv_cache_manager.py_connector.vllm.vllm_common import AttentionGroupMeta
+from kv_cache_manager.py_connector.test.vllm_stubs import STUBBED, make_connector
+from kv_cache_manager.py_connector.vllm.vllm_common import (
+    AttentionGroupMeta,
+    StateGroupMeta,
+    state_kv_view,
+)
+import torch
 from kv_cache_manager.py_connector.vllm.v1_connector import (
     attn_kv_views,
     ensure_hybrid_supported,
@@ -230,6 +235,149 @@ class TestBuildTransferGroup(unittest.TestCase):
     def test_unrecognized_layout_fails_fast(self):
         with self.assertRaises(NotImplementedError):
             self._build({"l0": FakeTensor.contiguous([10, 16, 4])})
+
+
+@unittest.skipIf("torch" in STUBBED, "requires real CPU tensors")
+class TestStateKvViews(unittest.TestCase):
+    """Opaque transfers must respect shared storage and leave other pages alone."""
+
+    def test_shared_layer_views_copy_only_selected_page(self):
+        # Two layers interleaved within each block, with a leading offset,
+        # page padding and gaps between blocks. C exposes content bytes only.
+        raw = torch.arange(224, dtype=torch.uint8)
+        caches = {
+            name: raw.view(torch.int8).as_strided(
+                (3, 1, 1, 20), (64, 20, 20, 1), 16 + layer * 24
+            )
+            for layer, name in enumerate(("m0", "m1"))
+        }
+        conn = _make_group_conn()
+        group = conn._build_state_group(
+            StateGroupMeta(0, list(caches), 16, 48, page_size_bytes=24), caches
+        )
+        before = raw.clone()
+        for layer, view in enumerate(group.block_view_tensors):
+            self.assertEqual(view.stride(), (64, 1))
+            for block in range(3):
+                start = 16 + layer * 24 + block * 64
+                self.assertTrue(torch.equal(view[block], before[start : start + 24]))
+
+        # Exercise the same staging copy used by state save/load tasks.
+        staged = torch.empty(24, dtype=torch.uint8)
+        staged.copy_(group.block_view_tensors[1][2])
+        group.block_view_tensors[1][1].copy_(staged)
+        expected = before.clone()
+        expected[104:128] = before[168:192]
+        self.assertTrue(torch.equal(raw, expected))
+
+    def test_legacy_typed_states_preserve_offset_stride_and_padding(self):
+        raw = torch.arange(224, dtype=torch.uint8)
+        conv = raw.view(torch.int16).as_strided((3, 2, 2), (32, 2, 1), 8)
+        ssm = raw.view(torch.float32).as_strided((3, 3), (16, 1), 6)
+        view = state_kv_view([conv, ssm], page_size_bytes=24)
+        for block in range(3):
+            start = 16 + block * 64
+            self.assertTrue(torch.equal(view[block], raw[start : start + 24]))
+        before = raw.clone()
+        view[1].fill_(197)
+        expected = before.clone()
+        expected[80:104] = 197
+        self.assertTrue(torch.equal(raw, expected))
+
+    def test_legacy_contiguous_tuple(self):
+        raw = torch.arange(72, dtype=torch.uint8)
+        conv = raw.view(torch.int16).as_strided((3, 2, 2), (12, 2, 1))
+        ssm = raw.view(torch.float32).as_strided((3, 3), (6, 1), 2)
+        self.assertTrue(torch.equal(state_kv_view((conv, ssm), 24), raw.view(3, 24)))
+
+    def test_refuse_invalid_state_layouts(self):
+        raw = torch.zeros(20, dtype=torch.int8)
+        with self.assertRaisesRegex(ValueError, "shape"):
+            state_kv_view(raw, 24)
+        # Content fits, but copying the padded page would escape the storage.
+        with self.assertRaisesRegex(ValueError, "required end"):
+            state_kv_view(raw.as_strided((1, 1, 1, 20), (24, 20, 20, 1)), 24)
+        self.assertEqual(raw.untyped_storage().nbytes(), 20)
+        with self.assertRaisesRegex(ValueError, "do not share storage"):
+            state_kv_view([raw.view(1, 20), raw.clone().view(1, 20)], 20)
+
+    def test_refuse_component_crossing_page_boundary(self):
+        raw = torch.arange(64, dtype=torch.uint8)
+        conv = raw.as_strided((2, 4), (24, 1))
+        ssm = raw.as_strided((2, 8), (24, 1), 20)
+        before = raw.clone()
+        with self.assertRaisesRegex(ValueError, "component 1.*outside page"):
+            state_kv_view([conv, ssm], 24)
+        self.assertTrue(torch.equal(raw, before))
+        self.assertEqual(raw.untyped_storage().nbytes(), 64)
+
+    def test_refuse_strided_component_crossing_page_boundary(self):
+        raw = torch.zeros(128, dtype=torch.uint8)
+        conv = raw.as_strided((2, 2, 2), (64, 4, 1), 16)
+        # Four elements occupy 15 bytes with these inner strides. Bounding
+        # just numel would accept this component, which escapes the page.
+        ssm = raw.as_strided((2, 2, 2), (64, 12, 2), 26)
+        with self.assertRaisesRegex(ValueError, "component 1.*outside page"):
+            state_kv_view((conv, ssm), 24)
+
+    def test_single_block_preserves_offset_without_resizing_storage(self):
+        raw = torch.arange(40, dtype=torch.uint8)
+        cache = raw.view(torch.int8).as_strided((1, 1, 1, 20), (64, 20, 20, 1), 16)
+        view = state_kv_view(cache, 24)
+        self.assertTrue(torch.equal(view[0], raw[16:40]))
+        self.assertEqual(raw.untyped_storage().nbytes(), 40)
+
+    def test_empty_optional_component_fits_at_page_end(self):
+        raw = torch.arange(48, dtype=torch.uint8)
+        conv = raw.as_strided((2, 8), (24, 1))
+        empty = raw.as_strided((2, 0), (24, 1), 24)
+        self.assertTrue(torch.equal(state_kv_view([conv, empty], 24), raw.view(2, 24)))
+
+    def test_refuse_invalid_content_and_block_geometry(self):
+        raw = torch.zeros(64, dtype=torch.uint8)
+        invalid = [
+            (raw.as_strided((2, 1, 1, 10), (24, 20, 20, 2)), 24, "contiguous"),
+            (raw.as_strided((2, 1, 1, 20), (20, 20, 20, 1)), 24, "block stride"),
+            (torch.empty((0, 1, 1, 20), dtype=torch.uint8), 20, "block count"),
+            (raw.view(1, 1, 1, 64), 24, "fit page"),
+            (raw.view(1, 1, 1, 64), 0, "positive"),
+        ]
+        for cache, page_size, message in invalid:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    state_kv_view(cache, page_size)
+
+    def test_refuse_invalid_component_types_and_storage(self):
+        for cache in ([], (), [None]):
+            with self.subTest(cache=cache):
+                with self.assertRaises(TypeError):
+                    state_kv_view(cache, 24)  # ty: ignore[invalid-argument-type]
+        with self.assertRaisesRegex(ValueError, "block dimension"):
+            state_kv_view([torch.tensor(0)], 24)
+        with self.assertRaisesRegex(ValueError, "materialized"):
+            state_kv_view(
+                torch.empty((2, 1, 1, 20), dtype=torch.uint8, device="meta"), 24
+            )
+
+    def test_refuse_inconsistent_legacy_block_geometry(self):
+        raw = torch.zeros(128, dtype=torch.uint8)
+        conv = raw.as_strided((2, 4), (24, 1))
+        for ssm in (
+            raw.as_strided((3, 4), (24, 1), 4),
+            raw.as_strided((2, 4), (32, 1), 4),
+        ):
+            with self.subTest(shape=ssm.shape, stride=ssm.stride()):
+                with self.assertRaisesRegex(ValueError, "share block count"):
+                    state_kv_view([conv, ssm], 24)
+
+    def test_worker_error_identifies_state_layer(self):
+        conn = _make_group_conn()
+        with self.assertRaisesRegex(ValueError, "state layer 'm0'.*shape") as context:
+            conn._build_state_group(
+                StateGroupMeta(0, ["m0"], 16, 24, page_size_bytes=24),
+                {"m0": torch.zeros(24, dtype=torch.uint8)},
+            )
+        self.assertIsInstance(context.exception.__cause__, ValueError)
 
 
 class _BlockedScheduler:

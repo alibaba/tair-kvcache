@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/test/redis_test_environment.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -26,8 +27,9 @@ public:
     static std::shared_ptr<MetaStorageBackendConfig> MakeDualConfig() {
         auto config = std::make_shared<MetaStorageBackendConfig>();
         config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
-        config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
-                              "?client_max_pool_size=4&persistent_type=redis&cache_type=local");
+        config->SetStorageUri(redis_test::Uri("test_redis_user:test_redis_password",
+                                              redis_test::kMetaStorageBackendManagerDb,
+                                              "client_max_pool_size=4&persistent_type=redis&cache_type=local"));
         return config;
     }
 
@@ -36,10 +38,11 @@ public:
     static std::shared_ptr<MetaStorageBackendConfig> MakeAsyncDualConfig() {
         auto config = std::make_shared<MetaStorageBackendConfig>();
         config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
-        config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
-                              "?client_max_pool_size=4&persistent_type=async_redis&cache_type=local"
-                              "&async_queue_count=2&async_max_batch=64&async_wait_us=1000"
-                              "&async_max_size=1000&async_drain_ms=2000");
+        config->SetStorageUri(redis_test::Uri("test_redis_user:test_redis_password",
+                                              redis_test::kMetaStorageBackendManagerDb,
+                                              "client_max_pool_size=4&persistent_type=async_redis&cache_type=local"
+                                              "&async_queue_count=2&async_max_batch=64&async_wait_us=1000"
+                                              "&async_max_size=1000&async_drain_ms=2000"));
         return config;
     }
 
@@ -48,7 +51,8 @@ public:
     static std::shared_ptr<MetaStorageBackendConfig> MakeSingleConfig() {
         auto config = std::make_shared<MetaStorageBackendConfig>();
         config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
-        config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/?client_max_pool_size=4");
+        config->SetStorageUri(redis_test::Uri(
+            "test_redis_user:test_redis_password", redis_test::kMetaStorageBackendManagerDb, "client_max_pool_size=4"));
         return config;
     }
 
@@ -242,18 +246,20 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestInitInvalidBackendTypesReject
     // Unknown persistent_type -> EC_ERROR (factory cannot construct bogus).
     {
         auto config = std::make_shared<MetaStorageBackendConfig>();
-        config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
-        config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
-                              "?client_max_pool_size=4&persistent_type=bogus&cache_type=local");
+        config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
+        config->SetStorageUri(redis_test::Uri("test_redis_user:test_redis_password",
+                                              redis_test::kMetaStorageBackendManagerDb,
+                                              "client_max_pool_size=4&persistent_type=bogus&cache_type=local"));
         MetaStorageBackendManager mgr;
         ASSERT_EQ(EC_ERROR, mgr.Init("inst_redis_bad_persistent", config));
     }
     // Unknown cache_type -> EC_ERROR.
     {
         auto config = std::make_shared<MetaStorageBackendConfig>();
-        config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
-        config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
-                              "?client_max_pool_size=4&persistent_type=redis&cache_type=bogus");
+        config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
+        config->SetStorageUri(redis_test::Uri("test_redis_user:test_redis_password",
+                                              redis_test::kMetaStorageBackendManagerDb,
+                                              "client_max_pool_size=4&persistent_type=redis&cache_type=bogus"));
         MetaStorageBackendManager mgr;
         ASSERT_EQ(EC_ERROR, mgr.Init("inst_redis_bad_cache", config));
     }
