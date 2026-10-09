@@ -87,6 +87,7 @@ ErrorCode MooncakeBackend::Close() {
     KVCM_LOG_INFO("close mooncake backend");
     if (client_) {
         mooncake_client_destroy(client_);
+        client_ = nullptr;
     }
     return EC_OK;
 };
