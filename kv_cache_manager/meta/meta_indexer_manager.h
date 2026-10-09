@@ -37,7 +37,8 @@ public:
 
     std::shared_ptr<MetaIndexer> GetMetaIndexer(const std::string &instance_id) const;
 
-    ErrorCode DeleteMetaIndexer(const std::string &instance_id);
+    std::shared_ptr<MetaIndexer> ExtractMetaIndexer(const std::string &instance_id);
+    bool RestoreMetaIndexer(const std::string &instance_id, std::shared_ptr<MetaIndexer> indexer);
 
     size_t GetIndexerSize();
 

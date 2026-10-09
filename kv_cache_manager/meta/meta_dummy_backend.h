@@ -116,6 +116,7 @@ public:
 
     ErrorCode PutMetaData(const FieldMap &field_map) noexcept override;
     ErrorCode GetMetaData(FieldMap &out_field_map) noexcept override;
+    ErrorCode DeleteMetaData() noexcept override;
 
 private:
     ErrorCode PersistToPath();

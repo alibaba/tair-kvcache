@@ -113,20 +113,18 @@ std::shared_ptr<MetaIndexer> MetaIndexerManager::GetMetaIndexerUnsafe(const std:
     return nullptr;
 }
 
-ErrorCode MetaIndexerManager::DeleteMetaIndexer(const std::string &instance_id) {
-    // TODO : delete is dangerous, should carefully design
-    return ErrorCode::EC_UNIMPLEMENTED;
-    // size_t num = 0;
-    // {
-    //     std::scoped_lock write_guard(mutex_);
-    //     num = meta_indexers_.erase(instance_id);
-    // }
-    // if (num == 0) {
-    //     KVCM_LOG_WARN("Delete meta indexer failed, instance_id: %s", instance_id.c_str());
-    //     return ErrorCode::EC_NOENT;
-    // }
-    // KVCM_LOG_INFO("Delete meta indexer success, instance_id: %s", instance_id.c_str());
-    // return ErrorCode::EC_OK;
+std::shared_ptr<MetaIndexer> MetaIndexerManager::ExtractMetaIndexer(const std::string &instance_id) {
+    decltype(meta_indexers_)::node_type node;
+    {
+        std::scoped_lock write_guard(mutex_);
+        node = meta_indexers_.extract(instance_id);
+    }
+    return node.empty() ? nullptr : std::move(node.mapped());
+}
+
+bool MetaIndexerManager::RestoreMetaIndexer(const std::string &instance_id, std::shared_ptr<MetaIndexer> indexer) {
+    std::scoped_lock write_guard(mutex_);
+    return meta_indexers_.emplace(instance_id, std::move(indexer)).second;
 }
 
 std::map<std::string, std::shared_ptr<MetaIndexer>> MetaIndexerManager::GetIndexers() const {

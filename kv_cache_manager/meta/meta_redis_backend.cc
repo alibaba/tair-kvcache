@@ -572,4 +572,16 @@ ErrorCode MetaRedisBackend::GetMetaData(FieldMap &out_field_map) noexcept {
     return error_codes[0];
 }
 
+ErrorCode MetaRedisBackend::DeleteMetaData() noexcept {
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        return EC_TIMEOUT;
+    }
+    const auto results = handle->Delete({metadata_key_});
+    if (results.size() != 1) {
+        return EC_ERROR;
+    }
+    return results[0] == EC_NOENT ? EC_OK : results[0];
+}
+
 } // namespace kv_cache_manager

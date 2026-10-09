@@ -71,6 +71,28 @@ TEST_F(MetaRedisBackendTest, TestInit) {
     }
 }
 
+TEST_F(MetaRedisBackendTest, TestDeleteMetadataIsIdempotent) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri uri;
+        auto client = std::make_unique<MockRedisClient>(uri);
+        EXPECT_CALL(*client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*client, Reconnect()).WillRepeatedly(Return(true));
+        std::vector<ReplyUPtr> deleted, missing;
+        deleted.emplace_back(MakeFakeReplyInteger(1));
+        missing.emplace_back(MakeFakeReplyInteger(0));
+        EXPECT_CALL(
+            *client,
+            TryExecPipeline(ElementsAre(ElementsAre(StrEq("DEL"), StrEq("kvcache:instance_instance_0:metadata")))))
+            .WillOnce(Return(ByMove(std::move(deleted))))
+            .WillOnce(Return(ByMove(std::move(missing))));
+        return client;
+    }));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+    EXPECT_EQ(EC_OK, meta_redis_backend_->DeleteMetaData());
+    EXPECT_EQ(EC_OK, meta_redis_backend_->DeleteMetaData());
+}
+
 TEST_F(MetaRedisBackendTest, TestInvalidClientPoolSize) {
     EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillRepeatedly(Invoke([]() {
         StandardUri empty_storage_uri;

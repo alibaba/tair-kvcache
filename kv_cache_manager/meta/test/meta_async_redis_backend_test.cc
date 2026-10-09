@@ -1342,6 +1342,8 @@ TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryHealthySyncAndMetadata) {
     ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Put(nullptr, {7}, {{}}, {{{"p", "v"}}}));
     ASSERT_EQ(EC_OK, backend_->PutMetaData({{"key_count", "1"}}));
     EXPECT_TRUE(backend_->Sync({7}));
+    EXPECT_TRUE(backend_->SyncAll());
+    EXPECT_EQ(EC_OK, backend_->DeleteMetaData());
     ASSERT_EQ(EC_OK, backend_->Close());
     auto stats = backend_->GetAsyncWriteStats();
     EXPECT_EQ(1, stats.flush_key_count);

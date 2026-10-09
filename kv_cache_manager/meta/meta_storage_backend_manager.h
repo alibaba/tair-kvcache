@@ -181,6 +181,7 @@ public:
 
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
+    ErrorCode DeleteMetaData() noexcept;
 
     // Synchronously flush pending writes for the given keys to persistent storage.
     // Returns true on success, false on failure/timeout.

@@ -37,8 +37,8 @@ bool Server::Init(const ServerConfig &config) {
 
     metrics_registry_ = std::make_shared<MetricsRegistry>();
     // single shared lifecycle handle: producers hold it as a reader
-    // around metric registration; AdminServiceImpl::RemoveInstance and
-    // RemoveInstanceGroup hold it as a writer for the entire removal
+    // around metric registration; CacheManager::RemoveInstance and
+    // AdminServiceImpl group/storage removals hold it as a writer
     metrics_lifecycle_ = std::make_shared<MetricsLifecycle>();
 
     config_ = config;

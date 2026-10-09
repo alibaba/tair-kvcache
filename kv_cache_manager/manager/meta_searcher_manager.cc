@@ -18,11 +18,11 @@ MetaSearcherManager::MetaSearcherManager(std::shared_ptr<RegistryManager> regist
 
 MetaSearcherManager::~MetaSearcherManager() = default;
 
-MetaSearcher *MetaSearcherManager::TryCreateMetaSearcher(RequestContext *request_context,
-                                                         const std::string &instance_id,
-                                                         CheckLocDataExistFunc check_loc_data_exist,
-                                                         SubmitDelReqFunc submit_del_req) {
-    MetaSearcher *meta_searcher = GetMetaSearcher(instance_id);
+std::shared_ptr<MetaSearcher> MetaSearcherManager::TryCreateMetaSearcher(RequestContext *request_context,
+                                                                         const std::string &instance_id,
+                                                                         CheckLocDataExistFunc check_loc_data_exist,
+                                                                         SubmitDelReqFunc submit_del_req) {
+    auto meta_searcher = GetMetaSearcher(instance_id);
     if (meta_searcher) {
         return meta_searcher;
     }
@@ -66,10 +66,10 @@ MetaSearcher *MetaSearcherManager::TryCreateMetaSearcher(RequestContext *request
         if (ec == ErrorCode::EC_OK) {
             if (auto pair = meta_searcher_map_.emplace(
                     instance_id,
-                    std::make_unique<MetaSearcher>(
+                    std::make_shared<MetaSearcher>(
                         meta_indexer_manager_->GetMetaIndexer(instance_id), check_loc_data_exist, submit_del_req));
                 pair.second) {
-                return pair.first->second.get();
+                return pair.first->second;
             }
         } else if (ec == ErrorCode::EC_EXIST) {
             KVCM_LOG_ERROR("meta indexer exist! IMPOSSIBLE!");
@@ -81,20 +81,30 @@ MetaSearcher *MetaSearcherManager::TryCreateMetaSearcher(RequestContext *request
     return nullptr;
 }
 
-MetaSearcher *MetaSearcherManager::GetMetaSearcher(const std::string &instance_id) const {
+std::shared_ptr<MetaSearcher> MetaSearcherManager::GetMetaSearcher(const std::string &instance_id) const {
     std::shared_lock read_guard(mutex_);
     return GetMetaSearcherUnsafe(instance_id);
 }
+
+std::shared_ptr<MetaSearcher> MetaSearcherManager::ExtractMetaSearcher(const std::string &instance_id) {
+    decltype(meta_searcher_map_)::node_type node;
+    {
+        std::scoped_lock write_guard(mutex_);
+        node = meta_searcher_map_.extract(instance_id);
+    }
+    return node.empty() ? nullptr : std::move(node.mapped());
+}
+
 void MetaSearcherManager::DoCleanup() {
     std::scoped_lock write_guard(mutex_);
     meta_searcher_map_.clear();
 }
 
-MetaSearcher *MetaSearcherManager::GetMetaSearcherUnsafe(const std::string &instance_id) const {
+std::shared_ptr<MetaSearcher> MetaSearcherManager::GetMetaSearcherUnsafe(const std::string &instance_id) const {
     auto it = meta_searcher_map_.find(instance_id);
     if (it != meta_searcher_map_.end()) {
         KVCM_LOG_DEBUG("meta searcher [%s] exist", instance_id.c_str());
-        return it->second.get();
+        return it->second;
     }
     return nullptr;
 }

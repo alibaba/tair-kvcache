@@ -536,4 +536,15 @@ ErrorCode MetaDummyBackend::GetMetaData(FieldMap &out_field_map) noexcept {
     return ErrorCode::EC_OK;
 }
 
+ErrorCode MetaDummyBackend::DeleteMetaData() noexcept {
+    std::lock_guard<std::mutex> guard(mutex_);
+    metadata_.clear();
+    if (enable_persistence_ && table_.Empty()) {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+        return ec ? EC_IO_ERROR : EC_OK;
+    }
+    return PersistToPath();
+}
+
 } // namespace kv_cache_manager

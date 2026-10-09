@@ -10,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -92,6 +93,39 @@ namespace kv_cache_manager {
     } while (0)
 
 namespace {
+class InstanceRemovalGuard {
+public:
+    InstanceRemovalGuard(MetricsLifecycle &lifecycle, const std::string &instance_id)
+        : lifecycle_(lifecycle), instance_id_(instance_id) {
+        std::lock_guard lock(lifecycle_.instance_removal_mut_);
+        acquired_ = lifecycle_.removing_instance_ids_.insert(instance_id_).second;
+    }
+
+    ~InstanceRemovalGuard() {
+        if (acquired_) {
+            std::lock_guard lock(lifecycle_.instance_removal_mut_);
+            lifecycle_.removing_instance_ids_.erase(instance_id_);
+        }
+    }
+
+    bool acquired() const { return acquired_; }
+
+    InstanceRemovalGuard(const InstanceRemovalGuard &) = delete;
+    InstanceRemovalGuard &operator=(const InstanceRemovalGuard &) = delete;
+
+private:
+    MetricsLifecycle &lifecycle_;
+    std::string instance_id_;
+    bool acquired_ = false;
+};
+
+template <typename T>
+void WaitForOtherOwners(const std::shared_ptr<T> &owner) {
+    while (owner.use_count() > 1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 bool CollectTrimResult(std::deque<std::future<PlanExecuteResult>> &inflight,
                        const std::string &trace_id,
                        const std::string &instance_id,
@@ -616,7 +650,7 @@ CacheManager::RegisterInstance(RequestContext *request_context,
                                const std::vector<LocationSpecGroup> &location_spec_groups,
                                QueryType default_query_type) {
     SPAN_TRACER(request_context);
-    // TODO : not thread safe now
+    std::shared_lock<std::shared_mutex> lifecycle_guard(metrics_lifecycle_->mut_);
     const auto &trace_id = request_context->trace_id();
     auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     if (instance_info) {
@@ -658,9 +692,19 @@ CacheManager::RegisterInstance(RequestContext *request_context,
 }
 
 ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
-                                       const std::string &instance_group,
+                                       const std::string & /*instance_group*/,
                                        const std::string &instance_id) {
     SPAN_TRACER(request_context);
+    InstanceRemovalGuard instance_removal_guard(*metrics_lifecycle_, instance_id);
+    if (!instance_removal_guard.acquired()) {
+        request_context->error_tracer()->AddErrorMsg("instance removal already in progress: " + instance_id);
+        KVCM_LOG_WARN("[%s] remove instance already in progress, instance[%s]",
+                      request_context->trace_id().c_str(),
+                      instance_id.c_str());
+        return EC_EXIST;
+    }
+    std::shared_lock<std::shared_mutex> removal_guard(metrics_lifecycle_->removal_mut_);
+    std::unique_lock<std::shared_mutex> lifecycle_guard(metrics_lifecycle_->mut_);
     const auto &trace_id = request_context->trace_id();
 
     // drain 活跃迁移 copy 后再 trim，避免 trim 与 backend copy 竞态。
@@ -702,22 +746,90 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
                 waited_ms += kPollIntervalMs;
             }
             if (!migration_manager_->GetActiveBlockKeysForInstance(instance_id).empty()) {
-                KVCM_LOG_WARN("[%s] RemoveInstance drain timeout (%dms) for instance %s, "
-                              "proceeding with trim; residual WRITING targets will be orphan-cleaned",
+                KVCM_LOG_WARN("[%s] RemoveInstance drain timeout (%dms) for instance %s",
                               trace_id.c_str(),
                               kDrainTimeoutMs,
                               instance_id.c_str());
+                return EC_TIMEOUT;
             }
         }
     }
 
-    auto ec = registry_manager_->RemoveInstance(request_context, instance_group, instance_id);
-    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed"); // drain_guard 析构自动收尾
+    auto ec = registry_manager_->BeginRemoveInstance(request_context, instance_id);
+    if (ec != EC_OK) {
+        // A failed registry write may already have persisted the deletion
+        // intent. Do not leave its old searcher available to new requests.
+        if (registry_manager_->GetRemovingInstanceInfo(instance_id)) {
+            auto searcher = meta_searcher_manager_->ExtractMetaSearcher(instance_id);
+            WaitForOtherOwners(searcher);
+            InvalidateInstanceMetrics(instance_id);
+        }
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed");
+    }
+
+    auto meta_searcher = meta_searcher_manager_->ExtractMetaSearcher(instance_id);
+    WaitForOtherOwners(meta_searcher);
+    meta_searcher.reset();
 
     InvalidateInstanceMetrics(instance_id);
 
-    ec = TrimCache(request_context, instance_id, proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
-    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed"); // drain_guard 析构自动收尾
+    if (!meta_indexer_manager_->GetMetaIndexer(instance_id)) {
+        const auto pending = registry_manager_->GetRemovingInstanceInfo(instance_id);
+        const auto group = registry_manager_->GetInstanceGroupConfig(pending->instance_group_name());
+        const auto cache_config = group ? group->cache_config() : nullptr;
+        if (!cache_config) {
+            RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "remove instance failed: cache config unavailable");
+        }
+        ec = meta_indexer_manager_->CreateMetaIndexer(
+            instance_id, cache_config->meta_indexer_config(), group->revisit_interval_buckets());
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed: create meta indexer");
+    }
+
+    // Storage removal and replacement remain excluded while trim runs.
+    lifecycle_guard.unlock();
+    std::shared_ptr<MetaIndexer> meta_indexer;
+    std::optional<KeyType> previous_residual;
+    for (;;) {
+        ec = TrimCache(request_context, instance_id, proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed: trim cache");
+        meta_indexer = meta_indexer_manager_->ExtractMetaIndexer(instance_id);
+        WaitForOtherOwners(meta_indexer);
+
+        KeyVector remaining;
+        std::string cursor = SCAN_BASE_CURSOR;
+        do {
+            std::string next_cursor;
+            ec = meta_indexer->Scan(request_context, cursor, 256, next_cursor, remaining);
+            cursor = std::move(next_cursor);
+        } while (ec == EC_OK && remaining.empty() && cursor != SCAN_BASE_CURSOR);
+        if (ec == EC_OK && remaining.empty()) {
+            break;
+        }
+        const bool no_progress = ec == EC_OK && previous_residual == remaining.front();
+        if (!meta_indexer_manager_->RestoreMetaIndexer(instance_id, meta_indexer)) {
+            RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "remove instance failed: restore meta indexer");
+        }
+        meta_indexer.reset();
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed: scan remaining cache");
+        if (no_progress) {
+            RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "remove instance failed: trim made no progress");
+        }
+        previous_residual = remaining.front();
+    }
+
+    ec = meta_indexer->Retire();
+    if (ec != EC_OK) {
+        if (!meta_indexer_manager_->RestoreMetaIndexer(instance_id, meta_indexer)) {
+            KVCM_LOG_ERROR("remove instance failed to restore meta indexer, instance[%s]", instance_id.c_str());
+        }
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed: delete metadata");
+    }
+    meta_indexer.reset();
+
+    // Keep registration out until the tombstone and draining gate are retired.
+    lifecycle_guard.lock();
+    ec = registry_manager_->CompleteRemoveInstance(instance_id);
+    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed: complete registry removal");
     PREFIX_LOG(INFO, "remove instance OK");
     return ec;
 }
@@ -727,8 +839,8 @@ void CacheManager::InvalidateInstanceMetrics(const std::string &instance_id) con
         return;
     }
 
-    // callers must hold a unique lock on metrics_lifecycle_->mut_ while
-    // invoking this, so that no producer (recorder publish span,
+    // RemoveInstance holds a unique lifecycle lock during this purge,
+    // so no producer (recorder publish span,
     // reporter ReportInterval, MetaServiceMetricsBase slow path) can
     // register new instance_id-tagged metrics during the steps below
 
@@ -868,7 +980,7 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
     KeyVector query_keys = keys;
     ec = PerformCacheLocationQuery(request_context,
                                    service_metrics_collector,
-                                   meta_searcher,
+                                   meta_searcher.get(),
                                    instance_id,
                                    query_type,
                                    keys,
@@ -1102,7 +1214,7 @@ std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *
     KeyVector query_keys = keys;
     ec = PerformCacheLocationQuery(request_context,
                                    service_metrics_collector,
-                                   meta_searcher,
+                                   meta_searcher.get(),
                                    instance_id,
                                    query_type,
                                    keys,
@@ -1191,7 +1303,7 @@ CacheManager::StartWriteCache(RequestContext *request_context,
         KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, keys.size());
         filter_ec = FilterWriteCache(request_context,
                                      instance_id,
-                                     meta_searcher,
+                                     meta_searcher.get(),
                                      keys,
                                      new_keys,
                                      location_spec_group_names,
@@ -1207,7 +1319,7 @@ CacheManager::StartWriteCache(RequestContext *request_context,
         KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, gen_keys.size());
         filter_ec = FilterWriteCache(request_context,
                                      instance_id,
-                                     meta_searcher,
+                                     meta_searcher.get(),
                                      gen_keys,
                                      new_keys,
                                      location_spec_group_names,
@@ -1294,7 +1406,7 @@ void CacheManager::RollbackAddLocations(RequestContext *request_context,
         return;
     }
 
-    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    auto meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     MetaSearcher::AddLocationRollbackPlan plan;
     if (!meta_searcher) {
         // 无元数据访问时无法 reconcile uncertain 项，只能保留其 URI；但
@@ -1400,7 +1512,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                                      location_info.keys.size());
     }
 
-    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    auto meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher) {
         request_context->error_tracer()->AddErrorMsg("instance not exist");
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "finish write cache failed: meta searcher not found");
@@ -2870,7 +2982,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         });
     }
 
-    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    auto meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher) {
         KVCM_LOG_WARN("trace_id [%s] | ReportEvent: meta searcher not found for instance [%s]",
                       trace_id.c_str(),
@@ -4102,7 +4214,7 @@ void CacheManager::CleanupHostLocations(const std::string &instance_id,
         return;
     }
 
-    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    auto meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher) {
         KVCM_LOG_WARN("CleanupHostLocations: meta searcher not found for instance [%s]", instance_id.c_str());
         return;
@@ -4165,7 +4277,7 @@ ErrorCode CacheManager::CleanupStaleSnapshotLocations(const ReporterSnapshotKey 
          event_backend->GetSnapshotAttemptEpoch(reporter_key) != snapshot_attempt_epoch)) {
         return EC_OK;
     }
-    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(reporter_key.instance_id);
+    auto meta_searcher = meta_searcher_manager_->GetMetaSearcher(reporter_key.instance_id);
     if (!meta_searcher) {
         KVCM_LOG_WARN("CleanupStaleSnapshotLocations: meta searcher not found for instance [%s]",
                       reporter_key.instance_id.c_str());
@@ -4247,7 +4359,7 @@ ErrorCode CacheManager::TryCreateMetaSearcher(RequestContext *request_context, c
     const std::string &trace_id = request_context->trace_id();
     const auto check_loc_data_exist = GetCheckLocDataExistFunc(instance_id);
     const auto submit_del_req = GetSubmitDelReqFunc(instance_id);
-    MetaSearcher *meta_searcher = meta_searcher_manager_->TryCreateMetaSearcher(
+    auto meta_searcher = meta_searcher_manager_->TryCreateMetaSearcher(
         request_context, instance_id, check_loc_data_exist, submit_del_req);
     if (!meta_searcher) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "create meta searcher failed");
@@ -4256,13 +4368,14 @@ ErrorCode CacheManager::TryCreateMetaSearcher(RequestContext *request_context, c
     return EC_OK;
 }
 
-std::pair<ErrorCode, MetaSearcher *> CacheManager::CheckInputAndGetMetaSearcher(RequestContext *request_context,
-                                                                                const std::string &instance_id,
-                                                                                const KeyVector &keys,
-                                                                                const TokenIdsVector &tokens) const {
+std::pair<ErrorCode, std::shared_ptr<MetaSearcher>>
+CacheManager::CheckInputAndGetMetaSearcher(RequestContext *request_context,
+                                           const std::string &instance_id,
+                                           const KeyVector &keys,
+                                           const TokenIdsVector &tokens) const {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
-    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    auto meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher) {
         PREFIX_LOG(WARN, "meta searcher not found");
         request_context->error_tracer()->AddErrorMsg("instance not exist");
@@ -4427,6 +4540,13 @@ ErrorCode CacheManager::DoRecoverOnce() {
             KVCM_LOG_INFO("CacheManager RegisterInstance success when recover, instance_id[%s], storage_config[%s]",
                           instance_info->instance_id().c_str(),
                           config_str.c_str());
+        }
+    }
+
+    for (const auto &pending : registry_manager_->ListRemovingInstanceInfos()) {
+        RequestContext cleanup_context("recover_removing_instance");
+        if (RemoveInstance(&cleanup_context, pending->instance_group_name(), pending->instance_id()) != EC_OK) {
+            ++error_count;
         }
     }
 
@@ -4803,7 +4923,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
 
-    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    auto meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher) {
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
                                           EC_INSTANCE_NOT_EXIST,

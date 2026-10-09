@@ -33,6 +33,7 @@ private:                                                                        
 #endif
 
 class MetaIndexerManager;
+class MetaIndexer;
 class DataStorageManager;
 
 struct CacheMetaDelRequest {
@@ -164,6 +165,7 @@ private:
     struct LocationDelAdmissionResult {
         PlanExecuteResult result{ErrorCode::EC_OK, ""};
         CacheLocationDelRequest actual_task;
+        std::shared_ptr<MetaIndexer> indexer;
         bool needs_physical_delete{false};
     };
 
@@ -214,7 +216,8 @@ private:
     std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task, ScheduleTaskClass task_class);
     std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
                                                         ScheduleTaskClass task_class);
-    PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task);
+    PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task,
+                                        const std::shared_ptr<MetaIndexer> &indexer);
     PlanExecuteResult DoEventReportMetadataDelTask(const EventReportMetadataDelRequest &task);
     void DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
                     const CacheLocationCopyRequest &task);

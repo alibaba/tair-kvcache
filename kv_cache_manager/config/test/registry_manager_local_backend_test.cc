@@ -89,6 +89,42 @@ TEST_F(RegistryManagerLocalBackendTest, TestInit) {
     ASSERT_TRUE(InitRegistryManager(uri));
 }
 
+TEST_F(RegistryManagerLocalBackendTest, TestRemovingInstanceIntentSurvivesRecover) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "_removing_instance_registry";
+    ASSERT_TRUE(InitRegistryManager("local://" + path + "?cluster_name=test"));
+    CreateInstanceGroup("group1");
+    EXPECT_EQ(EC_BADARGS,
+              registry_manager_->RegisterInstance(request_context_.get(),
+                                                  "group1",
+                                                  "__kvcm_internal_removing_instance_registry__",
+                                                  1024,
+                                                  {LocationSpecInfo{}},
+                                                  ModelDeployment{}));
+    RegisterInstance("group1", "instance1");
+
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+    ASSERT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("instance1"));
+    EXPECT_NE(EC_OK, registry_manager_->RemoveInstanceGroup(request_context_.get(), "group1"));
+    auto [group_ec, group] = registry_manager_->GetInstanceGroup(request_context_.get(), "group1");
+    ASSERT_EQ(EC_OK, group_ec);
+    auto updated_group = *group;
+    updated_group.set_version(group->version() + 1);
+    EXPECT_NE(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), updated_group, group->version()));
+    EXPECT_NE(EC_OK,
+              registry_manager_->RegisterInstance(
+                  request_context_.get(), "group1", "instance1", 1024, {LocationSpecInfo{}}, ModelDeployment{}));
+
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    ASSERT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), "instance1"));
+    ASSERT_EQ(EC_OK, registry_manager_->BeginRemoveInstance(request_context_.get(), "instance1"));
+    ASSERT_EQ(EC_OK, registry_manager_->CompleteRemoveInstance("instance1"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("instance1"));
+    RegisterInstance("group1", "instance1");
+}
+
 TEST_F(RegistryManagerLocalBackendTest, TestStorageManagement) {
     std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_storage_test";
     std::string uri = "local://" + local_path + "?cluster_name=test";

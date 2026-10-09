@@ -138,6 +138,18 @@ MetaIndexer::~MetaIndexer() {
     }
 }
 
+ErrorCode MetaIndexer::Retire() noexcept {
+    if (!backend_manager_->SyncAll()) {
+        return EC_ERROR;
+    }
+    const ErrorCode ec = backend_manager_->DeleteMetaData();
+    if (ec != EC_OK) {
+        return ec;
+    }
+    backend_manager_.reset();
+    return EC_OK;
+}
+
 ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept {
     if (!config || !config->GetMetaStorageBackendConfig()) {
         KVCM_LOG_ERROR("instance[%s] meta indexer init failed, config is invalid", instance_id.c_str());

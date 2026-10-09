@@ -2190,6 +2190,8 @@ ErrorCode MetaStorageBackendManager::GetMetaData(FieldMap &field_maps) noexcept 
     return persistent_backend_->GetMetaData(field_maps);
 }
 
+ErrorCode MetaStorageBackendManager::DeleteMetaData() noexcept { return persistent_backend_->DeleteMetaData(); }
+
 bool MetaStorageBackendManager::Sync(const KeyVector &keys) noexcept {
     if (!persistent_backend_) {
         return true;

@@ -1776,6 +1776,8 @@ ErrorCode MetaLocalBackend::PutMetaData(const FieldMap & /*field_maps*/) noexcep
 
 ErrorCode MetaLocalBackend::GetMetaData(FieldMap & /*field_maps*/) noexcept { return EC_NOENT; }
 
+ErrorCode MetaLocalBackend::DeleteMetaData() noexcept { return EC_OK; }
+
 size_t MetaLocalBackend::GetMemUsage() const noexcept { return cache_->GetUsage(); }
 
 bool MetaLocalBackend::GetCacheHashSeed(uint32_t &out_hash_seed) const noexcept {
