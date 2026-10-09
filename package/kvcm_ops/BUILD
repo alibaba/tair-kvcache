@@ -66,3 +66,10 @@ py_test(
     srcs = ["test/instance_group_fairness_test.py"],
     deps = [":kvcm_ops_lib"],
 )
+
+py_test(
+    name = "ListInstanceTest",
+    srcs = ["test/list_instance_test.py"],
+    main = "test/list_instance_test.py",
+    deps = [":kvcm_ops_lib"],
+)

@@ -76,7 +76,7 @@ class WheelInstallTest(unittest.TestCase):
             "list_instance",
             "--help",
         )
-        self.assertIn("kvcm: list_intance.", http_command_help)
+        self.assertIn("kvcm: list_instance.", http_command_help)
 
 
 if __name__ == "__main__":
