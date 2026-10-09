@@ -180,6 +180,23 @@ struct SharedMemoryRegistration {
     int fd{-1};
 };
 
+struct GpuMemorySpan {
+    // Non-owning CUDA device address. The caller must keep the allocation alive
+    // until the TransferClient using this registration is destroyed.
+    void *base{nullptr};
+    size_t size{0};
+    // CUDA device that owns base. The wrapper forwards this value without
+    // validating the address-to-device mapping.
+    int device_id{-1};
+};
+
+struct ClientMemoryRegistrations {
+    // A default-constructed host registration means that only GPU memory, or no
+    // external memory, is registered.
+    SharedMemoryRegistration host;
+    std::vector<GpuMemorySpan> gpu;
+};
+
 struct InitParams {
     RoleType role_type{RoleType::UNKNOWN};
     RegistSpan *regist_span{nullptr};    // used by worker
