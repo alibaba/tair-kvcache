@@ -63,7 +63,8 @@ private:
     ClientErrorCode PrepareSharedMemoryRegistration(const SharedMemoryRegistration &shared_memory_registration,
                                                     SharedMemoryRegistration &prepared_registration);
     ClientErrorCode UpdateTairMempoolSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
-                                               const SharedMemoryRegistration *shared_memory_registration);
+                                               const SharedMemoryRegistration *shared_memory_registration,
+                                               const std::string &tair_mempool_metaservice_url = {});
 
 private:
     SdkFactory *sdk_factory_;

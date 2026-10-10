@@ -185,6 +185,8 @@ struct InitParams {
     RegistSpan *regist_span{nullptr};    // used by worker
     std::string self_location_spec_name; // used by worker
     std::string storage_configs;         // used by worker
+    // KVCM-selected URL for deferred TairMempool registration.
+    std::string tair_mempool_metaservice_url;
 };
 
 struct ForwardContext {

@@ -95,7 +95,8 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
             KVCM_LOG_WARN("fill span failed, storage config: %s", storage_config->ToString().c_str());
             return ec;
         }
-        ec = UpdateTairMempoolSdkConfig(sdk_backend_config, active_registration);
+        ec = UpdateTairMempoolSdkConfig(
+            sdk_backend_config, active_registration, init_params.tair_mempool_metaservice_url);
         if (ec != ER_OK) {
             KVCM_LOG_WARN("fill tair mempool span failed, storage config: %s", storage_config->ToString().c_str());
             return ec;
@@ -419,7 +420,8 @@ ClientErrorCode SdkWrapper::PrepareSharedMemoryRegistration(const SharedMemoryRe
 }
 
 ClientErrorCode SdkWrapper::UpdateTairMempoolSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
-                                                       const SharedMemoryRegistration *shared_memory_registration) {
+                                                       const SharedMemoryRegistration *shared_memory_registration,
+                                                       const std::string &tair_mempool_metaservice_url) {
     if (!IsTairMempoolStorageType(sdk_backend_config->type())) {
         return ER_OK;
     }
@@ -428,6 +430,7 @@ ClientErrorCode SdkWrapper::UpdateTairMempoolSdkConfig(const std::shared_ptr<Sdk
         KVCM_LOG_WARN("convert to tair mempool config failed");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
+    config->set_tair_mempool_metaservice_url(tair_mempool_metaservice_url);
     if (shared_memory_registration == nullptr || shared_memory_registration->fd < 0) {
         return ER_OK;
     }

@@ -168,15 +168,18 @@ public:
     int shm_fd() const { return shm_fd_; }
     size_t shm_size() const { return shm_size_; }
     void *client_base() const { return client_base_; }
+    const std::string &tair_mempool_metaservice_url() const { return tair_mempool_metaservice_url_; }
 
     void set_shm_fd(int fd) { shm_fd_ = fd; }
     void set_shm_size(size_t size) { shm_size_ = size; }
     void set_client_base(void *base) { client_base_ = base; }
+    void set_tair_mempool_metaservice_url(const std::string &url) { tair_mempool_metaservice_url_ = url; }
 
 private:
     int shm_fd_{-1};
     size_t shm_size_{0};
     void *client_base_{nullptr};
+    std::string tair_mempool_metaservice_url_;
 };
 
 class NfsSdkConfig : public SdkBackendConfig {
