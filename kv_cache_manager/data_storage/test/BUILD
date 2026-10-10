@@ -7,6 +7,7 @@ cc_test(
     linkopts = [
         "-Wl,--wrap=mooncake_client_create",
         "-Wl,--wrap=mooncake_client_destroy",
+        "-Wl,--wrap=mooncake_client_get_store_status",
     ],
     linkstatic = True,
     tags = ["manual", "mooncake"],
