@@ -62,6 +62,25 @@ bazelisk info --announce_rc repository_cache
 - 单元测试： ```bazelisk test //kv_cache_manager/...```
 - 集成测试： ```bazelisk test //integration_test/...```
 - C++客户端测试： ```bazelisk test //kv_cache_manager/... --config=client```
+
+Mooncake 后端的关闭回归测试需要显式选中目标：
+
+```bash
+bazelisk test //kv_cache_manager/data_storage/test:MooncakeBackendCloseTest --config=mooncake_common
+```
+
+该测试替换客户端销毁函数，不连接远端存储，验证显式关闭、重复关闭和析构只释放
+同一个客户端一次。`MooncakeBackend::Close` 在停止健康检查线程后清空已释放的
+客户端指针；这是顺序关闭的保证，不表示允许关闭与读写操作并发。
+真实 RDMA 验收还需验证设备权限、存储协议、模型缓存写入与读取，以及删除后回退。
+
+管理进程和推理 worker 的网卡名称或地址不同时，可为 Manager 设置
+`KVCM_MOONCAKE_LOCAL_HOSTNAME` 和 `KVCM_MOONCAKE_RDMA_DEVICE`。
+前者替代本机客户端的地址前缀，后者选择本机 RDMA 网卡；网卡设置为空字符串时，
+由本机传输库自动发现。未设置时沿用 `MooncakeStorageSpec` 的对应字段。
+这两个变量仅影响 Manager 创建本机 Mooncake 客户端，不改写注册表中的 StorageSpec，
+worker SDK 仍接收原存储协议和网卡配置。测试也验证这条边界；所有数据面操作
+仍需对照实际部署的客户端版本和设备权限进行验收。
 - 依赖Redis的测试：
   - 需要本地启动一个Redis或Valkey。
   - ```bazelisk test //kv_cache_manager/common/test:redis_client_real_service_test //kv_cache_manager/meta/test:meta_redis_backend_real_service_test //kv_cache_manager/meta/test:meta_storage_backend_manager_real_redis_test //kv_cache_manager/meta/test:meta_indexer_redis_test //kv_cache_manager/manager/test:MetaSearcherRedisTest //kv_cache_manager/config/test:registry_manager_redis_backend_test --test_tag_filters=redis```

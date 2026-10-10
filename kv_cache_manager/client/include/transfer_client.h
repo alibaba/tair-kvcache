@@ -11,6 +11,9 @@
 
 namespace kv_cache_manager {
 
+// Version 1 understands additional_local_memory_spans without changing InitParams ABI.
+extern "C" uint32_t kvcm_client_additional_memory_registration_version();
+
 class TransferClient {
 public:
     virtual ~TransferClient() = default;
