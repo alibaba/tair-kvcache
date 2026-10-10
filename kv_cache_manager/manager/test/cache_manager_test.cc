@@ -643,12 +643,14 @@ public:
         group->cache_config_ = std::make_shared<CacheConfig>();
         group->cache_config_->meta_indexer_config_ =
             registry_manager_->instance_group_configs_.at("default")->cache_config_->meta_indexer_config_;
+        std::vector<std::shared_ptr<MigrationStrategy>> migration_strategies;
         for (const auto &[source, target] : migrations) {
             auto migration = std::make_shared<MigrationStrategy>();
             migration->set_source_storage_name(source);
             migration->set_target_storage_name(target);
-            group->cache_config_->migration_strategies_.push_back(std::move(migration));
+            migration_strategies.push_back(std::move(migration));
         }
+        group->cache_config_->set_migration_strategies(migration_strategies);
         registry_manager_->instance_group_configs_[name] = std::move(group);
     }
 

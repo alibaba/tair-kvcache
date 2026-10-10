@@ -5,7 +5,7 @@
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
-#include "kv_cache_manager/config/location_spec_group.h"
+#include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/model_deployment.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
