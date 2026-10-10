@@ -98,7 +98,7 @@ instance group、data-storage backend 和 reporter node lock。当前实现做�
 10. prefix 只把首个 `EC_NOENT` 当作正常终止。首个 miss 之后的 speculative read 结果不影响已经确定的
     前缀；但 miss 之前的 `EC_ERROR`、`EC_MISMATCH` 等硬错误必须原样返回，不能伪装成较短的 cache miss。
     普通 prefix 与 Mamba 路径遵循相同规则；
-11. 上述渐进取消只用于 `p2p_host_count=0`。启用 P2P 时 local miss 之后仍可能由 Vineyard peer 延续覆盖，
+11. 上述渐进取消只用于 `global_kvs_host_count=0`。启用远端评估时 local miss 之后仍可能由 Tair/NFS 或 Vineyard peer 延续覆盖，
     因此当前保留完整 metadata materialization；它仍执行 serving 过滤和错误传播，但不能套用 local-only stop。
 
 可见性快照在首个有界 metadata range 读取之后、其 projection 开始时采集。采集前已经可见的 HOST_DOWN
@@ -1697,14 +1697,14 @@ pure-local Release 验证结果：
 
 #### 最终实现与并发边界
 
-1. `p2p_host_count=0` 使用真正的渐进式 compact projection。先同步读取 4096 key，利用第 0 个 key 建立有序候选
+1. `global_kvs_host_count=0` 使用真正的渐进式 compact projection。先同步读取 4096 key，利用第 0 个 key 建立有序候选
    host；每个候选维护 atomic prefix stop。只要所有候选均已停止，visitor 就降低全局 stop，尚未领取的后缀任务
    直接取消。首窗口内的 host miss/no-entry 因而只读取 4096 key，而不是先物化整个请求。
 2. 首窗口成功后使用 16384-key 后续批次并由现有有界 QueryExecutor 调度。默认 local LRU 有 1024 shard，旧 4096
    批次会在百万 key 请求中重复约 24 万次 lookup/release shard lock；增大后续批次可摊薄 lock/unlock，同时首窗口
    仍保持早停上界。16384 相对 4096 的同机 A/B 将 1M metadata/all-hit p50 从约 109.3/114.9ms 降至
    94.3/103.7ms；32768 没有进一步改善 all-hit 且放大后缀过读，已撤销。
-3. `p2p_host_count>0` 暂时保留完整读取。一个 host 的 local prefix 已停止时，Vineyard peer 仍可能继续覆盖后续 key，
+3. `global_kvs_host_count>0` 暂时保留完整读取。一个 host 的 local prefix 已停止时，Tair/NFS 或 Vineyard peer 仍可能继续覆盖后续 key，
    不能把 local miss 直接当作全局取消条件。该路径仍获得 serving 状态过滤、一次 host/spec 扫描和严格错误传播，
    但没有伪装成渐进路径；后续若优化，必须先设计 peer-aware stop 证明。
 4. request-specific checker 除返回可见/不可见外，同时借用返回已经解析的 reporter medium/host，并声明 EventReport URI
