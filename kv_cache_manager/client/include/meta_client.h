@@ -30,7 +30,8 @@ public:
                const std::vector<int64_t> &keys,
                const std::vector<int64_t> &tokens,
                const std::vector<std::string> &location_spec_group_names,
-               int64_t write_timeout_seconds) = 0;
+               int64_t write_timeout_seconds,
+               int32_t min_replica_count = 0) = 0;
     virtual ClientErrorCode FinishWrite(const std::string &trace_id,
                                         const std::string &write_session_id,
                                         const BlockMask &success_block,
@@ -54,6 +55,23 @@ public:
                                         const BlockMask &block_mask) = 0;
 
     virtual const std::string &GetStorageConfig() const = 0;
+
+    // This endpoint accepts batch queries only and preserves the key indices.
+    virtual std::pair<ClientErrorCode, BackendLocations>
+    GetCacheLocationsByBackend(const std::string &trace_id,
+                               const std::vector<int64_t> &keys,
+                               const std::vector<int64_t> &tokens,
+                               const BlockMask &block_mask,
+                               const std::vector<std::string> &location_spec_names,
+                               StorageType backend_type,
+                               BackendSelectStrategy strategy) = 0;
+
+    virtual std::pair<ClientErrorCode, HostCacheState>
+    GetHostCacheState(const std::string &trace_id,
+                      QueryType query_type,
+                      const std::vector<int64_t> &keys,
+                      const std::vector<std::string> &medium,
+                      int32_t p2p_host_count) = 0;
 
 protected:
     MetaClient() = default;

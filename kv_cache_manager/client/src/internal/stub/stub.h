@@ -63,7 +63,8 @@ public:
                     const KeyVector &keys,
                     const TokenIdsVector &tokens,
                     const std::vector<std::string> &location_spec_group_names,
-                    int64_t write_timeout_seconds) = 0;
+                    int64_t write_timeout_seconds,
+                    int32_t min_replica_count = 0) = 0;
     virtual ClientErrorCode FinishWriteCache(const std::string &trace_id,
                                              const std::string &instance_id,
                                              const std::string write_session_id,
@@ -76,6 +77,24 @@ public:
                                         const TokenIdsVector &tokens,
                                         const BlockMask &block_mask) = 0;
     virtual bool TrimCache() = 0;
+
+    virtual std::pair<ClientErrorCode, BackendLocations>
+    GetCacheLocationsByBackend(const std::string &trace_id,
+                               const std::string &instance_id,
+                               const KeyVector &keys,
+                               const TokenIdsVector &tokens,
+                               const BlockMask &block_mask,
+                               const std::vector<std::string> &location_spec_names,
+                               StorageType backend_type,
+                               BackendSelectStrategy strategy) = 0;
+
+    virtual std::pair<ClientErrorCode, HostCacheState>
+    GetHostCacheState(const std::string &trace_id,
+                      const std::string &instance_id,
+                      QueryType query_type,
+                      const KeyVector &keys,
+                      const std::vector<std::string> &medium,
+                      int32_t p2p_host_count) = 0;
 
     // leader 节点信息查询失败时 ClusterInfo::leader_endpoint 可能为空，调用方应据此决定是否重试。
     virtual std::pair<ClientErrorCode, ClusterInfo> GetClusterInfo(const std::string &trace_id,

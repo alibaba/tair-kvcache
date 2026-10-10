@@ -58,7 +58,8 @@ public:
                                                               const KeyVector &keys,
                                                               const TokenIdsVector &tokens,
                                                               const std::vector<std::string> &location_spec_group_names,
-                                                              int64_t write_timeout_seconds) override;
+                                                              int64_t write_timeout_seconds,
+                                                              int32_t min_replica_count = 0) override;
 
     ClientErrorCode FinishWriteCache(const std::string &trace_id,
                                      const std::string &instance_id,
@@ -73,6 +74,24 @@ public:
                                 const BlockMask &block_mask) override;
 
     bool TrimCache() override;
+
+    std::pair<ClientErrorCode, BackendLocations>
+    GetCacheLocationsByBackend(const std::string &trace_id,
+                               const std::string &instance_id,
+                               const KeyVector &keys,
+                               const TokenIdsVector &tokens,
+                               const BlockMask &block_mask,
+                               const std::vector<std::string> &location_spec_names,
+                               StorageType backend_type,
+                               BackendSelectStrategy strategy) override;
+
+    std::pair<ClientErrorCode, HostCacheState>
+    GetHostCacheState(const std::string &trace_id,
+                      const std::string &instance_id,
+                      QueryType query_type,
+                      const KeyVector &keys,
+                      const std::vector<std::string> &medium,
+                      int32_t p2p_host_count) override;
 
     std::pair<ClientErrorCode, ClusterInfo> GetClusterInfo(const std::string &trace_id,
                                                            const std::string &instance_id) override;

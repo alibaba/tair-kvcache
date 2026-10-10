@@ -118,7 +118,8 @@ public:
                  const KeyVector &keys,
                  const TokenIdsVector &tokens,
                  const std::vector<std::string> &location_spec_group_names,
-                 int64_t write_timeout_seconds),
+                 int64_t write_timeout_seconds,
+                 int32_t min_replica_count),
                 (override));
 
     MOCK_METHOD(ClientErrorCode,
@@ -139,6 +140,16 @@ public:
                  const BlockMask &block_mask),
                 (override));
 
+    MOCK_METHOD((std::pair<ClientErrorCode, BackendLocations>),
+                GetCacheLocationsByBackend,
+                (const std::string&, const std::string&, const KeyVector&, const TokenIdsVector&,
+                 const BlockMask&, const std::vector<std::string>&, StorageType, BackendSelectStrategy),
+                (override));
+    MOCK_METHOD((std::pair<ClientErrorCode, HostCacheState>),
+                GetHostCacheState,
+                (const std::string&, const std::string&, QueryType, const KeyVector&,
+                 const std::vector<std::string>&, int32_t),
+                (override));
     MOCK_METHOD(bool, TrimCache, (), (override));
 
     MOCK_METHOD((std::pair<ClientErrorCode, ClusterInfo>),
