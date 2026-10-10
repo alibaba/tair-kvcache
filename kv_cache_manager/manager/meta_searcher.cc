@@ -704,9 +704,7 @@ std::vector<size_t> SelectTopHostIndicesByLocal(const std::vector<MetaSearcher::
     std::vector<size_t> host_indices;
     host_indices.reserve(host_matches.size());
     for (size_t i = 0; i < host_matches.size(); ++i) {
-        if (host_matches[i].local > 0) {
-            host_indices.push_back(i);
-        }
+        host_indices.push_back(i);
     }
     const size_t selected_count = std::min(top_k_host_count, host_indices.size());
     std::partial_sort(host_indices.begin(),
@@ -1134,7 +1132,7 @@ ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostPrefixReduce);
     for (auto &match : matches) {
-        if (match.local > 0) {
+        if (match.local > 0 || match.global > 0) {
             out_matches.push_back(std::move(match));
         }
     }
