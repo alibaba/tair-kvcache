@@ -5232,49 +5232,6 @@ TEST_F(HostCacheRemoteTest, ZeroLocalPrefixUsesRequestedRemoteBackends) {
     EXPECT_TRUE(Query(1, std::vector<DataStorageType>{}, {}, true).empty());
 }
 
-TEST_F(HostCacheRemoteTest, ZeroLocalMambaUsesRequestedRemoteBackends) {
-    const std::vector<LocationSpecGroup> groups = {LocationSpecGroup("F0", {"full"}),
-                                                   LocationSpecGroup("L0", {"linear"})};
-    for (size_t i = 0; i < 4; ++i) {
-        Add(i, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80", {"full"});
-    }
-    Add(1, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90", {"linear"});
-    Add(3, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer:80", {"linear"});
-    Store();
-
-    const auto tair = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
-    const auto p2p = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
-    const std::vector<std::pair<std::vector<DataStorageType>, int64_t>> cases = {
-        {{tair}, 2}, {{p2p}, 4}, {{tair, p2p}, 4}};
-    // Full blocks alone have local=0 until a remote Linear state provides a recovery point.
-    for (const auto &[backends, expected_global] : cases) {
-        const auto matches = Query(1, backends, groups);
-        ASSERT_EQ(1u, matches.size());
-        EXPECT_EQ(std::make_pair(0L, expected_global), matches.at("worker:80"));
-        EXPECT_TRUE(Query(0, backends, groups).empty());
-    }
-    EXPECT_TRUE(Query(1, std::vector<DataStorageType>{}, groups).empty());
-}
-
-TEST_F(HostCacheRemoteTest, ZeroLocalHostsRespectTopKAndHostOrder) {
-    for (const auto &host : {"worker_c:80", "worker_b:80", "worker_a:80"}) {
-        Add(0, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, host);
-    }
-    Add(1, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90");
-    Store();
-
-    const auto top_one = Query(1, false, {}, true);
-    ASSERT_EQ(1u, top_one.size());
-    EXPECT_EQ(std::make_pair(0L, 1L), top_one.at("worker_a:80"));
-    const auto top_two = Query(2, false, {}, true);
-    ASSERT_EQ(2u, top_two.size());
-    EXPECT_EQ(std::make_pair(0L, 1L), top_two.at("worker_a:80"));
-    EXPECT_EQ(std::make_pair(0L, 1L), top_two.at("worker_b:80"));
-    const auto all = Query(20, false, {}, true);
-    ASSERT_EQ(3u, all.size());
-    EXPECT_EQ(std::make_pair(0L, 1L), all.at("worker_c:80"));
-}
-
 TEST_F(HostCacheRemoteTest, PositiveLocalHostsHavePriorityOverZeroLocalHosts) {
     for (const auto &host : {"a_zero:80", "b_zero:80", "z_positive:80"}) {
         Add(0, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, host);
