@@ -40,22 +40,38 @@ BASE_PTR = 1 << 20
 
 
 class FakeTensor:
-    """Minimal strided tensor: only what attn_kv_views / _build_transfer_group
-    read (dim/shape/stride/permute/indexing/data_ptr)."""
+    """Minimal strided tensor: only what attn_kv_views / _build_attention_group
+    read (dim/shape/stride/permute/indexing/data_ptr/element_size/dtype)."""
 
-    def __init__(self, shape, strides, offset=0, base=BASE_PTR):
+    def __init__(
+        self,
+        shape,
+        strides,
+        offset=0,
+        base=BASE_PTR,
+        itemsize=ITEMSIZE,
+        dtype="bfloat16",
+    ):
         self.shape = tuple(shape)
         self._strides = tuple(strides)
         self._offset = offset
         self._base = base
+        self._itemsize = itemsize
+        self.dtype = dtype
 
     @classmethod
-    def contiguous(cls, shape, base=BASE_PTR):
+    def contiguous(cls, shape, base=BASE_PTR, itemsize=ITEMSIZE, dtype="bfloat16"):
         strides, acc = [], 1
         for s in reversed(shape):
             strides.append(acc)
             acc *= s
-        return cls(shape, tuple(reversed(strides)), base=base)
+        return cls(
+            shape,
+            tuple(reversed(strides)),
+            base=base,
+            itemsize=itemsize,
+            dtype=dtype,
+        )
 
     def dim(self):
         return len(self.shape)
@@ -63,8 +79,11 @@ class FakeTensor:
     def stride(self, i=None):
         return self._strides if i is None else self._strides[i]
 
+    def element_size(self):
+        return self._itemsize
+
     def data_ptr(self):
-        return self._base + self._offset * ITEMSIZE
+        return self._base + self._offset * self._itemsize
 
     def permute(self, *dims):
         return FakeTensor(
@@ -72,6 +91,8 @@ class FakeTensor:
             [self._strides[d] for d in dims],
             self._offset,
             self._base,
+            self._itemsize,
+            self.dtype,
         )
 
     def unsqueeze(self, dim):
@@ -83,7 +104,9 @@ class FakeTensor:
         new_stride = shape[0] * strides[0] if dim == 0 else strides[dim - 1]
         shape.insert(dim, 1)
         strides.insert(dim, new_stride)
-        return FakeTensor(shape, strides, self._offset, self._base)
+        return FakeTensor(
+            shape, strides, self._offset, self._base, self._itemsize, self.dtype
+        )
 
     def __getitem__(self, idx):
         if isinstance(idx, int):  # t[i]: drop dim 0
@@ -92,6 +115,8 @@ class FakeTensor:
                 self._strides[1:],
                 self._offset + idx * self._strides[0],
                 self._base,
+                self._itemsize,
+                self.dtype,
             )
         if isinstance(idx, tuple) and idx[0] == slice(None) and isinstance(idx[1], int):
             # t[:, i]: drop dim 1
@@ -100,6 +125,8 @@ class FakeTensor:
                 self._strides[:1] + self._strides[2:],
                 self._offset + idx[1] * self._strides[1],
                 self._base,
+                self._itemsize,
+                self.dtype,
             )
         raise TypeError(f"unsupported index {idx!r}")
 
@@ -199,17 +226,39 @@ class TestAttnKvViews(unittest.TestCase):
             attn_kv_views(FakeTensor.contiguous([2, 2, 16, 4, 128]))
 
 
+class TestFakeTensorItemsize(unittest.TestCase):
+    """The fixture's byte math backs every stride/size assertion below:
+    data_ptr() must scale with the element size (uint8 fp8 rows vs bf16)."""
+
+    def test_uint8_rows_are_byte_offset(self):
+        t = FakeTensor.contiguous([10, 64, 656], itemsize=1)
+        self.assertEqual(t.element_size(), 1)
+        self.assertEqual(t[1].data_ptr() - t[0].data_ptr(), 64 * 656)
+
+    def test_default_itemsize_is_two_bytes(self):
+        t = FakeTensor.contiguous([10, 16, 576])
+        self.assertEqual(t.element_size(), 2)
+        self.assertEqual(t[1].data_ptr() - t[0].data_ptr(), 16 * 576 * 2)
+
+
 def _make_group_conn():
     conn = make_connector(manager_block_size=16)
-    # list instead of the production dict: group_idx == position here.
-    conn._self_spec_names = ["tp0_g0"]  # ty: ignore[invalid-assignment]
     conn._device = "cpu"
     return conn
 
 
-def _attn_meta(layer_names, block_size=16):
+def _attn_meta(layer_names, block_size=16, page_bytes=18432, manager_block_size=16):
+    """One attention bucket whose spec page matches the MLA bf16 tensor used
+    by most cases here (16 x 576 x 2 B)."""
     return AttentionGroupMeta(
-        group_idx=0, layer_names=layer_names, block_size=block_size, per_block_bytes=0
+        group_idx=0,
+        layer_names=layer_names,
+        block_size=block_size,
+        per_block_bytes=page_bytes
+        // block_size
+        * manager_block_size
+        * len(layer_names),
+        page_bytes=page_bytes,
     )
 
 
@@ -219,11 +268,12 @@ class TestBuildTransferGroup(unittest.TestCase):
     captured by patching ``torch.tensor`` (works with both the stubbed and a
     real torch: no tensor math happens on the captured value)."""
 
-    def _build(self, kv_caches):
+    def _build(self, kv_caches, block_size=16, page_bytes=18432, mbs=16):
         import unittest.mock as mock
         import kv_cache_manager.py_connector.vllm.connector_worker as wc
 
-        conn = _make_group_conn()
+        conn = make_connector(manager_block_size=mbs)
+        conn._device = "cpu"
         captured = []
 
         def fake_tensor(data, **kw):
@@ -234,13 +284,19 @@ class TestBuildTransferGroup(unittest.TestCase):
 
         with mock.patch.object(wc.torch, "tensor", side_effect=fake_tensor):
             g = conn._build_attention_group(
-                _attn_meta(list(kv_caches.keys())), kv_caches
+                _attn_meta(
+                    list(kv_caches.keys()),
+                    block_size=block_size,
+                    page_bytes=page_bytes,
+                    manager_block_size=mbs,
+                ),
+                kv_caches,
             )
         return g, captured
 
     def test_packed_one_ptr_per_layer(self):
         kv = {"l0": packed_4d(base=BASE_PTR), "l1": packed_4d(base=2 * BASE_PTR)}
-        g, ptrs = self._build(kv)
+        g, ptrs = self._build(kv, page_bytes=32768)
         self.assertEqual(g.num_kv_ptrs, 2)
         self.assertEqual(g.layer_num, 2)
         self.assertEqual(g.per_token_dim, 4 * 256)
@@ -250,7 +306,8 @@ class TestBuildTransferGroup(unittest.TestCase):
 
     def test_kv_first_two_ptrs_per_layer(self):
         kv = {"l0": kv_first_5d(base=BASE_PTR), "l1": kv_first_5d(base=2 * BASE_PTR)}
-        g, ptrs = self._build(kv)
+        # Split K/V: two views of 16 x 512 elements -> a 32768-byte page.
+        g, ptrs = self._build(kv, page_bytes=32768)
         self.assertEqual(g.num_kv_ptrs, 4)
         self.assertEqual(g.layer_num, 2)
         self.assertEqual(g.per_token_dim, 4 * 128)
@@ -262,7 +319,7 @@ class TestBuildTransferGroup(unittest.TestCase):
 
     def test_n_first_strided_blocks(self):
         kv = {"l0": n_first_5d(base=BASE_PTR)}
-        g, ptrs = self._build(kv)
+        g, ptrs = self._build(kv, page_bytes=32768)
         self.assertEqual(g.num_kv_ptrs, 2)
         self.assertEqual(g.per_token_dim, 4 * 128)
         # K/V interleaved per block -> kernel must walk the strided path.
@@ -293,6 +350,155 @@ class TestBuildTransferGroup(unittest.TestCase):
     def test_unrecognized_layout_fails_fast(self):
         with self.assertRaises(NotImplementedError):
             self._build({"l0": FakeTensor.contiguous([10, 16])})
+
+    def test_mla_fp8_ds_packed_uint8(self):
+        # V3.2 fp8_ds_mla main layer: 656 B/token, one uint8 row per token,
+        # flat pages -> itemsize 1 (the byte count is the element count).
+        kv = {"l0": FakeTensor.contiguous([10, 64, 656], itemsize=1, dtype="uint8")}
+        g, _ = self._build(kv, block_size=64, page_bytes=41984)
+        self.assertEqual(g.kernel_block_size, 64)
+        self.assertEqual(g.per_token_dim, 656)
+        self.assertEqual(g.block_stride, 0)  # 64 * 656 == stride(0)
+        self.assertEqual(g.dtype, "uint8")
+
+    def test_mla_padded_fp8_ds_packed_pages(self):
+        # V4 fp8_ds_mla (584 B/row): the compact page is 37376 bytes with the
+        # 64-byte alignment tail at its end, so the stride must skip it and
+        # the spec page must stay the compact size. The bucket's block is the
+        # storage block (compression stores `storage_block_size` rows per
+        # framework block; the c > 1 sizing comes with the V4 work).
+        kv = {"l0": FakeTensor([10, 64, 584], [37440, 584, 1], itemsize=1)}
+        g, _ = self._build(kv, block_size=64, page_bytes=37376)
+        self.assertEqual(g.kernel_block_size, 64)
+        self.assertEqual(g.per_token_dim, 584)
+        self.assertEqual(g.block_stride, 37440)
+        self.assertEqual(g.dtype, "bfloat16")  # the fixture's default dtype
+
+    def test_mla_fp8_ds_c128_pages(self):
+        # V4 c128a: two storage rows per page, 560 bytes of pad after them.
+        kv = {"l0": FakeTensor([10, 2, 584], [1728, 584, 1], itemsize=1)}
+        g, _ = self._build(kv, block_size=2, page_bytes=1168)
+        self.assertEqual(g.kernel_block_size, 2)
+        self.assertEqual(g.block_stride, 1728)
+
+    def test_mla_indexer_padded_pages(self):
+        # V4 indexer: 132 B/row, page padded 8448 -> 8640.
+        kv = {"l0": FakeTensor([10, 64, 132], [8640, 132, 1], itemsize=1)}
+        g, _ = self._build(kv, block_size=64, page_bytes=8448)
+        self.assertEqual(g.kernel_block_size, 64)
+        self.assertEqual(g.per_token_dim, 132)
+        self.assertEqual(g.block_stride, 8640)
+
+    def test_mla_indexer_flat_pages(self):
+        # Real V3.2 indexer: no alignment, so the pages are contiguous and
+        # the kernel takes the flat path (block_stride 0).
+        kv = {"l0": FakeTensor.contiguous([10, 64, 132], itemsize=1)}
+        g, _ = self._build(kv, block_size=64, page_bytes=8448)
+        self.assertEqual(g.kernel_block_size, 64)
+        self.assertEqual(g.per_token_dim, 132)
+        self.assertEqual(g.block_stride, 0)
+
+    def test_per_tensor_fp8_layout_stays_flat_uint8(self):
+        # B14/M3a: a non-packed fp8 cache keeps the plain MLA layout with
+        # uint8 elements (the per-tensor scales are layer-level, not in the
+        # page): one pointer, 576-wide rows, 576 B/token, flat pages.
+        kv = {"l0": FakeTensor.contiguous([10, 16, 576], itemsize=1, dtype="uint8")}
+        g, _ = self._build(kv, block_size=16, page_bytes=9216, mbs=64)
+        self.assertEqual(g.num_kv_ptrs, 1)
+        self.assertEqual(g.kernel_block_size, 16)
+        self.assertEqual(g.per_token_dim, 576)
+        self.assertEqual(g.block_stride, 0)
+        self.assertEqual(g.per_block_bytes, 576 * 64)
+
+    def test_hnd_layout_rejected(self):
+        # HND interleaves heads across tokens: the gather kernel needs NHD.
+        kv = {"l0": FakeTensor([10, 16, 576], [18432, 1, 16], itemsize=2)}
+        with self.assertRaises(AssertionError) as ctx:
+            self._build(kv)
+        self.assertIn("not token-major", str(ctx.exception))
+        self.assertIn("VLLM_KV_CACHE_LAYOUT=NHD", str(ctx.exception))
+
+    def test_layers_must_share_shape_and_stride(self):
+        kv = {
+            "l0": FakeTensor.contiguous([10, 16, 576]),
+            "l1": FakeTensor([10, 16, 576], [16 * 576 + 576, 576, 1]),
+        }
+        with self.assertRaises(AssertionError) as ctx:
+            self._build(kv)
+        self.assertIn("share shape/stride", str(ctx.exception))
+
+    def test_spec_page_bytes_must_match_the_tensor(self):
+        # The gate reads the spec; the tensors are the backend's truth. A
+        # mismatch (here: a spec claiming 10496 B/token against the bf16
+        # tensor's 1152 B/token) must fail at register_kv_caches, not
+        # silently mis-size every location.
+        kv = {"l0": mla_3d()}
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._build(kv, page_bytes=167936)
+        self.assertIn("10496", str(ctx.exception))
+        self.assertIn("1152", str(ctx.exception))
+
+    def test_backend_without_packed_scales_rejected(self):
+        # A backend that stores the fp8 rows *without* the in-row scale
+        # (512 B instead of the V3.2 main row's 656 B) is a different layout
+        # than the spec declares; refuse instead of transferring misaligned
+        # bytes.
+        kv = {"l0": FakeTensor.contiguous([10, 64, 512], itemsize=1)}
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._build(kv, block_size=64, page_bytes=41984)
+        self.assertIn("656", str(ctx.exception))
+        self.assertIn("512", str(ctx.exception))
+
+    def test_kernel_block_below_the_spec_block_is_legal(self):
+        # `--block-size 128` with a backend whose kernel page is 64 tokens is
+        # a legal vLLM configuration (the framework block only has to be a
+        # multiple of the kernel's), so the cross-check must compare per-token
+        # bytes: the spec page spans two kernel pages here.
+        kv = {"l0": FakeTensor.contiguous([10, 64, 576])}
+        g, _ = self._build(kv, block_size=128, page_bytes=147456, mbs=128)
+        self.assertEqual(g.kernel_block_size, 64)
+        self.assertEqual(g.block_size, 128)
+        self.assertEqual(g.per_token_dim, 576)
+        self.assertEqual(g.block_stride, 0)
+        self.assertEqual(g.num_kv_ptrs, 1)
+        self.assertEqual(g.per_block_bytes, 1152 * 128)
+
+    def test_split_kv_page_counted_twice(self):
+        # Regression: the cross-check must count *both* views of a split K/V
+        # layout, otherwise every vLLM <= 0.25 page looks half-sized.
+        kv = {"l0": kv_first_5d()}
+        g, _ = self._build(kv, page_bytes=32768)
+        self.assertEqual(g.num_kv_ptrs, 2)
+
+    def test_per_block_bytes_account_for_the_staged_rows(self):
+        # E1: the manager location's per-block bytes are exactly what the
+        # staging view stages -- one row set per transfer pointer, a manager
+        # block of rows, the bucket's per-token dim and element size.
+        for kv, block_size, page_bytes, mbs, itemsize in [
+            ({"l0": mla_3d()}, 16, 18432, 16, 2),
+            (
+                {"l0": FakeTensor.contiguous([10, 64, 656], itemsize=1)},
+                64,
+                41984,
+                64,
+                1,
+            ),
+            (
+                {"l0": FakeTensor.contiguous([10, 64, 132], itemsize=1)},
+                64,
+                8448,
+                128,
+                1,
+            ),
+        ]:
+            with self.subTest(page_bytes=page_bytes):
+                g, _ = self._build(
+                    kv, block_size=block_size, page_bytes=page_bytes, mbs=mbs
+                )
+                self.assertEqual(
+                    g.per_block_bytes,
+                    g.num_kv_ptrs * mbs * g.per_token_dim * itemsize,
+                )
 
 
 @unittest.skipIf("torch" in STUBBED, "requires real CPU tensors")
