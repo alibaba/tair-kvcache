@@ -378,7 +378,11 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
                           const KeyVector &keys,
                           const TokenIdsVector &tokens,
                           const std::vector<std::string> &location_spec_group_names,
-                          int64_t write_timeout_seconds) {
+                          int64_t write_timeout_seconds,
+                          int32_t min_replica_count) {
+    if (min_replica_count < 0) {
+        return {ER_INVALID_PARAMS, {}};
+    }
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::StartWriteCacheRequest request;
     SetKeysAndTokens(request, trace_id, instance_id, keys, tokens);
@@ -387,6 +391,7 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
         request.add_location_spec_group_names(name);
     }
     request.set_write_timeout_seconds(write_timeout_seconds);
+    request.set_min_replica_count(min_replica_count);
     grpc::ClientContext context;
     proto::meta::StartWriteCacheResponse response;
     auto grpc_status = stub->StartWriteCache(&context, request, &response);
@@ -450,6 +455,88 @@ ClientErrorCode GrpcStub::RemoveCache(const std::string &trace_id,
     CHECK_COMMON_HEADER(response);
     KVCM_LOG_DEBUG("remove cache success");
     return ER_OK;
+}
+
+std::pair<ClientErrorCode, BackendLocations>
+GrpcStub::GetCacheLocationsByBackend(const std::string &trace_id,
+                                     const std::string &instance_id,
+                                     const KeyVector &keys,
+                                     const TokenIdsVector &tokens,
+                                     const BlockMask &block_mask,
+                                     const std::vector<std::string> &location_spec_names,
+                                     StorageType backend_type,
+                                     BackendSelectStrategy strategy) {
+    auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
+    proto::meta::GetCacheLocationsByBackendRequest request;
+    SetKeysAndTokens(request, trace_id, instance_id, keys, tokens);
+    request.set_query_type(proto::meta::QT_BATCH_GET);
+    ProtoConvert::BlockMaskToProto(block_mask, request.mutable_block_mask());
+    for (const auto &name : location_spec_names) {
+        request.add_location_spec_names(name);
+    }
+    auto *selector = request.add_backend_selectors();
+    selector->set_backend_type(static_cast<proto::meta::StorageType>(backend_type));
+    selector->set_strategy(static_cast<proto::meta::LocationSelectStrategy>(strategy));
+    grpc::ClientContext context;
+    proto::meta::GetCacheLocationsByBackendResponse response;
+    auto grpc_status = stub->GetCacheLocationsByBackend(&context, request, &response);
+    CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
+    CHECK_COMMON_HEADER_WITH_TYPE(response);
+    if (!keys.empty() && static_cast<size_t>(response.key_locations_size()) != keys.size()) {
+        return {ER_SERVICE_NO_STATUS, {}};
+    }
+    BackendLocations result;
+    result.reserve(response.key_locations_size());
+    for (const auto &key_locations : response.key_locations()) {
+        result.emplace_back();
+        for (const auto &location : key_locations.locations()) {
+            if (static_cast<StorageType>(location.type()) != backend_type) {
+                return {ER_SERVICE_NO_STATUS, {}};
+            }
+            BackendLocation parsed;
+            parsed.type = static_cast<StorageType>(location.type());
+            parsed.spec_size = location.spec_size();
+            for (const auto &spec : location.location_specs()) {
+                parsed.location_specs.push_back({spec.name(), spec.uri()});
+            }
+            result.back().push_back(std::move(parsed));
+        }
+    }
+    return {ER_OK, std::move(result)};
+}
+
+std::pair<ClientErrorCode, HostCacheState>
+GrpcStub::GetHostCacheState(const std::string &trace_id,
+                            const std::string &instance_id,
+                            QueryType query_type,
+                            const KeyVector &keys,
+                            const std::vector<std::string> &medium,
+                            int32_t p2p_host_count) {
+    if (p2p_host_count < 0) {
+        return {ER_INVALID_PARAMS, {}};
+    }
+    auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
+    proto::meta::GetHostCacheStateRequest request;
+    SetCommonInfo(request, trace_id, instance_id);
+    request.set_query_type(static_cast<proto::meta::QueryType>(query_type));
+    for (auto key : keys) {
+        request.add_block_cache_keys(key);
+    }
+    for (const auto &name : medium) {
+        request.add_medium(name);
+    }
+    request.set_p2p_host_count(p2p_host_count);
+    grpc::ClientContext context;
+    proto::meta::GetHostCacheStateResponse response;
+    auto grpc_status = stub->GetHostCacheState(&context, request, &response);
+    CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
+    CHECK_COMMON_HEADER_WITH_TYPE(response);
+    HostCacheState result;
+    result.reserve(response.hosts_size());
+    for (const auto &host : response.hosts()) {
+        result.push_back({host.host_ip_port(), host.local(), host.p2p_1_fetch(), host.p2p_1_total_match()});
+    }
+    return {ER_OK, std::move(result)};
 }
 
 bool GrpcStub::TrimCache() {

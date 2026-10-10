@@ -32,7 +32,8 @@ public:
                                                          const std::vector<int64_t> &keys,
                                                          const std::vector<int64_t> &tokens,
                                                          const std::vector<std::string> &location_spec_group_names,
-                                                         int64_t write_timeout_seconds) override;
+                                                         int64_t write_timeout_seconds,
+                                                         int32_t min_replica_count = 0) override;
     ClientErrorCode FinishWrite(const std::string &trace_id,
                                 const std::string &write_session_id,
                                 const BlockMask &success_block,
@@ -50,6 +51,22 @@ public:
                                 const BlockMask &block_mask) override;
 
     const std::string &GetStorageConfig() const override;
+
+    std::pair<ClientErrorCode, BackendLocations>
+    GetCacheLocationsByBackend(const std::string &trace_id,
+                               const std::vector<int64_t> &keys,
+                               const std::vector<int64_t> &tokens,
+                               const BlockMask &block_mask,
+                               const std::vector<std::string> &location_spec_names,
+                               StorageType backend_type,
+                               BackendSelectStrategy strategy) override;
+
+    std::pair<ClientErrorCode, HostCacheState>
+    GetHostCacheState(const std::string &trace_id,
+                      QueryType query_type,
+                      const std::vector<int64_t> &keys,
+                      const std::vector<std::string> &medium,
+                      int32_t p2p_host_count) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) override;

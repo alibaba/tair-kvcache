@@ -977,3 +977,87 @@ TEST_F(GrpcStubTest, TestGetClusterInfoWithLeaderElector) {
 
     leader_elector->Stop();
 }
+
+TEST(GrpcStubMetadataProtocolTest, SendsReplicaBackendAndHostArgumentsAndKeepsMissPositions) {
+    class MetadataService final : public proto::meta::MetaService::Service {
+    public:
+        proto::meta::StartWriteCacheRequest write;
+        proto::meta::GetCacheLocationsByBackendRequest backend;
+        proto::meta::GetHostCacheStateRequest host;
+
+        grpc::Status StartWriteCache(grpc::ServerContext *, const proto::meta::StartWriteCacheRequest *request,
+                                     proto::meta::StartWriteCacheResponse *response) override {
+            write = *request;
+            response->mutable_header()->mutable_status()->set_code(proto::meta::OK);
+            response->mutable_block_mask()->set_offset(request->block_keys_size());
+            response->set_write_session_id("session");
+            return grpc::Status::OK;
+        }
+        grpc::Status GetCacheLocationsByBackend(grpc::ServerContext *,
+            const proto::meta::GetCacheLocationsByBackendRequest *request,
+            proto::meta::GetCacheLocationsByBackendResponse *response) override {
+            backend = *request;
+            response->mutable_header()->mutable_status()->set_code(proto::meta::OK);
+            response->add_key_locations();
+            response->add_key_locations();
+            auto *location = response->add_key_locations()->add_locations();
+            location->set_type(proto::meta::ST_NFS);
+            location->set_spec_size(1);
+            auto *spec = location->add_location_specs();
+            spec->set_name("tp0");
+            spec->set_uri("file://nfs/third?offset=0&size=64");
+            return grpc::Status::OK;
+        }
+        grpc::Status GetHostCacheState(grpc::ServerContext *, const proto::meta::GetHostCacheStateRequest *request,
+                                       proto::meta::GetHostCacheStateResponse *response) override {
+            host = *request;
+            response->mutable_header()->mutable_status()->set_code(proto::meta::OK);
+            auto *match = response->add_hosts();
+            match->set_host_ip_port("worker:9000");
+            match->set_local(1);
+            match->set_p2p_1_fetch(2);
+            match->set_p2p_1_total_match(3);
+            return grpc::Status::OK;
+        }
+    } service;
+    grpc::ServerBuilder builder;
+    int port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+    builder.RegisterService(&service);
+    auto server = builder.BuildAndStart();
+    ASSERT_NE(nullptr, server);
+    GrpcStub stub(0, 1000);
+    ASSERT_EQ(ER_OK, stub.AddConnection("127.0.0.1:" + std::to_string(port), 1000));
+    const std::vector<int64_t> keys{1, 2, 3};
+    EXPECT_EQ(ER_OK, stub.StartWriteCache("write", "instance", keys, {}, {}, 600, 3).first);
+    EXPECT_EQ(service.write.min_replica_count(), 3);
+    const auto [location_ec, locations] = stub.GetCacheLocationsByBackend(
+        "backend", "instance", keys, {}, BlockMaskOffset{1}, {},
+        StorageType::ST_NFS, BackendSelectStrategy::LSS_WEIGHTED_RANDOM);
+    ASSERT_EQ(ER_OK, location_ec);
+    ASSERT_EQ(3u, locations.size());
+    EXPECT_TRUE(locations[0].empty());
+    EXPECT_TRUE(locations[1].empty());
+    ASSERT_EQ(1u, locations[2].size());
+    EXPECT_EQ(locations[2][0].type, StorageType::ST_NFS);
+    ASSERT_EQ(1u, locations[2][0].location_specs.size());
+    EXPECT_EQ(locations[2][0].location_specs[0].uri, "file://nfs/third?offset=0&size=64");
+    EXPECT_EQ(service.backend.instance_id(), "instance");
+    EXPECT_EQ(service.backend.query_type(), proto::meta::QT_BATCH_GET);
+    EXPECT_EQ(service.backend.block_mask().offset(), 1);
+    ASSERT_EQ(service.backend.backend_selectors_size(), 1);
+    EXPECT_EQ(service.backend.backend_selectors(0).backend_type(), proto::meta::ST_NFS);
+    const auto [host_ec, hosts] = stub.GetHostCacheState(
+        "host", "instance", QueryType::QT_PREFIX_MATCH_WITH_MAMBA, keys, {"hbm"}, 2);
+    ASSERT_EQ(ER_OK, host_ec);
+    ASSERT_EQ(1u, hosts.size());
+    EXPECT_EQ(hosts[0].host_ip_port, "worker:9000");
+    EXPECT_EQ(hosts[0].local, 1);
+    EXPECT_EQ(hosts[0].p2p_1_fetch, 2);
+    EXPECT_EQ(hosts[0].p2p_1_total_match, 3);
+    EXPECT_EQ(service.host.query_type(), proto::meta::QT_PREFIX_MATCH_WITH_MAMBA);
+    EXPECT_EQ(service.host.p2p_host_count(), 2);
+    ASSERT_EQ(service.host.medium_size(), 1);
+    EXPECT_EQ(service.host.medium(0), "hbm");
+    server->Shutdown();
+}
