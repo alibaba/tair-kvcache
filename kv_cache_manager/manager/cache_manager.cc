@@ -4503,14 +4503,20 @@ std::string CacheManager::SelectTairMempoolMetaServiceUrl(RequestContext *reques
 
     const auto data_storage_manager = registry_manager_->data_storage_manager();
     std::vector<Candidate> candidates;
+    bool has_tair_mempool_candidate = false;
     double lowest_usage_ratio = std::numeric_limits<double>::infinity();
     for (const auto &storage_name : instance_group->storage_candidates()) {
         const auto backend = data_storage_manager->GetDataStorageBackend(storage_name);
-        if (backend == nullptr || !backend->Available()) {
+        if (backend == nullptr) {
             continue;
         }
         const auto &config = backend->GetStorageConfig();
         if (!IsTairMempoolStorageType(config.type())) {
+            continue;
+        }
+        // Count configured backends before checking availability so outages still warn.
+        has_tair_mempool_candidate = true;
+        if (!backend->Available()) {
             continue;
         }
         const auto spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(config.storage_spec());
@@ -4551,9 +4557,11 @@ std::string CacheManager::SelectTairMempoolMetaServiceUrl(RequestContext *reques
         }
     }
     if (selected == nullptr) {
-        KVCM_LOG_WARN("trace_id [%s] instance_group [%s] | no eligible TairMempool MetaService candidate",
-                      trace_id.c_str(),
-                      instance_group_name.c_str());
+        if (has_tair_mempool_candidate) {
+            KVCM_LOG_WARN("trace_id [%s] instance_group [%s] | no eligible TairMempool MetaService candidate",
+                          trace_id.c_str(),
+                          instance_group_name.c_str());
+        }
         return {};
     }
 
