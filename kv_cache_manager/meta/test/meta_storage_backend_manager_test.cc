@@ -992,6 +992,14 @@ TEST_F(MetaStorageBackendManagerTest, TestSampleReclaimCandidatesUsesHotCacheTim
     EXPECT_EQ(1, persistent_ptr->calls());
     EXPECT_EQ(1, cache_ptr->calls());
     EXPECT_EQ(1, cache_ptr->timestamp_lookup_calls());
+
+    ASSERT_EQ(EC_OK, mgr.SamplePersistentReclaimCandidates(nullptr, 1, candidates));
+    ASSERT_EQ(1, candidates.size());
+    EXPECT_EQ(11, candidates.front().key);
+    EXPECT_EQ(999, candidates.front().last_access_time_us);
+    EXPECT_EQ(2, persistent_ptr->calls());
+    EXPECT_EQ(1, cache_ptr->calls());
+    EXPECT_EQ(2, cache_ptr->timestamp_lookup_calls());
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestGroupLruStrictReadModeReachesSelectedBackend) {
@@ -1760,6 +1768,13 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesCacheWithoutPersist
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), scan_batch.location_results);
     ASSERT_EQ(1u, scan_batch.locations.size());
     ASSERT_TRUE(scan_batch.locations[0].count("loc_888") > 0);
+
+    MaintenanceScanBatch recovery_batch;
+    ASSERT_EQ(EC_OK, mgr.ScanPersistentLocationsForRecovery(nullptr, SCAN_BASE_CURSOR, 10, recovery_batch));
+    ASSERT_EQ((KeyVector{777}), recovery_batch.keys);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), recovery_batch.location_results);
+    ASSERT_EQ(1u, recovery_batch.locations.size());
+    ASSERT_TRUE(recovery_batch.locations[0].count("loc_777") > 0);
 
     cache_exists.clear();
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));

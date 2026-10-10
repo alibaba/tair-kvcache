@@ -176,6 +176,10 @@ public:
                                           const std::string &cursor,
                                           size_t limit,
                                           MaintenanceScanBatch &out) noexcept;
+    ErrorCode ScanPersistentLocationsForRecovery(RequestContext *request_context,
+                                                 const std::string &cursor,
+                                                 size_t limit,
+                                                 MaintenanceScanBatch &out) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
     ErrorCode
     SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept;
@@ -183,6 +187,10 @@ public:
                                       int64_t count,
                                       ReclaimCandidateVector &out_candidates,
                                       bool require_read_success = false) const noexcept;
+    ErrorCode SamplePersistentReclaimCandidates(RequestContext *request_context,
+                                                int64_t count,
+                                                ReclaimCandidateVector &out_candidates,
+                                                bool require_read_success = false) const noexcept;
     // A complete local sampling source does not need parallel I/O fragments.
     bool PreferSingleTaskReclaimSampling() const noexcept;
     size_t TouchKeysForMaintenance(const KeyVector &keys) const noexcept;

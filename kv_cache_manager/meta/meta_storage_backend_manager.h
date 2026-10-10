@@ -167,12 +167,20 @@ public:
                                           const std::string &cursor,
                                           int64_t limit,
                                           MaintenanceScanBatch &out) noexcept;
+    ErrorCode ScanPersistentLocationsForRecovery(RequestContext *request_context,
+                                                 const std::string &cursor,
+                                                 int64_t limit,
+                                                 MaintenanceScanBatch &out) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
     ErrorCode SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
     ErrorCode SampleReclaimCandidates(RequestContext *request_context,
                                       int64_t count,
                                       ReclaimCandidateVector &out_candidates,
                                       bool require_read_success = false) noexcept;
+    ErrorCode SamplePersistentReclaimCandidates(RequestContext *request_context,
+                                                int64_t count,
+                                                ReclaimCandidateVector &out_candidates,
+                                                bool require_read_success = false) noexcept;
     // Follow the same source selection as SampleReclaimCandidates: cached
     // metadata is complete only after recovery, not merely when configured.
     bool PreferSingleTaskReclaimSampling() const noexcept;
