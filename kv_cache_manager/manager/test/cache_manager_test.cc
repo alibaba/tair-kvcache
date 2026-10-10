@@ -9092,6 +9092,55 @@ TEST_F(HostCacheStateWithoutP2PTest, MambaPrefixMatchUsesTairWithoutP2P) {
     Verify(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA);
 }
 
+TEST_F(HostCacheStateWithoutP2PTest, ZeroLocalMambaUsesTairAndP2P) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+            {LocationSpecInfo("full", 512), LocationSpecInfo("linear", 512)},
+            {LocationSpecGroup("F0", {"full"}), LocationSpecGroup("L0", {"linear"})});
+    // 本地缺少所有 Linear state，local=0；Tair 补齐 Full 前缀并恢复到 103，
+    // P2P 单独只能恢复到 101，与 Tair 联合后可恢复到 104。
+    Report(101, {"full"});
+    Report(103, {"full"});
+    Report(104, {"full"});
+    AddTair(102, "full");
+    AddTair(103, "linear");
+    Report(101, {"linear"}, true);
+    Report(104, {"linear"}, true);
+
+    const auto tair = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    const auto p2p = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+    const auto query = [&](size_t count, const std::vector<DataStorageType> &backends, int64_t expected_global) {
+        auto [ec, matches] = cache_manager_->GetHostCacheState(request_context_.get(),
+                                                               instance_id_,
+                                                               CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+                                                               {101, 102, 103, 104},
+                                                               {"mem"},
+                                                               count,
+                                                               backends);
+        ASSERT_EQ(EC_OK, ec);
+        if (expected_global == 0) {
+            EXPECT_TRUE(matches.empty());
+            return;
+        }
+        ASSERT_EQ(1u, matches.size());
+        // 两个候选的 local 都为 0，K=1 按 host 顺序选中 worker。
+        EXPECT_EQ(worker_, matches[0].host_ip_port);
+        EXPECT_EQ(0, matches[0].local);
+        EXPECT_EQ(expected_global, matches[0].global);
+    };
+
+    EXPECT_CALL(*tair_, MightExist(_)).Times(0);
+    query(0, {tair, p2p}, 0);
+    query(1, {}, 0);
+    query(1, {p2p}, 1);
+    ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(tair_.get()));
+
+    EXPECT_CALL(*tair_, MightExist(_))
+        .Times(testing::AtLeast(1))
+        .WillRepeatedly([](const std::vector<DataStorageUri> &uris) { return std::vector<bool>(uris.size(), true); });
+    query(1, {tair}, 3);
+    query(1, {tair, p2p}, 4);
+}
+
 TEST_F(HostCacheStateWithoutP2PTest, P2POnlyPreservesLocalVineyardWithoutBaseStorage) {
     Prepare(CacheManager::QueryType::QT_PREFIX_MATCH, createLocationSpecInfos());
     InitializeEventReporter(instance_id_, worker_, proto::meta::ST_EVENT_REPORT_L2);
