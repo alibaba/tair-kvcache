@@ -13,7 +13,7 @@ BINARY=$BINARY_PATH/online_optimizer_server_main
 
 function start_server() {
     echo "start optimizer server at: "$BINARY
-    exec $BINARY -c $DEFAULT_CONFIG "$@"
+    exec "$BINARY" -c "$DEFAULT_CONFIG" -l "$DEFAULT_LOGGER_CONFIG" "$@"
 }
 
 start_server "$@"

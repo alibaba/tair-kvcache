@@ -5,8 +5,8 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/timestamp_util.h"
-#include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_collector.h"
-#include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_reporter.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
 
