@@ -22,6 +22,8 @@
 
 namespace kv_cache_manager {
 
+extern "C" uint32_t kvcm_client_additional_memory_registration_version() { return 1; }
+
 TransferClientImpl::TransferClientImpl() {}
 
 TransferClientImpl::~TransferClientImpl() {}
