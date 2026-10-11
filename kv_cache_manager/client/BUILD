@@ -4,11 +4,20 @@ cc_binary(
     name = "kv_cache_manager_client.so",
     srcs = [],
     copts = [],
+    additional_linker_inputs = ["sdk.exports"],
+    linkopts = ["-Wl,--version-script=$(location sdk.exports)"],
     linkshared = True,
     visibility = ["//visibility:public"],
     deps = [
         ":client",
     ],
+)
+
+py_test(
+    name = "sdk_symbols_test",
+    srcs = ["sdk_symbols_test.py"],
+    args = ["$(location :kv_cache_manager_client.so)"],
+    data = [":kv_cache_manager_client.so"],
 )
 
 filegroup(

@@ -6,6 +6,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -32,6 +33,10 @@ DataStorageType MooncakeBackend::GetType() { return DataStorageType::DATA_STORAG
 bool MooncakeBackend::Available() { return IsOpen() && IsAvailable(); }
 
 double MooncakeBackend::GetStorageUsageRatio(const std::string &trace_id) const {
+    std::lock_guard<std::mutex> guard(client_mutex_);
+    if (!IsOpen() || client_ == nullptr) {
+        return 0.0;
+    }
     MooncakeStoreStatus_t status;
     auto ec = mooncake_client_get_store_status(client_, &status);
     if (ec != MOONCAKE_ERROR_OK) {
@@ -42,6 +47,11 @@ double MooncakeBackend::GetStorageUsageRatio(const std::string &trace_id) const 
 }
 
 ErrorCode MooncakeBackend::DoOpen(const StorageConfig &storage_config, const std::string &trace_id) {
+    std::lock_guard<std::mutex> lifecycle_guard(lifecycle_mutex_);
+    std::lock_guard<std::mutex> client_guard(client_mutex_);
+    if (client_ != nullptr) {
+        return EC_ERROR;
+    }
     if (auto cfg = std::dynamic_pointer_cast<MooncakeStorageSpec>(storage_config.storage_spec())) {
         spec_ = *cfg;
     } else {
@@ -54,8 +64,10 @@ ErrorCode MooncakeBackend::DoOpen(const StorageConfig &storage_config, const std
     static std::uniform_int_distribution<std::uint64_t> dis;
     const std::uint64_t rand_val = dis(rng);
 
+    const auto local_hostname = EnvUtil::GetEnv("KVCM_MOONCAKE_LOCAL_HOSTNAME", spec_.local_hostname());
+    const auto rdma_device = EnvUtil::GetEnv("KVCM_MOONCAKE_RDMA_DEVICE", spec_.rdma_device());
     std::stringstream regenerate_local_hostname;
-    regenerate_local_hostname << spec_.local_hostname() << "_"
+    regenerate_local_hostname << local_hostname << "_"
                               << "kvcm"
                               << "_" << rand_val;
 
@@ -63,7 +75,7 @@ ErrorCode MooncakeBackend::DoOpen(const StorageConfig &storage_config, const std
     client_ = mooncake_client_create(regenerate_local_hostname.str().c_str(),
                                      spec_.metadata_connstring().c_str(),
                                      spec_.protocol().c_str(),
-                                     spec_.rdma_device().c_str(),
+                                     rdma_device.c_str(),
                                      spec_.master_server_entry().c_str());
     if (client_ == nullptr) {
         KVCM_LOG_WARN("create mooncake client failed, regenerate_local_hostname: [%s], config: [%s]",
@@ -79,14 +91,17 @@ ErrorCode MooncakeBackend::DoOpen(const StorageConfig &storage_config, const std
 };
 
 ErrorCode MooncakeBackend::Close() {
+    std::lock_guard<std::mutex> lifecycle_guard(lifecycle_mutex_);
     SetOpen(false);
     SetAvailable(false);
     if (available_thread_.joinable()) {
         available_thread_.join();
     }
     KVCM_LOG_INFO("close mooncake backend");
+    std::lock_guard<std::mutex> client_guard(client_mutex_);
     if (client_) {
         mooncake_client_destroy(client_);
+        client_ = nullptr;
     }
     return EC_OK;
 };
@@ -114,14 +129,21 @@ std::vector<ErrorCode> MooncakeBackend::Delete(const std::vector<DataStorageUri>
                                                const std::string &trace_id,
                                                std::function<void()> cb) {
     std::vector<ErrorCode> result;
-    for (int i = 0; i < storage_uris.size(); i++) {
-        MooncakeDataStorageItem item = MooncakeDataStorageItem::FromUri(storage_uris[i]);
-        ErrorCode_t err = mooncake_client_remove(client_, item.key.c_str());
-        if (err != MOONCAKE_ERROR_OK) {
-            KVCM_LOG_WARN("mooncake remove item failed, key: [%s], error: [%d]", item.key.c_str(), err);
-            result.push_back(EC_ERROR);
-        } else {
-            result.push_back(EC_OK);
+    {
+        std::lock_guard<std::mutex> guard(client_mutex_);
+        for (int i = 0; i < storage_uris.size(); i++) {
+            if (!IsOpen() || client_ == nullptr) {
+                result.push_back(EC_ERROR);
+                continue;
+            }
+            MooncakeDataStorageItem item = MooncakeDataStorageItem::FromUri(storage_uris[i]);
+            ErrorCode_t err = mooncake_client_remove(client_, item.key.c_str());
+            if (err != MOONCAKE_ERROR_OK) {
+                KVCM_LOG_WARN("mooncake remove item failed, key: [%s], error: [%d]", item.key.c_str(), err);
+                result.push_back(EC_ERROR);
+            } else {
+                result.push_back(EC_OK);
+            }
         }
     }
     if (cb) {
@@ -130,8 +152,13 @@ std::vector<ErrorCode> MooncakeBackend::Delete(const std::vector<DataStorageUri>
     return result;
 }
 std::vector<bool> MooncakeBackend::Exist(const std::vector<DataStorageUri> &storage_uris) {
+    std::lock_guard<std::mutex> guard(client_mutex_);
     std::vector<bool> result;
     for (int i = 0; i < storage_uris.size(); i++) {
+        if (!IsOpen() || client_ == nullptr) {
+            result.push_back(false);
+            continue;
+        }
         MooncakeDataStorageItem item = MooncakeDataStorageItem::FromUri(storage_uris[i]);
         ErrorCode_t err = mooncake_client_query(client_, item.key.c_str());
         if (err == MOONCAKE_ERROR_OK) {
@@ -156,7 +183,14 @@ void MooncakeBackend::DetectAvailableLoop(const std::string &trace_id) {
             if (!IsOpen()) {
                 return;
             }
-            auto ec = mooncake_client_get_store_status(client_, &status);
+            ErrorCode_t ec;
+            {
+                std::lock_guard<std::mutex> guard(client_mutex_);
+                if (!IsOpen() || client_ == nullptr) {
+                    return;
+                }
+                ec = mooncake_client_get_store_status(client_, &status);
+            }
             if (ec != MOONCAKE_ERROR_OK) {
                 KVCM_LOG_WARN("get store status failed, error: [%d]", ec);
             } else if (status.healthy) {

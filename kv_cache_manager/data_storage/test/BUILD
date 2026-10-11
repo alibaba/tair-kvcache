@@ -1,6 +1,23 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "MooncakeBackendCloseTest",
+    srcs = ["mooncake_backend_close_test.cc"],
+    copts = ["-fno-access-control"],
+    linkopts = [
+        "-Wl,--wrap=mooncake_client_create",
+        "-Wl,--wrap=mooncake_client_destroy",
+        "-Wl,--wrap=mooncake_client_get_store_status",
+    ],
+    linkstatic = True,
+    tags = ["manual", "mooncake"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage",
+    ],
+)
+
+cc_test(
     name = "DataStorageManagerTest",
     srcs = [
         "data_storage_manager_test.cc",

@@ -2,6 +2,7 @@
 
 #include <random>
 #include <sstream>
+#include <limits>
 
 namespace kv_cache_manager {
 MooncakeRemoteItem MooncakeRemoteItem::FromUri(const DataStorageUri &storage_uri) {
@@ -20,12 +21,16 @@ ClientErrorCode MooncakeSdk::Close() {
     KVCM_LOG_INFO("close mooncake sdk");
     if (client_) {
         mooncake_client_destroy(client_);
+        client_ = nullptr;
     }
     return ER_OK;
 };
 
 ClientErrorCode MooncakeSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                   const std::shared_ptr<StorageConfig> &storage_config) {
+    if (client_ != nullptr) {
+        return ER_SDKINIT_ERROR;
+    }
     sdk_backend_config_ = std::dynamic_pointer_cast<MooncakeSdkConfig>(sdk_backend_config);
     if (!sdk_backend_config_) {
         KVCM_LOG_WARN("Init mooncake sdk failed, unexpected config type [%s]",
@@ -39,6 +44,22 @@ ClientErrorCode MooncakeSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_b
     if (sdk_backend_config_->spec_byte_sizes_per_block().empty()) {
         KVCM_LOG_WARN("Init mooncake sdk failed, spec_byte_sizes_per_block is empty");
         return ER_INVALID_SDKBACKEND_CONFIG;
+    }
+    if (!sdk_backend_config_->Validate()) {
+        return ER_INVALID_SDKBACKEND_CONFIG;
+    }
+    const auto &additional_spans = sdk_backend_config_->additional_local_memory_spans();
+    if (!additional_spans.empty()) {
+        const auto base = reinterpret_cast<uintptr_t>(sdk_backend_config_->local_mem_ptr());
+        const auto size = sdk_backend_config_->local_buffer_size();
+        if (base == 0 || size == 0 || size > std::numeric_limits<uintptr_t>::max() - base) {
+            return ER_INVALID_SDKBACKEND_CONFIG;
+        }
+        for (const auto &span : additional_spans) {
+            if (span.at("base") < base + size && base < span.at("base") + span.at("size")) {
+                return ER_INVALID_SDKBACKEND_CONFIG;
+            }
+        }
     }
     storage_config_ = storage_config;
     if (!storage_config_) {
@@ -87,7 +108,22 @@ ClientErrorCode MooncakeSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_b
                       sdk_backend_config_->local_mem_ptr(),
                       sdk_backend_config_->local_buffer_size(),
                       err);
+        Close();
         return ER_SDKINIT_ERROR;
+    }
+
+    for (const auto &span : additional_spans) {
+        err = mooncake_client_register_local_memory(client_,
+                                                    reinterpret_cast<void *>(static_cast<uintptr_t>(span.at("base"))),
+                                                    span.at("size"),
+                                                    sdk_backend_config_->location().c_str(),
+                                                    false,
+                                                    false);
+        if (err != MOONCAKE_ERROR_OK) {
+            KVCM_LOG_WARN("failed to register additional Mooncake memory pool, error: [%d]", err);
+            Close();
+            return ER_SDKINIT_ERROR;
+        }
     }
 
     return ER_OK;

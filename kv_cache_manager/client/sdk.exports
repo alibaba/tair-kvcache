@@ -1,0 +1,12 @@
+{
+  global:
+    _ZN16kv_cache_manager*;
+    _ZNK16kv_cache_manager*;
+    _ZTVN16kv_cache_manager*;
+    _ZTIN16kv_cache_manager*;
+    _ZTSN16kv_cache_manager*;
+    _ZTTN16kv_cache_manager*;
+    _ZTCN16kv_cache_manager*;
+    kvcm_client_additional_memory_registration_version;
+  local: *;
+};

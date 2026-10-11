@@ -1,6 +1,10 @@
 #pragma once
 
 #include <unordered_map>
+#include <cstdint>
+#include <map>
+#include <vector>
+#include <utility>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
@@ -121,7 +125,8 @@ public:
         // Note: We don't compare local_mem_ptr_ as it's a pointer value that may change
         return SdkBackendConfig::operator==(other) && local_buffer_size_ == other.local_buffer_size_ &&
                location_ == other.location_ && put_replica_num_ == other.put_replica_num_ &&
-               self_location_spec_name_ == other.self_location_spec_name_;
+               self_location_spec_name_ == other.self_location_spec_name_ &&
+               additional_local_memory_spans_ == other.additional_local_memory_spans_;
     }
 
     bool operator!=(const MooncakeSdkConfig &other) const { return !(*this == other); }
@@ -131,6 +136,10 @@ public:
     const std::string &location() const { return location_; }
     size_t put_replica_num() const { return put_replica_num_; }
     const std::string &self_location_spec_name() const { return self_location_spec_name_; }
+    const auto &additional_local_memory_spans() const { return additional_local_memory_spans_; }
+    void set_additional_local_memory_spans(std::vector<std::map<std::string, uint64_t>> spans) {
+        additional_local_memory_spans_ = std::move(spans);
+    }
 
     void set_local_mem_ptr(void *local_mem_ptr) { local_mem_ptr_ = local_mem_ptr; }
     void set_local_buffer_size(size_t local_buffer_size) { local_buffer_size_ = local_buffer_size; }
@@ -146,6 +155,8 @@ private:
     std::string location_{"*"};
     size_t put_replica_num_{1};
     std::string self_location_spec_name_{""};
+    // Additional disjoint pools, e.g. split MLA HBM KV and GPU indexer buffers.
+    std::vector<std::map<std::string, uint64_t>> additional_local_memory_spans_;
 };
 
 class TairMempoolSdkConfig : public SdkBackendConfig {

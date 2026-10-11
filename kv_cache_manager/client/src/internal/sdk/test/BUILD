@@ -1,5 +1,21 @@
 package(default_visibility = ["//visibility:private"])
 
+cc_test(
+    name = "MooncakeRegistrationTest",
+    srcs = ["mooncake_registration_test.cc"],
+    linkstatic = True,
+    linkopts = [
+        "-Wl,--wrap=mooncake_client_create",
+        "-Wl,--wrap=mooncake_client_destroy",
+        "-Wl,--wrap=mooncake_client_register_local_memory",
+    ],
+    tags = ["manual", "mooncake"],
+    deps = [
+        "//kv_cache_manager/client/src/internal/sdk",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
 config_setting(
     name = "enable_hf3fs",
     values = {"define": "ENABLE_HF3FS=true"},

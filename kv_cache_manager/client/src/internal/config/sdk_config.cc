@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <sstream>
+#include <limits>
 
 #include "kv_cache_manager/common/logger.h"
 
@@ -82,17 +83,42 @@ MooncakeSdkConfig::MooncakeSdkConfig() { set_type(DataStorageType::DATA_STORAGE_
 bool MooncakeSdkConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "location", location_);
     KVCM_JSON_GET_MACRO(rapid_value, "put_replica_num", put_replica_num_);
+    additional_local_memory_spans_.clear();
+    KVCM_JSON_GET_MACRO(rapid_value, "additional_local_memory_spans", additional_local_memory_spans_);
     return SdkBackendConfig::FromRapidValue(rapid_value);
 }
 
 void MooncakeSdkConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "location", location_);
     Put(writer, "put_replica_num", put_replica_num_);
+    if (!additional_local_memory_spans_.empty()) {
+        Put(writer, "additional_local_memory_spans", additional_local_memory_spans_);
+    }
     SdkBackendConfig::ToRapidWriter(writer);
 }
 
 bool MooncakeSdkConfig::Validate() const {
-    return !location_.empty() && put_replica_num_ > 0 && SdkBackendConfig::Validate();
+    if (location_.empty() || put_replica_num_ == 0 || !SdkBackendConfig::Validate()) {
+        return false;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    for (const auto &span : additional_local_memory_spans_) {
+        const auto base = span.find("base");
+        const auto size = span.find("size");
+        if (span.size() != 2 || base == span.end() || size == span.end() || base->second == 0 ||
+            size->second == 0 || base->second > std::numeric_limits<uintptr_t>::max() ||
+            size->second > std::numeric_limits<uintptr_t>::max() - base->second) {
+            return false;
+        }
+        ranges.emplace_back(base->second, base->second + size->second);
+    }
+    std::sort(ranges.begin(), ranges.end());
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        if (ranges[i].first < ranges[i - 1].second) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::string MooncakeSdkConfig::ToString() const {

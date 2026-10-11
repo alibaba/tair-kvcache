@@ -9,6 +9,34 @@ using namespace kv_cache_manager;
 
 class SdkBackendConfigTest : public ConfigTestBase {};
 
+TEST_F(SdkBackendConfigTest, MooncakeAdditionalMemorySpansRoundTrip) {
+    MooncakeSdkConfig config;
+    ASSERT_TRUE(config.FromJsonString(R"({"type":"mooncake","additional_local_memory_spans":[{"base":4096,"size":64},{"base":8192,"size":128}]})"));
+    ASSERT_TRUE(config.Validate());
+    MooncakeSdkConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(config.ToJsonString()));
+    EXPECT_EQ(config, restored);
+    ASSERT_TRUE(restored.FromJsonString(R"({"type":"mooncake"})"));
+    EXPECT_TRUE(restored.additional_local_memory_spans().empty());
+}
+
+TEST_F(SdkBackendConfigTest, MooncakeRejectsInvalidAdditionalMemoryRanges) {
+    for (const auto &ranges : {R"([{"base":0,"size":64}])", R"([{"base":4096,"size":0}])",
+                              R"([{"base":18446744073709551615,"size":2}])",
+                              R"([{"base":4096,"size":128},{"base":4128,"size":32}])",
+                              R"([{"base":4096}])"}) {
+        MooncakeSdkConfig config;
+        ASSERT_TRUE(config.FromJsonString(std::string(R"({"type":"mooncake","additional_local_memory_spans":)") + ranges + "}"));
+        EXPECT_FALSE(config.Validate()) << ranges;
+    }
+}
+
+TEST_F(SdkBackendConfigTest, MooncakeAllowsAdjacentAdditionalPools) {
+    MooncakeSdkConfig config;
+    ASSERT_TRUE(config.FromJsonString(R"({"type":"mooncake","additional_local_memory_spans":[{"base":4096,"size":64},{"base":4160,"size":64}]})"));
+    EXPECT_TRUE(config.Validate());
+}
+
 TEST_F(SdkBackendConfigTest, TestHf3fsSdkConfigSuccess) {
     Hf3fsSdkConfig sdk_backend_config;
     std::string file_content = getFileContent("sdk_config_hf3fs_success.json");

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include "3rdparty/mooncake/client_c.h"
@@ -39,6 +40,10 @@ private:
     void DetectAvailableLoop(const std::string &trace_id);
 
 private:
+    // Lifecycle calls also own available_thread_; never join while holding client_mutex_.
+    std::mutex lifecycle_mutex_;
+    // Mooncake's shared HTTP metrics client is not safe for concurrent queries.
+    mutable std::mutex client_mutex_;
     client_t client_{nullptr};
     MooncakeStorageSpec spec_;
     std::thread available_thread_;
