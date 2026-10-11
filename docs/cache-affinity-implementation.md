@@ -8,7 +8,8 @@
 | 如何识别本地、副本如何表示 | [节点身份、元数据与协议](#identity) |
 | 配置如何覆盖、默认值是什么 | [策略与配置](#configuration) |
 | 写入和读选路的具体条件 | [普通写](#write) / [读与复制提示](#read) |
-| 谁执行复制、资源和失败怎么处理 | [复制执行](#replication) |
+| 谁执行复制、占用哪些资源 | [复制执行](#replication) |
+| 有提示却没有本地副本、失败后怎么办 | [复制结果与失败处理](#replication-results) |
 | 何时回收、最低副本与重启限制 | [节点回收与恢复](#eviction) |
 | 还有哪些待办、测试证明了什么 | [后端与待办](#status) / [验证依据](#validation) |
 
@@ -277,6 +278,34 @@ sequenceDiagram
 
 回调或统计用于观察执行结果，不能替代 GetCacheMeta 的实际副本状态与后端物理数据校验。上述分类也不是可以任意相加的互斥分区。
 
+<a id="replication-results"></a>
+
+### 6.5 从提示到可读副本，以及失败后的行为
+
+排查“有提示但本地未命中”时，依次确认三个阶段：
+
+| 阶段 | 说明与证据 |
+|---|---|
+| 返回提示 | `GetCacheLocation` 返回 target 与 sources，表示策略建议复制；不表示 SDK 已执行 |
+| SDK 接受并执行 | 队列、预算、去重及过期检查决定任务能否继续。异步接口返回接受任务，也不等于复制成功；用结果回调或 `GetReplicationStats()` 查看执行情况 |
+| 目标发布并可读 | 一个 block 所需的全部目标组件成功后才发布。用 `GetCacheMeta.replica_locations` 核对目标节点和 SERVING 组件，再验证实际读取；单看合成读结果或 RPC 顶层 OK 不够 |
+
+各类失败的当前处理如下，依据 [ReplicationExecutor](../kv_cache_manager/client/src/replication_executor.cc) 的 `Submit/ExecuteServerCopyBatch/ExecuteTask`：
+
+| 情况 | 当前行为 |
+|---|---|
+| 队列/预算不允许、任务过期 | 拒绝或结束该任务；已发出的提示仍受服务端抑制窗口约束。没有持久化重试队列 |
+| 执行时 caller 已变为另一个非空节点 | 丢弃旧目标任务；caller 为空时不走同样的拒绝分支 |
+| 目标已有完整可读组件 | 返回 already-exists；没有因本次任务新增副本 |
+| 服务端返回不支持 | SDK 尝试客户端 Load/Save；普通服务端错误不走这条回退，也不自动再复制一次 |
+| 客户端分配目标后、发布前传输或组件校验失败 | 尝试以失败 mask 结束会话，清理目标；清理请求也可能失败，不能认定返回错误时物理数据已全部删除 |
+| 客户端发送成功 Finish，但应答失败/丢失 | SDK 记录发布失败，不再发送相反的失败确认。实际状态可能已是 SERVING，需查元数据并验证读取 |
+| 批量请求部分成功 | 每项独立记录结果；不能因一项失败将整批认定为失败，或对整批无条件重试 |
+
+[ManagerClientImpl::MatchLocation](../kv_cache_manager/client/src/manager_client_impl.cc) 提交提示后直接返回原查询结果，不等待复制结束。因此复制失败本身不改写本次元数据查询的返回值；数据 Load 仍有自身的成功或失败结果。
+
+对应行为的测试入口为 [replication_executor_test.cc](../kv_cache_manager/client/test/replication_executor_test.cc)：`ServerSideCopyFailureDoesNotIssueSecondCopy`、`FailedPublishAcknowledgementDoesNotSendContradictoryAbort`、`ThrowingFallbackDoesNotDiscardSuccessfulSiblingInServerBatch`。这些是 mock 路径的验证，不能替代真实后端验收。
+
 <a id="eviction"></a>
 
 ## 7. 节点指标、压力回收与当前接线缺口
@@ -298,6 +327,10 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 超过 `threshold` 开始选择节点；有删除释放量后，按估算水位继续选择，直到达到 `low`。释放量只在后端返回删除成功后记录，并与删除开始时间和指标采样时间校验；新样本只清除该节点的估算。**成功提交异步删除不等于物理空间已经释放。** `critical` 目前不改变此流程。
 
 删除候选虽由 `LocationSpec.node_id` 匹配，提交与删除粒度仍是 **整个 CacheLocation**：只要其中一个 spec 位于压力节点，就可能连同其他节点上的组件一起删除，尚未实现按 spec 拆分删除。
+
+物理删除与元数据删除也不是事务。[SchedulePlanExecutor::DoLocationDelTask](../kv_cache_manager/manager/schedule_plan_executor.cc) 对后端返回的逐 URI 错误记录部分失败后，仍执行 `BatchCADLocationStatus` 清理相应元数据；因此元数据删除成功时，后端可能还有物理残留。后端直接抛异常则会提前返回，不能将这两类失败视为同一种恢复行为。`deleted_bytes_by_node` 只计入明确返回 `EC_OK` 的 URI，`EC_NOENT` 作为已不存在处理但不增加释放量。
+
+现有 [schedule_plan_executor_test.cc](../kv_cache_manager/manager/test/schedule_plan_executor_test.cc) 的 `TestPhysicalDeleteHandlesMissingUrisIdempotentlyAndLogsRealFailures` 已断言“部分物理失败、元数据仍删除”的行为。它证明错误上报和成功释放量的计数口径，不证明失败 URI 已被重试清理；这条路径没有在删元数据前持久化失败 URI 的补偿任务，残留追踪仍需补齐。
 
 ### 7.3 最少保留副本并未在节点路径完整生效
 
@@ -341,6 +374,7 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 | 重启后的节点索引 | 双后端 backfill 有通知；单后端 Open 没有全量重建动作，恢复边界需独立验收 |
 | 异常退出后的预算 | 计数按周期快照恢复，尚不能宣称与每次 Location 修改同步持久化或重启全量对账 |
 | 回收粒度与 critical 水位 | 当前按 Location 删除；spec 级拆分及 critical 独立策略未实现 |
+| 物理删除失败后的残留 | 逐 URI 错误可能伴随元数据清理，成功释放量仅按 EC_OK 统计；失败 URI 的持久化补偿及残留追踪需补齐 |
 | 复制完成反馈、重试与恢复 | SDK 有结果回调/统计；服务端抑制反馈、持久化任务、跨进程资源配额未实现 |
 | 源数据存活保障 | 复制会检查传输结果，但不能把元数据 SERVING 或后端 Lock 接口视为所有后端均有真实数据 pin |
 | 实机验收 | 多节点 PACE 数据正确性、真实压力删除、provider 重启和 GPU buffer 传输仍需专门实机用例 |
@@ -359,6 +393,7 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 | 元数据预算与保留 | [meta_searcher_test.cc](../kv_cache_manager/manager/test/meta_searcher_test.cc) | Location 准入与 RMW 保留函数；不代替 ReclaimByNode 接线验证 |
 | 复制服务编排 | [cache_manager_test.cc](../kv_cache_manager/manager/test/cache_manager_test.cc) | 严格目标、完整 spec、Copy 结果与发布/清理 |
 | SDK 复制 | [replication_executor_test.cc](../kv_cache_manager/client/test/replication_executor_test.cc) | mock 传输的多 spec、buffer 所有权、异常清理、资源预算、限速及结果统计 |
+| 物理删除与元数据清理 | [schedule_plan_executor_test.cc](../kv_cache_manager/manager/test/schedule_plan_executor_test.cc) | mock 后端的成功/缺失/失败 URI、释放量计数和元数据清理；不证明物理残留已补偿回收 |
 | 真实 Manager 集成 | [affinity_replication_test.py](../integration_test/affinity/affinity_replication_test.py) | 25 个测试：读写/发布/失败重试、实例隔离、协议升级、并发预算、批量结果、完整元数据、受控 Manager 重启 |
 
 真实 Manager 集成使用 NFS 和构造的调用方身份，验证控制与元数据链路；其中 Copy 不支持的分支也会被断言。它不是两台 PACE 节点的实际数据复制测试，Manager 重启测试也不是存储 provider 实机重启测试。内源后端及 PACE 适配的源码/依赖基线见父仓库 `docs/cache-affinity-internal.md`（该文件不属于开源 checkout）。

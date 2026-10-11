@@ -114,6 +114,8 @@ SDK 默认每次读取 PACE 本地身份；设正刷新间隔会允许复用旧�
 1. 用 StartWrite/Finish 完成普通写，检查 GetCacheMeta 中各 spec 的实际 node id 和 SERVING 状态；不能只看请求中的 preferred nodes。
 2. 从远端 caller 查询，检查正确的 spec 名称、hint target 和能力位。热度统计元数据远端命中，不等待数据 Load 成功；查询轮询也会增加热度。默认阈值为 3，仍受衰减、抑制、容量及成本门槛约束；前缀加权仅 PrefixMatch 使用实际位置。
 3. 通过 SDK 结果回调/统计确认复制结果，再用 GetCacheMeta 的 `replica_locations` 检查目标节点完整的 SERVING 组件；兼容字段 `locations` 仅含每 key 第一个 Location。批量 RPC 顶层 OK、`server_copy_succeeded`（包含 already-exists）均不等于实际新建副本数。
-4. 验证回收时同时核对物理空间与元数据。NFS 指标是合成容量，删除接口仍是占位实现，不能用 NFS 集成测试证明 PACE 真实空间释放。
+4. 验证回收时同时核对物理空间、删除逐项结果与元数据。当前后端部分删除失败时，元数据仍可能被清理，因此“查不到 Location”不等于空间已释放。NFS 指标是合成容量，删除接口仍是占位实现，不能用 NFS 集成测试证明 PACE 真实空间释放。
+
+若已收到提示却没有本地副本，按[复制结果与失败处理](cache-affinity-implementation.md#replication-results)依次确认任务是否被接受、是否执行成功、目标是否发布；发布应答失败时尤其不能只凭返回码认定目标不存在。
 
 测试入口：[真实 Manager 集成](../integration_test/affinity/affinity_replication_test.py)、[SDK 复制测试](../kv_cache_manager/client/test/replication_executor_test.cc)、[策略测试](../kv_cache_manager/affinity/test/)。完整限制及后续开发优先级见[后端与待办](cache-affinity-implementation.md#status)。
