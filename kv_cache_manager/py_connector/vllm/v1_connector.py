@@ -48,7 +48,7 @@ from vllm.v1.outputs import KVConnectorOutput
 try:
     # vllm >= 0.29.0: the engine resolves one layout for the whole model from
     # the backends' supported sets (see get_required_kvcache_layout).
-    from vllm.v1.kv_cache_layout import KVCacheLayout as _KVCacheLayout
+    from vllm.v1.kv_cache_layout import KVCacheLayout as _KVCacheLayout  # ty: ignore[unresolved-import]
 except ImportError:
     # vllm <= 0.28.0 knows only NHD/HND and takes a connector's answer at face
     # value, so no other layout name may be returned there.
