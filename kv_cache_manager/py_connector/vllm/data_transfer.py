@@ -364,6 +364,30 @@ def total_pinned_bytes(plans: Sequence[StagingPoolPlan]) -> int:
     return sum(plan.pinned_bytes for plan in plans)
 
 
+def group_meta_pinned_bytes(
+    group_metas: Sequence[GroupMeta],
+    kv_dtype: Any,
+    *,
+    configured_blocks: int,
+    max_bytes_per_pool: int,
+) -> int:
+    """The pinned total of a model whose buckets are known as GroupMetas.
+
+    Exactly the number the worker's ``DataTransferManager`` logs as
+    ``total pinned`` for the same configuration (it derives the same shapes
+    from its transfer groups, see ``staging_shape``), so an e2e or kvperf gate
+    can assert a budget from the model's group structure -- on whichever role
+    view it has -- instead of re-deriving the sizing.
+    """
+    return total_pinned_bytes(
+        plan_staging_pools(
+            [group_meta_shape(meta, kv_dtype) for meta in group_metas],
+            configured_blocks=configured_blocks,
+            max_bytes_per_pool=max_bytes_per_pool,
+        )
+    )
+
+
 class DataTransferManager:
     def __init__(
         self,
