@@ -56,6 +56,37 @@ py_library(
     srcs = ["mla_variant_facts.py"],
 )
 
+# The spec-receipt table (one row per vLLM spec class + the era map + the
+# pre-PR gate transcription), shared by test_spec_gate (stand-in ring) and
+# test_spec_gate_real (the installed vLLM). Imports vllm_common lazily through
+# the engine adapter, so it needs no vLLM at import time.
+py_library(
+    name = "spec_gate_facts",
+    srcs = ["spec_gate_facts.py"],
+    deps = ["//kv_cache_manager/py_connector/vllm:vllm_connector"],
+)
+
+py_test(
+    name = "test_spec_gate",
+    srcs = ["test_spec_gate.py"],
+    tags = ["no-remote-exec"],
+    deps = [
+        ":spec_gate_facts",
+        ":vllm_stubs",
+    ],
+)
+
+# Deliberately NOT dependent on vllm_stubs, like test_mla_spec_facts below: the
+# point of this target is the real class tree of the installed era. Run it with
+# --env vllm-0.26.0 and --env vllm-0.31.0 for the dual anchor; it skips itself
+# when vLLM is unavailable.
+py_test(
+    name = "test_spec_gate_real",
+    srcs = ["test_spec_gate_real.py"],
+    tags = ["no-remote-exec"],
+    deps = [":spec_gate_facts"],
+)
+
 py_test(
     name = "test_mla_variants",
     srcs = ["test_mla_variants.py"],
