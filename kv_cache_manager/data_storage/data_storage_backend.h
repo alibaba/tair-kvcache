@@ -35,7 +35,7 @@ public:
     // When meta-service is unavailable, TairMempoolBackend returns false to
     // indicate read-only mode, while still allowing read operations (Exist/MightExist).
     // Default implementation returns Available() for backward compatibility.
-    virtual bool Writable() const { return Available(); }
+    virtual bool Writable() { return Available(); }
     
     std::shared_ptr<DataStorageMetricsCollector> GetMetricsCollector() { return metrics_collector_; }
     virtual const StorageConfig &GetStorageConfig() { return config_; }
