@@ -547,6 +547,18 @@ class DataTransferManager:
                 len(names),
                 ",".join(names),
             )
+            if pool.reserved_blocks:
+                logger.info(
+                    "staging pool per_token=%dB dtype=%s: %d slots for captures "
+                    "+ %d reserved for transfer tasks%s",
+                    plan.key[0],
+                    plan.key[1],
+                    plan.blocks - pool.reserved_blocks,
+                    pool.reserved_blocks,
+                    " -- captures are disabled (the reserve takes the whole pool)"
+                    if pool.reserved_blocks == plan.blocks
+                    else "",
+                )
             fitting = (min(save_batch, plan.blocks), min(load_batch, plan.blocks))
             if fitting != (save_batch, load_batch):
                 logger.info(
@@ -763,6 +775,17 @@ class DataTransferManager:
                 skipped, failed = self._staged_dispositions(
                     group, remote_uris, staged_slots, n
                 )
+                # The staged branch (and only it) can fail a block that still
+                # holds captured bytes: a location that did not claim this
+                # spec while the capture holds its bytes. Such a block is never
+                # written, and this task owns every staged slot, so return the
+                # ones it will not write -- nothing else can (the written ones
+                # go back in _save_staged_blocks' finally).
+                for i in failed:
+                    if staged_slots[i] is not None:
+                        self._pools[group.spec_name].release(
+                            staged_slots[i], 1  # ty: ignore[invalid-argument-type]
+                        )
             else:
                 skipped, failed = self._save_dispositions(
                     group, remote_uris, block_ids, n
