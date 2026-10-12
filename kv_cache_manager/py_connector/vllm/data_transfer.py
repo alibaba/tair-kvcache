@@ -890,8 +890,20 @@ class DataTransferManager:
             )
             for i in valid
         ]
-        result = self._transfer_client.SaveKvCaches(uris, buffers)
-        ok = result[0] == kvcm_py_client.ClientErrorCode.ER_OK
+        ok = False
+        try:
+            result = self._transfer_client.SaveKvCaches(uris, buffers)
+            ok = result[0] == kvcm_py_client.ClientErrorCode.ER_OK
+        finally:
+            # One release per captured slot, on every path: the entry left the
+            # worker's staged map when the plan handed the block over, so this
+            # task is the only owner left, and the slot is gone for the rest of
+            # the process's life if the SDK raises instead of returning an
+            # error code (review_r2 N1 measured 384 of 1024 slots leaking that
+            # way; the other two staging paths, _save_valid_blocks and
+            # load_task, return their slots in a finally for the same reason).
+            for i in valid:
+                pool.release(staged_slots[i], 1)  # ty: ignore[invalid-argument-type]
         if not ok:
             logger.warning(
                 "save task failed group=%s uris=%d result=%s; the block is not "
@@ -900,15 +912,7 @@ class DataTransferManager:
                 len(uris),
                 result,
             )
-        # One release per captured slot. The entry left the worker's staged map
-        # when the plan handed the block over, so this driver owns it now, and
-        # it owns it whether or not the transfer landed: a block is announced
-        # to the manager exactly once (has_saved_block_num advances when the
-        # session is dispatched, not when it succeeds), so nothing waits for
-        # these bytes -- and freeing them at retirement instead is exactly the
-        # double-free review_r1 S1 found.
         for i in valid:
-            pool.release(staged_slots[i], 1)  # ty: ignore[invalid-argument-type]
             ok_mask[i] = ok
 
     def _save_dispositions(
