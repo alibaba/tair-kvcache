@@ -11,7 +11,7 @@ shell.
 import copy
 import json
 import typing
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 # kvcm_py_client is the compiled pybind11 client; it ships no type stubs.
 from kv_cache_manager.client.pybind import kvcm_py_client  # ty: ignore[unresolved-import]
@@ -383,7 +383,7 @@ class ConnectorWorker:
     # Load / save
     # ------------------------------------------------------------------ #
     def _iter_task_chunks(
-        self, plans: List[TransferPlan], per_task: int
+        self, plans: List[TransferPlan], per_task: Callable[[TransferGroup], int]
     ) -> Iterator[
         Tuple[
             TransferGroup,
@@ -394,12 +394,18 @@ class ConnectorWorker:
     ]:
         """Slice each plan's blocks into per-task chunks.
 
+        ``per_task`` resolves the batch for one group: the data transfer
+        manager shrinks it to fit the group's staging pool (a task stages its
+        whole batch as one contiguous run), so the configured
+        ``block_per_save_task``/``block_per_load_task`` is an upper bound.
+
         Pure generator: the task index is the consumer's concern (enumerate
         there); this only reads the plans."""
         for plan in plans:
             n = len(plan.uris)
-            for i in range(0, n, per_task):
-                end = min(n, i + per_task)
+            batch = per_task(plan.group)
+            for i in range(0, n, batch):
+                end = min(n, i + batch)
                 yield (
                     plan.group,
                     plan.uris[i:end],
@@ -565,7 +571,7 @@ class ConnectorWorker:
                 continue
 
             chunks = list(
-                self._iter_task_chunks(plans, self._extra_config.block_per_load_task)
+                self._iter_task_chunks(plans, self._data_transfer.load_task_blocks)
             )
             multi_result = MultiResult(len(chunks), done_cb)
             for task_idx, chunk in enumerate(chunks):
@@ -609,7 +615,7 @@ class ConnectorWorker:
                 continue
 
             chunks = list(
-                self._iter_task_chunks(plans, self._extra_config.block_per_save_task)
+                self._iter_task_chunks(plans, self._data_transfer.save_task_blocks)
             )
             multi_result = MultiResult(len(chunks), done_cb)
             for task_idx, chunk in enumerate(chunks):
