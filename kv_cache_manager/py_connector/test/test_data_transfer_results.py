@@ -983,6 +983,36 @@ class TestDataTransferManagerPools(unittest.TestCase):
         self.assertEqual(dtm.load_task_blocks(groups[0]), 3)
         self.assertEqual(dtm.save_task_blocks(groups[3]), 8)  # other shape
 
+    def test_the_transfer_reserve_is_the_largest_task_batch(self):
+        # The eager capture may only borrow above it, so a transfer task can
+        # always start and thereby release the captures its own session holds
+        # (review_r1 N1): one task's maximum batch per arena, clamped to what
+        # actually fits the (possibly capped) pool.
+        groups = self._groups()
+        dtm = self._dtm(
+            groups,
+            block_per_save_task=3,
+            block_per_load_task=2,
+            staging_pool_blocks=16,
+            staging_pool_max_bytes_per_group=16_384,  # 4 slots
+        )
+        shared = dtm._pools["tp0_g0"]
+        self.assertEqual(shared.max_blocks, 4)
+        self.assertEqual(shared.reserved_blocks, 3)
+        # Never the whole arena: the shared part must keep at least one slot, or
+        # a capture could not run at all (it would fail closed, but silently).
+        tiny = self._dtm(
+            groups,
+            block_per_save_task=128,
+            block_per_load_task=128,
+            staging_pool_blocks=16,
+            staging_pool_max_bytes_per_group=4096,  # a single slot
+        )
+        pool = tiny._pools["tp0_g0"]
+        self.assertEqual(pool.max_blocks, 1)
+        self.assertEqual(pool.reserved_blocks, 1)
+        self.assertEqual(pool.acquire(1, timeout=0.01, keep_reserved=True), None)
+
     def test_configured_batch_below_the_pool_is_untouched(self):
         groups = self._groups()
         dtm = self._dtm(
