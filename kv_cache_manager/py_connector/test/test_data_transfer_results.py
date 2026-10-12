@@ -25,6 +25,7 @@ from kv_cache_manager.py_connector.vllm.data_transfer import (
     DataTransferManager,
     MultiResult,
     StagingShape,
+    group_meta_pinned_bytes,
     group_meta_shape,
     plan_staging_pools,
     staging_shape,
@@ -726,6 +727,18 @@ class TestPinnedTotals(unittest.TestCase):
                 plans = _plan(metas)
                 self.assertEqual(len(plans), shapes, why)
                 self.assertEqual(total_pinned_bytes(plans), pinned, why)
+                # The one call an e2e/kvperf gate needs: GroupMeta list in,
+                # the logged pinned total out.
+                self.assertEqual(
+                    group_meta_pinned_bytes(
+                        metas,
+                        KV_DTYPE,
+                        configured_blocks=1024,
+                        max_bytes_per_pool=2**30,
+                    ),
+                    pinned,
+                    why,
+                )
 
     def test_budgets_of_the_pr_acceptance(self):
         # 04 §3.3 pinned gates: gemma-3-4b <= 0.4 GiB, Qwen3.5-4B <= 1 GiB.
