@@ -1035,10 +1035,12 @@ class TestBuildConnectorMeta(unittest.TestCase):
         # 40 tokens / 3 blocks -> min(40, 48)//16 = 2 blocks to save.
         conn._http_executor.submit.assert_called_once()
         args = conn._http_executor.submit.call_args[0]
-        # The per-block state-completeness mask is computed here, in the
-        # scheduler loop, and handed to the http thread: it is read off vLLM's
-        # block table, which later steps mutate.
-        self.assertEqual(args[1:], ("r0", list(range(32)), 2, [True, True]))
+        # The per-block state-completeness and window-coverage masks are
+        # computed here, in the scheduler loop, and handed to the http thread:
+        # they are read off vLLM's block table, which later steps mutate.
+        self.assertEqual(
+            args[1:], ("r0", list(range(32)), 2, [True, True], [True, True])
+        )
         self.assertEqual(conn._tracked["r0"].has_saved_block_num, 2)
 
     def test_load_request_emitted_after_alloc(self):

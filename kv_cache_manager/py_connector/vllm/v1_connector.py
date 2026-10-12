@@ -179,6 +179,14 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_config.cache_config, "calculate_kv_scales", False
             ),
         )
+        # EAGLE/MTP drafter groups are skipped by parse_groups, but their
+        # presence moves vLLM's windowed hit rule by one block
+        # (_contiguous_blocks_for_hit drops the last matched block); the
+        # windowed hit clamp mirrors that conservatively.
+        self._has_eagle_group = any(
+            getattr(group, "is_eagle_group", False)
+            for group in kv_cache_config.kv_cache_groups
+        )
 
         deployment = {
             "model_name": model_config.served_model_name,
@@ -208,6 +216,7 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._tp_size,
                 self._manager_client,
                 TpCoordinatorClient(host_ip, extra_config.coordinator_base_port),
+                has_eagle_group=self._has_eagle_group,
             )
             logger.warning(
                 "TairKvCacheConnector scheduler inited, extra_config: %r, "

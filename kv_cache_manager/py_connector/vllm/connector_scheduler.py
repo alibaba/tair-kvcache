@@ -34,6 +34,7 @@ from kv_cache_manager.py_connector.vllm.location_query_manager import (
     LocationQueryManager,
 )
 from kv_cache_manager.py_connector.vllm.metadata import (
+    CaptureRequest,
     FinishRequest,
     LoadRequest,
     SaveRequest,
@@ -42,9 +43,12 @@ from kv_cache_manager.py_connector.vllm.metadata import (
 from kv_cache_manager.py_connector.vllm.vllm_common import (
     ATTN_ONLY_SPEC_GROUP,
     ALL_SPEC_GROUP,
+    AttentionGroupMeta,
     GroupMeta,
     StateGroupMeta,
+    spec_group_plan,
     spec_name,
+    windowed_block_has_data,
 )
 
 if TYPE_CHECKING:
@@ -95,6 +99,7 @@ class ConnectorScheduler:
         tp_size: int,
         manager_client: KvCacheManagerClient,
         coordinator_client: TpCoordinatorClient,
+        has_eagle_group: bool = False,
     ) -> None:
         self._extra_config = extra_config
         self._group_metas = group_metas
@@ -102,6 +107,22 @@ class ConnectorScheduler:
         self._state_group_idxs = [
             m.group_idx for m in group_metas if isinstance(m, StateGroupMeta)
         ]
+        # Windowed buckets: the groups whose blocks vLLM frees while the
+        # request lives. They drive the eager-capture requests and the hit
+        # clamp; an instance without one keeps the pre-PR matching path.
+        self._windowed_metas = [
+            m
+            for m in group_metas
+            if isinstance(m, AttentionGroupMeta) and m.retention is not None
+        ]
+        # vLLM's own windowed hit rule requires one more block when EAGLE/MTP
+        # drops the last matched block (_contiguous_blocks_for_hit's
+        # drop_eagle_block); the clamp below mirrors it conservatively.
+        self._has_eagle_group = has_eagle_group
+        # (states complete, window data present) -> the spec group a block is
+        # announced under. An instance with nothing sparse declares nothing and
+        # sends no group names at all, exactly as before this PR.
+        self._spec_group_names = spec_group_plan(group_metas, tp_size)[1]
         self._manager_block_size = manager_block_size
         self._vllm_block_size = vllm_block_size
         self._tp_size = tp_size
@@ -169,6 +190,36 @@ class ConnectorScheduler:
             mask.append(complete)
         return mask
 
+    def _window_data_mask(
+        self, ledger: RequestLedger, manager_block_idxes: Sequence[int]
+    ) -> List[bool]:
+        """Per manager block: does every windowed group still hold real slots?
+
+        The windowed twin of ``_state_complete_mask``, read from the same block
+        table in the same loop iteration: vLLM frees a windowed block by writing
+        the null block into its table entry, so this predicate says exactly what
+        the step's capture can copy (`windowed_block_has_data` is shared with
+        the worker) *and* what the manager may be told this block carries. Read
+        here rather than at write time on purpose: a later read is the stale
+        ledger M1 of the SWA investigation.
+        """
+        return [
+            windowed_block_has_data(
+                self._windowed_metas,
+                ledger.block_ids_per_group,
+                mb,
+                self._manager_block_size,
+            )
+            for mb in manager_block_idxes
+        ]
+
+    def _spec_group_for(
+        self, states_complete: bool, window_present: bool
+    ) -> Optional[str]:
+        """The announced spec group of one block, or None when this instance
+        declares none for that coverage (see ``spec_group_plan``)."""
+        return self._spec_group_names.get((states_complete, window_present))
+
     def _num_allocated_blocks(self, ledger: RequestLedger) -> int:
         """Min allocated block-table length across the *transferred* groups.
 
@@ -201,6 +252,84 @@ class ConnectorScheduler:
             for meta in self._group_metas
             if isinstance(meta, StateGroupMeta)
         )
+
+    def _location_covers_windows(self, location: dict) -> bool:
+        """Does this published block carry every windowed group's spec per rank?
+
+        The windowed twin of ``_location_covers_states``: an externally matched
+        prefix may only end where the window region still has real data, and the
+        manager expresses "this block has no data for that group" exactly this
+        way -- the block's location does not carry the spec (a block whose
+        windowed bytes were never published, e.g. one that was already outside
+        the window when its group was saved).
+        """
+        names = {spec.get("name") for spec in location.get("location_specs", [])}
+        return all(
+            spec_name(rank, meta) in names
+            for rank in range(self._tp_size)
+            for meta in self._windowed_metas
+        )
+
+    def _window_blocks(self, meta: AttentionGroupMeta) -> int:
+        """Blocks of the window a hit end must have data for.
+
+        ``cdiv(window - 1 + extra_retained, mbs)`` mirrors vLLM's own
+        ``_contiguous_blocks_for_hit`` (cdiv(window - 1, block_size) plus the
+        extra retained trailing tokens), one manager-block at a time; with
+        EAGLE/MTP the matched tail loses one block, which vLLM expresses as
+        "+1 contiguous block required", so require one more here too.
+
+        Chunked-local is satisfied by the same upper bound: the chunk
+        containing the hit end is at most ``attention_chunk_size`` tokens long,
+        so its start lies inside the last cdiv(chunk - 1, mbs) blocks (the
+        region is at most one block wider than vLLM needs -- a conservative
+        over-requirement trims a hit, it never loads a hole).
+        """
+        retention = meta.retention
+        assert retention is not None
+        blocks = -(-(retention.window_tokens - 1 + retention.extra_retained_tokens)
+                   // self._manager_block_size)
+        return blocks + 1 if self._has_eagle_group else blocks
+
+    def _windowed_match_end(self, locations: List[dict], limit: int) -> int:
+        """Largest block count <= limit a windowed match may end on.
+
+        Two per-block predicates decide: the block's window region
+        ``[max(0, e-k), e)`` must carry every windowed group's spec for every
+        rank (k = the widest window, see ``_window_blocks``), and the block at
+        ``e-1`` must carry every state group's spec -- the same end condition
+        the full-attention path applies, evaluated jointly here because both
+        depend on where the match ends.
+
+        The bound is *not* the first hole from the end: the window constraint
+        is local to the region, so a longer hit whose tail is covered is legal
+        (vLLM's own windowed hit may end mid-prefix -- only the tail has to be
+        there), and taking the largest such e is what keeps the historian's
+        longer hits usable. A hole inside the region pushes the end down to
+        the hole, and a block without state steps back one.
+        """
+        covered = [self._location_covers_windows(loc) for loc in locations]
+        # Longest consecutive covered run *starting* at each index, so
+        # "all of [s, e) is covered" is O(1) (run[s] >= e - s).
+        run = [0] * (len(covered) + 1)
+        for i in range(len(covered) - 1, -1, -1):
+            run[i] = run[i + 1] + 1 if covered[i] else 0
+        k = max(self._window_blocks(m) for m in self._windowed_metas)
+        end = limit
+        while end > 0:
+            if not self._location_covers_states(locations[end - 1]):
+                # No recurrent state ending this block: the next candidate is
+                # one block shorter (the window region moves with it).
+                end -= 1
+                continue
+            start = max(0, end - k)
+            if run[start] >= min(k, end):
+                return end
+            # A hole inside [start, end): every end in (hole, end] has it in
+            # its own window region (hole + k >= end), so the largest
+            # candidate left is the hole itself -- which excludes it.
+            end = start + run[start]
+        return 0
 
     def _external_match_burned(self, req_id: str) -> bool:
         """Has this request lost its option of an external match?
@@ -310,19 +439,24 @@ class ConnectorScheduler:
     ) -> List[dict]:
         """Clamp an external match to the longest prefix vLLM can resume from.
 
-        Two constraints, both only ever trimming the tail, so the answer is
-        the longest prefix satisfying both at once:
+        Three constraints, all only ever trimming the tail, so the answer is
+        the longest prefix satisfying all of them at once:
 
         * the match must end on a state-complete block -- a hybrid request
           resumes from the recurrent state ending the reused prefix, so an
           ending block without one is unloadable however much attention KV
           precedes it;
+        * the window region ending a windowed match must carry that group's
+          data for every rank (``_window_hit_limit``) -- vLLM only allocates
+          the windowed group's blocks inside the window on an external hit, so
+          a region without published data would leave visible tokens unwritten;
         * at least one token must stay uncomputed -- logits are not part of
           the KV cache, so the model still needs one token to sample from,
           and vLLM's synchronous-load path asserts num_new_tokens > 0
           (vLLM's own connectors apply the same cap).
 
-        Full-attention models have no state groups and only feel the cap.
+        Full-attention models have no state groups and no windowed groups and
+        only feel the cap; their matching path is byte-for-byte the pre-PR one.
         """
         # Cap: how many leading blocks may be matched at all.
         limit = len(locations)
@@ -331,8 +465,22 @@ class ConnectorScheduler:
             and num_computed_tokens + limit * self._manager_block_size >= num_tokens
         ):
             limit -= 1
+        if self._windowed_metas:
+            # Window constraint, evaluated jointly with the state-complete end
+            # condition: both depend on where the match ends.
+            windowed_limit = self._windowed_match_end(locations, limit)
+            if windowed_limit < limit:
+                logger.info(
+                    "req:%s truncated external match from %d to %d blocks "
+                    "(window region of a windowed group has no published data)",
+                    req_id,
+                    len(locations),
+                    windowed_limit,
+                )
+                limit = windowed_limit
         # Within that allowance the match may only end on a block carrying
-        # the recurrent state: scan for the last one.
+        # the recurrent state: scan for the last one. (With windowed groups the
+        # joint scan above already enforced it on the ending block.)
         keep = 0
         for i, location in enumerate(locations[:limit]):
             if self._location_covers_states(location):
@@ -440,13 +588,15 @@ class ConnectorScheduler:
         earlier steps' async work (admitted loads, resolved save sessions,
         retirements). Only the last stage depends on the others: save
         settlement may retire a request within this step, so finishes flush
-        last.
+        last. Capture instructions are emitted while this step's block tables
+        are live: the worker runs them in the same step's wait_for_save, before
+        vLLM's window sliding touches the blocks.
         """
         meta = TairKvCacheConnectorMetadata(self._epoch)
         self._epoch += 1
 
         self._ingest_scheduled_reqs(scheduler_output)
-        self._dispatch_incremental_saves()
+        self._dispatch_incremental_saves(meta)
         self._collect_load_instructions(meta)
         self._collect_save_instructions(meta)
         self._collect_finish_instructions(meta)
@@ -515,14 +665,22 @@ class ConnectorScheduler:
                 ):
                     group_ids.extend(new_ids)
 
-    def _dispatch_incremental_saves(self) -> None:
+    def _dispatch_incremental_saves(
+        self, meta: TairKvCacheConnectorMetadata
+    ) -> None:
         """Start async StartWriteCache calls for requests whose computed
-        prefix crossed a manager-block boundary since the last step.
+        prefix crossed a manager-block boundary since the last step, and ask
+        the worker to capture the newly completed blocks of every windowed
+        group in this same step.
 
         This stage only acquires write locations (the HTTP call resolves tens
         of ms later, off the scheduler thread); the data itself moves later,
-        gathered by the worker out of HBM. The session the http thread
-        produces surfaces in _collect_save_instructions on a later step.
+        gathered by the worker out of HBM -- except for windowed groups, whose
+        blocks vLLM frees while the request lives: their bytes are copied into
+        the staging arena by the worker's wait_for_save of *this* step (see
+        CaptureRequest), so the announce -> session lag never reads HBM. The
+        session the http thread produces surfaces in _collect_save_instructions
+        on a later step.
         """
         for ledger in self._tracked.values():
             # Count blocks by the key material (all_token_ids), never by the
@@ -552,6 +710,21 @@ class ConnectorScheduler:
                     len(ledger.vllm_request.all_token_ids),
                     self._num_allocated_blocks(ledger),
                 )
+                if self._windowed_metas:
+                    # Windowed groups: the blocks just completed are still in
+                    # HBM right now and are freed by the *next* schedule step,
+                    # so this is the only moment their bytes can be copied.
+                    meta.add_capture_request(
+                        CaptureRequest(
+                            req_id=ledger.vllm_request.request_id,
+                            manager_block_idxes=list(
+                                range(ledger.has_saved_block_num, target_save_num)
+                            ),
+                            all_block_ids=[
+                                list(b) for b in ledger.block_ids_per_group
+                            ],
+                        )
+                    )
                 ledger.scheduled_saving_count += 1
                 # Per-block state completeness must be read here, in the
                 # scheduler loop: it comes from vLLM's block table, which the
@@ -566,6 +739,7 @@ class ConnectorScheduler:
                     ],
                     target_save_num,
                     self._state_complete_mask(ledger, range(target_save_num)),
+                    self._window_data_mask(ledger, range(target_save_num)),
                 )
             ledger.has_saved_block_num = target_save_num
 
@@ -633,15 +807,18 @@ class ConnectorScheduler:
         token_ids: List[int],
         target_save_num: int,
         state_complete_mask: List[bool],
+        window_data_mask: Optional[List[bool]] = None,
     ) -> None:
         """Ask the manager for write locations for a request's first
         ``target_save_num`` manager blocks.
 
-        ``state_complete_mask[i]`` says whether manager block i has a
-        materialized recurrent state. Blocks without one are announced under
-        the attention-only spec group, so the manager allocates (and later
-        advertises) only the specs that will really hold data -- absence is
-        never encoded as a successful write.
+        ``state_complete_mask[i]`` / ``window_data_mask[i]`` say whether manager
+        block i has a materialized recurrent state / real windowed slots. A
+        block missing either is announced under the spec group that describes
+        what it *does* carry, so the manager allocates (and later advertises)
+        only the specs that will really hold data -- absence is never encoded as
+        a successful write, and a windowed block whose window is already gone is
+        never advertised as if its bytes were there.
         """
         request = {
             "trace_id": "%s_%d" % (req_id, self._epoch),
@@ -650,14 +827,43 @@ class ConnectorScheduler:
             "token_ids": token_ids,
             "write_timeout_seconds": self._extra_config.write_timeout_seconds,
         }
-        if self._state_group_idxs:
+        if self._state_group_idxs or self._windowed_metas:
+            if window_data_mask is None:
+                window_data_mask = [True] * target_save_num
             assert len(state_complete_mask) == target_save_num, (
                 f"state mask {len(state_complete_mask)} != {target_save_num} blocks"
             )
-            request["location_spec_group_names"] = [
-                ALL_SPEC_GROUP if complete else ATTN_ONLY_SPEC_GROUP
-                for complete in state_complete_mask
+            assert len(window_data_mask) == target_save_num, (
+                f"window mask {len(window_data_mask)} != {target_save_num} blocks"
+            )
+            coverage_names = [
+                self._spec_group_for(complete, window_present)
+                for complete, window_present in zip(
+                    state_complete_mask, window_data_mask
+                )
             ]
+            if all(name is not None for name in coverage_names):
+                request["location_spec_group_names"] = coverage_names
+            else:
+                # No declared group describes every block of this session (the
+                # instance has no non-windowed spec at all): announce the
+                # default, i.e. every registered spec. Sound because such a
+                # block is one *nothing* can publish (every group abstains).
+                logger.info(
+                    "req:%s: %d/%d blocks have no declared spec group; "
+                    "announcing all specs",
+                    req_id,
+                    sum(name is None for name in coverage_names),
+                    target_save_num,
+                )
+            if not all(window_data_mask):
+                logger.info(
+                    "req:%s saving %d/%d blocks whose window is already gone "
+                    "(windowed specs excluded)",
+                    req_id,
+                    window_data_mask.count(False),
+                    target_save_num,
+                )
             if not all(state_complete_mask):
                 logger.info(
                     "req:%s saving %d/%d blocks without a recurrent "
