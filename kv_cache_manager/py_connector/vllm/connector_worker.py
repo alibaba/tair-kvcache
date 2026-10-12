@@ -99,16 +99,20 @@ class ConnectorWorker:
         self._finish_pending: set = set()
 
         # Eagerly captured windowed blocks, per request: (group_idx, manager
-        # block) -> the staging slot holding that block's bytes. The save task
-        # writes them once the write session lands; a slot comes back to its
-        # arena when written, or at the request's FinishRequest for whatever
-        # was never handed to a session (a canceled announce). ``_withheld``
-        # holds the blocks of a request-step whose capture could not run (the
-        # arena was full): their save verdict is a failure, never a publish.
-        # ``_capture_scope`` is every block a capture has considered for the
-        # request -- the difference between "looked at, had no data" (abstain)
-        # and "never looked at" (fail, we cannot vouch for the announcement).
+        # block) -> (staging pool, slot) holding that block's bytes, until a
+        # write session takes them. Handing a block over *moves* its entry to
+        # ``_in_flight``, where the task owns the release: it returns the slot
+        # when its transfer lands, success or failure. ``_staged`` is therefore
+        # exactly "captured but not yet given to a session", which is what the
+        # retirement path may release (freeing an in-flight slot would hand
+        # live bytes to the next capture and free it twice -- review_r1 S1).
+        # ``_withheld`` holds the blocks of a request-step whose capture could
+        # not run (the arena was full): their save verdict is a failure, never
+        # a publish. ``_capture_scope`` is every block a capture has considered
+        # for the request -- the difference between "looked at, had no data"
+        # (abstain) and "never looked at" (fail, we cannot vouch for it).
         self._staged: Dict[str, Dict[Tuple[int, int], Tuple[Any, int]]] = {}
+        self._in_flight: Dict[str, Dict[Tuple[int, int], Tuple[Any, int]]] = {}
         self._withheld: Dict[str, set] = {}
         self._capture_scope: Dict[str, set] = {}
 
@@ -501,12 +505,33 @@ class ConnectorWorker:
         this is: an announced location with no bytes must not be published (the
         block fails, withdrawing the claim), while a block the announcement
         already described as window-less wrote nothing by design and abstains.
+
+        Handing a block over *moves* its entry from ``_staged`` to
+        ``_in_flight``: the task owns the slot from here on and returns it when
+        its transfer lands. A block is announced once, so a second plan for the
+        same block is a contract violation -- it gets no slot (and no location
+        to write to) rather than a slot two tasks would both release.
         """
         staged = self._staged.get(req_id, {})
+        in_flight = self._in_flight.setdefault(req_id, {})
         slots: List[Optional[int]] = []
         for block in manager_block_idxes:
-            entry = staged.get((group.group_idx, block))
-            slots.append(None if entry is None else entry[1])
+            key = (group.group_idx, block)
+            entry = staged.pop(key, None)
+            if entry is None:
+                if key in in_flight:
+                    logger.warning(
+                        "req:%s windowed block %d (group %s) is planned twice; "
+                        "its bytes stay with the first session and this block is "
+                        "failed instead of handing the same slot out twice",
+                        req_id,
+                        block,
+                        group.spec_name,
+                    )
+                slots.append(None)
+                continue
+            in_flight[key] = entry
+            slots.append(entry[1])
         missing = [
             i for i, slot in enumerate(slots) if slot is None and uris[i] is not None
         ]
@@ -940,23 +965,30 @@ class ConnectorWorker:
             pool.release(start, len(captureable))
 
     def _release_staged(self, req_id: str) -> None:
-        """Return a request's un-written capture slots to their arenas.
+        """Return the capture slots the request never handed to a session.
 
-        Called when the request retires: whatever a session never referenced
-        (an announcement that was canceled, a step that was never re-announced)
-        must not pin the arena for the rest of the process's life.
+        Called when the request retires: whatever no session referenced (an
+        announcement that was canceled, a step that was never re-announced) must
+        not pin the arena for the rest of the process's life. A block that *did*
+        reach a session is that session's to release -- it returns its slot when
+        the transfer lands, success or failure -- because releasing in-flight
+        slots here would hand live bytes to the next capture before the SDK read
+        them and free the same slot twice (the pool's free list would then hold
+        the range twice and dispatch it to two transfers; review_r1 S1).
         """
         staged = self._staged.pop(req_id, None)
+        in_flight = self._in_flight.pop(req_id, None)
         withheld = self._withheld.pop(req_id, None)
         self._capture_scope.pop(req_id, None)
-        if not staged:
-            return
-        for pool, slot in staged.values():
-            pool.release(slot, 1)
+        if staged:
+            for pool, slot in staged.values():
+                pool.release(slot, 1)
         logger.debug(
-            "req:%s released %d un-written captured block slots (%d withheld)",
+            "req:%s released %d un-taken captured block slots "
+            "(%d in flight with their sessions, %d withheld)",
             req_id,
-            len(staged),
+            len(staged or ()),
+            len(in_flight or ()),
             len(withheld or ()),
         )
 

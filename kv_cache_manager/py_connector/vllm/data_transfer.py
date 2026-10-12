@@ -94,7 +94,11 @@ class _StagingPool:
     """
 
     def __init__(
-        self, device: torch.device, per_block_bytes: int, max_blocks: int
+        self,
+        device: torch.device,
+        per_block_bytes: int,
+        max_blocks: int,
+        reserved_blocks: int = 0,
     ) -> None:
         if max_blocks <= 0:
             raise ValueError("staging pool must have at least one block slot")
@@ -108,19 +112,37 @@ class _StagingPool:
             total, dtype=torch.uint8, device="cpu", pin_memory=(device.type == "cuda")
         )
         # Free runs as [start, start+len) block ranges, kept sorted by start.
-        self._runs = [[0, max_blocks]]
+        # ``reserved_blocks`` top slots are the transfer tasks' guaranteed
+        # staging room: the eager capture may only borrow from the rest (see
+        # acquire), so a task always finds free slots to make progress even
+        # while captures hold every shared slot -- without the split, a
+        # captured slot would be released by a task that cannot start.
+        self.reserved_blocks = min(max(0, reserved_blocks), max_blocks)
+        self._runs = [[0, max_blocks - self.reserved_blocks]]
+        self._reserved_runs = (
+            [[max_blocks - self.reserved_blocks, self.reserved_blocks]]
+            if self.reserved_blocks
+            else []
+        )
 
-    def acquire(self, n: int, timeout: Optional[float] = None) -> Optional[int]:
+    def acquire(
+        self, n: int, timeout: Optional[float] = None, *, keep_reserved: bool = False
+    ) -> Optional[int]:
         """Block until a contiguous run of ``n`` block slots is free; return
         its starting block index, or None when ``timeout`` (seconds) expires
         first.
 
         The optional deadline exists for the eager capture, whose slots are
         held until the write session lands -- i.e. until the engine makes
-        another step. Waiting for those slots forever would deadlock the
-        engine against its own sessions, so the capture waits a bounded time
-        and degrades instead (see DataTransferManager.capture_task): the
+        another step. Waiting for those slots forever would stall the engine
+        against its own sessions, so the capture waits a bounded time and
+        degrades instead (see DataTransferManager.capture_blocks): the
         transfer tasks keep the historical blocking behaviour.
+
+        ``keep_reserved`` (the capture) searches only the shared part of the
+        arena and leaves the reserve to the transfer tasks: a capture can never
+        hold the last run a task needs, and a captured slot is only released by
+        a task, which now always has room to start.
         """
         if n <= 0:
             raise ValueError("must acquire at least one block slot")
@@ -133,7 +155,7 @@ class _StagingPool:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
             while True:
-                start = self._take_run(n)
+                start = self._take_run(n, keep_reserved=keep_reserved)
                 if start is not None:
                     return start
                 if deadline is None:
@@ -144,35 +166,67 @@ class _StagingPool:
                     return None
                 self._cond.wait(remaining)
 
-    def _take_run(self, n: int) -> Optional[int]:
+    @property
+    def free_blocks(self) -> int:
+        """Free slots, reserve included: the arena's accounting, for tests."""
+        with self._cond:
+            return sum(length for _s, length in self._runs) + sum(
+                length for _s, length in self._reserved_runs
+            )
+
+    def _take_run(self, n: int, keep_reserved: bool = False) -> Optional[int]:
         """Carve the first run of at least ``n`` slots; caller holds the lock."""
-        for i, (start, length) in enumerate(self._runs):
-            if length >= n:
-                rest = length - n
-                if rest:
-                    self._runs[i] = [start + n, rest]
-                else:
-                    self._runs.pop(i)
-                return start
+        lists = [self._runs] if keep_reserved else [self._runs, self._reserved_runs]
+        for runs in lists:
+            for i, (start, length) in enumerate(runs):
+                if length >= n:
+                    rest = length - n
+                    if rest:
+                        runs[i] = [start + n, rest]
+                    else:
+                        runs.pop(i)
+                    return start
         return None
 
     def release(self, start: int, n: int) -> None:
+        if n <= 0 or start < 0 or start + n > self.max_blocks:
+            raise ValueError(
+                f"release of [{start}, {start + n}) is outside the pool "
+                f"(0..{self.max_blocks})"
+            )
         with self._cond:
+            target = (
+                self._reserved_runs
+                if start >= self.max_blocks - self.reserved_blocks
+                else self._runs
+            )
+            for s, length in target:
+                if s < start + n and start < s + length:
+                    # Releasing an already-free range means two owners gave the
+                    # same slots back: the arena would hand them to two
+                    # transfers at once and the pinned budget would drift. Fail
+                    # loudly instead of corrupting silently (review_r1 S1).
+                    raise ValueError(
+                        f"slots [{start}, {start + n}) of the pool "
+                        f"(block_bytes={self.block_bytes}, "
+                        f"max_blocks={self.max_blocks}) are already free; "
+                        f"released twice?"
+                    )
             pos, run = 0, [start, n]
-            for pos, (s, _len) in enumerate(self._runs):
+            for pos, (s, _len) in enumerate(target):
                 if s > start:
                     break
             else:
-                pos = len(self._runs)
-            self._runs.insert(pos, run)
+                pos = len(target)
+            target.insert(pos, run)
             # Merge with the neighbours the release just glued together.
             merged = []
-            for s, l in self._runs:
+            for s, l in target:
                 if merged and merged[-1][0] + merged[-1][1] == s:
                     merged[-1][1] += l
                 else:
                     merged.append([s, l])
-            self._runs = merged
+            target[:] = merged
             self._cond.notify_all()
 
     def cpu_view(
@@ -468,8 +522,17 @@ class DataTransferManager:
         self._pools: Dict[str, _StagingPool] = {}
         save_batch = extra_config.block_per_save_task
         load_batch = extra_config.block_per_load_task
+        # The reserve is the largest batch one transfer task can ask for: with
+        # it carved out, a task can always start (and thereby release the
+        # captures its own session holds), so the capture's bounded wait is a
+        # deadlock-free degradation rather than a race for the last run.
         for plan in plans:
-            pool = _StagingPool(self._device, plan.slot_bytes, plan.blocks)
+            pool = _StagingPool(
+                self._device,
+                plan.slot_bytes,
+                plan.blocks,
+                reserved_blocks=min(max(save_batch, load_batch), plan.blocks),
+            )
             names = [kvcache_info.groups[i].spec_name for i in plan.members]
             for name in names:
                 self._pools[name] = pool
@@ -564,7 +627,7 @@ class DataTransferManager:
         location whose bytes were never copied.
         """
         pool = self._pools[group.spec_name]
-        start = pool.acquire(len(block_slots), timeout=timeout)
+        start = pool.acquire(len(block_slots), timeout=timeout, keep_reserved=True)
         if start is None:
             return None
         try:
@@ -808,11 +871,11 @@ class DataTransferManager:
         ``ready_event`` exists for the late gather, which this path has none
         of).
 
-        Slots go back to the pool once their block has really been written: a
-        failed transfer keeps them, because the manager will hand those blocks
-        out again as "new" and the captured bytes are the only copy left (the
-        engine's window moved on). Whatever is still held when the request
-        retires is released there.
+        A captured slot is the task's to return, whatever the verdict: the
+        block is announced to the manager exactly once, so there is no retry
+        that could reuse these bytes, and a failure that kept the slot would
+        hold the arena for the rest of the request's life. Whatever the request
+        never handed to a session is released when it retires instead.
         """
         pool = self._pools[group.spec_name]
         uris = [remote_uris[i] for i in valid]
@@ -829,18 +892,23 @@ class DataTransferManager:
         ]
         result = self._transfer_client.SaveKvCaches(uris, buffers)
         ok = result[0] == kvcm_py_client.ClientErrorCode.ER_OK
-        if ok:
-            for i in valid:
-                pool.release(staged_slots[i], 1)  # ty: ignore[invalid-argument-type]
-        else:
+        if not ok:
             logger.warning(
-                "save task failed group=%s uris=%d result=%s; the captured "
-                "bytes stay in the arena for the manager's retry",
+                "save task failed group=%s uris=%d result=%s; the block is not "
+                "published and its captured slot goes back to the arena",
                 group.spec_name,
                 len(uris),
                 result,
             )
+        # One release per captured slot. The entry left the worker's staged map
+        # when the plan handed the block over, so this driver owns it now, and
+        # it owns it whether or not the transfer landed: a block is announced
+        # to the manager exactly once (has_saved_block_num advances when the
+        # session is dispatched, not when it succeeds), so nothing waits for
+        # these bytes -- and freeing them at retirement instead is exactly the
+        # double-free review_r1 S1 found.
         for i in valid:
+            pool.release(staged_slots[i], 1)  # ty: ignore[invalid-argument-type]
             ok_mask[i] = ok
 
     def _save_dispositions(
@@ -1193,9 +1261,12 @@ class DataTransferManager:
                             # data of their own (those tokens are outside the
                             # window): their token slots already point at a row
                             # that does get loaded, so this copies that row's
-                            # bytes over them. The scatter then writes the same
-                            # correct value twice, and the shared null block
-                            # stays untouched.
+                            # bytes onto them -- one row per null row, for every
+                            # pointer (a pointer is a layer in the packed
+                            # layouts, so the copy must be broadcast across the
+                            # row axis, not across pointers). The scatter then
+                            # writes the same correct value twice and the shared
+                            # null block stays untouched.
                             for out_i, i in enumerate(valid):
                                 alias = null_rows[i]
                                 if alias is not None:
@@ -1204,9 +1275,12 @@ class DataTransferManager:
                                         f"no real row to alias its null rows onto; "
                                         f"_load_valid_blocks must not see it"
                                     )
-                                    view[out_i, :, alias.rows, :] = view[
+                                    source = view[
                                         out_i, :, alias.source_row, :
-                                    ]
+                                    ].unsqueeze(1)
+                                    view[out_i, :, alias.rows, :] = source.expand(
+                                        -1, len(alias.rows), -1
+                                    )
                         batch_gather_scatter_helper.batch_scatter_kv_caches(
                             group.kvcache_ptr_tensor_gpu,
                             view,
@@ -1261,11 +1335,15 @@ class DataTransferManager:
         report_failures: bool = True,
     ) -> Callable[[List[Optional[bool]]], None]:
         """A manager block is loaded only if every group that had data for it
-        succeeded.
+        succeeded -- and it is *invalid* only when one of them failed.
 
         ``None`` entries mean "this group has no data for this block by design"
-        (mamba "align" interior blocks, see load_task) and are skipped, exactly
-        as in the save callback.
+        (mamba "align" interior blocks, and a windowed group's tokens outside
+        the window, see load_task) and are skipped; a block whose groups all
+        abstained asked for nothing and must not be reported as a lost block --
+        vLLM reacts to an invalid block id by truncating num_computed_tokens to
+        where that block first appears (block 0 would throw the whole external
+        hit away, and kv_load_failure_policy="fail" would fail the request).
 
         block_ids is the block table used to report vLLM-visible invalid block
         ids. vLLM's invalid-block recovery unpacks a single-group block table
@@ -1284,20 +1362,22 @@ class DataTransferManager:
                     continue
                 b = i % num_blocks
                 merged[b] = ok if merged[b] is None else (merged[b] and ok)
-            # A block no group loaded anything for was not restored.
-            merged = [bool(ok) for ok in merged]
+            # Only an explicit failure makes a block invalid: all-None means
+            # no group needed it (a null target in every group), which is a
+            # skip, not a hole in the request's KV.
+            broken = [ok for ok in merged if ok is False]
             failed = []
             if report_failures:
                 failed = [
                     block_ids[i]
                     for i in range(min(num_blocks, len(block_ids)))
-                    if not merged[i]
+                    if merged[i] is False
                 ]
-            elif not all(merged):
+            elif broken:
                 logger.warning(
                     "load failed for %d/%d blocks of req %s (hybrid: "
                     "not reporting invalid block ids)",
-                    merged.count(False),
+                    len(broken),
                     num_blocks,
                     req_id,
                 )

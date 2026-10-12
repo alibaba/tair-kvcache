@@ -90,6 +90,7 @@ class TestZooDispositions(unittest.TestCase):
         # one kind, one window, one trailing-edge retention per bucket. Every
         # accepted *non*-windowed row must carry None (full-prefix semantics
         # unchanged), which is what keeps the full-attention path untouched.
+        checked = 0
         for row in facts.ZOO:
             if row["disposition"] != "accept":
                 continue
@@ -98,14 +99,21 @@ class TestZooDispositions(unittest.TestCase):
                 own = [meta for meta in result.metas if meta.group_idx == 0][0]
                 expected = row.get("retention")
                 if expected is None:
+                    # Every accepted row without a window is checked too: a
+                    # stray retention on a full-attention model would lift the
+                    # whole data plane's restrictions onto it.
                     self.assertIsNone(own.retention)
-                    return
+                    continue
+                checked += 1
                 self.assertEqual(expected["kind"], own.retention.kind)
                 self.assertEqual(expected["window_tokens"], own.retention.window_tokens)
                 self.assertEqual(
                     expected.get("extra_retained_tokens", 0),
                     own.retention.extra_retained_tokens,
                 )
+        self.assertEqual(
+            len([row for row in facts.ZOO if row.get("retention")]), checked
+        )
 
     def test_sizes_of_every_accepted_row(self):
         # Sizing is re-pinned on the real engine too; here it proves the
