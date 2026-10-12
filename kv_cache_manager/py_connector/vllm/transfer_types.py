@@ -15,7 +15,7 @@ Nothing here is consumed by the sglang connector; per the placement rule
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import torch
 
@@ -89,6 +89,28 @@ class AttentionTransferGroup(TransferGroup):
     # element sizes (V3.2 bf16 main + uint8 indexer), so the staging view must
     # be built per bucket, never from a global dtype.
     dtype: torch.dtype
+    # Windowed retention (vllm_common.WindowRetention) or None for a full
+    # prefix: the worker's capture / null-slot / staged-write branches key on
+    # it, so a group describes its own transfer contract.
+    retention: Optional[Any] = None
+
+
+@dataclass(frozen=True)
+class NullBlockRow:
+    """Rows of one manager block whose target slot is vLLM's null block.
+
+    A windowed group's block table nulls the positions outside the window while
+    the request lives, and those rows must never be written (the null block is
+    the shared zero page every request reads for its own holes). ``rows`` are
+    the affected token rows; ``source_row`` is a row of the same manager block
+    that *does* receive its data -- the task aliases the null rows onto it, so
+    the real bytes land where they belong and block 0 stays untouched. A block
+    whose every row is null has no data to load at all: ``source_row`` is None
+    and the task skips it.
+    """
+
+    rows: List[int]
+    source_row: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +141,18 @@ class TransferPlan:
     token_indices: Optional[List[List[int]]] = None
     # State groups: source/target state block id per manager block.
     block_ids: Optional[List[int]] = None
+    # Windowed attention groups, save side: the staging-arena slot the eager
+    # capture already copied this block's bytes into (a captured block always
+    # sits at the start of its slot), or None when the block had no windowed
+    # data to publish (abstain). Present only for groups whose bytes were
+    # captured -- such a plan never gathers from HBM.
+    staged_slots: Optional[List[Optional[int]]] = None
+    # Windowed attention groups, load side: per manager block, which token
+    # rows target vLLM's null block (see NullBlockRow). Those rows are
+    # invisible to attention, but their slots must never be written: the task
+    # aliases them onto a row that does get its data, so the real bytes land
+    # where they belong and block 0 stays untouched.
+    null_rows: Optional[List[Optional[NullBlockRow]]] = None
 
 
 @dataclass(frozen=True)

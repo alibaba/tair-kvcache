@@ -48,6 +48,7 @@ from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraC
 from kv_cache_manager.py_connector.vllm.transfer_types import (
     AttentionTransferGroup,
     KVCacheInfo,
+    NullBlockRow,
     TransferGroup,
 )
 from kv_cache_manager.py_connector.vllm.vllm_common import (
@@ -109,9 +110,18 @@ class _StagingPool:
         # Free runs as [start, start+len) block ranges, kept sorted by start.
         self._runs = [[0, max_blocks]]
 
-    def acquire(self, n: int) -> int:
+    def acquire(self, n: int, timeout: Optional[float] = None) -> Optional[int]:
         """Block until a contiguous run of ``n`` block slots is free; return
-        its starting block index."""
+        its starting block index, or None when ``timeout`` (seconds) expires
+        first.
+
+        The optional deadline exists for the eager capture, whose slots are
+        held until the write session lands -- i.e. until the engine makes
+        another step. Waiting for those slots forever would deadlock the
+        engine against its own sessions, so the capture waits a bounded time
+        and degrades instead (see DataTransferManager.capture_task): the
+        transfer tasks keep the historical blocking behaviour.
+        """
         if n <= 0:
             raise ValueError("must acquire at least one block slot")
         if n > self.max_blocks:
@@ -120,17 +130,31 @@ class _StagingPool:
                 f"{self.max_blocks}; a task stages its whole batch as one run "
                 f"(see DataTransferManager.save_task_blocks)"
             )
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
             while True:
-                for i, (start, length) in enumerate(self._runs):
-                    if length >= n:
-                        rest = length - n
-                        if rest:
-                            self._runs[i] = [start + n, rest]
-                        else:
-                            self._runs.pop(i)
-                        return start
-                self._cond.wait()
+                start = self._take_run(n)
+                if start is not None:
+                    return start
+                if deadline is None:
+                    self._cond.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._cond.wait(remaining)
+
+    def _take_run(self, n: int) -> Optional[int]:
+        """Carve the first run of at least ``n`` slots; caller holds the lock."""
+        for i, (start, length) in enumerate(self._runs):
+            if length >= n:
+                rest = length - n
+                if rest:
+                    self._runs[i] = [start + n, rest]
+                else:
+                    self._runs.pop(i)
+                return start
+        return None
 
     def release(self, start: int, n: int) -> None:
         with self._cond:
@@ -168,6 +192,18 @@ class _StagingPool:
             )
         base = start * self.block_bytes
         return self._cpu[base : base + n * b]
+
+    def slot_base_ptr(self, slot: int) -> int:
+        """Byte address of one *held* slot (the eager capture's block buffers).
+
+        A captured block always sits at the start of a slot: the capture
+        addresses individual slots, so the save task can point the SDK straight
+        at them. (A *transfer* task borrows a run and stages its blocks densely,
+        which is why it goes through ``cpu_view`` instead.)
+        """
+        if not 0 <= slot < self.max_blocks:
+            raise ValueError(f"slot {slot} is outside the pool (0..{self.max_blocks})")
+        return self._cpu.data_ptr() + slot * self.block_bytes
 
 
 class MultiResult:
@@ -500,6 +536,78 @@ class DataTransferManager:
             self._pools[group.spec_name].max_blocks,
         )
 
+    def pool_of(self, group: TransferGroup) -> _StagingPool:
+        """The arena a bucket stages in.
+
+        Public because the eager capture has to address *individual* slots:
+        it holds them for as long as the write session is in flight, which is
+        not the borrow-and-release pattern the task APIs express.
+        """
+        return self._pools[group.spec_name]
+
+    def capture_blocks(
+        self, group: AttentionTransferGroup, block_slots: List[List[int]], timeout: float
+    ) -> Optional[int]:
+        """Copy blocks straight out of HBM into the arena, synchronously.
+
+        Called from the worker's wait_for_save hook, i.e. after the step's
+        forward and before vLLM's next schedule step frees the blocks: the
+        gather is ordered behind the forward on the engine's current stream and
+        synchronized before returning, so the arena holds the bytes -- not a
+        promise of them -- by the time the caller goes on. That is the whole
+        point of the eager capture: a windowed block is only readable in the
+        pass that produced it.
+
+        Returns the arena run the caller now owns (it keeps the slots until the
+        write lands), or None when the arena has no free run within ``timeout``
+        -- the caller must then withhold the blocks rather than publish a
+        location whose bytes were never copied.
+        """
+        pool = self._pools[group.spec_name]
+        start = pool.acquire(len(block_slots), timeout=timeout)
+        if start is None:
+            return None
+        try:
+            if group.per_block_bytes == pool.block_bytes:
+                # The member's block fills the arena's slot, so the whole run is
+                # one dense gather and each block ends up slot-aligned.
+                cpu_buffer = pool.cpu_view(start, len(block_slots))
+                view = self._attn_staging_view(cpu_buffer, group, len(block_slots))
+                batch_gather_scatter_helper.batch_gather_kv_caches(
+                    group.kvcache_ptr_tensor_gpu,
+                    view,
+                    block_slots,
+                    list(range(len(block_slots))),
+                    self._manager_block_size,
+                    group.per_token_dim,
+                    block_stride=group.block_stride,
+                    local_block_size=group.kernel_block_size,
+                )
+            else:
+                # A smaller member (shared arena, larger slot): stage each block
+                # at the start of *its* slot, one gather per block, so the save
+                # task can address captured slots individually.
+                for offset, slots in enumerate(block_slots):
+                    cpu_buffer = pool.cpu_view(
+                        start + offset, 1, group.per_block_bytes
+                    )
+                    view = self._attn_staging_view(cpu_buffer, group, 1)
+                    batch_gather_scatter_helper.batch_gather_kv_caches(
+                        group.kvcache_ptr_tensor_gpu,
+                        view,
+                        [slots],
+                        [0],
+                        self._manager_block_size,
+                        group.per_token_dim,
+                        block_stride=group.block_stride,
+                        local_block_size=group.kernel_block_size,
+                    )
+            self._device_mod.current_stream().synchronize()
+        except BaseException:
+            pool.release(start, len(block_slots))
+            raise
+        return start
+
     def _attn_staging_view(
         self, cpu_buffer: torch.Tensor, group: AttentionTransferGroup, batch: int
     ) -> torch.Tensor:
@@ -516,20 +624,24 @@ class DataTransferManager:
     # BlockBuffer helper
     # ------------------------------------------------------------------ #
     @staticmethod
+    def _block_buffer(base_ptr: int, per_block_bytes: int) -> Any:
+        buf = kvcm_py_client.BlockBuffer()
+        iov = kvcm_py_client.Iov()
+        iov.type = kvcm_py_client.MemoryType.CPU
+        iov.base = base_ptr
+        iov.size = per_block_bytes
+        iov.ignore = False
+        buf.iovs = [iov]
+        return buf
+
+    @classmethod
     def _make_block_buffers(
-        base_ptr: int, per_block_bytes: int, count: int
+        cls, base_ptr: int, per_block_bytes: int, count: int
     ) -> List[kvcm_py_client.BlockBuffer]:
-        buffers = []
-        for i in range(count):
-            buf = kvcm_py_client.BlockBuffer()
-            iov = kvcm_py_client.Iov()
-            iov.type = kvcm_py_client.MemoryType.CPU
-            iov.base = base_ptr + i * per_block_bytes
-            iov.size = per_block_bytes
-            iov.ignore = False
-            buf.iovs = [iov]
-            buffers.append(buf)
-        return buffers
+        return [
+            cls._block_buffer(base_ptr + i * per_block_bytes, per_block_bytes)
+            for i in range(count)
+        ]
 
     # ------------------------------------------------------------------ #
     # Save
@@ -542,22 +654,39 @@ class DataTransferManager:
         remote_uris: List[Optional[str]],
         block_token_indices: Optional[List[List[int]]],
         block_ids: Optional[List[int]],
-        ready_event: Any,
+        staged_slots: Optional[List[Optional[int]]] = None,
+        null_rows: Optional[List[Optional[NullBlockRow]]] = None,
+        ready_event: Any = None,
     ) -> None:
-        """Gather one group's manager blocks from HBM and save them.
+        """Move one group's manager blocks out of the engine and save them.
 
         block_token_indices: attention -> list[list[int]] flat token slots per block.
         block_ids:           state     -> list[int] block id per manager block.
         remote_uris:         positionally aligned with the manager blocks; None
                              where the manager allocated no location for this
-                             group's spec (see ``vllm_common.build_spec_groups``).
+                             group's spec (see ``vllm_common.build_spec_groups``)
+                             or where the block's windowed capture was withheld.
+        staged_slots:        windowed attention groups -> the staging-arena slot
+                             the eager capture already copied this block's bytes
+                             into, None where the block had no windowed data to
+                             publish. Such a group is never gathered from HBM
+                             here: the bytes left HBM in the pass that produced
+                             them (vLLM frees windowed blocks while the request
+                             is alive, so a late gather would read the null page
+                             or another request's data).
+
+        ``null_rows`` belongs to the load side and is accepted only to keep
+        the two task signatures one shape.
 
         A block is reported successful only when its data was actually written.
         Where a state group has no state (vLLM's null block in mamba "align"
         mode) the manager was already told so at start_write_cache time -- the
         block simply carries no spec for this group -- so nothing is written and
         nothing is claimed: the block is *excluded* from this group's verdict
-        rather than reported as a success.
+        rather than reported as a success. A windowed block whose capture was
+        withheld is the mirror image: this group has nothing to write although
+        the location was announced, so the block is *failed* -- publishing it
+        would advertise a spec whose bytes were never stored.
         """
         n = len(remote_uris)
         # Single exit: whatever happens below, the task reports, otherwise the
@@ -567,19 +696,31 @@ class DataTransferManager:
         try:
             # Three dispositions per block: abstain (this group holds no data
             # for it by design), transfer, or fail outright.
-            skipped, failed = self._save_dispositions(group, remote_uris, block_ids, n)
+            if staged_slots is not None:
+                skipped, failed = self._staged_dispositions(
+                    group, remote_uris, staged_slots, n
+                )
+            else:
+                skipped, failed = self._save_dispositions(
+                    group, remote_uris, block_ids, n
+                )
             valid = [i for i in range(n) if i not in skipped and i not in failed]
             ok_mask = [None if i in skipped else False for i in range(n)]
             if valid:
-                self._save_valid_blocks(
-                    group,
-                    remote_uris,
-                    block_token_indices,
-                    block_ids,
-                    ready_event,
-                    valid,
-                    ok_mask,
-                )
+                if staged_slots is not None:
+                    self._save_staged_blocks(
+                        group, remote_uris, staged_slots, valid, ok_mask
+                    )
+                else:
+                    self._save_valid_blocks(
+                        group,
+                        remote_uris,
+                        block_token_indices,
+                        block_ids,
+                        ready_event,
+                        valid,
+                        ok_mask,
+                    )
         except Exception:
             # Fail the whole task: partially transferred blocks are unknown, so
             # report conservatively -- never publish a block we cannot vouch
@@ -591,6 +732,116 @@ class DataTransferManager:
             )
             ok_mask = [False] * n
         multi_result.submit_result(task_idx, ok_mask)
+
+    def _staged_dispositions(
+        self,
+        group: TransferGroup,
+        remote_uris: List[Optional[str]],
+        staged_slots: List[Optional[int]],
+        n: int,
+    ) -> Tuple[Set[int], Set[int]]:
+        """Split a windowed group's task into (abstained, failed).
+
+        The location of each block says whether the announcement claimed this
+        group's spec for it, and the capture says whether its bytes exist; the
+        four combinations are three outcomes:
+
+        * claimed + captured -> transfer (the normal case);
+        * not claimed + no bytes -> **abstain**: the block's window was already
+          gone when it was announced, so the manager was told the group holds
+          nothing for it (no spec in the location) and there is nothing to
+          write -- not writing is the whole point, since the bytes at those
+          slots are the engine's shared zero page;
+        * claimed + no bytes -> **fail**: the bytes never made it into the arena
+          (the capture was withheld, or no capture ever ran for this block).
+          Publishing it would advertise a spec with no data behind it, so the
+          whole block is withdrawn instead;
+        * not claimed + captured -> **fail** too: there is no location to write
+          those bytes to, and the announcement and the capture disagreeing is a
+          contract violation, not something to paper over.
+        """
+        skipped: Set[int] = set()
+        failed: Set[int] = set()
+        for i in range(n):
+            claimed = remote_uris[i] is not None
+            captured = staged_slots[i] is not None
+            if captured and claimed:
+                continue
+            if not captured and not claimed:
+                skipped.add(i)
+                continue
+            failed.add(i)
+            logger.warning(
+                "save group %s: block %d %s; failing it instead of publishing "
+                "a hole",
+                group.spec_name,
+                i,
+                "was announced without captured bytes (withheld capture?)"
+                if claimed
+                else "has captured bytes but no announced location",
+            )
+        if skipped:
+            logger.debug(
+                "save group %s: %d/%d windowed blocks had no window data "
+                "(nothing published for them)",
+                group.spec_name,
+                len(skipped),
+                n,
+            )
+        return skipped, failed
+
+    def _save_staged_blocks(
+        self,
+        group: TransferGroup,
+        remote_uris: List[Optional[str]],
+        staged_slots: List[Optional[int]],
+        valid: List[int],
+        ok_mask: List[Optional[bool]],
+    ) -> None:
+        """Write the bytes the eager capture already gathered into the arena.
+
+        The captured slots are already owned by this request (held since the
+        capture step), so nothing is acquired here and nothing is copied: each
+        block's SDK buffer points straight at its captured slot. The capture's
+        gather was synchronized before it returned, so the bytes are visible to
+        the SDK thread -- no stream dance is needed either (the save side's
+        ``ready_event`` exists for the late gather, which this path has none
+        of).
+
+        Slots go back to the pool once their block has really been written: a
+        failed transfer keeps them, because the manager will hand those blocks
+        out again as "new" and the captured bytes are the only copy left (the
+        engine's window moved on). Whatever is still held when the request
+        retires is released there.
+        """
+        pool = self._pools[group.spec_name]
+        uris = [remote_uris[i] for i in valid]
+        assert all(uri is not None for uri in uris), (
+            f"group {group.spec_name}: staged save batch contains a block "
+            f"without a location; _staged_dispositions must have failed it"
+        )
+        buffers = [
+            self._block_buffer(
+                pool.slot_base_ptr(staged_slots[i]),  # ty: ignore[invalid-argument-type]
+                group.per_block_bytes,
+            )
+            for i in valid
+        ]
+        result = self._transfer_client.SaveKvCaches(uris, buffers)
+        ok = result[0] == kvcm_py_client.ClientErrorCode.ER_OK
+        if ok:
+            for i in valid:
+                pool.release(staged_slots[i], 1)  # ty: ignore[invalid-argument-type]
+        else:
+            logger.warning(
+                "save task failed group=%s uris=%d result=%s; the captured "
+                "bytes stay in the arena for the manager's retry",
+                group.spec_name,
+                len(uris),
+                result,
+            )
+        for i in valid:
+            ok_mask[i] = ok
 
     def _save_dispositions(
         self,
@@ -667,7 +918,8 @@ class DataTransferManager:
 
         Asymmetric with the save side on purpose: on load, a null target means
         vLLM does not *need* this group's data for that block (in mamba "align"
-        mode only the block ending the reused prefix needs its state), so the
+        mode only the block ending the reused prefix needs its state, and a
+        windowed group's targets outside the window are the null block), so the
         block is skipped whatever the manager published. The reverse -- a real
         target with nothing published -- is a genuine failure: the request would
         run on an unwritten state.
@@ -675,13 +927,27 @@ class DataTransferManager:
         if isinstance(group, AttentionTransferGroup):
             missing = sum(uri is None for uri in remote_uris)
             if missing:
-                logger.warning(
-                    "load group %s: %d/%d attention blocks have no "
-                    "location, failing them",
-                    group.spec_name,
-                    missing,
-                    n,
-                )
+                if group.retention is None:
+                    logger.warning(
+                        "load group %s: %d/%d attention blocks have no "
+                        "location, failing them",
+                        group.spec_name,
+                        missing,
+                        n,
+                    )
+                else:
+                    # Windowed group: a block without a published location is
+                    # one whose window was already gone when it was announced,
+                    # so its targets must be null slots (skipped). A real target
+                    # without a location is a clamp violation and is failed
+                    # right below.
+                    logger.debug(
+                        "load group %s: %d/%d windowed blocks have no published "
+                        "location (window already gone at save time)",
+                        group.spec_name,
+                        missing,
+                        n,
+                    )
             return set()
         # State tasks always carry block ids (see _iter_task_chunks).
         skipped = {i for i in range(n) if block_ids[i] == 0}  # ty: ignore[not-subscriptable]
@@ -827,6 +1093,8 @@ class DataTransferManager:
         remote_uris: List[Optional[str]],
         block_token_indices: Optional[List[List[int]]],
         block_ids: Optional[List[int]],
+        staged_slots: Optional[List[Optional[int]]] = None,
+        null_rows: Optional[List[Optional[NullBlockRow]]] = None,
     ) -> None:
         """Load one group's manager blocks from storage into HBM.
 
@@ -835,7 +1103,15 @@ class DataTransferManager:
         data for this group's spec. A state group's block is skipped only when
         vLLM's target is the null block *and* nothing was published -- i.e. the
         state is neither needed nor available. Everything else must transfer.
+
+        ``null_rows`` (windowed groups, see NullBlockRow) adds the load-side
+        zero-page rule: rows whose target is vLLM's null block are never
+        written, and a manager block whose every row is null is skipped --
+        vLLM does not allocate windowed slots outside the window, so there is
+        nothing to restore there. ``staged_slots`` belongs to the save side and
+        is accepted only to keep the task signatures uniform.
         """
+        del staged_slots
         n = len(remote_uris)
         # Single exit, as in save_task: an escaping exception would silently
         # swallow the MultiResult callback, which under the connector's
@@ -843,6 +1119,22 @@ class DataTransferManager:
         ok_mask = [False] * n
         try:
             skipped = self._load_skipped_blocks(group, remote_uris, block_ids, n)
+            if null_rows is not None:
+                all_null = {
+                    i
+                    for i in range(n)
+                    if null_rows[i] is not None
+                    and null_rows[i].source_row is None  # ty: ignore[unresolved-attribute]
+                }
+                if all_null:
+                    logger.debug(
+                        "load group %s: %d/%d blocks target only null slots "
+                        "(nothing to restore)",
+                        group.spec_name,
+                        len(all_null),
+                        n,
+                    )
+                skipped |= all_null
             # A block we must restore but nothing was published for cannot be
             # loaded; fail it without letting it shift the staging batch.
             failed = {
@@ -852,7 +1144,7 @@ class DataTransferManager:
             ok_mask = [None if i in skipped else False for i in range(n)]
             if valid:
                 ok = self._load_valid_blocks(
-                    group, remote_uris, block_token_indices, block_ids, valid
+                    group, remote_uris, block_token_indices, block_ids, valid, null_rows
                 )
                 for i in valid:
                     ok_mask[i] = ok
@@ -872,6 +1164,7 @@ class DataTransferManager:
         block_token_indices: Optional[List[List[int]]],
         block_ids: Optional[List[int]],
         valid: List[int],
+        null_rows: Optional[List[Optional[NullBlockRow]]] = None,
     ) -> bool:
         pool = self._pools[group.spec_name]
         start = pool.acquire(len(valid))
@@ -895,6 +1188,25 @@ class DataTransferManager:
                     # memory directly over PCIe; no device-side staging copy.
                     if isinstance(group, AttentionTransferGroup):
                         view = self._attn_staging_view(cpu_buffer, group, len(valid))
+                        if null_rows is not None:
+                            # Rows whose target is vLLM's null block carry no
+                            # data of their own (those tokens are outside the
+                            # window): their token slots already point at a row
+                            # that does get loaded, so this copies that row's
+                            # bytes over them. The scatter then writes the same
+                            # correct value twice, and the shared null block
+                            # stays untouched.
+                            for out_i, i in enumerate(valid):
+                                alias = null_rows[i]
+                                if alias is not None:
+                                    assert alias.source_row is not None, (
+                                        f"group {group.spec_name}: block {i} has "
+                                        f"no real row to alias its null rows onto; "
+                                        f"_load_valid_blocks must not see it"
+                                    )
+                                    view[out_i, :, alias.rows, :] = view[
+                                        out_i, :, alias.source_row, :
+                                    ]
                         batch_gather_scatter_helper.batch_scatter_kv_caches(
                             group.kvcache_ptr_tensor_gpu,
                             view,
