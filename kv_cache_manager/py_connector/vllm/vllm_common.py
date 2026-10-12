@@ -7,16 +7,17 @@ the kv_cache_config parsing. The two cores (scheduler_core / worker_core)
 and the thin connector shell (v1_connector) build on this module; nothing
 here may import them.
 
-Every accepted MLA layout is one latent row per token; the refusals below say
-why the rest are refused. Compressed MLA is a documented extension point, not a
-missing check: supporting it needs three dimensions this data model does not
-carry yet -- rows per block (spec.storage_block_size), tokens per row (the
-spec's tokens per stored state) and slots per block -- plus a manager block that
-stays a whole number of rows (mbs % tokens_per_state == 0); vLLM addresses a
-compressed row by (storage block number, row within the storage block) (see
-get_compressed_slot_mapping), never by token. vLLM renamed that field on the way
-to 0.31 (MLAAttentionSpec.compress_ratio -> AttentionSpec.tokens_per_state), so
-every read goes through the era-safe _tokens_per_state below.
+A compressed MLA cache (tokens_per_state > 1, the DeepSeek V4.1 main/indexer
+layers) stores one latent row per several tokens: vLLM addresses such a row by
+(storage block, row within it) and never by token. The data model carries that
+as RowGranularMeta -- tokens per row, rows per page, bytes per row -- plus the
+two arithmetic preconditions the mapping needs (mbs % tokens_per_state == 0 so
+a manager block stays a whole number of rows, block_size % tokens_per_state ==
+0 so a block-table entry does too). vLLM renamed the field on the way to 0.31
+(MLAAttentionSpec.compress_ratio -> AttentionSpec.tokens_per_state), so every
+read goes through the era-safe _tokens_per_state below; the layouts this file
+still refuses (fractional pooling, nvfp4_ds_mla, non-replayed windowed MLA) are
+refused by name, not by accident.
 """
 
 from dataclasses import dataclass, field
@@ -251,6 +252,29 @@ def spec_group_plan(
     return declared, table
 
 
+def _check_packed_groups_announceable(group_metas: List["GroupMeta"]) -> None:
+    """Refuse the packed-group + sparse-coverage combination (see
+    build_spec_groups): the scheduler's folded view cannot name the extra
+    buckets of a packed group."""
+    seen: set = set()
+    packed: List[int] = []
+    for meta in group_metas:
+        if meta.group_idx in seen and meta.group_idx not in packed:
+            packed.append(meta.group_idx)
+        seen.add(meta.group_idx)
+    if packed:
+        raise NotImplementedError(
+            f"vLLM group(s) {packed} carry several transfer buckets "
+            f"(packed layouts) while this instance also declares per-block "
+            f"spec coverage (windowed or recurrent-state groups). The "
+            f"scheduler's view of a packed group is folded to one sub spec, so "
+            f"the coverage can never name the extra buckets "
+            f"(_b1, _b2, ...) and the manager would allocate no location for "
+            f"them: every save of those buckets would fail. "
+            f"TairKvCacheConnector cannot serve this combination"
+        )
+
+
 def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict]:
     """LocationSpecGroups describing which specs a block may carry.
 
@@ -272,8 +296,25 @@ def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict
     Models with nothing to be sparse about declare no groups at all, which
     keeps their requests byte-identical to before (and compatible with managers
     that predate spec groups).
+
+    A packed group (several buckets for one vLLM group) cannot be described
+    this way, because the *scheduler* view is folded: the engine hands the
+    scheduler one sub spec per UniformTypeKVCacheSpecs group
+    (generate_scheduler_kv_cache_config keeps the first member), so the names
+    the scheduler can announce are the bare ones -- the extra buckets
+    (``tp0_g7_b1`` ...) are unnameable there. Announcing a coverage without
+    them would tell the manager those buckets' bytes do not exist while the
+    worker still has them, and every save of such a block would fail: the
+    configuration cannot work, so it is refused here (worker-side registration,
+    before any request) instead of degrading at runtime. Without a declared
+    group the announcement carries no names at all and the manager stores every
+    registered spec, which is what a packed group needs -- so a packed group is
+    only a problem together with the sparse (state / windowed) dimensions.
     """
-    return spec_group_plan(group_metas, tp_size)[0]
+    declared, _ = spec_group_plan(group_metas, tp_size)
+    if declared:
+        _check_packed_groups_announceable(group_metas)
+    return declared
 
 
 @dataclass(frozen=True)
@@ -331,6 +372,31 @@ class WindowRetention:
 
 
 @dataclass(frozen=True)
+class RowGranularMeta:
+    """How a compressed attention bucket's rows map onto tokens and pages.
+
+    vLLM stores one latent row per ``tokens_per_row`` tokens when the spec's
+    tokens_per_state (``compress_ratio`` on vllm <= 0.28) is above 1 -- the
+    DeepSeek V4.1 main and indexer layers -- and addresses such a row by
+    (storage block, row within it), never by token. One kernel block (SM90: 64
+    tokens, SM100 family: 128) is one page, so a page holds ``rows_per_page``
+    rows of ``bytes_per_row`` bytes each (per layer).
+
+    The two arithmetic preconditions are asserted where the meta is built: the
+    manager block size must be a whole number of rows (mbs % tokens_per_row)
+    and so must a block-table entry (block_size % tokens_per_row, checked by
+    the gate), or the block table would address half a row.
+    """
+
+    # spec.tokens_per_state / spec.compress_ratio (validated int >= 2).
+    tokens_per_row: int
+    # Rows in one compact page (vLLM's num_states): spec.block_size // tps.
+    rows_per_page: int
+    # Compact bytes of one row of one layer (spec's num_heads x state cell).
+    bytes_per_row: int
+
+
+@dataclass(frozen=True)
 class AttentionGroupMeta(GroupMeta):
     """Attention bucket: token-granular KV, re-blockable to the manager block
     size. Sizing derives from the *compact* page size (see parse_groups)."""
@@ -345,6 +411,10 @@ class AttentionGroupMeta(GroupMeta):
     # windowed-only branch (eager capture, null disposition, hit clamping)
     # keys on this field so full-attention groups keep their exact old path.
     retention: Optional[WindowRetention] = field(default=None, kw_only=True)
+    # None = one storage row per token (every bucket before V4.1). Not None =
+    # the compressed contract: the address math and the staging geometry work
+    # in rows, not tokens (see RowGranularMeta).
+    row_granular: Optional[RowGranularMeta] = field(default=None, kw_only=True)
 
     # The page element type (spec.dtype): one instance may mix them (V3.2 bf16
     # main + uint8 indexer), and the staging pool keys by it, so the bucket, not
@@ -498,7 +568,8 @@ def _tokens_per_state(spec: Any) -> Tuple[Any, str]:
     from ``tokens_per_state`` first -- the newer spelling.
 
     Missing attributes read as 1: vLLM 0.14 predates both fields and has no
-    compressed MLA either.
+    compressed MLA either. The value is used by the gate (validated) and by the
+    bucketing (one geometry per (page, head geometry, tokens per row) triple).
     """
     tokens_per_state = getattr(spec, "tokens_per_state", 1)
     if tokens_per_state != 1:
@@ -509,17 +580,40 @@ def _tokens_per_state(spec: Any) -> Tuple[Any, str]:
     return 1, "tokens_per_state"
 
 
-def _check_mla_structure(origin: str, spec: "MLAAttentionSpec") -> Tuple[Any, str]:
+def _mla_layout_triple(spec: Any) -> str:
+    """The (cache_dtype_str, geometry, tokens_per_state) triple of a refusal
+    message: what the layout *is*, not merely that it is unknown."""
+    tokens_per_state, field = _tokens_per_state(spec)
+    return (
+        f"cache_dtype_str={getattr(spec, 'cache_dtype_str', None)!r}, "
+        f"head_size={getattr(spec, 'head_size', None)}, "
+        f"block_size={getattr(spec, 'block_size', None)}, "
+        f"{field}={tokens_per_state}"
+    )
+
+
+def _check_mla_structure(origin: str, spec: "MLAAttentionSpec") -> Tuple[int, str]:
     """Refuse the tokens-per-state / model_version combinations vLLM's own size
     algebra cannot represent, reading raw fields only (never
-    storage_block_size / real_page_size_bytes / page_size_bytes): a ratio
-    below 1 divides by zero, one that does not divide block_size would be
-    floored silently, and an unknown model_version has no algebra at all.
-    Returns the validated (tokens per stored row, the field it came from).
+    storage_block_size / real_page_size_bytes / page_size_bytes): a fractional
+    ratio stores more states than tokens (and divides by zero on the way), and a
+    ratio that does not divide block_size would be floored silently. Returns the
+    validated (tokens per stored row, the field it came from).
 
-    Supporting a compressed layout (> 1) is a documented extension point,
-    see the module docstring."""
+    ``tokens_per_state > 1`` is a *supported* layout (see RowGranularMeta), so
+    the only refusals left here are ratios no row granularity can describe.
+    """
     tokens_per_state, field = _tokens_per_state(spec)
+    if isinstance(tokens_per_state, bool) or not isinstance(tokens_per_state, int):
+        # whisper_causal's Fraction(1, block_pool_size) pools several states
+        # into one token: the row unit is smaller than a token, so neither the
+        # manager block nor the block table stays a whole number of rows.
+        raise NotImplementedError(
+            f"{origin}: MLAAttentionSpec {field}={tokens_per_state} must be a "
+            f"whole number >= 1 of tokens per stored row (a fractional ratio "
+            f"pools states the row-granular transfer model cannot address); "
+            f"refusing to size it ({_mla_layout_triple(spec)})"
+        )
     if tokens_per_state < 1:
         raise NotImplementedError(
             f"{origin}: MLAAttentionSpec {field}={tokens_per_state} is "
@@ -543,17 +637,20 @@ def _check_mla_structure(origin: str, spec: "MLAAttentionSpec") -> Tuple[Any, st
 def _check_mla_variant(
     origin: str, spec: "MLAAttentionSpec", *, calculate_kv_scales: bool
 ) -> None:
-    """Gate one MLAAttentionSpec to the token-granular layouts the transfer
-    path supports, by the (cache_dtype_str, kv_quant_mode) pair, after the
+    """Gate one MLAAttentionSpec to the latent layouts the transfer path
+    supports, by the (cache_dtype_str, kv_quant_mode) pair, after the
     structural check (_check_mla_structure) that guarantees the ratio is
     usable.
 
-    Accepted (one latent row per token, self-contained bytes):
+    Accepted (self-contained bytes; one row per token, or one row per
+    ``tokens_per_state`` tokens in the row-granular case, see
+    RowGranularMeta):
 
-    * "fp8_ds_mla" (DeepSeek V3.2/V4 main layers): a packed 656/584 B layout
-      whose fp8 scale lives *inside* each row, so a verbatim round trip keeps
-      it. kv_quant_mode is FP8_PER_TENSOR there -- that alone must not refuse
-      it (a naive quant gate would make every real V3.2 main layer unreachable);
+    * "fp8_ds_mla" (DeepSeek V3.2/V4 main layers): a packed 656/584 B layout,
+      compressed or not, whose fp8 scale lives *inside* each row, so a verbatim
+      round trip keeps it. kv_quant_mode is FP8_PER_TENSOR there -- that alone
+      must not refuse it (a naive quant gate would make every real V3.2 main
+      layer unreachable);
     * None/auto/float16/bfloat16 with kv_quant_mode NONE: the plain latent
       cache (GLM, indexer layers, bf16 V3.2 main);
     * "fp8"/"fp8_e4m3"/"fp8_e5m2" with kv_quant_mode FP8_PER_TENSOR:
@@ -564,27 +661,25 @@ def _check_mla_variant(
       dtype string alone defines the layout, so the consistency rules are
       skipped, not failed.
 
-    Refused: compression (a row spans several tokens, and DeepSeek V4 reads
-    those rows together with its sliding-window and compressor-state groups,
-    so a partial transfer would silently corrupt reuse), per-token-head /
-    NVFP4 modes (their scales sit in the page budget but outside the
-    transferred rows), unknown cache_dtype_str, and (cds, kv_quant_mode) pairs
-    vLLM cannot produce -- guessing a scale layout is worse than refusing.
+    Refused by name: "nvfp4_ds_mla" (the SM100-only NVFP4 record layout, 288 B
+    per row for the V4.1 record and 352 B for the V3.2 one -- a layout the
+    connector would have to size from a page algebra it does not implement),
+    per-token-head quant modes (their scales sit in the page budget but outside
+    the transferred rows), unknown cache_dtype_str, and (cds, kv_quant_mode)
+    pairs vLLM cannot produce -- guessing a scale layout is worse than
+    refusing.
     """
-    tokens_per_state, field = _check_mla_structure(origin, spec)
-    if tokens_per_state > 1:
-        raise NotImplementedError(
-            f"{origin}: MLAAttentionSpec {field}={tokens_per_state} stores "
-            f"one latent row per {tokens_per_state} tokens; DeepSeek V4 reads "
-            f"those compressed rows together with its sliding-window and "
-            f"compressor-state caches, which live in separate vLLM groups, and "
-            f"the connector must serve a request's KV groups as a whole -- "
-            f"compressed MLA KV is not supported by TairKvCacheConnector; "
-            f"supporting it needs a rows-per-block (storage_block_size) "
-            f"dimension this transfer model does not have"
-        )
+    _check_mla_structure(origin, spec)
     cache_dtype_str = getattr(spec, "cache_dtype_str", None)
     mode = _quant_mode(spec)
+    if cache_dtype_str == "nvfp4_ds_mla":
+        raise NotImplementedError(
+            f"{origin}: MLAAttentionSpec is the SM100-only NVFP4 record layout "
+            f"({_mla_layout_triple(spec)}): its rows are an NVFP4 cell with an "
+            f"in-row scale, 288 B for the V4.1 record and 352 B for the V3.2 "
+            f"one, which the connector neither sizes nor validates; "
+            f"nvfp4_ds_mla KV is not supported by TairKvCacheConnector"
+        )
     if cache_dtype_str == "fp8_ds_mla":
         if _has_quant_mode(spec) and mode != _QUANT_FP8_PER_TENSOR:
             raise NotImplementedError(
@@ -743,16 +838,15 @@ def _check_attention_spec_supported(
     request is alive (vLLM frees or rewrites them) *and* no data-plane
     mechanism for them exists yet:
 
-    * SlidingWindowMLASpec: windowed or replayed MLA state, coupled by V4 with
-      the compressed MLA group; vLLM rebuilds those rows on a hit
-      (bounded_replay is the 0.31 default), so the correct disposition is the
-      parse-time skip of the DSA work, not a windowed transfer;
+    * a windowed/replayed MLA layout that vLLM does *not* rebuild itself
+      (SlidingWindowMLASpec with bounded_replay off): it needs the windowed
+      retention contract, which this connector implements for the plain
+      windowed classes only. The replayed form never reaches this gate -- it is
+      skipped while parsing, because the engine regenerates those rows;
     * an undeclared subclass of *any* accepted class, windowed ones included;
     * MLAAttentionSpec with a window field: only reachable through the promote
       path, which drops the replay policy; its retention semantics belong to
-      the windowed-MLA work;
-    * compressed MLA (tokens_per_state, or compress_ratio on vllm <= 0.28, > 1):
-      one row spans several tokens.
+      the windowed-MLA work.
 
     Accepted with a retention (the windowed contract, see WindowRetention --
     these three carry the eager-capture / null-disposition / hit-clamp
@@ -765,7 +859,9 @@ def _check_attention_spec_supported(
     Accepted with ``None`` retention (full prefix, unchanged contract): the
     full-prefix classes (_FULL_PREFIX_SPEC_TYPES) and the MLA latent layouts
     (_MLA_SPEC_TYPES, which includes the HiddenStateCacheSpec marker of
-    extract_hidden_states -- it changes no layout of its own).
+    extract_hidden_states -- it changes no layout of its own), compressed
+    (tokens_per_state > 1, or compress_ratio on vllm <= 0.28) ones included:
+    their rows are whole and the row-granular mapping is exact (RowGranularMeta).
 
     Acceptance is by *exact* type, never by family: a subclass of an accepted
     class is a fresh claim about byte layout and retention (RSWASpec is
@@ -783,13 +879,15 @@ def _check_attention_spec_supported(
     if SlidingWindowMLASpec is not None and isinstance(spec, SlidingWindowMLASpec):
         raise NotImplementedError(
             f"{origin}: SlidingWindowMLASpec sliding_window="
-            f"{getattr(spec, 'sliding_window', None)} holds windowed or partial "
-            f"state, not the full prefix, and DeepSeek V4 couples it with the "
-            f"compressed MLA group; vLLM rebuilds those rows on a hit "
-            f"(bounded_replay defaults to on), so a windowed transfer would "
-            f"republish state the engine regenerates -- sliding-window / "
-            f"compressor-state MLA KV is not supported by TairKvCacheConnector "
-            f"(the correct disposition is the parse-time skip)"
+            f"{getattr(spec, 'sliding_window', None)} with bounded_replay="
+            f"{bool(getattr(spec, 'bounded_replay', False))} holds windowed or "
+            f"partial state, not the full prefix, and vLLM does not rebuild "
+            f"those rows on a hit: it needs the windowed retention contract, "
+            f"which this connector implements for the plain windowed classes "
+            f"only. The replayed form (bounded_replay on, the 0.31 default) is "
+            f"skipped while parsing instead -- sliding-window / compressor-state "
+            f"MLA KV is not supported by TairKvCacheConnector in the "
+            f"non-replayed form"
         )
     if isinstance(spec, SlidingWindowSpec):
         if type(spec) is not SlidingWindowSpec:
@@ -804,9 +902,8 @@ def _check_attention_spec_supported(
                 f"windowed layouts of {SlidingWindowSpec.__name__} only"
             )
         return _retention_of(spec)
-    if (
-        ChunkedLocalAttentionSpec is not None
-        and isinstance(spec, ChunkedLocalAttentionSpec)
+    if ChunkedLocalAttentionSpec is not None and isinstance(
+        spec, ChunkedLocalAttentionSpec
     ):
         if type(spec) is not ChunkedLocalAttentionSpec:
             raise NotImplementedError(
@@ -890,7 +987,7 @@ def _is_scratch_spec(spec: Any) -> bool:
     Both halves matter: a *cacheable* spec must never be skipped (that would be
     a silent hole), and a spec that is not cacheable but is still transferable
     through the ordinary contract is refused by the gate rather than dropped
-    (SlidingWindowMLASpec with bounded_replay).
+    (SlidingWindowMLASpec with bounded_replay off).
 
     The flags arrived with the specs they describe (prefix_cacheable and
     CircularBufferSpec in 0.29, uses_slot_mapping / has_layer_views and the
@@ -903,6 +1000,60 @@ def _is_scratch_spec(spec: Any) -> bool:
     return not getattr(spec, "uses_slot_mapping", True) or not getattr(
         spec, "has_layer_views", True
     )
+
+
+def _is_replayed_window(spec: Any) -> bool:
+    """Does vLLM itself rebuild this group's rows on a prefix-cache hit?
+
+    A SlidingWindowMLASpec with ``bounded_replay`` (the 0.31 default, which is
+    what DeepSeek V4.1 configures) keeps no reusable window state: the engine
+    replays the window tokens and the forward pass regenerates the rows, and it
+    pads exactly those slots in the prefix-cacheable groups. The two flags say
+    the same thing (``prefix_replay_tokens`` is the window it replays), and both
+    default to "not replayed" -- so an era without them refuses the spec instead
+    of skipping it (fail-closed, vllm 0.26 has the class but not the policy).
+    """
+    if not (
+        SlidingWindowMLASpec is not None and isinstance(spec, SlidingWindowMLASpec)
+    ):
+        return False
+    return bool(getattr(spec, "prefix_replay_tokens", 0)) or bool(
+        getattr(spec, "bounded_replay", False)
+    )
+
+
+def _skip_reason(spec: Any) -> Optional[str]:
+    """Why this group's KV is not transferable prefix data (None = transfer it).
+
+    Two shapes of "no prefix cache can serve this", both of which make vLLM
+    keep the group out of its own reuse machinery:
+
+    * the engine rebuilds the rows (a replayed window, see _is_replayed_window);
+    * per-request scratch (see _is_scratch_spec).
+
+    A wrapper (UniformTypeKVCacheSpecs) is judged member by member: skipping it
+    drops *every* member, so a group with even one cacheable, transferable
+    member must go through the gate (which then names the refused member)
+    rather than disappear.
+
+    The returned string is the operator-facing log line; the *decision* is the
+    absence of a string, so the two cannot drift.
+    """
+    members = (
+        list(spec.kv_cache_specs.values())
+        if UniformTypeKVCacheSpecs is not None
+        and isinstance(spec, UniformTypeKVCacheSpecs)
+        else [spec]
+    )
+    if members and all(_is_replayed_window(member) for member in members):
+        return (
+            "vLLM replays this window on a hit and rebuilds the group's rows "
+            "(SlidingWindowMLASpec bounded_replay): the bytes are neither "
+            "stable nor needed"
+        )
+    if _is_scratch_spec(spec):
+        return "per-request scratch, no prefix cache to serve from it"
+    return None
 
 
 def _is_engine_rebuilt_scratch(spec: Any) -> bool:
@@ -959,10 +1110,11 @@ def _compact_page_bytes(spec: Any, origin: str) -> int:
 
 class _BucketKey(NamedTuple):
     """Transfer-shape key of one sub spec: layers can share a bucket only if
-    their class, element type, page size, page stride and window retention all
-    agree (a packed group may legally mix e.g. full and R-SWA layers, and two
-    R-SWA layers may carry different windows: one bucket keeps one geometry
-    *and* one retention)."""
+    their class, element type, page size, page stride, row granularity and
+    window retention all agree (a packed group may legally mix e.g. full and
+    R-SWA layers, two R-SWA layers may carry different windows, and V4.1 packs
+    compressed (tokens_per_state 2) next to uncompressed layers: one bucket
+    keeps one geometry *and* one retention *and* one row size)."""
 
     class_name: str
     dtype_name: str
@@ -977,10 +1129,17 @@ class _BucketKey(NamedTuple):
     head_size_v: int
     # None = full prefix; not None = the bucket's windowed contract.
     retention: Optional[WindowRetention]
+    # spec.tokens_per_state (compress_ratio on vllm <= 0.28); 1 = one row per
+    # token. Equal page bytes do not imply equal row granularity: the SWA layer
+    # of a V4-style model (tps=1, block 32, 32 rows x 584 B) and a compressed
+    # main layer (tps=2, block 64, 32 rows x 584 B) are byte-identical tensors
+    # with different address math, so this dimension is what keeps them apart.
+    tokens_per_state: int
 
 
 def _bucket_key(spec: Any, origin: str) -> _BucketKey:
     head_size = getattr(spec, "head_size", 0)
+    tokens_per_state, _field = _tokens_per_state(spec)
     return _BucketKey(
         class_name=type(spec).__name__,
         dtype_name=str(getattr(spec, "dtype", None)),
@@ -990,20 +1149,21 @@ def _bucket_key(spec: Any, origin: str) -> _BucketKey:
         head_size=head_size,
         head_size_v=getattr(spec, "head_size_v", None) or head_size,
         retention=_retention_of(spec),
+        tokens_per_state=tokens_per_state if isinstance(tokens_per_state, int) else 1,
     )
 
 
 def _bucket_order(
     key: _BucketKey,
-) -> Tuple[int, str, str, int, int, int, int, str, int, int]:
+) -> Tuple[int, str, str, int, int, int, int, str, int, int, int]:
     """Total order over the buckets of one group: biggest page first (so the
     main layer of a packed group keeps the bare group name), then class,
-    dtype, head geometry, pad and window retention. Only spec-local fields
-    enter, so the suffixes -- and with them the wire names -- are a pure
-    function of the bucket *set*: layer registration order, or a different
-    layer order on another rank, cannot move them. For a model with no
-    windowed layer every retention is None and the tail of the key is
-    constant, so old bucket sets order exactly as before."""
+    dtype, head geometry, pad, window retention and row granularity. Only
+    spec-local fields enter, so the suffixes -- and with them the wire names --
+    are a pure function of the bucket *set*: layer registration order, or a
+    different layer order on another rank, cannot move them. For a model with
+    no windowed and no compressed layer every retention is None and every
+    tokens_per_state is 1, so old bucket sets order exactly as before."""
     retention = key.retention
     return (
         -key.page_bytes,
@@ -1016,6 +1176,7 @@ def _bucket_order(
         retention.kind if retention is not None else "",
         retention.window_tokens if retention is not None else -1,
         retention.extra_retained_tokens if retention is not None else -1,
+        key.tokens_per_state,
     )
 
 
@@ -1029,30 +1190,68 @@ def _attention_meta(
     origin: str,
     retention: Optional[WindowRetention] = None,
 ) -> AttentionGroupMeta:
-    """Size one attention bucket from its spec. The gate already refused a
-    spec whose tokens_per_state (compress_ratio on vllm <= 0.28) is above 1, so
-    one token is one storage row and the per-token byte size is exact:
-    compact_page_bytes / block_size.
+    """Size one attention bucket from its spec.
+
+    One compact page holds the whole block-table entry, ``block_size //
+    tokens_per_state`` rows of ``page_bytes // rows`` bytes each, so the byte
+    size of a manager block is exact in *rows*:
+
+        per_block_bytes = bytes_per_row * (mbs // tps) * layers
+
+    With tokens_per_state == 1 (every bucket before the V4.1 compressed rows)
+    this is exactly the historical ``page_bytes // block_size * mbs * layers``
+    -- one token per row, one row per token. The two divisions are assertions,
+    not rounds: a page that is not a whole number of rows, or a manager block
+    that is not, would silently floor into a layout nobody allocated.
 
     ``retention`` is the gate's verdict for this bucket (None = full prefix)."""
     page_bytes = _compact_page_bytes(spec, origin)
-    if page_bytes % spec.block_size != 0:
+    tokens_per_row, _field = _tokens_per_state(spec)
+    if not isinstance(tokens_per_row, int) or tokens_per_row < 1:
+        # The gate refuses these; keep the sizing honest if it is ever bypassed.
+        raise NotImplementedError(
+            f"{origin}: tokens_per_state={tokens_per_row} is not a whole "
+            f"number of tokens per row; cannot size the block"
+        )
+    if spec.block_size % tokens_per_row:
+        raise NotImplementedError(
+            f"{origin}: block_size={spec.block_size} is not divisible by "
+            f"tokens_per_state={tokens_per_row}; a block-table entry would not "
+            f"hold a whole number of rows"
+        )
+    rows_per_page = spec.block_size // tokens_per_row
+    if page_bytes % rows_per_page != 0:
         raise NotImplementedError(
             f"{origin}: compact page size {page_bytes} is not a multiple of "
-            f"block_size {spec.block_size}; refusing to floor the per-token "
-            f"byte size"
+            f"the {rows_per_page} rows a page holds; refusing to floor the "
+            f"per-row byte size"
         )
+    if manager_block_size % tokens_per_row:
+        raise NotImplementedError(
+            f"{origin}: manager block size {manager_block_size} is not "
+            f"divisible by tokens_per_state={tokens_per_row}; a manager block "
+            f"would not hold a whole number of rows"
+        )
+    bytes_per_row = page_bytes // rows_per_page
+    rows_per_block = manager_block_size // tokens_per_row
     return AttentionGroupMeta(
         group_idx=group_idx,
         layer_names=list(layer_names),
         block_size=spec.block_size,
-        per_block_bytes=(page_bytes // spec.block_size)
-        * manager_block_size
-        * len(layer_names),
+        per_block_bytes=bytes_per_row * rows_per_block * len(layer_names),
         spec_suffix=suffix,
         page_bytes=page_bytes,
         dtype=getattr(spec, "dtype", None),
         retention=retention,
+        row_granular=(
+            None
+            if tokens_per_row == 1
+            else RowGranularMeta(
+                tokens_per_row=tokens_per_row,
+                rows_per_page=rows_per_page,
+                bytes_per_row=bytes_per_row,
+            )
+        ),
     )
 
 
@@ -1218,15 +1417,25 @@ def parse_groups(
     runtime-calibrated scale layout pass as a plain fp8 one.
 
     Groups that carry nothing the manager may cache are skipped instead of
-    refused -- EAGLE/MTP drafters (vLLM marks them) and per-request scratch
-    (see _is_scratch_spec), plus the groups the engine keeps out of the
-    transfer contract (see _transferable_groups). A skipped group keeps its
-    vLLM block-table index, so its number is simply absent from the wire names.
+    refused -- EAGLE/MTP drafters (vLLM marks them), per-request scratch and
+    engine-replayed windows (both by _skip_reason, which also gives the log
+    line), plus the groups the engine keeps out of the transfer contract (see
+    _transferable_groups). A skipped group keeps its vLLM block-table index, so
+    its number is simply absent from the wire names.
 
     The two vLLM contracts differ, though, and a scratch group that the engine
     *does* expose for transfer (vLLM 0.29+ default: enable_kv_transfer=True) is
     refused rather than dropped: the engine rebuilds only the groups it owns,
     so an external hit would otherwise resume with that state uninitialized.
+    A UniformTypeKVCacheSpecs group is bucketed by *member*, in the worker's
+    view, because vLLM's merge decision does not look at the row granularity:
+    the V4.1 packed group holds compressed (tokens_per_state 2) and
+    uncompressed layers at once, which are different transfer geometries (see
+    RowGranularMeta and _BucketKey) and therefore different buckets. Buckets
+    that agree on their coverage (window retention included) fold losslessly
+    for the scheduler, which only ever sees one representative sub spec; a
+    packed group whose members *disagree* is refused by the folding guard
+    (_check_coverage_survives_folding).
     The one exception is scratch the engine itself rebuilds per request -- the
     compression ring (see _is_engine_rebuilt_scratch) -- which is skipped even
     when transferable.
@@ -1252,9 +1461,13 @@ def parse_groups(
                 "skip eagle group %d (%d layers)", idx, len(group.layer_names)
             )
             continue
-        if _is_scratch_spec(group.kv_cache_spec):
-            engine_rebuilt = _is_engine_rebuilt_scratch(group.kv_cache_spec)
-            if declares_projection and not engine_rebuilt:
+        skip_reason = _skip_reason(group.kv_cache_spec)
+        if skip_reason is not None:
+            if (
+                _is_scratch_spec(group.kv_cache_spec)
+                and declares_projection
+                and not _is_engine_rebuilt_scratch(group.kv_cache_spec)
+            ):
                 raise NotImplementedError(
                     f"group {idx}: {type(group.kv_cache_spec).__name__} is "
                     f"per-request scratch (prefix_cacheable=False) yet the engine "
@@ -1264,7 +1477,7 @@ def parse_groups(
                     f"has no transfer layout for it, so the instance is refused "
                     f"rather than resumed with uninitialized state"
                 )
-            if engine_rebuilt:
+            if _is_engine_rebuilt_scratch(group.kv_cache_spec):
                 logger.warning(
                     "skip %s group %d (%d layers): per-request compression ring, "
                     "refilled by the engine for every request (not prefix KV)",
@@ -1283,6 +1496,14 @@ def parse_groups(
                     idx,
                     len(group.layer_names),
                 )
+            logger.warning(
+                "skip %s group %d (%d layers): %s; if this class is meant to "
+                "be cached, name it in vllm_common.py instead",
+                type(group.kv_cache_spec).__name__,
+                idx,
+                len(group.layer_names),
+                skip_reason,
+            )
             continue
         metas.extend(
             _parse_group(

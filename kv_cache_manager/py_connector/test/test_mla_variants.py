@@ -23,9 +23,9 @@ from unittest import mock
 from kv_cache_manager.py_connector.test import vllm_stubs  # noqa: F401 (stubs)
 from kv_cache_manager.py_connector.test.mla_variant_facts import (
     ACCEPTED,
+    ACCEPTED_ROW_GRANULAR,
     FROZEN,
     FROZEN_GROUPS,
-    REJECTED_COMPRESSED,
     REJECTED_INVALID,
     REJECTED_QUANTIZED,
     REJECTED_WINDOW,
@@ -194,6 +194,48 @@ class TestMLASizeTranslation(unittest.TestCase):
                 metas = _parse([_group(_spec(row), layers=("l0", "l1"))], mbs=mbs)
                 self.assertEqual(metas[0].per_block_bytes, row_bytes * mbs * 2)
                 self.assertEqual(metas[0].per_block_bytes % (row_bytes * 2), 0)
+
+    def test_row_granular_size_and_mapping_over_the_compressed_family(self):
+        # A13 for tokens_per_state > 1 (PR6): the row is the unit. One page is
+        # rows_per_page rows of bytes_per_row, a manager block is
+        # mbs // compress_ratio rows, and the row count the block table's entry
+        # covers must be a whole number (block_size % ratio == 0, which is also
+        # why vLLM floors it silently without this gate).
+        for row in ACCEPTED_ROW_GRANULAR:
+            with self.subTest(variant=row):
+                facts = FROZEN[row]
+                mbs = facts["mbs"]
+                ratio = facts["compress_ratio"]
+                row_bytes = facts["bytes_per_row"]
+                rows_per_page = facts["rows_per_page"]
+                self.assertEqual(
+                    facts["real_page_size_bytes"], rows_per_page * row_bytes
+                )
+                metas = _parse([_group(_spec(row), layers=("l0", "l1"))], mbs=mbs)
+                meta = metas[0]
+                self.assertEqual(meta.row_granular.tokens_per_row, ratio)
+                self.assertEqual(meta.row_granular.rows_per_page, rows_per_page)
+                self.assertEqual(meta.row_granular.bytes_per_row, row_bytes)
+                self.assertEqual(meta.per_block_bytes, row_bytes * (mbs // ratio) * 2)
+                # The pre-PR per-token formula agreed for the V4.1-shaped rows
+                # (bytes_per_row divisible by the ratio: the hole PR1 closed
+                # was a *silent* acceptance, the one PR6 closes is the address
+                # math, see test_dsa_v41) and *under*-sized the rest -- m2b2's
+                # 1168 B page over a 256-token block floors to 1024 B/block.
+                legacy = meta.page_bytes // meta.block_size * mbs * 2
+                if row_bytes % ratio == 0:
+                    self.assertEqual(meta.per_block_bytes, legacy)
+                else:
+                    self.assertLess(legacy, meta.per_block_bytes)
+
+    def test_a_token_granular_bucket_carries_no_row_metadata(self):
+        # The other half of the contract: with one row per token the meta is
+        # None, so the row-granular branches are unreachable for every model
+        # that transferred before PR6 (full attention, V3.2, GLM).
+        for row in ACCEPTED:
+            with self.subTest(variant=row):
+                metas = _parse([_group(_spec(row))], mbs=FROZEN[row]["mbs"])
+                self.assertIsNone(metas[0].row_granular)
 
 
 class TestUniformGroupBuckets(unittest.TestCase):
@@ -453,23 +495,77 @@ class TestMLAVariantGate(unittest.TestCase):
         metas = _parse([_group(spec)], mbs=64)
         self.assertEqual(metas[0].per_block_bytes, 576 * 64)
 
-    def test_compressed_mla_is_refused_with_the_v4_coupling_reason(self):
-        # D2a: the ratio is named, and the reason is V4's multi-group coupling
-        # -- the compressed rows are read with the SWA / compressor-state
-        # caches, so a request's KV groups go as a whole.
-        for row in REJECTED_COMPRESSED:
+    def test_compressed_mla_is_accepted_as_a_row_granular_bucket(self):
+        # D2a revisited by PR6: the layout is supported, so the acceptance is
+        # what needs pinning now -- one row per compress_ratio tokens, exact
+        # rows, and the same "V4 groups are one request's KV" reasoning carried
+        # by the *gate* only for the shapes that stay out (see D5).
+        for row in ACCEPTED_ROW_GRANULAR:
             with self.subTest(variant=row):
                 facts = FROZEN[row]
                 ratio = facts["compress_ratio"]
-                message = self._refusal(_spec(row), mbs=facts["mbs"])
-                self.assertIn("MLAAttentionSpec", message)
-                self.assertIn(f"compress_ratio={ratio}", message)
-                self.assertIn(f"one latent row per {ratio} tokens", message)
-                self.assertIn("sliding-window and", message)
-                self.assertIn("compressor-state", message)
-                self.assertIn("separate vLLM groups", message)
-                self.assertIn("as a whole", message)
-                self.assertIn("rows-per-block", message)
+                metas = _parse([_group(_spec(row))], mbs=facts["mbs"])
+                meta = metas[0]
+                self.assertIsInstance(meta, AttentionGroupMeta)
+                self.assertIsNone(meta.retention)  # full prefix, no window
+                self.assertEqual(meta.row_granular.tokens_per_row, ratio)
+                self.assertEqual(
+                    meta.row_granular.rows_per_page,
+                    facts["kwargs"]["block_size"] // ratio,
+                )
+                self.assertEqual(
+                    meta.row_granular.bytes_per_row, facts["bytes_per_row"]
+                )
+                self.assertEqual(meta.per_block_bytes, facts["per_block_bytes"])
+
+    def test_nvfp4_ds_mla_is_refused_by_name_with_the_layout_triple(self):
+        # PR6: the one cache_dtype_str that is *named* as unsupported instead of
+        # falling through to "not a layout this connector knows" -- the SM100
+        # NVFP4 record is a real layout (288 B/row for V4.1), just not one this
+        # connector sizes or validates.
+        spec = _spec_from_kwargs(
+            dict(
+                block_size=64,
+                head_size=512,
+                dtype="uint8",
+                tokens_per_state=2,
+                state_content_bytes=288,
+                cache_dtype_str="nvfp4_ds_mla",
+                model_version="deepseek_v4",
+                kv_quant_mode="FP8_PER_TENSOR",
+            )
+        )
+        message = self._refusal(spec, mbs=64)
+        self.assertIn("nvfp4_ds_mla", message)
+        self.assertIn("288", message)
+        self.assertIn("tokens_per_state=2", message)
+        self.assertIn("head_size=512", message)
+        self.assertIn("TairKvCacheConnector", message)
+        self.assertNotIn("not a layout this connector knows", message)
+
+    def test_a_tps_spec_whose_manager_block_is_not_whole_rows_is_refused(self):
+        # The PR6 precondition: a manager block must stay a whole number of
+        # rows, or the block table would address half a row. mbs 528 (vLLM's
+        # merge block size) with tokens_per_state 32: the block itself divides
+        # (64 % 32 == 0) while the manager block does not.
+        spec = _spec_from_kwargs(
+            dict(
+                block_size=64,
+                head_size=512,
+                dtype="uint8",
+                tokens_per_state=32,
+                state_content_bytes=584,
+                cache_dtype_str="fp8_ds_mla",
+                model_version="deepseek_v4",
+                kv_quant_mode="FP8_PER_TENSOR",
+            )
+        )
+        message = self._refusal(spec, mbs=528)
+        self.assertIn("manager block size 528", message)
+        self.assertIn("tokens_per_state=32", message)
+        # A whole number of rows is fine (the same ratio at mbs 512).
+        metas = _parse([_group(spec)], mbs=512)
+        self.assertEqual(metas[0].per_block_bytes, 584 * 16)
 
     def test_negative_compress_ratio_is_refused_as_invalid(self):
         # A15/D9: c < 1 is not a compression at all -- vLLM would floor it into
@@ -494,16 +590,19 @@ class TestMLAVariantGate(unittest.TestCase):
     def test_non_divisible_compress_ratio_is_refused(self):
         # A16/D10: X2 floors 16 // 3 to 5 rows per block in vLLM's algebra, so
         # the row bytes would silently describe a layout nobody allocated.
+        # (PR6 keeps this refusal: a partial row cannot be addressed at all.)
         message = self._refusal(_spec("X2"), mbs=16)
         self.assertIn("block_size=16", message)
         self.assertIn("compress_ratio=3", message)
         self.assertIn("not divisible", message)
-        # The structural branch, not the compression description.
-        self.assertNotIn("one latent row per", message)
+        # The structural branch, not the row-granular acceptance path.
+        self.assertNotIn("whole number", message)
 
     def test_compress_ratio_above_the_block_size_is_refused(self):
         # A17/D11: 64 // 128 == 0 storage rows -- refused by the same
         # divisibility check, before any storage_block_size read.
+        # (The other division PR6 adds, mbs % tokens_per_state, is pinned in
+        # test_a_tps_spec_whose_manager_block_is_not_whole_rows.)
         spec = _spec_from_kwargs(
             dict(
                 block_size=64,
@@ -517,7 +616,7 @@ class TestMLAVariantGate(unittest.TestCase):
         self.assertIn("block_size=64", message)
         self.assertIn("compress_ratio=128", message)
         self.assertIn("not divisible", message)
-        self.assertNotIn("one latent row per", message)
+        self.assertNotIn("whole number", message)
 
     def test_unknown_model_version_is_refused(self):
         # D8: vLLM itself does not validate model_version (its own
@@ -536,24 +635,31 @@ class TestMLAVariantGate(unittest.TestCase):
         self.assertIn("model_version='bogus'", message)
         self.assertIn("not a layout this connector knows", message)
         self.assertIn('"deepseek_v4"', message)
-        self.assertNotIn("one latent row per", message)
+        self.assertNotIn("whole number", message)
 
-    def test_structure_is_checked_before_the_compression_refusal(self):
+    def test_structure_is_checked_before_the_row_granular_acceptance(self):
         # Ordering (03 section 4.1): 1.1/1.2/1.3 run before 1.4, so a c>1 spec
-        # with an unknown model_version reports the model_version, not the
-        # compression.
+        # with an unknown model_version reports the model_version -- the
+        # compressed row itself is accepted since PR6, the structure is not.
         spec = _spec_from_kwargs(dict(FROZEN["m2b"]["kwargs"], model_version="bogus"))
         message = self._refusal(spec, mbs=256)
         self.assertIn("model_version='bogus'", message)
-        self.assertNotIn("one latent row per", message)
+        self.assertNotIn("whole number", message)
 
-    def test_refusals_are_independent_of_calculate_kv_scales(self):
-        # The calibration gate only guards the per-tensor path: a compressed
-        # spec must fail for its own reason either way.
+    def test_the_calibration_gate_does_not_touch_the_compressed_rows(self):
+        # The calibration gate only guards the per-tensor fp8 path (the scales
+        # live outside the cached bytes there); a row-granular fp8_ds_mla
+        # carries its scale *inside* the row, so calculate_kv_scales is none of
+        # its business either way.
         for flag in (False, True):
             with self.subTest(calculate_kv_scales=flag):
-                message = self._refusal(_spec("m2b"), mbs=256, calculate_kv_scales=flag)
-                self.assertIn("compress_ratio", message)
+                metas = _parse(
+                    [_group(_spec("m2b"))], mbs=256, calculate_kv_scales=flag
+                )
+                self.assertEqual(metas[0].row_granular.tokens_per_row, 4)
+                self.assertEqual(
+                    metas[0].per_block_bytes, FROZEN["m2b"]["per_block_bytes"]
+                )
 
 
 class TestWindowedMLARefusals(unittest.TestCase):
@@ -571,8 +677,9 @@ class TestWindowedMLARefusals(unittest.TestCase):
         return str(ctx.exception)
 
     def test_swa_spec_names_window_prefix_and_coupling(self):
-        # D15: a V4 SWA spec (compress_ratio=4 in the fixture) is refused by
-        # class + window + coupling, never by the compressed-row wording.
+        # D15: a V4 SWA spec (compress_ratio=4 in the fixture, bounded_replay
+        # off) is refused by class + window + coupling, never by the row
+        # granularity it could carry.
         spec = _spec_from_kwargs(
             dict(
                 block_size=256,
@@ -589,10 +696,11 @@ class TestWindowedMLARefusals(unittest.TestCase):
         message = self._refusal(spec)
         self.assertIn("SlidingWindowMLASpec", message)
         self.assertIn("sliding_window=2048", message)
+        self.assertIn("bounded_replay=False", message)
         self.assertIn("not the full prefix", message)
         self.assertIn("compressor-state", message)
         self.assertIn("TairKvCacheConnector", message)
-        self.assertNotIn("one latent row per", message)
+        self.assertNotIn("whole number", message)
 
     def test_swa_group_refusal_names_the_layer(self):
         # D2b/D16: V4 wraps each SWA cache in its own UniformTypeKVCacheSpecs
@@ -632,14 +740,21 @@ class TestWindowedMLARefusals(unittest.TestCase):
                 self.assertIn("compressor-state MLA KV is not supported", message)
 
 
+#: The V4 tiny groups that carry windowed / partial state (everything but the
+#: compressed full group). These are what keeps V4.0 refused as an instance.
+V4_WINDOWED_GROUPS: List[str] = [row for row in V4_TINY_GROUPS if row != "v4_full_c4a"]
+
+
 class TestV4GroupFacts(unittest.TestCase):
-    """F3: the six V4 tiny groups as frozen from the golden, refused as a whole.
+    """F3: the six V4 tiny groups as frozen from the golden.
 
     vLLM builds the V4 tiny model into six packed groups (one full-MLA group,
     one SWA group per layer, two compressor-state groups) and folds each of
-    them to its *first* sub spec for the scheduler. Both role views must be
-    refused -- the connector serves a request's KV groups as a whole, so a
-    partial transfer (some groups stored, some skipped) is never an option.
+    them to its *first* sub spec for the scheduler. Since PR6 the compressed
+    full group itself transfers (one row per 4 or 128 tokens -- the same
+    row-granular layout V4.1 uses), but the *instance* is still refused: its
+    SWA and compressor-state groups hold windowed/partial state that this
+    connector never transfers, and it serves a request's KV groups as a whole.
     """
 
     def test_worker_view_reproduces_the_frozen_group(self):
@@ -651,11 +766,36 @@ class TestV4GroupFacts(unittest.TestCase):
                 self.assertEqual(sorted(wrapper.get_page_sizes()), facts["page_sizes"])
                 self.assertEqual(wrapper.page_size_bytes, facts["page_size_bytes"])
 
-    def test_every_group_has_a_refused_sub_spec(self):
-        # The option-A predicate: one refused sub spec per group refuses the
-        # instance. For the real V4 model *every* sub spec is refused, which is
-        # why the A and B cases have the same acceptance surface.
-        for row in V4_TINY_GROUPS:
+    def test_the_compressed_full_group_transfers_as_rows(self):
+        # PR6: the V4.0 full group is the same row-granular layout as V4.1's
+        # (one row per 4 or 128 tokens), so the *group* is supported -- what
+        # keeps V4.0 out is its windowed/compressor-state coupling, not the
+        # compressed rows themselves. Three page layouts, three buckets, each
+        # sized in rows.
+        facts = FROZEN_GROUPS["v4_full_c4a"]
+        _, group = _wrapper_group("v4_full_c4a")
+        metas = _parse([group], mbs=facts["mbs"])
+        self.assertEqual(len(metas), 3)
+        by_row = {meta.row_granular.tokens_per_row: meta for meta in metas}
+        self.assertEqual(sorted(by_row), [4, 128])
+        # Bucket order is page size descending (the bare name goes to the
+        # biggest page): m2b (37440 B padded / 37376 compact) first, then the
+        # indexer m2c, then the two-row block m2b2.
+        self.assertEqual(
+            [meta.per_block_bytes for meta in metas],
+            [
+                FROZEN["m2b"]["per_block_bytes"],
+                FROZEN["m2c"]["per_block_bytes"],
+                FROZEN["m2b2"]["per_block_bytes"],
+            ],
+        )
+        for meta in metas:
+            self.assertIsNone(meta.retention)
+
+    def test_every_windowed_group_has_a_refused_sub_spec(self):
+        # The option-A predicate: one refused sub spec refuses the group; for
+        # the V4 SWA / compressor-state groups *every* sub spec is refused.
+        for row in V4_WINDOWED_GROUPS:
             with self.subTest(group=row):
                 facts = FROZEN_GROUPS[row]
                 refused = [
@@ -665,6 +805,25 @@ class TestV4GroupFacts(unittest.TestCase):
                 ]
                 self.assertTrue(refused, f"{row}: no sub spec refused")
                 self.assertEqual(refused, [name for name, _ in facts["layers"]])
+
+    def test_the_v4_instance_is_refused_as_a_whole(self):
+        # V4.0 stays out (the design's permanent refusal): the full group is
+        # transferable now, the instance is not -- nine of its sub specs hold
+        # windowed/partial state, and a partial transfer (some groups stored,
+        # some dropped) is never an option.
+        groups = []
+        for row in V4_TINY_GROUPS:
+            _, group = _wrapper_group(row)
+            groups.append(group)
+        with self.assertRaises(NotImplementedError) as ctx:
+            _parse(groups, mbs=FROZEN_GROUPS["v4_full_c4a"]["mbs"])
+        message = str(ctx.exception)
+        state_layer = FROZEN_GROUPS["v4_state_wrapper_l1"]["layers"][0][0]
+        self.assertIn(f"layer {state_layer}", message)
+        self.assertIn("SlidingWindowMLASpec", message)
+        # ... and the group that *is* supported is named nowhere: the failure is
+        # about the windowed state, not about compression.
+        self.assertNotIn("compress_ratio=", message)
 
     @staticmethod
     def _refused(spec_row: str, layer_name: str) -> bool:
@@ -680,7 +839,7 @@ class TestV4GroupFacts(unittest.TestCase):
     def test_worker_view_refusal_names_the_first_offending_layer(self):
         # A11/D2a-c: the wrapper is gated layer by layer, so the message points
         # at the first refused sub spec -- never at the wrapper class only.
-        for row in V4_TINY_GROUPS:
+        for row in V4_WINDOWED_GROUPS:
             with self.subTest(group=row):
                 facts = FROZEN_GROUPS[row]
                 _, group = _wrapper_group(row)
@@ -696,7 +855,7 @@ class TestV4GroupFacts(unittest.TestCase):
         # P1/F3: the scheduler's folded spec (the first sub spec, all layer
         # names) refuses too, but its message has no layer context -- that is
         # the worker view's; the PR body states the wording difference.
-        for row in V4_TINY_GROUPS:
+        for row in V4_WINDOWED_GROUPS:
             with self.subTest(group=row):
                 facts = FROZEN_GROUPS[row]
                 wrapper, _ = _wrapper_group(row)
@@ -714,10 +873,9 @@ class TestV4GroupFacts(unittest.TestCase):
                 with self.assertRaises(NotImplementedError) as ctx:
                     _parse([folded], mbs=facts["mbs"])
                 message = str(ctx.exception)
-                if FROZEN[facts["sched_row"]].get("kind") == "swa":
-                    self.assertIn("SlidingWindowMLASpec", message)
-                else:
-                    self.assertIn("compress_ratio=", message)
+                # Every windowed group folds to an SWA sub spec (the full
+                # group is not in V4_WINDOWED_GROUPS any more).
+                self.assertIn("SlidingWindowMLASpec", message)
                 self.assertNotIn(layer_names[0], message)
 
 
@@ -726,8 +884,11 @@ class TestRefusedRowsStayRefused(unittest.TestCase):
     with its own reason -- and never with a ZeroDivisionError/AssertionError
     (the structural checks read raw fields before any derived page size)."""
 
+    # The compressed family is *accepted* since PR6 (see
+    # test_row_granular_size_and_mapping_over_the_compressed_family); these are
+    # the shapes that must stay out: quantized modes, the non-replayed windowed
+    # MLA, and ratios that cannot describe whole rows.
     CASES = (
-        (REJECTED_COMPRESSED, "one latent row per"),
         (REJECTED_QUANTIZED, "per-token-head"),
         (REJECTED_WINDOW, "SlidingWindowMLASpec"),
         (REJECTED_INVALID, "not divisible"),
