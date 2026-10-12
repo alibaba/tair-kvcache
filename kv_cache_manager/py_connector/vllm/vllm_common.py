@@ -252,27 +252,50 @@ def spec_group_plan(
     return declared, table
 
 
-def _check_packed_groups_announceable(group_metas: List["GroupMeta"]) -> None:
-    """Refuse the packed-group + sparse-coverage combination (see
-    build_spec_groups): the scheduler's folded view cannot name the extra
-    buckets of a packed group."""
-    seen: set = set()
-    packed: List[int] = []
+def _group_coverage(meta: "GroupMeta") -> Tuple[Any, bool]:
+    """The coverage dimensions one vLLM group's folded view can lose.
+
+    The engine hands the scheduler one sub spec per UniformTypeKVCacheSpecs
+    group (generate_scheduler_kv_cache_config keeps the first member), so the
+    scheduler's masks are built from that one member: a window retention and a
+    recurrent state are the two dimensions a bucket is transferred under that
+    the fold can drop. Everything else (page size, geometry, tokens per row) is
+    the *worker's* business and folds harmlessly.
+
+    The state half is defensive -- vLLM's uniform bases keep mamba specs in
+    their own group today -- but the predicate is total on purpose.
+    """
+    return (getattr(meta, "retention", None), isinstance(meta, StateGroupMeta))
+
+
+def _check_coverage_survives_folding(group_metas: List["GroupMeta"]) -> None:
+    """Refuse a vLLM group whose buckets disagree about their coverage.
+
+    Buckets that agree are safe: the folded member carries every dimension the
+    group has, so the scheduler's window / state masks describe exactly what the
+    worker's buckets hold. Buckets that disagree (a windowed R-SWA layer packed
+    with a full MLA one, or two windows of different widths) are not: the
+    scheduler computes its masks from the one member it can see, so it would
+    report window data (or a state) as present while the worker's masking knows
+    it is gone -- and the manager would store stale or zero-page bytes as if
+    they were cacheable. That is a silent hole, so the combination is refused at
+    registration, before any request. A packed group whose buckets do agree
+    (V4.1's compressed group, which declares nothing at all) is untouched.
+    """
+    seen: Dict[int, Tuple[Any, bool]] = {}
     for meta in group_metas:
-        if meta.group_idx in seen and meta.group_idx not in packed:
-            packed.append(meta.group_idx)
-        seen.add(meta.group_idx)
-    if packed:
-        raise NotImplementedError(
-            f"vLLM group(s) {packed} carry several transfer buckets "
-            f"(packed layouts) while this instance also declares per-block "
-            f"spec coverage (windowed or recurrent-state groups). The "
-            f"scheduler's view of a packed group is folded to one sub spec, so "
-            f"the coverage can never name the extra buckets "
-            f"(_b1, _b2, ...) and the manager would allocate no location for "
-            f"them: every save of those buckets would fail. "
-            f"TairKvCacheConnector cannot serve this combination"
-        )
+        coverage = _group_coverage(meta)
+        previous = seen.setdefault(meta.group_idx, coverage)
+        if previous != coverage:
+            raise NotImplementedError(
+                f"vLLM group {meta.group_idx} carries transfer buckets with "
+                f"different coverage: {previous} and {coverage} "
+                f"(layer {meta.layer_names[0]!r}). The engine folds a packed "
+                f"group to one member spec for the scheduler, whose window and "
+                f"state masks would then miss this bucket's coverage and let "
+                f"the manager store stale or zero-page bytes as cacheable. "
+                f"TairKvCacheConnector cannot serve this combination"
+            )
 
 
 def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict]:
@@ -297,24 +320,18 @@ def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict
     keeps their requests byte-identical to before (and compatible with managers
     that predate spec groups).
 
-    A packed group (several buckets for one vLLM group) cannot be described
-    this way, because the *scheduler* view is folded: the engine hands the
-    scheduler one sub spec per UniformTypeKVCacheSpecs group
-    (generate_scheduler_kv_cache_config keeps the first member), so the names
-    the scheduler can announce are the bare ones -- the extra buckets
-    (``tp0_g7_b1`` ...) are unnameable there. Announcing a coverage without
-    them would tell the manager those buckets' bytes do not exist while the
-    worker still has them, and every save of such a block would fail: the
-    configuration cannot work, so it is refused here (worker-side registration,
-    before any request) instead of degrading at runtime. Without a declared
-    group the announcement carries no names at all and the manager stores every
-    registered spec, which is what a packed group needs -- so a packed group is
-    only a problem together with the sparse (state / windowed) dimensions.
+    A group whose buckets *disagree* about coverage is refused outright
+    (``_check_coverage_survives_folding``): the engine folds the group to one
+    member for the scheduler, so a disagreement would mask the wrong blocks.
+    Buckets that agree fold without loss -- including a packed group, whose
+    extra buckets keep both their registration *and* their announcement name
+    (the group's member list comes from the worker's registration, not from the
+    scheduler's folded view). A packed group with no sparsity declares nothing
+    at all, which leaves the manager on the worker's full registration: V4.1's
+    compressed group runs exactly that path.
     """
-    declared, _ = spec_group_plan(group_metas, tp_size)
-    if declared:
-        _check_packed_groups_announceable(group_metas)
-    return declared
+    _check_coverage_survives_folding(group_metas)
+    return spec_group_plan(group_metas, tp_size)[0]
 
 
 @dataclass(frozen=True)

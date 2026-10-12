@@ -76,6 +76,7 @@ else:
 
     from kv_cache_manager.py_connector.vllm.vllm_common import (
         _check_attention_spec_supported,
+        build_spec_groups,
         parse_groups,
     )
 
@@ -1025,6 +1026,76 @@ class TestV41CompressedOnTheRealEngine(RealEngineCase):
         spec = facts.build_spec(row, self.engine)
         self.assertTrue(facts.legacy_accepts(spec, self.engine))
         self.assertEqual(74752, spec.real_page_size_bytes)
+
+
+class TestFoldedGroupCoverageOnTheRealEngine(RealEngineCase):
+    """The reachable way to make one group's buckets disagree (PR6 review r1).
+
+    ``UniformTypeKVCacheSpecs.from_specs`` merges an MLA layer with an R-SWA one
+    -- their uniform base is the same FullAttentionSpec -- but the two carry
+    different coverage (one is a windowed contract, the other full prefix). The
+    engine hands the scheduler one member of such a group
+    (generate_scheduler_kv_cache_config keeps the first), whose masks would then
+    miss the other bucket's dimension: stale or zero-page bytes would be
+    published as cacheable. The guard must refuse it, on the real class tree of
+    the installed era.
+    """
+
+    def _mixed_wrapper(self):
+        module = self.module
+        members = {
+            "mla_l": module.MLAAttentionSpec(
+                block_size=64,
+                num_kv_heads=1,
+                head_size=576,
+                dtype=torch.uint8,
+            ),
+            "rswa_l": module.RSWASpec(
+                block_size=64,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.float16,
+                rswa_window=128,
+            ),
+        }
+        merged = module.UniformTypeKVCacheSpecs.from_specs(members)
+        return module, members, merged
+
+    def test_the_era_really_folds_these_two_specs(self):
+        module, _members, merged = self._mixed_wrapper()
+        self.assertIsNotNone(
+            merged,
+            "the era no longer merges MLA with R-SWA: this test would be dead; "
+            "pick the spec pair that folds on this version",
+        )
+        del module
+
+    def test_a_group_with_two_coverages_is_refused(self):
+        module, members, merged = self._mixed_wrapper()
+        self.assertIsNotNone(merged)
+        config = module.KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                module.KVCacheGroupSpec(layer_names=list(members), kv_cache_spec=merged)
+            ],
+        )
+        metas = parse_groups(config, 64, calculate_kv_scales=False)
+        self.assertEqual(
+            [None, 128],
+            [
+                meta.retention.window_tokens if meta.retention else None
+                for meta in metas
+            ],
+            "the two coverages must really be in the bucket set",
+        )
+        # The guard runs where the connector announces spec coverage: the
+        # worker's registration (build_spec_groups), before any request.
+        with self.assertRaises(NotImplementedError) as ctx:
+            build_spec_groups(metas, tp_size=1)
+        message = str(ctx.exception)
+        self.assertIn("different coverage", message)
+        self.assertIn("group 0", message)
 
 
 if __name__ == "__main__":
