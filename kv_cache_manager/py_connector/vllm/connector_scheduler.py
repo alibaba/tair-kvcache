@@ -596,7 +596,7 @@ class ConnectorScheduler:
         self._epoch += 1
 
         self._ingest_scheduled_reqs(scheduler_output)
-        self._dispatch_incremental_saves(meta)
+        self._dispatch_incremental_saves(meta, scheduler_output)
         self._collect_load_instructions(meta)
         self._collect_save_instructions(meta)
         self._collect_finish_instructions(meta)
@@ -666,7 +666,7 @@ class ConnectorScheduler:
                     group_ids.extend(new_ids)
 
     def _dispatch_incremental_saves(
-        self, meta: TairKvCacheConnectorMetadata
+        self, meta: TairKvCacheConnectorMetadata, scheduler_output: "SchedulerOutput"
     ) -> None:
         """Start async StartWriteCache calls for requests whose computed
         prefix crossed a manager-block boundary since the last step, and ask
@@ -682,20 +682,28 @@ class ConnectorScheduler:
         session the http thread produces surfaces in _collect_save_instructions
         on a later step.
         """
+        num_scheduled = scheduler_output.num_scheduled_tokens
         for ledger in self._tracked.values():
-            # Count blocks by the key material (all_token_ids), never by the
-            # scheduled token count: during decode all_token_ids lags one
-            # token behind (the token scheduled in this step is appended only
-            # once sampled), so a scheduled-count-derived block count
-            # announces blocks whose last token -- and thus cache key -- is
-            # not known yet. The manager then returns one location fewer
-            # than announced and the worker's strict alignment check drops
-            # the whole session. The allocated cap still bounds the other
-            # way: under chunked prefill all_token_ids runs ahead of the
-            # computed KV.
+            # The watermark is the *fully computed, fully keyed* prefix, capped
+            # on both sides. Computed KV: vLLM's own num_computed_tokens counts
+            # what the request has computed before this step (hits included);
+            # adding this step's scheduled tokens gives the prefix whose KV
+            # exists once the step's forward completes -- and the worker
+            # consumes this metadata after exactly that forward. The allocated
+            # block span is *not* that bound: a prefill chunk can end inside a
+            # manager block, and the allocation still covers the whole block,
+            # so announcing up to it would let a windowed group's eager capture
+            # (which reads in that same step) copy rows the forward never wrote
+            # and publish zero pages as KV. Key material: during decode
+            # all_token_ids lags one token behind (the token scheduled in this
+            # step is appended only once sampled), so it stays as the other
+            # cap; the block span remains a purely defensive ceiling (every
+            # transfer group's table must cover what we announce).
             target_save_num = (
                 min(
                     len(ledger.vllm_request.all_token_ids),
+                    ledger.vllm_request.num_computed_tokens
+                    + num_scheduled.get(ledger.vllm_request.request_id, 0),
                     self._num_allocated_blocks(ledger) * self._vllm_block_size,
                 )
                 // self._manager_block_size
