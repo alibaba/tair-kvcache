@@ -77,6 +77,9 @@ class FakeRequest:
     request_id: str
     prompt_token_ids: list
     output_token_ids: list = field(default_factory=list)
+    # vLLM's computed-token count; the save watermark reads it as the pre-step
+    # value and the tests advance it where they simulate a step.
+    num_computed_tokens: int = 0
 
     @property
     def num_tokens(self):
@@ -260,13 +263,13 @@ class TestCaptureRequests(unittest.TestCase):
     """The scheduler asks for a capture only where a window needs it."""
 
     @staticmethod
-    def _empty_output():
+    def _empty_output(num_scheduled=None):
         return SimpleNamespace(
             scheduled_new_reqs=[],
             scheduled_cached_reqs=SimpleNamespace(
                 req_ids=[], resumed_req_ids=set(), new_block_ids=[]
             ),
-            num_scheduled_tokens={},
+            num_scheduled_tokens=dict(num_scheduled or {}),
         )
 
     def _dispatch(self, conn, prompt_len, blocks):
@@ -274,7 +277,14 @@ class TestCaptureRequests(unittest.TestCase):
         conn.update_state_after_alloc(
             req, SimpleNamespace(get_block_ids=lambda: [list(blocks)]), 0
         )
-        return conn.build_connector_meta(self._empty_output())
+        # A fresh prefill schedules exactly the tokens it holds: the announce
+        # and capture watermark is the computed KV, not the allocated span.
+        # vLLM advances the request after the step (_update_after_schedule).
+        meta = conn.build_connector_meta(
+            self._empty_output(num_scheduled={"r0": prompt_len})
+        )
+        req.num_computed_tokens += prompt_len
+        return meta
 
     def test_full_attention_instance_emits_none(self):
         # The red line: a model without a windowed group must not grow a
@@ -306,8 +316,37 @@ class TestCaptureRequests(unittest.TestCase):
         self._dispatch(conn, 2 * MBS, [1, 2])
         conn._tracked["r0"].vllm_request.prompt_token_ids = list(range(4 * MBS))
         conn._tracked["r0"].block_ids_per_group = [[1, 2, 3, 4]]
-        meta = conn.build_connector_meta(self._empty_output())
+        meta = conn.build_connector_meta(
+            self._empty_output(num_scheduled={"r0": 2 * MBS})
+        )
+        conn._tracked["r0"].vllm_request.num_computed_tokens += 2 * MBS
         self.assertEqual([2, 3], meta.to_capture_requests[0].manager_block_idxes)
+
+    def test_chunk_ending_inside_a_block_waits_for_the_rest_of_it(self):
+        """A prefill chunk can end inside a manager block, and the allocation
+        still covers the whole block. The allocated span is therefore not a
+        safe announce watermark: a capture driven by it copies rows the
+        forward has not written yet and publishes zero pages as saved KV
+        (regression: the eager capture read exactly the tail rows of the
+        boundary block)."""
+        conn = make_connector_scheduler(manager_block_size=MBS, locations=[], windowed=1)
+        # 2 blocks + 3 tokens scheduled: block 2 is allocated, not computed.
+        req = FakeRequest("r0", list(range(2 * MBS + 3)))
+        conn.update_state_after_alloc(
+            req, SimpleNamespace(get_block_ids=lambda: [[1, 2, 3]]), 0
+        )
+        meta = conn.build_connector_meta(
+            self._empty_output(num_scheduled={"r0": 2 * MBS + 3})
+        )
+        conn._tracked["r0"].vllm_request.num_computed_tokens += 2 * MBS + 3
+        self.assertEqual([0, 1], meta.to_capture_requests[0].manager_block_idxes)
+
+        # The rest of the block lands in the next chunk: now it is captured.
+        conn._tracked["r0"].vllm_request.prompt_token_ids = list(range(3 * MBS))
+        meta = conn.build_connector_meta(
+            self._empty_output(num_scheduled={"r0": MBS - 3})
+        )
+        self.assertEqual([2], meta.to_capture_requests[0].manager_block_idxes)
 
 
 class TestWindowedSpecGroups(unittest.TestCase):
