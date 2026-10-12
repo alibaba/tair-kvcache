@@ -58,6 +58,9 @@ struct OptimizerKmonitorMetricsReporter::KmonContext {
 
     DECLARE_METRICS(trace, query_total);
     DECLARE_METRICS(trace, query_blocks_total);
+    DECLARE_METRICS(trace, query_input_tokens_total);
+    DECLARE_METRICS(trace, query_max_hit_tokens_total);
+    DECLARE_METRICS(trace, query_hit_tokens_total);
     DECLARE_METRICS(trace, query_max_hit_rate);
     DECLARE_METRICS(trace, query_unique_keys);
     DECLARE_METRICS(trace, query_bytes_per_block);
@@ -73,6 +76,10 @@ struct OptimizerKmonitorMetricsReporter::KmonContext {
     DECLARE_METRICS(trace, query_reuse_interval_avg_seconds);
     DECLARE_METRICS(trace, query_reuse_interval_p95_seconds);
     DECLARE_METRICS(trace, query_reuse_interval_p99_seconds);
+    DECLARE_METRICS(trace, query_reuse_interval_p995_seconds);
+    DECLARE_METRICS(trace, query_reuse_interval_p999_seconds);
+    DECLARE_METRICS(trace, query_capacity_history_p99_timestamp_ms);
+    DECLARE_METRICS(trace, query_capacity_history_p99_bytes);
 
     std::unique_ptr<kmonitor::MutableMetric> mrc_metrics;
 
@@ -226,6 +233,9 @@ bool OptimizerKmonitorMetricsReporter::InitMetrics() {
 
     REGISTER_GAUGE_METRIC(trace, query_total);
     REGISTER_GAUGE_METRIC(trace, query_blocks_total);
+    REGISTER_GAUGE_METRIC(trace, query_input_tokens_total);
+    REGISTER_GAUGE_METRIC(trace, query_max_hit_tokens_total);
+    REGISTER_GAUGE_METRIC(trace, query_hit_tokens_total);
     REGISTER_GAUGE_METRIC(trace, query_max_hit_rate);
     REGISTER_GAUGE_METRIC(trace, query_unique_keys);
     REGISTER_GAUGE_METRIC(trace, query_bytes_per_block);
@@ -241,6 +251,10 @@ bool OptimizerKmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(trace, query_reuse_interval_avg_seconds);
     REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p95_seconds);
     REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p99_seconds);
+    REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p995_seconds);
+    REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p999_seconds);
+    REGISTER_GAUGE_METRIC(trace, query_capacity_history_p99_timestamp_ms);
+    REGISTER_GAUGE_METRIC(trace, query_capacity_history_p99_bytes);
 
     kmon_ctx_->mrc_metrics.reset(reporter->RegisterMetric("mrc", kmonitor::GAUGE, kmonitor::FATAL));
     if (!kmon_ctx_->mrc_metrics) {
@@ -306,7 +320,8 @@ void OptimizerKmonitorMetricsReporter::ReportPerQuery(OptimizerServiceMetricsCol
 void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<InstanceSummary> &summaries,
                                                       const std::vector<IntervalMetricInfo> &interval_metrics,
                                                       const std::vector<MrcMetricInfo> &mrc_metrics,
-                                                      const std::vector<ReuseIntervalMetricInfo> &reuse_metrics) {
+                                                      const std::vector<ReuseIntervalMetricInfo> &reuse_metrics,
+                                                      const std::vector<CapacityHistoryMetricInfo> &history_metrics) {
     if (!kmon_ctx_ || !kmon_ctx_->kmonitor) {
         return;
     }
@@ -316,6 +331,14 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
         const auto tags = kmon_ctx_->GetKmonitorTags(base_tags);
         kmon_ctx_->trace_query_total_metrics->Report(&tags, static_cast<double>(summary.total_queries));
         kmon_ctx_->trace_query_blocks_total_metrics->Report(&tags, static_cast<double>(summary.total_blocks_queried));
+        if (summary.linear_step == 0) {
+            kmon_ctx_->trace_query_input_tokens_total_metrics->Report(&tags,
+                                                                      static_cast<double>(summary.total_input_tokens));
+            if (summary.max_hit_rate >= 0) {
+                kmon_ctx_->trace_query_max_hit_tokens_total_metrics->Report(
+                    &tags, static_cast<double>(summary.total_max_hits) * summary.block_size);
+            }
+        }
         if (summary.max_hit_rate >= 0) {
             kmon_ctx_->trace_query_max_hit_rate_metrics->Report(&tags, summary.max_hit_rate);
         }
@@ -334,6 +357,10 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
             MetricsTags capacity_base_tags = base_tags;
             capacity_base_tags["capacity_gb"] = std::to_string(capacity.capacity_gb);
             const auto capacity_tags = kmon_ctx_->GetKmonitorTags(capacity_base_tags);
+            if (summary.linear_step == 0) {
+                kmon_ctx_->trace_query_hit_tokens_total_metrics->Report(
+                    &capacity_tags, static_cast<double>(capacity.total_hits) * summary.block_size);
+            }
             kmon_ctx_->trace_query_hit_rate_metrics->Report(&capacity_tags, capacity.hit_rate);
             if (summary.max_hit_rate > 0) {
                 kmon_ctx_->trace_query_capacity_efficiency_metrics->Report(&capacity_tags,
@@ -358,6 +385,10 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
             &tags, static_cast<double>(metric.stats.p95_ns) / 1e9);
         kmon_ctx_->trace_query_reuse_interval_p99_seconds_metrics->Report(
             &tags, static_cast<double>(metric.stats.p99_ns) / 1e9);
+        kmon_ctx_->trace_query_reuse_interval_p995_seconds_metrics->Report(
+            &tags, static_cast<double>(metric.stats.p995_ns) / 1e9);
+        kmon_ctx_->trace_query_reuse_interval_p999_seconds_metrics->Report(
+            &tags, static_cast<double>(metric.stats.p999_ns) / 1e9);
     }
 
     for (const auto &metric : interval_metrics) {
@@ -385,6 +416,17 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
                                  {"target_hit_rate_percent", FormatTargetHitRatePercent(metric.target_basis_points)}};
         const auto tags = kmon_ctx_->GetKmonitorTags(base_tags);
         kmon_ctx_->mrc_metrics->Report(&tags, static_cast<double>(metric.capacity_bytes));
+    }
+    for (const auto &metric : history_metrics) {
+        for (size_t slot = 0; slot < metric.points.size(); ++slot) {
+            MetricsTags base_tags = {{"instance_group", metric.instance_group},
+                                     {"instance_id", metric.instance_id},
+                                     {"slot", std::to_string(slot)}};
+            const auto tags = kmon_ctx_->GetKmonitorTags(base_tags);
+            const auto &point = metric.points[slot];
+            kmon_ctx_->trace_query_capacity_history_p99_timestamp_ms_metrics->Report(&tags, point.timestamp_ms);
+            kmon_ctx_->trace_query_capacity_history_p99_bytes_metrics->Report(&tags, point.capacity_bytes);
+        }
     }
 }
 

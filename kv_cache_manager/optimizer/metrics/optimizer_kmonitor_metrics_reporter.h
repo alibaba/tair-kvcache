@@ -12,6 +12,7 @@ struct InstanceSummary;
 struct IntervalMetricInfo;
 struct MrcMetricInfo;
 struct ReuseIntervalMetricInfo;
+struct CapacityHistoryMetricInfo;
 class OptimizerServiceMetricsCollector;
 
 class OptimizerKmonitorMetricsReporter {
@@ -31,7 +32,8 @@ public:
     void ReportInterval(const std::vector<InstanceSummary> &summaries,
                         const std::vector<IntervalMetricInfo> &interval_metrics,
                         const std::vector<MrcMetricInfo> &mrc_metrics,
-                        const std::vector<ReuseIntervalMetricInfo> &reuse_metrics);
+                        const std::vector<ReuseIntervalMetricInfo> &reuse_metrics,
+                        const std::vector<CapacityHistoryMetricInfo> &history_metrics);
 
 private:
     bool InitMetrics();

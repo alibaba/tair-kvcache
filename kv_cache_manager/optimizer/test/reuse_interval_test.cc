@@ -23,6 +23,8 @@ TEST_F(ReuseIntervalTest, ExactTimesAndSampleWeightedAverage) {
     EXPECT_DOUBLE_EQ(3.0, stats.avg_ns);
     EXPECT_EQ(8, stats.p95_ns);
     EXPECT_EQ(8, stats.p99_ns);
+    EXPECT_EQ(8, stats.p995_ns);
+    EXPECT_EQ(8, stats.p999_ns);
 }
 
 TEST_F(ReuseIntervalTest, TakeClearsWindow) {
@@ -45,6 +47,8 @@ TEST_F(ReuseIntervalTest, TakeClearsWindow) {
     EXPECT_DOUBLE_EQ(10.0, stats.avg_ns);
     EXPECT_EQ(10, stats.p95_ns);
     EXPECT_EQ(10, stats.p99_ns);
+    EXPECT_EQ(10, stats.p995_ns);
+    EXPECT_EQ(10, stats.p999_ns);
 }
 
 TEST_F(ReuseIntervalTest, LargeIntervalsDoNotOverflowSum) {
@@ -59,6 +63,8 @@ TEST_F(ReuseIntervalTest, LargeIntervalsDoNotOverflowSum) {
     EXPECT_DOUBLE_EQ(static_cast<double>(value), stats.avg_ns);
     EXPECT_EQ(value, stats.p95_ns);
     EXPECT_EQ(value, stats.p99_ns);
+    EXPECT_EQ(value, stats.p995_ns);
+    EXPECT_EQ(value, stats.p999_ns);
 }
 
 TEST_F(ReuseIntervalTest, ResetClearsWindow) {
@@ -106,12 +112,12 @@ TEST_F(ReuseIntervalTest, BucketBoundariesRespectRelativeErrorAcrossUint64Range)
         const uint64_t power = uint64_t{1} << exponent;
         for (uint64_t value : {power - 1, power, power + 1}) {
             ReuseInterval intervals;
-            for (int i = 0; i < 100; ++i) {
+            for (int i = 0; i < 1000; ++i) {
                 intervals.Record(value);
             }
             intervals.Record(std::numeric_limits<uint64_t>::max());
             const auto stats = intervals.Take();
-            for (uint64_t quantile : {stats.p95_ns, stats.p99_ns}) {
+            for (uint64_t quantile : {stats.p95_ns, stats.p99_ns, stats.p995_ns, stats.p999_ns}) {
                 EXPECT_GE(quantile, value);
                 EXPECT_LE(static_cast<long double>(quantile), static_cast<long double>(value) * (1.0L + 1.0L / 128));
             }
@@ -131,13 +137,39 @@ TEST_F(ReuseIntervalTest, QuantilesMatchSortedOracleWithinErrorBound) {
     }
     std::sort(values.begin(), values.end());
     const auto stats = intervals.Snapshot();
-    for (const auto &[percent, estimate] : {std::pair<uint64_t, uint64_t>{95, stats.p95_ns}, {99, stats.p99_ns}}) {
-        const auto expected = values[(values.size() * percent + 99) / 100 - 1];
+    for (const auto &[basis_points, estimate] : {std::pair<uint64_t, uint64_t>{9500, stats.p95_ns},
+                                                 {9900, stats.p99_ns},
+                                                 {9950, stats.p995_ns},
+                                                 {9990, stats.p999_ns}}) {
+        const auto expected = values[(values.size() * basis_points + 9999) / 10000 - 1];
         EXPECT_GE(estimate, expected);
         EXPECT_LE(static_cast<long double>(estimate), static_cast<long double>(expected) * (1.0L + 1.0L / 128));
     }
     EXPECT_LE(stats.p95_ns, stats.p99_ns);
-    EXPECT_LE(stats.p99_ns, stats.max_ns);
+    EXPECT_LE(stats.p99_ns, stats.p995_ns);
+    EXPECT_LE(stats.p995_ns, stats.p999_ns);
+    EXPECT_LE(stats.p999_ns, stats.max_ns);
+}
+
+TEST_F(ReuseIntervalTest, FractionalPercentilesHaveDistinctNearestRanks) {
+    ReuseInterval intervals;
+    for (int i = 0; i < 1000; ++i) {
+        intervals.Record(i < 990 ? 1 : (i < 995 ? 2 : (i < 999 ? 3 : 4)));
+    }
+    auto stats = intervals.Snapshot();
+    EXPECT_EQ(1, stats.p99_ns);
+    EXPECT_EQ(2, stats.p995_ns);
+    EXPECT_EQ(3, stats.p999_ns);
+    EXPECT_EQ(4, stats.max_ns);
+
+    // Non-integral ranks must round up, not truncate to 99% or round down.
+    intervals.Record(4);
+    stats = intervals.Take();
+    EXPECT_EQ(2, stats.p99_ns);
+    EXPECT_EQ(3, stats.p995_ns);
+    EXPECT_EQ(4, stats.p999_ns);
+    EXPECT_EQ(0, intervals.Snapshot().p995_ns);
+    EXPECT_EQ(0, intervals.Snapshot().p999_ns);
 }
 
 } // namespace kv_cache_manager

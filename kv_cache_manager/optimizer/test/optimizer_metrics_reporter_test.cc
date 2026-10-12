@@ -127,6 +127,104 @@ TEST_F(OptimizerMetricsReporterTest, ReportIntervalPerCapacityHitRate) {
     EXPECT_GE(rate5.Get(), rate1.Get());
 }
 
+TEST_F(OptimizerMetricsReporterTest, TokenTotalsWeightWindowsAndCapacitiesByAnalyzedInput) {
+    // A block costs 1024 bytes. The small capacity holds exactly one block.
+    const double small_capacity = 1024.0 / (1024.0 * 1024.0 * 1024.0);
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {small_capacity, 1.0}, 0, true));
+    const MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    MetricsTags small_tags = tags;
+    small_tags["capacity_gb"] = std::to_string(small_capacity);
+    MetricsTags large_tags = tags;
+    large_tags["capacity_gb"] = std::to_string(1.0);
+    auto input = registry_->GetGauge("trace_query_input_tokens_total", tags);
+    auto max_hits = registry_->GetGauge("trace_query_max_hit_tokens_total", tags);
+    auto small_hits = registry_->GetGauge("trace_query_hit_tokens_total", small_tags);
+    auto large_hits = registry_->GetGauge("trace_query_hit_tokens_total", large_tags);
+
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0, input.Get());
+    EXPECT_DOUBLE_EQ(0, max_hits.Get());
+    EXPECT_DOUBLE_EQ(0, small_hits.Get());
+    EXPECT_DOUBLE_EQ(0, large_hits.Get());
+
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2}, 2500, 0, result));
+    reporter_->ReportInterval();
+    // The partial tail remains in the denominator; do not use blocks * size.
+    EXPECT_DOUBLE_EQ(2500, input.Get());
+    EXPECT_DOUBLE_EQ(0, max_hits.Get());
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2, 3}, 3072, 0, result));
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(5572, input.Get());
+    EXPECT_DOUBLE_EQ(2048, max_hits.Get());
+    EXPECT_DOUBLE_EQ(1024, small_hits.Get());
+    EXPECT_DOUBLE_EQ(2048, large_hits.Get());
+    // Window rates were 0 and 2/3. Their arithmetic mean (1/3) is wrong.
+    EXPECT_DOUBLE_EQ(2048.0 / 5572.0, max_hits.Get() / input.Get());
+    EXPECT_DOUBLE_EQ(registry_->GetGauge("trace_query_max_hit_rate", tags).Get(), max_hits.Get() / input.Get());
+    EXPECT_DOUBLE_EQ(registry_->GetGauge("trace_query_hit_rate", small_tags).Get(), small_hits.Get() / input.Get());
+
+    // Rejected requests and idle/repeated reports cannot change the totals.
+    ASSERT_EQ(EC_BADARGS, manager_->TraceQuery("inst1", {1}, -1, 0, result));
+    reporter_->ReportInterval();
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(5572, input.Get());
+    EXPECT_DOUBLE_EQ(2048, max_hits.Get());
+    EXPECT_DOUBLE_EQ(1024, small_hits.Get());
+
+    ASSERT_EQ(EC_OK, manager_->ResetStats("inst1"));
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0, input.Get());
+    EXPECT_DOUBLE_EQ(0, max_hits.Get());
+    EXPECT_DOUBLE_EQ(0, small_hits.Get());
+    EXPECT_DOUBLE_EQ(0, large_hits.Get());
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2}, 2500, 0, result));
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(2500, input.Get());
+    EXPECT_DOUBLE_EQ(0, max_hits.Get());
+}
+
+TEST_F(OptimizerMetricsReporterTest, TokenTotalsAreIsolatedAndTheoreticalMayBeDisabled) {
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1"));
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst2"));
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2}, 2500, 0, result));
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2}, 2500, 0, result));
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst2", {1}, 1024, 0, result));
+    reporter_->ReportInterval();
+    EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_max_hit_tokens_total"));
+    const MetricsTags tags1 = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    const MetricsTags tags2 = {{"instance_group", "grp1"}, {"instance_id", "inst2"}};
+    EXPECT_DOUBLE_EQ(5000, registry_->GetGauge("trace_query_input_tokens_total", tags1).Get());
+    EXPECT_DOUBLE_EQ(1024, registry_->GetGauge("trace_query_input_tokens_total", tags2).Get());
+    MetricsTags capacity_tags2 = tags2;
+    capacity_tags2["capacity_gb"] = std::to_string(1.0);
+    EXPECT_DOUBLE_EQ(0, registry_->GetGauge("trace_query_hit_tokens_total", capacity_tags2).Get());
+    reporter_->RemoveInstanceMetrics("inst1");
+    auto data = registry_->GetMetricsData("trace_query_input_tokens_total");
+    ASSERT_NE(nullptr, data);
+    ASSERT_EQ(1, data->GetMetricsValues().size());
+    EXPECT_DOUBLE_EQ(1024, registry_->GetGauge("trace_query_input_tokens_total", tags2).Get());
+}
+
+TEST_F(OptimizerMetricsReporterTest, TokenTotalsRetainPastHitsAfterTtlExpiration) {
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {1.0}, 1, true));
+    TraceQueryResult result;
+    constexpr int64_t kSecond = 1000000000LL;
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1}, 1024, 100 * kSecond, result));
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1}, 1024, 100 * kSecond, result));
+    EXPECT_EQ(1, result.max_hit_count);
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1}, 1024, 102 * kSecond, result));
+    EXPECT_EQ(0, result.max_hit_count);
+    reporter_->ReportInterval();
+    const MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}};
+    EXPECT_DOUBLE_EQ(3072, registry_->GetGauge("trace_query_input_tokens_total", tags).Get());
+    EXPECT_DOUBLE_EQ(1024, registry_->GetGauge("trace_query_max_hit_tokens_total", tags).Get());
+    MetricsTags capacity_tags = tags;
+    capacity_tags["capacity_gb"] = std::to_string(1.0);
+    EXPECT_DOUBLE_EQ(1024, registry_->GetGauge("trace_query_hit_tokens_total", capacity_tags).Get());
+}
+
 TEST_F(OptimizerMetricsReporterTest, ReportPerQueryWritesToRegistry) {
     auto collector = std::make_shared<OptimizerServiceMetricsCollector>(registry_);
     ASSERT_TRUE(collector->Init());
@@ -472,6 +570,11 @@ TEST_F(OptimizerMetricsReporterTest, LegacyIndexerDoesNotReportReuseInterval) {
         EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_avg_seconds"));
         EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_p95_seconds"));
         EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_p99_seconds"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_p995_seconds"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_p999_seconds"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_input_tokens_total"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_max_hit_tokens_total"));
+        EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_hit_tokens_total"));
         EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_hit_age_bucket_ratio"));
         MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", instance_id}};
         EXPECT_DOUBLE_EQ(2.0, registry_->GetGauge("trace_query_total", tags).Get());
@@ -495,6 +598,8 @@ TEST_F(OptimizerMetricsReporterTest, ReportFullAttentionReuseIntervalWindow) {
     EXPECT_NEAR(44.0 / 3.0, registry_->GetGauge("trace_query_reuse_interval_avg_seconds", tags).Get(), 1e-9);
     EXPECT_DOUBLE_EQ(36.0, registry_->GetGauge("trace_query_reuse_interval_p95_seconds", tags).Get());
     EXPECT_DOUBLE_EQ(36.0, registry_->GetGauge("trace_query_reuse_interval_p99_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(36.0, registry_->GetGauge("trace_query_reuse_interval_p995_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(36.0, registry_->GetGauge("trace_query_reuse_interval_p999_seconds", tags).Get());
     EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_bucket_ratio"));
 
     reporter_->ReportInterval();
@@ -502,7 +607,9 @@ TEST_F(OptimizerMetricsReporterTest, ReportFullAttentionReuseIntervalWindow) {
                              "trace_query_reuse_interval_max_seconds",
                              "trace_query_reuse_interval_avg_seconds",
                              "trace_query_reuse_interval_p95_seconds",
-                             "trace_query_reuse_interval_p99_seconds"}) {
+                             "trace_query_reuse_interval_p99_seconds",
+                             "trace_query_reuse_interval_p995_seconds",
+                             "trace_query_reuse_interval_p999_seconds"}) {
         EXPECT_TRUE(std::isnan(registry_->GetGauge(name, tags).Get()));
     }
     EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_reuse_interval_count"));
@@ -515,6 +622,8 @@ TEST_F(OptimizerMetricsReporterTest, ReportFullAttentionReuseIntervalWindow) {
     EXPECT_DOUBLE_EQ(10.0, registry_->GetGauge("trace_query_reuse_interval_avg_seconds", tags).Get());
     EXPECT_DOUBLE_EQ(10.0, registry_->GetGauge("trace_query_reuse_interval_p95_seconds", tags).Get());
     EXPECT_DOUBLE_EQ(10.0, registry_->GetGauge("trace_query_reuse_interval_p99_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(10.0, registry_->GetGauge("trace_query_reuse_interval_p995_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(10.0, registry_->GetGauge("trace_query_reuse_interval_p999_seconds", tags).Get());
 
     // A zero interval is valid and is different from an empty window.
     ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1}, 0, 150 * kSecond, result));
@@ -524,6 +633,8 @@ TEST_F(OptimizerMetricsReporterTest, ReportFullAttentionReuseIntervalWindow) {
     EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("trace_query_reuse_interval_avg_seconds", tags).Get());
     EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("trace_query_reuse_interval_p95_seconds", tags).Get());
     EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("trace_query_reuse_interval_p99_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("trace_query_reuse_interval_p995_seconds", tags).Get());
+    EXPECT_DOUBLE_EQ(0.0, registry_->GetGauge("trace_query_reuse_interval_p999_seconds", tags).Get());
 }
 
 TEST_F(OptimizerMetricsReporterTest, RemoveInstanceMetricsCleansUp) {
@@ -546,6 +657,45 @@ TEST_F(OptimizerMetricsReporterTest, RemoveInstanceMetricsCleansUp) {
     // After removal, getting the gauge creates a fresh entry with default 0.0
     Gauge qt_after = registry_->GetGauge("trace_query_total", tags);
     EXPECT_DOUBLE_EQ(0.0, qt_after.Get());
+}
+
+TEST_F(OptimizerMetricsReporterTest, PlanningWindowHistoryIsolationAndReset) {
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {1.0}, 0, true));
+    ASSERT_EQ(EC_OK, RegisterTestInstance("inst2", {1.0}, 0, true));
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2}, 0, 1000000000, result));
+    ASSERT_EQ(EC_OK, manager_->TraceQuery("inst1", {1, 2}, 0, 601000000000, result));
+    std::vector<MrcMetricInfo> mrc;
+    std::vector<ReuseIntervalMetricInfo> reuse;
+    std::vector<CapacityHistoryMetricInfo> history;
+    constexpr int64_t now = 1000 * CapacityHistory::kStepMs;
+    ASSERT_EQ(EC_OK, manager_->TakePlanningMetrics(now, mrc, reuse, history));
+    ASSERT_EQ(2, history.size());
+    for (const auto &metric : history) {
+        size_t count = 0;
+        for (const auto &point : metric.points) {
+            if (point.timestamp_ms > 0) {
+                ++count;
+                EXPECT_EQ(2048, point.capacity_bytes);
+            }
+        }
+        EXPECT_EQ(metric.instance_id == "inst1" ? 3 : 0, count);
+    }
+    manager_->TakePlanningMetrics(now, mrc, reuse, history);
+    for (const auto &metric : reuse) {
+        EXPECT_EQ(0, metric.stats.count); // Drained only once, both backends share the snapshot.
+    }
+    ASSERT_EQ(EC_OK, manager_->ResetStats("inst1"));
+    manager_->TakePlanningMetrics(now, mrc, reuse, history);
+    for (const auto &metric : history) {
+        for (const auto &point : metric.points) {
+            EXPECT_EQ(0, point.timestamp_ms);
+        }
+    }
+    reporter_->ReportInterval();
+    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}, {"slot", "0"}};
+    EXPECT_DOUBLE_EQ(0, registry_->GetGauge("trace_query_capacity_history_p99_timestamp_ms", tags).Get());
+    EXPECT_DOUBLE_EQ(0, registry_->GetGauge("trace_query_capacity_history_p99_bytes", tags).Get());
 }
 
 } // namespace kv_cache_manager

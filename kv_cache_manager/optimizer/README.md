@@ -92,9 +92,75 @@ Optimizer 侧在现有 JSON 配置中加入订阅配置，不使用额外配置�
 
 在线 full-attention 实例还会输出 `mrc` gauge（Prometheus 名称默认为 `kvcm_optimizer_mrc`，标签为 `instance_group`、`instance_id` 和 `target_hit_rate_percent`，单位 byte）。`target_hit_rate_percent` 是相对于本上报窗口理论最大可命中量的比例，不是绝对请求命中率：目标命中量等于窗口理论无限容量最大可命中 block 数乘以该比例，`mrc` 则表示保留这些目标命中所需的最小 LRU 容量。当前固定输出 60%、80%、90%、95%、99%、99.5% 六个相对目标。例如理论最大命中率为 68.6% 时，95% 相对目标对应约 65.17% 的绝对命中率，而不是 95%。每次上报会原子取走并清空仅供 MRC 使用的 hit curve，不影响查询数、命中率等累计指标。该值直接聚合 LiteHit 产生的容量无关 hit curve，不依赖预先配置的离散容量点；周期内尚无理论可命中 block 时值为 0。
 
-在线 LiteHit full-attention 实例统计 block reuse interval（同一 block 两次有效访问之间的 producer 时间差）。每个监控上报周期输出 `trace_query_reuse_interval_min_seconds`、`trace_query_reuse_interval_max_seconds` 、`trace_query_reuse_interval_avg_seconds`、`trace_query_reuse_interval_p95_seconds` 和 `trace_query_reuse_interval_p99_seconds`，单位为秒，标签为 `instance_group`、`instance_id`。每次上报后清空本周期样本，但保留各 block 的上次访问时间；均值按本周期所有 block 复用样本加权，不是请求均值的平均。空周期的 Prometheus 时间值为 NaN，KMonitor 不发送该周期的时间值；真实的零间隔仍正常输出 0。只在内部保留本周期样本数以计算平均值，不维护或上报累计 reuse count。统计容量无关，包含前缀 miss 后仍存活的 block；单请求内重复 key 最多计一次，首次访问及 TTL 已过期 block 不产生样本。时间戳未设置时使用 Optimizer 本机到达时间。p95/p99 采用 nearest-rank（ceil(N×p)）口径，使用固定 58 KiB/Instance 的内部对数直方图近似，以桶上界估计并限制不超过本周期 max；非零时间值的向上相对误差小于 1/128（约 0.78125%），零间隔精确。直方图随周期重置，不保存全部样本，不对外输出分桶占比。
+在线 LiteHit full-attention 实例统计 block reuse interval（同一 block 两次有效访问之间的 producer 时间差）。每个监控上报周期输出 `trace_query_reuse_interval_min_seconds`、`trace_query_reuse_interval_max_seconds`、`trace_query_reuse_interval_avg_seconds`、`trace_query_reuse_interval_p95_seconds`、`trace_query_reuse_interval_p99_seconds`、`trace_query_reuse_interval_p995_seconds`（p99.5）和 `trace_query_reuse_interval_p999_seconds`（p99.9），单位为秒，标签为 `instance_group`、`instance_id`。每次上报后清空本周期样本，但保留各 block 的上次访问时间；均值按本周期所有 block 复用样本加权，不是请求均值的平均。空周期的 Prometheus 时间值为 NaN，KMonitor 不发送该周期的时间值；真实的零间隔仍正常输出 0。只在内部保留本周期样本数以计算平均值，不维护或上报累计 reuse count。统计容量无关，包含前缀 miss 后仍存活的 block；单请求内重复 key 最多计一次，首次访问及 TTL 已过期 block 不产生样本。时间戳未设置时使用 Optimizer 本机到达时间。p95/p99/p99.5/p99.9 采用 nearest-rank（ceil(N×p)）口径，使用固定 58 KiB/Instance 的内部对数直方图近似，以桶上界估计并限制不超过本周期 max；非零时间值的向上相对误差小于 1/128（约 0.78125%），零间隔精确。直方图随周期重置，不保存全部样本，不对外输出分桶占比；各分位数不能跨周期或跨 Instance 直接平均成总体分位数。
 
 当前仅 LiteHit full-attention 路径提供原生 reuse interval 统计；旧 linear indexer 不上报这些指标，也不再使用旧 hit-age 分桶作为兼容数据源。
+
+### P99 retrospective capacity estimate
+
+Full-attention instances with theoretical analysis enabled keep a bounded,
+in-memory history: 288 fixed five-minute buckets (approximately 24 hours).
+At reporting time `t`, MRC99 and reuse-interval P99 are drained under the same
+Instance lock. The MRC capacity is backfilled across `[t - reuse_p99, t]`;
+overlapping observations take the **maximum**, never the sum. Both interval
+endpoints round down to five-minute bucket starts, so short/zero reuse still
+updates the current bucket. This is a window-level heuristic, not an exact
+per-key reconstruction or a guarantee of the true minimum cache capacity.
+
+Two Gauge snapshots are exported with `instance_group`, `instance_id`, and
+fixed `slot` (0–287) labels: `trace_query_capacity_history_p99_timestamp_ms`
+and `trace_query_capacity_history_p99_bytes`. A timestamp of 0 means unobserved;
+zero bytes with a positive timestamp is a valid observation. Slots expire even
+in idle reporting windows. Restart, instance recreation, and ResetStats clear
+the history. Clock regression does not resurrect expired history. New requests
+can revise retained older buckets, but cannot revise history already discarded.
+There is no per-request history update and no external queue/storage dependency.
+The core ring uses about 4.5 KiB/Instance; metric registry/tag overhead is extra,
+and these metrics add 576 series per eligible Instance.
+
+Grafana uses two Instant/Table queries against the same exporter identity and
+snapshot time, joins by all identity labels plus `slot`, drops the collection
+time and `slot`, converts the numeric historical milliseconds to a Time field,
+sorts, and prepares multi-frame time series. Filter zero timestamps; never
+average timestamps or independently aggregate values across exporter replicas.
+Each refresh redraws the current snapshot, rather than rewriting samples in
+Prometheus. An Instant query at a historical range end shows the snapshot as of
+that end, not the latest revision; the live panel is intended for a range ending
+at now. Previously unavailable observations are not recovered on deployment.
+
+### 所选时间范围的 token 加权命中率
+
+full-attention 路径周期上报以下累计分析状态，Prometheus 默认加 `kvcm_optimizer_` 前缀。
+这些指标沿用 `trace_query_blocks_total` 的 **Gauge 快照类型**，数值具有累计计数语义：
+正常运行只增不减，`ResetStats`、实例重建或进程重启后归零；并非每个上报周期的增量。
+KMonitor 同样按累计 Gauge 上报，不使用会转换成每秒速率的 QPS 类型。
+
+| 指标后缀 | 标签 | 累计值 |
+| --- | --- | --- |
+| `trace_query_input_tokens_total` | `instance_group`, `instance_id` | 成功进入分析的规范化输入 token 总数，包含不完整尾块对应的 token |
+| `trace_query_max_hit_tokens_total` | 同上 | 理论最大命中 block 总数 × 该 Instance 的 block size；未启用理论分析时不输出 |
+| `trace_query_hit_tokens_total` | 同上，加 `capacity_gb` | 指定模拟容量命中 block 总数 × block size |
+
+分子、分母取自同一个加锁的 InstanceSummary，不混用 service 输入计数，也不从命中率反推计数。
+首次访问和 TTL 过期后的访问仍计入输入，命中按分析器结果计入；TTL 驱逐不扣减历史命中。
+空闲时累计值保持不变。旧 linear 路径不输出这些 token 指标，避免把 block 命中率伪装成 token 命中率。
+
+对于一个指定 exporter/Instance，所选时间范围 `W` 的理论加权值为
+`increase(kvcm_optimizer_trace_query_max_hit_tokens_total[W]) / increase(kvcm_optimizer_trace_query_input_tokens_total[W])`。
+这里对具有 counter 语义的累计浮点快照使用 `increase`，不能使用会忽略归零的普通差值，
+也不能用 `avg_over_time(interval_query_*hit_rate[W])` 替代 token 加权。
+指定容量的分子换成 `trace_query_hit_tokens_total`，分母通过 `ignoring(capacity_gb) group_left` 匹配。
+
+Grafana Table/Stat 使用 **Instant** 查询，评估时刻为所选范围结束时间，`W` 使用 `$__range`。
+有多个 exporter 时必须对每条原始序列先 `increase` 再按业务标签求和，之后相除；
+保留 workspace/application/deployment/instance group/instance 的隔离，容量只保留在有限容量分子上。
+不要先把累计值求和再 `increase`，也不要跨容量累加同一份输入；重复采集同一 exporter 的副本应先由采集链路去重。
+面板单位用 `percentunit`，分母增量为 0 时显示无样本，不补成 0% 或 100%。
+
+注意：这是同口径累计计数的时间范围统计，不是请求级审计。
+`increase` 会校正可见的计数归零并对窗口边界外推（见 [Prometheus 文档](https://prometheus.io/docs/prometheus/latest/querying/functions/#increase)）。
+新版本上线前没有历史 token 计数，不能回填；窗口内至少需要两个有效样本。
+采集空洞、不可见的重置及边界处只有部分上报周期时仍存在监控采样误差，短于上报周期的窗口不能精确还原。
 
 ### Eviction Policies
 

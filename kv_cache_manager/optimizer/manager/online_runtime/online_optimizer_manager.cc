@@ -765,6 +765,40 @@ ErrorCode OnlineOptimizerManager::TakeIntervalMetrics(std::vector<IntervalMetric
     return EC_OK;
 }
 
+ErrorCode OnlineOptimizerManager::TakePlanningMetrics(int64_t timestamp_ms,
+                                                      std::vector<MrcMetricInfo> &mrc_metrics,
+                                                      std::vector<ReuseIntervalMetricInfo> &reuse_metrics,
+                                                      std::vector<CapacityHistoryMetricInfo> &history_metrics) {
+    std::shared_lock lock(instances_mutex_);
+    mrc_metrics.clear();
+    reuse_metrics.clear();
+    history_metrics.clear();
+    for (const auto &[id, state] : instances_) {
+        std::lock_guard<std::mutex> guard(state->mutex);
+        if (state->linear_step != 0 || !state->lite_hit) {
+            continue;
+        }
+        const auto &group = state->instance_info->instance_group_name();
+        const auto reuse = state->lite_hit->TakeReuseIntervalStats();
+        reuse_metrics.push_back({id, group, reuse});
+        if (!state->instance_group->enable_theoretical_max_cache()) {
+            continue;
+        }
+        int64_t p99_capacity = -1;
+        for (const auto &point : state->mrc_window.Take()) {
+            const int64_t bytes =
+                SaturatingMultiplyToInt64(point.required_blocks, static_cast<uint64_t>(state->size_full));
+            mrc_metrics.push_back({id, group, point.target_basis_points, bytes});
+            if (point.target_basis_points == 9900) {
+                p99_capacity = bytes;
+            }
+        }
+        state->capacity_history.Update(timestamp_ms, reuse.p99_ns, p99_capacity, reuse.count > 0);
+        history_metrics.push_back({id, group, state->capacity_history.points()});
+    }
+    return EC_OK;
+}
+
 ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     std::shared_ptr<InstanceState> state;
     {
@@ -808,6 +842,7 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     std::fill(state->interval_hits_per_capacity.begin(), state->interval_hits_per_capacity.end(), 0);
     state->interval_max_hits = 0;
     state->mrc_window.Reset();
+    state->capacity_history.Reset();
     KVCM_LOG_INFO("ResetStats OK: instance[%s]", instance_id.c_str());
     return EC_OK;
 }

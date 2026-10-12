@@ -1,5 +1,6 @@
 #include "kv_cache_manager/optimizer/metrics/optimizer_metrics_reporter.h"
 
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <utility>
@@ -58,9 +59,12 @@ void OptimizerMetricsReporter::ReportInterval() {
     std::vector<IntervalMetricInfo> interval_metrics;
     manager_->TakeIntervalMetrics(interval_metrics);
     std::vector<MrcMetricInfo> mrc_metrics;
-    manager_->TakeMrcMetrics(mrc_metrics);
     std::vector<ReuseIntervalMetricInfo> reuse_metrics;
-    manager_->TakeReuseIntervalMetrics(reuse_metrics);
+    std::vector<CapacityHistoryMetricInfo> history_metrics;
+    const auto timestamp_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    manager_->TakePlanningMetrics(timestamp_ms, mrc_metrics, reuse_metrics, history_metrics);
 
     for (const auto &summary : summaries) {
         MetricsTags instance_tags = {{"instance_group", summary.instance_group}, {"instance_id", summary.instance_id}};
@@ -68,6 +72,18 @@ void OptimizerMetricsReporter::ReportInterval() {
         metrics_registry_->GetGauge("trace_query_total", instance_tags) = static_cast<double>(summary.total_queries);
         metrics_registry_->GetGauge("trace_query_blocks_total", instance_tags) =
             static_cast<double>(summary.total_blocks_queried);
+        // Cumulative analyzer snapshots, not service ingress counters. All
+        // operands come from the same instance-locked summary. Like the other
+        // trace totals these reset with ResetStats / instance recreation.
+        // Legacy linear analyzers do not maintain token-based totals.
+        if (summary.linear_step == 0) {
+            metrics_registry_->GetGauge("trace_query_input_tokens_total", instance_tags) =
+                static_cast<double>(summary.total_input_tokens);
+            if (summary.max_hit_rate >= 0) {
+                metrics_registry_->GetGauge("trace_query_max_hit_tokens_total", instance_tags) =
+                    static_cast<double>(summary.total_max_hits) * summary.block_size;
+            }
+        }
         if (summary.max_hit_rate >= 0) {
             metrics_registry_->GetGauge("trace_query_max_hit_rate", instance_tags) = summary.max_hit_rate;
         }
@@ -89,6 +105,10 @@ void OptimizerMetricsReporter::ReportInterval() {
         for (const auto &capacity : summary.per_capacity_hit_rates) {
             MetricsTags capacity_tags = instance_tags;
             capacity_tags["capacity_gb"] = std::to_string(capacity.capacity_gb);
+            if (summary.linear_step == 0) {
+                metrics_registry_->GetGauge("trace_query_hit_tokens_total", capacity_tags) =
+                    static_cast<double>(capacity.total_hits) * summary.block_size;
+            }
             metrics_registry_->GetGauge("trace_query_hit_rate", capacity_tags) = capacity.hit_rate;
             metrics_registry_->GetGauge("trace_query_capacity_efficiency", capacity_tags) =
                 summary.max_hit_rate > 0 ? capacity.hit_rate / summary.max_hit_rate
@@ -133,11 +153,26 @@ void OptimizerMetricsReporter::ReportInterval() {
             stats.count > 0 ? static_cast<double>(stats.p95_ns) / 1e9 : no_samples;
         metrics_registry_->GetGauge("trace_query_reuse_interval_p99_seconds", tags) =
             stats.count > 0 ? static_cast<double>(stats.p99_ns) / 1e9 : no_samples;
+        metrics_registry_->GetGauge("trace_query_reuse_interval_p995_seconds", tags) =
+            stats.count > 0 ? static_cast<double>(stats.p995_ns) / 1e9 : no_samples;
+        metrics_registry_->GetGauge("trace_query_reuse_interval_p999_seconds", tags) =
+            stats.count > 0 ? static_cast<double>(stats.p999_ns) / 1e9 : no_samples;
     }
 
     if (kmonitor_reporter_) {
         // Both backends consume the same window; never Take() twice.
-        kmonitor_reporter_->ReportInterval(summaries, interval_metrics, mrc_metrics, reuse_metrics);
+        kmonitor_reporter_->ReportInterval(summaries, interval_metrics, mrc_metrics, reuse_metrics, history_metrics);
+    }
+    for (const auto &metric : history_metrics) {
+        for (size_t slot = 0; slot < metric.points.size(); ++slot) {
+            MetricsTags tags = {{"instance_group", metric.instance_group},
+                                {"instance_id", metric.instance_id},
+                                {"slot", std::to_string(slot)}};
+            const auto &point = metric.points[slot];
+            // Empty slots are explicitly cleared, never held at stale values.
+            metrics_registry_->GetGauge("trace_query_capacity_history_p99_timestamp_ms", tags) = point.timestamp_ms;
+            metrics_registry_->GetGauge("trace_query_capacity_history_p99_bytes", tags) = point.capacity_bytes;
+        }
     }
 }
 

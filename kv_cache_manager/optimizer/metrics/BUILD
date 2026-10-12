@@ -1,6 +1,11 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "capacity_history",
+    hdrs = ["capacity_history.h"],
+)
+
+cc_library(
     name = "mrc_window",
     srcs = ["mrc_window.cc"],
     hdrs = ["mrc_window.h"],

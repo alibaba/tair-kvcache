@@ -14,6 +14,7 @@
 #include "kv_cache_manager/optimizer/config/optimizer_instance_info.h"
 #include "kv_cache_manager/optimizer/index/online/cache_indexer.h"
 #include "kv_cache_manager/optimizer/liteHit/lite_hit.h"
+#include "kv_cache_manager/optimizer/metrics/capacity_history.h"
 #include "kv_cache_manager/optimizer/metrics/mrc_window.h"
 
 namespace kv_cache_manager {
@@ -51,6 +52,7 @@ struct InstanceState {
     int64_t interval_max_hits = 0;
 
     MrcWindow mrc_window;
+    CapacityHistory capacity_history;
 };
 
 struct TraceQueryResult {
@@ -90,6 +92,12 @@ struct MrcMetricInfo {
     // count; 9500 means retaining 95% of those theoretical hits.
     uint32_t target_basis_points = 0;
     int64_t capacity_bytes = 0;
+};
+
+struct CapacityHistoryMetricInfo {
+    std::string instance_id;
+    std::string instance_group;
+    std::array<CapacityHistory::Point, CapacityHistory::kSlots> points;
 };
 
 struct IntervalMetricInfo {
@@ -155,6 +163,13 @@ public:
 
     // Returns and clears the MRC curve accumulated since the previous call.
     ErrorCode TakeMrcMetrics(std::vector<MrcMetricInfo> &metrics);
+
+    // Drain both planning inputs under the same instance lock; both reporters
+    // must consume this single snapshot. timestamp_ms is wall-clock report time.
+    ErrorCode TakePlanningMetrics(int64_t timestamp_ms,
+                                  std::vector<MrcMetricInfo> &mrc_metrics,
+                                  std::vector<ReuseIntervalMetricInfo> &reuse_metrics,
+                                  std::vector<CapacityHistoryMetricInfo> &history_metrics);
 
     ErrorCode ResetStats(const std::string &instance_id);
 
