@@ -36,9 +36,11 @@ class TairKvCacheConnectorExtraConfig(BaseModel):
     # Upper bound on the blocks one save/load task stages. The staging pool
     # shrinks a task to the blocks its arena can hold in one run (see
     # staging_pool_max_bytes_per_group), so a batch larger than the pool is
-    # never silently oversized -- the granularity yields instead.
-    block_per_save_task: int = 128
-    block_per_load_task: int = 128
+    # never silently oversized -- the granularity yields instead. A batch of
+    # zero or less is a configuration error, refused at startup rather than
+    # exploding later inside range(0, n, 0).
+    block_per_save_task: int = Field(default=128, ge=1)
+    block_per_load_task: int = Field(default=128, ge=1)
 
     # --- Staging buffers ---
     # Pre-allocated contiguous staging slots, shared by save and load *and* by
