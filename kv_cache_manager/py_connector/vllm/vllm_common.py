@@ -277,9 +277,12 @@ def _check_coverage_survives_folding(group_metas: List["GroupMeta"]) -> None:
     with a full MLA one, or two windows of different widths) are not: the
     scheduler computes its masks from the one member it can see, so it would
     report window data (or a state) as present while the worker's masking knows
-    it is gone -- and the manager would store stale or zero-page bytes as if
-    they were cacheable. That is a silent hole, so the combination is refused at
-    registration, before any request. A packed group whose buckets do agree
+    it is gone. The observable failure depends on which side the folded member
+    lands on: at least one path is loud (a windowed bucket whose capture was
+    withheld fails its announced block instead of publishing it), but the
+    other direction can reach the manager with stale or zero-page bytes, so
+    the combination is refused at registration, before any request, rather
+    than measured case by case. A packed group whose buckets do agree
     (V4.1's compressed group, which declares nothing at all) is untouched.
     """
     seen: Dict[int, Tuple[Any, bool]] = {}
@@ -1147,10 +1150,14 @@ class _BucketKey(NamedTuple):
     # None = full prefix; not None = the bucket's windowed contract.
     retention: Optional[WindowRetention]
     # spec.tokens_per_state (compress_ratio on vllm <= 0.28); 1 = one row per
-    # token. Equal page bytes do not imply equal row granularity: the SWA layer
-    # of a V4-style model (tps=1, block 32, 32 rows x 584 B) and a compressed
-    # main layer (tps=2, block 64, 32 rows x 584 B) are byte-identical tensors
-    # with different address math, so this dimension is what keeps them apart.
+    # token. Equal page bytes do not imply equal row granularity: today the
+    # SWA layer of a V4-style model (tps=1, block 32, 32 rows x 584 B) and a
+    # compressed main layer (tps=2, block 64, 32 rows x 584 B) happen to
+    # differ in class and alignment padding as well, but both separators are
+    # incidental -- same-class layers with tps 1 and 2, or specs without
+    # alignment padding, would collide on every other key while their
+    # address math differs. This dimension is the semantic guardrail; the
+    # load-bearing construction is pinned in TestBucketKeyKeepsRowGranularityApart.
     tokens_per_state: int
 
 
