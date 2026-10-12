@@ -1,7 +1,9 @@
 #include <cstdint>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
@@ -45,6 +47,25 @@ TEST_F(PrometheusExporterTest, SingleGauge) {
     EXPECT_NE(output.find("kvcm_meta_indexer_total_key_count 42000"), std::string::npos);
 }
 
+TEST_F(PrometheusExporterTest, GaugeValuesRoundTripWithoutPrecisionLoss) {
+    const std::vector<double> values = {
+        1791790800000.0, 1791791100000.0, 162349123456789.0, 0.12345678901234567, 1.2345678901234567e-20};
+    for (size_t i = 0; i < values.size(); ++i) {
+        registry_->GetGauge("round_trip", {{"slot", std::to_string(i)}}) = values[i];
+    }
+    std::istringstream input(PrometheusExporter::Expose(*registry_));
+    std::string line;
+    size_t index = 0;
+    while (std::getline(input, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        ASSERT_LT(index, values.size());
+        EXPECT_EQ(std::stod(line.substr(line.find(' ') + 1)), values[index++]);
+    }
+    EXPECT_EQ(index, values.size());
+}
+
 TEST_F(PrometheusExporterTest, MetricsWithTags) {
     MetricsTags tags = {{"instance_group", "group_a"}, {"type", "hf3fs"}};
     Gauge g = registry_->GetGauge("data_storage.storage_usage_ratio", tags);
@@ -73,9 +94,8 @@ TEST_F(PrometheusExporterTest, EventReportSnapshotMetricsReuseServiceTagsAndValu
     SET_METRICS_(&collector, service, query_rt_us, 321.);
 
     const std::string output = PrometheusExporter::Expose(*registry_);
-    const std::string labels =
-        "{api_name=\"ReportEvent\",event_type=\"block_snapshot\",instance_group=\"group_a\","
-        "instance_id=\"instance_a\",type=\"event_report_l2\"}";
+    const std::string labels = "{api_name=\"ReportEvent\",event_type=\"block_snapshot\",instance_group=\"group_a\","
+                               "instance_id=\"instance_a\",type=\"event_report_l2\"}";
     EXPECT_NE(output.find("kvcm_service_query_counter" + labels + " 1"), std::string::npos) << output;
     EXPECT_NE(output.find("kvcm_service_query_rt_us" + labels + " 321"), std::string::npos) << output;
     EXPECT_EQ(output.find("kvcm_event_report_request_counter"), std::string::npos) << output;

@@ -1,6 +1,8 @@
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
 
 #include <cmath>
+#include <iomanip>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string>
@@ -118,6 +120,9 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
     // registered by RevisitIntervalHistogram::Init(). The exporter queries
     // the registry — no suffix-based guessing.
     std::ostringstream ss;
+    // Preserve double round trips, particularly epoch-millisecond gauges.
+    // The default six significant digits collapse neighboring history slots.
+    ss << std::setprecision(std::numeric_limits<double>::max_digits10);
 
     std::string prev_name;
     std::string current_family;             // histogram family for current metric (empty if regular)
