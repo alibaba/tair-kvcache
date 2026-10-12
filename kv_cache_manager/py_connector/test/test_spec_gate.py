@@ -35,11 +35,16 @@ LOGGER_NAME = "kv_cache_manager.py_connector.common.logger"
 
 
 def engine() -> facts.Engine:
-    """The stand-in engine: dtype names stay names, the stub parses them."""
+    """The stand-in engine: dtype names stay names, the stub parses them.
+
+    Its version is the era the stand-in mirrors (0.31), which is what makes the
+    scratch rows' era-dependent skip expectations apply here.
+    """
     return facts.Engine(
         module=sys.modules["vllm.v1.kv_cache_interface"],
         dtype_of=lambda name: name,
         parse_groups=parse_groups,
+        version="0.31.0",
     )
 
 
@@ -62,7 +67,8 @@ class TestZooDispositions(unittest.TestCase):
         for row in facts.ZOO:
             with self.subTest(row=row["name"]):
                 result = facts.run_row(row, self.engine)
-                self.assertEqual(row["disposition"], result.outcome, result.message)
+                expected = facts.expected_outcome(row, self.engine)
+                self.assertEqual(expected, result.outcome, result.message)
                 if result.outcome != "refuse":
                     continue
                 for keyword in row.get("keywords", ()):
@@ -88,7 +94,7 @@ class TestZooDispositions(unittest.TestCase):
 
     def test_skipped_rows_leave_the_companion_alone(self):
         for row in facts.ZOO:
-            if row["disposition"] != "skip":
+            if facts.expected_outcome(row, self.engine) != "skip":
                 continue
             with self.subTest(row=row["name"]):
                 result = facts.run_row(row, self.engine)

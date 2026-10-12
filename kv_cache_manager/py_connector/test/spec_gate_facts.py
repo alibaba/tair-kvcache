@@ -114,6 +114,57 @@ def expected_classes(version: str) -> Optional[set]:
     return {name for name, eras in SPEC_CLASS_ERAS.items() if version in eras}
 
 
+#: Measured capability flags of the scratch families per era: (prefix_cacheable,
+#: uses_slot_mapping, has_layer_views), None = the era has no such attribute.
+#: The skip rests on the era *declaring* both halves (see _is_scratch_spec), so
+#: vLLM 0.29 (ring specs: no slot-mapping flag) and 0.30 (KpoolTailSpec keeps
+#: the slot mapping) refuse those groups -- their pre-PR behaviour, fail-closed.
+SCRATCH_FLAGS: Dict[str, Dict[str, Tuple[Any, Any, Any]]] = {
+    "0.29.0": {
+        "CircularBufferSpec": (False, None, None),
+    },
+    "0.30.0": {
+        "CircularBufferSpec": (False, False, True),
+        "KpoolTailSpec": (False, True, True),
+        "HiSparseHotSpec": (False, False, False),
+        "HiSparseResidentSpec": (False, True, False),
+    },
+    "0.31.0": {
+        "CircularBufferSpec": (False, False, True),
+        "KpoolTailSpec": (False, False, True),
+        "HiSparseHotSpec": (False, False, False),
+        "HiSparseResidentSpec": (False, True, False),
+    },
+}
+
+
+def skip_eras(row: Dict[str, Any]) -> Tuple[str, ...]:
+    """The eras whose spec declares the whole scratch contract for this row."""
+    if row["cls"] == "UniformTypeKVCacheSpecs":
+        member = next(iter(_members(row).values()))
+        return skip_eras(member)
+    eras = SCRATCH_FLAGS.keys()
+    return tuple(
+        version
+        for version in eras
+        if (flags := SCRATCH_FLAGS[version].get(row["cls"])) is not None
+        and flags[0] is False
+        and (flags[1] is False or flags[2] is False)
+    )
+
+
+def expected_outcome(row: Dict[str, Any], engine: "Engine") -> str:
+    """The row's disposition *in this era*.
+
+    Only the scratch rows are era-dependent: the group is dropped where the
+    era's own spec opts out of the transfer contract (see skip_eras); an era
+    that still claims it refuses the group instead of dropping data.
+    """
+    if row["disposition"] != "skip":
+        return row["disposition"]
+    return "skip" if engine.version in skip_eras(row) else "refuse"
+
+
 # --------------------------------------------------------------------------- #
 # The zoo: one row per spec class, at a real construction point.
 #
@@ -659,6 +710,8 @@ class Engine:
     module: Any
     dtype_of: Callable[[str], Any]
     parse_groups: Callable[..., Sequence[Any]]
+    #: The vLLM era this engine speaks (the stand-in passes the era it mirrors).
+    version: str = "0.31.0"
 
     def class_of(self, name: str) -> Optional[type]:
         cls = getattr(self.module, name, None)
