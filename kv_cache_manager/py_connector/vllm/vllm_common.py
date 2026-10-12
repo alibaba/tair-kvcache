@@ -1072,7 +1072,11 @@ def _skip_reason(spec: Any) -> Optional[str]:
             "stable nor needed"
         )
     if _is_scratch_spec(spec):
-        return "per-request scratch, no prefix cache to serve from it"
+        return (
+            "the class declares itself out of the prefix cache "
+            "(prefix_cacheable=False and no slot mapping or no layer views), "
+            "so the manager has nothing to serve"
+        )
     return None
 
 
