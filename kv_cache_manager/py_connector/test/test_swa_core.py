@@ -1087,6 +1087,42 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         self.assertEqual(self.CAPACITY - 1, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=1)
 
+    def test_a_raising_sdk_still_returns_the_slots(self):
+        # The plan handed these slots to this task, so nothing else can return
+        # them: an SDK that raises (a pybind/backend exception, not an error
+        # code) must not shrink the arena for the rest of the process's life
+        # (review_r2 N1 measured 384 of 1024 slots leaking that way).
+        conn, dtm, pool, group = self._fixture()
+        blocks = list(range(self.BLOCKS))
+        conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
+        plan = self._plan(conn, blocks)
+        dtm._transfer_client.SaveKvCaches.side_effect = RuntimeError("pybind blew up")
+        with self.assertRaises(RuntimeError):
+            dtm._save_staged_blocks(
+                group, plan.uris, plan.staged_slots, [0, 1, 2, 3], [None] * 4
+            )
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
+        self._assert_arena_accounting(conn, pool, sessions=0)
+
+        # The same crash through save_task: its single exit turns the escaping
+        # exception into all-failed verdicts, and the slots still come back.
+        blocks = list(range(self.BLOCKS))
+        conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
+        plan = self._plan(conn, blocks)
+        done = {}
+        dtm.save_task(
+            MultiResult(1, lambda flat: done.setdefault("flat", flat)),
+            0,
+            group,
+            plan.uris,
+            None,
+            None,
+            plan.staged_slots,
+        )
+        self.assertEqual([False] * self.BLOCKS, done["flat"])
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
+        self._assert_arena_accounting(conn, pool, sessions=0)
+
     def test_a_second_plan_fails_instead_of_handing_the_slot_out_twice(self):
         conn, dtm, pool, group = self._fixture()
         conn._capture_request(CaptureRequest("r0", [0], all_block_ids=[[7]]))
