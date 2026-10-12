@@ -373,11 +373,13 @@ def group_meta_pinned_bytes(
 ) -> int:
     """The pinned total of a model whose buckets are known as GroupMetas.
 
-    Exactly the number the worker's ``DataTransferManager`` logs as
-    ``total pinned`` for the same configuration (it derives the same shapes
-    from its transfer groups, see ``staging_shape``), so an e2e or kvperf gate
-    can assert a budget from the model's group structure -- on whichever role
-    view it has -- instead of re-deriving the sizing.
+    The number the worker's ``DataTransferManager`` logs as ``total pinned``
+    for the same configuration, for models whose buckets share one element
+    type (every model the connector accepts today); the single ``kv_dtype``
+    argument cannot express a per-bucket dtype split. It derives the same
+    shapes from the group structure (see ``staging_shape``), so an e2e or
+    kvperf gate can assert a budget -- on whichever role view it has --
+    instead of re-deriving the sizing.
     """
     return total_pinned_bytes(
         plan_staging_pools(
