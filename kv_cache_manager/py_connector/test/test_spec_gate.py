@@ -22,11 +22,15 @@ Three things are pinned here that a plain table check would miss:
 
 import sys
 import unittest
+from types import SimpleNamespace
 
 from kv_cache_manager.py_connector.test import spec_gate_facts as facts
 from kv_cache_manager.py_connector.test import vllm_stubs  # noqa: F401 (stubs)
 
 from kv_cache_manager.py_connector.vllm.vllm_common import (
+    _check_attention_spec_supported,
+    _is_scratch_spec,
+    _tokens_per_state,
     parse_groups,
     spec_name,
 )
@@ -101,6 +105,144 @@ class TestZooDispositions(unittest.TestCase):
                 self.assertEqual([meta.group_idx for meta in result.metas], [1])
 
 
+class TestUndeclaredSubclassesFailClosed(unittest.TestCase):
+    """Acceptance is per exact class: a new subclass must be declared first.
+
+    This is the RSWA lesson applied to the mechanism itself: RSWASpec is a
+    FullAttentionSpec subclass whose window lives in a field the gate did not
+    know, and the field whitelist let it pass. Naming RSWA fixes that one
+    class; refusing *undeclared* subclasses fixes the class of hole.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.engine = engine()
+
+    def _subclass(self, base_name: str, class_name: str, **kwargs):
+        base = self.engine.class_of(base_name)
+        assert base is not None
+        cls = type(class_name, (base,), {})
+        return cls(**kwargs)
+
+    def test_undeclared_subclasses_are_refused_whatever_the_fields_say(self):
+        # Three shapes: a bare subclass of each accepted full-prefix class, and
+        # one that keeps a *known* window field (the promote escape hatch is
+        # about the declared class, not about the field set).
+        cases = (
+            ("FullAttentionSpec", "FooFullSpec", {}),
+            ("FullAttentionSpec", "FooWindowSpec", {"sliding_window": 1024}),
+            ("SinkFullAttentionSpec", "FooSinkSpec", {}),
+        )
+        for base, class_name, extra in cases:
+            kwargs = dict(
+                block_size=16, num_kv_heads=4, head_size=64, dtype="bfloat16", **extra
+            )
+            with self.subTest(cls=class_name):
+                spec = self._subclass(base, class_name, **kwargs)
+                with self.assertRaises(NotImplementedError) as ctx:
+                    _check_attention_spec_supported(
+                        "group 0", spec, calculate_kv_scales=False
+                    )
+                message = str(ctx.exception)
+                self.assertIn(class_name, message)
+                self.assertIn("Unsupported kv cache spec", message)
+
+    def test_the_rswa_shaped_subclass_is_refused_too(self):
+        # A brand-new window field on a FullAttentionSpec subclass: accepted by
+        # neither the gate nor parse_groups (the pre-B1 hole).
+        spec = self._subclass(
+            "FullAttentionSpec", "FooBrandNewWindowSpec",
+            block_size=16, num_kv_heads=4, head_size=64, dtype="bfloat16",
+        )
+        spec.brand_new_window = 4096
+        with self.assertRaises(NotImplementedError) as ctx:
+            _check_attention_spec_supported("group 0", spec, calculate_kv_scales=False)
+        self.assertIn("FooBrandNewWindowSpec", str(ctx.exception))
+        with self.assertRaises(NotImplementedError):
+            parse_groups(
+                SimpleNamespace(
+                    kv_cache_groups=[
+                        SimpleNamespace(
+                            layer_names=["l0"], kv_cache_spec=spec, is_eagle_group=False
+                        )
+                    ]
+                ),
+                16,
+                calculate_kv_scales=False,
+            )
+
+    def test_an_undeclared_mla_subclass_is_refused(self):
+        for base, name in (
+            ("MLAAttentionSpec", "FooMLASpec"),
+            ("HiddenStateCacheSpec", "FooHiddenStateSpec"),
+        ):
+            with self.subTest(cls=name):
+                spec = self._subclass(
+                    base, name, block_size=16, num_kv_heads=1, head_size=576,
+                    dtype="bfloat16",
+                )
+                with self.assertRaises(NotImplementedError) as ctx:
+                    _check_attention_spec_supported(
+                        "group 0", spec, calculate_kv_scales=False
+                    )
+                self.assertIn(name, str(ctx.exception))
+
+    def test_declared_classes_are_unaffected(self):
+        # The contrast that keeps the fix honest: the declared classes (and the
+        # declared marker) still transfer.
+        for row_name in ("full", "full_window", "sink", "hidden_state", "tq_full"):
+            with self.subTest(row=row_name):
+                result = facts.run_row(facts.ROW_BY_NAME[row_name], self.engine)
+                self.assertEqual("accept", result.outcome, result.message)
+
+    def test_a_windowed_subclass_names_itself_in_the_refusal(self):
+        # N4: the refusal must name the concrete class (vLLM 0.30's
+        # KpoolTailSpec is refused through this branch, and calling it a
+        # SlidingWindowSpec would send the operator looking for the wrong spec).
+        spec = self._subclass(
+            "SlidingWindowSpec", "MyWindowedSpec",
+            block_size=16, num_kv_heads=4, head_size=64, dtype="bfloat16",
+            sliding_window=512,
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            _check_attention_spec_supported("group 0", spec, calculate_kv_scales=False)
+        message = str(ctx.exception)
+        self.assertIn("MyWindowedSpec", message)
+        self.assertIn("sliding_window=512", message)
+
+
+class TestHiddenStateWindows(unittest.TestCase):
+    """N1: the extract_hidden_states marker gets no window exemption."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.engine = engine()
+
+    def test_a_windowed_hidden_state_spec_is_refused(self):
+        spec_cls = self.engine.class_of("HiddenStateCacheSpec")
+        assert spec_cls is not None
+        spec = spec_cls(
+            block_size=16,
+            num_kv_heads=3,
+            head_size=2560,
+            dtype="bfloat16",
+        )
+        # The real class inherits the window fields from FullAttentionSpec (only
+        # this stand-in's constructor drops them), so set the one vLLM's promote
+        # path would leave behind.
+        spec.sliding_window = 1024
+        with self.assertRaises(NotImplementedError) as ctx:
+            _check_attention_spec_supported("group 0", spec, calculate_kv_scales=False)
+        message = str(ctx.exception)
+        self.assertIn("HiddenStateCacheSpec", message)
+        self.assertIn("sliding_window=1024", message)
+        # ... while the plain marker (the only shape vLLM builds) is accepted.
+        self.assertEqual(
+            "accept",
+            facts.run_row(facts.ROW_BY_NAME["hidden_state"], self.engine).outcome,
+        )
+
+
 class TestScratchGroupSkip(unittest.TestCase):
     """A scratch group is dropped, not refused -- and the wire shows a hole."""
 
@@ -109,15 +251,11 @@ class TestScratchGroupSkip(unittest.TestCase):
         cls.engine = engine()
 
     def _parse(self, groups, mbs=16):
-        from types import SimpleNamespace
-
         return parse_groups(
             SimpleNamespace(kv_cache_groups=groups), mbs, calculate_kv_scales=False
         )
 
     def _group(self, row_name, layers):
-        from types import SimpleNamespace
-
         return SimpleNamespace(
             layer_names=layers,
             kv_cache_spec=facts.build_spec(facts.ROW_BY_NAME[row_name], self.engine),
@@ -180,8 +318,6 @@ class TestScratchGroupSkip(unittest.TestCase):
         )
         self.assertFalse(spec.prefix_cacheable)
         self.assertTrue(spec.uses_slot_mapping)
-        from kv_cache_manager.py_connector.vllm.vllm_common import _is_scratch_spec
-
         self.assertFalse(_is_scratch_spec(spec))
         # ... and the 0.26 shapes answer nothing at all: never skip on a flag
         # the era cannot answer.
@@ -252,10 +388,6 @@ class TestEraSafeTokensPerState(unittest.TestCase):
         cls.engine = engine()
 
     def _message(self, **kwargs) -> str:
-        from kv_cache_manager.py_connector.vllm.vllm_common import (
-            _check_attention_spec_supported,
-        )
-
         spec_cls = self.engine.class_of("MLAAttentionSpec")
         assert spec_cls is not None
         spec = spec_cls(
@@ -284,10 +416,6 @@ class TestEraSafeTokensPerState(unittest.TestCase):
         self.assertNotIn("compress_ratio=4", message)
 
     def test_both_defaults_mean_one_row_per_token(self):
-        from kv_cache_manager.py_connector.vllm.vllm_common import (
-            _tokens_per_state,
-        )
-
         spec_cls = self.engine.class_of("MLAAttentionSpec")
         assert spec_cls is not None
         spec = spec_cls(

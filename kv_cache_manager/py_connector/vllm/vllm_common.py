@@ -486,8 +486,11 @@ def _check_mla_variant(
 #:
 #: * FullAttentionSpec -- including a *promoted* local-attention layer, i.e.
 #:   sliding_window / attention_chunk_size left set by
-#:   --disable-hybrid-kv-cache-manager (kv_cache_utils._promote_local_kv_cache_specs):
-#:   the allocation covers all tokens and the window only narrows the compute.
+#:   kv_cache_utils._promote_local_kv_cache_specs: its two callers are
+#:   unify_hybrid_kv_cache_specs (--disable-hybrid-kv-cache-manager) and
+#:   _try_get_full_allocation_fallback_groups (the allocation-only fallback
+#:   taken when page sizes cannot be unified, with the hybrid manager *on*).
+#:   Both allocate for all tokens and let the window narrow only the compute.
 #:   That is the documented escape hatch for windowed models (GPU KV is not
 #:   saved by it).
 #: * SinkFullAttentionSpec (OpenPangu) -- the sink K/V is a per-layer constant
@@ -495,11 +498,27 @@ def _check_mla_variant(
 #:   so the blocks are the full prefix and the byte round trip is lossless.
 #: * TQFullAttentionSpec (vllm 0.22 - 0.27) -- a page-size-only variant.
 #:
+#: Matched by *exact* type: a class this file has not been taught is refused
+#: even when it inherits from one of these (a subclass is a new claim about
+#: layout and retention -- RSWASpec itself is exactly such a subclass). The
+#: same rule governs _MLA_SPEC_TYPES below. A user-registered custom spec
+#: subclass (see vllm.v1.kv_cache_spec_registry) is refused for the same
+#: reason: it must be declared here deliberately first.
+#:
 #: Era-safe: a class this vLLM lacks reads as None and drops out of the tuple.
 _FULL_PREFIX_SPEC_TYPES: Tuple[type, ...] = tuple(
     cls
     for cls in (FullAttentionSpec, SinkFullAttentionSpec, TQFullAttentionSpec)
     if cls is not None
+)
+
+#: The accepted MLA-family classes: the latent layout itself, plus the
+#: extract_hidden_states marker, which adds no layout of its own. Measured
+#: across the vllm 0.14 - 0.31 trees (envs/): HiddenStateCacheSpec is the only
+#: MLAAttentionSpec subclass any era ships, so exact-type matching refuses
+#: nothing a real engine produces.
+_MLA_SPEC_TYPES: Tuple[type, ...] = tuple(
+    cls for cls in (MLAAttentionSpec, HiddenStateCacheSpec) if cls is not None
 )
 
 
@@ -531,9 +550,17 @@ def _check_attention_spec_supported(
     * compressed MLA (tokens_per_state, or compress_ratio on vllm <= 0.28, > 1):
       one row spans several tokens.
 
-    Accepted: the full-prefix families (_FULL_PREFIX_SPEC_TYPES) and the MLA
-    latent layouts (_check_mla_variant), including the HiddenStateCacheSpec
-    marker (extract_hidden_states), which changes no layout of its own.
+    Accepted: the full-prefix classes (_FULL_PREFIX_SPEC_TYPES) and the MLA
+    latent layouts (_MLA_SPEC_TYPES, which includes the HiddenStateCacheSpec
+    marker of extract_hidden_states -- it changes no layout of its own, so the
+    latent-layout gate is the whole check).
+
+    Acceptance is by *exact* type, never by family: a subclass of an accepted
+    class is a fresh claim about byte layout and retention (RSWASpec is
+    precisely such a subclass) and is refused until this file names it. That is
+    also why the window test below is no longer the only line of defence -- a
+    spec whose window hides under a new field name cannot reach any accept
+    branch at all.
 
     Everything else -- CrossAttentionSpec, EncoderOnlyAttentionSpec, and any
     class this file has not been taught -- fails closed.
@@ -550,7 +577,7 @@ def _check_attention_spec_supported(
         )
     if isinstance(spec, SlidingWindowSpec):
         raise NotImplementedError(
-            f"{origin}: SlidingWindowSpec sliding_window="
+            f"{origin}: {type(spec).__name__} sliding_window="
             f"{getattr(spec, 'sliding_window', None)} extra_retained_tokens="
             f"{getattr(spec, 'extra_retained_tokens', 0)} holds windowed KV: "
             f"vLLM frees the blocks below the window while the request is "
@@ -576,27 +603,31 @@ def _check_attention_spec_supported(
             f"(window retention lands with the sliding-window support)"
         )
     if isinstance(spec, MLAAttentionSpec):
-        # HiddenStateCacheSpec (the extract_hidden_states marker) is accepted
-        # explicitly: it adds no layout of its own, so the latent-layout gate
-        # below is the whole check. Not exercised by this repo's e2e suite
-        # (extract_hidden_states is a user-side wrapper) -- declared as such in
-        # the PR body.
-        is_hidden_state = HiddenStateCacheSpec is not None and isinstance(
-            spec, HiddenStateCacheSpec
-        )
-        if not is_hidden_state:
-            for window_field in ("sliding_window", "attention_chunk_size"):
-                if getattr(spec, window_field, None) is not None:
-                    raise NotImplementedError(
-                        f"{origin}: MLAAttentionSpec has {window_field}="
-                        f"{getattr(spec, window_field)}; a windowed MLA layout "
-                        f"holds windowed or replayed state, not the full "
-                        f"prefix, and is not supported by "
-                        f"TairKvCacheConnector yet"
-                    )
+        if type(spec) not in _MLA_SPEC_TYPES:
+            # HiddenStateCacheSpec is the only declared one (a marker that adds
+            # no layout); anything else is a new layout/retention claim -- the
+            # RSWA shape one level down -- and must be named here first.
+            raise NotImplementedError(
+                f"{origin}: {type(spec).__name__} is an MLAAttentionSpec subclass "
+                f"this connector has not been taught; it transfers the declared "
+                f"latent layouts only ({', '.join(cls.__name__ for cls in _MLA_SPEC_TYPES)})"
+            )
+        # HiddenStateCacheSpec deliberately falls through the same checks as
+        # MLAAttentionSpec: the marker changes no layout, so the window test and
+        # the latent-layout gate apply to it verbatim (it is accepted because
+        # extract_hidden_states writes plain latent bytes).
+        for window_field in ("sliding_window", "attention_chunk_size"):
+            if getattr(spec, window_field, None) is not None:
+                raise NotImplementedError(
+                    f"{origin}: {type(spec).__name__} has {window_field}="
+                    f"{getattr(spec, window_field)}; a windowed MLA layout "
+                    f"holds windowed or replayed state, not the full "
+                    f"prefix, and is not supported by "
+                    f"TairKvCacheConnector yet"
+                )
         _check_mla_variant(origin, spec, calculate_kv_scales=calculate_kv_scales)
         return
-    if isinstance(spec, _FULL_PREFIX_SPEC_TYPES):
+    if type(spec) in _FULL_PREFIX_SPEC_TYPES:
         return
     raise NotImplementedError(
         f"Unsupported kv cache spec {type(spec).__name__} in {origin}: "

@@ -21,6 +21,7 @@ stand-in to the table it was built from.
 import inspect
 import sys
 import unittest
+from types import SimpleNamespace
 from typing import Any, Dict
 
 from kv_cache_manager.py_connector.test import spec_gate_facts as facts
@@ -31,13 +32,17 @@ try:
 
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
-    from kv_cache_manager.py_connector.vllm.vllm_common import parse_groups
+    from kv_cache_manager.py_connector.vllm.vllm_common import (
+        _check_attention_spec_supported,
+        parse_groups,
+    )
 
     _IMPORT_ERROR = ""
 except ImportError as exc:  # pragma: no cover - environment dependent
     torch = None  # ty: ignore[invalid-assignment]
     vllm = None  # ty: ignore[invalid-assignment]
     KVCacheSpec = None  # ty: ignore[invalid-assignment]
+    _check_attention_spec_supported = None  # ty: ignore[invalid-assignment]
     parse_groups = None  # ty: ignore[invalid-assignment]
     _IMPORT_ERROR = str(exc)
 
@@ -162,6 +167,130 @@ class TestZooOnTheRealEngine(RealEngineCase):
                 self.assertEqual([meta.group_idx for meta in result.metas], [1])
 
 
+class TestUndeclaredSubclassesFailClosed(RealEngineCase):
+    """A new FullAttentionSpec / MLA subclass must be declared before it transfers.
+
+    The reviewer's probe for the pre-fix hole: an undeclared subclass -- and in
+    particular one whose window hides in a brand-new field name, the RSWASpec
+    shape -- used to slip through the family accept rule. Exact-type acceptance
+    refuses it at the gate and at parse_groups, while the declared classes and
+    the declared HiddenStateCacheSpec marker keep working.
+    """
+
+    def _subclass(self, base_name: str, class_name: str, **kwargs):
+        base = self.engine.class_of(base_name)
+        self.assertIsNotNone(base, f"{base_name} missing in vLLM {self.version}")
+        return type(class_name, (base,), {})(**kwargs)
+
+    def _gate_refusal(self, spec) -> str:
+        with self.assertRaises(NotImplementedError) as ctx:
+            _check_attention_spec_supported(
+                "group 0", spec, calculate_kv_scales=False
+            )
+        return str(ctx.exception)
+
+    def _assert_parse_refuses(self, spec) -> None:
+        with self.assertRaises(NotImplementedError):
+            parse_groups(
+                SimpleNamespace(
+                    kv_cache_groups=[
+                        SimpleNamespace(
+                            layer_names=["l0"], kv_cache_spec=spec, is_eagle_group=False
+                        )
+                    ]
+                ),
+                16,
+                calculate_kv_scales=False,
+            )
+
+    def test_an_undeclared_subclass_is_refused_even_with_a_brand_new_window(self):
+        # The review report's CPU probe, now an assertion: the base gate refused
+        # this spec (window whitelist), the pre-fix head accepted it.
+        spec = self._subclass(
+            "FullAttentionSpec",
+            "FooBrandNewWindowSpec",
+            block_size=16,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.bfloat16,
+        )
+        object.__setattr__(spec, "brand_new_window", 4096)
+        self.assertIn("FooBrandNewWindowSpec", self._gate_refusal(spec))
+        self._assert_parse_refuses(spec)
+
+    def test_an_undeclared_subclass_with_a_known_window_is_refused_too(self):
+        spec = self._subclass(
+            "FullAttentionSpec",
+            "FooWindowSpec",
+            block_size=16,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.bfloat16,
+            sliding_window=1024,
+        )
+        self.assertIn("FooWindowSpec", self._gate_refusal(spec))
+        self._assert_parse_refuses(spec)
+        # The exact declared class with the same fields is accepted: the
+        # decision is the class, not the field set (the promote escape hatch).
+        full = self.engine.class_of("FullAttentionSpec")
+        self.assertIsNotNone(full)
+        self.assertIsNone(
+            _check_attention_spec_supported(
+                "group 0",
+                full(
+                    block_size=16,
+                    num_kv_heads=4,
+                    head_size=64,
+                    dtype=torch.bfloat16,
+                    sliding_window=1024,
+                ),
+                calculate_kv_scales=False,
+            )
+        )
+
+    def test_undeclared_mla_subclasses_are_refused(self):
+        for base_name, class_name in (
+            ("MLAAttentionSpec", "FooMLASpec"),
+            ("HiddenStateCacheSpec", "FooHiddenStateSpec"),
+        ):
+            with self.subTest(cls=class_name):
+                if self.engine.class_of(base_name) is None:
+                    continue
+                spec = self._subclass(
+                    base_name,
+                    class_name,
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=576,
+                    dtype=torch.bfloat16,
+                )
+                self.assertIn(class_name, self._gate_refusal(spec))
+
+    def test_a_windowed_hidden_state_spec_is_refused(self):
+        # N1: the marker gets no window exemption -- it walks the same window
+        # test and latent-layout gate as MLAAttentionSpec.
+        hidden = self.engine.class_of("HiddenStateCacheSpec")
+        if hidden is None:
+            self.skipTest(f"vLLM {self.version} has no HiddenStateCacheSpec")
+        if "sliding_window" not in inspect.signature(hidden).parameters:
+            self.skipTest("this era's HiddenStateCacheSpec takes no window field")
+        windowed = hidden(
+            block_size=16,
+            num_kv_heads=3,
+            head_size=2560,
+            dtype=torch.bfloat16,
+            sliding_window=1024,
+        )
+        message = self._gate_refusal(windowed)
+        self.assertIn("HiddenStateCacheSpec", message)
+        self.assertIn("sliding_window=1024", message)
+        # The plain marker (the only shape vLLM builds) stays accepted.
+        self.assertEqual(
+            "accept",
+            facts.run_row(facts.ROW_BY_NAME["hidden_state"], self.engine).outcome,
+        )
+
+
 class TestEraShapes(RealEngineCase):
     """What this era spells and declares, through the same code path."""
 
@@ -226,8 +355,10 @@ class TestCoverageGuard(RealEngineCase):
 
     That is the RSWA lesson turned into a test: the hole existed because the
     gate tested *fields*, so a class with a differently-named window slipped
-    through. The table is now the gate's contract, and a new class (or a new
-    era) must be added to it deliberately.
+    through. The gate now accepts exact declared classes only and refuses
+    anything else, so this guard is its other half -- it tells us when a new
+    era ships a class (or a subclass) that should be declared instead of being
+    refused in the field.
     """
 
     def test_every_spec_class_has_a_disposition(self):
