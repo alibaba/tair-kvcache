@@ -7,6 +7,14 @@ level. For pure-logic unit tests we register lightweight stand-ins in
 ``__new__`` with only the attributes the code under test reads. No production
 module is modified; real modules are preferred whenever they are importable
 (e.g. on a dev machine with a full vLLM venv).
+
+The stand-in spec zoo mirrors the *union* of the vLLM eras the connector
+supports: the vllm 0.31 class tree and capability flags (prefix_cacheable /
+uses_slot_mapping / has_layer_views, which is what the parse gate dispatches
+on) plus the 0.26 ``compress_ratio`` spelling next to ``tokens_per_state``.
+Both spellings live on one class because a real engine spec carries exactly one
+of them -- the connector reads whichever is not the default (see
+``vllm_common._tokens_per_state``).
 """
 
 import importlib.util
@@ -203,13 +211,38 @@ def _install_stubs():
     def _quant_mode_value(mode: Any) -> int:
         return int(mode or 0)
 
-    class AttentionSpec:
+    class KVCacheSpec:
+        """The vLLM 0.31 KVCacheSpec root: the three capability flags the parse
+        gate reads. Every real spec answers them, and only the ring-buffer /
+        host-tier ones answer False (per-class overrides below). The flags
+        arrived across vLLM 0.29 - 0.30, which is why the connector reads them
+        with ``getattr(..., True)``."""
+
+        @property
+        def prefix_cacheable(self) -> bool:
+            return True
+
+        @property
+        def uses_slot_mapping(self) -> bool:
+            return True
+
+        @property
+        def has_layer_views(self) -> bool:
+            return True
+
+    class AttentionSpec(KVCacheSpec):
         """vLLM 0.26 AttentionSpec: the derived page sizes the connector reads
         are computed from the raw fields (see the real vLLM for the algebra).
 
         ``page_size_bytes`` is a stub-only shortcut that *pins* the compact
         page size for hand-built fixtures -- the repo's older tests pass it
-        positionally. Leave it None to exercise the real algebra."""
+        positionally. Leave it None to exercise the real algebra.
+
+        ``compress_ratio`` (vllm <= 0.28) and ``tokens_per_state`` (vllm >=
+        0.29) are both carried: this stand-in mirrors the union of the two
+        eras, and a real engine spec carries exactly one of them. The
+        *effective* value -- the one the algebra uses -- is whichever is not
+        the default 1, exactly as ``vllm_common._tokens_per_state`` reads it."""
 
         def __init__(
             self,
@@ -222,13 +255,17 @@ def _install_stubs():
             dtype=None,
             kv_quant_mode=KVQuantMode.NONE,
             indexes_kv_by_block_stride=False,
+            head_size_v=None,
+            tokens_per_state=1,
         ):
             self.block_size = block_size
             self.num_kv_heads = num_kv_heads
             self.head_size = head_size
+            self.head_size_v = head_size if head_size_v is None else head_size_v
             self.dtype = dtype
             self.kv_quant_mode = kv_quant_mode
             self.indexes_kv_by_block_stride = indexes_kv_by_block_stride
+            self.tokens_per_state = tokens_per_state
             self.page_size_padded = page_size_padded
             self._pinned_page_bytes = page_size_bytes
             try:
@@ -237,7 +274,7 @@ def _install_stubs():
                     if page_size_bytes is not None
                     else self._compute_real_page_size_bytes()
                 )
-            except (ArithmeticError, TypeError, AssertionError):
+            except (ArithmeticError, TypeError, AssertionError, KeyError):
                 # A malformed spec (compress_ratio < 1, missing head_size, ...)
                 # is the gate's business: vLLM computes these lazily, this stub
                 # eagerly, so keep the derived sizes None instead of failing the
@@ -267,13 +304,29 @@ def _install_stubs():
                 == KVQuantMode.INT4_PER_TOKEN_HEAD
                 else self.head_size
             )
+            head_dim_v = (
+                self.head_size_v // 2
+                if _quant_mode_value(self.kv_quant_mode)
+                == KVQuantMode.INT4_PER_TOKEN_HEAD
+                else self.head_size_v
+            )
+            # One K row and one V row per token (head_size_v defaults to
+            # head_size, i.e. the K/V-symmetric case).
             return (
-                2
-                * self.block_size
+                self.block_size
                 * self.num_kv_heads
-                * head_dim
+                * (head_dim + head_dim_v)
                 * _dtype_itemsize(self.dtype)
             )
+
+        def _effective_tokens_per_state(self):
+            """The union of the 0.26 compress_ratio and the 0.31
+            tokens_per_state: the non-default one is the effective value (see
+            the class docstring)."""
+            for value in (self.tokens_per_state, getattr(self, "compress_ratio", 1)):
+                if value != 1:
+                    return value
+            return 1
 
         @property
         def storage_block_size(self):
@@ -313,6 +366,7 @@ def _install_stubs():
             sliding_window=None,
             attention_chunk_size=None,
             non_causal=False,
+            tokens_per_state=1,
         ):
             super().__init__(
                 block_size,
@@ -323,11 +377,35 @@ def _install_stubs():
                 dtype=dtype,
                 kv_quant_mode=kv_quant_mode,
                 indexes_kv_by_block_stride=indexes_kv_by_block_stride,
+                head_size_v=head_size_v,
+                tokens_per_state=tokens_per_state,
             )
-            self.head_size_v = head_size_v
             self.sliding_window = sliding_window
             self.attention_chunk_size = attention_chunk_size
             self.non_causal = non_causal
+
+    class TQFullAttentionSpec(FullAttentionSpec):
+        """vllm 0.22 - 0.27: full attention whose page size counts TQ slots."""
+
+        def __init__(self, *args, tq_slot_size=0, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.tq_slot_size = tq_slot_size
+
+    class SinkFullAttentionSpec(FullAttentionSpec):
+        """OpenPangu static sink: the sink constant lives in every request's own
+        blocks, so the blocks still hold the whole prefix."""
+
+        def __init__(self, *args, sink_len=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.sink_len = sink_len
+
+    class RSWASpec(FullAttentionSpec):
+        """R-SWA: prefill stays global, only the last ``rswa_window`` generated
+        tokens are kept -- the gap in between is freed while the request lives."""
+
+        def __init__(self, *args, rswa_window=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.rswa_window = rswa_window
 
     class MLAAttentionSpec(FullAttentionSpec):
         """Mirrors the real spec's consumed contract: the MLA-only fields the
@@ -348,11 +426,15 @@ def _install_stubs():
             compress_ratio=1,
             alignment=None,
             model_version=None,
+            head_size_v=0,
+            state_content_bytes=None,
+            tokens_per_state=1,
         ):
             self.cache_dtype_str = cache_dtype_str
             self.compress_ratio = compress_ratio
             self.alignment = alignment
             self.model_version = model_version
+            self.state_content_bytes = state_content_bytes
             super().__init__(
                 block_size,
                 page_size_bytes,
@@ -362,17 +444,22 @@ def _install_stubs():
                 dtype=dtype,
                 kv_quant_mode=kv_quant_mode,
                 indexes_kv_by_block_stride=indexes_kv_by_block_stride,
+                head_size_v=head_size_v,
+                tokens_per_state=tokens_per_state,
             )
             _apply_alignment_padding(self)
 
         @property
         def storage_block_size(self):
-            return self.block_size // self.compress_ratio
+            return self.block_size // self._effective_tokens_per_state()
 
         def _compute_real_page_size_bytes(self):
             assert self.head_size is not None, (
                 "the stub spec needs head_size to derive its page size"
             )
+            if self.state_content_bytes is not None:
+                # vllm 0.31 packs NoPE + RoPE + scales into one opaque cell.
+                return self.storage_block_size * self.state_content_bytes
             if self.cache_dtype_str == "fp8_ds_mla":
                 if self.model_version == "deepseek_v4":
                     # DeepSeek V4: 448 B NoPE + 128 B RoPE + 8 B scale/token.
@@ -393,13 +480,137 @@ def _install_stubs():
                 * _dtype_itemsize(self.dtype)
             )
 
-    class SlidingWindowMLASpec(AttentionSpec):
+    class HiddenStateCacheSpec(MLAAttentionSpec):
+        """extract_hidden_states marker: an MLA-shaped cache of hidden states."""
+
+        pass
+
+    class SlidingWindowSpec(AttentionSpec):
+        """Windowed KV: blocks below the window are freed while the request
+        lives (so they are not a token prefix)."""
+
+        def __init__(
+            self,
+            block_size,
+            sliding_window=None,
+            page_size_bytes=None,
+            page_size_padded=None,
+            *,
+            num_kv_heads=1,
+            head_size=None,
+            dtype=None,
+            kv_quant_mode=KVQuantMode.NONE,
+            head_size_v=None,
+            extra_retained_tokens=0,
+            tokens_per_state=1,
+        ):
+            self.sliding_window = sliding_window
+            self.extra_retained_tokens = extra_retained_tokens
+            super().__init__(
+                block_size,
+                page_size_bytes,
+                page_size_padded,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=dtype,
+                kv_quant_mode=kv_quant_mode,
+                head_size_v=head_size_v,
+                tokens_per_state=tokens_per_state,
+            )
+
+    class KpoolTailSpec(SlidingWindowSpec):
+        """GLM-5-Next kpool indexer tail: one ring block per request."""
+
+        @property
+        def prefix_cacheable(self):
+            return False
+
+        @property
+        def uses_slot_mapping(self):
+            return False
+
+    class CircularBufferSpec(AttentionSpec):
+        """One block per request holding the open compression group's raw keys."""
+
+        @property
+        def prefix_cacheable(self):
+            return False
+
+        @property
+        def uses_slot_mapping(self):
+            return False
+
+    class ChunkedLocalAttentionSpec(AttentionSpec):
+        """Chunked-local KV: blocks outside the current chunk are freed."""
+
+        def __init__(self, *args, attention_chunk_size=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.attention_chunk_size = attention_chunk_size
+
+    class CrossAttentionSpec(AttentionSpec):
+        """Encoder-decoder cross attention: encoder states, not a token prefix."""
+
+        pass
+
+    class EncoderOnlyAttentionSpec(AttentionSpec):
+        """Encoder-only layers: vLLM returns no spec for them at all."""
+
+        pass
+
+    class HiSparseHotSpec(KVCacheSpec):
+        """Ephemeral per-request HiSparse hot pages."""
+
+        def __init__(self, block_size=None, *, page_size, blocks_per_request=1):
+            self.block_size = block_size
+            self.page_size = page_size
+            self.blocks_per_request = blocks_per_request
+
+        @property
+        def page_size_bytes(self):
+            return self.page_size
+
+        @property
+        def prefix_cacheable(self):
+            return False
+
+        @property
+        def uses_slot_mapping(self):
+            return False
+
+        @property
+        def has_layer_views(self):
+            return False
+
+    class HiSparseResidentSpec(KVCacheSpec):
+        """Reclaimable GPU-resident pages for host-backed HiSparse KV.
+
+        ``uses_slot_mapping`` stays True (the real spec inherits the base
+        default) -- the measured reason the scratch predicate cannot rely on
+        slot mapping alone."""
+
+        def __init__(self, block_size=None, *, page_size):
+            self.block_size = block_size
+            self.page_size = page_size
+
+        @property
+        def page_size_bytes(self):
+            return self.page_size
+
+        @property
+        def prefix_cacheable(self):
+            return False
+
+        @property
+        def has_layer_views(self):
+            return False
+
+    class SlidingWindowMLASpec(SlidingWindowSpec):
         """Windowed / partial-state MLA cache (V4 SWA and compressor state)."""
 
         def __init__(
             self,
             block_size,
-            sliding_window,
+            sliding_window=None,
             page_size_bytes=None,
             page_size_padded=None,
             *,
@@ -411,26 +622,37 @@ def _install_stubs():
             compress_ratio=1,
             alignment=None,
             model_version=None,
+            bounded_replay=False,
+            head_size_v=0,
+            tokens_per_state=1,
         ):
-            self.sliding_window = sliding_window
             self.cache_dtype_str = cache_dtype_str
             self.compress_ratio = compress_ratio
             self.alignment = alignment
             self.model_version = model_version
+            self.bounded_replay = bounded_replay
             super().__init__(
                 block_size,
+                sliding_window,
                 page_size_bytes,
                 page_size_padded,
                 num_kv_heads=num_kv_heads,
                 head_size=head_size,
                 dtype=dtype,
                 kv_quant_mode=kv_quant_mode,
+                head_size_v=head_size_v,
+                tokens_per_state=tokens_per_state,
             )
             _apply_alignment_padding(self)
 
         @property
+        def prefix_cacheable(self):
+            # vllm 0.31: bounded replay hands those layers back to the engine.
+            return not self.bounded_replay
+
+        @property
         def storage_block_size(self):
-            return self.block_size // self.compress_ratio
+            return self.block_size // self._effective_tokens_per_state()
 
         def _compute_real_page_size_bytes(self):
             assert self.head_size is not None, (
@@ -451,7 +673,7 @@ def _install_stubs():
                 * _dtype_itemsize(self.dtype)
             )
 
-    class UniformTypeKVCacheSpecs:
+    class UniformTypeKVCacheSpecs(KVCacheSpec):
         """vLLM's wrapper: one group of layers whose specs share a block size
         but may differ in page size (V3.2 main + indexer)."""
 
@@ -460,8 +682,20 @@ def _install_stubs():
             self.kv_cache_specs = kv_cache_specs
 
         @property
+        def first_spec(self):
+            return next(iter(self.kv_cache_specs.values()))
+
+        @property
         def page_size_bytes(self):
             return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+
+        @property
+        def prefix_cacheable(self):
+            return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
+
+        @property
+        def uses_slot_mapping(self):
+            return self.first_spec.uses_slot_mapping
 
         def get_page_sizes(self):
             return list(
@@ -478,16 +712,29 @@ def _install_stubs():
                 kv_cache_specs=kv_cache_specs,
             )
 
-    class MambaSpec:
+    class MambaSpec(KVCacheSpec):
         def __init__(self, block_size, page_size_bytes):
             self.block_size = block_size
             self.page_size_bytes = page_size_bytes
 
     kv_cache_interface.KVQuantMode = KVQuantMode
+    kv_cache_interface.KVCacheSpec = KVCacheSpec
     kv_cache_interface.AttentionSpec = AttentionSpec
     kv_cache_interface.FullAttentionSpec = FullAttentionSpec
+    kv_cache_interface.TQFullAttentionSpec = TQFullAttentionSpec
+    kv_cache_interface.SinkFullAttentionSpec = SinkFullAttentionSpec
+    kv_cache_interface.RSWASpec = RSWASpec
     kv_cache_interface.MLAAttentionSpec = MLAAttentionSpec
+    kv_cache_interface.HiddenStateCacheSpec = HiddenStateCacheSpec
+    kv_cache_interface.SlidingWindowSpec = SlidingWindowSpec
     kv_cache_interface.SlidingWindowMLASpec = SlidingWindowMLASpec
+    kv_cache_interface.KpoolTailSpec = KpoolTailSpec
+    kv_cache_interface.CircularBufferSpec = CircularBufferSpec
+    kv_cache_interface.ChunkedLocalAttentionSpec = ChunkedLocalAttentionSpec
+    kv_cache_interface.CrossAttentionSpec = CrossAttentionSpec
+    kv_cache_interface.EncoderOnlyAttentionSpec = EncoderOnlyAttentionSpec
+    kv_cache_interface.HiSparseHotSpec = HiSparseHotSpec
+    kv_cache_interface.HiSparseResidentSpec = HiSparseResidentSpec
     kv_cache_interface.UniformTypeKVCacheSpecs = UniformTypeKVCacheSpecs
     kv_cache_interface.MambaSpec = MambaSpec
 
