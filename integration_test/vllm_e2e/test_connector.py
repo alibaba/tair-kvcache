@@ -80,6 +80,50 @@ def _worker_attr(name):
     return property(lambda self: getattr(self.connector_worker, name))
 
 
+def _group_has_slots(block_table, group_bs, manager_block, manager_block_size):
+    """Does this one group hold real slots for this manager block?
+
+    vLLM writes the null block (id 0, the shared zero page) into the block
+    table of every position it did not allocate, so a block table entry of 0 is
+    exactly "no slot here": true for a windowed group's positions outside its
+    window, never true for a full-attention group (which keeps every matched
+    block). Deliberately re-derived here instead of importing the connector's
+    predicate: the capture side has to stay independent of the code under test.
+    """
+    first = manager_block * manager_block_size
+    last = first + manager_block_size - 1
+    for logical in range(first // group_bs, last // group_bs + 1):
+        if logical >= len(block_table) or block_table[logical] == 0:
+            return False
+    return True
+
+
+def _groups_to_capture(cap_groups, windowed_groups, block_ids_per_group,
+                       manager_block, manager_block_size):
+    """The attention groups whose KV this block must be captured from.
+
+    Per (group, block), not per block: a windowed group has no slots outside
+    its window while a full-attention group keeps the whole matched prefix, and
+    the connector really loads the full group's out-of-window blocks. Dropping
+    the whole block record would take those loaded bytes -- and only those --
+    out of the assertion surface. An empty result means nothing was loaded for
+    this block at all (a model whose attention groups are all windowed).
+
+    ``windowed_groups`` is [group_idx] for the windowed attention groups (empty
+    for every other model, which returns every attention group).
+    """
+    keep = set()
+    for group_idx, is_attention, _, group_bs, _ in cap_groups:
+        if not is_attention:
+            continue  # state groups do their own null-block check
+        if group_idx not in windowed_groups or _group_has_slots(
+            block_ids_per_group[group_idx], group_bs, manager_block,
+            manager_block_size,
+        ):
+            keep.add(group_idx)
+    return keep
+
+
 class VerifyingConnector(TairKvCacheConnector):
     """Production connector + independent per-group KV capture for e2e."""
 
@@ -102,12 +146,25 @@ class VerifyingConnector(TairKvCacheConnector):
         # Snapshot the static per-group description into a capture-friendly form.
         # Each entry: (group_idx, is_attention, layer_names, group_block_size,
         # kernel_block_size). kernel_block_size is read straight off the tensor.
+        # Windowed attention groups (see WindowRetention) are additionally
+        # listed so the capture can tell "vLLM allocated a slot" from "this is
+        # the null page": their blocks are freed while the request lives, so a
+        # capture must be taken in the step that produced them and a load only
+        # ever has real slots inside the window. Kept as a list for the
+        # registration log (and a set for the per-block lookup).
         self._cap_groups = []
+        self._windowed_groups = []
+        self._windowed_idx = set()
+        self._attn_idx = set()
         self._state_caches = {}
         for meta in self._group_metas:
             if isinstance(meta, AttentionGroupMeta):
                 ref = kv_caches[meta.layer_names[0]]
                 kernel_bs = attn_kv_views(ref)[0][0].shape[1]
+                self._attn_idx.add(meta.group_idx)
+                if meta.retention is not None:
+                    self._windowed_groups.append((meta.group_idx, meta.block_size))
+                    self._windowed_idx.add(meta.group_idx)
             else:
                 kernel_bs = 0
                 for name in meta.layer_names:
@@ -156,10 +213,12 @@ class VerifyingConnector(TairKvCacheConnector):
         self._data_transfer.create_load_done_callback = tracking_factory
         logger.warning(
             "VerifyingConnector enabled, capture_dir=%s tp_rank=%s groups=%s "
-            "vllm_bs=%s manager_bs=%s",
+            "windowed=%s vllm_bs=%s manager_bs=%s block_tables=%d",
             self._capture_dir, self._tp_rank,
             [(g[0], "attn" if g[1] else "state", g[3], g[4]) for g in self._cap_groups],
+            self._windowed_groups,
             self._vllm_block_size, self._manager_block_size,
+            len(self._group_metas),
         )
 
     # ------------------------------------------------------------------ #
@@ -214,20 +273,48 @@ class VerifyingConnector(TairKvCacheConnector):
         super().wait_for_save()
 
     def _capture_refs(self, meta: TairKvCacheConnectorMetadata):
-        if not meta.to_save_requests:
+        """Reference capture of the blocks being saved.
+
+        Windowed models: driven by the *capture* requests, i.e. the same
+        scheduler loop iteration that produced the bytes. The save request
+        arrives a step (or more) later -- by then vLLM has already freed the
+        blocks outside the window and written the null block into their table
+        entries, so reading them then would capture the shared zero page
+        instead of the block. Full-prefix groups are never freed, so they keep
+        the original save-request-driven capture (identical behaviour to
+        before windowed groups existed).
+        """
+        if not getattr(self, "_windowed_groups", None):
+            if not meta.to_save_requests:
+                return
+            # Make all forward-pass KV writes visible before reading the paged cache.
+            self._device_mod.synchronize()
+            tokens = getattr(meta, "token_snapshots", {})
+            for save_req in meta.to_save_requests:
+                token_ids = tokens.get(save_req.req_id)
+                if token_ids is None or not save_req.all_block_ids:
+                    continue
+                self._capture_range(
+                    kind="ref",
+                    token_ids=token_ids,
+                    block_ids_per_group=save_req.all_block_ids,
+                    manager_block_idxes=save_req.manager_block_idxes,
+                )
             return
-        # Make all forward-pass KV writes visible before reading the paged cache.
+
+        if not meta.to_capture_requests:
+            return
         self._device_mod.synchronize()
         tokens = getattr(meta, "token_snapshots", {})
-        for save_req in meta.to_save_requests:
-            token_ids = tokens.get(save_req.req_id)
-            if token_ids is None or not save_req.all_block_ids:
+        for capture in meta.to_capture_requests:
+            token_ids = tokens.get(capture.req_id)
+            if token_ids is None or not capture.all_block_ids:
                 continue
             self._capture_range(
                 kind="ref",
                 token_ids=token_ids,
-                block_ids_per_group=save_req.all_block_ids,
-                manager_block_idxes=save_req.manager_block_idxes,
+                block_ids_per_group=capture.all_block_ids,
+                manager_block_idxes=capture.manager_block_idxes,
             )
 
     def _capture_pending_loaded(self, meta):
@@ -266,7 +353,75 @@ class VerifyingConnector(TairKvCacheConnector):
         # loads arrive all-at-once, so per-block records let the driver match
         # reference vs loaded captures by each block's token content.
         for b in manager_block_idxes:
-            self._capture_block(kind, token_ids, block_ids_per_group, b)
+            groups = None
+            # Only a windowed group can lack slots, so a model without one
+            # keeps the original capture set byte for byte (this guard is what
+            # makes the narrowing a no-op for full-attention and hybrid
+            # models).
+            if kind == "loaded" and self._windowed_idx:
+                # A load only writes where vLLM allocated slots, and that is a
+                # per-group fact: windowed groups park everything outside their
+                # window on the null page, while a full-attention group keeps
+                # the whole matched prefix and *is* loaded out of the window.
+                # Narrow to the groups that really have slots instead of
+                # dropping the block, so the out-of-window load stays verified.
+                groups = _groups_to_capture(
+                    self._cap_groups, self._windowed_idx, block_ids_per_group,
+                    b, self._manager_block_size,
+                )
+                # The groups this block's load did *not* touch are dropped from
+                # the record; make sure they were not written either, or the
+                # filter itself would hide exactly the corruption it exists to
+                # detect (see _assert_null_page_untouched). Checked before the
+                # empty-set skip so a purely windowed model (no full-attention
+                # group to keep the record alive) is covered as well.
+                self._assert_null_page_untouched(
+                    block_ids_per_group, b, self._attn_idx - groups,
+                )
+                if not groups:
+                    continue
+            self._capture_block(kind, token_ids, block_ids_per_group, b, groups)
+
+    def _assert_null_page_untouched(self, block_ids_per_group, manager_block_idx,
+                                    excluded):
+        """The positions vLLM parked on the null block must still hold nothing.
+
+        A windowed group's out-of-window positions are not loaded, so the
+        loaded capture drops that group from the block's record -- and with it
+        any evidence that the connector wrote there. vLLM's null block is
+        shared by every position it did not allocate, so a write would corrupt
+        it for every other block and request. The KV cache is allocated with
+        torch.zeros, so the page being all-zero is exactly "nobody wrote here":
+        read the dropped positions and require that.
+
+        ``excluded`` is the set of attention group indices not captured for
+        this block (empty when every group has slots).
+        """
+        if not excluded:
+            return
+        mbs = self._manager_block_size
+        positions = list(range(manager_block_idx * mbs,
+                               (manager_block_idx + 1) * mbs))
+        for group_idx, _, layer_names, group_bs, kernel_bs in self._cap_groups:
+            if group_idx not in excluded:
+                continue
+            table = block_ids_per_group[group_idx]
+            slots = [self._attn_token_slot(p, table, group_bs, kernel_bs)
+                     for p in positions]
+            slot_tensor = torch.tensor(slots, dtype=torch.long,
+                                       device=self._device)
+            blk = slot_tensor // kernel_bs
+            tok = slot_tensor % kernel_bs
+            for layer_name in layer_names:
+                for view in attn_kv_views(self._kv_caches[layer_name])[0]:
+                    if int(torch.count_nonzero(view[blk, tok])) != 0:
+                        raise AssertionError(
+                            f"vLLM's null block was written: group {group_idx} "
+                            f"layer {layer_name} of manager block "
+                            f"{manager_block_idx} holds non-zero bytes at a "
+                            f"position vLLM did not allocate (manager block "
+                            f"size {mbs}); the connector must never write "
+                            f"out-of-window slots")
 
     def _attn_token_slot(self, pos, block_table, group_bs, kernel_bs):
         """Map a global token position to its flat slot in an attention group.
@@ -283,7 +438,13 @@ class VerifyingConnector(TairKvCacheConnector):
         physical = block_table[logical] * ratio + off // kernel_bs
         return physical * kernel_bs + off % kernel_bs
 
-    def _capture_block(self, kind, token_ids, block_ids_per_group, manager_block_idx):
+    def _capture_block(self, kind, token_ids, block_ids_per_group,
+                       manager_block_idx, groups=None):
+        """Capture one manager block's KV.
+
+        ``groups`` (loaded captures) restricts the attention groups to those
+        vLLM gave a slot to for this block; None captures every group.
+        """
         mbs = self._manager_block_size
 
         # Global token positions covered by this manager block.
@@ -297,6 +458,8 @@ class VerifyingConnector(TairKvCacheConnector):
         kv_by_layer = {}
 
         for group_idx, is_attention, layer_names, group_bs, kernel_bs in self._cap_groups:
+            if groups is not None and is_attention and group_idx not in groups:
+                continue
             block_table = block_ids_per_group[group_idx]
             if is_attention:
                 slots = [self._attn_token_slot(p, block_table, group_bs, kernel_bs)
@@ -345,11 +508,19 @@ class VerifyingConnector(TairKvCacheConnector):
 
 
 class MutatedWorkerCore(ConnectorWorker):
-    """Off-by-one in the attention token translation (see MutatedConnector)."""
+    """Off-by-one in the attention token translation (see MutatedConnector).
 
-    def _attn_token_indices(self, group, manager_block_idxes, block_table):
-        out = super()._attn_token_indices(group, manager_block_idxes, block_table)
-        return [[slot - 1 for slot in block] for block in out]
+    The translation entry point is ``_attn_slots`` (``_attn_token_indices`` is
+    its slots-only wrapper): every attention transfer -- the windowed eager
+    capture, the staged save and the load -- goes through it, so patching this
+    one method shifts the whole data path.
+    """
+
+    def _attn_slots(self, group, manager_block_idxes, block_table):
+        slots, null_masks = super()._attn_slots(
+            group, manager_block_idxes, block_table
+        )
+        return [[slot - 1 for slot in block] for block in slots], null_masks
 
 
 class MutatedConnector(VerifyingConnector):

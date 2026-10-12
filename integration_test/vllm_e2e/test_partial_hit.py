@@ -15,6 +15,12 @@ This scenario forces both, with prefix caching enabled for all model types:
   externally matches A+B -- proving stage 2's incremental save committed --
   loads it, and the loaded KV is verified against the reference captures.
 
+Windowed models (SWA): vLLM hands out slots per group -- the tail window of
+the match for every group, plus the whole match for a full-attention group --
+so stage 3 asserts the loaded blocks are exactly that region (see
+``test_mid_prefix_hit`` for the case where the hit ends in the middle of a
+saved request).
+
 Log evidence asserted: a getCacheLocation request carrying a non-zero offset
 (requires connector DEBUG logging, enabled via log_level).
 """
@@ -23,8 +29,9 @@ import logging
 import unittest
 
 from e2e_lib import (
-    ScenarioEnv, assert_report_ok, compare_captures, make_base_prompts,
-    send_completions, shared_token_prefix_len, tokenize, wait_for_captures,
+    ScenarioEnv, assert_loaded_blocks, assert_report_ok, compare_captures,
+    full_block_hashes, loaded_block_count, make_base_prompts, send_completions,
+    shared_token_prefix_len, tokenize, wait_for_captures,
     wait_for_prefix_cached,
 )
 
@@ -40,7 +47,7 @@ class TestPartialHit(unittest.TestCase):
             vllm = env.start_vllm(log_suffix="_s12")
             mbs = env.manager_block_size()
 
-            base = make_base_prompts(1, env.hybrid)[0]
+            base = make_base_prompts(1, env.hybrid, env.window)[0]
             # Three nested prompts: A < A+B < A+B+C.
             prompt_a = base
             prompt_ab = base + " Continuation section B. " + " ".join(
@@ -53,12 +60,16 @@ class TestPartialHit(unittest.TestCase):
             toks_abc = tokenize(vllm.base_url(), prompt_abc)
             blocks_a = len(toks_a) // mbs
             blocks_ab = len(toks_ab) // mbs
-            shared_abc = shared_token_prefix_len(toks_ab, toks_abc) // mbs
+            shared_abc = min(shared_token_prefix_len(toks_ab, toks_abc) // mbs,
+                             blocks_ab)
+            load_blocks = loaded_block_count(
+                shared_abc * mbs, env.window, mbs, env.full_attention_group,
+                env.window_kind)
             self.assertGreaterEqual(blocks_a, 1)
             self.assertGreater(blocks_ab, blocks_a,
                                "B must add at least one manager block")
-            logger.info("blocks: A=%d AB=%d shared(AB,ABC)=%d",
-                        blocks_a, blocks_ab, shared_abc)
+            logger.info("blocks: A=%d AB=%d shared(AB,ABC)=%d load=%d window=%s",
+                        blocks_a, blocks_ab, shared_abc, load_blocks, env.window)
 
             # ---- Stage 1: save A.
             send_completions(vllm.base_url(), [prompt_a])
@@ -84,10 +95,124 @@ class TestPartialHit(unittest.TestCase):
             vllm = env.restart_vllm(log_suffix="_s3")
             send_completions(vllm.base_url(), [prompt_abc])
             wait_for_captures(env.capture_dir, "loaded",
-                              expected=shared_abc, timeout=180)
+                              expected=env.tp_size * load_blocks, timeout=180)
+
+            hashes = full_block_hashes(toks_abc, mbs)
+            assert_loaded_blocks(
+                env.capture_dir,
+                {(f"tp{r}", h) for r in range(env.tp_size)
+                 for h in hashes[shared_abc - load_blocks:shared_abc]},
+                env.tp_size)
 
             report = compare_captures(env.capture_dir)
-            assert_report_ok(report, min_matched=shared_abc)
+            assert_report_ok(report, min_matched=env.tp_size * load_blocks)
+            env.assert_pinned_budget()
+        finally:
+            env.stop()
+
+    def test_mid_prefix_hit(self):
+        """The external hit ends in the middle of a saved request.
+
+        Every other scenario's match ends at (or near) the end of what was
+        saved, so a connector that served "the tail of the stored prefix"
+        would look correct. Here B is a strict token prefix of A plus a fresh
+        suffix, so the match ends several windows before A's own tail: the
+        blocks vLLM hands out slots for are A's *middle* blocks. Asserting the
+        loaded blocks are exactly the window ending at B's match end -- and
+        that no block of A's tail was loaded -- pins the load region to the
+        hit, not to the stored request.
+
+        Windowed models only: with a window the matched region is strictly
+        larger than the loaded region, which is what this scenario contrasts.
+        """
+        env = ScenarioEnv("mid_prefix_hit", enable_prefix_caching=True,
+                          log_level="DEBUG")
+        try:
+            env.start_manager()
+            if env.window is None:
+                self.skipTest("mid-prefix window assertions need a windowed model")
+            mbs = env.manager_block_size()
+            window_blocks = -(-(env.window - 1) // mbs)
+            # B's match must end inside A, one window before A's own tail window,
+            # so the prompt has to hold three windows. A window larger than a
+            # third of the model length cannot satisfy that with a request the
+            # server accepts: say so instead of failing an assertion that is
+            # impossible to meet (the prompt would have to exceed
+            # --max-model-len, and the server would reject it).
+            needed_tokens = 3 * window_blocks * mbs
+            if needed_tokens > env.max_model_len():
+                self.skipTest(
+                    f"a {env.window}-token window needs {needed_tokens} tokens "
+                    f"for three windows, over the {env.max_model_len()} this "
+                    f"server accepts; the mid-prefix case cannot be built")
+            vllm = env.start_vllm(log_suffix="_p1")
+            # The loaded region is the union of every group's slots: the window
+            # for the sliding groups, the whole match for the full-attention
+            # one (so it is a superset of the window).
+
+            toks_a = tokenize(vllm.base_url(),
+                              make_base_prompts(1, env.hybrid, env.window)[0])
+            blocks_a = len(toks_a) // mbs
+            toks_a = toks_a[:blocks_a * mbs]
+            # B's match must end inside A but far enough in that the window it
+            # is served from is a real one (not the prompt head), and far
+            # enough from A's end that A's own tail window is a different
+            # region: k < mid and mid + k <= blocks_a.
+            mid = min(2 * window_blocks, blocks_a - window_blocks)
+            self.assertGreaterEqual(mid, 2 * window_blocks,
+                                    f"A too short ({blocks_a} blocks) for a "
+                                    f"mid-prefix hit with a {window_blocks}-block "
+                                    f"window")
+            suffix = tokenize(vllm.base_url(), " Final question: what is 2+2?")
+            toks_b = toks_a[:mid * mbs] + suffix
+            logger.info("A=%d blocks, B matches %d blocks (window=%d blocks)",
+                        blocks_a, mid, window_blocks)
+
+            # ---- Phase 1: save A (token ids: exact cache keys).
+            send_completions(vllm.base_url(), [toks_a], max_tokens=4)
+            wait_for_captures(env.capture_dir, "ref", expected=blocks_a, timeout=180)
+            self.assertTrue(wait_for_prefix_cached(
+                env.manager.manager_uri(), env.instance_id, toks_a,
+                min_blocks=blocks_a), "A was not committed to the manager")
+
+            # ---- Phase 2: restart, then run B against A's middle.
+            vllm = env.restart_vllm(log_suffix="_p2")
+            send_completions(vllm.base_url(), [toks_b], max_tokens=4)
+
+            matched = [int(g[0]) for g in
+                       env.scan_connector_logs(r"matched (\d+) external tokens")]
+            self.assertEqual(max(matched, default=0), mid * mbs,
+                             f"the external match did not end at B's prefix: "
+                             f"{matched} (want {mid * mbs}); A holds "
+                             f"{blocks_a * mbs} tokens")
+            self.assertFalse(env.scan_connector_logs(r"load task failed"),
+                             "a load failed: a published block was not readable")
+
+            hashes = full_block_hashes(toks_b, mbs)
+            # The loaded region is the union of every group's slots: the window
+            # of the hit for the sliding groups (the region a "just serve the
+            # stored tail" implementation would *not* have loaded), plus the
+            # whole match for the full-attention group.
+            covered = loaded_block_count(mid * mbs, env.window, mbs,
+                                         env.full_attention_group,
+                                         env.window_kind)
+            expected_keys = {(f"tp{r}", h) for r in range(env.tp_size)
+                             for h in hashes[mid - covered:mid]}
+            # ... and that whole region is disjoint from A's own tail window
+            # (the region a "just serve the stored tail" implementation would
+            # have loaded), so the scenario can tell "region of the hit" from
+            # "tail of the stored request" apart.
+            self.assertLessEqual(mid, blocks_a - window_blocks,
+                                 "the loaded region overlaps A's tail window; the "
+                                 "scenario cannot tell 'region of the hit' from "
+                                 "'tail of the stored request' apart")
+            wait_for_captures(env.capture_dir, "loaded",
+                              expected=env.tp_size * covered, timeout=180)
+            assert_loaded_blocks(env.capture_dir, expected_keys, env.tp_size)
+
+            report = compare_captures(env.capture_dir)
+            assert_report_ok(report, min_matched=env.tp_size * covered)
+            env.assert_pinned_budget()
         finally:
             env.stop()
 

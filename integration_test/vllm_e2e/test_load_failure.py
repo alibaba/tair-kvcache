@@ -33,6 +33,7 @@ loops load-fail-reschedule forever and the request hangs.
 
 import logging
 import os
+import sys
 import unittest
 from urllib.parse import urlparse
 
@@ -96,10 +97,10 @@ class TestLoadFailure(unittest.TestCase):
         )
         try:
             env.start_manager()
-            vllm = env.start_vllm(log_suffix="_p1" if env.hybrid else "")
+            vllm = env.start_vllm(log_suffix="_p1" if env.multigroup else "")
             mbs = env.manager_block_size()
 
-            prompt = make_base_prompts(1, env.hybrid)[0]
+            prompt = make_base_prompts(1, env.hybrid, env.window)[0]
             suffix = " Now answer: what is 2+2?"
             toks = tokenize(vllm.base_url(), prompt)
             save_blocks = len(toks) // mbs
@@ -125,7 +126,9 @@ class TestLoadFailure(unittest.TestCase):
             logger.info("deleted %d/%d block files (kept blocks 0..%d)",
                         save_blocks - keep, save_blocks, keep - 1)
 
-            if env.hybrid:
+            if env.multigroup:
+                # Prefix caching stays on for multi-group models, so the restart
+                # is what forces the load through KVCM.
                 vllm = env.restart_vllm(log_suffix="_p2")
 
             # ---- Phase 2: load with holes. The request must return normally.
@@ -140,15 +143,20 @@ class TestLoadFailure(unittest.TestCase):
             self.assertTrue(failed_tasks, "no load failure was logged; the "
                             "sabotage did not break any loaded block")
 
-            if env.hybrid:
-                # report_failures=False path: swallowed but logged.
+            if env.connector_block_tables() > 1:
+                # Multi-block-table path: the connector cannot hand vLLM a
+                # group-indexed invalid-block list, so report_failures is False
+                # and the failure is swallowed into a log line. Keyed on the
+                # *registered* block-table count, not on the model family: a
+                # single-group windowed model reports like full attention even
+                # though is_multigroup()/env.hybrid are true for it.
                 swallowed = env.scan_connector_logs(
                     r"load failed for \d+/\d+ blocks .*hybrid")
                 self.assertTrue(swallowed,
-                                "hybrid load failure was not logged")
+                                "multi-block-table load failure was not logged")
                 return
 
-            # Full-attention: vLLM was told about the invalid blocks...
+            # Single block table: vLLM was told about the invalid blocks...
             reported = env.scan_connector_logs(r"block_ids_with_load_errors")
             self.assertTrue(reported, "failed loads were not reported to vLLM")
 
@@ -181,7 +189,17 @@ class TestLoadFailure(unittest.TestCase):
                 f"only {len(matched_kept)}/{keep * env.tp_size} surviving "
                 f"blocks verified")
         finally:
-            env.stop()
+            # Stop the processes even if the gate raises: a leaked manager or
+            # engine would hold ports and GPU memory and cascade into the next
+            # scenario. On the way out of a *failing* run the gate is skipped
+            # entirely -- that failure must surface, not a gate that may not
+            # even be evaluable (the engine logs exist only if a server got far
+            # enough to print its pinned line).
+            try:
+                if sys.exc_info()[0] is None:
+                    env.assert_pinned_budget()
+            finally:
+                env.stop()
 
 
 if __name__ == "__main__":

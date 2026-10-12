@@ -22,7 +22,8 @@ from pathlib import Path
 import unittest
 
 from e2e_lib import (
-    ScenarioEnv, full_block_hashes, make_base_prompts, send_completions, tokenize,
+    ScenarioEnv, assert_loaded_blocks, full_block_hashes, loaded_block_count,
+    make_base_prompts, send_completions, tokenize, wait_for_captures,
     wait_for_prefix_cached,
 )
 
@@ -34,12 +35,13 @@ class TestFullHit(unittest.TestCase):
         env = ScenarioEnv("full_hit")
         try:
             env.start_manager()
-            vllm = env.start_vllm(log_suffix="_p1" if env.hybrid else "")
+            vllm = env.start_vllm(log_suffix="_p1" if env.multigroup else "")
 
             mbs = env.manager_block_size()
             # Trim a long-enough prompt's token ids to an exact multiple of the
             # manager block size (>= 2 blocks so the cap has room to drop one).
-            toks = tokenize(vllm.base_url(), make_base_prompts(1, env.hybrid)[0])
+            toks = tokenize(vllm.base_url(),
+                            make_base_prompts(1, env.hybrid, env.window)[0])
             num_blocks = len(toks) // mbs
             self.assertGreaterEqual(
                 num_blocks, 2, f"prompt too short: {len(toks)} tokens, mbs={mbs}")
@@ -81,7 +83,10 @@ class TestFullHit(unittest.TestCase):
                 expected_hit = max(
                     ((i + 1) * mbs for i, names in enumerate(checkpoints[:-1])
                      if names == state_layers), default=0)
-                # Clear the local prefix cache so phase 2 goes external.
+
+            if env.multigroup:
+                # Prefix caching is on for multi-group models; restart so the
+                # hit comes from KVCM, not from the local prefix cache.
                 vllm = env.restart_vllm(log_suffix="_p2")
 
             # Phase 2: the exact same prompt -> full external hit. Without the
@@ -103,6 +108,24 @@ class TestFullHit(unittest.TestCase):
                         max(matched), expected_hit)
             self.assertTrue(all(m < len(prompt_ids) for m in matched),
                             f"match not capped below prompt len: {matched}")
+
+            # The capped hit still loads exactly the region vLLM gave slots
+            # for: the tail window of every group, plus the whole matched
+            # prefix when the model has a full-attention group.
+            if expected_hit:
+                matched_blocks = expected_hit // mbs
+                load_blocks = loaded_block_count(
+                    expected_hit, env.window, mbs, env.full_attention_group,
+                    env.window_kind)
+                hashes = full_block_hashes(prompt_ids, mbs)
+                wait_for_captures(env.capture_dir, "loaded",
+                                  expected=env.tp_size * load_blocks, timeout=180)
+                assert_loaded_blocks(
+                    env.capture_dir,
+                    {(f"tp{r}", h) for r in range(env.tp_size)
+                     for h in hashes[matched_blocks - load_blocks:matched_blocks]},
+                    env.tp_size)
+            env.assert_pinned_budget()
         finally:
             env.stop()
 

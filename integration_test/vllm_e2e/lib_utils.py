@@ -41,11 +41,204 @@ SERVED_MODEL_NAME = "e2e-model"
 
 
 
+def _model_config(model_path: str) -> dict:
+    with open(os.path.join(model_path, "config.json")) as f:
+        return json.load(f)
+
+
+#: Layer types that mean "this layer attends a bounded window", i.e. the layer
+#: becomes a windowed kv_cache_group (vLLM's gemma3 / gpt_oss / llama4 configs).
+_LOCAL_LAYER_TYPES = ("sliding_attention", "sliding_window", "chunked_local",
+                      "local_attention")
+#: Model families whose configs interleave local and full attention layers
+#: without a per-config marker (gemma-3 declares sliding_window + an arch, not
+#: a layer_types list).
+_SWA_ARCH_MARKERS = ("Gemma2", "Gemma3", "GptOss", "Llama4")
+
+
+def is_swa_model(model_path: str) -> bool:
+    """Detect a model with sliding-window / chunked-local attention layers.
+
+    A windowed layer is not a full-prefix layer: vLLM frees its blocks outside
+    the window while the request lives, so the connector has to copy them in
+    the step that produces them and a hit must be clamped to the servable
+    window (see WindowRetention in the connector). Such models need the same
+    orchestration as hybrid ones: prefix caching on, and a server restart
+    between the save and load phases so the load goes through KVCM.
+
+    The signals are the ones vLLM itself keys on, ORed:
+    * ``layer_types`` naming a local layer (gemma-3-1b/gpt-oss style);
+    * ``sliding_window_pattern`` (gemma-2 style interleave);
+    * a known interleaved family architecture *and* a declared window.
+    The architecture alone is not enough (a plain window value is not either:
+    Qwen2 declares ``sliding_window=131072`` while never using it -- its
+    layers are full attention, and treating it as windowed would change the
+    orchestration of an existing model).
+    """
+    try:
+        cfg = _model_config(model_path)
+    except Exception:
+        return False
+    text_cfg = cfg.get("text_config", cfg)
+    window = window_tokens(model_path)
+    layer_types = text_cfg.get("layer_types") or []
+    if any(t in _LOCAL_LAYER_TYPES for t in layer_types):
+        return True
+    pattern = text_cfg.get("sliding_window_pattern")
+    if isinstance(pattern, int) and pattern > 0:
+        return True
+    archs = ", ".join(cfg.get("architectures", []) or [])
+    return window is not None and any(m in archs for m in _SWA_ARCH_MARKERS)
+
+
+def window_kind(model_path: str) -> Optional[str]:
+    """Which retention rule the model's window follows (None = no window).
+
+    vLLM keeps the two windowed shapes in separate managers with different
+    skip rules, so the harness must not apply one's arithmetic to the other:
+
+    * ``"sliding"`` -- ``SlidingWindowManager``: only the last ``window`` tokens
+      are attended, so the skipped prefix grows with every step;
+    * ``"chunked"`` -- ``ChunkedLocalAttentionManager``: attention is confined
+      to the *current* chunk, so the skipped prefix is everything before the
+      chunk the next token falls in (``H // chunk * chunk``).
+
+    Sliding wins when a config declares both (that is also the key order
+    ``window_tokens`` has always used).
+    """
+    try:
+        cfg = _model_config(model_path)
+    except Exception:
+        return None
+    text_cfg = cfg.get("text_config", cfg)
+    for key, kind in (("sliding_window", "sliding"),
+                      ("attention_chunk_size", "chunked")):
+        value = text_cfg.get(key)
+        if isinstance(value, int) and value > 0:
+            return kind
+    return None
+
+
+def window_tokens(model_path: str) -> Optional[int]:
+    """The attention window of a windowed model, in tokens (None = full).
+
+    Reads the same config field the connector turns into
+    ``WindowRetention.window_tokens`` (SlidingWindowSpec.sliding_window, or
+    ChunkedLocalAttentionSpec.attention_chunk_size for chunked-local);
+    ``window_kind`` says which of the two it is.
+    """
+    try:
+        cfg = _model_config(model_path)
+    except Exception:
+        return None
+    text_cfg = cfg.get("text_config", cfg)
+    for key in ("sliding_window", "attention_chunk_size"):
+        value = text_cfg.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
+def skipped_window_tokens(matched_tokens: int, window: Optional[int],
+                          extra_retained: int = 0,
+                          kind: str = "sliding") -> int:
+    """Tokens of a hit that vLLM parks on the null block (its own rule).
+
+    ``SingleTypeKVCacheManager.get_num_skipped_tokens`` in vLLM 0.31, per
+    manager, with H the hit length:
+
+    * sliding window: ``max(0, H - window + 1 - extra_retained)``;
+    * chunked local: ``H // chunk_size * chunk_size`` -- the whole chunks before
+      the one the next token falls in, *not* an H-(window-1) tail (H=13,
+      chunk=8 -> 8 skipped tokens, not 6). It ignores ``extra_retained``: that
+      term only exists in the sliding manager.
+
+    Full attention (window None) never skips.
+    """
+    if window is None:
+        return 0
+    if kind == "chunked":
+        return (matched_tokens // window) * window
+    return max(0, matched_tokens - (window - 1) - extra_retained)
+
+
+def window_tail_blocks(matched_tokens: int, window: Optional[int],
+                       manager_block_size: int, extra_retained: int = 0,
+                       kind: str = "sliding") -> int:
+    """Manager blocks vLLM gives real slots on an external hit of that size.
+
+    vLLM's own allocation, for a hit of H tokens (vLLM 0.31
+    SingleTypeKVCacheManager.allocate_external_computed_blocks): the leading
+    ``skipped_window_tokens(H) // bs`` blocks are replaced by the null block and
+    ``cdiv(H, bs)`` blocks are allocated, so the blocks with a real block table
+    entry are the tail of the window (``kind`` decides the rule). Full-attention
+    models (window None) keep every block.
+
+    This is *one* half of the load expectation; the other is
+    :func:`loaded_block_count`, which adds the full-attention group's whole
+    prefix when the model has one.
+    """
+    blocks = -(-matched_tokens // manager_block_size)
+    skipped = skipped_window_tokens(matched_tokens, window, extra_retained, kind)
+    return blocks - skipped // manager_block_size
+
+
+def has_full_attention_group(model_path: str) -> bool:
+    """Does the model keep at least one non-windowed attention layer?
+
+    vLLM groups attention layers by spec; when a config mixes local and full
+    layers (gemma-3: six sliding + one full, gpt-oss: one of each) the full
+    group keeps *every* matched block. A hit therefore loads the whole matched
+    prefix, not just the tail window -- the loaded-capture expectation follows
+    the same split.
+
+    Unknown or undeclared layouts answer True: expecting the larger set fails
+    loudly instead of quietly shrinking the assertion surface.
+    """
+    try:
+        cfg = _model_config(model_path)
+    except Exception:
+        return True
+    text_cfg = cfg.get("text_config", cfg)
+    layer_types = text_cfg.get("layer_types") or []
+    if layer_types:
+        return any(t not in _LOCAL_LAYER_TYPES for t in layer_types)
+    pattern = text_cfg.get("sliding_window_pattern")
+    if isinstance(pattern, int) and pattern > 0:
+        # "every pattern-th layer is full attention" (gemma-2 style): a full
+        # layer exists only if the model is at least that deep.
+        return int(text_cfg.get("num_hidden_layers") or 0) >= pattern
+    return True
+
+
+def loaded_block_count(matched_tokens: int, window: Optional[int],
+                       manager_block_size: int,
+                       full_attention_group: bool = True,
+                       kind: str = "sliding") -> int:
+    """Manager blocks whose KV a hit of that size really loads.
+
+    vLLM hands out slots per group, so the loaded set is a union: every group
+    gets the tail window of the match (``window_tail_blocks``), and a
+    full-attention group -- one without a window -- additionally keeps the whole
+    matched prefix. For a model whose attention groups are *all* windowed the
+    load stops at the window; for one with a full group it covers everything
+    (a windowed model such as gemma-3 loads its full group's out-of-window
+    blocks, which the harness must capture and verify like any other block).
+
+    ``window`` None (no windowed layers) means the whole matched prefix either
+    way.
+    """
+    blocks = -(-matched_tokens // manager_block_size)
+    if window is None or full_attention_group:
+        return blocks
+    return window_tail_blocks(matched_tokens, window, manager_block_size,
+                              kind=kind)
+
+
 def is_hybrid_model(model_path: str) -> bool:
     """Detect a hybrid (mamba/linear + full attention) model from its config."""
     try:
-        with open(os.path.join(model_path, "config.json")) as f:
-            cfg = json.load(f)
+        cfg = _model_config(model_path)
     except Exception:
         return False
     text_cfg = cfg.get("text_config", cfg)
@@ -63,6 +256,34 @@ def is_hybrid_model(model_path: str) -> bool:
         or "linear_conv_kernel_dim" in text_cfg
         or str(cfg.get("model_type", "")).startswith("qwen3_")
     )
+
+
+def is_multigroup_model(model_path: str) -> bool:
+    """Does this model need the multi-group orchestration?
+
+    prefix caching on (per-group block tables / windowed blocks survive) and a
+    vLLM restart between the save and the load phase, so phase 2 loads from
+    KVCM instead of hitting vLLM's own prefix cache. True for hybrid
+    (mamba/linear + attention) and for windowed (SWA / chunked-local) models;
+    single-group full-attention models keep the original orchestration.
+    """
+    return is_hybrid_model(model_path) or is_swa_model(model_path)
+
+
+def model_fingerprint(model_path: str) -> tuple:
+    """``(architectures[0], declared window)``: a path-independent identity.
+
+    Used to key per-model budgets (e.g. the pinned-host gate) so that a copied,
+    renamed or symlinked checkpoint keeps the gate it had under its original
+    directory name. The window component separates same-architecture siblings
+    (gemma-3-4b 1024 vs gemma-3-1b / 270m 512).
+    """
+    try:
+        cfg = _model_config(model_path)
+    except Exception:
+        cfg = {}
+    archs = cfg.get("architectures") or []
+    return (archs[0] if archs else None, window_tokens(model_path))
 
 
 def scenario_tp_size(default: int = 1) -> int:
@@ -387,6 +608,112 @@ def compare_captures(capture_dir: str) -> dict:
     return report
 
 
+def loaded_capture_keys(capture_dir: str) -> set:
+    """The (tp rank, token-content hash) keys of the loaded captures."""
+    keys = set()
+    for path in glob.glob(os.path.join(capture_dir, "loaded_*.pt")):
+        name = os.path.basename(path)[:-3]  # strip .pt
+        parts = name.split("_")
+        keys.add((parts[1], "_".join(parts[2:])))
+    return keys
+
+
+def assert_loaded_blocks(capture_dir: str, expected_keys: set, tp_size: int):
+    """The loaded captures must be *exactly* the expected blocks, per tp rank.
+
+    The load expectation is a *set*, not a count, and for a windowed model it
+    is the union of every group's slots (``loaded_block_count``): the hit's
+    tail window plus, when the model has a full-attention group, the whole
+    matched prefix. Asserting the set catches both directions -- a load that
+    stops at the window and a model whose windowed groups were served their
+    out-of-window (null-page) positions -- even though the blocks that are
+    loaded are bit-exact on their own.
+    """
+    actual = loaded_capture_keys(capture_dir)
+    missing = expected_keys - actual
+    extra = actual - expected_keys
+    if missing or extra:
+        raise AssertionError(
+            f"loaded captures are not the expected region: missing {sorted(missing)}, "
+            f"unexpected {sorted(extra)} (expected {len(expected_keys)} blocks "
+            f"across {tp_size} rank(s), got {len(actual)})")
+
+
+def assert_loaded_nonempty(capture_dir: str, tp_size: int):
+    """Every loaded capture must carry real bytes in every layer.
+
+    Used where the reference comparison is skipped on purpose (see
+    test_cross_request_prefix): the refs there come from an *independent*
+    recomputation of the same tokens, whose low bits legitimately differ, so
+    the bit-exact comparison only applies to scenarios whose refs and loads
+    come from the same run. An all-zero layer, though, would mean the load
+    target was the shared null page -- a published block that is in fact
+    empty -- and must fail everywhere.
+    """
+    import torch
+
+    paths = sorted(glob.glob(os.path.join(capture_dir, "loaded_*.pt")))
+    if not paths:
+        raise AssertionError(f"no loaded captures in {capture_dir}")
+    for path in paths:
+        rec = torch.load(path, map_location="cpu", weights_only=True)
+        for layer_name, kv in rec["kv"].items():
+            parts = kv if isinstance(kv, (list, tuple)) else [kv]
+            for part in parts:
+                if part.numel() and float(part.float().abs().sum()) == 0.0:
+                    raise AssertionError(
+                        f"{os.path.basename(path)}: layer {layer_name} of a "
+                        f"loaded block is all zero (null page, not loaded KV)")
+    logger.info("loaded captures non-empty: %d file(s) over %d rank(s)",
+                len(paths), tp_size)
+
+
+def block_tables_from_logs(lines: list) -> int:
+    """Block-table count from the connector's registration line(s).
+
+    The connector's load-failure reporting mode depends on how many vLLM block
+    tables the request carries (``report_failures = len(all_block_ids) == 1``),
+    so the harness reads the same number out of its own registration log
+    instead of guessing from the model family. Disagreeing registrations (e.g.
+    a restart that resolved a different layout) are a hard error.
+    """
+    seen = {int(g[0]) if isinstance(g, tuple) else int(g) for g in lines}
+    assert seen, ("the connector registration line carries no block_tables "
+                  "count; the load-failure branch cannot be decided")
+    assert len(seen) == 1, f"inconsistent block-table counts: {sorted(seen)}"
+    return seen.pop()
+
+
+def assert_pinned_ok(lines: list, limit_gib: float, model_path: str,
+                     expected_ranks: int = 1):
+    """Assert every `total pinned = X GiB` line of the run stays under budget.
+
+    PR2 made the pinned total machine-parseable exactly so this gate can read
+    it; the connector prints one line per pool-planning instance, i.e. one per
+    tp rank (plus one per restarted server). Both failure directions are hard:
+    a line above the budget, and fewer lines than ranks -- losing one worker's
+    report must not pass on the surviving worker's value, otherwise the gate
+    can be bypassed exactly when per-rank pool planning regresses.
+    """
+    values = [float(g[0]) if isinstance(g, tuple) else float(g) for g in lines]
+    assert len(values) >= expected_ranks, (
+        f"pinned report incomplete: {len(values)} 'total pinned' line(s) in "
+        f"the connector logs of {model_path}, expected at least "
+        f"{expected_ranks} (one per tp rank); the pinned gate cannot cover "
+        f"every rank")
+    if not values:
+        raise AssertionError(
+            f"no 'total pinned' line found in the connector logs of "
+            f"{model_path}; the pinned gate cannot be evaluated")
+    worst = max(values)
+    if worst > limit_gib:
+        raise AssertionError(
+            f"pinned budget breached: {worst:.3f} GiB > {limit_gib} GiB "
+            f"(all observations: {values})")
+    logger.info("pinned gate OK: max %.3f GiB <= %.3f GiB (%d observation(s))",
+                worst, limit_gib, len(values))
+
+
 def assert_report_ok(report: dict, min_matched: int = 1):
     """Assert the comparison succeeded.
 
@@ -417,7 +744,8 @@ def assert_report_ok(report: dict, min_matched: int = 1):
 # --------------------------------------------------------------------------- #
 # Scenario runner
 
-def make_base_prompts(num_prompts: int, hybrid: bool) -> list[str]:
+def make_base_prompts(num_prompts: int, hybrid: bool,
+                      window: Optional[int] = None) -> list[str]:
     """Distinct, deterministic prompts. Each sentence carries a unique counter
     so every manager block has unique token content -- this avoids hash
     collisions between blocks with identical text but different KV (RoPE is
@@ -428,8 +756,18 @@ def make_base_prompts(num_prompts: int, hybrid: bool) -> list[str]:
     (empirically 140 sentences ~ 2100 tokens > 3 x 528). Full-attention models
     use manager blocks of 16/32 tokens, where 40 sentences (~580 tokens) already
     span dozens of blocks.
+
+    Windowed models additionally need the prompt to cross the attention window
+    repeatedly (the save/load block-count difference and the tail-window load
+    are only meaningful past the first window): ask for ~2.5 windows, assuming
+    a conservative 12 tokens per sentence (measured: 14.5 for gemma-3's
+    tokenizer, 12.1 for gpt-oss's). run_e2e asserts the result really crosses
+    the window twice, so a shorter tokenizer fails loudly instead of silently
+    weakening the assertions.
     """
     num_sentences = 140 if hybrid else 40
+    if window:
+        num_sentences = max(num_sentences, window * 5 // 2 // 12 + 10)
     return [
         f"Prompt number {i}. " + " ".join(
             f"Sentence {j} of prompt {i} has value {j * 7 + i * 131}."
