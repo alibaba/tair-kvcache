@@ -178,6 +178,29 @@ class TestZooOnTheRealEngine(RealEngineCase):
         # catches a table that silently stops running.
         self.assertGreater(built, 10, "the era built too few rows to be a check")
 
+    def test_retention_of_every_windowed_row(self):
+        # The real classes carry the window fields: the retention every consumer
+        # keys on must come out of the *era's own* spec objects, not just the
+        # union stand-in (review_r1 N3).
+        for row in facts.ZOO:
+            if row["disposition"] != "accept":
+                continue
+            result = facts.run_row(row, self.engine)
+            if result.outcome != "accept":
+                continue
+            with self.subTest(row=row["name"]):
+                own = [meta for meta in result.metas if meta.group_idx == 0][0]
+                expected = row.get("retention")
+                if expected is None:
+                    self.assertIsNone(own.retention)
+                    continue
+                self.assertEqual(expected["kind"], own.retention.kind)
+                self.assertEqual(expected["window_tokens"], own.retention.window_tokens)
+                self.assertEqual(
+                    expected.get("extra_retained_tokens", 0),
+                    own.retention.extra_retained_tokens,
+                )
+
     def test_sizes_of_every_accepted_row(self):
         for row in facts.ZOO:
             if row["disposition"] != "accept" or "page_bytes" not in row:

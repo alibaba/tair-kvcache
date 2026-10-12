@@ -387,12 +387,37 @@ class TestAbstainedVerdicts(unittest.TestCase):
         )  # attention group
         self.assertEqual(_sent_event(dtm).failed_block_idxs, [30])
 
-    def test_load_all_groups_abstain_counts_as_failure(self):
+    def test_load_all_groups_abstain_is_a_skip_not_a_failure(self):
+        # Every group skipped the block because none of them *needed* it: a
+        # windowed group's target outside the window (vLLM allocated no slot
+        # there on an external hit) or a mamba interior block. Reporting it as
+        # an invalid block would make vLLM truncate num_computed_tokens to
+        # where the block first appears -- block 0 throws the whole external
+        # hit away, and kv_load_failure_policy="fail" fails the request --
+        # even though every byte that was needed arrived (review_r1 B1).
         dtm = _make_dtm()
         cb = dtm.create_load_done_callback(
             "req", 0, epoch=0, block_ids=[11], num_blocks=1
         )
         cb([None])
+        self.assertEqual(_sent_event(dtm).failed_block_idxs, [])
+
+    def test_load_one_group_failing_still_fails_the_block(self):
+        # The same all-skip shape, but one group *reported*: that is a hole in
+        # the request's KV and must be named.
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req", 0, epoch=0, block_ids=[11], num_blocks=1
+        )
+        cb([False, None])
+        self.assertEqual(_sent_event(dtm).failed_block_idxs, [11])
+
+    def test_load_one_group_succeeding_and_one_failing_fails_the_block(self):
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req", 0, epoch=0, block_ids=[11], num_blocks=1
+        )
+        cb([True, False])
         self.assertEqual(_sent_event(dtm).failed_block_idxs, [11])
 
 
