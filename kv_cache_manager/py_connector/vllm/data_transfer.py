@@ -421,6 +421,8 @@ class DataTransferManager:
             max_bytes_per_pool=extra_config.staging_pool_max_bytes_per_group,
         )
         self._pools: Dict[str, _StagingPool] = {}
+        save_batch = extra_config.block_per_save_task
+        load_batch = extra_config.block_per_load_task
         for plan in plans:
             pool = _StagingPool(self._device, plan.slot_bytes, plan.blocks)
             names = [kvcache_info.groups[i].spec_name for i in plan.members]
@@ -437,17 +439,17 @@ class DataTransferManager:
                 len(names),
                 ",".join(names),
             )
-            if plan.blocks < max(
-                extra_config.block_per_save_task, extra_config.block_per_load_task
-            ):
+            fitting = (min(save_batch, plan.blocks), min(load_batch, plan.blocks))
+            if fitting != (save_batch, load_batch):
                 logger.info(
-                    "staging pool per_token=%dB dtype=%s: task batch shrunk to "
-                    "%d blocks (configured save/load %d/%d) to fit the pool",
+                    "staging pool per_token=%dB dtype=%s: task batches shrink to "
+                    "save %d / load %d blocks (configured %d / %d) to fit the pool",
                     plan.key[0],
                     plan.key[1],
-                    plan.blocks,
-                    extra_config.block_per_save_task,
-                    extra_config.block_per_load_task,
+                    fitting[0],
+                    fitting[1],
+                    save_batch,
+                    load_batch,
                 )
         pinned_total = total_pinned_bytes(plans)
         logger.info(
