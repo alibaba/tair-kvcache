@@ -330,8 +330,13 @@ class TestCaptureRequests(unittest.TestCase):
         (regression: the eager capture read exactly the tail rows of the
         boundary block)."""
         conn = make_connector_scheduler(manager_block_size=MBS, locations=[], windowed=1)
-        # 2 blocks + 3 tokens scheduled: block 2 is allocated, not computed.
-        req = FakeRequest("r0", list(range(2 * MBS + 3)))
+        # Chunked prefill: a 3-block prompt whose first chunk covers 2 blocks
+        # + 3 tokens. Block 2 is allocated (allocation covers whole blocks)
+        # but only 3 of its rows are computed. The old formula -- the
+        # allocated span capped only by all_token_ids -- announced [0, 1, 2]
+        # here and let the eager capture publish the unwritten rows as zero
+        # pages; the computed-token watermark announces [0, 1].
+        req = FakeRequest("r0", list(range(3 * MBS)))
         conn.update_state_after_alloc(
             req, SimpleNamespace(get_block_ids=lambda: [[1, 2, 3]]), 0
         )
@@ -342,7 +347,6 @@ class TestCaptureRequests(unittest.TestCase):
         self.assertEqual([0, 1], meta.to_capture_requests[0].manager_block_idxes)
 
         # The rest of the block lands in the next chunk: now it is captured.
-        conn._tracked["r0"].vllm_request.prompt_token_ids = list(range(3 * MBS))
         meta = conn.build_connector_meta(
             self._empty_output(num_scheduled={"r0": MBS - 3})
         )
