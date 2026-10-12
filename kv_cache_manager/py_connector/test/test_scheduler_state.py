@@ -751,18 +751,23 @@ class TestParseGroups(unittest.TestCase):
         metas = self._parse([group], mbs)
         self.assertEqual(metas[0].per_block_bytes, 2048 * 16)
 
-    def test_windowed_attention_spec_rejected(self):
-        # vLLM can merge SWA / chunked-attention layers into a
-        # FullAttentionSpec that keeps sliding_window / attention_chunk_size
-        # set; such blocks are not full-prefix KV and must be refused.
+    def test_promoted_windowed_full_attention_is_accepted(self):
+        # vLLM merges SWA / chunked-attention layers into a FullAttentionSpec
+        # that keeps sliding_window / attention_chunk_size set
+        # (--disable-hybrid-kv-cache-manager, _promote_local_kv_cache_specs):
+        # the allocation covers *all* tokens and the window only narrows the
+        # compute, so those blocks are the full prefix and transfer as such.
+        # (Before PR1 the window fields alone refused them; the windowed
+        # classes -- SlidingWindowSpec / ChunkedLocalAttentionSpec /
+        # SlidingWindowMLASpec -- are still refused, see test_spec_gate.)
         for window_field in ("sliding_window", "attention_chunk_size"):
             with self.subTest(field=window_field):
                 mbs = 16
                 group = self._attn_group(["l0"])
                 setattr(group.kv_cache_spec, window_field, 1024)
-                with self.assertRaises(NotImplementedError) as cm:
-                    self._parse([group], mbs)
-                self.assertIn(window_field, str(cm.exception))
+                metas = self._parse([group], mbs)
+                self.assertEqual(len(metas), 1)
+                self.assertEqual(metas[0].per_block_bytes, 2048 * 16)
 
     def test_windowed_fields_none_accepted(self):
         # Real FullAttentionSpec objects carry the fields as None; that is the
