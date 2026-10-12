@@ -85,6 +85,28 @@ class TestZooDispositions(unittest.TestCase):
                     # pinned by its keywords instead.
                     self.assertIn("TairKvCacheConnector", result.message)
 
+    def test_retention_of_every_windowed_row(self):
+        # The retention metadata is the contract the data plane consumes:
+        # one kind, one window, one trailing-edge retention per bucket. Every
+        # accepted *non*-windowed row must carry None (full-prefix semantics
+        # unchanged), which is what keeps the full-attention path untouched.
+        for row in facts.ZOO:
+            if row["disposition"] != "accept":
+                continue
+            with self.subTest(row=row["name"]):
+                result = facts.run_row(row, self.engine)
+                own = [meta for meta in result.metas if meta.group_idx == 0][0]
+                expected = row.get("retention")
+                if expected is None:
+                    self.assertIsNone(own.retention)
+                    return
+                self.assertEqual(expected["kind"], own.retention.kind)
+                self.assertEqual(expected["window_tokens"], own.retention.window_tokens)
+                self.assertEqual(
+                    expected.get("extra_retained_tokens", 0),
+                    own.retention.extra_retained_tokens,
+                )
+
     def test_sizes_of_every_accepted_row(self):
         # Sizing is re-pinned on the real engine too; here it proves the
         # stand-in and the gate agree on *what* is being transferred.
@@ -715,17 +737,21 @@ class TestHolesAreReversed(unittest.TestCase):
         spec = facts.build_spec(row, self.engine)
         return row, spec, facts.legacy_accepts(spec, self.engine)
 
-    def test_rswa_was_accepted_and_is_refused_now(self):
+    def test_rswa_was_silently_accepted_and_now_declares_its_window(self):
         # Pre-PR: RSWASpec is a FullAttentionSpec with no window field in the
         # whitelist (rswa_window) -> ACCEPT, and the freed gap blocks were
-        # published as a token prefix. Now the class itself is the decision.
+        # published as a token prefix. Now the class itself is the decision: it
+        # is accepted *with* the retention metadata that drives the eager
+        # capture, the null disposition and the hit clamp.
         row, spec, legacy = self._row("rswa")
         self.assertTrue(legacy, "the transcription must reproduce the old hole")
         result = facts.run_row(row, self.engine)
-        self.assertEqual("refuse", result.outcome)
-        self.assertIn("rswa_window=128", result.message)
-        # Same geometry, plain FullAttentionSpec: accepted. The difference is
-        # the class (the window semantics), not the fields.
+        self.assertEqual("accept", result.outcome)
+        own = [meta for meta in result.metas if meta.group_idx == 0][0]
+        self.assertEqual("rswa_gap", own.retention.kind)
+        self.assertEqual(128, own.retention.window_tokens)
+        # Same geometry, plain FullAttentionSpec: accepted without retention.
+        # The difference is the class (the window semantics), not the fields.
         accepted_row = {
             "name": row["name"] + "_as_full",
             "cls": "FullAttentionSpec",
@@ -735,7 +761,9 @@ class TestHolesAreReversed(unittest.TestCase):
         }
         plain = facts.build_spec(accepted_row, self.engine)
         self.assertEqual(spec.real_page_size_bytes, plain.real_page_size_bytes)
-        self.assertEqual("accept", facts.run_row(accepted_row, self.engine).outcome)
+        plain_result = facts.run_row(accepted_row, self.engine)
+        self.assertEqual("accept", plain_result.outcome)
+        self.assertIsNone(plain_result.metas[0].retention)
 
     def test_a_pooled_full_attention_spec_was_accepted_and_is_refused_now(self):
         # Pre-PR: FullAttentionSpec isinstance -> ACCEPT with the page sized as
@@ -856,16 +884,26 @@ class TestAcceptanceSurfaceDifferential(unittest.TestCase):
                 else:
                     self.assertIn(result.outcome, ("accept", "skip"))
 
-    def test_the_widened_rows_are_the_promote_shapes(self):
-        # Widening is the other direction: only the promoted FullAttentionSpec
-        # window shapes (the --disable-hybrid-kv-cache-manager escape hatch).
+    def test_the_widened_rows_are_the_declared_mechanism_shapes(self):
+        # Widening is the other direction, and it is a *declared* list: the two
+        # promoted FullAttentionSpec window shapes (the
+        # --disable-hybrid-kv-cache-manager escape hatch, which needs no
+        # windowed machinery -- those blocks are the full prefix) plus the three
+        # windowed classes this PR accepts with their retention.
         widened = [
             row["name"]
             for row in facts.ZOO
             if not facts.legacy_accepts_row(row, self.engine)
             and facts.run_row(row, self.engine).outcome == "accept"
         ]
-        self.assertEqual(["full_window", "full_chunked"], widened)
+        # (RSWASpec is not in the list: the old gate already accepted it, so it
+        # is a hole closed with a mechanism rather than a widened class -- see
+        # TestHolesAreReversed.)
+        self.assertEqual(
+            ["full_window", "full_chunked", "sliding_window",
+             "sliding_window_retained", "chunked_local"],
+            widened,
+        )
 
 
 class TestTableInvariants(unittest.TestCase):
@@ -903,15 +941,16 @@ class TestTableInvariants(unittest.TestCase):
         self.assertEqual(set(facts.SPEC_DISPOSITIONS), covered)
 
     def test_windowed_and_scratch_classes_keep_their_side(self):
-        # The red line of this PR, spelled out: windowed classes stay refused
-        # (their data-plane mechanism arrives in the follow-up work), scratch
+        # The red line of this PR, spelled out: the three windowed classes this
+        # PR implements are accepted (with retention), the windowed MLA variant
+        # stays refused (its correct disposition is the DSA skip), the scratch
         # classes are skipped, and nothing else moved.
         self.assertEqual(
             {
-                "SlidingWindowSpec": "refuse",
-                "ChunkedLocalAttentionSpec": "refuse",
+                "SlidingWindowSpec": "accept",
+                "ChunkedLocalAttentionSpec": "accept",
                 "SlidingWindowMLASpec": "refuse",
-                "RSWASpec": "refuse",
+                "RSWASpec": "accept",
                 "CircularBufferSpec": "skip",
                 "KpoolTailSpec": "skip",
                 "HiSparseHotSpec": "skip",
