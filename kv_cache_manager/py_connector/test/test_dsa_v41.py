@@ -37,6 +37,7 @@ from kv_cache_manager.py_connector.vllm.vllm_common import (
     ALL_SPEC_GROUP,
     AttentionGroupMeta,
     GroupMeta,
+    StateGroupMeta,
     RowGranularMeta,
     WindowRetention,
     build_spec_groups,
@@ -189,11 +190,13 @@ class TestRowGranularAddressMath(unittest.TestCase):
         self.assertEqual((14, 0), legacy(0))
         self.assertEqual(0, self._connector_slot(0)[1])
 
-    def test_a_larger_page_covers_several_block_table_entries(self):
-        # The mapping must not assume one entry per page: a block table whose
-        # entries hold one page each is the V4.1 case, but the same formula must
-        # stay correct when a page is a fraction of the entry (padded /
-        # kernel-split layouts), which is what the tps=1 path always did.
+    def test_a_page_smaller_than_the_entry_covers_several_of_them(self):
+        # The mapping must not assume one page per entry. For a token-granular
+        # bucket that is production (the kernel-split layouts: block 64 with a
+        # 32-token kernel page); for a *row-granular* one registration pins
+        # `kernel_block_size == rows_per_page`, so the geometry below is only
+        # reachable through a bypassed registration -- kept as the defensive pin
+        # for the formula's `pages_per_entry` term.
         from kv_cache_manager.py_connector.test.vllm_stubs import make_connector
         from kv_cache_manager.py_connector.vllm.transfer_types import (
             AttentionTransferGroup,
@@ -547,8 +550,16 @@ class TestBucketKeyKeepsRowGranularityApart(unittest.TestCase):
         self.assertEqual(by_ratio[2].per_block_bytes, 1024 * 128)
 
 
-class TestPackedGroupAndSparseCoverage(unittest.TestCase):
-    """The folding interaction: a packed group cannot be announced per block."""
+class TestCoverageSurvivesFolding(unittest.TestCase):
+    """The folding interaction: one vLLM group, one coverage.
+
+    The engine hands the scheduler one member per packed group
+    (generate_scheduler_kv_cache_config), so the scheduler's window / state masks
+    come from that member. Buckets that agree fold harmlessly -- the extra
+    buckets keep their registration *and* their announcement name (the group's
+    member list is the worker's registration) -- while buckets that disagree
+    would mask the wrong blocks, which is what this pins.
+    """
 
     def _metas(self, *, packed: bool, windowed: bool) -> List[GroupMeta]:
         metas: List[GroupMeta] = []
@@ -601,29 +612,91 @@ class TestPackedGroupAndSparseCoverage(unittest.TestCase):
             )
         return metas
 
-    def test_a_packed_group_with_sparse_coverage_is_refused(self):
-        # The scheduler's view of a packed group is folded to one sub spec, so a
-        # per-block coverage could never name the extra buckets: the
-        # configuration cannot work, and it is refused before any request
-        # instead of failing every save at runtime.
+    def test_a_packed_group_with_an_independent_windowed_group_is_announceable(
+        self,
+    ):
+        # The usable combination (measured end to end: both buckets of the
+        # packed group are registered *and* named, the windowed group keeps its
+        # own name, and every block round-trips bit-exact). The declaration
+        # names both packed buckets for the coverage that has the window.
+        groups = build_spec_groups(self._metas(packed=True, windowed=True), tp_size=1)
+        names = {group["name"]: group["spec_names"] for group in groups}
+        self.assertEqual({"tp0_g0", "tp0_g0_b1", "tp0_g1"}, set(names[ALL_SPEC_GROUP]))
+
+    def test_two_buckets_of_one_group_may_not_disagree_about_the_window(self):
+        # The combination the guard exists for: a group whose buckets fold to
+        # one member would let the scheduler mask blocks by a window the *other*
+        # bucket does not have (or miss a window it cannot see), publishing
+        # stale / zero-page bytes as cacheable.
+        metas = self._metas(packed=True, windowed=False)
+        metas[-1] = AttentionGroupMeta(
+            group_idx=metas[-1].group_idx,
+            layer_names=["rswa"],
+            block_size=metas[-1].block_size,
+            per_block_bytes=metas[-1].per_block_bytes,
+            page_bytes=metas[-1].page_bytes,
+            row_granular=metas[-1].row_granular,
+            spec_suffix="_b2",
+            retention=WindowRetention(kind="sliding", window_tokens=128),
+        )
         with self.assertRaises(NotImplementedError) as ctx:
-            build_spec_groups(self._metas(packed=True, windowed=True), tp_size=1)
+            build_spec_groups(metas, tp_size=1)
         message = str(ctx.exception)
-        self.assertIn("[0]", message)
-        self.assertIn("_b1", message)
+        self.assertIn("group 0", message)
+        self.assertIn("different coverage", message)
+        self.assertIn("'rswa'", message)
+
+    def test_two_buckets_of_one_group_may_not_carry_different_windows(self):
+        # Same dimension, different scope: the folded member would supply the
+        # *narrower* window to the mask, so blocks whose wider window is gone
+        # would still be published.
+        metas = self._metas(packed=True, windowed=False)
+        for suffix, window in (("_b1", 1024), ("_b2", 4096)):
+            metas.append(
+                AttentionGroupMeta(
+                    group_idx=0,
+                    layer_names=[f"swa{window}"],
+                    block_size=16,
+                    per_block_bytes=65536,
+                    page_bytes=65536,
+                    retention=WindowRetention(kind="sliding", window_tokens=window),
+                    spec_suffix=suffix,
+                )
+            )
+        with self.assertRaises(NotImplementedError) as ctx:
+            build_spec_groups(metas, tp_size=1)
+        self.assertIn("different coverage", str(ctx.exception))
+
+    def test_a_group_cannot_mix_a_state_bucket_with_an_attention_bucket(self):
+        # The defensive half of the predicate: vLLM's uniform bases keep mamba
+        # specs in a group of their own today, so this cannot be built from a
+        # real KVCacheConfig -- but the fold would lose the state dimension all
+        # the same, and the guard is total on purpose.
+        metas: List[GroupMeta] = self._metas(packed=False, windowed=False)
+        metas.append(
+            StateGroupMeta(
+                group_idx=0,
+                layer_names=["mamba"],
+                block_size=16,
+                per_block_bytes=2048,
+                page_size_bytes=2048,
+            )
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            build_spec_groups(metas, tp_size=1)
+        self.assertIn("different coverage", str(ctx.exception))
 
     def test_a_packed_group_without_sparse_coverage_declares_nothing(self):
         # No declared groups means the announcement carries no names and the
-        # manager stores every registered spec -- which is exactly what a packed
-        # group needs (V4.1 runs this path).
+        # manager stores every registered spec -- which is exactly what a
+        # coverage-free packed group does (V4.1 runs this path).
         self.assertEqual(
             [], build_spec_groups(self._metas(packed=True, windowed=False), tp_size=1)
         )
 
     def test_a_single_bucket_group_with_sparse_coverage_is_announceable(self):
-        # The contrast that keeps the guard honest: with one bucket per group
-        # the folded view names every transfer bucket, so the declaration is
-        # fine (every windowed / hybrid model that works today).
+        # With one bucket per group there is nothing to fold away: every
+        # windowed / hybrid model that works today takes this path.
         groups = build_spec_groups(self._metas(packed=False, windowed=True), tp_size=1)
         names = {group["name"]: group["spec_names"] for group in groups}
         self.assertIn(ALL_SPEC_GROUP, names)

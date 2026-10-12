@@ -419,6 +419,10 @@ class ConnectorWorker:
           manager block (KVCM unit) -> global row index
           -> group block (block_table unit, group.block_size / tokens_per_row rows)
           -> kernel physical page (tensor unit, group.kernel_block_size rows).
+
+        One entry may span several pages (the token-granular kernel-split
+        layouts, e.g. block 64 with a 32-token kernel page); a row-granular
+        bucket is registered one page per entry, so it never does.
         """
         slots, _ = self._attn_slots(group, manager_block_idxes, block_table)
         return slots
@@ -451,10 +455,12 @@ class ConnectorWorker:
         rows_per_page = group.kernel_block_size
         rows_per_entry = group.block_size // tokens_per_row
         if tokens_per_row > 1:
-            # A compressed row cannot be split across pages: the row-granular
-            # entry has to be a whole number of pages. (The token-granular path
-            # keeps its historical floor here; registration refuses a tensor
-            # whose kernel page does not divide the group block.)
+            # Internal invariant, not input validation: registration requires a
+            # row-granular bucket's kernel page to *be* its row page
+            # (_build_attention_group), so rows_per_entry == rows_per_page here.
+            # A compressed row cannot be split across pages, so a bypassed
+            # registration must fail loudly instead of addressing half a row.
+            # (The token-granular path keeps its historical floor.)
             assert rows_per_entry % rows_per_page == 0, (
                 f"group {group.group_idx}: block size {group.block_size} "
                 f"({rows_per_entry} rows) is not a whole number of pages of "
