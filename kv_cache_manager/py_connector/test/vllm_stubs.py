@@ -754,16 +754,29 @@ _install_stubs()
 
 # Import after stubs are in place.
 from kv_cache_manager.py_connector.vllm.vllm_common import (  # noqa: E402
+    RETENTION_SLIDING,
     AttentionGroupMeta,
     StateGroupMeta,
+    WindowRetention,
+    spec_group_plan,
 )
 from kv_cache_manager.py_connector.vllm.connector_scheduler import ConnectorScheduler  # noqa: E402
 from kv_cache_manager.py_connector.vllm.connector_worker import ConnectorWorker  # noqa: E402
 
 
-def _make_group_metas(num_groups: int, num_state_groups: int, block_size: int) -> list:
+def _make_group_metas(
+    num_groups: int,
+    num_state_groups: int,
+    block_size: int,
+    windowed: int = 0,
+    window_tokens: int = 1024,
+) -> list:
     """Attention groups first, then mamba-style state groups; group_idx is the
-    vLLM group index (what block tables are indexed by)."""
+    vLLM group index (what block tables are indexed by).
+
+    ``windowed`` makes that many of the attention groups sliding-window ones
+    (retention metadata included), which turns on the eager-capture and hit
+    clamp paths; the rest stay full-prefix."""
     return [
         AttentionGroupMeta(
             group_idx=i,
@@ -773,6 +786,11 @@ def _make_group_metas(num_groups: int, num_state_groups: int, block_size: int) -
             # A positive page size: the tensor-side cross-check rejects 0, and
             # the translation paths under test never read it.
             page_bytes=block_size * 8,
+            retention=(
+                WindowRetention(kind=RETENTION_SLIDING, window_tokens=window_tokens)
+                if i < windowed
+                else None
+            ),
         )
         for i in range(num_groups)
     ] + [
@@ -861,10 +879,17 @@ def make_connector_scheduler(
     num_state_groups: int = 0,
     tp_size: int = 1,
     locations=None,
+    windowed: int = 0,
+    window_tokens: int = 1024,
+    has_eagle_group: bool = False,
 ) -> ConnectorScheduler:
     """Build a bare ConnectorScheduler (no __init__) with the scheduler-loop state
     build_connector_meta and friends need, plus a FakeLocationQueries
-    answering ``locations`` (None means "still in flight")."""
+    answering ``locations`` (None means "still in flight").
+
+    ``windowed`` turns the first that many attention groups into windowed ones
+    (retention metadata included), which is what enables the capture requests
+    and the windowed hit clamp."""
     from unittest.mock import MagicMock
 
     core = ConnectorScheduler.__new__(ConnectorScheduler)
@@ -872,12 +897,19 @@ def make_connector_scheduler(
     core._vllm_block_size = vllm_block_size or manager_block_size
     core._tp_size = tp_size
     core._group_metas = _make_group_metas(
-        num_groups, num_state_groups, core._vllm_block_size
+        num_groups, num_state_groups, core._vllm_block_size, windowed, window_tokens
     )
     core._num_groups = len(core._group_metas)
     core._state_group_idxs = [
         m.group_idx for m in core._group_metas if isinstance(m, StateGroupMeta)
     ]
+    core._windowed_metas = [
+        m
+        for m in core._group_metas
+        if isinstance(m, AttentionGroupMeta) and m.retention is not None
+    ]
+    core._has_eagle_group = has_eagle_group
+    core._spec_group_names = spec_group_plan(core._group_metas, tp_size)[1]
     core._epoch = 0
     core._tracked = {}
     core._load_failed = set()
