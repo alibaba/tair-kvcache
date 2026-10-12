@@ -287,25 +287,48 @@ class ConnectorWorker:
                 f"page (vLLM's NHD order, spelled BLNHC/LBNHC among its "
                 f"VLLM_KV_CACHE_LAYOUT candidates; this tensor is head-major)"
             )
-        # Cross-check the spec against the tensor per *token*: the spec page
-        # covers meta.block_size tokens while the tensor page covers
-        # kernel_block_size rows (a legal vLLM split: the framework block only
-        # needs to be a multiple of the kernel's), so byte-per-token is the
-        # comparable unit. A backend that packs rows differently (e.g. leaving
-        # fp8 scales out) is caught here instead of mis-sizing every location.
+        # Cross-check the spec against the tensor. The comparable unit is the
+        # *row*: a token for a token-granular spec, one storage row (spanning
+        # tokens_per_state tokens) for a compressed one. The tensor page holds
+        # kernel_block_size rows, which the spec counts in tokens while
+        # tokens_per_state == 1 and in rows once it is above (the same number of
+        # bytes either way, different address math). A backend that packs rows
+        # differently (e.g. leaving fp8 scales out) is caught here instead of
+        # mis-sizing every location.
         itemsize = view.element_size()
-        spec_per_token = meta.page_bytes // meta.block_size
-        tensor_per_token = len(ref_views) * per_token_dim * itemsize
-        if spec_per_token != tensor_per_token:
-            raise NotImplementedError(
-                f"group {meta.group_idx}{meta.spec_suffix}: spec page_bytes="
-                f"{meta.page_bytes} over block_size={meta.block_size} is "
-                f"{spec_per_token} B/token, but the tensor stores "
-                f"{tensor_per_token} B/token ({len(ref_views)} view(s) x "
-                f"{kernel_block_size} rows x {per_token_dim} elements x "
-                f"{itemsize} B per kernel page); the KV cache layout does not "
-                f"match the spec (unsupported backend packing or mixed layouts)"
-            )
+        tensor_bytes_per_row = len(ref_views) * per_token_dim * itemsize
+        if meta.row_granular is None:
+            spec_per_token = meta.page_bytes // meta.block_size
+            if spec_per_token != tensor_bytes_per_row:
+                raise NotImplementedError(
+                    f"group {meta.group_idx}{meta.spec_suffix}: spec page_bytes="
+                    f"{meta.page_bytes} over block_size={meta.block_size} is "
+                    f"{spec_per_token} B/token, but the tensor stores "
+                    f"{tensor_bytes_per_row} B/token ({len(ref_views)} view(s) x "
+                    f"{kernel_block_size} rows x {per_token_dim} elements x "
+                    f"{itemsize} B per kernel page); the KV cache layout does not "
+                    f"match the spec (unsupported backend packing or mixed layouts)"
+                )
+        else:
+            rows_per_page = meta.row_granular.rows_per_page
+            if kernel_block_size != rows_per_page or len(ref_views) != 1:
+                raise NotImplementedError(
+                    f"group {meta.group_idx}{meta.spec_suffix}: the spec stores "
+                    f"one row per {meta.row_granular.tokens_per_row} tokens with "
+                    f"{rows_per_page} rows per page, but the tensor page holds "
+                    f"{kernel_block_size} row(s) over {len(ref_views)} view(s); "
+                    f"the KV cache layout does not match the spec (compressed "
+                    f"row algebra)"
+                )
+            if tensor_bytes_per_row != meta.row_granular.bytes_per_row:
+                raise NotImplementedError(
+                    f"group {meta.group_idx}{meta.spec_suffix}: spec row is "
+                    f"{meta.row_granular.bytes_per_row} B (page_bytes="
+                    f"{meta.page_bytes} over {rows_per_page} rows), but the "
+                    f"tensor stores {tensor_bytes_per_row} B per row "
+                    f"({per_token_dim} elements x {itemsize} B); the compressed "
+                    f"KV cache layout does not match the spec"
+                )
         # Non-flat block layouts (page_size_padded gaps, or split K/V
         # interleaved per block as in the 5-D N-first layout) go through the
         # kernel's strided path. Stride 0 = fast flat indexing.
@@ -333,6 +356,9 @@ class ConnectorWorker:
             block_stride=block_stride,
             dtype=ref.dtype,
             retention=meta.retention,
+            tokens_per_row=(
+                1 if meta.row_granular is None else meta.row_granular.tokens_per_row
+            ),
         )
 
     def _build_state_group(
@@ -384,12 +410,15 @@ class ConnectorWorker:
         manager_block_idxes: Sequence[int],
         block_table: List[int],
     ) -> List[List[int]]:
-        """Map manager blocks to flat token slots of one attention group.
+        """Map manager blocks to the flat row slots of one attention group.
 
-        Three-tier hierarchy:
-          manager block (KVCM unit) -> global token idx
-          -> group block (block_table unit, group.block_size tokens)
-          -> kernel physical block (tensor unit; ratio physical per group block).
+        One entry per *staged row*: a token for a token-granular bucket
+        (tokens_per_row == 1) and a storage row (tokens_per_row tokens) for a
+        compressed one. Three-tier hierarchy, in rows throughout:
+
+          manager block (KVCM unit) -> global row index
+          -> group block (block_table unit, group.block_size / tokens_per_row rows)
+          -> kernel physical page (tensor unit, group.kernel_block_size rows).
         """
         slots, _ = self._attn_slots(group, manager_block_idxes, block_table)
         return slots
@@ -400,7 +429,7 @@ class ConnectorWorker:
         manager_block_idxes: Sequence[int],
         block_table: List[int],
     ) -> Tuple[List[List[int]], List[List[bool]]]:
-        """``_attn_token_indices`` plus, per token, "is this a null slot?".
+        """``_attn_token_indices`` plus, per row, "is this a null slot?".
 
         A windowed group's block table carries vLLM's null block (id 0) for the
         positions outside the window: those slots alias page 0, which is the
@@ -408,26 +437,45 @@ class ConnectorWorker:
         not write them, the capture must not publish their bytes), and the
         block table entry is the only trustworthy source -- a group block is
         null exactly when its table entry is 0.
+
+        The unit is the *row*, because that is what vLLM addresses and what the
+        kernel copies: a compressed row spans tokens_per_row tokens, and both
+        the tensor's page (kernel_block_size rows) and the block table's entry
+        (block_size / tokens_per_row rows) are counted in it. For the
+        token-granular case (tokens_per_row == 1) every term below is the
+        historical token count, so the translation is unchanged.
         """
         mbs = self._manager_block_size
-        gbs = group.block_size
-        kbs = group.kernel_block_size
-        ratio = gbs // kbs
+        tokens_per_row = group.tokens_per_row
+        rows_per_block = mbs // tokens_per_row
+        rows_per_page = group.kernel_block_size
+        rows_per_entry = group.block_size // tokens_per_row
+        if tokens_per_row > 1:
+            # A compressed row cannot be split across pages: the row-granular
+            # entry has to be a whole number of pages. (The token-granular path
+            # keeps its historical floor here; registration refuses a tensor
+            # whose kernel page does not divide the group block.)
+            assert rows_per_entry % rows_per_page == 0, (
+                f"group {group.group_idx}: block size {group.block_size} "
+                f"({rows_per_entry} rows) is not a whole number of pages of "
+                f"{rows_per_page} rows"
+            )
+        pages_per_entry = rows_per_entry // rows_per_page
         out: List[List[int]] = []
         null: List[List[bool]] = []
         for mb in manager_block_idxes:
             idxs = []
             nulls = []
-            base = mb * mbs
-            for i in range(mbs):
-                tok = base + i
-                logical = tok // gbs
+            base = mb * rows_per_block
+            for i in range(rows_per_block):
+                row = base + i
+                logical = row // rows_per_entry
                 assert logical < len(block_table), (
                     f"group block {logical} out of range (len={len(block_table)})"
                 )
-                off = tok % gbs
-                phys = block_table[logical] * ratio + off // kbs
-                idxs.append(phys * kbs + off % kbs)
+                within = row % rows_per_entry
+                phys = block_table[logical] * pages_per_entry + within // rows_per_page
+                idxs.append(phys * rows_per_page + within % rows_per_page)
                 nulls.append(block_table[logical] == 0)
             out.append(idxs)
             null.append(nulls)
@@ -503,9 +551,7 @@ class ConnectorWorker:
                     if plan.token_indices is not None
                     else None,
                     plan.block_ids[i:end] if plan.block_ids is not None else None,
-                    plan.staged_slots[i:end]
-                    if plan.staged_slots is not None
-                    else None,
+                    plan.staged_slots[i:end] if plan.staged_slots is not None else None,
                     plan.null_rows[i:end] if plan.null_rows is not None else None,
                 )
 
@@ -1082,8 +1128,7 @@ class ConnectorWorker:
                     )
                 staged[key] = (pool, start + offset)
         logger.info(
-            "req:%s captured %d windowed blocks (%d groups) before the window "
-            "moved",
+            "req:%s captured %d windowed blocks (%d groups) before the window moved",
             capture.req_id,
             sum(len(captureable) for _, captureable, _, _ in taken),
             len(taken),
