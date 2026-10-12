@@ -62,6 +62,8 @@ from kv_cache_manager.py_connector.vllm.vllm_common import (
     AttentionGroupMeta,
     WindowRetention,
     build_spec_groups,
+    parse_groups,
+    spec_name,
 )
 
 MBS = 16
@@ -215,8 +217,6 @@ def worker_with(groups: List[AttentionTransferGroup], dtm: Any = None) -> Any:
     conn._data_transfer = dtm
     conn._staged = {}
     conn._in_flight = {}
-    conn._withheld = {}
-    conn._capture_scope = {}
     return conn
 
 
@@ -381,6 +381,44 @@ class TestWindowedSpecGroups(unittest.TestCase):
         self.assertEqual(groups["attn"], ["tp0_g0", "tp0_g1"])
         self.assertEqual(groups["attn_no_window"], ["tp0_g1"])
         self.assertEqual(groups["full_no_window"], ["tp0_g1", "tp0_g2"])
+
+    def test_one_group_can_hold_two_window_buckets(self):
+        # The shape the bucket keys exist for: a packed UniformType group whose
+        # members carry different windows (two RSWASpecs, or two SlidingWindow
+        # specs that differ only in extra_retained_tokens). Both buckets keep
+        # the same vLLM group index, so anything keyed on that index would let
+        # them overwrite each other -- the retention, the pool lookup and the
+        # staged bookkeeping all key on the bucket's spec name.
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
+
+        def spec(extra):
+            return SlidingWindowSpec(
+                block_size=MBS,
+                sliding_window=1024,
+                page_size_bytes=2048,
+                num_kv_heads=2,
+                head_size=64,
+                dtype=torch.bfloat16,
+                extra_retained_tokens=extra,
+            )
+
+        config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=["l0", "l1"],
+                    kv_cache_spec=UniformTypeKVCacheSpecs.from_specs(
+                        {"l0": spec(0), "l1": spec(8)}
+                    ),
+                    is_eagle_group=False,
+                )
+            ]
+        )
+        metas = parse_groups(config, MBS, calculate_kv_scales=False)
+        self.assertEqual(2, len(metas))
+        self.assertEqual({0}, {meta.group_idx for meta in metas})
+        self.assertEqual({"sliding"}, {meta.retention.kind for meta in metas})
+        self.assertEqual({0, 8}, {meta.retention.extra_retained_tokens for meta in metas})
+        self.assertEqual(2, len({spec_name(0, meta) for meta in metas}))
 
     def test_pure_windowed_instance_declares_only_the_full_group(self):
         # Nothing to exclude into: every spec is windowed, so a block without
@@ -549,13 +587,17 @@ class TestWindowedHitClamp(unittest.TestCase):
         self.assertEqual(3 * MBS, self._answer(conn, locations(broken), 20 * MBS))
 
     def test_each_kind_uses_its_own_window(self):
+        # sliding / chunked_local: only the window tail must carry data, so a
+        # hole exactly `window blocks` before the end is inside the region and
+        # the match is cut back to it.
         for kind, window, blocks in (
             (RETENTION_SLIDING, 64, 4),
             (RETENTION_CHUNKED_LOCAL, 64, 4),
-            (RETENTION_RSWA_GAP, 48, 3),
         ):
             with self.subTest(kind=kind):
-                conn = make_connector_scheduler(manager_block_size=MBS, locations=[], windowed=1)
+                conn = make_connector_scheduler(
+                    manager_block_size=MBS, locations=[], windowed=1
+                )
                 conn._windowed_metas[0] = AttentionGroupMeta(
                     group_idx=0,
                     layer_names=["l0"],
@@ -564,10 +606,31 @@ class TestWindowedHitClamp(unittest.TestCase):
                     page_bytes=MBS * 8,
                     retention=WindowRetention(kind, window_tokens=window),
                 )
-                # A hole exactly `blocks` before the end is inside the region.
                 locs = locations([["tp0_g0"]] * 8)
                 locs[8 - blocks] = {"location_specs": []}
                 self.assertEqual((8 - blocks) * MBS, self._answer(conn, locs, 20 * MBS))
+
+        # R-SWA: the hit is a full-prefix match (RSWAManager inherits the
+        # full-attention manager) and only the gap is masked out, so a hole
+        # anywhere in the prefix -- here far below the window tail -- must
+        # refuse the whole end: a visible prefill row without data would
+        # otherwise read unloaded KV.
+        conn = make_connector_scheduler(manager_block_size=MBS, locations=[], windowed=1)
+        conn._windowed_metas[0] = AttentionGroupMeta(
+            group_idx=0,
+            layer_names=["l0"],
+            block_size=MBS,
+            per_block_bytes=1024,
+            page_bytes=MBS * 8,
+            retention=WindowRetention(RETENTION_RSWA_GAP, window_tokens=48),
+        )
+        locs = locations([["tp0_g0"]] * 8)
+        locs[1] = {"location_specs": []}  # a mid-prefix hole
+        self.assertEqual(1 * MBS, self._answer(conn, locs, 20 * MBS))
+        # Without the hole the same geometry serves the whole prefix.
+        self.assertEqual(
+            8 * MBS, self._answer(conn, locations([["tp0_g0"]] * 8), 20 * MBS)
+        )
 
     def test_the_full_hit_cap_still_applies(self):
         conn = self._conn(8)
@@ -626,34 +689,64 @@ class TestCaptureDispositions(unittest.TestCase):
             view = call.args[1]
             self.assertEqual(1, view.shape[0])
 
-    def test_captured_blocks_are_staged_and_scope_marked(self):
+    def test_captured_blocks_are_staged_per_bucket(self):
         conn = captured_worker([0, 1, 2, 3], [7, 8, 9, 10])
         self.assertEqual(1, len(conn._data_transfer.captures))
         name, slots, timeout = conn._data_transfer.captures[0]
         self.assertEqual("tp0_g0", name)
         self.assertEqual(4, len(slots))
         self.assertGreater(timeout, 0)
-        self.assertEqual({0, 1, 2, 3}, conn._capture_scope["r0"])
         self.assertEqual(
-            [0, 1, 2, 3],
-            sorted(block for _, block in conn._staged["r0"]),
+            [("tp0_g0", 0), ("tp0_g0", 1), ("tp0_g0", 2), ("tp0_g0", 3)],
+            sorted(conn._staged["r0"]),
         )
 
     def test_null_block_abstains_instead_of_publishing_zero_page(self):
         # Block 1's slots are vLLM's null block (id 0) at capture time: those
-        # bytes do not exist, so the block is neither captured nor withheld --
-        # it must abstain (see TestStagedDispositions for the verdict).
+        # bytes do not exist, so it is left out of the run (abstain, see
+        # TestStagedDispositions for the verdict).
         conn = captured_worker([0, 1], [7, 0])
-        self.assertEqual({0, 1}, conn._capture_scope["r0"])
-        self.assertEqual([(0, 0)], [(g, b) for g, b in conn._staged["r0"]])
+        self.assertEqual([("tp0_g0", 0)], sorted(conn._staged["r0"]))
         name, slots, _ = conn._data_transfer.captures[0]
         self.assertEqual(1, len(slots))  # only the real block was gathered
 
     def test_pool_exhaustion_withholds_the_whole_step(self):
-        conn = captured_worker([0, 1], [7, 8], exhausted=True)
-        self.assertEqual(set(), set(conn._staged.get("r0", {})))
-        self.assertEqual({0, 1}, conn._withheld["r0"])
-        self.assertEqual({0, 1}, conn._capture_scope["r0"])
+        # The arena is held by an in-flight write: the capture waits its
+        # deadline, gives up and says so (the caller stops capturing this step).
+        group = windowed_group()
+        pool = _StagingPool(torch.device("cpu"), group.per_block_bytes, 2)
+        self.assertEqual(0, pool.acquire(2))
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        conn = worker_with([group], dtm)
+        self.assertFalse(
+            conn._capture_request(
+                CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8]])
+            )
+        )
+        self.assertEqual({}, conn._staged.get("r0", {}))
+        # The blocks stay announced with no captured bytes: the plan and the
+        # task fail them (claimed + absent), so nothing is published.
+        plan = conn._plan_group_transfers(
+            locations([["tp0_g0"]] * 2), [0, 1], [[7, 8]], "r0", for_save=True
+        )
+        self.assertEqual([None, None], plan[0].staged_slots)
+        verdicts: List[Any] = [None, None]
+        dtm.save_task(
+            MultiResult(1, lambda flat: verdicts.__setitem__(slice(None), flat)),
+            0,
+            group,
+            plan[0].uris,
+            None,
+            None,
+            plan[0].staged_slots,
+        )
+        self.assertEqual([False, False], verdicts)
+        self.assertEqual(0, pool.free_blocks)  # the write that holds them
 
     def test_capture_exception_releases_the_runs_it_already_took(self):
         g0 = windowed_group("tp0_g0", group_idx=0)
@@ -668,13 +761,14 @@ class TestCaptureDispositions(unittest.TestCase):
 
         dtm = _Raising(pool)
         conn = worker_with([g0, g1], dtm)
-        with mock.patch.object(conn, "_withhold") as withhold:
-            with self.assertRaises(RuntimeError):
-                conn._capture_request(
-                    CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8], [9, 10]])
-                )
+        with self.assertRaises(RuntimeError):
+            conn._capture_request(
+                CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8], [9, 10]])
+            )
+        # Nothing is left staged: the caller (_capture_blocks) logs and lets the
+        # blocks fail closed.
         self.assertEqual([(0, 2)], pool.released)
-        self.assertFalse(withhold.called)  # _capture_blocks is the one that withholds
+        self.assertEqual({}, conn._staged.get("r0", {}))
 
     def test_capture_failure_withholds_and_keeps_serving(self):
         group = windowed_group()
@@ -690,7 +784,8 @@ class TestCaptureDispositions(unittest.TestCase):
                     ]
                 )
             )
-        self.assertEqual({0, 1}, conn._withheld["r0"])
+        # The step's capture budget is spent: the caller stops there.
+        self.assertEqual({}, conn._staged.get("r0", {}))
 
     def test_two_windowed_groups_capture_together(self):
         g0 = windowed_group("tp0_g0", group_idx=0)
@@ -702,8 +797,62 @@ class TestCaptureDispositions(unittest.TestCase):
         )
         self.assertEqual(["tp0_g0", "tp0_g1"], [c[0] for c in dtm.captures])
         self.assertEqual(
-            [(0, 0), (0, 1), (1, 0), (1, 1)], sorted(conn._staged["r0"])
+            [("tp0_g0", 0), ("tp0_g0", 1), ("tp0_g1", 0), ("tp0_g1", 1)],
+            sorted(conn._staged["r0"]),
         )
+
+    def test_two_buckets_of_one_group_keep_their_own_slots(self):
+        # One vLLM group, two transfer buckets (a packed group can hold two
+        # R-SWA windows or two window retentions): the capture, the plan and
+        # the task must key on the bucket, not on the shared group index --
+        # keying on the index makes the second bucket's capture overwrite the
+        # first's entry, the first plan then takes the *other* bucket's bytes
+        # and the second bucket's block fails with no bytes at all.
+        g0 = windowed_group("tp0_g0", group_idx=0)
+        # A different content dim: another shape, another arena.
+        g1 = windowed_group("tp0_g0_b1", group_idx=0, per_token_dim=12)
+        pool_a = _StagingPool(torch.device("cpu"), g0.per_block_bytes, 8)
+        pool_b = _StagingPool(torch.device("cpu"), g1.per_block_bytes, 8)
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {"tp0_g0": pool_a, "tp0_g0_b1": pool_b}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        conn = worker_with([g0, g1], dtm)
+        with mock.patch("kv_cache_manager.py_connector.vllm.data_transfer"
+                        ".batch_gather_scatter_helper"):
+            conn._capture_request(
+                CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8]])
+            )
+        self.assertEqual(
+            [("tp0_g0", 0), ("tp0_g0", 1), ("tp0_g0_b1", 0), ("tp0_g0_b1", 1)],
+            sorted(conn._staged["r0"]),
+        )
+        plans = conn._plan_group_transfers(
+            locations([["tp0_g0", "tp0_g0_b1"]] * 2),
+            [0, 1],
+            [[7, 8]],
+            "r0",
+            for_save=True,
+        )
+        self.assertEqual([0, 1], plans[0].staged_slots)
+        self.assertEqual([0, 1], plans[1].staged_slots)
+        for plan, group in zip(plans, (g0, g1)):
+            verdicts = [None, None]
+            dtm.save_task(
+                MultiResult(1, lambda flat: verdicts.__setitem__(slice(None), flat)),
+                0,
+                group,
+                plan.uris,
+                None,
+                None,
+                plan.staged_slots,
+            )
+            self.assertEqual([True, True], verdicts)
+        # Every slot went back to the arena it came from, exactly once.
+        self.assertEqual(8, pool_a.free_blocks)
+        self.assertEqual(8, pool_b.free_blocks)
 
     def test_second_group_exhaustion_releases_the_first_run(self):
         g0 = windowed_group("tp0_g0", group_idx=0)
@@ -712,20 +861,77 @@ class TestCaptureDispositions(unittest.TestCase):
         dtm = _RecordingDTM(pool)
         conn = worker_with([g0, g1], dtm)
         # First group gets a run of 2, second group cannot: nothing may be held.
-        conn._capture_request(
-            CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8], [9, 10]])
+        self.assertFalse(
+            conn._capture_request(
+                CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8], [9, 10]])
+            )
         )
         self.assertEqual([(0, 2)], pool.released)
-        self.assertEqual({0, 1}, conn._withheld["r0"])
         self.assertEqual({}, conn._staged.get("r0", {}))
+
+    def test_a_repeat_capture_returns_the_slot_it_displaces(self):
+        # The scheduler's save watermark can move backwards (preemption shrinks
+        # the allocation), so the same block can be captured twice. The repeat
+        # overwrites the old entry -- the old slot has no session reference (a
+        # session *moves* the entry into _in_flight when it takes it), so it
+        # must go back to the arena: overwriting it silently leaks the slot for
+        # the rest of the process's life.
+        pool = _StagingPool(torch.device("cpu"), 256, 8)
+        dtm = _RecordingDTM(pool)
+        conn = worker_with([windowed_group()], dtm)
+        conn._capture_request(CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8]]))
+        self.assertEqual(6, pool.free_blocks)
+        self.assertEqual(
+            [0, 1], sorted(slot for _key, (_pool, slot) in conn._staged["r0"].items())
+        )
+        conn._capture_request(CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8]]))
+        # The repeat holds its new run and the displaced one is already back:
+        # arena use is one run, not two.
+        self.assertEqual(6, pool.free_blocks)
+        self.assertEqual(
+            [2, 3], sorted(slot for _key, (_pool, slot) in conn._staged["r0"].items())
+        )
+        conn._release_staged("r0")
+        self.assertEqual(8, pool.free_blocks)
+        self.assertEqual({}, conn._staged.get("r0", {}))
+
+    def test_one_timeout_spends_the_whole_step_budget(self):
+        # Every capture of a step waits on the same arena, so the second one
+        # would only burn the same deadline again (the engine thread pays the
+        # sum): the first timeout ends the step's capturing, and the skipped
+        # requests fail closed exactly like a withheld one.
+        group = windowed_group()
+        pool = _StagingPool(torch.device("cpu"), group.per_block_bytes, 2)
+        self.assertEqual(0, pool.acquire(2))  # held by an in-flight write
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        conn = worker_with([group], dtm)
+        with mock.patch.object(
+            conn._data_transfer, "capture_blocks", wraps=conn._data_transfer.capture_blocks
+        ) as capture:
+            conn._capture_blocks(
+                SimpleNamespace(
+                    to_capture_requests=[
+                        CaptureRequest("r0", [0], all_block_ids=[[7]]),
+                        CaptureRequest("r1", [0], all_block_ids=[[8]]),
+                        CaptureRequest("r2", [0], all_block_ids=[[9]]),
+                    ]
+                )
+            )
+        # Only the first request tried (and timed out): the other two were
+        # skipped with it.
+        self.assertEqual(1, capture.call_count)
+        self.assertEqual({}, conn._staged)
 
     def test_finish_releases_unwritten_slots(self):
         conn = captured_worker([0, 1], [7, 8])
         conn._release_staged("r0")
         self.assertEqual([(0, 1), (1, 1)], conn._data_transfer.pool.released)
         self.assertNotIn("r0", conn._staged)
-        self.assertNotIn("r0", conn._capture_scope)
-        self.assertNotIn("r0", conn._withheld)
+        self.assertNotIn("r0", conn._in_flight)
 
 
 class TestStagedDispositions(unittest.TestCase):
@@ -1165,6 +1371,37 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         self.assertEqual([False] * self.BLOCKS, done["flat"])
         self.assertEqual(self.CAPACITY, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=0)
+
+    def test_a_failed_contract_returns_its_staged_slots(self):
+        # claimed=False + captured=True (the capture holds bytes for a block
+        # whose location never claimed this spec) is a contract violation: the
+        # block fails *and* the task returns the slot it owns -- failing alone
+        # would leave the arena short for the rest of the process's life.
+        group = windowed_group()
+        pool = _StagingPool(torch.device("cpu"), group.per_block_bytes, 4)
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        conn = worker_with([group], dtm)
+        with mock.patch("kv_cache_manager.py_connector.vllm.data_transfer"
+                        ".batch_gather_scatter_helper"):
+            conn._capture_request(CaptureRequest("r0", [0], all_block_ids=[[7]]))
+        self.assertEqual(3, pool.free_blocks)
+        verdicts: List[Any] = [None]
+        dtm.save_task(
+            MultiResult(1, lambda flat: verdicts.__setitem__(slice(None), flat)),
+            0,
+            group,
+            [None],  # no location claimed this block's spec
+            None,
+            None,
+            [0],
+        )
+        self.assertEqual([False], verdicts)
+        self.assertEqual(4, pool.free_blocks)
 
     def test_a_second_plan_fails_instead_of_handing_the_slot_out_twice(self):
         conn, dtm, pool, group = self._fixture()

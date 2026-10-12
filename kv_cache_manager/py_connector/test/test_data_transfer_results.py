@@ -984,6 +984,8 @@ class TestDataTransferManagerPools(unittest.TestCase):
         self.assertEqual(dtm.save_task_blocks(groups[3]), 8)  # other shape
 
     def test_the_transfer_reserve_is_the_largest_task_batch(self):
+        from kv_cache_manager.py_connector.common.logger import logger
+
         # The eager capture may only borrow above it, so a transfer task can
         # always start and thereby release the captures its own session holds
         # (review_r1 N1): one task's maximum batch per arena, clamped to what
@@ -1012,6 +1014,19 @@ class TestDataTransferManagerPools(unittest.TestCase):
         self.assertEqual(pool.max_blocks, 1)
         self.assertEqual(pool.reserved_blocks, 1)
         self.assertEqual(pool.acquire(1, timeout=0.01, keep_reserved=True), None)
+        # The degraded configuration says so at startup instead of leaving it
+        # to the per-capture withholding warnings.
+        with self.assertLogs(logger, level="INFO") as logs:
+            self._dtm(
+                groups,
+                block_per_save_task=128,
+                block_per_load_task=128,
+                staging_pool_blocks=16,
+                staging_pool_max_bytes_per_group=4096,
+            )
+        self.assertTrue(
+            any("captures are disabled" in line for line in logs.output), logs.output
+        )
 
     def test_configured_batch_below_the_pool_is_untouched(self):
         groups = self._groups()
