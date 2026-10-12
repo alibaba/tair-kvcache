@@ -43,6 +43,7 @@ from kv_cache_manager.py_connector.vllm.metadata import (
 from kv_cache_manager.py_connector.vllm.vllm_common import (
     ATTN_ONLY_SPEC_GROUP,
     ALL_SPEC_GROUP,
+    RETENTION_RSWA_GAP,
     AttentionGroupMeta,
     GroupMeta,
     StateGroupMeta,
@@ -284,12 +285,43 @@ class ConnectorScheduler:
         so its start lies inside the last cdiv(chunk - 1, mbs) blocks (the
         region is at most one block wider than vLLM needs -- a conservative
         over-requirement trims a hit, it never loads a hole).
+
+        R-SWA gets the opposite treatment: ``RSWAManager`` inherits the
+        full-attention manager (its ``get_num_skipped_tokens`` is not
+        overridden) and its mask keeps the whole prefill segment visible, so a
+        hit is a *prefix* whose every visible row must carry data. Requiring
+        only the window tail would accept a hit with a hole in the middle --
+        and the load would then either fail the block (vLLM truncating or
+        failing the request) or, for a multi-group model, let visible rows read
+        unloaded KV. Such a meta therefore requires the whole range instead,
+        which ``_window_required_from`` expresses as "from block 0".
         """
         retention = meta.retention
         assert retention is not None
-        blocks = -(-(retention.window_tokens - 1 + retention.extra_retained_tokens)
-                   // self._manager_block_size)
+        if retention.kind == RETENTION_RSWA_GAP:
+            return self._num_blocks_of_retention(meta)
+        blocks = self._num_blocks_of_retention(meta)
         return blocks + 1 if self._has_eagle_group else blocks
+
+    def _num_blocks_of_retention(self, meta: AttentionGroupMeta) -> int:
+        retention = meta.retention
+        assert retention is not None
+        return -(
+            -(retention.window_tokens - 1 + retention.extra_retained_tokens)
+            // self._manager_block_size
+        )
+
+    def _window_required_from(self, meta: AttentionGroupMeta, end: int) -> int:
+        """First manager block of ``[.., end)`` this windowed group must cover.
+
+        The window tail for sliding / chunked-local, block 0 for R-SWA (see
+        ``_window_blocks``): the caller only has to check that the run starting
+        here reaches ``end``.
+        """
+        assert meta.retention is not None
+        if meta.retention.kind == RETENTION_RSWA_GAP:
+            return 0
+        return max(0, end - self._window_blocks(meta))
 
     def _windowed_match_end(self, locations: List[dict], limit: int) -> int:
         """Largest block count <= limit a windowed match may end on.
@@ -314,7 +346,6 @@ class ConnectorScheduler:
         run = [0] * (len(covered) + 1)
         for i in range(len(covered) - 1, -1, -1):
             run[i] = run[i + 1] + 1 if covered[i] else 0
-        k = max(self._window_blocks(m) for m in self._windowed_metas)
         end = limit
         while end > 0:
             if not self._location_covers_states(locations[end - 1]):
@@ -322,12 +353,18 @@ class ConnectorScheduler:
                 # one block shorter (the window region moves with it).
                 end -= 1
                 continue
-            start = max(0, end - k)
-            if run[start] >= min(k, end):
+            # The union of every windowed group's requirement: the widest tail
+            # window decides where it starts, and an R-SWA group pins it to
+            # block 0 (see _window_required_from).
+            start = min(
+                self._window_required_from(meta, end) for meta in self._windowed_metas
+            )
+            if run[start] >= end - start:
                 return end
-            # A hole inside [start, end): every end in (hole, end] has it in
-            # its own window region (hole + k >= end), so the largest
-            # candidate left is the hole itself -- which excludes it.
+            # A hole inside [start, end): every end in (hole, end] has that
+            # hole in its own region (start only grows with end, and R-SWA's
+            # region only shrinks), so the largest candidate left is the hole
+            # itself -- which excludes it.
             end = start + run[start]
         return 0
 

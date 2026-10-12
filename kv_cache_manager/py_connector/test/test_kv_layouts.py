@@ -412,11 +412,17 @@ class TestBuildTransferGroup(unittest.TestCase):
 
     def test_hnd_layout_rejected(self):
         # HND interleaves heads across tokens: the gather kernel needs NHD.
+        # The message has to be actionable for every backend -- naming the knob
+        # and the *engine's* layout vocabulary (a bare "=NHD" is not a value V4
+        # accepts), not just the tensor's shape.
         kv = {"l0": FakeTensor([10, 16, 576], [18432, 1, 16], itemsize=2)}
         with self.assertRaises(AssertionError) as ctx:
             self._build(kv)
-        self.assertIn("not token-major", str(ctx.exception))
-        self.assertIn("VLLM_KV_CACHE_LAYOUT=NHD", str(ctx.exception))
+        message = str(ctx.exception)
+        self.assertIn("not token-major", message)
+        self.assertIn("BLNHC/LBNHC", message)
+        self.assertIn("VLLM_KV_CACHE_LAYOUT", message)
+        self.assertIn("head-major", message)
 
     def test_layers_must_share_shape_and_stride(self):
         kv = {
