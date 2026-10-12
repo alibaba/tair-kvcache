@@ -37,22 +37,51 @@ class FinishRequest:
 
 
 @dataclass
+class CaptureRequest:
+    """Copy one request's newly completed manager blocks out of HBM *now*.
+
+    Windowed groups (see vllm_common.WindowRetention) lose their blocks to
+    vLLM's window sliding in the *next* schedule step, so the scheduler asks
+    the worker to copy the bytes in the step whose forward produced them --
+    before the write session (and with it the remote addresses) exists. The
+    worker keeps the captured bytes in its pinned staging arena and the save
+    task writes them once the session lands, so the announce -> session lag
+    never touches HBM again.
+
+    ``all_block_ids`` is the scheduler's block-table snapshot, taken in the
+    same scheduler loop iteration: the physical ids are still valid at capture
+    time (the free happens in the next schedule), which is what makes this
+    snapshot -- not a later ledger read -- the trustworthy null/data source.
+    """
+
+    req_id: str
+    # Manager blocks to capture, in ascending order.
+    manager_block_idxes: List[int]
+    all_block_ids: List[List[int]] = field(default_factory=list)
+
+
+@dataclass
 class TairKvCacheConnectorMetadata(KVConnectorMetadata):
     """Scheduler -> worker metadata for one engine step.
 
-    Three instruction kinds, each consumed by its own worker hook:
-    to_load_requests (start_load_kv), to_save_requests (wait_for_save) and
-    to_finish_requests (get_finished). Every instruction is self-contained
-    -- the worker keeps no per-request mirror of scheduler state."""
+    Four instruction kinds, each consumed by its own worker hook:
+    to_load_requests (start_load_kv), to_capture_requests + to_save_requests
+    (wait_for_save) and to_finish_requests (get_finished). Every instruction is
+    self-contained -- the worker keeps no per-request mirror of scheduler
+    state."""
 
     def __init__(self, epoch: int) -> None:
         self.epoch = epoch
         self.to_load_requests: List[LoadRequest] = []
+        self.to_capture_requests: List[CaptureRequest] = []
         self.to_save_requests: List[SaveRequest] = []
         self.to_finish_requests: List[FinishRequest] = []
 
     def add_load_request(self, request: LoadRequest) -> None:
         self.to_load_requests.append(request)
+
+    def add_capture_request(self, request: CaptureRequest) -> None:
+        self.to_capture_requests.append(request)
 
     def add_save_request(self, save_request: SaveRequest) -> None:
         self.to_save_requests.append(save_request)
@@ -64,6 +93,7 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
         return (
             f"TairKvCacheConnectorMetadata(epoch={self.epoch}, "
             f"load={len(self.to_load_requests)}, "
+            f"capture={len(self.to_capture_requests)}, "
             f"save={len(self.to_save_requests)}, "
             f"finish={len(self.to_finish_requests)})"
         )
