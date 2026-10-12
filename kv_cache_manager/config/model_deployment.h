@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,7 @@ public:
     const std::string &extra() const noexcept { return extra_; }
     const std::string &user_data() const noexcept { return user_data_; }
     bool use_eagle_pop() const noexcept { return use_eagle_pop_; }
+    int64_t sliding_window_tokens() const noexcept { return sliding_window_tokens_; }
 
     // Setter methods
     void set_model_name(const std::string &v) { model_name_ = v; }
@@ -35,6 +37,7 @@ public:
     void set_extra(const std::string &v) { extra_ = v; }
     void set_user_data(const std::string &v) { user_data_ = v; }
     void set_use_eagle_pop(bool v) noexcept { use_eagle_pop_ = v; }
+    void set_sliding_window_tokens(int64_t v) noexcept { sliding_window_tokens_ = v; }
 
 private:
     std::string model_name_;
@@ -47,5 +50,6 @@ private:
     std::string extra_;
     std::string user_data_;
     bool use_eagle_pop_ = false;
+    int64_t sliding_window_tokens_ = 0;
 };
 } // namespace kv_cache_manager

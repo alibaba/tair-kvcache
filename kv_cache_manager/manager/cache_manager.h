@@ -55,6 +55,7 @@ public:
         QT_PREFIX_MATCH = 2,
         QT_REVERSE_ROLL_SW_MATCH = 3,
         QT_PREFIX_MATCH_WITH_MAMBA = 4,
+        QT_PREFIX_MATCH_WITH_SWA = 5,
     };
     std::string QueryTypeToString(QueryType query_type) const {
         switch (query_type) {
@@ -66,6 +67,8 @@ public:
             return "reverse_roll_sw_match";
         case QueryType::QT_PREFIX_MATCH_WITH_MAMBA:
             return "prefix_match_with_mamba";
+        case QueryType::QT_PREFIX_MATCH_WITH_SWA:
+            return "prefix_match_with_swa";
         default:
             return "unspecified";
         }

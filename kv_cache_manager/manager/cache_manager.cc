@@ -4797,12 +4797,24 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
         }
     }
     const bool use_eagle_pop = instance_info->model_deployment().use_eagle_pop();
-    if (query_type != QueryType::QT_PREFIX_MATCH && query_type != QueryType::QT_PREFIX_MATCH_WITH_MAMBA) {
+    if (query_type != QueryType::QT_PREFIX_MATCH && query_type != QueryType::QT_PREFIX_MATCH_WITH_MAMBA &&
+        query_type != QueryType::QT_PREFIX_MATCH_WITH_SWA) {
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
                                           EC_BADARGS,
                                           std::vector<HostCacheMatch>,
                                           "unsupported query type for GetHostCacheState: %s",
                                           QueryTypeToString(query_type).c_str());
+    }
+
+    size_t window_blocks = 0;
+    if (query_type == QueryType::QT_PREFIX_MATCH_WITH_SWA) {
+        const int64_t window_tokens = instance_info->model_deployment().sliding_window_tokens();
+        const int64_t block_size = instance_info->block_size();
+        if (window_tokens <= 0 || block_size <= 0) {
+            request_context->error_tracer()->AddErrorMsg("SWA requires positive sliding_window_tokens and block_size");
+            return {EC_BADARGS, {}};
+        }
+        window_blocks = static_cast<size_t>(1 + (window_tokens - 1) / block_size);
     }
 
     PREFIX_LOG(DEBUG, "GetHostCacheState query_type [%s]", QueryTypeToString(query_type).c_str());
@@ -4842,6 +4854,20 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                                        top_k_host_count,
                                                        backend_types,
                                                        policy.get());
+        break;
+    }
+    case QueryType::QT_PREFIX_MATCH_WITH_SWA: {
+        ec = meta_searcher->PrefixMatchWithSwaByHost(request_context,
+                                                     block_cache_keys,
+                                                     window_blocks,
+                                                     use_eagle_pop,
+                                                     medium_filter,
+                                                     instance_info->location_spec_groups(),
+                                                     host_matches,
+                                                     &request_check_location,
+                                                     top_k_host_count,
+                                                     backend_types,
+                                                     policy.get());
         break;
     }
     default:

@@ -987,6 +987,109 @@ TEST_F(MetaSearcherTest, TestPrefixMatchWithMambaByHostSupportsMultiwordSpecsAnd
     EXPECT_EQ(1, matches[0].local);
 }
 
+TEST_F(MetaSearcherTest, TestSwaWindowsRequireAllSpecsAndAllowShortHistory) {
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"fa", "fb"}),
+        LocationSpecGroup("F1", {"fc"}),
+        LocationSpecGroup("W0", {"wa", "wb"}),
+        LocationSpecGroup("W1", {"wc"}),
+    };
+    struct Case {
+        const char *name;
+        size_t full_prefix;
+        std::set<size_t> window_blocks; // One-based positions with complete W specs.
+        size_t window_size;
+        bool eagle;
+        int64_t expected;
+    };
+    const std::vector<Case> cases = {
+        {"tail window", 8, {6, 7, 8}, 3, false, 8},
+        {"earlier window", 8, {4, 5, 6}, 3, false, 6},
+        {"short history", 2, {1, 2}, 3, false, 2},
+        {"hole inside window", 8, {6, 8}, 3, false, 0},
+        {"window after hole", 8, {1, 2, 4, 5, 6}, 3, false, 6},
+        {"full gap limits search", 5, {1, 4, 5, 6}, 3, false, 1},
+        {"one block window", 8, {6}, 1, false, 6},
+        {"window larger than prompt", 8, {1, 2, 3, 4, 5, 6, 7, 8}, 20, false, 8},
+        {"large window with hole", 8, {1, 2, 4, 5, 6, 7, 8}, 20, false, 2},
+        {"eagle invalidates tail", 8, {6, 7, 8}, 3, true, 0},
+        {"eagle keeps earlier window", 8, {4, 5, 6}, 3, true, 6},
+        {"eagle short history", 2, {1, 2}, 3, true, 1},
+    };
+    size_t case_index = 0;
+    for (const auto &test : cases) {
+        SCOPED_TRACE(test.name);
+        MetaSearcher::KeyVector keys(8);
+        std::iota(keys.begin(), keys.end(), 120000 + 8 * case_index++);
+        CacheLocationMapVector locations(keys.size());
+        const std::string host = "swa:80";
+        for (size_t i = 0; i < keys.size(); ++i) {
+            // Split specs across same-host L1/L2 locations. An incomplete
+            // group is still present: membership alone must not count as a hit.
+            for (bool l2 : {false, true}) {
+                const auto type = l2 ? DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2
+                                     : DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
+                const std::string id = std::string("kvs#event_report_") + (l2 ? "l2" : "l1p5") + "#mem#" + host;
+                std::vector<LocationSpec> specs;
+                const auto add = [&](const char *name) { specs.emplace_back(name, "event_report://" + host + "/mem"); };
+                add(l2 ? "fb" : "fa");
+                if (i < test.full_prefix && !l2) {
+                    add("fc");
+                }
+                add(l2 ? "wb" : "wa");
+                if (test.window_blocks.count(i + 1) && l2) {
+                    add("wc");
+                }
+                locations[i][id] = std::make_shared<CacheLocation>(id, CLS_SERVING, type, specs.size(), specs);
+            }
+        }
+        PropertyMapVector properties;
+        ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, locations, properties).ec);
+        for (size_t top_k : {0u, 1u}) {
+            std::vector<MetaSearcher::HostCacheMatch> matches;
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->PrefixMatchWithSwaByHost(request_context_.get(),
+                                                               keys,
+                                                               test.window_size,
+                                                               test.eagle,
+                                                               {"mem"},
+                                                               groups,
+                                                               matches,
+                                                               nullptr,
+                                                               top_k,
+                                                               {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}));
+            if (test.expected == 0) {
+                EXPECT_TRUE(matches.empty());
+            } else {
+                ASSERT_EQ(1u, matches.size());
+                EXPECT_EQ(host, matches[0].host_ip_port);
+                EXPECT_EQ(test.expected, matches[0].local);
+                EXPECT_EQ(test.expected, matches[0].global);
+            }
+        }
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->PrefixMatchWithSwaByHost(
+                      request_context_.get(), keys, test.window_size, false, {"disk"}, groups, matches));
+        EXPECT_TRUE(matches.empty());
+    }
+}
+
+TEST_F(MetaSearcherTest, TestSwaRejectsUnsupportedOrMissingGroups) {
+    const std::vector<std::vector<LocationSpecGroup>> invalid_groups = {
+        {},
+        {LocationSpecGroup("F0", {"f"})},
+        {LocationSpecGroup("W0", {"w"})},
+        {LocationSpecGroup("F0", {"f"}), LocationSpecGroup("L0", {"w"})},
+        {LocationSpecGroup("F0", {"f"}), LocationSpecGroup("W0", {"w"}), LocationSpecGroup("X0", {"x"})},
+    };
+    for (const auto &groups : invalid_groups) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        EXPECT_EQ(EC_BADARGS,
+                  meta_searcher_->PrefixMatchWithSwaByHost(request_context_.get(), {1}, 3, false, {}, groups, matches));
+    }
+}
+
 TEST_F(MetaSearcherTest, TestMambaProgressiveBitsetMatchesReferenceAcrossParallelReadChunks) {
     constexpr size_t kKeyCount = 40000;
     constexpr size_t kFullPrefix = 37001;
@@ -1081,6 +1184,30 @@ TEST_F(MetaSearcherTest, TestMambaProgressiveBitsetMatchesReferenceAcrossParalle
     EXPECT_EQ(run(false, 1), run(false, 0));
     EXPECT_EQ(static_cast<int64_t>(kLastStateBeforeEaglePop + 1), run(true, 0));
     EXPECT_EQ(run(true, 1), run(true, 0));
+    const std::vector<LocationSpecGroup> swa_groups = {
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("W0", {"state_0"}),
+    };
+    for (bool eagle : {false, true}) {
+        for (size_t top_k : {0u, 1u}) {
+            std::vector<MetaSearcher::HostCacheMatch> matches;
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->PrefixMatchWithSwaByHost(request_context_.get(),
+                                                               keys,
+                                                               2,
+                                                               eagle,
+                                                               {"mem"},
+                                                               swa_groups,
+                                                               matches,
+                                                               nullptr,
+                                                               top_k,
+                                                               {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}));
+            ASSERT_EQ(1u, matches.size());
+            // The last adjacent states are at zero-based 20479/20480.
+            EXPECT_EQ(20481, matches[0].local);
+            EXPECT_EQ(20481, matches[0].global);
+        }
+    }
 }
 
 TEST_F(MetaSearcherTest, TestProgressiveHostPrefixesMatchRandomizedFullReadReference) {
@@ -1337,6 +1464,25 @@ TEST_F(MetaSearcherTest, TestPrefixMatchByHostExcludesEveryNonServingStatusWithA
     };
     verify_mamba(0);
     verify_mamba(5);
+    for (size_t top_k : {0u, 5u}) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->PrefixMatchWithSwaByHost(
+                      request_context_.get(),
+                      keys,
+                      3,
+                      false,
+                      {"mem"},
+                      {LocationSpecGroup("F0", {"full_0"}), LocationSpecGroup("W0", {"state_0"})},
+                      matches,
+                      nullptr,
+                      top_k,
+                      {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}));
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ("serving-host:8080", matches[0].host_ip_port);
+        EXPECT_EQ(2, matches[0].local);
+        EXPECT_EQ(2, matches[0].global);
+    }
 }
 
 TEST_F(MetaSearcherTest, TestHostPrefixQueriesPropagateMetadataErrorsWithAndWithoutP2P) {
@@ -5155,14 +5301,25 @@ protected:
         return Query(count, backend_types, groups, eagle);
     }
 
-    std::map<std::string, std::pair<int64_t, int64_t>>
-    Query(size_t count,
-          const std::vector<DataStorageType> &backend_types,
-          const std::vector<LocationSpecGroup> &groups = {},
-          bool eagle = false) {
+    std::map<std::string, std::pair<int64_t, int64_t>> Query(size_t count,
+                                                             const std::vector<DataStorageType> &backend_types,
+                                                             const std::vector<LocationSpecGroup> &groups = {},
+                                                             bool eagle = false,
+                                                             size_t window_blocks = 0) {
         std::vector<MetaSearcher::HostCacheMatch> matches;
         auto ec =
-            groups.empty()
+            window_blocks > 0 ? meta_searcher_->PrefixMatchWithSwaByHost(request_context_.get(),
+                                                                         keys_,
+                                                                         window_blocks,
+                                                                         eagle,
+                                                                         {"mem"},
+                                                                         groups,
+                                                                         matches,
+                                                                         nullptr,
+                                                                         count,
+                                                                         backend_types,
+                                                                         &policy_)
+            : groups.empty()
                 ? meta_searcher_->PrefixMatchByHost(
                       request_context_.get(), keys_, eagle, {"mem"}, matches, nullptr, count, backend_types, &policy_)
                 : meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(),
@@ -5372,6 +5529,65 @@ TEST_F(HostCacheRemoteTest, LinearCoverageCountsSpecPositionsLikeBackendQuery) {
     }
     EXPECT_TRUE(selected[3].empty());
     EXPECT_TRUE(selected[4].empty());
+}
+
+TEST_F(HostCacheRemoteTest, SwaCoverageSelectsOnePeerBySpecCountRatherThanFarthestWindow) {
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full"}),
+        LocationSpecGroup("W0", {"a", "b", "c"}),
+        LocationSpecGroup("W1", {"d"}),
+    };
+    const auto local = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
+    const auto p2p = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+    Add(0, local, "worker:80", {"full", "a", "b", "c", "d"});
+    Add(1, local, "worker:80", {"full", "d"});
+    Add(1, p2p, "peer_a:80", {"a", "b", "c"});
+    for (size_t i : {2u, 3u}) {
+        Add(i, local, "worker:80", {"full", "a", "b", "c"});
+        Add(i, p2p, "peer_b:80", {"d"});
+    }
+    Store();
+    // A adds three spec positions, B adds two. B could complete the later
+    // B3/B4 window, but the actual COVERAGE strategy picks A, yielding B1/B2.
+    EXPECT_EQ(std::make_pair(1L, 2L), Query(1, std::vector<DataStorageType>{p2p}, groups, false, 2).at("worker:80"));
+    EXPECT_EQ(std::make_pair(1L, 1L), Query(0, std::vector<DataStorageType>{p2p}, groups, false, 2).at("worker:80"));
+}
+
+TEST_F(HostCacheRemoteTest, SwaZeroLocalHostsRespectTopKAndDoNotStitchPeers) {
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full"}),
+        LocationSpecGroup("W0", {"window"}),
+    };
+    const auto local = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
+    const auto p2p = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+    for (size_t i = 0; i < keys_.size(); ++i) {
+        Add(i, local, "worker_a:80", {"full"});
+        Add(i, local, "worker_b:80", {"full"});
+    }
+    Add(3, p2p, "peer_a:80", {"window"});
+    Add(4, p2p, "peer_b:80", {"window"});
+    Add(5, p2p, "peer_b:80", {"window"});
+    Store();
+    EXPECT_TRUE(Query(2, std::vector<DataStorageType>{p2p}, groups, false, 3).empty());
+    // One peer can now complete a window. Both workers still have local=0;
+    // K=1 chooses worker_a by host order and omits unselected zero hosts.
+    Add(3, p2p, "peer_b:80", {"window"});
+    Store();
+    auto matches = Query(1, std::vector<DataStorageType>{p2p}, groups, false, 3);
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ(std::make_pair(0L, 6L), matches.at("worker_a:80"));
+    matches = Query(2, std::vector<DataStorageType>{p2p}, groups, false, 3);
+    ASSERT_EQ(2u, matches.size());
+    EXPECT_EQ(std::make_pair(0L, 6L), matches.at("worker_b:80"));
+    // A positive local hit outranks worker_a. Top K limits remote evaluation,
+    // while worker_a remains in the response with global=local.
+    Add(0, local, "worker_a:80", {"full", "window"});
+    Add(0, local, "worker_b:80", {"full", "window"});
+    Add(1, local, "worker_b:80", {"full", "window"});
+    Store();
+    matches = Query(1, std::vector<DataStorageType>{p2p}, groups, false, 3);
+    EXPECT_EQ(std::make_pair(1L, 1L), matches.at("worker_a:80"));
+    EXPECT_EQ(std::make_pair(2L, 6L), matches.at("worker_b:80"));
 }
 
 TEST_F(HostCacheRemoteTest, BaseSelectionIsSharedAcrossHostsAndHonorsPolicy) {

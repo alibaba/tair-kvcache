@@ -138,6 +138,21 @@ TEST_F(InstanceInfoTest, TestDefaultQueryTypeSerializeAndMismatch) {
     EXPECT_EQ(kQueryType, parsed.default_query_type());
 }
 
+TEST_F(InstanceInfoTest, TestSlidingWindowPersistsAndParticipatesInModelIdentity) {
+    ModelDeployment model;
+    ASSERT_TRUE(model.FromJsonString(R"({"model_name":"swa","dtype":"fp16"})"));
+    EXPECT_EQ(0, model.sliding_window_tokens());
+    model.set_sliding_window_tokens(192);
+    InstanceInfo instance("quota", "group", "swa", 64, {}, model, {}, 5);
+    InstanceInfo restored;
+    ASSERT_TRUE(restored.FromJsonString(instance.ToJsonString()));
+    EXPECT_EQ(192, restored.model_deployment().sliding_window_tokens());
+    EXPECT_EQ(5, restored.default_query_type());
+    EXPECT_TRUE(restored.MismatchFields(64, {}, model, {}, 5).empty());
+    model.set_sliding_window_tokens(256);
+    EXPECT_EQ((std::vector<std::string>{"model_deployment"}), restored.MismatchFields(64, {}, model, {}, 5));
+}
+
 TEST_F(InstanceInfoTest, TestToStringProducesJsonObject) {
     InstanceInfo instance_info("quota_group", "instance_group", "instance_id", 64, {}, {}, {}, 4);
 

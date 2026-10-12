@@ -676,21 +676,25 @@ HTTP 接口为 `POST /api/getHostCacheState`：
 规则：
 
 - 输入 block key 的顺序有意义；
-- 每个 host 从第一个 key 开始连续计数，遇到第一个 miss 即停止；
+- 普通前缀匹配从第一个 key 连续计数；Mamba/SWA 先确定 Full 连续前缀，再查找可恢复位置；
 - host 候选仍来自第一个 key 的本地数据投影；
 - `medium` 为空表示考虑所有 medium；
 - `medium` 非空时只约束本地和 V6D 上报介质，不过滤 TairMempool 的路径；
 - `QT_UNSPECIFIED` 使用 RegisterInstance 时配置的 `default_query_type`；
-- 支持 `QT_PREFIX_MATCH` 和 `QT_PREFIX_MATCH_WITH_MAMBA`，其他类型返回参数错误；
+- 支持 `QT_PREFIX_MATCH`、`QT_PREFIX_MATCH_WITH_MAMBA` 和 `QT_PREFIX_MATCH_WITH_SWA`，其他类型返回参数错误；
+- SWA 只接受 F/W 两类 group，且两类都必须存在；group 名称首字符决定类别，同类所有 group 的全部 spec 齐全才算该 block 完整；
+- SWA 从 `model_deployment.sliding_window_tokens` 读取窗口 token 数，按 instance 的 `block_size` 向上取整为窗口块数 `w`；两者必须为正；
+- SWA 返回最大的 `k`：Full 在 `[1,k]` 完整，W 在 `[max(1,k-w+1),k]` 完整；不足一整个窗口的起始前缀也可以命中。W 的缺口不终止后续窗口搜索；
+- Eagle 先将 Full 前缀上限减一，再寻找 Mamba 状态或 SWA 窗口，不能对最终结果直接减一；
 - local 按逻辑 engine 身份汇总，独立 rank 不合并；共享 V6D 沿 reporter 映射贡献给对应 rank；
 - `local` 包含同一 host 的 subscriber 与 Vineyard 上报；
 - 非混合注意力对 full local-miss 使用 Prefix 选择远端 Vineyard；混合注意力先对
-  FullAttention group 使用 Prefix，再对 Mamba local-miss spec 使用 Coverage；
+  FullAttention group 使用 Prefix，再对 Full 可恢复范围内的 Mamba/SWA local-miss spec 使用 Coverage；
 - `top_k_host_count`（默认 0，不能为负）控制按 local 降序选出的逻辑 engine 数，同分按 host 升序；local 为 0 的候选也可入选并计算联合命中；
 - `backend_types` 仅支持 `ST_TAIRMEMPOOL`、`ST_EVENT_REPORT_L2`（P2P），可同时选择，顺序无关；
 - 入选 engine 合并本地与指定后端的缓存；空列表或 `top_k_host_count=0` 时仅计算本地；
 - `backend_types` 不影响 `local`，同机 Vineyard 仍按本地缓存计入；NFS/SSD 不参与本接口的补缺计算；
-- 每次最多选择一个 peer；Mamba 各 Full group 分别选一个，Linear 缺失组汇总选一个；
+- 普通模式最多选一个远端 peer；Mamba/SWA 各 Full group 分别选一个，所有 Linear/W 缺失组汇总做一次 Coverage 选择，共选一个 peer；Coverage 按新增 spec 覆盖数选 peer，不保证最终恢复位置最远；
 - `global` 是本地与本次远端评估合并后的可复用前缀，未入选时等于 `local`；
 - `global - local` 是额外可复用块数，不等于实际传输块数；
 - 旧的请求/返回字段已移除并保留编号，调用方需同步升级；

@@ -8945,16 +8945,13 @@ protected:
 
     void Prepare(CacheManager::QueryType query_type,
                  const std::vector<LocationSpecInfo> &specs,
-                 const std::vector<LocationSpecGroup> &groups = {}) {
+                 const std::vector<LocationSpecGroup> &groups = {},
+                 int64_t sliding_window_tokens = 0) {
+        auto model = createModelDeployment();
+        model.set_sliding_window_tokens(sliding_window_tokens);
         ASSERT_EQ(std::make_pair(EC_OK, default_storage_configs),
-                  cache_manager_->RegisterInstance(request_context_.get(),
-                                                   "default",
-                                                   instance_id_,
-                                                   64,
-                                                   specs,
-                                                   createModelDeployment(),
-                                                   groups,
-                                                   query_type));
+                  cache_manager_->RegisterInstance(
+                      request_context_.get(), "default", instance_id_, 64, specs, model, groups, query_type));
         auto dsm = registry_manager_->data_storage_manager_;
         tair_ = std::make_shared<testing::NiceMock<MockDataStorageBackend>>(metrics_registry_);
         ON_CALL(*tair_, GetType()).WillByDefault(testing::Return(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
@@ -8988,10 +8985,20 @@ protected:
     }
 
     void Report(int64_t key, const std::vector<std::string> &specs, bool peer = false) {
+        ReportFrom(peer ? peer_ : worker_,
+                   peer ? proto::meta::ST_EVENT_REPORT_L2 : proto::meta::ST_EVENT_REPORT_L1P5,
+                   key,
+                   specs);
+    }
+
+    void ReportFrom(const std::string &host,
+                    proto::meta::StorageType storage_type,
+                    int64_t key,
+                    const std::vector<std::string> &specs) {
         proto::meta::ReportEventRequest request;
         request.set_instance_id(instance_id_);
-        request.set_host_ip_port(peer ? peer_ : worker_);
-        request.set_storage_type(peer ? proto::meta::ST_EVENT_REPORT_L2 : proto::meta::ST_EVENT_REPORT_L1P5);
+        request.set_host_ip_port(host);
+        request.set_storage_type(storage_type);
         auto *event = request.add_events();
         event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
         auto *block = event->mutable_block_add();
@@ -9090,6 +9097,170 @@ TEST_F(HostCacheStateWithoutP2PTest, MambaPrefixMatchUsesTairWithoutP2P) {
     AddTair(103, "linear1");
     Report(104, {"linear1"}, true);
     Verify(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA);
+}
+
+TEST_F(HostCacheStateWithoutP2PTest, SwaRequiresBothFullGroupsBeforeMatchingWindow) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_SWA,
+            {LocationSpecInfo("full0", 512), LocationSpecInfo("full1", 512), LocationSpecInfo("swa", 512)},
+            {LocationSpecGroup("F0", {"full0"}), LocationSpecGroup("F1", {"full1"}), LocationSpecGroup("W0", {"swa"})},
+            191);
+    // Full0 stops at B7, Full1 at B6. W has a hole at B3 and a complete B4-B6 window.
+    const std::vector<std::vector<std::string>> local_specs = {
+        {"full0", "full1", "swa"}, // B1
+        {"full0", "full1", "swa"}, // B2
+        {"full0", "full1"},        // B3
+        {"full0", "full1", "swa"}, // B4
+        {"full0", "full1", "swa"}, // B5
+        {"full0", "full1", "swa"}, // B6
+        {"full0", "swa"},          // B7
+        {"full1", "swa"},          // B8
+    };
+    const CacheManager::KeyVector keys = {101, 102, 103, 104, 105, 106, 107, 108};
+    for (size_t i = 0; i < keys.size(); ++i) {
+        Report(keys[i], local_specs[i]);
+    }
+    struct Case {
+        const char *name;
+        int64_t window_tokens;
+        bool eagle;
+        CacheManager::KeyVector keys;
+        int64_t expected;
+    };
+    const std::vector<Case> cases = {
+        {"short history", 191, false, {101, 102}, 2},
+        {"two trailing W blocks are insufficient", 191, false, {101, 102, 103, 104, 105}, 2},
+        {"complete window after W hole, bounded by both Full groups", 191, false, keys, 6},
+        {"Eagle caps Full at B5 before checking W", 191, true, keys, 2},
+        {"192 tokens also needs three blocks", 192, true, keys, 2},
+        {"128 tokens needs only the B4-B5 window", 128, true, keys, 5},
+        {"one block window", 1, true, keys, 5},
+        {"large window requires all available history", std::numeric_limits<int64_t>::max(), false, keys, 2},
+        {"Full0 is required even when Full1 and W exist", 191, false, {108}, 0},
+        {"Full1 is required even when Full0 and W exist", 191, false, {107}, 0},
+    };
+    auto instance = registry_manager_->instance_infos_.at(instance_id_);
+    for (const auto &test : cases) {
+        SCOPED_TRACE(test.name);
+        auto model = instance->model_deployment();
+        model.set_sliding_window_tokens(test.window_tokens);
+        model.set_use_eagle_pop(test.eagle);
+        instance->set_model_deployment(model);
+        for (auto type : {CacheManager::QueryType::QT_UNSPECIFIED, CacheManager::QueryType::QT_PREFIX_MATCH_WITH_SWA}) {
+            auto [ec, matches] =
+                cache_manager_->GetHostCacheState(request_context_.get(), instance_id_, type, test.keys);
+            ASSERT_EQ(EC_OK, ec);
+            if (test.expected == 0) {
+                EXPECT_TRUE(matches.empty());
+            } else {
+                ASSERT_EQ(1u, matches.size());
+                EXPECT_EQ(worker_, matches[0].host_ip_port);
+                EXPECT_EQ(test.expected, matches[0].local);
+                EXPECT_EQ(test.expected, matches[0].global);
+            }
+        }
+    }
+}
+
+TEST_F(HostCacheStateWithoutP2PTest, SwaSelectsPeersPerFullGroupAndOnePeerForWindow) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_SWA,
+            {LocationSpecInfo("full0", 512), LocationSpecInfo("full1", 512), LocationSpecInfo("swa", 512)},
+            {LocationSpecGroup("F0", {"full0"}), LocationSpecGroup("F1", {"full1"}), LocationSpecGroup("W0", {"swa"})},
+            191);
+    const CacheManager::KeyVector keys = {101, 102, 103, 104, 105, 106, 107, 108};
+    const std::vector<std::vector<std::string>> local_specs = {
+        {"full0", "full1", "swa"}, // B1
+        {"full0", "full1", "swa"}, // B2
+        {"full1", "swa"},          // B3: missing Full0
+        {"full0"},                 // B4: missing Full1 and W
+        {"full0", "full1", "swa"}, // B5
+        {"full0", "full1"},        // B6: missing W
+        {"full0", "full1"},        // B7: missing W
+        {"full0", "full1", "swa"}, // B8
+    };
+    for (size_t i = 0; i < keys.size(); ++i) {
+        Report(keys[i], local_specs[i]);
+    }
+    AddTair(103, "full0");
+    AddTair(104, "full1");
+    AddTair(104, "swa");
+    AddTair(106, "swa");
+
+    // Full0 must use peer A, Full1 must use peer B. Neither peer has both Full gaps.
+    Report(103, {"full0"}, true);
+    Report(104, {"swa"}, true);
+    Report(107, {"swa"}, true);
+    const std::string peer_b = "10.0.9.3:8080";
+    InitializeEventReporter(instance_id_, peer_b, proto::meta::ST_EVENT_REPORT_L2);
+    ReportFrom(peer_b, proto::meta::ST_EVENT_REPORT_L2, 104, {"full1"});
+    ReportFrom(peer_b, proto::meta::ST_EVENT_REPORT_L2, 106, {"swa"});
+
+    const auto tair = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    const auto p2p = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+    const auto query = [&](size_t top_k, const std::vector<DataStorageType> &backends, int64_t expected_global) {
+        SCOPED_TRACE(testing::PrintToString(backends));
+        auto [ec, matches] = cache_manager_->GetHostCacheState(request_context_.get(),
+                                                               instance_id_,
+                                                               CacheManager::QueryType::QT_UNSPECIFIED,
+                                                               keys,
+                                                               {"mem"},
+                                                               top_k,
+                                                               backends);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, matches.size()); // Peers have no B1 and are not candidate hosts.
+        EXPECT_EQ(worker_, matches[0].host_ip_port);
+        EXPECT_EQ(2, matches[0].local);
+        EXPECT_EQ(expected_global, matches[0].global);
+    };
+    EXPECT_CALL(*tair_, MightExist(_)).Times(0);
+    query(0, {tair, p2p}, 2);
+    query(1, {}, 2);
+    // Full reaches B8 using two peers. W COVERAGE selects A (B4/B7), not B (B6).
+    // B3-B5 is complete; B6 remains missing. Combining both W peers would wrongly return 8.
+    query(1, {p2p}, 5);
+    ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(tair_.get()));
+
+    for (bool readable : {true, false}) {
+        SCOPED_TRACE(readable);
+        EXPECT_CALL(*tair_, MightExist(_))
+            .Times(testing::AtLeast(1))
+            .WillRepeatedly([readable](const std::vector<DataStorageUri> &uris) {
+                return std::vector<bool>(uris.size(), readable);
+            });
+        // Tair alone completes B4-B6. With P2P, A supplies B7 so B6-B8 is complete.
+        query(1, {tair}, readable ? 6 : 2);
+        query(1, {tair, p2p}, readable ? 8 : 5);
+        query(1, {p2p, tair, p2p}, readable ? 8 : 5);
+        ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(tair_.get()));
+    }
+}
+
+TEST_F(HostCacheStateWithoutP2PTest, SwaRejectsInvalidWindowConfiguration) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_SWA,
+            {LocationSpecInfo("full0", 512), LocationSpecInfo("full1", 512), LocationSpecInfo("swa", 512)},
+            {LocationSpecGroup("F0", {"full0"}), LocationSpecGroup("F1", {"full1"}), LocationSpecGroup("W0", {"swa"})},
+            191);
+    Report(101, {"full0", "full1", "swa"});
+    auto instance = registry_manager_->instance_infos_.at(instance_id_);
+    // Inject invalid persisted settings to exercise validation at the query boundary.
+    for (const auto &[window_tokens, block_size] :
+         std::vector<std::pair<int64_t, int32_t>>{{0, 64}, {-1, 64}, {191, 0}, {191, -1}}) {
+        SCOPED_TRACE(window_tokens);
+        SCOPED_TRACE(block_size);
+        auto model = instance->model_deployment();
+        model.set_sliding_window_tokens(window_tokens);
+        instance->set_model_deployment(model);
+        instance->set_block_size(block_size);
+        for (auto type : {CacheManager::QueryType::QT_UNSPECIFIED, CacheManager::QueryType::QT_PREFIX_MATCH_WITH_SWA}) {
+            auto [ec, matches] = cache_manager_->GetHostCacheState(request_context_.get(), instance_id_, type, {101});
+            EXPECT_EQ(EC_BADARGS, ec);
+            EXPECT_TRUE(matches.empty());
+        }
+        auto [ec, matches] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id_, CacheManager::QueryType::QT_PREFIX_MATCH, {101});
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ(1, matches[0].local);
+    }
 }
 
 TEST_F(HostCacheStateWithoutP2PTest, ZeroLocalMambaUsesTairAndP2P) {
