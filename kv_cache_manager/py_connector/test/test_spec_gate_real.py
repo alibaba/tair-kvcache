@@ -266,6 +266,106 @@ class TestUndeclaredSubclassesFailClosed(RealEngineCase):
                 )
                 self.assertIn(class_name, self._gate_refusal(spec))
 
+    #: Qwen3.5-4B mamba shapes (survey c1_gate_matrix): 2195456 B/page.
+    MAMBA_SHAPES = ((3, 8192), (32, 128, 128))
+
+    def _mamba(self, **extra):
+        cls = self.engine.class_of("MambaSpec")
+        self.assertIsNotNone(cls, f"MambaSpec missing in vLLM {self.version}")
+        return cls(
+            block_size=16,
+            shapes=self.MAMBA_SHAPES,
+            dtypes=(torch.float32, torch.float32),
+            **extra,
+        )
+
+    def _hybrid_config(self, state_spec):
+        full = self.engine.class_of("FullAttentionSpec")
+        self.assertIsNotNone(full)
+        return SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=["m0", "m1"], kv_cache_spec=state_spec, is_eagle_group=False
+                ),
+                SimpleNamespace(
+                    layer_names=["a0"],
+                    kv_cache_spec=full(
+                        block_size=16,
+                        num_kv_heads=4,
+                        head_size=256,
+                        head_size_v=256,
+                        dtype=torch.bfloat16,
+                    ),
+                    is_eagle_group=False,
+                ),
+            ]
+        )
+
+    def test_an_undeclared_mamba_subclass_is_refused(self):
+        # The review probe: a state spec subclass carrying its own field used to
+        # be taken as an ordinary state group (the same mechanism as the RSWA
+        # hole, one family over). The transfer path relies on "a block's state
+        # covers the prefix ending at that block" -- a subclass may not claim
+        # that by inheritance.
+        base = self.engine.class_of("MambaSpec")
+        self.assertIsNotNone(base)
+        foo_cls = type("FooMambaSpec", (base,), {})
+        spec = foo_cls(
+            block_size=16,
+            shapes=self.MAMBA_SHAPES,
+            dtypes=(torch.float32, torch.float32),
+        )
+        object.__setattr__(spec, "window", 1024)
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(self._hybrid_config(spec), 16, calculate_kv_scales=False)
+        self.assertIn("FooMambaSpec", str(ctx.exception))
+
+    def test_a_plain_mamba_group_is_still_a_state_group(self):
+        # The control: the declared class keeps transferring as state, hybrid
+        # instance included (the path PR2/PR3 build on).
+        metas = parse_groups(self._hybrid_config(self._mamba()), 16, calculate_kv_scales=False)
+        self.assertEqual(
+            [type(meta).__name__ for meta in metas],
+            ["StateGroupMeta", "AttentionGroupMeta"],
+        )
+        self.assertEqual(metas[0].page_size_bytes, 2195456)
+        self.assertEqual(metas[0].per_block_bytes, 2195456 * 2)
+
+    def test_an_undeclared_uniform_wrapper_subclass_is_refused(self):
+        wrapper = self.engine.class_of("UniformTypeKVCacheSpecs")
+        self.assertIsNotNone(wrapper)
+        inner = facts.build_spec(facts.ROW_BY_NAME["wrapper_v32_pair"], self.engine)
+        foo_cls = type("FooWrapperSpec", (wrapper,), {})
+        spec = foo_cls(block_size=inner.block_size, kv_cache_specs=inner.kv_cache_specs)
+        config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=sorted(inner.kv_cache_specs),
+                    kv_cache_spec=spec,
+                    is_eagle_group=False,
+                )
+            ]
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(config, 64, calculate_kv_scales=False)
+        self.assertIn("FooWrapperSpec", str(ctx.exception))
+
+    def test_the_group_receipt_classes_have_no_subclasses_here(self):
+        # The audit behind the exact match, per era: nothing in this vLLM
+        # inherits from the two group-level receipts (the AST scan over all nine
+        # era trees says the same for every era).
+        for base_name in ("MambaSpec", "UniformTypeKVCacheSpecs"):
+            base = self.engine.class_of(base_name)
+            with self.subTest(base=base_name):
+                self.assertEqual(
+                    [],
+                    [
+                        name
+                        for name, obj in self._spec_classes().items()
+                        if obj is not base and issubclass(obj, base)
+                    ],
+                )
+
     def test_a_windowed_hidden_state_spec_is_refused(self):
         # N1: the marker gets no window exemption -- it walks the same window
         # test and latent-layout gate as MLAAttentionSpec.
