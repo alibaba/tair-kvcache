@@ -1,0 +1,1026 @@
+"""Unit tests for the SWA data plane (PR3).
+
+Three mechanisms are pinned here, all of them keyed on
+``AttentionGroupMeta.retention``:
+
+* **eager capture** -- the scheduler asks for the newly completed blocks of
+  every windowed group in the step that produced them, and the worker copies
+  them into the staging arena before that step ends (vLLM frees them in the
+  next schedule);
+* **null disposition** -- a block whose windowed slots are already null has no
+  bytes to publish (abstain: never the shared zero page), a block whose capture
+  was withheld is *withdrawn* (failed: never a location without data), and a
+  load never writes into vLLM's null block (rows that would go there are
+  aliased onto a real row of the same block);
+* **the windowed hit clamp** -- an external match may only end where the window
+  region still carries every windowed group's spec, and only the largest such
+  end is returned.
+
+The transfers themselves run on CPU tensors / recording doubles: this file
+tests the decision logic, the mock harness proves the bytes.
+"""
+
+import threading
+import time
+import unittest
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Any, List, Optional
+from unittest import mock
+from unittest.mock import MagicMock
+
+# vllm_stubs must be imported before torch: in the open-source CI (no torch
+# installed) it registers the MagicMock stand-in that the bare `import torch`
+# below then resolves to.
+from kv_cache_manager.py_connector.test import vllm_stubs  # noqa: F401 (stubs)
+
+import torch
+from kv_cache_manager.py_connector.test.vllm_stubs import (
+    make_connector,
+    make_connector_scheduler,
+)
+from kv_cache_manager.py_connector.vllm.data_transfer import (
+    DataTransferManager,
+    MultiResult,
+    _StagingPool,
+)
+from kv_cache_manager.py_connector.vllm.metadata import (
+    CaptureRequest,
+    TairKvCacheConnectorMetadata,
+)
+from kv_cache_manager.py_connector.vllm.transfer_types import (
+    AttentionTransferGroup,
+    KVCacheInfo,
+    KVLayout,
+    NullBlockRow,
+)
+from kv_cache_manager.py_connector.vllm.connector_scheduler import RequestLedger
+from kv_cache_manager.py_connector.vllm.vllm_common import (
+    RETENTION_CHUNKED_LOCAL,
+    RETENTION_RSWA_GAP,
+    RETENTION_SLIDING,
+    AttentionGroupMeta,
+    WindowRetention,
+    build_spec_groups,
+)
+
+MBS = 16
+PER_TOKEN_DIM = 8
+KV_DTYPE = torch.bfloat16
+
+
+# --------------------------------------------------------------------------- #
+# Fakes / helpers
+# --------------------------------------------------------------------------- #
+@dataclass
+class FakeRequest:
+    request_id: str
+    prompt_token_ids: list
+    output_token_ids: list = field(default_factory=list)
+
+    @property
+    def num_tokens(self):
+        return len(self.prompt_token_ids) + len(self.output_token_ids)
+
+    @property
+    def all_token_ids(self):
+        return self.prompt_token_ids + self.output_token_ids
+
+
+def windowed_group(
+    spec_name: str = "tp0_g0",
+    *,
+    group_idx: int = 0,
+    block_size: int = MBS,
+    kernel_block_size: int = 0,
+    per_token_dim: int = PER_TOKEN_DIM,
+    retention: Optional[WindowRetention] = None,
+) -> AttentionTransferGroup:
+    return AttentionTransferGroup(
+        group_idx=group_idx,
+        spec_name=spec_name,
+        layer_names=[f"{spec_name}_l0"],
+        block_size=block_size,
+        per_block_bytes=block_size * per_token_dim * 2,
+        layer_num=1,
+        kv_layout=KVLayout.PACKED_4D,
+        # No real device pointers in these plumbing tests.
+        kvcache_ptr_tensor_gpu=None,  # ty: ignore[invalid-argument-type]
+        num_kv_ptrs=1,
+        per_token_dim=per_token_dim,
+        kernel_block_size=kernel_block_size or block_size,
+        block_stride=0,
+        dtype=KV_DTYPE,
+        retention=retention or WindowRetention(RETENTION_SLIDING, window_tokens=1024),
+    )
+
+
+class _FakePool:
+    """A staging arena stand-in that records the slots it hands out."""
+
+    def __init__(self, block_bytes: int = 1024, max_blocks: int = 8) -> None:
+        self.block_bytes = block_bytes
+        self.max_blocks = max_blocks
+        self.released: List[Any] = []
+        self._next = 0
+
+    def acquire(self, n: int, timeout: Optional[float] = None) -> Optional[int]:
+        if self._next + n > self.max_blocks:
+            return None
+        start = self._next
+        self._next += n
+        return start
+
+    def release(self, start: int, n: int) -> None:
+        self.released.append((start, n))
+
+    def slot_base_ptr(self, slot: int) -> int:
+        return slot * self.block_bytes
+
+
+class _RecordingDTM:
+    """Stand-in for DataTransferManager's capture surface.
+
+    ``capture_blocks`` never touches a device: the point under test is which
+    blocks are captured, which are withheld, and what the plan annotations say.
+    """
+
+    def __init__(self, pool: _FakePool, blocks_per_capture: int = 1) -> None:
+        self.pool = pool
+        self.blocks_per_capture = blocks_per_capture
+        self.captures: List[Any] = []
+        self.exhausted = False
+
+    def capture_blocks(self, group, block_slots, timeout):
+        self.captures.append((group.spec_name, [list(s) for s in block_slots], timeout))
+        if self.exhausted:
+            return None
+        return self.pool.acquire(len(block_slots) * self.blocks_per_capture)
+
+    def pool_of(self, group):
+        return self.pool
+
+
+def worker_with(groups: List[AttentionTransferGroup], dtm: Any = None) -> Any:
+    """A bare ConnectorWorker whose transfer groups are the given ones.
+
+    The group metas carry the same retention as the transfer groups, exactly as
+    ``_build_attention_group`` copies it from the meta in production: the shared
+    coverage predicate reads the metas.
+    """
+    conn = make_connector(manager_block_size=MBS)
+    conn._group_metas = [
+        AttentionGroupMeta(
+            group_idx=group.group_idx,
+            layer_names=list(group.layer_names),
+            block_size=group.block_size,
+            per_block_bytes=group.per_block_bytes,
+            page_bytes=group.block_size * group.per_token_dim * 2,
+            retention=group.retention,
+        )
+        for group in groups
+    ]
+    conn._num_groups = len(groups)
+    conn._kvcache_info = KVCacheInfo(
+        tp_rank=0, world_size=1, groups=list(groups), device="cpu", dtype=KV_DTYPE
+    )
+    conn._data_transfer = dtm
+    conn._staged = {}
+    conn._withheld = {}
+    conn._capture_scope = {}
+    return conn
+
+
+def captured_worker(
+    blocks: List[int],
+    table: List[int],
+    *,
+    group: Optional[AttentionTransferGroup] = None,
+    pool: Optional[_FakePool] = None,
+    exhausted: bool = False,
+) -> Any:
+    """A worker that has just run one capture request."""
+    group = group or windowed_group()
+    pool = pool or _FakePool()
+    dtm = _RecordingDTM(pool)
+    dtm.exhausted = exhausted
+    conn = worker_with([group], dtm)
+    conn._capture_request(
+        CaptureRequest(
+            req_id="r0",
+            manager_block_idxes=list(blocks),
+            all_block_ids=[list(table)],
+        )
+    )
+    return conn
+
+
+def locations(names_per_block: List[List[str]], tp_size: int = 1) -> List[dict]:
+    return [
+        {"location_specs": [{"name": n, "uri": f"u_{i}_{n}"} for n in names]}
+        for i, names in enumerate(names_per_block)
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Scheduler: capture requests and the windowed hit clamp
+# --------------------------------------------------------------------------- #
+class TestCaptureRequests(unittest.TestCase):
+    """The scheduler asks for a capture only where a window needs it."""
+
+    @staticmethod
+    def _empty_output():
+        return SimpleNamespace(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[], resumed_req_ids=set(), new_block_ids=[]
+            ),
+            num_scheduled_tokens={},
+        )
+
+    def _dispatch(self, conn, prompt_len, blocks):
+        req = FakeRequest("r0", list(range(prompt_len)))
+        conn.update_state_after_alloc(
+            req, SimpleNamespace(get_block_ids=lambda: [list(blocks)]), 0
+        )
+        return conn.build_connector_meta(self._empty_output())
+
+    def test_full_attention_instance_emits_none(self):
+        # The red line: a model without a windowed group must not grow a
+        # capture instruction (its blocks never leave HBM while the request
+        # lives, so the late gather stays correct and unchanged).
+        conn = make_connector_scheduler(manager_block_size=MBS, locations=[])
+        meta = self._dispatch(conn, 4 * MBS, [1, 2, 3, 4])
+        self.assertEqual([], meta.to_capture_requests)
+        self.assertTrue(conn._http_executor.submit.called)  # the save still ran
+
+    def test_windowed_instance_emits_the_new_range_with_the_table(self):
+        conn = make_connector_scheduler(manager_block_size=MBS, locations=[], windowed=1)
+        meta = self._dispatch(conn, 4 * MBS, [1, 2, 3, 4])
+        self.assertEqual(1, len(meta.to_capture_requests))
+        capture = meta.to_capture_requests[0]
+        self.assertEqual("r0", capture.req_id)
+        self.assertEqual([0, 1, 2, 3], capture.manager_block_idxes)
+        self.assertEqual([[1, 2, 3, 4]], capture.all_block_ids)
+
+    def test_no_capture_without_new_blocks(self):
+        conn = make_connector_scheduler(manager_block_size=MBS, locations=[], windowed=1)
+        self._dispatch(conn, 4 * MBS, [1, 2, 3, 4])
+        # Same request, same computed prefix: nothing new to capture.
+        meta = conn.build_connector_meta(self._empty_output())
+        self.assertEqual([], meta.to_capture_requests)
+
+    def test_capture_range_starts_where_the_last_one_ended(self):
+        conn = make_connector_scheduler(manager_block_size=MBS, locations=[], windowed=1)
+        self._dispatch(conn, 2 * MBS, [1, 2])
+        conn._tracked["r0"].vllm_request.prompt_token_ids = list(range(4 * MBS))
+        conn._tracked["r0"].block_ids_per_group = [[1, 2, 3, 4]]
+        meta = conn.build_connector_meta(self._empty_output())
+        self.assertEqual([2, 3], meta.to_capture_requests[0].manager_block_idxes)
+
+
+class TestWindowedSpecGroups(unittest.TestCase):
+    """The announcement says which specs a block really carries.
+
+    A windowed block whose window is already gone must not be advertised as
+    having windowed KV: the load side only trusts the manager's per-block spec
+    coverage, so the announcement (not the write) is what a later hit believes.
+    """
+
+    def test_windowed_instance_declares_the_no_window_twin(self):
+        conn = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=2, windowed=1
+        )
+        groups = {g["name"]: g["spec_names"] for g in build_spec_groups(conn._group_metas, 1)}
+        self.assertEqual(sorted(groups), ["full", "full_no_window"])
+        self.assertEqual(groups["full"], ["tp0_g0", "tp0_g1"])
+        self.assertEqual(groups["full_no_window"], ["tp0_g1"])
+
+    def test_hybrid_and_windowed_declare_all_four(self):
+        conn = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=2, windowed=1, num_state_groups=1
+        )
+        groups = {g["name"]: g["spec_names"] for g in build_spec_groups(conn._group_metas, 1)}
+        self.assertEqual(
+            sorted(groups), ["attn", "attn_no_window", "full", "full_no_window"]
+        )
+        self.assertEqual(groups["attn"], ["tp0_g0", "tp0_g1"])
+        self.assertEqual(groups["attn_no_window"], ["tp0_g1"])
+        self.assertEqual(groups["full_no_window"], ["tp0_g1", "tp0_g2"])
+
+    def test_pure_windowed_instance_declares_only_the_full_group(self):
+        # Nothing to exclude into: every spec is windowed, so a block without
+        # window data carries nothing at all and no group can describe it (it
+        # is never published, every group abstains for it).
+        conn = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        groups = {g["name"]: g["spec_names"] for g in build_spec_groups(conn._group_metas, 1)}
+        self.assertEqual(sorted(groups), ["full"])
+        self.assertIsNone(conn._spec_group_for(True, False))
+
+    def test_window_mask_reads_the_null_entries(self):
+        conn = make_connector_scheduler(manager_block_size=MBS, windowed=1)
+        ledger = RequestLedger(
+            vllm_request=FakeRequest("r0", []),  # ty: ignore[invalid-argument-type]
+            # blocks 0 and 2 are real, block 1 was freed (null) ...
+            block_ids_per_group=[[7, 0, 9], [1, 2, 3]],
+            has_saved_block_num=0,
+        )
+        self.assertEqual(
+            [True, False, True], conn._window_data_mask(ledger, range(3))
+        )
+
+    def test_the_announcement_names_the_coverage(self):
+        conn = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=2, windowed=1
+        )
+        conn._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=1
+        )
+        conn._manager_client.start_write_cache.return_value = {
+            "locations": [],
+            "write_session_id": "s",
+        }
+        conn.start_save_kvcache_async("r0", [0, 1, 2], 3, [True] * 3, [True, False, True])
+        request = conn._manager_client.start_write_cache.call_args.args[0]
+        self.assertEqual(
+            request["location_spec_group_names"],
+            ["full", "full_no_window", "full"],
+        )
+
+    def test_announcement_and_capture_classify_the_same_blocks(self):
+        # (two groups: one windowed, one full -- the shape whose announcement
+        # can name a coverage at all)
+        # The scheduler's window mask and the worker's capture read the same
+        # snapshot through the same predicate; a drift between them would mean
+        # either a claimed-but-missing block or a captured-but-unclaimed one.
+        table = [7, 0, 9, 0, 11]
+        conn = make_connector_scheduler(manager_block_size=MBS, windowed=1)
+        ledger = RequestLedger(
+            vllm_request=FakeRequest("r0", []),  # ty: ignore[invalid-argument-type]
+            block_ids_per_group=[list(table)],
+            has_saved_block_num=0,
+        )
+        announced = conn._window_data_mask(ledger, range(len(table)))
+        worker = captured_worker(list(range(len(table))), table)
+        captured = [
+            (group_idx, block) for group_idx, block in worker._staged["r0"]
+        ]
+        self.assertEqual([0, 2, 4], [block for _g, block in sorted(captured)])
+        self.assertEqual(
+            [block for block, present in enumerate(announced) if present],
+            [block for _g, block in sorted(captured)],
+        )
+
+
+class TestWindowedHitClamp(unittest.TestCase):
+    """`_safe_external_prefix` must only end where the window has data."""
+
+    WINDOW_BLOCKS = 4  # window 1024 tokens / mbs 16 -> cdiv(1023, 16) = 64;
+    # tests use a small window so the regions stay readable.
+
+    def _conn(self, blocks: int = 8):
+        # window_tokens=64 -> k = cdiv(63, 16) = 4 blocks
+        return make_connector_scheduler(
+            manager_block_size=MBS, locations=[], windowed=1, window_tokens=64
+        )
+
+    def _answer(self, conn, locations_, prompt_len):
+        conn._location_query_manager.locations = locations_
+        conn._location_query_manager.in_flight = False
+        req = FakeRequest("r0", list(range(prompt_len)))
+        matched, _async = conn.get_num_new_matched_tokens(req, 0)
+        return matched
+
+    def test_full_attention_match_is_untouched(self):
+        conn = make_connector_scheduler(manager_block_size=MBS, locations=[])
+        locs = locations([["tp0_g0"]] * 8)
+        self.assertEqual(8 * MBS, self._answer(conn, locs, 20 * MBS))
+
+    def test_complete_window_region_keeps_the_match(self):
+        conn = self._conn(8)
+        locs = locations([["tp0_g0"]] * 8)
+        self.assertEqual(8 * MBS, self._answer(conn, locs, 20 * MBS))
+
+    def test_hole_in_the_window_region_truncates_to_it(self):
+        conn = self._conn(8)
+        # Block 6 carries no windowed spec: an end at 8 (region [4, 8)) or at 7
+        # (region [3, 7)) is unusable, so the match ends at 6.
+        locs = locations([["tp0_g0"]] * 6 + [[]] + [["tp0_g0"]])
+        self.assertEqual(6 * MBS, self._answer(conn, locs, 20 * MBS))
+
+    def test_hole_far_below_the_window_region_keeps_the_match(self):
+        # The constraint is local to the window region: a hole at block 1 does
+        # not stop a match ending at block 8 (whose region is [4, 8)).
+        conn = self._conn(8)
+        locs = locations([["tp0_g0"]] + [[]] + [["tp0_g0"]] * 6)
+        self.assertEqual(8 * MBS, self._answer(conn, locs, 20 * MBS))
+
+    def test_hole_at_the_head_is_irrelevant_to_a_long_match(self):
+        conn = self._conn(8)
+        locs = locations([[]] + [["tp0_g0"]] * 7)
+        self.assertEqual(8 * MBS, self._answer(conn, locs, 20 * MBS))
+
+    def test_match_shorter_than_the_window_is_clamped_to_itself(self):
+        # Only 2 blocks matched (region [0, 2)): they must all be covered.
+        conn = self._conn(2)
+        locs = locations([["tp0_g0"]] + [[]])
+        self.assertEqual(1 * MBS, self._answer(conn, locs, 20 * MBS))
+
+    def test_extra_retained_tokens_widen_the_region(self):
+        # window 64 + 32 retained -> cdiv(95, 16) = 6 blocks required.
+        conn = make_connector_scheduler(manager_block_size=MBS, locations=[], windowed=1)
+        conn._windowed_metas[0] = AttentionGroupMeta(
+            group_idx=0,
+            layer_names=["l0"],
+            block_size=MBS,
+            per_block_bytes=1024,
+            page_bytes=MBS * 8,
+            retention=WindowRetention(
+                RETENTION_SLIDING, window_tokens=64, extra_retained_tokens=32
+            ),
+        )
+        locs = locations([["tp0_g0"]] * 5 + [[]] + [["tp0_g0"]] * 2)
+        self.assertEqual(5 * MBS, self._answer(conn, locs, 20 * MBS))
+        self.assertEqual(8 * MBS, self._answer(conn, locations([["tp0_g0"]] * 8), 20 * MBS))
+
+    def test_eagle_requires_one_more_block(self):
+        # A hole exactly 4 blocks before the end: without EAGLE the region
+        # [4, 8) is complete, with EAGLE it is [3, 8) and the hole is inside.
+        locs = locations([["tp0_g0"]] * 3 + [[]] + [["tp0_g0"]] * 4)
+        plain = make_connector_scheduler(
+            manager_block_size=MBS, locations=[], windowed=1, window_tokens=64
+        )
+        self.assertEqual(8 * MBS, self._answer(plain, locs, 20 * MBS))
+        eagle = make_connector_scheduler(
+            manager_block_size=MBS,
+            locations=[],
+            windowed=1,
+            window_tokens=64,
+            has_eagle_group=True,
+        )
+        self.assertEqual(3 * MBS, self._answer(eagle, locs, 20 * MBS))
+
+    def test_every_rank_must_carry_the_windowed_spec(self):
+        conn = make_connector_scheduler(
+            manager_block_size=MBS, locations=[], windowed=1, tp_size=2, window_tokens=64
+        )
+        complete = [["tp0_g0", "tp1_g0"]] * 4
+        self.assertEqual(4 * MBS, self._answer(conn, locations(complete), 20 * MBS))
+        # Rank 1's spec missing on the last block: the region [0, 4) is broken,
+        # so the match ends at 3 blocks (of which only rank 0's spec is needed
+        # on the remaining blocks... they all carry both).
+        broken = complete[:-1] + [["tp0_g0"]]
+        self.assertEqual(3 * MBS, self._answer(conn, locations(broken), 20 * MBS))
+
+    def test_each_kind_uses_its_own_window(self):
+        for kind, window, blocks in (
+            (RETENTION_SLIDING, 64, 4),
+            (RETENTION_CHUNKED_LOCAL, 64, 4),
+            (RETENTION_RSWA_GAP, 48, 3),
+        ):
+            with self.subTest(kind=kind):
+                conn = make_connector_scheduler(manager_block_size=MBS, locations=[], windowed=1)
+                conn._windowed_metas[0] = AttentionGroupMeta(
+                    group_idx=0,
+                    layer_names=["l0"],
+                    block_size=MBS,
+                    per_block_bytes=1024,
+                    page_bytes=MBS * 8,
+                    retention=WindowRetention(kind, window_tokens=window),
+                )
+                # A hole exactly `blocks` before the end is inside the region.
+                locs = locations([["tp0_g0"]] * 8)
+                locs[8 - blocks] = {"location_specs": []}
+                self.assertEqual((8 - blocks) * MBS, self._answer(conn, locs, 20 * MBS))
+
+    def test_the_full_hit_cap_still_applies(self):
+        conn = self._conn(8)
+        locs = locations([["tp0_g0"]] * 8)
+        matched = self._answer(conn, locs, 8 * MBS)
+        self.assertLess(matched, 8 * MBS)  # one token stays uncomputed
+        self.assertEqual(7 * MBS, matched)
+
+    def test_state_incomplete_end_still_truncates(self):
+        # The windowed and hybrid end conditions are evaluated together: the
+        # window is complete everywhere, but the state is missing at the end.
+        conn = make_connector_scheduler(
+            manager_block_size=MBS, locations=[], num_groups=1, num_state_groups=1, windowed=1
+        )
+        names = ["tp0_g0", "tp0_g1"]
+        # The last block has no state: the match ends on the previous block
+        # that does -- its window region [3, 7) is complete.
+        locs = locations([names] * 7 + [["tp0_g0"]])
+        self.assertEqual(7 * MBS, self._answer(conn, locs, 20 * MBS))
+        # Same shape with the window broken at block 6: the window constraint
+        # wins over the (later) state-complete block.
+        locs = locations([names] * 6 + [["tp0_g1"]] + [names])
+        self.assertEqual(6 * MBS, self._answer(conn, locs, 20 * MBS))
+
+
+# --------------------------------------------------------------------------- #
+# Worker: capture dispositions
+# --------------------------------------------------------------------------- #
+class TestCaptureDispositions(unittest.TestCase):
+    def test_slot_alignment_matches_the_arena(self):
+        # The capture ends up with one gather per block when the member's block
+        # is smaller than the arena's slot (a shared arena), and one dense
+        # gather otherwise; both leave every block at a slot start, which is
+        # what the save task's SDK buffers assume.
+        group = windowed_group(per_token_dim=8)  # 16 * 8 * 2 = 256 B per block
+        pool = _StagingPool(torch.device("cpu"), 256, 4)
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        import kv_cache_manager.py_connector.vllm.data_transfer as dt
+
+        with mock.patch.object(dt, "batch_gather_scatter_helper") as helper:
+            start = dtm.capture_blocks(group, [[0], [1]], timeout=0.1)
+        self.assertEqual(0, start)
+        self.assertEqual(1, len(helper.batch_gather_kv_caches.call_args_list))
+
+        wide = _StagingPool(torch.device("cpu"), 1024, 4)  # slot > per_block
+        dtm._pools = {group.spec_name: wide}
+        with mock.patch.object(dt, "batch_gather_scatter_helper") as helper:
+            start = dtm.capture_blocks(group, [[0], [1]], timeout=0.1)
+        self.assertEqual(0, start)
+        self.assertEqual(2, len(helper.batch_gather_kv_caches.call_args_list))
+        # Each per-block gather targets its own slot's prefix.
+        for offset, call in enumerate(helper.batch_gather_kv_caches.call_args_list):
+            view = call.args[1]
+            self.assertEqual(1, view.shape[0])
+
+    def test_captured_blocks_are_staged_and_scope_marked(self):
+        conn = captured_worker([0, 1, 2, 3], [7, 8, 9, 10])
+        self.assertEqual(1, len(conn._data_transfer.captures))
+        name, slots, timeout = conn._data_transfer.captures[0]
+        self.assertEqual("tp0_g0", name)
+        self.assertEqual(4, len(slots))
+        self.assertGreater(timeout, 0)
+        self.assertEqual({0, 1, 2, 3}, conn._capture_scope["r0"])
+        self.assertEqual(
+            [0, 1, 2, 3],
+            sorted(block for _, block in conn._staged["r0"]),
+        )
+
+    def test_null_block_abstains_instead_of_publishing_zero_page(self):
+        # Block 1's slots are vLLM's null block (id 0) at capture time: those
+        # bytes do not exist, so the block is neither captured nor withheld --
+        # it must abstain (see TestStagedDispositions for the verdict).
+        conn = captured_worker([0, 1], [7, 0])
+        self.assertEqual({0, 1}, conn._capture_scope["r0"])
+        self.assertEqual([(0, 0)], [(g, b) for g, b in conn._staged["r0"]])
+        name, slots, _ = conn._data_transfer.captures[0]
+        self.assertEqual(1, len(slots))  # only the real block was gathered
+
+    def test_pool_exhaustion_withholds_the_whole_step(self):
+        conn = captured_worker([0, 1], [7, 8], exhausted=True)
+        self.assertEqual(set(), set(conn._staged.get("r0", {})))
+        self.assertEqual({0, 1}, conn._withheld["r0"])
+        self.assertEqual({0, 1}, conn._capture_scope["r0"])
+
+    def test_capture_exception_releases_the_runs_it_already_took(self):
+        g0 = windowed_group("tp0_g0", group_idx=0)
+        g1 = windowed_group("tp0_g1", group_idx=1)
+        pool = _FakePool(max_blocks=8)
+
+        class _Raising(_RecordingDTM):
+            def capture_blocks(self, group, block_slots, timeout):
+                if group.spec_name == "tp0_g1":
+                    raise RuntimeError("team died")
+                return super().capture_blocks(group, block_slots, timeout)
+
+        dtm = _Raising(pool)
+        conn = worker_with([g0, g1], dtm)
+        with mock.patch.object(conn, "_withhold") as withhold:
+            with self.assertRaises(RuntimeError):
+                conn._capture_request(
+                    CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8], [9, 10]])
+                )
+        self.assertEqual([(0, 2)], pool.released)
+        self.assertFalse(withhold.called)  # _capture_blocks is the one that withholds
+
+    def test_capture_failure_withholds_and_keeps_serving(self):
+        group = windowed_group()
+        dtm = _RecordingDTM(_FakePool())
+        conn = worker_with([group], dtm)
+        with mock.patch.object(
+            conn, "_capture_request", side_effect=RuntimeError("boom")
+        ):
+            conn._capture_blocks(
+                SimpleNamespace(
+                    to_capture_requests=[
+                        CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8]])
+                    ]
+                )
+            )
+        self.assertEqual({0, 1}, conn._withheld["r0"])
+
+    def test_two_windowed_groups_capture_together(self):
+        g0 = windowed_group("tp0_g0", group_idx=0)
+        g1 = windowed_group("tp0_g1", group_idx=1)
+        dtm = _RecordingDTM(_FakePool(max_blocks=16))
+        conn = worker_with([g0, g1], dtm)
+        conn._capture_request(
+            CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8], [9, 10]])
+        )
+        self.assertEqual(["tp0_g0", "tp0_g1"], [c[0] for c in dtm.captures])
+        self.assertEqual(
+            [(0, 0), (0, 1), (1, 0), (1, 1)], sorted(conn._staged["r0"])
+        )
+
+    def test_second_group_exhaustion_releases_the_first_run(self):
+        g0 = windowed_group("tp0_g0", group_idx=0)
+        g1 = windowed_group("tp0_g1", group_idx=1)
+        pool = _FakePool(max_blocks=2)
+        dtm = _RecordingDTM(pool)
+        conn = worker_with([g0, g1], dtm)
+        # First group gets a run of 2, second group cannot: nothing may be held.
+        conn._capture_request(
+            CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8], [9, 10]])
+        )
+        self.assertEqual([(0, 2)], pool.released)
+        self.assertEqual({0, 1}, conn._withheld["r0"])
+        self.assertEqual({}, conn._staged.get("r0", {}))
+
+    def test_finish_releases_unwritten_slots(self):
+        conn = captured_worker([0, 1], [7, 8])
+        conn._release_staged("r0")
+        self.assertEqual([(0, 1), (1, 1)], conn._data_transfer.pool.released)
+        self.assertNotIn("r0", conn._staged)
+        self.assertNotIn("r0", conn._capture_scope)
+        self.assertNotIn("r0", conn._withheld)
+
+
+class TestStagedDispositions(unittest.TestCase):
+    """The save side's three states, as the plan and the task see them."""
+
+    def _plan(self, conn, table, staged_blocks):
+        return conn._plan_group_transfers(
+            locations([["tp0_g0"]] * len(table)),
+            list(range(len(table))),
+            [list(table)],
+            "r0",
+            for_save=True,
+        )
+
+    def test_captured_block_points_at_its_slot(self):
+        conn = captured_worker([0, 1], [7, 8])
+        plans = self._plan(conn, [7, 8], conn._staged["r0"])
+        self.assertEqual([0, 1], plans[0].staged_slots)
+
+    def test_withheld_block_keeps_its_location_and_fails(self):
+        # A withheld capture still has an announced location (the scheduler
+        # claimed the spec before the arena turned out to be full): the task
+        # must fail the block, never publish the claim.
+        conn = captured_worker([0, 1], [7, 8], exhausted=True)
+        plans = self._plan(conn, [7, 8], {})
+        self.assertIsNotNone(plans[0].uris[0])
+        self.assertEqual([None, None], plans[0].staged_slots)
+
+    def test_null_at_capture_abstains(self):
+        conn = captured_worker([0, 1], [7, 0])
+        plans = self._plan(conn, [7, 0], conn._staged["r0"])
+        self.assertEqual([0, None], plans[0].staged_slots)
+
+    def test_verdicts_of_the_four_states(self):
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._transfer_client = MagicMock()
+        group = windowed_group()
+        # 0: claimed + captured -> transfers
+        # 1: unclaimed + no bytes -> abstains (the announcement said "no window")
+        # 2: claimed + no bytes -> fails (withheld capture)
+        # 3: captured + unclaimed -> fails (the two sides disagree)
+        skipped, failed = dtm._staged_dispositions(
+            group, ["u0", None, "u2", None], [0, None, None, 3], 4
+        )
+        self.assertEqual({1}, skipped)
+        self.assertEqual({2, 3}, failed)
+
+
+# --------------------------------------------------------------------------- #
+# Worker: the load side's null disposition
+# --------------------------------------------------------------------------- #
+class TestLoadNullDisposition(unittest.TestCase):
+    def _plan(self, conn, table, group=None, blocks=None):
+        group = group or windowed_group()
+        blocks = list(range(len(table))) if blocks is None else blocks
+        return conn._plan_group_transfers(
+            locations([["tp0_g0"]] * len(blocks)),
+            blocks,
+            [list(table)],
+            "load-req",
+        )[0]
+
+    def test_all_null_block_is_skipped(self):
+        # mbs 16 (one group block): the whole block targets the null page.
+        conn = worker_with([windowed_group()])
+        plan = self._plan(conn, [0])
+        self.assertEqual([NullBlockRow(rows=list(range(MBS)), source_row=None)],
+                         plan.null_rows)
+
+    def test_no_null_rows_means_no_annotation(self):
+        conn = worker_with([windowed_group()])
+        self.assertEqual([None], self._plan(conn, [5]).null_rows)
+
+    def test_partial_null_aliases_onto_the_first_real_row(self):
+        # mbs 64 = 4 group blocks of 16: group blocks 0 and 1 are null, 2 and 3
+        # real -> rows 0..31 alias row 32 (the first real token).
+        group = windowed_group(block_size=16, kernel_block_size=16)
+        conn = make_connector(manager_block_size=64)
+        conn._kvcache_info = KVCacheInfo(
+            tp_rank=0, world_size=1, groups=[group], device="cpu", dtype=KV_DTYPE
+        )
+        conn._data_transfer = None
+        conn._staged, conn._withheld, conn._capture_scope = {}, {}, {}
+        plan = self._plan(conn, [0, 0, 7, 8], group, blocks=[0])
+        alias = plan.null_rows[0]
+        self.assertEqual(list(range(32)), alias.rows)
+        self.assertEqual(32, alias.source_row)
+        # Rows 0..31 of the kernel's slot list must point at row 32's slot: the
+        # alias is only sound if the data written there is the data that row
+        # holds (the task copies it), so the slots have to agree.
+        self.assertEqual(plan.token_indices[0][32 - 1], plan.token_indices[0][32])
+
+    def test_a_full_attention_group_is_never_annotated(self):
+        group = windowed_group()
+        plain = AttentionTransferGroup(
+            **{
+                **group.__dict__,
+                "retention": None,
+                "kvcache_ptr_tensor_gpu": None,
+            }
+        )
+        conn = worker_with([plain])
+        self.assertIsNone(self._plan(conn, [0], plain).null_rows)
+
+
+# --------------------------------------------------------------------------- #
+# Transfer manager: staged writes and the pool deadline
+# --------------------------------------------------------------------------- #
+class TestStagedWrites(unittest.TestCase):
+    def setUp(self) -> None:
+        # The stub ring's kvcm_py_client is a MagicMock whose Iov()/BlockBuffer()
+        # return one shared object; the pointer assertions need real ones.
+        import kv_cache_manager.py_connector.vllm.data_transfer as dt
+
+        class _Iov:
+            def __init__(self) -> None:
+                self.type = None
+                self.base = 0
+                self.size = 0
+                self.ignore = False
+
+        class _Buffer:
+            def __init__(self) -> None:
+                self.iovs: List[Any] = []
+
+        class _Client:
+            class ClientErrorCode:
+                ER_OK = 0
+
+            class MemoryType:
+                CPU = "cpu"
+
+            Iov = _Iov
+            BlockBuffer = _Buffer
+
+        patcher = mock.patch.object(dt, "kvcm_py_client", _Client)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _dtm(self, pool: _StagingPool, ok: bool = True) -> DataTransferManager:
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {"tp0_g0": pool}
+        dtm._manager_block_size = MBS
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0 if ok else 1]
+        return dtm
+
+    def test_buffers_point_at_the_captured_slots(self):
+        pool = _StagingPool(torch.device("cpu"), 1024, 4)
+        start = pool.acquire(2)  # what the eager capture did
+        self.assertNotEqual(start, None)
+        dtm = self._dtm(pool)
+        results = {}
+        mr = MultiResult(1, lambda flat: results.setdefault("flat", flat))
+        dtm.save_task(
+            mr,
+            0,
+            windowed_group(),
+            remote_uris=["u0", "u1"],
+            block_token_indices=None,
+            block_ids=None,
+            staged_slots=[start + 1, start],
+        )
+        uris, buffers = dtm._transfer_client.SaveKvCaches.call_args.args
+        self.assertEqual(["u0", "u1"], uris)
+        self.assertEqual(
+            [pool.slot_base_ptr(start + 1), pool.slot_base_ptr(start)],
+            [b.iovs[0].base for b in buffers],
+        )
+        self.assertEqual([True, True], results["flat"])
+        # The written slots are back in the arena: a 4-slot acquire succeeds.
+        self.assertEqual(0, pool.acquire(4, timeout=0.01))
+
+    def test_failed_write_keeps_the_bytes_for_the_retry(self):
+        pool = _StagingPool(torch.device("cpu"), 1024, 2)
+        start = pool.acquire(2)
+        dtm = self._dtm(pool, ok=False)
+        results = {}
+        mr = MultiResult(1, lambda flat: results.setdefault("flat", flat))
+        dtm.save_task(
+            mr,
+            0,
+            windowed_group(),
+            remote_uris=["u0", "u1"],
+            block_token_indices=None,
+            block_ids=None,
+            staged_slots=[start, start + 1],
+        )
+        self.assertEqual([False, False], results["flat"])
+        # Both slots are still held: the manager will re-hand the blocks out and
+        # the captured bytes are the only copy left.
+        self.assertIsNone(pool.acquire(1, timeout=0.01))
+
+    def test_withheld_block_fails_and_abstained_block_is_none(self):
+        pool = _StagingPool(torch.device("cpu"), 1024, 2)
+        start = pool.acquire(1)
+        dtm = self._dtm(pool)
+        results = {}
+        mr = MultiResult(1, lambda flat: results.setdefault("flat", flat))
+        dtm.save_task(
+            mr,
+            0,
+            windowed_group(),
+            # block0 withheld (claimed, no bytes), block1 abstained (unclaimed,
+            # nothing to write), block2 written.
+            remote_uris=["u0", None, "u2"],
+            block_token_indices=None,
+            block_ids=None,
+            staged_slots=[None, None, start],
+        )
+        self.assertEqual([False, None, True], results["flat"])
+        self.assertIsNotNone(pool.acquire(2, timeout=0.01))
+
+
+class TestPoolDeadline(unittest.TestCase):
+    """The capture's bounded wait: blocking forever would deadlock the engine."""
+
+    def test_acquire_times_out_and_returns_none(self):
+        pool = _StagingPool(torch.device("cpu"), 1024, 2)
+        self.assertEqual(0, pool.acquire(2))
+        started = time.monotonic()
+        self.assertIsNone(pool.acquire(1, timeout=0.05))
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_acquire_is_woken_by_a_release(self):
+        pool = _StagingPool(torch.device("cpu"), 1024, 2)
+        pool.acquire(2)
+        woke = threading.Event()
+
+        def waiter():
+            self.assertEqual(0, pool.acquire(2, timeout=5.0))
+            woke.set()
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.05)
+        pool.release(0, 2)
+        self.assertTrue(woke.wait(5.0))
+        thread.join()
+
+    def test_blocking_acquire_is_unchanged(self):
+        # The transfer tasks keep the historical contract: no deadline means
+        # wait for a run, however long that takes.
+        pool = _StagingPool(torch.device("cpu"), 1024, 1)
+        pool.acquire(1)
+        done = threading.Event()
+
+        def waiter():
+            self.assertEqual(0, pool.acquire(1))
+            done.set()
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.05)
+        pool.release(0, 1)
+        self.assertTrue(done.wait(5.0))
+        thread.join()
+
+
+# --------------------------------------------------------------------------- #
+# Wiring: the two task-batch call sites (PR2 review N4)
+# --------------------------------------------------------------------------- #
+class _FakeBatchDTM:
+    """A transfer manager whose every surface is recorded."""
+
+    def __init__(self, batch: int) -> None:
+        self.batch = batch
+        self.saved: List[Any] = []
+        self.loaded: List[Any] = []
+
+    def save_task_blocks(self, group) -> int:
+        return self.batch
+
+    def load_task_blocks(self, group) -> int:
+        return self.batch
+
+    def submit_task(self, func, *args):
+        bucket = self.saved if func.__name__ == "save_task" else self.loaded
+        bucket.append(args)
+
+    def save_task(self, *args):
+        pass
+
+    def load_task(self, *args):
+        pass
+
+    def create_save_done_callback(self, *args):
+        return lambda flat: None
+
+    def create_load_done_callback(self, *args, **kwargs):
+        return lambda flat: None
+
+
+class TestTaskChunkWiring(unittest.TestCase):
+    """Both task loops must take their batch size from the manager.
+
+    The transfer manager shrinks a task to its arena; a call site that
+    hardcodes its own batch would silently over-stage (the PR2 review's N4).
+    """
+
+    def _worker(self, batch: int):
+        group = windowed_group()
+        conn = make_connector(manager_block_size=MBS)
+        group_plain = AttentionTransferGroup(**{**group.__dict__, "retention": None})
+        conn._kvcache_info = KVCacheInfo(
+            tp_rank=0,
+            world_size=1,
+            groups=[group_plain],
+            device="cpu",
+            dtype=KV_DTYPE,
+        )
+        conn._data_transfer = _FakeBatchDTM(batch)
+        conn._group_metas = [
+            AttentionGroupMeta(
+                group_idx=group_plain.group_idx,
+                layer_names=list(group_plain.layer_names),
+                block_size=MBS,
+                per_block_bytes=group_plain.per_block_bytes,
+                page_bytes=MBS * 8,
+            )
+        ]
+        conn._state_group_idxs = []
+        conn._num_groups = 1
+        conn._device_mod = MagicMock()
+        conn._pending_saves = {}
+        conn._staged, conn._withheld, conn._capture_scope = {}, {}, {}
+        conn._coordinator_server = MagicMock()
+        return conn
+
+    def test_save_uses_the_manager_batch(self):
+        for batch in (1, 2):
+            with self.subTest(batch=batch):
+                conn = self._worker(batch)
+                conn.wait_for_save(
+                    SimpleNamespace(
+                        to_save_requests=[
+                            SimpleNamespace(
+                                req_id="r0",
+                                target_locations=locations([["tp0_g0"]] * 4),
+                                manager_block_idxes=[0, 1, 2, 3],
+                                write_session_id="s0",
+                                all_block_ids=[[1, 2, 3, 4]],
+                            )
+                        ],
+                        to_capture_requests=[],
+                    )
+                )
+                self.assertEqual(4 // batch, len(conn._data_transfer.saved))
+
+    def test_load_uses_the_manager_batch(self):
+        for batch in (1, 4):
+            with self.subTest(batch=batch):
+                conn = self._worker(batch)
+                conn.start_load_kv(
+                    None,
+                    SimpleNamespace(
+                        epoch=0,
+                        to_load_requests=[
+                            SimpleNamespace(
+                                req_id="r0",
+                                manager_block_idxes=[0, 1, 2, 3],
+                                need_load_locations=locations([["tp0_g0"]] * 4),
+                                all_block_ids=[[1, 2, 3, 4]],
+                            )
+                        ],
+                    ),
+                )
+                self.assertEqual(4 // batch, len(conn._data_transfer.loaded))
+
+
+if __name__ == "__main__":
+    unittest.main()

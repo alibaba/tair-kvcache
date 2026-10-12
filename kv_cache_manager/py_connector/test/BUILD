@@ -42,6 +42,15 @@ py_test(
     deps = [":vllm_stubs"],
 )
 
+# The SWA data plane: retention-driven eager capture, null dispositions, the
+# staged write path and the windowed hit clamp (stub ring, no GPU).
+py_test(
+    name = "test_swa_core",
+    srcs = ["test_swa_core.py"],
+    tags = ["no-remote-exec"],
+    deps = [":vllm_stubs"],
+)
+
 py_test(
     name = "test_location_query",
     srcs = ["test_location_query.py"],
