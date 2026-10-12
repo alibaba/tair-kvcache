@@ -19,9 +19,9 @@ stand-in to the table it was built from.
 """
 
 import inspect
+import sys
 import unittest
-from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 from kv_cache_manager.py_connector.test import spec_gate_facts as facts
 
@@ -60,8 +60,6 @@ class RealEngineCase(unittest.TestCase):
         reason = _skip_reason()
         if reason:
             raise unittest.SkipTest(reason)
-        import sys
-
         cls.version: str = vllm.__version__
         cls.module = sys.modules["vllm.v1.kv_cache_interface"]
         cls.engine = facts.Engine(
@@ -165,7 +163,7 @@ class TestZooOnTheRealEngine(RealEngineCase):
 
 
 class TestEraShapes(RealEngineCase):
-    """The 0.26 -> 0.31 field migration, per era, through the same code path."""
+    """What this era spells and declares, through the same code path."""
 
     def test_the_eras_spelling_is_the_one_that_runs(self):
         # At most one of the two compressed rows is buildable here; the other
@@ -187,19 +185,22 @@ class TestEraShapes(RealEngineCase):
         # The data behind the era-dependent skip (facts.SCRATCH_FLAGS): the
         # group is dropped only where the era's spec opts out of *both* halves,
         # which is why 0.29 and 0.30 refuse what 0.31 skips.
-        for version, classes in facts.SCRATCH_FLAGS.items():
-            if version != self.version:
-                continue
-            for name, flags in classes.items():
-                row = next(row for row in facts.ZOO if row["cls"] == name)
-                with self.subTest(cls=name):
-                    spec = facts.build_spec(row, self.engine)
-                    measured = tuple(
-                        getattr(spec, attribute, None)
-                        for attribute in ("prefix_cacheable", "uses_slot_mapping", "has_layer_views")
+        measured_era = facts.SCRATCH_FLAGS.get(self.version)
+        if not measured_era:
+            self.skipTest(f"no measured scratch flags for vLLM {self.version}")
+        for name, flags in measured_era.items():
+            row = next(row for row in facts.ZOO if row["cls"] == name)
+            with self.subTest(cls=name):
+                spec = facts.build_spec(row, self.engine)
+                measured = tuple(
+                    getattr(spec, attribute, None)
+                    for attribute in (
+                        "prefix_cacheable",
+                        "uses_slot_mapping",
+                        "has_layer_views",
                     )
-                    self.assertEqual(flags, measured)
-            return
+                )
+                self.assertEqual(flags, measured)
 
     def test_skip_eras_agree_with_the_measured_flags(self):
         # Two independent data sets (the measured flags and the era list) must
