@@ -36,6 +36,24 @@ py_test(
 )
 
 py_test(
+    name = "test_kv_layout_preference",
+    srcs = ["test_kv_layout_preference.py"],
+    tags = ["no-remote-exec"],
+    deps = [":vllm_stubs"],
+)
+
+# Deliberately NOT dependent on vllm_stubs, like test_spec_gate_real: the point
+# of this target is the real class tree of the installed era. Run it with
+# --env vllm-0.26.0 and --env vllm-0.31.0 for the dual anchor; it skips itself
+# when vLLM or the connector is unavailable.
+py_test(
+    name = "test_kv_layout_preference_real",
+    srcs = ["test_kv_layout_preference_real.py"],
+    tags = ["no-remote-exec"],
+    deps = ["//kv_cache_manager/py_connector/vllm:vllm_connector"],
+)
+
+py_test(
     name = "test_scheduler_state",
     srcs = ["test_scheduler_state.py"],
     tags = ["no-remote-exec"],

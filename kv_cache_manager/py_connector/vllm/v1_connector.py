@@ -45,6 +45,15 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
 
+try:
+    # vllm >= 0.29.0: the engine resolves one layout for the whole model from
+    # the backends' supported sets (see get_required_kvcache_layout).
+    from vllm.v1.kv_cache_layout import KVCacheLayout as _KVCacheLayout
+except ImportError:
+    # vllm <= 0.28.0 knows only NHD/HND and takes a connector's answer at face
+    # value, so no other layout name may be returned there.
+    _KVCacheLayout = None  # ty: ignore[invalid-assignment]
+
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.py_connector.common.tp_coordinator import TpCoordinatorClient
 from kv_cache_manager.py_connector.common.logger import logger, configure_log_level
@@ -100,8 +109,60 @@ __all__ = [
     "parse_groups",
 ]
 
+# The transfer kernel needs pages whose logical (block, token, head, content)
+# runs are contiguous. Two layouts qualify: LBNHC (token-major, layer-compact)
+# and BLNHC (token-major, layer inside the block, vLLM calls it block-outer).
+# Only the packed-block models rule LBNHC out; see _packs_pages_inside_blocks.
+_PREFERRED_KV_CACHE_LAYOUT = "BLNHC"
+
+# HF architecture prefixes whose KV blocks pack several per-layer pages inside
+# one block. Their backends therefore support block-outer layouts only (vLLM
+# rejects layer-compact ones for them, see validate_kv_cache_layout), and the
+# engine's own pick among those is BLHNC -- head-major inside a page, which the
+# transfer kernel cannot read. Every other model keeps the engine's choice:
+# BLNHC is part of the engine's *fallback* preference list, so declaring it
+# unconditionally would silently move each flash-attn/triton model (backends
+# that support any layout) onto a packed-block layout.
+_PACKED_BLOCK_ARCHITECTURES = ("DeepseekV4",)
+
+
+def _layout_names_include(layout_name: str) -> bool:
+    """Whether this vLLM era has ``layout_name`` in its layout name space."""
+    return _KVCacheLayout is not None and hasattr(_KVCacheLayout, layout_name)
+
+
+def _packs_pages_inside_blocks(vllm_config: "VllmConfig") -> bool:
+    """Whether this model packs several per-layer KV pages into one block."""
+    model_config = getattr(vllm_config, "model_config", None)
+    architectures = getattr(model_config, "architectures", None) or ()
+    return any(
+        architecture.startswith(_PACKED_BLOCK_ARCHITECTURES)
+        for architecture in architectures
+    )
+
 
 class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
+    # ------------------------------------------------------------------ #
+    # Layout negotiation (class-level: the engine core calls this before any
+    # instance exists)
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> Optional[str]:
+        """Ask for a layout this connector's kernel can read, when it can.
+
+        The engine intersects the answer with the layouts the attention
+        backends support (using its own default when the connector has no
+        preference) and warns before falling back, so a preference is never a
+        hard constraint. The kernel reads token-major pages only, which rules
+        out BLHNC -- the layout the engine picks for packed-block models; see
+        _PREFERRED_KV_CACHE_LAYOUT and _packs_pages_inside_blocks.
+        """
+        if not _layout_names_include(_PREFERRED_KV_CACHE_LAYOUT):
+            return None
+        if not _packs_pages_inside_blocks(vllm_config):
+            return None
+        return _PREFERRED_KV_CACHE_LAYOUT
+
     # ------------------------------------------------------------------ #
     # Init / registration (role-agnostic)
     # ------------------------------------------------------------------ #
