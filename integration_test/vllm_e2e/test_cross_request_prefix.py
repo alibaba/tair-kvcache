@@ -46,8 +46,9 @@ import unittest
 import requests
 
 from e2e_lib import (
-    ScenarioEnv, full_block_hashes, send_completions, tokenize,
-    wait_for_captures, wait_for_prefix_cached,
+    ScenarioEnv, assert_loaded_blocks, assert_loaded_nonempty, full_block_hashes,
+    loaded_block_count, send_completions, tokenize, wait_for_captures,
+    wait_for_prefix_cached,
 )
 
 logger = logging.getLogger("vllm_e2e")
@@ -132,8 +133,12 @@ class TestCrossRequestPrefix(unittest.TestCase):
             vllm = env.start_vllm(log_suffix="_p1")
             mbs = env.manager_block_size()
             # Hybrid models pin the manager block to the scheduler block (528),
-            # so they need a far longer prompt to span several blocks.
-            toks_a = tokenize(vllm.base_url(), long_prompt(260 if env.hybrid else 60))
+            # so they need a far longer prompt to span several blocks; windowed
+            # models get their length scaled so A crosses the window repeatedly
+            # (the phase-3 load then covers a real tail window, not the whole
+            # match).
+            sentences = 260 if env.hybrid else (120 if env.window else 60)
+            toks_a = tokenize(vllm.base_url(), long_prompt(sentences))
             # Cap the length so prompt + MAX_TOKENS stays inside the model len.
             blocks_a = min(len(toks_a) // mbs,
                            (self.MAX_MODEL_LEN - self.MAX_TOKENS) // mbs)
@@ -217,7 +222,27 @@ class TestCrossRequestPrefix(unittest.TestCase):
 
             # ---- Structural evidence.
             matched_blocks = max(matched) // mbs if matched else 0
-            if not env.hybrid:
+            if env.hybrid:
+                # Hybrid: what the manager advertises must match reality...
+                self.assertEqual(
+                    complete, has_state,
+                    f"advertised spec coverage {complete} does not match the "
+                    f"blocks that really have a state {has_state}: state-less "
+                    f"blocks are published as fully cached")
+                # ...and the match must stop at the last state-complete block.
+                expected = 0
+                for i in range(candidates):
+                    if has_state[i]:
+                        expected = i + 1
+                self.assertEqual(
+                    matched_blocks, expected,
+                    f"match not truncated to the last state-complete block: got "
+                    f"{matched_blocks} blocks, expected {expected} (state of "
+                    f"candidates: {has_state[:candidates]})")
+                self.assertTrue(
+                    env.scan_connector_logs(r"truncated external match"),
+                    "the truncation was not logged")
+            else:
                 # No state groups: uniform coverage, nothing to truncate.
                 self.assertTrue(all(complete),
                                 f"full-attention coverage is not uniform: {specs}")
@@ -225,27 +250,50 @@ class TestCrossRequestPrefix(unittest.TestCase):
                     matched_blocks, candidates,
                     f"full-attention match was truncated: {matched_blocks} of "
                     f"{candidates} blocks")
-                return
-
-            # Hybrid: what the manager advertises must match reality...
-            self.assertEqual(
-                complete, has_state,
-                f"advertised spec coverage {complete} does not match the "
-                f"blocks that really have a state {has_state}: state-less "
-                f"blocks are published as fully cached")
-            # ...and the match must stop at the last state-complete block.
-            expected = 0
-            for i in range(candidates):
-                if has_state[i]:
-                    expected = i + 1
-            self.assertEqual(
-                matched_blocks, expected,
-                f"match not truncated to the last state-complete block: got "
-                f"{matched_blocks} blocks, expected {expected} (state of "
-                f"candidates: {has_state[:candidates]})")
-            self.assertTrue(
-                env.scan_connector_logs(r"truncated external match"),
-                "the truncation was not logged")
+                if env.window is not None:
+                    # Windowed (SWA): the whole prefix is published (the
+                    # connector copies every block in the step that produced
+                    # it), so the clamp must not trim the match -- and the load
+                    # covers exactly the slots vLLM handed out: the sliding
+                    # groups' tail window of where the match ended, plus the
+                    # whole match for the full-attention group.
+                    load_blocks = loaded_block_count(
+                        candidates * mbs, env.window, mbs,
+                        env.full_attention_group, env.window_kind)
+                    hashes = full_block_hashes(toks_b, mbs)
+                    self.assertEqual(len(hashes), candidates)
+                    wait_for_captures(env.capture_dir, "loaded",
+                                      expected=env.tp_size * load_blocks,
+                                      timeout=180)
+                    assert_loaded_blocks(
+                        env.capture_dir,
+                        {(f"tp{r}", h) for r in range(env.tp_size)
+                         for h in hashes[candidates - load_blocks:candidates]},
+                        env.tp_size)
+                    # No bit-exact comparison here: these references were
+                    # captured on the ground-truth server (phase 2), i.e. by a
+                    # *different process* than the one that produced the loaded
+                    # bytes (phase 1), and a prefill forward is not
+                    # bit-reproducible across processes on every stack.
+                    # Measured on gpt-oss-20b (MXFP4/MARLIN): two runs of the
+                    # very same command differ in 1700 (block, layer) pairs of
+                    # their phase-2 refs -- onset abruptly around layer 12/24,
+                    # uniform across a block's rows, max |d| ~13 -- while
+                    # gemma-3 reproduces bit-exactly. The connector's own round
+                    # trip is not implicated: A's phase-1 capture and the
+                    # loaded (storage-read-back) bytes are bit-identical in all
+                    # 8 blocks x 24 layers, and the verbatim round trip stays
+                    # asserted bit-exactly in every scenario whose refs and
+                    # loads come from the same run (basic, concurrent, tp,
+                    # partial_hit, full_hit, multi_turn, load_failure). What
+                    # must hold *here* regardless is that the loaded slots hold
+                    # real KV:
+                    assert_loaded_nonempty(env.capture_dir, env.tp_size)
+            # One gate for every success path: the hybrid branch used
+            # to return before reaching it, so a budgeted hybrid model
+            # was never gated (its own pinning is what the gate exists
+            # for).
+            env.assert_pinned_budget()
         finally:
             env.stop()
 
