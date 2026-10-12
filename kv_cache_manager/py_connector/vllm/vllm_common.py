@@ -563,7 +563,10 @@ def _check_attention_spec_supported(
     branch at all.
 
     Everything else -- CrossAttentionSpec, EncoderOnlyAttentionSpec, and any
-    class this file has not been taught -- fails closed.
+    class this file has not been taught -- fails closed. The group-level
+    receipts are matched as strictly in _parse_group: an undeclared
+    MambaSpec / UniformTypeKVCacheSpecs subclass reaches this gate too and is
+    refused here by name.
     """
     if SlidingWindowMLASpec is not None and isinstance(spec, SlidingWindowMLASpec):
         raise NotImplementedError(
@@ -800,10 +803,18 @@ def _uniform_group_metas(
 def _parse_group(
     idx: int, group: Any, manager_block_size: int, *, calculate_kv_scales: bool
 ) -> List[GroupMeta]:
-    """One vLLM kv_cache_group -> its transfer buckets (a plain group = one)."""
+    """One vLLM kv_cache_group -> its transfer buckets (a plain group = one).
+
+    Both group-level receipts are matched by *exact* type: a MambaSpec subclass
+    is a new claim about what a block's state covers (the transfer path relies
+    on "one state per block end", see _state_block_ids), and a
+    UniformTypeKVCacheSpecs subclass need not be a page-size pack at all. An
+    undeclared subclass therefore falls through to the attention gate, which
+    refuses it by name (vLLM 0.14 - 0.31 ships no subclass of either).
+    """
     spec = group.kv_cache_spec
     layers = list(group.layer_names)
-    if isinstance(spec, MambaSpec):
+    if type(spec) is MambaSpec:
         return [
             StateGroupMeta(
                 group_idx=idx,
@@ -813,9 +824,7 @@ def _parse_group(
                 page_size_bytes=spec.page_size_bytes,
             )
         ]
-    if UniformTypeKVCacheSpecs is not None and isinstance(
-        spec, UniformTypeKVCacheSpecs
-    ):
+    if UniformTypeKVCacheSpecs is not None and type(spec) is UniformTypeKVCacheSpecs:
         return _uniform_group_metas(
             idx, spec, manager_block_size, calculate_kv_scales=calculate_kv_scales
         )
@@ -872,8 +881,10 @@ def parse_groups(
             continue
         if _is_scratch_spec(group.kv_cache_spec):
             logger.warning(
-                "skip %s group %d (%d layers): per-request scratch, no prefix "
-                "cache to serve from it",
+                "skip %s group %d (%d layers): the class declares itself out of "
+                "the prefix cache (prefix_cacheable=False and no slot mapping or "
+                "no layer views), so the manager has nothing to serve; if this "
+                "class is meant to be cached, name it in vllm_common.py instead",
                 type(group.kv_cache_spec).__name__,
                 idx,
                 len(group.layer_names),

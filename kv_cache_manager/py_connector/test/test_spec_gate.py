@@ -195,6 +195,89 @@ class TestUndeclaredSubclassesFailClosed(unittest.TestCase):
                 result = facts.run_row(facts.ROW_BY_NAME[row_name], self.engine)
                 self.assertEqual("accept", result.outcome, result.message)
 
+    def test_an_undeclared_mamba_subclass_is_refused(self):
+        # The group-level receipt is exact-typed too: a state spec subclass is a
+        # new claim about what a block's state covers, so it must not be waved
+        # through as an ordinary state group just because of its base class.
+        state_cls = self.engine.class_of("MambaSpec")
+        assert state_cls is not None
+        foo = type("FooMambaSpec", (state_cls,), {})
+        spec = foo(block_size=16, page_size_bytes=16384)
+        spec.window = 1024  # a brand-new field, like the RSWA shape
+        config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=["m0"], kv_cache_spec=spec, is_eagle_group=False),
+                SimpleNamespace(
+                    layer_names=["a0"],
+                    kv_cache_spec=facts.build_spec(facts.ROW_BY_NAME["full"], self.engine),
+                    is_eagle_group=False,
+                ),
+            ]
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertIn("FooMambaSpec", str(ctx.exception))
+
+    def test_a_plain_mamba_group_is_still_a_state_group(self):
+        # The control: the declared class keeps transferring as state (the
+        # hybrid path is what PR2/PR3 build on).
+        state_cls = self.engine.class_of("MambaSpec")
+        assert state_cls is not None
+        config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=["m0", "m1"],
+                    kv_cache_spec=state_cls(block_size=16, page_size_bytes=2048),
+                    is_eagle_group=False,
+                ),
+                SimpleNamespace(
+                    layer_names=["a0"],
+                    kv_cache_spec=facts.build_spec(facts.ROW_BY_NAME["full"], self.engine),
+                    is_eagle_group=False,
+                ),
+            ]
+        )
+        metas = parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertEqual(
+            [type(meta).__name__ for meta in metas],
+            ["StateGroupMeta", "AttentionGroupMeta"],
+        )
+        self.assertEqual(metas[0].per_block_bytes, 2048 * 2)
+        self.assertEqual(metas[0].page_size_bytes, 2048)
+
+    def test_an_undeclared_uniform_wrapper_subclass_is_refused(self):
+        wrapper_cls = self.engine.class_of("UniformTypeKVCacheSpecs")
+        assert wrapper_cls is not None
+        inner = facts.build_spec(facts.ROW_BY_NAME["wrapper_v32_pair"], self.engine)
+        foo = type("FooWrapperSpec", (wrapper_cls,), {})
+        spec = foo(block_size=inner.block_size, kv_cache_specs=inner.kv_cache_specs)
+        config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=sorted(inner.kv_cache_specs), kv_cache_spec=spec,
+                    is_eagle_group=False,
+                )
+            ]
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(config, 64, calculate_kv_scales=False)
+        self.assertIn("FooWrapperSpec", str(ctx.exception))
+
+    def test_a_declared_mamba_subclass_of_an_era_is_absent(self):
+        # The audit behind the exact match: vLLM 0.14 - 0.31 ships no MambaSpec
+        # or UniformTypeKVCacheSpecs subclass (AST scan over every era tree), so
+        # tightening the group receipts refuses no real shape.
+        module = self.engine.module
+        for base_name in ("MambaSpec", "UniformTypeKVCacheSpecs"):
+            base = self.engine.class_of(base_name)
+            subclasses = [
+                obj.__name__
+                for obj in vars(module).values()
+                if isinstance(obj, type) and issubclass(obj, base) and obj is not base
+            ]
+            with self.subTest(base=base_name):
+                self.assertEqual([], subclasses)
+
     def test_a_windowed_subclass_names_itself_in_the_refusal(self):
         # N4: the refusal must name the concrete class (vLLM 0.30's
         # KpoolTailSpec is refused through this branch, and calling it a
@@ -301,6 +384,10 @@ class TestScratchGroupSkip(unittest.TestCase):
         self.assertIn("KpoolTailSpec", skipped[0])
         self.assertIn("group 0", skipped[0])
         self.assertIn("1 layers", skipped[0])
+        # The line says why the group is gone *and* where a class that claims
+        # the opt-out flags but is meant to be cached has to be named.
+        self.assertIn("prefix_cacheable=False", skipped[0])
+        self.assertIn("vllm_common.py", skipped[0])
 
     def test_a_scratch_only_instance_is_refused(self):
         with self.assertRaisesRegex(
