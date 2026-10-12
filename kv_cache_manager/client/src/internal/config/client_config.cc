@@ -75,7 +75,7 @@ bool ClientConfig::Check() const {
         }
     }
     if (default_query_type_ < static_cast<int32_t>(QueryType::QT_UNSPECIFIED) ||
-        default_query_type_ > static_cast<int32_t>(QueryType::QT_PREFIX_MATCH_WITH_MAMBA)) {
+        default_query_type_ > static_cast<int32_t>(QueryType::QT_PREFIX_MATCH_WITH_SWA)) {
         KVCM_LOG_ERROR("default_query_type [%d] is invalid", default_query_type_);
         return false;
     }

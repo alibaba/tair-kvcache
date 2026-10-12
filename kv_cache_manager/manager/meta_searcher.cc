@@ -764,47 +764,29 @@ int64_t ComputePrefixMatchBlocks(const std::vector<std::set<std::string>> &specs
 
 ErrorCode ClassifySpecGroups(RequestContext *request_context,
                              const std::vector<LocationSpecGroup> &location_spec_groups,
+                             char state_category,
                              std::vector<const LocationSpecGroup *> &full_groups,
-                             std::vector<const LocationSpecGroup *> &mamba_state_groups) {
+                             std::vector<const LocationSpecGroup *> &state_groups) {
     full_groups.clear();
-    mamba_state_groups.clear();
+    state_groups.clear();
     for (const auto &group : location_spec_groups) {
         const auto &group_name = group.name();
         const char category = group_name.empty() ? '?' : group_name.front();
-        switch (category) {
-        case 'F':
+        if (category == 'F') {
             full_groups.push_back(&group);
-            break;
-        case 'L':
-            mamba_state_groups.push_back(&group);
-            break;
-        case 'W':
-        case 'C':
-        case 'E':
-        case 'X': {
-            std::string error_msg =
-                "unsupported location spec category for QT_PREFIX_MATCH_WITH_MAMBA, group: " + group_name +
-                ", category: " + std::string(1, category);
+        } else if (category == state_category) {
+            state_groups.push_back(&group);
+        } else {
+            const std::string error_msg = "expected F/" + std::string(1, state_category) +
+                                          " location spec groups, unexpected group: " + group_name;
             request_context->error_tracer()->AddErrorMsg(error_msg);
             KVCM_LOG_WARN("%s", error_msg.c_str());
             return EC_BADARGS;
-        }
-        default: {
-            std::string error_msg =
-                "invalid location spec category for QT_PREFIX_MATCH_WITH_MAMBA, group: " + group_name +
-                ", category: " + std::string(1, category);
-            request_context->error_tracer()->AddErrorMsg(error_msg);
-            KVCM_LOG_WARN("%s", error_msg.c_str());
-            return EC_BADARGS;
-        }
         }
     }
-
-    if (full_groups.empty() || mamba_state_groups.empty()) {
-        std::string group_names = Jsonizable::ToJsonString(location_spec_groups);
-        std::string error_msg =
-            full_groups.empty() ? "no full location spec group" : "no mamba state location spec group";
-        error_msg += ", location_spec_groups: " + group_names;
+    if (full_groups.empty() || state_groups.empty()) {
+        const std::string error_msg =
+            "both F and " + std::string(1, state_category) + " location spec groups are required";
         request_context->error_tracer()->AddErrorMsg(error_msg);
         KVCM_LOG_WARN("%s", error_msg.c_str());
         return EC_BADARGS;
@@ -824,10 +806,29 @@ bool HasAllLocationSpecGroups(const std::set<std::string> &spec_names,
     return true;
 }
 
-int64_t ComputeMambaPrefixMatchBlocks(const std::vector<std::set<std::string>> &specs_by_key,
-                                      bool use_eagle_pop,
-                                      const std::vector<const LocationSpecGroup *> &full_groups,
-                                      const std::vector<const LocationSpecGroup *> &mamba_state_groups) {
+// Mamba requires one complete state at the resume point; SWA requires a
+// complete trailing window. Near the prompt start, all available history
+// suffices. Scan each position at most once, even when windows overlap.
+template <typename HasState>
+int64_t FindLastCompleteWindow(size_t prefix_len, size_t window_blocks, HasState &&has_state) {
+    size_t run_end = prefix_len;
+    size_t run_length = 0;
+    for (size_t offset = prefix_len; offset > 0; --offset) {
+        if (!has_state(offset - 1)) {
+            run_end = offset - 1;
+            run_length = 0;
+        } else if (++run_length >= std::min(window_blocks, run_end)) {
+            return static_cast<int64_t>(run_end);
+        }
+    }
+    return 0;
+}
+
+int64_t ComputeGroupedPrefixMatchBlocks(const std::vector<std::set<std::string>> &specs_by_key,
+                                        bool use_eagle_pop,
+                                        const std::vector<const LocationSpecGroup *> &full_groups,
+                                        const std::vector<const LocationSpecGroup *> &state_groups,
+                                        size_t window_blocks) {
     size_t full_prefix_len = 0;
     for (; full_prefix_len < specs_by_key.size(); ++full_prefix_len) {
         if (!HasAllLocationSpecGroups(specs_by_key[full_prefix_len], full_groups)) {
@@ -837,13 +838,9 @@ int64_t ComputeMambaPrefixMatchBlocks(const std::vector<std::set<std::string>> &
     if (use_eagle_pop && full_prefix_len > 0) {
         --full_prefix_len;
     }
-    for (size_t offset = full_prefix_len; offset > 0; --offset) {
-        const size_t index = offset - 1;
-        if (HasAllLocationSpecGroups(specs_by_key[index], mamba_state_groups)) {
-            return static_cast<int64_t>(index + 1);
-        }
-    }
-    return 0;
+    return FindLastCompleteWindow(full_prefix_len, window_blocks, [&](size_t index) {
+        return HasAllLocationSpecGroups(specs_by_key[index], state_groups);
+    });
 }
 
 struct HostCacheProjection {
@@ -915,7 +912,7 @@ SpecsByKey SelectBaseSpecs(const LocationsPerKey &locations,
 
 // Keep the block/spec mapping explicit, just as requested_spec_names does in
 // GetCacheLocationsByBackend. Full groups each use one PREFIX selection;
-// all missing Linear spec positions share one COVERAGE selection.
+// all missing Linear/SWA spec positions share one COVERAGE selection.
 void AddPeerSpecs(const std::string &host,
                   const std::vector<HostCacheProjection> &projection,
                   const std::set<std::string> &local_peers,
@@ -975,9 +972,11 @@ void AddPeerSpecs(const std::string &host,
 int64_t ComputeHostMatch(const SpecsByKey &specs,
                          bool use_eagle_pop,
                          const std::vector<const LocationSpecGroup *> &full_groups,
-                         const std::vector<const LocationSpecGroup *> &state_groups) {
-    return full_groups.empty() ? ComputePrefixMatchBlocks(specs, use_eagle_pop)
-                               : ComputeMambaPrefixMatchBlocks(specs, use_eagle_pop, full_groups, state_groups);
+                         const std::vector<const LocationSpecGroup *> &state_groups,
+                         size_t window_blocks) {
+    return full_groups.empty()
+               ? ComputePrefixMatchBlocks(specs, use_eagle_pop)
+               : ComputeGroupedPrefixMatchBlocks(specs, use_eagle_pop, full_groups, state_groups, window_blocks);
 }
 
 int64_t ComputeRemoteHostMatch(const std::string &host,
@@ -986,7 +985,8 @@ int64_t ComputeRemoteHostMatch(const std::string &host,
                                bool enable_p2p,
                                bool use_eagle_pop,
                                const std::vector<const LocationSpecGroup *> &full_groups,
-                               const std::vector<const LocationSpecGroup *> &state_groups) {
+                               const std::vector<const LocationSpecGroup *> &state_groups,
+                               size_t window_blocks) {
     auto combined = CollectHostSpecs(host, projection);
     std::set<std::string> local_peers;
     for (size_t i = 0; i < combined.size(); ++i) {
@@ -1031,7 +1031,7 @@ int64_t ComputeRemoteHostMatch(const std::string &host,
                          combined);
         }
     }
-    return ComputeHostMatch(combined, use_eagle_pop, full_groups, state_groups);
+    return ComputeHostMatch(combined, use_eagle_pop, full_groups, state_groups, window_blocks);
 }
 
 ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
@@ -1046,7 +1046,8 @@ ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
                                       const MetaSearcher::CheckHostCacheLocationFunc *request_check_location,
                                       size_t top_k_host_count,
                                       const std::vector<DataStorageType> &backend_types,
-                                      SelectLocationPolicy *policy) {
+                                      SelectLocationPolicy *policy,
+                                      size_t window_blocks = 1) {
     const bool use_tair =
         std::find(backend_types.begin(), backend_types.end(), DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL) !=
         backend_types.end();
@@ -1102,8 +1103,11 @@ ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherHostPrefixReduce);
     const bool reduced = meta_indexer->ParallelForQuery(matches.size(), [&](size_t begin, size_t end) {
         for (size_t i = begin; i < end; ++i) {
-            matches[i].local = ComputeHostMatch(
-                CollectHostSpecs(matches[i].host_ip_port, projection), use_eagle_pop, full_groups, state_groups);
+            matches[i].local = ComputeHostMatch(CollectHostSpecs(matches[i].host_ip_port, projection),
+                                                use_eagle_pop,
+                                                full_groups,
+                                                state_groups,
+                                                window_blocks);
             matches[i].global = matches[i].local;
         }
     });
@@ -1121,8 +1125,14 @@ ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
         const bool evaluated = meta_indexer->ParallelForQuery(selected.size(), [&](size_t begin, size_t end) {
             for (size_t i = begin; i < end; ++i) {
                 auto &match = matches[selected[i]];
-                match.global = ComputeRemoteHostMatch(
-                    match.host_ip_port, projection, base_specs, enable_p2p, use_eagle_pop, full_groups, state_groups);
+                match.global = ComputeRemoteHostMatch(match.host_ip_port,
+                                                      projection,
+                                                      base_specs,
+                                                      enable_p2p,
+                                                      use_eagle_pop,
+                                                      full_groups,
+                                                      state_groups,
+                                                      window_blocks);
             }
         });
         if (!evaluated) {
@@ -1267,16 +1277,17 @@ ErrorCode PrefixMatchByHostLocalOnly(MetaIndexer *meta_indexer,
     return EC_OK;
 }
 
-ErrorCode PrefixMatchWithMambaByHostLocalOnly(MetaIndexer *meta_indexer,
-                                              const CheckLocDataExistFunc &check_loc_data_exist,
-                                              RequestContext *request_context,
-                                              const MetaSearcher::KeyVector &keys,
-                                              bool use_eagle_pop,
-                                              const std::vector<std::string> &medium_filter,
-                                              const std::vector<const LocationSpecGroup *> &full_groups,
-                                              const std::vector<const LocationSpecGroup *> &mamba_state_groups,
-                                              std::vector<MetaSearcher::HostCacheMatch> &out_matches,
-                                              const MetaSearcher::CheckHostCacheLocationFunc *request_check_location) {
+ErrorCode PrefixMatchWithGroupsByHostLocalOnly(MetaIndexer *meta_indexer,
+                                               const CheckLocDataExistFunc &check_loc_data_exist,
+                                               RequestContext *request_context,
+                                               const MetaSearcher::KeyVector &keys,
+                                               bool use_eagle_pop,
+                                               const std::vector<std::string> &medium_filter,
+                                               const std::vector<const LocationSpecGroup *> &full_groups,
+                                               const std::vector<const LocationSpecGroup *> &state_groups,
+                                               std::vector<MetaSearcher::HostCacheMatch> &out_matches,
+                                               const MetaSearcher::CheckHostCacheLocationFunc *request_check_location,
+                                               size_t window_blocks) {
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     const MediumViewSet medium_set = BuildMediumViewSet(medium_filter);
 
@@ -1288,7 +1299,7 @@ ErrorCode PrefixMatchWithMambaByHostLocalOnly(MetaIndexer *meta_indexer,
         }
     };
     append_required_names(full_groups);
-    append_required_names(mamba_state_groups);
+    append_required_names(state_groups);
     std::sort(required_spec_names.begin(), required_spec_names.end());
     required_spec_names.erase(std::unique(required_spec_names.begin(), required_spec_names.end()),
                               required_spec_names.end());
@@ -1307,7 +1318,7 @@ ErrorCode PrefixMatchWithMambaByHostLocalOnly(MetaIndexer *meta_indexer,
         }
     };
     build_required_mask(full_groups, full_required);
-    build_required_mask(mamba_state_groups, state_required);
+    build_required_mask(state_groups, state_required);
 
     std::vector<std::string> candidate_hosts;
     std::unique_ptr<std::atomic<std::size_t>[]> full_prefix_stops;
@@ -1441,17 +1452,17 @@ ErrorCode PrefixMatchWithMambaByHostLocalOnly(MetaIndexer *meta_indexer,
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, host_projection_time_us, projection_wall_timer.elapsed_us());
     if (projection_invalid.load(std::memory_order_relaxed)) {
-        request_context->error_tracer()->AddErrorMsg("mamba host/spec flag matrix size overflow");
+        request_context->error_tracer()->AddErrorMsg("grouped host/spec flag matrix size overflow");
         return EC_ERROR;
     }
     const std::size_t valid_key_count = result.valid_key_count;
     if (valid_key_count < keys.size() && result.terminal_ec != EC_OK) {
-        KVCM_LOG_DEBUG("prefix match with mamba by host end because Get keys[%lu](%lu) return %d",
+        KVCM_LOG_DEBUG("prefix match with groups by host end because Get keys[%lu](%lu) return %d",
                        valid_key_count,
                        keys[valid_key_count],
                        result.terminal_ec);
         if (result.terminal_ec != ErrorCode::EC_NOENT) {
-            request_context->error_tracer()->AddErrorMsg("mamba prefix match metadata read failed");
+            request_context->error_tracer()->AddErrorMsg("grouped prefix match metadata read failed");
             return result.terminal_ec;
         }
     }
@@ -1468,13 +1479,23 @@ ErrorCode PrefixMatchWithMambaByHostLocalOnly(MetaIndexer *meta_indexer,
          state_key_word_count,
          valid_key_count,
          &prefix_lengths,
-         use_eagle_pop](std::size_t begin, std::size_t end) {
+         use_eagle_pop,
+         window_blocks](std::size_t begin, std::size_t end) {
             for (std::size_t host_index = begin; host_index < end; ++host_index) {
                 size_t full_prefix_len =
                     std::min(valid_key_count, full_prefix_stops[host_index].load(std::memory_order_relaxed));
                 if (use_eagle_pop && full_prefix_len > 0) {
                     --full_prefix_len;
                 }
+                if (window_blocks > 1) {
+                    prefix_lengths[host_index] =
+                        FindLastCompleteWindow(full_prefix_len, window_blocks, [&](size_t index) {
+                            return (state_present_words[host_index * state_key_word_count + index / 64] &
+                                    (std::uint64_t{1} << (index % 64))) != 0;
+                        });
+                    continue;
+                }
+                // Preserve the word-wise last-state search for Mamba and one-block SWA.
                 while (full_prefix_len > 0) {
                     const size_t last_index = full_prefix_len - 1;
                     const size_t word_index = last_index / 64;
@@ -1494,7 +1515,7 @@ ErrorCode PrefixMatchWithMambaByHostLocalOnly(MetaIndexer *meta_indexer,
         });
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostPrefixReduce);
     if (!reduce_ok) {
-        request_context->error_tracer()->AddErrorMsg("parallel mamba host prefix reduction failed");
+        request_context->error_tracer()->AddErrorMsg("parallel grouped host prefix reduction failed");
         return EC_ERROR;
     }
     out_matches.reserve(candidate_hosts.size());
@@ -1984,6 +2005,57 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
                                                    size_t top_k_host_count,
                                                    const std::vector<DataStorageType> &backend_types,
                                                    SelectLocationPolicy *policy) const {
+    return PrefixMatchWithGroupsByHost(request_context,
+                                       keys,
+                                       use_eagle_pop,
+                                       medium_filter,
+                                       location_spec_groups,
+                                       out_matches,
+                                       request_check_location,
+                                       top_k_host_count,
+                                       backend_types,
+                                       policy,
+                                       'L',
+                                       1);
+}
+
+ErrorCode MetaSearcher::PrefixMatchWithSwaByHost(RequestContext *request_context,
+                                                 const KeyVector &keys,
+                                                 size_t window_blocks,
+                                                 bool use_eagle_pop,
+                                                 const std::vector<std::string> &medium_filter,
+                                                 const std::vector<LocationSpecGroup> &location_spec_groups,
+                                                 std::vector<HostCacheMatch> &out_matches,
+                                                 const CheckHostCacheLocationFunc *request_check_location,
+                                                 size_t top_k_host_count,
+                                                 const std::vector<DataStorageType> &backend_types,
+                                                 SelectLocationPolicy *policy) const {
+    return PrefixMatchWithGroupsByHost(request_context,
+                                       keys,
+                                       use_eagle_pop,
+                                       medium_filter,
+                                       location_spec_groups,
+                                       out_matches,
+                                       request_check_location,
+                                       top_k_host_count,
+                                       backend_types,
+                                       policy,
+                                       'W',
+                                       window_blocks);
+}
+
+ErrorCode MetaSearcher::PrefixMatchWithGroupsByHost(RequestContext *request_context,
+                                                    const KeyVector &keys,
+                                                    bool use_eagle_pop,
+                                                    const std::vector<std::string> &medium_filter,
+                                                    const std::vector<LocationSpecGroup> &location_spec_groups,
+                                                    std::vector<HostCacheMatch> &out_matches,
+                                                    const CheckHostCacheLocationFunc *request_check_location,
+                                                    size_t top_k_host_count,
+                                                    const std::vector<DataStorageType> &backend_types,
+                                                    SelectLocationPolicy *policy,
+                                                    char state_category,
+                                                    size_t window_blocks) const {
     SPAN_TRACER(request_context);
     out_matches.clear();
     if (keys.empty()) {
@@ -1991,22 +2063,23 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
     }
 
     std::vector<const LocationSpecGroup *> full_groups;
-    std::vector<const LocationSpecGroup *> mamba_state_groups;
-    auto ec = ClassifySpecGroups(request_context, location_spec_groups, full_groups, mamba_state_groups);
+    std::vector<const LocationSpecGroup *> state_groups;
+    auto ec = ClassifySpecGroups(request_context, location_spec_groups, state_category, full_groups, state_groups);
     if (ec != EC_OK) {
         return ec;
     }
     if (top_k_host_count == 0 || backend_types.empty()) {
-        return PrefixMatchWithMambaByHostLocalOnly(meta_indexer_.get(),
-                                                   check_loc_data_exist_func_,
-                                                   request_context,
-                                                   keys,
-                                                   use_eagle_pop,
-                                                   medium_filter,
-                                                   full_groups,
-                                                   mamba_state_groups,
-                                                   out_matches,
-                                                   request_check_location);
+        return PrefixMatchWithGroupsByHostLocalOnly(meta_indexer_.get(),
+                                                    check_loc_data_exist_func_,
+                                                    request_context,
+                                                    keys,
+                                                    use_eagle_pop,
+                                                    medium_filter,
+                                                    full_groups,
+                                                    state_groups,
+                                                    out_matches,
+                                                    request_check_location,
+                                                    window_blocks);
     }
     return PrefixMatchByHostWithRemote(meta_indexer_.get(),
                                        check_loc_data_exist_func_,
@@ -2015,12 +2088,13 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
                                        use_eagle_pop,
                                        medium_filter,
                                        full_groups,
-                                       mamba_state_groups,
+                                       state_groups,
                                        out_matches,
                                        request_check_location,
                                        top_k_host_count,
                                        backend_types,
-                                       policy);
+                                       policy,
+                                       window_blocks);
 }
 
 ErrorCode MetaSearcher::BatchGetLocation(RequestContext *request_context,

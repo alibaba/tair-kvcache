@@ -71,6 +71,7 @@ enum class QueryType : int {
     QT_PREFIX_MATCH = 2,
     QT_REVERSE_ROLL_SW_MATCH = 3,
     QT_PREFIX_MATCH_WITH_MAMBA = 4,
+    QT_PREFIX_MATCH_WITH_SWA = 5,
 };
 
 struct LocationSpecUnit {

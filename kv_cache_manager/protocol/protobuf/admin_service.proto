@@ -56,6 +56,7 @@ enum QueryType {
     QT_PREFIX_MATCH = 2;
     QT_REVERSE_ROLL_SW_MATCH = 3;
     QT_PREFIX_MATCH_WITH_MAMBA = 4;
+    QT_PREFIX_MATCH_WITH_SWA = 5;
 }
 
 message LocalStorageSpec {}
@@ -474,6 +475,7 @@ message ModelDeployment {
     string extra = 8;             // 额外字段，用于标识模型，参与判断唯一标识校验
     string user_data = 9;        // 用户自定义数据，不参与判断唯一标识校验
     bool use_eagle_pop = 10;     // EaglePop 模式下 full attention 前缀长度减一
+    int64 sliding_window_tokens = 11; // QT_PREFIX_MATCH_WITH_SWA 使用的窗口 token 数，必须为正
 }
 
 message InstanceInfo {

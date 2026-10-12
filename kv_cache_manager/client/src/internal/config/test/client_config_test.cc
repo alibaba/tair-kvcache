@@ -32,6 +32,20 @@ TEST_F(ClientConfigTest, TestClientConfigDefaultQueryType) {
     ASSERT_NE(std::string::npos, client_config.ToJsonString().find("\"default_query_type\":4"));
 }
 
+TEST_F(ClientConfigTest, TestClientConfigSwaDefaultQueryType) {
+    ClientConfig client_config;
+    std::string file_content = getFileContent("client_config_success.json");
+    ASSERT_FALSE(file_content.empty());
+    const std::string location_spec_infos_field = R"(    "location_spec_infos": {)";
+    const auto pos = file_content.find(location_spec_infos_field);
+    ASSERT_NE(std::string::npos, pos);
+    file_content.insert(pos, R"(    "default_query_type": 5,
+)");
+    ASSERT_TRUE(client_config.FromJsonString(file_content));
+    ASSERT_EQ(QueryType::QT_PREFIX_MATCH_WITH_SWA, client_config.default_query_type());
+    ASSERT_NE(std::string::npos, client_config.ToJsonString().find("\"default_query_type\":5"));
+}
+
 TEST_F(ClientConfigTest, TestClientConfigLegacyQueryTypeIsIgnored) {
     ClientConfig client_config;
     std::string file_content = getFileContent("client_config_success.json");
