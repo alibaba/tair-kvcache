@@ -297,6 +297,65 @@ class TestRowGranularPreconditions(unittest.TestCase):
         self.assertIn("cache_dtype_str=", message)
 
 
+class TestReplaySkipIsExactType(unittest.TestCase):
+    """The replay skip must not swallow an undeclared subclass.
+
+    A subclass may add layout or retention state the base replay does not
+    regenerate, so it must reach the attention gate and be refused by name
+    (the same fail-closed policy the receipt branches follow) instead of
+    being skipped wholesale as a replayed window.
+    """
+
+    def test_a_subclass_is_refused_not_skipped(self):
+        from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+        class ReplayedSWASub(SlidingWindowMLASpec):
+            pass
+
+        spec = ReplayedSWASub(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype="uint8",
+            sliding_window=128,
+            cache_dtype_str="fp8_ds_mla",
+            model_version="deepseek_v4",
+            bounded_replay=True,
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            _parse([_group(spec)], 64)
+        self.assertIn("ReplayedSWASub", str(ctx.exception))
+        self.assertIn("bounded_replay", str(ctx.exception))
+
+    def test_the_base_class_is_still_skipped(self):
+        from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+        spec = SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype="uint8",
+            sliding_window=128,
+            cache_dtype_str="fp8_ds_mla",
+            model_version="deepseek_v4",
+            bounded_replay=True,
+        )
+        # A lone skipped group trips the aggregate guard ("all groups
+        # skipped?"), so a plain attention group rides along and only the
+        # replayed one disappears.
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        plain = FullAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype="uint8",
+            sliding_window=None,
+        )
+        metas = _parse([_group(spec), _group(plain, ("l1",))], 64)
+        self.assertEqual([["l1"]], [meta.layer_names for meta in metas])
+
+
 class TestV41TinyGolden(unittest.TestCase):
     """The real V4.1-Flash group structure: what survives parse_groups.
 
