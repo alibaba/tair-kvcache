@@ -43,7 +43,7 @@ KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回�
 Optimizer 当前包含离线 trace 回放和在线优化服务两条运行路径：
 
 - 离线回放路径使用 `OptimizerManager`、`OptIndexerManager`、`OptEvictionManager` 和 `RadixTreeIndex`，依赖 replay 配置、trace loader/converter 和 data storage 类型。
-- 在线服务路径使用 `OnlineOptimizerManager`、LiteHit、`CacheIndexerFactory`、`LruCacheIndexer`/`TtlCacheIndexerWrapper` 和 service/protobuf 接口，依赖 online 实例组/实例配置与 registry。full-attention 多容量 LRU 由 `InstanceState` 直接持有 LiteHit；linear attention 仍由通用 `CacheIndexer` 模拟。
+- 在线服务路径使用 `OnlineOptimizerManager`、统一的 LiteHit 运行时和 service/protobuf 接口，依赖 online 实例组/实例配置与 registry。每个 `InstanceState` 持有一个 `TtlLiteHit` decorator，内部只有一个 `LiteHit` core；full-attention 使用 Full-only 策略，linear attention 额外启用 Linear state 策略。
 
 两条路径共享 optimizer 模块内的命中率建模代码，但运行时、配置 target 和服务边界保持独立，避免在线服务引入离线 replay/data storage 依赖。
 
@@ -78,9 +78,10 @@ OnlineOptimizerManager (在线运行时协调器)
     ├── OptimizerRegistryManager (实例组/实例持久化)
     └── InstanceState (instance_id 隔离的运行状态)
         ↓
-    ├── LiteHit (full-attention 多容量 LRU)
-    └── CacheIndexerFactory (linear attention)
-        └── LruCacheIndexer / TtlCacheIndexerWrapper
+    └── LiteHit (统一 weighted LRU core)
+        ├── Full-only（可选 block-RLE）
+        └── Linear state policy（Full + Linear 混合 charge）
+                    两者均可叠固定 TTL
 ```
 
 ### 目录结构
@@ -97,10 +98,12 @@ kv_cache_manager/optimizer/
 │   └── online_runtime/              # 在线运行时
 │       └── online_optimizer_manager.h/cc # 在线实例注册、TraceQuery 和统计
 ├── index/                # 索引层
-│   ├── radix_tree_index.h/cc        # 离线 Radix 树索引
-│   └── online/                    # linear attention 在线容量/TTL 索引器
-├── liteHit/              # 轻量多容量 full-attention LRU 命中率核心
-│   ├── lite_hit.h/cc                # 多容量 LRU 命中率分析器
+│   └── radix_tree_index.h/cc        # 离线 Radix 树索引
+├── liteHit/              # 轻量多容量命中率核心
+│   ├── lite_hit.h/cc                # Full/Mamba 共享的容量无关 weighted LRU 核心
+│   ├── lite_hit_linear.h/cc         # Linear state 恢复点与写入策略（无独立 LRU 状态）
+│   ├── lite_hit_ttl.h/cc            # 包裹 LiteHit 的固定 TTL decorator（epoch/watermark）
+│   ├── weighted_lru_pool.h/cc       # 字节加权 LRU 池（typed key：Full / Linear）
 │   └── dynamic_fenwick_tree.h/cc    # reuse-distance 用的 order-statistics Fenwick
 ├── eviction_policy/      # 驱逐策略层
 │   ├── base.h                   # 策略基类
@@ -156,7 +159,9 @@ kv_cache_manager/optimizer/
 
 在线服务协议定义在 `kv_cache_manager/protocol/protobuf/optimizer_service.proto`，由 service 层转换为 optimizer online config/runtime 对象。
 
-full-attention TraceQuery 只把完整 block 放入 `block_keys`，并用 `input_token_len` 传入包含尾部 token 的原始输入长度。Online Manager 用 full location spec group 的固定字节 charge 将 `capacity_gb` 向下取整为 block 容量，再把同一请求交给 LiteHit；请求级与累计命中率均为 `prefix_hit_blocks * block_size_tokens / input_tokens`。旧客户端缺少长度时兼容假设没有尾部 token。full-attention 组配置 `ttl_seconds != 0` 时，固定 TTL 以墙钟时间叠加在 LiteHit 之上（口径与 `TtlCacheIndexerWrapper` 一致）；linear attention 的统计口径和 TTL 行为保持 legacy 路径不变。
+full-attention TraceQuery 只把完整 block 放入 `block_keys`，并用 `input_token_len` 传入包含尾部 token 的原始输入长度。Online Manager 与 linear attention 一样只保存 byte 容量；核心默认 byte-step 可无损压成 Full-only block-RLE，最终投影时再用 full location spec group 的固定字节 charge 做一次 floor。请求级与累计命中率均为 `prefix_hit_blocks * block_size_tokens / input_tokens`。旧客户端缺少长度时兼容假设没有尾部 token。
+
+linear attention（`linear_step > 0`）在同一个 LiteHit 上启用 Linear state 策略：Full block 与 Linear state 是两个独立对象，但共享**同一个 recency 和总字节预算**；容量轴是总字节而非 block 数，命中语义是“从某个 Linear state 恢复”。`LiteHit` 本身没有时间概念；外层 `TtlLiteHit` decorator 用共享 epoch/watermark 同时过滤 Full 与 Linear state，age 达到组 TTL 时从 weighted LRU 可见集合中失效。在线使用墙钟，离线使用 trace 时间戳，TTL 为 0 时 decorator 透明透传。
 
 ---
 

@@ -51,6 +51,55 @@ OptimizerManager (core coordinator)
     HitAnalysis (result analysis)
 ```
 
+### 在线订阅 KVCM 事件
+
+`online_optimizer_server_main` 可以主动发现 KVCM，并通过 KVCM 现有的 Meta gRPC 端口订阅缓存读取事件。KVCM 不需要知道 Optimizer 地址，也不新增事件端口；Optimizer 是 gRPC 客户端，调用 `OptimizerEventStreamService.SubscribeEvents`，KVCM 通过 response stream 写入 `TraceQueryRequest`。
+
+KVCM 侧先在原有 server 配置中启用 optimizer publisher：
+
+```properties
+kvcm.event.event_publishers_configs={"log":{"enable":true,"queue_size":10000},"optimizer":{"enable":true,"queue_size":100000,"max_subscribers":4,"subscriber_queue_size":10000}}
+```
+
+Optimizer 侧在现有 JSON 配置中加入订阅配置，不使用额外配置文件：
+
+```json
+{
+    "kvcm_event_subscriptions": [
+        {
+            "service_discovery_url": "static://127.0.0.1:6381",
+            "consumer_id": "online-optimizer",
+            "discovery_refresh_interval_ms": 5000,
+            "fanout_all_instances": true,
+            "linear_steps": [0, 4096, 8192],
+            "full_location_spec_group_name": "full-cache",
+            "linear_location_spec_group_name": "mamba-state"
+        },
+        {
+            "service_discovery_url": "vipserver://another-kvcm",
+            "consumer_id": "online-optimizer",
+            "discovery_refresh_interval_ms": 5000
+        }
+    ]
+}
+```
+
+空数组表示不订阅 KVCM。每个数组元素对应一个独立 KVCM 部署；`service_discovery_url` 指向该 KVCM 的 `kvcm.service.rpc_port`，支持通用服务发现 URL（如 `static://`、`vipserver://`、`spectrum://`），同一个 URL 不能重复配置。每个 KVCM 的发现结果只作为 seed：Optimizer 周期调用任一健康 seed 的 `MetaService.GetClusterInfo` 获取当前 Leader，并且只向该 Leader 维持一条 `SubscribeEvents` stream。某个 KVCM 切主后，它自己的下一次刷新会先同步新 Leader 的配置，再关闭旧 stream、连接新 Leader；断流和切主不影响其他 KVCM 的订阅。
+
+部署时也可以通过 `kvcm_optimizer.kvcm_event_subscriptions`（或下划线形式 `kvcm_optimizer_kvcm_event_subscriptions`）传入完整 JSON 数组，不需要为每个 KVCM 增加独立配置文件。
+
+`OptimizerEventStreamService.GetConfiguration` 与事件流共用 KVCM 的 Meta gRPC 端口。Optimizer 启动时及每次服务发现刷新时拉取一次 Instance Group / Instance 快照，先创建缺失的 Group，再注册缺失的 Instance；收到未知 `instance_id` 时还会立即唤醒一次配置刷新。因此 KVCM 新增实例后不需要再提前调用 Optimizer 的注册 API。当前同步只添加新配置，不删除或热更新已经存在的 Optimizer 配置。
+
+自动注册采用能从 KVCM 配置直接确定的口径：Instance Group 的 quota byte 数转换成一个 GiB 容量点，使用当前 Optimizer 支持的 LRU，并开启 prefix hash；未配置 fanout 时，单 location spec group 的 Instance 按 full-only 注册，空 group 列表会使用全部 spec 合成 `full` group，多 group 因语义不明确而跳过。当前在线 indexer 不支持 shared group quota，因此同组各 Instance 分别按完整 Group quota 模拟。
+
+`fanout_all_instances=true` 时，一条 KVCM Event 会按源 Instance 所属的 Instance Group 广播给该组全部活跃 Optimizer Instance，各 Instance 维护独立的 LiteHit、LRU、TTL、MRC 和指标状态。只配置该开关时，可用于广播给已经注册的同组 Instance；再配置 `linear_steps` 时，配置同步会从 KVCM 的一个源 Instance 自动派生对比 Instance，不要求源 trace 注册多个 Instance：`0` 必须存在，沿用源 `instance_id` 并表示 full-only；每个正值生成 `<source_instance_id>@linear_step_<value>`。正值场景必须同时配置 `full_location_spec_group_name` 和 `linear_location_spec_group_name`，且名称必须与 KVCM 上报的 location spec group 一致。所有 fanout 目标必须与源 Instance 使用相同 `block_size`，因为在线 Event 只有源粒度的 block keys，无法无损重分块。
+
+fanout 在现有 stream 线程中依次执行，不新增队列或工作线程。因每个目标都被视为一次独立模拟，按 Instance 展示的指标正确；未按 Instance 去重的 service 请求总量会按 fanout 目标数放大。当前配置同步仍然只新增、不删除或热更新，因此修改派生步长集合时应使用干净的 Optimizer registry 或显式清理旧 Instance。
+
+每个 KVCM 订阅器固定使用两个线程：一个 supervisor 线程负责服务发现、Leader 查询和配置同步，一个 stream 线程负责读取当前 Leader 的事件；收到事件后直接调用 `OnlineOptimizerManager`，不增加额外事件队列。未知 Instance 的首条事件会记录并丢弃，并且只唤醒对应 KVCM 的配置刷新；配置刷新完成后的后续事件正常进入统计。事件时间戳用于 LiteHit 和线性 indexer 的 TTL 判定，旧客户端未设置时间戳时仍回退到 Optimizer 本机墙钟。
+
+开启 theoretical 统计的在线实例还会输出 `mrc` gauge（Prometheus 名称默认为 `kvcm_optimizer_mrc`，标签为 `instance_group`、`instance_id` 和 `target_hit_rate_percent`，单位 byte）。`target_hit_rate_percent` 是相对于本上报窗口理论最大可命中量的比例，不是绝对请求命中率：目标命中量等于窗口理论无限容量最大可命中 block 数乘以该比例，`mrc` 则表示保留这些目标命中所需的最小 LRU 容量。当前固定输出 60%、80%、90%、95%、99%、99.5% 六个相对目标。例如理论最大命中率为 68.6% 时，95% 相对目标对应约 65.17% 的绝对命中率，而不是 95%。Full-only 实例在 block 轴上稀疏聚合后按 Full block charge 转成 byte；linear/Mamba 实例直接聚合 `RequestFact` 的 byte-axis 阶梯断点，因此 Full 与 Linear state 的不同 charge 会被精确计入。每次上报会原子取走并清空仅供 MRC 使用的 hit curve，不影响查询数、命中率等累计指标。MRC 不依赖预先配置的离散容量点；周期内尚无理论可命中 block 时值为 0。
+
 
 ### Eviction Policies
 

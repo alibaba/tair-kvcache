@@ -66,6 +66,18 @@ void AddFullStateInfo(proto::optimizer::OptimizerRegisterInstanceRequest *req, i
     req->mutable_optimizer_state_info()->set_full_location_spec_group_name("full_group");
 }
 
+void AddLinearStateInfo(proto::optimizer::OptimizerRegisterInstanceRequest *req, int64_t linear_size) {
+    auto *spec = req->add_location_spec_infos();
+    spec->set_name("linear");
+    spec->set_size(linear_size);
+
+    auto *group = req->add_location_spec_groups();
+    group->set_name("linear_group");
+    group->add_spec_names("linear");
+
+    req->mutable_optimizer_state_info()->set_linear_location_spec_group_name("linear_group");
+}
+
 } // namespace
 
 class OnlineOptimizerIntegrationTest : public TESTBASE {
@@ -131,8 +143,12 @@ protected:
                                                                              const std::string &instance_id,
                                                                              int32_t block_size = 1024,
                                                                              double capacity_gb = 1.0,
-                                                                             int32_t linear_step = 1) {
+                                                                             int32_t linear_step = -1) {
         CreateTestGroup(group, capacity_gb);
+
+        if (linear_step < 0) {
+            linear_step = block_size;
+        }
 
         proto::optimizer::OptimizerRegisterInstanceRequest req;
         req.set_trace_id("integ-" + instance_id);
@@ -141,6 +157,9 @@ protected:
         req.set_block_size(block_size);
         req.set_linear_step(linear_step);
         AddFullStateInfo(&req, block_size);
+        if (linear_step > 0) {
+            AddLinearStateInfo(&req, block_size);
+        }
 
         proto::optimizer::OptimizerRegisterInstanceResponse resp;
         grpc::ClientContext ctx;
@@ -828,7 +847,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryIsolationBetweenInstances) {
 // =============================================================================
 
 TEST_F(OnlineOptimizerIntegrationTest, RegisterWithLinearStep) {
-    auto resp = RegisterTestInstance("integ_grp_ls", "integ_ls_1", 1024, 1.0, 4);
+    auto resp = RegisterTestInstance("integ_grp_ls", "integ_ls_1", 1024, 1.0, 4096);
     EXPECT_EQ(proto::optimizer::OK, resp.header().status().code());
 
     proto::optimizer::OptimizerListInstancesRequest list_req;
@@ -842,7 +861,7 @@ TEST_F(OnlineOptimizerIntegrationTest, RegisterWithLinearStep) {
     for (const auto &inst : list_resp.instances()) {
         if (inst.instance_id() == "integ_ls_1") {
             found = true;
-            EXPECT_EQ(4, inst.debug_info().linear_step());
+            EXPECT_EQ(4096, inst.debug_info().linear_step());
         }
     }
     EXPECT_TRUE(found);
@@ -905,7 +924,7 @@ TEST_F(OnlineOptimizerIntegrationTest, RegisterDuplicateOverwrites) {
 // =============================================================================
 
 TEST_F(OnlineOptimizerIntegrationTest, GetInstanceDetails) {
-    RegisterTestInstance("integ_grp_getinst", "integ_getinst_1", 2048, 1.0, 2);
+    RegisterTestInstance("integ_grp_getinst", "integ_getinst_1", 2048, 1.0, 4096);
 
     proto::optimizer::OptimizerGetInstanceRequest req;
     req.set_trace_id("integ-getinst");
@@ -918,7 +937,7 @@ TEST_F(OnlineOptimizerIntegrationTest, GetInstanceDetails) {
     EXPECT_EQ("integ_grp_getinst", resp.instance_group());
     EXPECT_EQ("integ_getinst_1", resp.instance_id());
     EXPECT_EQ(2048, resp.block_size());
-    EXPECT_EQ(2, resp.linear_step());
+    EXPECT_EQ(4096, resp.linear_step());
     EXPECT_GE(resp.location_spec_infos_size(), 1);
     EXPECT_EQ("full", resp.location_spec_infos(0).name());
     EXPECT_EQ(2048, resp.location_spec_infos(0).size());

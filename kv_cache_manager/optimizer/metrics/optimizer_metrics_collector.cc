@@ -1,4 +1,4 @@
-#include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_collector.h"
+#include "kv_cache_manager/optimizer/metrics/optimizer_metrics_collector.h"
 
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -11,7 +11,9 @@ namespace kv_cache_manager {
     REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, service, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_OPT_SERVICE(query_counter);
+DEFINE_METRICS_NAME_FOR_OPT_SERVICE(input_tokens_total);
 DEFINE_METRICS_NAME_FOR_OPT_SERVICE(query_rt_us);
+DEFINE_METRICS_NAME_FOR_OPT_SERVICE(query_rt_us_sum);
 DEFINE_METRICS_NAME_FOR_OPT_SERVICE(error_code);
 DEFINE_METRICS_NAME_FOR_OPT_SERVICE(error_counter);
 
@@ -31,7 +33,9 @@ bool OptimizerServiceMetricsCollector::Init() {
     }
 
     REGISTER_COUNTER_METRICS_FOR_OPT_SERVICE(query_counter);
+    REGISTER_COUNTER_METRICS_FOR_OPT_SERVICE(input_tokens_total);
     REGISTER_GAUGE_METRICS_FOR_OPT_SERVICE(query_rt_us);
+    REGISTER_COUNTER_METRICS_FOR_OPT_SERVICE(query_rt_us_sum);
     REGISTER_GAUGE_METRICS_FOR_OPT_SERVICE(error_code);
     REGISTER_COUNTER_METRICS_FOR_OPT_SERVICE(error_counter);
 
