@@ -2059,6 +2059,100 @@ class TestCaptureSlotInvariant(unittest.TestCase):
             )
             self.assertEqual(8, pool.free_blocks + owned, f"round {_round}")
 
+class TestCaptureFloor(unittest.TestCase):
+    """The capture's room survives a burst of in-flight tasks.
+
+    The gemma-3-4b concurrent run (16 requests, 6 windowed buckets, a 1024-slot
+    pool: 896 shared + 128 reserve) withheld one 16-block run and then failed
+    6 groups x 16/16 announced blocks: the shared part was held by in-flight
+    tasks and other requests' captures, and the 50 ms deadline expired. Sizing
+    the partition is not enough -- the shared part needs a runtime floor.
+    """
+
+    def _shared_pool_dtm(self, groups, pool):
+        class _DTM:
+            def __init__(self):
+                self._pools = {}
+                self.captures = []
+
+            def prepare_capture(self, *a, **kw):  # pragma: no cover - unused
+                raise AssertionError
+
+            def pool_of(self, group):
+                return pool
+
+            def capture_blocks(self, group, block_slots, timeout):
+                # The real capture: one contiguous run per group, all held.
+                self.captures.append(group.spec_name)
+                start = pool.acquire(len(block_slots), timeout=timeout, keep_reserved=True)
+                return start
+
+        return _DTM()
+
+    def test_a_task_may_not_take_the_captures_floor(self):
+        pool = _StagingPool(
+            torch.device("cpu"), 1024, 8, reserved_blocks=3, capture_blocks=4
+        )
+        # Tasks take the reserve first, then borrow the shared runs from the
+        # top -- only while the floor stays free.
+        taken = []
+        while True:
+            start = pool.acquire(3, timeout=0.05)
+            if start is None:
+                break
+            taken.append(start)
+        # Only the reserve: the shared part is all floor (5 slots, floor 4),
+        # so a task batch may not borrow from it at all.
+        self.assertEqual([5], taken)
+        floor = pool.acquire(4, timeout=0.01, keep_reserved=True)
+        self.assertIsNotNone(floor, "a burst of tasks ate the captures' room")
+        pool.release(floor, 4)
+        for start in taken:
+            pool.release(start, 3)
+        self.assertEqual(8, pool.free_blocks)
+
+    def test_a_burst_of_requests_does_not_starve_a_multi_bucket_capture(self):
+        # The e2e's shape: six windowed buckets share one arena, each capture
+        # request needs 16 contiguous blocks per bucket and holds all six runs,
+        # and the pool's floor covers exactly that. In-flight task staging may
+        # fill everything above it, but not it.
+        groups = [windowed_group(f"tp0_g{i}", group_idx=i) for i in range(6)]
+        pool = _StagingPool(
+            torch.device("cpu"),
+            groups[0].per_block_bytes,
+            1024,
+            reserved_blocks=128,
+            capture_blocks=6 * 16,
+        )
+        dtm = self._shared_pool_dtm(groups, pool)
+        conn = worker_with(groups, dtm)
+        with mock.patch(
+            "kv_cache_manager.py_connector.vllm.data_transfer.batch_gather_scatter_helper"
+        ):
+            # A burst of in-flight task staging (loads/saves) borrows the shared
+            # part until the floor stops it.
+            held = []
+            while True:
+                start = pool.acquire(63, timeout=0.05)
+                if start is None:
+                    break
+                held.append(start)
+            self.assertGreater(len(held), 2, "the burst did not even reach the floor")
+            tables = [
+                list(range(7 + 16 * i, 7 + 16 * (i + 1))) for i in range(6)
+            ]
+            self.assertTrue(
+                conn._capture_request(
+                    CaptureRequest("r0", list(range(16)), all_block_ids=tables)
+                ),
+                "the capture was starved by in-flight task staging",
+            )
+            self.assertEqual(6 * 16, len(conn._staged["r0"]))  # 6 buckets x 16
+            for start in held:
+                pool.release(start, 63)
+            conn._release_staged("r0")
+        self.assertEqual(1024, pool.free_blocks)
+
 class TestPoolDeadline(unittest.TestCase):
     """The capture's bounded wait: blocking forever would deadlock the engine."""
 
