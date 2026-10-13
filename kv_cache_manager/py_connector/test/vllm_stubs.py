@@ -806,6 +806,16 @@ def _make_group_metas(
     ]
 
 
+def install_capture_ledger(conn: Any) -> None:
+    """Give a hand-built ConnectorWorker the capture ledger its slot
+    bookkeeping lives in (the real one builds it in __init__)."""
+    from kv_cache_manager.py_connector.vllm.connector_worker import _CaptureLedger
+
+    conn._captures = _CaptureLedger()
+    conn._staged = conn._captures.staged
+    conn._in_flight = conn._captures.in_flight
+
+
 def make_connector(
     manager_block_size: int = 16,
     vllm_block_size: Optional[int] = None,

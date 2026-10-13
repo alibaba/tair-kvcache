@@ -37,6 +37,7 @@ from kv_cache_manager.py_connector.test import vllm_stubs  # noqa: F401 (stubs)
 
 import torch
 from kv_cache_manager.py_connector.test.vllm_stubs import (
+    install_capture_ledger,
     make_connector,
     make_connector_scheduler,
 )
@@ -218,8 +219,7 @@ def worker_with(groups: List[AttentionTransferGroup], dtm: Any = None) -> Any:
         tp_rank=0, world_size=1, groups=list(groups), device="cpu", dtype=KV_DTYPE
     )
     conn._data_transfer = dtm
-    conn._staged = {}
-    conn._in_flight = {}
+    install_capture_ledger(conn)
     return conn
 
 
@@ -591,6 +591,9 @@ class TestWindowedSpecGroups(unittest.TestCase):
         conn.wait_for_save(meta)
         self.assertEqual(16, len(plans[0][0].staged_slots))
         self.assertNotIn(None, plans[0][0].staged_slots)
+        conn._captures.settle(
+            "r0", 0, {("tp0_g0", b): True for b in range(16)}
+        )
         deadline = time.time() + 5
         while pool.free_blocks != 62 and time.time() < deadline:
             time.sleep(0.01)
@@ -750,8 +753,11 @@ class TestWindowedSpecGroups(unittest.TestCase):
                 plan.staged_slots,
                 "the concurrent session's release stripped A's captured bytes",
             )
-        # A's writes landed and their slots came back; B's 16 blocks (2
-        # buckets) are still captured for the session that has not run yet.
+        # A's write landed; its slots come back when the session settles (the
+        # callback is what returns them now), while B's 16 blocks (2 buckets)
+        # are still captured for the session that has not run yet.
+        for spec in ("tp0_g0", "tp0_g1"):
+            conn._captures.settle("r0", 0, {(spec, b): True for b in range(16)})
         deadline = time.time() + 5
         while pool.free_blocks != 96 and time.time() < deadline:
             time.sleep(0.01)
@@ -1347,7 +1353,14 @@ class TestCaptureDispositions(unittest.TestCase):
                 plan.staged_slots,
             )
             self.assertEqual([True, True], verdicts)
-        # Every slot went back to the arena it came from, exactly once.
+        # Every slot went back to the arena it came from, exactly once -- via
+        # the capture ledger's settle, which is the only release point.
+        conn._captures.settle(
+            "r0", 0, {("tp0_g0", b): True for b in (0, 1)}
+        )
+        conn._captures.settle(
+            "r0", 0, {("tp0_g0_b1", b): True for b in (0, 1)}
+        )
         self.assertEqual(8, pool_a.free_blocks)
         self.assertEqual(8, pool_b.free_blocks)
 
@@ -1379,14 +1392,14 @@ class TestCaptureDispositions(unittest.TestCase):
         conn._capture_request(CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8]]))
         self.assertEqual(6, pool.free_blocks)
         self.assertEqual(
-            [0, 1], sorted(slot for _key, (_pool, slot) in conn._staged["r0"].items())
+            [0, 1], sorted(entry.slot for entry in conn._staged["r0"].values())
         )
         conn._capture_request(CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8]]))
         # The repeat holds its new run and the displaced one is already back:
         # arena use is one run, not two.
         self.assertEqual(6, pool.free_blocks)
         self.assertEqual(
-            [2, 3], sorted(slot for _key, (_pool, slot) in conn._staged["r0"].items())
+            [2, 3], sorted(entry.slot for entry in conn._staged["r0"].values())
         )
         conn._release_staged("r0")
         self.assertEqual(8, pool.free_blocks)
@@ -1528,7 +1541,7 @@ class TestLoadNullDisposition(unittest.TestCase):
             tp_rank=0, world_size=1, groups=[group], device="cpu", dtype=KV_DTYPE
         )
         conn._data_transfer = None
-        conn._staged, conn._in_flight = {}, {}
+        install_capture_ledger(conn)
         conn._withheld, conn._capture_scope = {}, {}
         plan = self._plan(conn, [0, 0, 7, 8], group, blocks=[0])
         alias = plan.null_rows[0]
@@ -1596,8 +1609,12 @@ class TestStagedWrites(unittest.TestCase):
             [b.iovs[0].base for b in buffers],
         )
         self.assertEqual([True, True], results["flat"])
-        # The written slots are back in the arena: a 4-slot acquire succeeds.
-        self.assertEqual(0, pool.acquire(4, timeout=0.01))
+        # The slots are the capture ledger's to return, not this task's: they
+        # are still held here, and the ledger releases them on the session's
+        # settle (see the invariant family).
+        self.assertEqual(2, pool.free_blocks)
+        pool.release(start, 2)
+        self.assertEqual(4, pool.free_blocks)
 
     def test_failed_write_holds_its_slots_for_the_retry(self):
         pool = _StagingPool(torch.device("cpu"), 1024, 2)
@@ -1631,12 +1648,16 @@ class TestStagedWrites(unittest.TestCase):
             block_ids=None,
             staged_slots=[start, start + 1],
         )
-        self.assertEqual(0, pool.acquire(2, timeout=0.01))
-        pool.release(0, 2)
+        # A failure keeps its slots (the ledger hands the bytes back to the
+        # staged map for the retry), so this second task cannot take them --
+        # and the release that used to happen here is exactly what the ledger
+        # now owns: it happens once, on the session's settle.
+        self.assertIsNone(pool.acquire(1, timeout=0.01))
+        pool.release(start, 2)
         self.assertEqual(2, pool.free_blocks)
         # ... exactly once: the pool refuses a second release of the same slots.
         with self.assertRaises(ValueError):
-            pool.release(0, 2)
+            pool.release(start, 2)
 
     def test_withheld_block_fails_and_abstained_block_is_none(self):
         pool = _StagingPool(torch.device("cpu"), 1024, 2)
@@ -1656,7 +1677,199 @@ class TestStagedWrites(unittest.TestCase):
             staged_slots=[None, None, start],
         )
         self.assertEqual([False, None, True], results["flat"])
-        self.assertIsNotNone(pool.acquire(2, timeout=0.01))
+        # The written block's slot is the ledger's to return (see the
+        # invariant family); this task returns nothing, so the arena still
+        # holds exactly that one slot.
+        self.assertEqual(1, pool.free_blocks)
+        second = pool.acquire(1, timeout=0.01)
+        self.assertIsNotNone(second)
+        pool.release(second, 1)
+        pool.release(start, 1)
+        self.assertEqual(2, pool.free_blocks)
+
+
+class TestCaptureSlotInvariant(unittest.TestCase):
+    """The capture ledger's invariant -- and the three shapes that broke it.
+
+    At any moment every staging slot belongs to exactly one live entry in
+    exactly one of the ledger's two maps, it is released exactly once, and no
+    path ever reads a released slot. Each test below pins one of the holes the
+    audit found and checks the same invariant, so a regression fails as an
+    accounting error rather than as a corrupted transfer.
+    """
+
+    CAPACITY = 8
+    BLOCKS = 4
+
+    def _fixture(self, ok: bool = True):
+        import kv_cache_manager.py_connector.vllm.data_transfer as dt
+
+        patcher = mock.patch.object(dt, "batch_gather_scatter_helper")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        group = windowed_group()
+        pool = _StagingPool(
+            torch.device("cpu"), group.per_block_bytes, self.CAPACITY, reserved_blocks=2
+        )
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0 if ok else 1]
+        dtm._extra_config = SimpleNamespace(
+            block_per_save_task=2, block_per_load_task=2
+        )
+        dtm._io_executor = ThreadPoolExecutor(max_workers=2)
+        conn = worker_with([group], dtm)
+        conn._pending_saves = {}
+        conn._device_mod = MagicMock()
+        return conn, dtm, pool, group
+
+    def _invariant(self, conn, pool, note: str = ""):
+        """Every slot belongs to one live entry, and the pool agrees."""
+        entries = [
+            entry
+            for entries in conn._staged.values()
+            for entry in entries.values()
+        ] + [
+            entry
+            for entries in conn._in_flight.values()
+            for entry in entries.values()
+        ]
+        slots = [entry.slot for entry in entries]
+        self.assertEqual(len(slots), len(set(slots)), f"a slot has two owners {note}")
+        for slot in slots:
+            self.assertGreaterEqual(slot, 0, note)
+            self.assertLess(slot, pool.max_blocks, note)
+        self.assertEqual(
+            pool.max_blocks,
+            pool.free_blocks + len(slots),
+            f"a slot is neither free nor owned (released twice or leaked) {note}",
+        )
+
+    def _plan(self, conn, blocks, session):
+        return conn._plan_group_transfers(
+            locations([["tp0_g0"]] * len(blocks)),
+            blocks,
+            [list(range(7, 7 + len(blocks)))],
+            "r0",
+            for_save=True,
+            session_id=session,
+        )[0]
+
+    def _run_session(self, conn, dtm, group, plan, blocks, session):
+        done = {}
+        done_cb = conn._settle_session_captures(
+            SimpleNamespace(
+                req_id="r0", manager_block_idxes=list(blocks), session_id=session
+            ),
+            [plan],
+            lambda flat: done.setdefault("flat", flat),
+        )
+        dtm.save_task(
+            MultiResult(1, done_cb),
+            0,
+            group,
+            plan.uris,
+            None,
+            None,
+            plan.staged_slots,
+        )
+        return done.get("flat")
+
+    def test_an_sdk_exception_is_not_restored_onto_a_released_slot(self):
+        # The exception path used to release the slots and report a failure,
+        # which the worker's retain wrapper then restored -- onto slots the
+        # pool had already handed out again. The ledger owns both ends now: an
+        # exception is a failure, the bytes stay staged, and nothing was
+        # released behind its back.
+        conn, dtm, pool, group = self._fixture()
+        blocks = list(range(self.BLOCKS))
+        conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
+        plan = self._plan(conn, blocks, session=1)
+        dtm._transfer_client.SaveKvCaches.side_effect = RuntimeError("pybind blew up")
+        flat = self._run_session(conn, dtm, group, plan, blocks, session=1)
+        self.assertEqual([False] * self.BLOCKS, flat)
+        self._invariant(conn, pool, "after an SDK exception")
+        self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
+        self.assertEqual({}, conn._in_flight.get("r0", {}))
+
+        # The retry publishes from those very slots, and then releases them.
+        dtm._transfer_client.SaveKvCaches.side_effect = None
+        retry = self._plan(conn, blocks, session=2)
+        self.assertNotIn(None, retry.staged_slots)
+        self._run_session(conn, dtm, group, retry, blocks, session=2)
+        self._invariant(conn, pool, "after the retry")
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
+
+    def test_a_repeat_capture_keeps_both_sessions_ownership(self):
+        # The save watermark moved backwards, so the block was captured again
+        # while the first session's write was still in flight. Both owners must
+        # survive: the second session's failure may only move its own entry,
+        # and the first session's bytes must not be released or overwritten.
+        conn, dtm, pool, group = self._fixture()
+        conn._capture_request(CaptureRequest("r0", [0], all_block_ids=[[7]]))
+        first = self._plan(conn, [0], session=1)
+        self.assertIsNotNone(first.staged_slots[0])
+        conn._capture_request(CaptureRequest("r0", [0], all_block_ids=[[7]]))
+        self._invariant(conn, pool, "after the repeat capture")
+        second = self._plan(conn, [0], session=2)
+        self.assertIsNotNone(second.staged_slots[0])
+        self.assertNotEqual(first.staged_slots[0], second.staged_slots[0])
+        self.assertEqual(2, len(conn._in_flight["r0"]))
+        self._invariant(conn, pool, "with two sessions in flight")
+
+        # Session 2 fails: its entry goes back to staging, session 1's slot is
+        # untouched and still in flight.
+        dtm._transfer_client.SaveKvCaches.return_value = [1]
+        flat = self._run_session(conn, dtm, group, second, [0], session=2)
+        self.assertEqual([False], flat)
+        self._invariant(conn, pool, "after session 2 failed")
+        # Session 1's record is the one still in flight; session 2's settled
+        # entry went back to staging (with its own slot).
+        self.assertEqual([(1, "tp0_g0", 0)], list(conn._in_flight["r0"]))
+        self.assertEqual([second.staged_slots[0]],
+                         [entry.slot for entry in conn._staged["r0"].values()])
+
+    def test_a_retired_request_settles_its_in_flight_slots(self):
+        # The request retired before its task settled. The in-flight record has
+        # to survive that (the ledger keeps it) so the failure can release the
+        # slot: popping it at retirement is what leaked these slots for good.
+        conn, dtm, pool, group = self._fixture()
+        blocks = list(range(self.BLOCKS))
+        conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
+        plan = self._plan(conn, blocks, session=1)
+        conn._release_staged("r0")
+        self._invariant(conn, pool, "after retirement, task still in flight")
+
+        dtm._transfer_client.SaveKvCaches.return_value = [1]
+        flat = self._run_session(conn, dtm, group, plan, blocks, session=1)
+        self.assertEqual([False] * self.BLOCKS, flat)
+        self._invariant(conn, pool, "after the retired request settled")
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
+        self.assertEqual({}, conn._staged.get("r0", {}))
+        self.assertEqual({}, conn._in_flight.get("r0", {}))
+
+    def test_a_withheld_capture_does_not_hold_the_arena(self):
+        # The plain path still holds: an arena too small for this step's runs
+        # withholds the blocks (nothing staged, nothing in flight, nothing
+        # released), and the invariant is what says so.
+        conn, dtm, pool, group = self._fixture()
+        # Take the whole capture partition (capacity - reserve): the two-block
+        # run cannot fit, so the capture is withheld rather than queued.
+        held = pool.acquire(self.CAPACITY - pool.reserved_blocks, keep_reserved=True)
+        self.assertIsNotNone(held)
+        self.assertFalse(
+            conn._capture_request(
+                CaptureRequest("r0", [0, 1], all_block_ids=[[7, 8]])
+            )
+        )
+        # The rollback gave back whatever the failed run had taken; releasing
+        # the test's own hold leaves the arena whole again.
+        pool.release(held, self.CAPACITY - pool.reserved_blocks)
+        self._invariant(conn, pool, "after a withheld capture")
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
 
 
 class TestPoolDeadline(unittest.TestCase):
@@ -1754,29 +1967,35 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         catches it.
         """
         staged = sum(len(entries) for entries in conn._staged.values())
+        in_flight = sum(len(entries) for entries in conn._in_flight.values())
         self.assertLessEqual(
-            pool.free_blocks + staged + sessions,
+            pool.free_blocks + staged + in_flight + sessions,
             self.CAPACITY,
             "the arena handed out more slots than it has: a range was freed twice",
         )
-        self.assertEqual(self.CAPACITY, pool.free_blocks + staged + sessions)
+        self.assertEqual(
+            self.CAPACITY, pool.free_blocks + staged + in_flight + sessions
+        )
 
-    def _plan(self, conn, blocks):
+    def _plan(self, conn, blocks, session=0):
         return conn._plan_group_transfers(
             locations([["tp0_g0"]] * len(blocks)),
             blocks,
             [list(range(7, 7 + len(blocks)))],
             "r0",
             for_save=True,
+            session_id=session,
         )[0]
 
-    def _session_callback(self, conn, req_id, blocks, plans):
+    def _session_callback(self, conn, req_id, blocks, plans, session=0):
         """The worker's per-session result callback: the retain wrapper over a
         sink, exactly as wait_for_save builds it."""
         done = {}
         base = lambda flat: done.setdefault("flat", flat)  # noqa: E731
-        save_req = SimpleNamespace(req_id=req_id, manager_block_idxes=list(blocks))
-        return conn._retain_failed_windowed(save_req, plans, base), done
+        save_req = SimpleNamespace(
+            req_id=req_id, manager_block_idxes=list(blocks), session_id=session
+        )
+        return conn._settle_session_captures(save_req, plans, base), done
 
     def test_a_retiring_request_does_not_free_an_in_flight_slot(self):
         conn, dtm, pool, group = self._fixture()
@@ -1800,7 +2019,7 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             pool.free_blocks,
             "a retiring request freed slots its write session is still reading",
         )
-        self._assert_arena_accounting(conn, pool, sessions=self.BLOCKS)
+        self._assert_arena_accounting(conn, pool, sessions=0)
 
         # The write lands: one release, not two.
         done = {}
@@ -1814,7 +2033,11 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             plan.staged_slots,
         )
         self.assertEqual([True] * self.BLOCKS, done["flat"])
-        self.assertEqual(self.CAPACITY, pool.free_blocks)
+        self.assertEqual(self.BLOCKS, len(conn._in_flight["r0"]))
+        # The session settles: the slots come back exactly once, even though
+        # the request retired before the task reported.
+        conn._captures.settle("r0", 0, {("tp0_g0", block): True for block in blocks})
+        self.assertEqual(pool.max_blocks, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=0)
         # Everything is free again, and the two halves of the arena (the shared
         # part and the transfer reserve) add up to the capacity: nothing is in
@@ -1849,10 +2072,11 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             plan.staged_slots,
         )
         self.assertEqual([False] * self.BLOCKS, done["flat"])
-        # Nothing was published, the slot is still held, and the bytes are back
-        # in the staged map for the retry.
-        self.assertEqual(self.CAPACITY - self.BLOCKS, pool.free_blocks)
+        # Nothing was published; the settle kept the slots and the bytes are
+        # staged again for the retry.
         self.assertEqual(self.BLOCKS, len(conn._staged.get("r0", {})))
+        self.assertEqual({}, conn._in_flight.get("r0", {}))
+        self.assertEqual(self.CAPACITY - self.BLOCKS, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=0)
 
         # The retry session finds them and publishes.
@@ -1890,33 +2114,40 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         # Block 1 came back (no session took it); block 0's slot stays with the
         # task that reads it.
         self.assertEqual(self.CAPACITY - 1, pool.free_blocks)
-        self._assert_arena_accounting(conn, pool, sessions=1)
+        self._assert_arena_accounting(conn, pool, sessions=0)
 
-    def test_a_raising_sdk_still_returns_the_slots(self):
-        # The plan handed these slots to this task, so nothing else can return
-        # them: an SDK that raises (a pybind/backend exception, not an error
-        # code) must not shrink the arena for the rest of the process's life
-        # (review_r2 N1 measured 384 of 1024 slots leaking that way).
+    def test_a_raising_sdk_is_a_failure_and_keeps_the_bytes(self):
+        # An SDK that raises (a pybind/backend exception, not an error code) is
+        # reported like any other failure, and the capture ledger keeps the
+        # bytes for a retry: no slot is lost to the exception, and none is
+        # released behind the ledger's back (the r2 N1 leak was a release that
+        # only the DTM knew about).
         conn, dtm, pool, group = self._fixture()
         blocks = list(range(self.BLOCKS))
         conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
         plan = self._plan(conn, blocks)
         dtm._transfer_client.SaveKvCaches.side_effect = RuntimeError("pybind blew up")
-        with self.assertRaises(RuntimeError):
-            dtm._save_staged_blocks(
-                group, plan.uris, plan.staged_slots, [0, 1, 2, 3], [None] * 4
-            )
-        self.assertEqual(self.CAPACITY, pool.free_blocks)
+        ok_mask: List[Any] = [None] * self.BLOCKS
+        dtm._save_staged_blocks(
+            group, plan.uris, plan.staged_slots, [0, 1, 2, 3], ok_mask
+        )
+        self.assertEqual([False] * self.BLOCKS, ok_mask)
+        # Still in flight (the session has not settled yet) and the arena is
+        # untouched.
+        self.assertEqual(self.BLOCKS, len(conn._in_flight["r0"]))
+        self.assertEqual(self.CAPACITY - self.BLOCKS, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=0)
 
-        # The same crash through save_task: its single exit turns the escaping
-        # exception into all-failed verdicts, and the slots still come back.
-        blocks = list(range(self.BLOCKS))
+        # Through save_task the exception turns into all-failed verdicts, the
+        # settle keeps the bytes staged, and nothing was released twice.
         conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
-        plan = self._plan(conn, blocks)
+        plan = self._plan(conn, blocks, session=7)
+        dtm._transfer_client.SaveKvCaches.side_effect = None
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
         done = {}
+        done_cb = self._session_callback(conn, "r0", blocks, [plan], session=7)[0]
         dtm.save_task(
-            MultiResult(1, lambda flat: done.setdefault("flat", flat)),
+            MultiResult(1, done_cb),
             0,
             group,
             plan.uris,
@@ -1924,8 +2155,13 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             None,
             plan.staged_slots,
         )
-        self.assertEqual([False] * self.BLOCKS, done["flat"])
-        self.assertEqual(self.CAPACITY, pool.free_blocks)
+        # Session 0 never settled, so its four records are still in flight;
+        # session 7's own four were taken and then settled (successfully) by
+        # its callback. Two sessions on the same (spec, block) keys coexist,
+        # which is exactly why the in-flight ownership is keyed by session.
+        self.assertEqual(self.BLOCKS, len(conn._in_flight.get("r0", {})))
+        self.assertEqual({0}, {key[0] for key in conn._in_flight["r0"]})
+        self.assertEqual({}, conn._staged.get("r0", {}))
         self._assert_arena_accounting(conn, pool, sessions=0)
 
     def test_a_failed_contract_returns_its_staged_slots(self):
@@ -2459,7 +2695,7 @@ class TestTaskChunkWiring(unittest.TestCase):
         conn._num_groups = 1
         conn._device_mod = MagicMock()
         conn._pending_saves = {}
-        conn._staged, conn._in_flight = {}, {}
+        install_capture_ledger(conn)
         conn._withheld, conn._capture_scope = {}, {}
         conn._coordinator_server = MagicMock()
         return conn
