@@ -336,6 +336,10 @@ class ConnectorWorker:
         # captures -- and if the first writer then fails, neither request has
         # the windowed bytes left to publish them.
         self._block_uris: Dict[str, Dict[int, Optional[str]]] = {}
+        # write session -> (req_id, the (spec, block) keys it writes): the
+        # coordinator's global verdict arrives keyed by write_session_id, and
+        # this is how it finds the captures to release (see on_save_finished).
+        self._session_keys: Dict[str, Tuple[str, List[Tuple[str, int]]]] = {}
 
         self._tp_rank = get_tensor_model_parallel_rank()
         # torch device module (torch.cuda / torch.musa / ...), set in
@@ -781,6 +785,21 @@ class ConnectorWorker:
                 self._captures.settle(
                     save_req.req_id, save_req.session_id, outcomes
                 )
+                if self._tp_size == 1:
+                    # With one rank this verdict *is* the global one (the
+                    # coordinator's AND has nothing to combine), so the bytes
+                    # are durable now: release them, or a long prefill's
+                    # captures would fill the arena while waiting for a
+                    # confirmation that can never say anything new (the
+                    # gemma-3-4b regression). Blocks with any failing group
+                    # stay staged: the manager rejects the block and the retry
+                    # needs them.
+                    by_block: Dict[int, bool] = {}
+                    for (spec_name, block), ok in outcomes.items():
+                        by_block[block] = by_block.get(block, True) and bool(ok)
+                    committed = [b for b, ok in by_block.items() if ok]
+                    if committed:
+                        self._captures.release_staged(save_req.req_id, committed)
                 failed = [key for key, ok in outcomes.items() if not ok]
                 if failed:
                     logger.warning(
@@ -1136,6 +1155,18 @@ class ConnectorWorker:
                 save_req.req_id, self._tp_rank, save_req.write_session_id, num_blocks
             )
             if plans is not None:
+                keys = [
+                    (plan.group.spec_name, save_req.manager_block_idxes[pos])
+                    for plan in plans
+                    if getattr(plan.group, "retention", None) is not None
+                    for pos, slot in enumerate(plan.staged_slots or ())
+                    if slot is not None
+                ]
+                if keys:
+                    self._session_keys[save_req.write_session_id] = (
+                        save_req.req_id,
+                        keys,
+                    )
                 done_cb = self._settle_session_captures(save_req, plans, done_cb)
 
             if plans is None:
@@ -1457,6 +1488,7 @@ class ConnectorWorker:
             save_context.success_mask,
             write_session_id,
         )
+        committed = True
         try:
             self._manager_client.finish_write_cache(
                 {
@@ -1469,8 +1501,45 @@ class ConnectorWorker:
                 }
             )
         except Exception as e:
+            # The report failed: the manager may still hold these blocks
+            # uncommitted, so nothing may be released (a retry has to find the
+            # bytes).
+            committed = False
             logger.warning(
                 "finish_write_cache failed, session: %s, error: %s", write_session_id, e
+            )
+
+        # This is the confirmation the captures wait for: the AND over every
+        # rank says which blocks are durable. Those are released now (the
+        # whole point of waiting); the rejected ones stay staged, because the
+        # manager rejects the block globally and the retry needs the windowed
+        # bytes of the ranks that did write (their HBM window is gone).
+        session = self._session_keys.pop(write_session_id, None)
+        if session is None:
+            return
+        req_id, keys = session
+        committed_blocks = {
+            index
+            for index, ok in enumerate(save_context.success_mask)
+            if ok and committed
+        }
+        if not committed_blocks:
+            return
+        released = self._captures.release_staged(
+            req_id,
+            [
+                block
+                for spec_name, block in keys
+                if block in committed_blocks
+            ],
+        )
+        if released:
+            logger.debug(
+                "req:%s session %s: released %d captured block slots the "
+                "coordinator confirmed (all ranks wrote them)",
+                req_id,
+                write_session_id,
+                released,
             )
 
     def get_finished(
