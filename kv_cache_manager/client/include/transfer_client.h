@@ -19,6 +19,9 @@ public:
     Create(const std::string &client_config,
            const InitParams &init_params,
            const SharedMemoryRegistration &shared_memory_registration);
+    // Callers that use braced initialization must name the registration type
+    // explicitly. Bare `{}` or `{base, size, fd}` arguments are ambiguous with
+    // the SharedMemoryRegistration overload above.
     static std::unique_ptr<TransferClient>
     Create(const std::string &client_config,
            const InitParams &init_params,
