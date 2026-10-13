@@ -40,16 +40,17 @@ _MISSING_ENGINE_MODULES = ("vllm", "torch")
 def _missing_engine(exc: ImportError) -> bool:
     """Is this error 'vLLM is not installed here' rather than a regression?
 
-    True only for a missing vLLM/torch module (the engine and its runtime
-    dependencies). Everything else -- a connector symbol that vanished, a
+    True only when the *top-level* vLLM or torch package is missing: a broken
+    wheel that cannot load an internal module (vllm._C, torch._C, ...) is a
+    regression too, and skipping the dual-era suite for it would be exactly the
+    false green this guard exists to prevent. Everything else -- a connector
+    symbol that vanished, any nested module, a non-ModuleNotFoundError -- must
+    fail the run. Everything else -- a connector symbol that vanished, a
     broken install, a non-ModuleNotFoundError -- must fail the run.
     """
     if not isinstance(exc, ModuleNotFoundError):
         return False
-    name = exc.name or ""
-    return any(
-        name == root or name.startswith(root + ".") for root in _MISSING_ENGINE_MODULES
-    )
+    return exc.name in _MISSING_ENGINE_MODULES
 
 
 def _engine_absent(exc: ImportError) -> str:
@@ -728,6 +729,15 @@ class TestImportGuard(RealEngineCase):
                 ModuleNotFoundError("No module named 'x'", name="some_new_dependency")
             )
         )
+        # Installed but broken: a missing internal module is a regression, not
+        # an absent engine (a false skip here would hide a broken wheel).
+        for nested in ("vllm._C", "torch._C", "vllm.v1.kv_cache_interface"):
+            with self.subTest(module=nested):
+                self.assertFalse(
+                    _missing_engine(
+                        ModuleNotFoundError("No module named x", name=nested)
+                    )
+                )
 
     def _probe(self, blocked: str):
         root = str(Path(__file__).resolve().parents[3])
