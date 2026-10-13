@@ -9,6 +9,7 @@ shell.
 """
 
 import copy
+import threading
 from dataclasses import dataclass
 import json
 import typing
@@ -109,6 +110,14 @@ class _CaptureLedger:
     """
 
     def __init__(self) -> None:
+        # One lock for every ownership transition: the settle callbacks run on
+        # the transfer manager's io threads while staging, taking, releasing
+        # and retirement run on the engine thread. A decision that reads the
+        # maps has to write them before another thread reads, or two settles
+        # of the same block can both find no staged entry and each overwrite
+        # the other (leaking the slot one of them restaged), and a retirement
+        # can leave an entry a racing settle just created.
+        self._lock = threading.Lock()
         # (spec_name, manager block) -> _Capture: captured, not yet taken.
         self.staged: Dict[str, Dict[Tuple[str, int], _Capture]] = {}
         # (session id, spec_name, manager block) -> _Capture.
@@ -130,12 +139,13 @@ class _CaptureLedger:
         is released here -- it has no session reference, a session *moves* the
         entry into the in-flight map when it takes it.
         """
-        previous = self.staged.setdefault(req_id, {}).get(key)
-        self.staged[req_id][key] = capture
-        if previous is None:
-            return None
-        self._release(previous)
-        return previous.slot
+        with self._lock:
+            previous = self.staged.setdefault(req_id, {}).get(key)
+            self.staged[req_id][key] = capture
+            if previous is None:
+                return None
+            self._release(previous)
+            return previous.slot
 
     def take(
         self, req_id: str, session_id: int, key: Tuple[str, int]
@@ -146,19 +156,21 @@ class _CaptureLedger:
         capture is staged, or this very session already holds the block (a
         repeated plan must not overwrite the first task's ownership).
         """
-        flight_key = (session_id, key[0], key[1])
-        sessions = self.in_flight.setdefault(req_id, {})
-        if flight_key in sessions:
-            return None
-        capture = self.staged.get(req_id, {}).pop(key, None)
-        if capture is None:
-            return None
-        sessions[flight_key] = capture
-        return capture
+        with self._lock:
+            flight_key = (session_id, key[0], key[1])
+            sessions = self.in_flight.setdefault(req_id, {})
+            if flight_key in sessions:
+                return None
+            capture = self.staged.get(req_id, {}).pop(key, None)
+            if capture is None:
+                return None
+            sessions[flight_key] = capture
+            return capture
 
     def taken_by(self, req_id: str, session_id: int, key: Tuple[str, int]) -> bool:
         """Is this block already in flight for this session?"""
-        return (session_id, key[0], key[1]) in self.in_flight.get(req_id, {})
+        with self._lock:
+            return (session_id, key[0], key[1]) in self.in_flight.get(req_id, {})
 
     def settle(
         self,
@@ -174,25 +186,26 @@ class _CaptureLedger:
         is released. A block that was captured again while this task ran keeps
         the newer entry; the settled one goes back to the arena.
         """
-        sessions = self.in_flight.get(req_id)
-        if not sessions:
-            return
-        for key, ok in outcomes.items():
-            capture = sessions.pop((session_id, key[0], key[1]), None)
-            if capture is None:
-                continue  # already settled, or never taken: nothing to release
-            if ok or req_id in self._retired:
-                self._release(capture)
-                continue
-            staged = self.staged.setdefault(req_id, {})
-            if key in staged:
-                # A fresher capture for the same block wins.
-                self._release(capture)
-            else:
-                staged[key] = capture
-        if not sessions:
-            self.in_flight.pop(req_id, None)
-            self._retired.discard(req_id)
+        with self._lock:
+            sessions = self.in_flight.get(req_id)
+            if not sessions:
+                return
+            for key, ok in outcomes.items():
+                capture = sessions.pop((session_id, key[0], key[1]), None)
+                if capture is None:
+                    continue  # settled already: nothing to release
+                if ok or req_id in self._retired:
+                    self._release(capture)
+                    continue
+                staged = self.staged.setdefault(req_id, {})
+                if key in staged:
+                    # A fresher capture for the same block wins.
+                    self._release(capture)
+                else:
+                    staged[key] = capture
+            if not sessions:
+                self.in_flight.pop(req_id, None)
+                self._retired.discard(req_id)
 
     def release_staged(self, req_id: str, blocks: "Sequence[int]") -> int:
         """Release the captures of these manager blocks (returns how many).
@@ -201,25 +214,27 @@ class _CaptureLedger:
         session that announced them allocated nothing), so their bytes are
         dead weight in the arena.
         """
-        staged = self.staged.get(req_id)
-        if not staged:
-            return 0
-        wanted = set(blocks)
-        released = 0
-        for key in [key for key in staged if key[1] in wanted]:
-            self._release(staged.pop(key))
-            released += 1
-        return released
+        with self._lock:
+            staged = self.staged.get(req_id)
+            if not staged:
+                return 0
+            wanted = set(blocks)
+            released = 0
+            for key in [key for key in staged if key[1] in wanted]:
+                self._release(staged.pop(key))
+                released += 1
+            return released
 
     def retire(self, req_id: str) -> int:
         """Release everything still waiting for a session; keep in-flight
         records until their tasks settle (see settle)."""
-        staged = self.staged.pop(req_id, {})
-        for capture in staged.values():
-            self._release(capture)
-        if req_id in self.in_flight:
-            self._retired.add(req_id)
-        return len(staged)
+        with self._lock:
+            staged = self.staged.pop(req_id, {})
+            for capture in staged.values():
+                self._release(capture)
+            if req_id in self.in_flight:
+                self._retired.add(req_id)
+            return len(staged)
 
 
 class ConnectorWorker:
@@ -236,11 +251,14 @@ class ConnectorWorker:
         coordinator_client: TpCoordinatorClient,
         register_response: Dict[str, Any],
         max_num_batched_tokens: int = 0,
+        max_num_seqs: int = 0,
     ) -> None:
         self._extra_config = extra_config
-        # The engine's per-step token budget (chunked prefill's chunk): the
-        # capture partition is sized from it (see DataTransferManager).
+        # The engine's per-step token budget (chunked prefill's chunk) and its
+        # cap on requests per step: the capture partition is sized from both
+        # (see DataTransferManager).
         self._max_num_batched_tokens = max_num_batched_tokens
+        self._max_num_seqs = max_num_seqs
         self._group_metas = group_metas
         self._num_groups = len(group_metas)
         self._manager_block_size = manager_block_size
@@ -407,6 +425,7 @@ class ConnectorWorker:
             self._coordinator_client,
             self._extra_config,
             max_num_batched_tokens=self._max_num_batched_tokens,
+            max_num_seqs=self._max_num_seqs,
         )
 
         logger.warning(

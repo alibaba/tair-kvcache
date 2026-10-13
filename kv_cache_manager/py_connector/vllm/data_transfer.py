@@ -175,8 +175,19 @@ class _StagingPool:
             )
 
     def _take_run(self, n: int, keep_reserved: bool = False) -> Optional[int]:
-        """Carve the first run of at least ``n`` slots; caller holds the lock."""
-        lists = [self._runs] if keep_reserved else [self._runs, self._reserved_runs]
+        """Carve the first run of at least ``n`` slots; caller holds the lock.
+
+        A transfer task looks in the reserve *first*: the shared runs are the
+        captures' room, and the loads are submitted before the same step's
+        captures (start_load_kv runs before wait_for_save), so a task that
+        took the shared area first would leave the reserve idle and the
+        captures withheld -- their bounded wait is only 50 ms, far less than an
+        SDK call. The reserve is a task's guaranteed room; the shared part is
+        borrowed only when its own batch does not fit the reserve.
+        """
+        lists = (
+            [self._reserved_runs, self._runs] if not keep_reserved else [self._runs]
+        )
         for runs in lists:
             for i, (start, length) in enumerate(runs):
                 if length >= n:
@@ -496,6 +507,7 @@ class DataTransferManager:
         coordinator_client: TpCoordinatorClient,
         extra_config: TairKvCacheConnectorExtraConfig,
         max_num_batched_tokens: int = 0,
+        max_num_seqs: int = 0,
     ) -> None:
         self._manager_block_size = manager_block_size
         # The engine's per-step token budget (the chunked-prefill chunk). The
@@ -503,6 +515,9 @@ class DataTransferManager:
         # report one, in which case every step must fit the whole arena (the
         # partition check then refuses any pool too small for that).
         self._max_num_batched_tokens = max_num_batched_tokens
+        # The scheduler's cap on the requests running in one step: each of them
+        # can complete a partial block, so the capture demand counts them too.
+        self._max_num_seqs = max_num_seqs
         self._transfer_client = transfer_client
         self._coordinator_client = coordinator_client
         self._extra_config = extra_config
@@ -538,8 +553,15 @@ class DataTransferManager:
         # windowed buckets, with no tuned ratio anywhere:
         #
         #  * one request-step can complete at most ``max_num_batched_tokens``
-        #    tokens (chunked prefill's chunk), i.e. cdiv(bound, mbs) manager
-        #    blocks -- the span the eager capture copies;
+        #    tokens (chunked prefill's chunk) in *total* for the batch, i.e.
+        #    cdiv(bound, mbs) manager blocks -- but the rounding is per request:
+        #    a decode step of one token still completes a whole block, so N
+        #    requests can complete N blocks from a 16-token step. The bound is
+        #    therefore cdiv(bound, mbs) + max_num_seqs: every request
+        #    contributes at most cdiv(t_i, mbs) <= (t_i + mbs - 1)/mbs blocks,
+        #    and summing over the batch's requests gives at most
+        #    ceil(sum/mbs) + (number of requests - 1) <= cdiv(bound, mbs) +
+        #    max_num_seqs, the scheduler's cap on the requests in one step;
         #  * the worker captures one contiguous run *per windowed bucket* and
         #    holds every run of a step before releasing any of them (a group's
         #    run cannot be split), so the pool must cover the sum over its
@@ -549,7 +571,10 @@ class DataTransferManager:
         #    every multi-block step and the windowed KV would silently never be
         #    published. That is refused here, loudly, with the numbers -- the
         #    same fail-closed stance as the rest of the stack.
-        step_blocks = -(-max(self._max_num_batched_tokens, 1) // manager_block_size)
+        step_blocks = (
+            -(-max(self._max_num_batched_tokens, 1) // manager_block_size)
+            + max(self._max_num_seqs, 0)
+        )
         for plan in plans:
             windowed = [
                 kvcache_info.groups[i].spec_name
@@ -827,16 +852,15 @@ class DataTransferManager:
                     group, remote_uris, staged_slots, n
                 )
                 # The staged branch (and only it) can fail a block that still
-                # holds captured bytes: a location that did not claim this
-                # spec while the capture holds its bytes. Such a block is never
-                # written, and this task owns every staged slot, so return the
-                # ones it will not write -- nothing else can (the written ones
-                # go back in _save_staged_blocks' finally).
-                for i in failed:
-                    if staged_slots[i] is not None:
-                        self._pools[group.spec_name].release(
-                            staged_slots[i], 1  # ty: ignore[invalid-argument-type]
-                        )
+                # holds captured bytes: a location that did not claim this spec
+                # while the capture holds its bytes. Nothing is written for it,
+                # and *no release happens here*: the slot belongs to the
+                # worker's capture ledger, and its settle is what decides --
+                # keeping the bytes staged for the retry that a later
+                # announcement may make them publishable (the same verdict a
+                # failed write gets), or releasing them if nothing can. A
+                # release here would race that settle and hand a live slot
+                # back to the arena.
             else:
                 skipped, failed = self._save_dispositions(
                     group, remote_uris, block_ids, n
