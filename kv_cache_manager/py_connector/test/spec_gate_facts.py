@@ -764,6 +764,14 @@ def _members(row: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return members
 
 
+def member_specs(row: Dict[str, Any], engine: Engine) -> Dict[str, Any]:
+    """The row's member spec objects (a wrapper row's buckets), by layer name."""
+    return {
+        layer_name: build_spec(member, engine)
+        for layer_name, member in _members(row).items()
+    }
+
+
 def needed_classes(row: Dict[str, Any]) -> List[str]:
     """The classes a row's *specs* need: its members' for a wrapper, else its own."""
     members = _members(row)
