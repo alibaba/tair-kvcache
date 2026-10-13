@@ -546,6 +546,9 @@ _MLA_SPEC_TYPES: Tuple[type, ...] = tuple(
 #: KpoolTailSpec is deliberately NOT here: same manager family, but its data
 #: path has not been shown to be rebuilt per request, so it stays refused when
 #: transferable (fail-closed).
+#:
+#: Matched by *exact* type, like every other acceptance rule here: a subclass of
+#: the ring is a new claim about the block's content and gets no exemption.
 _COMPRESSION_SCRATCH_TYPES: Tuple[type, ...] = tuple(
     cls for cls in (CircularBufferSpec,) if cls is not None
 )
@@ -727,16 +730,21 @@ def _is_engine_rebuilt_scratch(spec: Any) -> bool:
     a group the engine hands to connectors and does *not* rebuild would resume
     an external hit with uninitialized state.
 
+    Exact types again, wrapper included: a registered custom spec that
+    *subclasses* the ring (or packs a subclass) is a new claim about that
+    block's content, so it must not inherit the exemption -- it falls through
+    to the transferable-scratch refusal above.
+
     Eras that ship no ring class answer False, so the refusal stays in place.
     """
     if not _COMPRESSION_SCRATCH_TYPES:
         return False
-    members = getattr(spec, "kv_cache_specs", None)
-    if isinstance(members, dict):
+    if UniformTypeKVCacheSpecs is not None and type(spec) is UniformTypeKVCacheSpecs:
+        members = spec.kv_cache_specs
         return bool(members) and all(
-            isinstance(member, _COMPRESSION_SCRATCH_TYPES) for member in members.values()
+            type(member) in _COMPRESSION_SCRATCH_TYPES for member in members.values()
         )
-    return isinstance(spec, _COMPRESSION_SCRATCH_TYPES)
+    return type(spec) in _COMPRESSION_SCRATCH_TYPES
 
 
 def _compact_page_bytes(spec: Any, origin: str) -> int:

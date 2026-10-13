@@ -582,6 +582,48 @@ class TestTransferableScratch(RealEngineCase):
             captured.output,
         )
 
+    def test_an_undeclared_ring_subclass_is_refused(self):
+        # A custom spec subclassing the ring inherits no exemption: the
+        # engine-rebuilt exception matches exact types, so the group lands on
+        # the transferable-scratch refusal (fail-closed) -- for the spec itself
+        # and for a pack that contains it.
+        self._needs_scratch_contract("circular_buffer")
+        ring_cls = self.engine.class_of("CircularBufferSpec")
+        self.assertIsNotNone(ring_cls)
+        foo = type("FooRingSpec", (ring_cls,), {})
+        declared = facts.build_spec(facts.ROW_BY_NAME["circular_buffer"], self.engine)
+        subclass = object.__new__(foo)
+        subclass.__dict__.update(declared.__dict__)
+        group_cls = getattr(self.module, "KVCacheGroupSpec", None)
+        config_cls = getattr(self.module, "KVCacheConfig")
+        full = facts.build_spec(facts.ROW_BY_NAME["full"], self.engine)
+        config = config_cls(
+            num_blocks=1,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                group_cls(["ring"], subclass),
+                group_cls(["attn"], full),
+            ],
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertIn("FooRingSpec", str(ctx.exception))
+
+        wrapper = self.engine.class_of("UniformTypeKVCacheSpecs")
+        pack = wrapper.from_specs({"l.cb0": subclass, "l.cb1": subclass})
+        self.assertIsNotNone(pack)
+        config = config_cls(
+            num_blocks=1,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                group_cls(["l.cb0", "l.cb1"], pack),
+                group_cls(["attn"], full),
+            ],
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertIn("UniformTypeKVCacheSpecs", str(ctx.exception))
+
     def test_an_unknown_transferable_scratch_class_is_refused(self):
         # KpoolTailSpec: same manager family, but nothing shows its data path is
         # rebuilt per request, so a transferable group is refused (fail-closed).

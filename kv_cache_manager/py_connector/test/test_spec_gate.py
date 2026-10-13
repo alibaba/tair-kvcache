@@ -448,6 +448,42 @@ class TestTransferableScratchRefusal(unittest.TestCase):
             captured.output,
         )
 
+    def test_an_undeclared_ring_subclass_gets_no_exemption(self):
+        # A custom spec subclassing the ring is a new claim about the block's
+        # content, so it must not inherit "engine-rebuilt": it falls through to
+        # the transferable-scratch refusal (exact types everywhere else too).
+        ring_cls = self.engine.class_of("CircularBufferSpec")
+        assert ring_cls is not None
+        foo = type("FooRingSpec", (ring_cls,), {})
+        declared = facts.build_spec(facts.ROW_BY_NAME["circular_buffer"], self.engine)
+        ring = object.__new__(foo)
+        ring.__dict__.update(declared.__dict__)  # same state, different class
+        config = self._config((0, 1))
+        config.kv_cache_groups[0].kv_cache_spec = ring
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertIn("FooRingSpec", str(ctx.exception))
+
+    def test_a_ring_pack_of_undeclared_subclasses_gets_no_exemption(self):
+        # Same for the wrapper form: every member must be exactly the declared
+        # ring class.
+        ring_cls = self.engine.class_of("CircularBufferSpec")
+        wrapper_cls = self.engine.class_of("UniformTypeKVCacheSpecs")
+        assert ring_cls is not None and wrapper_cls is not None
+        foo = type("FooRingMember", (ring_cls,), {})
+        base = facts.build_spec(facts.ROW_BY_NAME["circular_buffer"], self.engine)
+        member = object.__new__(foo)
+        member.__dict__.update(base.__dict__)
+        pack = wrapper_cls.from_specs({"l.cb0": member, "l.cb1": member})
+        self.assertIsNotNone(pack)
+        config = self._config((0, 1))
+        config.kv_cache_groups[0] = SimpleNamespace(
+            layer_names=["l.cb0", "l.cb1"], kv_cache_spec=pack, is_eagle_group=False
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertIn("UniformTypeKVCacheSpecs", str(ctx.exception))
+
     def test_a_transferable_ring_pack_is_skipped_too(self):
         # The wrapper form (V4.1 packs the rings in a UniformTypeKVCacheSpecs):
         # every member is a ring, so the pack is engine-rebuilt scratch too.
