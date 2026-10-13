@@ -402,8 +402,12 @@ class TestTransferableScratchRefusal(unittest.TestCase):
     """Transfer membership and prefix-cacheability are different vLLM contracts.
 
     A scratch group (prefix_cacheable=False) that the engine still exposes for
-    transfer must not be dropped: the engine rebuilds only the groups it owns,
-    so an external hit would otherwise resume with that state uninitialized.
+    transfer must not be dropped *unless the engine rebuilds it per request*:
+    the engine rebuilds only the groups it owns, so an unexplained scratch
+    group would leave an external hit with uninitialized state. The proven
+    exception is the compression ring -- one block per request holding the raw
+    keys of the token group still being compressed, refilled by the compression
+    machinery -- so it is skipped even when transferable.
     """
 
     @classmethod
@@ -433,13 +437,46 @@ class TestTransferableScratchRefusal(unittest.TestCase):
             config.transfer_group_ids = tuple(transfer_ids)
         return config
 
-    def test_a_transferable_scratch_group_is_refused(self):
+    def test_a_transferable_compression_ring_is_skipped(self):
+        # V4.1's compressor group: the ring is rebuilt per request, so the
+        # transferable flag does not make dropping it a hole.
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured:
+            metas = parse_groups(self._config((0, 1)), 16, calculate_kv_scales=False)
+        self.assertEqual([1], [meta.group_idx for meta in metas])
+        self.assertTrue(
+            any("compression ring, refilled by the engine" in msg for msg in captured.output),
+            captured.output,
+        )
+
+    def test_a_transferable_ring_pack_is_skipped_too(self):
+        # The wrapper form (V4.1 packs the rings in a UniformTypeKVCacheSpecs):
+        # every member is a ring, so the pack is engine-rebuilt scratch too.
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured:
+            metas = parse_groups(
+                self._config((0, 1), row_name="wrapper_circular"),
+                16,
+                calculate_kv_scales=False,
+            )
+        self.assertEqual([1], [meta.group_idx for meta in metas])
+        self.assertTrue(
+            any(
+                "UniformTypeKVCacheSpecs" in msg and "compression ring" in msg
+                for msg in captured.output
+            ),
+            captured.output,
+        )
+
+    def test_an_unknown_transferable_scratch_class_is_refused(self):
+        # KpoolTailSpec is the same manager family but its data path has not
+        # been shown to be rebuilt per request: fail closed instead of dropping
+        # a group the engine hands to connectors.
         with self.assertRaises(NotImplementedError) as ctx:
-            parse_groups(self._config((0, 1)), 16, calculate_kv_scales=False)
+            parse_groups(
+                self._config((0, 1), row_name="kpool_tail"), 16, calculate_kv_scales=False
+            )
         message = str(ctx.exception)
-        self.assertIn("CircularBufferSpec", message)
+        self.assertIn("KpoolTailSpec", message)
         self.assertIn("enable_kv_transfer=True", message)
-        self.assertIn("refused", message)
 
     def test_a_non_transferable_scratch_group_is_still_skipped(self):
         with self.assertLogs(LOGGER_NAME, level="WARNING") as captured:
@@ -451,10 +488,20 @@ class TestTransferableScratchRefusal(unittest.TestCase):
         )
 
     def test_an_era_without_the_projection_still_skips(self):
-        # <= 0.29 has no enable_kv_transfer: nothing engine-side expects the
-        # group, so dropping it stays the behaviour (and its log says why).
+        # <= 0.28 has no enable_kv_transfer: nothing engine-side expects the
+        # group, so dropping it stays the behaviour (the log still says why).
         with self.assertLogs(LOGGER_NAME, level="WARNING") as captured:
             metas = parse_groups(self._config(None), 16, calculate_kv_scales=False)
+        self.assertEqual([1], [meta.group_idx for meta in metas])
+        self.assertTrue(
+            any("compression ring" in msg for msg in captured.output), captured.output
+        )
+        # An unexplained scratch class takes the generic path: no projection,
+        # nothing engine-side, so it is dropped with the escape hatch named.
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured:
+            metas = parse_groups(
+                self._config(None, row_name="kpool_tail"), 16, calculate_kv_scales=False
+            )
         self.assertEqual([1], [meta.group_idx for meta in metas])
         self.assertTrue(
             any("name it in vllm_common.py" in msg for msg in captured.output),

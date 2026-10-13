@@ -494,7 +494,12 @@ class TestTransferProjection(RealEngineCase):
 
 
 class TestTransferableScratch(RealEngineCase):
-    """A transferable scratch group is refused, not dropped (0.29+)."""
+    """A transferable scratch group is refused -- unless the engine rebuilds it.
+
+    The compression ring (V4.1's CircularBufferSpec) is rebuilt per request, so
+    it is skipped even though the engine exposes it; an unexplained scratch
+    class stays refused (fail-closed).
+    """
 
     def _config(self, spec_row, enable_kv_transfer):
         group_cls = getattr(self.module, "KVCacheGroupSpec", None)
@@ -519,27 +524,77 @@ class TestTransferableScratch(RealEngineCase):
             ],
         )
 
-    def test_a_transferable_scratch_group_is_refused(self):
-        # enable_kv_transfer=True (the default) exposes the group to
-        # connectors, so dropping it would leave its state uninitialized on an
-        # external hit -- and this connector has no layout for it yet. Only
-        # where the era's own spec declares the scratch contract (0.29's
-        # CircularBufferSpec has no slot/views flag, so the gate owns it there).
-        row = facts.ROW_BY_NAME["circular_buffer"]
+    def _needs_scratch_contract(self, spec_row):
+        row = facts.ROW_BY_NAME[spec_row]
         if self.version not in facts.skip_eras(row):
             self.skipTest(f"vLLM {self.version} does not declare {row['cls']} scratch")
+
+    def test_a_transferable_compression_ring_is_skipped(self):
+        # enable_kv_transfer=True (the default) exposes the group to
+        # connectors, but the ring is rebuilt per request by the compression
+        # machinery ("one block per request holding the raw keys of the token
+        # group that is still being compressed"), so dropping it is not a hole
+        # -- an external hit restores the main MLA rows and the ring refills.
+        self._needs_scratch_contract("circular_buffer")
         config = self._config("circular_buffer", True)
         self.assertEqual((0, 1), config.transfer_group_ids)
+        with self.assertLogs(
+            "kv_cache_manager.py_connector.common.logger", level="WARNING"
+        ) as captured:
+            metas = parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertEqual([1], [meta.group_idx for meta in metas])
+        self.assertTrue(
+            any("compression ring" in msg for msg in captured.output), captured.output
+        )
+
+    def test_a_transferable_ring_pack_is_skipped(self):
+        # The wrapper form: V4.1 packs the compressor rings into one
+        # UniformTypeKVCacheSpecs, and every member being a ring is what makes
+        # the pack engine-rebuilt scratch.
+        self._needs_scratch_contract("circular_buffer")
+        wrapper = self.engine.class_of("UniformTypeKVCacheSpecs")
+        self.assertIsNotNone(wrapper)
+        rings = facts.build_spec(facts.ROW_BY_NAME["circular_buffer"], self.engine)
+        group = wrapper.from_specs({"l.cb0": rings, "l.cb1": rings})
+        self.assertIsNotNone(group)
+        group_cls = getattr(self.module, "KVCacheGroupSpec", None)
+        config = getattr(self.module, "KVCacheConfig")(
+            num_blocks=1,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                group_cls(["l.cb0", "l.cb1"], group),
+                group_cls(
+                    ["attn"], facts.build_spec(facts.ROW_BY_NAME["full"], self.engine)
+                ),
+            ],
+        )
+        self.assertEqual((0, 1), config.transfer_group_ids)
+        with self.assertLogs(
+            "kv_cache_manager.py_connector.common.logger", level="WARNING"
+        ) as captured:
+            metas = parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertEqual([1], [meta.group_idx for meta in metas])
+        self.assertTrue(
+            any(
+                "UniformTypeKVCacheSpecs" in msg and "compression ring" in msg
+                for msg in captured.output
+            ),
+            captured.output,
+        )
+
+    def test_an_unknown_transferable_scratch_class_is_refused(self):
+        # KpoolTailSpec: same manager family, but nothing shows its data path is
+        # rebuilt per request, so a transferable group is refused (fail-closed).
+        self._needs_scratch_contract("kpool_tail")
+        config = self._config("kpool_tail", True)
         with self.assertRaises(NotImplementedError) as ctx:
             parse_groups(config, 16, calculate_kv_scales=False)
         message = str(ctx.exception)
-        self.assertIn("CircularBufferSpec", message)
+        self.assertIn("KpoolTailSpec", message)
         self.assertIn("enable_kv_transfer=True", message)
 
     def test_a_scratch_group_the_engine_owns_is_still_skipped(self):
-        row = facts.ROW_BY_NAME["circular_buffer"]
-        if self.version not in facts.skip_eras(row):
-            self.skipTest(f"vLLM {self.version} does not declare {row['cls']} scratch")
+        self._needs_scratch_contract("circular_buffer")
         config = self._config("circular_buffer", False)
         self.assertEqual((1,), config.transfer_group_ids)
         with self.assertLogs(

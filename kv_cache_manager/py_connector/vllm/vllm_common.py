@@ -63,6 +63,10 @@ try:
     from vllm.v1.kv_cache_interface import TQFullAttentionSpec  # ty: ignore[unresolved-import]
 except ImportError:  # pragma: no cover - other vLLM eras
     TQFullAttentionSpec = None  # ty: ignore[invalid-assignment]
+try:
+    from vllm.v1.kv_cache_interface import CircularBufferSpec  # ty: ignore[unresolved-import]
+except ImportError:  # pragma: no cover - vllm <= 0.28 has no compression ring
+    CircularBufferSpec = None  # ty: ignore[invalid-assignment]
 
 from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.vllm.transfer_types import (
@@ -529,6 +533,23 @@ _MLA_SPEC_TYPES: Tuple[type, ...] = tuple(
     cls for cls in (MLAAttentionSpec, HiddenStateCacheSpec) if cls is not None
 )
 
+#: Scratch classes the *engine* rebuilds per request, so a connector may drop
+#: them even when vLLM advertises them for transfer (see parse_groups):
+#:
+#: CircularBufferSpec -- "one block per request holding the raw keys of the
+#: token group that is still being compressed" (0.31 docstring), claimed for
+#: the request's lifetime by CircularBufferManager ("Claims the ring's single
+#: block per request; prefix caching disabled"), i.e. the compression machinery
+#: refills it every request. An external hit restores the *main* MLA group's
+#: prefix rows and the compressor rebuilds the ring around them.
+#:
+#: KpoolTailSpec is deliberately NOT here: same manager family, but its data
+#: path has not been shown to be rebuilt per request, so it stays refused when
+#: transferable (fail-closed).
+_COMPRESSION_SCRATCH_TYPES: Tuple[type, ...] = tuple(
+    cls for cls in (CircularBufferSpec,) if cls is not None
+)
+
 
 def _check_attention_spec_supported(
     origin: str, spec: Any, *, calculate_kv_scales: bool
@@ -692,6 +713,30 @@ def _is_scratch_spec(spec: Any) -> bool:
     return not getattr(spec, "uses_slot_mapping", True) or not getattr(
         spec, "has_layer_views", True
     )
+
+
+def _is_engine_rebuilt_scratch(spec: Any) -> bool:
+    """Is this engine-rebuilt scratch, i.e. may a *transferable* group be dropped?
+
+    The one proven case is the compression ring: CircularBufferSpec (and a
+    UniformTypeKVCacheSpecs whose members are all rings, the shape V4.1 packs)
+    holds the raw keys of the in-flight token group for one request, and the
+    compression machinery refills it there -- an external hit restores the main
+    MLA group and the ring is rebuilt around it. Everything else that is
+    scratch *and* transferable is refused instead (see parse_groups): dropping
+    a group the engine hands to connectors and does *not* rebuild would resume
+    an external hit with uninitialized state.
+
+    Eras that ship no ring class answer False, so the refusal stays in place.
+    """
+    if not _COMPRESSION_SCRATCH_TYPES:
+        return False
+    members = getattr(spec, "kv_cache_specs", None)
+    if isinstance(members, dict):
+        return bool(members) and all(
+            isinstance(member, _COMPRESSION_SCRATCH_TYPES) for member in members.values()
+        )
+    return isinstance(spec, _COMPRESSION_SCRATCH_TYPES)
 
 
 def _compact_page_bytes(spec: Any, origin: str) -> int:
@@ -931,6 +976,9 @@ def parse_groups(
     *does* expose for transfer (vLLM 0.29+ default: enable_kv_transfer=True) is
     refused rather than dropped: the engine rebuilds only the groups it owns,
     so an external hit would otherwise resume with that state uninitialized.
+    The one exception is scratch the engine itself rebuilds per request -- the
+    compression ring (see _is_engine_rebuilt_scratch) -- which is skipped even
+    when transferable.
     """
     metas: List[GroupMeta] = []
     transferable = _transferable_groups(kv_cache_config)
@@ -954,7 +1002,8 @@ def parse_groups(
             )
             continue
         if _is_scratch_spec(group.kv_cache_spec):
-            if declares_projection:
+            engine_rebuilt = _is_engine_rebuilt_scratch(group.kv_cache_spec)
+            if declares_projection and not engine_rebuilt:
                 raise NotImplementedError(
                     f"group {idx}: {type(group.kv_cache_spec).__name__} is "
                     f"per-request scratch (prefix_cacheable=False) yet the engine "
@@ -964,15 +1013,25 @@ def parse_groups(
                     f"has no transfer layout for it, so the instance is refused "
                     f"rather than resumed with uninitialized state"
                 )
-            logger.warning(
-                "skip %s group %d (%d layers): the class declares itself out of "
-                "the prefix cache (prefix_cacheable=False and no slot mapping or "
-                "no layer views), so the manager has nothing to serve; if this "
-                "class is meant to be cached, name it in vllm_common.py instead",
-                type(group.kv_cache_spec).__name__,
-                idx,
-                len(group.layer_names),
-            )
+            if engine_rebuilt:
+                logger.warning(
+                    "skip %s group %d (%d layers): per-request compression ring, "
+                    "refilled by the engine for every request (not prefix KV)",
+                    type(group.kv_cache_spec).__name__,
+                    idx,
+                    len(group.layer_names),
+                )
+            else:
+                logger.warning(
+                    "skip %s group %d (%d layers): the class declares itself out "
+                    "of the prefix cache (prefix_cacheable=False and no slot "
+                    "mapping or no layer views), so the manager has nothing to "
+                    "serve; if this class is meant to be cached, name it in "
+                    "vllm_common.py instead",
+                    type(group.kv_cache_spec).__name__,
+                    idx,
+                    len(group.layer_names),
+                )
             continue
         metas.extend(
             _parse_group(

@@ -154,6 +154,11 @@ def declares_transfer_projection(engine: "Engine") -> bool:
     return engine.version in TRANSFER_PROJECTION_ERAS
 
 
+def _is_compression_ring_row(row: Dict[str, Any]) -> bool:
+    """Is every spec this row builds a compression ring (CircularBufferSpec)?"""
+    return set(needed_classes(row)) == {"CircularBufferSpec"}
+
+
 def skip_eras(row: Dict[str, Any]) -> Tuple[str, ...]:
     """The eras whose spec declares the whole scratch contract for this row."""
     if row["cls"] == "UniformTypeKVCacheSpecs":
@@ -177,14 +182,21 @@ def expected_outcome(row: Dict[str, Any], engine: "Engine") -> str:
     not be exposed to connectors. Where either half is missing a scratch group
     is not dropped -- an era that still claims it is refused by the gate, and a
     group the engine hands to connectors (transferable, the vLLM default)
-    is refused by parse_groups instead of being silently dropped.
+    is refused by parse_groups instead of being silently dropped -- except the
+    compression ring, which the engine rebuilds per request.
     """
     if row["disposition"] != "skip":
         return row["disposition"]
     if engine.version not in skip_eras(row):
         return "refuse"
     if declares_transfer_projection(engine) and row.get("transferable", True):
-        return "refuse"
+        # A transferable scratch group is refused -- unless the engine itself
+        # rebuilds it per request. The compression ring is the proven case
+        # (CircularBufferSpec: "one block per request holding the raw keys of
+        # the token group that is still being compressed", refilled by the
+        # compression machinery), including V4.1's UniformType pack of rings.
+        if not _is_compression_ring_row(row):
+            return "refuse"
     return "skip"
 
 
