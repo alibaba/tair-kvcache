@@ -708,8 +708,8 @@ class ConnectorScheduler:
         self._ingest_scheduled_reqs(scheduler_output)
         self._dispatch_incremental_saves(meta, scheduler_output)
         self._collect_load_instructions(meta)
-        self._collect_release_captures(meta)
         self._collect_save_instructions(meta)
+        self._collect_release_captures(meta)
         self._collect_finish_instructions(meta)
         return meta
 
@@ -914,6 +914,15 @@ class ConnectorScheduler:
             save_req.all_block_ids = [list(b) for b in ledger.block_ids_per_group]
             meta.add_save_request(save_req)
             ledger.sent_saving_count += 1
+            # This session's plan is in the worker's hands from here on. It no
+            # longer protects captured blocks: the worker runs save plans
+            # before release instructions within a step (wait_for_save), and any
+            # release the scheduler computed while this session was still
+            # in flight already excluded its blocks -- so once the plan is
+            # handed over, a later mask-derived release can only return bytes
+            # the plan did not take (kept for a retry when its write failed,
+            # see _save_staged_blocks).
+            self._retire_session_protection(save_req.req_id, save_req.session_id)
             if (
                 ledger.need_report_after_saving_finished
                 and ledger.scheduled_saving_count == ledger.sent_saving_count
@@ -1039,8 +1048,11 @@ class ConnectorScheduler:
             response = self._manager_client.start_write_cache(request)
         except Exception as e:
             # No locations were allocated: this session will write nothing, so
-            # it protects nothing either.
+            # it protects nothing and its captures are releasable (they would
+            # otherwise be pinned until the request retires, because the save
+            # watermark has already moved past their blocks).
             self._remember_session_plan(req_id, session_id, ())
+            self._queue_capture_release(req_id, session_id, target_save_num)
             logger.warning("start_write_cache error, skip saving: %s", e)
             with self._canceled_save_request_ids_lock:
                 self._canceled_save_request_ids.append(req_id)
@@ -1079,10 +1091,7 @@ class ConnectorScheduler:
             # session of this request is about to write (the same guard as
             # below -- "already has a location" is not "already written").
             self._remember_session_plan(req_id, session_id, ())
-            protected = self._blocks_other_sessions_write(req_id, session_id)
-            releasable = [b for b in range(target_save_num) if b not in protected]
-            with self._pending_release_captures_lock:
-                self._pending_release_captures.append((req_id, releasable))
+            self._queue_capture_release(req_id, session_id, target_save_num)
             try:
                 self._manager_client.finish_write_cache(
                     {
@@ -1107,18 +1116,13 @@ class ConnectorScheduler:
         )
         self._remember_session_plan(req_id, session_id, need_block_idx)
         already = self.parse_block_mask_to_existing_indices(response, target_save_num)
-        protected = self._blocks_other_sessions_write(req_id, session_id)
-        already = [block for block in already if block not in protected]
         if already:
             # The manager already holds these blocks and no concurrent session
             # of this request is about to write them, so the worker's eager
             # capture for them has nothing to publish and must give its arena
             # slots back now, not when the request retires (a long duplicate
             # request would otherwise pin one slot per already-cached block).
-            # The scheduler loop flushes this into the metadata (the http
-            # thread has none).
-            with self._pending_release_captures_lock:
-                self._pending_release_captures.append((req_id, already))
+            self._queue_capture_release(req_id, session_id, target_save_num, already)
         message = CoordinateMessage(
             time.time(),
             SendBlockStartEvent(
@@ -1131,7 +1135,13 @@ class ConnectorScheduler:
 
         with self._waiting_to_save_requests_lock:
             self._waiting_to_save_requests.append(
-                SaveRequest(req_id, locations, need_block_idx, write_session_id)
+                SaveRequest(
+                    req_id,
+                    locations,
+                    need_block_idx,
+                    write_session_id,
+                    session_id=session_id,
+                )
             )
 
     def handle_canceled_save_req(self) -> None:
@@ -1156,6 +1166,39 @@ class ConnectorScheduler:
         # Only rank0 reports finished requests.
         return 1
 
+    def _queue_capture_release(
+        self,
+        req_id: str,
+        session_id: int,
+        target_save_num: int,
+        blocks: Optional[List[int]] = None,
+    ) -> None:
+        """Queue the captures of blocks no session of this request will write.
+
+        The candidates come from the manager (a block mask reporting locations,
+        or a failed announcement whose blocks no session allocated), and every
+        other session's claim is held back (see _blocks_other_sessions_write).
+        The scheduler loop flushes the queue into the metadata; the http threads
+        have no metadata of their own.
+        """
+        protected = self._blocks_other_sessions_write(req_id, session_id)
+        if blocks is None:
+            blocks = list(range(target_save_num))
+        releasable = [block for block in blocks if block not in protected]
+        if not releasable:
+            return
+        with self._pending_release_captures_lock:
+            self._pending_release_captures.append((req_id, releasable))
+
+    def _retire_session_protection(self, req_id: str, session_id: int) -> None:
+        """Stop holding back this session's blocks (see _blocks_other_sessions_write)."""
+        with self._announced_sessions_lock:
+            sessions = self._announced_sessions.get(req_id)
+            if sessions is None or session_id not in sessions:
+                return
+            target, plan, _sent = sessions[session_id]
+            sessions[session_id] = (target, plan, True)
+
     def _record_announcement(self, req_id: str, target_save_num: int) -> int:
         """Note that a write session for [0, target_save_num) is now in flight.
 
@@ -1169,6 +1212,7 @@ class ConnectorScheduler:
             self._announced_sessions.setdefault(req_id, {})[session_id] = (
                 target_save_num,
                 None,
+                False,
             )
         return session_id
 
@@ -1185,11 +1229,13 @@ class ConnectorScheduler:
         """
         protected: Set[int] = set()
         with self._announced_sessions_lock:
-            for session_id, (target, plan) in self._announced_sessions.get(
+            for session_id, (target, plan, sent) in self._announced_sessions.get(
                 req_id, {}
             ).items():
                 if session_id == own_session:
                     continue  # the session answering right now
+                if sent:
+                    continue  # already handed to the worker; see _collect_save_instructions
                 protected |= plan if plan is not None else set(range(target))
         return protected
 
@@ -1200,8 +1246,8 @@ class ConnectorScheduler:
         with self._announced_sessions_lock:
             sessions = self._announced_sessions.get(req_id)
             if sessions is not None and session_id in sessions:
-                target, _plan = sessions[session_id]
-                sessions[session_id] = (target, set(plan))
+                target, _plan, sent = sessions[session_id]
+                sessions[session_id] = (target, set(plan), sent)
 
     def parse_block_mask_to_save_indices(
         self, response: dict, target_save_num: int
