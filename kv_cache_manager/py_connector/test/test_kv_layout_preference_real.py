@@ -169,10 +169,17 @@ class TestNegotiatedLayout(RealEngineCase):
         cls.utils = utils
 
     def resolve_layout(self, candidates, architectures, specs=None) -> str:
+        import vllm.envs as envs
+
         config = _config(architectures)
-        resolved = self.utils.resolve_kv_cache_layout(
-            config, [list(candidates)], specs or None
-        )
+        # The environment override is a supported deployment setting and the
+        # resolver gives it precedence over any connector preference, so it is
+        # cleared around the call -- the suite tests the connector's own
+        # preference deterministically (the legacy-era test does the same).
+        with mock.patch.object(envs, "VLLM_KV_CACHE_LAYOUT", None):
+            resolved = self.utils.resolve_kv_cache_layout(
+                config, [list(candidates)], specs or None
+            )
         # The engine records the resolution on the cache config it was handed.
         self.assertEqual(config.cache_config.kv_cache_layout, resolved.name)
         return resolved.name

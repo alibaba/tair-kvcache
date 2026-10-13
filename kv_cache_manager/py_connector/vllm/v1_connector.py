@@ -176,7 +176,12 @@ def _resolved_architecture(
     a really packed model fails registration with the layout assertion (the
     safe direction)."""
     resolved = getattr(model_config, "architecture", None)
-    if isinstance(resolved, str) and resolved in architectures:
+    if isinstance(resolved, str) and resolved:
+        # Trust the resolution as-is: with model_impl="transformers" the
+        # field carries the backend name (e.g. TransformersForCausalLM),
+        # which is deliberately absent from the checkpoint's architectures --
+        # a membership check would discard it and fall back to the raw name,
+        # moving a standard-backend model onto the packed-block layout.
         return resolved
     try:
         from vllm.model_executor.models.registry import ModelRegistry
