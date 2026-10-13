@@ -200,6 +200,11 @@ class _RecordingDTM:
         return self.pool
 
 
+def released_blocks(meta) -> list:
+    """The (req_id, blocks) pairs a metadata carries, ignoring the URIs."""
+    return [(req_id, blocks) for req_id, blocks, _uris in meta.to_release_captures]
+
+
 def worker_with(groups: List[AttentionTransferGroup], dtm: Any = None) -> Any:
     """A bare ConnectorWorker whose transfer groups are the given ones.
 
@@ -596,9 +601,12 @@ class TestWindowedSpecGroups(unittest.TestCase):
         conn.wait_for_save(meta)
         self.assertEqual(16, len(plans[0][0].staged_slots))
         self.assertNotIn(None, plans[0][0].staged_slots)
-        conn._captures.settle(
-            "r0", 0, {("tp0_g0", b): True for b in range(16)}
-        )
+        # A local success keeps the bytes until the *committed* state is known
+        # (a block is written only when every rank wrote it): the settle
+        # stages them again, and the manager's confirmation releases them.
+        conn._captures.settle("r0", 0, {("tp0_g0", b): True for b in range(16)})
+        self.assertEqual(16, len(conn._staged["r0"]))
+        conn._captures.release_staged("r0", list(range(16)))
         deadline = time.time() + 5
         while pool.free_blocks != 62 and time.time() < deadline:
             time.sleep(0.01)
@@ -735,7 +743,7 @@ class TestWindowedSpecGroups(unittest.TestCase):
         meta = TairKvCacheConnectorMetadata(epoch=0)
         sched._collect_release_captures(meta)
         # Nothing may be released: session A still has to write 0-15.
-        self.assertEqual([], meta.to_release_captures)
+        self.assertEqual([], released_blocks(meta))
         # ... and with nothing released, A's write finds all 16 of its blocks.
         meta.add_save_request(
             SaveRequest(
@@ -758,11 +766,13 @@ class TestWindowedSpecGroups(unittest.TestCase):
                 plan.staged_slots,
                 "the concurrent session's release stripped A's captured bytes",
             )
-        # A's write landed; its slots come back when the session settles (the
-        # callback is what returns them now), while B's 16 blocks (2 buckets)
-        # are still captured for the session that has not run yet.
+        # A's write landed: the settle keeps its bytes (a block commits only
+        # when every rank wrote it) and the manager's confirmation releases
+        # them, while B's 16 blocks (2 buckets) are still captured for the
+        # session that has not run yet.
         for spec in ("tp0_g0", "tp0_g1"):
             conn._captures.settle("r0", 0, {(spec, b): True for b in range(16)})
+            conn._captures.release_staged("r0", list(range(16)))
         deadline = time.time() + 5
         while pool.free_blocks != 96 and time.time() < deadline:
             time.sleep(0.01)
@@ -794,7 +804,7 @@ class TestWindowedSpecGroups(unittest.TestCase):
         )
         meta = TairKvCacheConnectorMetadata(epoch=0)
         sched._collect_release_captures(meta)
-        self.assertEqual([], meta.to_release_captures)
+        self.assertEqual([], released_blocks(meta))
 
     def test_an_unanswered_announcement_protects_its_blocks(self):
         # The same guard has to cover a session whose response has not come
@@ -824,7 +834,7 @@ class TestWindowedSpecGroups(unittest.TestCase):
         )
         meta = TairKvCacheConnectorMetadata(epoch=0)
         sched._collect_release_captures(meta)
-        self.assertEqual([], meta.to_release_captures)
+        self.assertEqual([], released_blocks(meta))
 
     def test_a_batch_release_waits_for_the_save_plans(self):
         # A release and a session's SaveRequest can ride in one batch (the
@@ -933,7 +943,7 @@ class TestWindowedSpecGroups(unittest.TestCase):
         # The whole announced prefix is releasable: A's session is in the
         # worker's hands and B writes nothing at all. While A still protected
         # its blocks, 0-15 would be held back and only 16-31 released.
-        self.assertEqual([("r0", list(range(32)))], release.to_release_captures)
+        self.assertEqual([("r0", list(range(32)))], released_blocks(release))
 
     def test_a_failed_announcement_releases_its_unprotected_captures(self):
         # start_write_cache raising means this session allocates and writes
@@ -954,7 +964,7 @@ class TestWindowedSpecGroups(unittest.TestCase):
         )
         release = TairKvCacheConnectorMetadata(epoch=0)
         sched._collect_release_captures(release)
-        self.assertEqual([("r0", list(range(16)))], release.to_release_captures)
+        self.assertEqual([("r0", list(range(16)))], released_blocks(release))
 
         # ... but a concurrent session that may still write those blocks keeps
         # them, exactly like the all-existing path.
@@ -966,7 +976,7 @@ class TestWindowedSpecGroups(unittest.TestCase):
         self.assertNotEqual(protecting, session2)
         later = TairKvCacheConnectorMetadata(epoch=0)
         sched._collect_release_captures(later)
-        self.assertEqual([], later.to_release_captures)
+        self.assertEqual([], released_blocks(later))
 
     def test_existing_blocks_release_their_captures(self):
         # StartWriteCache reporting that the manager already holds a block means
@@ -992,7 +1002,7 @@ class TestWindowedSpecGroups(unittest.TestCase):
         )
         meta = TairKvCacheConnectorMetadata(epoch=0)
         conn._collect_release_captures(meta)
-        self.assertEqual(meta.to_release_captures, [("r0", [0, 1])])
+        self.assertEqual(released_blocks(meta), [("r0", [0, 1])])
 
     def test_an_all_existing_response_releases_every_announced_block(self):
         conn = make_connector_scheduler(
@@ -1015,7 +1025,7 @@ class TestWindowedSpecGroups(unittest.TestCase):
         )
         meta = TairKvCacheConnectorMetadata(epoch=0)
         conn._collect_release_captures(meta)
-        self.assertEqual(meta.to_release_captures, [("r0", [0, 1, 2])])
+        self.assertEqual(released_blocks(meta), [("r0", [0, 1, 2])])
 
     def test_announcement_and_capture_classify_the_same_blocks(self):
         # (two groups: one windowed, one full -- the shape whose announcement
@@ -1059,6 +1069,60 @@ class TestWindowedSpecGroups(unittest.TestCase):
         # when the window moves away.
         self.assertEqual([True], sched._announced_window_mask("r0", [False]))
 
+    def test_window_claims_are_serialized(self):
+        # Overlapping start_save_kvcache_async calls for one request run on
+        # different http-executor threads: the claim is a read-modify-write,
+        # and a lost update can leave "no window" behind bytes that are staged
+        # (no retry could ever announce them). One transition must hold the
+        # sequence against the others.
+        import threading
+
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+
+        class _SlowClaims(dict):
+            def __init__(self) -> None:
+                super().__init__()
+                self.entered = threading.Event()
+                self.proceed = threading.Event()
+                self.slow = True
+
+            def get(self, key, *args):
+                if self.slow:
+                    self.slow = False
+                    self.entered.set()
+                    self.proceed.wait(timeout=5)
+                return super().get(key, *args)
+
+        sched._window_claims = {"r0": _SlowClaims()}
+        other_done = threading.Event()
+
+        first = threading.Thread(
+            target=lambda: sched._announced_window_mask("r0", [True])
+        )
+        second = threading.Thread(
+            target=lambda: (
+                sched._announced_window_mask("r0", [True]),
+                other_done.set(),
+            )
+        )
+        first.start()
+        self.assertTrue(
+            sched._window_claims["r0"].entered.wait(timeout=5),
+            "the first update never reached the claim read",
+        )
+        second.start()
+        self.assertFalse(
+            other_done.wait(timeout=0.3),
+            "a claim update ran while another held the sequence",
+        )
+        sched._window_claims["r0"].proceed.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+        self.assertTrue(other_done.is_set())
+        self.assertEqual({0: True}, sched._window_claims["r0"])
+
     def test_a_queued_release_is_rechecked_against_newer_sessions(self):
         # A failed announcement queues a release for its blocks; a session
         # created afterwards re-announces and recaptures the same block. The
@@ -1075,7 +1139,7 @@ class TestWindowedSpecGroups(unittest.TestCase):
         sched._queue_capture_release("r0", first, 16)
         meta = TairKvCacheConnectorMetadata(epoch=0)
         sched._collect_release_captures(meta)
-        self.assertEqual([("r0", list(range(16)))], meta.to_release_captures)
+        self.assertEqual([("r0", list(range(16)))], released_blocks(meta))
 
         # Now the release is queued and a *newer* session re-announces and
         # recaptures blocks 0-1 before the flush: their captures must survive.
@@ -1084,7 +1148,7 @@ class TestWindowedSpecGroups(unittest.TestCase):
         sched._remember_session_plan("r0", second, {0, 1})
         stale = TairKvCacheConnectorMetadata(epoch=0)
         sched._collect_release_captures(stale)
-        self.assertEqual([("r0", list(range(2, 16)))], stale.to_release_captures)
+        self.assertEqual([("r0", list(range(2, 16)))], released_blocks(stale))
 
 
 class TestWindowedHitClamp(unittest.TestCase):
@@ -1457,12 +1521,13 @@ class TestCaptureDispositions(unittest.TestCase):
             self.assertEqual([True, True], verdicts)
         # Every slot went back to the arena it came from, exactly once -- via
         # the capture ledger's settle, which is the only release point.
-        conn._captures.settle(
-            "r0", 0, {("tp0_g0", b): True for b in (0, 1)}
-        )
-        conn._captures.settle(
-            "r0", 0, {("tp0_g0_b1", b): True for b in (0, 1)}
-        )
+        conn._captures.settle("r0", 0, {("tp0_g0", b): True for b in (0, 1)})
+        conn._captures.settle("r0", 0, {("tp0_g0_b1", b): True for b in (0, 1)})
+        # Local success retains (a block is committed only when every rank
+        # wrote it): the confirmation releases both arenas' slots (one entry
+        # per bucket and block).
+        self.assertEqual(4, len(conn._staged["r0"]))
+        conn._captures.release_staged("r0", [0, 1])
         self.assertEqual(8, pool_a.free_blocks)
         self.assertEqual(8, pool_b.free_blocks)
 
@@ -1903,6 +1968,10 @@ class TestCaptureSlotInvariant(unittest.TestCase):
         self.assertNotIn(None, retry.staged_slots)
         self._run_session(conn, dtm, group, retry, blocks, session=2)
         self._invariant(conn, pool, "after the retry")
+        # The retry's local success keeps the bytes until the commit is known
+        # (see the ledger's settle): the confirmation releases them.
+        conn._captures.release_staged("r0", blocks)
+        self._invariant(conn, pool, "after the confirmation")
         self.assertEqual(self.CAPACITY, pool.free_blocks)
 
     def test_a_repeat_capture_keeps_both_sessions_ownership(self):
@@ -2045,6 +2114,10 @@ class TestCaptureSlotInvariant(unittest.TestCase):
 
         ledger._release = slow_release  # ty: ignore[method-assign]
         second_done = threading.Event()
+
+        # A retired request's settle releases inside the lock (that is the
+        # release path these two transitions contend on).
+        ledger.retire("r0")
 
         def first_settle():
             ledger.settle("r0", 1, {("tp0_g0", 0): True})
@@ -2208,6 +2281,38 @@ class TestCaptureFloor(unittest.TestCase):
         again = pool2.acquire(4, timeout=0.01, keep_reserved=True)
         self.assertIsNotNone(again, "the floor did not come back")
         pool2.release(again, 4)
+
+    def test_one_step_spends_one_deadline_across_requests(self):
+        # The budget belongs to the step: two capture requests must not each
+        # get a fresh 50 ms (the engine thread pays for both).
+        groups = [windowed_group("tp0_g0", group_idx=0)]
+        pool = _StagingPool(torch.device("cpu"), 4096, 32, reserved_blocks=8)
+        seen: List[float] = []
+
+        class _SlowFirst:
+            def pool_of(self, group):
+                return pool
+
+            def capture_blocks(self, group, slots, timeout):
+                seen.append(timeout)
+                if len(seen) == 1:
+                    time.sleep(0.3)
+                return pool.acquire(len(slots), timeout=timeout, keep_reserved=True)
+
+        conn = worker_with(groups, _SlowFirst())
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        for req_id in ("r0", "r1"):
+            meta.add_capture_request(
+                CaptureRequest(req_id, [0], all_block_ids=[[7]])
+            )
+        with mock.patch(
+            "kv_cache_manager.py_connector.vllm.data_transfer.batch_gather_scatter_helper"
+        ):
+            conn._capture_blocks(meta)
+        self.assertEqual(2, len(seen))
+        self.assertLess(seen[1], seen[0])
+        conn._release_staged("r0")
+        conn._release_staged("r1")
 
     def test_one_capture_request_spends_one_deadline(self):
         # Six buckets must not each start a fresh 50 ms wait: the budget is a
@@ -2510,6 +2615,10 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             None,
             retry.staged_slots,
         )
+        # Local success retains until the commit is known; the confirmation
+        # (the manager reporting the block) releases.
+        self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
+        conn._captures.release_staged("r0", blocks)
         self.assertEqual(self.CAPACITY, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=0)
 
@@ -2570,6 +2679,149 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         self.assertEqual({}, conn._in_flight.get("r0", {}))
         self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
 
+    def test_a_local_success_keeps_the_bytes_until_the_commit(self):
+        # A block is committed only when *every* rank wrote it (the
+        # coordinator ANDs the ranks into finish_write_cache). This rank's
+        # task success therefore keeps its capture: if another rank failed,
+        # the manager rejects the block and the retry has to find the windowed
+        # bytes still here -- the HBM window is gone, so a later capture
+        # abstains and the block could never be published.
+        conn, dtm, pool, group = self._fixture()
+        blocks = list(range(self.BLOCKS))
+        conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
+        first = self._plan(conn, blocks, session=1)
+        done = {}
+        dtm.save_task(
+            MultiResult(1, self._session_callback(conn, "r0", blocks, [first], session=1)[0]),
+            0,
+            group,
+            first.uris,
+            None,
+            None,
+            first.staged_slots,
+        )
+        self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
+        self.assertEqual({}, conn._in_flight.get("r0", {}))
+        self._assert_arena_accounting(conn, pool, sessions=0)
+
+        # The other rank failed, so the manager did not commit: the retry
+        # session (a new announcement of the same blocks) reuses the very
+        # bytes and both ranks succeed this time.
+        retained = {entry.slot for entry in conn._staged["r0"].values()}
+        self.assertEqual(self.BLOCKS, len(retained))
+        retry = self._plan(conn, blocks, session=2)
+        self.assertNotIn(None, retry.staged_slots)
+        self.assertTrue(
+            set(retry.staged_slots) <= retained,
+            "the retry did not reuse the retained bytes",
+        )
+        dtm.save_task(
+            MultiResult(1, self._session_callback(conn, "r0", blocks, [retry], session=2)[0]),
+            0,
+            group,
+            retry.uris,
+            None,
+            None,
+            retry.staged_slots,
+        )
+        # Still retained; the manager confirming the block releases it.
+        self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
+        conn._captures.release_staged("r0", blocks)
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
+        self._assert_arena_accounting(conn, pool, sessions=0)
+
+    def test_a_release_skips_bytes_another_request_is_still_writing(self):
+        # Two requests share a prefix: the manager answers "existing" for the
+        # second one's blocks while the first one's allocations are still
+        # uncommitted (duplicate StartWriteCache calls are deduplicated before
+        # FinishWriteCache). The release computed from that answer must not
+        # drop the second request's captures -- if the first writer then
+        # fails, neither request could publish those blocks.
+        group = windowed_group()
+        pool = _StagingPool(torch.device("cpu"), group.per_block_bytes, 32)
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        dtm._extra_config = SimpleNamespace(
+            block_per_save_task=128, block_per_load_task=128
+        )
+        dtm._io_executor = ThreadPoolExecutor(max_workers=2)
+        conn = worker_with([group], dtm)
+        conn._pending_saves = {}
+        conn._device_mod = MagicMock()
+
+        blocks = list(range(4))
+        shared_uris = ["u%d" % block for block in blocks]
+
+        def save_meta(req_id, session_id):
+            meta = TairKvCacheConnectorMetadata(epoch=0)
+            meta.add_capture_request(
+                CaptureRequest(req_id, blocks, all_block_ids=[list(range(7, 11))])
+            )
+            meta.add_save_request(
+                SaveRequest(
+                    req_id=req_id,
+                    write_session_id="s%s" % req_id,
+                    manager_block_idxes=blocks,
+                    all_block_ids=[list(range(7, 11))],
+                    target_locations=[
+                        {
+                            "block_idxes": [block],
+                            "location_specs": [
+                                {"name": "tp0_g0", "uri": shared_uris[block]}
+                            ],
+                        }
+                        for block in blocks
+                    ],
+                    session_id=session_id,
+                )
+            )
+            return meta
+
+        with mock.patch(
+            "kv_cache_manager.py_connector.vllm.data_transfer.batch_gather_scatter_helper"
+        ):
+            # r0's session holds the shared URIs (in flight, or already
+            # settled into its staged map -- both keep the keys guarded) ...
+            conn.wait_for_save(save_meta("r0", 1))
+            # ... while r1 only has its captures staged.
+            conn._capture_request(
+                CaptureRequest("r1", blocks, all_block_ids=[list(range(7, 11))])
+            )
+            self.assertEqual(len(blocks), len(conn._staged.get("r1", {})))
+            held = len(conn._in_flight.get("r0", {})) + len(
+                conn._staged.get("r0", {})
+            )
+            self.assertEqual(len(blocks), held)
+
+            # The release computed for r1 (the manager reported those very
+            # cache keys as already cached) must not drop the blocks r0 is
+            # still writing.
+            conn._release_captures_for(
+                "r1",
+                blocks,
+                {block: [shared_uris[block]] for block in blocks},
+            )
+            self.assertEqual(
+                len(blocks),
+                len(conn._staged.get("r1", {})),
+                "a release dropped bytes another request is still writing",
+            )
+
+            # Once r0 no longer holds any bytes for those keys (its request
+            # retired), the same release goes through.
+            conn._release_staged("r0")
+            conn._release_captures_for(
+                "r1",
+                blocks,
+                {block: [shared_uris[block]] for block in blocks},
+            )
+            self.assertEqual({}, conn._staged.get("r1", {}))
+        conn._release_staged("r1")
+
     def test_a_raising_sdk_is_a_failure_and_keeps_the_bytes(self):
         # An SDK that raises (a pybind/backend exception, not an error code) is
         # reported like any other failure, and the capture ledger keeps the
@@ -2611,11 +2863,12 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         )
         # Session 0 never settled, so its four records are still in flight;
         # session 7's own four were taken and then settled (successfully) by
-        # its callback. Two sessions on the same (spec, block) keys coexist,
-        # which is exactly why the in-flight ownership is keyed by session.
+        # its callback -- and a local success keeps them staged until the
+        # commit is confirmed. Two sessions on the same (spec, block) keys
+        # coexist, which is why the in-flight ownership is keyed by session.
         self.assertEqual(self.BLOCKS, len(conn._in_flight.get("r0", {})))
         self.assertEqual({0}, {key[0] for key in conn._in_flight["r0"]})
-        self.assertEqual({}, conn._staged.get("r0", {}))
+        self.assertEqual(self.BLOCKS, len(conn._staged.get("r0", {})))
         self._assert_arena_accounting(conn, pool, sessions=0)
 
     def test_a_failed_contract_returns_its_staged_slots(self):
@@ -2657,9 +2910,12 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         self.assertEqual(3, pool.free_blocks)  # kept for the retry
         conn._captures.settle("r0", 0, {("tp0_g0", 0): False})  # idempotent
         self.assertEqual(3, pool.free_blocks)
-        # The retry session takes the restaged entry and its write lands.
+        # The retry session takes the restaged entry and its write lands; the
+        # bytes are kept until the commit is confirmed (see settle).
         self.assertIsNotNone(conn._captures.take("r0", 7, ("tp0_g0", 0)))
         conn._captures.settle("r0", 7, {("tp0_g0", 0): True})
+        self.assertEqual(3, pool.free_blocks)
+        conn._captures.release_staged("r0", [0])
         self.assertEqual(4, pool.free_blocks)
 
     def test_a_second_plan_fails_instead_of_handing_the_slot_out_twice(self):

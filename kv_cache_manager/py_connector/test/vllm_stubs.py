@@ -18,6 +18,7 @@ of them -- the connector reads whichever is not the default (see
 """
 
 import importlib.util
+import threading
 import json
 import sys
 import threading as _threading
@@ -814,6 +815,7 @@ def install_capture_ledger(conn: Any) -> None:
     conn._captures = _CaptureLedger()
     conn._staged = conn._captures.staged
     conn._in_flight = conn._captures.in_flight
+    conn._block_uris = {}
 
 
 def make_connector(
@@ -929,6 +931,7 @@ def make_connector_scheduler(
         else None
     )
     core._window_claims = {}
+    core._window_claims_lock = threading.Lock()
     core._announced_sessions = {}
     core._announced_sessions_counters = {}
     core._announced_sessions_lock = _threading.Lock()
