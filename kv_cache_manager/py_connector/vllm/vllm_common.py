@@ -1070,30 +1070,14 @@ def _uniform_group_metas(
         )
         buckets.setdefault(_bucket_key(spec, origin), []).append((layer_name, spec))
     ordered = sorted(buckets.items(), key=lambda item: _bucket_order(item[0]))
-    # The connector cannot describe a packed group that mixes a windowed bucket
-    # with anything else: the *scheduler* only ever sees vLLM's folded view of
-    # the group (one representative sub spec, see parse_groups), so it would
-    # neither announce the windowed bucket's location specs nor clamp hits
-    # against them -- its saves would fail closed and its loads would fail
-    # silently in multi-group instances. Refuse the configuration instead of
-    # serving it wrong.
-    if len(ordered) > 1 and any(key.retention is not None for key, _ in ordered):
-        windows = sorted(
-            {
-                (key.retention.kind, key.retention.window_tokens)
-                for key, _ in ordered
-                if key.retention is not None
-            }
-        )
-        raise NotImplementedError(
-            f"group {idx} (UniformTypeKVCacheSpecs) packs {len(ordered)} transfer "
-            f"buckets of which {len(windows)} are windowed {windows}: vLLM folds "
-            f"this group to one representative sub spec for the scheduler, so the "
-            f"connector cannot announce or clamp the other buckets' specs (their "
-            f"blocks would never be published, and a load of them would fail). "
-            f"Keep windowed layers in their own group (or give the packed group a "
-            f"single window) and the connector serves them fine."
-        )
+    # Splitting is all this function does: a packed group whose members agree on
+    # their coverage (same window retention, same page semantics) folds
+    # losslessly for the scheduler -- its one representative sub spec carries
+    # the same retention -- and each bucket transfers on its own identity (wire
+    # name, staging pool, staged captures). A packed group whose members
+    # *disagree* on coverage is the case the scheduler's folded view cannot
+    # describe, and the folding guard (see the folding change stacked on this
+    # one) refuses it before any of this runs.
     return [
         _attention_meta(
             idx,

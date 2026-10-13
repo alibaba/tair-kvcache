@@ -144,16 +144,18 @@ class ConnectorScheduler:
         self._pending_release_captures: List[Tuple[str, List[int]]] = []
         self._pending_release_captures_lock = threading.Lock()
         # Per request, the write sessions that may still consume captured
-        # bytes: announced ranges (keyed by their target) mapped to the blocks
-        # the session will write once its response is in. A session that has
-        # not answered yet stays ``None`` and protects its whole announced
-        # range -- the manager's block mask reports an *allocation*, which a
-        # concurrent session of the same request may still be filling (see
-        # start_save_kvcache_async: a block another session is about to write
-        # must not have its capture released, or that write finds nothing).
+        # bytes, keyed by a per-request session id: each entry holds the
+        # session's announced target and the blocks it will write (``None``
+        # while its response is still in flight). Sessions are identified by
+        # that id and not by their target because a regressed save watermark
+        # can announce the same target twice, and the two sessions still need
+        # distinct identities for the guard (see _blocks_other_sessions_write:
+        # the manager's block mask reports an *allocation*, which a concurrent
+        # session of the same request may still be filling).
         self._announced_sessions: Dict[
-            str, Dict[Tuple[int, int], Optional[Set[int]]]
+            str, Dict[int, Tuple[int, Optional[Set[int]]]]
         ] = {}
+        self._announced_sessions_counters: Dict[str, int] = {}
         self._announced_sessions_lock = threading.Lock()
         # Per request, per block: whether the block's bytes were claimed as
         # windowed when it was first announced (see _dispatch_incremental_saves
@@ -848,7 +850,7 @@ class ConnectorScheduler:
                 # (0, target_save_num): noted here, in the loop, before the
                 # http thread runs -- a release decision made by a concurrent
                 # session must already see this one as in flight.
-                self._record_announcement(
+                session_id = self._record_announcement(
                     ledger.vllm_request.request_id, target_save_num
                 )
                 # Per-block state completeness must be read here, in the
@@ -865,6 +867,7 @@ class ConnectorScheduler:
                     target_save_num,
                     self._state_complete_mask(ledger, range(target_save_num)),
                     self._window_data_mask(ledger, range(target_save_num)),
+                    session_id,
                 )
             ledger.has_saved_block_num = target_save_num
 
@@ -930,6 +933,7 @@ class ConnectorScheduler:
         self._window_claims.pop(req_id, None)
         with self._announced_sessions_lock:
             self._announced_sessions.pop(req_id, None)
+            self._announced_sessions_counters.pop(req_id, None)
         """The request's save obligations are settled: tell the worker to drop
         its bookkeeping and stop tracking the request ourselves."""
         self._waiting_to_finish_requests.append(FinishRequest(req_id))
@@ -945,6 +949,7 @@ class ConnectorScheduler:
         target_save_num: int,
         state_complete_mask: List[bool],
         window_data_mask: Optional[List[bool]] = None,
+        session_id: Optional[int] = None,
     ) -> None:
         """Ask the manager for write locations for a request's first
         ``target_save_num`` manager blocks.
@@ -957,6 +962,10 @@ class ConnectorScheduler:
         a successful write, and a windowed block whose window is already gone is
         never advertised as if its bytes were there.
         """
+        if session_id is None:
+            # Direct callers (tests) did not pre-record the announcement; the
+            # session still needs an identity of its own.
+            session_id = self._record_announcement(req_id, target_save_num)
         request = {
             "trace_id": "%s_%d" % (req_id, self._epoch),
             "instance_id": self._extra_config.instance_id,
@@ -1031,7 +1040,7 @@ class ConnectorScheduler:
         except Exception as e:
             # No locations were allocated: this session will write nothing, so
             # it protects nothing either.
-            self._remember_session_plan(req_id, target_save_num, ())
+            self._remember_session_plan(req_id, session_id, ())
             logger.warning("start_write_cache error, skip saving: %s", e)
             with self._canceled_save_request_ids_lock:
                 self._canceled_save_request_ids.append(req_id)
@@ -1069,8 +1078,8 @@ class ConnectorScheduler:
             # nothing at all, so release the captures for the blocks no other
             # session of this request is about to write (the same guard as
             # below -- "already has a location" is not "already written").
-            self._remember_session_plan(req_id, target_save_num, ())
-            protected = self._blocks_other_sessions_write(req_id, target_save_num)
+            self._remember_session_plan(req_id, session_id, ())
+            protected = self._blocks_other_sessions_write(req_id, session_id)
             releasable = [b for b in range(target_save_num) if b not in protected]
             with self._pending_release_captures_lock:
                 self._pending_release_captures.append((req_id, releasable))
@@ -1096,9 +1105,9 @@ class ConnectorScheduler:
         need_block_idx = self.parse_block_mask_to_save_indices(
             response, target_save_num
         )
-        self._remember_session_plan(req_id, target_save_num, need_block_idx)
+        self._remember_session_plan(req_id, session_id, need_block_idx)
         already = self.parse_block_mask_to_existing_indices(response, target_save_num)
-        protected = self._blocks_other_sessions_write(req_id, target_save_num)
+        protected = self._blocks_other_sessions_write(req_id, session_id)
         already = [block for block in already if block not in protected]
         if already:
             # The manager already holds these blocks and no concurrent session
@@ -1147,15 +1156,23 @@ class ConnectorScheduler:
         # Only rank0 reports finished requests.
         return 1
 
-    def _record_announcement(self, req_id: str, target_save_num: int) -> None:
+    def _record_announcement(self, req_id: str, target_save_num: int) -> int:
         """Note that a write session for [0, target_save_num) is now in flight.
 
-        Called from the scheduler loop *before* the http thread runs, so a
-        release decision made by a concurrent session already sees it."""
+        Returns the session's id. Called from the scheduler loop *before* the
+        http thread runs, so a release decision made by a concurrent session
+        already sees it -- and a repeated target (a regressed save watermark)
+        gets its own entry rather than replacing the session still running."""
         with self._announced_sessions_lock:
-            self._announced_sessions.setdefault(req_id, {})[(0, target_save_num)] = None
+            session_id = self._announced_sessions_counters.get(req_id, 0) + 1
+            self._announced_sessions_counters[req_id] = session_id
+            self._announced_sessions.setdefault(req_id, {})[session_id] = (
+                target_save_num,
+                None,
+            )
+        return session_id
 
-    def _blocks_other_sessions_write(self, req_id: str, own_target: int) -> Set[int]:
+    def _blocks_other_sessions_write(self, req_id: str, own_session: int) -> Set[int]:
         """Blocks a concurrent write session of this request may still write.
 
         The manager's block mask says a block already has a location, not that
@@ -1164,25 +1181,27 @@ class ConnectorScheduler:
         capture would make that pending write fail (and lose the request's
         head, which is then never captured again), so the blocks of every other
         session of this request are held back: its write set once it answered,
-        its whole announced range while the response is still in flight.
+        its whole announced prefix while the response is still in flight.
         """
         protected: Set[int] = set()
         with self._announced_sessions_lock:
-            sessions = self._announced_sessions.get(req_id, {})
-            for (start, end), plan in sessions.items():
-                if start == 0 and end == own_target:
+            for session_id, (target, plan) in self._announced_sessions.get(
+                req_id, {}
+            ).items():
+                if session_id == own_session:
                     continue  # the session answering right now
-                protected |= plan if plan is not None else set(range(start, end))
+                protected |= plan if plan is not None else set(range(target))
         return protected
 
     def _remember_session_plan(
-        self, req_id: str, target_save_num: int, plan: Iterable[int]
+        self, req_id: str, session_id: int, plan: Iterable[int]
     ) -> None:
         """Record what this session will write (or nothing, if nothing)."""
         with self._announced_sessions_lock:
             sessions = self._announced_sessions.get(req_id)
-            if sessions is not None:
-                sessions[(0, target_save_num)] = set(plan)
+            if sessions is not None and session_id in sessions:
+                target, _plan = sessions[session_id]
+                sessions[session_id] = (target, set(plan))
 
     def parse_block_mask_to_save_indices(
         self, response: dict, target_save_num: int
