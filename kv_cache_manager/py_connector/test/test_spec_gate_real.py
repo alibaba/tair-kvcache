@@ -425,6 +425,287 @@ class TestUndeclaredSubclassesFailClosed(RealEngineCase):
         )
 
 
+class TestTransferProjection(RealEngineCase):
+    """vLLM 0.30+ projects the group list for connectors (enable_kv_transfer).
+
+    Membership comes from the engine's own projection; the index we keep is the
+    raw vLLM group index, because that is the space of the block-id payloads
+    this connector receives (KVCacheBlocks.get_block_ids / new_block_ids).
+    """
+
+    def _group_spec(self):
+        cls = getattr(self.module, "KVCacheGroupSpec", None)
+        if cls is None or "enable_kv_transfer" not in inspect.signature(cls).parameters:
+            self.skipTest(f"vLLM {self.version} has no enable_kv_transfer")
+        return cls
+
+    def _config(self, groups):
+        cls = self._group_spec()
+        spec = {
+            "full": facts.build_spec(facts.ROW_BY_NAME["full"], self.engine),
+            "mla_bf16": facts.build_spec(facts.ROW_BY_NAME["mla_bf16"], self.engine),
+        }
+        KVCacheConfig = getattr(self.module, "KVCacheConfig")
+        return KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                cls([layer], spec[row], **extra) for layer, row, extra in groups
+            ],
+        )
+
+    def test_the_config_projection_and_the_parser_agree(self):
+        config = self._config(
+            [
+                ("a0", "full", {}),
+                ("hidden", "mla_bf16", {"enable_kv_transfer": False}),
+                ("a2", "full", {}),
+            ]
+        )
+        # The engine says which groups are transferable...
+        self.assertEqual((0, 2), config.transfer_group_ids)
+        # ... and the parser must publish exactly those, keeping their indices:
+        # the payload stays indexed by the vLLM group id (0 and 2 here).
+        metas = parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertEqual([0, 2], [meta.group_idx for meta in metas])
+        from kv_cache_manager.py_connector.vllm.vllm_common import spec_name
+
+        self.assertEqual(["tp7_g0", "tp7_g2"], [spec_name(7, meta) for meta in metas])
+
+    def test_a_cacheable_class_is_still_dropped_when_the_engine_says_so(self):
+        # MLAAttentionSpec is accepted on its own; only the projection can say
+        # this instance's group is engine-owned (the HiSparse shape).
+        config = self._config(
+            [
+                ("hidden", "mla_bf16", {"enable_kv_transfer": False}),
+                ("a1", "full", {}),
+            ]
+        )
+        with self.assertLogs(
+            "kv_cache_manager.py_connector.common.logger", level="WARNING"
+        ) as captured:
+            metas = parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertEqual([1], [meta.group_idx for meta in metas])
+        self.assertTrue(
+            any("does not transfer it" in msg for msg in captured.output),
+            captured.output,
+        )
+
+
+class TestPooledFullAttention(RealEngineCase):
+    """One row per token is the transfer model: pooled rows are refused."""
+
+    def _has_tokens_per_state(self) -> bool:
+        cls = self.engine.class_of("FullAttentionSpec")
+        self.assertIsNotNone(cls)
+        return "tokens_per_state" in inspect.signature(cls).parameters
+
+    def _full(self, **extra):
+        cls = self.engine.class_of("FullAttentionSpec")
+        self.assertIsNotNone(cls)
+        return cls(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=256,
+            head_size_v=256,
+            dtype=torch.bfloat16,
+            **extra,
+        )
+
+    def _pooled(self, tokens_per_state=None, **extra):
+        from fractions import Fraction
+
+        if not self._has_tokens_per_state():
+            self.skipTest(f"vLLM {self.version} has no tokens_per_state")
+        if tokens_per_state is None:
+            tokens_per_state = Fraction(1, 8)
+        return self._full(tokens_per_state=tokens_per_state, **extra)
+
+    def test_pooled_and_compressed_full_attention_are_refused(self):
+        # Whisper pools (Fraction(1, n) = several states per token row) and the
+        # promote path can keep the field on a FullAttentionSpec; both are
+        # refused by field name instead of failing at registration.
+        cases = (
+            ("bare", self._pooled(), "tokens_per_state=1/8"),
+            (
+                "windowed (the promote shape)",
+                self._pooled(sliding_window=1024),
+                "tokens_per_state=1/8",
+            ),
+            ("compressed", self._pooled(tokens_per_state=2), "tokens_per_state=2"),
+        )
+        for label, spec, keyword in cases:
+            with self.subTest(shape=label):
+                with self.assertRaises(NotImplementedError) as ctx:
+                    _check_attention_spec_supported(
+                        "group 0", spec, calculate_kv_scales=False
+                    )
+                message = str(ctx.exception)
+                self.assertIn(keyword, message)
+                self.assertIn("one state per token", message)
+
+    def test_the_one_state_per_token_shapes_still_pass(self):
+        # Runs on every era: the plain and promote shapes need no new field,
+        # and the explicit tokens_per_state=1 case joins them where the field
+        # exists (it is the default, never a way in).
+        cases = [{}, dict(sliding_window=1024)]
+        if self._has_tokens_per_state():
+            cases.append(dict(tokens_per_state=1))
+        for extra in cases:
+            with self.subTest(extra=extra):
+                self.assertIsNone(
+                    _check_attention_spec_supported(
+                        "group 0", self._full(**extra), calculate_kv_scales=False
+                    )
+                )
+
+
+class TestBucketDtype(RealEngineCase):
+    """AttentionGroupMeta.dtype is the bucket's element type (spec.dtype)."""
+
+    def test_accepted_buckets_report_their_spec_dtype(self):
+        for row_name, expected in (
+            ("full", torch.bfloat16),
+            ("mla_bf16", torch.bfloat16),
+            ("mla_fp8_ds", torch.uint8),
+            ("mla_indexer", torch.uint8),
+        ):
+            with self.subTest(row=row_name):
+                row = facts.ROW_BY_NAME[row_name]
+                spec = facts.build_spec(row, self.engine)
+                metas = facts.run_row(row, self.engine).metas
+                self.assertEqual([expected], [meta.dtype for meta in metas])
+                self.assertEqual([spec.dtype], [meta.dtype for meta in metas])
+
+    def test_wrapper_buckets_keep_their_own_dtype(self):
+        # A packed group is one vLLM group but several buckets: V3.2 packs an
+        # fp8_ds_mla main with an fp8 indexer (both uint8 element-wise, distinct
+        # page sizes), and block_size 64 also admits a bf16 main next to the
+        # uint8 indexer -- one instance, two element sizes, and the staging
+        # pool keys by dtype, so the bucket must carry it.
+        wrapper = self.engine.class_of("UniformTypeKVCacheSpecs")
+        self.assertIsNotNone(wrapper)
+        packed = facts.build_spec(facts.ROW_BY_NAME["wrapper_v32_pair"], self.engine)
+        from dataclasses import replace
+
+        main = replace(
+            facts.build_spec(facts.ROW_BY_NAME["mla_bf16"], self.engine), block_size=64
+        )
+        indexer = facts.build_spec(facts.ROW_BY_NAME["mla_indexer"], self.engine)
+        cases = {
+            "v32_pair": packed.kv_cache_specs,
+            "mixed_element_sizes": {"l.main": main, "l.indexer": indexer},
+        }
+        for label, specs in cases.items():
+            with self.subTest(shape=label):
+                group = wrapper.from_specs(dict(specs))
+                self.assertIsNotNone(group, label)
+                metas = parse_groups(
+                    SimpleNamespace(
+                        kv_cache_groups=[
+                            SimpleNamespace(
+                                layer_names=sorted(specs),
+                                kv_cache_spec=group,
+                                is_eagle_group=False,
+                            )
+                        ]
+                    ),
+                    64,
+                    calculate_kv_scales=False,
+                )
+                self.assertEqual(
+                    sorted(str(spec.dtype) for spec in specs.values()),
+                    sorted(str(meta.dtype) for meta in metas),
+                )
+                self.assertEqual(
+                    {spec.dtype for spec in specs.values()},
+                    {meta.dtype for meta in metas},
+                )
+        self.assertEqual(
+            {torch.uint8, torch.bfloat16},
+            {spec.dtype for specs in cases.values() for spec in specs.values()},
+        )
+
+    def test_the_spec_dtype_is_the_dtype_a_tensor_gets_for_that_cache(self):
+        # Both sides call kv_cache_dtype_str_to_dtype on the same cache_dtype
+        # (gpu_model_runner.py for the KV tensors, the attention layer for the
+        # spec), so the bucket dtype the connector records is the staging tensor
+        # dtype the worker will see. Assert it on the fp8 shapes, where a wrong
+        # guess is silent (uint8 vs a float8 view share the byte count).
+        from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+
+        for row_name, cache_dtype in (
+            ("mla_fp8_ds", "fp8_ds_mla"),
+            ("mla_indexer", "fp8"),
+        ):
+            with self.subTest(row=row_name):
+                spec = facts.build_spec(facts.ROW_BY_NAME[row_name], self.engine)
+                self.assertEqual(torch.uint8, spec.dtype)
+                self.assertEqual(
+                    torch.uint8, kv_cache_dtype_str_to_dtype(cache_dtype, None)
+                )
+
+
+class TestImportGuard(RealEngineCase):
+    """A missing engine skips; a broken connector import must fail the run."""
+
+    def test_only_a_missing_engine_counts_as_absent(self):
+        self.assertTrue(
+            _missing_engine(ModuleNotFoundError("No module named 'vllm'", name="vllm"))
+        )
+        self.assertTrue(
+            _missing_engine(
+                ModuleNotFoundError("No module named 'torch'", name="torch")
+            )
+        )
+        # A connector symbol that vanished, or any other import failure, is a
+        # regression: it must not be reported as "vLLM is not installed here".
+        self.assertFalse(
+            _missing_engine(ImportError("cannot import name 'parse_groups'"))
+        )
+        self.assertFalse(
+            _missing_engine(
+                ModuleNotFoundError("No module named 'x'", name="some_new_dependency")
+            )
+        )
+
+    def _probe(self, blocked: str):
+        root = str(Path(__file__).resolve().parents[3])
+        script = textwrap.dedent(
+            """
+            import importlib.abc, sys
+
+            class Blocker(importlib.abc.MetaPathFinder):
+                def find_spec(self, name, path=None, target=None):
+                    if name == {blocked!r} or name.startswith({blocked!r} + "."):
+                        raise ModuleNotFoundError(
+                            f"No module named {{name!r}}", name=name
+                        )
+                    return None
+
+            sys.meta_path.insert(0, Blocker())
+            import kv_cache_manager.py_connector.test.test_spec_gate_real as m
+            print("IMPORTED", m._IMPORT_ERROR)
+            """
+        ).format(blocked=blocked)
+        env = dict(os.environ, PYTHONPATH=root)
+        return subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, env=env
+        )
+
+    def test_a_missing_vllm_is_still_a_skip(self):
+        proc = self._probe("vllm")
+        self.assertEqual(0, proc.returncode, proc.stderr[-800:])
+        self.assertIn("real vLLM not installed here", proc.stdout)
+        self.assertIn("IMPORTED", proc.stdout)
+
+    def test_a_broken_connector_import_fails_instead_of_skipping(self):
+        proc = self._probe("kv_cache_manager.py_connector.vllm.vllm_common")
+        self.assertNotEqual(0, proc.returncode, proc.stdout)
+        self.assertIn("kv_cache_manager.py_connector.vllm.vllm_common", proc.stderr)
+        self.assertNotIn("IMPORTED", proc.stdout)
+
+
 class TestEraShapes(RealEngineCase):
     """What this era spells and declares, through the same code path."""
 

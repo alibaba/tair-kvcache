@@ -16,8 +16,11 @@ the connector must give it:
 ``legacy`` is what the pre-PR gate (7b55b853) did with the same spec, so the
 differential ("today's accepted surface must stay accepted") is data, and
 ``legacy_accepts`` below is the executable transcription of that predicate. The
-only rows allowed to go from ``legacy=accept`` to ``refuse`` are the two
-documented holes, named by ``hole``.
+only rows allowed to go from ``legacy=accept`` to ``refuse`` are the documented
+holes, named by ``hole``: the RSWA window (``rswa``), the tokens-per-state field
+migration (``tokens_per_state``) -- which also covers the pooled/compressed
+full-attention rows below -- and, for undeclared subclasses, the tests that
+build them.
 
 ``requires`` lists constructor fields a row *needs* to be meaningful: a row
 whose fields the running era lacks is skipped (the era map below says why), so
@@ -235,6 +238,47 @@ ZOO: List[Dict[str, Any]] = [
         page_bytes=65536,
         per_block_bytes=65536,
         source="promoted llama4 chunked-local layer (same promote path)",
+    ),
+    dict(
+        name="full_pooled",
+        cls="FullAttentionSpec",
+        # Whisper block pooling: every token row holds several states, so the
+        # one-row-per-token transfer model would mis-size the page (the gate
+        # refuses it by field name; registration used to fail much later).
+        kwargs=dict(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=256,
+            dtype="bfloat16",
+            tokens_per_state=Fraction(1, 8),
+        ),
+        disposition="refuse",
+        legacy="accept",
+        hole="tokens_per_state",
+        requires=("tokens_per_state",),
+        keywords=("tokens_per_state=1/8", "one state per token"),
+        mbs=16,
+        source="whisper_causal block pooling (block_pool_size)",
+    ),
+    dict(
+        name="full_compressed",
+        cls="FullAttentionSpec",
+        # The same field on a plain full-attention spec (a state spanning
+        # several tokens), reachable through the hybrid-manager fallbacks.
+        kwargs=dict(
+            block_size=16,
+            num_kv_heads=4,
+            head_size=256,
+            dtype="bfloat16",
+            tokens_per_state=2,
+        ),
+        disposition="refuse",
+        legacy="accept",
+        hole="tokens_per_state",
+        requires=("tokens_per_state",),
+        keywords=("tokens_per_state=2", "one state per token"),
+        mbs=16,
+        source="the field's other direction on an accepted class",
     ),
     dict(
         name="mla_bf16",

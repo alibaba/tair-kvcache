@@ -15,7 +15,9 @@ Three things are pinned here that a plain table check would miss:
   *accepted* by the pre-PR gate (``legacy_accepts``, a transcription of that
   predicate) and are refused now;
 * the **differential**: today's accepted surface stays accepted, except for the
-  two documented holes;
+  documented holes (the RSWA window, the tokens-per-state field);
+  the third shape -- pooled / compressed *full attention* -- carries the same
+  field, and undeclared subclasses are pinned by their own tests;
 * the **wire hole** left by a skipped group (vLLM group numbers are kept, so a
   skipped group is simply absent from the name set).
 """
@@ -326,6 +328,137 @@ class TestHiddenStateWindows(unittest.TestCase):
         )
 
 
+class TestTransferProjection(unittest.TestCase):
+    """vLLM (0.30+) projects the group list for connectors; honor it.
+
+    enable_kv_transfer=False marks a group the engine rebuilds itself. Such a
+    group must not be registered even when its spec looks cacheable -- and the
+    remaining groups keep their raw vLLM indices, because that is the index
+    space of the block-id payloads this connector receives.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.engine = engine()
+
+    def _group(self, row_name, layers, **attrs):
+        spec = facts.build_spec(facts.ROW_BY_NAME[row_name], self.engine)
+        return SimpleNamespace(
+            layer_names=layers, kv_cache_spec=spec, is_eagle_group=False, **attrs
+        )
+
+    def _config(self, groups, transfer_ids=None):
+        config = SimpleNamespace(kv_cache_groups=groups)
+        if transfer_ids is not None:
+            config.transfer_group_ids = transfer_ids
+        return config
+
+    def test_a_non_transferable_group_stays_out_of_the_wire(self):
+        # [full(transfer), full(no transfer), full(transfer)]: the middle group
+        # is engine-owned; the wire keeps the raw indices 0 and 2.
+        config = self._config(
+            [
+                self._group("full", ["a0"]),
+                self._group("mla_bf16", ["x1"]),
+                self._group("full", ["a2"]),
+            ],
+            transfer_ids=(0, 2),
+        )
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured:
+            metas = parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertEqual([meta.group_idx for meta in metas], [0, 2])
+        self.assertEqual([spec_name(0, m) for m in metas], ["tp0_g0", "tp0_g2"])
+        self.assertTrue(
+            any("does not transfer it" in msg for msg in captured.output),
+            captured.output,
+        )
+
+    def test_the_engine_projection_decides_membership_not_the_class_flags(self):
+        # mla_bf16 is a perfectly cacheable class: only the engine's projection
+        # can say it is rebuilt engine-side (that is the HiSparse shape).
+        config = self._config(
+            [self._group("full", ["a0"]), self._group("mla_bf16", ["hidden"])],
+            transfer_ids=(0,),
+        )
+        metas = parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertEqual([meta.group_idx for meta in metas], [0])
+
+    def test_an_era_without_the_projection_keeps_every_group(self):
+        # vLLM <= 0.29 hands no transfer_group_ids attribute: all groups.
+        config = self._config(
+            [self._group("full", ["a0"]), self._group("mla_bf16", ["x1"])]
+        )
+        metas = parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertEqual([meta.group_idx for meta in metas], [0, 1])
+
+    def test_all_groups_filtered_out_is_a_clean_refusal(self):
+        config = self._config([self._group("full", ["a0"])], transfer_ids=())
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertIn("no usable kv cache groups", str(ctx.exception))
+
+
+class TestPooledFullAttentionRefusal(unittest.TestCase):
+    """One row per token is the transfer model: pooled rows are refused."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.engine = engine()
+
+    def _gate(self, row_name):
+        spec = facts.build_spec(facts.ROW_BY_NAME[row_name], self.engine)
+        return _check_attention_spec_supported(
+            "group 0", spec, calculate_kv_scales=False
+        )
+
+    def test_a_pooled_full_attention_spec_is_refused(self):
+        # Whisper pools: tokens_per_state = Fraction(1, n) means several states
+        # per token row, which _attention_meta would size as one per token.
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._gate("full_pooled")
+        message = str(ctx.exception)
+        self.assertIn("tokens_per_state=1/8", message)
+        self.assertIn("one state per token", message)
+
+    def test_a_compressed_full_attention_spec_is_refused(self):
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._gate("full_compressed")
+        self.assertIn("tokens_per_state=2", str(ctx.exception))
+
+    def test_the_plain_and_windowed_promote_specs_still_pass(self):
+        for row_name in ("full", "full_window", "full_chunked", "sink", "tq_full"):
+            with self.subTest(row=row_name):
+                self.assertIsNone(self._gate(row_name))
+
+
+class TestBucketDtype(unittest.TestCase):
+    """AttentionBucketMeta.dtype is the bucket's element type (spec.dtype)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.engine = engine()
+
+    def test_attention_metas_carry_the_spec_dtype(self):
+        # One instance may mix element sizes (V3.2 bf16 main + uint8 indexer),
+        # so the bucket -- not the instance -- is the dtype granularity.
+        for row_name in ("full", "mla_bf16", "mla_fp8_ds"):
+            with self.subTest(row=row_name):
+                row = facts.ROW_BY_NAME[row_name]
+                spec = facts.build_spec(row, self.engine)
+                metas = facts.run_row(row, self.engine).metas
+                self.assertEqual([meta.dtype for meta in metas], [spec.dtype])
+
+    def test_wrapper_buckets_each_carry_their_member_dtype(self):
+        row = facts.ROW_BY_NAME["wrapper_v32_pair"]
+        members = facts.member_specs(row, self.engine)
+        metas = facts.run_row(row, self.engine).metas
+        self.assertGreater(len(metas), 1)
+        self.assertEqual(
+            sorted(str(meta.dtype) for meta in metas),
+            sorted(str(spec.dtype) for spec in members.values()),
+        )
+
+
 class TestScratchGroupSkip(unittest.TestCase):
     """A scratch group is dropped, not refused -- and the wire shows a hole."""
 
@@ -415,7 +548,7 @@ class TestScratchGroupSkip(unittest.TestCase):
 
 
 class TestHolesAreReversed(unittest.TestCase):
-    """The two silent holes: accepted before this change, refused now."""
+    """The silent holes: accepted before this change, refused now."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -447,6 +580,22 @@ class TestHolesAreReversed(unittest.TestCase):
         plain = facts.build_spec(accepted_row, self.engine)
         self.assertEqual(spec.real_page_size_bytes, plain.real_page_size_bytes)
         self.assertEqual("accept", facts.run_row(accepted_row, self.engine).outcome)
+
+    def test_a_pooled_full_attention_spec_was_accepted_and_is_refused_now(self):
+        # Pre-PR: FullAttentionSpec isinstance -> ACCEPT with the page sized as
+        # one row per token, and registration failed much later (Whisper's
+        # block pooling, and the promote path can keep the field). Now the
+        # accepted branch reads the field itself.
+        for row_name, keyword in (
+            ("full_pooled", "tokens_per_state=1/8"),
+            ("full_compressed", "tokens_per_state=2"),
+        ):
+            with self.subTest(row=row_name):
+                row, _, legacy = self._row(row_name)
+                self.assertTrue(legacy, "the transcription must reproduce the hole")
+                result = facts.run_row(row, self.engine)
+                self.assertEqual("refuse", result.outcome)
+                self.assertIn(keyword, result.message)
 
     def test_compressed_mla_was_accepted_and_is_refused_now(self):
         # Pre-PR: the gate read compress_ratio, which the 0.29+ spec no longer
@@ -536,7 +685,7 @@ class TestAcceptanceSurfaceDifferential(unittest.TestCase):
 
     def test_legacy_surface_is_contained(self):
         # accepted before => accepted or skipped now. The only rows allowed to
-        # shrink are the two documented holes.
+        # shrink are the documented holes (rswa / tokens_per_state).
         for row in facts.ZOO:
             with self.subTest(row=row["name"]):
                 result = facts.run_row(row, self.engine)
