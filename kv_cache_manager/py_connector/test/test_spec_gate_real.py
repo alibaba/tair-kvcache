@@ -76,7 +76,6 @@ else:
 
     from kv_cache_manager.py_connector.vllm.vllm_common import (
         _check_attention_spec_supported,
-        build_spec_groups,
         parse_groups,
     )
 
@@ -1080,21 +1079,12 @@ class TestFoldedGroupCoverageOnTheRealEngine(RealEngineCase):
                 module.KVCacheGroupSpec(layer_names=list(members), kv_cache_spec=merged)
             ],
         )
-        metas = parse_groups(config, 64, calculate_kv_scales=False)
-        self.assertEqual(
-            [None, 128],
-            [
-                meta.retention.window_tokens if meta.retention else None
-                for meta in metas
-            ],
-            "the two coverages must really be in the bucket set",
-        )
-        # The guard runs where the connector announces spec coverage: the
-        # worker's registration (build_spec_groups), before any request. The
-        # parse-time bucket split serves *agreeing* packed windowed groups;
-        # a disagreement survives parsing and must be refused here.
+        # The parse-time bucket split serves *agreeing* packed windowed groups
+        # and refuses a divergence while splitting (the same predicate the
+        # stacked folding guard enforces at registration for metas built
+        # without going through the parse).
         with self.assertRaises(NotImplementedError) as ctx:
-            build_spec_groups(metas, tp_size=1)
+            parse_groups(config, 64, calculate_kv_scales=False)
         message = str(ctx.exception)
         self.assertIn("different coverage", message)
         self.assertIn("group 0", message)
