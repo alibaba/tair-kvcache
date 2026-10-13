@@ -131,6 +131,10 @@ class TestPartialHit(unittest.TestCase):
             env.start_manager()
             if env.window is None:
                 self.skipTest("mid-prefix window assertions need a windowed model")
+            vllm = env.start_vllm(log_suffix="_p1")
+            # The manager block size comes from the instance the connector
+            # registers at engine startup, so the gate runs after start_vllm
+            # (a skip below tears the server down cleanly through the finally).
             mbs = env.manager_block_size()
             window_blocks = -(-(env.window - 1) // mbs)
             # B's match must end inside A, one window before A's own tail window,
@@ -145,7 +149,6 @@ class TestPartialHit(unittest.TestCase):
                     f"a {env.window}-token window needs {needed_tokens} tokens "
                     f"for three windows, over the {env.max_model_len()} this "
                     f"server accepts; the mid-prefix case cannot be built")
-            vllm = env.start_vllm(log_suffix="_p1")
             # The loaded region is the union of every group's slots: the window
             # for the sliding groups, the whole match for the full-attention
             # one (so it is a superset of the window).
