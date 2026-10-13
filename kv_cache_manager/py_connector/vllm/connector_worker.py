@@ -9,9 +9,10 @@ shell.
 """
 
 import copy
+from dataclasses import dataclass
 import json
 import typing
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 # kvcm_py_client is the compiled pybind11 client; it ships no type stubs.
 from kv_cache_manager.client.pybind import kvcm_py_client  # ty: ignore[unresolved-import]
@@ -71,6 +72,156 @@ if typing.TYPE_CHECKING:
     from vllm.attention import AttentionMetadata  # ty: ignore[unresolved-import]
 
 
+@dataclass(frozen=True)
+class _Capture:
+    """One captured block's staging slot: the entry carries its own slot."""
+
+    pool: Any
+    slot: int
+
+
+class _CaptureLedger:
+    """The single accounting point for captured staging slots.
+
+    Every transition of a capture's slot goes through this class -- staging a
+    fresh capture, a session taking one (``take``), settling a session's
+    outcomes (``settle``: return on success, keep for a retry on failure),
+    the deliberate release a mask-derived instruction asks for, and the
+    request's retirement. Nothing else may release one of these slots or put
+    an entry back: that is the invariant the test family named after it
+    checks -- at any moment a slot belongs to exactly one live entry in
+    exactly one of the two maps, it is released exactly once, and no path
+    reads a released slot.
+
+    Two shapes make the bookkeeping non-trivial, and both are handled here
+    instead of at the call sites:
+
+    * in-flight ownership is keyed by ``(session, spec_name, block)``. A
+      regressed save watermark can capture a block again while an earlier
+      session's write is still running: both owners must keep their own
+      record (and their own slot), or a failure callback would move or
+      release a slot another task is still reading;
+    * a request can retire while its saves are still running. Its staged
+      entries are released then, but the in-flight records stay until every
+      session settles; a settled *failure* for a retired request releases its
+      slot (nothing will ever publish it) instead of staging it for a retry
+      that cannot come.
+    """
+
+    def __init__(self) -> None:
+        # (spec_name, manager block) -> _Capture: captured, not yet taken.
+        self.staged: Dict[str, Dict[Tuple[str, int], _Capture]] = {}
+        # (session id, spec_name, manager block) -> _Capture.
+        self.in_flight: Dict[str, Dict[Tuple[int, str, int], _Capture]] = {}
+        self._retired: Set[str] = set()
+
+    @staticmethod
+    def _release(capture: _Capture) -> None:
+        capture.pool.release(capture.slot, 1)
+
+    # ------------------------------------------------------------------ #
+    def stage(
+        self, req_id: str, key: Tuple[str, int], capture: _Capture
+    ) -> Optional[int]:
+        """Record a fresh capture; returns the superseded slot, if any.
+
+        A block can be captured twice (the save watermark moves backwards when
+        preemption shrinks an allocation). The newer bytes win: the old entry
+        is released here -- it has no session reference, a session *moves* the
+        entry into the in-flight map when it takes it.
+        """
+        previous = self.staged.setdefault(req_id, {}).get(key)
+        self.staged[req_id][key] = capture
+        if previous is None:
+            return None
+        self._release(previous)
+        return previous.slot
+
+    def take(
+        self, req_id: str, session_id: int, key: Tuple[str, int]
+    ) -> Optional[_Capture]:
+        """Hand a staged capture to a session, atomically.
+
+        ``None`` means "this session has nothing for that block": either no
+        capture is staged, or this very session already holds the block (a
+        repeated plan must not overwrite the first task's ownership).
+        """
+        flight_key = (session_id, key[0], key[1])
+        sessions = self.in_flight.setdefault(req_id, {})
+        if flight_key in sessions:
+            return None
+        capture = self.staged.get(req_id, {}).pop(key, None)
+        if capture is None:
+            return None
+        sessions[flight_key] = capture
+        return capture
+
+    def taken_by(self, req_id: str, session_id: int, key: Tuple[str, int]) -> bool:
+        """Is this block already in flight for this session?"""
+        return (session_id, key[0], key[1]) in self.in_flight.get(req_id, {})
+
+    def settle(
+        self,
+        req_id: str,
+        session_id: int,
+        outcomes: "Dict[Tuple[str, int], bool]",
+    ) -> None:
+        """Close out a session's blocks: ``True`` returns the slot, ``False``
+        keeps it (the block is announced again, and the HBM window that
+        produced the bytes has moved on -- they are the only copy left).
+
+        A failure whose request already retired cannot be retried, so its slot
+        is released. A block that was captured again while this task ran keeps
+        the newer entry; the settled one goes back to the arena.
+        """
+        sessions = self.in_flight.get(req_id)
+        if not sessions:
+            return
+        for key, ok in outcomes.items():
+            capture = sessions.pop((session_id, key[0], key[1]), None)
+            if capture is None:
+                continue  # already settled, or never taken: nothing to release
+            if ok or req_id in self._retired:
+                self._release(capture)
+                continue
+            staged = self.staged.setdefault(req_id, {})
+            if key in staged:
+                # A fresher capture for the same block wins.
+                self._release(capture)
+            else:
+                staged[key] = capture
+        if not sessions:
+            self.in_flight.pop(req_id, None)
+            self._retired.discard(req_id)
+
+    def release_staged(self, req_id: str, blocks: "Sequence[int]") -> int:
+        """Release the captures of these manager blocks (returns how many).
+
+        No session will write them (the manager holds them already, or the
+        session that announced them allocated nothing), so their bytes are
+        dead weight in the arena.
+        """
+        staged = self.staged.get(req_id)
+        if not staged:
+            return 0
+        wanted = set(blocks)
+        released = 0
+        for key in [key for key in staged if key[1] in wanted]:
+            self._release(staged.pop(key))
+            released += 1
+        return released
+
+    def retire(self, req_id: str) -> int:
+        """Release everything still waiting for a session; keep in-flight
+        records until their tasks settle (see settle)."""
+        staged = self.staged.pop(req_id, {})
+        for capture in staged.values():
+            self._release(capture)
+        if req_id in self.in_flight:
+            self._retired.add(req_id)
+        return len(staged)
+
+
 class ConnectorWorker:
     """State and hooks for the worker-role connector instance (one per TP rank)."""
 
@@ -84,8 +235,12 @@ class ConnectorWorker:
         manager_client: KvCacheManagerClient,
         coordinator_client: TpCoordinatorClient,
         register_response: Dict[str, Any],
+        max_num_batched_tokens: int = 0,
     ) -> None:
         self._extra_config = extra_config
+        # The engine's per-step token budget (chunked prefill's chunk): the
+        # capture partition is sized from it (see DataTransferManager).
+        self._max_num_batched_tokens = max_num_batched_tokens
         self._group_metas = group_metas
         self._num_groups = len(group_metas)
         self._manager_block_size = manager_block_size
@@ -121,8 +276,15 @@ class ConnectorWorker:
         # when the location claimed it and no bytes were captured (a withheld
         # or lost capture), and abstains when nothing claimed it
         # (``_staged_dispositions``).
-        self._staged: Dict[str, Dict[Tuple[str, int], Tuple[Any, int]]] = {}
-        self._in_flight: Dict[str, Dict[Tuple[str, int], Tuple[Any, int]]] = {}
+        #
+        # Every slot transition goes through this one ledger (see
+        # _CaptureLedger): captured-not-taken entries in ``staged``,
+        # session-owned ones in ``in_flight`` keyed by (session, spec, block).
+        # The two attributes below are the ledger's maps, exposed read-only for
+        # the tests and for the plan's diagnostics.
+        self._captures = _CaptureLedger()
+        self._staged = self._captures.staged
+        self._in_flight = self._captures.in_flight
 
         self._tp_rank = get_tensor_model_parallel_rank()
         # torch device module (torch.cuda / torch.musa / ...), set in
@@ -244,6 +406,7 @@ class ConnectorWorker:
             self._transfer_client,
             self._coordinator_client,
             self._extra_config,
+            max_num_batched_tokens=self._max_num_batched_tokens,
         )
 
         logger.warning(
@@ -509,29 +672,27 @@ class ConnectorWorker:
                     plan.null_rows[i:end] if plan.null_rows is not None else None,
                 )
 
-    def _retain_failed_windowed(
+    def _settle_session_captures(
         self,
         save_req: SaveRequest,
         plans: List[TransferPlan],
         done_cb: Callable[[List[Any]], None],
     ) -> Callable[[List[Any]], None]:
-        """Give a failed windowed block its captured bytes back.
+        """Settle this session's captured slots once its tasks report.
 
-        A staged (windowed) save reads the arena; when its write fails, the
-        bytes are the only copy the connector will ever hold (the HBM window
-        that produced them has moved on, so a later capture abstains), and
-        later incremental sessions still announce that block -- the manager
-        asks for it again and the block must be publishable. ``save_task``
-        keeps such a task's slots (see _save_staged_blocks) and this wrapper
-        moves the entries back into the staged map as soon as the session
-        reports, so the next announcement finds them. The slot stays owned by
-        exactly one of the two maps throughout, and a request that never
-        retries releases it at retirement.
+        Every windowed save hands its blocks to a session (the ledger's
+        ``take``) and this is where they come to rest: a block that was
+        written returns its slot, a block that failed keeps it -- the bytes are
+        the only copy the connector will ever hold (the HBM window that
+        produced them has moved on, so a later capture abstains) and a later
+        session announces the block again, so the retry must find them staged.
+        A request that retired before the callback ran releases the slot
+        instead (nothing will publish it).
 
-        Only a *failed* windowed group restores: when it wrote successfully
-        its slots were returned to the arena and the entries must not come
-        back. The verdict list is flat, group-major, ``num_blocks`` per group
-        (the same layout create_save_done_callback reads).
+        The verdict list is flat, group-major, ``num_blocks`` per group (the
+        same layout create_save_done_callback reads). It can be short when a
+        task never reported: the session's slots then stay in flight, which is
+        exactly where the ledger keeps them until something settles.
         """
         windowed = [
             (group_idx, plan)
@@ -546,33 +707,36 @@ class ConnectorWorker:
         def wrapper(flat: List[Any]) -> None:
             done_cb(flat)
             if len(flat) < len(plans) * num_blocks:
+                # A task never reported (an exception escaped the executor):
+                # its slots stay in flight until something settles them.
                 return
-            staged = self._staged.setdefault(save_req.req_id, {})
-            in_flight = self._in_flight.get(save_req.req_id)
-            if not in_flight:
-                return
+            outcomes: Dict[Tuple[str, int], bool] = {}
             for group_idx, plan in windowed:
                 for pos, slot in enumerate(plan.staged_slots):
                     if slot is None:
                         continue
                     block = save_req.manager_block_idxes[pos]
-                    key = (plan.group.spec_name, block)
-                    entry = in_flight.get(key)
-                    if entry is not None and flat[group_idx * num_blocks + pos] is False:
-                        staged[key] = in_flight.pop(key)
-                        logger.warning(
-                            "save group %s: block %d failed to write; its "
-                            "captured bytes stay staged for a retry (slot %d)",
-                            plan.group.spec_name,
-                            block,
-                            slot,
-                        )
+                    ok = flat[group_idx * num_blocks + pos]
+                    if ok is None:
+                        continue
+                    outcomes[(plan.group.spec_name, block)] = bool(ok)
+            self._captures.settle(save_req.req_id, save_req.session_id, outcomes)
+            failed = [key for key, ok in outcomes.items() if not ok]
+            if failed:
+                logger.warning(
+                    "req:%s session %d: %d windowed block(s) failed to write; "
+                    "their captured bytes stay staged for a retry",
+                    save_req.req_id,
+                    save_req.session_id,
+                    len(failed),
+                )
 
         return wrapper
 
     def _windowed_save_annotations(
         self,
         req_id: str,
+        session_id: int,
         group: AttentionTransferGroup,
         manager_block_idxes: Sequence[int],
         uris: List[Optional[str]],
@@ -592,14 +756,12 @@ class ConnectorWorker:
         no location to write to), rather than a slot two tasks would both
         release.
         """
-        staged = self._staged.get(req_id, {})
-        in_flight = self._in_flight.setdefault(req_id, {})
         slots: List[Optional[int]] = []
         for block in manager_block_idxes:
             key = (group.spec_name, block)
-            entry = staged.pop(key, None)
-            if entry is None:
-                if key in in_flight:
+            capture = self._captures.take(req_id, session_id, key)
+            if capture is None:
+                if self._captures.taken_by(req_id, session_id, key):
                     logger.warning(
                         "req:%s windowed block %d (group %s) is planned twice; "
                         "its bytes stay with the first session and this block is "
@@ -610,8 +772,7 @@ class ConnectorWorker:
                     )
                 slots.append(None)
                 continue
-            in_flight[key] = entry
-            slots.append(entry[1])
+            slots.append(capture.slot)
         missing = [
             i for i, slot in enumerate(slots) if slot is None and uris[i] is not None
         ]
@@ -662,6 +823,7 @@ class ConnectorWorker:
         req_id: str,
         *,
         for_save: bool = False,
+        session_id: int = 0,
     ) -> Optional[List[TransferPlan]]:
         """Build the per-group TransferPlans for a set of manager blocks.
 
@@ -717,7 +879,7 @@ class ConnectorWorker:
                             uris=uris,
                             token_indices=[],
                             **self._windowed_save_annotations(
-                                req_id, group, manager_block_idxes, uris
+                                req_id, session_id, group, manager_block_idxes, uris
                             ),
                         )
                     )
@@ -900,13 +1062,14 @@ class ConnectorWorker:
                 save_req.all_block_ids,
                 save_req.req_id,
                 for_save=True,
+                session_id=save_req.session_id,
             )
 
             done_cb = self._data_transfer.create_save_done_callback(
                 save_req.req_id, self._tp_rank, save_req.write_session_id, num_blocks
             )
             if plans is not None:
-                done_cb = self._retain_failed_windowed(save_req, plans, done_cb)
+                done_cb = self._settle_session_captures(save_req, plans, done_cb)
 
             if plans is None:
                 mr = MultiResult(1, done_cb)
@@ -1056,31 +1219,27 @@ class ConnectorWorker:
                 CAPTURE_POOL_WAIT_SECONDS * 1000,
             )
             return False
-        staged = self._staged.setdefault(capture.req_id, {})
         for group, captureable, pool, start in taken:
             for offset, i in enumerate(captureable):
-                key = (group.spec_name, blocks[i])
-                previous = staged.get(key)
-                if previous is not None:
-                    # A repeat capture for a block already staged: the
-                    # announcement was repeated (the scheduler's save watermark
-                    # can move backwards when preemption shrinks the allocation,
-                    # see _dispatch_incremental_saves). The old slot holds no
-                    # session reference -- a session *moves* the entry out of
-                    # _staged when it takes it -- so returning it here is safe;
-                    # overwriting it would drop the arena space for the rest of
-                    # the process's life.
-                    previous_pool, previous_slot = previous
-                    previous_pool.release(previous_slot, 1)
+                # A repeat capture for a block already staged (the save
+                # watermark moved backwards when preemption shrank the
+                # allocation): the ledger supersedes the old entry -- it has no
+                # session reference, a session *moves* the entry into the
+                # in-flight map when it takes it -- and returns its slot.
+                superseded = self._captures.stage(
+                    capture.req_id,
+                    (group.spec_name, blocks[i]),
+                    _Capture(pool=pool, slot=start + offset),
+                )
+                if superseded is not None:
                     logger.warning(
                         "req:%s block %d of %s was captured twice (the "
                         "announcement repeated); releasing its previous slot %d",
                         capture.req_id,
                         blocks[i],
                         group.spec_name,
-                        previous_slot,
+                        superseded,
                     )
-                staged[key] = (pool, start + offset)
         logger.info(
             "req:%s captured %d windowed blocks (%d groups) before the window "
             "moved",
@@ -1106,17 +1265,7 @@ class ConnectorWorker:
         as the request runs. Entries already handed to a session are the task's
         to release and are left alone.
         """
-        staged = self._staged.get(req_id)
-        if not staged:
-            return
-        released = 0
-        for block in blocks:
-            for key in [
-                key for key in staged if key[1] == block
-            ]:
-                pool, slot = staged.pop(key)
-                pool.release(slot, 1)
-                released += 1
+        released = self._captures.release_staged(req_id, blocks)
         if released:
             logger.info(
                 "req:%s released %d captured block slots the manager already "
@@ -1137,16 +1286,13 @@ class ConnectorWorker:
         them and free the same slot twice (the pool's free list would then hold
         the range twice and dispatch it to two transfers; review_r1 S1).
         """
-        staged = self._staged.pop(req_id, None)
-        in_flight = self._in_flight.pop(req_id, None)
-        if staged:
-            for pool, slot in staged.values():
-                pool.release(slot, 1)
+        released = self._captures.retire(req_id)
+        in_flight = self._in_flight.get(req_id)
         logger.debug(
             "req:%s released %d un-taken captured block slots (%d in flight "
             "with their sessions)",
             req_id,
-            len(staged or ()),
+            released,
             len(in_flight or ()),
         )
 

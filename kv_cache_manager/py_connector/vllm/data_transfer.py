@@ -495,8 +495,14 @@ class DataTransferManager:
         transfer_client: Any,
         coordinator_client: TpCoordinatorClient,
         extra_config: TairKvCacheConnectorExtraConfig,
+        max_num_batched_tokens: int = 0,
     ) -> None:
         self._manager_block_size = manager_block_size
+        # The engine's per-step token budget (the chunked-prefill chunk). The
+        # capture partition is sized from it; 0 means an engine that does not
+        # report one, in which case every step must fit the whole arena (the
+        # partition check then refuses any pool too small for that).
+        self._max_num_batched_tokens = max_num_batched_tokens
         self._transfer_client = transfer_client
         self._coordinator_client = coordinator_client
         self._extra_config = extra_config
@@ -526,24 +532,46 @@ class DataTransferManager:
         # save_task_blocks): with it carved out, a task can always start -- and
         # thereby release the captures its own session holds -- so the
         # capture's bounded wait is a deadlock-free degradation rather than a
-        # race for the last run.
+        # race for the last run. Everything else is the capture partition.
         #
-        # It never takes the whole arena, though: a plan whose block count is
-        # <= the configured batch (a 128-block arena with the default 128-block
-        # batches, or a byte-capped shape) would otherwise leave the capture
-        # side with zero slots and silently disable windowed caching for an
-        # otherwise valid configuration. The arena is split in half instead
-        # (capped by the task batch): the eager capture asks for the whole
-        # span of a step's completed blocks in *one* contiguous run and cannot
-        # split it, so one leftover slot would still time out every step that
-        # completes two or more blocks -- a 62-slot arena leaves 31 for
-        # captures, which covers a 16-block chunked-prefill step. The task
-        # batch is capped to the reserve, so a task can always start. Only in a
-        # single-slot arena, where the two cannot coexist, does the slot stay
-        # with the tasks (captures off, logged).
+        # The partition is sized from the *aggregate* demand of the pool's
+        # windowed buckets, with no tuned ratio anywhere:
+        #
+        #  * one request-step can complete at most ``max_num_batched_tokens``
+        #    tokens (chunked prefill's chunk), i.e. cdiv(bound, mbs) manager
+        #    blocks -- the span the eager capture copies;
+        #  * the worker captures one contiguous run *per windowed bucket* and
+        #    holds every run of a step before releasing any of them (a group's
+        #    run cannot be split), so the pool must cover the sum over its
+        #    windowed members;
+        #  * a pool whose arena cannot hold that sum plus one task batch cannot
+        #    serve its configuration at all: the captures would time out on
+        #    every multi-block step and the windowed KV would silently never be
+        #    published. That is refused here, loudly, with the numbers -- the
+        #    same fail-closed stance as the rest of the stack.
+        step_blocks = -(-max(self._max_num_batched_tokens, 1) // manager_block_size)
         for plan in plans:
-            task_batch = min(max(save_batch, load_batch), plan.blocks)
-            reserved = task_batch if plan.blocks == 1 else min(task_batch, plan.blocks // 2)
+            windowed = [
+                kvcache_info.groups[i].spec_name
+                for i in plan.members
+                if getattr(kvcache_info.groups[i], "retention", None) is not None
+            ]
+            capture_demand = len(windowed) * step_blocks
+            task_batch = min(max(save_batch, load_batch), max(plan.blocks - capture_demand, 0))
+            if plan.blocks - capture_demand < 1:
+                raise NotImplementedError(
+                    f"staging pool per_token={plan.key[0]}dB dtype={plan.key[1]}: "
+                    f"{plan.blocks} slots cannot serve its {len(windowed)} "
+                    f"windowed bucket(s) {windowed}: one step can complete "
+                    f"{step_blocks} manager block(s) per bucket (chunk/"
+                    f"preferred block size), so the eager capture needs "
+                    f"{capture_demand} slots at once plus at least one for a "
+                    f"transfer task. Raise staging_pool_blocks (or "
+                    f"staging_pool_max_bytes_per_group for this shape) to at "
+                    f"least {capture_demand + 1}, or lower "
+                    f"max_num_batched_tokens / preferred_block_size"
+                )
+            reserved = task_batch
             pool = _StagingPool(
                 self._device,
                 plan.slot_bytes,
@@ -917,18 +945,15 @@ class DataTransferManager:
         ``ready_event`` exists for the late gather, which this path has none
         of).
 
-        A captured slot goes back to the arena when the write *lands*, and only
-        then: a failed write is not a lost cause. The block can be announced
-        again (the save watermark moves backwards when preemption shrinks an
-        allocation, and a retry session announces the whole prefix), and by
-        then the HBM window that held its KV has moved on -- these captured
-        bytes are the only copy the connector will ever have. The worker puts
-        the failed block's entry back into its staged map (see
-        _retain_failed_windowed) with the slot still held, so the next session
-        publishes it; if that never happens, the entry is released when the
-        request retires. An *exception* out of the SDK is the one case that
-        still returns the slot here: no result callback will fire for that
-        task, so a kept slot would leak in flight for the process's lifetime.
+        The captured slot is *not* released here: it belongs to the worker's
+        capture ledger, which is the single accounting point for these slots
+        (see _CaptureLedger). The session's result callback settles each block
+        -- success returns the slot, failure keeps the bytes staged for a retry
+        (the block is announced again, and the HBM window that produced them
+        has moved on, so they are the only copy left), and a settle for an
+        already-retired request releases it. Doing it here would bypass that
+        ledger: an exception would release a slot the wrapper then restored,
+        and a retirement could free it twice.
         """
         pool = self._pools[group.spec_name]
         uris = [remote_uris[i] for i in valid]
@@ -943,29 +968,24 @@ class DataTransferManager:
             )
             for i in valid
         ]
+        result: Any = None
         ok = False
-        returned = False
         try:
             result = self._transfer_client.SaveKvCaches(uris, buffers)
             ok = result[0] == kvcm_py_client.ClientErrorCode.ER_OK
-            returned = True
-        finally:
-            # On success the captured slot goes back to the arena; on a failed
-            # write it stays held, because the worker restores the block's
-            # entry to its staged map with this very slot. The SDK raising is
-            # the exception: nothing will call the session's result callback
-            # then, so a kept entry would sit in flight for the rest of the
-            # process's life (review_r2 N1 measured 384 of 1024 slots leaking
-            # that way), hence the slot is released here even though the bytes
-            # are lost with it.
-            if ok or not returned:
-                for i in valid:
-                    pool.release(staged_slots[i], 1)  # ty: ignore[invalid-argument-type]
+        except BaseException:
+            # The failure is reported like any other (see save_task): the
+            # ledger settles it, so the bytes stay staged for a retry and the
+            # slot is accounted for exactly once.
+            logger.exception(
+                "save task raised group=%s uris=%d; failing the blocks",
+                group.spec_name,
+                len(uris),
+            )
         if not ok:
             logger.warning(
-                "save task failed group=%s uris=%d result=%s; the block is not "
-                "published and its captured bytes are kept for a retry "
-                "(the slot stays held until the request retires)",
+                "save task failed group=%s uris=%d result=%s; the blocks are "
+                "not published and their captured bytes are kept for a retry",
                 group.spec_name,
                 len(uris),
                 result,
