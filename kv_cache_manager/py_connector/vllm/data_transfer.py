@@ -99,6 +99,7 @@ class _StagingPool:
         per_block_bytes: int,
         max_blocks: int,
         reserved_blocks: int = 0,
+        capture_blocks: int = 0,
     ) -> None:
         if max_blocks <= 0:
             raise ValueError("staging pool must have at least one block slot")
@@ -118,6 +119,17 @@ class _StagingPool:
         # while captures hold every shared slot -- without the split, a
         # captured slot would be released by a task that cannot start.
         self.reserved_blocks = min(max(0, reserved_blocks), max_blocks)
+        # The shared part of the arena must always be able to hand the eager
+        # capture its whole single-step demand (one contiguous run per windowed
+        # bucket, all held at once -- see DataTransferManager._init_pools): a
+        # task that borrows the shared runs may only take down to this floor.
+        # Sizing the partition is not enough on its own -- loads are submitted
+        # before the same step's captures, so without the floor a burst of
+        # in-flight tasks (or of other requests' captures) can hold the whole
+        # shared part and the 50 ms capture deadline expires (the gemma-3-4b
+        # concurrent run measured exactly that: one 16-block run withheld in a
+        # 896-slot capture area, then 6 groups x 16/16 announced blocks failed).
+        self.capture_blocks = min(max(0, capture_blocks), max_blocks - self.reserved_blocks)
         self._runs = [[0, max_blocks - self.reserved_blocks]]
         self._reserved_runs = (
             [[max_blocks - self.reserved_blocks, self.reserved_blocks]]
@@ -175,28 +187,47 @@ class _StagingPool:
             )
 
     def _take_run(self, n: int, keep_reserved: bool = False) -> Optional[int]:
-        """Carve the first run of at least ``n`` slots; caller holds the lock.
+        """Carve a run of at least ``n`` slots; caller holds the lock.
 
-        A transfer task looks in the reserve *first*: the shared runs are the
-        captures' room, and the loads are submitted before the same step's
-        captures (start_load_kv runs before wait_for_save), so a task that
-        took the shared area first would leave the reserve idle and the
-        captures withheld -- their bounded wait is only 50 ms, far less than an
-        SDK call. The reserve is a task's guaranteed room; the shared part is
-        borrowed only when its own batch does not fit the reserve.
+        Two policies, both about the capture's 50 ms deadline (a task's SDK
+        call far exceeds it, so a task may not take the room a capture needs):
+
+        * the capture takes from the shared part, lowest run first -- it is
+          what the shared part exists for;
+        * a transfer task looks in the reserve *first* (its own guaranteed
+          room; loads are submitted before the same step's captures, so the
+          shared part must not be their first choice), then in the shared part
+          **highest run first and only while the floor ``capture_blocks``
+          stays free**. Both directions consume the free region from its own
+          edge, so what is left for the captures stays one contiguous run
+          instead of a spray of gaps.
         """
-        lists = (
-            [self._reserved_runs, self._runs] if not keep_reserved else [self._runs]
-        )
-        for runs in lists:
-            for i, (start, length) in enumerate(runs):
-                if length >= n:
-                    rest = length - n
-                    if rest:
-                        runs[i] = [start + n, rest]
-                    else:
-                        runs.pop(i)
-                    return start
+        if keep_reserved:
+            return self._take_from(self._runs, n, ascending=True)
+        start = self._take_from(self._reserved_runs, n, ascending=True)
+        if start is not None:
+            return start
+        free = sum(length for _start, length in self._runs)
+        if free - n < self.capture_blocks:
+            return None
+        return self._take_from(self._runs, n, ascending=False)
+
+    @staticmethod
+    def _take_from(
+        runs: List[List[int]], n: int, *, ascending: bool
+    ) -> Optional[int]:
+        """Carve from the first fitting run in this direction; caller holds
+        the lock (and has already checked the floor, where one applies)."""
+        order = range(len(runs)) if ascending else range(len(runs) - 1, -1, -1)
+        for i in order:
+            start, length = runs[i]
+            if length >= n:
+                rest = length - n
+                if rest:
+                    runs[i] = [start + n, rest]
+                else:
+                    runs.pop(i)
+                return start
         return None
 
     def release(self, start: int, n: int) -> None:
@@ -602,6 +633,7 @@ class DataTransferManager:
                 plan.slot_bytes,
                 plan.blocks,
                 reserved_blocks=reserved,
+                capture_blocks=capture_demand,
             )
             names = [kvcache_info.groups[i].spec_name for i in plan.members]
             for name in names:
@@ -620,10 +652,12 @@ class DataTransferManager:
             if pool.reserved_blocks:
                 logger.info(
                     "staging pool per_token=%dB dtype=%s: %d slots for captures "
-                    "+ %d reserved for transfer tasks%s",
+                    "(a task may use them only above the %d-slot single-step "
+                    "demand) + %d reserved for transfer tasks%s",
                     plan.key[0],
                     plan.key[1],
                     plan.blocks - pool.reserved_blocks,
+                    pool.capture_blocks,
                     pool.reserved_blocks,
                     " -- captures are disabled (the reserve takes the whole pool)"
                     if pool.reserved_blocks == plan.blocks
