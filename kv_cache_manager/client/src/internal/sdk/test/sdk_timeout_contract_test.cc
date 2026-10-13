@@ -618,11 +618,39 @@ TEST_F(SdkTimeoutContractTest, TestErrorPathDrainIsBoundedByDeadline) {
     int64_t elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
+    // slow peer 在 deadline 前没有完成，因此普通错误不能掩盖 completion unknown。
+    ASSERT_EQ(ER_SDK_TIMEOUT, ec);
     // 返回不得晚于 deadline（1000ms）+ 合理调度余量；绝不等待 slow peer 的 3s。
     ASSERT_LT(elapsed_ms, 2500);
-    ASSERT_NE(ER_OK, ec);
     // 收尾：等 slow fake 自行结束，避免线程池析构时任务仍在跑。
     ASSERT_TRUE(WaitFor(slow_ctrl->get_done, 5000));
+}
+
+// peer 已在 deadline 前返回，但它自己报告 timeout 时，completion 仍然未知；
+// wrapper 不能让另一个 group 更早返回的普通错误覆盖这个信号。
+TEST_F(SdkTimeoutContractTest, TestErrorPathPreservesPeerTimeout) {
+    const std::string kErrHost = "err_peer_timeout_host";
+    const std::string kTimeoutHost = "peer_timeout_host";
+    auto err_ctrl = std::make_shared<FakeSlowSdkControl>();
+    auto timeout_ctrl = std::make_shared<FakeSlowSdkControl>();
+    err_ctrl->get_result.store(static_cast<int>(ER_SDKREAD_ERROR));
+    timeout_ctrl->get_result.store(static_cast<int>(ER_SDK_TIMEOUT));
+    err_ctrl->gate_on_peer_calls = &timeout_ctrl->get_call_count;
+
+    RegisterFakeForTest(kErrHost, err_ctrl);
+    RegisterFakeForTest(kTimeoutHost, timeout_ctrl);
+
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 8, 2000, 2000, 3000, MakeDualFileStorageConfigs(kErrHost, kTimeoutHost)));
+
+    std::vector<DataStorageUri> uris = {
+        MakeUri(kErrHost, "e/0/0/1", 0, 1024),
+        MakeUri(kTimeoutHost, "t/0/0/1", 0, 1024),
+    };
+    auto buffers = TestBuffers::Make(2, 1024);
+
+    ASSERT_EQ(ER_SDK_TIMEOUT, sdk_wrapper.Get(uris, buffers.buffers));
+    ASSERT_TRUE(timeout_ctrl->get_done.load());
 }
 
 // 错误路径的 stop 标志：一个 group 报错后，仍在排队的 group 不得再发起 I/O。

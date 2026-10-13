@@ -307,7 +307,9 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     for (auto &task : tasks) {
         auto wrapped = [stop, deadline, task]() -> ClientErrorCode {
             if (stop->load()) {
-                return ER_SDK_TIMEOUT;
+                // The task was cancelled before starting I/O, so its completion
+                // is known and must not turn a peer's ordinary error into a timeout.
+                return ER_OK;
             }
             if (std::chrono::steady_clock::now() >= deadline) {
                 auto overdue_ms =
@@ -322,14 +324,22 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     }
 
     // 有界 drain：置 stop 拦截排队任务 + 等待其余 future 至多到 deadline（绝不越界）。
-    // 超时路径调用它时 deadline 已过，wait_until 立即返回，保持"超时立即返回"语义；
-    // 普通错误路径则真正等待在飞 peer（此时 deadline 未到，SDK 仍在契约窗口内写
-    // caller buffer，不等就返回会让 caller 在 hard backend 仍在读写时复用/释放 buffer）。
+    // 返回 true 表示至少一个 peer 的 completion 仍未知：它没有在 deadline 前完成，
+    // 或者它自己报告了 timeout。caller 必须把这种情况统一暴露为 ER_SDK_TIMEOUT，
+    // 不能用最先观察到的普通错误掩盖仍可能访问 caller buffer 的 peer。
     auto drain = [&](size_t from) {
         stop->store(true);
+        bool completion_unknown = false;
         for (size_t j = from; j < futures.size(); ++j) {
-            futures[j].wait_until(deadline);
+            if (futures[j].wait_until(deadline) != std::future_status::ready) {
+                completion_unknown = true;
+                continue;
+            }
+            if (futures[j].get() == ER_SDK_TIMEOUT) {
+                completion_unknown = true;
+            }
         }
+        return completion_unknown;
     };
 
     for (size_t i = 0; i < futures.size(); ++i) {
@@ -344,7 +354,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                           i + 1,
                           futures.size(),
                           static_cast<long long>(overdue_ms));
-            drain(i + 1);
+            (void)drain(i + 1);
             return ER_SDK_TIMEOUT;
         }
 
@@ -353,8 +363,7 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
             KVCM_LOG_WARN("run %s parallel failed, error: %d, drain in-flight peers until deadline",
                           getOpTypeString(op_type).c_str(),
                           static_cast<int>(ec));
-            drain(i + 1);
-            return ec;
+            return drain(i + 1) ? ER_SDK_TIMEOUT : ec;
         }
     }
 
