@@ -42,6 +42,7 @@ from kv_cache_manager.py_connector.test.vllm_stubs import (
     make_connector_scheduler,
 )
 from kv_cache_manager.py_connector.vllm.connector_worker import (
+    CAPTURE_POOL_WAIT_SECONDS,
     _Capture,
     _CaptureLedger,
 )
@@ -824,6 +825,58 @@ class TestWindowedSpecGroups(unittest.TestCase):
         meta = TairKvCacheConnectorMetadata(epoch=0)
         sched._collect_release_captures(meta)
         self.assertEqual([], meta.to_release_captures)
+
+    def test_a_batch_release_waits_for_the_save_plans(self):
+        # A release and a session's SaveRequest can ride in one batch (the
+        # release was queued for blocks an older session left behind). The
+        # plan of this batch must take its captures first: applied earlier, the
+        # release would withdraw the bytes the save is about to write, so the
+        # save fails the blocks and cannot even keep them for a retry.
+        group = windowed_group()
+        pool = _StagingPool(torch.device("cpu"), group.per_block_bytes, 32)
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        dtm._extra_config = SimpleNamespace(
+            block_per_save_task=128, block_per_load_task=128
+        )
+        dtm._io_executor = ThreadPoolExecutor(max_workers=2)
+        conn = worker_with([group], dtm)
+        conn._pending_saves = {}
+        conn._device_mod = MagicMock()
+
+        blocks = list(range(16))
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_capture_request(
+            CaptureRequest("r0", blocks, all_block_ids=[list(range(7, 23))])
+        )
+        meta.release_captures("r0", blocks)
+        meta.add_save_request(
+            SaveRequest(
+                req_id="r0",
+                write_session_id="sA",
+                manager_block_idxes=blocks,
+                all_block_ids=[list(range(7, 23))],
+                target_locations=[
+                    {
+                        "block_idxes": [block],
+                        "location_specs": [{"name": "tp0_g0", "uri": "a%d" % block}],
+                    }
+                    for block in blocks
+                ],
+                session_id=7,
+            )
+        )
+        with mock.patch(
+            "kv_cache_manager.py_connector.vllm.data_transfer.batch_gather_scatter_helper"
+        ):
+            conn.wait_for_save(meta)
+        # The plan took every block before the release was applied.
+        self.assertEqual(16, len(conn._in_flight.get("r0", {})))
+        self.assertEqual({}, conn._staged.get("r0", {}))
 
     def test_a_handed_over_session_stops_protecting_its_blocks(self):
         # A session whose plan is in the worker's hands no longer protects its
@@ -2111,6 +2164,90 @@ class TestCaptureFloor(unittest.TestCase):
             pool.release(start, 3)
         self.assertEqual(8, pool.free_blocks)
 
+    def test_the_floor_stays_one_contiguous_run(self):
+        # Fragmentation is the other half of the floor: four free slots split
+        # into 2 + 2 cannot serve a four-block capture, so a task may not
+        # borrow even though the total looks sufficient.
+        pool = _StagingPool(
+            torch.device("cpu"), 1024, 8, reserved_blocks=2, capture_blocks=4
+        )
+        # Carve the shared part into 2 + 2 with two live captures (they keep
+        # their runs), leaving 2 free at the bottom too.
+        # The two free two-slot runs an interleaved release/allocate pattern
+        # can leave behind: four shared slots in total, none usable whole.
+        # (Exhaust the reserve first: a task takes its own room before it
+        # borrows the shared part at all.)
+        reserve = pool.acquire(2, timeout=0.01)
+        self.assertIsNotNone(reserve)
+        pool._runs = [[0, 2], [4, 2]]
+        # Taking one of them would leave at most two in one piece, so the
+        # borrow must be refused even though four slots are free (the
+        # sum-only rule allowed it and the next capture timed out).
+        self.assertIsNone(pool.acquire(1, timeout=0.05))
+        # A capture needs one run of four: with the pieces it must wait, and
+        # once a two-slot run is handed back it goes through.
+        self.assertIsNone(pool.acquire(4, timeout=0.05, keep_reserved=True))
+        pool._runs = [[0, 4]]
+        self.assertEqual(0, pool.acquire(4, timeout=0.05, keep_reserved=True))
+        pool.release(0, 4)
+        pool.release(reserve, 2)
+
+        # The policy keeps that shape from forming in the first place: with
+        # the shared part holding exactly the floor, a live capture takes its
+        # four blocks and the borrow cannot shave the floor's last run.
+        pool2 = _StagingPool(
+            torch.device("cpu"), 1024, 6, reserved_blocks=2, capture_blocks=4
+        )
+        first = pool2.acquire(4, timeout=0.01, keep_reserved=True)
+        self.assertEqual(0, first)
+        reserve = pool2.acquire(2, timeout=0.01)  # a task takes its own room
+        self.assertIsNotNone(reserve)
+        self.assertIsNone(pool2.acquire(1, timeout=0.05))
+        pool2.release(reserve, 2)
+        pool2.release(first, 4)
+        again = pool2.acquire(4, timeout=0.01, keep_reserved=True)
+        self.assertIsNotNone(again, "the floor did not come back")
+        pool2.release(again, 4)
+
+    def test_one_capture_request_spends_one_deadline(self):
+        # Six buckets must not each start a fresh 50 ms wait: the budget is a
+        # property of the step, and the engine thread is what pays for it.
+        groups = [windowed_group(f"tp0_g{i}", group_idx=i) for i in range(3)]
+        pool = _StagingPool(torch.device("cpu"), 4096, 32, reserved_blocks=8)
+        seen: List[float] = []
+
+        class _SlowFirst:
+            def pool_of(self, group):
+                return pool
+
+            def capture_blocks(self, group, slots, timeout):
+                seen.append(timeout)
+                if len(seen) == 1:
+                    # Stand in for the SDK/DMA work a first acquisition waits
+                    # on: the remaining buckets must see the budget shrink.
+                    time.sleep(0.3)
+                return pool.acquire(len(slots), timeout=timeout, keep_reserved=True)
+
+        conn = worker_with(groups, _SlowFirst())
+        with mock.patch(
+            "kv_cache_manager.py_connector.vllm.data_transfer.batch_gather_scatter_helper"
+        ):
+            self.assertTrue(
+                conn._capture_request(
+                    CaptureRequest(
+                        "r0",
+                        list(range(2)),
+                        all_block_ids=[[7, 8], [7, 8], [7, 8]],
+                    )
+                )
+            )
+        self.assertEqual(3, len(seen))
+        self.assertLessEqual(seen[0], CAPTURE_POOL_WAIT_SECONDS)
+        self.assertGreater(seen[0], CAPTURE_POOL_WAIT_SECONDS - 0.01)
+        self.assertLess(seen[1], seen[0])
+        self.assertLessEqual(seen[2], seen[1])
+        conn._release_staged("r0")
+
     def test_a_burst_of_requests_does_not_starve_a_multi_bucket_capture(self):
         # The e2e's shape: six windowed buckets share one arena, each capture
         # request needs 16 contiguous blocks per bucket and holds all six runs,
@@ -2396,6 +2533,42 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         # task that reads it.
         self.assertEqual(self.CAPACITY - 1, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=0)
+
+    def test_a_raising_completion_report_still_settles_the_captures(self):
+        # done_cb talks to the coordinator socket, which can fail: reporting
+        # must not be able to skip the settle, or the session's slots stay in
+        # flight for good (MultiResult never calls a callback twice).
+        conn, dtm, pool, group = self._fixture()
+        blocks = list(range(self.BLOCKS))
+        conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
+        plan = self._plan(conn, blocks, session=1)
+        self.assertNotIn(None, plan.staged_slots)
+
+        def raising_report(flat):
+            raise RuntimeError("coordinator socket died")
+
+        done_cb = conn._settle_session_captures(
+            SimpleNamespace(
+                req_id="r0", manager_block_idxes=blocks, session_id=1
+            ),
+            [plan],
+            raising_report,
+        )
+        dtm._transfer_client.SaveKvCaches.return_value = [1]  # the write fails
+        with self.assertRaises(RuntimeError):
+            dtm.save_task(
+                MultiResult(1, done_cb),
+                0,
+                group,
+                plan.uris,
+                None,
+                None,
+                plan.staged_slots,
+            )
+        # Settled despite the report raising: the bytes are staged for a
+        # retry, nothing is left in flight.
+        self.assertEqual({}, conn._in_flight.get("r0", {}))
+        self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
 
     def test_a_raising_sdk_is_a_failure_and_keeps_the_bytes(self):
         # An SDK that raises (a pybind/backend exception, not an error code) is
