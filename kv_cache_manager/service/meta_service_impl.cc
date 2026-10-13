@@ -381,6 +381,7 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
     }
     std::vector<LocationSpecGroup> location_spec_groups;
     ProtoConvert::LocationSpecGroupsFromProto(request->location_spec_groups(), location_spec_groups);
+    std::string tair_mempool_metaservice_url;
     auto [ec_info, storage_configs] =
         cache_manager_->RegisterInstance(request_context,
                                          request->instance_group(),
@@ -389,7 +390,8 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
                                          location_spec_infos,
                                          model_deployment_req,
                                          location_spec_groups,
-                                         static_cast<CacheManager::QueryType>(request->default_query_type()));
+                                         static_cast<CacheManager::QueryType>(request->default_query_type()),
+                                         &tair_mempool_metaservice_url);
 
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));
@@ -408,6 +410,7 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
         status->set_message("Instance registered successfully");
         response->set_storage_configs(storage_configs);
         response->set_extra_info(cache_manager_->GetExtraInfo(request_context, request->instance_id()));
+        response->set_tair_mempool_metaservice_url(tair_mempool_metaservice_url);
         KVCM_LOG_INFO("[traceId: %s] RegisterInstance succeeded, extra_info=%s",
                       request->trace_id().c_str(),
                       response->extra_info().c_str());

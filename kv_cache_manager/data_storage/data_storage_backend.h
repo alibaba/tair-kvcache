@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -13,6 +15,13 @@
 
 namespace kv_cache_manager {
 
+struct StorageLoadSnapshot {
+    bool valid{false};
+    double storage_usage_ratio{1.0};
+    uint32_t healthy_consumer_count{0};
+    uint32_t healthy_provider_count{0};
+};
+
 class DataStorageBackend {
 public:
     DataStorageBackend() = delete;
@@ -23,6 +32,10 @@ public:
     virtual DataStorageType GetType() = 0;
     virtual bool Available() = 0;
     virtual double GetStorageUsageRatio(const std::string &trace_id) const = 0;
+    virtual StorageLoadSnapshot GetStorageLoadSnapshot(const std::string &trace_id) const {
+        const double ratio = GetStorageUsageRatio(trace_id);
+        return {std::isfinite(ratio) && ratio >= 0.0 && ratio <= 1.0, ratio, 0, 0};
+    }
     inline bool IsOpen() const { return is_open_.load(std::memory_order_relaxed); }
     inline void SetOpen(bool open) { is_open_.store(open, std::memory_order_relaxed); }
     virtual void SetAvailable(bool available) { is_available_.store(available, std::memory_order_release); }

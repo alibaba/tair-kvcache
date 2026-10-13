@@ -256,6 +256,17 @@ TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
     ASSERT_EQ(fclose(file), 0);
 }
 
+TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigPropagatesSelectedMetaServiceUrl) {
+    SdkWrapper sdk_wrapper;
+    auto config = std::make_shared<TairMempoolSdkConfig>();
+
+    ASSERT_EQ(ER_OK,
+              sdk_wrapper.UpdateTairMempoolSdkConfig(
+                  config, nullptr, "spectrum://v-selected?port=12348"));
+
+    EXPECT_EQ("spectrum://v-selected?port=12348", config->tair_mempool_metaservice_url());
+}
+
 // TODO: mock mooncake
 //  TEST_F(SdkWrapperTest, TestInitWithMooncake) {
 //  #ifdef ENABLE_MOONCAKE
