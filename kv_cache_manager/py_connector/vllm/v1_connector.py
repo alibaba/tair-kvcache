@@ -132,12 +132,15 @@ def _layout_names_include(layout_name: str) -> bool:
 
 
 def _packs_pages_inside_blocks(vllm_config: "VllmConfig") -> bool:
-    """Whether this model packs several per-layer KV pages into one block."""
+    """Whether this model packs several per-layer KV pages into one block.
+
+    Only the first architecture counts: vLLM resolves the implementation
+    from it, so a later entry is an unselected fallback whose DeepSeek-V4
+    prefix must not move the *selected* model onto the packed-block layout."""
     model_config = getattr(vllm_config, "model_config", None)
     architectures = getattr(model_config, "architectures", None) or ()
-    return any(
-        architecture.startswith(_PACKED_BLOCK_ARCHITECTURES)
-        for architecture in architectures
+    return bool(architectures) and architectures[0].startswith(
+        _PACKED_BLOCK_ARCHITECTURES
     )
 
 
