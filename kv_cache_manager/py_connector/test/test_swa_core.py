@@ -41,6 +41,10 @@ from kv_cache_manager.py_connector.test.vllm_stubs import (
     make_connector,
     make_connector_scheduler,
 )
+from kv_cache_manager.py_connector.vllm.connector_worker import (
+    _Capture,
+    _CaptureLedger,
+)
 from kv_cache_manager.py_connector.vllm.data_transfer import (
     DataTransferManager,
     MultiResult,
@@ -985,6 +989,51 @@ class TestWindowedSpecGroups(unittest.TestCase):
         )
 
 
+    def test_a_recaptured_block_promotes_its_remembered_claim(self):
+        # The block was first announced after its window had moved on
+        # (claimed=False) and the announcement is remembered; preemption later
+        # recomputed it and the eager capture holds its bytes. The memory must
+        # follow: a retry after this write fails has to announce the windowed
+        # spec, otherwise the staged bytes can never be published.
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._window_claims["r0"] = {0: False}
+        announced = sched._announced_window_mask("r0", [True])
+        self.assertEqual([True], announced)
+        self.assertEqual({0: True}, sched._window_claims["r0"])
+        # The other direction still holds: a claimed block keeps its coverage
+        # when the window moves away.
+        self.assertEqual([True], sched._announced_window_mask("r0", [False]))
+
+    def test_a_queued_release_is_rechecked_against_newer_sessions(self):
+        # A failed announcement queues a release for its blocks; a session
+        # created afterwards re-announces and recaptures the same block. The
+        # flush must drop the stale release, or the worker would capture the
+        # fresh bytes and immediately discard them.
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=1
+        )
+        first = sched._record_announcement("r0", 16)
+        sched._remember_session_plan("r0", first, set())
+        sched._queue_capture_release("r0", first, 16)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(meta)
+        self.assertEqual([("r0", list(range(16)))], meta.to_release_captures)
+
+        # Now the release is queued and a *newer* session re-announces and
+        # recaptures blocks 0-1 before the flush: their captures must survive.
+        sched._queue_capture_release("r0", first, 16)
+        second = sched._record_announcement("r0", 16)
+        sched._remember_session_plan("r0", second, {0, 1})
+        stale = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(stale)
+        self.assertEqual([("r0", list(range(2, 16)))], stale.to_release_captures)
+
+
 class TestWindowedHitClamp(unittest.TestCase):
     """`_safe_external_prefix` must only end where the window has data."""
 
@@ -1872,6 +1921,144 @@ class TestCaptureSlotInvariant(unittest.TestCase):
         self.assertEqual(self.CAPACITY, pool.free_blocks)
 
 
+
+    def test_concurrent_failed_settles_of_one_block_keep_one_owner(self):
+        # Two sessions hold the same (spec, block) and both fail at once: each
+        # restages its own entry, so the settle must not overwrite the other's
+        # (one slot would be held by the pool with no entry left to release
+        # it). The barrier lines the two threads up on the decision.
+        import threading
+
+        ledger = _CaptureLedger()
+        pool = _StagingPool(torch.device("cpu"), 1024, 8)
+        first_e = [pool.acquire(1)]
+        first = _Capture(pool=pool, slot=first_e[0])
+        second = _Capture(pool=pool, slot=pool.acquire(1))
+        ledger.stage("r0", ("tp0_g0", 0), first)
+        ledger.take("r0", 1, ("tp0_g0", 0))
+        ledger.stage("r0", ("tp0_g0", 0), second)
+        ledger.take("r0", 2, ("tp0_g0", 0))
+
+        barrier = threading.Barrier(2)
+        errors: List[BaseException] = []
+
+        def settle(session: int) -> None:
+            try:
+                barrier.wait(timeout=5)
+                ledger.settle("r0", session, {("tp0_g0", 0): False})
+            except BaseException as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [threading.Thread(target=settle, args=(session,)) for session in (1, 2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual([], errors)
+        staged = list(ledger.staged["r0"].values())
+        self.assertEqual(1, len(staged), "one of the two settled entries was lost")
+        self.assertEqual({}, ledger.in_flight.get("r0", {}))
+        self.assertEqual(8, pool.free_blocks + 1, "a slot is neither free nor owned")
+
+    def test_one_transition_holds_the_ledger_against_the_others(self):
+        # The lock is what makes an ownership decision atomic: the release a
+        # settle performs happens with the ledger held, so a concurrent settle
+        # cannot read a half-updated map. A slow release stands in for the
+        # window: with the lock the second settle waits it out, without it the
+        # second settle runs to completion inside it.
+        import threading
+
+        ledger = _CaptureLedger()
+        pool = _StagingPool(torch.device("cpu"), 1024, 8)
+        first_e = [pool.acquire(1)]
+        first = _Capture(pool=pool, slot=first_e[0])
+        second = _Capture(pool=pool, slot=pool.acquire(1))
+        ledger.stage("r0", ("tp0_g0", 0), first)
+        ledger.take("r0", 1, ("tp0_g0", 0))
+        ledger.stage("r0", ("tp0_g0", 1), second)
+        ledger.take("r0", 2, ("tp0_g0", 1))
+
+        entered = threading.Event()
+        proceed = threading.Event()
+        real_release = _CaptureLedger._release
+
+        def slow_release(capture):
+            # Only the first settler's release is slow: the point is what the
+            # *other* transition is allowed to do while it runs.
+            if capture.slot == first_e[0]:
+                entered.set()
+                proceed.wait(timeout=5)
+            real_release(capture)
+
+        ledger._release = slow_release  # ty: ignore[method-assign]
+        second_done = threading.Event()
+
+        def first_settle():
+            ledger.settle("r0", 1, {("tp0_g0", 0): True})
+
+        def second_settle():
+            ledger.settle("r0", 2, {("tp0_g0", 1): True})
+            second_done.set()
+
+        one = threading.Thread(target=first_settle)
+        two = threading.Thread(target=second_settle)
+        one.start()
+        self.assertTrue(entered.wait(timeout=5), "the first settle never released")
+        two.start()
+        self.assertFalse(
+            second_done.wait(timeout=0.3),
+            "a settle ran while another transition held the ledger",
+        )
+        proceed.set()
+        one.join(timeout=10)
+        two.join(timeout=10)
+        self.assertTrue(second_done.is_set())
+        self.assertEqual(8, pool.free_blocks)
+        self.assertEqual({}, ledger.in_flight.get("r0", {}))
+
+    def test_a_retire_racing_a_failed_settle_leaves_nothing_behind(self):
+        # A retirement and a failure callback can run at the same time. Whichever
+        # wins, the invariant holds: the request's staged entries are released,
+        # and a settle that lands after the retirement releases its slot too.
+        import threading
+
+        for _round in range(50):
+            ledger = _CaptureLedger()
+            pool = _StagingPool(torch.device("cpu"), 1024, 8)
+            staged = _Capture(pool=pool, slot=pool.acquire(1))
+            flight = _Capture(pool=pool, slot=pool.acquire(1))
+            ledger.stage("r0", ("tp0_g0", 0), staged)
+            ledger.stage("r0", ("tp0_g0", 1), flight)
+            ledger.take("r0", 1, ("tp0_g0", 1))
+
+            barrier = threading.Barrier(2)
+            errors: List[BaseException] = []
+
+            def retire() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    ledger.retire("r0")
+                except BaseException as exc:  # pragma: no cover - failure path
+                    errors.append(exc)
+
+            def settle() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    ledger.settle("r0", 1, {("tp0_g0", 1): False})
+                except BaseException as exc:  # pragma: no cover - failure path
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=retire), threading.Thread(target=settle)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+            self.assertEqual([], errors)
+            owned = sum(len(entries) for entries in ledger.staged.values()) + sum(
+                len(entries) for entries in ledger.in_flight.values()
+            )
+            self.assertEqual(8, pool.free_blocks + owned, f"round {_round}")
+
 class TestPoolDeadline(unittest.TestCase):
     """The capture's bounded wait: blocking forever would deadlock the engine."""
 
@@ -2193,6 +2380,19 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             [0],
         )
         self.assertEqual([False], verdicts)
+        # The slot is *not* returned here: it belongs to the capture ledger,
+        # and releasing it in the task would race the settle that keeps the
+        # bytes for a retry (or hands the slot to the next capture that the
+        # failure's restaged entry would then read). The ledger settles it.
+        self.assertEqual(3, pool.free_blocks)
+        self.assertEqual([0], [entry.slot for entry in conn._staged["r0"].values()])
+        conn._captures.settle("r0", 0, {("tp0_g0", 0): False})
+        self.assertEqual(3, pool.free_blocks)  # kept for the retry
+        conn._captures.settle("r0", 0, {("tp0_g0", 0): False})  # idempotent
+        self.assertEqual(3, pool.free_blocks)
+        # The retry session takes the restaged entry and its write lands.
+        self.assertIsNotNone(conn._captures.take("r0", 7, ("tp0_g0", 0)))
+        conn._captures.settle("r0", 7, {("tp0_g0", 0): True})
         self.assertEqual(4, pool.free_blocks)
 
     def test_a_second_plan_fails_instead_of_handing_the_slot_out_twice(self):

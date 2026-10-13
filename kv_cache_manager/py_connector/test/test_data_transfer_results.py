@@ -893,6 +893,7 @@ class TestDataTransferManagerPools(unittest.TestCase):
         import kv_cache_manager.py_connector.vllm.data_transfer as dt
 
         max_num_batched_tokens = overrides.pop("max_num_batched_tokens", self.MBS)
+        max_num_seqs = overrides.pop("max_num_seqs", 0)
         extra = TairKvCacheConnectorExtraConfig(
             manager_uri="http://127.0.0.1:1",
             coordinator_base_port=1,
@@ -915,6 +916,7 @@ class TestDataTransferManagerPools(unittest.TestCase):
                 MagicMock(),
                 extra,
                 max_num_batched_tokens=max_num_batched_tokens,
+                max_num_seqs=max_num_seqs,
             )
 
     def _groups(self):
@@ -1020,6 +1022,57 @@ class TestDataTransferManagerPools(unittest.TestCase):
         pool.release(second, 16)
         pool.release(task, 30)
         self.assertEqual(pool.free_blocks, 62)
+
+    def test_a_task_prefers_the_reserve_over_the_capture_area(self):
+        # Loads are submitted before the same step's captures, so a load that
+        # took the shared runs first would leave the reserve idle and the
+        # capture withheld (its wait is 50 ms, far less than an SDK call).
+        from kv_cache_manager.py_connector.vllm.data_transfer import _StagingPool
+
+        pool = _StagingPool(torch.device("cpu"), 4096, 8, reserved_blocks=3)
+        task = pool.acquire(3)  # a whole task batch
+        self.assertEqual(5, task)  # from the reserve, not from slot 0
+        capture = pool.acquire(2, timeout=0.01, keep_reserved=True)
+        self.assertIsNotNone(capture, "the capture area was eaten by a task")
+        self.assertEqual(0, capture)
+        pool.release(task, 3)
+        pool.release(capture, 2)
+        self.assertEqual(8, pool.free_blocks)
+
+    def test_the_demand_counts_per_request_block_rounding(self):
+        # A step of one block per request still completes a whole block each:
+        # 16 decode requests complete 16 blocks from a 16-token step, so the
+        # per-request rounding (max_num_seqs) is part of the demand, and an
+        # arena sized for cdiv(bound, mbs) alone would withhold every capture.
+        groups = self._groups()
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._dtm(
+                groups,
+                block_per_save_task=128,
+                block_per_load_task=128,
+                staging_pool_blocks=4,
+                staging_pool_max_bytes_per_group=4 * 4096,
+                max_num_batched_tokens=self.MBS,
+                max_num_seqs=16,
+            )
+        message = str(ctx.exception)
+        self.assertIn("per bucket", message)
+        self.assertIn("at least 35", message)
+
+        # With no room for the rounding the pool is refused; the same pool with
+        # a bound that admits it keeps the aggregate rule's reserve.
+        dtm = self._dtm(
+            groups,
+            block_per_save_task=128,
+            block_per_load_task=128,
+            staging_pool_blocks=64,
+            staging_pool_max_bytes_per_group=64 * 4096,
+            max_num_batched_tokens=self.MBS,
+            max_num_seqs=16,
+        )
+        shared = dtm._pools["tp0_g0"]
+        # two windowed buckets x (1 + 16) blocks of demand
+        self.assertEqual(64 - 2 * 17, shared.reserved_blocks)
 
     def test_a_pool_too_small_for_its_capture_demand_is_refused(self):
         # Failing closed here is the point: an arena that cannot hold the
