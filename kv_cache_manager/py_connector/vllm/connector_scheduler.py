@@ -141,7 +141,7 @@ class ConnectorScheduler:
         # (req_id, block indices) whose captures no write session will publish
         # (the manager already holds them): queued by the http threads, flushed
         # by the scheduler loop into the metadata the worker reads.
-        self._pending_release_captures: List[Tuple[str, List[int]]] = []
+        self._pending_release_captures: List[Tuple[str, int, List[int]]] = []
         self._pending_release_captures_lock = threading.Lock()
         # Per request, the write sessions that may still consume captured
         # bytes, keyed by a per-request session id: each entry holds the
@@ -281,6 +281,14 @@ class ConnectorScheduler:
                     block,
                 )
                 present = claimed
+            elif present and not claimed:
+                # The block was announced window-less after its window had
+                # moved on, but the window now covers it again (it was
+                # preempted and recomputed) and the eager capture has its
+                # bytes. Promote the memory: a retry after this write fails
+                # has to be allowed to publish them, and a stale "no window"
+                # claim would drop the spec from the retry's announcement.
+                claims[block] = True
             announced.append(present)
         return announced
 
@@ -876,9 +884,20 @@ class ConnectorScheduler:
         with self._pending_release_captures_lock:
             pending = self._pending_release_captures
             self._pending_release_captures = []
-        for req_id, blocks in pending:
-            if blocks:
-                meta.release_captures(req_id, blocks)
+        for req_id, session_id, blocks in pending:
+            if not blocks:
+                continue
+            # The protection was checked when the release was queued (in the
+            # http thread); a session created since may have re-announced and
+            # recaptured the same block, so re-check it here, where the queue
+            # meets the step that also carries the new capture. Otherwise the
+            # worker would capture and immediately discard the fresh bytes,
+            # and the retry that finally succeeds would have nothing to
+            # publish.
+            protected = self._blocks_other_sessions_write(req_id, session_id)
+            releasable = [block for block in blocks if block not in protected]
+            if releasable:
+                meta.release_captures(req_id, releasable)
 
     def _collect_load_instructions(self, meta: TairKvCacheConnectorMetadata) -> None:
         """Hand the worker the loads whose blocks were allocated.
@@ -1188,7 +1207,7 @@ class ConnectorScheduler:
         if not releasable:
             return
         with self._pending_release_captures_lock:
-            self._pending_release_captures.append((req_id, releasable))
+            self._pending_release_captures.append((req_id, session_id, releasable))
 
     def _retire_session_protection(self, req_id: str, session_id: int) -> None:
         """Stop holding back this session's blocks (see _blocks_other_sessions_write)."""
