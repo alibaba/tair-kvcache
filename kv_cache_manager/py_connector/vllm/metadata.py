@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
@@ -64,11 +64,11 @@ class CaptureRequest:
 class TairKvCacheConnectorMetadata(KVConnectorMetadata):
     """Scheduler -> worker metadata for one engine step.
 
-    Four instruction kinds, each consumed by its own worker hook:
-    to_load_requests (start_load_kv), to_capture_requests + to_save_requests
-    (wait_for_save) and to_finish_requests (get_finished). Every instruction is
-    self-contained -- the worker keeps no per-request mirror of scheduler
-    state."""
+    Five instruction kinds, each consumed by its own worker hook:
+    to_load_requests (start_load_kv), to_capture_requests + to_save_requests +
+    to_release_captures (wait_for_save) and to_finish_requests (get_finished).
+    Every instruction is self-contained -- the worker keeps no per-request
+    mirror of scheduler state."""
 
     def __init__(self, epoch: int) -> None:
         self.epoch = epoch
@@ -76,6 +76,7 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
         self.to_capture_requests: List[CaptureRequest] = []
         self.to_save_requests: List[SaveRequest] = []
         self.to_finish_requests: List[FinishRequest] = []
+        self._release_captures: List[Tuple[str, List[int]]] = []
 
     def add_load_request(self, request: LoadRequest) -> None:
         self.to_load_requests.append(request)
@@ -89,11 +90,25 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
     def add_finish_request(self, finish_request: FinishRequest) -> None:
         self.to_finish_requests.append(finish_request)
 
+    @property
+    def to_release_captures(self) -> List[Tuple[str, List[int]]]:
+        """(req_id, block indices) whose eager captures no session will write.
+
+        Filled by the scheduler when a write session reports that the manager
+        already holds those blocks: those captured bytes are not going to be
+        published, so the worker gives their arena slots back now instead of
+        holding them until the request retires."""
+        return self._release_captures
+
+    def release_captures(self, req_id: str, block_idxes: List[int]) -> None:
+        self._release_captures.append((req_id, list(block_idxes)))
+
     def __repr__(self) -> str:
         return (
             f"TairKvCacheConnectorMetadata(epoch={self.epoch}, "
             f"load={len(self.to_load_requests)}, "
             f"capture={len(self.to_capture_requests)}, "
             f"save={len(self.to_save_requests)}, "
-            f"finish={len(self.to_finish_requests)})"
+            f"finish={len(self.to_finish_requests)}, "
+            f"release={len(self._release_captures)})"
         )

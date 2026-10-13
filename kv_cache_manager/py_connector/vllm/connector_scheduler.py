@@ -123,7 +123,34 @@ class ConnectorScheduler:
         # (states complete, window data present) -> the spec group a block is
         # announced under. An instance with nothing sparse declares nothing and
         # sends no group names at all, exactly as before this PR.
-        self._spec_group_names = spec_group_plan(group_metas, tp_size)[1]
+        declared, self._spec_group_names = spec_group_plan(group_metas, tp_size)
+        # A block with *no* coverage at all (no state and no window data) has
+        # no group of its own: the manager needs a name for every announced
+        # block, so it gets the narrowest declared one (the fewest specs to
+        # allocate for bytes that will never arrive -- the block is failed by
+        # the save verdict either way), which keeps every other block's precise
+        # group instead of dropping the whole request to the "all specs"
+        # default.
+        self._narrowest_spec_group = (
+            min(declared, key=lambda group: (len(group["spec_names"]), group["name"]))[
+                "name"
+            ]
+            if declared
+            else None
+        )
+        # (req_id, block indices) whose captures no write session will publish
+        # (the manager already holds them): queued by the http threads, flushed
+        # by the scheduler loop into the metadata the worker reads.
+        self._pending_release_captures: List[Tuple[str, List[int]]] = []
+        self._pending_release_captures_lock = threading.Lock()
+        # Per request, per block: whether the block's bytes were claimed as
+        # windowed when it was first announced (see _dispatch_incremental_saves
+        # and _announced_window_mask): a repeat announce of the same block --
+        # the save watermark moves backwards when preemption shrinks the
+        # allocation, and a failed start_write_cache is retried the same way --
+        # must claim what the capture actually holds, not what the window looks
+        # like by then.
+        self._window_claims: Dict[str, Dict[int, bool]] = {}
         self._manager_block_size = manager_block_size
         self._vllm_block_size = vllm_block_size
         self._tp_size = tp_size
@@ -214,6 +241,35 @@ class ConnectorScheduler:
             for mb in manager_block_idxes
         ]
 
+    def _announced_window_mask(
+        self, req_id: str, window_data_mask: List[bool]
+    ) -> List[bool]:
+        """The window coverage to announce, remembering what was claimed.
+
+        A block that was already announced keeps the coverage of that first
+        announcement as long as the request lives: its captured bytes sit in
+        the worker's arena keyed to it (the window may have moved on since), so
+        re-announcing it as window-less would leave bytes the manager was never
+        told about -- the save would fail the block and release its only copy.
+        """
+        claims = self._window_claims.setdefault(req_id, {})
+        announced = []
+        for block, present in enumerate(window_data_mask):
+            claimed = claims.get(block)
+            if claimed is None:
+                claims[block] = present
+            elif claimed and not present:
+                logger.info(
+                    "req:%s block %d: keeping the windowed coverage claimed by "
+                    "its first announcement (the window has moved since; its "
+                    "captured bytes are still in the arena)",
+                    req_id,
+                    block,
+                )
+                present = claimed
+            announced.append(present)
+        return announced
+
     def _spec_group_for(
         self, states_complete: bool, window_present: bool
     ) -> Optional[str]:
@@ -295,19 +351,22 @@ class ConnectorScheduler:
         failing the request) or, for a multi-group model, let visible rows read
         unloaded KV. Such a meta therefore requires the whole range instead,
         which ``_window_required_from`` expresses as "from block 0".
+
+        The EAGLE/MTP drop is one *hash* block, i.e. vLLM's own block size in
+        tokens, not one manager block: when ``preferred_block_size`` makes the
+        manager blocks smaller than the scheduler's, the resumed window moves
+        back by several manager blocks at once.
         """
         retention = meta.retention
         assert retention is not None
-        if retention.kind == RETENTION_RSWA_GAP:
-            return self._num_blocks_of_retention(meta)
-        blocks = self._num_blocks_of_retention(meta)
-        return blocks + 1 if self._has_eagle_group else blocks
-
-    def _num_blocks_of_retention(self, meta: AttentionGroupMeta) -> int:
-        retention = meta.retention
-        assert retention is not None
+        dropped = self._vllm_block_size if self._has_eagle_group else 0
         return -(
-            -(retention.window_tokens - 1 + retention.extra_retained_tokens)
+            -(
+                retention.window_tokens
+                - 1
+                + retention.extra_retained_tokens
+                + dropped
+            )
             // self._manager_block_size
         )
 
@@ -635,6 +694,7 @@ class ConnectorScheduler:
         self._ingest_scheduled_reqs(scheduler_output)
         self._dispatch_incremental_saves(meta, scheduler_output)
         self._collect_load_instructions(meta)
+        self._collect_release_captures(meta)
         self._collect_save_instructions(meta)
         self._collect_finish_instructions(meta)
         return meta
@@ -788,6 +848,15 @@ class ConnectorScheduler:
                 )
             ledger.has_saved_block_num = target_save_num
 
+    def _collect_release_captures(self, meta: TairKvCacheConnectorMetadata) -> None:
+        """Hand the worker the captures this step's sessions will not write."""
+        with self._pending_release_captures_lock:
+            pending = self._pending_release_captures
+            self._pending_release_captures = []
+        for req_id, blocks in pending:
+            if blocks:
+                meta.release_captures(req_id, blocks)
+
     def _collect_load_instructions(self, meta: TairKvCacheConnectorMetadata) -> None:
         """Hand the worker the loads whose blocks were allocated.
 
@@ -838,6 +907,7 @@ class ConnectorScheduler:
         self._waiting_to_finish_requests = []
 
     def _retire_request(self, req_id: str) -> None:
+        self._window_claims.pop(req_id, None)
         """The request's save obligations are settled: tell the worker to drop
         its bookkeeping and stop tracking the request ourselves."""
         self._waiting_to_finish_requests.append(FinishRequest(req_id))
@@ -881,24 +951,41 @@ class ConnectorScheduler:
             assert len(window_data_mask) == target_save_num, (
                 f"window mask {len(window_data_mask)} != {target_save_num} blocks"
             )
+            announced = self._announced_window_mask(req_id, window_data_mask)
             coverage_names = [
                 self._spec_group_for(complete, window_present)
-                for complete, window_present in zip(
-                    state_complete_mask, window_data_mask
-                )
+                for complete, window_present in zip(state_complete_mask, announced)
             ]
+            empties = sum(name is None for name in coverage_names)
+            if empties and self._narrowest_spec_group is not None:
+                # A block with no coverage at all: give it the narrowest
+                # declared group (it cannot fill even that, so the save verdict
+                # fails it and nothing is published) and keep every other
+                # block's precise coverage.
+                coverage_names = [
+                    name if name is not None else self._narrowest_spec_group
+                    for name in coverage_names
+                ]
+                logger.warning(
+                    "req:%s: %d/%d blocks carry neither state nor window data; "
+                    "announcing them under %s (they will not be published)",
+                    req_id,
+                    empties,
+                    target_save_num,
+                    self._narrowest_spec_group,
+                )
             if all(name is not None for name in coverage_names):
                 request["location_spec_group_names"] = coverage_names
             else:
-                # No declared group describes every block of this session (the
-                # instance has no non-windowed spec at all): announce the
-                # default, i.e. every registered spec. Sound because such a
-                # block is one *nothing* can publish (every group abstains).
+                # Nothing at all is declared (no state group, no window): the
+                # default is every registered spec, which is what the manager
+                # assumed before this PR. Sound only because such an instance
+                # has nothing sparse to isolate.
                 logger.info(
                     "req:%s: %d/%d blocks have no declared spec group; "
                     "announcing all specs",
                     req_id,
-                    sum(name is None for name in coverage_names),
+                    empties,
                     target_save_num,
                 )
             if not all(window_data_mask):
@@ -953,6 +1040,12 @@ class ConnectorScheduler:
         )
 
         if not locations:
+            # Every announced block is already in the manager: release the
+            # captures for all of them too (this session writes nothing at all).
+            with self._pending_release_captures_lock:
+                self._pending_release_captures.append(
+                    (req_id, list(range(target_save_num)))
+                )
             try:
                 self._manager_client.finish_write_cache(
                     {
@@ -975,6 +1068,16 @@ class ConnectorScheduler:
         need_block_idx = self.parse_block_mask_to_save_indices(
             response, target_save_num
         )
+        already = self.parse_block_mask_to_existing_indices(response, target_save_num)
+        if already:
+            # The manager already holds these blocks, so this session will not
+            # write them: the worker's eager capture for them has nothing to
+            # publish and must give its arena slots back now, not when the
+            # request retires (a long duplicate request would otherwise pin one
+            # slot per already-cached block). The scheduler loop flushes this
+            # into the metadata (the http thread has none).
+            with self._pending_release_captures_lock:
+                self._pending_release_captures.append((req_id, already))
         message = CoordinateMessage(
             time.time(),
             SendBlockStartEvent(
@@ -1020,6 +1123,19 @@ class ConnectorScheduler:
             return list(range(block_mask["offset"], target_save_num))
         values = block_mask.get("bool_masks", {}).get("values", [])
         return [idx for idx, saved in enumerate(values) if not saved]
+
+    def parse_block_mask_to_existing_indices(
+        self, response: dict, target_save_num: int
+    ) -> List[int]:
+        """The mirror of ``parse_block_mask_to_save_indices``: the blocks the
+        manager already holds, which this session will therefore not write."""
+        block_mask = response.get("block_mask", {})
+        if "offset" in block_mask:
+            return list(range(0, min(block_mask["offset"], target_save_num)))
+        values = block_mask.get("bool_masks", {}).get("values", [])
+        return [
+            idx for idx, saved in enumerate(values[:target_save_num]) if saved
+        ]
 
     # ------------------------------------------------------------------ #
     # Request finish
