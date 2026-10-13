@@ -134,14 +134,39 @@ def _layout_names_include(layout_name: str) -> bool:
 def _packs_pages_inside_blocks(vllm_config: "VllmConfig") -> bool:
     """Whether this model packs several per-layer KV pages into one block.
 
-    Only the first architecture counts: vLLM resolves the implementation
-    from it, so a later entry is an unselected fallback whose DeepSeek-V4
-    prefix must not move the *selected* model onto the packed-block layout."""
+    Keyed on the architecture vLLM actually resolves (the first entry its
+    model registry supports, which is not necessarily ``architectures[0]``):
+    an unselected fallback must not move the selected model onto the
+    packed-block layout, and an unsupported leading entry must not hide a
+    supported packed one. Unresolvable (ancient vLLM, registry failures)
+    reads as False: the standard layout is accepted and a really packed
+    model then fails registration loudly, which is the safe direction."""
     model_config = getattr(vllm_config, "model_config", None)
     architectures = getattr(model_config, "architectures", None) or ()
-    return bool(architectures) and architectures[0].startswith(
-        _PACKED_BLOCK_ARCHITECTURES
-    )
+    if not architectures:
+        return False
+    resolved = _resolved_architecture(architectures, model_config)
+    return resolved is not None and resolved.startswith(_PACKED_BLOCK_ARCHITECTURES)
+
+
+def _resolved_architecture(
+    architectures: "list[str]", model_config: Any
+) -> Optional[str]:
+    """The architecture vLLM's model registry selects for this config.
+
+    Mirrors the engine's own resolution (``ModelRegistry.resolve_model_cls``
+    picks the first entry it supports) so the layout predicate and the engine
+    can never disagree about which implementation runs."""
+    try:
+        from vllm.model_executor.models.registry import ModelRegistry
+
+        _, resolved = ModelRegistry.resolve_model_cls(architectures, model_config)
+        return resolved
+    except Exception:
+        # An unresolvable list is not evidence of a packed-block model;
+        # refusing to guess keeps the standard layout (and a really packed
+        # model fails registration with the layout assertion).
+        return None
 
 
 class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
