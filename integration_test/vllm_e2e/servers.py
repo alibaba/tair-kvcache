@@ -3,14 +3,14 @@ binary and the real vLLM OpenAI server, plus ScenarioEnv which owns
 their lifetimes for one scenario."""
 
 from lib_utils import (
-    MODEL_PATH, assert_loaded_blocks, assert_pinned_ok, assert_report_ok,
-    block_tables_from_logs,
+    MODEL_PATH, CaptureVerificationError, RetentionFacts, assert_loaded_blocks,
+    assert_pinned_ok, assert_report_ok, block_tables_from_names,
     block_token_hash, compare_captures, count_captures, find_manager_binary,
     find_python, find_repo_root, free_port, full_block_hashes,
     get_manager_block_size, has_full_attention_group, is_hybrid_model,
-    is_mla_model, is_multigroup_model, is_swa_model, loaded_block_count,
-    make_base_prompts, model_fingerprint, scenario_tp_size, send_completions,
-    window_kind,
+    is_mla_model, is_multigroup_model, is_swa_model,
+    make_base_prompts, model_fingerprint, retention_facts_from_logs,
+    scenario_tp_size, send_completions, window_kind,
     shared_token_prefix_len, tokenize, wait_for_captures,
     wait_for_prefix_cached, wait_http, window_tail_blocks, window_tokens,
 )
@@ -20,11 +20,14 @@ import glob
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
 import time
+import unittest
 import uuid
+from dataclasses import dataclass
 from typing import Optional
 
 import requests
@@ -211,6 +214,24 @@ class ManagerProcess:
 # vLLM server
 
 # --------------------------------------------------------------------------- #
+#: Headroom a scenario leaves inside --max-model-len for the completion it asks
+#: for plus tokenizer slop when it gates a generated prompt on that limit.
+MODEL_LEN_MARGIN = 16
+
+#: The connector's worker-init line names the tp rank ("tp rank: 1/2"). The
+#: pinned total does not, so the ranks come from here (same worker, same start)
+#: and the report count is what says every start is covered.
+RANK_LINE_RE = r"worker inited, tp rank: (\d+)/(\d+)"
+
+#: Did *this* worker's pool plan run? The pinned total carries no rank, and a
+#: stream can show two totals from one rank while another never planned at all
+#: (the worker-init lines only prove the workers started). The harness's own
+#: connector logs this line right after the parent's registration -- i.e. in the
+#: very step that builds the pools and prints the total -- so its rank tags the
+#: worker that reported, on top of the unkeyed budget check (whose max over all
+#: lines is sound either way).
+PLAN_LINE_RE = r"VerifyingConnector enabled.*tp_rank=(\d+)"
+
 #: Serving flags every scenario starts from; `overrides` (a scenario's own args
 #: merged with KVCM_E2E_VLLM_ARGS) wins, then per-model additions kick in.
 _BASE_SERVING_ARGS = {
@@ -219,6 +240,22 @@ _BASE_SERVING_ARGS = {
     "enforce-eager": None,
     "max-num-seqs": "16",
 }
+
+
+def effective_serving_args(model_path: str = MODEL_PATH,
+                           overrides: Optional[dict] = None) -> dict:
+    """The serving flags a server is actually started with.
+
+    Single merge point for the built-in defaults, the operator's
+    KVCM_E2E_VLLM_ARGS and a scenario's own overrides (in that order of
+    precedence), so anything that has to reason about a knob -- e.g. the
+    scenario gates reading --max-model-len -- reads the same value the engine
+    got instead of re-guessing the default.
+    """
+    return serving_args(model_path, {
+        **(overrides or {}),
+        **json.loads(os.environ.get("KVCM_E2E_VLLM_ARGS", "{}")),
+    })
 
 
 def serving_args(model_path: str, overrides: Optional[dict] = None) -> dict:
@@ -305,11 +342,11 @@ class VllmServer:
         # KVCM_E2E_VLLM_ARGS (JSON dict, same key format) is the operator
         # escape hatch -- e.g. serving a model whose weights need
         # quantization to fit the local GPUs.
-        vllm_args = serving_args(
-            MODEL_PATH,
-            {**getattr(self, "vllm_args", {}),
-             **json.loads(os.environ.get("KVCM_E2E_VLLM_ARGS", "{}"))},
-        )
+        vllm_args = effective_serving_args(MODEL_PATH,
+                                           getattr(self, "vllm_args", {}))
+        # Recorded for the gates that must reason about a knob afterwards
+        # (--max-model-len bounds the prompts a scenario may build).
+        self.serving_args = vllm_args
         cmd = [
             find_python(), "-m", "vllm.entrypoints.openai.api_server",
             "--model", MODEL_PATH,
@@ -457,6 +494,11 @@ class ScenarioEnv:
             os.path.join(self.base_workdir, "manager"), self.storage_root,
             key_count_per_file=key_count_per_file)
         self.vllm: Optional[VllmServer] = None
+        # Engine starts so far: each one prints one pinned report per tp rank,
+        # which is what makes a missing rank detectable (see assert_pinned_ok).
+        self.vllm_starts = 0
+        # Parsed lazily from the connector's registration line.
+        self._retention: Optional["RetentionFacts"] = None
 
     def start_manager(self):
         self.manager.start(self.repo_root)
@@ -474,6 +516,7 @@ class ScenarioEnv:
             kv_load_failure_policy=self.kv_load_failure_policy,
         )
         self.vllm.start(self.repo_root, log_suffix=log_suffix)
+        self.vllm_starts += 1
         return self.vllm
 
     def restart_vllm(self, log_suffix: str = "") -> VllmServer:
@@ -488,11 +531,138 @@ class ScenarioEnv:
     def max_model_len(self) -> int:
         """The server's --max-model-len, i.e. what a prompt may span.
 
-        Read from the same serving args the engine is started with, so a
-        scenario gate (e.g. "three windows must fit") follows an operator's
-        KVCM_E2E_VLLM_ARGS override instead of assuming the default.
+        Read from the *effective* args: the started server's own record when
+        there is one, otherwise the same merge the server would use (defaults <
+        KVCM_E2E_VLLM_ARGS), so a scenario gate ("three windows must fit")
+        follows an operator's override instead of the built-in default.
         """
-        return int(serving_args(MODEL_PATH)["max-model-len"])
+        args = (getattr(self.vllm, "serving_args", None)
+                or effective_serving_args())
+        return int(args["max-model-len"])
+
+    def retention_facts(self) -> "RetentionFacts":
+        """The connector-registered retention, parsed once (see lib_utils).
+
+        Before the first engine start there is nothing registered to read, so
+        the config-derived facts stand in (with a log line). *After* a start
+        the absence of a registration is a disagreement, not a fallback: the
+        orchestration was chosen because the config said "windowed", and
+        verifying full-prefix expectations instead would pass every scenario
+        without a single windowed group ever being exercised.
+        """
+        if self._retention is None:
+            lines = self.scan_connector_logs(
+                r"retention=WindowRetention\([^)]*\)")
+            if lines:
+                # Only the parsed registration is cached: the config-derived
+                # fallback below must be re-evaluated, or a geometry built
+                # before the first engine start (a scenario gate) would freeze
+                # extra_retained_tokens at 0 for the expectations that follow.
+                self._retention = retention_facts_from_logs(lines)
+            else:
+                assert self.vllm_starts == 0 or self.window is None, (
+                    f"config-level detection says {MODEL_PATH} is windowed "
+                    f"(kind={self.window_kind}, window={self.window}) but the "
+                    f"connector registered no windowed group after "
+                    f"{self.vllm_starts} engine start(s); the run would verify "
+                    f"full-prefix expectations and never exercise a windowed "
+                    f"group")
+                logger.info(
+                    "no WindowRetention in the connector logs yet; using the "
+                    "config-derived retention (kind=%s window=%s)",
+                    self.window_kind, self.window)
+                return RetentionFacts(kind=self.window_kind,
+                                      window_tokens=self.window)
+        return self._retention
+
+    def prompt_capacity(self, max_tokens: int) -> int:
+        """Prompt tokens a request with that completion budget may use.
+
+        The terms guard_prompt_fits checks, exported for scenarios that
+        generate a long candidate on purpose and truncate it themselves:
+        truncating to the limit without the margin would leave the gate
+        skipping exactly the request that was just made to fit.
+        """
+        return max(0, self.max_model_len() - max_tokens - MODEL_LEN_MARGIN)
+
+    def guard_prompt_fits(self, tokens: list, label: str,
+                          max_tokens: int = 0) -> None:
+        """Skip the scenario when a generated prompt exceeds the limit.
+
+        The windowed prompts (``make_base_prompts``) exist to cross the window;
+        for a window wider than roughly a third of ``--max-model-len`` they
+        cannot, and the server would answer 400 before any verification. Say so
+        instead: an operator can raise the limit through KVCM_E2E_VLLM_ARGS.
+        ``max_tokens`` is the scenario's own completion request -- vLLM limits
+        prompt plus output against the same context window, so leaving it out
+        would pass the gate and still let the server reject the request.
+        """
+        needed = len(tokens) + max_tokens + MODEL_LEN_MARGIN
+        limit = self.max_model_len()
+        if needed > limit:
+            raise unittest.SkipTest(
+                f"{label}: prompt {len(tokens)} + output {max_tokens} + "
+                f"{MODEL_LEN_MARGIN} margin = {needed} tokens (window "
+                f"{self.window}) but the server accepts {limit} "
+                f"(--max-model-len); raise it via KVCM_E2E_VLLM_ARGS to run "
+                f"this scenario")
+
+    def window_geometry(self) -> "WindowGeometry":
+        """Expectation inputs for the loaded region, cross-checked.
+
+        The windowed orchestration was chosen from the config *before* any
+        engine started; the connector's registered retention is the
+        authoritative statement of what it will actually keep. They must agree
+        (a disagreement means the config-level detection missed a windowed
+        group -- an R-SWA checkpoint whose window vLLM injects, say -- and the
+        scenario would then verify the wrong region), so this fails loudly
+        instead of quietly shrinking the assertion surface. The
+        ``extra_retained_tokens`` has no config source at all and comes from
+        the registration alone (0 with a log line when unknown).
+        """
+        facts = self.retention_facts()
+        if facts.kind is not None:
+            assert self.window is not None, (
+                f"the connector registered a {facts.kind!r} windowed group "
+                f"(window {facts.window_tokens}) but the harness treated "
+                f"{MODEL_PATH} as having no window: the config-level detection "
+                f"missed it, so the windowed orchestration (prefix caching, "
+                f"phase restart, windowed expectations) was never applied")
+            # One deployment can mix retention kinds (sliding and chunked-local
+            # groups coexist); the config names one kind, and its window has to
+            # be among that kind's registered values. The other kinds' tuples
+            # are not compared -- they simply join the union.
+            kinds = {k for k, _, _ in facts.tuples}
+            assert self.window_kind in kinds, (
+                f"retention kind mismatch: the config says {self.window_kind}, "
+                f"the connector registered {sorted(kinds)}")
+            if self.window_kind == "chunked_local":
+                # Several sizes can live in one table: the config names one, and
+                # it has to be among the registered ones (the union is computed
+                # over all of them, see loaded_blocks).
+                assert self.window in facts.chunk_sizes, (
+                    f"chunk-size mismatch: the config says {self.window}, the "
+                    f"connector registered {list(facts.chunk_sizes)}")
+            else:
+                windows = {w for k, w, _ in facts.tuples
+                           if k == self.window_kind}
+                assert self.window in windows, (
+                    f"window mismatch: the config says {self.window}, the "
+                    f"connector registered {sorted(windows)} for "
+                    f"{self.window_kind}")
+        return WindowGeometry(
+            # The *registered* window, i.e. the widest one for a deployment with
+            # several chunk sizes: the guards built on it (window_blocks, the
+            # mid-prefix geometry, the window-crossing gates) have to bound the
+            # widest local group, not the single size the config names.
+            window=facts.window_tokens or self.window,
+            kind=facts.kind or self.window_kind,
+            full_attention_group=self.full_attention_group,
+            extra_retained_tokens=facts.extra_retained_tokens,
+            manager_block_size=self.manager_block_size(),
+            retention_tuples=facts.tuples,
+            chunk_sizes=facts.chunk_sizes,
+        )
 
     def connector_block_tables(self) -> int:
         """How many vLLM block tables (KV-cache groups) the connector got.
@@ -500,13 +670,13 @@ class ScenarioEnv:
         The load-failure reporting mode follows this *actual* shape, not the
         model family: the connector reports invalid blocks to vLLM only with a
         single block table (``len(load_req.all_block_ids) == 1``) and otherwise
-        swallows the failure into a log line. A single-group windowed model is
-        multi-group by the family predicate yet still reports. Read from the
-        connector's own registration line; disagreeing registrations (e.g. a
-        restart with a different layout) are a hard error.
+        swallows the failure into a log line. Read from the transfer-group names
+        the connector registers, deduplicated by table index -- a packed table
+        is several buckets sharing one index, and counting buckets would read a
+        single-table model as a multi-table one.
         """
-        return block_tables_from_logs(
-            self.scan_connector_logs(r"block_tables=(\d+)"))
+        return block_tables_from_names(
+            self.scan_connector_logs(r"register_kv_caches done.*"))
 
     def assert_pinned_budget(self):
         """Read the connector's pinned total out of the engine logs and gate it.
@@ -525,19 +695,55 @@ class ScenarioEnv:
                 "set KVCM_E2E_PINNED_GIB to gate it",
                 model_fingerprint(MODEL_PATH), MODEL_PATH)
             return
-        assert_pinned_ok(
-            self.scan_connector_logs(r"total pinned = ([\d.]+) GiB"), limit,
-            MODEL_PATH, expected_ranks=self.tp_size)
+        # Each engine start writes its own vllm<suffix>.std* pair, and every
+        # rank prints its pool plan once per start. Check the starts
+        # independently: a stream that reported every rank in phase 1 must not
+        # lend those ranks (or a duplicated line) to a restart whose own rank
+        # never reported.
+        checked = 0
+        for path in sorted(glob.glob(os.path.join(self.vllm_dir,
+                                                  "vllm*.std*"))):
+            with open(path, errors="replace") as f:
+                text = f.read()
+            ranks = re.findall(RANK_LINE_RE, text)
+            if not ranks:
+                # No connector worker in this stream (the stdout half of a
+                # server, or a start that never got that far): not a report to
+                # gate, and any failure of such a start surfaces elsewhere.
+                continue
+            checked += 1
+            assert_pinned_ok(
+                # The pinned line itself has no rank; the worker-init line says
+                # which workers started and the harness's own registration line
+                # (logged in the same step that plans the pools) says whose plan
+                # actually ran.
+                re.findall(r"total pinned = ([\d.]+) GiB", text), limit,
+                MODEL_PATH,
+                expected_ranks=self.tp_size,
+                expected_reports=self.tp_size,
+                reported_ranks={int(r) for r, _ in ranks},
+                declared_tp={int(tp) for _, tp in ranks},
+                plan_ranks={int(g[0]) for g in
+                            re.findall(PLAN_LINE_RE, text)},
+                where=f" ({os.path.basename(path)})")
+        assert checked, (
+            f"no connector worker registration found under {self.vllm_dir}; "
+            f"the pinned gate cannot be evaluated")
 
     def scan_connector_logs(self, pattern: str) -> list:
-        """Regex-scan all vLLM std streams; returns list of match groups."""
-        import re
+        """Regex-scan all vLLM std streams; returns the group tuple per match.
+
+        *Every* match on a line is returned, not just the first: the connector
+        prints one line per event, and an event can carry several groups the
+        harness needs (a deployment line lists every group's WindowRetention,
+        and a model with several windowed groups -- or several chunk sizes --
+        only shows them all there).
+        """
         out = []
         for path in glob.glob(os.path.join(self.vllm_dir, "vllm*.std*")):
             with open(path, errors="replace") as f:
                 for line in f:
-                    m = re.search(pattern, line)
-                    if m:
+                    for m in re.finditer(pattern, line):
                         out.append(m.groups() if m.groups() else m.group(0))
         return out
 
@@ -545,6 +751,125 @@ class ScenarioEnv:
         if self.vllm:
             self.vllm.stop()
         self.manager.stop()
+
+
+@dataclass(frozen=True)
+class WindowGeometry:
+    """Everything a loaded-region expectation needs, in one place.
+
+    Bundling it is the point: the loaded region depends on four inputs the
+    scenarios used to thread by hand (the window, its retention kind, whether a
+    full-attention group keeps everything, and the extra retained tokens), and
+    forgetting one silently over- or under-counts the expected blocks. The
+    token/metric inputs come from the model config for the orchestration
+    decisions (they must exist before any engine starts) and are cross-checked
+    against the connector's registered retention once it has.
+    """
+
+    window: Optional[int]
+    kind: Optional[str]
+    full_attention_group: bool
+    extra_retained_tokens: int
+    manager_block_size: int
+    #: Every registered registered ``(kind, window, extra)`` as it was
+    #: registered (empty when the facts came from the config fallback): one
+    #: deployment can mix retention kinds, and their kept regions are only
+    #: partly nested, so the union is computed from these tuples per hit.
+    retention_tuples: tuple = ()
+    #: Every registered chunk size for chunked_local (empty otherwise): kept
+    #: for messages and cross-checks; the tails come from ``retention_tuples``.
+    chunk_sizes: tuple = ()
+
+    @property
+    def prefill_unbounded(self) -> bool:
+        """Does a registered group keep its whole prefill (R-SWA)?
+
+        R-SWA evicts only the *decode* gap, so no prefill length bounds the
+        retained region and guards like "the prefix crossed the retained span"
+        cannot be decided from the prompt alone -- the caller has to skip (or
+        decode past the R-SWA window) instead of trusting a finite span.
+        """
+        if self.retention_tuples:
+            return any(kind == "rswa_gap" for kind, _, _ in self.retention_tuples)
+        return self.kind == "rswa_gap"
+
+    @property
+    def retained_span_tokens(self) -> int:
+        """Tokens the widest *bounded* local group can keep of a hit.
+
+        ``window_blocks`` rounds this *up* to manager blocks, which is what the
+        block-level guards want; the token-level condition "at least one block
+        was freed" is ``H >= retained_span_tokens + manager_block_size`` (a hit
+        only starts freeing blocks once it exceeds the span by a full block).
+        Chunked-local contributes ``chunk - 1`` (its kept part is ``H % chunk``,
+        never a whole chunk) and R-SWA contributes nothing at all: its prefill
+        retention is unbounded, see ``prefill_unbounded``.
+        """
+        if self.retention_tuples:
+            spans = [(w - 1 + e) if kind not in ("chunked_local", "rswa_gap")
+                     else (w - 1) for kind, w, e in self.retention_tuples
+                     if kind != "rswa_gap"]
+            return max(spans) if spans else 0
+        if self.window is None or self.kind == "rswa_gap":
+            return 0
+        return self.window - 1 + self.extra_retained_tokens
+
+    @property
+    def window_blocks(self) -> int:
+        """Manager blocks the widest local group spans of one window.
+
+        vLLM's ``_contiguous_blocks_for_hit`` for one group, maximized over the
+        registered tuples: the guards built on it (the mid-prefix geometry, the
+        "save crosses the window twice" assertion, the cross-request crossing
+        gate) have to bound every local group, and a single tuple's window must
+        never be recombined with another's extra.
+        """
+        if self.retention_tuples:
+            spans = [(-(-w // self.manager_block_size)
+                      if kind == "chunked_local"
+                      else -(-(w - 1 + e) // self.manager_block_size))
+                     for kind, w, e in self.retention_tuples]
+            return max(spans)
+        if self.window is None:
+            return 0
+        return -(-(self.window - 1 + self.extra_retained_tokens)
+                 // self.manager_block_size)
+
+    def local_tail(self, matched_tokens: int) -> int:
+        """Manager blocks the *windowed* groups alone keep of that hit.
+
+        Never includes a full-attention group's whole match: ``loaded_blocks``
+        adds that on top for the load expectation, while the scenarios that
+        reason about the windowed groups' own coverage -- the mid-prefix
+        boundary, which must not land where a chunked-local group keeps
+        nothing -- need this region by itself. Every kept region is a *suffix*
+        of the hit, so the union over the registered tuples is the widest of
+        their tails, evaluated per hit length (which is larger depends on the
+        hit: sliding tails nest by span, chunked-local ones align to chunks).
+        """
+        if self.retention_tuples:
+            return max(window_tail_blocks(matched_tokens, w,
+                                          self.manager_block_size,
+                                          extra_retained=e, kind=kind)
+                       for kind, w, e in self.retention_tuples)
+        return window_tail_blocks(matched_tokens, self.window,
+                                  self.manager_block_size,
+                                  self.extra_retained_tokens, self.kind)
+
+    def loaded_blocks(self, matched_tokens: int) -> int:
+        """Manager blocks a hit of that size really loads (union over groups).
+
+        The union of the windowed groups' tails (``local_tail``) and, when the
+        model has one, a full-attention group's whole matched prefix -- which
+        is what bounds the union for every windowed kind.
+        """
+        if self.full_attention_group:
+            return -(-matched_tokens // self.manager_block_size)
+        return self.local_tail(matched_tokens)
+
+    def window_tail(self, matched_tokens: int) -> int:
+        """Manager blocks the windowed groups alone keep of that hit."""
+        return self.local_tail(matched_tokens)
 
 
 def run_e2e(scenario: str, tp_size: int, num_prompts: int,
@@ -595,8 +920,82 @@ def run_e2e(scenario: str, tp_size: int, num_prompts: int,
         # Compute per-prompt expected block counts from the actual tokenization
         # so a silently dropped prompt (or block) fails the run.
         mbs = env.manager_block_size()
+        geom = env.window_geometry()
+        if window is not None:
+            # The guard below asserts "save crosses the *registered* window
+            # twice", i.e. the widest local group -- and the config-level window
+            # used to size the prompt can be narrower (a deployment may register
+            # several chunk sizes). Extend the generated text until the
+            # tokenized prompts really cross that window twice: the same
+            # dynamic sizing the mid-prefix scenario does for its three windows.
+            base_tokens = [tokenize(vllm.base_url(), p) for p in base_prompts]
+            extension = 0
+            while (extension < 32 and min(len(t) // mbs for t in base_tokens)
+                   <= 2 * geom.window_blocks):
+                extension += 1
+                base_prompts = [
+                    p + " " + " ".join(
+                        f"Extended part {extension} sentence {j} of prompt {k} "
+                        f"carries value {j * 23 + extension * 89 + k * 7}."
+                        for j in range(40))
+                    for k, p in enumerate(base_prompts)]
+                base_tokens = [tokenize(vllm.base_url(), p)
+                               for p in base_prompts]
+            if extension:
+                logger.info(
+                    "extended the prompts by %d part(s) to cross the "
+                    "%d-block registered window twice", extension,
+                    geom.window_blocks)
         base_tokens = [tokenize(vllm.base_url(), p) for p in base_prompts]
+        phase2_prompts = [p + s for p, s in zip(base_prompts, suffixes)]
         phase2_tokens = [tokenize(vllm.base_url(), p) for p in phase2_prompts]
+        if window is not None and geom.chunk_sizes:
+            # A chunked-local group keeps nothing when the *match* ends exactly
+            # on one of its chunk boundaries (vLLM skips every matched token).
+            # The match is the shared prefix rounded down to manager blocks, not
+            # the raw prompt length: mbs=16 with a chunk of 128 turns a
+            # 390-token base into a 384-token match, right on the boundary. So
+            # test the rounded match (suffix re-merge included) and nudge the
+            # prompt until it lands inside every chunk (the same kind of
+            # adjustment the mid-prefix scenario makes).
+            def _match_tokens(b: list, p2: list) -> int:
+                save = len(b) // mbs
+                return min(shared_token_prefix_len(b, p2) // mbs, save) * mbs
+
+            nudges = 0
+            while (nudges < 8 and any(
+                    _match_tokens(b, p2) % chunk == 0
+                    for b, p2 in zip(base_tokens, phase2_tokens)
+                    for chunk in geom.chunk_sizes)):
+                nudges += 1
+                # Each step appends `nudges` distinct words, so the token count
+                # moves by a different amount every time -- a fixed suffix could
+                # keep landing on the same boundary (a chunk size dividing its
+                # token count would never be escaped).
+                extra = " ".join(f"Realign{nudges}x{j}"
+                                 for j in range(nudges))
+                base_prompts = [f"{p} {extra}" for p in base_prompts]
+                base_tokens = [tokenize(vllm.base_url(), p)
+                               for p in base_prompts]
+                phase2_prompts = [p + s
+                                  for p, s in zip(base_prompts, suffixes)]
+                phase2_tokens = [tokenize(vllm.base_url(), p)
+                                 for p in phase2_prompts]
+            if nudges:
+                logger.info("nudged the match off the chunk boundaries in %d "
+                            "step(s)", nudges)
+            if any(_match_tokens(b, p2) % chunk == 0
+                   for b, p2 in zip(base_tokens, phase2_tokens)
+                   for chunk in geom.chunk_sizes):
+                # Still on a boundary after the cap: the chunk is at most one
+                # manager block wide, so *no* match can keep a block for it --
+                # the windowed loaded region is empty by construction and the
+                # exact-set assertion below would be vacuous.
+                raise unittest.SkipTest(
+                    f"no match length keeps a block for chunk size(s) "
+                    f"{sorted(geom.chunk_sizes)} at mbs={mbs} (a chunk that "
+                    f"small is inside one manager block); the windowed "
+                    f"loaded-region assertion cannot be built")
         # Saves cover the whole prompt: every completed block is copied in the
         # step that produces it, before vLLM can free it (historian).
         expected_save_blocks = [len(t) // mbs for t in base_tokens]
@@ -612,16 +1011,26 @@ def run_e2e(scenario: str, tp_size: int, num_prompts: int,
         # loads less than that -- or one that quietly loaded the whole prefix
         # of a purely windowed model -- fails assert_loaded_blocks below, which
         # pins the *set*, not just the count.
-        expected_load_blocks = [
-            loaded_block_count(n * mbs, window, mbs, env.full_attention_group,
-                               env.window_kind)
-            for n in matched_blocks
-        ]
+        expected_load_blocks = [geom.loaded_blocks(n * mbs) for n in matched_blocks]
+        # The generated prompts are ~2.5 windows long, which only fits a server
+        # whose limit accepts them: with a window wider than a third of
+        # --max-model-len neither the request nor the save > 2 * window guard
+        # can hold. Skip loudly instead of failing an unfixable assertion (or
+        # letting the server answer 400).
+        if window is not None:
+            env.guard_prompt_fits(max(phase2_tokens, key=len), "run_e2e",
+                                  max_tokens=4)
         assert all(n >= 1 for n in expected_load_blocks), (
             f"prompts too short to span a manager block (mbs={mbs}): "
             f"{expected_load_blocks}")
         if window is not None:
-            window_blocks = -(-(window - 1) // mbs)
+            local_tails = [geom.window_tail(n * mbs) for n in matched_blocks]
+            assert all(t >= 1 for t in local_tails), (
+                f"matched prefixes keep no windowed block (windowed tails "
+                f"{local_tails} of matches {matched_blocks}); the union below "
+                f"would be carried by a full-attention group alone")
+        if window is not None:
+            window_blocks = geom.window_blocks
             for save, matched in zip(expected_save_blocks, matched_blocks):
                 # The saved prefix must cross the window more than twice: a
                 # shorter prompt would make the windowed assertions vacuous.
@@ -644,15 +1053,22 @@ def run_e2e(scenario: str, tp_size: int, num_prompts: int,
             "mbs=%d window=%s expected save blocks=%s matched=%s window tail=%s "
             "loaded blocks=%s",
             mbs, window, expected_save_blocks, matched_blocks,
-            [window_tail_blocks(n * mbs, window, mbs, kind=env.window_kind)
-             for n in matched_blocks],
+            [geom.window_tail(n * mbs) for n in matched_blocks],
             expected_load_blocks)
 
         # ---- Phase 1: fresh prefill -> connector saves -> reference capture.
         logger.info("phase 1: sending %d fresh prompts", num_prompts)
         send_completions(vllm.base_url(), base_prompts)
+        # A capture-side assertion here is *not* a verdict, not even for the
+        # mutation meta-test: phase 1 only writes references, read through
+        # vLLM's own slot mapping, before any loaded or null-page verification
+        # runs -- and the injected shift affects the connector's translation,
+        # which phase 1 does not exercise. So it means the capture harness
+        # itself is broken and always fails the run.
         wait_for_captures(capture_dir, "ref",
-                          expected=tp_size * sum(expected_save_blocks), timeout=180)
+                          expected=tp_size * sum(expected_save_blocks),
+                          timeout=180)
+        capture_failure: Optional[str] = None
 
         # The save is committed to the manager asynchronously after the ref
         # capture (which fires when the save is submitted). Wait until the manager
@@ -671,8 +1087,25 @@ def run_e2e(scenario: str, tp_size: int, num_prompts: int,
         # ---- Phase 2: same prefix + suffix -> connector loads -> loaded capture.
         logger.info("phase 2: sending %d prefix+suffix prompts", num_prompts)
         send_completions(vllm.base_url(), phase2_prompts)
-        wait_for_captures(capture_dir, "loaded",
-                          expected=tp_size * sum(expected_load_blocks), timeout=180)
+        if capture_failure is None:
+            try:
+                wait_for_captures(capture_dir, "loaded",
+                                  expected=tp_size * sum(expected_load_blocks),
+                                  timeout=180)
+            except CaptureVerificationError as e:
+                if not expect_verification_failure:
+                    raise
+                capture_failure = str(e)
+
+        if capture_failure is not None:
+            # The verification already failed at capture time (phase 2): the
+            # region assertions below would only re-report the missing loaded
+            # captures. Jump to the verdict, which reports the catch.
+            env.assert_pinned_budget()
+            logger.info(
+                "verification failed as expected (capture-side, phase 2): %s",
+                capture_failure)
+            return
 
         # The loaded blocks must be exactly the tail window of each match, on
         # every tp rank -- not merely the right number of blocks.
@@ -694,6 +1127,16 @@ def run_e2e(scenario: str, tp_size: int, num_prompts: int,
         # expected outcome.
         env.assert_pinned_budget()
         if expect_verification_failure:
+            # A capture-side assertion firing is the verification failing at
+            # capture time (the null-page guard catches the slot shift before
+            # any comparison runs) -- the same expected catch as a mismatched
+            # report; a plain capture-count timeout is *not* (it means the
+            # path under test never ran).
+            if capture_failure is not None:
+                logger.info(
+                    "verification failed as expected (capture-side): %s",
+                    capture_failure)
+                return
             try:
                 assert_report_ok(report, min_matched=min_matched)
             except AssertionError as e:

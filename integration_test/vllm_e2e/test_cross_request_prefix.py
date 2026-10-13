@@ -47,8 +47,7 @@ import requests
 
 from e2e_lib import (
     ScenarioEnv, assert_loaded_blocks, assert_loaded_nonempty, full_block_hashes,
-    loaded_block_count, send_completions, tokenize, wait_for_captures,
-    wait_for_prefix_cached,
+    send_completions, tokenize, wait_for_captures, wait_for_prefix_cached,
 )
 
 logger = logging.getLogger("vllm_e2e")
@@ -119,8 +118,6 @@ class TestCrossRequestPrefix(unittest.TestCase):
     # Long enough that a corrupted recurrent state cannot plausibly reproduce
     # the reference continuation token for token.
     MAX_TOKENS = 32
-    # Mirrors the harness's --max-model-len; prompt + output must fit.
-    MAX_MODEL_LEN = 4096
 
     def test_cross_request_prefix(self):
         env = ScenarioEnv("cross_request_prefix", log_level="DEBUG")
@@ -139,15 +136,52 @@ class TestCrossRequestPrefix(unittest.TestCase):
             # match).
             sentences = 260 if env.hybrid else (120 if env.window else 60)
             toks_a = tokenize(vllm.base_url(), long_prompt(sentences))
-            # Cap the length so prompt + MAX_TOKENS stays inside the model len.
-            blocks_a = min(len(toks_a) // mbs,
-                           (self.MAX_MODEL_LEN - self.MAX_TOKENS) // mbs)
+            # The candidate is generated long on purpose, so cap it to what a
+            # request with MAX_TOKENS of completion may use of the *effective*
+            # --max-model-len, then gate the sequence that is really sent: a
+            # tokenizer that makes the candidate slightly too long must not
+            # cost the whole regression.
+            capacity = env.prompt_capacity(self.MAX_TOKENS)
+            blocks_a = min(len(toks_a) // mbs, capacity // mbs)
             self.assertGreaterEqual(
                 blocks_a, 4,
                 f"only {blocks_a} manager blocks available (mbs={mbs}); this "
                 f"scenario needs interior blocks")
             # Send A as explicit token ids so its cache keys are exactly toks_a.
             toks_a = toks_a[:blocks_a * mbs]
+            env.guard_prompt_fits(toks_a, "cross_request_prefix",
+                                  max_tokens=self.MAX_TOKENS)
+            geom = env.window_geometry()
+            # A hit only starts freeing blocks once it exceeds the retained span
+            # by a full manager block, so that is the bound this scenario needs
+            # (the nominal window is not: window - 1 + extra_retained_tokens can
+            # be kept, and a hit just below span + mbs still fills every slot).
+            span_tokens = geom.retained_span_tokens
+            if geom.prefill_unbounded:
+                # R-SWA keeps the whole prefill and evicts only a decode gap:
+                # this scenario's short decode stays inside the R-SWA window,
+                # so no gap is ever freed and the windowed path -- what the
+                # prompt length cannot bound -- would not be exercised.
+                self.skipTest(
+                    f"R-SWA retains the whole prefill and frees a gap only "
+                    f"after decoding past its {geom.window}-token window; this "
+                    f"scenario decodes {self.MAX_TOKENS} tokens, so the "
+                    f"windowed cross-request path is not exercised")
+            if geom.window is not None and len(toks_a) < span_tokens + mbs:
+                # The windowed point of this scenario is that part of A sits
+                # outside the served window (those blocks are freed and their
+                # table entries replaced by the null page). A prefix that fits
+                # inside one *retained span* exercises none of that: vLLM keeps
+                # up to window - 1 + extra_retained_tokens tokens, so the
+                # nominal window is not the bound -- window_blocks is (the
+                # registered geometry, i.e. the widest local group).
+                self.skipTest(
+                    f"the largest prefix this server accepts ({len(toks_a)} "
+                    f"tokens) does not exceed the registered retained span "
+                    f"({span_tokens} tokens) by a full manager block ({mbs}), "
+                    f"so nothing would be freed or replaced and the windowed "
+                    f"cross-request path is not exercised (raise "
+                    f"--max-model-len via KVCM_E2E_VLLM_ARGS to run it)")
             logger.info("A: %d tokens = %d x %d", len(toks_a), blocks_a, mbs)
             completion_token_ids(vllm.base_url(), toks_a, max_tokens=4)
             wait_for_captures(env.capture_dir, "ref", expected=blocks_a, timeout=180)
@@ -257,9 +291,8 @@ class TestCrossRequestPrefix(unittest.TestCase):
                     # covers exactly the slots vLLM handed out: the sliding
                     # groups' tail window of where the match ended, plus the
                     # whole match for the full-attention group.
-                    load_blocks = loaded_block_count(
-                        candidates * mbs, env.window, mbs,
-                        env.full_attention_group, env.window_kind)
+                    load_blocks = env.window_geometry().loaded_blocks(
+                        candidates * mbs)
                     hashes = full_block_hashes(toks_b, mbs)
                     self.assertEqual(len(hashes), candidates)
                     wait_for_captures(env.capture_dir, "loaded",

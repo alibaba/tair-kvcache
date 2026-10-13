@@ -57,6 +57,7 @@ reference vs loaded by content (the captured token ids).
 """
 
 import hashlib
+import json
 import os
 import threading
 import typing
@@ -218,7 +219,10 @@ class VerifyingConnector(TairKvCacheConnector):
             [(g[0], "attn" if g[1] else "state", g[3], g[4]) for g in self._cap_groups],
             self._windowed_groups,
             self._vllm_block_size, self._manager_block_size,
-            len(self._group_metas),
+            # Distinct group indices: a packed UniformTypeKVCacheSpecs table is
+            # several buckets sharing one index, and the connector's reporting
+            # mode counts tables (len(all_block_ids)), not buckets.
+            len({g[0] for g in self._cap_groups}),
         )
 
     # ------------------------------------------------------------------ #
@@ -269,6 +273,21 @@ class VerifyingConnector(TairKvCacheConnector):
                 self._capture_pending_loaded(meta)
             except Exception as e:  # never break inference for a capture error
                 logger.warning("VerifyingConnector capture failed: %s", e, exc_info=True)
+                # The capture is itself a verification mechanism (the null-page
+                # guard fires here): leave a marker the driver polls, so a
+                # capture-side assertion fails the scenario loudly instead of
+                # the run dying in a capture-count timeout. The *type* is part
+                # of the record: the driver accepts an assertion of this
+                # harness's verification as a verdict, but must not mistake a
+                # broken capture (an index or device error) for one.
+                marker = os.path.join(self._capture_dir, "capture_error.txt")
+                try:
+                    with open(marker, "x") as f:
+                        json.dump({"is_assertion": isinstance(e, AssertionError),
+                                   "type": type(e).__name__,
+                                   "message": str(e)}, f)
+                except FileExistsError:
+                    pass
 
         super().wait_for_save()
 

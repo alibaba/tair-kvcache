@@ -30,7 +30,7 @@ import unittest
 
 from e2e_lib import (
     ScenarioEnv, assert_loaded_blocks, assert_report_ok, compare_captures,
-    full_block_hashes, loaded_block_count, make_base_prompts, send_completions,
+    full_block_hashes, make_base_prompts, send_completions,
     shared_token_prefix_len, tokenize, wait_for_captures,
     wait_for_prefix_cached,
 )
@@ -38,11 +38,31 @@ from e2e_lib import (
 logger = logging.getLogger("vllm_e2e")
 
 
+def skip_if_rswa(env) -> None:
+    """R-SWA models cannot run this scenario (loudly, not silently).
+
+    ``UnlimitedOCRForCausalLMConfig`` forbids prefix caching outright -- R-SWA
+    decode KV is not a pure causal function of the prefix -- so the *local* hit
+    on A that this scenario's manager-query offsets depend on can never happen,
+    no matter what the harness asks vLLM for. Its window is a decode-time one
+    as well, which is not the prefill geometry the mid-prefix variant builds
+    its case from.
+    """
+    if env.window_kind == "rswa_gap":
+        raise unittest.SkipTest(
+            "R-SWA models disable vLLM prefix caching (the architecture's "
+            "config class forces it off), so this scenario's premise -- a "
+            "local hit on A with a nonzero manager-query offset -- cannot "
+            "hold; the R-SWA coverage lives in the standard runner and the "
+            "load-failure scenario")
+
+
 class TestPartialHit(unittest.TestCase):
     def test_partial_hit(self):
         env = ScenarioEnv("partial_hit", enable_prefix_caching=True,
                           log_level="DEBUG")
         try:
+            skip_if_rswa(env)
             env.start_manager()
             vllm = env.start_vllm(log_suffix="_s12")
             mbs = env.manager_block_size()
@@ -58,13 +78,12 @@ class TestPartialHit(unittest.TestCase):
             toks_a = tokenize(vllm.base_url(), prompt_a)
             toks_ab = tokenize(vllm.base_url(), prompt_ab)
             toks_abc = tokenize(vllm.base_url(), prompt_abc)
+            env.guard_prompt_fits(toks_abc, "partial_hit", max_tokens=4)
             blocks_a = len(toks_a) // mbs
             blocks_ab = len(toks_ab) // mbs
             shared_abc = min(shared_token_prefix_len(toks_ab, toks_abc) // mbs,
                              blocks_ab)
-            load_blocks = loaded_block_count(
-                shared_abc * mbs, env.window, mbs, env.full_attention_group,
-                env.window_kind)
+            load_blocks = env.window_geometry().loaded_blocks(shared_abc * mbs)
             self.assertGreaterEqual(blocks_a, 1)
             self.assertGreater(blocks_ab, blocks_a,
                                "B must add at least one manager block")
@@ -128,6 +147,7 @@ class TestPartialHit(unittest.TestCase):
         env = ScenarioEnv("mid_prefix_hit", enable_prefix_caching=True,
                           log_level="DEBUG")
         try:
+            skip_if_rswa(env)
             env.start_manager()
             if env.window is None:
                 self.skipTest("mid-prefix window assertions need a windowed model")
@@ -136,7 +156,8 @@ class TestPartialHit(unittest.TestCase):
             # registers at engine startup, so the gate runs after start_vllm
             # (a skip below tears the server down cleanly through the finally).
             mbs = env.manager_block_size()
-            window_blocks = -(-(env.window - 1) // mbs)
+            geom = env.window_geometry()
+            window_blocks = geom.window_blocks
             # B's match must end inside A, one window before A's own tail window,
             # so the prompt has to hold three windows. A window larger than a
             # third of the model length cannot satisfy that with a request the
@@ -155,8 +176,25 @@ class TestPartialHit(unittest.TestCase):
 
             toks_a = tokenize(vllm.base_url(),
                               make_base_prompts(1, env.hybrid, env.window)[0])
+            # The shared generator deliberately aims at ~2.5 windows; this
+            # scenario needs three (mid plus two window widths, see below).
+            # Extend the token sequence -- A is sent as ids -- with distinct
+            # sentences until the *tokenized* length really covers them, so a
+            # tokenizer that packs more tokens per generated sentence (the
+            # generator assumes 12) cannot make the assertions impossible.
+            extension = 0
+            while len(toks_a) // mbs < 3 * window_blocks and extension < 32:
+                extension += 1
+                toks_a += tokenize(vllm.base_url(), " ".join(
+                    f"Extended section {extension} sentence {j} carries value "
+                    f"{j * 19 + extension * 97}." for j in range(40)))
+            if extension:
+                logger.info("extended A by %d section(s) to cover three windows",
+                            extension)
             blocks_a = len(toks_a) // mbs
             toks_a = toks_a[:blocks_a * mbs]
+            # Gate what is actually sent (the block-aligned trim above).
+            env.guard_prompt_fits(toks_a, "mid_prefix_hit", max_tokens=4)
             # B's match must end inside A but far enough in that the window it
             # is served from is a real one (not the prompt head), and far
             # enough from A's end that A's own tail window is a different
@@ -166,6 +204,18 @@ class TestPartialHit(unittest.TestCase):
                                     f"A too short ({blocks_a} blocks) for a "
                                     f"mid-prefix hit with a {window_blocks}-block "
                                     f"window")
+            # A chunked_local hit ending exactly on a chunk boundary skips
+            # every matched token (that manager keeps the *next* chunk), so the
+            # windowed groups would keep nothing and the assertions below would
+            # be vacuous. Step one manager block back inside the chunk; sliding
+            # tails are never empty, so this only moves the chunked case.
+            if geom.window_tail(mid * mbs) == 0 and mid > window_blocks:
+                mid -= 1
+            self.assertGreater(
+                geom.window_tail(mid * mbs), 0,
+                f"a mid-prefix hit of {mid} blocks keeps no windowed block "
+                f"(kind={geom.kind}, window={geom.window}, mbs={mbs}); the "
+                f"loaded-region assertion would be vacuous")
             suffix = tokenize(vllm.base_url(), " Final question: what is 2+2?")
             toks_b = toks_a[:mid * mbs] + suffix
             logger.info("A=%d blocks, B matches %d blocks (window=%d blocks)",
@@ -196,9 +246,10 @@ class TestPartialHit(unittest.TestCase):
             # of the hit for the sliding groups (the region a "just serve the
             # stored tail" implementation would *not* have loaded), plus the
             # whole match for the full-attention group.
-            covered = loaded_block_count(mid * mbs, env.window, mbs,
-                                         env.full_attention_group,
-                                         env.window_kind)
+            # Built here (not reused from the gate above): the registration
+            # that supplies the extra retained tokens only exists once the
+            # engine has started.
+            covered = env.window_geometry().loaded_blocks(mid * mbs)
             expected_keys = {(f"tp{r}", h) for r in range(env.tp_size)
                              for h in hashes[mid - covered:mid]}
             # ... and that whole region is disjoint from A's own tail window

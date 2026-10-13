@@ -22,9 +22,9 @@ from pathlib import Path
 import unittest
 
 from e2e_lib import (
-    ScenarioEnv, assert_loaded_blocks, full_block_hashes, loaded_block_count,
-    make_base_prompts, send_completions, tokenize, wait_for_captures,
-    wait_for_prefix_cached,
+    ScenarioEnv, assert_loaded_blocks, assert_report_ok, compare_captures,
+    full_block_hashes, make_base_prompts, send_completions, tokenize,
+    wait_for_captures, wait_for_prefix_cached,
 )
 
 logger = logging.getLogger("vllm_e2e")
@@ -46,6 +46,8 @@ class TestFullHit(unittest.TestCase):
             self.assertGreaterEqual(
                 num_blocks, 2, f"prompt too short: {len(toks)} tokens, mbs={mbs}")
             prompt_ids = toks[:num_blocks * mbs]
+            # Gate what is actually sent (the block-aligned trim above).
+            env.guard_prompt_fits(prompt_ids, "full_hit", max_tokens=4)
             logger.info("full-hit prompt: %d tokens = %d x %d",
                         len(prompt_ids), num_blocks, mbs)
 
@@ -56,7 +58,17 @@ class TestFullHit(unittest.TestCase):
                 env.manager.manager_uri(), env.instance_id, prompt_ids,
                 min_blocks=num_blocks))
 
+            geom = env.window_geometry()
             expected_hit = (num_blocks - 1) * mbs
+            while (expected_hit > mbs and geom.chunk_sizes
+                   and any(expected_hit % chunk == 0
+                           for chunk in geom.chunk_sizes)):
+                # A chunked-local group keeps nothing when the hit ends exactly
+                # on one of its chunk boundaries: the loaded set would be empty
+                # and this scenario would pass vacuously (no capture, no key,
+                # min_matched=0). Drop one more block -- the non-hybrid hit is
+                # ours to choose -- until it lands inside the chunks.
+                expected_hit -= mbs
             if env.hybrid:
                 import torch
 
@@ -83,6 +95,18 @@ class TestFullHit(unittest.TestCase):
                 expected_hit = max(
                     ((i + 1) * mbs for i, names in enumerate(checkpoints[:-1])
                      if names == state_layers), default=0)
+                if (expected_hit and geom.chunk_sizes and any(
+                        expected_hit % chunk == 0 for chunk in geom.chunk_sizes)):
+                    # Here the hit is fixed by the state checkpoints (a partial
+                    # hit is only safe on a complete one), so it cannot be moved
+                    # off the boundary: refuse to run rather than pass with an
+                    # empty loaded set.
+                    self.skipTest(
+                        f"the only complete state checkpoint caps the hit at "
+                        f"{expected_hit} tokens, exactly on a chunk boundary "
+                        f"({sorted(geom.chunk_sizes)}) where the local groups "
+                        f"keep nothing; the loaded-region assertion would be "
+                        f"vacuous")
 
             if env.multigroup:
                 # Prefix caching is on for multi-group models; restart so the
@@ -114,9 +138,17 @@ class TestFullHit(unittest.TestCase):
             # prefix when the model has a full-attention group.
             if expected_hit:
                 matched_blocks = expected_hit // mbs
-                load_blocks = loaded_block_count(
-                    expected_hit, env.window, mbs, env.full_attention_group,
-                    env.window_kind)
+                # ...and the windowed groups have to keep something, or the
+                # union assertion below says nothing about them (a full group's
+                # captures would otherwise mask an empty local tail).
+                self.assertGreater(
+                    geom.window_tail(expected_hit), 0,
+                    f"the capped hit ({expected_hit} tokens) keeps no windowed "
+                    f"block (kind={geom.kind}, window={geom.window}, mbs={mbs}); "
+                    f"the loaded-region assertion would be vacuous")
+                # Registered geometry, like every other scenario: the extra
+                # retained tokens of a purely windowed model live there.
+                load_blocks = env.window_geometry().loaded_blocks(expected_hit)
                 hashes = full_block_hashes(prompt_ids, mbs)
                 wait_for_captures(env.capture_dir, "loaded",
                                   expected=env.tp_size * load_blocks, timeout=180)
@@ -125,6 +157,13 @@ class TestFullHit(unittest.TestCase):
                     {(f"tp{r}", h) for r in range(env.tp_size)
                      for h in hashes[matched_blocks - load_blocks:matched_blocks]},
                     env.tp_size)
+                # ...and those captures have to match the phase-1 references
+                # byte for byte: the key set alone cannot see a gather/scatter
+                # regression that fills the right slots with wrong KV (the
+                # refs and the loads come from the same run here, so this is
+                # the verbatim contract the other round-trip scenarios assert).
+                report = compare_captures(env.capture_dir)
+                assert_report_ok(report, min_matched=env.tp_size * load_blocks)
             env.assert_pinned_budget()
         finally:
             env.stop()

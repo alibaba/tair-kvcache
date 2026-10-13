@@ -44,7 +44,7 @@ The same test targets run against either model kind, selected by
 | Full attention | Qwen2.5-7B-Instruct | 1 `FullAttentionSpec` | prefix caching off, one server for both phases |
 | MLA | GLM-4.7-Flash | 1 `MLAAttentionSpec` | same as full attention (the latent cache is token-granular: one vector per token instead of K+V; auto-selected MLA attention backend instead of the forced FLASH_ATTN) |
 | Hybrid | Qwen3.5-4B | 3 `MambaSpec` + 1 `FullAttentionSpec` | prefix caching on (`mamba_cache_mode="align"`), server restarted between phases so phase 2 loads from KVCM instead of the local prefix cache |
-| Windowed (SWA) | gemma-3-4b-it / gemma-3-1b-it / gpt-oss-20b | 6 `SlidingWindowSpec` + 1 `FullAttentionSpec` (5:1 / 1:1 interleaves); a chunked-local config (`attention_chunk_size` + a `chunked_local` layer type) is supported too | same as hybrid (multigroup): prefix caching on, restart between phases, and a bounded prefill chunk (`--max-num-batched-tokens 256`) so the window slides *inside* the prefill while the eager captures still fit the pinned staging arena |
+| Windowed (SWA) | gemma-3-4b-it / gemma-3-1b-it / gpt-oss-20b (and a purely sliding config such as classic Mistral: a positive `sliding_window` with no interleaving signal means every layer attends it, unless `use_sliding_window` says it is unused, so such checkpoints get the windowed orchestration *and* no full-attention group) | 6 `SlidingWindowSpec` + 1 `FullAttentionSpec` (5:1 / 1:1 interleaves). Two more retention shapes are recognised: a chunked-local config (`attention_chunk_size` + a chunked layer type -- both the connector's `chunked_local` and the official HF/Llama-4 `chunked_attention` spelling count as local) and R-SWA (`rswa_window`, or the architecture whose vLLM config class injects it -- `RSWASpec` keeps the whole prefill visible and evicts only the decode gap) | same as hybrid (multigroup): prefix caching on, restart between phases, and a bounded prefill chunk (`--max-num-batched-tokens 256`) so the window slides *inside* the prefill while the eager captures still fit the pinned staging arena |
 
 Multi-group specifics verified:
 
@@ -57,11 +57,56 @@ Multi-group specifics verified:
   - the harness *reference* capture is driven by the connector's capture
     requests (the same scheduler iteration that produced the bytes) -- a
     save-request-driven capture would read the shared zero page;
-  - the retention rule follows the window's kind (`window_kind`): a sliding
-    window keeps the last `sliding_window` tokens, a chunked-local one keeps the
-    *current chunk* (`H // chunk_size * chunk_size` skipped, per vLLM's
-    `ChunkedLocalAttentionManager`), so the expected region is computed with the
-    same rule vLLM allocates with;
+  - the retention rule follows the window's kind (`window_kind`, named after
+    the connector's `WindowRetention.kind`): a sliding window keeps the last
+    `sliding_window` tokens (plus `extra_retained_tokens`, read from the
+    connector's own registration), a chunked-local one keeps the *current
+    chunk* (`H // chunk_size * chunk_size` skipped), and an R-SWA one keeps
+    everything (its manager never parks a block on the null page), so the
+    expected region is computed with the same rule vLLM allocates with. The
+    registered retention is also cross-checked against the config-derived one
+    and its *widest* window is what the guards use (a deployment can register
+    several chunk sizes, and the guards must bound the widest local group, so
+    the geometry's representative window is the widest one). Every registered
+    `(kind, window, extra)` tuple is kept -- a deployment may mix sliding and
+    chunked-local groups -- and the loaded region is the union of their kept
+    suffixes per hit length, never a fold of one tuple's window with another's
+    extra:
+    a windowed group the detection missed fails loudly instead of verifying the
+    wrong region, and the reverse is just as loud -- once an engine has started,
+    a windowed config with no registered windowed group is a mismatch, not a
+    fallback (the config-derived stand-in only covers the window before the
+    first start). Groups fold as (window, extra) *pairs* by their retained span
+    (`window - 1 + extra`), never as independent maxima, which would synthesize
+    retention that no group has;
+  - R-SWA keeps its whole prefill and frees a gap only while decoding past its
+    window, so the retained-span guards cannot bound it: the cross-request
+    scenario (32-token decode, below the 128-token default window) skips loudly
+    rather than pretend the prompt length decided anything;
+  - a full-attention *group* is detected from an actual `full_attention` layer:
+    state layer types (mamba / linear attention) keep a per-block state, not a
+    whole-prefix KV group, so a bounded+state hybrid is expected to load only
+    its window tail (unknown layer spellings stay conservative and expect the
+    larger set);
+  - every scenario that builds a window-scaled prompt gates it on the
+    *effective* `--max-model-len` (the started server's args, so a
+    `KVCM_E2E_VLLM_ARGS` override counts) and skips with the numbers when the
+    prompt cannot fit, instead of letting the server answer 400. The prompts
+    themselves are sized from the *registered* geometry once an engine has
+    registered (the config-level window may be narrower than the widest local
+    group): run_e2e extends them until they really cross the window twice. The gate
+    counts the scenario's own completion request too (vLLM limits prompt plus
+    output against the same context window), and a scenario that generates a
+    long candidate on purpose truncates it to `prompt_capacity(max_tokens)`
+    first and gates the sequence actually sent, and a scenario that needs more
+    windows than the shared generator aims at (the mid-prefix case needs three)
+    extends its token ids until the *tokenized* length really covers them. A windowed scenario whose
+    premise is *crossing* the window (cross_request_prefix) skips loudly when
+    the effective limit cannot produce a prefix past the registered window --
+    inside one window nothing is freed or replaced, so it would "pass" without
+    exercising any windowed load. Chunked-local retention keeps every
+    registered chunk size and unions their tails per hit length (those tails
+    are not nested, unlike sliding spans, where the widest pair is the union);
   - the connector saves the whole prefix (historian), while a *hit* gets slots
     per group: every group keeps the tail window of the match
     (`cdiv(H, mbs) - max(0, H - (window-1)) // mbs`) and a full-attention group
@@ -77,6 +122,35 @@ Multi-group specifics verified:
     all-zero at the positions they filter out: the filter exists to skip slots
     vLLM never allocated, and without that read it would also hide a connector
     that wrote into them;
+  - the log scan returns *every* match on a line (the connector prints one
+    line per event, and one event can carry several groups the harness needs:
+    a deployment line lists every windowed group's `WindowRetention`), and the
+    full-hit scenario compares its loaded captures byte for byte with the
+    phase-1 references like the other round trips -- the key set alone cannot
+    see a gather/scatter regression that fills the right slots with wrong KV;
+  - `WindowGeometry.window_tail()` reports the *windowed* groups' own tail (the
+    max over chunk sizes for chunked-local, the window tail for sliding) and
+    never folds in a full-attention group's whole match -- that union is what
+    `loaded_blocks()` is for. The mid-prefix scenario uses the local tail to
+    keep its hit strictly inside a chunk, so a mixed chunked/full model cannot
+    let the full group's captures mask a local group that kept nothing;
+  - a chunked-local match that ends exactly on a chunk boundary keeps nothing
+    (vLLM skips every matched token), and where the tokenizer puts the base's
+    last token decides that: run_e2e nudges it inside the chunks (increasing
+    increments, so no chunk size can trap it on the boundary) until the
+    *block-rounded* match -- the number the expectations use, not the raw token
+    count, and including the suffix re-merge -- clears every registered chunk,
+    and requires a nonempty windowed tail; a chunk no wider than one manager
+    block can never keep a block, so such a model skips loudly instead; the
+    full-hit scenario keeps its cap off the boundaries the same way (and skips
+    when a fixed state-checkpoint cap lands on one);
+  - the pinned-host gate checks each engine start's own log stream separately
+    (every rank prints its pool plan once per start): a restart that lost a rank
+    cannot borrow the other start's rank set, or a duplicated line, to pass, and
+    each report is tied to the rank whose pool plan actually ran (the totals
+    carry no rank themselves; the harness connector's registration line, logged
+    in that very step, is the marker). The budget side rests on the maximum over
+    all lines, which fails a breach wherever it came from;
   - the harness checks the pinned-host budget from the engine log
     (`total pinned = X GiB`), configured per model *fingerprint*
     (`architectures[0]` + declared window, so a copied or renamed checkpoint
@@ -105,8 +179,8 @@ Multi-group specifics verified:
 | `test_full_hit` | 1 | 1 | Phase 2 resends the identical prompt: full-prompt hit is capped so >= 1 token is recomputed |
 | `test_multi_turn` | 1 | 1 | Growing conversation: each turn loads the previous turns' blocks and saves new ones |
 | `test_cross_request_prefix` | 1 | 2 | Request B is a strict token prefix of saved request A, ending inside one of A's blocks. Hybrid: B's match must be truncated to the last block whose recurrent state was really materialized, and B's output must be token-identical to a no-cache reference |
-| `test_load_failure` | 1 | 1 | Storage files deleted between phases: load fails, retry loop must not spin, request still completes. The branch follows the *registered* block-table count: a single table reports the invalid blocks to vLLM, several tables cannot and must log the swallowed failure |
-| `test_mutation` | 1 | 1 | Meta-test: injected off-by-one in the slot translation must make verification FAIL (proves the harness is not vacuous) |
+| `test_load_failure` | 1 | 1 | Storage files deleted between phases: load fails, retry loop must not spin, request still completes. The branch follows the *registered* block-table count, read from the connector's own transfer-group names deduplicated by table index (a packed `UniformTypeKVCacheSpecs` table is several buckets sharing one index, and the reporting mode counts tables, not buckets): a single table reports the invalid blocks to vLLM, several tables cannot and must log the swallowed failure. Single-table runs verify the surviving loads over the *originally allocated* region (vLLM allocates slots for the whole external match and never re-loads the tail of the prefix that invalid-block recovery shortened) intersected with the undeleted head, and the reporting-mode return still reads the capture marker |
+| `test_mutation` | 1 | 1 | Meta-test: injected off-by-one in the slot translation must make verification FAIL (proves the harness is not vacuous). Only a *phase-2* verification assertion counts as the expected catch (phase 1 only writes references through vLLM's own slot mapping, so an assertion there means the capture is broken, not that the mutation was detected) and a capture implementation error (an index or device fault) fails the meta-test too, so a broken capture cannot masquerade as a detected corruption |
 
 ## Running
 
