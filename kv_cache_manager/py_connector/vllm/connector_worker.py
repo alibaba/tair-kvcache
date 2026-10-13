@@ -179,13 +179,21 @@ class _CaptureLedger:
         session_id: int,
         outcomes: "Dict[Tuple[str, int], bool]",
     ) -> None:
-        """Close out a session's blocks: ``True`` returns the slot, ``False``
-        keeps it (the block is announced again, and the HBM window that
-        produced the bytes has moved on -- they are the only copy left).
+        """Close out a session's blocks, keeping the bytes either way.
 
-        A failure whose request already retired cannot be retried, so its slot
-        is released. A block that was captured again while this task ran keeps
-        the newer entry; the settled one goes back to the arena.
+        A task's verdict is *this rank's* result, while a block is committed
+        only when every rank wrote it (the coordinator ANDs the ranks into
+        finish_write_cache, see on_save_finished). A successful local write
+        therefore says nothing yet: if this rank dropped its capture and
+        another rank failed, the manager rejects the block, the retry finds no
+        windowed bytes here -- the HBM window has moved on, a later capture
+        abstains -- and the block can never be published. So the unified rule
+        is: a local verdict keeps the bytes (they are the only copy left and a
+        retry reuses them); the slot is returned when the *committed* state is
+        known -- the manager reports the block as existing (the mask-derived
+        release, which is exactly "someone durable holds this data") -- or when
+        the request retires, where nothing can publish it any more. A block
+        captured again while this task ran keeps the newer entry.
         """
         with self._lock:
             sessions = self.in_flight.get(req_id)
@@ -195,7 +203,8 @@ class _CaptureLedger:
                 capture = sessions.pop((session_id, key[0], key[1]), None)
                 if capture is None:
                     continue  # settled already: nothing to release
-                if ok or req_id in self._retired:
+                if req_id in self._retired:
+                    # Nothing will publish it: see the retirement semantics.
                     self._release(capture)
                     continue
                 staged = self.staged.setdefault(req_id, {})
@@ -204,6 +213,14 @@ class _CaptureLedger:
                     self._release(capture)
                 else:
                     staged[key] = capture
+                if not ok:
+                    logger.debug(
+                        "req:%s session %d: block %s failed on this rank; its "
+                        "bytes stay staged for the retry",
+                        req_id,
+                        session_id,
+                        key,
+                    )
             if not sessions:
                 self.in_flight.pop(req_id, None)
                 self._retired.discard(req_id)
@@ -225,6 +242,11 @@ class _CaptureLedger:
                 self._release(staged.pop(key))
                 released += 1
             return released
+
+    def holds(self, req_id: str) -> bool:
+        """Does this request still own any staged or in-flight entry?"""
+        with self._lock:
+            return bool(self.staged.get(req_id)) or bool(self.in_flight.get(req_id))
 
     def retire(self, req_id: str) -> int:
         """Release everything still waiting for a session; keep in-flight
@@ -304,6 +326,16 @@ class ConnectorWorker:
         self._captures = _CaptureLedger()
         self._staged = self._captures.staged
         self._in_flight = self._captures.in_flight
+        # The URI (the manager's cache key) each planned block will be written
+        # to, per request: a release may only drop captured bytes whose URI no
+        # in-flight session of *any* request still owns. Two requests sharing a
+        # prefix make the manager answer "existing" for the second one's blocks
+        # while the first one's allocations are still uncommitted (duplicate
+        # StartWriteCache calls are deduplicated before FinishWriteCache), so a
+        # release computed from that answer would drop the second request's
+        # captures -- and if the first writer then fails, neither request has
+        # the windowed bytes left to publish them.
+        self._block_uris: Dict[str, Dict[int, Optional[str]]] = {}
 
         self._tp_rank = get_tensor_model_parallel_rank()
         # torch device module (torch.cuda / torch.musa / ...), set in
@@ -781,14 +813,19 @@ class ConnectorWorker:
 
         Handing a block over *moves* its entry from ``_staged`` to
         ``_in_flight``: the task owns the slot from here on and returns it when
-        its transfer lands. A block is announced once, so a second plan for the
+        its transfer lands. The block's URI is remembered with it: a release
+        for another request may only drop bytes whose URI is not still owned by
+        a live session (see _block_uris). A block is announced once, so a second plan for the
         same block means the announcement was repeated -- it gets no slot (and
         no location to write to), rather than a slot two tasks would both
         release.
         """
         slots: List[Optional[int]] = []
-        for block in manager_block_idxes:
+        block_uris = self._block_uris.setdefault(req_id, {})
+        for position, block in enumerate(manager_block_idxes):
             key = (group.spec_name, block)
+            if position < len(uris):
+                block_uris[block] = uris[position]
             capture = self._captures.take(req_id, session_id, key)
             if capture is None:
                 if self._captures.taken_by(req_id, session_id, key):
@@ -1078,8 +1115,8 @@ class ConnectorWorker:
         if meta.to_capture_requests:
             self._capture_blocks(meta)
         if not meta.to_save_requests:
-            for req_id, blocks in meta.to_release_captures:
-                self._release_captures_for(req_id, blocks)
+            for req_id, blocks, uris in meta.to_release_captures:
+                self._release_captures_for(req_id, blocks, uris)
             return
         ready_event = self._device_mod.Event()
         ready_event.record(self._device_mod.current_stream())
@@ -1130,8 +1167,8 @@ class ConnectorWorker:
         # behind must not be able to withdraw the bytes this step's session is
         # about to write (the scheduler re-checks its protection when it
         # flushes, and this is the same rule one layer down).
-        for req_id, blocks in meta.to_release_captures:
-            self._release_captures_for(req_id, blocks)
+        for req_id, blocks, uris in meta.to_release_captures:
+            self._release_captures_for(req_id, blocks, uris)
 
     # ------------------------------------------------------------------ #
     # Eager capture (windowed groups)
@@ -1162,9 +1199,13 @@ class ConnectorWorker:
         location, no bytes, so the block is not published.
         """
         captures = meta.to_capture_requests
+        # One deadline for the whole step, not one per request: every request
+        # of the step draws from the same budget, so a long chain of requests
+        # that each just make it cannot stall the engine thread for their sum.
+        deadline = time.monotonic() + CAPTURE_POOL_WAIT_SECONDS
         for index, capture in enumerate(captures):
             try:
-                if not self._capture_request(capture):
+                if not self._capture_request(capture, deadline):
                     skipped = len(captures) - index - 1
                     if skipped:
                         logger.warning(
@@ -1185,7 +1226,9 @@ class ConnectorWorker:
                     len(capture.manager_block_idxes),
                 )
 
-    def _capture_request(self, capture: CaptureRequest) -> bool:
+    def _capture_request(
+        self, capture: CaptureRequest, deadline: Optional[float] = None
+    ) -> bool:
         """Copy this request-step's windowed blocks into the staging arena.
 
         Returns False when the request-step was withheld for lack of arena room
@@ -1228,11 +1271,14 @@ class ConnectorWorker:
         # half-held slot behind, so the runs of the groups that did fit are
         # released again when a later group does not fit (or raises).
         #
-        # One deadline for the whole request-step: the budget is what a *step*
-        # may spend holding the engine thread, not what each bucket may spend
-        # on its own (a handful of buckets would otherwise stall the step for
-        # buckets x CAPTURE_POOL_WAIT_SECONDS while the slots trickle free).
-        deadline = time.monotonic() + CAPTURE_POOL_WAIT_SECONDS
+        # One deadline for the whole request-step, handed down from the step
+        # (see _capture_blocks): the budget is what a *step* may spend holding
+        # the engine thread -- not what each bucket, nor each request, may
+        # spend on its own (a handful of them would otherwise stall the step
+        # for count x CAPTURE_POOL_WAIT_SECONDS while the slots trickle free).
+        # A direct caller (tests, one-off captures) gets its own budget.
+        if deadline is None:
+            deadline = time.monotonic() + CAPTURE_POOL_WAIT_SECONDS
         taken: List[Tuple[AttentionTransferGroup, List[int], Any, int]] = []
         withheld: Optional[AttentionTransferGroup] = None
         try:
@@ -1299,7 +1345,12 @@ class ConnectorWorker:
         for _group, captureable, pool, start in taken:
             pool.release(start, len(captureable))
 
-    def _release_captures_for(self, req_id: str, blocks: Sequence[int]) -> None:
+    def _release_captures_for(
+        self,
+        req_id: str,
+        blocks: Sequence[int],
+        block_uris: "Optional[Dict[int, Sequence[str]]]" = None,
+    ) -> None:
         """Return the captured slots of blocks no session is going to write.
 
         The manager reported them as already cached when the session came back,
@@ -1309,7 +1360,30 @@ class ConnectorWorker:
         as the request runs. Entries already handed to a session are the task's
         to release and are left alone.
         """
-        released = self._captures.release_staged(req_id, blocks)
+        pending = self._uris_other_requests_hold(req_id)
+        releasable = []
+        for block in blocks:
+            reported = (block_uris or {}).get(block, ())
+            own = self._block_uris.get(req_id, {}).get(block)
+            candidates = set(reported)
+            if own is not None:
+                candidates.add(own)
+            if candidates & pending:
+                # A live session of some request still owns this cache key:
+                # the manager's "existing" may be one of its uncommitted
+                # allocations (duplicate StartWriteCache calls are deduplicated
+                # before FinishWriteCache), so dropping these bytes could leave
+                # nobody able to publish the block if that writer fails.
+                logger.debug(
+                    "req:%s block %d: not releasing its capture, %s is still "
+                    "being written by another session",
+                    req_id,
+                    block,
+                    sorted(candidates),
+                )
+                continue
+            releasable.append(block)
+        released = self._captures.release_staged(req_id, releasable)
         if released:
             logger.info(
                 "req:%s released %d captured block slots the manager already "
@@ -1317,6 +1391,33 @@ class ConnectorWorker:
                 req_id,
                 released,
             )
+
+    def _uris_other_requests_hold(self, req_id: str) -> Set[str]:
+        """The cache keys (URIs) *other* requests still hold bytes for.
+
+        A request's own blocks are not guarded (its release is exactly what
+        its own confirmation asks for), but another request's are: the manager
+        answers "existing" for a block while an earlier session of a *different*
+        request owns only uncommitted allocations (duplicate StartWriteCache
+        calls are deduplicated before FinishWriteCache). Dropping the second
+        request's bytes there leaves nobody able to publish the block if the
+        first writer fails. Both states guard: in flight (a task is writing it)
+        and staged (a local verdict landed, but the commit -- an AND over the
+        ranks -- is unknown).
+
+        Read without the ledger lock on purpose: a stale view can only make
+        this *more* conservative.
+        """
+        uris: Set[str] = set()
+        for other, block_uris in list(self._block_uris.items()):
+            if other == req_id:
+                continue
+            if not self._captures.holds(other):
+                continue
+            for uri in list(block_uris.values()):
+                if uri is not None:
+                    uris.add(uri)
+        return uris
 
     def _release_staged(self, req_id: str) -> None:
         """Return the capture slots the request never handed to a session.
@@ -1331,6 +1432,8 @@ class ConnectorWorker:
         the range twice and dispatch it to two transfers; review_r1 S1).
         """
         released = self._captures.retire(req_id)
+        if req_id not in self._in_flight:
+            self._block_uris.pop(req_id, None)
         in_flight = self._in_flight.get(req_id)
         logger.debug(
             "req:%s released %d un-taken captured block slots (%d in flight "
