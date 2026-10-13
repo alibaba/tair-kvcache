@@ -207,8 +207,29 @@ class _StagingPool:
         start = self._take_from(self._reserved_runs, n, ascending=True)
         if start is not None:
             return start
-        free = sum(length for _start, length in self._runs)
-        if free - n < self.capture_blocks:
+        if self.capture_blocks:
+            # The floor has to survive as *one run a capture can use whole*:
+            # free slots spread over pieces of two are not a floor, they are
+            # the fragmentation that withholds the next capture. Take from the
+            # highest run that still leaves a run of capture_blocks behind
+            # (the take and the captures consume the free region from opposite
+            # edges, so the remainder stays contiguous as long as this holds).
+            for i in range(len(self._runs) - 1, -1, -1):
+                _start, length = self._runs[i]
+                if length < n:
+                    continue
+                kept = length - n
+                others = max(
+                    (length for j, (_s, length) in enumerate(self._runs) if j != i),
+                    default=0,
+                )
+                if max(kept, others) < self.capture_blocks:
+                    continue
+                if kept:
+                    self._runs[i] = [_start + n, kept]
+                else:
+                    self._runs.pop(i)
+                return _start
             return None
         return self._take_from(self._runs, n, ascending=False)
 
