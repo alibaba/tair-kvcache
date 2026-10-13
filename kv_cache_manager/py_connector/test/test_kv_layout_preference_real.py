@@ -106,8 +106,14 @@ def _config(
     """
     from vllm.config import CacheConfig
 
+    # ``architecture`` mirrors what a real ModelConfig carries: the
+    # implementation the engine resolved from ``architectures``. The layout
+    # predicate reads it (falling back to the registry's supported names), so
+    # the fixture records the same pick a real config would.
     return SimpleNamespace(
-        model_config=SimpleNamespace(architectures=architectures),
+        model_config=SimpleNamespace(
+            architectures=architectures, architecture=architectures[0]
+        ),
         kv_transfer_config=SimpleNamespace(
             kv_connector=connector, kv_connector_module_path=module_path
         ),
