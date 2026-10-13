@@ -8,13 +8,15 @@ and the thin connector shell (v1_connector) build on this module; nothing
 here may import them.
 
 Every accepted MLA layout is one latent row per token; the refusals below say
-why the rest are refused. Compressed MLA (compress_ratio > 1) is a documented
-extension point, not a missing check: supporting it needs three dimensions this
-data model does not carry yet -- rows per block (spec.storage_block_size),
-tokens per row (compress_ratio) and slots per block -- plus a manager block that
-stays a whole number of rows (mbs % compress_ratio == 0); vLLM addresses a
+why the rest are refused. Compressed MLA is a documented extension point, not a
+missing check: supporting it needs three dimensions this data model does not
+carry yet -- rows per block (spec.storage_block_size), tokens per row (the
+spec's tokens per stored state) and slots per block -- plus a manager block that
+stays a whole number of rows (mbs % tokens_per_state == 0); vLLM addresses a
 compressed row by (storage block number, row within the storage block) (see
-get_compressed_slot_mapping), never by token.
+get_compressed_slot_mapping), never by token. vLLM renamed that field on the way
+to 0.31 (MLAAttentionSpec.compress_ratio -> AttentionSpec.tokens_per_state), so
+every read goes through the era-safe _tokens_per_state below.
 """
 
 from dataclasses import dataclass, field
@@ -23,9 +25,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple
 import torch
 
 from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     MLAAttentionSpec,
     MambaSpec,
+    SinkFullAttentionSpec,
+    SlidingWindowSpec,
 )
 
 try:
@@ -44,6 +49,24 @@ try:
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs  # ty: ignore[unresolved-import]
 except ImportError:  # pragma: no cover - older vLLM eras
     UniformTypeKVCacheSpecs = None  # ty: ignore[invalid-assignment]
+try:
+    from vllm.v1.kv_cache_interface import HiddenStateCacheSpec  # ty: ignore[unresolved-import]
+except ImportError:  # pragma: no cover - vllm <= 0.21 has no HiddenStateCacheSpec
+    HiddenStateCacheSpec = None  # ty: ignore[invalid-assignment]
+try:
+    from vllm.v1.kv_cache_interface import RSWASpec  # ty: ignore[unresolved-import]
+except ImportError:  # pragma: no cover - vllm <= 0.25 has no RSWASpec
+    RSWASpec = None  # ty: ignore[invalid-assignment]
+try:
+    # vllm 0.22 - 0.27 only: a FullAttentionSpec whose page size counts TQ slots
+    # instead of head x dtype. Dropped in 0.28.
+    from vllm.v1.kv_cache_interface import TQFullAttentionSpec  # ty: ignore[unresolved-import]
+except ImportError:  # pragma: no cover - other vLLM eras
+    TQFullAttentionSpec = None  # ty: ignore[invalid-assignment]
+try:
+    from vllm.v1.kv_cache_interface import CircularBufferSpec  # ty: ignore[unresolved-import]
+except ImportError:  # pragma: no cover - vllm <= 0.28 has no compression ring
+    CircularBufferSpec = None  # ty: ignore[invalid-assignment]
 
 from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.vllm.transfer_types import (
@@ -179,6 +202,14 @@ class AttentionGroupMeta(GroupMeta):
     # carries the defaulted spec_suffix.
     page_bytes: int = field(kw_only=True)
 
+    # The page element type (spec.dtype): one instance may mix them (V3.2 bf16
+    # main + uint8 indexer), and the staging pool keys by it, so the bucket, not
+    # the instance, is the granularity. Equals the kv_cache tensor dtype by
+    # construction: both come from kv_cache_dtype_str_to_dtype on the same
+    # cache_dtype (gpu_model_runner for the tensors, the attention layer for the
+    # spec). None only for a spec object that carries no dtype at all.
+    dtype: Any = None
+
 
 @dataclass(frozen=True)
 class StateGroupMeta(GroupMeta):
@@ -311,26 +342,49 @@ def _quant_mode_name(spec: Any) -> str:
     return _QUANT_MODE_NAMES.get(_quant_mode(spec), f"mode {_quant_mode(spec)}")
 
 
-def _check_mla_structure(origin: str, spec: "MLAAttentionSpec") -> int:
-    """Refuse the compress_ratio / model_version combinations vLLM's own size
+def _tokens_per_state(spec: Any) -> Tuple[Any, str]:
+    """Tokens covered by one stored row, plus the field that carried it.
+
+    vLLM <= 0.28 spells the compression as ``MLAAttentionSpec.compress_ratio``;
+    from 0.29 it is the AttentionSpec-wide ``tokens_per_state`` (int, or a
+    Fraction < 1 for pooled states). An engine spec carries exactly one of the
+    two and both default to 1, so reading *both* and trusting whichever is not
+    the default is the era-safe read: a compression can never hide behind the
+    era's field name. A spec that carries both (only a test double) is read
+    from ``tokens_per_state`` first -- the newer spelling.
+
+    Missing attributes read as 1: vLLM 0.14 predates both fields and has no
+    compressed MLA either.
+    """
+    tokens_per_state = getattr(spec, "tokens_per_state", 1)
+    if tokens_per_state != 1:
+        return tokens_per_state, "tokens_per_state"
+    compress_ratio = getattr(spec, "compress_ratio", 1)
+    if compress_ratio != 1:
+        return compress_ratio, "compress_ratio"
+    return 1, "tokens_per_state"
+
+
+def _check_mla_structure(origin: str, spec: "MLAAttentionSpec") -> Tuple[Any, str]:
+    """Refuse the tokens-per-state / model_version combinations vLLM's own size
     algebra cannot represent, reading raw fields only (never
     storage_block_size / real_page_size_bytes / page_size_bytes): a ratio
     below 1 divides by zero, one that does not divide block_size would be
     floored silently, and an unknown model_version has no algebra at all.
-    Returns the validated compress_ratio.
+    Returns the validated (tokens per stored row, the field it came from).
 
-    Supporting a compressed layout (c > 1) is a documented extension point,
+    Supporting a compressed layout (> 1) is a documented extension point,
     see the module docstring."""
-    compress_ratio = getattr(spec, "compress_ratio", 1)
-    if compress_ratio < 1:
+    tokens_per_state, field = _tokens_per_state(spec)
+    if tokens_per_state < 1:
         raise NotImplementedError(
-            f"{origin}: MLAAttentionSpec compress_ratio={compress_ratio} is "
+            f"{origin}: MLAAttentionSpec {field}={tokens_per_state} is "
             f"invalid (must be >= 1); refusing to size the KV cache from it"
         )
-    if compress_ratio > 1 and spec.block_size % compress_ratio:
+    if tokens_per_state > 1 and spec.block_size % tokens_per_state:
         raise NotImplementedError(
             f"{origin}: MLAAttentionSpec block_size={spec.block_size} is not "
-            f"divisible by compress_ratio={compress_ratio}; refusing to "
+            f"divisible by {field}={tokens_per_state}; refusing to "
             f"silently floor the storage layout"
         )
     model_version = getattr(spec, "model_version", None)
@@ -339,7 +393,7 @@ def _check_mla_structure(origin: str, spec: "MLAAttentionSpec") -> int:
             f"{origin}: MLAAttentionSpec model_version={model_version!r} is not "
             f'a layout this connector knows (expected None or "deepseek_v4")'
         )
-    return compress_ratio
+    return tokens_per_state, field
 
 
 def _check_mla_variant(
@@ -373,11 +427,11 @@ def _check_mla_variant(
     transferred rows), unknown cache_dtype_str, and (cds, kv_quant_mode) pairs
     vLLM cannot produce -- guessing a scale layout is worse than refusing.
     """
-    compress_ratio = _check_mla_structure(origin, spec)
-    if compress_ratio > 1:
+    tokens_per_state, field = _check_mla_structure(origin, spec)
+    if tokens_per_state > 1:
         raise NotImplementedError(
-            f"{origin}: MLAAttentionSpec compress_ratio={compress_ratio} stores "
-            f"one latent row per {compress_ratio} tokens; DeepSeek V4 reads "
+            f"{origin}: MLAAttentionSpec {field}={tokens_per_state} stores "
+            f"one latent row per {tokens_per_state} tokens; DeepSeek V4 reads "
             f"those compressed rows together with its sliding-window and "
             f"compressor-state caches, which live in separate vLLM groups, and "
             f"the connector must serve a request's KV groups as a whole -- "
@@ -438,24 +492,113 @@ def _check_mla_variant(
     )
 
 
+#: Spec classes whose blocks hold the whole token prefix: vLLM allocates them
+#: for every token of the request and never frees or rewrites one while the
+#: request lives, so a verbatim token-prefix cache is exactly their content.
+#:
+#: * FullAttentionSpec -- including a *promoted* local-attention layer, i.e.
+#:   sliding_window / attention_chunk_size left set by
+#:   kv_cache_utils._promote_local_kv_cache_specs: its two callers are
+#:   unify_hybrid_kv_cache_specs (--disable-hybrid-kv-cache-manager) and
+#:   _try_get_full_allocation_fallback_groups (the allocation-only fallback
+#:   taken when page sizes cannot be unified, with the hybrid manager *on*).
+#:   Both allocate for all tokens and let the window narrow only the compute.
+#:   That is the documented escape hatch for windowed models (GPU KV is not
+#:   saved by it).
+#: * SinkFullAttentionSpec (OpenPangu) -- the sink K/V is a per-layer constant
+#:   that vLLM populates into every request's own blocks (maybe_populate_sink),
+#:   so the blocks are the full prefix and the byte round trip is lossless.
+#: * TQFullAttentionSpec (vllm 0.22 - 0.27) -- a page-size-only variant.
+#:
+#: Matched by *exact* type: a class this file has not been taught is refused
+#: even when it inherits from one of these (a subclass is a new claim about
+#: layout and retention -- RSWASpec itself is exactly such a subclass). The
+#: same rule governs _MLA_SPEC_TYPES below. A user-registered custom spec
+#: subclass (see vllm.v1.kv_cache_spec_registry) is refused for the same
+#: reason: it must be declared here deliberately first.
+#:
+#: Era-safe: a class this vLLM lacks reads as None and drops out of the tuple.
+_FULL_PREFIX_SPEC_TYPES: Tuple[type, ...] = tuple(
+    cls
+    for cls in (FullAttentionSpec, SinkFullAttentionSpec, TQFullAttentionSpec)
+    if cls is not None
+)
+
+#: The accepted MLA-family classes: the latent layout itself, plus the
+#: extract_hidden_states marker, which adds no layout of its own. Measured
+#: across the vllm 0.14 - 0.31 trees (envs/): HiddenStateCacheSpec is the only
+#: MLAAttentionSpec subclass any era ships, so exact-type matching refuses
+#: nothing a real engine produces.
+_MLA_SPEC_TYPES: Tuple[type, ...] = tuple(
+    cls for cls in (MLAAttentionSpec, HiddenStateCacheSpec) if cls is not None
+)
+
+#: Scratch classes the *engine* rebuilds per request, so a connector may drop
+#: them even when vLLM advertises them for transfer (see parse_groups):
+#:
+#: CircularBufferSpec -- "one block per request holding the raw keys of the
+#: token group that is still being compressed" (0.31 docstring), claimed for
+#: the request's lifetime by CircularBufferManager ("Claims the ring's single
+#: block per request; prefix caching disabled"), i.e. the compression machinery
+#: refills it every request. An external hit restores the *main* MLA group's
+#: prefix rows and the compressor rebuilds the ring around them.
+#:
+#: KpoolTailSpec is deliberately NOT here: same manager family, but its data
+#: path has not been shown to be rebuilt per request, so it stays refused when
+#: transferable (fail-closed).
+#:
+#: Matched by *exact* type, like every other acceptance rule here: a subclass of
+#: the ring is a new claim about the block's content and gets no exemption.
+_COMPRESSION_SCRATCH_TYPES: Tuple[type, ...] = tuple(
+    cls for cls in (CircularBufferSpec,) if cls is not None
+)
+
+
 def _check_attention_spec_supported(
     origin: str, spec: Any, *, calculate_kv_scales: bool
 ) -> None:
-    """Gate one attention spec to the layouts the transfer path supports.
+    """Accept or refuse one attention spec, by *class* rather than by field.
 
-    SlidingWindowMLASpec comes first because it is *not* a FullAttentionSpec
-    subclass: V4 keeps its attention sliding-window cache and its compressor
-    state in those specs (the state is fp32, one row per window step), and
-    both hold windowed or partial state, not the full prefix. V4 couples them
-    with its compressed MLA group, so transferring the MLA group while
-    skipping these would serve hits with uninitialized layers.
+    The rules below cover the whole attention zoo of vllm 0.14 - 0.31 in the
+    order they must be tested (a subclass before its parent). The field
+    whitelist this replaces (sliding_window / attention_chunk_size) is exactly
+    how a spec that keeps its window under another name stayed accepted:
+    RSWASpec.rswa_window is not in it, so an R-SWA instance passed the gate and
+    only failed much later -- or silently published freed gap blocks.
 
-    MLA variants are decided by the spec's own fields (_check_mla_variant).
-    The other FullAttentionSpec flavours keep the merged-window refusal: vLLM
-    merges SWA / chunked-attention layers into FullAttentionSpec keeping
-    sliding_window / attention_chunk_size set, and those blocks hold windowed
-    KV, not the full prefix -- publishing them as prefix caches would corrupt
-    reuse.
+    Refused, because their blocks stop being the full token prefix while the
+    request is alive (vLLM frees or rewrites them):
+
+    * SlidingWindowSpec (and its KpoolTailSpec subclass -- skipped before the
+      gate, see parse_groups), ChunkedLocalAttentionSpec: everything below the
+      window / outside the current chunk;
+    * SlidingWindowMLASpec: windowed or replayed MLA state, coupled by V4 with
+      the compressed MLA group;
+    * RSWASpec: the whole prompt plus the last rswa_window generated tokens, so
+      the gap in between is freed;
+    * MLAAttentionSpec with a window field: only reachable through the promote
+      path, which drops the replay policy; its retention semantics belong to
+      the windowed-MLA work;
+    * compressed MLA (tokens_per_state, or compress_ratio on vllm <= 0.28, > 1):
+      one row spans several tokens.
+
+    Accepted: the full-prefix classes (_FULL_PREFIX_SPEC_TYPES) and the MLA
+    latent layouts (_MLA_SPEC_TYPES, which includes the HiddenStateCacheSpec
+    marker of extract_hidden_states -- it changes no layout of its own, so the
+    latent-layout gate is the whole check).
+
+    Acceptance is by *exact* type, never by family: a subclass of an accepted
+    class is a fresh claim about byte layout and retention (RSWASpec is
+    precisely such a subclass) and is refused until this file names it. That is
+    also why the window test below is no longer the only line of defence -- a
+    spec whose window hides under a new field name cannot reach any accept
+    branch at all.
+
+    Everything else -- CrossAttentionSpec, EncoderOnlyAttentionSpec, and any
+    class this file has not been taught -- fails closed. The group-level
+    receipts are matched as strictly in _parse_group: an undeclared
+    MambaSpec / UniformTypeKVCacheSpecs subclass reaches this gate too and is
+    refused here by name.
     """
     if SlidingWindowMLASpec is not None and isinstance(spec, SlidingWindowMLASpec):
         raise NotImplementedError(
@@ -464,22 +607,144 @@ def _check_attention_spec_supported(
             f"state, not the full prefix, and DeepSeek V4 couples it with the "
             f"compressed MLA group; skipping it would leave those layers "
             f"uninitialized after a hit -- sliding-window / compressor-state MLA "
-            f"KV is not supported by TairKvCacheConnector"
+            f"KV is not supported by TairKvCacheConnector (window retention "
+            f"lands with the sliding-window support)"
         )
-    if not isinstance(spec, FullAttentionSpec):
+    if isinstance(spec, SlidingWindowSpec):
         raise NotImplementedError(
-            f"Unsupported kv cache spec {type(spec).__name__} in {origin}"
+            f"{origin}: {type(spec).__name__} sliding_window="
+            f"{getattr(spec, 'sliding_window', None)} extra_retained_tokens="
+            f"{getattr(spec, 'extra_retained_tokens', 0)} holds windowed KV: "
+            f"vLLM frees the blocks below the window while the request is "
+            f"alive, so they are not a token prefix -- sliding-window KV is "
+            f"not supported by TairKvCacheConnector (window retention lands "
+            f"with the sliding-window support)"
+        )
+    if isinstance(spec, ChunkedLocalAttentionSpec):
+        raise NotImplementedError(
+            f"{origin}: ChunkedLocalAttentionSpec attention_chunk_size="
+            f"{spec.attention_chunk_size} holds chunked-local KV: vLLM frees "
+            f"the blocks outside the current chunk while the request is alive, "
+            f"so they are not a token prefix -- chunked-local attention KV is "
+            f"not supported by TairKvCacheConnector"
+        )
+    if RSWASpec is not None and isinstance(spec, RSWASpec):
+        raise NotImplementedError(
+            f"{origin}: RSWASpec rswa_window={spec.rswa_window} keeps the whole "
+            f"prompt but only the last {spec.rswa_window} generated tokens: "
+            f"vLLM frees the gap blocks in between while the request is alive, "
+            f"so a token prefix would republish freed (or already reused) "
+            f"blocks -- R-SWA KV is not supported by TairKvCacheConnector "
+            f"(window retention lands with the sliding-window support)"
         )
     if isinstance(spec, MLAAttentionSpec):
-        _check_mla_variant(origin, spec, calculate_kv_scales=calculate_kv_scales)
-    for window_field in ("sliding_window", "attention_chunk_size"):
-        if getattr(spec, window_field, None) is not None:
+        if type(spec) not in _MLA_SPEC_TYPES:
+            # HiddenStateCacheSpec is the only declared one (a marker that adds
+            # no layout); anything else is a new layout/retention claim -- the
+            # RSWA shape one level down -- and must be named here first.
             raise NotImplementedError(
-                f"{origin}: FullAttentionSpec has {window_field}="
-                f"{getattr(spec, window_field)}; sliding-window / "
-                f"chunked attention KV is not full-prefix and is "
-                f"not yet supported by TairKvCacheConnector"
+                f"{origin}: {type(spec).__name__} is an MLAAttentionSpec subclass "
+                f"this connector has not been taught; it transfers the declared "
+                f"latent layouts only ({', '.join(cls.__name__ for cls in _MLA_SPEC_TYPES)})"
             )
+        # HiddenStateCacheSpec deliberately falls through the same checks as
+        # MLAAttentionSpec: the marker changes no layout, so the window test and
+        # the latent-layout gate apply to it verbatim (it is accepted because
+        # extract_hidden_states writes plain latent bytes).
+        for window_field in ("sliding_window", "attention_chunk_size"):
+            if getattr(spec, window_field, None) is not None:
+                raise NotImplementedError(
+                    f"{origin}: {type(spec).__name__} has {window_field}="
+                    f"{getattr(spec, window_field)}; a windowed MLA layout "
+                    f"holds windowed or replayed state, not the full "
+                    f"prefix, and is not supported by "
+                    f"TairKvCacheConnector yet"
+                )
+        _check_mla_variant(origin, spec, calculate_kv_scales=calculate_kv_scales)
+        return
+    if type(spec) in _FULL_PREFIX_SPEC_TYPES:
+        tokens_per_state, field = _tokens_per_state(spec)
+        if tokens_per_state != 1:
+            # Pooled / compressed *full attention*: one row holds several states
+            # per token (Whisper's block pooling sets Fraction(1, n)) or spans
+            # several tokens. _attention_meta sizes one row per token, so the
+            # page would not match the tensor and registration fails much later
+            # with a bare block-size assertion -- refuse here, by field name.
+            # MLA keeps its own structural check above (that one will learn to
+            # transfer multi-token rows; this model does not).
+            raise NotImplementedError(
+                f"{origin}: {type(spec).__name__} {field}={tokens_per_state} is "
+                f"not one state per token; the transfer model sizes one row per "
+                f"token, so pooled or compressed full-attention KV would be "
+                f"mis-sized. Refusing the instance (not supported by "
+                f"TairKvCacheConnector yet)"
+            )
+        return
+    raise NotImplementedError(
+        f"Unsupported kv cache spec {type(spec).__name__} in {origin}: "
+        f"TairKvCacheConnector serves token-prefix KV (full attention, MLA "
+        f"latent, and hybrid attention + mamba state) only; there is no "
+        f"transfer contract for this class"
+    )
+
+
+def _is_scratch_spec(spec: Any) -> bool:
+    """Is this group's KV per-request scratch that no prefix-cache hit can serve?
+
+    vLLM's ring-buffer and host-tier caches (CircularBufferSpec, KpoolTailSpec,
+    HiSparseHot/ResidentSpec) hold a page or a raw buffer per request rather
+    than token-addressed prefix KV, and they say so: ``prefix_cacheable`` is
+    False (vLLM never hashes their blocks, so no hit is ever expected for them)
+    *and* the spec either takes no slot mapping row or keeps no per-layer views
+    for a connector to transfer. Nothing in them is a token prefix, so the
+    whole group is skipped -- the shape of an EAGLE drafter group -- instead of
+    refusing the instance that carries it.
+
+    Both halves matter: a *cacheable* spec must never be skipped (that would be
+    a silent hole), and a spec that is not cacheable but is still transferable
+    through the ordinary contract is refused by the gate rather than dropped
+    (SlidingWindowMLASpec with bounded_replay).
+
+    The flags arrived with the specs they describe (prefix_cacheable and
+    CircularBufferSpec in 0.29, uses_slot_mapping / has_layer_views and the
+    HiSparse / kpool-tail caches in 0.30), so an older era is missing both the
+    flag and the spec it would judge: a missing attribute reads as the
+    permissive default and nothing is skipped.
+    """
+    if getattr(spec, "prefix_cacheable", True):
+        return False
+    return not getattr(spec, "uses_slot_mapping", True) or not getattr(
+        spec, "has_layer_views", True
+    )
+
+
+def _is_engine_rebuilt_scratch(spec: Any) -> bool:
+    """Is this engine-rebuilt scratch, i.e. may a *transferable* group be dropped?
+
+    The one proven case is the compression ring: CircularBufferSpec (and a
+    UniformTypeKVCacheSpecs whose members are all rings, the shape V4.1 packs)
+    holds the raw keys of the in-flight token group for one request, and the
+    compression machinery refills it there -- an external hit restores the main
+    MLA group and the ring is rebuilt around it. Everything else that is
+    scratch *and* transferable is refused instead (see parse_groups): dropping
+    a group the engine hands to connectors and does *not* rebuild would resume
+    an external hit with uninitialized state.
+
+    Exact types again, wrapper included: a registered custom spec that
+    *subclasses* the ring (or packs a subclass) is a new claim about that
+    block's content, so it must not inherit the exemption -- it falls through
+    to the transferable-scratch refusal above.
+
+    Eras that ship no ring class answer False, so the refusal stays in place.
+    """
+    if not _COMPRESSION_SCRATCH_TYPES:
+        return False
+    if UniformTypeKVCacheSpecs is not None and type(spec) is UniformTypeKVCacheSpecs:
+        members = spec.kv_cache_specs
+        return bool(members) and all(
+            type(member) in _COMPRESSION_SCRATCH_TYPES for member in members.values()
+        )
+    return type(spec) in _COMPRESSION_SCRATCH_TYPES
 
 
 def _compact_page_bytes(spec: Any, origin: str) -> int:
@@ -557,9 +822,10 @@ def _attention_meta(
     suffix: str,
     origin: str,
 ) -> AttentionGroupMeta:
-    """Size one attention bucket from its spec. The gate already refused
-    compress_ratio > 1, so one token is one storage row and the per-token
-    byte size is exact: compact_page_bytes / block_size."""
+    """Size one attention bucket from its spec. The gate already refused a
+    spec whose tokens_per_state (compress_ratio on vllm <= 0.28) is above 1, so
+    one token is one storage row and the per-token byte size is exact:
+    compact_page_bytes / block_size."""
     page_bytes = _compact_page_bytes(spec, origin)
     if page_bytes % spec.block_size != 0:
         raise NotImplementedError(
@@ -576,6 +842,7 @@ def _attention_meta(
         * len(layer_names),
         spec_suffix=suffix,
         page_bytes=page_bytes,
+        dtype=getattr(spec, "dtype", None),
     )
 
 
@@ -614,10 +881,18 @@ def _uniform_group_metas(
 def _parse_group(
     idx: int, group: Any, manager_block_size: int, *, calculate_kv_scales: bool
 ) -> List[GroupMeta]:
-    """One vLLM kv_cache_group -> its transfer buckets (a plain group = one)."""
+    """One vLLM kv_cache_group -> its transfer buckets (a plain group = one).
+
+    Both group-level receipts are matched by *exact* type: a MambaSpec subclass
+    is a new claim about what a block's state covers (the transfer path relies
+    on "one state per block end", see _state_block_ids), and a
+    UniformTypeKVCacheSpecs subclass need not be a page-size pack at all. An
+    undeclared subclass therefore falls through to the attention gate, which
+    refuses it by name (vLLM 0.14 - 0.31 ships no subclass of either).
+    """
     spec = group.kv_cache_spec
     layers = list(group.layer_names)
-    if isinstance(spec, MambaSpec):
+    if type(spec) is MambaSpec:
         return [
             StateGroupMeta(
                 group_idx=idx,
@@ -627,9 +902,7 @@ def _parse_group(
                 page_size_bytes=spec.page_size_bytes,
             )
         ]
-    if UniformTypeKVCacheSpecs is not None and isinstance(
-        spec, UniformTypeKVCacheSpecs
-    ):
+    if UniformTypeKVCacheSpecs is not None and type(spec) is UniformTypeKVCacheSpecs:
         return _uniform_group_metas(
             idx, spec, manager_block_size, calculate_kv_scales=calculate_kv_scales
         )
@@ -648,6 +921,35 @@ def _check_unique_names(metas: List[GroupMeta]) -> None:
     part of the identity: every rank registers the same name set."""
     names = [f"g{m.group_idx}{m.spec_suffix}" for m in metas]
     assert len(names) == len(set(names)), f"wire spec name collision: {names}"
+
+
+def _transferable_groups(kv_cache_config: Any) -> List[Tuple[int, Any]]:
+    """The (vLLM group index, group) pairs this connector may transfer.
+
+    vLLM 0.29+ projects the group list for connectors: KVCacheGroupSpec.
+    enable_kv_transfer=False marks groups the engine rebuilds itself (ephemeral
+    accelerator-side replicas of a transferable source group, e.g. HiSparse's
+    resident/hot tiers), and KVCacheConfig.transfer_group_ids / transfer_groups
+    are the authoritative projection. A group the engine does not hand to
+    connectors must not be registered here even when its spec looks cacheable
+    (_is_scratch_spec judges the class, not the layout's role).
+
+    The projection decides *membership only*: the index we keep is the raw vLLM
+    group index, because that is the index space of every block-id payload this
+    connector receives (KVCacheBlocks.get_block_ids() and
+    CachedRequestData.new_block_ids are both unfiltered -- see
+    v1/core/kv_cache_manager.get_block_ids and its new_block_ids caller), and
+    the ledger plus every consumer index by it. Renumbering to the projected
+    position would pair our metas with another group's block table.
+
+    Eras without the attribute (vLLM <= 0.28) expose every group; the flag
+    arrived with the specs it describes.
+    """
+    groups = kv_cache_config.kv_cache_groups
+    transfer_ids = getattr(kv_cache_config, "transfer_group_ids", None)
+    if transfer_ids is None:
+        return [(idx, group) for idx, group in enumerate(groups)]
+    return [(idx, groups[idx]) for idx in transfer_ids]
 
 
 def parse_groups(
@@ -671,13 +973,73 @@ def parse_groups(
 
     calculate_kv_scales is a mandatory keyword: defaulting it would let a
     runtime-calibrated scale layout pass as a plain fp8 one.
+
+    Groups that carry nothing the manager may cache are skipped instead of
+    refused -- EAGLE/MTP drafters (vLLM marks them) and per-request scratch
+    (see _is_scratch_spec), plus the groups the engine keeps out of the
+    transfer contract (see _transferable_groups). A skipped group keeps its
+    vLLM block-table index, so its number is simply absent from the wire names.
+
+    The two vLLM contracts differ, though, and a scratch group that the engine
+    *does* expose for transfer (vLLM 0.29+ default: enable_kv_transfer=True) is
+    refused rather than dropped: the engine rebuilds only the groups it owns,
+    so an external hit would otherwise resume with that state uninitialized.
+    The one exception is scratch the engine itself rebuilds per request -- the
+    compression ring (see _is_engine_rebuilt_scratch) -- which is skipped even
+    when transferable.
     """
     metas: List[GroupMeta] = []
+    transferable = _transferable_groups(kv_cache_config)
+    declares_projection = (
+        getattr(kv_cache_config, "transfer_group_ids", None) is not None
+    )
+    transferable_ids = {idx for idx, _ in transferable}
     for idx, group in enumerate(kv_cache_config.kv_cache_groups):
+        if idx not in transferable_ids:
+            logger.warning(
+                "skip %s group %d (%d layers): the engine does not transfer it "
+                "(enable_kv_transfer=False) and rebuilds it after a load",
+                type(group.kv_cache_spec).__name__,
+                idx,
+                len(group.layer_names),
+            )
+    for idx, group in transferable:
         if getattr(group, "is_eagle_group", False):
             logger.warning(
                 "skip eagle group %d (%d layers)", idx, len(group.layer_names)
             )
+            continue
+        if _is_scratch_spec(group.kv_cache_spec):
+            engine_rebuilt = _is_engine_rebuilt_scratch(group.kv_cache_spec)
+            if declares_projection and not engine_rebuilt:
+                raise NotImplementedError(
+                    f"group {idx}: {type(group.kv_cache_spec).__name__} is "
+                    f"per-request scratch (prefix_cacheable=False) yet the engine "
+                    f"exposes it for transfer (enable_kv_transfer=True): its state "
+                    f"must be restored on an external hit and the engine does not "
+                    f"rebuild a group it hands to connectors. TairKvCacheConnector "
+                    f"has no transfer layout for it, so the instance is refused "
+                    f"rather than resumed with uninitialized state"
+                )
+            if engine_rebuilt:
+                logger.warning(
+                    "skip %s group %d (%d layers): per-request compression ring, "
+                    "refilled by the engine for every request (not prefix KV)",
+                    type(group.kv_cache_spec).__name__,
+                    idx,
+                    len(group.layer_names),
+                )
+            else:
+                logger.warning(
+                    "skip %s group %d (%d layers): the class declares itself out "
+                    "of the prefix cache (prefix_cacheable=False and no slot "
+                    "mapping or no layer views), so the manager has nothing to "
+                    "serve; if this class is meant to be cached, name it in "
+                    "vllm_common.py instead",
+                    type(group.kv_cache_spec).__name__,
+                    idx,
+                    len(group.layer_names),
+                )
             continue
         metas.extend(
             _parse_group(

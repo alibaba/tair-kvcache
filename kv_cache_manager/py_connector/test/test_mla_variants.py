@@ -66,13 +66,14 @@ def _spec_from_kwargs(kwargs: Dict[str, Any], kind: str = "mla") -> Any:
 
 
 def _spec_without_quant_mode(kwargs: Dict[str, Any]) -> Any:
-    """A vLLM 0.14-shaped spec: every 0.26 field except kv_quant_mode."""
-    base = _spec_from_kwargs(dict(kwargs))
-    cls = type("LegacyMLASpec", (type(base),), {})
-    spec = object.__new__(cls)
-    spec.__dict__.update(
-        {k: v for k, v in base.__dict__.items() if k != "kv_quant_mode"}
-    )
+    """A vLLM 0.14-shaped spec: every 0.26 field except kv_quant_mode.
+
+    The 0.14 *class* is the same MLAAttentionSpec; what its era lacks is the
+    field, so the stand-in drops the attribute from a plain instance (a
+    subclass would be a different class, which the gate -- correctly -- refuses
+    as undeclared)."""
+    spec = _spec_from_kwargs(dict(kwargs))
+    del spec.__dict__["kv_quant_mode"]
     return spec
 
 
