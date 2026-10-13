@@ -41,6 +41,7 @@ from kv_cache_manager.py_connector.test.vllm_stubs import (
     make_connector,
     make_connector_scheduler,
 )
+from kv_cache_manager.py_connector.common.tp_coordinator import SaveContext
 from kv_cache_manager.py_connector.vllm.connector_worker import (
     CAPTURE_POOL_WAIT_SECONDS,
     _Capture,
@@ -601,12 +602,9 @@ class TestWindowedSpecGroups(unittest.TestCase):
         conn.wait_for_save(meta)
         self.assertEqual(16, len(plans[0][0].staged_slots))
         self.assertNotIn(None, plans[0][0].staged_slots)
-        # A local success keeps the bytes until the *committed* state is known
-        # (a block is written only when every rank wrote it): the settle
-        # stages them again, and the manager's confirmation releases them.
+        # One rank: its own verdict is the global one, so the settle returns
+        # the slots.
         conn._captures.settle("r0", 0, {("tp0_g0", b): True for b in range(16)})
-        self.assertEqual(16, len(conn._staged["r0"]))
-        conn._captures.release_staged("r0", list(range(16)))
         deadline = time.time() + 5
         while pool.free_blocks != 62 and time.time() < deadline:
             time.sleep(0.01)
@@ -766,13 +764,11 @@ class TestWindowedSpecGroups(unittest.TestCase):
                 plan.staged_slots,
                 "the concurrent session's release stripped A's captured bytes",
             )
-        # A's write landed: the settle keeps its bytes (a block commits only
-        # when every rank wrote it) and the manager's confirmation releases
-        # them, while B's 16 blocks (2 buckets) are still captured for the
-        # session that has not run yet.
+        # A's write landed and (one rank) committed: its slots come back,
+        # while B's 16 blocks (2 buckets) are still captured for the session
+        # that has not run yet.
         for spec in ("tp0_g0", "tp0_g1"):
             conn._captures.settle("r0", 0, {(spec, b): True for b in range(16)})
-            conn._captures.release_staged("r0", list(range(16)))
         deadline = time.time() + 5
         while pool.free_blocks != 96 and time.time() < deadline:
             time.sleep(0.01)
@@ -884,9 +880,12 @@ class TestWindowedSpecGroups(unittest.TestCase):
             "kv_cache_manager.py_connector.vllm.data_transfer.batch_gather_scatter_helper"
         ):
             conn.wait_for_save(meta)
-        # The plan took every block before the release was applied.
-        self.assertEqual(16, len(conn._in_flight.get("r0", {})))
-        self.assertEqual({}, conn._staged.get("r0", {}))
+        # The plan took every block before the release was applied (whether
+        # its own commit then released them or not is the settle's business).
+        self.assertEqual(
+            16,
+            len(conn._in_flight.get("r0", {})) + len(conn._staged.get("r0", {})),
+        )
 
     def test_a_handed_over_session_stops_protecting_its_blocks(self):
         # A session whose plan is in the worker's hands no longer protects its
@@ -2185,6 +2184,165 @@ class TestCaptureSlotInvariant(unittest.TestCase):
             )
             self.assertEqual(8, pool.free_blocks + owned, f"round {_round}")
 
+class TestCommitConfirmation(unittest.TestCase):
+    """The confirmation loop: local success -> wait -> confirmation -> release.
+
+    The first wave8 attempt retained every locally-successful capture and had
+    no working confirmation in the real flow: the gemma-3-4b run filled the
+    arena within one prefill burst (10 sessions x 96 blocks > 896 slots) and
+    withheld every capture afterwards. These tests pin both ends: the loop
+    closes (a single rank confirms itself at the settle, several ranks at the
+    coordinator's AND), and a session whose confirmation never arrives must
+    not strand its slots past the request's life.
+    """
+
+    CAPACITY = 16
+    BLOCKS = 4
+
+    def _fixture(self, tp_size: int):
+        import kv_cache_manager.py_connector.vllm.data_transfer as dt
+
+        patcher = mock.patch.object(dt, "batch_gather_scatter_helper")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        group = windowed_group()
+        pool = _StagingPool(
+            torch.device("cpu"), group.per_block_bytes, self.CAPACITY
+        )
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        dtm._extra_config = SimpleNamespace(
+            block_per_save_task=8, block_per_load_task=8
+        )
+        dtm._io_executor = ThreadPoolExecutor(max_workers=2)
+        conn = worker_with([group], dtm)
+        conn._pending_saves = {}
+        conn._device_mod = MagicMock()
+        conn._tp_size = tp_size
+        conn._manager_client = MagicMock()
+        conn._extra_config = SimpleNamespace(instance_id="test")
+        return conn, dtm, pool, group
+
+    def _run(self, conn, dtm, group, session, write_session_id):
+        blocks = list(range(self.BLOCKS))
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_capture_request(
+            CaptureRequest("r0", blocks, all_block_ids=[list(range(7, 11))])
+        )
+        meta.add_save_request(
+            SaveRequest(
+                req_id="r0",
+                write_session_id=write_session_id,
+                manager_block_idxes=blocks,
+                all_block_ids=[list(range(7, 11))],
+                target_locations=[
+                    {
+                        "block_idxes": [block],
+                        "location_specs": [{"name": "tp0_g0", "uri": "u%d" % block}],
+                    }
+                    for block in blocks
+                ],
+                session_id=session,
+            )
+        )
+        conn.wait_for_save(meta)
+        # The tasks report on the io threads: wait for the settle to land.
+        deadline = time.time() + 5
+        while conn._in_flight.get("r0") and time.time() < deadline:
+            time.sleep(0.01)
+        return blocks
+
+    def test_one_rank_confirms_at_the_settle(self):
+        # A single rank's own verdict *is* the coordinator's AND: the bytes are
+        # durable when the task lands, so the slots must come back then -- not
+        # when some later manager answer happens to mention them (that is what
+        # starved the arena in the real run).
+        conn, dtm, pool, group = self._fixture(tp_size=1)
+        blocks = self._run(conn, dtm, group, session=1, write_session_id="sA")
+        deadline = time.time() + 5
+        while pool.free_blocks != self.CAPACITY and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(
+            self.CAPACITY,
+            pool.free_blocks,
+            "a single rank's successful capture was not released",
+        )
+        self.assertEqual({}, conn._staged.get("r0", {}))
+        self.assertEqual({}, conn._in_flight.get("r0", {}))
+
+    def test_the_coordinator_confirms_a_multi_rank_session(self):
+        # Two ranks: the local verdict is not enough, and the coordinator's AND
+        # (which arrives after every rank reported) is what releases. Until it
+        # does, the bytes stay available for the retry a rejection implies.
+        conn, dtm, pool, group = self._fixture(tp_size=2)
+        blocks = self._run(conn, dtm, group, session=1, write_session_id="sA")
+        self.assertEqual(self.BLOCKS, len(conn._staged.get("r0", {})))
+        self.assertEqual(self.CAPACITY - self.BLOCKS, pool.free_blocks)
+
+        context = SaveContext(
+            locations=[{"block_idxes": [block]} for block in blocks],
+            result_per_rank={0: [True] * self.BLOCKS, 1: [True] * self.BLOCKS},
+        )
+        conn.on_save_finished("sA", context)
+        self.assertEqual({}, conn._staged.get("r0", {}))
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
+
+    def test_a_rejected_rank_keeps_the_bytes_for_the_retry(self):
+        # rank 1 failed: the block is rejected globally, and rank 0's bytes are
+        # the only copy left (its HBM window is gone). Releasing them would make
+        # the block permanently unpublishable.
+        conn, dtm, pool, group = self._fixture(tp_size=2)
+        blocks = self._run(conn, dtm, group, session=1, write_session_id="sA")
+        context = SaveContext(
+            locations=[{"block_idxes": [block]} for block in blocks],
+            result_per_rank={0: [True] * self.BLOCKS, 1: [False] * self.BLOCKS},
+        )
+        conn.on_save_finished("sA", context)
+        self.assertEqual(self.BLOCKS, len(conn._staged.get("r0", {})))
+        self.assertEqual(self.CAPACITY - self.BLOCKS, pool.free_blocks)
+
+        # The retry (the same blocks announced again) reuses them, and this
+        # time both ranks confirm: the slots come back.
+        retry = self._run(conn, dtm, group, session=2, write_session_id="sB")
+        context = SaveContext(
+            locations=[{"block_idxes": [block]} for block in retry],
+            result_per_rank={0: [True] * self.BLOCKS, 1: [True] * self.BLOCKS},
+        )
+        conn.on_save_finished("sB", context)
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
+
+    def test_a_failed_confirmation_report_keeps_the_bytes(self):
+        # finish_write_cache itself failed: the manager may still hold these
+        # blocks uncommitted, so nothing is released (the review's "survive a
+        # failed finish_write_cache report").
+        conn, dtm, pool, group = self._fixture(tp_size=2)
+        blocks = self._run(conn, dtm, group, session=1, write_session_id="sA")
+        conn._manager_client.finish_write_cache.side_effect = RuntimeError("socket")
+        context = SaveContext(
+            locations=[{"block_idxes": [block]} for block in blocks],
+            result_per_rank={0: [True] * self.BLOCKS, 1: [True] * self.BLOCKS},
+        )
+        conn.on_save_finished("sA", context)
+        self.assertEqual(self.BLOCKS, len(conn._staged.get("r0", {})))
+
+    def test_an_unconfirmed_session_does_not_strand_its_slots_forever(self):
+        # The regression's shape: the confirmation never arrives (no later
+        # manager answer, no coordinator verdict). The request's retirement is
+        # then the last chance -- the invariant family checks the books after
+        # every step, and this one pins that the arena comes back whole.
+        conn, dtm, pool, group = self._fixture(tp_size=2)
+        self._run(conn, dtm, group, session=1, write_session_id="sA")
+        self.assertEqual(self.BLOCKS, len(conn._staged.get("r0", {})))
+        conn._release_staged("r0")  # the request retires
+        self.assertEqual({}, conn._staged.get("r0", {}))
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
+        self.assertEqual({}, conn._block_uris.get("r0", {}))
+
+
 class TestCaptureFloor(unittest.TestCase):
     """The capture's room survives a burst of in-flight tasks.
 
@@ -2615,10 +2773,8 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             None,
             retry.staged_slots,
         )
-        # Local success retains until the commit is known; the confirmation
-        # (the manager reporting the block) releases.
-        self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
-        conn._captures.release_staged("r0", blocks)
+        # One rank: the retry's own success is the global verdict, so it
+        # returns the slots.
         self.assertEqual(self.CAPACITY, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=0)
 
@@ -2687,6 +2843,9 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         # bytes still here -- the HBM window is gone, so a later capture
         # abstains and the block could never be published.
         conn, dtm, pool, group = self._fixture()
+        conn._tp_size = 2  # two ranks: a local verdict is not the global one
+        conn._manager_client = MagicMock()
+        conn._extra_config = SimpleNamespace(instance_id="test")
         blocks = list(range(self.BLOCKS))
         conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
         first = self._plan(conn, blocks, session=1)
@@ -2700,6 +2859,7 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             None,
             first.staged_slots,
         )
+        _ = first
         self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
         self.assertEqual({}, conn._in_flight.get("r0", {}))
         self._assert_arena_accounting(conn, pool, sessions=0)
@@ -2715,6 +2875,7 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             set(retry.staged_slots) <= retained,
             "the retry did not reuse the retained bytes",
         )
+        retry_session = "sB"
         dtm.save_task(
             MultiResult(1, self._session_callback(conn, "r0", blocks, [retry], session=2)[0]),
             0,
@@ -2724,9 +2885,18 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             None,
             retry.staged_slots,
         )
-        # Still retained; the manager confirming the block releases it.
+        # Still retained; the coordinator's confirmation (the AND over the
+        # ranks) releases them.
         self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
-        conn._captures.release_staged("r0", blocks)
+        confirmed = SaveContext(
+            locations=[{"block_idxes": [block]} for block in blocks],
+            result_per_rank={0: [True] * self.BLOCKS, 1: [True] * self.BLOCKS},
+        )
+        conn._session_keys[retry_session] = (
+            "r0",
+            [("tp0_g0", block) for block in blocks],
+        )
+        conn.on_save_finished(retry_session, confirmed)
         self.assertEqual(self.CAPACITY, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=0)
 
@@ -2785,7 +2955,9 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             "kv_cache_manager.py_connector.vllm.data_transfer.batch_gather_scatter_helper"
         ):
             # r0's session holds the shared URIs (in flight, or already
-            # settled into its staged map -- both keep the keys guarded) ...
+            # settled into its staged map -- both keep the keys guarded).
+            # Its write fails, which is the case that keeps the bytes.
+            dtm._transfer_client.SaveKvCaches.return_value = [1]
             conn.wait_for_save(save_meta("r0", 1))
             # ... while r1 only has its captures staged.
             conn._capture_request(
@@ -2813,6 +2985,12 @@ class TestCapturedSlotOwnership(unittest.TestCase):
 
             # Once r0 no longer holds any bytes for those keys (its request
             # retired), the same release goes through.
+            # r0's tasks report on the io threads; wait for the settle so the
+            # retirement below sees staged entries rather than in-flight ones.
+            deadline = time.time() + 5
+            while conn._in_flight.get("r0") and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual({}, conn._in_flight.get("r0", {}))
             conn._release_staged("r0")
             conn._release_captures_for(
                 "r1",
@@ -2861,14 +3039,14 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             None,
             plan.staged_slots,
         )
-        # Session 0 never settled, so its four records are still in flight;
-        # session 7's own four were taken and then settled (successfully) by
-        # its callback -- and a local success keeps them staged until the
-        # commit is confirmed. Two sessions on the same (spec, block) keys
-        # coexist, which is why the in-flight ownership is keyed by session.
+        # Session 0 never settled, so its four records are still in flight
+        # (part 1's blocks were never written); session 7's own four were
+        # taken and its callback wrote them on this single rank, so they were
+        # released. Two sessions on the same (spec, block) keys coexist, which
+        # is why the in-flight ownership is keyed by session.
         self.assertEqual(self.BLOCKS, len(conn._in_flight.get("r0", {})))
         self.assertEqual({0}, {key[0] for key in conn._in_flight["r0"]})
-        self.assertEqual(self.BLOCKS, len(conn._staged.get("r0", {})))
+        self.assertEqual({}, conn._staged.get("r0", {}))
         self._assert_arena_accounting(conn, pool, sessions=0)
 
     def test_a_failed_contract_returns_its_staged_slots(self):

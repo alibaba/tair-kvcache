@@ -816,6 +816,8 @@ def install_capture_ledger(conn: Any) -> None:
     conn._staged = conn._captures.staged
     conn._in_flight = conn._captures.in_flight
     conn._block_uris = {}
+    conn._session_keys = {}
+    conn._tp_size = getattr(conn, "_tp_size", 1)
 
 
 def make_connector(
