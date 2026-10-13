@@ -892,6 +892,7 @@ class TestDataTransferManagerPools(unittest.TestCase):
         from kv_cache_manager.py_connector.vllm.transfer_types import KVCacheInfo
         import kv_cache_manager.py_connector.vllm.data_transfer as dt
 
+        max_num_batched_tokens = overrides.pop("max_num_batched_tokens", self.MBS)
         extra = TairKvCacheConnectorExtraConfig(
             manager_uri="http://127.0.0.1:1",
             coordinator_base_port=1,
@@ -907,7 +908,14 @@ class TestDataTransferManagerPools(unittest.TestCase):
             dtype=KV_DTYPE,
         )
         with mock.patch.object(dt, "_get_device_module", return_value=MagicMock()):
-            return DataTransferManager(info, self.MBS, MagicMock(), MagicMock(), extra)
+            return DataTransferManager(
+                info,
+                self.MBS,
+                MagicMock(),
+                MagicMock(),
+                extra,
+                max_num_batched_tokens=max_num_batched_tokens,
+            )
 
     def _groups(self):
         from kv_cache_manager.py_connector.vllm.transfer_types import (
@@ -915,7 +923,12 @@ class TestDataTransferManagerPools(unittest.TestCase):
             StateTransferGroup,
         )
 
-        def attn(idx, name, layers, per_block):
+        from kv_cache_manager.py_connector.vllm.vllm_common import (
+            RETENTION_SLIDING,
+            WindowRetention,
+        )
+
+        def attn(idx, name, layers, per_block, windowed=True):
             return AttentionTransferGroup(
                 group_idx=idx,
                 spec_name=name,
@@ -930,6 +943,13 @@ class TestDataTransferManagerPools(unittest.TestCase):
                 kernel_block_size=self.MBS,
                 block_stride=0,
                 dtype=KV_DTYPE,
+                # tp0_g0 and tp0_g1 share one arena and both capture: the
+                # partition has to cover their *aggregate* demand.
+                retention=(
+                    WindowRetention(RETENTION_SLIDING, window_tokens=1024)
+                    if windowed
+                    else None
+                ),
             )
 
         # 16 B/token/layer (8 dims x 2 B) makes the three buckets of the first
@@ -968,61 +988,63 @@ class TestDataTransferManagerPools(unittest.TestCase):
         # The other shape is capped by its own slot size: 16 KiB / 512 B.
         self.assertEqual(dtm._pools["tp0_g3"].max_blocks, 16)
 
-    def test_the_reserve_leaves_room_for_a_capture_batch(self):
-        # The review's shape: a 62-slot arena with the default 128-block
-        # batches used to reserve all 62 slots, so every eager capture timed
-        # out and windowed caching was silently disabled. The arena is split in
-        # half instead: a step that completes 16 blocks (a chunked prefill)
-        # asks for one contiguous run of 16 and must get it, while a whole task
-        # batch still starts behind it.
+    def test_the_capture_partition_covers_the_aggregate_demand(self):
+        # The review's shape: a byte cap left a 62-slot arena holding 128-block
+        # task batches, and its *two* windowed buckets share it. One step can
+        # complete 16 manager blocks per bucket, and the worker holds one run
+        # per bucket before releasing any -- so the capture partition must
+        # cover 32 slots at once, not 16. The partition is derived from the
+        # engine's step budget, and the task batch is capped to what is left.
         groups = self._groups()
         dtm = self._dtm(
             groups,
             block_per_save_task=128,
             block_per_load_task=128,
             staging_pool_blocks=62,
+            max_num_batched_tokens=16 * self.MBS,
         )
         pool = dtm._pools["tp0_g0"]
         self.assertEqual(pool.max_blocks, 62)
-        self.assertEqual(pool.reserved_blocks, 31)
-        self.assertEqual(dtm.save_task_blocks(groups[0]), 31)
-        self.assertEqual(dtm.load_task_blocks(groups[0]), 31)
-        del groups
-        # A realistic capture batch of 16 blocks fits in one run ...
-        capture = pool.acquire(16, keep_reserved=True)
-        self.assertIsNotNone(capture)
-        # ... and a whole task batch still starts while it holds it.
-        task = pool.acquire(31)
+        self.assertEqual(pool.reserved_blocks, 30)  # 62 - 2 x 16
+        self.assertEqual(dtm.save_task_blocks(groups[0]), 30)
+        self.assertEqual(dtm.load_task_blocks(groups[0]), 30)
+        # Both buckets' runs fit at the same time (one contiguous run each) ...
+        first = pool.acquire(16, keep_reserved=True)
+        second = pool.acquire(16, keep_reserved=True)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        # ... and a whole task batch still starts behind them.
+        task = pool.acquire(30)
         self.assertIsNotNone(task)
-        pool.release(capture, 16)
-        pool.release(task, 31)
+        pool.release(first, 16)
+        pool.release(second, 16)
+        pool.release(task, 30)
         self.assertEqual(pool.free_blocks, 62)
 
-    def test_task_batch_shrinks_to_the_pool(self):
+    def test_a_pool_too_small_for_its_capture_demand_is_refused(self):
+        # Failing closed here is the point: an arena that cannot hold the
+        # aggregate demand plus a task batch would silently never publish
+        # windowed KV (every capture would time out on a multi-block step).
         groups = self._groups()
-        dtm = self._dtm(
-            groups,
-            block_per_save_task=128,
-            block_per_load_task=128,
-            staging_pool_blocks=8,
-            staging_pool_max_bytes_per_group=3 * 4096,  # 3 slots, not 8
-        )
-        # The cap buys 3 slots; a task stages its whole batch as one contiguous
-        # run, so both directions shrink to that pool's transfer reserve (half
-        # the arena: a batch that only fit the shared part could not start
-        # while captures hold it).
-        self.assertEqual(dtm.save_task_blocks(groups[0]), 1)
-        self.assertEqual(dtm.load_task_blocks(groups[0]), 1)
-        self.assertEqual(dtm._pools["tp0_g0"].reserved_blocks, 1)
-        self.assertEqual(dtm.save_task_blocks(groups[3]), 4)  # other shape
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._dtm(
+                groups,
+                block_per_save_task=128,
+                block_per_load_task=128,
+                staging_pool_blocks=31,
+                max_num_batched_tokens=16 * self.MBS,
+            )
+        message = str(ctx.exception)
+        self.assertIn("windowed bucket", message)
+        self.assertIn("31 slots", message)
+        self.assertIn("at least 33", message)
 
     def test_the_transfer_reserve_is_the_largest_task_batch(self):
-        from kv_cache_manager.py_connector.common.logger import logger
-
-        # The eager capture may only borrow above it, so a transfer task can
-        # always start and thereby release the captures its own session holds
-        # (review_r1 N1): one task's maximum batch per arena, clamped to what
-        # actually fits the (possibly capped) pool.
+        # The eager capture may only borrow above the reserve, so a transfer
+        # task can always start and thereby release the captures its own
+        # session holds (review_r1 N1): one task's maximum batch per arena,
+        # clamped to what the capture partition leaves (a capped pool, or a
+        # step budget that needs most of it).
         groups = self._groups()
         dtm = self._dtm(
             groups,
@@ -1033,39 +1055,26 @@ class TestDataTransferManagerPools(unittest.TestCase):
         )
         shared = dtm._pools["tp0_g0"]
         self.assertEqual(shared.max_blocks, 4)
-        # Half the arena goes to captures, and the task batch is capped to the
-        # reserve so it can always start.
+        # Four slots, two windowed buckets x one block per step: the captures
+        # need two, so the task's request of three is capped to what is left.
         self.assertEqual(shared.reserved_blocks, 2)
         self.assertEqual(dtm.save_task_blocks(groups[0]), 2)
-        # Never the whole arena: the shared part must keep at least one slot, or
-        # a capture could not run at all (it would fail closed, but silently).
-        tiny = self._dtm(
-            groups,
-            block_per_save_task=128,
-            block_per_load_task=128,
-            staging_pool_blocks=16,
-            staging_pool_max_bytes_per_group=4096,  # a single slot
-        )
-        pool = tiny._pools["tp0_g0"]
-        self.assertEqual(pool.max_blocks, 1)
-        # A single slot cannot serve a capture and a task at once: it stays with
-        # the tasks (captures are off, and the startup log says so).
-        self.assertEqual(pool.reserved_blocks, 1)
-        self.assertEqual(pool.acquire(1, timeout=0.01, keep_reserved=True), None)
-        self.assertEqual(1, tiny.save_task_blocks(groups[0]))
-        # The degraded configuration says so at startup instead of leaving it
-        # to the per-capture withholding warnings.
-        with self.assertLogs(logger, level="INFO") as logs:
+        self.assertEqual(dtm.load_task_blocks(groups[0]), 2)
+
+        # An arena that cannot hold the aggregate capture demand plus one task
+        # batch is refused at startup with the numbers, instead of timing out
+        # every multi-block capture and never publishing windowed KV.
+        with self.assertRaises(NotImplementedError) as ctx:
             self._dtm(
                 groups,
                 block_per_save_task=128,
                 block_per_load_task=128,
                 staging_pool_blocks=16,
-                staging_pool_max_bytes_per_group=4096,
+                staging_pool_max_bytes_per_group=2 * 4096,  # two slots
             )
-        self.assertTrue(
-            any("captures are disabled" in line for line in logs.output), logs.output
-        )
+        message = str(ctx.exception)
+        self.assertIn("2 slots cannot serve its 2 windowed bucket", message)
+        self.assertIn("at least 3", message)
 
     def test_configured_batch_below_the_pool_is_untouched(self):
         groups = self._groups()

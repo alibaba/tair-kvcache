@@ -178,6 +178,7 @@ class _FakeManagerClient:
 
 def _vllm_config(calculate_kv_scales: bool = False) -> Any:
     return SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=2048),
         model_config=SimpleNamespace(
             served_model_name="tiny", dtype="bfloat16", use_mla=True
         ),
@@ -240,7 +241,10 @@ class TestRegistrationRole(unittest.TestCase):
         self.assertNotIn("location_spec_groups", request)
         # The role object was built with the registration response.
         self.assertEqual(len(_RoleSpy.instances), 1)
-        self.assertEqual(_RoleSpy.instances[0].args[-1], {"storage_configs": "[]"})
+        # The worker gets the register response, then the engine's per-step
+        # token budget (the capture partition is sized from it).
+        self.assertEqual(_RoleSpy.instances[0].args[-2], {"storage_configs": "[]"})
+        self.assertEqual(_RoleSpy.instances[0].args[-1], 2048)
 
     def test_calculate_kv_scales_reaches_the_gate(self):
         # The connector reads the flag from the engine config: with it on, a
