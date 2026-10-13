@@ -141,7 +141,9 @@ class ConnectorScheduler:
         # (req_id, block indices) whose captures no write session will publish
         # (the manager already holds them): queued by the http threads, flushed
         # by the scheduler loop into the metadata the worker reads.
-        self._pending_release_captures: List[Tuple[str, int, List[int]]] = []
+        self._pending_release_captures: List[
+            Tuple[str, int, List[int], Dict[int, List[str]]]
+        ] = []
         self._pending_release_captures_lock = threading.Lock()
         # Per request, the write sessions that may still consume captured
         # bytes, keyed by a per-request session id: each entry holds the
@@ -164,6 +166,11 @@ class ConnectorScheduler:
         # allocation, and a failed start_write_cache is retried the same way --
         # must claim what the capture actually holds, not what the window looks
         # like by then.
+        # Guards _window_claims: overlapping start_save_kvcache_async calls for
+        # one request run on different http-executor threads, and the claim is
+        # a read-modify-write (a lost update would leave "no window" behind
+        # bytes that are staged, so no retry could ever announce them).
+        self._window_claims_lock = threading.Lock()
         self._window_claims: Dict[str, Dict[int, bool]] = {}
         self._manager_block_size = manager_block_size
         self._vllm_block_size = vllm_block_size
@@ -266,6 +273,12 @@ class ConnectorScheduler:
         re-announcing it as window-less would leave bytes the manager was never
         told about -- the save would fail the block and release its only copy.
         """
+        with self._window_claims_lock:
+            return self._announced_window_mask_locked(req_id, window_data_mask)
+
+    def _announced_window_mask_locked(
+        self, req_id: str, window_data_mask: List[bool]
+    ) -> List[bool]:
         claims = self._window_claims.setdefault(req_id, {})
         announced = []
         for block, present in enumerate(window_data_mask):
@@ -891,7 +904,7 @@ class ConnectorScheduler:
         with self._pending_release_captures_lock:
             pending = self._pending_release_captures
             self._pending_release_captures = []
-        for req_id, session_id, blocks in pending:
+        for req_id, session_id, blocks, uris_per_block in pending:
             if not blocks:
                 continue
             # The protection was checked when the release was queued (in the
@@ -904,7 +917,14 @@ class ConnectorScheduler:
             protected = self._blocks_other_sessions_write(req_id, session_id)
             releasable = [block for block in blocks if block not in protected]
             if releasable:
-                meta.release_captures(req_id, releasable)
+                meta.release_captures(
+                    req_id,
+                    releasable,
+                    {
+                        block: list((uris_per_block or {}).get(block, ()))
+                        for block in releasable
+                    },
+                )
 
     def _collect_load_instructions(self, meta: TairKvCacheConnectorMetadata) -> None:
         """Hand the worker the loads whose blocks were allocated.
@@ -965,7 +985,8 @@ class ConnectorScheduler:
         self._waiting_to_finish_requests = []
 
     def _retire_request(self, req_id: str) -> None:
-        self._window_claims.pop(req_id, None)
+        with self._window_claims_lock:
+            self._window_claims.pop(req_id, None)
         with self._announced_sessions_lock:
             self._announced_sessions.pop(req_id, None)
             self._announced_sessions_counters.pop(req_id, None)
@@ -1148,7 +1169,17 @@ class ConnectorScheduler:
             # capture for them has nothing to publish and must give its arena
             # slots back now, not when the request retires (a long duplicate
             # request would otherwise pin one slot per already-cached block).
-            self._queue_capture_release(req_id, session_id, target_save_num, already)
+            # The locations reported for them travel with the release: they are
+            # the cache keys the worker checks against *other* requests' live
+            # sessions before dropping bytes (a shared prefix can be marked
+            # existing while another request's allocation is uncommitted).
+            self._queue_capture_release(
+                req_id,
+                session_id,
+                target_save_num,
+                already,
+                self._uris_by_block(locations),
+            )
         message = CoordinateMessage(
             time.time(),
             SendBlockStartEvent(
@@ -1198,6 +1229,7 @@ class ConnectorScheduler:
         session_id: int,
         target_save_num: int,
         blocks: Optional[List[int]] = None,
+        uris_by_block: Optional[Dict[int, List[str]]] = None,
     ) -> None:
         """Queue the captures of blocks no session of this request will write.
 
@@ -1213,8 +1245,11 @@ class ConnectorScheduler:
         releasable = [block for block in blocks if block not in protected]
         if not releasable:
             return
+        uris = {block: list((uris_by_block or {}).get(block, ())) for block in blocks}
         with self._pending_release_captures_lock:
-            self._pending_release_captures.append((req_id, session_id, releasable))
+            self._pending_release_captures.append(
+                (req_id, session_id, releasable, uris_by_block)
+            )
 
     def _retire_session_protection(self, req_id: str, session_id: int) -> None:
         """Stop holding back this session's blocks (see _blocks_other_sessions_write)."""
@@ -1283,6 +1318,23 @@ class ConnectorScheduler:
             return list(range(block_mask["offset"], target_save_num))
         values = block_mask.get("bool_masks", {}).get("values", [])
         return [idx for idx, saved in enumerate(values) if not saved]
+
+    @staticmethod
+    def _uris_by_block(locations: List[dict]) -> Dict[int, List[str]]:
+        """Per manager block, the cache keys the manager reported for it."""
+        by_block: Dict[int, List[str]] = {}
+        for location in locations:
+            block_idxes = location.get("block_idxes") or []
+            uris = [
+                spec["uri"]
+                for spec in location.get("location_specs") or []
+                if spec.get("uri")
+            ]
+            for block in block_idxes:
+                by_block.setdefault(block, []).extend(
+                    uri for uri in uris if uri not in by_block[block]
+                )
+        return by_block
 
     def parse_block_mask_to_existing_indices(
         self, response: dict, target_save_num: int

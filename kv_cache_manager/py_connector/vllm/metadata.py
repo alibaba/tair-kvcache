@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
@@ -105,8 +105,21 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
         holding them until the request retires."""
         return self._release_captures
 
-    def release_captures(self, req_id: str, block_idxes: List[int]) -> None:
-        self._release_captures.append((req_id, list(block_idxes)))
+    def release_captures(
+        self,
+        req_id: str,
+        block_idxes: List[int],
+        block_uris: Optional[Dict[int, List[str]]] = None,
+    ) -> None:
+        """Return the captures of blocks no write session will publish.
+
+        ``block_uris`` carries, per manager block, the cache keys the manager
+        reported for it (only where the release came from an "already cached"
+        answer): the worker uses them to tell a *durable* copy from another
+        request's uncommitted allocation before dropping captured bytes (see
+        ConnectorWorker._release_captures_for).
+        """
+        self._release_captures.append((req_id, list(block_idxes), block_uris))
 
     def __repr__(self) -> str:
         return (
