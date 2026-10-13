@@ -639,6 +639,22 @@ def _check_attention_spec_supported(
         _check_mla_variant(origin, spec, calculate_kv_scales=calculate_kv_scales)
         return
     if type(spec) in _FULL_PREFIX_SPEC_TYPES:
+        tokens_per_state, field = _tokens_per_state(spec)
+        if tokens_per_state != 1:
+            # Pooled / compressed *full attention*: one row holds several states
+            # per token (Whisper's block pooling sets Fraction(1, n)) or spans
+            # several tokens. _attention_meta sizes one row per token, so the
+            # page would not match the tensor and registration fails much later
+            # with a bare block-size assertion -- refuse here, by field name.
+            # MLA keeps its own structural check above (that one will learn to
+            # transfer multi-token rows; this model does not).
+            raise NotImplementedError(
+                f"{origin}: {type(spec).__name__} {field}={tokens_per_state} is "
+                f"not one state per token; the transfer model sizes one row per "
+                f"token, so pooled or compressed full-attention KV would be "
+                f"mis-sized. Refusing the instance (not supported by "
+                f"TairKvCacheConnector yet)"
+            )
         return
     raise NotImplementedError(
         f"Unsupported kv cache spec {type(spec).__name__} in {origin}: "
