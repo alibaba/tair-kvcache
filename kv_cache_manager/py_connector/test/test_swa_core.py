@@ -815,6 +815,96 @@ class TestWindowedSpecGroups(unittest.TestCase):
         sched._collect_release_captures(meta)
         self.assertEqual([], meta.to_release_captures)
 
+    def test_a_handed_over_session_stops_protecting_its_blocks(self):
+        # A session whose plan is in the worker's hands no longer protects its
+        # blocks: its plan runs before any release of the same step, and a
+        # release computed while it was still in flight already excluded them.
+        # Without that retirement a long request with repeated preemptions
+        # pins the shared arena for its whole life (the blocks it recaptures
+        # after resuming can never be released while an old session's plan
+        # still "might" write them).
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=1
+        )
+        sched._tracked["r0"] = RequestLedger(
+            vllm_request=FakeRequest("r0", []),  # ty: ignore[invalid-argument-type]
+            block_ids_per_group=[list(range(16))],
+            has_saved_block_num=0,
+        )
+        sched._manager_client.start_write_cache.return_value = {
+            "locations": [
+                {
+                    "block_idxes": [block],
+                    "location_specs": [{"name": "tp0_g0", "uri": "a%d" % block}],
+                }
+                for block in range(16)
+            ],
+            "write_session_id": "sA",
+            "block_mask": {"offset": 0},
+        }
+        session_a = sched._record_announcement("r0", 16)
+        sched.start_save_kvcache_async(
+            "r0", list(range(16 * MBS)), 16, [True] * 16, [True] * 16, session_a
+        )
+        # A's plan reaches the worker (the scheduler loop's flush point).
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_save_instructions(meta)
+        self.assertEqual(1, len(meta.to_save_requests))
+
+        # A later session gets an all-existing response for A's blocks: those
+        # captures are dead and must be released now.
+        sched._manager_client.start_write_cache.return_value = {
+            "locations": [],
+            "write_session_id": "sB",
+            "block_mask": {"offset": 16},
+        }
+        session_b = sched._record_announcement("r0", 32)
+        sched.start_save_kvcache_async(
+            "r0", list(range(32 * MBS)), 32, [True] * 32, [True] * 32, session_b
+        )
+        release = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(release)
+        # The whole announced prefix is releasable: A's session is in the
+        # worker's hands and B writes nothing at all. While A still protected
+        # its blocks, 0-15 would be held back and only 16-31 released.
+        self.assertEqual([("r0", list(range(32)))], release.to_release_captures)
+
+    def test_a_failed_announcement_releases_its_unprotected_captures(self):
+        # start_write_cache raising means this session allocates and writes
+        # nothing, and the save watermark has already moved past its blocks --
+        # an active request does not announce them again, so without a release
+        # here every transient manager failure pins its captures until the
+        # request retires.
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=1
+        )
+        sched._manager_client.start_write_cache.side_effect = RuntimeError("boom")
+        session = sched._record_announcement("r0", 16)
+        sched.start_save_kvcache_async(
+            "r0", list(range(16 * MBS)), 16, [True] * 16, [True] * 16, session
+        )
+        release = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(release)
+        self.assertEqual([("r0", list(range(16)))], release.to_release_captures)
+
+        # ... but a concurrent session that may still write those blocks keeps
+        # them, exactly like the all-existing path.
+        protecting = sched._record_announcement("r0", 16)
+        session2 = sched._record_announcement("r0", 16)
+        sched.start_save_kvcache_async(
+            "r0", list(range(16 * MBS)), 16, [True] * 16, [True] * 16, session2
+        )
+        self.assertNotEqual(protecting, session2)
+        later = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(later)
+        self.assertEqual([], later.to_release_captures)
+
     def test_existing_blocks_release_their_captures(self):
         # StartWriteCache reporting that the manager already holds a block means
         # this session will not write it: its eager capture has nothing to
@@ -1509,7 +1599,7 @@ class TestStagedWrites(unittest.TestCase):
         # The written slots are back in the arena: a 4-slot acquire succeeds.
         self.assertEqual(0, pool.acquire(4, timeout=0.01))
 
-    def test_failed_write_returns_the_slots_once(self):
+    def test_failed_write_holds_its_slots_for_the_retry(self):
         pool = _StagingPool(torch.device("cpu"), 1024, 2)
         start = pool.acquire(2)
         dtm = self._dtm(pool, ok=False)
@@ -1525,9 +1615,22 @@ class TestStagedWrites(unittest.TestCase):
             staged_slots=[start, start + 1],
         )
         self.assertEqual([False, False], results["flat"])
-        # A failed transfer returns its slots too: the block is announced once,
-        # so nothing waits for these bytes, and a held slot would keep the
-        # arena -- and the accounting -- from ever settling.
+        # A failed transfer keeps its slots: the worker hands the bytes back to
+        # its staged map, so returning them here would let another capture take
+        # them and leave the retry with nothing to publish.
+        self.assertIsNone(pool.acquire(1, timeout=0.01))
+        # A *raise* is the exception (no result callback will fire for the
+        # task), so those slots do come back and cannot leak in flight.
+        dtm._transfer_client.SaveKvCaches.side_effect = RuntimeError("sdk")
+        dtm.save_task(
+            MultiResult(1, lambda flat: None),
+            0,
+            windowed_group(),
+            remote_uris=["u2", "u3"],
+            block_token_indices=None,
+            block_ids=None,
+            staged_slots=[start, start + 1],
+        )
         self.assertEqual(0, pool.acquire(2, timeout=0.01))
         pool.release(0, 2)
         self.assertEqual(2, pool.free_blocks)
@@ -1667,6 +1770,14 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             for_save=True,
         )[0]
 
+    def _session_callback(self, conn, req_id, blocks, plans):
+        """The worker's per-session result callback: the retain wrapper over a
+        sink, exactly as wait_for_save builds it."""
+        done = {}
+        base = lambda flat: done.setdefault("flat", flat)  # noqa: E731
+        save_req = SimpleNamespace(req_id=req_id, manager_block_idxes=list(blocks))
+        return conn._retain_failed_windowed(save_req, plans, base), done
+
     def test_a_retiring_request_does_not_free_an_in_flight_slot(self):
         conn, dtm, pool, group = self._fixture()
         blocks = list(range(self.BLOCKS))
@@ -1716,14 +1827,20 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         pool.release(shared, pool.reserved_blocks)
         self.assertEqual(self.CAPACITY, pool.free_blocks)
 
-    def test_a_failed_write_returns_the_slot_too(self):
+    def test_a_failed_write_keeps_the_bytes_for_a_retry(self):
+        # The window that produced these bytes has moved on by the time a later
+        # session announces the block again, so the capture is the only copy
+        # the connector will ever hold: a failed write keeps the slot and the
+        # worker restores the entry to its staged map (the callback below is
+        # the worker's, so the restore happens here too), and the next plan
+        # publishes the block.
         conn, dtm, pool, group = self._fixture(ok=False)
         blocks = list(range(self.BLOCKS))
         conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
         plan = self._plan(conn, blocks)
-        done = {}
+        done_cb, done = self._session_callback(conn, "r0", blocks, [plan])
         dtm.save_task(
-            MultiResult(1, lambda flat: done.setdefault("flat", flat)),
+            MultiResult(1, done_cb),
             0,
             group,
             plan.uris,
@@ -1731,11 +1848,26 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             None,
             plan.staged_slots,
         )
-        # A block is announced to the manager once (has_saved_block_num advances
-        # at dispatch, not at success), so nothing waits for these bytes: the
-        # slot goes back even though the transfer failed -- and the block is
-        # not published.
         self.assertEqual([False] * self.BLOCKS, done["flat"])
+        # Nothing was published, the slot is still held, and the bytes are back
+        # in the staged map for the retry.
+        self.assertEqual(self.CAPACITY - self.BLOCKS, pool.free_blocks)
+        self.assertEqual(self.BLOCKS, len(conn._staged.get("r0", {})))
+        self._assert_arena_accounting(conn, pool, sessions=0)
+
+        # The retry session finds them and publishes.
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        retry = self._plan(conn, blocks)
+        self.assertNotIn(None, retry.staged_slots)
+        dtm.save_task(
+            MultiResult(1, self._session_callback(conn, "r0", blocks, [retry])[0]),
+            0,
+            group,
+            retry.uris,
+            None,
+            None,
+            retry.staged_slots,
+        )
         self.assertEqual(self.CAPACITY, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=0)
 
@@ -2042,14 +2174,89 @@ class TestClampCoversTheNeededWindow(unittest.TestCase):
 class TestPackedGroupsAndStateBlocks(unittest.TestCase):
     """Configurations the connector must refuse or now accepts (registration)."""
 
-    def test_the_folded_view_hides_the_bucket_structure(self):
-        # The scheduler only sees vLLM's folded view: one representative sub
-        # spec per group, one bucket, no way to tell how many buckets the
-        # worker's view holds. That asymmetry is why an *agreeing* packed group
-        # can be served (the representative carries the same retention) and why
-        # a *disagreeing* one needs the folding guard (which the folding change
-        # stacked on this one adds to build_spec_groups).
-        from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
+    def test_an_undeclared_ring_subclass_is_refused_not_dropped(self):
+        # The scratch skip is exact-type matched like every other spec receipt:
+        # when the engine declares its transfer projection, a spec it hands to
+        # connectors must be *refused* by name (the connector has no transfer
+        # layout for it) rather than silently dropped, so an external hit can
+        # never resume with that group's state uninitialized. The declared
+        # classes -- the compression ring, and the packed wrapper of rings --
+        # are still skipped: the engine rebuilds those.
+        from vllm.v1.kv_cache_interface import (
+            CircularBufferSpec,
+            FullAttentionSpec,
+            UniformTypeKVCacheSpecs,
+        )
+
+        class MyRing(CircularBufferSpec):
+            pass
+
+        class MyWrapper(UniformTypeKVCacheSpecs):
+            pass
+
+        def ring(cls=CircularBufferSpec):
+            return cls(block_size=MBS, page_size_bytes=2048)
+
+        companion = SimpleNamespace(
+            layer_names=["l9"],
+            kv_cache_spec=FullAttentionSpec(
+                block_size=MBS,
+                num_kv_heads=2,
+                head_size=64,
+                dtype=torch.bfloat16,
+                page_size_bytes=2048,
+            ),
+            is_eagle_group=False,
+        )
+
+        def config(spec):
+            return SimpleNamespace(
+                kv_cache_groups=[
+                    SimpleNamespace(
+                        layer_names=["l0"], kv_cache_spec=spec, is_eagle_group=False
+                    ),
+                    companion,
+                ],
+                transfer_group_ids=[0, 1],
+            )
+
+        for spec, name in (
+            (ring(MyRing), "MyRing"),
+            (MyWrapper(MBS, {"l0": ring()}), "MyWrapper"),
+        ):
+            with self.subTest(declared_class=name):
+                with self.assertRaises(NotImplementedError) as ctx:
+                    parse_groups(config(spec), MBS, calculate_kv_scales=False)
+                self.assertIn(name, str(ctx.exception))
+                self.assertIn("exposes it for transfer", str(ctx.exception))
+
+        for spec in (ring(), UniformTypeKVCacheSpecs(MBS, {"l0": ring()})):
+            with self.subTest(skipped=type(spec).__name__):
+                metas = parse_groups(config(spec), MBS, calculate_kv_scales=False)
+                self.assertEqual([1], [m.group_idx for m in metas])
+
+    def _packed(self, specs):
+        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+        return SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=list(specs),
+                    kv_cache_spec=UniformTypeKVCacheSpecs(MBS, dict(specs)),
+                    is_eagle_group=False,
+                )
+            ]
+        )
+
+    def test_a_packed_group_with_divergent_windows_is_refused(self):
+        # Two sliding members with different windows are two buckets with
+        # different coverage: the scheduler sees only the folded representative
+        # (one window), so it would emit no capture and no clamp for the other
+        # bucket's window (its claimed saves fail), or announce the wrong
+        # retention. The connector refuses the divergence where the whole
+        # member list is visible -- and the scheduler's own (folded) view is
+        # shown to be exactly what it is: one bucket, one window.
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
         def spec(window):
             return SlidingWindowSpec(
@@ -2061,34 +2268,56 @@ class TestPackedGroupsAndStateBlocks(unittest.TestCase):
                 dtype=torch.bfloat16,
             )
 
-        worker_view = SimpleNamespace(
-            kv_cache_groups=[
-                SimpleNamespace(
-                    layer_names=["l0", "l1"],
-                    kv_cache_spec=UniformTypeKVCacheSpecs.from_specs(
-                        {"l0": spec(1024), "l1": spec(512)}
-                    ),
-                    is_eagle_group=False,
-                )
-            ]
-        )
-        # The worker's view holds both buckets ...
-        worker_metas = parse_groups(worker_view, MBS, calculate_kv_scales=False)
-        self.assertEqual(2, len(worker_metas))
-        self.assertEqual(
-            {1024, 512}, {m.retention.window_tokens for m in worker_metas}
-        )
-        # ... while the scheduler's holds one representative, one bucket.
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(
+                self._packed({"l0": spec(1024), "l1": spec(512)}),
+                MBS,
+                calculate_kv_scales=False,
+            )
+        self.assertIn("different coverage", str(ctx.exception))
+
         folded = SimpleNamespace(
             kv_cache_groups=[
                 SimpleNamespace(
-                    layer_names=["l0", "l1"], kv_cache_spec=spec(1024), is_eagle_group=False
+                    layer_names=["l0", "l1"],
+                    kv_cache_spec=spec(1024),
+                    is_eagle_group=False,
                 )
             ]
         )
         metas = parse_groups(folded, MBS, calculate_kv_scales=False)
         self.assertEqual(1, len(metas))
         self.assertEqual(1024, metas[0].retention.window_tokens)
+
+    def test_a_packed_group_mixing_full_and_windowed_is_refused(self):
+        # The same divergence in its other shape: a full-attention member
+        # carries no window at all, so the folded representative could be the
+        # one bucket whose retention the scheduler can see, while the windowed
+        # member's blocks need staged bytes nobody announces.
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        full = FullAttentionSpec(
+            block_size=MBS,
+            num_kv_heads=2,
+            head_size=64,
+            dtype=torch.bfloat16,
+            page_size_bytes=2048,
+        )
+        windowed = SlidingWindowSpec(
+            block_size=MBS,
+            sliding_window=1024,
+            page_size_bytes=2048,
+            num_kv_heads=2,
+            head_size=64,
+            dtype=torch.bfloat16,
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(
+                self._packed({"l0": full, "l1": windowed}),
+                MBS,
+                calculate_kv_scales=False,
+            )
+        self.assertIn("different coverage", str(ctx.exception))
 
     def test_state_blocks_smaller_than_the_manager_block_are_aligned(self):
         # --mamba-block-size below --block-size: a 48-token manager block over
