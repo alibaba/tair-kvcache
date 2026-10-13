@@ -268,6 +268,14 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     "max_num_batched_tokens",
                     0,
                 ),
+                # ... and the cap on requests in one step: each of them can
+                # complete a partial block, so the capture partition counts
+                # them too.
+                getattr(
+                    getattr(vllm_config, "scheduler_config", None),
+                    "max_num_seqs",
+                    0,
+                ),
             )
 
     def shutdown(self) -> None:
