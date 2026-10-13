@@ -385,26 +385,25 @@ class TestWindowedSpecGroups(unittest.TestCase):
         self.assertEqual(groups["attn_no_window"], ["tp0_g1"])
         self.assertEqual(groups["full_no_window"], ["tp0_g1", "tp0_g2"])
 
-    def test_a_packed_group_with_two_windows_is_refused(self):
-        # A packed UniformType group whose members carry different windows
-        # (two RSWASpecs, or two SlidingWindow specs that differ only in
-        # extra_retained_tokens) cannot be served: vLLM folds the group to one
-        # representative sub spec for the scheduler, so the connector could
-        # announce and clamp only one of the two buckets -- the other would
-        # never be published and its loads would fail. The bucket keys still
-        # exist (see TestCaptureDispositions) for the buckets that *are*
-        # servable, but this shape is refused at registration.
+    def test_a_packed_windowed_group_with_agreeing_coverage_splits(self):
+        # Two sliding members with the *same* window and different page
+        # geometry: their coverage is identical, so the one representative sub
+        # spec vLLM folds this group to for the scheduler carries the same
+        # retention, and the connector serves the group as its two buckets
+        # (own wire name, own staging pool, own staged captures -- see
+        # TestCaptureDispositions for the bookkeeping). A packed group whose
+        # members *disagree* on coverage is the case the folded view cannot
+        # describe; that one is refused by the folding guard, not here.
         from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
 
-        def spec(extra):
+        def spec(head_size):
             return SlidingWindowSpec(
                 block_size=MBS,
                 sliding_window=1024,
                 page_size_bytes=2048,
                 num_kv_heads=2,
-                head_size=64,
+                head_size=head_size,
                 dtype=torch.bfloat16,
-                extra_retained_tokens=extra,
             )
 
         config = SimpleNamespace(
@@ -412,16 +411,19 @@ class TestWindowedSpecGroups(unittest.TestCase):
                 SimpleNamespace(
                     layer_names=["l0", "l1"],
                     kv_cache_spec=UniformTypeKVCacheSpecs.from_specs(
-                        {"l0": spec(0), "l1": spec(8)}
+                        {"l0": spec(64), "l1": spec(128)}
                     ),
                     is_eagle_group=False,
                 )
             ]
         )
-        with self.assertRaises(NotImplementedError) as ctx:
-            parse_groups(config, MBS, calculate_kv_scales=False)
-        self.assertIn("folds", str(ctx.exception))
-        self.assertIn("windowed", str(ctx.exception))
+        metas = parse_groups(config, MBS, calculate_kv_scales=False)
+        self.assertEqual(2, len(metas))
+        self.assertEqual({0}, {meta.group_idx for meta in metas})
+        self.assertEqual(1, len({m.retention for m in metas}))
+        self.assertEqual(RETENTION_SLIDING, metas[0].retention.kind)
+        self.assertEqual(1024, metas[0].retention.window_tokens)
+        self.assertEqual(2, len({spec_name(0, meta) for meta in metas}))
 
     def test_pure_windowed_instance_declares_only_the_full_group(self):
         # Nothing to exclude into: every spec is windowed, so a block without
@@ -528,6 +530,112 @@ class TestWindowedSpecGroups(unittest.TestCase):
             ["full"] * 3,
             "the retry must claim the window its captured bytes cover",
         )
+
+    def test_a_multi_block_capture_fits_the_shrunk_pool(self):
+        # A pool a byte cap shrank to 62 slots holds 128-block task batches, so
+        # the plan halves it: 31 slots for transfers, 31 for captures. One step
+        # of a chunked prefill completes 16 blocks and the capture asks for
+        # them as *one* contiguous run -- with the old one-slot reserve it would
+        # time out on every step that completes more than one block, publishing
+        # no windowed KV at all.
+        group = windowed_group()
+        pool = _StagingPool(
+            torch.device("cpu"), group.per_block_bytes, 62, reserved_blocks=31
+        )
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        dtm._extra_config = SimpleNamespace(
+            block_per_save_task=128, block_per_load_task=128
+        )
+        dtm._io_executor = ThreadPoolExecutor(max_workers=2)
+        conn = worker_with([group], dtm)
+        conn._pending_saves = {}
+        conn._device_mod = MagicMock()
+        with mock.patch(
+            "kv_cache_manager.py_connector.vllm.data_transfer.batch_gather_scatter_helper"
+        ):
+            capture = conn._capture_request(
+                CaptureRequest(
+                    "r0",
+                    list(range(16)),
+                    all_block_ids=[list(range(7, 23))],
+                )
+            )
+        self.assertTrue(capture, "the capture timed out on a 16-block step")
+        self.assertEqual(16, len(conn._staged["r0"]))
+        # And a save task publishes them out of the arena.
+        plans = []
+        real_plan = conn._plan_group_transfers
+
+        def spy(*args, **kwargs):
+            result = real_plan(*args, **kwargs)
+            if kwargs.get("for_save"):
+                plans.append(result)
+            return result
+
+        conn._plan_group_transfers = spy
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_save_request(
+            SaveRequest(
+                req_id="r0",
+                target_locations=locations([["tp0_g0"]] * 16),
+                manager_block_idxes=list(range(16)),
+                write_session_id="s0",
+                all_block_ids=[list(range(7, 23))],
+            )
+        )
+        conn.wait_for_save(meta)
+        self.assertEqual(16, len(plans[0][0].staged_slots))
+        self.assertNotIn(None, plans[0][0].staged_slots)
+        deadline = time.time() + 5
+        while pool.free_blocks != 62 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(62, pool.free_blocks)
+
+    def test_a_stale_block_table_still_saves_staged_window_bytes(self):
+        # Preemption + resume: the save session's manager blocks name the
+        # original prefix (whose bytes the eager capture holds), while the
+        # block table snapshot is the resume's, shorter allocation. A staged
+        # (windowed) save reads the arena, not the table, so the plan must be
+        # built -- translating those blocks would hit the range check and abort
+        # a save that needs nothing from the table.
+        group = windowed_group()
+        pool = _StagingPool(torch.device("cpu"), group.per_block_bytes, 64)
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        dtm._extra_config = SimpleNamespace(
+            block_per_save_task=128, block_per_load_task=128
+        )
+        dtm._io_executor = ThreadPoolExecutor(max_workers=2)
+        conn = worker_with([group], dtm)
+        conn._pending_saves = {}
+        conn._device_mod = MagicMock()
+        with mock.patch(
+            "kv_cache_manager.py_connector.vllm.data_transfer.batch_gather_scatter_helper"
+        ):
+            conn._capture_request(
+                CaptureRequest(
+                    "r0", list(range(16)), all_block_ids=[list(range(7, 23))]
+                )
+            )
+        # The resume's table addresses four blocks only.
+        plans = conn._plan_group_transfers(
+            locations([["tp0_g0"]] * 16),
+            list(range(16)),
+            [list(range(7, 11))],
+            "r0",
+            for_save=True,
+        )
+        self.assertEqual(16, len(plans[0].staged_slots))
+        self.assertNotIn(None, plans[0].staged_slots)
 
     def test_a_concurrent_session_keeps_its_captures(self):
         # Two write sessions of one request overlap. Session A announced 16
@@ -648,6 +756,34 @@ class TestWindowedSpecGroups(unittest.TestCase):
         while pool.free_blocks != 96 and time.time() < deadline:
             time.sleep(0.01)
         self.assertEqual(96, pool.free_blocks)
+
+    def test_a_repeated_target_session_does_not_release_the_other(self):
+        # A regressed save watermark can announce the same target twice while
+        # the first session is still in its http call. The two sessions need
+        # distinct identities: keyed by their range alone, the second would
+        # replace the first and then be skipped as "the answering session",
+        # and its all-existing response would release captures the first
+        # session still has to write.
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=1
+        )
+        first = sched._record_announcement("r0", 16)
+        second = sched._record_announcement("r0", 16)
+        self.assertNotEqual(first, second)
+        sched._manager_client.start_write_cache.return_value = {
+            "locations": [],
+            "write_session_id": "s2",
+            "block_mask": {"offset": 16},  # everything already has a location
+        }
+        sched.start_save_kvcache_async(
+            "r0", list(range(16 * MBS)), 16, [True] * 16, [True] * 16, second
+        )
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(meta)
+        self.assertEqual([], meta.to_release_captures)
 
     def test_an_unanswered_announcement_protects_its_blocks(self):
         # The same guard has to cover a session whose response has not come
@@ -1906,14 +2042,13 @@ class TestClampCoversTheNeededWindow(unittest.TestCase):
 class TestPackedGroupsAndStateBlocks(unittest.TestCase):
     """Configurations the connector must refuse or now accepts (registration)."""
 
-    def test_a_packed_windowed_group_is_refused_but_the_folded_view_hides_it(self):
+    def test_the_folded_view_hides_the_bucket_structure(self):
         # The scheduler only sees vLLM's folded view: one representative sub
-        # spec per group. A packed group that mixes a windowed member with
-        # another member would therefore be announced and clamped for one
-        # bucket only -- the other bucket's blocks would never be published and
-        # a load of them would fail silently in multi-group instances. The
-        # worker (which sees every member) refuses the shape; the probe shows
-        # why the scheduler cannot: its view has a single bucket.
+        # spec per group, one bucket, no way to tell how many buckets the
+        # worker's view holds. That asymmetry is why an *agreeing* packed group
+        # can be served (the representative carries the same retention) and why
+        # a *disagreeing* one needs the folding guard (which the folding change
+        # stacked on this one adds to build_spec_groups).
         from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
 
         def spec(window):
@@ -1937,10 +2072,13 @@ class TestPackedGroupsAndStateBlocks(unittest.TestCase):
                 )
             ]
         )
-        with self.assertRaises(NotImplementedError) as ctx:
-            parse_groups(worker_view, MBS, calculate_kv_scales=False)
-        self.assertIn("folds", str(ctx.exception))
-        # ... what the scheduler gets instead: one representative, one bucket.
+        # The worker's view holds both buckets ...
+        worker_metas = parse_groups(worker_view, MBS, calculate_kv_scales=False)
+        self.assertEqual(2, len(worker_metas))
+        self.assertEqual(
+            {1024, 512}, {m.retention.window_tokens for m in worker_metas}
+        )
+        # ... while the scheduler's holds one representative, one bucket.
         folded = SimpleNamespace(
             kv_cache_groups=[
                 SimpleNamespace(

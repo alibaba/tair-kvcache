@@ -640,19 +640,36 @@ class ConnectorWorker:
             # block_ids_per_group is indexed by the vLLM group index.
             block_table = block_ids_per_group[group.group_idx]
             if isinstance(group, AttentionTransferGroup):
+                if for_save and group.retention is not None:
+                    # A staged (windowed) save reads its bytes out of the
+                    # staging arena, not out of vLLM's slots, so it does not
+                    # translate manager blocks through the block table at all:
+                    # after a preemption the resume's table can be shorter than
+                    # the prefix whose bytes the capture still holds, and the
+                    # translation's range check would abort a save that needs
+                    # nothing from the table (the captured block keys are the
+                    # old prefix's, and so are its bytes).
+                    plans.append(
+                        TransferPlan(
+                            group=group,
+                            uris=uris,
+                            token_indices=[],
+                            **self._windowed_save_annotations(
+                                req_id, group, manager_block_idxes, uris
+                            ),
+                        )
+                    )
+                    continue
                 token_indices, null_masks = self._attn_slots(
                     group, manager_block_idxes, block_table
                 )
                 extra: Dict[str, Any] = {}
                 if group.retention is not None:
-                    if for_save:
-                        extra = self._windowed_save_annotations(
-                            req_id, group, manager_block_idxes, uris
-                        )
-                    else:
-                        extra = self._windowed_load_annotations(
-                            group, manager_block_idxes, token_indices, null_masks
-                        )
+                    # The save side of a windowed group returned above; what is
+                    # left here is the load, whose rows come from the table.
+                    extra = self._windowed_load_annotations(
+                        group, manager_block_idxes, token_indices, null_masks
+                    )
                 plans.append(
                     TransferPlan(
                         group=group,

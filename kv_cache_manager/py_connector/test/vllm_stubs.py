@@ -920,6 +920,7 @@ def make_connector_scheduler(
     )
     core._window_claims = {}
     core._announced_sessions = {}
+    core._announced_sessions_counters = {}
     core._announced_sessions_lock = _threading.Lock()
     core._pending_release_captures = []
     core._pending_release_captures_lock = _threading.Lock()
