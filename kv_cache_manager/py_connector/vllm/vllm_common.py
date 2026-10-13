@@ -854,6 +854,35 @@ def _check_unique_names(metas: List[GroupMeta]) -> None:
     assert len(names) == len(set(names)), f"wire spec name collision: {names}"
 
 
+def _transferable_groups(kv_cache_config: Any) -> List[Tuple[int, Any]]:
+    """The (vLLM group index, group) pairs this connector may transfer.
+
+    vLLM 0.30+ projects the group list for connectors: KVCacheGroupSpec.
+    enable_kv_transfer=False marks groups the engine rebuilds itself (ephemeral
+    accelerator-side replicas of a transferable source group, e.g. HiSparse's
+    resident/hot tiers), and KVCacheConfig.transfer_group_ids / transfer_groups
+    are the authoritative projection. A group the engine does not hand to
+    connectors must not be registered here even when its spec looks cacheable
+    (_is_scratch_spec judges the class, not the layout's role).
+
+    The projection decides *membership only*: the index we keep is the raw vLLM
+    group index, because that is the index space of every block-id payload this
+    connector receives (KVCacheBlocks.get_block_ids() and
+    CachedRequestData.new_block_ids are both unfiltered -- see
+    v1/core/kv_cache_manager.get_block_ids and its new_block_ids caller), and
+    the ledger plus every consumer index by it. Renumbering to the projected
+    position would pair our metas with another group's block table.
+
+    Eras without the attribute (vLLM <= 0.29) expose every group; the flag
+    arrived with the groups it describes.
+    """
+    groups = kv_cache_config.kv_cache_groups
+    transfer_ids = getattr(kv_cache_config, "transfer_group_ids", None)
+    if transfer_ids is None:
+        return [(idx, group) for idx, group in enumerate(groups)]
+    return [(idx, groups[idx]) for idx in transfer_ids]
+
+
 def parse_groups(
     kv_cache_config: "KVCacheConfig",
     manager_block_size: int,
@@ -882,7 +911,18 @@ def parse_groups(
     so its number is simply absent from the wire names.
     """
     metas: List[GroupMeta] = []
+    transferable = _transferable_groups(kv_cache_config)
+    transferable_ids = {idx for idx, _ in transferable}
     for idx, group in enumerate(kv_cache_config.kv_cache_groups):
+        if idx not in transferable_ids:
+            logger.warning(
+                "skip %s group %d (%d layers): the engine does not transfer it "
+                "(enable_kv_transfer=False) and rebuilds it after a load",
+                type(group.kv_cache_spec).__name__,
+                idx,
+                len(group.layer_names),
+            )
+    for idx, group in transferable:
         if getattr(group, "is_eagle_group", False):
             logger.warning(
                 "skip eagle group %d (%d layers)", idx, len(group.layer_names)
