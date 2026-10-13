@@ -258,6 +258,16 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._manager_client,
                 TpCoordinatorClient(host_ip, extra_config.coordinator_base_port),
                 register_response,
+                # The capture partition is sized from the engine's per-step
+                # token budget (see DataTransferManager). An engine stub that
+                # does not report one leaves it at 0: the partition then
+                # assumes a step completes a single block, which is the
+                # conservative end of the check.
+                getattr(
+                    getattr(vllm_config, "scheduler_config", None),
+                    "max_num_batched_tokens",
+                    0,
+                ),
             )
 
     def shutdown(self) -> None:
