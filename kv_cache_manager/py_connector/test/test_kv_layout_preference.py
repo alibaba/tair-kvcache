@@ -54,13 +54,27 @@ _SERVED_ARCHITECTURES = (
 
 
 class LayoutPreferenceCase(unittest.TestCase):
-    def preference(self, architectures, layout_namespace):
-        """The hook's answer for a config shaped like the engine's."""
+    def preference(self, architectures, layout_namespace, resolved="first"):
+        """The hook's answer for a config shaped like the engine's.
+
+        The engine's own resolution is stubbed: this ring has no model registry
+        (and the installed era's one does not know every architecture this
+        test names), so passing ``resolved`` decides what the engine "supports"
+        -- the first entry by default, ``None`` for the unresolvable case. The
+        real resolution against the installed engine is
+        test_kv_layout_preference_real.py's subject.
+        """
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(architectures=list(architectures))
         )
+        resolved_architecture = (
+            (lambda archs, config: archs[0]) if resolved == "first" else (lambda a, c: None)
+        )
         with mock.patch.object(connector_module, "_KVCacheLayout", layout_namespace):
-            return TairKvCacheConnector.get_required_kvcache_layout(vllm_config)
+            with mock.patch.object(
+                connector_module, "_resolved_architecture", resolved_architecture
+            ):
+                return TairKvCacheConnector.get_required_kvcache_layout(vllm_config)
 
 
 class TestPackedBlockModels(LayoutPreferenceCase):
@@ -79,6 +93,14 @@ class TestPackedBlockModels(LayoutPreferenceCase):
     def test_name_space_without_the_name_stays_silent(self):
         self.assertIsNone(
             self.preference(["DeepseekV41ForCausalLM"], _ERA_WITHOUT_BLNHC)
+        )
+
+    def test_unresolvable_architecture_stays_silent(self):
+        # An era whose registry cannot resolve the entry (a name it predates)
+        # gets no preference: the standard layout is the safe direction, and a
+        # really packed model fails registration loudly.
+        self.assertIsNone(
+            self.preference(["DeepseekV41ForCausalLM"], _ERA_WITH_BLNHC, resolved=None)
         )
 
 
