@@ -897,8 +897,11 @@ def _check_attention_spec_supported(
     refused here by name.
     """
     if SlidingWindowMLASpec is not None and isinstance(spec, SlidingWindowMLASpec):
+        # Subclasses land here too (the replay skip is exact-type): a subclass
+        # may add layout or retention state the base replay does not
+        # regenerate, so it is refused by name like every undeclared class.
         raise NotImplementedError(
-            f"{origin}: SlidingWindowMLASpec sliding_window="
+            f"{origin}: {type(spec).__name__} sliding_window="
             f"{getattr(spec, 'sliding_window', None)} with bounded_replay="
             f"{bool(getattr(spec, 'bounded_replay', False))} holds windowed or "
             f"partial state, not the full prefix, and vLLM does not rebuild "
@@ -1033,9 +1036,11 @@ def _is_replayed_window(spec: Any) -> bool:
     default to "not replayed" -- so an era without them refuses the spec instead
     of skipping it (fail-closed, vllm 0.26 has the class but not the policy).
     """
-    if not (
-        SlidingWindowMLASpec is not None and isinstance(spec, SlidingWindowMLASpec)
-    ):
+    # Exact type, like the receipt branches in _parse_group: a subclass may
+    # add layout or retention state the base replay does not regenerate, so it
+    # must fall through to _check_attention_spec_supported and be refused by
+    # name instead of being skipped wholesale here.
+    if not (SlidingWindowMLASpec is not None and type(spec) is SlidingWindowMLASpec):
         return False
     return bool(getattr(spec, "prefix_replay_tokens", 0)) or bool(
         getattr(spec, "bounded_replay", False)
