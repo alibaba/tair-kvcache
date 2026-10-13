@@ -522,16 +522,28 @@ class DataTransferManager:
         self._pools: Dict[str, _StagingPool] = {}
         save_batch = extra_config.block_per_save_task
         load_batch = extra_config.block_per_load_task
-        # The reserve is the largest batch one transfer task can ask for: with
-        # it carved out, a task can always start (and thereby release the
-        # captures its own session holds), so the capture's bounded wait is a
-        # deadlock-free degradation rather than a race for the last run.
+        # The reserve is the largest batch one transfer task can ask for (see
+        # save_task_blocks): with it carved out, a task can always start -- and
+        # thereby release the captures its own session holds -- so the
+        # capture's bounded wait is a deadlock-free degradation rather than a
+        # race for the last run.
+        #
+        # It never takes the whole arena, though: a plan whose block count is
+        # <= the configured batch (a 128-block arena with the default 128-block
+        # batches, or a byte-capped shape) would otherwise leave the capture
+        # side with zero slots and silently disable windowed caching for an
+        # otherwise valid configuration. One slot is always left for captures
+        # (and, symmetrically, the task batch is capped to the reserve), except
+        # in a single-slot arena, where captures and tasks cannot coexist: there
+        # the slot stays with the tasks and captures are off (logged).
         for plan in plans:
+            task_batch = min(max(save_batch, load_batch), plan.blocks)
+            reserved = task_batch if plan.blocks == 1 else min(task_batch, plan.blocks - 1)
             pool = _StagingPool(
                 self._device,
                 plan.slot_bytes,
                 plan.blocks,
-                reserved_blocks=min(max(save_batch, load_batch), plan.blocks),
+                reserved_blocks=reserved,
             )
             names = [kvcache_info.groups[i].spec_name for i in plan.members]
             for name in names:
@@ -559,11 +571,15 @@ class DataTransferManager:
                     if pool.reserved_blocks == plan.blocks
                     else "",
                 )
-            fitting = (min(save_batch, plan.blocks), min(load_batch, plan.blocks))
+            fitting = (
+                min(save_batch, max(1, pool.reserved_blocks)),
+                min(load_batch, max(1, pool.reserved_blocks)),
+            )
             if fitting != (save_batch, load_batch):
                 logger.info(
                     "staging pool per_token=%dB dtype=%s: task batches shrink to "
-                    "save %d / load %d blocks (configured %d / %d) to fit the pool",
+                    "save %d / load %d blocks (configured %d / %d) to fit the "
+                    "pool's transfer reserve",
                     plan.key[0],
                     plan.key[1],
                     fitting[0],
@@ -596,19 +612,21 @@ class DataTransferManager:
 
     def save_task_blocks(self, group: TransferGroup) -> int:
         """Blocks per save task for this bucket: the configured batch, shrunk to
-        the bucket's (shared) arena. A task stages its whole batch as one
-        contiguous run, so it can never outgrow the pool -- the granularity
-        yields, the pinned budget does not."""
+        the pool's transfer reserve. A task stages its whole batch as one
+        contiguous run, so it can never outgrow the pool -- and a batch that fit
+        only the *shared* part could not start while captures hold it, which is
+        exactly the wait the reserve exists to break (see the pool plan above:
+        the granularity yields, the pinned budget does not)."""
         return min(
             self._extra_config.block_per_save_task,
-            self._pools[group.spec_name].max_blocks,
+            max(1, self._pools[group.spec_name].reserved_blocks),
         )
 
     def load_task_blocks(self, group: TransferGroup) -> int:
         """Load-side twin of ``save_task_blocks``."""
         return min(
             self._extra_config.block_per_load_task,
-            self._pools[group.spec_name].max_blocks,
+            max(1, self._pools[group.spec_name].reserved_blocks),
         )
 
     def pool_of(self, group: TransferGroup) -> _StagingPool:
