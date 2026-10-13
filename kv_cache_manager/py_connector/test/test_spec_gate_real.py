@@ -19,17 +19,58 @@ stand-in to the table it was built from.
 """
 
 import inspect
+import os
+import subprocess
 import sys
+import textwrap
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
 
 from kv_cache_manager.py_connector.test import spec_gate_facts as facts
 
+#: Where vLLM itself is *absent* (open-source CI), the suite skips. Only the
+#: engine may be missing: a failure to import a *connector* symbol must not be
+#: laundered into a skip, or the dual-era job would report green while the very
+#: interface it guards regressed -- see _missing_engine below.
+_MISSING_ENGINE_MODULES = ("vllm", "torch")
+
+
+def _missing_engine(exc: ImportError) -> bool:
+    """Is this error 'vLLM is not installed here' rather than a regression?
+
+    True only for a missing vLLM/torch module (the engine and its runtime
+    dependencies). Everything else -- a connector symbol that vanished, a
+    broken install, a non-ModuleNotFoundError -- must fail the run.
+    """
+    if not isinstance(exc, ModuleNotFoundError):
+        return False
+    name = exc.name or ""
+    return any(
+        name == root or name.startswith(root + ".") for root in _MISSING_ENGINE_MODULES
+    )
+
+
+def _engine_absent(exc: ImportError) -> str:
+    return f"real vLLM not installed here ({exc})"
+
+
 try:
     import torch
     import vllm
-
+except ImportError as _engine_import_error:  # pragma: no cover - env dependent
+    if not _missing_engine(_engine_import_error):
+        raise
+    torch = None  # ty: ignore[invalid-assignment]
+    vllm = None  # ty: ignore[invalid-assignment]
+    KVCacheSpec = None  # ty: ignore[invalid-assignment]
+    _check_attention_spec_supported = None  # ty: ignore[invalid-assignment]
+    parse_groups = None  # ty: ignore[invalid-assignment]
+    _IMPORT_ERROR = _engine_absent(_engine_import_error)
+else:
+    # vLLM is here: these imports must work, so an interface regression fails
+    # the suite instead of skipping it.
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
     from kv_cache_manager.py_connector.vllm.vllm_common import (
@@ -38,18 +79,11 @@ try:
     )
 
     _IMPORT_ERROR = ""
-except ImportError as exc:  # pragma: no cover - environment dependent
-    torch = None  # ty: ignore[invalid-assignment]
-    vllm = None  # ty: ignore[invalid-assignment]
-    KVCacheSpec = None  # ty: ignore[invalid-assignment]
-    _check_attention_spec_supported = None  # ty: ignore[invalid-assignment]
-    parse_groups = None  # ty: ignore[invalid-assignment]
-    _IMPORT_ERROR = str(exc)
 
 
 def _skip_reason() -> str:
     if _IMPORT_ERROR:
-        return f"real vLLM not importable ({_IMPORT_ERROR})"
+        return _IMPORT_ERROR
     if getattr(vllm, "_kvcm_test_stub", False) or "vllm_stubs" in str(
         getattr(vllm, "__file__", "")
     ):

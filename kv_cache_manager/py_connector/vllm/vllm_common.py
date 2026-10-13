@@ -198,6 +198,14 @@ class AttentionGroupMeta(GroupMeta):
     # carries the defaulted spec_suffix.
     page_bytes: int = field(kw_only=True)
 
+    # The page element type (spec.dtype): one instance may mix them (V3.2 bf16
+    # main + uint8 indexer), and the staging pool keys by it, so the bucket, not
+    # the instance, is the granularity. Equals the kv_cache tensor dtype by
+    # construction: both come from kv_cache_dtype_str_to_dtype on the same
+    # cache_dtype (gpu_model_runner for the tensors, the attention layer for the
+    # spec). None only for a spec object that carries no dtype at all.
+    dtype: Any = None
+
 
 @dataclass(frozen=True)
 class StateGroupMeta(GroupMeta):
@@ -765,6 +773,7 @@ def _attention_meta(
         * len(layer_names),
         spec_suffix=suffix,
         page_bytes=page_bytes,
+        dtype=getattr(spec, "dtype", None),
     )
 
 
