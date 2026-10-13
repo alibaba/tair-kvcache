@@ -1,0 +1,150 @@
+diff --git a/mooncake-store/include/cxx20_sync_compat.h b/mooncake-store/include/cxx20_sync_compat.h
+new file mode 100644
+index 0000000..0e5c148
+--- /dev/null
++++ b/mooncake-store/include/cxx20_sync_compat.h
+@@ -0,0 +1,78 @@
++#pragma once
++
++// libstdc++ before GCC 11 has no <latch> / <semaphore>. Provide the subset of
++// std::latch and std::binary_semaphore that Mooncake uses so the store still
++// builds with GCC 10; newer toolchains just alias the standard types.
++
++#if __has_include(<latch>) && __has_include(<semaphore>)
++#include <latch>
++#include <semaphore>
++
++namespace mooncake::compat {
++using std::latch;
++using binary_semaphore = std::binary_semaphore;
++}  // namespace mooncake::compat
++
++#else
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <mutex>
++
++namespace mooncake::compat {
++
++class latch {
++   public:
++    explicit latch(std::ptrdiff_t expected) : count_(expected) {}
++    latch(const latch&) = delete;
++    latch& operator=(const latch&) = delete;
++
++    void count_down(std::ptrdiff_t n = 1) {
++        std::lock_guard<std::mutex> lock(mu_);
++        count_ -= n;
++        if (count_ <= 0) cv_.notify_all();
++    }
++
++    void wait() const {
++        std::unique_lock<std::mutex> lock(mu_);
++        cv_.wait(lock, [this] { return count_ <= 0; });
++    }
++
++   private:
++    mutable std::mutex mu_;
++    mutable std::condition_variable cv_;
++    std::ptrdiff_t count_;
++};
++
++class binary_semaphore {
++   public:
++    explicit binary_semaphore(std::ptrdiff_t desired) : available_(desired > 0) {}
++    binary_semaphore(const binary_semaphore&) = delete;
++    binary_semaphore& operator=(const binary_semaphore&) = delete;
++
++    void release() {
++        {
++            std::lock_guard<std::mutex> lock(mu_);
++            available_ = true;
++        }
++        cv_.notify_one();
++    }
++
++    template <class Rep, class Period>
++    bool try_acquire_for(const std::chrono::duration<Rep, Period>& timeout) {
++        std::unique_lock<std::mutex> lock(mu_);
++        if (!cv_.wait_for(lock, timeout, [this] { return available_; })) {
++            return false;
++        }
++        available_ = false;
++        return true;
++    }
++
++   private:
++    std::mutex mu_;
++    std::condition_variable cv_;
++    bool available_;
++};
++
++}  // namespace mooncake::compat
++#endif
+diff --git a/mooncake-store/include/master_admin_service.h b/mooncake-store/include/master_admin_service.h
+index 752b1f7..62ac292 100644
+--- a/mooncake-store/include/master_admin_service.h
++++ b/mooncake-store/include/master_admin_service.h
+@@ -7,7 +7,7 @@
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+-#include <semaphore>
++#include "cxx20_sync_compat.h"
+ #include <string>
+ #include <thread>
+ 
+@@ -114,7 +114,7 @@ class MasterAdminServer {
+     coro_http::coro_http_server http_server_;
+     std::thread metric_report_thread_;
+     std::atomic<bool> metric_report_running_{false};
+-    std::binary_semaphore metric_report_stop_sem_{0};
++    compat::binary_semaphore metric_report_stop_sem_{0};
+     std::atomic<bool> started_{false};
+     // Serializes storage projection with service-plane handoff so a refresh
+     // that sampled the old leader cannot publish after it becomes unavailable.
+diff --git a/mooncake-store/src/nvme_kv_backend.cpp b/mooncake-store/src/nvme_kv_backend.cpp
+index 9c7b0f9..da1e998 100644
+--- a/mooncake-store/src/nvme_kv_backend.cpp
++++ b/mooncake-store/src/nvme_kv_backend.cpp
+@@ -8,7 +8,7 @@
+ #include <cstring>
+ #include <deque>
+ #include <exception>
+-#include <latch>
++#include "cxx20_sync_compat.h"
+ #include <limits>
+ #include <mutex>
+ #include <optional>
+@@ -278,7 +278,7 @@ void NvmeKvStorageBackend::RunParallelIo(
+     }
+ 
+     std::atomic<size_t> next_index{0};
+-    std::latch completed(static_cast<std::ptrdiff_t>(worker_count));
++    compat::latch completed(static_cast<std::ptrdiff_t>(worker_count));
+     std::mutex exception_mutex;
+     std::exception_ptr first_exception;
+     std::exception_ptr enqueue_exception;
+@@ -338,8 +338,8 @@ void NvmeKvStorageBackend::RunPipelinedIo(
+ 
+     std::atomic<size_t> next_index{0};
+     std::vector<std::exception_ptr> item_exceptions(item_count);
+-    std::latch items_completed(static_cast<std::ptrdiff_t>(item_count));
+-    std::latch workers_completed(static_cast<std::ptrdiff_t>(worker_count));
++    compat::latch items_completed(static_cast<std::ptrdiff_t>(item_count));
++    compat::latch workers_completed(static_cast<std::ptrdiff_t>(worker_count));
+     std::exception_ptr enqueue_exception;
+     size_t enqueued_workers = 0;
+     try {
+@@ -699,8 +699,8 @@ tl::expected<int64_t, ErrorCode> NvmeKvStorageBackend::BatchOffload(
+             close_queues();
+             root_queue.Close();
+         };
+-        std::latch consumers_done(static_cast<std::ptrdiff_t>(lane_count));
+-        std::latch root_consumers_done(
++        compat::latch consumers_done(static_cast<std::ptrdiff_t>(lane_count));
++        compat::latch root_consumers_done(
+             static_cast<std::ptrdiff_t>(root_lane_count));
+ 
+         size_t enqueued_root_consumers = 0;
