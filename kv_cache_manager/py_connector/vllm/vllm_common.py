@@ -1428,16 +1428,9 @@ def parse_groups(
             continue
         skip_reason = _skip_reason(group.kv_cache_spec)
         if skip_reason is not None:
-            logger.warning(
-                "skip %s group %d (%d layers): the class declares itself out "
-                "of the prefix cache (prefix_cacheable=False and no slot "
-                "mapping or no layer views), so the manager has nothing to "
-                "serve; if this class is meant to be cached, name it in "
-                "vllm_common.py instead",
-                type(group.kv_cache_spec).__name__,
-                idx,
-                len(group.layer_names),
-            )
+            # The reason string carries the family: the engine replays a
+            # window (or the scratch contract names itself) -- either way
+            # the engine owns the rebuild and the group leaves the wire.
             logger.warning(
                 "skip %s group %d (%d layers): %s; if this class is meant to "
                 "be cached, name it in vllm_common.py instead",
