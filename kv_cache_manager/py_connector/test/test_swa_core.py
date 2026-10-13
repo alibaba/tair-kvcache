@@ -46,6 +46,8 @@ from kv_cache_manager.py_connector.vllm.data_transfer import (
 )
 from kv_cache_manager.py_connector.vllm.metadata import (
     CaptureRequest,
+    LoadRequest,
+    SaveRequest,
     TairKvCacheConnectorMetadata,
 )
 from kv_cache_manager.py_connector.vllm.transfer_types import (
@@ -382,13 +384,15 @@ class TestWindowedSpecGroups(unittest.TestCase):
         self.assertEqual(groups["attn_no_window"], ["tp0_g1"])
         self.assertEqual(groups["full_no_window"], ["tp0_g1", "tp0_g2"])
 
-    def test_one_group_can_hold_two_window_buckets(self):
-        # The shape the bucket keys exist for: a packed UniformType group whose
-        # members carry different windows (two RSWASpecs, or two SlidingWindow
-        # specs that differ only in extra_retained_tokens). Both buckets keep
-        # the same vLLM group index, so anything keyed on that index would let
-        # them overwrite each other -- the retention, the pool lookup and the
-        # staged bookkeeping all key on the bucket's spec name.
+    def test_a_packed_group_with_two_windows_is_refused(self):
+        # A packed UniformType group whose members carry different windows
+        # (two RSWASpecs, or two SlidingWindow specs that differ only in
+        # extra_retained_tokens) cannot be served: vLLM folds the group to one
+        # representative sub spec for the scheduler, so the connector could
+        # announce and clamp only one of the two buckets -- the other would
+        # never be published and its loads would fail. The bucket keys still
+        # exist (see TestCaptureDispositions) for the buckets that *are*
+        # servable, but this shape is refused at registration.
         from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
 
         def spec(extra):
@@ -413,12 +417,10 @@ class TestWindowedSpecGroups(unittest.TestCase):
                 )
             ]
         )
-        metas = parse_groups(config, MBS, calculate_kv_scales=False)
-        self.assertEqual(2, len(metas))
-        self.assertEqual({0}, {meta.group_idx for meta in metas})
-        self.assertEqual({"sliding"}, {meta.retention.kind for meta in metas})
-        self.assertEqual({0, 8}, {meta.retention.extra_retained_tokens for meta in metas})
-        self.assertEqual(2, len({spec_name(0, meta) for meta in metas}))
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(config, MBS, calculate_kv_scales=False)
+        self.assertIn("folds", str(ctx.exception))
+        self.assertIn("windowed", str(ctx.exception))
 
     def test_pure_windowed_instance_declares_only_the_full_group(self):
         # Nothing to exclude into: every spec is windowed, so a block without
@@ -443,6 +445,12 @@ class TestWindowedSpecGroups(unittest.TestCase):
             [True, False, True], conn._window_data_mask(ledger, range(3))
         )
 
+    def _announce(self, conn, req_id, blocks, states, windows):
+        conn.start_save_kvcache_async(
+            req_id, list(range(blocks)), blocks, states, windows
+        )
+        return conn._manager_client.start_write_cache.call_args.args[0]
+
     def test_the_announcement_names_the_coverage(self):
         conn = make_connector_scheduler(
             manager_block_size=MBS, num_groups=2, windowed=1
@@ -454,12 +462,120 @@ class TestWindowedSpecGroups(unittest.TestCase):
             "locations": [],
             "write_session_id": "s",
         }
-        conn.start_save_kvcache_async("r0", [0, 1, 2], 3, [True] * 3, [True, False, True])
-        request = conn._manager_client.start_write_cache.call_args.args[0]
+        request = self._announce(conn, "r0", 3, [True] * 3, [True, False, True])
         self.assertEqual(
             request["location_spec_group_names"],
             ["full", "full_no_window", "full"],
         )
+
+    def test_a_block_without_any_coverage_keeps_the_others_precise(self):
+        # A block that carries neither state nor window data has no group of
+        # its own. Dropping the whole request to the "all specs" default (what
+        # the connector did before) made the manager allocate every spec for
+        # every *other* block too, and _save_dispositions then failed the
+        # partial-coverage blocks that were perfectly publishable. The empty
+        # block is isolated instead: it gets the narrowest declared group (and
+        # is failed by its own verdict), the rest keep theirs.
+        conn = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, num_state_groups=1, windowed=1
+        )
+        conn._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=1
+        )
+        conn._manager_client.start_write_cache.return_value = {
+            "locations": [],
+            "write_session_id": "s",
+        }
+        # Every attention spec here is windowed and there is a state group, so
+        # the (no state, no window) block carries *nothing*: no declared group
+        # describes it. The other three coverages are all declared.
+        request = self._announce(
+            conn, "r0", 4, [True, False, False, True], [True, True, False, False]
+        )
+        names = request["location_spec_group_names"]
+        self.assertEqual(
+            ["full", "attn", conn._narrowest_spec_group, "full_no_window"], names
+        )
+        # The narrowest declared group here is "attn" (the windowed attention,
+        # no state): the empty block still gets *a* name -- the manager needs
+        # one per block -- but the others keep their precise coverage instead
+        # of the whole request falling back to "all specs".
+        self.assertEqual("attn", names[2])
+
+    def test_a_retried_announcement_keeps_the_claimed_window(self):
+        # The window slides between two announcements of the same block (a
+        # failed session is retried, or preemption rolls the save watermark
+        # back). The bytes the first capture copied are still in the worker's
+        # arena, so the retry must claim what they cover: announcing the block
+        # as window-less would leave captured bytes with no location, and the
+        # worker would fail the block and release its only copy.
+        conn = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=2, windowed=1
+        )
+        conn._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=1
+        )
+        conn._manager_client.start_write_cache.return_value = {
+            "locations": [],
+            "write_session_id": "s",
+        }
+        first = self._announce(conn, "r0", 3, [True] * 3, [True, True, True])
+        self.assertEqual(first["location_spec_group_names"], ["full"] * 3)
+        retried = self._announce(conn, "r0", 3, [True] * 3, [False, False, False])
+        self.assertEqual(
+            retried["location_spec_group_names"],
+            ["full"] * 3,
+            "the retry must claim the window its captured bytes cover",
+        )
+
+    def test_existing_blocks_release_their_captures(self):
+        # StartWriteCache reporting that the manager already holds a block means
+        # this session will not write it: its eager capture has nothing to
+        # publish and must give its arena slot back now, not at retirement.
+        conn = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=2, windowed=1
+        )
+        conn._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=1
+        )
+        conn._manager_client.start_write_cache.return_value = {
+            "locations": [{"block_idxes": [2]}],
+            "write_session_id": "s",
+            "block_mask": {"offset": 2},
+        }
+        self._announce(conn, "r0", 4, [True] * 4, [True] * 4)
+        self.assertEqual(
+            conn.parse_block_mask_to_existing_indices(
+                {"block_mask": {"offset": 2}}, 4
+            ),
+            [0, 1],
+        )
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        conn._collect_release_captures(meta)
+        self.assertEqual(meta.to_release_captures, [("r0", [0, 1])])
+
+    def test_an_all_existing_response_releases_every_announced_block(self):
+        conn = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=2, windowed=1
+        )
+        conn._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=1
+        )
+        conn._manager_client.start_write_cache.return_value = {
+            "locations": [],
+            "write_session_id": "s",
+            "block_mask": {"bool_masks": {"values": [True, True, True]}},
+        }
+        self._announce(conn, "r0", 3, [True] * 3, [True] * 3)
+        self.assertEqual(
+            conn.parse_block_mask_to_existing_indices(
+                {"block_mask": {"bool_masks": {"values": [True, False, True]}}}, 3
+            ),
+            [0, 2],
+        )
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        conn._collect_release_captures(meta)
+        self.assertEqual(meta.to_release_captures, [("r0", [0, 1, 2])])
 
     def test_announcement_and_capture_classify_the_same_blocks(self):
         # (two groups: one windowed, one full -- the shape whose announcement
@@ -925,6 +1041,23 @@ class TestCaptureDispositions(unittest.TestCase):
         # skipped with it.
         self.assertEqual(1, capture.call_count)
         self.assertEqual({}, conn._staged)
+
+    def test_wait_for_save_honours_the_release_instruction(self):
+        conn = captured_worker([0, 1], [7, 8])
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.release_captures("r0", [1])
+        conn.wait_for_save(meta)
+        self.assertEqual([("tp0_g0", 0)], sorted(conn._staged["r0"]))
+
+    def test_release_captures_returns_only_the_listed_blocks(self):
+        conn = captured_worker([0, 1], [7, 8])
+        conn._release_captures_for("r0", [0])
+        # Block 0's slot went back with the instruction; block 1's capture is
+        # still there for the session that will write it.
+        self.assertEqual(
+            [("tp0_g0", 1)], sorted(conn._staged["r0"]),
+        )
+        self.assertEqual([(0, 1)], conn._data_transfer.pool.released)
 
     def test_finish_releases_unwritten_slots(self):
         conn = captured_worker([0, 1], [7, 8])
@@ -1555,6 +1688,35 @@ class TestClampCoversTheNeededWindow(unittest.TestCase):
         matched, _async = conn.get_num_new_matched_tokens(req, 0)
         return matched
 
+    def test_eagle_padding_is_a_hash_block_not_a_manager_block(self):
+        # preferred_block_size (16) below the scheduler's block size (64): the
+        # EAGLE drop moves the resumed window back a whole 64-token block, i.e.
+        # four manager blocks. A hole five blocks before the end is inside that
+        # region, so the match must stop there; a constant one-block padding
+        # (what the clamp asked for before) accepts the whole tail.
+        conn = make_connector_scheduler(
+            manager_block_size=16,
+            vllm_block_size=64,
+            locations=[],
+            windowed=1,
+            has_eagle_group=True,
+        )
+        conn._windowed_metas[0] = AttentionGroupMeta(
+            group_idx=0,
+            layer_names=["l0"],
+            block_size=16,
+            per_block_bytes=1024,
+            page_bytes=16 * 8,
+            retention=WindowRetention(RETENTION_SLIDING, window_tokens=64),
+        )
+        blocks = 24
+        table = [True] * blocks
+        table[blocks - 6] = False  # a hole six blocks before the end
+        locs = locations([["tp0_g0"] if present else [] for present in table])
+        # cdiv(64 - 1 + 64, 16) = 8 blocks of tail are required, so [16, 24) is
+        # the region and the hole at 18 ends the match there.
+        self.assertEqual(blocks - 6, conn._windowed_match_end(locs, blocks))
+
     def test_the_claimed_region_covers_every_needed_token(self):
         cases = [
             (16, 16, 1024, 0, False),
@@ -1582,6 +1744,131 @@ class TestClampCoversTheNeededWindow(unittest.TestCase):
                     f"{matched - window + 1}, but only claims data from "
                     f"{covered_from}",
                 )
+
+
+
+
+class TestPackedGroupsAndStateBlocks(unittest.TestCase):
+    """Configurations the connector must refuse or now accepts (registration)."""
+
+    def test_a_packed_windowed_group_is_refused_but_the_folded_view_hides_it(self):
+        # The scheduler only sees vLLM's folded view: one representative sub
+        # spec per group. A packed group that mixes a windowed member with
+        # another member would therefore be announced and clamped for one
+        # bucket only -- the other bucket's blocks would never be published and
+        # a load of them would fail silently in multi-group instances. The
+        # worker (which sees every member) refuses the shape; the probe shows
+        # why the scheduler cannot: its view has a single bucket.
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
+
+        def spec(window):
+            return SlidingWindowSpec(
+                block_size=MBS,
+                sliding_window=window,
+                page_size_bytes=2048,
+                num_kv_heads=2,
+                head_size=64,
+                dtype=torch.bfloat16,
+            )
+
+        worker_view = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=["l0", "l1"],
+                    kv_cache_spec=UniformTypeKVCacheSpecs.from_specs(
+                        {"l0": spec(1024), "l1": spec(512)}
+                    ),
+                    is_eagle_group=False,
+                )
+            ]
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(worker_view, MBS, calculate_kv_scales=False)
+        self.assertIn("folds", str(ctx.exception))
+        # ... what the scheduler gets instead: one representative, one bucket.
+        folded = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=["l0", "l1"], kv_cache_spec=spec(1024), is_eagle_group=False
+                )
+            ]
+        )
+        metas = parse_groups(folded, MBS, calculate_kv_scales=False)
+        self.assertEqual(1, len(metas))
+        self.assertEqual(1024, metas[0].retention.window_tokens)
+
+    def test_state_blocks_smaller_than_the_manager_block_are_aligned(self):
+        # --mamba-block-size below --block-size: a 48-token manager block over
+        # 16-token state blocks selects the states ending at 47, 95, 143, i.e.
+        # 2, 5, 8 -- one state per manager block, each covering that block's
+        # prefix, which is exactly what the transfer path needs.
+        from kv_cache_manager.py_connector.vllm.transfer_types import (
+            StateTransferGroup,
+        )
+
+        conn = make_connector(manager_block_size=48)
+        group = StateTransferGroup(
+            group_idx=0,
+            spec_name="tp0_s0",
+            layer_names=["s0"],
+            block_size=16,
+            per_block_bytes=1024,
+            layer_num=1,
+            block_view_tensors=[],
+            page_size_bytes=1024,
+        )
+        conn._kvcache_info = KVCacheInfo(
+            tp_rank=0, world_size=1, groups=[group], device="cpu", dtype=KV_DTYPE
+        )
+        table = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        self.assertEqual(
+            [2, 5, 8],
+            conn._state_block_ids(group, [0, 1, 2], table),
+        )
+        # Registration accepts it too (the equality assertion would refuse).
+        built = conn._build_state_group(
+            SimpleNamespace(
+                group_idx=0,
+                layer_names=["s0"],
+                block_size=16,
+                per_block_bytes=1024,
+                page_size_bytes=1024,
+                spec_suffix="",
+            ),
+            {"s0": torch.zeros(1, 1, 1, 1024, dtype=torch.uint8)},
+        )
+        self.assertEqual(16, built.block_size)
+
+    def test_state_blocks_larger_than_the_manager_block_are_refused(self):
+        # The other direction reproduces one state under several manager keys.
+        conn = make_connector(manager_block_size=16)
+        from kv_cache_manager.py_connector.vllm.transfer_types import (
+            StateTransferGroup,
+        )
+
+        group = StateTransferGroup(
+            group_idx=0,
+            spec_name="tp0_s0",
+            layer_names=["s0"],
+            block_size=64,
+            per_block_bytes=1024,
+            layer_num=1,
+            block_view_tensors=[],
+            page_size_bytes=1024,
+        )
+        conn._kvcache_info = KVCacheInfo(
+            tp_rank=0, world_size=1, groups=[group], device="cpu", dtype=KV_DTYPE
+        )
+        meta = SimpleNamespace(
+            group_idx=0,
+            layer_names=["s0"],
+            block_size=64,
+            per_block_bytes=1024,
+            page_size_bytes=1024,
+        )
+        with self.assertRaises(AssertionError) as ctx:
+            conn._build_state_group(meta, {"s0": torch.zeros(1024)})
+        self.assertIn("multiple of the state block", str(ctx.exception))
 
 
 # --------------------------------------------------------------------------- #
@@ -1659,40 +1946,33 @@ class TestTaskChunkWiring(unittest.TestCase):
         for batch in (1, 2):
             with self.subTest(batch=batch):
                 conn = self._worker(batch)
-                conn.wait_for_save(
-                    SimpleNamespace(
-                        to_save_requests=[
-                            SimpleNamespace(
-                                req_id="r0",
-                                target_locations=locations([["tp0_g0"]] * 4),
-                                manager_block_idxes=[0, 1, 2, 3],
-                                write_session_id="s0",
-                                all_block_ids=[[1, 2, 3, 4]],
-                            )
-                        ],
-                        to_capture_requests=[],
+                meta = TairKvCacheConnectorMetadata(epoch=0)
+                meta.add_save_request(
+                    SaveRequest(
+                        req_id="r0",
+                        target_locations=locations([["tp0_g0"]] * 4),
+                        manager_block_idxes=[0, 1, 2, 3],
+                        write_session_id="s0",
+                        all_block_ids=[[1, 2, 3, 4]],
                     )
                 )
+                conn.wait_for_save(meta)
                 self.assertEqual(4 // batch, len(conn._data_transfer.saved))
 
     def test_load_uses_the_manager_batch(self):
         for batch in (1, 4):
             with self.subTest(batch=batch):
                 conn = self._worker(batch)
-                conn.start_load_kv(
-                    None,
-                    SimpleNamespace(
-                        epoch=0,
-                        to_load_requests=[
-                            SimpleNamespace(
-                                req_id="r0",
-                                manager_block_idxes=[0, 1, 2, 3],
-                                need_load_locations=locations([["tp0_g0"]] * 4),
-                                all_block_ids=[[1, 2, 3, 4]],
-                            )
-                        ],
-                    ),
+                meta = TairKvCacheConnectorMetadata(epoch=0)
+                meta.add_load_request(
+                    LoadRequest(
+                        req_id="r0",
+                        manager_block_idxes=[0, 1, 2, 3],
+                        need_load_locations=locations([["tp0_g0"]] * 4),
+                        all_block_ids=[[1, 2, 3, 4]],
+                    )
                 )
+                conn.start_load_kv(None, meta)
                 self.assertEqual(4 // batch, len(conn._data_transfer.loaded))
 
 

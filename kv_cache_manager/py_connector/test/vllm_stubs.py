@@ -20,6 +20,7 @@ of them -- the connector reads whichever is not the default (see
 import importlib.util
 import json
 import sys
+import threading as _threading
 import types
 from enum import IntEnum
 from typing import Any, Optional
@@ -909,18 +910,26 @@ def make_connector_scheduler(
         if isinstance(m, AttentionGroupMeta) and m.retention is not None
     ]
     core._has_eagle_group = has_eagle_group
-    core._spec_group_names = spec_group_plan(core._group_metas, tp_size)[1]
+    declared, core._spec_group_names = spec_group_plan(core._group_metas, tp_size)
+    core._narrowest_spec_group = (
+        min(declared, key=lambda group: (len(group["spec_names"]), group["name"]))[
+            "name"
+        ]
+        if declared
+        else None
+    )
+    core._window_claims = {}
+    core._pending_release_captures = []
+    core._pending_release_captures_lock = _threading.Lock()
     core._epoch = 0
     core._tracked = {}
     core._load_failed = set()
     core._load_attempted = set()
     core._waiting_to_load_requests = []
-    import threading
-
-    core._waiting_to_save_requests_lock = threading.Lock()
+    core._waiting_to_save_requests_lock = _threading.Lock()
     core._waiting_to_save_requests = []
     core._waiting_to_finish_requests = []
-    core._canceled_save_request_ids_lock = threading.Lock()
+    core._canceled_save_request_ids_lock = _threading.Lock()
     core._canceled_save_request_ids = []
     core._http_executor = MagicMock()
     core._manager_client = MagicMock()

@@ -337,16 +337,24 @@ class ConnectorWorker:
     def _build_state_group(
         self, meta: StateGroupMeta, kv_caches: Dict[str, Any]
     ) -> StateTransferGroup:
-        # Mamba state exists once per scheduler block and covers the prefix
-        # ending at that block's last token, so the two block sizes must be
-        # *equal*: with a smaller state block size (--mamba-block-size below
-        # --block-size) _state_block_ids' "last token selects the block" would
-        # publish one state under several prefix keys -- a silently misplaced
-        # state. Fail at registration instead.
-        assert meta.block_size == self._manager_block_size, (
-            f"state group {meta.group_idx}: spec block size {meta.block_size} "
-            f"!= manager block size {self._manager_block_size}; mamba state is "
-            f"per scheduler block and cannot be re-blocked"
+        # A state exists once per state block and covers the prefix ending at
+        # that block's last token, so _state_block_ids' "last token selects the
+        # block" needs the manager block to be a whole number of state blocks:
+        # with --mamba-block-size <= --block-size an mbs-token manager block
+        # ends inside (or exactly on) a state block, and a 48-token manager
+        # block over 16-token states selects states 2, 5, 8, ... -- one state
+        # each, ending where the manager block ends (writes publish the state
+        # that really covers the block's prefix).
+        #
+        # The other direction is the misplacement: a *larger* state block
+        # (--mamba-block-size above --block-size) covers several manager blocks,
+        # so one state would be published under several prefix keys.
+        assert self._manager_block_size % meta.block_size == 0, (
+            f"state group {meta.group_idx}: manager block size "
+            f"{self._manager_block_size} is not a multiple of the state block "
+            f"size {meta.block_size}; a state covers the prefix ending at its "
+            f"block, so a larger state block would be published under several "
+            f"manager block keys (a silently misplaced state)"
         )
         spec = spec_name(self._tp_rank, meta)
         block_views = []
@@ -798,6 +806,8 @@ class ConnectorWorker:
         """
         if meta.to_capture_requests:
             self._capture_blocks(meta)
+        for req_id, blocks in meta.to_release_captures:
+            self._release_captures_for(req_id, blocks)
         if not meta.to_save_requests:
             return
         ready_event = self._device_mod.Event()
@@ -1004,6 +1014,35 @@ class ConnectorWorker:
         """Give back the runs of a capture that will not be kept."""
         for _group, captureable, pool, start in taken:
             pool.release(start, len(captureable))
+
+    def _release_captures_for(self, req_id: str, blocks: Sequence[int]) -> None:
+        """Return the captured slots of blocks no session is going to write.
+
+        The manager reported them as already cached when the session came back,
+        so the bytes the eager capture copied for them are never published (the
+        session does not even mention them): holding them until the request
+        retires would pin one arena slot per already-cached block for as long
+        as the request runs. Entries already handed to a session are the task's
+        to release and are left alone.
+        """
+        staged = self._staged.get(req_id)
+        if not staged:
+            return
+        released = 0
+        for block in blocks:
+            for key in [
+                key for key in staged if key[1] == block
+            ]:
+                pool, slot = staged.pop(key)
+                pool.release(slot, 1)
+                released += 1
+        if released:
+            logger.info(
+                "req:%s released %d captured block slots the manager already "
+                "holds (nothing to publish for them)",
+                req_id,
+                released,
+            )
 
     def _release_staged(self, req_id: str) -> None:
         """Return the capture slots the request never handed to a session.
