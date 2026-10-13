@@ -917,11 +917,18 @@ class DataTransferManager:
         ``ready_event`` exists for the late gather, which this path has none
         of).
 
-        A captured slot is the task's to return, whatever the verdict: the
-        block is announced to the manager exactly once, so there is no retry
-        that could reuse these bytes, and a failure that kept the slot would
-        hold the arena for the rest of the request's life. Whatever the request
-        never handed to a session is released when it retires instead.
+        A captured slot goes back to the arena when the write *lands*, and only
+        then: a failed write is not a lost cause. The block can be announced
+        again (the save watermark moves backwards when preemption shrinks an
+        allocation, and a retry session announces the whole prefix), and by
+        then the HBM window that held its KV has moved on -- these captured
+        bytes are the only copy the connector will ever have. The worker puts
+        the failed block's entry back into its staged map (see
+        _retain_failed_windowed) with the slot still held, so the next session
+        publishes it; if that never happens, the entry is released when the
+        request retires. An *exception* out of the SDK is the one case that
+        still returns the slot here: no result callback will fire for that
+        task, so a kept slot would leak in flight for the process's lifetime.
         """
         pool = self._pools[group.spec_name]
         uris = [remote_uris[i] for i in valid]
@@ -937,23 +944,28 @@ class DataTransferManager:
             for i in valid
         ]
         ok = False
+        returned = False
         try:
             result = self._transfer_client.SaveKvCaches(uris, buffers)
             ok = result[0] == kvcm_py_client.ClientErrorCode.ER_OK
+            returned = True
         finally:
-            # One release per captured slot, on every path: the entry left the
-            # worker's staged map when the plan handed the block over, so this
-            # task is the only owner left, and the slot is gone for the rest of
-            # the process's life if the SDK raises instead of returning an
-            # error code (review_r2 N1 measured 384 of 1024 slots leaking that
-            # way; the other two staging paths, _save_valid_blocks and
-            # load_task, return their slots in a finally for the same reason).
-            for i in valid:
-                pool.release(staged_slots[i], 1)  # ty: ignore[invalid-argument-type]
+            # On success the captured slot goes back to the arena; on a failed
+            # write it stays held, because the worker restores the block's
+            # entry to its staged map with this very slot. The SDK raising is
+            # the exception: nothing will call the session's result callback
+            # then, so a kept entry would sit in flight for the rest of the
+            # process's life (review_r2 N1 measured 384 of 1024 slots leaking
+            # that way), hence the slot is released here even though the bytes
+            # are lost with it.
+            if ok or not returned:
+                for i in valid:
+                    pool.release(staged_slots[i], 1)  # ty: ignore[invalid-argument-type]
         if not ok:
             logger.warning(
                 "save task failed group=%s uris=%d result=%s; the block is not "
-                "published and its captured slot goes back to the arena",
+                "published and its captured bytes are kept for a retry "
+                "(the slot stays held until the request retires)",
                 group.spec_name,
                 len(uris),
                 result,

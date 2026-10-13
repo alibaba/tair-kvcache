@@ -18,6 +18,11 @@ class SaveRequest:
     # manager blocks into physical slots, and the scheduler's ledger is the
     # only place it exists. The worker keeps no request mirror.
     all_block_ids: List[List[int]] = field(default_factory=list)
+    # The scheduler's id of the write session this request belongs to. The
+    # worker does not read it (its own bookkeeping is per block); the scheduler
+    # uses it to retire the session's capture protection when the request is
+    # handed over (see _collect_save_instructions).
+    session_id: int = 0
 
 
 @dataclass

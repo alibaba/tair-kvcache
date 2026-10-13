@@ -34,6 +34,7 @@ from kv_cache_manager.py_connector.vllm.data_transfer import (
 )
 from kv_cache_manager.py_connector.vllm.metadata import (
     CaptureRequest,
+    SaveRequest,
     TairKvCacheConnectorMetadata,
 )
 from kv_cache_manager.py_connector.vllm.transfer_types import (
@@ -508,6 +509,67 @@ class ConnectorWorker:
                     plan.null_rows[i:end] if plan.null_rows is not None else None,
                 )
 
+    def _retain_failed_windowed(
+        self,
+        save_req: SaveRequest,
+        plans: List[TransferPlan],
+        done_cb: Callable[[List[Any]], None],
+    ) -> Callable[[List[Any]], None]:
+        """Give a failed windowed block its captured bytes back.
+
+        A staged (windowed) save reads the arena; when its write fails, the
+        bytes are the only copy the connector will ever hold (the HBM window
+        that produced them has moved on, so a later capture abstains), and
+        later incremental sessions still announce that block -- the manager
+        asks for it again and the block must be publishable. ``save_task``
+        keeps such a task's slots (see _save_staged_blocks) and this wrapper
+        moves the entries back into the staged map as soon as the session
+        reports, so the next announcement finds them. The slot stays owned by
+        exactly one of the two maps throughout, and a request that never
+        retries releases it at retirement.
+
+        Only a *failed* windowed group restores: when it wrote successfully
+        its slots were returned to the arena and the entries must not come
+        back. The verdict list is flat, group-major, ``num_blocks`` per group
+        (the same layout create_save_done_callback reads).
+        """
+        windowed = [
+            (group_idx, plan)
+            for group_idx, plan in enumerate(plans)
+            if getattr(plan.group, "retention", None) is not None
+            and plan.staged_slots
+        ]
+        if not windowed:
+            return done_cb
+        num_blocks = len(save_req.manager_block_idxes)
+
+        def wrapper(flat: List[Any]) -> None:
+            done_cb(flat)
+            if len(flat) < len(plans) * num_blocks:
+                return
+            staged = self._staged.setdefault(save_req.req_id, {})
+            in_flight = self._in_flight.get(save_req.req_id)
+            if not in_flight:
+                return
+            for group_idx, plan in windowed:
+                for pos, slot in enumerate(plan.staged_slots):
+                    if slot is None:
+                        continue
+                    block = save_req.manager_block_idxes[pos]
+                    key = (plan.group.spec_name, block)
+                    entry = in_flight.get(key)
+                    if entry is not None and flat[group_idx * num_blocks + pos] is False:
+                        staged[key] = in_flight.pop(key)
+                        logger.warning(
+                            "save group %s: block %d failed to write; its "
+                            "captured bytes stay staged for a retry (slot %d)",
+                            plan.group.spec_name,
+                            block,
+                            slot,
+                        )
+
+        return wrapper
+
     def _windowed_save_annotations(
         self,
         req_id: str,
@@ -843,6 +905,8 @@ class ConnectorWorker:
             done_cb = self._data_transfer.create_save_done_callback(
                 save_req.req_id, self._tp_rank, save_req.write_session_id, num_blocks
             )
+            if plans is not None:
+                done_cb = self._retain_failed_windowed(save_req, plans, done_cb)
 
             if plans is None:
                 mr = MultiResult(1, done_cb)

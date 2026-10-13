@@ -1017,14 +1017,30 @@ def _uniform_group_metas(
         )
         buckets.setdefault(_bucket_key(spec, origin), []).append((layer_name, spec))
     ordered = sorted(buckets.items(), key=lambda item: _bucket_order(item[0]))
-    # Splitting is all this function does: a packed group whose members agree on
-    # their coverage (same window retention, same page semantics) folds
-    # losslessly for the scheduler -- its one representative sub spec carries
-    # the same retention -- and each bucket transfers on its own identity (wire
-    # name, staging pool, staged captures). A packed group whose members
-    # *disagree* on coverage is the case the scheduler's folded view cannot
-    # describe, and the folding guard (see the folding change stacked on this
-    # one) refuses it before any of this runs.
+    # A packed group whose members agree on their coverage (same window
+    # retention, same page semantics) folds losslessly for the scheduler -- its
+    # one representative sub spec carries the same retention -- and each bucket
+    # then transfers on its own identity (wire name, staging pool, staged
+    # captures). A packed group whose members *disagree* on coverage is the
+    # case the scheduler's folded view cannot describe, and this branch cannot
+    # bail out either: if the representative is the full-attention member, the
+    # scheduler emits no capture and no hit clamp although the worker's windowed
+    # bucket needs staged bytes (its claimed saves then fail); with a windowed
+    # representative the announcement can describe the wrong retention. Refuse
+    # the divergence here, where the whole member list is visible -- the folding
+    # guard (the folding change stacked on this one) enforces the same predicate
+    # at registration, for metas built without going through this function.
+    coverages = {key.retention for key, _layers in ordered}
+    if len(coverages) > 1:
+        raise NotImplementedError(
+            f"group {idx} (UniformTypeKVCacheSpecs) mixes {len(ordered)} "
+            f"transfer buckets with different coverage "
+            f"{sorted(str(c) for c in coverages)}: vLLM folds the group to one "
+            f"representative sub spec for the scheduler, so the connector could "
+            f"not announce or clamp every bucket's window. Keep the windowed "
+            f"layers together (one retention per packed group) or let them form "
+            f"their own group."
+        )
     return [
         _attention_meta(
             idx,
