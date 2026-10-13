@@ -873,7 +873,7 @@ def _check_unique_names(metas: List[GroupMeta]) -> None:
 def _transferable_groups(kv_cache_config: Any) -> List[Tuple[int, Any]]:
     """The (vLLM group index, group) pairs this connector may transfer.
 
-    vLLM 0.30+ projects the group list for connectors: KVCacheGroupSpec.
+    vLLM 0.29+ projects the group list for connectors: KVCacheGroupSpec.
     enable_kv_transfer=False marks groups the engine rebuilds itself (ephemeral
     accelerator-side replicas of a transferable source group, e.g. HiSparse's
     resident/hot tiers), and KVCacheConfig.transfer_group_ids / transfer_groups
@@ -889,8 +889,8 @@ def _transferable_groups(kv_cache_config: Any) -> List[Tuple[int, Any]]:
     the ledger plus every consumer index by it. Renumbering to the projected
     position would pair our metas with another group's block table.
 
-    Eras without the attribute (vLLM <= 0.29) expose every group; the flag
-    arrived with the groups it describes.
+    Eras without the attribute (vLLM <= 0.28) expose every group; the flag
+    arrived with the specs it describes.
     """
     groups = kv_cache_config.kv_cache_groups
     transfer_ids = getattr(kv_cache_config, "transfer_group_ids", None)
@@ -923,11 +923,20 @@ def parse_groups(
 
     Groups that carry nothing the manager may cache are skipped instead of
     refused -- EAGLE/MTP drafters (vLLM marks them) and per-request scratch
-    (see _is_scratch_spec). A skipped group keeps its vLLM block-table index,
-    so its number is simply absent from the wire names.
+    (see _is_scratch_spec), plus the groups the engine keeps out of the
+    transfer contract (see _transferable_groups). A skipped group keeps its
+    vLLM block-table index, so its number is simply absent from the wire names.
+
+    The two vLLM contracts differ, though, and a scratch group that the engine
+    *does* expose for transfer (vLLM 0.29+ default: enable_kv_transfer=True) is
+    refused rather than dropped: the engine rebuilds only the groups it owns,
+    so an external hit would otherwise resume with that state uninitialized.
     """
     metas: List[GroupMeta] = []
     transferable = _transferable_groups(kv_cache_config)
+    declares_projection = (
+        getattr(kv_cache_config, "transfer_group_ids", None) is not None
+    )
     transferable_ids = {idx for idx, _ in transferable}
     for idx, group in enumerate(kv_cache_config.kv_cache_groups):
         if idx not in transferable_ids:
@@ -945,6 +954,16 @@ def parse_groups(
             )
             continue
         if _is_scratch_spec(group.kv_cache_spec):
+            if declares_projection:
+                raise NotImplementedError(
+                    f"group {idx}: {type(group.kv_cache_spec).__name__} is "
+                    f"per-request scratch (prefix_cacheable=False) yet the engine "
+                    f"exposes it for transfer (enable_kv_transfer=True): its state "
+                    f"must be restored on an external hit and the engine does not "
+                    f"rebuild a group it hands to connectors. TairKvCacheConnector "
+                    f"has no transfer layout for it, so the instance is refused "
+                    f"rather than resumed with uninitialized state"
+                )
             logger.warning(
                 "skip %s group %d (%d layers): the class declares itself out of "
                 "the prefix cache (prefix_cacheable=False and no slot mapping or "

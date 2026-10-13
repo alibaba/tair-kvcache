@@ -426,7 +426,7 @@ class TestUndeclaredSubclassesFailClosed(RealEngineCase):
 
 
 class TestTransferProjection(RealEngineCase):
-    """vLLM 0.30+ projects the group list for connectors (enable_kv_transfer).
+    """vLLM 0.29+ projects the group list for connectors (enable_kv_transfer).
 
     Membership comes from the engine's own projection; the index we keep is the
     raw vLLM group index, because that is the space of the block-id payloads
@@ -481,6 +481,66 @@ class TestTransferProjection(RealEngineCase):
                 ("a1", "full", {}),
             ]
         )
+        with self.assertLogs(
+            "kv_cache_manager.py_connector.common.logger", level="WARNING"
+        ) as captured:
+            metas = parse_groups(config, 16, calculate_kv_scales=False)
+        self.assertEqual([1], [meta.group_idx for meta in metas])
+        self.assertTrue(
+            any("does not transfer it" in msg for msg in captured.output),
+            captured.output,
+        )
+
+
+class TestTransferableScratch(RealEngineCase):
+    """A transferable scratch group is refused, not dropped (0.29+)."""
+
+    def _config(self, spec_row, enable_kv_transfer):
+        group_cls = getattr(self.module, "KVCacheGroupSpec", None)
+        if group_cls is None or "enable_kv_transfer" not in inspect.signature(
+            group_cls
+        ).parameters:
+            self.skipTest(f"vLLM {self.version} has no enable_kv_transfer")
+        config_cls = getattr(self.module, "KVCacheConfig", None)
+        if config_cls is None or not hasattr(config_cls, "transfer_group_ids"):
+            self.skipTest(f"vLLM {self.version} has no transfer projection")
+        full = facts.build_spec(facts.ROW_BY_NAME["full"], self.engine)
+        return config_cls(
+            num_blocks=1,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                group_cls(
+                    ["ring"],
+                    facts.build_spec(facts.ROW_BY_NAME[spec_row], self.engine),
+                    enable_kv_transfer=enable_kv_transfer,
+                ),
+                group_cls(["attn"], full),
+            ],
+        )
+
+    def test_a_transferable_scratch_group_is_refused(self):
+        # enable_kv_transfer=True (the default) exposes the group to
+        # connectors, so dropping it would leave its state uninitialized on an
+        # external hit -- and this connector has no layout for it yet. Only
+        # where the era's own spec declares the scratch contract (0.29's
+        # CircularBufferSpec has no slot/views flag, so the gate owns it there).
+        row = facts.ROW_BY_NAME["circular_buffer"]
+        if self.version not in facts.skip_eras(row):
+            self.skipTest(f"vLLM {self.version} does not declare {row['cls']} scratch")
+        config = self._config("circular_buffer", True)
+        self.assertEqual((0, 1), config.transfer_group_ids)
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(config, 16, calculate_kv_scales=False)
+        message = str(ctx.exception)
+        self.assertIn("CircularBufferSpec", message)
+        self.assertIn("enable_kv_transfer=True", message)
+
+    def test_a_scratch_group_the_engine_owns_is_still_skipped(self):
+        row = facts.ROW_BY_NAME["circular_buffer"]
+        if self.version not in facts.skip_eras(row):
+            self.skipTest(f"vLLM {self.version} does not declare {row['cls']} scratch")
+        config = self._config("circular_buffer", False)
+        self.assertEqual((1,), config.transfer_group_ids)
         with self.assertLogs(
             "kv_cache_manager.py_connector.common.logger", level="WARNING"
         ) as captured:

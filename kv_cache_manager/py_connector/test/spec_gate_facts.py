@@ -141,6 +141,19 @@ SCRATCH_FLAGS: Dict[str, Dict[str, Tuple[Any, Any, Any]]] = {
 }
 
 
+#: Eras whose KVCacheConfig declares the transfer projection (KVCacheGroupSpec.
+#: enable_kv_transfer / transfer_group_ids / prefix_cacheable_group_ids). The
+#: enable_kv_transfer / transfer_group_ids arrived in vLLM 0.29; the
+#: prefix_cacheable_group_ids subset (the codex comment's second contract) in
+#: 0.30. Measured per tree: 0.14-0.28 carry neither, 0.29-0.31 both here.
+TRANSFER_PROJECTION_ERAS: Tuple[str, ...] = ("0.29.0", "0.30.0", "0.31.0")
+
+
+def declares_transfer_projection(engine: "Engine") -> bool:
+    """Does this era tell connectors which groups are theirs to transfer?"""
+    return engine.version in TRANSFER_PROJECTION_ERAS
+
+
 def skip_eras(row: Dict[str, Any]) -> Tuple[str, ...]:
     """The eras whose spec declares the whole scratch contract for this row."""
     if row["cls"] == "UniformTypeKVCacheSpecs":
@@ -159,13 +172,20 @@ def skip_eras(row: Dict[str, Any]) -> Tuple[str, ...]:
 def expected_outcome(row: Dict[str, Any], engine: "Engine") -> str:
     """The row's disposition *in this era*.
 
-    Only the scratch rows are era-dependent: the group is dropped where the
-    era's own spec opts out of the transfer contract (see skip_eras); an era
-    that still claims it refuses the group instead of dropping data.
+    Only the scratch rows are era-dependent, and for two reasons: the era's own
+    spec must declare the scratch contract (see skip_eras), and the group must
+    not be exposed to connectors. Where either half is missing a scratch group
+    is not dropped -- an era that still claims it is refused by the gate, and a
+    group the engine hands to connectors (transferable, the vLLM default)
+    is refused by parse_groups instead of being silently dropped.
     """
     if row["disposition"] != "skip":
         return row["disposition"]
-    return "skip" if engine.version in skip_eras(row) else "refuse"
+    if engine.version not in skip_eras(row):
+        return "refuse"
+    if declares_transfer_projection(engine) and row.get("transferable", True):
+        return "refuse"
+    return "skip"
 
 
 # --------------------------------------------------------------------------- #
@@ -634,6 +654,9 @@ ZOO: List[Dict[str, Any]] = [
         disposition="skip",
         legacy="refuse",
         companion=True,
+        # v1/hisparse/layout.py builds this group with enable_kv_transfer=False:
+        # the engine rebuilds it, so it is not part of the connector contract.
+        transferable=False,
         source="v1/hisparse/layout.py:185 (c1_gate_matrix row 8)",
     ),
     dict(
@@ -645,6 +668,8 @@ ZOO: List[Dict[str, Any]] = [
         disposition="skip",
         legacy="refuse",
         companion=True,
+        # Same layout, same flag: the resident tier is engine-owned too.
+        transferable=False,
         source="v1/hisparse/layout.py (c1_gate_matrix row 8b)",
     ),
     dict(
@@ -885,6 +910,11 @@ def run_row(row: Dict[str, Any], engine: Engine) -> RowResult:
     ``skip`` rows are parsed next to a plain full-attention companion group
     (index 1), so the instance still parses and the row's group index simply
     has no meta.
+
+    Where the era declares the transfer projection, the config carries the
+    realistic one: the row's group (unless the row is ``transferable=False``,
+    as the HiSparse layout builds them) and the companion are exposed. A
+    transferable scratch group is then *refused* -- see expected_outcome.
     """
     try:
         spec = build_spec(row, engine)
@@ -901,6 +931,11 @@ def run_row(row: Dict[str, Any], engine: Engine) -> RowResult:
             )
         )
     config = SimpleNamespace(kv_cache_groups=groups)
+    if declares_transfer_projection(engine):
+        ids = [1] if row.get("companion") else []
+        if row.get("transferable", True):
+            ids.insert(0, 0)
+        config.transfer_group_ids = tuple(sorted(ids))
     try:
         metas = engine.parse_groups(
             config, row.get("mbs", 16), calculate_kv_scales=False

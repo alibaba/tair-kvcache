@@ -329,7 +329,7 @@ class TestHiddenStateWindows(unittest.TestCase):
 
 
 class TestTransferProjection(unittest.TestCase):
-    """vLLM (0.30+) projects the group list for connectors; honor it.
+    """vLLM (0.29+) projects the group list for connectors; honor it.
 
     enable_kv_transfer=False marks a group the engine rebuilds itself. Such a
     group must not be registered even when its spec looks cacheable -- and the
@@ -396,6 +396,79 @@ class TestTransferProjection(unittest.TestCase):
         with self.assertRaises(NotImplementedError) as ctx:
             parse_groups(config, 16, calculate_kv_scales=False)
         self.assertIn("no usable kv cache groups", str(ctx.exception))
+
+
+class TestTransferableScratchRefusal(unittest.TestCase):
+    """Transfer membership and prefix-cacheability are different vLLM contracts.
+
+    A scratch group (prefix_cacheable=False) that the engine still exposes for
+    transfer must not be dropped: the engine rebuilds only the groups it owns,
+    so an external hit would otherwise resume with that state uninitialized.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.engine = engine()
+
+    def _config(self, transfer_ids, row_name="circular_buffer", companion=True):
+        groups = [
+            SimpleNamespace(
+                layer_names=["ring"],
+                kv_cache_spec=facts.build_spec(facts.ROW_BY_NAME[row_name], self.engine),
+                is_eagle_group=False,
+            )
+        ]
+        if companion:
+            groups.append(
+                SimpleNamespace(
+                    layer_names=["attn"],
+                    kv_cache_spec=facts.build_spec(
+                        facts.ROW_BY_NAME["full"], self.engine
+                    ),
+                    is_eagle_group=False,
+                )
+            )
+        config = SimpleNamespace(kv_cache_groups=groups)
+        if transfer_ids is not None:
+            config.transfer_group_ids = tuple(transfer_ids)
+        return config
+
+    def test_a_transferable_scratch_group_is_refused(self):
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(self._config((0, 1)), 16, calculate_kv_scales=False)
+        message = str(ctx.exception)
+        self.assertIn("CircularBufferSpec", message)
+        self.assertIn("enable_kv_transfer=True", message)
+        self.assertIn("refused", message)
+
+    def test_a_non_transferable_scratch_group_is_still_skipped(self):
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured:
+            metas = parse_groups(self._config((1,)), 16, calculate_kv_scales=False)
+        self.assertEqual([1], [meta.group_idx for meta in metas])
+        self.assertTrue(
+            any("does not transfer it" in msg for msg in captured.output),
+            captured.output,
+        )
+
+    def test_an_era_without_the_projection_still_skips(self):
+        # <= 0.29 has no enable_kv_transfer: nothing engine-side expects the
+        # group, so dropping it stays the behaviour (and its log says why).
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured:
+            metas = parse_groups(self._config(None), 16, calculate_kv_scales=False)
+        self.assertEqual([1], [meta.group_idx for meta in metas])
+        self.assertTrue(
+            any("name it in vllm_common.py" in msg for msg in captured.output),
+            captured.output,
+        )
+
+    def test_the_hi_sparse_rows_are_engine_owned_and_skip(self):
+        # v1/hisparse/layout.py builds these groups with
+        # enable_kv_transfer=False: the projection filters them out (and the
+        # row table says so -- they are the skip rows that survive on 0.29+).
+        for row_name in ("hisparse_hot", "hisparse_resident"):
+            with self.subTest(row=row_name):
+                result = facts.run_row(facts.ROW_BY_NAME[row_name], self.engine)
+                self.assertEqual("skip", result.outcome)
 
 
 class TestPooledFullAttentionRefusal(unittest.TestCase):
