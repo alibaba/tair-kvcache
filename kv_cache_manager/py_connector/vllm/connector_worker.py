@@ -10,6 +10,7 @@ shell.
 
 import copy
 import threading
+import time
 from dataclasses import dataclass
 import json
 import typing
@@ -724,31 +725,41 @@ class ConnectorWorker:
         num_blocks = len(save_req.manager_block_idxes)
 
         def wrapper(flat: List[Any]) -> None:
-            done_cb(flat)
-            if len(flat) < len(plans) * num_blocks:
-                # A task never reported (an exception escaped the executor):
-                # its slots stay in flight until something settles them.
-                return
-            outcomes: Dict[Tuple[str, int], bool] = {}
-            for group_idx, plan in windowed:
-                for pos, slot in enumerate(plan.staged_slots):
-                    if slot is None:
-                        continue
-                    block = save_req.manager_block_idxes[pos]
-                    ok = flat[group_idx * num_blocks + pos]
-                    if ok is None:
-                        continue
-                    outcomes[(plan.group.spec_name, block)] = bool(ok)
-            self._captures.settle(save_req.req_id, save_req.session_id, outcomes)
-            failed = [key for key, ok in outcomes.items() if not ok]
-            if failed:
-                logger.warning(
-                    "req:%s session %d: %d windowed block(s) failed to write; "
-                    "their captured bytes stay staged for a retry",
-                    save_req.req_id,
-                    save_req.session_id,
-                    len(failed),
+            # Settle *first* and report afterwards: the report goes to the
+            # coordinator (a socket that can fail), and an exception there
+            # would otherwise skip the settle for good -- MultiResult calls its
+            # callback once, so this session's slots would stay in flight for
+            # the process's life, eating the arena of unrelated requests. The
+            # finally keeps the report ordered even when the settle raises.
+            try:
+                if len(flat) < len(plans) * num_blocks:
+                    # A task never reported (an exception escaped the executor):
+                    # its slots stay in flight until something settles them.
+                    return
+                outcomes: Dict[Tuple[str, int], bool] = {}
+                for group_idx, plan in windowed:
+                    for pos, slot in enumerate(plan.staged_slots):
+                        if slot is None:
+                            continue
+                        block = save_req.manager_block_idxes[pos]
+                        ok = flat[group_idx * num_blocks + pos]
+                        if ok is None:
+                            continue
+                        outcomes[(plan.group.spec_name, block)] = bool(ok)
+                self._captures.settle(
+                    save_req.req_id, save_req.session_id, outcomes
                 )
+                failed = [key for key, ok in outcomes.items() if not ok]
+                if failed:
+                    logger.warning(
+                        "req:%s session %d: %d windowed block(s) failed to write; "
+                        "their captured bytes stay staged for a retry",
+                        save_req.req_id,
+                        save_req.session_id,
+                        len(failed),
+                    )
+            finally:
+                done_cb(flat)
 
         return wrapper
 
@@ -1066,9 +1077,9 @@ class ConnectorWorker:
         """
         if meta.to_capture_requests:
             self._capture_blocks(meta)
-        for req_id, blocks in meta.to_release_captures:
-            self._release_captures_for(req_id, blocks)
         if not meta.to_save_requests:
+            for req_id, blocks in meta.to_release_captures:
+                self._release_captures_for(req_id, blocks)
             return
         ready_event = self._device_mod.Event()
         ready_event.record(self._device_mod.current_stream())
@@ -1113,6 +1124,14 @@ class ConnectorWorker:
                 self._pending_saves[save_req.req_id] = (
                     self._pending_saves.get(save_req.req_id, 0) + 1
                 )
+
+        # The queued releases come *after* every plan of this batch has taken
+        # its captures: a release queued for a block an older session left
+        # behind must not be able to withdraw the bytes this step's session is
+        # about to write (the scheduler re-checks its protection when it
+        # flushes, and this is the same rule one layer down).
+        for req_id, blocks in meta.to_release_captures:
+            self._release_captures_for(req_id, blocks)
 
     # ------------------------------------------------------------------ #
     # Eager capture (windowed groups)
@@ -1208,6 +1227,12 @@ class ConnectorWorker:
         # Take every run before writing anything down: a failure must leave no
         # half-held slot behind, so the runs of the groups that did fit are
         # released again when a later group does not fit (or raises).
+        #
+        # One deadline for the whole request-step: the budget is what a *step*
+        # may spend holding the engine thread, not what each bucket may spend
+        # on its own (a handful of buckets would otherwise stall the step for
+        # buckets x CAPTURE_POOL_WAIT_SECONDS while the slots trickle free).
+        deadline = time.monotonic() + CAPTURE_POOL_WAIT_SECONDS
         taken: List[Tuple[AttentionTransferGroup, List[int], Any, int]] = []
         withheld: Optional[AttentionTransferGroup] = None
         try:
@@ -1215,7 +1240,7 @@ class ConnectorWorker:
                 start = self._data_transfer.capture_blocks(
                     group,
                     [slots[i] for i in captureable],
-                    timeout=CAPTURE_POOL_WAIT_SECONDS,
+                    timeout=max(deadline - time.monotonic(), 0.0),
                 )
                 if start is None:
                     withheld = group

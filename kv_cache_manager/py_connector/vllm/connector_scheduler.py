@@ -716,8 +716,15 @@ class ConnectorScheduler:
         self._ingest_scheduled_reqs(scheduler_output)
         self._dispatch_incremental_saves(meta, scheduler_output)
         self._collect_load_instructions(meta)
-        self._collect_save_instructions(meta)
+        # Releases are collected *before* the saves of this batch: flushing a
+        # save hands its session to the worker and retires the protection that
+        # keeps other sessions' releases off its blocks (see
+        # _retire_session_protection), and a release queued earlier must still
+        # see that protection. The worker applies the releases after the plans
+        # of the batch have taken their captures, which is the other half of
+        # the same rule (see wait_for_save).
         self._collect_release_captures(meta)
+        self._collect_save_instructions(meta)
         self._collect_finish_instructions(meta)
         return meta
 
