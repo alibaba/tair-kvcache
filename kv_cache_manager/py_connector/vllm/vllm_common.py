@@ -1518,25 +1518,26 @@ def parse_groups(
                     idx,
                     len(group.layer_names),
                 )
-            else:
+            elif _is_engine_rebuilt_scratch(group.kv_cache_spec):
                 logger.warning(
-                    "skip %s group %d (%d layers): the class declares itself out "
-                    "of the prefix cache (prefix_cacheable=False and no slot "
-                    "mapping or no layer views), so the manager has nothing to "
-                    "serve; if this class is meant to be cached, name it in "
-                    "vllm_common.py instead",
+                    "skip %s group %d (%d layers): per-request compression ring, "
+                    "refilled by the engine for every request (not prefix KV)",
                     type(group.kv_cache_spec).__name__,
                     idx,
                     len(group.layer_names),
                 )
-            logger.warning(
-                "skip %s group %d (%d layers): %s; if this class is meant to "
-                "be cached, name it in vllm_common.py instead",
-                type(group.kv_cache_spec).__name__,
-                idx,
-                len(group.layer_names),
-                skip_reason,
-            )
+            else:
+                # The reason string carries the family: the engine replays a
+                # window (or the scratch contract names itself) -- either way
+                # the engine owns the rebuild and the group leaves the wire.
+                logger.warning(
+                    "skip %s group %d (%d layers): %s; if this class is meant to "
+                    "be cached, name it in vllm_common.py instead",
+                    type(group.kv_cache_spec).__name__,
+                    idx,
+                    len(group.layer_names),
+                    skip_reason,
+                )
             continue
         metas.extend(
             _parse_group(
