@@ -16,13 +16,20 @@ The gather/scatter kernel addresses host pinned memory over PCIe (UVA
 zero-copy), and state-group copies use plain ``copy_`` between the GPU tensors
 and the pinned slices -- no device-side staging buffer exists anywhere on the
 data path, so the connector competes with the engine for exactly zero HBM.
+
+Pinned host RAM is the connector's only meaningful footprint, so the staging
+arenas are sized *per staging shape* rather than per transfer bucket: buckets
+whose per-token geometry and element type agree share one arena
+(``plan_staging_pools``), which keeps the pinned total proportional to the
+transfer window instead of to the number of vLLM groups.
 """
 
 import threading
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -43,6 +50,10 @@ from kv_cache_manager.py_connector.vllm.transfer_types import (
     KVCacheInfo,
     TransferGroup,
 )
+from kv_cache_manager.py_connector.vllm.vllm_common import (
+    AttentionGroupMeta,
+    GroupMeta,
+)
 from kv_cache_manager.py_connector.kernel import batch_gather_scatter_helper
 
 
@@ -61,15 +72,18 @@ def _get_device_module(device: Optional[torch.device] = None) -> Any:
 
 
 class _StagingPool:
-    """Bounded, pre-allocated *pinned host* slots for one TransferGroup.
+    """Bounded, pre-allocated *pinned host* slots shared by same-shape buckets.
 
-    Save and load share one pool. The slots are both the SDK's I/O buffers
-    and the kernel's gather/scatter target: the strided kernel and plain
-    ``copy_`` read/write host pinned memory directly over PCIe (UVA
-    zero-copy), so the pool needs no device-side mirror and the connector
-    reserves zero HBM. An exhausted pool blocks the acquiring task --
-    backpressure -- instead of failing. Slots are handed out as *contiguous*
-    runs because the kernel view needs one piece of memory.
+    One pool serves every transfer bucket of one staging shape (see
+    ``plan_staging_pools``): the slots are both the SDK's I/O buffers and the
+    kernel's gather/scatter target -- the strided kernel and plain ``copy_``
+    read/write host pinned memory directly over PCIe (UVA zero-copy), so the
+    pool needs no device-side mirror and the connector reserves zero HBM. An
+    exhausted pool blocks the acquiring task -- backpressure -- instead of
+    failing. Slots are handed out as *contiguous* runs because the kernel view
+    needs one piece of memory; the slot is sized for the *largest* member block,
+    so a member with smaller blocks stages a dense prefix of the slots it
+    borrows (``cpu_view``) and never touches its neighbours' bytes.
 
     Slots are reused once their task reports. This is the historical
     origin/main behaviour: after an SDK timeout/error a background DMA may
@@ -103,8 +117,8 @@ class _StagingPool:
         if n > self.max_blocks:
             raise ValueError(
                 f"staging task of {n} blocks exceeds the pool capacity "
-                f"{self.max_blocks}; raise staging_pool_blocks or shrink "
-                f"block_per_save_task/block_per_load_task"
+                f"{self.max_blocks}; a task stages its whole batch as one run "
+                f"(see DataTransferManager.save_task_blocks)"
             )
         with self._cond:
             while True:
@@ -137,9 +151,23 @@ class _StagingPool:
             self._runs = merged
             self._cond.notify_all()
 
-    def cpu_view(self, start: int, n: int) -> torch.Tensor:
-        b = self.block_bytes
-        return self._cpu[start * b : (start + n) * b]
+    def cpu_view(
+        self, start: int, n: int, block_bytes: Optional[int] = None
+    ) -> torch.Tensor:
+        """Dense view of the ``n`` blocks of one borrowed run.
+
+        ``block_bytes`` is the borrowing bucket's block size and defaults to the
+        slot size (single-shape pools). A smaller block views only its dense
+        prefix of the run: the SDK buffers, the kernel view and the state copies
+        keep assuming one contiguous piece of memory per block.
+        """
+        b = self.block_bytes if block_bytes is None else block_bytes
+        if not 0 < b <= self.block_bytes:
+            raise ValueError(
+                f"block size {b} does not fit the pool's {self.block_bytes}-byte slots"
+            )
+        base = start * self.block_bytes
+        return self._cpu[base : base + n * b]
 
 
 class MultiResult:
@@ -170,19 +198,203 @@ class MultiResult:
                 self._callback(flat)
 
 
-def _effective_pool_blocks(
-    configured: int, need: int, block_bytes: int, max_bytes: int
-) -> int:
-    """Blocks per staging-pool group under the per-group pinned-RAM ceiling.
+@dataclass(frozen=True)
+class StagingShape:
+    """One transfer bucket's staging geometry: what the arenas key and size by.
 
-    min(configured, max_bytes // block_bytes), floored at one full task
-    batch: a task stages its whole batch contiguously, so the pool can never
-    be smaller than the batch -- even when the byte cap alone would say so
-    (the caller warns in that case). Pure so the sizing contract is
-    unit-pinnable.
+    ``per_token_bytes`` is one layer's bytes per token. A state bucket has no
+    tokens of its own, so its page bytes are normalized by the block's token
+    count -- that is what makes state and attention buckets comparable.
+    ``dtype`` is the element type the bucket's rows are read as. Two buckets
+    share an arena only when both components match, so an arena always serves
+    one row shape.
     """
-    by_bytes = max_bytes // block_bytes if block_bytes > 0 else configured
-    return max(need, min(configured, by_bytes))
+
+    per_token_bytes: int
+    dtype: Any
+    per_block_bytes: int
+
+    @property
+    def pool_key(self) -> Tuple[int, Any]:
+        return (self.per_token_bytes, self.dtype)
+
+
+@dataclass(frozen=True)
+class StagingPoolPlan:
+    """One pinned arena, shared by every bucket of the same staging shape.
+
+    ``slot_bytes`` is the arena's slot -- the largest member block. A member
+    stages its ``n`` blocks densely inside the ``n`` slots it borrows, so a
+    member with smaller blocks never touches its neighbours' bytes.
+    """
+
+    key: Tuple[int, Any]
+    slot_bytes: int
+    blocks: int
+    #: Indices, into the shapes the plan was built from, of the pooled buckets.
+    members: Tuple[int, ...]
+
+    @property
+    def pinned_bytes(self) -> int:
+        return self.slot_bytes * self.blocks
+
+
+def staging_shape(
+    group: TransferGroup, manager_block_size: int, kv_dtype: Any
+) -> StagingShape:
+    """One bucket's staging shape, from the worker's transfer groups.
+
+    Attention buckets derive the per-token size from their own block size
+    (``per_block_bytes`` is built as per-token * manager_block_size * layers,
+    see vllm_common.parse_groups) and carry their tensors' element type. State
+    buckets stage opaque bytes and take ``kv_dtype``: their key then matches an
+    attention bucket of the same per-token geometry, which is byte-compatible
+    (each member only ever writes its own dense block run) and keeps a hybrid
+    instance on a single arena.
+    """
+    if isinstance(group, AttentionTransferGroup):
+        return StagingShape(
+            per_token_bytes=group.per_block_bytes
+            // (manager_block_size * group.layer_num),
+            dtype=group.dtype,
+            per_block_bytes=group.per_block_bytes,
+        )
+    # parse_groups produces only attention/state buckets; ty cannot infer that
+    # the complement of AttentionTransferGroup is a StateTransferGroup.
+    page_size_bytes = group.page_size_bytes  # ty: ignore[unresolved-attribute]
+    return StagingShape(
+        per_token_bytes=page_size_bytes // group.block_size,
+        dtype=kv_dtype,
+        per_block_bytes=group.per_block_bytes,
+    )
+
+
+def group_meta_shape(meta: GroupMeta, kv_dtype: Any) -> StagingShape:
+    """The same shape from a GroupMeta (scheduler role, tests, e2e harness).
+
+    Attention and state pages both carry their per-token byte size directly, so
+    this needs no manager block size -- and it agrees exactly with
+    ``staging_shape``, which divides the worker's per-block size back out.
+    An attention bucket carries its own element type (the spec's dtype, which
+    the worker's staging view shares), so mixed-dtype instances keep the same
+    pool split as the runtime; the instance-wide ``kv_dtype`` is only the
+    state buckets' element type (they stage opaque bytes) and the fallback
+    for a meta built without one.
+    """
+    per_token_bytes = (
+        meta.page_bytes // meta.block_size
+        if isinstance(meta, AttentionGroupMeta)
+        else meta.page_size_bytes // meta.block_size  # ty: ignore[unresolved-attribute]
+    )
+    return StagingShape(
+        per_token_bytes=per_token_bytes,
+        dtype=getattr(meta, "dtype", None) or kv_dtype
+        if isinstance(meta, AttentionGroupMeta)
+        else kv_dtype,
+        per_block_bytes=meta.per_block_bytes,
+    )
+
+
+def _effective_pool_blocks(
+    configured_blocks: int, slot_bytes: int, max_bytes: int
+) -> int:
+    """Slots in one staging arena under the pinned-RAM ceiling.
+
+    min(configured_blocks, max_bytes // slot_bytes). The byte cap is a hard
+    budget: a cap that cannot pay for the configured slot count shrinks the pool
+    -- and the task batches riding on it (see
+    ``DataTransferManager.save_task_blocks``) -- instead of being breached, and
+    a cap smaller than a single slot fails engine start. Pure so the sizing
+    contract is unit-pinnable.
+    """
+    if slot_bytes <= 0:
+        raise ValueError("staging slot size must be positive")
+    if configured_blocks < 1:
+        raise ValueError("staging_pool_blocks must be at least 1")
+    by_cap = max_bytes // slot_bytes
+    if by_cap < 1:
+        raise ValueError(
+            f"staging_pool_max_bytes_per_group={max_bytes} is smaller than one "
+            f"{slot_bytes}-byte staging slot; raise the cap or shrink the block"
+        )
+    return min(configured_blocks, by_cap)
+
+
+def plan_staging_pools(
+    shapes: Sequence[StagingShape],
+    *,
+    configured_blocks: int,
+    max_bytes_per_pool: int,
+) -> List[StagingPoolPlan]:
+    """Group buckets by staging shape and size one pinned arena per shape.
+
+    Arenas follow the shape, not the bucket: every bucket with the same
+    per-token geometry and element type shares one. A sliding-window model's
+    n+1 vLLM groups (0.31 splits them stride-wise, so their layer counts differ)
+    collapse to one arena, and a hybrid instance's state and attention buckets
+    join whenever their per-token geometry agrees. Sharing only adds contention
+    -- an exhausted pool blocks, exactly as a per-bucket pool did -- while the
+    pinned total stops scaling with the group count.
+    """
+    order: List[Tuple[int, Any]] = []
+    slot_bytes: Dict[Tuple[int, Any], int] = {}
+    members: Dict[Tuple[int, Any], List[int]] = {}
+    for i, shape in enumerate(shapes):
+        key = shape.pool_key
+        if key not in members:
+            order.append(key)
+            members[key] = []
+            slot_bytes[key] = shape.per_block_bytes
+        else:
+            slot_bytes[key] = max(slot_bytes[key], shape.per_block_bytes)
+        members[key].append(i)
+    return [
+        StagingPoolPlan(
+            key=key,
+            slot_bytes=slot_bytes[key],
+            blocks=_effective_pool_blocks(
+                configured_blocks, slot_bytes[key], max_bytes_per_pool
+            ),
+            members=tuple(members[key]),
+        )
+        for key in order
+    ]
+
+
+def total_pinned_bytes(plans: Sequence[StagingPoolPlan]) -> int:
+    """Pinned host bytes of one instance's staging arenas.
+
+    The connector's whole pinned footprint, from the same plans the arenas are
+    built from -- the e2e/kvperf pinned gates recompute it from the model's
+    group metas (``group_meta_shape``) and compare it with the logged total.
+    """
+    return sum(plan.pinned_bytes for plan in plans)
+
+
+def group_meta_pinned_bytes(
+    group_metas: Sequence[GroupMeta],
+    kv_dtype: Any,
+    *,
+    configured_blocks: int,
+    max_bytes_per_pool: int,
+) -> int:
+    """The pinned total of a model whose buckets are known as GroupMetas.
+
+    The number the worker's ``DataTransferManager`` logs as ``total pinned``
+    for the same configuration, for models whose buckets share one element
+    type (every model the connector accepts today); the single ``kv_dtype``
+    argument cannot express a per-bucket dtype split. It derives the same
+    shapes from the group structure (see ``staging_shape``), so an e2e or
+    kvperf gate can assert a budget -- on whichever role view it has --
+    instead of re-deriving the sizing.
+    """
+    return total_pinned_bytes(
+        plan_staging_pools(
+            [group_meta_shape(meta, kv_dtype) for meta in group_metas],
+            configured_blocks=configured_blocks,
+            max_bytes_per_pool=max_bytes_per_pool,
+        )
+    )
 
 
 class DataTransferManager:
@@ -203,56 +415,61 @@ class DataTransferManager:
         self._save_stream = self._device_mod.Stream()
         self._load_stream = self._device_mod.Stream()
 
-        pool_blocks = extra_config.staging_pool_blocks
-        need = max(extra_config.block_per_save_task, extra_config.block_per_load_task)
-        if pool_blocks < need:
-            raise ValueError(
-                f"staging_pool_blocks={pool_blocks} is smaller than the "
-                f"largest task batch ({need}); one task stages its whole "
-                f"batch contiguously, so the pool must cover it -- raise "
-                f"staging_pool_blocks or shrink block_per_save_task/"
-                f"block_per_load_task"
-            )
-        # One pool per group: block shapes differ between attention and state
-        # groups. The pool is pinned host memory only -- the kernel reaches it
-        # over PCIe -- so the connector's device-memory footprint is zero.
-        # The byte cap keeps the configured block count honest for groups
-        # with large blocks (hybrid state/attention blocks are ~17.3 MiB vs
-        # ~0.875 MiB for full attention): the same count would otherwise pin
-        # ~17 GiB of host RAM per group and engine start dies in the pinned
-        # allocator.
-        self._pools = {}
-        for g in kvcache_info.groups:
-            blocks = _effective_pool_blocks(
-                pool_blocks,
-                need,
-                g.per_block_bytes,
-                extra_config.staging_pool_max_bytes_per_group,
-            )
-            if blocks < pool_blocks:
-                logger.warning(
-                    "staging pool %s: %d blocks x %d bytes would pin "
-                    "%.1f GiB; capped to %d blocks (%.1f MiB) by "
-                    "staging_pool_max_bytes_per_group=%d",
-                    g.spec_name,
-                    pool_blocks,
-                    g.per_block_bytes,
-                    pool_blocks * g.per_block_bytes / 2**30,
-                    blocks,
-                    blocks * g.per_block_bytes / 2**20,
-                    extra_config.staging_pool_max_bytes_per_group,
-                )
-            self._pools[g.spec_name] = _StagingPool(
-                self._device, g.per_block_bytes, blocks
-            )
-        for name, pool in self._pools.items():
+        # One pinned arena per *staging shape*, shared by every bucket that has
+        # it (see plan_staging_pools). The arena is pinned host memory only --
+        # the kernel reaches it over PCIe -- so the connector's device-memory
+        # footprint is zero, while the pinned total is bounded by the byte cap
+        # per shape instead of growing with the number of vLLM groups.
+        shapes = [
+            staging_shape(g, manager_block_size, kvcache_info.dtype)
+            for g in kvcache_info.groups
+        ]
+        plans = plan_staging_pools(
+            shapes,
+            configured_blocks=extra_config.staging_pool_blocks,
+            max_bytes_per_pool=extra_config.staging_pool_max_bytes_per_group,
+        )
+        self._pools: Dict[str, _StagingPool] = {}
+        save_batch = extra_config.block_per_save_task
+        load_batch = extra_config.block_per_load_task
+        for plan in plans:
+            pool = _StagingPool(self._device, plan.slot_bytes, plan.blocks)
+            names = [kvcache_info.groups[i].spec_name for i in plan.members]
+            for name in names:
+                self._pools[name] = pool
             logger.info(
-                "staging pool %s: %d blocks x %d bytes (pinned %.1f MiB, GPU 0)",
-                name,
-                pool.max_blocks,
-                pool.block_bytes,
-                pool.max_blocks * pool.block_bytes / 2**20,
+                "staging pool per_token=%dB dtype=%s: %d blocks x %d bytes "
+                "(pinned %.1f MiB) shared by %d group(s): %s",
+                plan.key[0],
+                plan.key[1],
+                plan.blocks,
+                plan.slot_bytes,
+                plan.pinned_bytes / 2**20,
+                len(names),
+                ",".join(names),
             )
+            fitting = (min(save_batch, plan.blocks), min(load_batch, plan.blocks))
+            if fitting != (save_batch, load_batch):
+                logger.info(
+                    "staging pool per_token=%dB dtype=%s: task batches shrink to "
+                    "save %d / load %d blocks (configured %d / %d) to fit the pool",
+                    plan.key[0],
+                    plan.key[1],
+                    fitting[0],
+                    fitting[1],
+                    save_batch,
+                    load_batch,
+                )
+        pinned_total = total_pinned_bytes(plans)
+        logger.info(
+            "total pinned = %.3f GiB across %d %s / %d %s (%d bytes)",
+            pinned_total / 2**30,
+            len(plans),
+            "shape" if len(plans) == 1 else "shapes",
+            len(kvcache_info.groups),
+            "group" if len(kvcache_info.groups) == 1 else "groups",
+            pinned_total,
+        )
 
         def _init_worker() -> None:
             self._device_mod.set_device(self._device)
@@ -265,6 +482,23 @@ class DataTransferManager:
         self, func: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Future:
         return self._io_executor.submit(func, *args, **kwargs)
+
+    def save_task_blocks(self, group: TransferGroup) -> int:
+        """Blocks per save task for this bucket: the configured batch, shrunk to
+        the bucket's (shared) arena. A task stages its whole batch as one
+        contiguous run, so it can never outgrow the pool -- the granularity
+        yields, the pinned budget does not."""
+        return min(
+            self._extra_config.block_per_save_task,
+            self._pools[group.spec_name].max_blocks,
+        )
+
+    def load_task_blocks(self, group: TransferGroup) -> int:
+        """Load-side twin of ``save_task_blocks``."""
+        return min(
+            self._extra_config.block_per_load_task,
+            self._pools[group.spec_name].max_blocks,
+        )
 
     def _attn_staging_view(
         self, cpu_buffer: torch.Tensor, group: AttentionTransferGroup, batch: int
@@ -483,7 +717,9 @@ class DataTransferManager:
         pool = self._pools[group.spec_name]
         start = pool.acquire(len(valid))
         try:
-            cpu_buffer = pool.cpu_view(start, len(valid))
+            # The arena's slots serve the largest member block, so this
+            # bucket's batch is a dense prefix of the run it borrowed.
+            cpu_buffer = pool.cpu_view(start, len(valid), group.per_block_bytes)
             with self._device_mod.stream(self._save_stream):
                 # Gather straight into the pinned host slot: the kernel
                 # (attention) and copy_ (state) write host pinned memory
@@ -640,7 +876,8 @@ class DataTransferManager:
         pool = self._pools[group.spec_name]
         start = pool.acquire(len(valid))
         try:
-            cpu_buffer = pool.cpu_view(start, len(valid))
+            # Dense prefix of the borrowed run, as in the save path.
+            cpu_buffer = pool.cpu_view(start, len(valid), group.per_block_bytes)
             buffers = self._make_block_buffers(
                 cpu_buffer.data_ptr(), group.per_block_bytes, len(valid)
             )
