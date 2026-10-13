@@ -1048,8 +1048,10 @@ class TestBuildConnectorMeta(unittest.TestCase):
         # computed here, in the scheduler loop, and handed to the http thread:
         # they are read off vLLM's block table, which later steps mutate.
         self.assertEqual(
-            args[1:], ("r0", list(range(32)), 2, [True, True], [True, True])
+            args[1:-1], ("r0", list(range(32)), 2, [True, True], [True, True])
         )
+        # ... plus the session id the release guard keys this announcement by.
+        self.assertIsInstance(args[-1], int)
         self.assertEqual(conn._tracked["r0"].has_saved_block_num, 2)
 
     def test_load_request_emitted_after_alloc(self):

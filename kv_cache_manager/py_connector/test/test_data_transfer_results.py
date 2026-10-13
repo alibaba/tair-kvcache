@@ -968,12 +968,13 @@ class TestDataTransferManagerPools(unittest.TestCase):
         # The other shape is capped by its own slot size: 16 KiB / 512 B.
         self.assertEqual(dtm._pools["tp0_g3"].max_blocks, 16)
 
-    def test_the_reserve_never_takes_the_whole_arena(self):
+    def test_the_reserve_leaves_room_for_a_capture_batch(self):
         # The review's shape: a 62-slot arena with the default 128-block
         # batches used to reserve all 62 slots, so every eager capture timed
-        # out and windowed caching was silently disabled. One slot stays with
-        # the captures and the task batch is capped to the reserve, so a task
-        # can still always start.
+        # out and windowed caching was silently disabled. The arena is split in
+        # half instead: a step that completes 16 blocks (a chunked prefill)
+        # asks for one contiguous run of 16 and must get it, while a whole task
+        # batch still starts behind it.
         groups = self._groups()
         dtm = self._dtm(
             groups,
@@ -983,18 +984,18 @@ class TestDataTransferManagerPools(unittest.TestCase):
         )
         pool = dtm._pools["tp0_g0"]
         self.assertEqual(pool.max_blocks, 62)
-        self.assertEqual(pool.reserved_blocks, 61)
-        self.assertEqual(dtm.save_task_blocks(groups[0]), 61)
-        self.assertEqual(dtm.load_task_blocks(groups[0]), 61)
+        self.assertEqual(pool.reserved_blocks, 31)
+        self.assertEqual(dtm.save_task_blocks(groups[0]), 31)
+        self.assertEqual(dtm.load_task_blocks(groups[0]), 31)
         del groups
-        # A capture can still borrow a slot ...
-        capture = pool.acquire(1, keep_reserved=True)
+        # A realistic capture batch of 16 blocks fits in one run ...
+        capture = pool.acquire(16, keep_reserved=True)
         self.assertIsNotNone(capture)
-        # ... and a whole task batch still starts while it holds one.
-        task = pool.acquire(61)
+        # ... and a whole task batch still starts while it holds it.
+        task = pool.acquire(31)
         self.assertIsNotNone(task)
-        pool.release(capture, 1)
-        pool.release(task, 61)
+        pool.release(capture, 16)
+        pool.release(task, 31)
         self.assertEqual(pool.free_blocks, 62)
 
     def test_task_batch_shrinks_to_the_pool(self):
@@ -1007,13 +1008,13 @@ class TestDataTransferManagerPools(unittest.TestCase):
             staging_pool_max_bytes_per_group=3 * 4096,  # 3 slots, not 8
         )
         # The cap buys 3 slots; a task stages its whole batch as one contiguous
-        # run, so both directions shrink to that pool's transfer reserve (3 slots
-        # minus the one slot the eager capture always keeps: a batch that only
-        # fit the shared part could not start while captures hold it).
-        self.assertEqual(dtm.save_task_blocks(groups[0]), 2)
-        self.assertEqual(dtm.load_task_blocks(groups[0]), 2)
-        self.assertEqual(dtm._pools["tp0_g0"].reserved_blocks, 2)
-        self.assertEqual(dtm.save_task_blocks(groups[3]), 7)  # other shape
+        # run, so both directions shrink to that pool's transfer reserve (half
+        # the arena: a batch that only fit the shared part could not start
+        # while captures hold it).
+        self.assertEqual(dtm.save_task_blocks(groups[0]), 1)
+        self.assertEqual(dtm.load_task_blocks(groups[0]), 1)
+        self.assertEqual(dtm._pools["tp0_g0"].reserved_blocks, 1)
+        self.assertEqual(dtm.save_task_blocks(groups[3]), 4)  # other shape
 
     def test_the_transfer_reserve_is_the_largest_task_batch(self):
         from kv_cache_manager.py_connector.common.logger import logger
@@ -1032,9 +1033,10 @@ class TestDataTransferManagerPools(unittest.TestCase):
         )
         shared = dtm._pools["tp0_g0"]
         self.assertEqual(shared.max_blocks, 4)
-        # One slot short of the whole arena: captures always keep one.
-        self.assertEqual(shared.reserved_blocks, 3)
-        self.assertEqual(dtm.save_task_blocks(groups[0]), 3)
+        # Half the arena goes to captures, and the task batch is capped to the
+        # reserve so it can always start.
+        self.assertEqual(shared.reserved_blocks, 2)
+        self.assertEqual(dtm.save_task_blocks(groups[0]), 2)
         # Never the whole arena: the shared part must keep at least one slot, or
         # a capture could not run at all (it would fail closed, but silently).
         tiny = self._dtm(

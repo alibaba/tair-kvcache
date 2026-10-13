@@ -532,13 +532,18 @@ class DataTransferManager:
         # <= the configured batch (a 128-block arena with the default 128-block
         # batches, or a byte-capped shape) would otherwise leave the capture
         # side with zero slots and silently disable windowed caching for an
-        # otherwise valid configuration. One slot is always left for captures
-        # (and, symmetrically, the task batch is capped to the reserve), except
-        # in a single-slot arena, where captures and tasks cannot coexist: there
-        # the slot stays with the tasks and captures are off (logged).
+        # otherwise valid configuration. The arena is split in half instead
+        # (capped by the task batch): the eager capture asks for the whole
+        # span of a step's completed blocks in *one* contiguous run and cannot
+        # split it, so one leftover slot would still time out every step that
+        # completes two or more blocks -- a 62-slot arena leaves 31 for
+        # captures, which covers a 16-block chunked-prefill step. The task
+        # batch is capped to the reserve, so a task can always start. Only in a
+        # single-slot arena, where the two cannot coexist, does the slot stay
+        # with the tasks (captures off, logged).
         for plan in plans:
             task_batch = min(max(save_batch, load_batch), plan.blocks)
-            reserved = task_batch if plan.blocks == 1 else min(task_batch, plan.blocks - 1)
+            reserved = task_batch if plan.blocks == 1 else min(task_batch, plan.blocks // 2)
             pool = _StagingPool(
                 self._device,
                 plan.slot_bytes,
