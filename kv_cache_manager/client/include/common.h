@@ -78,6 +78,44 @@ struct LocationSpecUnit {
 using Location = std::vector<LocationSpecUnit>; // one block key may have multiple location_specs
 using Locations = std::vector<Location>;
 using UriStrVec = std::vector<std::string>;
+
+// Values match MetaService's wire enums. Keep storage identity when querying
+// by backend; an event-report URI is not a TransferClient payload address.
+enum class StorageType : int32_t {
+    ST_UNSPECIFIED = 0,
+    ST_3FS = 1,
+    ST_MOONCAKE = 2,
+    ST_TAIRMEMPOOL = 3,
+    ST_NFS = 4,
+    ST_VCNS_3FS = 5,
+    ST_DUMMY = 6,
+    ST_EVENT_REPORT_L1P5 = 7,
+    ST_EVENT_REPORT_L2 = 8,
+    ST_TAIRMEMPOOL_SSD = 9,
+};
+
+enum class BackendSelectStrategy : int32_t {
+    LSS_UNSPECIFIED = 0,
+    LSS_V6D_PREFIX = 1,
+    LSS_V6D_COVERAGE = 2,
+    LSS_WEIGHTED_RANDOM = 3,
+};
+
+struct BackendLocation {
+    StorageType type{StorageType::ST_UNSPECIFIED};
+    int32_t spec_size{0};
+    Location location_specs;
+};
+// Positional by input key, including masked keys and misses.
+using BackendLocations = std::vector<std::vector<BackendLocation>>;
+
+struct HostCacheMatch {
+    std::string host_ip_port;
+    int64_t local{0};
+    int64_t p2p_1_fetch{0};
+    int64_t p2p_1_total_match{0};
+};
+using HostCacheState = std::vector<HostCacheMatch>;
 struct Metas {
     Locations locations;
     std::vector<std::string> metas;
