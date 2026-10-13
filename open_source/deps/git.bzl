@@ -191,6 +191,13 @@ def git_deps():
         patch_args = ["-p1"],
     )
 
+    # Only fetched when mooncake is built with --config=efa.
+    native.new_local_repository(
+        name = "libfabric",
+        path = "/opt/amazon/efa",
+        build_file = clean_dep("//3rdparty/libfabric:libfabric.BUILD"),
+    )
+
     http_archive(
         name = "curl",
         build_file = clean_dep("//3rdparty/curl:curl.BUILD"),

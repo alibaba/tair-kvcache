@@ -25,6 +25,11 @@ config_setting(
 )
 
 config_setting(
+    name = "enable_efa",
+    values = {"define": "MOONCAKE_USE_EFA=true"},
+)
+
+config_setting(
     name = "enable_ascend",
     values = {"define": "MOONCAKE_USE_ASCEND=true"},
 )
@@ -211,9 +216,17 @@ cc_library(
     }) + select({
         ":enable_nvmeof": glob(["mooncake-transfer-engine/src/transport/nvmeof_transport/**/*.cpp"]),
         "//conditions:default": [],
+    }) + select({
+        ":enable_efa": glob(["mooncake-transfer-engine/src/transport/efa_transport/**/*.cpp"]),
+        "//conditions:default": [],
     }),
     hdrs = glob(["mooncake-transfer-engine/include/**/*.h"]),
-    defines = ["YLT_ENABLE_IBV"],
+    # USE_EFA changes TransferMetadata::HandShakeDesc layout, so it must reach
+    # every dependent (defines), not just the files compiled here (copts).
+    defines = ["YLT_ENABLE_IBV"] + select({
+        ":enable_efa": ["USE_EFA"],
+        "//conditions:default": [],
+    }),
     includes = [
         "mooncake-transfer-engine/include",
         "mooncake-transfer-engine/src/shared_segment",
@@ -230,6 +243,9 @@ cc_library(
         "//conditions:default": [],
     }) + select({
         ":enable_http": ["@curl//:curl"],
+        "//conditions:default": [],
+    }) + select({
+        ":enable_efa": ["@libfabric//:libfabric"],
         "//conditions:default": [],
     }),
     linkopts = [
