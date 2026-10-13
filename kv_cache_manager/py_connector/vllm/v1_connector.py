@@ -152,21 +152,30 @@ def _packs_pages_inside_blocks(vllm_config: "VllmConfig") -> bool:
 def _resolved_architecture(
     architectures: "list[str]", model_config: Any
 ) -> Optional[str]:
-    """The architecture vLLM's model registry selects for this config.
+    """The architecture vLLM resolved for this config, without loading it.
 
-    Mirrors the engine's own resolution (``ModelRegistry.resolve_model_cls``
-    picks the first entry it supports) so the layout predicate and the engine
-    can never disagree about which implementation runs."""
+    ``ModelConfig`` records the pick in ``architecture`` (the engine resolves
+    it before any connector hook runs), so reading that field mirrors the
+    engine's choice exactly. Eras or stub configs without the field fall
+    back to the registry's supported-name list -- a name check only:
+    ``resolve_model_cls`` would *import* the model class, initializing CUDA
+    in the parent process before workers fork. Unresolvable reads as None:
+    not evidence of a packed-block model, so the standard layout is kept and
+    a really packed model fails registration with the layout assertion (the
+    safe direction)."""
+    resolved = getattr(model_config, "architecture", None)
+    if isinstance(resolved, str) and resolved in architectures:
+        return resolved
     try:
         from vllm.model_executor.models.registry import ModelRegistry
 
-        _, resolved = ModelRegistry.resolve_model_cls(architectures, model_config)
-        return resolved
+        supported = set(ModelRegistry.get_supported_archs())
     except Exception:
-        # An unresolvable list is not evidence of a packed-block model;
-        # refusing to guess keeps the standard layout (and a really packed
-        # model fails registration with the layout assertion).
         return None
+    for architecture in architectures:
+        if architecture in supported:
+            return architecture
+    return None
 
 
 class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
