@@ -275,6 +275,11 @@ def group_meta_shape(meta: GroupMeta, kv_dtype: Any) -> StagingShape:
     Attention and state pages both carry their per-token byte size directly, so
     this needs no manager block size -- and it agrees exactly with
     ``staging_shape``, which divides the worker's per-block size back out.
+    An attention bucket carries its own element type (the spec's dtype, which
+    the worker's staging view shares), so mixed-dtype instances keep the same
+    pool split as the runtime; the instance-wide ``kv_dtype`` is only the
+    state buckets' element type (they stage opaque bytes) and the fallback
+    for a meta built without one.
     """
     per_token_bytes = (
         meta.page_bytes // meta.block_size
@@ -283,7 +288,9 @@ def group_meta_shape(meta: GroupMeta, kv_dtype: Any) -> StagingShape:
     )
     return StagingShape(
         per_token_bytes=per_token_bytes,
-        dtype=kv_dtype,
+        dtype=getattr(meta, "dtype", None) or kv_dtype
+        if isinstance(meta, AttentionGroupMeta)
+        else kv_dtype,
         per_block_bytes=meta.per_block_bytes,
     )
 
