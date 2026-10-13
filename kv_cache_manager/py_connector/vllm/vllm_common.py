@@ -1066,8 +1066,12 @@ def _skip_reason(spec: Any) -> Optional[str]:
     """
     members = (
         list(spec.kv_cache_specs.values())
+        # Exact type, like every other spec receipt in this file: a wrapper
+        # *subclass* is a new claim about its own layout, so it must reach the
+        # gate (which refuses it by name) instead of being unwrapped here and
+        # skipped member by member.
         if UniformTypeKVCacheSpecs is not None
-        and isinstance(spec, UniformTypeKVCacheSpecs)
+        and type(spec) is UniformTypeKVCacheSpecs
         else [spec]
     )
     if members and all(_is_replayed_window(member) for member in members):

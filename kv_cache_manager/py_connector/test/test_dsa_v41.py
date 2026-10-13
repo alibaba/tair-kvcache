@@ -327,6 +327,55 @@ class TestReplaySkipIsExactType(unittest.TestCase):
         self.assertIn("ReplayedSWASub", str(ctx.exception))
         self.assertIn("bounded_replay", str(ctx.exception))
 
+    def test_a_wrapper_subclass_is_refused_not_unwrapped(self):
+        # The skip families unpack a packed wrapper member by member, and that
+        # unpacking is exact-type matched: a wrapper *subclass* is a new claim
+        # about its own layout, so it must reach the gate (which refuses it by
+        # name) instead of being skipped because its members happen to look
+        # like engine-rebuilt scratch.
+        from vllm.v1.kv_cache_interface import (
+            CircularBufferSpec,
+            FullAttentionSpec,
+            SlidingWindowMLASpec,
+            UniformTypeKVCacheSpecs,
+        )
+
+        class MyWrapper(UniformTypeKVCacheSpecs):
+            pass
+
+        member = SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype="uint8",
+            sliding_window=128,
+            cache_dtype_str="fp8_ds_mla",
+            model_version="deepseek_v4",
+            bounded_replay=True,
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            _parse([_group(MyWrapper(64, {"l0": member}))], 64)
+        self.assertIn("MyWrapper", str(ctx.exception))
+
+        # The exact wrapper of replayed members is still skipped (the engine
+        # rebuilds those rows), and so is the exact ring.
+        companion = _group(
+            FullAttentionSpec(
+                block_size=64,
+                num_kv_heads=2,
+                head_size=64,
+                dtype="bfloat16",
+                page_size_bytes=2048,
+            ),
+            layers=("l9",),
+        )
+        for spec in (
+            UniformTypeKVCacheSpecs(64, {"l0": member}),
+            CircularBufferSpec(block_size=64, page_size_bytes=2048),
+        ):
+            metas = _parse([_group(spec), companion], 64)
+            self.assertEqual([1], [m.group_idx for m in metas])
+
     def test_the_base_class_is_still_skipped(self):
         from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
 
