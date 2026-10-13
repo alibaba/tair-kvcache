@@ -1667,6 +1667,78 @@ TEST_F(MetaStorageBackendManagerTest, TestListKeysAndRandomSample) {
     ASSERT_EQ(EC_OK, mgr.Close());
 }
 
+TEST_F(MetaStorageBackendManagerTest, TestListKeysKeepsBackendAcrossRecoveryTransition) {
+    class ScanBackend : public MetaLocalBackend {
+    public:
+        struct Page {
+            std::string cursor;
+            std::string next_cursor;
+            KeyTypeVec keys;
+        };
+
+        explicit ScanBackend(std::vector<Page> pages) : pages_(std::move(pages)) {}
+
+        ErrorCode ListKeys(RequestContext *,
+                           const std::string &cursor,
+                           int64_t,
+                           std::string &out_next_cursor,
+                           KeyTypeVec &out_keys) noexcept override {
+            if (page_index_ == pages_.size() || cursor != pages_[page_index_].cursor) {
+                return EC_BADARGS;
+            }
+            const auto &page = pages_[page_index_++];
+            out_next_cursor = page.next_cursor;
+            out_keys = page.keys;
+            return EC_OK;
+        }
+
+        size_t page_index() const { return page_index_; }
+
+    private:
+        std::vector<Page> pages_;
+        size_t page_index_ = 0;
+    };
+
+    for (const std::string redis_cursor : {"1", "999999"}) {
+        SCOPED_TRACE(redis_cursor);
+        MetaStorageBackendManager mgr;
+        auto persistent = std::make_unique<ScanBackend>(std::vector<ScanBackend::Page>{
+            {SCAN_BASE_CURSOR, redis_cursor, {11}}, {redis_cursor, SCAN_BASE_CURSOR, {12}}});
+        auto cache = std::make_unique<ScanBackend>(
+            std::vector<ScanBackend::Page>{{SCAN_BASE_CURSOR, "1", {21}}, {"1", SCAN_BASE_CURSOR, {22}}});
+        auto *persistent_ptr = persistent.get();
+        auto *cache_ptr = cache.get();
+        mgr.persistent_backend_ = std::move(persistent);
+        mgr.cache_backend_ = std::move(cache);
+        mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+
+        std::string cursor = SCAN_BASE_CURSOR;
+        std::string next_cursor;
+        KeyTypeVec keys;
+        ASSERT_EQ(EC_OK, mgr.ListKeys(nullptr, cursor, 1, next_cursor, keys));
+        EXPECT_EQ(KeyTypeVec{11}, keys);
+        EXPECT_EQ("p:" + redis_cursor, next_cursor);
+
+        mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+        cursor = std::move(next_cursor);
+        ASSERT_EQ(EC_OK, mgr.ListKeys(nullptr, cursor, 1, next_cursor, keys));
+        EXPECT_EQ(KeyTypeVec{12}, keys);
+        EXPECT_EQ(SCAN_BASE_CURSOR, next_cursor);
+        EXPECT_EQ(2u, persistent_ptr->page_index());
+        EXPECT_EQ(0u, cache_ptr->page_index());
+
+        cursor = std::move(next_cursor);
+        ASSERT_EQ(EC_OK, mgr.ListKeys(nullptr, cursor, 1, next_cursor, keys));
+        EXPECT_EQ(KeyTypeVec{21}, keys);
+        EXPECT_EQ("c:1", next_cursor);
+        cursor = std::move(next_cursor);
+        ASSERT_EQ(EC_OK, mgr.ListKeys(nullptr, cursor, 1, next_cursor, keys));
+        EXPECT_EQ(KeyTypeVec{22}, keys);
+        EXPECT_EQ(SCAN_BASE_CURSOR, next_cursor);
+        EXPECT_EQ(2u, cache_ptr->page_index());
+    }
+}
+
 TEST_F(MetaStorageBackendManagerTest, TestGroupLruMaintenanceViewDuringAndAfterRecovery) {
     MetaStorageBackendManager mgr;
     mgr.persistent_backend_ = std::make_unique<MetaLocalBackend>();

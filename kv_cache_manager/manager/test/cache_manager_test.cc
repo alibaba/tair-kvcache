@@ -1323,6 +1323,61 @@ TEST_F(CacheManagerTest, TestRemoveInstanceTrimsAllPersistedDummyPages) {
     EXPECT_TRUE(remaining.empty());
 }
 
+TEST_F(CacheManagerTest, TestRemoveInstanceDuringMetaRecoveryTransition) {
+    class TransitioningScanBackend : public MetaLocalBackend {
+    public:
+        TransitioningScanBackend(MetaStorageBackendManager &manager, bool &transitioned)
+            : manager_(manager), transitioned_(transitioned) {}
+
+        ErrorCode ListKeys(RequestContext *context,
+                           const std::string &cursor,
+                           int64_t limit,
+                           std::string &next_cursor,
+                           KeyTypeVec &keys) noexcept override {
+            if (cursor == "999999") {
+                return MetaLocalBackend::ListKeys(context, saved_cursor_, limit, next_cursor, keys);
+            }
+            const ErrorCode ec = MetaLocalBackend::ListKeys(context, cursor, limit, next_cursor, keys);
+            if (ec == EC_OK && !transitioned_ && cursor == SCAN_BASE_CURSOR && next_cursor != SCAN_BASE_CURSOR) {
+                saved_cursor_ = next_cursor;
+                next_cursor = "999999";
+                manager_.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+                transitioned_ = true;
+            }
+            return ec;
+        }
+
+    private:
+        MetaStorageBackendManager &manager_;
+        bool &transitioned_;
+        std::string saved_cursor_;
+    };
+
+    auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    auto &backend_manager = *indexer->backend_manager_;
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    bool transitioned = false;
+    auto persistent = std::make_unique<TransitioningScanBackend>(backend_manager, transitioned);
+    auto cache = std::make_unique<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, persistent->Init("test_instance", config));
+    ASSERT_EQ(EC_OK, persistent->Open());
+    ASSERT_EQ(EC_OK, cache->Init("test_instance", config));
+    ASSERT_EQ(EC_OK, cache->Open());
+    ASSERT_EQ(EC_OK, backend_manager.persistent_backend_->Close());
+    backend_manager.persistent_backend_ = std::move(persistent);
+    backend_manager.cache_backend_ = std::move(cache);
+    backend_manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    indexer.reset();
+
+    AddDummyLocationsForTrim(1024, "hot_01");
+    RequestContext context("remove_during_meta_recovery_transition");
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(&context, "default", "test_instance"));
+    EXPECT_TRUE(transitioned);
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance"));
+}
+
 // RemoveInstance 的 per-instance draining 不得读写全局 Reclaimer pause 状态。
 // Registry stub 在 drain 与删除的边界观察中间状态：false 场景验证删除 A 不会暂停
 // 其他 instance；true 场景验证错误返回不会 Resume 掉 Server 生命周期的既有暂停。
