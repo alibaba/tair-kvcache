@@ -23,6 +23,7 @@ tests the decision logic, the mock harness proves the bytes.
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any, List, Optional
@@ -528,6 +529,156 @@ class TestWindowedSpecGroups(unittest.TestCase):
             "the retry must claim the window its captured bytes cover",
         )
 
+    def test_a_concurrent_session_keeps_its_captures(self):
+        # Two write sessions of one request overlap. Session A announced 16
+        # blocks and its response allocated them, so its write task is pending;
+        # session B announced 32 and the manager reports blocks 0-15 as
+        # "already having a location" -- that is *A's in-flight allocation*,
+        # not committed bytes. Releasing A's captures there makes its write
+        # fail with "16/16 announced blocks have no captured bytes" and the
+        # request's head is lost for good (later sessions see the blocks as
+        # existing and never capture them again).
+        g0 = windowed_group("tp0_g0", group_idx=0)
+        g1 = windowed_group("tp0_g1", group_idx=1)
+        pool = _StagingPool(torch.device("cpu"), g0.per_block_bytes, 128)
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {"tp0_g0": pool, "tp0_g1": pool}  # same shape: one pool
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        dtm._extra_config = SimpleNamespace(
+            block_per_save_task=128, block_per_load_task=128
+        )
+        dtm._io_executor = ThreadPoolExecutor(max_workers=2)
+        conn = worker_with([g0, g1], dtm)
+        conn._pending_saves = {}
+        conn._device_mod = MagicMock()
+        with mock.patch(
+            "kv_cache_manager.py_connector.vllm.data_transfer.batch_gather_scatter_helper"
+        ):
+            conn._capture_request(
+                CaptureRequest(
+                    "r0",
+                    list(range(32)),
+                    all_block_ids=[list(range(7, 39)), list(range(7, 39))],
+                )
+            )
+        plans = []
+        real_plan = conn._plan_group_transfers
+
+        def spy(*args, **kwargs):
+            result = real_plan(*args, **kwargs)
+            if kwargs.get("for_save"):
+                plans.append(result)
+            return result
+
+        conn._plan_group_transfers = spy
+
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=1
+        )
+
+        def locations_for(blocks, session):
+            return [
+                {
+                    "block_idxes": [block],
+                    "location_specs": [
+                        {"name": "tp0_g0", "uri": f"{session}_{block}"},
+                        {"name": "tp0_g1", "uri": f"{session}_{block}_b"},
+                    ],
+                }
+                for block in blocks
+            ]
+
+        # A: announces 16 blocks, the manager wants all of them written.
+        sched._manager_client.start_write_cache.return_value = {
+            "locations": locations_for(range(16), "sA"),
+            "write_session_id": "sA",
+            "block_mask": {"offset": 0},
+        }
+        sched._record_announcement("r0", 16)
+        sched.start_save_kvcache_async(
+            "r0", list(range(16 * MBS)), 16, [True] * 16, [True] * 16
+        )
+        # B: announces 32, and blocks 0-15 come back as existing (A's in-flight
+        # allocation); only 16-31 need writing.
+        sched._manager_client.start_write_cache.return_value = {
+            "locations": locations_for(range(16, 32), "sB"),
+            "write_session_id": "sB",
+            "block_mask": {"offset": 16},
+        }
+        sched._record_announcement("r0", 32)
+        sched.start_save_kvcache_async(
+            "r0", list(range(32 * MBS)), 32, [True] * 32, [True] * 32
+        )
+
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(meta)
+        # Nothing may be released: session A still has to write 0-15.
+        self.assertEqual([], meta.to_release_captures)
+        # ... and with nothing released, A's write finds all 16 of its blocks.
+        meta.add_save_request(
+            SaveRequest(
+                req_id="r0",
+                target_locations=locations_for(range(16), "sA"),
+                manager_block_idxes=list(range(16)),
+                write_session_id="sA",
+                all_block_ids=[list(range(7, 39)), list(range(7, 39))],
+            )
+        )
+        conn.wait_for_save(meta)
+        # One call, one plan per bucket: every one of A's 16 blocks must still
+        # have its captured bytes.
+        per_group = [plan for call in plans for plan in call]
+        self.assertEqual(2, len(per_group))
+        for plan in per_group:
+            self.assertEqual(16, len(plan.staged_slots))
+            self.assertNotIn(
+                None,
+                plan.staged_slots,
+                "the concurrent session's release stripped A's captured bytes",
+            )
+        # A's writes landed and their slots came back; B's 16 blocks (2
+        # buckets) are still captured for the session that has not run yet.
+        deadline = time.time() + 5
+        while pool.free_blocks != 96 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(96, pool.free_blocks)
+
+    def test_an_unanswered_announcement_protects_its_blocks(self):
+        # The same guard has to cover a session whose response has not come
+        # back yet: its write set is unknowable, so its whole announced range
+        # is held back.
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=1
+        )
+        sched._manager_client.start_write_cache.return_value = {
+            "locations": [
+                {
+                    "block_idxes": [block],
+                    "location_specs": [{"name": "tp0_g0", "uri": "u%d" % block}],
+                }
+                for block in range(16, 32)
+            ],
+            "write_session_id": "sB",
+            "block_mask": {"offset": 16},
+        }
+        sched._record_announcement("r0", 16)  # A: still in flight
+        sched._record_announcement("r0", 32)  # B: answering now
+        sched.start_save_kvcache_async(
+            "r0", list(range(32 * MBS)), 32, [True] * 32, [True] * 32
+        )
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(meta)
+        self.assertEqual([], meta.to_release_captures)
+
     def test_existing_blocks_release_their_captures(self):
         # StartWriteCache reporting that the manager already holds a block means
         # this session will not write it: its eager capture has nothing to
@@ -935,6 +1086,10 @@ class TestCaptureDispositions(unittest.TestCase):
         dtm._device_mod = MagicMock()
         dtm._transfer_client = MagicMock()
         dtm._transfer_client.SaveKvCaches.return_value = [0]
+        dtm._extra_config = SimpleNamespace(
+            block_per_save_task=128, block_per_load_task=128
+        )
+        dtm._io_executor = ThreadPoolExecutor(max_workers=2)
         conn = worker_with([g0, g1], dtm)
         with mock.patch("kv_cache_manager.py_connector.vllm.data_transfer"
                         ".batch_gather_scatter_helper"):
