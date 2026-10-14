@@ -342,7 +342,9 @@ class ConnectorWorker:
         # write session -> (req_id, the (spec, block) keys it writes): the
         # coordinator's global verdict arrives keyed by write_session_id, and
         # this is how it finds the captures to release (see on_save_finished).
-        self._session_keys: Dict[str, Tuple[str, List[Tuple[str, int]]]] = {}
+        self._session_keys: Dict[
+            str, Tuple[str, List[Tuple[str, int]], List[int]]
+        ] = {}
 
         self._tp_rank = get_tensor_model_parallel_rank()
         # torch device module (torch.cuda / torch.musa / ...), set in
@@ -1158,17 +1160,38 @@ class ConnectorWorker:
                 save_req.req_id, self._tp_rank, save_req.write_session_id, num_blocks
             )
             if plans is not None:
-                keys = [
-                    (plan.group.spec_name, save_req.manager_block_idxes[pos])
+                # Register the session whether or not *this* rank captured
+                # anything: the coordinator's AND runs on tp0 only, and it has
+                # to relay the verdict to every rank. A rank whose own arena
+                # was toed (its captures withheld, or simply no windowed data
+                # in this chunk) has no keys of its own -- but the other rank
+                # does, and it is waiting for exactly this confirmation. The
+                # keys are the per-spec captures this rank holds; the blocks
+                # are the session's windowed blocks, identical on every rank
+                # (manager_block_idxes x the windowed groups).
+                windowed = [
+                    plan
                     for plan in plans
                     if getattr(plan.group, "retention", None) is not None
-                    for pos, slot in enumerate(plan.staged_slots or ())
-                    if slot is not None
                 ]
-                if keys:
+                if windowed:
+                    keys = [
+                        (plan.group.spec_name, save_req.manager_block_idxes[pos])
+                        for plan in windowed
+                        for pos, slot in enumerate(plan.staged_slots or ())
+                        if slot is not None
+                    ]
+                    blocks = sorted(
+                        {
+                            save_req.manager_block_idxes[pos]
+                            for plan in windowed
+                            for pos in range(len(plan.staged_slots or ()))
+                        }
+                    )
                     self._session_keys[save_req.write_session_id] = (
                         save_req.req_id,
                         keys,
+                        blocks,
                     )
                 done_cb = self._settle_session_captures(save_req, plans, done_cb)
 
@@ -1537,7 +1560,7 @@ class ConnectorWorker:
         session = self._session_keys.pop(write_session_id, None)
         if session is None:
             return
-        req_id, keys = session
+        req_id, keys, blocks = session
         committed_blocks = {
             index
             for index, ok in enumerate(save_context.success_mask)
@@ -1569,11 +1592,11 @@ class ConnectorWorker:
         if relay is not None:
             relay.confirm_committed(
                 req_id,
-                [
-                    block
-                    for _spec_name, block in keys
-                    if block in committed_blocks
-                ],
+                # The session's blocks, not this rank's keys: the other ranks
+                # hold their own captures for the very same blocks, and this
+                # rank may well have none (its arena was toed) while theirs
+                # wait for this confirmation.
+                [block for block in blocks if block in committed_blocks],
             )
 
     def get_finished(
