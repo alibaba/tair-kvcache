@@ -276,12 +276,35 @@ class TpCoordinatorServer:
             try:
                 query = orjson.loads(raw)
                 session_id, tp_rank = query["session_id"], query["tp_rank"]
+                cancel = bool(query.get("cancel", False))
             except Exception:  # pragma: no cover - protocol misuse
+                socket.send(b"")
+                continue
+            if cancel:
+                self.cancel_query(session_id, tp_rank)
                 socket.send(b"")
                 continue
             verdict = self.answer_query(session_id, tp_rank)
             # b"" = not decided yet (the querying rank rechecks next step).
             socket.send(orjson.dumps(verdict) if verdict is not None else b"")
+
+    def cancel_query(self, session_id: str, tp_rank: int) -> None:
+        """This rank will never ask for the session's verdict.
+
+        A request can retire on a fast rank while slower ranks are still
+        writing it: the retiring rank drops its local obligation, so without
+        this the entry waits for an acknowledgement that cannot come any more.
+        Cancelling counts as the rank's answer, which lets the entry go once
+        every rank is done.
+        """
+        with self._verdicts_lock:
+            if session_id not in self._verdicts:
+                return
+            acked = self._verdict_acks.setdefault(session_id, set())
+            acked.add(tp_rank)
+            if len(acked) >= self._tp_world_size:
+                self._verdicts.pop(session_id, None)
+                self._verdict_acks.pop(session_id, None)
 
     def answer_query(self, session_id: str, tp_rank: int) -> "Optional[List[bool]]":
         """The stored verdict, acknowledging it for this rank.
@@ -307,13 +330,20 @@ class TpCoordinatorServer:
             self._verdicts[write_session_id] = list(success_mask)
             self._verdict_acks.setdefault(write_session_id, set())
             if len(self._verdicts) > 4096:
-                # A rank that never asks (its session had nothing pending, or
-                # it is gone) would otherwise pin a mask forever. The cap is
-                # only a safety net; nothing is dropped before every rank that
-                # does ask has its answer (see the query routine).
+                # A rank that never asks and never cancels (it died, or its
+                # request was never retired) would pin masks forever. Below
+                # the cap nothing is dropped before every rank had its answer;
+                # above it the oldest entries go, fully acknowledged ones
+                # first, and either way loudly.
+                stale = [
+                    session for session in self._verdicts if not self._verdict_acks.get(session)
+                ] + [session for session in self._verdicts if self._verdict_acks.get(session)]
+                for session in stale[: len(self._verdicts) - 4096]:
+                    self._verdicts.pop(session, None)
+                    self._verdict_acks.pop(session, None)
                 logger.warning(
-                    "TairKvCacheConnector: %d verdicts retained; a rank has "
-                    "not queried its sessions",
+                    "TairKvCacheConnector: %d verdicts retained; evicting the "
+                    "oldest (a rank neither asked nor cancelled)",
                     len(self._verdicts),
                 )
 
@@ -362,6 +392,37 @@ class TpCoordinatorClient:
         with self._lock:
             self._socket.send(param)
 
+    def cancel_verdict(self, write_session_id: str, tp_rank: int) -> None:
+        """Tell the coordinator this rank will not ask for this session.
+
+        Best effort: if the query socket is unavailable the entry simply waits
+        for a rank that never comes -- which is what the cap is for.
+        """
+        self._ask_query(
+            {"session_id": write_session_id, "tp_rank": tp_rank, "cancel": True}
+        )
+
+    def _send_query(self, payload: Dict[str, Any], timeout_ms: int = 100) -> Any:
+        """One request/response over the query socket (caller holds the lock)."""
+        if self._query_socket is None:
+            socket = self._zmq_context.socket(zmq.REQ)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            socket.connect("tcp://%s:%d" % (self._host_ip, self._port + 1))
+            self._query_socket = socket
+        self._query_socket.send(orjson.dumps(payload))
+        return self._query_socket.recv()
+
+    def _ask_query(self, payload: Dict[str, Any], timeout_ms: int = 100) -> Any:
+        with self._lock:
+            try:
+                return self._send_query(payload, timeout_ms)
+            except zmq.ZMQError:
+                if self._query_socket is not None:
+                    self._query_socket.close(linger=0)
+                    self._query_socket = None
+                return False
+
     def ask_verdict(
         self, write_session_id: str, tp_rank: int = 0, timeout_ms: int = 100
     ) -> "Union[None, List[bool], bool]":
@@ -369,30 +430,14 @@ class TpCoordinatorClient:
 
         Returns the per-block AND mask (a list of bools), ``None`` while some
         rank has not reported yet, or ``False`` when the coordinator cannot be
-        asked at all (no query socket): the caller then keeps its bytes and
-        lets the retirement (or the manager's mask) close the loop.
+        asked (no query socket, or a timeout): the caller then keeps its bytes
+        and lets the retirement (or the manager's mask) close the loop.
         """
-        with self._lock:
-            if self._query_socket is None:
-                socket = self._zmq_context.socket(zmq.REQ)
-                socket.setsockopt(zmq.LINGER, 0)
-                socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-                socket.connect("tcp://%s:%d" % (self._host_ip, self._port + 1))
-                self._query_socket = socket
-            try:
-                self._query_socket.send(
-                    orjson.dumps(
-                        {"session_id": write_session_id, "tp_rank": tp_rank}
-                    )
-                )
-                raw = self._query_socket.recv()
-            except zmq.ZMQError:
-                # No answer (no query socket, a restart, a timeout): the loop
-                # is closed elsewhere, never here.
-                if self._query_socket is not None:
-                    self._query_socket.close(linger=0)
-                    self._query_socket = None
-                return False
-            if not raw:
-                return None
-            return list(orjson.loads(raw))
+        raw = self._ask_query(
+            {"session_id": write_session_id, "tp_rank": tp_rank}, timeout_ms
+        )
+        if raw is False:
+            return False
+        if not raw:
+            return None
+        return list(orjson.loads(raw))

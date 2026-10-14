@@ -942,6 +942,11 @@ class ConnectorWorker:
             pending = self._verdict_pending.pop(req_id, None)
         if not pending:
             return
+        # The request is gone on this rank while slower ranks may still be
+        # writing it: the coordinator would keep the entry waiting for a query
+        # that cannot come any more. Cancelling counts as this rank's answer.
+        for session_id in pending:
+            self._coordinator_client.cancel_verdict(session_id, self._tp_rank)
         self._captures.release_staged(
             req_id, [block for blocks in pending.values() for block in blocks]
         )
@@ -1638,12 +1643,6 @@ class ConnectorWorker:
             save_context.success_mask,
             write_session_id,
         )
-        # Make the AND queryable: the other ranks ask for exactly this answer
-        # (see _recheck_pending_verdicts) -- they must not release a capture
-        # until it says "committed", and must keep it when a rank failed.
-        self._coordinator_server.record_verdict(
-            write_session_id, save_context.success_mask
-        )
         committed = True
         try:
             self._manager_client.finish_write_cache(
@@ -1659,7 +1658,10 @@ class ConnectorWorker:
         except Exception as e:
             # The report failed: the manager may still hold these blocks
             # uncommitted, so nothing may be released (a retry has to find the
-            # bytes).
+            # bytes). The verdict is *not* published below either: making it
+            # queryable here would let every rank release its only captured
+            # copy of blocks the manager never committed, and the retry could
+            # not republish them once the HBM window moved.
             committed = False
             logger.warning(
                 "finish_write_cache failed, session: %s, error: %s", write_session_id, e
@@ -1670,7 +1672,13 @@ class ConnectorWorker:
         # callback has not restaged the captures yet), and there would be no
         # retry afterwards. Every rank releases through the pending recheck
         # instead (see _recheck_pending_verdicts), which converges within a
-        # step and has the retirement as its backstop.
+        # step and has the retirement as its backstop. Publication itself only
+        # happens once the manager acknowledged the report: before that the
+        # verdict is not a fact.
+        if committed:
+            self._coordinator_server.record_verdict(
+                write_session_id, save_context.success_mask
+            )
 
     def get_finished(
         self, finished_req_ids: set, meta: TairKvCacheConnectorMetadata
