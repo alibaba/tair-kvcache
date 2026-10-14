@@ -17,7 +17,8 @@ Both have identical `instance_group`, `instance_id`, `history_time_ms`,
 epoch-millisecond bucket timestamp. `history_generation` contains a process nonce
 and a process-local counter; reset and instance recreation allocate a new value.
 `history_shard = (history_time_ms / 300000) % 4` partitions queries without dropping
-any points. Platform source labels must also be retained when pairing samples.
+any points. Pair samples by the full immutable identity and evaluation time;
+the process nonce prevents different sources from sharing a generation.
 
 `observed_ms` identifies the report containing the value, not the last time that
 the value increased. Across generations select the latest observed report, not
@@ -34,9 +35,13 @@ the application tag cache for these changing timestamp tags.
 
 ## Query contract
 
-At the selected range end, evaluate `last_over_time(metric[range])` against stored
-samples for each immutable identity, then join the two gauge results by all
-identity/source labels. Filter historical timestamps to the displayed range,
+Evaluate a range query every 24 hours using `last_over_time(metric[24h])` against
+stored samples, and an additional instant query at the selected range end with
+the same lookback. The range query covers contiguous full windows (not sparse
+snapshots); the instant query covers the final partial window. This avoids a
+backend's per-window duration limit without losing intermediate revisions. Keep
+the evaluation time when joining capacity and observed-time results, as well as
+all identity labels. Filter historical timestamps to the displayed range,
 sort by `observed_ms`, and keep the latest valid pair per logical instance and
 historical timestamp. Query all four shards; a failed shard must remain an error,
 not be treated as an empty result. Check backend series limits separately from
@@ -44,9 +49,9 @@ the UI's maximum data point setting. Do not apply a sparse subquery resolution
 to obtain the last sample. Correctness is bounded by collected samples and the
 backend's raw/rollup retention; the dashboard cannot recover uncollected data.
 
-The query is instant only in the sense of evaluation at the selected end time:
-the range vector scans historical storage, including samples from processes that
-have exited and buckets older than the current in-memory ring. Grafana converts
+Both query forms scan historical storage, including samples from processes that
+have exited and buckets older than the current in-memory ring. The range-query
+step must not exceed its lookback. Grafana converts
 the immutable historical label into the plot time rather than using query time.
 
 Legacy data has no immutable timestamp label and must not be silently merged as
