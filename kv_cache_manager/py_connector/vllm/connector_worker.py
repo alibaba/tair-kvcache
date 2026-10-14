@@ -23,6 +23,11 @@ import torch
 from vllm.distributed import get_tensor_model_parallel_rank
 
 from kv_cache_manager.py_connector.common.logger import logger
+
+#: How long the verdict query stays muted after a failed probe. The endpoint
+#: only comes back with a restart, and an engine step must not pay a receive
+#: timeout per pending session meanwhile.
+VERDICT_QUERY_BACKOFF_SECONDS = 5.0
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.py_connector.common.tp_coordinator import (
     SaveContext,
@@ -343,6 +348,17 @@ class ConnectorWorker:
         # The coordinator runs in another process (the task's engine core), so
         # the answer is a query, not shared memory.
         self._verdict_pending: Dict[str, Dict[str, List[int]]] = {}
+        # Settles run on I/O threads and the recheck on the engine thread: one
+        # lock guards every add/remove/iterate (a callback that adds a session
+        # between the emptiness test and the pop would lose it, and its
+        # captures would never be rechecked).
+        self._verdict_lock = threading.Lock()
+        # When the coordinator cannot be asked (its port is unbound or it is
+        # gone), every probe costs a receive timeout -- on the engine thread,
+        # for every pending session, every step. One failure closes the whole
+        # round and mutes the endpoint for a while instead of paying that per
+        # session over and over.
+        self._verdict_query_down_until = 0.0
 
         self._tp_rank = get_tensor_model_parallel_rank()
         # torch device module (torch.cuda / torch.musa / ...), set in
@@ -788,43 +804,19 @@ class ConnectorWorker:
                 self._captures.settle(
                     save_req.req_id, save_req.session_id, outcomes
                 )
-                if self._tp_size == 1:
-                    # With one rank this verdict *is* the global one (the
-                    # coordinator's AND has nothing to combine), so the bytes
-                    # are durable now: release them, or a long prefill's
-                    # captures would fill the arena while waiting for a
-                    # confirmation that can never say anything new (the
-                    # gemma-3-4b regression). Blocks with any failing group
-                    # stay staged: the manager rejects the block and the retry
-                    # needs them.
-                    by_block: Dict[int, bool] = {}
-                    for (spec_name, block), ok in outcomes.items():
-                        by_block[block] = by_block.get(block, True) and bool(ok)
-                    committed = [b for b, ok in by_block.items() if ok]
-                    if committed:
-                        self._captures.release_staged(save_req.req_id, committed)
-                else:
-                    # Several ranks: a local success says nothing yet (another
-                    # rank may fail and the manager then rejects the block for
-                    # everyone), so the bytes stay staged and are marked
-                    # pending. Every rank follows this rule -- tp0 included:
-                    # its coordinator runs the AND, but the settle that puts
-                    # this rank's captures back into the staged map may land
-                    # *after* that AND (the last report can be this very rank),
-                    # and a release issued then would find nothing and never be
-                    # retried (the tp run lost 17 of 19 fully-successful
-                    # sessions exactly that way). The coordinator is asked
-                    # right away -- tp0 hits its own process -- and everything
-                    # undecided is rechecked on the next metadata, i.e. within
-                    # a step.
-                    # The session's blocks in the session's own order: the
-                    # verdict mask is indexed by position in the announced
-                    # range, not by absolute manager block number -- a session
-                    # that announced blocks 16..31 would otherwise never match
-                    # (block 16 is past the end of a 16-entry mask), which is
-                    # how 17 fully-successful sessions kept their bytes while
-                    # only the first (blocks 0..15, where the two spaces
-                    # coincide) ever released.
+                self._drop_uris_if_idle(save_req.req_id)
+                if True:
+                    # A local verdict is never the global one. With several
+                    # ranks another rank may fail and the manager then rejects
+                    # the block for everyone; even with one rank `outcomes` only
+                    # covers the *windowed* plans, while the block is committed
+                    # only when every group wrote it (a full-attention or state
+                    # group failing would leave the window bytes released and
+                    # the manager rejecting a block nobody can rewrite once the
+                    # window moved). So the bytes stay staged and the session is
+                    # marked pending: the coordinator's merged, all-group AND --
+                    # published by on_save_finished or answered by the query --
+                    # releases them, within a step.
                     ordered: List[int] = []
                     for plan in plans:
                         if getattr(plan.group, "retention", None) is None:
@@ -840,9 +832,10 @@ class ConnectorWorker:
                             getattr(save_req, "write_session_id", None)
                             or str(save_req.session_id)
                         )
-                        self._verdict_pending.setdefault(save_req.req_id, {})[
-                            session_key
-                        ] = ordered
+                        with self._verdict_lock:
+                            self._verdict_pending.setdefault(save_req.req_id, {})[
+                                session_key
+                            ] = ordered
                         self._recheck_pending_verdicts(
                             {save_req.req_id: {session_key: ordered}}
                         )
@@ -860,6 +853,19 @@ class ConnectorWorker:
 
         return wrapper
 
+    def _drop_uris_if_idle(self, req_id: str) -> None:
+        """Forget a request's cache keys once no capture of it can return.
+
+        A retiring request keeps its URI map while a save is in flight (a
+        release may still have to match those keys). The settle that lands the
+        last one is the only place that notices the map is now unreachable --
+        nothing can release or look these keys up again -- so without this it
+        sits there forever while every _uris_other_requests_hold scan walks it.
+        """
+        if self._in_flight.get(req_id) or self._staged.get(req_id):
+            return
+        self._block_uris.pop(req_id, None)
+
     def _recheck_pending_verdicts(
         self, pending: "Optional[Dict[str, Dict[str, List[int]]]]" = None
     ) -> None:
@@ -872,14 +878,32 @@ class ConnectorWorker:
         failed keeps its bytes (the retry's only copy -- and the manager
         rejected the block, so it is announced again).
         """
-        if self._tp_size == 1:
-            return  # one rank: the settle already released, nothing is pending
-        source = self._verdict_pending if pending is None else pending
-        for req_id, sessions in list(source.items()):
-            for session_id, ordered in list(sessions.items()):
-                verdict = self._coordinator_client.ask_verdict(session_id)
-                if verdict is False or verdict is None:
-                    continue  # cannot ask / not decided: recheck later
+        if time.monotonic() < self._verdict_query_down_until:
+            return  # the endpoint is down: do not pay a timeout per session
+        with self._verdict_lock:
+            if pending is None:
+                source = {
+                    req_id: dict(sessions)
+                    for req_id, sessions in self._verdict_pending.items()
+                }
+            else:
+                source = {req_id: dict(items) for req_id, items in pending.items()}
+        for req_id, sessions in source.items():
+            for session_id, ordered in sessions.items():
+                verdict = self._coordinator_client.ask_verdict(
+                    session_id, self._tp_rank
+                )
+                if verdict is False:
+                    # Cannot ask (the query port is unbound, or the answer
+                    # timed out): stop this round -- every further probe would
+                    # pay the same timeout -- and mute the endpoint for a while
+                    # so the next steps do not pay it either.
+                    self._verdict_query_down_until = (
+                        time.monotonic() + VERDICT_QUERY_BACKOFF_SECONDS
+                    )
+                    return
+                if verdict is None:
+                    continue  # not decided yet: recheck next step
                 # The mask follows the announced range: position i is the
                 # session's i-th block, whatever its manager block number is.
                 # A position the mask rejects keeps its bytes (a rank failed
@@ -901,14 +925,21 @@ class ConnectorWorker:
                             session_id,
                             released,
                         )
-                # Decided either way: nothing left to recheck.
-                sessions.pop(session_id, None)
-                if not sessions:
-                    self._verdict_pending.pop(req_id, None)
+                # Decided either way: nothing left to recheck. The lock keeps
+                # a settle that is landing right now from being dropped: only
+                # the entries seen here are removed, and the request's map is
+                # only popped while it is still the same empty object.
+                with self._verdict_lock:
+                    live = self._verdict_pending.get(req_id)
+                    if live is not None:
+                        live.pop(session_id, None)
+                        if not live:
+                            self._verdict_pending.pop(req_id, None)
 
     def _drop_pending_verdicts(self, req_id: str) -> None:
         """A retiring request has no retry left: pending blocks go with it."""
-        pending = self._verdict_pending.pop(req_id, None)
+        with self._verdict_lock:
+            pending = self._verdict_pending.pop(req_id, None)
         if not pending:
             return
         self._captures.release_staged(
@@ -1498,6 +1529,15 @@ class ConnectorWorker:
             candidates = set(reported)
             if own is not None:
                 candidates.add(own)
+            if not confirmed and not candidates:
+                # The manager returned no location for this block (it was
+                # deduplicated into its "already" mask), so its cache key is
+                # unknown: this release cannot tell whether another request
+                # holds an uncommitted allocation under that key, and dropping
+                # the bytes could leave that writer -- and any retry of ours --
+                # with nothing. Defer it: the verdict recheck (or retirement)
+                # releases once the commit is known.
+                continue
             if candidates & pending:
                 # A live session of some request still owns this cache key:
                 # the manager's "existing" may be one of its uncommitted

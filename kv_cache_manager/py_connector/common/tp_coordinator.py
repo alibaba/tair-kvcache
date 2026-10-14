@@ -135,6 +135,11 @@ class TpCoordinatorServer:
         # until this answer says "committed", or drop it when the answer says
         # a rank failed. ``None`` means "not decided yet".
         self._verdicts: Dict[str, List[bool]] = {}
+        # Ranks that already asked for a given session's verdict: a verdict is
+        # only dropped once every rank has consumed it, because the coordinator
+        # cannot reconstruct it and a rank that asks later must not be told
+        # "undecided" forever (it would keep its captures until retirement).
+        self._verdict_acks: Dict[str, Set[int]] = {}
         self._verdicts_lock = threading.Lock()
 
         self._coordinator_running = True
@@ -268,18 +273,49 @@ class TpCoordinatorServer:
                 raw = socket.recv()
             except zmq.ZMQError:  # pragma: no cover - context teardown
                 return
-            session_id = raw.decode()
-            with self._verdicts_lock:
-                verdict = self._verdicts.get(session_id)
+            try:
+                query = orjson.loads(raw)
+                session_id, tp_rank = query["session_id"], query["tp_rank"]
+            except Exception:  # pragma: no cover - protocol misuse
+                socket.send(b"")
+                continue
+            verdict = self.answer_query(session_id, tp_rank)
             # b"" = not decided yet (the querying rank rechecks next step).
             socket.send(orjson.dumps(verdict) if verdict is not None else b"")
+
+    def answer_query(self, session_id: str, tp_rank: int) -> "Optional[List[bool]]":
+        """The stored verdict, acknowledging it for this rank.
+
+        Nothing is dropped until every rank has consumed the mask: the
+        coordinator cannot rebuild one, and a rank that asks afterwards would
+        be told "undecided" forever, keeping its captures until retirements and
+        draining the arena.
+        """
+        with self._verdicts_lock:
+            verdict = self._verdicts.get(session_id)
+            if verdict is None:
+                return None
+            acked = self._verdict_acks.setdefault(session_id, set())
+            acked.add(tp_rank)
+            if len(acked) >= self._tp_world_size:
+                self._verdicts.pop(session_id, None)
+                self._verdict_acks.pop(session_id, None)
+            return verdict
 
     def record_verdict(self, write_session_id: str, success_mask: List[bool]) -> None:
         with self._verdicts_lock:
             self._verdicts[write_session_id] = list(success_mask)
-            if len(self._verdicts) > 1024:
-                for stale in list(self._verdicts)[:512]:
-                    self._verdicts.pop(stale, None)
+            self._verdict_acks.setdefault(write_session_id, set())
+            if len(self._verdicts) > 4096:
+                # A rank that never asks (its session had nothing pending, or
+                # it is gone) would otherwise pin a mask forever. The cap is
+                # only a safety net; nothing is dropped before every rank that
+                # does ask has its answer (see the query routine).
+                logger.warning(
+                    "TairKvCacheConnector: %d verdicts retained; a rank has "
+                    "not queried its sessions",
+                    len(self._verdicts),
+                )
 
     def get_finished_tasks(self) -> Tuple[List[str], List[str]]:
         finished_saving = []
@@ -327,7 +363,7 @@ class TpCoordinatorClient:
             self._socket.send(param)
 
     def ask_verdict(
-        self, write_session_id: str, timeout_ms: int = 100
+        self, write_session_id: str, tp_rank: int = 0, timeout_ms: int = 100
     ) -> "Union[None, List[bool], bool]":
         """The coordinator's global verdict for this session, if decided.
 
@@ -344,7 +380,11 @@ class TpCoordinatorClient:
                 socket.connect("tcp://%s:%d" % (self._host_ip, self._port + 1))
                 self._query_socket = socket
             try:
-                self._query_socket.send(write_session_id.encode())
+                self._query_socket.send(
+                    orjson.dumps(
+                        {"session_id": write_session_id, "tp_rank": tp_rank}
+                    )
+                )
                 raw = self._query_socket.recv()
             except zmq.ZMQError:
                 # No answer (no query socket, a restart, a timeout): the loop
