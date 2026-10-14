@@ -144,6 +144,11 @@ class TpCoordinatorServer:
         # cannot reconstruct it and a rank that asks later must not be told
         # "undecided" forever (it would keep its captures until retirement).
         self._verdict_acks: Dict[str, Set[int]] = {}
+        # Ranks that gave up on a session before its verdict existed (a fast
+        # rank retired the request while slower ranks were still writing it):
+        # the cancel must not be dropped, or the verdict waits for an
+        # acknowledgement that will never come.
+        self._verdict_cancels: Dict[str, Set[int]] = {}
         self._verdicts_lock = threading.Lock()
 
         self._finished_loading = []
@@ -329,6 +334,9 @@ class TpCoordinatorServer:
         """
         with self._verdicts_lock:
             if session_id not in self._verdicts:
+                # The verdict is not published yet: remember the cancel so
+                # record_verdict can apply it the moment it is.
+                self._verdict_cancels.setdefault(session_id, set()).add(tp_rank)
                 return
             acked = self._verdict_acks.setdefault(session_id, set())
             acked.add(tp_rank)
@@ -358,7 +366,14 @@ class TpCoordinatorServer:
     def record_verdict(self, write_session_id: str, success_mask: List[bool]) -> None:
         with self._verdicts_lock:
             self._verdicts[write_session_id] = list(success_mask)
-            self._verdict_acks.setdefault(write_session_id, set())
+            acked = self._verdict_acks.setdefault(
+                write_session_id, self._verdict_cancels.pop(write_session_id, set())
+            )
+            if len(acked) >= self._tp_world_size:
+                # Every rank already gave up on it: no one will ever ask.
+                self._verdicts.pop(write_session_id, None)
+                self._verdict_acks.pop(write_session_id, None)
+                return
             if len(self._verdicts) > 4096:
                 # A rank that never asks and never cancels (it died, or its
                 # request was never retired) would pin masks forever. Below
@@ -376,6 +391,29 @@ class TpCoordinatorServer:
                     "oldest (a rank neither asked nor cancelled)",
                     len(self._verdicts),
                 )
+
+    def stop(self) -> None:
+        """Ask the routines to end (see shutdown for the full teardown)."""
+        self._coordinator_running = False
+
+    def shutdown(self) -> None:
+        """Stop and release the sockets and the context.
+
+        Order matters: the context is only terminated after every socket is
+        closed, because terminating it under a socket that a routine is
+        blocked on trips a libzmq assertion. Only used by tests -- production
+        runs for the life of the engine.
+        """
+        self.stop()
+        for socket in (self._event_socket, self._query_socket):
+            try:
+                socket.close(linger=0)
+            except Exception:  # pragma: no cover - already closed
+                pass
+        try:
+            self._context.term()
+        except Exception:  # pragma: no cover - already terminated
+            pass
 
     def get_finished_tasks(self) -> Tuple[List[str], List[str]]:
         finished_saving = []
@@ -448,6 +486,14 @@ class TpCoordinatorClient:
             self._resync_endpoint(timeout_ms)
             raise
 
+    def shutdown(self) -> None:
+        """Release the client's sockets (tests only)."""
+        if self._query_socket is not None:
+            self._query_socket.close(linger=0)
+            self._query_socket = None
+        self._socket.close(linger=0)
+        self._zmq_context.term()
+
     def _connect_query(self, query_port: int, timeout_ms: int) -> None:
         socket = self._zmq_context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
@@ -459,39 +505,65 @@ class TpCoordinatorClient:
     def _resync_endpoint(self, timeout_ms: int = 100) -> None:
         """Find the coordinator's actual port after a failed query.
 
-        Called at most once per outage: the announcement above makes the
-        endpoint reachable again for every later query, and the worker's own
-        backoff keeps the engine thread from paying for a still-dead one.
+        Called at most once per outage: the port that answered is remembered
+        (and both sockets move to it), so later queries do not probe again, and
+        a still-dead coordinator is handed back to the caller, whose backoff
+        keeps the engine thread off it.
         """
         if self._query_socket is not None:
             self._query_socket.close(linger=0)
             self._query_socket = None
-        if self._event_socket is not None:
-            self._event_socket.disconnect("tcp://%s:%d" % (self._host_ip, self._port))
         for candidate in range(self._port, self._port + COORDINATOR_PORT_ATTEMPTS):
-            socket = self._zmq_context.socket(zmq.REQ)
-            socket.setsockopt(zmq.LINGER, 0)
-            socket.setsockopt(zmq.RCVTIMEO, min(timeout_ms, 20))
-            socket.connect("tcp://%s:%d" % (self._host_ip, candidate + 1))
+            probe = self._zmq_context.socket(zmq.REQ)
+            probe.setsockopt(zmq.LINGER, 0)
+            probe.setsockopt(zmq.RCVTIMEO, min(timeout_ms, 20))
+            probe.connect("tcp://%s:%d" % (self._host_ip, candidate + 1))
+            answered = False
             try:
-                socket.send(orjson.dumps({"probe": True}))
-                if socket.recv() is not None:
-                    raise StopIteration
-            except (zmq.ZMQError, StopIteration):
-                if socket.getsockopt(zmq.LAST_ENDPOINT) is not None:
-                    pass
+                probe.send(orjson.dumps({"probe": True}))
+                probe.recv()
+                answered = True
+            except zmq.ZMQError:
+                pass
             finally:
-                socket.close(linger=0)
+                probe.close(linger=0)
+            if not answered:
+                continue
+            try:
+                self._socket.disconnect(
+                    "tcp://%s:%d" % (self._host_ip, self._port)
+                )
+            except zmq.ZMQError:  # pragma: no cover - never connected
+                pass
+            self._socket.connect("tcp://%s:%d" % (self._host_ip, candidate))
+            logger.warning(
+                "TairKvCacheConnector: the coordinator answered on port %d "
+                "(configured %d was taken); reconnected",
+                candidate,
+                self._port,
+            )
+            self._port = candidate
+            self._connect_query(candidate + 1, timeout_ms)
+            return
         self._connect_query(self._port + 1, timeout_ms)
 
     def _ask_query(self, payload: Dict[str, Any], timeout_ms: int = 100) -> Any:
         with self._lock:
             try:
                 return self._send_query(payload, timeout_ms)
-            except zmq.ZMQError:
+            except Exception as e:
+                # Nothing from the query path may reach the engine thread: a
+                # coordinator that is down (or a bug in the probing) has to
+                # look like "cannot ask" so the caller backs off and keeps its
+                # bytes. The message is kept for whoever debugs the outage.
                 if self._query_socket is not None:
                     self._query_socket.close(linger=0)
                     self._query_socket = None
+                logger.warning(
+                    "TairKvCacheConnector: verdict query failed (%s: %s)",
+                    type(e).__name__,
+                    e,
+                )
                 return False
 
     def ask_verdict(
