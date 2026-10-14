@@ -907,16 +907,23 @@ class ConnectorScheduler:
         for req_id, session_id, blocks, uris_per_block, confirmed in pending:
             if not blocks:
                 continue
-            if confirmed:
-                meta.release_captures(req_id, blocks, None, confirmed=True)
-                continue
             # The protection was checked when the release was queued (in the
             # http thread); a session created since may have re-announced and
             # recaptured the same block, so re-check it here, where the queue
             # meets the step that also carries the new capture. Otherwise the
             # worker would capture and immediately discard the fresh bytes,
             # and the retry that finally succeeds would have nothing to
-            # publish.
+            # publish. A confirmed (allocation-failure) release passes the same
+            # recheck: nothing was allocated when it was queued, but a newer
+            # session may have captured those blocks since, and a fresh capture
+            # must never be discarded for an older release.
+            protected = self._blocks_other_sessions_write(req_id, session_id)
+            blocks = [block for block in blocks if block not in protected]
+            if not blocks:
+                continue
+            if confirmed:
+                meta.release_captures(req_id, blocks, None, confirmed=True)
+                continue
             protected = self._blocks_other_sessions_write(req_id, session_id)
             releasable = [block for block in blocks if block not in protected]
             if releasable:

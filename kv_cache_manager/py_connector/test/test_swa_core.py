@@ -2813,6 +2813,63 @@ class TestCoordinatorResync(unittest.TestCase):
         self.assertEqual([False], client.ask_verdict("s2", 0, timeout_ms=50))
 
 
+class TestConfirmedReleaseRecheck(unittest.TestCase):
+    """wave13 #4: a confirmed release must not discard a newer capture."""
+
+    def test_a_confirmed_release_waits_for_a_newer_session(self):
+        # An announcement that raised queues a confirmed (keyless) release.
+        # Nothing was allocated then -- but a *newer* session may have
+        # re-announced and captured those very blocks since, and the release
+        # must not make the worker drop the fresh bytes: the retry would then
+        # have nothing to publish, exactly as if it were a plain release.
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="confirmed-recheck", write_timeout_seconds=1
+        )
+        # The release is queued while the failing session is alone...
+        sched._queue_capture_release("r0", -1, 4, confirmed=True)
+        # ... and a newer session of the same request announces the same
+        # blocks before the queue is flushed.
+        sched._record_announcement("r0", 4)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(meta)
+        self.assertEqual([], released_blocks(meta), "a fresh capture was superseded")
+
+        # Once that session is handed over, the same release goes out.
+        session = next(iter(sched._announced_sessions["r0"]))
+        sched._remember_session_plan("r0", session, {0, 1, 2, 3})
+        sched._retire_session_protection("r0", session)
+        sched._queue_capture_release("r0", -1, 4, confirmed=True)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(meta)
+        self.assertEqual([("r0", [0, 1, 2, 3])], released_blocks(meta))
+        self.assertTrue(meta.to_release_captures[0][3])
+
+
+class TestCancellationBound(unittest.TestCase):
+    """wave13 #7: pre-verdict cancellations are bounded."""
+
+    def test_the_cancellation_table_is_bounded(self):
+        from kv_cache_manager.py_connector.common.tp_coordinator import (
+            TpCoordinatorServer,
+            VERDICT_CANCEL_LIMIT,
+        )
+
+        server = TpCoordinatorServer.__new__(TpCoordinatorServer)
+        server._tp_world_size = 2
+        server._verdicts = {}
+        server._verdict_acks = {}
+        server._verdict_cancels = {}
+        server._verdicts_lock = threading.Lock()
+        for index in range(VERDICT_CANCEL_LIMIT + 1):
+            server.cancel_query("s%d" % index, tp_rank=0)
+        self.assertLessEqual(len(server._verdict_cancels), VERDICT_CANCEL_LIMIT)
+        # The newest cancellation is still remembered (the oldest went).
+        self.assertIn("s%d" % VERDICT_CANCEL_LIMIT, server._verdict_cancels)
+
+
 class TestVerdictCancelBeforePublish(unittest.TestCase):
     """wave12: a cancel that beats the verdict must still count."""
 

@@ -46,6 +46,11 @@ CoordinateEventUnion = Union[
 #: is taken (a transient collision, typically TIME_WAIT after a restart).
 COORDINATOR_PORT_ATTEMPTS = 9
 
+#: How many pre-verdict cancellations the coordinator remembers. They only
+#: exist for sessions whose verdict is still to come (a rank that died, or a
+#: commit that never landed) and are dropped oldest-first beyond this.
+VERDICT_CANCEL_LIMIT = 4096
+
 
 @dataclass
 class CoordinateMessage:
@@ -337,6 +342,17 @@ class TpCoordinatorServer:
                 # The verdict is not published yet: remember the cancel so
                 # record_verdict can apply it the moment it is.
                 self._verdict_cancels.setdefault(session_id, set()).add(tp_rank)
+                if len(self._verdict_cancels) > VERDICT_CANCEL_LIMIT:
+                    # A rank that dies before the verdict is ever published
+                    # would otherwise pin these entries forever: drop the
+                    # oldest half, loudly, and keep serving the rest.
+                    for stale in list(self._verdict_cancels)[: VERDICT_CANCEL_LIMIT // 2]:
+                        self._verdict_cancels.pop(stale, None)
+                    logger.warning(
+                        "TairKvCacheConnector: dropped %d cancellations whose "
+                        "session's verdict never arrived",
+                        VERDICT_CANCEL_LIMIT // 2,
+                    )
                 return
             acked = self._verdict_acks.setdefault(session_id, set())
             acked.add(tp_rank)
