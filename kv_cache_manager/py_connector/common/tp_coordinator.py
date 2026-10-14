@@ -42,6 +42,10 @@ CoordinateEventUnion = Union[
     SendBlockFinishedEvent, LoadBlockFinishedEvent, SendBlockStartEvent
 ]
 
+#: How many consecutive ports the coordinator may try when the configured one
+#: is taken (a transient collision, typically TIME_WAIT after a restart).
+COORDINATOR_PORT_ATTEMPTS = 9
+
 
 @dataclass
 class CoordinateMessage:
@@ -142,22 +146,6 @@ class TpCoordinatorServer:
         self._verdict_acks: Dict[str, Set[int]] = {}
         self._verdicts_lock = threading.Lock()
 
-        self._coordinator_running = True
-        self._coordinator_thread = threading.Thread(
-            target=self.coordinator_routine, daemon=True
-        )
-        self._coordinator_thread.start()
-        # The verdict query rides a second socket (REQ/REP): the event stream
-        # above is one-way (PUSH/PULL), and a query needs an answer. A port
-        # that cannot be bound simply disables the active query -- the
-        # captures then wait for the manager's mask or the request's
-        # retirement, which is the pre-query behaviour (slower, still sound).
-        self._query_port = base_port + 1
-        self._query_thread = threading.Thread(
-            target=self.verdict_query_routine, daemon=True
-        )
-        self._query_thread.start()
-
         self._finished_loading = []
         self._failed_loading_block_idxs = []
         self._finished_loading_lock = threading.Lock()
@@ -165,12 +153,68 @@ class TpCoordinatorServer:
         self._finished_saving_lock = threading.Lock()
         self._on_finished_callback = on_finished_callback
 
+        # Both sockets are bound *here*, before any thread starts, so a port
+        # that cannot be taken fails the connector's initialization instead of
+        # killing a background thread: a coordinator that never bound used to
+        # leave the whole instance silently half-dead (no aggregations, no
+        # finish_write_cache, saves never committed) until someone read the
+        # logs. The configured port is tried first; a neighbour is only a
+        # fallback for a transient collision (the harness allocates a free
+        # port, but TIME_WAIT happens), and the port the coordinator actually
+        # took is what it announces and what the other ranks probe for.
+        self._context = zmq.Context()
+        self._event_socket = self._context.socket(zmq.PULL)
+        self._base_port = self._bind_retrying(self._event_socket, base_port, "events")
+        # The verdict query rides a second socket (REQ/REP): the event stream
+        # is one-way (PUSH/PULL), and a query needs an answer.
+        self._query_socket = self._context.socket(zmq.REP)
+        self._query_port = self._bind_retrying(
+            self._query_socket, self._base_port + 1, "verdict query"
+        )
+        logger.warning(
+            "TairKvCacheConnector coordinator started: transfer_client_config "
+            "coordinator_base_port=%d verdict_query_port=%d",
+            self._base_port,
+            self._query_port,
+        )
+        self._coordinator_running = True
+        self._coordinator_thread = threading.Thread(
+            target=self.coordinator_routine, daemon=True
+        )
+        self._coordinator_thread.start()
+        self._query_thread = threading.Thread(
+            target=self.verdict_query_routine, daemon=True
+        )
+        self._query_thread.start()
+
+    def _bind_retrying(self, socket: Any, port: int, what: str) -> int:
+        """Bind ``socket`` at ``port`` or the next few ports; raise if none.
+
+        Failing here is deliberate (fail-closed): the alternative is a
+        background thread that dies on a bind error while the connector looks
+        healthy, which loses every save the instance makes.
+        """
+        last_error: Optional[Exception] = None
+        for candidate in range(port, port + COORDINATOR_PORT_ATTEMPTS):
+            try:
+                socket.bind("tcp://%s:%d" % (self._host_ip, candidate))
+                return candidate
+            except zmq.ZMQError as e:
+                last_error = e
+        raise RuntimeError(
+            "TairKvCacheConnector: cannot bind the coordinator's %s socket on "
+            "%s:%d-%d (%s); another process holds those ports"
+            % (
+                what,
+                self._host_ip,
+                port,
+                port + COORDINATOR_PORT_ATTEMPTS - 1,
+                last_error,
+            )
+        )
+
     def coordinator_routine(self) -> None:
-        context = zmq.Context()
-        socket = context.socket(zmq.PULL)
-        port = self._base_port
-        socket.bind("tcp://%s:%d" % (self._host_ip, port))
-        logger.warning("TairKvCacheConnector coordinator started")
+        socket = self._event_socket
 
         running_load: Dict[RunningId, LoadContext] = {}
         running_save: Dict[RunningId, SaveContext] = {}
@@ -253,21 +297,7 @@ class TpCoordinatorServer:
                 logger.warning("[coordinator] received wrong msg: %s", msg)
 
     def verdict_query_routine(self) -> None:
-        context = zmq.Context()
-        socket = context.socket(zmq.REP)
-        try:
-            socket.bind("tcp://%s:%d" % (self._host_ip, self._query_port))
-        except zmq.ZMQError as e:
-            logger.warning(
-                "TairKvCacheConnector verdict query disabled (port %d: %s); "
-                "captures will wait for the manager's mask instead",
-                self._query_port,
-                e,
-            )
-            socket.close(linger=0)
-            context.term()
-            return
-        logger.warning("TairKvCacheConnector verdict query started")
+        socket = self._query_socket
         while self._coordinator_running:
             try:
                 raw = socket.recv()
@@ -403,15 +433,56 @@ class TpCoordinatorClient:
         )
 
     def _send_query(self, payload: Dict[str, Any], timeout_ms: int = 100) -> Any:
-        """One request/response over the query socket (caller holds the lock)."""
+        """One request/response over the query socket (caller holds the lock).
+
+        The coordinator may have had to bind a neighbouring port (a transient
+        collision); the first unanswered query probes the range once and
+        reconnects both sockets to whichever port answers.
+        """
         if self._query_socket is None:
+            self._connect_query(self._port + 1, timeout_ms)
+        self._query_socket.send(orjson.dumps(payload))
+        try:
+            return self._query_socket.recv()
+        except zmq.ZMQError:
+            self._resync_endpoint(timeout_ms)
+            raise
+
+    def _connect_query(self, query_port: int, timeout_ms: int) -> None:
+        socket = self._zmq_context.socket(zmq.REQ)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        socket.connect("tcp://%s:%d" % (self._host_ip, query_port))
+        self._query_socket = socket
+        self._query_port = query_port
+
+    def _resync_endpoint(self, timeout_ms: int = 100) -> None:
+        """Find the coordinator's actual port after a failed query.
+
+        Called at most once per outage: the announcement above makes the
+        endpoint reachable again for every later query, and the worker's own
+        backoff keeps the engine thread from paying for a still-dead one.
+        """
+        if self._query_socket is not None:
+            self._query_socket.close(linger=0)
+            self._query_socket = None
+        if self._event_socket is not None:
+            self._event_socket.disconnect("tcp://%s:%d" % (self._host_ip, self._port))
+        for candidate in range(self._port, self._port + COORDINATOR_PORT_ATTEMPTS):
             socket = self._zmq_context.socket(zmq.REQ)
             socket.setsockopt(zmq.LINGER, 0)
-            socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-            socket.connect("tcp://%s:%d" % (self._host_ip, self._port + 1))
-            self._query_socket = socket
-        self._query_socket.send(orjson.dumps(payload))
-        return self._query_socket.recv()
+            socket.setsockopt(zmq.RCVTIMEO, min(timeout_ms, 20))
+            socket.connect("tcp://%s:%d" % (self._host_ip, candidate + 1))
+            try:
+                socket.send(orjson.dumps({"probe": True}))
+                if socket.recv() is not None:
+                    raise StopIteration
+            except (zmq.ZMQError, StopIteration):
+                if socket.getsockopt(zmq.LAST_ENDPOINT) is not None:
+                    pass
+            finally:
+                socket.close(linger=0)
+        self._connect_query(self._port + 1, timeout_ms)
 
     def _ask_query(self, payload: Dict[str, Any], timeout_ms: int = 100) -> Any:
         with self._lock:
