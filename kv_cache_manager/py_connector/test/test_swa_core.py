@@ -2741,6 +2741,118 @@ class TestVerdictQueryHygiene(unittest.TestCase):
         self.assertEqual({"r1": {0: "uri-0"}}, conn._block_uris)
 
 
+class TestCoordinatorResync(unittest.TestCase):
+    """wave12: the query path never raises, and it keeps the port that answers."""
+
+    def _client(self, port):
+        from kv_cache_manager.py_connector.common.tp_coordinator import (
+            TpCoordinatorClient,
+        )
+
+        client = TpCoordinatorClient("127.0.0.1", port)
+        self.addCleanup(client.shutdown)
+        return client
+
+    def _server(self, port, tp_world_size=2):
+        from kv_cache_manager.py_connector.common.tp_coordinator import (
+            TpCoordinatorServer,
+        )
+
+        server = TpCoordinatorServer("127.0.0.1", port, tp_world_size, lambda *a: None)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def _free_port(self):
+        import socket as socket_module
+
+        with socket_module.socket() as sock:
+            sock.bind(("", 0))
+            return sock.getsockname()[1]
+
+    def test_a_dead_coordinator_looks_like_cannot_ask(self):
+        # Nothing from the query path may reach the engine thread: a missing
+        # coordinator (or a bug in the probing) has to come back as False so
+        # the caller backs off.
+        client = self._client(self._free_port())
+        self.assertIs(False, client.ask_verdict("s1", 0, timeout_ms=20))
+        # A resync that trips over its own state (a wrong attribute, say) is
+        # still "cannot ask": anything raised here would reach the engine
+        # thread, which must only ever see the verdict or a backoff.
+        client._resync_endpoint = MagicMock(side_effect=AttributeError("_event_socket"))
+        self.assertIs(False, client.ask_verdict("s1", 0, timeout_ms=20))
+
+    def test_the_probe_keeps_the_port_that_answered(self):
+        # The coordinator may have had to bind a neighbour: the client must
+        # find it, remember it, and reach it afterwards -- a probe that
+        # rediscovers the port but then reconnects to the configured one makes
+        # every later query unreachable, which is what the fallback announced.
+        import socket as socket_module
+
+        port = self._free_port()
+        holder = socket_module.socket()
+        holder.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+        holder.bind(("127.0.0.1", port))
+        holder.listen(1)
+        self.addCleanup(holder.close)
+
+        # A coordinator that had to move: it lives on port + 1.
+        server = self._server(port + 1)
+        self.assertEqual(port + 1, server._base_port)
+        server.record_verdict("s1", [True])
+
+        client = self._client(port)
+        # The first query fails (the configured port is dead), the probe finds
+        # the coordinator on its fallback port, and that port is what the
+        # client keeps -- a probe that reconnects to the configured one makes
+        # every later query unreachable.
+        self.assertIs(False, client.ask_verdict("s1", 0, timeout_ms=50))
+        self.assertEqual(port + 1, client._port)
+        self.assertEqual([True], client.ask_verdict("s1", 0, timeout_ms=50))
+        # ... and it stays reachable for the next query.
+        server.record_verdict("s2", [False])
+        self.assertEqual([False], client.ask_verdict("s2", 0, timeout_ms=50))
+
+
+class TestVerdictCancelBeforePublish(unittest.TestCase):
+    """wave12: a cancel that beats the verdict must still count."""
+
+    def _server(self):
+        from kv_cache_manager.py_connector.common.tp_coordinator import (
+            TpCoordinatorServer,
+        )
+
+        server = TpCoordinatorServer.__new__(TpCoordinatorServer)
+        server._tp_world_size = 2
+        server._verdicts = {}
+        server._verdict_acks = {}
+        server._verdict_cancels = {}
+        server._verdicts_lock = threading.Lock()
+        return server
+
+    def test_a_cancel_before_the_verdict_is_remembered(self):
+        # A fast rank retires the request while slower ranks are still writing
+        # it, so the cancel arrives before the verdict exists. Dropping it
+        # leaves the entry waiting for a rank that will never ask again.
+        server = self._server()
+        server.cancel_query("s1", tp_rank=1)
+        self.assertIn("s1", server._verdict_cancels)
+        server.record_verdict("s1", [True])
+        # Rank 1 already gave up; only rank 0 is left to answer, and once it
+        # does the entry goes.
+        self.assertEqual({1}, server._verdict_acks["s1"])
+        self.assertEqual([True], server.answer_query("s1", tp_rank=0))
+        self.assertNotIn("s1", server._verdicts)
+
+    def test_a_verdict_every_rank_cancelled_is_dropped_at_publish(self):
+        server = self._server()
+        server.cancel_query("s1", tp_rank=0)
+        server.cancel_query("s1", tp_rank=1)
+        server.record_verdict("s1", [True])
+        self.assertNotIn("s1", server._verdicts)
+        self.assertNotIn("s1", server._verdict_acks)
+        self.assertNotIn("s1", server._verdict_cancels)
+
+
 class TestCoordinatorBind(unittest.TestCase):
     """wave11: a taken port must not leave the connector half-dead."""
 
@@ -2765,8 +2877,7 @@ class TestCoordinatorBind(unittest.TestCase):
         holder.listen(1)
         self.addCleanup(holder.close)
         server = TpCoordinatorServer("127.0.0.1", port, 2, lambda *a: None)
-        self.addCleanup(server._event_socket.close, 0)
-        self.addCleanup(server._query_socket.close, 0)
+        self.addCleanup(server.shutdown)
         self.assertEqual(port + 1, server._base_port)
         self.assertEqual(port + 2, server._query_port)
 
@@ -2916,6 +3027,7 @@ class TestVerdictRetention(unittest.TestCase):
         server._tp_world_size = 2
         server._verdicts = {}
         server._verdict_acks = {}
+        server._verdict_cancels = {}
         server._verdicts_lock = threading.Lock()
         return server
 
