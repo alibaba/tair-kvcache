@@ -307,9 +307,9 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
     for (auto &task : tasks) {
         auto wrapped = [stop, deadline, task]() -> ClientErrorCode {
             if (stop->load()) {
-                // The task was cancelled before starting I/O, so its completion
-                // is known and must not turn a peer's ordinary error into a timeout.
-                return ER_OK;
+                // No backend I/O was started. drain treats this as a known
+                // terminal state and preserves the original peer error.
+                return ER_TASK_CANCELLED;
             }
             if (std::chrono::steady_clock::now() >= deadline) {
                 auto overdue_ms =

@@ -60,6 +60,9 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     ER_CUDA_STREAM_SYNCHRONIZE_ERROR = 115,
     ER_CUDA_STREAM_DESTROY_ERROR = 116,
     ER_CUDA_HOST_REGISTER_ERROR = 117,
+    // Internal parallel task was stopped before it started backend I/O.
+    // SdkWrapper consumes this state; client APIs must never return it.
+    ER_TASK_CANCELLED = 118,
 };
 
 enum class QueryType : int {
