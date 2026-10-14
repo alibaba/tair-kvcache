@@ -238,7 +238,7 @@ def worker_with(groups: List[AttentionTransferGroup], dtm: Any = None) -> Any:
     # production): a bare worker cannot ask, so pending stays pending -- the
     # tests that care stub it explicitly.
     conn._coordinator_client = MagicMock()
-    conn._coordinator_client.ask_verdict.return_value = False
+    conn._coordinator_client.ask_verdict.return_value = None
     conn._coordinator_server = MagicMock()
     return conn
 
@@ -611,9 +611,12 @@ class TestWindowedSpecGroups(unittest.TestCase):
         conn.wait_for_save(meta)
         self.assertEqual(16, len(plans[0][0].staged_slots))
         self.assertNotIn(None, plans[0][0].staged_slots)
-        # One rank: its own verdict is the global one, so the settle returns
-        # the slots.
+        # The settle hands the session to the verdict recheck, which returns
+        # the slots once the coordinator's merged AND says committed.
         conn._captures.settle("r0", 0, {("tp0_g0", b): True for b in range(16)})
+        conn._coordinator_client.ask_verdict.return_value = [True] * 16
+        conn._verdict_query_down_until = 0.0
+        conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         deadline = time.time() + 5
         while pool.free_blocks != 62 and time.time() < deadline:
             time.sleep(0.01)
@@ -778,6 +781,9 @@ class TestWindowedSpecGroups(unittest.TestCase):
         # that has not run yet.
         for spec in ("tp0_g0", "tp0_g1"):
             conn._captures.settle("r0", 0, {(spec, b): True for b in range(16)})
+        conn._coordinator_client.ask_verdict.return_value = [True] * 16
+        conn._verdict_query_down_until = 0.0
+        conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         deadline = time.time() + 5
         while pool.free_blocks != 96 and time.time() < deadline:
             time.sleep(0.01)
@@ -1614,19 +1620,37 @@ class TestCaptureDispositions(unittest.TestCase):
     def test_wait_for_save_honours_the_release_instruction(self):
         conn = captured_worker([0, 1], [7, 8])
         meta = TairKvCacheConnectorMetadata(epoch=0)
-        meta.release_captures("r0", [1])
+        meta.release_captures("r0", [1], {1: ["uri-1"]})
         conn.wait_for_save(meta)
         self.assertEqual([("tp0_g0", 0)], sorted(conn._staged["r0"]))
 
     def test_release_captures_returns_only_the_listed_blocks(self):
         conn = captured_worker([0, 1], [7, 8])
-        conn._release_captures_for("r0", [0])
+        conn._release_captures_for("r0", [0], {0: ["uri-0"]})
         # Block 0's slot went back with the instruction; block 1's capture is
         # still there for the session that will write it.
         self.assertEqual(
             [("tp0_g0", 1)], sorted(conn._staged["r0"]),
         )
         self.assertEqual([(0, 1)], conn._data_transfer.pool.released)
+
+    def test_a_release_without_a_cache_key_is_deferred(self):
+        # The manager returns no location for a deduplicated block (its answer
+        # only marks it "already"), so the release has no cache key for it and
+        # cannot tell whether another request holds an uncommitted allocation
+        # under that key. Dropping the bytes could leave that writer -- and any
+        # retry of ours -- with nothing, so the release waits for the commit
+        # verdict (or retirement) instead.
+        conn = captured_worker([0, 1], [7, 8])
+        conn._release_captures_for("r0", [0])
+        self.assertEqual(
+            [("tp0_g0", 0), ("tp0_g0", 1)],
+            sorted(conn._staged["r0"]),
+            "a keyless release dropped the bytes",
+        )
+        # ... while a confirmed release needs no key: the block is durable.
+        conn._release_captures_for("r0", [0], confirmed=True)
+        self.assertEqual([("tp0_g0", 1)], sorted(conn._staged["r0"]))
 
     def test_finish_releases_unwritten_slots(self):
         conn = captured_worker([0, 1], [7, 8])
@@ -2265,20 +2289,44 @@ class TestCommitConfirmation(unittest.TestCase):
             time.sleep(0.01)
         return blocks
 
-    def test_one_rank_confirms_at_the_settle(self):
-        # A single rank's own verdict *is* the coordinator's AND: the bytes are
-        # durable when the task lands, so the slots must come back then -- not
-        # when some later manager answer happens to mention them (that is what
-        # starved the arena in the real run).
+    def test_a_non_windowed_group_failure_keeps_the_window_bytes(self):
+        # Mixed windowed/full-attention (or windowed/state) instance, one rank:
+        # the settle's outcomes only describe the windowed plans, so releasing
+        # there would drop a block whose full-attention group failed -- the
+        # manager then rejects that block and a retry can never rewrite its
+        # window specs (the HBM window moved). The merged, all-group verdict is
+        # the only sound basis.
         conn, dtm, pool, group = self._fixture(tp_size=1)
+        conn._coordinator_client.ask_verdict.return_value = None
         blocks = self._run(conn, dtm, group, session=1, write_session_id="sA")
-        deadline = time.time() + 5
-        while pool.free_blocks != self.CAPACITY and time.time() < deadline:
-            time.sleep(0.01)
+        verdict = [True] * self.BLOCKS
+        verdict[1] = False
+        conn._coordinator_client.ask_verdict.return_value = verdict
+        conn._verdict_query_down_until = 0.0
+        conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
+        self.assertEqual(
+            [("tp0_g0", 1)],
+            sorted(conn._staged.get("r0", {})),
+            "a block failed by another group lost its windowed bytes",
+        )
+
+    def test_one_rank_confirms_through_the_recheck(self):
+        # A single rank cannot release at the settle either: its `outcomes`
+        # only cover the windowed plans, and a full-attention or state group
+        # failing would let the manager reject a block whose window bytes are
+        # already gone. The coordinator's merged, all-group AND (it runs in
+        # this process) is what releases, within a step.
+        conn, dtm, pool, group = self._fixture(tp_size=1)
+        conn._coordinator_client.ask_verdict.return_value = None
+        blocks = self._run(conn, dtm, group, session=1, write_session_id="sA")
+        self.assertEqual(self.BLOCKS, len(conn._staged.get("r0", {})))
+        conn._coordinator_client.ask_verdict.return_value = [True] * self.BLOCKS
+        conn._verdict_query_down_until = 0.0
+        conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         self.assertEqual(
             self.CAPACITY,
             pool.free_blocks,
-            "a single rank's successful capture was not released",
+            "a single rank's confirmed capture was not released",
         )
         self.assertEqual({}, conn._staged.get("r0", {}))
         self.assertEqual({}, conn._in_flight.get("r0", {}))
@@ -2298,6 +2346,7 @@ class TestCommitConfirmation(unittest.TestCase):
         )
         conn.on_save_finished("sA", context)
         conn._coordinator_client.ask_verdict.return_value = [True] * self.BLOCKS
+        conn._verdict_query_down_until = 0.0
         conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         self.assertEqual({}, conn._staged.get("r0", {}))
         self.assertEqual(self.CAPACITY, pool.free_blocks)
@@ -2314,6 +2363,7 @@ class TestCommitConfirmation(unittest.TestCase):
         )
         conn.on_save_finished("sA", context)
         conn._coordinator_client.ask_verdict.return_value = [False] * self.BLOCKS
+        conn._verdict_query_down_until = 0.0
         conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         self.assertEqual(self.BLOCKS, len(conn._staged.get("r0", {})))
         self.assertEqual(self.CAPACITY - self.BLOCKS, pool.free_blocks)
@@ -2344,6 +2394,7 @@ class TestCommitConfirmation(unittest.TestCase):
         )
         conn.on_save_finished("sA", context)
         conn._coordinator_client.ask_verdict.return_value = [False] * self.BLOCKS
+        conn._verdict_query_down_until = 0.0
         conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         self.assertEqual(self.BLOCKS, len(conn._staged.get("r0", {})))
 
@@ -2405,6 +2456,7 @@ class TestTpVerdictRelay(unittest.TestCase):
             instance_id="tp", block_per_save_task=8, block_per_load_task=8
         )
         conn._coordinator_client.ask_verdict.return_value = verdict
+        conn._verdict_query_down_until = 0.0
         return conn, dtm, pool, group
 
     def _run(self, conn, dtm, group, session, uris, ok=True):
@@ -2448,6 +2500,7 @@ class TestTpVerdictRelay(unittest.TestCase):
 
         # The coordinator now has the AND: the recheck releases.
         conn._coordinator_client.ask_verdict.return_value = [True] * self.BLOCKS
+        conn._verdict_query_down_until = 0.0
         conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         self.assertEqual({}, conn._staged.get("r0", {}))
         self.assertEqual(self.CAPACITY, pool.free_blocks)
@@ -2464,6 +2517,7 @@ class TestTpVerdictRelay(unittest.TestCase):
             True,
             True,
         ]
+        conn._verdict_query_down_until = 0.0
         conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         # The committed blocks are released; the rejected one keeps its bytes
         # (the manager rejected it for every rank, so it is announced again and
@@ -2544,6 +2598,7 @@ class TestTpVerdictRelay(unittest.TestCase):
         self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
         # The next step's recheck (tp0 asks its own in-process coordinator).
         conn._coordinator_client.ask_verdict.return_value = [True] * self.BLOCKS
+        conn._verdict_query_down_until = 0.0
         conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         self.assertEqual(self.CAPACITY, pool.free_blocks)
 
@@ -2606,9 +2661,121 @@ class TestTpVerdictRelay(unittest.TestCase):
 
         # One more step: the recheck releases what the AND already decided.
         conn._coordinator_client.ask_verdict.return_value = [True] * self.BLOCKS
+        conn._verdict_query_down_until = 0.0
         conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         self.assertEqual({}, conn._staged.get("r0", {}))
         self.assertEqual(self.CAPACITY, pool.free_blocks)
+
+
+class TestVerdictQueryHygiene(unittest.TestCase):
+    """The query endpoint's cost and its bookkeeping (wave9 review)."""
+
+    def _worker(self, tp_size=2, tp_rank=1):
+        conn = worker_with([], MagicMock())
+        conn._tp_size = tp_size
+        conn._tp_rank = tp_rank
+        conn._verdict_pending = {
+            "r0": {"s1": [0, 1], "s2": [2, 3], "s3": [4, 5]},
+        }
+        conn._verdict_query_down_until = 0.0
+        return conn
+
+    def test_one_failed_probe_mutes_the_endpoint_for_the_round(self):
+        # The engine thread runs this loop every step for every pending
+        # session; when the coordinator's query port is unbound or gone, each
+        # probe costs a full receive timeout. One failure must close the whole
+        # round (and the following ones, for a while) instead of paying that
+        # per session.
+        conn = self._worker()
+        conn._coordinator_client.ask_verdict.return_value = False
+        conn._recheck_pending_verdicts()
+        self.assertEqual(1, conn._coordinator_client.ask_verdict.call_count)
+        # ... and the next step does not even try (the endpoint is muted).
+        conn._recheck_pending_verdicts()
+        self.assertEqual(1, conn._coordinator_client.ask_verdict.call_count)
+        # Nothing was decided, so every session is still pending.
+        self.assertEqual(3, len(conn._verdict_pending["r0"]))
+
+    def test_a_settle_landing_during_the_recheck_is_not_lost(self):
+        # Settles add to the map on I/O threads while the engine thread removes
+        # from it: an entry added between the emptiness test and the top-level
+        # pop must survive, or its captures are never rechecked and the arena
+        # starves.
+        conn = self._worker()
+        conn._verdict_pending = {"r0": {"s1": [0, 1]}}
+
+        def ask(session_id, tp_rank=0, timeout_ms=100):
+            if session_id == "s1":
+                # A settle lands while we are deciding, adding a new session.
+                conn._verdict_pending.setdefault("r0", {})["s9"] = [6, 7]
+                return [True, True]
+            return None
+
+        conn._coordinator_client.ask_verdict.side_effect = ask
+        conn._recheck_pending_verdicts()
+        self.assertEqual(
+            {"s9": [6, 7]},
+            conn._verdict_pending.get("r0", {}),
+            "the session that landed during the recheck was dropped",
+        )
+
+    def test_a_retired_requests_uris_are_dropped_when_its_saves_settle(self):
+        # A retired request keeps its URI map while a save is in flight, but
+        # the last settle has to clear it: nothing can release or look those
+        # keys up afterwards, and every _uris_other_requests_hold scan walks
+        # the map.
+        conn = worker_with([], MagicMock())
+        conn._tp_size = 2
+        conn._tp_rank = 1
+        conn._block_uris = {"r0": {0: "uri-0"}}
+        conn._in_flight["r0"] = {(1, "tp0_g0", 0): None}
+        conn._staged.pop("r0", None)
+        conn._captures.retire("r0")
+        conn._captures.settle("r0", 1, {("tp0_g0", 0): True})
+        conn._drop_uris_if_idle("r0")
+        self.assertEqual({}, conn._block_uris.get("r0", {}))
+        # A request that still owns captures keeps its keys.
+        conn._block_uris = {"r1": {0: "uri-0"}}
+        conn._in_flight["r1"] = {(1, "tp0_g0", 0): None}
+        conn._drop_uris_if_idle("r1")
+        self.assertEqual({"r1": {0: "uri-0"}}, conn._block_uris)
+
+
+class TestVerdictRetention(unittest.TestCase):
+    """The coordinator keeps a verdict until every rank has consumed it."""
+
+    def _server(self):
+        from kv_cache_manager.py_connector.common.tp_coordinator import (
+            TpCoordinatorServer,
+        )
+
+        server = TpCoordinatorServer.__new__(TpCoordinatorServer)
+        server._tp_world_size = 2
+        server._verdicts = {}
+        server._verdict_acks = {}
+        server._verdicts_lock = threading.Lock()
+        return server
+
+    def _ask(self, server, session_id, tp_rank):
+        return server.answer_query(session_id, tp_rank)
+
+    def test_a_verdict_survives_until_every_rank_asked(self):
+        # Count-based eviction used to drop the oldest masks regardless of who
+        # had consumed them: a delayed rank then received None forever and kept
+        # its captures until retirement, starving the arena. Only the
+        # acknowledgements of every rank may retire a verdict.
+        server = self._server()
+        server.record_verdict("s-oldest", [True, True])
+        for index in range(2048):
+            server.record_verdict("s%d" % index, [True])
+        self.assertEqual(
+            [True, True],
+            self._ask(server, "s-oldest", tp_rank=0),
+            "a verdict was evicted before its rank asked",
+        )
+        # Rank 1 still gets its answer; after that the entry may go.
+        self.assertEqual([True, True], self._ask(server, "s-oldest", tp_rank=1))
+        self.assertNotIn("s-oldest", server._verdicts)
 
 
 class TestCaptureFloor(unittest.TestCase):
@@ -3041,8 +3208,11 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             None,
             retry.staged_slots,
         )
-        # One rank: the retry's own success is the global verdict, so it
-        # returns the slots.
+        # The retry's success is confirmed by the coordinator (one rank, in
+        # process): the recheck returns the slots.
+        conn._coordinator_client.ask_verdict.return_value = [True] * self.BLOCKS
+        conn._verdict_query_down_until = 0.0
+        conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         self.assertEqual(self.CAPACITY, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=0)
 
@@ -3162,6 +3332,7 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         )
         conn.on_save_finished(retry_session, confirmed)
         conn._coordinator_client.ask_verdict.return_value = [True] * self.BLOCKS
+        conn._verdict_query_down_until = 0.0
         conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         self.assertEqual(self.CAPACITY, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=0)
@@ -3307,11 +3478,16 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         )
         # Session 0 never settled, so its four records are still in flight
         # (part 1's blocks were never written); session 7's own four were
-        # taken and its callback wrote them on this single rank, so they were
-        # released. Two sessions on the same (spec, block) keys coexist, which
-        # is why the in-flight ownership is keyed by session.
+        # taken and its callback wrote them on this single rank, so they are
+        # staged and pending the coordinator's AND. Two sessions on the same
+        # (spec, block) keys coexist, which is why the in-flight ownership is
+        # keyed by session.
         self.assertEqual(self.BLOCKS, len(conn._in_flight.get("r0", {})))
         self.assertEqual({0}, {key[0] for key in conn._in_flight["r0"]})
+        self.assertEqual(self.BLOCKS, len(conn._staged.get("r0", {})))
+        conn._coordinator_client.ask_verdict.return_value = [True] * self.BLOCKS
+        conn._verdict_query_down_until = 0.0
+        conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
         self.assertEqual({}, conn._staged.get("r0", {}))
         self._assert_arena_accounting(conn, pool, sessions=0)
 

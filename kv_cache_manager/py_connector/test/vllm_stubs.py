@@ -817,6 +817,8 @@ def install_capture_ledger(conn: Any) -> None:
     conn._in_flight = conn._captures.in_flight
     conn._block_uris = {}
     conn._verdict_pending = {}
+    conn._verdict_lock = threading.Lock()
+    conn._verdict_query_down_until = 0.0
     conn._tp_size = getattr(conn, "_tp_size", 1)
 
 
