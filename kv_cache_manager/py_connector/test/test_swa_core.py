@@ -44,6 +44,7 @@ from kv_cache_manager.py_connector.test.vllm_stubs import (
 from kv_cache_manager.py_connector.common.tp_coordinator import SaveContext
 from kv_cache_manager.py_connector.vllm.connector_worker import (
     CAPTURE_POOL_WAIT_SECONDS,
+    FINISH_WRITE_CACHE_ATTEMPTS,
     _Capture,
     _CaptureLedger,
 )
@@ -3075,6 +3076,11 @@ class TestVerdictPublication(unittest.TestCase):
         conn = self._worker()
         conn._manager_client.finish_write_cache.side_effect = RuntimeError("socket")
         conn.on_save_finished("s1", self._context())
+        # Every attempt failed: the verdict stays unpublished.
+        self.assertEqual(
+            FINISH_WRITE_CACHE_ATTEMPTS,
+            conn._manager_client.finish_write_cache.call_count,
+        )
         conn._coordinator_server.record_verdict.assert_not_called()
 
         # The retry's report succeeds: now the verdict is published.
@@ -3082,6 +3088,27 @@ class TestVerdictPublication(unittest.TestCase):
         conn.on_save_finished("s2", self._context())
         conn._coordinator_server.record_verdict.assert_called_once_with(
             "s2", [True] * self.BLOCKS
+        )
+
+    def test_a_transient_report_failure_is_retried_before_giving_up(self):
+        # The session is out of the tracking map by the time the report runs,
+        # so a single failure would mean the locations are never committed: the
+        # block is not durable and its captures stay pinned until the request
+        # retires. A transient failure must be retried -- and a report that
+        # finally lands publishes the verdict as usual.
+        conn = self._worker()
+        calls = {"n": 0}
+
+        def flaky(report):
+            calls["n"] += 1
+            if calls["n"] < FINISH_WRITE_CACHE_ATTEMPTS:
+                raise RuntimeError("transient")
+
+        conn._manager_client.finish_write_cache.side_effect = flaky
+        conn.on_save_finished("s1", self._context())
+        self.assertEqual(FINISH_WRITE_CACHE_ATTEMPTS, calls["n"])
+        conn._coordinator_server.record_verdict.assert_called_once_with(
+            "s1", [True] * self.BLOCKS
         )
 
     def test_retirement_cancels_the_sessions_it_can_no_longer_ask_about(self):

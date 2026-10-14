@@ -28,6 +28,13 @@ from kv_cache_manager.py_connector.common.logger import logger
 #: only comes back with a restart, and an engine step must not pay a receive
 #: timeout per pending session meanwhile.
 VERDICT_QUERY_BACKOFF_SECONDS = 5.0
+
+#: The manager's commit report is retried. By the time it runs the write
+#: session is already out of the tracking map, so nothing would ever send it
+#: again: the locations stay uncommitted (the block is not durable) and the
+#: captures stay pinned until the request retires.
+FINISH_WRITE_CACHE_ATTEMPTS = 3
+FINISH_WRITE_CACHE_RETRY_SECONDS = 0.2
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.py_connector.common.tp_coordinator import (
     SaveContext,
@@ -1644,28 +1651,41 @@ class ConnectorWorker:
             write_session_id,
         )
         committed = True
-        try:
-            self._manager_client.finish_write_cache(
-                {
-                    "trace_id": "finish_%s" % write_session_id[:8],
-                    "instance_id": self._extra_config.instance_id,
-                    "write_session_id": write_session_id,
-                    "success_blocks": {
-                        "bool_masks": {"values": save_context.success_mask}
-                    },
-                }
-            )
-        except Exception as e:
-            # The report failed: the manager may still hold these blocks
-            # uncommitted, so nothing may be released (a retry has to find the
-            # bytes). The verdict is *not* published below either: making it
-            # queryable here would let every rank release its only captured
-            # copy of blocks the manager never committed, and the retry could
-            # not republish them once the HBM window moved.
-            committed = False
-            logger.warning(
-                "finish_write_cache failed, session: %s, error: %s", write_session_id, e
-            )
+        report = {
+            "trace_id": "finish_%s" % write_session_id[:8],
+            "instance_id": self._extra_config.instance_id,
+            "write_session_id": write_session_id,
+            "success_blocks": {"bool_masks": {"values": save_context.success_mask}},
+        }
+        for attempt in range(FINISH_WRITE_CACHE_ATTEMPTS):
+            try:
+                self._manager_client.finish_write_cache(report)
+                break
+            except Exception as e:
+                if attempt + 1 >= FINISH_WRITE_CACHE_ATTEMPTS:
+                    # Gave up: the manager may still hold these blocks
+                    # uncommitted, so nothing is released (a retry has to find
+                    # the bytes) and the verdict is not published -- publishing
+                    # it would let every rank release its only captured copy of
+                    # blocks the manager never committed.
+                    committed = False
+                    logger.warning(
+                        "finish_write_cache failed after %d attempts, session: "
+                        "%s, error: %s",
+                        FINISH_WRITE_CACHE_ATTEMPTS,
+                        write_session_id,
+                        e,
+                    )
+                    break
+                logger.warning(
+                    "finish_write_cache failed (attempt %d/%d), retrying: "
+                    "session %s, error: %s",
+                    attempt + 1,
+                    FINISH_WRITE_CACHE_ATTEMPTS,
+                    write_session_id,
+                    e,
+                )
+                time.sleep(FINISH_WRITE_CACHE_RETRY_SECONDS)
 
         # The verdict is published, not acted on: releasing here would race
         # this rank's own settle (the last report may be its own task, whose
