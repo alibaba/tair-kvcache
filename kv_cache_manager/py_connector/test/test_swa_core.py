@@ -2485,6 +2485,40 @@ class TestTpVerdictRelay(unittest.TestCase):
         conn._release_staged("r0")
         self.assertEqual(self.CAPACITY, pool.free_blocks)
 
+    def _mapping(self, ordered, verdict):
+        conn, dtm, pool, group = self._worker(tp_size=2, tp_rank=0, verdict=verdict)
+        conn._captures.release_staged = MagicMock(return_value=len(ordered))
+        conn._verdict_pending = {"r0": {"s9": list(ordered)}}
+        conn._recheck_pending_verdicts()
+        released = [
+            call.args[1]
+            for call in conn._captures.release_staged.call_args_list
+            if call.args and call.args[0] == "r0"
+        ]
+        self.assertEqual({}, conn._verdict_pending)
+        return released
+
+    def test_a_verdict_indexes_by_position_not_by_block_number(self):
+        # The mask follows the announced range: position i is the session's
+        # i-th block. A session that starts at block 16 has nothing in common
+        # with it, so an absolute-number lookup (block < len(mask)) leaves every
+        # block unmatched and the session keeps its bytes forever -- only
+        # sessions starting at block 0, where both spaces coincide, ever
+        # released. That is why the run freed one session's 96 slots and
+        # stranded the other 17.
+        self.assertEqual(
+            [[16, 17, 18, 19]],
+            self._mapping([16, 17, 18, 19], [True, True, True, True]),
+        )
+
+    def test_a_rejected_position_keeps_that_block(self):
+        # Positional in both directions: a False at position 3 must keep the
+        # session's 4th block (19), not whichever block shares index 3 (3).
+        self.assertEqual(
+            [[16, 17, 18]],
+            self._mapping([16, 17, 18, 19], [True, True, True, False]),
+        )
+
     def test_tp0_releases_when_the_and_arrives(self):
         # tp0 follows the same rule as every other rank: the AND publishes the
         # verdict, and the pending recheck releases. Releasing inside
