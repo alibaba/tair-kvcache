@@ -20,6 +20,8 @@ public:
 
 private:
     static bool ParseKmonitorTags(const std::string &tags_str, std::map<std::string, std::string> &tags_map);
+    // The default IP tag is not an explicitly configured receiver.
+    bool has_hippo_slave_ip_ = false;
 
 public:
     std::string hippo_slave_ip;

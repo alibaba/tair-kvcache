@@ -76,15 +76,20 @@ TEST_F(KmonParamTest, TestInitWithEnvironmentVariables) {
     EXPECT_EQ(param_->kmonitor_normal_sample_period, 10);
 }
 
-TEST_F(KmonParamTest, TestSdkDiscoveryTakesPriorityOverHippoAddress) {
-    ScopedEnv hippo_address("HIPPO_SLAVE_IP", "10.0.0.1");
+TEST_F(KmonParamTest, TestHippoAddressTakesPriorityOverSdkDiscovery) {
+    for (const auto *ip : {"10.0.0.1", "127.0.0.1"}) {
+        ScopedEnv hippo_address("HIPPO_SLAVE_IP", ip);
+        SCOPED_TRACE(ip);
 
-    ASSERT_TRUE(param_->Init());
+        ASSERT_TRUE(param_->Init());
 
-    EXPECT_EQ(param_->hippo_slave_ip, "10.0.0.1");
-    EXPECT_TRUE(param_->kmonitor_sink_address.empty());
-    EXPECT_TRUE(param_->GetSinkAddress("host-from-sdk").empty());
-    EXPECT_TRUE(param_->GetSinkAddress("host-from-sdk", "10.94.0.97").empty());
+        const auto expected_address = std::string(ip) + ":4141";
+        EXPECT_EQ(param_->hippo_slave_ip, ip);
+        EXPECT_TRUE(param_->kmonitor_sink_address.empty());
+        EXPECT_EQ(param_->GetSinkAddress("host-from-sdk"), expected_address);
+        EXPECT_EQ(param_->GetSinkAddress("host-from-sdk", "10.94.0.97"), expected_address);
+        EXPECT_EQ(param_->ResolveSinkAddress(), expected_address);
+    }
 }
 
 TEST_F(KmonParamTest, TestExplicitSinkOverridesSdkDiscoveryAndHippoAddress) {
@@ -97,6 +102,7 @@ TEST_F(KmonParamTest, TestExplicitSinkOverridesSdkDiscoveryAndHippoAddress) {
     EXPECT_EQ(param_->GetSinkAddress(""), "10.0.0.2:4141");
     EXPECT_EQ(param_->GetSinkAddress("host-from-sdk", "10.94.0.97"), "10.0.0.2:4141");
     EXPECT_EQ(param_->GetSinkAddress("", "10.94.0.97"), "10.0.0.2:4141");
+    EXPECT_EQ(param_->ResolveSinkAddress(), "10.0.0.2:4141");
 }
 
 TEST_F(KmonParamTest, TestExplicitSinkUsesCustomPort) {
@@ -109,7 +115,6 @@ TEST_F(KmonParamTest, TestExplicitSinkUsesCustomPort) {
 }
 
 TEST_F(KmonParamTest, TestSdkDiscoveryUsesCustomPort) {
-    ScopedEnv hippo_address("HIPPO_SLAVE_IP", "10.0.0.1");
     ScopedEnv port("kmonitorPort", "5141");
 
     ASSERT_TRUE(param_->Init());
@@ -118,12 +123,12 @@ TEST_F(KmonParamTest, TestSdkDiscoveryUsesCustomPort) {
     EXPECT_EQ(param_->GetSinkAddress("host-from-sdk", "10.94.0.97"), "host-from-sdk:5141");
 }
 
-TEST_F(KmonParamTest, TestHostInfoIpTakesPriorityOverHippoAddress) {
+TEST_F(KmonParamTest, TestHippoAddressTakesPriorityOverHostInfoIp) {
     ScopedEnv hippo_address("HIPPO_SLAVE_IP", "10.0.0.1");
 
     ASSERT_TRUE(param_->Init());
 
-    EXPECT_EQ(param_->GetSinkAddress("", "10.94.0.97"), "10.94.0.97:4141");
+    EXPECT_EQ(param_->GetSinkAddress("", "10.94.0.97"), "10.0.0.1:4141");
 }
 
 TEST_F(KmonParamTest, TestHostInfoIpUsesDefaultAndCustomPort) {
@@ -135,13 +140,15 @@ TEST_F(KmonParamTest, TestHostInfoIpUsesDefaultAndCustomPort) {
     EXPECT_EQ(param_->GetSinkAddress("", "10.94.0.97"), "10.94.0.97:5141");
 }
 
-TEST_F(KmonParamTest, TestMissingSdkHostFallsBackToHippoAddress) {
+TEST_F(KmonParamTest, TestHippoAddressUsesCustomPort) {
     ScopedEnv hippo_address("HIPPO_SLAVE_IP", "10.0.0.1");
     ScopedEnv port("kmonitorPort", "5141");
 
     ASSERT_TRUE(param_->Init());
 
     EXPECT_EQ(param_->GetSinkAddress(""), "10.0.0.1:5141");
+    EXPECT_EQ(param_->GetSinkAddress("host-from-sdk", "10.94.0.97"), "10.0.0.1:5141");
+    EXPECT_EQ(param_->ResolveSinkAddress(), "10.0.0.1:5141");
 }
 
 TEST_F(KmonParamTest, TestEmptySinkAndPortUseSdkDefaults) {

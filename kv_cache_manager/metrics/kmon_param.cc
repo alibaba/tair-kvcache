@@ -40,6 +40,7 @@ KmonParam::KmonParam()
 
 bool KmonParam::Init() {
     hippo_slave_ip = EnvUtil::GetEnv(kHippoSlaveIp, "127.0.0.1");
+    has_hippo_slave_ip_ = !EnvUtil::GetEnv(kHippoSlaveIp, "").empty();
     /*** for kmon ***/
     kmonitor_port = EnvUtil::GetEnv(kKmonitorPort, "4141");
     if (kmonitor_port.empty()) {
@@ -63,7 +64,7 @@ bool KmonParam::Init() {
 }
 
 std::string KmonParam::ResolveSinkAddress() const {
-    if (!kmonitor_sink_address.empty()) {
+    if (!kmonitor_sink_address.empty() || has_hippo_slave_ip_) {
         return GetSinkAddress("");
     }
     const auto sdk_host_name = kmonitor::Util::GetMachineName();
@@ -83,6 +84,9 @@ std::string KmonParam::GetSinkAddress(const std::string &sdk_host_name, const st
     if (!kmonitor_sink_address.empty()) {
         return kmonitor_sink_address + ":" + kmonitor_port;
     }
+    if (has_hippo_slave_ip_) {
+        return hippo_slave_ip + ":" + kmonitor_port;
+    }
     if (!sdk_host_name.empty()) {
         // The SDK discovers the host through /etc/hostinfo and uses port 4141.
         // Keep the complete address empty to enable that path.
@@ -91,9 +95,7 @@ std::string KmonParam::GetSinkAddress(const std::string &sdk_host_name, const st
     if (!host_info_ip.empty()) {
         return host_info_ip + ":" + kmonitor_port;
     }
-    // Preserve Hippo and local-agent deployments when SDK discovery is unavailable.
-    const auto &fallback_host = hippo_slave_ip.empty() ? std::string("127.0.0.1") : hippo_slave_ip;
-    return fallback_host + ":" + kmonitor_port;
+    return "127.0.0.1:" + kmonitor_port;
 }
 
 std::string KmonParam::ParseHostInfoIp(std::istream &input) {
