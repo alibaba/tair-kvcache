@@ -3046,6 +3046,107 @@ class TestAllocationFailureRelease(unittest.TestCase):
         )
 
 
+class TestLateSettleAfterRetirement(unittest.TestCase):
+    """wave13 #5/#6: a settle after retirement, and cancel backoff."""
+
+    BLOCKS = 4
+
+    def _worker(self):
+        import kv_cache_manager.py_connector.vllm.data_transfer as dt
+
+        patcher = mock.patch.object(dt, "batch_gather_scatter_helper")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        group = windowed_group()
+        pool = _StagingPool(torch.device("cpu"), group.per_block_bytes, 16)
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        dtm._extra_config = SimpleNamespace(
+            block_per_save_task=8, block_per_load_task=8
+        )
+        dtm._io_executor = ThreadPoolExecutor(max_workers=2)
+        conn = worker_with([group], dtm)
+        conn._pending_saves = {}
+        conn._device_mod = MagicMock()
+        conn._tp_size = 2
+        conn._tp_rank = 1
+        conn._manager_client = MagicMock()
+        conn._extra_config = SimpleNamespace(
+            instance_id="late-settle", block_per_save_task=8, block_per_load_task=8
+        )
+        conn._coordinator_client.ask_verdict.return_value = None
+        conn._verdict_query_down_until = 0.0
+        conn._retired_requests = set()
+        return conn, dtm, pool, group
+
+    def _run(self, conn, dtm, group, session=1):
+        blocks = list(range(self.BLOCKS))
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_capture_request(
+            CaptureRequest("r0", blocks, all_block_ids=[list(range(7, 11))])
+        )
+        meta.add_save_request(
+            SaveRequest(
+                req_id="r0",
+                write_session_id="s%d" % session,
+                manager_block_idxes=blocks,
+                all_block_ids=[list(range(7, 11))],
+                target_locations=[
+                    {
+                        "block_idxes": [block],
+                        "location_specs": [{"name": "tp0_g0", "uri": "u%d" % block}],
+                    }
+                    for block in blocks
+                ],
+                session_id=session,
+            )
+        )
+        conn.wait_for_save(meta)
+        deadline = time.time() + 5
+        while conn._in_flight.get("r0") and time.time() < deadline:
+            time.sleep(0.01)
+
+    def test_a_settle_after_retirement_is_cancelled_not_registered(self):
+        # FinishRequest often runs before the asynchronous save lands: the
+        # retirement already released the captures and the coordinator must be
+        # told this rank will not ask. Registering a pending entry instead
+        # would be rechecked every step forever, and cancelled never.
+        conn, dtm, pool, group = self._worker()
+        conn._release_staged("r0")  # the retirement path
+        self.assertIn("r0", conn._retired_requests)
+        conn._coordinator_client.cancel_verdict.reset_mock()
+        self._run(conn, dtm, group)
+        self.assertEqual({}, conn._verdict_pending.get("r0", {}))
+        self.assertEqual(
+            [mock.call("s1", 0), mock.call("s1", 1)],
+            conn._coordinator_client.cancel_verdict.call_args_list,
+        )
+        # The bytes were released with the retirement, not kept for a verdict
+        # nobody will consume.
+        self.assertEqual({}, conn._staged.get("r0", {}))
+
+    def test_the_retirement_cancels_respect_the_backoff(self):
+        # A coordinator that is down must not make retirement pay a receive
+        # timeout per session: one failure mutes the endpoint and ends the
+        # round, and a muted endpoint is not tried at all.
+        conn, dtm, pool, group = self._worker()
+        conn._verdict_pending = {"r0": {"s1": [0, 1], "s2": [2, 3], "s3": [4, 5]}}
+        conn._coordinator_client.cancel_verdict.return_value = False
+        conn._drop_pending_verdicts("r0")
+        self.assertEqual(1, conn._coordinator_client.cancel_verdict.call_count)
+        self.assertGreater(conn._verdict_query_down_until, time.monotonic())
+
+        # Muted: the next retirement does not even try.
+        conn._verdict_pending = {"r1": {"s4": [0, 1]}}
+        conn._coordinator_client.cancel_verdict.reset_mock()
+        conn._drop_pending_verdicts("r1")
+        self.assertEqual(0, conn._coordinator_client.cancel_verdict.call_count)
+
+
 class TestVerdictPublication(unittest.TestCase):
     """wave10: a verdict is a fact only once the manager committed."""
 

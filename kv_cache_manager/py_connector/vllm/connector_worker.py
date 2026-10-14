@@ -267,8 +267,10 @@ class _CaptureLedger:
             staged = self.staged.pop(req_id, {})
             for capture in staged.values():
                 self._release(capture)
-            if req_id in self.in_flight:
-                self._retired.add(req_id)
+            # The request is retired from here on, in-flight entries or not: a
+            # save callback that lands later must release its bytes instead of
+            # staging them for a verdict nobody will consume.
+            self._retired.add(req_id)
             return len(staged)
 
 
@@ -366,6 +368,10 @@ class ConnectorWorker:
         # round and mutes the endpoint for a while instead of paying that per
         # session over and over.
         self._verdict_query_down_until = 0.0
+        # Requests whose FinishRequest already ran (see _release_staged): a
+        # save callback that lands afterwards must not rebuild verdict
+        # bookkeeping that nothing would drop any more.
+        self._retired_requests: Set[str] = set()
 
         self._tp_rank = get_tensor_model_parallel_rank()
         # torch device module (torch.cuda / torch.musa / ...), set in
@@ -824,6 +830,18 @@ class ConnectorWorker:
                     # marked pending: the coordinator's merged, all-group AND --
                     # published by on_save_finished or answered by the query --
                     # releases them, within a step.
+                    session_key = (
+                        getattr(save_req, "write_session_id", None)
+                        or str(save_req.session_id)
+                    )
+                    if save_req.req_id in self._retired_requests:
+                        # The request is gone: the retirement already released
+                        # its captures, no verdict will be consumed, and a
+                        # pending entry here would be rechecked every step
+                        # without ever being cancelled (the retirement was the
+                        # only other place that clears them).
+                        for rank in range(self._tp_size):
+                            self._coordinator_client.cancel_verdict(session_key, rank)
                     ordered: List[int] = []
                     for plan in plans:
                         if getattr(plan.group, "retention", None) is None:
@@ -833,12 +851,7 @@ class ConnectorWorker:
                             for pos in range(len(plan.staged_slots or ()))
                         ]
                         break
-                    if ordered:
-                        # The key the coordinator knows this session by.
-                        session_key = (
-                            getattr(save_req, "write_session_id", None)
-                            or str(save_req.session_id)
-                        )
+                    if ordered and save_req.req_id not in self._retired_requests:
                         with self._verdict_lock:
                             self._verdict_pending.setdefault(save_req.req_id, {})[
                                 session_key
@@ -951,9 +964,19 @@ class ConnectorWorker:
             return
         # The request is gone on this rank while slower ranks may still be
         # writing it: the coordinator would keep the entry waiting for a query
-        # that cannot come any more. Cancelling counts as this rank's answer.
-        for session_id in pending:
-            self._coordinator_client.cancel_verdict(session_id, self._tp_rank)
+        # that cannot come any more. Cancelling counts as this rank's answer --
+        # and like the query loop it stops at the first failure and mutes the
+        # endpoint, instead of paying one receive timeout per session while the
+        # request retires.
+        if time.monotonic() >= self._verdict_query_down_until:
+            for session_id in pending:
+                if not self._coordinator_client.cancel_verdict(
+                    session_id, self._tp_rank
+                ):
+                    self._verdict_query_down_until = (
+                        time.monotonic() + VERDICT_QUERY_BACKOFF_SECONDS
+                    )
+                    break
         self._captures.release_staged(
             req_id, [block for blocks in pending.values() for block in blocks]
         )
@@ -1623,6 +1646,7 @@ class ConnectorWorker:
         them and free the same slot twice (the pool's free list would then hold
         the range twice and dispatch it to two transfers; review_r1 S1).
         """
+        self._retired_requests.add(req_id)
         self._drop_pending_verdicts(req_id)
         released = self._captures.retire(req_id)
         if req_id not in self._in_flight:
