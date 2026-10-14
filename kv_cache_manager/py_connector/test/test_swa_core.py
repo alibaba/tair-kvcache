@@ -2741,6 +2741,61 @@ class TestVerdictQueryHygiene(unittest.TestCase):
         self.assertEqual({"r1": {0: "uri-0"}}, conn._block_uris)
 
 
+class TestVerdictPublication(unittest.TestCase):
+    """wave10: a verdict is a fact only once the manager committed."""
+
+    BLOCKS = 4
+
+    def _worker(self):
+        conn = worker_with([], MagicMock())
+        conn._tp_size = 2
+        conn._tp_rank = 0
+        conn._manager_client = MagicMock()
+        conn._extra_config = SimpleNamespace(instance_id="test")
+        conn._coordinator_server = MagicMock()
+        return conn
+
+    def _context(self):
+        from kv_cache_manager.py_connector.common.tp_coordinator import SaveContext
+
+        return SaveContext(
+            locations=[{"block_idxes": [b]} for b in range(self.BLOCKS)],
+            result_per_rank={0: [True] * self.BLOCKS, 1: [True] * self.BLOCKS},
+        )
+
+    def test_a_failed_report_does_not_publish_the_verdict(self):
+        # Every rank wrote, but the report to the manager failed: the block was
+        # never committed. Publishing here would let every rank release its
+        # only captured copy, and a retry could not republish the windowed
+        # specs once the HBM window moved.
+        conn = self._worker()
+        conn._manager_client.finish_write_cache.side_effect = RuntimeError("socket")
+        conn.on_save_finished("s1", self._context())
+        conn._coordinator_server.record_verdict.assert_not_called()
+
+        # The retry's report succeeds: now the verdict is published.
+        conn._manager_client.finish_write_cache.side_effect = None
+        conn.on_save_finished("s2", self._context())
+        conn._coordinator_server.record_verdict.assert_called_once_with(
+            "s2", [True] * self.BLOCKS
+        )
+
+    def test_retirement_cancels_the_sessions_it_can_no_longer_ask_about(self):
+        # A fast rank retires the request while slower ranks are still writing
+        # it: without telling the coordinator, its entry waits for a query that
+        # cannot come, and the table grows without bound under repeated early
+        # retirements.
+        conn = self._worker()
+        conn._verdict_pending = {"r0": {"s1": [0, 1], "s2": [2, 3]}}
+        conn._captures.release_staged = MagicMock()
+        conn._drop_pending_verdicts("r0")
+        self.assertEqual(
+            [mock.call("s1", 0), mock.call("s2", 0)],
+            conn._coordinator_client.cancel_verdict.call_args_list,
+        )
+        self.assertEqual({}, conn._verdict_pending)
+
+
 class TestVerdictRetention(unittest.TestCase):
     """The coordinator keeps a verdict until every rank has consumed it."""
 
@@ -2758,6 +2813,24 @@ class TestVerdictRetention(unittest.TestCase):
 
     def _ask(self, server, session_id, tp_rank):
         return server.answer_query(session_id, tp_rank)
+
+    def test_a_cancelled_verdict_goes_away(self):
+        # The retiring rank cannot ask any more; its cancel counts as the
+        # answer so the entry does not wait for it forever.
+        server = self._server()
+        server.record_verdict("s1", [True])
+        server.cancel_query("s1", tp_rank=1)
+        self.assertEqual([True], self._ask(server, "s1", tp_rank=0))
+        self.assertNotIn("s1", server._verdicts)
+
+    def test_the_storage_is_bounded(self):
+        # Entries no rank ever asks about (a dead rank) must not grow without
+        # bound: the cap evicts the oldest and says so.
+        server = self._server()
+        for index in range(5000):
+            server.record_verdict("s%d" % index, [True])
+        self.assertLessEqual(len(server._verdicts), 4096)
+        self.assertLessEqual(len(server._verdict_acks), 4096)
 
     def test_a_verdict_survives_until_every_rank_asked(self):
         # Count-based eviction used to drop the oldest masks regardless of who
