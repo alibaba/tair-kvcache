@@ -174,16 +174,17 @@ class TpCoordinatorServer:
         # took is what it announces and what the other ranks probe for.
         self._context = zmq.Context()
         self._event_socket = self._context.socket(zmq.PULL)
-        self._base_port = self._bind_retrying(self._event_socket, base_port, "events")
         # The verdict query rides a second socket (REQ/REP): the event stream
-        # is one-way (PUSH/PULL), and a query needs an answer.
+        # is one-way (PUSH/PULL), and a query needs an answer. The two are
+        # bound as a *pair* -- event B, query B+1 -- because that is the pair
+        # the clients look for; chosen independently, a taken neighbour would
+        # make the announced pair a lie and send every event to a dead port.
         self._query_socket = self._context.socket(zmq.REP)
-        self._query_port = self._bind_retrying(
-            self._query_socket, self._base_port + 1, "verdict query"
-        )
+        self._base_port = self._bind_pair(base_port)
+        self._query_port = self._base_port + 1
         logger.warning(
             "TairKvCacheConnector coordinator started: transfer_client_config "
-            "coordinator_base_port=%d verdict_query_port=%d",
+            "coordinator_base_port=%d verdict_query_port=%d (pair)",
             self._base_port,
             self._query_port,
         )
@@ -197,28 +198,42 @@ class TpCoordinatorServer:
         )
         self._query_thread.start()
 
-    def _bind_retrying(self, socket: Any, port: int, what: str) -> int:
-        """Bind ``socket`` at ``port`` or the next few ports; raise if none.
+    def _bind_pair(self, base_port: int) -> int:
+        """Bind the event and query sockets on ``candidate``/``candidate+1``.
 
-        Failing here is deliberate (fail-closed): the alternative is a
-        background thread that dies on a bind error while the connector looks
-        healthy, which loses every save the instance makes.
+        Both or neither: the clients derive the query port from the event port
+        (``event + 1``), so a pair bound from two independent choices would
+        answer on a port they never probe and take every event to a dead one.
+        Failing over the whole range is deliberate (fail-closed): the
+        alternative is a coordinator whose background thread dies on a bind
+        error while the connector looks healthy, losing every save it makes.
         """
         last_error: Optional[Exception] = None
-        for candidate in range(port, port + COORDINATOR_PORT_ATTEMPTS):
+        for candidate in range(base_port, base_port + COORDINATOR_PORT_ATTEMPTS):
             try:
-                socket.bind("tcp://%s:%d" % (self._host_ip, candidate))
-                return candidate
+                self._event_socket.bind("tcp://%s:%d" % (self._host_ip, candidate))
             except zmq.ZMQError as e:
                 last_error = e
+                continue
+            try:
+                self._query_socket.bind(
+                    "tcp://%s:%d" % (self._host_ip, candidate + 1)
+                )
+            except zmq.ZMQError as e:
+                # Give the event port back and try the next pair: a half-bound
+                # pair is exactly what the clients cannot find.
+                last_error = e
+                self._event_socket.close(linger=0)
+                self._event_socket = self._context.socket(zmq.PULL)
+                continue
+            return candidate
         raise RuntimeError(
-            "TairKvCacheConnector: cannot bind the coordinator's %s socket on "
-            "%s:%d-%d (%s); another process holds those ports"
+            "TairKvCacheConnector: cannot bind the coordinator's event/query "
+            "port pairs on %s:%d-%d (%s); another process holds those ports"
             % (
-                what,
                 self._host_ip,
-                port,
-                port + COORDINATOR_PORT_ATTEMPTS - 1,
+                base_port,
+                base_port + COORDINATOR_PORT_ATTEMPTS,
                 last_error,
             )
         )

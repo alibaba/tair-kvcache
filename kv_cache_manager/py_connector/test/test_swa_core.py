@@ -2938,6 +2938,27 @@ class TestCoordinatorBind(unittest.TestCase):
         self.assertEqual(port + 1, server._base_port)
         self.assertEqual(port + 2, server._query_port)
 
+    def test_a_taken_query_port_moves_the_whole_pair(self):
+        # The clients look for event B with query B+1. If B is free but B+1 is
+        # not, binding the event socket on B would announce a pair nobody can
+        # reach: the pair moves together instead.
+        import socket as socket_module
+
+        from kv_cache_manager.py_connector.common.tp_coordinator import (
+            TpCoordinatorServer,
+        )
+
+        port = self._free_port()
+        holder = socket_module.socket()
+        holder.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+        holder.bind(("127.0.0.1", port + 1))
+        holder.listen(1)
+        self.addCleanup(holder.close)
+        server = TpCoordinatorServer("127.0.0.1", port, 2, lambda *a: None)
+        self.addCleanup(server.shutdown)
+        self.assertEqual(port + 2, server._base_port)
+        self.assertEqual(port + 3, server._query_port)
+
     def test_all_taken_ports_fail_loudly(self):
         import socket as socket_module
 
@@ -2948,7 +2969,9 @@ class TestCoordinatorBind(unittest.TestCase):
 
         port = self._free_port()
         holders = []
-        for offset in range(COORDINATOR_PORT_ATTEMPTS):
+        # One port more than the attempts: the last candidate's query port
+        # (base + attempts) belongs to the last pair.
+        for offset in range(COORDINATOR_PORT_ATTEMPTS + 1):
             sock = socket_module.socket()
             sock.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
             try:
