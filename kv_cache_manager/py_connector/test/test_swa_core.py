@@ -234,6 +234,12 @@ def worker_with(groups: List[AttentionTransferGroup], dtm: Any = None) -> Any:
     )
     conn._data_transfer = dtm
     install_capture_ledger(conn)
+    # The verdict query talks to the coordinator (another process in
+    # production): a bare worker cannot ask, so pending stays pending -- the
+    # tests that care stub it explicitly.
+    conn._coordinator_client = MagicMock()
+    conn._coordinator_client.ask_verdict.return_value = False
+    conn._coordinator_server = MagicMock()
     return conn
 
 
@@ -2347,22 +2353,22 @@ class TestCommitConfirmation(unittest.TestCase):
 
 
 class TestTpVerdictRelay(unittest.TestCase):
-    """TP: every rank's capture must survive until its own write consumed it.
+    """TP: a rank that is not the coordinator confirms before it releases.
 
-    The gemma-3-4b tp run failed every save on rank 1 (2365 withheld captures,
-    138 groups of "16/16 announced blocks have no captured bytes"): rank 1 has
-    no coordinator (it runs on tp0), so its successes were retained with only
-    the late manager mask as a drain, its arena filled, its captures were
-    withheld, and the cross-rank AND rejected every block. These tests pin the
-    relay that delivers tp0's verdict to every rank, and the guard that keeps a
-    release from stripping bytes a live session still has to consume (other
-    requests' keys *and* the same request's, which TP writes on both ranks).
+    The coordinator (the cross-rank AND) runs in the tp0 worker's process, and
+    the workers are separate processes -- the task even runs the engine core in
+    its own. So a rank-1 settle cannot see the verdict; it asks for it. Until
+    the answer arrives its captures stay staged (rank 0 may fail and the
+    manager then rejects the block for everyone), and it is rechecked on the
+    next step's metadata. Releasing on a local success without asking strands
+    the other ranks' captures (the tp run: 2545 withheld, 138 empty groups) --
+    hence both directions are pinned here.
     """
 
     CAPACITY = 16
     BLOCKS = 4
 
-    def _worker(self, tp_size: int, instance_id: str = "tp-relay"):
+    def _worker(self, tp_size: int, tp_rank: int = 1, verdict=False):
         import kv_cache_manager.py_connector.vllm.data_transfer as dt
 
         patcher = mock.patch.object(dt, "batch_gather_scatter_helper")
@@ -2377,17 +2383,19 @@ class TestTpVerdictRelay(unittest.TestCase):
         dtm._transfer_client = MagicMock()
         dtm._transfer_client.SaveKvCaches.return_value = [0]
         dtm._extra_config = SimpleNamespace(
-            block_per_save_task=8, block_per_load_task=8, instance_id=instance_id
+            block_per_save_task=8, block_per_load_task=8, instance_id="tp"
         )
         dtm._io_executor = ThreadPoolExecutor(max_workers=2)
         conn = worker_with([group], dtm)
         conn._pending_saves = {}
         conn._device_mod = MagicMock()
         conn._tp_size = tp_size
+        conn._tp_rank = tp_rank
         conn._manager_client = MagicMock()
         conn._extra_config = SimpleNamespace(
-            instance_id=instance_id, block_per_save_task=8, block_per_load_task=8
+            instance_id="tp", block_per_save_task=8, block_per_load_task=8
         )
+        conn._coordinator_client.ask_verdict.return_value = verdict
         return conn, dtm, pool, group
 
     def _run(self, conn, dtm, group, session, uris, ok=True):
@@ -2406,7 +2414,7 @@ class TestTpVerdictRelay(unittest.TestCase):
                 target_locations=[
                     {
                         "block_idxes": [block],
-                        "location_specs": [{"name": "tp0_g0", "uri": uris[block]}],
+                        "location_specs": [{"name": "tp0_g0", "uri": "u%d" % block}],
                     }
                     for block in blocks
                 ],
@@ -2419,128 +2427,72 @@ class TestTpVerdictRelay(unittest.TestCase):
             time.sleep(0.01)
         return blocks
 
-    def test_tp0_verdict_reaches_the_other_rank_through_the_metadata(self):
-        # The relay: rank 1 keeps its bytes (its own verdict says nothing about
-        # the other rank), and tp0's confirmation makes the *next metadata*
-        # release them on rank 1 as well. Without it rank 1 drains only when a
-        # later manager answer happens by, and its arena starves (the run).
-        sched = make_connector_scheduler(
-            manager_block_size=MBS, num_groups=1, windowed=1
-        )
-        sched._extra_config = SimpleNamespace(
-            instance_id="tp-relay", write_timeout_seconds=1
-        )
-        # A bare stub skips __init__, which is where the role registers itself.
-        from kv_cache_manager.py_connector.vllm.connector_scheduler import (
-            _VERDICT_RELAY,
-        )
+    def test_a_pending_verdict_keeps_the_bytes_until_it_is_confirmed(self):
+        # The settle asks and is told "not decided": the bytes stay, marked
+        # pending. The next step's metadata rechecks and the confirmation
+        # releases them -- without this the captures strand and the arena
+        # starves (the regression).
+        conn, dtm, pool, group = self._worker(tp_size=2, tp_rank=1, verdict=None)
+        blocks = self._run(conn, dtm, group, session=1, uris=None or ["u%d" % b for b in range(self.BLOCKS)])
+        self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
+        self.assertIn("s1", conn._verdict_pending.get("r0", {}))
 
-        _VERDICT_RELAY["tp-relay"] = sched
-        self.addCleanup(_VERDICT_RELAY.pop, "tp-relay", None)
-        rank0, dtm0, pool0, group0 = self._worker(tp_size=2)
-        rank1, dtm1, pool1, group1 = self._worker(tp_size=2)
-        uris = ["u%d" % block for block in range(self.BLOCKS)]
+        # The coordinator now has the AND: the recheck releases.
+        conn._coordinator_client.ask_verdict.return_value = [True] * self.BLOCKS
+        conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
+        self.assertEqual({}, conn._staged.get("r0", {}))
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
+        self.assertEqual({}, conn._verdict_pending.get("r0", {}))
 
-        blocks = self._run(rank1, dtm1, group1, session=1, uris=uris)
-        self.assertEqual(self.BLOCKS, len(rank1._staged["r0"]))
-        self.assertEqual(self.CAPACITY - self.BLOCKS, pool1.free_blocks)
+    def test_a_rejected_verdict_keeps_the_bytes_for_the_retry(self):
+        # A rank failed: the manager rejects the block for everyone, and this
+        # rank's bytes are the retry's only copy.
+        conn, dtm, pool, group = self._worker(tp_size=2, tp_rank=1, verdict=None)
+        blocks = self._run(conn, dtm, group, session=1, uris=["u%d" % b for b in range(self.BLOCKS)])
+        conn._coordinator_client.ask_verdict.return_value = [
+            True,
+            False,
+            True,
+            True,
+        ]
+        conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
+        # The committed blocks are released; the rejected one keeps its bytes
+        # (the manager rejected it for every rank, so it is announced again and
+        # the retry needs them).
+        self.assertEqual(
+            [("tp0_g0", 1)],
+            sorted(conn._staged["r0"]),
+            "a rejected block lost its bytes (or a committed one was kept)",
+        )
+        self.assertEqual({}, conn._verdict_pending.get("r0", {}))
 
-        # tp0 confirms (all ranks wrote): it releases locally and hands the
-        # verdict to the relay.
-        self._run(rank0, dtm0, group0, session=1, uris=uris)
+    def test_a_local_success_is_never_released_without_the_verdict(self):
+        # The P1 rule: with several ranks a local success says nothing, and a
+        # rank that cannot even ask keeps its bytes (the retirement is then the
+        # only release).
+        conn, dtm, pool, group = self._worker(tp_size=2, tp_rank=1, verdict=False)
+        self._run(conn, dtm, group, session=1, uris=["u%d" % b for b in range(self.BLOCKS)])
+        self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
+        conn._release_staged("r0")
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
+
+    def test_tp0_releases_when_the_and_arrives(self):
+        conn, dtm, pool, group = self._worker(tp_size=2, tp_rank=0)
+        blocks = self._run(
+            conn, dtm, group, session=1, uris=["u%d" % b for b in range(self.BLOCKS)]
+        )
+        self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
         context = SaveContext(
             locations=[{"block_idxes": [block]} for block in blocks],
             result_per_rank={0: [True] * self.BLOCKS, 1: [True] * self.BLOCKS},
         )
-        rank0.on_save_finished("s1", context)
-        self.assertEqual(self.CAPACITY, pool0.free_blocks)
-
-        # The next metadata carries the confirmed release to every rank.
-        meta = TairKvCacheConnectorMetadata(epoch=0)
-        sched._collect_release_captures(meta)
-        self.assertEqual([("r0", blocks)], released_blocks(meta))
-        rank1.wait_for_save(meta)
-        self.assertEqual({}, rank1._staged.get("r0", {}))
-        self.assertEqual(self.CAPACITY, pool1.free_blocks)
-
-    def test_the_confirmation_is_not_swallowed_by_an_empty_session(self):
-        # tp0 runs the coordinator, and its own chunk may hold no captures at
-        # all (its arena was toed, or the chunk had no windowed data) while the
-        # other rank's captures wait for the confirmation. Registering the
-        # session only when this rank has keys let on_save_finished return
-        # early and swallow the verdict: rank 1 kept every capture, its arena
-        # starved, its writes came up empty and the cross-rank AND rejected the
-        # whole prefix (the tp run: 2545 withheld, 138 empty groups).
-        sched = make_connector_scheduler(
-            manager_block_size=MBS, num_groups=1, windowed=1
-        )
-        sched._extra_config = SimpleNamespace(
-            instance_id="tp-empty", write_timeout_seconds=1
-        )
-        from kv_cache_manager.py_connector.vllm.connector_scheduler import (
-            _VERDICT_RELAY,
+        conn.on_save_finished("s1", context)
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
+        # ... and the same AND is what the other ranks query.
+        conn._coordinator_server.record_verdict.assert_called_with(
+            "s1", [True] * self.BLOCKS
         )
 
-        _VERDICT_RELAY["tp-empty"] = sched
-        self.addCleanup(_VERDICT_RELAY.pop, "tp-empty", None)
-
-        rank0, dtm0, pool0, group0 = self._worker(tp_size=2, instance_id="tp-empty")
-        rank1, dtm1, pool1, group1 = self._worker(tp_size=2, instance_id="tp-empty")
-        uris = ["u%d" % block for block in range(self.BLOCKS)]
-
-        # tp0's pool is toed: its capture is withheld, so it has no keys of
-        # its own for this session.
-        pool0.acquire(self.CAPACITY, timeout=0.01)
-        blocks0 = self._run(rank0, dtm0, group0, session=1, uris=uris)
-        self.assertEqual(self.BLOCKS, len(blocks0))
-        # ... while rank 1 captured every block.
-        self._run(rank1, dtm1, group1, session=1, uris=uris)
-        self.assertEqual(self.BLOCKS, len(rank1._staged["r0"]))
-
-        # Both ranks wrote: tp0 confirms and relays; rank 1 releases.
-        context = SaveContext(
-            locations=[{"block_idxes": [block]} for block in blocks0],
-            result_per_rank={0: [True] * self.BLOCKS, 1: [True] * self.BLOCKS},
-        )
-        rank0.on_save_finished("s1", context)
-        meta = TairKvCacheConnectorMetadata(epoch=0)
-        sched._collect_release_captures(meta)
-        self.assertEqual([("r0", blocks0)], released_blocks(meta))
-        rank1.wait_for_save(meta)
-        self.assertEqual({}, rank1._staged.get("r0", {}))
-        self.assertEqual(self.CAPACITY, pool1.free_blocks)
-
-    def test_a_stale_release_waits_for_the_requests_own_live_session(self):
-        # TP writes the same block keys on every rank, and each rank's sessions
-        # take their bytes when their plan runs. A release computed elsewhere
-        # (a failed announcement, the manager's mask) must not drop captures a
-        # live session of the *same* request is about to consume: its task
-        # would report "no captured bytes" and the cross-rank AND would reject
-        # the block for every rank.
-        sched = make_connector_scheduler(
-            manager_block_size=MBS, num_groups=1, windowed=1
-        )
-        sched._extra_config = SimpleNamespace(
-            instance_id="tp-live", write_timeout_seconds=1
-        )
-        # A session that will write blocks 0-3 is in flight (its plan has not
-        # arrived yet, so the whole announced range counts).
-        live = sched._record_announcement("r0", 4)
-        # ... and a release is queued for those blocks (a failed announcement).
-        sched._queue_capture_release("r0", -1, 4)
-        meta = TairKvCacheConnectorMetadata(epoch=0)
-        sched._collect_release_captures(meta)
-        self.assertEqual([], released_blocks(meta))
-
-        # Once that session is handed over it no longer protects its blocks
-        # (its own bytes are in flight, which a release cannot touch), so the
-        # same release goes through.
-        sched._remember_session_plan("r0", live, {0, 1, 2, 3})
-        sched._retire_session_protection("r0", live)
-        sched._queue_capture_release("r0", -1, 4)
-        meta = TairKvCacheConnectorMetadata(epoch=0)
-        sched._collect_release_captures(meta)
-        self.assertEqual([("r0", [0, 1, 2, 3])], released_blocks(meta))
 
 class TestCaptureFloor(unittest.TestCase):
     """The capture's room survives a burst of in-flight tasks.
