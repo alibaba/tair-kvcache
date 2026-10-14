@@ -1,9 +1,11 @@
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
 
 #include <cmath>
+#include <cstdio>
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -21,9 +23,9 @@ namespace {
 // WARN:
 // distinct raw strings that differ only in characters replaced by '_'
 // (e.g. "storage.type" vs "storage_type") will produce the same output
-// callers must avoid collisions after sanitization in all contexts:
+// callers must avoid collisions after sanitization for metric names
+// and prefixes. Label collisions are resolved in WriteLabels:
 // - metric names: duplicates cause repeated HELP/TYPE lines
-// - label keys: duplicates are invalid in prometheus text format
 // - prefixes: same collision risk as metric names
 std::string SanitizeIdentifier(const std::string &raw) {
     std::string out;
@@ -74,18 +76,25 @@ void EscapeLabelValue(std::ostringstream &ss, const std::string &v) {
     }
 }
 
-void WriteLabels(std::ostringstream &ss, const MetricsTags &tags) {
-    if (tags.empty()) {
+void WriteLabels(std::ostringstream &ss, const MetricsTags &tags, const MetricsTags &common_labels) {
+    MetricsTags labels;
+    // Normalize before merging so raw names like storage.type and
+    // storage_type cannot produce duplicate labels. Metric tags win.
+    for (const auto &[key, value] : tags) {
+        labels.emplace(SanitizeIdentifier(key), value);
+    }
+    labels.insert(common_labels.begin(), common_labels.end());
+    if (labels.empty()) {
         return;
     }
     ss << '{';
     bool first = true;
-    for (const auto &[k, v] : tags) {
+    for (const auto &[k, v] : labels) {
         if (!first) {
             ss << ',';
         }
         first = false;
-        ss << SanitizeIdentifier(k) << "=\"";
+        ss << k << "=\"";
         EscapeLabelValue(ss, v);
         ss << '"';
     }
@@ -94,7 +103,32 @@ void WriteLabels(std::ostringstream &ss, const MetricsTags &tags) {
 
 } // namespace
 
-std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::string &prefix) {
+MetricsTags PrometheusExporter::PrepareCommonTags(const MetricsTags &common_tags) {
+    MetricsTags labels;
+    for (const auto &[key, value] : common_tags) {
+        auto label = SanitizeIdentifier(key);
+        // Prometheus reserves __* labels and histogram/summary dimensions.
+        if (label.empty() || label.compare(0, 2, "__") == 0 || label == "le" || label == "quantile") {
+            continue;
+        }
+        auto [it, inserted] = labels.emplace(std::move(label), value);
+        if (!inserted) {
+            std::ostringstream error;
+            error << "ERROR: Prometheus common tag [" << key << "] normalizes to duplicate label [" << it->first
+                  << "]; overwriting value \"";
+            EscapeLabelValue(error, it->second);
+            error << "\" with \"";
+            EscapeLabelValue(error, value);
+            error << "\"\n";
+            fprintf(stderr, "%s", error.str().c_str());
+            it->second = value;
+        }
+    }
+    return labels;
+}
+
+std::string
+PrometheusExporter::Expose(MetricsRegistry &registry, const std::string &prefix, const MetricsTags &common_labels) {
     std::vector<MetricsRegistry::metrics_tuple_t> all_metrics;
     registry.GetAllMetrics(all_metrics);
 
@@ -159,7 +193,7 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
         }
 
         ss << prom_name;
-        WriteLabels(ss, tags);
+        WriteLabels(ss, tags, common_labels);
 
         if (std::holds_alternative<CounterValue>(val->value)) {
             uint64_t raw = std::get<CounterValue>(val->value).load(std::memory_order_relaxed);

@@ -2,6 +2,8 @@
 
 #include <string>
 
+#include "kv_cache_manager/metrics/metrics_registry.h"
+
 namespace kv_cache_manager {
 
 class MetricsRegistry;
@@ -22,9 +24,18 @@ class MetricsRegistry;
 //   - GaugeValue   metrics are emitted with TYPE gauge.
 class PrometheusExporter {
 public:
+    // Prepare process-level labels once at startup. Reserved names are omitted.
+    // Normalized collisions overwrite the previous value and report the old
+    // and effective values to stderr. Callers should avoid colliding names.
+    static MetricsTags PrepareCommonTags(const MetricsTags &common_tags);
+
     // Serialize all metrics in |registry| to Prometheus text format.
     // |prefix| is prepended to every metric name (e.g. "kvcm").
-    static std::string Expose(MetricsRegistry &registry, const std::string &prefix = "kvcm");
+    // |common_labels| must be prepared by PrepareCommonTags. Metric tags win
+    // collisions after name sanitization. Common label names must not overlap
+    // business labels: merging can otherwise collapse distinct registry series.
+    static std::string
+    Expose(MetricsRegistry &registry, const std::string &prefix = "kvcm", const MetricsTags &common_labels = {});
 };
 
 } // namespace kv_cache_manager

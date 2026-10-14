@@ -1,7 +1,10 @@
 #include <memory>
 #include <typeinfo>
+#include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/metrics/dummy_metrics_reporter.h"
 #include "kv_cache_manager/metrics/kmonitor_metrics_reporter.h"
 #include "kv_cache_manager/metrics/local_metrics_reporter.h"
@@ -61,4 +64,24 @@ TEST_F(MetricsReporterFactoryTest, TestCreateDefaultReporter) {
 
 TEST_F(MetricsReporterFactoryTest, TestCreateUnsupportedReporter) {
     EXPECT_EQ(nullptr, factory_->Create("unknown", ""));
+}
+
+TEST_F(MetricsReporterFactoryTest, CommonTagsAreProvidedToEveryBackend) {
+    auto metrics_registry = std::make_shared<MetricsRegistry>();
+    auto registry_manager = std::make_shared<RegistryManager>("", metrics_registry);
+    auto cache_manager = std::make_shared<CacheManager>(metrics_registry, registry_manager);
+    ASSERT_TRUE(factory_->Init(cache_manager, metrics_registry));
+    const MetricsTags expected{{"workspace", "workspace_a"}};
+    for (const auto &type : {"", "dummy", "local", "logging", "kmonitor"}) {
+        auto tags = expected;
+        auto reporter = factory_->Create(type, "", tags);
+        ASSERT_NE(nullptr, reporter) << type;
+        tags["workspace"] = "changed";
+        EXPECT_EQ(expected, reporter->GetCommonTags()) << type;
+        std::vector<MetricsRegistry::metrics_tuple_t> metrics;
+        metrics_registry->GetAllMetrics(metrics);
+        for (const auto &[name, metric_tags, value] : metrics) {
+            EXPECT_EQ(0, metric_tags.count("workspace")) << type;
+        }
+    }
 }

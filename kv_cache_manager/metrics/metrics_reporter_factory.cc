@@ -54,7 +54,8 @@ bool MetricsReporterFactory::Init(std::shared_ptr<CacheManager> cache_manager,
 }
 
 std::shared_ptr<MetricsReporter> MetricsReporterFactory::Create(const std::string &type,
-                                                                const std::string &config) const {
+                                                                const std::string &config,
+                                                                const MetricsTags &common_tags) const {
     const auto reporter_type = ParseMetricsReporterType(type);
     if (reporter_type == MetricsReporterType::kUnsupported) {
         KVCM_LOG_ERROR("unsupported metrics reporter type [%s], supported types: %s", type.c_str(), SupportedTypes());
@@ -64,19 +65,19 @@ std::shared_ptr<MetricsReporter> MetricsReporterFactory::Create(const std::strin
     KVCM_LOG_INFO("creating metrics reporter with type: %s", type.empty() ? "local (default)" : type.c_str());
     if (reporter_type == MetricsReporterType::kKmonitor) {
         auto reporter = std::make_shared<KmonitorMetricsReporter>();
-        reporter->Init(cache_manager_, metrics_registry_, config);
+        reporter->Init(cache_manager_, metrics_registry_, config, common_tags);
         return reporter;
     } else if (reporter_type == MetricsReporterType::kLocal) {
         auto reporter = std::make_shared<LocalMetricsReporter>();
-        reporter->Init(cache_manager_, metrics_registry_, config);
+        reporter->Init(cache_manager_, metrics_registry_, config, common_tags);
         return reporter;
     } else if (reporter_type == MetricsReporterType::kLogging) {
         auto reporter = std::make_shared<LoggingMetricsReporter>();
-        reporter->Init(cache_manager_, metrics_registry_, config);
+        reporter->Init(cache_manager_, metrics_registry_, config, common_tags);
         return reporter;
     } else if (reporter_type == MetricsReporterType::kDummy) {
         auto reporter = std::make_shared<DummyMetricsReporter>();
-        reporter->Init(cache_manager_, metrics_registry_, config);
+        reporter->Init(cache_manager_, metrics_registry_, config, common_tags);
         return reporter;
     }
     return nullptr;

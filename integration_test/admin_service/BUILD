@@ -27,6 +27,17 @@ py_test(
 )
 
 py_test(
+    name = "prometheus_common_tags_test",
+    srcs = ["prometheus_common_tags_test.py"],
+    tags = ["no-remote-exec"],
+    deps = [
+        ":http_interface_test",
+        "//integration_test/testlib:test_base",
+        "@pip_cpu//requests",
+    ],
+)
+
+py_test(
     name = "grpc_interface_test",
     srcs = ["grpc_interface_test.py"],
     data = [],

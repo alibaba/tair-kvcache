@@ -4,6 +4,7 @@
 #include <string>
 
 #include "kv_cache_manager/metrics/metrics_collector.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/service/http_service/coro_http_service.h"
 
@@ -19,7 +20,8 @@ public:
     AdminServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
                      std::shared_ptr<AdminServiceImpl> admin_service_impl,
                      bool enable_prometheus,
-                     const std::string &prometheus_prefix);
+                     const std::string &prometheus_prefix,
+                     const MetricsTags &prometheus_common_tags = {});
 
     void Init() override;
     void RegisterHandler() override;
@@ -128,6 +130,7 @@ private:
     std::shared_ptr<AdminServiceImpl> admin_service_impl_;
     bool enable_prometheus_ = true;
     std::string prometheus_prefix_ = "kvcm";
+    const MetricsTags prometheus_common_tags_;
 
     // for storage APIs
     KVCM_DECLARE_METRICS_COLLECTOR_(AddStorage);

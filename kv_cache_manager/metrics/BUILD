@@ -107,6 +107,7 @@ cc_library(
         "metrics_reporter_factory.h",
     ],
     deps = [
+        ":metrics_registry",
         ":metrics_reporter",
         "//kv_cache_manager/common:logger",
     ],

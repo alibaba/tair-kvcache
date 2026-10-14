@@ -23,11 +23,13 @@ AdminServiceHttp::AdminServiceHttp(std::shared_ptr<MetricsRegistry> metrics_regi
 AdminServiceHttp::AdminServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
                                    std::shared_ptr<AdminServiceImpl> admin_service_impl,
                                    bool enable_prometheus,
-                                   const std::string &prometheus_prefix)
+                                   const std::string &prometheus_prefix,
+                                   const MetricsTags &prometheus_common_tags)
     : metrics_registry_(std::move(metrics_registry))
     , admin_service_impl_(std::move(admin_service_impl))
     , enable_prometheus_(enable_prometheus)
-    , prometheus_prefix_(prometheus_prefix) {}
+    , prometheus_prefix_(prometheus_prefix)
+    , prometheus_common_tags_(prometheus_common_tags) {}
 
 void AdminServiceHttp::Init() {
     // for storage APIs
@@ -129,7 +131,8 @@ void AdminServiceHttp::RegisterHandler() {
         RegisterGetHandler("/metrics",
                            [this](coro_http::coro_http_request &req,
                                   coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
-                               std::string body = PrometheusExporter::Expose(*metrics_registry_, prometheus_prefix_);
+                               std::string body = PrometheusExporter::Expose(
+                                   *metrics_registry_, prometheus_prefix_, prometheus_common_tags_);
                                res.add_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
                                res.set_status_and_content(coro_http::status_type::ok, std::move(body));
                                co_return;

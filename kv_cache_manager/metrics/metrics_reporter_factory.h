@@ -3,6 +3,8 @@
 #include <memory>
 #include <string>
 
+#include "kv_cache_manager/metrics/metrics_registry.h"
+
 namespace kv_cache_manager {
 
 class CacheManager;
@@ -16,7 +18,8 @@ public:
     static const char *SupportedTypes();
 
     bool Init(std::shared_ptr<CacheManager> cache_manager, std::shared_ptr<MetricsRegistry> metrics_registry);
-    [[nodiscard]] std::shared_ptr<MetricsReporter> Create(const std::string &type, const std::string &config) const;
+    [[nodiscard]] std::shared_ptr<MetricsReporter>
+    Create(const std::string &type, const std::string &config, const MetricsTags &common_tags = {}) const;
 
 private:
     std::shared_ptr<CacheManager> cache_manager_;

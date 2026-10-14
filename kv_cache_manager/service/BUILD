@@ -38,6 +38,7 @@ cc_library(
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:metrics_reporter",
         "//kv_cache_manager/metrics:metrics_reporter_factory",
+        "//kv_cache_manager/metrics:prometheus_exporter",
         "//kv_cache_manager/service/grpc_service",
         "//kv_cache_manager/service/http_service",
         "//kv_cache_manager/service/util:manager_message_proto_util",
