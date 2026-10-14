@@ -80,6 +80,8 @@ struct OptimizerKmonitorMetricsReporter::KmonContext {
     DECLARE_METRICS(trace, query_reuse_interval_p999_seconds);
     DECLARE_METRICS(trace, query_capacity_history_p99_timestamp_ms);
     DECLARE_METRICS(trace, query_capacity_history_p99_bytes);
+    DECLARE_METRICS(trace, query_capacity_history_p99_v2_bytes);
+    DECLARE_METRICS(trace, query_capacity_history_p99_v2_observed_ms);
 
     std::unique_ptr<kmonitor::MutableMetric> mrc_metrics;
 
@@ -255,6 +257,8 @@ bool OptimizerKmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p999_seconds);
     REGISTER_GAUGE_METRIC(trace, query_capacity_history_p99_timestamp_ms);
     REGISTER_GAUGE_METRIC(trace, query_capacity_history_p99_bytes);
+    REGISTER_GAUGE_METRIC(trace, query_capacity_history_p99_v2_bytes);
+    REGISTER_GAUGE_METRIC(trace, query_capacity_history_p99_v2_observed_ms);
 
     kmon_ctx_->mrc_metrics.reset(reporter->RegisterMetric("mrc", kmonitor::GAUGE, kmonitor::FATAL));
     if (!kmon_ctx_->mrc_metrics) {
@@ -426,6 +430,19 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
             const auto &point = metric.points[slot];
             kmon_ctx_->trace_query_capacity_history_p99_timestamp_ms_metrics->Report(&tags, point.timestamp_ms);
             kmon_ctx_->trace_query_capacity_history_p99_bytes_metrics->Report(&tags, point.capacity_bytes);
+            if (point.timestamp_ms > 0 && metric.observed_ms > 0) {
+                // Historical timestamps change each day; do not grow tag_cache_.
+                const kmonitor::MetricsTags history_tags(
+                    {{"instance_group", metric.instance_group},
+                     {"instance_id", metric.instance_id},
+                     {"history_time_ms", std::to_string(point.timestamp_ms)},
+                     {"history_shard", std::to_string((point.timestamp_ms / CapacityHistory::kStepMs) % 4)},
+                     {"history_generation", metric.generation}});
+                kmon_ctx_->trace_query_capacity_history_p99_v2_bytes_metrics->Report(&history_tags,
+                                                                                     point.capacity_bytes);
+                kmon_ctx_->trace_query_capacity_history_p99_v2_observed_ms_metrics->Report(&history_tags,
+                                                                                           metric.observed_ms);
+            }
         }
     }
 }

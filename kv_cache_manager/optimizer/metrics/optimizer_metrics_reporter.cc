@@ -159,6 +159,7 @@ void OptimizerMetricsReporter::ReportInterval() {
             stats.count > 0 ? static_cast<double>(stats.p999_ns) / 1e9 : no_samples;
     }
 
+    ReportCapacityHistoryV2(history_metrics);
     if (kmonitor_reporter_) {
         // Both backends consume the same window; never Take() twice.
         kmonitor_reporter_->ReportInterval(summaries, interval_metrics, mrc_metrics, reuse_metrics, history_metrics);
@@ -174,6 +175,28 @@ void OptimizerMetricsReporter::ReportInterval() {
             metrics_registry_->GetGauge("trace_query_capacity_history_p99_bytes", tags) = point.capacity_bytes;
         }
     }
+}
+
+void OptimizerMetricsReporter::ReportCapacityHistoryV2(const std::vector<CapacityHistoryMetricInfo> &history_metrics) {
+    MetricsRegistry::GaugeSnapshot snapshot = {{"trace_query_capacity_history_p99_v2_bytes", {}},
+                                               {"trace_query_capacity_history_p99_v2_observed_ms", {}}};
+    for (const auto &metric : history_metrics) {
+        for (const auto &point : metric.points) {
+            if (point.timestamp_ms <= 0 || metric.observed_ms <= 0) {
+                continue;
+            }
+            MetricsTags tags = {{"instance_group", metric.instance_group},
+                                {"instance_id", metric.instance_id},
+                                {"history_time_ms", std::to_string(point.timestamp_ms)},
+                                {"history_shard", std::to_string((point.timestamp_ms / CapacityHistory::kStepMs) % 4)},
+                                {"history_generation", metric.generation}};
+            snapshot["trace_query_capacity_history_p99_v2_bytes"].emplace_back(tags, point.capacity_bytes);
+            snapshot["trace_query_capacity_history_p99_v2_observed_ms"].emplace_back(tags, metric.observed_ms);
+        }
+    }
+    // Expiry removes series instead of writing zero. Historical samples remain
+    // in monitoring storage, and last_over_time can recover the final revision.
+    metrics_registry_->ReplaceGaugeSnapshot(snapshot);
 }
 
 void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {

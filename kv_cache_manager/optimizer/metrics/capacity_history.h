@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <random>
+#include <string>
 
 namespace kv_cache_manager {
 
@@ -49,12 +52,26 @@ public:
     }
 
     const std::array<Point, kSlots> &points() const { return points_; }
+    const std::string &generation() const { return generation_; }
     void Reset() {
         points_ = {};
         last_update_ms_ = 0;
+        generation_ = NextGeneration();
     }
 
 private:
+    // A process nonce also protects direct Prometheus scrapes without the
+    // platform's process_id label. Reset/re-registration use distinct suffixes.
+    static std::string NextGeneration() {
+        static const std::string nonce = [] {
+            std::random_device random;
+            return std::to_string(random()) + "-" + std::to_string(random()) + "-" + std::to_string(random()) + "-" +
+                   std::to_string(random());
+        }();
+        static std::atomic<uint64_t> next{0};
+        return nonce + ":" + std::to_string(next.fetch_add(1, std::memory_order_relaxed) + 1);
+    }
+    std::string generation_ = NextGeneration();
     std::array<Point, kSlots> points_{};
     int64_t last_update_ms_ = 0;
 };

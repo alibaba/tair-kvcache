@@ -244,6 +244,12 @@ public:
     Counter GetCounter(const std::string &name, const MetricsTags &tags = {});
     Gauge GetGauge(const std::string &name, const MetricsTags &tags = {});
 
+    // Atomically replace exclusively-owned gauge families, dropping expired tags.
+    // Old snapshots retain immutable values. Do not retain/write Gauge handles for
+    // these families, or use this for shared counters/individually updated gauges.
+    using GaugeSnapshot = std::map<std::string, std::vector<std::pair<MetricsTags, double>>>;
+    void ReplaceGaugeSnapshot(const GaugeSnapshot &snapshot);
+
     // remove a specific metric by name + tags; returns true if erased
     bool Remove(const std::string &name, const MetricsTags &tags);
 

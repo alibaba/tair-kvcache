@@ -698,4 +698,52 @@ TEST_F(OptimizerMetricsReporterTest, PlanningWindowHistoryIsolationAndReset) {
     EXPECT_DOUBLE_EQ(0, registry_->GetGauge("trace_query_capacity_history_p99_bytes", tags).Get());
 }
 
+TEST_F(OptimizerMetricsReporterTest, HistoryV2ImmutableTimeIdentityAndBoundedExpiry) {
+    CapacityHistoryMetricInfo metric;
+    metric.instance_id = "inst1";
+    metric.instance_group = "grp1";
+    metric.generation = "7";
+    metric.observed_ms = 300100;
+    metric.points = {};
+    metric.points[1] = {300000, 0}; // Real zero must survive.
+    reporter_->ReportCapacityHistoryV2({metric});
+    const std::string bytes = "trace_query_capacity_history_p99_v2_bytes";
+    const std::string observed = "trace_query_capacity_history_p99_v2_observed_ms";
+    MetricsTags tags = {{"instance_id", "inst1"},
+                        {"instance_group", "grp1"},
+                        {"history_time_ms", "300000"},
+                        {"history_shard", "1"},
+                        {"history_generation", "7"}};
+    auto old_data = registry_->GetMetricsData(bytes);
+    ASSERT_EQ(1, old_data->GetSize());
+    ASSERT_TRUE(old_data->GetGauge(tags).has_value());
+    EXPECT_DOUBLE_EQ(0, old_data->GetGauge(tags)->Get());
+    metric.observed_ms += 30000;
+    metric.points[1].capacity_bytes = 900;
+    reporter_->ReportCapacityHistoryV2({metric});
+    EXPECT_DOUBLE_EQ(900, registry_->GetMetricsData(bytes)->GetGauge(tags)->Get());
+    EXPECT_DOUBLE_EQ(metric.observed_ms, registry_->GetMetricsData(observed)->GetGauge(tags)->Get());
+    EXPECT_DOUBLE_EQ(0, old_data->GetGauge(tags)->Get()); // Frozen scrape snapshot.
+
+    // Same ring slot the next day is a different series; old series is removed,
+    // not reset to zero. Repeated replacement never leaks old timestamp labels.
+    for (int day = 1; day <= 40; ++day) {
+        metric.points[1] = {300000 + day * 86400000LL, day};
+        metric.observed_ms = metric.points[1].timestamp_ms + 100;
+        reporter_->ReportCapacityHistoryV2({metric});
+        EXPECT_EQ(1, registry_->GetMetricsData(bytes)->GetSize());
+        EXPECT_EQ(1, registry_->GetMetricsData(observed)->GetSize());
+        EXPECT_FALSE(registry_->GetMetricsData(bytes)->GetGauge(tags).has_value());
+    }
+    metric.points[1] = {300000, 1};
+    metric.generation = "8"; // Reset in the same process, same historical time.
+    reporter_->ReportCapacityHistoryV2({metric});
+    EXPECT_FALSE(registry_->GetMetricsData(bytes)->GetGauge(tags).has_value());
+    tags["history_generation"] = "8";
+    EXPECT_DOUBLE_EQ(1, registry_->GetMetricsData(bytes)->GetGauge(tags)->Get());
+    reporter_->ReportCapacityHistoryV2({});
+    EXPECT_EQ(0, registry_->GetMetricsData(bytes)->GetSize());
+    EXPECT_EQ(0, registry_->GetMetricsData(observed)->GetSize());
+}
+
 } // namespace kv_cache_manager

@@ -369,6 +369,21 @@ Gauge MetricsRegistry::GetGauge(const std::string &name, const MetricsTags &tags
     return metrics_data->GetOrCreateGauge(tags);
 }
 
+void MetricsRegistry::ReplaceGaugeSnapshot(const GaugeSnapshot &snapshot) {
+    std::map<std::string, std::shared_ptr<MetricsData>> replacement;
+    for (const auto &[name, values] : snapshot) {
+        auto data = std::make_shared<MetricsData>();
+        for (const auto &[tags, value] : values) {
+            data->GetOrCreateGauge(tags) = value;
+        }
+        replacement.emplace(name, std::move(data));
+    }
+    std::lock_guard<std::mutex> guard(mutex_);
+    for (auto &[name, data] : replacement) {
+        metrics_data_map_[name] = std::move(data);
+    }
+}
+
 void MetricsRegistry::RegisterHistogramFamily(const std::string &family_name) {
     std::lock_guard<std::mutex> guard(mutex_);
     histogram_families_.insert(family_name);

@@ -794,7 +794,8 @@ ErrorCode OnlineOptimizerManager::TakePlanningMetrics(int64_t timestamp_ms,
             }
         }
         state->capacity_history.Update(timestamp_ms, reuse.p99_ns, p99_capacity, reuse.count > 0);
-        history_metrics.push_back({id, group, state->capacity_history.points()});
+        history_metrics.push_back(
+            {id, group, state->capacity_history.points(), state->capacity_history.generation(), timestamp_ms});
     }
     return EC_OK;
 }

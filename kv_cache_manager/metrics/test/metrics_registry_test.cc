@@ -51,6 +51,40 @@ public:
     std::shared_ptr<MetricsRegistry> registry_;
 };
 
+TEST_F(MetricsRegistryTest, ReplaceGaugeSnapshotIsAtomicAndPreservesOtherFamilies) {
+    registry_->GetCounter("unrelated") += 5;
+    MetricsTags tags = {{"key", "value"}};
+    registry_->ReplaceGaugeSnapshot({{"bytes", {{tags, 1}}}, {"observed", {{tags, 1}}}});
+    auto old = registry_->GetMetricsData("bytes");
+    std::atomic<bool> done{false};
+    std::atomic<bool> consistent{true};
+    std::thread reader([&]() {
+        while (!done.load()) {
+            std::vector<MetricsRegistry::metrics_tuple_t> values;
+            registry_->GetAllMetrics(values);
+            double bytes = -1, observed = -2;
+            for (const auto &[name, labels, value] : values) {
+                if (name == "bytes")
+                    bytes = Gauge(value).Get();
+                if (name == "observed")
+                    observed = Gauge(value).Get();
+            }
+            if (bytes != observed)
+                consistent.store(false);
+        }
+    });
+    for (int i = 2; i <= 1000; ++i) {
+        registry_->ReplaceGaugeSnapshot({{"bytes", {{tags, i}}}, {"observed", {{tags, i}}}});
+    }
+    done.store(true);
+    reader.join();
+    EXPECT_TRUE(consistent.load());
+    EXPECT_DOUBLE_EQ(1, old->GetGauge(tags)->Get());
+    registry_->ReplaceGaugeSnapshot({{"bytes", {}}, {"observed", {}}});
+    EXPECT_EQ(0, registry_->GetMetricsData("bytes")->GetSize());
+    EXPECT_EQ(5, registry_->GetCounter("unrelated").Get());
+}
+
 TEST_F(MetricsRegistryTest, TestCounterCtor) {
     // default ctor
     Counter a, b;

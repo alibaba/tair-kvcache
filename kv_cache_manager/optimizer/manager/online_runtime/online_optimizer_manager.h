@@ -98,6 +98,8 @@ struct CapacityHistoryMetricInfo {
     std::string instance_id;
     std::string instance_group;
     std::array<CapacityHistory::Point, CapacityHistory::kSlots> points;
+    std::string generation;
+    int64_t observed_ms = 0;
 };
 
 struct IntervalMetricInfo {

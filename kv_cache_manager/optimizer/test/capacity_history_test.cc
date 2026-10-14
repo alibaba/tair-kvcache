@@ -6,6 +6,18 @@
 namespace kv_cache_manager {
 class CapacityHistoryTest : public TESTBASE {};
 
+TEST_F(CapacityHistoryTest, GenerationSeparatesResetAndRecreatedInstances) {
+    CapacityHistory first;
+    CapacityHistory second;
+    EXPECT_NE(first.generation(), second.generation());
+    const auto generation = first.generation();
+    first.Update(300000, 0, 1, true);
+    EXPECT_EQ(generation, first.generation());
+    first.Reset();
+    EXPECT_NE(generation, first.generation());
+    EXPECT_NE(second.generation(), first.generation());
+}
+
 TEST_F(CapacityHistoryTest, BackfillMaxAndShortReuse) {
     CapacityHistory history;
     constexpr int64_t t = 1000 * CapacityHistory::kStepMs;
