@@ -96,8 +96,8 @@ TEST_F(PrometheusExporterTest, CommonTagsNormalizeNamesAndEscapeValues) {
                                                                     {"le", "not_a_boundary"},
                                                                     {"quantile", "not_a_quantile"}});
     const auto output = PrometheusExporter::Expose(*registry_, "kvcm", common_tags);
-    EXPECT_NE(output.find("kvcm_test_labels{_1zone=\"a\\\\b\\\"c\\nd\",host_name=\"node_b\","
-                          "storage_type=\"metric_value\"} 1\n"),
+    EXPECT_NE(output.find("kvcm_test_labels{storage_type=\"metric_value\",_1zone=\"a\\\\b\\\"c\\nd\","
+                          "host_name=\"node_b\"} 1\n"),
               std::string::npos)
         << output;
     EXPECT_EQ(std::string::npos, output.find("common_value"));
@@ -105,6 +105,24 @@ TEST_F(PrometheusExporterTest, CommonTagsNormalizeNamesAndEscapeValues) {
     EXPECT_EQ(std::string::npos, output.find("override"));
     EXPECT_EQ(std::string::npos, output.find("reserved"));
     EXPECT_EQ(std::string::npos, output.find("not_a_"));
+}
+
+TEST_F(PrometheusExporterTest, CommonTagsPreservePrecedenceWhenSanitizationChangesKeyOrder) {
+    registry_->GetCounter("test.labels", {{"a-b", "first_native"}, {"a.b", "duplicate_native"}, {"aA", "native_aA"}}) +=
+        1;
+    registry_->GetCounter("test.labels", {{"region", "native_region"}}) += 2;
+    registry_->GetCounter("test.untagged") += 3;
+    const auto common_labels = PrometheusExporter::PrepareCommonTags(
+        {{"aA", "common_aA"}, {"a_b", "common_a_b"}, {"region", "common_region"}});
+    const auto output = PrometheusExporter::Expose(*registry_, "kvcm", common_labels);
+
+    EXPECT_NE(std::string::npos,
+              output.find("kvcm_test_labels{a_b=\"first_native\",aA=\"native_aA\",region=\"common_region\"} 1\n"));
+    EXPECT_NE(std::string::npos,
+              output.find("kvcm_test_labels{region=\"native_region\",aA=\"common_aA\",a_b=\"common_a_b\"} 2\n"));
+    EXPECT_NE(std::string::npos,
+              output.find("kvcm_test_untagged{aA=\"common_aA\",a_b=\"common_a_b\",region=\"common_region\"} 3\n"));
+    EXPECT_EQ(std::string::npos, output.find("duplicate_native"));
 }
 
 TEST_F(PrometheusExporterTest, CommonTagCollisionsReportOverwrittenAndEffectiveValues) {

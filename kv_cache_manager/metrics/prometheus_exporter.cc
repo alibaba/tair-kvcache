@@ -1,5 +1,6 @@
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <set>
@@ -76,27 +77,40 @@ void EscapeLabelValue(std::ostringstream &ss, const std::string &v) {
     }
 }
 
-void WriteLabels(std::ostringstream &ss, const MetricsTags &tags, const MetricsTags &common_labels) {
-    MetricsTags labels;
-    // Normalize before merging so raw names like storage.type and
-    // storage_type cannot produce duplicate labels. Metric tags win.
-    for (const auto &[key, value] : tags) {
-        labels.emplace(SanitizeIdentifier(key), value);
-    }
-    labels.insert(common_labels.begin(), common_labels.end());
-    if (labels.empty()) {
+void WriteLabels(std::ostringstream &ss,
+                 const MetricsTags &tags,
+                 const MetricsTags &common_labels,
+                 std::vector<std::string> &native_label_names) {
+    if (tags.empty() && common_labels.empty()) {
         return;
     }
+    native_label_names.clear();
     ss << '{';
     bool first = true;
-    for (const auto &[k, v] : labels) {
+    const auto write_label = [&](const std::string &key, const std::string &value) {
         if (!first) {
             ss << ',';
         }
         first = false;
-        ss << k << "=\"";
-        EscapeLabelValue(ss, v);
+        ss << key << "=\"";
+        EscapeLabelValue(ss, value);
         ss << '"';
+    };
+
+    // Sanitization can change raw key order, so the two maps cannot be merged
+    // by iterator order. Track native names in scratch space reused per scrape.
+    for (const auto &[key, value] : tags) {
+        auto label = SanitizeIdentifier(key);
+        if (std::find(native_label_names.begin(), native_label_names.end(), label) != native_label_names.end()) {
+            continue;
+        }
+        write_label(label, value);
+        native_label_names.emplace_back(std::move(label));
+    }
+    for (const auto &[key, value] : common_labels) {
+        if (std::find(native_label_names.begin(), native_label_names.end(), key) == native_label_names.end()) {
+            write_label(key, value);
+        }
     }
     ss << '}';
 }
@@ -157,6 +171,7 @@ PrometheusExporter::Expose(MetricsRegistry &registry, const std::string &prefix,
     std::string current_family;             // histogram family for current metric (empty if regular)
     std::set<std::string> families_written; // histogram families whose TYPE header was emitted
     bool name_header_written = false;       // tracks TYPE/HELP for regular (non-histogram) metrics
+    std::vector<std::string> native_label_names;
     for (const auto &[name, tags, val] : all_metrics) {
         if (val == nullptr || !val->touched.load(std::memory_order_relaxed)) {
             continue;
@@ -193,7 +208,7 @@ PrometheusExporter::Expose(MetricsRegistry &registry, const std::string &prefix,
         }
 
         ss << prom_name;
-        WriteLabels(ss, tags, common_labels);
+        WriteLabels(ss, tags, common_labels, native_label_names);
 
         if (std::holds_alternative<CounterValue>(val->value)) {
             uint64_t raw = std::get<CounterValue>(val->value).load(std::memory_order_relaxed);
