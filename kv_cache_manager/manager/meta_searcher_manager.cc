@@ -91,13 +91,23 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::ExtractMetaSearcher(const std
     {
         std::scoped_lock write_guard(mutex_);
         node = meta_searcher_map_.extract(instance_id);
+        if (node.empty()) {
+            node = retiring_meta_searcher_map_.extract(instance_id);
+        }
     }
     return node.empty() ? nullptr : std::move(node.mapped());
+}
+
+void MetaSearcherManager::RestoreRetiringMetaSearcher(const std::string &instance_id,
+                                                      std::shared_ptr<MetaSearcher> searcher) {
+    std::scoped_lock write_guard(mutex_);
+    retiring_meta_searcher_map_.emplace(instance_id, std::move(searcher));
 }
 
 void MetaSearcherManager::DoCleanup() {
     std::scoped_lock write_guard(mutex_);
     meta_searcher_map_.clear();
+    retiring_meta_searcher_map_.clear();
 }
 
 std::shared_ptr<MetaSearcher> MetaSearcherManager::GetMetaSearcherUnsafe(const std::string &instance_id) const {

@@ -23,6 +23,7 @@ public:
                                                         SubmitDelReqFunc submit_del_req);
     std::shared_ptr<MetaSearcher> GetMetaSearcher(const std::string &instance_id) const;
     std::shared_ptr<MetaSearcher> ExtractMetaSearcher(const std::string &instance_id);
+    void RestoreRetiringMetaSearcher(const std::string &instance_id, std::shared_ptr<MetaSearcher> searcher);
     void DoCleanup();
 
 private:
@@ -30,6 +31,8 @@ private:
 
     // 需要清理 - 释放所有meta searcher
     std::unordered_map<std::string, std::shared_ptr<MetaSearcher>> meta_searcher_map_;
+    // Timed-out removals retain their old searcher without making it available to new requests.
+    std::unordered_map<std::string, std::shared_ptr<MetaSearcher>> retiring_meta_searcher_map_;
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager_;
     mutable std::shared_mutex mutex_;

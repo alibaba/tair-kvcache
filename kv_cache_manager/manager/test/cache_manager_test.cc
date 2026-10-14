@@ -1016,7 +1016,7 @@ TEST_F(CacheManagerTest, TestRemoveInstance) {
     EXPECT_TRUE(cache_metas.metas().empty());
 }
 
-TEST_F(CacheManagerTest, TestRegisterSameInstanceWaitsForSearcherDrainAndRetriesAfterRemoval) {
+TEST_F(CacheManagerTest, TestRegisterSameInstanceRejectedWhileSearcherDrainsAndRetriesAfterRemoval) {
     const std::string instance_id = "lifecycle_instance";
     const auto register_instance = [&]() {
         RequestContext context("register_lifecycle_instance");
@@ -1053,18 +1053,55 @@ TEST_F(CacheManagerTest, TestRegisterSameInstanceWaitsForSearcherDrainAndRetries
     while (!register_started.load(std::memory_order_acquire)) {
         std::this_thread::yield();
     }
-    EXPECT_EQ(std::future_status::timeout, register_future.wait_for(std::chrono::milliseconds(20)));
-
+    const auto register_status = register_future.wait_for(std::chrono::seconds(2));
     old_searcher.reset();
+    EXPECT_EQ(std::future_status::ready, register_status);
+    EXPECT_EQ(EC_ERROR, register_future.get()); // removal tombstone blocks the same ID without holding the global lock
     EXPECT_EQ(EC_OK, remove_future.get());
-    const auto register_ec = register_future.get();
-    if (register_ec != EC_OK) {
-        EXPECT_EQ(EC_ERROR, register_ec); // removal tombstone was still present
-        EXPECT_EQ(EC_OK, register_instance());
-    }
+    EXPECT_EQ(EC_OK, register_instance());
     EXPECT_TRUE(old_indexer.expired());
     EXPECT_NE(nullptr, cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id));
     EXPECT_NE(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer(instance_id));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceSearcherDrainTimeoutRetainsRetryPath) {
+    auto searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, searcher);
+
+    auto remove = std::async(std::launch::async, [this] {
+        RequestContext context("remove_searcher_drain_timeout");
+        return cache_manager_->RemoveInstance(&context, "default", "test_instance");
+    });
+    const auto status = remove.wait_for(std::chrono::seconds(7));
+    EXPECT_EQ(std::future_status::ready, status);
+    EXPECT_EQ(nullptr, cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance"));
+    EXPECT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    searcher.reset();
+    EXPECT_EQ(EC_TIMEOUT, remove.get());
+
+    RequestContext retry("retry_searcher_drain_timeout");
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(&retry, "default", "test_instance"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceIndexerDrainTimeoutRetainsRetryPath) {
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+
+    auto remove = std::async(std::launch::async, [this] {
+        RequestContext context("remove_indexer_drain_timeout");
+        return cache_manager_->RemoveInstance(&context, "default", "test_instance");
+    });
+    const auto status = remove.wait_for(std::chrono::seconds(7));
+    EXPECT_EQ(std::future_status::ready, status);
+    EXPECT_NE(nullptr, cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance"));
+    EXPECT_NE(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+    indexer.reset();
+    EXPECT_EQ(EC_TIMEOUT, remove.get());
+
+    RequestContext retry("retry_indexer_drain_timeout");
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(&retry, "default", "test_instance"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
 }
 
 TEST_F(CacheManagerTest, TestRemoveInstanceAllowsRegistrationDuringTrimButRejectsDuplicateRemoval) {
@@ -1244,6 +1281,19 @@ TEST_F(CacheManagerTest, TestRemoveInstanceRetriesAfterRegistryCompletionFailure
 
     RequestContext retry_ctx("remove_registry_completion_retry");
     EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(&retry_ctx, "default", "test_instance"));
+    EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceDeletesEmptyLocationKey) {
+    auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    CacheLocationMapVector locations(1);
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, indexer->Put(request_context_.get(), {123}, locations, properties).ec);
+    indexer.reset();
+
+    RequestContext context("remove_empty_location_key");
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(&context, "default", "test_instance"));
     EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
 }
 
@@ -10371,8 +10421,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaFallsBackOnMarkReadEr
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    auto meta_searcher =
-        cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_mark_read_error");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_mark_read_error");
     ASSERT_TRUE(meta_searcher);
 
     auto make_hot_loc = [](const std::string &uri) {
@@ -10680,8 +10729,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaHonorsTieredMarkWhenR
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    auto meta_searcher =
-        cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_satisfied_tiered");
+    auto meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_satisfied_tiered");
     ASSERT_TRUE(meta_searcher);
 
     auto make_hot_loc = [](const std::string &uri) {

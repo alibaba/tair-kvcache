@@ -120,10 +120,16 @@ private:
 };
 
 template <typename T>
-void WaitForOtherOwners(const std::shared_ptr<T> &owner) {
+bool WaitForOtherOwners(const std::shared_ptr<T> &owner) {
+    constexpr auto kTimeout = std::chrono::seconds(5);
+    const auto deadline = std::chrono::steady_clock::now() + kTimeout;
     while (owner.use_count() > 1) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    return true;
 }
 
 bool CollectTrimResult(std::deque<std::future<PlanExecuteResult>> &inflight,
@@ -761,15 +767,25 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
         // intent. Do not leave its old searcher available to new requests.
         if (registry_manager_->GetRemovingInstanceInfo(instance_id)) {
             auto searcher = meta_searcher_manager_->ExtractMetaSearcher(instance_id);
-            WaitForOtherOwners(searcher);
+            lifecycle_guard.unlock();
+            if (!WaitForOtherOwners(searcher)) {
+                meta_searcher_manager_->RestoreRetiringMetaSearcher(instance_id, std::move(searcher));
+                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_TIMEOUT, "remove instance failed: searcher drain timeout");
+            }
+            lifecycle_guard.lock();
             InvalidateInstanceMetrics(instance_id);
         }
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed");
     }
 
     auto meta_searcher = meta_searcher_manager_->ExtractMetaSearcher(instance_id);
-    WaitForOtherOwners(meta_searcher);
+    lifecycle_guard.unlock();
+    if (!WaitForOtherOwners(meta_searcher)) {
+        meta_searcher_manager_->RestoreRetiringMetaSearcher(instance_id, std::move(meta_searcher));
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_TIMEOUT, "remove instance failed: searcher drain timeout");
+    }
     meta_searcher.reset();
+    lifecycle_guard.lock();
 
     InvalidateInstanceMetrics(instance_id);
 
@@ -793,7 +809,12 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
         ec = TrimCache(request_context, instance_id, proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed: trim cache");
         meta_indexer = meta_indexer_manager_->ExtractMetaIndexer(instance_id);
-        WaitForOtherOwners(meta_indexer);
+        if (!WaitForOtherOwners(meta_indexer)) {
+            if (!meta_indexer_manager_->RestoreMetaIndexer(instance_id, meta_indexer)) {
+                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "remove instance failed: restore timed-out indexer");
+            }
+            RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_TIMEOUT, "remove instance failed: indexer drain timeout");
+        }
 
         KeyVector remaining;
         std::string cursor = SCAN_BASE_CURSOR;
@@ -805,7 +826,24 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
         if (ec == EC_OK && remaining.empty()) {
             break;
         }
-        const bool no_progress = ec == EC_OK && previous_residual == remaining.front();
+        bool deleted_empty_keys = false;
+        if (ec == EC_OK) {
+            CacheLocationMapVector locations;
+            ec = meta_indexer->GetLocations(request_context, remaining, locations).ec;
+            if (ec == EC_OK) {
+                KeyVector empty_keys;
+                for (size_t i = 0; i < remaining.size(); ++i) {
+                    if (locations[i].empty()) {
+                        empty_keys.push_back(remaining[i]);
+                    }
+                }
+                if (!empty_keys.empty()) {
+                    ec = meta_indexer->Delete(request_context, empty_keys).ec;
+                    deleted_empty_keys = ec == EC_OK;
+                }
+            }
+        }
+        const bool no_progress = ec == EC_OK && !deleted_empty_keys && previous_residual == remaining.front();
         if (!meta_indexer_manager_->RestoreMetaIndexer(instance_id, meta_indexer)) {
             RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "remove instance failed: restore meta indexer");
         }
@@ -814,7 +852,7 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
         if (no_progress) {
             RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "remove instance failed: trim made no progress");
         }
-        previous_residual = remaining.front();
+        previous_residual = deleted_empty_keys ? std::nullopt : std::optional<KeyType>(remaining.front());
     }
 
     ec = meta_indexer->Retire();
