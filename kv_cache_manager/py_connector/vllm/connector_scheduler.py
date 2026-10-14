@@ -1102,7 +1102,15 @@ class ConnectorScheduler:
             # otherwise be pinned until the request retires, because the save
             # watermark has already moved past their blocks).
             self._remember_session_plan(req_id, session_id, ())
-            self._queue_capture_release(req_id, session_id, target_save_num)
+            # Nothing was allocated: no uncommitted allocation of ours exists,
+            # so the captures are releasable without a cache key (a no-key
+            # release is otherwise deferred). They must go now -- the save
+            # watermark has already moved past these blocks, so an active
+            # request will not announce them again, and repeated transient
+            # manager failures would pin their slots until retirement.
+            self._queue_capture_release(
+                req_id, session_id, target_save_num, confirmed=True
+            )
             logger.warning("start_write_cache error, skip saving: %s", e)
             with self._canceled_save_request_ids_lock:
                 self._canceled_save_request_ids.append(req_id)
@@ -1233,6 +1241,7 @@ class ConnectorScheduler:
         target_save_num: int,
         blocks: Optional[List[int]] = None,
         uris_by_block: Optional[Dict[int, List[str]]] = None,
+        confirmed: bool = False,
     ) -> None:
         """Queue the captures of blocks no session of this request will write.
 
@@ -1241,6 +1250,12 @@ class ConnectorScheduler:
         other session's claim is held back (see _blocks_other_sessions_write).
         The scheduler loop flushes the queue into the metadata; the http threads
         have no metadata of their own.
+
+        ``confirmed`` marks a release the worker may perform without a cache
+        key: an announcement that raised allocated nothing at all, so no
+        uncommitted allocation exists to protect. Every other release carries
+        the manager's locations or waits for the commit verdict -- a
+        deduplicated block's key may be another request's pending write.
         """
         protected = self._blocks_other_sessions_write(req_id, session_id)
         if blocks is None:
@@ -1251,7 +1266,7 @@ class ConnectorScheduler:
         uris = {block: list((uris_by_block or {}).get(block, ())) for block in blocks}
         with self._pending_release_captures_lock:
             self._pending_release_captures.append(
-                (req_id, session_id, releasable, uris_by_block, False)
+                (req_id, session_id, releasable, uris_by_block, confirmed)
             )
 
     def _retire_session_protection(self, req_id: str, session_id: int) -> None:
