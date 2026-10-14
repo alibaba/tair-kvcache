@@ -30,9 +30,6 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
     TpCoordinatorServer,
 )
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
-from kv_cache_manager.py_connector.vllm.connector_scheduler import (
-    verdict_relay,
-)
 from kv_cache_manager.py_connector.vllm.data_transfer import (
     MultiResult,
     DataTransferManager,
@@ -339,9 +336,16 @@ class ConnectorWorker:
         # captures -- and if the first writer then fails, neither request has
         # the windowed bytes left to publish them.
         self._block_uris: Dict[str, Dict[int, Optional[str]]] = {}
-        # write session -> (req_id, the (spec, block) keys it writes): the
-        # coordinator's global verdict arrives keyed by write_session_id, and
-        # this is how it finds the captures to release (see on_save_finished).
+        # Sessions whose local success is not yet the global verdict (tp > 1,
+        # this rank is not the coordinator): req_id -> session id -> blocks
+        # whose bytes this rank keeps until the coordinator says committed, and
+        # which therefore have to be rechecked (see _recheck_pending_verdicts).
+        # The coordinator runs in another process (the task's engine core), so
+        # the answer is a query, not shared memory.
+        self._verdict_pending: Dict[str, Dict[str, List[int]]] = {}
+        # On tp0: write session -> (req_id, this rank's (spec, block) keys, the
+        # session's blocks) so on_save_finished can release locally and mark the
+        # verdict queryable.
         self._session_keys: Dict[
             str, Tuple[str, List[Tuple[str, int]], List[int]]
         ] = {}
@@ -805,6 +809,25 @@ class ConnectorWorker:
                     committed = [b for b, ok in by_block.items() if ok]
                     if committed:
                         self._captures.release_staged(save_req.req_id, committed)
+                elif self._tp_rank != 0:
+                    # Several ranks and this one is not the coordinator: a
+                    # local success says nothing yet (rank 0 may fail and the
+                    # manager then rejects the block for everyone), so the
+                    # bytes stay staged and are marked pending. The coordinator
+                    # is asked right away (it may already have the AND) and the
+                    # remaining ones are rechecked on the next metadata -- the
+                    # session cadence, so a step.
+                    by_block = {}
+                    for (_spec_name, block), ok in outcomes.items():
+                        by_block[block] = by_block.get(block, True) and bool(ok)
+                    succeeded = [b for b, ok in by_block.items() if ok]
+                    if succeeded:
+                        self._verdict_pending.setdefault(save_req.req_id, {})[
+                            save_req.write_session_id
+                        ] = succeeded
+                        self._recheck_pending_verdicts(
+                            {save_req.req_id: {save_req.write_session_id: succeeded}}
+                        )
                 failed = [key for key, ok in outcomes.items() if not ok]
                 if failed:
                     logger.warning(
@@ -818,6 +841,56 @@ class ConnectorWorker:
                 done_cb(flat)
 
         return wrapper
+
+    def _recheck_pending_verdicts(
+        self, pending: "Optional[Dict[str, Dict[str, List[int]]]]" = None
+    ) -> None:
+        """Ask the coordinator about sessions whose local success is pending.
+
+        Called right after a settle and once per step (wait_for_save): the
+        coordinator answers as soon as every rank reported (the same AND it
+        writes into finish_write_cache), so a session confirms within a step.
+        Confirmed blocks are released; a session whose verdict says a rank
+        failed keeps its bytes (the retry's only copy -- and the manager
+        rejected the block, so it is announced again).
+        """
+        if self._tp_size == 1 or self._tp_rank == 0:
+            return
+        source = self._verdict_pending if pending is None else pending
+        for req_id, sessions in list(source.items()):
+            for session_id, blocks in list(sessions.items()):
+                verdict = self._coordinator_client.ask_verdict(session_id)
+                if verdict is False or verdict is None:
+                    continue  # cannot ask / not decided: recheck later
+                committed = [
+                    block
+                    for block in blocks
+                    if block < len(verdict) and verdict[block]
+                ]
+                if committed:
+                    released = self._captures.release_staged(req_id, committed)
+                    if released:
+                        logger.debug(
+                            "req:%s session %s: released %d captured block "
+                            "slots the coordinator confirmed (all ranks wrote "
+                            "them)",
+                            req_id,
+                            session_id,
+                            released,
+                        )
+                # Decided either way: nothing left to recheck.
+                sessions.pop(session_id, None)
+                if not sessions:
+                    self._verdict_pending.pop(req_id, None)
+
+    def _drop_pending_verdicts(self, req_id: str) -> None:
+        """A retiring request has no retry left: pending blocks go with it."""
+        pending = self._verdict_pending.pop(req_id, None)
+        if not pending:
+            return
+        self._captures.release_staged(
+            req_id, [block for blocks in pending.values() for block in blocks]
+        )
 
     def _windowed_save_annotations(
         self,
@@ -1136,6 +1209,9 @@ class ConnectorWorker:
         (``staged_slots``) instead of gathering, so the announce -> session lag
         never touches HBM, while full-attention groups keep the late gather.
         """
+        # Sessions whose local success is not yet confirmed: the coordinator
+        # answers within a step, so this is where the loop closes.
+        self._recheck_pending_verdicts()
         if meta.to_capture_requests:
             self._capture_blocks(meta)
         if not meta.to_save_requests:
@@ -1505,6 +1581,7 @@ class ConnectorWorker:
         them and free the same slot twice (the pool's free list would then hold
         the range twice and dispatch it to two transfers; review_r1 S1).
         """
+        self._drop_pending_verdicts(req_id)
         released = self._captures.retire(req_id)
         if req_id not in self._in_flight:
             self._block_uris.pop(req_id, None)
@@ -1530,6 +1607,12 @@ class ConnectorWorker:
             "finish_write_cache mask:%s session:%s",
             save_context.success_mask,
             write_session_id,
+        )
+        # Make the AND queryable: the other ranks ask for exactly this answer
+        # (see _recheck_pending_verdicts) -- they must not release a capture
+        # until it says "committed", and must keep it when a rank failed.
+        self._coordinator_server.record_verdict(
+            write_session_id, save_context.success_mask
         )
         committed = True
         try:
@@ -1583,20 +1666,6 @@ class ConnectorWorker:
                 req_id,
                 write_session_id,
                 released,
-            )
-        # Hand the same verdict to the other ranks: they run the same scheduler
-        # (in process) and read the next metadata, which is the only channel
-        # that reaches all of them. Their own bytes must go too -- the block is
-        # durable, so nothing will write or retry it.
-        relay = verdict_relay(self._extra_config.instance_id)
-        if relay is not None:
-            relay.confirm_committed(
-                req_id,
-                # The session's blocks, not this rank's keys: the other ranks
-                # hold their own captures for the very same blocks, and this
-                # rank may well have none (its arena was toed) while theirs
-                # wait for this confirmation.
-                [block for block in blocks if block in committed_blocks],
             )
 
     def get_finished(

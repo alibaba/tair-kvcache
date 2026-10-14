@@ -129,12 +129,29 @@ class TpCoordinatorServer:
         self._host_ip = host_ip
         self._base_port = base_port
         self._tp_world_size = tp_world_size
+        # The cross-rank AND of a session, once every rank reported; the
+        # worker-side settle asks for it (see TpCoordinatorClient.ask_verdict):
+        # a rank whose write is not the global verdict must keep its capture
+        # until this answer says "committed", or drop it when the answer says
+        # a rank failed. ``None`` means "not decided yet".
+        self._verdicts: Dict[str, List[bool]] = {}
+        self._verdicts_lock = threading.Lock()
 
         self._coordinator_running = True
         self._coordinator_thread = threading.Thread(
             target=self.coordinator_routine, daemon=True
         )
         self._coordinator_thread.start()
+        # The verdict query rides a second socket (REQ/REP): the event stream
+        # above is one-way (PUSH/PULL), and a query needs an answer. A port
+        # that cannot be bound simply disables the active query -- the
+        # captures then wait for the manager's mask or the request's
+        # retirement, which is the pre-query behaviour (slower, still sound).
+        self._query_port = base_port + 1
+        self._query_thread = threading.Thread(
+            target=self.verdict_query_routine, daemon=True
+        )
+        self._query_thread.start()
 
         self._finished_loading = []
         self._failed_loading_block_idxs = []
@@ -230,6 +247,40 @@ class TpCoordinatorServer:
             else:
                 logger.warning("[coordinator] received wrong msg: %s", msg)
 
+    def verdict_query_routine(self) -> None:
+        context = zmq.Context()
+        socket = context.socket(zmq.REP)
+        try:
+            socket.bind("tcp://%s:%d" % (self._host_ip, self._query_port))
+        except zmq.ZMQError as e:
+            logger.warning(
+                "TairKvCacheConnector verdict query disabled (port %d: %s); "
+                "captures will wait for the manager's mask instead",
+                self._query_port,
+                e,
+            )
+            socket.close(linger=0)
+            context.term()
+            return
+        logger.warning("TairKvCacheConnector verdict query started")
+        while self._coordinator_running:
+            try:
+                raw = socket.recv()
+            except zmq.ZMQError:  # pragma: no cover - context teardown
+                return
+            session_id = raw.decode()
+            with self._verdicts_lock:
+                verdict = self._verdicts.get(session_id)
+            # b"" = not decided yet (the querying rank rechecks next step).
+            socket.send(orjson.dumps(verdict) if verdict is not None else b"")
+
+    def record_verdict(self, write_session_id: str, success_mask: List[bool]) -> None:
+        with self._verdicts_lock:
+            self._verdicts[write_session_id] = list(success_mask)
+            if len(self._verdicts) > 1024:
+                for stale in list(self._verdicts)[:512]:
+                    self._verdicts.pop(stale, None)
+
     def get_finished_tasks(self) -> Tuple[List[str], List[str]]:
         finished_saving = []
         finished_loading = []
@@ -266,7 +317,42 @@ class TpCoordinatorClient:
         socket = self._zmq_context.socket(zmq.PUSH)
         socket.connect("tcp://%s:%d" % (self._host_ip, self._port))
         self._socket = socket
+        # The verdict query (see TpCoordinatorServer.verdict_query_routine):
+        # REQ/REP on the coordinator's second port, created lazily so a
+        # deployment without it pays nothing.
+        self._query_socket: Any = None
 
     def send(self, param: bytes) -> None:
         with self._lock:
             self._socket.send(param)
+
+    def ask_verdict(
+        self, write_session_id: str, timeout_ms: int = 100
+    ) -> "Union[None, List[bool], bool]":
+        """The coordinator's global verdict for this session, if decided.
+
+        Returns the per-block AND mask (a list of bools), ``None`` while some
+        rank has not reported yet, or ``False`` when the coordinator cannot be
+        asked at all (no query socket): the caller then keeps its bytes and
+        lets the retirement (or the manager's mask) close the loop.
+        """
+        with self._lock:
+            if self._query_socket is None:
+                socket = self._zmq_context.socket(zmq.REQ)
+                socket.setsockopt(zmq.LINGER, 0)
+                socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+                socket.connect("tcp://%s:%d" % (self._host_ip, self._port + 1))
+                self._query_socket = socket
+            try:
+                self._query_socket.send(write_session_id.encode())
+                raw = self._query_socket.recv()
+            except zmq.ZMQError:
+                # No answer (no query socket, a restart, a timeout): the loop
+                # is closed elsewhere, never here.
+                if self._query_socket is not None:
+                    self._query_socket.close(linger=0)
+                    self._query_socket = None
+                return False
+            if not raw:
+                return None
+            return list(orjson.loads(raw))
