@@ -140,10 +140,7 @@ bool OptimizerKmonitorMetricsReporter::Init() {
     config.set_tenant_name(param.kmonitor_tenant);
     config.set_service_name(param.kmonitor_service_name);
 
-    std::string sink_address = param.kmonitor_sink_address;
-    if (!param.kmonitor_port.empty()) {
-        sink_address += ":" + param.kmonitor_port;
-    }
+    const auto sink_address = param.ResolveSinkAddress();
     config.set_sink_address(sink_address.c_str());
     config.set_enable_log_file_sink(param.kmonitor_enable_log_file_sink);
     config.set_manually_mode(param.kmonitor_manually_mode);
