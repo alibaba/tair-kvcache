@@ -343,12 +343,6 @@ class ConnectorWorker:
         # The coordinator runs in another process (the task's engine core), so
         # the answer is a query, not shared memory.
         self._verdict_pending: Dict[str, Dict[str, List[int]]] = {}
-        # On tp0: write session -> (req_id, this rank's (spec, block) keys, the
-        # session's blocks) so on_save_finished can release locally and mark the
-        # verdict queryable.
-        self._session_keys: Dict[
-            str, Tuple[str, List[Tuple[str, int]], List[int]]
-        ] = {}
 
         self._tp_rank = get_tensor_model_parallel_rank()
         # torch device module (torch.cuda / torch.musa / ...), set in
@@ -809,24 +803,35 @@ class ConnectorWorker:
                     committed = [b for b, ok in by_block.items() if ok]
                     if committed:
                         self._captures.release_staged(save_req.req_id, committed)
-                elif self._tp_rank != 0:
-                    # Several ranks and this one is not the coordinator: a
-                    # local success says nothing yet (rank 0 may fail and the
-                    # manager then rejects the block for everyone), so the
-                    # bytes stay staged and are marked pending. The coordinator
-                    # is asked right away (it may already have the AND) and the
-                    # remaining ones are rechecked on the next metadata -- the
-                    # session cadence, so a step.
+                else:
+                    # Several ranks: a local success says nothing yet (another
+                    # rank may fail and the manager then rejects the block for
+                    # everyone), so the bytes stay staged and are marked
+                    # pending. Every rank follows this rule -- tp0 included:
+                    # its coordinator runs the AND, but the settle that puts
+                    # this rank's captures back into the staged map may land
+                    # *after* that AND (the last report can be this very rank),
+                    # and a release issued then would find nothing and never be
+                    # retried (the tp run lost 17 of 19 fully-successful
+                    # sessions exactly that way). The coordinator is asked
+                    # right away -- tp0 hits its own process -- and everything
+                    # undecided is rechecked on the next metadata, i.e. within
+                    # a step.
                     by_block = {}
                     for (_spec_name, block), ok in outcomes.items():
                         by_block[block] = by_block.get(block, True) and bool(ok)
                     succeeded = [b for b, ok in by_block.items() if ok]
                     if succeeded:
+                        # The key the coordinator knows this session by.
+                        session_key = (
+                            getattr(save_req, "write_session_id", None)
+                            or str(save_req.session_id)
+                        )
                         self._verdict_pending.setdefault(save_req.req_id, {})[
-                            save_req.write_session_id
+                            session_key
                         ] = succeeded
                         self._recheck_pending_verdicts(
-                            {save_req.req_id: {save_req.write_session_id: succeeded}}
+                            {save_req.req_id: {session_key: succeeded}}
                         )
                 failed = [key for key, ok in outcomes.items() if not ok]
                 if failed:
@@ -854,8 +859,8 @@ class ConnectorWorker:
         failed keeps its bytes (the retry's only copy -- and the manager
         rejected the block, so it is announced again).
         """
-        if self._tp_size == 1 or self._tp_rank == 0:
-            return
+        if self._tp_size == 1:
+            return  # one rank: the settle already released, nothing is pending
         source = self._verdict_pending if pending is None else pending
         for req_id, sessions in list(source.items()):
             for session_id, blocks in list(sessions.items()):
@@ -1236,39 +1241,6 @@ class ConnectorWorker:
                 save_req.req_id, self._tp_rank, save_req.write_session_id, num_blocks
             )
             if plans is not None:
-                # Register the session whether or not *this* rank captured
-                # anything: the coordinator's AND runs on tp0 only, and it has
-                # to relay the verdict to every rank. A rank whose own arena
-                # was toed (its captures withheld, or simply no windowed data
-                # in this chunk) has no keys of its own -- but the other rank
-                # does, and it is waiting for exactly this confirmation. The
-                # keys are the per-spec captures this rank holds; the blocks
-                # are the session's windowed blocks, identical on every rank
-                # (manager_block_idxes x the windowed groups).
-                windowed = [
-                    plan
-                    for plan in plans
-                    if getattr(plan.group, "retention", None) is not None
-                ]
-                if windowed:
-                    keys = [
-                        (plan.group.spec_name, save_req.manager_block_idxes[pos])
-                        for plan in windowed
-                        for pos, slot in enumerate(plan.staged_slots or ())
-                        if slot is not None
-                    ]
-                    blocks = sorted(
-                        {
-                            save_req.manager_block_idxes[pos]
-                            for plan in windowed
-                            for pos in range(len(plan.staged_slots or ()))
-                        }
-                    )
-                    self._session_keys[save_req.write_session_id] = (
-                        save_req.req_id,
-                        keys,
-                        blocks,
-                    )
                 done_cb = self._settle_session_captures(save_req, plans, done_cb)
 
             if plans is None:
@@ -1635,38 +1607,12 @@ class ConnectorWorker:
                 "finish_write_cache failed, session: %s, error: %s", write_session_id, e
             )
 
-        # This is the confirmation the captures wait for: the AND over every
-        # rank says which blocks are durable. Those are released now (the
-        # whole point of waiting); the rejected ones stay staged, because the
-        # manager rejects the block globally and the retry needs the windowed
-        # bytes of the ranks that did write (their HBM window is gone).
-        session = self._session_keys.pop(write_session_id, None)
-        if session is None:
-            return
-        req_id, keys, blocks = session
-        committed_blocks = {
-            index
-            for index, ok in enumerate(save_context.success_mask)
-            if ok and committed
-        }
-        if not committed_blocks:
-            return
-        released = self._captures.release_staged(
-            req_id,
-            [
-                block
-                for spec_name, block in keys
-                if block in committed_blocks
-            ],
-        )
-        if released:
-            logger.debug(
-                "req:%s session %s: released %d captured block slots the "
-                "coordinator confirmed (all ranks wrote them)",
-                req_id,
-                write_session_id,
-                released,
-            )
+        # The verdict is published, not acted on: releasing here would race
+        # this rank's own settle (the last report may be its own task, whose
+        # callback has not restaged the captures yet), and there would be no
+        # retry afterwards. Every rank releases through the pending recheck
+        # instead (see _recheck_pending_verdicts), which converges within a
+        # step and has the retirement as its backstop.
 
     def get_finished(
         self, finished_req_ids: set, meta: TairKvCacheConnectorMetadata
