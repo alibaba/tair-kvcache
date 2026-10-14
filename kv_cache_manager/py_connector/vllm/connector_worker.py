@@ -817,11 +817,24 @@ class ConnectorWorker:
                     # right away -- tp0 hits its own process -- and everything
                     # undecided is rechecked on the next metadata, i.e. within
                     # a step.
-                    by_block = {}
-                    for (_spec_name, block), ok in outcomes.items():
-                        by_block[block] = by_block.get(block, True) and bool(ok)
-                    succeeded = [b for b, ok in by_block.items() if ok]
-                    if succeeded:
+                    # The session's blocks in the session's own order: the
+                    # verdict mask is indexed by position in the announced
+                    # range, not by absolute manager block number -- a session
+                    # that announced blocks 16..31 would otherwise never match
+                    # (block 16 is past the end of a 16-entry mask), which is
+                    # how 17 fully-successful sessions kept their bytes while
+                    # only the first (blocks 0..15, where the two spaces
+                    # coincide) ever released.
+                    ordered: List[int] = []
+                    for plan in plans:
+                        if getattr(plan.group, "retention", None) is None:
+                            continue
+                        ordered = [
+                            save_req.manager_block_idxes[pos]
+                            for pos in range(len(plan.staged_slots or ()))
+                        ]
+                        break
+                    if ordered:
                         # The key the coordinator knows this session by.
                         session_key = (
                             getattr(save_req, "write_session_id", None)
@@ -829,9 +842,9 @@ class ConnectorWorker:
                         )
                         self._verdict_pending.setdefault(save_req.req_id, {})[
                             session_key
-                        ] = succeeded
+                        ] = ordered
                         self._recheck_pending_verdicts(
-                            {save_req.req_id: {session_key: succeeded}}
+                            {save_req.req_id: {session_key: ordered}}
                         )
                 failed = [key for key, ok in outcomes.items() if not ok]
                 if failed:
@@ -863,14 +876,19 @@ class ConnectorWorker:
             return  # one rank: the settle already released, nothing is pending
         source = self._verdict_pending if pending is None else pending
         for req_id, sessions in list(source.items()):
-            for session_id, blocks in list(sessions.items()):
+            for session_id, ordered in list(sessions.items()):
                 verdict = self._coordinator_client.ask_verdict(session_id)
                 if verdict is False or verdict is None:
                     continue  # cannot ask / not decided: recheck later
+                # The mask follows the announced range: position i is the
+                # session's i-th block, whatever its manager block number is.
+                # A position the mask rejects keeps its bytes (a rank failed
+                # there, so the block is announced again and the retry needs
+                # them), which the retirement or that retry closes.
                 committed = [
-                    block
-                    for block in blocks
-                    if block < len(verdict) and verdict[block]
+                    ordered[i]
+                    for i in range(min(len(ordered), len(verdict)))
+                    if verdict[i]
                 ]
                 if committed:
                     released = self._captures.release_staged(req_id, committed)
