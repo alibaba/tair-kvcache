@@ -46,6 +46,10 @@ CoordinateEventUnion = Union[
 #: is taken (a transient collision, typically TIME_WAIT after a restart).
 COORDINATOR_PORT_ATTEMPTS = 9
 
+#: How long a coordinator routine sleeps between polls, so shutdown() can stop
+#: it without interrupting a blocked receive.
+COORDINATOR_POLL_MS = 100
+
 #: How many pre-verdict cancellations the coordinator remembers. They only
 #: exist for sessions whose verdict is still to come (a rank that died, or a
 #: commit that never landed) and are dropped oldest-first beyond this.
@@ -174,12 +178,17 @@ class TpCoordinatorServer:
         # took is what it announces and what the other ranks probe for.
         self._context = zmq.Context()
         self._event_socket = self._context.socket(zmq.PULL)
+        # LINGER 0 on every socket: a peer that never comes (the normal case in
+        # tests) must not block the context's teardown, which is what turned a
+        # clean test run into a 300 s timeout.
+        self._event_socket.setsockopt(zmq.LINGER, 0)
         # The verdict query rides a second socket (REQ/REP): the event stream
         # is one-way (PUSH/PULL), and a query needs an answer. The two are
         # bound as a *pair* -- event B, query B+1 -- because that is the pair
         # the clients look for; chosen independently, a taken neighbour would
         # make the announced pair a lie and send every event to a dead port.
         self._query_socket = self._context.socket(zmq.REP)
+        self._query_socket.setsockopt(zmq.LINGER, 0)
         self._base_port = self._bind_pair(base_port)
         self._query_port = self._base_port + 1
         logger.warning(
@@ -225,8 +234,20 @@ class TpCoordinatorServer:
                 last_error = e
                 self._event_socket.close(linger=0)
                 self._event_socket = self._context.socket(zmq.PULL)
+                self._event_socket.setsockopt(zmq.LINGER, 0)
                 continue
             return candidate
+        # Nothing bound: release what is left before failing, so a rejected
+        # initialization does not leave a context (and its IO thread) behind.
+        for socket in (self._event_socket, self._query_socket):
+            try:
+                socket.close(linger=0)
+            except Exception:  # pragma: no cover - already closed
+                pass
+        try:
+            self._context.term()
+        except Exception:  # pragma: no cover - already terminated
+            pass
         raise RuntimeError(
             "TairKvCacheConnector: cannot bind the coordinator's event/query "
             "port pairs on %s:%d-%d (%s); another process holds those ports"
@@ -430,10 +451,12 @@ class TpCoordinatorServer:
     def shutdown(self) -> None:
         """Stop and release the sockets and the context.
 
-        Order matters: the context is only terminated after every socket is
-        closed, because terminating it under a socket that a routine is
-        blocked on trips a libzmq assertion. Only used by tests -- production
-        runs for the life of the engine.
+        Order matters: the routines are stopped and their sockets closed
+        first (LINGER 0, so the closes are immediate even with an undeliverable
+        message queued), and only then is the context terminated -- tearing a
+        context down under a blocked recv is what turns a clean run into a
+        ContextTerminated storm. Only used by tests -- production runs for the
+        life of the engine.
         """
         self.stop()
         for socket in (self._event_socket, self._query_socket):
@@ -480,6 +503,9 @@ class TpCoordinatorClient:
         self._zmq_context = zmq.Context()
         # all rank need report finishing (include rank0)
         socket = self._zmq_context.socket(zmq.PUSH)
+        # LINGER 0: a dead coordinator must not make the context's teardown
+        # wait for a message nobody will ever receive.
+        socket.setsockopt(zmq.LINGER, 0)
         socket.connect("tcp://%s:%d" % (self._host_ip, self._port))
         self._socket = socket
         # The verdict query (see TpCoordinatorServer.verdict_query_routine):
@@ -523,6 +549,10 @@ class TpCoordinatorClient:
             self._query_socket.close(linger=0)
             self._query_socket = None
         self._socket.close(linger=0)
+        try:
+            self._zmq_context.term()
+        except Exception:  # pragma: no cover - already terminated
+            pass
         self._zmq_context.term()
 
     def _connect_query(self, query_port: int, timeout_ms: int) -> None:

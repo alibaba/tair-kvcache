@@ -2750,6 +2750,10 @@ class TestCoordinatorResync(unittest.TestCase):
         )
 
         client = TpCoordinatorClient("127.0.0.1", port)
+        # Its PUSH socket points at a dead port in these tests: without an
+        # explicit shutdown the context keeps the undeliverable message and
+        # the interpreter hangs at exit (see TpCoordinatorClient.shutdown).
+        self.addCleanup(client.shutdown)
         self.addCleanup(client.shutdown)
         return client
 
@@ -2759,6 +2763,7 @@ class TestCoordinatorResync(unittest.TestCase):
         )
 
         server = TpCoordinatorServer("127.0.0.1", port, tp_world_size, lambda *a: None)
+        self.addCleanup(server.shutdown)
         self.addCleanup(server.shutdown)
         return server
 
