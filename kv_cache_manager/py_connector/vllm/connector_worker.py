@@ -30,6 +30,9 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
     TpCoordinatorServer,
 )
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
+from kv_cache_manager.py_connector.vllm.connector_scheduler import (
+    verdict_relay,
+)
 from kv_cache_manager.py_connector.vllm.data_transfer import (
     MultiResult,
     DataTransferManager,
@@ -1134,8 +1137,8 @@ class ConnectorWorker:
         if meta.to_capture_requests:
             self._capture_blocks(meta)
         if not meta.to_save_requests:
-            for req_id, blocks, uris in meta.to_release_captures:
-                self._release_captures_for(req_id, blocks, uris)
+            for req_id, blocks, uris, confirmed in meta.to_release_captures:
+                self._release_captures_for(req_id, blocks, uris, confirmed=confirmed)
             return
         ready_event = self._device_mod.Event()
         ready_event.record(self._device_mod.current_stream())
@@ -1198,8 +1201,8 @@ class ConnectorWorker:
         # behind must not be able to withdraw the bytes this step's session is
         # about to write (the scheduler re-checks its protection when it
         # flushes, and this is the same rule one layer down).
-        for req_id, blocks, uris in meta.to_release_captures:
-            self._release_captures_for(req_id, blocks, uris)
+        for req_id, blocks, uris, confirmed in meta.to_release_captures:
+            self._release_captures_for(req_id, blocks, uris, confirmed=confirmed)
 
     # ------------------------------------------------------------------ #
     # Eager capture (windowed groups)
@@ -1381,6 +1384,7 @@ class ConnectorWorker:
         req_id: str,
         blocks: Sequence[int],
         block_uris: "Optional[Dict[int, Sequence[str]]]" = None,
+        confirmed: bool = False,
     ) -> None:
         """Return the captured slots of blocks no session is going to write.
 
@@ -1391,7 +1395,13 @@ class ConnectorWorker:
         as the request runs. Entries already handed to a session are the task's
         to release and are left alone.
         """
-        pending = self._uris_other_requests_hold(req_id)
+        # A confirmed block is durable (the coordinator's AND), so no pending
+        # writer's copy is at stake: nothing to guard. Otherwise the guard
+        # keeps the bytes of any block whose cache key a live write session
+        # still owns -- other requests' as before, and this request's own
+        # in-flight sessions (a task that has not consumed them yet; on TP the
+        # same block key is written by every rank).
+        pending = set() if confirmed else self._uris_other_requests_hold(req_id)
         releasable = []
         for block in blocks:
             reported = (block_uris or {}).get(block, ())
@@ -1442,6 +1452,16 @@ class ConnectorWorker:
         uris: Set[str] = set()
         for other, block_uris in list(self._block_uris.items()):
             if other == req_id:
+                # This request's own *in-flight* sessions guard their keys
+                # (their tasks have not read them yet); its staged (settled)
+                # entries do not -- releasing those is the confirmation's whole
+                # purpose.
+                for _session, _spec, block in list(
+                    self._in_flight.get(req_id, {})
+                ):
+                    uri = block_uris.get(block)
+                    if uri is not None:
+                        uris.add(uri)
                 continue
             if not self._captures.holds(other):
                 continue
@@ -1540,6 +1560,20 @@ class ConnectorWorker:
                 req_id,
                 write_session_id,
                 released,
+            )
+        # Hand the same verdict to the other ranks: they run the same scheduler
+        # (in process) and read the next metadata, which is the only channel
+        # that reaches all of them. Their own bytes must go too -- the block is
+        # durable, so nothing will write or retry it.
+        relay = verdict_relay(self._extra_config.instance_id)
+        if relay is not None:
+            relay.confirm_committed(
+                req_id,
+                [
+                    block
+                    for _spec_name, block in keys
+                    if block in committed_blocks
+                ],
             )
 
     def get_finished(

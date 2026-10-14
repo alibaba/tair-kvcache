@@ -88,6 +88,19 @@ class RequestLedger:
     need_report_after_saving_finished: bool = False
 
 
+#: In-process verdict relay, keyed by instance id: the tp0 worker computes the
+#: cross-rank AND (it runs the coordinator), and when it shares the process with
+#: the scheduler role (vLLM's in-process engine core, which is how the TP
+#: scenarios run) it hands the committed blocks over so the *next* metadata --
+#: which every rank reads -- releases their captures. Without a relay (separate
+#: processes) each rank still has the manager's mask and retirement as drains.
+_VERDICT_RELAY: Dict[str, "ConnectorScheduler"] = {}
+
+
+def verdict_relay(instance_id: str) -> Optional["ConnectorScheduler"]:
+    return _VERDICT_RELAY.get(instance_id)
+
+
 class ConnectorScheduler:
     """State and hooks for the scheduler-role connector instance."""
 
@@ -142,7 +155,7 @@ class ConnectorScheduler:
         # (the manager already holds them): queued by the http threads, flushed
         # by the scheduler loop into the metadata the worker reads.
         self._pending_release_captures: List[
-            Tuple[str, int, List[int], Dict[int, List[str]]]
+            Tuple[str, int, List[int], Dict[int, List[str]], bool]
         ] = []
         self._pending_release_captures_lock = threading.Lock()
         # Per request, the write sessions that may still consume captured
@@ -178,6 +191,7 @@ class ConnectorScheduler:
         self._manager_client = manager_client
         self._coordinator_client = coordinator_client
 
+        _VERDICT_RELAY[extra_config.instance_id] = self
         self._epoch = 0
         self._http_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="kvcm_http_"
@@ -899,13 +913,31 @@ class ConnectorScheduler:
                 )
             ledger.has_saved_block_num = target_save_num
 
+    def confirm_committed(self, req_id: str, blocks: List[int]) -> None:
+        """Queue the release of captures the coordinator committed.
+
+        Called (in process) by the tp0 worker once the cross-rank AND says the
+        blocks are durable: every rank has to drop its bytes then, and the
+        metadata is the only channel that reaches all of them. Blocks that any
+        rank failed are not sent -- their bytes are the retry's only copy.
+        """
+        if not blocks:
+            return
+        with self._pending_release_captures_lock:
+            self._pending_release_captures.append(
+                (req_id, -1, list(blocks), {}, True)
+            )
+
     def _collect_release_captures(self, meta: TairKvCacheConnectorMetadata) -> None:
         """Hand the worker the captures this step's sessions will not write."""
         with self._pending_release_captures_lock:
             pending = self._pending_release_captures
             self._pending_release_captures = []
-        for req_id, session_id, blocks, uris_per_block in pending:
+        for req_id, session_id, blocks, uris_per_block, confirmed in pending:
             if not blocks:
+                continue
+            if confirmed:
+                meta.release_captures(req_id, blocks, None, confirmed=True)
                 continue
             # The protection was checked when the release was queued (in the
             # http thread); a session created since may have re-announced and
@@ -1248,7 +1280,7 @@ class ConnectorScheduler:
         uris = {block: list((uris_by_block or {}).get(block, ())) for block in blocks}
         with self._pending_release_captures_lock:
             self._pending_release_captures.append(
-                (req_id, session_id, releasable, uris_by_block)
+                (req_id, session_id, releasable, uris_by_block, False)
             )
 
     def _retire_session_protection(self, req_id: str, session_id: int) -> None:

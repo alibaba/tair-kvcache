@@ -110,6 +110,7 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
         req_id: str,
         block_idxes: List[int],
         block_uris: Optional[Dict[int, List[str]]] = None,
+        confirmed: bool = False,
     ) -> None:
         """Return the captures of blocks no write session will publish.
 
@@ -119,7 +120,9 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
         request's uncommitted allocation before dropping captured bytes (see
         ConnectorWorker._release_captures_for).
         """
-        self._release_captures.append((req_id, list(block_idxes), block_uris))
+        self._release_captures.append(
+            (req_id, list(block_idxes), block_uris, confirmed)
+        )
 
     def __repr__(self) -> str:
         return (
