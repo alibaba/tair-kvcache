@@ -2741,6 +2741,60 @@ class TestVerdictQueryHygiene(unittest.TestCase):
         self.assertEqual({"r1": {0: "uri-0"}}, conn._block_uris)
 
 
+class TestAllocationFailureRelease(unittest.TestCase):
+    """wave11: an announcement that allocated nothing releases for real."""
+
+    def test_a_failed_announcement_releases_without_keys(self):
+        # StartWriteCache raised: the manager allocated nothing, so no
+        # uncommitted allocation exists to protect and the captures must go
+        # now. Deferring them (the no-key rule) would pin them until the
+        # request retires -- the save watermark already moved past these blocks
+        # and an active request will not announce them again.
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="alloc-fail", write_timeout_seconds=1
+        )
+        sched._manager_client = MagicMock()
+        sched._manager_client.start_write_cache.side_effect = RuntimeError("boom")
+        sched.start_save_kvcache_async("r0", [1, 2, 3, 4], 4, [True] * 4)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(meta)
+        entries = meta.to_release_captures
+        self.assertEqual([("r0", [0, 1, 2, 3])], released_blocks(meta))
+        self.assertTrue(
+            entries[0][2] is None and entries[0][3] is True,
+            "the allocation-failure release is not confirmed: %r" % (entries,),
+        )
+        # The worker honours it: no key needed, the captures are released.
+        conn = captured_worker([0, 1, 2, 3], [7, 8, 9, 10])
+        conn.wait_for_save(meta)
+        self.assertEqual({}, conn._staged.get("r0", {}))
+
+    def test_a_deduplicated_release_keeps_waiting_without_a_key(self):
+        # The other side of the same rule: an announcement the manager
+        # deduplicated (no locations) may point at another request's pending
+        # allocation, so its keyless release stays deferred.
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="dedup", write_timeout_seconds=1
+        )
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        sched._queue_capture_release("r0", -1, 4)
+        sched._collect_release_captures(meta)
+        self.assertEqual([("r0", [0, 1, 2, 3])], released_blocks(meta))
+        self.assertFalse(meta.to_release_captures[0][3])
+
+        conn = captured_worker([0, 1, 2, 3], [7, 8, 9, 10])
+        conn.wait_for_save(meta)
+        self.assertEqual(
+            4, len(conn._staged.get("r0", {})), "a keyless dedup release dropped bytes"
+        )
+
+
 class TestVerdictPublication(unittest.TestCase):
     """wave10: a verdict is a fact only once the manager committed."""
 
