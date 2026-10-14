@@ -2741,6 +2741,60 @@ class TestVerdictQueryHygiene(unittest.TestCase):
         self.assertEqual({"r1": {0: "uri-0"}}, conn._block_uris)
 
 
+class TestCoordinatorBind(unittest.TestCase):
+    """wave11: a taken port must not leave the connector half-dead."""
+
+    def _free_port(self):
+        import socket as socket_module
+
+        with socket_module.socket() as sock:
+            sock.bind(("", 0))
+            return sock.getsockname()[1]
+
+    def test_a_taken_port_moves_to_the_next(self):
+        import socket as socket_module
+
+        from kv_cache_manager.py_connector.common.tp_coordinator import (
+            TpCoordinatorServer,
+        )
+
+        port = self._free_port()
+        holder = socket_module.socket()
+        holder.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+        holder.bind(("127.0.0.1", port))
+        holder.listen(1)
+        self.addCleanup(holder.close)
+        server = TpCoordinatorServer("127.0.0.1", port, 2, lambda *a: None)
+        self.addCleanup(server._event_socket.close, 0)
+        self.addCleanup(server._query_socket.close, 0)
+        self.assertEqual(port + 1, server._base_port)
+        self.assertEqual(port + 2, server._query_port)
+
+    def test_all_taken_ports_fail_loudly(self):
+        import socket as socket_module
+
+        from kv_cache_manager.py_connector.common.tp_coordinator import (
+            COORDINATOR_PORT_ATTEMPTS,
+            TpCoordinatorServer,
+        )
+
+        port = self._free_port()
+        holders = []
+        for offset in range(COORDINATOR_PORT_ATTEMPTS):
+            sock = socket_module.socket()
+            sock.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", port + offset))
+            except OSError:  # pragma: no cover - the range was chosen free
+                sock.close()
+                continue
+            sock.listen(1)
+            holders.append(sock)
+        self.addCleanup(lambda: [sock.close() for sock in holders])
+        with self.assertRaises(RuntimeError):
+            TpCoordinatorServer("127.0.0.1", port, 2, lambda *a: None)
+
+
 class TestAllocationFailureRelease(unittest.TestCase):
     """wave11: an announcement that allocated nothing releases for real."""
 
