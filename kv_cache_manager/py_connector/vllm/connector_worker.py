@@ -873,6 +873,21 @@ class ConnectorWorker:
 
         return wrapper
 
+    def _blocks_awaiting_verdict(self, req_id: str) -> Set[int]:
+        """This request's blocks whose cross-rank verdict has not arrived.
+
+        Their bytes are held for the verdict: another rank may still fail, the
+        manager then rejects the block for everyone, and a retry can only
+        republish it from a capture that survived until then. A manager answer
+        that mentions the block (a stale, uncommitted allocation being the
+        usual reason) must not release them early.
+        """
+        with self._verdict_lock:
+            sessions = self._verdict_pending.get(req_id)
+            if not sessions:
+                return set()
+            return {block for blocks in sessions.values() for block in blocks}
+
     def _drop_uris_if_idle(self, req_id: str) -> None:
         """Forget a request's cache keys once no capture of it can return.
 
@@ -1564,6 +1579,13 @@ class ConnectorWorker:
             candidates = set(reported)
             if own is not None:
                 candidates.add(own)
+            if not confirmed and block in self._blocks_awaiting_verdict(req_id):
+                # A session of this request is still waiting for its verdict
+                # (see _blocks_awaiting_verdict): releasing the block's bytes
+                # now could leave the retry with nothing once the HBM window
+                # moved. The verdict recheck releases them when it says
+                # committed.
+                continue
             if not confirmed and not candidates:
                 # The manager returned no location for this block (it was
                 # deduplicated into its "already" mask), so its cache key is

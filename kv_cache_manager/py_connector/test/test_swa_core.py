@@ -3129,6 +3129,35 @@ class TestLateSettleAfterRetirement(unittest.TestCase):
         # nobody will consume.
         self.assertEqual({}, conn._staged.get("r0", {}))
 
+    def test_a_mask_release_waits_for_the_verdict_of_the_same_request(self):
+        # The manager may mention a block because of a stale, uncommitted
+        # allocation (a duplicate StartWriteCache is deduplicated before
+        # FinishWriteCache), and the block's own session may still be waiting
+        # for its cross-rank verdict. Releasing then would be exactly the case
+        # the retention exists for: another rank fails, the manager rejects the
+        # block for everyone, and the retry has no bytes left to publish.
+        conn, dtm, pool, group = self._worker()
+        self._run(conn, dtm, group)
+        blocks = list(range(self.BLOCKS))
+        self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
+        self.assertIn("s1", conn._verdict_pending["r0"])
+
+        conn._release_captures_for(
+            "r0", blocks, {block: ["u%d" % block] for block in blocks}
+        )
+        self.assertEqual(
+            self.BLOCKS,
+            len(conn._staged["r0"]),
+            "the mask release dropped bytes a verdict is still waiting for",
+        )
+
+        # The verdict arrives: released exactly once, and the arena is whole.
+        conn._coordinator_client.ask_verdict.return_value = [True] * self.BLOCKS
+        conn._verdict_query_down_until = 0.0
+        conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
+        self.assertEqual({}, conn._staged.get("r0", {}))
+        self.assertEqual(16, pool.free_blocks)
+
     def test_the_retirement_cancels_respect_the_backoff(self):
         # A coordinator that is down must not make retirement pay a receive
         # timeout per session: one failure mutes the endpoint and ends the
