@@ -2463,6 +2463,53 @@ class TestTpVerdictRelay(unittest.TestCase):
         self.assertEqual({}, rank1._staged.get("r0", {}))
         self.assertEqual(self.CAPACITY, pool1.free_blocks)
 
+    def test_the_confirmation_is_not_swallowed_by_an_empty_session(self):
+        # tp0 runs the coordinator, and its own chunk may hold no captures at
+        # all (its arena was toed, or the chunk had no windowed data) while the
+        # other rank's captures wait for the confirmation. Registering the
+        # session only when this rank has keys let on_save_finished return
+        # early and swallow the verdict: rank 1 kept every capture, its arena
+        # starved, its writes came up empty and the cross-rank AND rejected the
+        # whole prefix (the tp run: 2545 withheld, 138 empty groups).
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="tp-empty", write_timeout_seconds=1
+        )
+        from kv_cache_manager.py_connector.vllm.connector_scheduler import (
+            _VERDICT_RELAY,
+        )
+
+        _VERDICT_RELAY["tp-empty"] = sched
+        self.addCleanup(_VERDICT_RELAY.pop, "tp-empty", None)
+
+        rank0, dtm0, pool0, group0 = self._worker(tp_size=2, instance_id="tp-empty")
+        rank1, dtm1, pool1, group1 = self._worker(tp_size=2, instance_id="tp-empty")
+        uris = ["u%d" % block for block in range(self.BLOCKS)]
+
+        # tp0's pool is toed: its capture is withheld, so it has no keys of
+        # its own for this session.
+        pool0.acquire(self.CAPACITY, timeout=0.01)
+        blocks0 = self._run(rank0, dtm0, group0, session=1, uris=uris)
+        self.assertEqual(self.BLOCKS, len(blocks0))
+        # ... while rank 1 captured every block.
+        self._run(rank1, dtm1, group1, session=1, uris=uris)
+        self.assertEqual(self.BLOCKS, len(rank1._staged["r0"]))
+
+        # Both ranks wrote: tp0 confirms and relays; rank 1 releases.
+        context = SaveContext(
+            locations=[{"block_idxes": [block]} for block in blocks0],
+            result_per_rank={0: [True] * self.BLOCKS, 1: [True] * self.BLOCKS},
+        )
+        rank0.on_save_finished("s1", context)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(meta)
+        self.assertEqual([("r0", blocks0)], released_blocks(meta))
+        rank1.wait_for_save(meta)
+        self.assertEqual({}, rank1._staged.get("r0", {}))
+        self.assertEqual(self.CAPACITY, pool1.free_blocks)
+
     def test_a_stale_release_waits_for_the_requests_own_live_session(self):
         # TP writes the same block keys on every rank, and each rank's sessions
         # take their bytes when their plan runs. A release computed elsewhere
@@ -3047,6 +3094,7 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         conn._session_keys[retry_session] = (
             "r0",
             [("tp0_g0", block) for block in blocks],
+            blocks,
         )
         conn.on_save_finished(retry_session, confirmed)
         self.assertEqual(self.CAPACITY, pool.free_blocks)
