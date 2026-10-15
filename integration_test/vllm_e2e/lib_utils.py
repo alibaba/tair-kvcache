@@ -374,19 +374,30 @@ def is_multigroup_model(model_path: str) -> bool:
 
 
 def model_fingerprint(model_path: str) -> tuple:
-    """``(architectures[0], declared window)``: a path-independent identity.
+    """``(architectures[0], declared window, size tier)``: a path-independent
+    identity.
 
     Used to key per-model budgets (e.g. the pinned-host gate) so that a copied,
     renamed or symlinked checkpoint keeps the gate it had under its original
-    directory name. The window component separates same-architecture siblings
-    (gemma-3-4b 1024 vs gemma-3-1b / 270m 512).
+    directory name. The window separates same-architecture siblings the tier
+    alone cannot (gemma-3-4b 1024 vs gemma-3-1b / 270m 512), and the size tier
+    -- ``(num_hidden_layers, hidden_size)`` of the text config, the two knobs
+    every family scales its checkpoints with -- separates the siblings the
+    window cannot: gemma-3 12b / 27b share the 4b's architecture *and*
+    1024-token window but need roughly three times its pinned budget, so the
+    calibrated 4b threshold must not collide with them. A field the config
+    does not declare reads as None (the fingerprint still identifies the
+    checkpoint, just less precisely).
     """
     try:
         cfg = _model_config(model_path)
     except Exception:
         cfg = {}
+    text_cfg = cfg.get("text_config", cfg)
     archs = cfg.get("architectures") or []
-    return (archs[0] if archs else None, window_tokens(model_path))
+    tier = tuple(text_cfg.get(key) if isinstance(text_cfg.get(key), int)
+                 else None for key in ("num_hidden_layers", "hidden_size"))
+    return (archs[0] if archs else None, window_tokens(model_path), tier)
 
 
 def scenario_tp_size(default: int = 1) -> int:

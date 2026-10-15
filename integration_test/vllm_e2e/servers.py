@@ -57,16 +57,24 @@ SERVED_MODEL_NAME = "e2e-model"
 
 #: Pinned-host-RAM gate per model *fingerprint*, in GiB (see the connector's
 #: staging_pool_max_bytes_per_group and the SWA pinned report). The fingerprint
-#: is (architectures[0], declared window) from the checkpoint's config, not a
-#: directory name: a copy, a rename or a symlinked checkpoint must not turn a
-#: hard gate into a silent skip. The window separates same-architecture
-#: siblings (gemma-3-4b 1024 vs gemma-3-1b/270m 512). Only models with a
-#: derived budget are gated; KVCM_E2E_PINNED_GIB overrides for any model (e.g.
-#: a new one whose budget was just computed).
+#: is (architectures[0], declared window, size tier) from the checkpoint's
+#: config, not a directory name: a copy, a rename or a symlinked checkpoint
+#: must not turn a hard gate into a silent skip. The window separates
+#: same-architecture siblings (gemma-3-4b 1024 vs gemma-3-1b/270m 512) and the
+#: size tier -- (num_hidden_layers, hidden_size) -- the ones the window
+#: cannot: gemma-3 12b/27b share the 4b's architecture and 1024-token window
+#: but need ~3x its pinned budget, so they fall out of this table (a loud
+#: WARNING, the same contract as any uncalibrated model; KVCM_E2E_PINNED_GIB
+#: gates them until an e2e run calibrates an entry) instead of being killed by
+#: the 4b threshold. Only models with a derived budget are gated.
 PINNED_BUDGET_GIB = {
-    ("Gemma3ForConditionalGeneration", 1024): 0.4,
-    ("Gemma3ForCausalLM", 512): 0.4,
-    ("Qwen3_5ForConditionalGeneration", None): 1.0,
+    # gemma-3-4b-it: exact pool 0.3125 GiB (1024 x 327_680 B).
+    ("Gemma3ForConditionalGeneration", 1024, (34, 2560)): 0.4,
+    # gemma-3-1b-it and gemma-3-270m-it: same family and window, separate tiers.
+    ("Gemma3ForCausalLM", 512, (26, 1152)): 0.4,
+    ("Gemma3ForCausalLM", 512, (18, 640)): 0.4,
+    # Qwen3.5-4B: exact pool 0.999 GiB (62 x 17_301_504 B).
+    ("Qwen3_5ForConditionalGeneration", None, (32, 2560)): 1.0,
 }
 
 
@@ -452,9 +460,10 @@ class ScenarioEnv:
         # None = per-scenario default, overridable via KVCM_E2E_TP (models
         # too large for one GPU run every scenario with tp=2).
         self.tp_size = tp_size if tp_size is not None else scenario_tp_size()
-        # multigroup = hybrid OR windowed: both need prefix caching and a
-        # restart between the phases. hybrid additionally selects the mamba
-        # specific branches (long prompts, recurrent-state assertions);
+        # multigroup = hybrid OR windowed: both need a restart between the
+        # phases, and prefix caching -- except for R-SWA (below). hybrid
+        # additionally selects the mamba specific branches (long prompts,
+        # recurrent-state assertions);
         # window is the attention window in tokens (None = full attention) and
         # comes from the same predicate as the windowed orchestration itself:
         # a declared window a model never uses (Qwen2.5) must not switch the
@@ -471,8 +480,20 @@ class ScenarioEnv:
         # loaded_block_count).
         self.full_attention_group = has_full_attention_group(MODEL_PATH)
         self.preferred_block_size = 0 if self.multigroup else preferred_block_size
-        self.enable_prefix_caching = (self.multigroup if enable_prefix_caching is None
-                                      else enable_prefix_caching)
+        # R-SWA is the multigroup exception: its vLLM config class
+        # (UnlimitedOCRForCausalLMConfig) forbids prefix caching outright --
+        # R-SWA decode KV is not a pure causal function of the prefix -- so
+        # passing the flag would abort engine startup before any scenario
+        # logic, including the scenarios' own later R-SWA skips, could run.
+        # Those models stay multigroup (restart between phases, windowed
+        # expectations) but start with prefix caching off, the same default
+        # their config forces; an *explicit* request is still honored verbatim
+        # (a scenario that asks for the flag without skipping R-SWA first
+        # fails loudly at startup instead of silently running a different
+        # orchestration).
+        self.enable_prefix_caching = (
+            (self.multigroup and self.window_kind != "rswa_gap")
+            if enable_prefix_caching is None else enable_prefix_caching)
         self.connector_name = connector_name
         self.log_level = log_level
         self.extra_config_overrides = extra_config_overrides
@@ -881,7 +902,10 @@ def run_e2e(scenario: str, tp_size: int, num_prompts: int,
     both phases. Multi-group models (hybrid mamba + attention, or windowed
     attention): prefix caching on (per-group block tables, per-layer windows),
     the vLLM server is restarted between phases so phase 2 loads from KVCM
-    instead of hitting the local prefix cache.
+    instead of hitting the local prefix cache. R-SWA checkpoints are the
+    exception on the flag: their config class forbids prefix caching, so they
+    keep the multigroup orchestration (restart, windowed expectations) with
+    prefix caching off.
 
     Expected block counts differ per retention semantics: a full-prefix group
     saves the whole prompt and loads everything it matched, while a windowed

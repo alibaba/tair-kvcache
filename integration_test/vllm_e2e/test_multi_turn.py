@@ -86,14 +86,41 @@ class TestMultiTurn(unittest.TestCase):
                               timeout=180)
 
             if env.multigroup:
-                # Prefix caching is on for multi-group models; restart so turn
-                # 2's hit comes from KVCM, not the local prefix cache.
+                # Multi-group models may hold the prefix locally (hybrid
+                # models must keep prefix caching on; R-SWA starts with it
+                # off, its config's forced default): restart so turn 2's hit
+                # comes from KVCM, not a local prefix cache.
                 vllm = env.restart_vllm(log_suffix="_t2")
 
             # ---- Turn 2: conversation continues; prompt embeds turn 1's
             # prompt + output as token ids (immune to detokenization drift).
             turn2_suffix = tokenize(vllm.base_url(), TURN2_SUFFIX_TEXT)
-            turn2_ids = turn1_ids + turn2_suffix
+            # A hit ending exactly on a chunked-local chunk boundary keeps
+            # nothing (vLLM skips every matched token), so a full share
+            # landing there leaves loaded_blocks() at zero and the loaded
+            # assertions below would pass without capturing or comparing a
+            # single block. Share the largest block-aligned prefix whose
+            # loaded region is nonempty: stepping one manager block back
+            # moves the hit inside the chunk while the share still covers
+            # decode-produced blocks (it stays above prompt_blocks).
+            geom = env.window_geometry()
+            share_blocks = turn1_blocks
+            while (share_blocks > prompt_blocks
+                   and geom.loaded_blocks(share_blocks * mbs) == 0):
+                share_blocks -= 1
+            if share_blocks <= prompt_blocks:
+                raise unittest.SkipTest(
+                    f"every block-aligned share of the {turn1_blocks} "
+                    f"committed block(s) keeps no block (chunk size(s) "
+                    f"{geom.chunk_sizes} at mbs={mbs}): the loaded-region "
+                    f"assertions would be vacuous")
+            if share_blocks < turn1_blocks:
+                logger.info(
+                    "turn 2 shares %d of %d committed block(s): the full "
+                    "share ends on a chunk boundary (chunk size(s) %s)",
+                    share_blocks, turn1_blocks, geom.chunk_sizes)
+            turn2_ids = (turn1_ids if share_blocks == turn1_blocks
+                         else turn1_ids[:share_blocks * mbs]) + turn2_suffix
             shared_blocks = min(
                 shared_token_prefix_len(turn1_ids, turn2_ids) // mbs,
                 turn1_blocks)
@@ -115,7 +142,7 @@ class TestMultiTurn(unittest.TestCase):
             # And the loaded decode-block KV must verify -- the loaded region
             # is what vLLM gave slots for: the tail window of every group, plus
             # the whole match for a full-attention group.
-            load_blocks = env.window_geometry().loaded_blocks(shared_blocks * mbs)
+            load_blocks = geom.loaded_blocks(shared_blocks * mbs)
             hashes = full_block_hashes(turn2_ids, mbs)
             wait_for_captures(env.capture_dir, "loaded",
                               expected=env.tp_size * load_blocks, timeout=180)
