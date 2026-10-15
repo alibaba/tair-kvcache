@@ -84,6 +84,21 @@ class PaceStorageArgsTest(unittest.TestCase):
         add_pace_ssd_sub_parser(subparsers)
         return parser.parse_args(["pace_ssd", "--domain", "pace.meta", "--timeout", "5000", *args])
 
+    def test_health_timeout_is_optional(self):
+        spec = gen_pace_config_data(self._parse_args())
+        self.assertNotIn("health_check_timeout", spec)
+
+    def test_health_timeout_is_serialized(self):
+        spec = gen_pace_config_data(self._parse_args(
+            "--health_check_timeout", "2"))
+        self.assertEqual(2, spec["health_check_timeout"])
+
+    def test_health_timeout_must_be_positive(self):
+        for value in ("0", "-1"):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit):
+                    self._parse_args("--health_check_timeout", value)
+
     def test_ssd_subcommand_sets_distinct_storage_type(self):
         args = self._parse_ssd_args()
         self.assertEqual(5, gen_pace_config_data(args)["media_type"])
@@ -143,6 +158,7 @@ class PaceStorageUpdateTest(unittest.TestCase):
             media_type=media_type,
             service_discovery_url="",
             timeout=5000,
+            health_check_timeout=None,
             trace_id="trace",
             unique_name="pace_storage",
             verbose=False,
@@ -165,6 +181,24 @@ class PaceStorageUpdateTest(unittest.TestCase):
                 }
             ],
         }
+
+    @patch.object(update_storage, "http_post_and_print")
+    @patch.object(update_storage, "http_post")
+    def test_update_preserves_and_overrides_health_timeout(self, mock_http_post, mock_post_and_print):
+        response = self._list_response("ST_TAIRMEMPOOL", 2)
+        response["storage"][0]["tair_mem_pool"].update(
+            health_check_timeout=2, skip_confirmed_missing_backend_delete=True)
+        mock_http_post.return_value = response
+        args = self._args()
+        update_storage.handle_pace(args)
+        spec = mock_post_and_print.call_args.args[1]["storage"]["tair_mem_pool"]
+        self.assertEqual(2, spec["health_check_timeout"])
+        self.assertTrue(spec["skip_confirmed_missing_backend_delete"])
+        args.health_check_timeout = 1
+        update_storage.handle_pace(args)
+        spec = mock_post_and_print.call_args.args[1]["storage"]["tair_mem_pool"]
+        self.assertEqual(1, spec["health_check_timeout"])
+        self.assertTrue(spec["skip_confirmed_missing_backend_delete"])
 
     @patch.object(update_storage, "http_post_and_print")
     @patch.object(update_storage, "http_post")

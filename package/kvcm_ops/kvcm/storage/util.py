@@ -22,6 +22,8 @@ def gen_pace_config_data(args):
     skip_missing = getattr(args, "skip_confirmed_missing_backend_delete", None)
     if skip_missing is not None:
         storage_spec["skip_confirmed_missing_backend_delete"] = skip_missing
+    if args.health_check_timeout is not None:
+        storage_spec["health_check_timeout"] = args.health_check_timeout
     return storage_spec
 
 
@@ -92,7 +94,12 @@ def add_pace_ssd_sub_parser(subparsers):
 
 def add_pace_common_args(parser):
     parser.add_argument('--domain', "-d", required=True, help='pace domain')
-    parser.add_argument('--timeout', "-t", required=True, type=int, help='pace time out config')
+    parser.add_argument(
+        '--timeout', "-t", required=True, type=int,
+        help='business request and connection timeout in seconds, including synchronous copies (recommended: 5)')
+    parser.add_argument(
+        '--health_check_timeout', type=positive_int, default=None,
+        help='health request and connection timeout in seconds (server default: 1; update omission preserves existing)')
     parser.add_argument(
         '--skip_confirmed_missing_backend_delete',
         type=pace_gc_skip_delete_value,

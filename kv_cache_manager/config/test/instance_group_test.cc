@@ -419,4 +419,35 @@ TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyValidationRejectsUnknownValue)
     EXPECT_NE(std::string::npos, invalid_fields.find("instance_reclaim_budget_policy"));
 }
 
+TEST_F(InstanceGroupTest, TairMempoolHealthTimeoutProtoDefaultsAndRoundTrip) {
+    proto::admin::StorageConfig config;
+    config.set_global_unique_name("pace_timeouts");
+    config.mutable_tair_mem_pool()->set_domain("pace.meta");
+    config.mutable_tair_mem_pool()->set_timeout(5);
+    StorageConfig restored;
+    ProtoConvert::StorageFromProto(&config, restored);
+    auto spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, spec);
+    EXPECT_EQ(1, spec->health_check_timeout());
+
+    config.mutable_tair_mem_pool()->set_health_check_timeout(2);
+    ProtoConvert::StorageFromProto(&config, restored);
+    proto::admin::StorageConfig round_trip;
+    ProtoConvert::StorageConfigToProto(restored, &round_trip);
+    EXPECT_EQ(5, round_trip.tair_mem_pool().timeout());
+    EXPECT_EQ(2, round_trip.tair_mem_pool().health_check_timeout());
+
+    config.mutable_tair_mem_pool()->set_health_check_timeout(0);
+    ProtoConvert::StorageFromProto(&config, restored);
+    spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, spec);
+    EXPECT_EQ(1, spec->health_check_timeout());
+    std::string invalid_fields;
+    EXPECT_TRUE(restored.ValidateRequiredFields(invalid_fields));
+
+    config.mutable_tair_mem_pool()->set_health_check_timeout(-1);
+    ProtoConvert::StorageFromProto(&config, restored);
+    EXPECT_FALSE(restored.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("health_check_timeout"));
+}
 } // namespace kv_cache_manager

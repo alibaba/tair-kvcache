@@ -165,6 +165,7 @@ private:
  */
 class TairMemPoolStorageSpec : public StorageSpec {
 public:
+    static constexpr int64_t kDefaultHealthCheckTimeout = 1;
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
     bool ValidateRequiredFields(std::string &invalid_fields) const override;
@@ -172,6 +173,7 @@ public:
     const std::string &cluster_name() const { return cluster_name_; }
     const std::string &domain() const { return domain_; }
     int64_t timeout() const { return timeout_; }
+    int64_t health_check_timeout() const { return health_check_timeout_; }
     const std::string &service_discovery_url() const { return service_discovery_url_; }
     uint16_t media_type() const { return media_type_; }
     bool skip_confirmed_missing_backend_delete() const { return skip_confirmed_missing_backend_delete_; }
@@ -179,13 +181,17 @@ public:
     void set_domain(const std::string &domain) { domain_ = domain; }
     void set_cluster_name(const std::string &cluster_name) { cluster_name_ = cluster_name; }
     void set_timeout(int64_t timeout) { timeout_ = timeout; }
+    void set_health_check_timeout(int64_t timeout) { health_check_timeout_ = timeout; }
     void set_service_discovery_url(const std::string &url) { service_discovery_url_ = url; }
     void set_media_type(uint16_t media_type) { media_type_ = media_type; }
     void set_skip_confirmed_missing_backend_delete(bool value) { skip_confirmed_missing_backend_delete_ = value; }
 
 private:
     std::string domain_;                // 统一接入
-    int64_t timeout_{0};                // 目前连接超时、请求超时时间的值一样
+    // 除健康检查外的 HTTP 请求超时，单位秒（分配、删除、同步复制、容量和节点查询）。
+    // 连接和请求整体使用同一值，整体耗时包含连接时间。
+    int64_t timeout_{0};
+    int64_t health_check_timeout_{kDefaultHealthCheckTimeout};
     std::string service_discovery_url_; // 见类注释
     std::string cluster_name_;          // TODO proto中没有这个字段并且未使用，考虑删除
     uint16_t media_type_{kTairMemPoolMediaTypeUnspecified};

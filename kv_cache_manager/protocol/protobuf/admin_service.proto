@@ -99,7 +99,7 @@ message MooncakeStorageSpec {
 
 message TairMemPoolStorageSpec {
     string domain = 1; // tair mempool 的 meta service 挂载的域名（service_discovery_url 为空时直接用此 domain）
-    int32 timeout = 2; // 单位超时时间
+    int32 timeout = 2; // 除健康检查外的 HTTP 请求超时，单位秒（分配、删除、同步复制、容量和节点查询）。
     reserved 3, 4; // 历史字段：enable_vipserver / vipserver_domain
     reserved "enable_vipserver", "vipserver_domain";
     // 服务发现 URL，统一抽象不同发现机制；空字符串表示不使用服务发现，直接使用 domain。
@@ -110,6 +110,7 @@ message TairMemPoolStorageSpec {
     int32 media_type = 6; // 0=不指定；2=DRAM；5=SSD
     // GC 是否跳过已判定不存在的 URI 的后端删除；默认 false，仍发送 Delete/Free。
     bool skip_confirmed_missing_backend_delete = 7;
+    int32 health_check_timeout = 8; // /v1/api/healthy 的单次 HTTP 超时，单位秒，默认1s。
 }
 
 message NfsStorageSpec {

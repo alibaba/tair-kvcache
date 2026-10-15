@@ -361,10 +361,19 @@ Group LRU 使用以下进程级参数，均须为正整数，仅影响该模式�
 
 升级和回滚需注意：缺字段的旧 Registry 数据会采用新默认值；希望保持旧模式的 Group 应提前明确配置 `0` 或 `1`。旧 proto3 客户端会省略隐式零值，若需显式选择 `USAGE_PROPORTIONAL`，应升级到支持该字段 oneof 存在性的客户端，或使用明确携带字段的 Admin JSON。旧二进制不保证识别 `2`，回滚前应把新模式切回旧模式并回读确认。历史 LFU / TTL 配置若缺少模式字段，也应先明确选择旧模式或切为 LRU。
 
+### TairMempool
+
 TairMempool DRAM 使用 `pace`（proto `ST_TAIRMEMPOOL`），LocalSSD 使用
 `pace_ssd`（proto `ST_TAIRMEMPOOL_SSD`，同时要求 `media_type=5`）。两类 storage
 仍使用 `pace://` 数据面 URI，但 quota、类型水位和迁移触发用量分别统计。旧的
 `ST_TAIRMEMPOOL + media_type=5` 配置仍可读取，迁移到新类型后才能获得独立 SSD 水位。
+
+HTTP 超时参数配置在 `storage_spec` 中（Admin API 对应 `storage.tair_mem_pool`）：
+
+| 参数 | 用途 | 默认值 |
+|---|---|---|
+| `timeout` | 分配、删除、同步复制、容量和节点查询 | 必填，示例为 5 秒 |
+| `health_check_timeout` | 健康探测 | 1 秒 |
 
 启用独立 SSD 类型时还需遵守以下配置约束：
 

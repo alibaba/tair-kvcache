@@ -149,6 +149,8 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |
 | `cache_manager_instance.byte_size` | gauge | 单实例 KVCM 配额字节大小（不含 EventReport） |
 
+对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开且健康探测状态正常，否则为 0。状态由后台探测更新，单次请求超时不代表指标立即变为 0。超时参数见[配置说明](configuration.md#tairmempool)。
+
 完整指标列表取决于当前使用的 `MetricsReporter` 类型。`kmonitor`
 类型的 reporter 会填充最完整的指标集。
 

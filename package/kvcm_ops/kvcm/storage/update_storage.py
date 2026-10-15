@@ -68,12 +68,12 @@ def get_existing_pace_config(host: str, trace_id: str, unique_name: str, verbose
         if storage_type in ("ST_UNSPECIFIED", "ST_TAIRMEMPOOL"):
             # Older Managers may omit the type. Preserve the legacy identity,
             # including the historical ST_TAIRMEMPOOL + media_type=5 form.
-            return media_type, "ST_TAIRMEMPOOL", skip_missing
+            return media_type, "ST_TAIRMEMPOOL", storage_spec
         if storage_type == "ST_TAIRMEMPOOL_SSD":
             if media_type != 5:
                 raise RuntimeError(
                     f"storage '{unique_name}' has ST_TAIRMEMPOOL_SSD but media_type is {media_type}, expected 5")
-            return media_type, storage_type, skip_missing
+            return media_type, storage_type, storage_spec
         raise RuntimeError(f"storage '{unique_name}' has incompatible storage_type: {storage_type}")
 
     raise RuntimeError(f"PACE storage '{unique_name}' does not exist")
@@ -91,7 +91,7 @@ def handle_nfs(args):
 
 
 def handle_pace(args):
-    media_type, pace_storage_type, skip_missing = get_existing_pace_config(
+    media_type, pace_storage_type, existing_spec = get_existing_pace_config(
         args.host, args.trace_id, args.unique_name, args.verbose)
     expected_storage_type = (
         "ST_TAIRMEMPOOL_SSD" if args.storage_type == "pace_ssd" else "ST_TAIRMEMPOOL")
@@ -105,8 +105,10 @@ def handle_pace(args):
     if args.media_type is None:
         resolved_args.media_type = media_type
     if getattr(args, "skip_confirmed_missing_backend_delete", None) is None:
-        resolved_args.skip_confirmed_missing_backend_delete = skip_missing
-    storage_spec = gen_pace_config_data(resolved_args)
+        resolved_args.skip_confirmed_missing_backend_delete = existing_spec.get(
+            "skip_confirmed_missing_backend_delete", False)
+    storage_spec = dict(existing_spec)
+    storage_spec.update(gen_pace_config_data(resolved_args))
     data = create_update_storage_data(
         resolved_args, "tair_mem_pool", storage_spec, pace_storage_type=pace_storage_type)
     http_post_and_print(args.host, data, args.verbose)

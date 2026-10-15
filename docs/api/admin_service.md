@@ -53,6 +53,8 @@ TairMempool Storage（`ST_TAIRMEMPOOL` / `ST_TAIRMEMPOOL_SSD`）可以在 `tair_
 对象中设置 `"skip_confirmed_missing_backend_delete": true`。默认 `false`，即 GC 对已判定
 不存在的 URI 仍发送 Backend Delete；设为 `true` 才跳过这些 URI 的后端删除。
 
+TairMempool HTTP timeout parameters are described in the [configuration guide](../configuration.md#tairmempool).
+
 ## Enable Storage
 ```bash
 curl -g -vvv -X POST http://localhost:6492/api/enableStorage \

@@ -453,3 +453,28 @@ TEST_F(LocalMetricsReporterTest, TestReportIntervalCacheManagerMetrics) {
         EXPECT_DOUBLE_EQ(0., pipeline_err_v);
     }
 }
+
+TEST_F(LocalMetricsReporterTest, TestStorageHealthFailureRecoveryAndClose) {
+    auto backend = std::make_shared<NfsBackend>(metrics_registry_);
+    backend->SetOpen(true);
+    registry_manager_->data_storage_manager_ = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_->storage_map_.emplace("health_transition", backend);
+    const auto expect_health = [&](double expected) {
+        reporter_->ReportInterval();
+        const auto collectors = reporter_->data_storage_interval_metrics_collectors_.GetMetricsCollectors();
+        ASSERT_EQ(1u, collectors.size());
+        auto collector = std::dynamic_pointer_cast<DataStorageIntervalMetricsCollector>(collectors.front());
+        ASSERT_NE(nullptr, collector);
+        double value;
+        GET_METRICS_(collector, data_storage, healthy_status, value);
+        EXPECT_DOUBLE_EQ(expected, value);
+    };
+    backend->SetAvailable(true);
+    expect_health(1.0);
+    backend->SetAvailable(false);
+    expect_health(0.0);
+    backend->SetAvailable(true);
+    expect_health(1.0);
+    backend->SetOpen(false);
+    expect_health(0.0);
+}
