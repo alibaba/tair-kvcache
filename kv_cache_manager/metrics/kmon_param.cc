@@ -42,10 +42,8 @@ bool KmonParam::Init() {
     hippo_slave_ip = EnvUtil::GetEnv(kHippoSlaveIp, "127.0.0.1");
     has_hippo_slave_ip_ = !EnvUtil::GetEnv(kHippoSlaveIp, "").empty();
     /*** for kmon ***/
+    // An explicitly empty port preserves a preformatted sink address.
     kmonitor_port = EnvUtil::GetEnv(kKmonitorPort, "4141");
-    if (kmonitor_port.empty()) {
-        kmonitor_port = "4141";
-    }
     kmonitor_service_name = EnvUtil::GetEnv(kKmonitorServiceName, "kvcm_service");
     kmonitor_sink_address = EnvUtil::GetEnv(kKmonitorSinkAddress, "");
     kmonitor_enable_log_file_sink = EnvUtil::GetEnv(kKmonitorEnableLogFileSink, kmonitor_enable_log_file_sink);
@@ -82,20 +80,21 @@ std::string KmonParam::ResolveSinkAddress() const {
 
 std::string KmonParam::GetSinkAddress(const std::string &sdk_host_name, const std::string &host_info_ip) const {
     if (!kmonitor_sink_address.empty()) {
-        return kmonitor_sink_address + ":" + kmonitor_port;
+        return kmonitor_port.empty() ? kmonitor_sink_address : kmonitor_sink_address + ":" + kmonitor_port;
     }
     if (has_hippo_slave_ip_) {
-        return hippo_slave_ip + ":" + kmonitor_port;
+        return kmonitor_port.empty() ? hippo_slave_ip : hippo_slave_ip + ":" + kmonitor_port;
     }
+    const auto port = kmonitor_port.empty() ? "4141" : kmonitor_port;
     if (!sdk_host_name.empty()) {
         // The SDK discovers the host through /etc/hostinfo and uses port 4141.
         // Keep the complete address empty to enable that path.
-        return kmonitor_port == "4141" ? "" : sdk_host_name + ":" + kmonitor_port;
+        return port == "4141" ? "" : sdk_host_name + ":" + port;
     }
     if (!host_info_ip.empty()) {
-        return host_info_ip + ":" + kmonitor_port;
+        return host_info_ip + ":" + port;
     }
-    return "127.0.0.1:" + kmonitor_port;
+    return "127.0.0.1:" + port;
 }
 
 std::string KmonParam::ParseHostInfoIp(std::istream &input) {

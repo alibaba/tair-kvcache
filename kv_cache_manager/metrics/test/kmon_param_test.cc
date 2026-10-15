@@ -114,6 +114,21 @@ TEST_F(KmonParamTest, TestExplicitSinkUsesCustomPort) {
     EXPECT_EQ(param_->GetSinkAddress("host-from-sdk"), "receiver.example.com:5141");
 }
 
+TEST_F(KmonParamTest, TestExplicitSinkPreservesEmptyPort) {
+    ScopedEnv port("kmonitorPort", "");
+    ScopedEnv hippo_address("HIPPO_SLAVE_IP", "10.0.0.1");
+    for (const auto *address : {"127.0.0.1:5141", "receiver.example.com:5141", "10.0.0.2"}) {
+        ScopedEnv sink_address("kmonitorSinkAddress", address);
+        SCOPED_TRACE(address);
+
+        ASSERT_TRUE(param_->Init());
+
+        EXPECT_TRUE(param_->kmonitor_port.empty());
+        EXPECT_EQ(param_->GetSinkAddress("host-from-sdk", "10.94.0.97"), address);
+        EXPECT_EQ(param_->ResolveSinkAddress(), address);
+    }
+}
+
 TEST_F(KmonParamTest, TestSdkDiscoveryUsesCustomPort) {
     ScopedEnv port("kmonitorPort", "5141");
 
@@ -151,6 +166,20 @@ TEST_F(KmonParamTest, TestHippoAddressUsesCustomPort) {
     EXPECT_EQ(param_->ResolveSinkAddress(), "10.0.0.1:5141");
 }
 
+TEST_F(KmonParamTest, TestHippoAddressPreservesEmptyPort) {
+    ScopedEnv port("kmonitorPort", "");
+    for (const auto *ip : {"10.0.0.1", "127.0.0.1"}) {
+        ScopedEnv hippo_address("HIPPO_SLAVE_IP", ip);
+        SCOPED_TRACE(ip);
+
+        ASSERT_TRUE(param_->Init());
+
+        EXPECT_TRUE(param_->kmonitor_port.empty());
+        EXPECT_EQ(param_->GetSinkAddress("host-from-sdk", "10.94.0.97"), ip);
+        EXPECT_EQ(param_->ResolveSinkAddress(), ip);
+    }
+}
+
 TEST_F(KmonParamTest, TestEmptySinkAndPortUseSdkDefaults) {
     ScopedEnv sink_address("kmonitorSinkAddress", "");
     ScopedEnv port("kmonitorPort", "");
@@ -159,8 +188,9 @@ TEST_F(KmonParamTest, TestEmptySinkAndPortUseSdkDefaults) {
     ASSERT_TRUE(param_->Init());
 
     EXPECT_TRUE(param_->kmonitor_sink_address.empty());
-    EXPECT_EQ(param_->kmonitor_port, "4141");
+    EXPECT_TRUE(param_->kmonitor_port.empty());
     EXPECT_TRUE(param_->GetSinkAddress("host-from-sdk").empty());
+    EXPECT_EQ(param_->GetSinkAddress("", "10.94.0.97"), "10.94.0.97:4141");
     EXPECT_EQ(param_->GetSinkAddress(""), "127.0.0.1:4141");
 }
 
