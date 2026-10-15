@@ -3,6 +3,7 @@
 import threading
 import time
 import unittest
+import unittest.mock
 import socket as socket_module
 
 
@@ -566,6 +567,191 @@ class TestRequestFailedAggregation(unittest.TestCase):
     def tearDown(self):
         self.client.shutdown()
         self.server.shutdown()
+
+
+class TestForeignCoordinatorRefusal(unittest.TestCase):
+    """Only this instance's coordinator may receive this client's traffic.
+
+    This instance's coordinator can be unavailable while another instance's
+    coordinator owns the configured port: the probe rejects the foreign
+    identity, and nothing may be delivered there -- a foreign coordinator
+    would aggregate the wrong instance's completions. Events are held back
+    (bounded) until a coordinator of this instance answers, then flushed in
+    order; verdict queries report "cannot ask" instead of polling the foreign
+    coordinator forever."""
+
+    def setUp(self):
+        # A strip of free ports like TestProbeInstanceIdentity: instance A
+        # owns (p, p+1); a later server of instance B falls back to (p+2,
+        # p+3), which is inside the probe range of a client configured with
+        # the same base port.
+        self.holders = []
+        probe_port = _find_free_port()
+        for _ in range(12):
+            with socket_module.socket() as sock:
+                try:
+                    sock.bind(("127.0.0.1", probe_port))
+                except OSError:
+                    probe_port = _find_free_port()
+                    continue
+            self.base_port = probe_port
+            break
+        else:
+            raise AssertionError("no free port strip found")
+        for port in range(self.base_port, self.base_port + 4):
+            holder = socket_module.socket()
+            holder.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+            holder.bind(("127.0.0.1", port))
+            holder.listen(1)
+            self.holders.append(holder)
+        for holder in self.holders:
+            holder.close()
+        self.seen_a = []
+        self.seen_b = []
+        # tp_size=1: one start + one finish completes a save, so a delivery
+        # to a coordinator is directly observable through its callback.
+        self.server_a = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_a), "inst-A"
+        )
+        _wait_for_server(self.server_a)
+        # B's own coordinator does not exist yet: its client is configured
+        # with the same base port A owns.
+        self.server_b = None
+        self.client = TpCoordinatorClient("127.0.0.1", self.base_port, "inst-B")
+        # Teardown order as everywhere in this suite: the client first, then
+        # the servers.
+        self.addCleanup(self.server_a.shutdown)
+        self.addCleanup(self._shutdown_b)
+        self.addCleanup(self.client.shutdown)
+
+    def _record(self, sink):
+        def on_finished(write_session_id, save_context):
+            sink.append(write_session_id)
+
+        return on_finished
+
+    def _shutdown_b(self):
+        if self.server_b is not None:
+            self.server_b.shutdown()
+
+    def _save_events(self, request_id, write_session_id):
+        return [
+            CoordinateMsgSerializer.dumps(
+                CoordinateMessage(
+                    time.time(),
+                    SendBlockStartEvent(
+                        request_id=request_id,
+                        write_session_id=write_session_id,
+                        locations=[],
+                    ),
+                )
+            ),
+            CoordinateMsgSerializer.dumps(
+                CoordinateMessage(
+                    time.time(),
+                    SendBlockFinishedEvent(
+                        request_id=request_id,
+                        tp_rank=0,
+                        write_session_id=write_session_id,
+                        is_success_list=[True],
+                    ),
+                )
+            ),
+        ]
+
+    def test_events_are_deferred_until_the_own_coordinator_answers(self):
+        # While only A answers, every event is held back: A's coordinator
+        # must not aggregate them (the wrong instance), and the endpoint
+        # stays unresolved so discovery is retried.
+        for param in self._save_events("req-b1", "sess-b1"):
+            self.client.send(param)
+        self.assertFalse(self.client._endpoint_resolved,
+                         "a foreign-only answer must not resolve the endpoint")
+        self.assertEqual(len(self.client._pending_events), 2)
+        # Give a wrongly-delivered event time to arrive and complete A's
+        # aggregation: neither the callback nor the finished list may see it.
+        time.sleep(0.2)
+        self.assertEqual(self.seen_a, [])
+        self.assertEqual(self.server_a.get_finished_tasks(), ([], []),
+                         "the foreign coordinator aggregated deferred events")
+
+        # B's own coordinator comes up on the fallback pair; the next event
+        # finds it, flushes everything that was held back, in order, and only
+        # then delivers itself.
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        for param in self._save_events("req-b2", "sess-b2"):
+            self.client.send(param)
+        self.assertEqual(self.client._port, self.base_port + 2,
+                         "the client did not move to its instance's pair")
+        self.assertTrue(self.client._endpoint_resolved)
+        self.assertEqual(len(self.client._pending_events), 0)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and sorted(self.seen_b) != [
+            "sess-b1",
+            "sess-b2",
+        ]:
+            time.sleep(0.01)
+        # The deferred save completed on B's coordinator (order preserved:
+        # its start arrived before its finish), and A still saw nothing.
+        self.assertEqual(sorted(self.seen_b), ["sess-b1", "sess-b2"])
+        self.assertEqual(self.seen_a, [])
+
+    def test_a_dead_port_defers_too_and_retries_discovery(self):
+        # The other failure shape: nothing answers at all (the coordinator is
+        # not up yet -- a startup race). The event is held back rather than
+        # queued on a socket whose port this instance may never own, and the
+        # next event re-probes: the coordinator that comes up later -- on the
+        # configured pair or, after a collision, the fallback one -- receives
+        # everything, in order.
+        self.server_a.shutdown()
+        start_b3, finish_b3 = self._save_events("req-b3", "sess-b3")
+        self.client.send(start_b3)
+        self.assertFalse(self.client._endpoint_resolved)
+        self.assertEqual(len(self.client._pending_events), 1)
+        # B's own coordinator comes up (whichever pair it could bind).
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        # The second event discovers it and flushes the held-back one first.
+        self.client.send(finish_b3)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not self.seen_b:
+            time.sleep(0.01)
+        self.assertEqual(self.seen_b, ["sess-b3"])
+        self.assertTrue(self.client._endpoint_resolved)
+        self.assertEqual(len(self.client._pending_events), 0)
+
+    def test_the_defer_buffer_is_bounded(self):
+        # An outage longer than the buffer must drop the oldest events loudly
+        # rather than grow without bound; the coordinator-side caps settle
+        # the loss, exactly as for a dead coordinator.
+        import kv_cache_manager.py_connector.common.tp_coordinator as tp
+
+        with unittest.mock.patch.object(tp, "DEFERRED_EVENT_LIMIT", 3):
+            # r1: start+finish, r2: start fills the buffer, r2's finish drops
+            # r1's start -- without it r1's save can never complete.
+            for param in self._save_events("req-b1", "sess-b1"):
+                self.client.send(param)
+            self.client.send(self._save_events("req-b2", "sess-b2")[0])
+            with self.assertLogs(tp.logger, level="WARNING"):
+                self.client.send(self._save_events("req-b2", "sess-b2")[1])
+            self.assertEqual(len(self.client._pending_events), 3)
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        self.client.send(self._save_events("req-b3", "sess-b3")[0])
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not self.seen_b:
+            time.sleep(0.01)
+        # Only r2 completed: r1's start was dropped, so its finish -- flushed
+        # ahead of it -- can never complete on the coordinator.
+        self.assertEqual(self.seen_b, ["sess-b2"])
+        self.assertEqual(self.seen_a, [])
 
 
 if __name__ == "__main__":

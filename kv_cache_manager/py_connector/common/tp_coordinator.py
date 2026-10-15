@@ -1,6 +1,7 @@
 import orjson
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set, Tuple, Union
@@ -70,6 +71,14 @@ COORDINATOR_JOIN_SECONDS = 5.0
 #: exist for sessions whose verdict is still to come (a rank that died, or a
 #: commit that never landed) and are dropped oldest-first beyond this.
 VERDICT_CANCEL_LIMIT = 4096
+
+#: How many events an unresolved endpoint may hold back (see
+#: TpCoordinatorClient.send). The buffer only grows while no coordinator of
+#: this instance answers at all, i.e. during an outage or a startup race;
+#: beyond the cap the oldest events are dropped loudly and the coordinator's
+#: own caps (verdict limit, retirements) settle the loss -- the same
+#: degradation a dead coordinator always caused.
+DEFERRED_EVENT_LIMIT = 4096
 
 
 @dataclass
@@ -162,6 +171,7 @@ class TpCoordinatorServer:
         tp_world_size: int,
         on_finished_callback: Callable[[str, SaveContext], None],
         instance_id: str = "",
+        engine_id: str = "",
     ) -> None:
         self._host_ip = host_ip
         self._base_port = base_port
@@ -172,6 +182,16 @@ class TpCoordinatorServer:
         # unauthenticated shape tests use, which pairs only with an equally
         # empty client identity.
         self._instance_id = instance_id
+        # The engine run this coordinator serves (see the client's twin
+        # attribute): serving replicas share instance_id on purpose -- the
+        # manager keys on it -- so the instance alone cannot tell two
+        # coordinators on one host apart, and a replica whose coordinator had
+        # to take a fallback pair would otherwise accept the first replica's
+        # coordinator and send it every event. The engine identity is unique
+        # per engine run (vLLM's kv_transfer engine_id, which vLLM itself
+        # syncs across the TP group), so a probe reply only counts when it
+        # matches this engine as well.
+        self._engine_id = engine_id
         # The cross-rank AND of a session, once every rank reported; the
         # worker-side settle asks for it (see TpCoordinatorClient.ask_verdict):
         # a rank whose write is not the global verdict must keep its capture
@@ -227,9 +247,12 @@ class TpCoordinatorServer:
         self._query_port = self._base_port + 1
         logger.warning(
             "TairKvCacheConnector coordinator started: transfer_client_config "
-            "coordinator_base_port=%d verdict_query_port=%d (pair)",
+            "coordinator_base_port=%d verdict_query_port=%d (pair) "
+            "instance=%r engine=%r",
             self._base_port,
             self._query_port,
+            self._instance_id,
+            self._engine_id,
         )
         self._coordinator_running = True
         self._coordinator_thread = threading.Thread(
@@ -403,14 +426,18 @@ class TpCoordinatorServer:
                     query = orjson.loads(raw)
                     if isinstance(query, dict) and query.get("probe"):
                         # Identify ourselves: the client decides whether this
-                        # pair belongs to its instance (see
+                        # pair belongs to its instance *and its engine* (see
                         # TpCoordinatorClient._probe_and_reconnect_locked).
                         # A foreign client gets our identity and rejects it;
                         # an old client accepts any reply, but an old client of
-                        # another instance is old code we cannot fix from here.
+                        # another engine is old code we cannot fix from here.
                         socket.send(
                             orjson.dumps(
-                                {"probe": True, "instance_id": self._instance_id}
+                                {
+                                    "probe": True,
+                                    "instance_id": self._instance_id,
+                                    "engine_id": self._engine_id,
+                                }
                             )
                         )
                         continue
@@ -587,7 +614,9 @@ class TpCoordinatorServer:
 
 
 class TpCoordinatorClient:
-    def __init__(self, host_ip: str, port: int, instance_id: str = "") -> None:
+    def __init__(
+        self, host_ip: str, port: int, instance_id: str = "", engine_id: str = ""
+    ) -> None:
         self._host_ip = host_ip
         self._port = port
         # The instance this client's events belong to. A probe carrying it
@@ -598,6 +627,15 @@ class TpCoordinatorClient:
         # send every event there. Empty pairs only with an equally empty
         # server identity (the shape tests use).
         self._instance_id = instance_id
+        # The engine run this client belongs to: serving replicas of one
+        # instance share instance_id on purpose, so two coordinators of two
+        # replicas on one host answer a probe with indistinguishable instance
+        # identities and the second replica's clients would settle on the
+        # first replica's coordinator. The engine identity (vLLM's
+        # kv_transfer engine_id) is unique per engine run, so a reply only
+        # counts when it names *this* client's engine too. Empty pairs with
+        # an equally empty server identity, exactly like the instance one.
+        self._engine_id = engine_id
         self._lock = threading.Lock()
 
         self._zmq_context = zmq.Context()
@@ -615,6 +653,10 @@ class TpCoordinatorClient:
         # Whether the endpoint pair has been resolved (see send): resolved on
         # the first event, before anything can be queued to a dead port.
         self._endpoint_resolved = False
+        # Events held back while the endpoint is unresolved (see send): they
+        # are flushed, in order, to the first coordinator of this instance
+        # that answers, so a startup race loses nothing.
+        self._pending_events: "deque[bytes]" = deque()
 
     def send(self, param: bytes) -> None:
         # The coordinator may have had to take a neighbouring port pair (a
@@ -629,18 +671,59 @@ class TpCoordinatorClient:
         # probe of an old client with an empty protocol-error body.
         with self._lock:
             if not self._endpoint_resolved:
-                self._endpoint_resolved = True
-                if not self._probe_and_reconnect(lock_held=True):
-                    logger.warning(
-                        "TairKvCacheConnector: no coordinator of instance %r "
-                        "answered on ports %d-%d; keeping the configured port "
-                        "%d",
-                        self._instance_id,
-                        self._port,
-                        self._port + COORDINATOR_PORT_ATTEMPTS,
-                        self._port,
-                    )
+                if self._probe_and_reconnect(lock_held=True):
+                    self._endpoint_resolved = True
+                    self._flush_pending_locked()
+                else:
+                    # No coordinator of this instance answered: keep the
+                    # endpoint unresolved (every later event re-probes) and
+                    # defer this event instead of sending it to whatever owns
+                    # the configured port. A foreign coordinator there would
+                    # aggregate this instance's completions into the wrong
+                    # instance, which is worse than the outage itself.
+                    self._defer_event_locked(param)
+                    return
             self._socket.send(param)
+
+    def _defer_event_locked(self, param: bytes) -> None:
+        """Hold one event back until a matching coordinator answers."""
+        self._pending_events.append(param)
+        while len(self._pending_events) > DEFERRED_EVENT_LIMIT:
+            dropped = self._pending_events.popleft()
+            logger.warning(
+                "TairKvCacheConnector: deferred events beyond %d; dropping "
+                "the oldest (%d bytes) -- no coordinator of instance %r "
+                "answered on ports %d-%d",
+                DEFERRED_EVENT_LIMIT,
+                len(dropped),
+                self._instance_id,
+                self._port,
+                self._port + COORDINATOR_PORT_ATTEMPTS,
+            )
+        logger.warning(
+            "TairKvCacheConnector: no coordinator of instance %r answered on "
+            "ports %d-%d; deferring the event (%d held back) until a "
+            "coordinator of this instance answers",
+            self._instance_id,
+            self._port,
+            self._port + COORDINATOR_PORT_ATTEMPTS,
+            len(self._pending_events),
+        )
+
+    def _flush_pending_locked(self) -> None:
+        """Deliver the deferred events to the endpoint a probe just resolved."""
+        if not self._pending_events:
+            return
+        held = len(self._pending_events)
+        while self._pending_events:
+            self._socket.send(self._pending_events.popleft())
+        logger.warning(
+            "TairKvCacheConnector: flushed %d deferred event(s) to the "
+            "coordinator of instance %r on port %d",
+            held,
+            self._instance_id,
+            self._port,
+        )
 
     def cancel_verdict(
         self, write_session_id: str, tp_rank: int, timeout_ms: int = 100
@@ -709,13 +792,17 @@ class TpCoordinatorClient:
     def _resync_endpoint(self, timeout_ms: int = 100) -> None:
         """Find the coordinator's actual port after a failed query.
 
-        Called at most once per outage: the port that answered is remembered
-        (and both sockets move to it), so later queries do not probe again, and
-        a still-dead coordinator is handed back to the caller, whose backoff
-        keeps the engine thread off it.
+        The port that answered is remembered (and both sockets move to it), so
+        later queries do not probe again, and a still-dead coordinator is
+        handed back to the caller, whose backoff keeps the engine thread off
+        it. Resolution stays honest: only a probe that found this instance's
+        coordinator marks the endpoint resolved and releases the deferred
+        events -- a failed probe leaves it unresolved so the next event
+        re-probes.
         """
-        self._endpoint_resolved = True
-        self._probe_and_reconnect(timeout_ms, lock_held=True)
+        if self._probe_and_reconnect(timeout_ms, lock_held=True):
+            self._endpoint_resolved = True
+            self._flush_pending_locked()
 
     def _probe_and_reconnect(
         self, timeout_ms: int = 100, lock_held: bool = False
