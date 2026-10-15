@@ -66,7 +66,8 @@ export kvcm_metrics_env_tag_mappings='workspace=APP_WORKSPACE,deployment_name=AP
 ```
 
 Use comma-separated `tag_name=ENV_NAME` mappings. Values are read at startup;
-missing or empty variables are skipped. Restart the process after changing
+missing or empty variables are skipped. Nonempty values, including leading
+and trailing whitespace, are preserved. Restart the process after changing
 the mapping or source values. An empty setting adds no tags. Duplicate tag
 names, empty names, or malformed mappings fail configuration parsing. The
 setting supports the usual config-file, `-e`, and environment-variable
@@ -93,7 +94,8 @@ For example, `host.name=ENV_A,host-name=ENV_B` both convert to `host_name`.
 Avoid such collisions and do not rely on overwrite order. Common-tag name
 conversion and collision handling run once at startup.
 Common tags named `__*`, `le`, or `quantile` after conversion
-are omitted to protect metric names and histogram/summary dimensions;
+are omitted to protect metric names and histogram/summary dimensions.
+Startup prints one WARN per omitted tag with its original and normalized name;
 metric-specific labels such as `le` are preserved. Values are escaped for
 the Prometheus text format. Common tags are not stored in MetricsRegistry,
 so `/api/getMetrics` continues to return the original metric tags.

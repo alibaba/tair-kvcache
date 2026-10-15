@@ -123,6 +123,19 @@ MetricsTags PrometheusExporter::PrepareCommonTags(const MetricsTags &common_tags
         auto label = SanitizeIdentifier(key);
         // Prometheus reserves __* labels and histogram/summary dimensions.
         if (label.empty() || label.compare(0, 2, "__") == 0 || label == "le" || label == "quantile") {
+            std::ostringstream warning;
+            warning << "WARN: Prometheus common tag [";
+            EscapeLabelValue(warning, key);
+            warning << "] normalizes to ";
+            if (label.empty()) {
+                warning << "an empty label";
+            } else {
+                warning << "reserved label [";
+                EscapeLabelValue(warning, label);
+                warning << ']';
+            }
+            warning << "; tag omitted\n";
+            fprintf(stderr, "%s", warning.str().c_str());
             continue;
         }
         auto [it, inserted] = labels.emplace(std::move(label), value);

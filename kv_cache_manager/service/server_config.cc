@@ -367,6 +367,9 @@ bool ServerConfig::ResolveMetricsEnvTags() {
     }
 
     for (const auto &[tag, env_name] : mappings) {
+        // Mapping names are configuration syntax, but environment values are
+        // label data shared with every backend. Preserve their exact contents,
+        // including whitespace; only missing or zero-length values are skipped.
         auto value = EnvUtil::GetEnv(env_name, "");
         if (!value.empty()) {
             metrics_common_tags_.emplace(tag, std::move(value));

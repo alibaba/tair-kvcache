@@ -186,7 +186,8 @@ export kvcm_metrics_env_tag_mappings='workspace=APP_WORKSPACE,deployment_name=AP
 
 也可以在配置文件中设置
 `kvcm.metrics.env_tag_mappings=workspace=APP_WORKSPACE,deployment_name=APP_DEPLOYMENT`，
-或使用同名的 `-e` 启动参数。源环境变量的值保持原样；变量不存在或值为空时跳过对应 tag。
+或使用同名的 `-e` 启动参数。源环境变量的值（包括首尾空白）保持原样；
+变量不存在或值为零长度字符串时跳过对应 tag。
 未配置或配置为空时不添加公共 tag。映射中的 tag 名必须唯一，空名、缺少 `=`、
 多余分隔符等语法错误会使配置解析失败。修改映射或源环境变量后需要重启进程。
 

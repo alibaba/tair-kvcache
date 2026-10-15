@@ -6,8 +6,6 @@
 
 namespace kv_cache_manager {
 
-class MetricsRegistry;
-
 // Serializes all metrics held in a MetricsRegistry into the Prometheus
 // text exposition format (text/plain; version=0.0.4; charset=utf-8).
 //
@@ -24,7 +22,8 @@ class MetricsRegistry;
 //   - GaugeValue   metrics are emitted with TYPE gauge.
 class PrometheusExporter {
 public:
-    // Prepare process-level labels once at startup. Reserved names are omitted.
+    // Prepare process-level labels once at startup. Reserved or empty names are
+    // omitted with a warning for each tag.
     // Normalized collisions overwrite the previous value and report the old
     // and effective values to stderr. Callers should avoid colliding names.
     static MetricsTags PrepareCommonTags(const MetricsTags &common_tags);

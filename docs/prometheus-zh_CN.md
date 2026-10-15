@@ -64,7 +64,8 @@ export kvcm_metrics_env_tag_mappings='workspace=APP_WORKSPACE,deployment_name=AP
 ```
 
 配置格式是 `tag名=源环境变量名`，多个映射以逗号分隔。启动时读取源变量，
-变量不存在或值为空时跳过；修改后需重启。空配置不添加 tag，重复 tag 名、
+变量不存在或值为空时跳过；非空值（包括首尾空白）保持原样。修改后需重启。
+空配置不添加 tag，重复 tag 名、
 空名或错误的映射语法会使配置解析失败。配置遵循 KVCM 的配置文件、`-e`
 参数及系统环境变量入口，独立于 reporter 类型。
 
@@ -84,7 +85,8 @@ label 重名。即使单条输出保留了业务 label，也可能让原本不�
 例如 `host.name=ENV_A,host-name=ENV_B` 都转换为 `host_name`；配置者应避免这种重名，
 不依赖冲突时的覆盖顺序。名称转换和公共 tag 冲突处理只在启动时执行。
 公共 tag 中的保留 label 名 `__*`、`le` 和 `quantile` 被忽略，以保护指标名和
-histogram/summary 的维度；指标自身的 `le` 等 label 正常保留。值按 Prometheus
+histogram/summary 的维度。启动时对每个被忽略的 tag 输出一行 WARN，说明原始 tag 名和
+转换后的 label 名；指标自身的 `le` 等 label 正常保留。值按 Prometheus
 文本格式转义。公共 tag 不写入 MetricsRegistry，因此 `/api/getMetrics` 返回原始 tag。
 
 其他 metrics 后端可通过公共初始化参数获取相同的 tag key/value，并按各自规则处理；

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -123,6 +124,26 @@ TEST_F(PrometheusExporterTest, CommonTagsPreservePrecedenceWhenSanitizationChang
     EXPECT_NE(std::string::npos,
               output.find("kvcm_test_untagged{aA=\"common_aA\",a_b=\"common_a_b\",region=\"common_region\"} 3\n"));
     EXPECT_EQ(std::string::npos, output.find("duplicate_native"));
+}
+
+TEST_F(PrometheusExporterTest, DroppedCommonTagsReportEachReservedOrEmptyName) {
+    testing::internal::CaptureStderr();
+    const auto labels = PrometheusExporter::PrepareCommonTags({{"", "empty_name"},
+                                                               {"__internal", "internal"},
+                                                               {"__name__", "metric_name"},
+                                                               {"le", "boundary"},
+                                                               {"quantile", "percentile"},
+                                                               {"workspace", "workspace_a"}});
+    const auto warnings = testing::internal::GetCapturedStderr();
+    EXPECT_EQ((MetricsTags{{"workspace", "workspace_a"}}), labels);
+    EXPECT_EQ(5, std::count(warnings.begin(), warnings.end(), '\n'));
+    EXPECT_NE(std::string::npos, warnings.find("WARN: Prometheus common tag [] normalizes to an empty label"));
+    for (const auto &key : {"__internal", "__name__", "le", "quantile"}) {
+        EXPECT_NE(std::string::npos,
+                  warnings.find("WARN: Prometheus common tag [" + std::string(key) +
+                                "] normalizes to reserved label [" + key + "]"));
+    }
+    EXPECT_EQ(std::string::npos, warnings.find("[workspace]"));
 }
 
 TEST_F(PrometheusExporterTest, CommonTagCollisionsReportOverwrittenAndEffectiveValues) {

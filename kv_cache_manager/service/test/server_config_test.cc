@@ -100,16 +100,19 @@ TEST_F(ServerConfigTest, MetricsEnvTagsResolveAtStartup) {
     ScopedEnv workspace("KVCM_TEST_METRICS_WORKSPACE", " workspace_a ");
     ScopedEnv deployment("KVCM_TEST_METRICS_DEPLOYMENT", "deployment_a");
     ScopedEnv empty("KVCM_TEST_METRICS_EMPTY", "");
+    ScopedEnv whitespace("KVCM_TEST_METRICS_WHITESPACE", " \t ");
     const std::string mappings = " workspace = KVCM_TEST_METRICS_WORKSPACE , "
                                  "deployment_name=KVCM_TEST_METRICS_DEPLOYMENT,"
+                                 "whitespace=KVCM_TEST_METRICS_WHITESPACE,"
                                  "empty=KVCM_TEST_METRICS_EMPTY,missing=KVCM_TEST_METRICS_UNSET";
     for (const auto &type : {"local", "logging", "dummy", "kmonitor"}) {
         ServerConfig config;
         ASSERT_TRUE(
             config.Parse("", {{"kvcm.metrics.env_tag_mappings", mappings}, {"kvcm.metrics.reporter_type", type}}));
         ASSERT_TRUE(config.Check());
-        EXPECT_EQ((MetricsTags{{"workspace", " workspace_a "}, {"deployment_name", "deployment_a"}}),
-                  config.metrics_common_tags());
+        EXPECT_EQ(
+            (MetricsTags{{"workspace", " workspace_a "}, {"deployment_name", "deployment_a"}, {"whitespace", " \t "}}),
+            config.metrics_common_tags());
     }
 
     ServerConfig config;
