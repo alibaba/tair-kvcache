@@ -151,15 +151,28 @@ class TestLoadFailure(unittest.TestCase):
 
             if env.connector_block_tables() > 1:
                 # Multi-block-table path: the connector cannot hand vLLM a
-                # group-indexed invalid-block list, so report_failures is False
-                # and the failure is swallowed into a log line. Keyed on the
-                # *registered* block-table count, not on the model family: a
-                # single-group windowed model reports like full attention even
-                # though is_multigroup()/env.hybrid are true for it.
-                swallowed = env.scan_connector_logs(
-                    r"load failed for \d+/\d+ blocks .*hybrid")
-                self.assertTrue(swallowed,
-                                "multi-block-table load failure was not logged")
+                # group-indexed invalid-block list. What happens next depends
+                # on the layout: a *windowed* multi-group model reports the
+                # failure at request granularity (vLLM >= 0.30 recomputes the
+                # request instead of decoding on the hole), while a
+                # non-windowed hybrid keeps the swallowed-and-logged contract.
+                # Keyed on the *registered* block-table count, not on the
+                # model family: a single-group windowed model reports like
+                # full attention even though is_multigroup()/env.hybrid are
+                # true for it.
+                if env.window_geometry().window is not None:
+                    reported = env.scan_connector_logs(
+                        r"load failed for \d+/\d+ blocks of req .*windowed "
+                        r"multi-group")
+                    self.assertTrue(
+                        reported,
+                        "the windowed multi-group load failure was not "
+                        "reported at request granularity")
+                else:
+                    swallowed = env.scan_connector_logs(
+                        r"load failed for \d+/\d+ blocks .*hybrid")
+                    self.assertTrue(swallowed,
+                                    "multi-block-table load failure was not logged")
                 # No capture *count* is expected here (the loads failed on
                 # purpose), but the marker still has to be read: it is the only
                 # other channel a capture-side assertion or a broken capture
