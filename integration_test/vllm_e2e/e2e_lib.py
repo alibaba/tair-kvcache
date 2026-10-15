@@ -9,7 +9,7 @@ from lib_utils import (  # noqa: F401
     is_hybrid_model, is_mla_model, scenario_tp_size, _runfiles_root,
     find_repo_root, find_manager_binary, find_python, free_port, wait_http,
     tokenize, get_manager_block_size, block_token_hash, full_block_hashes,
-    wait_for_prefix_cached, send_completions, count_captures,
+    capture_keys, wait_for_prefix_cached, send_completions, count_captures,
     wait_for_captures, compare_captures, assert_report_ok, make_base_prompts,
     shared_token_prefix_len,
 )

@@ -207,6 +207,22 @@ def full_block_hashes(token_ids: list[int], manager_block_size: int) -> list[str
     ]
 
 
+def capture_keys(token_ids: list[int], manager_block_size: int, tp_size: int,
+                 num_blocks: int) -> set[tuple[str, str]]:
+    """The (tp rank, token_hash) capture keys of the first ``num_blocks``
+    manager blocks of ``token_ids``, on every rank.
+
+    The verifying connector names one capture per rank and manager block
+    (``{ref,loaded}_tp{rank}_{token_hash}.pt``), so a scenario can name the
+    exact captures its loads must produce instead of only bounding how many
+    there are -- a rank whose captures are missing entirely would satisfy any
+    count that another rank has slack for.
+    """
+    hashes = full_block_hashes(token_ids, manager_block_size)
+    assert num_blocks <= len(hashes), f"{num_blocks} blocks > {len(hashes)} full blocks"
+    return {(f"tp{r}", h) for r in range(tp_size) for h in hashes[:num_blocks]}
+
+
 def wait_for_prefix_cached(manager_uri: str, instance_id: str,
                            token_ids: list[int], min_blocks: int,
                            timeout: float = 120.0) -> bool:
@@ -387,12 +403,19 @@ def compare_captures(capture_dir: str) -> dict:
     return report
 
 
-def assert_report_ok(report: dict, min_matched: int = 1):
+def assert_report_ok(report: dict, min_matched: int = 1, tp_size: int = 1,
+                     expected_keys: Optional[set[tuple[str, str]]] = None):
     """Assert the comparison succeeded.
 
     min_matched is the exact lower bound of (ref, loaded) capture pairs computed
     from the prompts' tokenization (num full manager blocks x tp ranks); a lower
     count means some blocks were silently never saved or never loaded.
+
+    tp_size > 1 additionally requires every rank to have contributed a matched
+    capture, and expected_keys (the exact (rank, token_hash) set computed by
+    capture_keys) must be fully covered. compare_captures only inspects the
+    captures that exist, so a rank or block that produced no capture at all is
+    verified by nobody unless it is named here.
     """
     problems = []
     if report["loaded_without_ref"]:
@@ -405,6 +428,23 @@ def assert_report_ok(report: dict, min_matched: int = 1):
         problems.append(
             f"matched {report['matched']} loaded captures, expected >= {min_matched}"
         )
+    matched_keys = set(report["matched_keys"])
+    if tp_size > 1:
+        matched_ranks = {key[0] for key in matched_keys}
+        missing_ranks = [f"tp{r}" for r in range(tp_size)
+                         if f"tp{r}" not in matched_ranks]
+        if missing_ranks:
+            problems.append(
+                f"no matched capture on rank(s) {missing_ranks}: every rank "
+                f"loads the same blocks, so each one must be verified"
+            )
+    if expected_keys is not None:
+        missing_keys = sorted(set(expected_keys) - matched_keys)
+        if missing_keys:
+            problems.append(
+                f"expected captures never matched ({len(missing_keys)} of "
+                f"{len(set(expected_keys))}): {missing_keys}"
+            )
     if problems:
         raise AssertionError("KV verification failed: " + "; ".join(problems))
     logger.info(

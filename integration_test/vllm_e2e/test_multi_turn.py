@@ -20,8 +20,8 @@ import logging
 import unittest
 
 from e2e_lib import (
-    ScenarioEnv, assert_report_ok, compare_captures, send_completions,
-    shared_token_prefix_len, tokenize, wait_for_captures,
+    ScenarioEnv, assert_report_ok, capture_keys, compare_captures,
+    send_completions, shared_token_prefix_len, tokenize, wait_for_captures,
     wait_for_prefix_cached,
 )
 
@@ -68,8 +68,8 @@ class TestMultiTurn(unittest.TestCase):
             self.assertTrue(wait_for_prefix_cached(
                 env.manager.manager_uri(), env.instance_id, turn1_ids,
                 min_blocks=turn1_blocks))
-            wait_for_captures(env.capture_dir, "ref", expected=turn1_blocks,
-                              timeout=180)
+            wait_for_captures(env.capture_dir, "ref",
+                              expected=env.tp_size * turn1_blocks, timeout=180)
 
             if env.hybrid:
                 # Prefix caching is on for hybrid; restart so turn 2's hit
@@ -101,9 +101,14 @@ class TestMultiTurn(unittest.TestCase):
 
             # And the loaded decode-block KV must verify.
             wait_for_captures(env.capture_dir, "loaded",
-                              expected=shared_blocks, timeout=180)
+                              expected=env.tp_size * shared_blocks, timeout=180)
             report = compare_captures(env.capture_dir)
-            assert_report_ok(report, min_matched=shared_blocks)
+            # Turn 2's stream starts with turn 1's ids, so the shared blocks
+            # are the same manager blocks on every rank.
+            assert_report_ok(
+                report, min_matched=env.tp_size * shared_blocks,
+                tp_size=env.tp_size,
+                expected_keys=capture_keys(turn2_ids, mbs, env.tp_size, shared_blocks))
         finally:
             env.stop()
 

@@ -39,7 +39,7 @@ from urllib.parse import urlparse
 import requests
 
 from e2e_lib import (
-    ScenarioEnv, compare_captures, full_block_hashes, make_base_prompts,
+    ScenarioEnv, capture_keys, compare_captures, make_base_prompts,
     send_completions, tokenize, wait_for_captures, wait_for_prefix_cached,
 )
 
@@ -107,8 +107,8 @@ class TestLoadFailure(unittest.TestCase):
 
             # ---- Phase 1: save everything.
             send_completions(vllm.base_url(), [prompt])
-            wait_for_captures(env.capture_dir, "ref", expected=save_blocks,
-                              timeout=180)
+            wait_for_captures(env.capture_dir, "ref",
+                              expected=env.tp_size * save_blocks, timeout=180)
             self.assertTrue(wait_for_prefix_cached(
                 env.manager.manager_uri(), env.instance_id, toks,
                 min_blocks=save_blocks))
@@ -160,13 +160,12 @@ class TestLoadFailure(unittest.TestCase):
             # recomputed over -- their captures mismatch in low bits (a
             # different attention kernel path), which is exactly the
             # "recomputed" disposition, not a transfer failure.
-            wait_for_captures(env.capture_dir, "loaded", expected=keep,
-                              timeout=180)
+            wait_for_captures(env.capture_dir, "loaded",
+                              expected=env.tp_size * keep, timeout=180)
             report = compare_captures(env.capture_dir)
-            hashes = full_block_hashes(toks, mbs)
-            ranks = [f"tp{r}" for r in range(env.tp_size)]
-            kept_keys = {(r, h) for r in ranks for h in hashes[:keep]}
-            deleted_keys = {(r, h) for r in ranks for h in hashes[keep:]}
+            kept_keys = capture_keys(toks, mbs, env.tp_size, keep)
+            deleted_keys = (capture_keys(toks, mbs, env.tp_size, save_blocks)
+                            - kept_keys)
             failed_keys = {f["key"] for f in report["failures"]}
             self.assertFalse(
                 failed_keys & kept_keys,

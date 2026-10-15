@@ -465,13 +465,13 @@ def run_e2e(scenario: str, tp_size: int, num_prompts: int,
         min_matched = tp_size * sum(expected_load_blocks)
         if expect_verification_failure:
             try:
-                assert_report_ok(report, min_matched=min_matched)
+                assert_report_ok(report, min_matched=min_matched, tp_size=tp_size)
             except AssertionError as e:
                 logger.info("verification failed as expected: %s", e)
                 return
             raise AssertionError(
                 "mutated connector passed KV verification; the harness is blind")
-        assert_report_ok(report, min_matched=min_matched)
+        assert_report_ok(report, min_matched=min_matched, tp_size=tp_size)
         logger.info("scenario %s PASSED: %s", scenario, json.dumps(
             {k: v for k, v in report.items() if k not in ("failures", "matched_keys")},
             default=str))
