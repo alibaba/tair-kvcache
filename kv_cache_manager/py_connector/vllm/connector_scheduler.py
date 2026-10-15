@@ -22,7 +22,10 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from kv_cache_manager.py_connector.common.logger import logger
-from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
+from kv_cache_manager.py_connector.common.manager_client import (
+    KvCacheManagerBusinessError,
+    KvCacheManagerClient,
+)
 from kv_cache_manager.py_connector.common.tp_coordinator import (
     CoordinateMsgSerializer,
     CoordinateMessage,
@@ -1103,22 +1106,46 @@ class ConnectorScheduler:
                 )
         try:
             response = self._manager_client.start_write_cache(request)
-        except Exception as e:
-            # No locations were allocated: this session will write nothing, so
-            # it protects nothing and its captures are releasable (they would
-            # otherwise be pinned until the request retires, because the save
-            # watermark has already moved past their blocks).
+        except KvCacheManagerBusinessError as e:
+            # The manager's own answer says it applied nothing: this session
+            # will write nothing, so it protects nothing and its captures are
+            # releasable (they would otherwise be pinned until the request
+            # retires, because the save watermark has already moved past their
+            # blocks).
             self._remember_session_plan(req_id, session_id, ())
             # Nothing was allocated: no uncommitted allocation of ours exists,
             # so the captures are releasable without a cache key (a no-key
             # release is otherwise deferred). They must go now -- the save
             # watermark has already moved past these blocks, so an active
-            # request will not announce them again, and repeated transient
-            # manager failures would pin their slots until retirement.
+            # request will not announce them again, and repeated rejections
+            # would pin their slots until retirement.
             self._queue_capture_release(
                 req_id, session_id, target_save_num, confirmed=True
             )
-            logger.warning("start_write_cache error, skip saving: %s", e)
+            logger.warning("start_write_cache rejected, skip saving: %s", e)
+            with self._canceled_save_request_ids_lock:
+                self._canceled_save_request_ids.append(req_id)
+            return
+        except Exception as e:
+            # Ambiguous failure: no answer arrived (connection error, timeout)
+            # or the answer cannot be trusted (HTTP error, malformed
+            # envelope). StartWriteCache is a non-idempotent write the client
+            # never retries (see manager_client._make_api_request), so the
+            # manager may hold this session's allocation right now. The
+            # captures must survive: the save watermark has already moved past
+            # their blocks, so releasing them would make those window bytes
+            # unpublishable forever -- the HBM window that produced them is
+            # gone, and no later session can recapture it. The session
+            # therefore keeps protecting its whole announced prefix (like an
+            # in-flight one), so no later session's mask-derived release drops
+            # the bytes while that maybe-allocation lives; retirement releases
+            # whatever a re-announcement never republished.
+            self._remember_session_plan(req_id, session_id, range(target_save_num))
+            logger.warning(
+                "start_write_cache failed, skip saving; captures retained "
+                "until retirement or a retry announcement: %s",
+                e,
+            )
             with self._canceled_save_request_ids_lock:
                 self._canceled_save_request_ids.append(req_id)
             return
@@ -1253,16 +1280,18 @@ class ConnectorScheduler:
         """Queue the captures of blocks no session of this request will write.
 
         The candidates come from the manager (a block mask reporting locations,
-        or a failed announcement whose blocks no session allocated), and every
+        or a rejected announcement whose blocks no session allocated), and every
         other session's claim is held back (see _blocks_other_sessions_write).
         The scheduler loop flushes the queue into the metadata; the http threads
         have no metadata of their own.
 
         ``confirmed`` marks a release the worker may perform without a cache
-        key: an announcement that raised allocated nothing at all, so no
-        uncommitted allocation exists to protect. Every other release carries
-        the manager's locations or waits for the commit verdict -- a
-        deduplicated block's key may be another request's pending write.
+        key: an announcement the manager *rejected* allocated nothing at all,
+        so no uncommitted allocation exists to protect. Every other release
+        carries the manager's locations or waits for the commit verdict -- a
+        deduplicated block's key may be another request's pending write. (An
+        announcement that failed *ambiguously* queues no release at all; see
+        start_save_kvcache.)
         """
         protected = self._blocks_other_sessions_write(req_id, session_id)
         if blocks is None:
@@ -1335,7 +1364,12 @@ class ConnectorScheduler:
     def _remember_session_plan(
         self, req_id: str, session_id: int, plan: Iterable[int]
     ) -> None:
-        """Record what this session will write (or nothing, if nothing)."""
+        """Record what this session will write (or nothing, if nothing).
+
+        The ambiguous-failure path is the third case: the session will not
+        write, but the manager may still hold its allocation, so it protects
+        its whole announced prefix until retirement (see start_save_kvcache).
+        """
         with self._announced_sessions_lock:
             sessions = self._announced_sessions.get(req_id)
             if sessions is not None and session_id in sessions:

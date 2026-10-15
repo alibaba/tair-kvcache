@@ -41,6 +41,9 @@ from kv_cache_manager.py_connector.test.vllm_stubs import (
     make_connector,
     make_connector_scheduler,
 )
+from kv_cache_manager.py_connector.common.manager_client import (
+    KvCacheManagerBusinessError,
+)
 from kv_cache_manager.py_connector.common.tp_coordinator import SaveContext
 from kv_cache_manager.py_connector.vllm.connector_worker import (
     CAPTURE_POOL_WAIT_SECONDS,
@@ -961,18 +964,21 @@ class TestWindowedSpecGroups(unittest.TestCase):
         self.assertEqual([("r0", list(range(32)))], released_blocks(release))
 
     def test_a_failed_announcement_releases_its_unprotected_captures(self):
-        # start_write_cache raising means this session allocates and writes
-        # nothing, and the save watermark has already moved past its blocks --
-        # an active request does not announce them again, so without a release
-        # here every transient manager failure pins its captures until the
-        # request retires.
+        # A *rejected* start_write_cache (the manager's own answer says it
+        # applied nothing) means this session allocates and writes nothing,
+        # and the save watermark has already moved past its blocks -- an
+        # active request does not announce them again, so without a release
+        # here every repeated rejection pins its captures until the request
+        # retires.
         sched = make_connector_scheduler(
             manager_block_size=MBS, num_groups=1, windowed=1
         )
         sched._extra_config = SimpleNamespace(
             instance_id="inst", write_timeout_seconds=1
         )
-        sched._manager_client.start_write_cache.side_effect = RuntimeError("boom")
+        sched._manager_client.start_write_cache.side_effect = (
+            KvCacheManagerBusinessError("no room")
+        )
         session = sched._record_announcement("r0", 16)
         sched.start_save_kvcache_async(
             "r0", list(range(16 * MBS)), 16, [True] * 16, [True] * 16, session
@@ -989,6 +995,50 @@ class TestWindowedSpecGroups(unittest.TestCase):
             "r0", list(range(16 * MBS)), 16, [True] * 16, [True] * 16, session2
         )
         self.assertNotEqual(protecting, session2)
+        later = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(later)
+        self.assertEqual([], released_blocks(later))
+
+    def test_an_ambiguous_announcement_failure_retains_its_captures(self):
+        # A timeout or connection error says nothing about whether the manager
+        # applied this non-idempotent write, so the captures must survive (the
+        # save watermark already moved past their blocks -- released bytes can
+        # never be republished), and the session must keep protecting its
+        # whole announced prefix, or a later session's mask-derived "already"
+        # release would drop the very bytes this one may still be owed a
+        # publication for.
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="inst", write_timeout_seconds=1
+        )
+        # The transport face of ambiguity: a bare exception the manager client
+        # raises without any answer (requests.Timeout would be the same).
+        sched._manager_client.start_write_cache.side_effect = TimeoutError("ttl")
+        session = sched._record_announcement("r0", 16)
+        sched.start_save_kvcache_async(
+            "r0", list(range(16 * MBS)), 16, [True] * 16, [True] * 16, session
+        )
+        release = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(release)
+        self.assertEqual([], released_blocks(release))
+
+        # A later session the manager answers "already cached" for this
+        # prefix cannot release the failed session's blocks either: the
+        # manager may be reporting the failed session's own uncommitted
+        # allocation, and those staged bytes are the only copy the window
+        # ever had.
+        sched._manager_client.start_write_cache.side_effect = None
+        sched._manager_client.start_write_cache.return_value = {
+            "locations": [],
+            "write_session_id": "sB",
+            "block_mask": {"offset": 16},
+        }
+        session_b = sched._record_announcement("r0", 16)
+        sched.start_save_kvcache_async(
+            "r0", list(range(16 * MBS)), 16, [True] * 16, [True] * 16, session_b
+        )
         later = TairKvCacheConnectorMetadata(epoch=0)
         sched._collect_release_captures(later)
         self.assertEqual([], released_blocks(later))
@@ -2999,11 +3049,12 @@ class TestAllocationFailureRelease(unittest.TestCase):
     """wave11: an announcement that allocated nothing releases for real."""
 
     def test_a_failed_announcement_releases_without_keys(self):
-        # StartWriteCache raised: the manager allocated nothing, so no
-        # uncommitted allocation exists to protect and the captures must go
-        # now. Deferring them (the no-key rule) would pin them until the
-        # request retires -- the save watermark already moved past these blocks
-        # and an active request will not announce them again.
+        # StartWriteCache was *rejected* (the manager answered with a business
+        # failure): it allocated nothing, so no uncommitted allocation exists
+        # to protect and the captures must go now. Deferring them (the no-key
+        # rule) would pin them until the request retires -- the save watermark
+        # has already moved past these blocks and an active request will not
+        # announce them again.
         sched = make_connector_scheduler(
             manager_block_size=MBS, num_groups=1, windowed=1
         )
@@ -3011,7 +3062,9 @@ class TestAllocationFailureRelease(unittest.TestCase):
             instance_id="alloc-fail", write_timeout_seconds=1
         )
         sched._manager_client = MagicMock()
-        sched._manager_client.start_write_cache.side_effect = RuntimeError("boom")
+        sched._manager_client.start_write_cache.side_effect = (
+            KvCacheManagerBusinessError("no room")
+        )
         sched.start_save_kvcache_async("r0", [1, 2, 3, 4], 4, [True] * 4)
         meta = TairKvCacheConnectorMetadata(epoch=0)
         sched._collect_release_captures(meta)
@@ -3019,12 +3072,35 @@ class TestAllocationFailureRelease(unittest.TestCase):
         self.assertEqual([("r0", [0, 1, 2, 3])], released_blocks(meta))
         self.assertTrue(
             entries[0][2] is None and entries[0][3] is True,
-            "the allocation-failure release is not confirmed: %r" % (entries,),
+            "the rejection release is not confirmed: %r" % (entries,),
         )
         # The worker honours it: no key needed, the captures are released.
         conn = captured_worker([0, 1, 2, 3], [7, 8, 9, 10])
         conn.wait_for_save(meta)
         self.assertEqual({}, conn._staged.get("r0", {}))
+
+    def test_an_ambiguous_announcement_failure_queues_no_release(self):
+        # The other face of the same split: a timeout leaves the captures in
+        # place (the manager may hold this session's allocation) and queues no
+        # release at all -- not even an unconfirmed one, which would defer
+        # keyless blocks to a verdict no session of this announcement will
+        # ever produce.
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="timeout", write_timeout_seconds=1
+        )
+        sched._manager_client = MagicMock()
+        sched._manager_client.start_write_cache.side_effect = TimeoutError("ttl")
+        sched.start_save_kvcache_async("r0", [1, 2, 3, 4], 4, [True] * 4)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        sched._collect_release_captures(meta)
+        self.assertEqual([], released_blocks(meta))
+        # The worker was told nothing, so its staged bytes survive untouched.
+        conn = captured_worker([0, 1, 2, 3], [7, 8, 9, 10])
+        conn.wait_for_save(meta)
+        self.assertEqual(4, len(conn._staged.get("r0", {})))
 
     def test_a_deduplicated_release_keeps_waiting_without_a_key(self):
         # The other side of the same rule: an announcement the manager

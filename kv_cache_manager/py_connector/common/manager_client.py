@@ -25,6 +25,19 @@ class KvCacheManagerProtocolError(requests.RequestException, AssertionError):
     """The Manager returned HTTP 200 with a malformed API envelope."""
 
 
+class KvCacheManagerBusinessError(AssertionError):
+    """A well-formed Manager answer whose business status is not OK.
+
+    The Manager definitively refused the request, so whatever it was asked to
+    apply was not applied. This is the one failure a caller may treat as
+    "nothing happened": contrast the transport failures (no answer arrived --
+    the request may have been applied) and the protocol errors above (an
+    answer exists but cannot be trusted), where the caller cannot know.
+    Subclasses AssertionError because the legacy contract was a bare
+    ``AssertionError`` here and callers still catch that.
+    """
+
+
 class KvCacheManagerClient:
     @classmethod
     def from_connector_config(cls, config: Mapping[str, Any]) -> "KvCacheManagerClient":
@@ -365,7 +378,7 @@ class KvCacheManagerClient:
             )
 
         if check_business_status and status["code"] != "OK":
-            raise AssertionError(
+            raise KvCacheManagerBusinessError(
                 f"Request to {endpoint} failed with error: {status.get('message', '')}"
             )
 
