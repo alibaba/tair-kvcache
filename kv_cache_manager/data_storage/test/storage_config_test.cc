@@ -206,6 +206,29 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRoundTrip) {
     EXPECT_EQ(parsed.media_type(), spec.media_type());
 }
 
+TEST_F(StorageConfigTest, TestTairMempoolGcDeletePolicyDefaultsAndRoundTrip) {
+    TairMemPoolStorageSpec spec;
+    EXPECT_FALSE(spec.skip_confirmed_missing_backend_delete());
+    const std::string legacy_json = R"({"domain":"pace.meta","timeout":5000})";
+    for (const bool skip : {false, true}) {
+        spec.set_skip_confirmed_missing_backend_delete(skip);
+        TairMemPoolStorageSpec restored;
+        ASSERT_TRUE(restored.FromJsonString(spec.ToJsonString()));
+        EXPECT_EQ(skip, restored.skip_confirmed_missing_backend_delete());
+    }
+    // Reloading old Registry data must reset a previously enabled optimization.
+    ASSERT_TRUE(spec.FromJsonString(legacy_json));
+    EXPECT_FALSE(spec.skip_confirmed_missing_backend_delete());
+    ASSERT_TRUE(
+        spec.FromJsonString(R"({"domain":"pace.meta","timeout":5000,"skip_confirmed_missing_backend_delete":true})"));
+    EXPECT_TRUE(spec.skip_confirmed_missing_backend_delete());
+    ASSERT_TRUE(
+        spec.FromJsonString(R"({"domain":"pace.meta","timeout":5000,"skip_confirmed_missing_backend_delete":false})"));
+    EXPECT_FALSE(spec.skip_confirmed_missing_backend_delete());
+    EXPECT_FALSE(
+        spec.FromJsonString(R"({"domain":"pace.meta","timeout":5000,"skip_confirmed_missing_backend_delete":"true"})"));
+}
+
 TEST_F(StorageConfigTest, TestTairMempoolSsdTypeRoundTripAndValidation) {
     EXPECT_EQ("pace_ssd", ToString(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
     EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, ToDataStorageType("pace_ssd"));
