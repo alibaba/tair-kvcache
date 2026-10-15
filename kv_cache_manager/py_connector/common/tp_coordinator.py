@@ -80,6 +80,15 @@ VERDICT_CANCEL_LIMIT = 4096
 #: degradation a dead coordinator always caused.
 DEFERRED_EVENT_LIMIT = 4096
 
+#: How often a client that is holding deferred events re-probes for its
+#: coordinator (see TpCoordinatorClient._deferred_retry_routine). The queue
+#: must not depend on later connector traffic: a full-attention session never
+#: issues a verdict query, and an idle workload produces no later event, so
+#: without an independent retry the last save's completion could stay queued
+#: forever and the request would remain pending even after the coordinator
+#: returned.
+DEFERRED_RETRY_SECONDS = 1.0
+
 
 @dataclass
 class CoordinateMessage:
@@ -619,6 +628,14 @@ class TpCoordinatorClient:
     ) -> None:
         self._host_ip = host_ip
         self._port = port
+        # The configured base, separate from _port forever after: _port moves
+        # to whatever pair a probe resolved to, and the *next* probe must
+        # still sweep the whole configured range. A coordinator restart that
+        # rebinds the original (lower) pair after the collision that pushed
+        # it to a fallback has cleared must stay reachable -- scanning from
+        # the moved _port would look only at the fallback and above, and the
+        # client would be permanently locked out of its own coordinator.
+        self._configured_port = port
         # The instance this client's events belong to. A probe carrying it
         # decides which answering pair is *our* coordinator: two connector
         # instances on one host can share a configured base port, and the
@@ -657,6 +674,17 @@ class TpCoordinatorClient:
         # are flushed, in order, to the first coordinator of this instance
         # that answers, so a startup race loses nothing.
         self._pending_events: "deque[bytes]" = deque()
+        # The independent retry for those events (see
+        # _deferred_retry_routine): set when the first event is deferred,
+        # joined by shutdown().
+        self._retry_stop = threading.Event()
+        self._retry_thread: Any = None
+        # Whether a retry routine is responsible for the queue right now.
+        # Guarded by the lock together with the queue itself: the routine
+        # exits (and clears this) only inside the same lock section a
+        # deferral occupies, so a deferral can never observe a routine that
+        # has already decided to leave (is_alive() alone has that race).
+        self._retry_active = False
 
     def send(self, param: bytes) -> None:
         # The coordinator may have had to take a neighbouring port pair (a
@@ -697,18 +725,22 @@ class TpCoordinatorClient:
                 DEFERRED_EVENT_LIMIT,
                 len(dropped),
                 self._instance_id,
-                self._port,
-                self._port + COORDINATOR_PORT_ATTEMPTS,
+                self._configured_port,
+                self._configured_port + COORDINATOR_PORT_ATTEMPTS,
             )
         logger.warning(
             "TairKvCacheConnector: no coordinator of instance %r answered on "
             "ports %d-%d; deferring the event (%d held back) until a "
             "coordinator of this instance answers",
             self._instance_id,
-            self._port,
-            self._port + COORDINATOR_PORT_ATTEMPTS,
+            self._configured_port,
+            self._configured_port + COORDINATOR_PORT_ATTEMPTS,
             len(self._pending_events),
         )
+        # The queue just became non-empty: ensure the independent retry will
+        # happen even if no further traffic ever does (see
+        # _deferred_retry_routine).
+        self._ensure_retry_thread_locked()
 
     def _flush_pending_locked(self) -> None:
         """Deliver the deferred events to the endpoint a probe just resolved."""
@@ -724,6 +756,79 @@ class TpCoordinatorClient:
             self._instance_id,
             self._port,
         )
+
+    def _ensure_retry_thread_locked(self) -> None:
+        """Start the deferred-event retry thread if it is not running.
+
+        Called under the lock on every deferral. A running routine picks the
+        queue up on its own next iteration (it re-reads the queue under the
+        lock), so the flag -- not is_alive() -- is the test: a routine that
+        has decided to exit has already cleared it inside this same lock
+        section, and is_alive() would still be true for a moment after.
+        """
+        if self._retry_active or self._retry_stop.is_set():
+            # A routine is responsible, or the client is shut down and no
+            # retry may touch its context again.
+            return
+        thread = threading.Thread(
+            target=self._deferred_retry_routine,
+            name="TpCoordinatorClientDeferredRetry",
+            daemon=True,
+        )
+        self._retry_active = True
+        try:
+            thread.start()
+        except Exception:  # pragma: no cover - resource exhaustion
+            self._retry_active = False
+            raise
+        self._retry_thread = thread
+
+    def _deferred_retry_routine(self) -> None:
+        """Re-probe for the coordinator while events are held back.
+
+        Flushing the deferred queue must not depend on later connector
+        traffic: a full-attention session never asks for a verdict, and an
+        idle workload may never send another event, so without this routine
+        the last save's start/finish would stay queued after a coordinator
+        outage -- FinishWriteCache would never run and the request would stay
+        pending forever. A background timer is the only retry point that is
+        independent of the engine's steps: an engine-side step hook would
+        stall the engine thread for a whole probe sweep during the outage,
+        and an engine that goes idle after the last save stops stepping
+        entirely -- exactly the workload the queue exists for.
+
+        The routine parks on the stop event between sweeps (no polling while
+        the queue is empty, no busy-wait anywhere), takes the client lock
+        only for a bounded probe sweep, and exits -- under that lock -- when
+        the queue drains, so the next deferral can tell it is gone and start
+        a fresh one.
+        """
+        while not self._retry_stop.wait(DEFERRED_RETRY_SECONDS):
+            try:
+                with self._lock:
+                    if not self._pending_events:
+                        # Traffic already flushed the queue: hand the
+                        # responsibility back before releasing the lock, so
+                        # a concurrent deferral starts a new routine rather
+                        # than trusting one that is leaving.
+                        self._retry_active = False
+                        return
+                    if self._probe_and_reconnect_locked(100):
+                        self._endpoint_resolved = True
+                        self._flush_pending_locked()
+            except Exception as e:  # pragma: no cover - context teardown
+                # The context can only be gone after shutdown(), which stops
+                # this routine first -- reaching this means a send() raced
+                # the shutdown: log it once and leave rather than spin on a
+                # dead context.
+                logger.warning(
+                    "TairKvCacheConnector: deferred-event retry gave up "
+                    "(%s: %s); %d event(s) stay held back",
+                    type(e).__name__,
+                    e,
+                    len(self._pending_events),
+                )
+                return
 
     def cancel_verdict(
         self, write_session_id: str, tp_rank: int, timeout_ms: int = 100
@@ -770,8 +875,8 @@ class TpCoordinatorClient:
                     "no coordinator of instance %r answered on ports %d-%d"
                     % (
                         self._instance_id,
-                        self._port,
-                        self._port + COORDINATOR_PORT_ATTEMPTS,
+                        self._configured_port,
+                        self._configured_port + COORDINATOR_PORT_ATTEMPTS,
                     )
                 )
         if self._query_socket is None:
@@ -789,8 +894,18 @@ class TpCoordinatorClient:
         Idempotent, and nothing may touch a socket afterwards: the probe and
         query paths allocate their sockets lazily on the context, so a client
         whose context is terminated must answer "cannot ask"/keep the
-        configured port rather than reach into a dead context again.
+        configured port rather than reach into a dead context again. The
+        deferred-event retry is stopped (and joined) *before* the context is
+        terminated: the routine probes on this context, and a probe racing
+        the teardown is exactly the use-after-free the server side avoids by
+        stopping its routines first.
         """
+        self._retry_stop.set()
+        if self._retry_thread is not None:
+            # Bounded by one probe sweep: the routine holds the lock only
+            # for that, and every other moment it is parked on the stop
+            # event, which the set() above just ended.
+            self._retry_thread.join(timeout=5.0)
         with self._lock:
             if self._query_socket is not None:
                 self._query_socket.close(linger=0)
@@ -818,14 +933,19 @@ class TpCoordinatorClient:
         The port that answered is remembered (and both sockets move to it), so
         later queries do not probe again, and a still-dead coordinator is
         handed back to the caller, whose backoff keeps the engine thread off
-        it. Resolution stays honest: only a probe that found this instance's
-        coordinator marks the endpoint resolved and releases the deferred
-        events -- a failed probe leaves it unresolved so the next event
-        re-probes.
+        it. Resolution stays honest in both directions: only a probe that
+        found this instance's coordinator marks the endpoint resolved and
+        releases the deferred events -- a failed probe marks it *unresolved*
+        again, because the endpoint a query just failed on is proven dead:
+        leaving it resolved would send every later event to a socket nobody
+        reads and let later queries reconnect to the dead pair without ever
+        re-probing.
         """
         if self._probe_and_reconnect(timeout_ms, lock_held=True):
             self._endpoint_resolved = True
             self._flush_pending_locked()
+        else:
+            self._endpoint_resolved = False
 
     def _probe_and_reconnect(
         self, timeout_ms: int = 100, lock_held: bool = False
@@ -844,7 +964,16 @@ class TpCoordinatorClient:
         if self._query_socket is not None:
             self._query_socket.close(linger=0)
             self._query_socket = None
-        for candidate in range(self._port, self._port + COORDINATOR_PORT_ATTEMPTS):
+        # Every probe sweeps from the *configured* base, never from the port a
+        # previous probe moved to: a coordinator that restarts after its
+        # original collision cleared rebinds the lower original pair, and a
+        # scan starting at the old fallback would never look below it -- the
+        # client would be locked out of its own coordinator until its process
+        # restarts.
+        for candidate in range(
+            self._configured_port,
+            self._configured_port + COORDINATOR_PORT_ATTEMPTS,
+        ):
             probe = self._zmq_context.socket(zmq.REQ)
             probe.setsockopt(zmq.LINGER, 0)
             probe.setsockopt(zmq.RCVTIMEO, min(timeout_ms, 20))
@@ -896,9 +1025,10 @@ class TpCoordinatorClient:
                 self._socket.connect("tcp://%s:%d" % (self._host_ip, candidate))
                 logger.warning(
                     "TairKvCacheConnector: the coordinator answered on port %d "
-                    "(configured %d was taken); reconnected",
+                    "(previously used %d, configured %d); reconnected",
                     candidate,
                     self._port,
+                    self._configured_port,
                 )
                 self._port = candidate
             self._connect_query(candidate + 1, timeout_ms)

@@ -874,6 +874,118 @@ class TestForeignCoordinatorRefusal(unittest.TestCase):
         self.assertTrue(self.client._endpoint_resolved)
         self.assertEqual(len(self.client._pending_events), 0)
 
+    def test_deferred_events_flush_without_later_traffic(self):
+        # The stuck shape: the coordinator is unavailable while the last
+        # save's start and finish are sent, and nothing else ever comes -- a
+        # full-attention session asks for no verdict, and an idle workload
+        # produces no later event. Without an independent retry the queue is
+        # only flushed by the next send()/query, so the completion would stay
+        # held back forever, FinishWriteCache would never run and the request
+        # would remain pending even after the coordinator returned. The
+        # client's own background retry must deliver it on its own.
+        import kv_cache_manager.py_connector.common.tp_coordinator as tp
+
+        with unittest.mock.patch.object(tp, "DEFERRED_RETRY_SECONDS", 0.05):
+            for param in self._save_events("req-b4", "sess-b4"):
+                self.client.send(param)
+            self.assertFalse(self.client._endpoint_resolved)
+            self.assertEqual(2, len(self.client._pending_events))
+
+            # No further traffic from here on: the coordinator that comes up
+            # on the fallback pair is found by the retry alone.
+            self.server_b = TpCoordinatorServer(
+                "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+            )
+            _wait_for_server(self.server_b)
+            deadline = time.time() + 5.0
+            while time.time() < deadline and self.seen_b != ["sess-b4"]:
+                time.sleep(0.01)
+        self.assertEqual(
+            ["sess-b4"], self.seen_b, "the deferred save never completed"
+        )
+        self.assertTrue(self.client._endpoint_resolved)
+        self.assertEqual(self.base_port + 2, self.client._port)
+        self.assertEqual(0, len(self.client._pending_events))
+        self.assertEqual([], self.seen_a)
+
+    def test_a_coordinator_back_on_the_original_pair_is_found_again(self):
+        # After the client settled on a fallback pair, a coordinator restart
+        # can rebind the *configured* pair (the original collision has
+        # cleared). The resync must sweep from the configured base -- a scan
+        # starting at the port the client moved to never looks below it, and
+        # the client would stay locked out of its own coordinator until its
+        # process restarts.
+        # B's coordinator takes the fallback pair; the client settles there.
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        for param in self._save_events("req-b5", "sess-b5"):
+            self.client.send(param)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and self.seen_b != ["sess-b5"]:
+            time.sleep(0.01)
+        self.assertEqual(self.base_port + 2, self.client._port)
+
+        # Both coordinators go away; B's comes back and rebinds the
+        # configured pair.
+        self.server_a.shutdown()
+        self.server_b.shutdown()
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        self.assertEqual(self.base_port, self.server_b._base_port)
+
+        # The first query fails on the dead old pair and resyncs from the
+        # configured base -- finding the lower pair again; the second lands
+        # on it.
+        self.server_b.record_verdict("sess-r", [True])
+        self.assertIs(
+            False, self.client.ask_verdict("sess-r", 0), "the dead pair answered"
+        )
+        self.assertEqual(
+            [True], self.client.ask_verdict("sess-r", 0), "the restarted coordinator never answered"
+        )
+        self.assertEqual(self.base_port, self.client._port)
+        self.assertEqual([], self.seen_a)
+
+    def test_a_failed_resync_leaves_the_endpoint_unresolved(self):
+        # The resync's other half: when nothing of this instance answers, the
+        # endpoint a query just failed on is proven dead and must not stay
+        # "resolved" -- later events would queue on a socket nobody reads and
+        # later queries would reconnect to the dead pair without ever
+        # re-probing. The next event defers instead, exactly like a client
+        # that never resolved.
+        # B's coordinator takes the fallback pair; the client settles there.
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        for param in self._save_events("req-b6", "sess-b6"):
+            self.client.send(param)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and self.seen_b != ["sess-b6"]:
+            time.sleep(0.01)
+        self.assertTrue(self.client._endpoint_resolved)
+
+        # B's coordinator dies; only the foreign A answers the sweep now.
+        self.server_b.shutdown()
+        self.assertIs(
+            False, self.client.ask_verdict("sess-x", 0), "the query path raised"
+        )
+        self.assertFalse(
+            self.client._endpoint_resolved,
+            "a failed resync left the dead endpoint resolved",
+        )
+
+        # The next event defers instead of being queued on the dead socket,
+        # and the background retry owns it from here.
+        self.client.send(self._save_events("req-b7", "sess-b7")[0])
+        self.assertEqual(1, len(self.client._pending_events))
+        self.assertFalse(self.client._endpoint_resolved)
+        self.assertEqual([], self.seen_a)
+
     def test_the_defer_buffer_is_bounded(self):
         # An outage longer than the buffer must drop the oldest events loudly
         # rather than grow without bound; the coordinator-side caps settle
