@@ -112,6 +112,8 @@ Optimizer 的配置与订阅接口同时检查 `LEADER` 和 `IsStableState()`。
 
 失锁后的 PROMOTING、待清理的 LEADER 和 DEMOTING 都不参与竞选。只有清理回调返回、进入 FOLLOWER 后才允许再次竞选，并继续遵守现有 `forbid_campaign_time` 冷却配置。新一轮持锁重新执行恢复。
 
+暂停竞选期间，LeaderLock 仍查询锁持有者并刷新发现信息，使旧节点能够返回其他节点的新主端点。只读查询不改变本地持锁状态、轮次或业务门禁；发起查询时若没有竞选资格，即使清理或主动释放在查询途中结束，也只能等下一轮查询后再尝试获得租约。Stop 后停止刷新，并丢弃在途查询结果。
+
 协调请求在发送前记录轮次，返回后重新校验。响应提交时必须在取得状态互斥锁之后读取当前时间，避免等待互斥锁期间租约已经过期，却按等待前的时间提交成功。迟到的抢锁结果或续约成功不能恢复已撤销的轮次，必要时按持有者校验释放锁。协调 I/O 不持有状态互斥锁，避免阻塞租约检查；主动释放锁期间也禁止新竞选。停止时先撤销业务资格，再停止选主/租约线程，处理线程完成已开始的恢复及必要清理后退出。
 
 本次保留回调失败的现有行为：恢复提前返回或异常不新增失败重试、错误传播或角色转换阻断；清理返回错误或异常不新增重新竞选阻断。恢复成功路径之外不会因本次门禁调整而自动开放业务。
@@ -136,8 +138,8 @@ Optimizer 的配置与订阅接口同时检查 `LEADER` 和 `IsStableState()`。
 |---|---|---|
 | 1 | `server.cc` 门禁接入；`LoseLeaseLocked` / `RunIfCurrentPromotionValid` | 关闭和开放门禁使用同一把状态锁；所有失锁入口都会撤销资格；快速回调只关闭/开放入口，不重入选主器 |
 | 2 | `HasPendingTransitionLocked` / `ReconcileState` | 正常恢复、恢复失效后清理、LEADER 失锁后清理这三条路径完整；无历史任务积压；回调执行时已释放状态锁 |
-| 3 | `CanCampaignLocked` / `DoDemote` | 失锁后的 PROMOTING、待清理 LEADER、DEMOTING 和主动释放锁期间均不能竞选；清理返回后仍遵守冷却期 |
-| 4 | `CampaignLeader` / `AcceptLease` / `HoldLeader` / `ReleaseLock` | 发送前记录轮次，返回后重新检查轮次与期限；响应提交时读取时间的位置正确；拒绝结果后的释放先于本锁线程下一次竞选 |
+| 3 | `CanCampaignLocked` / `DoDemote` | 失锁后的 PROMOTING、待清理 LEADER、DEMOTING 和主动释放锁期间均不能竞选；清理返回后仍遵守冷却期；这些阶段仍刷新发现信息 |
+| 4 | `CampaignLeader` / `AcceptLease` / `HoldLeader` / `ReleaseLock` | 发送前记录轮次，返回后重新检查轮次与期限；只读发现查询不能因清理结束而变成获锁；拒绝结果后的释放先于本锁线程下一次竞选 |
 | 5 | `StateTransitionWorker` / `Stop` / `IsStableStateLocked` | 条件变量等待当前事实；停止时在途响应不能提交，已开始的恢复与必要清理完成后才退出 |
 
 重点交错时序及对应回归用例：
@@ -152,6 +154,8 @@ Optimizer 的配置与订阅接口同时检查 `LEADER` 和 `IsStableState()`。
 | Stop 与抢锁、恢复或清理同时发生 | 无在途结果提交；必要清理不被跳过 | `StopRejectsAcquisitionStillInFlight` / `StopWaitsForRecoveryCleanupAndNeverPublishesOldReadiness` / `StopDuringCleanupWaitsForAlreadyRunningCleanup` |
 
 并发假设也属于评审范围：竞选和续约只有一个 LeaderLock 线程；恢复和清理只有一个 StateTransition 线程；回调在 Start 前注册；两个快速门禁回调不能阻塞或重入。`transition_mutex_` 保护角色变更、轮次和释放标记；同时访问锁持有者字符串时，按状态锁到持有者锁的顺序获取，不反向获取。
+
+两个快速门禁回调持有非递归的 `transition_mutex_`。回调中调用 `IsStableState()`、`WaitForStableState()`、`Demote()`、`Stop()` 或 `RunIfCurrentPromotionValid()` 会再次获取同一把锁，即使调用的是查询接口也会自锁。
 
 请求排空丢通知的修复在 `ServiceImplBase` 中独立核对：完成请求的计数递减取得 shared lock，排空等待取得同一把锁的 unique lock，保证谓词检查到进入等待之间不会丢掉最后一次完成通知。回调失败策略保留现状，本地轮次不提供存储层 fencing；这两项不是本次验收新增的保证。
 
@@ -332,6 +336,7 @@ Redis选主key通过`cluster_name`区分：`kvcm_<cluster_name>_lock:`/`kvcm_<cl
 |---|---|---|
 | 恢复开始前反复得锁、失锁 | 不积压历史回调；最终持锁后只恢复一次 | `config/test/leader_elector_reconcile_test.cc` |
 | 恢复期间失锁、门禁发布与失锁并发 | 旧恢复不能重新开放门禁；清理返回后才允许竞选 | 同上 |
+| 恢复、清理、主动释放或冷却期间发现新主 | 继续刷新持有者，锁消失后清空发现；查询不提升资格，不采用释放前读到的自持锁旧结果 | 同上 |
 | 抢锁、查询锁持有者或续约响应迟到 | 轮次或租约已失效时拒绝结果；不删除其他节点的锁 | 同上 |
 | 响应等待状态锁跨过租约期限 | 取得状态锁后重新读取时间，拒绝过期结果 | 同上 |
 | 恢复开始前、发布门禁前、恢复返回时租约到期 | 尚未开始恢复时无需清理；已开始恢复时必须清理 | 同上 |
@@ -342,7 +347,7 @@ Redis选主key通过`cluster_name`区分：`kvcm_<cluster_name>_lock:`/`kvcm_<cl
 | 本地失锁、角色仍为 LEADER 且尚未关闭订阅 | Optimizer 配置与订阅 gRPC 接口拒绝新请求 | `service/test/optimizer_event_service_grpc_test.cc` |
 | 优雅退出与进程崩溃后的未完成写入 | SIGTERM 等待写会话清理；SIGKILL 后孤立 WRITING 可由 GC/Reclaimer 回收 | `integration_test/cache_garbage_collector/cache_garbage_collector_test.py`、`integration_test/reclaimer/reclaiming_test.py` |
 | 单节点主动降级后重新服务、双节点竞争与切主 | 通过 HTTP/gRPC 验证门禁和选主的装配行为 | `integration_test/admin_service/admin_interface_cases.py` |
-| 真实 Redis 锁 key 在恢复期间被外部删除 | 真实续约返回 `EC_NOENT`；恢复和清理期间各 100 次锁循环均不查询或抢锁；清理后重新恢复为 LEADER 并发布门禁 | `integration_test/redis_coordination/leader_lock_deletion_test_driver.cc`，由下述 Python 集成目标启动 |
+| 真实 Redis 锁 key 在恢复期间被外部删除 | 真实续约返回 `EC_NOENT`；恢复和清理期间各 100 次锁循环均刷新发现但不抢锁；清理阻塞时可解析其他节点的新主端点；清理后重新恢复为 LEADER 并发布门禁 | `integration_test/redis_coordination/leader_lock_deletion_test_driver.cc`，由下述 Python 集成目标启动 |
 | 外部连续删除真实 Redis 锁 key | 至少 10 次实际删除；停止注入后重新获锁、恢复 Meta/Admin 入口，并持续跨过 3 次后续续约 | `integration_test/redis_coordination/redis_leader_recovery_test.py` |
 | Redis 连接反复中断、主节点网络隔离 | 单节点能重新恢复；双节点只有新主提供业务，旧主恢复连接后不重复升主 | `integration_test/redis_coordination/redis_leader_recovery_test.py` |
 | Redis 已续约成功但响应丢失或迟到 | 客户端重连并重试同一命令；过期轮次不复活，补偿释放不删除新主的锁 | 同上 |

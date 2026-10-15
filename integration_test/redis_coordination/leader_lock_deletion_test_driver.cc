@@ -12,6 +12,7 @@
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/coordination_redis_backend.h"
 #include "kv_cache_manager/config/leader_elector.h"
+#include "kv_cache_manager/config/node_endpoint_info.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -123,7 +124,8 @@ protected:
             elector_->WorkLoop();
         }
         EXPECT_EQ(campaigns, backend_->campaigns);
-        EXPECT_EQ(holder_checks, backend_->holder_checks);
+        EXPECT_EQ(holder_checks + 100, backend_->holder_checks);
+        EXPECT_TRUE(elector_->GetLeaderNodeID().empty());
         EXPECT_FALSE(elector_->IsLeader());
         EXPECT_FALSE(ready_);
         std::string value;
@@ -159,15 +161,42 @@ TEST_F(RedisLeaderLockDeletionTest, ExternalDeletionDuringRecoveryRequiresCleanu
     EXPECT_EQ(RoleState::PROMOTING, elector_->GetRoleState());
     ExpectNoCampaignWhileKeyIsMissing();
 
-    // Prove Redis is writable and the missing key can be acquired immediately.
-    CoordinationRedisBackend probe;
-    ASSERT_EQ(EC_OK, probe.Init(StandardUri(std::getenv("KVCM_TEST_REDIS_URI"))));
-    ASSERT_EQ(EC_OK, probe.TryLock("leader", "probe", 60000));
-    ASSERT_EQ(EC_OK, probe.Unlock("leader", "probe"));
+    // A second elector becomes leader while the first recovery is blocked.
+    // The old node must still discover its real Redis endpoint record.
+    auto probe_backend = std::make_shared<CoordinationRedisBackend>();
+    ASSERT_EQ(EC_OK, probe_backend->Init(StandardUri(std::getenv("KVCM_TEST_REDIS_URI"))));
+    LeaderElector probe(probe_backend, "leader", "probe", 60000, 10);
+    NodeEndpointInfo endpoint("probe", "127.0.0.1", 12345, 12346, 12345, 12347);
+    ASSERT_EQ(EC_OK, probe.SetSelfNodeInfo(endpoint));
+    bool probe_ready = false;
+    probe.SetBecomeLeaderHandler([&] { probe.RunIfCurrentPromotionValid([&] { probe_ready = true; }); });
+    probe.SetNoLongerLeaderHandler([&] { probe_ready = false; });
+    probe.WorkLoop();
+    probe.ProcessStateTransitionsForTest();
+    ASSERT_TRUE(probe_ready);
+    int campaigns = backend_->campaigns;
+    elector_->WorkLoop();
+    EXPECT_EQ("probe", elector_->GetLeaderNodeID());
+    EXPECT_EQ(campaigns, backend_->campaigns);
 
     recovery_.Release();
     ASSERT_TRUE(cleanup_.WaitEntered());
     ASSERT_EQ(RoleState::DEMOTING, elector_->GetRoleState());
+    int holder_checks = backend_->holder_checks;
+    elector_->WorkLoop();
+    EXPECT_GT(backend_->holder_checks, holder_checks);
+    EXPECT_EQ("probe", elector_->GetLeaderNodeID());
+    EXPECT_EQ(campaigns, backend_->campaigns);
+    EXPECT_FALSE(elector_->IsLeader());
+    EXPECT_FALSE(ready_);
+    NodeEndpointInfo discovered;
+    EXPECT_EQ(EC_OK, elector_->GetLeaderNodeInfo(discovered));
+    EXPECT_EQ(endpoint.node_id(), discovered.node_id());
+    EXPECT_EQ(endpoint.host(), discovered.host());
+    EXPECT_EQ(endpoint.meta_http_port(), discovered.meta_http_port());
+    probe.Demote();
+    probe.ProcessStateTransitionsForTest();
+    EXPECT_FALSE(probe_ready);
     ExpectNoCampaignWhileKeyIsMissing();
     cleanup_.Release();
     worker_.get();

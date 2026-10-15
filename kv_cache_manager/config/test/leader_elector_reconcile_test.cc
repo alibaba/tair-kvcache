@@ -52,6 +52,7 @@ public:
         return CoordinationMemoryBackend::TryLock(key, value, ttl);
     }
     ErrorCode RenewLock(const std::string &key, const std::string &value, int64_t ttl) override {
+        ++renewals;
         if (renew_error != EC_OK) {
             return renew_error;
         }
@@ -65,7 +66,11 @@ public:
         if (before_get) {
             before_get();
         }
-        return CoordinationMemoryBackend::GetLockHolder(key, value, expiration);
+        ErrorCode ec = CoordinationMemoryBackend::GetLockHolder(key, value, expiration);
+        if (after_get) {
+            after_get();
+        }
+        return ec;
     }
     ErrorCode Unlock(const std::string &key, const std::string &value) override {
         if (before_unlock) {
@@ -77,11 +82,13 @@ public:
         return CoordinationMemoryBackend::Unlock(key, value);
     }
     std::atomic<int> campaigns{0};
+    std::atomic<int> renewals{0};
     ErrorCode renew_error = EC_OK;
     ErrorCode unlock_error = EC_OK;
     std::function<void()> before_try;
     std::function<void()> after_renew;
     std::function<void()> before_get;
+    std::function<void()> after_get;
     std::function<void()> before_unlock;
 };
 
@@ -155,11 +162,14 @@ TEST_F(LeaderReconcileTest, LossDuringRecoveryBlocksCampaignThroughCleanupAndRec
     EXPECT_TRUE(recovery.WaitEntered());
     EXPECT_EQ(RoleState::PROMOTING, elector->GetRoleState());
     LoseLock();
+    // Another node can acquire and be discovered before the old recovery returns.
+    EXPECT_EQ(EC_OK, backend->TryLock("lock", "other", 60000));
     int campaigns = backend->campaigns;
     for (int i = 0; i < 100; ++i) {
         Acquire();
     }
     EXPECT_EQ(campaigns, backend->campaigns);
+    EXPECT_EQ("other", elector->GetLeaderNodeID());
     recovery.Release();
     EXPECT_TRUE(cleanup.WaitEntered());
     EXPECT_EQ(RoleState::DEMOTING, elector->GetRoleState());
@@ -167,8 +177,7 @@ TEST_F(LeaderReconcileTest, LossDuringRecoveryBlocksCampaignThroughCleanupAndRec
         Acquire();
     }
     EXPECT_EQ(campaigns, backend->campaigns);
-    // This node does not acquire an unusable lease and block another candidate.
-    EXPECT_EQ(EC_OK, backend->TryLock("lock", "other", 60000));
+    EXPECT_EQ("other", elector->GetLeaderNodeID());
     cleanup.Release();
     worker.get();
     EXPECT_EQ(1, recoveries);
@@ -191,6 +200,12 @@ TEST_F(LeaderReconcileTest, ServingLossClosesGateBeforeCleanupAndDoesNotCampaign
     ASSERT_TRUE(ready);
     LoseLock();
     EXPECT_FALSE(elector->WaitForStableState(0));
+    EXPECT_EQ(EC_OK, backend->TryLock("lock", "other", 60000));
+    int campaigns = backend->campaigns;
+    Acquire();
+    EXPECT_EQ(RoleState::LEADER, elector->GetRoleState()); // Cleanup has not started yet.
+    EXPECT_EQ("other", elector->GetLeaderNodeID());
+    EXPECT_EQ(campaigns, backend->campaigns);
     BlockingPoint cleanup;
     elector->SetNoLongerLeaderHandler([&] {
         ++cleanups;
@@ -198,13 +213,20 @@ TEST_F(LeaderReconcileTest, ServingLossClosesGateBeforeCleanupAndDoesNotCampaign
     });
     auto worker = std::async(std::launch::async, [&] { Reconcile(); });
     EXPECT_TRUE(cleanup.WaitEntered());
-    int campaigns = backend->campaigns;
+    EXPECT_EQ(EC_OK, backend->Unlock("lock", "other"));
+    Acquire();
+    EXPECT_TRUE(elector->GetLeaderNodeID().empty());
+    EXPECT_EQ(campaigns, backend->campaigns);
+    EXPECT_EQ(EC_OK, backend->TryLock("lock", "other", 60000));
+    campaigns = backend->campaigns;
     for (int i = 0; i < 100; ++i) {
         Acquire();
     }
     EXPECT_EQ(campaigns, backend->campaigns);
+    EXPECT_EQ("other", elector->GetLeaderNodeID());
     cleanup.Release();
     worker.get();
+    EXPECT_EQ(EC_OK, backend->Unlock("lock", "other"));
     Acquire();
     Reconcile();
     EXPECT_TRUE(ready);
@@ -435,6 +457,87 @@ TEST_F(LeaderReconcileTest, FailedUnlockStillAllowsFreshRecoveryOfSelfHeldKey) {
     EXPECT_TRUE(ready);
     EXPECT_EQ(2, recoveries);
     EXPECT_EQ(1, cleanups);
+}
+
+TEST_F(LeaderReconcileTest, DiscoveryRefreshContinuesDuringCooldownWithoutCampaigning) {
+    Acquire();
+    Reconcile();
+    elector->SetForbidCampaignLeaderTimeMs(60000);
+    elector->Demote();
+    Reconcile();
+    ASSERT_EQ(RoleState::FOLLOWER, elector->GetRoleState());
+
+    ASSERT_EQ(EC_OK, backend->TryLock("lock", "other", 60000));
+    int campaigns = backend->campaigns;
+    Acquire();
+    EXPECT_EQ("other", elector->GetLeaderNodeID());
+    EXPECT_FALSE(elector->IsLeader());
+    EXPECT_FALSE(ready);
+    EXPECT_EQ(campaigns, backend->campaigns);
+
+    ASSERT_EQ(EC_OK, backend->Unlock("lock", "other"));
+    Acquire();
+    EXPECT_TRUE(elector->GetLeaderNodeID().empty());
+    EXPECT_EQ(campaigns, backend->campaigns);
+    EXPECT_EQ(1, recoveries);
+}
+
+TEST_F(LeaderReconcileTest, SelfHeldKeyDuringCooldownIsDiscoveryOnly) {
+    Acquire();
+    Reconcile();
+    elector->SetForbidCampaignLeaderTimeMs(60000);
+    backend->unlock_error = EC_ERROR;
+    elector->Demote();
+    Reconcile();
+    int campaigns = backend->campaigns;
+    int renewals = backend->renewals;
+
+    Acquire();
+    EXPECT_EQ("self", elector->GetLeaderNodeID());
+    EXPECT_EQ(RoleState::FOLLOWER, elector->GetRoleState());
+    EXPECT_FALSE(elector->IsLeader());
+    EXPECT_FALSE(ready);
+    EXPECT_EQ(campaigns, backend->campaigns);
+    EXPECT_EQ(renewals, backend->renewals);
+    EXPECT_EQ(1, recoveries);
+    backend->unlock_error = EC_OK;
+}
+
+TEST_F(LeaderReconcileTest, DiscoveryReadDuringReleaseCannotAdoptReleasedLease) {
+    Acquire();
+    Reconcile();
+    BlockingPoint unlock;
+    backend->before_unlock = [&] { unlock.Block(); };
+    auto demote = std::async(std::launch::async, [&] { elector->Demote(); });
+    EXPECT_TRUE(unlock.WaitEntered());
+    Reconcile();
+    EXPECT_EQ(RoleState::FOLLOWER, elector->GetRoleState());
+
+    // Read the old self-held key while Unlock is blocked, then return that
+    // snapshot only after Unlock and cleanup have both finished.
+    BlockingPoint query;
+    backend->after_get = [&] { query.Block(); };
+    int campaigns = backend->campaigns;
+    int renewals = backend->renewals;
+    auto rpc = std::async(std::launch::async, [&] { Acquire(); });
+    EXPECT_TRUE(query.WaitEntered());
+    unlock.Release();
+    demote.get();
+    backend->before_unlock = {};
+    query.Release();
+    rpc.get();
+    backend->after_get = {};
+
+    EXPECT_FALSE(elector->IsLeader());
+    EXPECT_FALSE(ready);
+    EXPECT_EQ(campaigns, backend->campaigns);
+    EXPECT_EQ(renewals, backend->renewals); // The snapshot was never adopted as a lease.
+    EXPECT_EQ(1, recoveries);
+    ExpectBackendUnlocked();
+    Acquire();
+    Reconcile();
+    EXPECT_TRUE(ready);
+    EXPECT_EQ(2, recoveries);
 }
 
 TEST_F(LeaderReconcileTest, DemoteWhileCheckingHolderCancelsAcquisitionBeforeTryLock) {

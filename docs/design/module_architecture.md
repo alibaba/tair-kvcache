@@ -321,7 +321,7 @@ flowchart LR
 
 ### 4.8 HA 故障转移
 
-`LeaderElector`（config）基于 `CoordinationBackend`（memory/file/redis）的分布式锁选主。`Server` 在成为 Leader 时调用 `CacheManager::DoRecover` 恢复状态，随后启动 GC、恢复 Reclaimer、启动 MigrationManager，并在持锁轮次与租约仍有效时开放 leader-only 请求。失锁时先同步关闭请求入口；选主层暂停本节点竞选，等待已开始的恢复返回并串行清理。降级回调通知 GC/Reclaimer 停止新工作并排空 leader-only 请求，再 join GC、停止 MigrationManager，最后调用 `DoCleanup` 清理运行时状态（正在进行的写入按失败处理）。Python `KvCacheManagerClient` 使用服务发现 URL 时，会在每次 Leader 刷新前重新选择一个 Manager 发现端点，避免把 Leader 查询入口固定在单个节点上。
+`LeaderElector`（config）基于 `CoordinationBackend`（memory/file/redis）的分布式锁选主。`Server` 在成为 Leader 时调用 `CacheManager::DoRecover` 恢复状态，随后启动 GC、恢复 Reclaimer、启动 MigrationManager，并在持锁轮次与租约仍有效时开放 leader-only 请求。失锁时先同步关闭请求入口；选主层暂停本节点竞选，等待已开始的恢复返回并串行清理，同时继续刷新主节点发现信息。降级回调通知 GC/Reclaimer 停止新工作并排空 leader-only 请求，再 join GC、停止 MigrationManager，最后调用 `DoCleanup` 清理运行时状态（正在进行的写入按失败处理）。Python `KvCacheManagerClient` 使用服务发现 URL 时，会在每次 Leader 刷新前重新选择一个 Manager 发现端点，避免把 Leader 查询入口固定在单个节点上。
 
 ### 4.9 KVCM 到在线 Optimizer 的事件流
 

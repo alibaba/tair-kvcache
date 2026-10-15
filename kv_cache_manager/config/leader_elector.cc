@@ -132,15 +132,18 @@ void LeaderElector::DoWorkLoop(int64_t current_time) {
 
 void LeaderElector::CampaignLeader(int64_t current_time) {
     uint64_t request_epoch;
+    bool campaign_allowed;
     {
         std::lock_guard guard(transition_mutex_);
-        if (!CanCampaignLocked(current_time)) {
+        if (stop_flag_ || lock_acquired_.load()) {
             return;
         }
         request_epoch = lock_epoch_;
+        campaign_allowed = CanCampaignLocked(current_time);
     }
 
-    // 检查当前锁是否被其他实例持有
+    // Keep discovery current while recovery, cleanup, release or cooldown
+    // prevents this node from campaigning.
     std::string current_value;
     int64_t expire_time_ms = -1;
     ErrorCode ec = coordination_backend_->GetLockHolder(lock_key_, current_value, expire_time_ms);
@@ -155,11 +158,18 @@ void LeaderElector::CampaignLeader(int64_t current_time) {
 
     {
         std::lock_guard transition_guard(transition_mutex_);
-        if (request_epoch != lock_epoch_ || !CanCampaignLocked(current_time)) {
+        if (request_epoch != lock_epoch_ || stop_flag_ || lock_acquired_.load()) {
             return;
         }
-        std::unique_lock guard(current_lock_holder_mutex_);
-        current_lock_holder_ = current_value;
+        {
+            std::unique_lock guard(current_lock_holder_mutex_);
+            current_lock_holder_ = current_value;
+        }
+        // A discovery-only read cannot become an acquisition if cleanup or
+        // release completed while the query was in flight.
+        if (!campaign_allowed || !CanCampaignLocked(current_time)) {
+            return;
+        }
     }
 
     if (!current_value.empty()) {

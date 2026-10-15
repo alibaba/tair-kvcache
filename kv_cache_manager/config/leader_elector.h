@@ -57,10 +57,12 @@ public:
     // 设置回调（必须在 Start 之前调用）
     void SetNoLongerLeaderHandler(const HandlerFuncType &handler);
     void SetBecomeLeaderHandler(const HandlerFuncType &handler);
-    // 快速关闭业务入口，在失锁线程中执行；不得阻塞或重入 LeaderElector。
+    // 快速关闭业务入口，在失锁线程持有 transition_mutex_ 时执行；不得阻塞或重入 LeaderElector。
+    // 尤其不能调用 IsStableState、WaitForStableState、Demote、Stop 或 RunIfCurrentPromotionValid：
+    // 它们会再次获取同一把非递归锁，即使是查询也会自锁。
     void SetLeadershipLostHandler(const HandlerFuncType &handler);
     // 仅在恢复回调的成功路径调用。与失锁处理串行，避免旧恢复重新开放业务。
-    // handler 不得阻塞或重入 LeaderElector；此接口不改变恢复失败的处理方式。
+    // handler 同样持有 transition_mutex_，遵守上述快速回调的限制；不改变恢复失败的处理方式。
     bool RunIfCurrentPromotionValid(const HandlerFuncType &handler);
 
     // Leader 信息
