@@ -217,6 +217,41 @@ class TestCrossRequestPrefix(unittest.TestCase):
                 candidates = max(choices)
             else:
                 candidates = blocks_a - 1
+                # The hit B produces is candidates blocks long, and a
+                # chunked-local group served a hit ending exactly on one of
+                # its chunk boundaries keeps *nothing* (vLLM skips every
+                # matched token). A purely chunked model then loads an empty
+                # region -- the wait and the key-set assertion accept it, so
+                # assert_loaded_nonempty below fails an otherwise-correct
+                # run -- while a mixed full-attention model's captures mask
+                # that the chunked group was never exercised at all. The
+                # non-hybrid candidate is ours to choose: step it back until
+                # the hit lands inside *every* registered chunk (the same
+                # adjustment the other windowed scenarios make), tested at
+                # the effective end -- an EAGLE/MTP drop moves the served
+                # region a hash block back, and that is the region that must
+                # keep blocks.
+                while (candidates > 1 and any(
+                        geom.effective_hit_tokens(candidates * mbs) % chunk
+                        == 0 for chunk in geom.chunk_sizes)):
+                    candidates -= 1
+                if any(geom.effective_hit_tokens(candidates * mbs) % chunk
+                       == 0 for chunk in geom.chunk_sizes):
+                    # Only reachable when a chunk size divides the manager
+                    # block: every block-aligned candidate ends on that
+                    # boundary, so no prefix of A can keep a block for it.
+                    self.skipTest(
+                        f"every candidate prefix of the {blocks_a} saved "
+                        f"block(s) ends on a chunk boundary (chunk size(s) "
+                        f"{sorted(geom.chunk_sizes)} at mbs={mbs}): the "
+                        f"chunked groups would keep nothing and the "
+                        f"loaded-region assertions would be vacuous")
+                if candidates < blocks_a - 1:
+                    logger.info(
+                        "B candidate blocks stepped back to %d (of %d): the "
+                        "full candidate ends on a chunk boundary (chunk "
+                        "size(s) %s)", candidates, blocks_a - 1,
+                        geom.chunk_sizes)
             toks_b = toks_a[:candidates * mbs + mbs // 2]
             logger.info("B: %d tokens, %d candidate blocks (last has_state=%s)",
                         len(toks_b), candidates, has_state[candidates - 1])

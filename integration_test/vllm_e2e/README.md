@@ -157,12 +157,15 @@ Multi-group specifics verified:
     partial-hit scenario nudges its shared A+B prefix off the boundaries the
     same way run_e2e does (its stage-3 loaded region would otherwise be empty
     and every assertion vacuous), the mid-prefix scenario steps its match end
-    back until it clears every registered chunk size, and the multi-turn
-    scenario trims turn 2's embedded prefix block by block until the shared
-    hit keeps a loaded block (a hit whose loaded region would be empty --
-    loaded_blocks() == 0 -- would make its wait, key-set and report assertions
-    pass without verifying anything), skipping loudly when no block-aligned
-    share works;
+    back until it clears every registered chunk size, and the multi-turn and
+    cross-request scenarios trim turn 2's embedded prefix / B's candidate
+    blocks block by block until the effective hit lands inside every
+    registered chunk -- `loaded_blocks()` is the union over groups, so a
+    full-attention group (nonzero for every hit) or another chunk size's
+    nonzero tail would mask the group that keeps nothing, and a hit whose
+    whole region is empty (an EAGLE/MTP drop consuming it) would make the
+    wait, key-set and report assertions pass without verifying anything --
+    skipping loudly when no block-aligned share works;
   - the pinned-host gate checks each engine start's own log stream separately
     (every rank prints its pool plan once per start): a restart that lost a rank
     cannot borrow the other start's rank set, or a duplicated line, to pass, and
@@ -199,8 +202,8 @@ Multi-group specifics verified:
 | `test_partial_hit` | 1 | 1 | Phase 2 extends the prompt mid-block: partial external hit. Windowed: phase 3's load covers exactly the slots vLLM handed out for the extended prefix (the sliding groups' tail window plus the full-attention group's whole match) |
 | `test_partial_hit::test_mid_prefix_hit` | 1 | 1 | Windowed only: the hit ends in the middle of a saved request, so the sliding groups' loaded window is a *middle* window of A (asserted disjoint from A's tail window) |
 | `test_full_hit` | 1 | 1 | Phase 2 resends the identical prompt: full-prompt hit is capped so >= 1 token is recomputed |
-| `test_multi_turn` | 1 | 1 | Growing conversation: each turn loads the previous turns' blocks and saves new ones. Turn 2 embeds turn 1's prompt + output as token ids; a chunked-local share landing on a chunk boundary is trimmed inside the chunk (or skipped loudly) so the loaded-region assertions stay non-vacuous |
-| `test_cross_request_prefix` | 1 | 2 | Request B is a strict token prefix of saved request A, ending inside one of A's blocks. Hybrid: B's match must be truncated to the last block whose recurrent state was really materialized, and B's output must be token-identical to a no-cache reference |
+| `test_multi_turn` | 1 | 1 | Growing conversation: each turn loads the previous turns' blocks and saves new ones. Turn 2 embeds turn 1's prompt + output as token ids; a share whose effective hit ends on *any* registered chunk boundary is trimmed inside every chunk (or skipped loudly) so each chunked group's loaded region stays non-vacuous |
+| `test_cross_request_prefix` | 1 | 2 | Request B is a strict token prefix of saved request A, ending inside one of A's blocks. Hybrid: B's match must be truncated to the last block whose recurrent state was really materialized, and B's output must be token-identical to a no-cache reference. Windowed: B's candidate blocks are stepped off every registered chunk boundary (or skipped loudly) so the loaded region stays nonempty |
 | `test_load_failure` | 1 | 1 | Storage files deleted between phases: load fails, retry loop must not spin, request still completes. The branch follows the *registered* block-table count, read from the connector's own transfer-group names deduplicated by table index (a packed `UniformTypeKVCacheSpecs` table is several buckets sharing one index, and the reporting mode counts tables, not buckets): a single table reports the invalid blocks to vLLM, several tables cannot and must log the swallowed failure. Single-table runs verify the surviving loads over the *originally allocated* region (vLLM allocates slots for the whole external match and never re-loads the tail of the prefix that invalid-block recovery shortened) intersected with the undeleted head, and the reporting-mode return still reads the capture marker. A windowed multi-group model splits by era: vLLM >= 0.30 reports the failure at request granularity (probed by importing `KVConnectorTransferResults`, the API itself) and the request recomputes; the pre-0.30 eras have no request-level path, so the connector fails closed (the completion errors out) and the scenario pins that refusal plus the request-granularity detection log that precedes it |
 | `test_mutation` | 1 | 1 | Meta-test: injected off-by-one in the slot translation must make verification FAIL (proves the harness is not vacuous). Only a *phase-2* verification assertion counts as the expected catch (phase 1 only writes references through vLLM's own slot mapping, so an assertion there means the capture is broken, not that the mutation was detected) and a capture implementation error (an index or device fault) fails the meta-test too, so a broken capture cannot masquerade as a detected corruption |
 

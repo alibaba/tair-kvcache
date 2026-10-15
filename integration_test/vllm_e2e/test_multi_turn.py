@@ -96,28 +96,40 @@ class TestMultiTurn(unittest.TestCase):
             # prompt + output as token ids (immune to detokenization drift).
             turn2_suffix = tokenize(vllm.base_url(), TURN2_SUFFIX_TEXT)
             # A hit ending exactly on a chunked-local chunk boundary keeps
-            # nothing (vLLM skips every matched token), so a full share
-            # landing there leaves loaded_blocks() at zero and the loaded
-            # assertions below would pass without capturing or comparing a
-            # single block. Share the largest block-aligned prefix whose
-            # loaded region is nonempty: stepping one manager block back
-            # moves the hit inside the chunk while the share still covers
-            # decode-produced blocks (it stays above prompt_blocks).
+            # nothing (vLLM skips every matched token): the loaded
+            # assertions below would pass without that group capturing or
+            # comparing a single block. loaded_blocks() alone cannot decide
+            # this -- it is the *union* over groups, so a full-attention
+            # group (nonzero for every hit) or another chunk size's nonzero
+            # tail masks the group that keeps nothing -- so the loop tests
+            # every registered chunk size itself, at the hit's effective
+            # end (an EAGLE/MTP drop moves it a hash block back). The union
+            # term stays for the case no chunk boundary can express: the
+            # drop consuming the entire hit leaves every group with
+            # nothing. Stepping one manager block back moves the hit off
+            # the boundary while the share still covers decode-produced
+            # blocks (it stays above prompt_blocks).
             geom = env.window_geometry()
             share_blocks = turn1_blocks
             while (share_blocks > prompt_blocks
-                   and geom.loaded_blocks(share_blocks * mbs) == 0):
+                   and (geom.loaded_blocks(share_blocks * mbs) == 0
+                        or any(geom.effective_hit_tokens(share_blocks * mbs)
+                               % chunk == 0
+                               for chunk in geom.chunk_sizes))):
                 share_blocks -= 1
             if share_blocks <= prompt_blocks:
                 raise unittest.SkipTest(
                     f"every block-aligned share of the {turn1_blocks} "
-                    f"committed block(s) keeps no block (chunk size(s) "
-                    f"{geom.chunk_sizes} at mbs={mbs}): the loaded-region "
-                    f"assertions would be vacuous")
+                    f"committed block(s) leaves a registered group with "
+                    f"nothing (chunk size(s) {geom.chunk_sizes}, eagle "
+                    f"drop {geom.eagle_dropped_tokens}, mbs={mbs}): the "
+                    f"loaded-region assertions would not exercise every "
+                    f"group")
             if share_blocks < turn1_blocks:
                 logger.info(
                     "turn 2 shares %d of %d committed block(s): the full "
-                    "share ends on a chunk boundary (chunk size(s) %s)",
+                    "share's effective hit ends on a registered chunk "
+                    "boundary (chunk size(s) %s)",
                     share_blocks, turn1_blocks, geom.chunk_sizes)
             turn2_ids = (turn1_ids if share_blocks == turn1_blocks
                          else turn1_ids[:share_blocks * mbs]) + turn2_suffix
