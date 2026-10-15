@@ -149,10 +149,17 @@ class TpCoordinatorServer:
         base_port: int,
         tp_world_size: int,
         on_finished_callback: Callable[[str, SaveContext], None],
+        instance_id: str = "",
     ) -> None:
         self._host_ip = host_ip
         self._base_port = base_port
         self._tp_world_size = tp_world_size
+        # This coordinator's instance identity (see TpCoordinatorClient.send):
+        # a probe answers with it, and a client of a *different* instance must
+        # not mistake this pair for its own coordinator. Empty means the
+        # unauthenticated shape tests use, which pairs only with an equally
+        # empty client identity.
+        self._instance_id = instance_id
         # The cross-rank AND of a session, once every rank reported; the
         # worker-side settle asks for it (see TpCoordinatorClient.ask_verdict):
         # a rank whose write is not the global verdict must keep its capture
@@ -374,6 +381,19 @@ class TpCoordinatorServer:
                 raw = socket.recv(zmq.NOBLOCK)
                 try:
                     query = orjson.loads(raw)
+                    if isinstance(query, dict) and query.get("probe"):
+                        # Identify ourselves: the client decides whether this
+                        # pair belongs to its instance (see
+                        # TpCoordinatorClient._probe_and_reconnect_locked).
+                        # A foreign client gets our identity and rejects it;
+                        # an old client accepts any reply, but an old client of
+                        # another instance is old code we cannot fix from here.
+                        socket.send(
+                            orjson.dumps(
+                                {"probe": True, "instance_id": self._instance_id}
+                            )
+                        )
+                        continue
                     session_id, tp_rank = query["session_id"], query["tp_rank"]
                     cancel = bool(query.get("cancel", False))
                 except Exception:  # pragma: no cover - protocol misuse
@@ -531,9 +551,17 @@ class TpCoordinatorServer:
 
 
 class TpCoordinatorClient:
-    def __init__(self, host_ip: str, port: int) -> None:
+    def __init__(self, host_ip: str, port: int, instance_id: str = "") -> None:
         self._host_ip = host_ip
         self._port = port
+        # The instance this client's events belong to. A probe carrying it
+        # decides which answering pair is *our* coordinator: two connector
+        # instances on one host can share a configured base port, and the
+        # foreign coordinator's query port answers protocol errors with an
+        # empty body -- without the identity check the client would happily
+        # send every event there. Empty pairs only with an equally empty
+        # server identity (the shape tests use).
+        self._instance_id = instance_id
         self._lock = threading.Lock()
 
         self._zmq_context = zmq.Context()
@@ -557,14 +585,21 @@ class TpCoordinatorClient:
         # transient collision): events sent to the configured port are queued
         # on a socket nobody reads and are never replayed, so the pair is
         # resolved *before* the first event. Full-attention sessions never ask
-        # for a verdict, so this handshake is the only chance they get.
+        # for a verdict, so this handshake is the only chance they get. The
+        # probe carries this client's instance identity, and only a pair that
+        # answers with it is accepted: a second connector instance on the same
+        # host (same configured base port) must never receive the first
+        # instance's events, and its query port would answer the identity-less
+        # probe of an old client with an empty protocol-error body.
         with self._lock:
             if not self._endpoint_resolved:
                 self._endpoint_resolved = True
                 if not self._probe_and_reconnect(lock_held=True):
                     logger.warning(
-                        "TairKvCacheConnector: no coordinator answered on "
-                        "ports %d-%d; keeping the configured port %d",
+                        "TairKvCacheConnector: no coordinator of instance %r "
+                        "answered on ports %d-%d; keeping the configured port "
+                        "%d",
+                        self._instance_id,
                         self._port,
                         self._port + COORDINATOR_PORT_ATTEMPTS,
                         self._port,
@@ -669,15 +704,31 @@ class TpCoordinatorClient:
             probe.setsockopt(zmq.RCVTIMEO, min(timeout_ms, 20))
             probe.connect("tcp://%s:%d" % (self._host_ip, candidate + 1))
             answered = False
+            foreign = None
             try:
-                probe.send(orjson.dumps({"probe": True}))
-                probe.recv()
-                answered = True
-            except zmq.ZMQError:
+                probe.send(
+                    orjson.dumps({"probe": True, "instance_id": self._instance_id})
+                )
+                raw = probe.recv()
+                answered = self._probe_reply_matches(raw)
+                if not answered:
+                    foreign = raw
+            except (zmq.ZMQError, ValueError):
+                # A timeout, a dead port, or a body that is not our
+                # coordinator's identity: not this pair.
                 pass
             finally:
                 probe.close(linger=0)
             if not answered:
+                if foreign is not None:
+                    logger.warning(
+                        "TairKvCacheConnector: the query port %d answered the "
+                        "probe for instance %r with %r; it is another "
+                        "instance's coordinator -- skipping it",
+                        candidate + 1,
+                        self._instance_id,
+                        foreign[:200],
+                    )
                 continue
             if candidate != self._port:
                 # Only the moved case touches the event socket: disconnecting
@@ -701,6 +752,18 @@ class TpCoordinatorClient:
             return True
         self._connect_query(self._port + 1, timeout_ms)
         return False
+
+    def _probe_reply_matches(self, raw: bytes) -> bool:
+        """Is this probe reply *our* coordinator's identity?"""
+        try:
+            reply = orjson.loads(raw)
+        except ValueError:
+            return False
+        return (
+            isinstance(reply, dict)
+            and reply.get("probe") is True
+            and reply.get("instance_id") == self._instance_id
+        )
 
     def _ask_query(self, payload: Dict[str, Any], timeout_ms: int = 100) -> Any:
         with self._lock:

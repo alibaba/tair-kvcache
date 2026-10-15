@@ -215,7 +215,11 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._vllm_block_size,
                 self._tp_size,
                 self._manager_client,
-                TpCoordinatorClient(host_ip, extra_config.coordinator_base_port),
+                TpCoordinatorClient(
+                    host_ip,
+                    extra_config.coordinator_base_port,
+                    extra_config.instance_id,
+                ),
                 has_eagle_group=self._has_eagle_group,
             )
             logger.warning(
@@ -256,7 +260,11 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._tp_size,
                 host_ip,
                 self._manager_client,
-                TpCoordinatorClient(host_ip, extra_config.coordinator_base_port),
+                TpCoordinatorClient(
+                    host_ip,
+                    extra_config.coordinator_base_port,
+                    extra_config.instance_id,
+                ),
                 register_response,
                 # The capture partition is sized from the engine's per-step
                 # token budget (see DataTransferManager). An engine stub that

@@ -400,5 +400,114 @@ class TestLoadFailureAggregation(unittest.TestCase):
         self.server.shutdown()
 
 
+class TestProbeInstanceIdentity(unittest.TestCase):
+    """A probe only counts when the answering pair is *this* instance's.
+
+    Two connector instances on one host can be configured with the same
+    coordinator base port: the first server takes the configured pair, the
+    second falls back to the neighbouring one. The second instance's clients
+    probe the configured pair first, and the first instance's query port
+    answers a probe with its *own* identity -- before the identity check the
+    probe accepted any reply (an old server even answers protocol errors with
+    an empty body), so every event and verdict query of the second instance
+    went to the first instance's coordinator and neither instance's sessions
+    could complete."""
+
+    def setUp(self):
+        # Four consecutive free ports: instance A takes (p, p+1), instance B
+        # -- configured with the same base port -- falls back to (p+2, p+3).
+        self.holders = []
+        probe_port = _find_free_port()
+        for _ in range(12):
+            with socket_module.socket() as sock:
+                try:
+                    sock.bind(("127.0.0.1", probe_port))
+                except OSError:
+                    probe_port = _find_free_port()
+                    continue
+            self.base_port = probe_port
+            break
+        else:
+            raise AssertionError("no free port strip found")
+        for port in range(self.base_port, self.base_port + 4):
+            holder = socket_module.socket()
+            holder.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+            holder.bind(("127.0.0.1", port))
+            holder.listen(1)
+            self.holders.append(holder)
+        self.addCleanup(lambda: [h.close() for h in self.holders])
+        # A binds its pair after the holders release the ports (TIME_WAIT
+        # insurance), B must then move one pair further.
+        for holder in self.holders:
+            holder.close()
+        self.holders = []
+        self.server_a = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 2, lambda *a: None, "inst-A"
+        )
+        _wait_for_server(self.server_a)
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 2, lambda *a: None, "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        self.assertEqual(self.base_port, self.server_a._base_port)
+        self.assertEqual(self.base_port + 2, self.server_b._base_port)
+
+    def tearDown(self):
+        for cleanup in (
+            lambda: self.server_a.shutdown(),
+            lambda: self.server_b.shutdown(),
+        ):
+            try:
+                cleanup()
+            except Exception:
+                pass
+
+    def test_a_foreign_coordinator_is_rejected_and_the_own_pair_found(self):
+        # The client of instance B probes the configured pair first: server A
+        # answers with inst-A's identity, which must NOT count as a hit, and
+        # the search moves on to B's own pair.
+        client = TpCoordinatorClient("127.0.0.1", self.base_port, "inst-B")
+        self.addCleanup(client.shutdown)
+        client.send(b"{}")
+        self.assertEqual(
+            self.base_port + 2,
+            client._port,
+            "the client settled on a coordinator that is not its instance's",
+        )
+        self.assertEqual(self.base_port + 3, client._query_port)
+
+    def test_the_own_coordinator_still_resolves_immediately(self):
+        # The identity check must not over-reject: a client of instance A
+        # finds its own pair on the first probe and does not move.
+        client = TpCoordinatorClient("127.0.0.1", self.base_port, "inst-A")
+        self.addCleanup(client.shutdown)
+        client.send(b"{}")
+        self.assertEqual(self.base_port, client._port)
+
+    def test_an_identityless_reply_is_not_a_hit(self):
+        # The reply faces the client can meet: an old server answers a probe
+        # with an empty protocol-error body, a foreign server with another
+        # instance's identity, and a dead port with nothing at all.
+        client = TpCoordinatorClient("127.0.0.1", self.base_port, "inst-B")
+        self.addCleanup(client.shutdown)
+        import orjson
+
+        self.assertFalse(client._probe_reply_matches(b""))
+        self.assertFalse(client._probe_reply_matches(b"not json"))
+        self.assertFalse(
+            client._probe_reply_matches(orjson.dumps({"probe": True}))
+        )
+        self.assertFalse(
+            client._probe_reply_matches(
+                orjson.dumps({"probe": True, "instance_id": "inst-A"})
+            )
+        )
+        self.assertTrue(
+            client._probe_reply_matches(
+                orjson.dumps({"probe": True, "instance_id": "inst-B"})
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

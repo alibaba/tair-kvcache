@@ -387,7 +387,11 @@ class ConnectorWorker:
         port = extra_config.coordinator_base_port
         if self._tp_rank == 0:
             self._coordinator_server = TpCoordinatorServer(
-                host_ip, port, tp_size, self.on_save_finished
+                host_ip,
+                port,
+                tp_size,
+                self.on_save_finished,
+                extra_config.instance_id,
             )
 
         max_group_bytes = max(m.per_block_bytes for m in self._group_metas)
