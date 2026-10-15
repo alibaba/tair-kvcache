@@ -1057,6 +1057,86 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         self.assertFalse(kwargs["report_failures"])
         self.assertFalse(kwargs["report_request_failures"])
 
+    def test_engine_rebuilt_skip_shape_reports_the_request(self):
+        # The V4.1 geometry (vLLM >= 0.31): the registered buckets are one
+        # packed group with no window retention, and the request still carries
+        # the block tables of the groups the connector skipped because the
+        # engine rebuilds them (a replayed window, a compression ring). No
+        # manager location can ever serve those groups, so the registered
+        # buckets are the request's whole externally-loaded KV -- the failed
+        # load must mark the request instead of logging and decoding on the
+        # hole. (The real model carries nine tables; three stand in for the
+        # two skip families here.)
+        conn = make_connector(manager_block_size=self.MBS)
+        conn._group_metas = [
+            AttentionGroupMeta(
+                group_idx=0,
+                layer_names=["a0"],
+                block_size=self.MBS,
+                per_block_bytes=0,
+                page_bytes=self.MBS * 8,
+            ),
+            AttentionGroupMeta(
+                group_idx=0,
+                layer_names=["a1"],
+                block_size=self.MBS,
+                per_block_bytes=0,
+                page_bytes=self.MBS * 8,
+                spec_suffix="_b1",
+            ),
+        ]
+        conn._num_groups = 2
+        conn._has_windowed_groups = False
+        conn._num_eagle_groups = 0
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="r0",
+                manager_block_idxes=[0],
+                need_load_locations=[{"location_specs": []}],
+                all_block_ids=[[10], [20], [30]],
+            )
+        )
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [])
+        self.assertFalse(kwargs["report_failures"])
+        self.assertTrue(kwargs["report_request_failures"])
+
+    def test_a_drafter_table_is_not_an_engine_rebuilt_group(self):
+        # The EAGLE/MTP drafter's block table travels with the request too,
+        # but a drafter is not engine-rebuilt state the manager would
+        # otherwise back: it must not turn the single registered group into
+        # "the request's whole KV" -- that shape keeps the legacy swallow its
+        # e2e pinned (see test_multigroup_without_window... above for the
+        # hybrid twin).
+        conn = make_connector(manager_block_size=self.MBS)
+        conn._num_eagle_groups = 1
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="r0",
+                manager_block_idxes=[0],
+                need_load_locations=[{"location_specs": []}],
+                all_block_ids=[[10], [20]],
+            )
+        )
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [])
+        self.assertFalse(kwargs["report_failures"])
+        self.assertFalse(kwargs["report_request_failures"])
+
     def test_lone_state_group_refuses_to_report(self):
         # A single vLLM block table that is not attention (pure mamba): the
         # token-granular recovery math upstream cannot consume state block

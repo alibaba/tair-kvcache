@@ -871,6 +871,9 @@ def make_connector(
     conn._has_windowed_groups = any(  # ty: ignore[unresolved-attribute]
         getattr(meta, "retention", None) is not None for meta in conn._group_metas
     )
+    # ... and the drafter count the same decision subtracts (the real __init__
+    # receives it from v1_connector; the fixture's configs mark no drafter).
+    conn._num_eagle_groups = 0  # ty: ignore[unresolved-attribute]
     conn._state_group_idxs = [  # ty: ignore[unresolved-attribute]
         m.group_idx for m in conn._group_metas if isinstance(m, StateGroupMeta)
     ]

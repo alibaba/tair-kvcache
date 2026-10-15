@@ -1518,14 +1518,17 @@ class DataTransferManager:
         engine-wide crash. See start_load_kv for the full trade-off.
 
         ``report_request_failures`` is the escape from that trade-off for the
-        shape this connector itself made dangerous -- a *windowed* multi-group
-        instance, whose external hits this connector grants: the failed
-        request is reported at request granularity (vLLM >= 0.30 consumes it
-        as KVConnectorOutput.failed_recving and recomputes or fails the
-        request; older vLLM has no such path and the connector fails closed
-        there, see v1_connector.get_finished). Non-windowed hybrid models keep
-        the contained legacy behaviour: their swallow predates this connector
-        and its e2e contract pins it.
+        shapes whose registered buckets are the request's whole externally-
+        loaded KV -- a *windowed* multi-group instance (the gemma geometry)
+        and the engine-rebuilt skip shapes (replayed windows and compression
+        rings beside a compressed main group, the V4.1 geometry: vLLM
+        rebuilds those groups on a hit, so nothing else can back the
+        request): the failed request is reported at request granularity
+        (vLLM >= 0.30 consumes it as KVConnectorOutput.failed_recving and
+        recomputes or fails the request; older vLLM has no such path and the
+        connector fails closed there, see v1_connector.get_finished).
+        Non-windowed hybrid models keep the contained legacy behaviour: their
+        swallow predates this connector and its e2e contract pins it.
         """
 
         def cb(flat: List[Optional[bool]]) -> None:
@@ -1554,8 +1557,9 @@ class DataTransferManager:
                 # the worker surfaces one failed request per load.
                 request_failed = True
                 logger.warning(
-                    "load failed for %d/%d blocks of req %s (windowed "
-                    "multi-group: reporting the request, not block ids)",
+                    "load failed for %d/%d blocks of req %s (the registered "
+                    "groups are the request's whole KV: reporting the "
+                    "request, not block ids)",
                     len(broken),
                     num_blocks,
                     req_id,

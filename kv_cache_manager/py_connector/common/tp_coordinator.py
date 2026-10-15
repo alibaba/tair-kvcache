@@ -609,9 +609,11 @@ class TpCoordinatorServer:
         """Requests whose load failed at request granularity, once.
 
         Block ids cannot address a multi-table block layout upstream (see
-        create_load_done_callback), so a windowed multi-group instance marks
-        the *request* failed instead; the coordinator holds the mark until
-        every rank reported and hands it over here, exactly once.
+        create_load_done_callback), so an instance whose registered groups
+        are the request's whole KV (windowed multi-group, or the
+        engine-rebuilt skip shapes) marks the *request* failed instead; the
+        coordinator holds the mark until every rank reported and hands it
+        over here, exactly once.
         """
         if len(self._failed_loading_requests) == 0:
             return set()

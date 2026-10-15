@@ -383,6 +383,7 @@ class ConnectorWorker:
         max_num_batched_tokens: int = 0,
         max_num_seqs: int = 0,
         engine_id: str = "",
+        num_eagle_groups: int = 0,
     ) -> None:
         self._extra_config = extra_config
         # The engine's per-step token budget (chunked prefill's chunk) and its
@@ -391,6 +392,13 @@ class ConnectorWorker:
         self._max_num_batched_tokens = max_num_batched_tokens
         self._max_num_seqs = max_num_seqs
         self._group_metas = group_metas
+        # How many vLLM groups this instance skips as EAGLE/MTP drafters
+        # (vLLM marks them; parse_groups drops them). Part of the load-failure
+        # reporting decision (see start_load_kv): a drafter's block table
+        # travels with every request too, but a drafter is not engine-rebuilt
+        # state, so it must not count as "the registered groups are the
+        # request's whole KV".
+        self._num_eagle_groups = num_eagle_groups
         # A verdict is only consumed where a capture waits for one: windowed
         # groups. A pure full-attention instance has nothing to confirm, and
         # publishing anyway filled the coordinator's table (and its log) with
@@ -1359,9 +1367,31 @@ class ConnectorWorker:
             # contract pinned. Remove the request-level detour once upstream
             # supports multi-group invalid-block recovery.
             #
+            # The same whole-KV contract holds for the engine-rebuilt skip
+            # shapes: a load request carries one block table per vLLM group,
+            # the skipped groups' included, and the tables this connector
+            # neither registers (the registered group numbers of the metas)
+            # nor owes to a drafter (vLLM's eagle mark) belong to groups the
+            # ENGINE rebuilds on a hit -- replayed windows and compression
+            # rings (the V4.1 shape, vLLM >= 0.31) or tiers the engine
+            # refills itself. No manager location can ever serve those
+            # groups, so the registered buckets are the request's entire
+            # externally-loaded KV and a partial load is a hole in exactly
+            # the windowed sense -- the failure travels at request
+            # granularity for them too. An era that hands fewer tables than
+            # the connector serves reads as "no unserved tables" and keeps
+            # the legacy behaviour; the non-windowed hybrid (every group
+            # registered) never counts an unserved table either.
             report_ids = []
             report_failures = len(load_req.all_block_ids) == 1
-            report_request_failures = not report_failures and self._has_windowed_groups
+            unserved_tables = (
+                len(load_req.all_block_ids)
+                - len({meta.group_idx for meta in self._group_metas})
+                - self._num_eagle_groups
+            )
+            report_request_failures = not report_failures and (
+                self._has_windowed_groups or unserved_tables > 0
+            )
             if report_failures:
                 # With exactly one vLLM block table the transferred group is
                 # group 0, and it must be an attention group: a lone state
@@ -1953,15 +1983,17 @@ class ConnectorWorker:
         return failed
 
     def drain_failed_loading_requests(self) -> Set[str]:
-        """Requests whose windowed multi-group load failed, once (rank 0).
+        """Requests whose whole-KV load failed, once (rank 0).
 
-        Block ids cannot address a multi-table block layout upstream, so a
-        windowed multi-group instance marks the request itself (see
-        create_load_done_callback). The coordinator holds the mark until
-        every rank reported, so it lands in the same step the request is
-        reported finished receiving; v1_connector decides what it becomes on
-        the running vLLM era (failed_recving where the path exists, a loud
-        fail-closed error where it does not).
+        Block ids cannot address a multi-table block layout upstream, so an
+        instance whose registered groups are the request's whole externally-
+        loaded KV (windowed multi-group, or the engine-rebuilt skip shapes)
+        marks the request itself (see create_load_done_callback). The
+        coordinator holds the mark until every rank reported, so it lands in
+        the same step the request is reported finished receiving;
+        v1_connector decides what it becomes on the running vLLM era
+        (failed_recving where the path exists, a loud fail-closed error where
+        it does not).
         """
         if self._tp_rank != 0:
             return set()
