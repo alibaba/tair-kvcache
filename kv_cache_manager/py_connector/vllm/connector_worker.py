@@ -302,8 +302,7 @@ class ConnectorWorker:
         # publishing anyway filled the coordinator's table (and its log) with
         # entries no worker would ever ask about.
         self._has_windowed_groups = any(
-            getattr(getattr(meta, "group", None), "retention", None) is not None
-            for meta in group_metas
+            getattr(meta, "retention", None) is not None for meta in group_metas
         )
         self._num_groups = len(group_metas)
         self._manager_block_size = manager_block_size
