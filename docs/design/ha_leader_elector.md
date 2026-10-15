@@ -193,6 +193,8 @@ Server::Init()
 
 失锁时业务入口已经由快速回调关闭；OnNoLongerLeader 再次关闭入口并等待已有请求结束。最后一个业务请求的计数递减与排空等待使用同一把请求状态锁，避免通知发生在谓词检查与进入等待之间，造成计数已归零但清理线程仍等待。恢复与清理串行执行，清理回调返回后才恢复本节点竞选。Server::Stop 在服务与管理组件销毁之前停止 LeaderElector，等待生命周期回调完成。
 
+优雅退出也会完成降级清理，将尚未完成的写会话按失败处理。模拟进程崩溃后孤立 WRITING 的集成测试使用 SIGKILL，并在崩溃前确认所需元数据已持久化；SIGTERM 用例单独验证退出前完成未完成写入的清理。
+
 ## 5. Leader 发现
 
 ### 5.1 MetaService - GetClusterInfo
@@ -338,6 +340,7 @@ Redis选主key通过`cluster_name`区分：`kvcm_<cluster_name>_lock:`/`kvcm_<cl
 | 恢复/清理异常、租约内普通续约错误 | 保留既有回调失败策略及续约容错行为 | 同上 |
 | 最后一个请求完成与排空等待并发 | 不丢完成通知；两类服务请求排空前不重新竞选 | `service/test/service_impl_base_test.cc` |
 | 本地失锁、角色仍为 LEADER 且尚未关闭订阅 | Optimizer 配置与订阅 gRPC 接口拒绝新请求 | `service/test/optimizer_event_service_grpc_test.cc` |
+| 优雅退出与进程崩溃后的未完成写入 | SIGTERM 等待写会话清理；SIGKILL 后孤立 WRITING 可由 GC/Reclaimer 回收 | `integration_test/cache_garbage_collector/cache_garbage_collector_test.py`、`integration_test/reclaimer/reclaiming_test.py` |
 | 单节点主动降级后重新服务、双节点竞争与切主 | 通过 HTTP/gRPC 验证门禁和选主的装配行为 | `integration_test/admin_service/admin_interface_cases.py` |
 | 真实 Redis 锁 key 在恢复期间被外部删除 | 真实续约返回 `EC_NOENT`；恢复和清理期间各 100 次锁循环均不查询或抢锁；清理后重新恢复为 LEADER 并发布门禁 | `integration_test/redis_coordination/leader_lock_deletion_test_driver.cc`，由下述 Python 集成目标启动 |
 | 外部连续删除真实 Redis 锁 key | 至少 10 次实际删除；停止注入后重新获锁、恢复 Meta/Admin 入口，并持续跨过 3 次后续续约 | `integration_test/redis_coordination/redis_leader_recovery_test.py` |
