@@ -201,8 +201,8 @@ class TestLoadFailure(unittest.TestCase):
                 # by the fail-closed branch above.)
                 if env.window_geometry().window is not None:
                     reported = env.scan_connector_logs(
-                        r"load failed for \d+/\d+ blocks of req .*windowed "
-                        r"multi-group")
+                        r"load failed for \d+/\d+ blocks of req "
+                        r".*reporting the request, not block ids")
                     self.assertTrue(
                         reported,
                         "the windowed multi-group load failure was not "
