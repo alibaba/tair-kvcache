@@ -510,6 +510,124 @@ class TestProbeInstanceIdentity(unittest.TestCase):
         )
 
 
+class TestProbeEngineIdentity(unittest.TestCase):
+    """A probe only counts when the answering pair is *this engine's.
+
+    Serving replicas share instance_id on purpose (the manager keys on it),
+    so two engines of one instance on one host with the same configured base
+    port answer a probe with indistinguishable instance identities: the
+    second coordinator takes the neighbouring pair, but its clients accept
+    the first replica's coordinator, send it every completion and load
+    event, and poll their own coordinator forever. The handshake therefore
+    also carries the engine's own identity (vLLM's per-run kv_transfer
+    engine_id): the reply only counts when it names the client's engine."""
+
+    def setUp(self):
+        # Four consecutive free ports: engine A takes (p, p+1), engine B --
+        # the same instance, the same configured base port -- falls back to
+        # (p+2, p+3). The port-strip dance is TestProbeInstanceIdentity's:
+        # TIME_WAIT neighbours must not eat into the strip.
+        probe_port = _find_free_port()
+        for _ in range(12):
+            with socket_module.socket() as sock:
+                try:
+                    sock.bind(("127.0.0.1", probe_port))
+                except OSError:
+                    probe_port = _find_free_port()
+                    continue
+            self.base_port = probe_port
+            break
+        else:
+            raise AssertionError("no free port strip found")
+        holders = []
+        for port in range(self.base_port, self.base_port + 4):
+            holder = socket_module.socket()
+            holder.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+            holder.bind(("127.0.0.1", port))
+            holder.listen(1)
+            holders.append(holder)
+        self.addCleanup(lambda: [h.close() for h in holders])
+        for holder in holders:
+            holder.close()
+        # The same instance twice; only the engine identity differs.
+        self.server_a = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 2, lambda *a: None, "inst", "engine-A"
+        )
+        _wait_for_server(self.server_a)
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 2, lambda *a: None, "inst", "engine-B"
+        )
+        _wait_for_server(self.server_b)
+        self.assertEqual(self.base_port, self.server_a._base_port)
+        self.assertEqual(self.base_port + 2, self.server_b._base_port)
+
+    def tearDown(self):
+        for cleanup in (
+            lambda: self.server_a.shutdown(),
+            lambda: self.server_b.shutdown(),
+        ):
+            try:
+                cleanup()
+            except Exception:
+                pass
+
+    def test_a_same_instance_foreign_engine_is_rejected(self):
+        # Replica B's client probes the configured pair first: replica A's
+        # coordinator answers with the *same* instance identity, which must
+        # NOT count as a hit, and the search moves on to B's own pair.
+        client = TpCoordinatorClient(
+            "127.0.0.1", self.base_port, "inst", "engine-B"
+        )
+        self.addCleanup(client.shutdown)
+        client.send(b"{}")
+        self.assertEqual(
+            self.base_port + 2,
+            client._port,
+            "the client settled on a coordinator of another engine",
+        )
+        self.assertEqual(self.base_port + 3, client._query_port)
+
+    def test_the_own_engine_resolves_immediately(self):
+        # The engine check must not over-reject: replica A's client finds its
+        # own pair on the first probe and does not move.
+        client = TpCoordinatorClient(
+            "127.0.0.1", self.base_port, "inst", "engine-A"
+        )
+        self.addCleanup(client.shutdown)
+        client.send(b"{}")
+        self.assertEqual(self.base_port, client._port)
+
+    def test_the_engine_identity_must_match(self):
+        # The reply faces the client can meet: a same-instance coordinator of
+        # another engine, and an older coordinator whose reply carries no
+        # engine identity at all (not provably ours, so not accepted).
+        import orjson
+
+        client = TpCoordinatorClient(
+            "127.0.0.1", self.base_port, "inst", "engine-B"
+        )
+        self.addCleanup(client.shutdown)
+        self.assertFalse(
+            client._probe_reply_matches(
+                orjson.dumps(
+                    {"probe": True, "instance_id": "inst", "engine_id": "engine-A"}
+                )
+            )
+        )
+        self.assertFalse(
+            client._probe_reply_matches(
+                orjson.dumps({"probe": True, "instance_id": "inst"})
+            )
+        )
+        self.assertTrue(
+            client._probe_reply_matches(
+                orjson.dumps(
+                    {"probe": True, "instance_id": "inst", "engine_id": "engine-B"}
+                )
+            )
+        )
+
+
 class TestRequestFailedAggregation(unittest.TestCase):
     """A request-level load failure is ORed across the ranks, once per load.
 

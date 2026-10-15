@@ -2778,17 +2778,17 @@ class TestVerdictQueryHygiene(unittest.TestCase):
         conn = worker_with([], MagicMock())
         conn._tp_size = 2
         conn._tp_rank = 1
-        conn._block_uris = {"r0": {0: "uri-0"}}
+        conn._captures.block_uris["r0"] = {0: "uri-0"}
         conn._in_flight["r0"] = {(1, "tp0_g0", 0): None}
         conn._staged.pop("r0", None)
         conn._captures.retire("r0")
         conn._captures.settle("r0", 1, {("tp0_g0", 0): True})
-        conn._drop_uris_if_idle("r0")
+        conn._captures.drop_uris_if_idle("r0")
         self.assertEqual({}, conn._block_uris.get("r0", {}))
         # A request that still owns captures keeps its keys.
-        conn._block_uris = {"r1": {0: "uri-0"}}
+        conn._captures.block_uris["r1"] = {0: "uri-0"}
         conn._in_flight["r1"] = {(1, "tp0_g0", 0): None}
-        conn._drop_uris_if_idle("r1")
+        conn._captures.drop_uris_if_idle("r1")
         self.assertEqual({"r1": {0: "uri-0"}}, conn._block_uris)
 
 
@@ -3300,12 +3300,28 @@ class TestWave14Hygiene(unittest.TestCase):
 
     # --- item 4: the retirement tombstone goes with the last callback -------
     def test_a_retirement_tombstone_goes_after_the_last_callback(self):
+        # FinishRequest arrives while the write is still in flight: the
+        # tombstone stands (the late settle must not rebuild state), and the
+        # last callback removes it. The retirement is injected between the
+        # plan's handoff (in flight) and the I/O settle -- exactly where the
+        # engine thread's get_finished lands relative to the transfer task.
         conn, dtm, pool, group = self._worker()
-        conn._release_staged("r0")
-        self.assertIn("r0", conn._retired_requests)
+        real_submit = conn._data_transfer.submit_task
+
+        def retire_mid_save(*args, **kwargs):
+            if "r0" not in conn._retired_requests:
+                conn._release_staged("r0")
+                self.assertIn("r0", conn._retired_requests)
+            return real_submit(*args, **kwargs)
+
+        conn._data_transfer.submit_task = retire_mid_save
         self._save(conn, dtm, group)
         self.assertNotIn("r0", conn._retired_requests)
         self.assertEqual({}, conn._verdict_pending.get("r0", {}))
+        # The late settle released the retired request's bytes instead of
+        # staging them for a verdict nobody would consume.
+        self.assertEqual({}, conn._staged.get("r0", {}))
+        self.assertEqual(16, pool.free_blocks)
 
     # --- item 5: session protection entries go at handoff -------------------
     def test_session_protection_entries_are_dropped_at_handoff(self):
@@ -3391,13 +3407,23 @@ class TestLateSettleAfterRetirement(unittest.TestCase):
             time.sleep(0.01)
 
     def test_a_settle_after_retirement_is_cancelled_not_registered(self):
-        # FinishRequest often runs before the asynchronous save lands: the
+        # FinishRequest often runs before the asynchronous save settles: the
         # retirement already released the captures and the coordinator must be
         # told this rank will not ask. Registering a pending entry instead
-        # would be rechecked every step forever, and cancelled never.
+        # would be rechecked every step forever, and cancelled never. The
+        # retirement is injected between the handoff and the I/O settle, which
+        # is the real ordering (the save was already issued when the request
+        # finished); retiring before the save even exists is the req-id-reuse
+        # shape, pinned separately below.
         conn, dtm, pool, group = self._worker()
-        conn._release_staged("r0")  # the retirement path
-        self.assertIn("r0", conn._retired_requests)
+        real_submit = conn._data_transfer.submit_task
+
+        def retire_mid_save(*args, **kwargs):
+            if "r0" not in conn._retired_requests:
+                conn._release_staged("r0")
+            return real_submit(*args, **kwargs)
+
+        conn._data_transfer.submit_task = retire_mid_save
         conn._coordinator_client.cancel_verdict.reset_mock()
         self._run(conn, dtm, group)
         self.assertEqual({}, conn._verdict_pending.get("r0", {}))
@@ -3406,8 +3432,9 @@ class TestLateSettleAfterRetirement(unittest.TestCase):
             conn._coordinator_client.cancel_verdict.call_args_list,
         )
         # The bytes were released with the retirement, not kept for a verdict
-        # nobody will consume.
+        # nobody will consume -- and the tombstone went with the last callback.
         self.assertEqual({}, conn._staged.get("r0", {}))
+        self.assertNotIn("r0", conn._retired_requests)
 
     def test_a_mask_release_waits_for_the_verdict_of_the_same_request(self):
         # The manager may mention a block because of a stale, uncommitted
@@ -3454,6 +3481,263 @@ class TestLateSettleAfterRetirement(unittest.TestCase):
         conn._coordinator_client.cancel_verdict.reset_mock()
         conn._drop_pending_verdicts("r1")
         self.assertEqual(0, conn._coordinator_client.cancel_verdict.call_count)
+
+
+class TestWave16RetirementHygiene(unittest.TestCase):
+    """wave16: a retirement tombstone exists only while a callback can land,
+    the verdict bookkeeping it guards is rebuilt atomically with it, and the
+    URI map it leaves behind is dropped atomically with the captures."""
+
+    def _worker(self, capacity=16):
+        import kv_cache_manager.py_connector.vllm.data_transfer as dt
+
+        patcher = mock.patch.object(dt, "batch_gather_scatter_helper")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        group = windowed_group()
+        pool = _StagingPool(torch.device("cpu"), group.per_block_bytes, capacity)
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        dtm._extra_config = SimpleNamespace(
+            block_per_save_task=8, block_per_load_task=8
+        )
+        dtm._io_executor = ThreadPoolExecutor(max_workers=2)
+        conn = worker_with([group], dtm)
+        conn._pending_saves = {}
+        conn._device_mod = MagicMock()
+        conn._tp_size = 2
+        conn._tp_rank = 1
+        conn._manager_client = MagicMock()
+        conn._extra_config = SimpleNamespace(
+            instance_id="wave16", block_per_save_task=8, block_per_load_task=8
+        )
+        conn._coordinator_client.ask_verdict.return_value = None
+        conn._verdict_query_down_until = 0.0
+        return conn, dtm, pool, group
+
+    # --- item 2: no tombstone when no callback remains ----------------------
+    def test_a_retirement_with_nothing_left_leaves_no_tombstone(self):
+        # FinishRequest of a request whose saves all settled already -- or of
+        # a pure full-attention request that never had a captured save
+        # callback at all: nothing can settle any more, and both removal
+        # paths run only from a later settle. An unconditional tombstone
+        # would pin the id for the process's life, and a reused id would
+        # settle as retired instead of being restaged.
+        conn, dtm, pool, group = self._worker()
+        conn._release_staged("r0")
+        self.assertNotIn("r0", conn._retired_requests)
+        self.assertNotIn("r0", conn._captures._retired)
+        self.assertEqual({}, conn._block_uris)
+
+    def test_a_retirement_after_every_settle_leaves_no_tombstone(self):
+        # The settles landed, the bytes stayed staged for a verdict that
+        # never came, and then the request finished: the retirement releases
+        # them, and with no in-flight session nothing can settle -- so the
+        # tombstone must not be added in either set.
+        conn, dtm, pool, group = self._worker()
+        pool_acq = _FakePool()
+        conn._captures.stage(
+            "r0", ("tp0_g0", 0), _Capture(pool=pool_acq, slot=pool_acq.acquire(1))
+        )
+        conn._captures.take("r0", 1, ("tp0_g0", 0))
+        conn._captures.settle("r0", 1, {("tp0_g0", 0): True})
+        self.assertEqual(1, len(conn._staged["r0"]))
+        conn._verdict_pending = {"r0": {"s1": [0]}}
+        conn._release_staged("r0")
+        self.assertNotIn("r0", conn._retired_requests)
+        self.assertNotIn("r0", conn._captures._retired)
+        self.assertEqual({}, conn._staged.get("r0", {}))
+        self.assertEqual({}, conn._verdict_pending.get("r0", {}))
+
+    # --- item 3: retirement and verdict insertion are atomic ----------------
+    def test_a_settle_racing_retirement_does_not_rebuild_pending(self):
+        # The I/O settle and the engine thread's FinishRequest are
+        # concurrent: the callback must not observe "not retired" and then,
+        # after the retirement has added the tombstone and emptied the
+        # pending map, rebuild its entry anyway -- the retired request would
+        # be rechecked every step forever and its cancellation never sent.
+        # The retiring tombstone set injects the engine thread's retirement
+        # exactly at the callback's membership test.
+        conn, dtm, pool, group = self._worker()
+        blocks = [0]
+        conn._capture_request(
+            CaptureRequest("r0", blocks, all_block_ids=[[7]])
+        )
+        plan = conn._plan_group_transfers(
+            locations([["tp0_g0"]] * len(blocks)),
+            blocks,
+            [list(range(7, 7 + len(blocks)))],
+            "r0",
+            for_save=True,
+            session_id=1,
+        )[0]
+        self.assertNotIn(None, plan.staged_slots)
+
+        thread_box = {}
+
+        class _RetiringTombstones(set):
+            """_retired_requests stand-in: the engine thread's FinishRequest
+            runs exactly when the callback tests whether the request retired.
+
+            The bounded join is what distinguishes the two orders: with the
+            decision outside the lock the retirement completes inside the
+            window (the callback then rebuilds state the retirement deleted,
+            or skips the cancel it should have sent); with the decision and
+            the insertion in one locked section the retirement parks until
+            the bookkeeping is done and cleans up after it."""
+
+            def __init__(self):
+                super().__init__()
+                self._fired = False
+
+            def __contains__(self, item):
+                was = set.__contains__(self, item)
+                if item == "r0" and not self._fired:
+                    self._fired = True
+                    thread = threading.Thread(
+                        target=conn._release_staged, args=("r0",)
+                    )
+                    thread.start()
+                    thread.join(0.5)
+                    thread_box["thread"] = thread
+                return was
+
+        conn._retired_requests = _RetiringTombstones()
+        done_cb, done = self._session_callback(
+            conn, "r0", blocks, [plan], session=1
+        )
+        dtm.save_task(
+            MultiResult(1, done_cb), 0, group, plan.uris, None, None,
+            plan.staged_slots,
+        )
+        thread_box["thread"].join(5)
+        # Either the retirement ran before the decision (the callback saw the
+        # tombstone and cancelled) or it ran after (the decision's entry was
+        # popped and cancelled): no pending entry may survive either way, and
+        # the coordinator must have been told this rank will not ask.
+        self.assertEqual(
+            {}, conn._verdict_pending.get("r0", {}),
+            "a settle kept verdict bookkeeping for a retired request",
+        )
+        self.assertNotIn("r0", conn._retired_requests)
+        self.assertTrue(
+            any(
+                call.args[:1] == ("1",)
+                for call in conn._coordinator_client.cancel_verdict.call_args_list
+            ),
+            "the racing session's verdict was never cancelled",
+        )
+        self.assertEqual({}, conn._staged.get("r0", {}))
+
+    # --- item 4: URI cleanup is serialized with the capture handoff ---------
+    def test_uri_cleanup_racing_a_new_handoff_keeps_the_new_uris(self):
+        # The old session's settle (an I/O thread) decides the request is
+        # idle while the engine thread hands a newer session of the same
+        # request over: without locking the two, the cleanup's pop deletes
+        # the key map the new plan just recorded, a later deduplication
+        # release misses the live writer, and the only copy of the retry's
+        # bytes is freed. The retiring map injects the handoff exactly at
+        # the cleanup's pop.
+        conn, dtm, pool, group = self._worker()
+        blocks = [0]
+        conn._capture_request(
+            CaptureRequest("r0", blocks, all_block_ids=[[7]])
+        )
+        plan = conn._plan_group_transfers(
+            locations([["tp0_g0"]] * len(blocks)),
+            blocks,
+            [list(range(7, 7 + len(blocks)))],
+            "r0",
+            for_save=True,
+            session_id=1,
+        )[0]
+        self.assertNotIn(None, plan.staged_slots)
+        # The request finishes while the write is in flight: the late settle
+        # is the one whose cleanup may pop the map.
+        conn._release_staged("r0")
+
+        thread_box = {}
+
+        def handoff():
+            # The engine thread's next step: a fresh capture, then a newer
+            # session's plan that records its keys and takes the capture.
+            conn._capture_request(
+                CaptureRequest("r0", blocks, all_block_ids=[[7]])
+            )
+            conn._plan_group_transfers(
+                locations([["tp0_g0"]] * len(blocks)),
+                blocks,
+                [list(range(7, 7 + len(blocks)))],
+                "r0",
+                for_save=True,
+                session_id=2,
+            )
+
+        class _HandoffRacingMap(dict):
+            """block_uris stand-in: the engine thread's handoff runs exactly
+            when the idle cleanup is about to delete the map.
+
+            The bounded join is what distinguishes the two orders: without
+            the lock the handoff completes inside the window (its keys land
+            in the map, which the pop then deletes); with the lock it parks
+            on the ledger and re-records its keys after the pop, into a
+            fresh map of its own."""
+
+            def __init__(self):
+                super().__init__()
+                self._fired = False
+
+            def pop(self, key, *args):
+                if key == "r0" and not self._fired:
+                    self._fired = True
+                    thread = threading.Thread(target=handoff)
+                    thread.start()
+                    thread.join(0.5)
+                    thread_box["thread"] = thread
+                return super().pop(key, *args)
+
+        racing = _HandoffRacingMap()
+        racing.update(conn._block_uris)
+        # Before the fix the map hangs off the worker alone; after it the
+        # ledger owns it -- install the stand-in wherever it is read.
+        conn._block_uris = racing
+        if hasattr(conn._captures, "block_uris"):
+            conn._captures.block_uris = racing
+        done_cb, done = self._session_callback(
+            conn, "r0", blocks, [plan], session=1
+        )
+        dtm.save_task(
+            MultiResult(1, done_cb), 0, group, plan.uris, None, None,
+            plan.staged_slots,
+        )
+        thread_box["thread"].join(5)
+        # The newer session's live writer kept its cache keys: the
+        # deduplication guard of another request still sees them.
+        self.assertEqual(
+            {0: "u_0_tp0_g0"},
+            conn._block_uris.get("r0"),
+            "the idle cleanup deleted a live session's key map",
+        )
+        self.assertIn(
+            "u_0_tp0_g0",
+            conn._uris_other_requests_hold("r1"),
+            "a deduplication release would miss the live writer",
+        )
+        self.assertTrue(conn._captures.holds("r0"))
+
+    def _session_callback(self, conn, req_id, blocks, plans, session=0):
+        """The worker's per-session result callback: the retain wrapper over
+        a sink, exactly as wait_for_save builds it."""
+        done = {}
+        base = lambda flat: done.setdefault("flat", flat)  # noqa: E731
+        save_req = SimpleNamespace(
+            req_id=req_id, manager_block_idxes=list(blocks), session_id=session
+        )
+        return conn._settle_session_captures(save_req, plans, base), done
 
 
 class TestVerdictPublication(unittest.TestCase):

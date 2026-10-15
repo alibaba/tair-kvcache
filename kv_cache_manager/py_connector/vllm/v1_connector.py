@@ -214,6 +214,17 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             extra_config.model_dump()
         )
         host_ip = get_ip()
+        # The engine run's own identity for the coordinator handshake: serving
+        # replicas share instance_id on purpose (the manager keys on it), so
+        # only an engine-unique identity can tell two same-instance
+        # coordinators on one host apart. vLLM assigns kv_transfer_config's
+        # engine_id per engine run and syncs it across the TP group, which is
+        # exactly the shared-per-engine, unique-per-run property the probe
+        # needs. Empty (absent on a stub config) pairs only with an equally
+        # empty server identity, exactly like the instance identity.
+        engine_id = str(
+            getattr(vllm_config.kv_transfer_config, "engine_id", "") or ""
+        )
 
         # One role object per instance; the other slot stays None and every
         # hook asserts the slot it needs.
@@ -231,6 +242,7 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     host_ip,
                     extra_config.coordinator_base_port,
                     extra_config.instance_id,
+                    engine_id,
                 ),
                 has_eagle_group=self._has_eagle_group,
             )
@@ -276,6 +288,7 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     host_ip,
                     extra_config.coordinator_base_port,
                     extra_config.instance_id,
+                    engine_id,
                 ),
                 register_response,
                 # The capture partition is sized from the engine's per-step
@@ -296,6 +309,7 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                     "max_num_seqs",
                     0,
                 ),
+                engine_id=engine_id,
             )
 
     def shutdown(self) -> None:

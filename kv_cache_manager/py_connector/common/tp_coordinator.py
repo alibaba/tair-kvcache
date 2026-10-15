@@ -830,7 +830,13 @@ class TpCoordinatorClient:
             foreign = None
             try:
                 probe.send(
-                    orjson.dumps({"probe": True, "instance_id": self._instance_id})
+                    orjson.dumps(
+                        {
+                            "probe": True,
+                            "instance_id": self._instance_id,
+                            "engine_id": self._engine_id,
+                        }
+                    )
                 )
                 raw = probe.recv()
                 answered = self._probe_reply_matches(raw)
@@ -846,10 +852,11 @@ class TpCoordinatorClient:
                 if foreign is not None:
                     logger.warning(
                         "TairKvCacheConnector: the query port %d answered the "
-                        "probe for instance %r with %r; it is another "
-                        "instance's coordinator -- skipping it",
+                        "probe for instance %r engine %r with %r; it is "
+                        "another engine's coordinator -- skipping it",
                         candidate + 1,
                         self._instance_id,
+                        self._engine_id,
                         foreign[:200],
                     )
                 continue
@@ -877,7 +884,16 @@ class TpCoordinatorClient:
         return False
 
     def _probe_reply_matches(self, raw: bytes) -> bool:
-        """Is this probe reply *our* coordinator's identity?"""
+        """Is this probe reply *our* coordinator's identity?
+
+        Both identities must match: the instance, because a foreign
+        instance's coordinator must not take our events, and the engine,
+        because serving replicas share the instance on purpose and only the
+        engine identity tells two same-instance coordinators on one host
+        apart. A reply without the engine identity (an older coordinator)
+        only matches a client that carries none itself -- the shape tests,
+        where both sides are built identity-less.
+        """
         try:
             reply = orjson.loads(raw)
         except ValueError:
@@ -886,6 +902,7 @@ class TpCoordinatorClient:
             isinstance(reply, dict)
             and reply.get("probe") is True
             and reply.get("instance_id") == self._instance_id
+            and reply.get("engine_id", "") == self._engine_id
         )
 
     def _ask_query(self, payload: Dict[str, Any], timeout_ms: int = 100) -> Any:

@@ -120,6 +120,13 @@ class _CaptureLedger:
       session settles; a settled *failure* for a retired request releases its
       slot (nothing will ever publish it) instead of staging it for a retry
       that cannot come.
+
+    The ledger also owns the per-request cache-key map (``block_uris``) the
+    save plans record and the deduplication guard reads: the keys move with
+    the captures they belong to (``take_planned`` hands both over in one
+    transition), and they are only forgotten once no capture of the request
+    can return (``drop_uris_if_idle``), under the same lock -- an idle check
+    that races a newer plan's handoff would delete the live writer's keys.
     """
 
     def __init__(self) -> None:
@@ -135,6 +142,12 @@ class _CaptureLedger:
         self.staged: Dict[str, Dict[Tuple[str, int], _Capture]] = {}
         # (session id, spec_name, manager block) -> _Capture.
         self.in_flight: Dict[str, Dict[Tuple[int, str, int], _Capture]] = {}
+        # req_id -> manager block -> the cache key (URI) a plan announced for
+        # it. Guarded by the same lock as the captures: a release consults it
+        # to keep bytes another live writer still owns (see
+        # _uris_other_requests_hold), so the map must appear and disappear
+        # atomically with the captures it guards.
+        self.block_uris: Dict[str, Dict[int, Optional[str]]] = {}
         self._retired: Set[str] = set()
 
     @staticmethod
@@ -170,15 +183,79 @@ class _CaptureLedger:
         repeated plan must not overwrite the first task's ownership).
         """
         with self._lock:
-            flight_key = (session_id, key[0], key[1])
-            sessions = self.in_flight.setdefault(req_id, {})
-            if flight_key in sessions:
-                return None
-            capture = self.staged.get(req_id, {}).pop(key, None)
-            if capture is None:
-                return None
-            sessions[flight_key] = capture
-            return capture
+            return self._take_locked(req_id, session_id, key)
+
+    def _take_locked(
+        self, req_id: str, session_id: int, key: Tuple[str, int]
+    ) -> Optional[_Capture]:
+        flight_key = (session_id, key[0], key[1])
+        sessions = self.in_flight.setdefault(req_id, {})
+        if flight_key in sessions:
+            return None
+        capture = self.staged.get(req_id, {}).pop(key, None)
+        if capture is None:
+            return None
+        sessions[flight_key] = capture
+        return capture
+
+    def take_planned(
+        self,
+        req_id: str,
+        session_id: int,
+        spec_name: str,
+        blocks: "Sequence[int]",
+        uris: "Sequence[Optional[str]]",
+    ) -> List[Optional[int]]:
+        """Record a save plan's cache keys and hand its captures over, as one
+        transition. Returns the staging slot per block (None where the plan
+        has no bytes to hand over).
+
+        The keys are written and the captures move staged -> in flight inside
+        one lock section, together with the idle cleanup that drops the keys
+        (drop_uris_if_idle): a settle of the request's older session that
+        races this handoff must not observe "no captures" between the two and
+        delete the key map this plan is still recording -- a later
+        deduplication release would then miss the live writer and free the
+        only copy of the retry's bytes.
+        """
+        with self._lock:
+            block_uris = self.block_uris.setdefault(req_id, {})
+            slots: List[Optional[int]] = []
+            for position, block in enumerate(blocks):
+                if position < len(uris):
+                    block_uris[block] = uris[position]
+                capture = self._take_locked(req_id, session_id, (spec_name, block))
+                if capture is None:
+                    if (session_id, spec_name, block) in self.in_flight.get(
+                        req_id, {}
+                    ):
+                        logger.warning(
+                            "req:%s windowed block %d (group %s) is planned "
+                            "twice; its bytes stay with the first session and "
+                            "this block is failed instead of handing the same "
+                            "slot out twice",
+                            req_id,
+                            block,
+                            spec_name,
+                        )
+                    slots.append(None)
+                    continue
+                slots.append(capture.slot)
+            return slots
+
+    def drop_uris_if_idle(self, req_id: str) -> None:
+        """Forget a request's cache keys once no capture of it can return.
+
+        The emptiness test and the pop are one lock section with the plan
+        that records the keys (take_planned) and with every capture
+        transition: an unsynchronized check could see "no captures" just
+        before a newer plan records its keys and hands a fresh capture over,
+        and the pop would then delete the new session's key map.
+        """
+        with self._lock:
+            if self.staged.get(req_id) or self.in_flight.get(req_id):
+                return
+            self.block_uris.pop(req_id, None)
 
     def taken_by(self, req_id: str, session_id: int, key: Tuple[str, int]) -> bool:
         """Is this block already in flight for this session?"""
@@ -260,18 +337,27 @@ class _CaptureLedger:
         with self._lock:
             return bool(self.staged.get(req_id)) or bool(self.in_flight.get(req_id))
 
-    def retire(self, req_id: str) -> int:
-        """Release everything still waiting for a session; keep in-flight
-        records until their tasks settle (see settle)."""
+    def retire(self, req_id: str) -> Tuple[int, bool]:
+        """Release everything still waiting for a session; report what is left.
+
+        Returns how many staged captures were released and whether in-flight
+        sessions remain whose callbacks still have to be guarded. The
+        retirement tombstone is only for those callbacks -- a settle that
+        lands after the retirement must release its bytes instead of staging
+        them for a verdict nobody will consume -- and with nothing in flight
+        no callback can land, while the tombstone's only removal path is a
+        later settle: adding it unconditionally would pin the request id for
+        the process's life, and a reused id would settle as retired instead
+        of being restaged.
+        """
         with self._lock:
             staged = self.staged.pop(req_id, {})
             for capture in staged.values():
                 self._release(capture)
-            # The request is retired from here on, in-flight entries or not: a
-            # save callback that lands later must release its bytes instead of
-            # staging them for a verdict nobody will consume.
-            self._retired.add(req_id)
-            return len(staged)
+            settles = bool(self.in_flight.get(req_id))
+            if settles:
+                self._retired.add(req_id)
+            return len(staged), settles
 
 
 class ConnectorWorker:
@@ -289,6 +375,7 @@ class ConnectorWorker:
         register_response: Dict[str, Any],
         max_num_batched_tokens: int = 0,
         max_num_seqs: int = 0,
+        engine_id: str = "",
     ) -> None:
         self._extra_config = extra_config
         # The engine's per-step token budget (chunked prefill's chunk) and its
@@ -342,8 +429,8 @@ class ConnectorWorker:
         # Every slot transition goes through this one ledger (see
         # _CaptureLedger): captured-not-taken entries in ``staged``,
         # session-owned ones in ``in_flight`` keyed by (session, spec, block).
-        # The two attributes below are the ledger's maps, exposed read-only for
-        # the tests and for the plan's diagnostics.
+        # The three attributes below are the ledger's maps, exposed read-only
+        # for the tests and for the plan's diagnostics.
         self._captures = _CaptureLedger()
         self._staged = self._captures.staged
         self._in_flight = self._captures.in_flight
@@ -355,8 +442,12 @@ class ConnectorWorker:
         # StartWriteCache calls are deduplicated before FinishWriteCache), so a
         # release computed from that answer would drop the second request's
         # captures -- and if the first writer then fails, neither request has
-        # the windowed bytes left to publish them.
-        self._block_uris: Dict[str, Dict[int, Optional[str]]] = {}
+        # the windowed bytes left to publish them. The map lives on the ledger
+        # (see _CaptureLedger.block_uris): it is written and dropped under the
+        # capture lock, atomically with the handoffs it guards; the release
+        # scans below read it without the lock on purpose, since a stale view
+        # can only make a release more conservative.
+        self._block_uris = self._captures.block_uris
         # Sessions whose local success is not yet the global verdict (tp > 1,
         # this rank is not the coordinator): req_id -> session id -> blocks
         # whose bytes this rank keeps until the coordinator says committed, and
@@ -367,7 +458,14 @@ class ConnectorWorker:
         # Settles run on I/O threads and the recheck on the engine thread: one
         # lock guards every add/remove/iterate (a callback that adds a session
         # between the emptiness test and the pop would lose it, and its
-        # captures would never be rechecked).
+        # captures would never be rechecked). It also orders a settle's
+        # "is this request retired?" decision against the retirement itself
+        # (see _release_staged and _settle_session_captures): the check, the
+        # insertion and the retirement's tombstone-and-drop all happen under
+        # it, or a callback that observed "not retired" could rebuild pending
+        # bookkeeping for a request whose retirement already emptied it --
+        # rechecked every step, cancelled never. Lock order when nesting:
+        # this lock first, the capture ledger's inside it.
         self._verdict_lock = threading.Lock()
         # When the coordinator cannot be asked (its port is unbound or it is
         # gone), every probe costs a receive timeout -- on the engine thread,
@@ -375,9 +473,12 @@ class ConnectorWorker:
         # round and mutes the endpoint for a while instead of paying that per
         # session over and over.
         self._verdict_query_down_until = 0.0
-        # Requests whose FinishRequest already ran (see _release_staged): a
-        # save callback that lands afterwards must not rebuild verdict
-        # bookkeeping that nothing would drop any more.
+        # Requests whose FinishRequest already ran while a settle could still
+        # land (see _release_staged): a save callback that arrives afterwards
+        # must not rebuild verdict bookkeeping that nothing would drop any
+        # more. Guarded by _verdict_lock, and only set while in-flight saves
+        # remain -- the last callback clears it, and a request with nothing
+        # in flight never gets one at all.
         self._retired_requests: Set[str] = set()
 
         self._tp_rank = get_tensor_model_parallel_rank()
@@ -392,6 +493,7 @@ class ConnectorWorker:
                 tp_size,
                 self.on_save_finished,
                 extra_config.instance_id,
+                engine_id,
             )
 
         max_group_bytes = max(m.per_block_bytes for m in self._group_metas)
@@ -825,63 +927,72 @@ class ConnectorWorker:
                         if ok is None:
                             continue
                         outcomes[(plan.group.spec_name, block)] = bool(ok)
-                self._captures.settle(
-                    save_req.req_id, save_req.session_id, outcomes
+                # A local verdict is never the global one. With several
+                # ranks another rank may fail and the manager then rejects
+                # the block for everyone; even with one rank `outcomes` only
+                # covers the *windowed* plans, while the block is committed
+                # only when every group wrote it (a full-attention or state
+                # group failing would leave the window bytes released and
+                # the manager rejecting a block nobody can rewrite once the
+                # window moved). So the bytes stay staged and the session is
+                # marked pending: the coordinator's merged, all-group AND --
+                # published by on_save_finished or answered by the query --
+                # releases them, within a step.
+                session_key = (
+                    getattr(save_req, "write_session_id", None)
+                    or str(save_req.session_id)
                 )
-                self._drop_uris_if_idle(save_req.req_id)
-                if True:
-                    # A local verdict is never the global one. With several
-                    # ranks another rank may fail and the manager then rejects
-                    # the block for everyone; even with one rank `outcomes` only
-                    # covers the *windowed* plans, while the block is committed
-                    # only when every group wrote it (a full-attention or state
-                    # group failing would leave the window bytes released and
-                    # the manager rejecting a block nobody can rewrite once the
-                    # window moved). So the bytes stay staged and the session is
-                    # marked pending: the coordinator's merged, all-group AND --
-                    # published by on_save_finished or answered by the query --
-                    # releases them, within a step.
-                    session_key = (
-                        getattr(save_req, "write_session_id", None)
-                        or str(save_req.session_id)
+                ordered: List[int] = []
+                for plan in plans:
+                    if getattr(plan.group, "retention", None) is None:
+                        continue
+                    ordered = [
+                        save_req.manager_block_idxes[pos]
+                        for pos in range(len(plan.staged_slots or ()))
+                    ]
+                    break
+                # One section for the whole transition: the settle that moves
+                # the bytes, the key cleanup that reads its result, and the
+                # verdict bookkeeping that follows it. Retirement runs the
+                # mirror section (see _release_staged) under the same lock:
+                # without it a retirement could land between this callback's
+                # "not retired" observation and its insertion, delete the
+                # pending map, and have the callback rebuild it for a request
+                # nobody will ever ask about again -- rechecked every step,
+                # cancelled never.
+                with self._verdict_lock:
+                    self._captures.settle(
+                        save_req.req_id, save_req.session_id, outcomes
                     )
-                    if save_req.req_id in self._retired_requests:
-                        # The request is gone: the retirement already released
-                        # its captures, no verdict will be consumed, and a
-                        # pending entry here would be rechecked every step
-                        # without ever being cancelled (the retirement was the
-                        # only other place that clears them).
-                        for rank in range(self._tp_size):
-                            self._coordinator_client.cancel_verdict(session_key, rank)
-                    ordered: List[int] = []
-                    for plan in plans:
-                        if getattr(plan.group, "retention", None) is None:
-                            continue
-                        ordered = [
-                            save_req.manager_block_idxes[pos]
-                            for pos in range(len(plan.staged_slots or ()))
-                        ]
-                        break
-                    if ordered and save_req.req_id not in self._retired_requests:
-                        with self._verdict_lock:
-                            self._verdict_pending.setdefault(save_req.req_id, {})[
-                                session_key
-                            ] = ordered
-                        self._recheck_pending_verdicts(
-                            {save_req.req_id: {session_key: ordered}}
-                        )
+                    self._captures.drop_uris_if_idle(save_req.req_id)
+                    retired = save_req.req_id in self._retired_requests
+                    if not retired and ordered:
+                        self._verdict_pending.setdefault(save_req.req_id, {})[
+                            session_key
+                        ] = ordered
                     if (
-                        save_req.req_id in self._retired_requests
-                        and not self._in_flight.get(save_req.req_id)
-                        and not self._staged.get(save_req.req_id)
+                        retired
                         and not self._verdict_pending.get(save_req.req_id)
+                        and not self._captures.holds(save_req.req_id)
                     ):
                         # The last callback for this request has landed: the
-                        # tombstone has done its job (it kept this late settle
+                        # tombstone has done its job (it kept late settles
                         # from rebuilding state) and must go, or a long-lived
                         # worker accumulates request ids -- and a reused id
                         # would treat a fresh request's callbacks as retired.
                         self._retired_requests.discard(save_req.req_id)
+                if retired:
+                    # The request is gone: the retirement already released
+                    # its captures, no verdict will be consumed, and a
+                    # pending entry here would be rechecked every step
+                    # without ever being cancelled (the retirement was the
+                    # only other place that clears them).
+                    for rank in range(self._tp_size):
+                        self._coordinator_client.cancel_verdict(session_key, rank)
+                elif ordered:
+                    self._recheck_pending_verdicts(
+                        {save_req.req_id: {session_key: ordered}}
+                    )
                 failed = [key for key, ok in outcomes.items() if not ok]
                 if failed:
                     logger.warning(
@@ -910,19 +1021,6 @@ class ConnectorWorker:
             if not sessions:
                 return set()
             return {block for blocks in sessions.values() for block in blocks}
-
-    def _drop_uris_if_idle(self, req_id: str) -> None:
-        """Forget a request's cache keys once no capture of it can return.
-
-        A retiring request keeps its URI map while a save is in flight (a
-        release may still have to match those keys). The settle that lands the
-        last one is the only place that notices the map is now unreachable --
-        nothing can release or look these keys up again -- so without this it
-        sits there forever while every _uris_other_requests_hold scan walks it.
-        """
-        if self._in_flight.get(req_id) or self._staged.get(req_id):
-            return
-        self._block_uris.pop(req_id, None)
 
     def _recheck_pending_verdicts(
         self, pending: "Optional[Dict[str, Dict[str, List[int]]]]" = None
@@ -998,14 +1096,22 @@ class ConnectorWorker:
         """A retiring request has no retry left: pending blocks go with it."""
         with self._verdict_lock:
             pending = self._verdict_pending.pop(req_id, None)
-        if not pending:
-            return
-        # The request is gone on this rank while slower ranks may still be
-        # writing it: the coordinator would keep the entry waiting for a query
-        # that cannot come any more. Cancelling counts as this rank's answer --
-        # and like the query loop it stops at the first failure and mutes the
-        # endpoint, instead of paying one receive timeout per session while the
-        # request retires.
+        if pending:
+            self._cancel_pending_verdicts(req_id, pending)
+
+    def _cancel_pending_verdicts(
+        self, req_id: str, pending: Dict[str, List[int]]
+    ) -> None:
+        """Cancel a retired request's pending sessions and free their bytes.
+
+        The request is gone on this rank while slower ranks may still be
+        writing it: the coordinator would keep each entry waiting for a query
+        that cannot come any more. Cancelling counts as this rank's answer --
+        and like the query loop it stops at the first failure and mutes the
+        endpoint, instead of paying one receive timeout per session while the
+        request retires. Runs outside _verdict_lock: the cancels are socket
+        calls with their own timeouts.
+        """
         if time.monotonic() >= self._verdict_query_down_until:
             for session_id in pending:
                 if not self._coordinator_client.cancel_verdict(
@@ -1037,33 +1143,18 @@ class ConnectorWorker:
 
         Handing a block over *moves* its entry from ``_staged`` to
         ``_in_flight``: the task owns the slot from here on and returns it when
-        its transfer lands. The block's URI is remembered with it: a release
-        for another request may only drop bytes whose URI is not still owned by
-        a live session (see _block_uris). A block is announced once, so a second plan for the
-        same block means the announcement was repeated -- it gets no slot (and
-        no location to write to), rather than a slot two tasks would both
-        release.
+        its transfer lands. The block's URI is remembered with the handover --
+        one ledger transition (see _CaptureLedger.take_planned), so a settle
+        that concurrently decides the request is idle cannot drop the key map
+        between the two -- and a release for another request may only drop
+        bytes whose URI is not still owned by a live session (see _block_uris).
+        A block is announced once, so a second plan for the same block means
+        the announcement was repeated -- it gets no slot (and no location to
+        write to), rather than a slot two tasks would both release.
         """
-        slots: List[Optional[int]] = []
-        block_uris = self._block_uris.setdefault(req_id, {})
-        for position, block in enumerate(manager_block_idxes):
-            key = (group.spec_name, block)
-            if position < len(uris):
-                block_uris[block] = uris[position]
-            capture = self._captures.take(req_id, session_id, key)
-            if capture is None:
-                if self._captures.taken_by(req_id, session_id, key):
-                    logger.warning(
-                        "req:%s windowed block %d (group %s) is planned twice; "
-                        "its bytes stay with the first session and this block is "
-                        "failed instead of handing the same slot out twice",
-                        req_id,
-                        block,
-                        group.spec_name,
-                    )
-                slots.append(None)
-                continue
-            slots.append(capture.slot)
+        slots = self._captures.take_planned(
+            req_id, session_id, group.spec_name, manager_block_idxes, uris
+        )
         missing = [
             i for i, slot in enumerate(slots) if slot is None and uris[i] is not None
         ]
@@ -1708,11 +1799,23 @@ class ConnectorWorker:
         them and free the same slot twice (the pool's free list would then hold
         the range twice and dispatch it to two transfers; review_r1 S1).
         """
-        self._retired_requests.add(req_id)
-        self._drop_pending_verdicts(req_id)
-        released = self._captures.retire(req_id)
-        if req_id not in self._in_flight:
-            self._block_uris.pop(req_id, None)
+        # One section for the whole retirement: the pending-verdict drop, the
+        # ledger retirement and the tombstone decision, the mirror of the
+        # settle callbacks' section (see _settle_session_captures) -- a settle
+        # that lands concurrently must not observe "not retired" here and
+        # rebuild the pending map the retirement just emptied. The tombstone
+        # is only added when a settle can still land: with nothing in flight
+        # no callback remains, and the tombstone's only removal path is a
+        # later settle -- it would pin the request id for the process's life,
+        # and a reused id would settle as retired instead of being restaged.
+        with self._verdict_lock:
+            pending = self._verdict_pending.pop(req_id, None)
+            released, settles = self._captures.retire(req_id)
+            if settles:
+                self._retired_requests.add(req_id)
+            self._captures.drop_uris_if_idle(req_id)
+        if pending:
+            self._cancel_pending_verdicts(req_id, pending)
         in_flight = self._in_flight.get(req_id)
         logger.debug(
             "req:%s released %d un-taken captured block slots (%d in flight "
