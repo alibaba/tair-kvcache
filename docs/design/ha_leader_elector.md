@@ -148,7 +148,7 @@ Optimizer 的配置与订阅接口同时检查 `LEADER` 和 `IsStableState()`。
 | 开放门禁与失锁同时发生 | 校验和开放不能在两个临界区；失锁处理返回后门禁关闭 | `GatePublicationAndLossAreSerialized` |
 | 续约成功 → 等状态锁 → 租约到期 → 获得状态锁 | 不使用等待前的时间接受结果 | `RenewalWaitingForStateMutexCannotCommitExpiredLease` |
 | 清理完成，但主动 Unlock 尚未返回 | 不允许新竞选与旧释放交错 | `CleanupCompletionDoesNotPermitCampaignBeforeUnlockReturns` |
-| 续约响应阻塞 → 旧主失锁 → 新主持锁 → 旧响应返回 | 旧资格不复活，补偿释放保留新主的锁 | `LateRenewalReleaseDoesNotDeleteAnotherNodesLock` |
+| 续约响应阻塞 → 旧主失锁 → 新主持锁 → 旧响应返回 | 旧资格不复活，补偿释放保留新主的锁 | `LateRenewalReleaseDoesNotDeleteAnotherNodesLock`；Redis 集成测试的 `test_late_successful_renew_reply_cannot_revive_old_leader_or_delete_new_lock` |
 | Stop 与抢锁、恢复或清理同时发生 | 无在途结果提交；必要清理不被跳过 | `StopRejectsAcquisitionStillInFlight` / `StopWaitsForRecoveryCleanupAndNeverPublishesOldReadiness` / `StopDuringCleanupWaitsForAlreadyRunningCleanup` |
 
 并发假设也属于评审范围：竞选和续约只有一个 LeaderLock 线程；恢复和清理只有一个 StateTransition 线程；回调在 Start 前注册；两个快速门禁回调不能阻塞或重入。`transition_mutex_` 保护角色变更、轮次和释放标记；同时访问锁持有者字符串时，按状态锁到持有者锁的顺序获取，不反向获取。
@@ -339,9 +339,15 @@ Redis选主key通过`cluster_name`区分：`kvcm_<cluster_name>_lock:`/`kvcm_<cl
 | 最后一个请求完成与排空等待并发 | 不丢完成通知；两类服务请求排空前不重新竞选 | `service/test/service_impl_base_test.cc` |
 | 本地失锁、角色仍为 LEADER 且尚未关闭订阅 | Optimizer 配置与订阅 gRPC 接口拒绝新请求 | `service/test/optimizer_event_service_grpc_test.cc` |
 | 单节点主动降级后重新服务、双节点竞争与切主 | 通过 HTTP/gRPC 验证门禁和选主的装配行为 | `integration_test/admin_service/admin_interface_cases.py` |
+| 真实 Redis 锁 key 在恢复期间被外部删除 | 真实续约返回 `EC_NOENT`；恢复和清理期间各 100 次锁循环均不查询或抢锁；清理后重新恢复为 LEADER 并发布门禁 | `integration_test/redis_coordination/leader_lock_deletion_test_driver.cc`，由下述 Python 集成目标启动 |
+| 外部连续删除真实 Redis 锁 key | 至少 10 次实际删除；停止注入后重新获锁、恢复 Meta/Admin 入口，并持续跨过 3 次后续续约 | `integration_test/redis_coordination/redis_leader_recovery_test.py` |
+| Redis 连接反复中断、主节点网络隔离 | 单节点能重新恢复；双节点只有新主提供业务，旧主恢复连接后不重复升主 | `integration_test/redis_coordination/redis_leader_recovery_test.py` |
+| Redis 已续约成功但响应丢失或迟到 | 客户端重连并重试同一命令；过期轮次不复活，补偿释放不删除新主的锁 | 同上 |
+| Redis 停止后以空状态重启 | 本地租约到期关闭门禁；Lua 缓存丢失后自动重载，重新恢复两类业务入口 | 同上 |
 
-单元测试使用受控后端精确安排状态转换的并发时序；HTTP/gRPC 集成测试验证业务门禁和选主装配。真实 Redis 故障注入尚未加入此提交。回调永久不返回仍遵循现有等待策略。
+单元测试使用受控后端精确安排状态转换的并发时序；Redis 集成测试复用 `RedisServer` 启动独立 Valkey/Redis，通过 TCP 代理关闭连接、丢弃或暂缓真实续约响应，并实际停止和重新启动 Redis 进程。注册表使用本地后端，保证测试聚焦选主失锁后的收敛行为。每个测试实例独立分配 Redis 端口及工作目录，CI 显式选择带 `manual` / `redis` 标签的 C++ 和集成测试。回调永久不返回仍遵循现有等待策略。
 
+外部删锁用例使用独立 Redis 连接执行 `DEL`，验证锁 key 消失后的选主行为，不依赖容量驱逐的随机性。恢复窗口用例由 Python 启动同一私有 Redis 和 C++ 测试驱动，以条件变量控制恢复、清理回调；选主器仍使用真实 `CoordinationRedisBackend` 和 Lua 脚本，并额外验证后端在此时可以立即被其他持有者取得。进程级反复删锁用例不阻塞恢复，而是在停止注入后检查真实服务入口。两者均不增加生产代码测试钩子，不覆盖 Redis 内存策略或 OOM 行为。
 
 ## 8. 模块目录结构
 
