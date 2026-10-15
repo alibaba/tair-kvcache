@@ -188,14 +188,21 @@ class _CaptureLedger:
     def _take_locked(
         self, req_id: str, session_id: int, key: Tuple[str, int]
     ) -> Optional[_Capture]:
+        # The per-request map is created only once a capture is found: a
+        # windowed save whose capture was withheld (the step's arena budget
+        # ran out) or whose every row was null takes nothing, and an empty
+        # map left behind is unreachable garbage -- settle() returns early
+        # for an empty map and retire() only tests it, so the entry would
+        # pin the request id for the worker's lifetime and repeated capture
+        # degradation would grow in_flight without bound.
         flight_key = (session_id, key[0], key[1])
-        sessions = self.in_flight.setdefault(req_id, {})
-        if flight_key in sessions:
+        sessions = self.in_flight.get(req_id)
+        if sessions is not None and flight_key in sessions:
             return None
         capture = self.staged.get(req_id, {}).pop(key, None)
         if capture is None:
             return None
-        sessions[flight_key] = capture
+        self.in_flight.setdefault(req_id, {})[flight_key] = capture
         return capture
 
     def take_planned(
@@ -1351,6 +1358,7 @@ class ConnectorWorker:
             # models keep the swallowed-and-logged behaviour their e2e
             # contract pinned. Remove the request-level detour once upstream
             # supports multi-group invalid-block recovery.
+            #
             report_ids = []
             report_failures = len(load_req.all_block_ids) == 1
             report_request_failures = not report_failures and self._has_windowed_groups

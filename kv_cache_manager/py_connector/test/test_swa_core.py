@@ -2125,7 +2125,30 @@ class TestCaptureSlotInvariant(unittest.TestCase):
         self._invariant(conn, pool, "after a withheld capture")
         self.assertEqual(self.CAPACITY, pool.free_blocks)
 
-
+    def test_a_take_without_a_capture_leaves_no_empty_entry(self):
+        # A windowed save can plan blocks whose capture never staged (the
+        # step's arena budget ran out, or every target row was null): the take
+        # finds no bytes and must not leave an empty per-request map behind --
+        # settle() returns early for an empty map and retire() only tests it,
+        # so the entry would pin the request id for the worker's lifetime and
+        # repeated capture degradation would grow in_flight without bound.
+        ledger = _CaptureLedger()
+        pool = _StagingPool(torch.device("cpu"), 1024, 8)
+        self.assertIsNone(ledger.take("r0", 1, ("tp0_g0", 0)))
+        self.assertNotIn("r0", ledger.in_flight)
+        # The same take through a save plan (take_planned) must not leave one
+        # either, and neither may the retirement or a settle of the empty
+        # session revive it.
+        self.assertEqual(
+            [None], ledger.take_planned("r0", 1, "tp0_g0", [0], [None])
+        )
+        self.assertNotIn("r0", ledger.in_flight)
+        ledger.settle("r0", 1, {("tp0_g0", 0): True})
+        self.assertNotIn("r0", ledger.in_flight)
+        released, settles = ledger.retire("r0")
+        self.assertEqual((0, False), (released, settles))
+        self.assertNotIn("r0", ledger.in_flight)
+        self.assertEqual(8, pool.free_blocks)
 
     def test_concurrent_failed_settles_of_one_block_keep_one_owner(self):
         # Two sessions hold the same (spec, block) and both fail at once: each
