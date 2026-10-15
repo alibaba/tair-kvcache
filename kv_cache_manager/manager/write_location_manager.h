@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -33,6 +34,12 @@ public:
              int64_t write_timeout_seconds,
              CallBack callback);
     bool GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info);
+    // FinishWriteCache 已应用结果的登记与查询。会话一旦删除（GetAndDelete 或
+    // 超时/清理回调），重试的 finish 只能凭这份记录裁决“已应用”（幂等成功）
+    // 还是“已被回滚/从未存在”（维持失败）：空的 keys 位图与掩码按位比对，
+    // 见 CacheManager::FinishWriteCache 的幂等重试分支。
+    void PutFinishedMask(const std::string &write_session_id, std::vector<bool> applied_mask);
+    bool GetFinishedMask(const std::string &write_session_id, std::vector<bool> &applied_mask) const;
     bool HasLocationId(const std::string &location_id) const;
     size_t ExpireSize() const { return session_id_map_.Size(); }
 
@@ -76,6 +83,12 @@ private:
     std::atomic_int64_t next_sleep_time_us_;
     std::mutex stop_mutex_;
     std::condition_variable stop_cond_;
+
+    // 已完成会话的应用结果（PutFinishedMask）：服务线程的 finish 与超时回调
+    // 线程的回滚都会写，读走服务线程的幂等重试，各自加 finished_mux_。
+    mutable std::mutex finished_mux_;
+    std::map<std::string, std::vector<bool>> finished_masks_;
+    std::deque<std::string> finished_order_;
 };
 
 } // namespace kv_cache_manager

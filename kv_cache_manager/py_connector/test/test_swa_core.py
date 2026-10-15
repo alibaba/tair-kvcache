@@ -2834,17 +2834,18 @@ class TestCoordinatorResync(unittest.TestCase):
         # the caller backs off.
         client = self._client(self._free_port())
         self.assertIs(False, client.ask_verdict("s1", 0, timeout_ms=20))
-        # A resync that trips over its own state (a wrong attribute, say) is
+        # A probe that trips over its own state (a wrong attribute, say) is
         # still "cannot ask": anything raised here would reach the engine
         # thread, which must only ever see the verdict or a backoff.
-        client._resync_endpoint = MagicMock(side_effect=AttributeError("_event_socket"))
+        client._probe_and_reconnect = MagicMock(side_effect=AttributeError("_event_socket"))
         self.assertIs(False, client.ask_verdict("s1", 0, timeout_ms=20))
 
     def test_the_probe_keeps_the_port_that_answered(self):
         # The coordinator may have had to bind a neighbour: the client must
-        # find it, remember it, and reach it afterwards -- a probe that
-        # rediscovers the port but then reconnects to the configured one makes
-        # every later query unreachable, which is what the fallback announced.
+        # find it *before* the first query (the configured pair is dead
+        # here), remember it, and reach it afterwards -- a probe that
+        # rediscovers the port but then reconnects to the configured one
+        # makes every later query unreachable.
         import socket as socket_module
 
         port = self._free_port()
@@ -2860,16 +2861,25 @@ class TestCoordinatorResync(unittest.TestCase):
         server.record_verdict("s1", [True])
 
         client = self._client(port)
-        # The first query fails (the configured port is dead), the probe finds
-        # the coordinator on its fallback port, and that port is what the
-        # client keeps -- a probe that reconnects to the configured one makes
-        # every later query unreachable.
-        self.assertIs(False, client.ask_verdict("s1", 0, timeout_ms=50))
-        self.assertEqual(port + 1, client._port)
+        # The first query resolves the pair before it is sent, so it is
+        # answered on the fallback port outright -- and that port is what
+        # the client keeps for every later query.
         self.assertEqual([True], client.ask_verdict("s1", 0, timeout_ms=50))
+        self.assertEqual(port + 1, client._port)
+        self.assertTrue(client._endpoint_resolved)
         # ... and it stays reachable for the next query.
         server.record_verdict("s2", [False])
         self.assertEqual([False], client.ask_verdict("s2", 0, timeout_ms=50))
+
+        # The resolved endpoint dies and the coordinator comes back one pair
+        # further: the query fails, the resync probes again, and the next
+        # query lands on the port that answered -- not on the configured one.
+        server.shutdown()
+        replacement = self._server(port + 2)
+        replacement.record_verdict("s3", [True])
+        self.assertIs(False, client.ask_verdict("s3", 0, timeout_ms=50))
+        self.assertEqual([True], client.ask_verdict("s3", 0, timeout_ms=50))
+        self.assertEqual(port + 2, client._port)
 
 
 class TestConfirmedReleaseRecheck(unittest.TestCase):
@@ -2935,6 +2945,82 @@ class TestConfirmedReleaseRecheck(unittest.TestCase):
         meta.to_release_captures.append(("r0", [0, 1], None, True))
         conn.wait_for_save(meta)
         self.assertEqual({}, conn._staged.get("r0", {}))
+
+
+class TestReleaseSettleAtomicity(unittest.TestCase):
+    """wave17 #1: a release's verdict check and its capture free are atomic."""
+
+    def test_a_settle_between_the_check_and_the_release_keeps_its_bytes(self):
+        # A confirmed release licenses the free with the verdict-pending
+        # table; an older session's settle runs the mirror section -- it
+        # restages that session's in-flight bytes and registers the pending
+        # verdict they wait for. With the check and the free apart, the
+        # settle could land exactly between them: the release would free the
+        # bytes the settle just put back, and once another rank fails that
+        # session's global verdict the retry has lost the only copy it could
+        # republish. One section over both leaves a settle only the safe
+        # orders -- before the check (its blocks are protected) or after the
+        # free (which took nothing of its own).
+        #
+        # The racing settle is injected at the release itself: only a release
+        # that runs outside the verdict lock lets it complete inside the
+        # window; the bounded join parks it otherwise, exactly as a real
+        # I/O callback would park on the lock.
+        conn = captured_worker([0], [7])
+        pool = conn._data_transfer.pool
+        blocks = [0]
+        # The capture belongs to the older session: taken in flight, so the
+        # release finds nothing staged for it yet.
+        plan = conn._plan_group_transfers(
+            locations([["tp0_g0"]] * len(blocks)),
+            blocks,
+            [list(range(7, 7 + len(blocks)))],
+            "r0",
+            for_save=True,
+            session_id=1,
+        )[0]
+        self.assertNotIn(None, plan.staged_slots)
+        self.assertEqual({}, conn._staged.get("r0", {}))
+
+        real_release = conn._captures.release_staged
+        thread_box = {}
+        done = {}
+
+        def base(flat):
+            done.setdefault("flat", flat)
+
+        save_req = SimpleNamespace(
+            req_id="r0", manager_block_idxes=list(blocks), session_id=1
+        )
+        done_cb = conn._settle_session_captures(save_req, [plan], base)
+
+        def release_with_a_settle_landing(req_id, blocks):
+            thread = threading.Thread(target=done_cb, args=([True],))
+            thread.start()
+            thread.join(0.5)
+            thread_box["thread"] = thread
+            return real_release(req_id, blocks)
+
+        conn._captures.release_staged = release_with_a_settle_landing
+        conn._release_captures_for("r0", blocks, confirmed=True)
+        thread_box["thread"].join(5)
+
+        # The settle restaged its bytes and registered the verdict it waits
+        # for: the release must not have freed them -- a failed global
+        # verdict's retry still has its only copy to republish.
+        self.assertEqual(
+            [("tp0_g0", 0)],
+            list(conn._staged.get("r0", {})),
+            "the release freed bytes a settle had just restaged",
+        )
+        self.assertEqual({"1": blocks}, conn._verdict_pending.get("r0"))
+        self.assertEqual(
+            [],
+            pool.released,
+            "the release returned the slot of verdict-pending bytes",
+        )
+        # The settle's own report ran to completion (no callback was lost).
+        self.assertEqual([True], done.get("flat"))
 
 
 class TestCancellationBound(unittest.TestCase):

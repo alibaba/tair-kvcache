@@ -747,10 +747,33 @@ class TpCoordinatorClient:
     def _send_query(self, payload: Dict[str, Any], timeout_ms: int = 100) -> Any:
         """One request/response over the query socket (caller holds the lock).
 
-        The coordinator may have had to bind a neighbouring port (a transient
-        collision); the first unanswered query probes the range once and
-        reconnects both sockets to whichever port answers.
+        The pair is resolved before the first query exactly as it is before
+        the first event (see send): a query can be this client's very first
+        interaction -- a late settle cancels before its done_cb sends the
+        completion event, and the recheck asks before that -- and the
+        configured pair may belong to another connector whose coordinator had
+        to take the neighbouring pair. Asking the configured port would reach
+        the foreign REP socket, whose empty protocol-error reply is
+        indistinguishable from a successful cancel: the real coordinator
+        would never hear the cancellation and would keep the abandoned
+        verdict, while the foreign one recorded cross-instance state.
         """
+        if not self._endpoint_resolved:
+            if self._probe_and_reconnect(timeout_ms, lock_held=True):
+                self._endpoint_resolved = True
+                self._flush_pending_locked()
+            else:
+                # No coordinator of this instance answered: "cannot ask" (the
+                # caller backs off and keeps its bytes) rather than a query
+                # into whatever owns the configured pair.
+                raise ConnectionError(
+                    "no coordinator of instance %r answered on ports %d-%d"
+                    % (
+                        self._instance_id,
+                        self._port,
+                        self._port + COORDINATOR_PORT_ATTEMPTS,
+                    )
+                )
         if self._query_socket is None:
             self._connect_query(self._port + 1, timeout_ms)
         self._query_socket.send(orjson.dumps(payload))
@@ -880,7 +903,11 @@ class TpCoordinatorClient:
                 self._port = candidate
             self._connect_query(candidate + 1, timeout_ms)
             return True
-        self._connect_query(self._port + 1, timeout_ms)
+        # Nothing answered: no query socket is left behind. The query path
+        # refuses to send while the endpoint is unresolved (see _send_query),
+        # so a socket on the configured pair would only ever be created and
+        # closed again -- and anything reading it before that would be
+        # talking to a foreign coordinator.
         return False
 
     def _probe_reply_matches(self, raw: bytes) -> bool:

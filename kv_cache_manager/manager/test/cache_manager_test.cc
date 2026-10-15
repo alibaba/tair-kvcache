@@ -2205,6 +2205,71 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
     }
 }
 
+// FinishWriteCache 的幂等重试：Manager 应用首次 finish 但 HTTP 应答丢失时，
+// 客户端重试会拿到“会话不存在”（GetAndDelete 已删）。重试必须能确认结果——
+// 否则客户端把已持久的提交判为未提交，裁决永不发布，各 rank 的捕获与
+// pending 条目钉到退休。会话的删除路径只有三条且都经过 FinishWriteCache
+// （GetAndDelete 的唯一生产调用方；超时/DropAll 回调带全失败掩码回到这里），
+// 所以“不存在”由登记的应用位图裁决：重试的成功位全部已生效才答复成功。
+TEST_F(CacheManagerTest, TestFinishWriteCacheRetryReconciles) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    std::vector<int64_t> keys{101, 102, 103};
+    auto [ec_start, start_write_cache_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec_start);
+    const std::string &session_id = start_write_cache_info.write_session_id();
+    BlockMask mask = BlockMaskVector({true, true, false});
+    ASSERT_EQ(EC_OK, cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", session_id, mask));
+
+    // 应答丢失后的同一（或子集）掩码重试：已应用，答复成功。
+    ASSERT_EQ(EC_OK, cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", session_id, mask))
+        << "a retry of an applied finish was answered as uncommitted";
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(request_context_.get(),
+                                               "test_instance",
+                                               session_id,
+                                               BlockMaskVector({true, false, false})))
+        << "a retry claiming a subset of the applied successes was answered as uncommitted";
+    // 偏移掩码（前 N 位成功）不超过已生效范围同样幂等。
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", session_id, static_cast<size_t>(2)));
+
+    // 从未登记的会话：无记录可调和，维持既有的失败语义。
+    ASSERT_NE(EC_OK,
+              cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", "no_such_session", BlockMaskVector({true})));
+
+    // 回滚形状：首次 finish 全失败（每个 rank 都没写成；超时回调走的是同一
+    // 提交路径，仅 info 来源不同——位图同样全 false），会话同样被消费。之后
+    // 客户端重试声称有成功位：那些位并未生效，必须维持失败——当成功答复会让
+    // 客户端发布裁决并释放各 rank 的唯一字节。
+    {
+        std::vector<int64_t> rolled_keys{201, 202};
+        auto [ec_rolled, rolled_info] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", rolled_keys, {}, {}, 100000000);
+        ASSERT_EQ(EC_OK, ec_rolled);
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(request_context_.get(),
+                                                   "test_instance",
+                                                   rolled_info.write_session_id(),
+                                                   BlockMaskVector({false, false})));
+        ASSERT_NE(EC_OK,
+                  cache_manager_->FinishWriteCache(request_context_.get(),
+                                                   "test_instance",
+                                                   rolled_info.write_session_id(),
+                                                   BlockMaskVector({true, false})))
+            << "a retry after a rolled-back finish was answered as committed";
+    }
+}
+
 TEST_F(CacheManagerTest, TestGetCacheMeta) {
     auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     ASSERT_EQ(expected,

@@ -1007,21 +1007,6 @@ class ConnectorWorker:
 
         return wrapper
 
-    def _blocks_awaiting_verdict(self, req_id: str) -> Set[int]:
-        """This request's blocks whose cross-rank verdict has not arrived.
-
-        Their bytes are held for the verdict: another rank may still fail, the
-        manager then rejects the block for everyone, and a retry can only
-        republish it from a capture that survived until then. A manager answer
-        that mentions the block (a stale, uncommitted allocation being the
-        usual reason) must not release them early.
-        """
-        with self._verdict_lock:
-            sessions = self._verdict_pending.get(req_id)
-            if not sessions:
-                return set()
-            return {block for blocks in sessions.values() for block in blocks}
-
     def _recheck_pending_verdicts(
         self, pending: "Optional[Dict[str, Dict[str, List[int]]]]" = None
     ) -> None:
@@ -1700,48 +1685,68 @@ class ConnectorWorker:
         # in-flight sessions (a task that has not consumed them yet; on TP the
         # same block key is written by every rank).
         pending = set() if confirmed else self._uris_other_requests_hold(req_id)
-        releasable = []
-        for block in blocks:
-            reported = (block_uris or {}).get(block, ())
-            own = self._block_uris.get(req_id, {}).get(block)
-            candidates = set(reported)
-            if own is not None:
-                candidates.add(own)
-            if block in self._blocks_awaiting_verdict(req_id):
-                # A session of this request is still waiting for its verdict
-                # (see _blocks_awaiting_verdict) -- confirmed or not:
-                # ``confirmed`` only means *this* release's announcement
-                # allocated nothing (a business rejection), not that the
-                # older session's write committed. Releasing the block's
-                # bytes now could leave the retry with nothing once the HBM
-                # window moved. The verdict recheck releases them when it
-                # says committed.
-                continue
-            if not confirmed and not candidates:
-                # The manager returned no location for this block (it was
-                # deduplicated into its "already" mask), so its cache key is
-                # unknown: this release cannot tell whether another request
-                # holds an uncommitted allocation under that key, and dropping
-                # the bytes could leave that writer -- and any retry of ours --
-                # with nothing. Defer it: the verdict recheck (or retirement)
-                # releases once the commit is known.
-                continue
-            if candidates & pending:
-                # A live session of some request still owns this cache key:
-                # the manager's "existing" may be one of its uncommitted
-                # allocations (duplicate StartWriteCache calls are deduplicated
-                # before FinishWriteCache), so dropping these bytes could leave
-                # nobody able to publish the block if that writer fails.
-                logger.debug(
-                    "req:%s block %d: not releasing its capture, %s is still "
-                    "being written by another session",
-                    req_id,
-                    block,
-                    sorted(candidates),
-                )
-                continue
-            releasable.append(block)
-        released = self._captures.release_staged(req_id, releasable)
+        # One section for the verdict check and the release it licenses: the
+        # settle callbacks run the mirror section (see
+        # _settle_session_captures), restaging an older session's bytes and
+        # registering the pending verdict they wait for. With the check and
+        # the release apart, a settle could land exactly between them -- the
+        # release would free the bytes the callback just put back, and once
+        # another rank fails that session's global verdict the retry has lost
+        # the only copy it could republish. Held together, a settle lands
+        # either before the check (its blocks are protected) or after the
+        # release (which freed nothing of its own -- its bytes were still in
+        # flight, and they restage afterwards).
+        with self._verdict_lock:
+            awaiting = {
+                block
+                for session_blocks in (
+                    self._verdict_pending.get(req_id) or {}
+                ).values()
+                for block in session_blocks
+            }
+            releasable = []
+            for block in blocks:
+                reported = (block_uris or {}).get(block, ())
+                own = self._block_uris.get(req_id, {}).get(block)
+                candidates = set(reported)
+                if own is not None:
+                    candidates.add(own)
+                if block in awaiting:
+                    # A session of this request is still waiting for its
+                    # verdict -- confirmed or not: ``confirmed`` only means
+                    # *this* release's announcement allocated nothing (a
+                    # business rejection), not that the older session's write
+                    # committed. Releasing the block's bytes now could leave
+                    # the retry with nothing once the HBM window moved. The
+                    # verdict recheck releases them when it says committed.
+                    continue
+                if not confirmed and not candidates:
+                    # The manager returned no location for this block (it was
+                    # deduplicated into its "already" mask), so its cache key
+                    # is unknown: this release cannot tell whether another
+                    # request holds an uncommitted allocation under that key,
+                    # and dropping the bytes could leave that writer -- and any
+                    # retry of ours -- with nothing. Defer it: the verdict
+                    # recheck (or retirement) releases once the commit is
+                    # known.
+                    continue
+                if candidates & pending:
+                    # A live session of some request still owns this cache key:
+                    # the manager's "existing" may be one of its uncommitted
+                    # allocations (duplicate StartWriteCache calls are
+                    # deduplicated before FinishWriteCache), so dropping these
+                    # bytes could leave nobody able to publish the block if
+                    # that writer fails.
+                    logger.debug(
+                        "req:%s block %d: not releasing its capture, %s is still "
+                        "being written by another session",
+                        req_id,
+                        block,
+                        sorted(candidates),
+                    )
+                    continue
+                releasable.append(block)
+            released = self._captures.release_staged(req_id, releasable)
         if released:
             logger.info(
                 "req:%s released %d captured block slots the manager already "

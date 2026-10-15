@@ -510,6 +510,37 @@ class TestProbeInstanceIdentity(unittest.TestCase):
         )
 
 
+    def test_a_query_resolves_the_pair_before_it_is_sent(self):
+        # A worker's first interaction with the coordinator can be a query,
+        # not an event: a late settle cancels before its done_cb sends the
+        # completion event (and the pending recheck asks before that). The
+        # configured pair here belongs to inst-A, so a query sent straight to
+        # the configured query port would reach A's REP socket -- whose empty
+        # protocol-error reply is indistinguishable from a successful cancel:
+        # B's coordinator would keep the abandoned verdict and A would record
+        # cross-instance state. The query must resolve and validate the pair
+        # first, exactly as an event does.
+        client = TpCoordinatorClient("127.0.0.1", self.base_port, "inst-B")
+        self.addCleanup(client.shutdown)
+        self.server_b.record_verdict("sess-q", [True])
+        self.assertTrue(
+            client.cancel_verdict("sess-q", 0),
+            "a cancel the coordinator acknowledged came back as a failure",
+        )
+        self.assertEqual(
+            self.base_port + 2,
+            client._port,
+            "the query went to a coordinator that is not this instance's",
+        )
+        self.assertTrue(client._endpoint_resolved)
+        # The cancellation reached B: with rank 1's acknowledgement the
+        # verdict is retired, exactly as a retirement expects.
+        self.assertEqual([True], self.server_b.answer_query("sess-q", 1))
+        self.assertNotIn("sess-q", self.server_b._verdicts)
+        # And inst-A never saw the foreign session at all.
+        self.assertEqual({}, self.server_a._verdict_cancels)
+
+
 class TestProbeEngineIdentity(unittest.TestCase):
     """A probe only counts when the answering pair is *this engine's.
 

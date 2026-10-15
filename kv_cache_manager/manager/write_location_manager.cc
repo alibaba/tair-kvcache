@@ -6,6 +6,10 @@ namespace kv_cache_manager {
 
 namespace {
 constexpr int kDefaultExpireLoopSleepTimeUs = 5 * 1000 * 1000; // us
+// 已完成会话应用结果的容量上限：只服务于丢应答后的幂等重试（秒级窗口），
+// 无限增长才需要更大的表。超限丢最旧的一半并出声，被丢会话的重试退化为
+// “会话不存在”的失败答复（客户端保守地当作未提交，保住字节）。
+constexpr size_t kFinishedMaskLimit = 4096;
 };
 
 // caller must hold mux_
@@ -194,6 +198,33 @@ void WriteLocationManager::Put(const std::string &write_session_id,
 
 bool WriteLocationManager::GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info) {
     return session_id_map_.GetAndDelete(write_session_id, location_info);
+}
+
+void WriteLocationManager::PutFinishedMask(const std::string &write_session_id, std::vector<bool> applied_mask) {
+    std::lock_guard<std::mutex> lock(finished_mux_);
+    if (finished_masks_.emplace(write_session_id, std::move(applied_mask)).second) {
+        finished_order_.push_back(write_session_id);
+        if (finished_order_.size() > kFinishedMaskLimit) {
+            const size_t drop = finished_order_.size() - kFinishedMaskLimit / 2;
+            for (size_t i = 0; i < drop; i++) {
+                finished_masks_.erase(finished_order_.front());
+                finished_order_.pop_front();
+            }
+            KVCM_LOG_WARN("Dropped %zu finished write_session records (limit %zu): their retries read \"not found\"",
+                          drop,
+                          kFinishedMaskLimit);
+        }
+    }
+}
+
+bool WriteLocationManager::GetFinishedMask(const std::string &write_session_id, std::vector<bool> &applied_mask) const {
+    std::lock_guard<std::mutex> lock(finished_mux_);
+    auto it = finished_masks_.find(write_session_id);
+    if (it == finished_masks_.end()) {
+        return false;
+    }
+    applied_mask = it->second;
+    return true;
 }
 
 bool WriteLocationManager::SessionIdMap::HasLocationId(const std::string &location_id) const {
