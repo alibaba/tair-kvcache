@@ -15,6 +15,7 @@
 #include "kv_cache_manager/optimizer/index/online/cache_indexer.h"
 #include "kv_cache_manager/optimizer/liteHit/lite_hit.h"
 #include "kv_cache_manager/optimizer/metrics/capacity_history.h"
+#include "kv_cache_manager/optimizer/metrics/capacity_planning_window.h"
 #include "kv_cache_manager/optimizer/metrics/mrc_window.h"
 
 namespace kv_cache_manager {
@@ -52,6 +53,7 @@ struct InstanceState {
     int64_t interval_max_hits = 0;
 
     MrcWindow mrc_window;
+    CapacityPlanningWindow capacity_planning_window;
     CapacityHistory capacity_history;
 };
 
@@ -166,8 +168,9 @@ public:
     // Returns and clears the MRC curve accumulated since the previous call.
     ErrorCode TakeMrcMetrics(std::vector<MrcMetricInfo> &metrics);
 
-    // Drain both planning inputs under the same instance lock; both reporters
-    // must consume this single snapshot. timestamp_ms is wall-clock report time.
+    // Drain ordinary interval inputs, finalize a completed 5m history window
+    // if necessary, and export history under the same lock. Both reporters
+    // consume this result. timestamp_ms is local wall-clock report time.
     ErrorCode TakePlanningMetrics(int64_t timestamp_ms,
                                   std::vector<MrcMetricInfo> &mrc_metrics,
                                   std::vector<ReuseIntervalMetricInfo> &reuse_metrics,
@@ -195,6 +198,8 @@ private:
     bool HasPersistedInstanceInGroup(const std::string &instance_group_name) const;
 
     std::shared_ptr<OptimizerRegistryManager> registry_manager_;
+    // Local receipt clock; replaceable in deterministic window tests.
+    std::function<int64_t()> receipt_time_ms_;
     mutable std::mutex admin_ops_mutex_;
     mutable std::shared_mutex instances_mutex_;
     std::unordered_map<std::string, std::shared_ptr<InstanceState>> instances_;

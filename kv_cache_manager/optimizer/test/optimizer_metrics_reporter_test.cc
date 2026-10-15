@@ -660,6 +660,8 @@ TEST_F(OptimizerMetricsReporterTest, RemoveInstanceMetricsCleansUp) {
 }
 
 TEST_F(OptimizerMetricsReporterTest, PlanningWindowHistoryIsolationAndReset) {
+    constexpr int64_t now = 1000 * CapacityHistory::kStepMs;
+    manager_->receipt_time_ms_ = [] { return now - 60000; };
     ASSERT_EQ(EC_OK, RegisterTestInstance("inst1", {1.0}, 0, true));
     ASSERT_EQ(EC_OK, RegisterTestInstance("inst2", {1.0}, 0, true));
     TraceQueryResult result;
@@ -668,7 +670,6 @@ TEST_F(OptimizerMetricsReporterTest, PlanningWindowHistoryIsolationAndReset) {
     std::vector<MrcMetricInfo> mrc;
     std::vector<ReuseIntervalMetricInfo> reuse;
     std::vector<CapacityHistoryMetricInfo> history;
-    constexpr int64_t now = 1000 * CapacityHistory::kStepMs;
     ASSERT_EQ(EC_OK, manager_->TakePlanningMetrics(now, mrc, reuse, history));
     ASSERT_EQ(2, history.size());
     for (const auto &metric : history) {

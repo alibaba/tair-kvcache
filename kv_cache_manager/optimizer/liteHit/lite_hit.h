@@ -58,7 +58,10 @@ public:
     // input (duplicate keys inside a request) is first defensively merged to
     // its longest prefix per threshold and then encoded monotonically; the
     // projection is never optimistic.
-    RequestFact ProcessRequest(const std::vector<int64_t> &block_keys, int64_t now_ns = 0);
+    // Optional independent accumulator receives the same valid reuse samples.
+    RequestFact ProcessRequest(const std::vector<int64_t> &block_keys,
+                               int64_t now_ns = 0,
+                               ReuseInterval *additional_reuse = nullptr);
 
     void Reset();
 
@@ -114,7 +117,7 @@ private:
     };
 
     RequestFact BuildHitCurve(const std::vector<int64_t> &block_keys) const;
-    void CommitRequest(const std::vector<int64_t> &block_keys, int64_t now_ns);
+    void CommitRequest(const std::vector<int64_t> &block_keys, int64_t now_ns, ReuseInterval *additional_reuse);
     void MaybeCompactPositions();
     uint64_t ReuseDistance(std::size_t previous_position) const;
     // Resident markers at or above the TTL watermark (all markers when no

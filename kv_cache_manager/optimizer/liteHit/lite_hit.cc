@@ -13,7 +13,8 @@ constexpr std::size_t kCompactionSlackPositions = 4096;
 
 LiteHit::LiteHit(uint64_t ttl_ns) : ttl_ns_(ttl_ns) {}
 
-RequestFact LiteHit::ProcessRequest(const std::vector<int64_t> &block_keys, int64_t now_ns) {
+RequestFact
+LiteHit::ProcessRequest(const std::vector<int64_t> &block_keys, int64_t now_ns, ReuseInterval *additional_reuse) {
     if (has_process_timestamp_) {
         now_ns = std::max(now_ns, last_process_timestamp_ns_);
     }
@@ -23,7 +24,7 @@ RequestFact LiteHit::ProcessRequest(const std::vector<int64_t> &block_keys, int6
         AdvanceTtlWatermark(now_ns);
     }
     RequestFact fact = BuildHitCurve(block_keys);
-    CommitRequest(block_keys, now_ns);
+    CommitRequest(block_keys, now_ns, additional_reuse);
     MaybeCompactPositions();
     return fact;
 }
@@ -96,7 +97,7 @@ RequestFact LiteHit::BuildHitCurve(const std::vector<int64_t> &block_keys) const
     return fact;
 }
 
-void LiteHit::CommitRequest(const std::vector<int64_t> &block_keys, int64_t now_ns) {
+void LiteHit::CommitRequest(const std::vector<int64_t> &block_keys, int64_t now_ns, ReuseInterval *additional_reuse) {
     if (block_keys.empty()) {
         return;
     }
@@ -130,6 +131,9 @@ void LiteHit::CommitRequest(const std::vector<int64_t> &block_keys, int64_t now_
         if (previous != last_positions_.end()) {
             if (previous->second.position >= dead_below_position_) {
                 reuse_interval_.Record(static_cast<uint64_t>(now_ns - previous->second.timestamp_ns));
+                if (additional_reuse) {
+                    additional_reuse->Record(static_cast<uint64_t>(now_ns - previous->second.timestamp_ns));
+                }
             }
             fenwick_.Add(previous->second.position, -1);
             last_positions_.erase(previous);

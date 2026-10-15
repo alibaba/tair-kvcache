@@ -100,8 +100,19 @@ Optimizer 侧在现有 JSON 配置中加入订阅配置，不使用额外配置�
 
 Full-attention instances with theoretical analysis enabled keep a bounded,
 in-memory history: 288 fixed five-minute buckets (approximately 24 hours).
-At reporting time `t`, MRC99 and reuse-interval P99 are drained under the same
-Instance lock. The MRC capacity is backfilled across `[t - reuse_p99, t]`;
+History uses MRC99 and reuse-interval P99 from the same **non-overlapping five-minute
+window**, aligned to wall-clock multiples of five minutes. Each window is finalized
+once on the first subsequent request or report; no intermediate 30-second history
+estimate is created. Ordinary MRC and reuse gauges still drain their own reporting
+windows (normally 30 seconds), without clearing the history inputs. One additional
+58 KiB reuse histogram and one sparse MRC accumulator hold the current window;
+there are no rolling slices or per-request sample queues. Percentiles are computed
+from sample counts, not averages of per-report percentiles. Local receipt time
+determines membership; producer timestamps still determine reuse durations.
+Startup contributes only available samples to its first partial window. Empty
+windows create no observations. The completed window is anchored at its end minus
+one millisecond (`t`), even if the report is delayed, and the MRC capacity is
+backfilled across `[t - reuse_p99, t]`;
 overlapping observations take the **maximum**, never the sum. Both interval
 endpoints round down to five-minute bucket starts, so short/zero reuse still
 updates the current bucket. This is a window-level heuristic, not an exact
@@ -114,19 +125,18 @@ zero bytes with a positive timestamp is a valid observation. Slots expire even
 in idle reporting windows. Restart, instance recreation, and ResetStats clear
 the history. Clock regression does not resurrect expired history. New requests
 can revise retained older buckets, but cannot revise history already discarded.
-There is no per-request history update and no external queue/storage dependency.
+There is no per-request history backfill and no external queue/storage dependency.
+Requests accumulate the separate five-minute input distributions and may finalize
+the previous window at a boundary. Reporters export the retained history every
+30 seconds; they do not store extra history points or recalculate it at that rate.
 The core ring uses about 4.5 KiB/Instance; metric registry/tag overhead is extra,
 and these metrics add 576 series per eligible Instance.
 
-Grafana uses two Instant/Table queries against the same exporter identity and
-snapshot time, joins by all identity labels plus `slot`, drops the collection
-time and `slot`, converts the numeric historical milliseconds to a Time field,
-sorts, and prepares multi-frame time series. Filter zero timestamps; never
-average timestamps or independently aggregate values across exporter replicas.
-Each refresh redraws the current snapshot, rather than rewriting samples in
-Prometheus. An Instant query at a historical range end shows the snapshot as of
-that end, not the latest revision; the live panel is intended for a range ending
-at now. Previously unavailable observations are not recovered on deployment.
+The fixed-slot metrics above remain for compatibility. The live revisable panel
+uses immutable-timestamp v2 metrics and Range queries that include later reports,
+so selecting a past display interval does not freeze its revisions at the selected
+end. See [the v2 history query contract](../../docs/design/optimizer_capacity_history_v2.md).
+Previously unavailable observations are not recovered on deployment.
 
 ### 所选时间范围的 token 加权命中率
 

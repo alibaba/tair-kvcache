@@ -1,6 +1,16 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "CapacityPlanningWindowTest",
+    srcs = ["capacity_planning_window_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/liteHit:hit_curve",
+        "//kv_cache_manager/optimizer/metrics:capacity_planning_window",
+    ],
+)
+
+cc_test(
     name = "CapacityHistoryTest",
     srcs = ["capacity_history_test.cc"],
     deps = [

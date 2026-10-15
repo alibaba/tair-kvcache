@@ -23,6 +23,7 @@ struct MrcWindowPoint {
 class MrcWindow {
 public:
     void Record(const RequestFact &fact);
+    uint64_t RequiredBlocks(uint32_t target_basis_points) const { return ComputeRequiredBlocks(target_basis_points); }
     std::vector<MrcWindowPoint> Take();
     void Reset();
 

@@ -16,7 +16,8 @@
 namespace kv_cache_manager {
 
 OnlineOptimizerManager::OnlineOptimizerManager(std::shared_ptr<OptimizerRegistryManager> registry_manager)
-    : registry_manager_(std::move(registry_manager)) {}
+    : registry_manager_(std::move(registry_manager))
+    , receipt_time_ms_([] { return static_cast<int64_t>(TimestampUtil::GetCurrentTimeUs() / 1000); }) {}
 
 namespace {
 
@@ -60,6 +61,15 @@ int64_t SaturatingMultiplyToInt64(uint64_t lhs, uint64_t rhs) {
         return std::numeric_limits<int64_t>::max();
     }
     return static_cast<int64_t>(lhs * rhs);
+}
+
+void CompleteCapacityPlanningWindow(InstanceState &state, int64_t now_ms) {
+    const auto completed = state.capacity_planning_window.Complete(now_ms);
+    if (completed && completed->reuse.count > 0) {
+        const auto bytes =
+            SaturatingMultiplyToInt64(completed->required_blocks, static_cast<uint64_t>(state.size_full));
+        state.capacity_history.Update(completed->timestamp_ms, completed->reuse.p99_ns, bytes, true);
+    }
 }
 
 } // namespace
@@ -494,7 +504,13 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
             return EC_BADARGS;
         }
 
-        const RequestFact fact = state->lite_hit->ProcessRequest(normalized.block_keys, replay_timestamp_ns);
+        ReuseInterval *planning_reuse = nullptr;
+        if (state->instance_group->enable_theoretical_max_cache()) {
+            CompleteCapacityPlanningWindow(*state, receipt_time_ms_());
+            planning_reuse = state->capacity_planning_window.reuse();
+        }
+        const RequestFact fact =
+            state->lite_hit->ProcessRequest(normalized.block_keys, replay_timestamp_ns, planning_reuse);
         result.input_token_len = ClampToInt64(normalized.input_token_len);
 
         const uint64_t block_size = static_cast<uint64_t>(state->instance_info->block_size());
@@ -521,6 +537,7 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
         if (state->instance_group->enable_theoretical_max_cache()) {
             const uint64_t max_hits = HitCurveProjector::ProjectInfinite(fact);
             state->mrc_window.Record(fact);
+            state->capacity_planning_window.RecordFact(fact);
             result.max_hit_count = ClampToInt64(max_hits);
             result.max_hit_rate =
                 normalized.input_token_len == 0 ? 0.0 : static_cast<double>(max_hits * block_size) / token_denominator;
@@ -784,16 +801,15 @@ ErrorCode OnlineOptimizerManager::TakePlanningMetrics(int64_t timestamp_ms,
         if (!state->instance_group->enable_theoretical_max_cache()) {
             continue;
         }
-        int64_t p99_capacity = -1;
         for (const auto &point : state->mrc_window.Take()) {
             const int64_t bytes =
                 SaturatingMultiplyToInt64(point.required_blocks, static_cast<uint64_t>(state->size_full));
             mrc_metrics.push_back({id, group, point.target_basis_points, bytes});
-            if (point.target_basis_points == 9900) {
-                p99_capacity = bytes;
-            }
         }
-        state->capacity_history.Update(timestamp_ms, reuse.p99_ns, p99_capacity, reuse.count > 0);
+        // Ordinary gauges still drain every report. History updates only once
+        // per completed five-minute window; other reports merely prune/export.
+        CompleteCapacityPlanningWindow(*state, timestamp_ms);
+        state->capacity_history.Update(timestamp_ms, 0, 0, false);
         history_metrics.push_back(
             {id, group, state->capacity_history.points(), state->capacity_history.generation(), timestamp_ms});
     }
@@ -843,6 +859,7 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     std::fill(state->interval_hits_per_capacity.begin(), state->interval_hits_per_capacity.end(), 0);
     state->interval_max_hits = 0;
     state->mrc_window.Reset();
+    state->capacity_planning_window.Reset();
     state->capacity_history.Reset();
     KVCM_LOG_INFO("ResetStats OK: instance[%s]", instance_id.c_str());
     return EC_OK;

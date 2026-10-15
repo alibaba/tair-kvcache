@@ -1,9 +1,24 @@
 # Revisable capacity history metrics v2
 
-The capacity estimate itself is unchanged: every reporting window applies MRC99
-to the five-minute buckets overlapping `[now - reuse_p99, now]`, retaining the
-maximum within one analyzer generation. This is a window-level estimate, not
+The capacity estimate applies MRC99 to the five-minute buckets overlapping
+`[now - reuse_p99, now]`, retaining the maximum within one analyzer generation.
+History's MRC99 and reuse P99 come from a separate **non-overlapping five-minute**
+sample window aligned to wall-clock five-minute boundaries. The first request or
+report after a boundary finalizes the previous window exactly once. Its result
+is anchored at the completed window end minus one millisecond, not the delayed
+report timestamp. There is only one additional 58 KiB reuse histogram and one
+sparse MRC accumulator, cleared after finalization: no rolling slices, per-request
+sample queue, or 30-second history estimates. Ordinary MRC/reuse gauges and history
+exports still run every reporting interval (normally 30 seconds). Percentiles use
+raw histogram counts and hit-curve deltas, never averages of per-report percentiles.
+Local receipt time determines membership; producer timestamps determine reuse
+duration. Startup uses available samples in the first partial window, empty windows
+do not create observations, and delayed reports do not fabricate idle-gap points.
+Reset clears the inputs along with history. This is a window-level estimate, not
 an exact reconstruction of cache occupancy.
+
+This source-window change requires an optimizer binary rollout; changing the
+dashboard alone cannot apply it. Previously collected history is not recomputed.
 
 ## Stable identity and lifecycle
 
@@ -35,13 +50,40 @@ the application tag cache for these changing timestamp tags.
 
 ## Query contract
 
-Evaluate a range query every 24 hours using `last_over_time(metric[24h])` against
-stored samples, and an additional instant query at the selected range end with
-the same lookback. The range query covers contiguous full windows (not sparse
-snapshots); the instant query covers the final partial window. This avoids a
-backend's per-window duration limit without losing intermediate revisions. Keep
-the evaluation time when joining capacity and observed-time results, as well as
-all identity labels. Filter historical timestamps to the displayed range,
+Use Range queries throughout. The Grafana datasource rejects fractional-second
+Instant timestamps and its lookback allowance differs from the CLI gateway's;
+a successful CLI replay alone does not establish browser compatibility.
+
+The display interval is **not** an as-of revision cutoff. A bucket at `h` may be
+revised by reports until `h + 24h`, so reading reports only through the selected
+display end is incorrect. Read the subsequent stored reports as well, including
+reports from generations/processes that have already exited.
+
+The deployed query evaluates hourly and reads 26 contiguous one-hour windows:
+`max_over_time(metric[1h] offset -Nh)` for `N = 0..25`. These cover
+`[evaluation - 1h, evaluation + 25h]`. Negative offsets read later **existing**
+reports; they do not fabricate future samples. For each displayed five-minute
+bucket `h`, the hourly evaluation `floor(h / 1h) * 1h` covers the entire 24h
+revision lifetime plus at least five minutes of collection-boundary margin.
+The hourly query step does not change the plotted five-minute bucket resolution.
+
+Capacity is nondecreasing within a full immutable identity including
+`history_generation`; `observed_ms` is also nondecreasing. Therefore each
+identity's window maximum equals its final value. This invariant is essential:
+**never maximize capacity across generations**. A reset can correctly produce a
+lower capacity or zero, and the latest report must win.
+
+To keep the query planner's expanded SQL bounded, combine at most four adjacent
+windows per query with `or`, newest window first. Query all seven groups, four
+shards, and both metrics (56 targets). Give capacity and observed-time targets in
+the same group the same `alias("revision_window_N", ...)`. Preserve this alias
+as `__name__` during the table merge: it is part of the pairing key and prevents
+values from different revision windows being incorrectly paired. `metrics()`
+with repeated selectors and different offsets was not reliable in testing and
+must not replace this grouping without validating its actual semantics.
+
+Keep evaluation time, window alias, and all immutable identity labels when
+joining capacity and observed-time results. Filter historical timestamps to the displayed range,
 sort by `observed_ms`, and keep the latest valid pair per logical instance and
 historical timestamp. Query all four shards; a failed shard must remain an error,
 not be treated as an empty result. Check backend series limits separately from
@@ -49,10 +91,15 @@ the UI's maximum data point setting. Do not apply a sparse subquery resolution
 to obtain the last sample. Correctness is bounded by collected samples and the
 backend's raw/rollup retention; the dashboard cannot recover uncollected data.
 
-Both query forms scan historical storage, including samples from processes that
-have exited and buckets older than the current in-memory ring. The range-query
-step must not exceed its lookback. Grafana converts
-the immutable historical label into the plot time rather than using query time.
+Use an actual query step of at most one hour; the current panel has a one-hour
+minimum and `maxDataPoints = 10000`. If Grafana increases the step beyond one
+hour, the fixed forward coverage needs to be redesigned rather than silently
+claimed complete. The boundary margin assumes prompt collection and aligned
+clocks; arbitrary late ingestion is not covered. Correctness is also bounded by
+monitoring retention, backend series/response limits, and actual collected
+samples. Grafana converts the immutable historical label into plot time; the
+selected display end is used only for this final filtering, not as the latest
+allowed report timestamp.
 
 Legacy data has no immutable timestamp label and must not be silently merged as
 if it were v2. Retain the legacy panel for pre-migration inspection, and mark the

@@ -1,6 +1,12 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "capacity_planning_window",
+    hdrs = ["capacity_planning_window.h"],
+    deps = [":mrc_window", ":reuse_interval"],
+)
+
+cc_library(
     name = "capacity_history",
     hdrs = ["capacity_history.h"],
 )

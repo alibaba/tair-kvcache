@@ -372,6 +372,75 @@ TEST_F(OnlineOptimizerManagerTest, TakeIntervalMetrics) {
     EXPECT_TRUE(std::isnan(metrics[0].per_capacity_hit_rates[0].hit_rate));
 }
 
+TEST_F(OnlineOptimizerManagerTest, CapacityHistoryFinalizesEveryFiveMinutesAndKeepsOrdinaryGauges) {
+    ASSERT_EQ(EC_OK, RegisterGroup(MakeGroup("g1", {1.0}, "lru", true)));
+    RegisterInstanceResult registered;
+    ASSERT_EQ(EC_OK, mgr_->RegisterInstance(MakeInfo("i1", "g1", 16, 0), registered));
+    ASSERT_EQ(EC_OK, mgr_->RegisterInstance(MakeInfo("i2", "g1", 16, 0), registered));
+    constexpr int64_t start = 1000 * CapacityHistory::kStepMs;
+    int64_t receipt_ms = start;
+    mgr_->receipt_time_ms_ = [&] { return receipt_ms; };
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 0, 1000000000, result));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 0, 601000000000, result));
+    std::vector<MrcMetricInfo> mrc;
+    std::vector<ReuseIntervalMetricInfo> reuse;
+    std::vector<CapacityHistoryMetricInfo> history;
+    for (int report = 1; report < 10; ++report) {
+        ASSERT_EQ(EC_OK, mgr_->TakePlanningMetrics(start + report * 30000, mrc, reuse, history));
+        for (const auto &metric : reuse) {
+            EXPECT_EQ(report == 1 && metric.instance_id == "i1" ? 2 : 0, metric.stats.count);
+        }
+        for (const auto &metric : history) {
+            for (const auto &point : metric.points) {
+                EXPECT_EQ(0, point.timestamp_ms); // No new 30s history estimates.
+            }
+        }
+    }
+    ASSERT_EQ(EC_OK, mgr_->TakePlanningMetrics(start + 300000, mrc, reuse, history));
+    for (const auto &metric : history) {
+        const auto &point = metric.points[1000 % CapacityHistory::kSlots];
+        EXPECT_EQ(metric.instance_id == "i1" ? start : 0, point.timestamp_ms);
+        EXPECT_EQ(metric.instance_id == "i1" ? registered.size_full * 2 : 0, point.capacity_bytes);
+    }
+    ASSERT_EQ(EC_OK, mgr_->TakePlanningMetrics(start + 600000, mrc, reuse, history));
+    for (const auto &metric : history) {
+        EXPECT_EQ(0, metric.points[1001 % CapacityHistory::kSlots].timestamp_ms); // Empty window.
+    }
+    ASSERT_EQ(EC_OK, mgr_->ResetStats("i1"));
+    ASSERT_EQ(EC_OK, mgr_->TakePlanningMetrics(start + 900000, mrc, reuse, history));
+    for (const auto &metric : history) {
+        for (const auto &point : metric.points) {
+            EXPECT_EQ(0, point.timestamp_ms);
+        }
+    }
+}
+
+TEST_F(OnlineOptimizerManagerTest, CapacityHistoryClosesOnRequestBeforeRecordingNextWindow) {
+    ASSERT_EQ(EC_OK, RegisterGroup(MakeGroup("g1", {1.0}, "lru", true)));
+    RegisterInstanceResult registered;
+    ASSERT_EQ(EC_OK, mgr_->RegisterInstance(MakeInfo("i1", "g1", 16, 0), registered));
+    constexpr int64_t start = 1000 * CapacityHistory::kStepMs;
+    int64_t receipt_ms = start;
+    mgr_->receipt_time_ms_ = [&] { return receipt_ms; };
+    TraceQueryResult result;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1}, 0, 1000000000, result));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1}, 0, 2000000000, result));
+    std::vector<MrcMetricInfo> mrc;
+    std::vector<ReuseIntervalMetricInfo> reuse;
+    std::vector<CapacityHistoryMetricInfo> history;
+    mgr_->TakeReuseIntervalMetrics(reuse);
+    mgr_->TakeMrcMetrics(mrc);
+    receipt_ms += 300000;
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {2}, 0, 301000000000, result));
+    ASSERT_EQ(EC_OK, mgr_->TakePlanningMetrics(receipt_ms, mrc, reuse, history));
+    ASSERT_EQ(1, history.size());
+    EXPECT_EQ(registered.size_full, history[0].points[1000 % CapacityHistory::kSlots].capacity_bytes);
+    EXPECT_EQ(0, history[0].points[1001 % CapacityHistory::kSlots].timestamp_ms);
+    mgr_->TakePlanningMetrics(receipt_ms + 300000, mrc, reuse, history);
+    EXPECT_EQ(0, history[0].points[1001 % CapacityHistory::kSlots].timestamp_ms); // New cold-only window.
+}
+
 TEST_F(OnlineOptimizerManagerTest, FullAttentionMrcUsesReportingWindows) {
     auto info = MakeInfo("i1", "g1", 4, 0);
     auto group = MakeGroup("g1", {FullCapacityGb(20)}, "lru", true);
