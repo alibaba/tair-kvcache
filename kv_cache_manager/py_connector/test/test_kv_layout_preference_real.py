@@ -24,8 +24,10 @@ Run it once per dual-anchor era:
     kvtest unit <worktree> --env vllm-0.31.0
 
 Deliberately NOT dependent on ``vllm_stubs``: the whole point is the real class
-tree. Skips itself when vLLM or the connector is unavailable (open-source CI) or
-when the stubs already replaced the module space in this process.
+tree. Skips itself when the *top-level* vLLM or torch package is genuinely
+absent (open-source CI) or when the stubs already replaced the module space in
+this process; an ImportError from inside an installed engine is a regression
+and fails the suite (see ``_missing_engine``).
 """
 
 import importlib
@@ -34,13 +36,38 @@ from types import SimpleNamespace
 from typing import Any, Optional
 from unittest import mock
 
+#: Where vLLM itself is *absent* (open-source CI), the suite skips. Only the
+#: engine may be missing: an ImportError raised from *inside* a real torch or
+#: vLLM package -- a renamed symbol, a moved module, a broken wheel -- is a
+#: regression against this era, and recording it as an unavailable environment
+#: would make the dual-era job report green on a broken install. The same
+#: contract ``test_spec_gate_real._missing_engine`` enforces.
+_MISSING_ENGINE_MODULES = ("vllm", "torch")
+
+
+def _missing_engine(exc: ImportError) -> bool:
+    """Is this error 'vLLM is not installed here' rather than a regression?
+
+    True only when the *top-level* vLLM or torch package is missing: a broken
+    wheel that cannot load an internal module (vllm._C, torch._C, ...) is a
+    regression too, and skipping the dual-era suite for it would be exactly
+    the false green this guard exists to prevent. Everything else -- a nested
+    module, a non-ModuleNotFoundError -- must fail the run.
+    """
+    if not isinstance(exc, ModuleNotFoundError):
+        return False
+    return exc.name in _MISSING_ENGINE_MODULES
+
+
 try:
     import torch
     import vllm
-except ImportError as exc:  # pragma: no cover - environment dependent
+except ImportError as _engine_import_error:  # pragma: no cover - environment dependent
+    if not _missing_engine(_engine_import_error):
+        raise
     torch = None  # ty: ignore[invalid-assignment]
     vllm = None  # ty: ignore[invalid-assignment]
-    _IMPORT_ERROR = str(exc)
+    _IMPORT_ERROR = f"real vLLM not installed here ({_engine_import_error})"
 else:
     _IMPORT_ERROR = ""
 
@@ -65,7 +92,7 @@ CONNECTOR_MODULE = "kv_cache_manager.py_connector.vllm.v1_connector"
 
 def _skip_reason() -> str:
     if _IMPORT_ERROR:
-        return f"real vLLM not importable ({_IMPORT_ERROR})"
+        return _IMPORT_ERROR
     if getattr(vllm, "_kvcm_test_stub", False) or "vllm_stubs" in str(
         getattr(vllm, "__file__", "")
     ):
