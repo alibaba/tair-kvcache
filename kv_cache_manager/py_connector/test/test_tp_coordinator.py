@@ -509,5 +509,64 @@ class TestProbeInstanceIdentity(unittest.TestCase):
         )
 
 
+class TestRequestFailedAggregation(unittest.TestCase):
+    """A request-level load failure is ORed across the ranks, once per load.
+
+    Block ids cannot address a multi-table block layout upstream, so a
+    windowed multi-group instance marks the *request* failed instead (see
+    create_load_done_callback): any rank's broken blocks fail the request,
+    and the mark is handed over exactly once with the load's completion."""
+
+    def setUp(self):
+        self.port = _find_free_port()
+        self.server = TpCoordinatorServer("127.0.0.1", self.port, 2, lambda *a: None)
+        _wait_for_server(self.server)
+        self.client = TpCoordinatorClient("127.0.0.1", self.port)
+
+    def _send(self, tp_rank, request_failed):
+        msg = CoordinateMessage(
+            time.time(),
+            LoadBlockFinishedEvent(
+                request_id="req-f",
+                tp_rank=tp_rank,
+                epoch=11,
+                request_failed=request_failed,
+            ),
+        )
+        self.client.send(CoordinateMsgSerializer.dumps(msg))
+
+    def _poll_failed_requests(self, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            failed = self.server.get_failed_loading_requests()
+            if failed:
+                return failed
+            time.sleep(0.01)
+        return set()
+
+    def test_one_failed_rank_fails_the_request(self):
+        # Rank 0's blocks failed, rank 1's succeeded: the request is failed
+        # (the AND a load needs is broken by any rank).
+        self._send(0, True)
+        self._send(1, False)
+        self.assertEqual(self._poll_failed_requests(), {"req-f"})
+        # Handed over once: a later poll finds nothing more.
+        self.assertEqual(set(), self.server.get_failed_loading_requests())
+
+    def test_all_success_reports_no_failed_request(self):
+        self._send(0, False)
+        self._send(1, False)
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if self.server.get_finished_tasks()[1]:
+                break
+            time.sleep(0.01)
+        self.assertEqual(set(), self.server.get_failed_loading_requests())
+
+    def tearDown(self):
+        self.client.shutdown()
+        self.server.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()

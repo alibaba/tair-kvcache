@@ -160,10 +160,21 @@ def _install_stubs():
     class SupportsHMA:
         pass
 
+    class KVConnectorTransferResults:
+        """Mirrors vLLM >= 0.30's request-level receive-failure carrier (the
+        real one is a dataclass with three set fields)."""
+
+        def __init__(self, finished_sending=None, finished_recving=None,
+                     failed_recving=None):
+            self.finished_sending = set(finished_sending or ())
+            self.finished_recving = set(finished_recving or ())
+            self.failed_recving = set(failed_recving or ())
+
     base.KVConnectorBase_V1 = KVConnectorBase_V1
     base.KVConnectorMetadata = KVConnectorMetadata
     base.KVConnectorRole = KVConnectorRole
     base.SupportsHMA = SupportsHMA
+    base.KVConnectorTransferResults = KVConnectorTransferResults
 
     utils = _module("vllm.utils")
     torch_utils = _module("vllm.utils.torch_utils")
@@ -855,6 +866,11 @@ def make_connector(
         conn._vllm_block_size,  # ty: ignore[unresolved-attribute]
     )
     conn._num_groups = len(conn._group_metas)
+    # Mirrors the real __init__ (start_load_kv reads it to decide how a
+    # failed load may be reported).
+    conn._has_windowed_groups = any(  # ty: ignore[unresolved-attribute]
+        getattr(meta, "retention", None) is not None for meta in conn._group_metas
+    )
     conn._state_group_idxs = [  # ty: ignore[unresolved-attribute]
         m.group_idx for m in conn._group_metas if isinstance(m, StateGroupMeta)
     ]

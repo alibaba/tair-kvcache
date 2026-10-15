@@ -167,6 +167,56 @@ class TestLoadDoneCallback(unittest.TestCase):
         self.assertEqual(evt.type, "LoadBlockFinishedEvent")
         self.assertEqual(evt.failed_block_idxs, [])
 
+    def test_request_level_failure_marking(self):
+        # A windowed multi-group load cannot report block ids either, but for
+        # that shape swallowing is not acceptable (the connector itself
+        # granted the external hit): the request is marked failed instead and
+        # travels to the coordinator like any load verdict.
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req",
+            0,
+            epoch=1,
+            block_ids=[],
+            num_blocks=2,
+            report_failures=False,
+            report_request_failures=True,
+        )
+        cb([False, True])
+        evt = _sent_event(dtm)
+        self.assertEqual(evt.type, "LoadBlockFinishedEvent")
+        self.assertEqual(evt.failed_block_idxs, [])
+        self.assertTrue(evt.request_failed)
+
+    def test_request_level_failure_not_marked_on_success(self):
+        # All-success (or all-abstain) loads never mark the request.
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req",
+            0,
+            epoch=1,
+            block_ids=[],
+            num_blocks=2,
+            report_failures=False,
+            report_request_failures=True,
+        )
+        cb([True, None])
+        evt = _sent_event(dtm)
+        self.assertFalse(evt.request_failed)
+        self.assertEqual(evt.failed_block_idxs, [])
+
+    def test_request_level_failure_off_keeps_the_legacy_swallow(self):
+        # A non-windowed multi-group model (the legacy hybrid shape) keeps the
+        # swallowed-and-logged behaviour: no request mark, no block ids.
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req", 0, epoch=1, block_ids=[], num_blocks=2, report_failures=False
+        )
+        cb([False, True])
+        evt = _sent_event(dtm)
+        self.assertFalse(evt.request_failed)
+        self.assertEqual(evt.failed_block_idxs, [])
+
 
 class TestNullStateBlocks(unittest.TestCase):
     """Mamba 'align' mode: vLLM materializes a recurrent state only at segment

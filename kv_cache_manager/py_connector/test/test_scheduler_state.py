@@ -977,6 +977,86 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         self.assertEqual(args[3], [])
         self.assertFalse(kwargs["report_failures"])
 
+    def test_windowed_multigroup_shape_reports_the_request(self):
+        # The shape this connector made dangerous: windowed groups on a
+        # multi-table instance. Block ids cannot be reported (the upstream
+        # unpack), and swallowing would decode on a hole -- so the load
+        # failure travels as the request itself.
+        conn = make_connector(manager_block_size=self.MBS, num_groups=2)
+        conn._has_windowed_groups = True
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="r0",
+                manager_block_idxes=[0],
+                need_load_locations=[{"location_specs": []}],
+                all_block_ids=[[10], [20]],
+            )
+        )
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [])
+        self.assertFalse(kwargs["report_failures"])
+        self.assertTrue(kwargs["report_request_failures"])
+
+    def test_windowed_single_group_still_reports_block_ids(self):
+        # One block table keeps the block-id report (upstream recovery works
+        # there), even on a windowed instance -- the request-level path is
+        # only for the unreportable shape.
+        conn = make_connector(manager_block_size=self.MBS)
+        conn._has_windowed_groups = True
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="r0",
+                manager_block_idxes=[0, 1],
+                need_load_locations=[{"location_specs": []}] * 2,
+                all_block_ids=[[10, 11]],
+            )
+        )
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [10, 11])
+        self.assertTrue(kwargs["report_failures"])
+        self.assertFalse(kwargs["report_request_failures"])
+
+    def test_multigroup_without_window_keeps_the_legacy_swallow(self):
+        # The non-windowed hybrid (mamba + full attention) keeps the
+        # swallowed-and-logged contract its e2e pinned: no block ids, no
+        # request mark.
+        conn = make_connector(
+            manager_block_size=self.MBS, num_groups=1, num_state_groups=1
+        )
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="r0",
+                manager_block_idxes=[0],
+                need_load_locations=[{"location_specs": []}],
+                all_block_ids=[[10], [20]],
+            )
+        )
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [])
+        self.assertFalse(kwargs["report_failures"])
+        self.assertFalse(kwargs["report_request_failures"])
+
     def test_lone_state_group_refuses_to_report(self):
         # A single vLLM block table that is not attention (pure mamba): the
         # token-granular recovery math upstream cannot consume state block

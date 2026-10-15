@@ -31,6 +31,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 
 try:
+    # vLLM >= 0.30: the request-level receive-failure path. A connector on
+    # those eras reports a request whose (multi-group, unreportable-by-block)
+    # load failed via KVConnectorTransferResults.failed_recving, and vLLM
+    # recomputes or fails it (kv_load_failure_policy). Older eras have no
+    # such path: there the same state fails closed instead (get_finished).
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorTransferResults,
+    )
+except ImportError:  # pragma: no cover - vllm <= 0.29
+    KVConnectorTransferResults = None  # ty: ignore[invalid-assignment]
+
+try:
     # vllm >= v0.11.1
     from vllm.utils.torch_utils import get_kv_cache_torch_dtype
     from vllm.utils.network_utils import get_ip
@@ -393,10 +405,51 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> Tuple[Optional[set], Optional[set]]:
         assert self.connector_worker is not None
         # See start_load_kv: the bound metadata is always our subclass.
-        return self.connector_worker.get_finished(
+        result = self.connector_worker.get_finished(
             finished_req_ids,
             self._get_connector_metadata(),  # ty: ignore[invalid-argument-type]
         )
+        if KVConnectorTransferResults is None:
+            # No request-level failure path exists on this vLLM era, so a
+            # windowed multi-group load that failed cannot be told to anyone:
+            # vLLM would resume the request on the partially loaded KV and
+            # decode on a hole. Fail closed -- a traceback beats silently
+            # corrupt output (the same rule update_state_after_alloc applies
+            # to its unresolvable state). get_transfer_results (the >= 0.30
+            # branch below) reports the failure instead of raising.
+            failed = self.connector_worker.drain_failed_loading_requests()
+            if failed:
+                raise RuntimeError(
+                    "TairKvCacheConnector: the external KV load of request(s) "
+                    f"{sorted(failed)} failed on a windowed multi-group model, "
+                    "and this vLLM version has no request-level load-failure "
+                    "path (KVConnectorOutput.failed_recving arrived in "
+                    "v0.30); resuming the request would decode on incomplete "
+                    "KV. Upgrade to vLLM >= 0.30, where the request is "
+                    "recomputed or failed per kv_load_failure_policy"
+                )
+        return result
+
+    if KVConnectorTransferResults is not None:
+
+        def get_transfer_results(
+            self, finished_req_ids: set
+        ) -> "KVConnectorTransferResults":
+            """Same snapshot as get_finished, plus the request-level failures.
+
+            A windowed multi-group load that failed is reported here so vLLM
+            recomputes (or fails) the request instead of decoding on the
+            partially loaded KV; the failed request is also in
+            finished_recving, which is what releases it from its remote-KV
+            wait (see _handle_failed_recving).
+            """
+            finished_sending, finished_recving = self.get_finished(finished_req_ids)
+            assert self.connector_worker is not None
+            return KVConnectorTransferResults(
+                finished_sending=set(finished_sending or ()),
+                finished_recving=set(finished_recving or ()),
+                failed_recving=self.connector_worker.drain_failed_loading_requests(),
+            )
 
     def get_block_ids_with_load_errors(self) -> set:
         assert self.connector_worker is not None

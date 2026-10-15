@@ -35,6 +35,11 @@ class LoadBlockFinishedEvent:
     tp_rank: int
     epoch: int
     failed_block_idxs: List[int] = field(default_factory=list)
+    # This rank's load had explicitly failed blocks on a shape whose failures
+    # cannot travel as block ids (see create_load_done_callback): the request
+    # itself is marked failed, and the coordinator turns the per-rank marks
+    # into one entry -- any rank's failure fails the request.
+    request_failed: bool = False
     type: str = "LoadBlockFinishedEvent"
 
 
@@ -115,12 +120,19 @@ class LoadContext:
     # then never reported to vLLM, which went on to compute on unwritten
     # KV blocks.
     failed_block_idxs: List[int] = field(default_factory=list)
+    # OR of the per-rank request-level failure marks (see
+    # LoadBlockFinishedEvent.request_failed), for shapes that cannot report
+    # block ids: one rank's broken blocks fail the request for everyone.
+    request_failed: bool = False
 
-    def add_new_rank(self, tp_rank: int, failed_block_idxs: List[int]) -> None:
+    def add_new_rank(
+        self, tp_rank: int, failed_block_idxs: List[int], request_failed: bool = False
+    ) -> None:
         if tp_rank in self.finished_rank:
             return
         self.finished_rank.add(tp_rank)
         self.failed_block_idxs.extend(failed_block_idxs)
+        self.request_failed = self.request_failed or request_failed
 
     def get_size(self) -> int:
         return len(self.finished_rank)
@@ -180,6 +192,10 @@ class TpCoordinatorServer:
 
         self._finished_loading = []
         self._failed_loading_block_idxs = []
+        # Requests whose load failed at request granularity (see
+        # LoadBlockFinishedEvent.request_failed): failures that cannot travel
+        # as block ids travel as request ids instead.
+        self._failed_loading_requests = []
         self._finished_loading_lock = threading.Lock()
         self._finished_saving = []
         self._finished_saving_lock = threading.Lock()
@@ -357,12 +373,16 @@ class TpCoordinatorServer:
                 if load_id not in running_load:
                     running_load[load_id] = LoadContext()
                 load_ctx = running_load[load_id]
-                load_ctx.add_new_rank(content.tp_rank, content.failed_block_idxs)
+                load_ctx.add_new_rank(
+                    content.tp_rank, content.failed_block_idxs, content.request_failed
+                )
                 if load_ctx.get_size() == self._tp_world_size:
                     running_load.pop(load_id)
 
                     self._finished_loading_lock.acquire()
                     self._failed_loading_block_idxs.extend(load_ctx.failed_block_idxs)
+                    if load_ctx.request_failed:
+                        self._failed_loading_requests.append(content.request_id)
                     self._finished_loading.append(content.request_id)
                     self._finished_loading_lock.release()
                     # logger.warning("[coordinator] all rank finished load_blocks_finished %s", load_id)
@@ -548,6 +568,22 @@ class TpCoordinatorServer:
         self._failed_loading_block_idxs = []
         self._finished_loading_lock.release()
         return set(failed_loading_block_idxs)
+
+    def get_failed_loading_requests(self) -> Set[str]:
+        """Requests whose load failed at request granularity, once.
+
+        Block ids cannot address a multi-table block layout upstream (see
+        create_load_done_callback), so a windowed multi-group instance marks
+        the *request* failed instead; the coordinator holds the mark until
+        every rank reported and hands it over here, exactly once.
+        """
+        if len(self._failed_loading_requests) == 0:
+            return set()
+        self._finished_loading_lock.acquire()
+        failed_loading_requests = self._failed_loading_requests.copy()
+        self._failed_loading_requests = []
+        self._finished_loading_lock.release()
+        return set(failed_loading_requests)
 
 
 class TpCoordinatorClient:

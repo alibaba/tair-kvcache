@@ -1494,6 +1494,7 @@ class DataTransferManager:
         block_ids: List[int],
         num_blocks: int,
         report_failures: bool = True,
+        report_request_failures: bool = False,
     ) -> Callable[[List[Optional[bool]]], None]:
         """A manager block is loaded only if every group that had data for it
         succeeded -- and it is *invalid* only when one of them failed.
@@ -1514,7 +1515,18 @@ class DataTransferManager:
         the scheduler, so hybrid connectors pass report_failures=False: the
         failure is logged, vLLM keeps the partially loaded KV, and the request
         may produce corrupt output -- the contained alternative to an
-        engine-wide crash. See start_load_kv for the full trade-off."""
+        engine-wide crash. See start_load_kv for the full trade-off.
+
+        ``report_request_failures`` is the escape from that trade-off for the
+        shape this connector itself made dangerous -- a *windowed* multi-group
+        instance, whose external hits this connector grants: the failed
+        request is reported at request granularity (vLLM >= 0.30 consumes it
+        as KVConnectorOutput.failed_recving and recomputes or fails the
+        request; older vLLM has no such path and the connector fails closed
+        there, see v1_connector.get_finished). Non-windowed hybrid models keep
+        the contained legacy behaviour: their swallow predates this connector
+        and its e2e contract pins it.
+        """
 
         def cb(flat: List[Optional[bool]]) -> None:
             merged = [None] * num_blocks
@@ -1528,12 +1540,26 @@ class DataTransferManager:
             # skip, not a hole in the request's KV.
             broken = [ok for ok in merged if ok is False]
             failed = []
+            request_failed = False
             if report_failures:
                 failed = [
                     block_ids[i]
                     for i in range(min(num_blocks, len(block_ids)))
                     if merged[i] is False
                 ]
+            elif report_request_failures and broken:
+                # The block-id report would crash upstream's single-table
+                # unpack, so the failure travels as the request itself: the
+                # coordinator ORs this rank's mark with the other ranks' and
+                # the worker surfaces one failed request per load.
+                request_failed = True
+                logger.warning(
+                    "load failed for %d/%d blocks of req %s (windowed "
+                    "multi-group: reporting the request, not block ids)",
+                    len(broken),
+                    num_blocks,
+                    req_id,
+                )
             elif broken:
                 logger.warning(
                     "load failed for %d/%d blocks of req %s (hybrid: "
@@ -1549,6 +1575,7 @@ class DataTransferManager:
                     tp_rank=tp_rank,
                     epoch=epoch,
                     failed_block_idxs=failed,
+                    request_failed=request_failed,
                 ),
             )
             self._coordinator_client.send(CoordinateMsgSerializer.dumps(msg))

@@ -1254,17 +1254,30 @@ class ConnectorWorker:
             # "TODO (davidb): add support for hybrid memory allocator" -- so
             # for multi-group models (hybrid attn+mamba, or any model whose
             # vLLM block table has more than one entry -- skipped EAGLE/MTP
-            # drafter groups still count) a failed load CANNOT be reported
-            # and is only logged; vLLM then decodes from whatever bytes the
-            # partial load left in the paged cache, which can produce corrupt
-            # output. Gate on the block-table shape (all_block_ids is the
+            # drafter groups still count) a failed load CANNOT be reported as
+            # block ids. Gate on the block-table shape (all_block_ids is the
             # snapshot of kv_cache_manager.get_block_ids -- the very table
             # the recovery path unpacks), not on is_hybrid: a multi-group
             # attention-only model is not hybrid yet still breaks the unpack.
-            # Remove the gating once upstream supports multi-group
-            # invalid-block recovery.
+            #
+            # Accepting windowed specs is what granted external hits to
+            # *windowed* multi-group shapes (the gemma geometry: sliding
+            # groups beside a full one), and for those this connector refuses
+            # to keep the legacy containment ("log it and decode on whatever
+            # loaded") -- the bytes it just loaded are the request's only KV,
+            # and a partial load would decode on a hole. Such a load reports
+            # its failure at request granularity instead (see
+            # create_load_done_callback): vLLM >= 0.30 turns it into a
+            # recompute (or a failed request under kv_load_failure_policy=
+            # "fail"), and an older vLLM -- which has no request-level path
+            # at all -- makes the connector fail closed rather than decode
+            # silently (v1_connector.get_finished). Non-windowed hybrid
+            # models keep the swallowed-and-logged behaviour their e2e
+            # contract pinned. Remove the request-level detour once upstream
+            # supports multi-group invalid-block recovery.
             report_ids = []
             report_failures = len(load_req.all_block_ids) == 1
+            report_request_failures = not report_failures and self._has_windowed_groups
             if report_failures:
                 # With exactly one vLLM block table the transferred group is
                 # group 0, and it must be an attention group: a lone state
@@ -1296,6 +1309,7 @@ class ConnectorWorker:
                 copy.copy(report_ids),
                 num_blocks,
                 report_failures=report_failures,
+                report_request_failures=report_request_failures,
             )
 
             if plans is None:
@@ -1821,3 +1835,18 @@ class ConnectorWorker:
         if failed:
             logger.warning("block_ids_with_load_errors: %s", failed)
         return failed
+
+    def drain_failed_loading_requests(self) -> Set[str]:
+        """Requests whose windowed multi-group load failed, once (rank 0).
+
+        Block ids cannot address a multi-table block layout upstream, so a
+        windowed multi-group instance marks the request itself (see
+        create_load_done_callback). The coordinator holds the mark until
+        every rank reported, so it lands in the same step the request is
+        reported finished receiving; v1_connector decides what it becomes on
+        the running vLLM era (failed_recving where the path exists, a loud
+        fail-closed error where it does not).
+        """
+        if self._tp_rank != 0:
+            return set()
+        return self._coordinator_server.get_failed_loading_requests()

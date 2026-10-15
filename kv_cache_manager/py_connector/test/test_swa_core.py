@@ -4892,5 +4892,70 @@ class TestTaskChunkWiring(unittest.TestCase):
                 self.assertEqual(4 // batch, len(conn._data_transfer.loaded))
 
 
+class TestFailedWindowedLoadSurfacing(unittest.TestCase):
+    """A failed windowed multi-group load reaches vLLM, era by era.
+
+    The worker marks the request (block ids cannot address a multi-table
+    layout upstream) and rank 0 drains the marks; what the mark becomes
+    depends on the running vLLM: >= 0.30 consumes it as
+    ``KVConnectorOutput.failed_recving`` and recomputes (or fails) the
+    request, older eras have no request-level path at all and the connector
+    fails closed instead of letting vLLM decode on a hole. The era flag is
+    the module global the import resolved, so each case pins it explicitly
+    (the stub carries the >= 0.30 symbol; a real 0.26 host resolves None)."""
+
+    def _connector(self, failed):
+        from kv_cache_manager.py_connector.vllm.v1_connector import (
+            TairKvCacheConnector,
+        )
+
+        conn = TairKvCacheConnector.__new__(TairKvCacheConnector)
+        worker = MagicMock()
+        worker.get_finished.return_value = (set(), {"r0"})
+        worker.drain_failed_loading_requests.return_value = set(failed)
+        conn.connector_worker = worker
+        # The metadata fetch is the base class's bookkeeping; the mocked
+        # worker never reads it, but 0.31's getter asserts it is bound.
+        conn._connector_metadata = MagicMock()
+        return conn
+
+    def test_get_finished_fails_closed_without_the_request_path(self):
+        from kv_cache_manager.py_connector.vllm import v1_connector
+
+        with mock.patch.object(
+            v1_connector, "KVConnectorTransferResults", None
+        ):
+            conn = self._connector(["r0"])
+            with self.assertRaises(RuntimeError) as caught:
+                conn.get_finished(set())
+            self.assertIn("failed", str(caught.exception))
+            # The drain ran exactly once: the failure is neither re-raised
+            # nor lost on a later step -- the engine is already dying.
+            conn.connector_worker.drain_failed_loading_requests.assert_called_once()
+
+    def test_get_finished_is_quiet_without_failures(self):
+        from kv_cache_manager.py_connector.vllm import v1_connector
+
+        with mock.patch.object(
+            v1_connector, "KVConnectorTransferResults", None
+        ):
+            conn = self._connector([])
+            self.assertEqual((set(), {"r0"}), conn.get_finished(set()))
+
+    def test_get_transfer_results_reports_failed_recving(self):
+        conn = self._connector(["r0"])
+        results = conn.get_transfer_results(set())
+        self.assertEqual({"r0"}, results.failed_recving)
+        # The failed request is also finished receiving: that is what takes
+        # it out of the remote-KV wait so the recompute can be scheduled.
+        self.assertEqual({"r0"}, results.finished_recving)
+        conn.connector_worker.drain_failed_loading_requests.assert_called_once()
+
+    def test_get_transfer_results_is_empty_without_failures(self):
+        conn = self._connector([])
+        results = conn.get_transfer_results(set())
+        self.assertEqual(set(), results.failed_recving)
+
+
 if __name__ == "__main__":
     unittest.main()
