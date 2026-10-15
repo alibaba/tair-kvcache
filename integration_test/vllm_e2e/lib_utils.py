@@ -78,14 +78,18 @@ def is_mla_model(model_path: str) -> bool:
     """Detect an MLA model from its config (kv_lora_rank is the defining
     knob -- vLLM's own is_deepseek_mla check keys on it for every MLA
     family). Used to stop the harness from forcing the FLASH_ATTN backend,
-    which has no MLA implementation and would abort engine init."""
+    which has no MLA implementation and would abort engine init.
+
+    The rank must be non-null: vLLM only treats a model as MLA when
+    kv_lora_rank is not None, so a config that declares the key as null
+    (e.g. a non-MLA model keeping the field) still needs FLASH_ATTN."""
     try:
         with open(os.path.join(model_path, "config.json")) as f:
             cfg = json.load(f)
     except Exception:
         return False
     text_cfg = cfg.get("text_config", cfg)
-    return "kv_lora_rank" in text_cfg
+    return text_cfg.get("kv_lora_rank") is not None
 
 
 # --------------------------------------------------------------------------- #
