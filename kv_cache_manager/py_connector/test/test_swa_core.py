@@ -2754,7 +2754,8 @@ class TestCoordinatorResync(unittest.TestCase):
         # Its PUSH socket points at a dead port in these tests: without an
         # explicit shutdown the context keeps the undeliverable message and
         # the interpreter hangs at exit (see TpCoordinatorClient.shutdown).
-        self.addCleanup(client.shutdown)
+        # The cleanup is registered here so the client cannot outlive the
+        # case even when the case itself fails midway.
         self.addCleanup(client.shutdown)
         return client
 
@@ -2764,7 +2765,9 @@ class TestCoordinatorResync(unittest.TestCase):
         )
 
         server = TpCoordinatorServer("127.0.0.1", port, tp_world_size, lambda *a: None)
-        self.addCleanup(server.shutdown)
+        # Registered the moment the server exists: a server that outlives its
+        # case keeps the port pair bound and its routine threads inside zmq,
+        # which is exactly the cross-case leak the lifecycle rules prevent.
         self.addCleanup(server.shutdown)
         return server
 

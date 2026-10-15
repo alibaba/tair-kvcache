@@ -24,8 +24,14 @@ def _find_free_port():
         return s.getsockname()[1]
 
 
-def _wait_for_server(port, timeout=5.0):
-    """Poll until server is ready to accept connections."""
+def _wait_for_server(server, timeout=5.0):
+    """Poll until the server is ready to accept connections.
+
+    Takes the server (not a port): the pair may have had to move off the
+    requested port (a transient collision), and the port that must answer is
+    the one it actually took.
+    """
+    port = server._base_port
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -50,7 +56,7 @@ class TestTpCoordinatorNormalOrder(unittest.TestCase):
             self.callback_event.set()
 
         self.server = TpCoordinatorServer("127.0.0.1", self.port, 2, on_finished)
-        _wait_for_server(self.port)
+        _wait_for_server(self.server)
         self.client = TpCoordinatorClient("127.0.0.1", self.port)
 
     def test_normal_order_callback_triggered(self):
@@ -98,9 +104,11 @@ class TestTpCoordinatorNormalOrder(unittest.TestCase):
         self.assertEqual(save_context.get_size(), 2)
 
     def tearDown(self):
-        # socket close + context term in that order, and the client's query
-        # socket (created by the endpoint probe) goes with it: terminating the
-        # context under an open socket blocks the interpreter.
+        # One case, one lifecycle: the client goes first (its sockets and any
+        # probe socket it opened die with it), then the server's shutdown
+        # stops both routines, joins them, and only then releases the sockets
+        # and the context -- so nothing of this case is still inside zmq when
+        # the next case binds its own pair.
         self.client.shutdown()
         self.server.shutdown()
 
@@ -118,7 +126,7 @@ class TestTpCoordinatorOutOfOrder(unittest.TestCase):
             self.callback_event.set()
 
         self.server = TpCoordinatorServer("127.0.0.1", self.port, 2, on_finished)
-        _wait_for_server(self.port)
+        _wait_for_server(self.server)
         self.client = TpCoordinatorClient("127.0.0.1", self.port)
 
     def test_finish_before_start_no_crash(self):
@@ -209,9 +217,11 @@ class TestTpCoordinatorOutOfOrder(unittest.TestCase):
         self.assertEqual(save_context.get_size(), 2)
 
     def tearDown(self):
-        # socket close + context term in that order, and the client's query
-        # socket (created by the endpoint probe) goes with it: terminating the
-        # context under an open socket blocks the interpreter.
+        # One case, one lifecycle: the client goes first (its sockets and any
+        # probe socket it opened die with it), then the server's shutdown
+        # stops both routines, joins them, and only then releases the sockets
+        # and the context -- so nothing of this case is still inside zmq when
+        # the next case binds its own pair.
         self.client.shutdown()
         self.server.shutdown()
 
@@ -229,7 +239,7 @@ class TestTpCoordinatorIdempotent(unittest.TestCase):
             self.callback_event.set()
 
         self.server = TpCoordinatorServer("127.0.0.1", self.port, 2, on_finished)
-        _wait_for_server(self.port)
+        _wait_for_server(self.server)
         self.client = TpCoordinatorClient("127.0.0.1", self.port)
 
     def test_duplicate_finish_ignored(self):
@@ -321,9 +331,11 @@ class TestTpCoordinatorIdempotent(unittest.TestCase):
         self.assertEqual(save_context.get_size(), 2)
 
     def tearDown(self):
-        # socket close + context term in that order, and the client's query
-        # socket (created by the endpoint probe) goes with it: terminating the
-        # context under an open socket blocks the interpreter.
+        # One case, one lifecycle: the client goes first (its sockets and any
+        # probe socket it opened die with it), then the server's shutdown
+        # stops both routines, joins them, and only then releases the sockets
+        # and the context -- so nothing of this case is still inside zmq when
+        # the next case binds its own pair.
         self.client.shutdown()
         self.server.shutdown()
 
@@ -341,7 +353,7 @@ class TestLoadFailureAggregation(unittest.TestCase):
     def setUp(self):
         self.port = _find_free_port()
         self.server = TpCoordinatorServer("127.0.0.1", self.port, 2, lambda *a: None)
-        _wait_for_server(self.port)
+        _wait_for_server(self.server)
         self.client = TpCoordinatorClient("127.0.0.1", self.port)
 
     def _send(self, tp_rank, failed):
