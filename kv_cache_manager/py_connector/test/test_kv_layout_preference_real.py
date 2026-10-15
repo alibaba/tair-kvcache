@@ -89,8 +89,14 @@ def _require_connector() -> None:
 def _module(name: str) -> Optional[Any]:
     try:
         return importlib.import_module(name)
-    except ImportError:
-        return None
+    except ModuleNotFoundError as exc:
+        # Unavailable means the requested module (or a parent of it) is not
+        # installed: a real vLLM whose internals fail to import -- a renamed
+        # symbol, a moved module -- is a regression and must surface, not a
+        # skip (the same contract _require_connector enforces).
+        if exc.name is None or name == exc.name or name.startswith(exc.name + "."):
+            return None
+        raise
 
 
 def _layout_enum() -> Optional[Any]:
