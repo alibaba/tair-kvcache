@@ -416,6 +416,10 @@ def assert_report_ok(report: dict, min_matched: int = 1, tp_size: int = 1,
     capture_keys) must be fully covered. compare_captures only inspects the
     captures that exist, so a rank or block that produced no capture at all is
     verified by nobody unless it is named here.
+
+    expected_keys pins the ranks it covers, so it must name exactly the ranks
+    tp_size implies: a caller that scales its expectations per rank but forgets
+    to pass tp_size would otherwise keep the rank gate silent.
     """
     problems = []
     if report["loaded_without_ref"]:
@@ -439,11 +443,22 @@ def assert_report_ok(report: dict, min_matched: int = 1, tp_size: int = 1,
                 f"loads the same blocks, so each one must be verified"
             )
     if expected_keys is not None:
+        expected_ranks = {key[0] for key in expected_keys}
+        implied_ranks = {f"tp{r}" for r in range(tp_size)}
+        if expected_ranks != implied_ranks:
+            problems.append(
+                f"expected_keys names rank(s) {sorted(expected_ranks)} but "
+                f"tp_size={tp_size} implies {sorted(implied_ranks)}: the "
+                f"capture expectations and the rank gate disagree"
+            )
         missing_keys = sorted(set(expected_keys) - matched_keys)
         if missing_keys:
+            sample = missing_keys[:8]
+            more = len(missing_keys) - len(sample)
             problems.append(
                 f"expected captures never matched ({len(missing_keys)} of "
-                f"{len(set(expected_keys))}): {missing_keys}"
+                f"{len(expected_keys)}): {sample}"
+                + (f" (+{more} more)" if more else "")
             )
     if problems:
         raise AssertionError("KV verification failed: " + "; ".join(problems))
