@@ -70,9 +70,20 @@ def _skip_reason() -> str:
         getattr(vllm, "__file__", "")
     ):
         return "vLLM is shadowed by the test stubs in this process"
-    if _CONNECTOR_ERROR:
-        return f"the connector is not importable ({_CONNECTOR_ERROR})"
     return ""
+
+
+def _require_connector() -> None:
+    """A real vLLM that cannot import the connector is a regression, not a gap.
+
+    The suite may only skip for a missing optional runtime dependency; with
+    vLLM importable, an ImportError from the connector means this branch is
+    incompatible with that era and must fail loudly (the spec-gate suite
+    enforces the same contract)."""
+    if _CONNECTOR_ERROR:
+        raise AssertionError(
+            f"the connector does not import against this vLLM: {_CONNECTOR_ERROR}"
+        )
 
 
 def _module(name: str) -> Optional[Any]:
@@ -127,6 +138,7 @@ class RealEngineCase(unittest.TestCase):
         reason = _skip_reason()
         if reason:
             raise unittest.SkipTest(reason)
+        _require_connector()
 
 
 class TestEraContract(RealEngineCase):
@@ -336,6 +348,7 @@ class TestRegistrationUnderEachLayout(unittest.TestCase):
         reason = _skip_reason()
         if reason:
             raise unittest.SkipTest(reason)
+        _require_connector()
         if _layout_enum() is None:
             raise unittest.SkipTest("era has no block-outer layouts")
         interfaces = _module("vllm.v1.kv_cache_interface")
