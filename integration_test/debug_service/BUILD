@@ -25,3 +25,15 @@ py_test(
         "@pip_cpu//requests",
     ],
 )
+
+py_test(
+    name = "grpc_interface_test",
+    srcs = ["grpc_interface_test.py"],
+    tags = ["no-remote-exec"],
+    deps = [
+        "//integration_test/testlib:test_base",
+        "//kv_cache_manager/protocol/protobuf:debug_service_py_proto",
+        "@pip_cpu//grpcio",
+        "@pip_cpu//protobuf",
+    ],
+)
