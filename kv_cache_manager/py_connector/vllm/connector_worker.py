@@ -1598,12 +1598,15 @@ class ConnectorWorker:
             candidates = set(reported)
             if own is not None:
                 candidates.add(own)
-            if not confirmed and block in self._blocks_awaiting_verdict(req_id):
+            if block in self._blocks_awaiting_verdict(req_id):
                 # A session of this request is still waiting for its verdict
-                # (see _blocks_awaiting_verdict): releasing the block's bytes
-                # now could leave the retry with nothing once the HBM window
-                # moved. The verdict recheck releases them when it says
-                # committed.
+                # (see _blocks_awaiting_verdict) -- confirmed or not:
+                # ``confirmed`` only means *this* release's announcement
+                # allocated nothing (a business rejection), not that the
+                # older session's write committed. Releasing the block's
+                # bytes now could leave the retry with nothing once the HBM
+                # window moved. The verdict recheck releases them when it
+                # says committed.
                 continue
             if not confirmed and not candidates:
                 # The manager returned no location for this block (it was

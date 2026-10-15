@@ -2906,6 +2906,36 @@ class TestConfirmedReleaseRecheck(unittest.TestCase):
         self.assertEqual([("r0", [0, 1, 2, 3])], released_blocks(meta))
         self.assertTrue(meta.to_release_captures[0][3])
 
+    def test_a_confirmed_release_keeps_verdict_pending_bytes(self):
+        # An older session settled locally and restaged its bytes while
+        # awaiting the cross-rank verdict; a newer announcement of the same
+        # prefix was then *rejected* and queues a confirmed release. That
+        # "confirmed" speaks only for the newer announcement (it allocated
+        # nothing) -- not for the older session's write, whose commit the
+        # verdict has not decided yet. Releasing there could discard the
+        # retry's only copy once the HBM window moved; the verdict recheck
+        # (or the retirement) is what releases those bytes.
+        conn = captured_worker([0, 1], [7, 8])
+        conn._verdict_pending = {"r0": {"sA": [0, 1]}}
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.to_release_captures.append(("r0", [0, 1], None, True))
+        conn.wait_for_save(meta)
+        self.assertEqual(
+            2,
+            len(conn._staged.get("r0", {})),
+            "a confirmed release dropped bytes that still await a verdict",
+        )
+
+    def test_a_confirmed_release_still_releases_settled_blocks(self):
+        # The guard is scoped to verdict-pending blocks: with no session
+        # awaiting anything, the confirmed release returns its slots exactly
+        # as before (an unbounded guard would pin them until retirement).
+        conn = captured_worker([0, 1], [7, 8])
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.to_release_captures.append(("r0", [0, 1], None, True))
+        conn.wait_for_save(meta)
+        self.assertEqual({}, conn._staged.get("r0", {}))
+
 
 class TestCancellationBound(unittest.TestCase):
     """wave13 #7: pre-verdict cancellations are bounded."""
