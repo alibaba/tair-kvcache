@@ -1,5 +1,7 @@
 #include "kv_cache_manager/config/leader_elector.h"
 
+#include <algorithm>
+
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/loop_thread.h"
@@ -66,7 +68,12 @@ void LeaderElector::Stop() {
 
     KVCM_LOG_INFO("stopping LeaderElector...");
 
-    stop_flag_ = true;
+    // Revoke readiness before waiting for an outstanding coordination request.
+    {
+        std::lock_guard guard(transition_mutex_);
+        stop_flag_ = true;
+        LoseLeaseLocked(TimestampUtil::GetCurrentTimeUs());
+    }
 
     // 停止选主线程
     if (leader_lock_thread_ptr_) {
@@ -79,13 +86,11 @@ void LeaderElector::Stop() {
         lease_check_thread_ptr_.reset();
     }
 
-    // 主动降级
-    Demote();
-
-    // 等待状态转换完成
-    WaitForStableState(5000);
+    // 释放锁
+    ReleaseLock();
 
     // 停止状态转换线程
+    // The worker exits only after any started recovery and its cleanup return.
     transition_cv_.notify_all();
     if (state_transition_thread_ && state_transition_thread_->joinable()) {
         state_transition_thread_->join();
@@ -105,8 +110,9 @@ bool LeaderElector::WorkLoop() {
 
 void LeaderElector::DoWorkLoop(int64_t current_time) {
     int64_t begin_time = TimestampUtil::GetCurrentTimeUs();
-    if (begin_time - last_loop_time_ < 0 || (begin_time - last_loop_time_ > loop_interval_us_ * 2)) {
-        KVCM_LOG_WARN("LeaderElector workloop begin timeout, current[%ld] last[%ld]", begin_time, last_loop_time_);
+    int64_t last_loop_time = last_loop_time_.load();
+    if (begin_time - last_loop_time < 0 || (begin_time - last_loop_time > loop_interval_us_ * 2)) {
+        KVCM_LOG_WARN("LeaderElector workloop begin timeout, current[%ld] last[%ld]", begin_time, last_loop_time);
     }
     last_loop_time_ = begin_time;
 
@@ -125,20 +131,33 @@ void LeaderElector::DoWorkLoop(int64_t current_time) {
 }
 
 void LeaderElector::CampaignLeader(int64_t current_time) {
-    if (current_time < next_can_campaign_time_us_.load()) {
-        return;
+    uint64_t request_epoch;
+    {
+        std::lock_guard guard(transition_mutex_);
+        if (!CanCampaignLocked(current_time)) {
+            return;
+        }
+        request_epoch = lock_epoch_;
     }
 
     // 检查当前锁是否被其他实例持有
     std::string current_value;
-    int64_t expire_time_ms;
+    int64_t expire_time_ms = -1;
     ErrorCode ec = coordination_backend_->GetLockHolder(lock_key_, current_value, expire_time_ms);
     if (ec != EC_OK && ec != EC_NOENT) {
         KVCM_LOG_WARN("check lock status failed, error_code=%d", static_cast<int>(ec));
         return;
     }
 
+    if (ec == EC_NOENT) {
+        current_value.clear();
+    }
+
     {
+        std::lock_guard transition_guard(transition_mutex_);
+        if (request_epoch != lock_epoch_ || !CanCampaignLocked(current_time)) {
+            return;
+        }
         std::unique_lock guard(current_lock_holder_mutex_);
         current_lock_holder_ = current_value;
     }
@@ -149,7 +168,7 @@ void LeaderElector::CampaignLeader(int64_t current_time) {
             return;
         } else {
             KVCM_LOG_INFO("lock already held by self, update status");
-            UpdateLockStatus(current_time, true, expire_time_ms * 1000);
+            AcceptLease(current_time, expire_time_ms * 1000, request_epoch);
             return;
         }
     }
@@ -157,8 +176,9 @@ void LeaderElector::CampaignLeader(int64_t current_time) {
     // 尝试获取锁
     ec = coordination_backend_->TryLock(lock_key_, lock_value_, lease_timeout_us_ / 1000);
     if (ec == EC_OK) {
-        KVCM_LOG_INFO("campaign leader success!");
-        UpdateLockStatus(current_time, true, current_time + lease_timeout_us_);
+        if (AcceptLease(current_time, current_time + lease_timeout_us_, request_epoch)) {
+            KVCM_LOG_INFO("campaign leader success!");
+        }
     } else if (ec == EC_EXIST) {
         KVCM_LOG_DEBUG("lock already held by other instance");
     } else {
@@ -167,33 +187,56 @@ void LeaderElector::CampaignLeader(int64_t current_time) {
 }
 
 void LeaderElector::HoldLeader(int64_t current_time) {
-    if (!lock_acquired_.load()) {
-        return;
+    uint64_t request_epoch;
+    {
+        std::lock_guard guard(transition_mutex_);
+        if (!CheckLeaseLocked(current_time)) {
+            return;
+        }
+        request_epoch = lock_epoch_;
     }
 
     ErrorCode ec = coordination_backend_->RenewLock(lock_key_, lock_value_, lease_timeout_us_ / 1000);
+    std::unique_lock<std::mutex> lock(transition_mutex_);
+    int64_t now = std::max(current_time, TimestampUtil::GetCurrentTimeUs());
+    if (request_epoch != lock_epoch_ || !CheckLeaseLocked(now)) {
+        // A successful late renewal must not resurrect a revoked lease.
+        lock.unlock();
+        if (ec == EC_OK) {
+            ReleaseLock();
+        }
+        return;
+    }
+
     if (ec == EC_OK) {
-        UpdateLockStatus(current_time, true, current_time + lease_timeout_us_);
+        lease_expiration_time_us_.store(current_time + lease_timeout_us_);
+        if (!CheckLeaseLocked(now)) {
+            lock.unlock();
+            ReleaseLock();
+        }
         return;
     }
 
     if (ec == EC_NOENT || ec == EC_MISMATCH) {
         KVCM_LOG_WARN("renew lock failed, lock not held by self, error_code=%d", static_cast<int>(ec));
-        UpdateLockStatus(current_time, false, -1);
+        LoseLeaseLocked(now);
         return;
     }
 
     KVCM_LOG_WARN("renew lock failed, unknown error_code=%d", static_cast<int>(ec));
-    if (current_time > GetLeaseExpirationTime()) {
-        UpdateLockStatus(current_time, false, -1);
-    }
 }
 
 void LeaderElector::CheckLeaseTimeout() {
     int64_t current_time = TimestampUtil::GetCurrentTimeUs();
     DoCheckLeaseTimeout(current_time);
 }
+
 bool LeaderElector::DoCheckLeaseTimeout(int64_t current_time) {
+    std::lock_guard guard(transition_mutex_);
+    return CheckLeaseLocked(current_time);
+}
+
+bool LeaderElector::CheckLeaseLocked(int64_t current_time) {
     if (!lock_acquired_.load()) {
         return false;
     }
@@ -201,7 +244,7 @@ bool LeaderElector::DoCheckLeaseTimeout(int64_t current_time) {
     int64_t lease_expiration_time_us = GetLeaseExpirationTime();
     if (current_time > lease_expiration_time_us - loop_interval_us_) {
         KVCM_LOG_WARN("lease timeout, current[%ld] expiration[%ld]", current_time, lease_expiration_time_us);
-        UpdateLockStatus(current_time, false, -1);
+        LoseLeaseLocked(current_time);
         return false;
     }
     return true;
@@ -213,241 +256,192 @@ void LeaderElector::Demote() {
 }
 
 void LeaderElector::DoDemote(int64_t current_time) {
-    if (!lock_acquired_.load()) {
-        KVCM_LOG_INFO("not holding lock, no need to demote");
-        return;
-    }
-
-    // 先设置延迟选主时间，保证抢主能按预期delay
-    if (forbid_campaign_time_ms_ > 0) {
-        int64_t next_campaign_time = current_time + forbid_campaign_time_ms_ * 1000;
-        next_can_campaign_time_us_.store(next_campaign_time);
-        KVCM_LOG_INFO("set next campaign time to %ld (delay %ld ms)", next_campaign_time, forbid_campaign_time_ms_);
+    {
+        std::lock_guard guard(transition_mutex_);
+        if (release_in_progress_) {
+            return;
+        }
+        release_in_progress_ = true;
+        // Invalidate even an acquisition which has not returned yet.
+        LoseLeaseLocked(current_time);
     }
 
     // 释放锁
+    ReleaseLock();
+
+    {
+        std::lock_guard guard(transition_mutex_);
+        release_in_progress_ = false;
+        transition_cv_.notify_all();
+    }
+}
+
+void LeaderElector::ReleaseLock() {
     ErrorCode ec = coordination_backend_->Unlock(lock_key_, lock_value_);
     if (ec == EC_OK) {
         KVCM_LOG_INFO("release lock success");
-    } else {
+    } else if (ec != EC_NOENT && ec != EC_MISMATCH) {
         KVCM_LOG_WARN("release lock failed, error_code=%d", static_cast<int>(ec));
     }
 
-    // 更新状态
-    UpdateLockStatus(current_time, false, -1);
+    std::unique_lock guard(current_lock_holder_mutex_);
+    if (!lock_acquired_.load() && current_lock_holder_ == lock_value_) {
+        current_lock_holder_.clear();
+    }
 }
 
 // ==================== 状态机逻辑 ====================
 
-void LeaderElector::UpdateLockStatus(int64_t current_time, bool acquired, int64_t lease_expiration_time) {
-    bool old_acquired = lock_acquired_.load();
-
-    // 先设置延迟选主时间，保证抢主能按预期delay
-    if (old_acquired && !acquired && forbid_campaign_time_ms_ > 0) {
-        int64_t next_campaign_time = current_time + forbid_campaign_time_ms_ * 1000;
-        next_can_campaign_time_us_.store(next_campaign_time);
-        KVCM_LOG_INFO("set next campaign time to %ld (delay %ld ms)", next_campaign_time, forbid_campaign_time_ms_);
-    }
-
-    // 更新锁状态
-    lock_acquired_.store(acquired);
-    lease_expiration_time_us_.store(lease_expiration_time);
-
-    // 锁状态变化时，触发角色状态转换
-    if (old_acquired != acquired) {
-        KVCM_LOG_INFO("lock status changed: acquired=%d, lease_expiration=%ld", acquired, lease_expiration_time);
-
-        if (acquired) {
-            {
-                std::unique_lock guard(current_lock_holder_mutex_);
-                if (current_lock_holder_ != lock_value_) {
-                    current_lock_holder_ = lock_value_;
-                }
-            }
-            RequestPromoteToLeader();
-        } else {
-            {
-                std::unique_lock guard(current_lock_holder_mutex_);
-                if (current_lock_holder_ == lock_value_) {
-                    current_lock_holder_.clear();
-                }
-            }
-            RequestDemoteToFollower();
-        }
-    }
+bool LeaderElector::CanCampaignLocked(int64_t current_time) const {
+    // A started recovery must be cleaned up before this node can campaign again.
+    return !stop_flag_ && !release_in_progress_ && !lock_acquired_.load() &&
+           role_state_.load() == RoleState::FOLLOWER && current_time >= next_can_campaign_time_us_.load();
 }
 
-void LeaderElector::RequestPromoteToLeader() {
-    std::unique_lock<std::mutex> lock(transition_mutex_);
-
-    RoleState current = role_state_.load();
-
-    // 如果已经是Leader或正在晋升，忽略
-    if (current == RoleState::LEADER || current == RoleState::PROMOTING) {
-        KVCM_LOG_DEBUG("already in LEADER or PROMOTING state, ignore promote request");
-        return;
-    }
-
-    // 如果正在降级，等待降级完成后会自动处理
-    if (current == RoleState::DEMOTING) {
-        KVCM_LOG_INFO("currently demoting, promote will be queued");
-    }
-
-    uint64_t new_version = state_version_.fetch_add(1) + 1;
-    RoleTransitionTask task;
-    task.version = new_version;
-    task.target_state = RoleState::LEADER;
-    task.action = [this]() {
-        if (become_leader_handler_) {
-            std::lock_guard guard(callback_mutex_);
-            become_leader_handler_();
+bool LeaderElector::AcceptLease(int64_t current_time, int64_t expiration, uint64_t request_epoch) {
+    {
+        std::lock_guard guard(transition_mutex_);
+        int64_t now = std::max(current_time, TimestampUtil::GetCurrentTimeUs());
+        if (request_epoch == lock_epoch_ && CanCampaignLocked(now) && now <= expiration - loop_interval_us_) {
+            ++lock_epoch_;
+            lock_acquired_.store(true);
+            lease_expiration_time_us_.store(expiration);
+            {
+                std::unique_lock holder_guard(current_lock_holder_mutex_);
+                current_lock_holder_ = lock_value_;
+            }
+            transition_cv_.notify_all();
+            return true;
         }
-    };
-
-    transition_queue_.push(std::move(task));
-    transition_cv_.notify_one();
-
-    KVCM_LOG_INFO("promote request queued, version=%lu", new_version);
+        KVCM_LOG_INFO("discard acquisition result, epoch=%lu, current_epoch=%lu", request_epoch, lock_epoch_);
+    }
+    // This lock-loop thread cannot start another acquisition before releasing
+    // the rejected result; Unlock checks the holder before deleting the key.
+    ReleaseLock();
+    return false;
 }
 
-void LeaderElector::RequestDemoteToFollower() {
-    std::unique_lock<std::mutex> lock(transition_mutex_);
-
-    RoleState current = role_state_.load();
-
-    // 如果已经是Follower或正在降级，忽略
-    if (current == RoleState::FOLLOWER || current == RoleState::DEMOTING) {
-        KVCM_LOG_DEBUG("already in FOLLOWER or DEMOTING state, ignore demote request");
-        return;
-    }
-
-    // 清空队列中的所有晋升任务
-    std::queue<RoleTransitionTask> empty_queue;
-    std::swap(transition_queue_, empty_queue);
-
-    uint64_t new_version = state_version_.fetch_add(1) + 1;
-    RoleTransitionTask task;
-    task.version = new_version;
-    task.target_state = RoleState::FOLLOWER;
-    task.action = [this]() {
-        KVCM_LOG_DEBUG("do demote action");
-        if (no_longer_leader_handler_) {
-            std::lock_guard guard(callback_mutex_);
-            KVCM_LOG_DEBUG("no_longer_leader_handler_");
-            no_longer_leader_handler_();
+void LeaderElector::LoseLeaseLocked(int64_t current_time) {
+    ++lock_epoch_;
+    bool was_acquired = lock_acquired_.exchange(false);
+    lease_expiration_time_us_.store(-1);
+    if (was_acquired) {
+        int64_t forbid_time = forbid_campaign_time_ms_.load();
+        if (forbid_time > 0) {
+            int64_t next_campaign_time = current_time + forbid_time * 1000;
+            next_can_campaign_time_us_.store(next_campaign_time);
+            KVCM_LOG_INFO("set next campaign time to %ld (delay %ld ms)", next_campaign_time, forbid_time);
         }
-    };
+        {
+            std::lock_guard holder_guard(current_lock_holder_mutex_);
+            if (current_lock_holder_ == lock_value_) {
+                current_lock_holder_.clear();
+            }
+        }
+        // Only the request gate runs here. Draining requests and cleanup remain
+        // on the worker, so lease checks never wait for a slow lifecycle callback.
+        InvokeHandler(leadership_lost_handler_);
+        KVCM_LOG_INFO("leadership revoked, role=%s, epoch=%lu", RoleStateToString(role_state_.load()), lock_epoch_);
+    }
+    transition_cv_.notify_all();
+}
 
-    transition_queue_.push(std::move(task));
-    transition_cv_.notify_one();
+bool LeaderElector::RunIfCurrentPromotionValid(const HandlerFuncType &handler) {
+    std::lock_guard guard(transition_mutex_);
+    if (role_state_.load() != RoleState::PROMOTING || promotion_epoch_ != lock_epoch_ || stop_flag_ ||
+        !CheckLeaseLocked(TimestampUtil::GetCurrentTimeUs())) {
+        return false;
+    }
+    handler();
+    return true;
+}
 
-    KVCM_LOG_INFO("demote request queued, version=%lu", new_version);
+bool LeaderElector::HasPendingTransitionLocked() const {
+    return (role_state_.load() == RoleState::FOLLOWER && lock_acquired_.load()) ||
+           (role_state_.load() == RoleState::LEADER && !lock_acquired_.load());
 }
 
 void LeaderElector::StateTransitionWorker() {
     KVCM_LOG_INFO("state transition worker thread started");
 
-    while (!stop_flag_) {
-        RoleTransitionTask task;
-
+    while (true) {
         {
             std::unique_lock<std::mutex> lock(transition_mutex_);
-            transition_cv_.wait(lock, [this] { return stop_flag_ || !transition_queue_.empty(); });
+            transition_cv_.wait(lock, [this] { return stop_flag_ || HasPendingTransitionLocked(); });
 
-            if (stop_flag_) {
+            if (stop_flag_ && !HasPendingTransitionLocked()) {
                 break;
             }
-
-            if (transition_queue_.empty()) {
-                continue;
-            }
-
-            task = std::move(transition_queue_.front());
-            transition_queue_.pop();
         }
 
-        ExecuteTransitionTask(task);
+        ReconcileState();
     }
 
     KVCM_LOG_INFO("state transition worker thread exited");
 }
 
 void LeaderElector::ProcessStateTransitionsForTest() {
-    // 处理所有待处理的状态转换任务，仅用于未启动后台线程的单元测试
-    while (true) {
-        RoleTransitionTask task;
-
-        {
-            std::unique_lock<std::mutex> lock(transition_mutex_);
-
-            if (transition_queue_.empty()) {
-                break;
-            }
-
-            task = std::move(transition_queue_.front());
-            transition_queue_.pop();
-        }
-
-        // 执行状态转换
-        ExecuteTransitionTask(task);
-    }
+    // 收敛至当前目标状态，仅用于未启动后台线程的单元测试。
+    while (ReconcileState()) {}
 }
 
-void LeaderElector::ExecuteTransitionTask(const RoleTransitionTask &task) {
-    is_transitioning_.store(true);
-
-    RoleState current = role_state_.load();
-    KVCM_LOG_INFO("begin state transition: %s -> %s, version=%lu",
-                  RoleStateToString(current),
-                  RoleStateToString(task.target_state),
-                  task.version);
-
-    int64_t start_time = TimestampUtil::GetCurrentTimeUs();
-
-    // 第一步：转换到中间状态
-    RoleState intermediate_state;
-    if (task.target_state == RoleState::LEADER) {
-        intermediate_state = RoleState::PROMOTING;
-    } else if (task.target_state == RoleState::FOLLOWER) {
-        intermediate_state = RoleState::DEMOTING;
-    } else {
-        KVCM_LOG_ERROR("invalid target state: %s", RoleStateToString(task.target_state));
-        is_transitioning_.store(false);
-        transition_cv_.notify_all();
-        return;
-    }
-
-    if (!TransitionToState(intermediate_state)) {
-        KVCM_LOG_ERROR("failed to transition to intermediate state %s", RoleStateToString(intermediate_state));
-        is_transitioning_.store(false);
-        transition_cv_.notify_all();
-        return;
-    }
-
-    // 第二步：执行状态转换操作（耗时操作）
-    // TODO: 添加异常情况下回滚和重试
+void LeaderElector::InvokeHandler(const HandlerFuncType &handler) {
+    // Preserve the existing callback failure behavior: log exceptions and
+    // continue the lifecycle; do not introduce retries or propagate errors.
     try {
-        if (task.action) {
-            task.action();
+        if (handler) {
+            handler();
         }
     } catch (const std::exception &e) {
         KVCM_LOG_ERROR("exception during state transition: %s", e.what());
-    } catch (...) { KVCM_LOG_ERROR("unknown exception during state transition"); }
-
-    // 第三步：转换到目标状态
-    if (!TransitionToState(task.target_state)) {
-        KVCM_LOG_ERROR("failed to transition to target state %s", RoleStateToString(task.target_state));
+    } catch (...) {
+        KVCM_LOG_ERROR("unknown exception during state transition");
     }
+}
 
-    int64_t end_time = TimestampUtil::GetCurrentTimeUs();
-    KVCM_LOG_INFO("state transition completed: %s -> %s, version=%lu, cost=%ld us",
-                  RoleStateToString(current),
-                  RoleStateToString(task.target_state),
-                  task.version,
-                  end_time - start_time);
-
-    is_transitioning_.store(false);
-    transition_cv_.notify_all();
+bool LeaderElector::ReconcileState() {
+    uint64_t epoch = 0;
+    bool recover = false;
+    {
+        std::lock_guard guard(transition_mutex_);
+        if (!HasPendingTransitionLocked()) {
+            return false;
+        }
+        recover = role_state_.load() == RoleState::FOLLOWER;
+        if (recover) {
+            if (stop_flag_ || !CheckLeaseLocked(TimestampUtil::GetCurrentTimeUs())) {
+                return false;
+            }
+            promotion_epoch_ = epoch = lock_epoch_;
+            TransitionToState(RoleState::PROMOTING);
+        } else {
+            TransitionToState(RoleState::DEMOTING);
+        }
+    }
+    if (recover) {
+        KVCM_LOG_INFO("begin recover, epoch=%lu", epoch);
+        InvokeHandler(become_leader_handler_);
+        std::lock_guard guard(transition_mutex_);
+        if (epoch == lock_epoch_ && !stop_flag_ && CheckLeaseLocked(TimestampUtil::GetCurrentTimeUs())) {
+            TransitionToState(RoleState::LEADER);
+            KVCM_LOG_INFO("recovery callback completed, role=LEADER, epoch=%lu", epoch);
+            transition_cv_.notify_all();
+            return true;
+        }
+        // Recovery has started and may have side effects; cleanup is mandatory
+        // even if the lock was lost before readiness could be published.
+        TransitionToState(RoleState::DEMOTING);
+        KVCM_LOG_INFO("discard recovery result, epoch=%lu, current_epoch=%lu", epoch, lock_epoch_);
+    }
+    KVCM_LOG_INFO("begin cleanup");
+    InvokeHandler(no_longer_leader_handler_);
+    {
+        std::lock_guard guard(transition_mutex_);
+        TransitionToState(RoleState::FOLLOWER);
+        KVCM_LOG_INFO("cleanup callback completed, role=FOLLOWER, epoch=%lu", lock_epoch_);
+        transition_cv_.notify_all();
+    }
+    return true;
 }
 
 bool LeaderElector::TransitionToState(RoleState target_state) {
@@ -460,7 +454,8 @@ bool LeaderElector::TransitionToState(RoleState target_state) {
         valid_transition = (target_state == RoleState::PROMOTING);
         break;
     case RoleState::PROMOTING:
-        valid_transition = (target_state == RoleState::LEADER || target_state == RoleState::FOLLOWER);
+        valid_transition = (target_state == RoleState::LEADER || target_state == RoleState::FOLLOWER ||
+                            target_state == RoleState::DEMOTING);
         break;
     case RoleState::LEADER:
         valid_transition = (target_state == RoleState::DEMOTING);
@@ -503,8 +498,14 @@ const char *LeaderElector::RoleStateToString(const RoleState state) {
 }
 
 bool LeaderElector::IsStableState() const {
+    std::lock_guard guard(transition_mutex_);
+    return IsStableStateLocked();
+}
+
+bool LeaderElector::IsStableStateLocked() const {
     RoleState state = role_state_.load();
-    return (state == RoleState::LEADER || state == RoleState::FOLLOWER) && !is_transitioning_.load();
+    return (state == RoleState::LEADER || state == RoleState::FOLLOWER) && !HasPendingTransitionLocked() &&
+           !release_in_progress_;
 }
 
 bool LeaderElector::WaitForStableState(int64_t timeout_ms) {
@@ -515,10 +516,11 @@ bool LeaderElector::WaitForStableState(int64_t timeout_ms) {
     std::unique_lock<std::mutex> lock(transition_mutex_);
 
     if (timeout_ms < 0) {
-        transition_cv_.wait(lock, [this] { return IsStableState(); });
+        transition_cv_.wait(lock, [this] { return IsStableStateLocked(); });
         return true;
     } else {
-        return transition_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] { return IsStableState(); });
+        return transition_cv_.wait_for(
+            lock, std::chrono::milliseconds(timeout_ms), [this] { return IsStableStateLocked(); });
     }
 }
 
@@ -529,6 +531,8 @@ int64_t LeaderElector::GetLeaseExpirationTime() const { return lease_expiration_
 void LeaderElector::SetNoLongerLeaderHandler(const HandlerFuncType &handler) { no_longer_leader_handler_ = handler; }
 
 void LeaderElector::SetBecomeLeaderHandler(const HandlerFuncType &handler) { become_leader_handler_ = handler; }
+
+void LeaderElector::SetLeadershipLostHandler(const HandlerFuncType &handler) { leadership_lost_handler_ = handler; }
 
 void LeaderElector::SetForbidCampaignLeaderTimeMs(int64_t forbid_time) { forbid_campaign_time_ms_ = forbid_time; }
 

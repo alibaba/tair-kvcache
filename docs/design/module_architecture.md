@@ -85,7 +85,7 @@ service → manager → meta → config → data_storage → common
 
 - `common`、`protocol` 是最底层的通用模块，被各层广泛依赖；`event` 的 optimizer 发布链路直接使用 `protocol` 定义的 `TraceQueryRequest`。
 - `metrics`、`event` 是通用支撑模块，被 `manager` 与 `service` 复用。
-- `service` 在启动时实例化 `CacheManager`（注入 `MetricsRegistry` + `RegistryManager`），并通过 `config` 的 `LeaderElector` 门控 recover/cleanup。
+- `service` 在启动时实例化 `CacheManager`（注入 `MetricsRegistry` + `RegistryManager`），并通过 `config` 的 `LeaderElector` 串行门控 recover/cleanup；选主层判定失锁时通过快速回调关闭 service 请求入口，恢复成功路径在同一轮有效租约下开放入口。
 
 ### 3.2 需要特别注意的反向边（近似环）
 
@@ -106,7 +106,7 @@ flowchart TD
     main["main.cpp（入口）"]
 
     subgraph access["接入层"]
-        service["service<br/>Server / *ServiceImpl<br/>grpc · http · util"]
+        service["service<br/>Server / *ServiceImpl · 请求门禁<br/>grpc · http · util"]
     end
 
     subgraph core["编排与业务核心"]
@@ -321,7 +321,7 @@ flowchart LR
 
 ### 4.8 HA 故障转移
 
-`LeaderElector`（config）基于 `CoordinationBackend`（memory/file/redis）的分布式锁选主。`Server` 在成为 Leader 时调用 `CacheManager::DoRecover` 恢复状态，随后启动 GC、恢复 Reclaimer、启动 MigrationManager 并开放 leader-only 请求。降级时先通知 GC/Reclaimer 停止新工作并关闭、排空 leader-only 请求，再 join GC、停止 MigrationManager，最后调用 `DoCleanup` 清理运行时状态（正在进行的写入按失败处理）。Python `KvCacheManagerClient` 使用服务发现 URL 时，会在每次 Leader 刷新前重新选择一个 Manager 发现端点，避免把 Leader 查询入口固定在单个节点上。
+`LeaderElector`（config）基于 `CoordinationBackend`（memory/file/redis）的分布式锁选主。`Server` 在成为 Leader 时调用 `CacheManager::DoRecover` 恢复状态，随后启动 GC、恢复 Reclaimer、启动 MigrationManager，并在持锁轮次与租约仍有效时开放 leader-only 请求。失锁时先同步关闭请求入口；选主层暂停本节点竞选，等待已开始的恢复返回并串行清理。降级回调通知 GC/Reclaimer 停止新工作并排空 leader-only 请求，再 join GC、停止 MigrationManager，最后调用 `DoCleanup` 清理运行时状态（正在进行的写入按失败处理）。Python `KvCacheManagerClient` 使用服务发现 URL 时，会在每次 Leader 刷新前重新选择一个 Manager 发现端点，避免把 Leader 查询入口固定在单个节点上。
 
 ### 4.9 KVCM 到在线 Optimizer 的事件流
 
