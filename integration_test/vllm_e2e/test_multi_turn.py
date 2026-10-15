@@ -140,16 +140,19 @@ class TestMultiTurn(unittest.TestCase):
                 f"were not used")
 
             # And the loaded decode-block KV must verify -- the loaded region
-            # is what vLLM gave slots for: the tail window of every group, plus
-            # the whole match for a full-attention group.
+            # is what vLLM gave slots for: the tail window of every group,
+            # plus the whole match for a full-attention group. The region ends
+            # at the hit's effective end (an EAGLE/MTP drop moves it a hash
+            # block back, see WindowGeometry.hit_end_blocks).
             load_blocks = geom.loaded_blocks(shared_blocks * mbs)
+            end = geom.hit_end_blocks(shared_blocks * mbs)
             hashes = full_block_hashes(turn2_ids, mbs)
             wait_for_captures(env.capture_dir, "loaded",
                               expected=env.tp_size * load_blocks, timeout=180)
             assert_loaded_blocks(
                 env.capture_dir,
                 {(f"tp{r}", h) for r in range(env.tp_size)
-                 for h in hashes[shared_blocks - load_blocks:shared_blocks]},
+                 for h in hashes[end - load_blocks:end]},
                 env.tp_size)
             report = compare_captures(env.capture_dir)
             assert_report_ok(report, min_matched=env.tp_size * load_blocks)

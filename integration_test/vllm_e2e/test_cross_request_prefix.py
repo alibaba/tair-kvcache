@@ -290,9 +290,12 @@ class TestCrossRequestPrefix(unittest.TestCase):
                     # it), so the clamp must not trim the match -- and the load
                     # covers exactly the slots vLLM handed out: the sliding
                     # groups' tail window of where the match ended, plus the
-                    # whole match for the full-attention group.
-                    load_blocks = env.window_geometry().loaded_blocks(
-                        candidates * mbs)
+                    # whole match for the full-attention group. The region
+                    # ends at the hit's effective end (an EAGLE/MTP drop
+                    # moves it a hash block back).
+                    geometry = env.window_geometry()
+                    load_blocks = geometry.loaded_blocks(candidates * mbs)
+                    end = geometry.hit_end_blocks(candidates * mbs)
                     hashes = full_block_hashes(toks_b, mbs)
                     self.assertEqual(len(hashes), candidates)
                     wait_for_captures(env.capture_dir, "loaded",
@@ -301,7 +304,7 @@ class TestCrossRequestPrefix(unittest.TestCase):
                     assert_loaded_blocks(
                         env.capture_dir,
                         {(f"tp{r}", h) for r in range(env.tp_size)
-                         for h in hashes[candidates - load_blocks:candidates]},
+                         for h in hashes[end - load_blocks:end]},
                         env.tp_size)
                     # No bit-exact comparison here: these references were
                     # captured on the ground-truth server (phase 2), i.e. by a

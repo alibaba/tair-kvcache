@@ -628,6 +628,30 @@ class ScenarioEnv:
                 f"(--max-model-len); raise it via KVCM_E2E_VLLM_ARGS to run "
                 f"this scenario")
 
+    def eagle_dropped_tokens(self) -> int:
+        """Tokens vLLM drops from a windowed hit's matched tail (EAGLE/MTP).
+
+        When the engine runs with a speculative group (KVCM_E2E_VLLM_ARGS
+        enabling EAGLE/MTP), vLLM drops the last matched *hash* block before
+        allocating a windowed hit, so the region the engine serves -- and the
+        connector loads for -- ends one vLLM block before the match the
+        connector reported; the production scheduler mirrors the same drop in
+        ``ConnectorScheduler._window_blocks``. The connector registers the
+        skipped drafter group at engine start (``skip eagle group``), and the
+        drop unit is vLLM's own block size, from the scheduler-init line.
+        Zero when no speculative group is registered (every default run: the
+        geometry then degenerates to the match itself).
+        """
+        if not self.scan_connector_logs(r"skip eagle group \d+"):
+            return 0
+        sizes = [int(g[0]) for g in self.scan_connector_logs(
+            r"scheduler inited.*vllm block size: (\d+)")]
+        assert sizes, (
+            "the connector skipped an EAGLE/MTP group but no scheduler-init "
+            "line reports the vLLM block size; the dropped-block geometry "
+            "cannot be built")
+        return max(sizes)
+
     def window_geometry(self) -> "WindowGeometry":
         """Expectation inputs for the loaded region, cross-checked.
 
@@ -671,18 +695,25 @@ class ScenarioEnv:
                     f"window mismatch: the config says {self.window}, the "
                     f"connector registered {sorted(windows)} for "
                     f"{self.window_kind}")
+        kind = facts.kind or self.window_kind
+        # The EAGLE/MTP drop only exists for *windowed* hits (the production
+        # scheduler compensates it in _window_blocks, which is a windowed
+        # clamp): a full-attention model's external allocation keeps the
+        # whole reported match, so its geometry carries no drop.
+        dropped = self.eagle_dropped_tokens() if kind is not None else 0
         return WindowGeometry(
             # The *registered* window, i.e. the widest one for a deployment with
             # several chunk sizes: the guards built on it (window_blocks, the
             # mid-prefix geometry, the window-crossing gates) have to bound the
             # widest local group, not the single size the config names.
             window=facts.window_tokens or self.window,
-            kind=facts.kind or self.window_kind,
+            kind=kind,
             full_attention_group=self.full_attention_group,
             extra_retained_tokens=facts.extra_retained_tokens,
             manager_block_size=self.manager_block_size(),
             retention_tuples=facts.tuples,
             chunk_sizes=facts.chunk_sizes,
+            eagle_dropped_tokens=dropped,
         )
 
     def connector_block_tables(self) -> int:
@@ -800,6 +831,33 @@ class WindowGeometry:
     #: Every registered chunk size for chunked_local (empty otherwise): kept
     #: for messages and cross-checks; the tails come from ``retention_tuples``.
     chunk_sizes: tuple = ()
+    #: Tokens an EAGLE/MTP group makes vLLM drop from a windowed hit's
+    #: matched tail (see ScenarioEnv.eagle_dropped_tokens): the loaded region
+    #: ends this far before the reported match. Zero without a speculative
+    #: group.
+    eagle_dropped_tokens: int = 0
+
+    def effective_hit_tokens(self, matched_tokens: int) -> int:
+        """Where the loaded suffix of a hit really ends, in tokens.
+
+        With an EAGLE/MTP group registered, vLLM drops the last matched hash
+        block before allocating the windowed hit (the production scheduler
+        demands one vLLM block more of published data for exactly this,
+        ``ConnectorScheduler._window_blocks``): the hit the engine serves --
+        and the connector loads for -- ends ``eagle_dropped_tokens`` before
+        the match the connector reported. Without a speculative group this is
+        the match itself.
+        """
+        return max(0, matched_tokens - self.eagle_dropped_tokens)
+
+    def hit_end_blocks(self, matched_tokens: int) -> int:
+        """Manager block the loaded suffix of a hit really ends at.
+
+        The scenarios' key slices end here, not at the reported match: with
+        EAGLE/MTP the dropped hash block is never loaded, so ending at the
+        match would expect a shifted region and fail a correct run.
+        """
+        return self.effective_hit_tokens(matched_tokens) // self.manager_block_size
 
     @property
     def prefill_unbounded(self) -> bool:
@@ -867,13 +925,17 @@ class WindowGeometry:
         of the hit, so the union over the registered tuples is the widest of
         their tails, evaluated per hit length (which is larger depends on the
         hit: sliding tails nest by span, chunked-local ones align to chunks).
+        The hit is the *effective* one (see ``effective_hit_tokens``): with an
+        EAGLE/MTP group the window vLLM allocates ends a hash block before
+        the reported match, and the tail follows that end.
         """
+        hit = self.effective_hit_tokens(matched_tokens)
         if self.retention_tuples:
-            return max(window_tail_blocks(matched_tokens, w,
+            return max(window_tail_blocks(hit, w,
                                           self.manager_block_size,
                                           extra_retained=e, kind=kind)
                        for kind, w, e in self.retention_tuples)
-        return window_tail_blocks(matched_tokens, self.window,
+        return window_tail_blocks(hit, self.window,
                                   self.manager_block_size,
                                   self.extra_retained_tokens, self.kind)
 
@@ -882,10 +944,13 @@ class WindowGeometry:
 
         The union of the windowed groups' tails (``local_tail``) and, when the
         model has one, a full-attention group's whole matched prefix -- which
-        is what bounds the union for every windowed kind.
+        is what bounds the union for every windowed kind. Both are evaluated
+        at the hit's effective end: an EAGLE/MTP drop moves the whole served
+        region back by the dropped hash block.
         """
+        hit = self.effective_hit_tokens(matched_tokens)
         if self.full_attention_group:
-            return -(-matched_tokens // self.manager_block_size)
+            return -(-hit // self.manager_block_size)
         return self.local_tail(matched_tokens)
 
     def window_tail(self, matched_tokens: int) -> int:
@@ -974,21 +1039,24 @@ def run_e2e(scenario: str, tp_size: int, num_prompts: int,
         phase2_prompts = [p + s for p, s in zip(base_prompts, suffixes)]
         phase2_tokens = [tokenize(vllm.base_url(), p) for p in phase2_prompts]
         if window is not None and geom.chunk_sizes:
-            # A chunked-local group keeps nothing when the *match* ends exactly
-            # on one of its chunk boundaries (vLLM skips every matched token).
-            # The match is the shared prefix rounded down to manager blocks, not
-            # the raw prompt length: mbs=16 with a chunk of 128 turns a
-            # 390-token base into a 384-token match, right on the boundary. So
-            # test the rounded match (suffix re-merge included) and nudge the
-            # prompt until it lands inside every chunk (the same kind of
+            # A chunked-local group keeps nothing when the *hit it is served*
+            # ends exactly on one of its chunk boundaries (vLLM skips every
+            # matched token). The hit is the shared prefix rounded down to
+            # manager blocks, less any EAGLE/MTP drop (the served region ends
+            # a hash block before the reported match), not the raw prompt
+            # length: mbs=16 with a chunk of 128 turns a 390-token base into a
+            # 384-token match, right on the boundary. So test the rounded
+            # match at its effective end (suffix re-merge included) and nudge
+            # the prompt until it lands inside every chunk (the same kind of
             # adjustment the mid-prefix scenario makes).
-            def _match_tokens(b: list, p2: list) -> int:
+            def _hit_tokens(b: list, p2: list) -> int:
                 save = len(b) // mbs
-                return min(shared_token_prefix_len(b, p2) // mbs, save) * mbs
+                return geom.effective_hit_tokens(
+                    min(shared_token_prefix_len(b, p2) // mbs, save) * mbs)
 
             nudges = 0
             while (nudges < 8 and any(
-                    _match_tokens(b, p2) % chunk == 0
+                    _hit_tokens(b, p2) % chunk == 0
                     for b, p2 in zip(base_tokens, phase2_tokens)
                     for chunk in geom.chunk_sizes)):
                 nudges += 1
@@ -1008,7 +1076,7 @@ def run_e2e(scenario: str, tp_size: int, num_prompts: int,
             if nudges:
                 logger.info("nudged the match off the chunk boundaries in %d "
                             "step(s)", nudges)
-            if any(_match_tokens(b, p2) % chunk == 0
+            if any(_hit_tokens(b, p2) % chunk == 0
                    for b, p2 in zip(base_tokens, phase2_tokens)
                    for chunk in geom.chunk_sizes):
                 # Still on a boundary after the cap: the chunk is at most one
@@ -1132,14 +1200,17 @@ def run_e2e(scenario: str, tp_size: int, num_prompts: int,
             return
 
         # The loaded blocks must be exactly the tail window of each match, on
-        # every tp rank -- not merely the right number of blocks.
+        # every tp rank -- not merely the right number of blocks. The region
+        # ends at the hit's *effective* end (EAGLE/MTP drops the last matched
+        # hash block of a windowed hit, see WindowGeometry.hit_end_blocks).
         expected_keys = set()
         for toks, matched, load in zip(phase2_tokens, matched_blocks,
                                        expected_load_blocks):
             hashes = full_block_hashes(toks, mbs)
+            end = geom.hit_end_blocks(matched * mbs)
             for rank in range(tp_size):
                 expected_keys.update(
-                    (f"tp{rank}", h) for h in hashes[matched - load:matched])
+                    (f"tp{rank}", h) for h in hashes[end - load:end])
         assert len(expected_keys) == tp_size * sum(expected_load_blocks)
         assert_loaded_blocks(capture_dir, expected_keys, tp_size)
 

@@ -66,6 +66,7 @@ class TestPartialHit(unittest.TestCase):
             env.start_manager()
             vllm = env.start_vllm(log_suffix="_s12")
             mbs = env.manager_block_size()
+            geom = env.window_geometry()
 
             base = make_base_prompts(1, env.hybrid, env.window)[0]
             # Three nested prompts: A < A+B < A+B+C.
@@ -78,15 +79,60 @@ class TestPartialHit(unittest.TestCase):
             toks_a = tokenize(vllm.base_url(), prompt_a)
             toks_ab = tokenize(vllm.base_url(), prompt_ab)
             toks_abc = tokenize(vllm.base_url(), prompt_abc)
-            env.guard_prompt_fits(toks_abc, "partial_hit", max_tokens=4)
             blocks_a = len(toks_a) // mbs
             blocks_ab = len(toks_ab) // mbs
             shared_abc = min(shared_token_prefix_len(toks_ab, toks_abc) // mbs,
                              blocks_ab)
-            load_blocks = env.window_geometry().loaded_blocks(shared_abc * mbs)
+            load_blocks = geom.loaded_blocks(shared_abc * mbs)
+            # Stage 3's whole point is the loaded region, so the shared
+            # prefix must not land where a windowed group keeps nothing: a
+            # chunked-local group served a hit ending exactly on one of its
+            # chunk boundaries skips every matched token, leaving zero loaded
+            # blocks, an empty expected key set and a vacuous pass. Nudge the
+            # shared prefix inside every registered chunk (the same
+            # adjustment the standard runner makes), testing the hit at its
+            # effective end -- an EAGLE/MTP drop moves it a hash block back.
+            nudges = 0
+            while (nudges < 8 and geom.chunk_sizes
+                   and any(geom.effective_hit_tokens(shared_abc * mbs) % chunk
+                           == 0 for chunk in geom.chunk_sizes)):
+                nudges += 1
+                extra = " ".join(f"Realign{nudges}x{j}" for j in range(nudges))
+                prompt_ab = f"{prompt_ab} {extra}"
+                prompt_abc = prompt_ab + " Final question: what is 2+2?"
+                toks_ab = tokenize(vllm.base_url(), prompt_ab)
+                toks_abc = tokenize(vllm.base_url(), prompt_abc)
+                blocks_ab = len(toks_ab) // mbs
+                shared_abc = min(
+                    shared_token_prefix_len(toks_ab, toks_abc) // mbs, blocks_ab)
+                load_blocks = geom.loaded_blocks(shared_abc * mbs)
+            if nudges:
+                logger.info("nudged the shared prefix off the chunk "
+                            "boundaries in %d step(s)", nudges)
+            if (geom.chunk_sizes
+                    and any(geom.effective_hit_tokens(shared_abc * mbs) % chunk
+                            == 0 for chunk in geom.chunk_sizes)):
+                # Still on a boundary after the cap: the chunk is at most one
+                # manager block wide, so no shared prefix can keep a block
+                # for it -- the windowed loaded region is empty by
+                # construction and stage 3 would pass without verifying any
+                # load at all.
+                raise unittest.SkipTest(
+                    f"no shared prefix keeps a block for chunk size(s) "
+                    f"{sorted(geom.chunk_sizes)} at mbs={mbs} (a chunk that "
+                    f"small is inside one manager block); the stage-3 "
+                    f"loaded-region assertions would be vacuous")
+            # Gate what is actually sent (the nudged prompts, not the ones
+            # the gate used to see before this loop existed).
+            env.guard_prompt_fits(toks_abc, "partial_hit", max_tokens=4)
             self.assertGreaterEqual(blocks_a, 1)
             self.assertGreater(blocks_ab, blocks_a,
                                "B must add at least one manager block")
+            self.assertGreater(
+                load_blocks, 0,
+                f"a shared prefix of {shared_abc} blocks loads nothing "
+                f"(kind={geom.kind}, window={geom.window}, mbs={mbs}); "
+                f"stage 3 would verify no load at all")
             logger.info("blocks: A=%d AB=%d shared(AB,ABC)=%d load=%d window=%s",
                         blocks_a, blocks_ab, shared_abc, load_blocks, env.window)
 
@@ -117,10 +163,14 @@ class TestPartialHit(unittest.TestCase):
                               expected=env.tp_size * load_blocks, timeout=180)
 
             hashes = full_block_hashes(toks_abc, mbs)
+            # The loaded region ends at the hit's effective end: an
+            # EAGLE/MTP group drops the last matched hash block before the
+            # windowed hit is allocated (see WindowGeometry.hit_end_blocks).
+            end = geom.hit_end_blocks(shared_abc * mbs)
             assert_loaded_blocks(
                 env.capture_dir,
                 {(f"tp{r}", h) for r in range(env.tp_size)
-                 for h in hashes[shared_abc - load_blocks:shared_abc]},
+                 for h in hashes[end - load_blocks:end]},
                 env.tp_size)
 
             report = compare_captures(env.capture_dir)
@@ -205,12 +255,31 @@ class TestPartialHit(unittest.TestCase):
                                     f"mid-prefix hit with a {window_blocks}-block "
                                     f"window")
             # A chunked_local hit ending exactly on a chunk boundary skips
-            # every matched token (that manager keeps the *next* chunk), so the
-            # windowed groups would keep nothing and the assertions below would
-            # be vacuous. Step one manager block back inside the chunk; sliding
-            # tails are never empty, so this only moves the chunked case.
-            if geom.window_tail(mid * mbs) == 0 and mid > window_blocks:
+            # every matched token *of that group* (its manager keeps the
+            # next chunk), and several chunk sizes can be registered at once:
+            # the union tail can be nonzero while one group keeps nothing --
+            # the assertions below would then never exercise that group. Step
+            # back inside the chunks of *every* registered size, the same
+            # adjustment the standard runner and the full-hit scenario make;
+            # sliding tails are never empty, so this only moves the chunked
+            # case. The boundary is tested at the hit's effective end -- an
+            # EAGLE/MTP drop moves it a hash block back.
+            while (mid > window_blocks and geom.chunk_sizes
+                   and any(geom.effective_hit_tokens(mid * mbs) % chunk == 0
+                           for chunk in geom.chunk_sizes)):
                 mid -= 1
+            if (geom.chunk_sizes
+                    and any(geom.effective_hit_tokens(mid * mbs) % chunk == 0
+                            for chunk in geom.chunk_sizes)):
+                # The loop stopped at its floor with a boundary remaining:
+                # the chunk is at most one manager block wide, so no hit
+                # length can keep a block for it -- the windowed assertions
+                # would be vacuous for that group whatever mid is chosen.
+                raise unittest.SkipTest(
+                    f"no hit length keeps a block for chunk size(s) "
+                    f"{sorted(geom.chunk_sizes)} at mbs={mbs} (a chunk that "
+                    f"small is inside one manager block); the mid-prefix "
+                    f"loaded-region assertions would be vacuous")
             self.assertGreater(
                 geom.window_tail(mid * mbs), 0,
                 f"a mid-prefix hit of {mid} blocks keeps no windowed block "
@@ -250,8 +319,12 @@ class TestPartialHit(unittest.TestCase):
             # that supplies the extra retained tokens only exists once the
             # engine has started.
             covered = env.window_geometry().loaded_blocks(mid * mbs)
+            # The region ends at the hit's effective end: an EAGLE/MTP group
+            # drops the last matched hash block before the windowed hit is
+            # allocated (see WindowGeometry.hit_end_blocks).
+            end = env.window_geometry().hit_end_blocks(mid * mbs)
             expected_keys = {(f"tp{r}", h) for r in range(env.tp_size)
-                             for h in hashes[mid - covered:mid]}
+                             for h in hashes[end - covered:end]}
             # ... and that whole region is disjoint from A's own tail window
             # (the region a "just serve the stored tail" implementation would
             # have loaded), so the scenario can tell "region of the hit" from

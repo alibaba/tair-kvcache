@@ -25,6 +25,15 @@ the failure. Asserts: the request still returns (no hang, no crash) and the
 failure was logged. KV content is NOT verified: with the failure swallowed
 the affected blocks keep garbage by design.
 
+Windowed multi-group models split by vLLM era: on vLLM >= 0.30 the connector
+reports the failure at request granularity (KVConnectorTransferResults) and
+vLLM recomputes the request -- asserted like the single-table case above. On
+the pre-0.30 eras there is no request-level API, so the connector fails
+closed (get_finished raises rather than resume the request on partially
+loaded KV): the completion errors out, and that intended refusal -- plus the
+request-granularity detection log that precedes it -- is what the scenario
+asserts there.
+
 This scenario also regression-tests the fail-reschedule loop fix: a request
 whose external load failed must not re-match external blocks on requeue
 (v1_connector.get_num_new_matched_tokens retry guard), otherwise the engine
@@ -41,8 +50,8 @@ import requests
 
 from e2e_lib import (
     ScenarioEnv, assert_no_capture_error, compare_captures, full_block_hashes,
-    make_base_prompts, send_completions, tokenize, wait_for_captures,
-    wait_for_prefix_cached,
+    make_base_prompts, send_completions, supports_request_level_load_failures,
+    tokenize, wait_for_captures, wait_for_prefix_cached,
 )
 
 logger = logging.getLogger("vllm_e2e")
@@ -137,6 +146,35 @@ class TestLoadFailure(unittest.TestCase):
                 # is what forces the load through KVCM.
                 vllm = env.restart_vllm(log_suffix="_p2")
 
+            # A windowed multi-group model on a vLLM without the request-level
+            # load-failure API (pre-0.30) never reaches the branches below:
+            # the connector deliberately fails closed there (get_finished
+            # raises rather than resume the request on partially loaded KV),
+            # so the completion errors out and the engine dies with it. Pin
+            # that intended refusal here -- the request-level recompute the
+            # newer eras perform is asserted in the main flow below.
+            fail_closed = (env.connector_block_tables() > 1
+                           and env.window_geometry().window is not None
+                           and not supports_request_level_load_failures())
+            if fail_closed:
+                with self.assertRaises(requests.RequestException):
+                    send_completions(vllm.base_url(), [prompt + suffix])
+                # The connector still detected and logged the failure at
+                # request granularity on its way out, and the sabotage path
+                # really ran (individual load tasks failed).
+                reported = env.scan_connector_logs(
+                    r"load failed for \d+/\d+ blocks of req .*windowed "
+                    r"multi-group")
+                self.assertTrue(
+                    reported,
+                    "the windowed multi-group load failure was not detected "
+                    "at request granularity on the fail-closed era")
+                self.assertTrue(env.scan_connector_logs(r"load task failed"),
+                                "no load failure was logged; the sabotage did "
+                                "not break any loaded block")
+                assert_no_capture_error(env.capture_dir)
+                return
+
             # ---- Phase 2: load with holes. The request must return normally.
             resp = send_completions(vllm.base_url(), [prompt + suffix])[0]
             self.assertTrue(resp["choices"][0]["text"])
@@ -159,7 +197,8 @@ class TestLoadFailure(unittest.TestCase):
                 # Keyed on the *registered* block-table count, not on the
                 # model family: a single-group windowed model reports like
                 # full attention even though is_multigroup()/env.hybrid are
-                # true for it.
+                # true for it. (Pre-0.30 windowed runs were already answered
+                # by the fail-closed branch above.)
                 if env.window_geometry().window is not None:
                     reported = env.scan_connector_logs(
                         r"load failed for \d+/\d+ blocks of req .*windowed "
@@ -203,8 +242,13 @@ class TestLoadFailure(unittest.TestCase):
             # in the deleted half, leaving nothing to verify beyond the failure
             # report itself.
             geom = env.window_geometry()
-            allocated_from = max(0, save_blocks - geom.window_tail(save_blocks * mbs))
-            load_blocks = max(0, min(save_blocks, keep) - allocated_from)
+            # The originally allocated region starts where the windowed tail
+            # of the *whole match* begins (the full group's region starts at
+            # block 0), ending at the match's effective end: an EAGLE/MTP
+            # drop moves the whole served region a hash block back.
+            end = geom.hit_end_blocks(save_blocks * mbs)
+            allocated_from = max(0, end - geom.window_tail(save_blocks * mbs))
+            load_blocks = max(0, min(end, keep) - allocated_from)
             wait_for_captures(env.capture_dir, "loaded", expected=load_blocks,
                               timeout=180)
             report = compare_captures(env.capture_dir)

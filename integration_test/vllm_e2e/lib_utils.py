@@ -71,8 +71,13 @@ _SWA_ARCH_MARKERS = ("Gemma2", "Gemma3", "GptOss", "Llama4")
 #: prefill stays visible and only the decode gap is evicted (RSWASpec, window
 #: rswa_window). vLLM *injects* its default window when the checkpoint does not
 #: declare one, so the architecture is the reliable signal and the window falls
-#: back to the same value vLLM uses.
-_RSWA_ARCH_MARKERS = ("UnlimitedOCR",)
+#: back to the same value vLLM uses. The markers name the *checkpoint*
+#: architectures (what config.json declares), not vLLM's internal config class
+#: (``UnlimitedOCRForCausalLMConfig``): the official DeepSeek-OCR-2 config
+#: declares ``DeepseekOCR2ForCausalLM``, nests its language model under
+#: ``language_config`` and declares no ``rswa_window`` -- its layers still run
+#: R-SWA with the injected default.
+_RSWA_ARCH_MARKERS = ("UnlimitedOCR", "DeepseekOCR2")
 _RSWA_DEFAULT_WINDOW = 128
 
 
@@ -159,9 +164,24 @@ def window_kind(model_path: str) -> Optional[str]:
     return None
 
 
+def _rswa_sources(text_cfg: dict, cfg: dict):
+    """Config scopes an R-SWA knob may live in.
+
+    The nesting differs per family: plain models and ``text_config`` models
+    (gemma-3) keep it at the top of the text config, while the DeepSeek
+    OCR/VL2 line nests the language model under ``language_config`` and puts
+    its knobs there. Both shapes are yielded, top level last.
+    """
+    yield text_cfg
+    language = cfg.get("language_config")
+    if isinstance(language, dict):
+        yield language
+    yield cfg
+
+
 def _has_rswa(text_cfg: dict, cfg: dict) -> bool:
     """Is this an R-SWA checkpoint (declared or by architecture)?"""
-    for source in (text_cfg, cfg):
+    for source in _rswa_sources(text_cfg, cfg):
         value = source.get("rswa_window")
         if isinstance(value, int) and value > 0:
             return True
@@ -185,7 +205,7 @@ def window_tokens(model_path: str) -> Optional[int]:
         return None
     text_cfg = cfg.get("text_config", cfg)
     if _has_rswa(text_cfg, cfg):
-        for source in (text_cfg, cfg):
+        for source in _rswa_sources(text_cfg, cfg):
             value = source.get("rswa_window")
             if isinstance(value, int) and value > 0:
                 return value
@@ -398,6 +418,28 @@ def model_fingerprint(model_path: str) -> tuple:
     tier = tuple(text_cfg.get(key) if isinstance(text_cfg.get(key), int)
                  else None for key in ("num_hidden_layers", "hidden_size"))
     return (archs[0] if archs else None, window_tokens(model_path), tier)
+
+
+def supports_request_level_load_failures() -> bool:
+    """Does this vLLM era expose the request-level load-failure path?
+
+    vLLM >= 0.30 carries a failed (multi-group, unreportable-by-block) load
+    through ``KVConnectorTransferResults.failed_recving``, and the engine
+    recomputes or fails the request per kv_load_failure_policy. Older eras
+    have no such API: the production connector fails closed instead
+    (``TairKvCacheConnector.get_finished`` raises rather than resume a
+    request on partially loaded KV), so a completion whose load failed errors
+    out -- the intended behaviour there, not a regression. Probed by import
+    (the same gate the connector itself uses), not by version string: the
+    symbol is the API.
+    """
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorTransferResults,  # noqa: F401
+        )
+        return True
+    except ImportError:
+        return False
 
 
 def scenario_tp_size(default: int = 1) -> int:

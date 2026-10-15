@@ -61,13 +61,17 @@ class TestFullHit(unittest.TestCase):
             geom = env.window_geometry()
             expected_hit = (num_blocks - 1) * mbs
             while (expected_hit > mbs and geom.chunk_sizes
-                   and any(expected_hit % chunk == 0
+                   and any(geom.effective_hit_tokens(expected_hit) % chunk == 0
                            for chunk in geom.chunk_sizes)):
-                # A chunked-local group keeps nothing when the hit ends exactly
-                # on one of its chunk boundaries: the loaded set would be empty
-                # and this scenario would pass vacuously (no capture, no key,
-                # min_matched=0). Drop one more block -- the non-hybrid hit is
-                # ours to choose -- until it lands inside the chunks.
+                # A chunked-local group keeps nothing when the hit it is
+                # served ends exactly on one of its chunk boundaries: the
+                # loaded set would be empty and this scenario would pass
+                # vacuously (no capture, no key, min_matched=0). Drop one
+                # more block -- the non-hybrid hit is ours to choose -- until
+                # it lands inside the chunks. The boundary is tested at the
+                # effective end: an EAGLE/MTP drop moves the served region a
+                # hash block back, and that is the region that must keep
+                # blocks.
                 expected_hit -= mbs
             if env.hybrid:
                 import torch
@@ -96,7 +100,8 @@ class TestFullHit(unittest.TestCase):
                     ((i + 1) * mbs for i, names in enumerate(checkpoints[:-1])
                      if names == state_layers), default=0)
                 if (expected_hit and geom.chunk_sizes and any(
-                        expected_hit % chunk == 0 for chunk in geom.chunk_sizes)):
+                        geom.effective_hit_tokens(expected_hit) % chunk == 0
+                        for chunk in geom.chunk_sizes)):
                     # Here the hit is fixed by the state checkpoints (a partial
                     # hit is only safe on a complete one), so it cannot be moved
                     # off the boundary: refuse to run rather than pass with an
@@ -137,7 +142,6 @@ class TestFullHit(unittest.TestCase):
             # for: the tail window of every group, plus the whole matched
             # prefix when the model has a full-attention group.
             if expected_hit:
-                matched_blocks = expected_hit // mbs
                 # ...and the windowed groups have to keep something, or the
                 # union assertion below says nothing about them (a full group's
                 # captures would otherwise mask an empty local tail).
@@ -149,13 +153,17 @@ class TestFullHit(unittest.TestCase):
                 # Registered geometry, like every other scenario: the extra
                 # retained tokens of a purely windowed model live there.
                 load_blocks = env.window_geometry().loaded_blocks(expected_hit)
+                # The loaded region ends at the hit's effective end: an
+                # EAGLE/MTP group drops the last matched hash block before
+                # the windowed hit is allocated.
+                end = env.window_geometry().hit_end_blocks(expected_hit)
                 hashes = full_block_hashes(prompt_ids, mbs)
                 wait_for_captures(env.capture_dir, "loaded",
                                   expected=env.tp_size * load_blocks, timeout=180)
                 assert_loaded_blocks(
                     env.capture_dir,
                     {(f"tp{r}", h) for r in range(env.tp_size)
-                     for h in hashes[matched_blocks - load_blocks:matched_blocks]},
+                     for h in hashes[end - load_blocks:end]},
                     env.tp_size)
                 # ...and those captures have to match the phase-1 references
                 # byte for byte: the key set alone cannot see a gather/scatter
