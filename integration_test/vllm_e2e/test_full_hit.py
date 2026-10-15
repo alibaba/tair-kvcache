@@ -38,6 +38,11 @@ class TestFullHit(unittest.TestCase):
             vllm = env.start_vllm(log_suffix="_p1" if env.multigroup else "")
 
             mbs = env.manager_block_size()
+            # The registered geometry is readable right here: the engine has
+            # started and the connector's registration line is already in the
+            # logs, so the trim below can step off chunk boundaries *before*
+            # anything is saved.
+            geom = env.window_geometry()
             # Trim a long-enough prompt's token ids to an exact multiple of the
             # manager block size (>= 2 blocks so the cap has room to drop one).
             toks = tokenize(vllm.base_url(),
@@ -45,7 +50,28 @@ class TestFullHit(unittest.TestCase):
             num_blocks = len(toks) // mbs
             self.assertGreaterEqual(
                 num_blocks, 2, f"prompt too short: {len(toks)} tokens, mbs={mbs}")
+            while (num_blocks > 2 and geom.chunk_sizes and any(
+                    geom.effective_hit_tokens((num_blocks - 1) * mbs) % chunk
+                    == 0 for chunk in geom.chunk_sizes)):
+                # A chunked-local group keeps nothing when the hit it is
+                # served ends exactly on one of its chunk boundaries: the
+                # loaded set would be empty and this scenario would pass
+                # vacuously (no capture, no key, min_matched=0). Drop one
+                # more block -- the non-hybrid hit is ours to choose -- until
+                # it lands inside the chunks. The block is dropped from the
+                # prompt itself, not just from the expectation: phase 2
+                # resends these very token ids and the connector's cap leaves
+                # exactly num_blocks - 1 of them computed, so lowering the
+                # expectation alone would assert against a match the
+                # connector never reports. The boundary is tested at the
+                # effective end: an EAGLE/MTP drop moves the served region a
+                # hash block back, and that is the region that must keep
+                # blocks.
+                num_blocks -= 1
             prompt_ids = toks[:num_blocks * mbs]
+            # The safe hit of the full resent prompt: the cap holds one block
+            # back for the token the logits are sampled from.
+            expected_hit = (num_blocks - 1) * mbs
             # Gate what is actually sent (the block-aligned trim above).
             env.guard_prompt_fits(prompt_ids, "full_hit", max_tokens=4)
             logger.info("full-hit prompt: %d tokens = %d x %d",
@@ -58,21 +84,6 @@ class TestFullHit(unittest.TestCase):
                 env.manager.manager_uri(), env.instance_id, prompt_ids,
                 min_blocks=num_blocks))
 
-            geom = env.window_geometry()
-            expected_hit = (num_blocks - 1) * mbs
-            while (expected_hit > mbs and geom.chunk_sizes
-                   and any(geom.effective_hit_tokens(expected_hit) % chunk == 0
-                           for chunk in geom.chunk_sizes)):
-                # A chunked-local group keeps nothing when the hit it is
-                # served ends exactly on one of its chunk boundaries: the
-                # loaded set would be empty and this scenario would pass
-                # vacuously (no capture, no key, min_matched=0). Drop one
-                # more block -- the non-hybrid hit is ours to choose -- until
-                # it lands inside the chunks. The boundary is tested at the
-                # effective end: an EAGLE/MTP drop moves the served region a
-                # hash block back, and that is the region that must keep
-                # blocks.
-                expected_hit -= mbs
             if env.hybrid:
                 import torch
 

@@ -978,25 +978,42 @@ def retention_facts_from_logs(lines: list) -> RetentionFacts:
 _TRANSFER_GROUP_RE = re.compile(r"'(tp\d+)_g(\d+)(?:_b\d+)?'")
 
 
-def block_tables_from_names(lines: list) -> int:
-    """Block-table count from the connector's own transfer-group names.
+def block_tables_from_names(lines: list, skipped_indices: list = ()) -> int:
+    """Block-table count from the connector's registration-time shape.
 
     The connector's load-failure reporting mode depends on how many vLLM block
     tables the request carries (``report_failures = len(all_block_ids) == 1``)
-    -- *tables*, not transfer buckets: a packed table is several buckets sharing
-    one index, so counting names would misread a single-table model as a
-    multi-table one and expect the wrong failure path. Deduplicating the index
-    (rank suffix dropped: every rank registers the same layout) reads the same
-    number the connector uses. Disagreeing indices are not an error in
-    themselves (each rank repeats the whole set), but an empty registration is.
+    -- *tables*, not transfer buckets: a packed table is several buckets
+    sharing one index, so counting names would misread a single-table model as
+    a multi-table one and expect the wrong failure path. Deduplicating the
+    index (rank suffix dropped: every rank registers the same layout) reads
+    the same number the connector uses.
+
+    ``skipped_indices`` are the block-table indices the connector announced
+    skipping at registration (its ``skip <spec> group <idx> (<n> layers)``
+    lines: an EAGLE/MTP drafter, per-request scratch, a group the engine
+    keeps to itself). A skipped table carries no transfer-group name yet
+    still counts in ``all_block_ids`` -- the very list production branches on
+    -- so leaving it out would read a drafter-carrying single-table model as
+    single-table and wait for the block-id report the connector never sends.
+    vLLM numbers its tables 0..N-1 and each is announced one way or the
+    other, so the union is contiguous; a gap fails loudly instead of silently
+    picking a failure branch. Disagreeing indices are not an error in
+    themselves (each rank repeats the whole set), but an empty registration
+    is.
     """
     indices = set()
     for line in lines:
         text = line if isinstance(line, str) else " ".join(map(str, line))
         for rank, idx in _TRANSFER_GROUP_RE.findall(text):
-            indices.add(idx)
+            indices.add(int(idx))
+    indices.update(int(i) for i in skipped_indices)
     assert indices, ("no connector transfer-group registration found; the "
                      "load-failure branch cannot be decided")
+    assert indices == set(range(len(indices))), (
+        f"announced block-table indices {sorted(indices)} are not contiguous: "
+        f"a vLLM block table was announced by neither its transfer-group "
+        f"name nor a skip line, so the load-failure branch cannot be decided")
     return len(indices)
 
 

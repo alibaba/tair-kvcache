@@ -722,13 +722,20 @@ class ScenarioEnv:
         The load-failure reporting mode follows this *actual* shape, not the
         model family: the connector reports invalid blocks to vLLM only with a
         single block table (``len(load_req.all_block_ids) == 1``) and otherwise
-        swallows the failure into a log line. Read from the transfer-group names
-        the connector registers, deduplicated by table index -- a packed table
-        is several buckets sharing one index, and counting buckets would read a
-        single-table model as a multi-table one.
+        swallows the failure into a log line. Read from the registration-time
+        shape -- the transfer-group names the connector registers *and* the
+        tables it announces skipping (``skip ... group N``): a skipped
+        EAGLE/MTP drafter table has no name yet still counts in
+        ``all_block_ids``, so names alone would misread that deployment as
+        single-table and wait for the block-id report it never sends. Packed
+        tables are deduplicated by table index (several buckets share one
+        table).
         """
+        skipped = {int(g[0]) for g in self.scan_connector_logs(
+            r"skip \w+ group (\d+) \(\d+ layers\)")}
         return block_tables_from_names(
-            self.scan_connector_logs(r"register_kv_caches done.*"))
+            self.scan_connector_logs(r"register_kv_caches done.*"),
+            sorted(skipped))
 
     def assert_pinned_budget(self):
         """Read the connector's pinned total out of the engine logs and gate it.
