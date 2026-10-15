@@ -67,4 +67,68 @@ TEST_F(CapacityPlanningWindowTest, PartialStartupAndReset) {
     ASSERT_TRUE(result);
     EXPECT_EQ(0, result->reuse.count);
 }
+TEST_F(CapacityPlanningWindowTest, FourWindowsMergeRawSamplesAndDiluteShortBurst) {
+    CapacityPlanningWindows windows;
+    constexpr int64_t start = 3600000;
+    windows.Complete(start);
+    for (int slice = 0; slice < 12; ++slice) {
+        const int count = slice == 0 ? 1 : 1000;
+        for (int sample = 0; sample < count; ++sample) {
+            windows.reuse()->Record(slice == 0 ? 36000000000000ULL : 1000000000ULL);
+            windows.RecordFact(RequestFact{{{slice == 0 ? 100ULL : 2ULL, 1}}});
+        }
+        for (int report = 1; report < 10; ++report) {
+            for (const auto &result : windows.Complete(start + slice * 300000 + report * 30000)) {
+                EXPECT_FALSE(result);
+            }
+        }
+        const auto results = windows.Complete(start + (slice + 1) * 300000);
+        for (std::size_t i = 0; i < results.size(); ++i) {
+            const auto width = CapacityPlanningWindows::kWindowsMs[i] / 300000;
+            ASSERT_EQ((slice + 1) % width == 0, results[i].has_value());
+            if (!results[i]) {
+                continue;
+            }
+            const auto &result = *results[i];
+            EXPECT_EQ(start + (slice + 1) * 300000 - 1, result.timestamp_ms);
+            EXPECT_EQ((slice + 1 == width ? (width - 1) * 1000 + 1 : width * 1000), result.reuse.count);
+            if (slice == 0) {
+                EXPECT_EQ(36000000000000ULL, result.reuse.p99_ns);
+                EXPECT_EQ(100, result.required_blocks);
+            } else {
+                EXPECT_GE(result.reuse.p99_ns, 1000000000ULL);
+                EXPECT_LT(result.reuse.p99_ns, 1008000000ULL);
+                EXPECT_EQ(2, result.required_blocks);
+            }
+        }
+        for (const auto &result : windows.Complete(start + (slice + 1) * 300000)) {
+            EXPECT_FALSE(result); // No repeated merge on report/request boundary.
+        }
+    }
+}
+
+TEST_F(CapacityPlanningWindowTest, FourWindowsLateReportPartialStartupResetAndClockRegression) {
+    CapacityPlanningWindows windows;
+    windows.Complete(3599999);
+    windows.reuse()->Record(100);
+    windows.RecordFact(RequestFact{{{9, 1}}});
+    const auto results = windows.Complete(10800000);
+    for (const auto &result : results) {
+        ASSERT_TRUE(result);
+        EXPECT_EQ(3599999, result->timestamp_ms);
+        EXPECT_EQ(1, result->reuse.count);
+        EXPECT_EQ(9, result->required_blocks);
+    }
+    windows.reuse()->Record(200);
+    for (const auto &result : windows.Complete(3600000)) {
+        EXPECT_FALSE(result);
+    }
+    windows.Reset();
+    windows.Complete(10800000);
+    for (const auto &result : windows.Complete(14400000)) {
+        ASSERT_TRUE(result);
+        EXPECT_EQ(0, result->reuse.count);
+        EXPECT_EQ(0, result->required_blocks);
+    }
+}
 } // namespace kv_cache_manager

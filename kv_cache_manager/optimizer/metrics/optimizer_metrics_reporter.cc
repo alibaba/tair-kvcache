@@ -164,23 +164,16 @@ void OptimizerMetricsReporter::ReportInterval() {
         // Both backends consume the same window; never Take() twice.
         kmonitor_reporter_->ReportInterval(summaries, interval_metrics, mrc_metrics, reuse_metrics, history_metrics);
     }
-    for (const auto &metric : history_metrics) {
-        for (size_t slot = 0; slot < metric.points.size(); ++slot) {
-            MetricsTags tags = {{"instance_group", metric.instance_group},
-                                {"instance_id", metric.instance_id},
-                                {"slot", std::to_string(slot)}};
-            const auto &point = metric.points[slot];
-            // Empty slots are explicitly cleared, never held at stale values.
-            metrics_registry_->GetGauge("trace_query_capacity_history_p99_timestamp_ms", tags) = point.timestamp_ms;
-            metrics_registry_->GetGauge("trace_query_capacity_history_p99_bytes", tags) = point.capacity_bytes;
-        }
-    }
 }
 
 void OptimizerMetricsReporter::ReportCapacityHistoryV2(const std::vector<CapacityHistoryMetricInfo> &history_metrics) {
     MetricsRegistry::GaugeSnapshot snapshot = {{"trace_query_capacity_history_p99_v2_bytes", {}},
-                                               {"trace_query_capacity_history_p99_v2_observed_ms", {}}};
+                                               {"trace_query_capacity_history_p99_v2_observed_ms", {}},
+                                               {"trace_query_capacity_history_p99_window_bytes", {}},
+                                               {"trace_query_capacity_history_p99_window_observed_ms", {}}};
     for (const auto &metric : history_metrics) {
+        const std::string prefix = metric.source_window_ms == 300000 ? "trace_query_capacity_history_p99_v2_"
+                                                                     : "trace_query_capacity_history_p99_window_";
         for (const auto &point : metric.points) {
             if (point.timestamp_ms <= 0 || metric.observed_ms <= 0) {
                 continue;
@@ -190,8 +183,11 @@ void OptimizerMetricsReporter::ReportCapacityHistoryV2(const std::vector<Capacit
                                 {"history_time_ms", std::to_string(point.timestamp_ms)},
                                 {"history_shard", std::to_string((point.timestamp_ms / CapacityHistory::kStepMs) % 4)},
                                 {"history_generation", metric.generation}};
-            snapshot["trace_query_capacity_history_p99_v2_bytes"].emplace_back(tags, point.capacity_bytes);
-            snapshot["trace_query_capacity_history_p99_v2_observed_ms"].emplace_back(tags, metric.observed_ms);
+            if (metric.source_window_ms != 300000) {
+                tags["source_window_seconds"] = std::to_string(metric.source_window_ms / 1000);
+            }
+            snapshot[prefix + "bytes"].emplace_back(tags, point.capacity_bytes);
+            snapshot[prefix + "observed_ms"].emplace_back(tags, metric.observed_ms);
         }
     }
     // Expiry removes series instead of writing zero. Historical samples remain

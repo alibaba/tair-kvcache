@@ -23,6 +23,12 @@ struct MrcWindowPoint {
 class MrcWindow {
 public:
     void Record(const RequestFact &fact);
+    void Merge(const MrcWindow &other) {
+        total_hits_ += other.total_hits_;
+        for (const auto &[capacity, delta] : other.hit_count_deltas_) {
+            hit_count_deltas_[capacity] += delta;
+        }
+    }
     uint64_t RequiredBlocks(uint32_t target_basis_points) const { return ComputeRequiredBlocks(target_basis_points); }
     std::vector<MrcWindowPoint> Take();
     void Reset();

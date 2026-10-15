@@ -671,7 +671,7 @@ TEST_F(OptimizerMetricsReporterTest, PlanningWindowHistoryIsolationAndReset) {
     std::vector<ReuseIntervalMetricInfo> reuse;
     std::vector<CapacityHistoryMetricInfo> history;
     ASSERT_EQ(EC_OK, manager_->TakePlanningMetrics(now, mrc, reuse, history));
-    ASSERT_EQ(2, history.size());
+    ASSERT_EQ(8, history.size());
     for (const auto &metric : history) {
         size_t count = 0;
         for (const auto &point : metric.points) {
@@ -680,7 +680,7 @@ TEST_F(OptimizerMetricsReporterTest, PlanningWindowHistoryIsolationAndReset) {
                 EXPECT_EQ(2048, point.capacity_bytes);
             }
         }
-        EXPECT_EQ(metric.instance_id == "inst1" ? 3 : 0, count);
+        EXPECT_EQ(metric.instance_id == "inst1" && metric.source_window_ms == 300000 ? 3 : 0, count);
     }
     manager_->TakePlanningMetrics(now, mrc, reuse, history);
     for (const auto &metric : reuse) {
@@ -694,9 +694,8 @@ TEST_F(OptimizerMetricsReporterTest, PlanningWindowHistoryIsolationAndReset) {
         }
     }
     reporter_->ReportInterval();
-    MetricsTags tags = {{"instance_group", "grp1"}, {"instance_id", "inst1"}, {"slot", "0"}};
-    EXPECT_DOUBLE_EQ(0, registry_->GetGauge("trace_query_capacity_history_p99_timestamp_ms", tags).Get());
-    EXPECT_DOUBLE_EQ(0, registry_->GetGauge("trace_query_capacity_history_p99_bytes", tags).Get());
+    EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_capacity_history_p99_timestamp_ms"));
+    EXPECT_EQ(nullptr, registry_->GetMetricsData("trace_query_capacity_history_p99_bytes"));
 }
 
 TEST_F(OptimizerMetricsReporterTest, HistoryV2ImmutableTimeIdentityAndBoundedExpiry) {
@@ -745,6 +744,38 @@ TEST_F(OptimizerMetricsReporterTest, HistoryV2ImmutableTimeIdentityAndBoundedExp
     reporter_->ReportCapacityHistoryV2({});
     EXPECT_EQ(0, registry_->GetMetricsData(bytes)->GetSize());
     EXPECT_EQ(0, registry_->GetMetricsData(observed)->GetSize());
+}
+
+TEST_F(OptimizerMetricsReporterTest, SourceWindowsHaveIndependentSeriesAndExpireTogether) {
+    CapacityHistoryMetricInfo metric;
+    metric.instance_id = "inst1";
+    metric.instance_group = "grp1";
+    metric.generation = "g";
+    metric.observed_ms = 3600000;
+    metric.points = {};
+    std::vector<CapacityHistoryMetricInfo> histories;
+    for (const auto window_ms : CapacityPlanningWindows::kWindowsMs) {
+        metric.source_window_ms = window_ms;
+        metric.points[1] = {300000, window_ms};
+        histories.push_back(metric);
+    }
+    reporter_->ReportCapacityHistoryV2(histories);
+    EXPECT_EQ(1, registry_->GetMetricsData("trace_query_capacity_history_p99_v2_bytes")->GetSize());
+    auto data = registry_->GetMetricsData("trace_query_capacity_history_p99_window_bytes");
+    ASSERT_EQ(3, data->GetSize());
+    for (const auto seconds : {900, 1800, 3600}) {
+        MetricsTags tags = {{"instance_id", "inst1"},
+                            {"instance_group", "grp1"},
+                            {"history_time_ms", "300000"},
+                            {"history_shard", "1"},
+                            {"history_generation", "g"},
+                            {"source_window_seconds", std::to_string(seconds)}};
+        ASSERT_TRUE(data->GetGauge(tags).has_value());
+        EXPECT_EQ(seconds * 1000, data->GetGauge(tags)->Get());
+    }
+    reporter_->ReportCapacityHistoryV2({});
+    EXPECT_EQ(0, registry_->GetMetricsData("trace_query_capacity_history_p99_window_bytes")->GetSize());
+    EXPECT_EQ(0, registry_->GetMetricsData("trace_query_capacity_history_p99_window_observed_ms")->GetSize());
 }
 
 } // namespace kv_cache_manager

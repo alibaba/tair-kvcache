@@ -65,10 +65,12 @@ int64_t SaturatingMultiplyToInt64(uint64_t lhs, uint64_t rhs) {
 
 void CompleteCapacityPlanningWindow(InstanceState &state, int64_t now_ms) {
     const auto completed = state.capacity_planning_window.Complete(now_ms);
-    if (completed && completed->reuse.count > 0) {
-        const auto bytes =
-            SaturatingMultiplyToInt64(completed->required_blocks, static_cast<uint64_t>(state.size_full));
-        state.capacity_history.Update(completed->timestamp_ms, completed->reuse.p99_ns, bytes, true);
+    for (std::size_t i = 0; i < completed.size(); ++i) {
+        if (completed[i] && completed[i]->reuse.count > 0) {
+            const auto bytes =
+                SaturatingMultiplyToInt64(completed[i]->required_blocks, static_cast<uint64_t>(state.size_full));
+            state.capacity_history[i].Update(completed[i]->timestamp_ms, completed[i]->reuse.p99_ns, bytes, true);
+        }
     }
 }
 
@@ -807,11 +809,18 @@ ErrorCode OnlineOptimizerManager::TakePlanningMetrics(int64_t timestamp_ms,
             mrc_metrics.push_back({id, group, point.target_basis_points, bytes});
         }
         // Ordinary gauges still drain every report. History updates only once
-        // per completed five-minute window; other reports merely prune/export.
+        // per completed source window; other reports merely prune/export.
         CompleteCapacityPlanningWindow(*state, timestamp_ms);
-        state->capacity_history.Update(timestamp_ms, 0, 0, false);
-        history_metrics.push_back(
-            {id, group, state->capacity_history.points(), state->capacity_history.generation(), timestamp_ms});
+        for (std::size_t i = 0; i < state->capacity_history.size(); ++i) {
+            auto &history = state->capacity_history[i];
+            history.Update(timestamp_ms, 0, 0, false);
+            history_metrics.push_back({id,
+                                       group,
+                                       history.points(),
+                                       history.generation(),
+                                       timestamp_ms,
+                                       CapacityPlanningWindows::kWindowsMs[i]});
+        }
     }
     return EC_OK;
 }
@@ -860,7 +869,9 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     state->interval_max_hits = 0;
     state->mrc_window.Reset();
     state->capacity_planning_window.Reset();
-    state->capacity_history.Reset();
+    for (auto &history : state->capacity_history) {
+        history.Reset();
+    }
     KVCM_LOG_INFO("ResetStats OK: instance[%s]", instance_id.c_str());
     return EC_OK;
 }

@@ -5,6 +5,19 @@
 
 namespace kv_cache_manager {
 
+void ReuseInterval::Merge(const ReuseInterval &other) {
+    if (other.window_.count == 0 || other.window_.count > std::numeric_limits<uint64_t>::max() - window_.count) {
+        return;
+    }
+    window_.min_ns = window_.count == 0 ? other.window_.min_ns : std::min(window_.min_ns, other.window_.min_ns);
+    window_.max_ns = std::max(window_.max_ns, other.window_.max_ns);
+    window_.count += other.window_.count;
+    total_ns_ += other.total_ns_;
+    for (std::size_t i = 0; i < buckets_.size(); ++i) {
+        buckets_[i] += other.buckets_[i];
+    }
+}
+
 void ReuseInterval::Record(uint64_t interval_ns) {
     if (window_.count == std::numeric_limits<uint64_t>::max()) {
         return;

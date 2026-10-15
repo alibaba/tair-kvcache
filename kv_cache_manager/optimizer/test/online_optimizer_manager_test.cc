@@ -400,12 +400,15 @@ TEST_F(OnlineOptimizerManagerTest, CapacityHistoryFinalizesEveryFiveMinutesAndKe
     ASSERT_EQ(EC_OK, mgr_->TakePlanningMetrics(start + 300000, mrc, reuse, history));
     for (const auto &metric : history) {
         const auto &point = metric.points[1000 % CapacityHistory::kSlots];
-        EXPECT_EQ(metric.instance_id == "i1" ? start : 0, point.timestamp_ms);
-        EXPECT_EQ(metric.instance_id == "i1" ? registered.size_full * 2 : 0, point.capacity_bytes);
+        const bool finalized = metric.instance_id == "i1" && metric.source_window_ms == 300000;
+        EXPECT_EQ(finalized ? start : 0, point.timestamp_ms);
+        EXPECT_EQ(finalized ? registered.size_full * 2 : 0, point.capacity_bytes);
     }
     ASSERT_EQ(EC_OK, mgr_->TakePlanningMetrics(start + 600000, mrc, reuse, history));
     for (const auto &metric : history) {
-        EXPECT_EQ(0, metric.points[1001 % CapacityHistory::kSlots].timestamp_ms); // Empty window.
+        if (metric.source_window_ms == 300000) {
+            EXPECT_EQ(0, metric.points[1001 % CapacityHistory::kSlots].timestamp_ms); // Empty base window.
+        }
     }
     ASSERT_EQ(EC_OK, mgr_->ResetStats("i1"));
     ASSERT_EQ(EC_OK, mgr_->TakePlanningMetrics(start + 900000, mrc, reuse, history));
@@ -434,7 +437,7 @@ TEST_F(OnlineOptimizerManagerTest, CapacityHistoryClosesOnRequestBeforeRecording
     receipt_ms += 300000;
     ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {2}, 0, 301000000000, result));
     ASSERT_EQ(EC_OK, mgr_->TakePlanningMetrics(receipt_ms, mrc, reuse, history));
-    ASSERT_EQ(1, history.size());
+    ASSERT_EQ(4, history.size());
     EXPECT_EQ(registered.size_full, history[0].points[1000 % CapacityHistory::kSlots].capacity_bytes);
     EXPECT_EQ(0, history[0].points[1001 % CapacityHistory::kSlots].timestamp_ms);
     mgr_->TakePlanningMetrics(receipt_ms + 300000, mrc, reuse, history);

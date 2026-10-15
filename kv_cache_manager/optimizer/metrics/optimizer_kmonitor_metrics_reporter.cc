@@ -78,8 +78,8 @@ struct OptimizerKmonitorMetricsReporter::KmonContext {
     DECLARE_METRICS(trace, query_reuse_interval_p99_seconds);
     DECLARE_METRICS(trace, query_reuse_interval_p995_seconds);
     DECLARE_METRICS(trace, query_reuse_interval_p999_seconds);
-    DECLARE_METRICS(trace, query_capacity_history_p99_timestamp_ms);
-    DECLARE_METRICS(trace, query_capacity_history_p99_bytes);
+    DECLARE_METRICS(trace, query_capacity_history_p99_window_bytes);
+    DECLARE_METRICS(trace, query_capacity_history_p99_window_observed_ms);
     DECLARE_METRICS(trace, query_capacity_history_p99_v2_bytes);
     DECLARE_METRICS(trace, query_capacity_history_p99_v2_observed_ms);
 
@@ -255,8 +255,8 @@ bool OptimizerKmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p99_seconds);
     REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p995_seconds);
     REGISTER_GAUGE_METRIC(trace, query_reuse_interval_p999_seconds);
-    REGISTER_GAUGE_METRIC(trace, query_capacity_history_p99_timestamp_ms);
-    REGISTER_GAUGE_METRIC(trace, query_capacity_history_p99_bytes);
+    REGISTER_GAUGE_METRIC(trace, query_capacity_history_p99_window_bytes);
+    REGISTER_GAUGE_METRIC(trace, query_capacity_history_p99_window_observed_ms);
     REGISTER_GAUGE_METRIC(trace, query_capacity_history_p99_v2_bytes);
     REGISTER_GAUGE_METRIC(trace, query_capacity_history_p99_v2_observed_ms);
 
@@ -422,26 +422,30 @@ void OptimizerKmonitorMetricsReporter::ReportInterval(const std::vector<Instance
         kmon_ctx_->mrc_metrics->Report(&tags, static_cast<double>(metric.capacity_bytes));
     }
     for (const auto &metric : history_metrics) {
-        for (size_t slot = 0; slot < metric.points.size(); ++slot) {
-            MetricsTags base_tags = {{"instance_group", metric.instance_group},
-                                     {"instance_id", metric.instance_id},
-                                     {"slot", std::to_string(slot)}};
-            const auto tags = kmon_ctx_->GetKmonitorTags(base_tags);
-            const auto &point = metric.points[slot];
-            kmon_ctx_->trace_query_capacity_history_p99_timestamp_ms_metrics->Report(&tags, point.timestamp_ms);
-            kmon_ctx_->trace_query_capacity_history_p99_bytes_metrics->Report(&tags, point.capacity_bytes);
+        for (const auto &point : metric.points) {
             if (point.timestamp_ms > 0 && metric.observed_ms > 0) {
                 // Historical timestamps change each day; do not grow tag_cache_.
-                const kmonitor::MetricsTags history_tags(
-                    {{"instance_group", metric.instance_group},
-                     {"instance_id", metric.instance_id},
-                     {"history_time_ms", std::to_string(point.timestamp_ms)},
-                     {"history_shard", std::to_string((point.timestamp_ms / CapacityHistory::kStepMs) % 4)},
-                     {"history_generation", metric.generation}});
-                kmon_ctx_->trace_query_capacity_history_p99_v2_bytes_metrics->Report(&history_tags,
-                                                                                     point.capacity_bytes);
-                kmon_ctx_->trace_query_capacity_history_p99_v2_observed_ms_metrics->Report(&history_tags,
-                                                                                           metric.observed_ms);
+                MetricsTags labels = {
+                    {"instance_group", metric.instance_group},
+                    {"instance_id", metric.instance_id},
+                    {"history_time_ms", std::to_string(point.timestamp_ms)},
+                    {"history_shard", std::to_string((point.timestamp_ms / CapacityHistory::kStepMs) % 4)},
+                    {"history_generation", metric.generation}};
+                if (metric.source_window_ms != 300000) {
+                    labels["source_window_seconds"] = std::to_string(metric.source_window_ms / 1000);
+                }
+                const kmonitor::MetricsTags history_tags(labels);
+                if (metric.source_window_ms == 300000) {
+                    kmon_ctx_->trace_query_capacity_history_p99_v2_bytes_metrics->Report(&history_tags,
+                                                                                         point.capacity_bytes);
+                    kmon_ctx_->trace_query_capacity_history_p99_v2_observed_ms_metrics->Report(&history_tags,
+                                                                                               metric.observed_ms);
+                } else {
+                    kmon_ctx_->trace_query_capacity_history_p99_window_bytes_metrics->Report(&history_tags,
+                                                                                             point.capacity_bytes);
+                    kmon_ctx_->trace_query_capacity_history_p99_window_observed_ms_metrics->Report(&history_tags,
+                                                                                                   metric.observed_ms);
+                }
             }
         }
     }

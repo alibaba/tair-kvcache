@@ -53,8 +53,8 @@ struct InstanceState {
     int64_t interval_max_hits = 0;
 
     MrcWindow mrc_window;
-    CapacityPlanningWindow capacity_planning_window;
-    CapacityHistory capacity_history;
+    CapacityPlanningWindows capacity_planning_window;
+    std::array<CapacityHistory, 4> capacity_history;
 };
 
 struct TraceQueryResult {
@@ -102,6 +102,7 @@ struct CapacityHistoryMetricInfo {
     std::array<CapacityHistory::Point, CapacityHistory::kSlots> points;
     std::string generation;
     int64_t observed_ms = 0;
+    int64_t source_window_ms = 300000;
 };
 
 struct IntervalMetricInfo {

@@ -99,13 +99,13 @@ Optimizer 侧在现有 JSON 配置中加入订阅配置，不使用额外配置�
 ### P99 retrospective capacity estimate
 
 Full-attention instances with theoretical analysis enabled keep a bounded,
-in-memory history: 288 fixed five-minute buckets (approximately 24 hours).
-History uses MRC99 and reuse-interval P99 from the same **non-overlapping five-minute
-window**, aligned to wall-clock multiples of five minutes. Each window is finalized
+in-memory history per source window: 288 fixed five-minute buckets (approximately 24 hours).
+Four independent histories use MRC99 and reuse-interval P99 from **non-overlapping
+5min, 15min, 30min and 1h windows**, aligned to wall-clock multiples of their duration. Each window is finalized
 once on the first subsequent request or report; no intermediate 30-second history
 estimate is created. Ordinary MRC and reuse gauges still drain their own reporting
-windows (normally 30 seconds), without clearing the history inputs. One additional
-58 KiB reuse histogram and one sparse MRC accumulator hold the current window;
+windows (normally 30 seconds), without clearing the history inputs. Four additional
+58 KiB reuse histograms and four sparse MRC accumulators hold the current windows;
 there are no rolling slices or per-request sample queues. Percentiles are computed
 from sample counts, not averages of per-report percentiles. Local receipt time
 determines membership; producer timestamps still determine reuse durations.
@@ -118,22 +118,27 @@ endpoints round down to five-minute bucket starts, so short/zero reuse still
 updates the current bucket. This is a window-level heuristic, not an exact
 per-key reconstruction or a guarantee of the true minimum cache capacity.
 
-Two Gauge snapshots are exported with `instance_group`, `instance_id`, and
-fixed `slot` (0–287) labels: `trace_query_capacity_history_p99_timestamp_ms`
-and `trace_query_capacity_history_p99_bytes`. A timestamp of 0 means unobserved;
-zero bytes with a positive timestamp is a valid observation. Slots expire even
+Only immutable-timestamp Gauge snapshots are exported; the legacy fixed-slot
+`trace_query_capacity_history_p99_timestamp_ms` and `trace_query_capacity_history_p99_bytes`
+metrics have been removed. An absent point means unobserved;
+zero bytes with a positive timestamp is a valid observation. Points expire even
 in idle reporting windows. Restart, instance recreation, and ResetStats clear
 the history. Clock regression does not resurrect expired history. New requests
 can revise retained older buckets, but cannot revise history already discarded.
 There is no per-request history backfill and no external queue/storage dependency.
-Requests accumulate the separate five-minute input distributions and may finalize
-the previous window at a boundary. Reporters export the retained history every
+Requests accumulate the base five-minute raw distributions. Before draining, their
+histogram counts and hit-curve deltas are merged into each longer window, which
+calculates its own percentiles at its boundary. Reporters export retained history every
 30 seconds; they do not store extra history points or recalculate it at that rate.
-The core ring uses about 4.5 KiB/Instance; metric registry/tag overhead is extra,
-and these metrics add 576 series per eligible Instance.
+The four core rings use about 18 KiB/Instance; histograms total 232 KiB, sparse
+MRC maps and metric registry/tag overhead are extra. At most 2304 history series
+are active per eligible Instance (four windows × 288 points × two gauges).
 
-The fixed-slot metrics above remain for compatibility. The live revisable panel
-uses immutable-timestamp v2 metrics and Range queries that include later reports,
+The 5min history retains the v2 metric names for compatibility. Longer windows use
+`trace_query_capacity_history_p99_window_bytes` and `_observed_ms`, with
+`source_window_seconds="900"`, `"1800"`, or `"3600"`. Each panel selects exactly one
+source window; capacities from different windows are never combined. The live panels
+use Range queries that include later reports,
 so selecting a past display interval does not freeze its revisions at the selected
 end. See [the v2 history query contract](../../docs/design/optimizer_capacity_history_v2.md).
 Previously unavailable observations are not recovered on deployment.

@@ -24,6 +24,7 @@ struct ReuseIntervalStats {
 class ReuseInterval {
 public:
     void Record(uint64_t interval_ns);
+    void Merge(const ReuseInterval &other);
     ReuseIntervalStats Snapshot() const;
     ReuseIntervalStats Take();
     void Reset();

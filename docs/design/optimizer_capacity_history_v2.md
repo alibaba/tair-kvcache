@@ -2,15 +2,22 @@
 
 The capacity estimate applies MRC99 to the five-minute buckets overlapping
 `[now - reuse_p99, now]`, retaining the maximum within one analyzer generation.
-History's MRC99 and reuse P99 come from a separate **non-overlapping five-minute**
-sample window aligned to wall-clock five-minute boundaries. The first request or
+Four independent histories use MRC99 and reuse P99 from **non-overlapping 5min,
+15min, 30min and 1h** sample windows aligned to their wall-clock boundaries. The first request or
 report after a boundary finalizes the previous window exactly once. Its result
 is anchored at the completed window end minus one millisecond, not the delayed
-report timestamp. There is only one additional 58 KiB reuse histogram and one
-sparse MRC accumulator, cleared after finalization: no rolling slices, per-request
+report timestamp. There are four additional 58 KiB reuse histograms and four
+sparse MRC accumulators, cleared at their respective boundaries: no rolling slices, per-request
 sample queue, or 30-second history estimates. Ordinary MRC/reuse gauges and history
 exports still run every reporting interval (normally 30 seconds). Percentiles use
 raw histogram counts and hit-curve deltas, never averages of per-report percentiles.
+Only the 5min base receives per-request updates; before each drain, its raw counts
+are merged into the three longer accumulators. Each history has its own 288-point
+ring; no maximum is taken across different source windows. Historical plot buckets
+remain 5min for comparison, but new estimates are produced only at each source
+window's boundary. Startup windows can be partial; longer windows may have gaps
+when the reuse interval is shorter than the source window. Do not fill those gaps
+with fabricated values or reinterpret them as zero.
 Local receipt time determines membership; producer timestamps determine reuse
 duration. Startup uses available samples in the first partial window, empty windows
 do not create observations, and delayed reports do not fabricate idle-gap points.
@@ -22,10 +29,16 @@ dashboard alone cannot apply it. Previously collected history is not recomputed.
 
 ## Stable identity and lifecycle
 
-Two new gauges accompany the legacy ring-slot metrics:
+The 5min source preserves these two gauges (legacy ring-slot gauges are removed):
 
 - `trace_query_capacity_history_p99_v2_bytes`
 - `trace_query_capacity_history_p99_v2_observed_ms`
+
+The other sources use `trace_query_capacity_history_p99_window_bytes` and
+`trace_query_capacity_history_p99_window_observed_ms`, with an additional
+`source_window_seconds` label (`900`, `1800`, `3600`). Queries must filter this label
+to one value, preserving the same pairing/revision rules. The 5min series have no
+new label, so already collected v2 history remains queryable without migration.
 
 Both have identical `instance_group`, `instance_id`, `history_time_ms`,
 `history_generation`, and `history_shard` labels. `history_time_ms` is an immutable
@@ -40,11 +53,12 @@ the value increased. Across generations select the latest observed report, not
 the largest capacity. A genuine zero capacity is valid; an absent bucket is not
 reported. A generation with no observation does not erase an older observation.
 
-The local reporter atomically replaces the two exclusively-owned gauge families.
+The local reporter atomically replaces the four exclusively-owned gauge families.
 Scrapes keep immutable snapshots, so capacity and report time cannot straddle a
 report update. Expired/replaced tags are removed, never changed to zero. Each
-family has at most 288 active series per instance. Historical storage cardinality
-grows by up to 288 bucket identities per active instance/day plus reset overlap;
+5min family has at most 288 active series per instance; each multi-window family
+has at most 864. The total is at most 2304 series per instance. Historical storage cardinality
+grows by up to 1152 bucket identities per active instance/day plus reset overlap;
 it is subject to the monitoring retention policy. Kmonitor reporting bypasses
 the application tag cache for these changing timestamp tags.
 
@@ -102,5 +116,6 @@ selected display end is used only for this final filtering, not as the latest
 allowed report timestamp.
 
 Legacy data has no immutable timestamp label and must not be silently merged as
-if it were v2. Retain the legacy panel for pre-migration inspection, and mark the
-v2 rollout boundary. No historical v2 samples are fabricated during deployment.
+if it were v2. Legacy reporting and its dashboard panel are removed; stored legacy
+samples are not deleted. No historical samples for newly introduced windows are
+fabricated during deployment. Preserve the existing 5min panel and its v2 history.
