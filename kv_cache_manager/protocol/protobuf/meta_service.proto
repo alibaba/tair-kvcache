@@ -544,8 +544,6 @@ service MetaService {
     rpc GetInstanceInfo(GetInstanceInfoRequest) returns (GetInstanceInfoResponse);
     // 在排查问题时获取meta完整信息，明确的; TODO : 把这个挪到debug service中
     rpc GetCacheMeta(GetCacheMetaRequest) returns (GetCacheMetaResponse);
-    // 查询指定 key 的完整 raw metadata，不做 location 选择、数据文件检查或 lazy prune
-    rpc GetCacheMetaDetail(GetCacheMetaDetailRequest) returns (GetCacheMetaDetailResponse);
     // 返回Cache的位置，由PD节点调用
     rpc GetCacheLocation(GetCacheLocationRequest) returns (GetCacheLocationResponse);
     // 返回命中的key的数量

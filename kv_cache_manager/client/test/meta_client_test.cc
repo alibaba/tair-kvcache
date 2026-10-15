@@ -89,16 +89,6 @@ public:
                  int32_t detail_level),
                 (override));
 
-    MOCK_METHOD((std::pair<ClientErrorCode, CacheMetaDetails>),
-                GetCacheMetaDetail,
-                (const std::string &trace_id,
-                 const std::string &instance_id,
-                 const KeyVector &keys,
-                 const TokenIdsVector &tokens,
-                 const BlockMask &block_mask,
-                 int32_t detail_level),
-                (override));
-
     MOCK_METHOD((std::pair<ClientErrorCode, Locations>),
                 GetCacheLocation,
                 (const std::string &trace_id,

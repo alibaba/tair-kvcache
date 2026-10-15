@@ -6,6 +6,8 @@ package kv_cache_manager.proto.debug;
 
 option cc_generic_services = false;
 
+import "meta_service.proto";
+
 enum ErrorCode {
     UNSPECIFIED = 0;
     OK = 1;
@@ -55,6 +57,9 @@ message RemoveFaultRequest {
 message ClearFaultsRequest {}
 
 service DebugService { 
+    // Raw metadata inspection for tests and diagnostics. Available only when the debug service is enabled.
+    rpc GetCacheMetaDetail(kv_cache_manager.proto.meta.GetCacheMetaDetailRequest)
+        returns (kv_cache_manager.proto.meta.GetCacheMetaDetailResponse);
     // 给某个方法注入故障
     rpc InjectFault(InjectFaultRequest) returns (CommonResponse);
     // 给某个方法清除故障

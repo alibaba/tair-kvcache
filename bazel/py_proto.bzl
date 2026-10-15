@@ -15,11 +15,14 @@ def _generate_grpc_proto_impl(ctx):
     print("output_dir: {}".format(output_dir))
 
     # use create_grpc_proto generate proto py files
+    args = [proto_file.path, output_dir]
+    if ctx.attr.short_import_path:
+        args.append("--short-import-path")
     ctx.actions.run(
         outputs = [pb2_file, pb2_grpc_file],
-        inputs = [proto_file],
+        inputs = [proto_file] + ctx.files.proto_deps,
         executable = ctx.executable.create_grpc_proto,
-        arguments = [proto_file.path, output_dir],
+        arguments = args,
         tools = [ctx.executable.create_grpc_proto]
     )
 
@@ -38,6 +41,8 @@ generate_grpc_proto = rule(
             allow_single_file = [".proto"],
             mandatory = True,
         ),
+        "proto_deps": attr.label_list(allow_files = [".proto"]),
+        "short_import_path": attr.bool(default = False),
         "create_grpc_proto": attr.label(
             executable = True,
             cfg = "exec",

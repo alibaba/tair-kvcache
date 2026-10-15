@@ -60,7 +60,6 @@ void MetaServiceMetricsBase::InvalidateCollectorCache(const std::string &instanc
     }
 
     KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(GetCacheMeta, instance_id);
-    KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(GetCacheMetaDetail, instance_id);
     KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(GetCacheLocation, instance_id);
     KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(GetCacheLocationsByBackend, instance_id);
     KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(GetCacheLocationLen, instance_id);
@@ -263,7 +262,6 @@ void MetaServiceMetricsBase::AttachReportEventTypeMetricsCollectors(const proto:
 }
 
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheMeta);
-KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheMetaDetail);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheLocation);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheLocationsByBackend);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheLocationLen);
