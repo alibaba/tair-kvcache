@@ -144,11 +144,13 @@ TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationOwnsFd) {
     registration.base = init_params_.regist_span->base;
     registration.size = init_params_.regist_span->size;
     registration.fd = fileno(file);
+    registration.numa_node = 1;
 
     SdkWrapper sdk_wrapper;
     SharedMemoryRegistration prepared_registration;
     ASSERT_EQ(ER_OK, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
     EXPECT_NE(prepared_registration.fd, registration.fd);
+    EXPECT_EQ(prepared_registration.numa_node, registration.numa_node);
     const int fd_flags = fcntl(prepared_registration.fd, F_GETFD);
     ASSERT_GE(fd_flags, 0);
     EXPECT_NE(fd_flags & FD_CLOEXEC, 0);
@@ -238,6 +240,7 @@ TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
     registration.base = init_params_.regist_span->base;
     registration.size = init_params_.regist_span->size;
     registration.fd = fileno(file);
+    registration.numa_node = 1;
 
     SdkWrapper sdk_wrapper;
     SharedMemoryRegistration prepared_registration;
@@ -254,6 +257,7 @@ TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
         EXPECT_EQ(config->shm_fd(), prepared_registration.fd);
         EXPECT_EQ(config->shm_size(), registration.size);
         EXPECT_EQ(config->client_base(), registration.base);
+        EXPECT_EQ(config->shm_numa_node(), registration.numa_node);
         ASSERT_EQ(config->gpu_memory_spans().size(), 1u);
         EXPECT_EQ(config->gpu_memory_spans()[0].base, reinterpret_cast<void *>(0x1000));
         EXPECT_EQ(config->gpu_memory_spans()[0].size, 4096u);

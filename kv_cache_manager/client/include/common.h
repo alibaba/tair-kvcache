@@ -219,6 +219,8 @@ struct SharedMemoryRegistration {
     void *base{nullptr};
     size_t size{0};
     int fd{-1};
+    // Physical node verified by the owner before registration; -1 means unknown.
+    int numa_node{-1};
 };
 
 struct GpuMemorySpan {

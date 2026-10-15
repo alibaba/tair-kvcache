@@ -409,6 +409,10 @@ ClientErrorCode SdkWrapper::PrepareSharedMemoryRegistration(const SharedMemoryRe
         KVCM_LOG_WARN("shared memory registration must provide fd, base and size together");
         return ER_INVALID_PARAMS;
     }
+    if (shared_memory_registration.numa_node < -1) {
+        KVCM_LOG_WARN("shared memory registration has invalid NUMA node: %d", shared_memory_registration.numa_node);
+        return ER_INVALID_PARAMS;
+    }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(shared_memory_registration.base);
     if (shared_memory_registration.size > std::numeric_limits<uintptr_t>::max() - base) {
@@ -454,6 +458,7 @@ ClientErrorCode SdkWrapper::UpdateTairMempoolSdkConfig(const std::shared_ptr<Sdk
         config->set_shm_fd(memory_registrations->host.fd);
         config->set_shm_size(memory_registrations->host.size);
         config->set_client_base(memory_registrations->host.base);
+        config->set_shm_numa_node(memory_registrations->host.numa_node);
     }
     config->set_gpu_memory_spans(memory_registrations->gpu);
     return ER_OK;
