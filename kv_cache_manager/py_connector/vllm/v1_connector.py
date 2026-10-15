@@ -172,7 +172,13 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 manager_block_size = extra_config.preferred_block_size
         self._manager_block_size = manager_block_size
 
-        self._group_metas = parse_groups(kv_cache_config, manager_block_size)
+        self._group_metas = parse_groups(
+            kv_cache_config,
+            manager_block_size,
+            calculate_kv_scales=getattr(
+                vllm_config.cache_config, "calculate_kv_scales", False
+            ),
+        )
 
         deployment = {
             "model_name": model_config.served_model_name,
@@ -188,25 +194,6 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             extra_config.model_dump()
         )
         host_ip = get_ip()
-
-        register_request = {
-            "trace_id": "register_%s" % extra_config.instance_id,
-            "instance_group": extra_config.instance_group,
-            "instance_id": extra_config.instance_id,
-            "model_deployment": deployment,
-            "block_size": manager_block_size,
-            "location_spec_infos": [
-                {"name": spec_name(rank, meta.group_idx), "size": meta.per_block_bytes}
-                for rank in range(self._tp_size)
-                for meta in self._group_metas
-            ],
-        }
-        spec_groups = build_spec_groups(self._group_metas, self._tp_size)
-        if spec_groups:
-            # Hybrid models publish per-block spec coverage
-            # (see vllm_common.build_spec_groups).
-            register_request["location_spec_groups"] = spec_groups
-        register_response = self._manager_client.register_instance(register_request)
 
         # One role object per instance; the other slot stays None and every
         # hook asserts the slot it needs.
@@ -224,13 +211,35 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
             logger.warning(
                 "TairKvCacheConnector scheduler inited, extra_config: %r, "
-                "manager block size: %d, vllm block size: %d, groups: %d",
+                "manager block size: %d, vllm block size: %d, "
+                "transfer buckets: %d",
                 extra_config.model_dump(),
                 manager_block_size,
                 self._vllm_block_size,
                 len(self._group_metas),
             )
         else:
+            # Worker-only registration: the scheduler's config is a *folded*
+            # view of every packed group, so it would publish a
+            # location_spec_infos the manager rejects as a mismatch.
+            register_request = {
+                "trace_id": "register_%s" % extra_config.instance_id,
+                "instance_group": extra_config.instance_group,
+                "instance_id": extra_config.instance_id,
+                "model_deployment": deployment,
+                "block_size": manager_block_size,
+                "location_spec_infos": [
+                    {"name": spec_name(rank, meta), "size": meta.per_block_bytes}
+                    for rank in range(self._tp_size)
+                    for meta in self._group_metas
+                ],
+            }
+            spec_groups = build_spec_groups(self._group_metas, self._tp_size)
+            if spec_groups:
+                # Hybrid models publish per-block spec coverage
+                # (see vllm_common.build_spec_groups).
+                register_request["location_spec_groups"] = spec_groups
+            register_response = self._manager_client.register_instance(register_request)
             self.connector_worker = ConnectorWorker(
                 extra_config,
                 self._group_metas,
