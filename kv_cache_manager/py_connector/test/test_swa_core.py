@@ -3046,6 +3046,177 @@ class TestAllocationFailureRelease(unittest.TestCase):
         )
 
 
+class TestWave14Hygiene(unittest.TestCase):
+    """wave14: endpoint resolution, cancel results, publish gate, tombstones,
+    session-protection cleanup."""
+
+    def _worker(self, spare=16):
+        import kv_cache_manager.py_connector.vllm.data_transfer as dt
+
+        patcher = mock.patch.object(dt, "batch_gather_scatter_helper")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        group = windowed_group()
+        pool = _StagingPool(torch.device("cpu"), group.per_block_bytes, spare)
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {group.spec_name: pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        dtm._extra_config = SimpleNamespace(
+            block_per_save_task=8, block_per_load_task=8
+        )
+        dtm._io_executor = ThreadPoolExecutor(max_workers=2)
+        conn = worker_with([group], dtm)
+        conn._device_mod = MagicMock()
+        conn._manager_client = MagicMock()
+        conn._pending_saves = {}
+        conn._extra_config = SimpleNamespace(
+            instance_id="wave14", block_per_save_task=8, block_per_load_task=8
+        )
+        conn._coordinator_client.ask_verdict.return_value = None
+        conn._verdict_query_down_until = 0.0
+        conn._retired_requests = set()
+        return conn, dtm, pool, group
+
+    def _save(self, conn, dtm, group, session=1):
+        blocks = list(range(4))
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_capture_request(
+            CaptureRequest("r0", blocks, all_block_ids=[list(range(7, 11))])
+        )
+        meta.add_save_request(
+            SaveRequest(
+                req_id="r0",
+                write_session_id="s%d" % session,
+                manager_block_idxes=blocks,
+                all_block_ids=[list(range(7, 11))],
+                target_locations=[
+                    {
+                        "block_idxes": [block],
+                        "location_specs": [{"name": "tp0_g0", "uri": "u%d" % block}],
+                    }
+                    for block in blocks
+                ],
+                session_id=session,
+            )
+        )
+        conn.wait_for_save(meta)
+        deadline = time.time() + 5
+        while conn._in_flight.get("r0") and time.time() < deadline:
+            time.sleep(0.01)
+        return blocks
+
+    # --- item 1: the endpoint pair is resolved before the first event --------
+    def test_the_client_resolves_the_pair_before_the_first_event(self):
+        import socket as socket_module
+
+        from kv_cache_manager.py_connector.common.tp_coordinator import (
+            TpCoordinatorClient,
+            TpCoordinatorServer,
+        )
+
+        with socket_module.socket() as sock:
+            sock.bind(("", 0))
+            port = sock.getsockname()[1]
+        holder = socket_module.socket()
+        holder.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+        holder.bind(("127.0.0.1", port))
+        holder.listen(1)
+        self.addCleanup(holder.close)
+        # The coordinator had to move to the next pair.
+        server = TpCoordinatorServer("127.0.0.1", port + 1, 2, lambda *a: None)
+        self.addCleanup(server.shutdown)
+        self.assertEqual(port + 1, server._base_port)
+
+        client = TpCoordinatorClient("127.0.0.1", port)
+        self.addCleanup(client.shutdown)
+        # The first event resolves the pair *before* it is sent: an event
+        # queued to the configured port is never replayed, and full-attention
+        # sessions never query a verdict, so this is their only chance.
+        client.send(b"{}")
+        self.assertEqual(port + 1, client._port)
+        self.assertTrue(client._endpoint_resolved)
+
+    # --- item 2: a successful cancel is a success, not a failure ------------
+    def test_a_successful_cancel_is_not_treated_as_a_failure(self):
+        conn, dtm, pool, group = self._worker()
+        conn._verdict_pending = {"r0": {"s1": [0, 1], "s2": [2, 3]}}
+        conn._coordinator_client.cancel_verdict.return_value = True
+        conn._drop_pending_verdicts("r0")
+        self.assertEqual(2, conn._coordinator_client.cancel_verdict.call_count)
+        self.assertEqual(0.0, conn._verdict_query_down_until)
+
+    def test_the_cancel_result_is_explicit(self):
+        # The coordinator answers a successful cancel with an empty body, and
+        # an empty body is falsy: the client has to turn that into an explicit
+        # success, or every retirement mutes the endpoint and abandons the
+        # request's remaining sessions.
+        import socket as socket_module
+
+        from kv_cache_manager.py_connector.common.tp_coordinator import (
+            TpCoordinatorClient,
+            TpCoordinatorServer,
+        )
+
+        with socket_module.socket() as sock:
+            sock.bind(("", 0))
+            port = sock.getsockname()[1]
+        server = TpCoordinatorServer("127.0.0.1", port, 2, lambda *a: None)
+        self.addCleanup(server.shutdown)
+        client = TpCoordinatorClient("127.0.0.1", port)
+        self.addCleanup(client.shutdown)
+        self.assertIs(True, client.cancel_verdict("s1", 0))
+
+        dead = TpCoordinatorClient("127.0.0.1", port + 20)
+        self.addCleanup(dead.shutdown)
+        self.assertIs(False, dead.cancel_verdict("s1", 0, timeout_ms=20))
+
+    # --- item 3: no verdicts for sessions nobody will query -----------------
+    def test_a_full_attention_worker_does_not_publish_verdicts(self):
+        conn, dtm, pool, group = self._worker()
+        conn._has_windowed_groups = False  # pure full attention
+        conn._manager_client.finish_write_cache.side_effect = None
+        from kv_cache_manager.py_connector.common.tp_coordinator import SaveContext
+
+        conn.on_save_finished(
+            "s1",
+            SaveContext(
+                locations=[{"block_idxes": [0]}],
+                result_per_rank={0: [True], 1: [True]},
+            ),
+        )
+        conn._coordinator_server.record_verdict.assert_not_called()
+
+    # --- item 4: the retirement tombstone goes with the last callback -------
+    def test_a_retirement_tombstone_goes_after_the_last_callback(self):
+        conn, dtm, pool, group = self._worker()
+        conn._release_staged("r0")
+        self.assertIn("r0", conn._retired_requests)
+        self._save(conn, dtm, group)
+        self.assertNotIn("r0", conn._retired_requests)
+        self.assertEqual({}, conn._verdict_pending.get("r0", {}))
+
+    # --- item 5: session protection entries go at handoff -------------------
+    def test_session_protection_entries_are_dropped_at_handoff(self):
+        sched = make_connector_scheduler(
+            manager_block_size=MBS, num_groups=1, windowed=1
+        )
+        sched._extra_config = SimpleNamespace(
+            instance_id="handoff", write_timeout_seconds=1
+        )
+        session = sched._record_announcement("r0", 4)
+        sched._remember_session_plan("r0", session, {0, 1, 2, 3})
+        sched._retire_session_protection("r0", session)
+        self.assertEqual({}, sched._announced_sessions.get("r0", {}))
+        # A late plan for a handed-over session does not rebuild the entry.
+        sched._remember_session_plan("r0", session, {0, 1})
+        self.assertEqual({}, sched._announced_sessions.get("r0", {}))
+        # ... and the request's map itself is gone, not just emptied.
+        self.assertNotIn("r0", sched._announced_sessions)
+
+
 class TestLateSettleAfterRetirement(unittest.TestCase):
     """wave13 #5/#6: a settle after retirement, and cancel backoff."""
 

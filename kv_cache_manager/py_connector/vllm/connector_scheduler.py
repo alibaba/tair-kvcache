@@ -1277,13 +1277,20 @@ class ConnectorScheduler:
             )
 
     def _retire_session_protection(self, req_id: str, session_id: int) -> None:
-        """Stop holding back this session's blocks (see _blocks_other_sessions_write)."""
+        """Stop holding back this session's blocks (see _blocks_other_sessions_write).
+
+        The session is handed over to the worker; from here on it protects
+        nothing (its bytes are in flight, which a release cannot touch), so the
+        entry is dropped rather than flagged -- a long request creates one per
+        incremental save, and every release scan walks them all.
+        """
         with self._announced_sessions_lock:
             sessions = self._announced_sessions.get(req_id)
             if sessions is None or session_id not in sessions:
                 return
-            target, plan, _sent = sessions[session_id]
-            sessions[session_id] = (target, plan, True)
+            sessions.pop(session_id, None)
+            if not sessions:
+                self._announced_sessions.pop(req_id, None)
 
     def _record_announcement(self, req_id: str, target_save_num: int) -> int:
         """Note that a write session for [0, target_save_num) is now in flight.

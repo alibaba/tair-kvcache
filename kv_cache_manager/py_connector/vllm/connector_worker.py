@@ -297,6 +297,14 @@ class ConnectorWorker:
         self._max_num_batched_tokens = max_num_batched_tokens
         self._max_num_seqs = max_num_seqs
         self._group_metas = group_metas
+        # A verdict is only consumed where a capture waits for one: windowed
+        # groups. A pure full-attention instance has nothing to confirm, and
+        # publishing anyway filled the coordinator's table (and its log) with
+        # entries no worker would ever ask about.
+        self._has_windowed_groups = any(
+            getattr(getattr(meta, "group", None), "retention", None) is not None
+            for meta in group_metas
+        )
         self._num_groups = len(group_metas)
         self._manager_block_size = manager_block_size
         self._tp_size = tp_size
@@ -859,6 +867,18 @@ class ConnectorWorker:
                         self._recheck_pending_verdicts(
                             {save_req.req_id: {session_key: ordered}}
                         )
+                    if (
+                        save_req.req_id in self._retired_requests
+                        and not self._in_flight.get(save_req.req_id)
+                        and not self._staged.get(save_req.req_id)
+                        and not self._verdict_pending.get(save_req.req_id)
+                    ):
+                        # The last callback for this request has landed: the
+                        # tombstone has done its job (it kept this late settle
+                        # from rebuilding state) and must go, or a long-lived
+                        # worker accumulates request ids -- and a reused id
+                        # would treat a fresh request's callbacks as retired.
+                        self._retired_requests.discard(save_req.req_id)
                 failed = [key for key, ok in outcomes.items() if not ok]
                 if failed:
                     logger.warning(
@@ -1741,7 +1761,7 @@ class ConnectorWorker:
         # step and has the retirement as its backstop. Publication itself only
         # happens once the manager acknowledged the report: before that the
         # verdict is not a fact.
-        if committed:
+        if committed and self._has_windowed_groups:
             self._coordinator_server.record_verdict(
                 write_session_id, save_context.success_mask
             )
