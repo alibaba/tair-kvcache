@@ -107,6 +107,23 @@ class CoverageReportTest(unittest.TestCase):
 
         self.assertEqual(coverage["kv_cache_manager/common/env_util.cc"], {7: 3, 8: 3})
 
+    def test_lcov_duplicate_lines_within_record_are_accumulated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            lcov = workspace / "coverage.dat"
+            lcov.write_text(
+                "SF:kv_cache_manager/common/env_util.cc\n"
+                "DA:7,1\n"
+                "DA:7,2\n"
+                "DA:7,-3\n"
+                "end_of_record\n",
+                encoding="utf-8",
+            )
+
+            coverage = coverage_report.parse_lcov(lcov, workspace, ["kv_cache_manager/"])
+
+        self.assertEqual(coverage["kv_cache_manager/common/env_util.cc"], {7: 3})
+
     def test_lcov_negative_line_hits_are_clamped_to_zero(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)

@@ -68,16 +68,8 @@ bazelisk info --announce_rc repository_cache
   - ```bazelisk test //kv_cache_manager/common/test:redis_client_real_service_test //kv_cache_manager/meta/test:meta_redis_backend_real_service_test //kv_cache_manager/meta/test:meta_storage_backend_manager_real_redis_test //kv_cache_manager/meta/test:meta_indexer_redis_test //kv_cache_manager/manager/test:MetaSearcherRedisTest //kv_cache_manager/config/test:registry_manager_redis_backend_test --test_tag_filters=redis```
 - 启用ASAN：上述命令后添加 ```--config=debug --config=asan --test_env ASAN_OPTIONS=detect_odr_violation=0```
 - 覆盖率：
-  - ```tools/coverage/run_coverage.sh --base-ref origin/main --head-ref HEAD --output-dir coverage --include-prefix kv_cache_manager/ --jobs 8 --local-test-jobs 8 -- //kv_cache_manager/... //integration_test/...```
-  - 脚本会执行 Bazel LCOV 采集、归一化负 hit count、生成全量/增量覆盖率摘要，并在安装了 lcov/genhtml 时生成 HTML 报告。
-  - 输出位于 ```coverage/```，包含 ```lcov.info```、```coverage-summary.md```、```coverage-summary.json``` 和 ```html/index.html```。
-  - 如本地未安装 ```genhtml``` 且只需要 LCOV/摘要，可添加 ```--no-html```。
-  - ```gcov_json_isolated.sh``` 用于规避 Bazel 6.4 C++ coverage collector 在并发 gcov json 采集时共享 ```*.gcov.json.gz``` 中间文件导致的竞态。
-  - Bazel 6.4 默认不向 gcov 传 ```-b```；当前开发镜像的 GCC 10 支持通过 ```COVERAGE_GCOV_OPTIONS=-b``` 生成 ```BRDA/BRF/BRH``` 分支覆盖率记录。
-  - CI 会上传 ```coverage/lcov.info```、```coverage/coverage-summary.md```、```coverage/coverage-summary.json``` 和 ```coverage/html/```。
-  - PR 触发的 coverage 会更新同一条固定评论；评论 job 仅下载 coverage artifact，不检出或执行 PR 代码。
-  - ```coverage``` workflow 使用 setup-bazel 的 Bazelisk cache、repository cache 和独立 disk cache。PR 只读 cache；仅 nightly cache rebuild 或手动以 ```rebuildDiskCache=true``` 触发时保存并替换 main 分支的旧 disk cache。
-  - 可通过 workflow_dispatch 的 ```runs-on``` 或仓库变量 ```COVERAGE_RUNS_ON``` 选择 ```ubuntu-latest```、```ubuntu-24.04-arm``` 或 ```aliyun-ecs-x64```。
+  - ```tools/coverage/run_coverage.sh --base-ref origin/main``` 默认运行单元测试和集成测试。需安装 ```genhtml```；没有时可加 ```--no-html```。
+  - 查看 ```coverage/coverage-summary.md``` 中的全量/增量结果，或打开 ```coverage/html/index.html``` 查看逐文件、逐行和分支覆盖率。CI 会在 PR 中更新摘要并上传完整报告。
 ### 测试资源清理
 
 测试结束后会自动清理资源。测试工作目录位于 bazel runfiles 目录中，不会污染源代码目录。如果测试异常退出，可能需要手动清理：

@@ -59,7 +59,10 @@ def parse_lcov(lcov_path, workspace, include_prefixes):
             elif line.startswith("DA:") and current_file:
                 fields = line[3:].split(",", 2)
                 if len(fields) >= 2:
-                    current_lines[int(fields[0])] = max(int(fields[1]), 0)
+                    line_number = int(fields[0])
+                    current_lines[line_number] = current_lines.get(line_number, 0) + max(
+                        int(fields[1]), 0
+                    )
             elif line == "end_of_record":
                 flush_record()
                 current_file = None

@@ -209,14 +209,11 @@ jobs:
 
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const artifactUrl = process.env.COVERAGE_ARTIFACT_URL || '';
-            const links = artifactUrl
-              ? `HTML report and raw LCOV: [coverage-report](${artifactUrl})`
-              : `Workflow run: [${context.runId}](${runUrl})`;
             const body = [
               marker,
               summary,
               '',
-              links,
+              ...(artifactUrl ? [`HTML report and raw LCOV: [coverage-report](${artifactUrl})`] : []),
               `Workflow run: [${context.runId}](${runUrl})`,
             ].join('\n');
 
