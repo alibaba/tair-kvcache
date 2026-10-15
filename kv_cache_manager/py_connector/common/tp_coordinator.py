@@ -512,19 +512,46 @@ class TpCoordinatorClient:
         # REQ/REP on the coordinator's second port, created lazily so a
         # deployment without it pays nothing.
         self._query_socket: Any = None
+        # Whether the endpoint pair has been resolved (see send): resolved on
+        # the first event, before anything can be queued to a dead port.
+        self._endpoint_resolved = False
 
     def send(self, param: bytes) -> None:
+        # The coordinator may have had to take a neighbouring port pair (a
+        # transient collision): events sent to the configured port are queued
+        # on a socket nobody reads and are never replayed, so the pair is
+        # resolved *before* the first event. Full-attention sessions never ask
+        # for a verdict, so this handshake is the only chance they get.
         with self._lock:
+            if not self._endpoint_resolved:
+                self._endpoint_resolved = True
+                if not self._probe_and_reconnect(lock_held=True):
+                    logger.warning(
+                        "TairKvCacheConnector: no coordinator answered on "
+                        "ports %d-%d; keeping the configured port %d",
+                        self._port,
+                        self._port + COORDINATOR_PORT_ATTEMPTS,
+                        self._port,
+                    )
             self._socket.send(param)
 
-    def cancel_verdict(self, write_session_id: str, tp_rank: int) -> None:
+    def cancel_verdict(
+        self, write_session_id: str, tp_rank: int, timeout_ms: int = 100
+    ) -> bool:
         """Tell the coordinator this rank will not ask for this session.
 
-        Best effort: if the query socket is unavailable the entry simply waits
-        for a rank that never comes -- which is what the cap is for.
+        Returns True when the coordinator acknowledged (a successful cancel
+        replies with an empty body -- that is not a failure), False when it
+        could not be reached. Best effort: if the query socket is unavailable
+        the entry simply waits for a rank that never comes -- which is what the
+        cap is for.
         """
-        self._ask_query(
-            {"session_id": write_session_id, "tp_rank": tp_rank, "cancel": True}
+        return (
+            self._ask_query(
+                {"session_id": write_session_id, "tp_rank": tp_rank, "cancel": True},
+                timeout_ms,
+            )
+            is not False
         )
 
     def _send_query(self, payload: Dict[str, Any], timeout_ms: int = 100) -> Any:
@@ -571,6 +598,23 @@ class TpCoordinatorClient:
         a still-dead coordinator is handed back to the caller, whose backoff
         keeps the engine thread off it.
         """
+        self._endpoint_resolved = True
+        self._probe_and_reconnect(timeout_ms, lock_held=True)
+
+    def _probe_and_reconnect(
+        self, timeout_ms: int = 100, lock_held: bool = False
+    ) -> bool:
+        """Probe the port range for the coordinator's pair and move both
+        sockets onto it. Returns False when nothing answered."""
+        if not lock_held:
+            self._lock.acquire()
+        try:
+            return self._probe_and_reconnect_locked(timeout_ms)
+        finally:
+            if not lock_held:
+                self._lock.release()
+
+    def _probe_and_reconnect_locked(self, timeout_ms: int) -> bool:
         if self._query_socket is not None:
             self._query_socket.close(linger=0)
             self._query_socket = None
@@ -590,23 +634,28 @@ class TpCoordinatorClient:
                 probe.close(linger=0)
             if not answered:
                 continue
-            try:
-                self._socket.disconnect(
-                    "tcp://%s:%d" % (self._host_ip, self._port)
+            if candidate != self._port:
+                # Only the moved case touches the event socket: disconnecting
+                # and reconnecting the same endpoint drops whatever is queued
+                # on it, and an event sent right after would be lost.
+                try:
+                    self._socket.disconnect(
+                        "tcp://%s:%d" % (self._host_ip, self._port)
+                    )
+                except zmq.ZMQError:  # pragma: no cover - never connected
+                    pass
+                self._socket.connect("tcp://%s:%d" % (self._host_ip, candidate))
+                logger.warning(
+                    "TairKvCacheConnector: the coordinator answered on port %d "
+                    "(configured %d was taken); reconnected",
+                    candidate,
+                    self._port,
                 )
-            except zmq.ZMQError:  # pragma: no cover - never connected
-                pass
-            self._socket.connect("tcp://%s:%d" % (self._host_ip, candidate))
-            logger.warning(
-                "TairKvCacheConnector: the coordinator answered on port %d "
-                "(configured %d was taken); reconnected",
-                candidate,
-                self._port,
-            )
-            self._port = candidate
+                self._port = candidate
             self._connect_query(candidate + 1, timeout_ms)
-            return
+            return True
         self._connect_query(self._port + 1, timeout_ms)
+        return False
 
     def _ask_query(self, payload: Dict[str, Any], timeout_ms: int = 100) -> Any:
         with self._lock:

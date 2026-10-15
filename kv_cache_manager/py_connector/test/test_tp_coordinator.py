@@ -98,10 +98,11 @@ class TestTpCoordinatorNormalOrder(unittest.TestCase):
         self.assertEqual(save_context.get_size(), 2)
 
     def tearDown(self):
-        self.server._coordinator_running = False
-        # Don't join - thread is blocked on recv() and will be cleaned up as daemon
-        self.client._socket.close()
-        self.client._zmq_context.term()
+        # socket close + context term in that order, and the client's query
+        # socket (created by the endpoint probe) goes with it: terminating the
+        # context under an open socket blocks the interpreter.
+        self.client.shutdown()
+        self.server.shutdown()
 
 
 class TestTpCoordinatorOutOfOrder(unittest.TestCase):
@@ -208,10 +209,11 @@ class TestTpCoordinatorOutOfOrder(unittest.TestCase):
         self.assertEqual(save_context.get_size(), 2)
 
     def tearDown(self):
-        self.server._coordinator_running = False
-        # Don't join - thread is blocked on recv() and will be cleaned up as daemon
-        self.client._socket.close()
-        self.client._zmq_context.term()
+        # socket close + context term in that order, and the client's query
+        # socket (created by the endpoint probe) goes with it: terminating the
+        # context under an open socket blocks the interpreter.
+        self.client.shutdown()
+        self.server.shutdown()
 
 
 class TestTpCoordinatorIdempotent(unittest.TestCase):
@@ -319,10 +321,11 @@ class TestTpCoordinatorIdempotent(unittest.TestCase):
         self.assertEqual(save_context.get_size(), 2)
 
     def tearDown(self):
-        self.server._coordinator_running = False
-        # Don't join - thread is blocked on recv() and will be cleaned up as daemon
-        self.client._socket.close()
-        self.client._zmq_context.term()
+        # socket close + context term in that order, and the client's query
+        # socket (created by the endpoint probe) goes with it: terminating the
+        # context under an open socket blocks the interpreter.
+        self.client.shutdown()
+        self.server.shutdown()
 
 
 class TestLoadFailureAggregation(unittest.TestCase):
@@ -381,9 +384,8 @@ class TestLoadFailureAggregation(unittest.TestCase):
         self.assertEqual(self._poll_failed(), {9})
 
     def tearDown(self):
-        self.server._coordinator_running = False
-        self.client._socket.close()
-        self.client._zmq_context.term()
+        self.client.shutdown()
+        self.server.shutdown()
 
 
 if __name__ == "__main__":
