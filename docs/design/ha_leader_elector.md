@@ -68,62 +68,96 @@ LeaderElector 是选主状态机的核心实现，负责竞选、续约、降级
 
 #### 3.2.1 角色状态机
 
-```
-                   竞选成功               OnBecomeLeader
-                 （获取分布式锁）              回调完成
-    FOLLOWER ──────────────► PROMOTING ──────────────► LEADER
-       ▲                                                 │
-       │                                        锁丢失 / │
-       │               OnNoLongerLeader         主动降级  │
-       │                  回调完成                        │
-       └──────────────── DEMOTING ◄──────────────────────┘
+```mermaid
+graph TD
+    FOLLOWER -->|持锁，开始恢复| PROMOTING
+    PROMOTING -->|恢复返回，本轮租约仍有效| LEADER
+    PROMOTING -->|失锁或停止，等待恢复返回| DEMOTING
+    LEADER -->|失锁、主动降级或停止| DEMOTING
+    DEMOTING -->|清理回调返回| FOLLOWER
 ```
 
-| 状态 | 含义 | 是否可对外服务 |
-|---|---|---|
-| `FOLLOWER` | 备节点稳定态 | 仅响应 Leader 发现等非数据面请求 |
-| `PROMOTING` | 竞选成功后的晋升中间态（执行 OnBecomeLeader 回调） | 否 |
-| `LEADER` | 主节点稳定态 | 是 |
-| `DEMOTING` | 降级中间态（执行 OnNoLongerLeader 回调） | 否 |
+| 状态 | 含义 | 是否参与竞选 | 业务门禁 |
+|---|---|---|---|
+| `FOLLOWER` | 尚未开始恢复，或已完成清理 | 未持锁、未停止、未在释放锁且冷却期结束时参与 | 关闭 |
+| `PROMOTING` | 执行 OnBecomeLeader 回调 | 否；本轮有效时继续续约 | 仅恢复成功路径通过租约校验后开放 |
+| `LEADER` | 恢复回调返回后的主节点角色 | 否；继续续约 | 取决于恢复成功路径是否开放；失锁时立即关闭 |
+| `DEMOTING` | 执行 OnNoLongerLeader 回调 | 否 | 关闭 |
 
-中间状态（PROMOTING / DEMOTING）确保回调逻辑（数据恢复、清理）执行完毕后才切换到稳定态，避免请求在不一致状态下被处理。
+角色、是否持锁、业务是否可服务有不同含义。`IsLeader()` 保留原有“本地是否持锁”的查询语义；`GetLeaderNodeID()` 保留锁持有者发现语义。恢复期间发现自身为锁持有者，不代表业务门禁已经开放。
 
-LEADER → DEMOTING 的触发条件包括：租约过期、续约失败、主动调用 Demote 接口。
+#### 3.2.2 线程模型与状态收敛
 
-#### 3.2.2 线程模型
-
-LeaderElector 内部维护 3 个线程：
+LeaderElector 保留 3 个线程：
 
 | 线程 | 职责 | 周期 |
 |---|---|---|
-| LeaderLock 线程 | 执行选主循环：未获锁时尝试竞选，已获锁时续约 | `loop_interval_ms`（建议 < `lease_ms / 10`） |
-| LeaseCheck 线程 | 独立检查租约是否过期，作为 LeaderLock 线程的安全兜底：当 LeaderLock 线程因阻塞导致未能及时感知租约过期时，LeaseCheck 线程可独立触发降级 | `loop_interval_ms` |
-| StateTransition 线程 | 消费状态转换任务队列，串行执行所有状态变更及用户回调 | 事件驱动（条件变量唤醒） |
+| LeaderLock | 仅在干净的 FOLLOWER 阶段竞选；持锁时续约 | `loop_interval_ms` |
+| LeaseCheck | 独立检查本地租约，避免协调请求阻塞时继续服务 | `loop_interval_ms` |
+| StateTransition | 根据当前锁状态串行执行恢复及清理，无历史任务队列 | 条件变量唤醒 |
 
-StateTransition 线程是单线程串行执行的，保证 PROMOTING → LEADER 和 DEMOTING → FOLLOWER 的回调不会并发，简化上层逻辑。
+锁变化只更新当前事实并通知处理线程，不逐次排入 promote/demote 任务。工作线程开始恢复时记录本地持锁轮次 `lock_epoch_`；每次获得或撤销租约都会推进轮次。恢复完成只能提交到同一轮有效租约，失锁事实不会因之后的通知被合并而消失。轮次仅用于本进程的生命周期与请求结果校验，不是存储层 fencing token。
 
-#### 3.2.3 选主流程
+持锁与角色不一致时处理线程继续收敛：FOLLOWER 持锁则开始恢复，LEADER 失锁则开始清理。恢复过程中失锁会先等待正在执行的回调返回，再直接执行清理，不经过可服务的 LEADER 状态。恢复尚未开始就失锁，无需执行恢复或清理。由此避免锁抖动造成任务积压以及遗漏必要的升主。
 
-```
-LeaderLock 线程每次循环:
+#### 3.2.3 失锁与业务门禁
 
-1. 检查是否已持有锁:
-   ├─ 未持有 → CampaignLeader()
-   │   ├─ 检查 forbid_campaign_time（降级冷却期）
-   │   ├─ GetLockHolder 查看当前锁状态
-   │   ├─ TryLock 尝试获锁
-   │   ├─ 成功 → 入队 PROMOTING 任务
-   │   └─ 失败 → 保持 FOLLOWER
-   │
-   └─ 已持有 → HoldLeader()
-       ├─ RenewLock 续约
-       ├─ 成功 → 更新 lease_expiration_time
-       └─ 失败 → 入队 DEMOTING 任务
-```
+确认失锁的条件为续约返回 `EC_NOENT` / `EC_MISMATCH`，或本地租约到期（保留提前一个循环间隔的检查余量）。普通续约错误在租约仍有效时只记录日志。
+
+失锁处理在同一把状态互斥锁下撤销本地持锁状态、推进轮次，并通过 `SetLeadershipLostHandler` 同步关闭 Meta/Admin 业务入口。该快速回调只能关闭门禁，不得阻塞或重入 LeaderElector；请求排空、后台线程停止与清理留在 StateTransition 线程中执行。
+
+恢复成功路径通过 `RunIfCurrentPromotionValid` 检查恢复轮次、本地租约及停止标记，再开放业务门禁。检查与开放入口使用失锁处理的同一把互斥锁，避免旧恢复在关闭入口后重新开放入口。此接口中的回调同样不得阻塞或重入。
+
+Optimizer 的配置与订阅接口同时检查 `LEADER` 和 `IsStableState()`。本地失锁后，即使角色尚未进入 DEMOTING，也会拒绝新请求。恢复时启用订阅同样放在 `RunIfCurrentPromotionValid` 中；关闭已有订阅需要遍历并清理流，留在 `OnNoLongerLeader` 中执行。
+
+失锁后的 PROMOTING、待清理的 LEADER 和 DEMOTING 都不参与竞选。只有清理回调返回、进入 FOLLOWER 后才允许再次竞选，并继续遵守现有 `forbid_campaign_time` 冷却配置。新一轮持锁重新执行恢复。
+
+暂停竞选期间，LeaderLock 仍查询锁持有者并刷新发现信息，使旧节点能够返回其他节点的新主端点。只读查询不改变本地持锁状态、轮次或业务门禁；发起查询时若没有竞选资格，即使清理或主动释放在查询途中结束，也只能等下一轮查询后再尝试获得租约。Stop 后停止刷新，并丢弃在途查询结果。
+
+协调请求在发送前记录轮次，返回后重新校验。响应提交时必须在取得状态互斥锁之后读取当前时间，避免等待互斥锁期间租约已经过期，却按等待前的时间提交成功。迟到的抢锁结果或续约成功不能恢复已撤销的轮次，必要时按持有者校验释放锁。协调 I/O 不持有状态互斥锁，避免阻塞租约检查；主动释放锁期间也禁止新竞选。停止时先撤销业务资格，再停止选主/租约线程，处理线程完成已开始的恢复及必要清理后退出。
+
+本次保留回调失败的现有行为：恢复提前返回或异常不新增失败重试、错误传播或角色转换阻断；清理返回错误或异常不新增重新竞选阻断。恢复成功路径之外不会因本次门禁调整而自动开放业务。
 
 #### 3.2.4 节点端点信息
 
 每个节点启动时将自身连接信息（node_id、host、各服务端口）写入 CoordinationBackend 的 KV 存储。任意节点获取到 leader_node_id 后，即可查询到 Leader 的完整连接方式，用于 Leader 发现。
+
+#### 3.2.5 本次选主改造的评审入口
+
+核心变化是用“当前租约事实 + 当前生命周期阶段”取代历史 promote/demote 任务队列。评审时先确认以下性质，再沿函数检查实现，最后对照 [场景测试覆盖](#75-状态收敛测试覆盖)。
+
+- 判定失锁后同步关闭新业务入口；旧恢复不能再次开放入口。
+- 已开始的恢复与清理由同一个工作线程串行执行；失锁后必须等这次清理返回才能重新竞选。
+- 尚未开始恢复就失锁时，不执行无效恢复或清理；最终稳定持锁的 FOLLOWER 能启动一次必要恢复。
+- 协调响应只能提交到发送时所属的有效轮次；取得状态锁后用当前时间检查租约，迟到成功不能恢复旧资格。
+- 协调 I/O 和耗时生命周期回调不持有状态锁；必要的补偿释放不会删除其他节点或本节点下一轮的锁。
+
+建议阅读顺序：
+
+| 顺序 | 阅读位置 | Reviewer 要核对的行为 |
+|---|---|---|
+| 1 | `server.cc` 门禁接入；`LoseLeaseLocked` / `RunIfCurrentPromotionValid` | 关闭和开放门禁使用同一把状态锁；所有失锁入口都会撤销资格；快速回调只关闭/开放入口，不重入选主器 |
+| 2 | `HasPendingTransitionLocked` / `ReconcileState` | 正常恢复、恢复失效后清理、LEADER 失锁后清理这三条路径完整；无历史任务积压；回调执行时已释放状态锁 |
+| 3 | `CanCampaignLocked` / `DoDemote` | 失锁后的 PROMOTING、待清理 LEADER、DEMOTING 和主动释放锁期间均不能竞选；清理返回后仍遵守冷却期；这些阶段仍刷新发现信息 |
+| 4 | `CampaignLeader` / `AcceptLease` / `HoldLeader` / `ReleaseLock` | 发送前记录轮次，返回后重新检查轮次与期限；只读发现查询不能因清理结束而变成获锁；拒绝结果后的释放先于本锁线程下一次竞选 |
+| 5 | `StateTransitionWorker` / `Stop` / `IsStableStateLocked` | 条件变量等待当前事实；停止时在途响应不能提交，已开始的恢复与必要清理完成后才退出 |
+
+重点交错时序及对应回归用例：
+
+| 交错时序 | 重点检查 | 回归用例 |
+|---|---|---|
+| 恢复已开始 → 失锁 → 旧恢复返回 | 旧恢复不开放入口，先清理，再恢复竞选 | `LossDuringRecoveryBlocksCampaignThroughCleanupAndRecoversAgain` |
+| 开放门禁与失锁同时发生 | 校验和开放不能在两个临界区；失锁处理返回后门禁关闭 | `GatePublicationAndLossAreSerialized` |
+| 续约成功 → 等状态锁 → 租约到期 → 获得状态锁 | 不使用等待前的时间接受结果 | `RenewalWaitingForStateMutexCannotCommitExpiredLease` |
+| 清理完成，但主动 Unlock 尚未返回 | 不允许新竞选与旧释放交错 | `CleanupCompletionDoesNotPermitCampaignBeforeUnlockReturns` |
+| 续约响应阻塞 → 旧主失锁 → 新主持锁 → 旧响应返回 | 旧资格不复活，补偿释放保留新主的锁 | `LateRenewalReleaseDoesNotDeleteAnotherNodesLock`；Redis 集成测试的 `test_late_successful_renew_reply_cannot_revive_old_leader_or_delete_new_lock` |
+| Stop 与抢锁、恢复或清理同时发生 | 无在途结果提交；必要清理不被跳过 | `StopRejectsAcquisitionStillInFlight` / `StopWaitsForRecoveryCleanupAndNeverPublishesOldReadiness` / `StopDuringCleanupWaitsForAlreadyRunningCleanup` |
+
+并发假设也属于评审范围：竞选和续约只有一个 LeaderLock 线程；恢复和清理只有一个 StateTransition 线程；回调在 Start 前注册；两个快速门禁回调不能阻塞或重入。`transition_mutex_` 保护角色变更、轮次和释放标记；同时访问锁持有者字符串时，按状态锁到持有者锁的顺序获取，不反向获取。
+
+两个快速门禁回调持有非递归的 `transition_mutex_`。回调中调用 `IsStableState()`、`WaitForStableState()`、`Demote()`、`Stop()` 或 `RunIfCurrentPromotionValid()` 会再次获取同一把锁，即使调用的是查询接口也会自锁。
+
+请求排空丢通知的修复在 `ServiceImplBase` 中独立核对：完成请求的计数递减取得 shared lock，排空等待取得同一把锁的 unique lock，保证谓词检查到进入等待之间不会丢掉最后一次完成通知。回调失败策略保留现状，本地轮次不提供存储层 fencing；这两项不是本次验收新增的保证。
 
 ## 4. Server 集成
 
@@ -139,7 +173,7 @@ Server::Init()
        ├─ 3. 确定 node_id（配置指定 > 自动生成）
        ├─ 4. 创建 CoordinationBackend 并 Init
        ├─ 5. 创建 LeaderElector
-       ├─ 6. 注册回调: OnBecomeLeader / OnNoLongerLeader
+       ├─ 6. 注册回调: OnBecomeLeader / OnNoLongerLeader / 快速关闭业务门禁
        └─ 7. WriteNodeInfo 将本节点端点信息写入 CoordinationBackend
 ```
 
@@ -151,7 +185,7 @@ Server::Init()
 2. 启动配置加载（首次启动时加载 startup_config）
 3. CacheManager 数据恢复（重建缓存索引）
 4. 恢复 CacheReclaimer（缓存回收线程）
-5. 启用数据面请求
+5. 通过 RunIfCurrentPromotionValid 校验持锁轮次与租约后，启用业务请求
 
 **OnNoLongerLeader（降级为 Follower）：**
 
@@ -161,7 +195,9 @@ Server::Init()
 4. CacheManager 清理
 5. Registry 清理
 
-优雅关闭保证降级过程中不会出现请求被中途丢弃的情况。
+失锁时业务入口已经由快速回调关闭；OnNoLongerLeader 再次关闭入口并等待已有请求结束。最后一个业务请求的计数递减与排空等待使用同一把请求状态锁，避免通知发生在谓词检查与进入等待之间，造成计数已归零但清理线程仍等待。恢复与清理串行执行，清理回调返回后才恢复本节点竞选。Server::Stop 在服务与管理组件销毁之前停止 LeaderElector，等待生命周期回调完成。
+
+优雅退出也会完成降级清理，将尚未完成的写会话按失败处理。模拟进程崩溃后孤立 WRITING 的集成测试使用 SIGKILL，并在崩溃前确认所需元数据已持久化；SIGTERM 用例单独验证退出前完成未完成写入的清理。
 
 ## 5. Leader 发现
 
@@ -272,7 +308,7 @@ Redis选主key通过`cluster_name`区分：`kvcm_<cluster_name>_lock:`/`kvcm_<cl
 
 ### 7.2 Leader 主动降级（Demote）
 
-1. 调用 `LeaderDemote` 接口，直接释放分布式锁并入队 DEMOTING 任务。
+1. 调用 `LeaderDemote` 接口，立即撤销业务资格、通知状态处理线程并释放分布式锁。
 2. StateTransition 线程执行 OnNoLongerLeader 回调（优雅清理）。
 3. 可选配置 `forbid_campaign_time_ms` 防止原 Leader 立即重新竞选。
 4. Follower 竞选成功后成为新 Leader。
@@ -286,10 +322,40 @@ Redis选主key通过`cluster_name`区分：`kvcm_<cluster_name>_lock:`/`kvcm_<cl
 
 ### 7.4 网络分区
 
-由于采用单一协调后端（而非多数派投票），不存在脑裂风险：
+选主依赖单一协调后端提供锁的原子性和 TTL：
+
 - 能连接到协调后端的节点可以正常竞选和续约。
 - 不能连接的节点无法续约，自动降级。
-- 同一时刻最多只有一个节点持有锁（Leader）。
+- 协调后端正常履行锁约定时，同一时刻最多只有一个节点持有有效锁。
+
+本地失锁会关闭新请求入口，已有请求仍按优雅降级约定排空。本地轮次不提供存储层 fencing，不能据此保证旧主的所有已接受操作与新主操作绝无重叠。
+
+### 7.5 状态收敛测试覆盖
+
+| 场景 | 验证的约束 | 用例位置 |
+|---|---|---|
+| 恢复开始前反复得锁、失锁 | 不积压历史回调；最终持锁后只恢复一次 | `config/test/leader_elector_reconcile_test.cc` |
+| 恢复期间失锁、门禁发布与失锁并发 | 旧恢复不能重新开放门禁；清理返回后才允许竞选 | 同上 |
+| 恢复、清理、主动释放或冷却期间发现新主 | 继续刷新持有者，锁消失后清空发现；查询不提升资格，不采用释放前读到的自持锁旧结果 | 同上 |
+| 抢锁、查询锁持有者或续约响应迟到 | 轮次或租约已失效时拒绝结果；不删除其他节点的锁 | 同上 |
+| 响应等待状态锁跨过租约期限 | 取得状态锁后重新读取时间，拒绝过期结果 | 同上 |
+| 恢复开始前、发布门禁前、恢复返回时租约到期 | 尚未开始恢复时无需清理；已开始恢复时必须清理 | 同上 |
+| 主动释放锁阻塞或失败、冷却期先于清理结束 | 释放期间不竞选；清理完后可重新恢复自持锁 | 同上 |
+| 抢锁、恢复或清理期间停止 | 迟到结果不生效；已开始的生命周期回调完成后停止返回 | 同上 |
+| 恢复/清理异常、租约内普通续约错误 | 保留既有回调失败策略及续约容错行为 | 同上 |
+| 最后一个请求完成与排空等待并发 | 不丢完成通知；两类服务请求排空前不重新竞选 | `service/test/service_impl_base_test.cc` |
+| 本地失锁、角色仍为 LEADER 且尚未关闭订阅 | Optimizer 配置与订阅 gRPC 接口拒绝新请求 | `service/test/optimizer_event_service_grpc_test.cc` |
+| 优雅退出与进程崩溃后的未完成写入 | SIGTERM 等待写会话清理；SIGKILL 后孤立 WRITING 可由 GC/Reclaimer 回收 | `integration_test/cache_garbage_collector/cache_garbage_collector_test.py`、`integration_test/reclaimer/reclaiming_test.py` |
+| 单节点主动降级后重新服务、双节点竞争与切主 | 通过 HTTP/gRPC 验证门禁和选主的装配行为 | `integration_test/admin_service/admin_interface_cases.py` |
+| 真实 Redis 锁 key 在恢复期间被外部删除 | 真实续约返回 `EC_NOENT`；恢复和清理期间各 100 次锁循环均刷新发现但不抢锁；清理阻塞时可解析其他节点的新主端点；清理后重新恢复为 LEADER 并发布门禁 | `integration_test/redis_coordination/leader_lock_deletion_test_driver.cc`，由下述 Python 集成目标启动 |
+| 外部连续删除真实 Redis 锁 key | 至少 10 次实际删除；停止注入后重新获锁、恢复 Meta/Admin 入口，并持续跨过 3 次后续续约 | `integration_test/redis_coordination/redis_leader_recovery_test.py` |
+| Redis 连接反复中断、主节点网络隔离 | 单节点能重新恢复；双节点只有新主提供业务，旧主恢复连接后不重复升主 | `integration_test/redis_coordination/redis_leader_recovery_test.py` |
+| Redis 已续约成功但响应丢失或迟到 | 客户端重连并重试同一命令；过期轮次不复活，补偿释放不删除新主的锁 | 同上 |
+| Redis 停止后以空状态重启 | 本地租约到期关闭门禁；Lua 缓存丢失后自动重载，重新恢复两类业务入口 | 同上 |
+
+单元测试使用受控后端精确安排状态转换的并发时序；Redis 集成测试复用 `RedisServer` 启动独立 Valkey/Redis，通过 TCP 代理关闭连接、丢弃或暂缓真实续约响应，并实际停止和重新启动 Redis 进程。注册表使用本地后端，保证测试聚焦选主失锁后的收敛行为。每个测试实例独立分配 Redis 端口及工作目录，CI 显式选择带 `manual` / `redis` 标签的 C++ 和集成测试。回调永久不返回仍遵循现有等待策略。
+
+外部删锁用例使用独立 Redis 连接执行 `DEL`，验证锁 key 消失后的选主行为，不依赖容量驱逐的随机性。恢复窗口用例由 Python 启动同一私有 Redis 和 C++ 测试驱动，以条件变量控制恢复、清理回调；选主器仍使用真实 `CoordinationRedisBackend` 和 Lua 脚本，并额外验证后端在此时可以立即被其他持有者取得。进程级反复删锁用例不阻塞恢复，而是在停止注入后检查真实服务入口。两者均不增加生产代码测试钩子，不覆盖 Redis 内存策略或 OOM 行为。
 
 ## 8. 模块目录结构
 
