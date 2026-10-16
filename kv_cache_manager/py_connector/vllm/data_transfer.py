@@ -399,7 +399,9 @@ def staging_shape(
 
     Attention buckets derive the per-token size from their own block size
     (``per_block_bytes`` is built as per-token * manager_block_size * layers,
-    see vllm_common.parse_groups) and carry their tensors' element type. State
+    see vllm_common.parse_groups; for a compressed bucket that is bytes per row
+    divided by the tokens a row spans, see RowGranularMeta) and carry their
+    tensors' element type. State
     buckets stage opaque bytes and take ``kv_dtype``: their key then matches an
     attention bucket of the same per-token geometry, which is byte-compatible
     (each member only ever writes its own dense block run) and keeps a hybrid
@@ -752,7 +754,10 @@ class DataTransferManager:
         return self._pools[group.spec_name]
 
     def capture_blocks(
-        self, group: AttentionTransferGroup, block_slots: List[List[int]], timeout: float
+        self,
+        group: AttentionTransferGroup,
+        block_slots: List[List[int]],
+        timeout: float,
     ) -> Optional[int]:
         """Copy blocks straight out of HBM into the arena, synchronously.
 
@@ -784,7 +789,7 @@ class DataTransferManager:
                     view,
                     block_slots,
                     list(range(len(block_slots))),
-                    self._manager_block_size,
+                    self._attn_rows_per_block(group),
                     group.per_token_dim,
                     block_stride=group.block_stride,
                     local_block_size=group.kernel_block_size,
@@ -794,16 +799,14 @@ class DataTransferManager:
                 # at the start of *its* slot, one gather per block, so the save
                 # task can address captured slots individually.
                 for offset, slots in enumerate(block_slots):
-                    cpu_buffer = pool.cpu_view(
-                        start + offset, 1, group.per_block_bytes
-                    )
+                    cpu_buffer = pool.cpu_view(start + offset, 1, group.per_block_bytes)
                     view = self._attn_staging_view(cpu_buffer, group, 1)
                     batch_gather_scatter_helper.batch_gather_kv_caches(
                         group.kvcache_ptr_tensor_gpu,
                         view,
                         [slots],
                         [0],
-                        self._manager_block_size,
+                        self._attn_rows_per_block(group),
                         group.per_token_dim,
                         block_stride=group.block_stride,
                         local_block_size=group.kernel_block_size,
@@ -814,16 +817,24 @@ class DataTransferManager:
             raise
         return start
 
+    def _attn_rows_per_block(self, group: AttentionTransferGroup) -> int:
+        """Staging rows one manager block holds: one per token for a
+        token-granular bucket, one per stored state for a compressed one (the
+        kernel indexes rows, see AttentionTransferGroup.tokens_per_row)."""
+        return self._manager_block_size // group.tokens_per_row
+
     def _attn_staging_view(
         self, cpu_buffer: torch.Tensor, group: AttentionTransferGroup, batch: int
     ) -> torch.Tensor:
         """Pinned host staging view for one attention bucket: the *bucket's*
         element type (instances may mix element sizes, e.g. a V3.2 bf16 main
-        spec next to a uint8 indexer) and one row per token slots
-        (compress_ratio == 1 => manager block rows).
+        spec next to a uint8 indexer) and one staging row per kernel row.
         """
         return cpu_buffer.view(group.dtype).view(
-            batch, group.num_kv_ptrs, self._manager_block_size, group.per_token_dim
+            batch,
+            group.num_kv_ptrs,
+            self._attn_rows_per_block(group),
+            group.per_token_dim,
         )
 
     # ------------------------------------------------------------------ #
@@ -988,8 +999,7 @@ class DataTransferManager:
                 continue
             failed.add(i)
             logger.warning(
-                "save group %s: block %d %s; failing it instead of publishing "
-                "a hole",
+                "save group %s: block %d %s; failing it instead of publishing a hole",
                 group.spec_name,
                 i,
                 "was announced without captured bytes (withheld capture?)"
@@ -1227,7 +1237,7 @@ class DataTransferManager:
                         # Attention tasks always carry token indices.
                         [block_token_indices[i] for i in valid],  # ty: ignore[not-subscriptable]
                         list(range(len(valid))),
-                        self._manager_block_size,
+                        self._attn_rows_per_block(group),
                         group.per_token_dim,
                         block_stride=group.block_stride,
                         local_block_size=group.kernel_block_size,
@@ -1352,8 +1362,7 @@ class DataTransferManager:
                 all_null = {
                     i
                     for i in range(n)
-                    if null_rows[i] is not None
-                    and null_rows[i].source_row is None  # ty: ignore[unresolved-attribute]
+                    if null_rows[i] is not None and null_rows[i].source_row is None  # ty: ignore[unresolved-attribute]
                 }
                 if all_null:
                     logger.debug(
@@ -1449,7 +1458,7 @@ class DataTransferManager:
                             # (see _iter_task_chunks).
                             [block_token_indices[i] for i in valid],  # ty: ignore[not-subscriptable]
                             list(range(len(valid))),
-                            self._manager_block_size,
+                            self._attn_rows_per_block(group),
                             group.per_token_dim,
                             block_stride=group.block_stride,
                             local_block_size=group.kernel_block_size,

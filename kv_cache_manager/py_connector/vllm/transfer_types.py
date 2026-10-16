@@ -80,7 +80,10 @@ class AttentionTransferGroup(TransferGroup):
     num_kv_ptrs: int
     # heads * content dim per pointer (content dim is 2*D packed, D split).
     per_token_dim: int
-    # Tokens per kernel page (may differ from block_size on padded pages).
+    # Rows per kernel page (may differ from block_size on padded pages). A row
+    # is what the kernel copies: one token when tokens_per_row == 1, one stored
+    # state spanning tokens_per_row tokens for a compressed bucket, so this is
+    # the tensor's page size in *rows*, never in tokens.
     kernel_block_size: int
     # Element stride between kernel pages of one pointer; 0 => the pages are
     # contiguous and the kernel uses flat indexing.
@@ -93,6 +96,11 @@ class AttentionTransferGroup(TransferGroup):
     # prefix: the worker's capture / null-slot / staged-write branches key on
     # it, so a group describes its own transfer contract.
     retention: Optional[Any] = None
+    # Tokens one stored row spans (1 = one row per token; > 1 = a compressed
+    # row, see vllm_common.RowGranularMeta). Every row-addressed quantity --
+    # the token indices fed to the kernel, the staging view's rows per manager
+    # block -- is derived from it.
+    tokens_per_row: int = 1
 
 
 @dataclass(frozen=True)

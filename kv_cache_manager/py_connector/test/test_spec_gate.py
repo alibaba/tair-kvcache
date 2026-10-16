@@ -31,7 +31,9 @@ from kv_cache_manager.py_connector.test import vllm_stubs  # noqa: F401 (stubs)
 
 from kv_cache_manager.py_connector.vllm.vllm_common import (
     _check_attention_spec_supported,
+    _is_replayed_window,
     _is_scratch_spec,
+    _skip_reason,
     _tokens_per_state,
     parse_groups,
     spec_name,
@@ -127,6 +129,19 @@ class TestZooDispositions(unittest.TestCase):
                 self.assertTrue(own, result.message)
                 self.assertEqual(row["page_bytes"], own[0].page_bytes)
                 self.assertEqual(row["per_block_bytes"], own[0].per_block_bytes)
+                expected = row.get("row_granular")
+                if expected is None:
+                    self.assertIsNone(own[0].row_granular)
+                else:
+                    self.assertEqual(
+                        expected["tokens_per_row"], own[0].row_granular.tokens_per_row
+                    )
+                    self.assertEqual(
+                        expected["rows_per_page"], own[0].row_granular.rows_per_page
+                    )
+                    self.assertEqual(
+                        expected["bytes_per_row"], own[0].row_granular.bytes_per_row
+                    )
 
     def test_skipped_rows_leave_the_companion_alone(self):
         for row in facts.ZOO:
@@ -183,8 +198,12 @@ class TestUndeclaredSubclassesFailClosed(unittest.TestCase):
         # A brand-new window field on a FullAttentionSpec subclass: accepted by
         # neither the gate nor parse_groups (the pre-B1 hole).
         spec = self._subclass(
-            "FullAttentionSpec", "FooBrandNewWindowSpec",
-            block_size=16, num_kv_heads=4, head_size=64, dtype="bfloat16",
+            "FullAttentionSpec",
+            "FooBrandNewWindowSpec",
+            block_size=16,
+            num_kv_heads=4,
+            head_size=64,
+            dtype="bfloat16",
         )
         spec.brand_new_window = 4096
         with self.assertRaises(NotImplementedError) as ctx:
@@ -210,7 +229,11 @@ class TestUndeclaredSubclassesFailClosed(unittest.TestCase):
         ):
             with self.subTest(cls=name):
                 spec = self._subclass(
-                    base, name, block_size=16, num_kv_heads=1, head_size=576,
+                    base,
+                    name,
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=576,
                     dtype="bfloat16",
                 )
                 with self.assertRaises(NotImplementedError) as ctx:
@@ -315,8 +338,12 @@ class TestUndeclaredSubclassesFailClosed(unittest.TestCase):
         # KpoolTailSpec is refused through this branch, and calling it a
         # SlidingWindowSpec would send the operator looking for the wrong spec).
         spec = self._subclass(
-            "SlidingWindowSpec", "MyWindowedSpec",
-            block_size=16, num_kv_heads=4, head_size=64, dtype="bfloat16",
+            "SlidingWindowSpec",
+            "MyWindowedSpec",
+            block_size=16,
+            num_kv_heads=4,
+            head_size=64,
+            dtype="bfloat16",
             sliding_window=512,
         )
         with self.assertRaises(NotImplementedError) as ctx:
@@ -685,9 +712,7 @@ class TestScratchGroupSkip(unittest.TestCase):
             ]
         )
         self.assertEqual([meta.group_idx for meta in metas], [0, 2])
-        self.assertEqual(
-            [spec_name(0, meta) for meta in metas], ["tp0_g0", "tp0_g2"]
-        )
+        self.assertEqual([spec_name(0, meta) for meta in metas], ["tp0_g0", "tp0_g2"])
 
     def test_skip_logs_one_line_with_the_class(self):
         # The operator must be able to see *what* was left out of the manager.
@@ -709,28 +734,81 @@ class TestScratchGroupSkip(unittest.TestCase):
         self.assertIn("vllm_common.py", skipped[0])
 
     def test_a_scratch_only_instance_is_refused(self):
-        with self.assertRaisesRegex(
-            NotImplementedError, "no usable kv cache groups"
-        ):
+        with self.assertRaisesRegex(NotImplementedError, "no usable kv cache groups"):
             self._parse([self._group("circular_buffer", ["ring"])])
 
     def test_the_skip_predicate_is_capability_based(self):
-        # The predicate is "not prefix cacheable AND not transferable"; both
-        # halves are needed. SlidingWindowMLASpec with bounded replay is the
+        # The scratch predicate is "not prefix cacheable AND not transferable";
+        # both halves are needed. SlidingWindowMLASpec with bounded replay is the
         # counter-example that keeps a plain "prefix_cacheable is False" rule
-        # from silently dropping a group the table still refuses.
+        # from claiming it: it is skipped because the *engine replays the
+        # window*, a different reason with a different predicate (and one that
+        # must not be reachable for a group with a cacheable member).
         spec = facts.build_spec(
             facts.ROW_BY_NAME["swa_mla_bounded_replay"], self.engine
         )
         self.assertFalse(spec.prefix_cacheable)
         self.assertTrue(spec.uses_slot_mapping)
         self.assertFalse(_is_scratch_spec(spec))
+        self.assertTrue(_is_replayed_window(spec))
+        self.assertIn("replays this window", _skip_reason(spec))
+
         # ... and the 0.26 shapes answer nothing at all: never skip on a flag
         # the era cannot answer.
         class NoFlags:
             block_size = 16
 
         self.assertFalse(_is_scratch_spec(NoFlags()))
+        self.assertFalse(_is_replayed_window(NoFlags()))
+        self.assertIsNone(_skip_reason(NoFlags()))
+
+    def test_a_mixed_wrapper_is_never_skipped(self):
+        # Skipping a wrapper drops *every* member, so a wrapper with one
+        # cacheable member must reach the gate (which refuses the offending
+        # member) instead of disappearing with its data.
+        wrapper_cls = self.engine.class_of("UniformTypeKVCacheSpecs")
+        assert wrapper_cls is not None
+        wrapper = wrapper_cls(
+            block_size=64,
+            kv_cache_specs={
+                "swa": facts.build_spec(
+                    facts.ROW_BY_NAME["swa_mla_bounded_replay"], self.engine
+                ),
+                "main": facts.build_spec(
+                    facts.ROW_BY_NAME["mla_compressed_0_31"], self.engine
+                ),
+            },
+        )
+        self.assertIsNone(_skip_reason(wrapper))
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._parse(
+                [
+                    SimpleNamespace(
+                        layer_names=["swa", "main"],
+                        kv_cache_spec=wrapper,
+                        is_eagle_group=False,
+                    )
+                ]
+            )
+        self.assertIn("SlidingWindowMLASpec", str(ctx.exception))
+
+    def test_the_replayed_window_is_skipped_with_the_wire_hole(self):
+        # The V4.1 SWA-MLA groups: dropped with a reason, keeping their vLLM
+        # group index (so the surviving groups' names do not move).
+        with self.assertLogs(LOGGER_NAME, level="WARNING") as captured:
+            metas = self._parse(
+                [
+                    self._group("swa_mla_bounded_replay", ["swa0"]),
+                    self._group("mla_compressed_0_31", ["main"]),
+                ],
+                mbs=64,
+            )
+        self.assertEqual([meta.group_idx for meta in metas], [1])
+        self.assertEqual([spec_name(0, meta) for meta in metas], ["tp0_g1"])
+        skipped = [msg for msg in captured.output if "skip" in msg]
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("SlidingWindowMLASpec", skipped[0])
+        self.assertIn("replays this window", skipped[0])
 
 
 class TestHolesAreReversed(unittest.TestCase):
@@ -789,15 +867,43 @@ class TestHolesAreReversed(unittest.TestCase):
                 self.assertEqual("refuse", result.outcome)
                 self.assertIn(keyword, result.message)
 
-    def test_compressed_mla_was_accepted_and_is_refused_now(self):
+    def test_compressed_mla_is_accepted_with_the_row_mapping(self):
         # Pre-PR: the gate read compress_ratio, which the 0.29+ spec no longer
-        # has (getattr -> 1) -> ACCEPT, while the real layout is one row per 2
-        # tokens. Now the era-safe read sees tokens_per_state.
+        # has (getattr -> 1) -> ACCEPT while the real layout is one row per 2
+        # tokens. PR1 closed that by refusing the layout; PR6 supports it by
+        # *reading the era's field* and mapping it as rows (RowGranularMeta),
+        # so the hole is closed by the mechanism rather than the refusal.
         row, _, legacy = self._row("mla_compressed_0_31")
         self.assertTrue(legacy)
         result = facts.run_row(row, self.engine)
+        self.assertEqual("accept", result.outcome)
+        own = [meta for meta in result.metas if meta.group_idx == 0][0]
+        self.assertEqual(2, own.row_granular.tokens_per_row)
+        self.assertEqual(128, own.row_granular.rows_per_page)
+        self.assertEqual(584, own.row_granular.bytes_per_row)
+        # 584 B/row x (256 // 2) rows -- the same block size the pre-PR gate
+        # produced by accident, which is why the hole was in the address math.
+        self.assertEqual(74752, own.per_block_bytes)
+
+    def test_a_ratio_that_does_not_divide_the_manager_block_is_refused(self):
+        # The arithmetic precondition of the row mapping: a manager block has
+        # to stay a whole number of rows (the block table's unit is the entry,
+        # the manager's is the block).
+        row = facts.ROW_BY_NAME["mla_tps_not_dividing_mbs"]
+        result = facts.run_row(row, self.engine)
         self.assertEqual("refuse", result.outcome)
-        self.assertIn("tokens_per_state=2", result.message)
+        self.assertIn("manager block size 528", result.message)
+        self.assertIn("tokens_per_state=32", result.message)
+
+    def test_nvfp4_ds_mla_is_refused_by_name(self):
+        # Not "unknown cache_dtype_str": the SM100-only NVFP4 record, named
+        # with the (cache_dtype_str, geometry, tokens_per_state) triple.
+        row = facts.ROW_BY_NAME["mla_nvfp4"]
+        self.assertEqual("refuse", row["legacy"])  # also refused before, by name
+        result = facts.run_row(row, self.engine)
+        self.assertEqual("refuse", result.outcome)
+        self.assertIn("nvfp4_ds_mla", result.message)
+        self.assertIn("288", result.message)
 
     def test_pooled_states_are_refused_too(self):
         # The same field family: Fraction(1, n) means several states per token.
@@ -809,13 +915,18 @@ class TestHolesAreReversed(unittest.TestCase):
 
 
 class TestEraSafeTokensPerState(unittest.TestCase):
-    """One code path, two spellings: whichever field carries a value wins."""
+    """One code path, two spellings: whichever field carries a value wins.
+
+    Since PR6 the compressed rows are *accepted*, so the reading is asserted
+    through the parsed bucket (the ratio and the field name travel into the
+    message only when the ratio is refused for arithmetic reasons).
+    """
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.engine = engine()
 
-    def _message(self, **kwargs) -> str:
+    def _meta(self, **kwargs):
         spec_cls = self.engine.class_of("MLAAttentionSpec")
         assert spec_cls is not None
         spec = spec_cls(
@@ -826,29 +937,51 @@ class TestEraSafeTokensPerState(unittest.TestCase):
             cache_dtype_str="auto",
             **kwargs,
         )
-        with self.assertRaises(NotImplementedError) as ctx:
-            _check_attention_spec_supported(
-                "group 0", spec, calculate_kv_scales=False
-            )
-        return str(ctx.exception)
+        return parse_groups(
+            SimpleNamespace(
+                kv_cache_groups=[
+                    SimpleNamespace(
+                        layer_names=["l0"], kv_cache_spec=spec, is_eagle_group=False
+                    )
+                ]
+            ),
+            256,
+            calculate_kv_scales=False,
+        )[0]
 
-    def test_the_026_spelling_is_named(self):
-        self.assertIn("compress_ratio=4", self._message(compress_ratio=4))
+    def test_the_026_spelling_is_read(self):
+        meta = self._meta(compress_ratio=4)
+        self.assertEqual(meta.row_granular.tokens_per_row, 4)
 
-    def test_the_031_spelling_is_named(self):
-        self.assertIn("tokens_per_state=2", self._message(tokens_per_state=2))
+    def test_the_031_spelling_is_read(self):
+        meta = self._meta(tokens_per_state=2)
+        self.assertEqual(meta.row_granular.tokens_per_row, 2)
 
     def test_the_newer_spelling_wins_when_both_carry_a_value(self):
-        message = self._message(compress_ratio=4, tokens_per_state=2)
-        self.assertIn("tokens_per_state=2", message)
+        # The stub carries both (the era union); a real spec carries one. The
+        # newer spelling is the one that decides -- and the refused arithmetic
+        # names it: 256 % 3 != 0 here, while the older field's 4 would divide.
+        spec_cls = self.engine.class_of("MLAAttentionSpec")
+        assert spec_cls is not None
+        spec = spec_cls(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=512,
+            dtype="bfloat16",
+            cache_dtype_str="auto",
+            compress_ratio=4,
+            tokens_per_state=3,
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            _check_attention_spec_supported("group 0", spec, calculate_kv_scales=False)
+        message = str(ctx.exception)
+        self.assertIn("tokens_per_state=3", message)
         self.assertNotIn("compress_ratio=4", message)
 
     def test_both_defaults_mean_one_row_per_token(self):
         spec_cls = self.engine.class_of("MLAAttentionSpec")
         assert spec_cls is not None
-        spec = spec_cls(
-            block_size=16, num_kv_heads=1, head_size=576, dtype="bfloat16"
-        )
+        spec = spec_cls(block_size=16, num_kv_heads=1, head_size=576, dtype="bfloat16")
         self.assertEqual((1, "tokens_per_state"), _tokens_per_state(spec))
         plain = engine().class_of("FullAttentionSpec")
         assert plain is not None
@@ -906,11 +1039,21 @@ class TestAcceptanceSurfaceDifferential(unittest.TestCase):
         ]
         # (RSWASpec is not in the list: the old gate already accepted it, so it
         # is a hole closed with a mechanism rather than a widened class -- see
-        # TestHolesAreReversed.)
+        # TestHolesAreReversed. mla_compressed_0_26 is PR6's: the *old* gate read
+        # compress_ratio and refused the ratio, the new one reads the same field
+        # and accepts it as a row-granular bucket.)
         self.assertEqual(
-            ["full_window", "full_chunked", "sliding_window",
-             "sliding_window_retained", "chunked_local"],
-            widened,
+            sorted(
+                [
+                    "full_window",
+                    "full_chunked",
+                    "sliding_window",
+                    "sliding_window_retained",
+                    "chunked_local",
+                    "mla_compressed_0_26",
+                ]
+            ),
+            sorted(widened),
         )
 
 
@@ -921,12 +1064,15 @@ class TestTableInvariants(unittest.TestCase):
         # The class table is the family-level decision; a row may be narrower
         # (a compressed or windowed MLA variant is refused inside an accepted
         # family). The other direction is absolute: a refused or skipped
-        # family has no accepted row.
+        # family (and the per-form skip_or_refuse of the replayed window) has
+        # no accepted row.
         for row in facts.ZOO:
             family = facts.SPEC_DISPOSITIONS[row["cls"]]
             with self.subTest(row=row["name"]):
                 if family in ("refuse", "skip"):
                     self.assertEqual(family, row["disposition"])
+                elif family == "skip_or_refuse":
+                    self.assertIn(row["disposition"], ("refuse", "skip"))
                 else:
                     self.assertIn(family, ("accept", "split"))
                     self.assertIn(row["disposition"], ("accept", "refuse", "skip"))
@@ -949,15 +1095,16 @@ class TestTableInvariants(unittest.TestCase):
         self.assertEqual(set(facts.SPEC_DISPOSITIONS), covered)
 
     def test_windowed_and_scratch_classes_keep_their_side(self):
-        # The red line of this PR, spelled out: the three windowed classes this
-        # PR implements are accepted (with retention), the windowed MLA variant
-        # stays refused (its correct disposition is the DSA skip), the scratch
-        # classes are skipped, and nothing else moved.
+        # The red line of PR3, spelled out and unchanged by PR6: the three
+        # windowed classes this PR implements are accepted (with retention), the
+        # windowed MLA variant is *never transferred* (the replayed form is
+        # skipped, the non-replayed one refused), the scratch classes are
+        # skipped, and nothing else moved.
         self.assertEqual(
             {
                 "SlidingWindowSpec": "accept",
                 "ChunkedLocalAttentionSpec": "accept",
-                "SlidingWindowMLASpec": "refuse",
+                "SlidingWindowMLASpec": "skip_or_refuse",
                 "RSWASpec": "accept",
                 "CircularBufferSpec": "skip",
                 "KpoolTailSpec": "skip",
@@ -983,6 +1130,54 @@ class TestTableInvariants(unittest.TestCase):
         for row in facts.ZOO:
             if row["legacy"] == "accept" and row["disposition"] == "refuse":
                 self.assertIn(row.get("hole"), ("rswa", "tokens_per_state"))
+
+
+class TestPR6RelaxationsAreDeclared(unittest.TestCase):
+    """PR6's declared relaxations of the PR1 table, and nothing else.
+
+    Two directions are declared: the compressed rows (tokens_per_state > 1,
+    refused by PR1 to close the field-migration hole) are *accepted* with the
+    row-granular mapping, and the engine-replayed SWA-MLA window (refused by
+    PR1) is *skipped*. The second test is the completeness half: inside the
+    tps/replay family, the rows that left the refuse set must be exactly the
+    declared ones -- a future relaxation cannot slip in unnoticed.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.engine = engine()
+
+    def test_declared_relaxations_hold(self):
+        for name, (pr1, now) in facts.PR6_DECISIONS.items():
+            with self.subTest(row=name):
+                row = facts.ROW_BY_NAME[name]
+                # PR1's verdict for the row (the declaration's first half) and
+                # the row's own table entry must agree with what the parser
+                # really does now.
+                self.assertEqual("refuse", pr1)
+                self.assertEqual(now, row["disposition"])
+                self.assertEqual(now, facts.run_row(row, self.engine).outcome)
+
+    def test_only_the_declared_rows_left_the_refuse_set(self):
+        relaxed = sorted(
+            row["name"]
+            for row in facts.ZOO
+            if facts.in_tps_or_replay_family(row)
+            and facts.run_row(row, self.engine).outcome != "refuse"
+        )
+        self.assertEqual(sorted(facts.PR6_DECISIONS), relaxed)
+
+    def test_the_family_still_refuses_the_two_undescribed_shapes(self):
+        # The relaxation is about whole rows per token, not about "compressed
+        # is fine": fractional pooling (row unit smaller than a token) and the
+        # non-replayed window still refuse.
+        family = {
+            row["name"]: facts.run_row(row, self.engine).outcome
+            for row in facts.ZOO
+            if facts.in_tps_or_replay_family(row)
+        }
+        self.assertEqual("refuse", family["mla_pooled_fraction"])
+        self.assertEqual("refuse", family["swa_mla_prefix_replay"])
 
 
 if __name__ == "__main__":

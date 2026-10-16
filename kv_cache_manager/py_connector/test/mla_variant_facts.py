@@ -43,8 +43,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 #: One attention spec per variant: the constructor kwargs plus the derived
 #: numbers of a single layer. ``per_block_bytes`` assumes manager_block_size
-#: == ``mbs`` and is None for the rows the gate refuses (compressed, windowed),
-#: so the connector never sizes them.
+#: == ``mbs``; it is None only for the rows the gate refuses (windowed and the
+#: other rejected shapes), so the connector never sizes them. For the
+#: compressed rows (compress_ratio > 1) the size is pinned in *rows*:
+#: ``rows_per_page`` x ``bytes_per_row`` is the page, and per block it is
+#: ``bytes_per_row * (mbs // compress_ratio)`` -- with one row per token
+#: (compress_ratio == 1) this equals the historical ``page_bytes // block_size
+#: * mbs``.
 FROZEN: Dict[str, Dict[str, Any]] = {
     # --- accepted variants: one latent row per token ---------------------- #
     "m0": dict(  # GLM-4.7-Flash bf16 (the regression baseline)
@@ -139,7 +144,7 @@ FROZEN: Dict[str, Dict[str, Any]] = {
         page_size_padded=None,
         per_block_bytes=36864,  # 576 B/token x 64
     ),
-    # --- V4 compressed family (refused: one row per several tokens) ------- #
+    # --- V4 compressed family (row-granular: one row per several tokens) --- #
     "m2a": dict(  # V4 c4a bf16, block 256: alignment holds exactly
         kwargs=dict(
             block_size=256,
@@ -158,7 +163,9 @@ FROZEN: Dict[str, Dict[str, Any]] = {
         real_page_size_bytes=65536,
         unpadded_page_size_bytes=65536,
         page_size_padded=None,
-        per_block_bytes=None,
+        rows_per_page=64,
+        bytes_per_row=1024,
+        per_block_bytes=65536,  # 1024 B/row x (mbs 256 // 4) rows
     ),
     "m2a_s": dict(  # the same spec on a small page (block 64)
         kwargs=dict(
@@ -178,7 +185,9 @@ FROZEN: Dict[str, Dict[str, Any]] = {
         real_page_size_bytes=16384,
         unpadded_page_size_bytes=16384,
         page_size_padded=None,
-        per_block_bytes=None,
+        rows_per_page=16,
+        bytes_per_row=1024,
+        per_block_bytes=16384,  # 1024 B/row x (mbs 64 // 4) rows
     ),
     "m2b": dict(  # V4 c4a fp8_ds_mla (584 B/row) with a 64 B alignment tail
         kwargs=dict(
@@ -199,7 +208,9 @@ FROZEN: Dict[str, Dict[str, Any]] = {
         real_page_size_bytes=37376,
         unpadded_page_size_bytes=37376,
         page_size_padded=37440,
-        per_block_bytes=None,
+        rows_per_page=64,
+        bytes_per_row=584,
+        per_block_bytes=37376,  # 584 B/row x (mbs 256 // 4) rows
     ),
     "m2b_s": dict(  # the same spec on a small page (block 64)
         kwargs=dict(
@@ -220,7 +231,9 @@ FROZEN: Dict[str, Dict[str, Any]] = {
         real_page_size_bytes=9344,
         unpadded_page_size_bytes=9344,
         page_size_padded=9792,
-        per_block_bytes=None,
+        rows_per_page=16,
+        bytes_per_row=584,
+        per_block_bytes=9344,  # 584 B/row x (mbs 64 // 4) rows
     ),
     "m2b2": dict(  # V4 c128a: two rows per page, 560 B of alignment tail
         kwargs=dict(
@@ -241,7 +254,9 @@ FROZEN: Dict[str, Dict[str, Any]] = {
         real_page_size_bytes=1168,
         unpadded_page_size_bytes=1168,
         page_size_padded=1728,
-        per_block_bytes=None,
+        rows_per_page=2,
+        bytes_per_row=584,
+        per_block_bytes=1168,  # 584 B/row x (mbs 256 // 128) rows
     ),
     "m2c": dict(  # V4 indexer (132 B/row) with a 192 B alignment tail
         kwargs=dict(
@@ -260,7 +275,9 @@ FROZEN: Dict[str, Dict[str, Any]] = {
         real_page_size_bytes=8448,
         unpadded_page_size_bytes=8448,
         page_size_padded=8640,
-        per_block_bytes=None,
+        rows_per_page=64,
+        bytes_per_row=132,
+        per_block_bytes=8448,  # 132 B/row x (mbs 256 // 4) rows
     ),
     # --- V4 windowed / compressor-state rows (refused: not the full prefix) #
     # They pin the *grouped* spec: page_size_padded is a constructor input
@@ -389,7 +406,9 @@ FROZEN: Dict[str, Dict[str, Any]] = {
         real_page_size_bytes=167936,
         unpadded_page_size_bytes=167936,
         page_size_padded=None,
-        per_block_bytes=None,
+        rows_per_page=64,
+        bytes_per_row=2624,
+        per_block_bytes=41984,  # 2624 B/row x (mbs 64 // 4) rows
     ),
     "X2": dict(  # synthetic: block_size 16 with compress_ratio 3 floors to 5
         kwargs=dict(
@@ -413,8 +432,12 @@ FROZEN: Dict[str, Dict[str, Any]] = {
 
 #: Variants the gate accepts today (c == 1, self-contained rows).
 ACCEPTED: List[str] = ["m0", "m0_b64", "m1", "m2c2", "m3b"]
-#: Variants the gate refuses, grouped by the rule that refuses them.
-REJECTED_COMPRESSED: List[str] = ["m2a", "m2a_s", "m2b", "m2b_s", "m2b2", "m2c", "X1"]
+#: Compressed variants (compress_ratio > 1): accepted since PR6 as row-granular
+#: buckets -- one stored row per compress_ratio tokens, addressed in rows. The
+#: per-block bytes are pinned per row below (``bytes_per_row x mbs // ratio``),
+#: which for these rows coincides with the pre-PR per-token formula: the hole
+#: was in the address math, never in the size.
+ACCEPTED_ROW_GRANULAR: List[str] = ["m2a", "m2a_s", "m2b", "m2b_s", "m2b2", "m2c", "X1"]
 REJECTED_QUANTIZED: List[str] = ["m3"]
 #: SlidingWindowMLASpec rows (V4 SWA / compressor state: not the full prefix).
 REJECTED_WINDOW: List[str] = [

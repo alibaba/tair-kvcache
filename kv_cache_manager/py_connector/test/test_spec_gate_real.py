@@ -242,9 +242,7 @@ class TestUndeclaredSubclassesFailClosed(RealEngineCase):
 
     def _gate_refusal(self, spec) -> str:
         with self.assertRaises(NotImplementedError) as ctx:
-            _check_attention_spec_supported(
-                "group 0", spec, calculate_kv_scales=False
-            )
+            _check_attention_spec_supported("group 0", spec, calculate_kv_scales=False)
         return str(ctx.exception)
 
     def _assert_parse_refuses(self, spec) -> None:
@@ -903,17 +901,23 @@ class TestEraShapes(RealEngineCase):
         # At most one of the two compressed rows is buildable here; the other
         # era's shape is reported as such instead of being silently built from
         # the wrong field. vLLM 0.14 has neither spelling (and no compressed
-        # MLA at all).
+        # MLA at all). Since PR6 the buildable one is *accepted* as a
+        # row-granular bucket, with the ratio the era's own field carries.
         compress = facts.run_row(facts.ROW_BY_NAME["mla_compressed_0_26"], self.engine)
         tokens = facts.run_row(facts.ROW_BY_NAME["mla_compressed_0_31"], self.engine)
-        outcomes = [compress.outcome, tokens.outcome]
-        self.assertLessEqual(outcomes.count("refuse"), 1, "both spellings refused")
-        if "refuse" not in outcomes:
-            self.assertEqual(["unavailable", "unavailable"], outcomes)
-        elif compress.outcome == "refuse":
-            self.assertIn("compress_ratio=4", compress.message)
-        else:
-            self.assertIn("tokens_per_state=2", tokens.message)
+        for result in (compress, tokens):
+            self.assertIn(result.outcome, ("accept", "unavailable"), result.message)
+        for result, ratio in ((compress, 4), (tokens, 2)):
+            if result.outcome != "accept":
+                continue
+            own = [meta for meta in result.metas if meta.group_idx == 0][0]
+            self.assertEqual(ratio, own.row_granular.tokens_per_row)
+        if "accept" in (compress.outcome, tokens.outcome):
+            self.assertEqual(
+                1,
+                (compress.outcome == "accept") + (tokens.outcome == "accept"),
+                "both compressed spellings were buildable at once",
+            )
 
     def test_scratch_flag_shapes_are_the_measured_ones(self):
         # The data behind the era-dependent skip (facts.SCRATCH_FLAGS): the
@@ -994,22 +998,96 @@ class TestDifferentialOnTheRealZoo(RealEngineCase):
         self.assertGreater(checked, 5, "too few rows accepted before to be a check")
 
 
-class TestV41HoleOnTheRealEngine(RealEngineCase):
-    """The field-migration hole, at the size the old gate actually produced."""
+class TestV41CompressedOnTheRealEngine(RealEngineCase):
+    """The field-migration hole, read from the real 0.31 spec.
 
-    def test_compressed_main_is_refused_at_the_legacy_size(self):
+    PR1 closed the hole by refusing what the old gate had accepted silently
+    (it read compress_ratio, which this era no longer has); PR6 closes it from
+    the other side: the era's own field is read, and the layout is transferred
+    as rows. The size the old gate produced by accident (a per-token formula on
+    a two-token row) is the same number here -- the hole was never the size.
+    """
+
+    def test_compressed_main_is_a_row_granular_bucket(self):
         row = facts.ROW_BY_NAME["mla_compressed_0_31"]
         result = facts.run_row(row, self.engine)
         if result.outcome == "unavailable":
             self.assert_unavailable_is_expected(row, result.message)
             return
-        self.assertEqual("refuse", result.outcome)
-        self.assertIn("tokens_per_state=2", result.message)
-        # What the pre-PR gate sized from the same spec (74752 B/block at
-        # mbs 256, i.e. a page that described a layout the tensor never had).
+        self.assertEqual("accept", result.outcome, result.message)
+        own = [meta for meta in result.metas if meta.group_idx == 0][0]
+        self.assertEqual(2, own.row_granular.tokens_per_row)
+        self.assertEqual(128, own.row_granular.rows_per_page)
+        self.assertEqual(584, own.row_granular.bytes_per_row)
+        self.assertEqual(74752, own.per_block_bytes)  # 584 B x 128 rows
+        # What the pre-PR gate sized from the same spec, and what the real
+        # spec's page is: the same 74752 B/block, from a per-token formula.
         spec = facts.build_spec(row, self.engine)
         self.assertTrue(facts.legacy_accepts(spec, self.engine))
         self.assertEqual(74752, spec.real_page_size_bytes)
+
+
+class TestFoldedGroupCoverageOnTheRealEngine(RealEngineCase):
+    """The reachable way to make one group's buckets disagree (PR6 review r1).
+
+    ``UniformTypeKVCacheSpecs.from_specs`` merges an MLA layer with an R-SWA one
+    -- their uniform base is the same FullAttentionSpec -- but the two carry
+    different coverage (one is a windowed contract, the other full prefix). The
+    engine hands the scheduler one member of such a group
+    (generate_scheduler_kv_cache_config keeps the first), whose masks would then
+    miss the other bucket's dimension: stale or zero-page bytes would be
+    published as cacheable. The guard must refuse it, on the real class tree of
+    the installed era.
+    """
+
+    def _mixed_wrapper(self):
+        module = self.module
+        members = {
+            "mla_l": module.MLAAttentionSpec(
+                block_size=64,
+                num_kv_heads=1,
+                head_size=576,
+                dtype=torch.uint8,
+            ),
+            "rswa_l": module.RSWASpec(
+                block_size=64,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.float16,
+                rswa_window=128,
+            ),
+        }
+        merged = module.UniformTypeKVCacheSpecs.from_specs(members)
+        return module, members, merged
+
+    def test_the_era_really_folds_these_two_specs(self):
+        module, _members, merged = self._mixed_wrapper()
+        self.assertIsNotNone(
+            merged,
+            "the era no longer merges MLA with R-SWA: this test would be dead; "
+            "pick the spec pair that folds on this version",
+        )
+        del module
+
+    def test_a_group_with_two_coverages_is_refused(self):
+        module, members, merged = self._mixed_wrapper()
+        self.assertIsNotNone(merged)
+        config = module.KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                module.KVCacheGroupSpec(layer_names=list(members), kv_cache_spec=merged)
+            ],
+        )
+        # The parse-time bucket split serves *agreeing* packed windowed groups
+        # and refuses a divergence while splitting (the same predicate the
+        # stacked folding guard enforces at registration for metas built
+        # without going through the parse).
+        with self.assertRaises(NotImplementedError) as ctx:
+            parse_groups(config, 64, calculate_kv_scales=False)
+        message = str(ctx.exception)
+        self.assertIn("different coverage", message)
+        self.assertIn("group 0", message)
 
 
 if __name__ == "__main__":

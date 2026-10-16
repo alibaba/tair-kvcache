@@ -27,6 +27,7 @@ from kv_cache_manager.py_connector.test.vllm_stubs import (
 from kv_cache_manager.py_connector.vllm.connector_scheduler import RequestLedger
 from kv_cache_manager.py_connector.vllm.vllm_common import (
     AttentionGroupMeta,
+    RowGranularMeta,
     StateGroupMeta,
     build_spec_groups,
     parse_groups,
@@ -620,11 +621,22 @@ class TestParseGroups(unittest.TestCase):
         # per_token = 16 * 576 * 2 // 16 = 1152 bytes.
         self.assertEqual(m.per_block_bytes, 1152 * 32 * 2)
 
-    def test_mla_compressed_rejected(self):
+    def test_mla_compressed_is_a_row_granular_bucket(self):
         # DeepSeek V4 compress_ratio > 1: one stored row covers multiple
-        # tokens; the token-granular slot mapping has nothing to gather.
-        with self.assertRaisesRegex(NotImplementedError, "compress_ratio"):
-            self._parse([self._mla_group(["l0"], compress_ratio=2)], 16)
+        # tokens. Since PR6 the group transfers as a row-granular bucket: the
+        # page (18432 B here) holds block_size // ratio rows of its own, and a
+        # manager block holds mbs // ratio of them.
+        mbs = 16
+        metas = self._parse([self._mla_group(["l0"], compress_ratio=2)], mbs)
+        self.assertEqual(len(metas), 1)
+        meta = metas[0]
+        self.assertIsInstance(meta, AttentionGroupMeta)
+        self.assertEqual(meta.row_granular, RowGranularMeta(2, 8, 2304))
+        self.assertEqual(meta.per_block_bytes, 2304 * (mbs // 2))
+        # A manager block that is not a whole number of rows is refused before
+        # a single location is sized.
+        with self.assertRaisesRegex(NotImplementedError, "manager block size 15"):
+            self._parse([self._mla_group(["l0"], compress_ratio=2)], 15)
 
     def test_mla_fp8_ds_layout_accepted(self):
         # DeepSeek V3.2 "fp8_ds_mla": a packed 656 B/token layout whose fp8

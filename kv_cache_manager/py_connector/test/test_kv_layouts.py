@@ -251,18 +251,37 @@ def _make_group_conn():
     return conn
 
 
-def _attn_meta(layer_names, block_size=16, page_bytes=18432, manager_block_size=16):
+def _attn_meta(
+    layer_names,
+    block_size=16,
+    page_bytes=18432,
+    manager_block_size=16,
+    row_granular=None,
+):
     """One attention bucket whose spec page matches the MLA bf16 tensor used
-    by most cases here (16 x 576 x 2 B)."""
+    by most cases here (16 x 576 x 2 B).
+
+    ``row_granular`` switches the bucket to the compressed contract: one row
+    per N tokens, ``block_size // N`` rows a page, ``page_bytes / rows`` bytes
+    a row, and ``mbs // N`` rows a manager block.
+    """
+    if row_granular is None:
+        per_block_bytes = (
+            page_bytes // block_size * manager_block_size * len(layer_names)
+        )
+    else:
+        per_block_bytes = (
+            row_granular.bytes_per_row
+            * (manager_block_size // row_granular.tokens_per_row)
+            * len(layer_names)
+        )
     return AttentionGroupMeta(
         group_idx=0,
         layer_names=layer_names,
         block_size=block_size,
-        per_block_bytes=page_bytes
-        // block_size
-        * manager_block_size
-        * len(layer_names),
+        per_block_bytes=per_block_bytes,
         page_bytes=page_bytes,
+        row_granular=row_granular,
     )
 
 
@@ -272,7 +291,7 @@ class TestBuildTransferGroup(unittest.TestCase):
     captured by patching ``torch.tensor`` (works with both the stubbed and a
     real torch: no tensor math happens on the captured value)."""
 
-    def _build(self, kv_caches, block_size=16, page_bytes=18432, mbs=16):
+    def _build(self, kv_caches, block_size=16, page_bytes=18432, mbs=16, meta=None):
         import unittest.mock as mock
         import kv_cache_manager.py_connector.vllm.connector_worker as wc
 
@@ -286,16 +305,15 @@ class TestBuildTransferGroup(unittest.TestCase):
             t.to.return_value = t
             return t
 
-        with mock.patch.object(wc.torch, "tensor", side_effect=fake_tensor):
-            g = conn._build_attention_group(
-                _attn_meta(
-                    list(kv_caches.keys()),
-                    block_size=block_size,
-                    page_bytes=page_bytes,
-                    manager_block_size=mbs,
-                ),
-                kv_caches,
+        if meta is None:
+            meta = _attn_meta(
+                list(kv_caches.keys()),
+                block_size=block_size,
+                page_bytes=page_bytes,
+                manager_block_size=mbs,
             )
+        with mock.patch.object(wc.torch, "tensor", side_effect=fake_tensor):
+            g = conn._build_attention_group(meta, kv_caches)
         return g, captured
 
     def test_packed_one_ptr_per_layer(self):
@@ -447,6 +465,65 @@ class TestBuildTransferGroup(unittest.TestCase):
             self._build(kv, page_bytes=167936)
         self.assertIn("10496", str(ctx.exception))
         self.assertIn("1152", str(ctx.exception))
+
+    def test_row_granular_rows_are_counted_as_rows(self):
+        # PR6: a compressed bucket's tensor page holds rows, not tokens -- the
+        # spec's rows_per_page and bytes_per_row must match the tensor exactly,
+        # and the transfer group must carry the row size for the staging view
+        # and the kernel call.
+        from kv_cache_manager.py_connector.vllm.vllm_common import RowGranularMeta
+
+        # 32 rows x 584 B: the V4.1 main layer (block 64, two tokens per row;
+        # uint8 storage, so one element is one byte).
+        kv = {"l0": FakeTensor.contiguous([10, 32, 584], itemsize=1)}
+        meta = _attn_meta(
+            ["l0"],
+            block_size=64,
+            page_bytes=32 * 584,
+            manager_block_size=64,
+            row_granular=RowGranularMeta(2, 32, 584),
+        )
+        g, _ = self._build(kv, meta=meta)
+        self.assertEqual(g.kernel_block_size, 32)
+        self.assertEqual(g.per_token_dim, 584)
+        self.assertEqual(g.tokens_per_row, 2)
+        self.assertEqual(g.per_block_bytes, 584 * 32)
+
+    def test_row_granular_tensor_with_the_wrong_row_count_is_rejected(self):
+        # A tensor page of 64 rows against a spec that stores 32: the layout is
+        # a different one (a per-token page), and every row index would be off
+        # by a factor of two -- refuse at registration.
+        from kv_cache_manager.py_connector.vllm.vllm_common import RowGranularMeta
+
+        kv = {"l0": FakeTensor.contiguous([10, 64, 584], itemsize=1)}
+        meta = _attn_meta(
+            ["l0"],
+            block_size=64,
+            page_bytes=32 * 584,
+            manager_block_size=64,
+            row_granular=RowGranularMeta(2, 32, 584),
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._build(kv, meta=meta)
+        self.assertIn("32 rows per page", str(ctx.exception))
+
+    def test_row_granular_tensor_with_the_wrong_row_bytes_is_rejected(self):
+        # Right row count, wrong row size (a backend that drops the in-row fp8
+        # scale, say): the bytes per row are the comparable unit.
+        from kv_cache_manager.py_connector.vllm.vllm_common import RowGranularMeta
+
+        kv = {"l0": FakeTensor.contiguous([10, 32, 512], itemsize=1)}
+        meta = _attn_meta(
+            ["l0"],
+            block_size=64,
+            page_bytes=32 * 584,
+            manager_block_size=64,
+            row_granular=RowGranularMeta(2, 32, 584),
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._build(kv, meta=meta)
+        self.assertIn("584", str(ctx.exception))
+        self.assertIn("512", str(ctx.exception))
 
     def test_backend_without_packed_scales_rejected(self):
         # A backend that stores the fp8 rows *without* the in-row scale

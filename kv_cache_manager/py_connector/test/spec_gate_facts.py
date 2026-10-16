@@ -39,6 +39,9 @@ MIB = 2**20
 #: The 19 KVCacheSpec classes of vLLM 0.31 and what the parser does with each.
 #: ``test_spec_gate_real`` fails when the installed vLLM exposes a class that is
 #: missing here -- the mechanism against the next RSWA-style surprise.
+#: SlidingWindowMLASpec is the one class whose disposition depends on a policy
+#: field rather than the class alone: the replayed form is skipped, the
+#: non-replayed one refused -- never transferred either way (PR6).
 SPEC_DISPOSITIONS: Dict[str, str] = {
     "FullAttentionSpec": "accept",
     "TQFullAttentionSpec": "accept",
@@ -48,7 +51,7 @@ SPEC_DISPOSITIONS: Dict[str, str] = {
     "RSWASpec": "accept",
     "SlidingWindowSpec": "accept",
     "ChunkedLocalAttentionSpec": "accept",
-    "SlidingWindowMLASpec": "refuse",
+    "SlidingWindowMLASpec": "skip_or_refuse",
     "CircularBufferSpec": "skip",
     "KpoolTailSpec": "skip",
     "HiSparseHotSpec": "skip",
@@ -140,6 +143,39 @@ SCRATCH_FLAGS: Dict[str, Dict[str, Tuple[Any, Any, Any]]] = {
     },
 }
 
+#: PR6's declared relaxations of the PR1 table, as ``row -> (PR1's verdict,
+#: this PR's verdict)``. The compressed main/indexer rows are *accepted* (one
+#: row per 2 or 4 tokens, addressed in rows -- see vllm_common.RowGranularMeta),
+#: the packed V4.1 group with them, and the engine-replayed SWA-MLA window is
+#: *skipped* (vLLM rebuilds those rows on a hit, so the group holds no prefix
+#: data to serve). Everything else in the tps/replay family stays refused: the
+#: fractional pooling ratio (its row unit is smaller than a token) and the
+#: non-replayed windowed MLA (it needs the windowed retention contract,
+#: deferred). ``test_spec_gate`` asserts that these four are exactly the rows
+#: that left the refuse set.
+PR6_DECISIONS: Dict[str, Tuple[str, str]] = {
+    "mla_compressed_0_26": ("refuse", "accept"),
+    "mla_compressed_0_31": ("refuse", "accept"),
+    "wrapper_v41_packed": ("refuse", "accept"),
+    "swa_mla_bounded_replay": ("refuse", "skip"),
+}
+
+#: The ZOO fields that put a row in the tps / replay family (see
+#: PR6_DECISIONS): used to assert that *only* the declared rows left the refuse
+#: set, so a future row cannot be relaxed by accident.
+TPS_OR_REPLAY_FIELDS = ("tokens_per_state", "compress_ratio", "bounded_replay")
+
+
+def in_tps_or_replay_family(row: Dict[str, Any]) -> bool:
+    """Is this row (or any of its members, for a wrapper row) in the family
+    whose rows PR6 relaxes? See PR6_DECISIONS."""
+    if set(row.get("kwargs", {})) & set(TPS_OR_REPLAY_FIELDS):
+        return True
+    return any(
+        in_tps_or_replay_family(ROW_BY_NAME[member])
+        for member in row.get("members", {}).values()
+    )
+
 
 #: Eras whose KVCacheConfig declares the transfer projection (KVCacheGroupSpec.
 #: enable_kv_transfer / transfer_group_ids / prefix_cacheable_group_ids). The
@@ -177,16 +213,20 @@ def skip_eras(row: Dict[str, Any]) -> Tuple[str, ...]:
 def expected_outcome(row: Dict[str, Any], engine: "Engine") -> str:
     """The row's disposition *in this era*.
 
-    Only the scratch rows are era-dependent, and for two reasons: the era's own
-    spec must declare the scratch contract (see skip_eras), and the group must
-    not be exposed to connectors. Where either half is missing a scratch group
-    is not dropped -- an era that still claims it is refused by the gate, and a
-    group the engine hands to connectors (transferable, the vLLM default)
-    is refused by parse_groups instead of being silently dropped -- except the
-    compression ring, which the engine rebuilds per request.
+    Two families answer differently. The scratch rows are era-dependent, for
+    two reasons: the era's own spec must declare the scratch contract (see
+    skip_eras), and the group must not be exposed to connectors -- an era
+    that still claims it, or a group the engine hands to connectors
+    (transferable, the vLLM default: parse_groups refuses it instead of
+    silently dropping it), is refused rather than dropped. Two exceptions
+    keep skipping: the engine-replayed window (``skip_kind`` ``replay``, a
+    policy field -- wherever the flag exists, vLLM rebuilds the rows), and
+    the compression ring, which the engine rebuilds per request.
     """
     if row["disposition"] != "skip":
         return row["disposition"]
+    if row.get("skip_kind") == "replay":
+        return "skip"
     if engine.version not in skip_eras(row):
         return "refuse"
     if declares_transfer_projection(engine) and row.get("transferable", True):
@@ -198,6 +238,7 @@ def expected_outcome(row: Dict[str, Any], engine: "Engine") -> str:
         if not _is_compression_ring_row(row):
             return "refuse"
     return "skip"
+
 
 
 # --------------------------------------------------------------------------- #
@@ -372,7 +413,9 @@ ZOO: List[Dict[str, Any]] = [
     dict(
         name="mla_compressed_0_26",
         cls="MLAAttentionSpec",
-        # V4 c4a bf16 (the vllm <= 0.28 spelling: compress_ratio).
+        # V4 c4a bf16 (the vllm <= 0.28 spelling: compress_ratio). One row per
+        # 4 tokens, 1024 B/row (512 bf16 x 2 = 1024 B, K and V halves in one
+        # row); 64 rows in the 256-token page.
         kwargs=dict(
             block_size=256,
             num_kv_heads=1,
@@ -383,11 +426,13 @@ ZOO: List[Dict[str, Any]] = [
             alignment=512,
             model_version="deepseek_v4",
         ),
-        disposition="refuse",
+        disposition="accept",
         legacy="refuse",
         requires=("compress_ratio",),
-        keywords=("compress_ratio=4", "one latent row per 4 tokens"),
+        row_granular=dict(tokens_per_row=4, rows_per_page=64, bytes_per_row=1024),
         mbs=256,
+        page_bytes=65536,
+        per_block_bytes=65536,  # 1024 B/row x (256 // 4) rows
         source="FROZEN m2a",
     ),
     dict(
@@ -396,7 +441,9 @@ ZOO: List[Dict[str, Any]] = [
         # DeepSeek-V4.1-Flash compressed main row (vllm >= 0.29 spelling:
         # tokens_per_state): 1 row = 2 tokens, 584 B/row, 128 rows/page. Before
         # PR1 the gate read compress_ratio (absent here -> 1) and accepted it,
-        # sizing 74752 B/block at mbs 256.
+        # sizing 74752 B/block at mbs 256; PR1 refused it (the silent-acceptance
+        # hole), PR6 accepts it *with* the row-granular mapping -- the block
+        # size was never wrong, the address math was (see test_dsa_v41).
         kwargs=dict(
             block_size=256,
             num_kv_heads=1,
@@ -409,20 +456,21 @@ ZOO: List[Dict[str, Any]] = [
             model_version="deepseek_v4",
             kv_quant_mode="FP8_PER_TENSOR",
         ),
-        disposition="refuse",
+        disposition="accept",
         legacy="accept",
-        hole="tokens_per_state",
         requires=("tokens_per_state",),
-        keywords=("tokens_per_state=2", "one latent row per 2 tokens"),
+        row_granular=dict(tokens_per_row=2, rows_per_page=128, bytes_per_row=584),
         mbs=256,
         page_bytes=74752,
+        per_block_bytes=74752,  # 584 B/row x (256 // 2) rows
         source="V4.1 run_gate experiment (swa-dsa-support data/exp_gate_v41.py)",
     ),
     dict(
         name="mla_pooled_fraction",
         cls="MLAAttentionSpec",
         # Whisper block pooling spells the same field as a Fraction < 1: more
-        # states than tokens, equally outside the one-row-per-token model.
+        # states than tokens, so the row unit is smaller than a token -- the
+        # row-granular model cannot address it either.
         kwargs=dict(
             block_size=16,
             num_kv_heads=1,
@@ -435,9 +483,64 @@ ZOO: List[Dict[str, Any]] = [
         legacy="accept",
         hole="tokens_per_state",
         requires=("tokens_per_state",),
-        keywords=("tokens_per_state=1/8", "must be >= 1"),
+        keywords=("tokens_per_state=1/8", "whole number", "cache_dtype_str"),
         mbs=64,
         source="whisper_causal.py:408 (Fraction(1, block_pool_size))",
+    ),
+    dict(
+        name="mla_tps_not_dividing_mbs",
+        cls="MLAAttentionSpec",
+        # The other arithmetic precondition (mbs % tokens_per_state == 0): a
+        # manager block must stay a whole number of rows. Synthetic ratio at
+        # the shape of the PR6 table test (mbs 528 is vLLM's default merge
+        # block size; 528 % 32 != 0 while the block itself divides).
+        kwargs=dict(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype="uint8",
+            tokens_per_state=32,
+            cache_dtype_str="fp8_ds_mla",
+            state_content_bytes=584,
+            model_version="deepseek_v4",
+            kv_quant_mode="FP8_PER_TENSOR",
+        ),
+        disposition="refuse",
+        legacy="accept",
+        hole="tokens_per_state",
+        requires=("tokens_per_state",),
+        keywords=("manager block size 528", "tokens_per_state=32"),
+        mbs=528,
+        source="mbs divisibility precondition (vllm_common._attention_meta)",
+    ),
+    dict(
+        name="mla_nvfp4",
+        cls="MLAAttentionSpec",
+        # The SM100-only NVFP4 record: an in-row scale plus a packed cell, 288 B
+        # per row for V4.1. Named refusal (the pre-PR6 wording fell through to
+        # "unknown cache_dtype_str", which reads as a typo rather than a
+        # layout the connector deliberately does not size).
+        kwargs=dict(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype="uint8",
+            tokens_per_state=2,
+            cache_dtype_str="nvfp4_ds_mla",
+            state_content_bytes=288,
+            model_version="deepseek_v4",
+        ),
+        disposition="refuse",
+        legacy="refuse",
+        requires=("tokens_per_state",),
+        keywords=(
+            "nvfp4_ds_mla",
+            "288",
+            "tokens_per_state=2",
+            "TairKvCacheConnector",
+        ),
+        mbs=64,
+        source="deepseek_v41/attention.py:505-512 (SM100 NVFP4 record)",
     ),
     dict(
         name="hidden_state",
@@ -586,7 +689,10 @@ ZOO: List[Dict[str, Any]] = [
         name="swa_mla_bounded_replay",
         cls="SlidingWindowMLASpec",
         # V4/V4.1 SWA cache: 584 B rows with bounded replay ON (the vLLM 0.31
-        # config default), so vLLM rebuilds those rows on a hit.
+        # config default), so vLLM replays the window itself and rebuilds these
+        # rows on a hit. Skipped while parsing (the group holds no reusable
+        # prefix data), with the wire name absent -- same shape as an EAGLE or
+        # scratch group.
         kwargs=dict(
             block_size=64,
             num_kv_heads=1,
@@ -598,10 +704,13 @@ ZOO: List[Dict[str, Any]] = [
             tokens_per_state=1,
             bounded_replay=True,
         ),
-        disposition="refuse",
+        disposition="skip",
         legacy="refuse",
         requires=("bounded_replay",),
-        keywords=("SlidingWindowMLASpec", "sliding_window=128"),
+        # One predicate (the replay policy), not the era-dependent scratch
+        # contract: wherever the flag exists, the group is dropped.
+        skip_kind="replay",
+        companion=True,
         mbs=64,
         page_bytes=37376,
         source="V4.1 SWA-MLA group (c1_gate_matrix row 11)",
@@ -609,8 +718,10 @@ ZOO: List[Dict[str, Any]] = [
     dict(
         name="swa_mla_prefix_replay",
         cls="SlidingWindowMLASpec",
-        # bounded_replay=False is prefix_cacheable -- still refused: the *class*
-        # is the windowed/partial-state decision, not that flag.
+        # bounded_replay=False is prefix_cacheable -- still refused: vLLM does
+        # not rebuild those rows, so they would need the windowed retention
+        # contract, which the connector implements for the plain windowed
+        # classes only (deferred, see the gate's message).
         kwargs=dict(
             block_size=64,
             num_kv_heads=1,
@@ -625,7 +736,7 @@ ZOO: List[Dict[str, Any]] = [
         disposition="refuse",
         legacy="refuse",
         requires=("bounded_replay",),
-        keywords=("SlidingWindowMLASpec", "sliding_window=128"),
+        keywords=("SlidingWindowMLASpec", "sliding_window=128", "bounded_replay=False"),
         mbs=64,
         page_bytes=37376,
         source="same spec with the replay policy off (M5: default is on)",
@@ -737,14 +848,20 @@ ZOO: List[Dict[str, Any]] = [
         name="wrapper_v41_packed",
         cls="UniformTypeKVCacheSpecs",
         # V4.1 packs its compressed main and indexer into one group; both carry
-        # tokens_per_state=2 (the second member is declared below).
+        # tokens_per_state=2 (the second member is declared below). The buckets
+        # are the two page layouts (74752 B main first, then the 16896 B
+        # indexer), each sized in rows: 584 B x 32 rows, 132 B x 32 rows at
+        # mbs 64.
         members={"l.main": "mla_compressed_0_31", "l.indexer": "mla_indexer_tps2"},
-        disposition="refuse",
+        disposition="accept",
         legacy="accept",
-        hole="tokens_per_state",
         requires=("tokens_per_state",),
-        keywords=("tokens_per_state=2",),
+        # The first bucket (largest page) is the compressed main: the wrapper
+        # row's own expectation is that bucket's, as in every other row.
+        row_granular=dict(tokens_per_row=2, rows_per_page=128, bytes_per_row=584),
         mbs=64,
+        page_bytes=74752,
+        per_block_bytes=18688,
         source="exp_gate_v41.py section 4 (V4.1 UniformType main+indexer)",
     ),
     dict(
@@ -780,9 +897,7 @@ MEMBER_ROWS: Dict[str, Dict[str, Any]] = {
     ),
 }
 
-ROW_BY_NAME: Dict[str, Dict[str, Any]] = {
-    row["name"]: row for row in ZOO
-}
+ROW_BY_NAME: Dict[str, Dict[str, Any]] = {row["name"]: row for row in ZOO}
 ROW_BY_NAME.update(MEMBER_ROWS)
 
 
@@ -941,7 +1056,11 @@ def run_row(row: Dict[str, Any], engine: Engine) -> RowResult:
     except RowUnavailable as exc:
         return RowResult("unavailable", str(exc), ())
     layer_names = sorted(row["members"]) if row.get("members") else ["l0"]
-    groups = [SimpleNamespace(layer_names=layer_names, kv_cache_spec=spec, is_eagle_group=False)]
+    groups = [
+        SimpleNamespace(
+            layer_names=layer_names, kv_cache_spec=spec, is_eagle_group=False
+        )
+    ]
     if row.get("companion"):
         groups.append(
             SimpleNamespace(
@@ -987,7 +1106,10 @@ def legacy_accepts_row(row: Dict[str, Any], engine: Engine) -> bool:
     """
     members = _members(row)
     if members:
-        return all(legacy_accepts(build_spec(member, engine), engine) for member in members.values())
+        return all(
+            legacy_accepts(build_spec(member, engine), engine)
+            for member in members.values()
+        )
     return legacy_accepts(build_spec(row, engine), engine)
 
 
