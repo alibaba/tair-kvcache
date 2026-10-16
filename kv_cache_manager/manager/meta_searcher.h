@@ -52,8 +52,7 @@ public:
     struct HostCacheMatch {
         std::string host_ip_port;
         int64_t local;
-        int64_t p2p_1_fetch;
-        int64_t p2p_1_total_match;
+        int64_t global;
     };
 
     struct HostCacheLocationInfo {
@@ -109,7 +108,9 @@ public:
                                 const std::vector<std::string> &medium_filter,
                                 std::vector<HostCacheMatch> &out_matches,
                                 const CheckHostCacheLocationFunc *request_check_location = nullptr,
-                                size_t p2p_host_count = 0) const;
+                                size_t top_k_host_count = 0,
+                                const std::vector<DataStorageType> &backend_types = {},
+                                SelectLocationPolicy *policy = nullptr) const;
     ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
                                          const KeyVector &keys,
                                          bool use_eagle_pop,
@@ -117,7 +118,20 @@ public:
                                          const std::vector<LocationSpecGroup> &location_spec_groups,
                                          std::vector<HostCacheMatch> &out_matches,
                                          const CheckHostCacheLocationFunc *request_check_location = nullptr,
-                                         size_t p2p_host_count = 0) const;
+                                         size_t top_k_host_count = 0,
+                                         const std::vector<DataStorageType> &backend_types = {},
+                                         SelectLocationPolicy *policy = nullptr) const;
+    ErrorCode PrefixMatchWithSwaByHost(RequestContext *request_context,
+                                       const KeyVector &keys,
+                                       size_t window_blocks,
+                                       bool use_eagle_pop,
+                                       const std::vector<std::string> &medium_filter,
+                                       const std::vector<LocationSpecGroup> &location_spec_groups,
+                                       std::vector<HostCacheMatch> &out_matches,
+                                       const CheckHostCacheLocationFunc *request_check_location = nullptr,
+                                       size_t top_k_host_count = 0,
+                                       const std::vector<DataStorageType> &backend_types = {},
+                                       SelectLocationPolicy *policy = nullptr) const;
     ErrorCode BatchGetLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const BlockMask &input_mask,
@@ -369,6 +383,18 @@ public:
                                      AcquireMetadataWriteLeaseFunc acquire_cleanup_lease = nullptr);
 
 private:
+    ErrorCode PrefixMatchWithGroupsByHost(RequestContext *request_context,
+                                          const KeyVector &keys,
+                                          bool use_eagle_pop,
+                                          const std::vector<std::string> &medium_filter,
+                                          const std::vector<LocationSpecGroup> &location_spec_groups,
+                                          std::vector<HostCacheMatch> &out_matches,
+                                          const CheckHostCacheLocationFunc *request_check_location,
+                                          size_t top_k_host_count,
+                                          const std::vector<DataStorageType> &backend_types,
+                                          SelectLocationPolicy *policy,
+                                          char state_category,
+                                          size_t window_blocks) const;
     class MergeLocationSpecsTaskView;
 
     ErrorCode BatchMergeLocationSpecsImpl(RequestContext *request_context,

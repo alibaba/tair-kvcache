@@ -987,6 +987,109 @@ TEST_F(MetaSearcherTest, TestPrefixMatchWithMambaByHostSupportsMultiwordSpecsAnd
     EXPECT_EQ(1, matches[0].local);
 }
 
+TEST_F(MetaSearcherTest, TestSwaWindowsRequireAllSpecsAndAllowShortHistory) {
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"fa", "fb"}),
+        LocationSpecGroup("F1", {"fc"}),
+        LocationSpecGroup("W0", {"wa", "wb"}),
+        LocationSpecGroup("W1", {"wc"}),
+    };
+    struct Case {
+        const char *name;
+        size_t full_prefix;
+        std::set<size_t> window_blocks; // One-based positions with complete W specs.
+        size_t window_size;
+        bool eagle;
+        int64_t expected;
+    };
+    const std::vector<Case> cases = {
+        {"tail window", 8, {6, 7, 8}, 3, false, 8},
+        {"earlier window", 8, {4, 5, 6}, 3, false, 6},
+        {"short history", 2, {1, 2}, 3, false, 2},
+        {"hole inside window", 8, {6, 8}, 3, false, 0},
+        {"window after hole", 8, {1, 2, 4, 5, 6}, 3, false, 6},
+        {"full gap limits search", 5, {1, 4, 5, 6}, 3, false, 1},
+        {"one block window", 8, {6}, 1, false, 6},
+        {"window larger than prompt", 8, {1, 2, 3, 4, 5, 6, 7, 8}, 20, false, 8},
+        {"large window with hole", 8, {1, 2, 4, 5, 6, 7, 8}, 20, false, 2},
+        {"eagle invalidates tail", 8, {6, 7, 8}, 3, true, 0},
+        {"eagle keeps earlier window", 8, {4, 5, 6}, 3, true, 6},
+        {"eagle short history", 2, {1, 2}, 3, true, 1},
+    };
+    size_t case_index = 0;
+    for (const auto &test : cases) {
+        SCOPED_TRACE(test.name);
+        MetaSearcher::KeyVector keys(8);
+        std::iota(keys.begin(), keys.end(), 120000 + 8 * case_index++);
+        CacheLocationMapVector locations(keys.size());
+        const std::string host = "swa:80";
+        for (size_t i = 0; i < keys.size(); ++i) {
+            // Split specs across same-host L1/L2 locations. An incomplete
+            // group is still present: membership alone must not count as a hit.
+            for (bool l2 : {false, true}) {
+                const auto type = l2 ? DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2
+                                     : DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
+                const std::string id = std::string("kvs#event_report_") + (l2 ? "l2" : "l1p5") + "#mem#" + host;
+                std::vector<LocationSpec> specs;
+                const auto add = [&](const char *name) { specs.emplace_back(name, "event_report://" + host + "/mem"); };
+                add(l2 ? "fb" : "fa");
+                if (i < test.full_prefix && !l2) {
+                    add("fc");
+                }
+                add(l2 ? "wb" : "wa");
+                if (test.window_blocks.count(i + 1) && l2) {
+                    add("wc");
+                }
+                locations[i][id] = std::make_shared<CacheLocation>(id, CLS_SERVING, type, specs.size(), specs);
+            }
+        }
+        PropertyMapVector properties;
+        ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, locations, properties).ec);
+        for (size_t top_k : {0u, 1u}) {
+            std::vector<MetaSearcher::HostCacheMatch> matches;
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->PrefixMatchWithSwaByHost(request_context_.get(),
+                                                               keys,
+                                                               test.window_size,
+                                                               test.eagle,
+                                                               {"mem"},
+                                                               groups,
+                                                               matches,
+                                                               nullptr,
+                                                               top_k,
+                                                               {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}));
+            if (test.expected == 0) {
+                EXPECT_TRUE(matches.empty());
+            } else {
+                ASSERT_EQ(1u, matches.size());
+                EXPECT_EQ(host, matches[0].host_ip_port);
+                EXPECT_EQ(test.expected, matches[0].local);
+                EXPECT_EQ(test.expected, matches[0].global);
+            }
+        }
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->PrefixMatchWithSwaByHost(
+                      request_context_.get(), keys, test.window_size, false, {"disk"}, groups, matches));
+        EXPECT_TRUE(matches.empty());
+    }
+}
+
+TEST_F(MetaSearcherTest, TestSwaRejectsUnsupportedOrMissingGroups) {
+    const std::vector<std::vector<LocationSpecGroup>> invalid_groups = {
+        {},
+        {LocationSpecGroup("F0", {"f"})},
+        {LocationSpecGroup("W0", {"w"})},
+        {LocationSpecGroup("F0", {"f"}), LocationSpecGroup("L0", {"w"})},
+        {LocationSpecGroup("F0", {"f"}), LocationSpecGroup("W0", {"w"}), LocationSpecGroup("X0", {"x"})},
+    };
+    for (const auto &groups : invalid_groups) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        EXPECT_EQ(EC_BADARGS,
+                  meta_searcher_->PrefixMatchWithSwaByHost(request_context_.get(), {1}, 3, false, {}, groups, matches));
+    }
+}
+
 TEST_F(MetaSearcherTest, TestMambaProgressiveBitsetMatchesReferenceAcrossParallelReadChunks) {
     constexpr size_t kKeyCount = 40000;
     constexpr size_t kFullPrefix = 37001;
@@ -1057,21 +1160,54 @@ TEST_F(MetaSearcherTest, TestMambaProgressiveBitsetMatchesReferenceAcrossParalle
         LocationSpecGroup("F0", {"full_0"}),
         LocationSpecGroup("L0", {"state_0"}),
     };
-    auto run = [&](bool use_eagle_pop, size_t p2p_host_count) {
+    auto run = [&](bool use_eagle_pop, size_t top_k_host_count) {
         std::vector<MetaSearcher::HostCacheMatch> matches;
         EXPECT_EQ(EC_OK,
-                  meta_searcher_->PrefixMatchWithMambaByHost(
-                      request_context_.get(), keys, use_eagle_pop, {"mem"}, groups, matches, nullptr, p2p_host_count));
+                  meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(),
+                                                             keys,
+                                                             use_eagle_pop,
+                                                             {"mem"},
+                                                             groups,
+                                                             matches,
+                                                             nullptr,
+                                                             top_k_host_count,
+                                                             {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                                              DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2},
+                                                             &policy_));
         EXPECT_EQ(1u, matches.size());
         return matches.empty() ? int64_t{-1} : matches.front().local;
     };
 
-    // p2p_host_count=1 intentionally selects the established full-materialize
+    // top_k_host_count=1 intentionally selects the established full-materialize
     // implementation as a semantic reference for the progressive bitset path.
     EXPECT_EQ(static_cast<int64_t>(kFullPrefix), run(false, 0));
     EXPECT_EQ(run(false, 1), run(false, 0));
     EXPECT_EQ(static_cast<int64_t>(kLastStateBeforeEaglePop + 1), run(true, 0));
     EXPECT_EQ(run(true, 1), run(true, 0));
+    const std::vector<LocationSpecGroup> swa_groups = {
+        LocationSpecGroup("F0", {"full_0"}),
+        LocationSpecGroup("W0", {"state_0"}),
+    };
+    for (bool eagle : {false, true}) {
+        for (size_t top_k : {0u, 1u}) {
+            std::vector<MetaSearcher::HostCacheMatch> matches;
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->PrefixMatchWithSwaByHost(request_context_.get(),
+                                                               keys,
+                                                               2,
+                                                               eagle,
+                                                               {"mem"},
+                                                               swa_groups,
+                                                               matches,
+                                                               nullptr,
+                                                               top_k,
+                                                               {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}));
+            ASSERT_EQ(1u, matches.size());
+            // The last adjacent states are at zero-based 20479/20480.
+            EXPECT_EQ(20481, matches[0].local);
+            EXPECT_EQ(20481, matches[0].global);
+        }
+    }
 }
 
 TEST_F(MetaSearcherTest, TestProgressiveHostPrefixesMatchRandomizedFullReadReference) {
@@ -1181,10 +1317,15 @@ TEST_F(MetaSearcherTest, TestProgressiveHostPrefixesMatchRandomizedFullReadRefer
     PropertyMapVector properties;
     ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
 
-    auto local_prefixes = [](const std::vector<MetaSearcher::HostCacheMatch> &matches) {
+    auto positive_local_prefixes = [](const std::vector<MetaSearcher::HostCacheMatch> &matches) {
         std::map<std::string, int64_t> prefixes;
         for (const auto &match : matches) {
-            prefixes.emplace(match.host_ip_port, match.local);
+            if (match.local > 0) {
+                prefixes.emplace(match.host_ip_port, match.local);
+            } else {
+                // Remote evaluation may also return hosts recovered from a zero local prefix.
+                EXPECT_GT(match.global, 0);
+            }
         }
         return prefixes;
     };
@@ -1198,16 +1339,41 @@ TEST_F(MetaSearcherTest, TestProgressiveHostPrefixesMatchRandomizedFullReadRefer
             std::vector<MetaSearcher::HostCacheMatch> progressive;
             std::vector<MetaSearcher::HostCacheMatch> full_read;
             ASSERT_EQ(EC_OK,
-                      meta_searcher_->PrefixMatchByHost(
-                          request_context_.get(), keys, use_eagle_pop, medium_filter, progressive, nullptr, 0));
+                      meta_searcher_->PrefixMatchByHost(request_context_.get(),
+                                                        keys,
+                                                        use_eagle_pop,
+                                                        medium_filter,
+                                                        progressive,
+                                                        nullptr,
+                                                        0,
+                                                        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                                         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2},
+                                                        &policy_));
             ASSERT_EQ(EC_OK,
-                      meta_searcher_->PrefixMatchByHost(
-                          request_context_.get(), keys, use_eagle_pop, medium_filter, full_read, nullptr, kHostCount));
-            EXPECT_EQ(local_prefixes(full_read), local_prefixes(progressive));
+                      meta_searcher_->PrefixMatchByHost(request_context_.get(),
+                                                        keys,
+                                                        use_eagle_pop,
+                                                        medium_filter,
+                                                        full_read,
+                                                        nullptr,
+                                                        kHostCount,
+                                                        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                                         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2},
+                                                        &policy_));
+            EXPECT_EQ(positive_local_prefixes(full_read), positive_local_prefixes(progressive));
 
             ASSERT_EQ(EC_OK,
-                      meta_searcher_->PrefixMatchWithMambaByHost(
-                          request_context_.get(), keys, use_eagle_pop, medium_filter, groups, progressive, nullptr, 0));
+                      meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(),
+                                                                 keys,
+                                                                 use_eagle_pop,
+                                                                 medium_filter,
+                                                                 groups,
+                                                                 progressive,
+                                                                 nullptr,
+                                                                 0,
+                                                                 {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                                                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2},
+                                                                 &policy_));
             ASSERT_EQ(EC_OK,
                       meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(),
                                                                  keys,
@@ -1216,8 +1382,11 @@ TEST_F(MetaSearcherTest, TestProgressiveHostPrefixesMatchRandomizedFullReadRefer
                                                                  groups,
                                                                  full_read,
                                                                  nullptr,
-                                                                 kHostCount));
-            EXPECT_EQ(local_prefixes(full_read), local_prefixes(progressive));
+                                                                 kHostCount,
+                                                                 {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                                                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2},
+                                                                 &policy_));
+            EXPECT_EQ(positive_local_prefixes(full_read), positive_local_prefixes(progressive));
         }
     }
 }
@@ -1249,16 +1418,23 @@ TEST_F(MetaSearcherTest, TestPrefixMatchByHostExcludesEveryNonServingStatusWithA
     PropertyMapVector properties;
     ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
 
-    auto verify_prefix = [&](size_t p2p_host_count) {
+    auto verify_prefix = [&](size_t top_k_host_count) {
         std::vector<MetaSearcher::HostCacheMatch> matches;
         ASSERT_EQ(EC_OK,
-                  meta_searcher_->PrefixMatchByHost(
-                      request_context_.get(), keys, false, {"mem"}, matches, nullptr, p2p_host_count));
+                  meta_searcher_->PrefixMatchByHost(request_context_.get(),
+                                                    keys,
+                                                    false,
+                                                    {"mem"},
+                                                    matches,
+                                                    nullptr,
+                                                    top_k_host_count,
+                                                    {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                                     DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2},
+                                                    &policy_));
         ASSERT_EQ(1u, matches.size());
         EXPECT_EQ("serving-host:8080", matches[0].host_ip_port);
         EXPECT_EQ(2, matches[0].local);
-        EXPECT_EQ(0, matches[0].p2p_1_fetch);
-        EXPECT_EQ(2, matches[0].p2p_1_total_match);
+        EXPECT_EQ(2, matches[0].global);
     };
     verify_prefix(0);
     verify_prefix(5);
@@ -1267,19 +1443,46 @@ TEST_F(MetaSearcherTest, TestPrefixMatchByHostExcludesEveryNonServingStatusWithA
         LocationSpecGroup("F0", {"full_0"}),
         LocationSpecGroup("L0", {"state_0"}),
     };
-    auto verify_mamba = [&](size_t p2p_host_count) {
+    auto verify_mamba = [&](size_t top_k_host_count) {
         std::vector<MetaSearcher::HostCacheMatch> matches;
         ASSERT_EQ(EC_OK,
-                  meta_searcher_->PrefixMatchWithMambaByHost(
-                      request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, p2p_host_count));
+                  meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(),
+                                                             keys,
+                                                             false,
+                                                             {"mem"},
+                                                             groups,
+                                                             matches,
+                                                             nullptr,
+                                                             top_k_host_count,
+                                                             {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                                              DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2},
+                                                             &policy_));
         ASSERT_EQ(1u, matches.size());
         EXPECT_EQ("serving-host:8080", matches[0].host_ip_port);
         EXPECT_EQ(2, matches[0].local);
-        EXPECT_EQ(0, matches[0].p2p_1_fetch);
-        EXPECT_EQ(2, matches[0].p2p_1_total_match);
+        EXPECT_EQ(2, matches[0].global);
     };
     verify_mamba(0);
     verify_mamba(5);
+    for (size_t top_k : {0u, 5u}) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->PrefixMatchWithSwaByHost(
+                      request_context_.get(),
+                      keys,
+                      3,
+                      false,
+                      {"mem"},
+                      {LocationSpecGroup("F0", {"full_0"}), LocationSpecGroup("W0", {"state_0"})},
+                      matches,
+                      nullptr,
+                      top_k,
+                      {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2}));
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ("serving-host:8080", matches[0].host_ip_port);
+        EXPECT_EQ(2, matches[0].local);
+        EXPECT_EQ(2, matches[0].global);
+    }
 }
 
 TEST_F(MetaSearcherTest, TestHostPrefixQueriesPropagateMetadataErrorsWithAndWithoutP2P) {
@@ -1307,11 +1510,19 @@ TEST_F(MetaSearcherTest, TestHostPrefixQueriesPropagateMetadataErrorsWithAndWith
     ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, location_maps, properties).ec);
     backend->SetFailedKey(keys[1]);
 
-    for (size_t p2p_host_count : {size_t{0}, size_t{1}}) {
+    for (size_t top_k_host_count : {size_t{0}, size_t{1}}) {
         std::vector<MetaSearcher::HostCacheMatch> matches;
         EXPECT_EQ(EC_TIMEOUT,
-                  meta_searcher_->PrefixMatchByHost(
-                      request_context_.get(), keys, false, {"mem"}, matches, nullptr, p2p_host_count));
+                  meta_searcher_->PrefixMatchByHost(request_context_.get(),
+                                                    keys,
+                                                    false,
+                                                    {"mem"},
+                                                    matches,
+                                                    nullptr,
+                                                    top_k_host_count,
+                                                    {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                                     DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2},
+                                                    &policy_));
         EXPECT_TRUE(matches.empty());
     }
 
@@ -1319,11 +1530,20 @@ TEST_F(MetaSearcherTest, TestHostPrefixQueriesPropagateMetadataErrorsWithAndWith
         LocationSpecGroup("F0", {"full_0"}),
         LocationSpecGroup("L0", {"state_0"}),
     };
-    for (size_t p2p_host_count : {size_t{0}, size_t{1}}) {
+    for (size_t top_k_host_count : {size_t{0}, size_t{1}}) {
         std::vector<MetaSearcher::HostCacheMatch> matches;
         EXPECT_EQ(EC_TIMEOUT,
-                  meta_searcher_->PrefixMatchWithMambaByHost(
-                      request_context_.get(), keys, false, {"mem"}, groups, matches, nullptr, p2p_host_count));
+                  meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(),
+                                                             keys,
+                                                             false,
+                                                             {"mem"},
+                                                             groups,
+                                                             matches,
+                                                             nullptr,
+                                                             top_k_host_count,
+                                                             {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                                                              DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2},
+                                                             &policy_));
         EXPECT_TRUE(matches.empty());
     }
 }
@@ -5109,4 +5329,391 @@ TEST_F(BatchGetBestLocationByBackendTest, NoLocationsAtAll) {
     ASSERT_EQ(ec, ErrorCode::EC_OK);
     ASSERT_EQ(out.size(), 1);
     EXPECT_TRUE(out[0].empty());
+}
+
+class HostCacheRemoteTest : public MetaSearcherTest {
+protected:
+    const MetaSearcher::KeyVector keys_ = {91000, 91001, 91002, 91003, 91004, 91005};
+    CacheLocationMapVector locations_{keys_.size()};
+
+    void Add(size_t index,
+             DataStorageType type,
+             const std::string &host,
+             const std::vector<std::string> &names = {"tp0"},
+             CacheLocationStatus status = CLS_SERVING) {
+        const bool event = type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 ||
+                           type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+        const std::string id =
+            event ? "kvs#" +
+                        std::string(type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2 ? "event_report_l2"
+                                                                                               : "event_report_l1p5") +
+                        "#mem#" + host
+                  : host;
+        std::vector<LocationSpec> specs;
+        for (const auto &name : names) {
+            specs.emplace_back(name, (event ? "event_report://" : "tair://") + host + "/objects");
+        }
+        locations_[index][id] = std::make_shared<CacheLocation>(id, status, type, specs.size(), specs);
+    }
+
+    void Store() {
+        auto copy = locations_;
+        PropertyMapVector properties;
+        ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys_, copy, properties).ec);
+    }
+
+    std::map<std::string, std::pair<int64_t, int64_t>>
+    Query(size_t count, bool p2p, const std::vector<LocationSpecGroup> &groups = {}, bool eagle = false) {
+        std::vector<DataStorageType> backend_types = {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL};
+        if (p2p) {
+            backend_types.push_back(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+        }
+        return Query(count, backend_types, groups, eagle);
+    }
+
+    std::map<std::string, std::pair<int64_t, int64_t>> Query(size_t count,
+                                                             const std::vector<DataStorageType> &backend_types,
+                                                             const std::vector<LocationSpecGroup> &groups = {},
+                                                             bool eagle = false,
+                                                             size_t window_blocks = 0) {
+        std::vector<MetaSearcher::HostCacheMatch> matches;
+        auto ec =
+            window_blocks > 0 ? meta_searcher_->PrefixMatchWithSwaByHost(request_context_.get(),
+                                                                         keys_,
+                                                                         window_blocks,
+                                                                         eagle,
+                                                                         {"mem"},
+                                                                         groups,
+                                                                         matches,
+                                                                         nullptr,
+                                                                         count,
+                                                                         backend_types,
+                                                                         &policy_)
+            : groups.empty()
+                ? meta_searcher_->PrefixMatchByHost(
+                      request_context_.get(), keys_, eagle, {"mem"}, matches, nullptr, count, backend_types, &policy_)
+                : meta_searcher_->PrefixMatchWithMambaByHost(request_context_.get(),
+                                                             keys_,
+                                                             eagle,
+                                                             {"mem"},
+                                                             groups,
+                                                             matches,
+                                                             nullptr,
+                                                             count,
+                                                             backend_types,
+                                                             &policy_);
+        EXPECT_EQ(EC_OK, ec);
+        std::map<std::string, std::pair<int64_t, int64_t>> result;
+        for (const auto &match : matches) {
+            EXPECT_GE(match.global, match.local);
+            EXPECT_LE(match.global, keys_.size());
+            result.emplace(match.host_ip_port, std::make_pair(match.local, match.global));
+        }
+        return result;
+    }
+};
+
+TEST_F(HostCacheRemoteTest, BaseBackendsBridgeLocalHolesAndBudgetCountsLogicalHosts) {
+    for (const auto &host : {"worker:80@0", "worker:80@1"}) {
+        Add(0, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, host);
+        Add(2, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, host);
+    }
+    Add(0, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90");
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90");
+    Add(3, DataStorageType::DATA_STORAGE_TYPE_NFS, "nfs:90");
+    Add(4, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, "ssd:90");
+    Add(5, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90");
+    Store();
+    const auto local = Query(0, false);
+    ASSERT_EQ(2u, local.size()); // Cold storage addresses never become workers.
+    EXPECT_EQ(std::make_pair(1L, 1L), local.at("worker:80@0"));
+    const auto top_one = Query(1, false);
+    EXPECT_EQ(std::make_pair(1L, 3L), top_one.at("worker:80@0"));
+    EXPECT_EQ(std::make_pair(1L, 1L), top_one.at("worker:80@1"));
+    const auto all = Query(20, false);
+    EXPECT_EQ(std::make_pair(1L, 3L), all.at("worker:80@0"));
+    EXPECT_EQ(std::make_pair(1L, 3L), all.at("worker:80@1"));
+    EXPECT_EQ(all, Query(20, true));
+}
+
+TEST_F(HostCacheRemoteTest, ZeroLocalPrefixUsesRequestedRemoteBackends) {
+    Add(0, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80");
+    Add(4, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80");
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90");
+    Add(2, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90");
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer:80");
+    Add(3, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer:80");
+    Store();
+
+    const auto tair = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    const auto p2p = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+    const std::vector<std::pair<std::vector<DataStorageType>, int64_t>> cases = {
+        {{tair}, 2}, {{p2p}, 1}, {{tair, p2p}, 4}};
+    // Eagle removes the single local prefix block. Remote sources can still extend it.
+    for (const auto &[backends, expected_global] : cases) {
+        const auto matches = Query(1, backends, {}, true);
+        ASSERT_EQ(1u, matches.size());
+        EXPECT_EQ(std::make_pair(0L, expected_global), matches.at("worker:80"));
+        EXPECT_TRUE(Query(0, backends, {}, true).empty());
+    }
+    EXPECT_TRUE(Query(1, std::vector<DataStorageType>{}, {}, true).empty());
+}
+
+TEST_F(HostCacheRemoteTest, PositiveLocalHostsHavePriorityOverZeroLocalHosts) {
+    for (const auto &host : {"a_zero:80", "b_zero:80", "z_positive:80"}) {
+        Add(0, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, host);
+    }
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "z_positive:80");
+    Add(2, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "z_positive:80");
+    for (size_t i = 1; i < 4; ++i) {
+        Add(i, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90");
+    }
+    Store();
+
+    const auto top_one = Query(1, false, {}, true);
+    ASSERT_EQ(1u, top_one.size());
+    EXPECT_EQ(std::make_pair(2L, 3L), top_one.at("z_positive:80"));
+    const auto top_two = Query(2, false, {}, true);
+    ASSERT_EQ(2u, top_two.size());
+    EXPECT_EQ(std::make_pair(2L, 3L), top_two.at("z_positive:80"));
+    EXPECT_EQ(std::make_pair(0L, 3L), top_two.at("a_zero:80"));
+    const auto all = Query(3, false, {}, true);
+    ASSERT_EQ(3u, all.size());
+    EXPECT_EQ(std::make_pair(0L, 3L), all.at("b_zero:80"));
+
+    const auto local = Query(0, false, {}, true);
+    ASSERT_EQ(1u, local.size());
+    EXPECT_EQ(std::make_pair(2L, 2L), local.at("z_positive:80"));
+    EXPECT_EQ(local, Query(3, std::vector<DataStorageType>{}, {}, true));
+}
+
+TEST_F(HostCacheRemoteTest, ZeroGlobalHostsAreOmittedWithoutRefillingTopK) {
+    const std::vector<LocationSpecGroup> groups = {LocationSpecGroup("F0", {"full"}),
+                                                   LocationSpecGroup("L0", {"linear"})};
+    Add(0, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "a_incomplete:80", {"full"});
+    for (size_t i = 0; i < 4; ++i) {
+        Add(i, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "b_recoverable:80", {"full"});
+    }
+    Add(3, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90", {"linear"});
+    Store();
+
+    // Both hosts have local=0. The shared state only helps the host with a complete Full prefix.
+    EXPECT_TRUE(Query(1, false, groups).empty());
+    const auto top_two = Query(2, false, groups);
+    ASSERT_EQ(1u, top_two.size());
+    EXPECT_EQ(std::make_pair(0L, 4L), top_two.at("b_recoverable:80"));
+}
+
+TEST_F(HostCacheRemoteTest, CombinedPrefixUsesOnePeerAndMatchesBackendSelection) {
+    Add(0, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80");
+    Add(2, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80");
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90");
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer_a:80");
+    Add(3, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer_b:80");
+    Add(4, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer_b:80");
+    Add(5, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer_c:80");
+    Store();
+    EXPECT_EQ(std::make_pair(1L, 3L), Query(1, false).at("worker:80"));
+    EXPECT_EQ(std::make_pair(1L, 5L), Query(1, true).at("worker:80"));
+    LocationsPerKey selected;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(),
+                  {keys_[1], keys_[3], keys_[4], keys_[5]},
+                  selected,
+                  &policy_,
+                  {{DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+                   {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX}}));
+    ASSERT_EQ(4u, selected.size());
+    EXPECT_FALSE(selected[0].empty());
+    ASSERT_EQ(1u, selected[1].size());
+    EXPECT_NE(std::string::npos, selected[1][0]->id().find("peer_b"));
+    EXPECT_FALSE(selected[2].empty());
+    EXPECT_TRUE(selected[3].empty()); // No second peer to append the last block.
+}
+
+TEST_F(HostCacheRemoteTest, MambaFullAndLinearSpecsCombineWithoutInventingCompleteStates) {
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full_a", "full_b"}),
+        LocationSpecGroup("L0", {"linear_a"}),
+        LocationSpecGroup("L1", {"linear_b"}),
+    };
+    Add(0,
+        DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+        "worker:80",
+        {"full_a", "full_b", "linear_a", "linear_b"});
+    for (size_t i = 1; i < keys_.size(); ++i) {
+        Add(i, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90", {"full_a"});
+        Add(i, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80", {"full_b"});
+    }
+    Add(2, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80", {"full_b", "linear_a", "linear_b"});
+    Add(4, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80", {"full_b", "linear_a"});
+    Add(4, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer:80", {"linear_b"});
+    Add(5, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "z_other_peer:80", {"linear_a"});
+    Store();
+    EXPECT_EQ(std::make_pair(1L, 1L), Query(0, false, groups).at("worker:80"));
+    EXPECT_EQ(std::make_pair(1L, 3L), Query(1, false, groups).at("worker:80"));
+    EXPECT_EQ(std::make_pair(1L, 5L), Query(1, true, groups).at("worker:80"));
+    // Eagle removes one Full block before selecting the recoverable Linear endpoint.
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80", {"full_a", "full_b"});
+    Store();
+    EXPECT_EQ(std::make_pair(1L, 5L), Query(1, true, groups, true).at("worker:80"));
+}
+
+TEST_F(HostCacheRemoteTest, NonServingBaseLocationsCannotExtendPrefix) {
+    Add(0, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80");
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "writing:90", {"tp0"}, CLS_WRITING);
+    Store();
+    EXPECT_EQ(std::make_pair(1L, 1L), Query(1, false).at("worker:80"));
+}
+
+TEST_F(HostCacheRemoteTest, LinearCoverageCountsSpecPositionsLikeBackendQuery) {
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full"}),
+        LocationSpecGroup("L0", {"a", "b", "c"}),
+        LocationSpecGroup("L1", {"d"}),
+    };
+    Add(0, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80", {"full", "a", "b", "c", "d"});
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80", {"full", "d"});
+    Add(2, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80", {"full", "a", "b", "c"});
+    Add(3, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker:80", {"full", "a", "b", "c"});
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer_a:80", {"a", "b", "c"});
+    Add(2, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer_b:80", {"d"});
+    Add(3, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, "peer_b:80", {"d"});
+    Store();
+    // Three missing specs on A beat two on B, even though B would restore a later endpoint.
+    EXPECT_EQ(std::make_pair(1L, 2L), Query(1, true, groups).at("worker:80"));
+    LocationsPerKey selected;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(
+                  request_context_.get(),
+                  {keys_[1], keys_[1], keys_[1], keys_[2], keys_[3]},
+                  selected,
+                  &policy_,
+                  {{DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE}},
+                  {"a", "b", "c", "d", "d"}));
+    ASSERT_EQ(5u, selected.size());
+    for (size_t i = 0; i < 3; ++i) {
+        ASSERT_EQ(1u, selected[i].size());
+        EXPECT_NE(std::string::npos, selected[i][0]->id().find("peer_a"));
+    }
+    EXPECT_TRUE(selected[3].empty());
+    EXPECT_TRUE(selected[4].empty());
+}
+
+TEST_F(HostCacheRemoteTest, SwaCoverageSelectsOnePeerBySpecCountRatherThanFarthestWindow) {
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full"}),
+        LocationSpecGroup("W0", {"a", "b", "c"}),
+        LocationSpecGroup("W1", {"d"}),
+    };
+    const auto local = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
+    const auto p2p = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+    Add(0, local, "worker:80", {"full", "a", "b", "c", "d"});
+    Add(1, local, "worker:80", {"full", "d"});
+    Add(1, p2p, "peer_a:80", {"a", "b", "c"});
+    for (size_t i : {2u, 3u}) {
+        Add(i, local, "worker:80", {"full", "a", "b", "c"});
+        Add(i, p2p, "peer_b:80", {"d"});
+    }
+    Store();
+    // A adds three spec positions, B adds two. B could complete the later
+    // B3/B4 window, but the actual COVERAGE strategy picks A, yielding B1/B2.
+    EXPECT_EQ(std::make_pair(1L, 2L), Query(1, std::vector<DataStorageType>{p2p}, groups, false, 2).at("worker:80"));
+    EXPECT_EQ(std::make_pair(1L, 1L), Query(0, std::vector<DataStorageType>{p2p}, groups, false, 2).at("worker:80"));
+}
+
+TEST_F(HostCacheRemoteTest, SwaZeroLocalHostsRespectTopKAndDoNotStitchPeers) {
+    const std::vector<LocationSpecGroup> groups = {
+        LocationSpecGroup("F0", {"full"}),
+        LocationSpecGroup("W0", {"window"}),
+    };
+    const auto local = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
+    const auto p2p = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+    for (size_t i = 0; i < keys_.size(); ++i) {
+        Add(i, local, "worker_a:80", {"full"});
+        Add(i, local, "worker_b:80", {"full"});
+    }
+    Add(3, p2p, "peer_a:80", {"window"});
+    Add(4, p2p, "peer_b:80", {"window"});
+    Add(5, p2p, "peer_b:80", {"window"});
+    Store();
+    EXPECT_TRUE(Query(2, std::vector<DataStorageType>{p2p}, groups, false, 3).empty());
+    // One peer can now complete a window. Both workers still have local=0;
+    // K=1 chooses worker_a by host order and omits unselected zero hosts.
+    Add(3, p2p, "peer_b:80", {"window"});
+    Store();
+    auto matches = Query(1, std::vector<DataStorageType>{p2p}, groups, false, 3);
+    ASSERT_EQ(1u, matches.size());
+    EXPECT_EQ(std::make_pair(0L, 6L), matches.at("worker_a:80"));
+    matches = Query(2, std::vector<DataStorageType>{p2p}, groups, false, 3);
+    ASSERT_EQ(2u, matches.size());
+    EXPECT_EQ(std::make_pair(0L, 6L), matches.at("worker_b:80"));
+    // A positive local hit outranks worker_a. Top K limits remote evaluation,
+    // while worker_a remains in the response with global=local.
+    Add(0, local, "worker_a:80", {"full", "window"});
+    Add(0, local, "worker_b:80", {"full", "window"});
+    Add(1, local, "worker_b:80", {"full", "window"});
+    Store();
+    matches = Query(1, std::vector<DataStorageType>{p2p}, groups, false, 3);
+    EXPECT_EQ(std::make_pair(1L, 1L), matches.at("worker_a:80"));
+    EXPECT_EQ(std::make_pair(2L, 6L), matches.at("worker_b:80"));
+}
+
+TEST_F(HostCacheRemoteTest, BaseSelectionIsSharedAcrossHostsAndHonorsPolicy) {
+    Add(0, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker_a:80");
+    Add(0, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "worker_b:80");
+    Add(1, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, "storage:90");
+    Store();
+    class CountingPolicy : public WeightSLPolicy {
+    public:
+        mutable size_t calls = 0;
+        uint32_t weight = 1;
+        uint32_t GetWeight(CacheLocationMap::const_reference) const override {
+            ++calls;
+            return weight;
+        }
+    } policy;
+    std::vector<MetaSearcher::HostCacheMatch> matches;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchByHost(request_context_.get(),
+                                                keys_,
+                                                false,
+                                                {"mem"},
+                                                matches,
+                                                nullptr,
+                                                1,
+                                                {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL},
+                                                &policy));
+    const size_t one_host_calls = policy.calls;
+    EXPECT_GT(one_host_calls, 0u);
+    policy.calls = 0;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchByHost(request_context_.get(),
+                                                keys_,
+                                                false,
+                                                {"mem"},
+                                                matches,
+                                                nullptr,
+                                                2,
+                                                {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL},
+                                                &policy));
+    ASSERT_EQ(2u, matches.size());
+    EXPECT_EQ(one_host_calls, policy.calls);
+    EXPECT_EQ(2, matches[0].global);
+    EXPECT_EQ(2, matches[1].global);
+    policy.weight = 0;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatchByHost(request_context_.get(),
+                                                keys_,
+                                                false,
+                                                {"mem"},
+                                                matches,
+                                                nullptr,
+                                                2,
+                                                {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL},
+                                                &policy));
+    ASSERT_EQ(2u, matches.size());
+    EXPECT_EQ(1, matches[0].global);
+    EXPECT_EQ(1, matches[1].global);
 }

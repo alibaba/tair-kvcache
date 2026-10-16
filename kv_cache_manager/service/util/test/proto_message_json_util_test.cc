@@ -1020,6 +1020,35 @@ TEST_F(ProtoMessageJsonUtilTest, TestFromJsonRepeated) {
 
 namespace kv_cache_manager {
 
+TEST_F(ProtoMessageJsonUtilTest, TestSwaModelDeploymentAndQueryTypeConversion) {
+    proto::meta::RegisterInstanceRequest request;
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(
+        R"({"default_query_type":"QT_PREFIX_MATCH_WITH_SWA","model_deployment":{"model_name":"swa","dtype":"fp16","sliding_window_tokens":"192"}})",
+        &request));
+    EXPECT_EQ(proto::meta::QT_PREFIX_MATCH_WITH_SWA, request.default_query_type());
+    ModelDeployment model;
+    ProtoConvert::ModelDeploymentFromProto(&request.model_deployment(), model);
+    EXPECT_EQ(192, model.sliding_window_tokens());
+    proto::admin::ModelDeployment admin_model;
+    ProtoConvert::ModelDeploymentToProto(model, &admin_model);
+    EXPECT_EQ(192, admin_model.sliding_window_tokens());
+    ModelDeployment restored;
+    ProtoConvert::ModelDeploymentFromProto(&admin_model, restored);
+    EXPECT_EQ(model, restored);
+    proto::meta::ModelDeployment meta_model;
+    ProtoConvert::ModelDeploymentToProto(restored, &meta_model);
+    EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(request.model_deployment(), meta_model));
+
+    proto::meta::GetHostCacheStateRequest query;
+    ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(R"({"query_type":"QT_PREFIX_MATCH_WITH_SWA"})", &query));
+    EXPECT_EQ(proto::meta::QT_PREFIX_MATCH_WITH_SWA, query.query_type());
+    proto::admin::InstanceInfo admin_instance;
+    admin_instance.set_default_query_type(proto::admin::QT_PREFIX_MATCH_WITH_SWA);
+    std::string json;
+    ASSERT_TRUE(FastProtoJsonCodec::TryToJson(admin_instance, json));
+    EXPECT_NE(std::string::npos, json.find("QT_PREFIX_MATCH_WITH_SWA"));
+}
+
 TEST_F(ProtoMessageJsonUtilTest, TestModelDeploymentUseEaglePopConversion) {
     ModelDeployment default_model_deployment;
     EXPECT_FALSE(default_model_deployment.use_eagle_pop());

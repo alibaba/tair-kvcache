@@ -55,6 +55,7 @@ public:
         QT_PREFIX_MATCH = 2,
         QT_REVERSE_ROLL_SW_MATCH = 3,
         QT_PREFIX_MATCH_WITH_MAMBA = 4,
+        QT_PREFIX_MATCH_WITH_SWA = 5,
     };
     std::string QueryTypeToString(QueryType query_type) const {
         switch (query_type) {
@@ -66,6 +67,8 @@ public:
             return "reverse_roll_sw_match";
         case QueryType::QT_PREFIX_MATCH_WITH_MAMBA:
             return "prefix_match_with_mamba";
+        case QueryType::QT_PREFIX_MATCH_WITH_SWA:
+            return "prefix_match_with_swa";
         default:
             return "unspecified";
         }
@@ -80,8 +83,7 @@ public:
     struct HostCacheMatch {
         std::string host_ip_port;
         int64_t local;
-        int64_t p2p_1_fetch;
-        int64_t p2p_1_total_match;
+        int64_t global;
     };
 
     CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -226,7 +228,8 @@ public:
                       QueryType query_type,
                       const KeyVector &block_cache_keys,
                       const std::vector<std::string> &medium_filter = {},
-                      size_t p2p_host_count = 0);
+                      size_t top_k_host_count = 0,
+                      const std::vector<DataStorageType> &backend_types = {});
     ErrorCode TrimCache(RequestContext *request_context,
                         const std::string &instance_id,
                         const proto::meta::TrimStrategy &trim_strategy,
@@ -379,7 +382,8 @@ private:
                                         KeyVector &query_keys,
                                         CacheLocationVector &cache_locations) const;
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
-                                                                  const std::string &instance_id) const;
+                                                                  const std::string &instance_id,
+                                                                  bool allow_unavailable_storages = false) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
     MetaSearcher::CheckHostCacheLocationFunc
     GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const;
