@@ -16,9 +16,15 @@ def gen_pace_config_data(args):
     storage_spec = {
         "domain": args.domain,
         "timeout": args.timeout,
-        "service_discovery_url": args.service_discovery_url,
         "media_type": args.media_type,
     }
+    if args.service_discovery_url is not None:
+        storage_spec["service_discovery_url"] = args.service_discovery_url
+    skip_missing = getattr(args, "skip_confirmed_missing_backend_delete", None)
+    if skip_missing is not None:
+        storage_spec["skip_confirmed_missing_backend_delete"] = skip_missing
+    if args.health_check_timeout is not None:
+        storage_spec["health_check_timeout"] = args.health_check_timeout
     return storage_spec
 
 
@@ -89,17 +95,36 @@ def add_pace_ssd_sub_parser(subparsers):
 
 def add_pace_common_args(parser):
     parser.add_argument('--domain', "-d", required=True, help='pace domain')
-    parser.add_argument('--timeout', "-t", required=True, type=int, help='pace time out config')
+    parser.add_argument(
+        '--timeout', "-t", required=True, type=int,
+        help='business request and connection timeout in seconds, including synchronous copies (recommended: 5)')
+    parser.add_argument(
+        '--health_check_timeout', type=positive_int, default=None,
+        help='health request and connection timeout in seconds (server default: 1; update omission preserves existing)')
+    parser.add_argument(
+        '--skip_confirmed_missing_backend_delete',
+        type=pace_gc_skip_delete_value,
+        default=None,
+        metavar='{true,false}',
+        help='Skip GC Delete for confirmed-missing URIs; add defaults to false, update omission preserves the value')
     parser.add_argument(
         '--service_discovery_url',
-        default="",
+        default=None,
         help=(
-            'service discovery url, empty string means use --domain directly. '
+            'service discovery url; omitted on add uses --domain directly, '
+            'omitted on update preserves the existing value. '
+            'Pass an empty string to clear it and use --domain directly. '
             'Examples: vipserver://pace.meta.vipserver?timeout=10  |  '
             'spectrum://v-ad2d143d?cache_time=30&retry_time=3&timeout=5000  |  '
             'static://10.0.0.1:8080,10.0.0.2:8080'
         ),
     )
+
+
+def pace_gc_skip_delete_value(value):
+    if value.lower() not in ("true", "false"):
+        raise argparse.ArgumentTypeError("expected true or false")
+    return value.lower() == "true"
 
 
 def add_3fs_sub_parser(subparsers):

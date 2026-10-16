@@ -10,17 +10,17 @@
 #include "kv_cache_manager/common/logger.h"
 namespace kv_cache_manager {
 
-LogEventPublisher::LogEventPublisher() = default;
+LogEventPublisher::LogEventPublisher() : LogEventPublisher(LogEventPublisherConfig{}) {}
+
+LogEventPublisher::LogEventPublisher(const LogEventPublisherConfig &config) : config_(config) {}
 
 LogEventPublisher::~LogEventPublisher() {
     if (running_) {
         Stop();
     }
 }
-// 先假设这里传的就是log文件路径
-bool LogEventPublisher::Init(const std::string &config) {
-    // 初始化基础队列，这里的队列长度可以通过配置传入
-    InitBasicQueue();
+bool LogEventPublisher::Init(const std::string & /*config*/) {
+    InitBasicQueue(config_.queue_size());
 
     running_ = true;
 

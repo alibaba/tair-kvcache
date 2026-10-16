@@ -13,7 +13,7 @@ public:
         common_tags_ = common_tags;
         return true;
     }
-    void ReportPerQuery(MetricsCollector *collector) override {}
+    void ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed = std::nullopt) override {}
     void ReportInterval() override {}
     std::shared_ptr<MetricsRegistry> GetMetricsRegistry() override { return nullptr; }
 };

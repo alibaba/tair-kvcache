@@ -1,7 +1,9 @@
+import functools
 import hashlib
 import logging
+import threading
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import AbstractSet, Any, Dict, List, Optional
 import time
 import json
 
@@ -52,11 +54,122 @@ from kv_cache_manager.py_connector.common._version_info import (  # ty: ignore[u
 logger = logging.getLogger(__name__)
 
 
+# Pools sglang shards across the TP ranks of a hybrid stack: every rank owns a
+# slice and is handed its own transfer, even when the primary KV is replicated
+# (MLA).  Mirrors the upstream filter that decides what a non-zero MLA rank
+# writes: ``HybridCacheController.should_backup()`` from v0.5.18 on (Mamba/KDA
+# only, plus mooncake's MHA draft pools, which this connector does not manage)
+# and v0.5.17's equivalent Mamba filter in ``_page_backup``.
+_RANK_SHARDED_POOLS = (PoolName.MAMBA,)
+
+
+@functools.lru_cache(maxsize=1)
+def _sidecars_are_written_by_every_rank() -> bool:
+    """Whether this sglang hands rank-sharded sidecars to every TP rank.
+
+    ``HybridCacheController`` only started to run the whole backup path on
+    every rank in v0.5.17: from there it defines its own
+    ``backup_thread_func`` (hybrid_cache_controller.py:718 in v0.5.17, :739 in
+    v0.5.19), which no longer inherits the base controller's ``backup_skip``
+    gate (managers/cache_controller.py:1222 in v0.5.16), and filters the
+    transfers down to the rank-owned pools (``should_backup`` since v0.5.18,
+    an inline Mamba filter in v0.5.17).  Before that, a non-zero MLA rank never
+    reached ``batch_set_v2`` at all, so a write that waits for it there would
+    hang.
+
+    Structural probe rather than a version comparison on purpose: an upstream
+    shape we do not recognise falls back to the rank-0-only protocol -- safe,
+    just unable to reuse the sidecar of a sharded pool -- instead of waiting
+    for ranks that may never arrive.  Only a hybrid stack defines this class,
+    and only a hybrid stack has sidecar pools to write.
+    """
+    try:
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+    except ImportError:
+        return False
+    return "backup_thread_func" in vars(HybridCacheController)
+
+
+class _UnsupportedBackendError(RuntimeError):
+    """The connector cannot serve this backend, and retrying cannot change it.
+
+    Raised by ``_ensure_client`` for permanent shape mismatches -- e.g. a KV
+    anchor that is not a host pool (sglang's DeepSeek-V4 compressed pool).
+    The problem is reported once when it is detected, so the data-path
+    entries answer conservatively on every call without logging once per call.
+    """
+
+
 class HiCacheKVCM(HiCacheStorage):
-    # Pools sglang asked for that this connector does not manage, already
-    # reported as misses. Process-wide so the warning is emitted once per pool
-    # instead of once per block batch, and survives a backend re-creation.
-    _warned_unknown_pools: set = set()
+    """KVCM HiCache storage backend for sglang (v0.5.10 ~ v0.5.19).
+
+    Pool registration contract -- what sglang hands the backend, in order:
+
+    * ``register_mem_pool_host`` (v1) runs first on every attach. It carries
+      the KV host pool for flat models on all supported versions and, since
+      v0.5.19, for every model (sglang passes ``HostPoolGroup.anchor_entry.host_pool``).
+      Up to v0.5.18 hybrid stacks pass the ``HostPoolGroup`` itself instead;
+      a group is not a ``HostKVCache``, so its KV entry reaches the connector
+      through ``register_mem_host_pool_v2`` right after.
+    * ``register_mem_host_pool_v2`` carries one host pool per call and is the
+      only source of sidecar pools (Mamba/Indexer/...). sglang calls it for
+      every entry of the group, KV included.
+
+    No storage call can happen before the attach returns, so the pool set is
+    final at the first data-path call -- and that is exactly when the Manager
+    registration and the SDK client are created (``_ensure_client``):
+    ``registerInstance`` only accepts a repeat when every field matches and
+    there is no spec update API, so the location specs must be frozen once.
+    A pool registered after that point is reported once, not recorded, and
+    marked unusable: even if it reuses the name of an already-registered
+    pool, its transfers are answered with misses instead of being paired with
+    that pool's spec.  It is never silently assumed to work.
+
+    If the KV anchor itself cannot be served -- sglang's DeepSeek-V4
+    compressed KV pool anchors on a tensorless ``LogicalHostPool`` that is not
+    a host pool -- initialization reports it once and every storage call for
+    that instance degrades to a miss.
+
+    The write paths are the only callers of the connector's TP collectives,
+    and those need every rank of the group.  They therefore agree with the
+    group on initialization before entering any of them: a rank that cannot
+    create its client publishes that instead of returning, and the whole group
+    then refuses the write (``_ensure_client_for_write``).  Reads are
+    rank-local and never wait for another rank.
+
+    Which ranks write what follows sglang's own split: an MLA KV pool is
+    replicated and written by rank 0 alone, while a hybrid model's rank-sharded
+    sidecars (Mamba/KDA state, e.g. Kimi-K3) are handed to every rank, which
+    then each write their own slice into their own rank spec.  A sidecar write
+    that spans the group is committed only for the blocks every rank wrote.
+    """
+
+    # Pools already reported as unusable -- either unknown to this connector
+    # or registered after the specs were frozen -- and therefore answered with
+    # misses. Process-wide so each pool is reported once instead of once per
+    # block batch, and so the report survives a backend re-creation.
+    _reported_pools: set = set()
+
+    # Legacy entry points (batch_get/batch_set) already reported as not
+    # implemented; same process-wide, report-once reasoning.
+    _warned_legacy_ops: set = set()
+
+    # Defaults for instances built without __init__ (tests build connectors by
+    # hand to drive one code path); a real backend sets these in __init__.
+    _client_ready: bool = False
+    _closed: bool = False
+    # Read by the write paths before the client exists, hence the default; a
+    # real backend sets it from the storage config in __init__.
+    is_mla_model: bool = False
+    # Whether a round of _ensure_client_for_write() has already seen every
+    # rank of the TP group ready (see that method).
+    _tp_init_agreed: bool = False
+    # Immutable so hand-built instances (tests bypass __init__) can read it
+    # without sharing one mutable object: late names are added by rebinding,
+    # never by mutating a shared set.
+    _late_pools: AbstractSet[Any] = frozenset()
 
     def __init__(self, storage_config: HiCacheStorageConfig, kwargs: Any) -> None:
         logger.warning(
@@ -75,6 +188,11 @@ class HiCacheKVCM(HiCacheStorage):
         self.instance_group = self.extra_config["instance_group"]
         self.instance_id = self.extra_config["instance_id"]
 
+        # Also read in _init_kvcm_client, but needed earlier: whether the write
+        # paths run TP collectives is decided on the first write call, which is
+        # before the client exists (an MLA write never uses the group).
+        self.is_mla_model = self.storage_config.is_mla_model
+
         self._manager_client = KvCacheManagerClient.from_connector_config(
             self.extra_config
         )
@@ -82,6 +200,25 @@ class HiCacheKVCM(HiCacheStorage):
         # PoolName -> the pool object; sglang's pool classes expose more than
         # the HostKVCache base (e.g. get_page_buffer_meta), hence Any.
         self.registered_pools: Dict[Any, Any] = {}
+
+        # Pool names that arrived after the location specs were frozen (or
+        # after close()): the Manager has no spec update API, and such a pool
+        # may even reuse the name of an already-registered pool -- whose spec
+        # the new host indices do not belong to.  The data path answers miss
+        # for these names instead of pairing them with a registered spec.
+        self._late_pools = set()
+
+        # _init_lock guards the one-time client initialization; the flags are
+        # instance state (class-level defaults keep hand-built instances
+        # -- tests -- from raising on the first check).
+        self._init_lock = threading.Lock()
+        self._client_ready = False
+        self._closed = False
+        self._tp_init_agreed = False
+
+        # SDK handles, created by _ensure_client() and dropped by close().
+        self.transfer_client: Any = None
+        self.init_params: Any = None
 
         self.prefetch_pgs = []
         self.backup_pgs = []
@@ -94,7 +231,14 @@ class HiCacheKVCM(HiCacheStorage):
         # "interface_v1": 1 in --hicache-storage-backend-extra-config.
         self.extra_config.setdefault("interface_v1", 1)
 
-    def _init_kvcm_client(self) -> None:
+    def _init_parallel_context(self) -> None:
+        """Resolve the TP group and create the connector's own gloo group.
+
+        COLLECTIVE: ``torch.distributed.new_group`` requires every rank of the
+        default group to call it in the same order, so this stays in the v1
+        hook -- the attach path, where all ranks meet in lockstep. Everything
+        else is deferred to the first storage call (``_ensure_client``).
+        """
         # parallelism
         self.tp_rank = self.storage_config.tp_rank
         self.tp_size = self.storage_config.tp_size
@@ -114,10 +258,197 @@ class HiCacheKVCM(HiCacheStorage):
                 group_ranks, backend="gloo"
             )
 
-        # model
+    def _raise_if_closed(self) -> None:
+        """Refuse to serve once ``close()`` retired this backend."""
+        if self._closed:
+            raise RuntimeError(
+                "connector was closed; storage stays disabled until the "
+                "backend is re-attached"
+            )
+
+    def _ensure_client(self) -> None:
+        """Register with the Manager and create the SDK client, once.
+
+        Deliberately deferred to the first storage call: sglang's registration
+        burst (v1 anchor, then one v2 call per pool) has to be over before the
+        location specs are frozen into ``registerInstance`` -- a repeat with a
+        different configuration is rejected and there is no spec update API.
+        Pools registered later are degraded, see ``register_mem_host_pool_v2``.
+
+        No collective happens here, so ranks may initialize at different times
+        and the read paths call this directly.  The write paths must agree on
+        the outcome first, see ``_ensure_client_for_write``.
+        Raises on failure: the ``batch_*`` callers turn that into a
+        conservative result and retry on their next call.
+        """
+        # Checked before the ready flag: close() tears the client down, so a
+        # late storage call must fail with a clear message instead of using it.
+        self._raise_if_closed()
+        if self._client_ready:
+            return
+        with self._init_lock:
+            if self._client_ready:
+                return
+            self._raise_if_closed()
+
+            kv_pool = self.registered_pools.get(PoolName.KV)
+            if kv_pool is None:
+                raise RuntimeError(
+                    "no KV host pool registered yet; storage calls require "
+                    "sglang's register_mem_pool_host/register_mem_host_pool_v2"
+                )
+            if not isinstance(kv_pool, HostKVCache):
+                # Permanent, so it is reported once here instead of failing
+                # with an ERROR per storage call: sglang's DeepSeek-V4
+                # compressed pool anchors its KV entry on a LogicalHostPool,
+                # which has no get_size_per_token() to build specs from.
+                self._report_unsupported_kv_pool(kv_pool)
+                raise _UnsupportedBackendError(
+                    f"the KV anchor of this instance is a "
+                    f"{type(kv_pool).__name__}, not a host pool; this pool "
+                    f"shape is not supported by this connector"
+                )
+            self._init_kvcm_client()
+            self._client_ready = True
+
+    def _transfer_is_written_by_every_rank(self, transfer: PoolTransfer) -> bool:
+        """Whether sglang hands this transfer to every rank of the TP group.
+
+        Non-MLA: yes, ``should_backup()`` answers True on every rank, so every
+        rank writes every pool with its own rank spec.  MLA: only the
+        rank-sharded sidecars (Mamba/KDA state of e.g. Kimi-K3) are written
+        from every rank; the remaining pools are filtered out on non-zero
+        ranks and reach ``batch_set_v2`` from rank 0 alone, so no peer waits
+        for them.  Which of the two protocols the installed sglang implements
+        for those rank-sharded sidecars is decided by
+        ``_sidecars_are_written_by_every_rank``.
+        """
+        if not self.is_mla_model:
+            return True
+        return (
+            transfer.name in _RANK_SHARDED_POOLS
+            and _sidecars_are_written_by_every_rank()
+        )
+
+    def _write_path_uses_tp_collectives(
+        self, pool_transfers: Optional[List[PoolTransfer]] = None
+    ) -> bool:
+        """Whether this write call runs collectives over the TP group.
+
+        The same condition as the guard in front of every collective the call
+        will run: a single rank has nobody to wait for, the v1 KV write uses
+        the group for a non-MLA model only (an MLA KV pool is replicated and
+        written by rank 0), and the v2 sidecar write joins it for the
+        transfers sglang hands to every rank.  ``pool_transfers`` is what the
+        call was given, so a sidecar write on an MLA model is judged from its
+        own pools instead of from the model kind.
+
+        Only rank-independent inputs are read (parallel sizes, model kind, and
+        for a sidecar write pools whose presence is a property of the tree,
+        not of the rank), so every rank answers the same -- a rank-dependent
+        answer here would split the group, which is what this whole path
+        exists to prevent.
+        """
+        if getattr(self, "tp_world_size", 1) <= 1:
+            return False
+        if not self.is_mla_model:
+            return True
+        return any(
+            self._transfer_is_written_by_every_rank(transfer)
+            for transfer in pool_transfers or []
+        )
+
+    def _ensure_client_for_write(
+        self, pool_transfers: Optional[List[PoolTransfer]] = None
+    ) -> None:
+        """``_ensure_client`` plus the TP-group agreement the write paths need.
+
+        The write paths are the only callers of the connector's TP collectives
+        (``_batch_set``, ``batch_set_v2``), and a collective needs the whole
+        group: a rank whose client cannot be created would otherwise answer
+        conservatively and leave its peers waiting in
+        ``broadcast_object_list`` / ``all_reduce`` for a rank that is already
+        gone.  So the local outcome is published instead of being decided
+        locally:
+
+        * no collective on this path (single rank, or a write that runs rank-0
+          only) -> plain local initialization, exactly as before;
+        * a previous round already saw every rank ready -> return, so the
+          steady state pays no extra collective;
+        * otherwise one ``all_reduce(MIN)``, which every rank enters *before*
+          the first write collective;
+        * any rank failed -> *every* rank refuses the write, i.e. the callers
+          turn it into their conservative result and no rank enters a write
+          collective that another rank will never reach;
+        * the group is missing -> refuse the write rather than run a
+          collective nobody coordinates (``group=None`` means torch's
+          *default* group, not "no group").
+
+        ``pool_transfers`` is the sidecar write's transfer list: it decides,
+        together with the model kind, whether this call runs collectives (see
+        ``_write_path_uses_tp_collectives``), and the agreement therefore
+        covers exactly the calls that will reach one.
+
+        ``close()`` is checked first, so a retired backend fails here exactly
+        like it does on the read paths, agreement or not.
+
+        The failing rank does not return early: it records the error, joins
+        the round and only then fails with it.  Readiness only ever turns from
+        False to True, so a round that saw the whole group ready is final for
+        this backend instance; until such a round happens every write call
+        repeats it, which is what keeps a rank that failed once from slipping
+        into a later write whose peers would already be waiting for it.
+        Nothing is sticky, so the next call retries initialization.
+        """
+        self._raise_if_closed()
+        if not self._write_path_uses_tp_collectives(pool_transfers):
+            self._ensure_client()
+            return
+        if self._tp_init_agreed:
+            return
+
+        local_error: Optional[BaseException] = None
+        try:
+            self._ensure_client()
+        except Exception as e:
+            # Deliberately no early return: the ranks that did initialize are
+            # already on their way to the write collectives and this rank has
+            # to be in the round that tells them to stop.
+            local_error = e
+
+        # The agreement runs on the same group as the collectives it guards;
+        # every rank that would reach them reaches this first.  A missing
+        # group is a failure: peers may be about to wait here, and running the
+        # write collectives on torch's default group instead is never wanted.
+        group = getattr(self, "storage_tp_group", None)
+        if group is None:
+            raise RuntimeError(
+                "the connector has no TP process group to agree on storage "
+                "initialization with; refusing to write, because the write "
+                "collectives would wait for ranks that cannot answer"
+            )
+        ready = torch.tensor([0 if local_error is not None else 1], dtype=torch.int)
+        torch.distributed.all_reduce(
+            ready, op=torch.distributed.ReduceOp.MIN, group=group
+        )
+        if not bool(ready.item()):
+            if local_error is not None:
+                raise local_error
+            raise RuntimeError(
+                "storage initialization failed on at least one rank of the TP "
+                "group; this rank refuses the write so that no rank waits in a "
+                "collective another rank will never reach"
+            )
+        self._tp_init_agreed = True
+
+    def _init_kvcm_client(self) -> None:
+        # model (is_mla_model is set in __init__ already: the write paths need
+        # it before the client exists)
         self.model_name = self.storage_config.model_name
-        self.is_mla_model = self.storage_config.is_mla_model
         self.kv_factor = 1 if self.is_mla_model else 2
+        # The KV pool comes from the v1 hook (plain host pool) or from the v2
+        # hook when v1 only carried a HostPoolGroup; _ensure_client rejects an
+        # empty pool set before calling this.
         kv_pool = self.registered_pools[PoolName.KV]
         self.kv_dtype = kv_pool.dtype
 
@@ -150,6 +481,10 @@ class HiCacheKVCM(HiCacheStorage):
         # Mamba/Linear specs
         if self.has_mamba:
             mamba_pool = self.registered_pools[PoolName.MAMBA]
+            # No "* block_size" here, unlike KV and Indexer above: a mamba host
+            # pool is page-granular (MambaPoolHost.page_size == 1), so
+            # get_size_per_token() already returns the bytes of one slot, i.e.
+            # of one block, which is what a location spec size means.
             self.mamba_spec_size = mamba_pool.get_size_per_token()
             linear_spec_names = []
             for rank in range(self.tp_size):
@@ -158,9 +493,15 @@ class HiCacheKVCM(HiCacheStorage):
                     {"name": name, "size": self.mamba_spec_size}
                 )
                 linear_spec_names.append(name)
-            mamba_spec_rank = 0 if self.is_mla_model else self.tp_rank
+            # The Mamba/KDA pool is rank-sharded whenever sglang backs it up
+            # from every rank (every non-MLA hybrid, and a hybrid MLA model
+            # with such a sidecar): each rank owns a slice, so each rank writes
+            # and reads its own linear spec.  That is also the honest pair of
+            # the rank-0-only protocol of releases that write only rank 0's
+            # slice: the other ranks then miss instead of loading rank 0's
+            # shard into their own pool.
             self.mamba_location_spec_name = self._tp_rank_to_linear_spec_name(
-                mamba_spec_rank
+                self.tp_rank
             )
             self.location_spec_groups.append(
                 {
@@ -326,39 +667,100 @@ class HiCacheKVCM(HiCacheStorage):
         return hf3fs_configs
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache) -> None:
+        """v1 hook: the KV (anchor) host pool, or a <= 0.5.18 HostPoolGroup.
+
+        The object is kept for the v1 data path (``get_page_buffer_meta`` and
+        ``page_size``); pools themselves are registered from the v2 hook only,
+        and the Manager is told about them on the first storage call.
+        """
         # The pool objects expose more than the HostKVCache base
         # (get_page_buffer_meta & co).
         self.mem_pool_host: Any = mem_pool_host
-        # Extract all pools from HostPoolGroup.entries if available
-        if hasattr(mem_pool_host, "entries"):
-            # HostPoolGroup; sglang types entries as object.
-            for entry in mem_pool_host.entries:  # ty: ignore[not-iterable]
-                self.registered_pools[entry.name] = entry.host_pool
-                logger.info(
-                    "register_mem_pool_host: found pool entry name=%s, "
-                    "host_pool type=%s, is_anchor=%s",
-                    entry.name,
-                    type(entry.host_pool).__name__,
-                    getattr(entry, "is_primary_index_anchor", None),
-                )
-        else:
+        self._init_parallel_context()
+
+        # A host pool handed over here is the KV pool: flat models on every
+        # version, and every model on sglang >= 0.5.19 (sglang passes the
+        # HostPoolGroup's anchor entry). Up to v0.5.18 a hybrid stack passes
+        # the group itself, which is not a HostKVCache -- the KV entry then
+        # arrives through register_mem_host_pool_v2 right after.
+        if isinstance(mem_pool_host, HostKVCache):
             self.registered_pools[PoolName.KV] = mem_pool_host
-            logger.info(
-                "register_mem_pool_host: single pool, type=%s",
-                type(mem_pool_host).__name__,
-            )
         logger.info(
-            "register_mem_pool_host: registered_pools=%s",
-            {k: type(v).__name__ for k, v in self.registered_pools.items()},
+            "register_mem_pool_host: type=%s, kv_pool_registered=%s",
+            type(mem_pool_host).__name__,
+            PoolName.KV in self.registered_pools,
         )
-        self._init_kvcm_client()
 
     def register_mem_host_pool_v2(
         self, host_pool: HostKVCache, host_pool_name: str
     ) -> None:
-        # All pools already extracted from HostPoolGroup in register_mem_pool_host,
-        # so this is a no-op for KVCM connector.
-        pass
+        """v2 hook: one host pool per call, sidecars included.
+
+        sglang calls this for every entry of its host pool group, the KV
+        anchor included, right after the v1 hook. There is no "registration
+        finished" callback, so the pool set is only known to be final at the
+        first data-path call -- pools showing up after that cannot be added to
+        the Manager registration and are degraded (see the class docstring).
+
+        The initialization lock is taken: a pool arriving while the specs are
+        being frozen would otherwise be recorded but missing from the
+        registration payload, i.e. silently unusable.
+        """
+        with self._init_lock:
+            if self._client_ready or self._closed:
+                # Too late for this instance.  Do not record it: if it reuses
+                # a managed pool's name, the data path must not pick it up
+                # (its memory is not the memory the registered spec refers
+                # to).  ``_late_pools`` keeps the name unusable explicitly;
+                # rebind instead of add() so the class-level default stays
+                # immutable.
+                self._late_pools = self._late_pools | {host_pool_name}
+                self._report_late_pool(host_pool_name)
+                return
+            self.registered_pools[host_pool_name] = host_pool
+            logger.info(
+                "register_mem_host_pool_v2: pool=%s, type=%s",
+                host_pool_name,
+                type(host_pool).__name__,
+            )
+
+    def _report_late_pool(self, pool_name: Any) -> None:
+        """Report once that a pool arrived after the specs were frozen."""
+        if not self._mark_pool_reported(pool_name):
+            return
+        logger.error(
+            "register_mem_host_pool_v2: pool %s was registered after the "
+            "connector was initialized with the Manager; there is no "
+            "specification update API, so this pool stays unsupported and its "
+            "transfers are reported as misses.",
+            pool_name,
+        )
+
+    def _mark_pool_reported(self, pool_name: Any) -> bool:
+        """Record that a pool has been reported, returning False if it was."""
+        if pool_name in self._reported_pools:
+            return False
+        self._reported_pools.add(pool_name)
+        return True
+
+    def _report_unsupported_kv_pool(self, pool: Any) -> None:
+        """Report once that the KV anchor is not a host pool.
+
+        Seen with sglang's DeepSeek-V4 compressed KV pool, whose anchor is a
+        ``LogicalHostPool``: it holds no tensors and no ``get_size_per_token``,
+        so no location spec can be built for it.  The report is deduplicated
+        through ``_reported_pools`` like every other unusable pool, so a
+        re-created backend in the same process stays quiet.
+        """
+        if not self._mark_pool_reported(PoolName.KV):
+            return
+        logger.error(
+            "the KV anchor of this instance is a %s, not a host pool: this "
+            "pool shape (e.g. sglang's DeepSeek-V4 compressed KV pool) is not "
+            "supported by this connector, so every storage call degrades to a "
+            "miss for this instance.",
+            type(pool).__name__,
+        )
 
     def _batch_get(
         self,
@@ -420,6 +822,7 @@ class HiCacheKVCM(HiCacheStorage):
     ) -> List[bool]:
         trace_id = self._get_trace_id()
         try:
+            self._ensure_client()
             result = self._batch_get(
                 keys=keys,
                 host_indices=host_indices,
@@ -427,6 +830,10 @@ class HiCacheKVCM(HiCacheStorage):
                 extra_info=extra_info,
             )
             return result
+        except _UnsupportedBackendError:
+            # Already reported once by _ensure_client; keep answering
+            # conservatively without logging on every call.
+            return [False] * len(keys)
         except Exception as e:
             logger.error(f"batch_get_v1 failed: {trace_id=} {e=}")
             return [False] * len(keys)
@@ -439,11 +846,20 @@ class HiCacheKVCM(HiCacheStorage):
         results = {}
         trace_id = self._get_trace_id()
         try:
+            self._ensure_client()
             for transfer in transfers:
                 spec_name = self._get_extra_pool_spec_name(transfer.name)
                 pool = self.registered_pools.get(transfer.name)
                 keys = transfer.keys or []
-                if spec_name is None or pool is None or not keys:
+                if not keys:
+                    results[transfer.name] = []
+                    continue
+                if (
+                    transfer.name in self._late_pools
+                    or spec_name is None
+                    or pool is None
+                ):
+                    self._report_unknown_pool(transfer.name)
                     results[transfer.name] = [False] * len(keys)
                     continue
 
@@ -506,6 +922,10 @@ class HiCacheKVCM(HiCacheStorage):
                 results[transfer.name] = per_key
 
             return results
+        except _UnsupportedBackendError:
+            # Already reported once by _ensure_client; keep answering
+            # conservatively without logging on every call.
+            return {t.name: [False] * len(t.keys or []) for t in transfers}
         except Exception as e:
             logger.error(f"batch_get_v2 failed: {trace_id=} {e=}")
             return {t.name: [False] * len(t.keys or []) for t in transfers}
@@ -782,6 +1202,9 @@ class HiCacheKVCM(HiCacheStorage):
     ) -> List[bool]:
         trace_id = self._get_trace_id()
         try:
+            # The group agreement, not just the local init: _batch_set runs
+            # collectives that need every rank (see _ensure_client_for_write).
+            self._ensure_client_for_write()
             result = self._batch_set(
                 keys=keys,
                 host_indices=host_indices,
@@ -789,6 +1212,10 @@ class HiCacheKVCM(HiCacheStorage):
                 extra_info=extra_info,
             )
             return result
+        except _UnsupportedBackendError:
+            # Already reported once by _ensure_client; keep answering
+            # conservatively without logging on every call.
+            return [False] * len(keys)
         except Exception as e:
             logger.error(f"batch_set_v1 failed: {trace_id=} {e=}")
             return [False] * len(keys)
@@ -803,20 +1230,42 @@ class HiCacheKVCM(HiCacheStorage):
         Each PoolTransfer gets its own StartWriteCache -> Save -> FinishWriteCache
         using the pool's spec group, allowing writes to blocks whose KV cache
         was already committed in a separate write session.
+
+        A transfer sglang hands to every rank (``_transfer_is_written_by_every_rank``)
+        is written cooperatively: rank 0 opens the session, every rank writes
+        its own slice with its own rank spec, and the session is only committed
+        for the blocks that every rank reported -- a rank-sharded sidecar is
+        complete in storage only when all of its shards are.  A transfer only
+        rank 0 receives is written here without peers.
         """
         results = {}
         trace_id = self._get_trace_id()
         try:
+            # The group agreement, for the calls that will reach a collective
+            # below (see _ensure_client_for_write).
+            self._ensure_client_for_write(transfers)
             for transfer in transfers:
                 spec_name = self._get_extra_pool_spec_name(transfer.name)
                 pool = self.registered_pools.get(transfer.name)
                 keys = transfer.keys or []
-                if spec_name is None or pool is None or not keys:
+                if not keys:
+                    results[transfer.name] = []
+                    continue
+                if (
+                    transfer.name in self._late_pools
+                    or spec_name is None
+                    or pool is None
+                ):
+                    self._report_unknown_pool(transfer.name)
                     results[transfer.name] = [False] * len(keys)
                     continue
 
                 spec_group = self._get_extra_pool_spec_group(transfer.name)
                 block_keys, _, _ = self._prepare_block_keys(keys)
+                # Every rank sglang hands this transfer to takes part in the
+                # session; the others are not called for it at all, so waiting
+                # for them would hang.
+                shared = self._transfer_is_written_by_every_rank(transfer)
 
                 if self.tp_rank == 0:
                     start_trace_id = f"start-v2-{trace_id}"
@@ -834,23 +1283,24 @@ class HiCacheKVCM(HiCacheStorage):
                             f"start_write_cache failed on rank 0: {trace_id=} {e=}"
                         )
                         write_result = None
-                    if self.tp_world_size > 1 and not self.is_mla_model:
+                    if shared and self.tp_world_size > 1:
                         torch.distributed.broadcast_object_list(
                             [write_result], src=0, group=self.storage_tp_group
                         )
-                elif self.is_mla_model:
-                    logger.warning(
-                        f"batch_set_v2 called on non-rank-0 (tp_rank={self.tp_rank}) "
-                        f"for MLA model; only rank 0 should write. Returning all False."
-                    )
-                    results[transfer.name] = [False] * len(keys)
-                    continue
-                else:
+                elif shared and self.tp_world_size > 1:
                     recv: List[Any] = [None]
                     torch.distributed.broadcast_object_list(
                         recv, src=0, group=self.storage_tp_group
                     )
                     write_result = recv[0]
+                else:
+                    logger.warning(
+                        f"batch_set_v2 called on non-rank-0 (tp_rank={self.tp_rank}) "
+                        f"for pool {transfer.name}, which sglang does not write from "
+                        f"this rank; returning all False."
+                    )
+                    results[transfer.name] = [False] * len(keys)
+                    continue
                 if write_result is None:
                     results[transfer.name] = [False] * len(keys)
                     continue
@@ -957,7 +1407,9 @@ class HiCacheKVCM(HiCacheStorage):
                     )
                     flag = False
 
-                if self.tp_world_size > 1 and not self.is_mla_model:
+                if shared and self.tp_world_size > 1:
+                    # The block is complete in storage only when every rank
+                    # wrote its slice: commit on the group's minimum.
                     flag_tensor = torch.tensor(flag, dtype=torch.int)
                     torch.distributed.all_reduce(
                         flag_tensor,
@@ -988,6 +1440,10 @@ class HiCacheKVCM(HiCacheStorage):
                 results[transfer.name] = per_key
 
             return results
+        except _UnsupportedBackendError:
+            # Already reported once by _ensure_client; keep answering
+            # conservatively without logging on every call.
+            return {t.name: [False] * len(t.keys or []) for t in transfers}
         except Exception as e:
             logger.error(f"batch_set_v2 failed: {trace_id=} {e=}")
             return {t.name: [False] * len(t.keys or []) for t in transfers}
@@ -1017,10 +1473,15 @@ class HiCacheKVCM(HiCacheStorage):
     ) -> int:
         trace_id = self._get_trace_id()
         try:
+            self._ensure_client()
             result = self._batch_exists(
                 keys=keys, trace_id=trace_id, extra_info=extra_info
             )
             return result
+        except _UnsupportedBackendError:
+            # Already reported once by _ensure_client; keep answering
+            # conservatively without logging on every call.
+            return 0
         except Exception as e:
             logger.error(f"batch_exists failed: {trace_id=} {e=}")
             return 0
@@ -1033,6 +1494,7 @@ class HiCacheKVCM(HiCacheStorage):
     ) -> PoolTransferResult:
         trace_id = self._get_trace_id()
         try:
+            self._ensure_client()
             # Reuse the same get_cache_location call as batch_exists,
             # but inspect per-location specs for extra pool existence.
             block_keys, len_prefix, len_new = self._prepare_block_keys(keys, extra_info)
@@ -1073,6 +1535,10 @@ class HiCacheKVCM(HiCacheStorage):
                 final_pages = min(final_pages, boundary)
 
             return PoolTransferResult(final_pages, pool_hit_pages)
+        except _UnsupportedBackendError:
+            # Already reported once by _ensure_client; keep answering
+            # conservatively without logging on every call.
+            return PoolTransferResult.empty()
         except Exception as e:
             logger.error(f"batch_exists_v2 failed: {trace_id=} {e=}")
             return PoolTransferResult.empty()
@@ -1088,6 +1554,40 @@ class HiCacheKVCM(HiCacheStorage):
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
         return storage_metrics
+
+    def close(self) -> None:
+        """Release what this backend owns; sglang calls it on detach.
+
+        sglang builds a fresh backend instance on re-attach, so nothing has to
+        be re-armed here and the method is idempotent.
+
+        close() takes the initialization lock, so it cannot interleave with
+        the one-time init: either it wins and the init then fails on
+        ``_closed``, or it waits and releases everything the init created.  A
+        client created during the race can therefore never stay referenced
+        (upstream also joins the storage threads before detaching, but the
+        ordering is enforced here instead of assumed).
+
+        Dropping ``transfer_client`` runs the pybind destructor of the SDK
+        wrapper.  The Manager HTTP client (its session and leader-refresh
+        thread) and the gloo group created for the TP collectives are per
+        instance resources too, so they are released explicitly.
+        """
+        with self._init_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.transfer_client = None
+            self.init_params = None
+            self._manager_client.close()
+
+            group = getattr(self, "storage_tp_group", None)
+            if group is not None:
+                self.storage_tp_group = None
+                try:
+                    torch.distributed.destroy_process_group(group)
+                except Exception as e:
+                    logger.warning("close: storage_tp_group not destroyed: %s", e)
 
     ##################################################
 
@@ -1307,11 +1807,12 @@ class HiCacheKVCM(HiCacheStorage):
         a stale/future enum value never causes an UnboundLocalError crash.
         """
         spec_name = self._get_extra_pool_spec_name(transfer.name)
-        if spec_name is None:
-            # Unmanaged pool (e.g. a newer sglang side pool such as SWA): its
-            # data is never written, so claiming hits here would only make the
-            # caller move KV pages that batch_get_v2 then reports as misses.
-            self._warn_unknown_pool_once(transfer.name)
+        if spec_name is None or transfer.name in self._late_pools:
+            # Unmanaged pool (e.g. a newer sglang side pool such as SWA) or a
+            # pool that showed up after the specs were frozen: its data is
+            # never written, so claiming hits here would only make the caller
+            # move KV pages that batch_get_v2 then reports as misses.
+            self._report_unknown_pool(transfer.name)
             return 0
 
         def has_spec(loc: dict) -> bool:
@@ -1342,15 +1843,14 @@ class HiCacheKVCM(HiCacheStorage):
         )
         return 0
 
-    def _warn_unknown_pool_once(self, pool_name: Any) -> None:
-        """Report once that sglang asked for a pool this connector ignores."""
-        if pool_name in self._warned_unknown_pools:
+    def _report_unknown_pool(self, pool_name: Any) -> None:
+        """Report once that sglang moved data for a pool we do not manage."""
+        if not self._mark_pool_reported(pool_name):
             return
-        self._warned_unknown_pools.add(pool_name)
         logger.warning(
-            "batch_exists_v2: pool %s is not managed by this connector; "
-            "reporting 0 hit pages for it. Its entries are neither written "
-            "nor read from KVCM (check the sglang/connector version pairing).",
+            "pool %s is not backed by this connector: its transfers are "
+            "reported as misses and its data is neither read from nor written "
+            "to KVCM (unknown pool, or registered after initialization).",
             pool_name,
         )
 
@@ -1376,7 +1876,22 @@ class HiCacheKVCM(HiCacheStorage):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None] | int:
-        raise NotImplementedError()
+        """Legacy page interface (sglang <= 0.5.18 draft/MTP path).
+
+        KVCM backs KV/Mamba/Indexer location specs, not the draft pool, so the
+        honest answer is "nothing stored": the caller skips every ``None``.
+
+        Answering instead of raising is about visibility, not about keeping
+        the request alive.  Upstream wraps the draft functions in a bare
+        ``except Exception`` that logs at DEBUG, so the old
+        ``NotImplementedError`` was swallowed silently; the one-time WARNING
+        below names the missing L3 path instead.  (Only with ``interface_v1``
+        forced to 0 would this interface also carry KV, where ``_page_backup``
+        has no handler and a raise would kill the backup thread; the connector
+        sets ``interface_v1 = 1`` itself, so that needs an explicit override.)
+        """
+        self._report_legacy_op("batch_get")
+        return [None] * len(keys)
 
     def set(
         self,
@@ -1394,4 +1909,25 @@ class HiCacheKVCM(HiCacheStorage):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        raise NotImplementedError()
+        """Legacy page interface (sglang <= 0.5.18 draft/MTP path).
+
+        Same reasoning as ``batch_get``: the draft wrapper swallows exceptions
+        into a DEBUG log and discards the return value, so a failed write is
+        equivalent in effect -- and the one-time WARNING below makes it
+        visible.
+        """
+        self._report_legacy_op("batch_set")
+        return False
+
+    def _report_legacy_op(self, op: str) -> None:
+        """Report once per legacy entry point that it is not implemented."""
+        if op in self._warned_legacy_ops:
+            return
+        self._warned_legacy_ops.add(op)
+        logger.warning(
+            "%s: this backend only serves the v1/v2 location-spec interfaces; "
+            "draft/MTP L3 is not backed by KVCM, so the call is answered "
+            "conservatively (miss / failed write) instead of raising an error "
+            "that upstream would only log at DEBUG.",
+            op,
+        )

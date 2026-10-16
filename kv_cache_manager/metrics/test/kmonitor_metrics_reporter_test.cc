@@ -1,5 +1,6 @@
 #include <memory>
 
+#include "kmonitor/client/core/MutableMetric.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
@@ -8,8 +9,19 @@
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/metrics/kmonitor_metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
+#include "stub.h"
 
 using namespace kv_cache_manager;
+
+namespace {
+thread_local double reported_error_qps = 0;
+
+void CaptureErrorQps(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *, double value) {
+    if (metric->metric_name_.find("service.error_qps") != std::string::npos) {
+        reported_error_qps += value;
+    }
+}
+} // namespace
 
 class KmonitorMetricsReporterTest : public TESTBASE {
 protected:
@@ -161,4 +173,35 @@ TEST_F(KmonitorMetricsReporterTest, TestReportIntervalWriteBytes) {
     // that ReportInterval reads from instead
     const auto &tags = be->GetMetricsCollector()->GetMetricsTags();
     EXPECT_EQ(2048u, metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total", tags).Get());
+}
+
+TEST_F(KmonitorMetricsReporterTest, RequestOutcomeControlsKmonitorAndLocalErrorCounts) {
+    ServiceMetricsCollector collector(metrics_registry_);
+    ASSERT_TRUE(collector.Init());
+    Stub stub;
+    auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+        &kmonitor::MutableMetric::Report);
+    reported_error_qps = 0;
+    stub.set(report, CaptureErrorQps);
+
+    SET_METRICS_(&collector, service, error_code, 1.);
+    reporter_->ReportPerQuery(&collector, false);
+    EXPECT_DOUBLE_EQ(0., reported_error_qps);
+    EXPECT_EQ(0u, collector.get_service_error_counter_metrics());
+
+    SET_METRICS_(&collector, service, error_code, 0.);
+    reporter_->ReportPerQuery(&collector, true);
+    EXPECT_DOUBLE_EQ(1., reported_error_qps);
+    EXPECT_EQ(1u, collector.get_service_error_counter_metrics());
+
+    SET_METRICS_(&collector, service, error_code, 1.);
+    reporter_->ReportPerQuery(&collector, false);
+    EXPECT_DOUBLE_EQ(1., reported_error_qps);
+    EXPECT_EQ(1u, collector.get_service_error_counter_metrics());
+
+    // Existing callers without a request outcome still use the collector gauge.
+    reporter_->ReportPerQuery(&collector);
+    EXPECT_DOUBLE_EQ(2., reported_error_qps);
+    EXPECT_EQ(2u, collector.get_service_error_counter_metrics());
+    EXPECT_EQ(4u, collector.get_service_query_counter_metrics());
 }

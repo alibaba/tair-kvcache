@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -18,7 +19,7 @@ public:
                       std::shared_ptr<MetricsRegistry> metrics_registry,
                       const std::string &config,
                       const MetricsTags &common_tags = {}) = 0;
-    virtual void ReportPerQuery(MetricsCollector *collector) = 0;
+    virtual void ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed = std::nullopt) = 0;
     virtual void ReportInterval() = 0;
     virtual std::shared_ptr<MetricsRegistry> GetMetricsRegistry() = 0;
     const MetricsTags &GetCommonTags() const { return common_tags_; }

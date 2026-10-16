@@ -12,6 +12,7 @@ public:
     explicit TairMempoolBackend(std::shared_ptr<MetricsRegistry> metrics_registry);
     ~TairMempoolBackend() override;
     DataStorageType GetType() override;
+    bool ShouldSkipConfirmedMissingBackendDelete() const override;
     bool Available() override;
     double GetStorageUsageRatio(const std::string &trace_id) const override;
 

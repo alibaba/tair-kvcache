@@ -115,3 +115,16 @@ TEST_F(LoggingMetricsReporterTest, TestReportInterval) {
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
     }
 }
+
+TEST_F(LoggingMetricsReporterTest, ForwardsRequestOutcomeToLocalCounters) {
+    ServiceMetricsCollector collector(metrics_registry_);
+    ASSERT_TRUE(collector.Init());
+    SET_METRICS_(&collector, service, error_code, 1.);
+    reporter_->ReportPerQuery(&collector, false);
+    EXPECT_EQ(0u, collector.get_service_error_counter_metrics());
+
+    SET_METRICS_(&collector, service, error_code, 0.);
+    reporter_->ReportPerQuery(&collector, true);
+    EXPECT_EQ(1u, collector.get_service_error_counter_metrics());
+    EXPECT_EQ(2u, collector.get_service_query_counter_metrics());
+}

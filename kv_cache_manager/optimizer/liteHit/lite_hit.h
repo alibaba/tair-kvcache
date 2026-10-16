@@ -8,6 +8,7 @@
 
 #include "kv_cache_manager/optimizer/liteHit/dynamic_fenwick_tree.h"
 #include "kv_cache_manager/optimizer/liteHit/hit_curve.h"
+#include "kv_cache_manager/optimizer/metrics/reuse_interval.h"
 
 namespace kv_cache_manager {
 
@@ -26,23 +27,22 @@ namespace kv_cache_manager {
 // alive ones and one replay stays exact for every capacity under the fixed
 // TTL.
 //
-// The TTL needs no per-key timestamps: marker positions are assigned
-// monotonically, so a block's last access time is the commit time of the
-// request that assigned its current position. A small epoch deque maps
-// position ranges to commit timestamps; expired epochs advance a single
-// dead-below watermark and liveness is one integer comparison. The extra
-// state is O(distinct commit timestamps inside one TTL window), independent
-// of the number of unique blocks.
+// TTL liveness needs no per-key timestamps: marker positions are assigned
+// monotonically, so a small epoch deque maps position ranges to commit
+// timestamps; expired epochs advance one dead-below watermark and liveness
+// is one integer comparison. Reuse-interval observability separately keeps
+// the latest timestamp beside each block's position, adding one int64 per
+// tracked block without another hash table or lookup.
 class LiteHit {
 public:
     // ttl_ns == 0 disables the TTL (pure LRU).
-    explicit LiteHit(uint64_t ttl_ns = 0) : ttl_ns_(ttl_ns) {}
+    explicit LiteHit(uint64_t ttl_ns = 0);
 
     // One call is one request boundary. block_keys must be the normalized
     // prefix-chained keys of all complete blocks of the request, in request
     // order; input length parsing, validation, and prefix hashing happen in
     // the shared preprocessing outside the core. now_ns is the request trace
-    // timestamp (time-sorted); it is only consulted when a TTL is configured.
+    // timestamp (time-sorted); it drives TTL and reuse-interval accounting.
     //
     // Phase 1 evaluates the prefix hit curve against the request-start LRU
     // snapshot; with a TTL an expired block stops the prefix like a cold
@@ -83,14 +83,26 @@ public:
     // counts again on its next expiry.
     uint64_t ttl_expired_blocks() const { return ttl_expired_blocks_; }
 
-    // Coarse memory estimate for observability. It is derived from the state
-    // already required by the algorithm and does not retain extra trace data.
+    // Reporting-window reuse intervals for distinct blocks resident at
+    // request start. The statistics are capacity-independent and include
+    // resident blocks after a prefix miss;
+    // duplicate keys inside one request contribute at most one sample.
+    ReuseIntervalStats GetReuseIntervalStats() const { return reuse_interval_.Snapshot(); }
+    ReuseIntervalStats TakeReuseIntervalStats() { return reuse_interval_.Take(); }
+
+    // Coarse memory estimate for observability, including the per-block
+    // timestamp used by reuse-interval statistics.
     uint64_t memory_usage_bytes() const;
 
 private:
     struct SnapshotEntry {
         bool is_resident = false;
         uint64_t required_blocks = 0;
+    };
+
+    struct LastAccess {
+        std::size_t position = 0;
+        int64_t timestamp_ns = 0;
     };
 
     // Positions in [start_position, next epoch's start_position) were
@@ -113,12 +125,16 @@ private:
 
     uint64_t ttl_ns_ = 0;
     DynamicFenwickTree fenwick_;
-    std::unordered_map<int64_t, std::size_t> last_positions_;
+    std::unordered_map<int64_t, LastAccess> last_positions_;
     // TTL state (empty when ttl_ns_ == 0): markers below the watermark are
     // expired.
     std::deque<PositionEpoch> position_epochs_;
     std::size_t dead_below_position_ = 0;
     uint64_t ttl_expired_blocks_ = 0;
+
+    ReuseInterval reuse_interval_;
+    int64_t last_process_timestamp_ns_ = 0;
+    bool has_process_timestamp_ = false;
 };
 
 } // namespace kv_cache_manager

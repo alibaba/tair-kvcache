@@ -96,7 +96,7 @@ bool LiteHitOfflineRunner::Run() {
     }
 
     // Per-instance lanes. Registration through the manager validates the
-    // config and yields size_full_only, the per-block byte charge recorded
+    // config and yields size_full, the per-block byte charge recorded
     // into every fact row.
     std::unordered_map<std::string, std::unique_ptr<InstanceLane>> lanes;
     std::vector<std::string> instance_ids;
@@ -137,7 +137,7 @@ bool LiteHitOfflineRunner::Run() {
         const OptimizerInstanceGroup &group = *groups_by_name.at(instance.instance_group_name());
         auto lane = std::make_unique<InstanceLane>(static_cast<uint64_t>(group.ttl_seconds()) * 1000000000ULL);
         lane->block_size_tokens = static_cast<uint64_t>(instance.block_size());
-        lane->block_bytes = static_cast<uint64_t>(register_result.size_full_only);
+        lane->block_bytes = static_cast<uint64_t>(register_result.size_full);
         lane->enable_prefix_hash = group.enable_prefix_hash();
         if (!lanes.emplace(instance.instance_id(), std::move(lane)).second) {
             KVCM_LOG_ERROR("LiteHitOfflineRunner: duplicate instance_id[%s] in config", instance.instance_id().c_str());

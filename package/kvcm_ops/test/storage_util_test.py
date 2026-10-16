@@ -17,7 +17,7 @@ from kvcm_ops.kvcm.storage.util import (
     gen_pace_config_data,
     get_pace_storage_type,
 )
-from kvcm_ops.kvcm.storage import update_storage
+from kvcm_ops.kvcm.storage import add_storage, update_storage
 from kvcm_ops.kvcm.storage.update_storage import create_update_storage_data
 from kvcm_ops.kvcm.instance_group.util import CacheConfig
 
@@ -84,6 +84,21 @@ class PaceStorageArgsTest(unittest.TestCase):
         add_pace_ssd_sub_parser(subparsers)
         return parser.parse_args(["pace_ssd", "--domain", "pace.meta", "--timeout", "5000", *args])
 
+    def test_health_timeout_is_optional(self):
+        spec = gen_pace_config_data(self._parse_args())
+        self.assertNotIn("health_check_timeout", spec)
+
+    def test_health_timeout_is_serialized(self):
+        spec = gen_pace_config_data(self._parse_args(
+            "--health_check_timeout", "2"))
+        self.assertEqual(2, spec["health_check_timeout"])
+
+    def test_health_timeout_must_be_positive(self):
+        for value in ("0", "-1"):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit):
+                    self._parse_args("--health_check_timeout", value)
+
     def test_ssd_subcommand_sets_distinct_storage_type(self):
         args = self._parse_ssd_args()
         self.assertEqual(5, gen_pace_config_data(args)["media_type"])
@@ -105,6 +120,17 @@ class PaceStorageArgsTest(unittest.TestCase):
     def test_invalid_media_type_is_rejected(self):
         with self.assertRaises(SystemExit):
             self._parse_args("--media_type", "7")
+
+    def test_gc_delete_policy_is_optional_and_accepts_explicit_booleans(self):
+        for parse in (self._parse_args, self._parse_ssd_args):
+            self.assertNotIn("skip_confirmed_missing_backend_delete", gen_pace_config_data(parse()))
+            for value in ("true", "false"):
+                with self.subTest(parser=parse.__name__, value=value):
+                    args = parse("--skip_confirmed_missing_backend_delete", value)
+                    self.assertEqual(
+                        value == "true", gen_pace_config_data(args)["skip_confirmed_missing_backend_delete"])
+            with self.assertRaises(SystemExit):
+                parse("--skip_confirmed_missing_backend_delete", "invalid")
 
     def test_update_can_distinguish_omitted_media_type(self):
         parser = argparse.ArgumentParser()
@@ -130,8 +156,9 @@ class PaceStorageUpdateTest(unittest.TestCase):
             domain="pace.meta",
             host="http://manager",
             media_type=media_type,
-            service_discovery_url="",
+            service_discovery_url=None,
             timeout=5000,
+            health_check_timeout=None,
             trace_id="trace",
             unique_name="pace_storage",
             verbose=False,
@@ -154,6 +181,24 @@ class PaceStorageUpdateTest(unittest.TestCase):
                 }
             ],
         }
+
+    @patch.object(update_storage, "http_post_and_print")
+    @patch.object(update_storage, "http_post")
+    def test_update_preserves_and_overrides_health_timeout(self, mock_http_post, mock_post_and_print):
+        response = self._list_response("ST_TAIRMEMPOOL", 2)
+        response["storage"][0]["tair_mem_pool"].update(
+            health_check_timeout=2, skip_confirmed_missing_backend_delete=True)
+        mock_http_post.return_value = response
+        args = self._args()
+        update_storage.handle_pace(args)
+        spec = mock_post_and_print.call_args.args[1]["storage"]["tair_mem_pool"]
+        self.assertEqual(2, spec["health_check_timeout"])
+        self.assertTrue(spec["skip_confirmed_missing_backend_delete"])
+        args.health_check_timeout = 1
+        update_storage.handle_pace(args)
+        spec = mock_post_and_print.call_args.args[1]["storage"]["tair_mem_pool"]
+        self.assertEqual(1, spec["health_check_timeout"])
+        self.assertTrue(spec["skip_confirmed_missing_backend_delete"])
 
     @patch.object(update_storage, "http_post_and_print")
     @patch.object(update_storage, "http_post")
@@ -219,6 +264,80 @@ class PaceStorageUpdateTest(unittest.TestCase):
             update_storage.handle_pace(self._args())
 
         mock_post_and_print.assert_not_called()
+
+    @patch.object(update_storage, "http_post_and_print")
+    @patch.object(update_storage, "http_post")
+    def test_gc_delete_policy_is_preserved_or_explicitly_updated(self, mock_http_post, mock_post_and_print):
+        field = "skip_confirmed_missing_backend_delete"
+        for storage_type, media_type, subcommand in (
+                ("ST_TAIRMEMPOOL", 2, "pace"), ("ST_TAIRMEMPOOL_SSD", 5, "pace_ssd")):
+            for previous in (None, False, True):
+                for requested in (None, False, True):
+                    with self.subTest(storage_type=storage_type, previous=previous, requested=requested):
+                        response = self._list_response(storage_type, media_type)
+                        if previous is not None:
+                            response["storage"][0]["tair_mem_pool"][field] = previous
+                        mock_http_post.return_value = response
+                        args = self._args(storage_type=subcommand)
+                        setattr(args, field, requested)
+                        update_storage.handle_pace(args)
+                        expected = requested if requested is not None else bool(previous)
+                        payload = mock_post_and_print.call_args.args[1]
+                        self.assertEqual(expected, payload["storage"]["tair_mem_pool"][field])
+                        self.assertEqual(media_type, payload["storage"]["tair_mem_pool"]["media_type"])
+                        self.assertIs(requested, getattr(args, field))
+
+
+class PaceServiceDiscoveryCliTest(unittest.TestCase):
+    @patch.object(add_storage, "http_post_and_print")
+    def test_add_defaults_to_direct_domain_and_accepts_explicit_url(self, mock_post):
+        for subcommand in ("pace", "pace_ssd"):
+            for requested in (None, "", "vipserver://new.meta"):
+                with self.subTest(subcommand=subcommand, requested=requested):
+                    argv = ["add_storage", "-u", "pace_storage", subcommand,
+                            "--domain", "pace.meta", "--timeout", "30"]
+                    if requested is not None:
+                        argv.extend(["--service_discovery_url", requested])
+                    with patch.object(sys, "argv", argv):
+                        add_storage.main()
+                    spec = mock_post.call_args.args[1]["storage"]["tair_mem_pool"]
+                    self.assertEqual(requested or "", spec.get("service_discovery_url", ""))
+                    self.assertEqual("pace.meta", spec["domain"])
+
+    @patch.object(update_storage, "http_post_and_print")
+    @patch.object(update_storage, "http_post")
+    def test_update_preserves_omitted_url_and_allows_replace_or_clear(self, mock_http_post, mock_post):
+        for storage_type, media_type, subcommand in (
+                ("ST_TAIRMEMPOOL", 0, "pace"),
+                ("ST_TAIRMEMPOOL", 2, "pace"),
+                ("ST_TAIRMEMPOOL", 5, "pace"),
+                ("ST_TAIRMEMPOOL_SSD", 5, "pace_ssd")):
+            for previous in (None, "", "vipserver://old.meta"):
+                for requested in (None, "", "vipserver://new.meta"):
+                    with self.subTest(storage_type=storage_type, media_type=media_type,
+                                      previous=previous, requested=requested):
+                        response = PaceStorageUpdateTest._list_response(storage_type, media_type)
+                        existing_spec = response["storage"][0]["tair_mem_pool"]
+                        existing_spec.update(health_check_timeout=2, skip_confirmed_missing_backend_delete=True)
+                        if previous is not None:
+                            existing_spec["service_discovery_url"] = previous
+                        mock_http_post.return_value = response
+                        argv = ["update_storage", "-u", "pace_storage", subcommand,
+                                "--domain", "pace.meta", "--timeout", "30"]
+                        if requested is not None:
+                            argv.extend(["--service_discovery_url", requested])
+                        with patch.object(sys, "argv", argv):
+                            update_storage.main()
+                        storage = mock_post.call_args.args[1]["storage"]
+                        spec = storage["tair_mem_pool"]
+                        expected = requested if requested is not None else previous or ""
+                        self.assertEqual(expected, spec.get("service_discovery_url", ""))
+                        self.assertEqual(storage_type, storage["storage_type"])
+                        self.assertEqual(media_type, spec["media_type"])
+                        self.assertEqual(30, spec["timeout"])
+                        self.assertEqual(2, spec["health_check_timeout"])
+                        self.assertTrue(spec["skip_confirmed_missing_backend_delete"])
+                        self.assertEqual(previous, existing_spec.get("service_discovery_url"))
 
 
 class TairMempoolSsdPreferenceTest(unittest.TestCase):

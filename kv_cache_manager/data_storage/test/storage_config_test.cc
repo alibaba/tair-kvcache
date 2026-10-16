@@ -174,7 +174,7 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecLegacyEnabledButEmptyDomainN
 }
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecToJsonOmitsLegacyFields) {
-    // ToJsonString 必须只输出新版字段（domain / timeout / service_discovery_url / media_type），
+    // ToJsonString 必须只输出当前字段，
     // 不应再输出已废弃的 enable_vipserver / vipserver_domain，避免污染老 client 的解析路径。
     TairMemPoolStorageSpec spec;
     spec.set_domain("pace.meta");
@@ -204,6 +204,29 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRoundTrip) {
     EXPECT_EQ(parsed.timeout(), spec.timeout());
     EXPECT_EQ(parsed.service_discovery_url(), spec.service_discovery_url());
     EXPECT_EQ(parsed.media_type(), spec.media_type());
+}
+
+TEST_F(StorageConfigTest, TestTairMempoolGcDeletePolicyDefaultsAndRoundTrip) {
+    TairMemPoolStorageSpec spec;
+    EXPECT_FALSE(spec.skip_confirmed_missing_backend_delete());
+    const std::string legacy_json = R"({"domain":"pace.meta","timeout":5000})";
+    for (const bool skip : {false, true}) {
+        spec.set_skip_confirmed_missing_backend_delete(skip);
+        TairMemPoolStorageSpec restored;
+        ASSERT_TRUE(restored.FromJsonString(spec.ToJsonString()));
+        EXPECT_EQ(skip, restored.skip_confirmed_missing_backend_delete());
+    }
+    // Reloading old Registry data must reset a previously enabled optimization.
+    ASSERT_TRUE(spec.FromJsonString(legacy_json));
+    EXPECT_FALSE(spec.skip_confirmed_missing_backend_delete());
+    ASSERT_TRUE(
+        spec.FromJsonString(R"({"domain":"pace.meta","timeout":5000,"skip_confirmed_missing_backend_delete":true})"));
+    EXPECT_TRUE(spec.skip_confirmed_missing_backend_delete());
+    ASSERT_TRUE(
+        spec.FromJsonString(R"({"domain":"pace.meta","timeout":5000,"skip_confirmed_missing_backend_delete":false})"));
+    EXPECT_FALSE(spec.skip_confirmed_missing_backend_delete());
+    EXPECT_FALSE(
+        spec.FromJsonString(R"({"domain":"pace.meta","timeout":5000,"skip_confirmed_missing_backend_delete":"true"})"));
 }
 
 TEST_F(StorageConfigTest, TestTairMempoolSsdTypeRoundTripAndValidation) {
@@ -250,4 +273,30 @@ TEST_F(StorageConfigTest, TestTairMempoolSsdTypeRequiresSsdMedia) {
     spec->set_media_type(kTairMemPoolMediaTypeSsd);
     invalid_fields.clear();
     EXPECT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+}
+
+TEST_F(StorageConfigTest, TestTairMempoolHealthTimeoutDefaultsAndRoundTrip) {
+    TairMemPoolStorageSpec spec;
+    ASSERT_TRUE(spec.FromJsonString(R"({"domain":"pace.meta","timeout":5})"));
+    EXPECT_EQ(5, spec.timeout());
+    EXPECT_EQ(1, spec.health_check_timeout());
+    spec.set_health_check_timeout(2);
+    TairMemPoolStorageSpec restored;
+    ASSERT_TRUE(restored.FromJsonString(spec.ToJsonString()));
+    EXPECT_EQ(5, restored.timeout());
+    EXPECT_EQ(2, restored.health_check_timeout());
+    std::string invalid_fields;
+    EXPECT_TRUE(restored.ValidateRequiredFields(invalid_fields));
+}
+
+TEST_F(StorageConfigTest, TestTairMempoolRejectsNonPositiveHealthTimeout) {
+    for (int64_t value : {0, -1}) {
+        TairMemPoolStorageSpec spec;
+        spec.set_domain("pace.meta");
+        spec.set_timeout(5);
+        spec.set_health_check_timeout(value);
+        std::string invalid_fields;
+        EXPECT_FALSE(spec.ValidateRequiredFields(invalid_fields));
+        EXPECT_NE(std::string::npos, invalid_fields.find("health_check_timeout"));
+    }
 }

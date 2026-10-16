@@ -21,9 +21,11 @@ cc_test(
     ],
     copts = ["-fno-access-control"],
     data = [],
+    linkstatic = True,
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/metrics:metrics_reporter",
+        "@cpp_stub",
         "@havenask//aios/kmonitor:kmonitor_client_cpp",
     ],
 )
@@ -56,6 +58,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
         "//kv_cache_manager/service/util:service_call_guard",
         "@cpp_stub",
     ],
@@ -83,7 +86,7 @@ cc_test(
     data = [],
     deps = [
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:kmon_param",
     ],
 )
 

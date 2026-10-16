@@ -49,8 +49,11 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         auto *tair_mem_pool = proto_storage_config->mutable_tair_mem_pool();
         tair_mem_pool->set_domain(tair_mem_pool_storage.domain());
         tair_mem_pool->set_timeout(tair_mem_pool_storage.timeout());
+        tair_mem_pool->set_health_check_timeout(tair_mem_pool_storage.health_check_timeout());
         tair_mem_pool->set_service_discovery_url(tair_mem_pool_storage.service_discovery_url());
         tair_mem_pool->set_media_type(tair_mem_pool_storage.media_type());
+        tair_mem_pool->set_skip_confirmed_missing_backend_delete(
+            tair_mem_pool_storage.skip_confirmed_missing_backend_delete());
         proto::admin::StorageType proto_storage_type = proto::admin::ST_UNSPECIFIED;
         ProtoConvert::DataStorageTypeToProto(type, &proto_storage_type);
         proto_storage_config->set_storage_type(proto_storage_type);
@@ -125,7 +128,12 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
         TairMemPoolStorageSpec spec;
         spec.set_domain(proto_storage_config->tair_mem_pool().domain());
         spec.set_timeout(proto_storage_config->tair_mem_pool().timeout());
+        if (proto_storage_config->tair_mem_pool().health_check_timeout() != 0) {
+            spec.set_health_check_timeout(proto_storage_config->tair_mem_pool().health_check_timeout());
+        }
         spec.set_service_discovery_url(proto_storage_config->tair_mem_pool().service_discovery_url());
+        spec.set_skip_confirmed_missing_backend_delete(
+            proto_storage_config->tair_mem_pool().skip_confirmed_missing_backend_delete());
         const int32_t media_type = proto_storage_config->tair_mem_pool().media_type();
         spec.set_media_type(media_type < 0 || media_type > std::numeric_limits<uint16_t>::max()
                                 ? std::numeric_limits<uint16_t>::max()

@@ -242,15 +242,22 @@ TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
     SdkWrapper sdk_wrapper;
     SharedMemoryRegistration prepared_registration;
     ASSERT_EQ(ER_OK, sdk_wrapper.PrepareSharedMemoryRegistration(registration, prepared_registration));
+    ClientMemoryRegistrations memory_registrations;
+    memory_registrations.host = prepared_registration;
+    memory_registrations.gpu.push_back({reinterpret_cast<void *>(0x1000), 4096, 0});
 
     for (const auto type : {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
                             DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
         SCOPED_TRACE(static_cast<int>(type));
         auto config = std::make_shared<TairMempoolSdkConfig>(type);
-        ASSERT_EQ(ER_OK, sdk_wrapper.UpdateTairMempoolSdkConfig(config, &prepared_registration));
+        ASSERT_EQ(ER_OK, sdk_wrapper.UpdateTairMempoolSdkConfig(config, &memory_registrations));
         EXPECT_EQ(config->shm_fd(), prepared_registration.fd);
         EXPECT_EQ(config->shm_size(), registration.size);
         EXPECT_EQ(config->client_base(), registration.base);
+        ASSERT_EQ(config->gpu_memory_spans().size(), 1u);
+        EXPECT_EQ(config->gpu_memory_spans()[0].base, reinterpret_cast<void *>(0x1000));
+        EXPECT_EQ(config->gpu_memory_spans()[0].size, 4096u);
+        EXPECT_EQ(config->gpu_memory_spans()[0].device_id, 0);
     }
 
     ASSERT_EQ(fclose(file), 0);

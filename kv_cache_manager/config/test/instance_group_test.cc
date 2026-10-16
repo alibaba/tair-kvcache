@@ -292,6 +292,32 @@ TEST_F(InstanceGroupTest, LegacyTairMempoolProtoWithoutStorageTypeRemainsDramTyp
     const auto restored_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
     ASSERT_NE(nullptr, restored_spec);
     EXPECT_EQ(kTairMemPoolMediaTypeSsd, restored_spec->media_type());
+    EXPECT_FALSE(restored_spec->skip_confirmed_missing_backend_delete());
+}
+
+TEST_F(InstanceGroupTest, TairMempoolGcDeletePolicySurvivesProtoAndRegistryRoundTrip) {
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+        for (const bool skip : {false, true}) {
+            auto spec = std::make_shared<TairMemPoolStorageSpec>();
+            spec->set_domain("pace.meta");
+            spec->set_timeout(5000);
+            spec->set_media_type(kTairMemPoolMediaTypeSsd);
+            spec->set_skip_confirmed_missing_backend_delete(skip);
+            StorageConfig original(type, "pace_gc", spec);
+            proto::admin::StorageConfig proto_config;
+            ProtoConvert::StorageConfigToProto(original, &proto_config);
+            EXPECT_EQ(skip, proto_config.tair_mem_pool().skip_confirmed_missing_backend_delete());
+            StorageConfig converted;
+            ProtoConvert::StorageFromProto(&proto_config, converted);
+            StorageConfig restored;
+            ASSERT_TRUE(restored.FromJsonString(converted.ToJsonString()));
+            EXPECT_EQ(type, restored.type());
+            const auto restored_spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+            ASSERT_NE(nullptr, restored_spec);
+            EXPECT_EQ(skip, restored_spec->skip_confirmed_missing_backend_delete());
+        }
+    }
 }
 
 TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyProtoRoundTripPreservesFixedPerInstance) {
@@ -393,4 +419,35 @@ TEST_F(InstanceGroupTest, CacheReclaimBudgetPolicyValidationRejectsUnknownValue)
     EXPECT_NE(std::string::npos, invalid_fields.find("instance_reclaim_budget_policy"));
 }
 
+TEST_F(InstanceGroupTest, TairMempoolHealthTimeoutProtoDefaultsAndRoundTrip) {
+    proto::admin::StorageConfig config;
+    config.set_global_unique_name("pace_timeouts");
+    config.mutable_tair_mem_pool()->set_domain("pace.meta");
+    config.mutable_tair_mem_pool()->set_timeout(5);
+    StorageConfig restored;
+    ProtoConvert::StorageFromProto(&config, restored);
+    auto spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, spec);
+    EXPECT_EQ(1, spec->health_check_timeout());
+
+    config.mutable_tair_mem_pool()->set_health_check_timeout(2);
+    ProtoConvert::StorageFromProto(&config, restored);
+    proto::admin::StorageConfig round_trip;
+    ProtoConvert::StorageConfigToProto(restored, &round_trip);
+    EXPECT_EQ(5, round_trip.tair_mem_pool().timeout());
+    EXPECT_EQ(2, round_trip.tair_mem_pool().health_check_timeout());
+
+    config.mutable_tair_mem_pool()->set_health_check_timeout(0);
+    ProtoConvert::StorageFromProto(&config, restored);
+    spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, spec);
+    EXPECT_EQ(1, spec->health_check_timeout());
+    std::string invalid_fields;
+    EXPECT_TRUE(restored.ValidateRequiredFields(invalid_fields));
+
+    config.mutable_tair_mem_pool()->set_health_check_timeout(-1);
+    ProtoConvert::StorageFromProto(&config, restored);
+    EXPECT_FALSE(restored.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("health_check_timeout"));
+}
 } // namespace kv_cache_manager

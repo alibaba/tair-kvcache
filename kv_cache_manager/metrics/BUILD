@@ -43,6 +43,7 @@ cc_library(
     deps = [
         "//kv_cache_manager/common:utils",
         "//kv_cache_manager/common:logger",
+        "@havenask//aios/kmonitor:kmonitor_client_cpp",
     ],
 )
 

@@ -230,7 +230,11 @@ def _create_hybrid_backend(kv_pool_host, mamba_pool, instance_id, num_blocks=10)
     )
 
     storage_backend = HiCacheKVCM(storage_config, {})
+    # Same sequence as sglang: the v1 hook gets the host pool group, then every
+    # entry -- the KV anchor included -- goes through the v2 hook.
     storage_backend.register_mem_pool_host(host_pool_group)  # ty: ignore[invalid-argument-type]
+    for entry in entries:
+        storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     # Generate test data
     token_ids = list(range(num_blocks * page_size))

@@ -14,7 +14,7 @@ public:
               std::shared_ptr<MetricsRegistry> metrics_registry,
               const std::string &config,
               const MetricsTags &common_tags = {}) override;
-    void ReportPerQuery(MetricsCollector *collector) override;
+    void ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed = std::nullopt) override;
     void ReportInterval() override;
 
 private:

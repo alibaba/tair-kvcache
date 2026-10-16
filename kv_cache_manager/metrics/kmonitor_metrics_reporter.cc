@@ -298,10 +298,7 @@ bool KmonitorMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
     metrics_config.set_tenant_name(param.kmonitor_tenant);
     metrics_config.set_service_name(param.kmonitor_service_name);
 
-    std::string sink_address = param.kmonitor_sink_address;
-    if (!param.kmonitor_port.empty()) {
-        sink_address += ":" + param.kmonitor_port;
-    }
+    const auto sink_address = param.ResolveSinkAddress();
     metrics_config.set_sink_address(sink_address.c_str());
 
     metrics_config.set_enable_log_file_sink(param.kmonitor_enable_log_file_sink);
@@ -583,8 +580,8 @@ bool KmonitorMetricsReporter::InitMetrics() {
         }                                                                                                              \
     } while (0)
 
-void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
-    LocalMetricsReporter::ReportPerQuery(collector);
+void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed) {
+    LocalMetricsReporter::ReportPerQuery(collector, request_failed);
 
     if (!ctx_->kmonitor) {
         KVCM_LOG_WARN("kmonitor is null, ReportPerQuery ignored.");
@@ -603,10 +600,8 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         REPORT_COLLECTED_METRICS(service, request_queue_size);
 
         do {
-            // TODO(rui): better handling double error_code
-            double service_error_code_v;
-            GET_METRICS_(p, service, error_code, service_error_code_v);
-            REPORT_METRICS_WHEN(service, error_qps, 1.0, !CommonUtil::IsZeroDouble(service_error_code_v));
+            const bool failed = request_failed.value_or(!CommonUtil::IsZeroDouble(p->get_service_error_code_metrics()));
+            REPORT_METRICS_WHEN(service, error_qps, 1.0, failed);
         } while (false);
 
         // manager metrics
