@@ -25,6 +25,15 @@ the failure. Asserts: the request still returns (no hang, no crash) and the
 failure was logged. KV content is NOT verified: with the failure swallowed
 the affected blocks keep garbage by design.
 
+Windowed multi-group models split by vLLM era: on vLLM >= 0.30 the connector
+reports the failure at request granularity (KVConnectorTransferResults) and
+vLLM recomputes the request -- asserted like the single-table case above. On
+the pre-0.30 eras there is no request-level API, so the connector fails
+closed (get_finished raises rather than resume the request on partially
+loaded KV): the completion errors out, and that intended refusal -- plus the
+request-granularity detection log that precedes it -- is what the scenario
+asserts there.
+
 This scenario also regression-tests the fail-reschedule loop fix: a request
 whose external load failed must not re-match external blocks on requeue
 (v1_connector.get_num_new_matched_tokens retry guard), otherwise the engine
@@ -33,14 +42,16 @@ loops load-fail-reschedule forever and the request hangs.
 
 import logging
 import os
+import sys
 import unittest
 from urllib.parse import urlparse
 
 import requests
 
 from e2e_lib import (
-    ScenarioEnv, compare_captures, full_block_hashes, make_base_prompts,
-    send_completions, tokenize, wait_for_captures, wait_for_prefix_cached,
+    ScenarioEnv, assert_no_capture_error, compare_captures, full_block_hashes,
+    make_base_prompts, send_completions, supports_request_level_load_failures,
+    tokenize, wait_for_captures, wait_for_prefix_cached,
 )
 
 logger = logging.getLogger("vllm_e2e")
@@ -96,12 +107,17 @@ class TestLoadFailure(unittest.TestCase):
         )
         try:
             env.start_manager()
-            vllm = env.start_vllm(log_suffix="_p1" if env.hybrid else "")
+            vllm = env.start_vllm(log_suffix="_p1" if env.multigroup else "")
             mbs = env.manager_block_size()
 
-            prompt = make_base_prompts(1, env.hybrid)[0]
+            prompt = make_base_prompts(1, env.hybrid, env.window)[0]
             suffix = " Now answer: what is 2+2?"
             toks = tokenize(vllm.base_url(), prompt)
+            # Same gate as the other scaled-prompt scenarios: a window too wide
+            # for --max-model-len must skip loudly instead of letting the HTTP
+            # request fail before the storage-loss path is exercised.
+            env.guard_prompt_fits(toks, "load_failure",
+                                  max_tokens=len(tokenize(vllm.base_url(), suffix)) + 4)
             save_blocks = len(toks) // mbs
             self.assertGreaterEqual(save_blocks, 2)
 
@@ -125,8 +141,39 @@ class TestLoadFailure(unittest.TestCase):
             logger.info("deleted %d/%d block files (kept blocks 0..%d)",
                         save_blocks - keep, save_blocks, keep - 1)
 
-            if env.hybrid:
+            if env.multigroup:
+                # Prefix caching stays on for multi-group models, so the restart
+                # is what forces the load through KVCM.
                 vllm = env.restart_vllm(log_suffix="_p2")
+
+            # A windowed multi-group model on a vLLM without the request-level
+            # load-failure API (pre-0.30) never reaches the branches below:
+            # the connector deliberately fails closed there (get_finished
+            # raises rather than resume the request on partially loaded KV),
+            # so the completion errors out and the engine dies with it. Pin
+            # that intended refusal here -- the request-level recompute the
+            # newer eras perform is asserted in the main flow below.
+            fail_closed = (env.connector_block_tables() > 1
+                           and env.window_geometry().window is not None
+                           and not supports_request_level_load_failures())
+            if fail_closed:
+                with self.assertRaises(requests.RequestException):
+                    send_completions(vllm.base_url(), [prompt + suffix])
+                # The connector still detected and logged the failure at
+                # request granularity on its way out, and the sabotage path
+                # really ran (individual load tasks failed).
+                reported = env.scan_connector_logs(
+                    r"load failed for \d+/\d+ blocks of req .*windowed "
+                    r"multi-group")
+                self.assertTrue(
+                    reported,
+                    "the windowed multi-group load failure was not detected "
+                    "at request granularity on the fail-closed era")
+                self.assertTrue(env.scan_connector_logs(r"load task failed"),
+                                "no load failure was logged; the sabotage did "
+                                "not break any loaded block")
+                assert_no_capture_error(env.capture_dir)
+                return
 
             # ---- Phase 2: load with holes. The request must return normally.
             resp = send_completions(vllm.base_url(), [prompt + suffix])[0]
@@ -140,15 +187,39 @@ class TestLoadFailure(unittest.TestCase):
             self.assertTrue(failed_tasks, "no load failure was logged; the "
                             "sabotage did not break any loaded block")
 
-            if env.hybrid:
-                # report_failures=False path: swallowed but logged.
-                swallowed = env.scan_connector_logs(
-                    r"load failed for \d+/\d+ blocks .*hybrid")
-                self.assertTrue(swallowed,
-                                "hybrid load failure was not logged")
+            if env.connector_block_tables() > 1:
+                # Multi-block-table path: the connector cannot hand vLLM a
+                # group-indexed invalid-block list. What happens next depends
+                # on the layout: a *windowed* multi-group model reports the
+                # failure at request granularity (vLLM >= 0.30 recomputes the
+                # request instead of decoding on the hole), while a
+                # non-windowed hybrid keeps the swallowed-and-logged contract.
+                # Keyed on the *registered* block-table count, not on the
+                # model family: a single-group windowed model reports like
+                # full attention even though is_multigroup()/env.hybrid are
+                # true for it. (Pre-0.30 windowed runs were already answered
+                # by the fail-closed branch above.)
+                if env.window_geometry().window is not None:
+                    reported = env.scan_connector_logs(
+                        r"load failed for \d+/\d+ blocks of req "
+                        r".*reporting the request, not block ids")
+                    self.assertTrue(
+                        reported,
+                        "the windowed multi-group load failure was not "
+                        "reported at request granularity")
+                else:
+                    swallowed = env.scan_connector_logs(
+                        r"load failed for \d+/\d+ blocks .*hybrid")
+                    self.assertTrue(swallowed,
+                                    "multi-block-table load failure was not logged")
+                # No capture *count* is expected here (the loads failed on
+                # purpose), but the marker still has to be read: it is the only
+                # other channel a capture-side assertion or a broken capture
+                # uses, and returning without it would accept either silently.
+                assert_no_capture_error(env.capture_dir)
                 return
 
-            # Full-attention: vLLM was told about the invalid blocks...
+            # Single block table: vLLM was told about the invalid blocks...
             reported = env.scan_connector_logs(r"block_ids_with_load_errors")
             self.assertTrue(reported, "failed loads were not reported to vLLM")
 
@@ -160,28 +231,61 @@ class TestLoadFailure(unittest.TestCase):
             # recomputed over -- their captures mismatch in low bits (a
             # different attention kernel path), which is exactly the
             # "recomputed" disposition, not a transfer failure.
-            wait_for_captures(env.capture_dir, "loaded", expected=keep,
+            # vLLM allocated slots for the *original* external match (the whole
+            # prompt), then invalid-block recovery truncated the request to the
+            # first deleted block -- it does not go back and load the tail of
+            # the shortened prefix. So the region that can have real loaded
+            # captures is the originally allocated region intersected with the
+            # undeleted head: the whole match for a full-attention group (and
+            # for R-SWA), the tail window of the whole match for a purely
+            # windowed model -- which for this ~2.5-window prompt lies entirely
+            # in the deleted half, leaving nothing to verify beyond the failure
+            # report itself.
+            geom = env.window_geometry()
+            # The originally allocated region starts where the windowed tail
+            # of the *whole match* begins (the full group's region starts at
+            # block 0), ending at the match's effective end: an EAGLE/MTP
+            # drop moves the whole served region a hash block back.
+            end = geom.hit_end_blocks(save_blocks * mbs)
+            allocated_from = max(0, end - geom.window_tail(save_blocks * mbs))
+            load_blocks = max(0, min(end, keep) - allocated_from)
+            wait_for_captures(env.capture_dir, "loaded", expected=load_blocks,
                               timeout=180)
             report = compare_captures(env.capture_dir)
             hashes = full_block_hashes(toks, mbs)
             ranks = [f"tp{r}" for r in range(env.tp_size)]
             kept_keys = {(r, h) for r in ranks for h in hashes[:keep]}
             deleted_keys = {(r, h) for r in ranks for h in hashes[keep:]}
+            loaded_keys = {(r, h) for r in ranks
+                           for h in hashes[keep - load_blocks:keep]}
             failed_keys = {f["key"] for f in report["failures"]}
             self.assertFalse(
-                failed_keys & kept_keys,
-                f"surviving loaded blocks mismatched: {failed_keys & kept_keys}")
+                failed_keys & loaded_keys,
+                f"surviving loaded blocks mismatched: "
+                f"{failed_keys & loaded_keys} (kept head: {keep}, loaded "
+                f"region: [{keep - load_blocks}, {keep}))")
             self.assertTrue(
                 failed_keys <= deleted_keys,
                 f"mismatches outside the deleted blocks: "
                 f"{failed_keys - deleted_keys}")
-            matched_kept = kept_keys & set(report["matched_keys"])
+            matched_loaded = loaded_keys & set(report["matched_keys"])
             self.assertEqual(
-                len(matched_kept), keep * env.tp_size,
-                f"only {len(matched_kept)}/{keep * env.tp_size} surviving "
-                f"blocks verified")
+                len(matched_loaded), load_blocks * env.tp_size,
+                f"only {len(matched_loaded)}/{load_blocks * env.tp_size} "
+                f"loaded surviving blocks verified (kept head: {keep}, "
+                f"window: {geom.window})")
         finally:
-            env.stop()
+            # Stop the processes even if the gate raises: a leaked manager or
+            # engine would hold ports and GPU memory and cascade into the next
+            # scenario. On the way out of a *failing* run the gate is skipped
+            # entirely -- that failure must surface, not a gate that may not
+            # even be evaluable (the engine logs exist only if a server got far
+            # enough to print its pinned line).
+            try:
+                if sys.exc_info()[0] is None:
+                    env.assert_pinned_budget()
+            finally:
+                env.stop()
 
 
 if __name__ == "__main__":

@@ -46,8 +46,8 @@ import unittest
 import requests
 
 from e2e_lib import (
-    ScenarioEnv, full_block_hashes, send_completions, tokenize,
-    wait_for_captures, wait_for_prefix_cached,
+    ScenarioEnv, assert_loaded_blocks, assert_loaded_nonempty, full_block_hashes,
+    send_completions, tokenize, wait_for_captures, wait_for_prefix_cached,
 )
 
 logger = logging.getLogger("vllm_e2e")
@@ -118,8 +118,6 @@ class TestCrossRequestPrefix(unittest.TestCase):
     # Long enough that a corrupted recurrent state cannot plausibly reproduce
     # the reference continuation token for token.
     MAX_TOKENS = 32
-    # Mirrors the harness's --max-model-len; prompt + output must fit.
-    MAX_MODEL_LEN = 4096
 
     def test_cross_request_prefix(self):
         env = ScenarioEnv("cross_request_prefix", log_level="DEBUG")
@@ -132,17 +130,58 @@ class TestCrossRequestPrefix(unittest.TestCase):
             vllm = env.start_vllm(log_suffix="_p1")
             mbs = env.manager_block_size()
             # Hybrid models pin the manager block to the scheduler block (528),
-            # so they need a far longer prompt to span several blocks.
-            toks_a = tokenize(vllm.base_url(), long_prompt(260 if env.hybrid else 60))
-            # Cap the length so prompt + MAX_TOKENS stays inside the model len.
-            blocks_a = min(len(toks_a) // mbs,
-                           (self.MAX_MODEL_LEN - self.MAX_TOKENS) // mbs)
+            # so they need a far longer prompt to span several blocks; windowed
+            # models get their length scaled so A crosses the window repeatedly
+            # (the phase-3 load then covers a real tail window, not the whole
+            # match).
+            sentences = 260 if env.hybrid else (120 if env.window else 60)
+            toks_a = tokenize(vllm.base_url(), long_prompt(sentences))
+            # The candidate is generated long on purpose, so cap it to what a
+            # request with MAX_TOKENS of completion may use of the *effective*
+            # --max-model-len, then gate the sequence that is really sent: a
+            # tokenizer that makes the candidate slightly too long must not
+            # cost the whole regression.
+            capacity = env.prompt_capacity(self.MAX_TOKENS)
+            blocks_a = min(len(toks_a) // mbs, capacity // mbs)
             self.assertGreaterEqual(
                 blocks_a, 4,
                 f"only {blocks_a} manager blocks available (mbs={mbs}); this "
                 f"scenario needs interior blocks")
             # Send A as explicit token ids so its cache keys are exactly toks_a.
             toks_a = toks_a[:blocks_a * mbs]
+            env.guard_prompt_fits(toks_a, "cross_request_prefix",
+                                  max_tokens=self.MAX_TOKENS)
+            geom = env.window_geometry()
+            # A hit only starts freeing blocks once it exceeds the retained span
+            # by a full manager block, so that is the bound this scenario needs
+            # (the nominal window is not: window - 1 + extra_retained_tokens can
+            # be kept, and a hit just below span + mbs still fills every slot).
+            span_tokens = geom.retained_span_tokens
+            if geom.prefill_unbounded:
+                # R-SWA keeps the whole prefill and evicts only a decode gap:
+                # this scenario's short decode stays inside the R-SWA window,
+                # so no gap is ever freed and the windowed path -- what the
+                # prompt length cannot bound -- would not be exercised.
+                self.skipTest(
+                    f"R-SWA retains the whole prefill and frees a gap only "
+                    f"after decoding past its {geom.window}-token window; this "
+                    f"scenario decodes {self.MAX_TOKENS} tokens, so the "
+                    f"windowed cross-request path is not exercised")
+            if geom.window is not None and len(toks_a) < span_tokens + mbs:
+                # The windowed point of this scenario is that part of A sits
+                # outside the served window (those blocks are freed and their
+                # table entries replaced by the null page). A prefix that fits
+                # inside one *retained span* exercises none of that: vLLM keeps
+                # up to window - 1 + extra_retained_tokens tokens, so the
+                # nominal window is not the bound -- window_blocks is (the
+                # registered geometry, i.e. the widest local group).
+                self.skipTest(
+                    f"the largest prefix this server accepts ({len(toks_a)} "
+                    f"tokens) does not exceed the registered retained span "
+                    f"({span_tokens} tokens) by a full manager block ({mbs}), "
+                    f"so nothing would be freed or replaced and the windowed "
+                    f"cross-request path is not exercised (raise "
+                    f"--max-model-len via KVCM_E2E_VLLM_ARGS to run it)")
             logger.info("A: %d tokens = %d x %d", len(toks_a), blocks_a, mbs)
             completion_token_ids(vllm.base_url(), toks_a, max_tokens=4)
             wait_for_captures(env.capture_dir, "ref", expected=blocks_a, timeout=180)
@@ -178,6 +217,41 @@ class TestCrossRequestPrefix(unittest.TestCase):
                 candidates = max(choices)
             else:
                 candidates = blocks_a - 1
+                # The hit B produces is candidates blocks long, and a
+                # chunked-local group served a hit ending exactly on one of
+                # its chunk boundaries keeps *nothing* (vLLM skips every
+                # matched token). A purely chunked model then loads an empty
+                # region -- the wait and the key-set assertion accept it, so
+                # assert_loaded_nonempty below fails an otherwise-correct
+                # run -- while a mixed full-attention model's captures mask
+                # that the chunked group was never exercised at all. The
+                # non-hybrid candidate is ours to choose: step it back until
+                # the hit lands inside *every* registered chunk (the same
+                # adjustment the other windowed scenarios make), tested at
+                # the effective end -- an EAGLE/MTP drop moves the served
+                # region a hash block back, and that is the region that must
+                # keep blocks.
+                while (candidates > 1 and any(
+                        geom.effective_hit_tokens(candidates * mbs) % chunk
+                        == 0 for chunk in geom.chunk_sizes)):
+                    candidates -= 1
+                if any(geom.effective_hit_tokens(candidates * mbs) % chunk
+                       == 0 for chunk in geom.chunk_sizes):
+                    # Only reachable when a chunk size divides the manager
+                    # block: every block-aligned candidate ends on that
+                    # boundary, so no prefix of A can keep a block for it.
+                    self.skipTest(
+                        f"every candidate prefix of the {blocks_a} saved "
+                        f"block(s) ends on a chunk boundary (chunk size(s) "
+                        f"{sorted(geom.chunk_sizes)} at mbs={mbs}): the "
+                        f"chunked groups would keep nothing and the "
+                        f"loaded-region assertions would be vacuous")
+                if candidates < blocks_a - 1:
+                    logger.info(
+                        "B candidate blocks stepped back to %d (of %d): the "
+                        "full candidate ends on a chunk boundary (chunk "
+                        "size(s) %s)", candidates, blocks_a - 1,
+                        geom.chunk_sizes)
             toks_b = toks_a[:candidates * mbs + mbs // 2]
             logger.info("B: %d tokens, %d candidate blocks (last has_state=%s)",
                         len(toks_b), candidates, has_state[candidates - 1])
@@ -217,7 +291,27 @@ class TestCrossRequestPrefix(unittest.TestCase):
 
             # ---- Structural evidence.
             matched_blocks = max(matched) // mbs if matched else 0
-            if not env.hybrid:
+            if env.hybrid:
+                # Hybrid: what the manager advertises must match reality...
+                self.assertEqual(
+                    complete, has_state,
+                    f"advertised spec coverage {complete} does not match the "
+                    f"blocks that really have a state {has_state}: state-less "
+                    f"blocks are published as fully cached")
+                # ...and the match must stop at the last state-complete block.
+                expected = 0
+                for i in range(candidates):
+                    if has_state[i]:
+                        expected = i + 1
+                self.assertEqual(
+                    matched_blocks, expected,
+                    f"match not truncated to the last state-complete block: got "
+                    f"{matched_blocks} blocks, expected {expected} (state of "
+                    f"candidates: {has_state[:candidates]})")
+                self.assertTrue(
+                    env.scan_connector_logs(r"truncated external match"),
+                    "the truncation was not logged")
+            else:
                 # No state groups: uniform coverage, nothing to truncate.
                 self.assertTrue(all(complete),
                                 f"full-attention coverage is not uniform: {specs}")
@@ -225,27 +319,52 @@ class TestCrossRequestPrefix(unittest.TestCase):
                     matched_blocks, candidates,
                     f"full-attention match was truncated: {matched_blocks} of "
                     f"{candidates} blocks")
-                return
-
-            # Hybrid: what the manager advertises must match reality...
-            self.assertEqual(
-                complete, has_state,
-                f"advertised spec coverage {complete} does not match the "
-                f"blocks that really have a state {has_state}: state-less "
-                f"blocks are published as fully cached")
-            # ...and the match must stop at the last state-complete block.
-            expected = 0
-            for i in range(candidates):
-                if has_state[i]:
-                    expected = i + 1
-            self.assertEqual(
-                matched_blocks, expected,
-                f"match not truncated to the last state-complete block: got "
-                f"{matched_blocks} blocks, expected {expected} (state of "
-                f"candidates: {has_state[:candidates]})")
-            self.assertTrue(
-                env.scan_connector_logs(r"truncated external match"),
-                "the truncation was not logged")
+                if env.window is not None:
+                    # Windowed (SWA): the whole prefix is published (the
+                    # connector copies every block in the step that produced
+                    # it), so the clamp must not trim the match -- and the load
+                    # covers exactly the slots vLLM handed out: the sliding
+                    # groups' tail window of where the match ended, plus the
+                    # whole match for the full-attention group. The region
+                    # ends at the hit's effective end (an EAGLE/MTP drop
+                    # moves it a hash block back).
+                    geometry = env.window_geometry()
+                    load_blocks = geometry.loaded_blocks(candidates * mbs)
+                    end = geometry.hit_end_blocks(candidates * mbs)
+                    hashes = full_block_hashes(toks_b, mbs)
+                    self.assertEqual(len(hashes), candidates)
+                    wait_for_captures(env.capture_dir, "loaded",
+                                      expected=env.tp_size * load_blocks,
+                                      timeout=180)
+                    assert_loaded_blocks(
+                        env.capture_dir,
+                        {(f"tp{r}", h) for r in range(env.tp_size)
+                         for h in hashes[end - load_blocks:end]},
+                        env.tp_size)
+                    # No bit-exact comparison here: these references were
+                    # captured on the ground-truth server (phase 2), i.e. by a
+                    # *different process* than the one that produced the loaded
+                    # bytes (phase 1), and a prefill forward is not
+                    # bit-reproducible across processes on every stack.
+                    # Measured on gpt-oss-20b (MXFP4/MARLIN): two runs of the
+                    # very same command differ in 1700 (block, layer) pairs of
+                    # their phase-2 refs -- onset abruptly around layer 12/24,
+                    # uniform across a block's rows, max |d| ~13 -- while
+                    # gemma-3 reproduces bit-exactly. The connector's own round
+                    # trip is not implicated: A's phase-1 capture and the
+                    # loaded (storage-read-back) bytes are bit-identical in all
+                    # 8 blocks x 24 layers, and the verbatim round trip stays
+                    # asserted bit-exactly in every scenario whose refs and
+                    # loads come from the same run (basic, concurrent, tp,
+                    # partial_hit, full_hit, multi_turn, load_failure). What
+                    # must hold *here* regardless is that the loaded slots hold
+                    # real KV:
+                    assert_loaded_nonempty(env.capture_dir, env.tp_size)
+            # One gate for every success path: the hybrid branch used
+            # to return before reaching it, so a budgeted hybrid model
+            # was never gated (its own pinning is what the gate exists
+            # for).
+            env.assert_pinned_budget()
         finally:
             env.stop()
 
