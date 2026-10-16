@@ -4,6 +4,7 @@
 #include <cassert>
 #include <climits>
 #include <exception>
+#include <string_view>
 #include <typeinfo>
 #include <unordered_set>
 #include <utility>
@@ -26,6 +27,8 @@ namespace kv_cache_manager {
 namespace {
 constexpr int64_t kRecoverScanBatchSize = 1000;
 constexpr int kRecoverMaxConsecutiveFailures = 3;
+constexpr std::string_view kCacheScanCursorPrefix = "c:";
+constexpr std::string_view kPersistentScanCursorPrefix = "p:";
 
 // Collects keys where results[i] == EC_NOENT. Returns {missing_keys, missing_indices}.
 std::pair<KeyTypeVec, std::vector<size_t>> CollectMissingKeys(const KeyVector &keys,
@@ -2026,10 +2029,33 @@ ErrorCode MetaStorageBackendManager::ListKeys(RequestContext *request_context,
                                               const int64_t limit,
                                               std::string &out_next_cursor,
                                               KeyTypeVec &out_keys) noexcept {
-    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
-        return cache_backend_->ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
+    if (!cache_backend_) {
+        return persistent_backend_->ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
     }
-    return persistent_backend_->ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
+
+    // Keep a continuation on its original backend when async recovery finishes between pages.
+    const bool new_scan = cursor == SCAN_BASE_CURSOR;
+    std::string_view prefix;
+    if (new_scan) {
+        prefix = recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning ? kCacheScanCursorPrefix
+                                                                                          : kPersistentScanCursorPrefix;
+    } else if (std::string_view(cursor).substr(0, kCacheScanCursorPrefix.size()) == kCacheScanCursorPrefix) {
+        prefix = kCacheScanCursorPrefix;
+    } else if (std::string_view(cursor).substr(0, kPersistentScanCursorPrefix.size()) == kPersistentScanCursorPrefix) {
+        prefix = kPersistentScanCursorPrefix;
+    } else {
+        return EC_BADARGS;
+    }
+
+    const std::string backend_cursor = new_scan ? cursor : cursor.substr(prefix.size());
+    auto *backend = prefix == kCacheScanCursorPrefix ? static_cast<MetaStorageBackend *>(cache_backend_.get())
+                                                     : persistent_backend_.get();
+    std::string next_cursor;
+    const ErrorCode ec = backend->ListKeys(request_context, backend_cursor, limit, next_cursor, out_keys);
+    if (ec == EC_OK) {
+        out_next_cursor = next_cursor == SCAN_BASE_CURSOR ? SCAN_BASE_CURSOR : std::string(prefix) + next_cursor;
+    }
+    return ec;
 }
 
 ErrorCode MetaStorageBackendManager::ListPersistentKeys(RequestContext *request_context,
@@ -2189,6 +2215,8 @@ ErrorCode MetaStorageBackendManager::PutMetaData(const FieldMap &field_maps) noe
 ErrorCode MetaStorageBackendManager::GetMetaData(FieldMap &field_maps) noexcept {
     return persistent_backend_->GetMetaData(field_maps);
 }
+
+ErrorCode MetaStorageBackendManager::DeleteMetaData() noexcept { return persistent_backend_->DeleteMetaData(); }
 
 bool MetaStorageBackendManager::Sync(const KeyVector &keys) noexcept {
     if (!persistent_backend_) {

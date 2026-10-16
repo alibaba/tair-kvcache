@@ -2,6 +2,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <utility>
@@ -217,7 +218,9 @@ void AdminServiceImpl::RemoveStorage(RequestContext *request_context,
     // hold the lifecycle lock as a writer so metric-registration sites
     // (reporter interval loop) cannot re-create storage-tagged entries
     // concurrently with the purge below
-    std::unique_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
+    const auto metrics_lifecycle = cache_manager_->metrics_lifecycle();
+    std::unique_lock<std::shared_mutex> removal_guard(metrics_lifecycle->removal_mut_);
+    std::unique_lock<std::shared_mutex> lifecycle_guard(metrics_lifecycle->mut_);
 
     ErrorCode ec_info = registry_manager_->RemoveStorage(request_context, request->storage_unique_name());
     if (ec_info != EC_OK) {
@@ -255,6 +258,7 @@ void AdminServiceImpl::UpdateStorage(RequestContext *request_context,
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("AddStorage", "StorageConfig", false);
         return;
     }
+    std::unique_lock<std::shared_mutex> removal_guard(cache_manager_->metrics_lifecycle()->removal_mut_);
     ErrorCode ec_info = registry_manager_->UpdateStorage(request_context, storage_req, request->force_update());
     if (ec_info != EC_OK) {
         status->set_code(proto::admin::INTERNAL_ERROR);
@@ -707,11 +711,6 @@ void AdminServiceImpl::RemoveInstance(RequestContext *request_context,
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RemoveInstance", "instance_id", true);
     }
-    // exclude all metrics-registration sites for the duration of the
-    // removal so InvalidateInstanceMetrics' single tag-filter purge
-    // cannot race with concurrent producers; instance removal is low
-    // frequency, so the wide locking range is acceptable
-    std::unique_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
     ErrorCode ec_info =
         cache_manager_->RemoveInstance(request_context, request->instance_group(), request->instance_id());
     if (ec_info != EC_OK) {

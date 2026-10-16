@@ -151,6 +151,7 @@ public:
     Exists(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_is_exist_vec) noexcept;
 
     // ----- Cross-batch APIs (no shard locks) -----
+    // Continuation cursors are opaque and retain their source backend in dual-backend mode.
     ErrorCode ListKeys(RequestContext *request_context,
                        const std::string &cursor,
                        const int64_t limit,
@@ -181,6 +182,7 @@ public:
 
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
+    ErrorCode DeleteMetaData() noexcept;
 
     // Synchronously flush pending writes for the given keys to persistent storage.
     // Returns true on success, false on failure/timeout.

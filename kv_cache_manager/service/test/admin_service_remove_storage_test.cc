@@ -1,5 +1,8 @@
 #include <atomic>
+#include <chrono>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -10,6 +13,7 @@
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/metrics/local_metrics_reporter.h"
+#include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/service/admin_service_impl.h"
 
@@ -81,6 +85,53 @@ TEST_F(AdminServiceRemoveStorageTest, RemoveNonexistentStorageReturnsError) {
     admin_service_->RemoveStorage(&rc, &request, &response);
 
     ASSERT_EQ(proto::admin::INTERNAL_ERROR, response.header().status().code());
+}
+
+TEST_F(AdminServiceRemoveStorageTest, WaitsForInstanceRemovalBeforeClosingStorage) {
+    SeedStorage("store1");
+    std::unique_lock<std::shared_mutex> removal_guard(cache_manager_->metrics_lifecycle()->removal_mut_);
+    std::atomic<bool> started{false};
+    auto remove_future = std::async(std::launch::async, [&] {
+        RequestContext context("remove_storage_during_instance_removal");
+        proto::admin::RemoveStorageRequest request;
+        request.set_storage_unique_name("store1");
+        proto::admin::CommonResponse response;
+        started.store(true, std::memory_order_release);
+        admin_service_->RemoveStorage(&context, &request, &response);
+        return response.header().status().code();
+    });
+    while (!started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    const auto status = remove_future.wait_for(std::chrono::milliseconds(50));
+    removal_guard.unlock();
+    EXPECT_EQ(std::future_status::timeout, status);
+    EXPECT_EQ(proto::admin::OK, remove_future.get());
+}
+
+TEST_F(AdminServiceRemoveStorageTest, UpdateStorageWaitsForInstanceRemoval) {
+    SeedStorage("store1");
+    std::unique_lock<std::shared_mutex> removal_guard(cache_manager_->metrics_lifecycle()->removal_mut_);
+    std::atomic<bool> started{false};
+    auto update_future = std::async(std::launch::async, [&] {
+        RequestContext context("update_storage_during_instance_removal");
+        proto::admin::UpdateStorageRequest request;
+        auto *storage = request.mutable_storage();
+        storage->set_global_unique_name("store1");
+        storage->mutable_dummy()->set_root_path("/tmp/test_store1");
+        storage->mutable_dummy()->set_key_count_per_file(1);
+        proto::admin::CommonResponse response;
+        started.store(true, std::memory_order_release);
+        admin_service_->UpdateStorage(&context, &request, &response);
+        return response.header().status().code();
+    });
+    while (!started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    const auto status = update_future.wait_for(std::chrono::milliseconds(50));
+    removal_guard.unlock();
+    EXPECT_EQ(std::future_status::timeout, status);
+    EXPECT_EQ(proto::admin::OK, update_future.get());
 }
 
 TEST_F(AdminServiceRemoveStorageTest, PurgesOnlyTargetedStorageMetrics) {

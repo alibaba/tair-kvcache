@@ -786,6 +786,18 @@ ErrorCode MetaAsyncRedisBackend::GetMetaData(FieldMap &out_field_map) noexcept {
     return error_codes[0];
 }
 
+ErrorCode MetaAsyncRedisBackend::DeleteMetaData() noexcept {
+    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        return EC_TIMEOUT;
+    }
+    const auto results = handle->Delete({metadata_key_});
+    if (results.size() != 1) {
+        return EC_ERROR;
+    }
+    return results[0] == EC_NOENT ? EC_OK : results[0];
+}
+
 // ==================== Sync ====================
 
 bool MetaAsyncRedisBackend::Sync(const KeyTypeVec &keys) noexcept {

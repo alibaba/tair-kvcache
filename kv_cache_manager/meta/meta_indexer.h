@@ -193,6 +193,9 @@ public:
     bool ParallelForQuery(std::size_t count, const QueryExecutor::RangeFunction &fn) const noexcept;
 
     void PersistMetaData() noexcept;
+    // Flush outstanding writes and remove persistent per-instance counters.
+    // On success the backend is released so destruction cannot recreate them.
+    ErrorCode Retire() noexcept;
     size_t GetKeyCount() const noexcept;
     size_t GetMaxKeyCount() const noexcept;
     size_t GetMemUsage() const noexcept;

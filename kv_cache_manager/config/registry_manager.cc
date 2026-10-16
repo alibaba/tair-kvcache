@@ -19,6 +19,7 @@ namespace kv_cache_manager {
 static constexpr const char *kRegistryStorageKey = "storage";
 static constexpr const char *kRegistryGroupKey = "instance_group";
 static constexpr const char *kRegistryInstanceKey = "instance";
+static constexpr const char *kRegistryRemovingInstanceKey = "__kvcm_internal_removing_instance_registry__";
 static constexpr const char *kRegistryAccountKey = "account";
 
 #define PREFIX_LOG_I(LEVEL, format, args...)                                                                           \
@@ -252,6 +253,9 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
     if (iter == instance_group_configs_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_NOENT, "update instance group failed: instance group not found");
     }
+    if (HasRemovingInstanceInGroupUnsafe(instance_group_name)) {
+        RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_ERROR, "update instance group failed: instance removal pending");
+    }
     if (current_version != iter->second->version() || instance_group.version() <= iter->second->version()) {
         // TODO: 定义错误码
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN,
@@ -277,6 +281,9 @@ ErrorCode RegistryManager::RemoveInstanceGroup(RequestContext *request_context,
     const auto iter = instance_group_configs_.find(instance_group_name);
     if (iter == instance_group_configs_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_NOENT, "remove instance group failed: instance group not found");
+    }
+    if (HasRemovingInstanceInGroupUnsafe(instance_group_name)) {
+        RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_ERROR, "remove instance group failed: instance removal pending");
     }
     // delete from storage backend
     auto ec = LoadAndDelete(kRegistryGroupKey, instance_group_name);
@@ -306,6 +313,14 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                             int32_t default_query_type) {
     const auto &trace_id = request_context->trace_id();
     std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (instance_id == kRegistryRemovingInstanceKey) {
+        request_context->error_tracer()->AddErrorMsg("register instance failed: reserved instance id");
+        return EC_BADARGS;
+    }
+    if (removing_instance_infos_.count(instance_id) != 0) {
+        request_context->error_tracer()->AddErrorMsg("register instance failed: instance removal pending");
+        return EC_ERROR;
+    }
     auto instance_group_iter = instance_group_configs_.find(instance_group);
     if (instance_group_iter == instance_group_configs_.end()) {
         request_context->error_tracer()->AddErrorMsg("register instance failed: instance group '" + instance_group +
@@ -380,6 +395,69 @@ ErrorCode RegistryManager::RemoveInstance(RequestContext *request_context,
     instance_infos_.erase(instance_id);
     PREFIX_LOG_I(INFO, "remove instance OK");
     return EC_OK;
+}
+
+ErrorCode RegistryManager::BeginRemoveInstance(RequestContext * /*request_context*/, const std::string &instance_id) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto pending = removing_instance_infos_.find(instance_id);
+    if (pending == removing_instance_infos_.end()) {
+        const auto active = instance_infos_.find(instance_id);
+        if (active == instance_infos_.end()) {
+            return EC_NOENT;
+        }
+        const ErrorCode ec = LoadAndSave(kRegistryRemovingInstanceKey, instance_id, active->second.get());
+        if (ec != EC_OK) {
+            return ec;
+        }
+        removing_instance_infos_[instance_id] = active->second;
+    }
+    // The intent is durable before the instance becomes invisible. Retrying a
+    // partially completed removal is safe even if either key is already absent.
+    instance_infos_.erase(instance_id);
+    ErrorCode ec = LoadAndDelete(kRegistryInstanceKey, instance_id);
+    if (ec != EC_OK && ec != EC_NOENT) {
+        return ec;
+    }
+    ec = LoadAndDelete(instance_id, instance_id);
+    return ec == EC_NOENT ? EC_OK : ec;
+}
+
+ErrorCode RegistryManager::CompleteRemoveInstance(const std::string &instance_id) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (removing_instance_infos_.count(instance_id) == 0) {
+        return EC_NOENT;
+    }
+    const ErrorCode ec = LoadAndDelete(kRegistryRemovingInstanceKey, instance_id);
+    if (ec != EC_OK && ec != EC_NOENT) {
+        return ec;
+    }
+    removing_instance_infos_.erase(instance_id);
+    return EC_OK;
+}
+
+std::shared_ptr<const InstanceInfo> RegistryManager::GetRemovingInstanceInfo(const std::string &instance_id) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const auto it = removing_instance_infos_.find(instance_id);
+    return it == removing_instance_infos_.end() ? nullptr : it->second;
+}
+
+std::vector<std::shared_ptr<const InstanceInfo>> RegistryManager::ListRemovingInstanceInfos() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    std::vector<std::shared_ptr<const InstanceInfo>> result;
+    result.reserve(removing_instance_infos_.size());
+    for (const auto &[id, info] : removing_instance_infos_) {
+        result.push_back(info);
+    }
+    return result;
+}
+
+bool RegistryManager::HasRemovingInstanceInGroupUnsafe(const std::string &instance_group_name) const {
+    for (const auto &[id, info] : removing_instance_infos_) {
+        if (info->instance_group_name() == instance_group_name) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::pair<ErrorCode, std::shared_ptr<const InstanceGroup>>
@@ -642,6 +720,9 @@ size_t RegistryManager::RecoverInstanceInfoUnsafe() {
         return 1;
     }
     for (const auto &[id, val] : value_map) {
+        if (removing_instance_infos_.count(id) != 0) {
+            continue;
+        }
         if (instance_infos_.find(id) != instance_infos_.end()) {
             continue;
         }
@@ -663,6 +744,28 @@ size_t RegistryManager::RecoverInstanceInfoUnsafe() {
     return error_count;
 }
 
+size_t RegistryManager::RecoverRemovingInstanceInfoUnsafe() {
+    std::map<std::string, std::string> value_map;
+    const ErrorCode ec = storage_->Load(kRegistryRemovingInstanceKey, value_map);
+    if (ec != EC_OK && ec != EC_NOENT) {
+        return 1;
+    }
+    size_t error_count = 0;
+    for (const auto &[id, serialized] : value_map) {
+        if (removing_instance_infos_.count(id) != 0) {
+            continue;
+        }
+        auto info = std::make_shared<InstanceInfo>();
+        if (!info->FromJsonString(serialized)) {
+            ++error_count;
+            continue;
+        }
+        removing_instance_infos_[id] = std::move(info);
+        instance_infos_.erase(id);
+    }
+    return error_count;
+}
+
 ErrorCode RegistryManager::DoRecoverOnce() {
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
@@ -670,14 +773,19 @@ ErrorCode RegistryManager::DoRecoverOnce() {
     error_count += RecoverStorageUnsafe();
     error_count += RecoverAccountUnsafe();
     error_count += RecoverInstanceGroupUnsafe();
-    error_count += RecoverInstanceInfoUnsafe();
+    const size_t removing_error_count = RecoverRemovingInstanceInfoUnsafe();
+    error_count += removing_error_count;
+    if (removing_error_count == 0) {
+        error_count += RecoverInstanceInfoUnsafe();
+    }
 
     KVCM_LOG_INFO("registry manager do recover once done, error_count[%lu], account num[%lu], "
-                  "instance group num[%lu], instance info num[%lu]",
+                  "instance group num[%lu], instance info num[%lu], removing instance info num[%lu]",
                   error_count,
                   accounts_.size(),
                   instance_group_configs_.size(),
-                  instance_infos_.size());
+                  instance_infos_.size(),
+                  removing_instance_infos_.size());
     if (error_count == 0) {
         recover_complete_.store(true);
     }
@@ -739,6 +847,7 @@ ErrorCode RegistryManager::DoCleanup() {
     // clear config and infos
     instance_group_configs_.clear();
     instance_infos_.clear();
+    removing_instance_infos_.clear();
     accounts_.clear();
 
     KVCM_LOG_INFO("registry manager cleanup completed");

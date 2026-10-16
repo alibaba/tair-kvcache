@@ -67,6 +67,11 @@ public:
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
+    // Keep a durable deletion intent until cache and persistent metadata have been reclaimed.
+    ErrorCode BeginRemoveInstance(RequestContext *request_context, const std::string &instance_id);
+    ErrorCode CompleteRemoveInstance(const std::string &instance_id);
+    std::shared_ptr<const InstanceInfo> GetRemovingInstanceInfo(const std::string &instance_id) const;
+    std::vector<std::shared_ptr<const InstanceInfo>> ListRemovingInstanceInfos() const;
     std::shared_ptr<const InstanceInfo> GetInstanceInfo(RequestContext *request_context,
                                                         const std::string &instance_id);
     std::pair<ErrorCode, std::vector<std::shared_ptr<const InstanceInfo>>>
@@ -96,6 +101,8 @@ private:
     size_t RecoverAccountUnsafe();
     size_t RecoverInstanceGroupUnsafe();
     size_t RecoverInstanceInfoUnsafe();
+    size_t RecoverRemovingInstanceInfoUnsafe();
+    bool HasRemovingInstanceInGroupUnsafe(const std::string &instance_group_name) const;
 
 private:
     /***
@@ -116,6 +123,8 @@ private:
     std::unordered_map<std::string, std::shared_ptr<InstanceGroup>> instance_group_configs_;
     // 需要清理 - 在DoCleanup()中clear()
     std::unordered_map<std::string, std::shared_ptr<InstanceInfo>> instance_infos_;
+    // 需要清理 - DoRecoverOnce 从持久化删除意图中恢复。
+    std::unordered_map<std::string, std::shared_ptr<InstanceInfo>> removing_instance_infos_;
     // 需要清理 - 在DoCleanup()中clear()
     std::unordered_map<std::string, std::shared_ptr<Account>> accounts_;
     // 无需清理 - 主备切换不改变到registry后端存储的配置

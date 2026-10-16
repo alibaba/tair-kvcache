@@ -51,14 +51,6 @@ TEST_F(MetaIndexerManagerTest, TestSingleThreadCreateAndGet) {
               manager_->GetMetaIndexer(id_1)->backend_manager_->persistent_backend_->GetStorageType());
     // ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR,
     //           manager_->GetMetaIndexer(id_2)->backend_manager_->persistent_backend_->GetStorageType());
-
-    // test delete, TODO
-    // ASSERT_EQ(ErrorCode::EC_NOENT, manager_->DeleteMetaIndexer("3"));
-    // ASSERT_EQ(2, manager_->GetIndexerSize());
-    // ASSERT_EQ(ErrorCode::EC_OK, manager_->DeleteMetaIndexer("2"));
-    // ASSERT_EQ(1, manager_->GetIndexerSize());
-    // ASSERT_EQ(ErrorCode::EC_OK, manager_->DeleteMetaIndexer("1"));
-    // ASSERT_EQ(0, manager_->GetIndexerSize());
 }
 
 TEST_F(MetaIndexerManagerTest, TestMultiThreadCreateAndGet) {

@@ -456,8 +456,8 @@ void MetaIndexer_PersistMetaData_stub(void *obj) noexcept {}
 // the dummy meta_searcher that the meta_searcher_manager would return
 std::shared_ptr<MetaSearcher> dummy_meta_searcher;
 
-MetaSearcher *MetaSearcherManager_GetMetaSearcher_stub(void *obj, const std::string &i) {
-    return dummy_meta_searcher.get();
+std::shared_ptr<MetaSearcher> MetaSearcherManager_GetMetaSearcher_stub(void *obj, const std::string &i) {
+    return dummy_meta_searcher;
 }
 
 /* ---------------- MetaSearcher_BatchGetLocation_stub ---------------- */

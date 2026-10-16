@@ -89,6 +89,7 @@ public:
     // ----- Metadata APIs -----
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
+    ErrorCode DeleteMetaData() noexcept override;
 
 private:
     // virtual for test

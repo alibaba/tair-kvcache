@@ -60,8 +60,9 @@ TEST_F(MetaSearcherManagerTest, TestMultiThreadCreate) {
     auto thread_fcn = [this, &searcher, &go]() {
         while (!go.load(std::memory_order_relaxed)) {}
         std::shared_ptr<RequestContext> request_context(new RequestContext("test_trace_id"));
-        MetaSearcher *real = this->meta_searcher_manager_->TryCreateMetaSearcher(
+        auto real_owner = this->meta_searcher_manager_->TryCreateMetaSearcher(
             request_context.get(), "test_instance", dummy_check_loc_data_exist, dummy_submit_del_req);
+        MetaSearcher *real = real_owner.get();
         MetaSearcher *expected = nullptr;
         if (!searcher.compare_exchange_strong(expected, real, std::memory_order_acq_rel)) {
             ASSERT_EQ(searcher.load(std::memory_order_relaxed), real);
@@ -86,19 +87,19 @@ TEST_F(MetaSearcherManagerTest, TestMultiThreadCreate) {
 TEST_F(MetaSearcherManagerTest, TestDoCleanup) {
     // 1. 创建 MetaSearcher
     std::shared_ptr<RequestContext> request_context(new RequestContext("test_trace_id"));
-    MetaSearcher *searcher = meta_searcher_manager_->TryCreateMetaSearcher(
+    auto searcher = meta_searcher_manager_->TryCreateMetaSearcher(
         request_context.get(), "test_instance", dummy_check_loc_data_exist, dummy_submit_del_req);
     ASSERT_NE(searcher, nullptr);
 
     // 验证可以获取到创建的 MetaSearcher
-    MetaSearcher *retrieved_searcher = meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto retrieved_searcher = meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_EQ(retrieved_searcher, searcher);
 
     // 2. 调用 DoCleanup
     meta_searcher_manager_->DoCleanup();
 
     // 3. 验证清理后获取不到 MetaSearcher
-    MetaSearcher *after_cleanup_searcher = meta_searcher_manager_->GetMetaSearcher("test_instance");
+    auto after_cleanup_searcher = meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_EQ(after_cleanup_searcher, nullptr);
 
     // 4. 再次调用 DoCleanup 应该正常工作
@@ -108,7 +109,7 @@ TEST_F(MetaSearcherManagerTest, TestDoCleanup) {
     meta_searcher_manager_->meta_indexer_manager_->DoCleanup();
 
     // 6. 重新创建 MetaSearcher
-    MetaSearcher *new_searcher = meta_searcher_manager_->TryCreateMetaSearcher(
+    auto new_searcher = meta_searcher_manager_->TryCreateMetaSearcher(
         request_context.get(), "test_instance", dummy_check_loc_data_exist, dummy_submit_del_req);
     ASSERT_NE(new_searcher, nullptr);
 
