@@ -17,7 +17,7 @@ from kvcm_ops.kvcm.storage.util import (
     gen_pace_config_data,
     get_pace_storage_type,
 )
-from kvcm_ops.kvcm.storage import update_storage
+from kvcm_ops.kvcm.storage import add_storage, update_storage
 from kvcm_ops.kvcm.storage.update_storage import create_update_storage_data
 from kvcm_ops.kvcm.instance_group.util import CacheConfig
 
@@ -156,7 +156,7 @@ class PaceStorageUpdateTest(unittest.TestCase):
             domain="pace.meta",
             host="http://manager",
             media_type=media_type,
-            service_discovery_url="",
+            service_discovery_url=None,
             timeout=5000,
             health_check_timeout=None,
             trace_id="trace",
@@ -286,6 +286,58 @@ class PaceStorageUpdateTest(unittest.TestCase):
                         self.assertEqual(expected, payload["storage"]["tair_mem_pool"][field])
                         self.assertEqual(media_type, payload["storage"]["tair_mem_pool"]["media_type"])
                         self.assertIs(requested, getattr(args, field))
+
+
+class PaceServiceDiscoveryCliTest(unittest.TestCase):
+    @patch.object(add_storage, "http_post_and_print")
+    def test_add_defaults_to_direct_domain_and_accepts_explicit_url(self, mock_post):
+        for subcommand in ("pace", "pace_ssd"):
+            for requested in (None, "", "vipserver://new.meta"):
+                with self.subTest(subcommand=subcommand, requested=requested):
+                    argv = ["add_storage", "-u", "pace_storage", subcommand,
+                            "--domain", "pace.meta", "--timeout", "30"]
+                    if requested is not None:
+                        argv.extend(["--service_discovery_url", requested])
+                    with patch.object(sys, "argv", argv):
+                        add_storage.main()
+                    spec = mock_post.call_args.args[1]["storage"]["tair_mem_pool"]
+                    self.assertEqual(requested or "", spec.get("service_discovery_url", ""))
+                    self.assertEqual("pace.meta", spec["domain"])
+
+    @patch.object(update_storage, "http_post_and_print")
+    @patch.object(update_storage, "http_post")
+    def test_update_preserves_omitted_url_and_allows_replace_or_clear(self, mock_http_post, mock_post):
+        for storage_type, media_type, subcommand in (
+                ("ST_TAIRMEMPOOL", 0, "pace"),
+                ("ST_TAIRMEMPOOL", 2, "pace"),
+                ("ST_TAIRMEMPOOL", 5, "pace"),
+                ("ST_TAIRMEMPOOL_SSD", 5, "pace_ssd")):
+            for previous in (None, "", "vipserver://old.meta"):
+                for requested in (None, "", "vipserver://new.meta"):
+                    with self.subTest(storage_type=storage_type, media_type=media_type,
+                                      previous=previous, requested=requested):
+                        response = PaceStorageUpdateTest._list_response(storage_type, media_type)
+                        existing_spec = response["storage"][0]["tair_mem_pool"]
+                        existing_spec.update(health_check_timeout=2, skip_confirmed_missing_backend_delete=True)
+                        if previous is not None:
+                            existing_spec["service_discovery_url"] = previous
+                        mock_http_post.return_value = response
+                        argv = ["update_storage", "-u", "pace_storage", subcommand,
+                                "--domain", "pace.meta", "--timeout", "30"]
+                        if requested is not None:
+                            argv.extend(["--service_discovery_url", requested])
+                        with patch.object(sys, "argv", argv):
+                            update_storage.main()
+                        storage = mock_post.call_args.args[1]["storage"]
+                        spec = storage["tair_mem_pool"]
+                        expected = requested if requested is not None else previous or ""
+                        self.assertEqual(expected, spec.get("service_discovery_url", ""))
+                        self.assertEqual(storage_type, storage["storage_type"])
+                        self.assertEqual(media_type, spec["media_type"])
+                        self.assertEqual(30, spec["timeout"])
+                        self.assertEqual(2, spec["health_check_timeout"])
+                        self.assertTrue(spec["skip_confirmed_missing_backend_delete"])
+                        self.assertEqual(previous, existing_spec.get("service_discovery_url"))
 
 
 class TairMempoolSsdPreferenceTest(unittest.TestCase):

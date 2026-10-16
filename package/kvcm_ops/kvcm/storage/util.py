@@ -16,9 +16,10 @@ def gen_pace_config_data(args):
     storage_spec = {
         "domain": args.domain,
         "timeout": args.timeout,
-        "service_discovery_url": args.service_discovery_url,
         "media_type": args.media_type,
     }
+    if args.service_discovery_url is not None:
+        storage_spec["service_discovery_url"] = args.service_discovery_url
     skip_missing = getattr(args, "skip_confirmed_missing_backend_delete", None)
     if skip_missing is not None:
         storage_spec["skip_confirmed_missing_backend_delete"] = skip_missing
@@ -108,9 +109,11 @@ def add_pace_common_args(parser):
         help='Skip GC Delete for confirmed-missing URIs; add defaults to false, update omission preserves the value')
     parser.add_argument(
         '--service_discovery_url',
-        default="",
+        default=None,
         help=(
-            'service discovery url, empty string means use --domain directly. '
+            'service discovery url; omitted on add uses --domain directly, '
+            'omitted on update preserves the existing value. '
+            'Pass an empty string to clear it and use --domain directly. '
             'Examples: vipserver://pace.meta.vipserver?timeout=10  |  '
             'spectrum://v-ad2d143d?cache_time=30&retry_time=3&timeout=5000  |  '
             'static://10.0.0.1:8080,10.0.0.2:8080'
