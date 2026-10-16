@@ -1,6 +1,19 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "QuotaPolicyPollerTest",
+    srcs = ["quota_policy_poller_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+        "//kv_cache_manager/service:quota_policy_poller",
+        "@grpc//:grpc++",
+    ],
+)
+
+cc_test(
     name = "MetaServiceMetricsBaseTest",
     srcs = [
         "meta_service_metrics_base_test.cc",

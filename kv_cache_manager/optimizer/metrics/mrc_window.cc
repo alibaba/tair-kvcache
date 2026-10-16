@@ -1,5 +1,6 @@
 #include "kv_cache_manager/optimizer/metrics/mrc_window.h"
 
+#include <algorithm>
 #include <array>
 #include <iterator>
 #include <limits>
@@ -52,6 +53,16 @@ std::vector<MrcWindowPoint> MrcWindow::Take() {
     return curve;
 }
 
+std::vector<uint64_t> MrcWindow::TakeHitCounts(const std::vector<uint64_t> &capacity_blocks) {
+    std::vector<uint64_t> hits;
+    hits.reserve(capacity_blocks.size());
+    for (uint64_t capacity : capacity_blocks) {
+        hits.push_back(ComputeHitsAtCapacity(capacity));
+    }
+    Reset();
+    return hits;
+}
+
 void MrcWindow::Reset() {
     hit_count_deltas_.clear();
     total_hits_ = 0;
@@ -87,6 +98,26 @@ uint64_t MrcWindow::ComputeRequiredBlocks(uint32_t target_basis_points) const {
         accumulated_hits = SaturatingAdd(accumulated_hits, span_hits);
     }
     return 0;
+}
+
+uint64_t MrcWindow::ComputeHitsAtCapacity(uint64_t capacity_blocks) const {
+    uint64_t accumulated_hits = 0;
+    int64_t hits_at_required_blocks = 0;
+    for (auto it = hit_count_deltas_.begin(); it != hit_count_deltas_.end(); ++it) {
+        hits_at_required_blocks += it->second;
+        const auto next = std::next(it);
+        if (hits_at_required_blocks <= 0 || next == hit_count_deltas_.end() || it->first > capacity_blocks) {
+            continue;
+        }
+        const uint64_t inclusive_end = std::min(capacity_blocks, next->first - 1);
+        if (inclusive_end < it->first) {
+            continue;
+        }
+        const uint64_t span = inclusive_end - it->first + 1;
+        accumulated_hits =
+            SaturatingAdd(accumulated_hits, SaturatingMultiply(static_cast<uint64_t>(hits_at_required_blocks), span));
+    }
+    return std::min(accumulated_hits, total_hits_);
 }
 
 } // namespace kv_cache_manager

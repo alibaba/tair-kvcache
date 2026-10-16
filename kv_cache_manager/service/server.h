@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -33,6 +34,7 @@ class MetricsReporter;
 class MetricsReporterFactory;
 struct MetricsLifecycle;
 class LoopThread;
+class QuotaPolicyPoller;
 
 class Server {
 public:
@@ -87,5 +89,6 @@ private:
     std::shared_ptr<MetricsReporterFactory> metrics_reporter_factory_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<LoopThread> metrics_report_thread_;
+    std::unique_ptr<QuotaPolicyPoller> quota_policy_poller_;
 };
 } // namespace kv_cache_manager
