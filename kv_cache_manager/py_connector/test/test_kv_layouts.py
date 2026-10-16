@@ -21,8 +21,12 @@ import sys
 import types
 from typing import Any
 import unittest
+import unittest.mock
 
 from kv_cache_manager.py_connector.test.vllm_stubs import STUBBED, make_connector
+from kv_cache_manager.py_connector.vllm.v1_connector import (  # noqa: E402
+    _packs_pages_inside_blocks,
+)
 from kv_cache_manager.py_connector.vllm.vllm_common import (
     AttentionGroupMeta,
     StateGroupMeta,
@@ -748,6 +752,79 @@ class TestHybridGate(unittest.TestCase):
         self._with_scheduler(_BlockedScheduler)
         with self.assertRaises(NotImplementedError):
             ensure_hybrid_supported(force=True)
+
+
+class TestPacksPagesInsideBlocks(unittest.TestCase):
+    """The layout predicate keys on the architecture vLLM resolves (the
+    first entry), not on every raw candidate a config lists."""
+
+    @staticmethod
+    def _vllm_config(architectures):
+        vllm_config = types.SimpleNamespace()
+        vllm_config.model_config = types.SimpleNamespace(
+            architectures=architectures
+        )
+        return vllm_config
+
+    def test_a_packed_architecture_first_requests_packing(self):
+        with unittest.mock.patch(
+            "kv_cache_manager.py_connector.vllm.v1_connector"
+            "._resolved_architecture",
+            return_value="DeepseekV4ForCausalLM",
+        ):
+            self.assertTrue(
+                _packs_pages_inside_blocks(
+                    self._vllm_config(["DeepseekV4ForCausalLM"])
+                )
+            )
+
+    def test_an_unselected_fallback_does_not(self):
+        # vLLM resolves the implementation from the first entry it supports; a
+        # DeepSeek-V4 fallback behind a plain Qwen must not move the selected
+        # model onto the packed-block layout.
+        self.assertFalse(
+            _packs_pages_inside_blocks(
+                self._vllm_config(["Qwen2ForCausalLM", "DeepseekV4ForCausalLM"])
+            )
+        )
+
+    def test_an_unsupported_leading_entry_does_not_hide_a_packed_one(self):
+        # ['<unsupported>', 'DeepseekV4...'] selects the V4.1 implementation:
+        # the registry skips the leading entry it cannot build, so the
+        # resolved architecture is the packed one (the naive
+        # architectures[0] check would miss it and leave the model on the
+        # head-major layout, failing registration).
+        with unittest.mock.patch(
+            "kv_cache_manager.py_connector.vllm.v1_connector"
+            "._resolved_architecture",
+            return_value="DeepseekV41ForCausalLM",
+        ):
+            self.assertTrue(
+                _packs_pages_inside_blocks(
+                    self._vllm_config(
+                        ["UnsupportedWrapper", "DeepseekV41ForCausalLM"]
+                    )
+                )
+            )
+
+    def test_an_unresolvable_list_reads_as_standard(self):
+        # A registry failure is not evidence of a packed model: read as False
+        # (a really packed model then fails registration loudly, which is the
+        # safe direction).
+        with unittest.mock.patch(
+            "kv_cache_manager.py_connector.vllm.v1_connector"
+            "._resolved_architecture",
+            return_value=None,
+        ):
+            self.assertFalse(
+                _packs_pages_inside_blocks(
+                    self._vllm_config(["DeepseekV4ForCausalLM"])
+                )
+            )
+
+    def test_no_architecture_does_not(self):
+        self.assertFalse(_packs_pages_inside_blocks(self._vllm_config([])))
+        self.assertFalse(_packs_pages_inside_blocks(self._vllm_config(None)))
 
 
 if __name__ == "__main__":

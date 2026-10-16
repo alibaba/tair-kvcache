@@ -57,6 +57,15 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
 
+try:
+    # vllm >= 0.29.0: the engine resolves one layout for the whole model from
+    # the backends' supported sets (see get_required_kvcache_layout).
+    from vllm.v1.kv_cache_layout import KVCacheLayout as _KVCacheLayout  # ty: ignore[unresolved-import]
+except ImportError:
+    # vllm <= 0.28.0 knows only NHD/HND and takes a connector's answer at face
+    # value, so no other layout name may be returned there.
+    _KVCacheLayout = None  # ty: ignore[invalid-assignment]
+
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.py_connector.common.tp_coordinator import TpCoordinatorClient
 from kv_cache_manager.py_connector.common.logger import logger, configure_log_level
@@ -112,8 +121,102 @@ __all__ = [
     "parse_groups",
 ]
 
+# The transfer kernel needs pages whose logical (block, token, head, content)
+# runs are contiguous. Two layouts qualify: LBNHC (token-major, layer-compact)
+# and BLNHC (token-major, layer inside the block, vLLM calls it block-outer).
+# Only the packed-block models rule LBNHC out; see _packs_pages_inside_blocks.
+_PREFERRED_KV_CACHE_LAYOUT = "BLNHC"
+
+# HF architecture prefixes whose KV blocks pack several per-layer pages inside
+# one block. Their backends therefore support block-outer layouts only (vLLM
+# rejects layer-compact ones for them, see validate_kv_cache_layout), and the
+# engine's own pick among those is BLHNC -- head-major inside a page, which the
+# transfer kernel cannot read. Every other model keeps the engine's choice:
+# BLNHC is part of the engine's *fallback* preference list, so declaring it
+# unconditionally would silently move each flash-attn/triton model (backends
+# that support any layout) onto a packed-block layout.
+_PACKED_BLOCK_ARCHITECTURES = ("DeepseekV4",)
+
+
+def _layout_names_include(layout_name: str) -> bool:
+    """Whether this vLLM era has ``layout_name`` in its layout name space."""
+    return _KVCacheLayout is not None and hasattr(_KVCacheLayout, layout_name)
+
+
+def _packs_pages_inside_blocks(vllm_config: "VllmConfig") -> bool:
+    """Whether this model packs several per-layer KV pages into one block.
+
+    Keyed on the architecture vLLM actually resolves (the first entry its
+    model registry supports, which is not necessarily ``architectures[0]``):
+    an unselected fallback must not move the selected model onto the
+    packed-block layout, and an unsupported leading entry must not hide a
+    supported packed one. Unresolvable (ancient vLLM, registry failures)
+    reads as False: the standard layout is accepted and a really packed
+    model then fails registration loudly, which is the safe direction."""
+    model_config = getattr(vllm_config, "model_config", None)
+    architectures = getattr(model_config, "architectures", None) or ()
+    if not architectures:
+        return False
+    resolved = _resolved_architecture(architectures, model_config)
+    return resolved is not None and resolved.startswith(_PACKED_BLOCK_ARCHITECTURES)
+
+
+def _resolved_architecture(
+    architectures: "list[str]", model_config: Any
+) -> Optional[str]:
+    """The architecture vLLM resolved for this config, without loading it.
+
+    ``ModelConfig`` records the pick in ``architecture`` (the engine resolves
+    it before any connector hook runs), so reading that field mirrors the
+    engine's choice exactly. Eras or stub configs without the field fall
+    back to the registry's supported-name list -- a name check only:
+    ``resolve_model_cls`` would *import* the model class, initializing CUDA
+    in the parent process before workers fork. Unresolvable reads as None:
+    not evidence of a packed-block model, so the standard layout is kept and
+    a really packed model fails registration with the layout assertion (the
+    safe direction)."""
+    resolved = getattr(model_config, "architecture", None)
+    if isinstance(resolved, str) and resolved:
+        # Trust the resolution as-is: with model_impl="transformers" the
+        # field carries the backend name (e.g. TransformersForCausalLM),
+        # which is deliberately absent from the checkpoint's architectures --
+        # a membership check would discard it and fall back to the raw name,
+        # moving a standard-backend model onto the packed-block layout.
+        return resolved
+    try:
+        from vllm.model_executor.models.registry import ModelRegistry
+
+        supported = set(ModelRegistry.get_supported_archs())
+    except Exception:
+        return None
+    for architecture in architectures:
+        if architecture in supported:
+            return architecture
+    return None
+
 
 class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
+    # ------------------------------------------------------------------ #
+    # Layout negotiation (class-level: the engine core calls this before any
+    # instance exists)
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> Optional[str]:
+        """Ask for a layout this connector's kernel can read, when it can.
+
+        The engine intersects the answer with the layouts the attention
+        backends support (using its own default when the connector has no
+        preference) and warns before falling back, so a preference is never a
+        hard constraint. The kernel reads token-major pages only, which rules
+        out BLHNC -- the layout the engine picks for packed-block models; see
+        _PREFERRED_KV_CACHE_LAYOUT and _packs_pages_inside_blocks.
+        """
+        if not _layout_names_include(_PREFERRED_KV_CACHE_LAYOUT):
+            return None
+        if not _packs_pages_inside_blocks(vllm_config):
+            return None
+        return _PREFERRED_KV_CACHE_LAYOUT
+
     # ------------------------------------------------------------------ #
     # Init / registration (role-agnostic)
     # ------------------------------------------------------------------ #
