@@ -987,32 +987,264 @@ class TestForeignCoordinatorRefusal(unittest.TestCase):
         self.assertEqual([], self.seen_a)
 
     def test_the_defer_buffer_is_bounded(self):
-        # An outage longer than the buffer must drop the oldest events loudly
-        # rather than grow without bound; the coordinator-side caps settle
-        # the loss, exactly as for a dead coordinator.
+        # An outage longer than the buffer retires the oldest sessions loudly
+        # rather than growing without bound -- and the retirement is reported:
+        # r1's start is dropped with a failure marker, so once the coordinator
+        # returns the marker settles the whole session (the finish that
+        # survived in this same queue is dropped as late) instead of leaving a
+        # finish without its start pinned in the server's buffers with the
+        # request's _pending_saves stuck above zero forever.
         import kv_cache_manager.py_connector.common.tp_coordinator as tp
 
         with unittest.mock.patch.object(tp, "DEFERRED_EVENT_LIMIT", 3):
-            # r1: start+finish, r2: start fills the buffer, r2's finish drops
-            # r1's start -- without it r1's save can never complete.
+            # r1: start+finish, r2: start fills the buffer, r2's finish retires
+            # r1's start -- its session settles through the marker.
             for param in self._save_events("req-b1", "sess-b1"):
                 self.client.send(param)
             self.client.send(self._save_events("req-b2", "sess-b2")[0])
             with self.assertLogs(tp.logger, level="WARNING"):
                 self.client.send(self._save_events("req-b2", "sess-b2")[1])
             self.assertEqual(len(self.client._pending_events), 3)
+            self.assertEqual(1, len(self.client._dropped_sessions))
         self.server_b = TpCoordinatorServer(
             "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
         )
         _wait_for_server(self.server_b)
         self.client.send(self._save_events("req-b3", "sess-b3")[0])
         deadline = time.time() + 5.0
-        while time.time() < deadline and not self.seen_b:
+        while time.time() < deadline and len(self.seen_b) < 2:
             time.sleep(0.01)
-        # Only r2 completed: r1's start was dropped, so its finish -- flushed
-        # ahead of it -- can never complete on the coordinator.
-        self.assertEqual(self.seen_b, ["sess-b2"])
+        # Both sessions settled: r1 through its retirement marker (first --
+        # markers flush ahead of the survivors), r2 through the normal
+        # start+finish aggregation.
+        self.assertEqual(self.seen_b, ["sess-b1", "sess-b2"])
         self.assertEqual(self.seen_a, [])
+
+
+class TestOverflowRetiresWholeSessions(unittest.TestCase):
+    """The defer cap retires whole sessions and reports the retirement.
+
+    A save's start lives in the scheduler's client queue while each rank's
+    finish lives in its own, and a load's reports live with the ranks: the
+    queues overflow independently, so dropping one event silently leaves the
+    server a finish without its start (pinned in ``pending_save_finishes``)
+    or a start whose finishes were dropped (pinned in ``running_save``, the
+    request's ``_pending_saves`` never reaching zero). Every dropped event
+    carries a failure marker that settles its session as a unit when the
+    endpoint resolves."""
+
+    def setUp(self):
+        self.holders = []
+        probe_port = _find_free_port()
+        for _ in range(12):
+            with socket_module.socket() as sock:
+                try:
+                    sock.bind(("127.0.0.1", probe_port))
+                except OSError:
+                    probe_port = _find_free_port()
+                    continue
+            self.base_port = probe_port
+            break
+        else:
+            raise AssertionError("no free port strip found")
+        for port in range(self.base_port, self.base_port + 4):
+            holder = socket_module.socket()
+            holder.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+            holder.bind(("127.0.0.1", port))
+            holder.listen(1)
+            self.holders.append(holder)
+        for holder in self.holders:
+            holder.close()
+        # (session id, save context) pairs the server's callback settled.
+        self.settled = []
+        # A foreign coordinator holds the configured pair, so this instance's
+        # client defers whatever it is given.
+        self.server_a = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record, "inst-A"
+        )
+        _wait_for_server(self.server_a)
+        self.server_b = None
+        self.clients = []
+        self.addCleanup(self.server_a.shutdown)
+        self.addCleanup(self._shutdown_b)
+        self.addCleanup(self._shutdown_clients)
+
+    def _record(self, write_session_id, save_context):
+        self.settled.append((write_session_id, save_context))
+
+    def _shutdown_b(self):
+        if self.server_b is not None:
+            self.server_b.shutdown()
+
+    def _shutdown_clients(self):
+        for client in self.clients:
+            client.shutdown()
+
+    def _client(self):
+        client = TpCoordinatorClient("127.0.0.1", self.base_port, "inst-B")
+        self.clients.append(client)
+        return client
+
+    def _start_event(self, request_id, write_session_id, num_blocks=1):
+        return CoordinateMsgSerializer.dumps(
+            CoordinateMessage(
+                time.time(),
+                SendBlockStartEvent(
+                    request_id=request_id,
+                    write_session_id=write_session_id,
+                    locations=[{"location_specs": []}] * num_blocks,
+                ),
+            )
+        )
+
+    def _finish_event(self, request_id, write_session_id, successes, tp_rank=0):
+        return CoordinateMsgSerializer.dumps(
+            CoordinateMessage(
+                time.time(),
+                SendBlockFinishedEvent(
+                    request_id=request_id,
+                    tp_rank=tp_rank,
+                    write_session_id=write_session_id,
+                    is_success_list=list(successes),
+                ),
+            )
+        )
+
+    def _load_event(self, request_id, epoch):
+        return CoordinateMsgSerializer.dumps(
+            CoordinateMessage(
+                time.time(),
+                LoadBlockFinishedEvent(
+                    request_id=request_id,
+                    tp_rank=0,
+                    epoch=epoch,
+                ),
+            )
+        )
+
+    def _drain_until_saving(self, request_id):
+        """Poll get_finished_tasks (which drains) until request_id lands."""
+        finished_saving = []
+        deadline = time.time() + 5.0
+        while time.time() < deadline and request_id not in finished_saving:
+            saving, _ = self.server_b.get_finished_tasks()
+            finished_saving.extend(saving)
+            time.sleep(0.01)
+        self.assertIn(request_id, finished_saving)
+        return finished_saving
+
+    def test_a_dropped_finish_settles_the_session_and_unblocks_the_request(self):
+        # The worker's queue overflows and retires its finish; the start was
+        # delivered by the scheduler's queue. The marker settles the session
+        # as failed (0/1 ranks reported), the request completes, and the late
+        # events of the retired session -- the finish arriving after the
+        # marker flushed -- are dropped instead of resurrecting it.
+        import kv_cache_manager.py_connector.common.tp_coordinator as tp
+
+        # The retry routine must not flush on its own here: the orchestration
+        # below decides when the marker travels.
+        retry_patch = unittest.mock.patch.object(tp, "DEFERRED_RETRY_SECONDS", 30)
+        retry_patch.start()
+        self.addCleanup(retry_patch.stop)
+        worker = self._client()
+        with unittest.mock.patch.object(tp, "DEFERRED_EVENT_LIMIT", 1):
+            worker.send(self._finish_event("req-1", "sess-1", [True, True]))
+            worker.send(self._finish_event("req-2", "sess-2", [True]))
+            self.assertEqual(1, len(worker._dropped_sessions))
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record, "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        # The scheduler's queue never overflowed: its start is delivered.
+        scheduler = self._client()
+        scheduler.send(self._start_event("req-1", "sess-1", num_blocks=2))
+        # The worker's next send resolves its endpoint and flushes the marker
+        # ahead of the survivor.
+        worker.send(self._finish_event("req-2", "sess-2", [True]))
+        finished_saving = self._drain_until_saving("req-1")
+        self.assertEqual(["sess-1"], [session for session, _ in self.settled])
+        # Nothing was reported for the session: the verdict downstream reads
+        # every block as failed, and the request is settled either way.
+        self.assertEqual({}, self.settled[0][1].result_per_rank)
+        self.assertEqual(["req-1"], finished_saving)
+
+        # A late duplicate finish for the retired session must not resurrect
+        # it (no second settle, no second completion).
+        scheduler.send(self._finish_event("req-1", "sess-1", [True, True]))
+        time.sleep(0.2)
+        self.assertEqual(1, len(self.settled))
+        self.assertEqual([], self.server_b.get_finished_tasks()[0])
+
+    def test_a_dropped_start_settles_on_the_results_that_all_ranks_reported(self):
+        # The scheduler's queue overflows and retires the start; every rank's
+        # finish was delivered and buffers without it. The results are
+        # complete, so the marker settles the session on them instead of
+        # failing it -- the bytes are written and all ranks reported.
+        import kv_cache_manager.py_connector.common.tp_coordinator as tp
+
+        # The retry routine must not flush on its own here: the worker's
+        # delivery below must land before the marker does.
+        retry_patch = unittest.mock.patch.object(tp, "DEFERRED_RETRY_SECONDS", 30)
+        retry_patch.start()
+        self.addCleanup(retry_patch.stop)
+        scheduler = self._client()
+        with unittest.mock.patch.object(tp, "DEFERRED_EVENT_LIMIT", 1):
+            scheduler.send(self._start_event("req-1", "sess-1", num_blocks=2))
+            scheduler.send(self._start_event("req-2", "sess-2"))
+            self.assertEqual(1, len(scheduler._dropped_sessions))
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record, "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        # The worker's queue never overflowed: its finish is delivered, and
+        # with no start it buffers in pending_save_finishes. A throwaway
+        # session on the same socket proves the delivery landed before the
+        # marker (per-socket FIFO), so the settle sees the buffered result.
+        worker = self._client()
+        worker.send(self._finish_event("req-1", "sess-1", [True, True]))
+        worker.send(self._start_event("req-P", "sess-P"))
+        worker.send(self._finish_event("req-P", "sess-P", [True]))
+        self._drain_until_saving("req-P")
+        # The scheduler's next send flushes the marker ahead of survivors.
+        scheduler.send(self._start_event("req-3", "sess-3"))
+        self._drain_until_saving("req-1")
+        settled = {session: context for session, context in self.settled}
+        self.assertIn("sess-1", settled)
+        context = settled["sess-1"]
+        self.assertEqual({0: [True, True]}, context.result_per_rank)
+        self.assertEqual(2, len(context.locations))
+
+    def test_a_dropped_load_event_fails_its_request(self):
+        # A load session's reports travel per rank; dropping one leaves the
+        # rest pinned in running_load with the request never reported. The
+        # marker fails the request (its block ids are gone, so the failure is
+        # request-granular) and reports it finished receiving. No further
+        # traffic is needed: the client's own retry flushes the marker.
+        import kv_cache_manager.py_connector.common.tp_coordinator as tp
+
+        retry_patch = unittest.mock.patch.object(tp, "DEFERRED_RETRY_SECONDS", 0.05)
+        retry_patch.start()
+        self.addCleanup(retry_patch.stop)
+        worker = self._client()
+        with unittest.mock.patch.object(tp, "DEFERRED_EVENT_LIMIT", 1):
+            worker.send(self._load_event("req-1", epoch=7))
+            worker.send(self._load_event("req-2", epoch=8))
+            self.assertEqual(1, len(worker._dropped_sessions))
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record, "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        finished_loading = []
+        deadline = time.time() + 5.0
+        while time.time() < deadline and len(finished_loading) < 2:
+            _, loading = self.server_b.get_finished_tasks()
+            finished_loading.extend(loading)
+            time.sleep(0.01)
+        # The marker (flushed ahead of the survivor) fails req-1's load at
+        # request granularity; the surviving report completes req-2 normally.
+        self.assertEqual(["req-1", "req-2"], finished_loading)
+        self.assertEqual({"req-1"}, self.server_b.get_failed_loading_requests())
+        self.assertEqual([], self.server_b.get_finished_tasks()[0])
 
 
 if __name__ == "__main__":

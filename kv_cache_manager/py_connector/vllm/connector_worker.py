@@ -339,6 +339,31 @@ class _CaptureLedger:
                 released += 1
             return released
 
+    def release_staged_keys(
+        self, req_id: str, keys: "Sequence[Tuple[str, int]]"
+    ) -> int:
+        """Release exactly these (spec, block) captures (returns how many).
+
+        The verdict-derived release must be spec-exact: a session's verdict
+        confirms a block position through the AND over the groups that had
+        data for it, so a windowed group that abstained (its window already
+        slid past the block) contributes nothing to the mask and the committed
+        location carries no spec of it -- releasing by block number alone
+        would free a *newer* capture of that block whose spec nobody committed,
+        leaving the promoted retry with a URI and no bytes.
+        """
+        with self._lock:
+            staged = self.staged.get(req_id)
+            if not staged:
+                return 0
+            released = 0
+            for key in keys:
+                capture = staged.pop(key, None)
+                if capture is not None:
+                    self._release(capture)
+                    released += 1
+            return released
+
     def holds(self, req_id: str) -> bool:
         """Does this request still own any staged or in-flight entry?"""
         with self._lock:
@@ -464,12 +489,14 @@ class ConnectorWorker:
         # can only make a release more conservative.
         self._block_uris = self._captures.block_uris
         # Sessions whose local success is not yet the global verdict (tp > 1,
-        # this rank is not the coordinator): req_id -> session id -> blocks
-        # whose bytes this rank keeps until the coordinator says committed, and
-        # which therefore have to be rechecked (see _recheck_pending_verdicts).
-        # The coordinator runs in another process (the task's engine core), so
-        # the answer is a query, not shared memory.
-        self._verdict_pending: Dict[str, Dict[str, List[int]]] = {}
+        # this rank is not the coordinator): req_id -> session id -> per
+        # announced position, the (window spec, block) captures this session
+        # actually wrote (abstained positions stay empty and are never
+        # released by this session's verdict), which therefore have to be
+        # rechecked (see _recheck_pending_verdicts). The coordinator runs in
+        # another process (the task's engine core), so the answer is a query,
+        # not shared memory.
+        self._verdict_pending: Dict[str, Dict[str, List[List[Tuple[str, int]]]]] = {}
         # Settles run on I/O threads and the recheck on the engine thread: one
         # lock guards every add/remove/iterate (a callback that adds a session
         # between the emptiness test and the pop would lose it, and its
@@ -561,6 +588,23 @@ class ConnectorWorker:
     # ------------------------------------------------------------------ #
     # Storage config plumbing
     # ------------------------------------------------------------------ #
+    def shutdown(self) -> None:
+        """Release the coordinator (its server, then this rank's client).
+
+        tp0's coordinator server stops first: a completion it is processing
+        right now still calls finish_write_cache on the manager client, which
+        stays open until the connector-level shutdown closes it. The client's
+        shutdown then stops the deferred-event retry thread and frees its
+        context -- without it, a connector rebuilt while its coordinator is
+        unavailable leaves one active retry loop (thread, context, socket and
+        queued events) behind per reload, flushing stale events if the old
+        identity ever answers again.
+        """
+        server = getattr(self, "_coordinator_server", None)
+        if server is not None:
+            server.shutdown()
+        self._coordinator_client.shutdown()
+
     def parse_hf3fs_configs(self, storage_configs: str) -> List[Dict[str, Any]]:
         hf3fs_configs: List[Dict[str, Any]] = []
         storage_configs_json = json.loads(storage_configs)
@@ -957,15 +1001,24 @@ class ConnectorWorker:
                     getattr(save_req, "write_session_id", None)
                     or str(save_req.session_id)
                 )
-                ordered: List[int] = []
-                for plan in plans:
-                    if getattr(plan.group, "retention", None) is None:
-                        continue
-                    ordered = [
-                        save_req.manager_block_idxes[pos]
-                        for pos in range(len(plan.staged_slots or ()))
-                    ]
-                    break
+                # 逐位只记本会话真正交出的捕获，精确到 (窗口 spec, block)：
+                # verdict 的位是会话的通告序号，弃权位（窗口已滑走、该 spec
+                # 无捕获）绝不入账。弃权位的 verdict 可因非窗口组的成功而为
+                # True——按块号 release 会放走更新的重算捕获，而提交的位置里
+                # 并没有该窗口 spec；把这类块留在账外，它就只能由真正捕获了
+                # 它的会话（或退休）来释放。
+                session_captures: List[List[Tuple[str, int]]] = [
+                    [] for _ in range(num_blocks)
+                ]
+                for _, windowed_plan in windowed:
+                    for pos, slot in enumerate(windowed_plan.staged_slots):
+                        if slot is not None:
+                            session_captures[pos].append(
+                                (
+                                    windowed_plan.group.spec_name,
+                                    save_req.manager_block_idxes[pos],
+                                )
+                            )
                 # One section for the whole transition: the settle that moves
                 # the bytes, the key cleanup that reads its result, and the
                 # verdict bookkeeping that follows it. Retirement runs the
@@ -981,10 +1034,10 @@ class ConnectorWorker:
                     )
                     self._captures.drop_uris_if_idle(save_req.req_id)
                     retired = save_req.req_id in self._retired_requests
-                    if not retired and ordered:
+                    if not retired and any(session_captures):
                         self._verdict_pending.setdefault(save_req.req_id, {})[
                             session_key
-                        ] = ordered
+                        ] = session_captures
                     if (
                         retired
                         and not self._verdict_pending.get(save_req.req_id)
@@ -1004,9 +1057,9 @@ class ConnectorWorker:
                     # only other place that clears them).
                     for rank in range(self._tp_size):
                         self._coordinator_client.cancel_verdict(session_key, rank)
-                elif ordered:
+                elif any(session_captures):
                     self._recheck_pending_verdicts(
-                        {save_req.req_id: {session_key: ordered}}
+                        {save_req.req_id: {session_key: session_captures}}
                     )
                 failed = [key for key, ok in outcomes.items() if not ok]
                 if failed:
@@ -1045,7 +1098,7 @@ class ConnectorWorker:
             else:
                 source = {req_id: dict(items) for req_id, items in pending.items()}
         for req_id, sessions in source.items():
-            for session_id, ordered in sessions.items():
+            for session_id, positions in sessions.items():
                 verdict = self._coordinator_client.ask_verdict(
                     session_id, self._tp_rank
                 )
@@ -1062,16 +1115,19 @@ class ConnectorWorker:
                     continue  # not decided yet: recheck next step
                 # The mask follows the announced range: position i is the
                 # session's i-th block, whatever its manager block number is.
-                # A position the mask rejects keeps its bytes (a rank failed
-                # there, so the block is announced again and the retry needs
-                # them), which the retirement or that retry closes.
+                # Only the positions this session actually captured are on the
+                # books (see _settle_session_captures): the release is exact to
+                # the (window spec, block) pairs it wrote, so a committed
+                # position whose windowed group abstained cannot free a newer
+                # capture the committed location never carried.
                 committed = [
-                    ordered[i]
-                    for i in range(min(len(ordered), len(verdict)))
-                    if verdict[i]
+                    pair
+                    for i, pairs in enumerate(positions)
+                    if i < len(verdict) and verdict[i]
+                    for pair in pairs
                 ]
                 if committed:
-                    released = self._captures.release_staged(req_id, committed)
+                    released = self._captures.release_staged_keys(req_id, committed)
                     if released:
                         logger.debug(
                             "req:%s session %s: released %d captured block "
@@ -1122,7 +1178,13 @@ class ConnectorWorker:
                     )
                     break
         self._captures.release_staged(
-            req_id, [block for blocks in pending.values() for block in blocks]
+            req_id,
+            [
+                block
+                for positions in pending.values()
+                for pairs in positions
+                for _, block in pairs
+            ],
         )
 
     def _windowed_save_annotations(
@@ -1737,10 +1799,9 @@ class ConnectorWorker:
         with self._verdict_lock:
             awaiting = {
                 block
-                for session_blocks in (
-                    self._verdict_pending.get(req_id) or {}
-                ).values()
-                for block in session_blocks
+                for positions in (self._verdict_pending.get(req_id) or {}).values()
+                for pairs in positions
+                for _, block in pairs
             }
             releasable = []
             for block in blocks:
@@ -1871,6 +1932,13 @@ class ConnectorWorker:
     def on_save_finished(
         self, write_session_id: str, save_context: SaveContext
     ) -> None:
+        # 未报到过的 rank 按全失败参与 AND：整席退役的会话（协调者溢出标记）
+        # 只有部分 rank 的结果，缺席位不得被当成成功——裁决声称了被丢事件
+        # 可能失败的块，就会让各 rank 释放唯一字节。
+        for rank in range(self._tp_size):
+            save_context.result_per_rank.setdefault(
+                rank, [False] * len(save_context.locations)
+            )
         for block_idx in range(len(save_context.locations)):
             fully_saved = all(
                 save_context.result_per_rank[rank][block_idx]
@@ -1883,41 +1951,53 @@ class ConnectorWorker:
             write_session_id,
         )
         committed = True
-        report = {
-            "trace_id": "finish_%s" % write_session_id[:8],
-            "instance_id": self._extra_config.instance_id,
-            "write_session_id": write_session_id,
-            "success_blocks": {"bool_masks": {"values": save_context.success_mask}},
-        }
-        for attempt in range(FINISH_WRITE_CACHE_ATTEMPTS):
-            try:
-                self._manager_client.finish_write_cache(report)
-                break
-            except Exception as e:
-                if attempt + 1 >= FINISH_WRITE_CACHE_ATTEMPTS:
-                    # Gave up: the manager may still hold these blocks
-                    # uncommitted, so nothing is released (a retry has to find
-                    # the bytes) and the verdict is not published -- publishing
-                    # it would let every rank release its only captured copy of
-                    # blocks the manager never committed.
-                    committed = False
+        if save_context.locations:
+            report = {
+                "trace_id": "finish_%s" % write_session_id[:8],
+                "instance_id": self._extra_config.instance_id,
+                "write_session_id": write_session_id,
+                "success_blocks": {"bool_masks": {"values": save_context.success_mask}},
+            }
+            for attempt in range(FINISH_WRITE_CACHE_ATTEMPTS):
+                try:
+                    self._manager_client.finish_write_cache(report)
+                    break
+                except Exception as e:
+                    if attempt + 1 >= FINISH_WRITE_CACHE_ATTEMPTS:
+                        # Gave up: the manager may still hold these blocks
+                        # uncommitted, so nothing is released (a retry has to find
+                        # the bytes) and the verdict is not published -- publishing
+                        # it would let every rank release its only captured copy of
+                        # blocks the manager never committed.
+                        committed = False
+                        logger.warning(
+                            "finish_write_cache failed after %d attempts, session: "
+                            "%s, error: %s",
+                            FINISH_WRITE_CACHE_ATTEMPTS,
+                            write_session_id,
+                            e,
+                        )
+                        break
                     logger.warning(
-                        "finish_write_cache failed after %d attempts, session: "
-                        "%s, error: %s",
+                        "finish_write_cache failed (attempt %d/%d), retrying: "
+                        "session %s, error: %s",
+                        attempt + 1,
                         FINISH_WRITE_CACHE_ATTEMPTS,
                         write_session_id,
                         e,
                     )
-                    break
-                logger.warning(
-                    "finish_write_cache failed (attempt %d/%d), retrying: "
-                    "session %s, error: %s",
-                    attempt + 1,
-                    FINISH_WRITE_CACHE_ATTEMPTS,
-                    write_session_id,
-                    e,
-                )
-                time.sleep(FINISH_WRITE_CACHE_RETRY_SECONDS)
+                    time.sleep(FINISH_WRITE_CACHE_RETRY_SECONDS)
+        else:
+            # 会话在协调者一无所知时被整席退役（start 与 finish 都被丢弃）：
+            # 无结果可报，manager 侧由写会话自身的超时回滚；这里仍要发布
+            # “空提交”的裁决，让等待该会话的 pending verdict 落定为
+            # “无提交位”，而不是每步重问直到退休。
+            logger.warning(
+                "session %s settled with nothing known; publishing an empty "
+                "verdict (the manager's own write-session timeout rolls it "
+                "back)",
+                write_session_id,
+            )
 
         # The verdict is published, not acted on: releasing here would race
         # this rank's own settle (the last report may be its own task, whose

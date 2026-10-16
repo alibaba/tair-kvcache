@@ -4,7 +4,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import zmq
 
@@ -44,8 +44,31 @@ class LoadBlockFinishedEvent:
     type: str = "LoadBlockFinishedEvent"
 
 
+@dataclass
+class SessionFailedEvent:
+    """A session this client retired when its defer queue overflowed.
+
+    The cap may only retire WHOLE sessions, and a retirement must be
+    reported: a save's start lives in the scheduler's client queue while each
+    rank's finish lives in its own, so the queues overflow independently and
+    dropping one event silently would leave the server a finish without its
+    start (pinned in ``pending_save_finishes``) or a start waiting for
+    finishes that were dropped (pinned in ``running_save``, the request's
+    ``_pending_saves`` never reaching zero). The marker travels ahead of the
+    surviving events once the endpoint resolves, so the server fails -- or,
+    when every rank's result had already arrived, settles -- the session
+    coherently instead of assembling a partial one.
+    """
+
+    request_id: str
+    # Save sessions carry write_session_id; load sessions carry epoch.
+    write_session_id: Optional[str] = None
+    epoch: Optional[int] = None
+    type: str = "SessionFailedEvent"
+
+
 CoordinateEventUnion = Union[
-    SendBlockFinishedEvent, LoadBlockFinishedEvent, SendBlockStartEvent
+    SendBlockFinishedEvent, LoadBlockFinishedEvent, SendBlockStartEvent, SessionFailedEvent
 ]
 
 #: How many consecutive ports the coordinator may try when the configured one
@@ -80,6 +103,19 @@ VERDICT_CANCEL_LIMIT = 4096
 #: degradation a dead coordinator always caused.
 DEFERRED_EVENT_LIMIT = 4096
 
+#: How many dropped-session failure markers the client remembers between the
+#: drop and the flush (see TpCoordinatorClient._defer_event_locked). One per
+#: retired session; beyond the cap the oldest go and their sessions' late
+#: events pin the server's buffers -- the same bounded degradation every
+#: coordinator table here accepts.
+DEFERRED_SESSION_MARKER_LIMIT = 4096
+
+#: How many retired sessions the server remembers (see
+#: TpCoordinatorServer.coordinator_routine): their start/finish events may
+#: still arrive from other clients' queues, and must be dropped rather than
+#: resurrect a session the marker already settled. Oldest half beyond the cap.
+FAILED_SESSION_LIMIT = 4096
+
 #: How often a client that is holding deferred events re-probes for its
 #: coordinator (see TpCoordinatorClient._deferred_retry_routine). The queue
 #: must not depend on later connector traffic: a full-attention session never
@@ -101,6 +137,7 @@ msg_type_mapping: Dict[str, type] = {
     "SendBlockStartEvent": SendBlockStartEvent,
     "SendBlockFinishedEvent": SendBlockFinishedEvent,
     "LoadBlockFinishedEvent": LoadBlockFinishedEvent,
+    "SessionFailedEvent": SessionFailedEvent,
 }
 
 
@@ -334,6 +371,99 @@ class TpCoordinatorServer:
         running_save: Dict[RunningId, SaveContext] = {}
         # Buffer for SendBlockFinishedEvent that arrives before SendBlockStartEvent
         pending_save_finishes: Dict[RunningId, List[SendBlockFinishedEvent]] = {}
+        # Sessions settled by a SessionFailedEvent (a client retired them when
+        # its defer queue overflowed): their late events -- a start arriving
+        # after the marker, a finish from another client's queue -- must be
+        # dropped rather than resurrect a session already settled. Ordered set,
+        # oldest half dropped beyond FAILED_SESSION_LIMIT.
+        failed_sessions: Dict[RunningId, None] = {}
+
+        def remember_failed_session(session_id: RunningId) -> None:
+            failed_sessions[session_id] = None
+            if len(failed_sessions) <= FAILED_SESSION_LIMIT:
+                return
+            for stale in list(failed_sessions)[: FAILED_SESSION_LIMIT // 2]:
+                failed_sessions.pop(stale, None)
+            logger.warning(
+                "[coordinator] dropped %d retired-session marks (limit %d); "
+                "their late events will buffer again",
+                FAILED_SESSION_LIMIT // 2,
+                FAILED_SESSION_LIMIT,
+            )
+
+        def settle_save_session(
+            save_id: RunningId, write_session_id: str, request_id: str
+        ) -> None:
+            """Complete a save session the coordinator can no longer aggregate.
+
+            A marker settles the session whatever arrived. The start and the
+            finishes live in different clients' queues, so either half may be
+            the one that survived: with every rank's finish buffered (only the
+            start was dropped) the results are complete and the session
+            settles on them; otherwise it settles as failed -- a partial
+            session must never be published, and the request's completion
+            (``_pending_saves``) must not wait for ranks whose events were
+            dropped.
+            """
+            buffered = pending_save_finishes.pop(save_id, None) or []
+            save_context = running_save.pop(save_id, None)
+            reported = len(buffered) + (
+                len(save_context.result_per_rank) if save_context else 0
+            )
+            if save_context is None:
+                # No start ever arrived: rebuild the mask length from a
+                # finish (the report and the manager's own session records
+                # key on the session id, not on these locations).
+                save_context = SaveContext(
+                    locations=[
+                        {} for _ in range(len(buffered[0].is_success_list) if buffered else 0)
+                    ]
+                )
+            if len(buffered) == self._tp_world_size and self._tp_world_size > 0:
+                save_context = SaveContext(
+                    locations=list(save_context.locations),
+                    result_per_rank={
+                        finish.tp_rank: finish.is_success_list for finish in buffered
+                    },
+                )
+                logger.warning(
+                    "[coordinator] session %s (request %s) was retired by a "
+                    "client after every rank reported; settling it on the "
+                    "reported results",
+                    write_session_id,
+                    request_id,
+                )
+            else:
+                # Ranks whose finish never arrived read as failed downstream
+                # (on_save_finished): the verdict must not claim blocks a
+                # dropped event might have failed.
+                logger.warning(
+                    "[coordinator] session %s (request %s) was retired by a "
+                    "client with %d/%d rank(s) reported; settling it as "
+                    "failed",
+                    write_session_id,
+                    request_id,
+                    reported,
+                    self._tp_world_size,
+                )
+            self._on_finished_callback(write_session_id, save_context)
+            with self._finished_saving_lock:
+                self._finished_saving.append(request_id)
+
+        def settle_load_session(load_id: RunningId, request_id: str) -> None:
+            """Fail a load session a marker retired: its block ids are gone,
+            so the failure is reported at request granularity (the same
+            any-rank-failure semantics of LoadBlockFinishedEvent)."""
+            running_load.pop(load_id, None)
+            with self._finished_loading_lock:
+                self._failed_loading_requests.append(request_id)
+                self._finished_loading.append(request_id)
+            logger.warning(
+                "[coordinator] load session %s (request %s) was retired by a "
+                "client; reporting the request's load as failed",
+                load_id,
+                request_id,
+            )
 
         def complete_save_if_ready(
             save_id: RunningId, write_session_id: str, request_id: str
@@ -369,6 +499,8 @@ class TpCoordinatorServer:
             if isinstance(msg.content, SendBlockStartEvent):
                 content: SendBlockStartEvent = msg.content
                 save_id = RunningId(content.write_session_id, content.request_id)
+                if save_id in failed_sessions:
+                    continue
                 if save_id not in running_save:
                     running_save[save_id] = SaveContext(content.locations)
 
@@ -387,6 +519,8 @@ class TpCoordinatorServer:
                 content: SendBlockFinishedEvent = msg.content
                 save_id = RunningId(content.write_session_id, content.request_id)
 
+                if save_id in failed_sessions:
+                    continue
                 if save_id not in running_save:
                     # Start event hasn't arrived yet, buffer this finish
                     if save_id not in pending_save_finishes:
@@ -402,6 +536,8 @@ class TpCoordinatorServer:
             elif isinstance(msg.content, LoadBlockFinishedEvent):
                 content: LoadBlockFinishedEvent = msg.content
                 load_id = RunningId(str(content.epoch), content.request_id)
+                if load_id in failed_sessions:
+                    continue
                 if load_id not in running_load:
                     running_load[load_id] = LoadContext()
                 load_ctx = running_load[load_id]
@@ -418,6 +554,22 @@ class TpCoordinatorServer:
                     self._finished_loading.append(content.request_id)
                     self._finished_loading_lock.release()
                     # logger.warning("[coordinator] all rank finished load_blocks_finished %s", load_id)
+            elif isinstance(msg.content, SessionFailedEvent):
+                content: SessionFailedEvent = msg.content
+                if content.write_session_id is not None:
+                    save_id = RunningId(content.write_session_id, content.request_id)
+                    if save_id in failed_sessions:
+                        continue
+                    remember_failed_session(save_id)
+                    settle_save_session(
+                        save_id, content.write_session_id, content.request_id
+                    )
+                elif content.epoch is not None:
+                    load_id = RunningId(str(content.epoch), content.request_id)
+                    if load_id in failed_sessions:
+                        continue
+                    remember_failed_session(load_id)
+                    settle_load_session(load_id, content.request_id)
             else:
                 logger.warning("[coordinator] received wrong msg: %s", msg)
 
@@ -676,6 +828,12 @@ class TpCoordinatorClient:
         # are flushed, in order, to the first coordinator of this instance
         # that answers, so a startup race loses nothing.
         self._pending_events: "deque[bytes]" = deque()
+        # Sessions the defer cap retired (see _defer_event_locked), keyed by
+        # (request id, session token) as an ordered set: their failure marker
+        # travels ahead of the surviving events when the endpoint resolves,
+        # so the server settles the whole session instead of assembling a
+        # partial one out of what other clients' queues delivered.
+        self._dropped_sessions: "Dict[Tuple[str, str], SessionFailedEvent]" = {}
         # The independent retry for those events (see
         # _deferred_retry_routine): set when the first event is deferred,
         # joined by shutdown().
@@ -720,10 +878,11 @@ class TpCoordinatorClient:
         self._pending_events.append(param)
         while len(self._pending_events) > DEFERRED_EVENT_LIMIT:
             dropped = self._pending_events.popleft()
+            self._remember_dropped_session_locked(dropped)
             logger.warning(
-                "TairKvCacheConnector: deferred events beyond %d; dropping "
-                "the oldest (%d bytes) -- no coordinator of instance %r "
-                "answered on ports %d-%d",
+                "TairKvCacheConnector: deferred events beyond %d; retiring "
+                "the oldest event's whole session (%d bytes) -- no "
+                "coordinator of instance %r answered on ports %d-%d",
                 DEFERRED_EVENT_LIMIT,
                 len(dropped),
                 self._instance_id,
@@ -744,10 +903,71 @@ class TpCoordinatorClient:
         # _deferred_retry_routine).
         self._ensure_retry_thread_locked()
 
+    def _remember_dropped_session_locked(self, dropped: bytes) -> None:
+        """Record the session an overflowed event belonged to.
+
+        Each client queue holds at most one event per session (the scheduler
+        sends the start, each rank its own finish/load report), so retiring
+        the event retires the session's whole presence in THIS queue -- but
+        the session's other events travel in other queues and may still be
+        delivered. The marker tells the server to settle the session as a
+        unit; without it a finish without its start (or a start whose
+        finishes were dropped) would pin the server's buffers and the
+        request's ``_pending_saves`` forever.
+        """
+        try:
+            content = CoordinateMsgSerializer.loads(dropped).content
+        except Exception:
+            logger.warning(
+                "TairKvCacheConnector: dropped an unidentifiable deferred "
+                "event (%d bytes); no failure marker can be sent for it",
+                len(dropped),
+            )
+            return
+        marker: Optional[SessionFailedEvent] = None
+        if isinstance(content, (SendBlockStartEvent, SendBlockFinishedEvent)):
+            marker = SessionFailedEvent(
+                request_id=content.request_id,
+                write_session_id=content.write_session_id,
+            )
+        elif isinstance(content, LoadBlockFinishedEvent):
+            marker = SessionFailedEvent(
+                request_id=content.request_id, epoch=content.epoch
+            )
+        if marker is None:
+            return
+        token = marker.write_session_id or ("epoch:%d" % (marker.epoch or 0))
+        self._dropped_sessions.pop((marker.request_id, token), None)
+        self._dropped_sessions[(marker.request_id, token)] = marker
+        if len(self._dropped_sessions) > DEFERRED_SESSION_MARKER_LIMIT:
+            stale = list(self._dropped_sessions)[
+                : len(self._dropped_sessions) - DEFERRED_SESSION_MARKER_LIMIT // 2
+            ]
+            for key in stale:
+                self._dropped_sessions.pop(key, None)
+            logger.warning(
+                "TairKvCacheConnector: dropped %d retired-session markers "
+                "(limit %d); those sessions' late events will buffer on the "
+                "server again",
+                len(stale),
+                DEFERRED_SESSION_MARKER_LIMIT,
+            )
+
     def _flush_pending_locked(self) -> None:
         """Deliver the deferred events to the endpoint a probe just resolved."""
-        if not self._pending_events:
+        if not self._pending_events and not self._dropped_sessions:
             return
+        # The retired sessions' markers go first, so the server settles them
+        # before -- and independently of -- anything that survived here or in
+        # another client's queue; a failure of the flush leaves un-sent
+        # markers recorded for the next attempt.
+        while self._dropped_sessions:
+            key = next(iter(self._dropped_sessions))
+            marker = self._dropped_sessions[key]
+            self._socket.send(
+                CoordinateMsgSerializer.dumps(CoordinateMessage(time.time(), marker))
+            )
+            del self._dropped_sessions[key]
         held = len(self._pending_events)
         while self._pending_events:
             self._socket.send(self._pending_events.popleft())

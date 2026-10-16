@@ -205,6 +205,12 @@ class ConnectorScheduler:
         self._load_attempted: set = set()
 
     def shutdown(self) -> None:
+        # The coordinator client goes first: its deferred-event retry thread
+        # must stop before the process lets go of anything it could still
+        # probe, and a connector rebuilt while its coordinator stays
+        # unavailable must not leave the old thread (with its ZeroMQ context
+        # and queued events) behind.
+        self._coordinator_client.shutdown()
         self._location_query_manager.shutdown()
         self._http_executor.shutdown(wait=False)
 

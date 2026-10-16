@@ -197,24 +197,79 @@ void WriteLocationManager::Put(const std::string &write_session_id,
 }
 
 bool WriteLocationManager::GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info) {
-    return session_id_map_.GetAndDelete(write_session_id, location_info);
+    // 首个 finish 在删会话之前登记 in-progress：并发的幂等重试若观察到会话
+    // 已删而结果未记（GetAndDelete 之后、PutFinishedMask 之前），凭标记等待
+    // 首次应用落定，而不是被误判为“会话不存在”而耗尽重试。标记先于删除、
+    // 删除在锁下原子生效，故该顺序对任何观察者成立。
+    MarkFinishInProgress(write_session_id);
+    if (!session_id_map_.GetAndDelete(write_session_id, location_info)) {
+        UnmarkFinishInProgress(write_session_id);
+        return false;
+    }
+    return true;
+}
+
+void WriteLocationManager::MarkFinishInProgress(const std::string &write_session_id) {
+    std::lock_guard<std::mutex> lock(finished_mux_);
+    ++finish_in_progress_[write_session_id];
+}
+
+void WriteLocationManager::UnmarkFinishInProgress(const std::string &write_session_id) {
+    std::lock_guard<std::mutex> lock(finished_mux_);
+    auto it = finish_in_progress_.find(write_session_id);
+    if (it == finish_in_progress_.end()) {
+        return;
+    }
+    if (--it->second == 0) {
+        // 撤销后可能已无任何应用者：唤醒按“标记消失”等待的重试，让它们
+        // 立刻重读结果而不是空等满超时。
+        finish_in_progress_.erase(it);
+        finish_cv_.notify_all();
+    }
+}
+
+void WriteLocationManager::ResolveFinish(const std::string &write_session_id) {
+    std::lock_guard<std::mutex> lock(finished_mux_);
+    finish_in_progress_.erase(write_session_id);
+    finish_cv_.notify_all();
+}
+
+bool WriteLocationManager::WaitFinishedMask(const std::string &write_session_id,
+                                            std::chrono::milliseconds timeout,
+                                            std::vector<bool> &applied_mask) {
+    std::unique_lock<std::mutex> lock(finished_mux_);
+    if (finish_in_progress_.find(write_session_id) != finish_in_progress_.end()) {
+        finish_cv_.wait_for(
+            lock, timeout, [&] { return finish_in_progress_.find(write_session_id) == finish_in_progress_.end(); });
+    }
+    auto it = finished_masks_.find(write_session_id);
+    if (it == finished_masks_.end()) {
+        return false;
+    }
+    applied_mask = it->second;
+    return true;
 }
 
 void WriteLocationManager::PutFinishedMask(const std::string &write_session_id, std::vector<bool> applied_mask) {
-    std::lock_guard<std::mutex> lock(finished_mux_);
-    if (finished_masks_.emplace(write_session_id, std::move(applied_mask)).second) {
-        finished_order_.push_back(write_session_id);
-        if (finished_order_.size() > kFinishedMaskLimit) {
-            const size_t drop = finished_order_.size() - kFinishedMaskLimit / 2;
-            for (size_t i = 0; i < drop; i++) {
-                finished_masks_.erase(finished_order_.front());
-                finished_order_.pop_front();
+    {
+        std::lock_guard<std::mutex> lock(finished_mux_);
+        if (finished_masks_.emplace(write_session_id, std::move(applied_mask)).second) {
+            finished_order_.push_back(write_session_id);
+            if (finished_order_.size() > kFinishedMaskLimit) {
+                const size_t drop = finished_order_.size() - kFinishedMaskLimit / 2;
+                for (size_t i = 0; i < drop; i++) {
+                    finished_masks_.erase(finished_order_.front());
+                    finished_order_.pop_front();
+                }
+                KVCM_LOG_WARN(
+                    "Dropped %zu finished write_session records (limit %zu): their retries read \"not found\"",
+                    drop,
+                    kFinishedMaskLimit);
             }
-            KVCM_LOG_WARN("Dropped %zu finished write_session records (limit %zu): their retries read \"not found\"",
-                          drop,
-                          kFinishedMaskLimit);
         }
     }
+    // 结果已登记：落定 in-progress，唤醒等待首请求结果的幂等重试。
+    ResolveFinish(write_session_id);
 }
 
 bool WriteLocationManager::GetFinishedMask(const std::string &write_session_id, std::vector<bool> &applied_mask) const {

@@ -357,5 +357,114 @@ class TestGoldenDrift(unittest.TestCase):
         )
 
 
+class TestShutdownWiring(unittest.TestCase):
+    """shutdown() releases the coordinator before the manager client.
+
+    The public TairKvCacheConnector.shutdown() used to stop at the scheduler
+    role's query/executor pools and the manager client: the coordinator
+    client (either role) kept its deferred-event retry thread, ZeroMQ context
+    and socket alive, so rebuilding a connector while its coordinator stays
+    unavailable accumulated one active retry loop per connector -- and an old
+    identity that became reachable again would flush stale events into it.
+    """
+
+    def _ordered(self) -> Tuple[mock.MagicMock, List[str]]:
+        """A parent mock that records shutdown calls in a shared order."""
+        parent = mock.MagicMock()
+        order: List[str] = []
+        for name in ("server", "client", "lqm", "http"):
+            child = mock.MagicMock(name=name)
+            child.shutdown.side_effect = (
+                lambda *args, n=name, **kwargs: order.append(n)
+            )
+            parent.attach_mock(child, name)
+        return parent, order
+
+    def test_scheduler_role_stops_the_coordinator_client_first(self):
+        from kv_cache_manager.py_connector.test.vllm_stubs import (
+            make_connector_scheduler,
+        )
+
+        core = make_connector_scheduler()
+        parent, order = self._ordered()
+        core._coordinator_client = parent.client
+        core._location_query_manager = parent.lqm
+        core._http_executor = parent.http
+        core.shutdown()
+        self.assertEqual(["client", "lqm", "http"], order)
+
+    def test_worker_role_stops_the_coordinator_server_then_client(self):
+        from kv_cache_manager.py_connector.vllm.connector_worker import (
+            ConnectorWorker,
+        )
+
+        worker = ConnectorWorker.__new__(ConnectorWorker)
+        parent, order = self._ordered()
+        worker._coordinator_server = parent.server
+        worker._coordinator_client = parent.client
+        worker.shutdown()
+        # The server stops first: a completion it is processing still reports
+        # to the manager, whose client is only closed after the role's
+        # shutdown returns.
+        self.assertEqual(["server", "client"], order)
+
+    def test_a_rank_without_a_coordinator_server_still_shuts_the_client(self):
+        # Only tp0 runs a coordinator server; every other rank's worker has
+        # no attribute to stop, and its client must still be released.
+        from kv_cache_manager.py_connector.vllm.connector_worker import (
+            ConnectorWorker,
+        )
+
+        worker = ConnectorWorker.__new__(ConnectorWorker)
+        worker._coordinator_client = mock.MagicMock()
+        worker.shutdown()
+        worker._coordinator_client.shutdown.assert_called_once()
+
+    def test_the_connector_shuts_the_role_down_before_the_manager_client(self):
+        # The public entry point, per role: the role object (which owns the
+        # coordinator) is released while the manager client is still open,
+        # and the manager client closes last.
+        _RoleSpy.instances = []
+        manager = _FakeManagerClient()
+        order: List[str] = []
+
+        class _ShutdownSpy:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                self.args = args
+
+            def shutdown(self) -> None:
+                order.append("role")
+
+        manager.close = lambda: order.append("manager")
+        _, group = _worker_view()
+        with mock.patch.object(
+            v1_connector.KvCacheManagerClient,
+            "from_connector_config",
+            return_value=manager,
+        ):
+            with mock.patch.object(
+                v1_connector, "TpCoordinatorClient", return_value=mock.MagicMock()
+            ):
+                with mock.patch.object(
+                    v1_connector, "ConnectorScheduler", _ShutdownSpy
+                ):
+                    with mock.patch.object(
+                        v1_connector, "ConnectorWorker", _ShutdownSpy
+                    ):
+                        config: Any = SimpleNamespace(kv_cache_groups=[group])
+                        connector = v1_connector.TairKvCacheConnector(
+                            _vllm_config(), KVConnectorRole.SCHEDULER, config
+                        )
+                        connector.shutdown()
+                        self.assertEqual(["role", "manager"], order)
+
+                        order.clear()
+                        connector = v1_connector.TairKvCacheConnector(
+                            _vllm_config(), KVConnectorRole.WORKER, config
+                        )
+                        connector.shutdown()
+                        self.assertEqual(["role", "manager"], order)
+
+
 if __name__ == "__main__":
     unittest.main()

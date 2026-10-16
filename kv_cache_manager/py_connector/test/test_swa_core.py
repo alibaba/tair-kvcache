@@ -247,6 +247,13 @@ def worker_with(groups: List[AttentionTransferGroup], dtm: Any = None) -> Any:
     return conn
 
 
+def pending_positions(blocks: List[int], spec: str = "tp0_g0"):
+    """Verdict bookkeeping for one session: per announced position, the
+    (window spec, block) captures that session actually wrote (see
+    _settle_session_captures)."""
+    return [[(spec, block)] for block in blocks]
+
+
 def captured_worker(
     blocks: List[int],
     table: List[int],
@@ -2486,6 +2493,137 @@ class TestCommitConfirmation(unittest.TestCase):
         self.assertEqual({}, conn._block_uris.get("r0", {}))
 
 
+class TestVerdictBookkeeping(unittest.TestCase):
+    """A pending verdict releases only the captures its session wrote.
+
+    The review's shape: an older session announces a block after its window
+    data was already gone -- its windowed plan is all ``None`` slots and
+    abstains -- while the non-windowed groups write the block fine, so the
+    verdict's position is True. Bookkeeping keyed on the announced range
+    would release by block number and free a *newer* capture of that block
+    (the preemption's recompute) whose window spec the committed location
+    never carried; the promoted retry would then hold an allocated window
+    URI with no bytes, and once the window moved again the only publishable
+    copy is gone.
+    """
+
+    CAPACITY = 4
+
+    def _fixture(self, tp_size: int = 1):
+        import kv_cache_manager.py_connector.vllm.data_transfer as dt
+
+        patcher = mock.patch.object(dt, "batch_gather_scatter_helper")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        windowed = windowed_group(spec_name="tp0_g0", group_idx=0)
+        full = replace(windowed_group(spec_name="tp0_g1", group_idx=1), retention=None)
+        pool = _StagingPool(
+            torch.device("cpu"), windowed.per_block_bytes, self.CAPACITY
+        )
+        full_pool = _StagingPool(torch.device("cpu"), full.per_block_bytes, 2)
+        dtm = DataTransferManager.__new__(DataTransferManager)
+        dtm._pools = {windowed.spec_name: pool, full.spec_name: full_pool}
+        dtm._manager_block_size = MBS
+        dtm._device_mod = MagicMock()
+        # The full-attention group gathers through a stream like production.
+        dtm._save_stream = MagicMock()
+        dtm._transfer_client = MagicMock()
+        dtm._transfer_client.SaveKvCaches.return_value = [0]
+        dtm._extra_config = SimpleNamespace(block_per_save_task=8, block_per_load_task=8)
+        dtm._io_executor = ThreadPoolExecutor(max_workers=2)
+        conn = worker_with([windowed, full], dtm)
+        conn._pending_saves = {}
+        conn._device_mod = MagicMock()
+        conn._tp_rank = 0
+        conn._tp_size = tp_size
+        conn._manager_client = MagicMock()
+        conn._extra_config = SimpleNamespace(instance_id="test")
+        # The save-done callback reports through the manager's coordinator
+        # client (the same object the worker owns in production).
+        dtm._coordinator_client = conn._coordinator_client
+        return conn, dtm, pool, windowed, full
+
+    def _save(self, conn, spec_names_per_block, session, write_session_id):
+        """Run one save session whose locations claim the given specs per block."""
+        blocks = list(range(len(spec_names_per_block)))
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_save_request(
+            SaveRequest(
+                req_id="r0",
+                write_session_id=write_session_id,
+                manager_block_idxes=blocks,
+                all_block_ids=[list(range(7, 11)), list(range(7, 11))],
+                target_locations=locations(spec_names_per_block),
+                session_id=session,
+            )
+        )
+        conn.wait_for_save(meta)
+        # The session's finish event is sent after the settle and the verdict
+        # bookkeeping have run (the wrapper settles first, reports after), so
+        # waiting for it is waiting for the whole callback: a session that
+        # took no capture leaves nothing in flight to drain.
+        deadline = time.time() + 5
+        while time.time() < deadline and not conn._coordinator_client.send.call_count:
+            time.sleep(0.01)
+        self.assertTrue(
+            conn._coordinator_client.send.called, "the save session never reported"
+        )
+
+    def test_an_abstained_position_is_not_released_by_its_own_verdict(self):
+        # Mixed positions: position 0 was captured and written, position 1's
+        # window had already slid past (its location claims no window spec and
+        # its plan holds no bytes). A preemption's recompute captures position
+        # 1 again. The session's successful verdict -- True everywhere, since
+        # the non-windowed group wrote both blocks -- may only release what
+        # this session actually wrote: position 1's newer capture belongs to
+        # whatever session captures it next, not to this verdict.
+        conn, dtm, pool, windowed, full = self._fixture()
+        conn._captures.stage(
+            "r0", ("tp0_g0", 0), _Capture(pool=pool, slot=pool.acquire(1))
+        )
+        conn._coordinator_client.ask_verdict.return_value = None
+        self._save(
+            conn, [["tp0_g0", "tp0_g1"], ["tp0_g1"]], session=1, write_session_id="sA"
+        )
+        # The bookkeeping holds exactly the session's written capture, per
+        # announced position: the abstained position stays empty.
+        self.assertEqual([[("tp0_g0", 0)], []], conn._verdict_pending["r0"]["sA"])
+        # The preemption recomputes and recaptures position 1 (newer bytes,
+        # waiting for the session that will announce them).
+        conn._captures.stage(
+            "r0", ("tp0_g0", 1), _Capture(pool=pool, slot=pool.acquire(1))
+        )
+        self.assertEqual(2, len(conn._staged["r0"]))
+        # The older session's verdict arrives: True at both positions.
+        conn._coordinator_client.ask_verdict.return_value = [True, True]
+        conn._verdict_query_down_until = 0.0
+        conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
+        # Only the written capture is released; the committed location never
+        # carried a window spec for position 1, so its newer capture survives.
+        self.assertEqual({("tp0_g0", 1)}, set(conn._staged.get("r0", {})))
+        self.assertEqual(self.CAPACITY - 1, pool.free_blocks)
+
+    def test_an_all_abstained_session_registers_no_pending_verdict(self):
+        # The extreme of the same rule: the session announced its block after
+        # the window data was gone and its windowed plan is all None slots.
+        # Nothing it wrote awaits a verdict, so nothing is registered -- and
+        # its (non-windowed-group) success verdict can never release the
+        # newer capture a recompute staged for that block.
+        conn, dtm, pool, windowed, full = self._fixture()
+        conn._coordinator_client.ask_verdict.return_value = None
+        self._save(conn, [["tp0_g1"]], session=1, write_session_id="sA")
+        self.assertEqual({}, conn._verdict_pending.get("r0", {}))
+        # The preemption's recompute stages the block's only windowed copy.
+        conn._captures.stage(
+            "r0", ("tp0_g0", 0), _Capture(pool=pool, slot=pool.acquire(1))
+        )
+        conn._coordinator_client.ask_verdict.return_value = [True]
+        conn._verdict_query_down_until = 0.0
+        conn.wait_for_save(TairKvCacheConnectorMetadata(epoch=0))
+        self.assertEqual({("tp0_g0", 0)}, set(conn._staged.get("r0", {})))
+        self.assertEqual(self.CAPACITY - 1, pool.free_blocks)
+
+
 class TestTpVerdictRelay(unittest.TestCase):
     """TP: a rank that is not the coordinator confirms before it releases.
 
@@ -2615,12 +2753,12 @@ class TestTpVerdictRelay(unittest.TestCase):
 
     def _mapping(self, ordered, verdict):
         conn, dtm, pool, group = self._worker(tp_size=2, tp_rank=0, verdict=verdict)
-        conn._captures.release_staged = MagicMock(return_value=len(ordered))
-        conn._verdict_pending = {"r0": {"s9": list(ordered)}}
+        conn._captures.release_staged_keys = MagicMock(return_value=len(ordered))
+        conn._verdict_pending = {"r0": {"s9": pending_positions(list(ordered))}}
         conn._recheck_pending_verdicts()
         released = [
             call.args[1]
-            for call in conn._captures.release_staged.call_args_list
+            for call in conn._captures.release_staged_keys.call_args_list
             if call.args and call.args[0] == "r0"
         ]
         self.assertEqual({}, conn._verdict_pending)
@@ -2635,7 +2773,7 @@ class TestTpVerdictRelay(unittest.TestCase):
         # released. That is why the run freed one session's 96 slots and
         # stranded the other 17.
         self.assertEqual(
-            [[16, 17, 18, 19]],
+            [[("tp0_g0", b) for b in [16, 17, 18, 19]]],
             self._mapping([16, 17, 18, 19], [True, True, True, True]),
         )
 
@@ -2643,7 +2781,7 @@ class TestTpVerdictRelay(unittest.TestCase):
         # Positional in both directions: a False at position 3 must keep the
         # session's 4th block (19), not whichever block shares index 3 (3).
         self.assertEqual(
-            [[16, 17, 18]],
+            [[("tp0_g0", b) for b in [16, 17, 18]]],
             self._mapping([16, 17, 18, 19], [True, True, True, False]),
         )
 
@@ -2749,7 +2887,11 @@ class TestVerdictQueryHygiene(unittest.TestCase):
         conn._tp_size = tp_size
         conn._tp_rank = tp_rank
         conn._verdict_pending = {
-            "r0": {"s1": [0, 1], "s2": [2, 3], "s3": [4, 5]},
+            "r0": {
+                "s1": pending_positions([0, 1]),
+                "s2": pending_positions([2, 3]),
+                "s3": pending_positions([4, 5]),
+            },
         }
         conn._verdict_query_down_until = 0.0
         return conn
@@ -2776,19 +2918,21 @@ class TestVerdictQueryHygiene(unittest.TestCase):
         # pop must survive, or its captures are never rechecked and the arena
         # starves.
         conn = self._worker()
-        conn._verdict_pending = {"r0": {"s1": [0, 1]}}
+        conn._verdict_pending = {"r0": {"s1": pending_positions([0, 1])}}
 
         def ask(session_id, tp_rank=0, timeout_ms=100):
             if session_id == "s1":
                 # A settle lands while we are deciding, adding a new session.
-                conn._verdict_pending.setdefault("r0", {})["s9"] = [6, 7]
+                conn._verdict_pending.setdefault("r0", {})["s9"] = pending_positions(
+                    [6, 7]
+                )
                 return [True, True]
             return None
 
         conn._coordinator_client.ask_verdict.side_effect = ask
         conn._recheck_pending_verdicts()
         self.assertEqual(
-            {"s9": [6, 7]},
+            {"s9": pending_positions([6, 7])},
             conn._verdict_pending.get("r0", {}),
             "the session that landed during the recheck was dropped",
         )
@@ -2949,7 +3093,7 @@ class TestConfirmedReleaseRecheck(unittest.TestCase):
         # retry's only copy once the HBM window moved; the verdict recheck
         # (or the retirement) is what releases those bytes.
         conn = captured_worker([0, 1], [7, 8])
-        conn._verdict_pending = {"r0": {"sA": [0, 1]}}
+        conn._verdict_pending = {"r0": {"sA": pending_positions([0, 1])}}
         meta = TairKvCacheConnectorMetadata(epoch=0)
         meta.to_release_captures.append(("r0", [0, 1], None, True))
         conn.wait_for_save(meta)
@@ -3036,7 +3180,9 @@ class TestReleaseSettleAtomicity(unittest.TestCase):
             list(conn._staged.get("r0", {})),
             "the release freed bytes a settle had just restaged",
         )
-        self.assertEqual({"1": blocks}, conn._verdict_pending.get("r0"))
+        self.assertEqual(
+            {"1": pending_positions(blocks)}, conn._verdict_pending.get("r0")
+        )
         self.assertEqual(
             [],
             pool.released,
@@ -3360,7 +3506,9 @@ class TestWave14Hygiene(unittest.TestCase):
     # --- item 2: a successful cancel is a success, not a failure ------------
     def test_a_successful_cancel_is_not_treated_as_a_failure(self):
         conn, dtm, pool, group = self._worker()
-        conn._verdict_pending = {"r0": {"s1": [0, 1], "s2": [2, 3]}}
+        conn._verdict_pending = {
+            "r0": {"s1": pending_positions([0, 1]), "s2": pending_positions([2, 3])}
+        }
         conn._coordinator_client.cancel_verdict.return_value = True
         conn._drop_pending_verdicts("r0")
         self.assertEqual(2, conn._coordinator_client.cancel_verdict.call_count)
@@ -3579,14 +3727,20 @@ class TestLateSettleAfterRetirement(unittest.TestCase):
         # timeout per session: one failure mutes the endpoint and ends the
         # round, and a muted endpoint is not tried at all.
         conn, dtm, pool, group = self._worker()
-        conn._verdict_pending = {"r0": {"s1": [0, 1], "s2": [2, 3], "s3": [4, 5]}}
+        conn._verdict_pending = {
+            "r0": {
+                "s1": pending_positions([0, 1]),
+                "s2": pending_positions([2, 3]),
+                "s3": pending_positions([4, 5]),
+            }
+        }
         conn._coordinator_client.cancel_verdict.return_value = False
         conn._drop_pending_verdicts("r0")
         self.assertEqual(1, conn._coordinator_client.cancel_verdict.call_count)
         self.assertGreater(conn._verdict_query_down_until, time.monotonic())
 
         # Muted: the next retirement does not even try.
-        conn._verdict_pending = {"r1": {"s4": [0, 1]}}
+        conn._verdict_pending = {"r1": {"s4": pending_positions([0, 1])}}
         conn._coordinator_client.cancel_verdict.reset_mock()
         conn._drop_pending_verdicts("r1")
         self.assertEqual(0, conn._coordinator_client.cancel_verdict.call_count)
@@ -3655,7 +3809,7 @@ class TestWave16RetirementHygiene(unittest.TestCase):
         conn._captures.take("r0", 1, ("tp0_g0", 0))
         conn._captures.settle("r0", 1, {("tp0_g0", 0): True})
         self.assertEqual(1, len(conn._staged["r0"]))
-        conn._verdict_pending = {"r0": {"s1": [0]}}
+        conn._verdict_pending = {"r0": {"s1": pending_positions([0])}}
         conn._release_staged("r0")
         self.assertNotIn("r0", conn._retired_requests)
         self.assertNotIn("r0", conn._captures._retired)
@@ -3914,13 +4068,44 @@ class TestVerdictPublication(unittest.TestCase):
             "s1", [True] * self.BLOCKS
         )
 
+    def test_a_rank_that_never_reported_fails_the_session(self):
+        # A session settled by an overflow marker carries only the ranks that
+        # reported: the absent rank's verdict must read as failed. Treating
+        # the absence as success would publish blocks a dropped event may
+        # have failed, and every rank would then release its only copy.
+        conn = self._worker()
+        context = self._context()
+        context.result_per_rank = {0: [True] * self.BLOCKS}
+        conn.on_save_finished("s1", context)
+        report = conn._manager_client.finish_write_cache.call_args[0][0]
+        self.assertEqual(
+            [False] * self.BLOCKS,
+            report["success_blocks"]["bool_masks"]["values"],
+        )
+        conn._coordinator_server.record_verdict.assert_called_once_with(
+            "s1", [False] * self.BLOCKS
+        )
+
+    def test_a_session_settled_with_nothing_known_publishes_an_empty_verdict(self):
+        # A session whose start and finishes were all dropped settles with no
+        # locations: there is nothing to report (the manager's own write
+        # session timeout rolls it back), but the empty verdict must still be
+        # published -- a pending recheck would otherwise re-ask every step
+        # until retirement.
+        conn = self._worker()
+        conn.on_save_finished("s1", SaveContext(locations=[], result_per_rank={}))
+        conn._manager_client.finish_write_cache.assert_not_called()
+        conn._coordinator_server.record_verdict.assert_called_once_with("s1", [])
+
     def test_retirement_cancels_the_sessions_it_can_no_longer_ask_about(self):
         # A fast rank retires the request while slower ranks are still writing
         # it: without telling the coordinator, its entry waits for a query that
         # cannot come, and the table grows without bound under repeated early
         # retirements.
         conn = self._worker()
-        conn._verdict_pending = {"r0": {"s1": [0, 1], "s2": [2, 3]}}
+        conn._verdict_pending = {
+            "r0": {"s1": pending_positions([0, 1]), "s2": pending_positions([2, 3])}
+        }
         conn._captures.release_staged = MagicMock()
         conn._drop_pending_verdicts("r0")
         self.assertEqual(

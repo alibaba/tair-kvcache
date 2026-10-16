@@ -323,8 +323,15 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             )
 
     def shutdown(self) -> None:
+        # The role object owns the coordinator: its client's deferred-event
+        # retry thread (and tp0's coordinator server) must stop while the
+        # manager client is still open -- an in-flight completion finishes its
+        # finish_write_cache report, and nothing of this connector is left
+        # behind when the engine reloads it.
         if self.connector_scheduler is not None:
             self.connector_scheduler.shutdown()
+        if self.connector_worker is not None:
+            self.connector_worker.shutdown()
         self._manager_client.close()
         return None
 
