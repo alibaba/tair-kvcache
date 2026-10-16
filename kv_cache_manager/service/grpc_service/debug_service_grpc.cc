@@ -12,6 +12,13 @@ DebugServiceGRpc::DebugServiceGRpc(std::shared_ptr<MetricsRegistry> metrics_regi
                                    std::shared_ptr<DebugServiceImpl> debug_service_impl)
     : metrics_registry_(std::move(metrics_registry)), debug_service_impl_(std::move(debug_service_impl)) {}
 
+grpc::Status DebugServiceGRpc::GetCacheMetaDetail(grpc::ServerContext *context,
+                                                  const proto::meta::GetCacheMetaDetailRequest *request,
+                                                  proto::meta::GetCacheMetaDetailResponse *response) {
+    debug_service_impl_->GetCacheMetaDetail(request, response);
+    return grpc::Status::OK;
+}
+
 grpc::Status DebugServiceGRpc::InjectFault(grpc::ServerContext *context,
                                            const proto::debug::InjectFaultRequest *request,
                                            proto::debug::CommonResponse *response) {
