@@ -172,20 +172,30 @@ def git_deps():
 
     http_archive(
         name = "mooncake",
-        sha256 = "eb3f3f53d873d441cbd04cebd76506b56d7526c805da25b8525ed54abc2a06ba",
-        strip_prefix = "Mooncake-211b75742b6d1fee739ad9a486f2ae9ce2695847",
+        sha256 = "a66c98157cf44e0bef8f01c7a61f9076eb11b6bf06e082e005b59cedc1c58fce",
+        strip_prefix = "Mooncake-719735896c86b56fabec6cf3e825fb2ea640597a",
         type = "tar.gz",
         urls = [
-            "https://codeload.github.com/openanolis/Mooncake/tar.gz/211b75742b6d1fee739ad9a486f2ae9ce2695847",
-            "https://github.com/openanolis/Mooncake/archive/211b75742b6d1fee739ad9a486f2ae9ce2695847.tar.gz",
+            # v0.3.13.post1
+            "https://codeload.github.com/kvcache-ai/Mooncake/tar.gz/719735896c86b56fabec6cf3e825fb2ea640597a",
+            "https://github.com/kvcache-ai/Mooncake/archive/719735896c86b56fabec6cf3e825fb2ea640597a.tar.gz",
         ],
         build_file = clean_dep("//3rdparty/mooncake:mooncake.BUILD"),
         patches = [
             clean_dep("//patches/mooncake:0001-fix-spinlock-gcc10-compat.patch"),
             clean_dep("//patches/mooncake:0002-fix-missing-gflags-include.patch"),
             clean_dep("//patches/mooncake:0003-fix-linux-memfd-header-compat.patch"),
+            clean_dep("//patches/mooncake:0004-fix-boost-split-rvalue-input.patch"),
+            clean_dep("//patches/mooncake:0005-add-latch-semaphore-compat-for-gcc10.patch"),
         ],
         patch_args = ["-p1"],
+    )
+
+    # Only fetched when mooncake is built with --config=efa.
+    native.new_local_repository(
+        name = "libfabric",
+        path = "/opt/amazon/efa",
+        build_file = clean_dep("//3rdparty/libfabric:libfabric.BUILD"),
     )
 
     http_archive(
