@@ -39,7 +39,7 @@ from urllib.parse import urlparse
 import requests
 
 from e2e_lib import (
-    ScenarioEnv, compare_captures, full_block_hashes, make_base_prompts,
+    ScenarioEnv, capture_keys, compare_captures, make_base_prompts,
     send_completions, tokenize, wait_for_captures, wait_for_prefix_cached,
 )
 
@@ -107,8 +107,8 @@ class TestLoadFailure(unittest.TestCase):
 
             # ---- Phase 1: save everything.
             send_completions(vllm.base_url(), [prompt])
-            wait_for_captures(env.capture_dir, "ref", expected=save_blocks,
-                              timeout=180)
+            wait_for_captures(env.capture_dir, "ref",
+                              expected=env.tp_size * save_blocks, timeout=180)
             self.assertTrue(wait_for_prefix_cached(
                 env.manager.manager_uri(), env.instance_id, toks,
                 min_blocks=save_blocks))
@@ -154,12 +154,18 @@ class TestLoadFailure(unittest.TestCase):
 
             # ...and every surviving head block's loaded KV is bit-exact,
             # while any mismatch belongs to a deleted (recomputed) block.
-            wait_for_captures(env.capture_dir, "loaded", expected=keep,
-                              timeout=180)
-            report = compare_captures(env.capture_dir, tp_size=1)
-            hashes = full_block_hashes(toks, mbs)
-            kept_keys = {("tp0", h) for h in hashes[:keep]}
-            deleted_keys = {("tp0", h) for h in hashes[keep:]}
+            # Key sets cover every tp rank: the sabotage deletes one rank's
+            # files, but vLLM's invalid-block truncation is rank-global, so
+            # on the other ranks the tail blocks are loaded and then
+            # recomputed over -- their captures mismatch in low bits (a
+            # different attention kernel path), which is exactly the
+            # "recomputed" disposition, not a transfer failure.
+            wait_for_captures(env.capture_dir, "loaded",
+                              expected=env.tp_size * keep, timeout=180)
+            report = compare_captures(env.capture_dir)
+            kept_keys = capture_keys(toks, mbs, env.tp_size, keep)
+            deleted_keys = (capture_keys(toks, mbs, env.tp_size, save_blocks)
+                            - kept_keys)
             failed_keys = {f["key"] for f in report["failures"]}
             self.assertFalse(
                 failed_keys & kept_keys,
@@ -170,8 +176,9 @@ class TestLoadFailure(unittest.TestCase):
                 f"{failed_keys - deleted_keys}")
             matched_kept = kept_keys & set(report["matched_keys"])
             self.assertEqual(
-                len(matched_kept), keep,
-                f"only {len(matched_kept)}/{keep} surviving blocks verified")
+                len(matched_kept), keep * env.tp_size,
+                f"only {len(matched_kept)}/{keep * env.tp_size} surviving "
+                f"blocks verified")
         finally:
             env.stop()
 
