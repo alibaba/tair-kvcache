@@ -31,6 +31,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 
 try:
+    # vLLM >= 0.30: the request-level receive-failure path. A connector on
+    # those eras reports a request whose (multi-group, unreportable-by-block)
+    # load failed via KVConnectorTransferResults.failed_recving, and vLLM
+    # recomputes or fails it (kv_load_failure_policy). Older eras have no
+    # such path: there the same state fails closed instead (get_finished).
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorTransferResults,
+    )
+except ImportError:  # pragma: no cover - vllm <= 0.29
+    KVConnectorTransferResults = None  # ty: ignore[invalid-assignment]
+
+try:
     # vllm >= v0.11.1
     from vllm.utils.torch_utils import get_kv_cache_torch_dtype
     from vllm.utils.network_utils import get_ip
@@ -179,6 +191,20 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_config.cache_config, "calculate_kv_scales", False
             ),
         )
+        # EAGLE/MTP drafter groups are skipped by parse_groups, but their
+        # presence moves vLLM's windowed hit rule by one block
+        # (_contiguous_blocks_for_hit drops the last matched block); the
+        # windowed hit clamp mirrors that conservatively. The count (not just
+        # the flag) travels to the worker: its load-failure reporting
+        # subtracts the drafter tables from the request's block-table count
+        # (see ConnectorWorker.start_load_kv), and two drafters must not read
+        # as one unserved engine-rebuilt group.
+        self._num_eagle_groups = sum(
+            1
+            for group in kv_cache_config.kv_cache_groups
+            if getattr(group, "is_eagle_group", False)
+        )
+        self._has_eagle_group = self._num_eagle_groups > 0
 
         deployment = {
             "model_name": model_config.served_model_name,
@@ -194,6 +220,17 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
             extra_config.model_dump()
         )
         host_ip = get_ip()
+        # The engine run's own identity for the coordinator handshake: serving
+        # replicas share instance_id on purpose (the manager keys on it), so
+        # only an engine-unique identity can tell two same-instance
+        # coordinators on one host apart. vLLM assigns kv_transfer_config's
+        # engine_id per engine run and syncs it across the TP group, which is
+        # exactly the shared-per-engine, unique-per-run property the probe
+        # needs. Empty (absent on a stub config) pairs only with an equally
+        # empty server identity, exactly like the instance identity.
+        engine_id = str(
+            getattr(vllm_config.kv_transfer_config, "engine_id", "") or ""
+        )
 
         # One role object per instance; the other slot stays None and every
         # hook asserts the slot it needs.
@@ -207,7 +244,13 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._vllm_block_size,
                 self._tp_size,
                 self._manager_client,
-                TpCoordinatorClient(host_ip, extra_config.coordinator_base_port),
+                TpCoordinatorClient(
+                    host_ip,
+                    extra_config.coordinator_base_port,
+                    extra_config.instance_id,
+                    engine_id,
+                ),
+                has_eagle_group=self._has_eagle_group,
             )
             logger.warning(
                 "TairKvCacheConnector scheduler inited, extra_config: %r, "
@@ -247,13 +290,48 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
                 self._tp_size,
                 host_ip,
                 self._manager_client,
-                TpCoordinatorClient(host_ip, extra_config.coordinator_base_port),
+                TpCoordinatorClient(
+                    host_ip,
+                    extra_config.coordinator_base_port,
+                    extra_config.instance_id,
+                    engine_id,
+                ),
                 register_response,
+                # The capture partition is sized from the engine's per-step
+                # token budget (see DataTransferManager). An engine stub that
+                # does not report one leaves it at 0: the partition then
+                # assumes a step completes a single block, which is the
+                # conservative end of the check.
+                getattr(
+                    getattr(vllm_config, "scheduler_config", None),
+                    "max_num_batched_tokens",
+                    0,
+                ),
+                # ... and the cap on requests in one step: each of them can
+                # complete a partial block, so the capture partition counts
+                # them too.
+                getattr(
+                    getattr(vllm_config, "scheduler_config", None),
+                    "max_num_seqs",
+                    0,
+                ),
+                engine_id=engine_id,
+                # How many vLLM groups this instance skips as drafters: the
+                # worker's load-failure reporting must not count their block
+                # tables as engine-rebuilt state (see start_load_kv).
+                num_eagle_groups=self._num_eagle_groups,
             )
 
     def shutdown(self) -> None:
+        # The role object owns the coordinator: its client's deferred-event
+        # retry thread (and tp0's coordinator server) must stop while the
+        # manager client is still open -- an in-flight completion finishes its
+        # finish_write_cache report, and nothing of this connector is left
+        # behind when the engine reloads it.
         if self.connector_scheduler is not None:
             self.connector_scheduler.shutdown()
+        if self.connector_worker is not None:
+            self.connector_worker.shutdown()
         self._manager_client.close()
         return None
 
@@ -358,10 +436,54 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> Tuple[Optional[set], Optional[set]]:
         assert self.connector_worker is not None
         # See start_load_kv: the bound metadata is always our subclass.
-        return self.connector_worker.get_finished(
+        result = self.connector_worker.get_finished(
             finished_req_ids,
             self._get_connector_metadata(),  # ty: ignore[invalid-argument-type]
         )
+        if KVConnectorTransferResults is None:
+            # No request-level failure path exists on this vLLM era, so a
+            # request-level load failure cannot be told to anyone: vLLM would
+            # resume the request on the partially loaded KV and decode on a
+            # hole. Fail closed -- a traceback beats silently corrupt output
+            # (the same rule update_state_after_alloc applies to its
+            # unresolvable state). get_transfer_results (the >= 0.30 branch
+            # below) reports the failure instead of raising.
+            failed = self.connector_worker.drain_failed_loading_requests()
+            if failed:
+                raise RuntimeError(
+                    "TairKvCacheConnector: the external KV load of request(s) "
+                    f"{sorted(failed)} failed on a model whose registered "
+                    "groups are the request's whole KV (windowed multi-group "
+                    "or engine-rebuilt skips), and this vLLM version has no "
+                    "request-level load-failure path "
+                    "(KVConnectorOutput.failed_recving arrived in v0.30); "
+                    "resuming the request would decode on incomplete KV. "
+                    "Upgrade to vLLM >= 0.30, where the request is recomputed "
+                    "or failed per kv_load_failure_policy"
+                )
+        return result
+
+    if KVConnectorTransferResults is not None:
+
+        def get_transfer_results(
+            self, finished_req_ids: set
+        ) -> "KVConnectorTransferResults":
+            """Same snapshot as get_finished, plus the request-level failures.
+
+            A load whose registered groups are the request's whole KV
+            (windowed multi-group, or engine-rebuilt skips) is reported here
+            when it failed, so vLLM recomputes (or fails) the request instead
+            of decoding on the partially loaded KV; the failed request is
+            also in finished_recving, which is what releases it from its
+            remote-KV wait (see _handle_failed_recving).
+            """
+            finished_sending, finished_recving = self.get_finished(finished_req_ids)
+            assert self.connector_worker is not None
+            return KVConnectorTransferResults(
+                finished_sending=set(finished_sending or ()),
+                finished_recving=set(finished_recving or ()),
+                failed_recving=self.connector_worker.drain_failed_loading_requests(),
+            )
 
     def get_block_ids_with_load_errors(self) -> set:
         assert self.connector_worker is not None

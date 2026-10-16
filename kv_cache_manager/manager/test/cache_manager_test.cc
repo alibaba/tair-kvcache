@@ -85,6 +85,31 @@ ErrorCode ReadError_stub(void * /*obj*/,
 }
 } // namespace mark_query_read_error_stub
 
+namespace finish_in_progress_stub {
+// 把首个 finish 的应用（BatchUpdateLocationStatus）钉在原地：会话已被
+// GetAndDelete 删除、PutFinishedMask 尚未登记，窗口确定性地敞开。
+std::atomic<int> entered{0};
+std::atomic<bool> release{false};
+
+void Reset() {
+    entered = 0;
+    release = false;
+}
+
+ErrorCode StallUpdateStatus_stub(void * /*obj*/,
+                                 RequestContext * /*request_context*/,
+                                 const KeyVector & /*keys*/,
+                                 const std::vector<std::vector<MetaSearcher::LocationUpdateTask>> &batch_tasks,
+                                 std::vector<std::vector<ErrorCode>> &out_batch_results) {
+    entered++;
+    while (!release.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    out_batch_results.assign(batch_tasks.size(), std::vector<ErrorCode>(1, ErrorCode::EC_OK));
+    return ErrorCode::EC_OK;
+}
+} // namespace finish_in_progress_stub
+
 namespace remove_instance_reclaimer_state_stub {
 CacheReclaimer *reclaimer = nullptr;
 bool called = false;
@@ -2203,6 +2228,128 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
                 CacheLocation::CacheLocationStatusToString(CacheLocationStatus::CLS_NOT_FOUND) == meta.at("status"));
         }
     }
+}
+
+// FinishWriteCache 的幂等重试：Manager 应用首次 finish 但 HTTP 应答丢失时，
+// 客户端重试会拿到“会话不存在”（GetAndDelete 已删）。重试必须能确认结果——
+// 否则客户端把已持久的提交判为未提交，裁决永不发布，各 rank 的捕获与
+// pending 条目钉到退休。会话的删除路径只有三条且都经过 FinishWriteCache
+// （GetAndDelete 的唯一生产调用方；超时/DropAll 回调带全失败掩码回到这里），
+// 所以“不存在”由登记的应用位图裁决：重试的成功位全部已生效才答复成功。
+TEST_F(CacheManagerTest, TestFinishWriteCacheRetryReconciles) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    std::vector<int64_t> keys{101, 102, 103};
+    auto [ec_start, start_write_cache_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec_start);
+    const std::string &session_id = start_write_cache_info.write_session_id();
+    BlockMask mask = BlockMaskVector({true, true, false});
+    ASSERT_EQ(EC_OK, cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", session_id, mask));
+
+    // 应答丢失后的同一（或子集）掩码重试：已应用，答复成功。
+    ASSERT_EQ(EC_OK, cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", session_id, mask))
+        << "a retry of an applied finish was answered as uncommitted";
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(request_context_.get(),
+                                               "test_instance",
+                                               session_id,
+                                               BlockMaskVector({true, false, false})))
+        << "a retry claiming a subset of the applied successes was answered as uncommitted";
+    // 偏移掩码（前 N 位成功）不超过已生效范围同样幂等。
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", session_id, static_cast<size_t>(2)));
+
+    // 从未登记的会话：无记录可调和，维持既有的失败语义。
+    ASSERT_NE(EC_OK,
+              cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", "no_such_session", BlockMaskVector({true})));
+
+    // 回滚形状：首次 finish 全失败（每个 rank 都没写成；超时回调走的是同一
+    // 提交路径，仅 info 来源不同——位图同样全 false），会话同样被消费。之后
+    // 客户端重试声称有成功位：那些位并未生效，必须维持失败——当成功答复会让
+    // 客户端发布裁决并释放各 rank 的唯一字节。
+    {
+        std::vector<int64_t> rolled_keys{201, 202};
+        auto [ec_rolled, rolled_info] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", rolled_keys, {}, {}, 100000000);
+        ASSERT_EQ(EC_OK, ec_rolled);
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(request_context_.get(),
+                                                   "test_instance",
+                                                   rolled_info.write_session_id(),
+                                                   BlockMaskVector({false, false})));
+        ASSERT_NE(EC_OK,
+                  cache_manager_->FinishWriteCache(request_context_.get(),
+                                                   "test_instance",
+                                                   rolled_info.write_session_id(),
+                                                   BlockMaskVector({true, false})))
+            << "a retry after a rolled-back finish was answered as committed";
+    }
+}
+
+TEST_F(CacheManagerTest, TestFinishWriteCacheRetryWaitsForInFlightFinish) {
+    // 首个 FinishWriteCache 超过客户端超时但仍在处理：会话已被 GetAndDelete
+    // 删除，而结果要等 BatchUpdateLocationStatus 之后才由 PutFinishedMask 登
+    // 记。窗口内到达的重试必须等首请求落定再裁决——否则三次重试都可在首请
+    // 求记录结果前读到“会话不存在”而耗尽，尽管首请求稍后提交成功：裁决
+    // 永不发布、捕获滞留到退休。放行时间（100ms）远小于重试的等待上限
+    // （kFinishApplyRetryWait），重试必然先进入等待再被唤醒。
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    std::vector<int64_t> keys{301, 302};
+    auto [ec_start, start_write_cache_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec_start);
+    const std::string &session_id = start_write_cache_info.write_session_id();
+    BlockMask mask = BlockMaskVector({true, true});
+
+    finish_in_progress_stub::Reset();
+    Stub stub;
+    stub.set(ADDR(MetaSearcher, BatchUpdateLocationStatus), finish_in_progress_stub::StallUpdateStatus_stub);
+
+    // 首 finish 停在 stub 里：此刻会话已删、结果未登记。
+    ErrorCode first_ec = ErrorCode::EC_ERROR;
+    std::thread first([&] {
+        first_ec = cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", session_id, mask);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (finish_in_progress_stub::entered.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_NE(0, finish_in_progress_stub::entered.load()) << "the first finish never reached its application";
+
+    // 100ms 后放行首请求（登记结果并提交成功）。
+    std::thread releaser([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        finish_in_progress_stub::release = true;
+    });
+    // 窗口内到达的重试：每个请求独立的 RequestContext，与服务层一一对应。
+    RequestContext retry_context("retry_finish_in_progress");
+    const ErrorCode retry_ec = cache_manager_->FinishWriteCache(&retry_context, "test_instance", session_id, mask);
+    releaser.join();
+    first.join();
+    EXPECT_EQ(ErrorCode::EC_OK, first_ec);
+    EXPECT_EQ(ErrorCode::EC_OK, retry_ec)
+        << "a retry inside the first finish's application window was rejected before its result landed";
+
+    // 首请求已落定：窗口后的重试按已应用幂等成功。
+    EXPECT_EQ(ErrorCode::EC_OK, cache_manager_->FinishWriteCache(&retry_context, "test_instance", session_id, mask));
 }
 
 TEST_F(CacheManagerTest, TestGetCacheMeta) {

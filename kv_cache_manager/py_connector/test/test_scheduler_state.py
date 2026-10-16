@@ -46,6 +46,11 @@ class FakeRequest:
     request_id: str
     prompt_token_ids: list
     output_token_ids: list = field(default_factory=list)
+    # vLLM advances this with each step's scheduled tokens right after the
+    # connector metadata is built (_update_after_schedule); the save watermark
+    # reads it as the pre-step computed count. Tests that simulate a step
+    # advance it themselves.
+    num_computed_tokens: int = 0
 
     @property
     def num_tokens(self):
@@ -972,6 +977,166 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         self.assertEqual(args[3], [])
         self.assertFalse(kwargs["report_failures"])
 
+    def test_windowed_multigroup_shape_reports_the_request(self):
+        # The shape this connector made dangerous: windowed groups on a
+        # multi-table instance. Block ids cannot be reported (the upstream
+        # unpack), and swallowing would decode on a hole -- so the load
+        # failure travels as the request itself.
+        conn = make_connector(manager_block_size=self.MBS, num_groups=2)
+        conn._has_windowed_groups = True
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="r0",
+                manager_block_idxes=[0],
+                need_load_locations=[{"location_specs": []}],
+                all_block_ids=[[10], [20]],
+            )
+        )
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [])
+        self.assertFalse(kwargs["report_failures"])
+        self.assertTrue(kwargs["report_request_failures"])
+
+    def test_windowed_single_group_still_reports_block_ids(self):
+        # One block table keeps the block-id report (upstream recovery works
+        # there), even on a windowed instance -- the request-level path is
+        # only for the unreportable shape.
+        conn = make_connector(manager_block_size=self.MBS)
+        conn._has_windowed_groups = True
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="r0",
+                manager_block_idxes=[0, 1],
+                need_load_locations=[{"location_specs": []}] * 2,
+                all_block_ids=[[10, 11]],
+            )
+        )
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [10, 11])
+        self.assertTrue(kwargs["report_failures"])
+        self.assertFalse(kwargs["report_request_failures"])
+
+    def test_multigroup_without_window_keeps_the_legacy_swallow(self):
+        # The non-windowed hybrid (mamba + full attention) keeps the
+        # swallowed-and-logged contract its e2e pinned: no block ids, no
+        # request mark.
+        conn = make_connector(
+            manager_block_size=self.MBS, num_groups=1, num_state_groups=1
+        )
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="r0",
+                manager_block_idxes=[0],
+                need_load_locations=[{"location_specs": []}],
+                all_block_ids=[[10], [20]],
+            )
+        )
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [])
+        self.assertFalse(kwargs["report_failures"])
+        self.assertFalse(kwargs["report_request_failures"])
+
+    def test_engine_rebuilt_skip_shape_reports_the_request(self):
+        # The V4.1 geometry (vLLM >= 0.31): the registered buckets are one
+        # packed group with no window retention, and the request still carries
+        # the block tables of the groups the connector skipped because the
+        # engine rebuilds them (a replayed window, a compression ring). No
+        # manager location can ever serve those groups, so the registered
+        # buckets are the request's whole externally-loaded KV -- the failed
+        # load must mark the request instead of logging and decoding on the
+        # hole. (The real model carries nine tables; three stand in for the
+        # two skip families here.)
+        conn = make_connector(manager_block_size=self.MBS)
+        conn._group_metas = [
+            AttentionGroupMeta(
+                group_idx=0,
+                layer_names=["a0"],
+                block_size=self.MBS,
+                per_block_bytes=0,
+                page_bytes=self.MBS * 8,
+            ),
+            AttentionGroupMeta(
+                group_idx=0,
+                layer_names=["a1"],
+                block_size=self.MBS,
+                per_block_bytes=0,
+                page_bytes=self.MBS * 8,
+                spec_suffix="_b1",
+            ),
+        ]
+        conn._num_groups = 2
+        conn._has_windowed_groups = False
+        conn._num_eagle_groups = 0
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="r0",
+                manager_block_idxes=[0],
+                need_load_locations=[{"location_specs": []}],
+                all_block_ids=[[10], [20], [30]],
+            )
+        )
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [])
+        self.assertFalse(kwargs["report_failures"])
+        self.assertTrue(kwargs["report_request_failures"])
+
+    def test_a_drafter_table_is_not_an_engine_rebuilt_group(self):
+        # The EAGLE/MTP drafter's block table travels with the request too,
+        # but a drafter is not engine-rebuilt state the manager would
+        # otherwise back: it must not turn the single registered group into
+        # "the request's whole KV" -- that shape keeps the legacy swallow its
+        # e2e pinned (see test_multigroup_without_window... above for the
+        # hybrid twin).
+        conn = make_connector(manager_block_size=self.MBS)
+        conn._num_eagle_groups = 1
+        conn._extra_config = (  # ty: ignore[invalid-assignment]
+            SimpleNamespace(block_per_load_task=8)
+        )
+        conn._data_transfer = MagicMock()
+        conn._plan_group_transfers = MagicMock(return_value=None)
+        meta = TairKvCacheConnectorMetadata(epoch=0)
+        meta.add_load_request(
+            LoadRequest(
+                req_id="r0",
+                manager_block_idxes=[0],
+                need_load_locations=[{"location_specs": []}],
+                all_block_ids=[[10], [20]],
+            )
+        )
+        conn.start_load_kv(MagicMock(), meta)
+        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        self.assertEqual(args[3], [])
+        self.assertFalse(kwargs["report_failures"])
+        self.assertFalse(kwargs["report_request_failures"])
+
     def test_lone_state_group_refuses_to_report(self):
         # A single vLLM block table that is not attention (pure mamba): the
         # token-granular recovery math upstream cannot consume state block
@@ -1023,9 +1188,13 @@ class TestBuildConnectorMeta(unittest.TestCase):
             req, SimpleNamespace(get_block_ids=lambda: block_ids), matched
         )
         out = fake_scheduler_output(
-            new_reqs=[SimpleNamespace(req_id=req_id, block_ids=block_ids)]
+            new_reqs=[SimpleNamespace(req_id=req_id, block_ids=block_ids)],
+            # A fresh prefill schedules exactly the tokens it holds.
+            num_scheduled={req_id: num_tokens},
         )
-        return req, conn.build_connector_meta(out)
+        meta = conn.build_connector_meta(out)
+        req.num_computed_tokens += num_tokens
+        return req, meta
 
     def test_new_request_full_state(self):
         conn = make_scheduler_connector(mbs=self.MBS)
@@ -1035,10 +1204,14 @@ class TestBuildConnectorMeta(unittest.TestCase):
         # 40 tokens / 3 blocks -> min(40, 48)//16 = 2 blocks to save.
         conn._http_executor.submit.assert_called_once()
         args = conn._http_executor.submit.call_args[0]
-        # The per-block state-completeness mask is computed here, in the
-        # scheduler loop, and handed to the http thread: it is read off vLLM's
-        # block table, which later steps mutate.
-        self.assertEqual(args[1:], ("r0", list(range(32)), 2, [True, True]))
+        # The per-block state-completeness and window-coverage masks are
+        # computed here, in the scheduler loop, and handed to the http thread:
+        # they are read off vLLM's block table, which later steps mutate.
+        self.assertEqual(
+            args[1:-1], ("r0", list(range(32)), 2, [True, True], [True, True])
+        )
+        # ... plus the session id the release guard keys this announcement by.
+        self.assertIsInstance(args[-1], int)
         self.assertEqual(conn._tracked["r0"].has_saved_block_num, 2)
 
     def test_load_request_emitted_after_alloc(self):
@@ -1060,12 +1233,14 @@ class TestBuildConnectorMeta(unittest.TestCase):
             cached_req_ids=["r0"], num_scheduled={"r0": 8}, new_block_ids=[None]
         )
         conn.build_connector_meta(out)
+        req.num_computed_tokens += 8
         # Step 3: 2 more tokens with a new block -> table grows.
         req.output_token_ids = list(range(1000, 1010))
         out = fake_scheduler_output(
             cached_req_ids=["r0"], num_scheduled={"r0": 2}, new_block_ids=[[[103]]]
         )
         conn.build_connector_meta(out)
+        req.num_computed_tokens += 2
         self.assertEqual(
             conn._tracked["r0"].block_ids_per_group, [[100, 101, 102, 103]]
         )
@@ -1119,6 +1294,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
             cached_req_ids=["r0"], num_scheduled={"r0": 8}, new_block_ids=[[[103]]]
         )
         conn.build_connector_meta(out)
+        req.num_computed_tokens += 8
         args = conn._http_executor.submit.call_args[0]
         self.assertEqual(args[3], 3)  # target_save_num
         self.assertEqual(conn._tracked["r0"].has_saved_block_num, 3)
@@ -1141,6 +1317,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
             cached_req_ids=["r0"], num_scheduled={"r0": 8}, new_block_ids=[[[103]]]
         )
         conn.build_connector_meta(out)
+        req.num_computed_tokens += 8
         conn._http_executor.submit.assert_not_called()
         self.assertEqual(conn._tracked["r0"].has_saved_block_num, 2)
 
@@ -1151,6 +1328,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
             cached_req_ids=["r0"], num_scheduled={"r0": 1}, new_block_ids=[[[]]]
         )
         conn.build_connector_meta(out)
+        req.num_computed_tokens += 1
         args = conn._http_executor.submit.call_args[0]
         self.assertEqual(args[3], 3)  # target_save_num
         self.assertEqual(len(args[2]), 3 * self.MBS)  # token_ids sent

@@ -92,6 +92,38 @@ namespace kv_cache_manager {
     } while (0)
 
 namespace {
+// 幂等重试等待首个 finish 落定的上限：客户端的 finish 请求自带秒级超时
+// （manager_client 的 request_timeout_seconds 默认 1s），等待必须留在其
+// 预算内；超限则退回既有的“会话不存在”失败语义，由客户端的下一次重试
+// 或首请求自身的提交收敛。
+constexpr auto kFinishApplyRetryWait = std::chrono::milliseconds(500);
+// 重试的成功位是否全部已在上次应用的结果里（FinishWriteCache 的幂等重试裁决）。
+// 位图掩码要求与 keys 等长（IsBlockMaskValid 的同一约束）；偏移掩码即前 N 位成功。
+bool FinishedMaskCovers(const std::vector<bool> &applied, const BlockMask &asked) {
+    if (std::holds_alternative<BlockMaskVector>(asked)) {
+        const auto &mask_vector = std::get<BlockMaskVector>(asked);
+        if (mask_vector.size() != applied.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < mask_vector.size(); i++) {
+            if (mask_vector[i] && !applied[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+    const auto mask_offset = std::get<BlockMaskOffset>(asked);
+    if (mask_offset > applied.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < mask_offset; i++) {
+        if (!applied[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool CollectTrimResult(std::deque<std::future<PlanExecuteResult>> &inflight,
                        const std::string &trace_id,
                        const std::string &instance_id,
@@ -1388,11 +1420,39 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     if (write_location_info_internal != nullptr) {
         location_info = std::move(*write_location_info_internal);
     } else if (!write_location_manager_->GetAndDelete(write_session_id, location_info)) {
+        // 幂等重试裁决。会话不在只有两种来路，且都经过 FinishWriteCache：
+        // 本 finish 已应用而应答在途中丢失（客户端重试），或超时/清理回调已
+        // 以全失败掩码把会话回滚。会话的删除路径仅此三条（GetAndDelete 的
+        // 唯一生产调用方就是本函数；超时与 DropAll 都经回调回到这里），所以
+        // “不存在”本身无法区分两种结果——只有 PutFinishedMask 登记的应用
+        // 位图能。重试声称的成功位全部已生效时按已应用答复成功，否则维持
+        // 失败：把已回滚的重试当成功会让客户端释放唯一字节，把已应用的重试
+        // 当失败则让裁决永远无法发布、捕获钉到退休。
+        // 还有一种窗口：首个 finish 已拿走会话（GetAndDelete）但尚未登记
+        // 结果（PutFinishedMask 在 BatchUpdateLocationStatus 之后）——此时
+        // 重试既查不到会话也查不到记录。不等它，三次重试都会在首请求落定
+        // 前读到“会话不存在”而耗尽，尽管首请求稍后提交成功。故无记录时先
+        // 有界等待 in-progress 落定再读一次（WaitFinishedMask 对无 in-progress
+        // 的会话退化为一次读取）。
+        std::vector<bool> applied_mask;
+        if (write_location_manager_->GetFinishedMask(write_session_id, applied_mask) ||
+            write_location_manager_->WaitFinishedMask(write_session_id, kFinishApplyRetryWait, applied_mask)) {
+            if (FinishedMaskCovers(applied_mask, success_block_mask)) {
+                PREFIX_LOG(INFO, "finish write cache retry matches the applied session: %s", write_session_id.c_str());
+                return ErrorCode::EC_OK;
+            }
+            // 记录在但不覆盖重试声称的成功位：已回滚，维持失败答复。
+        }
         request_context->error_tracer()->AddErrorMsg("write_session_id has been deleted");
         RETURN_IF_EC_NOT_OK_WITH_LOG(
             WARN, EC_ERROR, "finish write cache failed: write_session_id not found: %s", write_session_id.c_str());
     }
+    // 此处起会话已被本调用持有（GetAndDelete 成功，或超时/清理回调直接携
+    // info 进入）：掩码非法、instance 不存在等提前退出也必须落定 in-progress
+    // （ResolveFinish 幂等，对未登记者是无操作），否则等待首请求结果的
+    // 重试要空等满超时。
     if (!IsBlockMaskValid(success_block_mask, location_info.keys.size())) {
+        write_location_manager_->ResolveFinish(write_session_id);
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
                                      EC_BADARGS,
                                      "invalid block mask, mask type: %zu, size: %zu",
@@ -1403,6 +1463,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher) {
         request_context->error_tracer()->AddErrorMsg("instance not exist");
+        write_location_manager_->ResolveFinish(write_session_id);
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "finish write cache failed: meta searcher not found");
     }
     std::vector<KeyType> success_batch_keys;
@@ -1438,6 +1499,25 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
         }
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchUpdateLocation);
+
+    // 登记本次实际生效的成功位（成功位 ∧ 每位的 batch 更新结果），供丢应答后的
+    // 幂等重试裁决（见函数开头的 GetFinishedMask 分支）：重试拿不到会话，只有
+    // 这份记录能区分“已应用”与“已回滚”。部分失败也如实登记——把未生效的位
+    // 答复成已应用同样会让客户端释放唯一字节。
+    {
+        std::vector<bool> applied_mask(location_info.keys.size(), false);
+        size_t success_idx = 0;
+        for (size_t block_key_idx = 0; block_key_idx < location_info.keys.size(); block_key_idx++) {
+            if (!IsIndexInMaskRange(success_block_mask, block_key_idx)) {
+                continue;
+            }
+            applied_mask[block_key_idx] = success_idx < out_batch_results.size() &&
+                                          !out_batch_results[success_idx].empty() &&
+                                          out_batch_results[success_idx][0] == ErrorCode::EC_OK;
+            success_idx++;
+        }
+        write_location_manager_->PutFinishedMask(write_session_id, std::move(applied_mask));
+    }
 
     // 多层存储 Mark 消费完成：仅当本次 target location 成功 SERVING 后，按配置策略清标。
     // 仅处理启用了 tiered migration（配置了 migration_strategies）的 instance group，与

@@ -9,9 +9,12 @@ shell.
 """
 
 import copy
+import threading
+import time
+from dataclasses import dataclass
 import json
 import typing
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 # kvcm_py_client is the compiled pybind11 client; it ships no type stubs.
 from kv_cache_manager.client.pybind import kvcm_py_client  # ty: ignore[unresolved-import]
@@ -20,6 +23,18 @@ import torch
 from vllm.distributed import get_tensor_model_parallel_rank
 
 from kv_cache_manager.py_connector.common.logger import logger
+
+#: How long the verdict query stays muted after a failed probe. The endpoint
+#: only comes back with a restart, and an engine step must not pay a receive
+#: timeout per pending session meanwhile.
+VERDICT_QUERY_BACKOFF_SECONDS = 5.0
+
+#: The manager's commit report is retried. By the time it runs the write
+#: session is already out of the tracking map, so nothing would ever send it
+#: again: the locations stay uncommitted (the block is not durable) and the
+#: captures stay pinned until the request retires.
+FINISH_WRITE_CACHE_ATTEMPTS = 3
+FINISH_WRITE_CACHE_RETRY_SECONDS = 0.2
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.py_connector.common.tp_coordinator import (
     SaveContext,
@@ -32,10 +47,15 @@ from kv_cache_manager.py_connector.vllm.data_transfer import (
     DataTransferManager,
     _get_device_module,
 )
-from kv_cache_manager.py_connector.vllm.metadata import TairKvCacheConnectorMetadata
+from kv_cache_manager.py_connector.vllm.metadata import (
+    CaptureRequest,
+    SaveRequest,
+    TairKvCacheConnectorMetadata,
+)
 from kv_cache_manager.py_connector.vllm.transfer_types import (
     AttentionTransferGroup,
     KVCacheInfo,
+    NullBlockRow,
     StateTransferGroup,
     TransferGroup,
     TransferPlan,
@@ -47,7 +67,16 @@ from kv_cache_manager.py_connector.vllm.vllm_common import (
     attn_kv_views,
     spec_name,
     state_kv_view,
+    windowed_block_has_data,
 )
+
+#: How long the eager capture waits for arena slots before withholding the
+#: blocks of this request-step. Unlike a transfer task, a capture holds its
+#: slots until the write session lands -- i.e. until the engine makes another
+#: step -- so waiting without a deadline could deadlock the engine against its
+#: own sessions. Timing out costs the blocks' hit rate (they are failed, never
+#: published with a hole); the deadline itself is not a correctness parameter.
+CAPTURE_POOL_WAIT_SECONDS = 0.05
 
 if typing.TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -55,6 +84,312 @@ if typing.TYPE_CHECKING:
     # vllm.attention no longer exists in vLLM >= 0.26; kept for the older
     # eras this connector supports.
     from vllm.attention import AttentionMetadata  # ty: ignore[unresolved-import]
+
+
+@dataclass(frozen=True)
+class _Capture:
+    """One captured block's staging slot: the entry carries its own slot."""
+
+    pool: Any
+    slot: int
+
+
+class _CaptureLedger:
+    """The single accounting point for captured staging slots.
+
+    Every transition of a capture's slot goes through this class -- staging a
+    fresh capture, a session taking one (``take``), settling a session's
+    outcomes (``settle``: return on success, keep for a retry on failure),
+    the deliberate release a mask-derived instruction asks for, and the
+    request's retirement. Nothing else may release one of these slots or put
+    an entry back: that is the invariant the test family named after it
+    checks -- at any moment a slot belongs to exactly one live entry in
+    exactly one of the two maps, it is released exactly once, and no path
+    reads a released slot.
+
+    Two shapes make the bookkeeping non-trivial, and both are handled here
+    instead of at the call sites:
+
+    * in-flight ownership is keyed by ``(session, spec_name, block)``. A
+      regressed save watermark can capture a block again while an earlier
+      session's write is still running: both owners must keep their own
+      record (and their own slot), or a failure callback would move or
+      release a slot another task is still reading;
+    * a request can retire while its saves are still running. Its staged
+      entries are released then, but the in-flight records stay until every
+      session settles; a settled *failure* for a retired request releases its
+      slot (nothing will ever publish it) instead of staging it for a retry
+      that cannot come.
+
+    The ledger also owns the per-request cache-key map (``block_uris``) the
+    save plans record and the deduplication guard reads: the keys move with
+    the captures they belong to (``take_planned`` hands both over in one
+    transition), and they are only forgotten once no capture of the request
+    can return (``drop_uris_if_idle``), under the same lock -- an idle check
+    that races a newer plan's handoff would delete the live writer's keys.
+    """
+
+    def __init__(self) -> None:
+        # One lock for every ownership transition: the settle callbacks run on
+        # the transfer manager's io threads while staging, taking, releasing
+        # and retirement run on the engine thread. A decision that reads the
+        # maps has to write them before another thread reads, or two settles
+        # of the same block can both find no staged entry and each overwrite
+        # the other (leaking the slot one of them restaged), and a retirement
+        # can leave an entry a racing settle just created.
+        self._lock = threading.Lock()
+        # (spec_name, manager block) -> _Capture: captured, not yet taken.
+        self.staged: Dict[str, Dict[Tuple[str, int], _Capture]] = {}
+        # (session id, spec_name, manager block) -> _Capture.
+        self.in_flight: Dict[str, Dict[Tuple[int, str, int], _Capture]] = {}
+        # req_id -> manager block -> the cache key (URI) a plan announced for
+        # it. Guarded by the same lock as the captures: a release consults it
+        # to keep bytes another live writer still owns (see
+        # _uris_other_requests_hold), so the map must appear and disappear
+        # atomically with the captures it guards.
+        self.block_uris: Dict[str, Dict[int, Optional[str]]] = {}
+        self._retired: Set[str] = set()
+
+    @staticmethod
+    def _release(capture: _Capture) -> None:
+        capture.pool.release(capture.slot, 1)
+
+    # ------------------------------------------------------------------ #
+    def stage(
+        self, req_id: str, key: Tuple[str, int], capture: _Capture
+    ) -> Optional[int]:
+        """Record a fresh capture; returns the superseded slot, if any.
+
+        A block can be captured twice (the save watermark moves backwards when
+        preemption shrinks an allocation). The newer bytes win: the old entry
+        is released here -- it has no session reference, a session *moves* the
+        entry into the in-flight map when it takes it.
+        """
+        with self._lock:
+            previous = self.staged.setdefault(req_id, {}).get(key)
+            self.staged[req_id][key] = capture
+            if previous is None:
+                return None
+            self._release(previous)
+            return previous.slot
+
+    def take(
+        self, req_id: str, session_id: int, key: Tuple[str, int]
+    ) -> Optional[_Capture]:
+        """Hand a staged capture to a session, atomically.
+
+        ``None`` means "this session has nothing for that block": either no
+        capture is staged, or this very session already holds the block (a
+        repeated plan must not overwrite the first task's ownership).
+        """
+        with self._lock:
+            return self._take_locked(req_id, session_id, key)
+
+    def _take_locked(
+        self, req_id: str, session_id: int, key: Tuple[str, int]
+    ) -> Optional[_Capture]:
+        # The per-request map is created only once a capture is found: a
+        # windowed save whose capture was withheld (the step's arena budget
+        # ran out) or whose every row was null takes nothing, and an empty
+        # map left behind is unreachable garbage -- settle() returns early
+        # for an empty map and retire() only tests it, so the entry would
+        # pin the request id for the worker's lifetime and repeated capture
+        # degradation would grow in_flight without bound.
+        flight_key = (session_id, key[0], key[1])
+        sessions = self.in_flight.get(req_id)
+        if sessions is not None and flight_key in sessions:
+            return None
+        capture = self.staged.get(req_id, {}).pop(key, None)
+        if capture is None:
+            return None
+        self.in_flight.setdefault(req_id, {})[flight_key] = capture
+        return capture
+
+    def take_planned(
+        self,
+        req_id: str,
+        session_id: int,
+        spec_name: str,
+        blocks: "Sequence[int]",
+        uris: "Sequence[Optional[str]]",
+    ) -> List[Optional[int]]:
+        """Record a save plan's cache keys and hand its captures over, as one
+        transition. Returns the staging slot per block (None where the plan
+        has no bytes to hand over).
+
+        The keys are written and the captures move staged -> in flight inside
+        one lock section, together with the idle cleanup that drops the keys
+        (drop_uris_if_idle): a settle of the request's older session that
+        races this handoff must not observe "no captures" between the two and
+        delete the key map this plan is still recording -- a later
+        deduplication release would then miss the live writer and free the
+        only copy of the retry's bytes.
+        """
+        with self._lock:
+            block_uris = self.block_uris.setdefault(req_id, {})
+            slots: List[Optional[int]] = []
+            for position, block in enumerate(blocks):
+                if position < len(uris):
+                    block_uris[block] = uris[position]
+                capture = self._take_locked(req_id, session_id, (spec_name, block))
+                if capture is None:
+                    if (session_id, spec_name, block) in self.in_flight.get(
+                        req_id, {}
+                    ):
+                        logger.warning(
+                            "req:%s windowed block %d (group %s) is planned "
+                            "twice; its bytes stay with the first session and "
+                            "this block is failed instead of handing the same "
+                            "slot out twice",
+                            req_id,
+                            block,
+                            spec_name,
+                        )
+                    slots.append(None)
+                    continue
+                slots.append(capture.slot)
+            return slots
+
+    def drop_uris_if_idle(self, req_id: str) -> None:
+        """Forget a request's cache keys once no capture of it can return.
+
+        The emptiness test and the pop are one lock section with the plan
+        that records the keys (take_planned) and with every capture
+        transition: an unsynchronized check could see "no captures" just
+        before a newer plan records its keys and hands a fresh capture over,
+        and the pop would then delete the new session's key map.
+        """
+        with self._lock:
+            if self.staged.get(req_id) or self.in_flight.get(req_id):
+                return
+            self.block_uris.pop(req_id, None)
+
+    def taken_by(self, req_id: str, session_id: int, key: Tuple[str, int]) -> bool:
+        """Is this block already in flight for this session?"""
+        with self._lock:
+            return (session_id, key[0], key[1]) in self.in_flight.get(req_id, {})
+
+    def settle(
+        self,
+        req_id: str,
+        session_id: int,
+        outcomes: "Dict[Tuple[str, int], bool]",
+    ) -> None:
+        """Close out a session's blocks, keeping the bytes either way.
+
+        A task's verdict is *this rank's* result, while a block is committed
+        only when every rank wrote it (the coordinator ANDs the ranks into
+        finish_write_cache, see on_save_finished). A successful local write
+        therefore says nothing yet: if this rank dropped its capture and
+        another rank failed, the manager rejects the block, the retry finds no
+        windowed bytes here -- the HBM window has moved on, a later capture
+        abstains -- and the block can never be published. So the unified rule
+        is: a local verdict keeps the bytes (they are the only copy left and a
+        retry reuses them); the slot is returned when the *committed* state is
+        known -- the manager reports the block as existing (the mask-derived
+        release, which is exactly "someone durable holds this data") -- or when
+        the request retires, where nothing can publish it any more. A block
+        captured again while this task ran keeps the newer entry.
+        """
+        with self._lock:
+            sessions = self.in_flight.get(req_id)
+            if not sessions:
+                return
+            for key, ok in outcomes.items():
+                capture = sessions.pop((session_id, key[0], key[1]), None)
+                if capture is None:
+                    continue  # settled already: nothing to release
+                if req_id in self._retired:
+                    # Nothing will publish it: see the retirement semantics.
+                    self._release(capture)
+                    continue
+                staged = self.staged.setdefault(req_id, {})
+                if key in staged:
+                    # A fresher capture for the same block wins.
+                    self._release(capture)
+                else:
+                    staged[key] = capture
+                if not ok:
+                    logger.debug(
+                        "req:%s session %d: block %s failed on this rank; its "
+                        "bytes stay staged for the retry",
+                        req_id,
+                        session_id,
+                        key,
+                    )
+            if not sessions:
+                self.in_flight.pop(req_id, None)
+                self._retired.discard(req_id)
+
+    def release_staged(self, req_id: str, blocks: "Sequence[int]") -> int:
+        """Release the captures of these manager blocks (returns how many).
+
+        No session will write them (the manager holds them already, or the
+        session that announced them allocated nothing), so their bytes are
+        dead weight in the arena.
+        """
+        with self._lock:
+            staged = self.staged.get(req_id)
+            if not staged:
+                return 0
+            wanted = set(blocks)
+            released = 0
+            for key in [key for key in staged if key[1] in wanted]:
+                self._release(staged.pop(key))
+                released += 1
+            return released
+
+    def release_staged_keys(
+        self, req_id: str, keys: "Sequence[Tuple[str, int]]"
+    ) -> int:
+        """Release exactly these (spec, block) captures (returns how many).
+
+        The verdict-derived release must be spec-exact: a session's verdict
+        confirms a block position through the AND over the groups that had
+        data for it, so a windowed group that abstained (its window already
+        slid past the block) contributes nothing to the mask and the committed
+        location carries no spec of it -- releasing by block number alone
+        would free a *newer* capture of that block whose spec nobody committed,
+        leaving the promoted retry with a URI and no bytes.
+        """
+        with self._lock:
+            staged = self.staged.get(req_id)
+            if not staged:
+                return 0
+            released = 0
+            for key in keys:
+                capture = staged.pop(key, None)
+                if capture is not None:
+                    self._release(capture)
+                    released += 1
+            return released
+
+    def holds(self, req_id: str) -> bool:
+        """Does this request still own any staged or in-flight entry?"""
+        with self._lock:
+            return bool(self.staged.get(req_id)) or bool(self.in_flight.get(req_id))
+
+    def retire(self, req_id: str) -> Tuple[int, bool]:
+        """Release everything still waiting for a session; report what is left.
+
+        Returns how many staged captures were released and whether in-flight
+        sessions remain whose callbacks still have to be guarded. The
+        retirement tombstone is only for those callbacks -- a settle that
+        lands after the retirement must release its bytes instead of staging
+        them for a verdict nobody will consume -- and with nothing in flight
+        no callback can land, while the tombstone's only removal path is a
+        later settle: adding it unconditionally would pin the request id for
+        the process's life, and a reused id would settle as retired instead
+        of being restaged.
+        """
+        with self._lock:
+            staged = self.staged.pop(req_id, {})
+            for capture in staged.values():
+                self._release(capture)
+            settles = bool(self.in_flight.get(req_id))
+            if settles:
+                self._retired.add(req_id)
+            return len(staged), settles
 
 
 class ConnectorWorker:
@@ -70,9 +405,32 @@ class ConnectorWorker:
         manager_client: KvCacheManagerClient,
         coordinator_client: TpCoordinatorClient,
         register_response: Dict[str, Any],
+        max_num_batched_tokens: int = 0,
+        max_num_seqs: int = 0,
+        engine_id: str = "",
+        num_eagle_groups: int = 0,
     ) -> None:
         self._extra_config = extra_config
+        # The engine's per-step token budget (chunked prefill's chunk) and its
+        # cap on requests per step: the capture partition is sized from both
+        # (see DataTransferManager).
+        self._max_num_batched_tokens = max_num_batched_tokens
+        self._max_num_seqs = max_num_seqs
         self._group_metas = group_metas
+        # How many vLLM groups this instance skips as EAGLE/MTP drafters
+        # (vLLM marks them; parse_groups drops them). Part of the load-failure
+        # reporting decision (see start_load_kv): a drafter's block table
+        # travels with every request too, but a drafter is not engine-rebuilt
+        # state, so it must not count as "the registered groups are the
+        # request's whole KV".
+        self._num_eagle_groups = num_eagle_groups
+        # A verdict is only consumed where a capture waits for one: windowed
+        # groups. A pure full-attention instance has nothing to confirm, and
+        # publishing anyway filled the coordinator's table (and its log) with
+        # entries no worker would ever ask about.
+        self._has_windowed_groups = any(
+            getattr(meta, "retention", None) is not None for meta in group_metas
+        )
         self._num_groups = len(group_metas)
         self._manager_block_size = manager_block_size
         self._tp_size = tp_size
@@ -85,6 +443,86 @@ class ConnectorWorker:
         self._pending_saves: dict = {}
         self._finish_pending: set = set()
 
+        # Eagerly captured windowed blocks, per request: (spec name, manager
+        # block) -> (staging pool, slot) holding that block's bytes, until a
+        # write session takes them. The key is the *bucket's* spec name, not
+        # the vLLM group index: one group may be split into several transfer
+        # buckets (``_uniform_group_metas`` / ``_BucketKey``: a packed group can
+        # mix two R-SWA windows), the spec name is unique by construction
+        # (``_check_unique_names``) and is what the save plan looks its
+        # locations up by -- keying on the group index would let two buckets of
+        # one group overwrite each other's slots and hand each other's bytes to
+        # the wrong location.
+        #
+        # Handing a block over *moves* its entry to ``_in_flight``, where the
+        # task owns the release: it returns the slot when its transfer lands,
+        # success or failure. ``_staged`` is therefore exactly "captured but
+        # not yet given to a session", which is what a later capture (or the
+        # retirement path) may release.
+        #
+        # The save verdict itself needs no side state: a block is written when
+        # its location claimed the spec and the capture holds its bytes, fails
+        # when the location claimed it and no bytes were captured (a withheld
+        # or lost capture), and abstains when nothing claimed it
+        # (``_staged_dispositions``).
+        #
+        # Every slot transition goes through this one ledger (see
+        # _CaptureLedger): captured-not-taken entries in ``staged``,
+        # session-owned ones in ``in_flight`` keyed by (session, spec, block).
+        # The three attributes below are the ledger's maps, exposed read-only
+        # for the tests and for the plan's diagnostics.
+        self._captures = _CaptureLedger()
+        self._staged = self._captures.staged
+        self._in_flight = self._captures.in_flight
+        # The URI (the manager's cache key) each planned block will be written
+        # to, per request: a release may only drop captured bytes whose URI no
+        # in-flight session of *any* request still owns. Two requests sharing a
+        # prefix make the manager answer "existing" for the second one's blocks
+        # while the first one's allocations are still uncommitted (duplicate
+        # StartWriteCache calls are deduplicated before FinishWriteCache), so a
+        # release computed from that answer would drop the second request's
+        # captures -- and if the first writer then fails, neither request has
+        # the windowed bytes left to publish them. The map lives on the ledger
+        # (see _CaptureLedger.block_uris): it is written and dropped under the
+        # capture lock, atomically with the handoffs it guards; the release
+        # scans below read it without the lock on purpose, since a stale view
+        # can only make a release more conservative.
+        self._block_uris = self._captures.block_uris
+        # Sessions whose local success is not yet the global verdict (tp > 1,
+        # this rank is not the coordinator): req_id -> session id -> per
+        # announced position, the (window spec, block) captures this session
+        # actually wrote (abstained positions stay empty and are never
+        # released by this session's verdict), which therefore have to be
+        # rechecked (see _recheck_pending_verdicts). The coordinator runs in
+        # another process (the task's engine core), so the answer is a query,
+        # not shared memory.
+        self._verdict_pending: Dict[str, Dict[str, List[List[Tuple[str, int]]]]] = {}
+        # Settles run on I/O threads and the recheck on the engine thread: one
+        # lock guards every add/remove/iterate (a callback that adds a session
+        # between the emptiness test and the pop would lose it, and its
+        # captures would never be rechecked). It also orders a settle's
+        # "is this request retired?" decision against the retirement itself
+        # (see _release_staged and _settle_session_captures): the check, the
+        # insertion and the retirement's tombstone-and-drop all happen under
+        # it, or a callback that observed "not retired" could rebuild pending
+        # bookkeeping for a request whose retirement already emptied it --
+        # rechecked every step, cancelled never. Lock order when nesting:
+        # this lock first, the capture ledger's inside it.
+        self._verdict_lock = threading.Lock()
+        # When the coordinator cannot be asked (its port is unbound or it is
+        # gone), every probe costs a receive timeout -- on the engine thread,
+        # for every pending session, every step. One failure closes the whole
+        # round and mutes the endpoint for a while instead of paying that per
+        # session over and over.
+        self._verdict_query_down_until = 0.0
+        # Requests whose FinishRequest already ran while a settle could still
+        # land (see _release_staged): a save callback that arrives afterwards
+        # must not rebuild verdict bookkeeping that nothing would drop any
+        # more. Guarded by _verdict_lock, and only set while in-flight saves
+        # remain -- the last callback clears it, and a request with nothing
+        # in flight never gets one at all.
+        self._retired_requests: Set[str] = set()
+
         self._tp_rank = get_tensor_model_parallel_rank()
         # torch device module (torch.cuda / torch.musa / ...), set in
         # register_kv_caches; Any because the module surface is dynamic.
@@ -92,7 +530,12 @@ class ConnectorWorker:
         port = extra_config.coordinator_base_port
         if self._tp_rank == 0:
             self._coordinator_server = TpCoordinatorServer(
-                host_ip, port, tp_size, self.on_save_finished
+                host_ip,
+                port,
+                tp_size,
+                self.on_save_finished,
+                extra_config.instance_id,
+                engine_id,
             )
 
         max_group_bytes = max(m.per_block_bytes for m in self._group_metas)
@@ -145,6 +588,23 @@ class ConnectorWorker:
     # ------------------------------------------------------------------ #
     # Storage config plumbing
     # ------------------------------------------------------------------ #
+    def shutdown(self) -> None:
+        """Release the coordinator (its server, then this rank's client).
+
+        tp0's coordinator server stops first: a completion it is processing
+        right now still calls finish_write_cache on the manager client, which
+        stays open until the connector-level shutdown closes it. The client's
+        shutdown then stops the deferred-event retry thread and frees its
+        context -- without it, a connector rebuilt while its coordinator is
+        unavailable leaves one active retry loop (thread, context, socket and
+        queued events) behind per reload, flushing stale events if the old
+        identity ever answers again.
+        """
+        server = getattr(self, "_coordinator_server", None)
+        if server is not None:
+            server.shutdown()
+        self._coordinator_client.shutdown()
+
     def parse_hf3fs_configs(self, storage_configs: str) -> List[Dict[str, Any]]:
         hf3fs_configs: List[Dict[str, Any]] = []
         storage_configs_json = json.loads(storage_configs)
@@ -205,6 +665,8 @@ class ConnectorWorker:
             self._transfer_client,
             self._coordinator_client,
             self._extra_config,
+            max_num_batched_tokens=self._max_num_batched_tokens,
+            max_num_seqs=self._max_num_seqs,
         )
 
         logger.warning(
@@ -244,7 +706,9 @@ class ConnectorWorker:
         for v in ref_views:
             assert v.stride()[1:] == (per_token_dim, v.shape[3], 1), (
                 f"kv cache page not token-major: shape={tuple(v.shape)} "
-                f"stride={v.stride()}; set VLLM_KV_CACHE_LAYOUT=NHD"
+                f"stride={v.stride()}; the gather/scatter needs a token-major "
+                f"page (vLLM's NHD order, spelled BLNHC/LBNHC among its "
+                f"VLLM_KV_CACHE_LAYOUT candidates; this tensor is head-major)"
             )
         # Cross-check the spec against the tensor per *token*: the spec page
         # covers meta.block_size tokens while the tensor page covers
@@ -291,11 +755,31 @@ class ConnectorWorker:
             kernel_block_size=kernel_block_size,
             block_stride=block_stride,
             dtype=ref.dtype,
+            retention=meta.retention,
         )
 
     def _build_state_group(
         self, meta: StateGroupMeta, kv_caches: Dict[str, Any]
     ) -> StateTransferGroup:
+        # A state exists once per state block and covers the prefix ending at
+        # that block's last token, so _state_block_ids' "last token selects the
+        # block" needs the manager block to be a whole number of state blocks:
+        # with --mamba-block-size <= --block-size an mbs-token manager block
+        # ends inside (or exactly on) a state block, and a 48-token manager
+        # block over 16-token states selects states 2, 5, 8, ... -- one state
+        # each, ending where the manager block ends (writes publish the state
+        # that really covers the block's prefix).
+        #
+        # The other direction is the misplacement: a *larger* state block
+        # (--mamba-block-size above --block-size) covers several manager blocks,
+        # so one state would be published under several prefix keys.
+        assert self._manager_block_size % meta.block_size == 0, (
+            f"state group {meta.group_idx}: manager block size "
+            f"{self._manager_block_size} is not a multiple of the state block "
+            f"size {meta.block_size}; a state covers the prefix ending at its "
+            f"block, so a larger state block would be published under several "
+            f"manager block keys (a silently misplaced state)"
+        )
         spec = spec_name(self._tp_rank, meta)
         block_views = []
         for name in meta.layer_names:
@@ -330,13 +814,33 @@ class ConnectorWorker:
           -> group block (block_table unit, group.block_size tokens)
           -> kernel physical block (tensor unit; ratio physical per group block).
         """
+        slots, _ = self._attn_slots(group, manager_block_idxes, block_table)
+        return slots
+
+    def _attn_slots(
+        self,
+        group: AttentionTransferGroup,
+        manager_block_idxes: Sequence[int],
+        block_table: List[int],
+    ) -> Tuple[List[List[int]], List[List[bool]]]:
+        """``_attn_token_indices`` plus, per token, "is this a null slot?".
+
+        A windowed group's block table carries vLLM's null block (id 0) for the
+        positions outside the window: those slots alias page 0, which is the
+        engine's shared zero page. Both callers have to know (the loader must
+        not write them, the capture must not publish their bytes), and the
+        block table entry is the only trustworthy source -- a group block is
+        null exactly when its table entry is 0.
+        """
         mbs = self._manager_block_size
         gbs = group.block_size
         kbs = group.kernel_block_size
         ratio = gbs // kbs
-        out = []
+        out: List[List[int]] = []
+        null: List[List[bool]] = []
         for mb in manager_block_idxes:
             idxs = []
+            nulls = []
             base = mb * mbs
             for i in range(mbs):
                 tok = base + i
@@ -347,8 +851,10 @@ class ConnectorWorker:
                 off = tok % gbs
                 phys = block_table[logical] * ratio + off // kbs
                 idxs.append(phys * kbs + off % kbs)
+                nulls.append(block_table[logical] == 0)
             out.append(idxs)
-        return out
+            null.append(nulls)
+        return out, null
 
     def _state_block_ids(
         self,
@@ -390,6 +896,8 @@ class ConnectorWorker:
             List[Optional[str]],
             Optional[List[List[int]]],
             Optional[List[int]],
+            Optional[List[Optional[int]]],
+            Optional[List[Optional[NullBlockRow]]],
         ]
     ]:
         """Slice each plan's blocks into per-task chunks.
@@ -398,6 +906,11 @@ class ConnectorWorker:
         manager shrinks it to fit the group's staging pool (a task stages its
         whole batch as one contiguous run), so the configured
         ``block_per_save_task``/``block_per_load_task`` is an upper bound.
+
+        The chunk is ``(group, uris, token_indices, block_ids, staged_slots,
+        null_rows)`` -- the two trailing fields are the windowed-group extras
+        (see TransferPlan); a group that has none yields None for both, which
+        is what makes the save and load tasks one signature.
 
         Pure generator: the task index is the consumer's concern (enumerate
         there); this only reads the plans."""
@@ -413,13 +926,348 @@ class ConnectorWorker:
                     if plan.token_indices is not None
                     else None,
                     plan.block_ids[i:end] if plan.block_ids is not None else None,
+                    plan.staged_slots[i:end]
+                    if plan.staged_slots is not None
+                    else None,
+                    plan.null_rows[i:end] if plan.null_rows is not None else None,
                 )
+
+    def _settle_session_captures(
+        self,
+        save_req: SaveRequest,
+        plans: List[TransferPlan],
+        done_cb: Callable[[List[Any]], None],
+    ) -> Callable[[List[Any]], None]:
+        """Settle this session's captured slots once its tasks report.
+
+        Every windowed save hands its blocks to a session (the ledger's
+        ``take``) and this is where they come to rest: a block that was
+        written returns its slot, a block that failed keeps it -- the bytes are
+        the only copy the connector will ever hold (the HBM window that
+        produced them has moved on, so a later capture abstains) and a later
+        session announces the block again, so the retry must find them staged.
+        A request that retired before the callback ran releases the slot
+        instead (nothing will publish it).
+
+        The verdict list is flat, group-major, ``num_blocks`` per group (the
+        same layout create_save_done_callback reads). It can be short when a
+        task never reported: the session's slots then stay in flight, which is
+        exactly where the ledger keeps them until something settles.
+        """
+        windowed = [
+            (group_idx, plan)
+            for group_idx, plan in enumerate(plans)
+            if getattr(plan.group, "retention", None) is not None
+            and plan.staged_slots
+        ]
+        if not windowed:
+            return done_cb
+        num_blocks = len(save_req.manager_block_idxes)
+
+        def wrapper(flat: List[Any]) -> None:
+            # Settle *first* and report afterwards: the report goes to the
+            # coordinator (a socket that can fail), and an exception there
+            # would otherwise skip the settle for good -- MultiResult calls its
+            # callback once, so this session's slots would stay in flight for
+            # the process's life, eating the arena of unrelated requests. The
+            # finally keeps the report ordered even when the settle raises.
+            try:
+                if len(flat) < len(plans) * num_blocks:
+                    # A task never reported (an exception escaped the executor):
+                    # its slots stay in flight until something settles them.
+                    return
+                outcomes: Dict[Tuple[str, int], bool] = {}
+                for group_idx, plan in windowed:
+                    for pos, slot in enumerate(plan.staged_slots):
+                        if slot is None:
+                            continue
+                        block = save_req.manager_block_idxes[pos]
+                        ok = flat[group_idx * num_blocks + pos]
+                        if ok is None:
+                            continue
+                        outcomes[(plan.group.spec_name, block)] = bool(ok)
+                # A local verdict is never the global one. With several
+                # ranks another rank may fail and the manager then rejects
+                # the block for everyone; even with one rank `outcomes` only
+                # covers the *windowed* plans, while the block is committed
+                # only when every group wrote it (a full-attention or state
+                # group failing would leave the window bytes released and
+                # the manager rejecting a block nobody can rewrite once the
+                # window moved). So the bytes stay staged and the session is
+                # marked pending: the coordinator's merged, all-group AND --
+                # published by on_save_finished or answered by the query --
+                # releases them, within a step.
+                session_key = (
+                    getattr(save_req, "write_session_id", None)
+                    or str(save_req.session_id)
+                )
+                # 逐位只记本会话真正交出的捕获，精确到 (窗口 spec, block)：
+                # verdict 的位是会话的通告序号，弃权位（窗口已滑走、该 spec
+                # 无捕获）绝不入账。弃权位的 verdict 可因非窗口组的成功而为
+                # True——按块号 release 会放走更新的重算捕获，而提交的位置里
+                # 并没有该窗口 spec；把这类块留在账外，它就只能由真正捕获了
+                # 它的会话（或退休）来释放。
+                session_captures: List[List[Tuple[str, int]]] = [
+                    [] for _ in range(num_blocks)
+                ]
+                for _, windowed_plan in windowed:
+                    for pos, slot in enumerate(windowed_plan.staged_slots):
+                        if slot is not None:
+                            session_captures[pos].append(
+                                (
+                                    windowed_plan.group.spec_name,
+                                    save_req.manager_block_idxes[pos],
+                                )
+                            )
+                # One section for the whole transition: the settle that moves
+                # the bytes, the key cleanup that reads its result, and the
+                # verdict bookkeeping that follows it. Retirement runs the
+                # mirror section (see _release_staged) under the same lock:
+                # without it a retirement could land between this callback's
+                # "not retired" observation and its insertion, delete the
+                # pending map, and have the callback rebuild it for a request
+                # nobody will ever ask about again -- rechecked every step,
+                # cancelled never.
+                with self._verdict_lock:
+                    self._captures.settle(
+                        save_req.req_id, save_req.session_id, outcomes
+                    )
+                    self._captures.drop_uris_if_idle(save_req.req_id)
+                    retired = save_req.req_id in self._retired_requests
+                    if not retired and any(session_captures):
+                        self._verdict_pending.setdefault(save_req.req_id, {})[
+                            session_key
+                        ] = session_captures
+                    if (
+                        retired
+                        and not self._verdict_pending.get(save_req.req_id)
+                        and not self._captures.holds(save_req.req_id)
+                    ):
+                        # The last callback for this request has landed: the
+                        # tombstone has done its job (it kept late settles
+                        # from rebuilding state) and must go, or a long-lived
+                        # worker accumulates request ids -- and a reused id
+                        # would treat a fresh request's callbacks as retired.
+                        self._retired_requests.discard(save_req.req_id)
+                if retired:
+                    # The request is gone: the retirement already released
+                    # its captures, no verdict will be consumed, and a
+                    # pending entry here would be rechecked every step
+                    # without ever being cancelled (the retirement was the
+                    # only other place that clears them).
+                    for rank in range(self._tp_size):
+                        self._coordinator_client.cancel_verdict(session_key, rank)
+                elif any(session_captures):
+                    self._recheck_pending_verdicts(
+                        {save_req.req_id: {session_key: session_captures}}
+                    )
+                failed = [key for key, ok in outcomes.items() if not ok]
+                if failed:
+                    logger.warning(
+                        "req:%s session %d: %d windowed block(s) failed to write; "
+                        "their captured bytes stay staged for a retry",
+                        save_req.req_id,
+                        save_req.session_id,
+                        len(failed),
+                    )
+            finally:
+                done_cb(flat)
+
+        return wrapper
+
+    def _recheck_pending_verdicts(
+        self, pending: "Optional[Dict[str, Dict[str, List[int]]]]" = None
+    ) -> None:
+        """Ask the coordinator about sessions whose local success is pending.
+
+        Called right after a settle and once per step (wait_for_save): the
+        coordinator answers as soon as every rank reported (the same AND it
+        writes into finish_write_cache), so a session confirms within a step.
+        Confirmed blocks are released; a session whose verdict says a rank
+        failed keeps its bytes (the retry's only copy -- and the manager
+        rejected the block, so it is announced again).
+        """
+        if time.monotonic() < self._verdict_query_down_until:
+            return  # the endpoint is down: do not pay a timeout per session
+        with self._verdict_lock:
+            if pending is None:
+                source = {
+                    req_id: dict(sessions)
+                    for req_id, sessions in self._verdict_pending.items()
+                }
+            else:
+                source = {req_id: dict(items) for req_id, items in pending.items()}
+        for req_id, sessions in source.items():
+            for session_id, positions in sessions.items():
+                verdict = self._coordinator_client.ask_verdict(
+                    session_id, self._tp_rank
+                )
+                if verdict is False:
+                    # Cannot ask (the query port is unbound, or the answer
+                    # timed out): stop this round -- every further probe would
+                    # pay the same timeout -- and mute the endpoint for a while
+                    # so the next steps do not pay it either.
+                    self._verdict_query_down_until = (
+                        time.monotonic() + VERDICT_QUERY_BACKOFF_SECONDS
+                    )
+                    return
+                if verdict is None:
+                    continue  # not decided yet: recheck next step
+                # The mask follows the announced range: position i is the
+                # session's i-th block, whatever its manager block number is.
+                # Only the positions this session actually captured are on the
+                # books (see _settle_session_captures): the release is exact to
+                # the (window spec, block) pairs it wrote, so a committed
+                # position whose windowed group abstained cannot free a newer
+                # capture the committed location never carried.
+                committed = [
+                    pair
+                    for i, pairs in enumerate(positions)
+                    if i < len(verdict) and verdict[i]
+                    for pair in pairs
+                ]
+                if committed:
+                    released = self._captures.release_staged_keys(req_id, committed)
+                    if released:
+                        logger.debug(
+                            "req:%s session %s: released %d captured block "
+                            "slots the coordinator confirmed (all ranks wrote "
+                            "them)",
+                            req_id,
+                            session_id,
+                            released,
+                        )
+                # Decided either way: nothing left to recheck. The lock keeps
+                # a settle that is landing right now from being dropped: only
+                # the entries seen here are removed, and the request's map is
+                # only popped while it is still the same empty object.
+                with self._verdict_lock:
+                    live = self._verdict_pending.get(req_id)
+                    if live is not None:
+                        live.pop(session_id, None)
+                        if not live:
+                            self._verdict_pending.pop(req_id, None)
+
+    def _drop_pending_verdicts(self, req_id: str) -> None:
+        """A retiring request has no retry left: pending blocks go with it."""
+        with self._verdict_lock:
+            pending = self._verdict_pending.pop(req_id, None)
+        if pending:
+            self._cancel_pending_verdicts(req_id, pending)
+
+    def _cancel_pending_verdicts(
+        self, req_id: str, pending: Dict[str, List[int]]
+    ) -> None:
+        """Cancel a retired request's pending sessions and free their bytes.
+
+        The request is gone on this rank while slower ranks may still be
+        writing it: the coordinator would keep each entry waiting for a query
+        that cannot come any more. Cancelling counts as this rank's answer --
+        and like the query loop it stops at the first failure and mutes the
+        endpoint, instead of paying one receive timeout per session while the
+        request retires. Runs outside _verdict_lock: the cancels are socket
+        calls with their own timeouts.
+        """
+        if time.monotonic() >= self._verdict_query_down_until:
+            for session_id in pending:
+                if not self._coordinator_client.cancel_verdict(
+                    session_id, self._tp_rank
+                ):
+                    self._verdict_query_down_until = (
+                        time.monotonic() + VERDICT_QUERY_BACKOFF_SECONDS
+                    )
+                    break
+        self._captures.release_staged(
+            req_id,
+            [
+                block
+                for positions in pending.values()
+                for pairs in positions
+                for _, block in pairs
+            ],
+        )
+
+    def _windowed_save_annotations(
+        self,
+        req_id: str,
+        session_id: int,
+        group: AttentionTransferGroup,
+        manager_block_idxes: Sequence[int],
+        uris: List[Optional[str]],
+    ) -> Dict[str, Any]:
+        """Staging slots for a windowed group's save, block by block.
+
+        The slot the capture holds, or None where it holds nothing; what None
+        *means* is the task's business, and the location tells it which case
+        this is: an announced location with no bytes must not be published (the
+        block fails, withdrawing the claim), while a block the announcement
+        already described as window-less wrote nothing by design and abstains.
+
+        Handing a block over *moves* its entry from ``_staged`` to
+        ``_in_flight``: the task owns the slot from here on and returns it when
+        its transfer lands. The block's URI is remembered with the handover --
+        one ledger transition (see _CaptureLedger.take_planned), so a settle
+        that concurrently decides the request is idle cannot drop the key map
+        between the two -- and a release for another request may only drop
+        bytes whose URI is not still owned by a live session (see _block_uris).
+        A block is announced once, so a second plan for the same block means
+        the announcement was repeated -- it gets no slot (and no location to
+        write to), rather than a slot two tasks would both release.
+        """
+        slots = self._captures.take_planned(
+            req_id, session_id, group.spec_name, manager_block_idxes, uris
+        )
+        missing = [
+            i for i, slot in enumerate(slots) if slot is None and uris[i] is not None
+        ]
+        if missing:
+            logger.warning(
+                "save group %s: %d/%d announced blocks have no captured bytes "
+                "(withheld capture?); failing them instead of publishing a hole",
+                group.spec_name,
+                len(missing),
+                len(manager_block_idxes),
+            )
+        return {"staged_slots": slots}
+
+    def _windowed_load_annotations(
+        self,
+        group: AttentionTransferGroup,
+        manager_block_idxes: Sequence[int],
+        token_indices: List[List[int]],
+        null_masks: List[List[bool]],
+    ) -> Dict[str, Any]:
+        """Null-slot disposition of a windowed group's load, block by block.
+
+        Rows pointing at vLLM's null block are invisible to attention, but
+        writing them would scribble on the shared zero page: they are aliased
+        onto the block's first real row instead (and the kernel's token slots
+        are rewritten to match, so the real bytes land on the real slots). A
+        block whose every row is null has nothing to load at all.
+        """
+        annotations: List[Optional[NullBlockRow]] = []
+        for i, _block in enumerate(manager_block_idxes):
+            nulls = null_masks[i]
+            if not any(nulls):
+                annotations.append(None)
+                continue
+            rows = [r for r, is_null in enumerate(nulls) if is_null]
+            source = next((r for r, is_null in enumerate(nulls) if not is_null), None)
+            if source is not None:
+                for row in rows:
+                    token_indices[i][row] = token_indices[i][source]
+            annotations.append(NullBlockRow(rows=rows, source_row=source))
+        return {"null_rows": annotations}
 
     def _plan_group_transfers(
         self,
         locations: List[Dict[str, Any]],
         manager_block_idxes: Sequence[int],
         block_ids_per_group: List[List[int]],
+        req_id: str,
+        *,
+        for_save: bool = False,
+        session_id: int = 0,
     ) -> Optional[List[TransferPlan]]:
         """Build the per-group TransferPlans for a set of manager blocks.
 
@@ -430,6 +1278,15 @@ class ConnectorWorker:
         hole is a failure, for state groups it must agree with the block
         table (a null state block). Returns None only if the manager returned
         the wrong number of locations altogether.
+
+        Windowed groups get their own annotations in the same pass, and which
+        ones depends on the direction: a *save* plan points each block at the
+        staging slot the eager capture filled (``staged_slots``, with a
+        withdrawn location for the blocks whose capture was withheld), a *load*
+        plan carries the rows whose target slot is vLLM's null block
+        (``null_rows``). Both are read off the block table snapshot the
+        instructions carry; the late-gather path of full-attention groups is
+        untouched.
         """
         num_blocks = len(manager_block_idxes)
         if len(locations) != num_blocks:
@@ -451,13 +1308,42 @@ class ConnectorWorker:
             # block_ids_per_group is indexed by the vLLM group index.
             block_table = block_ids_per_group[group.group_idx]
             if isinstance(group, AttentionTransferGroup):
+                if for_save and group.retention is not None:
+                    # A staged (windowed) save reads its bytes out of the
+                    # staging arena, not out of vLLM's slots, so it does not
+                    # translate manager blocks through the block table at all:
+                    # after a preemption the resume's table can be shorter than
+                    # the prefix whose bytes the capture still holds, and the
+                    # translation's range check would abort a save that needs
+                    # nothing from the table (the captured block keys are the
+                    # old prefix's, and so are its bytes).
+                    plans.append(
+                        TransferPlan(
+                            group=group,
+                            uris=uris,
+                            token_indices=[],
+                            **self._windowed_save_annotations(
+                                req_id, session_id, group, manager_block_idxes, uris
+                            ),
+                        )
+                    )
+                    continue
+                token_indices, null_masks = self._attn_slots(
+                    group, manager_block_idxes, block_table
+                )
+                extra: Dict[str, Any] = {}
+                if group.retention is not None:
+                    # The save side of a windowed group returned above; what is
+                    # left here is the load, whose rows come from the table.
+                    extra = self._windowed_load_annotations(
+                        group, manager_block_idxes, token_indices, null_masks
+                    )
                 plans.append(
                     TransferPlan(
                         group=group,
                         uris=uris,
-                        token_indices=self._attn_token_indices(
-                            group, manager_block_idxes, block_table
-                        ),
+                        token_indices=token_indices,
+                        **extra,
                     )
                 )
             else:
@@ -506,6 +1392,7 @@ class ConnectorWorker:
                 load_req.need_load_locations,
                 load_req.manager_block_idxes,
                 load_req.all_block_ids,
+                load_req.req_id,
             )
 
             # Report failures against the block table vLLM can act on: map each
@@ -520,17 +1407,53 @@ class ConnectorWorker:
             # "TODO (davidb): add support for hybrid memory allocator" -- so
             # for multi-group models (hybrid attn+mamba, or any model whose
             # vLLM block table has more than one entry -- skipped EAGLE/MTP
-            # drafter groups still count) a failed load CANNOT be reported
-            # and is only logged; vLLM then decodes from whatever bytes the
-            # partial load left in the paged cache, which can produce corrupt
-            # output. Gate on the block-table shape (all_block_ids is the
+            # drafter groups still count) a failed load CANNOT be reported as
+            # block ids. Gate on the block-table shape (all_block_ids is the
             # snapshot of kv_cache_manager.get_block_ids -- the very table
             # the recovery path unpacks), not on is_hybrid: a multi-group
             # attention-only model is not hybrid yet still breaks the unpack.
-            # Remove the gating once upstream supports multi-group
-            # invalid-block recovery.
+            #
+            # Accepting windowed specs is what granted external hits to
+            # *windowed* multi-group shapes (the gemma geometry: sliding
+            # groups beside a full one), and for those this connector refuses
+            # to keep the legacy containment ("log it and decode on whatever
+            # loaded") -- the bytes it just loaded are the request's only KV,
+            # and a partial load would decode on a hole. Such a load reports
+            # its failure at request granularity instead (see
+            # create_load_done_callback): vLLM >= 0.30 turns it into a
+            # recompute (or a failed request under kv_load_failure_policy=
+            # "fail"), and an older vLLM -- which has no request-level path
+            # at all -- makes the connector fail closed rather than decode
+            # silently (v1_connector.get_finished). Non-windowed hybrid
+            # models keep the swallowed-and-logged behaviour their e2e
+            # contract pinned. Remove the request-level detour once upstream
+            # supports multi-group invalid-block recovery.
+            #
+            # The same whole-KV contract holds for the engine-rebuilt skip
+            # shapes: a load request carries one block table per vLLM group,
+            # the skipped groups' included, and the tables this connector
+            # neither registers (the registered group numbers of the metas)
+            # nor owes to a drafter (vLLM's eagle mark) belong to groups the
+            # ENGINE rebuilds on a hit -- replayed windows and compression
+            # rings (the V4.1 shape, vLLM >= 0.31) or tiers the engine
+            # refills itself. No manager location can ever serve those
+            # groups, so the registered buckets are the request's entire
+            # externally-loaded KV and a partial load is a hole in exactly
+            # the windowed sense -- the failure travels at request
+            # granularity for them too. An era that hands fewer tables than
+            # the connector serves reads as "no unserved tables" and keeps
+            # the legacy behaviour; the non-windowed hybrid (every group
+            # registered) never counts an unserved table either.
             report_ids = []
             report_failures = len(load_req.all_block_ids) == 1
+            unserved_tables = (
+                len(load_req.all_block_ids)
+                - len({meta.group_idx for meta in self._group_metas})
+                - self._num_eagle_groups
+            )
+            report_request_failures = not report_failures and (
+                self._has_windowed_groups or unserved_tables > 0
+            )
             if report_failures:
                 # With exactly one vLLM block table the transferred group is
                 # group 0, and it must be an attention group: a lone state
@@ -562,6 +1485,7 @@ class ConnectorWorker:
                 copy.copy(report_ids),
                 num_blocks,
                 report_failures=report_failures,
+                report_request_failures=report_request_failures,
             )
 
             if plans is None:
@@ -592,7 +1516,24 @@ class ConnectorWorker:
         pass
 
     def wait_for_save(self, meta: TairKvCacheConnectorMetadata) -> None:
+        """Capture the windowed groups' new blocks, then write the sessions.
+
+        Capture first and unconditionally: those blocks are freed by vLLM's
+        next schedule step, so this hook -- the tail of the step whose forward
+        produced them -- is the only moment their bytes are still in HBM. The
+        writes that follow are the sessions an earlier step's HTTP call
+        produced; a windowed group's task takes its bytes from the capture
+        (``staged_slots``) instead of gathering, so the announce -> session lag
+        never touches HBM, while full-attention groups keep the late gather.
+        """
+        # Sessions whose local success is not yet confirmed: the coordinator
+        # answers within a step, so this is where the loop closes.
+        self._recheck_pending_verdicts()
+        if meta.to_capture_requests:
+            self._capture_blocks(meta)
         if not meta.to_save_requests:
+            for req_id, blocks, uris, confirmed in meta.to_release_captures:
+                self._release_captures_for(req_id, blocks, uris, confirmed=confirmed)
             return
         ready_event = self._device_mod.Event()
         ready_event.record(self._device_mod.current_stream())
@@ -603,11 +1544,16 @@ class ConnectorWorker:
                 save_req.target_locations,
                 save_req.manager_block_idxes,
                 save_req.all_block_ids,
+                save_req.req_id,
+                for_save=True,
+                session_id=save_req.session_id,
             )
 
             done_cb = self._data_transfer.create_save_done_callback(
                 save_req.req_id, self._tp_rank, save_req.write_session_id, num_blocks
             )
+            if plans is not None:
+                done_cb = self._settle_session_captures(save_req, plans, done_cb)
 
             if plans is None:
                 mr = MultiResult(1, done_cb)
@@ -633,9 +1579,366 @@ class ConnectorWorker:
                     self._pending_saves.get(save_req.req_id, 0) + 1
                 )
 
+        # The queued releases come *after* every plan of this batch has taken
+        # its captures: a release queued for a block an older session left
+        # behind must not be able to withdraw the bytes this step's session is
+        # about to write (the scheduler re-checks its protection when it
+        # flushes, and this is the same rule one layer down).
+        for req_id, blocks, uris, confirmed in meta.to_release_captures:
+            self._release_captures_for(req_id, blocks, uris, confirmed=confirmed)
+
+    # ------------------------------------------------------------------ #
+    # Eager capture (windowed groups)
+    # ------------------------------------------------------------------ #
+    def _windowed_metas(self) -> List[AttentionGroupMeta]:
+        return [
+            meta
+            for meta in self._group_metas
+            if isinstance(meta, AttentionGroupMeta) and meta.retention is not None
+        ]
+
+    def _windowed_groups(self) -> List[AttentionTransferGroup]:
+        return [
+            g
+            for g in self._kvcache_info.groups
+            if isinstance(g, AttentionTransferGroup) and g.retention is not None
+        ]
+
+    def _capture_blocks(self, meta: TairKvCacheConnectorMetadata) -> None:
+        """Copy every request-step of this step, on one step-level budget.
+
+        The capture waits a bounded time for arena room (see
+        ``CAPTURE_POOL_WAIT_SECONDS``); when the arena is held by in-flight
+        writes, *every* request of the step would pay that wait and the engine
+        thread pays the sum of them. One timeout is therefore the whole step's
+        budget: the remaining captures are skipped (they would only time out
+        too) and their blocks fail closed like a withheld capture -- announced
+        location, no bytes, so the block is not published.
+        """
+        captures = meta.to_capture_requests
+        # One deadline for the whole step, not one per request: every request
+        # of the step draws from the same budget, so a long chain of requests
+        # that each just make it cannot stall the engine thread for their sum.
+        deadline = time.monotonic() + CAPTURE_POOL_WAIT_SECONDS
+        for index, capture in enumerate(captures):
+            try:
+                if not self._capture_request(capture, deadline):
+                    skipped = len(captures) - index - 1
+                    if skipped:
+                        logger.warning(
+                            "windowed capture budget for this step is spent "
+                            "(%.0f ms); skipping %d further capture(s), whose "
+                            "blocks are not published",
+                            CAPTURE_POOL_WAIT_SECONDS * 1000,
+                            skipped,
+                        )
+                    break
+            except Exception:
+                # Degrade, never crash the engine mid-step: the block's save
+                # verdict becomes a failure (its location claimed the spec and
+                # no bytes were captured), so nothing is published for it.
+                logger.exception(
+                    "req:%s windowed capture failed, failing %d blocks",
+                    capture.req_id,
+                    len(capture.manager_block_idxes),
+                )
+
+    def _capture_request(
+        self, capture: CaptureRequest, deadline: Optional[float] = None
+    ) -> bool:
+        """Copy this request-step's windowed blocks into the staging arena.
+
+        Returns False when the request-step was withheld for lack of arena room
+        within the capture deadline (the caller then stops capturing for this
+        step), True otherwise.
+
+        All-or-nothing per request-step: a block's publish verdict is the AND
+        over its groups, so a partially captured step would fail the blocks
+        anyway -- releasing the runs again keeps the arena free for the steps
+        that can be captured whole. Blocks whose windowed slots are already
+        null are left out of the runs (abstain: their bytes do not exist).
+        """
+        groups = self._windowed_groups()
+        if not groups:
+            return True
+        blocks = capture.manager_block_idxes
+        if not blocks:
+            return True
+        metas = self._windowed_metas()
+        per_group: List[Tuple[AttentionTransferGroup, List[List[int]], List[int]]] = []
+        for group in groups:
+            table = capture.all_block_ids[group.group_idx]
+            slots, _null_masks = self._attn_slots(group, blocks, table)
+            # The *shared* predicate, on the announced snapshot: what the
+            # scheduler announced as "has window data" is exactly what this
+            # capture copies -- the two must never disagree, since the
+            # announcement is what a later hit trusts.
+            captureable = [
+                i
+                for i in range(len(blocks))
+                if windowed_block_has_data(
+                    metas, capture.all_block_ids, blocks[i], self._manager_block_size
+                )
+            ]
+            if captureable:
+                per_group.append((group, slots, captureable))
+        if not per_group:
+            return True
+        # Take every run before writing anything down: a failure must leave no
+        # half-held slot behind, so the runs of the groups that did fit are
+        # released again when a later group does not fit (or raises).
+        #
+        # One deadline for the whole request-step, handed down from the step
+        # (see _capture_blocks): the budget is what a *step* may spend holding
+        # the engine thread -- not what each bucket, nor each request, may
+        # spend on its own (a handful of them would otherwise stall the step
+        # for count x CAPTURE_POOL_WAIT_SECONDS while the slots trickle free).
+        # A direct caller (tests, one-off captures) gets its own budget.
+        if deadline is None:
+            deadline = time.monotonic() + CAPTURE_POOL_WAIT_SECONDS
+        taken: List[Tuple[AttentionTransferGroup, List[int], Any, int]] = []
+        withheld: Optional[AttentionTransferGroup] = None
+        try:
+            for group, slots, captureable in per_group:
+                start = self._data_transfer.capture_blocks(
+                    group,
+                    [slots[i] for i in captureable],
+                    timeout=max(deadline - time.monotonic(), 0.0),
+                )
+                if start is None:
+                    withheld = group
+                    break
+                taken.append(
+                    (group, captureable, self._data_transfer.pool_of(group), start)
+                )
+        except BaseException:
+            self._release_runs(taken)
+            raise
+        if withheld is not None:
+            self._release_runs(taken)
+            logger.warning(
+                "req:%s windowed capture of %d blocks withheld: the staging "
+                "arena of %s has no free run within %.0f ms (held by in-flight "
+                "writes); those blocks are failed, not published",
+                capture.req_id,
+                len(blocks),
+                withheld.spec_name,
+                CAPTURE_POOL_WAIT_SECONDS * 1000,
+            )
+            return False
+        for group, captureable, pool, start in taken:
+            for offset, i in enumerate(captureable):
+                # A repeat capture for a block already staged (the save
+                # watermark moved backwards when preemption shrank the
+                # allocation): the ledger supersedes the old entry -- it has no
+                # session reference, a session *moves* the entry into the
+                # in-flight map when it takes it -- and returns its slot.
+                superseded = self._captures.stage(
+                    capture.req_id,
+                    (group.spec_name, blocks[i]),
+                    _Capture(pool=pool, slot=start + offset),
+                )
+                if superseded is not None:
+                    logger.warning(
+                        "req:%s block %d of %s was captured twice (the "
+                        "announcement repeated); releasing its previous slot %d",
+                        capture.req_id,
+                        blocks[i],
+                        group.spec_name,
+                        superseded,
+                    )
+        logger.info(
+            "req:%s captured %d windowed blocks (%d groups) before the window "
+            "moved",
+            capture.req_id,
+            sum(len(captureable) for _, captureable, _, _ in taken),
+            len(taken),
+        )
+        return True
+
+    @staticmethod
+    def _release_runs(taken: Sequence[Tuple[Any, List[int], Any, int]]) -> None:
+        """Give back the runs of a capture that will not be kept."""
+        for _group, captureable, pool, start in taken:
+            pool.release(start, len(captureable))
+
+    def _release_captures_for(
+        self,
+        req_id: str,
+        blocks: Sequence[int],
+        block_uris: "Optional[Dict[int, Sequence[str]]]" = None,
+        confirmed: bool = False,
+    ) -> None:
+        """Return the captured slots of blocks no session is going to write.
+
+        The manager reported them as already cached when the session came back,
+        so the bytes the eager capture copied for them are never published (the
+        session does not even mention them): holding them until the request
+        retires would pin one arena slot per already-cached block for as long
+        as the request runs. Entries already handed to a session are the task's
+        to release and are left alone.
+        """
+        # A confirmed block is durable (the coordinator's AND), so no pending
+        # writer's copy is at stake: nothing to guard. Otherwise the guard
+        # keeps the bytes of any block whose cache key a live write session
+        # still owns -- other requests' as before, and this request's own
+        # in-flight sessions (a task that has not consumed them yet; on TP the
+        # same block key is written by every rank).
+        pending = set() if confirmed else self._uris_other_requests_hold(req_id)
+        # One section for the verdict check and the release it licenses: the
+        # settle callbacks run the mirror section (see
+        # _settle_session_captures), restaging an older session's bytes and
+        # registering the pending verdict they wait for. With the check and
+        # the release apart, a settle could land exactly between them -- the
+        # release would free the bytes the callback just put back, and once
+        # another rank fails that session's global verdict the retry has lost
+        # the only copy it could republish. Held together, a settle lands
+        # either before the check (its blocks are protected) or after the
+        # release (which freed nothing of its own -- its bytes were still in
+        # flight, and they restage afterwards).
+        with self._verdict_lock:
+            awaiting = {
+                block
+                for positions in (self._verdict_pending.get(req_id) or {}).values()
+                for pairs in positions
+                for _, block in pairs
+            }
+            releasable = []
+            for block in blocks:
+                reported = (block_uris or {}).get(block, ())
+                own = self._block_uris.get(req_id, {}).get(block)
+                candidates = set(reported)
+                if own is not None:
+                    candidates.add(own)
+                if block in awaiting:
+                    # A session of this request is still waiting for its
+                    # verdict -- confirmed or not: ``confirmed`` only means
+                    # *this* release's announcement allocated nothing (a
+                    # business rejection), not that the older session's write
+                    # committed. Releasing the block's bytes now could leave
+                    # the retry with nothing once the HBM window moved. The
+                    # verdict recheck releases them when it says committed.
+                    continue
+                if not confirmed and not candidates:
+                    # The manager returned no location for this block (it was
+                    # deduplicated into its "already" mask), so its cache key
+                    # is unknown: this release cannot tell whether another
+                    # request holds an uncommitted allocation under that key,
+                    # and dropping the bytes could leave that writer -- and any
+                    # retry of ours -- with nothing. Defer it: the verdict
+                    # recheck (or retirement) releases once the commit is
+                    # known.
+                    continue
+                if candidates & pending:
+                    # A live session of some request still owns this cache key:
+                    # the manager's "existing" may be one of its uncommitted
+                    # allocations (duplicate StartWriteCache calls are
+                    # deduplicated before FinishWriteCache), so dropping these
+                    # bytes could leave nobody able to publish the block if
+                    # that writer fails.
+                    logger.debug(
+                        "req:%s block %d: not releasing its capture, %s is still "
+                        "being written by another session",
+                        req_id,
+                        block,
+                        sorted(candidates),
+                    )
+                    continue
+                releasable.append(block)
+            released = self._captures.release_staged(req_id, releasable)
+        if released:
+            logger.info(
+                "req:%s released %d captured block slots the manager already "
+                "holds (nothing to publish for them)",
+                req_id,
+                released,
+            )
+
+    def _uris_other_requests_hold(self, req_id: str) -> Set[str]:
+        """The cache keys (URIs) *other* requests still hold bytes for.
+
+        A request's own blocks are not guarded (its release is exactly what
+        its own confirmation asks for), but another request's are: the manager
+        answers "existing" for a block while an earlier session of a *different*
+        request owns only uncommitted allocations (duplicate StartWriteCache
+        calls are deduplicated before FinishWriteCache). Dropping the second
+        request's bytes there leaves nobody able to publish the block if the
+        first writer fails. Both states guard: in flight (a task is writing it)
+        and staged (a local verdict landed, but the commit -- an AND over the
+        ranks -- is unknown).
+
+        Read without the ledger lock on purpose: a stale view can only make
+        this *more* conservative.
+        """
+        uris: Set[str] = set()
+        for other, block_uris in list(self._block_uris.items()):
+            if other == req_id:
+                # This request's own *in-flight* sessions guard their keys
+                # (their tasks have not read them yet); its staged (settled)
+                # entries do not -- releasing those is the confirmation's whole
+                # purpose.
+                for _session, _spec, block in list(
+                    self._in_flight.get(req_id, {})
+                ):
+                    uri = block_uris.get(block)
+                    if uri is not None:
+                        uris.add(uri)
+                continue
+            if not self._captures.holds(other):
+                continue
+            for uri in list(block_uris.values()):
+                if uri is not None:
+                    uris.add(uri)
+        return uris
+
+    def _release_staged(self, req_id: str) -> None:
+        """Return the capture slots the request never handed to a session.
+
+        Called when the request retires: whatever no session referenced (an
+        announcement that was canceled, a step that was never re-announced) must
+        not pin the arena for the rest of the process's life. A block that *did*
+        reach a session is that session's to release -- it returns its slot when
+        the transfer lands, success or failure -- because releasing in-flight
+        slots here would hand live bytes to the next capture before the SDK read
+        them and free the same slot twice (the pool's free list would then hold
+        the range twice and dispatch it to two transfers; review_r1 S1).
+        """
+        # One section for the whole retirement: the pending-verdict drop, the
+        # ledger retirement and the tombstone decision, the mirror of the
+        # settle callbacks' section (see _settle_session_captures) -- a settle
+        # that lands concurrently must not observe "not retired" here and
+        # rebuild the pending map the retirement just emptied. The tombstone
+        # is only added when a settle can still land: with nothing in flight
+        # no callback remains, and the tombstone's only removal path is a
+        # later settle -- it would pin the request id for the process's life,
+        # and a reused id would settle as retired instead of being restaged.
+        with self._verdict_lock:
+            pending = self._verdict_pending.pop(req_id, None)
+            released, settles = self._captures.retire(req_id)
+            if settles:
+                self._retired_requests.add(req_id)
+            self._captures.drop_uris_if_idle(req_id)
+        if pending:
+            self._cancel_pending_verdicts(req_id, pending)
+        in_flight = self._in_flight.get(req_id)
+        logger.debug(
+            "req:%s released %d un-taken captured block slots (%d in flight "
+            "with their sessions)",
+            req_id,
+            released,
+            len(in_flight or ()),
+        )
+
     def on_save_finished(
         self, write_session_id: str, save_context: SaveContext
     ) -> None:
+        # 未报到过的 rank 按全失败参与 AND：整席退役的会话（协调者溢出标记）
+        # 只有部分 rank 的结果，缺席位不得被当成成功——裁决声称了被丢事件
+        # 可能失败的块，就会让各 rank 释放唯一字节。
+        for rank in range(self._tp_size):
+            save_context.result_per_rank.setdefault(
+                rank, [False] * len(save_context.locations)
+            )
         for block_idx in range(len(save_context.locations)):
             fully_saved = all(
                 save_context.result_per_rank[rank][block_idx]
@@ -647,20 +1950,66 @@ class ConnectorWorker:
             save_context.success_mask,
             write_session_id,
         )
-        try:
-            self._manager_client.finish_write_cache(
-                {
-                    "trace_id": "finish_%s" % write_session_id[:8],
-                    "instance_id": self._extra_config.instance_id,
-                    "write_session_id": write_session_id,
-                    "success_blocks": {
-                        "bool_masks": {"values": save_context.success_mask}
-                    },
-                }
-            )
-        except Exception as e:
+        committed = True
+        if save_context.locations:
+            report = {
+                "trace_id": "finish_%s" % write_session_id[:8],
+                "instance_id": self._extra_config.instance_id,
+                "write_session_id": write_session_id,
+                "success_blocks": {"bool_masks": {"values": save_context.success_mask}},
+            }
+            for attempt in range(FINISH_WRITE_CACHE_ATTEMPTS):
+                try:
+                    self._manager_client.finish_write_cache(report)
+                    break
+                except Exception as e:
+                    if attempt + 1 >= FINISH_WRITE_CACHE_ATTEMPTS:
+                        # Gave up: the manager may still hold these blocks
+                        # uncommitted, so nothing is released (a retry has to find
+                        # the bytes) and the verdict is not published -- publishing
+                        # it would let every rank release its only captured copy of
+                        # blocks the manager never committed.
+                        committed = False
+                        logger.warning(
+                            "finish_write_cache failed after %d attempts, session: "
+                            "%s, error: %s",
+                            FINISH_WRITE_CACHE_ATTEMPTS,
+                            write_session_id,
+                            e,
+                        )
+                        break
+                    logger.warning(
+                        "finish_write_cache failed (attempt %d/%d), retrying: "
+                        "session %s, error: %s",
+                        attempt + 1,
+                        FINISH_WRITE_CACHE_ATTEMPTS,
+                        write_session_id,
+                        e,
+                    )
+                    time.sleep(FINISH_WRITE_CACHE_RETRY_SECONDS)
+        else:
+            # 会话在协调者一无所知时被整席退役（start 与 finish 都被丢弃）：
+            # 无结果可报，manager 侧由写会话自身的超时回滚；这里仍要发布
+            # “空提交”的裁决，让等待该会话的 pending verdict 落定为
+            # “无提交位”，而不是每步重问直到退休。
             logger.warning(
-                "finish_write_cache failed, session: %s, error: %s", write_session_id, e
+                "session %s settled with nothing known; publishing an empty "
+                "verdict (the manager's own write-session timeout rolls it "
+                "back)",
+                write_session_id,
+            )
+
+        # The verdict is published, not acted on: releasing here would race
+        # this rank's own settle (the last report may be its own task, whose
+        # callback has not restaged the captures yet), and there would be no
+        # retry afterwards. Every rank releases through the pending recheck
+        # instead (see _recheck_pending_verdicts), which converges within a
+        # step and has the retirement as its backstop. Publication itself only
+        # happens once the manager acknowledged the report: before that the
+        # verdict is not a fact.
+        if committed and self._has_windowed_groups:
+            self._coordinator_server.record_verdict(
+                write_session_id, save_context.success_mask
             )
 
     def get_finished(
@@ -673,6 +2022,11 @@ class ConnectorWorker:
         finish_write_cache). The scheduler's FinishRequest -- sent when its
         own ledger says the request is settled -- either reports immediately
         or defers until the last session lands."""
+        for finish_req in meta.to_finish_requests:
+            # The request is done on the scheduler side (every announced
+            # session was handed over), so no further write can reference its
+            # captures: release whatever a session never took.
+            self._release_staged(finish_req.req_id)
         if self._tp_rank != 0:
             for finish_req in meta.to_finish_requests:
                 self._pending_saves.pop(finish_req.req_id, None)
@@ -707,3 +2061,20 @@ class ConnectorWorker:
         if failed:
             logger.warning("block_ids_with_load_errors: %s", failed)
         return failed
+
+    def drain_failed_loading_requests(self) -> Set[str]:
+        """Requests whose whole-KV load failed, once (rank 0).
+
+        Block ids cannot address a multi-table block layout upstream, so an
+        instance whose registered groups are the request's whole externally-
+        loaded KV (windowed multi-group, or the engine-rebuilt skip shapes)
+        marks the request itself (see create_load_done_callback). The
+        coordinator holds the mark until every rank reported, so it lands in
+        the same step the request is reported finished receiving;
+        v1_connector decides what it becomes on the running vLLM era
+        (failed_recving where the path exists, a loud fail-closed error where
+        it does not).
+        """
+        if self._tp_rank != 0:
+            return set()
+        return self._coordinator_server.get_failed_loading_requests()

@@ -120,6 +120,10 @@ _KNOWN_CACHE_DTYPES = (
 # recurrent state group (the union, i.e. *all* specs).
 ATTN_ONLY_SPEC_GROUP = "attn"
 ALL_SPEC_GROUP = "full"
+#: The windowed twins: every registered spec minus the windowed ones, i.e. what
+#: a block whose window was already freed still carries (see spec_group_plan).
+NO_WINDOW_SPEC_GROUP = "full_no_window"
+NO_WINDOW_ATTN_SPEC_GROUP = "attn_no_window"
 
 
 def spec_name(tp_rank: int, meta: "GroupMeta") -> str:
@@ -133,42 +137,143 @@ def spec_name(tp_rank: int, meta: "GroupMeta") -> str:
     return f"tp{tp_rank}_g{meta.group_idx}{meta.spec_suffix}"
 
 
-def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict]:
-    """LocationSpecGroups describing which specs a block may carry.
+def windowed_block_has_data(
+    windowed_metas: List["AttentionGroupMeta"],
+    block_ids_per_group: List[List[int]],
+    manager_block: int,
+    manager_block_size: int,
+) -> bool:
+    """Does every windowed group hold real slots for this manager block?
 
-    Hybrid (mamba "align") models write a *sparse* set of recurrent states:
-    vLLM materializes a state only at segment boundaries, so the interior
-    manager blocks of a request have attention KV but no state. Declaring
-    two groups lets ``start_write_cache`` say, per block, which specs that
-    block will actually hold:
+    vLLM's windowed managers write the *null block* (id 0) into every block-table
+    entry they free, so a manager block is describable by this one predicate:
+    all of its group blocks are still real (the bytes are in HBM and readable)
+    or some are null (the data does not exist any more -- reading the slots
+    yields the shared zero page, never the block's KV).
 
-    * ``full`` -- *all* specs: attention KV + every recurrent state;
-    * ``attn`` -- attention specs only (no state was materialized).
-
-    The manager then stores exactly the advertised specs, reports the real
-    per-block coverage in ``getCacheLocation``, and later lets a
-    complementary write fill in a block's missing state specs.
-
-    Full-attention models have nothing to be sparse about: they declare no
-    groups at all, which keeps their requests byte-identical to before (and
-    compatible with managers that predate spec groups).
+    Both roles read it from the *same* snapshot: the scheduler in the loop
+    iteration that announces the block (which fixes the announced spec coverage)
+    and the worker in the same step's capture (which fixes what is really
+    copied). Sharing the predicate is what keeps the announcement and the
+    capture from ever disagreeing.
     """
-    state_groups = [m for m in group_metas if isinstance(m, StateGroupMeta)]
-    if not state_groups:
-        return []
-    attn_specs = sorted(
+    if not windowed_metas:
+        return True
+    first = manager_block * manager_block_size
+    last = first + manager_block_size - 1
+    for meta in windowed_metas:
+        table = block_ids_per_group[meta.group_idx]
+        group_block_size = meta.block_size
+        for logical in range(first // group_block_size, last // group_block_size + 1):
+            if logical >= len(table) or table[logical] == 0:
+                return False
+    return True
+
+
+def spec_group_plan(
+    group_metas: List["GroupMeta"], tp_size: int
+) -> Tuple[List[dict], Dict[Tuple[bool, bool], str]]:
+    """The declared location spec groups and the per-block selection table.
+
+    A block's *coverage* is the pair (every state group holds a state, every
+    windowed group holds window data); what a block really carries is the specs
+    its coverage implies, and ``location_spec_group_names`` announces exactly
+    that set per block. The table maps each reachable coverage to a declared
+    group name.
+
+    Why it exists: a windowed block whose data is already gone must not be
+    published *as if* it had some -- the load side only trusts the manager's
+    per-block spec coverage. The state dimension has always worked this way
+    (attn/full); this adds the window dimension (``*_no_window`` variants), so
+    a block without windowed data is announced with the specs it does have.
+
+    A coverage missing from the table means no declared group describes it,
+    which happens only when the instance has no non-windowed spec at all (there
+    is nothing to announce for such a block, and nothing else can publish it
+    either -- an all-abstain block is not published).
+    """
+    if not any(isinstance(meta, AttentionGroupMeta) for meta in group_metas):
+        return [], {}
+    windowed_specs = {
         spec_name(rank, meta)
         for rank in range(tp_size)
         for meta in group_metas
-        if isinstance(meta, AttentionGroupMeta)
-    )
-    all_specs = sorted(
+        if isinstance(meta, AttentionGroupMeta) and meta.retention is not None
+    }
+    state_specs = {
+        spec_name(rank, meta)
+        for rank in range(tp_size)
+        for meta in group_metas
+        if isinstance(meta, StateGroupMeta)
+    }
+    all_specs = {
         spec_name(rank, meta) for rank in range(tp_size) for meta in group_metas
-    )
-    return [
-        {"name": ATTN_ONLY_SPEC_GROUP, "spec_names": attn_specs},
-        {"name": ALL_SPEC_GROUP, "spec_names": all_specs},
-    ]
+    }
+    attn_specs = all_specs - state_specs
+    no_window = all_specs - windowed_specs
+    no_window_attn = attn_specs - windowed_specs
+    if not windowed_specs and not state_specs:
+        # Nothing sparse: no groups at all, so single-group and hybrid-free
+        # models keep byte-identical requests (and old managers keep working).
+        return [], {}
+    declared: List[dict] = []
+
+    def declare(name: str, names: set) -> None:
+        if names:
+            declared.append({"name": name, "spec_names": sorted(names)})
+
+    # Once a block's coverage is announced per block, the "has everything"
+    # group is needed whatever dimensions are sparse; the state dimension adds
+    # its attention-only twin, the window dimension its no-window variants
+    # (whose sets can be empty -- a group is declared only when it names specs,
+    # and a coverage with no declareable group is one that carries nothing, so
+    # nothing gets published for it either).
+    declare(ALL_SPEC_GROUP, all_specs)
+    if state_specs:
+        declare(ATTN_ONLY_SPEC_GROUP, attn_specs)
+    if windowed_specs:
+        declare(NO_WINDOW_SPEC_GROUP, no_window)
+        if state_specs:
+            declare(NO_WINDOW_ATTN_SPEC_GROUP, no_window_attn)
+    table: Dict[Tuple[bool, bool], str] = {}
+    for states_complete in (True, False):
+        for window_present in (True, False):
+            if window_present:
+                name = ALL_SPEC_GROUP if states_complete else ATTN_ONLY_SPEC_GROUP
+            else:
+                name = (
+                    NO_WINDOW_SPEC_GROUP
+                    if states_complete
+                    else NO_WINDOW_ATTN_SPEC_GROUP
+                )
+            if any(group["name"] == name for group in declared):
+                table[(states_complete, window_present)] = name
+    return declared, table
+
+
+def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict]:
+    """LocationSpecGroups describing which specs a block may carry.
+
+    Two kinds of sparsity make a block's spec coverage narrower than the
+    instance's full set:
+
+    * hybrid (mamba "align") models materialize a recurrent state only at
+      segment boundaries, so interior manager blocks have attention KV but no
+      state (``full`` / ``attn``);
+    * windowed models free the blocks outside the window while the request
+      lives, so a block saved late carries no windowed KV at all
+      (``*_no_window``, see spec_group_plan).
+
+    Declaring the groups lets ``start_write_cache`` say, per block, which specs
+    that block will really hold. The manager then stores exactly the advertised
+    specs, reports the real per-block coverage in ``getCacheLocation``, and
+    later lets a complementary write fill in a block's missing specs.
+
+    Models with nothing to be sparse about declare no groups at all, which
+    keeps their requests byte-identical to before (and compatible with managers
+    that predate spec groups).
+    """
+    return spec_group_plan(group_metas, tp_size)[0]
 
 
 @dataclass(frozen=True)
@@ -192,6 +297,39 @@ class GroupMeta:
     spec_suffix: str = ""
 
 
+#: Retention kinds of a windowed attention bucket (see WindowRetention.kind).
+RETENTION_SLIDING = "sliding"
+RETENTION_CHUNKED_LOCAL = "chunked_local"
+RETENTION_RSWA_GAP = "rswa_gap"
+
+
+@dataclass(frozen=True)
+class WindowRetention:
+    """What a windowed attention group keeps, and therefore what the connector
+    must copy eagerly and must never restore into a freed slot.
+
+    vLLM's windowed managers free the blocks outside the window while the
+    request is alive (``remove_skipped_blocks``) and write the *null block* into
+    their block-table slots, so those positions are neither a token prefix nor
+    readable: a block's bytes exist only in the pass that produced it (eager
+    capture) and a null slot must never be written (the null block is the
+    shared zero page). The window the connector has to be able to serve is:
+
+    * ``sliding`` (SlidingWindowSpec): [H - sliding_window, H), extended by
+      ``extra_retained_tokens`` on the trailing edge (spec decoding);
+    * ``chunked_local`` (ChunkedLocalAttentionSpec): the chunk containing H;
+    * ``rswa_gap`` (RSWASpec): [H - rswa_window, H) plus the whole prefill, with
+      only the gap in between freed.
+    """
+
+    kind: str
+    # spec.sliding_window / spec.attention_chunk_size / spec.rswa_window.
+    window_tokens: int
+    # spec.extra_retained_tokens: trailing tokens kept (but not attended) so a
+    # multi-module spec-decoding store lag can still rebuild the window.
+    extra_retained_tokens: int = 0
+
+
 @dataclass(frozen=True)
 class AttentionGroupMeta(GroupMeta):
     """Attention bucket: token-granular KV, re-blockable to the manager block
@@ -201,6 +339,12 @@ class AttentionGroupMeta(GroupMeta):
     # padded page is never copied. Keyword-only because the base class already
     # carries the defaulted spec_suffix.
     page_bytes: int = field(kw_only=True)
+    # None = the bucket's blocks hold the whole token prefix and are never
+    # freed while the request lives (the contract the transfer path had before
+    # windowed groups arrived). Not None = the windowed contract above; every
+    # windowed-only branch (eager capture, null disposition, hit clamping)
+    # keys on this field so full-attention groups keep their exact old path.
+    retention: Optional[WindowRetention] = field(default=None, kw_only=True)
 
     # The page element type (spec.dtype): one instance may mix them (V3.2 bf16
     # main + uint8 indexer), and the staging pool keys by it, so the bucket, not
@@ -554,10 +698,39 @@ _COMPRESSION_SCRATCH_TYPES: Tuple[type, ...] = tuple(
 )
 
 
+def _retention_of(spec: Any) -> Optional[WindowRetention]:
+    """The window retention of an already-vetted attention spec.
+
+    Only the three windowed classes carry one -- and only as their *exact*
+    type, for the same reason the accept set is exact-type matched (an
+    undeclared subclass is a new claim about what stays alive). Called by the
+    gate's accept branches and by the parse path, so both agree by
+    construction.
+    """
+    if type(spec) is SlidingWindowSpec:
+        return WindowRetention(
+            kind=RETENTION_SLIDING,
+            window_tokens=spec.sliding_window,
+            extra_retained_tokens=getattr(spec, "extra_retained_tokens", 0) or 0,
+        )
+    if (
+        ChunkedLocalAttentionSpec is not None
+        and type(spec) is ChunkedLocalAttentionSpec
+    ):
+        return WindowRetention(
+            kind=RETENTION_CHUNKED_LOCAL,
+            window_tokens=spec.attention_chunk_size,
+        )
+    if RSWASpec is not None and type(spec) is RSWASpec:
+        return WindowRetention(kind=RETENTION_RSWA_GAP, window_tokens=spec.rswa_window)
+    return None
+
+
 def _check_attention_spec_supported(
     origin: str, spec: Any, *, calculate_kv_scales: bool
-) -> None:
-    """Accept or refuse one attention spec, by *class* rather than by field.
+) -> Optional[WindowRetention]:
+    """Accept or refuse one attention spec, by *class* rather than by field,
+    and return how the accepted bucket retains its blocks.
 
     The rules below cover the whole attention zoo of vllm 0.14 - 0.31 in the
     order they must be tested (a subclass before its parent). The field
@@ -567,25 +740,32 @@ def _check_attention_spec_supported(
     only failed much later -- or silently published freed gap blocks.
 
     Refused, because their blocks stop being the full token prefix while the
-    request is alive (vLLM frees or rewrites them):
+    request is alive (vLLM frees or rewrites them) *and* no data-plane
+    mechanism for them exists yet:
 
-    * SlidingWindowSpec (and its KpoolTailSpec subclass -- skipped before the
-      gate, see parse_groups), ChunkedLocalAttentionSpec: everything below the
-      window / outside the current chunk;
     * SlidingWindowMLASpec: windowed or replayed MLA state, coupled by V4 with
-      the compressed MLA group;
-    * RSWASpec: the whole prompt plus the last rswa_window generated tokens, so
-      the gap in between is freed;
+      the compressed MLA group; vLLM rebuilds those rows on a hit
+      (bounded_replay is the 0.31 default), so the correct disposition is the
+      parse-time skip of the DSA work, not a windowed transfer;
+    * an undeclared subclass of *any* accepted class, windowed ones included;
     * MLAAttentionSpec with a window field: only reachable through the promote
       path, which drops the replay policy; its retention semantics belong to
       the windowed-MLA work;
     * compressed MLA (tokens_per_state, or compress_ratio on vllm <= 0.28, > 1):
       one row spans several tokens.
 
-    Accepted: the full-prefix classes (_FULL_PREFIX_SPEC_TYPES) and the MLA
-    latent layouts (_MLA_SPEC_TYPES, which includes the HiddenStateCacheSpec
-    marker of extract_hidden_states -- it changes no layout of its own, so the
-    latent-layout gate is the whole check).
+    Accepted with a retention (the windowed contract, see WindowRetention --
+    these three carry the eager-capture / null-disposition / hit-clamp
+    machinery this file's users implement):
+
+    * SlidingWindowSpec -> ``sliding``;
+    * ChunkedLocalAttentionSpec -> ``chunked_local``;
+    * RSWASpec -> ``rswa_gap`` (the hole of vllm <= 0.31's field whitelist).
+
+    Accepted with ``None`` retention (full prefix, unchanged contract): the
+    full-prefix classes (_FULL_PREFIX_SPEC_TYPES) and the MLA latent layouts
+    (_MLA_SPEC_TYPES, which includes the HiddenStateCacheSpec marker of
+    extract_hidden_states -- it changes no layout of its own).
 
     Acceptance is by *exact* type, never by family: a subclass of an accepted
     class is a fresh claim about byte layout and retention (RSWASpec is
@@ -605,38 +785,45 @@ def _check_attention_spec_supported(
             f"{origin}: SlidingWindowMLASpec sliding_window="
             f"{getattr(spec, 'sliding_window', None)} holds windowed or partial "
             f"state, not the full prefix, and DeepSeek V4 couples it with the "
-            f"compressed MLA group; skipping it would leave those layers "
-            f"uninitialized after a hit -- sliding-window / compressor-state MLA "
-            f"KV is not supported by TairKvCacheConnector (window retention "
-            f"lands with the sliding-window support)"
+            f"compressed MLA group; vLLM rebuilds those rows on a hit "
+            f"(bounded_replay defaults to on), so a windowed transfer would "
+            f"republish state the engine regenerates -- sliding-window / "
+            f"compressor-state MLA KV is not supported by TairKvCacheConnector "
+            f"(the correct disposition is the parse-time skip)"
         )
     if isinstance(spec, SlidingWindowSpec):
-        raise NotImplementedError(
-            f"{origin}: {type(spec).__name__} sliding_window="
-            f"{getattr(spec, 'sliding_window', None)} extra_retained_tokens="
-            f"{getattr(spec, 'extra_retained_tokens', 0)} holds windowed KV: "
-            f"vLLM frees the blocks below the window while the request is "
-            f"alive, so they are not a token prefix -- sliding-window KV is "
-            f"not supported by TairKvCacheConnector (window retention lands "
-            f"with the sliding-window support)"
-        )
-    if isinstance(spec, ChunkedLocalAttentionSpec):
-        raise NotImplementedError(
-            f"{origin}: ChunkedLocalAttentionSpec attention_chunk_size="
-            f"{spec.attention_chunk_size} holds chunked-local KV: vLLM frees "
-            f"the blocks outside the current chunk while the request is alive, "
-            f"so they are not a token prefix -- chunked-local attention KV is "
-            f"not supported by TairKvCacheConnector"
-        )
+        if type(spec) is not SlidingWindowSpec:
+            # KpoolTailSpec (a ring tail, skipped before the gate when the era
+            # declares it is not cacheable) and anything user-registered: a
+            # windowed subclass is a new retention claim, so it must be named
+            # here deliberately first -- the RSWA lesson.
+            raise NotImplementedError(
+                f"{origin}: {type(spec).__name__} sliding_window="
+                f"{getattr(spec, 'sliding_window', None)} is a SlidingWindowSpec "
+                f"subclass this connector has not been taught; it transfers the "
+                f"windowed layouts of {SlidingWindowSpec.__name__} only"
+            )
+        return _retention_of(spec)
+    if (
+        ChunkedLocalAttentionSpec is not None
+        and isinstance(spec, ChunkedLocalAttentionSpec)
+    ):
+        if type(spec) is not ChunkedLocalAttentionSpec:
+            raise NotImplementedError(
+                f"{origin}: {type(spec).__name__} attention_chunk_size="
+                f"{getattr(spec, 'attention_chunk_size', None)} is a "
+                f"{ChunkedLocalAttentionSpec.__name__} subclass this connector "
+                f"has not been taught"
+            )
+        return _retention_of(spec)
     if RSWASpec is not None and isinstance(spec, RSWASpec):
-        raise NotImplementedError(
-            f"{origin}: RSWASpec rswa_window={spec.rswa_window} keeps the whole "
-            f"prompt but only the last {spec.rswa_window} generated tokens: "
-            f"vLLM frees the gap blocks in between while the request is alive, "
-            f"so a token prefix would republish freed (or already reused) "
-            f"blocks -- R-SWA KV is not supported by TairKvCacheConnector "
-            f"(window retention lands with the sliding-window support)"
-        )
+        if type(spec) is not RSWASpec:
+            raise NotImplementedError(
+                f"{origin}: {type(spec).__name__} rswa_window="
+                f"{getattr(spec, 'rswa_window', None)} is an RSWASpec subclass "
+                f"this connector has not been taught"
+            )
+        return _retention_of(spec)
     if isinstance(spec, MLAAttentionSpec):
         if type(spec) not in _MLA_SPEC_TYPES:
             # HiddenStateCacheSpec is the only declared one (a marker that adds
@@ -661,7 +848,7 @@ def _check_attention_spec_supported(
                     f"TairKvCacheConnector yet"
                 )
         _check_mla_variant(origin, spec, calculate_kv_scales=calculate_kv_scales)
-        return
+        return None
     if type(spec) in _FULL_PREFIX_SPEC_TYPES:
         tokens_per_state, field = _tokens_per_state(spec)
         if tokens_per_state != 1:
@@ -679,12 +866,12 @@ def _check_attention_spec_supported(
                 f"mis-sized. Refusing the instance (not supported by "
                 f"TairKvCacheConnector yet)"
             )
-        return
+        return None
     raise NotImplementedError(
         f"Unsupported kv cache spec {type(spec).__name__} in {origin}: "
-        f"TairKvCacheConnector serves token-prefix KV (full attention, MLA "
-        f"latent, and hybrid attention + mamba state) only; there is no "
-        f"transfer contract for this class"
+        f"TairKvCacheConnector serves token-prefix KV (full attention, windowed "
+        f"attention, MLA latent, and hybrid attention + mamba state) only; "
+        f"there is no transfer contract for this class"
     )
 
 
@@ -739,8 +926,13 @@ def _is_engine_rebuilt_scratch(spec: Any) -> bool:
     """
     if not _COMPRESSION_SCRATCH_TYPES:
         return False
+    # Exact types, like every other spec receipt in this file: a subclass of a
+    # ring (or of the packed wrapper) is a new claim about its own layout, and
+    # dropping it here would bypass the gate that refuses undeclared classes.
+    members = getattr(spec, "kv_cache_specs", None)
     if UniformTypeKVCacheSpecs is not None and type(spec) is UniformTypeKVCacheSpecs:
-        members = spec.kv_cache_specs
+        if not isinstance(members, dict):
+            return False
         return bool(members) and all(
             type(member) in _COMPRESSION_SCRATCH_TYPES for member in members.values()
         )
@@ -767,7 +959,10 @@ def _compact_page_bytes(spec: Any, origin: str) -> int:
 
 class _BucketKey(NamedTuple):
     """Transfer-shape key of one sub spec: layers can share a bucket only if
-    their class, element type, page size and page stride all agree."""
+    their class, element type, page size, page stride and window retention all
+    agree (a packed group may legally mix e.g. full and R-SWA layers, and two
+    R-SWA layers may carry different windows: one bucket keeps one geometry
+    *and* one retention)."""
 
     class_name: str
     dtype_name: str
@@ -780,6 +975,8 @@ class _BucketKey(NamedTuple):
     num_kv_heads: int
     head_size: int
     head_size_v: int
+    # None = full prefix; not None = the bucket's windowed contract.
+    retention: Optional[WindowRetention]
 
 
 def _bucket_key(spec: Any, origin: str) -> _BucketKey:
@@ -792,16 +989,22 @@ def _bucket_key(spec: Any, origin: str) -> _BucketKey:
         num_kv_heads=getattr(spec, "num_kv_heads", 0),
         head_size=head_size,
         head_size_v=getattr(spec, "head_size_v", None) or head_size,
+        retention=_retention_of(spec),
     )
 
 
-def _bucket_order(key: _BucketKey) -> Tuple[int, str, str, int, int, int, int]:
+def _bucket_order(
+    key: _BucketKey,
+) -> Tuple[int, str, str, int, int, int, int, str, int, int]:
     """Total order over the buckets of one group: biggest page first (so the
     main layer of a packed group keeps the bare group name), then class,
-    dtype, head geometry and pad. Only spec-local fields enter, so the
-    suffixes -- and with them the wire names -- are a pure function of the
-    bucket *set*: layer registration order, or a different layer order on
-    another rank, cannot move them."""
+    dtype, head geometry, pad and window retention. Only spec-local fields
+    enter, so the suffixes -- and with them the wire names -- are a pure
+    function of the bucket *set*: layer registration order, or a different
+    layer order on another rank, cannot move them. For a model with no
+    windowed layer every retention is None and the tail of the key is
+    constant, so old bucket sets order exactly as before."""
+    retention = key.retention
     return (
         -key.page_bytes,
         key.class_name,
@@ -810,6 +1013,9 @@ def _bucket_order(key: _BucketKey) -> Tuple[int, str, str, int, int, int, int]:
         key.head_size,
         key.head_size_v,
         key.pad if key.pad is not None else -1,
+        retention.kind if retention is not None else "",
+        retention.window_tokens if retention is not None else -1,
+        retention.extra_retained_tokens if retention is not None else -1,
     )
 
 
@@ -821,11 +1027,14 @@ def _attention_meta(
     *,
     suffix: str,
     origin: str,
+    retention: Optional[WindowRetention] = None,
 ) -> AttentionGroupMeta:
     """Size one attention bucket from its spec. The gate already refused a
     spec whose tokens_per_state (compress_ratio on vllm <= 0.28) is above 1, so
     one token is one storage row and the per-token byte size is exact:
-    compact_page_bytes / block_size."""
+    compact_page_bytes / block_size.
+
+    ``retention`` is the gate's verdict for this bucket (None = full prefix)."""
     page_bytes = _compact_page_bytes(spec, origin)
     if page_bytes % spec.block_size != 0:
         raise NotImplementedError(
@@ -843,6 +1052,7 @@ def _attention_meta(
         spec_suffix=suffix,
         page_bytes=page_bytes,
         dtype=getattr(spec, "dtype", None),
+        retention=retention,
     )
 
 
@@ -865,6 +1075,30 @@ def _uniform_group_metas(
         )
         buckets.setdefault(_bucket_key(spec, origin), []).append((layer_name, spec))
     ordered = sorted(buckets.items(), key=lambda item: _bucket_order(item[0]))
+    # A packed group whose members agree on their coverage (same window
+    # retention, same page semantics) folds losslessly for the scheduler -- its
+    # one representative sub spec carries the same retention -- and each bucket
+    # then transfers on its own identity (wire name, staging pool, staged
+    # captures). A packed group whose members *disagree* on coverage is the
+    # case the scheduler's folded view cannot describe, and this branch cannot
+    # bail out either: if the representative is the full-attention member, the
+    # scheduler emits no capture and no hit clamp although the worker's windowed
+    # bucket needs staged bytes (its claimed saves then fail); with a windowed
+    # representative the announcement can describe the wrong retention. Refuse
+    # the divergence here, where the whole member list is visible -- the folding
+    # guard (the folding change stacked on this one) enforces the same predicate
+    # at registration, for metas built without going through this function.
+    coverages = {key.retention for key, _layers in ordered}
+    if len(coverages) > 1:
+        raise NotImplementedError(
+            f"group {idx} (UniformTypeKVCacheSpecs) mixes {len(ordered)} "
+            f"transfer buckets with different coverage "
+            f"{sorted(str(c) for c in coverages)}: vLLM folds the group to one "
+            f"representative sub spec for the scheduler, so the connector could "
+            f"not announce or clamp every bucket's window. Keep the windowed "
+            f"layers together (one retention per packed group) or let them form "
+            f"their own group."
+        )
     return [
         _attention_meta(
             idx,
@@ -873,8 +1107,9 @@ def _uniform_group_metas(
             manager_block_size,
             suffix="" if i == 0 else f"_b{i}",
             origin=f"group {idx} (UniformTypeKVCacheSpecs)",
+            retention=key.retention,
         )
-        for i, (_, layers) in enumerate(ordered)
+        for i, (key, layers) in enumerate(ordered)
     ]
 
 
@@ -907,11 +1142,19 @@ def _parse_group(
             idx, spec, manager_block_size, calculate_kv_scales=calculate_kv_scales
         )
     origin = f"group {idx}"
-    _check_attention_spec_supported(
+    retention = _check_attention_spec_supported(
         origin, spec, calculate_kv_scales=calculate_kv_scales
     )
     return [
-        _attention_meta(idx, layers, spec, manager_block_size, suffix="", origin=origin)
+        _attention_meta(
+            idx,
+            layers,
+            spec,
+            manager_block_size,
+            suffix="",
+            origin=origin,
+            retention=retention,
+        )
     ]
 
 

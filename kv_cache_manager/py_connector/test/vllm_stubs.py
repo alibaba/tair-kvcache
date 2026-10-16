@@ -18,8 +18,10 @@ of them -- the connector reads whichever is not the default (see
 """
 
 import importlib.util
+import threading
 import json
 import sys
+import threading as _threading
 import types
 from enum import IntEnum
 from typing import Any, Optional
@@ -158,10 +160,21 @@ def _install_stubs():
     class SupportsHMA:
         pass
 
+    class KVConnectorTransferResults:
+        """Mirrors vLLM >= 0.30's request-level receive-failure carrier (the
+        real one is a dataclass with three set fields)."""
+
+        def __init__(self, finished_sending=None, finished_recving=None,
+                     failed_recving=None):
+            self.finished_sending = set(finished_sending or ())
+            self.finished_recving = set(finished_recving or ())
+            self.failed_recving = set(failed_recving or ())
+
     base.KVConnectorBase_V1 = KVConnectorBase_V1
     base.KVConnectorMetadata = KVConnectorMetadata
     base.KVConnectorRole = KVConnectorRole
     base.SupportsHMA = SupportsHMA
+    base.KVConnectorTransferResults = KVConnectorTransferResults
 
     utils = _module("vllm.utils")
     torch_utils = _module("vllm.utils.torch_utils")
@@ -754,16 +767,29 @@ _install_stubs()
 
 # Import after stubs are in place.
 from kv_cache_manager.py_connector.vllm.vllm_common import (  # noqa: E402
+    RETENTION_SLIDING,
     AttentionGroupMeta,
     StateGroupMeta,
+    WindowRetention,
+    spec_group_plan,
 )
 from kv_cache_manager.py_connector.vllm.connector_scheduler import ConnectorScheduler  # noqa: E402
 from kv_cache_manager.py_connector.vllm.connector_worker import ConnectorWorker  # noqa: E402
 
 
-def _make_group_metas(num_groups: int, num_state_groups: int, block_size: int) -> list:
+def _make_group_metas(
+    num_groups: int,
+    num_state_groups: int,
+    block_size: int,
+    windowed: int = 0,
+    window_tokens: int = 1024,
+) -> list:
     """Attention groups first, then mamba-style state groups; group_idx is the
-    vLLM group index (what block tables are indexed by)."""
+    vLLM group index (what block tables are indexed by).
+
+    ``windowed`` makes that many of the attention groups sliding-window ones
+    (retention metadata included), which turns on the eager-capture and hit
+    clamp paths; the rest stay full-prefix."""
     return [
         AttentionGroupMeta(
             group_idx=i,
@@ -773,6 +799,11 @@ def _make_group_metas(num_groups: int, num_state_groups: int, block_size: int) -
             # A positive page size: the tensor-side cross-check rejects 0, and
             # the translation paths under test never read it.
             page_bytes=block_size * 8,
+            retention=(
+                WindowRetention(kind=RETENTION_SLIDING, window_tokens=window_tokens)
+                if i < windowed
+                else None
+            ),
         )
         for i in range(num_groups)
     ] + [
@@ -785,6 +816,24 @@ def _make_group_metas(num_groups: int, num_state_groups: int, block_size: int) -
         )
         for i in range(num_state_groups)
     ]
+
+
+def install_capture_ledger(conn: Any) -> None:
+    """Give a hand-built ConnectorWorker the capture ledger its slot
+    bookkeeping lives in (the real one builds it in __init__)."""
+    from kv_cache_manager.py_connector.vllm.connector_worker import _CaptureLedger
+
+    conn._captures = _CaptureLedger()
+    conn._staged = conn._captures.staged
+    conn._in_flight = conn._captures.in_flight
+    conn._block_uris = conn._captures.block_uris
+    conn._verdict_pending = {}
+    conn._verdict_lock = threading.Lock()
+    conn._verdict_query_down_until = 0.0
+    conn._retired_requests = set()
+    # publish-gate default: the hand-built groups are windowed.
+    conn._has_windowed_groups = True
+    conn._tp_size = getattr(conn, "_tp_size", 1)
 
 
 def make_connector(
@@ -817,6 +866,14 @@ def make_connector(
         conn._vllm_block_size,  # ty: ignore[unresolved-attribute]
     )
     conn._num_groups = len(conn._group_metas)
+    # Mirrors the real __init__ (start_load_kv reads it to decide how a
+    # failed load may be reported).
+    conn._has_windowed_groups = any(  # ty: ignore[unresolved-attribute]
+        getattr(meta, "retention", None) is not None for meta in conn._group_metas
+    )
+    # ... and the drafter count the same decision subtracts (the real __init__
+    # receives it from v1_connector; the fixture's configs mark no drafter).
+    conn._num_eagle_groups = 0  # ty: ignore[unresolved-attribute]
     conn._state_group_idxs = [  # ty: ignore[unresolved-attribute]
         m.group_idx for m in conn._group_metas if isinstance(m, StateGroupMeta)
     ]
@@ -861,10 +918,17 @@ def make_connector_scheduler(
     num_state_groups: int = 0,
     tp_size: int = 1,
     locations=None,
+    windowed: int = 0,
+    window_tokens: int = 1024,
+    has_eagle_group: bool = False,
 ) -> ConnectorScheduler:
     """Build a bare ConnectorScheduler (no __init__) with the scheduler-loop state
     build_connector_meta and friends need, plus a FakeLocationQueries
-    answering ``locations`` (None means "still in flight")."""
+    answering ``locations`` (None means "still in flight").
+
+    ``windowed`` turns the first that many attention groups into windowed ones
+    (retention metadata included), which is what enables the capture requests
+    and the windowed hit clamp."""
     from unittest.mock import MagicMock
 
     core = ConnectorScheduler.__new__(ConnectorScheduler)
@@ -872,23 +936,42 @@ def make_connector_scheduler(
     core._vllm_block_size = vllm_block_size or manager_block_size
     core._tp_size = tp_size
     core._group_metas = _make_group_metas(
-        num_groups, num_state_groups, core._vllm_block_size
+        num_groups, num_state_groups, core._vllm_block_size, windowed, window_tokens
     )
     core._num_groups = len(core._group_metas)
     core._state_group_idxs = [
         m.group_idx for m in core._group_metas if isinstance(m, StateGroupMeta)
     ]
+    core._windowed_metas = [
+        m
+        for m in core._group_metas
+        if isinstance(m, AttentionGroupMeta) and m.retention is not None
+    ]
+    core._has_eagle_group = has_eagle_group
+    declared, core._spec_group_names = spec_group_plan(core._group_metas, tp_size)
+    core._narrowest_spec_group = (
+        min(declared, key=lambda group: (len(group["spec_names"]), group["name"]))[
+            "name"
+        ]
+        if declared
+        else None
+    )
+    core._window_claims = {}
+    core._window_claims_lock = threading.Lock()
+    core._announced_sessions = {}
+    core._announced_sessions_counters = {}
+    core._announced_sessions_lock = _threading.Lock()
+    core._pending_release_captures = []
+    core._pending_release_captures_lock = _threading.Lock()
     core._epoch = 0
     core._tracked = {}
     core._load_failed = set()
     core._load_attempted = set()
     core._waiting_to_load_requests = []
-    import threading
-
-    core._waiting_to_save_requests_lock = threading.Lock()
+    core._waiting_to_save_requests_lock = _threading.Lock()
     core._waiting_to_save_requests = []
     core._waiting_to_finish_requests = []
-    core._canceled_save_request_ids_lock = threading.Lock()
+    core._canceled_save_request_ids_lock = _threading.Lock()
     core._canceled_save_request_ids = []
     core._http_executor = MagicMock()
     core._manager_client = MagicMock()

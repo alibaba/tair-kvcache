@@ -167,6 +167,56 @@ class TestLoadDoneCallback(unittest.TestCase):
         self.assertEqual(evt.type, "LoadBlockFinishedEvent")
         self.assertEqual(evt.failed_block_idxs, [])
 
+    def test_request_level_failure_marking(self):
+        # A windowed multi-group load cannot report block ids either, but for
+        # that shape swallowing is not acceptable (the connector itself
+        # granted the external hit): the request is marked failed instead and
+        # travels to the coordinator like any load verdict.
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req",
+            0,
+            epoch=1,
+            block_ids=[],
+            num_blocks=2,
+            report_failures=False,
+            report_request_failures=True,
+        )
+        cb([False, True])
+        evt = _sent_event(dtm)
+        self.assertEqual(evt.type, "LoadBlockFinishedEvent")
+        self.assertEqual(evt.failed_block_idxs, [])
+        self.assertTrue(evt.request_failed)
+
+    def test_request_level_failure_not_marked_on_success(self):
+        # All-success (or all-abstain) loads never mark the request.
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req",
+            0,
+            epoch=1,
+            block_ids=[],
+            num_blocks=2,
+            report_failures=False,
+            report_request_failures=True,
+        )
+        cb([True, None])
+        evt = _sent_event(dtm)
+        self.assertFalse(evt.request_failed)
+        self.assertEqual(evt.failed_block_idxs, [])
+
+    def test_request_level_failure_off_keeps_the_legacy_swallow(self):
+        # A non-windowed multi-group model (the legacy hybrid shape) keeps the
+        # swallowed-and-logged behaviour: no request mark, no block ids.
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req", 0, epoch=1, block_ids=[], num_blocks=2, report_failures=False
+        )
+        cb([False, True])
+        evt = _sent_event(dtm)
+        self.assertFalse(evt.request_failed)
+        self.assertEqual(evt.failed_block_idxs, [])
+
 
 class TestNullStateBlocks(unittest.TestCase):
     """Mamba 'align' mode: vLLM materializes a recurrent state only at segment
@@ -387,12 +437,37 @@ class TestAbstainedVerdicts(unittest.TestCase):
         )  # attention group
         self.assertEqual(_sent_event(dtm).failed_block_idxs, [30])
 
-    def test_load_all_groups_abstain_counts_as_failure(self):
+    def test_load_all_groups_abstain_is_a_skip_not_a_failure(self):
+        # Every group skipped the block because none of them *needed* it: a
+        # windowed group's target outside the window (vLLM allocated no slot
+        # there on an external hit) or a mamba interior block. Reporting it as
+        # an invalid block would make vLLM truncate num_computed_tokens to
+        # where the block first appears -- block 0 throws the whole external
+        # hit away, and kv_load_failure_policy="fail" fails the request --
+        # even though every byte that was needed arrived (review_r1 B1).
         dtm = _make_dtm()
         cb = dtm.create_load_done_callback(
             "req", 0, epoch=0, block_ids=[11], num_blocks=1
         )
         cb([None])
+        self.assertEqual(_sent_event(dtm).failed_block_idxs, [])
+
+    def test_load_one_group_failing_still_fails_the_block(self):
+        # The same all-skip shape, but one group *reported*: that is a hole in
+        # the request's KV and must be named.
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req", 0, epoch=0, block_ids=[11], num_blocks=1
+        )
+        cb([False, None])
+        self.assertEqual(_sent_event(dtm).failed_block_idxs, [11])
+
+    def test_load_one_group_succeeding_and_one_failing_fails_the_block(self):
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req", 0, epoch=0, block_ids=[11], num_blocks=1
+        )
+        cb([True, False])
         self.assertEqual(_sent_event(dtm).failed_block_idxs, [11])
 
 
@@ -867,6 +942,8 @@ class TestDataTransferManagerPools(unittest.TestCase):
         from kv_cache_manager.py_connector.vllm.transfer_types import KVCacheInfo
         import kv_cache_manager.py_connector.vllm.data_transfer as dt
 
+        max_num_batched_tokens = overrides.pop("max_num_batched_tokens", self.MBS)
+        max_num_seqs = overrides.pop("max_num_seqs", 0)
         extra = TairKvCacheConnectorExtraConfig(
             manager_uri="http://127.0.0.1:1",
             coordinator_base_port=1,
@@ -882,7 +959,15 @@ class TestDataTransferManagerPools(unittest.TestCase):
             dtype=KV_DTYPE,
         )
         with mock.patch.object(dt, "_get_device_module", return_value=MagicMock()):
-            return DataTransferManager(info, self.MBS, MagicMock(), MagicMock(), extra)
+            return DataTransferManager(
+                info,
+                self.MBS,
+                MagicMock(),
+                MagicMock(),
+                extra,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_num_seqs=max_num_seqs,
+            )
 
     def _groups(self):
         from kv_cache_manager.py_connector.vllm.transfer_types import (
@@ -890,7 +975,12 @@ class TestDataTransferManagerPools(unittest.TestCase):
             StateTransferGroup,
         )
 
-        def attn(idx, name, layers, per_block):
+        from kv_cache_manager.py_connector.vllm.vllm_common import (
+            RETENTION_SLIDING,
+            WindowRetention,
+        )
+
+        def attn(idx, name, layers, per_block, windowed=True):
             return AttentionTransferGroup(
                 group_idx=idx,
                 spec_name=name,
@@ -905,6 +995,13 @@ class TestDataTransferManagerPools(unittest.TestCase):
                 kernel_block_size=self.MBS,
                 block_stride=0,
                 dtype=KV_DTYPE,
+                # tp0_g0 and tp0_g1 share one arena and both capture: the
+                # partition has to cover their *aggregate* demand.
+                retention=(
+                    WindowRetention(RETENTION_SLIDING, window_tokens=1024)
+                    if windowed
+                    else None
+                ),
             )
 
         # 16 B/token/layer (8 dims x 2 B) makes the three buckets of the first
@@ -943,20 +1040,144 @@ class TestDataTransferManagerPools(unittest.TestCase):
         # The other shape is capped by its own slot size: 16 KiB / 512 B.
         self.assertEqual(dtm._pools["tp0_g3"].max_blocks, 16)
 
-    def test_task_batch_shrinks_to_the_pool(self):
+    def test_the_capture_partition_covers_the_aggregate_demand(self):
+        # The review's shape: a byte cap left a 62-slot arena holding 128-block
+        # task batches, and its *two* windowed buckets share it. One step can
+        # complete 16 manager blocks per bucket, and the worker holds one run
+        # per bucket before releasing any -- so the capture partition must
+        # cover 32 slots at once, not 16. The partition is derived from the
+        # engine's step budget, and the task batch is capped to what is left.
         groups = self._groups()
         dtm = self._dtm(
             groups,
             block_per_save_task=128,
             block_per_load_task=128,
-            staging_pool_blocks=8,
-            staging_pool_max_bytes_per_group=3 * 4096,  # 3 slots, not 8
+            staging_pool_blocks=62,
+            max_num_batched_tokens=16 * self.MBS,
         )
-        # The cap buys 3 slots; a task stages its whole batch as one contiguous
-        # run, so both directions shrink to it instead of breaching the cap.
-        self.assertEqual(dtm.save_task_blocks(groups[0]), 3)
-        self.assertEqual(dtm.load_task_blocks(groups[0]), 3)
-        self.assertEqual(dtm.save_task_blocks(groups[3]), 8)  # other shape
+        pool = dtm._pools["tp0_g0"]
+        self.assertEqual(pool.max_blocks, 62)
+        self.assertEqual(pool.reserved_blocks, 30)  # 62 - 2 x 16
+        self.assertEqual(dtm.save_task_blocks(groups[0]), 30)
+        self.assertEqual(dtm.load_task_blocks(groups[0]), 30)
+        # Both buckets' runs fit at the same time (one contiguous run each) ...
+        first = pool.acquire(16, keep_reserved=True)
+        second = pool.acquire(16, keep_reserved=True)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        # ... and a whole task batch still starts behind them.
+        task = pool.acquire(30)
+        self.assertIsNotNone(task)
+        pool.release(first, 16)
+        pool.release(second, 16)
+        pool.release(task, 30)
+        self.assertEqual(pool.free_blocks, 62)
+
+    def test_a_task_prefers_the_reserve_over_the_capture_area(self):
+        # Loads are submitted before the same step's captures, so a load that
+        # took the shared runs first would leave the reserve idle and the
+        # capture withheld (its wait is 50 ms, far less than an SDK call).
+        from kv_cache_manager.py_connector.vllm.data_transfer import _StagingPool
+
+        pool = _StagingPool(torch.device("cpu"), 4096, 8, reserved_blocks=3)
+        task = pool.acquire(3)  # a whole task batch
+        self.assertEqual(5, task)  # from the reserve, not from slot 0
+        capture = pool.acquire(2, timeout=0.01, keep_reserved=True)
+        self.assertIsNotNone(capture, "the capture area was eaten by a task")
+        self.assertEqual(0, capture)
+        pool.release(task, 3)
+        pool.release(capture, 2)
+        self.assertEqual(8, pool.free_blocks)
+
+    def test_the_demand_counts_per_request_block_rounding(self):
+        # A step of one block per request still completes a whole block each:
+        # 16 decode requests complete 16 blocks from a 16-token step, so the
+        # per-request rounding (max_num_seqs) is part of the demand, and an
+        # arena sized for cdiv(bound, mbs) alone would withhold every capture.
+        groups = self._groups()
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._dtm(
+                groups,
+                block_per_save_task=128,
+                block_per_load_task=128,
+                staging_pool_blocks=4,
+                staging_pool_max_bytes_per_group=4 * 4096,
+                max_num_batched_tokens=self.MBS,
+                max_num_seqs=16,
+            )
+        message = str(ctx.exception)
+        self.assertIn("per bucket", message)
+        self.assertIn("at least 35", message)
+
+        # With no room for the rounding the pool is refused; the same pool with
+        # a bound that admits it keeps the aggregate rule's reserve.
+        dtm = self._dtm(
+            groups,
+            block_per_save_task=128,
+            block_per_load_task=128,
+            staging_pool_blocks=64,
+            staging_pool_max_bytes_per_group=64 * 4096,
+            max_num_batched_tokens=self.MBS,
+            max_num_seqs=16,
+        )
+        shared = dtm._pools["tp0_g0"]
+        # two windowed buckets x (1 + 16) blocks of demand
+        self.assertEqual(64 - 2 * 17, shared.reserved_blocks)
+
+    def test_a_pool_too_small_for_its_capture_demand_is_refused(self):
+        # Failing closed here is the point: an arena that cannot hold the
+        # aggregate demand plus a task batch would silently never publish
+        # windowed KV (every capture would time out on a multi-block step).
+        groups = self._groups()
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._dtm(
+                groups,
+                block_per_save_task=128,
+                block_per_load_task=128,
+                staging_pool_blocks=31,
+                max_num_batched_tokens=16 * self.MBS,
+            )
+        message = str(ctx.exception)
+        self.assertIn("windowed bucket", message)
+        self.assertIn("31 slots", message)
+        self.assertIn("at least 33", message)
+
+    def test_the_transfer_reserve_is_the_largest_task_batch(self):
+        # The eager capture may only borrow above the reserve, so a transfer
+        # task can always start and thereby release the captures its own
+        # session holds (review_r1 N1): one task's maximum batch per arena,
+        # clamped to what the capture partition leaves (a capped pool, or a
+        # step budget that needs most of it).
+        groups = self._groups()
+        dtm = self._dtm(
+            groups,
+            block_per_save_task=3,
+            block_per_load_task=2,
+            staging_pool_blocks=16,
+            staging_pool_max_bytes_per_group=16_384,  # 4 slots
+        )
+        shared = dtm._pools["tp0_g0"]
+        self.assertEqual(shared.max_blocks, 4)
+        # Four slots, two windowed buckets x one block per step: the captures
+        # need two, so the task's request of three is capped to what is left.
+        self.assertEqual(shared.reserved_blocks, 2)
+        self.assertEqual(dtm.save_task_blocks(groups[0]), 2)
+        self.assertEqual(dtm.load_task_blocks(groups[0]), 2)
+
+        # An arena that cannot hold the aggregate capture demand plus one task
+        # batch is refused at startup with the numbers, instead of timing out
+        # every multi-block capture and never publishing windowed KV.
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._dtm(
+                groups,
+                block_per_save_task=128,
+                block_per_load_task=128,
+                staging_pool_blocks=16,
+                staging_pool_max_bytes_per_group=2 * 4096,  # two slots
+            )
+        message = str(ctx.exception)
+        self.assertIn("2 slots cannot serve its 2 windowed bucket", message)
+        self.assertIn("at least 3", message)
 
     def test_configured_batch_below_the_pool_is_untouched(self):
         groups = self._groups()

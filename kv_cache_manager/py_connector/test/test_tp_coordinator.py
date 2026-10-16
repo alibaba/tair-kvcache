@@ -3,6 +3,7 @@
 import threading
 import time
 import unittest
+import unittest.mock
 import socket as socket_module
 
 
@@ -24,8 +25,14 @@ def _find_free_port():
         return s.getsockname()[1]
 
 
-def _wait_for_server(port, timeout=5.0):
-    """Poll until server is ready to accept connections."""
+def _wait_for_server(server, timeout=5.0):
+    """Poll until the server is ready to accept connections.
+
+    Takes the server (not a port): the pair may have had to move off the
+    requested port (a transient collision), and the port that must answer is
+    the one it actually took.
+    """
+    port = server._base_port
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -50,7 +57,7 @@ class TestTpCoordinatorNormalOrder(unittest.TestCase):
             self.callback_event.set()
 
         self.server = TpCoordinatorServer("127.0.0.1", self.port, 2, on_finished)
-        _wait_for_server(self.port)
+        _wait_for_server(self.server)
         self.client = TpCoordinatorClient("127.0.0.1", self.port)
 
     def test_normal_order_callback_triggered(self):
@@ -98,10 +105,13 @@ class TestTpCoordinatorNormalOrder(unittest.TestCase):
         self.assertEqual(save_context.get_size(), 2)
 
     def tearDown(self):
-        self.server._coordinator_running = False
-        # Don't join - thread is blocked on recv() and will be cleaned up as daemon
-        self.client._socket.close()
-        self.client._zmq_context.term()
+        # One case, one lifecycle: the client goes first (its sockets and any
+        # probe socket it opened die with it), then the server's shutdown
+        # stops both routines, joins them, and only then releases the sockets
+        # and the context -- so nothing of this case is still inside zmq when
+        # the next case binds its own pair.
+        self.client.shutdown()
+        self.server.shutdown()
 
 
 class TestTpCoordinatorOutOfOrder(unittest.TestCase):
@@ -117,7 +127,7 @@ class TestTpCoordinatorOutOfOrder(unittest.TestCase):
             self.callback_event.set()
 
         self.server = TpCoordinatorServer("127.0.0.1", self.port, 2, on_finished)
-        _wait_for_server(self.port)
+        _wait_for_server(self.server)
         self.client = TpCoordinatorClient("127.0.0.1", self.port)
 
     def test_finish_before_start_no_crash(self):
@@ -208,10 +218,13 @@ class TestTpCoordinatorOutOfOrder(unittest.TestCase):
         self.assertEqual(save_context.get_size(), 2)
 
     def tearDown(self):
-        self.server._coordinator_running = False
-        # Don't join - thread is blocked on recv() and will be cleaned up as daemon
-        self.client._socket.close()
-        self.client._zmq_context.term()
+        # One case, one lifecycle: the client goes first (its sockets and any
+        # probe socket it opened die with it), then the server's shutdown
+        # stops both routines, joins them, and only then releases the sockets
+        # and the context -- so nothing of this case is still inside zmq when
+        # the next case binds its own pair.
+        self.client.shutdown()
+        self.server.shutdown()
 
 
 class TestTpCoordinatorIdempotent(unittest.TestCase):
@@ -227,7 +240,7 @@ class TestTpCoordinatorIdempotent(unittest.TestCase):
             self.callback_event.set()
 
         self.server = TpCoordinatorServer("127.0.0.1", self.port, 2, on_finished)
-        _wait_for_server(self.port)
+        _wait_for_server(self.server)
         self.client = TpCoordinatorClient("127.0.0.1", self.port)
 
     def test_duplicate_finish_ignored(self):
@@ -319,10 +332,13 @@ class TestTpCoordinatorIdempotent(unittest.TestCase):
         self.assertEqual(save_context.get_size(), 2)
 
     def tearDown(self):
-        self.server._coordinator_running = False
-        # Don't join - thread is blocked on recv() and will be cleaned up as daemon
-        self.client._socket.close()
-        self.client._zmq_context.term()
+        # One case, one lifecycle: the client goes first (its sockets and any
+        # probe socket it opened die with it), then the server's shutdown
+        # stops both routines, joins them, and only then releases the sockets
+        # and the context -- so nothing of this case is still inside zmq when
+        # the next case binds its own pair.
+        self.client.shutdown()
+        self.server.shutdown()
 
 
 class TestLoadFailureAggregation(unittest.TestCase):
@@ -338,7 +354,7 @@ class TestLoadFailureAggregation(unittest.TestCase):
     def setUp(self):
         self.port = _find_free_port()
         self.server = TpCoordinatorServer("127.0.0.1", self.port, 2, lambda *a: None)
-        _wait_for_server(self.port)
+        _wait_for_server(self.server)
         self.client = TpCoordinatorClient("127.0.0.1", self.port)
 
     def _send(self, tp_rank, failed):
@@ -381,9 +397,854 @@ class TestLoadFailureAggregation(unittest.TestCase):
         self.assertEqual(self._poll_failed(), {9})
 
     def tearDown(self):
-        self.server._coordinator_running = False
-        self.client._socket.close()
-        self.client._zmq_context.term()
+        self.client.shutdown()
+        self.server.shutdown()
+
+
+class TestProbeInstanceIdentity(unittest.TestCase):
+    """A probe only counts when the answering pair is *this* instance's.
+
+    Two connector instances on one host can be configured with the same
+    coordinator base port: the first server takes the configured pair, the
+    second falls back to the neighbouring one. The second instance's clients
+    probe the configured pair first, and the first instance's query port
+    answers a probe with its *own* identity -- before the identity check the
+    probe accepted any reply (an old server even answers protocol errors with
+    an empty body), so every event and verdict query of the second instance
+    went to the first instance's coordinator and neither instance's sessions
+    could complete."""
+
+    def setUp(self):
+        # Four consecutive free ports: instance A takes (p, p+1), instance B
+        # -- configured with the same base port -- falls back to (p+2, p+3).
+        self.holders = []
+        probe_port = _find_free_port()
+        for _ in range(12):
+            with socket_module.socket() as sock:
+                try:
+                    sock.bind(("127.0.0.1", probe_port))
+                except OSError:
+                    probe_port = _find_free_port()
+                    continue
+            self.base_port = probe_port
+            break
+        else:
+            raise AssertionError("no free port strip found")
+        for port in range(self.base_port, self.base_port + 4):
+            holder = socket_module.socket()
+            holder.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+            holder.bind(("127.0.0.1", port))
+            holder.listen(1)
+            self.holders.append(holder)
+        self.addCleanup(lambda: [h.close() for h in self.holders])
+        # A binds its pair after the holders release the ports (TIME_WAIT
+        # insurance), B must then move one pair further.
+        for holder in self.holders:
+            holder.close()
+        self.holders = []
+        self.server_a = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 2, lambda *a: None, "inst-A"
+        )
+        _wait_for_server(self.server_a)
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 2, lambda *a: None, "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        self.assertEqual(self.base_port, self.server_a._base_port)
+        self.assertEqual(self.base_port + 2, self.server_b._base_port)
+
+    def tearDown(self):
+        for cleanup in (
+            lambda: self.server_a.shutdown(),
+            lambda: self.server_b.shutdown(),
+        ):
+            try:
+                cleanup()
+            except Exception:
+                pass
+
+    def test_a_foreign_coordinator_is_rejected_and_the_own_pair_found(self):
+        # The client of instance B probes the configured pair first: server A
+        # answers with inst-A's identity, which must NOT count as a hit, and
+        # the search moves on to B's own pair.
+        client = TpCoordinatorClient("127.0.0.1", self.base_port, "inst-B")
+        self.addCleanup(client.shutdown)
+        client.send(b"{}")
+        self.assertEqual(
+            self.base_port + 2,
+            client._port,
+            "the client settled on a coordinator that is not its instance's",
+        )
+        self.assertEqual(self.base_port + 3, client._query_port)
+
+    def test_the_own_coordinator_still_resolves_immediately(self):
+        # The identity check must not over-reject: a client of instance A
+        # finds its own pair on the first probe and does not move.
+        client = TpCoordinatorClient("127.0.0.1", self.base_port, "inst-A")
+        self.addCleanup(client.shutdown)
+        client.send(b"{}")
+        self.assertEqual(self.base_port, client._port)
+
+    def test_an_identityless_reply_is_not_a_hit(self):
+        # The reply faces the client can meet: an old server answers a probe
+        # with an empty protocol-error body, a foreign server with another
+        # instance's identity, and a dead port with nothing at all.
+        client = TpCoordinatorClient("127.0.0.1", self.base_port, "inst-B")
+        self.addCleanup(client.shutdown)
+        import orjson
+
+        self.assertFalse(client._probe_reply_matches(b""))
+        self.assertFalse(client._probe_reply_matches(b"not json"))
+        self.assertFalse(
+            client._probe_reply_matches(orjson.dumps({"probe": True}))
+        )
+        self.assertFalse(
+            client._probe_reply_matches(
+                orjson.dumps({"probe": True, "instance_id": "inst-A"})
+            )
+        )
+        self.assertTrue(
+            client._probe_reply_matches(
+                orjson.dumps({"probe": True, "instance_id": "inst-B"})
+            )
+        )
+
+
+    def test_a_query_resolves_the_pair_before_it_is_sent(self):
+        # A worker's first interaction with the coordinator can be a query,
+        # not an event: a late settle cancels before its done_cb sends the
+        # completion event (and the pending recheck asks before that). The
+        # configured pair here belongs to inst-A, so a query sent straight to
+        # the configured query port would reach A's REP socket -- whose empty
+        # protocol-error reply is indistinguishable from a successful cancel:
+        # B's coordinator would keep the abandoned verdict and A would record
+        # cross-instance state. The query must resolve and validate the pair
+        # first, exactly as an event does.
+        client = TpCoordinatorClient("127.0.0.1", self.base_port, "inst-B")
+        self.addCleanup(client.shutdown)
+        self.server_b.record_verdict("sess-q", [True])
+        self.assertTrue(
+            client.cancel_verdict("sess-q", 0),
+            "a cancel the coordinator acknowledged came back as a failure",
+        )
+        self.assertEqual(
+            self.base_port + 2,
+            client._port,
+            "the query went to a coordinator that is not this instance's",
+        )
+        self.assertTrue(client._endpoint_resolved)
+        # The cancellation reached B: with rank 1's acknowledgement the
+        # verdict is retired, exactly as a retirement expects.
+        self.assertEqual([True], self.server_b.answer_query("sess-q", 1))
+        self.assertNotIn("sess-q", self.server_b._verdicts)
+        # And inst-A never saw the foreign session at all.
+        self.assertEqual({}, self.server_a._verdict_cancels)
+
+
+class TestProbeEngineIdentity(unittest.TestCase):
+    """A probe only counts when the answering pair is *this engine's.
+
+    Serving replicas share instance_id on purpose (the manager keys on it),
+    so two engines of one instance on one host with the same configured base
+    port answer a probe with indistinguishable instance identities: the
+    second coordinator takes the neighbouring pair, but its clients accept
+    the first replica's coordinator, send it every completion and load
+    event, and poll their own coordinator forever. The handshake therefore
+    also carries the engine's own identity (vLLM's per-run kv_transfer
+    engine_id): the reply only counts when it names the client's engine."""
+
+    def setUp(self):
+        # Four consecutive free ports: engine A takes (p, p+1), engine B --
+        # the same instance, the same configured base port -- falls back to
+        # (p+2, p+3). The port-strip dance is TestProbeInstanceIdentity's:
+        # TIME_WAIT neighbours must not eat into the strip.
+        probe_port = _find_free_port()
+        for _ in range(12):
+            with socket_module.socket() as sock:
+                try:
+                    sock.bind(("127.0.0.1", probe_port))
+                except OSError:
+                    probe_port = _find_free_port()
+                    continue
+            self.base_port = probe_port
+            break
+        else:
+            raise AssertionError("no free port strip found")
+        holders = []
+        for port in range(self.base_port, self.base_port + 4):
+            holder = socket_module.socket()
+            holder.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+            holder.bind(("127.0.0.1", port))
+            holder.listen(1)
+            holders.append(holder)
+        self.addCleanup(lambda: [h.close() for h in holders])
+        for holder in holders:
+            holder.close()
+        # The same instance twice; only the engine identity differs.
+        self.server_a = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 2, lambda *a: None, "inst", "engine-A"
+        )
+        _wait_for_server(self.server_a)
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 2, lambda *a: None, "inst", "engine-B"
+        )
+        _wait_for_server(self.server_b)
+        self.assertEqual(self.base_port, self.server_a._base_port)
+        self.assertEqual(self.base_port + 2, self.server_b._base_port)
+
+    def tearDown(self):
+        for cleanup in (
+            lambda: self.server_a.shutdown(),
+            lambda: self.server_b.shutdown(),
+        ):
+            try:
+                cleanup()
+            except Exception:
+                pass
+
+    def test_a_same_instance_foreign_engine_is_rejected(self):
+        # Replica B's client probes the configured pair first: replica A's
+        # coordinator answers with the *same* instance identity, which must
+        # NOT count as a hit, and the search moves on to B's own pair.
+        client = TpCoordinatorClient(
+            "127.0.0.1", self.base_port, "inst", "engine-B"
+        )
+        self.addCleanup(client.shutdown)
+        client.send(b"{}")
+        self.assertEqual(
+            self.base_port + 2,
+            client._port,
+            "the client settled on a coordinator of another engine",
+        )
+        self.assertEqual(self.base_port + 3, client._query_port)
+
+    def test_the_own_engine_resolves_immediately(self):
+        # The engine check must not over-reject: replica A's client finds its
+        # own pair on the first probe and does not move.
+        client = TpCoordinatorClient(
+            "127.0.0.1", self.base_port, "inst", "engine-A"
+        )
+        self.addCleanup(client.shutdown)
+        client.send(b"{}")
+        self.assertEqual(self.base_port, client._port)
+
+    def test_the_engine_identity_must_match(self):
+        # The reply faces the client can meet: a same-instance coordinator of
+        # another engine, and an older coordinator whose reply carries no
+        # engine identity at all (not provably ours, so not accepted).
+        import orjson
+
+        client = TpCoordinatorClient(
+            "127.0.0.1", self.base_port, "inst", "engine-B"
+        )
+        self.addCleanup(client.shutdown)
+        self.assertFalse(
+            client._probe_reply_matches(
+                orjson.dumps(
+                    {"probe": True, "instance_id": "inst", "engine_id": "engine-A"}
+                )
+            )
+        )
+        self.assertFalse(
+            client._probe_reply_matches(
+                orjson.dumps({"probe": True, "instance_id": "inst"})
+            )
+        )
+        self.assertTrue(
+            client._probe_reply_matches(
+                orjson.dumps(
+                    {"probe": True, "instance_id": "inst", "engine_id": "engine-B"}
+                )
+            )
+        )
+
+
+class TestRequestFailedAggregation(unittest.TestCase):
+    """A request-level load failure is ORed across the ranks, once per load.
+
+    Block ids cannot address a multi-table block layout upstream, so a
+    windowed multi-group instance marks the *request* failed instead (see
+    create_load_done_callback): any rank's broken blocks fail the request,
+    and the mark is handed over exactly once with the load's completion."""
+
+    def setUp(self):
+        self.port = _find_free_port()
+        self.server = TpCoordinatorServer("127.0.0.1", self.port, 2, lambda *a: None)
+        _wait_for_server(self.server)
+        self.client = TpCoordinatorClient("127.0.0.1", self.port)
+
+    def _send(self, tp_rank, request_failed):
+        msg = CoordinateMessage(
+            time.time(),
+            LoadBlockFinishedEvent(
+                request_id="req-f",
+                tp_rank=tp_rank,
+                epoch=11,
+                request_failed=request_failed,
+            ),
+        )
+        self.client.send(CoordinateMsgSerializer.dumps(msg))
+
+    def _poll_failed_requests(self, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            failed = self.server.get_failed_loading_requests()
+            if failed:
+                return failed
+            time.sleep(0.01)
+        return set()
+
+    def test_one_failed_rank_fails_the_request(self):
+        # Rank 0's blocks failed, rank 1's succeeded: the request is failed
+        # (the AND a load needs is broken by any rank).
+        self._send(0, True)
+        self._send(1, False)
+        self.assertEqual(self._poll_failed_requests(), {"req-f"})
+        # Handed over once: a later poll finds nothing more.
+        self.assertEqual(set(), self.server.get_failed_loading_requests())
+
+    def test_all_success_reports_no_failed_request(self):
+        self._send(0, False)
+        self._send(1, False)
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if self.server.get_finished_tasks()[1]:
+                break
+            time.sleep(0.01)
+        self.assertEqual(set(), self.server.get_failed_loading_requests())
+
+    def tearDown(self):
+        self.client.shutdown()
+        self.server.shutdown()
+
+
+class TestForeignCoordinatorRefusal(unittest.TestCase):
+    """Only this instance's coordinator may receive this client's traffic.
+
+    This instance's coordinator can be unavailable while another instance's
+    coordinator owns the configured port: the probe rejects the foreign
+    identity, and nothing may be delivered there -- a foreign coordinator
+    would aggregate the wrong instance's completions. Events are held back
+    (bounded) until a coordinator of this instance answers, then flushed in
+    order; verdict queries report "cannot ask" instead of polling the foreign
+    coordinator forever."""
+
+    def setUp(self):
+        # A strip of free ports like TestProbeInstanceIdentity: instance A
+        # owns (p, p+1); a later server of instance B falls back to (p+2,
+        # p+3), which is inside the probe range of a client configured with
+        # the same base port.
+        self.holders = []
+        probe_port = _find_free_port()
+        for _ in range(12):
+            with socket_module.socket() as sock:
+                try:
+                    sock.bind(("127.0.0.1", probe_port))
+                except OSError:
+                    probe_port = _find_free_port()
+                    continue
+            self.base_port = probe_port
+            break
+        else:
+            raise AssertionError("no free port strip found")
+        for port in range(self.base_port, self.base_port + 4):
+            holder = socket_module.socket()
+            holder.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+            holder.bind(("127.0.0.1", port))
+            holder.listen(1)
+            self.holders.append(holder)
+        for holder in self.holders:
+            holder.close()
+        self.seen_a = []
+        self.seen_b = []
+        # tp_size=1: one start + one finish completes a save, so a delivery
+        # to a coordinator is directly observable through its callback.
+        self.server_a = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_a), "inst-A"
+        )
+        _wait_for_server(self.server_a)
+        # B's own coordinator does not exist yet: its client is configured
+        # with the same base port A owns.
+        self.server_b = None
+        self.client = TpCoordinatorClient("127.0.0.1", self.base_port, "inst-B")
+        # Teardown order as everywhere in this suite: the client first, then
+        # the servers.
+        self.addCleanup(self.server_a.shutdown)
+        self.addCleanup(self._shutdown_b)
+        self.addCleanup(self.client.shutdown)
+
+    def _record(self, sink):
+        def on_finished(write_session_id, save_context):
+            sink.append(write_session_id)
+
+        return on_finished
+
+    def _shutdown_b(self):
+        if self.server_b is not None:
+            self.server_b.shutdown()
+
+    def _save_events(self, request_id, write_session_id):
+        return [
+            CoordinateMsgSerializer.dumps(
+                CoordinateMessage(
+                    time.time(),
+                    SendBlockStartEvent(
+                        request_id=request_id,
+                        write_session_id=write_session_id,
+                        locations=[],
+                    ),
+                )
+            ),
+            CoordinateMsgSerializer.dumps(
+                CoordinateMessage(
+                    time.time(),
+                    SendBlockFinishedEvent(
+                        request_id=request_id,
+                        tp_rank=0,
+                        write_session_id=write_session_id,
+                        is_success_list=[True],
+                    ),
+                )
+            ),
+        ]
+
+    def test_events_are_deferred_until_the_own_coordinator_answers(self):
+        # While only A answers, every event is held back: A's coordinator
+        # must not aggregate them (the wrong instance), and the endpoint
+        # stays unresolved so discovery is retried.
+        for param in self._save_events("req-b1", "sess-b1"):
+            self.client.send(param)
+        self.assertFalse(self.client._endpoint_resolved,
+                         "a foreign-only answer must not resolve the endpoint")
+        self.assertEqual(len(self.client._pending_events), 2)
+        # Give a wrongly-delivered event time to arrive and complete A's
+        # aggregation: neither the callback nor the finished list may see it.
+        time.sleep(0.2)
+        self.assertEqual(self.seen_a, [])
+        self.assertEqual(self.server_a.get_finished_tasks(), ([], []),
+                         "the foreign coordinator aggregated deferred events")
+
+        # B's own coordinator comes up on the fallback pair; the next event
+        # finds it, flushes everything that was held back, in order, and only
+        # then delivers itself.
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        for param in self._save_events("req-b2", "sess-b2"):
+            self.client.send(param)
+        self.assertEqual(self.client._port, self.base_port + 2,
+                         "the client did not move to its instance's pair")
+        self.assertTrue(self.client._endpoint_resolved)
+        self.assertEqual(len(self.client._pending_events), 0)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and sorted(self.seen_b) != [
+            "sess-b1",
+            "sess-b2",
+        ]:
+            time.sleep(0.01)
+        # The deferred save completed on B's coordinator (order preserved:
+        # its start arrived before its finish), and A still saw nothing.
+        self.assertEqual(sorted(self.seen_b), ["sess-b1", "sess-b2"])
+        self.assertEqual(self.seen_a, [])
+
+    def test_a_dead_port_defers_too_and_retries_discovery(self):
+        # The other failure shape: nothing answers at all (the coordinator is
+        # not up yet -- a startup race). The event is held back rather than
+        # queued on a socket whose port this instance may never own, and the
+        # next event re-probes: the coordinator that comes up later -- on the
+        # configured pair or, after a collision, the fallback one -- receives
+        # everything, in order.
+        self.server_a.shutdown()
+        start_b3, finish_b3 = self._save_events("req-b3", "sess-b3")
+        self.client.send(start_b3)
+        self.assertFalse(self.client._endpoint_resolved)
+        self.assertEqual(len(self.client._pending_events), 1)
+        # B's own coordinator comes up (whichever pair it could bind).
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        # The second event discovers it and flushes the held-back one first.
+        self.client.send(finish_b3)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not self.seen_b:
+            time.sleep(0.01)
+        self.assertEqual(self.seen_b, ["sess-b3"])
+        self.assertTrue(self.client._endpoint_resolved)
+        self.assertEqual(len(self.client._pending_events), 0)
+
+    def test_deferred_events_flush_without_later_traffic(self):
+        # The stuck shape: the coordinator is unavailable while the last
+        # save's start and finish are sent, and nothing else ever comes -- a
+        # full-attention session asks for no verdict, and an idle workload
+        # produces no later event. Without an independent retry the queue is
+        # only flushed by the next send()/query, so the completion would stay
+        # held back forever, FinishWriteCache would never run and the request
+        # would remain pending even after the coordinator returned. The
+        # client's own background retry must deliver it on its own.
+        import kv_cache_manager.py_connector.common.tp_coordinator as tp
+
+        with unittest.mock.patch.object(tp, "DEFERRED_RETRY_SECONDS", 0.05):
+            for param in self._save_events("req-b4", "sess-b4"):
+                self.client.send(param)
+            self.assertFalse(self.client._endpoint_resolved)
+            self.assertEqual(2, len(self.client._pending_events))
+
+            # No further traffic from here on: the coordinator that comes up
+            # on the fallback pair is found by the retry alone.
+            self.server_b = TpCoordinatorServer(
+                "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+            )
+            _wait_for_server(self.server_b)
+            deadline = time.time() + 5.0
+            while time.time() < deadline and self.seen_b != ["sess-b4"]:
+                time.sleep(0.01)
+        self.assertEqual(
+            ["sess-b4"], self.seen_b, "the deferred save never completed"
+        )
+        self.assertTrue(self.client._endpoint_resolved)
+        self.assertEqual(self.base_port + 2, self.client._port)
+        self.assertEqual(0, len(self.client._pending_events))
+        self.assertEqual([], self.seen_a)
+
+    def test_a_coordinator_back_on_the_original_pair_is_found_again(self):
+        # After the client settled on a fallback pair, a coordinator restart
+        # can rebind the *configured* pair (the original collision has
+        # cleared). The resync must sweep from the configured base -- a scan
+        # starting at the port the client moved to never looks below it, and
+        # the client would stay locked out of its own coordinator until its
+        # process restarts.
+        # B's coordinator takes the fallback pair; the client settles there.
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        for param in self._save_events("req-b5", "sess-b5"):
+            self.client.send(param)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and self.seen_b != ["sess-b5"]:
+            time.sleep(0.01)
+        self.assertEqual(self.base_port + 2, self.client._port)
+
+        # Both coordinators go away; B's comes back and rebinds the
+        # configured pair.
+        self.server_a.shutdown()
+        self.server_b.shutdown()
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        self.assertEqual(self.base_port, self.server_b._base_port)
+
+        # The first query fails on the dead old pair and resyncs from the
+        # configured base -- finding the lower pair again; the second lands
+        # on it.
+        self.server_b.record_verdict("sess-r", [True])
+        self.assertIs(
+            False, self.client.ask_verdict("sess-r", 0), "the dead pair answered"
+        )
+        self.assertEqual(
+            [True], self.client.ask_verdict("sess-r", 0), "the restarted coordinator never answered"
+        )
+        self.assertEqual(self.base_port, self.client._port)
+        self.assertEqual([], self.seen_a)
+
+    def test_a_failed_resync_leaves_the_endpoint_unresolved(self):
+        # The resync's other half: when nothing of this instance answers, the
+        # endpoint a query just failed on is proven dead and must not stay
+        # "resolved" -- later events would queue on a socket nobody reads and
+        # later queries would reconnect to the dead pair without ever
+        # re-probing. The next event defers instead, exactly like a client
+        # that never resolved.
+        # B's coordinator takes the fallback pair; the client settles there.
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        for param in self._save_events("req-b6", "sess-b6"):
+            self.client.send(param)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and self.seen_b != ["sess-b6"]:
+            time.sleep(0.01)
+        self.assertTrue(self.client._endpoint_resolved)
+
+        # B's coordinator dies; only the foreign A answers the sweep now.
+        self.server_b.shutdown()
+        self.assertIs(
+            False, self.client.ask_verdict("sess-x", 0), "the query path raised"
+        )
+        self.assertFalse(
+            self.client._endpoint_resolved,
+            "a failed resync left the dead endpoint resolved",
+        )
+
+        # The next event defers instead of being queued on the dead socket,
+        # and the background retry owns it from here.
+        self.client.send(self._save_events("req-b7", "sess-b7")[0])
+        self.assertEqual(1, len(self.client._pending_events))
+        self.assertFalse(self.client._endpoint_resolved)
+        self.assertEqual([], self.seen_a)
+
+    def test_the_defer_buffer_is_bounded(self):
+        # An outage longer than the buffer retires the oldest sessions loudly
+        # rather than growing without bound -- and the retirement is reported:
+        # r1's start is dropped with a failure marker, so once the coordinator
+        # returns the marker settles the whole session (the finish that
+        # survived in this same queue is dropped as late) instead of leaving a
+        # finish without its start pinned in the server's buffers with the
+        # request's _pending_saves stuck above zero forever.
+        import kv_cache_manager.py_connector.common.tp_coordinator as tp
+
+        with unittest.mock.patch.object(tp, "DEFERRED_EVENT_LIMIT", 3):
+            # r1: start+finish, r2: start fills the buffer, r2's finish retires
+            # r1's start -- its session settles through the marker.
+            for param in self._save_events("req-b1", "sess-b1"):
+                self.client.send(param)
+            self.client.send(self._save_events("req-b2", "sess-b2")[0])
+            with self.assertLogs(tp.logger, level="WARNING"):
+                self.client.send(self._save_events("req-b2", "sess-b2")[1])
+            self.assertEqual(len(self.client._pending_events), 3)
+            self.assertEqual(1, len(self.client._dropped_sessions))
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record(self.seen_b), "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        self.client.send(self._save_events("req-b3", "sess-b3")[0])
+        deadline = time.time() + 5.0
+        while time.time() < deadline and len(self.seen_b) < 2:
+            time.sleep(0.01)
+        # Both sessions settled: r1 through its retirement marker (first --
+        # markers flush ahead of the survivors), r2 through the normal
+        # start+finish aggregation.
+        self.assertEqual(self.seen_b, ["sess-b1", "sess-b2"])
+        self.assertEqual(self.seen_a, [])
+
+
+class TestOverflowRetiresWholeSessions(unittest.TestCase):
+    """The defer cap retires whole sessions and reports the retirement.
+
+    A save's start lives in the scheduler's client queue while each rank's
+    finish lives in its own, and a load's reports live with the ranks: the
+    queues overflow independently, so dropping one event silently leaves the
+    server a finish without its start (pinned in ``pending_save_finishes``)
+    or a start whose finishes were dropped (pinned in ``running_save``, the
+    request's ``_pending_saves`` never reaching zero). Every dropped event
+    carries a failure marker that settles its session as a unit when the
+    endpoint resolves."""
+
+    def setUp(self):
+        self.holders = []
+        probe_port = _find_free_port()
+        for _ in range(12):
+            with socket_module.socket() as sock:
+                try:
+                    sock.bind(("127.0.0.1", probe_port))
+                except OSError:
+                    probe_port = _find_free_port()
+                    continue
+            self.base_port = probe_port
+            break
+        else:
+            raise AssertionError("no free port strip found")
+        for port in range(self.base_port, self.base_port + 4):
+            holder = socket_module.socket()
+            holder.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_REUSEADDR, 1)
+            holder.bind(("127.0.0.1", port))
+            holder.listen(1)
+            self.holders.append(holder)
+        for holder in self.holders:
+            holder.close()
+        # (session id, save context) pairs the server's callback settled.
+        self.settled = []
+        # A foreign coordinator holds the configured pair, so this instance's
+        # client defers whatever it is given.
+        self.server_a = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record, "inst-A"
+        )
+        _wait_for_server(self.server_a)
+        self.server_b = None
+        self.clients = []
+        self.addCleanup(self.server_a.shutdown)
+        self.addCleanup(self._shutdown_b)
+        self.addCleanup(self._shutdown_clients)
+
+    def _record(self, write_session_id, save_context):
+        self.settled.append((write_session_id, save_context))
+
+    def _shutdown_b(self):
+        if self.server_b is not None:
+            self.server_b.shutdown()
+
+    def _shutdown_clients(self):
+        for client in self.clients:
+            client.shutdown()
+
+    def _client(self):
+        client = TpCoordinatorClient("127.0.0.1", self.base_port, "inst-B")
+        self.clients.append(client)
+        return client
+
+    def _start_event(self, request_id, write_session_id, num_blocks=1):
+        return CoordinateMsgSerializer.dumps(
+            CoordinateMessage(
+                time.time(),
+                SendBlockStartEvent(
+                    request_id=request_id,
+                    write_session_id=write_session_id,
+                    locations=[{"location_specs": []}] * num_blocks,
+                ),
+            )
+        )
+
+    def _finish_event(self, request_id, write_session_id, successes, tp_rank=0):
+        return CoordinateMsgSerializer.dumps(
+            CoordinateMessage(
+                time.time(),
+                SendBlockFinishedEvent(
+                    request_id=request_id,
+                    tp_rank=tp_rank,
+                    write_session_id=write_session_id,
+                    is_success_list=list(successes),
+                ),
+            )
+        )
+
+    def _load_event(self, request_id, epoch):
+        return CoordinateMsgSerializer.dumps(
+            CoordinateMessage(
+                time.time(),
+                LoadBlockFinishedEvent(
+                    request_id=request_id,
+                    tp_rank=0,
+                    epoch=epoch,
+                ),
+            )
+        )
+
+    def _drain_until_saving(self, request_id):
+        """Poll get_finished_tasks (which drains) until request_id lands."""
+        finished_saving = []
+        deadline = time.time() + 5.0
+        while time.time() < deadline and request_id not in finished_saving:
+            saving, _ = self.server_b.get_finished_tasks()
+            finished_saving.extend(saving)
+            time.sleep(0.01)
+        self.assertIn(request_id, finished_saving)
+        return finished_saving
+
+    def test_a_dropped_finish_settles_the_session_and_unblocks_the_request(self):
+        # The worker's queue overflows and retires its finish; the start was
+        # delivered by the scheduler's queue. The marker settles the session
+        # as failed (0/1 ranks reported), the request completes, and the late
+        # events of the retired session -- the finish arriving after the
+        # marker flushed -- are dropped instead of resurrecting it.
+        import kv_cache_manager.py_connector.common.tp_coordinator as tp
+
+        # The retry routine must not flush on its own here: the orchestration
+        # below decides when the marker travels.
+        retry_patch = unittest.mock.patch.object(tp, "DEFERRED_RETRY_SECONDS", 30)
+        retry_patch.start()
+        self.addCleanup(retry_patch.stop)
+        worker = self._client()
+        with unittest.mock.patch.object(tp, "DEFERRED_EVENT_LIMIT", 1):
+            worker.send(self._finish_event("req-1", "sess-1", [True, True]))
+            worker.send(self._finish_event("req-2", "sess-2", [True]))
+            self.assertEqual(1, len(worker._dropped_sessions))
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record, "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        # The scheduler's queue never overflowed: its start is delivered.
+        scheduler = self._client()
+        scheduler.send(self._start_event("req-1", "sess-1", num_blocks=2))
+        # The worker's next send resolves its endpoint and flushes the marker
+        # ahead of the survivor.
+        worker.send(self._finish_event("req-2", "sess-2", [True]))
+        finished_saving = self._drain_until_saving("req-1")
+        self.assertEqual(["sess-1"], [session for session, _ in self.settled])
+        # Nothing was reported for the session: the verdict downstream reads
+        # every block as failed, and the request is settled either way.
+        self.assertEqual({}, self.settled[0][1].result_per_rank)
+        self.assertEqual(["req-1"], finished_saving)
+
+        # A late duplicate finish for the retired session must not resurrect
+        # it (no second settle, no second completion).
+        scheduler.send(self._finish_event("req-1", "sess-1", [True, True]))
+        time.sleep(0.2)
+        self.assertEqual(1, len(self.settled))
+        self.assertEqual([], self.server_b.get_finished_tasks()[0])
+
+    def test_a_dropped_start_settles_on_the_results_that_all_ranks_reported(self):
+        # The scheduler's queue overflows and retires the start; every rank's
+        # finish was delivered and buffers without it. The results are
+        # complete, so the marker settles the session on them instead of
+        # failing it -- the bytes are written and all ranks reported.
+        import kv_cache_manager.py_connector.common.tp_coordinator as tp
+
+        # The retry routine must not flush on its own here: the worker's
+        # delivery below must land before the marker does.
+        retry_patch = unittest.mock.patch.object(tp, "DEFERRED_RETRY_SECONDS", 30)
+        retry_patch.start()
+        self.addCleanup(retry_patch.stop)
+        scheduler = self._client()
+        with unittest.mock.patch.object(tp, "DEFERRED_EVENT_LIMIT", 1):
+            scheduler.send(self._start_event("req-1", "sess-1", num_blocks=2))
+            scheduler.send(self._start_event("req-2", "sess-2"))
+            self.assertEqual(1, len(scheduler._dropped_sessions))
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record, "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        # The worker's queue never overflowed: its finish is delivered, and
+        # with no start it buffers in pending_save_finishes. A throwaway
+        # session on the same socket proves the delivery landed before the
+        # marker (per-socket FIFO), so the settle sees the buffered result.
+        worker = self._client()
+        worker.send(self._finish_event("req-1", "sess-1", [True, True]))
+        worker.send(self._start_event("req-P", "sess-P"))
+        worker.send(self._finish_event("req-P", "sess-P", [True]))
+        self._drain_until_saving("req-P")
+        # The scheduler's next send flushes the marker ahead of survivors.
+        scheduler.send(self._start_event("req-3", "sess-3"))
+        self._drain_until_saving("req-1")
+        settled = {session: context for session, context in self.settled}
+        self.assertIn("sess-1", settled)
+        context = settled["sess-1"]
+        self.assertEqual({0: [True, True]}, context.result_per_rank)
+        self.assertEqual(2, len(context.locations))
+
+    def test_a_dropped_load_event_fails_its_request(self):
+        # A load session's reports travel per rank; dropping one leaves the
+        # rest pinned in running_load with the request never reported. The
+        # marker fails the request (its block ids are gone, so the failure is
+        # request-granular) and reports it finished receiving. No further
+        # traffic is needed: the client's own retry flushes the marker.
+        import kv_cache_manager.py_connector.common.tp_coordinator as tp
+
+        retry_patch = unittest.mock.patch.object(tp, "DEFERRED_RETRY_SECONDS", 0.05)
+        retry_patch.start()
+        self.addCleanup(retry_patch.stop)
+        worker = self._client()
+        with unittest.mock.patch.object(tp, "DEFERRED_EVENT_LIMIT", 1):
+            worker.send(self._load_event("req-1", epoch=7))
+            worker.send(self._load_event("req-2", epoch=8))
+            self.assertEqual(1, len(worker._dropped_sessions))
+        self.server_b = TpCoordinatorServer(
+            "127.0.0.1", self.base_port, 1, self._record, "inst-B"
+        )
+        _wait_for_server(self.server_b)
+        finished_loading = []
+        deadline = time.time() + 5.0
+        while time.time() < deadline and len(finished_loading) < 2:
+            _, loading = self.server_b.get_finished_tasks()
+            finished_loading.extend(loading)
+            time.sleep(0.01)
+        # The marker (flushed ahead of the survivor) fails req-1's load at
+        # request granularity; the surviving report completes req-2 normally.
+        self.assertEqual(["req-1", "req-2"], finished_loading)
+        self.assertEqual({"req-1"}, self.server_b.get_failed_loading_requests())
+        self.assertEqual([], self.server_b.get_finished_tasks()[0])
 
 
 if __name__ == "__main__":
