@@ -23,6 +23,7 @@ public:
     ~DummyBackend() override = default;
 
     DataStorageType GetType() override;
+    bool ShouldSkipConfirmedMissingBackendDelete() const override { return true; }
     bool Available() override;
     [[nodiscard]] double GetStorageUsageRatio(const std::string &trace_id) const override;
 

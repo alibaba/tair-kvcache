@@ -184,6 +184,35 @@ TEST(LiteHitTest, ResetClearsLruState) {
     EXPECT_TRUE(lite_hit.ProcessRequest({1, 2}).hit_curve.empty());
 }
 
+TEST(LiteHitTest, TracksResidentBlockReuseIntervalsFromTraceTimestamps) {
+    constexpr int64_t kSecond = 1000000000LL;
+    LiteHit lite_hit;
+    lite_hit.ProcessRequest({1, 2, 3}, 100 * kSecond);
+    // Deduplicate within a request: two samples of 3 seconds.
+    lite_hit.ProcessRequest({1, 2, 4, 2}, 103 * kSecond);
+    // Two more samples: 37 and 40 seconds, including a key after prefix miss.
+    lite_hit.ProcessRequest({1, 3}, 140 * kSecond);
+    // Out-of-order time is clamped: a real zero-interval sample.
+    lite_hit.ProcessRequest({1}, 120 * kSecond);
+
+    const auto stats = lite_hit.TakeReuseIntervalStats();
+    EXPECT_EQ(5, stats.count);
+    EXPECT_EQ(0, stats.min_ns);
+    EXPECT_EQ(40 * kSecond, stats.max_ns);
+    EXPECT_DOUBLE_EQ(16.6 * kSecond, stats.avg_ns);
+    EXPECT_EQ(0, lite_hit.TakeReuseIntervalStats().count);
+
+    // Reporting-window reset must retain each block's last-access timestamp.
+    lite_hit.ProcessRequest({3}, 145 * kSecond);
+    const auto next = lite_hit.TakeReuseIntervalStats();
+    EXPECT_EQ(1, next.count);
+    EXPECT_EQ(5 * kSecond, next.min_ns);
+    EXPECT_EQ(5 * kSecond, next.max_ns);
+
+    lite_hit.Reset();
+    EXPECT_EQ(0, lite_hit.GetReuseIntervalStats().count);
+}
+
 TEST(LiteHitTest, MatchesNaiveMultiCapacityOracleOnRandomContractTraces) {
     // Generate contract-valid traces: every request is a prefix chain from a
     // random branching tree, keyed by rolling prefix hash.

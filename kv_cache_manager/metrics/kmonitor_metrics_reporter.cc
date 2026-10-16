@@ -297,10 +297,7 @@ bool KmonitorMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
     metrics_config.set_tenant_name(param.kmonitor_tenant);
     metrics_config.set_service_name(param.kmonitor_service_name);
 
-    std::string sink_address = param.kmonitor_sink_address;
-    if (!param.kmonitor_port.empty()) {
-        sink_address += ":" + param.kmonitor_port;
-    }
+    const auto sink_address = param.ResolveSinkAddress();
     metrics_config.set_sink_address(sink_address.c_str());
 
     metrics_config.set_enable_log_file_sink(param.kmonitor_enable_log_file_sink);

@@ -24,7 +24,7 @@ public:
 public:
     ClientErrorCode Init(const std::unique_ptr<ClientConfig> &client_config,
                          const InitParams &init_params,
-                         const SharedMemoryRegistration *shared_memory_registration = nullptr);
+                         const ClientMemoryRegistrations *memory_registrations = nullptr);
 
     ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
@@ -63,7 +63,7 @@ private:
     ClientErrorCode PrepareSharedMemoryRegistration(const SharedMemoryRegistration &shared_memory_registration,
                                                     SharedMemoryRegistration &prepared_registration);
     ClientErrorCode UpdateTairMempoolSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
-                                               const SharedMemoryRegistration *shared_memory_registration);
+                                               const ClientMemoryRegistrations *memory_registrations);
 
 private:
     SdkFactory *sdk_factory_;

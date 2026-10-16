@@ -154,7 +154,8 @@ MetaClientImpl::StartWrite(const std::string &trace_id,
                            const std::vector<int64_t> &keys,
                            const std::vector<int64_t> &tokens,
                            const std::vector<std::string> &location_spec_group_names,
-                           int64_t write_timeout_seconds) {
+                           int64_t write_timeout_seconds,
+                           int32_t min_replica_count) {
     KVCM_LOG_DEBUG("start write with trace_id [%s], keys %s, tokens %s, location_spec_group_names [%s], "
                    "write_timeout_seconds [%ld]",
                    trace_id.c_str(),
@@ -164,7 +165,7 @@ MetaClientImpl::StartWrite(const std::string &trace_id,
                    write_timeout_seconds);
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
     return stub_->StartWriteCache(
-        trace_id, instance_id, keys, tokens, location_spec_group_names, write_timeout_seconds);
+        trace_id, instance_id, keys, tokens, location_spec_group_names, write_timeout_seconds, min_replica_count);
 }
 ClientErrorCode MetaClientImpl::FinishWrite(const std::string &trace_id,
                                             const std::string &write_session_id,
@@ -195,6 +196,29 @@ ClientErrorCode MetaClientImpl::RemoveCache(const std::string &trace_id,
 const std::string &MetaClientImpl::GetStorageConfig() const {
     KVCM_LOG_DEBUG("get storage config");
     return storage_config_;
+}
+
+std::pair<ClientErrorCode, BackendLocations>
+MetaClientImpl::GetCacheLocationsByBackend(const std::string &trace_id,
+                                          const std::vector<int64_t> &keys,
+                                          const std::vector<int64_t> &tokens,
+                                          const BlockMask &block_mask,
+                                          const std::vector<std::string> &location_spec_names,
+                                          StorageType backend_type,
+                                          BackendSelectStrategy strategy) {
+    const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
+    return stub_->GetCacheLocationsByBackend(
+        trace_id, instance_id, keys, tokens, block_mask, location_spec_names, backend_type, strategy);
+}
+
+std::pair<ClientErrorCode, HostCacheState>
+MetaClientImpl::GetHostCacheState(const std::string &trace_id,
+                                 QueryType query_type,
+                                 const std::vector<int64_t> &keys,
+                                 const std::vector<std::string> &medium,
+                                 int32_t p2p_host_count) {
+    const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
+    return stub_->GetHostCacheState(trace_id, instance_id, query_type, keys, medium, p2p_host_count);
 }
 
 ClientErrorCode MetaClientImpl::IsValid(const std::unique_ptr<ClientConfig> &client_config) const {

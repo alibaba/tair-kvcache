@@ -1,5 +1,6 @@
 #pragma once
 
+#include <istream>
 #include <map>
 #include <string>
 
@@ -11,8 +12,16 @@ public:
 
     bool Init();
 
+    // An empty result delegates the default host and port to the KMonitor SDK.
+    std::string ResolveSinkAddress() const;
+    // sdk_host_name must be resolvable; host_info_ip must be a validated IPv4 address.
+    std::string GetSinkAddress(const std::string &sdk_host_name, const std::string &host_info_ip = "") const;
+    static std::string ParseHostInfoIp(std::istream &input);
+
 private:
     static bool ParseKmonitorTags(const std::string &tags_str, std::map<std::string, std::string> &tags_map);
+    // The default IP tag is not an explicitly configured receiver.
+    bool has_hippo_slave_ip_ = false;
 
 public:
     std::string hippo_slave_ip;
