@@ -324,8 +324,11 @@ bool Server::StartHttpServer() {
 
     meta_http_service_ =
         std::make_shared<MetaServiceHttp>(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_);
-    admin_http_service_ = std::make_shared<AdminServiceHttp>(
-        metrics_registry_, admin_impl_, config_.enable_prometheus(), config_.prometheus_prefix());
+    admin_http_service_ = std::make_shared<AdminServiceHttp>(metrics_registry_,
+                                                             admin_impl_,
+                                                             config_.enable_prometheus(),
+                                                             config_.prometheus_prefix(),
+                                                             config_.prometheus_common_tags());
     debug_http_service_ = std::make_shared<DebugServiceHttp>(metrics_registry_, debug_impl_);
 
     meta_http_service_->Init();
@@ -383,7 +386,8 @@ void Server::CreateMetricsReporter() {
     metrics_reporter_factory_->Init(cache_manager_, metrics_registry_);
     auto reporter_type = config_.metrics_reporter_type();
     auto reporter_config = config_.metrics_reporter_config();
-    metrics_reporter_ = metrics_reporter_factory_->Create(reporter_type, reporter_config);
+    metrics_reporter_ =
+        metrics_reporter_factory_->Create(reporter_type, reporter_config, config_.metrics_common_tags());
     KVCM_LOG_INFO("create metrics reporter OK");
 }
 

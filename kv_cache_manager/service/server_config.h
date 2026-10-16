@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "kv_cache_manager/metrics/metrics_registry.h"
+
 namespace kv_cache_manager {
 
 class ServerConfig;
@@ -68,6 +70,8 @@ public:
     uint64_t GetCacheGcEventReportActionBatchSize() const { return cache_gc_event_report_action_batch_size_; }
     const std::string &metrics_reporter_type() { return metrics_reporter_type_; }
     const std::string &metrics_reporter_config() { return metrics_reporter_config_; }
+    const MetricsTags &metrics_common_tags() const { return metrics_common_tags_; }
+    const MetricsTags &prometheus_common_tags() const { return prometheus_common_tags_; }
     int64_t metrics_report_interval_ms() { return metrics_report_interval_ms_; }
     bool enable_prometheus() const { return enable_prometheus_; }
     const std::string &prometheus_prefix() const { return prometheus_prefix_; }
@@ -90,6 +94,7 @@ private:
     bool ParseFromFile(const std::string &config_file);
     bool ParseFromEnviron(const EnvironMap &environ);
     void UpdateEnviron(EnvironMap &environ);
+    bool ResolveMetricsEnvTags();
 
 private:
     std::string registry_storage_uri_;
@@ -133,6 +138,9 @@ private:
     uint64_t cache_gc_event_report_action_batch_size_ = 0;
     std::string metrics_reporter_type_ = "local";
     std::string metrics_reporter_config_;
+    std::string metrics_env_tag_mappings_;
+    MetricsTags metrics_common_tags_;
+    MetricsTags prometheus_common_tags_;
     int64_t metrics_report_interval_ms_ = 0;
     bool enable_prometheus_ = true;
     std::string prometheus_prefix_ = "kvcm";

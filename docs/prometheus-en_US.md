@@ -54,6 +54,56 @@ kv_cache_manager_bin -e 'kvcm.metrics.enable_prometheus=false'
 kv_cache_manager_bin -e 'kvcm.metrics.prometheus_prefix=myapp'
 ```
 
+### Common tags from environment variables
+
+The backend-independent setting `kvcm.metrics.env_tag_mappings` resolves
+environment variables into process-level tags:
+
+```bash
+export APP_WORKSPACE=workspace_a
+export APP_DEPLOYMENT=deployment_a
+export kvcm_metrics_env_tag_mappings='workspace=APP_WORKSPACE,deployment_name=APP_DEPLOYMENT'
+```
+
+Use comma-separated `tag_name=ENV_NAME` mappings. Values are read at startup;
+missing or empty variables are skipped. Nonempty values, including leading
+and trailing whitespace, are preserved. Restart the process after changing
+the mapping or source values. An empty setting adds no tags. Duplicate tag
+names, empty names, or malformed mappings fail configuration parsing. The
+setting supports the usual config-file, `-e`, and environment-variable
+inputs and works independently of the reporter type.
+
+Prometheus merges these tags at export time, including metrics without
+existing labels:
+
+```text
+kvcm_service_query_counter{deployment_name="deployment_a",workspace="workspace_a"} 12345
+```
+
+Label names use the character conversion rules below. Metric labels take
+precedence over common tags after conversion. Use deployment dimensions
+such as workspace and deployment_name for common tags, and avoid names that
+overlap existing business labels after conversion. Preserving a business
+label on an individual sample can still collapse distinct series; the
+service does not check for cross-series collisions.
+
+When multiple common tags convert to the same label name, startup parsing
+prints an ERROR with the duplicate label name, the overwritten value, and
+the effective value. Only one value is retained, and startup continues.
+For example, `host.name=ENV_A,host-name=ENV_B` both convert to `host_name`.
+Avoid such collisions and do not rely on overwrite order. Common-tag name
+conversion and collision handling run once at startup.
+Common tags named `__*`, `le`, or `quantile` after conversion
+are omitted to protect metric names and histogram/summary dimensions.
+Startup prints one WARN per omitted tag with its original and normalized name;
+metric-specific labels such as `le` are preserved. Values are escaped for
+the Prometheus text format. Common tags are not stored in MetricsRegistry,
+so `/api/getMetrics` continues to return the original metric tags.
+
+Other metrics backends receive the same resolved key/value pairs through
+common initialization parameters and can apply their own rules. Currently,
+Prometheus implements common-tag output.
+
 ## Output Format
 
 The endpoint outputs the Prometheus text exposition format

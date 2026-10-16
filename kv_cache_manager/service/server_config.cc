@@ -6,11 +6,13 @@
 #include <limits>
 #include <sstream>
 #include <stdio.h>
+#include <utility>
 
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/manager/cache_garbage_collector.h"
 #include "kv_cache_manager/metrics/metrics_reporter_factory.h"
+#include "kv_cache_manager/metrics/prometheus_exporter.h"
 
 namespace kv_cache_manager {
 
@@ -274,6 +276,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->metrics_reporter_config_ = value;
          return true;
      }},
+    {"kvcm.metrics.env_tag_mappings",
+     [](const std::string &value, ServerConfig *config) {
+         config->metrics_env_tag_mappings_ = value;
+         return true;
+     }},
     {"kvcm.metrics.report_interval_ms",
      [](const std::string &value, ServerConfig *config) {
          config->metrics_report_interval_ms_ = std::stol(value);
@@ -323,11 +330,62 @@ bool ServerConfig::Parse(const std::string &config_file, const EnvironMap &envir
         fprintf(stderr, "Parse config from environ failed\n");
         return false;
     }
+    return ResolveMetricsEnvTags();
+}
+
+bool ServerConfig::ResolveMetricsEnvTags() {
+    if (metrics_env_tag_mappings_.empty()) {
+        return true;
+    }
+
+    // Validate the entire mapping before resolving values. Tag names are
+    // backend-independent here; each backend applies its own naming rules.
+    MetricsTags mappings;
+    size_t start = 0;
+    while (true) {
+        const auto end = metrics_env_tag_mappings_.find(',', start);
+        const auto entry = metrics_env_tag_mappings_.substr(start, end - start);
+        const auto equal = entry.find('=');
+        if (equal == std::string::npos || entry.find('=', equal + 1) != std::string::npos) {
+            fprintf(stderr, "Invalid kvcm.metrics.env_tag_mappings entry [%s]: expected tag=ENV_NAME\n", entry.c_str());
+            return false;
+        }
+        auto tag = entry.substr(0, equal);
+        auto env_name = entry.substr(equal + 1);
+        StringUtil::Trim(tag);
+        StringUtil::Trim(env_name);
+        if (tag.empty() || env_name.empty() || !mappings.emplace(tag, env_name).second) {
+            fprintf(stderr,
+                    "Invalid kvcm.metrics.env_tag_mappings entry [%s]: empty name or duplicate tag\n",
+                    entry.c_str());
+            return false;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    for (const auto &[tag, env_name] : mappings) {
+        // Mapping names are configuration syntax, but environment values are
+        // label data shared with every backend. Preserve their exact contents,
+        // including whitespace; only missing or zero-length values are skipped.
+        auto value = EnvUtil::GetEnv(env_name, "");
+        if (!value.empty()) {
+            metrics_common_tags_.emplace(tag, std::move(value));
+        }
+    }
+    if (enable_prometheus_) {
+        prometheus_common_tags_ = PrometheusExporter::PrepareCommonTags(metrics_common_tags_);
+    }
     return true;
 }
 
 void ServerConfig::UpdateDefaultConfig() {
     metrics_reporter_type_ = "local";
+    metrics_env_tag_mappings_.clear();
+    metrics_common_tags_.clear();
+    prometheus_common_tags_.clear();
     metrics_report_interval_ms_ = 20000;
     leader_elector_lease_ms_ = 10000;
     leader_elector_loop_interval_ms_ = 100;

@@ -8,8 +8,9 @@ namespace kv_cache_manager {
 
 bool LoggingMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
                                   std::shared_ptr<MetricsRegistry> metrics_registry,
-                                  const std::string &config) {
-    return LocalMetricsReporter::Init(cache_manager, metrics_registry, config);
+                                  const std::string &config,
+                                  const MetricsTags &common_tags) {
+    return LocalMetricsReporter::Init(cache_manager, metrics_registry, config, common_tags);
 }
 
 void LoggingMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed) {

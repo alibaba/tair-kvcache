@@ -1,7 +1,9 @@
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
@@ -57,6 +59,124 @@ TEST_F(PrometheusExporterTest, MetricsWithTags) {
               std::string::npos)
         << "Actual output:\n"
         << output;
+}
+
+TEST_F(PrometheusExporterTest, CommonTagsApplyWithoutChangingRegistry) {
+    const MetricsTags metric_tags{{"type", "nfs"}};
+    registry_->GetCounter("service.query_counter") += 3;
+    registry_->GetGauge("data_storage.storage_usage_ratio", metric_tags) = 0.75;
+    const auto common_tags =
+        PrometheusExporter::PrepareCommonTags({{"workspace", "workspace_a"}, {"type", "deployment_type"}});
+    const auto output = PrometheusExporter::Expose(*registry_, "kvcm", common_tags);
+    EXPECT_NE(output.find("kvcm_service_query_counter{type=\"deployment_type\",workspace=\"workspace_a\"} 3\n"),
+              std::string::npos)
+        << output;
+    EXPECT_NE(output.find("kvcm_data_storage_storage_usage_ratio{type=\"nfs\",workspace=\"workspace_a\"} 0.75\n"),
+              std::string::npos)
+        << output;
+
+    std::vector<MetricsRegistry::metrics_tuple_t> metrics;
+    registry_->GetAllMetrics(metrics);
+    ASSERT_EQ(2, metrics.size());
+    for (const auto &[name, tags, value] : metrics) {
+        EXPECT_EQ(0, tags.count("workspace"));
+    }
+    EXPECT_EQ(3, registry_->GetCounter("service.query_counter").Get());
+    EXPECT_TRUE(registry_->Remove("data_storage.storage_usage_ratio", metric_tags));
+    EXPECT_EQ(1, registry_->GetSize());
+}
+
+TEST_F(PrometheusExporterTest, CommonTagsNormalizeNamesAndEscapeValues) {
+    registry_->GetGauge("test.labels", {{"storage.type", "metric_value"}}) = 1;
+    const auto common_tags = PrometheusExporter::PrepareCommonTags({{"storage_type", "common_value"},
+                                                                    {"host-name", "node_a"},
+                                                                    {"host.name", "node_b"},
+                                                                    {"1zone", "a\\b\"c\nd"},
+                                                                    {"__name__", "override"},
+                                                                    {"__internal", "reserved"},
+                                                                    {"le", "not_a_boundary"},
+                                                                    {"quantile", "not_a_quantile"}});
+    const auto output = PrometheusExporter::Expose(*registry_, "kvcm", common_tags);
+    EXPECT_NE(output.find("kvcm_test_labels{storage_type=\"metric_value\",_1zone=\"a\\\\b\\\"c\\nd\","
+                          "host_name=\"node_b\"} 1\n"),
+              std::string::npos)
+        << output;
+    EXPECT_EQ(std::string::npos, output.find("common_value"));
+    EXPECT_EQ(std::string::npos, output.find("node_a"));
+    EXPECT_EQ(std::string::npos, output.find("override"));
+    EXPECT_EQ(std::string::npos, output.find("reserved"));
+    EXPECT_EQ(std::string::npos, output.find("not_a_"));
+}
+
+TEST_F(PrometheusExporterTest, CommonTagsPreservePrecedenceWhenSanitizationChangesKeyOrder) {
+    registry_->GetCounter("test.labels", {{"a-b", "first_native"}, {"a.b", "duplicate_native"}, {"aA", "native_aA"}}) +=
+        1;
+    registry_->GetCounter("test.labels", {{"region", "native_region"}}) += 2;
+    registry_->GetCounter("test.untagged") += 3;
+    const auto common_labels = PrometheusExporter::PrepareCommonTags(
+        {{"aA", "common_aA"}, {"a_b", "common_a_b"}, {"region", "common_region"}});
+    const auto output = PrometheusExporter::Expose(*registry_, "kvcm", common_labels);
+
+    EXPECT_NE(std::string::npos,
+              output.find("kvcm_test_labels{a_b=\"first_native\",aA=\"native_aA\",region=\"common_region\"} 1\n"));
+    EXPECT_NE(std::string::npos,
+              output.find("kvcm_test_labels{region=\"native_region\",aA=\"common_aA\",a_b=\"common_a_b\"} 2\n"));
+    EXPECT_NE(std::string::npos,
+              output.find("kvcm_test_untagged{aA=\"common_aA\",a_b=\"common_a_b\",region=\"common_region\"} 3\n"));
+    EXPECT_EQ(std::string::npos, output.find("duplicate_native"));
+}
+
+TEST_F(PrometheusExporterTest, DroppedCommonTagsReportEachReservedOrEmptyName) {
+    testing::internal::CaptureStderr();
+    const auto labels = PrometheusExporter::PrepareCommonTags({{"", "empty_name"},
+                                                               {"__internal", "internal"},
+                                                               {"__name__", "metric_name"},
+                                                               {"le", "boundary"},
+                                                               {"quantile", "percentile"},
+                                                               {"workspace", "workspace_a"}});
+    const auto warnings = testing::internal::GetCapturedStderr();
+    EXPECT_EQ((MetricsTags{{"workspace", "workspace_a"}}), labels);
+    EXPECT_EQ(5, std::count(warnings.begin(), warnings.end(), '\n'));
+    EXPECT_NE(std::string::npos, warnings.find("WARN: Prometheus common tag [] normalizes to an empty label"));
+    for (const auto &key : {"__internal", "__name__", "le", "quantile"}) {
+        EXPECT_NE(std::string::npos,
+                  warnings.find("WARN: Prometheus common tag [" + std::string(key) +
+                                "] normalizes to reserved label [" + key + "]"));
+    }
+    EXPECT_EQ(std::string::npos, warnings.find("[workspace]"));
+}
+
+TEST_F(PrometheusExporterTest, CommonTagCollisionsReportOverwrittenAndEffectiveValues) {
+    testing::internal::CaptureStderr();
+    const auto labels =
+        PrometheusExporter::PrepareCommonTags({{"host-name", "node_a"}, {"host.name", "node_b\n\"zone\""}});
+    const auto errors = testing::internal::GetCapturedStderr();
+    EXPECT_EQ((MetricsTags{{"host_name", "node_b\n\"zone\""}}), labels);
+    EXPECT_NE(std::string::npos, errors.find("ERROR:"));
+    EXPECT_NE(std::string::npos, errors.find("[host.name] normalizes to duplicate label [host_name]"));
+    EXPECT_NE(std::string::npos, errors.find(R"(overwriting value "node_a" with "node_b\n\"zone\"")"));
+
+    registry_->GetCounter("test.common_tags") += 1;
+    testing::internal::CaptureStderr();
+    const auto output = PrometheusExporter::Expose(*registry_, "kvcm", labels);
+    const auto repeated_output = PrometheusExporter::Expose(*registry_, "kvcm", labels);
+    const auto export_errors = testing::internal::GetCapturedStderr();
+    EXPECT_NE(std::string::npos, output.find(R"(kvcm_test_common_tags{host_name="node_b\n\"zone\""} 1)"));
+    EXPECT_EQ(output, repeated_output);
+    EXPECT_TRUE(export_errors.empty());
+}
+
+TEST_F(PrometheusExporterTest, CommonTagsPreserveHistogramDimensions) {
+    registry_->RegisterHistogramFamily("test.histogram");
+    registry_->MapMetricToFamily("test.histogram_bucket", "test.histogram");
+    registry_->MapMetricToFamily("test.histogram_count", "test.histogram");
+    registry_->GetCounter("test.histogram_bucket", {{"le", "+Inf"}}) += 2;
+    registry_->GetCounter("test.histogram_count") += 2;
+    const auto common_tags = PrometheusExporter::PrepareCommonTags({{"le", "override"}, {"workspace", "ws"}});
+    const auto output = PrometheusExporter::Expose(*registry_, "kvcm", common_tags);
+    EXPECT_NE(output.find("kvcm_test_histogram_bucket{le=\"+Inf\",workspace=\"ws\"} 2\n"), std::string::npos) << output;
+    EXPECT_NE(output.find("kvcm_test_histogram_count{workspace=\"ws\"} 2\n"), std::string::npos) << output;
+    EXPECT_EQ(std::string::npos, output.find("override"));
 }
 
 TEST_F(PrometheusExporterTest, EventReportSnapshotMetricsReuseServiceTagsAndValues) {

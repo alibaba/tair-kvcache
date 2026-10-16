@@ -12,7 +12,8 @@ public:
     ~KmonitorMetricsReporter();
     bool Init(std::shared_ptr<CacheManager> cache_manager,
               std::shared_ptr<MetricsRegistry> metrics_registry,
-              const std::string &config) override;
+              const std::string &config,
+              const MetricsTags &common_tags = {}) override;
     void ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed = std::nullopt) override;
     void ReportInterval() override;
 

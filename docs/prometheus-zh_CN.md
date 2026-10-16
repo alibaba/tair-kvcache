@@ -53,6 +53,45 @@ kv_cache_manager_bin -e 'kvcm.metrics.enable_prometheus=false'
 kv_cache_manager_bin -e 'kvcm.metrics.prometheus_prefix=myapp'
 ```
 
+### 公共环境变量 tag
+
+公共配置 `kvcm.metrics.env_tag_mappings` 支持将环境变量解析为进程级 tag：
+
+```bash
+export APP_WORKSPACE=workspace_a
+export APP_DEPLOYMENT=deployment_a
+export kvcm_metrics_env_tag_mappings='workspace=APP_WORKSPACE,deployment_name=APP_DEPLOYMENT'
+```
+
+配置格式是 `tag名=源环境变量名`，多个映射以逗号分隔。启动时读取源变量，
+变量不存在或值为空时跳过；非空值（包括首尾空白）保持原样。修改后需重启。
+空配置不添加 tag，重复 tag 名、
+空名或错误的映射语法会使配置解析失败。配置遵循 KVCM 的配置文件、`-e`
+参数及系统环境变量入口，独立于 reporter 类型。
+
+Prometheus 在导出阶段合并这些 tag，包括原本没有 tag 的指标：
+
+```text
+kvcm_service_query_counter{deployment_name="deployment_a",workspace="workspace_a"} 12345
+```
+
+label 名沿用下述字符转换规则；转换后与指标自身 label 重名时，指标自身的值优先。
+公共 tag 应使用 workspace、deployment_name 等部署维度，转换后的名称不要与已有业务
+label 重名。即使单条输出保留了业务 label，也可能让原本不同的序列变得相同；
+服务不检查跨序列冲突。
+
+多个公共 tag 转换为同一个 label 名时，启动解析会输出 ERROR，
+打印重名的 label、被覆盖的值和最终生效的值，最终只保留一个值，服务继续启动。
+例如 `host.name=ENV_A,host-name=ENV_B` 都转换为 `host_name`；配置者应避免这种重名，
+不依赖冲突时的覆盖顺序。名称转换和公共 tag 冲突处理只在启动时执行。
+公共 tag 中的保留 label 名 `__*`、`le` 和 `quantile` 被忽略，以保护指标名和
+histogram/summary 的维度。启动时对每个被忽略的 tag 输出一行 WARN，说明原始 tag 名和
+转换后的 label 名；指标自身的 `le` 等 label 正常保留。值按 Prometheus
+文本格式转义。公共 tag 不写入 MetricsRegistry，因此 `/api/getMetrics` 返回原始 tag。
+
+其他 metrics 后端可通过公共初始化参数获取相同的 tag key/value，并按各自规则处理；
+当前已适配的输出后端是 Prometheus。
+
 ## 输出格式
 
 端点输出 Prometheus 文本展示格式

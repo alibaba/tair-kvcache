@@ -39,6 +39,9 @@ cc_test(
     data = [],
     deps = [
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:metrics_reporter",
         "//kv_cache_manager/metrics:metrics_reporter_factory",
     ],

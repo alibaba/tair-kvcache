@@ -269,8 +269,9 @@ KmonitorMetricsReporter::~KmonitorMetricsReporter() {}
 
 bool KmonitorMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
                                    std::shared_ptr<MetricsRegistry> metrics_registry,
-                                   const std::string &config) {
-    if (!LocalMetricsReporter::Init(std::move(cache_manager), std::move(metrics_registry), config)) {
+                                   const std::string &config,
+                                   const MetricsTags &common_tags) {
+    if (!LocalMetricsReporter::Init(std::move(cache_manager), std::move(metrics_registry), config, common_tags)) {
         return false;
     }
 

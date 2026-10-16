@@ -96,6 +96,96 @@ TEST_F(ServerConfigTest, TestSimple) {
     }
 }
 
+TEST_F(ServerConfigTest, MetricsEnvTagsResolveAtStartup) {
+    ScopedEnv workspace("KVCM_TEST_METRICS_WORKSPACE", " workspace_a ");
+    ScopedEnv deployment("KVCM_TEST_METRICS_DEPLOYMENT", "deployment_a");
+    ScopedEnv empty("KVCM_TEST_METRICS_EMPTY", "");
+    ScopedEnv whitespace("KVCM_TEST_METRICS_WHITESPACE", " \t ");
+    const std::string mappings = " workspace = KVCM_TEST_METRICS_WORKSPACE , "
+                                 "deployment_name=KVCM_TEST_METRICS_DEPLOYMENT,"
+                                 "whitespace=KVCM_TEST_METRICS_WHITESPACE,"
+                                 "empty=KVCM_TEST_METRICS_EMPTY,missing=KVCM_TEST_METRICS_UNSET";
+    for (const auto &type : {"local", "logging", "dummy", "kmonitor"}) {
+        ServerConfig config;
+        ASSERT_TRUE(
+            config.Parse("", {{"kvcm.metrics.env_tag_mappings", mappings}, {"kvcm.metrics.reporter_type", type}}));
+        ASSERT_TRUE(config.Check());
+        EXPECT_EQ(
+            (MetricsTags{{"workspace", " workspace_a "}, {"deployment_name", "deployment_a"}, {"whitespace", " \t "}}),
+            config.metrics_common_tags());
+    }
+
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {{"kvcm.metrics.env_tag_mappings", mappings}}));
+    setenv("KVCM_TEST_METRICS_DEPLOYMENT", "deployment_b", 1);
+    ASSERT_TRUE(config.Check());
+    EXPECT_EQ("deployment_a", config.metrics_common_tags().at("deployment_name"));
+    // Parsing a fresh configuration must not retain tags from an earlier one.
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_TRUE(config.metrics_common_tags().empty());
+    EXPECT_TRUE(config.prometheus_common_tags().empty());
+    ASSERT_TRUE(config.Parse("", {{"kvcm.metrics.env_tag_mappings", ""}}));
+    EXPECT_TRUE(config.metrics_common_tags().empty());
+    EXPECT_TRUE(config.prometheus_common_tags().empty());
+}
+
+TEST_F(ServerConfigTest, MetricsEnvTagCollisionsKeepRawTagsAndReportEffectiveLabels) {
+    ScopedEnv first("KVCM_TEST_METRICS_FIRST", "first_value");
+    ScopedEnv second("KVCM_TEST_METRICS_SECOND", "second_value");
+    ScopedEnv empty("KVCM_TEST_METRICS_EMPTY", "");
+    ServerConfig config;
+    testing::internal::CaptureStderr();
+    const auto parsed = config.Parse(
+        "",
+        {{"kvcm.metrics.env_tag_mappings",
+          "host.name=KVCM_TEST_METRICS_FIRST,host-name=KVCM_TEST_METRICS_SECOND,host_name=KVCM_TEST_METRICS_EMPTY"}});
+    const auto errors = testing::internal::GetCapturedStderr();
+    ASSERT_TRUE(parsed);
+    EXPECT_EQ((MetricsTags{{"host.name", "first_value"}, {"host-name", "second_value"}}), config.metrics_common_tags());
+    EXPECT_EQ((MetricsTags{{"host_name", "first_value"}}), config.prometheus_common_tags());
+    EXPECT_NE(std::string::npos, errors.find("ERROR:"));
+    EXPECT_NE(std::string::npos, errors.find("[host.name] normalizes to duplicate label [host_name]"));
+    EXPECT_NE(std::string::npos, errors.find("overwriting value \"second_value\" with \"first_value\""));
+
+    testing::internal::CaptureStderr();
+    const auto disabled = config.Parse(
+        "",
+        {{"kvcm.metrics.enable_prometheus", "false"},
+         {"kvcm.metrics.env_tag_mappings", "host.name=KVCM_TEST_METRICS_FIRST,host-name=KVCM_TEST_METRICS_SECOND"}});
+    const auto disabled_errors = testing::internal::GetCapturedStderr();
+    ASSERT_TRUE(disabled);
+    EXPECT_EQ(2, config.metrics_common_tags().size());
+    EXPECT_TRUE(config.prometheus_common_tags().empty());
+    EXPECT_TRUE(disabled_errors.empty());
+}
+
+TEST_F(ServerConfigTest, MetricsEnvTagsUseExistingEnvironmentPrecedence) {
+    ScopedEnv workspace("KVCM_TEST_METRICS_WORKSPACE", "workspace_a");
+    ScopedEnv underscore("kvcm_metrics_env_tag_mappings", "workspace=KVCM_TEST_METRICS_WORKSPACE");
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {{"kvcm.metrics.env_tag_mappings", "other=KVCM_TEST_METRICS_WORKSPACE"}}));
+    EXPECT_EQ((MetricsTags{{"workspace", "workspace_a"}}), config.metrics_common_tags());
+    ScopedEnv dotted("kvcm.metrics.env_tag_mappings", "deployment=KVCM_TEST_METRICS_WORKSPACE");
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ((MetricsTags{{"deployment", "workspace_a"}}), config.metrics_common_tags());
+}
+
+TEST_F(ServerConfigTest, MetricsEnvTagsRejectMalformedAndDuplicateMappings) {
+    for (const auto &mappings : {"workspace",
+                                 "=ENV",
+                                 "workspace=",
+                                 "workspace=ENV=OTHER",
+                                 "workspace=ENV,workspace=OTHER",
+                                 "workspace=ENV,",
+                                 ",workspace=ENV",
+                                 "workspace=ENV,,deployment=OTHER",
+                                 "workspace=ENV, =OTHER"}) {
+        ServerConfig config;
+        EXPECT_FALSE(config.Parse("", {{"kvcm.metrics.env_tag_mappings", mappings}})) << mappings;
+        EXPECT_TRUE(config.metrics_common_tags().empty());
+    }
+}
+
 TEST_F(ServerConfigTest, TestGroupLruLimits) {
     ServerConfig defaults;
     ASSERT_TRUE(defaults.Parse("", {}));

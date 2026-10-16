@@ -153,6 +153,9 @@ kvcm.metrics.reporter_type=local
 # 传递给metrics reporter的配置值
 kvcm.metrics.reporter_config
 
+# 公共环境变量 tag 映射，格式为 tag名=环境变量名，多个映射用逗号分隔；默认空
+kvcm.metrics.env_tag_mappings=
+
 # 若启用的metrics reporter有周期性report任务，指定该任务的唤醒间隔；默认20000
 kvcm.metrics.report_interval_ms
 
@@ -168,6 +171,36 @@ kvcm.metrics.prometheus_prefix=kvcm
 # subscriber_queue_size 是每个订阅者的独立缓冲上限；字段省略时使用下列默认值。
 kvcm.event.event_publishers_configs={"log":{"enable":true,"queue_size":10000},"optimizer":{"enable":true,"queue_size":100000,"max_subscribers":4,"subscriber_queue_size":10000}}
 ```
+
+### Metrics 公共环境变量 tag
+
+`kvcm.metrics.env_tag_mappings` 是独立于 metrics 后端选择的公共配置。
+启动时读取指定的环境变量，将实际的 tag key/value 提供给 reporter 和 exporter，
+各后端决定如何输出。当前 Prometheus `/metrics` 将它们加入每条已导出指标的 label，
+使用 `local` reporter 时也生效；其他后端已接收公共 tag，暂未适配输出。
+
+例如，通过系统环境变量配置映射：
+
+```bash
+export APP_WORKSPACE=workspace_a
+export APP_DEPLOYMENT=deployment_a
+export kvcm_metrics_env_tag_mappings='workspace=APP_WORKSPACE,deployment_name=APP_DEPLOYMENT'
+```
+
+也可以在配置文件中设置
+`kvcm.metrics.env_tag_mappings=workspace=APP_WORKSPACE,deployment_name=APP_DEPLOYMENT`，
+或使用同名的 `-e` 启动参数。源环境变量的值（包括首尾空白）保持原样；
+变量不存在或值为零长度字符串时跳过对应 tag。
+未配置或配置为空时不添加公共 tag。映射中的 tag 名必须唯一，空名、缺少 `=`、
+多余分隔符等语法错误会使配置解析失败。修改映射或源环境变量后需要重启进程。
+
+公共 tag 不参与 MetricsRegistry 的指标标识、查找和删除，`/api/getMetrics`
+继续返回 Registry 中的原始 tag。公共 tag 应使用 workspace、deployment_name 等部署维度，
+名称经过具体后端转换后不要与已有业务 label 重名，以免使原本不同的序列变得相同。
+Prometheus 公共 tag 名称转换后发生重名时，启动解析会输出 ERROR，
+打印被覆盖的值和最终生效的值，服务继续启动。配置者应避免重名，不依赖冲突时的覆盖顺序。
+Prometheus 的名称转换、冲突和保留 label 处理规则见
+[Prometheus 文档](prometheus-zh_CN.md#公共环境变量-tag)。
 
 ### SchedulePlanExecutor 线程与迁移预算
 

@@ -22,13 +22,15 @@ namespace kv_cache_manager {
 
 bool LocalMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
                                 std::shared_ptr<MetricsRegistry> metrics_registry,
-                                const std::string &config) {
+                                const std::string &config,
+                                const MetricsTags &common_tags) {
     if (cache_manager == nullptr || metrics_registry == nullptr) {
         return false;
     }
 
     cache_manager_ = std::move(cache_manager);
     metrics_registry_ = std::move(metrics_registry);
+    common_tags_ = common_tags;
 
     KVCM_MAKE_METRICS_COLLECTOR_(metrics_registry_, MetaIndexerAccumulative, MetaIndexerAccumulative, MetricsTags{});
     KVCM_MAKE_METRICS_COLLECTOR_(metrics_registry_, CacheManager, CacheManager, MetricsTags{});
