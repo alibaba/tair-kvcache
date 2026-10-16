@@ -11,7 +11,7 @@ public:
               const std::string &config) override {
         return true;
     }
-    void ReportPerQuery(MetricsCollector *collector) override {}
+    void ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed = std::nullopt) override {}
     void ReportInterval() override {}
     std::shared_ptr<MetricsRegistry> GetMetricsRegistry() override { return nullptr; }
 };

@@ -46,7 +46,8 @@ ServiceCallGuard::~ServiceCallGuard() {
     // MetricsReporter treats any non-zero error_code sample as a failed
     // request, so this gauge is deliberately a 0/1 failure flag rather than
     // the wire enum value (where a successful request is non-zero).
-    const double error_code = request_context_->status_code() == RequestContext::kOkStatusCode ? 0.0 : 1.0;
+    const bool request_failed = request_context_->status_code() != RequestContext::kOkStatusCode;
+    const double error_code = request_failed ? 1.0 : 0.0;
     // The response must be finalized before materialization. Doing this once
     // here lets the access log and the HTTP transport share the same bytes.
     request_context_->MaterializeResponseJson();
@@ -54,7 +55,9 @@ ServiceCallGuard::~ServiceCallGuard() {
         completion_callback_();
     }
     if (metrics_reporter_) {
-        metrics_reporter_->ReportPerQuery(service_metrics_collector);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, service, error_code, error_code);
+        // Count using this request's outcome; concurrent requests may overwrite the shared gauge.
+        metrics_reporter_->ReportPerQuery(service_metrics_collector, request_failed);
         for (const auto &mc : extra_collectors) {
             if (auto *event_metrics_collector = dynamic_cast<EventReportMetricsCollector *>(mc.get())) {
                 // The master ServiceMetricsCollector is cached per instance and

@@ -1,7 +1,9 @@
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <thread>
+#include <vector>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -18,6 +20,7 @@
 #include "kv_cache_manager/metrics/local_metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "kv_cache_manager/metrics/prometheus_exporter.h"
 #include "kv_cache_manager/service/util/service_call_guard.h"
 #include "stub.h"
 
@@ -205,6 +208,65 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery02) {
         GET_METRICS_(&collector, service, error_counter, v);
         EXPECT_EQ(1, v);
     }
+}
+
+TEST_F(LocalMetricsReporterTest, ExplicitRequestOutcomeOverridesSharedGauge) {
+    ServiceMetricsCollector collector(metrics_registry_);
+    ASSERT_TRUE(collector.Init());
+
+    SET_METRICS_(&collector, service, error_code, 1.);
+    reporter_->ReportPerQuery(&collector, false);
+    EXPECT_EQ(0u, collector.get_service_error_counter_metrics());
+
+    SET_METRICS_(&collector, service, error_code, 0.);
+    reporter_->ReportPerQuery(&collector, true);
+    EXPECT_EQ(2u, collector.get_service_query_counter_metrics());
+    EXPECT_EQ(1u, collector.get_service_error_counter_metrics());
+}
+
+TEST_F(LocalMetricsReporterTest, ServiceCallGuardReportsSuccessFailureAndRecovery) {
+    auto collector = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    ASSERT_TRUE(collector->Init());
+    EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*metrics_registry_).find("kvcm_service_error_counter"));
+
+    for (int status : {RequestContext::kOkStatusCode, 10, RequestContext::kOkStatusCode}) {
+        RequestContext context("request-outcome", collector);
+        context.set_status_code(status);
+        { ServiceCallGuard guard(cache_manager_.get(), &context, reporter_.get()); }
+        EXPECT_DOUBLE_EQ(status == RequestContext::kOkStatusCode ? 0. : 1.,
+                         collector->get_service_error_code_metrics());
+    }
+
+    EXPECT_EQ(3u, collector->get_service_query_counter_metrics());
+    EXPECT_EQ(1u, collector->get_service_error_counter_metrics());
+    EXPECT_NE(std::string::npos, PrometheusExporter::Expose(*metrics_registry_).find("kvcm_service_error_counter 1\n"));
+}
+
+TEST_F(LocalMetricsReporterTest, ConcurrentServiceCallsCountTheirOwnFailures) {
+    auto collector = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    ASSERT_TRUE(collector->Init());
+    std::atomic<int> ready{0};
+    std::vector<std::thread> workers;
+    constexpr int kWorkers = 4;
+    constexpr int kRequests = 100;
+    for (int i = 0; i < kWorkers; ++i) {
+        workers.emplace_back([&, i]() {
+            ++ready;
+            while (ready.load() != kWorkers) {
+                std::this_thread::yield();
+            }
+            for (int j = 0; j < kRequests; ++j) {
+                RequestContext context("concurrent-outcome", collector);
+                context.set_status_code(i % 2 == 0 ? RequestContext::kOkStatusCode : 10);
+                ServiceCallGuard guard(cache_manager_.get(), &context, reporter_.get());
+            }
+        });
+    }
+    for (auto &worker : workers) {
+        worker.join();
+    }
+    EXPECT_EQ(kWorkers * kRequests, collector->get_service_query_counter_metrics());
+    EXPECT_EQ(kWorkers * kRequests / 2, collector->get_service_error_counter_metrics());
 }
 
 TEST_F(LocalMetricsReporterTest, TestReportPerQueryEventReport) {

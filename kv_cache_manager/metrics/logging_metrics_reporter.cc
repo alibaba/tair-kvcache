@@ -12,8 +12,8 @@ bool LoggingMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
     return LocalMetricsReporter::Init(cache_manager, metrics_registry, config);
 }
 
-void LoggingMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
-    LocalMetricsReporter::ReportPerQuery(collector);
+void LoggingMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed) {
+    LocalMetricsReporter::ReportPerQuery(collector, request_failed);
 
     if (metrics_registry_ == nullptr) {
         return;

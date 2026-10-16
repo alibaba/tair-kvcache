@@ -36,7 +36,7 @@ bool LocalMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
     return true;
 }
 
-void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
+void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed) {
     if (dynamic_cast<ServiceMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<ServiceMetricsCollector *>(collector);
 
@@ -50,10 +50,8 @@ void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         do {
             // service error_counter
 
-            // first get the error_code value
-            double service_error_code_v;
-            GET_METRICS_(p, service, error_code, service_error_code_v);
-            if (CommonUtil::IsZeroDouble(service_error_code_v)) {
+            const bool failed = request_failed.value_or(!CommonUtil::IsZeroDouble(p->get_service_error_code_metrics()));
+            if (!failed) {
                 // no error, no report
                 break;
             }

@@ -958,8 +958,6 @@ void MetaServiceImpl::ReportEvent(RequestContext *request_context,
     if (!request->instance_id().empty()) {
         response->set_extra_info(cache_manager_->GetExtraInfo(request_context, request->instance_id()));
     }
-    auto *smc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    KVCM_METRICS_COLLECTOR_SET_METRICS(smc, service, error_code, (ec != EC_OK) ? 1.0 : 0.0);
     request_context->set_status_code(header->status().code());
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
