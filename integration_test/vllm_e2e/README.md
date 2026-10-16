@@ -88,6 +88,19 @@ Multi-group specifics verified:
     whole-prefix KV group, so a bounded+state hybrid is expected to load only
     its window tail (unknown layer spellings stay conservative and expect the
     larger set);
+  - the hybrid flag -- which selects the state-aware scenario branches (long
+    prompts, recurrent-state assertions, checkpoint-selected caps) -- is
+    derived from the same layer vocabulary: family architectures, the
+    Qwen3.5-style layer knobs, or a `layer_types` entry naming a state layer,
+    the config's own declaration of a recurrent-state group (without that
+    last signal a windowed config mixing state and bounded-attention layers
+    would be multigroup but not hybrid, and the no-state branches would
+    reject the state groups a correct connector registers). Once an engine
+    has started, the flag is cross-checked against the connector's
+    registration line: a state group the config-level markers missed (an
+    unknown spelling), or a hybrid marker with no registered state group, is
+    a disagreement that fails loudly instead of running the wrong branches --
+    the same contract the registered retention already enforces for windows;
   - every scenario that builds a window-scaled prompt gates it on the
     *effective* `--max-model-len` (the started server's args, so a
     `KVCM_E2E_VLLM_ARGS` override counts) and skips with the numbers when the

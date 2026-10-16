@@ -369,15 +369,24 @@ def is_hybrid_model(model_path: str) -> bool:
     # know (e.g. Qwen3NextForCausalLM), the layer knobs cover configs that
     # interleave linear/mamba layers with full attention without naming a
     # known family (e.g. Qwen3_5ForConditionalGeneration declares its own
-    # architecture). The signals are ORed -- a non-matching architecture
-    # string must never shadow the knobs.
+    # architecture), and a layer_types entry naming a state layer -- the same
+    # _STATE_LAYER_TYPES has_full_attention_group already reads -- is the
+    # config's own declaration of a recurrent-state group (vLLM builds a
+    # MambaSpec group from such a layer whatever the family). Without it a
+    # windowed config that mixes state and bounded-attention layers would be
+    # multigroup but not hybrid, and the no-state scenario branches (uniform
+    # spec coverage, no recurrent-checkpoint selection) would reject the
+    # state groups a correct connector registers. The signals are ORed -- a
+    # non-matching architecture string must never shadow the knobs.
     archs = ", ".join(cfg.get("architectures", []) or [])
     arch_markers = ("Qwen3Next", "Zamba", "FalconH1", "Samba", "Jamba")
+    layer_types = text_cfg.get("layer_types") or []
     return (
         any(m in archs for m in arch_markers)
         or "full_attention_interval" in text_cfg
         or "linear_conv_kernel_dim" in text_cfg
         or str(cfg.get("model_type", "")).startswith("qwen3_")
+        or any(t in _STATE_LAYER_TYPES for t in layer_types)
     )
 
 

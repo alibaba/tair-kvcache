@@ -538,7 +538,39 @@ class ScenarioEnv:
         )
         self.vllm.start(self.repo_root, log_suffix=log_suffix)
         self.vllm_starts += 1
+        self.assert_hybrid_registration()
         return self.vllm
+
+    def assert_hybrid_registration(self):
+        """The config-derived hybrid flag must match the registered groups.
+
+        ``self.hybrid`` chose the scenario branches from the config *before*
+        any engine started; the registration line is the connector's own
+        statement of the groups it registered, and the two must agree -- the
+        same cross-check ``retention_facts`` makes for the windowed groups,
+        and for the same reason. Both directions are disagreements, not
+        fallbacks: a state group the config-level markers missed (a
+        state-layer spelling outside ``_STATE_LAYER_TYPES``, say) leaves the
+        scenarios on their no-state branches -- uniform spec coverage in
+        test_cross_request_prefix, no recurrent-checkpoint selection in
+        test_full_hit -- which reject the very groups a correct connector
+        registered, and the reverse (a hybrid marker with no registered state
+        group) makes the state-aware branches assert against layers that do
+        not exist. Read from the group classes of the registration line, the
+        same line ``connector_block_tables`` already parses.
+        """
+        lines = self.scan_connector_logs(r"register_kv_caches done.*")
+        assert lines, (
+            f"no group registration found in the connector logs after "
+            f"{self.vllm_starts} engine start(s); the hybrid agreement "
+            f"cannot be evaluated")
+        registered = any("StateTransferGroup" in line for line in lines)
+        assert registered == self.hybrid, (
+            f"hybrid disagreement for {MODEL_PATH}: the config-derived flag "
+            f"says {'hybrid' if self.hybrid else 'not hybrid'} but the "
+            f"connector registered "
+            f"{'a recurrent-state group' if registered else 'no recurrent-state group'}; "
+            f"the scenario branches would verify the wrong path")
 
     def restart_vllm(self, log_suffix: str = "") -> VllmServer:
         """Restart vLLM to drop its local prefix cache (KVCM state persists)."""
