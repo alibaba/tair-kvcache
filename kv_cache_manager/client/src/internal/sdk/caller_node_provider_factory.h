@@ -12,17 +12,15 @@ namespace kv_cache_manager {
 // Builds a CallerNodeProvider for the meta client based on the storage
 // configs returned by RegisterInstance.
 //
-// Selection rule (v1):
+// Selection rule:
 //   - Walk the storage_configs in declared order.
 //   - For each entry, dispatch on `StorageConfig::type()`. If a concrete
-//     provider is compiled in for that type and successfully initialises
-//     (i.e. the local backend is actually reachable on this machine), use it.
+//     provider is compiled in for that type and accepts the configuration,
+//     use it. Initialization does not probe provider health or identity.
 //   - Otherwise fall back to NoopCallerNodeProvider.
 //
-// v1 only knows how to produce a real provider for TAIR_MEMPOOL — that is
-// the only backend whose SDK can introspect the local pace-server's node id.
-// All other types (HF3FS / Mooncake / NFS / Dummy / Vineyard) get the noop
-// provider, exactly matching the pre-affinity behaviour.
+// TAIR_MEMPOOL and TAIR_MEMPOOL_SSD share PACE's numeric node identity;
+// NFS uses the local IP. Other storage types have no concrete provider.
 class CallerNodeProviderFactory {
 public:
     // Returns a non-null CallerNodeProvider. Falls back to

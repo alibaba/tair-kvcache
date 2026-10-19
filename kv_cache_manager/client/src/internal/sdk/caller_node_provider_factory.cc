@@ -23,7 +23,8 @@ CallerNodeProviderFactory::Create(const std::vector<std::shared_ptr<StorageConfi
         const DataStorageType type = storage_config->type();
         switch (type) {
 #ifdef ENABLE_TAIR_MEMPOOL
-        case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL: {
+        case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
+        case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD: {
             auto provider = std::make_unique<TairMempoolCallerNodeProvider>(refresh_interval);
             if (provider->Init(storage_config) == ER_OK) {
                 KVCM_LOG_INFO("caller_node_provider: using TairMempoolCallerNodeProvider for storage [%s]",
