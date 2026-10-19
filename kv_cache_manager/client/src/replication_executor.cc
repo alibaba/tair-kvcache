@@ -164,12 +164,13 @@ bool ReplicationExecutor::SubmitWithData(ClientReplicationHint hint,
         Notify(hint, result_callback, ReplicationOutcome::REJECTED_STOPPED, ER_THREADPOOL_ERROR);
         return false;
     }
+    const bool has_data = data != nullptr && size > 0;
     std::string key = MakeKey(hint.block_key, hint.target_node_id);
     if (inflight_.count(key)) {
         auto queued = std::find_if(queue_.begin(), queue_.end(), [&](const auto &task) {
             return MakeKey(task.hint.block_key, task.hint.target_node_id) == key;
         });
-        if (queued != queue_.end() && queued->data == nullptr && queued->named_buffers.empty() &&
+        if (has_data && queued != queue_.end() && queued->data == nullptr && queued->named_buffers.empty() &&
             piggyback_queue_size_ < max_piggyback_queue_) {
             const size_t bytes = std::max(size, HintBytes(hint));
             const size_t without_old = pending_bytes_ - queued->pending_bytes;
@@ -204,7 +205,6 @@ bool ReplicationExecutor::SubmitWithData(ClientReplicationHint hint,
         Notify(hint, result_callback, ReplicationOutcome::REJECTED_QUEUE_FULL, ER_THREADPOOL_ERROR);
         return false;
     }
-    const bool has_data = data != nullptr && size > 0;
     if (has_data && piggyback_queue_size_ >= max_piggyback_queue_) {
         ++counters_.dropped_queue;
         KVCM_LOG_WARN("[replication] SubmitWithData: block_key [%ld] target [%s] dropped, "

@@ -759,6 +759,52 @@ TEST_F(ReplicationExecutorTest, EmptyBuffersDoNotConsumePiggybackQueueCapacity) 
     EXPECT_EQ(3, releases.load());
 }
 
+TEST_F(ReplicationExecutorTest, EmptyBuffersDoNotUpgradeQueuedCopiesOrConsumePiggybackCapacity) {
+    std::promise<void> entered, proceed;
+    auto entered_future = entered.get_future();
+    auto proceed_future = proceed.get_future().share();
+    std::vector<int64_t> executed;
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
+        .WillRepeatedly([&](auto, const auto &keys, auto, auto, auto) {
+            executed.push_back(keys[0]);
+            if (keys[0] == 1) {
+                entered.set_value();
+                proceed_future.wait();
+            }
+            return std::make_pair(ER_OK, MakeEmptyWriteLocation());
+        });
+    auto executor = MakeExecutor(1);
+    executor->Submit({MakeHint(1, "reader")});
+    const bool ready = entered_future.wait_for(5s) == std::future_status::ready;
+    char buffer[4]{};
+    std::atomic<int> empty_releases{0}, buffer_releases{0}, duplicates{0};
+    if (ready) {
+        executor->Submit({MakeHint(2, "reader"), MakeHint(3, "reader")});
+        for (int64_t key : {2, 3}) {
+            EXPECT_FALSE(executor->SubmitWithData(
+                MakeHint(key, "reader"), nullptr, 0, [&] { ++empty_releases; },
+                [&](const auto &result) {
+                    EXPECT_EQ(ReplicationOutcome::DUPLICATE, result.outcome);
+                    ++duplicates;
+                }));
+        }
+        EXPECT_EQ(2, empty_releases.load());
+        EXPECT_EQ(2, duplicates.load());
+        for (int64_t key : {4, 5}) {
+            EXPECT_TRUE(executor->SubmitWithData(
+                MakeHint(key, "reader"), buffer, sizeof(buffer), [&] { ++buffer_releases; }));
+        }
+        EXPECT_EQ(0, buffer_releases.load());
+    }
+    proceed.set_value();
+    executor->Shutdown();
+    ASSERT_TRUE(ready);
+    EXPECT_EQ((std::vector<int64_t>{1, 2, 3, 4, 5}), executed);
+    EXPECT_EQ(2, empty_releases.load());
+    EXPECT_EQ(2, buffer_releases.load());
+    EXPECT_EQ(2, duplicates.load());
+}
+
 TEST(ReplicationResourcesTest, EnforcesAggregateMemoryAndOversizeWithoutWaiting) {
     ReplicationResources resources;
     std::atomic<bool> stopped{false};
