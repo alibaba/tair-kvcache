@@ -138,6 +138,25 @@ TEST_F(InstanceInfoTest, TestDefaultQueryTypeSerializeAndMismatch) {
     EXPECT_EQ(kQueryType, parsed.default_query_type());
 }
 
+TEST_F(InstanceInfoTest, RepeatedRegistrationChecksExplicitAffinityStrategyOnly) {
+    InstanceInfo info("quota", "group", "instance", 64, {}, {}, {});
+    const auto mismatches = [&](const std::string &policy) { return info.MismatchFields(64, {}, {}, {}, 0, policy); };
+    const std::vector<std::string> different_policy{"affinity_strategy_json"};
+    EXPECT_EQ(different_policy, mismatches(R"({"type":"noop"})"));
+    const std::string original = R"({"type":"local_replica","replica_limits":{"max_replicas_per_key":2}})";
+    info.set_affinity_strategy_json(original);
+    EXPECT_TRUE(mismatches("").empty());
+    EXPECT_TRUE(mismatches(original).empty());
+    EXPECT_TRUE(
+        mismatches(R"( { "replica_limits": { "max_replicas_per_key": 2 }, "type": "local_replica" } )").empty());
+    EXPECT_EQ(different_policy, mismatches(R"({"type":"local_replica","replica_limits":{"max_replicas_per_key":3}})"));
+    EXPECT_EQ(different_policy, mismatches(R"({"type":"noop"})"));
+    EXPECT_EQ(different_policy, mismatches("{}"));
+    EXPECT_EQ(different_policy, mismatches("null"));
+    EXPECT_EQ(different_policy, mismatches("not-json"));
+    EXPECT_EQ(original, info.affinity_strategy_json());
+}
+
 TEST_F(InstanceInfoTest, TestToStringProducesJsonObject) {
     InstanceInfo instance_info("quota_group", "instance_group", "instance_id", 64, {}, {}, {}, 4);
 

@@ -317,8 +317,12 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
     auto it = instance_infos_.find(instance_id);
     if (it != instance_infos_.end()) {
         const auto &existing = it->second;
-        auto mismatched = existing->MismatchFields(
-            block_size, location_spec_infos, model_deployment, location_spec_groups, default_query_type);
+        auto mismatched = existing->MismatchFields(block_size,
+                                                   location_spec_infos,
+                                                   model_deployment,
+                                                   location_spec_groups,
+                                                   default_query_type,
+                                                   affinity_strategy_json);
         if (existing->instance_group_name() != instance_group) {
             mismatched.insert(mismatched.begin(), "instance_group_name");
         }

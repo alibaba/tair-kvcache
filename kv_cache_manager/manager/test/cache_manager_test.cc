@@ -953,6 +953,58 @@ TEST_F(CacheManagerTest, TestRegisterInstanceRejectsDifferentInstanceGroup) {
     EXPECT_NE(std::string::npos, request_context_->error_tracer()->ToJsonString().find("instance_group_name"));
 }
 
+TEST_F(CacheManagerTest, RegisterInstanceRejectsExplicitAffinityChangeOnExistingRpcPath) {
+    const auto register_policy = [&](const std::string &instance, const std::string &policy) {
+        return cache_manager_->RegisterInstance(request_context_.get(),
+                                                "default",
+                                                instance,
+                                                64,
+                                                createLocationSpecInfos(),
+                                                createModelDeployment(),
+                                                {},
+                                                CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                policy);
+    };
+    const std::string original = R"({"type":"local_replica","replica_limits":{"max_replicas_per_key":2}})";
+    ASSERT_EQ(EC_OK, register_policy("policy_instance", original).first);
+    // The existing-instance fast path must reject, rather than bypassing the
+    // registry check and returning a successful RegisterInstance RPC result.
+    const auto rejected = register_policy("policy_instance", R"({"type":"noop"})");
+    EXPECT_EQ(EC_DUPLICATE_ENTITY, rejected.first);
+    EXPECT_TRUE(rejected.second.empty());
+    EXPECT_NE(std::string::npos, request_context_->error_tracer()->ToJsonString().find("affinity_strategy_json"));
+    EXPECT_EQ(EC_OK, register_policy("policy_instance", "").first);
+    EXPECT_EQ(EC_OK, register_policy("policy_instance", original).first);
+    EXPECT_EQ(EC_OK,
+              register_policy("policy_instance",
+                              R"({ "replica_limits": {"max_replicas_per_key": 2}, "type": "local_replica" })")
+                  .first);
+    const auto stored = registry_manager_->GetInstanceInfo(request_context_.get(), "policy_instance");
+    ASSERT_NE(nullptr, stored);
+    EXPECT_EQ(original, stored->affinity_strategy_json());
+}
+
+TEST_F(CacheManagerTest, RegisterInstanceCannotAddAffinityOverrideToExistingInstance) {
+    const auto existing = registry_manager_->GetInstanceInfo(request_context_.get(), "test_instance");
+    ASSERT_NE(nullptr, existing);
+    ASSERT_TRUE(existing->affinity_strategy_json().empty());
+    const auto rejected =
+        cache_manager_->RegisterInstance(request_context_.get(),
+                                         "default",
+                                         "test_instance",
+                                         existing->block_size(),
+                                         existing->location_spec_infos(),
+                                         existing->model_deployment(),
+                                         existing->location_spec_groups(),
+                                         static_cast<CacheManager::QueryType>(existing->default_query_type()),
+                                         R"({"type":"noop"})");
+    EXPECT_EQ(EC_DUPLICATE_ENTITY, rejected.first);
+    EXPECT_TRUE(rejected.second.empty());
+    EXPECT_NE(std::string::npos, request_context_->error_tracer()->ToJsonString().find("affinity_strategy_json"));
+    EXPECT_TRUE(
+        registry_manager_->GetInstanceInfo(request_context_.get(), "test_instance")->affinity_strategy_json().empty());
+}
+
 TEST_F(CacheManagerTest, TestRegisterInstanceReturnsTieredMigrationStorageConfigs) {
     const std::string migration_source = "nfs_migration_source";
     const std::string migration_target = "nfs_migration_target";

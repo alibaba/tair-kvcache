@@ -313,6 +313,63 @@ TEST_F(RegistryManagerLocalBackendTest, DuplicateInstanceCannotMoveToAnotherGrou
     EXPECT_NE(std::string::npos, request_context_->error_tracer()->ToJsonString().find("instance_group_name"));
 }
 
+TEST_F(RegistryManagerLocalBackendTest, DuplicateRegistrationRejectsPolicyChangeAndPreservesPersistedPolicy) {
+    const std::string uri = "local://" + GetPrivateTestRuntimeDataPath() + "_affinity_registration?cluster_name=test";
+    ASSERT_TRUE(InitRegistryManager(uri));
+    CreateInstanceGroup("group1");
+    const std::string original = R"({"type":"local_replica","replica_limits":{"max_replicas_per_key":2}})";
+    const auto register_policy = [&](const std::string &policy) {
+        return registry_manager_->RegisterInstance(
+            request_context_.get(), "group1", "instance1", 1024, {}, {}, {}, 0, policy);
+    };
+    ASSERT_EQ(EC_OK, register_policy(original));
+    EXPECT_EQ(EC_OK, register_policy(original));
+    EXPECT_EQ(EC_OK, register_policy("")); // legacy client does not clear the override
+    EXPECT_EQ(EC_OK, register_policy(R"({ "replica_limits": {"max_replicas_per_key": 2}, "type": "local_replica" })"));
+    EXPECT_EQ(EC_DUPLICATE_ENTITY, register_policy(R"({"type":"noop"})"));
+    EXPECT_NE(std::string::npos, request_context_->error_tracer()->ToJsonString().find("affinity_strategy_json"));
+    const auto stored = registry_manager_->GetInstanceInfo(request_context_.get(), "instance1");
+    ASSERT_NE(nullptr, stored);
+    EXPECT_EQ(original, stored->affinity_strategy_json());
+
+    // Verify no attempted update was persisted, not only the in-memory value.
+    ASSERT_TRUE(InitRegistryManager(uri));
+    ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+    const auto recovered = registry_manager_->GetInstanceInfo(request_context_.get(), "instance1");
+    ASSERT_NE(nullptr, recovered);
+    EXPECT_EQ(original, recovered->affinity_strategy_json());
+    EXPECT_EQ(EC_DUPLICATE_ENTITY, register_policy(R"({"type":"noop"})"));
+}
+
+TEST_F(RegistryManagerLocalBackendTest, GroupPolicyUpdatesRemainAvailableWithoutChangingInstanceOverrides) {
+    ASSERT_TRUE(InitRegistryManager("local://?cluster_name=test"));
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "inherited");
+    const std::string override_policy = R"({"type":"noop"})";
+    ASSERT_EQ(EC_OK,
+              registry_manager_->RegisterInstance(
+                  request_context_.get(), "group1", "overridden", 1024, {}, {}, {}, 0, override_policy));
+    LocationSpecInfo info;
+    EXPECT_EQ(EC_DUPLICATE_ENTITY,
+              registry_manager_->RegisterInstance(
+                  request_context_.get(), "group1", "inherited", 1024, {info}, {}, {}, 0, override_policy));
+
+    auto [ec, group] = registry_manager_->GetInstanceGroup(request_context_.get(), "group1");
+    ASSERT_EQ(EC_OK, ec);
+    auto updated = *group;
+    const std::string group_policy = R"({"type":"local_replica"})";
+    updated.set_affinity_strategy_json(group_policy);
+    updated.set_version(1);
+    ASSERT_EQ(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), updated, 0));
+    EXPECT_EQ(group_policy, registry_manager_->GetGroupAffinityStrategyJson(request_context_.get(), "group1"));
+    EXPECT_TRUE(
+        registry_manager_->GetInstanceInfo(request_context_.get(), "inherited")->affinity_strategy_json().empty());
+    EXPECT_EQ(override_policy,
+              registry_manager_->GetInstanceInfo(request_context_.get(), "overridden")->affinity_strategy_json());
+    EXPECT_NE(EC_OK, registry_manager_->UpdateInstanceGroup(request_context_.get(), updated, 0));
+    RegisterInstance("group1", "inherited"); // omitted policy still succeeds after the group update
+}
+
 TEST_F(RegistryManagerLocalBackendTest, TestAccountManagement) {
     std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_account_test";
     std::string uri = "local://" + local_path + "?cluster_name=test";

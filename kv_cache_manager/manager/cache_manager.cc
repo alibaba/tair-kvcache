@@ -647,7 +647,8 @@ CacheManager::RegisterInstance(RequestContext *request_context,
                                                         location_spec_infos,
                                                         model_deployment,
                                                         location_spec_groups,
-                                                        static_cast<int32_t>(default_query_type));
+                                                        static_cast<int32_t>(default_query_type),
+                                                        affinity_strategy_json);
         if (instance_info->instance_group_name() != instance_group) {
             mismatched.insert(mismatched.begin(), "instance_group_name");
         }
