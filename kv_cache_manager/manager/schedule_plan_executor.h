@@ -12,6 +12,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -183,6 +184,9 @@ private:
     std::size_t migration_worker_budget_{0};
     std::size_t running_migration_tasks_{0};
     std::mutex queue_mutex_;
+    // Shared by ordinary deletion and GC recovery; protected by queue_mutex_.
+    using LocationDeleteKey = std::tuple<std::string, int64_t, std::string>;
+    std::set<LocationDeleteKey> active_location_deletes_;
     std::condition_variable condition_;
     std::atomic<uint64_t> sequence_counter_{0};
 

@@ -1216,6 +1216,71 @@ TEST_F(CacheGarbageCollectorTest, FixedPredicateIsFailClosedAndRequestIsBounded)
     EXPECT_TRUE(gc->BuildDeleteActions("", batch, now_us).executor_request.block_keys.empty());
 }
 
+TEST_F(CacheGarbageCollectorTest, DeletingTombstonesAreRetriedWithoutStorageProbeAndDeduplicateInflight) {
+    auto config = DefaultConfig();
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+    const auto location = MakeStoredLocation("failed_delete",
+                                             CLS_DELETING,
+                                             DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                             {"dummy://unavailable_backend/remaining?size=5"});
+    const auto batch = MakeBatch(SCAN_BASE_CURSOR, {19}, {{{"failed_delete", location}}});
+    const auto actions = gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs());
+    EXPECT_EQ((KeyVector{19}), actions.executor_request.block_keys);
+    EXPECT_EQ((std::vector<std::vector<std::string>>{{"failed_delete"}}), actions.executor_request.location_ids);
+    EXPECT_EQ((std::vector<std::vector<std::string>>{{location->ToJsonString()}}),
+              actions.executor_request.expected_location_values);
+    EXPECT_TRUE(actions.executor_request.authoritative_read);
+    EXPECT_EQ(1u, actions.executor_reason_counts.at("deleting_retry"));
+    EXPECT_TRUE(might_exist_calls.empty());
+
+    gc->pending_locations_.insert({"instance_a", 19, "failed_delete"});
+    EXPECT_TRUE(gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs())
+                    .executor_request.block_keys.empty());
+    gc->pending_locations_.clear();
+    EXPECT_FALSE(gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs())
+                     .executor_request.block_keys.empty());
+}
+
+TEST_F(CacheGarbageCollectorTest, DisabledGcPreservesTombstonesAndEnabledGcRescansAfterFailureAndRestart) {
+    auto config = DefaultConfig();
+    config.round_pause_ms = 0;
+    const auto location = MakeStoredLocation(
+        "retry", CLS_DELETING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://storage/retry?size=7"});
+    const auto batch = MakeBatch(SCAN_BASE_CURSOR, {20}, {{{"retry", location}}});
+    scan_responses["instance_a"] = {{EC_OK, batch}, {EC_OK, batch}, {EC_OK, batch}};
+
+    auto disabled_config = config;
+    disabled_config.enabled = false;
+    auto disabled = MakeGc(disabled_config);
+    ASSERT_EQ(EC_OK, disabled->Start());
+    disabled->Stop();
+    EXPECT_TRUE(scan_calls.empty());
+    EXPECT_TRUE(submitted_requests.empty());
+    EXPECT_EQ(CLS_DELETING, location->status());
+
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+    submit_mode = SubmitMode::kReadyPartial;
+    gc->RunOneTick();
+    ASSERT_EQ(1u, submitted_requests.size());
+    gc->PollInflightDeletes();
+    EXPECT_TRUE(gc->pending_locations_.empty());
+    gc->RunOneTick();
+    EXPECT_EQ(2u, submitted_requests.size());
+    gc->PollInflightDeletes();
+    gc.reset();
+
+    auto restarted = MakeGc(config);
+    PrepareForSingleStep(*restarted);
+    submit_mode = SubmitMode::kReadyOk;
+    restarted->RunOneTick();
+    ASSERT_EQ(3u, submitted_requests.size());
+    EXPECT_EQ((std::vector<std::vector<std::string>>{{location->ToJsonString()}}),
+              submitted_requests.back().expected_location_values);
+    EXPECT_EQ(SCAN_BASE_CURSOR, scan_calls.back().second);
+}
+
 TEST_F(CacheGarbageCollectorTest, ServingMissingSpecIsBatchedAndSubmittedWithExactSnapshot) {
     auto config = DefaultConfig();
     config.scan_batch_size = 10;
