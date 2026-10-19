@@ -46,6 +46,11 @@ class FakeRequest:
     request_id: str
     prompt_token_ids: list
     output_token_ids: list = field(default_factory=list)
+    # vLLM advances this with each step's scheduled tokens right after the
+    # connector metadata is built (_update_after_schedule); the save watermark
+    # reads it as the pre-step computed count. Tests that simulate a step
+    # advance it themselves.
+    num_computed_tokens: int = 0
 
     @property
     def num_tokens(self):
@@ -1023,9 +1028,13 @@ class TestBuildConnectorMeta(unittest.TestCase):
             req, SimpleNamespace(get_block_ids=lambda: block_ids), matched
         )
         out = fake_scheduler_output(
-            new_reqs=[SimpleNamespace(req_id=req_id, block_ids=block_ids)]
+            new_reqs=[SimpleNamespace(req_id=req_id, block_ids=block_ids)],
+            # A fresh prefill schedules exactly the tokens it holds.
+            num_scheduled={req_id: num_tokens},
         )
-        return req, conn.build_connector_meta(out)
+        meta = conn.build_connector_meta(out)
+        req.num_computed_tokens += num_tokens
+        return req, meta
 
     def test_new_request_full_state(self):
         conn = make_scheduler_connector(mbs=self.MBS)
@@ -1035,10 +1044,14 @@ class TestBuildConnectorMeta(unittest.TestCase):
         # 40 tokens / 3 blocks -> min(40, 48)//16 = 2 blocks to save.
         conn._http_executor.submit.assert_called_once()
         args = conn._http_executor.submit.call_args[0]
-        # The per-block state-completeness mask is computed here, in the
-        # scheduler loop, and handed to the http thread: it is read off vLLM's
-        # block table, which later steps mutate.
-        self.assertEqual(args[1:], ("r0", list(range(32)), 2, [True, True]))
+        # The per-block state-completeness and window-coverage masks are
+        # computed here, in the scheduler loop, and handed to the http thread:
+        # they are read off vLLM's block table, which later steps mutate.
+        self.assertEqual(
+            args[1:-1], ("r0", list(range(32)), 2, [True, True], [True, True])
+        )
+        # ... plus the session id the release guard keys this announcement by.
+        self.assertIsInstance(args[-1], int)
         self.assertEqual(conn._tracked["r0"].has_saved_block_num, 2)
 
     def test_load_request_emitted_after_alloc(self):
@@ -1060,12 +1073,14 @@ class TestBuildConnectorMeta(unittest.TestCase):
             cached_req_ids=["r0"], num_scheduled={"r0": 8}, new_block_ids=[None]
         )
         conn.build_connector_meta(out)
+        req.num_computed_tokens += 8
         # Step 3: 2 more tokens with a new block -> table grows.
         req.output_token_ids = list(range(1000, 1010))
         out = fake_scheduler_output(
             cached_req_ids=["r0"], num_scheduled={"r0": 2}, new_block_ids=[[[103]]]
         )
         conn.build_connector_meta(out)
+        req.num_computed_tokens += 2
         self.assertEqual(
             conn._tracked["r0"].block_ids_per_group, [[100, 101, 102, 103]]
         )
@@ -1119,6 +1134,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
             cached_req_ids=["r0"], num_scheduled={"r0": 8}, new_block_ids=[[[103]]]
         )
         conn.build_connector_meta(out)
+        req.num_computed_tokens += 8
         args = conn._http_executor.submit.call_args[0]
         self.assertEqual(args[3], 3)  # target_save_num
         self.assertEqual(conn._tracked["r0"].has_saved_block_num, 3)
@@ -1141,6 +1157,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
             cached_req_ids=["r0"], num_scheduled={"r0": 8}, new_block_ids=[[[103]]]
         )
         conn.build_connector_meta(out)
+        req.num_computed_tokens += 8
         conn._http_executor.submit.assert_not_called()
         self.assertEqual(conn._tracked["r0"].has_saved_block_num, 2)
 
@@ -1151,6 +1168,7 @@ class TestBuildConnectorMeta(unittest.TestCase):
             cached_req_ids=["r0"], num_scheduled={"r0": 1}, new_block_ids=[[[]]]
         )
         conn.build_connector_meta(out)
+        req.num_computed_tokens += 1
         args = conn._http_executor.submit.call_args[0]
         self.assertEqual(args[3], 3)  # target_save_num
         self.assertEqual(len(args[2]), 3 * self.MBS)  # token_ids sent

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
@@ -18,6 +18,11 @@ class SaveRequest:
     # manager blocks into physical slots, and the scheduler's ledger is the
     # only place it exists. The worker keeps no request mirror.
     all_block_ids: List[List[int]] = field(default_factory=list)
+    # The scheduler's id of the write session this request belongs to. The
+    # worker does not read it (its own bookkeeping is per block); the scheduler
+    # uses it to retire the session's capture protection when the request is
+    # handed over (see _collect_save_instructions).
+    session_id: int = 0
 
 
 @dataclass
@@ -37,22 +42,52 @@ class FinishRequest:
 
 
 @dataclass
+class CaptureRequest:
+    """Copy one request's newly completed manager blocks out of HBM *now*.
+
+    Windowed groups (see vllm_common.WindowRetention) lose their blocks to
+    vLLM's window sliding in the *next* schedule step, so the scheduler asks
+    the worker to copy the bytes in the step whose forward produced them --
+    before the write session (and with it the remote addresses) exists. The
+    worker keeps the captured bytes in its pinned staging arena and the save
+    task writes them once the session lands, so the announce -> session lag
+    never touches HBM again.
+
+    ``all_block_ids`` is the scheduler's block-table snapshot, taken in the
+    same scheduler loop iteration: the physical ids are still valid at capture
+    time (the free happens in the next schedule), which is what makes this
+    snapshot -- not a later ledger read -- the trustworthy null/data source.
+    """
+
+    req_id: str
+    # Manager blocks to capture, in ascending order.
+    manager_block_idxes: List[int]
+    all_block_ids: List[List[int]] = field(default_factory=list)
+
+
+@dataclass
 class TairKvCacheConnectorMetadata(KVConnectorMetadata):
     """Scheduler -> worker metadata for one engine step.
 
-    Three instruction kinds, each consumed by its own worker hook:
-    to_load_requests (start_load_kv), to_save_requests (wait_for_save) and
-    to_finish_requests (get_finished). Every instruction is self-contained
-    -- the worker keeps no per-request mirror of scheduler state."""
+    Five instruction kinds, each consumed by its own worker hook:
+    to_load_requests (start_load_kv), to_capture_requests + to_save_requests +
+    to_release_captures (wait_for_save) and to_finish_requests (get_finished).
+    Every instruction is self-contained -- the worker keeps no per-request
+    mirror of scheduler state."""
 
     def __init__(self, epoch: int) -> None:
         self.epoch = epoch
         self.to_load_requests: List[LoadRequest] = []
+        self.to_capture_requests: List[CaptureRequest] = []
         self.to_save_requests: List[SaveRequest] = []
         self.to_finish_requests: List[FinishRequest] = []
+        self._release_captures: List[Tuple[str, List[int]]] = []
 
     def add_load_request(self, request: LoadRequest) -> None:
         self.to_load_requests.append(request)
+
+    def add_capture_request(self, request: CaptureRequest) -> None:
+        self.to_capture_requests.append(request)
 
     def add_save_request(self, save_request: SaveRequest) -> None:
         self.to_save_requests.append(save_request)
@@ -60,10 +95,25 @@ class TairKvCacheConnectorMetadata(KVConnectorMetadata):
     def add_finish_request(self, finish_request: FinishRequest) -> None:
         self.to_finish_requests.append(finish_request)
 
+    @property
+    def to_release_captures(self) -> List[Tuple[str, List[int]]]:
+        """(req_id, block indices) whose eager captures no session will write.
+
+        Filled by the scheduler when a write session reports that the manager
+        already holds those blocks: those captured bytes are not going to be
+        published, so the worker gives their arena slots back now instead of
+        holding them until the request retires."""
+        return self._release_captures
+
+    def release_captures(self, req_id: str, block_idxes: List[int]) -> None:
+        self._release_captures.append((req_id, list(block_idxes)))
+
     def __repr__(self) -> str:
         return (
             f"TairKvCacheConnectorMetadata(epoch={self.epoch}, "
             f"load={len(self.to_load_requests)}, "
+            f"capture={len(self.to_capture_requests)}, "
             f"save={len(self.to_save_requests)}, "
-            f"finish={len(self.to_finish_requests)})"
+            f"finish={len(self.to_finish_requests)}, "
+            f"release={len(self._release_captures)})"
         )

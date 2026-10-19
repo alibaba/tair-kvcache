@@ -32,10 +32,15 @@ from kv_cache_manager.py_connector.vllm.data_transfer import (
     DataTransferManager,
     _get_device_module,
 )
-from kv_cache_manager.py_connector.vllm.metadata import TairKvCacheConnectorMetadata
+from kv_cache_manager.py_connector.vllm.metadata import (
+    CaptureRequest,
+    SaveRequest,
+    TairKvCacheConnectorMetadata,
+)
 from kv_cache_manager.py_connector.vllm.transfer_types import (
     AttentionTransferGroup,
     KVCacheInfo,
+    NullBlockRow,
     StateTransferGroup,
     TransferGroup,
     TransferPlan,
@@ -47,7 +52,16 @@ from kv_cache_manager.py_connector.vllm.vllm_common import (
     attn_kv_views,
     spec_name,
     state_kv_view,
+    windowed_block_has_data,
 )
+
+#: How long the eager capture waits for arena slots before withholding the
+#: blocks of this request-step. Unlike a transfer task, a capture holds its
+#: slots until the write session lands -- i.e. until the engine makes another
+#: step -- so waiting without a deadline could deadlock the engine against its
+#: own sessions. Timing out costs the blocks' hit rate (they are failed, never
+#: published with a hole); the deadline itself is not a correctness parameter.
+CAPTURE_POOL_WAIT_SECONDS = 0.05
 
 if typing.TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -84,6 +98,31 @@ class ConnectorWorker:
         # no mirrored request table (every instruction is self-contained).
         self._pending_saves: dict = {}
         self._finish_pending: set = set()
+
+        # Eagerly captured windowed blocks, per request: (spec name, manager
+        # block) -> (staging pool, slot) holding that block's bytes, until a
+        # write session takes them. The key is the *bucket's* spec name, not
+        # the vLLM group index: one group may be split into several transfer
+        # buckets (``_uniform_group_metas`` / ``_BucketKey``: a packed group can
+        # mix two R-SWA windows), the spec name is unique by construction
+        # (``_check_unique_names``) and is what the save plan looks its
+        # locations up by -- keying on the group index would let two buckets of
+        # one group overwrite each other's slots and hand each other's bytes to
+        # the wrong location.
+        #
+        # Handing a block over *moves* its entry to ``_in_flight``, where the
+        # task owns the release: it returns the slot when its transfer lands,
+        # success or failure. ``_staged`` is therefore exactly "captured but
+        # not yet given to a session", which is what a later capture (or the
+        # retirement path) may release.
+        #
+        # The save verdict itself needs no side state: a block is written when
+        # its location claimed the spec and the capture holds its bytes, fails
+        # when the location claimed it and no bytes were captured (a withheld
+        # or lost capture), and abstains when nothing claimed it
+        # (``_staged_dispositions``).
+        self._staged: Dict[str, Dict[Tuple[str, int], Tuple[Any, int]]] = {}
+        self._in_flight: Dict[str, Dict[Tuple[str, int], Tuple[Any, int]]] = {}
 
         self._tp_rank = get_tensor_model_parallel_rank()
         # torch device module (torch.cuda / torch.musa / ...), set in
@@ -244,7 +283,9 @@ class ConnectorWorker:
         for v in ref_views:
             assert v.stride()[1:] == (per_token_dim, v.shape[3], 1), (
                 f"kv cache page not token-major: shape={tuple(v.shape)} "
-                f"stride={v.stride()}; set VLLM_KV_CACHE_LAYOUT=NHD"
+                f"stride={v.stride()}; the gather/scatter needs a token-major "
+                f"page (vLLM's NHD order, spelled BLNHC/LBNHC among its "
+                f"VLLM_KV_CACHE_LAYOUT candidates; this tensor is head-major)"
             )
         # Cross-check the spec against the tensor per *token*: the spec page
         # covers meta.block_size tokens while the tensor page covers
@@ -291,11 +332,31 @@ class ConnectorWorker:
             kernel_block_size=kernel_block_size,
             block_stride=block_stride,
             dtype=ref.dtype,
+            retention=meta.retention,
         )
 
     def _build_state_group(
         self, meta: StateGroupMeta, kv_caches: Dict[str, Any]
     ) -> StateTransferGroup:
+        # A state exists once per state block and covers the prefix ending at
+        # that block's last token, so _state_block_ids' "last token selects the
+        # block" needs the manager block to be a whole number of state blocks:
+        # with --mamba-block-size <= --block-size an mbs-token manager block
+        # ends inside (or exactly on) a state block, and a 48-token manager
+        # block over 16-token states selects states 2, 5, 8, ... -- one state
+        # each, ending where the manager block ends (writes publish the state
+        # that really covers the block's prefix).
+        #
+        # The other direction is the misplacement: a *larger* state block
+        # (--mamba-block-size above --block-size) covers several manager blocks,
+        # so one state would be published under several prefix keys.
+        assert self._manager_block_size % meta.block_size == 0, (
+            f"state group {meta.group_idx}: manager block size "
+            f"{self._manager_block_size} is not a multiple of the state block "
+            f"size {meta.block_size}; a state covers the prefix ending at its "
+            f"block, so a larger state block would be published under several "
+            f"manager block keys (a silently misplaced state)"
+        )
         spec = spec_name(self._tp_rank, meta)
         block_views = []
         for name in meta.layer_names:
@@ -330,13 +391,33 @@ class ConnectorWorker:
           -> group block (block_table unit, group.block_size tokens)
           -> kernel physical block (tensor unit; ratio physical per group block).
         """
+        slots, _ = self._attn_slots(group, manager_block_idxes, block_table)
+        return slots
+
+    def _attn_slots(
+        self,
+        group: AttentionTransferGroup,
+        manager_block_idxes: Sequence[int],
+        block_table: List[int],
+    ) -> Tuple[List[List[int]], List[List[bool]]]:
+        """``_attn_token_indices`` plus, per token, "is this a null slot?".
+
+        A windowed group's block table carries vLLM's null block (id 0) for the
+        positions outside the window: those slots alias page 0, which is the
+        engine's shared zero page. Both callers have to know (the loader must
+        not write them, the capture must not publish their bytes), and the
+        block table entry is the only trustworthy source -- a group block is
+        null exactly when its table entry is 0.
+        """
         mbs = self._manager_block_size
         gbs = group.block_size
         kbs = group.kernel_block_size
         ratio = gbs // kbs
-        out = []
+        out: List[List[int]] = []
+        null: List[List[bool]] = []
         for mb in manager_block_idxes:
             idxs = []
+            nulls = []
             base = mb * mbs
             for i in range(mbs):
                 tok = base + i
@@ -347,8 +428,10 @@ class ConnectorWorker:
                 off = tok % gbs
                 phys = block_table[logical] * ratio + off // kbs
                 idxs.append(phys * kbs + off % kbs)
+                nulls.append(block_table[logical] == 0)
             out.append(idxs)
-        return out
+            null.append(nulls)
+        return out, null
 
     def _state_block_ids(
         self,
@@ -390,6 +473,8 @@ class ConnectorWorker:
             List[Optional[str]],
             Optional[List[List[int]]],
             Optional[List[int]],
+            Optional[List[Optional[int]]],
+            Optional[List[Optional[NullBlockRow]]],
         ]
     ]:
         """Slice each plan's blocks into per-task chunks.
@@ -398,6 +483,11 @@ class ConnectorWorker:
         manager shrinks it to fit the group's staging pool (a task stages its
         whole batch as one contiguous run), so the configured
         ``block_per_save_task``/``block_per_load_task`` is an upper bound.
+
+        The chunk is ``(group, uris, token_indices, block_ids, staged_slots,
+        null_rows)`` -- the two trailing fields are the windowed-group extras
+        (see TransferPlan); a group that has none yields None for both, which
+        is what makes the save and load tasks one signature.
 
         Pure generator: the task index is the consumer's concern (enumerate
         there); this only reads the plans."""
@@ -413,13 +503,165 @@ class ConnectorWorker:
                     if plan.token_indices is not None
                     else None,
                     plan.block_ids[i:end] if plan.block_ids is not None else None,
+                    plan.staged_slots[i:end]
+                    if plan.staged_slots is not None
+                    else None,
+                    plan.null_rows[i:end] if plan.null_rows is not None else None,
                 )
+
+    def _retain_failed_windowed(
+        self,
+        save_req: SaveRequest,
+        plans: List[TransferPlan],
+        done_cb: Callable[[List[Any]], None],
+    ) -> Callable[[List[Any]], None]:
+        """Give a failed windowed block its captured bytes back.
+
+        A staged (windowed) save reads the arena; when its write fails, the
+        bytes are the only copy the connector will ever hold (the HBM window
+        that produced them has moved on, so a later capture abstains), and
+        later incremental sessions still announce that block -- the manager
+        asks for it again and the block must be publishable. ``save_task``
+        keeps such a task's slots (see _save_staged_blocks) and this wrapper
+        moves the entries back into the staged map as soon as the session
+        reports, so the next announcement finds them. The slot stays owned by
+        exactly one of the two maps throughout, and a request that never
+        retries releases it at retirement.
+
+        Only a *failed* windowed group restores: when it wrote successfully
+        its slots were returned to the arena and the entries must not come
+        back. The verdict list is flat, group-major, ``num_blocks`` per group
+        (the same layout create_save_done_callback reads).
+        """
+        windowed = [
+            (group_idx, plan)
+            for group_idx, plan in enumerate(plans)
+            if getattr(plan.group, "retention", None) is not None
+            and plan.staged_slots
+        ]
+        if not windowed:
+            return done_cb
+        num_blocks = len(save_req.manager_block_idxes)
+
+        def wrapper(flat: List[Any]) -> None:
+            done_cb(flat)
+            if len(flat) < len(plans) * num_blocks:
+                return
+            staged = self._staged.setdefault(save_req.req_id, {})
+            in_flight = self._in_flight.get(save_req.req_id)
+            if not in_flight:
+                return
+            for group_idx, plan in windowed:
+                for pos, slot in enumerate(plan.staged_slots):
+                    if slot is None:
+                        continue
+                    block = save_req.manager_block_idxes[pos]
+                    key = (plan.group.spec_name, block)
+                    entry = in_flight.get(key)
+                    if entry is not None and flat[group_idx * num_blocks + pos] is False:
+                        staged[key] = in_flight.pop(key)
+                        logger.warning(
+                            "save group %s: block %d failed to write; its "
+                            "captured bytes stay staged for a retry (slot %d)",
+                            plan.group.spec_name,
+                            block,
+                            slot,
+                        )
+
+        return wrapper
+
+    def _windowed_save_annotations(
+        self,
+        req_id: str,
+        group: AttentionTransferGroup,
+        manager_block_idxes: Sequence[int],
+        uris: List[Optional[str]],
+    ) -> Dict[str, Any]:
+        """Staging slots for a windowed group's save, block by block.
+
+        The slot the capture holds, or None where it holds nothing; what None
+        *means* is the task's business, and the location tells it which case
+        this is: an announced location with no bytes must not be published (the
+        block fails, withdrawing the claim), while a block the announcement
+        already described as window-less wrote nothing by design and abstains.
+
+        Handing a block over *moves* its entry from ``_staged`` to
+        ``_in_flight``: the task owns the slot from here on and returns it when
+        its transfer lands. A block is announced once, so a second plan for the
+        same block means the announcement was repeated -- it gets no slot (and
+        no location to write to), rather than a slot two tasks would both
+        release.
+        """
+        staged = self._staged.get(req_id, {})
+        in_flight = self._in_flight.setdefault(req_id, {})
+        slots: List[Optional[int]] = []
+        for block in manager_block_idxes:
+            key = (group.spec_name, block)
+            entry = staged.pop(key, None)
+            if entry is None:
+                if key in in_flight:
+                    logger.warning(
+                        "req:%s windowed block %d (group %s) is planned twice; "
+                        "its bytes stay with the first session and this block is "
+                        "failed instead of handing the same slot out twice",
+                        req_id,
+                        block,
+                        group.spec_name,
+                    )
+                slots.append(None)
+                continue
+            in_flight[key] = entry
+            slots.append(entry[1])
+        missing = [
+            i for i, slot in enumerate(slots) if slot is None and uris[i] is not None
+        ]
+        if missing:
+            logger.warning(
+                "save group %s: %d/%d announced blocks have no captured bytes "
+                "(withheld capture?); failing them instead of publishing a hole",
+                group.spec_name,
+                len(missing),
+                len(manager_block_idxes),
+            )
+        return {"staged_slots": slots}
+
+    def _windowed_load_annotations(
+        self,
+        group: AttentionTransferGroup,
+        manager_block_idxes: Sequence[int],
+        token_indices: List[List[int]],
+        null_masks: List[List[bool]],
+    ) -> Dict[str, Any]:
+        """Null-slot disposition of a windowed group's load, block by block.
+
+        Rows pointing at vLLM's null block are invisible to attention, but
+        writing them would scribble on the shared zero page: they are aliased
+        onto the block's first real row instead (and the kernel's token slots
+        are rewritten to match, so the real bytes land on the real slots). A
+        block whose every row is null has nothing to load at all.
+        """
+        annotations: List[Optional[NullBlockRow]] = []
+        for i, _block in enumerate(manager_block_idxes):
+            nulls = null_masks[i]
+            if not any(nulls):
+                annotations.append(None)
+                continue
+            rows = [r for r, is_null in enumerate(nulls) if is_null]
+            source = next((r for r, is_null in enumerate(nulls) if not is_null), None)
+            if source is not None:
+                for row in rows:
+                    token_indices[i][row] = token_indices[i][source]
+            annotations.append(NullBlockRow(rows=rows, source_row=source))
+        return {"null_rows": annotations}
 
     def _plan_group_transfers(
         self,
         locations: List[Dict[str, Any]],
         manager_block_idxes: Sequence[int],
         block_ids_per_group: List[List[int]],
+        req_id: str,
+        *,
+        for_save: bool = False,
     ) -> Optional[List[TransferPlan]]:
         """Build the per-group TransferPlans for a set of manager blocks.
 
@@ -430,6 +672,15 @@ class ConnectorWorker:
         hole is a failure, for state groups it must agree with the block
         table (a null state block). Returns None only if the manager returned
         the wrong number of locations altogether.
+
+        Windowed groups get their own annotations in the same pass, and which
+        ones depends on the direction: a *save* plan points each block at the
+        staging slot the eager capture filled (``staged_slots``, with a
+        withdrawn location for the blocks whose capture was withheld), a *load*
+        plan carries the rows whose target slot is vLLM's null block
+        (``null_rows``). Both are read off the block table snapshot the
+        instructions carry; the late-gather path of full-attention groups is
+        untouched.
         """
         num_blocks = len(manager_block_idxes)
         if len(locations) != num_blocks:
@@ -451,13 +702,42 @@ class ConnectorWorker:
             # block_ids_per_group is indexed by the vLLM group index.
             block_table = block_ids_per_group[group.group_idx]
             if isinstance(group, AttentionTransferGroup):
+                if for_save and group.retention is not None:
+                    # A staged (windowed) save reads its bytes out of the
+                    # staging arena, not out of vLLM's slots, so it does not
+                    # translate manager blocks through the block table at all:
+                    # after a preemption the resume's table can be shorter than
+                    # the prefix whose bytes the capture still holds, and the
+                    # translation's range check would abort a save that needs
+                    # nothing from the table (the captured block keys are the
+                    # old prefix's, and so are its bytes).
+                    plans.append(
+                        TransferPlan(
+                            group=group,
+                            uris=uris,
+                            token_indices=[],
+                            **self._windowed_save_annotations(
+                                req_id, group, manager_block_idxes, uris
+                            ),
+                        )
+                    )
+                    continue
+                token_indices, null_masks = self._attn_slots(
+                    group, manager_block_idxes, block_table
+                )
+                extra: Dict[str, Any] = {}
+                if group.retention is not None:
+                    # The save side of a windowed group returned above; what is
+                    # left here is the load, whose rows come from the table.
+                    extra = self._windowed_load_annotations(
+                        group, manager_block_idxes, token_indices, null_masks
+                    )
                 plans.append(
                     TransferPlan(
                         group=group,
                         uris=uris,
-                        token_indices=self._attn_token_indices(
-                            group, manager_block_idxes, block_table
-                        ),
+                        token_indices=token_indices,
+                        **extra,
                     )
                 )
             else:
@@ -506,6 +786,7 @@ class ConnectorWorker:
                 load_req.need_load_locations,
                 load_req.manager_block_idxes,
                 load_req.all_block_ids,
+                load_req.req_id,
             )
 
             # Report failures against the block table vLLM can act on: map each
@@ -592,6 +873,20 @@ class ConnectorWorker:
         pass
 
     def wait_for_save(self, meta: TairKvCacheConnectorMetadata) -> None:
+        """Capture the windowed groups' new blocks, then write the sessions.
+
+        Capture first and unconditionally: those blocks are freed by vLLM's
+        next schedule step, so this hook -- the tail of the step whose forward
+        produced them -- is the only moment their bytes are still in HBM. The
+        writes that follow are the sessions an earlier step's HTTP call
+        produced; a windowed group's task takes its bytes from the capture
+        (``staged_slots``) instead of gathering, so the announce -> session lag
+        never touches HBM, while full-attention groups keep the late gather.
+        """
+        if meta.to_capture_requests:
+            self._capture_blocks(meta)
+        for req_id, blocks in meta.to_release_captures:
+            self._release_captures_for(req_id, blocks)
         if not meta.to_save_requests:
             return
         ready_event = self._device_mod.Event()
@@ -603,11 +898,15 @@ class ConnectorWorker:
                 save_req.target_locations,
                 save_req.manager_block_idxes,
                 save_req.all_block_ids,
+                save_req.req_id,
+                for_save=True,
             )
 
             done_cb = self._data_transfer.create_save_done_callback(
                 save_req.req_id, self._tp_rank, save_req.write_session_id, num_blocks
             )
+            if plans is not None:
+                done_cb = self._retain_failed_windowed(save_req, plans, done_cb)
 
             if plans is None:
                 mr = MultiResult(1, done_cb)
@@ -632,6 +931,224 @@ class ConnectorWorker:
                 self._pending_saves[save_req.req_id] = (
                     self._pending_saves.get(save_req.req_id, 0) + 1
                 )
+
+    # ------------------------------------------------------------------ #
+    # Eager capture (windowed groups)
+    # ------------------------------------------------------------------ #
+    def _windowed_metas(self) -> List[AttentionGroupMeta]:
+        return [
+            meta
+            for meta in self._group_metas
+            if isinstance(meta, AttentionGroupMeta) and meta.retention is not None
+        ]
+
+    def _windowed_groups(self) -> List[AttentionTransferGroup]:
+        return [
+            g
+            for g in self._kvcache_info.groups
+            if isinstance(g, AttentionTransferGroup) and g.retention is not None
+        ]
+
+    def _capture_blocks(self, meta: TairKvCacheConnectorMetadata) -> None:
+        """Copy every request-step of this step, on one step-level budget.
+
+        The capture waits a bounded time for arena room (see
+        ``CAPTURE_POOL_WAIT_SECONDS``); when the arena is held by in-flight
+        writes, *every* request of the step would pay that wait and the engine
+        thread pays the sum of them. One timeout is therefore the whole step's
+        budget: the remaining captures are skipped (they would only time out
+        too) and their blocks fail closed like a withheld capture -- announced
+        location, no bytes, so the block is not published.
+        """
+        captures = meta.to_capture_requests
+        for index, capture in enumerate(captures):
+            try:
+                if not self._capture_request(capture):
+                    skipped = len(captures) - index - 1
+                    if skipped:
+                        logger.warning(
+                            "windowed capture budget for this step is spent "
+                            "(%.0f ms); skipping %d further capture(s), whose "
+                            "blocks are not published",
+                            CAPTURE_POOL_WAIT_SECONDS * 1000,
+                            skipped,
+                        )
+                    break
+            except Exception:
+                # Degrade, never crash the engine mid-step: the block's save
+                # verdict becomes a failure (its location claimed the spec and
+                # no bytes were captured), so nothing is published for it.
+                logger.exception(
+                    "req:%s windowed capture failed, failing %d blocks",
+                    capture.req_id,
+                    len(capture.manager_block_idxes),
+                )
+
+    def _capture_request(self, capture: CaptureRequest) -> bool:
+        """Copy this request-step's windowed blocks into the staging arena.
+
+        Returns False when the request-step was withheld for lack of arena room
+        within the capture deadline (the caller then stops capturing for this
+        step), True otherwise.
+
+        All-or-nothing per request-step: a block's publish verdict is the AND
+        over its groups, so a partially captured step would fail the blocks
+        anyway -- releasing the runs again keeps the arena free for the steps
+        that can be captured whole. Blocks whose windowed slots are already
+        null are left out of the runs (abstain: their bytes do not exist).
+        """
+        groups = self._windowed_groups()
+        if not groups:
+            return True
+        blocks = capture.manager_block_idxes
+        if not blocks:
+            return True
+        metas = self._windowed_metas()
+        per_group: List[Tuple[AttentionTransferGroup, List[List[int]], List[int]]] = []
+        for group in groups:
+            table = capture.all_block_ids[group.group_idx]
+            slots, _null_masks = self._attn_slots(group, blocks, table)
+            # The *shared* predicate, on the announced snapshot: what the
+            # scheduler announced as "has window data" is exactly what this
+            # capture copies -- the two must never disagree, since the
+            # announcement is what a later hit trusts.
+            captureable = [
+                i
+                for i in range(len(blocks))
+                if windowed_block_has_data(
+                    metas, capture.all_block_ids, blocks[i], self._manager_block_size
+                )
+            ]
+            if captureable:
+                per_group.append((group, slots, captureable))
+        if not per_group:
+            return True
+        # Take every run before writing anything down: a failure must leave no
+        # half-held slot behind, so the runs of the groups that did fit are
+        # released again when a later group does not fit (or raises).
+        taken: List[Tuple[AttentionTransferGroup, List[int], Any, int]] = []
+        withheld: Optional[AttentionTransferGroup] = None
+        try:
+            for group, slots, captureable in per_group:
+                start = self._data_transfer.capture_blocks(
+                    group,
+                    [slots[i] for i in captureable],
+                    timeout=CAPTURE_POOL_WAIT_SECONDS,
+                )
+                if start is None:
+                    withheld = group
+                    break
+                taken.append(
+                    (group, captureable, self._data_transfer.pool_of(group), start)
+                )
+        except BaseException:
+            self._release_runs(taken)
+            raise
+        if withheld is not None:
+            self._release_runs(taken)
+            logger.warning(
+                "req:%s windowed capture of %d blocks withheld: the staging "
+                "arena of %s has no free run within %.0f ms (held by in-flight "
+                "writes); those blocks are failed, not published",
+                capture.req_id,
+                len(blocks),
+                withheld.spec_name,
+                CAPTURE_POOL_WAIT_SECONDS * 1000,
+            )
+            return False
+        staged = self._staged.setdefault(capture.req_id, {})
+        for group, captureable, pool, start in taken:
+            for offset, i in enumerate(captureable):
+                key = (group.spec_name, blocks[i])
+                previous = staged.get(key)
+                if previous is not None:
+                    # A repeat capture for a block already staged: the
+                    # announcement was repeated (the scheduler's save watermark
+                    # can move backwards when preemption shrinks the allocation,
+                    # see _dispatch_incremental_saves). The old slot holds no
+                    # session reference -- a session *moves* the entry out of
+                    # _staged when it takes it -- so returning it here is safe;
+                    # overwriting it would drop the arena space for the rest of
+                    # the process's life.
+                    previous_pool, previous_slot = previous
+                    previous_pool.release(previous_slot, 1)
+                    logger.warning(
+                        "req:%s block %d of %s was captured twice (the "
+                        "announcement repeated); releasing its previous slot %d",
+                        capture.req_id,
+                        blocks[i],
+                        group.spec_name,
+                        previous_slot,
+                    )
+                staged[key] = (pool, start + offset)
+        logger.info(
+            "req:%s captured %d windowed blocks (%d groups) before the window "
+            "moved",
+            capture.req_id,
+            sum(len(captureable) for _, captureable, _, _ in taken),
+            len(taken),
+        )
+        return True
+
+    @staticmethod
+    def _release_runs(taken: Sequence[Tuple[Any, List[int], Any, int]]) -> None:
+        """Give back the runs of a capture that will not be kept."""
+        for _group, captureable, pool, start in taken:
+            pool.release(start, len(captureable))
+
+    def _release_captures_for(self, req_id: str, blocks: Sequence[int]) -> None:
+        """Return the captured slots of blocks no session is going to write.
+
+        The manager reported them as already cached when the session came back,
+        so the bytes the eager capture copied for them are never published (the
+        session does not even mention them): holding them until the request
+        retires would pin one arena slot per already-cached block for as long
+        as the request runs. Entries already handed to a session are the task's
+        to release and are left alone.
+        """
+        staged = self._staged.get(req_id)
+        if not staged:
+            return
+        released = 0
+        for block in blocks:
+            for key in [
+                key for key in staged if key[1] == block
+            ]:
+                pool, slot = staged.pop(key)
+                pool.release(slot, 1)
+                released += 1
+        if released:
+            logger.info(
+                "req:%s released %d captured block slots the manager already "
+                "holds (nothing to publish for them)",
+                req_id,
+                released,
+            )
+
+    def _release_staged(self, req_id: str) -> None:
+        """Return the capture slots the request never handed to a session.
+
+        Called when the request retires: whatever no session referenced (an
+        announcement that was canceled, a step that was never re-announced) must
+        not pin the arena for the rest of the process's life. A block that *did*
+        reach a session is that session's to release -- it returns its slot when
+        the transfer lands, success or failure -- because releasing in-flight
+        slots here would hand live bytes to the next capture before the SDK read
+        them and free the same slot twice (the pool's free list would then hold
+        the range twice and dispatch it to two transfers; review_r1 S1).
+        """
+        staged = self._staged.pop(req_id, None)
+        in_flight = self._in_flight.pop(req_id, None)
+        if staged:
+            for pool, slot in staged.values():
+                pool.release(slot, 1)
+        logger.debug(
+            "req:%s released %d un-taken captured block slots (%d in flight "
+            "with their sessions)",
+            req_id,
+            len(staged or ()),
+            len(in_flight or ()),
+        )
 
     def on_save_finished(
         self, write_session_id: str, save_context: SaveContext
@@ -673,6 +1190,11 @@ class ConnectorWorker:
         finish_write_cache). The scheduler's FinishRequest -- sent when its
         own ledger says the request is settled -- either reports immediately
         or defers until the last session lands."""
+        for finish_req in meta.to_finish_requests:
+            # The request is done on the scheduler side (every announced
+            # session was handed over), so no further write can reference its
+            # captures: release whatever a session never took.
+            self._release_staged(finish_req.req_id)
         if self._tp_rank != 0:
             for finish_req in meta.to_finish_requests:
                 self._pending_saves.pop(finish_req.req_id, None)
