@@ -77,6 +77,73 @@ TEST_F(NodeLruReclaimIndexerTest, AddMultipleNodes) {
     EXPECT_EQ(20, sampled_b[0]);
 }
 
+TEST_F(NodeLruReclaimIndexerTest, ReplacingLocationRemovesFormerNode) {
+    NodeLruReclaimIndexer indexer;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), indexer.Add({42}, {MakeLocMap("loc", "spec", "nodeA")}, {EC_OK}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), indexer.Add({42}, {MakeLocMap("loc", "spec", "nodeB")}, {EC_OK}));
+
+    KeyTypeVec sampled;
+    ASSERT_EQ(EC_OK, indexer.Sample(10, {"nodeA"}, sampled));
+    EXPECT_TRUE(sampled.empty());
+    ASSERT_EQ(EC_OK, indexer.Sample(10, {"nodeB"}, sampled));
+    EXPECT_EQ((KeyTypeVec{42}), sampled);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), indexer.Remove({42}, {{"loc"}}, {EC_OK}));
+    ASSERT_EQ(EC_OK, indexer.Sample(10, {"nodeB"}, sampled));
+    EXPECT_TRUE(sampled.empty());
+}
+
+TEST_F(NodeLruReclaimIndexerTest, ReplacingLocationPreservesOtherLocationsAndTheirLruOrder) {
+    NodeLruReclaimIndexer indexer;
+    indexer.Add({1}, {MakeLocMap("kept", "spec", "nodeA")}, {EC_OK});
+    indexer.Add({1}, {MakeLocMap("moved", "spec", "nodeA")}, {EC_OK});
+    indexer.Add({2}, {MakeLocMap("other", "spec", "nodeA")}, {EC_OK});
+    indexer.Add({1}, {MakeLocMap("moved", "spec", "nodeB")}, {EC_OK});
+
+    KeyTypeVec sampled;
+    ASSERT_EQ(EC_OK, indexer.Sample(10, {"nodeA"}, sampled));
+    EXPECT_EQ((KeyTypeVec{1, 2}), sampled);
+    ASSERT_EQ(EC_OK, indexer.Sample(10, {"nodeB"}, sampled));
+    EXPECT_EQ((KeyTypeVec{1}), sampled);
+    indexer.Remove({1}, {{"kept"}}, {EC_OK});
+    ASSERT_EQ(EC_OK, indexer.Sample(10, {"nodeA"}, sampled));
+    EXPECT_EQ((KeyTypeVec{2}), sampled);
+}
+
+TEST_F(NodeLruReclaimIndexerTest, ReplacingLocationDropsRemovedAndUnknownNodeSpecs) {
+    NodeLruReclaimIndexer indexer;
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id("loc");
+    location->push_location_spec(LocationSpec("first", "uri://first", "nodeA"));
+    location->push_location_spec(LocationSpec("second", "uri://second", "nodeB"));
+    indexer.Add({1}, {{{"loc", location}}}, {EC_OK});
+
+    // The replacement no longer has second; its old node must disappear.
+    indexer.Add({1}, {MakeLocMap("loc", "first", "nodeA")}, {EC_OK});
+    KeyTypeVec sampled;
+    ASSERT_EQ(EC_OK, indexer.Sample(10, {"nodeB"}, sampled));
+    EXPECT_TRUE(sampled.empty());
+    ASSERT_EQ(EC_OK, indexer.Sample(10, {"nodeA"}, sampled));
+    EXPECT_EQ((KeyTypeVec{1}), sampled);
+
+    // A stored spec without a node id also replaces the old membership.
+    indexer.Add({1}, {MakeLocMap("loc", "first", "")}, {EC_OK});
+    ASSERT_EQ(EC_OK, indexer.Sample(10, {"nodeA"}, sampled));
+    EXPECT_TRUE(sampled.empty());
+    EXPECT_TRUE(indexer.key_to_loc_nodes_.empty());
+}
+
+TEST_F(NodeLruReclaimIndexerTest, FailedOrNullLocationUpdateKeepsExistingMembership) {
+    NodeLruReclaimIndexer indexer;
+    indexer.Add({1}, {MakeLocMap("loc", "spec", "nodeA")}, {EC_OK});
+    EXPECT_EQ((std::vector<ErrorCode>{EC_ERROR}), indexer.Add({1}, {MakeLocMap("loc", "spec", "nodeB")}, {EC_ERROR}));
+    indexer.Add({1}, {{{"loc", nullptr}}}, {EC_OK});
+    KeyTypeVec sampled;
+    ASSERT_EQ(EC_OK, indexer.Sample(10, {"nodeA"}, sampled));
+    EXPECT_EQ((KeyTypeVec{1}), sampled);
+    ASSERT_EQ(EC_OK, indexer.Sample(10, {"nodeB"}, sampled));
+    EXPECT_TRUE(sampled.empty());
+}
+
 // --- Touch ---
 
 TEST_F(NodeLruReclaimIndexerTest, TouchPromotesKey) {

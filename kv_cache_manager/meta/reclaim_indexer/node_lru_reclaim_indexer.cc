@@ -32,10 +32,21 @@ std::vector<ErrorCode> NodeLruReclaimIndexer::Add(const KeyTypeVec &keys,
         const auto key = keys[i];
         auto key_sv = KeyToView(key);
         auto &loc_nodes = key_to_loc_nodes_[key];
+        std::unordered_set<std::string> previous_nodes;
+        std::unordered_set<std::string> updated_nodes;
 
         for (const auto &[loc_id, loc_ptr] : locations[i]) {
             if (!loc_ptr) {
                 continue;
+            }
+            // Add receives complete values for the supplied locations, but
+            // other locations of the same key may be omitted. Replace only
+            // this location's spec mappings so a moved/removed spec cannot
+            // leave the key behind in its former node's LRU.
+            auto old = loc_nodes.lower_bound({loc_id, ""});
+            while (old != loc_nodes.end() && old->first.first == loc_id) {
+                previous_nodes.insert(old->second);
+                old = loc_nodes.erase(old);
             }
             for (const auto &spec : loc_ptr->location_specs()) {
                 const auto &node_id = spec.node_id();
@@ -43,9 +54,27 @@ std::vector<ErrorCode> NodeLruReclaimIndexer::Add(const KeyTypeVec &keys,
                     continue;
                 }
                 loc_nodes[{loc_id, spec.name()}] = node_id;
-                auto node_cache = GetOrCreateNodeCache(node_id);
-                node_cache->Insert(key_sv, nullptr, &kItemHelper, /*charge*/ 1);
             }
+            for (auto it = loc_nodes.lower_bound({loc_id, ""}); it != loc_nodes.end() && it->first.first == loc_id;
+                 ++it) {
+                updated_nodes.insert(it->second);
+            }
+        }
+        for (const auto &[loc_spec, node_id] : loc_nodes) {
+            previous_nodes.erase(node_id);
+        }
+        for (const auto &node_id : previous_nodes) {
+            auto cache_it = node_caches_.find(node_id);
+            if (cache_it != node_caches_.end()) {
+                cache_it->second->Erase(key_sv);
+            }
+        }
+        for (const auto &node_id : updated_nodes) {
+            auto node_cache = GetOrCreateNodeCache(node_id);
+            node_cache->Insert(key_sv, nullptr, &kItemHelper, /*charge*/ 1);
+        }
+        if (loc_nodes.empty()) {
+            key_to_loc_nodes_.erase(key);
         }
     }
     return results;
