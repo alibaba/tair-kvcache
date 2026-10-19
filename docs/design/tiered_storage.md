@@ -132,7 +132,8 @@ Copy 的“目标可读后再删除源副本”只约束迁移任务自身。容
 | `migration_config.strategies` | 默认空，不启用自动迁移；同一 Group 中源/目标组合必须唯一，源和目标不同 |
 | `trigger_threshold` | 自动迁移阈值，必须显式设置，范围为 `0 < 值 < 1` |
 | `method_configs.copy/mark.enabled` | 单条规则至少开启一种方式；同时开启时 Copy 优先 |
-| `copy_max_concurrency` | Group 的活跃 Copy 上限，默认 `1`，必须大于 `0` |
+| `copy_max_concurrency` | Group 的活跃 Copy 上限，默认 `64`，必须大于 `0` |
+| `copy_max_inflight_bytes` | Group 异步 Copy 的在途字节上限，默认 `34359738368`（32 GiB）；异步模式下必须大于 `0` |
 | `mark.timeout_ms` | 新 Mark 的有效期，默认 `86400000`（24 小时）；开启 Mark 时必须大于 `0` |
 | `mark_clear_policy` | 默认 `MIGRATION_MARK_CLEAR_ON_NEXT_WRITE_SUCCESS`，控制 FinishWrite 清标 |
 | `retention` | 开启 Copy 时必须明确指定，取值与行为见 3.3 节 |

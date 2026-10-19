@@ -1,730 +1,163 @@
 # KVCM × PACE CopyGA 异步化设计
 
+KVCM 以进程内异步任务编排 CopyGA，通过条件发布保证迁移结果只关联到有效的源和目标，物理 allocation 的生命周期安全依赖 PACE 的 Copy/Delete 互斥契约。Copy 任务不持久化，不在切主或重启后恢复；普通 Location 元数据仍按所选元数据后端的语义存储。
+
 | 项目 | 内容 |
 |---|---|
-| 状态 | V1 已实现，默认关闭；需要 backend 显式声明异步能力 |
 | 默认模式 | `MIGRATION_COPY_SYNC` |
-| 异步模式 | `MIGRATION_COPY_ASYNC_REQUIRED` |
-| 改造范围 | KVCM 通用异步 Copy 框架、持久化 Copy Guard、恢复、回收保护、反压与配置 |
-| Backend 依赖 | submit/query/cancel、稳定 task ID，以及可靠的 `terminal` / `safe_to_reuse_dst` 语义 |
-| 核心不变量 | 只有 `terminal && safe_to_reuse_dst` 才能自动删除或复用目标 |
+| 异步模式 | `MIGRATION_COPY_ASYNC_REQUIRED`，仅接受显式支持异步的 backend |
+| KVCM 职责 | 并发/字节准入、异步提交与完成、源和目标条件发布、失败清理与重试、失败源退避 |
+| PACE 安全前提 | Copy 与源/目标 Delete 在 allocation 生命周期上互斥；busy、失败或未确认不能报告删除成功 |
 
-本文是异步 CopyGA 的权威设计文档。它描述公开的接口与配置、持久状态机、失败语义和上线约束，
-不记录特定部署环境、内部仓库分支或一次性测试过程。
+## 1. 目标与设计取舍
 
-## 1. 背景
+KVCache 存在 68/136 MiB 等较大 block；当 Copy RT 达到 200–300 ms 时，同步等待会长时间占用共享 Executor worker 和 DataStorageManager 锁。异步化的目标是释放这些编排资源，为提高 Copy 并发提供条件，物理搬运耗时仍由存储后端决定。
 
-### 1.1 为什么需要异步化
+KVCM 不持久化 Copy Guard、operation 阶段、源身份快照或远端 task IDs，也不通过持久化 pin 阻止源逐出。源可进入普通回收流程，PACE 在真实 I/O 仍访问 allocation 时拒绝物理删除；Copy 完成时，KVCM 再通过源和目标的条件更新拒绝过期结果。这一分工允许切主或重启时放弃在途迁移，代价是可能丢失已完成但尚未发布的结果，且不提供远端失联任务的自动恢复。
 
-早期 CopyGA 测试主要使用 4 MiB block，单次耗时通常只有数毫秒。真实 KVCache block 可能达到
-68 MiB 或 136 MiB，物理 Copy 耗时随数据量近似线性增长，进入数百毫秒量级。
+普通 write/read、Provider 执行队列重构、全局 allocation epoch、跨进程任务 exactly-once 和所有 backend 的统一保护改造不属于本设计。同步 Copy 使用同步后端接口及 Storage timeout，MARK 继续引导后续写入；同步与异步 Copy 共用源/目标条件发布和元数据 Sync 收尾，因此收尾延迟包含元数据操作。
 
-同步路径会让以下资源等待完整物理 Copy：
+## 2. 必需的后端安全契约
 
-- Migration executor worker；
-- storage backend 调用栈；
-- PACE HTTP client；
-- `DataStorageManager` 的 backend 生命周期锁；
-- 同一 Instance Group 的 Copy slot。
+`SupportsAsyncCopy()` 是 backend 的显式能力声明。启用原生异步不仅需要 submit/query 接口，还要求 PACE 满足以下 allocation 安全契约；这些要求是部署前提，不能视为已经部署验证的能力。
 
-把调用移到后台不会降低物理搬运耗时，但可以缩短 KVCM 共享执行资源的占用，并为后续安全提高
-Copy 并发建立基础。
+1. Provider 绑定源 allocation 后，源 lease 必须持有到最后一次源访问结束。其间 Delete 返回 busy，并保留 allocation 及映射，不能提前回收或复用给其他 GA。
+2. 目标搬运和 commit 使用同样的互斥机制：Copy 先获得 lease 时 Delete 返回 busy；Delete 先关闭访问入口时，迟到的 Copy 不能重新写入或重建已删除目标。
+3. HTTP timeout、cancel ACK、pending timeout 和节点注销成功均不等于真实 I/O drain，不能仅凭这些事件释放底层 owner。
+4. 明确 GA 列表中存在 busy、失败或未确认项时，删除链必须向 KVCM 返回失败或待重试，不能因路由缺失或后台清理已提交就报告整体 success。
+5. Delete 失败后必须保留重试所需的业务引用；只有确认对象不存在时，才能以不存在为由返回幂等成功。
 
-### 1.2 改造前调用链
+该契约的源保护范围从 Provider 绑定 allocation 开始。Meta 接受请求到 Provider 绑定之前，在途请求仍可能遇到源 GA 同址复用；KVCM 依赖第 4 节的条件发布拒绝过期结果。这个边界不保证 PACE 从未读到复用后的数据，也不覆盖绕过 KVCM 元数据直接 Free 的端到端身份安全。
 
-```text
-MigrationManager
-  -> SchedulePlanExecutor
-    -> DataStorageManager::Copy()
-      -> backend synchronous Copy
-        -> wait for remote data movement
-      <- per-item ErrorCode
-    <- future ready
-  -> publish or delete target
-```
+无响应且无法证明 drain 时，PACE 可能长期保留 pending 与 allocation。这是安全契约允许的异常容量代价，不能用固定超时强制释放；KVCM 不持久化 Copy 任务也不意味着底层可以无条件 Free。
 
-同步返回只表达“本次调用结束”。当 HTTP timeout、连接中断或远端重启发生时，KVCM 无法仅凭
-`ErrorCode` 判断远端是否仍会写目标。如果此时立即删除并复用目标，迟到写可能破坏其他数据。
-
-### 1.3 三层异步边界
-
-本文区分三个层次：
-
-| 层次 | 含义 | V1 |
-|---|---|---|
-| KVCM executor 异步 | executor 只完成本地 handoff，不等待远端 Copy | 已实现 |
-| backend coordinator 异步 | backend 后台 submit、query、cancel 并收敛结果 | 由支持异步的 backend 实现 |
-| Provider 数据面异步 | Provider handler 不等待物理 Copy | 不在本次范围 |
-
-Provider 内部是否异步不会改变 KVCM 的安全模型。只要远端可能在 API 返回后继续写，KVCM 就必须
-持有目标 fence，直到取得明确的 drain 证明。
-
-## 2. 目标与非目标
-
-### 2.1 目标
-
-1. executor 在 backend 接受本地 handoff 后立即释放。
-2. 同步 backend 行为保持不变；异步能力必须显式 opt-in。
-3. 远端 task ID、source identity、target identity 和字节数可跨 Leader 恢复。
-4. timeout、cancel、重启和响应丢失均采用 fail-closed 语义。
-5. Reclaimer、后台 GC 和普通删除路径都不能回收未决目标。
-6. operation、在途字节和 quarantine 容量均有硬上限。
-7. 同一 operation 只选择一种执行模式，不在异步提交后回退到同步 Copy。
-
-### 2.2 非目标
-
-1. 不降低单次物理 Copy 的数据面耗时。
-2. 不改变所有 backend 的 `Copy()` 同步契约。
-3. 不把 timeout、task age 或 HTTP 状态码解释为目标可复用证明。
-4. 不实现跨 Location 的分布式事务。
-5. 不保证远端 submit exactly-once；没有幂等键时，响应不确定必须隔离。
-6. 不自动删除无法证明安全的 quarantine 目标。
-7. 不在本次改造中实现 Provider 的异步执行队列或全局字节 admission。
-
-## 3. 安全模型
-
-### 3.1 术语
-
-| 术语 | 含义 |
-|---|---|
-| operation | KVCM 一次逻辑 Copy，可能包含多个 URI pair |
-| item | operation 中的一对 source/destination URI |
-| local handoff | backend coordinator 接受本地任务，不代表远端已受理 |
-| remote acceptance | 远端明确返回完整 task ID 集 |
-| terminal | task 不再继续状态迁移 |
-| safe to reuse | 远端保证不会再读写目标，可以删除或复用 |
-| guard | 写入目标 `CacheLocation` 的持久化 Copy fence |
-| quarantine | 无法取得安全证明而保留的目标及其 guard |
-
-### 3.2 核心不变量
-
-1. **自动回收凭据唯一。**
-
-   ```text
-   may_reuse_destination = terminal && safe_to_reuse_dst
-   ```
-
-   `ErrorCode`、timeout、cancel ACK、task `not_found`、进程退出和等待时长都不能替代该条件。
-
-2. **成功发布也要求安全终态。** 所有 item 必须同时满足：
-
-   ```text
-   outcome == success && terminal && safe_to_reuse_dst
-   ```
-
-3. **提交不确定时不得重发。** 如果 request 可能已送达，但没有拿到完整 task ID 集，目标进入
-   quarantine。重复 POST 可能让两组 task 并发写同一目标。
-
-4. **source 和 target 同时受保护。** target guard 存在期间：
-
-   - 目标不能被普通删除、Reclaimer 或 GC 回收；
-   - guard 中记录的精确 source `location_id + create_time` 不能先被淘汰；
-   - 同一 block 到同一 target storage 不得重复提交。
-
-5. **未知 schema 必须 fail-closed。** 显式存在但无法解析的 guard 不能被静默降级为普通
-   `CLS_WRITING` Location。
-
-6. **回收判断不读取诊断错误码。** `AsyncCopyItemResult::error` 只用于日志、指标和分类；
-   publish/delete 只读取 `outcome + terminal + safe_to_reuse_dst`。
-
-### 3.3 Backend 的纵深校验
-
-远端通常会同时返回 `terminal`、`drained` 和 `safe_to_reuse_dst`。PACE adapter 应重新计算：
+## 3. 运行流程与异步接口
 
 ```text
-effective_safe =
-    terminal &&
-    drained &&
-    server_safe_to_reuse_dst
+Group 并发/字节准入，登记进程内任务
+  → 分配目标，写普通 CLS_WRITING Location
+  → CopyAsync 本地接收，返回提交结果
+  → backend 协调器 POST → 内存保存 task IDs → 批量 query / cancel
+  → 唯一完成回调 → Executor future → MigrationManager
+      成功：同一 block 条件更新核验 source + target，再发布 SERVING
+      失败/取消/未知：精确删除本次目标，busy/失败保留 DELETING 并重试
 ```
 
-这可以避免版本偏斜或服务端派生字段错误直接授权目标复用。通用 KVCM 层只消费最终的
-`safe_to_reuse_dst`。
-
-## 4. 方案选择
-
-### 4.1 候选方案
-
-| 方案 | 结果 | 原因 |
-|---|---|---|
-| `batch_sync` + timeout 后内存对账 | 未采用 | 正常路径仍长时间占用 worker、client 和锁；响应不确定时缺少可靠恢复身份 |
-| async submit/query + 纯内存 operation | 未采用 | 能释放 worker，但切主后丢失 task ID、fence 和容量 accounting |
-| async submit/query + 持久 Copy Guard | 采用 | 同时解决资源占用、HA 恢复和目标安全回收 |
-
-因此仓库只有 `SYNC` 和 `ASYNC_REQUIRED` 两种模式，不存在
-`ASYNC_MEMORY_RECONCILE` 等第三种运行模式。
-
-### 4.2 总体架构
-
-```mermaid
-flowchart TD
-    R[Reclaimer or Admin migration]
-    M[MigrationManager]
-    A[Validate size and reserve credits]
-    G[Persist WRITING target and Copy Guard]
-    E[SchedulePlanExecutor]
-    D[DataStorageManager]
-    B[Async-capable backend coordinator]
-    S[Remote submit]
-    Q[Remote query and cancel]
-    F[Completion future]
-    O{Aggregate outcome}
-    P[Promote target]
-    C[Delete safe failed target]
-    U[Keep quarantined target]
-
-    R --> M --> A --> G --> E --> D --> B
-    B --> S --> Q --> F --> O
-    O -->|all success and safe| P
-    O -->|all terminal and safe, any failure| C
-    O -->|ambiguous or unsafe| U
-```
-
-### 4.3 组件职责
-
-| 组件 | 职责 |
-|---|---|
-| `MigrationManager` | admission、guard 状态机、credit、恢复和最终 metadata CAS |
-| `SchedulePlanExecutor` | 创建执行计划并完成短本地 handoff |
-| `DataStorageManager` | capability 检查、backend 转发和生命周期管理 |
-| async backend | submit/query/cancel、polling、响应校验和 exactly-once completion |
-| Reclaimer / GC | 直接读取持久 guard 并跳过受保护 Location |
-| Admin API | quarantine 只读查询和受审计的 break-glass |
-
-## 5. 正常执行流程
-
-一次异步迁移按以下顺序执行：
-
-1. 解析所有 source URI 的正数 `size`，校验 item 数量和总和溢出。
-2. 在任何外部副作用前申请 operation 和 byte reservation。
-3. 分配目标 URI，创建非 SERVING 的 `CLS_WRITING` Location。
-4. 通过精确 CAS 写入 `MCGS_SUBMITTING` guard，并执行 metadata durability barrier。
-5. executor 调用 `DataStorageManager::CopyAsync()` 完成本地 handoff。
-6. backend coordinator 向远端 submit，并通过独立 callback 返回 acceptance 和完整 task ID 集。
-7. KVCM 以 operation ID 和 guard state 为条件，把 guard 更新为 `MCGS_ACTIVE`。
-8. backend 按退避间隔 query；需要取消时发送 cancel intent，但继续 query。
-9. completion exactly once 返回逐 item 结果。
-10. `MigrationManager` 重新校验 source identity，并认领唯一终态 owner。
-11. 所有 item success+safe 时，原子地把目标改为 `CLS_SERVING` 并清 guard。
-12. 所有 item terminal+safe 但存在失败时，删除目标。
-13. 任一 item 不安全或结果不确定时，把 guard 改为 `MCGS_UNKNOWN` 并计入 quarantine。
-
-本地 queue 拒绝发生在远端 POST 前，可以安全回滚。POST 之后的任何不确定都必须保留目标。
-
-## 6. 通用异步接口
-
-### 6.1 结果模型
-
-```cpp
-enum class AsyncCopyOutcome {
-    kSuccess,
-    kFailed,
-    kCancelled,
-    kUnknown,
-};
-
-struct AsyncCopyItemResult {
-    AsyncCopyOutcome outcome;
-    ErrorCode error;                 // diagnostic only
-    bool terminal;
-    bool safe_to_reuse_dst;
-    std::string backend_task_id;
-    std::string detail;
-};
-
-struct AsyncCopyBatchResult {
-    ErrorCode status;
-    std::vector<AsyncCopyItemResult> items;
-    std::string detail;
-};
-```
-
-Batch success 必须由逐 item 条件聚合，不能只读取 backend aggregate status。
+`CopyAsync` 分为本地接收结果和最终 completion 两个阶段。本地接收不等待远端 Copy 完成；接收成功后，backend 负责恰好一次完成回调。operation 和 task IDs 仅用于进程内跟踪，不写入 CacheLocation，也没有远端提交持久化回调或 `ResumeAsyncCopy` 接口。
 
-### 6.2 两阶段受理
+Reclaimer 和 Admin 分发路径先准备源信息，再进入批量准入。`ASYNC_REQUIRED` 请求必须提供非空 `src_specs`、`instance_group_name` 和非零字节额度，缺少这些参数时返回 `EC_BADARGS`。直接调用 `MigrationManager::Submit` 的异步分支也遵守此约定；只有同步分支支持通过 `PrepareCopyTask` 补读省略的源信息。
 
-`CopyAsync()` 返回只表示 local handoff：
+PACE adapter 的本地接收在发送 POST 前完成。本地明确拒绝且没有远端副作用时可直接进入清理；POST 响应丢失或不完整时，不能重发为新的 Copy，而应报告 unknown，再由普通 Delete 请求后端判断是否仍有活跃 I/O。通用接口中的 `acceptance_unknown` 用于表达无法确认接收结果的 backend，不构成安全完成证明。
 
-```cpp
-struct AsyncCopySubmitResult {
-    ErrorCode status;
-    bool accepted;
-    bool acceptance_unknown;
-    std::string operation_id;
-    std::vector<std::string> backend_task_ids;
-    std::string detail;
-};
-```
-
-远端 acceptance 通过 `AsyncCopyRemoteSubmitCompletion` 独立返回。两者不能混淆：
-
-- local `accepted=true`：coordinator 接管了任务；
-- remote `accepted=true`：远端返回了完整 task ID 集；
-- `acceptance_unknown=true`：请求可能产生远端副作用，但没有权威 handle。
-
-### 6.3 Backend 能力
-
-```cpp
-class DataStorageBackend {
-public:
-    virtual bool SupportsAsyncCopy() const;
+异步路径的 `DataStorageManager` 在核对 backend 身份和完成本地接收时持 shared lock，使本地提交与 Storage 注销互斥；远端请求、轮询和完成等待不持该锁。任务用 `shared_ptr` 保存源、目标 backend 的进程内身份，保持对象存活不代表它仍注册或尚未关闭。协调器对单个 operation 的 task IDs 批量查询，并按请求大小分片，不跨 operation 合并查询；协调器需保持有界准入、轮询退避、分阶段 HTTP 预算、取消意图和唯一完成回调。
 
-    virtual AsyncCopySubmitResult CopyAsync(
-        const std::vector<DataStorageUri>& src,
-        const std::vector<DataStorageUri>& dst,
-        const std::string& operation_id,
-        const std::string& trace_id,
-        const AsyncCopyOptions& options,
-        AsyncCopyRemoteSubmitCompletion remote_submit_completion,
-        AsyncCopyCompletion completion);
-
-    virtual AsyncCopySubmitResult ResumeAsyncCopy(
-        const std::vector<std::string>& backend_task_ids,
-        size_t expected_items,
-        const std::string& operation_id,
-        const std::string& trace_id,
-        const AsyncCopyOptions& options,
-        AsyncCopyCompletion completion);
+`ASYNC_REQUIRED` 遇到不支持异步的 backend 直接拒绝，不回退到同步 Copy。完成结果的整批 `status` 必须为 `EC_OK`，item 数量必须与请求一致，且每个 item 都满足 `terminal && safe_to_reuse_dst && outcome == success` 才能报告 Copy 成功；`AsyncCopyItemResult::error` 仅用于诊断。PACE adapter 还需核验 drained 与 server safe，短返回、缺字段、not_found 或 timeout 都不能冒充成功。
 
-    virtual ErrorCode RequestCancelAsyncCopy(
-        const std::string& operation_id);
-};
-```
+异步 Copy 的提交统计与提交事件在本地接收成功后登记，并先于完成结果消费。提交前被拒绝的请求仍须清理目标、释放额度和移除活跃记录，但不计入已提交任务的成功、失败或取消终态，也不发送完成事件。
 
-基类默认不支持异步。开源仓中的异步框架只有在具体 backend override
-`SupportsAsyncCopy()` 后才可达；`ASYNC_REQUIRED` 遇到不支持的 backend 必须明确失败，不能静默
-回退同步。
+**结果未知不能发布成功，但可以发起由后端安全契约保护的 Delete。** 发起 Delete 不代表 allocation 已可复用，只有后端确认安全删除才能完成清理。
 
-`ResumeAsyncCopy()` 只能重新 query 已有 task ID，绝不能发起第二次物理 Copy。
+## 4. 元数据发布与删除
 
-### 6.4 DataStorageManager 生命周期
+### 4.1 成功发布
 
-`DataStorageManager::CopyAsync()` 在锁内只查找并取得 backend `shared_ptr`，随后释放锁。远端
-submit 和 completion callback 持有该强引用，避免长时间持有 manager 锁。
+Copy 准入时绑定源和目标 backend 的进程内身份，并保存本次源和目标的 Location 身份及完整快照。完成处理属于当前 Leader 的任务生命周期，并通过唯一认领与取消仲裁；取消先取得处理权时，即使远端 Copy 成功也不发布目标、不删除源，而是清理本次目标。
 
-storage unregister/update 必须先确认没有 active 或 quarantined guard。存在引用时拒绝删除 backend
-配置，因为新 Leader 恢复需要相同 backend。进程 shutdown 可以 detach coordinator，但不能把未决
-任务合成为安全失败。
+源和目标必须属于同一个 Instance/block，KVCache 不跨 `instance_id` 复用。发布不能依靠先 Get(source)、再独立 Promote(target)，因为两步之间可能发生源删除。一次 block 级条件 RMW 同时校验：
 
-## 7. 持久 Copy Guard
+- 源 Location ID、`create_time`、完整快照和 `SERVING` 状态仍匹配。
+- 目标仍是本次创建的 `WRITING` Location，身份和完整值未变化。
 
-### 7.1 为什么放在 CacheLocation
+全部条件满足才把目标改成 `SERVING`；任一条件不符则丢弃结果，并按本次目标快照清理，不触碰替换后的 Location。CAS 已生效但 Sync 暂未确认时，进程内任务保留完成处理权，只重试 Sync，不能因再次 CAS 不匹配而误删已发布目标。
 
-Guard 写入目标 `CacheLocation` JSON，因此：
+发布时还在 `DataStorageManager` shared lock 内核对源、目标 backend 仍是本次绑定的对象，并执行条件更新，与注销所需的 unique lock 互斥。Sync 在该锁外等待；Sync 完成后，再次核对 backend 身份并在锁内提交源删除任务。任一 Storage 已注销或被同名新 backend 替换时，Copy 按失败收尾，不再发布目标或提交源删除；已发布的目标也不会被本次 `WRITING` 快照清理误删。
 
-- Reclaimer 和后台 GC 无需依赖 `MigrationManager` 内存表；
-- Leader 切换后仍能恢复；
-- guard 状态跃迁会改变 Location 的完整值，使 GC 在途的
-  `expected_location_values` 条件删除自动失效；
-- source identity 与目标生命周期绑定在同一权威记录中。
+Sync 遵循所选元数据后端的语义。memory-primary 模式下，普通 `SERVING` 更新的备份是 best-effort，Sync 不等于每条目标更新都已持久化，也不提供迁移结果跨重启恢复保证。成功收尾后按 retention 决定是否删除源，源删除同样使用精确快照和普通删除链。
 
-旧二进制的逐字段反序列化可能擦除未知字段，因此产生过 guard 后不能直接回滚到不识别它的版本。
+`DELETE_SOURCE` 在源首次转为 `DELETING` 的同一次 block 条件 RMW 中，校验本次已发布目标的完整 `SERVING` 快照。目标已被删除、进入删除状态或被替换时，保留源；这也覆盖目标发布后等待 Sync 的期间。源已成功进入 `DELETING` 后，其物理清理继续遵守精确身份和 Sync 屏障，不再要求目标持续存在，避免目标后续正常淘汰导致源清理永久挂起。该条件保证的是源开始失效时目标仍有效，不阻止之后对目标的独立删除。
 
-### 7.2 Guard 内容
+### 4.2 删除准入与重试责任
 
-`MigrationCopyGuard` 至少持久化：
+失败、取消和 unknown 均使用普通删除链。GC、Reclaimer 和普通删除不依赖 Copy Guard 或反向源 pin，只保留进程内 active target 检查；`WRITING`、`DELETING` 是普通 Location 状态，不是持久化迁移任务。
 
-- schema version 和 operation ID；
-- guard state；
-- source `location_id + create_time + storage_name`；
-- target storage；
-- migration retention；
-- total bytes；
-- backend task IDs；
-- create/update time 和 last error。
+1. 按精确 Location 快照将 `WRITING/SERVING` 改为 `DELETING`。
+2. 确认元数据变更的 Sync 屏障后才调用物理 Delete，使元数据中的源失效先于源空间释放。
+3. Delete busy 或失败时保留 `DELETING` 和进程内清理责任，不提前删除元数据。Executor 通过现有定时队列退避重试，等待不占 worker；原 future 保持 pending，使上层保留删除任务对应的 pending 记录和额度。
+4. 重试重新读取原身份，允许本次对象已是 `DELETING`，但必须执行精确的 `DELETING → DELETING` CAS，重新确认备份准入后再 Sync。仅凭本地已有状态和空队列的 Sync，不能授权物理删除。
+5. 物理删除确认后才执行精确的 metadata CAD；CAD 失败仍由同一任务保留重试责任。
 
-显式存在但 schema 非当前版本、状态未知或 operation ID 为空的 guard 必须解析失败，不能当成“无 guard”。
+这套重试用于普通 RemoveCache、Reclaimer、GC 和迁移清理。删除请求入队前绑定 backend 身份，Executor 只跟踪本次准入的精确 Location，不重新扩展到同 key 的新 Location，也不转用同名重建的 backend。Storage 注销后，任务在下一次执行时停止对该 Storage 的清理；同批次中其他 Storage 的清理继续执行。未确认物理删除的 Location 元数据保留，最终 future 以失败结束，并明确标记清理被放弃，不把注销当作删除成功。
 
-### 7.3 状态机
+任务结束或 Executor 停止时释放其进程内引用，停止以失败结束等待，不代表物理删除成功。无法建立重试责任的首次准入失败会返回错误；异步迁移清理另由 MigrationManager 的进程内队列保留上层责任，直到清理成功或 Executor 确认原 Storage 已注销并放弃相应清理。
 
-```mermaid
-stateDiagram-v2
-    [*] --> SUBMITTING: guard persisted before POST
-    SUBMITTING --> ACTIVE: complete task IDs persisted
-    SUBMITTING --> DONE: definite rejection without remote side effect
-    SUBMITTING --> UNKNOWN: remote acceptance ambiguous
-    ACTIVE --> ACTIVE: pending or retryable query failure
-    ACTIVE --> CANCELLING: cancel intent persisted
-    CANCELLING --> CANCELLING: cancel ACK or task still pending
-    ACTIVE --> DONE: all items terminal and safe
-    CANCELLING --> DONE: all items terminal and safe
-    ACTIVE --> UNKNOWN: result cannot be proven safe
-    CANCELLING --> UNKNOWN: result cannot be proven safe
-    UNKNOWN --> UNKNOWN: automatic paths remain fenced
-```
+### 4.3 CAS 竞争与重复删除边界
 
-`DONE` 不是持久 guard state。成功时目标 promote 与 clear guard 在一次条件更新中完成；安全失败时
-删除目标。内存 task 状态只负责调度，持久 guard 才是恢复和回收的权威。
+首次迁移精确清理也接受同一对象已经是 `DELETING` 的情况，不能把另一路删除尚未完成当成清理成功。如果在首次读取之后、CAS 之前，并发删除只将本地状态改为 `DELETING`，甚至其备份准入失败，CAS mismatch 也不能证明物理删除完成。
 
-所有 guard 跃迁必须同时校验：
+精确清理将整批原身份请求交给重试所有者重新读取，包括本批 CAS 成功项和竞争失败项，不能只保留成功子集后就放弃竞争项。再次读取确认原对象已不存在或已被不同身份替换，才可跳过；同 ID 的换代对象不能误删。
 
-- operation ID；
-- expected guard state；
-- 目标 Location identity/value。
+同一内存删除任务记录完整返回中已确认 `EC_OK/EC_NOENT` 的 URI。部分物理删除成功或后续 metadata CAD 失败时，不重复删除这些 URI；该记录与 GC 的“查询确认不存在”提示分开，不受 backend 的 GC 删除策略影响。短返回、异常和超时不构成成功证明。模糊删除结果、跨任务重复删除以及底层 GA 身份复用仍依赖后端 Delete 契约，KVCM 不提供额外的 allocation generation 协议。
 
-这样 cancel、completion 和恢复线程不能互相覆盖状态。若 CAS 已生效但 durability barrier 超时，只能
-重试 barrier，不能重复 CAS、Copy、删除或 quarantine。
+## 5. 并发、容量与失败源退避
 
-## 8. 结果与失败语义
+Group 的 `copy_max_concurrency` 限制活跃 Copy operation，默认 64；异步模式同时受 `copy_max_inflight_bytes` 限制，默认 32 GiB，显式配置时必须非零。准入先预留额度和进程内任务，再分配目标；源 URI size 缺失、为零、解析失败或求和溢出时拒绝。终态处理唯一认领，重复完成或取消不能重复归还额度。
 
-### 8.1 Operation 聚合
+Copy inflight credit 表示 KVCM 正在跟踪的 Copy，不等于 PACE 的全部物理占用。unknown 收尾可释放 Copy credit，但其删除重试及 PACE 未 drain 的 pending 仍可能占用容量，清理记录继续保存原 backend 身份和 Location 快照。本设计没有独立的 quarantine operation/bytes 容量闸门；持续 busy/unknown 时，需要控制新 Copy 压力并检查删除积压和 PACE 实际容量。
 
-| 逐 item 结果 | Operation 动作 |
-|---|---|
-| 全部 success + terminal + safe | promote 目标 |
-| 全部 terminal + safe，至少一个非 success | Copy 失败并删除目标 |
-| 任一非 terminal 或 safe=false | 继续 query；到 deadline 后 cancel，再无法确认则 quarantine |
-| `not_found` / `unknown` | quarantine |
-| HTTP/解析错误 | 保持原状态并退避重试 |
-| item 数量、顺序或 task ID 不匹配 | unknown，不能部分采信 |
-
-一个 Location 内的多 item 采用全有或全无语义。V1 不做部分发布或部分清理。
-
-### 8.2 Submit ambiguity
-
-只有能证明 POST 没有产生远端副作用时，才允许安全回滚，例如本地参数校验失败或 local admission
-拒绝。
-
-以下情况必须按 acceptance unknown：
-
-- request 可能已经写出后发生 timeout/reset；
-- response body 丢失或无法完整解析；
-- task ID 数量不足、为空或重复；
-- transport 未完整结束，即使缓冲区中存在看似可解析的 error body。
-
-当前协议没有 caller-provided idempotency key，因此上述情况不能自动重发。
-
-### 8.3 Query 与 cancel
-
-Query 必须逐项校验 task identity。HTTP 404 或 task `not_found` 只表示当前 registry 找不到记录，
-不表示目标已经 drained。
-
-Cancel 只表达意图：
-
-- `EC_OK` 表示 coordinator 接受 cancel request；
-- cancel ACK 不是 terminal 证明；
-- cancel 后继续 query；
-- 如果迟到结果为 success+safe，允许 success 胜出。
-
-Cancel 与 completion 共享唯一终态 owner，credit 只能释放或转 quarantine 一次。
-
-### 8.4 Timeout
-
-四类时间彼此独立：
-
-| 时间 | 语义 |
-|---|---|
-| connect timeout | 单次控制请求建立连接的预算 |
-| submit timeout | 单次 submit HTTP 总预算 |
-| query timeout | 单次 query/cancel HTTP 总预算 |
-| operation deadline | KVCM 自动跟踪正常完成的总预算 |
-
-任一 timeout 都不是 drain 证明。Query timeout 只影响本轮 poll；operation deadline 到期后请求 cancel，
-若仍无安全终态则 quarantine。
-
-## 9. 恢复、关闭与回收
-
-### 9.1 Leader 恢复
-
-新 Leader 在开放 leader-only 请求和启动 Reclaimer/GC 前扫描 guarded Location：
-
-1. 有界分页扫描全部 Instance；
-2. 校验 guard schema、identity、bytes 和 Group 配置；
-3. 重建 active/quarantine operation 与 byte accounting；
-4. 对 `ACTIVE/CANCELLING` 且 task ID 完整的记录调用 `ResumeAsyncCopy()`；
-5. 无法恢复的记录转为 `UNKNOWN`，保持 fence；
-6. 全部扫描和校验成功后一次性发布恢复结果。
-
-恢复失败不能发布部分 accounting，也不能让节点持有 Leader lease 却不提供服务；服务端应主动 demote
-并由其他节点重试。
-
-Backend 暂时 unavailable 与 backend 不存在语义不同。恢复已有 task 时仍应尝试 query，不能因为一次
-availability probe 失败就丢失恢复路径。
-
-### 9.2 Shutdown 与 storage close
-
-受控 shutdown 的顺序是：
-
-1. 停止新 leader-only 请求；
-2. 停止 Reclaimer/GC；
-3. 停止 MigrationManager 接受新 operation；
-4. detach 已持久化 task ID 的 backend job；
-5. 由新 Leader 从 guard 重新接管。
-
-已经提交且 task ID 已持久化的 job 不应在 Close 时逐个串行 cancel，也不应被批量标成
-`UNKNOWN`。仍处于 `SUBMITTING` 且没有 task ID 的 operation 必须 fail-closed。
-
-### 9.3 Reclaimer 与后台 GC
-
-两条路径的 fencing 机制不同：
-
-| 路径 | Fence 来源 |
-|---|---|
-| Reclaimer | 读取目标 guard，并保护 target 与精确 source identity |
-| 后台 GC | 直接读取 Location JSON 中的 guard |
-
-GC 不能仅凭 `CLS_WRITING` 年龄删除 guarded target。Guard 状态变化后，旧
-`expected_location_values` 应使条件删除失败。
-
-### 9.4 Quarantine
-
-`MCGS_UNKNOWN` 表示 KVCM 无法证明目标可回收：
-
-- source 保持可服务；
-- target 保持非 SERVING；
-- operation/bytes 计入 quarantine；
-- 自动路径不再 submit 同一目标；
-- 容量达到 gate 后停止新的异步 Copy，但允许已有任务继续收敛。
-
-最小运维接口包括：
-
-- 按 Instance Group 列出 quarantine；
-- 查看 operation、task IDs、source/target、bytes 和最后错误；
-- 只有取得独立外部 fencing 证明后，才允许受审计的 break-glass release。
-
-Break-glass 不是自动恢复策略。按年龄、重试次数或人工点击本身都不能构成 drain 证明。
-
-### 9.5 二进制回滚
-
-关闭异步模式不会清除已有 guard。回滚到不识别 guard 的二进制前必须：
-
-1. 停止新异步 submit；
-2. 等待 active operation 收敛；
-3. 处理全部 quarantine；
-4. 扫描确认全局 guard count 为 0；
-5. 再执行 binary rollback。
-
-## 10. 反压与调度
-
-### 10.1 Credit
-
-仅限制 `copy_max_concurrency` 不足以约束大 block。V1 同时维护：
+同步与异步 Copy 共用进程内失败源退避，身份键为：
 
 ```text
-active_operations
-active_bytes
-quarantine_operations
-quarantine_bytes
+(instance_id, block_key, source_location_id, source_create_time, target_storage_name)
 ```
 
-推荐准入顺序：
+重复失败采用有上限的指数退避，优先选择未失败或失败次数较少的合格副本；所有可选源均在退避期时，不分配 Copy 目标、不提交 Copy。`create_time` 防止同 ID 旧副本的失败记录影响换代后的副本。错误码不被当成永久数据失效证明，也不触发自动删除源。
 
-```text
-validate source sizes
-  -> reserve operation and byte credits
-  -> allocate destination
-  -> persist SUBMITTING guard
-  -> local backend handoff
-  -> remote submit
-```
+失败源退避只影响 Copy。纯 MARK 以及 BOTH 的 MARK 回退仍按独立的结构准入和去重规则处理：已有任务、源缺失、目标已覆盖、已有 MARK 或去重读取错误等条件仍需检查。
 
-size 缺失、非法、为 0 或求和溢出时必须在副作用前拒绝。Operation 从 active 转 quarantine 时，credit
-转移必须原子，不能先释放 active 再增加 quarantine。
+Reclaimer 的候选数量不等于实际准入数量。有 Group 硬限制时，分发层将候选交给 `BatchSubmit`，由它在锁内结合活跃并发和已占字节完成准入；批内 operation 名额只在两项准入都成功后扣减。大候选因字节额度不足被拒后，后续小候选仍有补位机会，例如剩余 1 个名额和 100 MiB 时，128 MiB 候选被拒后仍可接纳后面的 64 MiB 候选。不带 Group 硬限制的内部调用仍遵守分发层的软上限。
 
-### 10.2 Coordinator
+## 6. 停止、重启与管理操作
 
-Backend coordinator 应具备：
+### 6.1 任务生命周期
 
-- 有界 local queue；
-- operation ID 到 task ID 的映射；
-- polling backoff；
-- 批量/分片 query；
-- exactly-once callback；
-- stop admission 和 graceful detach。
+切主或 Stop 关闭 Copy 准入，使旧 generation 的 Prepare Job 失效，停止完成结果消费，并丢弃内存 Copy 任务及 future。新 Leader 不接回旧任务或发布其迟到结果，也不扫描元数据恢复迁移；遗留 `WRITING` 由普通维护规则处理。
 
-一个 coordinator 线程串行发送同步 HTTP 时，最坏轮询时间会随 operation 数增长。Backend 应合并同一
-轮到期 task，限制 query URL 长度，并让实际 admission 与
-`operation_deadline / query_timeout` 的可处理规模匹配。提高 Copy 并发前必须验证 queue wait、poll
-周期和 timeout 比例。
+进程存活且相应组件运行时，Executor 负责已接管删除的失败重试，MigrationManager 清理队列保留上层责任。不存在跨重启的 `DELETING` 清理队列，也不承诺所有遗留半成品自动收敛；普通维护能力需要按具体环境和元数据后端验证。
 
-### 10.3 失败源退避
+backend 关闭不能逐任务串行等待完整 Copy。唯一完成回调可以报告 unknown，但不能伪造 drained；KVCM 停止跟踪之后，allocation 仍必须受 PACE 安全契约保护。
 
-`node not found` 等失败不应让 Reclaimer 持续选择同一旧 source。同步和异步路径共用
-`MigrationManager` 的进程内失败记录，key 为：
+### 6.2 在途任务与管理请求
 
-```text
-(instance_id, block_key, source_location_id,
- source_create_time, target_storage_name)
-```
+Storage 注销不以 Copy 完成或清理成功为前提。`DataStorageManager` 用现有读写锁串行化本地 Copy 接收、结果发布和注销；普通 Create/Delete 仍在调用 backend 期间持 shared lock。注销可能等待这些正在执行的调用及 backend 的 Close，但不等待远端 Copy completion 或清理 future。backend Close 的实际 I/O 安全仍由第 2 节的契约保证。
 
-失败后使用有上限的指数退避；存在其他完整副本时优先换源，所有候选都在 backoff 时本轮不分配目标、
-不 submit。由于 backend 错误分类仍可能不够精确，V1 不据此自动删除 source，也不持久化“永久失效”
-结论。
+Monitor 定期核对活跃 Copy 绑定的 backend 身份，发现源或目标已注销时按失败收尾，无需等待远端结果；迟到结果不能恢复任务。Executor 在已有定时任务的下一次执行中结束相应清理责任，后台重试不会否决 Storage 移除。同名 Storage 重建也不会让旧任务重新获得发布或物理删除权限。清理记录用于保存进程内任务责任，不保证注销后残留数据自动清除。
 
-## 11. 配置
+`RemoveInstance` 先关闭该实例的迁移准入并请求取消活跃 Copy，最多等待 5 秒；仍有活跃 Copy 时返回 `EC_EXIST`。待重试的迁移清理和普通删除任务不单独阻止实例移除。
 
-### 11.1 MigrationConfig
+`TrimCache` 对每个已提交批次最多同步等待 5 秒，超过后返回 `EC_TIMEOUT`，不继续清扫残留，也不取消 Executor 的后台重试。该上限只约束单批等待，不是整个多批 Trim 的总时长上限；它避免持续 busy 使管理请求和切主请求排空永久等待。`RemoveInstance` 按先注销、后 Trim 的顺序执行；本进程确认注销成功后保留待清扫记录，失败或超时后再次调用可继续 Trim，已经接管的删除仍由 Executor 重试。显式 Trim 重试可能与已有删除任务重叠，跨任务重复删除仍遵循第 4.3 节的后端契约。待清扫记录在清扫成功、实例重新注册或主备清理时移除，不提供跨重启恢复。同一实例的 RegisterInstance 与 RemoveInstance 调用互斥，其他实例不等待它的 drain 或 Trim。返回非成功后仍需读取当前注册状态。
 
-| 字段 | 默认值 | 说明 |
+## 7. 配置与超时
+
+| 配置 | 默认 | 含义 |
 |---|---:|---|
-| `copy_execution_mode` | `SYNC` | `SYNC` / `ASYNC_REQUIRED` |
-| `copy_max_concurrency` | 1 | Group Copy operation 并发 |
-| `copy_max_inflight_bytes` | 0 | 异步模式必须显式为正 |
-| `copy_max_quarantine_operations` | 0 | 异步模式必须显式为正 |
-| `copy_max_quarantine_bytes` | 0 | 异步模式必须显式为正 |
-| `copy_operation_deadline_ms` | 600000 | 自动跟踪总预算 |
-| `copy_poll_initial_interval_ms` | 20 | 初始 poll 间隔 |
-| `copy_poll_max_interval_ms` | 1000 | 最大 poll 间隔 |
-| `copy_connect_timeout_ms` | 1000 | 建连预算 |
-| `copy_submit_timeout_ms` | 3000 | submit 总预算 |
-| `copy_query_timeout_ms` | 3000 | query/cancel 总预算 |
-
-### 11.2 校验约束
+| copy_execution_mode | SYNC | 同步 / ASYNC_REQUIRED |
+| copy_max_concurrency | 64 | Group operation 上限 |
+| copy_max_inflight_bytes | 34359738368（32 GiB） | 异步模式下必须非零 |
+| copy_operation_deadline_ms | 600000 | 操作总跟踪预算 |
+| copy_poll_initial_interval_ms | 20 | 首次查询间隔 |
+| copy_poll_max_interval_ms | 1000 | 轮询退避上限，不保证实际轮询延迟 |
+| copy_connect_timeout_ms | 1000 | 建连预算 |
+| copy_submit_timeout_ms | 3000 | 单次 submit 总预算 |
+| copy_query_timeout_ms | 3000 | 单次 query/cancel 总预算 |
 
 ```text
 0 < poll_initial <= poll_max < operation_deadline
-0 < connect <= submit < operation_deadline
-0 < connect <= query < operation_deadline
+0 < connect <= submit, query
 16 * max(submit, query) <= operation_deadline
 ```
 
-`ASYNC_REQUIRED` 还要求三个容量 gate 都为正。配置校验保证单次控制请求不会吃掉大部分 operation
-deadline，但不能替代部署容量评估。
+这些限制约束单次阻塞，不能保证大量任务共享一个协调器时的真实轮询周期。使用默认 64 并发或调整并发配置时，需要观察协调器 queue wait、查询耗时及超时、实际 Copy 完成延迟，并评估远端 task 保留窗口；队列等待、轮询和正常 Copy P99 之和应留在 operation budget 内。
 
-外部协议还需要满足：
+Storage timeout 控制 Create/Delete/health/同步 Copy，异步 HTTP 请求使用独立预算。降低全局 Storage timeout 不能代替异步预算配置；Provider 的等待超时同样不代表物理 I/O 停止，任何一层超时都不单独授权内存复用。
 
-```text
-normal_copy_P99 + queue_and_poll_margin < operation_deadline
-max_expected_leader_outage + poll_max
-    < remote_terminal_record_retention
-```
-
-远端 terminal retention 从任务终态发布开始计时，不能简单用
-`operation_deadline < retention` 代替完整约束。
-
-Storage 自身的 `timeout` 继续控制 Create/Delete/health 和同步 Copy 等旧调用；三个 async HTTP timeout
-只作用于异步控制请求，不应通过全局下调 storage timeout 来替代。
-
-## 12. 可观测性
-
-### 12.1 当前核心指标
-
-- active operation/bytes；
-- quarantine operation/bytes；
-- async unknown 累计数；
-- source failure recorded/suppressed/alternate-selected/no-eligible-source；
-- 当前 source failure entry 数；
-- quarantine list API。
-
-### 12.2 日志字段
-
-状态转换日志至少包含：
-
-```text
-instance_group, instance_id, block_key, operation_id,
-source_location_id, source_create_time, target_location_id,
-backend_task_ids, bytes, guard_state, outcome,
-terminal, safe_to_reuse_dst, trace_id
-```
-
-高频 polling 使用 DEBUG 或采样，状态跃迁和 quarantine 使用 INFO/WARN。
-
-不要把 submit RT 当成 Copy RT。性能分析应分别观察：
-
-- local queue wait；
-- submit HTTP；
-- remote execution；
-- poll convergence；
-- metadata promote/delete。
-
-## 13. 测试
-
-### 13.1 自动化范围
-
-通用框架测试至少覆盖：
-
-1. backend capability 和 local handoff；
-2. pre-submit 拒绝无远端副作用；
-3. size 缺失、非法、溢出和 item 数不一致；
-4. guard schema、状态跃迁和严格 CAS；
-5. success/safe、safe failure、unknown 的聚合；
-6. cancel/completion 竞争和 exactly-once credit；
-7. Leader recovery、resume 和恢复失败；
-8. Reclaimer、GC 和普通删除 fencing；
-9. quarantine capacity gate 与 break-glass 前置校验；
-10. source failure backoff 与 alternate source；
-11. config JSON/proto round-trip 和 timeout 约束；
-12. binary build。
-
-具体 PACE adapter 还应覆盖：
-
-- submit/query/cancel 响应 shape 与 task identity；
-- transport ambiguity；
-- query URL 分片或批量合并；
-- deadline/cancel 后继续收敛；
-- close detach；
-- task `not_found`；
-- same-provider 和 cross-provider payload 校验。
-
-### 13.2 故障注入
-
-上线前至少验证：
-
-1. 远端接受 submit 后丢失响应；
-2. task 创建后 query 返回 `not_found`；
-3. Copy 中切换 KVCM Leader；
-4. Copy 中重启远端 metadata 或 Provider；
-5. cancel 与 completion 竞争；
-6. deadline 后迟到 success；
-7. storage update/unregister 与 Copy 并发；
-8. mixed-result batch；
-9. guard 年龄超过 GC grace period；
-10. quarantine list 和 break-glass 审计。
-
-所有测试共享一个硬断言：没有 `terminal && safe_to_reuse_dst` 时，普通业务、Reclaimer、GC、
-shutdown 和恢复路径都不得删除或复用目标。
-
-## 14. 上线与兼容
-
-### 14.1 上线顺序
-
-1. 升级所有可能成为 Leader 的 KVCM 节点。
-2. 保持 `MIGRATION_COPY_SYNC` 验证兼容性。
-3. 确认目标 backend `SupportsAsyncCopy()`。
-4. 为一个 Instance Group 配置 operation/byte/quarantine gate。
-5. 开启 `MIGRATION_COPY_ASYNC_REQUIRED`，从 concurrency 1 开始。
-6. 完成正常、跨 Provider、cancel、切主和远端重启验证。
-7. 观察 active/quarantine、远端 registry 容量和前台延迟。
-8. 前一级稳定后再提高并发。
-
-### 14.2 兼容规则
-
-- 配置缺失时保持同步行为；
-- 异步 backend 不可用时 `ASYNC_REQUIRED` 明确失败；
-- 旧节点仍可能成为 Leader 时不得开启异步；
-- 同一 operation 异步提交后不能回退到同步；
-- 关闭 feature 不清理 guard；
-- binary rollback 前必须确认 guard 为零；
-- 所有 Location 读改写路径必须保留 guard。
-
-## 15. 已知限制与未来工作
-
-V1 已建立 KVCM 端的持久 fence 和异步控制面，但仍有以下限制：
-
-- 没有 caller-provided idempotency key，submit ambiguity 只能 quarantine；
-- 远端 task registry 若不持久化，重启后可能返回 `not_found`；
-- source pin 与 target guard 不是跨两个 Location 的原子事务；
-- quarantine 只有查询和 break-glass，没有自动权威对账；
-- source failure backoff 为进程内状态，且错误分类仍是聚合 `ErrorCode`；
-- 单 coordinator 的控制请求吞吐需要随并发单独验收；
-- Provider 是否异步、是否具备全局 ops/bytes admission 不由本方案保证。
-
-后续工作按实际指标触发：
-
-1. 远端支持 caller request ID 幂等和按 operation 查询；
-2. task registry 持久化并引入 topology/provider epoch；
-3. Provider 增加 ops/bytes admission 和有界队列；
-4. query 改为 POST body、long-poll 或完成事件；
-5. KVCM 增加 completion queue、持久 unknown-rate breaker 和普通 safe-release；
-6. 引入权威 stale-source 清理机制。
-
-在这些能力完成前，不能声明：
-
-- timeout 或 `not_found` 后目标可以自动回收；
-- 远端重启对在途 Copy 完全透明；
-- 可以无条件提高 Copy 并发；
-- 异步化会降低物理 Copy RT；
-- 存在 guard 时可以回滚到不识别 guard 的旧二进制。
-
-V1 的取舍是：复用现有远端异步任务协议，先解除 KVCM 长阻塞，并用持久 guard、恢复、容量 gate 和
-fail-closed quarantine 保证目标生命周期安全。更深的 Provider 改造由真实负载和故障数据决定。
+proto 的 `MigrationConfig` 将字段号 6、7 及名称 `copy_max_quarantine_operations`、`copy_max_quarantine_bytes` 声明为 reserved，不能复用为其他含义；它们不是可用配置项。

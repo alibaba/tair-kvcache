@@ -46,9 +46,8 @@ class RequestContext;
  *     供写路径批量查询并由 StartWriteCache 消费。打标天然随元数据持久化，
  *     crash 后自动可见（继续按持久化的 Mark 迁移）。
  *
- * 同步路径沿用 CLS_WRITING；原生异步路径额外在 CacheLocation 中持久化
- * migration_copy_guard。guard 是跨重启的回收权威：没有 terminal + drained
- * 证明时目标只能 quarantine，不能交给 Reclaimer/GC 当普通 orphan 回收。
+ * Copy 任务只保留在当前 Leader 内存；切主后不恢复任务，遗留 WRITING 走普通清理。
+ * PACE 必须保证 Copy 与 Delete 并发安全（busy 时保留 GA，完成后再重试删除）。
  * MigrationManager 维护一个活跃任务集合（instance_id + block_key）用于防重复迁移与并发预算统计。
  *
  * 线程模型：Reclaimer 的 Prepare 与所有 Copy/迁移 cleanup 在共享 SchedulePlanExecutor 中执行，
@@ -58,7 +57,7 @@ class MigrationManager : public std::enable_shared_from_this<MigrationManager> {
 public:
     // 一条 Copy 迁移请求：把 instance/block 下 src_location 的数据复制到 dst_storage。
     struct MigrationRequest {
-        std::string instance_group_name; // Copy 并发限流作用域；空表示未启用 group 限流（测试/内部直调）
+        std::string instance_group_name; // ASYNC_REQUIRED 必填（字节额度作用域）；SYNC 内部直调可空
         std::string instance_id;
         int64_t block_key = 0;
         std::string src_location_id;
@@ -66,16 +65,16 @@ public:
         std::string dst_storage_name; // 目标 storage（冷层）
         MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
         MigrationCopyExecutionMode copy_execution_mode = MigrationCopyExecutionMode::SYNC;
-        uint64_t copy_max_inflight_bytes = 0;
-        int64_t copy_max_quarantine_operations = 0;
-        uint64_t copy_max_quarantine_bytes = 0;
+        uint64_t copy_max_inflight_bytes = 0; // ASYNC_REQUIRED 必须显式提供非零额度
         AsyncCopyOptions async_copy_options;
         std::string async_operation_id;
         // admission 已定位的源 location 信息，避免批量提交时冗余 BatchGetLocation。
-        // DispatchMigrationBatch 生成的 prepared request 必须非空；单条 Submit 可留空，由
-        // PrepareCopyTask 兼容性地重读 meta。
+        // DispatchMigrationBatch 和 ASYNC_REQUIRED Submit 必须非空；只有 SYNC Submit
+        // 可留空，由 PrepareCopyTask 兼容性地重读 meta。
         std::vector<LocationSpec> src_specs;
         int64_t src_create_time = 0;
+        std::string src_location_value;
+        StorageBackendSnapshot storage_backends;
     };
 
     // Copy 提交的 group 级硬上限。BatchSubmit 在短准入锁 + task_mutex_ 内统计 active 并 reserve，
@@ -102,21 +101,11 @@ public:
         uint64_t async_copy_unknown = 0;
         uint64_t async_copy_inflight_operations = 0;
         uint64_t async_copy_inflight_bytes = 0;
-        uint64_t async_copy_quarantine_operations = 0;
-        uint64_t async_copy_quarantine_bytes = 0;
         uint64_t marks_added = 0;
         uint64_t marks_cleared = 0;
         size_t active_copy_tasks = 0;
         size_t source_failure_entries = 0;
         size_t active_marks = 0;
-    };
-
-    struct AsyncCopyQuarantineRecord {
-        std::string instance_group_name;
-        std::string instance_id;
-        int64_t block_key = 0;
-        std::string target_location_id;
-        MigrationCopyGuard guard;
     };
 
     MigrationManager(std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor,
@@ -131,20 +120,8 @@ public:
     MigrationManager(const MigrationManager &) = delete;
     MigrationManager &operator=(const MigrationManager &) = delete;
 
-    ErrorCode Start();
+    void Start();
     void Stop();
-
-    // Persistent quarantine is rebuilt before new migration admission on
-    // every leader start.  Listing is read-only.  Break-glass release is an
-    // explicitly fenced operation and requires non-empty operator/evidence;
-    // ordinary timeout/age is never accepted as evidence.
-    std::vector<AsyncCopyQuarantineRecord>
-    ListAsyncCopyQuarantine(const std::string &instance_group_name = "") const;
-    ErrorCode BreakGlassReleaseAsyncCopy(const std::string &operation_id,
-                                         const std::string &operator_name,
-                                         const std::string &external_fencing_evidence);
-    bool HasAsyncCopyStorageReference(const std::string &storage_name) const;
-    bool HasAsyncCopyInstanceReference(const std::string &instance_id) const;
 
     // ---- Copy 路径 ----
     // 同步完成"建目标 location + 提交 copy 任务"，copy 字节复制异步执行；
@@ -154,12 +131,13 @@ public:
     ErrorCode Submit(const std::string &trace_id, MigrationRequest request);
 
     // ---- copy 任务完成回调（监控线程驱动，亦可供测试直接调用） ----
-    // Return false only when a guard CAS was applied but its persistent Sync
-    // barrier is still unconfirmed.  MonitorLoop retains the completed backend
-    // result and retries the barrier without reissuing the CAS or the Copy.
+    // false means a successful promote still awaits its metadata Sync barrier.
     bool OnTaskSuccess(const std::string &instance_id, int64_t block_key);
     bool OnTaskFailed(const std::string &instance_id, int64_t block_key, ErrorCode reason);
-    bool OnTaskUnknown(const std::string &instance_id, int64_t block_key, const std::string &reason);
+    bool OnTaskUnknown(const std::string &instance_id,
+                       int64_t block_key,
+                       const std::string &reason,
+                       bool record_completion = true);
 
     // ---- Mark 路径（MetaIndexer 持久化：block 级 property，随元数据落 Redis + local cache） ----
     // 打标/清标走 ReadModifyWriteBlock 只写 property（不动 location）；查标走 GetProperties。
@@ -241,7 +219,6 @@ public:
         kTargetWritingExists,   // 目标 storage 上存在 WRITING 副本（可能为其他迁移半成品）
         kSourceServingNotFound, // 源 storage 上没有 SERVING 副本，无可复制源
         kSourceRetrySuppressed, // 尚未被目标覆盖的源均处于失败退避，当前不应再次提交 Copy
-        kSourcePinnedByGuard,   // 源被另一条持久异步 Copy guard 钉住，不能并行派生新迁移
     };
 
     struct CopyAdmission {
@@ -249,15 +226,17 @@ public:
         const CacheLocation *src_location = nullptr; // 仅 kAccept 时有效
     };
 
-    // 在某个候选 block 上做 Copy 准入判断（无副作用）。
+    // 在某个候选 block 上做迁移准入判断（不修改元数据；Copy 退避可能更新统计）。
     // - instance_id/block_key：候选 block 的实例作用域与 block id；
     // - loc_map：该 block 当前所有 CacheLocation（来自 MetaSearcher::BatchGetLocation）；
-    // - src_storage_name / dst_storage_name：迁移源/目标 storage 的 unique name。
+    // - src_storage_name / dst_storage_name：迁移源/目标 storage 的 unique name；
+    // - apply_copy_backoff：MARK 不读取旧源，跳过 Copy 失败退避，但保留全部结构校验。
     CopyAdmission CheckCopyAdmission(const std::string &instance_id,
                                      int64_t block_key,
                                      const CacheLocationMap &loc_map,
                                      const std::string &src_storage_name,
-                                     const std::string &dst_storage_name) const;
+                                     const std::string &dst_storage_name,
+                                     bool apply_copy_backoff = true) const;
 
     // ---- 编排入口（API 触发，供 CacheManager::MigrateCache 薄 facade 调用）----
     // 承载迁移编排本身：候选选择 + location 批查(MetaSearcher) + 逐 block 准入(CheckCopyAdmission)
@@ -291,17 +270,18 @@ public:
     struct DispatchBatchParams {
         bool do_copy = false;
         bool do_mark = false;
-        // max_copy_slots 是调用方本批次的提前剪枝；copy_limit 是 BatchSubmit 内的原子硬限制。
+        // 有 group 硬限制时，max_copy_slots 仅用于零空闲 slot 的快速剪枝，不能按候选数
+        // 截断：候选可能因字节不足被拒，仍需尝试后续较小项。没有 group 硬限制的内部
+        // 调用继续使用本批次软上限；实际 group 并发/字节准入由 BatchSubmit 原子执行。
         std::size_t max_copy_slots = SIZE_MAX;
         CopyConcurrencyLimit copy_limit;
         MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
         MigrationCopyExecutionMode copy_execution_mode = MigrationCopyExecutionMode::SYNC;
         uint64_t copy_max_inflight_bytes = 0;
-        int64_t copy_max_quarantine_operations = 0;
-        uint64_t copy_max_quarantine_bytes = 0;
         AsyncCopyOptions async_copy_options;
         int64_t mark_timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;
         bool dedup_marks = false; // true=跳过已打标的 block（reclaimer 用；Admin 显式指定 block 不需要）
+        StorageBackendSnapshot storage_backends;
     };
     struct DispatchBatchResult {
         int64_t copy_submitted = 0;
@@ -320,6 +300,7 @@ public:
         std::vector<int64_t> block_keys;
         std::vector<std::vector<std::string>> pending_location_ids_by_block;
         std::function<void(const DispatchBatchResult &)> on_dispatched;
+        StorageBackendSnapshot storage_backends;
     };
 
     // 同一路由最多保留一个 queued/running Prepare。返回 true 仅表示 Job 已入队；实际
@@ -364,20 +345,6 @@ private:
     //   kCancelling —— 外部已请求取消，收尾推迟到 future 完成时由 monitor 执行（删 WRITING 目标、不 promote）。
     enum class CopyTaskState { kPreparing, kPrepareCancelling, kRunning, kCompleting, kCancelling };
 
-    enum class GuardMutationResult {
-        kNotApplied,
-        kAppliedDurably,
-        kAppliedDurabilityUnknown,
-    };
-
-    enum class CopyCompletionAction {
-        kNone,
-        kSuccess,
-        kFailed,
-        kCancelled,
-        kUnknown,
-    };
-
     // 单个活跃 Copy 任务的上下文。
     struct CopyTaskContext {
         std::string instance_group_name;
@@ -391,27 +358,17 @@ private:
         MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
         MigrationCopyExecutionMode copy_execution_mode = MigrationCopyExecutionMode::SYNC;
         std::string async_operation_id;
-        std::vector<std::string> async_backend_task_ids;
-        int64_t async_guard_create_time_us = 0;
         bool async_credit_active = false;
-        // Guard transitions are serialized per operation.  The mutex is shared
-        // by copied task snapshots so Cancel, remote-acceptance persistence and
-        // completion cannot concurrently finalize the same operation, while
-        // unrelated operations remain parallel.
-        std::shared_ptr<std::mutex> async_transition_mutex;
-        // A final status CAS has already changed the logical Location, but the
-        // persistent Sync barrier timed out.  Retried completion must only call
-        // Sync; reissuing the CAS would observe the new status and manufacture
-        // a false UNKNOWN/quarantine record.
-        bool async_guard_finalization_pending_sync = false;
-        bool completion_was_cancelling = false;
-        CopyCompletionAction async_guard_pending_action = CopyCompletionAction::kNone;
-        std::string async_guard_pending_reason;
+        // Only the durable barrier is retried after a successful atomic promotion.
+        bool promotion_pending_sync = false;
+        std::string src_location_value;
+        std::string dst_location_value;
         std::chrono::steady_clock::time_point submit_time;
         uint64_t total_bytes = 0;     // 源端各 spec 字节数之和（取自 uri size 参数）
         std::string mark_target;      // 提交时 mark 的 target（空=无 mark，用于 match-clear）
         int64_t mark_deadline_ms = 0; // 提交时 mark 的 deadline（用于 match-clear）
         CopyTaskState state = CopyTaskState::kRunning; // 收尾认领状态
+        StorageBackendSnapshot storage_backends;
     };
 
     // Copy 后端当前只向 MigrationManager 返回聚合 ErrorCode，无法可靠区分 source 永久失效、
@@ -461,16 +418,14 @@ private:
         size_t expected_items = 0;
         std::future<PlanExecuteResult> future;
         bool native_async = false;
-        std::future<AsyncCopyRemoteSubmitResult> remote_submit_future;
-        bool remote_submit_processed = true;
         std::optional<PlanExecuteResult> completed_result;
         std::chrono::steady_clock::time_point completion_retry_after{};
+        StorageBackendSnapshot storage_backends;
+        std::string async_operation_id;
     };
 
-    // An async Copy is not fully cleaned up when its target/source metadata is
-    // merely queued for deletion. Keep a reference until the executor finishes
-    // the physical delete so RemoveStorage cannot close the backend underneath
-    // the cleanup task.
+    // Retain cleanup until it succeeds or its original backend is unregistered.
+    // Administrative retirement ends it as failure, never as physical-delete success.
     struct PendingLocationCleanup {
         std::string instance_id;
         std::string storage_name;
@@ -507,40 +462,21 @@ private:
     void SubmitSourceLocationDelete(const CopyTaskContext &ctx);
     // Copy 成功回调收尾前，确认源 location 仍可作为有效源副本。
     bool IsSourceLocationServing(const CopyTaskContext &ctx) const;
+    void RecordCopySubmission(const CopyTaskContext &ctx, const std::string &trace_id);
+    // Pre-submit rollback owns the same cleanup, but is not a submitted task's terminal event.
     bool CompleteCopyTaskAsFailed(const CopyTaskContext &ctx,
                                   const std::string &fail_reason,
-                                  bool remote_side_effect_possible = true);
+                                  bool record_completion = true);
     bool OnTaskFailedInternal(const std::string &instance_id,
                               int64_t block_key,
                               ErrorCode reason,
                               const std::string &fail_reason,
-                              bool remote_side_effect_possible,
-                              bool record_source_failure);
+                              bool record_source_failure,
+                              bool record_completion = true);
     bool CompleteCopyTaskAsSucceeded(const CopyTaskContext &ctx);
-    bool CompleteCopyTaskAsUnknown(const CopyTaskContext &ctx, const std::string &fail_reason);
-    bool HasDurableUnknownGuard(const CopyTaskContext &ctx) const;
-    GuardMutationResult UpdateAsyncCopyGuard(const CopyTaskContext &ctx,
-                                             MigrationCopyGuardState expected_state,
-                                             MigrationCopyGuardState state,
-                                             const std::vector<std::string> &backend_task_ids,
-                                             const std::string &last_error);
-    GuardMutationResult FinalizeAsyncCopyGuard(const CopyTaskContext &ctx,
-                                               MigrationCopyGuardState expected_state,
-                                               CacheLocationStatus new_status);
-    static MigrationCopyGuardState ExpectedGuardState(const CopyTaskContext &ctx);
-    std::shared_ptr<std::mutex> GetAsyncTransitionMutex(const std::string &instance_id, int64_t block_key) const;
-    void MarkGuardFinalizationPendingSync(const CopyTaskContext &ctx,
-                                          CopyCompletionAction action,
-                                          const std::string &reason = "");
-    void MarkUnknownGuardPersistencePending(const CopyTaskContext &ctx, const std::string &reason, bool sync_only);
-    bool ResumePendingGuardFinalization(const CopyTaskContext &ctx);
-    bool PersistRemoteAsyncCopyAcceptance(const std::string &instance_id,
-                                          int64_t block_key,
-                                          size_t expected_items,
-                                          const AsyncCopyRemoteSubmitResult &remote_result,
-                                          CopyTaskContext &out_ctx,
-                                          bool &out_cancel_requested);
-    void SubmitPreparedTargetLocationDelete(const CopyTaskContext &ctx);
+    bool CompleteCopyTaskAsUnknown(const CopyTaskContext &ctx,
+                                   const std::string &fail_reason,
+                                   bool record_completion = true);
     void TrackLocationCleanup(const std::string &instance_id,
                               const std::string &storage_name,
                               CacheLocationDelRequest request,
@@ -548,9 +484,6 @@ private:
     void ProcessCompletedLocationCleanups();
     bool ReserveAsyncCopyCredit(const MigrationRequest &request, uint64_t total_bytes);
     void ReleaseAsyncCopyCredit(const CopyTaskContext &ctx);
-    void MoveAsyncCopyCreditToQuarantine(const CopyTaskContext &ctx, const std::string &reason);
-    bool RestoreAsyncCopyInflightCredit(const CopyTaskContext &ctx);
-    bool RecoverAsyncCopyGuards();
     void RecordCopySourceFailure(const CopyTaskContext &ctx, ErrorCode reason);
     void ClearCopySourceFailure(const CopyTaskContext &ctx);
     CopySourceFailureSnapshot GetCopySourceFailure(const std::string &instance_id,
@@ -617,15 +550,13 @@ private:
     enum class ClaimResult {
         kClaimedRunning,
         kWasCancelling,
-        kRetryingGuardTransition,
+        kRetryingPromotion,
         kBusyPreparing,
         kBusyCompleting,
         kNotFound,
     };
     // monitor 完成路径认领：kRunning→置 kCompleting 并拷 ctx（kClaimedRunning）；
-    // kCancelling→置 kCompleting，记住 cancellation owner 并返回 kWasCancelling，交由
-    // CompleteCancelledTask 唯一收尾。已认领收尾但 guard 跃迁或其 Sync 屏障尚未
-    // 持久确认时返回 kRetryingGuardTransition。
+    // kCancelling→置 kCompleting 返回 kWasCancelling；已 promote 但 Sync 未完成时返回 kRetryingPromotion。
     ClaimResult ClaimForCompletionLocked(const std::string &instance_id, int64_t block_key, CopyTaskContext &out_ctx);
     enum class CancelResult { kMarked, kMarkedPreparing, kAlreadyCancelling, kBusyCompleting, kNotFound };
     // 外部 Cancel 认领：kPreparing→kPrepareCancelling（由提交线程清理）；
@@ -633,7 +564,7 @@ private:
     CancelResult MarkCancellingLocked(const std::string &instance_id, int64_t block_key);
     // 取消任务的延迟收尾（monitor 线程，入口不持锁）：删 WRITING 目标（源不动）+ 移除活跃任务
     // + cancelled 终态 metric/event/log。仅由 OnTaskSuccess/OnTaskFailed 在认领到 kWasCancelling 时调用。
-    bool CompleteCancelledTask(const CopyTaskContext &ctx);
+    bool CompleteCancelledTask(const CopyTaskContext &ctx, bool record_completion = true);
 
     struct AsyncMigrationPrepareKey {
         std::uint64_t generation = 0;
@@ -694,15 +625,12 @@ private:
     struct AsyncCopyGroupUsage {
         uint64_t inflight_operations = 0;
         uint64_t inflight_bytes = 0;
-        uint64_t quarantine_operations = 0;
-        uint64_t quarantine_bytes = 0;
     };
     mutable std::mutex async_copy_usage_mutex_;
-    // Exact operation-id ledger makes inflight -> released/quarantine credit a
+    // Exact operation-id ledger makes inflight -> released credit a
     // one-way, exactly-once transition even if an error path is retried.
     std::unordered_set<std::string> async_copy_inflight_operation_ids_;
     std::unordered_map<std::string, AsyncCopyGroupUsage> async_copy_usage_by_group_;
-    std::unordered_map<std::string, AsyncCopyQuarantineRecord> async_copy_quarantine_by_operation_;
 
     // 监控线程待处理队列。
     std::mutex pending_mutex_;

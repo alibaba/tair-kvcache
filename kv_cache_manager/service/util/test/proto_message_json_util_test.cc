@@ -50,6 +50,49 @@ TEST(ProtoConvertTest, MemoryPrimaryRoundTrip) {
     EXPECT_TRUE(config.meta_indexer_config()->GetMetaStorageBackendConfig()->GetForceDeletingAsyncEnqueue());
 }
 
+TEST(ProtoConvertTest, MigrationCopyLimitDefaultsAndExplicitValues) {
+    struct TestCase {
+        const char *json;
+        int64_t concurrency;
+        uint64_t bytes;
+        bool valid;
+    };
+    const TestCase cases[] = {
+        {R"({})", 64, 34359738368ULL, true},
+        {R"({"migration_config":{}})", 64, 34359738368ULL, true},
+        {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED"}})", 64, 34359738368ULL, true},
+        {R"({"migration_config":{"copy_max_concurrency":6,"copy_max_inflight_bytes":"12884901888"}})",
+         6,
+         12884901888ULL,
+         true},
+        {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED","copy_max_inflight_bytes":"0"}})",
+         64,
+         0,
+         false},
+        {R"({"migration_config":{"copy_max_concurrency":0}})", 0, 34359738368ULL, false},
+    };
+    for (const auto &test : cases) {
+        SCOPED_TRACE(test.json);
+        proto::admin::CacheConfig request;
+        ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(test.json, &request));
+        CacheConfig config;
+        config.set_migration_copy_max_concurrency(2);
+        config.set_migration_copy_max_inflight_bytes(64);
+        ProtoConvert::CacheConfigFromProto(&request, config);
+        EXPECT_EQ(test.concurrency, config.migration_copy_max_concurrency());
+        EXPECT_EQ(test.bytes, config.migration_copy_max_inflight_bytes());
+        std::string invalid_fields;
+        EXPECT_EQ(test.valid, config.migration_config().ValidateRequiredFields(invalid_fields)) << invalid_fields;
+
+        proto::admin::CacheConfig round_trip;
+        ProtoConvert::CacheConfigToProto(config, &round_trip);
+        ASSERT_TRUE(round_trip.migration_config().has_copy_max_concurrency());
+        ASSERT_TRUE(round_trip.migration_config().has_copy_max_inflight_bytes());
+        EXPECT_EQ(test.concurrency, round_trip.migration_config().copy_max_concurrency().value());
+        EXPECT_EQ(test.bytes, round_trip.migration_config().copy_max_inflight_bytes().value());
+    }
+}
+
 namespace {
 
 bool ProtobufToJson(const google::protobuf::Message &message, std::string *json) {
@@ -124,7 +167,6 @@ TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesUnsignedMigrationLimits) {
         SCOPED_TRACE(value);
         proto::admin::MigrationConfig message;
         message.mutable_copy_max_inflight_bytes()->set_value(value);
-        message.mutable_copy_max_quarantine_bytes()->set_value(value);
         ASSERT_TRUE(FastProtoJsonCodec::Supports(message.GetDescriptor()));
 
         std::string json;

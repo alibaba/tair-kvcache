@@ -1,7 +1,6 @@
 #include "kv_cache_manager/service/server.h"
 
 #include <cinttypes>
-#include <algorithm>
 #include <cstdio>
 #include <grpcpp/grpcpp.h>
 
@@ -38,10 +37,6 @@
 #include "kv_cache_manager/service/meta_service_impl.h"
 
 namespace kv_cache_manager {
-
-namespace {
-constexpr int64_t kLeaderRecoveryFailureCampaignBackoffMs = 5000;
-}
 
 bool Server::Init(const ServerConfig &config) {
     KVCM_LOG_INFO("begin server init...\n");
@@ -139,7 +134,6 @@ void Server::OnBecomeLeader() {
     ErrorCode ec = registry_manager_->DoRecover();
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("registry_manager recover failed");
-        AbortLeaderRecovery("registry_manager", ec);
         return;
     }
 
@@ -155,25 +149,15 @@ void Server::OnBecomeLeader() {
     ec = cache_manager_->DoRecover();
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("cache_manager recover failed");
-        AbortLeaderRecovery("cache_manager", ec);
-        return;
-    }
-    // MigrationManager performs the persistent async-Copy guard recovery
-    // barrier synchronously.  Reclaimer and GC must not run before that scan
-    // has rebuilt active/query and quarantine accounting.
-    ec = cache_manager_->StartMigrationManager();
-    if (ec != EC_OK) {
-        KVCM_LOG_ERROR("migration manager guard recovery/start failed, ec[%d]", static_cast<int>(ec));
-        AbortLeaderRecovery("migration_manager", ec);
         return;
     }
     ec = cache_manager_->StartCacheGarbageCollector();
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("cache garbage collector start failed, ec[%d]", static_cast<int>(ec));
-        AbortLeaderRecovery("cache_garbage_collector", ec);
         return;
     }
     cache_manager_->ResumeReclaimer();
+    cache_manager_->StartMigrationManager();
 
     if (leader_elector_->RunIfCurrentPromotionValid([this]() {
             meta_impl_->EnableLeaderOnlyRequests();
@@ -186,22 +170,6 @@ void Server::OnBecomeLeader() {
     } else {
         KVCM_LOG_INFO("recover finished after leadership was revoked, cleanup required");
     }
-}
-
-void Server::AbortLeaderRecovery(const char *stage, ErrorCode ec) {
-    // Keeping the lease while leader-only APIs remain disabled creates a
-    // wedged cluster.  Fail this promotion attempt explicitly and delay this
-    // node's next campaign so another replica can recover.  The normal demote
-    // callback performs whatever partial cleanup is needed.
-    meta_impl_->DisableLeaderOnlyRequests();
-    admin_impl_->DisableLeaderOnlyRequests();
-    const int64_t current_backoff = leader_elector_->GetForbidCampaignLeaderTimeMs();
-    leader_elector_->SetForbidCampaignLeaderTimeMs(std::max(current_backoff, kLeaderRecoveryFailureCampaignBackoffMs));
-    KVCM_LOG_ERROR("leader recovery aborted at stage %s, ec[%d]; demoting with campaign backoff %lld ms",
-                   stage,
-                   static_cast<int>(ec),
-                   static_cast<long long>(leader_elector_->GetForbidCampaignLeaderTimeMs()));
-    leader_elector_->Demote();
 }
 
 void Server::OnNoLongerLeader() {
