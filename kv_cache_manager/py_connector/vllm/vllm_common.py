@@ -873,7 +873,7 @@ def _check_unique_names(metas: List[GroupMeta]) -> None:
 def _transferable_groups(kv_cache_config: Any) -> List[Tuple[int, Any]]:
     """The (vLLM group index, group) pairs this connector may transfer.
 
-    vLLM 0.30+ projects the group list for connectors: KVCacheGroupSpec.
+    vLLM 0.29+ projects the group list for connectors: KVCacheGroupSpec.
     enable_kv_transfer=False marks groups the engine rebuilds itself (ephemeral
     accelerator-side replicas of a transferable source group, e.g. HiSparse's
     resident/hot tiers), and KVCacheConfig.transfer_group_ids / transfer_groups
@@ -889,7 +889,7 @@ def _transferable_groups(kv_cache_config: Any) -> List[Tuple[int, Any]]:
     the ledger plus every consumer index by it. Renumbering to the projected
     position would pair our metas with another group's block table.
 
-    Eras without the attribute (vLLM <= 0.29) expose every group; the flag
+    Eras without the attribute (vLLM <= 0.28) expose every group; the flag
     arrived with the groups it describes.
     """
     groups = kv_cache_config.kv_cache_groups
