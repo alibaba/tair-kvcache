@@ -915,13 +915,13 @@ class ConnectorScheduler:
             meta.add_save_request(save_req)
             ledger.sent_saving_count += 1
             # This session's plan is in the worker's hands from here on. It no
-            # longer protects captured blocks: the worker runs save plans
-            # before release instructions within a step (wait_for_save), and any
-            # release the scheduler computed while this session was still
-            # in flight already excluded its blocks -- so once the plan is
-            # handed over, a later mask-derived release can only return bytes
-            # the plan did not take (kept for a retry when its write failed,
-            # see _save_staged_blocks).
+            # longer protects captured blocks: the worker runs capture, then
+            # release instructions, then save plans within a step
+            # (wait_for_save), and any release the scheduler computed while this
+            # session was still in flight already excluded its blocks -- so once
+            # the plan is handed over, a later mask-derived release can only
+            # return bytes the plan did not take (kept for a retry when its
+            # write failed, see _save_staged_blocks).
             self._retire_session_protection(save_req.req_id, save_req.session_id)
             if (
                 ledger.need_report_after_saving_finished
