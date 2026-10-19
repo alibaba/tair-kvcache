@@ -32,6 +32,10 @@ from kv_cache_manager.py_connector.vllm.data_transfer import (
     total_pinned_bytes,
 )
 from kv_cache_manager.py_connector.vllm.transfer_types import KVLayout
+from kv_cache_manager.py_connector.vllm.vllm_common import (
+    AttentionGroupMeta,
+    RowGranularMeta,
+)
 from kv_cache_manager.py_connector.common.tp_coordinator import CoordinateMsgSerializer
 
 
@@ -675,6 +679,74 @@ class TestStagingShapes(unittest.TestCase):
             staging_shape(attn_group, QWEN35_MBS, KV_DTYPE),
             group_meta_shape(attn_meta, KV_DTYPE),
         )
+
+
+class TestRowGranularStaging(unittest.TestCase):
+    """A compressed bucket stages rows, not tokens (PR6).
+
+    The staging view the gather/scatter kernel writes has `mbs // tokens_per_row`
+    rows per manager block and each row is the bucket's own row: getting this
+    from the manager block size would over-read the tensor by a factor of the
+    ratio (and mis-size every slot's sub-view).
+    """
+
+    def _group(self, *, tokens_per_row: int, rows_per_page: int, row_bytes: int):
+        from kv_cache_manager.py_connector.vllm.transfer_types import (
+            AttentionTransferGroup,
+        )
+
+        return AttentionTransferGroup(
+            group_idx=0,
+            spec_name="tp0_g0",
+            layer_names=["l0"],
+            block_size=rows_per_page * tokens_per_row,
+            per_block_bytes=row_bytes * (256 // tokens_per_row),
+            layer_num=1,
+            kv_layout=KVLayout.MLA_3D,
+            kvcache_ptr_tensor_gpu=None,  # ty: ignore[invalid-argument-type]
+            num_kv_ptrs=1,
+            per_token_dim=row_bytes,
+            kernel_block_size=rows_per_page,
+            block_stride=0,
+            dtype=KV_DTYPE,
+            tokens_per_row=tokens_per_row,
+        )
+
+    def test_staging_view_rows_follow_the_row_granularity(self):
+        import torch
+
+        from kv_cache_manager.py_connector.vllm.data_transfer import (
+            DataTransferManager,
+        )
+
+        manager = DataTransferManager.__new__(DataTransferManager)
+        manager._manager_block_size = 256
+        buffer = torch.zeros(256 * 584, dtype=torch.uint8)
+        token_granular = self._group(tokens_per_row=1, rows_per_page=64, row_bytes=584)
+        compressed = self._group(tokens_per_row=2, rows_per_page=32, row_bytes=584)
+        self.assertEqual(256, manager._attn_rows_per_block(token_granular))
+        self.assertEqual(128, manager._attn_rows_per_block(compressed))
+        view = manager._attn_staging_view(buffer, compressed, batch=1)
+        self.assertEqual(view.shape, (1, 1, 128, 584))
+
+    def test_the_pool_key_normalizes_a_row_granular_bucket(self):
+        # The arena key stays per-token (the PR2 contract) and a compressed
+        # bucket derives it from its rows: 584 B/row over 2 tokens is 292 B per
+        # token, which is what a token-granular bucket of the same row shape
+        # would key with.
+        compressed = self._group(tokens_per_row=2, rows_per_page=32, row_bytes=584)
+        shape = staging_shape(compressed, 256, KV_DTYPE)
+        self.assertEqual(292, shape.per_token_bytes)
+        self.assertEqual(584 * 128, shape.per_block_bytes)
+        meta = AttentionGroupMeta(
+            group_idx=0,
+            layer_names=["l0"],
+            block_size=64,
+            per_block_bytes=584 * 128,
+            page_bytes=32 * 584,
+            row_granular=RowGranularMeta(2, 32, 584),
+        )
+        self.assertEqual(shape, group_meta_shape(meta, KV_DTYPE))
 
 
 class TestPinnedTotals(unittest.TestCase):

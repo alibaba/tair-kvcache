@@ -332,6 +332,18 @@ class TestGoldenDrift(unittest.TestCase):
                             frozen["real_page_size_bytes"]
                             // frozen["storage_block_size"],
                         )
+                        if "bytes_per_row" in frozen:
+                            # The row-granular facts (PR6) are the golden's own
+                            # measured column: one row per tokens_per_state
+                            # tokens, one page per block-table entry.
+                            self.assertEqual(
+                                golden_spec["bytes_per_storage_row"],
+                                frozen["bytes_per_row"],
+                            )
+                            self.assertEqual(
+                                golden_spec["real_page_size_bytes"],
+                                frozen["rows_per_page"] * frozen["bytes_per_row"],
+                            )
                         if "page_size_padded_before_grouping" in frozen:
                             # The V4 state rows record the *grouped* padding
                             # (37440) while their own alignment gives 32832.

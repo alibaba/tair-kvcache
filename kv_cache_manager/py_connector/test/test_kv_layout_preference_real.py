@@ -72,6 +72,16 @@ def _skip_reason() -> str:
         return "vLLM is shadowed by the test stubs in this process"
     if _CONNECTOR_ERROR:
         return f"the connector is not importable ({_CONNECTOR_ERROR})"
+    # The layout predicate resolves the architecture through the engine's
+    # model registry, which needs the compiled extension; a minimal install
+    # (the unit-test container's venv without vllm._C) cannot exercise the
+    # real resolution -- the host suites cover it.
+    try:
+        # importlib, not an import statement: a function-local
+        # "import vllm..." would shadow the module-level binding above.
+        importlib.import_module("vllm.model_executor.models.registry")
+    except ImportError as exc:
+        return f"the engine registry is not importable ({exc})"
     return ""
 
 

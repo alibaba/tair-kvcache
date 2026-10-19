@@ -124,6 +124,18 @@ py_test(
     ],
 )
 
+# The DSA V4.1 row-granular data plane (PR6): the address math against the
+# survey's measured token -> (page, row) table, the mbs / block-size
+# preconditions, the V4.1 bucket structure and the packed-group announcement
+# guard. Stand-in ring only (no vLLM); the real-class anchor for the same specs
+# is test_spec_gate_real / test_mla_spec_facts.
+py_test(
+    name = "test_dsa_v41",
+    srcs = ["test_dsa_v41.py"],
+    tags = ["no-remote-exec"],
+    deps = [":vllm_stubs"],
+)
+
 py_test(
     name = "test_role_views",
     srcs = ["test_role_views.py"],
