@@ -4,6 +4,7 @@
 #include <cassert>
 #include <climits>
 #include <exception>
+#include <limits>
 #include <typeinfo>
 #include <unordered_set>
 #include <utility>
@@ -21,6 +22,7 @@
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
 #include "kv_cache_manager/meta/reclaim_indexer/reclaim_indexer_factory.h"
+#include "kv_cache_manager/meta/storage_usage_data.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 
 namespace kv_cache_manager {
@@ -183,6 +185,7 @@ ErrorCode MetaStorageBackendManager::Open() noexcept {
         KVCM_LOG_ERROR("persistent backend not inited! instance[%s]", instance_id_.c_str());
         return EC_ERROR;
     }
+    recovered_metadata_.clear();
 
     ErrorCode ec = persistent_backend_->Open();
     if (ec != EC_OK) {
@@ -198,6 +201,20 @@ ErrorCode MetaStorageBackendManager::Open() noexcept {
     is_closed_.store(false, std::memory_order_release);
 
     if (!cache_backend_) {
+        if (persistent_backend_->GetStorageType() != META_LOCAL_BACKEND_TYPE_STR &&
+            reclaim_indexers_.count("node_lru") != 0) {
+            recover_state_.store(RecoverState::kRecover, std::memory_order_release);
+            ec = RecoverSingleBackendIndexes();
+            if (ec != EC_OK) {
+                is_closed_.store(true, std::memory_order_release);
+                const ErrorCode close_ec = persistent_backend_->Close();
+                KVCM_LOG_ERROR("single-backend index recovery failed, instance[%s] ec[%d] rollback_close_ec[%d]",
+                               instance_id_.c_str(),
+                               ec,
+                               close_ec);
+                return ec;
+            }
+        }
         recover_state_.store(RecoverState::kRunning, std::memory_order_release);
         opened_ = true;
         KVCM_LOG_INFO("meta storage backend manager opened in single-backend mode, instance[%s]", instance_id_.c_str());
@@ -285,6 +302,158 @@ ErrorCode MetaStorageBackendManager::Close() noexcept {
     opened_ = false;
     KVCM_LOG_INFO("meta storage backend manager closed, instance[%s]", instance_id_.c_str());
     return EC_OK;
+}
+
+ErrorCode MetaStorageBackendManager::RecoverSingleBackendIndexes() noexcept {
+    // Open holds the lifecycle lock and the owner has not published this
+    // manager to requests. Unlike dual-backend recovery, there is no cache
+    // PutIfAbsent fence, so this scan must finish before accepting writes.
+    // Redis SCAN can repeat keys: keep one temporary key set for exact counts.
+    // The index is rebuilt in a separate map so failures/reopens never expose
+    // a partially recovered or previous-generation index.
+    try {
+        std::unordered_map<std::string, std::unique_ptr<ReclaimIndexer>> indexers;
+        for (const auto &[type, unused] : reclaim_indexers_) {
+            auto indexer = ReclaimIndexerFactory::Create(type);
+            if (!indexer) {
+                return EC_ERROR;
+            }
+            indexers.emplace(type, std::move(indexer));
+        }
+        StorageUsageData usage;
+        usage.Reset();
+        uint64_t total_usage = 0;
+        int64_t key_count = 0;
+        std::unordered_set<KeyType> seen_keys;
+        std::string cursor = SCAN_BASE_CURSOR;
+        do {
+            std::string next_cursor;
+            KeyTypeVec scanned_keys;
+            ErrorCode ec = EC_ERROR;
+            for (int attempt = 0; attempt < kRecoverMaxConsecutiveFailures; ++attempt) {
+                scanned_keys.clear();
+                next_cursor.clear();
+                ec = persistent_backend_->ListKeys(nullptr, cursor, kRecoverScanBatchSize, next_cursor, scanned_keys);
+                if (ec == EC_OK) {
+                    break;
+                }
+            }
+            if (ec != EC_OK) {
+                return ec;
+            }
+            if (next_cursor.empty() || (next_cursor == cursor && cursor != SCAN_BASE_CURSOR)) {
+                return EC_MISMATCH;
+            }
+            KeyTypeVec keys;
+            keys.reserve(scanned_keys.size());
+            for (const auto key : scanned_keys) {
+                if (seen_keys.insert(key).second) {
+                    keys.push_back(key);
+                }
+            }
+            if (!keys.empty()) {
+                CacheLocationMapVector locations;
+                PropertyMapVector properties;
+                std::vector<ErrorCode> results;
+                // Retain these exact keys across Get retries. A second SCAN
+                // at the same cursor need not return the same failed batch.
+                for (int attempt = 0; attempt < kRecoverMaxConsecutiveFailures; ++attempt) {
+                    locations.clear();
+                    properties.clear();
+                    results = persistent_backend_->Get(nullptr, keys, locations, properties);
+                    ec = EC_OK;
+                    if (results.size() != keys.size() || locations.size() != keys.size() ||
+                        properties.size() != keys.size()) {
+                        ec = EC_MISMATCH;
+                    } else {
+                        for (const auto result : results) {
+                            if (result != EC_OK && result != EC_NOENT) {
+                                ec = result;
+                                break;
+                            }
+                        }
+                    }
+                    if (ec == EC_OK) {
+                        break;
+                    }
+                }
+                if (ec != EC_OK) {
+                    return ec;
+                }
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    if (results[i] == EC_NOENT) {
+                        continue;
+                    }
+                    if (key_count == std::numeric_limits<int64_t>::max()) {
+                        return EC_ERROR;
+                    }
+                    ++key_count;
+                    for (const auto &[location_id, location] : locations[i]) {
+                        if (!location || ToIndex(ToBaseType(location->type())) >= ToIndex(DataStorageType::COUNT)) {
+                            return EC_MISMATCH;
+                        }
+                        // All persisted states occupy budget, including
+                        // WRITING and DELETING. spec_size is a count, not bytes.
+                        for (const auto &spec : location->location_specs()) {
+                            const StandardUri uri(spec.uri());
+                            uint64_t size = 0;
+                            if (uri.Valid() && uri.HasParam("size")) {
+                                const std::string value = uri.GetParam("size");
+                                const auto [end, error] =
+                                    std::from_chars(value.data(), value.data() + value.size(), size);
+                                if (error != std::errc{} || end != value.data() + value.size()) {
+                                    return EC_MISMATCH;
+                                }
+                            }
+                            const auto current = usage.GetStorageUsageByType(location->type());
+                            if (size > std::numeric_limits<uint64_t>::max() - current) {
+                                return EC_ERROR;
+                            }
+                            const auto type = ToBaseType(location->type());
+                            if (type != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN && !IsEventReportStorageType(type)) {
+                                if (size > std::numeric_limits<uint64_t>::max() - total_usage) {
+                                    return EC_ERROR;
+                                }
+                                total_usage += size;
+                            }
+                            usage.AddStorageUsageByType(location->type(), size);
+                        }
+                    }
+                }
+                for (auto &[type, indexer] : indexers) {
+                    const auto added = indexer->Add(keys, locations, results);
+                    if (added != results) {
+                        return EC_ERROR;
+                    }
+                }
+            }
+            cursor = std::move(next_cursor);
+        } while (cursor != SCAN_BASE_CURSOR);
+
+        FieldMap metadata;
+        metadata[METADATA_PROPERTY_KEY_COUNT] = std::to_string(key_count);
+        metadata[METADATA_PROPERTY_STORAGE_USAGE_DATA] = usage.Serialize();
+        reclaim_indexers_.swap(indexers);
+        recovered_metadata_.swap(metadata);
+        KVCM_LOG_INFO("single-backend indexes recovered, instance[%s] keys[%ld] storage_usage[%s]",
+                      instance_id_.c_str(),
+                      key_count,
+                      usage.ToJsonString().c_str());
+        return EC_OK;
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("single-backend index recovery raised, instance[%s] error[%s]", instance_id_.c_str(), e.what());
+    } catch (...) {
+        KVCM_LOG_ERROR("single-backend index recovery raised, instance[%s]", instance_id_.c_str());
+    }
+    return EC_ERROR;
+}
+
+bool MetaStorageBackendManager::GetRecoveredMetaData(FieldMap &field_maps) const noexcept {
+    if (recovered_metadata_.empty()) {
+        return false;
+    }
+    field_maps = recovered_metadata_;
+    return true;
 }
 
 void MetaStorageBackendManager::AsyncRecoverTask() noexcept {

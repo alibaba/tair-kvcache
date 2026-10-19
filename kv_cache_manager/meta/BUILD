@@ -92,6 +92,7 @@ cc_library(
         ":meta_local_backend",
         ":meta_redis_backend",
         ":meta_storage_backend",
+        ":storage_usage_data",
         ":types",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:env_util",

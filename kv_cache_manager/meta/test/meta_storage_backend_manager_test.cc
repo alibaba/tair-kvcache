@@ -2,6 +2,7 @@
 #include <dlfcn.h>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -18,6 +19,7 @@
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_redis_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
+#include "kv_cache_manager/meta/storage_usage_data.h"
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
 #include "kv_cache_manager/meta/types.h"
 
@@ -270,6 +272,81 @@ private:
     bool malformed_get_ = false;
     int list_calls_ = 0;
     int get_calls_ = 0;
+};
+
+class SingleBackendRecoverySource : public MetaLocalBackend {
+public:
+    std::string GetStorageType() noexcept override { return META_DUMMY_BACKEND_TYPE_STR; }
+    ErrorCode Open() noexcept override { return EC_OK; }
+    ErrorCode Close() noexcept override {
+        ++close_calls;
+        return EC_OK;
+    }
+    ErrorCode ListKeys(RequestContext *,
+                       const std::string &cursor,
+                       int64_t,
+                       std::string &next_cursor,
+                       KeyTypeVec &keys) noexcept override {
+        ++list_calls;
+        if (list_calls <= scan_failures) {
+            return EC_TIMEOUT;
+        }
+        if (cursor == SCAN_BASE_CURSOR) {
+            keys = {101, 101};
+            next_cursor = "next";
+        } else {
+            keys = {101, 102, 103};
+            next_cursor = SCAN_BASE_CURSOR;
+        }
+        if (bad_cursor) {
+            next_cursor.clear();
+        }
+        return EC_OK;
+    }
+    std::vector<ErrorCode> Get(RequestContext *,
+                               const KeyTypeVec &keys,
+                               CacheLocationMapVector &locations,
+                               PropertyMapVector &properties) noexcept override {
+        ++get_calls;
+        read_batches.push_back(keys);
+        if (malformed_get) {
+            return std::vector<ErrorCode>(keys.size(), EC_OK);
+        }
+        locations.resize(keys.size());
+        properties.resize(keys.size());
+        if (get_calls <= get_failures) {
+            return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
+        }
+        std::vector<ErrorCode> results(keys.size(), EC_OK);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == 103) {
+                results[i] = EC_NOENT; // deleted after SCAN
+                continue;
+            }
+            auto location = std::make_shared<CacheLocation>();
+            location->set_id("loc");
+            location->set_type(keys[i] == 101 ? DataStorageType::DATA_STORAGE_TYPE_HF3FS
+                                              : DataStorageType::DATA_STORAGE_TYPE_NFS);
+            const std::string size =
+                bad_size ? "invalid"
+                         : (overflow && keys[i] == 101 ? std::to_string(std::numeric_limits<uint64_t>::max()) : "100");
+            location->push_location_spec(
+                LocationSpec("spec", "file:///data?size=" + size, keys[i] == 101 ? "nodeA" : "nodeB"));
+            locations[i]["loc"] = std::move(location);
+        }
+        return results;
+    }
+
+    int scan_failures = 0;
+    int get_failures = 0;
+    bool malformed_get = false;
+    bool bad_cursor = false;
+    bool bad_size = false;
+    bool overflow = false;
+    int list_calls = 0;
+    int get_calls = 0;
+    int close_calls = 0;
+    std::vector<KeyTypeVec> read_batches;
 };
 
 class FlakyRecoverCacheBackend : public RecoverContractCacheBackend {
@@ -930,6 +1007,83 @@ TEST_F(MetaStorageBackendManagerTest, TestInitSingleBackend) {
     ASSERT_EQ(EC_OK, mgr.Open());
     ASSERT_EQ(MetaStorageBackendManager::RecoverState::kRunning, mgr.GetRecoverState());
     ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, SingleBackendRecoveryDeduplicatesAndRetriesTheSameReadBatch) {
+    MetaStorageBackendManager mgr;
+    mgr.instance_id_ = "single_recovery";
+    ASSERT_EQ(EC_OK, mgr.InitReclaimIndexers("node_lru"));
+    auto source = std::make_unique<SingleBackendRecoverySource>();
+    auto *raw = source.get();
+    raw->scan_failures = 1;
+    raw->get_failures = 1;
+    mgr.persistent_backend_ = std::move(source);
+    ASSERT_EQ(EC_OK, mgr.Open());
+    EXPECT_EQ(MetaStorageBackendManager::RecoverState::kRunning, mgr.GetRecoverState());
+    EXPECT_EQ(3, raw->list_calls);
+    ASSERT_EQ(3u, raw->read_batches.size());
+    EXPECT_EQ((KeyTypeVec{101}), raw->read_batches[0]);
+    EXPECT_EQ(raw->read_batches[0], raw->read_batches[1]);
+    EXPECT_EQ((KeyTypeVec{102, 103}), raw->read_batches[2]);
+    FieldMap metadata;
+    ASSERT_TRUE(mgr.GetRecoveredMetaData(metadata));
+    EXPECT_EQ("2", metadata[METADATA_PROPERTY_KEY_COUNT]);
+    StorageUsageData usage;
+    ASSERT_EQ(EC_OK, usage.Deserialize(metadata[METADATA_PROPERTY_STORAGE_USAGE_DATA]));
+    EXPECT_EQ(200u, usage.GetStorageUsage());
+    KeyTypeVec sampled;
+    ASSERT_EQ(EC_OK, mgr.SampleReclaimKeys(nullptr, "node_lru", {"nodeA"}, 10, sampled));
+    EXPECT_EQ((KeyTypeVec{101}), sampled);
+    ASSERT_EQ(EC_OK, mgr.SampleReclaimKeys(nullptr, "node_lru", {"nodeB"}, 10, sampled));
+    EXPECT_EQ((KeyTypeVec{102}), sampled);
+
+    // Reopen replaces the complete index and snapshot, including any stale
+    // in-memory entries from the previous lifetime.
+    ASSERT_EQ(EC_OK, mgr.Close());
+    auto stale = MakeLocation("stale", "file:///stale?size=1");
+    auto stale_with_node = std::make_shared<CacheLocation>(*stale);
+    stale_with_node->set_location_specs({LocationSpec("default", "file:///stale?size=1", "nodeA")});
+    mgr.NotifyIndexersAdd({999}, {{{"stale", stale_with_node}}}, {EC_OK});
+    ASSERT_EQ(EC_OK, mgr.Open());
+    ASSERT_TRUE(mgr.GetRecoveredMetaData(metadata));
+    EXPECT_EQ("2", metadata[METADATA_PROPERTY_KEY_COUNT]);
+    ASSERT_EQ(EC_OK, mgr.SampleReclaimKeys(nullptr, "node_lru", {"nodeA"}, 10, sampled));
+    EXPECT_EQ((KeyTypeVec{101}), sampled);
+}
+
+TEST_F(MetaStorageBackendManagerTest, SingleBackendRecoveryFailsClosedAndCanRetryOpen) {
+    for (int failure = 0; failure < 6; ++failure) {
+        SCOPED_TRACE(failure);
+        MetaStorageBackendManager mgr;
+        mgr.instance_id_ = "single_failure";
+        ASSERT_EQ(EC_OK, mgr.InitReclaimIndexers("node_lru"));
+        auto source = std::make_unique<SingleBackendRecoverySource>();
+        auto *raw = source.get();
+        raw->scan_failures = failure == 0 ? 3 : 0;
+        raw->get_failures = failure == 1 ? 3 : 0;
+        raw->malformed_get = failure == 2;
+        raw->bad_cursor = failure == 3;
+        raw->bad_size = failure == 4;
+        raw->overflow = failure == 5;
+        mgr.persistent_backend_ = std::move(source);
+        EXPECT_NE(EC_OK, mgr.Open());
+        EXPECT_FALSE(mgr.opened_);
+        EXPECT_EQ(MetaStorageBackendManager::RecoverState::kRecover, mgr.GetRecoverState());
+        EXPECT_EQ(1, raw->close_calls);
+        FieldMap metadata;
+        EXPECT_FALSE(mgr.GetRecoveredMetaData(metadata));
+        KeyTypeVec sampled;
+        ASSERT_EQ(EC_OK, mgr.SampleReclaimKeys(nullptr, "node_lru", {"nodeA"}, 10, sampled));
+        EXPECT_TRUE(sampled.empty());
+
+        raw->scan_failures = raw->get_failures = 0;
+        raw->malformed_get = raw->bad_cursor = raw->bad_size = raw->overflow = false;
+        ASSERT_EQ(EC_OK, mgr.Open());
+        ASSERT_TRUE(mgr.GetRecoveredMetaData(metadata));
+        EXPECT_EQ("2", metadata[METADATA_PROPERTY_KEY_COUNT]);
+        ASSERT_EQ(EC_OK, mgr.SampleReclaimKeys(nullptr, "node_lru", {"nodeA"}, 10, sampled));
+        EXPECT_EQ((KeyTypeVec{101}), sampled);
+    }
 }
 
 TEST_F(MetaStorageBackendManagerTest, TestInitDualBackend) {

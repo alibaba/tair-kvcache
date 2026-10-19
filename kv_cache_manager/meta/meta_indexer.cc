@@ -2149,7 +2149,10 @@ std::vector<MetaIndexer::IndexBatch> MetaIndexer::MakeBatches(const KeyVector &k
 
 ErrorCode MetaIndexer::RecoverMetaData() noexcept {
     PropertyMap metadata_map;
-    ErrorCode ec = backend_manager_->GetMetaData(metadata_map);
+    // Persistent node_lru deployments rebuild before Open returns. That
+    // complete scan is authoritative over a missing/stale periodic snapshot.
+    ErrorCode ec =
+        backend_manager_->GetRecoveredMetaData(metadata_map) ? EC_OK : backend_manager_->GetMetaData(metadata_map);
     if (ec == EC_NOENT) {
         KVCM_LOG_INFO("there is no metadata key in storage backend, no need to recover metadata");
         return ec;

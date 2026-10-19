@@ -12,6 +12,7 @@
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
+#include "kv_cache_manager/meta/storage_usage_data.h"
 #include "kv_cache_manager/meta/types.h"
 
 namespace kv_cache_manager {
@@ -306,6 +307,49 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestSingleBackendCrud) {
 
     Cleanup(mgr, keys);
     ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerRealRedisTest, SingleBackendRestartRestoresNodeIndexAndUsage) {
+    const std::string instance = "inst_single_node_lru_recovery";
+    const KeyVector keys = {560001, 560002};
+    {
+        MetaStorageBackendManager writer;
+        ASSERT_EQ(EC_OK, writer.Init(instance, MakeSingleConfig()));
+        ASSERT_EQ(EC_OK, writer.Open());
+        Cleanup(writer, keys);
+        auto batch = MakeBatch(keys);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const std::string id = "loc_" + std::to_string(keys[i]);
+            auto location = std::make_shared<CacheLocation>(*batch.batch_locations[i].at(id));
+            location->set_location_specs(
+                {LocationSpec("default", "file:///cache?size=128", i == 0 ? "nodeA" : "nodeB")});
+            batch.batch_locations[i][id] = std::move(location);
+        }
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), writer.Put(request_context_.get(), batch));
+        ASSERT_EQ(
+            EC_OK,
+            writer.PutMetaData({{METADATA_PROPERTY_KEY_COUNT, "999"}, {METADATA_PROPERTY_STORAGE_USAGE_DATA, "{}"}}));
+        ASSERT_EQ(EC_OK, writer.Close());
+    }
+    auto config = MakeSingleConfig();
+    config->SetStorageUri(config->GetStorageUri() + "&reclaim_indexer_type=node_lru");
+    MetaStorageBackendManager reader;
+    ASSERT_EQ(EC_OK, reader.Init(instance, config));
+    ASSERT_EQ(EC_OK, reader.Open());
+    EXPECT_EQ(MetaStorageBackendManager::RecoverState::kRunning, reader.GetRecoverState());
+    KeyTypeVec sampled;
+    ASSERT_EQ(EC_OK, reader.SampleReclaimKeys(nullptr, "node_lru", {"nodeA"}, 10, sampled));
+    EXPECT_EQ((KeyTypeVec{keys[0]}), sampled);
+    ASSERT_EQ(EC_OK, reader.SampleReclaimKeys(nullptr, "node_lru", {"nodeB"}, 10, sampled));
+    EXPECT_EQ((KeyTypeVec{keys[1]}), sampled);
+    FieldMap metadata;
+    ASSERT_TRUE(reader.GetRecoveredMetaData(metadata));
+    EXPECT_EQ("2", metadata[METADATA_PROPERTY_KEY_COUNT]);
+    StorageUsageData usage;
+    ASSERT_EQ(EC_OK, usage.Deserialize(metadata[METADATA_PROPERTY_STORAGE_USAGE_DATA]));
+    EXPECT_EQ(256u, usage.GetStorageUsage());
+    Cleanup(reader, keys);
+    ASSERT_EQ(EC_OK, reader.Close());
 }
 
 // --- Recover phase: local miss falls back to redis ---------------------------

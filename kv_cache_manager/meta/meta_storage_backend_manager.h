@@ -29,7 +29,8 @@ struct SingleLocationRmwScratch;
 //     memory_primary keeps that write order during Recover, then makes local
 //     the ordinary-write primary after recovery; Redis remains the recovery
 //     source and backup.
-//   * Single-backend: persistent only (cache is null, no Recover).
+//   * Single-backend: persistent only (cache is null). Persistent node_lru
+//     deployments rebuild the node index and accounting synchronously in Open.
 //
 // Callers must partition requests via MetaIndexer::MakeBatches and hold
 // shard locks before invoking the manager.
@@ -189,6 +190,9 @@ public:
 
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
+    // Startup-only snapshot, available after a successful single-backend
+    // node_lru rebuild. Consume before publishing the MetaIndexer to traffic.
+    bool GetRecoveredMetaData(FieldMap &field_maps) const noexcept;
 
     // Synchronously flush pending writes for the given keys to persistent storage.
     // Returns true on success, false on failure/timeout.
@@ -234,6 +238,7 @@ private:
                 local_primary};
     }
     void AsyncRecoverTask() noexcept;
+    ErrorCode RecoverSingleBackendIndexes() noexcept;
     int64_t BackfillKeysToCache(const KeyTypeVec &keys,
                                 const CacheLocationMapVector &locations,
                                 const PropertyMapVector &properties,
@@ -272,6 +277,7 @@ private:
     bool force_deleting_async_enqueue_ = true;
     // type -> per-type reclaim indexer
     std::unordered_map<std::string, std::unique_ptr<ReclaimIndexer>> reclaim_indexers_;
+    FieldMap recovered_metadata_;
 
     std::atomic<RecoverState> recover_state_{RecoverState::kRecover};
     std::atomic<bool> is_closed_{false};

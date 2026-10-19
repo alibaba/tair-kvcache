@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -28,6 +29,20 @@ CacheLocationMap MakeNodeLocation(const std::string &loc_id, const std::string &
     CacheLocationMap map;
     map.emplace(loc_id, std::move(loc));
     return map;
+}
+
+CacheLocationConstPtr MakeSizedNodeLocation(const std::string &id,
+                                            const std::string &node,
+                                            uint64_t size,
+                                            DataStorageType type,
+                                            CacheLocationStatus status = CLS_SERVING) {
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id(id);
+    location->set_status(status);
+    location->set_type(type);
+    location->set_spec_size(1);
+    location->push_location_spec(LocationSpec("default", "file:///cache?size=" + std::to_string(size), node));
+    return location;
 }
 
 } // namespace
@@ -186,4 +201,87 @@ TEST_F(MetaIndexerNodeLruTest, PureLocalTargetedUpsertAndDeleteKeepNodeIndex) {
     ASSERT_EQ(EC_OK, meta_indexer_->Delete(request_context_.get(), {42}).ec);
     ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(request_context_.get(), "node_lru", {"nodeB"}, 10, keys));
     EXPECT_TRUE(keys.empty());
+}
+
+TEST_F(MetaIndexerNodeLruTest, PersistentRestartRebuildsNodeMembershipAndReconcilesUsage) {
+    for (const bool stale_metadata : {false, true}) {
+        SCOPED_TRACE(stale_metadata ? "stale counters" : "missing counters");
+        auto config = std::make_shared<MetaIndexerConfig>();
+        ASSERT_TRUE(config->FromJsonString(R"({
+            "max_key_count": 1000,
+            "mutex_shard_num": 8,
+            "persist_metadata_interval_time_ms": 0,
+            "meta_storage_backend_config": {"storage_type": "dummy"}
+        })"));
+        const std::string instance = stale_metadata ? "stale" : "missing";
+        const std::string path = GetPrivateTestRuntimeDataPath() + "restart_node_lru";
+        std::filesystem::remove(path + "_" + instance);
+        config->meta_storage_backend_config_->SetStorageUri("file://" + path + "?reclaim_indexer_type=node_lru");
+
+        // Persist real locations independently of the periodic counters,
+        // as happens when a process exits before the next metadata snapshot.
+        {
+            MetaStorageBackendManager writer;
+            ASSERT_EQ(EC_OK, writer.Init(instance, config->GetMetaStorageBackendConfig()));
+            ASSERT_EQ(EC_OK, writer.Open());
+            BatchMetaData batch;
+            batch.batch_keys = {1, 2, 3};
+            batch.batch_locations = {
+                {{"base", MakeSizedNodeLocation("base", "nodeA", 100, DataStorageType::DATA_STORAGE_TYPE_HF3FS)},
+                 {"alias", MakeSizedNodeLocation("alias", "nodeA", 25, DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS)}},
+                {{"writing",
+                  MakeSizedNodeLocation(
+                      "writing", "nodeB", 300, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, CLS_WRITING)}},
+                {{"deleting",
+                  MakeSizedNodeLocation(
+                      "deleting", "nodeA", 40, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, CLS_DELETING)}},
+            };
+            auto multi_spec = std::make_shared<CacheLocation>(*batch.batch_locations[0].at("base"));
+            multi_spec->set_spec_size(2);
+            multi_spec->push_location_spec(LocationSpec("second", "file:///cache-second?size=50", "nodeC"));
+            batch.batch_locations[0]["base"] = std::move(multi_spec);
+            batch.batch_properties.resize(3);
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), writer.Put(nullptr, batch));
+            if (stale_metadata) {
+                StorageUsageData stale_usage;
+                stale_usage.Reset();
+                stale_usage.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 9999);
+                ASSERT_EQ(EC_OK,
+                          writer.PutMetaData({{METADATA_PROPERTY_KEY_COUNT, "99"},
+                                              {METADATA_PROPERTY_STORAGE_USAGE_DATA, stale_usage.Serialize()}}));
+            }
+            ASSERT_EQ(EC_OK, writer.Close());
+        }
+
+        meta_indexer_ = std::make_shared<MetaIndexer>();
+        ASSERT_EQ(EC_OK, meta_indexer_->Init(instance, config));
+        EXPECT_EQ(3u, meta_indexer_->GetKeyCount());
+        EXPECT_EQ(175u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        EXPECT_EQ(175u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+        EXPECT_EQ(300u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+        EXPECT_EQ(40u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+        EXPECT_EQ(475u, meta_indexer_->GetStorageUsage());
+        KeyTypeVec sampled;
+        ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(nullptr, "node_lru", {"nodeA"}, 10, sampled));
+        std::sort(sampled.begin(), sampled.end());
+        EXPECT_EQ((KeyTypeVec{1, 3}), sampled);
+        ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(nullptr, "node_lru", {"nodeB"}, 10, sampled));
+        EXPECT_EQ((KeyTypeVec{2}), sampled);
+        ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(nullptr, "node_lru", {"nodeC"}, 10, sampled));
+        EXPECT_EQ((KeyTypeVec{1}), sampled);
+
+        // The direct indexer API does not adjust usage (MetaSearcher does).
+        // A second restart must recompute, not double-count the prior snapshot.
+        ASSERT_EQ(EC_OK, meta_indexer_->Delete(request_context_.get(), {2}).ec);
+        meta_indexer_.reset();
+        meta_indexer_ = std::make_shared<MetaIndexer>();
+        ASSERT_EQ(EC_OK, meta_indexer_->Init(instance, config));
+        EXPECT_EQ(2u, meta_indexer_->GetKeyCount());
+        EXPECT_EQ(175u, meta_indexer_->GetStorageUsage());
+        EXPECT_EQ(0u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+        ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(nullptr, "node_lru", {"nodeB"}, 10, sampled));
+        EXPECT_TRUE(sampled.empty());
+        meta_indexer_.reset();
+        std::filesystem::remove(path + "_" + instance);
+    }
 }
