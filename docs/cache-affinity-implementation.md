@@ -328,9 +328,9 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 
 删除候选虽由 `LocationSpec.node_id` 匹配，提交与删除粒度仍是 **整个 CacheLocation**：只要其中一个 spec 位于压力节点，就可能连同其他节点上的组件一起删除，尚未实现按 spec 拆分删除。
 
-物理删除与元数据删除不是事务，但删除失败会留下可恢复的记录。[SchedulePlanExecutor](../kv_cache_manager/manager/schedule_plan_executor.cc) 先将 Location 标为 DELETING 并 `Sync`，再删除物理 URI。普通物理删除路径只有在该 Location 的全部 URI 确认删除成功或已不存在时，才按完整 Location 值条件删除元数据；失败、异常、结果缺项或非法 URI 都保留整个 DELETING Location 及其预算。独立 Location 可继续完成。`deleted_bytes_by_node` 只统计明确 `EC_OK` 的 URI，已不存在的 URI 不再次增加释放量。
+物理删除与元数据删除不是事务，但删除失败会留下可恢复的记录。[SchedulePlanExecutor](../kv_cache_manager/manager/schedule_plan_executor.cc) 先将 Location 标为 DELETING 并 `Sync`，再删除物理 URI。普通物理删除路径只有在该 Location 的全部 URI 确认删除成功或已不存在时，才按完整 Location 值条件删除元数据；失败、异常、结果缺项或非法 URI 都保留整个 DELETING Location 及其预算。独立 Location 可继续完成。`deleted_bytes_by_node` 只统计 `EC_OK` 的 URI，`EC_NOENT` 不增加释放量；后端若把重复删除也返回 `EC_OK`，不能据此视为新增物理释放。
 
-[CacheGarbageCollector](../kv_cache_manager/manager/cache_garbage_collector.cc) 扫描持久化的 DELETING Location 并重新提交删除；进程内正在删除的同一 instance/key/location 会去重，旧任务的完整值校验用于避免清理被替换的元数据。服务进程的 `kvcm.cache_gc.enabled` **默认 true**；显式关闭后不会自动扫描重试。组件独立构造的 `Config.enabled` 默认 false，不能据此推断服务默认值。重试依赖后端删除幂等性和后续 GC 扫描，不保证清理时限，也不修复后端自身的删除语义错误。
+[CacheGarbageCollector](../kv_cache_manager/manager/cache_garbage_collector.cc) 扫描持久化的 DELETING Location；执行器仅对支持安全删除重试的后端重新提交物理删除。进程内从准入、延时等待到执行完成持续占有同一 instance/key/location，GC 不会绕过原任务的删除宽限期；剩余延时未持久化，进程重启后不恢复。旧任务的完整值校验用于避免清理被替换的元数据，不是物理地址的代次锁。服务进程的 `kvcm.cache_gc.enabled` **默认 true**；显式关闭后不会自动扫描重试。组件独立构造的 `Config.enabled` 默认 false，不能据此推断服务默认值。`SupportsDeleteRetry` 默认 false，当前真实后端均未开启，包含 PACE 与 VCNS；测试中的安全后端替身用于验证恢复机制。一个 Location 的全部 URI 都须支持才允许重试。PACE 的 GA 会复用且删除协议没有分配代次校验，因此禁止其未知结果后的自动物理重发，保留完整记录和预算供核查；不能把旧 GA 直接再次删除。安全重试后端仍依赖后续 GC 扫描，不保证清理时限。
 
 ### 7.3 最少保留副本的作用范围
 
@@ -347,7 +347,7 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 | 其他组合的用量计数 | 继续使用 `PersistMetaData` 周期快照；双后端和未配置 `node_lru` 的单后端不因此获得启动全量对账保证 |
 | 节点 LRU | 单后端扫描与双后端 `BackfillKeysToCache → NotifyIndexersAdd` 可恢复成员关系；精确的重启前 LRU 顺序不持久化 |
 | 写会话 | session 表在进程内；遗留 WRITING 不可读、不能续传，需后续回收/GC；启动对账仍计入其用量 |
-| 未完成删除 | DELETING 及完整 URI 随 meta 持久化；开启 GC 后继续重试，全部组件确认删除后才释放 Location 预算 |
+| 未完成删除 | DELETING 及完整 URI 随 meta 持久化；GC 仅重试支持安全重发的后端，PACE 保留待处置；全部组件确认删除后才释放预算 |
 | 热度、抑制、删除释放量、SDK 队列 | 均在各自进程内；重启后重新采样或触发，不恢复已丢失的复制任务 |
 
 启动扫描是 O(N) 工作量，去重集合和派生索引也占用随 key 数增长的内存，期间该实例不能服务。计费累加所有持久化状态的 spec URI size，含 WRITING/DELETING；历史 URI 缺少 size 时仍按零处理，无法凭空还原未知大小。它修正的是已持久化 Location 与派生计数的偏差，不是跨 Manager 进程的分布式硬配额或连续在线对账。
@@ -373,12 +373,12 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 | 重启后的节点索引 | 持久化单后端启用 node_lru 时同步全量重建；双后端继续 backfill，不保存精确 LRU 顺序 |
 | 异常退出后的预算 | 上述单后端扫描按已持久化 Location 对账；其他组合仍依赖周期快照，未知 URI size 无法补算 |
 | 回收粒度 | 当前按 Location 删除；spec 级拆分未实现 |
-| 物理删除失败后的残留 | 保留完整 DELETING Location，开启 GC 后重试；全部 URI 确认删除才清理元数据，依赖后端幂等删除 |
+| 物理删除失败后的残留 | 保留完整 DELETING Location；安全后端可经 GC 重试，PACE 未知结果禁止自动重发，须补分配代次校验 |
 | 复制完成反馈、重试与恢复 | SDK 有结果回调/统计；服务端抑制反馈、持久化任务、跨进程资源配额未实现 |
 | 源数据存活保障 | 复制会检查传输结果，但不能把元数据 SERVING 或后端 Lock 接口视为所有后端均有真实数据 pin |
 | 实机验收 | 多节点 PACE 数据正确性、真实压力删除、provider 重启和 GPU buffer 传输仍需专门实机用例 |
 
-下一步优先验收真实 PACE 的复制、压力删除、SSD-only 身份切换和持久化恢复，解决透明 SSD 分层删除阻断，再扩展 spec group / 多 storage 组合。高级收益模型和自动调参应放在这些生命周期正确性之后。
+下一步优先验收真实 PACE 的复制、压力删除、SSD-only 身份切换和持久化恢复，先补 PACE 分配代次校验与透明 SSD 分层删除确认，再扩展 spec group / 多 storage 组合。高级收益模型和自动调参应放在这些生命周期正确性之后。
 
 <a id="validation"></a>
 
