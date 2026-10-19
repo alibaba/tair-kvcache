@@ -78,7 +78,7 @@ Config ParseArgs(int argc, char **argv) {
         Require(!cfg.expected_node_id.empty(), "--expected-node-id is required to prove physical locality");
         size_t consumed = 0;
         auto node = std::stoul(cfg.expected_node_id, &consumed);
-        Require(consumed == cfg.expected_node_id.size() && node <= 65535, "invalid PACE node ID");
+        Require(consumed == cfg.expected_node_id.size() && node > 0 && node <= 65535, "invalid PACE node ID");
         cfg.expected_node_id = std::to_string(node);
     }
     return cfg;
