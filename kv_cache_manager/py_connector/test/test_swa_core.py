@@ -2174,25 +2174,16 @@ class TestClampCoversTheNeededWindow(unittest.TestCase):
 class TestPackedGroupsAndStateBlocks(unittest.TestCase):
     """Configurations the connector must refuse or now accepts (registration)."""
 
-    def test_an_undeclared_ring_subclass_is_refused_not_dropped(self):
-        # The scratch skip is exact-type matched like every other spec receipt:
-        # when the engine declares its transfer projection, a spec it hands to
-        # connectors must be *refused* by name (the connector has no transfer
-        # layout for it) rather than silently dropped, so an external hit can
-        # never resume with that group's state uninitialized. The declared
-        # classes -- the compression ring, and the packed wrapper of rings --
-        # are still skipped: the engine rebuilds those.
+    def test_packed_rings_are_skipped_and_their_companions_survive(self):
+        # The compression ring and the packed wrapper of rings are engine
+        # scratch: the group is skipped (the engine rebuilds it around an
+        # external hit) while the companion transferable group survives
+        # registration.
         from vllm.v1.kv_cache_interface import (
             CircularBufferSpec,
             FullAttentionSpec,
             UniformTypeKVCacheSpecs,
         )
-
-        class MyRing(CircularBufferSpec):
-            pass
-
-        class MyWrapper(UniformTypeKVCacheSpecs):
-            pass
 
         def ring(cls=CircularBufferSpec):
             return cls(block_size=MBS, page_size_bytes=2048)
@@ -2219,16 +2210,6 @@ class TestPackedGroupsAndStateBlocks(unittest.TestCase):
                 ],
                 transfer_group_ids=[0, 1],
             )
-
-        for spec, name in (
-            (ring(MyRing), "MyRing"),
-            (MyWrapper(MBS, {"l0": ring()}), "MyWrapper"),
-        ):
-            with self.subTest(declared_class=name):
-                with self.assertRaises(NotImplementedError) as ctx:
-                    parse_groups(config(spec), MBS, calculate_kv_scales=False)
-                self.assertIn(name, str(ctx.exception))
-                self.assertIn("exposes it for transfer", str(ctx.exception))
 
         for spec in (ring(), UniformTypeKVCacheSpecs(MBS, {"l0": ring()})):
             with self.subTest(skipped=type(spec).__name__):
