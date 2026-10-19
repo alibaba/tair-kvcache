@@ -81,7 +81,7 @@ bool Server::Init(const ServerConfig &config) {
             }
         } else {
             // No explicit strategy file: apply built-in local_replica default.
-            // - write: prefer_local with passthrough on miss (best-effort local placement)
+            // - write: prefer_local aborts on miss; ordinary writes then fall back to backend placement
             // - read:  frequency sketch triggers ReplicationHint after 3 remote reads
             static constexpr char kDefaultStrategyJson[] = R"({
                 "type": "local_replica",

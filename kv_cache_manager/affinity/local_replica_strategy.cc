@@ -72,7 +72,7 @@ ReadDecision LocalReplicaAffinityStrategy::ResolveRead(const ReadRequest &req, c
         const long double benefit = static_cast<long double>(remote) * heat * prefix_weight;
         if (benefit < static_cast<long double>(copied) * params_.min_benefit_ratio) return dec;
     }
-    if (ShouldEmitReplicationHint(req.block_key, /*has_local=*/false, req.winner_tier, ctx)) {
+    if (ShouldEmitReplicationHint(req.block_key, ctx)) {
         const bool allow = params_.suppressor == nullptr ||
                            params_.suppressor->TryEmit(req.block_key, ctx.caller_node.node_id,
                                                       params_.suppression_window_ms, ctx.instance_id);
@@ -165,19 +165,9 @@ const LocationSpec *LocalReplicaAffinityStrategy::PickLocalSpec(const std::vecto
     return candidates.front();
 }
 
-bool LocalReplicaAffinityStrategy::ShouldEmitReplicationHint(int64_t block_key,
-                                                             bool has_local_in_picked,
-                                                             const CacheLocation * /*winner_tier*/,
-                                                             const StrategyContext &ctx) const {
-    // gate 1: caller_node.node_id 非空（ResolveRead 已检过，这里 belt-and-suspender）
-    if (ctx.caller_node.node_id.empty()) {
-        return false;
-    }
-    // gate 2: 还没有完整的本地副本（ResolveRead 已检过）
-    if (has_local_in_picked) {
-        return false;
-    }
-    // gate 3: 频率超阈值
+bool LocalReplicaAffinityStrategy::ShouldEmitReplicationHint(int64_t block_key, const StrategyContext &ctx) const {
+    // ResolveRead has already checked caller identity and the absence of a complete local copy.
+    // 频率超阈值
     if (params_.sketch == nullptr) {
         return false; // 没 sketch 拿不到计数，保守不发
     }
@@ -185,7 +175,7 @@ bool LocalReplicaAffinityStrategy::ShouldEmitReplicationHint(int64_t block_key,
     if (cnt < params_.replication_hot_threshold) {
         return false;
     }
-    // gate 4: caller 节点容量允许
+    // caller 节点容量允许
     if (ctx.get_node_metrics) {
         const NodeMetrics *m = ctx.get_node_metrics(ctx.caller_node.node_id);
         if (m != nullptr) {

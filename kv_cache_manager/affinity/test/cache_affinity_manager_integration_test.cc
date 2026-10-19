@@ -113,7 +113,7 @@ static const char *kFullStrategyJson = R"({
     },
     "eviction": {
         "ops": [
-            { "op": "node_water_level", "threshold": 0.85, "critical": 0.95, "low": 0.70 }
+            { "op": "node_water_level", "threshold": 0.85, "low": 0.70 }
         ]
     }
 })";

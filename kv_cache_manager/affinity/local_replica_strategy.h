@@ -62,7 +62,6 @@ public:
 
         // === 淘汰一级 (eviction.ops)：节点水位 ===
         double node_water_threshold = 0.85;
-        double node_water_critical = 0.95;
         double node_water_low = 0.70;
     };
 
@@ -90,10 +89,7 @@ private:
                                       const StrategyContext &ctx) const;
 
     // 读一级实现细节 2（on_miss 路径）：判定是否触发复制 + 喂 sketch + 产 hint
-    bool ShouldEmitReplicationHint(int64_t block_key,
-                                   bool has_local_in_picked,
-                                   const CacheLocation *winner_tier,
-                                   const StrategyContext &ctx) const;
+    bool ShouldEmitReplicationHint(int64_t block_key, const StrategyContext &ctx) const;
 
     Params params_;
 };

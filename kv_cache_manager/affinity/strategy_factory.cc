@@ -1,6 +1,8 @@
 #include "kv_cache_manager/affinity/strategy_factory.h"
 
+#include <cmath>
 #include <string>
+#include <utility>
 
 #include "kv_cache_manager/affinity/hint_suppressor.h"
 #include "kv_cache_manager/affinity/local_replica_strategy.h"
@@ -39,60 +41,84 @@ std::string ValueToJson(const rapidjson::Value &v) {
     return std::string(sb.GetString(), sb.GetSize());
 }
 
-void ReadBoolField(const rapidjson::Value &obj, const char *key, bool &out) {
-    if (obj.HasMember(key) && obj[key].IsBool()) {
-        out = obj[key].GetBool();
+// Missing fields retain defaults; malformed fields must not turn into a valid
+// high-priority strategy that masks a lower-priority configuration.
+template <typename T>
+bool ReadField(const rapidjson::Value &obj, const char *key, T &out, std::string *err) {
+    if (!obj.HasMember(key))
+        return true;
+    if (!obj[key].Is<T>()) {
+        SetErr(err, std::string("invalid type or integer range for '") + key + "'");
+        return false;
     }
-}
-void ReadUIntField(const rapidjson::Value &obj, const char *key, uint32_t &out) {
-    if (obj.HasMember(key) && obj[key].IsUint()) {
-        out = obj[key].GetUint();
-    }
-}
-void ReadDoubleField(const rapidjson::Value &obj, const char *key, double &out) {
-    if (obj.HasMember(key) && obj[key].IsNumber()) {
-        out = obj[key].GetDouble();
-    }
+    out = obj[key].Get<T>();
+    return true;
 }
 
-// 解析 write 一级配置块：{ "ops": <5 段流水线对象> }
-std::shared_ptr<CandidatePipeline> ParseWriteOps(const rapidjson::Value &write_block, std::string *err) {
-    if (write_block.HasMember(kFieldOps) && write_block[kFieldOps].IsObject()) {
-        return CandidatePipeline::ParseJsonString(ValueToJson(write_block[kFieldOps]), err);
+bool ReadField(const rapidjson::Value &obj, const char *key, double &out, std::string *err) {
+    if (!obj.HasMember(key))
+        return true;
+    const auto &value = obj[key];
+    if (!value.IsNumber() || !std::isfinite(value.GetDouble()) || value.GetDouble() < 0) {
+        SetErr(err, std::string(key) + " must be a finite non-negative number");
+        return false;
     }
-    return nullptr;
+    out = value.GetDouble();
+    return true;
 }
 
-// 解析 read 一级的 on_miss 子项参数（复制触发 4 gate 阈值等）。
-void ApplyOnMiss(const rapidjson::Value &on_miss, LocalReplicaAffinityStrategy::Params &p) {
-    // 子开关：on_miss 路径可单独关停（不影响 read.pick 本地优先）
-    ReadBoolField(on_miss, "enabled", p.enable_on_miss);
-    ReadUIntField(on_miss, "replication_hot_threshold", p.replication_hot_threshold);
-    ReadUIntField(on_miss, "heat_half_life_ms", p.heat_half_life_ms);
-    ReadDoubleField(on_miss, "min_benefit_ratio", p.min_benefit_ratio);
-    ReadDoubleField(on_miss, "prefix_bonus", p.prefix_bonus);
-    if (on_miss.HasMember("max_replication_bytes") && on_miss["max_replication_bytes"].IsUint64())
-        p.max_replication_bytes = on_miss["max_replication_bytes"].GetUint64();
-    ReadDoubleField(on_miss, "caller_capacity_threshold", p.caller_capacity_threshold);
-    ReadDoubleField(on_miss, "caller_capacity_buffer", p.caller_capacity_buffer);
-    ReadUIntField(on_miss, "suppression_window_ms", p.suppression_window_ms);
+bool CheckObjectField(const rapidjson::Value &obj, const char *key, std::string *err) {
+    if (!obj.HasMember(key) || obj[key].IsObject())
+        return true;
+    SetErr(err, std::string(key) + " must be an object");
+    return false;
 }
 
-// 解析 eviction 一级 ops 参数（v1 只有 node_water）。
-void ApplyEvictionOps(const rapidjson::Value &eviction_block, LocalReplicaAffinityStrategy::Params &p) {
-    if (eviction_block.HasMember(kFieldOps) && eviction_block[kFieldOps].IsArray()) {
-        for (const auto &op : eviction_block[kFieldOps].GetArray()) {
-            if (!op.IsObject() || !op.HasMember("op") || !op["op"].IsString()) {
-                continue;
-            }
-            std::string name = op["op"].GetString();
-            if (name == "node_water_level") {
-                ReadDoubleField(op, "threshold", p.node_water_threshold);
-                ReadDoubleField(op, "critical", p.node_water_critical);
-                ReadDoubleField(op, "low", p.node_water_low);
-            }
+bool ParseWriteOps(const rapidjson::Value &write_block, LocalReplicaAffinityStrategy::Params &p, std::string *err) {
+    if (!CheckObjectField(write_block, kFieldOps, err))
+        return false;
+    if (!write_block.HasMember(kFieldOps))
+        return true;
+    p.write_pipeline = CandidatePipeline::ParseJsonString(ValueToJson(write_block[kFieldOps]), err);
+    return p.write_pipeline != nullptr;
+}
+
+bool ApplyOnMiss(const rapidjson::Value &on_miss, LocalReplicaAffinityStrategy::Params &p, std::string *err) {
+    return ReadField(on_miss, "enabled", p.enable_on_miss, err) &&
+           ReadField(on_miss, "replication_hot_threshold", p.replication_hot_threshold, err) &&
+           ReadField(on_miss, "heat_half_life_ms", p.heat_half_life_ms, err) &&
+           ReadField(on_miss, "min_benefit_ratio", p.min_benefit_ratio, err) &&
+           ReadField(on_miss, "prefix_bonus", p.prefix_bonus, err) &&
+           ReadField(on_miss, "max_replication_bytes", p.max_replication_bytes, err) &&
+           ReadField(on_miss, "caller_capacity_threshold", p.caller_capacity_threshold, err) &&
+           ReadField(on_miss, "caller_capacity_buffer", p.caller_capacity_buffer, err) &&
+           ReadField(on_miss, "suppression_window_ms", p.suppression_window_ms, err);
+}
+
+bool ApplyEvictionOps(const rapidjson::Value &eviction_block,
+                      LocalReplicaAffinityStrategy::Params &p,
+                      std::string *err) {
+    if (!eviction_block.HasMember(kFieldOps))
+        return true;
+    if (!eviction_block[kFieldOps].IsArray()) {
+        SetErr(err, "eviction.ops must be an array");
+        return false;
+    }
+    bool legacy_critical = false;
+    for (const auto &op : eviction_block[kFieldOps].GetArray()) {
+        if (!op.IsObject() || !op.HasMember("op") || !op["op"].IsString() ||
+            std::string(op["op"].GetString()) != "node_water_level") {
+            SetErr(err, "eviction.ops requires node_water_level operations");
+            return false;
         }
+        if (!ReadField(op, "threshold", p.node_water_threshold, err) || !ReadField(op, "low", p.node_water_low, err))
+            return false;
+        legacy_critical |= op.HasMember("critical");
     }
+    if (legacy_critical) {
+        KVCM_LOG_WARN("affinity node_water_level.critical is deprecated and ignored; use threshold and low");
+    }
+    return true;
 }
 
 // 构造 LocalReplicaAffinityStrategy::Params；从 target 对象按一级行为块解析。
@@ -102,46 +128,51 @@ void ApplyEvictionOps(const rapidjson::Value &eviction_block, LocalReplicaAffini
 //       "write":     { "ops": <5 段流水线对象> },
 //       "read":      { "on_miss": { "replication_hot_threshold": 3, ... } },
 //       "eviction":  { "ops": [{"op":"node_water_level","threshold":0.85}, ...] } }
-LocalReplicaAffinityStrategy::Params
-BuildLocalReplicaParams(const rapidjson::Value &target, FrequencySketch *sketch, HintSuppressor *suppressor) {
-    LocalReplicaAffinityStrategy::Params p;
-    p.sketch = sketch;
-    p.suppressor = suppressor;
-
-    if (target.HasMember("replica_limits") && target["replica_limits"].IsObject()) {
+bool BuildLocalReplicaParams(const rapidjson::Value &target,
+                             LocalReplicaAffinityStrategy::Params &p,
+                             std::string *err) {
+    for (const char *key : {"replica_limits", kFieldEnabledAspects, kFieldWrite, kFieldRead, kFieldEviction}) {
+        if (!CheckObjectField(target, key, err))
+            return false;
+    }
+    if (target.HasMember("replica_limits")) {
         const auto &limits = target["replica_limits"];
-        ReadUIntField(limits, "max_replicas_per_key", p.replica_limits.max_replicas_per_key);
-        ReadUIntField(limits, "min_retained_replicas", p.replica_limits.min_retained_replicas);
-        if (limits.HasMember("max_instance_bytes") && limits["max_instance_bytes"].IsUint64()) {
-            p.replica_limits.max_instance_bytes = limits["max_instance_bytes"].GetUint64();
-        }
+        if (!ReadField(limits, "max_replicas_per_key", p.replica_limits.max_replicas_per_key, err) ||
+            !ReadField(limits, "min_retained_replicas", p.replica_limits.min_retained_replicas, err) ||
+            !ReadField(limits, "max_instance_bytes", p.replica_limits.max_instance_bytes, err))
+            return false;
     }
-    // enabled_aspects
-    if (target.HasMember(kFieldEnabledAspects) && target[kFieldEnabledAspects].IsObject()) {
+    if (target.HasMember(kFieldEnabledAspects)) {
         const auto &ea = target[kFieldEnabledAspects];
-        ReadBoolField(ea, "write", p.enable_write);
-        ReadBoolField(ea, "read", p.enable_read);
-        ReadBoolField(ea, "eviction", p.enable_eviction);
+        if (!ReadField(ea, "write", p.enable_write, err) || !ReadField(ea, "read", p.enable_read, err) ||
+            !ReadField(ea, "eviction", p.enable_eviction, err))
+            return false;
     }
-    // write 一级
-    if (target.HasMember(kFieldWrite) && target[kFieldWrite].IsObject()) {
-        auto pipe = ParseWriteOps(target[kFieldWrite], nullptr);
-        if (pipe) {
-            p.write_pipeline = std::move(pipe);
-        }
-    }
-    // read 一级 - on_miss 子项
-    if (target.HasMember(kFieldRead) && target[kFieldRead].IsObject()) {
+    if (target.HasMember(kFieldWrite) && !ParseWriteOps(target[kFieldWrite], p, err))
+        return false;
+    if (target.HasMember(kFieldRead)) {
         const auto &read_block = target[kFieldRead];
-        if (read_block.HasMember(kFieldOnMiss) && read_block[kFieldOnMiss].IsObject()) {
-            ApplyOnMiss(read_block[kFieldOnMiss], p);
-        }
+        if (!CheckObjectField(read_block, kFieldOnMiss, err))
+            return false;
+        if (read_block.HasMember(kFieldOnMiss) && !ApplyOnMiss(read_block[kFieldOnMiss], p, err))
+            return false;
     }
-    // eviction 一级
-    if (target.HasMember(kFieldEviction) && target[kFieldEviction].IsObject()) {
-        ApplyEvictionOps(target[kFieldEviction], p);
+    if (target.HasMember(kFieldEviction) && !ApplyEvictionOps(target[kFieldEviction], p, err))
+        return false;
+    if (p.caller_capacity_threshold > 1 || p.caller_capacity_buffer > p.caller_capacity_threshold) {
+        SetErr(err, "caller capacity requires 0 <= buffer <= threshold <= 1");
+        return false;
     }
-    return p;
+    if (p.node_water_threshold > 1 || p.node_water_low > p.node_water_threshold) {
+        SetErr(err, "node water levels require 0 <= low <= threshold <= 1");
+        return false;
+    }
+    if (p.replica_limits.max_replicas_per_key > 0 &&
+        p.replica_limits.min_retained_replicas > p.replica_limits.max_replicas_per_key) {
+        SetErr(err, "min_retained_replicas exceeds max_replicas_per_key");
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -167,7 +198,9 @@ std::shared_ptr<AffinityStrategy> StrategyFactory::ParseJsonString(const std::st
     }
 
     const rapidjson::Value *target = &doc;
-    if (doc.HasMember(kFieldStrategy) && doc[kFieldStrategy].IsObject()) {
+    if (!CheckObjectField(doc, kFieldStrategy, error_msg))
+        return nullptr;
+    if (doc.HasMember(kFieldStrategy)) {
         target = &doc[kFieldStrategy];
     }
 
@@ -181,36 +214,12 @@ std::shared_ptr<AffinityStrategy> StrategyFactory::ParseJsonString(const std::st
         return std::make_shared<NoopAffinityStrategy>();
     }
     if (type == kTypeLocalReplica) {
-        if (target->HasMember("read") && (*target)["read"].IsObject() &&
-            (*target)["read"].HasMember("on_miss") && (*target)["read"]["on_miss"].IsObject()) {
-            const auto &on_miss = (*target)["read"]["on_miss"];
-            for (const char *name : {"min_benefit_ratio", "prefix_bonus"}) {
-                if (on_miss.HasMember(name) && (!on_miss[name].IsNumber() || on_miss[name].GetDouble() < 0)) {
-                    SetErr(error_msg, std::string(name) + " must be non-negative"); return nullptr;
-                }
-            }
-            if ((on_miss.HasMember("heat_half_life_ms") && !on_miss["heat_half_life_ms"].IsUint()) ||
-                (on_miss.HasMember("max_replication_bytes") && !on_miss["max_replication_bytes"].IsUint64())) {
-                SetErr(error_msg, "heat/copy limits must be non-negative integers"); return nullptr;
-            }
-        }
-        if (target->HasMember("replica_limits")) {
-            const auto &limits = (*target)["replica_limits"];
-            if (!limits.IsObject() ||
-                (limits.HasMember("max_replicas_per_key") && !limits["max_replicas_per_key"].IsUint()) ||
-                (limits.HasMember("min_retained_replicas") && !limits["min_retained_replicas"].IsUint()) ||
-                (limits.HasMember("max_instance_bytes") && !limits["max_instance_bytes"].IsUint64())) {
-                SetErr(error_msg, "replica_limits must contain non-negative integer limits");
-                return nullptr;
-            }
-            const auto params = BuildLocalReplicaParams(*target, sketch, suppressor);
-            if (params.replica_limits.max_replicas_per_key > 0 &&
-                params.replica_limits.min_retained_replicas > params.replica_limits.max_replicas_per_key) {
-                SetErr(error_msg, "min_retained_replicas exceeds max_replicas_per_key");
-                return nullptr;
-            }
-        }
-        return std::make_shared<LocalReplicaAffinityStrategy>(BuildLocalReplicaParams(*target, sketch, suppressor));
+        LocalReplicaAffinityStrategy::Params params;
+        params.sketch = sketch;
+        params.suppressor = suppressor;
+        if (!BuildLocalReplicaParams(*target, params, error_msg))
+            return nullptr;
+        return std::make_shared<LocalReplicaAffinityStrategy>(std::move(params));
     }
 
     SetErr(error_msg, std::string("unknown strategy type: ") + type);

@@ -65,6 +65,37 @@ TEST_F(CacheAffinityManagerStrategyTest, RepeatedGetStrategyReturnsSameSharedPtr
     EXPECT_EQ(s1.get(), s2.get()); // memoize 生效
 }
 
+TEST_F(CacheAffinityManagerStrategyTest, InvalidOverridesCannotMaskLowerPriorityStrategies) {
+    CacheAffinityManager m;
+    ASSERT_TRUE(m.LoadProcessStrategyFromJsonString(R"({"type":"noop"})"));
+    const auto process = m.GetStrategy("", "");
+    const std::string group_json = R"({"type":"local_replica","enabled_aspects":{"eviction":false}})";
+    const auto group = m.GetStrategy("", group_json);
+    ASSERT_NE(group.get(), process.get());
+    const char *invalid_overrides[] = {
+        R"({"type":"local_replica","enabled_aspects":{"eviction":"false"}})",
+        R"({"type":"local_replica","read":{"on_miss":{"enabled":0}}})",
+        R"({"type":"local_replica","read":{"on_miss":{"suppression_window_ms":-1}}})",
+        R"({"type":"local_replica","read":{"on_miss":{"caller_capacity_threshold":0.1,"caller_capacity_buffer":0.2}}})",
+        R"({"type":"local_replica","write":{"ops":{"limit":0}}})",
+        R"({"type":"local_replica","write":{"ops":[]}})",
+        R"({"type":"local_replica","eviction":{"ops":[{"op":"node_water_level","low":0.9}]}})",
+        R"({"type":"local_replica","replica_limits":{"min_retained_replicas":2,"max_replicas_per_key":1}})",
+    };
+    for (const auto *invalid : invalid_overrides) {
+        SCOPED_TRACE(invalid);
+        for (int retry = 0; retry < 2; ++retry) {
+            EXPECT_EQ(group.get(), m.GetStrategy(invalid, group_json).get());
+            EXPECT_EQ(process.get(), m.GetStrategy("", invalid).get());
+            EXPECT_EQ(process.get(), m.GetStrategy(invalid, invalid).get());
+        }
+        std::string err;
+        EXPECT_FALSE(m.LoadProcessStrategyFromJsonString(invalid, &err));
+        EXPECT_FALSE(err.empty());
+        EXPECT_EQ(process.get(), m.GetStrategy("", "").get()); // Failed replacement retains the current policy.
+    }
+}
+
 // affinity v1 C9: SetGloballyDisabled(true) ⇒ 强制返回 Noop，无视任何配置
 TEST_F(CacheAffinityManagerStrategyTest, GloballyDisabledForcesNoop) {
     CacheAffinityManager m;

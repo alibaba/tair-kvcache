@@ -75,7 +75,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveReadPicksLocalSpec) {
     ReadRequest req;
     req.block_key = 1;
     req.spec_candidates["tp0"] = {&remote, &local};
-    CacheLocation winner; // 任意 winner_tier，仅 ShouldEmitReplicationHint 需要
+    CacheLocation winner; // ResolveRead requires a winning tier before emitting a hint.
     winner.set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
     req.winner_tier = &winner;
 
