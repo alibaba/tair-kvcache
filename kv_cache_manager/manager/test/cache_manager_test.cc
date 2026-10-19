@@ -6433,21 +6433,8 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleBreaksPrefix) {
 
     // stop executor workers so we can inspect queued tasks
     auto &executor = cache_manager_->schedule_plan_executor_;
-    executor->stop_.store(true);
-    executor->condition_.notify_all();
-    for (auto &w : executor->workers_) {
-        if (w.joinable()) {
-            w.join();
-        }
-    }
-    executor->workers_.clear();
+    executor->Stop();
     executor->stop_.store(false);
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        for (auto &queue : executor->task_queues_) {
-            queue.clear();
-        }
-    }
 
     // install interceptor: key 1 exists, key 2 stale, key 3 exists
     auto dsm = registry_manager_->data_storage_manager_;
@@ -6487,12 +6474,9 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleBreaksPrefix) {
     }
 
     // clean up
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        for (auto &queue : executor->task_queues_) {
-            queue.clear();
-        }
-    }
+    // Cancel outside queue_mutex_: delete-task destruction releases its lease.
+    executor->Stop();
+    EXPECT_TRUE(executor->active_location_deletes_.empty());
     dsm->storage_map_["nfs_01"] = original;
 }
 
@@ -6529,21 +6513,8 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_AllStale) {
 
     // stop executor workers
     auto &executor = cache_manager_->schedule_plan_executor_;
-    executor->stop_.store(true);
-    executor->condition_.notify_all();
-    for (auto &w : executor->workers_) {
-        if (w.joinable()) {
-            w.join();
-        }
-    }
-    executor->workers_.clear();
+    executor->Stop();
     executor->stop_.store(false);
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        for (auto &queue : executor->task_queues_) {
-            queue.clear();
-        }
-    }
 
     // install interceptor: all stale
     auto dsm = registry_manager_->data_storage_manager_;
@@ -6569,12 +6540,9 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_AllStale) {
         ASSERT_EQ(1u, executor->WaitingTaskCountLocked());
     }
 
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        for (auto &queue : executor->task_queues_) {
-            queue.clear();
-        }
-    }
+    // Cancel outside queue_mutex_: delete-task destruction releases its lease.
+    executor->Stop();
+    EXPECT_TRUE(executor->active_location_deletes_.empty());
     dsm->storage_map_["nfs_01"] = original;
 }
 
@@ -6611,21 +6579,8 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleSuffix) {
 
     // stop executor workers
     auto &executor = cache_manager_->schedule_plan_executor_;
-    executor->stop_.store(true);
-    executor->condition_.notify_all();
-    for (auto &w : executor->workers_) {
-        if (w.joinable()) {
-            w.join();
-        }
-    }
-    executor->workers_.clear();
+    executor->Stop();
     executor->stop_.store(false);
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        for (auto &queue : executor->task_queues_) {
-            queue.clear();
-        }
-    }
 
     // install interceptor: key 1 valid, key 2 stale, key 3 stale
     auto dsm = registry_manager_->data_storage_manager_;
@@ -6659,12 +6614,9 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleSuffix) {
         ASSERT_EQ(1u, executor->WaitingTaskCountLocked());
     }
 
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        for (auto &queue : executor->task_queues_) {
-            queue.clear();
-        }
-    }
+    // Cancel outside queue_mutex_: delete-task destruction releases its lease.
+    executor->Stop();
+    EXPECT_TRUE(executor->active_location_deletes_.empty());
     dsm->storage_map_["nfs_01"] = original;
 }
 
