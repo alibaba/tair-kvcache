@@ -15,16 +15,27 @@ namespace kv_cache_manager {
 namespace {
 ErrorCode RequestResult(RequestContext *context) { return context->trace_id() == "failure" ? EC_ERROR : EC_OK; }
 
-std::pair<ErrorCode, CacheLocationViewVecWrapper> GetCacheLocationForMetrics(CacheManager *,
-                                                                             RequestContext *context,
-                                                                             const std::string &,
-                                                                             CacheManager::QueryType,
-                                                                             const KeyVector &,
-                                                                             const CacheManager::TokenIdsVector &,
-                                                                             const BlockMask &,
-                                                                             int32_t,
-                                                                             const std::vector<std::string> &) {
-    return {RequestResult(context), CacheLocationViewVecWrapper{}};
+// cpp_stub accepts unrelated function types. Check the member's complete
+// signature before patching it so API changes cannot silently corrupt the ABI.
+template <typename Result, typename... Args>
+void SetCacheManagerStub(Stub &stub,
+                         Result (CacheManager::*method)(Args...),
+                         Result (*replacement)(CacheManager *, Args...)) {
+    stub.set(method, replacement);
+}
+
+ErrorCode GetCacheLocationForMetrics(CacheManager *,
+                                     RequestContext *context,
+                                     const std::string &,
+                                     CacheManager::QueryType,
+                                     const KeyVector &,
+                                     const CacheManager::TokenIdsVector &,
+                                     const BlockMask &,
+                                     int32_t,
+                                     const std::vector<std::string> &,
+                                     CacheLocationViewVecWrapper &,
+                                     std::vector<ReplicationHint> &) {
+    return RequestResult(context);
 }
 
 std::pair<ErrorCode, BatchLocationsView> GetCacheLocationsByBackendForMetrics(CacheManager *,
@@ -148,7 +159,7 @@ TEST_F(MetaServiceImplTest, FollowerRejectsReportEventQueryAndWrite) {
 
 TEST_F(MetaServiceImplTest, GetCacheLocationErrorMetrics) {
     Stub stub;
-    stub.set(ADDR(CacheManager, GetCacheLocation), GetCacheLocationForMetrics);
+    SetCacheManagerStub(stub, &CacheManager::GetCacheLocation, GetCacheLocationForMetrics);
     proto::meta::GetCacheLocationRequest request;
     request.set_instance_id("test-instance");
     request.add_block_keys(1);
