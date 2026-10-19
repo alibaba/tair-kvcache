@@ -21,11 +21,16 @@ import unittest
 
 from e2e_lib import (
     ScenarioEnv, assert_loaded_blocks, assert_report_ok, compare_captures,
-    full_block_hashes, loaded_block_count, send_completions,
-    shared_token_prefix_len, tokenize, wait_for_captures, wait_for_prefix_cached,
+    full_block_hashes, send_completions, shared_token_prefix_len, tokenize,
+    wait_for_captures, wait_for_prefix_cached,
 )
 
 logger = logging.getLogger("vllm_e2e")
+
+
+#: Hoisted so the prompt-fit gate can size the turn-2 request before turn 2
+#: exists (vLLM budgets prompt + output against one context window).
+TURN2_SUFFIX_TEXT = " Now summarize the story in one word."
 
 
 class TestMultiTurn(unittest.TestCase):
@@ -39,12 +44,21 @@ class TestMultiTurn(unittest.TestCase):
             turn1_prompt = ("A short story request. Please write a long, "
                             "detailed story about a robot that learns to paint.")
             prompt_tokens = tokenize(vllm.base_url(), turn1_prompt)
+
             prompt_blocks = len(prompt_tokens) // mbs
 
             # ---- Turn 1: generate output crossing >= 1 manager block
             # boundary (3 blocks for full-attn's mbs=16; 1 block for hybrid's
             # mbs=528 to keep decode time bounded).
             max_tokens = (mbs + 32) if env.hybrid else (mbs * 3 + 5)
+            # vLLM budgets prompt plus requested output against the same
+            # context window, so the fit gate has to see both -- and the
+            # request that has to fit is turn 2's, i.e. prompt + this output +
+            # the turn-2 suffix + its own (small) completion.
+            env.guard_prompt_fits(
+                prompt_tokens, "multi_turn",
+                max_tokens=max_tokens
+                + len(tokenize(vllm.base_url(), TURN2_SUFFIX_TEXT)) + 4)
             resp = send_completions(
                 vllm.base_url(), [turn1_prompt], max_tokens=max_tokens,
                 ignore_eos=True, return_token_ids=True)[0]
@@ -78,8 +92,7 @@ class TestMultiTurn(unittest.TestCase):
 
             # ---- Turn 2: conversation continues; prompt embeds turn 1's
             # prompt + output as token ids (immune to detokenization drift).
-            turn2_suffix = tokenize(vllm.base_url(),
-                                    " Now summarize the story in one word.")
+            turn2_suffix = tokenize(vllm.base_url(), TURN2_SUFFIX_TEXT)
             turn2_ids = turn1_ids + turn2_suffix
             shared_blocks = min(
                 shared_token_prefix_len(turn1_ids, turn2_ids) // mbs,
@@ -102,9 +115,7 @@ class TestMultiTurn(unittest.TestCase):
             # And the loaded decode-block KV must verify -- the loaded region
             # is what vLLM gave slots for: the tail window of every group, plus
             # the whole match for a full-attention group.
-            load_blocks = loaded_block_count(
-                shared_blocks * mbs, env.window, mbs, env.full_attention_group,
-                env.window_kind)
+            load_blocks = env.window_geometry().loaded_blocks(shared_blocks * mbs)
             hashes = full_block_hashes(turn2_ids, mbs)
             wait_for_captures(env.capture_dir, "loaded",
                               expected=env.tp_size * load_blocks, timeout=180)

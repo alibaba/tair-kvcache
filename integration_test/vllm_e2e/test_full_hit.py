@@ -22,8 +22,8 @@ from pathlib import Path
 import unittest
 
 from e2e_lib import (
-    ScenarioEnv, assert_loaded_blocks, full_block_hashes, loaded_block_count,
-    make_base_prompts, send_completions, tokenize, wait_for_captures,
+    ScenarioEnv, assert_loaded_blocks, full_block_hashes, make_base_prompts,
+    send_completions, tokenize, wait_for_captures,
     wait_for_prefix_cached,
 )
 
@@ -42,6 +42,7 @@ class TestFullHit(unittest.TestCase):
             # manager block size (>= 2 blocks so the cap has room to drop one).
             toks = tokenize(vllm.base_url(),
                             make_base_prompts(1, env.hybrid, env.window)[0])
+            env.guard_prompt_fits(toks, "full_hit", max_tokens=4)
             num_blocks = len(toks) // mbs
             self.assertGreaterEqual(
                 num_blocks, 2, f"prompt too short: {len(toks)} tokens, mbs={mbs}")
@@ -114,9 +115,9 @@ class TestFullHit(unittest.TestCase):
             # prefix when the model has a full-attention group.
             if expected_hit:
                 matched_blocks = expected_hit // mbs
-                load_blocks = loaded_block_count(
-                    expected_hit, env.window, mbs, env.full_attention_group,
-                    env.window_kind)
+                # Registered geometry, like every other scenario: the extra
+                # retained tokens of a purely windowed model live there.
+                load_blocks = env.window_geometry().loaded_blocks(expected_hit)
                 hashes = full_block_hashes(prompt_ids, mbs)
                 wait_for_captures(env.capture_dir, "loaded",
                                   expected=env.tp_size * load_blocks, timeout=180)

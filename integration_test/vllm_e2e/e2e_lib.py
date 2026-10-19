@@ -14,8 +14,8 @@ from lib_utils import (  # noqa: F401
     tokenize, get_manager_block_size, block_token_hash, full_block_hashes,
     wait_for_prefix_cached, send_completions, count_captures,
     wait_for_captures, compare_captures, loaded_capture_keys,
-    assert_loaded_blocks, assert_loaded_nonempty, assert_pinned_ok,
-    assert_report_ok, make_base_prompts,
+    assert_loaded_blocks, assert_loaded_nonempty, assert_no_capture_error,
+    assert_pinned_ok, assert_report_ok, make_base_prompts,
     shared_token_prefix_len,
 )
 from servers import (  # noqa: F401

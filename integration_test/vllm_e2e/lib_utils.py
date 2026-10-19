@@ -7,11 +7,13 @@ import glob
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Optional
 
 import requests
@@ -54,6 +56,13 @@ _LOCAL_LAYER_TYPES = ("sliding_attention", "sliding_window", "chunked_local",
 #: without a per-config marker (gemma-3 declares sliding_window + an arch, not
 #: a layer_types list).
 _SWA_ARCH_MARKERS = ("Gemma2", "Gemma3", "GptOss", "Llama4")
+#: Architectures whose vLLM config class turns them into R-SWA: the whole
+#: prefill stays visible and only the decode gap is evicted (RSWASpec, window
+#: rswa_window). vLLM *injects* its default window when the checkpoint does not
+#: declare one, so the architecture is the reliable signal and the window falls
+#: back to the same value vLLM uses.
+_RSWA_ARCH_MARKERS = ("UnlimitedOCR",)
+_RSWA_DEFAULT_WINDOW = 128
 
 
 def is_swa_model(model_path: str) -> bool:
@@ -69,6 +78,9 @@ def is_swa_model(model_path: str) -> bool:
     The signals are the ones vLLM itself keys on, ORed:
     * ``layer_types`` naming a local layer (gemma-3-1b/gpt-oss style);
     * ``sliding_window_pattern`` (gemma-2 style interleave);
+    * an R-SWA checkpoint (``rswa_window``, or the architecture whose config
+      class injects it): it evicts the decode gap, so it needs the same
+      orchestration even though its manager inherits full attention;
     * a known interleaved family architecture *and* a declared window.
     The architecture alone is not enough (a plain window value is not either:
     Qwen2 declares ``sliding_window=131072`` while never using it -- its
@@ -80,58 +92,89 @@ def is_swa_model(model_path: str) -> bool:
     except Exception:
         return False
     text_cfg = cfg.get("text_config", cfg)
-    window = window_tokens(model_path)
     layer_types = text_cfg.get("layer_types") or []
     if any(t in _LOCAL_LAYER_TYPES for t in layer_types):
         return True
     pattern = text_cfg.get("sliding_window_pattern")
     if isinstance(pattern, int) and pattern > 0:
         return True
+    kind = window_kind(model_path)
+    if kind == "rswa_gap":
+        return True
+    if kind is None:
+        return False
     archs = ", ".join(cfg.get("architectures", []) or [])
-    return window is not None and any(m in archs for m in _SWA_ARCH_MARKERS)
+    return any(m in archs for m in _SWA_ARCH_MARKERS)
 
 
 def window_kind(model_path: str) -> Optional[str]:
     """Which retention rule the model's window follows (None = no window).
 
-    vLLM keeps the two windowed shapes in separate managers with different
-    skip rules, so the harness must not apply one's arithmetic to the other:
+    vLLM keeps the windowed shapes in separate managers with different skip
+    rules, so the harness must not apply one's arithmetic to another:
 
     * ``"sliding"`` -- ``SlidingWindowManager``: only the last ``window`` tokens
       are attended, so the skipped prefix grows with every step;
-    * ``"chunked"`` -- ``ChunkedLocalAttentionManager``: attention is confined
+    * ``"chunked_local"`` -- ``ChunkedLocalAttentionManager``: attention is confined
       to the *current* chunk, so the skipped prefix is everything before the
-      chunk the next token falls in (``H // chunk * chunk``).
+      chunk the next token falls in (``H // chunk * chunk``);
+    * ``"rswa_gap"`` -- ``RSWASpec`` (R-SWA): the whole prefill stays visible
+      and only the decode gap is evicted; its manager inherits the
+      full-attention one, so nothing is parked on the null block (see
+      ``skipped_window_tokens``).
 
+    The names are the connector's own ``WindowRetention.kind`` literals, so the
+    config-derived kind and the registered one can be compared directly.
     Sliding wins when a config declares both (that is also the key order
-    ``window_tokens`` has always used).
+    ``window_tokens`` has always used); R-SWA is tested first because
+    ``rswa_window`` is specific to it.
     """
     try:
         cfg = _model_config(model_path)
     except Exception:
         return None
     text_cfg = cfg.get("text_config", cfg)
+    if _has_rswa(text_cfg, cfg):
+        return "rswa_gap"
     for key, kind in (("sliding_window", "sliding"),
-                      ("attention_chunk_size", "chunked")):
+                      ("attention_chunk_size", "chunked_local")):
         value = text_cfg.get(key)
         if isinstance(value, int) and value > 0:
             return kind
     return None
 
 
+def _has_rswa(text_cfg: dict, cfg: dict) -> bool:
+    """Is this an R-SWA checkpoint (declared or by architecture)?"""
+    for source in (text_cfg, cfg):
+        value = source.get("rswa_window")
+        if isinstance(value, int) and value > 0:
+            return True
+    archs = ", ".join(cfg.get("architectures", []) or [])
+    return any(m in archs for m in _RSWA_ARCH_MARKERS)
+
+
 def window_tokens(model_path: str) -> Optional[int]:
     """The attention window of a windowed model, in tokens (None = full).
 
     Reads the same config field the connector turns into
-    ``WindowRetention.window_tokens`` (SlidingWindowSpec.sliding_window, or
-    ChunkedLocalAttentionSpec.attention_chunk_size for chunked-local);
-    ``window_kind`` says which of the two it is.
+    ``WindowRetention.window_tokens`` (SlidingWindowSpec.sliding_window,
+    ChunkedLocalAttentionSpec.attention_chunk_size, or RSWASpec.rswa_window);
+    ``window_kind`` says which rule it is. An R-SWA checkpoint may leave
+    ``rswa_window`` out -- vLLM injects its default then -- so the same default
+    is used here.
     """
     try:
         cfg = _model_config(model_path)
     except Exception:
         return None
     text_cfg = cfg.get("text_config", cfg)
+    if _has_rswa(text_cfg, cfg):
+        for source in (text_cfg, cfg):
+            value = source.get("rswa_window")
+            if isinstance(value, int) and value > 0:
+                return value
+        return _RSWA_DEFAULT_WINDOW
     for key in ("sliding_window", "attention_chunk_size"):
         value = text_cfg.get(key)
         if isinstance(value, int) and value > 0:
@@ -151,13 +194,17 @@ def skipped_window_tokens(matched_tokens: int, window: Optional[int],
     * chunked local: ``H // chunk_size * chunk_size`` -- the whole chunks before
       the one the next token falls in, *not* an H-(window-1) tail (H=13,
       chunk=8 -> 8 skipped tokens, not 6). It ignores ``extra_retained``: that
-      term only exists in the sliding manager.
+      term only exists in the sliding manager;
+    * R-SWA: nothing. ``RSWAManager`` inherits ``FullAttentionManager`` and does
+      not override ``get_num_skipped_tokens``, so no block table entry is ever
+      parked on the null block -- the gap is evicted by the attention mask, not
+      by the block table, and a hit must carry the whole visible prefix.
 
     Full attention (window None) never skips.
     """
-    if window is None:
+    if window is None or kind == "rswa_gap":
         return 0
-    if kind == "chunked":
+    if kind == "chunked_local":
         return (matched_tokens // window) * window
     return max(0, matched_tokens - (window - 1) - extra_retained)
 
@@ -214,7 +261,8 @@ def has_full_attention_group(model_path: str) -> bool:
 def loaded_block_count(matched_tokens: int, window: Optional[int],
                        manager_block_size: int,
                        full_attention_group: bool = True,
-                       kind: str = "sliding") -> int:
+                       kind: str = "sliding",
+                       extra_retained: int = 0) -> int:
     """Manager blocks whose KV a hit of that size really loads.
 
     vLLM hands out slots per group, so the loaded set is a union: every group
@@ -232,7 +280,7 @@ def loaded_block_count(matched_tokens: int, window: Optional[int],
     if window is None or full_attention_group:
         return blocks
     return window_tail_blocks(matched_tokens, window, manager_block_size,
-                              kind=kind)
+                              extra_retained=extra_retained, kind=kind)
 
 
 def is_hybrid_model(model_path: str) -> bool:
@@ -498,16 +546,66 @@ def count_captures(capture_dir: str, kind: str) -> int:
     return len(glob.glob(os.path.join(capture_dir, f"{kind}_*.pt")))
 
 
+class CaptureVerificationError(AssertionError):
+    """A capture-side *verification* assertion fired (e.g. the null-page guard).
+
+    Distinct from a plain capture-count timeout: this means the verification
+    *ran and failed*, which the mutation meta-test counts as its expected catch
+    while a timeout stays a harness failure. Only failures of the harness's own
+    verification assertions map here -- a capture *implementation* error is a
+    CaptureToolError, so a broken capture cannot be mistaken for the injected
+    corruption the meta-test is supposed to observe.
+    """
+
+
+class CaptureToolError(RuntimeError):
+    """The capture mechanism itself broke (an index, device or I/O error).
+
+    Never an acceptable "expected catch" anywhere: every scenario, the mutation
+    meta-test included, must fail on it.
+    """
+
+
+def capture_error_from_marker(marker: str) -> BaseException:
+    """Turn the connector's capture-error marker into the right exception.
+
+    The capture hooks run inside vLLM's step and must never break inference, so
+    they record the failure in a file the driver polls; the *type* therefore has
+    to travel with the message (the reader has to tell "the verification
+    asserted" from "the capture broke").
+    """
+    with open(marker) as f:
+        raw = f.read()
+    try:
+        rec = json.loads(raw)
+        message = str(rec["message"])
+        is_assertion = bool(rec["is_assertion"])
+        kind = str(rec["type"])
+    except Exception:
+        return CaptureToolError(
+            f"unreadable capture-error marker ({raw[:200]!r})")
+    if is_assertion:
+        return CaptureVerificationError(
+            f"capture-side verification failed: {message}")
+    return CaptureToolError(
+        f"capture implementation failed ({kind}): {message}")
+
+
 def wait_for_captures(capture_dir: str, kind: str, expected: int,
                       timeout: float = 120.0) -> int:
     """Wait until at least ``expected`` captures of ``kind`` exist.
 
     Raises AssertionError on timeout: a missing capture means the connector
     never exercised the code path under test, so the scenario must fail rather
-    than silently verify fewer blocks.
+    than silently verify fewer blocks. Raises CaptureVerificationError as soon
+    as the connector wrote its capture-error marker (the capture itself is a
+    verification mechanism; its assertion failing is the scenario failing).
     """
+    marker = os.path.join(capture_dir, "capture_error.txt")
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if os.path.exists(marker):
+            raise capture_error_from_marker(marker)
         n = count_captures(capture_dir, kind)
         if n >= expected:
             logger.info("saw %d/%d %s captures", n, expected, kind)
@@ -516,6 +614,20 @@ def wait_for_captures(capture_dir: str, kind: str, expected: int,
     n = count_captures(capture_dir, kind)
     raise AssertionError(
         f"timed out waiting for {kind} captures: got {n}, want {expected}")
+
+
+def assert_no_capture_error(capture_dir: str) -> None:
+    """Raise the marker's typed error if the capture hooks recorded one.
+
+    ``wait_for_captures`` is the usual reader, but a path that deliberately
+    does not wait for capture counts (blocks whose loads were sabotaged on
+    purpose) still has to call this: otherwise a capture-side verification
+    assertion or a broken capture would be silently accepted there, which is
+    exactly the kind of failure the marker exists to surface.
+    """
+    marker = os.path.join(capture_dir, "capture_error.txt")
+    if os.path.exists(marker):
+        raise capture_error_from_marker(marker)
 
 
 def compare_captures(capture_dir: str) -> dict:
@@ -668,6 +780,54 @@ def assert_loaded_nonempty(capture_dir: str, tp_size: int):
                 len(paths), tp_size)
 
 
+#: The connector prints one WindowRetention per windowed group in its
+#: registration line, e.g.
+#: ``retention=WindowRetention(kind='sliding', window_tokens=128,
+#: extra_retained_tokens=0)``.
+_WINDOWED_RETENTION_RE = re.compile(
+    r"WindowRetention\(kind='([a-z_]+)', window_tokens=(\d+), "
+    r"extra_retained_tokens=(\d+)\)")
+
+
+@dataclass(frozen=True)
+class RetentionFacts:
+    """What the connector's registered windowed groups actually keep.
+
+    Parsed from the connector's own registration line (the metadata it plans
+    transfers with) rather than from the model config, because the config is
+    not authoritative: vLLM's R-SWA config class injects its default window
+    when the checkpoint omits one, and ``extra_retained_tokens`` is a spec-level
+    field no checkpoint declares. ``kind`` is None when no group is windowed
+    (full prefix). The window and the extra retain are the widest values seen:
+    the loaded region is the *union* over groups, so the widest group's tail
+    bounds it.
+    """
+
+    kind: Optional[str] = None
+    window_tokens: Optional[int] = None
+    extra_retained_tokens: int = 0
+
+
+def retention_facts_from_logs(lines: list) -> RetentionFacts:
+    """Fold the registration lines' WindowRetention reprs into one fact set."""
+    seen = set()
+    for line in lines:
+        text = line[0] if isinstance(line, tuple) else line
+        for kind, window, extra in _WINDOWED_RETENTION_RE.findall(text):
+            seen.add((kind, int(window), int(extra)))
+    if not seen:
+        return RetentionFacts()
+    kinds = {kind for kind, _, _ in seen}
+    assert len(kinds) == 1, (
+        f"the connector registered windowed groups with different retention "
+        f"kinds {sorted(kinds)}; the harness models one window rule per run")
+    return RetentionFacts(
+        kind=kinds.pop(),
+        window_tokens=max(window for _, window, _ in seen),
+        extra_retained_tokens=max(extra for _, _, extra in seen),
+    )
+
+
 def block_tables_from_logs(lines: list) -> int:
     """Block-table count from the connector's registration line(s).
 
@@ -685,22 +845,43 @@ def block_tables_from_logs(lines: list) -> int:
 
 
 def assert_pinned_ok(lines: list, limit_gib: float, model_path: str,
-                     expected_ranks: int = 1):
+                     expected_ranks: int = 1,
+                     expected_reports: Optional[int] = None,
+                     reported_ranks: Optional[set] = None,
+                     declared_tp: Optional[set] = None):
     """Assert every `total pinned = X GiB` line of the run stays under budget.
 
     PR2 made the pinned total machine-parseable exactly so this gate can read
-    it; the connector prints one line per pool-planning instance, i.e. one per
-    tp rank (plus one per restarted server). Both failure directions are hard:
-    a line above the budget, and fewer lines than ranks -- losing one worker's
-    report must not pass on the surviving worker's value, otherwise the gate
-    can be bypassed exactly when per-rank pool planning regresses.
+    it; the connector's pool planning prints one line per tp rank per engine
+    start. Both failure directions are hard: a line above the budget, and
+    missing reports.
+
+    The report itself carries no rank, so "one per rank" is checked from both
+    sides: the *count* must reach ``expected_reports`` (tp_size x engine
+    starts, defaults to ``expected_ranks``), and every expected rank must
+    appear in the rank-tagged lines the same worker prints at init
+    (``reported_ranks``). Counting alone would let a duplicated report from one
+    rank cover a silent one after a restart -- which is exactly when the gate
+    matters, since every restart is a fresh pool plan.
     """
     values = [float(g[0]) if isinstance(g, tuple) else float(g) for g in lines]
-    assert len(values) >= expected_ranks, (
+    want_reports = expected_reports if expected_reports is not None else expected_ranks
+    assert len(values) >= want_reports, (
         f"pinned report incomplete: {len(values)} 'total pinned' line(s) in "
         f"the connector logs of {model_path}, expected at least "
-        f"{expected_ranks} (one per tp rank); the pinned gate cannot cover "
-        f"every rank")
+        f"{want_reports} ({expected_ranks} tp rank(s) x engine start(s)); the "
+        f"pinned gate cannot cover every rank")
+    if reported_ranks is not None:
+        missing = set(range(expected_ranks)) - {int(r) for r in reported_ranks}
+        assert not missing, (
+            f"tp rank(s) {sorted(missing)} never reported their worker init in "
+            f"the connector logs of {model_path} (saw {sorted(reported_ranks)}); "
+            f"the pinned gate cannot cover every rank")
+    if declared_tp:
+        assert declared_tp == {expected_ranks}, (
+            f"the connector reports tp_size(s) {sorted(declared_tp)} but the "
+            f"harness started the engine with {expected_ranks}; the gate would "
+            f"count the wrong number of reports")
     if not values:
         raise AssertionError(
             f"no 'total pinned' line found in the connector logs of "

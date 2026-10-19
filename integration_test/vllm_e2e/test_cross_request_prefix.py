@@ -47,8 +47,7 @@ import requests
 
 from e2e_lib import (
     ScenarioEnv, assert_loaded_blocks, assert_loaded_nonempty, full_block_hashes,
-    loaded_block_count, send_completions, tokenize, wait_for_captures,
-    wait_for_prefix_cached,
+    send_completions, tokenize, wait_for_captures, wait_for_prefix_cached,
 )
 
 logger = logging.getLogger("vllm_e2e")
@@ -139,6 +138,8 @@ class TestCrossRequestPrefix(unittest.TestCase):
             # match).
             sentences = 260 if env.hybrid else (120 if env.window else 60)
             toks_a = tokenize(vllm.base_url(), long_prompt(sentences))
+            env.guard_prompt_fits(toks_a, "cross_request_prefix",
+                                  max_tokens=4)
             # Cap the length so prompt + MAX_TOKENS stays inside the model len.
             blocks_a = min(len(toks_a) // mbs,
                            (self.MAX_MODEL_LEN - self.MAX_TOKENS) // mbs)
@@ -257,9 +258,8 @@ class TestCrossRequestPrefix(unittest.TestCase):
                     # covers exactly the slots vLLM handed out: the sliding
                     # groups' tail window of where the match ended, plus the
                     # whole match for the full-attention group.
-                    load_blocks = loaded_block_count(
-                        candidates * mbs, env.window, mbs,
-                        env.full_attention_group, env.window_kind)
+                    load_blocks = env.window_geometry().loaded_blocks(
+                        candidates * mbs)
                     hashes = full_block_hashes(toks_b, mbs)
                     self.assertEqual(len(hashes), candidates)
                     wait_for_captures(env.capture_dir, "loaded",

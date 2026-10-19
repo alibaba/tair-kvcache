@@ -40,8 +40,9 @@ from urllib.parse import urlparse
 import requests
 
 from e2e_lib import (
-    ScenarioEnv, compare_captures, full_block_hashes, make_base_prompts,
-    send_completions, tokenize, wait_for_captures, wait_for_prefix_cached,
+    ScenarioEnv, assert_no_capture_error, compare_captures, full_block_hashes,
+    make_base_prompts, send_completions, tokenize, wait_for_captures,
+    wait_for_prefix_cached,
 )
 
 logger = logging.getLogger("vllm_e2e")
@@ -103,6 +104,11 @@ class TestLoadFailure(unittest.TestCase):
             prompt = make_base_prompts(1, env.hybrid, env.window)[0]
             suffix = " Now answer: what is 2+2?"
             toks = tokenize(vllm.base_url(), prompt)
+            # Same gate as the other scaled-prompt scenarios: a window too wide
+            # for --max-model-len must skip loudly instead of letting the HTTP
+            # request fail before the storage-loss path is exercised.
+            env.guard_prompt_fits(toks, "load_failure",
+                                  max_tokens=len(tokenize(vllm.base_url(), suffix)) + 4)
             save_blocks = len(toks) // mbs
             self.assertGreaterEqual(save_blocks, 2)
 
@@ -154,6 +160,11 @@ class TestLoadFailure(unittest.TestCase):
                     r"load failed for \d+/\d+ blocks .*hybrid")
                 self.assertTrue(swallowed,
                                 "multi-block-table load failure was not logged")
+                # No capture *count* is expected here (the loads failed on
+                # purpose), but the marker still has to be read: it is the only
+                # other channel a capture-side assertion or a broken capture
+                # uses, and returning without it would accept either silently.
+                assert_no_capture_error(env.capture_dir)
                 return
 
             # Single block table: vLLM was told about the invalid blocks...
@@ -168,26 +179,40 @@ class TestLoadFailure(unittest.TestCase):
             # recomputed over -- their captures mismatch in low bits (a
             # different attention kernel path), which is exactly the
             # "recomputed" disposition, not a transfer failure.
-            wait_for_captures(env.capture_dir, "loaded", expected=keep,
+            # vLLM truncates the hit at the first deleted block, so the hit
+            # this request really serves is the kept head; what gets *loaded*
+            # is the geometry's region for that hit (the whole hit for full
+            # attention and R-SWA, only the tail window for a purely windowed
+            # model whose blocks outside the window are parked on the null
+            # page). The surviving captures are that region intersected with
+            # the undeleted head.
+            geom = env.window_geometry()
+            load_blocks = geom.loaded_blocks(keep * mbs)
+            wait_for_captures(env.capture_dir, "loaded", expected=load_blocks,
                               timeout=180)
             report = compare_captures(env.capture_dir)
             hashes = full_block_hashes(toks, mbs)
             ranks = [f"tp{r}" for r in range(env.tp_size)]
             kept_keys = {(r, h) for r in ranks for h in hashes[:keep]}
             deleted_keys = {(r, h) for r in ranks for h in hashes[keep:]}
+            loaded_keys = {(r, h) for r in ranks
+                           for h in hashes[keep - load_blocks:keep]}
             failed_keys = {f["key"] for f in report["failures"]}
             self.assertFalse(
-                failed_keys & kept_keys,
-                f"surviving loaded blocks mismatched: {failed_keys & kept_keys}")
+                failed_keys & loaded_keys,
+                f"surviving loaded blocks mismatched: "
+                f"{failed_keys & loaded_keys} (kept head: {keep}, loaded "
+                f"region: [{keep - load_blocks}, {keep}))")
             self.assertTrue(
                 failed_keys <= deleted_keys,
                 f"mismatches outside the deleted blocks: "
                 f"{failed_keys - deleted_keys}")
-            matched_kept = kept_keys & set(report["matched_keys"])
+            matched_loaded = loaded_keys & set(report["matched_keys"])
             self.assertEqual(
-                len(matched_kept), keep * env.tp_size,
-                f"only {len(matched_kept)}/{keep * env.tp_size} surviving "
-                f"blocks verified")
+                len(matched_loaded), load_blocks * env.tp_size,
+                f"only {len(matched_loaded)}/{load_blocks * env.tp_size} "
+                f"loaded surviving blocks verified (kept head: {keep}, "
+                f"window: {geom.window})")
         finally:
             # Stop the processes even if the gate raises: a leaked manager or
             # engine would hold ports and GPU memory and cascade into the next
