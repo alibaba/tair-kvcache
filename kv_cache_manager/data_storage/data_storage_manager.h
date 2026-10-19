@@ -36,25 +36,31 @@ public:
     ErrorCode
     RegisterStorage(RequestContext *request_context, const std::string &name, const StorageConfig &storage_config);
     ErrorCode UnRegisterStorage(const std::string &name);
-    void SetAsyncCopyReferenceChecker(std::function<bool(const std::string &)> checker);
+    StorageBackendSnapshot CaptureStorageBackends(const std::vector<std::string> &names = {}) const;
+    bool WithCurrentStorageBackends(const StorageBackendSnapshot &snapshot, const std::function<void()> &action) const;
+    bool IsStorageBackendCurrent(const StorageBackendSnapshot &snapshot, const std::string &name) const;
     ErrorCode DoCleanup();
 
     std::vector<std::pair<ErrorCode, DataStorageUri>> Create(RequestContext *request_context,
                                                              const std::string &unique_name,
                                                              const std::vector<std::string> &keys,
                                                              size_t size_per_key,
-                                                             std::function<void()> cb);
+                                                             std::function<void()> cb,
+                                                             const StorageBackendSnapshot &snapshot = {});
 
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const std::string &unique_name,
                                   const std::vector<DataStorageUri> &storage_uris,
-                                  std::function<void()> cb);
+                                  std::function<void()> cb,
+                                  const StorageBackendSnapshot &snapshot = {},
+                                  bool *storage_removed = nullptr);
     // 跨存储层复制：用 unique_name 对应的 backend 执行 src_uris[i] -> dst_uris[i] 的复制。
     // 可选能力，backend 不支持时返回逐项 EC_UNIMPLEMENTED；storage 不存在返回逐项 EC_NOENT。
     std::vector<ErrorCode> Copy(RequestContext *request_context,
                                 const std::string &unique_name,
                                 const std::vector<DataStorageUri> &src_uris,
-                                const std::vector<DataStorageUri> &dst_uris);
+                                const std::vector<DataStorageUri> &dst_uris,
+                                const StorageBackendSnapshot &snapshot = {});
     bool SupportsAsyncCopy(const std::string &unique_name) const;
     AsyncCopySubmitResult CopyAsync(RequestContext *request_context,
                                     const std::string &unique_name,
@@ -62,16 +68,11 @@ public:
                                     const std::vector<DataStorageUri> &dst_uris,
                                     const std::string &operation_id,
                                     const AsyncCopyOptions &options,
-                                    AsyncCopyRemoteSubmitCompletion remote_submit_completion,
-                                    AsyncCopyCompletion completion);
-    AsyncCopySubmitResult ResumeAsyncCopy(RequestContext *request_context,
-                                          const std::string &unique_name,
-                                          const std::vector<std::string> &backend_task_ids,
-                                          size_t expected_items,
-                                          const std::string &operation_id,
-                                          const AsyncCopyOptions &options,
-                                          AsyncCopyCompletion completion);
-    ErrorCode RequestCancelAsyncCopy(const std::string &unique_name, const std::string &operation_id);
+                                    AsyncCopyCompletion completion,
+                                    const StorageBackendSnapshot &snapshot = {});
+    ErrorCode RequestCancelAsyncCopy(const std::string &unique_name,
+                                     const std::string &operation_id,
+                                     const StorageBackendSnapshot &snapshot = {});
     std::vector<bool>
     Exist(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris, bool fastpath = false);
     std::vector<ErrorCode> Lock(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris);
@@ -88,6 +89,8 @@ public:
 private:
     std::shared_ptr<DataStorageBackend> CreateStorageBackend(const DataStorageType &type);
     std::string ToString(DataStorageType type);
+    bool StorageBackendsCurrentLocked(const StorageBackendSnapshot &snapshot) const;
+    bool StorageBackendCurrentLocked(const StorageBackendSnapshot &snapshot, const std::string &name) const;
 
 private:
     mutable std::shared_mutex rw_lock_;
@@ -95,7 +98,6 @@ private:
     // stroage unique name -> storage_backend
     std::map<std::string, std::shared_ptr<DataStorageBackend>> storage_map_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
-    std::function<bool(const std::string &)> async_copy_reference_checker_;
 };
 
 } // namespace kv_cache_manager

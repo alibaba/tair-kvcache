@@ -140,11 +140,14 @@ public:
         ErrorCode ec = EC_UNKNOWN;
         // EC_OK 时是可供业务使用的 location id；失败时若非空，仅可作为回滚定位符。
         std::string location_id;
+        // Optional exact identity captured when the WRITING location is created.
+        std::string location_value;
     };
     ErrorCode BatchAddLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
-                               std::vector<AddLocationResult> &out_results);
+                               std::vector<AddLocationResult> &out_results,
+                               bool capture_location_values = false);
     struct AddLocationRollbackPlan {
         // Confirmed-successful items (EC_OK + non-empty location id). The
         // caller submits these to the standard location delete pipeline.
@@ -340,17 +343,13 @@ public:
         // This closes the gap between a cleanup scan and its status CAS when
         // a stable location id is refreshed by a newer snapshot.
         std::string expected_location_value;
-        // Optional guard ownership check/mutation.  If expected_operation_id is
-        // non-empty, the location must carry that exact operation guard.
-        std::string expected_operation_id;
-        // Optional state check used by destructive/manual transitions.  NONE
-        // means no state predicate.
-        MigrationCopyGuardState expected_migration_copy_guard_state = MigrationCopyGuardState::MCGS_NONE;
-        // Used only when installing the first SUBMITTING guard.  The target
-        // must still be unowned; never overwrite another operation's fence.
-        bool expected_migration_copy_guard_absent = false;
-        bool clear_migration_copy_guard = false;
-        std::shared_ptr<MigrationCopyGuard> new_migration_copy_guard;
+        // Optional source condition checked under the same block RMW lock as
+        // the target CAS. Source slots are read-only, never upserted. This is
+        // a completion-time condition, not a persistent migration/source pin.
+        std::string expected_source_location_id;
+        int64_t expected_source_create_time = 0;
+        CacheLocationStatus expected_source_status = CLS_SERVING;
+        std::string expected_source_location_value;
     };
     ErrorCode BatchCASLocationStatus(RequestContext *request_context,
                                      const KeyVector &keys,
@@ -360,6 +359,9 @@ public:
     struct LocationCADTask {
         std::string location_id;
         CacheLocationStatus expect_status;
+        // Optional identity fence for delayed/retried physical deletion. A
+        // newer location may already have the same id and DELETING status.
+        std::string expected_location_value;
     };
     ErrorCode BatchCADLocationStatus(RequestContext *request_context,
                                      const KeyVector &keys,

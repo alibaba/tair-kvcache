@@ -272,10 +272,6 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
         static_cast<proto::admin::MigrationCopyExecutionMode>(cache_config_info.migration_copy_execution_mode()));
     migration_config->mutable_copy_max_inflight_bytes()->set_value(
         cache_config_info.migration_copy_max_inflight_bytes());
-    migration_config->mutable_copy_max_quarantine_operations()->set_value(
-        cache_config_info.migration_copy_max_quarantine_operations());
-    migration_config->mutable_copy_max_quarantine_bytes()->set_value(
-        cache_config_info.migration_copy_max_quarantine_bytes());
     migration_config->mutable_copy_operation_deadline_ms()->set_value(
         cache_config_info.migration_copy_operation_deadline_ms());
     migration_config->mutable_copy_poll_initial_interval_ms()->set_value(
@@ -348,15 +344,7 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     cache_config_info.set_migration_copy_max_inflight_bytes(
         proto_migration_config.has_copy_max_inflight_bytes()
             ? proto_migration_config.copy_max_inflight_bytes().value()
-            : 0);
-    cache_config_info.set_migration_copy_max_quarantine_operations(
-        proto_migration_config.has_copy_max_quarantine_operations()
-            ? proto_migration_config.copy_max_quarantine_operations().value()
-            : 0);
-    cache_config_info.set_migration_copy_max_quarantine_bytes(
-        proto_migration_config.has_copy_max_quarantine_bytes()
-            ? proto_migration_config.copy_max_quarantine_bytes().value()
-            : 0);
+            : MigrationConfig::kDefaultCopyMaxInflightBytes);
     cache_config_info.set_migration_copy_operation_deadline_ms(
         proto_migration_config.has_copy_operation_deadline_ms()
             ? proto_migration_config.copy_operation_deadline_ms().value()

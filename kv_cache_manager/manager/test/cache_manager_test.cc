@@ -469,6 +469,29 @@ private:
     std::atomic<size_t> deleted_uri_count_{0};
 };
 
+class FailingDeleteBackend : public DeleteRecordingBackend {
+public:
+    using DeleteRecordingBackend::DeleteRecordingBackend;
+
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &uris,
+           const std::string &trace_id,
+           std::function<void()> cb) override {
+        delete_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (allow_deletes_.load(std::memory_order_acquire)) {
+            return DeleteRecordingBackend::Delete(uris, trace_id, std::move(cb));
+        }
+        return std::vector<ErrorCode>(uris.size(), EC_ERROR);
+    }
+
+    void AllowDeletes() { allow_deletes_.store(true, std::memory_order_release); }
+    size_t GetDeleteCallCount() const { return delete_calls_.load(std::memory_order_relaxed); }
+
+private:
+    std::atomic<size_t> delete_calls_{0};
+    std::atomic<bool> allow_deletes_{false};
+};
+
 class BlockingDeleteBackend : public DataStorageBackend {
 public:
     explicit BlockingDeleteBackend(std::shared_ptr<DataStorageBackend> delegate)
@@ -728,14 +751,14 @@ public:
         return snapshot_response.committed_snapshot_version();
     }
 
-    ControllableMetaLocalBackend *InstallControllableMetaBackend() {
-        auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ControllableMetaLocalBackend *InstallControllableMetaBackend(const std::string &instance_id = "test_instance") {
+        auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer(instance_id);
         if (!indexer) {
             return nullptr;
         }
         auto config = std::make_shared<MetaStorageBackendConfig>();
         auto controlled = std::make_unique<ControllableMetaLocalBackend>();
-        if (controlled->Init("test_instance", config) != EC_OK || controlled->Open() != EC_OK) {
+        if (controlled->Init(instance_id, config) != EC_OK || controlled->Open() != EC_OK) {
             return nullptr;
         }
         auto *controlled_raw = controlled.get();
@@ -1486,6 +1509,187 @@ TEST_F(CacheManagerTest, TestRemoveInstanceDuringMetaRecoveryTransition) {
     EXPECT_TRUE(transitioned);
     EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
     EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance"));
+}
+
+TEST_F(CacheManagerTest, TestPendingDeleteDoesNotVetoInstanceOrStorageRemoval) {
+    const std::string instance_id = "pending_delete_removal_instance";
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     instance_id,
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>())
+                  .first);
+    auto *searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    ASSERT_NE(nullptr, searcher);
+    auto location = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/pending-delete?size=1")});
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(searcher, request_context_.get(), {123}, {location}, ids));
+    ASSERT_EQ(1u, ids.size());
+
+    auto executor = cache_manager_->schedule_plan_executor_;
+    CacheLocationDelRequest request;
+    request.instance_id = instance_id;
+    request.block_keys = {123};
+    request.location_ids = {ids};
+    // A queued cleanup must not turn administrative removal into an
+    // indefinite wait for a successful physical Delete.
+    request.delay = std::chrono::hours(1);
+    auto future = executor->Submit(request);
+    EXPECT_EQ(std::future_status::timeout, future.wait_for(std::chrono::milliseconds(0)));
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), instance_id));
+    auto storage_manager = registry_manager_->data_storage_manager();
+    EXPECT_EQ(EC_OK, storage_manager->UnRegisterStorage("hot_01"));
+    EXPECT_EQ(nullptr, storage_manager->GetDataStorageBackend("hot_01"));
+
+    executor->Stop();
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::milliseconds(0)));
+    EXPECT_NE(EC_OK, future.get().status);
+    EXPECT_EQ(EC_NOENT, storage_manager->UnRegisterStorage("hot_01"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceRetriesRemainingTrimAfterTimeout) {
+    const std::string instance_id = "remove_timeout_retry";
+    ASSERT_EQ(EC_OK,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               {}).first);
+    auto *persistent = InstallControllableMetaBackend(instance_id);
+    ASSERT_NE(nullptr, persistent);
+    const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer(instance_id);
+    auto cache = std::make_unique<ControllableMetaLocalBackend>();
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    ASSERT_EQ(EC_OK, cache->Init(instance_id, config));
+    ASSERT_EQ(EC_OK, cache->Open());
+    auto *primary = cache.get();
+    indexer->backend_manager_->cache_backend_ = std::move(cache);
+    indexer->backend_manager_->memory_primary_ = true;
+    indexer->backend_manager_->recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+    auto storage_manager = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<FailingDeleteBackend>(storage_manager->storage_map_.at("hot_01"));
+    storage_manager->storage_map_["hot_01"] = backend;
+    constexpr size_t key_count = 2048;
+    AddDummyLocationsForTrim(key_count, "hot_01", instance_id);
+
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_EQ(EC_TIMEOUT, cache_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(10));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), instance_id));
+    const size_t submitted_pages = 2 * cache_manager_->schedule_plan_executor_->GetWorkerCount();
+    EXPECT_EQ(submitted_pages, primary->GetListKeysCallCount());
+    EXPECT_EQ(0u, persistent->GetSyncAllCallCount());
+    EXPECT_EQ(0u, persistent->GetListKeysCallCount());
+    EXPECT_EQ(key_count, indexer->GetKeyCount());
+
+    // Neither a different group nor an arbitrary missing id inherits the
+    // permission created by this successful unregister.
+    EXPECT_EQ(EC_NOENT, cache_manager_->RemoveInstance(request_context_.get(), "other_group", instance_id));
+    EXPECT_EQ(EC_NOENT, cache_manager_->RemoveInstance(request_context_.get(), "default", "unknown_remove"));
+    EXPECT_EQ(submitted_pages, primary->GetListKeysCallCount());
+
+    backend->AllowDeletes();
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
+    EXPECT_GT(primary->GetListKeysCallCount(), submitted_pages);
+    EXPECT_GT(persistent->GetSyncAllCallCount(), 0u);
+    EXPECT_GT(persistent->GetListKeysCallCount(), 0u); // TrimResidues ran after SyncAll.
+    EXPECT_FALSE(persistent->ListedKeysBeforeSyncAll());
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), instance_id));
+    // Earlier pages may still be in their Executor backoff. They retain their
+    // own cleanup without preventing the remaining scan from completing.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (indexer->GetKeyCount() != 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(0u, indexer->GetKeyCount());
+    // The explicit Trim retry and earlier Executor operations may overlap.
+    // Each operation is exact, but cross-operation Delete deduplication is not promised.
+    EXPECT_GE(backend->DeletedUriCount(), key_count);
+    EXPECT_EQ(EC_NOENT, cache_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceRejectsOnlyConcurrentManagementOfSameInstance) {
+    const std::string instance_id = "remove_registration_race";
+    auto register_instance = [&](const std::string &id) {
+        RequestContext context("register_during_remove");
+        return cache_manager_->RegisterInstance(
+            &context, "default", id, 64, createLocationSpecInfos(), createModelDeployment(), {}).first;
+    };
+    ASSERT_EQ(EC_OK, register_instance(instance_id));
+    AddDummyLocationsForTrim(1, "hot_01", instance_id);
+    auto storage_manager = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<BlockingDeleteBackend>(storage_manager->storage_map_.at("hot_01"));
+    storage_manager->storage_map_["hot_01"] = backend;
+    auto removal = std::async(std::launch::async, [&] {
+        RequestContext context("remove_during_register");
+        return cache_manager_->RemoveInstance(&context, "default", instance_id);
+    });
+    const bool entered_delete = backend->WaitForActiveDeletes(1, std::chrono::seconds(5));
+    auto same_instance = std::async(std::launch::async, [&] { return register_instance(instance_id); });
+    auto other_instance = std::async(std::launch::async, [&] { return register_instance("unrelated_registration"); });
+    const auto same_ready = same_instance.wait_for(std::chrono::seconds(1));
+    const auto other_ready = other_instance.wait_for(std::chrono::seconds(1));
+    // Unblock before assertions or future destruction, even if a lock regresses.
+    backend->ReleaseDeletes();
+    EXPECT_TRUE(entered_delete);
+    EXPECT_EQ(std::future_status::ready, same_ready);
+    EXPECT_EQ(std::future_status::ready, other_ready);
+    EXPECT_EQ(EC_EXIST, same_instance.get());
+    EXPECT_EQ(EC_OK, other_instance.get());
+    EXPECT_EQ(EC_OK, removal.get());
+    EXPECT_EQ(EC_OK, register_instance(instance_id)); // The in-flight gate was released.
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceDoesNotAuthorizeRetryFromIndexerOrRegistryFailure) {
+    const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    const auto original = registry_manager_->instance_infos_.at("test_instance");
+    EXPECT_EQ(EC_MISMATCH, cache_manager_->RemoveInstance(request_context_.get(), "other_group", "test_instance"));
+    EXPECT_EQ(original, registry_manager_->GetInstanceInfo(request_context_.get(), "test_instance"));
+    // The fixture injected this registration in memory only: durable deletion
+    // returns EC_NOENT. That error must not create a pending-Trim permission.
+    EXPECT_EQ(EC_NOENT, cache_manager_->RemoveInstance(request_context_.get(), "default", "test_instance"));
+    registry_manager_->instance_infos_.erase("test_instance");
+    EXPECT_EQ(indexer, cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance"));
+    EXPECT_EQ(EC_NOENT, cache_manager_->RemoveInstance(request_context_.get(), "default", "test_instance"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceRetryPermissionDoesNotSurviveRegistrationOrCleanup) {
+    const std::string instance_id = "remove_replacement";
+    auto register_instance = [&] {
+        return cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               {}).first;
+    };
+    ASSERT_EQ(EC_OK, register_instance());
+    AddDummyLocationsForTrim(1, "hot_01", instance_id);
+    cache_manager_->schedule_plan_executor_->Stop();
+    EXPECT_EQ(EC_ERROR, cache_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), instance_id));
+    ASSERT_EQ(EC_OK, register_instance());
+    // A direct registry removal does not grant CacheManager cleanup ownership.
+    // Even though the same indexer survived, the old retry permission is gone.
+    ASSERT_EQ(EC_OK, registry_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
+    EXPECT_EQ(EC_NOENT, cache_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
+
+    ASSERT_EQ(EC_OK, register_instance());
+    EXPECT_EQ(EC_ERROR, cache_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
+    EXPECT_EQ(EC_OK, cache_manager_->DoCleanup());
+    EXPECT_EQ(EC_NOENT, cache_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
 }
 
 // RemoveInstance 的 per-instance draining 不得读写全局 Reclaimer pause 状态。
@@ -2993,16 +3197,64 @@ TEST_F(CacheManagerTest, TestTrimCacheRunsBoundedConcurrentDeletesBeforeSync) {
     EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
 }
 
-TEST_F(CacheManagerTest, TestTrimCacheContinuesAfterPartialDeleteFailure) {
+TEST_F(CacheManagerTest, TestTrimCacheTimeoutPreservesRetryAndStopsSubmitting) {
     auto *meta_backend = InstallControllableMetaBackend();
     ASSERT_NE(nullptr, meta_backend);
-    AddDummyLocationsForTrim(2048, "missing_storage");
+    auto storage_manager = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<FailingDeleteBackend>(storage_manager->storage_map_.at("hot_01"));
+    storage_manager->storage_map_["hot_01"] = backend;
+    AddDummyLocationsForTrim(2048, "hot_01");
 
-    EXPECT_EQ(EC_ERROR,
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_EQ(EC_TIMEOUT,
               cache_manager_->TrimCache(
                   request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
-    EXPECT_GT(meta_backend->GetListKeysCallCount(), 2 * cache_manager_->schedule_plan_executor_->GetWorkerCount());
-    EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(10));
+    EXPECT_EQ(2 * cache_manager_->schedule_plan_executor_->GetWorkerCount(), meta_backend->GetListKeysCallCount());
+    EXPECT_EQ(0u, meta_backend->GetSyncAllCallCount());
+    // Dropping Trim's caller futures does not cancel the Executor's retries.
+    const auto calls_at_timeout = backend->GetDeleteCallCount();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (backend->GetDeleteCallCount() == calls_at_timeout && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GT(backend->GetDeleteCallCount(), calls_at_timeout);
+    EXPECT_EQ(2048u, cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance")->GetKeyCount());
+    cache_manager_->schedule_plan_executor_->Stop();
+}
+
+TEST_F(CacheManagerTest, TestTrimCacheFinalDrainTimeoutDoesNotCancelPhysicalDelete) {
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+    AddDummyLocationsForTrim(1, "hot_01");
+    auto storage_manager = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<BlockingDeleteBackend>(storage_manager->storage_map_.at("hot_01"));
+    storage_manager->storage_map_["hot_01"] = backend;
+
+    auto trim_future = std::async(std::launch::async, [this] {
+        return cache_manager_->TrimCache(
+            request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
+    });
+    const bool entered_delete = backend->WaitForActiveDeletes(1, std::chrono::seconds(5));
+    const auto wait_status = trim_future.wait_for(std::chrono::seconds(6));
+    const bool delete_still_running = backend->WaitForActiveDeletes(1, std::chrono::milliseconds(0));
+    const auto sync_count = meta_backend->GetSyncAllCallCount();
+    // Release before assertions, so a regression cannot strand a worker or
+    // make std::async's observer destructor block during test teardown.
+    backend->ReleaseDeletes();
+    const auto trim_result = trim_future.get();
+
+    EXPECT_TRUE(entered_delete);
+    EXPECT_EQ(std::future_status::ready, wait_status);
+    EXPECT_EQ(EC_TIMEOUT, trim_result);
+    EXPECT_TRUE(delete_still_running);
+    EXPECT_EQ(0u, sync_count);
+    const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (indexer->GetKeyCount() != 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(0u, indexer->GetKeyCount());
 }
 
 TEST_F(CacheManagerTest, TestTrimCacheStopsSubmittingAfterExecutorFailure) {
@@ -3019,7 +3271,7 @@ TEST_F(CacheManagerTest, TestTrimCacheStopsSubmittingAfterExecutorFailure) {
     EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
 }
 
-TEST_F(CacheManagerTest, TestTrimCacheSkipsPersistentResiduesAfterPartialFailure) {
+TEST_F(CacheManagerTest, TestTrimCacheSkipsPersistentResiduesAfterDeleteTimeout) {
     auto *persistent = InstallControllableMetaBackend();
     ASSERT_NE(nullptr, persistent);
     const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
@@ -3034,13 +3286,18 @@ TEST_F(CacheManagerTest, TestTrimCacheSkipsPersistentResiduesAfterPartialFailure
     backend_manager.cache_backend_ = std::move(cache);
     backend_manager.memory_primary_ = true;
     backend_manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
-    AddDummyLocationsForTrim(1024, "missing_storage");
+    auto storage_manager = registry_manager_->data_storage_manager();
+    storage_manager->storage_map_["hot_01"] =
+        std::make_shared<FailingDeleteBackend>(storage_manager->storage_map_.at("hot_01"));
+    AddDummyLocationsForTrim(1024, "hot_01");
 
-    EXPECT_EQ(EC_ERROR,
+    EXPECT_EQ(EC_TIMEOUT,
               cache_manager_->TrimCache(
                   request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
     EXPECT_EQ(0u, persistent->GetListKeysCallCount());
-    EXPECT_EQ(1u, persistent->GetSyncAllCallCount());
+    EXPECT_EQ(0u, persistent->GetSyncAllCallCount());
+    EXPECT_EQ(1024u, indexer->GetKeyCount());
+    cache_manager_->schedule_plan_executor_->Stop();
 }
 
 TEST_F(CacheManagerTest, TestTrimCacheSyncsBeforeCleaningPersistentResidueWithEmptyLocal) {

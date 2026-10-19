@@ -1515,7 +1515,7 @@ TEST_F(CacheGarbageCollectorTest, ActiveMigrationCopyTargetIsNotCollected) {
     EXPECT_EQ(2, gc->get_cache_gc_candidate_count_metrics());
 }
 
-TEST_F(CacheGarbageCollectorTest, PersistentCopyGuardFencesTargetAndExactSourceWithoutActiveTask) {
+TEST_F(CacheGarbageCollectorTest, AbandonedCopyTargetAndMissingSourceUseOrdinaryCleanup) {
     auto config = DefaultConfig();
     auto gc = MakeGc(config);
     PrepareForSingleStep(*gc);
@@ -1530,16 +1530,6 @@ TEST_F(CacheGarbageCollectorTest, PersistentCopyGuardFencesTargetAndExactSourceW
     source->set_create_time(source_create_time);
     auto target = MakeLocation(
         "target_location", CLS_WRITING, now_us - config.orphan_writing_grace_period_ms * 1000 - 1);
-    MigrationCopyGuard guard;
-    guard.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
-    guard.set_state(MigrationCopyGuardState::MCGS_UNKNOWN);
-    guard.set_operation_id("operation-after-restart");
-    guard.set_source_location_id(source->id());
-    guard.set_source_location_create_time(source_create_time);
-    guard.set_source_storage_name("pace_dram");
-    guard.set_target_storage_name("pace_ssd");
-    guard.set_total_bytes(1);
-    target->set_migration_copy_guard(guard);
 
     CacheLocationMap locations;
     locations[source->id()] = source;
@@ -1548,9 +1538,12 @@ TEST_F(CacheGarbageCollectorTest, PersistentCopyGuardFencesTargetAndExactSourceW
         gc->BuildDeleteActions("instance_a", MakeBatch(SCAN_BASE_CURSOR, {10}, {locations}), now_us)
             .executor_request;
 
-    EXPECT_TRUE(request.block_keys.empty());
-    EXPECT_TRUE(might_exist_calls.empty());
-    EXPECT_FALSE(gc->IsOrphanWriting(target->id(), *target, now_us));
+    ASSERT_EQ((KeyVector{10}), request.block_keys);
+    ASSERT_EQ(1u, request.location_ids.size());
+    EXPECT_EQ((std::set<std::string>{"source_location", "target_location"}),
+              (std::set<std::string>(request.location_ids[0].begin(), request.location_ids[0].end())));
+    EXPECT_FALSE(might_exist_calls.empty());
+    EXPECT_TRUE(gc->IsOrphanWriting(target->id(), *target, now_us));
 }
 
 TEST_F(CacheGarbageCollectorTest, MissingScannedKeyIsNotCountedAsOperationError) {

@@ -69,10 +69,6 @@ public:
         return migration_config_.copy_execution_mode();
     }
     uint64_t migration_copy_max_inflight_bytes() const { return migration_config_.copy_max_inflight_bytes(); }
-    int64_t migration_copy_max_quarantine_operations() const {
-        return migration_config_.copy_max_quarantine_operations();
-    }
-    uint64_t migration_copy_max_quarantine_bytes() const { return migration_config_.copy_max_quarantine_bytes(); }
     int64_t migration_copy_operation_deadline_ms() const {
         return migration_config_.copy_operation_deadline_ms();
     }
@@ -109,12 +105,6 @@ public:
     }
     void set_migration_copy_max_inflight_bytes(uint64_t value) {
         migration_config_.set_copy_max_inflight_bytes(value);
-    }
-    void set_migration_copy_max_quarantine_operations(int64_t value) {
-        migration_config_.set_copy_max_quarantine_operations(value);
-    }
-    void set_migration_copy_max_quarantine_bytes(uint64_t value) {
-        migration_config_.set_copy_max_quarantine_bytes(value);
     }
     void set_migration_copy_operation_deadline_ms(int64_t value) {
         migration_config_.set_copy_operation_deadline_ms(value);

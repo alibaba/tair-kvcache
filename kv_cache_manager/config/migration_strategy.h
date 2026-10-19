@@ -127,7 +127,8 @@ private:
 
 class MigrationConfig : public Jsonizable {
 public:
-    static constexpr int64_t kDefaultCopyMaxConcurrency = 1;
+    static constexpr int64_t kDefaultCopyMaxConcurrency = 64;
+    static constexpr uint64_t kDefaultCopyMaxInflightBytes = 32ULL * 1024 * 1024 * 1024;
     static constexpr int64_t kDefaultCopyOperationDeadlineMs = 10 * 60 * 1000;
     static constexpr int64_t kDefaultCopyPollInitialIntervalMs = 20;
     static constexpr int64_t kDefaultCopyPollMaxIntervalMs = 1000;
@@ -148,8 +149,6 @@ public:
     MigrationMarkClearPolicy mark_clear_policy() const { return mark_clear_policy_; }
     MigrationCopyExecutionMode copy_execution_mode() const { return copy_execution_mode_; }
     uint64_t copy_max_inflight_bytes() const { return copy_max_inflight_bytes_; }
-    int64_t copy_max_quarantine_operations() const { return copy_max_quarantine_operations_; }
-    uint64_t copy_max_quarantine_bytes() const { return copy_max_quarantine_bytes_; }
     int64_t copy_operation_deadline_ms() const { return copy_operation_deadline_ms_; }
     int64_t copy_poll_initial_interval_ms() const { return copy_poll_initial_interval_ms_; }
     int64_t copy_poll_max_interval_ms() const { return copy_poll_max_interval_ms_; }
@@ -168,8 +167,6 @@ public:
     }
     void set_copy_execution_mode(MigrationCopyExecutionMode value) { copy_execution_mode_ = value; }
     void set_copy_max_inflight_bytes(uint64_t value) { copy_max_inflight_bytes_ = value; }
-    void set_copy_max_quarantine_operations(int64_t value) { copy_max_quarantine_operations_ = value; }
-    void set_copy_max_quarantine_bytes(uint64_t value) { copy_max_quarantine_bytes_ = value; }
     void set_copy_operation_deadline_ms(int64_t value) { copy_operation_deadline_ms_ = value; }
     void set_copy_poll_initial_interval_ms(int64_t value) { copy_poll_initial_interval_ms_ = value; }
     void set_copy_poll_max_interval_ms(int64_t value) { copy_poll_max_interval_ms_ = value; }
@@ -186,9 +183,7 @@ private:
     int64_t copy_max_concurrency_ = kDefaultCopyMaxConcurrency;
     MigrationMarkClearPolicy mark_clear_policy_ = MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS;
     MigrationCopyExecutionMode copy_execution_mode_ = MigrationCopyExecutionMode::SYNC;
-    uint64_t copy_max_inflight_bytes_ = 0;
-    int64_t copy_max_quarantine_operations_ = 0;
-    uint64_t copy_max_quarantine_bytes_ = 0;
+    uint64_t copy_max_inflight_bytes_ = kDefaultCopyMaxInflightBytes;
     int64_t copy_operation_deadline_ms_ = kDefaultCopyOperationDeadlineMs;
     int64_t copy_poll_initial_interval_ms_ = kDefaultCopyPollInitialIntervalMs;
     int64_t copy_poll_max_interval_ms_ = kDefaultCopyPollMaxIntervalMs;

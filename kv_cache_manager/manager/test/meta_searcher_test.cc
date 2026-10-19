@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <future>
@@ -292,6 +293,74 @@ public:
 private:
     mutable std::mutex mutex_;
     std::vector<KeyTypeVec> requested_key_batches_;
+};
+
+class CopyPromotionBarrierBackend : public MetaLocalBackend {
+public:
+    void Arm() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        armed_ = true;
+        released_ = false;
+        read_seen_ = false;
+        write_ids_.clear();
+    }
+
+    bool WaitForRead() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5), [&] { return read_seen_; });
+    }
+
+    void Release() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        armed_ = false;
+        cv_.notify_all();
+    }
+
+    std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *rc,
+                                                    const KeyTypeVec &keys,
+                                                    const LocationIdsPerKey &ids,
+                                                    LocationsPerKey &locations) noexcept override {
+        auto result = MetaLocalBackend::GetLocations(rc, keys, ids, locations);
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (armed_ && ids.size() == 1 && ids[0] == LocationIdVector({"target", "source"})) {
+            read_seen_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [&] { return released_; });
+        }
+        return result;
+    }
+
+    std::vector<ErrorCode> Upsert(RequestContext *rc,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::set<std::string> ids;
+            for (const auto &map : locations) {
+                for (const auto &[id, location] : map) {
+                    (void)location;
+                    ids.insert(id);
+                }
+            }
+            write_ids_.push_back(std::move(ids));
+        }
+        return MetaLocalBackend::Upsert(rc, keys, locations, properties);
+    }
+
+    std::vector<std::set<std::string>> WriteIds() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return write_ids_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    bool armed_ = false;
+    bool released_ = false;
+    bool read_seen_ = false;
+    std::vector<std::set<std::string>> write_ids_;
 };
 
 class PrefixReadBackend : public MetaLocalBackend {
@@ -4088,121 +4157,204 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatusChecksExactLocationValue) {
     ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
 }
 
-TEST_F(MetaSearcherTest, TestMigrationCopyGuardExactOwnershipAndRoundTrip) {
-    const MetaSearcher::KeyVector keys = {151};
+TEST_F(MetaSearcherTest, TestBatchAddLocationCanCaptureExactWritingSnapshot) {
+    const KeyType key = 151;
     auto location = MetaSearcherTestHelper::CreateCacheLocation(
-        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
-    std::vector<std::string> location_ids;
-    ASSERT_EQ(EC_OK,
-              BatchAddLocationForTest(
-                  meta_searcher_.get(), request_context_.get(), keys, {location}, location_ids));
-    ASSERT_EQ(1u, location_ids.size());
-
-    MigrationCopyGuard submitting;
-    submitting.set_schema_version(MigrationCopyGuard::kCurrentSchemaVersion);
-    submitting.set_state(MigrationCopyGuardState::MCGS_SUBMITTING);
-    submitting.set_operation_id("operation-151");
-    submitting.set_source_location_id("source-151");
-    submitting.set_source_location_create_time(12345);
-    submitting.set_source_storage_name("pace_dram");
-    submitting.set_target_storage_name("pace_ssd");
-    submitting.set_total_bytes(4096);
-    submitting.set_create_time_us(100);
-    submitting.set_update_time_us(100);
-
-    MetaSearcher::LocationCASTask install;
-    install.location_id = location_ids[0];
-    install.old_status = CLS_WRITING;
-    install.new_status = CLS_WRITING;
-    install.expected_migration_copy_guard_absent = true;
-    install.new_migration_copy_guard = std::make_shared<MigrationCopyGuard>(submitting);
-    std::vector<std::vector<ErrorCode>> results;
-    ASSERT_EQ(EC_OK, meta_searcher_->BatchCASLocationStatus(request_context_.get(), keys, {{install}}, results));
-    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
-    ASSERT_TRUE(meta_indexer_->Sync(keys));
-
-    std::vector<CacheLocationMap> location_maps;
-    BlockMask empty_mask;
-    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps));
-    const auto guarded = location_maps[0].at(location_ids[0]);
-    ASSERT_TRUE(guarded->has_migration_copy_guard());
-    EXPECT_EQ(MigrationCopyGuardState::MCGS_SUBMITTING, guarded->migration_copy_guard().state());
-    EXPECT_EQ("operation-151", guarded->migration_copy_guard().operation_id());
-    EXPECT_EQ("source-151", guarded->migration_copy_guard().source_location_id());
-    EXPECT_EQ(4096u, guarded->migration_copy_guard().total_bytes());
-
-    // A second operation cannot steal the first operation's target.
-    MigrationCopyGuard other = submitting;
-    other.set_operation_id("operation-other");
-    auto duplicate_install = install;
-    duplicate_install.new_migration_copy_guard = std::make_shared<MigrationCopyGuard>(other);
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->BatchCASLocationStatus(
-                  request_context_.get(), keys, {{duplicate_install}}, results));
-    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), results);
-
-    // Only the exact owner and expected state may attach PACE task handles.
-    MigrationCopyGuard active = submitting;
-    active.set_state(MigrationCopyGuardState::MCGS_ACTIVE);
-    active.set_backend_task_ids({"pace-task-151"});
-    active.set_update_time_us(200);
-    MetaSearcher::LocationCASTask activate;
-    activate.location_id = location_ids[0];
-    activate.old_status = CLS_WRITING;
-    activate.new_status = CLS_WRITING;
-    activate.expected_operation_id = "wrong-operation";
-    activate.expected_migration_copy_guard_state = MigrationCopyGuardState::MCGS_SUBMITTING;
-    activate.new_migration_copy_guard = std::make_shared<MigrationCopyGuard>(active);
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->BatchCASLocationStatus(request_context_.get(), keys, {{activate}}, results));
-    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), results);
-
-    activate.expected_operation_id = "operation-151";
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->BatchCASLocationStatus(request_context_.get(), keys, {{activate}}, results));
-    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
-
-    MetaSearcher::LocationCASTask finalize;
-    finalize.location_id = location_ids[0];
-    finalize.old_status = CLS_WRITING;
-    finalize.new_status = CLS_SERVING;
-    finalize.expected_operation_id = "operation-151";
-    finalize.expected_migration_copy_guard_state = MigrationCopyGuardState::MCGS_ACTIVE;
-    finalize.clear_migration_copy_guard = true;
-    ASSERT_EQ(EC_OK,
-              meta_searcher_->BatchCASLocationStatus(request_context_.get(), keys, {{finalize}}, results));
-    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
-
-    location_maps.clear();
-    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps));
-    const auto serving = location_maps[0].at(location_ids[0]);
-    EXPECT_EQ(CLS_SERVING, serving->status());
-    EXPECT_FALSE(serving->has_migration_copy_guard());
-}
-
-TEST_F(MetaSearcherTest, TestExplicitMalformedOrFutureMigrationGuardFailsClosed) {
-    auto location = MetaSearcherTestHelper::CreateCacheLocation(
-        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
-    std::string base = location->ToJsonString();
-    ASSERT_FALSE(base.empty());
-    ASSERT_EQ('}', base.back());
-    base.pop_back();
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, {LocationSpec("TP0", "nfs://copy-target?size=4096")});
+    std::vector<MetaSearcher::AddLocationResult> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {key}, {location}, results, true));
+    ASSERT_EQ(1u, results.size());
+    ASSERT_EQ(EC_OK, results[0].ec);
 
     CacheLocation parsed;
-    EXPECT_FALSE(parsed.FromJsonString(base + R"(,"migration_copy_guard":{}})"));
-    EXPECT_FALSE(parsed.FromJsonString(
-        base +
-        R"(,"migration_copy_guard":{"schema_version":2,"state":2,"operation_id":"future-op"}})"));
-    EXPECT_FALSE(parsed.FromJsonString(
-        base +
-        R"(,"migration_copy_guard":{"schema_version":1,"state":99,"operation_id":"bad-state"}})"));
+    ASSERT_TRUE(parsed.FromJsonString(results[0].location_value));
+    EXPECT_EQ(results[0].location_id, parsed.id());
+    EXPECT_EQ(CLS_WRITING, parsed.status());
+    EXPECT_GT(parsed.create_time(), 0);
+    ASSERT_EQ(1u, parsed.location_specs().size());
+    EXPECT_EQ(location->location_specs()[0].ToJsonString(), parsed.location_specs()[0].ToJsonString());
+    std::vector<CacheLocationMap> maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, {}, maps));
+    EXPECT_EQ(results[0].location_value, maps[0].at(results[0].location_id)->ToJsonString());
 
-    // A fully understood fence still round-trips normally.
-    EXPECT_TRUE(parsed.FromJsonString(
-        base +
-        R"(,"migration_copy_guard":{"schema_version":1,"state":1,"operation_id":"known-op"}})"));
-    EXPECT_TRUE(parsed.has_migration_copy_guard());
-    EXPECT_EQ("known-op", parsed.migration_copy_guard().operation_id());
+    // Ordinary writes do not pay for or retain a serialized snapshot.
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {key + 1}, {location}, results));
+    ASSERT_EQ(1u, results.size());
+    EXPECT_TRUE(results[0].location_value.empty());
+}
+
+TEST_F(MetaSearcherTest, TestCopyPromotionRequiresOriginalServingSourceAndExactTarget) {
+    enum class Mutation { kNone, kLegacySource, kSourceMissing, kSourceDeleting, kSourceReplaced, kSourceUriChanged,
+                          kTargetReplaced, kTargetDeleting };
+    const std::vector<Mutation> mutations = {
+        Mutation::kNone, Mutation::kLegacySource, Mutation::kSourceMissing, Mutation::kSourceDeleting, Mutation::kSourceReplaced,
+        Mutation::kSourceUriChanged, Mutation::kTargetReplaced, Mutation::kTargetDeleting};
+    for (size_t i = 0; i < mutations.size(); ++i) {
+        SCOPED_TRACE(i);
+        const KeyType key = 160 + i;
+        auto source = std::make_shared<CacheLocation>(
+            "source", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1,
+            std::vector<LocationSpec>{LocationSpec("TP0", "nfs://source?size=4096")});
+        source->set_create_time(mutations[i] == Mutation::kLegacySource ? 0 : 100);
+        auto target = std::make_shared<CacheLocation>(
+            "target", CLS_WRITING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1,
+            std::vector<LocationSpec>{LocationSpec("TP0", "nfs://target?size=4096")});
+        target->set_create_time(200);
+        MetaSearcher::LocationCASTask promote{"target", CLS_WRITING, CLS_SERVING, target->ToJsonString()};
+        promote.expected_source_location_id = source->id();
+        promote.expected_source_create_time = source->create_time();
+        promote.expected_source_status = CLS_SERVING;
+        promote.expected_source_location_value = source->ToJsonString();
+
+        switch (mutations[i]) {
+        case Mutation::kSourceDeleting:
+            source->set_status(CLS_DELETING);
+            break;
+        case Mutation::kSourceReplaced:
+            source->set_create_time(101);
+            break;
+        case Mutation::kSourceUriChanged:
+            source->set_location_specs({LocationSpec("TP0", "nfs://replacement?size=4096")});
+            break;
+        case Mutation::kTargetReplaced:
+            target->set_create_time(201);
+            break;
+        case Mutation::kTargetDeleting:
+            target->set_status(CLS_DELETING);
+            break;
+        default:
+            break;
+        }
+        CacheLocationMapVector maps(1);
+        maps[0].emplace(target->id(), target);
+        if (mutations[i] != Mutation::kSourceMissing) {
+            maps[0].emplace(source->id(), source);
+        }
+        PropertyMapVector properties(1);
+        ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {key}, maps, properties).ec);
+        std::vector<std::vector<ErrorCode>> results;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchCASLocationStatus(request_context_.get(), {key}, {{promote}}, results));
+        const bool should_promote = mutations[i] == Mutation::kNone || mutations[i] == Mutation::kLegacySource;
+        EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{should_promote ? EC_OK : EC_MISMATCH}}), results);
+
+        maps.clear();
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, {}, maps));
+        EXPECT_EQ(should_promote ? CLS_SERVING : target->status(), maps[0].at("target")->status());
+        if (mutations[i] != Mutation::kSourceMissing) {
+            EXPECT_EQ(source->ToJsonString(), maps[0].at("source")->ToJsonString());
+        }
+    }
+}
+
+TEST_F(MetaSearcherTest, TestCopyPromotionCanShareReadOnlySourceWithinOneBlock) {
+    const KeyType key = 170;
+    auto source = std::make_shared<CacheLocation>(
+        "source", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "nfs://source?size=4096")});
+    source->set_create_time(100);
+    CacheLocationMapVector maps(1);
+    maps[0].emplace("source", source);
+    std::vector<MetaSearcher::LocationCASTask> tasks;
+    for (const auto &id : {"target-a", "target-b"}) {
+        auto target = std::make_shared<CacheLocation>(
+            id, CLS_WRITING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1,
+            std::vector<LocationSpec>{LocationSpec("TP0", "nfs://target?size=4096")});
+        target->set_create_time(200);
+        maps[0].emplace(id, target);
+        MetaSearcher::LocationCASTask task{id, CLS_WRITING, CLS_SERVING, target->ToJsonString()};
+        task.expected_source_location_id = "source";
+        task.expected_source_create_time = 100;
+        task.expected_source_location_value = source->ToJsonString();
+        tasks.push_back(std::move(task));
+    }
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {key}, maps, properties).ec);
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchCASLocationStatus(request_context_.get(), {key}, {tasks}, results));
+    // Internal predicate-only slots must not appear as failed public mutation results.
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK, EC_OK}}), results);
+    maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, {}, maps));
+    EXPECT_EQ(source->ToJsonString(), maps[0].at("source")->ToJsonString());
+    EXPECT_EQ(CLS_SERVING, maps[0].at("target-a")->status());
+    EXPECT_EQ(CLS_SERVING, maps[0].at("target-b")->status());
+}
+
+TEST_F(MetaSearcherTest, TestCopyPromotionSerializesWithSourceDeletionAndDoesNotRewriteSource) {
+    auto backend = std::make_unique<CopyPromotionBarrierBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("test", ConstructMetaStorageBackendConfig()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    auto *barrier = backend.get();
+    meta_indexer_->backend_manager_->persistent_backend_->Close();
+    meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
+    meta_indexer_->backend_manager_->cache_backend_.reset();
+
+    const KeyType key = 172;
+    auto source = std::make_shared<CacheLocation>(
+        "source", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "nfs://source?size=4096")});
+    source->set_create_time(100);
+    auto target = std::make_shared<CacheLocation>(
+        "target", CLS_WRITING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "nfs://target?size=4096")});
+    target->set_create_time(200);
+    CacheLocationMapVector maps(1);
+    maps[0] = {{"source", source}, {"target", target}};
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {key}, maps, properties).ec);
+    MetaSearcher::LocationCASTask promote{"target", CLS_WRITING, CLS_SERVING, target->ToJsonString()};
+    promote.expected_source_location_id = "source";
+    promote.expected_source_create_time = 100;
+    promote.expected_source_location_value = source->ToJsonString();
+    barrier->Arm();
+    auto promotion = std::async(std::launch::async, [&] {
+        RequestContext rc("promotion");
+        std::vector<std::vector<ErrorCode>> results;
+        const auto ec = meta_searcher_->BatchCASLocationStatus(&rc, {key}, {{promote}}, results);
+        return std::make_pair(ec, results);
+    });
+    const bool observed_atomic_read = barrier->WaitForRead();
+    std::promise<void> deletion_started;
+    auto started = deletion_started.get_future();
+    auto deletion = std::async(std::launch::async, [&] {
+        RequestContext rc("source-deletion");
+        MetaSearcher::LocationCASTask remove{"source", CLS_SERVING, CLS_DELETING, source->ToJsonString()};
+        std::vector<std::vector<ErrorCode>> results;
+        deletion_started.set_value();
+        const auto ec = meta_searcher_->BatchCASLocationStatus(&rc, {key}, {{remove}}, results);
+        return std::make_pair(ec, results);
+    });
+    started.wait();
+    const auto deletion_before_release = deletion.wait_for(std::chrono::milliseconds(20));
+    // Always release the barrier before assertions/future destruction.
+    barrier->Release();
+    const auto promoted = promotion.get();
+    const auto deleted = deletion.get();
+    ASSERT_TRUE(observed_atomic_read);
+    EXPECT_EQ(std::future_status::timeout, deletion_before_release);
+    EXPECT_EQ(EC_OK, promoted.first);
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), promoted.second);
+    EXPECT_EQ(EC_OK, deleted.first);
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), deleted.second);
+    // Source validation participates in the locked read, never in its upsert.
+    EXPECT_EQ((std::vector<std::set<std::string>>{{"target"}, {"source"}}), barrier->WriteIds());
+    maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, {}, maps));
+    EXPECT_EQ(CLS_SERVING, maps[0].at("target")->status());
+    EXPECT_EQ(CLS_DELETING, maps[0].at("source")->status());
+}
+
+TEST_F(MetaSearcherTest, TestCopyPromotionRejectsIncompleteOrMutableSourcePredicate) {
+    MetaSearcher::LocationCASTask task{"target", CLS_WRITING, CLS_SERVING};
+    task.expected_source_location_id = "source";
+    std::vector<std::vector<ErrorCode>> results;
+    EXPECT_EQ(EC_BADARGS, meta_searcher_->BatchCASLocationStatus(request_context_.get(), {171}, {{task}}, results));
+    task.expected_source_create_time = -1;
+    task.expected_source_location_value = "source snapshot";
+    EXPECT_EQ(EC_BADARGS, meta_searcher_->BatchCASLocationStatus(request_context_.get(), {171}, {{task}}, results));
+    task.expected_source_create_time = 100;
+    task.expected_source_location_id = task.location_id;
+    EXPECT_EQ(EC_BADARGS, meta_searcher_->BatchCASLocationStatus(request_context_.get(), {171}, {{task}}, results));
 }
 
 TEST_F(MetaSearcherTest, TestBatchCADLocationStatus) {
@@ -4294,6 +4446,48 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatus) {
         // 位置不存在时，可能返回EC_NOENT或EC_IO_ERROR
         EXPECT_TRUE(results[0] == ErrorCode::EC_NOENT); // 应该失败，因为位置不存在
     }
+}
+
+TEST_F(MetaSearcherTest, TestBatchCADLocationStatusRejectsReplacedDeletingSnapshot) {
+    const MetaSearcher::KeyVector keys{405};
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        {MetaSearcherTestHelper::CreateLocationSpec("nfs", "file://store/block?size=13")});
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, {location}, ids));
+    ASSERT_EQ(1u, ids.size());
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(
+                  request_context_.get(), keys, {{{ids[0], CLS_DELETING}}}, results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+
+    std::vector<CacheLocationMap> maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, {}, maps));
+    ASSERT_EQ(1u, maps.size());
+    const auto current = maps[0].at(ids[0]);
+    CacheLocation old_snapshot = *current;
+    old_snapshot.set_create_time(current->create_time() - 1);
+    const auto usage = meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ASSERT_EQ(13u, usage);
+
+    // A delayed CAD must not erase a replacement merely because its status is
+    // also DELETING, or subtract that replacement's capacity accounting.
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchCADLocationStatus(
+                  request_context_.get(), keys, {{{ids[0], CLS_DELETING, old_snapshot.ToJsonString()}}}, results));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), results);
+    EXPECT_EQ(usage, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, {}, maps));
+    ASSERT_EQ(1u, maps[0].size());
+    EXPECT_EQ(current->ToJsonString(), maps[0].at(ids[0])->ToJsonString());
+
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchCADLocationStatus(
+                  request_context_.get(), keys, {{{ids[0], CLS_DELETING, current->ToJsonString()}}}, results));
+    EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
+    EXPECT_EQ(0u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
 }
 
 TEST_F(MetaSearcherTest, TestBatchCADLocationStatus2) {

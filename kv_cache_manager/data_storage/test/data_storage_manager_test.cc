@@ -1,11 +1,58 @@
+#include <chrono>
+#include <future>
 #include <gtest/gtest.h>
 #include <memory>
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/dummy_backend.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 using namespace kv_cache_manager;
+
+namespace {
+struct AsyncCopyLifetimeState {
+    AsyncCopyCompletion completion;
+    int close_count = 0;
+    int destroy_count = 0;
+    int copy_count = 0;
+    int cancel_count = 0;
+};
+
+class LifetimeAsyncBackend : public DummyBackend {
+public:
+    LifetimeAsyncBackend(const std::shared_ptr<MetricsRegistry> &metrics, std::shared_ptr<AsyncCopyLifetimeState> state)
+        : DummyBackend(metrics), state_(std::move(state)) {}
+    ~LifetimeAsyncBackend() override { ++state_->destroy_count; }
+    bool Available() override { return true; }
+    bool SupportsAsyncCopy() const override { return true; }
+    ErrorCode Close() override {
+        ++state_->close_count;
+        return EC_OK;
+    }
+    AsyncCopySubmitResult CopyAsync(const std::vector<DataStorageUri> &,
+                                    const std::vector<DataStorageUri> &,
+                                    const std::string &operation_id,
+                                    const std::string &,
+                                    const AsyncCopyOptions &,
+                                    AsyncCopyCompletion completion) override {
+        ++state_->copy_count;
+        state_->completion = std::move(completion);
+        AsyncCopySubmitResult result;
+        result.status = EC_OK;
+        result.accepted = true;
+        result.operation_id = operation_id;
+        return result;
+    }
+    ErrorCode RequestCancelAsyncCopy(const std::string &) override {
+        ++state_->cancel_count;
+        return EC_OK;
+    }
+
+private:
+    std::shared_ptr<AsyncCopyLifetimeState> state_;
+};
+} // namespace
 
 class DataStorageManagerTest : public TESTBASE {
 public:
@@ -72,6 +119,35 @@ TEST_F(DataStorageManagerTest, TestSimple) {
     ASSERT_EQ(0, data_storage_backends.size());
 }
 
+TEST_F(DataStorageManagerTest, TestUnregisterInvalidatesSnapshotWithoutBlockingOrReusingName) {
+    DataStorageManager manager(metrics_registry_);
+    auto spec = std::make_shared<NfsStorageSpec>();
+    spec->set_root_path("/data/");
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_NFS, "retired", spec);
+    RequestContext context("retire-storage");
+    ASSERT_EQ(EC_OK, manager.RegisterStorage(&context, "retired", config));
+    const auto snapshot = manager.CaptureStorageBackends({"retired"});
+    EXPECT_TRUE(manager.IsStorageBackendCurrent(snapshot, "retired"));
+    ASSERT_EQ(EC_OK, manager.UnRegisterStorage("retired"));
+    EXPECT_FALSE(manager.IsStorageBackendCurrent(snapshot, "retired"));
+    ASSERT_EQ(EC_OK, manager.RegisterStorage(&context, "retired", config));
+    EXPECT_NE(snapshot->at("retired"), manager.GetDataStorageBackend("retired"));
+    bool published = false;
+    EXPECT_FALSE(manager.WithCurrentStorageBackends(snapshot, [&] { published = true; }));
+    EXPECT_FALSE(published);
+    const auto created = manager.Create(&context, "retired", {"old-key"}, 128, {}, snapshot);
+    ASSERT_EQ(1u, created.size());
+    EXPECT_EQ(EC_NOENT, created.front().first);
+    bool retired = false;
+    EXPECT_TRUE(
+        manager
+            .Delete(
+                &context, "retired", {DataStorageUri("file://retired/data/old-key?size=128")}, {}, snapshot, &retired)
+            .empty());
+    EXPECT_TRUE(retired);
+    EXPECT_TRUE(manager.IsStorageBackendCurrent(manager.CaptureStorageBackends({"retired"}), "retired"));
+}
+
 TEST_F(DataStorageManagerTest, TestCopyRejectsMismatchedUris) {
     DataStorageManager data_storage_manager(metrics_registry_);
     RequestContext request_context("test");
@@ -86,70 +162,115 @@ TEST_F(DataStorageManagerTest, TestCopyRejectsMismatchedUris) {
     }
 }
 
-TEST_F(DataStorageManagerTest, TestResumeAsyncCopyQueriesTemporarilyUnavailableBackend) {
-    class TemporarilyUnavailableAsyncBackend : public DataStorageBackend {
-    public:
-        TemporarilyUnavailableAsyncBackend(std::shared_ptr<MetricsRegistry> metrics_registry, bool &resume_called)
-            : DataStorageBackend(std::move(metrics_registry)), resume_called_(resume_called) {}
+TEST_F(DataStorageManagerTest, TestAsyncCopyValidationNeedsOnlyFinalCompletion) {
+    DataStorageManager manager(metrics_registry_);
+    RequestContext context("async-copy");
+    const std::vector<DataStorageUri> source{DataStorageUri("file://missing/src?size=128")};
+    const std::vector<DataStorageUri> target{DataStorageUri("file://missing/dst?size=128")};
+    bool completed = false;
+    auto completion = [&](AsyncCopyBatchResult) { completed = true; };
 
-        DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_DUMMY; }
-        bool Available() override { return false; }
-        double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
-        ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
-        ErrorCode Close() override { return EC_OK; }
-        std::vector<std::pair<ErrorCode, DataStorageUri>>
-        Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override {
-            return {};
-        }
-        std::vector<ErrorCode>
-        Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
-            return std::vector<ErrorCode>(uris.size(), EC_OK);
-        }
-        std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
-            return std::vector<bool>(uris.size(), true);
-        }
-        std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
-            return std::vector<ErrorCode>(uris.size(), EC_OK);
-        }
-        std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override {
-            return std::vector<ErrorCode>(uris.size(), EC_OK);
-        }
-        bool SupportsAsyncCopy() const override { return true; }
-        AsyncCopySubmitResult ResumeAsyncCopy(const std::vector<std::string> &backend_task_ids,
-                                              size_t expected_items,
-                                              const std::string &operation_id,
-                                              const std::string &,
-                                              const AsyncCopyOptions &,
-                                              AsyncCopyCompletion) override {
-            resume_called_ = true;
-            AsyncCopySubmitResult result;
-            result.status = backend_task_ids.size() == expected_items ? EC_OK : EC_MISMATCH;
-            result.accepted = result.status == EC_OK;
-            result.operation_id = operation_id;
-            return result;
-        }
+    auto result = manager.CopyAsync(&context, "missing", {}, target, "op", AsyncCopyOptions{}, completion);
+    EXPECT_FALSE(result.accepted);
+    EXPECT_EQ(EC_BADARGS, result.status);
+    result = manager.CopyAsync(&context, "missing", source, target, "op", AsyncCopyOptions{}, {});
+    EXPECT_FALSE(result.accepted);
+    EXPECT_EQ(EC_BADARGS, result.status);
+    result = manager.CopyAsync(&context, "missing", source, target, "op", AsyncCopyOptions{}, completion);
+    EXPECT_FALSE(result.accepted);
+    EXPECT_EQ(EC_NOENT, result.status);
+    EXPECT_FALSE(completed); // Rejection never transfers callback ownership.
+}
 
-    private:
-        bool &resume_called_;
-    };
+TEST_F(DataStorageManagerTest, TestAsyncCompletionKeepsRetiredBackendAliveWithoutReusingRegistration) {
+    DataStorageManager manager(metrics_registry_);
+    auto state = std::make_shared<AsyncCopyLifetimeState>();
+    auto backend = std::make_shared<LifetimeAsyncBackend>(metrics_registry_, state);
+    manager.storage_map_["async_source"] = backend;
+    const std::weak_ptr<DataStorageBackend> old_backend = backend;
+    auto snapshot = manager.CaptureStorageBackends({"async_source"});
+    RequestContext context("async_lifetime");
+    const std::vector<DataStorageUri> sources{DataStorageUri("dummy://async_source/source?size=128")};
+    const std::vector<DataStorageUri> targets{DataStorageUri("dummy://target/destination?size=128")};
+    int completion_count = 0;
+    bool alive_during_completion = false;
+    const auto submitted = manager.CopyAsync(
+        &context,
+        "async_source",
+        sources,
+        targets,
+        "original-operation",
+        {},
+        [&](AsyncCopyBatchResult result) {
+            ++completion_count;
+            alive_during_completion = !old_backend.expired();
+            EXPECT_EQ(EC_UNKNOWN, result.status);
+        },
+        snapshot);
+    ASSERT_TRUE(submitted.accepted);
+    ASSERT_TRUE(state->completion);
+    auto completion = std::move(state->completion);
+    EXPECT_EQ(0, completion_count);
 
-    DataStorageManager data_storage_manager(metrics_registry_);
-    bool resume_called = false;
-    data_storage_manager.storage_map_["temporarily-unavailable"] =
-        std::make_shared<TemporarilyUnavailableAsyncBackend>(metrics_registry_, resume_called);
+    // Completion is deliberately withheld. Close/UnRegister must finish after
+    // local handoff without waiting for the remote operation.
+    auto unregister = std::async(std::launch::async, [&] { return manager.UnRegisterStorage("async_source"); });
+    const auto unregister_status = unregister.wait_for(std::chrono::seconds(1));
+    if (unregister_status != std::future_status::ready) {
+        // Release a regressed completion-held lock before joining the test thread.
+        completion(AsyncCopyBatchResult{});
+        completion = {};
+    }
+    ASSERT_EQ(EC_OK, unregister.get());
+    ASSERT_EQ(std::future_status::ready, unregister_status);
+    EXPECT_EQ(1, state->close_count);
+    EXPECT_EQ(0, completion_count);
 
-    RequestContext request_context("resume-temporarily-unavailable");
-    auto result = data_storage_manager.ResumeAsyncCopy(&request_context,
-                                                       "temporarily-unavailable",
-                                                       {"pace-task-1"},
-                                                       1,
-                                                       "operation-1",
-                                                       AsyncCopyOptions{},
-                                                       [](AsyncCopyBatchResult) {});
-    EXPECT_TRUE(resume_called);
-    EXPECT_EQ(EC_OK, result.status);
-    EXPECT_TRUE(result.accepted);
-    EXPECT_EQ("operation-1", result.operation_id);
+    auto replacement_state = std::make_shared<AsyncCopyLifetimeState>();
+    manager.storage_map_["async_source"] = std::make_shared<LifetimeAsyncBackend>(metrics_registry_, replacement_state);
+    bool rejected_completion_called = false;
+    const auto rejected = manager.CopyAsync(
+        &context,
+        "async_source",
+        sources,
+        targets,
+        "stale-operation",
+        {},
+        [&](AsyncCopyBatchResult) { rejected_completion_called = true; },
+        snapshot);
+    EXPECT_FALSE(rejected.accepted);
+    EXPECT_EQ(EC_NOENT, rejected.status);
+    EXPECT_EQ(EC_NOENT, manager.RequestCancelAsyncCopy("async_source", "original-operation", snapshot));
+    EXPECT_FALSE(rejected_completion_called);
+    EXPECT_EQ(0, replacement_state->copy_count);
+    EXPECT_EQ(0, replacement_state->cancel_count);
+
+    // Remove every owner except the manager's callback lease. This checks
+    // object lifetime, not whether Close proves remote allocation drain.
+    snapshot.reset();
+    backend.reset();
+    EXPECT_FALSE(old_backend.expired());
+    EXPECT_EQ(0, state->destroy_count);
+    completion(AsyncCopyBatchResult{});
+    EXPECT_EQ(1, completion_count);
+    EXPECT_TRUE(alive_during_completion);
+    completion = {};
+    EXPECT_TRUE(old_backend.expired());
+    EXPECT_EQ(1, state->destroy_count);
+}
+
+TEST_F(DataStorageManagerTest, TestAsyncCopyUnknownCannotBePublishedAsSuccess) {
+    AsyncCopyBatchResult result;
+    result.status = EC_OK; // Status alone is not authoritative.
+    result.items.resize(1);
+    result.items[0].outcome = AsyncCopyOutcome::kSuccess;
+    EXPECT_FALSE(result.AllSucceeded());
+    result.items[0].terminal = true;
+    EXPECT_FALSE(result.AllSucceeded());
+    result.items[0].safe_to_reuse_dst = true;
+    EXPECT_TRUE(result.AllSucceeded());
+    result.items[0].outcome = AsyncCopyOutcome::kUnknown;
+    EXPECT_FALSE(result.AllSucceeded());
 }
 
 TEST_F(DataStorageManagerTest, TestOptionalBackendsFollowBuildConfig) {

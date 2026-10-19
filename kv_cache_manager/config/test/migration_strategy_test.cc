@@ -236,6 +236,7 @@ TEST_F(MigrationStrategyTest, TestInCacheConfig) {
     })";
     ASSERT_TRUE(no_migration.FromJsonString(json2));
     ASSERT_EQ(CacheConfig::kDefaultMigrationCopyMaxConcurrency, no_migration.migration_copy_max_concurrency());
+    ASSERT_EQ(34359738368ULL, no_migration.migration_copy_max_inflight_bytes());
     ASSERT_EQ(MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS, no_migration.migration_mark_clear_policy());
     ASSERT_EQ(MigrationConfig::kDefaultCopyConnectTimeoutMs,
               no_migration.migration_copy_connect_timeout_ms());
@@ -243,6 +244,41 @@ TEST_F(MigrationStrategyTest, TestInCacheConfig) {
               no_migration.migration_copy_submit_timeout_ms());
     ASSERT_EQ(MigrationConfig::kDefaultCopyQueryTimeoutMs, no_migration.migration_copy_query_timeout_ms());
     ASSERT_TRUE(no_migration.migration_strategies().empty());
+}
+
+TEST_F(MigrationStrategyTest, TestAsyncCopyBudgetDefaultsAndExplicitZero) {
+    MigrationConfig config;
+    EXPECT_EQ(64, config.copy_max_concurrency());
+    EXPECT_EQ(34359738368ULL, config.copy_max_inflight_bytes());
+    config.set_copy_execution_mode(MigrationCopyExecutionMode::ASYNC_REQUIRED);
+    std::string invalid_fields;
+    EXPECT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+
+    MigrationConfig parsed_defaults;
+    parsed_defaults.set_copy_max_concurrency(2);
+    parsed_defaults.set_copy_max_inflight_bytes(128ULL * 1024 * 1024);
+    ASSERT_TRUE(parsed_defaults.FromJsonString(R"({"copy_execution_mode":1,"strategies":[]})"));
+    EXPECT_EQ(64, parsed_defaults.copy_max_concurrency());
+    EXPECT_EQ(34359738368ULL, parsed_defaults.copy_max_inflight_bytes());
+    invalid_fields.clear();
+    EXPECT_TRUE(parsed_defaults.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+
+    ASSERT_TRUE(config.FromJsonString(R"({"copy_execution_mode":1,"copy_max_inflight_bytes":0,"strategies":[]})"));
+    invalid_fields.clear();
+    EXPECT_FALSE(config.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("copy_async_limits"));
+
+    config.set_copy_max_concurrency(6);
+    config.set_copy_max_inflight_bytes(128ULL * 1024 * 1024);
+    invalid_fields.clear();
+    EXPECT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+    const auto json = config.ToJsonString();
+    EXPECT_EQ(std::string::npos, json.find("quarantine"));
+    MigrationConfig parsed;
+    ASSERT_TRUE(parsed.FromJsonString(json));
+    EXPECT_EQ(6, parsed.copy_max_concurrency());
+    EXPECT_EQ(config.copy_execution_mode(), parsed.copy_execution_mode());
+    EXPECT_EQ(config.copy_max_inflight_bytes(), parsed.copy_max_inflight_bytes());
 }
 
 TEST_F(MigrationStrategyTest, TestMigrationConfigRejectsInvalidAsyncHttpTiming) {

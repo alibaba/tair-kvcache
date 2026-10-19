@@ -131,14 +131,24 @@ bool WaitForOtherOwners(const std::shared_ptr<T> &owner, int64_t timeout_seconds
     return true;
 }
 
-bool CollectTrimResult(std::deque<std::future<PlanExecuteResult>> &inflight,
-                       const std::string &trace_id,
-                       const std::string &instance_id,
-                       bool &has_error) {
+ErrorCode CollectTrimResult(std::deque<std::future<PlanExecuteResult>> &inflight,
+                             const std::string &trace_id,
+                             const std::string &instance_id,
+                             bool &has_error) {
+    // This bounds only the caller's wait for one batch, not the lifetime of
+    // cleanup or the total duration of a healthy multi-page Trim. The Executor
+    // owns its promise-backed operation and physical-delete references until
+    // completion; dropping this observer never authorizes reclaim or reuse.
+    if (inflight.front().wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        KVCM_LOG_WARN("trace_id [%s] instance [%s] | trim cache wait timed out; deletion continues in background",
+                      trace_id.c_str(),
+                      instance_id.c_str());
+        return EC_TIMEOUT;
+    }
     const PlanExecuteResult result = inflight.front().get();
     inflight.pop_front();
     if (result.status == EC_OK) {
-        return false;
+        return EC_OK;
     }
 
     has_error = true;
@@ -149,7 +159,7 @@ bool CollectTrimResult(std::deque<std::future<PlanExecuteResult>> &inflight,
                       result.status,
                       result.error_message.c_str());
     }
-    return result.status != EC_PARTIAL_OK;
+    return result.status;
 }
 
 struct ReporterIdentityView {
@@ -585,11 +595,6 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
     // Invariant: migration_manager_ is always constructed here. Feature enablement is a per
     // instance-group property (IsTieredMigrationEnabled), never expressed via pointer nullness.
     assert(migration_manager_ != nullptr);
-    registry_manager_->data_storage_manager()->SetAsyncCopyReferenceChecker(
-        [weak_manager = std::weak_ptr<MigrationManager>(migration_manager_)](const std::string &storage_name) {
-            const auto manager = weak_manager.lock();
-            return manager && manager->HasAsyncCopyStorageReference(storage_name);
-        });
 
     cache_garbage_collector_ = std::make_shared<CacheGarbageCollector>(std::move(cache_gc_config),
                                                                        registry_manager_,
@@ -648,6 +653,41 @@ void CacheManager::SetRevisitHistogramConfig(const std::vector<double> &boundari
         meta_indexer_manager_->SetRevisitHistogramConfig(metrics_registry_, boundaries);
         KVCM_LOG_INFO("Set revisit histogram config with %zu boundaries", boundaries.size());
     }
+}
+
+bool CacheManager::BeginInstanceManagement(const std::string &instance_id, bool removing) {
+    std::lock_guard<std::mutex> lock(instance_management_mutex_);
+    auto &state = instance_management_[instance_id];
+    if (state.removing || (removing && state.registrations != 0)) {
+        return false;
+    }
+    if (removing) {
+        state.removing = true;
+    } else {
+        ++state.registrations;
+    }
+    return true;
+}
+
+void CacheManager::EndInstanceManagement(const std::string &instance_id, bool removing) {
+    std::lock_guard<std::mutex> lock(instance_management_mutex_);
+    const auto it = instance_management_.find(instance_id);
+    if (it == instance_management_.end()) {
+        return;
+    }
+    auto &state = it->second;
+    if (removing) {
+        state.removing = false;
+    } else {
+        --state.registrations;
+    }
+    if (!state.removing && state.registrations == 0 && !state.pending_trim) {
+        instance_management_.erase(it);
+    }
+}
+
+CacheManager::InstanceManagementGuard::~InstanceManagementGuard() {
+    manager->EndInstanceManagement(instance_id, removing);
 }
 
 std::pair<ErrorCode, std::string>
@@ -768,13 +808,9 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
                 return EC_TIMEOUT;
             }
         }
-        // A quarantined guard is intentionally invisible to the active task
-        // table, and an accepted physical cleanup may outlive task completion.
-        // Removing the registry entry here would make those durable guards
-        // undiscoverable on the next leader and could close their backend while
-        // it is still being used. Keep the instance registered until every
-        // active/quarantined/cleanup reference has drained.
-        if (migration_manager_->HasAsyncCopyInstanceReference(instance_id)) {
+        // An active Copy still owns its preparation or completion state. Queued
+        // physical deletion alone does not veto administrative removal.
+        if (!migration_manager_->GetActiveBlockKeysForInstance(instance_id).empty()) {
             PREFIX_LOG(WARN, "remove instance rejected: asynchronous Copy reference remains");
             return EC_EXIST;
         }
@@ -1831,14 +1867,20 @@ ErrorCode CacheManager::TrimCacheWithIndexer(RequestContext *request_context,
             inflight.emplace_back(detached_indexer ? schedule_plan_executor_->Submit(request, meta_indexer)
                                                    : schedule_plan_executor_->Submit(request));
             if (inflight.size() >= max_inflight) {
-                stop_submit = CollectTrimResult(inflight, trace_id, instance_id, has_error);
+                const auto collect_ec = CollectTrimResult(inflight, trace_id, instance_id, has_error);
+                if (collect_ec == EC_TIMEOUT) {
+                    return EC_TIMEOUT;
+                }
+                stop_submit = collect_ec != EC_OK && collect_ec != EC_PARTIAL_OK;
             }
         }
         cursor = std::move(next_cursor);
     } while (!stop_submit && cursor != SCAN_BASE_CURSOR);
 
     while (!inflight.empty()) {
-        CollectTrimResult(inflight, trace_id, instance_id, has_error);
+        if (CollectTrimResult(inflight, trace_id, instance_id, has_error) == EC_TIMEOUT) {
+            return EC_TIMEOUT;
+        }
     }
 
     const bool synced = meta_indexer->SyncAll();
@@ -1870,7 +1912,7 @@ void CacheManager::JoinCacheGarbageCollector() {
     }
 }
 
-ErrorCode CacheManager::StartMigrationManager() { return migration_manager_->Start(); }
+void CacheManager::StartMigrationManager() { migration_manager_->Start(); }
 void CacheManager::StopMigrationManager() { migration_manager_->Stop(); }
 
 CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *request_context,
@@ -4774,6 +4816,10 @@ ErrorCode CacheManager::DoCleanup() {
     ClearEventCleanupCallbacks();
     StopRecoverRetryLoop();
     DeactivateEventCleanupCallbacks();
+    {
+        std::lock_guard<std::mutex> lock(instance_management_mutex_);
+        instance_management_.clear();
+    }
     // aborting write session need meta indexer
     if (write_location_manager_) {
         write_location_manager_->DoCleanup();
