@@ -1027,13 +1027,6 @@ bool CacheReclaimer::ReclaimByLRUImpl(const std::shared_ptr<RequestContext> &req
     // here the cache location form of deleting request is used to
     // permit the cache location status aware deleting control
     CacheLocationDelRequest request;
-    if (affinity_manager_) {
-        AffinityResolveContext ctx;
-        ctx.instance_strategy_json = instance_info->affinity_strategy_json();
-        ctx.group_strategy_json = registry_manager_->GetGroupAffinityStrategyJson(
-            request_context.get(), instance_info->instance_group_name());
-        request.min_retained_replicas = affinity_manager_->GetReplicaLimits(ctx).min_retained_replicas;
-    }
     request.instance_id = ins_id;
     request.delay = std::chrono::milliseconds(delay_before_delete_ms);
 
@@ -1117,6 +1110,15 @@ bool CacheReclaimer::ReclaimByNode(const std::shared_ptr<RequestContext> &reques
     CacheLocationDelRequest request;
     request.instance_id = instance_info->instance_id();
     request.delay = std::chrono::milliseconds(delay_before_delete_ms);
+    // Retain readable replicas for node-pressure eviction only. Quota/TTL
+    // reclamation must still be able to remove the final copy of a cold key.
+    if (affinity_manager_) {
+        AffinityResolveContext ctx;
+        ctx.instance_strategy_json = instance_info->affinity_strategy_json();
+        ctx.group_strategy_json = registry_manager_->GetGroupAffinityStrategyJson(request_context.get(),
+                                                                                  instance_info->instance_group_name());
+        request.min_retained_replicas = affinity_manager_->GetReplicaLimits(ctx).min_retained_replicas;
+    }
     // The node index supplies the oldest keys on each pressured node. Keep its
     // per-node sampling quota and cap admission with the normal deletion batch.
     const auto count = std::min(GetSamplingSize(request_context.get()), GetBatchingSize(request_context.get()));
