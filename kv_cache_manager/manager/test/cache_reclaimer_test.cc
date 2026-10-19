@@ -1171,6 +1171,45 @@ public:
     std::shared_ptr<RequestContext> request_context_;
 };
 
+TEST_F(CacheReclaimerTest, TestDestructorSynchronizesWorkerStopWithQueueWait) {
+    auto reclaimer = std::make_unique<CacheReclaimer>(1, 1, 1, 1, 1, rm_, mim_, msm_, spe_, mr_, em_, nullptr);
+    std::promise<void> task_started;
+    auto task_started_future = task_started.get_future();
+    std::promise<void> finish_task;
+    auto finish_task_future = finish_task.get_future();
+    // Keep the object alive in the destructor's join while inspecting its stop
+    // flag, including on the old implementation that writes it without a lock.
+    reclaimer->SubmitTask([&] {
+        task_started.set_value();
+        finish_task_future.wait();
+    });
+    const auto started = task_started_future.wait_for(std::chrono::seconds(5));
+    if (started != std::future_status::ready) {
+        finish_task.set_value();
+        reclaimer.reset();
+    }
+    ASSERT_EQ(std::future_status::ready, started);
+
+    auto *raw_reclaimer = reclaimer.get();
+    std::unique_lock<std::mutex> queue_lock(raw_reclaimer->task_queue_mutex_);
+    std::promise<void> destruction_started;
+    auto destruction_started_future = destruction_started.get_future();
+    std::thread destroyer([owned = std::move(reclaimer), &destruction_started]() mutable {
+        destruction_started.set_value();
+        owned.reset();
+    });
+    destruction_started_future.wait();
+
+    // A waiter holds this mutex between evaluating the predicate and entering
+    // wait(). Shutdown must not change the predicate across that boundary.
+    const bool stop_changed_while_locked =
+        WaitUntil([raw_reclaimer] { return raw_reclaimer->worker_stop_.load(); }, std::chrono::seconds(1));
+    queue_lock.unlock();
+    finish_task.set_value();
+    destroyer.join();
+    EXPECT_FALSE(stop_changed_while_locked);
+}
+
 TEST_F(CacheReclaimerTest, TestStartStop) {
     stub_.reset(ADDR(RegistryManager, ListInstanceGroup));
     stub_.reset(ADDR(RegistryManager, ListInstanceInfo));

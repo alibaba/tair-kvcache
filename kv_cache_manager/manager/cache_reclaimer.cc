@@ -612,7 +612,12 @@ CacheReclaimer::~CacheReclaimer() {
     this->Stop();
 
     // stop workers
-    worker_stop_ = true;
+    {
+        // Serialize the stop predicate with the workers' condition-variable
+        // wait so shutdown cannot notify between the check and going to sleep.
+        std::lock_guard<std::mutex> lock(task_queue_mutex_);
+        worker_stop_ = true;
+    }
     cv_task_queue_.notify_all();
 
     for (auto &worker : workers_) {
