@@ -33,15 +33,23 @@ class TairKvCacheConnectorExtraConfig(BaseModel):
     hf3fs_concurrent_io_block_count: int = 32
 
     # --- Transfer task granularity ---
-    block_per_save_task: int = 128
-    block_per_load_task: int = 128
+    # Upper bound on the blocks one save/load task stages. The staging pool
+    # shrinks a task to the blocks its arena can hold in one run (see
+    # staging_pool_max_bytes_per_group), so a batch larger than the pool is
+    # never silently oversized -- the granularity yields instead. A batch of
+    # zero or less is a configuration error, refused at startup rather than
+    # exploding later inside range(0, n, 0).
+    block_per_save_task: int = Field(default=128, ge=1)
+    block_per_load_task: int = Field(default=128, ge=1)
 
     # --- Staging buffers ---
-    # Pre-allocated contiguous staging slots per transfer group (shared by
-    # save and load). The pool is *pinned host memory only* -- the gather/
-    # scatter kernel and the state copies reach it directly over PCIe, so
-    # the connector's device-memory footprint is zero and this knob sizes
-    # host RAM, not VRAM. An exhausted pool blocks the task (backpressure).
+    # Pre-allocated contiguous staging slots, shared by save and load *and* by
+    # every transfer bucket of the same staging shape -- the pool key is
+    # (per-token bytes of one layer, element type), not the wire spec name. The
+    # pool is *pinned host memory only* -- the gather/scatter kernel and the
+    # state copies reach it directly over PCIe, so the connector's
+    # device-memory footprint is zero and this knob sizes host RAM, not VRAM.
+    # An exhausted pool blocks the task (backpressure).
     #
     # The pool is the *concurrency* of staging: tasks hold their slots for
     # gather + the synchronous SDK transfer, so the pool size caps how many
@@ -49,21 +57,24 @@ class TairKvCacheConnectorExtraConfig(BaseModel):
     # serializes and burst loads queue behind saves: measured -3.5% ab
     # throughput and +54% vs +65% TP2 hit throughput against a 512-block
     # pool (perf 2026-08-20, doc protocol). 1024 restores origin/main's
-    # concurrency (8 full tasks) for ~896 MiB pinned host RAM per attention
-    # group -- host RAM is cheap, and the old 1024-slot behaviour is what
-    # the merge-base AB baseline ran. Shrink only together with
-    # block_per_save_task/block_per_load_task (must be >= the larger one,
-    # one task stages its whole batch contiguously).
+    # concurrency (8 full tasks) for ~896 MiB pinned host RAM per shape --
+    # host RAM is cheap, and the old 1024-slot behaviour is what the
+    # merge-base AB baseline ran. This is an *upper* bound: each shape's pool
+    # is min(this, its byte cap), and the task batches shrink to fit.
     staging_pool_blocks: int = 1024
 
-    # Per-group ceiling on the staging pool's pinned host RAM. The block
-    # count above was derived for full-attention blocks (~0.875 MiB each:
-    # 1024 blocks ~= 896 MiB); hybrid blocks are ~17.3 MiB, and the same
-    # count would pin ~17 GiB per group -- four groups then die in the
-    # pinned allocator at engine start on an ordinary host. Effective blocks
-    # per group = min(staging_pool_blocks, this_cap // block_bytes), never
-    # below one full task batch (the contiguity invariant). Raise this cap
-    # (not just the block count) to give hybrid deployments more in-flight
+    # Hard byte budget per staging shape. The block count above was derived for
+    # full-attention blocks (~0.875 MiB each: 1024 blocks ~= 896 MiB); hybrid
+    # blocks are ~17.3 MiB, and the same count would pin ~17 GiB per shape --
+    # one per bucket group, and engine start then dies in the pinned allocator
+    # on an ordinary host. Slots per shape = min(staging_pool_blocks, this //
+    # slot_bytes), where the slot holds the largest block of the buckets that
+    # share the shape; a cap that cannot pay for the configured count shrinks
+    # the pool and the task batches, and a cap smaller than one slot fails
+    # engine start instead of being breached. 1 GiB ~= 40 ms x 20 GB/s (the
+    # measured A10 pinned<->device bandwidth) with a 1.3x margin: the pool is
+    # sized in bytes because that is what the DMA keeps in flight. Raise this
+    # cap (not just the block count) to give a deployment more in-flight
     # transfer concurrency.
     staging_pool_max_bytes_per_group: int = 2**30
 
