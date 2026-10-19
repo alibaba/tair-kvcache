@@ -123,7 +123,7 @@ public:
                  const std::vector<std::string> &location_spec_group_names,
                  int64_t write_timeout_seconds,
                  const ClientCallerNode &caller,
-                 bool is_replication, int32_t min_replica_count),
+                 int32_t min_replica_count),
                 (override));
 
     MOCK_METHOD(ClientErrorCode,
@@ -388,4 +388,36 @@ TEST_F(MetaClientTest, TestMatchLocationLen) {
     auto [fail_result_ec, fail_len] = client->MatchLocationLen(trace_id + "_fail", query_type, keys, tokens, sw_size);
     ASSERT_EQ(fail_result_ec, expected_error);
     // The value of 'len' is not checked when error code is not ER_OK
+}
+
+TEST_F(MetaClientTest, OrdinaryWritePreservesReplicaCount) {
+    using ::testing::_;
+    using ::testing::Return;
+    auto stub = new ::testing::NiceMock<MockStub>();
+    MetaClientImpl client;
+    client.stub_.reset(stub);
+    ON_CALL(*stub, AddConnection(_, _)).WillByDefault(Return(ER_OK));
+    ON_CALL(*stub, RegisterInstance(_, _, _, _, _, _, _, _))
+        .WillByDefault(Return(std::make_pair(ER_OK, std::string("{}"))));
+    ASSERT_EQ(ER_OK, client.Init(client_config_, init_params_));
+    EXPECT_CALL(*stub, StartWriteCache("write", "test_instance", _, _, _, 60, _, 3))
+        .WillOnce(Return(std::make_pair(ER_OK, WriteLocation{})));
+    EXPECT_EQ(ER_OK, client.StartWrite("write", {1}, {}, {}, 60, 3).first);
+}
+
+TEST_F(MetaClientTest, UnsupportedExplicitTargetDoesNotFallBackToOrdinaryWrite) {
+    ::testing::NiceMock<MockStub> stub;
+    EXPECT_CALL(stub,
+                StartWriteCache(::testing::_,
+                                ::testing::_,
+                                ::testing::_,
+                                ::testing::_,
+                                ::testing::_,
+                                ::testing::_,
+                                ::testing::_,
+                                ::testing::_))
+        .Times(0);
+    const auto result = stub.StartReplicationWriteCache("copy", "instance", {1}, {}, 60, {}, "target");
+    EXPECT_EQ(ER_SERVICE_UNSUPPORTED, result.first);
+    EXPECT_TRUE(result.second.locations.empty());
 }

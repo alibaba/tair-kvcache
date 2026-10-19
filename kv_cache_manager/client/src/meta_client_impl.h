@@ -37,7 +37,7 @@ public:
                                                          const std::vector<int64_t> &tokens,
                                                          const std::vector<std::string> &location_spec_group_names,
                                                          int64_t write_timeout_seconds,
-                                                         bool is_replication = false, int32_t min_replica_count = 0) override;
+                                                         int32_t min_replica_count = 0) override;
     std::pair<ClientErrorCode, WriteLocation>
     StartReplicationWrite(const std::string &trace_id,
                           const std::vector<int64_t> &keys,

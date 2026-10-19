@@ -1140,6 +1140,15 @@ TEST(GrpcStubMetadataProtocolTest, SendsReplicaBackendAndHostArgumentsAndKeepsMi
     const std::vector<int64_t> keys{1, 2, 3};
     EXPECT_EQ(ER_OK, stub.StartWriteCache("write", "instance", keys, {}, {}, 600, {}, 3).first);
     EXPECT_EQ(service.write.min_replica_count(), 3);
+    EXPECT_FALSE(service.write.is_replication());
+    EXPECT_TRUE(service.write.replication_target_node_id().empty());
+    EXPECT_EQ(ER_INVALID_PARAMS,
+              stub.StartWriteCache("invalid", "instance", keys, {}, {}, 600, {}, -1).first);
+    EXPECT_EQ("write", service.write.trace_id());
+    EXPECT_EQ(ER_OK, stub.StartReplicationWriteCache("copy", "instance", keys, {}, 60, {}, "nodeB").first);
+    EXPECT_TRUE(service.write.is_replication());
+    EXPECT_EQ("nodeB", service.write.replication_target_node_id());
+    EXPECT_EQ(0, service.write.min_replica_count());
     const auto [location_ec, locations] = stub.GetCacheLocationsByBackend(
         "backend", "instance", keys, {}, BlockMaskOffset{1}, {},
         StorageType::ST_NFS, BackendSelectStrategy::LSS_WEIGHTED_RANDOM);

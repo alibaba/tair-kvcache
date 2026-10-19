@@ -31,17 +31,15 @@ public:
                const std::vector<int64_t> &tokens,
                const std::vector<std::string> &location_spec_group_names,
                int64_t write_timeout_seconds,
-               bool is_replication = false, int32_t min_replica_count = 0) = 0;
-    // Explicit-target form used by replication writes. The default preserves
-    // source compatibility for test/custom clients while MetaClientImpl sends
-    // the target through the wire protocol.
+               int32_t min_replica_count = 0) = 0;
+    // Replication must honor an explicit target; unsupported clients fail closed.
     virtual std::pair<ClientErrorCode, WriteLocation>
     StartReplicationWrite(const std::string &trace_id,
                           const std::vector<int64_t> &keys,
                           const std::vector<std::string> &location_spec_group_names,
                           int64_t write_timeout_seconds,
                           const std::string &target_node_id) {
-        return StartWrite(trace_id, keys, {}, location_spec_group_names, write_timeout_seconds, true);
+        return {ER_SERVICE_UNSUPPORTED, {}};
     }
     virtual ClientErrorCode ReplicateCache(const std::string &trace_id,
                                            const ClientReplicationHint &hint,

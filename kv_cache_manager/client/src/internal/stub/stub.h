@@ -66,7 +66,7 @@ public:
                     const std::vector<std::string> &location_spec_group_names,
                     int64_t write_timeout_seconds,
                     const ClientCallerNode &caller,
-                    bool is_replication = false, int32_t min_replica_count = 0) = 0;
+                    int32_t min_replica_count = 0) = 0;
     virtual std::pair<ClientErrorCode, WriteLocation>
     StartReplicationWriteCache(const std::string &trace_id,
                                const std::string &instance_id,
@@ -75,8 +75,7 @@ public:
                                int64_t write_timeout_seconds,
                                const ClientCallerNode &caller,
                                const std::string &target_node_id) {
-        return StartWriteCache(trace_id, instance_id, keys, {}, location_spec_group_names,
-                               write_timeout_seconds, caller, true);
+        return {ER_SERVICE_UNSUPPORTED, {}};
     }
     virtual ClientErrorCode ReplicateCache(const std::string &trace_id,
                                            const std::string &instance_id,

@@ -39,8 +39,31 @@ public:
                  const std::vector<int64_t> &,
                  const std::vector<std::string> &,
                  int64_t,
-                 bool),
+                 int32_t),
                 (override));
+    MOCK_METHOD((std::pair<ClientErrorCode, WriteLocation>),
+                StartReplicationWrite,
+                (const std::string &,
+                 const std::vector<int64_t> &,
+                 const std::vector<std::string> &,
+                 int64_t,
+                 const std::string &),
+                (override));
+    MOCK_METHOD((std::pair<ClientErrorCode, BackendLocations>),
+                GetCacheLocationsByBackend,
+                (const std::string &,
+                 const std::vector<int64_t> &,
+                 const std::vector<int64_t> &,
+                 const BlockMask &,
+                 const std::vector<std::string> &,
+                 StorageType,
+                 BackendSelectStrategy),
+                (override));
+    MOCK_METHOD(
+        (std::pair<ClientErrorCode, HostCacheState>),
+        GetHostCacheState,
+        (const std::string &, QueryType, const std::vector<int64_t> &, const std::vector<std::string> &, int32_t),
+        (override));
     MOCK_METHOD(ClientErrorCode,
                 FinishWrite,
                 (const std::string &, const std::string &, const BlockMask &, const Locations &),
@@ -129,7 +152,7 @@ protected:
     }
 
     void SetupSuccessfulWritePath() {
-        ON_CALL(mock_meta_, StartWrite(_, _, _, _, _, _))
+        ON_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
             .WillByDefault(Return(std::make_pair(ER_OK, MakeWriteLocation())));
         ON_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillByDefault(Return(std::make_pair(ER_OK, UriStrVec{})));
         ON_CALL(mock_meta_, FinishWrite(_, _, _, _)).WillByDefault(Return(ER_OK));
@@ -188,7 +211,7 @@ TEST_F(ReplicationExecutorTest, ReleaseGuardMoveAssignReleasesOld) {
 
 TEST_F(ReplicationExecutorTest, SubmitDedupWithinSameCall) {
     std::atomic<int> start_write_count{0};
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).WillRepeatedly([&](auto...) {
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillRepeatedly([&](auto...) {
         ++start_write_count;
         return std::make_pair(ER_OK, MakeEmptyWriteLocation());
     });
@@ -207,7 +230,7 @@ TEST_F(ReplicationExecutorTest, SubmitDedupWhileInflight) {
     auto proceed_future = proceed.get_future().share();
     std::atomic<int> start_write_count{0};
 
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).WillRepeatedly([&](auto...) {
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillRepeatedly([&](auto...) {
         ++start_write_count;
         entered.store(true);
         proceed_future.wait();
@@ -231,7 +254,7 @@ TEST_F(ReplicationExecutorTest, SubmitDedupWhileInflight) {
 
 TEST_F(ReplicationExecutorTest, SubmitDifferentKeysNotDeduped) {
     std::atomic<int> start_write_count{0};
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).WillRepeatedly([&](auto...) {
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillRepeatedly([&](auto...) {
         ++start_write_count;
         return std::make_pair(ER_OK, MakeEmptyWriteLocation());
     });
@@ -263,7 +286,7 @@ TEST_F(ReplicationExecutorTest, SubmitWithDataDedupReleasesBuffer) {
     std::promise<void> proceed;
     auto proceed_future = proceed.get_future().share();
 
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).WillRepeatedly([&](auto...) {
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillRepeatedly([&](auto...) {
         entered.store(true);
         proceed_future.wait();
         return std::make_pair(ER_OK, MakeEmptyWriteLocation());
@@ -293,7 +316,7 @@ TEST_F(ReplicationExecutorTest, SubmitWithDataUpgradesQueuedAutomaticCopy) {
     std::promise<void> proceed;
     auto proceed_future = proceed.get_future().share();
     EXPECT_CALL(mock_meta_, ReplicateCache(_, _, _)).Times(0);
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).WillRepeatedly([&](auto...) {
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillRepeatedly([&](auto...) {
         if (starts.fetch_add(1) == 0) {
             first_entered.store(true);
             proceed_future.wait();
@@ -323,7 +346,7 @@ TEST_F(ReplicationExecutorTest, SubmitWithDataQueueDepthLimitReleasesBuffer) {
     std::promise<void> proceed;
     auto proceed_future = proceed.get_future().share();
 
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).WillRepeatedly([&](auto...) {
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillRepeatedly([&](auto...) {
         entered.store(true);
         proceed_future.wait();
         return std::make_pair(ER_OK, MakeEmptyWriteLocation());
@@ -361,7 +384,7 @@ TEST_F(ReplicationExecutorTest, PiggybackTasksPreserveFifoAndDoNotStarveAsync) {
     std::vector<int64_t> execution_order;
     std::mutex order_mu;
 
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _))
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
         .WillRepeatedly([&](const std::string &,
                             const std::vector<int64_t> &keys,
                             auto...) -> std::pair<ClientErrorCode, WriteLocation> {
@@ -403,7 +426,7 @@ TEST_F(ReplicationExecutorTest, PiggybackTasksPreserveFifoAndDoNotStarveAsync) {
 // ===========================================================================
 
 TEST_F(ReplicationExecutorTest, ExecuteWriteEndToEnd) {
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true))
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, "nodeA"))
         .WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation("sess_pb", "spec0", "rdma://dest/0"))));
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce(Return(std::make_pair(ER_OK, UriStrVec{})));
     EXPECT_CALL(mock_meta_, FinishWrite(_, "sess_pb", _, _)).WillOnce(Return(ER_OK));
@@ -418,7 +441,7 @@ TEST_F(ReplicationExecutorTest, ExecuteWriteEndToEnd) {
 }
 
 TEST_F(ReplicationExecutorTest, ExecuteWriteStartWriteFailsReleasesBuffer) {
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _))
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
         .WillRepeatedly(Return(std::make_pair(ER_CONNECT_FAIL, WriteLocation{})));
 
     std::atomic<int> release_count{0};
@@ -431,7 +454,7 @@ TEST_F(ReplicationExecutorTest, ExecuteWriteStartWriteFailsReleasesBuffer) {
 }
 
 TEST_F(ReplicationExecutorTest, ExecuteWriteSaveFailsReleasesBuffer) {
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _))
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
         .WillRepeatedly(Return(std::make_pair(ER_OK, MakeWriteLocation())));
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _))
         .WillRepeatedly(Return(std::make_pair(ER_SDKWRITE_ERROR, UriStrVec{})));
@@ -451,7 +474,7 @@ TEST_F(ReplicationExecutorTest, ExecuteWriteSaveFailsReleasesBuffer) {
 
 TEST_F(ReplicationExecutorTest, AutomaticHintUsesServerSideCopyWithoutClientTransfer) {
     EXPECT_CALL(mock_meta_, ReplicateCache(_, _, 60)).WillOnce(Return(ER_OK));
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).Times(0);
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).Times(0);
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(0);
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).Times(0);
 
@@ -464,7 +487,7 @@ TEST_F(ReplicationExecutorTest, AutomaticHintUsesServerSideCopyWithoutClientTran
 
 TEST_F(ReplicationExecutorTest, ServerSideCopyFailureDoesNotIssueSecondCopy) {
     EXPECT_CALL(mock_meta_, ReplicateCache(_, _, 60)).WillOnce(Return(ER_SERVICE_INTERNAL_ERROR));
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).Times(0);
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).Times(0);
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(0);
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).Times(0);
 
@@ -475,7 +498,7 @@ TEST_F(ReplicationExecutorTest, ServerSideCopyFailureDoesNotIssueSecondCopy) {
 }
 
 TEST_F(ReplicationExecutorTest, ExecuteHintAsyncEndToEnd) {
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true))
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, "nodeB"))
         .WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation("sess_async", "spec0", "rdma://dest/0"))));
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).WillOnce(Return(ER_OK));
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce(Return(std::make_pair(ER_OK, UriStrVec{})));
@@ -487,7 +510,8 @@ TEST_F(ReplicationExecutorTest, ExecuteHintAsyncEndToEnd) {
 }
 
 TEST_F(ReplicationExecutorTest, ExecuteHintAsyncNoSizeInUriAborts) {
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation())));
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
+        .WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation())));
 
     auto executor = MakeExecutor(1);
     executor->Submit({MakeHint(1, "nodeA", "rdma://src/block/0")});
@@ -519,7 +543,7 @@ TEST_F(ReplicationExecutorTest, MultiSpecCopiesByNameAndPublishesAllActualUris) 
     location.locations[0].push_back({"state", "rdma://dest/state?size=4"});
     auto hint = MakeHint(42, "reader", "");
     hint.source_specs = {{"state", "rdma://src/state?size=4"}, {"kv", "rdma://src/kv?size=4"}};
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillOnce(Return(std::make_pair(ER_OK, location)));
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(2).WillRepeatedly([](const auto &uris, const auto &bufs, auto) {
         const char value = uris[0].find("/state?") != std::string::npos ? 's' : 'k';
         EXPECT_EQ(4u, bufs[0].iovs[0].size);
@@ -547,7 +571,7 @@ TEST_F(ReplicationExecutorTest, MultiSpecLoadFailureAbortsWholeSession) {
     location.locations[0].push_back({"state", "rdma://dest/state"});
     auto hint = MakeHint(42, "reader", "");
     hint.source_specs = {{"kv", "rdma://src/kv?size=4"}, {"state", "rdma://src/state?size=4"}};
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillOnce(Return(std::make_pair(ER_OK, location)));
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).WillOnce(Return(ER_OK)).WillOnce(Return(ER_SDKREAD_ERROR));
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).Times(0);
     EXPECT_CALL(mock_meta_, FinishWrite(_, "multi", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &locs) {
@@ -563,7 +587,7 @@ TEST_F(ReplicationExecutorTest, MultiSpecLoadFailureAbortsWholeSession) {
 TEST_F(ReplicationExecutorTest, LegacySingleSourceCannotPublishMultipleSpecs) {
     auto location = MakeWriteLocation();
     location.locations[0].push_back({"state", "rdma://dest/state"});
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillOnce(Return(std::make_pair(ER_OK, location)));
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(0);
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).Times(0);
     EXPECT_CALL(mock_meta_, FinishWrite(_, "sess_1", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &) {
@@ -583,7 +607,7 @@ TEST_F(ReplicationExecutorTest, MultiSpecPiggybackFallsBackToCompleteNamedSource
     location.locations[0].push_back({"state", "rdma://dest/state"});
     auto hint = MakeHint(42, "reader", "");
     hint.source_specs = {{"kv", "rdma://src/kv?size=4"}, {"state", "rdma://src/state?size=4"}};
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillOnce(Return(std::make_pair(ER_OK, location)));
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(2).WillRepeatedly(Return(ER_OK));
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce([](const auto &uris, const auto &bufs, auto) {
         EXPECT_EQ(2u, uris.size());
@@ -608,7 +632,7 @@ TEST_F(ReplicationExecutorTest, MissingSourceSpecNeverPublishesPartialReplica) {
     location.locations[0].push_back({"state", "rdma://dest/state"});
     auto hint = MakeHint(42, "reader", "");
     hint.source_specs = {{"unrelated", "rdma://src/other?size=4"}};
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillOnce(Return(std::make_pair(ER_OK, location)));
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(0);
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).Times(0);
     EXPECT_CALL(mock_meta_, FinishWrite(_, "multi", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &) {
@@ -621,7 +645,8 @@ TEST_F(ReplicationExecutorTest, MissingSourceSpecNeverPublishesPartialReplica) {
 }
 
 TEST_F(ReplicationExecutorTest, SaveFailureAbortsSessionWithoutPublishing) {
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation())));
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
+        .WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation())));
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce(Return(std::make_pair(ER_SDKWRITE_ERROR, UriStrVec{})));
     EXPECT_CALL(mock_meta_, FinishWrite(_, "sess_1", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &locs) {
         EXPECT_EQ((BlockMaskVector{false}), std::get<BlockMaskVector>(mask));
@@ -648,7 +673,7 @@ TEST_F(ReplicationExecutorTest, FailedPublishAcknowledgementDoesNotSendContradic
 
 TEST_F(ReplicationExecutorTest, CallerChangeDropsStaleTargetHint) {
     EXPECT_CALL(mock_meta_, GetCallerNode()).WillOnce(Return("new_provider"));
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).Times(0);
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).Times(0);
     auto executor = MakeExecutor();
     executor->Submit({MakeHint(42, "old_provider")});
     executor->Shutdown();
@@ -659,14 +684,15 @@ TEST_F(ReplicationExecutorTest, AsyncQueueIsBoundedAndStoppedExecutorReleasesBuf
     auto entered_future = entered.get_future();
     auto proceed_future = proceed.get_future().share();
     std::vector<int64_t> executed;
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).WillRepeatedly([&](auto, const auto &keys, auto, auto, auto, auto) {
-        executed.push_back(keys[0]);
-        if (keys[0] == 1) {
-            entered.set_value();
-            proceed_future.wait();
-        }
-        return std::make_pair(ER_OK, MakeEmptyWriteLocation());
-    });
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
+        .WillRepeatedly([&](auto, const auto &keys, auto, auto, auto) {
+            executed.push_back(keys[0]);
+            if (keys[0] == 1) {
+                entered.set_value();
+                proceed_future.wait();
+            }
+            return std::make_pair(ER_OK, MakeEmptyWriteLocation());
+        });
     auto executor = std::make_unique<ReplicationExecutor>(&mock_meta_, &mock_transfer_, 1, 2);
     executor->Submit({MakeHint(1, "reader")});
     const bool ready = entered_future.wait_for(5s) == std::future_status::ready;
@@ -688,7 +714,7 @@ TEST_F(ReplicationExecutorTest, PartialActualUriResponseAbortsWholeReplica) {
     location.locations[0].push_back({"state", "rdma://dest/state"});
     auto hint = MakeHint(42, "reader", "");
     hint.source_specs = {{"kv", "rdma://src/kv?size=4"}, {"state", "rdma://src/state?size=4"}};
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillOnce(Return(std::make_pair(ER_OK, location)));
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(2).WillRepeatedly(Return(ER_OK));
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _))
         .WillOnce(Return(std::make_pair(ER_OK, UriStrVec{"rdma://actual/kv"})));
@@ -707,14 +733,15 @@ TEST_F(ReplicationExecutorTest, EmptyBuffersDoNotConsumePiggybackQueueCapacity) 
     auto entered_future = entered.get_future();
     auto proceed_future = proceed.get_future().share();
     std::vector<int64_t> executed;
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).WillRepeatedly([&](auto, const auto &keys, auto, auto, auto, auto) {
-        executed.push_back(keys[0]);
-        if (keys[0] == 1) {
-            entered.set_value();
-            proceed_future.wait();
-        }
-        return std::make_pair(ER_OK, MakeEmptyWriteLocation());
-    });
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
+        .WillRepeatedly([&](auto, const auto &keys, auto, auto, auto) {
+            executed.push_back(keys[0]);
+            if (keys[0] == 1) {
+                entered.set_value();
+                proceed_future.wait();
+            }
+            return std::make_pair(ER_OK, MakeEmptyWriteLocation());
+        });
     auto executor = MakeExecutor();
     executor->Submit({MakeHint(1, "reader")});
     const bool ready = entered_future.wait_for(5s) == std::future_status::ready;
@@ -791,7 +818,7 @@ TEST(ReplicationResourcesTest, PacesEachNodeAndCancelsExpiredWorkWithoutLeakingB
 }
 
 TEST_F(ReplicationExecutorTest, MetricsReportAcknowledgedSuccessAndExporterFailureDoesNotBreakWorker) {
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true))
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
         .WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation())));
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce(Return(std::make_pair(ER_OK, UriStrVec{})));
     EXPECT_CALL(mock_meta_, FinishWrite(_, _, _, _)).WillOnce(Return(ER_OK));
@@ -814,7 +841,7 @@ TEST_F(ReplicationExecutorTest, MetricsReportAcknowledgedSuccessAndExporterFailu
 }
 
 TEST_F(ReplicationExecutorTest, MetricsDistinguishFailedSkippedExpiredAndBudgetDrops) {
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _))
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
         .WillOnce(Return(std::make_pair(ER_CONNECT_FAIL, WriteLocation{})))
         .WillOnce(Return(std::make_pair(ER_OK, MakeEmptyWriteLocation())));
     ReplicationExecutor executor(&mock_meta_, &mock_transfer_, 1);
@@ -848,7 +875,7 @@ TEST_F(ReplicationExecutorTest, NamedBuffersReuseAllSpecsByNameAndRetainOwnersTh
     std::vector<ClientReplicationBuffer> buffers{
         {"state", base + 4, 4, MemoryType::CPU, owner}, {"kv", base, 4, MemoryType::CPU, owner}};
     owner.reset();
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillOnce(Return(std::make_pair(ER_OK, location)));
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(0);
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce([&](const auto &, const auto &data, auto) {
         EXPECT_FALSE(weak.expired());
@@ -876,7 +903,7 @@ TEST_F(ReplicationExecutorTest, NamedPartialReuseLoadsOnlyMissingSpecAndPropagat
     auto hint = MakeHint(901, "reader", "");
     hint.source_specs = {{"state", "rdma://src/state?size=4"}, {"kv", "rdma://src/kv?size=4"}};
     auto owner = std::make_shared<std::vector<char>>(4, 'k');
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(Return(std::make_pair(ER_OK, location)));
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).WillOnce(Return(std::make_pair(ER_OK, location)));
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).WillOnce([](const auto &uris, const auto &data, auto) {
         EXPECT_EQ((UriStrVec{"rdma://src/state?size=4"}), uris);
         std::memset(data[0].iovs[0].base, 's', 4);
@@ -895,7 +922,7 @@ TEST_F(ReplicationExecutorTest, NamedPartialReuseLoadsOnlyMissingSpecAndPropagat
 }
 
 TEST_F(ReplicationExecutorTest, NamedInvalidBuffersRejectBeforeAllocationAndReleaseOwnership) {
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).Times(0);
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).Times(0);
     auto hint = MakeHint(902, "reader", "");
     hint.source_specs = {{"kv", "rdma://src/kv?size=4"}};
     auto owner = std::make_shared<std::vector<char>>(4);
@@ -921,8 +948,8 @@ TEST_F(ReplicationExecutorTest, NamedTransferExceptionAbortsWholeSessionAndRelea
     std::weak_ptr<std::vector<char>> weak = owner;
     std::vector<ClientReplicationBuffer> buffers{{"kv", owner->data(), 4, MemoryType::CPU, owner}};
     owner.reset();
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true)).WillOnce(
-        Return(std::make_pair(ER_OK, MakeWriteLocation("named", "kv", "rdma://dest/kv?size=4"))));
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
+        .WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation("named", "kv", "rdma://dest/kv?size=4"))));
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _)).Times(0);
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _)).WillOnce(testing::Throw(std::runtime_error("transfer failure")));
     EXPECT_CALL(mock_meta_, FinishWrite(_, "named", _, _)).WillOnce([](auto, auto, const auto &mask, const auto &locs) {
@@ -938,7 +965,7 @@ TEST_F(ReplicationExecutorTest, NamedTransferExceptionAbortsWholeSessionAndRelea
 }
 
 TEST_F(ReplicationExecutorTest, TransferAbortAndReleaseExceptionsDoNotTerminateWorker) {
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true))
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
         .WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation())))
         .WillOnce(Return(std::make_pair(ER_OK, MakeEmptyWriteLocation())));
     EXPECT_CALL(mock_transfer_, SaveKvCaches(_, _, _))
@@ -974,7 +1001,7 @@ TEST(ReleaseGuardTest, MoveAssignmentReleasesBothCallbacksExactlyOnceWhenTheyThr
 
 TEST_F(ReplicationExecutorTest, ServerCopyHonorsTargetRateAcrossAutomaticTasks) {
     EXPECT_CALL(mock_meta_, ReplicateCache(_, _, 60)).Times(1).WillOnce(Return(ER_OK));
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).Times(0);
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _)).Times(0);
     ReplicationOptions options;
     options.node_bytes_per_second = 1;
     options.max_age_ms = 50;
@@ -1022,7 +1049,7 @@ TEST_F(ReplicationExecutorTest, ThrowingFallbackDoesNotDiscardSuccessfulSiblingI
             EXPECT_EQ(2u, hints.size());
             return std::vector<ClientReplicationRpcResult>{{ER_SERVICE_UNSUPPORTED, false}, {ER_OK, false}};
         });
-    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, true))
+    EXPECT_CALL(mock_meta_, StartReplicationWrite(_, _, _, _, _))
         .WillOnce(Return(std::make_pair(ER_OK, MakeWriteLocation())));
     EXPECT_CALL(mock_transfer_, LoadKvCaches(_, _, _))
         .WillOnce(testing::Throw(std::runtime_error("fallback transfer exception")));
@@ -1042,4 +1069,11 @@ TEST_F(ReplicationExecutorTest, ThrowingFallbackDoesNotDiscardSuccessfulSiblingI
     EXPECT_EQ(1u, executor->GetStats().failed);
     EXPECT_EQ(1u, executor->GetStats().transfer_failed);
     EXPECT_EQ(0u, executor->GetStats().active);
+}
+
+TEST_F(ReplicationExecutorTest, UnsupportedExplicitTargetDoesNotFallBackToOrdinaryWrite) {
+    EXPECT_CALL(mock_meta_, StartWrite(_, _, _, _, _, _)).Times(0);
+    const auto result = mock_meta_.MetaClient::StartReplicationWrite("trace", {1}, {}, 60, "target");
+    EXPECT_EQ(ER_SERVICE_UNSUPPORTED, result.first);
+    EXPECT_TRUE(result.second.locations.empty());
 }

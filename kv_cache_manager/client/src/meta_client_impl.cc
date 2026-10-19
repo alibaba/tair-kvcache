@@ -169,7 +169,7 @@ MetaClientImpl::StartWrite(const std::string &trace_id,
                            const std::vector<int64_t> &tokens,
                            const std::vector<std::string> &location_spec_group_names,
                            int64_t write_timeout_seconds,
-                           bool is_replication, int32_t min_replica_count) {
+                           int32_t min_replica_count) {
     KVCM_LOG_DEBUG("start write with trace_id [%s], keys %s, tokens %s, location_spec_group_names [%s], "
                    "write_timeout_seconds [%ld]",
                    trace_id.c_str(),
@@ -178,8 +178,14 @@ MetaClientImpl::StartWrite(const std::string &trace_id,
                    DebugStringUtil::ToString(location_spec_group_names).c_str(),
                    write_timeout_seconds);
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
-    return stub_->StartWriteCache(
-        trace_id, instance_id, keys, tokens, location_spec_group_names, write_timeout_seconds, CurrentCallerNode(), is_replication, min_replica_count);
+    return stub_->StartWriteCache(trace_id,
+                                  instance_id,
+                                  keys,
+                                  tokens,
+                                  location_spec_group_names,
+                                  write_timeout_seconds,
+                                  CurrentCallerNode(),
+                                  min_replica_count);
 }
 
 std::pair<ClientErrorCode, WriteLocation>

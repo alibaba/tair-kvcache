@@ -422,7 +422,7 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
                           const std::vector<std::string> &location_spec_group_names,
                           int64_t write_timeout_seconds,
                           const ClientCallerNode &caller,
-                          bool is_replication, int32_t min_replica_count) {
+                          int32_t min_replica_count) {
     if (min_replica_count < 0) {
         return {ER_INVALID_PARAMS, {}};
     }
@@ -441,7 +441,6 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
         proto_caller->set_supernode_id(caller.supernode_id);
         proto_caller->set_replication_capabilities(caller.replication_capabilities);
     }
-    request.set_is_replication(is_replication);
     grpc::ClientContext context;
     proto::meta::StartWriteCacheResponse response;
     auto grpc_status = stub->StartWriteCache(&context, request, &response);
