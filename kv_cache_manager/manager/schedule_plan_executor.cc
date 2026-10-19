@@ -710,7 +710,9 @@ SchedulePlanExecutor::PrepareDeleteTask(const CacheLocationDelRequest &task) {
                                         &task.location_ids,
                                         expected_location_values,
                                         task.delay,
-                                        task.authoritative_read, task.min_retained_replicas);
+                                        task.authoritative_read,
+                                        task.min_retained_replicas,
+                                        task.metadata_only);
     result.actual_task.metadata_only = task.metadata_only;
     result.actual_task.confirmed_missing_uris = task.confirmed_missing_uris;
     return result;
@@ -722,7 +724,9 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                                             const std::vector<std::vector<std::string>> *target_location_ids,
                                             const std::vector<std::vector<std::string>> *expected_location_values,
                                             std::chrono::microseconds delay,
-                                            bool authoritative_read, uint32_t min_retained_replicas) {
+                                            bool authoritative_read,
+                                            uint32_t min_retained_replicas,
+                                            bool metadata_only) {
     LocationDelAdmissionResult admission_result;
     admission_result.actual_task = CacheLocationDelRequest{instance_id, {}, {}, delay};
 
@@ -806,6 +810,24 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                 const auto expected = expected_values_by_location.find(location.id());
                 if (expected == expected_values_by_location.end() || expected_location_value != expected->second) {
                     continue; // stable location was refreshed after the cleanup scan
+                }
+            }
+            if (location.status() == CLS_DELETING && !metadata_only && !IsEventReportStorageType(location.type())) {
+                const bool retry_safe = std::all_of(
+                    location.location_specs().begin(), location.location_specs().end(), [&](const auto &spec) {
+                        const DataStorageUri uri(spec.uri());
+                        const auto backend = uri.Valid() && data_storage_manager_
+                                                 ? data_storage_manager_->GetDataStorageBackend(uri.GetHostName())
+                                                 : nullptr;
+                        return backend && backend->SupportsDeleteRetry();
+                    });
+                if (!retry_safe) {
+                    KVCM_LOG_WARN("retain deleting location: backend cannot safely retry an unknown delete, "
+                                  "instance[%s] key[%ld] location[%s]",
+                                  instance_id.c_str(),
+                                  block_key,
+                                  location.id().c_str());
+                    continue;
                 }
             }
             location_cas_tasks.push_back({location.id(),

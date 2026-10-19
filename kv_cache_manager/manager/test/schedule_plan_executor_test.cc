@@ -144,6 +144,7 @@ public:
         ++policy_queries;
         return skip_missing_;
     }
+    bool SupportsDeleteRetry() const override { return supports_delete_retry; }
     bool Available() override { return true; }
     double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
     const StorageConfig &GetStorageConfig() override { return config_; }
@@ -187,6 +188,7 @@ public:
     mutable size_t policy_queries{0};
     ErrorCode delete_result{EC_OK};
     bool throw_on_delete{false};
+    bool supports_delete_retry{true};
     bool short_result{false};
     size_t result_limit{std::numeric_limits<size_t>::max()};
     std::function<void()> on_delete;
@@ -744,6 +746,60 @@ TEST_F(BackendGcDeleteTest, GcRetryPreservesQueuedDelayAndCanRecoverAfterCancell
         EXPECT_EQ(EC_OK, Run(Request(key, {"target"}, {})).status);
         EXPECT_EQ(delete_count + 1, backend->delete_batches.size());
         EXPECT_TRUE(Locations(key).empty());
+    }
+}
+
+TEST_F(BackendGcDeleteTest, UnknownDeleteCannotRetryAReusableAddressAfterRestart) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    auto backend = AddBackend("pace", type);
+    backend->supports_delete_retry = false;
+    backend->delete_result = EC_TIMEOUT;
+    const std::string uri = "pace://pace/123?size=5";
+    SetLocation(100, "target", type, {uri});
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Request(100, {"target"}, {})).status);
+    ASSERT_EQ(1u, backend->delete_batches.size());
+    const auto tombstone = Locations(100).at("target")->ToJsonString();
+
+    // The first Free may have succeeded and the same GA may now name new data.
+    executor = std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    backend->delete_result = EC_OK;
+    EXPECT_EQ(EC_OK, Run(Request(100, {"target"}, {uri})).status);
+    EXPECT_EQ(1u, backend->delete_batches.size());
+    EXPECT_EQ(tombstone, Locations(100).at("target")->ToJsonString());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+
+    auto metadata_only = Request(100, {"target"}, {});
+    metadata_only.metadata_only = true;
+    EXPECT_EQ(EC_OK, Run(metadata_only).status);
+    EXPECT_EQ(1u, backend->delete_batches.size());
+    EXPECT_TRUE(Locations(100).empty());
+}
+
+TEST_F(BackendGcDeleteTest, TombstoneRetryRequiresEveryUriToHaveAnAvailableRetryPolicy) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto safe = AddBackend("safe", type);
+    auto unsafe = AddBackend("unsafe", type);
+    unsafe->supports_delete_retry = false;
+    for (const auto &uri : {"dummy://unsafe/reused", "dummy://missing/unknown", ""}) {
+        SetLocation(100, "target", type, {"dummy://safe/one?size=3"});
+        // Simulate a recovered tombstone, including a malformed stored URI.
+        auto modifier = [&](const std::vector<ErrorCode> &,
+                            const LocationIdVector &,
+                            size_t,
+                            CacheLocationVector &locations,
+                            PropertyMap &) -> LocationModifierResult {
+            auto location = std::make_shared<CacheLocation>(*locations[0]);
+            location->set_status(CLS_DELETING);
+            location->push_location_spec(LocationSpec("other", uri));
+            locations[0] = std::move(location);
+            return {ModifierAction::MA_OK, {EC_OK}};
+        };
+        ASSERT_EQ(EC_OK, indexer->ReadModifyWriteLocation(&context, {100}, {{"target"}}, modifier).ec);
+        const auto tombstone = Locations(100).at("target")->ToJsonString();
+        EXPECT_EQ(EC_OK, Run(Request(100, {"target"}, {})).status);
+        EXPECT_EQ(tombstone, Locations(100).at("target")->ToJsonString());
+        EXPECT_TRUE(safe->delete_batches.empty());
+        EXPECT_TRUE(unsafe->delete_batches.empty());
     }
 }
 

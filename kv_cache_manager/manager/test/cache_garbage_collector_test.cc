@@ -1,9 +1,11 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <set>
 #include <shared_mutex>
@@ -18,12 +20,15 @@
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
+#include "kv_cache_manager/config/meta_indexer_config.h"
+#include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/manager/cache_garbage_collector.h"
+#include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -78,6 +83,7 @@ public:
     explicit ProbeTestBackend(DataStorageType type) : DataStorageBackend(nullptr), type_(type) {}
 
     DataStorageType GetType() override { return type_; }
+    bool SupportsDeleteRetry() const override { return !IsTairMempoolStorageType(type_); }
     bool Available() override { return true; }
     double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
     ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
@@ -1242,6 +1248,35 @@ TEST_F(CacheGarbageCollectorTest, DeletingTombstonesAreRetriedWithoutStorageProb
                      .executor_request.block_keys.empty());
 }
 
+TEST_F(CacheGarbageCollectorTest, UnsafeOrUnavailableBackendsKeepDeletingTombstones) {
+    auto gc = MakeGc(DefaultConfig());
+    PrepareForSingleStep(*gc);
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+        SCOPED_TRACE(static_cast<int>(type));
+        probe_storage_type_overrides["pace"] = type;
+        const auto location = MakeStoredLocation("old", CLS_DELETING, type, {"tair_mempool://pace/123?size=8"});
+        const auto snapshot = location->ToJsonString();
+        const auto batch = MakeBatch(SCAN_BASE_CURSOR, {23}, {{{"old", location}}});
+        EXPECT_TRUE(gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs())
+                        .executor_request.block_keys.empty());
+        EXPECT_EQ(snapshot, location->ToJsonString());
+    }
+    missing_probe_storages.insert("missing");
+    const auto missing =
+        MakeStoredLocation("missing", CLS_DELETING, DataStorageType::DATA_STORAGE_TYPE_NFS, {"file://missing/old"});
+    EXPECT_TRUE(gc->BuildDeleteActions("instance_a",
+                                       MakeBatch(SCAN_BASE_CURSOR, {24}, {{{"missing", missing}}}),
+                                       TimestampUtil::GetCurrentTimeUs())
+                    .executor_request.block_keys.empty());
+    EXPECT_EQ(3,
+              metrics_registry_
+                  ->GetCounter("cache_gc.candidate_dropped_count",
+                               {{"reason", "deleting_retry"}, {"cause", "unsafe_backend_retry"}})
+                  .Get());
+    EXPECT_TRUE(might_exist_calls.empty());
+}
+
 TEST_F(CacheGarbageCollectorTest, DisabledGcPreservesTombstonesAndEnabledGcRescansAfterFailureAndRestart) {
     auto config = DefaultConfig();
     config.round_pause_ms = 0;
@@ -2260,6 +2295,200 @@ TEST_F(CacheGarbageCollectorTest, JoinWaitsForActiveMaintenanceScan) {
     ASSERT_EQ(std::future_status::ready, join_future.wait_for(std::chrono::seconds(1)));
     join_future.get();
     EXPECT_FALSE(gc->IsRunning());
+}
+
+// Only the provider allocation/free boundary is simulated. GC, executor,
+// metadata transitions, persisted tombstones and usage accounting run normally.
+class PaceDeleteReuseGcTest : public CacheGarbageCollectorTest {
+public:
+    class ReusingStorage : public ProbeTestBackend {
+    public:
+        ReusingStorage(DataStorageType type, bool partial) : ProbeTestBackend(type), partial_(partial) {}
+        bool SupportsDeleteRetry() const override { return allow_unsafe_retry; }
+
+        std::vector<std::pair<ErrorCode, DataStorageUri>>
+        Create(const std::vector<std::string> &keys, size_t, const std::string &, std::function<void()>) override {
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::vector<std::pair<ErrorCode, DataStorageUri>> result;
+            for (const auto &key : keys) {
+                const auto slot = std::find(allocated_.begin(), allocated_.end(), false) - allocated_.begin();
+                if (slot == allocated_.size()) {
+                    result.emplace_back(EC_OUT_OF_LIMIT, DataStorageUri{});
+                    continue;
+                }
+                allocated_[slot] = true;
+                bytes_[slot].fill(key.back());
+                result.emplace_back(EC_OK, Uri(slot));
+            }
+            return result;
+        }
+
+        std::vector<ErrorCode>
+        Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++delete_calls;
+            for (size_t i = 0; i < uris.size(); ++i) {
+                if (partial_ && delete_calls == 1 && i > 0)
+                    continue;
+                for (size_t slot = 0; slot < bytes_.size(); ++slot) {
+                    if (uris[i].ToUriString() == Uri(slot).ToUriString()) {
+                        allocated_[slot] = false;
+                        bytes_[slot].fill(0);
+                    }
+                }
+            }
+            // PACE exposes a batch-level error for partial failure, and a lost
+            // successful reply is indistinguishable from failure to its caller.
+            return std::vector<ErrorCode>(uris.size(), delete_calls == 1 ? EC_ERROR : EC_OK);
+        }
+
+        bool NewAllocationIntact() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return allocated_[0] && std::all_of(bytes_[0].begin(), bytes_[0].end(), [](char c) { return c == 'N'; });
+        }
+
+        bool allow_unsafe_retry = false; // Negative control reproduces the unfenced legacy replay.
+        size_t delete_calls = 0;
+
+    private:
+        DataStorageUri Uri(size_t slot) const {
+            return DataStorageUri("tair_mempool://reused/" +
+                                  std::to_string(reinterpret_cast<uintptr_t>(bytes_[slot].data())) + "?size=8");
+        }
+        bool partial_;
+        std::mutex mutex_;
+        std::array<std::array<char, 8>, 2> bytes_{};
+        std::array<bool, 2> allocated_{{false, false}};
+    };
+
+    void SetUp() override {
+        CacheGarbageCollectorTest::SetUp();
+        stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
+        stub_.reset(ADDR(MetaIndexer, ScanLocationsForMaintenance));
+        stub_.reset(ADDR(DataStorageManager, GetDataStorageBackend));
+        stub_.reset(ADDR(DataStorageManager, Exist));
+        stub_.reset(static_cast<SubmitAsyncLocation>(ADDR(SchedulePlanExecutor, SubmitAsync)));
+    }
+
+    void Put(KeyType key, const std::string &id, DataStorageType type, const std::vector<std::string> &uris) {
+        RequestContext ctx("reuse-test");
+        MetaSearcher searcher(indexer_);
+        std::vector<LocationSpec> specs;
+        for (size_t i = 0; i < uris.size(); ++i) {
+            specs.emplace_back("spec_" + std::to_string(i), uris[i]);
+        }
+        std::vector<ErrorCode> results;
+        ASSERT_EQ(EC_OK, searcher.BatchReplaceLocationSpecs(&ctx, {key}, {{{id, type, CLS_SERVING, specs}}}, results));
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), results);
+    }
+
+    CacheLocationConstPtr Location(KeyType key, const std::string &id) {
+        MetaSearcher searcher(indexer_);
+        RequestContext ctx("reuse-test");
+        CacheLocationMapVector locations;
+        EXPECT_EQ(EC_OK, searcher.BatchGetLocation(&ctx, {key}, {}, locations));
+        return locations.size() == 1 && locations[0].count(id) ? locations[0].at(id) : nullptr;
+    }
+
+    void RestartMetadataAndExecutor(const std::shared_ptr<MetaIndexerConfig> &config) {
+        migration_manager_.reset();
+        executor_.reset();
+        if (indexer_)
+            indexer_->PersistMetaData();
+        indexer_.reset();
+        meta_indexer_manager_ = std::make_shared<MetaIndexerManager>();
+        ASSERT_EQ(EC_OK, meta_indexer_manager_->CreateMetaIndexer("instance_a", config));
+        indexer_ = meta_indexer_manager_->GetMetaIndexer("instance_a");
+        executor_ =
+            std::make_shared<SchedulePlanExecutor>(1, meta_indexer_manager_, data_storage_manager_, metrics_registry_);
+    }
+
+    void Exercise(DataStorageType type, bool partial) {
+        SCOPED_TRACE(static_cast<int>(type));
+        SCOPED_TRACE(partial);
+        auto meta_config = std::make_shared<MetaIndexerConfig>();
+        meta_config->SetMaxKeyCount(32);
+        meta_config->SetMutexShardNum(4);
+        meta_config->SetPersistMetaDataIntervalTimeMs(0);
+        meta_config->GetMetaStorageBackendConfig()->SetStorageType("dummy");
+        meta_config->GetMetaStorageBackendConfig()->SetStorageUri(
+            "file://" + GetPrivateTestRuntimeDataPath() + "reused_ga_" + std::to_string(static_cast<int>(type)) + "_" +
+            std::to_string(partial));
+        RestartMetadataAndExecutor(meta_config);
+        auto storage = std::make_shared<ReusingStorage>(type, partial);
+        data_storage_manager_->storage_map_["reused"] = storage;
+
+        const auto old = storage->Create({"old_A", "old_B"}, 8, "", nullptr);
+        ASSERT_EQ(2u, old.size());
+        Put(1, "old", type, {old[0].second.ToUriString(), old[1].second.ToUriString()});
+        ASSERT_EQ(16u, indexer_->GetStorageUsage());
+        CacheLocationDelRequest request;
+        request.instance_id = "instance_a";
+        request.block_keys = {1};
+        request.location_ids = {{"old"}};
+        auto first_delete = executor_->Submit(request);
+        ASSERT_EQ(std::future_status::ready, first_delete.wait_for(std::chrono::seconds(3)));
+        EXPECT_NE(EC_OK, first_delete.get().status);
+        ASSERT_EQ(1u, storage->delete_calls);
+        const auto old_location = Location(1, "old");
+        ASSERT_NE(nullptr, old_location);
+        ASSERT_EQ(CLS_DELETING, old_location->status());
+        const auto tombstone = old_location->ToJsonString();
+
+        const auto allocated = storage->Create({"new_N"}, 8, "", nullptr);
+        ASSERT_EQ(1u, allocated.size());
+        ASSERT_EQ(old[0].second.ToUriString(), allocated[0].second.ToUriString());
+        ASSERT_TRUE(storage->NewAllocationIntact());
+        Put(2, "new", type, {allocated[0].second.ToUriString()});
+        ASSERT_EQ(24u, indexer_->GetStorageUsage());
+
+        auto config = DefaultConfig();
+        config.scan_batch_size = 8;
+        for (int round = 0; round < 3; ++round) {
+            if (round == 2)
+                RestartMetadataAndExecutor(meta_config);
+            auto gc = MakeGc(config);
+            PrepareForSingleStep(*gc);
+            gc->RunOneTick();
+            gc->PollInflightDeletes();
+            EXPECT_TRUE(gc->inflight_deletes_.empty());
+            EXPECT_EQ(1u, storage->delete_calls);
+            EXPECT_TRUE(storage->NewAllocationIntact());
+            ASSERT_NE(nullptr, Location(1, "old"));
+            EXPECT_EQ(tombstone, Location(1, "old")->ToJsonString());
+            EXPECT_EQ(24u, indexer_->GetStorageUsage());
+        }
+
+        // Removing the safety capability reproduces the old behavior: the
+        // identical URI now deletes the newly allocated bytes, despite the
+        // old location's snapshot still matching exactly.
+        storage->allow_unsafe_retry = true;
+        auto gc = MakeGc(config);
+        PrepareForSingleStep(*gc);
+        gc->RunOneTick();
+        ASSERT_EQ(1u, gc->inflight_deletes_.size());
+        ASSERT_EQ(std::future_status::ready, gc->inflight_deletes_.front().future.wait_for(std::chrono::seconds(3)));
+        gc->PollInflightDeletes();
+        EXPECT_EQ(2u, storage->delete_calls);
+        EXPECT_FALSE(storage->NewAllocationIntact());
+        ASSERT_NE(nullptr, Location(2, "new"));
+        EXPECT_EQ(CLS_SERVING, Location(2, "new")->status());
+    }
+
+private:
+    std::shared_ptr<MetaIndexer> indexer_;
+};
+
+TEST_F(PaceDeleteReuseGcTest, PartialDeleteCannotDeleteReusedDramAddressOnRetryOrRestart) {
+    Exercise(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, true);
+}
+
+TEST_F(PaceDeleteReuseGcTest, LostReplyCannotDeleteReusedDramAddressOnRetryOrRestart) {
+    Exercise(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, false);
+}
+
+TEST_F(PaceDeleteReuseGcTest, SsdAliasAlsoRequiresGenerationFencingBeforeRetry) {
+    Exercise(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, false);
 }
 
 } // namespace kv_cache_manager

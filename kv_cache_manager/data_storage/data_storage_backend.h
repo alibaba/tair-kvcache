@@ -36,6 +36,10 @@ public:
     // Default to deletion: a missing URI does not always imply reclaimed data.
     // This policy does not affect metadata-only cleanup.
     virtual bool ShouldSkipConfirmedMissingBackendDelete() const { return false; }
+    // Whether an unknown-result Delete may be replayed after other allocations
+    // or a restart. Opt in only when the same URI cannot name a newer object.
+    // This does not restrict the first delete or metadata-only cleanup.
+    virtual bool SupportsDeleteRetry() const { return false; }
     virtual bool Available() = 0;
     virtual double GetStorageUsageRatio(const std::string &trace_id) const = 0;
     inline bool IsOpen() const { return is_open_.load(std::memory_order_relaxed); }

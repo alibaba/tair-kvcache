@@ -930,6 +930,23 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
 
             const CandidateKey candidate_key{batch.keys[i], location_id};
             if (location->status() == CLS_DELETING) {
+                // A failed or interrupted delete may already have freed part
+                // of the allocation. Reusable addresses (notably PACE GAs)
+                // cannot be replayed without an allocation generation fence.
+                if (!IsEventReportStorageType(location->type()) &&
+                    std::any_of(location->location_specs().begin(),
+                                location->location_specs().end(),
+                                [&](const LocationSpec &spec) {
+                                    const DataStorageUri uri(spec.uri());
+                                    const auto backend =
+                                        uri.Valid() && data_storage_manager_
+                                            ? data_storage_manager_->GetDataStorageBackend(uri.GetHostName())
+                                            : nullptr;
+                                    return !backend || !backend->SupportsDeleteRetry();
+                                })) {
+                    RecordCandidateDropped(kDeletingRetryReason, "unsafe_backend_retry", 1);
+                    continue;
+                }
                 // The executor persists this state before touching data. A
                 // failed/interrupted delete remains discoverable after restart.
                 candidates.emplace(candidate_key,
