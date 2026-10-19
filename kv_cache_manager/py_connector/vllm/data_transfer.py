@@ -798,17 +798,6 @@ class DataTransferManager:
                 skipped, failed = self._staged_dispositions(
                     group, remote_uris, staged_slots, n
                 )
-                # The staged branch (and only it) can fail a block that still
-                # holds captured bytes: a location that did not claim this
-                # spec while the capture holds its bytes. Such a block is never
-                # written, and this task owns every staged slot, so return the
-                # ones it will not write -- nothing else can (the written ones
-                # go back in _save_staged_blocks' finally).
-                for i in failed:
-                    if staged_slots[i] is not None:
-                        self._pools[group.spec_name].release(
-                            staged_slots[i], 1  # ty: ignore[invalid-argument-type]
-                        )
             else:
                 skipped, failed = self._save_dispositions(
                     group, remote_uris, block_ids, n
@@ -918,17 +907,17 @@ class DataTransferManager:
         of).
 
         A captured slot goes back to the arena when the write *lands*, and only
-        then: a failed write is not a lost cause. The block can be announced
-        again (the save watermark moves backwards when preemption shrinks an
-        allocation, and a retry session announces the whole prefix), and by
-        then the HBM window that held its KV has moved on -- these captured
-        bytes are the only copy the connector will ever have. The worker puts
-        the failed block's entry back into its staged map (see
-        _retain_failed_windowed) with the slot still held, so the next session
-        publishes it; if that never happens, the entry is released when the
-        request retires. An *exception* out of the SDK is the one case that
-        still returns the slot here: no result callback will fire for that
-        task, so a kept slot would leak in flight for the process's lifetime.
+        then -- this task never returns a slot it did not write, not even when
+        the SDK raises. It cannot: save_task's single exit always reports
+        through the MultiResult, so the session's result callback always fires,
+        and the worker owns the failed path. It puts the failed block's entry
+        back into its staged map (see _retain_failed_windowed) with the slot
+        still held, so the next session publishes it; if that never happens,
+        retirement releases it. Keeping the bytes is the point: the block can
+        be announced again (the save watermark moves backwards when preemption
+        shrinks an allocation, and a retry session announces the whole prefix),
+        and by then the HBM window that held its KV has moved on -- these
+        captured bytes are the only copy the connector will ever have.
         """
         pool = self._pools[group.spec_name]
         uris = [remote_uris[i] for i in valid]
@@ -944,21 +933,18 @@ class DataTransferManager:
             for i in valid
         ]
         ok = False
-        returned = False
         try:
             result = self._transfer_client.SaveKvCaches(uris, buffers)
             ok = result[0] == kvcm_py_client.ClientErrorCode.ER_OK
-            returned = True
         finally:
-            # On success the captured slot goes back to the arena; on a failed
-            # write it stays held, because the worker restores the block's
-            # entry to its staged map with this very slot. The SDK raising is
-            # the exception: nothing will call the session's result callback
-            # then, so a kept entry would sit in flight for the rest of the
-            # process's life (review_r2 N1 measured 384 of 1024 slots leaking
-            # that way), hence the slot is released here even though the bytes
-            # are lost with it.
-            if ok or not returned:
+            # Only a landed write returns the slot. A failed one keeps it,
+            # because the worker restores the block's entry to its staged map
+            # with this very slot: returning it here would hand the arena a
+            # slot the worker still points at, and the retry would publish
+            # whatever the next capture wrote there. An SDK exception is not a
+            # special case -- save_task reports through its single exit either
+            # way, so the callback fires and the worker owns the entry too.
+            if ok:
                 for i in valid:
                     pool.release(staged_slots[i], 1)  # ty: ignore[invalid-argument-type]
         if not ok:

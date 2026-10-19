@@ -1619,8 +1619,11 @@ class TestStagedWrites(unittest.TestCase):
         # its staged map, so returning them here would let another capture take
         # them and leave the retry with nothing to publish.
         self.assertIsNone(pool.acquire(1, timeout=0.01))
-        # A *raise* is the exception (no result callback will fire for the
-        # task), so those slots do come back and cannot leak in flight.
+        # A *raise* is no different: save_task reports through its single exit
+        # either way, so the callback fires and the worker restores the entry
+        # just the same -- these slots stay held too (returning them here would
+        # free a slot the worker still points at, and the retry would publish
+        # whatever the next capture wrote there).
         dtm._transfer_client.SaveKvCaches.side_effect = RuntimeError("sdk")
         dtm.save_task(
             MultiResult(1, lambda flat: None),
@@ -1631,7 +1634,8 @@ class TestStagedWrites(unittest.TestCase):
             block_ids=None,
             staged_slots=[start, start + 1],
         )
-        self.assertEqual(0, pool.acquire(2, timeout=0.01))
+        self.assertIsNone(pool.acquire(2, timeout=0.01))
+        # Retirement returns them...
         pool.release(0, 2)
         self.assertEqual(2, pool.free_blocks)
         # ... exactly once: the pool refuses a second release of the same slots.
@@ -1892,11 +1896,14 @@ class TestCapturedSlotOwnership(unittest.TestCase):
         self.assertEqual(self.CAPACITY - 1, pool.free_blocks)
         self._assert_arena_accounting(conn, pool, sessions=1)
 
-    def test_a_raising_sdk_still_returns_the_slots(self):
-        # The plan handed these slots to this task, so nothing else can return
-        # them: an SDK that raises (a pybind/backend exception, not an error
-        # code) must not shrink the arena for the rest of the process's life
-        # (review_r2 N1 measured 384 of 1024 slots leaking that way).
+    def test_a_raising_sdk_leaves_the_slots_with_the_session(self):
+        # An SDK that raises (a pybind/backend exception, not an error code) is
+        # *not* a case where no callback fires: save_task's single exit always
+        # reports, so the session's callback always runs and the worker restores
+        # the failed block's entry to its staged map with this very slot. The
+        # task returning the slot itself -- the old premise -- freed a slot the
+        # worker still pointed at, and the retry then published whatever the
+        # next capture had written there.
         conn, dtm, pool, group = self._fixture()
         blocks = list(range(self.BLOCKS))
         conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
@@ -1906,17 +1913,22 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             dtm._save_staged_blocks(
                 group, plan.uris, plan.staged_slots, [0, 1, 2, 3], [None] * 4
             )
-        self.assertEqual(self.CAPACITY, pool.free_blocks)
-        self._assert_arena_accounting(conn, pool, sessions=0)
+        # Nothing came back: the bytes are still there for the retry.
+        self.assertEqual(self.CAPACITY - self.BLOCKS, pool.free_blocks)
+        self._assert_arena_accounting(conn, pool, sessions=self.BLOCKS)
 
         # The same crash through save_task: its single exit turns the escaping
-        # exception into all-failed verdicts, and the slots still come back.
+        # exception into all-failed verdicts (report, never publish), the
+        # worker's wrapper puts the entries back where a retry finds them, and
+        # retirement is what finally releases them -- exactly once.
+        conn, dtm, pool, group = self._fixture()
         blocks = list(range(self.BLOCKS))
         conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
         plan = self._plan(conn, blocks)
-        done = {}
+        done_cb, done = self._session_callback(conn, "r0", blocks, [plan])
+        dtm._transfer_client.SaveKvCaches.side_effect = RuntimeError("pybind blew up")
         dtm.save_task(
-            MultiResult(1, lambda flat: done.setdefault("flat", flat)),
+            MultiResult(1, done_cb),
             0,
             group,
             plan.uris,
@@ -1925,14 +1937,19 @@ class TestCapturedSlotOwnership(unittest.TestCase):
             plan.staged_slots,
         )
         self.assertEqual([False] * self.BLOCKS, done["flat"])
-        self.assertEqual(self.CAPACITY, pool.free_blocks)
+        self.assertEqual(self.CAPACITY - self.BLOCKS, pool.free_blocks)
+        self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
         self._assert_arena_accounting(conn, pool, sessions=0)
+        conn._release_staged("r0")
+        self.assertEqual(self.CAPACITY, pool.free_blocks)
 
-    def test_a_failed_contract_returns_its_staged_slots(self):
+    def test_a_failed_contract_keeps_the_slot_with_the_session(self):
         # claimed=False + captured=True (the capture holds bytes for a block
         # whose location never claimed this spec) is a contract violation: the
-        # block fails *and* the task returns the slot it owns -- failing alone
-        # would leave the arena short for the rest of the process's life.
+        # block fails. The task used to return the slot it could not write
+        # ("nothing else can") -- it must not: every failed block belongs to the
+        # session, whose callback puts the entry back in the staged map, and
+        # retirement is the one that releases it.
         group = windowed_group()
         pool = _StagingPool(torch.device("cpu"), group.per_block_bytes, 4)
         dtm = DataTransferManager.__new__(DataTransferManager)
@@ -1946,18 +1963,107 @@ class TestCapturedSlotOwnership(unittest.TestCase):
                         ".batch_gather_scatter_helper"):
             conn._capture_request(CaptureRequest("r0", [0], all_block_ids=[[7]]))
         self.assertEqual(3, pool.free_blocks)
-        verdicts: List[Any] = [None]
+        plan = conn._plan_group_transfers(
+            [{"location_specs": []}],  # no location claimed this block's spec
+            [0],
+            [[7]],
+            "r0",
+            for_save=True,
+        )[0]
+        self.assertEqual([None], plan.uris)
+        self.assertEqual([0], plan.staged_slots)
+        done_cb, done = self._session_callback(conn, "r0", [0], [plan])
         dtm.save_task(
-            MultiResult(1, lambda flat: verdicts.__setitem__(slice(None), flat)),
+            MultiResult(1, done_cb),
             0,
             group,
-            [None],  # no location claimed this block's spec
+            plan.uris,
             None,
             None,
-            [0],
+            plan.staged_slots,
         )
-        self.assertEqual([False], verdicts)
+        self.assertEqual([False], done["flat"])
+        # Still the session's: the slot came back to the staged map, not to the
+        # arena.
+        self.assertEqual(3, pool.free_blocks)
+        self.assertEqual([("tp0_g0", 0)], list(conn._staged["r0"]))
+        conn._release_staged("r0")
         self.assertEqual(4, pool.free_blocks)
+
+    def _task_releases(self, dtm, pool, run):
+        """Run ``run`` with the pool's release calls recorded."""
+        with mock.patch.object(pool, "release", wraps=pool.release) as released:
+            run()
+        return released.call_args_list
+
+    def test_a_failed_write_never_returns_the_slots_from_the_task(self):
+        # The invariant the ownership fix rests on: whatever goes wrong in a
+        # staged save, the task only reports. It never calls pool.release for a
+        # block it did not write -- the worker holds that slot in its staged map
+        # and restores the entry itself, so a task-side release frees a slot a
+        # retry is about to publish and the retirement that follows then frees
+        # it twice (the pool's double-release guard turns that into a ValueError
+        # out of the engine thread).
+        #
+        # Both task-side releases are covered here, so reinstating either makes
+        # this red: ``if ok or not returned`` in _save_staged_blocks (the
+        # raising-SDK case) and the disposition-failed loop in save_task (the
+        # failed-contract case).
+        conn, dtm, pool, group = self._fixture()
+        blocks = list(range(self.BLOCKS))
+        conn._capture_request(CaptureRequest("r0", blocks, all_block_ids=[[7, 8, 9, 10]]))
+        plan = self._plan(conn, blocks)
+        done_cb, done = self._session_callback(conn, "r0", blocks, [plan])
+        dtm._transfer_client.SaveKvCaches.side_effect = RuntimeError("pybind blew up")
+        released = self._task_releases(
+            dtm,
+            pool,
+            lambda: dtm.save_task(
+                MultiResult(1, done_cb),
+                0,
+                group,
+                plan.uris,
+                None,
+                None,
+                plan.staged_slots,
+            ),
+        )
+        self.assertEqual([False] * self.BLOCKS, done["flat"])
+        self.assertEqual(
+            [], released, "a raising SDK must not free the slots it did not write"
+        )
+        self.assertEqual(self.CAPACITY - self.BLOCKS, pool.free_blocks)
+        self.assertEqual(self.BLOCKS, len(conn._staged["r0"]))
+        self._assert_arena_accounting(conn, pool, sessions=0)
+
+        conn, dtm, pool, group = self._fixture()
+        conn._capture_request(CaptureRequest("r0", [0], all_block_ids=[[7]]))
+        violated = conn._plan_group_transfers(
+            [{"location_specs": []}], [0], [[7]], "r0", for_save=True
+        )[0]
+        done_cb, done = self._session_callback(conn, "r0", [0], [violated])
+        released = self._task_releases(
+            dtm,
+            pool,
+            lambda: dtm.save_task(
+                MultiResult(1, done_cb),
+                0,
+                group,
+                violated.uris,
+                None,
+                None,
+                violated.staged_slots,
+            ),
+        )
+        self.assertEqual([False], done["flat"])
+        self.assertEqual(
+            [],
+            released,
+            "a failed contract must not free the slot it could not write",
+        )
+        self.assertEqual(self.CAPACITY - 1, pool.free_blocks)
+        self.assertEqual([("tp0_g0", 0)], list(conn._staged["r0"]))
+        self._assert_arena_accounting(conn, pool, sessions=0)
 
     def test_a_second_plan_fails_instead_of_handing_the_slot_out_twice(self):
         conn, dtm, pool, group = self._fixture()
