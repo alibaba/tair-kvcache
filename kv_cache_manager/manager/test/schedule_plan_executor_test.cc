@@ -567,7 +567,7 @@ TEST_F(BackendGcDeleteTest, PreparedDeleteCannotDeleteAReplacementWithTheSameIdA
         SetLocation(key, "target", type, {replacement});
         std::vector<std::vector<ErrorCode>> results;
         ASSERT_EQ(EC_OK, searcher->BatchUpdateLocationStatus(&context, {key}, {{{"target", CLS_DELETING}}}, results));
-        EXPECT_EQ(EC_OK, executor->DoLocationDelTask(admission.actual_task).status);
+        EXPECT_EQ(EC_OK, executor->DoLocationDelTask(admission.actual_task, admission.delete_lease).status);
         EXPECT_TRUE(backend->delete_batches.empty());
         EXPECT_EQ(replacement, Locations(key).at("target")->location_specs().front().uri());
     }
@@ -704,6 +704,47 @@ TEST_F(BackendGcDeleteTest, GcRetryCannotReenterAnActivePhysicalDelete) {
     EXPECT_EQ(1u, backend->delete_batches.size());
     EXPECT_TRUE(Locations(100).empty());
     EXPECT_TRUE(executor->active_location_deletes_.empty());
+}
+
+TEST_F(BackendGcDeleteTest, GcRetryPreservesQueuedDelayAndCanRecoverAfterCancellation) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("storage", type);
+    for (int mode = 0; mode < 4; ++mode) {
+        SCOPED_TRACE(mode);
+        const int64_t key = 200 + mode;
+        SetLocation(key, "target", type, {"dummy://storage/" + std::to_string(key) + "?size=5"});
+        CacheLocationDelRequest location_request{kTestInstanceName, {key}, {{"target"}}, std::chrono::hours(1)};
+        CacheMetaDelRequest meta_request{kTestInstanceName, {key}, std::chrono::hours(1)};
+        std::future<PlanExecuteResult> delayed;
+        if (mode == 0)
+            delayed = executor->Submit(location_request);
+        if (mode == 1)
+            delayed = executor->Submit(meta_request);
+        if (mode >= 2) {
+            auto submitted = mode == 2 ? executor->SubmitAsync(location_request) : executor->SubmitAsync(meta_request);
+            ASSERT_TRUE(submitted.accepted);
+            delayed = std::move(submitted.future);
+        }
+        // The sole worker completes admission before this lower-priority barrier.
+        std::promise<void> admitted;
+        ASSERT_TRUE(executor->SubmitTask([&] { admitted.set_value(); }));
+        ASSERT_EQ(std::future_status::ready, admitted.get_future().wait_for(std::chrono::seconds(1)));
+        ASSERT_EQ(CLS_DELETING, Locations(key).at("target")->status());
+
+        const auto delete_count = backend->delete_batches.size();
+        EXPECT_EQ(EC_OK, Run(Request(key, {"target"}, {})).status);
+        EXPECT_EQ(delete_count, backend->delete_batches.size());
+        EXPECT_EQ(std::future_status::timeout, delayed.wait_for(std::chrono::milliseconds(0)));
+
+        executor->Stop();
+        ASSERT_EQ(std::future_status::ready, delayed.wait_for(std::chrono::seconds(1)));
+        EXPECT_EQ(EC_ERROR, delayed.get().status);
+        EXPECT_TRUE(executor->active_location_deletes_.empty());
+        executor = std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_);
+        EXPECT_EQ(EC_OK, Run(Request(key, {"target"}, {})).status);
+        EXPECT_EQ(delete_count + 1, backend->delete_batches.size());
+        EXPECT_TRUE(Locations(key).empty());
+    }
 }
 
 TEST_F(BackendGcDeleteTest, MalformedUriRemainsDiscoverableAndStaleRecoverySnapshotCannotDeleteReplacement) {
@@ -928,6 +969,7 @@ TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteRequiresBackupAdmissionA
     EXPECT_EQ(EC_ERROR, failed.result.status);
     EXPECT_EQ(KeyVector{42}, failed.actual_task.block_keys);
     EXPECT_EQ(1, backup_ptr->sync_calls);
+    EXPECT_TRUE(executor.active_location_deletes_.empty());
     CacheLocationMapVector local;
     ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.GetLocationsFromPrimary(nullptr, {42}, local));
     EXPECT_EQ(CLS_DELETING, local[0].at(ids[0])->status());

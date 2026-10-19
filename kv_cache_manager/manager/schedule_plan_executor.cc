@@ -63,6 +63,32 @@ const char *EventReportCleanupReasonName(EventReportBackend::MaintenanceCleanupR
 }
 } // namespace
 
+struct SchedulePlanExecutor::LocationDeleteLease {
+    explicit LocationDeleteLease(SchedulePlanExecutor &executor) : executor(executor) {}
+    ~LocationDeleteLease() { Release(); }
+
+    // Caller holds queue_mutex_. Own before publishing so allocation failure
+    // cannot leave an entry behind in the shared set.
+    bool ClaimLocked(const LocationDeleteKey &key) {
+        const auto [it, inserted] = owned.insert(key);
+        if (!inserted)
+            return true;
+        if (executor.active_location_deletes_.insert(key).second)
+            return true;
+        owned.erase(it);
+        return false;
+    }
+    void Release() {
+        std::lock_guard<std::mutex> lock(executor.queue_mutex_);
+        for (const auto &key : owned)
+            executor.active_location_deletes_.erase(key);
+        owned.clear();
+    }
+
+    SchedulePlanExecutor &executor;
+    std::set<LocationDeleteKey> owned;
+};
+
 struct SchedulePlanExecutor::PromiseCompletion {
     explicit PromiseCompletion(std::shared_ptr<std::promise<PlanExecuteResult>> promise)
         : promise_(std::move(promise)) {}
@@ -268,7 +294,8 @@ void SchedulePlanExecutor::WorkerRoutine() {
     }
 }
 
-PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDelRequest &task) {
+PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDelRequest &task,
+                                                          std::shared_ptr<LocationDeleteLease> lease) {
     PlanExecuteResult result;
     result.status = ErrorCode::EC_OK;
 
@@ -289,29 +316,20 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
         }
     }
 
-    // DELETING is a durable retry marker, not an exclusive execution lease.
-    // A GC scan can observe it while an ordinary delete is still running.
-    struct DeleteLease {
-        std::mutex &mutex;
-        std::set<LocationDeleteKey> &active;
-        std::set<LocationDeleteKey> owned;
-        ~DeleteLease() {
-            std::lock_guard<std::mutex> lock(mutex);
-            for (const auto &key : owned)
-                active.erase(key);
-        }
-    } lease{queue_mutex_, active_location_deletes_, {}};
-    {
+    if (!lease) {
+        lease = std::make_shared<LocationDeleteLease>(*this);
         std::lock_guard<std::mutex> lock(queue_mutex_);
         for (size_t i = 0; i < task.block_keys.size(); ++i) {
             for (const auto &id : task.location_ids[i]) {
-                const LocationDeleteKey key{task.instance_id, task.block_keys[i], id};
-                if (active_location_deletes_.insert(key).second)
-                    lease.owned.insert(key);
+                lease->ClaimLocked({task.instance_id, task.block_keys[i], id});
             }
         }
     }
-    if (lease.owned.empty())
+    struct ReleaseLease {
+        LocationDeleteLease &lease;
+        ~ReleaseLease() { lease.Release(); }
+    } release{*lease};
+    if (lease->owned.empty())
         return result;
 
     std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(task.instance_id);
@@ -354,7 +372,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
         for (size_t j = 0; j < need_delete_location_ids.size(); ++j) {
             const auto &location_id = need_delete_location_ids[j];
             const LocationDeleteKey delete_key{task.instance_id, block_key, location_id};
-            if (lease.owned.count(delete_key) == 0 || required_uris.count(delete_key) != 0)
+            if (lease->owned.count(delete_key) == 0 || required_uris.count(delete_key) != 0)
                 continue;
             auto iter = location_map.find(location_id);
             if (iter == location_map.end() || !iter->second) {
@@ -595,113 +613,11 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
 
 std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const CacheMetaDelRequest &task,
                                                                       ScheduleTaskClass task_class) {
-    KVCM_LOG_DEBUG("Submitting meta delete task for instance_id: %s, block_keys count: %zu",
-                   task.instance_id.c_str(),
-                   task.block_keys.size());
-
     auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
-    std::future<PlanExecuteResult> future = promise->get_future();
-
-    if (stop_) {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped.");
-        return future;
-    }
-
-    // 1. sync set block status to deleting
-    const std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(task.instance_id);
-    if (indexer == nullptr) {
-        HandleErrorPromise(promise, ErrorCode::EC_NOENT, "MetaIndexer %s not found", task.instance_id.c_str());
-        return future;
-    }
-
-    MetaSearcher meta_searcher(indexer);
-
-    std::vector<CacheLocationMap> location_maps;
-    BlockMask empty_mask;
-    auto request_context = std::make_shared<RequestContext>("schedule_plan_executor_call");
-    ErrorCode get_locations_ec =
-        meta_searcher.BatchGetLocation(request_context.get(), task.block_keys, empty_mask, location_maps);
-    if (get_locations_ec != ErrorCode::EC_OK) {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "Failed to get block locations");
-        return future;
-    }
-
-    std::vector<int64_t> batch_cas_block_keys;
-    std::vector<std::vector<MetaSearcher::LocationCASTask>> batch_cas_tasks;
-    for (size_t block_key_idx = 0; block_key_idx < task.block_keys.size(); ++block_key_idx) {
-        std::vector<MetaSearcher::LocationCASTask> cas_tasks;
-        for (const auto &loc_kv : location_maps[block_key_idx]) {
-            if (!loc_kv.second) {
-                continue;
-            }
-            cas_tasks.push_back({loc_kv.first, loc_kv.second->status(), CLS_DELETING, loc_kv.second->ToJsonString()});
-        }
-        if (cas_tasks.empty()) {
-            continue;
-        }
-        batch_cas_block_keys.emplace_back(task.block_keys[block_key_idx]);
-        batch_cas_tasks.emplace_back(std::move(cas_tasks));
-    }
-
-    if (batch_cas_block_keys.empty()) {
-        promise->set_value({ErrorCode::EC_OK, ""});
-        return future;
-    }
-
-    std::vector<std::vector<ErrorCode>> cas_results;
-    ErrorCode update_ec =
-        meta_searcher.BatchCASLocationStatus(request_context.get(), batch_cas_block_keys, batch_cas_tasks, cas_results);
-    if (update_ec != ErrorCode::EC_OK) {
-        KVCM_LOG_DEBUG("Location status BatchCASLocationStatus not ok, ec: %d", update_ec);
-    }
-
-    std::string error_message;
-    CacheLocationDelRequest actual_task{task.instance_id, {}, {}, task.delay};
-    if (!FillActualTask(batch_cas_block_keys, batch_cas_tasks, cas_results, actual_task, error_message)) {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "FillActualTask error: %s", error_message.c_str());
-        return future;
-    }
-    if (actual_task.block_keys.empty()) {
-        if (update_ec == ErrorCode::EC_OK) {
-            promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
-        } else {
-            HandleErrorPromise(promise,
-                               update_ec,
-                               "Failed to admit location delete metadata update, instance[%s]",
-                               task.instance_id.c_str());
-        }
-        return future;
-    }
-
-    // Sync: ensure CAS(→DELETING) is persisted before scheduling Phase 2.
-    if (!indexer->Sync(actual_task.block_keys)) {
-        HandleErrorPromise(promise,
-                           ErrorCode::EC_ERROR,
-                           "Sync failed or timed out for location delete, instance[%s]",
-                           task.instance_id.c_str());
-        return future;
-    }
-
-    KVCM_LOG_DEBUG("Location statuses updated, submitting task to worker pool with delay: %lld microseconds",
-                   static_cast<long long>(task.delay.count()));
-
-    auto execute_task = [this, promise, actual_task]() {
-        try {
-            promise->set_value(DoLocationDelTask(actual_task));
-        } catch (const std::exception &e) {
-            HandleErrorPromise(promise, ErrorCode::EC_ERROR, "location delete task threw exception: %s", e.what());
-        } catch (...) {
-            HandleErrorPromise(promise, ErrorCode::EC_ERROR, "location delete task threw unknown exception");
-        }
-    };
-    auto cancel_task = [promise]() {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before task execution.");
-    };
-    bool submit_result = this->SubmitRaw(execute_task, task.delay, cancel_task, task_class);
-    if (!submit_result) {
-        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "submit task failed");
-        return future;
-    }
+    auto future = promise->get_future();
+    auto completion = std::make_shared<PromiseCompletion>(promise);
+    RunDeleteAdmission(
+        completion, task.delay, [this, &task]() { return PrepareDeleteTask(task); }, task_class);
     return future;
 }
 
@@ -907,12 +823,35 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
         return admission_result;
     }
 
+    // Claim before publishing DELETING: GC must not bypass the queued delay.
+    auto lease = std::make_shared<LocationDeleteLease>(*this);
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        for (size_t i = batch_cas_tasks.size(); i-- > 0;) {
+            auto &tasks = batch_cas_tasks[i];
+            tasks.erase(
+                std::remove_if(tasks.begin(),
+                               tasks.end(),
+                               [&](const auto &cas) {
+                                   return !lease->ClaimLocked({instance_id, batch_cas_block_keys[i], cas.location_id});
+                               }),
+                tasks.end());
+            if (tasks.empty()) {
+                batch_cas_tasks.erase(batch_cas_tasks.begin() + i);
+                batch_cas_block_keys.erase(batch_cas_block_keys.begin() + i);
+            }
+        }
+    }
+    if (batch_cas_block_keys.empty())
+        return admission_result;
+
     std::vector<std::vector<ErrorCode>> batch_results;
-    ErrorCode update_ec = min_retained_replicas > 0
-        ? meta_searcher.BatchMarkDeletingWithRetention(request_context.get(), batch_cas_block_keys,
-                                                       batch_cas_tasks, min_retained_replicas, batch_results)
-        : meta_searcher.BatchCASLocationStatus(request_context.get(), batch_cas_block_keys,
-                                               batch_cas_tasks, batch_results, authoritative_read);
+    ErrorCode update_ec =
+        min_retained_replicas > 0
+            ? meta_searcher.BatchMarkDeletingWithRetention(
+                  request_context.get(), batch_cas_block_keys, batch_cas_tasks, min_retained_replicas, batch_results)
+            : meta_searcher.BatchCASLocationStatus(
+                  request_context.get(), batch_cas_block_keys, batch_cas_tasks, batch_results, authoritative_read);
     if (update_ec != ErrorCode::EC_OK) {
         KVCM_LOG_DEBUG("Location status BatchCASLocationStatus not ok, ec: %d", update_ec);
     }
@@ -943,6 +882,7 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
     }
 
     admission_result.needs_physical_delete = true;
+    admission_result.delete_lease = std::move(lease);
     return admission_result;
 }
 
@@ -960,15 +900,21 @@ void SchedulePlanExecutor::RunDeleteAdmission(const std::shared_ptr<PromiseCompl
         KVCM_LOG_DEBUG("Location statuses updated, submitting task to worker pool with delay: %lld microseconds",
                        static_cast<long long>(delay.count()));
         auto actual_task = std::move(admission_result.actual_task);
-        auto execute_task = [this, completion, actual_task]() {
+        auto lease = std::move(admission_result.delete_lease);
+        auto execute_task = [this, completion, actual_task, lease]() {
             try {
-                completion->Complete(DoLocationDelTask(actual_task));
+                completion->Complete(DoLocationDelTask(actual_task, lease));
             } catch (const std::exception &e) {
                 completion->Complete(ErrorCode::EC_ERROR,
                                      StringUtil::FormatString("location delete task threw exception: %s", e.what()));
-            } catch (...) { completion->Complete(ErrorCode::EC_ERROR, "location delete task threw unknown exception"); }
+            } catch (...) {
+                completion->Complete(ErrorCode::EC_ERROR, "location delete task threw unknown exception");
+            }
         };
-        auto cancel_task = [completion]() {
+        // Stop destroys queued execute closures under queue_mutex_. Keep the
+        // lease in the cancel closure until cancellation runs outside the lock.
+        auto cancel_task = [completion, lease]() {
+            lease->Release();
             completion->Complete(ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped before physical delete.");
         };
         if (!SubmitRaw(execute_task, delay, cancel_task, task_class)) {
