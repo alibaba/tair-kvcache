@@ -17,16 +17,6 @@ uint32_t FrequencySketch::DecayedCount(const Entry &entry, int64_t now, uint32_t
     return periods >= 32 ? 0 : entry.count >> periods;
 }
 
-void FrequencySketch::TouchLocked(const Key &k) {
-    auto it = table_.find(k);
-    if (it == table_.end()) {
-        return;
-    }
-    lru_.erase(it->second.lru_it);
-    lru_.push_front(k);
-    it->second.lru_it = lru_.begin();
-}
-
 void FrequencySketch::EvictIfFullLocked() {
     while (table_.size() > capacity_) {
         const Key &victim = lru_.back();

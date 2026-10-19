@@ -64,7 +64,6 @@ private:
         typename std::list<Key>::iterator lru_it;
     };
 
-    void TouchLocked(const Key &k);
     void EvictIfFullLocked();
 
     mutable std::mutex mu_;

@@ -217,12 +217,10 @@ void ApplySort(const std::vector<SortTerm> &terms,
     struct Scored {
         std::string id;
         double score;
-        std::size_t orig_index;
     };
     std::vector<Scored> scored;
     scored.reserve(input.size());
-    for (std::size_t i = 0; i < input.size(); ++i) {
-        const auto &id = input[i];
+    for (const auto &id : input) {
         const NodeMetrics *m = find_metrics ? find_metrics(id) : nullptr;
         double score = 0.0;
         if (m != nullptr) {
@@ -233,7 +231,7 @@ void ApplySort(const std::vector<SortTerm> &terms,
                 }
             }
         }
-        scored.push_back(Scored{id, score, i});
+        scored.push_back(Scored{id, score});
     }
     std::stable_sort(scored.begin(), scored.end(), [](const Scored &a, const Scored &b) {
         return a.score > b.score; // descending
