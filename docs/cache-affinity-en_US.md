@@ -60,14 +60,18 @@ Key semantics:
 - Reads first select existing components within the selected storage. The example emits replication hints only after heat, size, benefit, capacity and suppression checks. Unknown node capacity is permissive.
 - The example's capacity cutoff is `0.90 - 0.05 = 0.85`. A bare `{"type":"local_replica"}` uses class defaults of `0.85 - 0.05 = 0.80` and has no write pipeline.
 - `max_replicas_per_key` counts Location entries. `max_instance_bytes` includes original replicas, all specs and WRITING reservations. Both limits apply to ordinary and replication StartWrite calls.
-- **The retention helper exists, but ReclaimByNode currently does not pass `min_retained_replicas`; node-pressure eviction does not guarantee retaining one replica.** The parsed `critical` threshold also has no separate execution branch.
-- Under Noop or the disabled global switch, `GetReplicaLimits` still defaults to one retained replica, which ReclaimByLRU can apply. Disabling affinity does not restore every previous reclamation behavior.
+- `min_retained_replicas` protects node-pressure eviction by checking the remaining SERVING Location count for each spec. It defaults to 1; use 0 to disable protection. The legacy `critical` field is deprecated: it is accepted for compatibility, warned about during parsing and ignored. Node eviction uses only `threshold` and `low`.
+- This protection does not apply to ordinary quota reclamation, explicit deletion or GC, which may remove the last replica. Noop, a disabled global switch or disabled eviction prevents policy-driven node-pressure reclamation.
 
-Strategies are selected as whole objects in instance, instance_group, process order, without field merging. Instance and group settings use `affinity_strategy_json`. A partial but accepted override replaces the lower-level strategy. Some malformed fields fall back to defaults, so successful loading does not prove every field was applied.
+Strategies are selected as whole objects in instance, instance_group, process order, without field merging. Instance and group settings use `affinity_strategy_json`. A partial but accepted override replaces the lower-level strategy. Omitted fields use the selected strategy's defaults; known-field validation is described below.
 
-**Registering an existing instance again does not update its affinity strategy.** That branch neither compares nor overwrites `affinity_strategy_json`; it can return OK while retaining the old value. Update a group's complete configuration with `UpdateInstanceGroup`, matching `current_version` and increasing the new `version`. An accepted instance override still takes precedence. A successful configuration write also does not mean every strategy field passed strict validation.
+**RegisterInstance is idempotent for an existing instance and does not update its affinity strategy.** An omitted `affinity_strategy_json` (empty string) preserves the stored policy. An explicitly different policy returns `EC_DUPLICATE_ENTITY`, identifying `affinity_strategy_json` as a mismatched field. Equivalent JSON with only whitespace or object-key order changes is accepted without rewriting the stored value. An empty string cannot clear an override, and repeat registration cannot add an override to an existing instance that has none. Update a group's complete configuration with `UpdateInstanceGroup`, matching `current_version` and increasing the new `version`. An accepted instance override still takes precedence. A successful configuration write also does not mean every strategy field passed strict validation.
+
+When selecting `local_replica`, the parser validates known boolean switches, numeric ranges and watermark relationships. Invalid write pipelines also invalidate the entire strategy. Invalid instance/group overrides fall through to the next layer; a failed process-policy load preserves the previous policy. Unknown fields remain ignored for compatibility. See [defaults and validation rules](cache-affinity-implementation.md#configuration).
 
 Node-pressure eviction also requires `reclaim_indexer_type=node_lru` in the metadata backend URI. Enabling affinity does not create this index automatically; without it, node sampling returns `EC_NOENT` and no node-pressure deletion is submitted.
+
+A single persistent, non-local metadata backend with `node_lru` performs an O(N) startup scan to rebuild node membership and reconcile usage. Recovery failure prevents startup; the exact previous LRU order is not preserved. Other backend combinations still recover usage from periodic snapshots. See [recovery boundaries](cache-affinity-implementation.md#eviction).
 
 ## 2. Enable client replication execution
 
@@ -87,7 +91,7 @@ Add these fields to an otherwise complete ManagerClient configuration; this frag
 
 Automatic execution requires a HYBRID ManagerClient with both MetaClient and TransferClient, using the MatchLocation path that returns hints. `auto_replicate` defaults to false; enabling the server alone does not move data.
 
-The SDK queries the current PACE local identity on every request by default. A positive refresh interval permits cached identities. The provider factory currently handles the mempool memory type and NFS, but not automatic selection for SSD-only configurations.
+The SDK queries the current PACE local identity on every request by default. A positive refresh interval permits cached identities. With mempool build support enabled, both DRAM and SSD-only configurations select the PACE provider, which still requires exactly one local provider with a nonzero node ID. NFS uses its own provider.
 
 Tasks without reusable buffers first call server ReplicateCache and fall back to client Load/Save only for an unsupported operation. Explicit buffer reuse accepts named specs with shared owners. An asynchronous boolean return indicates queue admission; the result callback reports the replication outcome. A release callback does not indicate success.
 
@@ -114,8 +118,10 @@ The server's file mapping takes precedence over the caller's reported supernode.
 1. Complete an ordinary StartWrite/Finish flow and inspect actual spec node IDs and SERVING states with GetCacheMeta. Preferred-node input alone does not prove placement.
 2. Query from a remote caller and check spec names, hint target and capabilities. Heat counts remote metadata matches without waiting for a successful Load; polling also increments it. The default threshold is three, subject to decay, suppression, capacity and cost gates. Only PrefixMatch supplies an actual position for prefix weighting.
 3. Check SDK result callbacks/statistics, then inspect GetCacheMeta's `replica_locations` for complete SERVING components on the target. The compatibility `locations` field contains only the first Location per key. Neither batch-level OK nor `server_copy_succeeded` (which includes already-exists) measures newly created replicas.
-4. Check physical space, per-item deletion results and metadata when validating eviction. Metadata may still be removed after partial backend deletion failure, so a missing Location does not prove that space was released. NFS reports synthetic capacity and has a placeholder Delete implementation, so NFS integration tests do not establish real PACE space reclamation.
+4. Check physical space, per-item deletion results and metadata when validating eviction. Partial deletion failures retain the complete DELETING Location until every URI is confirmed deleted or absent. Server `kvcm.cache_gc.enabled` defaults to true; disabling it stops automatic scan-based retries. NFS reports synthetic capacity and has a placeholder Delete implementation, so NFS integration tests do not establish real PACE space reclamation.
 
 If a hint does not lead to a local replica, follow [replication results and failure handling](cache-affinity-implementation.md#replication-results) to check task admission, execution and publication in order. A failed publication acknowledgement alone does not prove that the target is absent.
 
 Test entry points: [real Manager integration](../integration_test/affinity/affinity_replication_test.py), [SDK replication tests](../kv_cache_manager/client/test/replication_executor_test.cc), [strategy tests](../kv_cache_manager/affinity/test/). See [backend support and remaining work](cache-affinity-implementation.md#status) for limitations and development priorities.
+
+Current production candidates are limited to DRAM with transparent SSD tiering disabled, or explicit SSD storage. Transparent tiered deletion remains blocked separately; real PACE replication, pressure reclamation and restart behavior still need hardware acceptance tests.

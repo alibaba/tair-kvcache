@@ -15,7 +15,7 @@
 
 <a id="baseline"></a>
 
-本文描述 `kvcm_affinity_merge` 分支的实际行为，不把设计目标视为已完成能力。源码核对基线为 **2026-10-08，KVCM `f0b9254d917bba8c23df8c91b56e49e321718664`**；下文链接随分支移动，核对历史行为时使用此提交。配置示例见[中文指南](cache-affinity-zh_CN.md) / [English guide](cache-affinity-en_US.md)。
+本文描述 `kvcm_affinity_merge` 分支的实际行为，不把设计目标视为已完成能力。本次源码核对日期为 **2026-10-19**，包括节点回收、启动恢复、删除重试和注册策略校验修复；下文链接随分支移动，历史行为应结合对应提交核对。配置示例见[中文指南](cache-affinity-zh_CN.md) / [English guide](cache-affinity-en_US.md)。
 
 <a id="components"></a>
 
@@ -63,7 +63,7 @@ flowchart LR
 
 [CallerNodeProviderFactory](../kv_cache_manager/client/src/internal/sdk/caller_node_provider_factory.cc) 按 storage 配置顺序选择第一个可初始化的 provider。内源 mempool 通过 `pace_local_providers` 查询：仅在恰好一个 provider 且数字 ID 非零时返回身份，否则返回空。默认每次查询；只有显式配置正的 `caller_node_refresh_seconds` 才缓存。该查询不等价于 provider 健康探测。
 
-当前工厂处理 `TAIR_MEMPOOL` 和 NFS，**没有 `TAIR_MEMPOOL_SSD` 分支**；仅配置 SSD 类型时不能据此声称 SDK 已自动取得 PACE 身份。多 storage、多 PACE 集群的身份选择也没有按请求重新绑定。
+启用 mempool 编译支持时，工厂将 `TAIR_MEMPOOL` 和 `TAIR_MEMPOOL_SSD` 都交给 PACE provider，因此 SSD-only 配置也可自动取得身份；NFS 使用独立 provider。身份仍取决于本机恰好存在一个有效 PACE provider，多 storage、多 PACE 集群的选择没有按请求重新绑定。SSD 身份支持不代表透明 SSD 分层删除或独立 SSD 容量控制已完成。
 
 [NodeTopology](../kv_cache_manager/common/node_topology.h) 读取环境变量 `KVCM_NODE_TOPOLOGY_FILE` 指定的 JSON：`nodes` 将上述实际 node id 映射到 supernode。按需最多每 5 秒刷新，连续读取失败后旧映射最多保留 30 秒。它与策略文件不同，支持周期重读；不自动发现集群拓扑。
 
@@ -113,7 +113,7 @@ instance_id → block_key → 多个 CacheLocation（各自有 id / status / cre
 
 | 层级 | 当前可用入口 | 更新边界 |
 |---|---|---|
-| instance | 首次 `RegisterInstance.affinity_strategy_json` | 已存在实例的注册分支不比较、不更新该字段；仅更改此字段再次注册可能返回 OK，但策略保持原值 |
+| instance | 首次 `RegisterInstance.affinity_strategy_json` | 已有实例不支持通过注册更新策略；空串表示省略、保留旧值；非空且不同的策略返回 `EC_DUPLICATE_ENTITY`，空白/对象键顺序变化视为同一 JSON。检查同时覆盖 CacheManager 早返回和 RegistryManager 路径 |
 | instance_group | 创建组或 `UpdateInstanceGroup` | 更新需携带完整组配置，`current_version` 等于旧版本且新 `version` 更大；后续决策读取新组对象，已有有效 instance 覆盖仍优先 |
 | process | 启动配置中的 `strategy_file` | 文件不监视；改动后需重新加载进程配置 |
 
@@ -121,7 +121,7 @@ instance_id → block_key → 多个 CacheLocation（各自有 id / status / cre
 
 `kvcm.affinity.enabled` 默认 `false`，关闭时所有层级返回 Noop。开启且未指定策略文件时安装服务端内置 LocalReplica 策略；指定文件但读取/解析失败时仅记录警告，不另装内置策略，仍可使用实例/实例组策略。
 
-全局开关控制策略决策；**它不禁止显式 `ReplicateCache` RPC，也不会撤销 SDK 已提交的复制任务**。另外，Noop 下 `GetReplicaLimits` 返回的结构仍默认保留数为 1，对 `ReclaimByLRU` 的影响见第 7.3 节，不能把总开关描述成完全恢复旧回收行为。SDK 的 `auto_replicate` 则只控制读结果自动入队，不禁止显式复制 API。
+全局开关控制策略决策；**它不禁止显式 `ReplicateCache` RPC，也不会撤销 SDK 已提交的复制任务**。最低副本保护仅接入节点压力回收，普通配额回收不因 Noop 的默认保留数而留下最后一份副本，见第 7.3 节。SDK 的 `auto_replicate` 则只控制读结果自动入队，不禁止显式复制 API。
 
 ### 3.2 默认值必须区分两种来源
 
@@ -136,15 +136,15 @@ instance_id → block_key → 多个 CacheLocation（各自有 id / status / cre
 | `caller_capacity_threshold` / `caller_capacity_buffer` | 0.85 / 0.05 | **0.90 / 0.05** |
 | `heat_half_life_ms` / `suppression_window_ms` | 60000 / 60000 | 同左 |
 | `max_replication_bytes` / `min_benefit_ratio` / `prefix_bonus` | 0 / 0 / 0 | 同左 |
-| `node_water_level.threshold` / `low` / `critical` | 0.85 / 0.70 / 0.95 | 同左 |
+| `node_water_level.threshold` / `low` | 0.85 / 0.70 | 同左 |
 | `max_replicas_per_key` / `max_instance_bytes` | 0 / 0，均不设上限 | 同左 |
 | `min_retained_replicas` | 1；实际接入范围见第 7 节 | 同左 |
 
-复制容量门槛是 `threshold - buffer`，因此已知指标下两种配置分别允许到 **0.80** 和 **0.85**，相等仍可通过。`critical` 已解析存储，但目前没有对应的独立决策分支。
+复制容量门槛是 `threshold - buffer`，因此已知指标下两种配置分别允许到 **0.80** 和 **0.85**，相等仍可通过。旧配置中的 `critical` 已弃用：为兼容仍接受此字段，解析时记录一次警告并忽略，不影响节点回收。
 
 [StrategyFactory](../kv_cache_manager/affinity/strategy_factory.cc) 接受裸策略或 `{"strategy":{...}}` 包装，要求 `type` 为 `noop` 或 `local_replica`。写流水线必须放在 **`write.ops` 对象**中。旧版把 `filter/sort/limit` 直接放在 strategy 下的示例不适用。
 
-解析器不是完整的严格 schema 校验器：部分字段类型错误会保留默认值，写流水线解析失败也可能仅使 `write_pipeline` 为空，而整个 LocalReplica 策略仍被接受。不能把“加载成功”视为所有配置字段均生效。
+`local_replica` 的已知配置块必须是对象，开关必须是 JSON 布尔值，次数、时间窗及字节限制必须是对应位宽内的非负整数；收益参数必须是有限非负数。容量参数要求 `0 <= buffer <= threshold <= 1`，回收水位要求 `0 <= low <= threshold <= 1`；副本上限非零时，保留数不能超过上限。错误的 `write.ops` 也会使整个策略解析失败。失败的 instance/group 策略会向下一层回退，失败的进程策略加载保留原策略；未声明的字段仍保留兼容忽略行为，并非完整的 JSON schema 校验。
 
 <a id="write"></a>
 
@@ -308,7 +308,7 @@ sequenceDiagram
 
 <a id="eviction"></a>
 
-## 7. 节点指标、压力回收与当前接线缺口
+## 7. 节点指标、压力回收与恢复
 
 ### 7.1 指标新鲜度
 
@@ -322,39 +322,37 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 
 该分支还要求元数据 backend URI 带 `reclaim_indexer_type=node_lru`。[MetaStorageBackendManager](../kv_cache_manager/meta/meta_storage_backend_manager.cc) 不会仅因 affinity 开启就自动创建节点索引；缺少索引时采样返回 `EC_NOENT`，本轮不提交节点回收。索引维护行为见 [meta_indexer_node_lru_test.cc](../kv_cache_manager/meta/test/meta_indexer_node_lru_test.cc)。
 
-[NodeLruReclaimIndexer](../kv_cache_manager/meta/reclaim_indexer/node_lru_reclaim_indexer.cc) 按 node 维护 key 的顺序；一次 key 的 Touch 会更新它在索引中关联的所有节点，并非只更新本次读取选中的副本。索引还会登记带 node id 的 WRITING 等条目，能否删除由后续状态、活动会话和迁移检查决定。因此这里的 LRU 不等于各存储节点真实数据读取次数。
+[NodeLruReclaimIndexer](../kv_cache_manager/meta/reclaim_indexer/node_lru_reclaim_indexer.cc) 按 node 维护 key 的顺序；一次 key 的 Touch 会更新它在索引中关联的所有节点，并非只更新本次读取选中的副本。索引还会登记带 node id 的 WRITING 等条目，能否删除由后续状态、活动会话和迁移检查决定。更新同一 Location 时会替换它原有的节点映射，其他 Location 的映射保留，未受影响节点的 LRU 顺序不变。因此这里的 LRU 不等于各存储节点真实数据读取次数。
 
-超过 `threshold` 开始选择节点；有删除释放量后，按估算水位继续选择，直到达到 `low`。释放量只在后端返回删除成功后记录，并与删除开始时间和指标采样时间校验；新样本只清除该节点的估算。**成功提交异步删除不等于物理空间已经释放。** `critical` 目前不改变此流程。
+超过 `threshold` 开始选择节点；有删除释放量后，按估算水位继续选择，直到达到 `low`。释放量只在后端返回删除成功后记录，并与删除开始时间和指标采样时间校验；新样本只清除该节点的估算。**成功提交异步删除不等于物理空间已经释放。**
 
 删除候选虽由 `LocationSpec.node_id` 匹配，提交与删除粒度仍是 **整个 CacheLocation**：只要其中一个 spec 位于压力节点，就可能连同其他节点上的组件一起删除，尚未实现按 spec 拆分删除。
 
-物理删除与元数据删除也不是事务。[SchedulePlanExecutor::DoLocationDelTask](../kv_cache_manager/manager/schedule_plan_executor.cc) 对后端返回的逐 URI 错误记录部分失败后，仍执行 `BatchCADLocationStatus` 清理相应元数据；因此元数据删除成功时，后端可能还有物理残留。后端直接抛异常则会提前返回，不能将这两类失败视为同一种恢复行为。`deleted_bytes_by_node` 只计入明确返回 `EC_OK` 的 URI，`EC_NOENT` 作为已不存在处理但不增加释放量。
+物理删除与元数据删除不是事务，但删除失败会留下可恢复的记录。[SchedulePlanExecutor](../kv_cache_manager/manager/schedule_plan_executor.cc) 先将 Location 标为 DELETING 并 `Sync`，再删除物理 URI。普通物理删除路径只有在该 Location 的全部 URI 确认删除成功或已不存在时，才按完整 Location 值条件删除元数据；失败、异常、结果缺项或非法 URI 都保留整个 DELETING Location 及其预算。独立 Location 可继续完成。`deleted_bytes_by_node` 只统计明确 `EC_OK` 的 URI，已不存在的 URI 不再次增加释放量。
 
-现有 [schedule_plan_executor_test.cc](../kv_cache_manager/manager/test/schedule_plan_executor_test.cc) 的 `TestPhysicalDeleteHandlesMissingUrisIdempotentlyAndLogsRealFailures` 已断言“部分物理失败、元数据仍删除”的行为。它证明错误上报和成功释放量的计数口径，不证明失败 URI 已被重试清理；这条路径没有在删元数据前持久化失败 URI 的补偿任务，残留追踪仍需补齐。
+[CacheGarbageCollector](../kv_cache_manager/manager/cache_garbage_collector.cc) 扫描持久化的 DELETING Location 并重新提交删除；进程内正在删除的同一 instance/key/location 会去重，旧任务的完整值校验用于避免清理被替换的元数据。服务进程的 `kvcm.cache_gc.enabled` **默认 true**；显式关闭后不会自动扫描重试。组件独立构造的 `Config.enabled` 默认 false，不能据此推断服务默认值。重试依赖后端删除幂等性和后续 GC 扫描，不保证清理时限，也不修复后端自身的删除语义错误。
 
-### 7.3 最少保留副本并未在节点路径完整生效
+### 7.3 最少保留副本的作用范围
 
-保护函数与调用者的参数传递关系如下：
+`ReclaimByNode` 读取有效 instance/group/process 策略的 `min_retained_replicas` 并传给删除执行器；正值调用 `MetaSearcher::BatchMarkDeletingWithRetention`，在同一 MetaIndexer 的 RMW 中按 spec 名称检查剩余 SERVING Location 数，拒绝会低于保留数的项。这样可以防止重叠的节点回收请求各自删掉最后一份可读组件。该数量是按 spec 统计的可读 Location 数，不是完整物理节点副本数。
 
-- `MetaSearcher::BatchMarkDeletingWithRetention` 已实现 RMW：按 spec 名称统计 SERVING Location 数，若删除会低于 minimum 则拒绝该项。
-- `SchedulePlanExecutor::PrepareDeleteTaskImpl` 在收到正的 `min_retained_replicas` 时调用上述保护，否则走普通 CAS。
-- **`ReclaimByNode` 构造请求时没有设置该字段，沿用请求默认 0。** 当前不能保证节点压力回收保留配置的最低副本数。
-- 当前显式设置该字段的调用点在 `ReclaimByLRU`；其他回收、显式删除、TTL/GC 不应据此推定有同等保护。
-- `GetReplicaLimits` 在 Noop/全局关闭时返回 `ReplicaLimits{}`，其中默认保留数仍为 1。因此只要传入 affinity manager，`ReclaimByLRU` 也可能在全局关闭时继续保留最低数量。这是与“仅保护节点压力回收”的参数注释不一致的另一面，不能以注释替代调用链结论。
-
-节点压力回收要获得最低副本保护，还需要补齐调用者传参，并验证保护的作用范围；仅有参数解析和元数据函数单测不足以证明这条链路有效。
+保护只用于节点压力回收。普通 `ReclaimByLRU` 配额回收不传保留数，仍可删除冷 key 的最后一份副本；显式删除、TTL/GC 也没有这项保护。Noop、全局 affinity 关闭或关闭 eviction 时不会由策略触发节点压力回收。`min_retained_replicas=0` 可关闭保留检查；保留要求无法满足时允许节点继续处于高水位，不强行突破保护。
 
 ### 7.4 重启恢复的范围
 
 | 状态 | 当前恢复行为 |
 |---|---|
 | 实例/组策略与 Location 元数据 | 依赖所选 registry/meta 后端的持久化和恢复；内存后端不能提供进程重启持久性 |
-| 实例用量计数 | [MetaIndexer](../kv_cache_manager/meta/meta_indexer.cc) 的 `PersistMetaData` 周期保存计数，`RecoverMetaData` 读取快照，不扫描全部 Location 重算；异常退出可能留下滞后的预算基数，不能等同于崩溃后一致的硬配额 |
-| 写会话 | [WriteLocationManager](../kv_cache_manager/manager/write_location_manager.cc) 的 session 表在进程内；遗留 WRITING 不是可读副本，也不是可自动继续执行的复制任务，需后续回收/GC 处理 |
-| 节点 LRU | 进程内派生索引；写入通知和双后端恢复的 `BackfillKeysToCache → NotifyIndexersAdd` 可填充。单后端 Open 分支没有等价的全量重建动作，不能把元数据恢复成功直接等同于节点索引恢复完整 |
-| 热度、抑制、删除释放量、SDK 队列 | 均在各自进程内，不持久化；各自进程重启后重新采样或触发，不恢复已丢失的复制任务 |
+| 单个持久化 meta 后端且配置 `node_lru` | 非 local 后端在 Open 内同步扫描全部 key，重建节点成员关系、key 数及各 storage 用量，再开始服务；失败则 Open 失败，不发布部分索引/计数 |
+| 其他组合的用量计数 | 继续使用 `PersistMetaData` 周期快照；双后端和未配置 `node_lru` 的单后端不因此获得启动全量对账保证 |
+| 节点 LRU | 单后端扫描与双后端 `BackfillKeysToCache → NotifyIndexersAdd` 可恢复成员关系；精确的重启前 LRU 顺序不持久化 |
+| 写会话 | session 表在进程内；遗留 WRITING 不可读、不能续传，需后续回收/GC；启动对账仍计入其用量 |
+| 未完成删除 | DELETING 及完整 URI 随 meta 持久化；开启 GC 后继续重试，全部组件确认删除后才释放 Location 预算 |
+| 热度、抑制、删除释放量、SDK 队列 | 均在各自进程内；重启后重新采样或触发，不恢复已丢失的复制任务 |
 
-现有 Manager 受控重启测试验证的是元数据及预算恢复，不覆盖任意后端组合的节点索引完整恢复、崩溃瞬间的写会话续传或 provider 物理数据恢复。
+启动扫描是 O(N) 工作量，去重集合和派生索引也占用随 key 数增长的内存，期间该实例不能服务。计费累加所有持久化状态的 spec URI size，含 WRITING/DELETING；历史 URI 缺少 size 时仍按零处理，无法凭空还原未知大小。它修正的是已持久化 Location 与派生计数的偏差，不是跨 Manager 进程的分布式硬配额或连续在线对账。
+
+新增持久化重启测试验证了节点成员、旧计数覆盖、重复扫描去重及恢复失败拒绝启动；仍需按真实后端规模验收启动耗时和故障恢复。受控 Manager 重启不等于 provider 物理数据恢复或复制任务续传。
 
 <a id="status"></a>
 
@@ -366,20 +364,21 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 | 内源 mempool Copy | 已接 PACE 批量同步 Copy；源/目标须符合 URI、大小及介质约束；成功后才发布 |
 | NFS | 支持本机身份及严格本机分配；容量快照是 free=最大值、load=0 的合成值；Copy 未实现，Delete/Exist/Lock/UnLock 仍为占位行为 |
 | 其他后端 | 默认普通写兼容，严格 affinity 分配拒绝；必须分别核对是否覆盖后端虚函数 |
-| 最少保留副本 | 元数据保护已实现；节点压力未传参数，普通 ReclaimByLRU 却可能在 Noop 下继续保留默认数量，需修正作用范围并补端到端回归 |
-| SSD caller 与多集群节点身份 | SSD-only 自动 provider 选择未接；同号 node id 的跨 storage 隔离待完善 |
-| 进程策略更新与配置校验 | 启动加载已有；文件自动热加载、全字段严格校验未实现 |
-| 已有 instance 的策略更新 | 重复 RegisterInstance 不更新 affinity 字段；不能把注册 OK 当成覆盖成功 |
+| 最少保留副本 | 已接节点压力回收并覆盖并发/多 spec；普通配额回收可删除最后一份副本 |
+| SSD caller 与多集群节点身份 | 已接 SSD-only 自动 provider 选择；同号 node id 的跨 storage/集群隔离待完善 |
+| 透明 SSD 分层 | 后端分层删除仍有独立阻断；当前生产候选限关闭透明分层的 DRAM 或显式 SSD，仍须实机验收 |
+| 进程策略更新与配置校验 | 启动加载及已知字段类型/范围校验已有；文件自动热加载未实现，未知字段仍兼容忽略 |
+| 已有 instance 的策略更新 | 显式不同策略返回 `EC_DUPLICATE_ENTITY`，省略则保留；动态更新/清空实例覆盖未实现 |
 | spec group / 多 storage 复制 | 提示源集合、复制目标 spec 全集及 storage 选择未统一约束；缺组件或 storage 不同会失败，需专门的端到端场景 |
-| 重启后的节点索引 | 双后端 backfill 有通知；单后端 Open 没有全量重建动作，恢复边界需独立验收 |
-| 异常退出后的预算 | 计数按周期快照恢复，尚不能宣称与每次 Location 修改同步持久化或重启全量对账 |
-| 回收粒度与 critical 水位 | 当前按 Location 删除；spec 级拆分及 critical 独立策略未实现 |
-| 物理删除失败后的残留 | 逐 URI 错误可能伴随元数据清理，成功释放量仅按 EC_OK 统计；失败 URI 的持久化补偿及残留追踪需补齐 |
+| 重启后的节点索引 | 持久化单后端启用 node_lru 时同步全量重建；双后端继续 backfill，不保存精确 LRU 顺序 |
+| 异常退出后的预算 | 上述单后端扫描按已持久化 Location 对账；其他组合仍依赖周期快照，未知 URI size 无法补算 |
+| 回收粒度 | 当前按 Location 删除；spec 级拆分未实现 |
+| 物理删除失败后的残留 | 保留完整 DELETING Location，开启 GC 后重试；全部 URI 确认删除才清理元数据，依赖后端幂等删除 |
 | 复制完成反馈、重试与恢复 | SDK 有结果回调/统计；服务端抑制反馈、持久化任务、跨进程资源配额未实现 |
 | 源数据存活保障 | 复制会检查传输结果，但不能把元数据 SERVING 或后端 Lock 接口视为所有后端均有真实数据 pin |
 | 实机验收 | 多节点 PACE 数据正确性、真实压力删除、provider 重启和 GPU buffer 传输仍需专门实机用例 |
 
-若继续开发，优先补节点回收的保留数接线及回归，其次验证身份切换/SSD-only 和真实 PACE 复制回收。高级收益模型、全局调度和自动调参不应先于这些生命周期正确性问题。
+下一步优先验收真实 PACE 的复制、压力删除、SSD-only 身份切换和持久化恢复，解决透明 SSD 分层删除阻断，再扩展 spec group / 多 storage 组合。高级收益模型和自动调参应放在这些生命周期正确性之后。
 
 <a id="validation"></a>
 
@@ -390,14 +389,16 @@ CacheManager 初始化预热节点指标，随后默认每 5 秒拉取后端快�
 | 范围 | 源码/测试入口 | 能证明什么 |
 |---|---|---|
 | 策略与指标 | [affinity/test](../kv_cache_manager/affinity/test/) | 优先级、选路、热度/抑制隔离、指标 TTL、容量估算、成本门槛 |
-| 元数据预算与保留 | [meta_searcher_test.cc](../kv_cache_manager/manager/test/meta_searcher_test.cc) | Location 准入与 RMW 保留函数；不代替 ReclaimByNode 接线验证 |
+| 元数据预算与保留 | [meta_searcher_test.cc](../kv_cache_manager/manager/test/meta_searcher_test.cc)、[cache_reclaimer_test.cc](../kv_cache_manager/manager/test/cache_reclaimer_test.cc) | 准入、逐 spec RMW 保留、策略层级、重叠节点回收和普通配额回收作用域 |
+| 持久化启动恢复 | [meta_indexer_node_lru_test.cc](../kv_cache_manager/meta/test/meta_indexer_node_lru_test.cc)、[meta_storage_backend_manager_test.cc](../kv_cache_manager/meta/test/meta_storage_backend_manager_test.cc) | 文件后端重启后的成员/计数恢复、过期快照覆盖、扫描去重/重试和失败拒绝启动；不代替真实 Redis 规模验收 |
+| 重复注册策略 | [instance_info_test.cc](../kv_cache_manager/config/test/instance_info_test.cc)、[registry_manager_local_backend_test.cc](../kv_cache_manager/config/test/registry_manager_local_backend_test.cc)、[cache_manager_test.cc](../kv_cache_manager/manager/test/cache_manager_test.cc) | 省略/等价策略幂等、显式不同策略拒绝、持久化后仍拒绝及组更新保留 |
 | 复制服务编排 | [cache_manager_test.cc](../kv_cache_manager/manager/test/cache_manager_test.cc) | 严格目标、完整 spec、Copy 结果与发布/清理 |
 | SDK 复制 | [replication_executor_test.cc](../kv_cache_manager/client/test/replication_executor_test.cc) | mock 传输的多 spec、buffer 所有权、异常清理、资源预算、限速及结果统计 |
-| 物理删除与元数据清理 | [schedule_plan_executor_test.cc](../kv_cache_manager/manager/test/schedule_plan_executor_test.cc) | mock 后端的成功/缺失/失败 URI、释放量计数和元数据清理；不证明物理残留已补偿回收 |
+| 物理删除与元数据清理 | [schedule_plan_executor_test.cc](../kv_cache_manager/manager/test/schedule_plan_executor_test.cc)、[cache_garbage_collector_test.cc](../kv_cache_manager/manager/test/cache_garbage_collector_test.cc) | mock 后端部分失败/异常/结果缺项保留 tombstone、幂等重试、替换值保护及并发去重；不证明真实 PACE 分层删除正确 |
 | 真实 Manager 集成 | [affinity_replication_test.py](../integration_test/affinity/affinity_replication_test.py) | 25 个测试：读写/发布/失败重试、实例隔离、协议升级、并发预算、批量结果、完整元数据、受控 Manager 重启 |
 
 真实 Manager 集成使用 NFS 和构造的调用方身份，验证控制与元数据链路；其中 Copy 不支持的分支也会被断言。它不是两台 PACE 节点的实际数据复制测试，Manager 重启测试也不是存储 provider 实机重启测试。内源后端及 PACE 适配的源码/依赖基线见父仓库 `docs/cache-affinity-internal.md`（该文件不属于开源 checkout）。
 
-已存在实例的策略更新、部分 spec group / 多 storage 自动复制、单后端节点索引重建、崩溃后用量对账仍需补齐并单独验收。现有 25 个控制面用例不能作为这些组合已端到端验证的证据；补验收时应分别检查返回值、持久化配置/Location、物理数据以及回收候选，不能只断言 RPC 成功。
+部分 spec group / 多 storage 自动复制、透明 SSD 分层删除和各持久化组合的故障恢复仍需单独验收；已有实例的动态策略更新也未实现。上述单测和控制面用例不能证明所有模式已可生产使用。验收应分别检查返回值、持久化配置/Location、物理数据以及回收候选，不能只断言 RPC 成功。
 
 维护本文时，应同时核对调用者是否传参、被调用者是否执行、默认配置是否覆盖、测试使用真实后端还是 mock。新增能力要更新对应流程及边界；只新增字段或单测时，不应直接将待完成项改为已完成。

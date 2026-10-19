@@ -60,14 +60,18 @@ kvcm.affinity.strategy_file=/path/to/affinity.json
 - 读取先在选定 storage 内选择已有副本；上例在热度、大小、收益、容量及抑制条件通过后才产生复制提示。指标未知时容量门槛放行。
 - 上例容量门槛为 `0.90 - 0.05 = 0.85`。裸 `{"type":"local_replica"}` 的类默认门槛为 `0.85 - 0.05 = 0.80`，且不含写流水线。
 - `max_replicas_per_key` 统计 Location 条目；`max_instance_bytes` 含原始副本、全部 spec 和 WRITING 预留。它们作用于普通及复制 StartWrite。
-- **`min_retained_replicas` 已有底层保护函数，但当前 ReclaimByNode 未传入此参数，不能保证节点压力回收保留一个副本。** `critical` 虽可解析，当前也没有独立执行逻辑。
-- Noop/总开关关闭时，`GetReplicaLimits` 的默认保留数仍为 1，`ReclaimByLRU` 可能继续应用该保护；关闭 affinity 不等于恢复全部旧回收行为。
+- `min_retained_replicas` 用于节点压力回收，按 spec 检查剩余 SERVING Location 数；默认保留 1，设 0 关闭保护。旧字段 `critical` 已弃用，兼容接受但在解析时警告并忽略；节点回收只使用 `threshold` 与 `low`。
+- 最低副本保护不用于普通配额回收、显式删除或 GC；这些路径仍可删除最后一份副本。Noop/总开关关闭或关闭 eviction 时不触发节点压力回收。
 
-策略整体按 instance、instance_group、process 优先级选择，不按字段合并。实例/实例组通过其 `affinity_strategy_json` 配置；不完整但解析成功的覆盖策略会替换低层配置。解析器对部分错误字段使用默认值，加载成功不等于全部字段有效。
+策略整体按 instance、instance_group、process 优先级选择，不按字段合并。实例/实例组通过其 `affinity_strategy_json` 配置；不完整但解析成功的覆盖策略会替换低层配置。省略字段使用该策略的默认值；已知字段校验规则见下文。
 
-**已有 instance 不能靠再次 RegisterInstance 更新亲和性策略**：该分支不比较或覆盖 `affinity_strategy_json`，可能返回 OK 但继续使用旧值。组策略可通过 `UpdateInstanceGroup` 更新完整配置，需要 `current_version` 匹配且新 `version` 递增；有效的 instance 覆盖仍会遮挡组策略。配置写入 OK 也不代表策略 JSON 的全部字段经过严格校验。
+**已有 instance 的 `RegisterInstance` 是幂等注册，不提供策略更新**：省略 `affinity_strategy_json`（空串）保留已有策略；显式提供与已存 JSON 不同的策略返回 `EC_DUPLICATE_ENTITY`，错误字段包含 `affinity_strategy_json`。相同 JSON 仅调整空白或对象键顺序仍按幂等重试接受，原存储值不变。空串不能清除已有覆盖；原来没有覆盖的实例也不能通过重复注册追加覆盖。组策略可通过 `UpdateInstanceGroup` 更新完整配置，需要 `current_version` 匹配且新 `version` 递增；有效的 instance 覆盖仍会遮挡组策略。配置写入 OK 也不代表策略 JSON 的全部字段经过严格校验。
+
+选用 `local_replica` 时，解析器校验已知开关的布尔类型、数值范围和水位关系，写流水线解析错误也会使整个策略无效。无效的 instance/group 策略向下一层回退；进程策略加载失败则保留旧策略。未知字段仍兼容忽略；具体范围见[默认值与校验规则](cache-affinity-implementation.md#configuration)。
 
 节点压力回收还需要在元数据 backend URI 中配置 `reclaim_indexer_type=node_lru`；仅打开 affinity 不会创建节点索引。未配置时节点采样返回 `EC_NOENT`，不能期待节点回收生效。
+
+非 local 的单个持久化 meta 后端启用 `node_lru` 后，启动时会 O(N) 扫描 Location，重建节点成员关系并对账用量；扫描失败则启动失败，不保留重启前的精确 LRU 顺序。其他后端组合的用量仍依赖周期快照，见[恢复边界](cache-affinity-implementation.md#eviction)。
 
 ## 2. 配置客户端执行复制
 
@@ -87,7 +91,7 @@ kvcm.affinity.strategy_file=/path/to/affinity.json
 
 自动执行要求 HYBRID ManagerClient 同时有 MetaClient 和 TransferClient，并走可返回 hints 的 MatchLocation。`auto_replicate` 默认 false；仅打开服务端开关不会自动搬运数据。
 
-SDK 默认每次读取 PACE 本地身份；设正刷新间隔会允许复用旧身份。当前仅支持 mempool 内存类型和 NFS 的 provider 工厂选择，SSD-only 配置尚未接入自动选择。
+SDK 默认每次读取 PACE 本地身份；设正刷新间隔会允许复用旧身份。启用 mempool 编译支持时，DRAM 和 SSD-only 配置均可选择 PACE provider，仍要求本机恰好有一个非零节点身份；NFS 使用独立 provider。
 
 无复用 buffer 的任务先调用服务端 ReplicateCache，仅“不支持”回退客户端 Load/Save。显式复用接口支持按 spec 名称传 buffer 与共享 owner；异步返回值表示入队，结果回调表示复制结果。释放回调不表示复制成功。
 
@@ -114,8 +118,10 @@ SDK 默认每次读取 PACE 本地身份；设正刷新间隔会允许复用旧�
 1. 用 StartWrite/Finish 完成普通写，检查 GetCacheMeta 中各 spec 的实际 node id 和 SERVING 状态；不能只看请求中的 preferred nodes。
 2. 从远端 caller 查询，检查正确的 spec 名称、hint target 和能力位。热度统计元数据远端命中，不等待数据 Load 成功；查询轮询也会增加热度。默认阈值为 3，仍受衰减、抑制、容量及成本门槛约束；前缀加权仅 PrefixMatch 使用实际位置。
 3. 通过 SDK 结果回调/统计确认复制结果，再用 GetCacheMeta 的 `replica_locations` 检查目标节点完整的 SERVING 组件；兼容字段 `locations` 仅含每 key 第一个 Location。批量 RPC 顶层 OK、`server_copy_succeeded`（包含 already-exists）均不等于实际新建副本数。
-4. 验证回收时同时核对物理空间、删除逐项结果与元数据。当前后端部分删除失败时，元数据仍可能被清理，因此“查不到 Location”不等于空间已释放。NFS 指标是合成容量，删除接口仍是占位实现，不能用 NFS 集成测试证明 PACE 真实空间释放。
+4. 验证回收时同时核对物理空间、删除逐项结果与元数据。后端部分删除失败会保留完整 DELETING Location，全部 URI 确认已删除或不存在后才清理元数据。服务端 `kvcm.cache_gc.enabled` 默认 true，关闭后不会自动扫描重试。NFS 指标是合成容量，删除接口仍是占位实现，不能用 NFS 集成测试证明 PACE 真实空间释放。
 
 若已收到提示却没有本地副本，按[复制结果与失败处理](cache-affinity-implementation.md#replication-results)依次确认任务是否被接受、是否执行成功、目标是否发布；发布应答失败时尤其不能只凭返回码认定目标不存在。
 
 测试入口：[真实 Manager 集成](../integration_test/affinity/affinity_replication_test.py)、[SDK 复制测试](../kv_cache_manager/client/test/replication_executor_test.cc)、[策略测试](../kv_cache_manager/affinity/test/)。完整限制及后续开发优先级见[后端与待办](cache-affinity-implementation.md#status)。
+
+当前生产候选限关闭透明 SSD 分层的 DRAM 或显式 SSD；透明分层删除仍有独立阻断，真实 PACE 复制、压力回收和重启仍须实机验收。
