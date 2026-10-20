@@ -117,6 +117,7 @@ struct KmonitorMetricsReporter::Context {
 
     // data storage metrics
     DECLARE_METRICS(data_storage, healthy_status);
+    DECLARE_METRICS(data_storage, writable_status);
     DECLARE_METRICS(data_storage, storage_usage_ratio);
     DECLARE_METRICS(data_storage, write_bytes_dispatched_total);
 
@@ -429,6 +430,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
     // data storage metrics
     REGISTER_GAUGE_METRIC(data_storage, healthy_status);
+    REGISTER_GAUGE_METRIC(data_storage, writable_status);
     REGISTER_GAUGE_METRIC(data_storage, storage_usage_ratio);
     REGISTER_GAUGE_METRIC(data_storage, write_bytes_dispatched_total);
 
@@ -715,9 +717,12 @@ void KmonitorMetricsReporter::ReportInterval() {
             if (const auto p = std::dynamic_pointer_cast<DataStorageIntervalMetricsCollector>(mc); p != nullptr) {
                 const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
                 double healthy_status_v;
+                double writable_status_v;
                 double storage_usage_ratio_v;
                 GET_METRICS_(p, data_storage, healthy_status, healthy_status_v);
                 REPORT_METRICS(data_storage, healthy_status, healthy_status_v);
+                GET_METRICS_(p, data_storage, writable_status, writable_status_v);
+                REPORT_METRICS(data_storage, writable_status, writable_status_v);
                 GET_METRICS_(p, data_storage, storage_usage_ratio, storage_usage_ratio_v);
                 REPORT_METRICS(data_storage, storage_usage_ratio, storage_usage_ratio_v);
             }

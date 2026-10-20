@@ -181,7 +181,8 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 |---|---|---|
 | `meta_indexer.total_key_count` | gauge | 所有索引器的 key 总数 |
 | `meta_indexer.total_cache_usage` | gauge | 缓存使用总量（字节） |
-| `data_storage.healthy_status` | gauge | 存储后端健康状态（1/0） |
+| `data_storage.healthy_status` | gauge | 存储后端读取可用状态（1/0） |
+| `data_storage.writable_status` | gauge | 存储后端写入可用状态（1/0）；只读降级时为 0 |
 | `data_storage.storage_usage_ratio` | gauge | 存储使用率 |
 | `cache_manager.write_location_expire_size` | gauge | 已过期的写入位置数量 |
 | `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |

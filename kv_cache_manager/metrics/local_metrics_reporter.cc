@@ -134,6 +134,7 @@ void LocalMetricsReporter::ReportInterval() {
                     metrics_registry_,
                     MetricsTags{{"type", ToString(storage_backend->GetType())}, {"unique_name", unique_name}});
             SET_METRICS_(p, data_storage, healthy_status, storage_backend->Available() ? 1.0 : 0.0);
+            SET_METRICS_(p, data_storage, writable_status, storage_backend->Writable() ? 1.0 : 0.0);
             SET_METRICS_(
                 p, data_storage, storage_usage_ratio, storage_backend->GetStorageUsageRatio("trace_report_interval"));
         }

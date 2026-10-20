@@ -395,6 +395,8 @@ TEST_F(LocalMetricsReporterTest, TestReportInterval01) {
         double v;
         GET_METRICS_(p, data_storage, healthy_status, v);
         EXPECT_DOUBLE_EQ(1., v);
+        GET_METRICS_(p, data_storage, writable_status, v);
+        EXPECT_DOUBLE_EQ(1., v);
         GET_METRICS_(p, data_storage, storage_usage_ratio, v);
         EXPECT_DOUBLE_EQ(0., v);
     }
@@ -413,6 +415,8 @@ TEST_F(LocalMetricsReporterTest, TestReportInterval01) {
         EXPECT_TRUE(p);
         double v;
         GET_METRICS_(p, data_storage, healthy_status, v);
+        EXPECT_DOUBLE_EQ(0., v);
+        GET_METRICS_(p, data_storage, writable_status, v);
         EXPECT_DOUBLE_EQ(0., v);
         GET_METRICS_(p, data_storage, storage_usage_ratio, v);
         EXPECT_DOUBLE_EQ(0., v);

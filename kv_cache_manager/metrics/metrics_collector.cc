@@ -279,6 +279,7 @@ bool DataStorageMetricsCollector::Init() {
     DEFINE_METRICS_NAME_(DataStorageIntervalMetricsCollector, data_storage, name)
 
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE_INTERVAL(healthy_status);
+DEFINE_METRICS_NAME_FOR_DATA_STORAGE_INTERVAL(writable_status);
 DEFINE_METRICS_NAME_FOR_DATA_STORAGE_INTERVAL(storage_usage_ratio);
 
 DataStorageIntervalMetricsCollector::DataStorageIntervalMetricsCollector(
@@ -295,6 +296,7 @@ bool DataStorageIntervalMetricsCollector::Init() {
     }
 
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(healthy_status);
+    REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(writable_status);
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(storage_usage_ratio);
 
     return true;

@@ -195,7 +195,8 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 |---|---|---|
 | `meta_indexer.total_key_count` | gauge | Total keys across all indexers |
 | `meta_indexer.total_cache_usage` | gauge | Total cache usage bytes |
-| `data_storage.healthy_status` | gauge | Storage backend health (1/0) |
+| `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |
+| `data_storage.writable_status` | gauge | Storage backend write availability (1/0); 0 in read-only mode |
 | `data_storage.storage_usage_ratio` | gauge | Storage usage ratio |
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |

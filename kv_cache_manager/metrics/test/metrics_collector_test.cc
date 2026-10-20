@@ -310,6 +310,9 @@ TEST_F(MetricsCollectorTest, DataStorageHealthMetricsCollectorTest) {
     EXPECT_DOUBLE_EQ(GET(p, data_storage, healthy_status), 0.);
     SET_METRICS_(p, data_storage, healthy_status, 1.);
     EXPECT_DOUBLE_EQ(GET(p, data_storage, healthy_status), 1.);
+    EXPECT_DOUBLE_EQ(GET(p, data_storage, writable_status), 0.);
+    SET_METRICS_(p, data_storage, writable_status, 1.);
+    EXPECT_DOUBLE_EQ(GET(p, data_storage, writable_status), 1.);
 }
 
 TEST_F(MetricsCollectorTest, MetaIndexerAccumulativeMetricsCollectorTest) {
