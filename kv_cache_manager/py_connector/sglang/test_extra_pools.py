@@ -166,25 +166,41 @@ class FakeIndexerPoolHost:
         return ptr_list, size_list
 
 
-def _build_connector(
-    *, pools: dict, has_mamba: bool = False, has_indexer: bool = False
-):
-    """Build a HiCacheKVCM with only the attributes the v2 paths read."""
+class FakeKvPoolHost:
+    """Stand-in for sglang's KV host pool: only what the spec table reads."""
+
+    def __init__(self, *, page_size: int = 64, page_bytes: int = 4096) -> None:
+        self.page_size = page_size
+        self.page_bytes = page_bytes
+        self.dtype = torch.bfloat16
+
+    def get_size_per_token(self) -> int:
+        return self.page_bytes // self.page_size
+
+
+def _build_connector(*, pools: dict):
+    """Build a HiCacheKVCM with only the attributes the v2 paths read.
+
+    A KV anchor is registered alongside ``pools``, and the spec table is then
+    resolved the way ``_init_kvcm_client`` resolves it, so the data path sees the
+    spec names and per-block sizes a real instance would use.  The anchor's own
+    spec is ``tp_0`` whenever the scenario brings no sidecar pool.
+    """
     connector = HiCacheKVCM.__new__(HiCacheKVCM)
     connector.tp_rank = 0
+    connector.tp_size = 1
     connector.tp_world_size = 1
+    # The page size the fake pools model.
+    connector.block_size = 64
     connector.is_mla_model = False
     connector.instance_id = "test-instance"
     connector.write_timeout_seconds = 30
-    connector.location_spec_name = "tp_0"
-    connector.location_spec_size = 4096
-    connector.mamba_location_spec_name = "tp_0_linear"
-    connector.mamba_spec_size = 512
-    connector.indexer_location_spec_name = "tp_0_indexer"
-    connector.indexer_spec_size = 256
-    connector.has_mamba = has_mamba
-    connector.has_indexer = has_indexer
-    connector.registered_pools = pools
+    connector.registered_pools = {PoolName.KV: FakeKvPoolHost(), **pools}
+    connector.pool_specs = connector._resolve_pool_specs()
+    anchor = connector.pool_specs[PoolName.KV]
+    # The anchor's spec, as _init_kvcm_client assigns it.
+    connector.location_spec_name = anchor.name
+    connector.location_spec_size = anchor.size
     connector.prefetch_pgs = []
     connector.backup_pgs = []
     connector.prefetch_bandwidth = []
@@ -222,7 +238,7 @@ class TestExtraPoolIovLayout(unittest.TestCase):
 
     def test_conv_only_mamba_set_writes_one_buffer_per_page(self):
         pool = FakeMambaPoolHost(temporal_state=False, conv_buffers=2)
-        connector = _build_connector(pools={PoolName.MAMBA: pool}, has_mamba=True)
+        connector = _build_connector(pools={PoolName.MAMBA: pool})
         num_pages = 3
         connector._manager_client.start_write_cache.return_value = {
             "locations": _locations("tp_0_linear", [0, 1, 2], num_pages),
@@ -252,7 +268,7 @@ class TestExtraPoolIovLayout(unittest.TestCase):
     def test_ssm_mamba_set_keeps_temporal_iov(self):
         """Control: models with an SSM state still get temporal + conv IOVs."""
         pool = FakeMambaPoolHost(temporal_state=True, conv_buffers=2)
-        connector = _build_connector(pools={PoolName.MAMBA: pool}, has_mamba=True)
+        connector = _build_connector(pools={PoolName.MAMBA: pool})
         num_pages = 2
         connector._manager_client.start_write_cache.return_value = {
             "locations": _locations("tp_0_linear", [0, 1], num_pages),
@@ -280,7 +296,7 @@ class TestExtraPoolIovLayout(unittest.TestCase):
 
     def test_conv_only_mamba_get_maps_only_hit_pages(self):
         pool = FakeMambaPoolHost(temporal_state=False, conv_buffers=2)
-        connector = _build_connector(pools={PoolName.MAMBA: pool}, has_mamba=True)
+        connector = _build_connector(pools={PoolName.MAMBA: pool})
         num_pages = 4
         connector._manager_client.get_cache_location.return_value = {
             "locations": _locations("tp_0_linear", [1, 3], num_pages)
@@ -308,7 +324,7 @@ class TestExtraPoolIovLayout(unittest.TestCase):
     def test_partial_mamba_set_writes_only_missing_pages(self):
         """block_mask.offset > 0: only the not-yet-cached pages are written."""
         pool = FakeMambaPoolHost(temporal_state=False, conv_buffers=2)
-        connector = _build_connector(pools={PoolName.MAMBA: pool}, has_mamba=True)
+        connector = _build_connector(pools={PoolName.MAMBA: pool})
         num_pages = 5
         # Pages 0/1 are already cached; the manager only returns locations for
         # the 3 pages it wants written.
@@ -341,7 +357,7 @@ class TestExtraPoolIovLayout(unittest.TestCase):
         """Control: a pool with page_size > 1 still yields one IOV per page."""
         page_size = 64
         pool = FakeIndexerPoolHost(page_size=page_size)
-        connector = _build_connector(pools={PoolName.INDEXER: pool}, has_indexer=True)
+        connector = _build_connector(pools={PoolName.INDEXER: pool})
         num_pages = 2
         connector._manager_client.start_write_cache.return_value = {
             "locations": _locations("tp_0_indexer", [0, 1], num_pages),
@@ -381,7 +397,7 @@ class TestTransferShapeGuard(unittest.TestCase):
 
     def test_extra_pages_are_rejected_on_set(self):
         pool = FakeMambaPoolHost(temporal_state=False, conv_buffers=2)
-        connector = _build_connector(pools={PoolName.MAMBA: pool}, has_mamba=True)
+        connector = _build_connector(pools={PoolName.MAMBA: pool})
         num_keys = 2
         connector._manager_client.start_write_cache.return_value = {
             "locations": _locations("tp_0_linear", [0, 1], num_keys),
@@ -403,7 +419,7 @@ class TestTransferShapeGuard(unittest.TestCase):
 
     def test_extra_pages_are_rejected_on_get(self):
         pool = FakeMambaPoolHost(temporal_state=False, conv_buffers=2)
-        connector = _build_connector(pools={PoolName.MAMBA: pool}, has_mamba=True)
+        connector = _build_connector(pools={PoolName.MAMBA: pool})
         num_keys = 2
         connector._manager_client.get_cache_location.return_value = {
             "locations": _locations("tp_0_linear", [0, 1], num_keys)
