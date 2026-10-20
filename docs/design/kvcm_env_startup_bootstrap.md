@@ -25,7 +25,7 @@ KVCM 启动后，可以根据环境变量自动创建或更新 Storage 和 Insta
 {
   "KVCM_PACE_STORAGE": "{\"unique_name\":\"tairmempool_s_test\",\"domain\":\"empty\",\"timeout\":30,\"service_discovery_url\":\"spectrum://v-example?cache_time=30&retry_time=3&timeout=5000&port=12348\"}",
   "KVCM_L2P_STORAGE": "{\"unique_name\":\"vineyard_s_test\"}",
-  "KVCM_INSTANCE_GROUP": "{\"name\":\"group_test\",\"quota_capacity\":7476679068870,\"reclaim_used_percentage\":0.8,\"metadata_backend_mode\":3,\"meta_storage_backend_config\":\"cached,redis://default:<password>@redis.example.com:6379?db=4&timeout_ms=1000&retry_count=3&cluster_name=group_test&num_shard_bits=15&sample_times=1024&persistent_type=async_redis&cache_type=local&async_queue_count=32&async_max_batch=1024000&async_max_size=1024000&async_enqueue_timeout_ms=10&async_wait_us=1000000&capacity=65536\"}"
+  "KVCM_INSTANCE_GROUP": "{\"name\":\"group_test\",\"quota_capacity\":7476679068870,\"reclaim_used_percentage\":0.8,\"metadata_backend_mode\":3,\"meta_storage_backend_config\":\"cached,redis://default:<password>@redis.example.com:6379?db=4&cluster_name=group_test&capacity=65536\"}"
 }
 ```
 
@@ -52,7 +52,7 @@ python3 -m kvcm_ops create_instance_group \
   --max_key_count 1000000000 \
   --mutex_shard_num 131072 \
   --batch_key_size 1024 \
-  --meta_storage_backend_config 'cached,redis://default:<password>@redis.example.com:6379?db=4&timeout_ms=1000&retry_count=3&cluster_name=group_test&num_shard_bits=15&sample_times=1024&persistent_type=async_redis&cache_type=local&async_queue_count=32&async_max_batch=1024000&async_max_size=1024000&async_enqueue_timeout_ms=10&async_wait_us=1000000&capacity=65536' \
+  --meta_storage_backend_config 'cached,redis://default:<password>@redis.example.com:6379?db=4&cluster_name=group_test&capacity=65536&timeout_ms=1000&retry_count=3&num_shard_bits=15&sample_times=1024&persistent_type=async_redis&cache_type=local&async_queue_count=32&async_max_batch=204800&async_max_size=204800&async_enqueue_timeout_ms=10&async_wait_us=1000000' \
   --search_cache_capacity 10240 \
   --search_cache_shard_bits 6 \
   --extra_info '{"metadata_backend_mode":3}' \
@@ -197,7 +197,23 @@ MetaIndexer 相关字段包括：
 | `search_cache_shard_bits` | 否 | 6 |
 | `metadata_backend_mode` | 否 | 不写入 |
 
-`meta_storage_backend_config` 使用 `type,uri` 格式，type 支持 `redis` 和 `cached`，Redis URI 必须包含 `cluster_name`。URI query 会原样传递给 Meta Backend，Group 的数值字段应直接配置在 `KVCM_INSTANCE_GROUP` JSON 中。
+`meta_storage_backend_config` 使用 `type,uri` 格式，type 支持 `redis` 和 `cached`，Redis URI 必须包含 `cluster_name`。Bootstrap 只补齐 URI 中缺失的参数；显式配置的值优先，其他 query 参数保持原样。Group 的数值字段应直接配置在 `KVCM_INSTANCE_GROUP` JSON 中。
+
+| URI 参数 | Bootstrap 默认值 | 适用类型 |
+|---|---:|---|
+| `timeout_ms` | 1000 | `redis`、`cached` |
+| `retry_count` | 3 | `redis`、`cached` |
+| `num_shard_bits` | 15 | `cached` |
+| `sample_times` | 1024 | `cached` |
+| `persistent_type` | `async_redis` | `cached` |
+| `cache_type` | `local` | `cached` |
+| `async_queue_count` | 32 | `cached` 且使用 `async_redis` |
+| `async_max_batch` | 204800 | `cached` 且使用 `async_redis` |
+| `async_max_size` | 204800 | `cached` 且使用 `async_redis` |
+| `async_enqueue_timeout_ms` | 10 | `cached` 且使用 `async_redis` |
+| `async_wait_us` | 1000000 | `cached` 且使用 `async_redis` |
+
+上面的环境变量示例只保留 `db`、`cluster_name` 和 `capacity` 等显式参数；其余参数由 Bootstrap 补齐。直接调用 `create_instance_group` 不会补齐这些参数，因此前面的等价命令写出了完整 URI。未配置 `capacity` 时，本地 Meta 缓存继续使用后端默认值。
 
 ## 6. 配置错误和重试
 

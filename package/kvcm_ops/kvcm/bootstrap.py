@@ -100,6 +100,26 @@ NON_NEGATIVE_PASSTHROUGH_QUERY_KEYS = {
     "client_min_pool_size",
 }
 
+META_STORAGE_URI_DEFAULTS = (
+    ("timeout_ms", "1000"),
+    ("retry_count", "3"),
+)
+
+CACHED_META_STORAGE_URI_DEFAULTS = (
+    ("num_shard_bits", "15"),
+    ("sample_times", "1024"),
+    ("persistent_type", "async_redis"),
+    ("cache_type", "local"),
+)
+
+ASYNC_REDIS_URI_DEFAULTS = (
+    ("async_queue_count", "32"),
+    ("async_max_batch", "204800"),
+    ("async_max_size", "204800"),
+    ("async_enqueue_timeout_ms", "10"),
+    ("async_wait_us", "1000000"),
+)
+
 
 class BootstrapError(RuntimeError):
     pass
@@ -315,6 +335,21 @@ def _validate_passthrough_query(query, meta_storage_type):
         raise BootstrapError("storage URI query parameter num_shard_bits must be less than 20")
 
 
+def _apply_meta_storage_uri_defaults(uri, query, meta_storage_type):
+    # Keep explicit URI values and the original user-info spelling intact.
+    defaults = list(META_STORAGE_URI_DEFAULTS)
+    if meta_storage_type == "cached":
+        defaults.extend(CACHED_META_STORAGE_URI_DEFAULTS)
+        persistent_type = _single_query_value(query, "persistent_type") or "async_redis"
+        if persistent_type == "async_redis":
+            defaults.extend(ASYNC_REDIS_URI_DEFAULTS)
+    additions = ["{}={}".format(name, value) for name, value in defaults if name not in query]
+    if not additions:
+        return uri
+    separator = "" if uri.endswith(("?", "&")) else ("&" if "?" in uri else "?")
+    return uri + separator + "&".join(additions)
+
+
 def _parse_event_report_storage(environ, env_name, storage_type):
     value = _parse_json_object(environ, env_name, EVENT_REPORT_KEYS)
     if value is None:
@@ -427,6 +462,8 @@ def parse_environment(environ=None):
         _parse_meta_storage_backend_config(raw_meta_storage))
     config.redis_host, config.redis_port, query = _parse_storage_uri(config.meta_storage_uri)
     _validate_passthrough_query(query, config.meta_storage_type)
+    config.meta_storage_uri = _apply_meta_storage_uri_defaults(
+        config.meta_storage_uri, query, config.meta_storage_type)
     return config
 
 

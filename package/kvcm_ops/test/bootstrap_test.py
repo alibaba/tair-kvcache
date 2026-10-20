@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -248,6 +249,72 @@ class EnvironmentParsingTest(unittest.TestCase):
         self.assertEqual(4, config.metadata_backend_mode)
         self.assertEqual("custom", config.user_data)
 
+    def test_cached_uri_fills_missing_backend_defaults(self):
+        uri = "redis://redis.example:6379/?cluster_name=test"
+        environ = dict(BASE_ENV)
+        environ["KVCM_INSTANCE_GROUP"] = group_env(
+            meta_storage_backend_config="cached,{}".format(uri))
+
+        config = parse_environment(environ)
+        group = _build_new_instance_group(config)
+        query = parse_qs(urlsplit(config.meta_storage_uri).query)
+
+        self.assertEqual({
+            "timeout_ms": ["1000"],
+            "retry_count": ["3"],
+            "num_shard_bits": ["15"],
+            "sample_times": ["1024"],
+            "persistent_type": ["async_redis"],
+            "cache_type": ["local"],
+            "async_queue_count": ["32"],
+            "async_max_batch": ["204800"],
+            "async_max_size": ["204800"],
+            "async_enqueue_timeout_ms": ["10"],
+            "async_wait_us": ["1000000"],
+        }, {key: query[key] for key in (
+            "timeout_ms", "retry_count", "num_shard_bits", "sample_times",
+            "persistent_type", "cache_type", "async_queue_count", "async_max_batch",
+            "async_max_size", "async_enqueue_timeout_ms", "async_wait_us")})
+        self.assertEqual(
+            config.meta_storage_uri,
+            group["cache_config"]["meta_indexer_config"]
+            ["meta_storage_backend_config"]["storage_uri"],
+        )
+
+    def test_explicit_uri_values_override_bootstrap_defaults(self):
+        uri = (
+            "redis://redis.example:6379/?cluster_name=test"
+            "&timeout_ms=2500&retry_count=4&num_shard_bits=8"
+            "&persistent_type=redis&cache_type=local")
+        environ = dict(BASE_ENV)
+        environ["KVCM_INSTANCE_GROUP"] = group_env(
+            meta_storage_backend_config="cached,{}".format(uri))
+
+        config = parse_environment(environ)
+        query = parse_qs(urlsplit(config.meta_storage_uri).query)
+
+        self.assertTrue(config.meta_storage_uri.startswith(uri + "&"))
+        self.assertEqual(["2500"], query["timeout_ms"])
+        self.assertEqual(["4"], query["retry_count"])
+        self.assertEqual(["8"], query["num_shard_bits"])
+        self.assertEqual(["redis"], query["persistent_type"])
+        self.assertNotIn("async_queue_count", query)
+        self.assertEqual(["1024"], query["sample_times"])
+
+    def test_redis_backend_only_gets_shared_defaults(self):
+        uri = "redis://redis.example:6379/?cluster_name=test"
+        environ = dict(BASE_ENV)
+        environ["KVCM_INSTANCE_GROUP"] = group_env(
+            meta_storage_backend_config="redis,{}".format(uri))
+
+        config = parse_environment(environ)
+        query = parse_qs(urlsplit(config.meta_storage_uri).query)
+
+        self.assertEqual(["1000"], query["timeout_ms"])
+        self.assertEqual(["3"], query["retry_count"])
+        self.assertNotIn("persistent_type", query)
+        self.assertNotIn("async_queue_count", query)
+
     def test_raw_hash_in_password_is_supported_and_preserved(self):
         raw_uri = "redis://user:p#ss@redis.example:6379/?cluster_name=test"
         environ = dict(BASE_ENV)
@@ -258,9 +325,10 @@ class EnvironmentParsingTest(unittest.TestCase):
         group = _build_new_instance_group(config)
 
         self.assertEqual("redis.example", config.redis_host)
-        self.assertEqual(raw_uri, config.meta_storage_uri)
+        self.assertTrue(config.meta_storage_uri.startswith(raw_uri + "&"))
+        self.assertIn("async_queue_count=32", config.meta_storage_uri)
         self.assertEqual(
-            raw_uri,
+            config.meta_storage_uri,
             group["cache_config"]["meta_indexer_config"]
             ["meta_storage_backend_config"]["storage_uri"],
         )
