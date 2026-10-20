@@ -86,6 +86,10 @@ from kv_cache_manager.py_connector.sglang.connector import HiCacheKVCM  # noqa: 
 PAGE_SIZE = 64
 KV_BYTES_PER_TOKEN = 512
 MAMBA_BYTES_PER_TOKEN = 96
+# The page size each registered pool's host object reports.  Mamba's host pool is
+# page-granular (``MambaPoolHost.page_size == 1``, one slot per page), which is
+# exactly why its spec size is its per-token size; every other pool counts tokens.
+POOL_PAGE_SIZES = {PoolName.MAMBA: 1}
 # Never used by a correct connector: reading it means pools were taken from
 # HostPoolGroup.entries.
 SENTINEL_BYTES_PER_TOKEN = 7
@@ -105,13 +109,22 @@ class FakeHostPool(HostKVCache):
 
     The ABC's transfer hooks need real device pools, so they are stubbed out.
     Subclassing for real keeps the connector's ``isinstance`` check (and with
-    it the "a group is not a host pool" distinction) meaningful.
+    it the "a group is not a host pool" distinction) meaningful.  ``page_size``
+    is the pool's own, which is what its spec size is counted from: a Mamba host
+    pool keeps one slot per page (``page_size == 1``), every other pool here
+    counts ``PAGE_SIZE`` tokens.
     """
 
-    def __init__(self, *, bytes_per_token: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        *,
+        bytes_per_token: int,
+        dtype: torch.dtype,
+        page_size: int = PAGE_SIZE,
+    ) -> None:
         self.dtype = dtype
         self.bytes_per_token = bytes_per_token
-        self.page_size = PAGE_SIZE
+        self.page_size = page_size
 
     def get_size_per_token(self) -> int:
         return self.bytes_per_token
@@ -248,7 +261,9 @@ class TestRegistrationOrders(unittest.TestCase):
         return FakeHostPool(bytes_per_token=KV_BYTES_PER_TOKEN, dtype=torch.bfloat16)
 
     def _mamba_pool(self) -> FakeHostPool:
-        return FakeHostPool(bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32)
+        return FakeHostPool(
+            bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32, page_size=1
+        )
 
     def _expected_payload(self) -> dict:
         kv_size = KV_BYTES_PER_TOKEN * PAGE_SIZE
@@ -666,7 +681,11 @@ class TestControlPlaneGolden(unittest.TestCase):
             )
             for name, bytes_per_token in pools:
                 connector.register_mem_host_pool_v2(
-                    FakeHostPool(bytes_per_token=bytes_per_token, dtype=torch.float32),
+                    FakeHostPool(
+                        bytes_per_token=bytes_per_token,
+                        dtype=torch.float32,
+                        page_size=POOL_PAGE_SIZES.get(name, PAGE_SIZE),
+                    ),
                     name,
                 )
             connector.batch_exists(["block-0"])
@@ -829,14 +848,14 @@ class TestInitializationTiming(unittest.TestCase):
                 bytes_per_token=KV_BYTES_PER_TOKEN, dtype=torch.bfloat16
             )
             mamba_pool = FakeHostPool(
-                bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32
+                bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32, page_size=1
             )
             connector.register_mem_pool_host(kv_pool)
             connector.register_mem_host_pool_v2(mamba_pool, PoolName.MAMBA)
             connector.batch_exists(["block-0"])
 
             late_pool = FakeHostPool(
-                bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32
+                bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32, page_size=1
             )
             with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
                 connector.register_mem_host_pool_v2(late_pool, PoolName.MAMBA)
@@ -936,7 +955,9 @@ class TestV2EntriesLazyInitialization(unittest.TestCase):
             FakeHostPool(bytes_per_token=KV_BYTES_PER_TOKEN, dtype=torch.bfloat16)
         )
         connector.register_mem_host_pool_v2(
-            FakeHostPool(bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32),
+            FakeHostPool(
+                bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32, page_size=1
+            ),
             PoolName.MAMBA,
         )
         return connector
