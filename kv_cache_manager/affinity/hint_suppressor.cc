@@ -34,9 +34,7 @@ bool HintSuppressor::TryEmit(int64_t block_key, const std::string &target_node, 
             }
         }
         it->second.last_emit_us = now;
-        lru_.erase(it->second.lru_it);
-        lru_.push_front(it->first);
-        it->second.lru_it = lru_.begin();
+        lru_.splice(lru_.begin(), lru_, it->second.lru_it);
         return true;
     }
     lru_.push_front(k);

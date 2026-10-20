@@ -10,14 +10,8 @@
 // Each test loads a realistic JSON strategy config, injects NodeMetrics, and
 // drives the manager through ResolveWrite / ResolveRead / ResolveEviction to
 // verify the decisions match expected behavior.
-//
-// NOTE: CacheAffinityManager is heap-allocated via NewManager() to ensure each
-// test gets a unique address. MakeNodeMetricsAccessor uses a thread-local cache
-// keyed by `this`; stack-local managers across TEST_F share the same address,
-// causing stale metrics from the previous test to leak through.
 
 #include <fstream>
-#include <memory>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -29,21 +23,12 @@
 
 namespace kv_cache_manager {
 
-namespace {
-// Keep managers alive across tests to prevent heap address reuse.
-std::vector<std::unique_ptr<CacheAffinityManager>> g_mgr_pool;
-CacheAffinityManager &NewManager() {
-    g_mgr_pool.push_back(std::make_unique<CacheAffinityManager>());
-    return *g_mgr_pool.back();
-}
-} // namespace
-
 class CacheAffinityManagerIntegrationTest : public TESTBASE {};
 
 // Strategy lifecycle only: storage deletion is covered by CacheReclaimerTest,
 // and physical replica publication is checked by mock_inference_node.
 TEST_F(CacheAffinityManagerIntegrationTest, EvictedReplicaCanBeRecreatedAfterCapacityRecovers) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
         "type":"local_replica",
         "read":{"on_miss":{"replication_hot_threshold":1,"suppression_window_ms":0}},
@@ -135,7 +120,7 @@ static ReadRequest MakeRemoteReadRequest(int64_t block_key, LocationSpec *spec, 
 // ---------------------------------------------------------------------------
 
 TEST_F(CacheAffinityManagerIntegrationTest, AdaptiveHotKeyRetentionLoop) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     // Cluster: 3 nodes, caller is on node_a
@@ -221,7 +206,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, AdaptiveHotKeyRetentionLoop) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CacheAffinityManagerIntegrationTest, WritePipelineFilterSortLimit) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     // node_a: load 0.95 → filtered out by "load_ratio max 0.90"
@@ -256,7 +241,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, WritePipelineFilterSortLimit) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CacheAffinityManagerIntegrationTest, WritePipelinePreferLocalWithFilter) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     // node_a (caller): load 0.50, passes filter (max 0.90)
@@ -284,7 +269,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, WritePipelinePreferLocalWithFilter) 
 // ---------------------------------------------------------------------------
 
 TEST_F(CacheAffinityManagerIntegrationTest, ReadOnMissCallerCapacityGateBlocksHint) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     // caller node_a: load 0.82 > threshold(0.85) - buffer(0.05) = 0.80
@@ -316,7 +301,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, ReadOnMissCallerCapacityGateBlocksHi
 // ---------------------------------------------------------------------------
 
 TEST_F(CacheAffinityManagerIntegrationTest, EvictionLoopWithHysteresis) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     // node_a: load 0.90 (> threshold 0.85), free 100000 → total ~1000000
@@ -364,7 +349,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, EvictionLoopWithHysteresis) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CacheAffinityManagerIntegrationTest, MultiCallerBothGetReplicationHints) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 500000, 0.30, 0, 0, 1});
@@ -415,7 +400,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, MultiCallerBothGetReplicationHints) 
 }
 
 TEST_F(CacheAffinityManagerIntegrationTest, HintDedupSuppressionWindow) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
         "type": "local_replica",
         "read": {
@@ -479,7 +464,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, HintDedupSuppressionWindow) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CacheAffinityManagerIntegrationTest, ThreeTierPriorityRealisticOverrides) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 500000, 0.30, 0, 0, 1});
@@ -546,7 +531,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, ThreeTierPriorityRealisticOverrides)
 // ---------------------------------------------------------------------------
 
 TEST_F(CacheAffinityManagerIntegrationTest, GlobalKillSwitchMidFlight) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 100000, 0.90, 0, 0, 1});
@@ -590,7 +575,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, GlobalKillSwitchMidFlight) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CacheAffinityManagerIntegrationTest, LoadFullStrategyFromFile) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     std::string path = GetPrivateTestRuntimeDataPath() + "strategy.json";
     {
         std::ofstream f(path);
@@ -619,7 +604,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, LoadFullStrategyFromFile) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CacheAffinityManagerIntegrationTest, NoNodesGracefulDegradation) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     AffinityResolveContext ctx;
@@ -642,7 +627,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, NoNodesGracefulDegradation) {
 // ---------------------------------------------------------------------------
 
 TEST_F(CacheAffinityManagerIntegrationTest, WriteAspectDisabledReadEvictionOn) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
         "type": "local_replica",
         "enabled_aspects": { "write": false, "read": true, "eviction": true },

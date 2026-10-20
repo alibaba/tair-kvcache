@@ -348,8 +348,11 @@ bool ReplicationExecutor::SubmitWithBuffers(ClientReplicationHint hint,
 }
 
 void ReplicationExecutor::Shutdown() {
-    if (stopped_.exchange(true)) {
-        return;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (stopped_.exchange(true)) {
+            return;
+        }
     }
     cv_.notify_all();
     for (auto &w : workers_) {
@@ -370,9 +373,6 @@ void ReplicationExecutor::WorkerLoop() {
             cv_.wait(lk, [this] { return stopped_.load(std::memory_order_relaxed) || !queue_.empty(); });
             if (stopped_.load(std::memory_order_relaxed) && queue_.empty()) {
                 return;
-            }
-            if (queue_.empty()) {
-                continue;
             }
             tasks.push_back(std::move(queue_.front()));
             queue_.pop_front();
@@ -564,7 +564,7 @@ void ReplicationExecutor::ExecuteServerCopyBatch(std::vector<ReplicationTask *> 
             // results for other blocks in this server batch. ExecuteTask sets
             // the active failure stage before invoking the transfer backend.
             try {
-                ExecuteTask(task, false);
+                ExecuteTask(task);
             } catch (const std::exception &e) {
                 KVCM_LOG_WARN("[replication] fallback failed for block [%ld]: %s", task.hint.block_key, e.what());
             } catch (...) {
@@ -578,7 +578,7 @@ void ReplicationExecutor::ExecuteServerCopyBatch(std::vector<ReplicationTask *> 
     }
 }
 
-void ReplicationExecutor::ExecuteTask(ReplicationTask &task, bool try_server_copy) {
+void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
     if (ReplicationResources::Clock::now() >= task.submitted_at + std::chrono::milliseconds(options_.max_age_ms)) {
         task.outcome = ReplicationOutcome::EXPIRED;
         task.error_code = ER_SDK_TIMEOUT;
@@ -592,26 +592,6 @@ void ReplicationExecutor::ExecuteTask(ReplicationTask &task, bool try_server_cop
         task.error_code = ER_OK;
         KVCM_LOG_WARN("[replication] caller changed; dropping hint for node [%s]", hint.target_node_id.c_str());
         return;
-    }
-    const bool has_client_buffer = (task.data != nullptr && task.data_size > 0) || !task.named_buffers.empty();
-    if (!has_client_buffer && try_server_copy) {
-        const auto server_ec = meta_client_->ReplicateCache(trace_id, hint, /*write_timeout_seconds=*/60);
-        if (server_ec == ER_OK) {
-            task.outcome = ReplicationOutcome::SUCCEEDED;
-            task.error_code = ER_OK;
-            task.copied_bytes = HintBytes(hint);
-            ++counters_.server_copy_succeeded;
-            return;
-        }
-        if (server_ec != ER_SERVICE_UNSUPPORTED) {
-            task.outcome = ReplicationOutcome::SERVER_COPY_FAILED;
-            task.error_code = server_ec;
-            ++counters_.server_copy_failed;
-            KVCM_LOG_WARN("[replication] server-side copy failed for block_key [%ld], ec [%d]",
-                          hint.block_key, server_ec);
-            return;
-        }
-        ++counters_.client_fallback;
     }
     auto [start_ec, write_loc] = meta_client_->StartReplicationWrite(
         trace_id, {hint.block_key}, {}, /*write_timeout_seconds=*/60, hint.target_node_id);

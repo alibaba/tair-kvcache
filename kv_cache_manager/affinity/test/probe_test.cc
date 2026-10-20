@@ -1,10 +1,8 @@
 // Probe tests: targeted edge-case and bug-hunting tests for
 // CacheAffinityManager new logic. Each test probes a specific concern.
 
-#include <memory>
 #include <string>
 #include <unordered_set>
-#include <vector>
 
 #include "kv_cache_manager/affinity/cache_affinity_manager.h"
 #include "kv_cache_manager/affinity/local_replica_strategy.h"
@@ -12,14 +10,6 @@
 #include "kv_cache_manager/common/unittest.h"
 
 namespace kv_cache_manager {
-
-namespace {
-std::vector<std::unique_ptr<CacheAffinityManager>> g_mgr_pool;
-CacheAffinityManager &NewManager() {
-    g_mgr_pool.push_back(std::make_unique<CacheAffinityManager>());
-    return *g_mgr_pool.back();
-}
-} // namespace
 
 class AffinityProbeTest : public TESTBASE {};
 
@@ -37,18 +27,13 @@ static const char *kWriteFilterJson = R"({
 // ===================================================================
 // Probe 1: MakeNodeMetricsAccessor TLS staleness
 //
-// MakeNodeMetricsAccessor uses thread_local keyed by `this`. On the
-// same thread + same manager, calling UpsertNodeMetrics between two
-// ResolveWrite calls does NOT refresh the TLS snapshot. The second
-// Resolve sees stale metrics.
-//
-// Scenario: node_a starts at load 0.50 (passes filter max 0.90).
-// After first ResolveWrite, update node_a to load 0.95 (should fail filter).
-// Second ResolveWrite should filter out node_a, but TLS returns stale 0.50.
+// Regression for the former thread-local cache: every resolve must use
+// current metrics. Raising node_a's load from 0.50 to 0.95 must make it
+// fail the filter on the next ResolveWrite.
 // ===================================================================
 
 TEST_F(AffinityProbeTest, TlsStaleMetricsInWriteFilter) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kWriteFilterJson));
 
     mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 300000, 0.50, 0, 0, 1});
@@ -85,12 +70,11 @@ TEST_F(AffinityProbeTest, TlsStaleMetricsInWriteFilter) {
 // ===================================================================
 // Probe 2: TLS staleness affects read capacity gate
 //
-// Same TLS issue but in the read path: caller_capacity_threshold check
-// uses get_node_metrics which goes through the TLS accessor.
+// The read capacity gate must also use updated metrics on every resolve.
 // ===================================================================
 
 TEST_F(AffinityProbeTest, TlsStaleMetricsInReadCapacityGate) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
         "type": "local_replica",
         "read": {
@@ -151,7 +135,7 @@ TEST_F(AffinityProbeTest, TlsStaleMetricsInReadCapacityGate) {
 // ===================================================================
 
 TEST_F(AffinityProbeTest, HysteresisResetsOnMetricsRefresh) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
         "type": "local_replica",
         "eviction": {
@@ -196,7 +180,7 @@ TEST_F(AffinityProbeTest, HysteresisResetsOnMetricsRefresh) {
 // ===================================================================
 
 TEST_F(AffinityProbeTest, HysteresisWithZeroTimestamp) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
         "type": "local_replica",
         "eviction": {
@@ -238,7 +222,7 @@ TEST_F(AffinityProbeTest, HysteresisWithZeroTimestamp) {
 // ===================================================================
 
 TEST_F(AffinityProbeTest, SketchSurvivesStrategyReload) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
         "type": "local_replica",
         "read": { "on_miss": { "enabled": true, "replication_hot_threshold": 3 } }
@@ -295,7 +279,7 @@ TEST_F(AffinityProbeTest, SketchSurvivesStrategyReload) {
 // ===================================================================
 
 TEST_F(AffinityProbeTest, EvictionContextHasNoGetNodeMetrics) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
         "type": "local_replica",
         "eviction": {
@@ -319,7 +303,7 @@ TEST_F(AffinityProbeTest, EvictionContextHasNoGetNodeMetrics) {
 // ===================================================================
 
 TEST_F(AffinityProbeTest, ReadMultipleSpecNamesPickIndependently) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
         "type": "local_replica"
     })"));
@@ -356,7 +340,7 @@ TEST_F(AffinityProbeTest, ReadMultipleSpecNamesPickIndependently) {
 // ===================================================================
 
 TEST_F(AffinityProbeTest, WriteReflectsNodeAddRemove) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
         "type": "local_replica",
         "write": { "ops": { "prefer_local": {"on_miss": "passthrough"} } }
@@ -411,7 +395,7 @@ TEST_F(AffinityProbeTest, WriteReflectsNodeAddRemove) {
 // ===================================================================
 
 TEST_F(AffinityProbeTest, EvictionAtFullCapacity) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
         "type": "local_replica",
         "eviction": {
@@ -449,7 +433,7 @@ TEST_F(AffinityProbeTest, EvictionAtFullCapacity) {
 // ===================================================================
 
 TEST_F(AffinityProbeTest, StrategyMemoizationSharesParsedInstance) {
-    auto &mgr = NewManager();
+    CacheAffinityManager mgr;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({"type":"noop"})"));
 
     mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 500000, 0.30, 0, 0, 1});

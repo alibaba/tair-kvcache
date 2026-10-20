@@ -121,7 +121,7 @@ public:
 
 private:
     void WorkerLoop();
-    void ExecuteTask(ReplicationTask &task, bool try_server_copy = true);
+    void ExecuteTask(ReplicationTask &task);
     void ExecuteServerCopyBatch(std::vector<ReplicationTask *> tasks);
     void CompleteTask(ReplicationTask &task,
                       ReplicationResources::Clock::time_point started_at);

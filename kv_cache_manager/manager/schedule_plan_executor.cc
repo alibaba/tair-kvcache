@@ -356,8 +356,11 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
 
     std::map<std::string, std::vector<DataStorageUri>> delete_uris_by_unique_name;
     std::map<std::string, std::string> node_by_uri;
-    std::map<LocationDeleteKey, std::set<std::string>> required_uris;
-    std::map<LocationDeleteKey, std::string> expected_deleted_values;
+    struct PendingDelete {
+        std::set<std::string> required_uris;
+        std::string expected_value;
+    };
+    std::map<LocationDeleteKey, PendingDelete> pending_deletes;
     std::set<std::string> completed_uris;
     bool unlogged_exception = false;
     const auto mark_partial_failure = [&] {
@@ -372,7 +375,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
         for (size_t j = 0; j < need_delete_location_ids.size(); ++j) {
             const auto &location_id = need_delete_location_ids[j];
             const LocationDeleteKey delete_key{task.instance_id, block_key, location_id};
-            if (lease->owned.count(delete_key) == 0 || required_uris.count(delete_key) != 0)
+            if (lease->owned.count(delete_key) == 0 || pending_deletes.count(delete_key) != 0)
                 continue;
             auto iter = location_map.find(location_id);
             if (iter == location_map.end() || !iter->second) {
@@ -385,13 +388,13 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             if (!task.expected_location_values.empty() && current_value != task.expected_location_values[i][j]) {
                 continue;
             }
-            auto &required = required_uris[delete_key];
-            expected_deleted_values.emplace(delete_key, current_value);
+            auto &pending = pending_deletes[delete_key];
+            pending.expected_value = current_value;
             if (!task.metadata_only && !IsEventReportStorageType(iter->second->type())) {
                 for (const auto &loc_spec : iter->second->location_specs()) {
                     DataStorageUri uri(loc_spec.uri());
                     if (uri.Valid()) {
-                        required.insert(uri.ToUriString());
+                        pending.required_uris.insert(uri.ToUriString());
                         std::string storage_unique_name = uri.GetHostName();
                         if (node_by_uri.emplace(uri.ToUriString(), loc_spec.node_id()).second) {
                             delete_uris_by_unique_name[storage_unique_name].emplace_back(uri);
@@ -399,7 +402,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
                     } else {
                         // Keep malformed metadata for diagnosis; never lose the
                         // only reference to data whose deletion was not confirmed.
-                        required.insert(loc_spec.uri());
+                        pending.required_uris.insert(loc_spec.uri());
                         mark_partial_failure();
                         result.error_message = "invalid storage URI in deleting location";
                         KVCM_LOG_WARN("invalid storage delete uri, instance[%s] location[%s] uri[%s]",
@@ -412,7 +415,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
         }
     }
 
-    KVCM_LOG_DEBUG("Found %zu meta location(s) to delete", required_uris.size());
+    KVCM_LOG_DEBUG("Found %zu meta location(s) to delete", pending_deletes.size());
 
     // delete storage uris
     auto request_context = std::make_shared<RequestContext>("location_del_task_trace");
@@ -511,8 +514,8 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
     std::vector<int64_t> block_keys_to_delete;
     LocationIdsPerKey delete_ids;
     std::vector<std::vector<std::string>> expected_values;
-    for (const auto &[key, required] : required_uris) {
-        if (!std::all_of(required.begin(), required.end(), [&](const std::string &uri) {
+    for (const auto &[key, pending] : pending_deletes) {
+        if (!std::all_of(pending.required_uris.begin(), pending.required_uris.end(), [&](const std::string &uri) {
                 return completed_uris.count(uri) != 0;
             }))
             continue;
@@ -523,7 +526,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             expected_values.emplace_back();
         }
         delete_ids.back().push_back(std::get<2>(key));
-        expected_values.back().push_back(expected_deleted_values.at(key));
+        expected_values.back().push_back(pending.expected_value);
     }
 
     // delete locations

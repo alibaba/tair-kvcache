@@ -52,9 +52,7 @@ void FrequencySketch::Observe(const std::string &caller_node_id, int64_t block_k
             ++it->second.count;
         }
         // 移到 MRU 位置
-        lru_.erase(it->second.lru_it);
-        lru_.push_front(it->first);
-        it->second.lru_it = lru_.begin();
+        lru_.splice(lru_.begin(), lru_, entry.lru_it);
     }
 }
 
