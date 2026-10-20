@@ -38,6 +38,20 @@ export KVCM_INSTANCE_GROUP='{"name":"group_test","meta_storage_backend_config":"
 }
 ```
 
+### 组合示例：L1.5 + L2
+
+同时接收 L1.5 和 L2 EventReport、且不使用 PACE 时，可配置：
+
+```json
+{
+  "KVCM_L1P5_STORAGE": "{\"unique_name\":\"engine_l1p5_s_test\"}",
+  "KVCM_L2P_STORAGE": "{\"unique_name\":\"vineyard_s_test\"}",
+  "KVCM_INSTANCE_GROUP": "{\"name\":\"group_test\",\"meta_storage_backend_config\":\"cached,redis://default:<password>@redis.example.com:6379?cluster_name=group_test\"}"
+}
+```
+
+这组配置以 L1.5 为主 Storage，L1.5 和 L2 都加入 EventReport candidates。
+
 ## 2. JSON 字段与默认值
 
 ### L1.5 / L2 Storage
@@ -96,7 +110,7 @@ export KVCM_INSTANCE_GROUP='{"name":"group_test","meta_storage_backend_config":"
 | `async_enqueue_timeout_ms` | 10 | `cached` 且使用 `async_redis` |
 | `async_wait_us` | 1000000 | `cached` 且使用 `async_redis` |
 
-上面的组合示例只保留 `db`、`cluster_name` 和 `capacity` 等显式参数；其余参数由 Bootstrap 补齐。这些是 Bootstrap 补齐的默认值，不会修改 Meta Backend 本身的默认值。直接调用 `create_instance_group` 时，需要自行写出所需参数。未配置 `capacity` 时，本地 Meta 缓存使用后端默认的 32768 MB。
+上面的 PACE + L2 示例只保留 `db`、`cluster_name` 和 `capacity` 等显式参数；其余参数由 Bootstrap 补齐。这些是 Bootstrap 补齐的默认值，不会修改 Meta Backend 本身的默认值。直接调用 `create_instance_group` 时，需要自行写出所需参数。未配置 `capacity` 时，本地 Meta 缓存使用后端默认的 32768 MB。
 
 ## 3. 启动和主从行为
 
