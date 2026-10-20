@@ -191,3 +191,64 @@ TEST_F(NfsBackendTest, TestCreateSingleKeyBatch) {
     ASSERT_EQ(results.size(), keys.size());
     ASSERT_EQ(results[0].second.ToUriString(), "file:///root/singlekey?blkid=0&size=10");
 }
+
+TEST_F(NfsBackendTest, TestCreateWithHintsStrictAndNodeId) {
+    NfsBackend backend(metrics_registry_);
+    std::shared_ptr<NfsStorageSpec> spec(new NfsStorageSpec);
+    spec->set_key_count_per_file(1);
+    spec->set_root_path("/data/");
+    StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "test", spec);
+    ASSERT_EQ(EC_OK, backend.Open(storage_config, "fake_trace_id_1"));
+    std::string local_ip = backend.local_node_id_;
+    ASSERT_FALSE(local_ip.empty());
+
+    std::vector<std::string> keys = {"key1", "key2"};
+
+    // strict=true, preferred empty → fail
+    {
+        auto r = backend.CreateWithHints(keys, 128, /*hints=*/{}, /*strict=*/true, "t1", nullptr);
+        ASSERT_EQ(r.size(), keys.size());
+        for (auto &d : r) {
+            EXPECT_EQ(EC_ERROR, d.ec);
+        }
+    }
+    // strict=true, preferred != local → fail
+    {
+        WriteHints h;
+        h.preferred_node_ids = {"remote_node"};
+        auto r = backend.CreateWithHints(keys, 128, h, /*strict=*/true, "t2", nullptr);
+        ASSERT_EQ(r.size(), keys.size());
+        for (auto &d : r) {
+            EXPECT_EQ(EC_ERROR, d.ec);
+        }
+    }
+    // strict=true, preferred == local → ok, node_id == local
+    {
+        WriteHints h;
+        h.preferred_node_ids = {local_ip};
+        auto r = backend.CreateWithHints(keys, 128, h, /*strict=*/true, "t3", nullptr);
+        ASSERT_EQ(r.size(), keys.size());
+        for (auto &d : r) {
+            EXPECT_EQ(EC_OK, d.ec);
+            EXPECT_EQ(local_ip, d.node_id);
+        }
+    }
+    // strict=false, any preferred → ok, node_id always local
+    {
+        auto r1 = backend.CreateWithHints(keys, 128, /*hints=*/{}, /*strict=*/false, "t4", nullptr);
+        ASSERT_EQ(r1.size(), keys.size());
+        for (auto &d : r1) {
+            EXPECT_EQ(EC_OK, d.ec);
+            EXPECT_EQ(local_ip, d.node_id);
+        }
+
+        WriteHints h;
+        h.preferred_node_ids = {"remote_node"};
+        auto r2 = backend.CreateWithHints(keys, 128, h, /*strict=*/false, "t5", nullptr);
+        ASSERT_EQ(r2.size(), keys.size());
+        for (auto &d : r2) {
+            EXPECT_EQ(EC_OK, d.ec);
+            EXPECT_EQ(local_ip, d.node_id);
+        }
+    }
+}

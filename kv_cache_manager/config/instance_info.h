@@ -149,6 +149,10 @@ public:
     const ModelDeployment &model_deployment() const { return model_deployment_; }
     const std::vector<LocationSpecGroup> &location_spec_groups() const { return location_spec_groups_; }
     int32_t default_query_type() const { return default_query_type_; }
+    const std::string &affinity_strategy_json() const { return affinity_strategy_json_; }
+    void set_affinity_strategy_json(const std::string &affinity_strategy_json) {
+        affinity_strategy_json_ = affinity_strategy_json;
+    }
     void set_quota_group_name(const std::string &quota_group_name) { quota_group_name_ = quota_group_name; }
     void set_instance_group_name(const std::string &instance_group_name) { instance_group_name_ = instance_group_name; }
     void set_instance_id(const std::string &instance_id) { instance_id_ = instance_id; }
@@ -168,7 +172,8 @@ public:
                                                           const std::vector<LocationSpecInfo> &location_spec_infos,
                                                           const ModelDeployment &model_deployment,
                                                           const std::vector<LocationSpecGroup> &location_spec_groups,
-                                                          int32_t default_query_type = 0) const {
+                                                          int32_t default_query_type = 0,
+                                                          const std::string &affinity_strategy_json = {}) const {
         std::vector<std::string> mismatched;
         if (block_size_ != block_size) {
             mismatched.emplace_back("block_size");
@@ -189,11 +194,17 @@ public:
         if (default_query_type_ != default_query_type) {
             mismatched.emplace_back("default_query_type");
         }
+        // Proto3's default empty string is also sent by older clients. It
+        // means unspecified on a retry, never a request to clear the policy.
+        if (!affinity_strategy_json.empty() && !MatchesAffinityStrategyJson(affinity_strategy_json)) {
+            mismatched.emplace_back("affinity_strategy_json");
+        }
         return mismatched;
     }
 
 private:
     void SortLocationSpecGroups();
+    bool MatchesAffinityStrategyJson(const std::string &requested) const;
 
 private:
     std::string quota_group_name_;
@@ -204,6 +215,7 @@ private:
     ModelDeployment model_deployment_;
     std::vector<LocationSpecGroup> location_spec_groups_;
     int32_t default_query_type_{0};
+    std::string affinity_strategy_json_;
 };
 
 using InstanceInfoConstPtr = std::shared_ptr<const InstanceInfo>;

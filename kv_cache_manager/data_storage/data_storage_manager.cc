@@ -195,6 +195,23 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
                                                                              const std::vector<std::string> &keys,
                                                                              size_t size_per_key,
                                                                              std::function<void()> cb) {
+    // 非 affinity 路径：复用新返回类型的 Create，丢弃 node_id 字段。
+    auto descs = Create(request_context, unique_name, keys, size_per_key, WriteHints{}, /*strict=*/false, std::move(cb));
+    std::vector<std::pair<ErrorCode, DataStorageUri>> out;
+    out.reserve(descs.size());
+    for (auto &d : descs) {
+        out.emplace_back(d.ec, std::move(d.uri));
+    }
+    return out;
+}
+
+std::vector<LocationDescriptor> DataStorageManager::Create(RequestContext *request_context,
+                                                           const std::string &unique_name,
+                                                           const std::vector<std::string> &keys,
+                                                           size_t size_per_key,
+                                                           const WriteHints &hints,
+                                                           bool strict,
+                                                           std::function<void()> cb) {
     SPAN_TRACER(request_context);
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     const std::string &trace_id = request_context->trace_id();
@@ -208,20 +225,24 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
     // target cannot become disabled between admission and backend allocation.
     if (storage_backend == nullptr || !storage_backend->Available()) {
         KVCM_LOG_WARN("Storage name: %s is unavailable, reject create", unique_name.c_str());
-        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOENT, DataStorageUri{}});
+        return std::vector<LocationDescriptor>(keys.size(), {EC_NOENT, DataStorageUri{}, ""});
+    }
+    if (strict && (!storage_backend->SupportsAffinity() || hints.preferred_node_ids.empty())) {
+        KVCM_LOG_WARN("Storage name: %s cannot satisfy strict affinity", unique_name.c_str());
+        return std::vector<LocationDescriptor>(keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}, ""});
     }
     const auto dsmc = storage_backend->GetMetricsCollector();
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);
-    std::vector<std::pair<ErrorCode, DataStorageUri>> create_result =
-        storage_backend->Create(keys, size_per_key, trace_id, cb);
+    std::vector<LocationDescriptor> create_result =
+        storage_backend->CreateWithHints(keys, size_per_key, hints, strict, trace_id, cb);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(dsmc, DataStorageCreate);
     KVCM_METRICS_COLLECTOR_SET_METRICS(dsmc, data_storage, create_keys_qps, keys.size());
     if (request_context) {
         request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(dsmc);
     }
-    std::for_each(create_result.begin(), create_result.end(), [&unique_name](auto &pair) {
-        if (pair.first == EC_OK) {
-            pair.second.SetHostName(unique_name);
+    std::for_each(create_result.begin(), create_result.end(), [&unique_name](auto &desc) {
+        if (desc.ec == EC_OK) {
+            desc.uri.SetHostName(unique_name);
         }
     });
     return create_result;

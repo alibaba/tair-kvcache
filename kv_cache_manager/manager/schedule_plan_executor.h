@@ -12,6 +12,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -47,6 +48,10 @@ struct PlanExecuteResult {
     // True only when every failure in this result has already been logged.
     // Callers can retain result metrics without repeating the diagnostics.
     bool error_logged{false};
+    // Only EC_OK physical deletes contribute, never missing/failed/speculative
+    // deletes. The start timestamp fences against newer capacity samples.
+    std::map<std::string, int64_t> deleted_bytes_by_node;
+    int64_t physical_delete_started_at_us{0};
 };
 
 struct AsyncDeleteSubmitResult {
@@ -72,6 +77,7 @@ struct CacheLocationDelRequest {
     // ShouldSkipConfirmedMissingBackendDelete policy determines whether to
     // omit Delete for these URIs; remaining specs are deleted normally.
     std::set<std::string> confirmed_missing_uris;
+    uint32_t min_retained_replicas{0};
 };
 
 struct EventReportMetadataDeleteTarget {
@@ -161,10 +167,12 @@ public:
 
 private:
     struct PromiseCompletion;
+    struct LocationDeleteLease;
     struct LocationDelAdmissionResult {
         PlanExecuteResult result{ErrorCode::EC_OK, ""};
         CacheLocationDelRequest actual_task;
         bool needs_physical_delete{false};
+        std::shared_ptr<LocationDeleteLease> delete_lease;
     };
 
     std::shared_ptr<MetaIndexerManager> meta_manager_;
@@ -178,6 +186,9 @@ private:
     std::size_t migration_worker_budget_{0};
     std::size_t running_migration_tasks_{0};
     std::mutex queue_mutex_;
+    // Covers admission, delay and execution; protected by queue_mutex_.
+    using LocationDeleteKey = std::tuple<std::string, int64_t, std::string>;
+    std::set<LocationDeleteKey> active_location_deletes_;
     std::condition_variable condition_;
     std::atomic<uint64_t> sequence_counter_{0};
 
@@ -204,7 +215,9 @@ private:
                           const std::vector<std::vector<std::string>> *target_location_ids,
                           const std::vector<std::vector<std::string>> *expected_location_values,
                           std::chrono::microseconds delay,
-                          bool authoritative_read = false);
+                          bool authoritative_read = false,
+                          uint32_t min_retained_replicas = 0,
+                          bool metadata_only = false);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare,
@@ -214,7 +227,8 @@ private:
     std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task, ScheduleTaskClass task_class);
     std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
                                                         ScheduleTaskClass task_class);
-    PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task);
+    PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task,
+                                        std::shared_ptr<LocationDeleteLease> lease = {});
     PlanExecuteResult DoEventReportMetadataDelTask(const EventReportMetadataDelRequest &task);
     void DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
                     const CacheLocationCopyRequest &task);

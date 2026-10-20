@@ -18,6 +18,8 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -50,6 +52,7 @@ private:                                                                        
 
 class CacheReclaimStrategy;
 class CacheLocation;
+class CacheAffinityManager;
 class EventManager;
 class InstanceGroup;
 class InstanceGroupQuota;
@@ -173,7 +176,8 @@ public:
                    std::shared_ptr<WriteLocationManager> write_location_manager,
                    CacheReclaimerAsyncDeleteConfig async_delete_config = {},
                    std::shared_ptr<MigrationManager> migration_manager = nullptr,
-                   CacheReclaimerGroupLruConfig group_lru_config = {});
+                   CacheReclaimerGroupLruConfig group_lru_config = {},
+                   std::shared_ptr<CacheAffinityManager> affinity_manager = nullptr);
 
     /**
      * @brief Delete copy constructor
@@ -335,6 +339,7 @@ private:
     const std::shared_ptr<MigrationManager> migration_manager_;
     // Startup-only configuration; no public mutation API.
     CacheReclaimerGroupLruConfig group_lru_config_;
+    const std::shared_ptr<CacheAffinityManager> affinity_manager_;
 
     // represents the object of the associated working thread
     std::thread reclaimer_;
@@ -607,6 +612,11 @@ private:
                       const WaterLevelExceed &water_level_exceed,
                       std::int32_t delay_before_delete_ms) noexcept;
 
+    bool ReclaimByNode(const std::shared_ptr<RequestContext> &request_context,
+                       const std::shared_ptr<const InstanceInfo> &instance_info,
+                       const std::unordered_set<std::string> &node_ids,
+                       std::int32_t delay_before_delete_ms) noexcept;
+
     bool ReclaimByLRUWithBudget(const std::shared_ptr<RequestContext> &request_context,
                                 const std::shared_ptr<const InstanceInfo> &instance_info,
                                 const WaterLevelExceed &water_level_exceed,
@@ -794,7 +804,9 @@ private:
                          std::uint64_t &out_predicted_deleted_keys,
                          AgeStats &out_create_age_stats,
                          bool eligibility_only,
-                         bool maintenance_read) noexcept;
+                         bool maintenance_read,
+                         const std::unordered_set<std::string> &node_ids = {},
+                         std::unordered_map<std::string, int64_t> *out_node_bytes = nullptr) noexcept;
 
     /**
      * @brief 评估并执行一个 instance group 的多层存储迁移（水位触发）。

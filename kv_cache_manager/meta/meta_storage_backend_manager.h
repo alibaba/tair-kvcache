@@ -3,7 +3,9 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -11,6 +13,7 @@
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_cache_base_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
+#include "kv_cache_manager/meta/reclaim_indexer/reclaim_indexer.h"
 #include "kv_cache_manager/meta/types.h"
 
 namespace kv_cache_manager {
@@ -26,7 +29,8 @@ struct SingleLocationRmwScratch;
 //     memory_primary keeps that write order during Recover, then makes local
 //     the ordinary-write primary after recovery; Redis remains the recovery
 //     source and backup.
-//   * Single-backend: persistent only (cache is null, no Recover).
+//   * Single-backend: persistent only (cache is null). Persistent node_lru
+//     deployments rebuild the node index and accounting synchronously in Open.
 //
 // Callers must partition requests via MetaIndexer::MakeBatches and hold
 // shard locks before invoking the manager.
@@ -178,9 +182,17 @@ public:
     bool PreferSingleTaskReclaimSampling() const noexcept;
     // Apply the maintenance yield only to a complete Local reclaim source.
     size_t TouchKeysForMaintenance(const KeyTypeVec &keys) noexcept;
+    ErrorCode SampleReclaimKeys(RequestContext *request_context,
+                                const std::string &type,
+                                const std::unordered_set<std::string> &node_ids,
+                                const int64_t count,
+                                KeyTypeVec &out_keys) noexcept;
 
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
+    // Startup-only snapshot, available after a successful single-backend
+    // node_lru rebuild. Consume before publishing the MetaIndexer to traffic.
+    bool GetRecoveredMetaData(FieldMap &field_maps) const noexcept;
 
     // Synchronously flush pending writes for the given keys to persistent storage.
     // Returns true on success, false on failure/timeout.
@@ -226,6 +238,7 @@ private:
                 local_primary};
     }
     void AsyncRecoverTask() noexcept;
+    ErrorCode RecoverSingleBackendIndexes() noexcept;
     int64_t BackfillKeysToCache(const KeyTypeVec &keys,
                                 const CacheLocationMapVector &locations,
                                 const PropertyMapVector &properties,
@@ -241,11 +254,30 @@ private:
     int32_t MaybeReclaimEmptyKeys(RequestContext *request_context,
                                   const KeyVector &keys,
                                   const std::vector<ErrorCode> &delete_results) noexcept;
+    // Create reclaim indexers from a semicolon-separated type string (e.g. "node_lru;ttl").
+    ErrorCode InitReclaimIndexers(const std::string &types_str) noexcept;
+
+    // Notify all reclaim indexers about successfully written keys+locations (write / recover path).
+    void NotifyIndexersAdd(const KeyVector &keys,
+                           const CacheLocationMapVector &locations,
+                           const std::vector<ErrorCode> &results) noexcept;
+    // Notify all reclaim indexers about successfully read keys (read path).
+    void NotifyIndexersTouch(const KeyVector &keys, const std::vector<ErrorCode> &results) noexcept;
+    // Notify all reclaim indexers about fully deleted keys.
+    void NotifyIndexersRemove(const KeyVector &keys, const std::vector<ErrorCode> &results) noexcept;
+    // Notify all reclaim indexers about partially deleted locations.
+    void NotifyIndexersRemoveLocations(const KeyVector &keys,
+                                       const LocationIdsPerKey &location_ids,
+                                       const std::vector<ErrorCode> &results) noexcept;
+
     std::string instance_id_;
     std::unique_ptr<MetaStorageBackend> persistent_backend_;
     std::unique_ptr<MetaCacheBaseBackend> cache_backend_;
     bool memory_primary_ = false;
     bool force_deleting_async_enqueue_ = true;
+    // type -> per-type reclaim indexer
+    std::unordered_map<std::string, std::unique_ptr<ReclaimIndexer>> reclaim_indexers_;
+    FieldMap recovered_metadata_;
 
     std::atomic<RecoverState> recover_state_{RecoverState::kRecover};
     std::atomic<bool> is_closed_{false};

@@ -227,3 +227,84 @@ curl -g -vvv -X POST http://localhost:6382/api/getCacheMeta \
     "detail_level": 1
 }'
 ```
+
+响应中的旧字段 `locations` 继续按请求 key 返回第一个 location。新增的
+`replica_locations` 与请求 key 一一对应，每一项包含该 key 的全部副本。每个副本返回
+`id`、`status`、`create_time`，每个 spec 返回字符串形式的 PACE `node_id` 和包含该数字
+node id/GA 的原始 `uri`。调用方应使用 `replica_locations` 做副本诊断和状态展示。
+
+
+## 亲和性复制提示
+
+`GetCacheLocationResponse.hints` 为远端热点提供异步复制建议，不改变本次读取返回的 location。
+单个提示包含 `block_key`、字符串形式的目标 PACE node id `target_node_id` 和 `source_specs`：
+
+```json
+{
+  "block_key": "123",
+  "target_node_id": "42",
+  "source_specs": [
+    {"spec_name": "kv", "uri": "pace://source/kv?size=1024"},
+    {"spec_name": "state", "uri": "pace://source/state?size=2048"}
+  ]
+}
+```
+
+`source_specs` 与目标按 `spec_name` 匹配，不按数组位置匹配。所有目标 spec 写入成功后才能
+成功 `FinishWriteCache`；中途失败应使用失败 mask 结束会话。既有 `source_uri` 字段仅在
+单 spec 提示中设置。多 spec 复制要求配套升级 SDK，不能让旧客户端忽略新字段后按单 spec 执行。
+
+### 亲和性复制能力协商
+
+`GetCacheLocationRequest.caller.replication_capabilities` 为位图，bit 0（值 1）表示客户端支持按名称复制完整的多 spec 源。响应 `replication_capabilities` 返回双方支持能力的交集。未携带能力的旧客户端仍可读取全部位置，只接收单 spec 提示。新 SDK 默认声明值 1，仅在响应确认后使用多 spec 提示。未知位忽略；升级 SDK 与服务端可分批进行。HTTP/Python 调用方只有实现全部 spec 的原子发布后才应声明该位。
+
+### 服务端复制
+
+新 SDK 对没有现成推理侧 buffer 的提示调用 `ReplicateCache`。服务端按 `target_node_id`
+严格申请目标 GA，调用同一 storage backend 的 CopyGA，并在全部 `source_specs` 成功后发布
+目标元数据。任一 spec 失败都会以失败 mask 结束写会话并回收目标 GA。批量请求使用
+`items`；服务端把同一 storage 的多个 block/spec 汇总到一次 backend `Copy`，TairMempool
+因此只发起一次 `BatchSyncCopyGA`。响应 `results` 与 `items` 一一对应。
+
+```json
+POST /api/replicateCache
+{
+  "trace_id": "replicate_123",
+  "instance_id": "instance_1",
+  "block_key": "123",
+  "target_node_id": "42",
+  "write_timeout_seconds": 60,
+  "source_specs": [
+    {"spec_name": "kv", "uri": "pace://storage/ga1?size=1024"}
+  ]
+}
+```
+
+```json
+POST /api/replicateCache
+{
+  "trace_id": "replicate_batch_123",
+  "instance_id": "instance_1",
+  "write_timeout_seconds": 60,
+  "items": [
+    {
+      "block_key": "123",
+      "target_node_id": "provider-a",
+      "source_specs": [{"spec_name": "kv", "uri": "pace://storage/ga1?size=1024"}]
+    },
+    {
+      "block_key": "124",
+      "target_node_id": "provider-b",
+      "source_specs": [{"spec_name": "kv", "uri": "pace://storage/ga2?size=1024"}]
+    }
+  ]
+}
+```
+
+SDK 的 `ReplicateWithDataAsync` 和 `ReplicateWithBuffersAsync` 提供最终结果回调。结果区分
+已存在、调用方节点变化、过期、队列/预算拒绝、重复、分配失败、服务端复制失败、传输失败
+和发布失败。输入 buffer 的 release callback 只表示生命周期结束，不代表复制成功。
+
+复制写若仍使用 `StartWriteCache`，必须同时设置 `is_replication=true` 和
+`replication_target_node_id`。缺少目标节点会返回 `INVALID_ARGUMENT`；服务端不会再从普通
+`write.ops` 推导复制目标。

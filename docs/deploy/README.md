@@ -1,4 +1,7 @@
 # 部署方式
+
+亲和性功能的本地运行与验收见 [Manager + SDK 完整示例](cache-affinity-local.md)。
+
 ## 启动 Manager
 ### 使用容器启动（推荐）
 ```

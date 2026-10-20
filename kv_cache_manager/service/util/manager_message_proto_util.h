@@ -202,6 +202,9 @@ void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_locat
     static_assert(std::is_same_v<T, proto::meta::CacheLocation> || std::is_same_v<T, proto::admin::CacheLocation>,
                   "T must be either proto::meta::CacheLocation or proto::admin::CacheLocation");
     proto_cache_location->set_spec_size(cache_location_info.spec_size());
+    proto_cache_location->set_id(cache_location_info.id());
+    proto_cache_location->set_status(CacheLocation::CacheLocationStatusToString(cache_location_info.status()));
+    proto_cache_location->set_create_time(cache_location_info.create_time());
     if constexpr (std::is_same_v<T, proto::meta::CacheLocation>) {
         proto::meta::StorageType type;
         DataStorageTypeToProto(cache_location_info.type(), &type);
@@ -216,6 +219,7 @@ void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_locat
         auto *proto_spec = proto_cache_location->add_location_specs();
         proto_spec->set_name(location_spec.name());
         proto_spec->set_uri(location_spec.uri());
+        proto_spec->set_node_id(location_spec.node_id());
     }
 }
 // DONE
@@ -399,6 +403,7 @@ ProtoConvert::InstanceInfoToProto(const InstanceInfo &instance_info, T *proto_in
         proto_instance_info->set_default_query_type(
             static_cast<proto::admin::QueryType>(instance_info.default_query_type()));
     }
+    proto_instance_info->set_affinity_strategy_json(instance_info.affinity_strategy_json());
 }
 
 template <typename T>
@@ -424,6 +429,7 @@ ProtoConvert::InstanceInfoFromProto(const T *proto_instance_info, InstanceInfo &
     instance_info.set_location_spec_groups(location_spec_groups);
 
     instance_info.set_default_query_type(static_cast<int32_t>(proto_instance_info->default_query_type()));
+    instance_info.set_affinity_strategy_json(proto_instance_info->affinity_strategy_json());
 }
 
 template <typename T>
@@ -512,12 +518,14 @@ std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<
 ProtoConvert::LocationSpecToProto(const LocationSpec &location_spec_info, T *proto_location_spec) {
     proto_location_spec->set_name(location_spec_info.name());
     proto_location_spec->set_uri(location_spec_info.uri());
+    proto_location_spec->set_node_id(location_spec_info.node_id());
 }
 template <typename T>
 std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<T, proto::admin::LocationSpec>>
 ProtoConvert::LocationSpecFromProto(const T *proto_location_spec, LocationSpec &location_spec_info) {
     location_spec_info.set_name(proto_location_spec->name());
     location_spec_info.set_uri(proto_location_spec->uri());
+    location_spec_info.set_node_id(proto_location_spec->node_id());
 }
 template <typename T>
 std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<T, proto::admin::LocationSpec>>
@@ -543,6 +551,9 @@ template <typename T>
 std::enable_if_t<std::is_same_v<T, proto::meta::CacheLocation> || std::is_same_v<T, proto::admin::CacheLocation>>
 ProtoConvert::CacheLocationToProto(const CacheLocation &cache_location_info, T *proto_cache_location) {
     proto_cache_location->set_spec_size(cache_location_info.spec_size());
+    proto_cache_location->set_id(cache_location_info.id());
+    proto_cache_location->set_status(CacheLocation::CacheLocationStatusToString(cache_location_info.status()));
+    proto_cache_location->set_create_time(cache_location_info.create_time());
     if constexpr (std::is_same_v<T, proto::meta::CacheLocation>) {
         proto::meta::StorageType type;
         DataStorageTypeToProto(cache_location_info.type(), &type);

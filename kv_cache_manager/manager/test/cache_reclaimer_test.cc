@@ -40,6 +40,7 @@
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/migration_manager.h"
@@ -866,7 +867,6 @@ public:
         stub_.reset(ADDR(MetaIndexer, GetProperties));
         stub_.reset(ADDR(MetaIndexer, RandomSample));
         stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
-        stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
         stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
         stub_.reset(ADDR(MetaIndexer, GetKeyCount));
         stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
@@ -1170,6 +1170,45 @@ public:
     std::shared_ptr<MigrationManager> mm_;
     std::shared_ptr<RequestContext> request_context_;
 };
+
+TEST_F(CacheReclaimerTest, TestDestructorSynchronizesWorkerStopWithQueueWait) {
+    auto reclaimer = std::make_unique<CacheReclaimer>(1, 1, 1, 1, 1, rm_, mim_, msm_, spe_, mr_, em_, nullptr);
+    std::promise<void> task_started;
+    auto task_started_future = task_started.get_future();
+    std::promise<void> finish_task;
+    auto finish_task_future = finish_task.get_future();
+    // Keep the object alive in the destructor's join while inspecting its stop
+    // flag, including on the old implementation that writes it without a lock.
+    reclaimer->SubmitTask([&] {
+        task_started.set_value();
+        finish_task_future.wait();
+    });
+    const auto started = task_started_future.wait_for(std::chrono::seconds(5));
+    if (started != std::future_status::ready) {
+        finish_task.set_value();
+        reclaimer.reset();
+    }
+    ASSERT_EQ(std::future_status::ready, started);
+
+    auto *raw_reclaimer = reclaimer.get();
+    std::unique_lock<std::mutex> queue_lock(raw_reclaimer->task_queue_mutex_);
+    std::promise<void> destruction_started;
+    auto destruction_started_future = destruction_started.get_future();
+    std::thread destroyer([owned = std::move(reclaimer), &destruction_started]() mutable {
+        destruction_started.set_value();
+        owned.reset();
+    });
+    destruction_started_future.wait();
+
+    // A waiter holds this mutex between evaluating the predicate and entering
+    // wait(). Shutdown must not change the predicate across that boundary.
+    const bool stop_changed_while_locked =
+        WaitUntil([raw_reclaimer] { return raw_reclaimer->worker_stop_.load(); }, std::chrono::seconds(1));
+    queue_lock.unlock();
+    finish_task.set_value();
+    destroyer.join();
+    EXPECT_FALSE(stop_changed_while_locked);
+}
 
 TEST_F(CacheReclaimerTest, TestStartStop) {
     stub_.reset(ADDR(RegistryManager, ListInstanceGroup));
@@ -8371,4 +8410,361 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDWritingColdDoesNotProtectHot) {
 
     stub_.reset(ADDR(RegistryManager, GetInstanceGroup));
     g_cold_ig.reset();
+}
+
+TEST_F(CacheReclaimerTest, NodePressureKeepsHealthyReplicaAndHonorsPendingLimits) {
+    auto pressured = std::make_shared<CacheLocation>(
+        "pressured", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1,
+        std::vector<LocationSpec>{LocationSpec("test_spec", "nfs://store/a?size=64", "nodeA")});
+    auto healthy = std::make_shared<CacheLocation>(
+        "healthy", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1,
+        std::vector<LocationSpec>{LocationSpec("test_spec", "nfs://store/b?size=64", "nodeB")});
+    batch_get_loc_out_maps = {{{"pressured", pressured}, {"healthy", healthy}}};
+    CacheReclaimer::BytesByStorageType bytes{};
+    CacheReclaimer::CountsByStorageType counts{};
+    uint64_t deleted_keys = 0;
+    CacheReclaimer::AgeStats ages;
+    std::vector<std::vector<std::string>> ids;
+    std::unordered_map<std::string, int64_t> node_bytes;
+    const auto filter = [&]() {
+        return cache_reclaimer_->FilterLocIDImpl(
+            request_context_.get(), instance_infos.front(), {42}, CacheReclaimer::WaterLevelExceed{},
+            ids, bytes, counts, deleted_keys, ages, false, false, {"nodeA"}, &node_bytes);
+    };
+    ASSERT_TRUE(filter());
+    ASSERT_EQ((std::vector<std::vector<std::string>>{{"pressured"}}), ids);
+    EXPECT_EQ(0u, deleted_keys); // The healthy replica keeps the key alive.
+    EXPECT_EQ(64, node_bytes["nodeA"]);
+    EXPECT_EQ(0u, node_bytes.count("nodeB"));
+
+    cache_reclaimer_->pending_locations_.insert({instance_infos.front()->instance_id(), 42, "pressured"});
+    ASSERT_TRUE(filter());
+    ASSERT_EQ(1u, ids.size());
+    EXPECT_TRUE(ids.front().empty());
+    EXPECT_TRUE(node_bytes.empty());
+    cache_reclaimer_->pending_locations_.clear();
+
+    CacheReclaimerAsyncDeleteConfig config;
+    config.pending_bytes_limit = 32;
+    ReplaceReclaimer(config);
+    ASSERT_TRUE(filter());
+    ASSERT_EQ(1u, ids.size());
+    EXPECT_TRUE(ids.front().empty());
+    EXPECT_TRUE(node_bytes.empty());
+}
+
+TEST_F(CacheReclaimerTest, NodePressureHonorsEachInstanceOverrideAndContinuesAfterNoop) {
+    cache_reclaimer_->job_state_flag_ = true;
+    auto affinity = std::make_shared<CacheAffinityManager>();
+    ASSERT_TRUE(affinity->LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})"));
+    affinity->UpsertNodeMetrics({"nodeA", "nodeA", DataStorageType{}, 80, 0.92, 0, 0, 1});
+    cache_reclaimer_->Stop();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
+        10, 100, 10, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr,
+        CacheReclaimerAsyncDeleteConfig{}, nullptr, CacheReclaimerGroupLruConfig{}, affinity);
+    cache_reclaimer_->job_state_flag_ = true;
+    auto disabled = InstanceInfoFactory();
+    disabled->set_instance_id("disabled");
+    disabled->set_affinity_strategy_json(R"({"type":"noop"})");
+    auto enabled = InstanceInfoFactory();
+    enabled->set_instance_id("enabled");
+    enabled->set_affinity_strategy_json(R"({"type":"local_replica"})");
+    instance_infos = {disabled, enabled};
+    auto group = InstanceGroupFactory();
+    group->set_affinity_strategy_json(R"({"type":"noop"})");
+    static std::vector<std::string> reclaimed;
+    reclaimed.clear();
+    stub_.set(ADDR(CacheReclaimer, ReclaimByNode),
+              +[](void *, const std::shared_ptr<RequestContext> &, const std::shared_ptr<const InstanceInfo> &instance,
+                  const std::unordered_set<std::string> &nodes, int32_t) -> bool {
+                  reclaimed.push_back(instance->instance_id());
+                  EXPECT_EQ((std::unordered_set<std::string>{"nodeA"}), nodes);
+                  return true;
+              });
+    const auto result = cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+    EXPECT_TRUE(result.made_progress);
+    EXPECT_EQ((std::vector<std::string>{"enabled"}), reclaimed);
+    stub_.reset(ADDR(CacheReclaimer, ReclaimByNode));
+}
+
+TEST_F(CacheReclaimerTest, NodeCreditWaitsForTerminalPhysicalResultsIncludingLatePartialSuccess) {
+    auto affinity = std::make_shared<CacheAffinityManager>();
+    ASSERT_TRUE(affinity->LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})"));
+    affinity->UpsertNodeMetrics({"node", "node", DataStorageType{}, 80, 0.92, 0, 0, 1});
+    cache_reclaimer_->Stop();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
+        10, 100, 10, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr,
+        CacheReclaimerAsyncDeleteConfig{}, nullptr, CacheReclaimerGroupLruConfig{}, affinity);
+    const auto now = std::chrono::steady_clock::now();
+    std::promise<PlanExecuteResult> promise;
+    cache_reclaimer_->delete_handlers_.emplace_front(
+        request_context_, "test_instance", "test_instance_group", 1, 1,
+        std::vector<CacheReclaimer::PendingLocationKey>{}, CacheReclaimer::BytesByStorageType{},
+        CacheReclaimer::CountsByStorageType{}, 0, now, now, promise.get_future());
+    cache_reclaimer_->AddDeleteHandlerState(cache_reclaimer_->delete_handlers_.front());
+    cache_reclaimer_->HandleDelRes(); // Timed out admission is not freed capacity.
+    EXPECT_EQ(1u, affinity->ResolveEviction({}).size());
+    PlanExecuteResult partial{EC_PARTIAL_OK, "one spec failed"};
+    partial.deleted_bytes_by_node["node"] = 250;
+    partial.physical_delete_started_at_us = 2;
+    promise.set_value(partial);
+    cache_reclaimer_->HandleDelRes();
+    EXPECT_TRUE(affinity->ResolveEviction({}).empty());
+    EXPECT_TRUE(cache_reclaimer_->delete_handlers_.empty());
+    cache_reclaimer_->HandleDelRes(); // A consumed future cannot credit twice.
+    EXPECT_TRUE(affinity->ResolveEviction({}).empty());
+}
+
+// Exercise the real node index, deletion admission, metadata RMW and executor.
+// Only physical storage is replaced, so retention must prevent Delete itself,
+// rather than merely setting a field in a captured request.
+class AffinityRetentionReclaimerTest : public CacheReclaimerTest {
+public:
+    class Storage : public TypedTestBackend {
+    public:
+        explicit Storage(const std::shared_ptr<MetricsRegistry> &metrics)
+            : TypedTestBackend(metrics, DataStorageType::DATA_STORAGE_TYPE_NFS) {}
+
+        std::vector<ErrorCode>
+        Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (const auto &uri : uris)
+                deleted.push_back(uri.ToUriString());
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+
+        std::vector<std::string> Deleted() {
+            std::lock_guard<std::mutex> lock(mutex);
+            return deleted;
+        }
+
+    private:
+        std::mutex mutex;
+        std::vector<std::string> deleted;
+    };
+
+    void SetUp() override {
+        CacheReclaimerTest::SetUp();
+        stub_.reset(ADDR(RegistryManager, ListInstanceGroup));
+        stub_.reset(ADDR(RegistryManager, ListInstanceInfo));
+        stub_.reset(static_cast<spe_submit_async_loc>(ADDR(SchedulePlanExecutor, SubmitAsync)));
+        stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
+        stub_.reset(ADDR(MetaIndexer, GetProperties));
+        stub_.reset(ADDR(MetaIndexer, RandomSample));
+        stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
+        stub_.reset(ADDR(MetaIndexer, GetKeyCount));
+        stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
+        stub_.reset(ADDR(MetaIndexer, PersistMetaData));
+        stub_.reset(ADDR(MetaSearcherManager, GetMetaSearcher));
+        stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+
+        group = InstanceGroupFactory();
+        group->cache_config_->reclaim_strategy_->set_delay_before_delete_ms(0);
+        info = InstanceInfoFactory();
+        rm_->instance_group_configs_[group->name()] = group;
+        rm_->instance_infos_[info->instance_id()] = info;
+        auto config = std::make_shared<MetaIndexerConfig>();
+        config->SetMaxKeyCount(1024);
+        config->SetMutexShardNum(8);
+        config->GetMetaStorageBackendConfig()->SetStorageType("local");
+        config->GetMetaStorageBackendConfig()->SetStorageUri(
+            "local://?capacity=1024&num_shard_bits=0&reclaim_indexer_type=node_lru");
+        ASSERT_EQ(EC_OK, mim_->CreateMetaIndexer(info->instance_id(), config));
+        indexer = mim_->GetMetaIndexer(info->instance_id());
+        msm_->meta_searcher_map_[info->instance_id()] = std::make_unique<MetaSearcher>(indexer);
+        searcher = msm_->GetMetaSearcher(info->instance_id());
+        storage = std::make_shared<Storage>(mr_);
+        dsm_->storage_map_["retention"] = storage;
+        spe_ = std::make_shared<SchedulePlanExecutor>(2, mim_, dsm_, mr_);
+        affinity = std::make_shared<CacheAffinityManager>();
+        ASSERT_TRUE(affinity->LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})"));
+        affinity->UpsertNodeMetrics(
+            {"nodeA", "nodeA", DataStorageType{}, 80000, 0.92, 0, 0, TimestampUtil::GetCurrentTimeUs(), 1000000});
+        cache_reclaimer_ = std::make_unique<CacheReclaimer>(10,
+                                                            100,
+                                                            10,
+                                                            10,
+                                                            2,
+                                                            rm_,
+                                                            mim_,
+                                                            msm_,
+                                                            spe_,
+                                                            mr_,
+                                                            em_,
+                                                            nullptr,
+                                                            CacheReclaimerAsyncDeleteConfig{},
+                                                            nullptr,
+                                                            CacheReclaimerGroupLruConfig{},
+                                                            affinity);
+        // Initialize metrics with an empty index, then drive cron rounds
+        // explicitly so assertions do not race the background scheduler.
+        ASSERT_EQ(EC_OK, cache_reclaimer_->Start());
+        cache_reclaimer_->Stop();
+        cache_reclaimer_->job_state_flag_ = true;
+    }
+
+    void TearDown() override {
+        spe_->Stop();
+        CacheReclaimerTest::TearDown();
+    }
+
+    void Put(KeyType key, const std::vector<std::string> &nodes) {
+        CacheLocationMap locations;
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const auto id = "loc" + std::to_string(i);
+            const auto uri = "nfs://retention/" + std::to_string(key) + "/" + id + "?size=64";
+            locations[id] =
+                std::make_shared<CacheLocation>(id,
+                                                CLS_SERVING,
+                                                DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                1,
+                                                std::vector<LocationSpec>{LocationSpec("kv", uri, nodes[i])});
+        }
+        CacheLocationMapVector batch_locations{std::move(locations)};
+        PropertyMapVector properties{{{PROPERTY_LRU_TIME, "1"}}};
+        ASSERT_EQ(EC_OK, indexer->Put(request_context_.get(), {key}, batch_locations, properties).ec);
+    }
+
+    void Drain() {
+        for (auto &handler : cache_reclaimer_->delete_handlers_) {
+            ASSERT_EQ(std::future_status::ready, handler.fut_.wait_for(std::chrono::seconds(5)));
+        }
+        cache_reclaimer_->HandleDelRes();
+        ASSERT_TRUE(cache_reclaimer_->delete_handlers_.empty());
+    }
+
+    CacheLocationMap Locations(KeyType key) {
+        CacheLocationMapVector locations;
+        EXPECT_EQ(EC_OK, searcher->BatchGetLocation(request_context_.get(), {key}, BlockMask{}, locations));
+        return locations.empty() ? CacheLocationMap{} : locations.front();
+    }
+
+    std::shared_ptr<InstanceGroup> group;
+    std::shared_ptr<InstanceInfo> info;
+    std::shared_ptr<MetaIndexer> indexer;
+    MetaSearcher *searcher = nullptr;
+    std::shared_ptr<CacheAffinityManager> affinity;
+    std::shared_ptr<Storage> storage;
+};
+
+TEST_F(AffinityRetentionReclaimerTest, NodePressureKeepsLastServingCopyAndEverySpec) {
+    Put(1, {"nodeA"});
+    Put(2, {"nodeA", "nodeB"});
+    Put(3, {"nodeA", "nodeB"});
+    Put(4, {"nodeA", "nodeB"});
+    auto mixed_locations = Locations(3);
+    auto mixed = std::make_shared<CacheLocation>(*mixed_locations.at("loc0"));
+    auto specs = mixed->location_specs();
+    specs.emplace_back("unique", "nfs://retention/3/unique?size=64", "nodeA");
+    mixed->set_location_specs(std::move(specs));
+    mixed->set_spec_size(2);
+    mixed_locations["loc0"] = std::move(mixed);
+    CacheLocationMapVector batch_locations{std::move(mixed_locations)};
+    PropertyMapVector properties(1);
+    ASSERT_EQ(EC_OK, indexer->Put(request_context_.get(), {3}, batch_locations, properties).ec);
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK,
+              searcher->BatchUpdateLocationStatus(request_context_.get(), {4}, {{{"loc1", CLS_WRITING}}}, results));
+
+    EXPECT_TRUE(cache_reclaimer_->TryReclaimOnGroup(request_context_, group).made_progress);
+    Drain();
+    ASSERT_EQ(1u, Locations(1).size());
+    EXPECT_EQ(CLS_SERVING, Locations(1).at("loc0")->status());
+    ASSERT_EQ(1u, Locations(2).size());
+    EXPECT_EQ("nodeB", Locations(2).begin()->second->location_specs().front().node_id());
+    EXPECT_EQ(2u, Locations(3).size()); // The unique component has no replacement.
+    EXPECT_EQ(2u, Locations(4).size()); // WRITING does not protect the serving source.
+    EXPECT_EQ((std::vector<std::string>{"nfs://retention/2/loc0?size=64"}), storage->Deleted());
+}
+
+TEST_F(AffinityRetentionReclaimerTest, NodePressureUsesPolicyHierarchyAndEvictionSwitches) {
+    struct Scenario {
+        const char *process;
+        const char *group;
+        const char *instance;
+        bool disabled;
+        size_t remaining;
+    };
+    const char *keep_two = R"({"type":"local_replica","replica_limits":{"min_retained_replicas":2}})";
+    const char *keep_three = R"({"type":"local_replica","replica_limits":{"min_retained_replicas":3}})";
+    const char *keep_none = R"({"type":"local_replica","replica_limits":{"min_retained_replicas":0}})";
+    const char *local = R"({"type":"local_replica"})";
+    const char *noop = R"({"type":"noop"})";
+    const char *eviction_off = R"({"type":"local_replica","enabled_aspects":{"eviction":false}})";
+    const std::vector<Scenario> scenarios = {
+        {local, "", "", false, 1},
+        {keep_two, "", "", false, 2},
+        {keep_three, keep_two, "", false, 2},
+        {keep_three, keep_two, local, false, 1},
+        {keep_three, keep_two, "invalid", false, 2},
+        {keep_two, "invalid", "", false, 2},
+        {keep_three, keep_two, keep_none, false, 0},
+        {noop, "", "", false, 3},
+        {local, noop, "", false, 3},
+        {keep_three, noop, local, false, 1},
+        {local, "", noop, false, 3},
+        {eviction_off, "", "", false, 3},
+        {local, eviction_off, "", false, 3},
+        {local, eviction_off, local, false, 1},
+        {local, "", eviction_off, false, 3},
+        {local, "", local, true, 3},
+    };
+    for (size_t i = 0; i < scenarios.size(); ++i) {
+        SCOPED_TRACE(i);
+        const auto &scenario = scenarios[i];
+        ASSERT_TRUE(affinity->LoadProcessStrategyFromJsonString(scenario.process));
+        group->set_affinity_strategy_json(scenario.group);
+        info->set_affinity_strategy_json(scenario.instance);
+        affinity->SetGloballyDisabled(scenario.disabled);
+        Put(42, {"nodeA", "nodeA", "nodeA"});
+        const auto deleted_before = storage->Deleted().size();
+        cache_reclaimer_->TryReclaimOnGroup(request_context_, group);
+        Drain();
+        EXPECT_EQ(scenario.remaining, Locations(42).size());
+        EXPECT_EQ(3 - scenario.remaining, storage->Deleted().size() - deleted_before);
+        if (scenario.remaining != 0) {
+            ASSERT_EQ(EC_OK, indexer->Delete(request_context_.get(), {42}).ec);
+        }
+    }
+}
+
+TEST_F(AffinityRetentionReclaimerTest, OverlappingNodeRequestsCannotDeleteAllCopies) {
+    Put(42, {"nodeA", "nodeB"});
+    // Requests are admitted before waiting for either worker. They target
+    // different Locations of the same key and must share the metadata guard.
+    EXPECT_TRUE(cache_reclaimer_->ReclaimByNode(request_context_, info, {"nodeA"}, 0));
+    cache_reclaimer_->ReclaimByNode(request_context_, info, {"nodeB"}, 0);
+    Drain();
+    ASSERT_EQ(1u, Locations(42).size());
+    EXPECT_EQ(CLS_SERVING, Locations(42).begin()->second->status());
+    EXPECT_EQ(1u, storage->Deleted().size());
+}
+
+TEST_F(AffinityRetentionReclaimerTest, QuotaReclaimCanRemoveFinalCopyRegardlessOfAffinity) {
+    const std::vector<std::string> policies = {
+        R"({"type":"local_replica","replica_limits":{"min_retained_replicas":2}})",
+        R"({"type":"noop"})",
+        R"({"type":"local_replica","enabled_aspects":{"eviction":false}})",
+    };
+    CacheReclaimer::WaterLevelExceed pressure;
+    pressure.SetGroupBytesWaterLevelExceed(true);
+    for (bool disabled : {false, true}) {
+        affinity->SetGloballyDisabled(disabled);
+        for (const auto &policy : policies) {
+            SCOPED_TRACE(policy + (disabled ? " global-off" : " global-on"));
+            info->set_affinity_strategy_json(policy);
+            for (bool budgeted : {false, true}) {
+                SCOPED_TRACE(budgeted);
+                Put(42, {"nodeA"});
+                const auto deleted_before = storage->Deleted().size();
+                const bool submitted =
+                    budgeted ? cache_reclaimer_->ReclaimByLRUWithBudget(request_context_, info, pressure, 0, 10, 10)
+                             : cache_reclaimer_->ReclaimByLRU(request_context_, info, pressure, 0);
+                ASSERT_TRUE(submitted);
+                Drain();
+                EXPECT_TRUE(Locations(42).empty());
+                EXPECT_EQ(deleted_before + 1, storage->Deleted().size());
+            }
+        }
+    }
 }

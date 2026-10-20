@@ -17,6 +17,10 @@
 
 namespace kv_cache_manager {
 
+class CacheAffinityManager;
+struct AffinityResolveContext;
+struct ReadSideEffect;
+
 using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk_keys,
                                             const std::vector<std::vector<std::string>> &loc_ids,
                                             const std::vector<std::vector<std::string>> &expected_location_values,
@@ -86,11 +90,17 @@ public:
                           const KeyVector &keys,
                           const BlockMask &input_mask,
                           CacheLocationVector &out_locations,
-                          SelectLocationPolicy *policy) const;
+                          SelectLocationPolicy *policy,
+                          const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                          const AffinityResolveContext *resolve_ctx,
+                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
     ErrorCode BatchGetBestLocation(RequestContext *request_context,
                                    const KeyVector &keys,
                                    CacheLocationVector &out_locations,
-                                   SelectLocationPolicy *policy) const;
+                                   SelectLocationPolicy *policy,
+                                   const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                   const AffinityResolveContext *resolve_ctx,
+                                   std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
     ErrorCode BatchGetBestLocationByBackend(RequestContext *request_context,
                                             const KeyVector &keys,
                                             LocationsPerKey &out_locations,
@@ -102,7 +112,10 @@ public:
                                           const KeyVector &keys,
                                           int32_t sw_size,
                                           CacheLocationVector &out_locations,
-                                          SelectLocationPolicy *policy) const;
+                                          SelectLocationPolicy *policy,
+                                          const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                          const AffinityResolveContext *resolve_ctx,
+                                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
     ErrorCode PrefixMatchByHost(RequestContext *request_context,
                                 const KeyVector &keys,
                                 bool use_eagle_pop,
@@ -130,7 +143,8 @@ public:
     ErrorCode BatchAddLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
-                               std::vector<AddLocationResult> &out_results);
+                               std::vector<AddLocationResult> &out_results,
+                               const ReplicaLimits &limits = {});
     struct AddLocationRollbackPlan {
         // Confirmed-successful items (EC_OK + non-empty location id). The
         // caller submits these to the standard location delete pipeline.
@@ -332,6 +346,10 @@ public:
                                      const std::vector<std::vector<LocationCASTask>> &batch_tasks,
                                      std::vector<std::vector<ErrorCode>> &out_batch_results,
                                      bool refresh_cache_from_persistent = false);
+    ErrorCode BatchMarkDeletingWithRetention(RequestContext *request_context, const KeyVector &keys,
+        const std::vector<std::vector<LocationCASTask>> &tasks, uint32_t minimum,
+        std::vector<std::vector<ErrorCode>> &out_results);
+
     struct LocationCADTask {
         std::string location_id;
         CacheLocationStatus expect_status;
@@ -392,7 +410,10 @@ private:
     ErrorCode PrefixMatchBestLocationImpl(RequestContext *request_context,
                                           const KeyVector &keys,
                                           CacheLocationVector &out_locations,
-                                          SelectLocationPolicy *policy) const;
+                                          SelectLocationPolicy *policy,
+                                          const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                          const AffinityResolveContext *resolve_ctx,
+                                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
 
     std::shared_ptr<MetaIndexer> meta_indexer_;
     CheckLocDataExistFunc check_loc_data_exist_func_;

@@ -16,6 +16,9 @@
 #include <tuple>
 #include <type_traits>
 
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
+#include "kv_cache_manager/affinity/local_replica_strategy.h"
+#include "kv_cache_manager/affinity/noop_strategy.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_info.h"
@@ -2922,8 +2925,11 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
         // 改成serving之前match不到
         CacheLocationVector out_locations;
         BlockMask mask; // 空mask，不跳过任何元素
+        std::shared_ptr<CacheAffinityManager> affinity_manager;
+        std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
 
-        ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out_locations, &policy_);
+        ec = meta_searcher_->PrefixMatch(
+            request_context_.get(), keys, mask, out_locations, &policy_, affinity_manager, nullptr, side_effects);
         EXPECT_EQ(ec, ErrorCode::EC_OK);
         EXPECT_EQ(out_locations.size(), 0);
     }
@@ -2961,8 +2967,17 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
         // 测试PrefixMatch
         CacheLocationVector out_locations;
         BlockMask mask; // 空mask，不跳过任何元素
+        std::shared_ptr<CacheAffinityManager> affinity_manager;
+        std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
 
-        ec = meta_searcher_->PrefixMatch(request_context_.get(), test_data.keys, mask, out_locations, &policy_);
+        ec = meta_searcher_->PrefixMatch(request_context_.get(),
+                                         test_data.keys,
+                                         mask,
+                                         out_locations,
+                                         &policy_,
+                                         affinity_manager,
+                                         nullptr,
+                                         side_effects);
 
         // 验证结果
         EXPECT_EQ(ec, ErrorCode::EC_OK);
@@ -2982,7 +2997,10 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
     for (auto &block_mask : mask_vectors) {
         CacheLocationVector out_locations;
         out_locations.clear();
-        ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, block_mask, out_locations, &policy_);
+        std::shared_ptr<CacheAffinityManager> affinity_manager;
+        std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+        ec = meta_searcher_->PrefixMatch(
+            request_context_.get(), keys, block_mask, out_locations, &policy_, affinity_manager, nullptr, side_effects);
 
         // 验证结果 - 应该只返回后两个元素
         EXPECT_EQ(ec, ErrorCode::EC_OK);
@@ -3700,7 +3718,10 @@ TEST_F(MetaSearcherTest, TestBatchVsSequentialPerformance) {
     for (size_t i = 0; i <= 100; ++i) {
         CacheLocationVector out_locations;
         BlockMask mask; // 空mask，不跳过任何元素
-        ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out_locations, &policy_);
+        std::shared_ptr<CacheAffinityManager> affinity_manager;
+        std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+        ec = meta_searcher_->PrefixMatch(
+            request_context_.get(), keys, mask, out_locations, &policy_, affinity_manager, nullptr, side_effects);
         EXPECT_EQ(ec, ErrorCode::EC_OK);
         EXPECT_EQ(out_locations.size(), num_keys);
     }
@@ -3713,10 +3734,19 @@ TEST_F(MetaSearcherTest, TestBatchVsSequentialPerformance) {
     for (size_t i = 0; i <= 100; ++i) {
         CacheLocationVector out_locations;
         BlockMask mask;
+        std::shared_ptr<CacheAffinityManager> affinity_manager;
+        std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
         ErrorCode result_ec = ErrorCode::EC_OK;
         for (size_t j = 0; j < keys.size(); ++j) {
             MetaSearcher::KeyVector single_key = {keys[j]};
-            result_ec = meta_searcher_->PrefixMatch(request_context_.get(), single_key, mask, out_locations, &policy_);
+            result_ec = meta_searcher_->PrefixMatch(request_context_.get(),
+                                                    single_key,
+                                                    mask,
+                                                    out_locations,
+                                                    &policy_,
+                                                    affinity_manager,
+                                                    nullptr,
+                                                    side_effects);
             if (result_ec != ErrorCode::EC_OK) {
                 break;
             }
@@ -4271,7 +4301,10 @@ TEST_F(MetaSearcherTest, TestPrefixMatchMergesSpecsByStorageType) {
     // PrefixMatch should merge specs from all same-type locations
     CacheLocationVector out_locations;
     BlockMask mask;
-    ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out_locations, &policy_);
+    std::shared_ptr<CacheAffinityManager> affinity_manager;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+    ec = meta_searcher_->PrefixMatch(
+        request_context_.get(), keys, mask, out_locations, &policy_, affinity_manager, nullptr, side_effects);
     ASSERT_EQ(ec, ErrorCode::EC_OK);
     ASSERT_EQ(out_locations.size(), 3);
 
@@ -4337,7 +4370,10 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
 
     // BatchGetBestLocation
     CacheLocationVector out_locations;
-    ErrorCode ec = meta_searcher_->BatchGetBestLocation(request_context_.get(), keys, out_locations, &policy_);
+    std::shared_ptr<CacheAffinityManager> affinity_manager;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+    ErrorCode ec = meta_searcher_->BatchGetBestLocation(
+        request_context_.get(), keys, out_locations, &policy_, affinity_manager, nullptr, side_effects);
     ASSERT_EQ(ec, ErrorCode::EC_OK);
     ASSERT_EQ(out_locations.size(), 2);
 
@@ -5109,4 +5145,208 @@ TEST_F(BatchGetBestLocationByBackendTest, NoLocationsAtAll) {
     ASSERT_EQ(ec, ErrorCode::EC_OK);
     ASSERT_EQ(out.size(), 1);
     EXPECT_TRUE(out[0].empty());
+}
+
+// When caller_node_id is set, merge step prefers the local spec among
+// same-name candidates. Without caller_node_id (old client) it degrades
+// to first-seen insertion order (non-deterministic, not asserted here).
+TEST_F(MetaSearcherTest, LocalReplicaSpecAtMergeStep) {
+    MetaSearcher::KeyVector keys = {70001};
+
+    // 两个 mempool location 各自有同名 spec "tp0"，但一个在 node_local，
+    // 一个在 node_remote。caller 传 node_local → 期望 merge 后 spec 来自本地。
+    LocationSpec local_spec("tp0", "pace://cluster/local", "node_local");
+    LocationSpec remote_spec("tp0", "pace://cluster/remote", "node_remote");
+
+    CacheLocationConstPtr loc_local =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {local_spec});
+    CacheLocationConstPtr loc_remote =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {remote_spec});
+
+    std::vector<MetaSearcher::AddLocationResult> ids_local;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_local}, ids_local));
+    std::vector<MetaSearcher::AddLocationResult> ids_remote;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_remote}, ids_remote));
+
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks = {{
+        {ids_local[0].location_id, CLS_SERVING},
+        {ids_remote[0].location_id, CLS_SERVING},
+    }};
+    std::vector<std::vector<ErrorCode>> upd;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, upd));
+
+    // 模拟 caller 在 node_local 上
+    request_context_->set_caller_node_id("node_local");
+
+    CacheLocationVector out;
+    BlockMask mask;
+    std::shared_ptr<CacheAffinityManager> affinity_manager;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatch(
+                  request_context_.get(), keys, mask, out, &policy_, affinity_manager, nullptr, side_effects));
+    ASSERT_EQ(1u, out.size());
+    ASSERT_EQ(1u, out[0]->location_specs().size());
+    EXPECT_EQ("node_local", out[0]->location_specs()[0].node_id())
+        << "merge step must prefer local spec when caller_node_id matches";
+}
+
+// With LocalReplicaStrategy, read path goes through PickReadSpec
+TEST_F(MetaSearcherTest, ReadSelectionViaStrategyPicksLocal) {
+    MetaSearcher::KeyVector keys = {70010};
+
+    LocationSpec local("tp0", "uri_a", "node_local");
+    LocationSpec remote("tp0", "uri_b", "node_remote");
+    CacheLocationConstPtr loc_local =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {local});
+    CacheLocationConstPtr loc_remote =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {remote});
+
+    std::vector<MetaSearcher::AddLocationResult> ids_local;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_local}, ids_local));
+    std::vector<MetaSearcher::AddLocationResult> ids_remote;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_remote}, ids_remote));
+
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks = {{
+        {ids_local[0].location_id, CLS_SERVING},
+        {ids_remote[0].location_id, CLS_SERVING},
+    }};
+    std::vector<std::vector<ErrorCode>> upd;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, upd));
+
+    request_context_->set_caller_node_id("node_local");
+
+    auto mgr = std::make_shared<CacheAffinityManager>();
+    mgr->LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})");
+    AffinityResolveContext resolve_ctx;
+    resolve_ctx.caller_node.node_id = "node_local";
+
+    CacheLocationVector out;
+    BlockMask mask;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatch(
+                  request_context_.get(), keys, mask, out, &policy_, mgr, &resolve_ctx, side_effects));
+    ASSERT_EQ(1u, out.size());
+    ASSERT_EQ(1u, out[0]->location_specs().size());
+    EXPECT_EQ("node_local", out[0]->location_specs()[0].node_id());
+}
+
+// Noop strategy: IsReadEnabled=false, degrades to first-seen insertion
+// (no local-preference even if caller_node_id is set).
+TEST_F(MetaSearcherTest, ReadSelectionWithNoopStrategyDegradesToFirstSeen) {
+    MetaSearcher::KeyVector keys = {70020};
+
+    LocationSpec local("tp0", "uri_a", "node_local");
+    LocationSpec remote("tp0", "uri_b", "node_remote");
+    CacheLocationConstPtr loc_local =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {local});
+    CacheLocationConstPtr loc_remote =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {remote});
+
+    std::vector<MetaSearcher::AddLocationResult> ids_local;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_local}, ids_local));
+    std::vector<MetaSearcher::AddLocationResult> ids_remote;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_remote}, ids_remote));
+
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks = {{
+        {ids_local[0].location_id, CLS_SERVING},
+        {ids_remote[0].location_id, CLS_SERVING},
+    }};
+    std::vector<std::vector<ErrorCode>> upd;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, upd));
+
+    request_context_->set_caller_node_id("node_local");
+
+    auto mgr = std::make_shared<CacheAffinityManager>();
+    mgr->LoadProcessStrategyFromJsonString(R"({"type":"noop"})");
+    AffinityResolveContext resolve_ctx;
+    resolve_ctx.caller_node.node_id = "node_local";
+
+    CacheLocationVector out;
+    BlockMask mask;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatch(
+                  request_context_.get(), keys, mask, out, &policy_, mgr, &resolve_ctx, side_effects));
+    ASSERT_EQ(1u, out.size());
+    ASSERT_EQ(1u, out[0]->location_specs().size());
+    // Noop: IsReadEnabled=false, ResolveRead returns empty picked_specs,
+    // degrades to candidates.front(), no local vs remote distinction.
+    const std::string &nid = out[0]->location_specs()[0].node_id();
+    EXPECT_TRUE(nid == "node_local" || nid == "node_remote");
+}
+
+TEST_F(MetaSearcherTest, ReplicaAdmissionSerializesCapacityAndCountsWritingReservations) {
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+        1, {LocationSpec("tp0", "tair_mempool://store/x?size=64", "a")});
+    ReplicaLimits limits;
+    limits.max_replicas_per_key = 2;
+    limits.max_instance_bytes = 128;
+    auto add = [&](int64_t key) {
+        RequestContext ctx("concurrent_budget");
+        std::vector<MetaSearcher::AddLocationResult> results;
+        return meta_searcher_->BatchAddLocation(&ctx, {key}, {location}, results, limits);
+    };
+    std::vector<std::future<ErrorCode>> calls;
+    for (int i = 0; i < 8; ++i) calls.push_back(std::async(std::launch::async, add, 88001));
+    int accepted = 0;
+    for (auto &call : calls) if (call.get() == EC_OK) ++accepted;
+    EXPECT_EQ(2, accepted);
+    EXPECT_EQ(128u, meta_indexer_->GetStorageUsage());
+    EXPECT_NE(EC_OK, add(88002)); // Instance budget spans keys, including WRITING.
+    limits.max_instance_bytes = 0;
+    EXPECT_NE(EC_OK, add(88001)); // Per-key budget remains enforced.
+    EXPECT_EQ(EC_OK, add(88002));
+}
+
+TEST_F(MetaSearcherTest, NodeEvictionRevalidatesMinimumPerSpecWithConcurrentDeletes) {
+    const int64_t key = 88003;
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+        2, {LocationSpec("tp0", "tair_mempool://store/x?size=64", "a"),
+            LocationSpec("tp1", "tair_mempool://store/y?size=32", "a")});
+    std::vector<std::string> ids;
+    for (int i = 0; i < 3; ++i) {
+        std::vector<MetaSearcher::AddLocationResult> results;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {key}, {location}, results));
+        ids.push_back(results[0].location_id);
+    }
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {key},
+        {{{ids[0], CLS_SERVING}, {ids[1], CLS_SERVING}, {ids[2], CLS_SERVING}}}, results));
+    auto remove = [&](const std::string &id) {
+        RequestContext ctx("retained_replica");
+        std::vector<std::vector<ErrorCode>> ecs;
+        meta_searcher_->BatchMarkDeletingWithRetention(&ctx, {key}, {{{id, CLS_SERVING, CLS_DELETING}}}, 2, ecs);
+        return ecs.size() == 1 && ecs[0].size() == 1 && ecs[0][0] == EC_OK;
+    };
+    auto a = std::async(std::launch::async, remove, ids[0]);
+    auto b = std::async(std::launch::async, remove, ids[1]);
+    EXPECT_EQ(1, static_cast<int>(a.get()) + static_cast<int>(b.get()));
+    EXPECT_FALSE(remove(ids[2]));
+    CacheLocationMapVector maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, BlockMask{}, maps));
+    int serving = 0;
+    for (const auto &entry : maps[0]) if (entry.second->status() == CLS_SERVING) ++serving;
+    EXPECT_EQ(2, serving);
+}
+
+TEST_F(MetaSearcherTest, ReplicaAdmissionRejectsDuplicateBatchKeysBeforeMutation) {
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+        1, {LocationSpec("tp0", "tair_mempool://store/x?size=64", "a")});
+    ReplicaLimits limits;
+    limits.max_replicas_per_key = 1;
+    std::vector<MetaSearcher::AddLocationResult> results;
+    EXPECT_EQ(EC_BADARGS, meta_searcher_->BatchAddLocation(request_context_.get(), {88004, 88004},
+        {location, location}, results, limits));
+    ASSERT_EQ(2u, results.size());
+    for (const auto &result : results) {
+        EXPECT_EQ(EC_BADARGS, result.ec);
+        EXPECT_TRUE(result.location_id.empty());
+    }
+    EXPECT_EQ(0u, meta_indexer_->GetStorageUsage());
+    EXPECT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {88004}, {location}, results, limits));
+    EXPECT_EQ(64u, meta_indexer_->GetStorageUsage());
+    EXPECT_NE(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), {88004}, {location}, results, limits));
+    EXPECT_EQ(64u, meta_indexer_->GetStorageUsage());
 }

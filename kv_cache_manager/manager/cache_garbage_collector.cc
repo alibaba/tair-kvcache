@@ -45,6 +45,7 @@ namespace {
 constexpr const char *kDeleteResultMetricName = "cache_gc.delete_result_count";
 constexpr const char *kOperationErrorMetricName = "cache_gc.operation_error_count";
 constexpr const char *kOrphanWritingReason = "orphan_writing";
+constexpr const char *kDeletingRetryReason = "deleting_retry";
 constexpr const char *kStorageMissingReason = "storage_missing";
 constexpr const char *kEventReportStaleSnapshotReason = "event_report_stale_snapshot";
 constexpr const char *kEventReportDownHostReason = "event_report_down_host";
@@ -60,6 +61,7 @@ using CandidateKey = std::pair<KeyType, std::string>;
 using StorageProbeKey = std::tuple<std::string, DataStorageType>;
 
 enum class CandidateReason {
+    kDeletingRetry,
     kOrphanWriting,
     kStorageMissing,
     kEventReportStaleSnapshot,
@@ -69,6 +71,8 @@ enum class CandidateReason {
 
 const char *CandidateReasonName(CandidateReason reason) {
     switch (reason) {
+    case CandidateReason::kDeletingRetry:
+        return kDeletingRetryReason;
     case CandidateReason::kOrphanWriting:
         return kOrphanWritingReason;
     case CandidateReason::kStorageMissing:
@@ -85,6 +89,8 @@ const char *CandidateReasonName(CandidateReason reason) {
 
 int CandidatePriority(CandidateReason reason) {
     switch (reason) {
+    case CandidateReason::kDeletingRetry:
+        return 0;
     case CandidateReason::kOrphanWriting:
         return 0;
     case CandidateReason::kStorageMissing:
@@ -923,6 +929,31 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
             }
 
             const CandidateKey candidate_key{batch.keys[i], location_id};
+            if (location->status() == CLS_DELETING) {
+                // A failed or interrupted delete may already have freed part
+                // of the allocation. Reusable addresses (notably PACE GAs)
+                // cannot be replayed without an allocation generation fence.
+                if (!IsEventReportStorageType(location->type()) &&
+                    std::any_of(location->location_specs().begin(),
+                                location->location_specs().end(),
+                                [&](const LocationSpec &spec) {
+                                    const DataStorageUri uri(spec.uri());
+                                    const auto backend =
+                                        uri.Valid() && data_storage_manager_
+                                            ? data_storage_manager_->GetDataStorageBackend(uri.GetHostName())
+                                            : nullptr;
+                                    return !backend || !backend->SupportsDeleteRetry();
+                                })) {
+                    RecordCandidateDropped(kDeletingRetryReason, "unsafe_backend_retry", 1);
+                    continue;
+                }
+                // The executor persists this state before touching data. A
+                // failed/interrupted delete remains discoverable after restart.
+                candidates.emplace(candidate_key,
+                                   DeleteCandidate{.expected_location_value = location->ToJsonString(),
+                                                   .reason = CandidateReason::kDeletingRetry});
+                continue;
+            }
             if (IsOrphanWriting(location_id, *location, now_us)) {
                 if (migration_manager_ &&
                     migration_manager_->HasActiveCopyTargetLocation(instance_id, batch.keys[i], location_id)) {

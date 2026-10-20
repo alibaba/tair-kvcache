@@ -1,10 +1,14 @@
 #pragma once
 
+#include <functional>
+#include <memory>
+
 #include "kv_cache_manager/client/include/manager_client.h"
 
 namespace kv_cache_manager {
 class MetaClient;
 class TransferClient;
+class ReplicationExecutor;
 class ManagerClientImpl : public ManagerClient {
 public:
     ManagerClientImpl();
@@ -16,7 +20,8 @@ public:
                                                         const std::vector<int64_t> &tokens,
                                                         const BlockMask &block_mask,
                                                         int32_t sw_size,
-                                                        const std::vector<std::string> &location_spec_names) override;
+                                                        const std::vector<std::string> &location_spec_names,
+                                                        std::vector<ClientReplicationHint> &out_hints) override;
 
     std::pair<ClientErrorCode, WriteLocation> StartWrite(const std::string &trace_id,
                                                          const std::vector<int64_t> &keys,
@@ -39,10 +44,28 @@ public:
                                 const std::vector<int64_t> &tokens,
                                 const BlockMask &block_mask) override;
 
+    void ReplicateWithData(const ClientReplicationHint &hint,
+                           const void *data,
+                           size_t size,
+                           std::function<void()> release_fn) override;
+    bool ReplicateWithDataAsync(const ClientReplicationHint &hint,
+                                const void *data,
+                                size_t size,
+                                std::function<void()> release_fn,
+                                ReplicationResultCallback result_fn) override;
+
     ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) override;
 
     std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                        const BlockBuffers &block_buffers) override;
+
+    std::string GetCallerNode() const override;
+    ReplicationStats GetReplicationStats() const override;
+    bool ReplicateWithBuffers(const ClientReplicationHint &hint,
+                               std::vector<ClientReplicationBuffer> buffers) override;
+    bool ReplicateWithBuffersAsync(const ClientReplicationHint &hint,
+                                   std::vector<ClientReplicationBuffer> buffers,
+                                   ReplicationResultCallback result_fn) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, InitParams &init_params) override;
@@ -55,5 +78,7 @@ private:
     friend class ManagerClient;
     std::unique_ptr<MetaClient> meta_client_;
     std::unique_ptr<TransferClient> transfer_client_;
+    std::unique_ptr<ReplicationExecutor> replication_executor_;
+    bool auto_replicate_ = false;
 };
 } // namespace kv_cache_manager

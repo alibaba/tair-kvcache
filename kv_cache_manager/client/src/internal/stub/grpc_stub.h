@@ -36,15 +36,16 @@ public:
                                                    const BlockMask &block_mask,
                                                    int32_t detail_level) override;
 
-    std::pair<ClientErrorCode, Locations>
-    GetCacheLocation(const std::string &trace_id,
-                     const std::string &instance_id,
-                     QueryType query_type,
-                     const KeyVector &keys,
-                     const TokenIdsVector &tokens,
-                     const BlockMask &block_mask,
-                     int32_t sw_size,
-                     const std::vector<std::string> &location_spec_names) override;
+    std::pair<ClientErrorCode, Locations> GetCacheLocation(const std::string &trace_id,
+                                                           const std::string &instance_id,
+                                                           QueryType query_type,
+                                                           const KeyVector &keys,
+                                                           const TokenIdsVector &tokens,
+                                                           const BlockMask &block_mask,
+                                                           int32_t sw_size,
+                                                           const std::vector<std::string> &location_spec_names,
+                                                           const ClientCallerNode &caller,
+                                                           std::vector<ClientReplicationHint> &out_hints) override;
 
     std::pair<ClientErrorCode, int64_t> GetCacheLocationLen(const std::string &trace_id,
                                                             const std::string &instance_id,
@@ -59,7 +60,26 @@ public:
                                                               const TokenIdsVector &tokens,
                                                               const std::vector<std::string> &location_spec_group_names,
                                                               int64_t write_timeout_seconds,
+                                                              const ClientCallerNode &caller,
                                                               int32_t min_replica_count = 0) override;
+    std::pair<ClientErrorCode, WriteLocation>
+    StartReplicationWriteCache(const std::string &trace_id,
+                               const std::string &instance_id,
+                               const KeyVector &keys,
+                               const std::vector<std::string> &location_spec_group_names,
+                               int64_t write_timeout_seconds,
+                               const ClientCallerNode &caller,
+                               const std::string &target_node_id) override;
+
+    ClientErrorCode ReplicateCache(const std::string &trace_id,
+                                   const std::string &instance_id,
+                                   const ClientReplicationHint &hint,
+                                   int32_t write_timeout_seconds) override;
+    std::vector<ClientReplicationRpcResult>
+    ReplicateCaches(const std::string &trace_id,
+                    const std::string &instance_id,
+                    const std::vector<ClientReplicationHint> &hints,
+                    int32_t write_timeout_seconds) override;
 
     ClientErrorCode FinishWriteCache(const std::string &trace_id,
                                      const std::string &instance_id,

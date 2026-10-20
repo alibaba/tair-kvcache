@@ -144,6 +144,7 @@ public:
         ++policy_queries;
         return skip_missing_;
     }
+    bool SupportsDeleteRetry() const override { return supports_delete_retry; }
     bool Available() override { return true; }
     double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
     const StorageConfig &GetStorageConfig() override { return config_; }
@@ -170,6 +171,7 @@ public:
             const auto it = delete_results_by_uri.find(uri.ToUriString());
             results.push_back(it == delete_results_by_uri.end() ? delete_result : it->second);
         }
+        results.resize(std::min(results.size(), result_limit));
         return results;
     }
     std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
@@ -186,7 +188,9 @@ public:
     mutable size_t policy_queries{0};
     ErrorCode delete_result{EC_OK};
     bool throw_on_delete{false};
+    bool supports_delete_retry{true};
     bool short_result{false};
+    size_t result_limit{std::numeric_limits<size_t>::max()};
     std::function<void()> on_delete;
     std::map<std::string, ErrorCode> delete_results_by_uri;
     std::vector<std::vector<DataStorageUri>> delete_batches;
@@ -521,6 +525,59 @@ TEST_F(BackendGcDeleteTest, FinalCadKeepsLocationRefreshedDuringBackendDelete) {
     EXPECT_EQ(13u, indexer->GetStorageUsage());
 }
 
+TEST_F(BackendGcDeleteTest, FinalDeleteChecksCompleteValueWhenReplacementIsAlsoDeleting) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("storage", type);
+    const std::string old_uri = "dummy://storage/old?size=5";
+    const std::string replacement = "dummy://storage/new?size=13";
+    SetLocation(100, "target", type, {old_uri});
+    backend->on_delete = [&] {
+        SetLocation(100, "target", type, {replacement});
+        std::vector<std::vector<ErrorCode>> results;
+        EXPECT_EQ(EC_OK, searcher->BatchUpdateLocationStatus(&context, {100}, {{{"target", CLS_DELETING}}}, results));
+    };
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Request(100, {"target"}, {})).status);
+    ASSERT_EQ(1u, Locations(100).size());
+    EXPECT_EQ(CLS_DELETING, Locations(100).at("target")->status());
+    EXPECT_EQ(replacement, Locations(100).at("target")->location_specs().front().uri());
+    EXPECT_EQ(13u, indexer->GetStorageUsage());
+    backend->on_delete = {};
+    EXPECT_EQ(EC_OK, Run(Request(100, {"target"}, {})).status);
+    EXPECT_TRUE(Locations(100).empty());
+    EXPECT_EQ((std::vector<std::string>{old_uri, replacement}), DeletedUris(*backend));
+}
+
+TEST_F(BackendGcDeleteTest, PreparedDeleteCannotDeleteAReplacementWithTheSameIdAndStatus) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("storage", type);
+    const std::string old_uri = "dummy://storage/old?size=5";
+    const std::string replacement = "dummy://storage/new?size=13";
+    for (int mode = 0; mode < 3; ++mode) {
+        const int64_t key = 100 + mode;
+        SetLocation(key, "target", type, {old_uri});
+        auto request = Request(key, {"target"}, {});
+        if (mode == 1) {
+            request.expected_location_values.clear();
+            request.authoritative_read = false;
+        }
+        const auto admission = mode == 2 ? executor->PrepareDeleteTask(CacheMetaDelRequest{kTestInstanceName, {key}})
+                                         : executor->PrepareDeleteTask(request);
+        ASSERT_TRUE(admission.needs_physical_delete);
+        ASSERT_EQ(1u, admission.actual_task.expected_location_values.size());
+        EXPECT_EQ(Locations(key).at("target")->ToJsonString(), admission.actual_task.expected_location_values[0][0]);
+
+        SetLocation(key, "target", type, {replacement});
+        std::vector<std::vector<ErrorCode>> results;
+        ASSERT_EQ(EC_OK, searcher->BatchUpdateLocationStatus(&context, {key}, {{{"target", CLS_DELETING}}}, results));
+        EXPECT_EQ(EC_OK, executor->DoLocationDelTask(admission.actual_task, admission.delete_lease).status);
+        EXPECT_TRUE(backend->delete_batches.empty());
+        EXPECT_EQ(replacement, Locations(key).at("target")->location_specs().front().uri());
+    }
+    EXPECT_EQ(39u, indexer->GetStorageUsage());
+    EXPECT_EQ(EC_OK, Run(Request(100, {"target"}, {})).status);
+    EXPECT_EQ((std::vector<std::string>{replacement}), DeletedUris(*backend));
+}
+
 TEST_F(BackendGcDeleteTest, DeleteResultsPreserveExistingMetadataUsageAndLogContracts) {
     const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
     Stub log_stub;
@@ -539,6 +596,15 @@ TEST_F(BackendGcDeleteTest, DeleteResultsPreserveExistingMetadataUsageAndLogCont
         EXPECT_EQ(failed, result.error_logged);
         EXPECT_EQ(failed ? 1u : 0u, physical_delete_warnings.size());
         EXPECT_EQ((std::vector<std::string>{uri}), DeletedUris(*backend));
+        if (failed) {
+            ASSERT_EQ(1u, Locations(key).size());
+            EXPECT_EQ(CLS_DELETING, Locations(key).at("target")->status());
+            EXPECT_EQ(5u, indexer->GetStorageUsage());
+            backend->delete_result = EC_NOENT;
+            const auto retried = Run(Request(key, {"target"}, {}));
+            EXPECT_EQ(EC_OK, retried.status);
+            EXPECT_TRUE(retried.deleted_bytes_by_node.empty());
+        }
         EXPECT_TRUE(Locations(key).empty());
         EXPECT_EQ(0u, indexer->GetStorageUsage());
         ++key;
@@ -549,6 +615,10 @@ TEST_F(BackendGcDeleteTest, DeleteResultsPreserveExistingMetadataUsageAndLogCont
     SetLocation(200, "target", type, {uri});
     backend->short_result = true;
     EXPECT_EQ(EC_PARTIAL_OK, Run(Request(200, {"target"}, {uri})).status);
+    EXPECT_EQ(CLS_DELETING, Locations(200).at("target")->status());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+    backend->short_result = false;
+    EXPECT_EQ(EC_OK, Run(Request(200, {"target"}, {})).status);
     EXPECT_TRUE(Locations(200).empty());
     EXPECT_EQ(0u, indexer->GetStorageUsage());
 
@@ -559,6 +629,209 @@ TEST_F(BackendGcDeleteTest, DeleteResultsPreserveExistingMetadataUsageAndLogCont
     EXPECT_FALSE(result.error_logged);
     EXPECT_EQ(CLS_DELETING, Locations(201).at("target")->status());
     EXPECT_EQ(5u, indexer->GetStorageUsage());
+    backend->throw_on_delete = false;
+    EXPECT_EQ(EC_OK, Run(Request(201, {"target"}, {})).status);
+    EXPECT_TRUE(Locations(201).empty());
+}
+
+TEST_F(BackendGcDeleteTest, PartialDeleteKeepsFullTombstoneAndCleansIndependentLocations) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("storage", type);
+    const std::string done = "dummy://storage/done?size=5";
+    const std::string failed = "dummy://storage/failed?size=7";
+    const std::string sibling = "dummy://storage/sibling?size=11";
+    SetLocation(100, "partial", type, {done, failed});
+    SetLocation(100, "complete", type, {sibling});
+    backend->delete_results_by_uri[failed] = EC_TIMEOUT;
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Request(100, {"partial", "complete"}, {})).status);
+    const auto left = Locations(100);
+    ASSERT_EQ(1u, left.size());
+    ASSERT_EQ(2u, left.at("partial")->location_specs().size());
+    EXPECT_EQ(CLS_DELETING, left.at("partial")->status());
+    EXPECT_EQ(12u, indexer->GetStorageUsage());
+
+    // An ordinary duplicate is not a GC retry and must not resubmit DELETING.
+    EXPECT_EQ(EC_OK,
+              executor
+                  ->Submit(CacheLocationDelRequest{
+                      .instance_id = kTestInstanceName, .block_keys = {100}, .location_ids = {{"partial"}}})
+                  .get()
+                  .status);
+    EXPECT_EQ(1u, backend->delete_batches.size());
+    backend->delete_results_by_uri[done] = EC_NOENT;
+    backend->delete_results_by_uri[failed] = EC_OK;
+    EXPECT_EQ(EC_OK, Run(Request(100, {"partial"}, {})).status);
+    EXPECT_TRUE(Locations(100).empty());
+    EXPECT_EQ(0u, indexer->GetStorageUsage());
+}
+
+TEST_F(BackendGcDeleteTest, ShortDeleteResultsRetainUnknownTargetsAndExceptionsDoNotBlockOtherBackends) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto first = AddBackend("a_storage", type);
+    auto second = AddBackend("b_storage", type);
+    SetLocation(100, "known", type, {"dummy://a_storage/known?size=3"});
+    SetLocation(100, "unknown", type, {"dummy://a_storage/unknown?size=5"});
+    first->result_limit = 1;
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Request(100, {"known", "unknown"}, {})).status);
+    ASSERT_EQ(1u, Locations(100).size());
+    EXPECT_EQ(CLS_DELETING, Locations(100).at("unknown")->status());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+
+    SetLocation(100, "independent", type, {"dummy://b_storage/independent?size=7"});
+    first->throw_on_delete = true;
+    const auto failed = Run(Request(100, {"unknown", "independent"}, {}));
+    EXPECT_EQ(EC_ERROR, failed.status);
+    EXPECT_FALSE(failed.error_logged);
+    ASSERT_EQ(1u, Locations(100).size());
+    EXPECT_EQ(CLS_DELETING, Locations(100).at("unknown")->status());
+    EXPECT_EQ(1u, second->delete_batches.size());
+    first->throw_on_delete = false;
+    EXPECT_EQ(EC_OK, Run(Request(100, {"unknown"}, {})).status);
+    EXPECT_TRUE(Locations(100).empty());
+    EXPECT_TRUE(executor->active_location_deletes_.empty());
+}
+
+TEST_F(BackendGcDeleteTest, GcRetryCannotReenterAnActivePhysicalDelete) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("storage", type);
+    SetLocation(100, "target", type, {"dummy://storage/one?size=5"});
+    backend->on_delete = [&] {
+        // Reproduce GC observing a durable tombstone while the first worker
+        // is inside the backend. Its admitted task must not delete it twice.
+        const auto duplicate = executor->DoLocationDelTask(Request(100, {"target"}, {}));
+        EXPECT_EQ(EC_OK, duplicate.status);
+        EXPECT_TRUE(duplicate.deleted_bytes_by_node.empty());
+    };
+    EXPECT_EQ(EC_OK, Run(Request(100, {"target"}, {})).status);
+    EXPECT_EQ(1u, backend->delete_batches.size());
+    EXPECT_TRUE(Locations(100).empty());
+    EXPECT_TRUE(executor->active_location_deletes_.empty());
+}
+
+TEST_F(BackendGcDeleteTest, GcRetryPreservesQueuedDelayAndCanRecoverAfterCancellation) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("storage", type);
+    for (int mode = 0; mode < 4; ++mode) {
+        SCOPED_TRACE(mode);
+        const int64_t key = 200 + mode;
+        SetLocation(key, "target", type, {"dummy://storage/" + std::to_string(key) + "?size=5"});
+        CacheLocationDelRequest location_request{kTestInstanceName, {key}, {{"target"}}, std::chrono::hours(1)};
+        CacheMetaDelRequest meta_request{kTestInstanceName, {key}, std::chrono::hours(1)};
+        std::future<PlanExecuteResult> delayed;
+        if (mode == 0)
+            delayed = executor->Submit(location_request);
+        if (mode == 1)
+            delayed = executor->Submit(meta_request);
+        if (mode >= 2) {
+            auto submitted = mode == 2 ? executor->SubmitAsync(location_request) : executor->SubmitAsync(meta_request);
+            ASSERT_TRUE(submitted.accepted);
+            delayed = std::move(submitted.future);
+        }
+        // The sole worker completes admission before this lower-priority barrier.
+        std::promise<void> admitted;
+        ASSERT_TRUE(executor->SubmitTask([&] { admitted.set_value(); }));
+        ASSERT_EQ(std::future_status::ready, admitted.get_future().wait_for(std::chrono::seconds(1)));
+        ASSERT_EQ(CLS_DELETING, Locations(key).at("target")->status());
+
+        const auto delete_count = backend->delete_batches.size();
+        EXPECT_EQ(EC_OK, Run(Request(key, {"target"}, {})).status);
+        EXPECT_EQ(delete_count, backend->delete_batches.size());
+        EXPECT_EQ(std::future_status::timeout, delayed.wait_for(std::chrono::milliseconds(0)));
+
+        executor->Stop();
+        ASSERT_EQ(std::future_status::ready, delayed.wait_for(std::chrono::seconds(1)));
+        EXPECT_EQ(EC_ERROR, delayed.get().status);
+        EXPECT_TRUE(executor->active_location_deletes_.empty());
+        executor = std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_);
+        EXPECT_EQ(EC_OK, Run(Request(key, {"target"}, {})).status);
+        EXPECT_EQ(delete_count + 1, backend->delete_batches.size());
+        EXPECT_TRUE(Locations(key).empty());
+    }
+}
+
+TEST_F(BackendGcDeleteTest, UnknownDeleteCannotRetryAReusableAddressAfterRestart) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    auto backend = AddBackend("pace", type);
+    backend->supports_delete_retry = false;
+    backend->delete_result = EC_TIMEOUT;
+    const std::string uri = "pace://pace/123?size=5";
+    SetLocation(100, "target", type, {uri});
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Request(100, {"target"}, {})).status);
+    ASSERT_EQ(1u, backend->delete_batches.size());
+    const auto tombstone = Locations(100).at("target")->ToJsonString();
+
+    // The first Free may have succeeded and the same GA may now name new data.
+    executor = std::make_unique<SchedulePlanExecutor>(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    backend->delete_result = EC_OK;
+    EXPECT_EQ(EC_OK, Run(Request(100, {"target"}, {uri})).status);
+    EXPECT_EQ(1u, backend->delete_batches.size());
+    EXPECT_EQ(tombstone, Locations(100).at("target")->ToJsonString());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+
+    auto metadata_only = Request(100, {"target"}, {});
+    metadata_only.metadata_only = true;
+    EXPECT_EQ(EC_OK, Run(metadata_only).status);
+    EXPECT_EQ(1u, backend->delete_batches.size());
+    EXPECT_TRUE(Locations(100).empty());
+}
+
+TEST_F(BackendGcDeleteTest, TombstoneRetryRequiresEveryUriToHaveAnAvailableRetryPolicy) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto safe = AddBackend("safe", type);
+    auto unsafe = AddBackend("unsafe", type);
+    unsafe->supports_delete_retry = false;
+    for (const auto &uri : {"dummy://unsafe/reused", "dummy://missing/unknown", ""}) {
+        SetLocation(100, "target", type, {"dummy://safe/one?size=3"});
+        // Simulate a recovered tombstone, including a malformed stored URI.
+        auto modifier = [&](const std::vector<ErrorCode> &,
+                            const LocationIdVector &,
+                            size_t,
+                            CacheLocationVector &locations,
+                            PropertyMap &) -> LocationModifierResult {
+            auto location = std::make_shared<CacheLocation>(*locations[0]);
+            location->set_status(CLS_DELETING);
+            location->push_location_spec(LocationSpec("other", uri));
+            locations[0] = std::move(location);
+            return {ModifierAction::MA_OK, {EC_OK}};
+        };
+        ASSERT_EQ(EC_OK, indexer->ReadModifyWriteLocation(&context, {100}, {{"target"}}, modifier).ec);
+        const auto tombstone = Locations(100).at("target")->ToJsonString();
+        EXPECT_EQ(EC_OK, Run(Request(100, {"target"}, {})).status);
+        EXPECT_EQ(tombstone, Locations(100).at("target")->ToJsonString());
+        EXPECT_TRUE(safe->delete_batches.empty());
+        EXPECT_TRUE(unsafe->delete_batches.empty());
+    }
+}
+
+TEST_F(BackendGcDeleteTest, MalformedUriRemainsDiscoverableAndStaleRecoverySnapshotCannotDeleteReplacement) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("storage", type);
+    const std::string uri = "dummy://storage/data?size=5";
+    SetLocation(100, "target", type, {uri});
+    const auto corrupt = indexer->ReadModifyWriteLocation(&context,
+                                                          {100},
+                                                          {{"target"}},
+                                                          [](const std::vector<ErrorCode> &,
+                                                             const LocationIdVector &,
+                                                             size_t,
+                                                             CacheLocationVector &locations,
+                                                             PropertyMap &) -> LocationModifierResult {
+                                                              auto copy =
+                                                                  std::make_shared<CacheLocation>(*locations.front());
+                                                              copy->set_location_specs({LocationSpec("tp0", "")});
+                                                              locations.front() = std::move(copy);
+                                                              return {ModifierAction::MA_OK, {EC_OK}};
+                                                          });
+    ASSERT_EQ(EC_OK, corrupt.ec);
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Request(100, {"target"}, {})).status);
+    ASSERT_EQ(1u, Locations(100).size());
+    EXPECT_EQ(CLS_DELETING, Locations(100).at("target")->status());
+    EXPECT_TRUE(backend->delete_batches.empty());
+    const auto stale = Request(100, {"target"}, {});
+    SetLocation(100, "target", type, {uri});
+    EXPECT_EQ(EC_OK, Run(stale).status);
+    EXPECT_EQ(CLS_SERVING, Locations(100).at("target")->status());
+    EXPECT_TRUE(backend->delete_batches.empty());
 }
 
 TEST_F(SchedulePlanExecutorTest, TestSubmit) {
@@ -752,6 +1025,7 @@ TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteRequiresBackupAdmissionA
     EXPECT_EQ(EC_ERROR, failed.result.status);
     EXPECT_EQ(KeyVector{42}, failed.actual_task.block_keys);
     EXPECT_EQ(1, backup_ptr->sync_calls);
+    EXPECT_TRUE(executor.active_location_deletes_.empty());
     CacheLocationMapVector local;
     ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.GetLocationsFromPrimary(nullptr, {42}, local));
     EXPECT_EQ(CLS_DELETING, local[0].at(ids[0])->status());
@@ -1420,7 +1694,7 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
         [&](int64_t block_key, const std::vector<std::string> &uris, CacheLocationStatus status = CLS_SERVING) {
             std::vector<LocationSpec> specs;
             for (size_t i = 0; i < uris.size(); ++i) {
-                specs.emplace_back("tp" + std::to_string(i), uris[i]);
+                specs.emplace_back("tp" + std::to_string(i), uris[i], "delete_node");
             }
             const auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
                 DataStorageType::DATA_STORAGE_TYPE_DUMMY, specs.size(), specs);
@@ -1457,6 +1731,8 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     };
     const auto mixed_result = executor.Submit(mixed_request).get();
     ASSERT_EQ(EC_OK, mixed_result.status) << mixed_result.error_message;
+    EXPECT_EQ((std::map<std::string, int64_t>{{"delete_node", 1}}), mixed_result.deleted_bytes_by_node);
+    EXPECT_GT(mixed_result.physical_delete_started_at_us, 0);
     ASSERT_EQ(1u, backend->delete_batches.size());
     ASSERT_EQ(1u, backend->delete_batches.front().size());
     EXPECT_EQ(existing_uri, backend->delete_batches.front().front().ToUriString());
@@ -1476,6 +1752,7 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
                                     })
                                     .get();
     EXPECT_EQ(EC_OK, missing_result.status);
+    EXPECT_TRUE(missing_result.deleted_bytes_by_node.empty());
     EXPECT_EQ(1u, backend->delete_batches.size());
     EXPECT_TRUE(physical_delete_warnings.empty());
     expect_location_deleted(missing_block_key);
@@ -1548,6 +1825,7 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
                                   })
                                   .get();
     EXPECT_EQ(EC_OK, noent_result.status) << noent_result.error_message;
+    EXPECT_TRUE(noent_result.deleted_bytes_by_node.empty());
     EXPECT_FALSE(noent_result.error_logged);
     EXPECT_TRUE(physical_delete_warnings.empty());
     expect_location_deleted(noent_block_key);
@@ -1561,7 +1839,9 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     other_backend->delete_result = EC_ERROR;
     data_storage_manager_->storage_map_["gc_other_backend"] = other_backend;
     const int64_t error_block_key = 712;
-    const std::string error_location_id = add_location(error_block_key, {error_uri, timeout_uri, other_uri});
+    backend->delete_results_by_uri[existing_uri] = EC_OK;
+    const std::string error_location_id = add_location(error_block_key, {error_uri, timeout_uri, other_uri,
+                                                                       existing_uri, existing_uri});
     const auto error_result = executor
                                   .Submit(CacheLocationDelRequest{
                                       .instance_id = kTestInstanceName,
@@ -1570,6 +1850,8 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
                                   })
                                   .get();
     EXPECT_EQ(EC_PARTIAL_OK, error_result.status);
+    // Partial success counts only successful physical bytes, once per URI.
+    EXPECT_EQ((std::map<std::string, int64_t>{{"delete_node", 1}}), error_result.deleted_bytes_by_node);
     EXPECT_TRUE(error_result.error_logged);
     EXPECT_NE(std::string::npos, error_result.error_message.find("failed[2]"));
     EXPECT_THAT(physical_delete_warnings,
@@ -1580,6 +1862,28 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
                         timeout_uri + "] ec[" + std::to_string(EC_TIMEOUT) + "]",
                     "storage delete failed, instance[" + kTestInstanceName + "] storage[gc_other_backend] uri[" +
                         other_uri + "] ec[" + std::to_string(EC_ERROR) + "]"));
+    CacheLocationMapVector failed_locations;
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(&context, {error_block_key}, {}, failed_locations));
+    ASSERT_EQ(1u, failed_locations.front().size());
+    EXPECT_EQ(CLS_DELETING, failed_locations.front().at(error_location_id)->status());
+    EXPECT_EQ(5u, failed_locations.front().at(error_location_id)->location_specs().size());
+    backend->delete_result = EC_OK;
+    backend->delete_results_by_uri[timeout_uri] = EC_OK;
+    backend->delete_results_by_uri[existing_uri] = EC_NOENT;
+    other_backend->delete_result = EC_OK;
+    const auto retry_result =
+        executor
+            .Submit(CacheLocationDelRequest{
+                .instance_id = kTestInstanceName,
+                .block_keys = {error_block_key},
+                .location_ids = {{error_location_id}},
+                .expected_location_values = {{failed_locations.front().at(error_location_id)->ToJsonString()}},
+                .authoritative_read = true,
+            })
+            .get();
+    EXPECT_EQ(EC_OK, retry_result.status);
+    // The duplicate successful URI now returns NOENT and is never credited again.
+    EXPECT_EQ((std::map<std::string, int64_t>{{"delete_node", 3}}), retry_result.deleted_bytes_by_node);
     expect_location_deleted(error_block_key);
 
     // Worker/admission errors have not been diagnosed by DoLocationDelTask.

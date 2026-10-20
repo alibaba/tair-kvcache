@@ -10,10 +10,13 @@ cc_library(
         "client_test_base.h",
         "service_process_controller.h",
     ],
+    data = ["//package/etc:default_server_confs"],
     deps = [
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/client",
+        "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
+        "@rapidjson",
     ],
 )
 

@@ -103,6 +103,18 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(meta_indexer, cache_backend_upsert_time_us);
     DECLARE_METRICS(meta_indexer, cache_backend_delete_time_us);
 
+    // affinity metrics
+    DECLARE_METRICS(affinity, read_local_hit);
+    DECLARE_METRICS(affinity, read_remote_hit);
+    DECLARE_METRICS(affinity, hint_emitted);
+    DECLARE_METRICS(affinity, replication_write_count);
+    DECLARE_METRICS(affinity, replication_server_copy_success);
+    DECLARE_METRICS(affinity, replication_server_copy_failure);
+    DECLARE_METRICS(affinity, replication_allocation_failure);
+    DECLARE_METRICS(affinity, replication_copy_failure);
+    DECLARE_METRICS(affinity, replication_publish_failure);
+    DECLARE_METRICS(affinity, replication_server_copy_latency_us);
+
     // data storage metrics
     DECLARE_METRICS(data_storage, create_qps);
     DECLARE_METRICS(data_storage, create_keys_qps);
@@ -415,6 +427,18 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(meta_indexer, cache_backend_upsert_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, cache_backend_delete_time_us);
 
+    // affinity metrics
+    REGISTER_GAUGE_METRIC(affinity, read_local_hit);
+    REGISTER_GAUGE_METRIC(affinity, read_remote_hit);
+    REGISTER_GAUGE_METRIC(affinity, hint_emitted);
+    REGISTER_GAUGE_METRIC(affinity, replication_write_count);
+    REGISTER_GAUGE_METRIC(affinity, replication_server_copy_success);
+    REGISTER_GAUGE_METRIC(affinity, replication_server_copy_failure);
+    REGISTER_GAUGE_METRIC(affinity, replication_allocation_failure);
+    REGISTER_GAUGE_METRIC(affinity, replication_copy_failure);
+    REGISTER_GAUGE_METRIC(affinity, replication_publish_failure);
+    REGISTER_GAUGE_METRIC(affinity, replication_server_copy_latency_us);
+
     // data storage metrics
     REGISTER_QPS_METRIC(data_storage, create_qps);
     REGISTER_QPS_METRIC(data_storage, create_keys_qps);
@@ -655,6 +679,18 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::o
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_put_time_us);
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_upsert_time_us);
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_delete_time_us);
+
+        // affinity metrics
+        REPORT_COLLECTED_METRICS(affinity, read_local_hit);
+        REPORT_COLLECTED_METRICS(affinity, read_remote_hit);
+        REPORT_COLLECTED_METRICS(affinity, hint_emitted);
+        REPORT_COLLECTED_METRICS(affinity, replication_write_count);
+        REPORT_COLLECTED_METRICS(affinity, replication_server_copy_success);
+        REPORT_COLLECTED_METRICS(affinity, replication_server_copy_failure);
+        REPORT_COLLECTED_METRICS(affinity, replication_allocation_failure);
+        REPORT_COLLECTED_METRICS(affinity, replication_copy_failure);
+        REPORT_COLLECTED_METRICS(affinity, replication_publish_failure);
+        REPORT_COLLECTED_METRICS(affinity, replication_server_copy_latency_us);
     } else if (dynamic_cast<EventReportMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<EventReportMetricsCollector *>(collector);
         const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());

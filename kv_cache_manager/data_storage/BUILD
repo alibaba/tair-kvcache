@@ -43,6 +43,8 @@ cc_library(
     deps = [
         # 不一定用
         # "//3rdparty/3fs:hf3fs",
+        "//kv_cache_manager/affinity:node_metrics",  # NfsBackend::SnapshotPerNodeMetrics
+        "//kv_cache_manager/common:net_util",  # NfsBackend 默认上报本机 IP
         "//kv_cache_manager/common/hash",  # for xxph3
         ":common_define",
         ":snapshot_uri_utils",
@@ -77,8 +79,11 @@ cc_library(
         "data_storage_backend.h",
         "data_storage_uri.h",
         "storage_config.h",
+        "write_hints.h",
     ],
     deps = [
+        # data_storage_backend.h references NodeMetrics (header-only, no circular dep)
+        "//kv_cache_manager/affinity:node_metrics",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:service_discovery",
         "//kv_cache_manager/common:standard_uri",

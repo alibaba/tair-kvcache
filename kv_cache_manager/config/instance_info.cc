@@ -14,6 +14,7 @@ bool InstanceInfo::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "location_spec_groups", location_spec_groups_, std::vector<LocationSpecGroup>());
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "default_query_type", default_query_type_, static_cast<int32_t>(0));
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "affinity_strategy_json", affinity_strategy_json_, std::string(""));
     SortLocationSpecGroups();
     return true;
 }
@@ -27,9 +28,25 @@ void InstanceInfo::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wri
     Put(writer, "model_deployment", model_deployment_);
     Put(writer, "location_spec_groups", location_spec_groups_);
     Put(writer, "default_query_type", default_query_type_);
+    Put(writer, "affinity_strategy_json", affinity_strategy_json_);
 }
 
 std::string InstanceInfo::ToString() const { return Jsonizable::ToJsonString(); }
+
+bool InstanceInfo::MatchesAffinityStrategyJson(const std::string &requested) const {
+    if (affinity_strategy_json_ == requested) {
+        return true;
+    }
+    // Equivalent JSON formatting/key order is an idempotent registration.
+    // This compares stored configuration only; it does not load a strategy
+    // or mutate the policy of a live instance.
+    rapidjson::Document stored_json;
+    rapidjson::Document requested_json;
+    stored_json.Parse(affinity_strategy_json_.data(), affinity_strategy_json_.size());
+    requested_json.Parse(requested.data(), requested.size());
+    return !stored_json.HasParseError() && !requested_json.HasParseError() && stored_json.IsObject() &&
+           requested_json.IsObject() && stored_json == requested_json;
+}
 
 void InstanceInfo::SortLocationSpecGroups() {
     // to use binary search

@@ -172,12 +172,18 @@ message ReportEventResponse {
 message LocationSpec {
     string name = 1; // 对应LocationSpecInfo中的name
     string uri = 2;
+    // Storage node this spec resides on. Empty = backend not affinity-aware.
+    // Used by read path for local-preference and eviction for per-node load.
+    string node_id = 3;
 }
 
 message CacheLocation {
     StorageType type = 1;
     int32 spec_size = 2;
     repeated LocationSpec location_specs = 3;
+    string id = 4;
+    string status = 5;
+    int64 create_time = 6;
 }
 
 message LocationSpecInfo {
@@ -212,6 +218,9 @@ message InstanceInfo {
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
     QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
+    // 实例级 cache affinity 策略 JSON。空串表示未覆盖；
+    // 由 server 端 CacheAffinityManager 与 instance_group/process 级别一并选取。
+    string affinity_strategy_json = 9;
 }
 
 message LocalStorageSpec {}
@@ -293,6 +302,8 @@ message RegisterInstanceRequest {
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
     QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
+    // 实例级 cache affinity 策略 JSON，空串表示由 instance_group/process 级回退。
+    string affinity_strategy_json = 9;
 }
 
 message RegisterInstanceResponse {
@@ -328,6 +339,20 @@ enum QueryType {
     QT_PREFIX_MATCH_WITH_MAMBA = 4;
 }
 
+// The caller's self-reported node, used by the affinity layer.
+//   node_id      : the inference node identity (IP / hostname). Same notion as
+//                  LocationSpec.node_id / NodeMetrics.node_id — a single
+//                  physical machine. Empty = unknown / affinity not enabled.
+//   supernode_id : the super-node (e.g. same rack / switch domain) the node
+//                  belongs to. Used for hierarchical locality:
+//                  same node (cheapest) > same supernode > remote.
+message CallerNode {
+    string node_id = 1;
+    string supernode_id = 2;
+    // Bit 0: client can copy a complete named multi-spec source set.
+    uint32 replication_capabilities = 3;
+}
+
 message GetCacheLocationRequest {
     string trace_id = 1;
     string instance_id = 2;
@@ -337,6 +362,11 @@ message GetCacheLocationRequest {
     BlockMask block_mask = 6; // 按前缀mask或者bool矩阵mask
     int32 sw_size = 7;        // slide window size, for QT_REVERSE_ROLL_SW_MATCH
     repeated string location_spec_names = 8; // 用于仅返回部分spec。不传则全返回。
+
+    // The caller's self-reported node (inference node + super-node). Used for
+    // local-preference in read path, replication trigger, and hierarchical
+    // locality. Empty / unset = old client / affinity not enabled.
+    CallerNode caller = 9;
 }
 
 message CacheLocationVector {
@@ -381,9 +411,30 @@ message GetCacheLocationLenRequest {
     int32 sw_size = 6;        // slide window size, for QT_REVERSE_ROLL_SW_MATCH
 }
 
+// Replication hint: server tells the SDK that a block_key is frequently read
+// from a remote node and suggests creating a local replica asynchronously.
+// source_uri is the data source; target_node_id is the desired replica node.
+message ReplicationHint {
+    int64 block_key = 1;
+    string source_uri = 2;
+    string target_node_id = 3;
+    // Complete sources for multi-spec replication. Legacy source_uri remains
+    // populated only for a single spec. Multi-spec replication requires a new SDK.
+    repeated ReplicationSourceSpec source_specs = 4;
+}
+
+message ReplicationSourceSpec {
+    string spec_name = 1;
+    string uri = 2;
+}
+
 message GetCacheLocationResponse {
     CommonResponseHeader header = 1;
     repeated CacheLocation locations = 2; // 多个key的列表
+    // Replication hints from server. Old SDKs ignore unknown fields (proto3).
+    repeated ReplicationHint hints = 3;
+    // Intersection of server support and the caller capability bitmap.
+    uint32 replication_capabilities = 4;
 }
 
 message GetCacheLocationLenResponse {
@@ -404,6 +455,9 @@ message GetCacheMetaResponse {
     CommonResponseHeader header = 1;
     repeated CacheLocation locations = 2; // 多个key的列表
     repeated string metas = 3;            // 与请求key一一对应
+    // Full replica set for each requested key. The legacy locations field keeps
+    // the first replica for old clients.
+    repeated CacheLocationVector replica_locations = 4;
 }
 
 // 在每次写入 cache 前, 需要调用这个接口获得CacheLocation信息
@@ -421,6 +475,51 @@ message StartWriteCacheRequest {
     int32 write_timeout_seconds = 6; // seconds, 要在指定timeout内调用FinishWriteCacheRequest，否则服务端会将本次 Request 相关的 Meta 全释放掉
     // 看情况添加一个已匹配block数量，提升metaservice性能，针对流式存储场景
     int32 min_replica_count = 7; // 可用副本数 >= min_replica_count 才跳过写入，0 或未设置视为 1
+
+    // 调用方自报的节点（推理节点 + 超节点），给服务端 affinity 决策用
+    // (cache_affinity_manager + write_hints 路径)。unset = 老客户端，
+    // 退化为无亲和性的写放置（行为完全等价于改造前）。
+    CallerNode caller = 10;
+
+    // Replication write flag.
+    //   false = normal write: global dedup via ExistsForWrite, strict=false
+    //   true  = replication write: dedup only on replication_target_node_id,
+    //           strict=true
+    // Server derives the strict parameter from this flag automatically.
+    bool is_replication = 8;
+    // Required when is_replication=true. The server allocates the new replica
+    // on this exact storage node instead of re-running the normal write policy.
+    string replication_target_node_id = 9;
+}
+
+message ReplicateCacheItem {
+    int64 block_key = 1;
+    repeated ReplicationSourceSpec source_specs = 2;
+    string target_node_id = 3;
+}
+
+message ReplicateCacheResult {
+    ErrorCode code = 1;
+    bool already_exists = 2;
+}
+
+// Copy cache blocks to explicit nodes entirely inside KVCM/storage.
+message ReplicateCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    int64 block_key = 3;
+    repeated ReplicationSourceSpec source_specs = 4;
+    string target_node_id = 5;
+    int32 write_timeout_seconds = 6;
+    // New clients use items. Legacy single-item fields above remain supported.
+    repeated ReplicateCacheItem items = 7;
+}
+
+message ReplicateCacheResponse {
+    CommonResponseHeader header = 1;
+    // True means a complete replica already existed on target_node_id.
+    bool already_exists = 2;
+    repeated ReplicateCacheResult results = 3;
 }
 
 message StartWriteCacheResponse {
@@ -505,6 +604,8 @@ service MetaService {
     rpc GetCacheLocationLen(GetCacheLocationLenRequest) returns (GetCacheLocationLenResponse);
     // 准备开始写Cache，尝试获取写的位置，如果返回空，则代表不需要写Cache
     rpc StartWriteCache(StartWriteCacheRequest) returns (StartWriteCacheResponse);
+    // Allocate on target_node_id, invoke backend CopyGA, then publish metadata.
+    rpc ReplicateCache(ReplicateCacheRequest) returns (ReplicateCacheResponse);
     // 不论写Cache成功与否，都调用这个
     rpc FinishWriteCache(FinishWriteCacheRequest) returns (CommonResponse);
     // 删除指定key的cache，用于修复用户反馈的单query异常

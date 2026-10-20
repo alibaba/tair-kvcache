@@ -11,6 +11,20 @@ cc_test(
     data = [],
     deps = [
         "//kv_cache_manager/client",
+        "//kv_cache_manager/client/src/internal/stub:base_stub",
+        "//kv_cache_manager/common:affinity_types",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
+    name = "ReplicationExecutorTest",
+    srcs = [
+        "replication_executor_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/client",
         "//kv_cache_manager/common:unittest",
     ],
 )

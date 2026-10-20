@@ -30,6 +30,13 @@ public:
     const ModelDeployment &model_deployment() const { return model_deployment_; }
     const LocationSpecGroups &location_spec_groups() const { return location_spec_groups_; }
     QueryType default_query_type() const { return static_cast<QueryType>(default_query_type_); }
+    int32_t replication_workers() const { return replication_workers_; }
+    uint64_t replication_max_buffer_bytes() const { return replication_max_buffer_bytes_; }
+    uint64_t replication_max_pending_bytes() const { return replication_max_pending_bytes_; }
+    uint64_t replication_node_bytes_per_second() const { return replication_node_bytes_per_second_; }
+    uint32_t replication_max_age_ms() const { return replication_max_age_ms_; }
+    bool auto_replicate() const { return auto_replicate_; }
+    int32_t caller_node_refresh_seconds() const { return caller_node_refresh_seconds_; }
 
 private:
     bool Check() const;
@@ -45,6 +52,15 @@ private:
     ModelDeployment model_deployment_;
     LocationSpecGroups location_spec_groups_;
     int32_t default_query_type_{0};
+    int32_t replication_workers_ = 2;
+    uint64_t replication_max_buffer_bytes_ = 256 * 1024 * 1024;
+    uint64_t replication_max_pending_bytes_ = 256 * 1024 * 1024;
+    uint64_t replication_node_bytes_per_second_ = 0;
+    uint32_t replication_max_age_ms_ = 30000;
+    bool auto_replicate_ = false;
+    // 0 refreshes the backend identity on every request. This is the safe
+    // default for backends whose node id also identifies a data incarnation.
+    int32_t caller_node_refresh_seconds_ = 0;
 };
 
 } // namespace kv_cache_manager

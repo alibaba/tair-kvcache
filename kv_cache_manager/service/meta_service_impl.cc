@@ -8,6 +8,7 @@
 
 #include "google/protobuf/message.h"
 #include "kv_cache_manager/common/env_util.h"
+#include "kv_cache_manager/affinity/local_replica_strategy.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -389,7 +390,8 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
                                          location_spec_infos,
                                          model_deployment_req,
                                          location_spec_groups,
-                                         static_cast<CacheManager::QueryType>(request->default_query_type()));
+                                         static_cast<CacheManager::QueryType>(request->default_query_type()),
+                                         request->affinity_strategy_json());
 
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));
@@ -486,8 +488,12 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
     for (const auto &name : request->location_spec_names()) {
         location_spec_names.push_back(name);
     }
+    request_context->set_caller_node(CallerNode{request->caller().node_id(), request->caller().supernode_id(),
+                                               request->caller().replication_capabilities()});
 
-    std::pair<ErrorCode, CacheLocationViewVecWrapper> get_cache_meta = cache_manager_->GetCacheLocation(
+    std::vector<ReplicationHint> hints;
+    CacheLocationViewVecWrapper cache_location_view_vec_wrapper;
+    ErrorCode ec_info = cache_manager_->GetCacheLocation(
         request_context,
         request->instance_id(),
         static_cast<CacheManager::QueryType>(request->query_type()),
@@ -495,9 +501,9 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
         std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
         block_mask_req,
         request->sw_size(),
-        location_spec_names);
-    ErrorCode ec_info = get_cache_meta.first;
-    CacheLocationViewVecWrapper cache_location_view_vec_wrapper(std::move(get_cache_meta.second));
+        location_spec_names,
+        cache_location_view_vec_wrapper,
+        hints);
     CacheLocationViewVec cache_locations_res = cache_location_view_vec_wrapper.cache_locations_view();
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));
@@ -509,12 +515,26 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
             auto *location_meta = response->add_locations();
             ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
         }
+        response->set_replication_capabilities(request->caller().replication_capabilities() & kReplicationNamedSpecs);
+        for (const auto &h : hints) {
+            if (h.source_specs.size() > 1 && !(response->replication_capabilities() & kReplicationNamedSpecs)) continue;
+            auto *pb_hint = response->add_hints();
+            pb_hint->set_block_key(h.block_key);
+            pb_hint->set_source_uri(h.source_uri);
+            pb_hint->set_target_node_id(h.target_node_id);
+            for (const auto &source : h.source_specs) {
+                auto *pb_source = pb_hint->add_source_specs();
+                pb_source->set_spec_name(source.spec_name);
+                pb_source->set_uri(source.uri);
+            }
+        }
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
         status->set_message("Cache locations retrieved successfully");
-        KVCM_LOG_INFO("[traceId: %s] GetCacheLocation succeeded, returned %d locations",
+        KVCM_LOG_INFO("[traceId: %s] GetCacheLocation succeeded, returned %d locations, %zu hints",
                       request->trace_id().c_str(),
-                      response->locations_size());
+                      response->locations_size(),
+                      hints.size());
     }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
@@ -666,6 +686,7 @@ void MetaServiceImpl::GetCacheMeta(RequestContext *request_context,
     ErrorCode ec_info = get_cache_meta.first;
     CacheMetaVecWrapper cache_meta_vec_wrapper(std::move(get_cache_meta.second));
     CacheLocationViewVec cache_locations_res = cache_meta_vec_wrapper.cache_locations_view();
+    const auto &replica_locations_res = cache_meta_vec_wrapper.replica_locations();
     std::vector<std::string> metas_res = cache_meta_vec_wrapper.metas();
 
     if (ec_info != EC_OK) {
@@ -677,6 +698,12 @@ void MetaServiceImpl::GetCacheMeta(RequestContext *request_context,
         for (const auto &cache_location : cache_locations_res) {
             auto *location_meta = response->add_locations();
             ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
+        }
+        for (const auto &replicas : replica_locations_res) {
+            auto *replicas_proto = response->add_replica_locations();
+            for (const auto &replica : replicas.cache_locations_view()) {
+                ProtoConvert::CacheLocationViewToProto(replica, replicas_proto->add_locations());
+            }
         }
         for (const auto &meta : metas_res) {
             response->add_metas(meta);
@@ -718,6 +745,14 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
     for (const auto &name : request->location_spec_group_names()) {
         location_spec_group_names.push_back(name);
     }
+
+    // 把调用方推理节点 IP 透传到 RequestContext，CacheManager 写路径在构建
+    // AffinityResolveContext 时会读它。空字符串 = 老客户端 / 未启用 affinity，
+    // 后端会退化为无亲和性的写放置（行为完全等价于改造前）。
+    request_context->set_caller_node(CallerNode{request->caller().node_id(), request->caller().supernode_id(),
+                                               request->caller().replication_capabilities()});
+    request_context->set_is_replication(request->is_replication());
+    request_context->set_replication_target_node_id(request->replication_target_node_id());
 
     std::pair<ErrorCode, StartWriteCacheInfo> start_write_cache = cache_manager_->StartWriteCache(
         request_context,
@@ -800,6 +835,70 @@ void MetaServiceImpl::FinishWriteCache(RequestContext *request_context,
                       request->trace_id().c_str(),
                       request->write_session_id().c_str());
     }
+    SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+}
+
+void MetaServiceImpl::ReplicateCache(RequestContext *request_context,
+                                     const proto::meta::ReplicateCacheRequest *request,
+                                     proto::meta::ReplicateCacheResponse *response) {
+    SPAN_TRACER(request_context);
+    API_CALL_GUARD("ReplicateCache", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    const bool is_batch = request->items_size() > 0;
+    if (request->instance_id().empty() ||
+        (!is_batch && (request->target_node_id().empty() || request->source_specs().empty()))) {
+        status->set_code(proto::meta::INVALID_ARGUMENT);
+        status->set_message("instance_id, target_node_id and source_specs are required");
+        request_context->set_status_code(status->code());
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    std::vector<ReplicationHint> hints;
+    hints.reserve(is_batch ? request->items_size() : 1);
+    auto append_hint = [&](int64_t block_key,
+                           const std::string &target_node_id,
+                           const auto &source_specs) {
+        ReplicationHint hint;
+        hint.block_key = block_key;
+        hint.target_node_id = target_node_id;
+        hint.source_specs.reserve(source_specs.size());
+        for (const auto &source : source_specs) {
+            hint.source_specs.push_back({source.spec_name(), source.uri()});
+        }
+        hints.push_back(std::move(hint));
+    };
+    if (is_batch) {
+        for (const auto &item : request->items()) {
+            append_hint(item.block_key(), item.target_node_id(), item.source_specs());
+        }
+    } else {
+        append_hint(request->block_key(), request->target_node_id(), request->source_specs());
+    }
+    const int64_t timeout_seconds = request->write_timeout_seconds() > 0
+                                        ? request->write_timeout_seconds()
+                                        : 60;
+    const auto results =
+        cache_manager_->ReplicateCaches(request_context, request->instance_id(), hints, timeout_seconds);
+    if (results.size() != hints.size()) {
+        status->set_code(proto::meta::INTERNAL_ERROR);
+        status->set_message("Replication result count mismatch");
+        request_context->set_status_code(status->code());
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    for (const auto &[ec, already_exists] : results) {
+        auto *result = response->add_results();
+        result->set_code(ec == EC_OK ? proto::meta::OK : ToMetaPbError(ec));
+        result->set_already_exists(already_exists);
+    }
+    const auto [first_ec, first_already_exists] = results.front();
+    response->set_already_exists(first_already_exists);
+    status->set_code(is_batch ? proto::meta::OK
+                              : (first_ec == EC_OK ? proto::meta::OK : ToMetaPbError(first_ec)));
+    status->set_message(is_batch || first_ec == EC_OK ? "Cache replication request processed"
+                                                       : "Failed to replicate cache");
+    request_context->set_status_code(status->code());
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
 

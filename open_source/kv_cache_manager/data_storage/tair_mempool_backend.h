@@ -12,6 +12,8 @@ public:
     explicit TairMempoolBackend(std::shared_ptr<MetricsRegistry> metrics_registry);
     ~TairMempoolBackend() override;
     DataStorageType GetType() override;
+    // PACE URIs have no allocation generation; a freed GA may be reused.
+    bool SupportsDeleteRetry() const override { return false; }
     bool ShouldSkipConfirmedMissingBackendDelete() const override;
     bool Available() override;
     double GetStorageUsageRatio(const std::string &trace_id) const override;
@@ -25,6 +27,26 @@ public:
                                                              size_t size_per_key,
                                                              const std::string &trace_id,
                                                              std::function<void()> cb) override;
+    // Open-source stub: real affinity-aware placement lives in the internal
+    // build; here we just fall through to legacy Create() inline.
+    std::vector<LocationDescriptor> CreateWithHints(const std::vector<std::string> &keys,
+                                                    size_t size_per_key,
+                                                    const WriteHints &hints,
+                                                    bool strict,
+                                                    const std::string &trace_id,
+                                                    std::function<void()> cb) override {
+        (void)hints;
+        if (strict) {
+            return std::vector<LocationDescriptor>(keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}, ""});
+        }
+        auto legacy = Create(keys, size_per_key, trace_id, std::move(cb));
+        std::vector<LocationDescriptor> out;
+        out.reserve(legacy.size());
+        for (auto &p : legacy) {
+            out.push_back(LocationDescriptor{p.first, std::move(p.second), /*node_id=*/""});
+        }
+        return out;
+    }
     std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,
                                   const std::string &trace_id,
                                   std::function<void()> cb) override;

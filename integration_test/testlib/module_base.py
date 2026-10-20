@@ -3,6 +3,7 @@ import logging
 import shutil
 import subprocess
 import signal
+import time
 
 
 class ModuleBase(object):
@@ -66,10 +67,27 @@ class ModuleBase(object):
 
         return pids
 
-    def _wait_exit(self, module_name, pid):
+    def _wait_exit(self, module_name, pid, timeout=30):
+        if pid is None:
+            return
+        deadline = time.monotonic() + timeout
         while True:
-            if not self._get_pid(module_name, extra='%s' % pid):
-                break
+            try:
+                state = subprocess.check_output(
+                    ['ps', '-p', str(pid), '-o', 'stat='],
+                    universal_newlines=True, timeout=1,
+                ).strip()
+            except subprocess.CalledProcessError as error:
+                if error.returncode == 1:  # The exact PID no longer exists.
+                    return
+                raise
+            if not state or state.startswith('Z'):
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f'{module_name} pid={pid} did not exit within {timeout}s (state={state})'
+                )
+            time.sleep(0.05)
 
     @staticmethod
     def _stop(pid=None, force=False):

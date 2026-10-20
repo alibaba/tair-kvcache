@@ -27,6 +27,9 @@ cc_library(
         ":reclaimer_task_supervisor",
         ":startup_config_loader",
         ":write_location_manager",
+        "//kv_cache_manager/affinity",
+        "//kv_cache_manager/affinity:local_replica_strategy",
+        "//kv_cache_manager/affinity:node_metrics",
         "//kv_cache_manager/common",
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",
@@ -97,6 +100,9 @@ cc_library(
     ],
     hdrs = ["cache_reclaimer.h"],
     deps = [
+        # Inject CacheAffinityManager for NodeMetrics source + GetStrategy
+        "//kv_cache_manager/affinity",
+        "//kv_cache_manager/affinity:affinity_strategy",
         "//kv_cache_manager/config",
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/manager:meta_searcher",
@@ -131,6 +137,8 @@ cc_library(
     ],
     deps = [
         ":select_location_policy",
+        "//kv_cache_manager/affinity:affinity_strategy",
+        "//kv_cache_manager/affinity",
         "//kv_cache_manager/common",
         "//kv_cache_manager/meta",
         "//kv_cache_manager/meta:cache_location",
