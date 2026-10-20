@@ -41,7 +41,11 @@ except ImportError:
 from sglang.srt.distributed import get_attn_tp_group, get_tp_group
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
-from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
+from kv_cache_manager.py_connector.common.manager_client import (
+    KvCacheManagerClient,
+    KvCacheManagerHTTPError,
+    KvCacheManagerProtocolError,
+)
 
 # kvcm_py_client is the compiled pybind11 client; it ships no type stubs.
 from kv_cache_manager.client.pybind import kvcm_py_client  # ty: ignore[unresolved-import]
@@ -60,10 +64,12 @@ logger = logging.getLogger(__name__)
 class _PoolSpec:
     """How one sglang pool maps onto the location specs of this connector.
 
-    ``_POOL_SPECS`` is the connector's whole pool knowledge: ``_init_kvcm_client``
-    derives the specs, the spec groups, the iov size and the SDK client config
-    from it, and the data path resolves a ``PoolTransfer`` through it.  A pool
-    without a row here is not backed by the connector.
+    ``_POOL_SPECS`` is the connector's knowledge of the pools sglang shipped
+    before it: ``_init_kvcm_client`` derives the specs, the spec groups, the iov
+    size and the SDK client config from the resolved rows, and the data path
+    resolves a ``PoolTransfer`` through them.  A pool without a row here is
+    derived from itself (``_derived_pool_spec``), so a new sglang side pool is
+    backed without a connector change.
     """
 
     # sglang's PoolName member: the key of ``registered_pools`` and of a
@@ -81,10 +87,12 @@ class _PoolSpec:
     # The KV pool: sglang hands exactly one per instance, and a flat model keeps
     # its historic "tp_{rank}" spec names so already-cached data stays readable.
     anchor: bool = False
-    # get_size_per_token() counts one token, so a block is that times
-    # block_size.  A page-granular pool (Mamba, page_size 1) already returns one
-    # slot per call and turns this off.
-    tokens_per_block: bool = True
+    # The row was derived from a registered pool instead of coming from
+    # ``_POOL_SPECS``.  A derived pool is backed like any other, but it does not
+    # size the shared IOV area the HF3FS backend allocates at startup (see
+    # ``_init_kvcm_client``): that area is paid for by every deployment,
+    # including the ones this connector backed before the pool existed here.
+    derived: bool = False
     # The pool is replicated rather than sharded across the TP ranks: an MLA
     # model writes rank 0's copy alone, so every rank reads and writes rank 0's
     # spec.  A sharded pool is the opposite -- sglang hands it to every rank,
@@ -100,10 +108,24 @@ class _PoolSpec:
             suffix = self.hybrid_suffix
         return f"tp_{tp_rank}{suffix}"
 
-    def spec_size(self, pool: Any, block_size: int) -> int:
-        """Bytes of one block of this pool."""
-        per_token = pool.get_size_per_token()
-        return per_token * block_size if self.tokens_per_block else per_token
+    def spec_size(self, pool: Any) -> int:
+        """Bytes of one block of this pool, counted by the pool itself.
+
+        One page is ``page_size`` slots of ``get_size_per_token()`` bytes: a
+        token-granular pool (the KV family, the indexer) multiplies, and a
+        page-granular one (Mamba, whose host pool keeps one slot per page)
+        reports ``page_size == 1`` and comes out as the identity.  Every host
+        pool of one instance is built with the controller's page size, so the
+        indexer's product equals the anchor's (the basis the table used before
+        this refactor) and no deployment changes its registered sizes.
+
+        sglang's DeepSeek-V4 host pools do not satisfy this: they report the
+        bytes of one *page row* as their per-token size, so the product would be
+        ``page_size`` times too large.  Such a pool only ever exists on an
+        instance whose anchor is a ``LogicalHostPool``, which is refused before
+        any row is resolved, so no row here is one of them.
+        """
+        return pool.get_size_per_token() * pool.page_size
 
 
 _KV_SPEC = _PoolSpec(
@@ -117,7 +139,6 @@ _MAMBA_SPEC = _PoolSpec(
     pool=PoolName.MAMBA,
     group="Linear",
     suffix="_linear",
-    tokens_per_block=False,
     shared_across_ranks=False,
 )
 # Probed: a release without the enum member has no such pool to register, and
@@ -200,8 +221,73 @@ _validate_pool_specs(_POOL_SPECS)
 
 
 def _pool_spec(pool_name: Any) -> Optional[_PoolSpec]:
-    """The table row of a pool, or None when this connector does not back it."""
+    """The table row of a pool, or None when the table does not know it."""
     return next((spec for spec in _POOL_SPECS if spec.pool == pool_name), None)
+
+
+# The Manager reads a location-spec group's hit semantics off the first
+# character of the group name (manager/meta_searcher.cc::ClassifySpecGroups):
+# 'F' requires every page of a prefix to carry the group's specs -- what
+# PoolHitPolicy.ALL_PAGES asks for -- and 'L' only the trailing boundary page
+# (TRAILING_PAGES); every other character is rejected outright.
+#
+# A registration cannot see a pool's hit policy: sglang hands a pool over as
+# (name, host pool) and only a PoolTransfer carries ``hit_policy``, long after
+# ``registerInstance`` froze the specs, with no update API behind it.  A derived
+# row therefore claims the strict category -- the only choice that cannot hand
+# out pages the pool does not have: over-strict costs hits, over-permissive
+# would claim data.  The connector's own existence check follows the transfer's
+# ``hit_policy``, never this name, and a pool whose policy is known belongs in
+# ``_POOL_SPECS`` with the category that fits it.
+_DERIVED_GROUP_PREFIX = "F"
+
+# How many blocks of the largest pool the shared IOV area of an HF3FS backend
+# must hold: the historical sizing of ``iov_size``, kept as the default because
+# every deployment pays for that area twice at startup (see
+# ``HiCacheKVCM._init_kvcm_client``).
+_DEFAULT_IOV_BLOCK_COUNT = 1024
+
+# A transport-ish failure that says the Manager was not able to judge the
+# registration: the leader election is still moving, and the client has already
+# retried.  Its own text is the only signal the Manager client forwards (the
+# status code is not carried on the exception), so it is matched as a substring
+# and only to keep such a failure out of the "your layout was rejected" branch.
+# A non-OK business status arrives as a bare ``AssertionError`` carrying only the
+# Manager's message (``common/manager_client.py``), and the Manager can fail for a
+# reason that a retry fixes -- persisting the instance info or the instance key to
+# its storage backend, for instance.  So the default is ``unjudged``: only a
+# message that positively identifies a permanent refusal is diagnosed as one.
+_REGISTER_REJECTED_HINTS = (
+    "mismatched fields",
+    "already exists",
+    "not found",
+    "invalid",
+    "unavailable",
+)
+
+
+def _derived_pool_spec(pool_name: Any) -> _PoolSpec:
+    """The row of a pool that is not in ``_POOL_SPECS``, derived from itself.
+
+    The pool name is all a registration carries and is unique per instance, so
+    it prefixes both the spec suffix and the spec group.
+
+    ``shared_across_ranks`` stays at its default (replicated), which is also
+    sglang's own default: on an MLA model ``should_backup`` hands every pool
+    except the sharded Mamba state to rank 0 alone, so the rank-0 protocol is the
+    one that never waits for a peer that will not be called.  A pool that really
+    is sharded across the TP ranks must therefore be a table row with
+    ``shared_across_ranks=False``: a derived row is always treated as replicated,
+    and treating a sharded pool as replicated makes every rank load rank 0's
+    shard.
+    """
+    name = getattr(pool_name, "value", pool_name)
+    return _PoolSpec(
+        pool=pool_name,
+        group=f"{_DERIVED_GROUP_PREFIX}{name}",
+        suffix=f"_{name}",
+        derived=True,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -265,9 +351,10 @@ class HiCacheKVCM(HiCacheStorage):
     """KVCM HiCache storage backend for sglang (v0.5.10 ~ v0.5.19).
 
     Which pools it backs, and how each of them maps onto KVCM location specs, is
-    the module-level ``_POOL_SPECS`` table; everything per instance (spec names,
-    spec sizes, groups, iov size, SDK client config) is derived from it by
-    ``_resolve_pool_specs``.
+    the module-level ``_POOL_SPECS`` table plus one row derived from every
+    registered host pool the table does not know; everything per instance (spec
+    names, spec sizes, groups, iov size, SDK client config) is derived from those
+    rows by ``_resolve_pool_specs``.
 
     Pool registration contract -- what sglang hands the backend, in order:
 
@@ -291,10 +378,19 @@ class HiCacheKVCM(HiCacheStorage):
     pool, its transfers are answered with misses instead of being paired with
     that pool's spec.  It is never silently assumed to work.
 
+    That also makes the pool set part of the deployment identity: a pool this
+    connector backs after an upgrade but did not back before changes the
+    registered specs, and the Manager refuses such a repeat under the same
+    ``instance_id``.  Changing the pool set is therefore an operator action --
+    a new ``instance_id`` -- not something this connector can repair at runtime.
+
     If the KV anchor itself cannot be served -- sglang's DeepSeek-V4
     compressed KV pool anchors on a tensorless ``LogicalHostPool`` that is not
     a host pool -- initialization reports it once and every storage call for
-    that instance degrades to a miss.
+    that instance degrades to a miss.  A sidecar registered under such a name,
+    or one whose derived spec name would share another pool's spec, is simply
+    not backed: its transfers are answered with a miss, never with someone
+    else's data.
 
     The write paths are the only callers of the connector's TP collectives,
     and those need every rank of the group.  They therefore agree with the
@@ -310,10 +406,11 @@ class HiCacheKVCM(HiCacheStorage):
     that spans the group is committed only for the blocks every rank wrote.
     """
 
-    # Pools already reported as unusable -- either unknown to this connector
-    # or registered after the specs were frozen -- and therefore answered with
-    # misses. Process-wide so each pool is reported once instead of once per
-    # block batch, and so the report survives a backend re-creation.
+    # Pools already reported as unusable -- unknown to this connector, registered
+    # after the specs were frozen, or named so that their spec would alias
+    # another pool's -- and therefore answered with misses. Process-wide so each
+    # pool is reported once instead of once per block batch, and so the report
+    # survives a backend re-creation.
     _reported_pools: set = set()
 
     # Legacy entry points (batch_get/batch_set) already reported as not
@@ -479,6 +576,58 @@ class HiCacheKVCM(HiCacheStorage):
             self._init_kvcm_client()
             self._client_ready = True
 
+    def _agree_collective_transfers(self, transfers: List[PoolTransfer]) -> set:
+        """The transfers every rank of the group will run collectives for.
+
+        ``batch_set_v2`` opens a write session and folds a commit flag per
+        transfer, and both are collectives: a rank that enters them alone blocks
+        its peers forever.  Which transfers a rank is handed is not the same
+        everywhere -- sglang filters replicated pools to rank 0 on MLA, and a
+        sidecar whose source pool is present on one rank only is resolvable on
+        that rank alone -- so the group agrees on the intersection first and no
+        rank starts a session for something the others will not join.  One
+        gather per call, against file I/O per block.
+        """
+        # ``PoolName`` members are enum objects without ordering, and a derived
+        # pool's name is a plain string, so the sort key has to be the text.
+        local = sorted(
+            (
+                transfer.name
+                for transfer in transfers
+                if self._transfer_is_written_by_every_rank(transfer)
+            ),
+            key=str,
+        )
+        if not self._write_path_uses_tp_collectives(transfers):
+            # This write runs no TP collective at all -- a single rank, or the
+            # rank-0 protocol an MLA sidecar write uses before sglang 0.5.17,
+            # where only rank 0 is called.  Gathering here would hang the one
+            # rank that calls it, so the local set *is* the schedule.
+            return set(local)
+        if self.storage_tp_group is None:
+            return set(local)
+        gathered: List[Any] = [None] * self.tp_world_size
+        torch.distributed.all_gather_object(
+            gathered, local, group=self.storage_tp_group
+        )
+        sets = [set(names) for names in gathered if names is not None]
+        if not sets:
+            return set(local)
+        return set.intersection(*sets)
+
+    def _report_rank_local_shared_transfer(self, pool_name: Any) -> None:
+        """Report once that a group-wide pool was handed to this rank alone."""
+        if not self._mark_pool_reported(("rank-local-shared", pool_name)):
+            return
+        logger.warning(
+            "pool %s is written by every rank of the TP group, but only this "
+            "rank was handed it for this call, so its peers would wait on the "
+            "write session forever; it is not written and its transfers are "
+            "reported as misses. A pool that only some ranks back belongs in the "
+            "connector's table with the matching sharing mode.",
+            pool_name,
+        )
+
     def _transfer_is_written_by_every_rank(self, transfer: PoolTransfer) -> bool:
         """Whether sglang hands this transfer to every rank of the TP group.
 
@@ -491,6 +640,13 @@ class HiCacheKVCM(HiCacheStorage):
         of the two protocols the installed sglang implements for those
         rank-sharded sidecars is decided by
         ``_sidecars_are_written_by_every_rank``.
+
+        A row derived from a pool the table does not know is deliberately not
+        consulted here: this method is called before ``_ensure_client`` may have
+        resolved the per-instance rows, and a rank-dependent answer would split
+        the TP group.  Not finding the pool keeps the rank-0 protocol, which is
+        what sglang's own ``should_backup`` does for every pool but the Mamba
+        state.
         """
         if not self.is_mla_model:
             return True
@@ -672,8 +828,33 @@ class HiCacheKVCM(HiCacheStorage):
         }
         if self.location_spec_groups:
             register_request["location_spec_groups"] = self.location_spec_groups
+        # The layout this run wants to freeze, in one comparable string: the
+        # Manager keeps the first registration of an instance_id forever (it only
+        # accepts a repeat when every field matches, and there is no spec update
+        # API), so two different layouts under one id are a deployment error that
+        # neither side can repair at runtime.  The digest is for the logs only.
+        self.spec_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "location_spec_infos": self.location_spec_infos,
+                    "location_spec_groups": self.location_spec_groups,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        logger.debug(
+            "instance_id %s freezes %d location specs in %d groups, fingerprint %s",
+            self.instance_id,
+            len(self.location_spec_infos),
+            len(self.location_spec_groups),
+            self.spec_fingerprint,
+        )
         # TODO: check conflict and update
-        register_response = self._manager_client.register_instance(register_request)
+        try:
+            register_response = self._manager_client.register_instance(register_request)
+        except Exception as e:
+            self._report_register_failure(e)
+            raise
         logger.debug(f"register_instance {register_response=}")
 
         self.storage_configs = register_response["storage_configs"]
@@ -689,13 +870,39 @@ class HiCacheKVCM(HiCacheStorage):
         self.read_iov_block_size = self.extra_config.get("read_iov_block_size", 0)
         self.write_iov_block_size = self.extra_config.get("write_iov_block_size", 0)
 
-        # TODO: the HF3FS backend is currently not well suited for hybrid
-        # (KV + Mamba) transfers.  A single IOV mempool is shared across
-        # all spec types, so when the specs of two pools differ significantly
-        # the mempool is either over-allocated for the smaller spec or too
-        # small for the larger one.  Per-spec IOV sizing would require changes
-        # to the HF3FS SDK itself.
-        self.iov_size = max(pool.size for pool in self.pool_specs.values()) * 1024
+        # The HF3FS backend allocates this area twice at Init (one read and one
+        # write iov, shared memory plus host-pinned through
+        # Hf3fsSdk::InitIovHandle) and every client of the instance pays for it,
+        # so it must not grow because a pool this connector did not back before is
+        # backed now: a client that cannot be created takes *all* of the
+        # instance's caching with it, while an area too small for one pool only
+        # costs that pool's transfers (each one fails its own allocation and is
+        # reported as a miss).  The default is therefore what it has always been
+        # -- _DEFAULT_IOV_BLOCK_COUNT blocks of the largest *table* pool -- and a
+        # pool the area cannot hold a full budget of is reported by capacity, not
+        # by "is bigger than the pools it is sized from".
+        #
+        # TODO: per-pool IOV areas would remove the trade-off; that needs changes
+        # to the HF3FS SDK.
+        known_block = max(
+            pool.size for pool in self.pool_specs.values() if not pool.spec.derived
+        )
+        # Must be an integer; a malformed value fails here, at startup, instead of
+        # being guessed at.
+        configured_iov_size = self.extra_config.get("iov_size_bytes")
+        self.iov_size = int(
+            known_block * _DEFAULT_IOV_BLOCK_COUNT
+            if configured_iov_size is None
+            else configured_iov_size
+        )
+        # ``self.iov_size`` reaches the data path only through the HF3FS SDK
+        # configs (``parse_hf3fs_configs``); a deployment using any other storage
+        # never allocates that area, so warning about its capacity would be a
+        # false alarm.
+        active_hf3fs = bool(self.parse_hf3fs_configs(self.storage_configs))
+        if active_hf3fs:
+            for pool in self.pool_specs.values():
+                self._report_iov_capacity(pool)
 
         sdk_backend_configs = list(self.extra_config.get("sdk_backend_configs", []))
 
@@ -740,32 +947,110 @@ class HiCacheKVCM(HiCacheStorage):
         )
 
     def _resolve_pool_specs(self) -> Mapping[Any, _RegisteredPool]:
-        """Resolve the spec table against the pools this instance registered.
+        """Resolve the spec rows against the pools this instance registered.
 
-        Pools keep the table order (anchor first); a pool that never registered
-        has no entry.  A sidecar's presence also decides the anchor's spec name
-        (``tp_{rank}`` vs ``tp_{rank}_full``), so the pool set is read once here
-        and every derived answer follows from it.  That predicate is the same
-        fact as ``has_sidecars``, which cannot be used here because this method
-        is what fills the state it reads.
+        The table rows come first, in table order (anchor first), then one
+        derived row per registered host pool the table does not know, in the
+        order sglang registered them.  That order is this connector's own and it
+        is stable (same engine build, same pool set, same order); the Manager
+        neither keeps it for the spec groups -- it sorts them by name
+        (``config/instance_info.cc::SortLocationSpecGroups``) -- nor derives any
+        id from it.  What *is* order-sensitive is ``location_spec_infos``, which
+        the Manager compares element by element against the stored copy
+        (``config/instance_info.h::MismatchFields``), hence the stable order here.
+        A pool that never registered has no entry.
+
+        Two pools may never share a location spec or a spec group: the Manager
+        would be handed the same spec name twice and the data path would write
+        one pool's bytes under the other pool's name, which no pool-local test
+        can see.  Table rows are held apart by the table's own invariants; a
+        derived row is refused (that pool falls back to "not backed", i.e. to
+        misses) instead, because its name comes from the engine.
+
+        A backed sidecar also decides the anchor's spec name (``tp_{rank}`` vs
+        ``tp_{rank}_full``), so the sidecar set is decided once here and every
+        derived answer follows from it.  That predicate is the same fact as
+        ``has_sidecars``, which cannot be used here because this method is what
+        fills the state it reads.
         """
-        registered = [
-            spec for spec in _POOL_SPECS if spec.pool in self.registered_pools
+        static = [spec for spec in _POOL_SPECS if spec.pool in self.registered_pools]
+        known = {spec.pool for spec in static}
+        derived = [
+            _derived_pool_spec(name)
+            for name, pool in self.registered_pools.items()
+            if name not in known and isinstance(pool, HostKVCache)
         ]
-        hybrid_stack = any(not spec.anchor for spec in registered)
-        resolved = {}
-        for spec in registered:
-            own_rank = (
-                0 if spec.shared_across_ranks and self.is_mla_model else self.tp_rank
-            )
-            resolved[spec.pool] = _RegisteredPool(
+
+        def names_of(spec: _PoolSpec) -> set:
+            """Every spec name the row can emit, whichever anchor naming wins."""
+            return {
+                spec.spec_name(rank, hybrid)
+                for hybrid in (False, True)
+                for rank in range(self.tp_size)
+            }
+
+        # The anchor claims both of its names: which one it takes depends on the
+        # sidecars that survive below, and a derived pool must never land on
+        # either (a pool called "full" would otherwise take the hybrid name).
+        anchor = next((spec for spec in static if spec.anchor), None)
+        claimed_names = names_of(anchor) if anchor is not None else set()
+        claimed_groups = {anchor.group} if anchor is not None else set()
+        sidecars: List[tuple[_PoolSpec, int]] = []
+        rows = [(spec, False) for spec in static if not spec.anchor]
+        rows += [(spec, True) for spec in derived]
+        for spec, is_derived in rows:
+            if names_of(spec) & claimed_names or spec.group in claimed_groups:
+                if not is_derived:
+                    # Unreachable: TestPoolSpecTable holds the table apart.
+                    raise RuntimeError(f"two rows of _POOL_SPECS claim {spec.pool}")
+                self._report_unknown_pool(spec.pool)
+                continue
+            size = spec.spec_size(self.registered_pools[spec.pool])
+            if size <= 0:
+                # A spec of zero bytes is not a layout the Manager or the SDK can
+                # use (the SDK refuses a non-positive spec size outright), so the
+                # pool is not backed at all rather than breaking the instance.
+                if not is_derived:
+                    # Unreachable for a host pool; the anchor contract is its own.
+                    raise RuntimeError(f"{spec.pool} reports {size} bytes per block")
+                self._report_unusable_pool_spec(spec.pool, size)
+                continue
+            claimed_names |= names_of(spec)
+            claimed_groups.add(spec.group)
+            sidecars.append((spec, size))
+
+        hybrid_stack = bool(sidecars)
+
+        def row_of(spec: _PoolSpec, size: int) -> _RegisteredPool:
+            return _RegisteredPool(
                 spec=spec,
-                size=spec.spec_size(self.registered_pools[spec.pool], self.block_size),
+                size=size,
                 names=tuple(
                     spec.spec_name(rank, hybrid_stack) for rank in range(self.tp_size)
                 ),
-                own_rank=own_rank,
+                own_rank=(
+                    0
+                    if spec.shared_across_ranks and self.is_mla_model
+                    else self.tp_rank
+                ),
             )
+
+        resolved = {}
+        if anchor is not None:
+            resolved[anchor.pool] = row_of(
+                anchor, anchor.spec_size(self.registered_pools[anchor.pool])
+            )
+        for spec, size in sidecars:
+            resolved[spec.pool] = row_of(spec, size)
+            if spec.pool not in known:
+                logger.debug(
+                    "pool %s is not in the spec table; derived spec %s (%d bytes "
+                    "per block, group %s) from the pool itself",
+                    spec.pool,
+                    resolved[spec.pool].name,
+                    size,
+                    spec.group,
+                )
         return MappingProxyType(resolved)
 
     # TODO: delete once the stacked pool PRs land -- nothing in this tree reads
@@ -886,12 +1171,177 @@ class HiCacheKVCM(HiCacheStorage):
             pool_name,
         )
 
-    def _mark_pool_reported(self, pool_name: Any) -> bool:
-        """Record that a pool has been reported, returning False if it was."""
-        if pool_name in self._reported_pools:
+    def _mark_pool_reported(self, key: Any) -> bool:
+        """Record that something has been reported, returning False if it was.
+
+        The key is usually a pool name, but a report that is not about a pool
+        (a failed registration, for instance) passes a tuple of its own, and the
+        tuple carries the instance id because two instances in one process are
+        two deployments.
+        """
+        if key in self._reported_pools:
             return False
-        self._reported_pools.add(pool_name)
+        self._reported_pools.add(key)
         return True
+
+    def _report_register_failure(self, error: BaseException) -> None:
+        """Report a failed registration once per instance and cause.
+
+        ``_ensure_client`` retries on every storage call, so the same failure
+        would otherwise be logged once per call.  Three causes are told apart,
+        because only one of them can be fixed by changing the deployment's
+        identity:
+
+        * ``rejected`` -- the Manager answered and refused the registration as
+          such (a non-OK business status).  If the id it refused is already
+          registered with a different layout, the fix is a new ``instance_id``;
+          that is the case the log leads with, and the Manager's own message
+          (which names the mismatched fields) is attached;
+        * ``refused`` -- the Manager refused the HTTP request itself (4xx);
+        * ``unjudged`` -- nothing was decided: a 5xx, a broken envelope, a
+          transport failure, or a leader election the client already retried.
+
+        Only the first may name ``instance_id``; the other two are reported as
+        what they are, and stay warnings.
+
+        The classification cannot use ``isinstance(error, AssertionError)``: the
+        Manager client's ``KvCacheManagerHTTPError`` and
+        ``KvCacheManagerProtocolError`` inherit ``AssertionError`` as well (see
+        ``common/manager_client.py``), so a 503 or a broken envelope would be
+        read as "your layout was rejected" -- the one diagnosis whose fix costs a
+        full cache restart.
+
+        Deduplicated through ``_reported_pools`` like every other report, under a
+        key that carries the instance id: two instances in one process are two
+        deployments (sglang can detach and re-attach the backend with another
+        ``instance_id`` at runtime), while a re-created backend of the *same*
+        instance stays quiet because the diagnosis has not changed.
+        """
+        cause = self._register_failure_cause(error)
+        key = ("registerInstance", self.instance_id, cause)
+        if not self._mark_pool_reported(key):
+            logger.debug("registerInstance failed again (%s): %s", cause, error)
+            return
+        if cause == "unjudged":
+            logger.warning(
+                "registerInstance could not be judged by the Manager (transport, "
+                "protocol, server or leader-election failure), so nothing is "
+                "concluded about the layout of instance_id %s; the next storage "
+                "call retries. Error: %s",
+                self.instance_id,
+                error,
+            )
+            return
+        if cause == "refused":
+            logger.error(
+                "the Manager refused the registration request of instance_id %s "
+                "(instance_group %s) as a whole, so nothing is concluded about "
+                "the pool set; check the request fields and whether the connector "
+                "and the Manager agree on the API. Layout fingerprint %s. "
+                "Error: %s",
+                self.instance_id,
+                self.instance_group,
+                self.spec_fingerprint,
+                error,
+            )
+            return
+        logger.error(
+            "the Manager rejected the registration of instance_id %s "
+            "(instance_group %s) with the layout fingerprint %s (specs %s, "
+            "groups %s). If this id is already registered with a different "
+            "layout, that is a changed pool set -- registerInstance only accepts "
+            "a repeat when every field matches and there is no spec update API, so "
+            "it needs a new instance_id (and instance_group, if the pools moved "
+            "between storage groups). Any other rejection is about the request "
+            "itself, and the Manager's message says which field it refused: %s",
+            self.instance_id,
+            self.instance_group,
+            self.spec_fingerprint,
+            [spec["name"] for spec in self.location_spec_infos],
+            [group["name"] for group in self.location_spec_groups],
+            error,
+        )
+
+    @staticmethod
+    def _register_failure_cause(error: BaseException) -> str:
+        """Which of ``rejected`` / ``refused`` / ``unjudged`` a failure is.
+
+        See ``_report_register_failure`` for why the exception *types* decide
+        this and ``AssertionError`` cannot be the predicate.
+        """
+        if isinstance(error, KvCacheManagerProtocolError):
+            return "unjudged"
+        if isinstance(error, KvCacheManagerHTTPError):
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            return (
+                "refused" if status is not None and 400 <= status < 500 else "unjudged"
+            )
+        if isinstance(error, AssertionError):
+            message = str(error).lower()
+            if any(hint in message for hint in _REGISTER_REJECTED_HINTS):
+                return "rejected"
+            # Not identifiable: the Manager refused for a reason this connector
+            # cannot name, and retrying may still succeed.
+            return "unjudged"
+        return "unjudged"
+
+    def _report_unusable_pool_spec(self, pool_name: Any, size: int) -> None:
+        """Report once that a pool's block size cannot become a location spec."""
+        if not self._mark_pool_reported(pool_name):
+            return
+        logger.warning(
+            "pool %s reports %d bytes per block; a location spec of zero bytes is "
+            "not a layout the Manager or the SDK accepts, so this pool is not "
+            "backed and its transfers are reported as misses.",
+            pool_name,
+            size,
+        )
+
+    def _report_iov_capacity(self, pool: _RegisteredPool) -> None:
+        """Report a pool whose block does not fit the shared IOV area at all.
+
+        The area is allocated per *block*, not per call: ``Hf3fsSdk::Get``/``Put``
+        walk the operation one URI at a time, and each call allocates that block's
+        bytes from ``Hf3fsMempool`` and frees them again before the next one.  So
+        one block must fit; how many more fit only decides how many transfers can
+        be in flight at once, and running out there fails that block's
+        ``InitIovIor`` and reports it as a miss rather than corrupting anything.
+        A pool whose single block does not fit is therefore never backed, and
+        that is what this reports.
+        """
+        if pool.size <= 0:
+            # Cannot happen for a backed row (see ``_resolve_pool_specs``); a
+            # division here must never be able to fail the whole instance.
+            return
+
+        # Each direction is rounded up before use, with its own alignment:
+        # ``Hf3fsSdk::InitIovHandle`` rounds the configured area up to a multiple
+        # of that direction's ``iov_block_size`` and ``Hf3fsMempool::Alloc``
+        # rounds the requested block up to the same value, so a block and an area
+        # in one bucket fit even when the raw numbers say otherwise.  Read and
+        # write areas are separate, so each has to fit on its own.
+        def blocks(size: int, align: int) -> int:
+            return (size + align - 1) // align if align > 1 else size
+
+        fits = all(
+            blocks(self.iov_size, align) >= blocks(pool.size, align)
+            for align in (self.read_iov_block_size, self.write_iov_block_size)
+        )
+        if fits:
+            return
+        tokens = int(getattr(self.registered_pools[pool.spec.pool], "page_size", 1))
+        logger.error(
+            "pool %s moves %d bytes per block and the shared iov area "
+            "(read_iov_size=write_iov_size=%d) does not hold even one of them, so "
+            "every transfer of this pool fails to allocate and its data is never "
+            "backed. Set iov_size_bytes to at least %d (one block; about %d tokens "
+            "of this pool) -- larger values only allow more transfers in flight.",
+            pool.spec.pool,
+            pool.size,
+            self.iov_size,
+            pool.size,
+            tokens,
+        )
 
     def _report_unsupported_kv_pool(self, pool: Any) -> None:
         """Report once that the KV anchor is not a host pool.
@@ -1012,6 +1462,16 @@ class HiCacheKVCM(HiCacheStorage):
                     self._report_unknown_pool(transfer.name)
                     results[transfer.name] = [False] * len(keys)
                     continue
+                host_indices = self._transfer_host_indices(transfers, transfer)
+                if host_indices is None:
+                    logger.debug(
+                        "pool %s: no host indices and no resolvable source pool "
+                        "(%r); reporting a miss instead of moving data",
+                        transfer.name,
+                        transfer.indices_from_pool,
+                    )
+                    results[transfer.name] = [False] * len(keys)
+                    continue
 
                 block_keys, _, _ = self._prepare_block_keys(keys)
                 get_request = {
@@ -1037,7 +1497,9 @@ class HiCacheKVCM(HiCacheStorage):
                     results[transfer.name] = [False] * len(keys)
                     continue
 
-                ptr_list, size_list, components = self._page_buffer_meta(pool, transfer)
+                ptr_list, size_list, components = self._page_buffer_meta(
+                    pool, transfer, host_indices
+                )
                 ptr_list = [
                     p
                     for i, p in enumerate(ptr_list)
@@ -1388,6 +1850,12 @@ class HiCacheKVCM(HiCacheStorage):
         for the blocks that every rank reported -- a rank-sharded sidecar is
         complete in storage only when all of its shards are.  A transfer only
         rank 0 receives is written here without peers.
+
+        For a cooperative transfer every rank must reach both collectives
+        (``broadcast_object_list`` for the session, ``_join_commit_reduce`` for
+        the commit), whatever it decides locally: which ranks can resolve the
+        indices, parse the mask or find anything left to write can differ, and a
+        branch that returns early leaves its peers blocked forever.
         """
         results = {}
         trace_id = self._get_trace_id()
@@ -1395,6 +1863,12 @@ class HiCacheKVCM(HiCacheStorage):
             # The group agreement, for the calls that will reach a collective
             # below (see _ensure_client_for_write).
             self._ensure_client_for_write(transfers)
+            # Which transfers run collectively has to be the same set on every
+            # rank, and it cannot be inferred from the local list: a rank may be
+            # handed a transfer its peers are not (sglang filters replicated
+            # pools to rank 0 on MLA, and a sidecar whose source pool is present
+            # here but not there is resolvable on this rank alone).
+            collective = self._agree_collective_transfers(transfers)
             for transfer in transfers:
                 spec_name = self._get_extra_pool_spec_name(transfer.name)
                 pool = self.registered_pools.get(transfer.name)
@@ -1410,30 +1884,55 @@ class HiCacheKVCM(HiCacheStorage):
                     self._report_unknown_pool(transfer.name)
                     results[transfer.name] = [False] * len(keys)
                     continue
+                host_indices = self._transfer_host_indices(transfers, transfer)
+                if host_indices is None:
+                    # Decided below, but *after* the collective: a rank that
+                    # cannot resolve the indices must still take part in the
+                    # session handshake or its peers wait forever.  Whether the
+                    # indices resolve can differ per rank, the collective cannot.
+                    logger.debug(
+                        "pool %s: no host indices and no resolvable source pool "
+                        "(%r); refusing to write",
+                        transfer.name,
+                        transfer.indices_from_pool,
+                    )
 
                 spec_group = self._get_extra_pool_spec_group(transfer.name)
                 block_keys, _, _ = self._prepare_block_keys(keys)
                 # Every rank sglang hands this transfer to takes part in the
                 # session; the others are not called for it at all, so waiting
-                # for them would hang.
-                shared = self._transfer_is_written_by_every_rank(transfer)
+                # for them would hang.  ``collective`` is the agreed set, so a
+                # transfer only this rank was handed is never written here.
+                shared = transfer.name in collective
+                if not shared and self._transfer_is_written_by_every_rank(transfer):
+                    self._report_rank_local_shared_transfer(transfer.name)
+                    results[transfer.name] = [False] * len(keys)
+                    continue
 
                 if self.tp_rank == 0:
-                    start_trace_id = f"start-v2-{trace_id}"
-                    request = {
-                        "trace_id": start_trace_id,
-                        "instance_id": self.instance_id,
-                        "block_keys": block_keys,
-                        "location_spec_group_names": [spec_group] * len(block_keys),
-                        "write_timeout_seconds": self.write_timeout_seconds,
-                    }
-                    try:
-                        write_result = self._manager_client.start_write_cache(request)
-                    except Exception as e:
-                        logger.error(
-                            f"start_write_cache failed on rank 0: {trace_id=} {e=}"
-                        )
+                    if host_indices is None:
+                        # No session to open: there is nothing to fill it with on
+                        # any rank that takes part.  The broadcast below still
+                        # runs, so the peers learn it instead of waiting.
                         write_result = None
+                    else:
+                        start_trace_id = f"start-v2-{trace_id}"
+                        request = {
+                            "trace_id": start_trace_id,
+                            "instance_id": self.instance_id,
+                            "block_keys": block_keys,
+                            "location_spec_group_names": [spec_group] * len(block_keys),
+                            "write_timeout_seconds": self.write_timeout_seconds,
+                        }
+                        try:
+                            write_result = self._manager_client.start_write_cache(
+                                request
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"start_write_cache failed on rank 0: {trace_id=} {e=}"
+                            )
+                            write_result = None
                     if shared and self.tp_world_size > 1:
                         torch.distributed.broadcast_object_list(
                             [write_result], src=0, group=self.storage_tp_group
@@ -1452,7 +1951,13 @@ class HiCacheKVCM(HiCacheStorage):
                     )
                     results[transfer.name] = [False] * len(keys)
                     continue
-                if write_result is None:
+                if host_indices is None or write_result is None:
+                    # Nothing to write here, but the peers of a shared transfer
+                    # may have a session: this rank still enters the group's
+                    # reduce (with zero) or they block on it forever.  Blocks are
+                    # committed on the group's minimum, so a zero is exactly
+                    # "this rank wrote nothing".
+                    self._join_commit_reduce(False, shared)
                     results[transfer.name] = [False] * len(keys)
                     continue
 
@@ -1484,6 +1989,7 @@ class HiCacheKVCM(HiCacheStorage):
                             )
                         except Exception as e:
                             logger.error(f"finish_write_cache failed: {e}")
+                    self._join_commit_reduce(False, shared)
                     results[transfer.name] = [False] * len(keys)
                     continue
 
@@ -1507,7 +2013,11 @@ class HiCacheKVCM(HiCacheStorage):
                             )
                         except Exception as e:
                             logger.error(f"finish_write_cache failed: {e}")
-                    results[transfer.name] = [True] * len(keys)
+                    # Already in storage on this rank, so it contributes True;
+                    # the reduce still has to happen, because a peer that cannot
+                    # write this transfer is waiting on it.
+                    cached = self._join_commit_reduce(True, shared)
+                    results[transfer.name] = [cached] * len(keys)
                     continue
 
                 assert len(save_indices) + _prefix_write_count == len(locations)
@@ -1517,7 +2027,7 @@ class HiCacheKVCM(HiCacheStorage):
                 # all_reduce below, preventing cross-rank NCCL/gloo hangs.
                 try:
                     ptr_list, size_list, components = self._page_buffer_meta(
-                        pool, transfer
+                        pool, transfer, host_indices
                     )
                     save_set = set(save_indices)
                     ptr_list = [
@@ -1558,16 +2068,9 @@ class HiCacheKVCM(HiCacheStorage):
                     )
                     flag = False
 
-                if shared and self.tp_world_size > 1:
-                    # The block is complete in storage only when every rank
-                    # wrote its slice: commit on the group's minimum.
-                    flag_tensor = torch.tensor(flag, dtype=torch.int)
-                    torch.distributed.all_reduce(
-                        flag_tensor,
-                        op=torch.distributed.ReduceOp.MIN,
-                        group=self.storage_tp_group,
-                    )
-                    flag = bool(flag_tensor.item())
+                # The block is complete in storage only when every rank wrote
+                # its slice: commit on the group's minimum.
+                flag = self._join_commit_reduce(flag, shared)
 
                 finish_mask = [flag] * len(locations)
                 if self.tp_rank == 0:
@@ -1861,9 +2364,12 @@ class HiCacheKVCM(HiCacheStorage):
 
     @staticmethod
     def _page_buffer_meta(
-        pool: Any, transfer: PoolTransfer
+        pool: Any, transfer: PoolTransfer, host_indices: torch.Tensor
     ) -> tuple[List[int], List[int], int]:
         """Per-page zero-copy meta of an extra pool plus its IOVs per page.
+
+        ``host_indices`` come from the transfer itself or from the pool it rides
+        on (see ``_transfer_host_indices``).
 
         The component count is read back from the pool's own output instead of
         being derived from pool internals: mamba pools emit a temporal IOV only
@@ -1873,10 +2379,6 @@ class HiCacheKVCM(HiCacheStorage):
         position, so both a wrong component count and a page/key mismatch would
         silently shift every page's data.  Both are asserted here instead.
         """
-        host_indices = transfer.host_indices
-        assert host_indices is not None, (
-            f"pool transfer {transfer.name} carries no host indices"
-        )
         ptr_list, size_list = pool.get_page_buffer_meta(host_indices)
         num_pages = len(host_indices) // pool.page_size
         assert num_pages == len(transfer.keys or []), (
@@ -1895,10 +2397,10 @@ class HiCacheKVCM(HiCacheStorage):
 
     def _get_extra_pool_spec_group(self, pool_name: Any) -> str:
         """Spec group name used in start_write_cache for an extra pool."""
-        spec = _pool_spec(pool_name)
-        if spec is None or spec.anchor:
+        pool = self._extra_pool(pool_name)
+        if pool is None:
             raise ValueError(f"Unknown extra pool: {pool_name}")
-        return spec.group
+        return pool.spec.group
 
     def _get_extra_pool_spec_size(self, pool_name: Any) -> int:
         """Per-block spec size in bytes for bandwidth tracking."""
@@ -1911,6 +2413,36 @@ class HiCacheKVCM(HiCacheStorage):
         if pool is None or pool.spec.anchor:
             return None
         return pool
+
+    def _transfer_host_indices(
+        self, transfers: List[PoolTransfer], transfer: PoolTransfer
+    ) -> Optional[torch.Tensor]:
+        """The host indices a transfer moves, following a sidecar to its source.
+
+        A sidecar sglang's tree builds carries ``indices_from_pool`` and no host
+        indices of its own: it reuses another pool's slots and only the bytes
+        behind them belong to the sidecar.  The engine normally materializes
+        them before calling the backend (``HostPoolGroup.resolve_host_transfers``
+        does the same lookup, ``pool_host/group.py``); when it has not, the
+        sibling transfer of the same call is the source -- and one hop is all
+        there is, because a source is a pool of its own.  A source outside the
+        call (the KV anchor is not part of a v2 call) stays unresolved, and the
+        caller answers conservatively instead of raising: an exception here would
+        kill the backup thread it runs on.
+        """
+        if transfer.host_indices is not None:
+            return transfer.host_indices
+        source = transfer.indices_from_pool
+        if source is None:
+            return None
+        return next(
+            (
+                other.host_indices
+                for other in transfers
+                if other.name == source and other.host_indices is not None
+            ),
+            None,
+        )
 
     def _prepare_extra_pool_buffers(
         self, ptr_list: List[int], size_list: List[int], components_per_page: int
@@ -1954,10 +2486,11 @@ class HiCacheKVCM(HiCacheStorage):
         """
         spec_name = self._get_extra_pool_spec_name(transfer.name)
         if spec_name is None or transfer.name in self._late_pools:
-            # Unmanaged pool (e.g. a newer sglang side pool such as SWA) or a
-            # pool that showed up after the specs were frozen: its data is
-            # never written, so claiming hits here would only make the caller
-            # move KV pages that batch_get_v2 then reports as misses.
+            # No spec was registered for this pool -- it was never registered,
+            # arrived after the specs were frozen, or its name would share
+            # another pool's spec: its data is never written, so claiming hits
+            # here would only make the caller move KV pages that batch_get_v2
+            # then reports as misses.
             self._report_unknown_pool(transfer.name)
             return 0
 
@@ -1989,14 +2522,35 @@ class HiCacheKVCM(HiCacheStorage):
         )
         return 0
 
+    def _join_commit_reduce(self, flag: bool, shared: bool) -> bool:
+        """Fold this rank's contribution into the group's commit flag.
+
+        A shared transfer commits a block only when every rank that takes part
+        reported it written, so this is one ``all_reduce(MIN)`` over the group
+        and *every* participating rank has to call it exactly once -- whatever
+        it decided locally.  A branch that returns without it leaves its peers
+        blocked on the collective forever, and whether the indices resolve, the
+        mask parses or anything needs writing can differ per rank.
+        """
+        if not (shared and self.tp_world_size > 1):
+            return flag
+        flag_tensor = torch.tensor(flag, dtype=torch.int)
+        torch.distributed.all_reduce(
+            flag_tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.storage_tp_group,
+        )
+        return bool(flag_tensor.item())
+
     def _report_unknown_pool(self, pool_name: Any) -> None:
-        """Report once that sglang moved data for a pool we do not manage."""
+        """Report once that sglang moved data for a pool this instance misses."""
         if not self._mark_pool_reported(pool_name):
             return
         logger.warning(
-            "pool %s is not backed by this connector: its transfers are "
-            "reported as misses and its data is neither read from nor written "
-            "to KVCM (unknown pool, or registered after initialization).",
+            "pool %s is not backed by this connector: no location spec was "
+            "registered for it, so its transfers are reported as misses (the "
+            "pool was never registered, arrived after the specs were frozen, "
+            "or its name would share another pool's spec).",
             pool_name,
         )
 
