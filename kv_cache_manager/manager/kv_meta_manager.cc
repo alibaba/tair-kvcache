@@ -215,6 +215,7 @@ public:
         Clock::time_point deadline;
         std::vector<KvMetaManager::SessionItem> items;
         bool cleanup_only = false;
+        bool release_allocation = false;
     };
 
     KvMetaWriteSessionManager(KvMetaManager *owner, std::size_t max_sessions)
@@ -306,10 +307,11 @@ public:
         return out.deadline <= Clock::now() ? EC_TIMEOUT : EC_OK;
     }
 
-    void ScheduleCleanup(const std::string &session_id, Session session) noexcept {
+    void ScheduleCleanup(const std::string &session_id, Session session, bool release_allocation = true) noexcept {
         try {
             session.deadline = Clock::now() + std::chrono::seconds(1);
             session.cleanup_only = true;
+            session.release_allocation = release_allocation;
             std::lock_guard<std::mutex> lock(mutex_);
             if (stopping_) {
                 return;
@@ -356,8 +358,12 @@ private:
                 }
             }
             for (auto &[session_id, session] : expired) {
-                if (owner_ && !owner_->ExpireSession(session_id, session.internal_instance_id, session.items)) {
-                    ScheduleCleanup(session_id, std::move(session));
+                const bool release_allocation = session.release_allocation;
+                if (owner_ && !owner_->ExpireSession(
+                                  session_id, session.internal_instance_id, session.items, release_allocation)) {
+                    // A retry must not turn an unacknowledged write into a
+                    // physically reclaimable allocation.
+                    ScheduleCleanup(session_id, std::move(session), release_allocation);
                 }
             }
         }
@@ -582,9 +588,8 @@ private:
                 KVCM_LOG_WARN("KVMeta reclaim failed for instance [%s], ec[%d]", instance_id.c_str(), ec);
             }
             if (!deleted.empty()) {
-                const auto delay = std::chrono::milliseconds(strategy->delay_before_delete_ms());
-                if (delay.count() > 0) {
-                    std::this_thread::sleep_for(delay);
+                if (!owner_->WaitForDeletionDelay(strategy->delay_before_delete_ms())) {
+                    return;
                 }
                 owner_->DeletePhysicalBestEffort(&context, deleted);
             }
@@ -665,7 +670,11 @@ void KvMetaManager::DoCleanup() {
 
 void KvMetaManager::CancelMaintenance() noexcept {
     recovery_complete_.store(false, std::memory_order_release);
-    maintenance_cancelled_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(maintenance_mutex_);
+        maintenance_cancelled_.store(true, std::memory_order_release);
+    }
+    maintenance_condition_.notify_all();
     if (reclaimer_) {
         reclaimer_->RequestStop();
     }
@@ -1096,6 +1105,20 @@ ErrorCode KvMetaManager::DeleteItems(RequestContext *request_context,
             overall = FirstHardError(overall, result.ec);
         }
     }
+    if ((delete_physical || deleted_items) && !physically_deleted.empty()) {
+        KeyVector deleted_keys;
+        LocationIdsPerKey deleted_ids;
+        for (const auto &item : physically_deleted) {
+            deleted_keys.push_back(item.internal_key);
+            deleted_ids.push_back({item.location_id});
+        }
+        if (!indexer->SyncDeletedLocations(request_context, deleted_keys, deleted_ids)) {
+            // Retain orphaned storage rather than free an address that recovery
+            // could still expose. Usage follows the accepted metadata mutation.
+            physically_deleted.clear();
+            overall = FirstHardError(overall, EC_ERROR);
+        }
+    }
     mutation_lock.unlock();
     if (deleted_items) {
         *deleted_items = physically_deleted;
@@ -1220,6 +1243,9 @@ KvMetaManager::StartWrite(RequestContext *request_context,
             inserted = true;
             return {MA_OK, {EC_OK}};
         };
+        const std::size_t mutation_shard =
+            std::hash<std::string>{}(internal_instance_id) % metadata_mutation_mutexes_.size();
+        std::lock_guard<std::mutex> mutation_lock(metadata_mutation_mutexes_[mutation_shard]);
         const auto result = indexer->ReadModifyWriteTargetLocations(
             request_context, {candidate.internal_key}, {{candidate.location_id}}, modifier);
         if (result.per_location_error_codes.size() != 1 || result.per_location_error_codes[0].size() != 1) {
@@ -1370,7 +1396,8 @@ ErrorCode KvMetaManager::FinishWrite(RequestContext *request_context,
 
     auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(internal_instance_id);
     if (!indexer) {
-        DeletePhysicalBestEffort(request_context, session.items);
+        // Without the indexer we cannot confirm that persistent metadata no
+        // longer references these allocations.
         return EC_INSTANCE_NOT_EXIST;
     }
     const std::size_t mutation_shard =
@@ -1501,20 +1528,32 @@ ErrorCode KvMetaManager::Remove(RequestContext *request_context,
         if (group_ec == EC_OK && group && group->cache_config() && group->cache_config()->reclaim_strategy()) {
             delay_ms = std::max<std::int32_t>(0, group->cache_config()->reclaim_strategy()->delay_before_delete_ms());
         }
-        if (delay_ms > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        if (!WaitForDeletionDelay(delay_ms)) {
+            // Metadata has already changed; a leader redirect would invite
+            // automatic retries against a replacement generation.
+            return EC_ERROR;
         }
         DeletePhysicalBestEffort(request_context, deleted);
     }
     return delete_ec;
 }
 
+bool KvMetaManager::WaitForDeletionDelay(std::int32_t delay_ms) {
+    std::unique_lock<std::mutex> lock(maintenance_mutex_);
+    return !maintenance_condition_.wait_for(lock, std::chrono::milliseconds(delay_ms), [this]() {
+        return maintenance_cancelled_.load(std::memory_order_acquire);
+    });
+}
+
 bool KvMetaManager::ExpireSession(const std::string &session_id,
                                   const std::string &internal_instance_id,
-                                  const std::vector<SessionItem> &items) noexcept {
+                                  const std::vector<SessionItem> &items,
+                                  bool delete_physical) noexcept {
     try {
         RequestContext context("kv_meta_session_expire_" + session_id);
-        return DeleteItems(&context, internal_instance_id, items, true, true) == EC_OK;
+        // A lease timeout does not fence an outstanding PACE write. Only
+        // acknowledged or never-published allocations may be released.
+        return DeleteItems(&context, internal_instance_id, items, delete_physical, true) == EC_OK;
     } catch (const std::exception &e) { KVCM_LOG_WARN("KVMeta session expiry failed: %s", e.what()); } catch (...) {
         KVCM_LOG_WARN("KVMeta session expiry failed with unknown exception");
     }
@@ -1528,6 +1567,9 @@ ErrorCode KvMetaManager::DoRecover() {
     recovery_complete_.store(false, std::memory_order_release);
     if (maintenance_cancelled_.load(std::memory_order_acquire)) {
         return EC_SERVICE_NOT_LEADER;
+    }
+    if (!registry_manager_->IsRecoverComplete()) {
+        return EC_CONFIG_ERROR;
     }
     RequestContext context("kv_meta_recover");
     const auto [groups_ec, groups] = registry_manager_->ListInstanceGroup(&context);
@@ -1610,7 +1652,9 @@ ErrorCode KvMetaManager::DoRecover() {
                         }
                     }
                     if (instance_ec == EC_OK && !stale.empty()) {
-                        instance_ec = DeleteItems(&context, instance->instance_id(), stale, true, true, nullptr, true);
+                        // The previous writer may still own these addresses.
+                        // Hide abandoned writes, but do not recycle them.
+                        instance_ec = DeleteItems(&context, instance->instance_id(), stale, false, true, nullptr, true);
                     }
                 }
                 cursor = std::move(batch.next_cursor);

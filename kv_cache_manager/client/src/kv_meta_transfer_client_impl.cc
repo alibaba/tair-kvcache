@@ -90,7 +90,15 @@ ClientErrorCode KvMetaTransferClientImpl::LoadObjects(const UriStrVec &uri_str_v
         return ER_INVALID_SDKWRAPPER_CONFIG;
     }
     SetAllowedObjectSizes(value_sizes);
-    const auto ec = sdk_wrapper_->Get(ParseLocations(uri_str_vec), object_buffers);
+    ClientErrorCode ec;
+    try {
+        ec = sdk_wrapper_->Get(ParseLocations(uri_str_vec), object_buffers);
+    } catch (...) {
+        // A failed future can leave peer tasks running. Join them before
+        // the caller reuses buffers or reports the write session finished.
+        sdk_wrapper_.reset();
+        throw;
+    }
     if (ec == ER_SDK_TIMEOUT) {
         // SdkWrapper's deadline is advisory: its backend task can still own
         // the caller's buffer after Get returns. Destroying the private
@@ -113,7 +121,13 @@ std::pair<ClientErrorCode, UriStrVec> KvMetaTransferClientImpl::SaveObjects(
     }
     SetAllowedObjectSizes(value_sizes);
     auto actual_locations = std::make_shared<std::vector<DataStorageUri>>();
-    const auto ec = sdk_wrapper_->Put(ParseLocations(uri_str_vec), object_buffers, actual_locations);
+    ClientErrorCode ec;
+    try {
+        ec = sdk_wrapper_->Put(ParseLocations(uri_str_vec), object_buffers, actual_locations);
+    } catch (...) {
+        sdk_wrapper_.reset();
+        throw;
+    }
     if (ec == ER_SDK_TIMEOUT) {
         sdk_wrapper_.reset();
     }

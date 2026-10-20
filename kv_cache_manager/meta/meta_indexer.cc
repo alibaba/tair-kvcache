@@ -2090,6 +2090,12 @@ size_t MetaIndexer::GetMemUsage() const noexcept { return backend_manager_->GetM
 
 bool MetaIndexer::Sync(const KeyVector &keys) noexcept { return backend_manager_->Sync(keys); }
 
+bool MetaIndexer::SyncDeletedLocations(RequestContext *request_context,
+                                       const KeyVector &keys,
+                                       const LocationIdsPerKey &location_ids) noexcept {
+    return backend_manager_->SyncDeletedLocations(request_context, keys, location_ids);
+}
+
 bool MetaIndexer::SyncAll() noexcept { return backend_manager_->SyncAll(); }
 
 MetaStorageBackend::AsyncWriteStats MetaIndexer::GetAsyncWriteStats() noexcept {

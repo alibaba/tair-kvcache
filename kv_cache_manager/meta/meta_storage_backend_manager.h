@@ -193,6 +193,11 @@ public:
     // Synchronously flush pending writes for the given keys to persistent storage.
     // Returns true on success, false on failure/timeout.
     bool Sync(const KeyVector &keys) noexcept;
+    // Callers must fence same-key mutations until this check completes.
+    // An async barrier alone cannot prove that an earlier failed/dropped delete persisted.
+    bool SyncDeletedLocations(RequestContext *request_context,
+                              const KeyVector &keys,
+                              const LocationIdsPerKey &location_ids) noexcept;
     bool SyncAll() noexcept;
     bool SyncBeforeMaintenanceRead(const KeyVector &keys) noexcept { return memory_primary_ || Sync(keys); }
     bool IsMemoryPrimary() const noexcept { return memory_primary_; }

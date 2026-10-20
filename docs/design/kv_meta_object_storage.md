@@ -90,10 +90,12 @@ stateDiagram-v2
 3. 对 miss 使用真实 size 向 PACE 分配空间。
 4. 条件创建 `WRITING` metadata，并记录有期限的内存 write session。
 5. 客户端直接向 PACE 写 bytes。
-6. `PutFinish` 全部成功时，条件执行 `WRITING -> SERVING` 并增加 usage。
+6. 客户端确认全部数据面写入已结束后调用 `PutFinish`；全部成功时，条件执行 `WRITING -> SERVING` 并增加 usage。
 7. 任一失败则清理本 session 的全部 generation，并尽力释放 allocation。
 
 多 key session 提供整批最终成功/失败语义，但不保证多个 key 同时线性化可见。
+
+超时不能证明后台 I/O 已停止。未收到客户端结束确认的 `WRITING` 只清理 metadata，保留 allocation，避免旧写入污染复用地址。
 
 ### 3.2 读取
 
@@ -111,8 +113,8 @@ stateDiagram-v2
 2. 对 `WRITING` 返回 `WRITE_IN_PROGRESS`。
 3. 按 generation 条件删除 metadata。
 4. 删除成功才扣 usage。
-5. 等待 `delay_before_delete_ms`。
-6. best-effort 删除 PACE allocation。
+5. 确认 metadata 删除已持久化，否则保留 allocation 并返回错误。
+6. 等待 `delay_before_delete_ms` 后，best-effort 删除 PACE allocation；等待被降主/退出打断时保留 allocation。
 
 不存在的 key 视为删除成功。transport error 时结果可能未知，不能盲目重试。
 
@@ -130,7 +132,7 @@ PACE URI 的 size
 
 同一个 object client 的 Save/Load 串行执行，并在 `PutStart` 前取得 data-plane mutex，避免本地排队消耗 write lease。不同 client 仍可并发，由服务端条件写协调。
 
-SDK timeout 后会销毁私有 wrapper并等待后台任务退出，防止旧任务继续访问 buffer 或已经释放的 allocation；该 data-plane client 随后不再可用。
+SDK 超时或抛异常后会销毁私有 wrapper 并等待后台任务退出，防止旧任务继续访问 buffer 或已经释放的 allocation；该 data-plane client 随后不再可用。
 
 ## 5. 容量统计和准入
 
@@ -151,13 +153,13 @@ group_usage          = Σ group 内全部 KVMeta instance_usage
 | 条件删除失败 | 不变 |
 | PACE 物理删除失败 | 不恢复 |
 
-提交和删除使用同一把 instance 分片 mutation lock，使 metadata 状态变化和 usage 增减不交叉。`PutStart` 不进入该锁，因为 `WRITING` 不计 usage。
+metadata 发布、提交和删除使用同一把 instance 分片 mutation lock，使 usage 更新和持久化删除确认不与新 generation 交叉；PACE 分配不持有该锁。
 
 usage 是逻辑已提交字节，不等于 PACE 物理占用，不包含：
 
 - `WRITING` allocation。
 - allocator 对齐和管理开销。
-- metadata 已删除但物理删除失败的孤儿 allocation。
+- metadata 已删除但物理删除失败、取消或无法确认写入停止而保留的孤儿 allocation。
 - PACE Create 后、metadata 发布前崩溃留下的 allocation。
 
 ### 5.2 快照准入
@@ -191,7 +193,7 @@ excess   = group_usage - target
 5. 重新读取 metadata，只保留合法 `SERVING` generation。
 6. 选择至多一个 batch，或预计删除字节达到 `excess`。
 7. generation 条件删除 metadata；只有成功删除才扣 usage。
-8. 等待 reader grace period，best-effort 删除 PACE allocation。
+8. 确认删除已持久化，再等待 reader grace period，best-effort 删除 PACE allocation。
 9. 后续轮次继续采样，直到 usage 回到 target 以下。
 
 这是异步采样 LRU，不是每轮全量排序。persistent source 保证 hot-cache 淘汰的 key 仍有机会被回收；maintenance 查询不会刷新 LRU。
@@ -200,9 +202,9 @@ excess   = group_usage - target
 
 ## 7. 恢复和服务隔离
 
-升主后先恢复并放流普通 KVCache，再启动 KVMeta maintenance worker。KVMeta 在首轮 GC 前扫描 persistent metadata：
+升主后启动 KVMeta maintenance worker，等待 Registry 完整恢复及相关 MetaIndexer 创建完成，在首轮 GC 前扫描 persistent metadata：
 
-- 删除遗留 `WRITING` 并释放 allocation。
+- 删除遗留 `WRITING` metadata，保留可能仍被旧客户端写入的 allocation。
 - 汇总全部合法 `SERVING` size。
 - 重建每个 MetaIndexer 的 usage。
 
@@ -261,11 +263,13 @@ RTP 仍负责 singleflight、回源、内容校验、poisoned entry 修复、指
 | Get miss | 重算 embedding |
 | PACE allocation/I/O 失败 | cache 失败，推理继续 |
 | PutFinish/Remove transport error | 结果可能未知，不盲目重试 |
-| session 超时 | 后台条件清理 |
+| session 超时或恢复遇到 `WRITING` | 条件清理 metadata，保留 allocation |
 | PACE Delete 失败 | metadata 已 miss，记录孤儿风险 |
 | Leader 恢复未完成 | KVMeta 暂不可用，普通 MetaService 不受影响 |
 
 V1 不提供强一致容量 reservation、跨 key 原子可见、持久化 session、read lease、内容 checksum、多 tier 混合存储和 `Trim` handler。
+
+PACE 接口尚无写入隔离机制。KVMeta 无法安全自动回收未获客户端结束确认的 allocation，因此这些孤儿仍占物理容量。
 
 主要限制：
 
@@ -284,7 +288,7 @@ V1 不提供强一致容量 reservation、跨 key 原子可见、持久化 sessi
 
 - session 使用 `steady_clock` deadline，避免系统时间回拨。
 - session map 满时，在创建新 PACE allocation 前拒绝请求。
-- 超时或失败清理 metadata；清理失败转为 cleanup-only session，每秒重试。
+- 后台超时只清理 metadata；显式 `PutFinish` 确认全部写入停止后，才可释放 allocation。metadata 清理失败转为 cleanup-only session，每秒重试。
 - PACE Create 成功但 metadata 尚未发布时失败，直接 best-effort Delete。
 - 若进程恰在 Create 后、metadata 发布前崩溃，Leader recovery 无法从 metadata 发现该 allocation。
 

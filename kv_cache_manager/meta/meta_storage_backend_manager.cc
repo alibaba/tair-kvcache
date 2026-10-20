@@ -2230,6 +2230,31 @@ bool MetaStorageBackendManager::Sync(const KeyVector &keys) noexcept {
     return persistent_backend_->Sync(keys);
 }
 
+bool MetaStorageBackendManager::SyncDeletedLocations(RequestContext *request_context,
+                                                     const KeyVector &keys,
+                                                     const LocationIdsPerKey &location_ids) noexcept {
+    if (keys.size() != location_ids.size() || !persistent_backend_ || !Sync(keys)) {
+        return false;
+    }
+    LocationsPerKey locations;
+    const auto results =
+        persistent_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, locations);
+    if (results.size() != keys.size() || locations.size() != keys.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (results[i].size() != location_ids[i].size() || locations[i].size() != location_ids[i].size()) {
+            return false;
+        }
+        for (std::size_t j = 0; j < location_ids[i].size(); ++j) {
+            if (results[i][j] != EC_NOENT || locations[i][j]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool MetaStorageBackendManager::SyncAll() noexcept {
     if (!persistent_backend_) {
         return true;

@@ -22,8 +22,15 @@ from kv_cache_manager.client.kv_meta_object_client import (
 
 class _Code(IntEnum):
     ER_OK = 0
+    ER_INVALID_STUB = 1
     ER_INVALID_GRPCSTATUS = 2
+    ER_INVALID_PARAMS = 3
+    ER_CLIENT_NOT_EXISTS = 15
+    ER_SERVICE_NO_STATUS = 50
     ER_FAILED = 51
+    ER_SERVICE_WRITE_IN_PROGRESS = 61
+    ER_SERVICE_IO_ERROR = 64
+    ER_SDK_TIMEOUT = 100
 
 
 class _Memory(IntEnum):
@@ -686,19 +693,68 @@ class KvMetaObjectClientTest(unittest.TestCase):
                     client.save(["key"], [_Tensor()])
                 self.assertTrue(raised.exception.unknown_outcome)
 
-    def test_unknown_integer_mutation_code_is_ambiguous_but_known_code_is_not(self):
+    def test_remove_service_errors_and_unknown_codes_are_ambiguous(self):
         client, native, _ = _client()
         self.addCleanup(client.close)
 
-        native.results["Remove"] = [987654]
-        with self.assertRaises(KvMetaObjectClientError) as unknown:
-            client.remove(["unknown"])
-        self.assertTrue(unknown.exception.unknown_outcome)
+        for code in (
+            987654,
+            _Code.ER_SERVICE_NO_STATUS,
+            _Code.ER_FAILED,
+            _Code.ER_SERVICE_WRITE_IN_PROGRESS,
+            _Code.ER_SERVICE_IO_ERROR,
+        ):
+            for result in (code, int(code)):
+                with self.subTest(code=code, result_type=type(result)):
+                    native.results["Remove"] = [result]
+                    with self.assertRaises(KvMetaObjectClientError) as raised:
+                        client.remove(["key"])
+                    self.assertTrue(raised.exception.unknown_outcome)
 
-        native.results["Remove"] = [_Code.ER_FAILED]
-        with self.assertRaises(KvMetaObjectClientError) as known:
-            client.remove(["known"])
-        self.assertFalse(known.exception.unknown_outcome)
+    def test_remove_local_rejections_have_known_outcome(self):
+        client, native, _ = _client()
+        self.addCleanup(client.close)
+        for code in (
+            _Code.ER_INVALID_STUB,
+            _Code.ER_INVALID_PARAMS,
+            _Code.ER_CLIENT_NOT_EXISTS,
+            _Code.ER_SDK_TIMEOUT,
+        ):
+            for result in (code, int(code)):
+                with self.subTest(code=code, result_type=type(result)):
+                    native.results["Remove"] = [result]
+                    with self.assertRaises(KvMetaObjectClientError) as raised:
+                        client.remove(["key"])
+                    self.assertFalse(raised.exception.unknown_outcome)
+                    self.assertEqual(raised.exception.completed_items, 0)
+
+    def test_partial_remove_keeps_failed_batch_unknown_and_stops(self):
+        client, native, _ = _client()
+        self.addCleanup(client.close)
+        keys = [f"key-{index}" for index in range(129)]
+        live = set(keys)
+
+        def partial_remove(trace_id, batch):
+            native.calls.append(("Remove", trace_id, batch))
+            if len(native.calls) == 1:
+                live.difference_update(batch)
+                return _Code.ER_OK
+            live.remove(batch[0])
+            return _Code.ER_FAILED
+
+        native.Remove = partial_remove
+        with self.assertRaises(KvMetaObjectClientError) as raised:
+            client.remove(keys)
+
+        error = raised.exception
+        self.assertEqual(live, set(keys[65:]))
+        self.assertEqual(len(native.calls), 2)
+        self.assertTrue(error.unknown_outcome)
+        self.assertEqual(error.completed_items, 64)
+        self.assertEqual(error.batch_index, 1)
+        self.assertEqual(error.batch_count, 3)
+        self.assertEqual(error.batch_start, 64)
+        self.assertEqual(error.batch_size, 64)
 
     def test_malformed_native_enum_registry_keeps_mutation_ambiguous(self):
         client, native, pybind = _client()
@@ -742,7 +798,7 @@ class KvMetaObjectClientTest(unittest.TestCase):
         self.assertEqual([len(call[2]) for call in native.calls], [64])
         self.assertEqual(error.batch_index, 0)
         self.assertEqual(error.completed_items, 0)
-        self.assertFalse(error.unknown_outcome)
+        self.assertTrue(error.unknown_outcome)
 
     def test_remove_success_batches_all_keys_and_empty_remove_is_a_noop(self):
         client, native, _ = _client()

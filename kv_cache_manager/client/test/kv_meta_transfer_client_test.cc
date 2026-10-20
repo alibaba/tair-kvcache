@@ -1,7 +1,10 @@
 #include <chrono>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -82,6 +85,9 @@ public:
     SdkType Type() override { return SdkType::TAIR_MEMPOOL; }
 
     ClientErrorCode Get(const std::vector<DataStorageUri> &uris, const BlockBuffers &) override {
+        if (before_io) {
+            before_io(uris);
+        }
         std::this_thread::sleep_for(delay);
         loaded = ToStrings(uris);
         seen_sizes = config_->spec_byte_sizes_per_block();
@@ -91,6 +97,9 @@ public:
     ClientErrorCode Put(const std::vector<DataStorageUri> &uris,
                         const BlockBuffers &,
                         std::shared_ptr<std::vector<DataStorageUri>> actual_uris) override {
+        if (before_io) {
+            before_io(uris);
+        }
         std::this_thread::sleep_for(delay);
         saved = ToStrings(uris);
         seen_sizes = config_->spec_byte_sizes_per_block();
@@ -103,6 +112,7 @@ public:
     ClientErrorCode load_result = ER_OK;
     ClientErrorCode save_result = ER_OK;
     std::chrono::milliseconds delay{0};
+    std::function<void(const std::vector<DataStorageUri> &)> before_io;
     UriStrVec loaded;
     UriStrVec saved;
     std::map<std::string, std::int64_t> seen_sizes;
@@ -139,7 +149,8 @@ public:
 std::unique_ptr<KvMetaTransferClientImpl> MakeTransferClient(RecordingSdkFactory &factory,
                                                              RecordingSdk *&recording,
                                                              std::uint64_t max_object_bytes = 32,
-                                                             int timeout_ms = 1000) {
+                                                             int timeout_ms = 1000,
+                                                             std::size_t thread_count = 1) {
     auto config = std::make_unique<ClientConfig>();
     EXPECT_TRUE(config->FromJsonString(R"({
         "instance_group": "group",
@@ -157,6 +168,7 @@ std::unique_ptr<KvMetaTransferClientImpl> MakeTransferClient(RecordingSdkFactory
     timeout.set_get_timeout_ms(timeout_ms);
     timeout.set_put_timeout_ms(timeout_ms);
     config->sdk_wrapper_config()->set_timeout_config(timeout);
+    config->sdk_wrapper_config()->set_thread_num(thread_count);
     InitParams params;
     params.self_location_spec_name = "value";
     params.storage_configs = R"([{
@@ -246,6 +258,52 @@ TEST(KvMetaTransferClientTest, TimeoutDrainsBackendAndClosesDataPlane) {
     EXPECT_EQ(ER_SDK_TIMEOUT, client->SaveObjects(uris, {sizeof(value)}, buffers).first);
     EXPECT_GE(std::chrono::steady_clock::now() - begin, std::chrono::milliseconds(40));
     EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, client->LoadObjects(uris, {sizeof(value)}, buffers));
+}
+
+TEST(KvMetaTransferClientTest, ExceptionDrainsPendingPeerBeforeReturningAndClosesDataPlane) {
+    for (const bool save : {false, true}) {
+        SCOPED_TRACE(save ? "save" : "load");
+        RecordingSdkFactory factory;
+        RecordingSdk *recording = nullptr;
+        auto client = MakeTransferClient(factory, recording, 32, 5000, 2);
+        client->sdk_wrapper_->sdk_map_["peer"] = factory.sdk;
+
+        std::promise<void> peer_started;
+        const auto started = peer_started.get_future().share();
+        std::promise<void> release_peer;
+        const auto release = release_peer.get_future().share();
+        recording->before_io = [&](const std::vector<DataStorageUri> &uris) {
+            if (uris.front().GetHostName() == "peer") {
+                peer_started.set_value();
+                release.wait();
+            } else {
+                if (started.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+                    throw std::runtime_error("peer did not start");
+                }
+                throw std::runtime_error("backend failed");
+            }
+        };
+        char values[2]{};
+        BlockBuffer first;
+        first.iovs.push_back({MemoryType::CPU, &values[0], 1, false});
+        BlockBuffer second;
+        second.iovs.push_back({MemoryType::CPU, &values[1], 1, false});
+        const BlockBuffers buffers{first, second};
+        const UriStrVec uris{
+            "pace://pace/1?media_type=0&node_id=1&range_id=0&size=1",
+            "pace://peer/2?media_type=0&node_id=1&range_id=0&size=1",
+        };
+        auto operation = std::async(std::launch::async, [&] {
+            return save ? client->SaveObjects(uris, {1, 1}, buffers).first : client->LoadObjects(uris, {1, 1}, buffers);
+        });
+
+        EXPECT_EQ(std::future_status::ready, started.wait_for(std::chrono::seconds(2)));
+        EXPECT_EQ(std::future_status::timeout, operation.wait_for(std::chrono::milliseconds(50)));
+        release_peer.set_value();
+        EXPECT_THROW((void)operation.get(), std::runtime_error);
+        EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, client->LoadObjects(uris, {1, 1}, buffers));
+        EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, client->SaveObjects(uris, {1, 1}, buffers).first);
+    }
 }
 
 } // namespace

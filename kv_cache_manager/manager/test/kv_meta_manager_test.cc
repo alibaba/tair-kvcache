@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -14,6 +15,7 @@
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
+#include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/config/trigger_strategy.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
@@ -25,11 +27,30 @@
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
+#include "kv_cache_manager/meta/meta_storage_backend_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
 
 namespace {
+
+class FailingSyncBackend : public MetaLocalBackend {
+public:
+    bool Sync(const KeyTypeVec &) noexcept override { return false; }
+};
+
+class RetryDeleteBackend : public MetaLocalBackend {
+public:
+    std::vector<ErrorCode> Delete(RequestContext *context, const KeyTypeVec &keys) noexcept override {
+        if (delete_attempts.fetch_add(1) == 0) {
+            return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+        }
+        return MetaLocalBackend::Delete(context, keys);
+    }
+
+    std::atomic<int> delete_attempts{0};
+};
 
 class TestPaceBackend : public DataStorageBackend {
 public:
@@ -105,6 +126,7 @@ protected:
         metrics_registry_ = std::make_shared<MetricsRegistry>();
         registry_manager_ = std::make_shared<RegistryManager>("", metrics_registry_);
         ASSERT_TRUE(registry_manager_->Init());
+        ASSERT_EQ(EC_OK, registry_manager_->DoRecover());
 
         cache_manager_ = std::make_shared<CacheManager>(metrics_registry_, registry_manager_);
         ASSERT_TRUE(cache_manager_->Init());
@@ -251,6 +273,15 @@ TEST_F(KvMetaManagerTest, FailedFinishAbortsTheWholeSession) {
     EXPECT_FALSE(values[0].found);
     EXPECT_FALSE(values[1].found);
     EXPECT_EQ(0u, Indexer(kDefaultInstance)->GetStorageUsage());
+    EXPECT_EQ(2u, pace_backend_->delete_count());
+}
+
+TEST_F(KvMetaManagerTest, MissingIndexerDoesNotAuthorizePhysicalDeletion) {
+    auto start = Start(kDefaultInstance, {"object"}, {31});
+    cache_manager_->meta_indexer_manager()->DoCleanup();
+    EXPECT_EQ(EC_INSTANCE_NOT_EXIST,
+              manager_->FinishWrite(&context_, kDefaultInstance, start.write_session_id, {true}));
+    EXPECT_EQ(0u, pace_backend_->delete_count());
 }
 
 TEST_F(KvMetaManagerTest, WriteInProgressHitAndSizeMismatchAreDistinct) {
@@ -478,7 +509,12 @@ TEST_F(KvMetaManagerTest, ReclaimerHonorsPhysicalDeleteDelay) {
     EXPECT_TRUE(WaitUntil([&]() { return pace_backend_->delete_count() > 0; }, std::chrono::seconds(2)));
 }
 
-TEST_F(KvMetaManagerTest, ExpiredSessionIsInvisibleAndCleaned) {
+TEST_F(KvMetaManagerTest, ExpiredSessionRetriesCleanupWithoutReleasingAllocation) {
+    auto backend = std::make_unique<RetryDeleteBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("expiry-retry", std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    auto *retry_backend = backend.get();
+    Indexer(kDefaultInstance)->backend_manager_->persistent_backend_ = std::move(backend);
     auto start = Start(kDefaultInstance, {"expires"}, {29}, 1);
     ASSERT_FALSE(start.write_session_id.empty());
     ASSERT_TRUE(WaitUntil(
@@ -492,9 +528,12 @@ TEST_F(KvMetaManagerTest, ExpiredSessionIsInvisibleAndCleaned) {
             return result.per_location_error_codes.size() == 1 && result.per_location_error_codes[0].size() == 1 &&
                    result.per_location_error_codes[0][0] == EC_NOENT;
         },
-        std::chrono::seconds(3)));
+        std::chrono::seconds(5)));
     EXPECT_EQ(EC_NOENT, manager_->FinishWrite(&context_, kDefaultInstance, start.write_session_id, {true}));
+    EXPECT_GE(retry_backend->delete_attempts.load(), 2);
     EXPECT_EQ(0u, Indexer(kDefaultInstance)->GetStorageUsage());
+    // The SDK timeout is advisory; the old writer may still hold its address.
+    EXPECT_EQ(0u, pace_backend_->delete_count());
 }
 
 TEST_F(KvMetaManagerTest, RecoveryDropsIncompleteWritesAndRebuildsUsage) {
@@ -514,6 +553,75 @@ TEST_F(KvMetaManagerTest, RecoveryDropsIncompleteWritesAndRebuildsUsage) {
     ASSERT_EQ(2u, values.size());
     EXPECT_TRUE(values[0].found);
     EXPECT_FALSE(values[1].found);
+    EXPECT_EQ(0u, pace_backend_->delete_count());
+
+    auto replacement = Start(kDefaultInstance, {"incomplete"}, {47});
+    ASSERT_EQ(1u, replacement.locations.size());
+    EXPECT_NE(incomplete.locations[0].specs, replacement.locations[0].specs);
+    EXPECT_EQ(EC_NOENT, manager_->FinishWrite(&context_, kDefaultInstance, incomplete.write_session_id, {false}));
+    EXPECT_EQ(0u, pace_backend_->delete_count());
+    EXPECT_EQ(EC_OK, manager_->FinishWrite(&context_, kDefaultInstance, replacement.write_session_id, {true}));
+}
+
+TEST_F(KvMetaManagerTest, RecoveryWaitsForTheCompleteRegistry) {
+    Commit(kDefaultInstance, "committed", 31);
+    Indexer(kDefaultInstance)->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 999);
+    registry_manager_->recover_complete_.store(false);
+
+    EXPECT_EQ(EC_CONFIG_ERROR, manager_->DoRecover());
+    EXPECT_EQ(999u, Indexer(kDefaultInstance)->GetStorageUsage());
+    EXPECT_EQ(EC_CONFIG_ERROR, manager_->Get(&context_, kDefaultInstance, {"committed"}).first);
+
+    registry_manager_->recover_complete_.store(true);
+    EXPECT_EQ(EC_OK, manager_->DoRecover());
+    EXPECT_EQ(31u, Indexer(kDefaultInstance)->GetStorageUsage());
+    EXPECT_EQ(EC_OK, manager_->Get(&context_, kDefaultInstance, {"committed"}).first);
+}
+
+TEST_F(KvMetaManagerTest, FailedDeleteConfirmationNeverReleasesTheAllocation) {
+    auto backend = std::make_unique<FailingSyncBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("delete-failure", std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, backend->Open());
+    Indexer(kDefaultInstance)->backend_manager_->persistent_backend_ = std::move(backend);
+    Commit(kDefaultInstance, "object", 31);
+
+    EXPECT_EQ(EC_ERROR, manager_->Remove(&context_, kDefaultInstance, {"object"}));
+    EXPECT_EQ(0u, pace_backend_->delete_count());
+    EXPECT_EQ(0u, Indexer(kDefaultInstance)->GetStorageUsage());
+    auto [ec, values] = manager_->Get(&context_, kDefaultInstance, {"object"});
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(1u, values.size());
+    EXPECT_FALSE(values[0].found);
+}
+
+TEST_F(KvMetaManagerTest, CancelInterruptsRemoveGraceWithoutReleasingReadersMemory) {
+    CreateGroup("cancel-remove", "cancel-remove-instance", 100, 0.8, 30000);
+    Commit("cancel-remove-instance", "object", 31);
+    auto removed = std::async(std::launch::async, [&]() {
+        RequestContext context("cancel_remove");
+        return manager_->Remove(&context, "cancel-remove-instance", {"object"});
+    });
+    ASSERT_TRUE(WaitUntil([&]() { return Indexer("cancel-remove-instance")->GetStorageUsage() == 0; },
+                          std::chrono::seconds(2)));
+
+    manager_->CancelMaintenance();
+    ASSERT_EQ(std::future_status::ready, removed.wait_for(std::chrono::seconds(2)));
+    EXPECT_EQ(EC_ERROR, removed.get());
+    EXPECT_EQ(0u, pace_backend_->delete_count());
+}
+
+TEST_F(KvMetaManagerTest, CancelInterruptsReclaimerGrace) {
+    CreateGroup("cancel-reclaim", "cancel-reclaim-instance", 100, 0.8, 30000);
+    Commit("cancel-reclaim-instance", "object", 90);
+    cache_manager_->cache_reclaimer()->SetSleepIntervalMs(&context_, 10);
+    ASSERT_TRUE(manager_->ResumeMaintenance());
+    ASSERT_TRUE(WaitUntil([&]() { return Indexer("cancel-reclaim-instance")->GetStorageUsage() == 0; },
+                          std::chrono::seconds(2)));
+
+    auto stopped = std::async(std::launch::async, [&]() { manager_->DoCleanup(); });
+    ASSERT_EQ(std::future_status::ready, stopped.wait_for(std::chrono::seconds(2)));
+    stopped.get();
+    EXPECT_EQ(0u, pace_backend_->delete_count());
 }
 
 TEST_F(KvMetaManagerTest, RejectsMalformedRequestsWithoutMutation) {

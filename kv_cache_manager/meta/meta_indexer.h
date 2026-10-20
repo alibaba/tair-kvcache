@@ -208,6 +208,9 @@ public:
 
     // Synchronously flush pending writes for the given keys to persistent storage.
     bool Sync(const KeyVector &keys) noexcept;
+    bool SyncDeletedLocations(RequestContext *request_context,
+                              const KeyVector &keys,
+                              const LocationIdsPerKey &location_ids) noexcept;
     bool SyncAll() noexcept;
 
     // Returns async write path stats from async backend.

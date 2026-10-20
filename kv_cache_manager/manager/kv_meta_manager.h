@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -137,9 +138,11 @@ private:
                           std::vector<SessionItem> *deleted_items = nullptr,
                           bool refresh_cache_from_persistent = false);
     void DeletePhysicalBestEffort(RequestContext *request_context, const std::vector<SessionItem> &items) const;
+    bool WaitForDeletionDelay(std::int32_t delay_ms);
     bool ExpireSession(const std::string &session_id,
                        const std::string &internal_instance_id,
-                       const std::vector<SessionItem> &items) noexcept;
+                       const std::vector<SessionItem> &items,
+                       bool delete_physical) noexcept;
 
 private:
     friend class KvMetaReclaimer;
@@ -152,9 +155,10 @@ private:
     std::unique_ptr<KvMetaReclaimer> reclaimer_;
     std::unique_ptr<KvMetaWriteSessionManager> write_session_manager_;
 
-    // Serializes only SERVING transitions and deletes so their byte-counter
-    // updates cannot cross. PutStart never enters this lock.
+    // Serializes metadata transitions, including persistent delete confirmation.
     mutable std::array<std::mutex, 64> metadata_mutation_mutexes_;
+    std::mutex maintenance_mutex_;
+    std::condition_variable maintenance_condition_;
     std::atomic<bool> maintenance_cancelled_{false};
     std::atomic<bool> recovery_complete_{false};
     std::atomic<bool> initialized_{false};

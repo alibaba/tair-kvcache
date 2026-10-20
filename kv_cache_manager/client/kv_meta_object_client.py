@@ -307,6 +307,20 @@ def _mutation_outcome_is_unknown(pybind: Any, code: Any) -> bool:
     return not any(type(code) is type(member) and code == member for member in members)
 
 
+def _remove_outcome_is_unknown(pybind: Any, code: Any) -> bool:
+    # Service errors can follow partial deletion. Only these local rejections
+    # prove that Remove did not dispatch a mutation.
+    return not any(
+        _matches_native_code(pybind, code, name, value)
+        for name, value in (
+            ("ER_INVALID_STUB", 1),
+            ("ER_INVALID_PARAMS", 3),
+            ("ER_CLIENT_NOT_EXISTS", 15),
+            ("ER_SDK_TIMEOUT", 100),
+        )
+    )
+
+
 def _best_effort_close(client: Any, phase: str) -> None:
     if client is None:
         return
@@ -618,7 +632,7 @@ class KvMetaObjectClient:
                 raise KvMetaObjectClientError(
                     "remove",
                     code,
-                    unknown_outcome=_mutation_outcome_is_unknown(self._pybind, code),
+                    unknown_outcome=_remove_outcome_is_unknown(self._pybind, code),
                     batch_index=batch_index,
                     batch_count=len(batches),
                     batch_start=begin,

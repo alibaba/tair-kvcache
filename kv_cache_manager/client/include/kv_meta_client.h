@@ -78,7 +78,8 @@ public:
                                                             const std::vector<std::string> &keys) = 0;
 
     // ER_INVALID_GRPCSTATUS means the server may already have reserved a
-    // session. The bounded write lease cleans it if the response was lost.
+    // session. Expiry removes its metadata but retains its allocation because
+    // the server cannot prove that data-plane writes have stopped.
     virtual std::pair<ClientErrorCode, KvMetaStartWriteResult> StartWrite(const std::string &trace_id,
                                                                           const std::vector<std::string> &keys,
                                                                           const std::vector<std::uint64_t> &value_sizes,
@@ -86,6 +87,8 @@ public:
 
     // success_keys is aligned with StartWriteResult.locations, not with the
     // original request. A single false value aborts the complete session.
+    // All data-plane writes must have stopped before calling, including after
+    // an I/O timeout: FinishWrite may release the session's allocations.
     // After a transport error, callers may use Get to resolve the cache state.
     virtual ClientErrorCode FinishWrite(const std::string &trace_id,
                                         const std::string &write_session_id,

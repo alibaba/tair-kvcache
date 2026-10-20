@@ -47,16 +47,20 @@ KVMeta 为 embedding 等变长对象提供独立的 exact-key 元数据协议。
 
 只要 `PutStart` 返回非空 session，无论数据面成功或失败都必须调用：
 
+- 调用前必须确认本 session 的全部数据面写入已停止；超时报错本身不代表后台 I/O 已结束。
 - `success_keys` 与紧凑的 `PutStartResponse.locations` 对齐。
 - 全部为 `true` 时提交为 `SERVING`。
 - 任一为 `false` 时整批回滚。
 
-session 超时后服务端会自动清理。transport error 代表结果可能未知，应先 `Get` 对账，不能盲目重试 mutation。
+session 超时或切主后，服务端只清理遗留 `WRITING` metadata，不释放可能仍被写入的 PACE allocation。当前 PACE 接口没有写入隔离机制，这些孤儿 allocation 不会由 KVMeta 自动回收。
+
+transport error 代表结果可能未知，应先 `Get` 对账，不能盲目重试 mutation。
 
 ## 删除
 
 `Remove` 删除指定 key 的 metadata，并尽力释放 PACE allocation。不存在的 key 按成功处理；目标仍处于
 `WRITING` 时返回 `WRITE_IN_PROGRESS`，不会释放数据面仍可能使用的 allocation。
+物理删除前须确认 metadata 删除已持久化；确认失败或删除宽限期被降主/退出打断时保留 allocation。
 
 `Trim` 仅作为旧 proto 的保留 RPC，V1 client 不暴露该接口，调用时由 gRPC 返回标准
 `UNIMPLEMENTED`。按 key 删除使用 `Remove`，容量回收由后台 GC 完成。

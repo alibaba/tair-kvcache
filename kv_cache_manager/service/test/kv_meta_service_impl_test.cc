@@ -91,6 +91,7 @@ protected:
         metrics_registry_ = std::make_shared<MetricsRegistry>();
         registry_manager_ = std::make_shared<RegistryManager>("", metrics_registry_);
         ASSERT_TRUE(registry_manager_->Init());
+        ASSERT_EQ(EC_OK, registry_manager_->DoRecover());
 
         cache_manager_ = std::make_shared<CacheManager>(metrics_registry_, registry_manager_);
         ASSERT_TRUE(cache_manager_->Init());
