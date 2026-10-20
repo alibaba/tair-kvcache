@@ -70,8 +70,6 @@ def _build_connector(
     obj._manager_client = MagicMock()
     obj.transfer_client = MagicMock()
     obj.mem_pool_host = MagicMock()
-    obj.has_mamba = False
-    obj.has_indexer = False
     obj.registered_pools = {}
     return obj
 

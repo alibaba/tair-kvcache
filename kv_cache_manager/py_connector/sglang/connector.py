@@ -1,9 +1,11 @@
+import dataclasses
 import functools
 import hashlib
 import logging
 import threading
 import uuid
-from typing import AbstractSet, Any, Dict, List, Optional
+from types import MappingProxyType
+from typing import AbstractSet, Any, Dict, List, Mapping, Optional
 import time
 import json
 
@@ -54,13 +56,170 @@ from kv_cache_manager.py_connector.common._version_info import (  # ty: ignore[u
 logger = logging.getLogger(__name__)
 
 
-# Pools sglang shards across the TP ranks of a hybrid stack: every rank owns a
-# slice and is handed its own transfer, even when the primary KV is replicated
-# (MLA).  Mirrors the upstream filter that decides what a non-zero MLA rank
-# writes: ``HybridCacheController.should_backup()`` from v0.5.18 on (Mamba/KDA
-# only, plus mooncake's MHA draft pools, which this connector does not manage)
-# and v0.5.17's equivalent Mamba filter in ``_page_backup``.
-_RANK_SHARDED_POOLS = (PoolName.MAMBA,)
+@dataclasses.dataclass(frozen=True)
+class _PoolSpec:
+    """How one sglang pool maps onto the location specs of this connector.
+
+    ``_POOL_SPECS`` is the connector's whole pool knowledge: ``_init_kvcm_client``
+    derives the specs, the spec groups, the iov size and the SDK client config
+    from it, and the data path resolves a ``PoolTransfer`` through it.  A pool
+    without a row here is not backed by the connector.
+    """
+
+    # sglang's PoolName member: the key of ``registered_pools`` and of a
+    # PoolTransfer.
+    pool: Any
+    # Location-spec-group name.  A KVCM write session covers one group, so the
+    # pools of one group are written together.  Each row emits one group entry,
+    # so a row's group has to differ from every other row's: the Manager resolves
+    # a group name to a single group and silently skips a duplicate's specs.
+    group: str
+    # Appended to "tp_{rank}" to name the pool's location specs.
+    suffix: str
+    # The anchor's suffix once a sidecar pool is registered as well.
+    hybrid_suffix: Optional[str] = None
+    # The KV pool: sglang hands exactly one per instance, and a flat model keeps
+    # its historic "tp_{rank}" spec names so already-cached data stays readable.
+    anchor: bool = False
+    # get_size_per_token() counts one token, so a block is that times
+    # block_size.  A page-granular pool (Mamba, page_size 1) already returns one
+    # slot per call and turns this off.
+    tokens_per_block: bool = True
+    # The pool is replicated rather than sharded across the TP ranks: an MLA
+    # model writes rank 0's copy alone, so every rank reads and writes rank 0's
+    # spec.  A sharded pool is the opposite -- sglang hands it to every rank,
+    # which then each write their own slice into their own rank spec (upstream
+    # HybridCacheController.should_backup(): Mamba/KDA only since v0.5.18, plus
+    # mooncake's MHA draft pools, which this connector does not manage).
+    shared_across_ranks: bool = True
+
+    def spec_name(self, tp_rank: int, hybrid_stack: bool) -> str:
+        """The location spec name of this pool on one TP rank."""
+        suffix = self.suffix
+        if hybrid_stack and self.hybrid_suffix is not None:
+            suffix = self.hybrid_suffix
+        return f"tp_{tp_rank}{suffix}"
+
+    def spec_size(self, pool: Any, block_size: int) -> int:
+        """Bytes of one block of this pool."""
+        per_token = pool.get_size_per_token()
+        return per_token * block_size if self.tokens_per_block else per_token
+
+
+_KV_SPEC = _PoolSpec(
+    pool=PoolName.KV,
+    group="Full",
+    suffix="",
+    hybrid_suffix="_full",
+    anchor=True,
+)
+_MAMBA_SPEC = _PoolSpec(
+    pool=PoolName.MAMBA,
+    group="Linear",
+    suffix="_linear",
+    tokens_per_block=False,
+    shared_across_ranks=False,
+)
+# Probed: a release without the enum member has no such pool to register, and
+# the row then drops out of the table (naming only reads ``suffix``).
+_INDEXER_SPEC = _PoolSpec(
+    pool=getattr(PoolName, "INDEXER", None),
+    group="Indexer",
+    suffix="_indexer",
+)
+
+# In registration order: the anchor first, so the KV specs lead
+# ``location_spec_infos`` and the KV group leads ``location_spec_groups``.
+_POOL_SPECS: tuple[_PoolSpec, ...] = tuple(
+    spec for spec in (_KV_SPEC, _MAMBA_SPEC, _INDEXER_SPEC) if spec.pool is not None
+)
+
+
+def _validate_pool_specs(table: tuple[_PoolSpec, ...]) -> None:
+    """Reject a row set that would alias two pools onto one location spec.
+
+    A row that breaks one of these invariants is silent in production: the
+    Manager is handed two specs with the same name and different sizes (the SDK
+    client keeps one of them), or it resolves a group name to a single group and
+    skips the duplicate's specs.  Either way one pool's pages are read or
+    written under another pool's identity and the only symptom is a cache that
+    does not work.  Running this once at import turns a bad future row into an
+    immediate failure instead of that.
+    """
+
+    def require(ok: bool, message: str) -> None:
+        if not ok:
+            raise ValueError(message)
+
+    require(bool(table), "the table must hold at least the KV anchor")
+    require(
+        all(spec.pool is not None for spec in table),
+        "a row was built without a PoolName member (it should not enter the "
+        f"table at all): {table}",
+    )
+
+    pools = [spec.pool for spec in table]
+    require(len(set(pools)) == len(pools), f"a pool has more than one row: {pools}")
+
+    # Every spec suffix a row can emit -- its own, and the anchor's hybrid one
+    # -- has to identify exactly one row, or two pools resolve to one spec.
+    require(
+        all(spec.suffix is not None for spec in table),
+        f"a row has no suffix, its spec name would end in 'None': {table}",
+    )
+    emitted = [spec.suffix for spec in table] + [
+        spec.hybrid_suffix for spec in table if spec.hybrid_suffix is not None
+    ]
+    require(
+        len(set(emitted)) == len(emitted),
+        f"two rows can emit the same spec suffix: {emitted}",
+    )
+
+    anchors = [spec for spec in table if spec.anchor]
+    require(len(anchors) == 1, f"expected exactly one anchor row, got {len(anchors)}")
+    anchor = anchors[0]
+    require(anchor.pool is PoolName.KV, f"the anchor is the KV pool, not {anchor.pool}")
+    # Every row needs a group: the Manager treats an empty group name as "no
+    # constraint", drops that row's specs and leaves the pool permanently
+    # missing -- the same silent failure a duplicate group causes.
+    require(
+        all(spec.group for spec in table),
+        f"a row has an empty spec group: {[spec.group for spec in table]}",
+    )
+    # One row emits one group entry, so two rows sharing a group hand the
+    # Manager a duplicate name: it resolves the name to a single group and skips
+    # the other row's specs without an error.  (This also covers "a sidecar
+    # must not reuse the anchor's group".)
+    groups = [spec.group for spec in table]
+    require(len(set(groups)) == len(groups), f"two rows share a spec group: {groups}")
+
+
+# CI does not run this package's tests (they need a real sglang runtime), so the
+# table is checked where it is defined rather than only from a test.
+_validate_pool_specs(_POOL_SPECS)
+
+
+def _pool_spec(pool_name: Any) -> Optional[_PoolSpec]:
+    """The table row of a pool, or None when this connector does not back it."""
+    return next((spec for spec in _POOL_SPECS if spec.pool == pool_name), None)
+
+
+@dataclasses.dataclass(frozen=True)
+class _RegisteredPool:
+    """A ``_PoolSpec`` resolved against the pools one instance registered."""
+
+    spec: _PoolSpec
+    # Bytes of one block, as frozen into the Manager registration.
+    size: int
+    # The pool's location spec names, indexed by TP rank.
+    names: tuple[str, ...]
+    # The rank whose spec this instance reads and writes for the pool.
+    own_rank: int
+
+    @property
+    def name(self) -> str:
+        """The location spec this instance reads and writes for the pool."""
+        return self.names[self.own_rank]
 
 
 @functools.lru_cache(maxsize=1)
@@ -104,6 +263,11 @@ class _UnsupportedBackendError(RuntimeError):
 
 class HiCacheKVCM(HiCacheStorage):
     """KVCM HiCache storage backend for sglang (v0.5.10 ~ v0.5.19).
+
+    Which pools it backs, and how each of them maps onto KVCM location specs, is
+    the module-level ``_POOL_SPECS`` table; everything per instance (spec names,
+    spec sizes, groups, iov size, SDK client config) is derived from it by
+    ``_resolve_pool_specs``.
 
     Pool registration contract -- what sglang hands the backend, in order:
 
@@ -170,6 +334,10 @@ class HiCacheKVCM(HiCacheStorage):
     # without sharing one mutable object: late names are added by rebinding,
     # never by mutating a shared set.
     _late_pools: AbstractSet[Any] = frozenset()
+    # The spec table resolved against the pools this instance registered, the
+    # anchor first; filled by _init_kvcm_client.  Read-only, and empty (never
+    # shared mutable state) for instances built without it.
+    pool_specs: Mapping[Any, _RegisteredPool] = MappingProxyType({})
 
     def __init__(self, storage_config: HiCacheStorageConfig, kwargs: Any) -> None:
         logger.warning(
@@ -315,18 +483,21 @@ class HiCacheKVCM(HiCacheStorage):
         """Whether sglang hands this transfer to every rank of the TP group.
 
         Non-MLA: yes, ``should_backup()`` answers True on every rank, so every
-        rank writes every pool with its own rank spec.  MLA: only the
-        rank-sharded sidecars (Mamba/KDA state of e.g. Kimi-K3) are written
-        from every rank; the remaining pools are filtered out on non-zero
-        ranks and reach ``batch_set_v2`` from rank 0 alone, so no peer waits
-        for them.  Which of the two protocols the installed sglang implements
-        for those rank-sharded sidecars is decided by
+        rank writes every pool with its own rank spec.  MLA: only the pools the
+        table marks as rank-sharded (``shared_across_ranks=False``, i.e. the
+        Mamba/KDA state of e.g. Kimi-K3) are written from every rank; the
+        remaining pools are filtered out on non-zero ranks and reach
+        ``batch_set_v2`` from rank 0 alone, so no peer waits for them.  Which
+        of the two protocols the installed sglang implements for those
+        rank-sharded sidecars is decided by
         ``_sidecars_are_written_by_every_rank``.
         """
         if not self.is_mla_model:
             return True
+        spec = _pool_spec(transfer.name)
         return (
-            transfer.name in _RANK_SHARDED_POOLS
+            spec is not None
+            and not spec.shared_across_ranks
             and _sidecars_are_written_by_every_rank()
         )
 
@@ -449,96 +620,37 @@ class HiCacheKVCM(HiCacheStorage):
         # The KV pool comes from the v1 hook (plain host pool) or from the v2
         # hook when v1 only carried a HostPoolGroup; _ensure_client rejects an
         # empty pool set before calling this.
-        kv_pool = self.registered_pools[PoolName.KV]
-        self.kv_dtype = kv_pool.dtype
+        self.kv_dtype = self.registered_pools[PoolName.KV].dtype
 
         # manager
         self.block_size = self.mem_pool_host.page_size
 
-        # Detect extra pools early — _tp_rank_to_spec_name depends on these.
-        self.has_mamba = PoolName.MAMBA in self.registered_pools
-        self.has_indexer = (
-            getattr(PoolName, "INDEXER", None) is not None
-            and PoolName.INDEXER in self.registered_pools
-        )
+        # The pool table resolved against what this instance registered, in
+        # table order.  Everything below -- specs, groups, iov size, SDK spec
+        # map -- is derived from it, and so is the data path's per-pool lookup.
+        self.pool_specs = self._resolve_pool_specs()
+        anchor = self.pool_specs[PoolName.KV]
+        # The anchor's spec, under the names the data path uses.
+        self.location_spec_name = anchor.name
+        self.location_spec_size = anchor.size
 
-        self.location_spec_size = kv_pool.get_size_per_token() * self.block_size
         self.location_spec_infos = [
-            {
-                "name": self._tp_rank_to_spec_name(rank),
-                "size": self.location_spec_size,
-            }
-            for rank in range(self.tp_size)
+            {"name": name, "size": pool.size}
+            for pool in self.pool_specs.values()
+            for name in pool.names
         ]
 
-        # LocationSpecGroup: KV specs always prepared, but only sent when
+        # LocationSpecGroup: KV specs are always prepared, but only sent when
         # extra pools exist (backward compat with older managers).
-        kv_spec_names = [
-            self._tp_rank_to_spec_name(rank) for rank in range(self.tp_size)
+        self.location_spec_groups = [
+            {"name": pool.spec.group, "spec_names": list(pool.names)}
+            for pool in self.pool_specs.values()
+            if not pool.spec.anchor
         ]
-        self.location_spec_groups = []
-
-        # Mamba/Linear specs
-        if self.has_mamba:
-            mamba_pool = self.registered_pools[PoolName.MAMBA]
-            # No "* block_size" here, unlike KV and Indexer above: a mamba host
-            # pool is page-granular (MambaPoolHost.page_size == 1), so
-            # get_size_per_token() already returns the bytes of one slot, i.e.
-            # of one block, which is what a location spec size means.
-            self.mamba_spec_size = mamba_pool.get_size_per_token()
-            linear_spec_names = []
-            for rank in range(self.tp_size):
-                name = self._tp_rank_to_linear_spec_name(rank)
-                self.location_spec_infos.append(
-                    {"name": name, "size": self.mamba_spec_size}
-                )
-                linear_spec_names.append(name)
-            # The Mamba/KDA pool is rank-sharded whenever sglang backs it up
-            # from every rank (every non-MLA hybrid, and a hybrid MLA model
-            # with such a sidecar): each rank owns a slice, so each rank writes
-            # and reads its own linear spec.  That is also the honest pair of
-            # the rank-0-only protocol of releases that write only rank 0's
-            # slice: the other ranks then miss instead of loading rank 0's
-            # shard into their own pool.
-            self.mamba_location_spec_name = self._tp_rank_to_linear_spec_name(
-                self.tp_rank
-            )
-            self.location_spec_groups.append(
-                {
-                    "name": self._get_extra_pool_spec_group(PoolName.MAMBA),
-                    "spec_names": linear_spec_names,
-                }
-            )
-
-        # Indexer specs (NSA/DSA)
-        if self.has_indexer:
-            indexer_pool = self.registered_pools[PoolName.INDEXER]
-            self.indexer_spec_size = indexer_pool.get_size_per_token() * self.block_size
-            indexer_spec_names = []
-            for rank in range(self.tp_size):
-                name = self._tp_rank_to_indexer_spec_name(rank)
-                self.location_spec_infos.append(
-                    {"name": name, "size": self.indexer_spec_size}
-                )
-                indexer_spec_names.append(name)
-            indexer_spec_rank = 0 if self.is_mla_model else self.tp_rank
-            self.indexer_location_spec_name = self._tp_rank_to_indexer_spec_name(
-                indexer_spec_rank
-            )
-            self.location_spec_groups.append(
-                {
-                    "name": self._get_extra_pool_spec_group(PoolName.INDEXER),
-                    "spec_names": indexer_spec_names,
-                }
-            )
-
         if self.location_spec_groups:
             self.location_spec_groups.insert(
                 0,
-                {
-                    "name": self._get_kv_spec_group(),
-                    "spec_names": kv_spec_names,
-                },
+                {"name": anchor.spec.group, "spec_names": list(anchor.names)},
             )
 
         self.deployment = {
@@ -566,11 +678,6 @@ class HiCacheKVCM(HiCacheStorage):
 
         self.storage_configs = register_response["storage_configs"]
 
-        # data transfer setup
-        # MLA: only rank 0 writes, so all ranks use rank 0's spec for read/write
-        kv_spec_rank = 0 if self.is_mla_model else self.tp_rank
-        self.location_spec_name = self._tp_rank_to_spec_name(kv_spec_rank)
-
         self.write_timeout_seconds = self.extra_config.get("write_timeout_seconds", 30)
 
         # sdk
@@ -584,15 +691,11 @@ class HiCacheKVCM(HiCacheStorage):
 
         # TODO: the HF3FS backend is currently not well suited for hybrid
         # (KV + Mamba) transfers.  A single IOV mempool is shared across
-        # all spec types, so when location_spec_size and mamba_spec_size
-        # differ significantly the mempool is either over-allocated for the
-        # smaller spec or too small for the larger one.  Per-spec IOV
-        # sizing would require changes to the HF3FS SDK itself.
-        self.iov_size = max(
-            self.location_spec_size * 1024,
-            self.mamba_spec_size * 1024 if self.has_mamba else 0,
-            self.indexer_spec_size * 1024 if self.has_indexer else 0,
-        )
+        # all spec types, so when the specs of two pools differ significantly
+        # the mempool is either over-allocated for the smaller spec or too
+        # small for the larger one.  Per-spec IOV sizing would require changes
+        # to the HF3FS SDK itself.
+        self.iov_size = max(pool.size for pool in self.pool_specs.values()) * 1024
 
         sdk_backend_configs = list(self.extra_config.get("sdk_backend_configs", []))
 
@@ -613,18 +716,9 @@ class HiCacheKVCM(HiCacheStorage):
                     "put_timeout_ms": self.sdk_put_timeout_ms,
                 },
             },
+            # This instance's own spec per pool: the KV one plus one per sidecar.
             "location_spec_infos": {
-                self.location_spec_name: self.location_spec_size,
-                **(
-                    {self.mamba_location_spec_name: self.mamba_spec_size}
-                    if self.has_mamba
-                    else {}
-                ),
-                **(
-                    {self.indexer_location_spec_name: self.indexer_spec_size}
-                    if self.has_indexer
-                    else {}
-                ),
+                pool.name: pool.size for pool in self.pool_specs.values()
             },
         }
         self.transfer_client_config = json.dumps(transfer_client_json)
@@ -644,6 +738,62 @@ class HiCacheKVCM(HiCacheStorage):
         assert self.transfer_client is not None, (
             "kvcm_py_client.TransferClient.Create failed"
         )
+
+    def _resolve_pool_specs(self) -> Mapping[Any, _RegisteredPool]:
+        """Resolve the spec table against the pools this instance registered.
+
+        Pools keep the table order (anchor first); a pool that never registered
+        has no entry.  A sidecar's presence also decides the anchor's spec name
+        (``tp_{rank}`` vs ``tp_{rank}_full``), so the pool set is read once here
+        and every derived answer follows from it.  That predicate is the same
+        fact as ``has_sidecars``, which cannot be used here because this method
+        is what fills the state it reads.
+        """
+        registered = [
+            spec for spec in _POOL_SPECS if spec.pool in self.registered_pools
+        ]
+        hybrid_stack = any(not spec.anchor for spec in registered)
+        resolved = {}
+        for spec in registered:
+            own_rank = (
+                0 if spec.shared_across_ranks and self.is_mla_model else self.tp_rank
+            )
+            resolved[spec.pool] = _RegisteredPool(
+                spec=spec,
+                size=spec.spec_size(self.registered_pools[spec.pool], self.block_size),
+                names=tuple(
+                    spec.spec_name(rank, hybrid_stack) for rank in range(self.tp_size)
+                ),
+                own_rank=own_rank,
+            )
+        return MappingProxyType(resolved)
+
+    # TODO: delete once the stacked pool PRs land -- nothing in this tree reads
+    # them any more; use ``pool_specs`` or ``has_sidecars`` instead.  The same
+    # applies to ``_tp_rank_to_spec_name`` / ``_tp_rank_to_linear_spec_name`` /
+    # ``_tp_rank_to_indexer_spec_name`` below, whose only remaining caller is a
+    # test fixture.
+    @property
+    def has_mamba(self) -> bool:
+        """Whether this instance registered the Mamba/KDA pool.
+
+        Read-only view of ``pool_specs``, which is resolved once per instance.
+        """
+        return _MAMBA_SPEC.pool in self.pool_specs
+
+    @property
+    def has_indexer(self) -> bool:
+        """Whether this instance registered the NSA/DSA indexer pool.
+
+        Read-only view of ``pool_specs``; always False on a release whose
+        ``PoolName`` has no indexer member.
+        """
+        return _INDEXER_SPEC.pool is not None and _INDEXER_SPEC.pool in self.pool_specs
+
+    @property
+    def has_sidecars(self) -> bool:
+        """Whether this instance registered a pool besides the KV anchor."""
+        return any(not pool.spec.anchor for pool in self.pool_specs.values())
 
     def parse_hf3fs_configs(self, storage_configs: str) -> List[Dict[str, Any]]:
         hf3fs_configs = []
@@ -964,9 +1114,10 @@ class HiCacheKVCM(HiCacheStorage):
         if self.tp_rank == 0:
             start_trace_id = f"start-{trace_id}"
             # When extra pools exist, use KV spec group to write KV specs only
-            has_extra_pools = self.has_mamba or self.has_indexer
             location_spec_group_names = (
-                [self._get_kv_spec_group()] * len(block_keys) if has_extra_pools else []
+                [self._get_kv_spec_group()] * len(block_keys)
+                if self.has_sidecars
+                else []
             )
             request = {
                 "trace_id": start_trace_id,
@@ -1592,19 +1743,14 @@ class HiCacheKVCM(HiCacheStorage):
     ##################################################
 
     def _tp_rank_to_spec_name(self, tp_rank: int) -> str:
-        # For pure FullAttention models (no Mamba/Indexer), use old format "tp_{rank}"
-        # for backward compatibility with existing cached data.
-        # For hybrid models, use "tp_{rank}_full" to distinguish KV specs from
-        # Mamba/SSM specs ("tp_{rank}_linear") and Indexer specs.
-        if self.has_mamba or self.has_indexer:
-            return f"tp_{tp_rank}_full"
-        return f"tp_{tp_rank}"
+        """The KV spec name: ``tp_{rank}``, ``tp_{rank}_full`` with sidecars."""
+        return _KV_SPEC.spec_name(tp_rank, self.has_sidecars)
 
     def _tp_rank_to_linear_spec_name(self, tp_rank: int) -> str:
-        return f"tp_{tp_rank}_linear"
+        return _MAMBA_SPEC.spec_name(tp_rank, self.has_sidecars)
 
     def _tp_rank_to_indexer_spec_name(self, tp_rank: int) -> str:
-        return f"tp_{tp_rank}_indexer"
+        return _INDEXER_SPEC.spec_name(tp_rank, self.has_sidecars)
 
     def _get_trace_id(self) -> str:
         return str(uuid.uuid1())
@@ -1745,23 +1891,26 @@ class HiCacheKVCM(HiCacheStorage):
 
     def _get_kv_spec_group(self) -> str:
         """Spec group name used in start_write_cache for KV pool."""
-        return "Full"
+        return _KV_SPEC.group
 
-    def _get_extra_pool_spec_group(self, pool_name: str) -> str:
+    def _get_extra_pool_spec_group(self, pool_name: Any) -> str:
         """Spec group name used in start_write_cache for an extra pool."""
-        if pool_name == PoolName.MAMBA:
-            return "Linear"
-        if pool_name == PoolName.INDEXER:
-            return "Indexer"
-        raise ValueError(f"Unknown extra pool: {pool_name}")
+        spec = _pool_spec(pool_name)
+        if spec is None or spec.anchor:
+            raise ValueError(f"Unknown extra pool: {pool_name}")
+        return spec.group
 
-    def _get_extra_pool_spec_size(self, pool_name: str) -> int:
+    def _get_extra_pool_spec_size(self, pool_name: Any) -> int:
         """Per-block spec size in bytes for bandwidth tracking."""
-        if pool_name == PoolName.MAMBA:
-            return self.mamba_spec_size
-        if pool_name == PoolName.INDEXER:
-            return self.indexer_spec_size
-        return 0
+        pool = self._extra_pool(pool_name)
+        return 0 if pool is None else pool.size
+
+    def _extra_pool(self, pool_name: Any) -> Optional[_RegisteredPool]:
+        """The pool this instance backs under that name, if it is an extra pool."""
+        pool = self.pool_specs.get(pool_name)
+        if pool is None or pool.spec.anchor:
+            return None
+        return pool
 
     def _prepare_extra_pool_buffers(
         self, ptr_list: List[int], size_list: List[int], components_per_page: int
@@ -1786,13 +1935,10 @@ class HiCacheKVCM(HiCacheStorage):
             buffers.append(buffer)
         return buffers
 
-    def _get_extra_pool_spec_name(self, pool_name: str) -> Optional[str]:
+    def _get_extra_pool_spec_name(self, pool_name: Any) -> Optional[str]:
         """Map a PoolName to its KVCM location spec name for the current rank."""
-        if pool_name == PoolName.MAMBA and self.has_mamba:
-            return self.mamba_location_spec_name
-        if pool_name == PoolName.INDEXER and self.has_indexer:
-            return self.indexer_location_spec_name
-        return None
+        pool = self._extra_pool(pool_name)
+        return None if pool is None else pool.name
 
     def _check_pool_spec_existence(
         self,

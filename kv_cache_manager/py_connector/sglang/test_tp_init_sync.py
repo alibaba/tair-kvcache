@@ -90,10 +90,13 @@ GROUP = object()
 
 
 class _FakeMambaPool:
-    """Only what the v2 write path reads from a Mamba host pool."""
+    """Only what the v2 write path and the spec table read from a Mamba host pool."""
 
     def __init__(self) -> None:
         self.page_size = 1
+
+    def get_size_per_token(self) -> int:
+        return MAMBA_BYTES_PER_TOKEN
 
     def get_page_buffer_meta(self, indices: torch.Tensor) -> tuple[list, list]:
         return (
@@ -129,24 +132,24 @@ class ScriptedConnector(HiCacheKVCM):
     ) -> None:
         self.tp_rank = tp_rank
         self.tp_world_size = tp_world_size
+        # A rank-local model, so the spec table resolves to this many ranks.
+        self.tp_size = tp_world_size
+        self.block_size = 64
         self.is_mla_model = is_mla_model
         self.storage_tp_group = group
         self.kv_factor = 2
         self.instance_id = "tp-init-sync-test"
         self.location_spec_size = 4096
         self.write_timeout_seconds = 5
-        self.has_mamba = with_mamba
-        self.has_indexer = False
         self.registered_pools = {}
+        if with_mamba:
+            self.registered_pools[PoolName.MAMBA] = _FakeMambaPool()
+        self.pool_specs = self._resolve_pool_specs()
         # Same names as _init_kvcm_client would pick: the MLA KV pool is
         # replicated, so every rank uses rank 0's KV spec, while the Mamba pool
         # is rank-sharded and every rank uses its own linear spec.
         kv_spec_rank = 0 if is_mla_model else tp_rank
         self.location_spec_name = self._tp_rank_to_spec_name(kv_spec_rank)
-        if with_mamba:
-            self.mamba_spec_size = MAMBA_BYTES_PER_TOKEN
-            self.mamba_location_spec_name = self._tp_rank_to_linear_spec_name(tp_rank)
-            self.registered_pools[PoolName.MAMBA] = _FakeMambaPool()
         self.backup_pgs = []
         self.backup_bandwidth = []
         self.prefetch_pgs = []
