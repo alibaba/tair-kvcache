@@ -26,6 +26,18 @@ export KVCM_INSTANCE_GROUP='{"name":"group_test","meta_storage_backend_config":"
 
 将 Redis 地址和 `<password>` 替换为实际配置。`cluster_name` 是必填的 URI 参数；采用 `cached` 模式时，其余常用参数会按第 2 节的 URI 参数表自动补齐。主 Storage 优先级为 **PACE → L1.5 → L2**；已配置的 L1.5/L2 还会加入 EventReport candidates。
 
+### 组合示例：PACE + L2
+
+需要 PACE 存储并同时接收 L2 EventReport 时，可在平台中注入：
+
+```json
+{
+  "KVCM_PACE_STORAGE": "{\"unique_name\":\"tairmempool_s_test\",\"domain\":\"empty\",\"timeout\":30,\"service_discovery_url\":\"spectrum://v-example?cache_time=30&retry_time=3&timeout=5000&port=12348\"}",
+  "KVCM_L2P_STORAGE": "{\"unique_name\":\"vineyard_s_test\"}",
+  "KVCM_INSTANCE_GROUP": "{\"name\":\"group_test\",\"quota_capacity\":7476679068870,\"reclaim_used_percentage\":0.8,\"metadata_backend_mode\":3,\"meta_storage_backend_config\":\"cached,redis://default:<password>@redis.example.com:6379?db=4&cluster_name=group_test&capacity=65536\"}"
+}
+```
+
 ## 2. JSON 字段与默认值
 
 ### L1.5 / L2 Storage
@@ -84,21 +96,9 @@ export KVCM_INSTANCE_GROUP='{"name":"group_test","meta_storage_backend_config":"
 | `async_enqueue_timeout_ms` | 10 | `cached` 且使用 `async_redis` |
 | `async_wait_us` | 1000000 | `cached` 且使用 `async_redis` |
 
-下文的完整环境变量示例只保留 `db`、`cluster_name` 和 `capacity` 等显式参数；其余参数由 Bootstrap 补齐。这些是 Bootstrap 补齐的默认值，不会修改 Meta Backend 本身的默认值。直接调用 `create_instance_group` 时，需要自行写出所需参数。未配置 `capacity` 时，本地 Meta 缓存使用后端默认的 32768 MB。
+上面的组合示例只保留 `db`、`cluster_name` 和 `capacity` 等显式参数；其余参数由 Bootstrap 补齐。这些是 Bootstrap 补齐的默认值，不会修改 Meta Backend 本身的默认值。直接调用 `create_instance_group` 时，需要自行写出所需参数。未配置 `capacity` 时，本地 Meta 缓存使用后端默认的 32768 MB。
 
-## 3. 完整示例：PACE + L2
-
-例如需要 PACE 存储并同时接收 L2 EventReport 时，在平台中注入以下环境变量：
-
-```json
-{
-  "KVCM_PACE_STORAGE": "{\"unique_name\":\"tairmempool_s_test\",\"domain\":\"empty\",\"timeout\":30,\"service_discovery_url\":\"spectrum://v-example?cache_time=30&retry_time=3&timeout=5000&port=12348\"}",
-  "KVCM_L2P_STORAGE": "{\"unique_name\":\"vineyard_s_test\"}",
-  "KVCM_INSTANCE_GROUP": "{\"name\":\"group_test\",\"quota_capacity\":7476679068870,\"reclaim_used_percentage\":0.8,\"metadata_backend_mode\":3,\"meta_storage_backend_config\":\"cached,redis://default:<password>@redis.example.com:6379?db=4&cluster_name=group_test&capacity=65536\"}"
-}
-```
-
-## 4. 启动和主从行为
+## 3. 启动和主从行为
 
 bootstrap 在 KVCM Admin 服务健康后执行，调用关系为：
 
@@ -121,7 +121,7 @@ start_server.sh
 
 因此，多次启动、Leader 切换或环境变量未变化时，bootstrap 都是幂等的，不会重复创建相同资源。
 
-## 5. 修改配置后的行为
+## 4. 修改配置后的行为
 
 修改环境变量并重启 KVCM 后，bootstrap 会读取 Registry 中的已有配置并进行对比。
 
@@ -194,7 +194,7 @@ MetaIndexer 相关字段包括：
 3. 保留旧的 `example_l1p5`，但 Group 不再引用它。
 4. 不执行第二次重启，因为 MetaIndexer 配置没有变化。
 
-## 6. 配置错误和重试
+## 5. 配置错误和重试
 
 以下情况会被视为配置错误：
 
@@ -210,7 +210,7 @@ bootstrap 日志输出到容器标准输出和标准错误，错误信息不会�
 
 ## 附录：等价的手工命令
 
-下面的命令与第 3 节示例对应。手工调用 `create_instance_group` 不经过 Bootstrap，因此 URI 中写出了 Bootstrap 会补齐的参数。
+下面的命令与第 1 节的组合示例对应。手工调用 `create_instance_group` 不经过 Bootstrap，因此 URI 中写出了 Bootstrap 会补齐的参数。
 
 ```bash
 python3 -m kvcm_ops add_storage -u tairmempool_s_test pace \
