@@ -64,7 +64,12 @@ ClientErrorCode KvMetaTransferClientImpl::Init(const std::string &client_config,
         return ER_INVALID_CLIENT_CONFIG;
     }
     sdk_wrapper_ = std::make_unique<SdkWrapper>();
-    const auto ec = sdk_wrapper_->Init(client_config_, init_params, shared_memory_registration);
+    ClientMemoryRegistrations registrations;
+    if (shared_memory_registration) {
+        registrations.host = *shared_memory_registration;
+    }
+    const auto ec =
+        sdk_wrapper_->Init(client_config_, init_params, shared_memory_registration ? &registrations : nullptr);
     if (ec != ER_OK) {
         sdk_wrapper_.reset();
         client_config_.reset();
