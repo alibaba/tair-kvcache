@@ -1037,6 +1037,21 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
                               static_cast<int>(actual_storage_type));
                 continue;
             }
+            if (storage_backend->InReadOnlyMode()) {
+                // A read-only backend lost the authority that backs its
+                // existence verdicts, and it cannot reclaim the object either.
+                // Confirming "missing" here would delete metadata while the
+                // physical data leaks, so skip the probe and retry next round.
+                RecordOperationError("might_exist_storage_read_only");
+                KVCM_INTERVAL_LOG_WARN(10,
+                                       "cache gc skips existence probe on read-only storage, round[%lu] instance[%s] "
+                                       "storage[%s] uris[%zu]",
+                                       round_id_,
+                                       instance_id.c_str(),
+                                       storage_name.c_str(),
+                                       probe_batch.uris.size());
+                continue;
+            }
 
             for (size_t offset = 0; offset < probe_batch.uris.size(); offset += kMightExistProbeBatchSize) {
                 if (stop_requested_.load(std::memory_order_acquire)) {

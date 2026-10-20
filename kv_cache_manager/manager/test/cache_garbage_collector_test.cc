@@ -104,6 +104,15 @@ private:
     DataStorageType type_;
 };
 
+// Backend that keeps serving reads while its write path is down. Its existence
+// verdicts must never drive metadata cleanup.
+class ReadOnlyProbeTestBackend : public ProbeTestBackend {
+public:
+    explicit ReadOnlyProbeTestBackend(DataStorageType type) : ProbeTestBackend(type) {}
+    bool Writable() override { return false; }
+    bool InReadOnlyMode() override { return true; }
+};
+
 ErrorCode list_groups_ec = EC_OK;
 InstanceGroups instance_groups;
 std::map<std::string, std::pair<ErrorCode, InstanceInfos>> instances_by_group;
@@ -1430,6 +1439,44 @@ TEST_F(CacheGarbageCollectorTest, MissingOrMismatchedStorageIsUnknownAndClassifi
         1,
         metrics_registry_
             ->GetCounter("cache_gc.operation_error_count", MetricsTags{{"stage", "might_exist_storage_type_mismatch"}})
+            .Get());
+}
+
+TEST_F(CacheGarbageCollectorTest, ReadOnlyStorageIsNotProbedAndNeverConfirmedMissing) {
+    auto config = DefaultConfig();
+    config.scan_batch_size = 10;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    storage_backends["read_only_storage"] =
+        std::make_shared<ReadOnlyProbeTestBackend>(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+    // Even if the read-only backend would have denied this URI, the denial is
+    // not trustworthy while it cannot reclaim the object either.
+    might_exist_by_uri["dummy://read_only_storage/ga?size=1"] = false;
+    const std::string healthy_missing_uri = "dummy://healthy_storage/missing?size=1";
+    might_exist_by_uri[healthy_missing_uri] = false;
+
+    CacheLocationMap locations;
+    locations["on_read_only"] = MakeStoredLocation("on_read_only",
+                                                   CLS_SERVING,
+                                                   DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                                   {"dummy://read_only_storage/ga?size=1"});
+    locations["on_healthy"] =
+        MakeStoredLocation("on_healthy", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {healthy_missing_uri});
+
+    auto batch = MakeBatch(SCAN_BASE_CURSOR, {10}, {locations});
+    const CacheLocationDelRequest request =
+        gc->BuildDeleteActions("instance_a", batch, TimestampUtil::GetCurrentTimeUs()).executor_request;
+
+    // Only the healthy storage may confirm absence; the read-only one is deferred.
+    EXPECT_EQ((KeyVector{10}), request.block_keys);
+    EXPECT_EQ((std::vector<std::vector<std::string>>{{"on_healthy"}}), request.location_ids);
+    ASSERT_EQ(1, might_exist_calls.size());
+    EXPECT_EQ("healthy_storage", might_exist_calls.front().storage_name);
+    EXPECT_EQ(
+        1,
+        metrics_registry_
+            ->GetCounter("cache_gc.operation_error_count", MetricsTags{{"stage", "might_exist_storage_read_only"}})
             .Get());
 }
 

@@ -37,6 +37,14 @@ public:
     // Default implementation returns Available() for backward compatibility.
     virtual bool Writable() { return Available(); }
 
+    // True while the backend still serves reads but can no longer reclaim
+    // physical objects because its write path is down (read-only degradation).
+    // Existence verdicts are untrustworthy in this state and a delete cannot
+    // free space, so callers must defer metadata cleanup instead of dropping
+    // metadata and leaking storage. Backends without a read-only degraded mode
+    // keep the default false, which preserves their existing cleanup behaviour.
+    virtual bool InReadOnlyMode() { return false; }
+
     std::shared_ptr<DataStorageMetricsCollector> GetMetricsCollector() { return metrics_collector_; }
     virtual const StorageConfig &GetStorageConfig() { return config_; }
 

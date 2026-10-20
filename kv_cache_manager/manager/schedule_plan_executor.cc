@@ -646,6 +646,35 @@ bool SchedulePlanExecutor::FillActualTask(
     }
     return true;
 }
+
+bool SchedulePlanExecutor::IsLocationBlockedByReadOnlyStorage(
+    const CacheLocation &location, std::unordered_map<std::string, bool> &read_only_by_storage) const {
+    if (!data_storage_manager_ || IsEventReportStorageType(location.type())) {
+        return false;
+    }
+    for (const auto &loc_spec : location.location_specs()) {
+        const DataStorageUri uri(loc_spec.uri());
+        if (!uri.Valid()) {
+            continue;
+        }
+        const std::string &storage_unique_name = uri.GetHostName();
+        const auto memo = read_only_by_storage.find(storage_unique_name);
+        if (memo != read_only_by_storage.end()) {
+            if (memo->second) {
+                return true;
+            }
+            continue;
+        }
+        const auto backend = data_storage_manager_->GetDataStorageBackend(storage_unique_name);
+        const bool read_only = backend != nullptr && backend->InReadOnlyMode();
+        read_only_by_storage.emplace(storage_unique_name, read_only);
+        if (read_only) {
+            return true;
+        }
+    }
+    return false;
+}
+
 SchedulePlanExecutor::LocationDelAdmissionResult
 SchedulePlanExecutor::PrepareDeleteTask(const CacheMetaDelRequest &task) {
     return PrepareDeleteTaskImpl(task.instance_id, task.block_keys, nullptr, nullptr, task.delay, false);
@@ -741,6 +770,8 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
 
     std::vector<int64_t> batch_cas_block_keys;
     std::vector<std::vector<MetaSearcher::LocationCASTask>> batch_cas_tasks;
+    size_t read_only_deferred_locations = 0;
+    std::unordered_map<std::string, bool> read_only_by_storage;
     // A null target list represents CacheMetaDelRequest and selects every non-deleting location.
     for (size_t block_key_idx = 0; block_key_idx < block_keys.size(); ++block_key_idx) {
         std::unordered_set<std::string> target_ids;
@@ -769,6 +800,13 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
             if (target_location_ids != nullptr && target_ids.find(location.id()) == target_ids.end()) {
                 continue;
             }
+            if (IsLocationBlockedByReadOnlyStorage(location, read_only_by_storage)) {
+                // Defer instead of admitting: the location stays CLS_SERVING so
+                // reads keep hitting it and reclaim/GC can retry once the
+                // backend is writable again.
+                ++read_only_deferred_locations;
+                continue;
+            }
             std::string expected_location_value;
             if (expected_location_values != nullptr) {
                 const auto expected = expected_values_by_location.find(location.id());
@@ -787,6 +825,14 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
         }
         batch_cas_block_keys.push_back(block_key);
         batch_cas_tasks.emplace_back(std::move(location_cas_tasks));
+    }
+    if (read_only_deferred_locations > 0) {
+        KVCM_INTERVAL_LOG_WARN(10,
+                               "location delete deferred by read-only storage, instance[%s] deferred_locations[%zu] "
+                               "admitted_blocks[%zu]",
+                               instance_id.c_str(),
+                               read_only_deferred_locations,
+                               batch_cas_tasks.size());
     }
     if (batch_cas_block_keys.empty()) {
         return admission_result;

@@ -324,6 +324,8 @@ GC 的普通规则只探测 `status == CLS_SERVING` 且 storage type 已知的�
 
 storage 未注册记录 `might_exist_storage_not_found`，backend type 不一致记录 `might_exist_storage_type_mismatch`；两者均视为 unknown，不调用探测。结果长度必须与当前分块的输入 URI 数完全一致，否则该分块结果不可关联，记录 `might_exist_shape` 并丢弃；其他分块和 storage 继续。调用异常记录 `might_exist_exception`，不影响同 batch 的其他 storage。GC 不逐 URI 输出正常 missing 日志，避免全量扫描制造日志压力。
 
+backend 处于只读降级（`InReadOnlyMode()`，例如 tair-mempool 的 meta-service 不可用）时同样跳过探测，记录 `might_exist_storage_read_only`。理由有两层：一是此时 backend 的存在性判定失去权威来源，`false` 可能是 false negative；二是 `Delete()` 已被拒绝，即使判定正确也回收不了物理空间，删除 metadata 只会让对象永久泄漏。这些 Location 保持 `CLS_SERVING` 继续服务读，等 backend 恢复可写后由后续 round 重新判定。
+
 该规则删除整个 Location，而不是只删 missing spec。原因是一个 Location 的 specs 共同描述同一份可用缓存，任一必需 spec 丢失后该 Location 已无法完整服务；Executor 仍会 best effort 删除其余 URI，再完成 metadata CAD。NFS/HF3FS 等未覆写 `MightExist()` 的 backend 默认返回全 `true`，因此不会因为 GC 引入同步 I/O 或误删；具备低成本明确判定能力的 backend 才实际启用该规则。
 
 storage-missing 往往由节点批量退出触发，可能在短时间产生大量物理删除。任务会进入与 Reclaimer 共享的 Executor；如果后端 `Delete()` 缺少 I/O timeout，大量慢删除可能占用共享 worker，并通过 `DataStorageManager` 锁竞争延长 storage cleanup。V1 不能改为 metadata-only：同一 Location 的其他 spec 可能仍存在，需要 best effort 释放。上线需按 Instance/Group 灰度，重点监控在途任务年龄、Executor/存储后端负载和 demotion 时延；物理 I/O timeout/cancel 与独立执行隔离仍是后续公共治理项。
@@ -357,6 +359,8 @@ GC 对 WRITING 和 SERVING 两类 target 都设置扫描时的 `CacheLocation::T
 未设置 `expected_location_values`、未启用 `authoritative_read` 的现有调用方保持当前行为。authoritative read 只在候选 admission/CAS 阶段触碰被选中的完整 key；maintenance scan 本身不从 persistent 回填 hot cache。V1 不新增 GC 专用删除状态机，也不改变物理删除和最终 CAD 的顺序。
 
 #234 的 `SubmitAsync()` 首次入队成功后立即返回；Get/CAS/Sync、delay 和物理删除都在 Executor 中完成。精确值筛选和 CAS 已由 #233 落在共享 `PrepareDeleteTaskImpl`/MetaSearcher RMW 中，同步与异步入口复用同一 admission 语义。
+
+只读降级在 admission 阶段还有一道护栏：`PrepareDeleteTaskImpl` 构造 CAS 之前检查 target 的 spec 是否落在 `InReadOnlyMode()` 的 backend 上，命中则整个 Location 被延迟，不进入 `CLS_DELETING`，请求整体仍返回 `EC_OK`。护栏必须在准入期而非执行期：`DoLocationDelTask` 在物理 `Delete()` 失败后仍会继续 metadata CAD，而 GC 不会重新拾取 `CLS_DELETING`，一旦放行就等于丢掉元数据并泄漏空间。EventReport 类型的 Location 不受该护栏影响。
 
 ### 4.5 有界 Future 窗口、pending 去重和结果
 
@@ -445,6 +449,7 @@ Stop 通过 GC stop flag、`LoopThread::RunOnce()` 和最终 `LoopThread::Stop()
 | URI 无法解析或无可探测 spec | 视为 unknown，单独不授权删除 |
 | storage 未注册 | 视为 unknown，不调用探测，记录 `might_exist_storage_not_found` |
 | backend type 与 Location 不一致 | 视为 unknown，不调用探测，记录 `might_exist_storage_type_mismatch` |
+| backend 处于只读降级 | 视为 unknown，不调用探测，记录 `might_exist_storage_read_only`；Executor admission 同步延迟该 backend 上的 Location 删除，backend 恢复后由后续 round 重试 |
 | `MightExist()` 返回长度不一致 | 丢弃当前 URI 分块结果，记录 `might_exist_shape`；其他分块继续 |
 | `MightExist()` 抛异常 | 当前及后续分块视为 unknown，记录 `might_exist_exception`；已完成分块的明确结果保留，其他 storage 继续 |
 | 空候选 | 不调用 Executor |

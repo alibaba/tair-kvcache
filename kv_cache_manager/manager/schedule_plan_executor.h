@@ -11,7 +11,9 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -196,6 +198,15 @@ private:
                                const std::vector<std::vector<ErrorCode>> &batch_results,
                                CacheLocationDelRequest &actual_task,
                                std::string &error_message);
+    // True when at least one spec of \p location lives on a backend that is in
+    // read-only degradation. Such a location must keep its current status: the
+    // physical object cannot be reclaimed, so admitting the delete would hide
+    // still-readable data and leak storage space once the metadata is dropped.
+    // \p read_only_by_storage memoizes the verdict per storage unique name for
+    // the duration of one admission, so a large batch does not re-take the
+    // DataStorageManager lock for every spec of every location.
+    bool IsLocationBlockedByReadOnlyStorage(const CacheLocation &location,
+                                            std::unordered_map<std::string, bool> &read_only_by_storage) const;
     LocationDelAdmissionResult PrepareDeleteTask(const CacheMetaDelRequest &task);
     LocationDelAdmissionResult PrepareDeleteTask(const CacheLocationDelRequest &task);
     LocationDelAdmissionResult

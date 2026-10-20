@@ -145,6 +145,8 @@ public:
         return skip_missing_;
     }
     bool Available() override { return true; }
+    bool Writable() override { return !read_only; }
+    bool InReadOnlyMode() override { return read_only; }
     double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
     const StorageConfig &GetStorageConfig() override { return config_; }
     ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
@@ -184,6 +186,9 @@ public:
 
     const bool skip_missing_;
     mutable size_t policy_queries{0};
+    // Emulates a backend whose write path is down (meta-service unavailable):
+    // reads keep working, but nothing can be allocated or reclaimed.
+    bool read_only{false};
     ErrorCode delete_result{EC_OK};
     bool throw_on_delete{false};
     bool short_result{false};
@@ -460,6 +465,41 @@ TEST_F(BackendGcDeleteTest, MixedStoragesUseTheirOwnPolicyAndOtherBackendsKeepSk
     SetLocation(101, "ordinary", type, {missing_skip});
     EXPECT_EQ(EC_OK, Run(Request(101, {"ordinary"}, {})).status);
     EXPECT_EQ((std::vector<std::string>{existing_skip, missing_skip}), DeletedUris(*skip_backend));
+}
+
+TEST_F(BackendGcDeleteTest, ReadOnlyStorageDefersDeleteAndKeepsLocationReadable) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    auto read_only_backend = AddBackend("pace_read_only", type);
+    read_only_backend->read_only = true;
+    auto healthy_backend = AddBackend("pace_healthy", type);
+
+    // The degraded backend cannot reclaim the GA, so admitting the delete would
+    // drop the metadata and leak the space forever. Defer and keep it readable.
+    const std::string read_only_uri = "pace://pace_read_only/1?size=5";
+    SetLocation(100, "deferred", type, {read_only_uri});
+    // Even a GC-confirmed-missing verdict is not actionable while read-only.
+    EXPECT_EQ(EC_OK, Run(Request(100, {"deferred"}, {read_only_uri})).status);
+    EXPECT_TRUE(read_only_backend->delete_batches.empty());
+    ASSERT_EQ(1u, Locations(100).size());
+    EXPECT_EQ(CLS_SERVING, Locations(100).at("deferred")->status());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+
+    // A location spanning both backends is deferred as a whole: reclaiming only
+    // the healthy half would still leave the degraded half leaking.
+    const std::string mixed_healthy_uri = "pace://pace_healthy/2?size=7";
+    SetLocation(101, "mixed", type, {read_only_uri, mixed_healthy_uri});
+    EXPECT_EQ(EC_OK, Run(Request(101, {"mixed"}, {})).status);
+    EXPECT_TRUE(read_only_backend->delete_batches.empty());
+    EXPECT_TRUE(healthy_backend->delete_batches.empty());
+    ASSERT_EQ(1u, Locations(101).size());
+    EXPECT_EQ(CLS_SERVING, Locations(101).at("mixed")->status());
+
+    // Locations that never touch the degraded backend keep being deleted.
+    const std::string healthy_uri = "pace://pace_healthy/3?size=11";
+    SetLocation(102, "healthy", type, {healthy_uri});
+    EXPECT_EQ(EC_OK, Run(Request(102, {"healthy"}, {})).status);
+    EXPECT_EQ((std::vector<std::string>{healthy_uri}), DeletedUris(*healthy_backend));
+    EXPECT_TRUE(Locations(102).empty());
 }
 
 TEST_F(BackendGcDeleteTest, MetadataOnlySkipsDeleteForBothSettings) {
