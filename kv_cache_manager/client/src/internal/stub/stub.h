@@ -94,7 +94,8 @@ public:
                       QueryType query_type,
                       const KeyVector &keys,
                       const std::vector<std::string> &medium,
-                      int32_t p2p_host_count) = 0;
+                      int32_t top_k_host_count,
+                      const std::vector<StorageType> &backend_types) = 0;
 
     // leader 节点信息查询失败时 ClusterInfo::leader_endpoint 可能为空，调用方应据此决定是否重试。
     virtual std::pair<ClientErrorCode, ClusterInfo> GetClusterInfo(const std::string &trace_id,

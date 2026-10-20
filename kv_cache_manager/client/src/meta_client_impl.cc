@@ -216,9 +216,10 @@ MetaClientImpl::GetHostCacheState(const std::string &trace_id,
                                  QueryType query_type,
                                  const std::vector<int64_t> &keys,
                                  const std::vector<std::string> &medium,
-                                 int32_t p2p_host_count) {
+                                 int32_t top_k_host_count,
+                                 const std::vector<StorageType> &backend_types) {
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
-    return stub_->GetHostCacheState(trace_id, instance_id, query_type, keys, medium, p2p_host_count);
+    return stub_->GetHostCacheState(trace_id, instance_id, query_type, keys, medium, top_k_host_count, backend_types);
 }
 
 ClientErrorCode MetaClientImpl::IsValid(const std::unique_ptr<ClientConfig> &client_config) const {

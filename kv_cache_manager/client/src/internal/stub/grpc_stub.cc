@@ -511,8 +511,9 @@ GrpcStub::GetHostCacheState(const std::string &trace_id,
                             QueryType query_type,
                             const KeyVector &keys,
                             const std::vector<std::string> &medium,
-                            int32_t p2p_host_count) {
-    if (p2p_host_count < 0) {
+                            int32_t top_k_host_count,
+                            const std::vector<StorageType> &backend_types) {
+    if (top_k_host_count < 0) {
         return {ER_INVALID_PARAMS, {}};
     }
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
@@ -525,7 +526,10 @@ GrpcStub::GetHostCacheState(const std::string &trace_id,
     for (const auto &name : medium) {
         request.add_medium(name);
     }
-    request.set_p2p_host_count(p2p_host_count);
+    request.set_top_k_host_count(top_k_host_count);
+    for (const auto type : backend_types) {
+        request.add_backend_types(static_cast<proto::meta::StorageType>(type));
+    }
     grpc::ClientContext context;
     proto::meta::GetHostCacheStateResponse response;
     auto grpc_status = stub->GetHostCacheState(&context, request, &response);
@@ -534,7 +538,7 @@ GrpcStub::GetHostCacheState(const std::string &trace_id,
     HostCacheState result;
     result.reserve(response.hosts_size());
     for (const auto &host : response.hosts()) {
-        result.push_back({host.host_ip_port(), host.local(), host.p2p_1_fetch(), host.p2p_1_total_match()});
+        result.push_back({host.host_ip_port(), host.local(), host.global()});
     }
     return {ER_OK, std::move(result)};
 }

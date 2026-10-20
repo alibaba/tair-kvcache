@@ -148,7 +148,7 @@ public:
     MOCK_METHOD((std::pair<ClientErrorCode, HostCacheState>),
                 GetHostCacheState,
                 (const std::string&, const std::string&, QueryType, const KeyVector&,
-                 const std::vector<std::string>&, int32_t),
+                 const std::vector<std::string>&, int32_t, const std::vector<StorageType>&),
                 (override));
     MOCK_METHOD(bool, TrimCache, (), (override));
 

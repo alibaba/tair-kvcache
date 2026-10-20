@@ -71,7 +71,8 @@ public:
                       QueryType query_type,
                       const std::vector<int64_t> &keys,
                       const std::vector<std::string> &medium,
-                      int32_t p2p_host_count) = 0;
+                      int32_t top_k_host_count,
+                      const std::vector<StorageType> &backend_types) = 0;
 
 protected:
     MetaClient() = default;

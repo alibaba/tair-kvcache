@@ -1015,8 +1015,7 @@ TEST(GrpcStubMetadataProtocolTest, SendsReplicaBackendAndHostArgumentsAndKeepsMi
             auto *match = response->add_hosts();
             match->set_host_ip_port("worker:9000");
             match->set_local(1);
-            match->set_p2p_1_fetch(2);
-            match->set_p2p_1_total_match(3);
+            match->set_global(3);
             return grpc::Status::OK;
         }
     } service;
@@ -1048,15 +1047,18 @@ TEST(GrpcStubMetadataProtocolTest, SendsReplicaBackendAndHostArgumentsAndKeepsMi
     ASSERT_EQ(service.backend.backend_selectors_size(), 1);
     EXPECT_EQ(service.backend.backend_selectors(0).backend_type(), proto::meta::ST_NFS);
     const auto [host_ec, hosts] = stub.GetHostCacheState(
-        "host", "instance", QueryType::QT_PREFIX_MATCH_WITH_MAMBA, keys, {"hbm"}, 2);
+        "host", "instance", QueryType::QT_PREFIX_MATCH_WITH_MAMBA, keys, {"hbm"}, 2,
+        {StorageType::ST_TAIRMEMPOOL, StorageType::ST_EVENT_REPORT_L2});
     ASSERT_EQ(ER_OK, host_ec);
     ASSERT_EQ(1u, hosts.size());
     EXPECT_EQ(hosts[0].host_ip_port, "worker:9000");
     EXPECT_EQ(hosts[0].local, 1);
-    EXPECT_EQ(hosts[0].p2p_1_fetch, 2);
-    EXPECT_EQ(hosts[0].p2p_1_total_match, 3);
+    EXPECT_EQ(hosts[0].global, 3);
     EXPECT_EQ(service.host.query_type(), proto::meta::QT_PREFIX_MATCH_WITH_MAMBA);
-    EXPECT_EQ(service.host.p2p_host_count(), 2);
+    EXPECT_EQ(service.host.top_k_host_count(), 2);
+    ASSERT_EQ(service.host.backend_types_size(), 2);
+    EXPECT_EQ(service.host.backend_types(0), proto::meta::ST_TAIRMEMPOOL);
+    EXPECT_EQ(service.host.backend_types(1), proto::meta::ST_EVENT_REPORT_L2);
     ASSERT_EQ(service.host.medium_size(), 1);
     EXPECT_EQ(service.host.medium(0), "hbm");
     server->Shutdown();

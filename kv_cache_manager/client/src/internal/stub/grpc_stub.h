@@ -91,7 +91,8 @@ public:
                       QueryType query_type,
                       const KeyVector &keys,
                       const std::vector<std::string> &medium,
-                      int32_t p2p_host_count) override;
+                      int32_t top_k_host_count,
+                      const std::vector<StorageType> &backend_types) override;
 
     std::pair<ClientErrorCode, ClusterInfo> GetClusterInfo(const std::string &trace_id,
                                                            const std::string &instance_id) override;

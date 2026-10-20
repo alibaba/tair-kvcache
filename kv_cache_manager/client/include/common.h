@@ -116,8 +116,7 @@ using BackendLocations = std::vector<std::vector<BackendLocation>>;
 struct HostCacheMatch {
     std::string host_ip_port;
     int64_t local{0};
-    int64_t p2p_1_fetch{0};
-    int64_t p2p_1_total_match{0};
+    int64_t global{0};
 };
 using HostCacheState = std::vector<HostCacheMatch>;
 struct Metas {
