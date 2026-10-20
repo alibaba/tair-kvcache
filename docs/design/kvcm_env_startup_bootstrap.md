@@ -52,6 +52,21 @@ export KVCM_INSTANCE_GROUP='{"name":"group_test","meta_storage_backend_config":"
 
 这组配置以 L1.5 为主 Storage，L1.5 和 L2 都加入 EventReport candidates。
 
+### 完整组合示例：PACE + L1.5 + L2
+
+同时配置全部四个环境变量时，可在平台中注入：
+
+```json
+{
+  "KVCM_PACE_STORAGE": "{\"unique_name\":\"tairmempool_s_test\",\"domain\":\"empty\",\"timeout\":30,\"service_discovery_url\":\"spectrum://v-example?cache_time=30&retry_time=3&timeout=5000&port=12348\"}",
+  "KVCM_L1P5_STORAGE": "{\"unique_name\":\"engine_l1p5_s_test\"}",
+  "KVCM_L2P_STORAGE": "{\"unique_name\":\"vineyard_s_test\"}",
+  "KVCM_INSTANCE_GROUP": "{\"name\":\"group_test\",\"quota_capacity\":7476679068870,\"reclaim_used_percentage\":0.8,\"metadata_backend_mode\":3,\"meta_storage_backend_config\":\"cached,redis://default:<password>@redis.example.com:6379?db=4&cluster_name=group_test&capacity=65536\"}"
+}
+```
+
+这组配置以 PACE 为主 Storage；L1.5 和 L2 都加入 EventReport candidates。将 Redis 地址、`<password>` 和 PACE 服务发现地址替换为实际配置。
+
 ## 2. JSON 字段与默认值
 
 ### L1.5 / L2 Storage
