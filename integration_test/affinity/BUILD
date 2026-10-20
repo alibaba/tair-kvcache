@@ -1,5 +1,11 @@
 package(default_visibility = ["//integration_test:__subpackages__"])
 
+cc_binary(
+    name = "local_client",
+    srcs = ["local_client.cc"],
+    deps = ["//kv_cache_manager/client"],
+)
+
 cc_test(
     name = "AffinityPendingContractTest",
     srcs = ["affinity_pending_contract_test.cc"],

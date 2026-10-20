@@ -1,13 +1,14 @@
 # Cache affinity 生命周期验收
 
-当前算法、配置与限制见[整体设计](../../docs/design-cache-affinity-v1.md)。特别注意：保留副本的元数据 RMW 单测不代表节点回收全链路已受保护；当前 `ReclaimByNode` 未传入 `min_retained_replicas`。节点回收还依赖元数据 URI 的 `reclaim_indexer_type=node_lru` 配置。
+当前算法、配置与限制见[整体设计](../../docs/design-cache-affinity-v1.md)。`ReclaimByNode` 已将有效策略的 `min_retained_replicas` 传入删除准入，按 spec 保护剩余 SERVING 副本。节点回收还依赖元数据 URI 的 `reclaim_indexer_type=node_lru` 配置；该保护不用于普通配额回收、显式删除或 GC。
 
-测试分为三层；控制面返回 URI、释放复制 buffer、物理数据正确是不同的验收条件。
+先从[本地 Manager + SDK 示例](../../docs/deploy/cache-affinity-local.md)运行完整文件读写。测试分层如下；控制面返回 URI、释放复制 buffer、物理数据正确是不同的验收条件。
 
 | 层次 | 入口 | 检查内容 |
 | --- | --- | --- |
 | 策略和组件回归 | `//kv_cache_manager/affinity/test:all`、`ReplicationExecutorTest`、`CacheManagerTest`、`MetaSearcherTest`、`CacheReclaimerTest`、`NodeLruReclaimIndexerTest` | 写入路由、复制门限/抑制、异步复制失败处理、元数据发布、淘汰决策及删除组件 |
 | 真实服务的控制面集成 | `//integration_test/affinity:affinity_replication_test` | 25 个用例：本地写、远端读 hint、strict/non-strict 写、未完成/失败写与重试、部分 batch 发布、重复本地命中、逐 key 抑制、实例隔离、空 caller 兼容、noop、删除/重写、多 spec 发布、并发预算/失败回滚、协议滚动升级、显式目标、gRPC/HTTP 批量复制、重启恢复 |
+| 本地 Manager + SDK 数据链路 | `//integration_test/client_test:manager_client_test`、`//integration_test/affinity:local_client` | 真实 NFS Save/Load、实际 URI 发布、发布前不可读、逐字节校验；集成测试额外检查多 block、多 spec 和失败发布 |
 | 双机真实数据链路 | `//integration_test/affinity_piggyback:mock_inference_node` + tair-mempool `.aoneci/kvcm_affinity_test.yaml` | A 写入、B 远端逐字节读、piggyback/async 两种复制、本地物理 Provider 校验、重复读、停 A 后读 B、跨实例 miss、删除和重写 |
 
 `EvictedReplicaCanBeRecreatedAfterCapacityRecovers` 连接策略阶段：远端热读 → hint → 本地候选 → 高水位淘汰 → 滞后估算停止 → 容量恢复 → 再次 hint。它注入候选和节点指标，并不分配内存或执行物理淘汰。真实双机当前测试的是显式删除/重建和源 Provider 停机；控制面已覆盖 Manager 重启后的元数据与容量预算恢复；容量压满导致自动物理淘汰、PACE Provider 重启后的物理数据恢复、真实推理引擎/GPU 读写仍需要专门的集群用例，不能据此宣称已验收。
@@ -46,13 +47,13 @@ bazelisk --output_base=/tmp/bazel-affinity-e2e-os test \
 
 ## 双机验收契约
 
-每种模式使用独立 key 前缀，默认 3 个 block。每个阶段都要求进程退出码为 0，并由 `tair-mempool/tests/affinity/e2e_checks.py` 核验恰好 N 条 `BLOCK_OK` 和唯一、最后出现的 `E2E_OK`。
+每种模式各使用 `test`、`cleanup` 两组独立 key 前缀，每组默认 3 个 block。每个数据阶段都要求进程退出码为 0，并由 `tair-mempool/tests/affinity/e2e_checks.py` 核验恰好 N 条 `BLOCK_OK` 和唯一、最后出现的 `E2E_OK`。
 
 1. A 执行 `writer_abort`：未 Finish/失败 Finish 的 block 都不可读。
 2. A 执行 `writer`：真实 Save、成功 Finish 后能逐字节读回，URI 的物理 node ID 必须属于 A。
 3. B 执行 `reader_piggyback` 或 `reader_async`：先读远端原始数据，查询到设定门限才获得 hint；hint 的 key、源 URI、目标 PACE node ID 都必须准确。等 B 副本发布后，验证物理 node ID、稳定 URI、无重复 hint 和完整数据。
-4. CI 停掉 A 的 Provider 容器并确认退出，B 执行 `reader_local` 再读全部 block。
-5. 另一个 instance 对相同 key 执行 `reader_miss`；原 instance 执行 `remove`、`reader_miss`、`writer`、`reader_local`，验证删除和本地重建。
+4. A、B 均健康时，B 对 `cleanup` 前缀执行 `remove`；用 `wait-no-replicas` 确认 GetCacheMeta 中全部副本（包括 DELETING）消失，再执行 `reader_miss`、`writer`、`reader_local`，验证删除和本地重建。
+5. 保留 `test` 前缀的原复制副本。CI 停掉 A 的 Provider 容器并确认退出，B 对该前缀执行 `reader_local`，再由另一个 instance 执行 `reader_miss`，验证存活副本和实例隔离。失联后不要求删除成功或重写，PACE 未知删除结果会保留墓碑。
 
 `--expected-node-id` 必须来自 MetaService `/v1/api/memnode` 中本机唯一、健康 Provider 的 **数值 PACE ID**，不能使用 Provider UUID 或从被测 URI 反推期望值。SDK caller 和 hint 的 `target_node_id` 都使用该 PACE ID 的字符串形式。
 
@@ -70,7 +71,7 @@ mock_inference_node --kvcm-endpoint KVCM_IP:6381 \
   --query-rounds 5 --expected-hint-round 2 --wait-seconds 30
 ```
 
-实例组配置需要同时包含 `write.ops.prefer_local` 和 `read.on_miss`；group override 会整体覆盖 process strategy。测试使用 CPU buffer 和单个 `spec_0`，不需要模型/GPU。禁止关闭校验、读取失败后造数据、将 release callback 当作复制成功。
+实例组配置需要同时包含 `write.ops.prefer_local` 和 `read.on_miss`；group override 会整体覆盖 process strategy。上例要求组策略的 `replication_hot_threshold=2`，与 `--expected-hint-round 2` 一致；内置策略默认阈值为 3。测试使用 CPU buffer 和单个 `spec_0`，不需要模型/GPU。禁止关闭校验、读取失败后造数据、将 release callback 当作复制成功。
 
 ## 正确性补齐回归
 

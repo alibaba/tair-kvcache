@@ -1,6 +1,6 @@
 # Cache affinity configuration and usage
 
-This guide describes the current `kvcm_affinity_merge` implementation. Start with the [overall design](design-cache-affinity-v1.md); consult the [implementation reference](cache-affinity-implementation.md) for call flows, defaults, backend support and the full list of known gaps. [中文](cache-affinity-zh_CN.md)
+This guide describes the current `kvcm_affinity_merge` implementation. Start with the [overall design](design-cache-affinity-v1.md) or run the [local Manager + SDK example (Chinese)](deploy/cache-affinity-local.md); consult the [implementation reference](cache-affinity-implementation.md) for call flows, defaults, backend support and the full list of known gaps. [中文](cache-affinity-zh_CN.md)
 
 ## 1. Enable the server strategy
 
@@ -91,7 +91,7 @@ Add these fields to an otherwise complete ManagerClient configuration; this frag
 
 Automatic execution requires a HYBRID ManagerClient with both MetaClient and TransferClient, using the MatchLocation path that returns hints. `auto_replicate` defaults to false; enabling the server alone does not move data.
 
-The SDK queries the current PACE local identity on every request by default. A positive refresh interval permits cached identities. With mempool build support enabled, both DRAM and SSD-only configurations select the PACE provider, which still requires exactly one local provider with a nonzero node ID. NFS uses its own provider.
+The SDK selects a caller provider from the storage configuration returned by instance registration: PACE uses a numeric node ID string, and NFS uses the local IP. PACE queries the local identity on every request by default; a positive refresh interval permits cached identities. With mempool build support enabled, both DRAM and SSD-only configurations can select the PACE provider, which requires exactly one local provider with a nonzero node ID. Inspect the result with `GetCallerNode()`. ManagerClient configuration has no caller override field; direct HTTP/gRPC requests can supply `caller`.
 
 Tasks without reusable buffers first call server ReplicateCache and fall back to client Load/Save only for an unsupported operation. Explicit buffer reuse accepts named specs with shared owners. An asynchronous boolean return indicates queue admission; the result callback reports the replication outcome. A release callback does not indicate success.
 
@@ -124,4 +124,4 @@ If a hint does not lead to a local replica, follow [replication results and fail
 
 Test entry points: [real Manager integration](../integration_test/affinity/affinity_replication_test.py), [SDK replication tests](../kv_cache_manager/client/test/replication_executor_test.cc), [strategy tests](../kv_cache_manager/affinity/test/). See [backend support and remaining work](cache-affinity-implementation.md#status) for limitations and development priorities.
 
-Current production candidates are limited to DRAM with transparent SSD tiering disabled, or explicit SSD storage. Transparent tiered deletion remains blocked separately; real PACE replication, pressure reclamation and restart behavior still need hardware acceptance tests.
+Current production candidates are limited to DRAM with transparent SSD tiering disabled. Explicit SSD storage requires separate acceptance testing. Transparent tiered deletion remains blocked separately; real PACE replication, pressure reclamation and restart behavior still need hardware acceptance tests.

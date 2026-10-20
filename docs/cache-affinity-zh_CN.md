@@ -1,6 +1,6 @@
 # 缓存亲和性配置与使用
 
-本页对应 `kvcm_affinity_merge` 当前实现。先读[整体设计](design-cache-affinity-v1.md)了解方案；调用链、默认值、后端能力和完整缺口见[实现参考](cache-affinity-implementation.md)。[English](cache-affinity-en_US.md)
+本页对应 `kvcm_affinity_merge` 当前实现。先读[整体设计](design-cache-affinity-v1.md)了解方案；直接运行可看[本地 Manager + SDK 示例](deploy/cache-affinity-local.md)。调用链、默认值、后端能力和完整缺口见[实现参考](cache-affinity-implementation.md)。[English](cache-affinity-en_US.md)
 
 ## 1. 启用服务端策略
 
@@ -91,7 +91,7 @@ kvcm.affinity.strategy_file=/path/to/affinity.json
 
 自动执行要求 HYBRID ManagerClient 同时有 MetaClient 和 TransferClient，并走可返回 hints 的 MatchLocation。`auto_replicate` 默认 false；仅打开服务端开关不会自动搬运数据。
 
-SDK 默认每次读取 PACE 本地身份；设正刷新间隔会允许复用旧身份。启用 mempool 编译支持时，DRAM 和 SSD-only 配置均可选择 PACE provider，仍要求本机恰好有一个非零节点身份；NFS 使用独立 provider。
+SDK 根据注册实例返回的 storage 配置选择 caller provider：PACE 使用数字 node id 字符串，NFS 使用本机 IP。PACE 默认每次查询本地身份；设正刷新间隔会允许复用旧身份。启用 mempool 编译支持时，DRAM 和 SSD-only 配置均可选择 PACE provider，仍要求本机恰好有一个非零节点身份。可用 `GetCallerNode()` 检查结果；当前 ManagerClient 配置没有手工覆盖 caller 的字段，直接调用 HTTP/gRPC 时可在请求的 `caller` 中指定。
 
 无复用 buffer 的任务先调用服务端 ReplicateCache，仅“不支持”回退客户端 Load/Save。显式复用接口支持按 spec 名称传 buffer 与共享 owner；异步返回值表示入队，结果回调表示复制结果。释放回调不表示复制成功。
 
@@ -124,4 +124,4 @@ SDK 默认每次读取 PACE 本地身份；设正刷新间隔会允许复用旧�
 
 测试入口：[真实 Manager 集成](../integration_test/affinity/affinity_replication_test.py)、[SDK 复制测试](../kv_cache_manager/client/test/replication_executor_test.cc)、[策略测试](../kv_cache_manager/affinity/test/)。完整限制及后续开发优先级见[后端与待办](cache-affinity-implementation.md#status)。
 
-当前生产候选限关闭透明 SSD 分层的 DRAM 或显式 SSD；透明分层删除仍有独立阻断，真实 PACE 复制、压力回收和重启仍须实机验收。
+当前生产候选限关闭透明 SSD 分层的 DRAM，显式 SSD 另行验收。透明分层删除仍有独立阻断，真实 PACE 复制、压力回收和重启仍须实机验收。
