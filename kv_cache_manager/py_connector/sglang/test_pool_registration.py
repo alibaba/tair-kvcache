@@ -15,7 +15,10 @@ process group:
 * ``HostPoolGroup.entries`` is not a source of pools any more -- the KV pool of
   a hybrid group is the one v2 registers;
 * the Manager registration and the SDK client are created on the first storage
-  call (never before the pool set is final) and exactly once;
+  call (never before the pool set is final) and exactly once; sglang that offers
+  the duck-typed ``finalize_registration`` hook instead freezes them at the end
+  of the attach (draft pools included) and fails the attach when that fails,
+  while a release without the hook keeps the lazy timing unchanged;
 * a pool registered after that point is reported once and degraded to misses:
   it is not recorded and stays unusable, even when it reuses the name of a pool
   whose spec is already registered;
@@ -51,6 +54,7 @@ from typing import Any
 from unittest import mock
 from unittest.mock import MagicMock
 
+import requests
 import torch
 
 # ── Modules the connector imports but this test does not exercise ──────
@@ -74,12 +78,17 @@ sys.modules.setdefault(
 )
 
 from sglang.srt.mem_cache.hicache_storage import (  # noqa: E402
+    HiCacheStorage,
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache  # noqa: E402
 
+from kv_cache_manager.py_connector.common.manager_client import (  # noqa: E402
+    KvCacheManagerHTTPError,
+    KvCacheManagerProtocolError,
+)
 from kv_cache_manager.py_connector.sglang import connector as connector_module  # noqa: E402
 from kv_cache_manager.py_connector.sglang.connector import HiCacheKVCM  # noqa: E402
 
@@ -939,6 +948,474 @@ class TestInitializationTiming(unittest.TestCase):
                     connector.batch_set_v2([draft]),
                     {UNMANAGED_DRAFT: [False, False]},
                 )
+
+
+class TestFinalizeRegistration(unittest.TestCase):
+    """sglang that reports "registration done" freezes the specs right there.
+
+    The hook is duck-typed: sglang that has it calls ``finalize_registration``
+    after the last pool of the attach (draft pools included), and a failure
+    there must fail the attach instead of leaving every storage call to degrade
+    in a background thread.  Upstream sglang has no such callback, so it keeps
+    freezing at the first storage call -- the last test here pins that the
+    coexistence changes nothing for it.
+    """
+
+    def setUp(self) -> None:
+        _mock_kvcm.reset_mock()
+        HiCacheKVCM._reported_pools.clear()
+
+    def _kv_pool(self) -> FakeHostPool:
+        return FakeHostPool(bytes_per_token=KV_BYTES_PER_TOKEN, dtype=torch.bfloat16)
+
+    def _mamba_pool(self) -> FakeHostPool:
+        return FakeHostPool(
+            bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32, page_size=1
+        )
+
+    def _burst_connector(self) -> HiCacheKVCM:
+        """A connector that ran sglang's registration burst, before any I/O."""
+        connector = _connector()
+        connector.register_mem_pool_host(self._kv_pool())
+        connector.register_mem_host_pool_v2(self._mamba_pool(), PoolName.MAMBA)
+        return connector
+
+    def test_a_second_instance_still_reports_its_missing_sdk_client(self) -> None:
+        """The report names an instance, so the dedup key must carry it.
+
+        sglang can detach and re-attach the backend with a different
+        ``instance_id`` at runtime; a process-wide key would swallow the second
+        instance's only diagnosis.
+        """
+        create = _mock_kvcm.TransferClient.Create
+        create.return_value = None
+        self.addCleanup(setattr, create, "return_value", MagicMock())
+
+        with _patched_parallel_context():
+            for instance_id in ("instance-a", "instance-b"):
+                connector = _connector(
+                    extra_config={
+                        "manager_uri": "http://127.0.0.1:6382",
+                        "instance_group": "default",
+                        "instance_id": instance_id,
+                    }
+                )
+                connector.register_mem_pool_host(self._kv_pool())
+                with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                    with self.assertRaises(connector_module._UnsupportedBackendError):
+                        connector.finalize_registration()
+                self.assertTrue(
+                    any(instance_id in r.getMessage() for r in logs.records),
+                    f"{instance_id} was not named in its own report",
+                )
+
+    def test_the_hook_is_not_part_of_the_upstream_interface(self) -> None:
+        """Duck-typed on purpose: no upstream release declares this method.
+
+        The connector only *implements* the hook; sglang that knows it finds it
+        with ``getattr``.  If this fails, upstream has declared a
+        ``finalize_registration`` of its own and its contract has to be
+        re-read before the connector claims to satisfy it.
+        """
+        self.assertFalse(hasattr(HiCacheStorage, "finalize_registration"))
+        self.assertTrue(callable(HiCacheKVCM.finalize_registration))
+
+    def test_finalize_registration_builds_the_client_once(self) -> None:
+        """The hook registers and creates the client; a repeat does neither."""
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            self.assertFalse(connector._client_ready)
+            self.assertIsNone(
+                _manager(connector).register_instance.call_args,
+                "a registration hook must not register the instance by itself",
+            )
+
+            connector.finalize_registration()
+            self.assertTrue(connector._client_ready)
+            self.assertIsNotNone(connector.transfer_client)
+
+            connector.finalize_registration()
+            self.assertFalse(
+                connector._tp_init_agreed,
+                "the hook is not a collective: it must not claim the TP group "
+                "agreed on initialization",
+            )
+
+        self.assertEqual(_manager(connector).register_instance.call_count, 1)
+        self.assertEqual(_mock_kvcm.TransferClient.Create.call_count, 1)
+
+    def test_finalize_registration_races_the_first_storage_call_once(self) -> None:
+        """Both entry points take the same lock: the instance registers once."""
+        entered = threading.Event()
+        release = threading.Event()
+        finalized = threading.Event()
+
+        def slow_register(request: Any) -> dict:
+            entered.set()
+            release.wait(timeout=5)
+            return {"storage_configs": "[]"}
+
+        def finalize() -> None:
+            connector.finalize_registration()
+            finalized.set()
+
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            _manager(connector).register_instance.side_effect = slow_register
+
+            storage_call = threading.Thread(
+                target=connector.batch_exists, args=(["block-0"],)
+            )
+            storage_call.start()
+            self.assertTrue(entered.wait(timeout=5), "the storage call never started")
+
+            finalizer = threading.Thread(target=finalize)
+            finalizer.start()
+            self.assertFalse(
+                finalized.is_set(),
+                "the hook must wait for the initialization already in flight; "
+                "the registration count below is what proves it did not slip "
+                "past it into a second registration",
+            )
+            release.set()
+            storage_call.join(timeout=5)
+            finalizer.join(timeout=5)
+
+        self.assertTrue(finalized.is_set(), "the finalize thread must complete")
+        self.assertFalse(storage_call.is_alive())
+        self.assertTrue(connector._client_ready)
+        self.assertEqual(_manager(connector).register_instance.call_count, 1)
+        self.assertEqual(_mock_kvcm.TransferClient.Create.call_count, 1)
+
+    def test_finalize_registration_covers_every_pool_registered_before_it(self) -> None:
+        """Every pool of the attach reaches the registration payload."""
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            connector.register_mem_host_pool_v2(
+                FakeHostPool(bytes_per_token=256, dtype=torch.bfloat16), UNMANAGED_POOL
+            )
+            connector.finalize_registration()
+
+        payload = dict(_manager(connector).register_instance.call_args.args[0])
+        self.assertEqual(
+            [spec["name"] for spec in payload["location_spec_infos"]],
+            [
+                # A sidecar exists, so the anchor carries its hybrid name.
+                "tp_0_full",
+                "tp_1_full",
+                "tp_0_linear",
+                "tp_1_linear",
+                f"tp_0_{UNMANAGED_POOL}",
+                f"tp_1_{UNMANAGED_POOL}",
+            ],
+        )
+        self.assertEqual(
+            [group["name"] for group in payload["location_spec_groups"]],
+            ["Full", "Linear", f"F{UNMANAGED_POOL}"],
+        )
+        self.assertEqual(connector._late_pools, frozenset(), "nothing was late")
+        self.assertEqual(
+            set(connector.pool_specs), {PoolName.KV, PoolName.MAMBA, UNMANAGED_POOL}
+        )
+
+    def test_finalize_registration_without_an_anchor_fails_loudly(self) -> None:
+        """No KV pool means nothing can be registered: the attach fails."""
+        with _patched_parallel_context():
+            connector = _connector()
+            # Only the v0.5.18-style group arrives, never the KV entry.
+            connector.register_mem_pool_host(FakeHostPoolGroup())  # ty: ignore[invalid-argument-type]
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                with self.assertRaisesRegex(RuntimeError, "no KV host pool"):
+                    connector.finalize_registration()
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("local:", logs.records[0].getMessage())
+        self.assertFalse(connector._client_ready)
+        self.assertIsNone(_manager(connector).register_instance.call_args)
+
+    def test_finalize_registration_raises_a_permanent_shape_error(self) -> None:
+        """An unservable anchor surfaces as the backend error, not a shape bug."""
+        with _patched_parallel_context():
+            connector = _connector()
+            anchor = FakeLogicalHostPool()
+            connector.register_mem_pool_host(anchor)  # ty: ignore[invalid-argument-type]
+            connector.register_mem_host_pool_v2(anchor, PoolName.KV)  # ty: ignore[invalid-argument-type]
+
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                with self.assertRaises(
+                    connector_module._UnsupportedBackendError
+                ) as caught:
+                    connector.finalize_registration()
+
+        # What the caller can catch: a RuntimeError, not an AssertionError from
+        # a stripped ``assert`` and not a NotImplementedError/AttributeError
+        # from an unimplemented interface method.
+        self.assertIsInstance(caught.exception, RuntimeError)
+        self.assertEqual(len(logs.records), 2)
+        self.assertIn("FakeLogicalHostPool", logs.records[0].getMessage())
+        self.assertIn("rejected:", logs.records[1].getMessage())
+        self.assertFalse(connector._client_ready)
+        self.assertIsNone(_manager(connector).register_instance.call_args)
+
+    def test_a_missing_sdk_client_is_a_permanent_failure(self) -> None:
+        """``Create`` returning no client must not pass for a working backend."""
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            # Set the shared mock's return value in place: ``reset_mock()``
+            # (the other classes' setUp) keeps return values, and patching the
+            # attribute would leave the mock's children unresettable.
+            create = _mock_kvcm.TransferClient.Create
+            create.return_value = None
+            self.addCleanup(setattr, create, "return_value", MagicMock())
+
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                with self.assertRaises(connector_module._UnsupportedBackendError):
+                    connector.finalize_registration()
+
+        # Two distinct reports, not one repeated: what is broken (the SDK
+        # client, with the instance and its specs), then that the attach fails.
+        self.assertEqual(len(logs.records), 2)
+        self.assertIn(
+            "TransferClient.Create returned no client", logs.records[0].getMessage()
+        )
+        self.assertIn("registration-test", logs.records[0].getMessage())
+        self.assertIn(
+            "rejected: the KVCM transfer runtime could not be created",
+            logs.records[1].getMessage(),
+        )
+        self.assertNotIn(
+            "pool or spec shape",
+            logs.records[1].getMessage(),
+            "the reason of a missing SDK client is not a pool shape",
+        )
+        self.assertIsNone(connector.transfer_client)
+        self.assertFalse(connector._client_ready)
+
+    def test_a_missing_sdk_client_is_reported_once_on_the_lazy_path(self) -> None:
+        """Without the hook the first storage call must report, not stay silent.
+
+        Upstream sglang never calls ``finalize_registration``, so the first
+        data-path call is what discovers the broken SDK.  The callers answer a
+        conservative result without a log of their own, so the report has to
+        happen where the failure is detected -- once for the instance, not once
+        per call.
+        """
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            create = _mock_kvcm.TransferClient.Create
+            create.return_value = None
+            self.addCleanup(setattr, create, "return_value", MagicMock())
+
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                self.assertEqual(connector.batch_exists(["block-0"]), 0)
+            self.assertEqual(len(logs.records), 1)
+            message = logs.records[0].getMessage()
+            self.assertIn("TransferClient.Create returned no client", message)
+            self.assertIn("registration-test", message)
+            self.assertIn("tp_0_linear", message, "the specs locate the failure")
+            self.assertFalse(connector._client_ready)
+
+            with self.assertNoLogs(connector_module.__name__, level="ERROR"):
+                self.assertEqual(connector.batch_exists(["block-1"]), 0)
+                self.assertEqual(
+                    connector.batch_get_v1(["block-1"], torch.arange(PAGE_SIZE)),
+                    [False],
+                )
+                self.assertEqual(connector.batch_exists_v2(["block-1"]).kv_hit_pages, 0)
+
+    def test_an_unusable_anchor_does_not_suppress_the_sdk_report(self) -> None:
+        """The two instance-wide reports keep keys of their own.
+
+        ``_reported_pools`` deduplicates by key and is process-wide, so a shared
+        key would silence the second cause -- exactly the failure this reporting
+        exists to prevent.  Both orders are checked: neither report may depend on
+        which one the process saw first.
+        """
+
+        def anchor_failure() -> list:
+            connector = _connector()
+            anchor = FakeLogicalHostPool()
+            connector.register_mem_pool_host(anchor)  # ty: ignore[invalid-argument-type]
+            connector.register_mem_host_pool_v2(anchor, PoolName.KV)  # ty: ignore[invalid-argument-type]
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                self.assertEqual(connector.batch_exists(["block-0"]), 0)
+            return logs.records
+
+        def sdk_failure() -> list:
+            connector = self._burst_connector()
+            # Set in place: ``reset_mock()`` keeps return values, and patching
+            # the attribute would leave the mock's children unresettable.
+            create = _mock_kvcm.TransferClient.Create
+            create.return_value = None
+            self.addCleanup(setattr, create, "return_value", MagicMock())
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                self.assertEqual(connector.batch_exists(["block-0"]), 0)
+            return logs.records
+
+        for order, first, second in (
+            ("anchor first", anchor_failure, sdk_failure),
+            ("sdk first", sdk_failure, anchor_failure),
+        ):
+            with self.subTest(order=order):
+                # A fresh process as far as the process-wide report set goes.
+                HiCacheKVCM._reported_pools.clear()
+                with _patched_parallel_context():
+                    messages = [record.getMessage() for record in first() + second()]
+                self.assertEqual(len(messages), 2, messages)
+                self.assertTrue(
+                    any("not a host pool" in message for message in messages),
+                    messages,
+                )
+                self.assertTrue(
+                    any(
+                        "has no KVCM transfer client" in message for message in messages
+                    ),
+                    messages,
+                )
+
+    def test_finalize_registration_keeps_the_manager_error_class(self) -> None:
+        """Both kinds fail startup, but the type still says what went wrong."""
+        cases = [
+            (
+                "unreachable",
+                requests.ConnectionError("connection refused"),
+                "unjudged: the Manager is unreachable",
+            ),
+            (
+                "http-503",
+                KvCacheManagerHTTPError(
+                    "status code 503",
+                    response=types.SimpleNamespace(status_code=503),
+                ),
+                "unjudged: the Manager failed with HTTP 503",
+            ),
+            (
+                "http-400",
+                KvCacheManagerHTTPError(
+                    "status code 400", response=types.SimpleNamespace(status_code=400)
+                ),
+                "refused: the Manager rejected the request (HTTP 400)",
+            ),
+            (
+                "protocol",
+                KvCacheManagerProtocolError("missing a valid 'header' field"),
+                "unjudged: the Manager did not decide on the registration",
+            ),
+        ]
+        for name, error, label in cases:
+            with self.subTest(name=name, label=label):
+                with _patched_parallel_context():
+                    connector = self._burst_connector()
+                    _manager(connector).register_instance.side_effect = error
+                    with self.assertLogs(
+                        connector_module.__name__, level="ERROR"
+                    ) as logs:
+                        with self.assertRaises(type(error)) as caught:
+                            connector.finalize_registration()
+
+                self.assertIs(
+                    caught.exception, error, "the Manager error must not be wrapped"
+                )
+                self.assertIn(label, logs.records[-1].getMessage())
+                self.assertFalse(connector._client_ready)
+
+    def test_a_pool_registered_after_finalize_registration_is_degraded(self) -> None:
+        """Late means late: one report, misses, and the frozen pools unaffected."""
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            connector.finalize_registration()
+
+            late_pool = FakeHostPool(bytes_per_token=256, dtype=torch.bfloat16)
+            with self.assertLogs(connector_module.__name__, level="WARNING") as logs:
+                connector.register_mem_host_pool_v2(late_pool, UNMANAGED_POOL)
+            self.assertEqual(len(logs.records), 1)
+            self.assertIn(str(UNMANAGED_POOL), logs.records[0].getMessage())
+            self.assertNotIn(UNMANAGED_POOL, connector.registered_pools)
+            self.assertIn(UNMANAGED_POOL, connector._late_pools)
+
+            manager = _manager(connector)
+            manager.get_cache_location.return_value = {
+                # Two KV pages that also carry the registered pool's spec, so
+                # "the spec is missing from the Manager" cannot be the reason
+                # why the late pool must come back as a miss.
+                "locations": [
+                    {
+                        "location_specs": [
+                            {"name": "tp_0_full", "uri": f"uri-{i}"},
+                            {"name": "tp_0_linear", "uri": f"lin-{i}"},
+                        ]
+                    }
+                    for i in range(2)
+                ]
+            }
+            mamba = PoolTransfer(
+                name=PoolName.MAMBA,
+                host_indices=torch.arange(2),
+                keys=["block-0", "block-1"],
+            )
+            late = PoolTransfer(
+                name=UNMANAGED_POOL,
+                host_indices=torch.arange(2),
+                keys=["block-0", "block-1"],
+            )
+            with self.assertNoLogs(connector_module.__name__, level="WARNING"):
+                exists = connector.batch_exists_v2(
+                    ["block-0", "block-1"], [mamba, late]
+                )
+            self.assertEqual(exists.extra_pool_hit_pages[PoolName.KV], 2)
+            self.assertEqual(exists.extra_pool_hit_pages[PoolName.MAMBA], 2)
+            self.assertEqual(exists.extra_pool_hit_pages[UNMANAGED_POOL], 0)
+            # The engine may load no page: the late pool's pages are not in
+            # storage, so the prefix is clamped to the pool minimum.
+            self.assertEqual(exists.kv_hit_pages, 0)
+
+            manager.get_cache_location.reset_mock()
+            with self.assertNoLogs(connector_module.__name__, level="WARNING"):
+                self.assertEqual(
+                    connector.batch_get_v2([late]), {UNMANAGED_POOL: [False, False]}
+                )
+            self.assertIsNone(
+                manager.get_cache_location.call_args,
+                "a late pool must not query the Manager for its spec",
+            )
+
+    def test_without_the_hook_the_specs_freeze_at_the_first_storage_call(self) -> None:
+        """Upstream sglang never calls the hook, so it keeps today's timing."""
+        with _patched_parallel_context():
+            connector = _connector()
+            connector.register_mem_pool_host(self._kv_pool())
+            # Registered after the attach but before any storage call: the lazy
+            # path freezes late enough to include it.
+            connector.register_mem_host_pool_v2(self._mamba_pool(), PoolName.MAMBA)
+            self.assertFalse(connector._client_ready)
+            self.assertIsNone(_manager(connector).register_instance.call_args)
+
+            connector.batch_exists(["block-0"])
+            self.assertTrue(connector._client_ready)
+            self.assertIn(PoolName.MAMBA, connector.pool_specs)
+            self.assertEqual(connector._late_pools, frozenset(), "nothing was late")
+            self.assertEqual(_manager(connector).register_instance.call_count, 1)
+
+            late_pool = FakeHostPool(bytes_per_token=256, dtype=torch.bfloat16)
+            with self.assertLogs(connector_module.__name__, level="WARNING") as logs:
+                connector.register_mem_host_pool_v2(late_pool, UNMANAGED_POOL)
+            self.assertEqual(len(logs.records), 1)
+            self.assertIn(UNMANAGED_POOL, connector._late_pools)
+
+    def test_finalize_registration_after_close_fails(self) -> None:
+        """A retired backend must not register itself back into life."""
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            connector.finalize_registration()
+            connector.close()
+
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                with self.assertRaisesRegex(RuntimeError, "was closed"):
+                    connector.finalize_registration()
+
+        self.assertIn("local:", logs.records[-1].getMessage())
+        self.assertEqual(_manager(connector).register_instance.call_count, 1)
+        self.assertIsNone(connector.transfer_client)
 
 
 class TestV2EntriesLazyInitialization(unittest.TestCase):
