@@ -84,11 +84,19 @@ class RunningId:
 @dataclass()
 class LoadContext:
     finished_rank: Set[int] = field(default_factory=set)
+    # Union of the per-rank failed vLLM block ids. A rank whose loads all
+    # succeed reports an empty list, so keeping only the last-arriving
+    # event's list silently dropped the other ranks' failures whenever a
+    # success event arrived last -- at tp >= 2 a partially failed load was
+    # then never reported to vLLM, which went on to compute on unwritten
+    # KV blocks.
+    failed_block_idxs: List[int] = field(default_factory=list)
 
-    def add_new_rank(self, tp_rank: int) -> None:
+    def add_new_rank(self, tp_rank: int, failed_block_idxs: List[int]) -> None:
         if tp_rank in self.finished_rank:
             return
         self.finished_rank.add(tp_rank)
+        self.failed_block_idxs.extend(failed_block_idxs)
 
     def get_size(self) -> int:
         return len(self.finished_rank)
@@ -209,12 +217,13 @@ class TpCoordinatorServer:
                 load_id = RunningId(str(content.epoch), content.request_id)
                 if load_id not in running_load:
                     running_load[load_id] = LoadContext()
-                running_load[load_id].add_new_rank(content.tp_rank)
-                if running_load[load_id].get_size() == self._tp_world_size:
+                load_ctx = running_load[load_id]
+                load_ctx.add_new_rank(content.tp_rank, content.failed_block_idxs)
+                if load_ctx.get_size() == self._tp_world_size:
                     running_load.pop(load_id)
 
                     self._finished_loading_lock.acquire()
-                    self._failed_loading_block_idxs.extend(content.failed_block_idxs)
+                    self._failed_loading_block_idxs.extend(load_ctx.failed_block_idxs)
                     self._finished_loading.append(content.request_id)
                     self._finished_loading_lock.release()
                     # logger.warning("[coordinator] all rank finished load_blocks_finished %s", load_id)

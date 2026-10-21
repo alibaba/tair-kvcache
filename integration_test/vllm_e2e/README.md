@@ -41,6 +41,7 @@ The same test targets run against either model kind, selected by
 | Kind | Example | Groups | Orchestration |
 |---|---|---|---|
 | Full attention | Qwen2.5-7B-Instruct | 1 `FullAttentionSpec` | prefix caching off, one server for both phases |
+| MLA | GLM-4.7-Flash | 1 `MLAAttentionSpec` | same as full attention (the latent cache is token-granular: one vector per token instead of K+V; auto-selected MLA attention backend instead of the forced FLASH_ATTN) |
 | Hybrid | Qwen3.5-4B | 3 `MambaSpec` + 1 `FullAttentionSpec` | prefix caching on (`mamba_cache_mode="align"`), server restarted between phases so phase 2 loads from KVCM instead of the local prefix cache |
 
 Hybrid specifics verified:
@@ -99,14 +100,18 @@ All environment variables used by the e2e harness:
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `KVCM_E2E_MODEL` | yes | Path to a local HF model directory (`config.json` + weights). Full-attention coverage needs a plain attention model (e.g. Qwen2.5-7B-Instruct); hybrid coverage needs a mamba/linear + attention model (e.g. Qwen3.5-4B). Hybrid models are auto-detected from `config.json`. |
+| `KVCM_E2E_MODEL` | yes | Path to a local HF model directory (`config.json` + weights). Full-attention coverage needs a plain attention model (e.g. Qwen2.5-7B-Instruct); MLA coverage needs an MLA model (e.g. GLM-4.7-Flash); hybrid coverage needs a mamba/linear + attention model (e.g. Qwen3.5-4B). Both kinds are auto-detected from `config.json`. |
 | `KVCM_E2E_PYTHON` | yes | Python interpreter of a venv with vLLM (any supported version, see above) and both KVCM wheels (`kvcm_py_client`, `kvcm_vllm_connector`) installed. |
+| `KVCM_E2E_TP` | no | Overrides every scenario's tensor-parallel size (default 1). For models whose (quantized) weights do not fit a single GPU, e.g. GLM-4.7-Flash fp8 on 24 GB cards, set this to 2; `test_tp` then adds no new topology and can be skipped. |
+| `KVCM_E2E_VLLM_ARGS` | no | JSON dict of extra vLLM CLI flags for the spawned server (keys without `--`), e.g. `{"quantization": "fp8"}`. Wins over per-scenario defaults. |
 | `KVCM_E2E_CAPTURE_DIR` | internal | Set by the driver for the vLLM subprocess; tells `VerifyingConnector` where to write `.pt` captures. Do not set manually. |
 
 The driver also sets vLLM knobs for the spawned server (`VLLM_KV_CACHE_LAYOUT=NHD`,
 `VLLM_ATTENTION_BACKEND=FLASH_ATTN`, `VLLM_USE_FLASHINFER_SAMPLER=0`,
 `FLASHINFER_DISABLE_VERSION_CHECK=1`) via `env.setdefault`, so a value you
-export yourself wins.
+export yourself wins. MLA models are exempt from the `VLLM_ATTENTION_BACKEND`
+default (FLASH_ATTN has no MLA implementation; vLLM auto-selects an MLA
+backend -- every one of them registers the same 3-D latent cache layout).
 
 ## Debugging
 
