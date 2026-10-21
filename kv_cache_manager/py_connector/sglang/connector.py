@@ -1,3 +1,4 @@
+import ctypes
 import dataclasses
 import functools
 import hashlib
@@ -573,6 +574,10 @@ class HiCacheKVCM(HiCacheStorage):
         # SDK handles, created by _ensure_client() and dropped by close().
         self.transfer_client: Any = None
         self.init_params: Any = None
+        # (fd, mm, allocator) of every host pool shm segment registered with
+        # PACE; held so that neither a mapping nor its fd disappears before
+        # close() deregisters it.
+        self._pace_regions: List[tuple] = []
 
         self.prefetch_pgs = []
         self.backup_pgs = []
@@ -1055,6 +1060,134 @@ class HiCacheKVCM(HiCacheStorage):
                 "this instance's storage configuration and location specs",
                 reason="the KVCM transfer runtime could not be created",
             )
+
+        self._register_pace_host_pools()
+
+    def _register_pace_host_pools(self) -> None:
+        """Register every host pool shm segment with PACE (zero-copy RDMA).
+
+        Runs once, right after the SDK client exists: the registration lands in
+        the PACE singleton linked into this process, which is the one the
+        transfer path uses.  Every failure is a degradation -- an unregistered
+        region only pays a bounce copy -- so nothing here raises, and one pool
+        never takes another one's registration with it.
+
+        A segment reaches PACE at most once per instance, however often an
+        initialization is retried: close() deregisters each fd exactly once, so
+        a second registration of the same fd would be an orphan.
+        """
+        if self._pace_regions:
+            logger.debug(
+                "PACE zero-copy: %d segment(s) already registered, not registering "
+                "again",
+                len(self._pace_regions),
+            )
+            return
+        if self.extra_config.get("allocator") != "shm":
+            logger.warning(
+                'host pools are not shm-backed (no "allocator":"shm" in '
+                "--hicache-storage-backend-extra-config), so PACE zero-copy is "
+                "unavailable and every transfer pays a bounce copy"
+            )
+            return
+        register = getattr(kvcm_py_client, "register_host_memory", None)
+        disable_reason = getattr(
+            kvcm_py_client, "external_zero_copy_disable_reason", None
+        )
+        if register is None or disable_reason is None:
+            logger.warning(
+                "kvcm_py_client carries no PACE passthrough (open-source build or "
+                "an older client), so PACE zero-copy is unavailable"
+            )
+            return
+
+        pools = regions = registered = skipped_pools = 0
+        for pool_name, pool in self.registered_pools.items():
+            allocator = getattr(pool, "allocator", None)
+            # The allocator appends one segment per allocation; the pool's ``fd``
+            # and the allocator's ``mm`` are only the first of them.
+            fds = getattr(allocator, "fds", None)
+            mms = getattr(allocator, "mms", None)
+            if not fds or not mms:
+                skipped_pools += 1
+                logger.warning(
+                    "PACE zero-copy: pool %s has no shm segments (allocator %s); "
+                    "it is skipped and the other pools are unaffected",
+                    pool_name,
+                    type(allocator).__name__,
+                )
+                continue
+            pools += 1
+            for fd, mm in zip(fds, mms):
+                regions += 1
+                try:
+                    # ``len(mm)`` is the page-aligned mapping, which is what the
+                    # memfd was sized to -- not the tensor's nbytes.
+                    base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+                    ret = register(fd, len(mm), base)
+                except Exception as e:
+                    logger.warning(
+                        "PACE zero-copy: pool %s fd=%s could not be registered "
+                        "(%s); its transfers fall back to a bounce copy",
+                        pool_name,
+                        fd,
+                        e,
+                    )
+                    continue
+                if ret != 0:
+                    logger.warning(
+                        "PACE zero-copy: register_host_memory failed for pool %s "
+                        "fd=%s size=%d base=%#x ret=%s; its transfers fall back to "
+                        "a bounce copy",
+                        pool_name,
+                        fd,
+                        len(mm),
+                        base,
+                        ret,
+                    )
+                    continue
+                registered += 1
+                self._pace_regions.append((fd, mm, allocator))
+
+        disabled, unreadable = self._pace_zero_copy_state(disable_reason)
+        logger.info(
+            "PACE zero-copy: pools=%d regions=%d registered=%d skipped_pools=%d "
+            "disabled=%s",
+            pools,
+            regions,
+            registered,
+            skipped_pools,
+            disabled or "-",
+        )
+        if unreadable is not None:
+            logger.warning(
+                "PACE zero-copy: %d segment(s) are registered but PACE's "
+                "zero-copy state could not be read (%s), so the registrations are "
+                "unverified",
+                registered,
+                unreadable,
+            )
+        elif disabled:
+            logger.warning(
+                "PACE zero-copy: %d segment(s) are registered but PACE reports "
+                "external zero-copy unavailable (%s), so the transfers still take "
+                "the bounce-copy path",
+                registered,
+                disabled,
+            )
+
+    @staticmethod
+    def _pace_zero_copy_state(reason_of: Any) -> tuple:
+        """PACE's zero-copy verdict as ``(reason, error)``; never raises.
+
+        ``reason`` is empty when PACE allows it.  An unreadable verdict is
+        returned as ``"unknown (<error>)"`` with the error attached, so that a
+        caller cannot mistake it for an available one.
+        """
+        try:
+            return reason_of(), None
+        except Exception as e:
+            return f"unknown ({e})", e
 
     def _resolve_pool_specs(self) -> Mapping[Any, _RegisteredPool]:
         """Resolve the spec rows against the pools this instance registered.
@@ -2388,6 +2521,7 @@ class HiCacheKVCM(HiCacheStorage):
             if self._closed:
                 return
             self._closed = True
+            self._deregister_pace_host_pools()
             self.transfer_client = None
             self.init_params = None
             self._manager_client.close()
@@ -2399,6 +2533,29 @@ class HiCacheKVCM(HiCacheStorage):
                     torch.distributed.destroy_process_group(group)
                 except Exception as e:
                     logger.warning("close: storage_tp_group not destroyed: %s", e)
+
+    def _deregister_pace_host_pools(self) -> None:
+        """Hand every PACE-registered host pool segment back, then drop it.
+
+        Deregistration comes first: dropping a segment releases its
+        ``ShmHostTensorAllocator``, whose ``__del__`` closes the fds, and a
+        closed fd can no longer be deregistered.  Nothing here raises -- close()
+        is best-effort and may run twice.
+        """
+        regions, self._pace_regions = self._pace_regions, []
+        deregister = getattr(kvcm_py_client, "deregister_host_memory", None)
+        for fd, _mm, _allocator in regions:
+            try:
+                ret = None if deregister is None else deregister(fd)
+            except Exception as e:
+                logger.warning("PACE zero-copy: deregister fd=%s raised: %s", fd, e)
+                continue
+            if ret not in (None, 0):
+                logger.warning(
+                    "PACE zero-copy: deregister_host_memory failed for fd=%s ret=%s",
+                    fd,
+                    ret,
+                )
 
     ##################################################
 
