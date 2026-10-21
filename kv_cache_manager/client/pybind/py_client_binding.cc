@@ -5,6 +5,10 @@
 
 #include "kv_cache_manager/client/include/transfer_client.h"
 
+#if defined(ENABLE_TAIR_MEMPOOL)
+#include "pace_mp.h"
+#endif
+
 namespace py = pybind11;
 namespace kvcm = kv_cache_manager;
 
@@ -194,5 +198,26 @@ PYBIND11_MODULE(kvcm_py_client, module) {
              py::arg("block_buffers"),
              py::arg("trace_info") = nullptr,
              py::call_guard<py::gil_scoped_release>());
+
+#if defined(ENABLE_TAIR_MEMPOOL)
+    // PACE 宿主内存零拷贝注册透传，返回 PACE 错误码（0 = SUCCESS）。
+    // PACE 静态链在本模块内，注册进的是传输路径用的同一个 MPSClient 单例。
+    module.def(
+        "register_host_memory",
+        [](int fd, size_t size, uint64_t base) {
+            return pace_register_shared_memory(fd, size, reinterpret_cast<void *>(base));
+        },
+        py::arg("fd"),
+        py::arg("size"),
+        py::arg("base"));
+
+    module.def("deregister_host_memory", [](int fd) { return pace_deregister_shared_memory(fd); }, py::arg("fd"));
+
+    // pace_external_zero_copy_disable_reason 允许零拷贝时返回 nullptr。
+    module.def("external_zero_copy_disable_reason", []() {
+        const char *reason = pace_external_zero_copy_disable_reason();
+        return reason == nullptr ? std::string() : std::string(reason);
+    });
+#endif
 
 } // namespace kv_cache_manager

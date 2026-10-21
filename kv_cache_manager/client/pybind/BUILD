@@ -11,7 +11,13 @@ pybind_extension(
     srcs = ["py_client_binding.cc"],
     deps = [
         "//kv_cache_manager/client:client",
-    ],
+    ] + select({
+        # 与 sdk 侧同一 config_setting：--config=client 同时给出 -DENABLE_TAIR_MEMPOOL 与本 define。
+        "//kv_cache_manager/client/src/internal/sdk:enable_tair_mempool": [
+            "//3rdparty/tair_mempool",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
 )
 
