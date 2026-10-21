@@ -152,6 +152,259 @@ class TransferClientPyTest(unittest.TestCase):
         client = kvcm_py_client.TransferClient.Create(self.client_config, self.init_params)
         self.assertIsNone(client)
 
+    @staticmethod
+    def _make_regist_span(address, owner, size, fd):
+        span = kvcm_py_client.RegistSpan()
+        span.base = address
+        span.size = size
+        span.fd = fd
+        span.owner = owner
+        return span
+
+    def test_create_with_multiple_regist_spans(self):
+        """regist_spans 里的每一段都随 Create 交给后端。"""
+
+        segment_size = 4096
+        owners = [ctypes.create_string_buffer(segment_size) for _ in range(2)]
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(segment_size)
+            init_params = self._create_init_params("tp0")
+            init_params.regist_spans = [
+                self._make_regist_span(ctypes.addressof(owner), owner, segment_size, shared_memory_file.fileno())
+                for owner in owners
+            ]
+            client = kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+            self.assertIsNotNone(client)
+
+    def test_single_segment_regist_spans_create_a_client(self):
+        """只设 1 段 regist_spans：等同旧单段入口，创建路径照旧。"""
+
+        segment_size = 4096
+        owner = ctypes.create_string_buffer(segment_size)
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(segment_size)
+            init_params = self._create_init_params("tp0")
+            init_params.regist_span = None
+            init_params.regist_spans = [
+                self._make_regist_span(ctypes.addressof(owner), owner, segment_size, shared_memory_file.fileno())
+            ]
+            client = kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+            self.assertIsNotNone(client)
+            self.assertEqual(len(client._regist_spans), 1)
+
+    def test_multiple_regist_spans_do_not_collapse_into_a_singular_span(self):
+        """多段列表不合成单数（单区域后端只认显式单数或恰好 1 段）。"""
+
+        segment_size = 4096
+        owners = [ctypes.create_string_buffer(segment_size) for _ in range(2)]
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(segment_size)
+            init_params = self._create_init_params("tp0")
+            init_params.regist_span = None
+            init_params.regist_spans = [
+                self._make_regist_span(ctypes.addressof(owner), owner, segment_size, shared_memory_file.fileno())
+                for owner in owners
+            ]
+            client = kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+            self.assertIsNotNone(client)
+            self.assertEqual(len(client._regist_spans), 2)
+
+    def test_explicit_singular_span_stays_separate_from_regist_spans(self):
+        """两者都设：列表驱动 host 段通道，显式单数原样保留给只认单数的后端。"""
+
+        segment_size = 4096
+        owners = [ctypes.create_string_buffer(segment_size) for _ in range(2)]
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(segment_size)
+            init_params = self._create_init_params("tp0")
+            init_params.regist_spans = [
+                self._make_regist_span(ctypes.addressof(owner), owner, segment_size, shared_memory_file.fileno())
+                for owner in owners
+            ]
+            client = kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+            self.assertIsNotNone(client)
+            self.assertEqual(len(client._regist_spans), 2)
+
+    def test_explicit_singular_span_owner_survives_gc_with_regist_spans(self):
+        """两者都设：单数那段的内存也要活到 client 销毁（它不在多段列表里）。"""
+
+        class BufferOwner:
+            def __init__(self, size):
+                self.buffer = ctypes.create_string_buffer(size)
+
+        segment_size = 4096
+        singular_owner = BufferOwner(segment_size)
+        singular_ref = weakref.ref(singular_owner)
+        list_owners = [BufferOwner(segment_size) for _ in range(2)]
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(segment_size)
+            init_params = self._create_init_params("tp0")
+            singular_span = self._make_regist_span(
+                ctypes.addressof(singular_owner.buffer), singular_owner, segment_size, shared_memory_file.fileno()
+            )
+            init_params.regist_span = singular_span
+            init_params.regist_spans = [
+                self._make_regist_span(ctypes.addressof(owner.buffer), owner, segment_size, shared_memory_file.fileno())
+                for owner in list_owners
+            ]
+            client = kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+            self.assertIsNotNone(client)
+            self.assertEqual(len(client._regist_spans), 2)
+
+            singular_span.owner = None
+            init_params.regist_span = None
+            init_params.regist_spans = []
+            del init_params, list_owners, singular_owner
+            gc.collect()
+            self.assertIsNotNone(singular_ref())
+
+            del client
+            gc.collect()
+            self.assertIsNone(singular_ref())
+
+    def test_regist_spans_wins_over_singular_regist_span(self):
+        """regist_spans 非空时忽略单数 regist_span。"""
+
+        segment_size = 4096
+        owner = ctypes.create_string_buffer(segment_size)
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(segment_size)
+            init_params = self._create_init_params("tp0")
+            init_params.regist_spans = [
+                self._make_regist_span(ctypes.addressof(owner), owner, segment_size, shared_memory_file.fileno())
+            ]
+            # 单数段是非法注册（base 为空），若仍被采用 Create 会失败。
+            init_params.regist_span.base = 0
+            init_params.regist_span.fd = shared_memory_file.fileno()
+            client = kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+            self.assertIsNotNone(client)
+
+    def test_invalid_trailing_regist_span_fails_create(self):
+        """列表里靠后的段同样被校验，说明不是只取了第一段。"""
+
+        segment_size = 4096
+        owner = ctypes.create_string_buffer(segment_size)
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(segment_size)
+            init_params = self._create_init_params("tp0")
+            invalid_span = self._make_regist_span(
+                ctypes.addressof(owner), owner, segment_size, shared_memory_file.fileno()
+            )
+            # base 为空：非法段，必须让 Create 失败。
+            invalid_span.base = 0
+            init_params.regist_spans = [
+                self._make_regist_span(ctypes.addressof(owner), owner, segment_size, shared_memory_file.fileno()),
+                invalid_span,
+            ]
+            with self.assertRaises(ValueError) as raised:
+                kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+            self.assertIn("regist_spans[1]", str(raised.exception))
+            self.assertIn("base", str(raised.exception))
+
+    def test_empty_regist_span_entries_are_skipped(self):
+        """完全默认的条目等于"这一条没有"，其余段照常交出。"""
+
+        segment_size = 4096
+        owner = ctypes.create_string_buffer(segment_size)
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(segment_size)
+            init_params = self._create_init_params("tp0")
+            init_params.regist_spans = [
+                kvcm_py_client.RegistSpan(),
+                self._make_regist_span(ctypes.addressof(owner), owner, segment_size, shared_memory_file.fileno()),
+            ]
+            client = kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+            self.assertIsNotNone(client)
+
+    def test_none_regist_span_entries_are_skipped(self):
+        """None 占位不算一段：有效段照常交出，Create 不因占位失败。"""
+
+        segment_size = 4096
+        owner = ctypes.create_string_buffer(segment_size)
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(segment_size)
+            valid_span = self._make_regist_span(
+                ctypes.addressof(owner), owner, segment_size, shared_memory_file.fileno()
+            )
+            for regist_spans in ([valid_span, None], [None, valid_span]):
+                init_params = self._create_init_params("tp0")
+                init_params.regist_span = None
+                init_params.regist_spans = regist_spans
+                client = kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+                self.assertIsNotNone(client)
+                self.assertEqual(len(client._regist_spans), 2)
+
+    def test_missing_fd_regist_span_fails_create(self):
+        """base/size 有值但 fd 未给：不能静默丢弃，必须报错并指出第几段。"""
+
+        segment_size = 4096
+        owner = ctypes.create_string_buffer(segment_size)
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(segment_size)
+            init_params = self._create_init_params("tp0")
+            init_params.regist_span = None
+            init_params.regist_spans = [
+                self._make_regist_span(ctypes.addressof(owner), owner, segment_size, shared_memory_file.fileno()),
+                self._make_regist_span(ctypes.addressof(owner), owner, segment_size, -1),
+            ]
+            with self.assertRaises(ValueError) as raised:
+                kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+            self.assertIn("regist_spans[1]", str(raised.exception))
+            self.assertIn("fd", str(raised.exception))
+
+    def test_zero_size_regist_span_fails_create(self):
+        """fd 有了但 size 为 0：同样必须报错。"""
+
+        segment_size = 4096
+        owner = ctypes.create_string_buffer(segment_size)
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(segment_size)
+            init_params = self._create_init_params("tp0")
+            init_params.regist_span = None
+            init_params.regist_spans = [
+                self._make_regist_span(ctypes.addressof(owner), owner, 0, shared_memory_file.fileno()),
+            ]
+            with self.assertRaises(ValueError) as raised:
+                kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+            self.assertIn("regist_spans[0]", str(raised.exception))
+            self.assertIn("size", str(raised.exception))
+
+    def test_regist_spans_owners_survive_gc(self):
+        """每个段的持有对象在客户端生命周期内保持有效。"""
+
+        class BufferOwner:
+            def __init__(self, size):
+                self.buffer = ctypes.create_string_buffer(size)
+
+        segment_size = 4096
+        owners = [BufferOwner(segment_size) for _ in range(2)]
+        owner_refs = [weakref.ref(owner) for owner in owners]
+        with tempfile.TemporaryFile() as shared_memory_file:
+            shared_memory_file.truncate(segment_size)
+            init_params = self._create_init_params("tp0")
+            spans = [
+                self._make_regist_span(
+                    ctypes.addressof(owner.buffer), owner, segment_size, shared_memory_file.fileno()
+                )
+                for owner in owners
+            ]
+            init_params.regist_spans = spans
+            client = kvcm_py_client.TransferClient.Create(self.client_config, init_params)
+            self.assertIsNotNone(client)
+
+            for span in spans:
+                span.owner = None
+            init_params.regist_spans = []
+            del spans, owners
+            gc.collect()
+            for owner_ref in owner_refs:
+                self.assertIsNotNone(owner_ref())
+
+            del client
+            gc.collect()
+            for owner_ref in owner_refs:
+                self.assertIsNone(owner_ref())
+
     def tearDown(self):
         """测试后清理"""
         import shutil

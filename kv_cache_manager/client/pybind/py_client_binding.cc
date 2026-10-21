@@ -1,9 +1,12 @@
+#include <optional>
+
 #include <pybind11/gil.h>
 #include <pybind11/native_enum.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 #include "kv_cache_manager/client/include/transfer_client.h"
+#include "kv_cache_manager/client/pybind/py_host_registration.h"
 
 namespace py = pybind11;
 namespace kvcm = kv_cache_manager;
@@ -27,13 +30,26 @@ struct PyRegistSpan {
 struct PyInitParams {
     kvcm::RoleType role_type{kvcm::RoleType::UNKNOWN};
     std::shared_ptr<PyRegistSpan> regist_span;
+    std::vector<std::shared_ptr<PyRegistSpan>> regist_spans;
     std::string self_location_spec_name;
     std::string storage_configs;
 
+    // regist_spans wins for the host-memory channel; the singular regist_span is
+    // what legacy callers (and mooncake) get.
+    std::vector<std::shared_ptr<PyRegistSpan>> HostRegistSpans() const {
+        if (!regist_spans.empty()) {
+            return regist_spans;
+        }
+        if (regist_span != nullptr) {
+            return {regist_span};
+        }
+        return {};
+    }
+
+    // regist_span is filled in Create from a value snapshot, see there.
     kvcm::InitParams ToCpp() const {
         kvcm::InitParams params;
         params.role_type = role_type;
-        params.regist_span = regist_span == nullptr ? nullptr : &regist_span->span;
         params.self_location_spec_name = self_location_spec_name;
         params.storage_configs = storage_configs;
         return params;
@@ -134,6 +150,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .def(py::init<>())
         .def_readwrite("role_type", &PyInitParams::role_type)
         .def_readwrite("regist_span", &PyInitParams::regist_span)
+        .def_readwrite("regist_spans", &PyInitParams::regist_spans)
         .def_readwrite("self_location_spec_name", &PyInitParams::self_location_spec_name)
         .def_readwrite("storage_configs", &PyInitParams::storage_configs);
 
@@ -156,18 +173,61 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .def_static(
             "Create",
             [](const std::string &client_config, const PyInitParams &py_init_params) -> py::object {
+                // Snapshot both registration entries first: the explicit singular is
+                // separate from the host-span list and only one of them has to be set.
+                auto singular = py_init_params.regist_span;
+                auto span_list = py_init_params.regist_spans;
+                auto spans = py_init_params.HostRegistSpans();
                 auto init_params = py_init_params.ToCpp();
-                auto captured_span = py_init_params.regist_span;
-                py::object captured_owner = captured_span == nullptr ? py::none() : captured_span->owner;
+                // The backend holds raw addresses into these objects for the client's
+                // lifetime, so the objects and their owners live on the client. The
+                // singular gets its own reference: when both entries are set it is not
+                // part of the host-span list.
+                py::list owners;
+                for (const auto &span : spans) {
+                    owners.append(span == nullptr ? py::none() : span->owner);
+                }
+                py::object singular_owner = singular == nullptr ? py::none() : singular->owner;
+                auto registration_of = [](const std::shared_ptr<PyRegistSpan> &span) {
+                    if (span == nullptr || span->fd == -1) {
+                        return std::optional<kvcm::SharedMemoryRegistration>{};
+                    }
+                    return std::optional<kvcm::SharedMemoryRegistration>{
+                        kvcm::SharedMemoryRegistration{span->span.base, span->span.size, span->fd}};
+                };
+                // Everything read after the release must come from these snapshots:
+                // another thread may rebind regist_spans/regist_span meanwhile.
+                const bool list_form = !span_list.empty();
+                std::vector<kvcm::SharedMemoryRegistration> host_entries;
+                host_entries.reserve(span_list.size());
+                for (const auto &span : span_list) {
+                    host_entries.push_back(span == nullptr ? kvcm::SharedMemoryRegistration{}
+                                                           : kvcm::SharedMemoryRegistration{
+                                                                 span->span.base, span->span.size, span->fd});
+                }
+                // One normalization, then both the multi-segment channel and the
+                // singular criterion read that same result -- never the raw list.
+                const auto host_registrations = kvcm::NormalizeHostRegistrations(host_entries);
+                std::optional<kvcm::RegistSpan> explicit_span;
+                if (singular != nullptr) {
+                    explicit_span = singular->span;
+                }
+                // Single-region backends read this copy without the GIL; it lives for the
+                // whole Create call, which is as long as anything reads it.
+                auto singular_span = kvcm::SelectSingularRegistSpan(explicit_span, host_registrations);
+                init_params.regist_span = singular_span ? &*singular_span : nullptr;
+                // Only the list channel is strict; the singular channel keeps its legacy
+                // lenient semantics (see registration_of above).
+                const auto single_registration = registration_of(singular);
                 std::unique_ptr<kvcm::TransferClient> client;
                 {
                     py::gil_scoped_release release;
-                    if (captured_span != nullptr && captured_span->fd != -1) {
-                        kvcm::SharedMemoryRegistration registration;
-                        registration.base = captured_span->span.base;
-                        registration.size = captured_span->span.size;
-                        registration.fd = captured_span->fd;
-                        client = kvcm::TransferClient::Create(client_config, init_params, registration);
+                    if (list_form) {
+                        client = host_registrations.empty()
+                                     ? kvcm::TransferClient::Create(client_config, init_params)
+                                     : kvcm::TransferClient::Create(client_config, init_params, host_registrations);
+                    } else if (single_registration) {
+                        client = kvcm::TransferClient::Create(client_config, init_params, *single_registration);
                     } else {
                         client = kvcm::TransferClient::Create(client_config, init_params);
                     }
@@ -176,8 +236,10 @@ PYBIND11_MODULE(kvcm_py_client, module) {
                     return py::none();
                 }
                 auto py_client = py::cast(std::move(client));
-                py_client.attr("_regist_span") = py::cast(captured_span);
-                py_client.attr("_regist_span_owner") = captured_owner;
+                py_client.attr("_regist_spans") = py::cast(spans);
+                py_client.attr("_regist_spans_owners") = owners;
+                py_client.attr("_regist_span") = py::cast(singular);
+                py_client.attr("_regist_span_owner") = singular_owner;
                 return py_client;
             },
             py::arg("client_config"),
