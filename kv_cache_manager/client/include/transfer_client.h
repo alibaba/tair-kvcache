@@ -26,6 +26,14 @@ public:
     Create(const std::string &client_config,
            const InitParams &init_params,
            const ClientMemoryRegistrations &memory_registrations);
+    // Every host segment is registered, in the given order; empty registers none.
+    // A separate overload (not a new field in ClientMemoryRegistrations) keeps the
+    // published struct layout unchanged for binaries built against older headers.
+    static std::unique_ptr<TransferClient>
+    Create(const std::string &client_config,
+           const InitParams &init_params,
+           const std::vector<SharedMemoryRegistration> &host_registrations,
+           const std::vector<GpuMemorySpan> &gpu_registrations = {});
 
     virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                          const BlockBuffers &block_buffers,
