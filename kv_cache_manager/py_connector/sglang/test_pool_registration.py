@@ -15,11 +15,20 @@ process group:
 * ``HostPoolGroup.entries`` is not a source of pools any more -- the KV pool of
   a hybrid group is the one v2 registers;
 * the Manager registration and the SDK client are created on the first storage
-  call (never before the pool set is final) and exactly once;
-* a pool registered after that point is reported once and degraded to misses.
-
-* a pool registered after initialization is not recorded and stays unusable,
-  even when it reuses the name of a pool whose spec is already registered.
+  call (never before the pool set is final) and exactly once; sglang that offers
+  the duck-typed ``finalize_registration`` hook instead freezes them at the end
+  of the attach (draft pools included) and fails the attach when that fails,
+  while a release without the hook keeps the lazy timing unchanged;
+* a pool registered after that point is reported once and degraded to misses:
+  it is not recorded and stays unusable, even when it reuses the name of a pool
+  whose spec is already registered;
+* the module-level ``_POOL_SPECS`` table holds its invariants (unique pools and
+  spec suffixes, exactly one anchor), so "one more row" cannot silently alias
+  two pools onto one location spec;
+* the whole control plane an instance hands to the Manager and the SDK client
+  -- spec names, sizes, groups, iov size, client config -- matches a literal
+  golden table for every pool combination, on MLA and non-MLA models, on every
+  rank.
 
 Prerequisites: a sglang runtime that can import its own backend (``sgl_kernel``
 and friends) and ``kv_cache_manager`` importable from the repository root on
@@ -33,6 +42,7 @@ resolved with ``getattr``; the file itself needs sglang >= v0.5.11, whose
     PYTHONPATH=$PWD python kv_cache_manager/py_connector/sglang/test_pool_registration.py
 """
 
+import dataclasses
 import json
 import sys
 import threading
@@ -44,6 +54,7 @@ from typing import Any
 from unittest import mock
 from unittest.mock import MagicMock
 
+import requests
 import torch
 
 # ── Modules the connector imports but this test does not exercise ──────
@@ -67,18 +78,27 @@ sys.modules.setdefault(
 )
 
 from sglang.srt.mem_cache.hicache_storage import (  # noqa: E402
+    HiCacheStorage,
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache  # noqa: E402
 
+from kv_cache_manager.py_connector.common.manager_client import (  # noqa: E402
+    KvCacheManagerHTTPError,
+    KvCacheManagerProtocolError,
+)
 from kv_cache_manager.py_connector.sglang import connector as connector_module  # noqa: E402
 from kv_cache_manager.py_connector.sglang.connector import HiCacheKVCM  # noqa: E402
 
 PAGE_SIZE = 64
 KV_BYTES_PER_TOKEN = 512
 MAMBA_BYTES_PER_TOKEN = 96
+# The page size each registered pool's host object reports.  Mamba's host pool is
+# page-granular (``MambaPoolHost.page_size == 1``, one slot per page), which is
+# exactly why its spec size is its per-token size; every other pool counts tokens.
+POOL_PAGE_SIZES = {PoolName.MAMBA: 1}
 # Never used by a correct connector: reading it means pools were taken from
 # HostPoolGroup.entries.
 SENTINEL_BYTES_PER_TOKEN = 7
@@ -98,13 +118,22 @@ class FakeHostPool(HostKVCache):
 
     The ABC's transfer hooks need real device pools, so they are stubbed out.
     Subclassing for real keeps the connector's ``isinstance`` check (and with
-    it the "a group is not a host pool" distinction) meaningful.
+    it the "a group is not a host pool" distinction) meaningful.  ``page_size``
+    is the pool's own, which is what its spec size is counted from: a Mamba host
+    pool keeps one slot per page (``page_size == 1``), every other pool here
+    counts ``PAGE_SIZE`` tokens.
     """
 
-    def __init__(self, *, bytes_per_token: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        *,
+        bytes_per_token: int,
+        dtype: torch.dtype,
+        page_size: int = PAGE_SIZE,
+    ) -> None:
         self.dtype = dtype
         self.bytes_per_token = bytes_per_token
-        self.page_size = PAGE_SIZE
+        self.page_size = page_size
 
     def get_size_per_token(self) -> int:
         return self.bytes_per_token
@@ -241,7 +270,9 @@ class TestRegistrationOrders(unittest.TestCase):
         return FakeHostPool(bytes_per_token=KV_BYTES_PER_TOKEN, dtype=torch.bfloat16)
 
     def _mamba_pool(self) -> FakeHostPool:
-        return FakeHostPool(bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32)
+        return FakeHostPool(
+            bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32, page_size=1
+        )
 
     def _expected_payload(self) -> dict:
         kv_size = KV_BYTES_PER_TOKEN * PAGE_SIZE
@@ -353,10 +384,400 @@ class TestRegistrationOrders(unittest.TestCase):
             # what this test is about.
             self.assertEqual(connector.location_spec_name, "tp_0_full")
             self.assertEqual(
-                connector.mamba_location_spec_name,
+                connector._get_extra_pool_spec_name(PoolName.MAMBA),
                 f"tp_{tp_rank}_linear",
                 "each rank reads and writes its own Mamba slice",
             )
+
+
+##################################################
+# The pool spec table
+##################################################
+
+# Bytes of one block of the fake pools below: KV and Indexer are token-granular
+# (times the page size), Mamba is page-granular (one slot per block).
+KV_SPEC_BYTES = KV_BYTES_PER_TOKEN * PAGE_SIZE
+MAMBA_SPEC_BYTES = MAMBA_BYTES_PER_TOKEN
+INDEXER_BYTES_PER_TOKEN = 40
+INDEXER_SPEC_BYTES = INDEXER_BYTES_PER_TOKEN * PAGE_SIZE
+# A DSA indexer cache can hold more bytes per block than the KV cache (its
+# quantized index adds up over layers), which is the case that pins the iov size
+# to the largest pool instead of to the KV pool.
+BIG_INDEXER_BYTES_PER_TOKEN = 4096
+BIG_INDEXER_SPEC_BYTES = BIG_INDEXER_BYTES_PER_TOKEN * PAGE_SIZE
+
+# The negative cases below build their tables from this minimal valid one, not
+# from ``_POOL_SPECS``: a later PR adding a row to the real table must not change
+# which invariant rejects them (that would hide the one under test).
+_BASE_TABLE = (connector_module._KV_SPEC, connector_module._MAMBA_SPEC)
+# A pool name no table can contain -- deliberately not a sglang enum member.
+_FRESH_POOL = "pool-that-is-not-in-the-table"
+
+
+def _check_pool_spec_table(table: tuple) -> None:
+    """Run the table guard that ``connector`` also runs at import time."""
+    connector_module._validate_pool_specs(table)
+
+
+class TestPoolSpecTable(unittest.TestCase):
+    """The spec table is the connector's whole pool knowledge.
+
+    Every later PR adds rows to it, so its invariants are pinned here -- and
+    pinned *negatively* too, on the row shapes that would otherwise pass every
+    other test in this directory while corrupting data.
+    """
+
+    def test_the_table_holds_its_invariants(self) -> None:
+        _check_pool_spec_table(connector_module._POOL_SPECS)
+
+    def test_a_sidecar_reusing_a_suffix_is_rejected(self) -> None:
+        """P4 writing ``suffix="_linear"`` for SWA must fail here, not at runtime."""
+        colliding = connector_module._PoolSpec(
+            pool=_FRESH_POOL,
+            group="Swa",
+            suffix=connector_module._MAMBA_SPEC.suffix,
+        )
+        with self.assertRaisesRegex(ValueError, "same spec suffix"):
+            _check_pool_spec_table((*_BASE_TABLE, colliding))
+
+    def test_a_repeated_pool_row_is_rejected(self) -> None:
+        # The suffix differs, so only the pool-uniqueness check can catch it.
+        duplicate = dataclasses.replace(connector_module._MAMBA_SPEC, suffix="_kda")
+        with self.assertRaisesRegex(ValueError, "more than one row"):
+            _check_pool_spec_table((*_BASE_TABLE, duplicate))
+
+    def test_a_second_anchor_is_rejected(self) -> None:
+        # A pool, suffix and group nobody else uses, so only the anchor count
+        # can reject this table.
+        second_anchor = connector_module._PoolSpec(
+            pool=_FRESH_POOL, group="Swa", suffix="_swa", anchor=True
+        )
+        with self.assertRaisesRegex(ValueError, "exactly one anchor"):
+            _check_pool_spec_table((*_BASE_TABLE, second_anchor))
+
+    def test_a_missing_anchor_is_rejected(self) -> None:
+        without_anchor = tuple(spec for spec in _BASE_TABLE if not spec.anchor)
+        with self.assertRaisesRegex(ValueError, "exactly one anchor"):
+            _check_pool_spec_table(without_anchor)
+
+    def test_an_anchor_that_is_not_the_kv_pool_is_rejected(self) -> None:
+        wrong_anchor = dataclasses.replace(connector_module._KV_SPEC, pool=_FRESH_POOL)
+        with self.assertRaisesRegex(ValueError, "the anchor is the KV pool"):
+            _check_pool_spec_table((wrong_anchor, connector_module._MAMBA_SPEC))
+
+    def test_a_row_without_a_suffix_is_rejected(self) -> None:
+        # Deliberately invalid: the guard must catch what the type checker
+        # already refuses.
+        no_suffix = connector_module._PoolSpec(
+            pool=_FRESH_POOL,
+            group="Swa",
+            suffix=None,  # ty: ignore[invalid-argument-type]
+        )
+        with self.assertRaisesRegex(ValueError, "no suffix"):
+            _check_pool_spec_table((*_BASE_TABLE, no_suffix))
+
+    def test_a_sidecar_sharing_the_anchor_group_is_rejected(self) -> None:
+        same_group = dataclasses.replace(
+            connector_module._MAMBA_SPEC, group=connector_module._KV_SPEC.group
+        )
+        with self.assertRaisesRegex(ValueError, "share a spec group"):
+            _check_pool_spec_table((connector_module._KV_SPEC, same_group))
+
+    def test_two_sidecars_sharing_a_group_is_rejected(self) -> None:
+        """P4 writing ``group="Linear"`` for SWA: the Manager skips its specs."""
+        same_group = connector_module._PoolSpec(
+            pool=_FRESH_POOL, group=connector_module._MAMBA_SPEC.group, suffix="_swa"
+        )
+        with self.assertRaisesRegex(ValueError, "share a spec group"):
+            _check_pool_spec_table((*_BASE_TABLE, same_group))
+
+    def test_a_sidecar_with_an_empty_group_is_rejected(self) -> None:
+        """An empty group name means "no constraint" to the Manager, so the
+        pool would be silently dropped -- it must be rejected at the table."""
+        empty = connector_module._PoolSpec(pool=_FRESH_POOL, group="", suffix="_swa")
+        with self.assertRaisesRegex(ValueError, "empty spec group"):
+            _check_pool_spec_table((*_BASE_TABLE, empty))
+
+    def test_the_anchor_with_an_empty_group_is_rejected(self) -> None:
+        empty = dataclasses.replace(connector_module._KV_SPEC, group="")
+        with self.assertRaisesRegex(ValueError, "empty spec group"):
+            _check_pool_spec_table((empty, connector_module._MAMBA_SPEC))
+
+
+##################################################
+# Control plane golden
+##################################################
+
+# What one instance hands to the Manager and to the SDK client, per pool
+# combination: the register payload's (name, size) pairs in order, its
+# (group, spec_names) pairs in order or None when the field stays absent, and
+# the iov size.  Literal on purpose: P2/P3/P4 add pools and change these
+# fields, and this is the table that makes "only added, nothing changed"
+# checkable without a GPU or a Manager.
+_COMBO_GOLDEN: dict[tuple, tuple] = {
+    (): (
+        [("tp_0", KV_SPEC_BYTES), ("tp_1", KV_SPEC_BYTES)],
+        None,
+        KV_SPEC_BYTES * 1024,
+    ),
+    ((PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),): (
+        [
+            ("tp_0_full", KV_SPEC_BYTES),
+            ("tp_1_full", KV_SPEC_BYTES),
+            ("tp_0_linear", MAMBA_SPEC_BYTES),
+            ("tp_1_linear", MAMBA_SPEC_BYTES),
+        ],
+        [
+            ("Full", ["tp_0_full", "tp_1_full"]),
+            ("Linear", ["tp_0_linear", "tp_1_linear"]),
+        ],
+        KV_SPEC_BYTES * 1024,
+    ),
+    ((PoolName.INDEXER, INDEXER_BYTES_PER_TOKEN),): (
+        [
+            ("tp_0_full", KV_SPEC_BYTES),
+            ("tp_1_full", KV_SPEC_BYTES),
+            ("tp_0_indexer", INDEXER_SPEC_BYTES),
+            ("tp_1_indexer", INDEXER_SPEC_BYTES),
+        ],
+        [
+            ("Full", ["tp_0_full", "tp_1_full"]),
+            ("Indexer", ["tp_0_indexer", "tp_1_indexer"]),
+        ],
+        KV_SPEC_BYTES * 1024,
+    ),
+    (
+        (PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),
+        (PoolName.INDEXER, INDEXER_BYTES_PER_TOKEN),
+    ): (
+        [
+            ("tp_0_full", KV_SPEC_BYTES),
+            ("tp_1_full", KV_SPEC_BYTES),
+            ("tp_0_linear", MAMBA_SPEC_BYTES),
+            ("tp_1_linear", MAMBA_SPEC_BYTES),
+            ("tp_0_indexer", INDEXER_SPEC_BYTES),
+            ("tp_1_indexer", INDEXER_SPEC_BYTES),
+        ],
+        [
+            ("Full", ["tp_0_full", "tp_1_full"]),
+            ("Linear", ["tp_0_linear", "tp_1_linear"]),
+            ("Indexer", ["tp_0_indexer", "tp_1_indexer"]),
+        ],
+        KV_SPEC_BYTES * 1024,
+    ),
+    ((PoolName.INDEXER, BIG_INDEXER_BYTES_PER_TOKEN),): (
+        [
+            ("tp_0_full", KV_SPEC_BYTES),
+            ("tp_1_full", KV_SPEC_BYTES),
+            ("tp_0_indexer", BIG_INDEXER_SPEC_BYTES),
+            ("tp_1_indexer", BIG_INDEXER_SPEC_BYTES),
+        ],
+        [
+            ("Full", ["tp_0_full", "tp_1_full"]),
+            ("Indexer", ["tp_0_indexer", "tp_1_indexer"]),
+        ],
+        BIG_INDEXER_SPEC_BYTES * 1024,
+    ),
+}
+
+# The SDK client's spec map, i.e. the specs this rank reads and writes: the
+# replicated pools (KV, Indexer) are rank 0's on an MLA model, the sharded one
+# (Mamba) is always this rank's.  The KV spec leads the map.
+_OWN_SPECS: dict[tuple, dict[tuple[bool, int], dict[str, int]]] = {
+    (): {
+        (False, 0): {"tp_0": KV_SPEC_BYTES},
+        (False, 1): {"tp_1": KV_SPEC_BYTES},
+        (True, 0): {"tp_0": KV_SPEC_BYTES},
+        (True, 1): {"tp_0": KV_SPEC_BYTES},
+    },
+    ((PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),): {
+        (False, 0): {"tp_0_full": KV_SPEC_BYTES, "tp_0_linear": MAMBA_SPEC_BYTES},
+        (False, 1): {"tp_1_full": KV_SPEC_BYTES, "tp_1_linear": MAMBA_SPEC_BYTES},
+        (True, 0): {"tp_0_full": KV_SPEC_BYTES, "tp_0_linear": MAMBA_SPEC_BYTES},
+        (True, 1): {"tp_0_full": KV_SPEC_BYTES, "tp_1_linear": MAMBA_SPEC_BYTES},
+    },
+    ((PoolName.INDEXER, INDEXER_BYTES_PER_TOKEN),): {
+        (False, 0): {"tp_0_full": KV_SPEC_BYTES, "tp_0_indexer": INDEXER_SPEC_BYTES},
+        (False, 1): {"tp_1_full": KV_SPEC_BYTES, "tp_1_indexer": INDEXER_SPEC_BYTES},
+        (True, 0): {"tp_0_full": KV_SPEC_BYTES, "tp_0_indexer": INDEXER_SPEC_BYTES},
+        (True, 1): {"tp_0_full": KV_SPEC_BYTES, "tp_0_indexer": INDEXER_SPEC_BYTES},
+    },
+    (
+        (PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),
+        (PoolName.INDEXER, INDEXER_BYTES_PER_TOKEN),
+    ): {
+        (False, 0): {
+            "tp_0_full": KV_SPEC_BYTES,
+            "tp_0_linear": MAMBA_SPEC_BYTES,
+            "tp_0_indexer": INDEXER_SPEC_BYTES,
+        },
+        (False, 1): {
+            "tp_1_full": KV_SPEC_BYTES,
+            "tp_1_linear": MAMBA_SPEC_BYTES,
+            "tp_1_indexer": INDEXER_SPEC_BYTES,
+        },
+        (True, 0): {
+            "tp_0_full": KV_SPEC_BYTES,
+            "tp_0_linear": MAMBA_SPEC_BYTES,
+            "tp_0_indexer": INDEXER_SPEC_BYTES,
+        },
+        (True, 1): {
+            "tp_0_full": KV_SPEC_BYTES,
+            "tp_1_linear": MAMBA_SPEC_BYTES,
+            "tp_0_indexer": INDEXER_SPEC_BYTES,
+        },
+    },
+    ((PoolName.INDEXER, BIG_INDEXER_BYTES_PER_TOKEN),): {
+        (False, 0): {
+            "tp_0_full": KV_SPEC_BYTES,
+            "tp_0_indexer": BIG_INDEXER_SPEC_BYTES,
+        },
+        (False, 1): {
+            "tp_1_full": KV_SPEC_BYTES,
+            "tp_1_indexer": BIG_INDEXER_SPEC_BYTES,
+        },
+        (True, 0): {"tp_0_full": KV_SPEC_BYTES, "tp_0_indexer": BIG_INDEXER_SPEC_BYTES},
+        (True, 1): {"tp_0_full": KV_SPEC_BYTES, "tp_0_indexer": BIG_INDEXER_SPEC_BYTES},
+    },
+}
+
+
+def _expected_client_config(spec_infos: dict) -> str:
+    """The SDK client config string of a control-plane instance.
+
+    Only the spec map varies with the pool combination and the rank; the rest
+    is what ``_connector()`` configures (the SDK defaults of an instance that
+    sets none of the ``sdk_*`` knobs).
+    """
+    return json.dumps(
+        {
+            "instance_group": "default",
+            "instance_id": "registration-test",
+            "block_size": PAGE_SIZE,
+            "sdk_config": {
+                "thread_num": 4,
+                "queue_size": 1000,
+                "sdk_backend_configs": [],
+                "timeout_config": {"get_timeout_ms": 15000, "put_timeout_ms": 15000},
+            },
+            "location_spec_infos": spec_infos,
+        }
+    )
+
+
+class TestControlPlaneGolden(unittest.TestCase):
+    """The control plane of an instance, pinned for every pool combination.
+
+    The register payload and the SDK client config are what a Manager and the
+    data path are built from; P2/P3/P4 all change them, so their exact content
+    is asserted here instead of being compared by hand between branches.
+    """
+
+    def setUp(self) -> None:
+        _mock_kvcm.reset_mock()
+        HiCacheKVCM._reported_pools.clear()
+
+    def _control_plane(
+        self, pools: tuple, *, is_mla: bool, tp_rank: int, tp_size: int = 2
+    ) -> dict:
+        """Drive the real initialization for one rank of one pool combination."""
+        with _patched_parallel_context():
+            connector = _connector(
+                tp_rank=tp_rank, tp_size=tp_size, is_mla_model=is_mla
+            )
+            connector.register_mem_pool_host(
+                FakeHostPool(bytes_per_token=KV_BYTES_PER_TOKEN, dtype=torch.bfloat16)
+            )
+            for name, bytes_per_token in pools:
+                connector.register_mem_host_pool_v2(
+                    FakeHostPool(
+                        bytes_per_token=bytes_per_token,
+                        dtype=torch.float32,
+                        page_size=POOL_PAGE_SIZES.get(name, PAGE_SIZE),
+                    ),
+                    name,
+                )
+            connector.batch_exists(["block-0"])
+
+        payload = _register_instance_payload(connector)
+        return {
+            "location_spec_infos": payload["location_spec_infos"],
+            "location_spec_groups": payload.get("location_spec_groups"),
+            "iov_size": connector.iov_size,
+            "client_config": _mock_kvcm.TransferClient.Create.call_args.args[0],
+            "self_location_spec_name": connector.init_params.self_location_spec_name,
+            "location_spec_name": connector.location_spec_name,
+            "kv_factor": connector.kv_factor,
+        }
+
+    def test_control_plane_is_unchanged_per_pool_combination(self) -> None:
+        for pools, (infos, groups, iov_size) in _COMBO_GOLDEN.items():
+            for is_mla in (False, True):
+                for tp_rank in (0, 1):
+                    scenario = f"pools={pools} mla={is_mla} tp_rank={tp_rank}"
+                    with self.subTest(scenario=scenario):
+                        control_plane = self._control_plane(
+                            pools, is_mla=is_mla, tp_rank=tp_rank
+                        )
+                        self.assertEqual(
+                            [
+                                (spec["name"], spec["size"])
+                                for spec in control_plane["location_spec_infos"]
+                            ],
+                            infos,
+                            f"{scenario}: register payload specs, in order",
+                        )
+                        if groups is None:
+                            # Older Managers do not know the field: a flat
+                            # stack must not send it at all, not even empty.
+                            self.assertIsNone(
+                                control_plane["location_spec_groups"],
+                                f"{scenario}: a flat stack must not send spec groups",
+                            )
+                        else:
+                            self.assertEqual(
+                                [
+                                    (group["name"], group["spec_names"])
+                                    for group in control_plane["location_spec_groups"]
+                                    or []
+                                ],
+                                groups,
+                                f"{scenario}: register payload spec groups, in order",
+                            )
+                        self.assertEqual(control_plane["iov_size"], iov_size, scenario)
+
+                        own = _OWN_SPECS[pools][(is_mla, tp_rank)]
+                        self.assertEqual(
+                            control_plane["client_config"],
+                            _expected_client_config(own),
+                            f"{scenario}: SDK client config",
+                        )
+                        # The KV spec leads ``own`` and is the instance's own.
+                        self.assertEqual(
+                            control_plane["self_location_spec_name"], next(iter(own))
+                        )
+                        self.assertEqual(
+                            control_plane["location_spec_name"], next(iter(own))
+                        )
+                        self.assertEqual(
+                            control_plane["kv_factor"], 1 if is_mla else 2, scenario
+                        )
+
+    def test_single_rank_flat_model_keeps_the_legacy_spec_name(self) -> None:
+        control_plane = self._control_plane((), is_mla=False, tp_rank=0, tp_size=1)
+
+        self.assertEqual(
+            [
+                (spec["name"], spec["size"])
+                for spec in control_plane["location_spec_infos"]
+            ],
+            [("tp_0", KV_SPEC_BYTES)],
+        )
+        self.assertIsNone(
+            control_plane["location_spec_groups"],
+            "a flat stack must not send the field older Managers reject",
+        )
+        self.assertEqual(control_plane["location_spec_name"], "tp_0")
 
 
 class TestInitializationTiming(unittest.TestCase):
@@ -436,14 +857,14 @@ class TestInitializationTiming(unittest.TestCase):
                 bytes_per_token=KV_BYTES_PER_TOKEN, dtype=torch.bfloat16
             )
             mamba_pool = FakeHostPool(
-                bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32
+                bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32, page_size=1
             )
             connector.register_mem_pool_host(kv_pool)
             connector.register_mem_host_pool_v2(mamba_pool, PoolName.MAMBA)
             connector.batch_exists(["block-0"])
 
             late_pool = FakeHostPool(
-                bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32
+                bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32, page_size=1
             )
             with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
                 connector.register_mem_host_pool_v2(late_pool, PoolName.MAMBA)
@@ -529,6 +950,474 @@ class TestInitializationTiming(unittest.TestCase):
                 )
 
 
+class TestFinalizeRegistration(unittest.TestCase):
+    """sglang that reports "registration done" freezes the specs right there.
+
+    The hook is duck-typed: sglang that has it calls ``finalize_registration``
+    after the last pool of the attach (draft pools included), and a failure
+    there must fail the attach instead of leaving every storage call to degrade
+    in a background thread.  Upstream sglang has no such callback, so it keeps
+    freezing at the first storage call -- the last test here pins that the
+    coexistence changes nothing for it.
+    """
+
+    def setUp(self) -> None:
+        _mock_kvcm.reset_mock()
+        HiCacheKVCM._reported_pools.clear()
+
+    def _kv_pool(self) -> FakeHostPool:
+        return FakeHostPool(bytes_per_token=KV_BYTES_PER_TOKEN, dtype=torch.bfloat16)
+
+    def _mamba_pool(self) -> FakeHostPool:
+        return FakeHostPool(
+            bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32, page_size=1
+        )
+
+    def _burst_connector(self) -> HiCacheKVCM:
+        """A connector that ran sglang's registration burst, before any I/O."""
+        connector = _connector()
+        connector.register_mem_pool_host(self._kv_pool())
+        connector.register_mem_host_pool_v2(self._mamba_pool(), PoolName.MAMBA)
+        return connector
+
+    def test_a_second_instance_still_reports_its_missing_sdk_client(self) -> None:
+        """The report names an instance, so the dedup key must carry it.
+
+        sglang can detach and re-attach the backend with a different
+        ``instance_id`` at runtime; a process-wide key would swallow the second
+        instance's only diagnosis.
+        """
+        create = _mock_kvcm.TransferClient.Create
+        create.return_value = None
+        self.addCleanup(setattr, create, "return_value", MagicMock())
+
+        with _patched_parallel_context():
+            for instance_id in ("instance-a", "instance-b"):
+                connector = _connector(
+                    extra_config={
+                        "manager_uri": "http://127.0.0.1:6382",
+                        "instance_group": "default",
+                        "instance_id": instance_id,
+                    }
+                )
+                connector.register_mem_pool_host(self._kv_pool())
+                with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                    with self.assertRaises(connector_module._UnsupportedBackendError):
+                        connector.finalize_registration()
+                self.assertTrue(
+                    any(instance_id in r.getMessage() for r in logs.records),
+                    f"{instance_id} was not named in its own report",
+                )
+
+    def test_the_hook_is_not_part_of_the_upstream_interface(self) -> None:
+        """Duck-typed on purpose: no upstream release declares this method.
+
+        The connector only *implements* the hook; sglang that knows it finds it
+        with ``getattr``.  If this fails, upstream has declared a
+        ``finalize_registration`` of its own and its contract has to be
+        re-read before the connector claims to satisfy it.
+        """
+        self.assertFalse(hasattr(HiCacheStorage, "finalize_registration"))
+        self.assertTrue(callable(HiCacheKVCM.finalize_registration))
+
+    def test_finalize_registration_builds_the_client_once(self) -> None:
+        """The hook registers and creates the client; a repeat does neither."""
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            self.assertFalse(connector._client_ready)
+            self.assertIsNone(
+                _manager(connector).register_instance.call_args,
+                "a registration hook must not register the instance by itself",
+            )
+
+            connector.finalize_registration()
+            self.assertTrue(connector._client_ready)
+            self.assertIsNotNone(connector.transfer_client)
+
+            connector.finalize_registration()
+            self.assertFalse(
+                connector._tp_init_agreed,
+                "the hook is not a collective: it must not claim the TP group "
+                "agreed on initialization",
+            )
+
+        self.assertEqual(_manager(connector).register_instance.call_count, 1)
+        self.assertEqual(_mock_kvcm.TransferClient.Create.call_count, 1)
+
+    def test_finalize_registration_races_the_first_storage_call_once(self) -> None:
+        """Both entry points take the same lock: the instance registers once."""
+        entered = threading.Event()
+        release = threading.Event()
+        finalized = threading.Event()
+
+        def slow_register(request: Any) -> dict:
+            entered.set()
+            release.wait(timeout=5)
+            return {"storage_configs": "[]"}
+
+        def finalize() -> None:
+            connector.finalize_registration()
+            finalized.set()
+
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            _manager(connector).register_instance.side_effect = slow_register
+
+            storage_call = threading.Thread(
+                target=connector.batch_exists, args=(["block-0"],)
+            )
+            storage_call.start()
+            self.assertTrue(entered.wait(timeout=5), "the storage call never started")
+
+            finalizer = threading.Thread(target=finalize)
+            finalizer.start()
+            self.assertFalse(
+                finalized.is_set(),
+                "the hook must wait for the initialization already in flight; "
+                "the registration count below is what proves it did not slip "
+                "past it into a second registration",
+            )
+            release.set()
+            storage_call.join(timeout=5)
+            finalizer.join(timeout=5)
+
+        self.assertTrue(finalized.is_set(), "the finalize thread must complete")
+        self.assertFalse(storage_call.is_alive())
+        self.assertTrue(connector._client_ready)
+        self.assertEqual(_manager(connector).register_instance.call_count, 1)
+        self.assertEqual(_mock_kvcm.TransferClient.Create.call_count, 1)
+
+    def test_finalize_registration_covers_every_pool_registered_before_it(self) -> None:
+        """Every pool of the attach reaches the registration payload."""
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            connector.register_mem_host_pool_v2(
+                FakeHostPool(bytes_per_token=256, dtype=torch.bfloat16), UNMANAGED_POOL
+            )
+            connector.finalize_registration()
+
+        payload = dict(_manager(connector).register_instance.call_args.args[0])
+        self.assertEqual(
+            [spec["name"] for spec in payload["location_spec_infos"]],
+            [
+                # A sidecar exists, so the anchor carries its hybrid name.
+                "tp_0_full",
+                "tp_1_full",
+                "tp_0_linear",
+                "tp_1_linear",
+                f"tp_0_{UNMANAGED_POOL}",
+                f"tp_1_{UNMANAGED_POOL}",
+            ],
+        )
+        self.assertEqual(
+            [group["name"] for group in payload["location_spec_groups"]],
+            ["Full", "Linear", f"F{UNMANAGED_POOL}"],
+        )
+        self.assertEqual(connector._late_pools, frozenset(), "nothing was late")
+        self.assertEqual(
+            set(connector.pool_specs), {PoolName.KV, PoolName.MAMBA, UNMANAGED_POOL}
+        )
+
+    def test_finalize_registration_without_an_anchor_fails_loudly(self) -> None:
+        """No KV pool means nothing can be registered: the attach fails."""
+        with _patched_parallel_context():
+            connector = _connector()
+            # Only the v0.5.18-style group arrives, never the KV entry.
+            connector.register_mem_pool_host(FakeHostPoolGroup())  # ty: ignore[invalid-argument-type]
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                with self.assertRaisesRegex(RuntimeError, "no KV host pool"):
+                    connector.finalize_registration()
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("local:", logs.records[0].getMessage())
+        self.assertFalse(connector._client_ready)
+        self.assertIsNone(_manager(connector).register_instance.call_args)
+
+    def test_finalize_registration_raises_a_permanent_shape_error(self) -> None:
+        """An unservable anchor surfaces as the backend error, not a shape bug."""
+        with _patched_parallel_context():
+            connector = _connector()
+            anchor = FakeLogicalHostPool()
+            connector.register_mem_pool_host(anchor)  # ty: ignore[invalid-argument-type]
+            connector.register_mem_host_pool_v2(anchor, PoolName.KV)  # ty: ignore[invalid-argument-type]
+
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                with self.assertRaises(
+                    connector_module._UnsupportedBackendError
+                ) as caught:
+                    connector.finalize_registration()
+
+        # What the caller can catch: a RuntimeError, not an AssertionError from
+        # a stripped ``assert`` and not a NotImplementedError/AttributeError
+        # from an unimplemented interface method.
+        self.assertIsInstance(caught.exception, RuntimeError)
+        self.assertEqual(len(logs.records), 2)
+        self.assertIn("FakeLogicalHostPool", logs.records[0].getMessage())
+        self.assertIn("rejected:", logs.records[1].getMessage())
+        self.assertFalse(connector._client_ready)
+        self.assertIsNone(_manager(connector).register_instance.call_args)
+
+    def test_a_missing_sdk_client_is_a_permanent_failure(self) -> None:
+        """``Create`` returning no client must not pass for a working backend."""
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            # Set the shared mock's return value in place: ``reset_mock()``
+            # (the other classes' setUp) keeps return values, and patching the
+            # attribute would leave the mock's children unresettable.
+            create = _mock_kvcm.TransferClient.Create
+            create.return_value = None
+            self.addCleanup(setattr, create, "return_value", MagicMock())
+
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                with self.assertRaises(connector_module._UnsupportedBackendError):
+                    connector.finalize_registration()
+
+        # Two distinct reports, not one repeated: what is broken (the SDK
+        # client, with the instance and its specs), then that the attach fails.
+        self.assertEqual(len(logs.records), 2)
+        self.assertIn(
+            "TransferClient.Create returned no client", logs.records[0].getMessage()
+        )
+        self.assertIn("registration-test", logs.records[0].getMessage())
+        self.assertIn(
+            "rejected: the KVCM transfer runtime could not be created",
+            logs.records[1].getMessage(),
+        )
+        self.assertNotIn(
+            "pool or spec shape",
+            logs.records[1].getMessage(),
+            "the reason of a missing SDK client is not a pool shape",
+        )
+        self.assertIsNone(connector.transfer_client)
+        self.assertFalse(connector._client_ready)
+
+    def test_a_missing_sdk_client_is_reported_once_on_the_lazy_path(self) -> None:
+        """Without the hook the first storage call must report, not stay silent.
+
+        Upstream sglang never calls ``finalize_registration``, so the first
+        data-path call is what discovers the broken SDK.  The callers answer a
+        conservative result without a log of their own, so the report has to
+        happen where the failure is detected -- once for the instance, not once
+        per call.
+        """
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            create = _mock_kvcm.TransferClient.Create
+            create.return_value = None
+            self.addCleanup(setattr, create, "return_value", MagicMock())
+
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                self.assertEqual(connector.batch_exists(["block-0"]), 0)
+            self.assertEqual(len(logs.records), 1)
+            message = logs.records[0].getMessage()
+            self.assertIn("TransferClient.Create returned no client", message)
+            self.assertIn("registration-test", message)
+            self.assertIn("tp_0_linear", message, "the specs locate the failure")
+            self.assertFalse(connector._client_ready)
+
+            with self.assertNoLogs(connector_module.__name__, level="ERROR"):
+                self.assertEqual(connector.batch_exists(["block-1"]), 0)
+                self.assertEqual(
+                    connector.batch_get_v1(["block-1"], torch.arange(PAGE_SIZE)),
+                    [False],
+                )
+                self.assertEqual(connector.batch_exists_v2(["block-1"]).kv_hit_pages, 0)
+
+    def test_an_unusable_anchor_does_not_suppress_the_sdk_report(self) -> None:
+        """The two instance-wide reports keep keys of their own.
+
+        ``_reported_pools`` deduplicates by key and is process-wide, so a shared
+        key would silence the second cause -- exactly the failure this reporting
+        exists to prevent.  Both orders are checked: neither report may depend on
+        which one the process saw first.
+        """
+
+        def anchor_failure() -> list:
+            connector = _connector()
+            anchor = FakeLogicalHostPool()
+            connector.register_mem_pool_host(anchor)  # ty: ignore[invalid-argument-type]
+            connector.register_mem_host_pool_v2(anchor, PoolName.KV)  # ty: ignore[invalid-argument-type]
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                self.assertEqual(connector.batch_exists(["block-0"]), 0)
+            return logs.records
+
+        def sdk_failure() -> list:
+            connector = self._burst_connector()
+            # Set in place: ``reset_mock()`` keeps return values, and patching
+            # the attribute would leave the mock's children unresettable.
+            create = _mock_kvcm.TransferClient.Create
+            create.return_value = None
+            self.addCleanup(setattr, create, "return_value", MagicMock())
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                self.assertEqual(connector.batch_exists(["block-0"]), 0)
+            return logs.records
+
+        for order, first, second in (
+            ("anchor first", anchor_failure, sdk_failure),
+            ("sdk first", sdk_failure, anchor_failure),
+        ):
+            with self.subTest(order=order):
+                # A fresh process as far as the process-wide report set goes.
+                HiCacheKVCM._reported_pools.clear()
+                with _patched_parallel_context():
+                    messages = [record.getMessage() for record in first() + second()]
+                self.assertEqual(len(messages), 2, messages)
+                self.assertTrue(
+                    any("not a host pool" in message for message in messages),
+                    messages,
+                )
+                self.assertTrue(
+                    any(
+                        "has no KVCM transfer client" in message for message in messages
+                    ),
+                    messages,
+                )
+
+    def test_finalize_registration_keeps_the_manager_error_class(self) -> None:
+        """Both kinds fail startup, but the type still says what went wrong."""
+        cases = [
+            (
+                "unreachable",
+                requests.ConnectionError("connection refused"),
+                "unjudged: the Manager is unreachable",
+            ),
+            (
+                "http-503",
+                KvCacheManagerHTTPError(
+                    "status code 503",
+                    response=types.SimpleNamespace(status_code=503),
+                ),
+                "unjudged: the Manager failed with HTTP 503",
+            ),
+            (
+                "http-400",
+                KvCacheManagerHTTPError(
+                    "status code 400", response=types.SimpleNamespace(status_code=400)
+                ),
+                "refused: the Manager rejected the request (HTTP 400)",
+            ),
+            (
+                "protocol",
+                KvCacheManagerProtocolError("missing a valid 'header' field"),
+                "unjudged: the Manager did not decide on the registration",
+            ),
+        ]
+        for name, error, label in cases:
+            with self.subTest(name=name, label=label):
+                with _patched_parallel_context():
+                    connector = self._burst_connector()
+                    _manager(connector).register_instance.side_effect = error
+                    with self.assertLogs(
+                        connector_module.__name__, level="ERROR"
+                    ) as logs:
+                        with self.assertRaises(type(error)) as caught:
+                            connector.finalize_registration()
+
+                self.assertIs(
+                    caught.exception, error, "the Manager error must not be wrapped"
+                )
+                self.assertIn(label, logs.records[-1].getMessage())
+                self.assertFalse(connector._client_ready)
+
+    def test_a_pool_registered_after_finalize_registration_is_degraded(self) -> None:
+        """Late means late: one report, misses, and the frozen pools unaffected."""
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            connector.finalize_registration()
+
+            late_pool = FakeHostPool(bytes_per_token=256, dtype=torch.bfloat16)
+            with self.assertLogs(connector_module.__name__, level="WARNING") as logs:
+                connector.register_mem_host_pool_v2(late_pool, UNMANAGED_POOL)
+            self.assertEqual(len(logs.records), 1)
+            self.assertIn(str(UNMANAGED_POOL), logs.records[0].getMessage())
+            self.assertNotIn(UNMANAGED_POOL, connector.registered_pools)
+            self.assertIn(UNMANAGED_POOL, connector._late_pools)
+
+            manager = _manager(connector)
+            manager.get_cache_location.return_value = {
+                # Two KV pages that also carry the registered pool's spec, so
+                # "the spec is missing from the Manager" cannot be the reason
+                # why the late pool must come back as a miss.
+                "locations": [
+                    {
+                        "location_specs": [
+                            {"name": "tp_0_full", "uri": f"uri-{i}"},
+                            {"name": "tp_0_linear", "uri": f"lin-{i}"},
+                        ]
+                    }
+                    for i in range(2)
+                ]
+            }
+            mamba = PoolTransfer(
+                name=PoolName.MAMBA,
+                host_indices=torch.arange(2),
+                keys=["block-0", "block-1"],
+            )
+            late = PoolTransfer(
+                name=UNMANAGED_POOL,
+                host_indices=torch.arange(2),
+                keys=["block-0", "block-1"],
+            )
+            with self.assertNoLogs(connector_module.__name__, level="WARNING"):
+                exists = connector.batch_exists_v2(
+                    ["block-0", "block-1"], [mamba, late]
+                )
+            self.assertEqual(exists.extra_pool_hit_pages[PoolName.KV], 2)
+            self.assertEqual(exists.extra_pool_hit_pages[PoolName.MAMBA], 2)
+            self.assertEqual(exists.extra_pool_hit_pages[UNMANAGED_POOL], 0)
+            # The engine may load no page: the late pool's pages are not in
+            # storage, so the prefix is clamped to the pool minimum.
+            self.assertEqual(exists.kv_hit_pages, 0)
+
+            manager.get_cache_location.reset_mock()
+            with self.assertNoLogs(connector_module.__name__, level="WARNING"):
+                self.assertEqual(
+                    connector.batch_get_v2([late]), {UNMANAGED_POOL: [False, False]}
+                )
+            self.assertIsNone(
+                manager.get_cache_location.call_args,
+                "a late pool must not query the Manager for its spec",
+            )
+
+    def test_without_the_hook_the_specs_freeze_at_the_first_storage_call(self) -> None:
+        """Upstream sglang never calls the hook, so it keeps today's timing."""
+        with _patched_parallel_context():
+            connector = _connector()
+            connector.register_mem_pool_host(self._kv_pool())
+            # Registered after the attach but before any storage call: the lazy
+            # path freezes late enough to include it.
+            connector.register_mem_host_pool_v2(self._mamba_pool(), PoolName.MAMBA)
+            self.assertFalse(connector._client_ready)
+            self.assertIsNone(_manager(connector).register_instance.call_args)
+
+            connector.batch_exists(["block-0"])
+            self.assertTrue(connector._client_ready)
+            self.assertIn(PoolName.MAMBA, connector.pool_specs)
+            self.assertEqual(connector._late_pools, frozenset(), "nothing was late")
+            self.assertEqual(_manager(connector).register_instance.call_count, 1)
+
+            late_pool = FakeHostPool(bytes_per_token=256, dtype=torch.bfloat16)
+            with self.assertLogs(connector_module.__name__, level="WARNING") as logs:
+                connector.register_mem_host_pool_v2(late_pool, UNMANAGED_POOL)
+            self.assertEqual(len(logs.records), 1)
+            self.assertIn(UNMANAGED_POOL, connector._late_pools)
+
+    def test_finalize_registration_after_close_fails(self) -> None:
+        """A retired backend must not register itself back into life."""
+        with _patched_parallel_context():
+            connector = self._burst_connector()
+            connector.finalize_registration()
+            connector.close()
+
+            with self.assertLogs(connector_module.__name__, level="ERROR") as logs:
+                with self.assertRaisesRegex(RuntimeError, "was closed"):
+                    connector.finalize_registration()
+
+        self.assertIn("local:", logs.records[-1].getMessage())
+        self.assertEqual(_manager(connector).register_instance.call_count, 1)
+        self.assertIsNone(connector.transfer_client)
+
+
 class TestV2EntriesLazyInitialization(unittest.TestCase):
     """The v2 entries must trigger the deferred initialization like any other
     data-path entry, and stay conservative when there is no KV pool at all."""
@@ -543,7 +1432,9 @@ class TestV2EntriesLazyInitialization(unittest.TestCase):
             FakeHostPool(bytes_per_token=KV_BYTES_PER_TOKEN, dtype=torch.bfloat16)
         )
         connector.register_mem_host_pool_v2(
-            FakeHostPool(bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32),
+            FakeHostPool(
+                bytes_per_token=MAMBA_BYTES_PER_TOKEN, dtype=torch.float32, page_size=1
+            ),
             PoolName.MAMBA,
         )
         return connector
