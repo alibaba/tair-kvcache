@@ -133,6 +133,9 @@ build:mooncake --define MOONCAKE_USE_CUDA=true
 build:mooncake_common --define ENABLE_MOONCAKE=true
 build:mooncake_common --define MOONCAKE_USE_HTTP=true --define MOONCAKE_USE_TCP=true
 
+# AWS EFA (libfabric) transport for mooncake; combine with --config=client etc.
+build:efa --define MOONCAKE_USE_EFA=true
+
 build:vcns --define ENABLE_VCNS=true
 
 build:tair_mempool --config=cuda

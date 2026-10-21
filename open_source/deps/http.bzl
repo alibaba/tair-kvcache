@@ -116,9 +116,10 @@ def http_deps():
     # yalantinglibs
     http_archive(
         name = "yalantinglibs",
-        urls = ["https://github.com/alibaba/yalantinglibs/archive/refs/tags/0.5.5.tar.gz"],
-        strip_prefix = "yalantinglibs-0.5.5",
-        sha256 = "7962579c1414d1ade4fd22316476723d54112c919514bf1e6015a1870e5e68f7",
+        # Commit pinned by Mooncake v0.3.13.post1 (mooncake-common/FindYLT.cmake).
+        urls = ["https://github.com/alibaba/yalantinglibs/archive/7801bc9ad9021781f15217552214e325a1cf7373.tar.gz"],
+        strip_prefix = "yalantinglibs-7801bc9ad9021781f15217552214e325a1cf7373",
+        sha256 = "2a4b93c256c09fa84e1507bf4d5b33571ee47a4e2c65316ca255680ad3cdfc1e",
     )
 
     # curl
