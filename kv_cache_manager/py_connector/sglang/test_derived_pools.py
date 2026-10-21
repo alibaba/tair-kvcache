@@ -392,6 +392,34 @@ class TestDerivedPoolSpec(unittest.TestCase):
         client_config = connector.transfer_client_config
         self.assertIn(f"tp_0_{DERIVED_POOL}", client_config)
 
+    def test_derived_pool_registers_rank0_spec_alone_on_an_mla_model(self) -> None:
+        """A derived pool is replicated, so only rank 0's spec is registered."""
+        with _patched_parallel_context():
+            connector = _attached_connector(tp_rank=1, tp_size=2, is_mla_model=True)
+            connector.register_mem_pool_host(FakeHostPool())
+            connector.register_mem_host_pool_v2(
+                FakeHostPool(page_bytes=3072), DERIVED_POOL
+            )
+            connector.batch_exists(["block-0"])
+
+        payload = dict(_manager(connector).register_instance.call_args.args[0])
+        self.assertEqual(
+            [spec["name"] for spec in payload["location_spec_infos"]],
+            ["tp_0_full", f"tp_0_{DERIVED_POOL}"],
+        )
+        self.assertEqual(
+            payload["location_spec_groups"],
+            [
+                {"name": "Full", "spec_names": ["tp_0_full"]},
+                {"name": f"F{DERIVED_POOL}", "spec_names": [f"tp_0_{DERIVED_POOL}"]},
+            ],
+        )
+        # Rank 1 reads and writes rank 0's spec too.
+        self.assertEqual(
+            connector.pool_specs[DERIVED_POOL].name, f"tp_0_{DERIVED_POOL}"
+        )
+        self.assertEqual(connector.location_spec_name, "tp_0_full")
+
     def test_spec_size_uses_the_pool_own_page_size(self) -> None:
         """Not the anchor's block size: a sidecar page may be narrower."""
         pool = FakeHostPool(page_size=32, page_bytes=1024)

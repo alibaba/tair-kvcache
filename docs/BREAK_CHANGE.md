@@ -128,3 +128,30 @@ PR #249 review 进一步确认，Instance 注册信息中的 `query_type` 表示
 2. 使用新 proto 重新生成并编译所有 Meta/Admin gRPC 与 SDK 调用方，将实例注册和 InstanceInfo accessor 切换为新名称。
 3. 在同一升级窗口更新 KVCM 与注册调用方。混合版本虽然可传输字段号 `8` 的 protobuf 二进制数据，但 Registry/HTTP JSON 与生成源码 API 不构成受支持的混合版本契约。
 4. 升级后检查 GetInstanceInfo/Registry 回显中的 `default_query_type`；未配置时应为 `QT_UNSPECIFIED`，显式请求级 `query_type` 的行为不变。
+
+## SGLang MLA Instance 的 Location Spec 集合
+
+Introduced by: PR #394
+
+sglang connector 在 MLA 模型上对复制型池（KV、Indexer 及 `step4_dsa_summary` 这类派生池）只注册 rank 0 的
+location spec，不再每个 TP rank 一份；分片型池（Mamba/KDA）与非 MLA 模型的注册集合不变。
+
+### 不兼容内容
+
+- 同一个 `instance_id` 的 `location_spec_infos` / `location_spec_groups` 变短。Manager 用首次注册的副本逐元素
+  比对（`MismatchFields`）且没有 spec 更新 API，拿旧 `instance_id` 注册新布局会被拒绝（`EC_DUPLICATE_ENTITY`，
+  `mismatched fields: [location_spec_infos, location_spec_groups]`），connector 打一条 ERROR 后该 instance 的
+  所有传输降级为 miss —— 升级后缓存会整体失效，直到换用新 id。
+- 旧 `instance_id` 下的 CacheLocation 仍按旧 spec 名建立，新注册不会读取它们；其中 peer rank 的 spec 位置从未
+  被写入过（正是本变更修掉的容量泄漏），随旧 id 一起退役。
+
+### 升级要求
+
+1. 升级 sglang connector 后，为每个 MLA instance 换用新的 `instance_id`（例如带上部署版本或时间戳）。
+2. 旧 `instance_id` 的元数据与 location 按既有流程清理或等待 GC 回收；不要复用旧 id，也不要让新旧布局共用一个 id。
+3. 非 MLA 模型的注册集合未变，可以沿用原 `instance_id`。
+4. 验收看"新 instance 的 Create 次数 / 容量增长斜率"，而不是"旧泄漏的地址是否立刻归零"。
+
+### 回滚说明
+
+回滚到旧 connector 同样需要换新 `instance_id`：旧布局的 spec 集合与当前注册不一致，沿用新 id 会被拒绝。

@@ -1,7 +1,9 @@
+import ctypes
 import dataclasses
 import functools
 import hashlib
 import logging
+import os
 import threading
 import uuid
 from collections import Counter
@@ -249,6 +251,38 @@ _DERIVED_GROUP_PREFIX = "F"
 # ``HiCacheKVCM._init_kvcm_client``).
 _DEFAULT_IOV_BLOCK_COUNT = 1024
 
+# The two storage types that are backed by the mempool SDK, as they appear in
+# the Manager's ``storage_configs`` JSON: ``StorageConfig::ToRapidWriter`` writes
+# ``ToString(DataStorageType)``, which spells DATA_STORAGE_TYPE_TAIR_MEMPOOL
+# "pace" and DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD "pace_ssd"
+# (``data_storage/storage_config.cc``).
+_TAIR_MEMPOOL_STORAGE_TYPES = ("pace", "pace_ssd")
+
+
+def _has_tair_mempool_storage(storage_configs: Any) -> Optional[bool]:
+    """Whether a Tair mempool backend is among these storage configs.
+
+    Reads the ``type`` of every entry of the Manager's ``storage_configs`` --
+    the same JSON this connector hands to the client as
+    ``InitParams.storage_configs``.  ``None`` means the list could not be read,
+    which is not the same as "there is none": the caller may not treat an
+    unreadable list as a consumer.
+    """
+    try:
+        configs = (
+            json.loads(storage_configs)
+            if isinstance(storage_configs, str)
+            else storage_configs
+        )
+        return any(
+            isinstance(config, dict)
+            and config.get("type") in _TAIR_MEMPOOL_STORAGE_TYPES
+            for config in configs
+        )
+    except Exception:
+        return None
+
+
 # A transport-ish failure that says the Manager was not able to judge the
 # registration: the leader election is still moving, and the client has already
 # retried.  Its own text is the only signal the Manager client forwards (the
@@ -318,9 +352,10 @@ class _RegisteredPool:
     spec: _PoolSpec
     # Bytes of one block, as frozen into the Manager registration.
     size: int
-    # The pool's location spec names, indexed by TP rank.
+    # The spec names this instance registers for the pool: rank 0 alone for a
+    # replicated pool on an MLA model (``row_of``), one per TP rank otherwise.
     names: tuple[str, ...]
-    # The rank whose spec this instance reads and writes for the pool.
+    # The index into ``names`` of the spec this instance reads and writes.
     own_rank: int
 
     @property
@@ -593,6 +628,10 @@ class HiCacheKVCM(HiCacheStorage):
         # SDK handles, created by _ensure_client() and dropped by close().
         self.transfer_client: Any = None
         self.init_params: Any = None
+        # The host pool shm segments handed to the client (each one keeps its
+        # mapping and allocator alive through ``owner``); held so that they
+        # outlive the client, which holds raw addresses into them.
+        self._host_pool_spans: List[Any] = []
 
         self.prefetch_pgs = []
         self.backup_pgs = []
@@ -1014,8 +1053,9 @@ class HiCacheKVCM(HiCacheStorage):
         # The layout this run wants to freeze, in one comparable string: the
         # Manager keeps the first registration of an instance_id forever (it only
         # accepts a repeat when every field matches, and there is no spec update
-        # API), so two different layouts under one id are a deployment error that
-        # neither side can repair at runtime.  The digest is for the logs only.
+        # API), so a different pool set -- or the shorter spec set an MLA model
+        # registers -- under one id needs a new instance_id.  The digest is for
+        # the logs only.
         self.spec_fingerprint = hashlib.sha256(
             json.dumps(
                 {
@@ -1117,10 +1157,13 @@ class HiCacheKVCM(HiCacheStorage):
         #   - self_location_spec_name: validated against location_spec_infos;
         #     also used to construct a unique Mooncake hostname when the
         #     Mooncake backend is present (format: {host}_{spec_name}_{rand}).
+        #   - regist_spans: every host pool shm segment, which the backend
+        #     registers for RDMA zero-copy in its own Init.
         self.init_params = kvcm_py_client.InitParams()
         self.init_params.role_type = kvcm_py_client.RoleType.WORKER
         self.init_params.self_location_spec_name = self.location_spec_name
         self.init_params.storage_configs = f"{self.storage_configs}"
+        self._attach_host_pool_spans()
 
         self.transfer_client = kvcm_py_client.TransferClient.Create(
             self.transfer_client_config, self.init_params
@@ -1138,6 +1181,130 @@ class HiCacheKVCM(HiCacheStorage):
                 "this instance's storage configuration and location specs",
                 reason="the KVCM transfer runtime could not be created",
             )
+
+    def _attach_host_pool_spans(self) -> None:
+        """Hand every host pool shm segment to the client before it is created.
+
+        The spans travel in ``InitParams.regist_spans``: the client passes them
+        to the backend, which registers each one for RDMA zero-copy inside its
+        own Init, so this connector never calls into the backend itself.
+
+        Every segment is checked first, because the backend refuses the whole
+        registration on the first one it cannot take and ``Create`` then returns
+        no client at all -- that would cost every pool its storage, not just the
+        broken segment.  Nothing here raises: a segment that fails a check is
+        counted and left out, and the rest is handed over as usual.
+
+        Nothing is handed over when the instance has no Tair mempool backend:
+        the spans are dead weight there, and the cost is not free -- the client
+        dups every fd and holds it until it is destroyed.
+        """
+        if self.extra_config.get("allocator") != "shm":
+            logger.warning(
+                'host pools are not shm-backed (no "allocator":"shm" in '
+                "--hicache-storage-backend-extra-config), so no host segment is "
+                "handed to the client and every transfer pays a bounce copy"
+            )
+            return
+        if not hasattr(kvcm_py_client, "RegistSpan") or not hasattr(
+            self.init_params, "regist_spans"
+        ):
+            logger.warning(
+                "kvcm_py_client takes no host memory spans (open-source build or "
+                "an older client), so no host segment is handed over and every "
+                "transfer pays a bounce copy"
+            )
+            return
+
+        spans: List[Any] = []
+        pools = segments = skipped_pools = skipped_segments = 0
+        skipped_no_backend = 0
+        # Only a Tair mempool backend consumes these spans; every other backend
+        # leaves them untouched, while the client still dups each fd and keeps
+        # it for the instance's lifetime (``SdkWrapper::Init`` prepares the
+        # registrations before it looks at the storage types).  So a deployment
+        # without one is handed nothing at all.
+        consumer = _has_tair_mempool_storage(self.storage_configs)
+        if consumer is None:
+            logger.warning(
+                "host zero-copy: the storage configs cannot be read, so no host "
+                "segment is handed over"
+            )
+        for pool_name, pool in self.registered_pools.items():
+            allocator = getattr(pool, "allocator", None)
+            # The allocator appends one segment per allocation; the pool's ``fd``
+            # and the allocator's ``mm`` are only the first of them.
+            fds = getattr(allocator, "fds", None)
+            mms = getattr(allocator, "mms", None)
+            if not fds or not mms:
+                skipped_pools += 1
+                logger.warning(
+                    "host zero-copy: pool %s has no shm segments (allocator %s); "
+                    "it is skipped and the other pools are unaffected",
+                    pool_name,
+                    type(allocator).__name__,
+                )
+                continue
+            pools += 1
+            for fd, mm in zip(fds, mms):
+                segments += 1
+                if consumer is not True:
+                    skipped_no_backend += 1
+                    continue
+                span, defect = self._host_segment_span(fd, mm, allocator)
+                if span is None:
+                    skipped_segments += 1
+                    logger.warning(
+                        "host zero-copy: pool %s fd=%s is not handed over (%s); "
+                        "its transfers fall back to a bounce copy",
+                        pool_name,
+                        fd,
+                        defect,
+                    )
+                    continue
+                spans.append(span)
+
+        self._host_pool_spans = spans
+        self.init_params.regist_spans = spans
+        logger.info(
+            "host zero-copy: pools=%d segments=%d handed=%d skipped_pools=%d "
+            "skipped_segments=%d skipped_no_backend=%d",
+            pools,
+            segments,
+            len(spans),
+            skipped_pools,
+            skipped_segments,
+            skipped_no_backend,
+        )
+
+    @staticmethod
+    def _host_segment_span(fd: Any, mm: Any, allocator: Any) -> tuple:
+        """The ``RegistSpan`` for one shm segment, or ``(None, why not)``.
+
+        The checks are the ones the backend's Init performs before it dups the
+        fd: an open fd whose size still matches the mapping, and an fd this
+        process can still dup.  ``owner`` keeps the mapping and the allocator
+        alive -- the backend reaches them by raw address while the client lives.
+        """
+        try:
+            # ``len(mm)`` is the page-aligned mapping, which is what the memfd
+            # was sized to -- not the tensor's nbytes.
+            size = len(mm)
+            base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+            if not isinstance(fd, int) or fd < 0:
+                return None, f"fd {fd!r} is not an open descriptor"
+            stat = os.fstat(fd)
+            if stat.st_size != size:
+                return None, f"the fd holds {stat.st_size} bytes, the mapping {size}"
+            os.close(os.dup(fd))
+            span = kvcm_py_client.RegistSpan()
+            span.fd = fd
+            span.size = size
+            span.base = base
+            span.owner = (mm, allocator)
+        except Exception as e:
+            return None, str(e)
+        return span, None
 
     def _resolve_pool_specs(self) -> Mapping[Any, _RegisteredPool]:
         """Resolve the spec rows against the pools this instance registered.
@@ -1175,7 +1342,11 @@ class HiCacheKVCM(HiCacheStorage):
         ]
 
         def names_of(spec: _PoolSpec) -> set:
-            """Every spec name the row can emit, whichever anchor naming wins."""
+            """Every spec name the row claims, registered or not.
+
+            A superset of ``names``, whichever anchor naming wins: rank-agnostic
+            on purpose, so the collision check does not depend on the model kind.
+            """
             return {
                 spec.spec_name(rank, hybrid)
                 for hybrid in (False, True)
@@ -1215,17 +1386,17 @@ class HiCacheKVCM(HiCacheStorage):
         hybrid_stack = bool(sidecars)
 
         def row_of(spec: _PoolSpec, size: int) -> _RegisteredPool:
+            # An MLA model reads and writes a replicated pool on rank 0 alone, so a
+            # peer's spec is only a location nobody writes that still reserves
+            # capacity.  A sharded pool keeps every rank's spec: which ranks sglang
+            # hands it to is version-dependent and must not change a registration.
+            rank_zero_only = spec.shared_across_ranks and self.is_mla_model
+            ranks = (0,) if rank_zero_only else range(self.tp_size)
             return _RegisteredPool(
                 spec=spec,
                 size=size,
-                names=tuple(
-                    spec.spec_name(rank, hybrid_stack) for rank in range(self.tp_size)
-                ),
-                own_rank=(
-                    0
-                    if spec.shared_across_ranks and self.is_mla_model
-                    else self.tp_rank
-                ),
+                names=tuple(spec.spec_name(rank, hybrid_stack) for rank in ranks),
+                own_rank=0 if rank_zero_only else self.tp_rank,
             )
 
         resolved = {}
@@ -2500,6 +2671,10 @@ class HiCacheKVCM(HiCacheStorage):
         wrapper.  The Manager HTTP client (its session and leader-refresh
         thread) and the gloo group created for the TP collectives are per
         instance resources too, so they are released explicitly.
+
+        The host pool spans go after the client: the backend owns their
+        registration and holds raw addresses into them for the client's
+        lifetime, so the mappings may only be dropped once it is gone.
         """
         with self._init_lock:
             if self._closed:
@@ -2507,6 +2682,7 @@ class HiCacheKVCM(HiCacheStorage):
             self._closed = True
             self.transfer_client = None
             self.init_params = None
+            self._host_pool_spans = []
             self._manager_client.close()
 
             group = getattr(self, "storage_tp_group", None)
