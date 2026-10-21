@@ -229,6 +229,14 @@ class KvCacheManagerClient:
             )
             return False
 
+        try:
+            self._check_response(
+                "/api/getClusterInfo", resp, data, check_business_status=False
+            )
+        except KvCacheManagerProtocolError as e:
+            logger.warning("Invalid leader discovery response from %s: %s", url, e)
+            return False
+
         if self._get_status_code(data) != "OK":
             msg = data.get("header", {}).get("status", {}).get("message", "unknown")
             logger.warning("Leader discovery from %s returned error: %s", url, msg)
@@ -236,7 +244,7 @@ class KvCacheManagerClient:
 
         leader_ep = data.get("leader_endpoint")
         if (
-            not leader_ep
+            not isinstance(leader_ep, dict)
             or not leader_ep.get("host")
             or not leader_ep.get("meta_http_port")
         ):
@@ -335,6 +343,14 @@ class KvCacheManagerClient:
 
         return response
 
+    @staticmethod
+    def _check_http_status(endpoint: str, response: requests.Response) -> None:
+        if response.status_code != 200:
+            raise KvCacheManagerHTTPError(
+                f"Request to {endpoint} failed with status code {response.status_code}",
+                response=response,
+            )
+
     def _check_response(
         self,
         endpoint: str,
@@ -343,11 +359,7 @@ class KvCacheManagerClient:
         check_business_status: bool = True,
     ) -> None:
         """Validate transport/envelope and optionally the Manager status."""
-        if response.status_code != 200:
-            raise KvCacheManagerHTTPError(
-                f"Request to {endpoint} failed with status code {response.status_code}",
-                response=response,
-            )
+        self._check_http_status(endpoint, response)
 
         if not isinstance(response_data, dict):
             raise KvCacheManagerProtocolError(
@@ -394,7 +406,14 @@ class KvCacheManagerClient:
                     self._refresh_event.set()
                 raise
 
-            response_data = response.json()
+            self._check_http_status(endpoint, response)
+            try:
+                response_data = response.json()
+            except ValueError as e:
+                raise KvCacheManagerProtocolError(
+                    f"Response from {endpoint} is not valid JSON",
+                    response=response,
+                ) from e
 
             # Validate transport and the common envelope before inspecting the
             # status for leader routing. This remains mandatory even when callers
