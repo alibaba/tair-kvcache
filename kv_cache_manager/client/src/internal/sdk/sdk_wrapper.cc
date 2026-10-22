@@ -9,6 +9,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
+#include "kv_cache_manager/client/src/internal/util/host_registration.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 
@@ -393,15 +394,13 @@ ClientErrorCode SdkWrapper::UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBac
 
 ClientErrorCode SdkWrapper::PrepareSharedMemoryRegistration(const SharedMemoryRegistration &shared_memory_registration,
                                                             SharedMemoryRegistration &prepared_registration) {
-    const bool disabled = shared_memory_registration.fd == -1 && shared_memory_registration.base == nullptr &&
-                          shared_memory_registration.size == 0;
-    if (disabled) {
+    const HostRegistrationState state = ClassifyHostRegistration(shared_memory_registration);
+    if (state == HostRegistrationState::Disabled) {
         prepared_registration = shared_memory_registration;
         return ER_OK;
     }
 
-    if (shared_memory_registration.fd < 0 || shared_memory_registration.base == nullptr ||
-        shared_memory_registration.size == 0) {
+    if (state == HostRegistrationState::Partial) {
         KVCM_LOG_WARN("shared memory registration must provide fd, base and size together");
         return ER_INVALID_PARAMS;
     }
