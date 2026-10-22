@@ -140,9 +140,9 @@ ReportEvent RT；worker 并非越多越好。
 3. 重试依赖保留为每个稳定 block/location 的有序 event 引用。只有已经 materialize 且参与最终 ADD 或
    DELETE phase 的事件先接收该 phase 的写错误，随后再按原有规则闭包传播。因此 last-operation-wins、
    admission failure、两 phase 不同错误以及逐 item 返回语义均未因扁平化改变；
-4. 协议 URI 在入口完整校验时保存已经解析的 `DataStorageUri`，追加 `s_version` 时复用，不再为同一 URI
+4. 协议 URI 在入口完整校验时保存已经解析的 `DataStorageUri`，追加 `s_v` 时复用，不再为同一 URI
    重复 parse；BatchMerge 的版本一致性校验也复用本轮已解析对象，同时仍在 API 边界保留 raw 参数计数，
-   duplicate `s_version` 仍会 fail closed；
+   duplicate `s_v` 仍会 fail closed；
 5. `BatchMergeLocationSpecs` 直接让 caller-owned task 与目标 location id 对齐，不再复制 location id 和
    整组 spec/URI。existing Location 仍做一次必要的 copy-on-write，之后在其小 vector 内按 name 原地
    覆盖、兼容 legacy 重名并恢复字典序；不再构造每 key 的 ordered map 和第二份完整 spec vector；
@@ -453,7 +453,7 @@ limit 主要改善写写公平性，必须用混合写 p99 验证，不能把它
 
 1. `IsEventReportLocationReadable` 对每个 spec 构造 `DataStorageUri`。解析会复制 URI 的多个 substring，并为
    每个 query param 分配 `std::map` node；随后 `GetParam` 和 `SnapshotUriInfo` 又复制 32-byte token。查询
-   实际只需要确认 URI 有合法 scheme、`s_version` 不重复且为 32 位十六进制，并与 request snapshot 中的
+   实际只需要确认 URI 有合法 scheme、`s_v` 不重复且为 32 位十六进制，并与 request snapshot 中的
    committed token 比较。因此改为一次 `string_view` 扫描，malformed/重复 token 仍然 fail closed；
 2. `MetaLocalBackend::GetLocationValues` 对每个命中 key 调用 revisit histogram `Observe`。默认 13 个 bucket
    下，一次 10k-key 查询会产生十万级共享 counter 原子 RMW；4 个 query worker 会争抢同一组 cache line。
@@ -677,7 +677,7 @@ before/after 使用相同进程形态，因此 allocator 条件一致。
 3. `DeltaMutationGuard` 缓存并返回 request-owned lease，后续事件只读其 snapshot token/generation，不再为
    每个 event 复制 32-byte token。lease 仍由 guard 析构时成对结束，generation-pinned lifecycle fence
    窗口不变；
-4. 入口完整解析 URI 时同时保存 `size` 和已经验证的 parsed URI；追加 `s_version` 使用
+4. 入口完整解析 URI 时同时保存 `size` 和已经验证的 parsed URI；追加 `s_v` 使用
    `ToUriStringWithExtraParam` 直接生成与 `SetParam + ToUriString` 完全相同的 canonical sorted URI，不再
    clone/mutate 参数 map 或使用 `ostringstream`。`StandardUri` 的 query 解析改用 `string_view`，host/port
    也不再先复制一份中间字符串；
@@ -1144,7 +1144,7 @@ metadata lock、Redis/cached backend 或查询语义。
 1. 常见单 spec BLOCK_ADD/SNAPSHOT 的校验结果和 `MergeLocationSpecsTask` 使用 inline optional；只有第二个 spec
    到来时才提升为预留好容量的 vector。纯 ADD 请求也不再创建每 block 的一元素 task vector、空 delete task
    reserve，最终用 flat task vector + offsets 调用 MetaSearcher；通用嵌套接口和多 spec 语义保持不变；
-2. canonical URI 使用 allocation-free string_view 扫描，一次得到 `size` 和 `s_version` 的有序插入位置，再直接
+2. canonical URI 使用 allocation-free string_view 扫描，一次得到 `size` 和 `s_v` 的有序插入位置，再直接
    生成最终 URI。只有协议、正数 canonical port、显式 `key=value`、严格递增且无重复参数等条件全部满足时
    才走快路；合法但非 canonical 的历史输入继续回退完整 StandardUri，非法 port、重复内部参数和溢出仍失败；
 3. 同一请求的 snapshot token 只做一次严格 ASCII `[0-9A-Fa-f]` 校验。每个已经独立验证过的 spec 随后使用
@@ -1812,7 +1812,7 @@ GPU-only 测试按预期跳过。上述 mixed 结果也说明渐进 query 没有
    只有在所有保留旧 spec 也验证通过时才恢复。反序列化/恢复值始终没有证明，必须重新检查；
 3. 特别覆盖“恢复值含坏端口，随后 merge 一个不同名字的正常 spec”：坏 spec 仍被保留时不能错误恢复证明，查询
    继续 fail-closed；只有把最后一个坏 spec 按名替换掉后，最终 vector 才重新获得证明。这样 query 只对可信的
-   pure-local ReportEvent 值跳过重复 authority/port 扫描，scheme/query 位置和每次请求的 `s_version` generation
+   pure-local ReportEvent 值跳过重复 authority/port 扫描，scheme/query 位置和每次请求的 `s_v` generation
    仍逐 spec 检查；
 4. ordinary 与 Mamba visitor 在一个已经读取的 callback range 内，一旦所有候选 host 的单调 prefix stop 都不晚于
    当前 key，就立即停止剩余 location projection。它不取消仍可能决定更短 prefix 的早期 range，也不屏蔽仍在任一

@@ -1403,7 +1403,7 @@ EventReportBackend::ProbeLocationsForMaintenance(const std::vector<MaintenanceLo
                     malformed = true;
                     continue;
                 }
-                // A structurally valid URI without s_version is legacy
+                // A structurally valid URI without s_v is legacy
                 // metadata. It is stale only when no sibling spec carries the
                 // committed or in-flight generation.
                 if (version == state.committed || (!state.in_flight.empty() && version == state.in_flight)) {

@@ -501,19 +501,19 @@ class EventReportFunctionalTest(unittest.TestCase):
             actual_params = parse_qsl(actual.query, keep_blank_values=True)
             expected_params = parse_qsl(expected.query, keep_blank_values=True)
             versions = [
-                value for key, value in actual_params if key == "s_version"
+                value for key, value in actual_params if key == "s_v"
             ]
             self.assertEqual(
                 len(versions),
                 1,
-                f"Expected exactly one s_version in URI: {actual_uri}",
+                f"Expected exactly one s_v in URI: {actual_uri}",
             )
             self.assertRegex(versions[0], re.compile(r"^[0-9a-fA-F]{32}$"))
             self.assertEqual(
                 sorted(
                     (key, value)
                     for key, value in actual_params
-                    if key != "s_version"
+                    if key != "s_v"
                 ),
                 sorted(expected_params),
                 f"KVCM changed caller URI parameters: {actual_uri}",

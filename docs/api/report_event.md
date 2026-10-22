@@ -13,7 +13,7 @@
 2. 只支持实时事件的引擎可以一直使用 `ADD/DELETE`，永远不发 snapshot。
 3. 支持全量的引擎应把 snapshot 当作低频纠偏手段，不能分页，也不应高频发送。
 4. 一次 snapshot 是一个 reporter 在一个 storage type 下、跨全部 medium 的完整状态。
-5. 客户端不得在 URI 中填写 `s_version`；KVCM 会自动追加。
+5. 客户端不得在 URI 中填写 `s_v`；KVCM 会自动追加。
 6. `committed_snapshot_version` 是 32 位十六进制 opaque generation，不能按大小比较；成功完整
    snapshot 后它会成为该 reporter 的严格查询栅栏。
 7. `snapshot_required=true` 表示请求到达时当前进程还没有该 reporter generation；创建 generation
@@ -271,7 +271,7 @@ InstanceGroup 必须把对应 EventReport storage 配置在
 - `specs` 非空；
 - 每个 `spec.name` 非空、已在 `RegisterInstance.location_spec_infos` 中注册，且同一事件内不能重复；
 - 每个 URI 必须合法；
-- 客户端 URI 不能带 `s_version`；
+- 客户端 URI 不能带 `s_v`；
 - 旧字段 `block_add.uri` 已废弃，只有 `specs` 生效。
 
 行为：
@@ -280,7 +280,7 @@ InstanceGroup 必须把对应 EventReport storage 配置在
 - 本次未涉及的其他 spec 会保留；
 - 同一逻辑 spec 再次 ADD 会覆盖旧 URI；
 - 首条合法 ADD 可以创建 generation；
-- KVCM 会给每个 URI 追加一个 `s_version`。
+- KVCM 会给每个 URI 追加一个 `s_v`。
 
 ### 5.4 EVENT_BLOCK_DELETE
 
@@ -573,13 +573,13 @@ Event-report location 只有同时满足以下条件才可参与业务查询：
 3. reporter 当前 available；
 4. location 至少包含一个 spec；
 5. 每个 URI 语法合法；
-6. URI 如果带 `s_version`，只能出现一次且必须是 32 位十六进制文本。
+6. URI 如果带 `s_v`，只能出现一次且必须是 32 位十六进制文本。
 
 version 可见性分为两种状态：
 
 - **strict**：一次完整 snapshot 成功后启用。location 必须至少包含一个当前
   `committed_snapshot_version`；完全由正在写入的 snapshot candidate、旧 generation
-  或无 `s_version` 的 legacy spec 组成的 location 不可见；
+  或无 `s_v` 的 legacy spec 组成的 location 不可见；
 - **soft**：KVCM 重启后、尚未成功完成完整 snapshot 时，或一次已经准入的 snapshot
   写入失败后启用。此时接受全部格式合法的历史 generation 和 legacy URI，允许少量陈旧
   candidate，由后续增量或完整 snapshot 自愈。
@@ -588,7 +588,7 @@ version 可见性分为两种状态：
 committed generation，location 仍可见，以免按 spec 增量刷新时误隐藏有效数据；candidate
 只有成功 commit 后才成为新的 committed。若 snapshot 失败则回到 soft，格式合法的 candidate
 和历史 generation 可重新参与查询。一个 location 中只要有任一 malformed spec，整个
-location fail closed。查询不比较 `s_version` 的大小。
+location fail closed。查询不比较 `s_v` 的大小。
 
 `EventReportBackend::MightExist` 是底层无 instance/location-id 上下文的保守接口，只能对它
 能够反查 owner 的当前 generation 做判断。上述三个公共查询入口使用带 instance 和完整
@@ -610,7 +610,7 @@ HTTP 接口为 `POST /api/getCacheLocation`：
 }
 ```
 
-返回的 EventReport URI 会包含 KVCM 追加的 `s_version`。调用方应把 URI 交给相应 connector
+返回的 EventReport URI 会包含 KVCM 追加的 `s_v`。调用方应把 URI 交给相应 connector
 读取；真实读取失败按普通 cache miss 处理，不能把 metadata 命中当作数据一定存在。
 
 当多个 medium 或多个 backend 返回相同 spec name 时，普通查询可能按选择策略合并/去重。
@@ -765,7 +765,7 @@ inflight count/age 指标观察扫描成本与积压。若后续形成更短的�
 - [ ] reporter 自身启动时建议发送 REGISTER；不依赖 KVCM 重启后再次 REGISTER
 - [ ] 正确区分“进程重启后的懒恢复”和“HOST_DOWN/grace tombstone 后显式 REGISTER”
 - [ ] 实时-only 模式不会因 `snapshot_required=true` 停止发送增量
-- [ ] 客户端 URI 不包含 `s_version`
+- [ ] 客户端 URI 不包含 `s_v`
 - [ ] `block_key + medium + spec.name` 在发送前已去重
 - [ ] snapshot 合并同一 block 的全部 specs，且包含全部 medium
 - [ ] snapshot 不分页、不与 ADD/DELETE/HOST_DOWN 混发
@@ -838,7 +838,7 @@ heartbeat/grace 短时序测试使用独立 storage/instance group，不得缩�
 | D-09 | 同请求 ADD/DELETE 最后操作获胜 | `TestReportEventSameRequestDeltaOrderUsesLastOperationPerSpec`；snapshot 集成 `test_25_*` |
 | D-10 | 并发写不同 spec 不互相丢失 | snapshot 集成 `test_24_*` |
 | D-11 | 重复物理逻辑身份是 set 而非 refcount | `TestReportEventRepeatedPhysicalDeltaUsesSetNotReferenceCountSemantics` |
-| D-12 | KVCM 只追加一个合法 s_version，不改变客户端 URI 其他部分 | 基础集成 `_assert_profile_specs_in_locations`；snapshot 集成 `_assert_reporter_scope` |
+| D-12 | KVCM 只追加一个合法 s_v，不改变客户端 URI 其他部分 | 基础集成 `_assert_profile_specs_in_locations`；snapshot 集成 `_assert_reporter_scope` |
 | D-13 | 第一条 delta 已创建 generation、metadata 写失败时准确报错，重试复用 generation | `TestReportEventFirstDeltaMetadataFailureReportsFailureAndReusesGeneration` |
 | D-14 | 同一 spec 的折叠事件共享最终 metadata 写入失败结果 | `TestReportEventFoldedDeltaEventsShareFinalWriteFailure` |
 | D-15 | 大于 32 KiB 的部分失败批次保持逐项结果与输入索引严格对齐，只重试失败项后复用 generation 并最终收敛 | snapshot 集成 `test_34_large_partial_batch_preserves_item_alignment_and_retry` |
@@ -856,7 +856,7 @@ heartbeat/grace 短时序测试使用独立 storage/instance group，不得缩�
 | S-12 | snapshot cleanup 只删 metadata，不调用外部 URI backend | `TestMetadataOnlyLocationDeleteSkipsPhysicalBackend`、`TestCleanupLocationsByPredicateSubmitsExactObservedValue` |
 | S-13 | unavailable reporter 可完成 snapshot，但 HEARTBEAT 恢复前查询保持隐藏 | `TestReportEventSnapshotWhileUnavailableCommitsButStaysHiddenUntilHeartbeat` |
 | Q-01 | soft 接受合法历史/legacy；strict 只接受至少含 committed spec 的 location，in-flight candidate 在 commit 前不单独可见 | `TestGetCheckLocDataExistFuncFencesVersionsAfterSuccessfulSnapshot`、`TestGetCheckLocDataExistFuncEventReportUriValidationMatrix` |
-| Q-02 | 空 spec、坏 URI、重复/畸形 s_version 整条 location fail closed | `TestGetCheckLocDataExistFuncEventReportUriValidationMatrix` |
+| Q-02 | 空 spec、坏 URI、重复/畸形 s_v 整条 location fail closed | `TestGetCheckLocDataExistFuncEventReportUriValidationMatrix` |
 | Q-03 | malformed location id、错误 storage type、未知 host 不可见 | 同上；`TestGetCheckLocDataExistFunc_MissingEventReportBackendFailsClosed` |
 | Q-04 | 节点 available/unavailable/unregistered 控制真实查询入口 | `TestGetCacheLocationEnforcesReporterLifecycleAndBatchOrdering`；snapshot 集成 `test_16a/16b` |
 | Q-05 | GetHostCacheState 的 prefix、medium、默认 query type | `TestGetHostCacheState`、`TestGetHostCacheStatePrefixMatchWithMamba`；snapshot 集成 `test_16` |
@@ -888,9 +888,9 @@ heartbeat/grace 短时序测试使用独立 storage/instance group，不得缩�
 | V-01 | reporter host、ADD/DELETE/SNAPSHOT medium 含 `#` 时拒绝且无写入副作用 | `RegisterNodeWithMediums`、`TestReportEventRejectsInvalidRequestsAndMapsItemErrors`；snapshot 集成 `test_19_*` |
 | V-02 | instance/host/storage type/instance backend 的公共字段校验 | `TestReportEventRejectsInvalidRequestsAndMapsItemErrors`；snapshot 集成 `test_14_*` |
 | V-03 | event_type 与 oneof payload 缺失/错配时该 item fail closed；同批其他合法 mutation 可独立懒初始化并生效 | `TestReportEventRejectsMismatchedPayloadsWithoutSideEffects`；snapshot 集成 `test_13/33` |
-| V-04 | ADD 的 key、medium、spec 数量/name/URI/s_version 完整校验且无副作用 | `TestReportEventMutationValidationMatrixHasNoSideEffects`；snapshot 集成 `test_19/33` |
+| V-04 | ADD 的 key、medium、spec 数量/name/URI/s_v 完整校验且无副作用 | `TestReportEventMutationValidationMatrixHasNoSideEffects`；snapshot 集成 `test_19/33` |
 | V-05 | DELETE 的 key、medium、spec_names 数量/空值/重复完整校验且无副作用 | `TestReportEventMutationValidationMatrixHasNoSideEffects`；snapshot 集成 `test_19/33` |
-| V-06 | SNAPSHOT 的 key、medium、spec、URI、s_version、重复 block 完整校验且无副作用 | `TestReportEventMutationValidationMatrixHasNoSideEffects`；snapshot 集成 `test_19/27/33` |
+| V-06 | SNAPSHOT 的 key、medium、spec、URI、s_v、重复 block 完整校验且无副作用 | `TestReportEventMutationValidationMatrixHasNoSideEffects`；snapshot 集成 `test_19/27/33` |
 | V-07 | snapshot+delta、双 snapshot、HOST_DOWN 混发均在任何副作用前整批拒绝 | `TestReportEventRejectsRequestShapeBeforeAnySideEffect`；snapshot 集成 `test_17/33` |
 | CFG-01 | snapshot interval/drain timeout 默认值、正数校验、负数拒绝、JSON/proto round trip，并由 backend 加载 | `TestEventReportStorageSpecSnapshotSettingsDefaultAndValidation`、`TestEventReportStorageSpecJsonRoundTripIncludesSnapshotSettings`、`EventReportStorageSpecProtoRoundTripPreservesSnapshotSettings`、`BasicAccessors` |
 | PERF-01 | 100 线程共 1 万 ADD、50 线程共 5000 混合批次均无错误 | `EventReportBenchTest.test_17/18` |

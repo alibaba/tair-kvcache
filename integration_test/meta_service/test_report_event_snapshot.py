@@ -249,7 +249,7 @@ def _uri_identity_without_snapshot_version(uri):
     params = tuple(
         (key, value)
         for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-        if key != "s_version"
+        if key != "s_v"
     )
     return parsed.scheme, parsed.netloc, parsed.path, params
 
@@ -302,7 +302,7 @@ def _query_block_specs_by_backend(
 def _assert_reporter_scope(
     test_case, actual_uri, reported_uri, instance_id, host, medium, version=None
 ):
-    """Assert the reporter URI is preserved except for the opaque s_version."""
+    """Assert the reporter URI is preserved except for the opaque s_v."""
     actual = urlsplit(actual_uri)
     reported = urlsplit(reported_uri)
     test_case.assertEqual(actual.scheme, reported.scheme)
@@ -310,10 +310,10 @@ def _assert_reporter_scope(
     test_case.assertEqual(actual.path, reported.path)
     actual_params = parse_qsl(actual.query, keep_blank_values=True)
     reported_params = parse_qsl(reported.query, keep_blank_values=True)
-    visible_params = [(k, v) for k, v in actual_params if k != "s_version"]
+    visible_params = [(k, v) for k, v in actual_params if k != "s_v"]
     test_case.assertEqual(visible_params, reported_params)
     test_case.assertFalse(any(k.startswith("kvcm_") for k, _ in actual_params))
-    versions = [v for k, v in actual_params if k == "s_version"]
+    versions = [v for k, v in actual_params if k == "s_v"]
     if version is None:
         test_case.assertEqual(len(versions), 1)
         test_case.assertEqual(len(versions[0]), 32)
@@ -330,9 +330,9 @@ def _snapshot_version_from_uri(test_case, uri):
         for key, value in parse_qsl(
             urlsplit(uri).query, keep_blank_values=True
         )
-        if key == "s_version"
+        if key == "s_v"
     ]
-    test_case.assertEqual(len(values), 1, "URI must contain one s_version")
+    test_case.assertEqual(len(values), 1, "URI must contain one s_v")
     version = values[0]
     test_case.assertEqual(len(version), 32)
     test_case.assertTrue(all(c in "0123456789abcdef" for c in version))
@@ -1944,7 +1944,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
         )
         bad_uri = _build_event_report_uri(
-            bad_host, "mem", {"s_version": "client_value"}
+            bad_host, "mem", {"s_v": "client_value"}
         )
         malformed = self.client.report_event(
             _make_request(
@@ -1955,7 +1955,7 @@ class EventReportFunctionalTest(unittest.TestCase):
                     "medium": "mem",
                     "specs": _make_single_spec("linear_0", bad_uri),
                 }])],
-                trace_id="t19_reserved_s_version",
+                trace_id="t19_reserved_s_v",
             ),
             check_ok=False,
         )
@@ -3896,7 +3896,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         invalid_add_key = block_key + 1
         client_version_uri = (
             _build_event_report_uri(host, "mem")
-            + "?s_version="
+            + "?s_v="
             + "a" * 32
         )
         invalid_add = self.client.report_event(

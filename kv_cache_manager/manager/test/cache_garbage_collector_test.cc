@@ -641,7 +641,7 @@ TEST_F(CacheGarbageCollectorTest, SharedScanDeletesOnlyStaleSnapshotAndMalformed
         SnapshotUriUtils::AddSnapshotVersionToUri("event_report://event_report_l1p5/old", old_version, old_uri));
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
         "event_report://event_report_l1p5/current", committed_version, committed_uri));
-    const std::string malformed_uri = "event_report://event_report_l1p5/malformed?s_version=first&s_version=second";
+    const std::string malformed_uri = "event_report://event_report_l1p5/malformed?s_v=first&s_v=second";
     const std::string location_id = backend->BuildLocationId("hbm", reporter.host_ip_port);
 
     CacheLocationMap old_locations;

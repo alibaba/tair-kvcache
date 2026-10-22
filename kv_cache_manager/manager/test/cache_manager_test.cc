@@ -3086,7 +3086,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_MissingEventReportBackendF
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     loc.set_location_specs(
-        {LocationSpec("tp0", "event_report://cache-node/mem?s_version=0123456789abcdef0123456789abcdef")});
+        {LocationSpec("tp0", "event_report://cache-node/mem?s_v=0123456789abcdef0123456789abcdef")});
 
     EXPECT_FALSE(func(loc));
 }
@@ -3137,7 +3137,7 @@ TEST_F(CacheManagerTest, TestReportEventDeltaAlreadyAdmittedThenSnapshotWins) {
     const auto uris = QueryEventReportUris({key});
     ASSERT_EQ(1u, uris.size());
     EXPECT_NE(std::string::npos, uris[0].find("source=snapshot_after_delta"));
-    EXPECT_NE(std::string::npos, uris[0].find("s_version=" + snapshot_token));
+    EXPECT_NE(std::string::npos, uris[0].find("s_v=" + snapshot_token));
 }
 
 TEST_F(CacheManagerTest, TestReportEventSnapshotGateThenDeltaInheritsNewTokenAndWins) {
@@ -3185,7 +3185,7 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotGateThenDeltaInheritsNewTokenAnd
     const auto uris = QueryEventReportUris({key});
     ASSERT_EQ(1u, uris.size());
     EXPECT_NE(std::string::npos, uris[0].find("source=delta_after_snapshot_gate"));
-    EXPECT_NE(std::string::npos, uris[0].find("s_version=" + new_token));
+    EXPECT_NE(std::string::npos, uris[0].find("s_v=" + new_token));
 }
 
 TEST_F(CacheManagerTest, TestReportEventDeltaGateTimeoutReturnsSnapshotInProgressAndCanRetry) {
@@ -3239,7 +3239,7 @@ TEST_F(CacheManagerTest, TestReportEventDeltaGateTimeoutReturnsSnapshotInProgres
     const auto uris = QueryEventReportUris({delta_key});
     ASSERT_EQ(1u, uris.size());
     EXPECT_NE(std::string::npos, uris.front().find("source=retried_delta"));
-    EXPECT_NE(std::string::npos, uris.front().find("s_version=" + snapshot_token));
+    EXPECT_NE(std::string::npos, uris.front().find("s_v=" + snapshot_token));
 }
 
 TEST_F(CacheManagerTest, TestHostDownCancelsSnapshotAlreadyWritingMetadata) {
@@ -3537,7 +3537,7 @@ TEST_F(CacheManagerTest, TestReportEventPartialSnapshotFailureKeepsCacheReadable
     ASSERT_EQ(2u, visible_after_retry.size());
     std::set<std::string> retry_sources;
     for (const auto &uri : visible_after_retry) {
-        EXPECT_NE(std::string::npos, uri.find("s_version=" + retry_token));
+        EXPECT_NE(std::string::npos, uri.find("s_v=" + retry_token));
         if (uri.find("source=retry_a") != std::string::npos) {
             retry_sources.insert("retry_a");
         }
@@ -3572,7 +3572,7 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotCommitsWithoutWaitingForPersiste
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=async_snapshot"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + committed));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + committed));
 }
 
 TEST_F(CacheManagerTest, TestReportEventSameRequestDeltaOrderUsesLastOperationPerSpec) {
@@ -3624,7 +3624,7 @@ TEST_F(CacheManagerTest, TestReportEventSameRequestDeltaOrderUsesLastOperationPe
     visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=final_add"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + token));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + token));
 }
 
 TEST_F(CacheManagerTest, TestReportEventFlatFoldMatchesReferenceAcrossBlocksMediaAndSpecs) {
@@ -4231,7 +4231,7 @@ TEST_F(CacheManagerTest, TestReportEventLazilyRestoresReporterWithoutRegisterOrS
     auto visible = QueryEventReportUris({9427});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=first_delta"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + first_delta.committed_snapshot_version()));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + first_delta.committed_snapshot_version()));
 
     const auto [first_snapshot_ec, first_snapshot] =
         CallReportEvent(MakeSnapshotRequest(snapshot_host, {}), "snapshot_without_register");
@@ -4381,7 +4381,7 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotWhileUnavailableCommitsButStaysH
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=snapshot_while_unavailable"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + snapshot_generation));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + snapshot_generation));
 }
 
 TEST_F(CacheManagerTest, TestReportEventHeartbeatRecoveryCarriesSameRequestMutationsIntoNewLifecycle) {
@@ -4489,7 +4489,7 @@ TEST_F(CacheManagerTest, TestReportEventRegisterThenFirstDeltaInSameRequest) {
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=same_request_first_delta"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + response.committed_snapshot_version()));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + response.committed_snapshot_version()));
 }
 
 TEST_F(CacheManagerTest, TestReportEventDeltaBeforeExplicitRegisterSucceedsInSameRequest) {
@@ -4517,7 +4517,7 @@ TEST_F(CacheManagerTest, TestReportEventDeltaBeforeExplicitRegisterSucceedsInSam
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=delta_before_register"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + response.committed_snapshot_version()));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + response.committed_snapshot_version()));
 }
 
 TEST_F(CacheManagerTest, TestReportEventAdmissionFailurePropagatesToLaterRelatedMutation) {
@@ -4771,7 +4771,7 @@ TEST_F(CacheManagerTest, TestReportEventInvalidFirstDeltaDoesNotCreateVersionBut
     const auto visible = QueryEventReportUris({valid_key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=valid_in_partial_first_delta"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + partial_response.committed_snapshot_version()));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + partial_response.committed_snapshot_version()));
 }
 
 TEST_F(CacheManagerTest, TestReportEventFirstDeleteWithoutSnapshotCreatesReusableVersion) {
@@ -4803,7 +4803,7 @@ TEST_F(CacheManagerTest, TestReportEventFirstDeleteWithoutSnapshotCreatesReusabl
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=after_first_delete"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + version));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + version));
 }
 
 TEST_F(CacheManagerTest, TestReportEventMissingBlockDeletesRemainSuccessfulAsOneBatch) {
@@ -4882,8 +4882,8 @@ TEST_F(CacheManagerTest, TestReportEventRestartKeepsHistoricalCacheAndAcceptsDel
     const auto [before_ec, before] =
         CallReportEvent(MakeAddRequest(host, historical_key, "before_restart"), "delta_before_restart");
     ASSERT_EQ(EC_OK, before_ec);
-    const std::string previous_version = before.committed_snapshot_version();
-    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(previous_version));
+    const std::string previous_v = before.committed_snapshot_version();
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(previous_v));
     ASSERT_EQ(1u, QueryEventReportUris({historical_key}).size());
 
     const StorageConfig storage_config = event_backend->GetStorageConfig();
@@ -4904,7 +4904,7 @@ TEST_F(CacheManagerTest, TestReportEventRestartKeepsHistoricalCacheAndAcceptsDel
     EXPECT_EQ(proto::meta::OK, delta.header().status().code());
     EXPECT_TRUE(delta.snapshot_required());
     ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(delta.committed_snapshot_version()));
-    EXPECT_NE(previous_version, delta.committed_snapshot_version());
+    EXPECT_NE(previous_v, delta.committed_snapshot_version());
     EXPECT_TRUE(event_backend->IsNodeRegistered("test_instance", host));
     EXPECT_TRUE(event_backend->IsNodeAvailable("test_instance", host));
 
@@ -4984,7 +4984,7 @@ TEST_F(CacheManagerTest, TestReportEventRejectsCanonicalDuplicateSnapshotKeysBut
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(2u, visible.size());
     for (const auto &uri : visible) {
-        EXPECT_NE(std::string::npos, uri.find("s_version=" + token));
+        EXPECT_NE(std::string::npos, uri.find("s_v=" + token));
     }
 }
 
@@ -5033,7 +5033,7 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotReplacesCompleteSpecSetPerBlock)
     for (const auto &uri : visible) {
         EXPECT_EQ(std::string::npos, uri.find("source=old_tp0"));
         EXPECT_EQ(std::string::npos, uri.find("source=old_tp1"));
-        EXPECT_NE(std::string::npos, uri.find("s_version=" + replacement_token));
+        EXPECT_NE(std::string::npos, uri.find("s_v=" + replacement_token));
         found_tp1 = found_tp1 || uri.find("source=new_tp1") != std::string::npos;
         found_tp2 = found_tp2 || uri.find("source=new_tp2") != std::string::npos;
     }
@@ -5077,7 +5077,7 @@ TEST_F(CacheManagerTest, TestReportEventRejectsDuplicatePhysicalSnapshotItemsWit
     const auto visible_after_rejection = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible_after_rejection.size());
     EXPECT_NE(std::string::npos, visible_after_rejection.front().find("source=baseline"));
-    EXPECT_NE(std::string::npos, visible_after_rejection.front().find("s_version=" + baseline_token));
+    EXPECT_NE(std::string::npos, visible_after_rejection.front().find("s_v=" + baseline_token));
     EXPECT_EQ(1u, QueryRawEventReportUris(key).size());
 
     const auto [retry_ec, retry] =
@@ -5127,7 +5127,7 @@ TEST_F(CacheManagerTest, TestReportEventRejectsDuplicateSpecNamesWithinSnapshotB
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=baseline"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + baseline_token));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + baseline_token));
 }
 
 TEST_F(CacheManagerTest, TestReportEventStoresSameSpecAcrossMediaAndDeduplicatesQueryByName) {
@@ -5158,7 +5158,7 @@ TEST_F(CacheManagerTest, TestReportEventStoresSameSpecAcrossMediaAndDeduplicates
     bool stored_mem = false;
     bool stored_disk = false;
     for (const auto &uri : raw) {
-        EXPECT_NE(std::string::npos, uri.find("s_version=" + token));
+        EXPECT_NE(std::string::npos, uri.find("s_v=" + token));
         stored_mem = stored_mem || uri.find("/mem?") != std::string::npos;
         stored_disk = stored_disk || uri.find("/disk?") != std::string::npos;
     }
@@ -5170,7 +5170,7 @@ TEST_F(CacheManagerTest, TestReportEventStoresSameSpecAcrossMediaAndDeduplicates
     // two logical tp0 components.
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + token));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + token));
     EXPECT_TRUE(visible.front().find("/mem?") != std::string::npos ||
                 visible.front().find("/disk?") != std::string::npos);
 }
@@ -5259,11 +5259,11 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotCommitReclaimsOnlyStaleReporterL
     const auto current_uris = QueryRawEventReportUris(current_key);
     ASSERT_EQ(1u, current_uris.size());
     EXPECT_NE(std::string::npos, current_uris.front().find("source=host_a_new_current"));
-    EXPECT_NE(std::string::npos, current_uris.front().find("s_version=" + host_a_new_token));
+    EXPECT_NE(std::string::npos, current_uris.front().find("s_v=" + host_a_new_token));
     const auto other_host_uris = QueryRawEventReportUris(other_host_key);
     ASSERT_EQ(1u, other_host_uris.size());
     EXPECT_NE(std::string::npos, other_host_uris.front().find("source=host_b_current"));
-    EXPECT_NE(std::string::npos, other_host_uris.front().find("s_version=" + host_b_token));
+    EXPECT_NE(std::string::npos, other_host_uris.front().find("s_v=" + host_b_token));
 
     // Re-scanning after the stale location has already gone is idempotent.
     EXPECT_EQ(EC_OK,
@@ -5588,7 +5588,7 @@ TEST_F(CacheManagerTest, TestSnapshotCleanupCASPreservesLocationRefreshedAfterSc
     const auto raw_uris = QueryRawEventReportUris(key);
     ASSERT_EQ(1u, raw_uris.size());
     EXPECT_NE(std::string::npos, raw_uris.front().find("source=refreshed"));
-    EXPECT_NE(std::string::npos, raw_uris.front().find("s_version=" + refreshed_token));
+    EXPECT_NE(std::string::npos, raw_uris.front().find("s_v=" + refreshed_token));
     ASSERT_EQ(1u, QueryEventReportUris({key}).size());
 }
 
@@ -5739,7 +5739,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncFencesVersionsAfterSuccessf
     location.set_location_specs({LocationSpec("tp0", unknown_uri)});
     EXPECT_FALSE(check(location));
     location.set_location_specs(
-        {LocationSpec("tp0", current_uri), LocationSpec("tp1", "event_report://raw/mem?s_version=bad")});
+        {LocationSpec("tp0", current_uri), LocationSpec("tp1", "event_report://raw/mem?s_v=bad")});
     EXPECT_FALSE(check(location));
     location.set_location_specs({});
     EXPECT_FALSE(check(location));
@@ -5819,21 +5819,21 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
         {"empty_specs", {}, false},
         {"legacy_without_query", {"event_report://physical-cache:9600/mem"}, true},
         {"legacy_with_other_params", {"event_report://physical-cache:9600/mem?size=4096&offset=0"}, true},
-        {"valid_lowercase_version", {"event_report://physical-cache:9600/mem?s_version=" + token}, true},
-        {"valid_uppercase_version", {"event_report://physical-cache:9600/mem?s_version=" + upper_token}, true},
-        {"near_match_param", {"event_report://physical-cache:9600/mem?xs_version=bad&s_version_suffix=bad"}, true},
-        {"empty_version", {"event_report://physical-cache:9600/mem?s_version="}, false},
-        {"version_without_equals", {"event_report://physical-cache:9600/mem?s_version"}, false},
-        {"short_version", {"event_report://physical-cache:9600/mem?s_version=" + std::string(31, 'a')}, false},
-        {"long_version", {"event_report://physical-cache:9600/mem?s_version=" + std::string(33, 'a')}, false},
+        {"valid_lowercase_version", {"event_report://physical-cache:9600/mem?s_v=" + token}, true},
+        {"valid_uppercase_version", {"event_report://physical-cache:9600/mem?s_v=" + upper_token}, true},
+        {"near_match_param", {"event_report://physical-cache:9600/mem?xs_v=bad&s_v_suffix=bad"}, true},
+        {"empty_version", {"event_report://physical-cache:9600/mem?s_v="}, false},
+        {"version_without_equals", {"event_report://physical-cache:9600/mem?s_v"}, false},
+        {"short_version", {"event_report://physical-cache:9600/mem?s_v=" + std::string(31, 'a')}, false},
+        {"long_version", {"event_report://physical-cache:9600/mem?s_v=" + std::string(33, 'a')}, false},
         {"non_hex_version",
-         {"event_report://physical-cache:9600/mem?s_version=0123456789abcdef0123456789abcdeg"},
+         {"event_report://physical-cache:9600/mem?s_v=0123456789abcdef0123456789abcdeg"},
          false},
         {"duplicate_same_version",
-         {"event_report://physical-cache:9600/mem?s_version=" + token + "&s_version=" + token},
+         {"event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + token},
          false},
         {"duplicate_different_version",
-         {"event_report://physical-cache:9600/mem?s_version=" + token + "&s_version=" + upper_token},
+         {"event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + upper_token},
          false},
         {"invalid_uri", {"not-a-uri"}, false},
         {"invalid_empty_port", {"event_report://physical-cache:/mem"}, false},
@@ -5842,16 +5842,16 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
         {"invalid_overflow_port", {"event_report://physical-cache:9223372036854775808/mem"}, false},
         {"invalid_userinfo_port", {"event_report://user:secret@physical-cache:not-a-port/mem"}, false},
         {"mixed_versioned_and_legacy",
-         {"event_report://physical-cache:9600/mem?s_version=" + token,
+         {"event_report://physical-cache:9600/mem?s_v=" + token,
           "event_report://physical-cache:9600/mem?source=legacy"},
          true},
         {"mixed_valid_and_malformed",
-         {"event_report://physical-cache:9600/mem?s_version=" + token,
-          "event_report://physical-cache:9600/mem?s_version=bad"},
+         {"event_report://physical-cache:9600/mem?s_v=" + token,
+          "event_report://physical-cache:9600/mem?s_v=bad"},
          false},
         {"mixed_valid_and_duplicate",
-         {"event_report://physical-cache:9600/mem?s_version=" + token,
-          "event_report://physical-cache:9600/mem?s_version=" + token + "&s_version=" + token},
+         {"event_report://physical-cache:9600/mem?s_v=" + token,
+          "event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + token},
          false},
     };
 
@@ -5866,7 +5866,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
         EXPECT_EQ(test_case.readable, check(location));
     }
 
-    location.set_location_specs({LocationSpec("tp0", "event_report://physical-cache:9600/mem?s_version=" + token)});
+    location.set_location_specs({LocationSpec("tp0", "event_report://physical-cache:9600/mem?s_v=" + token)});
     location.set_id("kvs#event_report_l2#mem");
     EXPECT_FALSE(check(location));
     location.set_id("kvs#event_report_l1p5#mem#" + host);
@@ -5921,8 +5921,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationEnforcesReporterLifecycleAndBatchOr
     ASSERT_EQ(1u, visible[1].size());
     ASSERT_EQ(1u, visible[2].size());
     EXPECT_TRUE(visible[3].empty());
-    EXPECT_NE(std::string::npos, visible[0][0].find("s_version=" + first_a_token));
-    EXPECT_NE(std::string::npos, visible[2][0].find("s_version=" + first_b_token));
+    EXPECT_NE(std::string::npos, visible[0][0].find("s_v=" + first_a_token));
+    EXPECT_NE(std::string::npos, visible[2][0].find("s_v=" + first_b_token));
 
     // A successful snapshot immediately fences omitted old versions; metadata
     // reclamation remains asynchronous and does not affect query correctness.
@@ -5948,7 +5948,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationEnforcesReporterLifecycleAndBatchOr
     EXPECT_TRUE(visible[1].empty());
     ASSERT_EQ(1u, visible[2].size());
     EXPECT_TRUE(visible[3].empty());
-    EXPECT_NE(std::string::npos, visible[0][0].find("s_version=" + second_a_token));
+    EXPECT_NE(std::string::npos, visible[0][0].find("s_v=" + second_a_token));
 
     // Only host B is hidden; host A and the batch result ordering are
     // unaffected. Heartbeat recovery restores B's original committed token.
@@ -5962,7 +5962,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationEnforcesReporterLifecycleAndBatchOr
     ASSERT_EQ(EC_OK, event_backend->OnHeartbeat("test_instance", host_b, {}));
     visible = query_visibility({current_key, old_key, down_key, missing_key});
     ASSERT_EQ(1u, visible[2].size());
-    EXPECT_NE(std::string::npos, visible[2][0].find("s_version=" + first_b_token));
+    EXPECT_NE(std::string::npos, visible[2][0].find("s_v=" + first_b_token));
 
     // Same-process unregister creates a tombstone: late events cannot revive
     // the reporter until an explicit REGISTER clears it.
@@ -7014,7 +7014,7 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_add(event, key, host)
                  ->mutable_specs(0)
-                 ->set_uri("event_report://" + host + "/mem?s_version=" + std::string(32, 'a'));
+                 ->set_uri("event_report://" + host + "/mem?s_v=" + std::string(32, 'a'));
          }},
         {"delete_non_numeric_key",
          [=](auto *event, int64_t key, const std::string &) {
@@ -7093,7 +7093,7 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_snapshot(event, key, host)
                  ->mutable_specs(0)
-                 ->set_uri("event_report://" + host + "/mem?s_version=" + std::string(32, 'a'));
+                 ->set_uri("event_report://" + host + "/mem?s_v=" + std::string(32, 'a'));
          }},
         {"snapshot_duplicate_block_and_medium",
          [=](auto *event, int64_t key, const std::string &host) {
@@ -7338,7 +7338,7 @@ TEST_F(CacheManagerTest, TestReportEventFirstDeltaMetadataFailureReportsFailureA
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=first_write_retry"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + generation));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + generation));
 }
 
 TEST_F(CacheManagerTest, TestReportEventRejectsInvalidRequestsAndMapsItemErrors) {

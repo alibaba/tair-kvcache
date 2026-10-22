@@ -2206,7 +2206,7 @@ TEST(EventReportBackendSnapshotTest, UriCarriesOnlyOpaqueSnapshotToken) {
     const std::string reporter_uri = "vineyard://127.0.0.1:9600/object?size=1024";
     std::string versioned_uri;
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(reporter_uri, token, versioned_uri));
-    EXPECT_NE(std::string::npos, versioned_uri.find("s_version=" + token));
+    EXPECT_NE(std::string::npos, versioned_uri.find("s_v=" + token));
     EXPECT_EQ(std::string::npos, versioned_uri.find("kvcm_"));
 
     SnapshotUriInfo info;
@@ -2214,7 +2214,7 @@ TEST(EventReportBackendSnapshotTest, UriCarriesOnlyOpaqueSnapshotToken) {
     EXPECT_EQ(token, info.version);
     EXPECT_TRUE(SnapshotUriUtils::HasEventReportInternalUriMetadata(DataStorageUri(versioned_uri)));
 
-    EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(versioned_uri + "&s_version=" + token, info));
+    EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(versioned_uri + "&s_v=" + token, info));
     EXPECT_FALSE(SnapshotUriUtils::AddSnapshotVersionToUri(versioned_uri, token, versioned_uri));
     EXPECT_FALSE(SnapshotUriUtils::IsValidSnapshotVersionToken(""));
     EXPECT_FALSE(SnapshotUriUtils::IsValidSnapshotVersionToken("7"));
@@ -2435,7 +2435,7 @@ TEST_F(EventReportBackendTest, MaintenanceProbeUsesCurrentSnapshotAndFailsClosed
     };
     const std::string old_uri = versioned_uri(old_version);
     const std::string current_uri = versioned_uri(current_version);
-    const std::string malformed_uri = current_uri + "&s_version=" + current_version;
+    const std::string malformed_uri = current_uri + "&s_v=" + current_version;
     const std::string malformed_legacy_uri = "not-a-uri";
 
     const std::vector<EventReportBackend::MaintenanceLocationProbe> probes{
@@ -2845,7 +2845,7 @@ TEST_F(EventReportBackendTest, DisableUnblocksSnapshotAndDeltaWaitersAndReopensG
 
 TEST(EventReportBackendSnapshotTest, SnapshotUriUtilitiesHandleExactParameterBoundaries) {
     const std::string token = "00112233445566778899aabbccddeeff";
-    const std::string raw_uri = "event_report://10.0.0.1:8080/mem?size=7&user_s_version=kept&s_version_hint=kept";
+    const std::string raw_uri = "event_report://10.0.0.1:8080/mem?size=7&user_s_v=kept&s_v_hint=kept";
     EXPECT_EQ(0u, SnapshotUriUtils::CountUriParam(raw_uri, SnapshotUriUtils::kSnapshotVersionParam));
 
     std::string versioned_uri;
@@ -2854,8 +2854,8 @@ TEST(EventReportBackendSnapshotTest, SnapshotUriUtilitiesHandleExactParameterBou
     const DataStorageUri parsed(versioned_uri);
     ASSERT_TRUE(parsed.Valid());
     EXPECT_EQ("7", parsed.GetParam("size"));
-    EXPECT_EQ("kept", parsed.GetParam("user_s_version"));
-    EXPECT_EQ("kept", parsed.GetParam("s_version_hint"));
+    EXPECT_EQ("kept", parsed.GetParam("user_s_v"));
+    EXPECT_EQ("kept", parsed.GetParam("s_v_hint"));
     EXPECT_EQ(token, parsed.GetParam(SnapshotUriUtils::kSnapshotVersionParam));
 
     SnapshotUriInfo info;
@@ -2863,10 +2863,10 @@ TEST(EventReportBackendSnapshotTest, SnapshotUriUtilitiesHandleExactParameterBou
     EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(raw_uri, info));
     EXPECT_TRUE(info.version.empty());
     EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(
-        "event_report://10.0.0.1:8080/mem?s_version=" + std::string(31, 'a'), info));
+        "event_report://10.0.0.1:8080/mem?s_v=" + std::string(31, 'a'), info));
     EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(
-        "event_report://10.0.0.1:8080/mem?s_version=" + std::string(32, 'g'), info));
-    EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(versioned_uri + "&s_version=" + token, info));
+        "event_report://10.0.0.1:8080/mem?s_v=" + std::string(32, 'g'), info));
+    EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(versioned_uri + "&s_v=" + token, info));
     versioned_uri = "stale";
     EXPECT_FALSE(SnapshotUriUtils::AddSnapshotVersionToUri("", token, versioned_uri));
     EXPECT_TRUE(versioned_uri.empty());

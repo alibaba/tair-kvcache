@@ -1871,7 +1871,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsPreservesUntouchedSpecsAcros
     const std::string version_a = "00112233445566778899aabbccddeeff";
     const std::string version_b = "ffeeddccbbaa99887766554433221100";
     auto uri = [](const std::string &source, const std::string &version) {
-        return "event_report://127.0.0.1:8080/mem?source=" + source + "&s_version=" + version;
+        return "event_report://127.0.0.1:8080/mem?source=" + source + "&s_v=" + version;
     };
 
     std::vector<ErrorCode> per_key_ec;
@@ -1939,7 +1939,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
     const std::string version_a = "00112233445566778899aabbccddeeff";
     const std::string version_b = "ffeeddccbbaa99887766554433221100";
     auto uri = [](const std::string &source, const std::string &version) {
-        return "event_report://127.0.0.1:8080/mem?source=" + source + "&s_version=" + version;
+        return "event_report://127.0.0.1:8080/mem?source=" + source + "&s_v=" + version;
     };
 
     std::vector<ErrorCode> per_key_ec;
@@ -1970,7 +1970,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
         },
         {
             LocationSpec("valid", uri("valid", version_b)),
-            LocationSpec("malformed", "event_report://127.0.0.1:8080/mem?source=malformed&s_version=not-a-token"),
+            LocationSpec("malformed", "event_report://127.0.0.1:8080/mem?source=malformed&s_v=not-a-token"),
         },
         {
             LocationSpec("version_a", uri("version_a", version_a)),
@@ -1978,13 +1978,13 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
         },
         {
             LocationSpec("duplicate",
-                         "event_report://127.0.0.1:8080/mem?source=duplicate&s_version=" + version_b +
-                             "&s_version=" + version_b),
+                         "event_report://127.0.0.1:8080/mem?source=duplicate&s_v=" + version_b +
+                             "&s_v=" + version_b),
         },
         {
             LocationSpec("max_size",
-                         "event_report://127.0.0.1:8080/mem?size=18446744073709551615&s_version=" + version_b),
-            LocationSpec("overflow_size", "event_report://127.0.0.1:8080/mem?size=1&s_version=" + version_b),
+                         "event_report://127.0.0.1:8080/mem?size=18446744073709551615&s_v=" + version_b),
+            LocationSpec("overflow_size", "event_report://127.0.0.1:8080/mem?size=1&s_v=" + version_b),
         },
     };
 
@@ -2045,7 +2045,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsOverflowAgainstExisti
     const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
     const std::string version = "00112233445566778899aabbccddeeff";
     auto uri = [&version](const std::string &source, const std::string &size) {
-        return "event_report://127.0.0.1:8080/mem?size=" + size + "&source=" + source + "&s_version=" + version;
+        return "event_report://127.0.0.1:8080/mem?size=" + size + "&source=" + source + "&s_v=" + version;
     };
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
         {location_id,
@@ -2093,7 +2093,7 @@ TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltas
             const std::string generation = std::to_string(i);
             const std::string token = std::string(31, '0') + "0123456789ab"[i];
             const std::string uri_prefix =
-                "event_report://127.0.0.1:8080/mem?generation=" + generation + "&s_version=" + token;
+                "event_report://127.0.0.1:8080/mem?generation=" + generation + "&s_v=" + token;
             std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> tasks = {{
                 {location_id,
                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
@@ -2140,7 +2140,7 @@ TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltas
             merge_signal.wait();
             const std::string index = std::to_string(i);
             const std::string uri =
-                "event_report://127.0.0.1:8080/mem?delta=" + index + "&s_version=" + first_info.version;
+                "event_report://127.0.0.1:8080/mem?delta=" + index + "&s_v=" + first_info.version;
             std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
                 {location_id,
                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
