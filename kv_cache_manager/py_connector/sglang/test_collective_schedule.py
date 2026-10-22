@@ -249,10 +249,10 @@ class FakeGroup:
             object_list[:] = [list(report) for report in gathered]
 
     def broadcast_object_list(
-        self, object_list: Any = None, src: int = 0, group: Any = None
+        self, object_list: Any = None, group_src: int = 0, group: Any = None
     ) -> None:
         rank = self._rank()
-        if rank == src:
+        if rank == group_src:
             self._payload = object_list[0]
         self._barrier.wait()
         payload = self._payload
