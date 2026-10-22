@@ -100,7 +100,9 @@ Sync 遵循所选元数据后端的语义。memory-primary 模式下，普通 `S
 
 ## 5. 并发、容量与失败源退避
 
-Group 的 `copy_max_concurrency` 限制活跃 Copy operation，默认 64；异步模式同时受 `copy_max_inflight_bytes` 限制，默认 32 GiB，显式配置时必须非零。准入先预留额度和进程内任务，再分配目标；源 URI size 缺失、为零、解析失败或求和溢出时拒绝。终态处理唯一认领，重复完成或取消不能重复归还额度。
+Group 的 `copy_max_concurrency` 限制同步与异步模式的活跃 Copy operation，默认 1024；异步模式同时受 `copy_max_inflight_bytes` 限制，默认 1 TiB，显式配置时必须非零。准入先预留额度和进程内任务，再分配目标；源 URI size 缺失、为零、解析失败或求和溢出时拒绝。终态处理唯一认领，重复完成或取消不能重复归还额度。
+
+默认窗口以“待回收数据先完成 Copy，再回收源”作为容量规划目标。Copy 的 operation 与字节额度均按 Group 计账；Reclaimer 的删除批次上限按进程计账，待删除字节额度另按 Group × Storage 类型计账，二者分别准入。该规划目标不改变现有迁移触发和 retention 策略。
 
 Copy inflight credit 表示 KVCM 正在跟踪的 Copy，不等于 PACE 的全部物理占用。unknown 收尾可释放 Copy credit，但其删除重试及 PACE 未 drain 的 pending 仍可能占用容量，清理记录继续保存原 backend 身份和 Location 快照。本设计没有独立的 quarantine operation/bytes 容量闸门；持续 busy/unknown 时，需要控制新 Copy 压力并检查删除积压和 PACE 实际容量。
 
@@ -141,8 +143,8 @@ Monitor 定期核对活跃 Copy 绑定的 backend 身份，发现源或目标已
 | 配置 | 默认 | 含义 |
 |---|---:|---|
 | copy_execution_mode | SYNC | 同步 / ASYNC_REQUIRED |
-| copy_max_concurrency | 64 | Group operation 上限 |
-| copy_max_inflight_bytes | 34359738368（32 GiB） | 异步模式下必须非零 |
+| copy_max_concurrency | 1024 | Group operation 上限 |
+| copy_max_inflight_bytes | 1099511627776（1 TiB） | 异步模式下必须非零 |
 | copy_operation_deadline_ms | 600000 | 操作总跟踪预算 |
 | copy_poll_initial_interval_ms | 20 | 首次查询间隔 |
 | copy_poll_max_interval_ms | 1000 | 轮询退避上限，不保证实际轮询延迟 |
@@ -156,7 +158,9 @@ Monitor 定期核对活跃 Copy 绑定的 backend 身份，发现源或目标已
 16 * max(submit, query) <= operation_deadline
 ```
 
-这些限制约束单次阻塞，不能保证大量任务共享一个协调器时的真实轮询周期。使用默认 64 并发或调整并发配置时，需要观察协调器 queue wait、查询耗时及超时、实际 Copy 完成延迟，并评估远端 task 保留窗口；队列等待、轮询和正常 Copy P99 之和应留在 operation budget 内。
+默认值用于新建配置或未提供相应字段的配置；已有配置中显式保存的额度保持不变。
+
+这些限制约束单次阻塞，不能保证大量任务共享一个协调器时的真实轮询周期。使用默认 1024 并发或调整并发配置时，需要观察协调器 queue wait、查询耗时及超时、实际 Copy 完成延迟，并评估远端 task 保留窗口；队列等待、轮询和正常 Copy P99 之和应留在 operation budget 内。
 
 Storage timeout 控制 Create/Delete/health/同步 Copy，异步 HTTP 请求使用独立预算。降低全局 Storage timeout 不能代替异步预算配置；Provider 的等待超时同样不代表物理 I/O 停止，任何一层超时都不单独授权内存复用。
 

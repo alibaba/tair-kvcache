@@ -58,18 +58,18 @@ TEST(ProtoConvertTest, MigrationCopyLimitDefaultsAndExplicitValues) {
         bool valid;
     };
     const TestCase cases[] = {
-        {R"({})", 64, 34359738368ULL, true},
-        {R"({"migration_config":{}})", 64, 34359738368ULL, true},
-        {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED"}})", 64, 34359738368ULL, true},
+        {R"({})", 1024, 1099511627776ULL, true},
+        {R"({"migration_config":{}})", 1024, 1099511627776ULL, true},
+        {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED"}})", 1024, 1099511627776ULL, true},
         {R"({"migration_config":{"copy_max_concurrency":6,"copy_max_inflight_bytes":"12884901888"}})",
          6,
          12884901888ULL,
          true},
         {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED","copy_max_inflight_bytes":"0"}})",
-         64,
+         1024,
          0,
          false},
-        {R"({"migration_config":{"copy_max_concurrency":0}})", 0, 34359738368ULL, false},
+        {R"({"migration_config":{"copy_max_concurrency":0}})", 0, 1099511627776ULL, false},
     };
     for (const auto &test : cases) {
         SCOPED_TRACE(test.json);
