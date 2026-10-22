@@ -73,3 +73,9 @@ py_test(
     main = "test/list_instance_test.py",
     deps = [":kvcm_ops_lib"],
 )
+
+py_test(
+    name = "bootstrap_test",
+    srcs = ["test/bootstrap_test.py"],
+    deps = [":kvcm_ops_lib"],
+)
