@@ -127,9 +127,9 @@ TEST_F(DataStorageManagerTest, TestUnregisterInvalidatesSnapshotWithoutBlockingO
     RequestContext context("retire-storage");
     ASSERT_EQ(EC_OK, manager.RegisterStorage(&context, "retired", config));
     const auto snapshot = manager.CaptureStorageBackends({"retired"});
-    EXPECT_TRUE(manager.IsStorageBackendCurrent(snapshot, "retired"));
+    EXPECT_TRUE(manager.WithCurrentStorageBackends(snapshot, [] {}));
     ASSERT_EQ(EC_OK, manager.UnRegisterStorage("retired"));
-    EXPECT_FALSE(manager.IsStorageBackendCurrent(snapshot, "retired"));
+    EXPECT_FALSE(manager.WithCurrentStorageBackends(snapshot, [] {}));
     ASSERT_EQ(EC_OK, manager.RegisterStorage(&context, "retired", config));
     EXPECT_NE(snapshot->at("retired"), manager.GetDataStorageBackend("retired"));
     bool published = false;
@@ -145,7 +145,7 @@ TEST_F(DataStorageManagerTest, TestUnregisterInvalidatesSnapshotWithoutBlockingO
                 &context, "retired", {DataStorageUri("file://retired/data/old-key?size=128")}, {}, snapshot, &retired)
             .empty());
     EXPECT_TRUE(retired);
-    EXPECT_TRUE(manager.IsStorageBackendCurrent(manager.CaptureStorageBackends({"retired"}), "retired"));
+    EXPECT_TRUE(manager.WithCurrentStorageBackends(manager.CaptureStorageBackends({"retired"}), [] {}));
 }
 
 TEST_F(DataStorageManagerTest, TestCopyRejectsMismatchedUris) {

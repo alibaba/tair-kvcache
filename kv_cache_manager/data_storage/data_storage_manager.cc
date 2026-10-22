@@ -173,12 +173,6 @@ bool DataStorageManager::StorageBackendsCurrentLocked(const StorageBackendSnapsh
     });
 }
 
-bool DataStorageManager::IsStorageBackendCurrent(const StorageBackendSnapshot &snapshot,
-                                                 const std::string &name) const {
-    std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    return StorageBackendCurrentLocked(snapshot, name);
-}
-
 bool DataStorageManager::WithCurrentStorageBackends(const StorageBackendSnapshot &snapshot,
                                                     const std::function<void()> &action) const {
     std::shared_lock<std::shared_mutex> lock(rw_lock_);

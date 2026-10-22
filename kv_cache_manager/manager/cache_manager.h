@@ -5,7 +5,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -405,24 +404,6 @@ private:
     void InvalidateInstanceMetrics(const std::string &instance_id) const;
 
 private:
-    struct PendingInstanceTrim {
-        std::string instance_group;
-        std::weak_ptr<MetaIndexer> indexer;
-    };
-    struct InstanceManagementState {
-        size_t registrations = 0;
-        bool removing = false;
-        std::optional<PendingInstanceTrim> pending_trim;
-    };
-    struct InstanceManagementGuard {
-        CacheManager *manager;
-        const std::string &instance_id;
-        bool removing;
-        ~InstanceManagementGuard();
-    };
-    bool BeginInstanceManagement(const std::string &instance_id, bool removing);
-    void EndInstanceManagement(const std::string &instance_id, bool removing);
-
     /***
      * === 成员变量清理说明 ===
      * 所有成员变量必须添加注释说明在主备切换时是否需要清理，并按需要在DoCleanup中添加清理实现。
@@ -433,10 +414,6 @@ private:
 
     // 需要清理
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager_;
-    // 需要清理 - process-local removal retries only; cleared after request drain
-    // in DoCleanup. The mutex never spans Registry I/O, Copy drain, or Trim.
-    std::mutex instance_management_mutex_;
-    std::unordered_map<std::string, InstanceManagementState> instance_management_;
     // 需要清理 - 所有正在执行的写入均按失败处理
     std::shared_ptr<WriteLocationManager> write_location_manager_;
     // 需要清理

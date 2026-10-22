@@ -57,8 +57,6 @@ struct PlanExecuteResult {
     // them from the backend result.  ErrorCode never authorizes target reuse.
     bool terminal{true};
     bool safe_to_reuse_dst{true};
-    // Administrative retirement ended cleanup without proving physical deletion.
-    bool cleanup_abandoned{false};
 };
 
 struct AsyncDeleteSubmitResult {
@@ -84,9 +82,8 @@ struct CacheLocationDelRequest {
     // ShouldSkipConfirmedMissingBackendDelete policy determines whether to
     // omit Delete for these URIs; remaining specs are deleted normally.
     std::set<std::string> confirmed_missing_uris;
-    // Retry a previously submitted delete without assuming whether its status
-    // transition reached persistent meta. Admission accepts an already
-    // CLS_DELETING location or performs the ordinary exact-snapshot CAS.
+    // An explicit request may also admit this exact location in CLS_DELETING.
+    // It still makes only one deletion attempt after a fresh CAS and Sync.
     bool resume_deleting{false};
     StorageBackendSnapshot storage_backends;
     // Optional sibling SERVING snapshots, keyed by block. Check these in the
@@ -199,16 +196,11 @@ public:
 
 private:
     struct PromiseCompletion;
-    struct PendingDeleteOperation;
     struct LocationDelAdmissionResult {
         PlanExecuteResult result{ErrorCode::EC_OK, ""};
         CacheLocationDelRequest actual_task;
         std::shared_ptr<MetaIndexer> indexer;
-        // Original identities for a resumed batch whose conditional admission
-        // raced or failed. Never use these snapshots for physical deletion.
-        CacheLocationDelRequest retry_task;
         bool needs_physical_delete{false};
-        std::set<std::string> abandoned_uris;
     };
 
     std::shared_ptr<MetaIndexerManager> meta_manager_;
@@ -259,7 +251,8 @@ private:
                           std::chrono::microseconds delay,
                           bool authoritative_read = false,
                           bool resume_deleting = false,
-                          const std::map<int64_t, std::string> *required_serving_location_values = nullptr);
+                          const std::map<int64_t, std::string> *required_serving_location_values = nullptr,
+                          std::shared_ptr<MetaIndexer> indexer = nullptr);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare,
@@ -267,27 +260,11 @@ private:
     AsyncDeleteSubmitResult SubmitDeleteTaskAsync(std::chrono::microseconds delay,
                                                   std::function<LocationDelAdmissionResult()> prepare,
                                                   ScheduleTaskClass task_class = ScheduleTaskClass::kReclaim);
-    std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task, ScheduleTaskClass task_class,
+    std::future<PlanExecuteResult> SubmitMetaDelete(const CacheMetaDelRequest &task,
+                                                    ScheduleTaskClass task_class,
                                                     std::shared_ptr<MetaIndexer> indexer);
-    std::future<PlanExecuteResult> SubmitLocationDelete(const CacheLocationDelRequest &task,
-                                                        ScheduleTaskClass task_class);
     PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task,
-                                        std::set<std::string> *confirmed_deleted_uris = nullptr,
-                                        std::set<std::string> *abandoned_uris = nullptr,
-                                        const std::shared_ptr<MetaIndexer> &provided_indexer = {});
-    void StartLocationDelete(const std::shared_ptr<PromiseCompletion> &completion,
-                             CacheLocationDelRequest task,
-                             std::chrono::microseconds delay,
-                             ScheduleTaskClass task_class,
-                             bool readmit = false,
-                             std::set<std::string> abandoned_uris = {});
-    void QueueLocationDelete(const std::shared_ptr<PendingDeleteOperation> &operation,
-                             std::chrono::microseconds delay,
-                             bool readmit);
-    void RunLocationDelete(const std::shared_ptr<PendingDeleteOperation> &operation, bool readmit);
-    void DropRetiredDeleteLocations(const std::shared_ptr<PendingDeleteOperation> &operation);
-    void RetryLocationDelete(const std::shared_ptr<PendingDeleteOperation> &operation);
-    void FinishLocationDelete(const std::shared_ptr<PendingDeleteOperation> &operation, PlanExecuteResult result);
+                                        const std::shared_ptr<MetaIndexer> &indexer);
     PlanExecuteResult DoEventReportMetadataDelTask(const EventReportMetadataDelRequest &task);
     void DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
                     const CacheLocationCopyRequest &task);

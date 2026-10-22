@@ -38,7 +38,6 @@ public:
     ErrorCode UnRegisterStorage(const std::string &name);
     StorageBackendSnapshot CaptureStorageBackends(const std::vector<std::string> &names = {}) const;
     bool WithCurrentStorageBackends(const StorageBackendSnapshot &snapshot, const std::function<void()> &action) const;
-    bool IsStorageBackendCurrent(const StorageBackendSnapshot &snapshot, const std::string &name) const;
     ErrorCode DoCleanup();
 
     std::vector<std::pair<ErrorCode, DataStorageUri>> Create(RequestContext *request_context,

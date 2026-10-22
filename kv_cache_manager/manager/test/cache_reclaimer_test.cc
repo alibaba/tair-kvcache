@@ -436,21 +436,6 @@ ErrorCode MetaIndexer_SampleReclaimCandidates_stub(void *obj,
     return result;
 }
 
-/* ---------------- MetaIndexer_ScanLocationsForMaintenance_stub ---------------- */
-
-ErrorCode MetaIndexer_ScanLocationsForMaintenance_stub(void *,
-                                                       RequestContext *,
-                                                       const std::string &,
-                                                       std::size_t,
-                                                       MaintenanceScanBatch &out) noexcept {
-    // MigrationManager::Start performs a source-of-truth guard recovery scan.
-    // This fixture intentionally uses an uninitialized dummy MetaIndexer, so
-    // expose an empty, completed scan unless an individual test overrides it.
-    out.Clear();
-    out.next_cursor = SCAN_BASE_CURSOR;
-    return ErrorCode::EC_OK;
-}
-
 /* ---------------- MetaIndexer KeyCount stubs ---------------- */
 
 std::size_t key_count;
@@ -614,7 +599,6 @@ public:
         stub_.set(ADDR(MetaIndexer, GetProperties), MetaIndexer_GetProperties_stub);
         stub_.set(ADDR(MetaIndexer, RandomSample), MetaIndexer_RandomSample_stub);
         stub_.set(ADDR(MetaIndexer, SampleReclaimCandidates), MetaIndexer_SampleReclaimCandidates_stub);
-        stub_.set(ADDR(MetaIndexer, ScanLocationsForMaintenance), MetaIndexer_ScanLocationsForMaintenance_stub);
         stub_.set(ADDR(MetaIndexer, GetKeyCount), MetaIndexer_GetKeyCount_stub);
         stub_.set(ADDR(MetaIndexer, GetMaxKeyCount), MetaIndexer_GetMaxKeyCount_stub);
         stub_.set(ADDR(MetaIndexer, PersistMetaData), MetaIndexer_PersistMetaData_stub);
@@ -884,7 +868,6 @@ public:
         stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
         stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
         stub_.reset(ADDR(MetaIndexer, GetLocationMapsForMaintenance));
-        stub_.reset(ADDR(MetaIndexer, ScanLocationsForMaintenance));
         stub_.reset(ADDR(MetaIndexer, GetKeyCount));
         stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
         stub_.reset(ADDR(MetaIndexer, PersistMetaData));
@@ -1196,7 +1179,6 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     stub_.reset(ADDR(MetaIndexer, GetProperties));
     stub_.reset(ADDR(MetaIndexer, RandomSample));
     stub_.reset(ADDR(MetaIndexer, SampleReclaimCandidates));
-    stub_.reset(ADDR(MetaIndexer, ScanLocationsForMaintenance));
     stub_.reset(ADDR(MetaIndexer, GetKeyCount));
     stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
     stub_.reset(ADDR(MetaIndexer, PersistMetaData));

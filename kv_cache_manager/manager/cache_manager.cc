@@ -131,24 +131,14 @@ bool WaitForOtherOwners(const std::shared_ptr<T> &owner, int64_t timeout_seconds
     return true;
 }
 
-ErrorCode CollectTrimResult(std::deque<std::future<PlanExecuteResult>> &inflight,
-                             const std::string &trace_id,
-                             const std::string &instance_id,
-                             bool &has_error) {
-    // This bounds only the caller's wait for one batch, not the lifetime of
-    // cleanup or the total duration of a healthy multi-page Trim. The Executor
-    // owns its promise-backed operation and physical-delete references until
-    // completion; dropping this observer never authorizes reclaim or reuse.
-    if (inflight.front().wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
-        KVCM_LOG_WARN("trace_id [%s] instance [%s] | trim cache wait timed out; deletion continues in background",
-                      trace_id.c_str(),
-                      instance_id.c_str());
-        return EC_TIMEOUT;
-    }
+bool CollectTrimResult(std::deque<std::future<PlanExecuteResult>> &inflight,
+                       const std::string &trace_id,
+                       const std::string &instance_id,
+                       bool &has_error) {
     const PlanExecuteResult result = inflight.front().get();
     inflight.pop_front();
     if (result.status == EC_OK) {
-        return EC_OK;
+        return false;
     }
 
     has_error = true;
@@ -159,7 +149,7 @@ ErrorCode CollectTrimResult(std::deque<std::future<PlanExecuteResult>> &inflight
                       result.status,
                       result.error_message.c_str());
     }
-    return result.status;
+    return result.status != EC_PARTIAL_OK;
 }
 
 struct ReporterIdentityView {
@@ -655,41 +645,6 @@ void CacheManager::SetRevisitHistogramConfig(const std::vector<double> &boundari
     }
 }
 
-bool CacheManager::BeginInstanceManagement(const std::string &instance_id, bool removing) {
-    std::lock_guard<std::mutex> lock(instance_management_mutex_);
-    auto &state = instance_management_[instance_id];
-    if (state.removing || (removing && state.registrations != 0)) {
-        return false;
-    }
-    if (removing) {
-        state.removing = true;
-    } else {
-        ++state.registrations;
-    }
-    return true;
-}
-
-void CacheManager::EndInstanceManagement(const std::string &instance_id, bool removing) {
-    std::lock_guard<std::mutex> lock(instance_management_mutex_);
-    const auto it = instance_management_.find(instance_id);
-    if (it == instance_management_.end()) {
-        return;
-    }
-    auto &state = it->second;
-    if (removing) {
-        state.removing = false;
-    } else {
-        --state.registrations;
-    }
-    if (!state.removing && state.registrations == 0 && !state.pending_trim) {
-        instance_management_.erase(it);
-    }
-}
-
-CacheManager::InstanceManagementGuard::~InstanceManagementGuard() {
-    manager->EndInstanceManagement(instance_id, removing);
-}
-
 std::pair<ErrorCode, std::string>
 CacheManager::RegisterInstance(RequestContext *request_context,
                                const std::string &instance_group,
@@ -808,8 +763,8 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
                 return EC_TIMEOUT;
             }
         }
-        // An active Copy still owns its preparation or completion state. Queued
-        // physical deletion alone does not veto administrative removal.
+        // An active Copy still owns its preparation or completion state.
+        // Physical deletion is drained through the indexer lifetime below.
         if (!migration_manager_->GetActiveBlockKeysForInstance(instance_id).empty()) {
             PREFIX_LOG(WARN, "remove instance rejected: asynchronous Copy reference remains");
             return EC_EXIST;
@@ -1867,20 +1822,14 @@ ErrorCode CacheManager::TrimCacheWithIndexer(RequestContext *request_context,
             inflight.emplace_back(detached_indexer ? schedule_plan_executor_->Submit(request, meta_indexer)
                                                    : schedule_plan_executor_->Submit(request));
             if (inflight.size() >= max_inflight) {
-                const auto collect_ec = CollectTrimResult(inflight, trace_id, instance_id, has_error);
-                if (collect_ec == EC_TIMEOUT) {
-                    return EC_TIMEOUT;
-                }
-                stop_submit = collect_ec != EC_OK && collect_ec != EC_PARTIAL_OK;
+                stop_submit = CollectTrimResult(inflight, trace_id, instance_id, has_error);
             }
         }
         cursor = std::move(next_cursor);
     } while (!stop_submit && cursor != SCAN_BASE_CURSOR);
 
     while (!inflight.empty()) {
-        if (CollectTrimResult(inflight, trace_id, instance_id, has_error) == EC_TIMEOUT) {
-            return EC_TIMEOUT;
-        }
+        CollectTrimResult(inflight, trace_id, instance_id, has_error);
     }
 
     const bool synced = meta_indexer->SyncAll();
@@ -4816,10 +4765,6 @@ ErrorCode CacheManager::DoCleanup() {
     ClearEventCleanupCallbacks();
     StopRecoverRetryLoop();
     DeactivateEventCleanupCallbacks();
-    {
-        std::lock_guard<std::mutex> lock(instance_management_mutex_);
-        instance_management_.clear();
-    }
     // aborting write session need meta indexer
     if (write_location_manager_) {
         write_location_manager_->DoCleanup();

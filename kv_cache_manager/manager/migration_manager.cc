@@ -38,9 +38,6 @@ static_assert(MigrationConfig::kMinCopyHttpTimeoutWindowsPerDeadline ==
 namespace {
 constexpr auto kMonitorIdleSleep = std::chrono::milliseconds(50);
 constexpr auto kFutureWaitTime = std::chrono::microseconds(200);
-constexpr auto kPromotionSyncRetryInterval = std::chrono::milliseconds(100);
-constexpr auto kPromotionSyncRetryIdleSleep = std::chrono::milliseconds(5);
-constexpr auto kLocationCleanupRetryInterval = std::chrono::seconds(1);
 
 struct AddLocationRollbackItem {
     int64_t block_key = 0;
@@ -1679,100 +1676,6 @@ MigrationManager::GetCopySourceFailure(const std::string &instance_id,
         true, now < iter->second.retry_after, iter->second.consecutive_failures, iter->second.last_error};
 }
 
-void MigrationManager::TrackLocationCleanup(const std::string &instance_id,
-                                            const std::string &storage_name,
-                                            CacheLocationDelRequest request,
-                                            std::future<PlanExecuteResult> future) {
-    if (storage_name.empty()) {
-        KVCM_LOG_ERROR("cannot track asynchronous Copy location cleanup: instance %s storage %s valid_future %d",
-                       instance_id.c_str(),
-                       storage_name.c_str(),
-                       static_cast<int>(future.valid()));
-        return;
-    }
-    if (!request.storage_backends) {
-        request.storage_backends =
-            data_storage_manager_
-                ? data_storage_manager_->CaptureStorageBackends()
-                : std::make_shared<const std::map<std::string, std::shared_ptr<DataStorageBackend>>>();
-    }
-    {
-        std::lock_guard<std::mutex> lock(pending_cleanup_mutex_);
-        pending_location_cleanups_.push_back(
-            PendingLocationCleanup{instance_id, storage_name, std::move(request), std::move(future), {}, 0});
-    }
-    pending_cv_.notify_one();
-}
-
-void MigrationManager::ProcessCompletedLocationCleanups() {
-    const auto now = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(pending_cleanup_mutex_);
-    for (auto iter = pending_location_cleanups_.begin(); iter != pending_location_cleanups_.end();) {
-        if (!iter->future.valid()) {
-            if (now < iter->retry_after) {
-                ++iter;
-                continue;
-            }
-            if (!schedule_plan_executor_) {
-                iter->retry_after = now + kLocationCleanupRetryInterval;
-                ++iter;
-                continue;
-            }
-            iter->request.authoritative_read = true;
-            iter->request.resume_deleting = true;
-            iter->future = std::move(
-                schedule_plan_executor_->SubmitAsync(iter->request, ScheduleTaskClass::kMigrationContinuation).future);
-            ++iter->retry_count;
-            KVCM_LOG_WARN("retry asynchronous Copy location cleanup: instance %s storage %s retry %u",
-                          iter->instance_id.c_str(),
-                          iter->storage_name.c_str(),
-                          iter->retry_count);
-            ++iter;
-            continue;
-        }
-        if (iter->future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-            ++iter;
-            continue;
-        }
-
-        bool completed = false;
-        std::string failure_detail;
-        ErrorCode failure_ec = EC_ERROR;
-        try {
-            const auto result = iter->future.get();
-            completed = result.status == EC_OK || result.cleanup_abandoned;
-            if (result.cleanup_abandoned) {
-                KVCM_LOG_WARN("stop migration cleanup after storage retirement: instance %s storage %s detail %s",
-                              iter->instance_id.c_str(),
-                              iter->storage_name.c_str(),
-                              result.error_message.c_str());
-            }
-            failure_ec = result.status;
-            failure_detail = result.error_message;
-        } catch (const std::exception &e) {
-            failure_detail = e.what();
-        } catch (...) {
-            failure_detail = "unknown cleanup future exception";
-        }
-        if (completed) {
-            iter = pending_location_cleanups_.erase(iter);
-            continue;
-        }
-
-        // get() invalidates the future. Keep this record (and therefore the
-        // backend/instance reference) while a bounded-delay retry is pending.
-        iter->retry_after = now + kLocationCleanupRetryInterval;
-        KVCM_LOG_WARN("asynchronous Copy location cleanup retained for retry: instance %s storage %s ec %d "
-                      "detail %s retry %u",
-                      iter->instance_id.c_str(),
-                      iter->storage_name.c_str(),
-                      static_cast<int>(failure_ec),
-                      failure_detail.c_str(),
-                      iter->retry_count);
-        ++iter;
-    }
-}
-
 void MigrationManager::RecordCopySubmission(const CopyTaskContext &ctx, const std::string &trace_id) {
     // Record acceptance before exposing the future to the completion consumer.
     stat_copy_submitted_.fetch_add(1, std::memory_order_relaxed);
@@ -1788,22 +1691,26 @@ void MigrationManager::RecordCopySubmission(const CopyTaskContext &ctx, const st
     }
 }
 
-bool MigrationManager::CompleteCopyTaskAsUnknown(const CopyTaskContext &ctx,
+void MigrationManager::CompleteCopyTaskAsUnknown(const CopyTaskContext &ctx,
                                                  const std::string &fail_reason,
                                                  bool record_completion) {
     stat_async_copy_unknown_.fetch_add(1, std::memory_order_relaxed);
-    // UNKNOWN is not proof of drain. Ordinary deletion asks PACE to enforce
-    // allocation lifetime; busy/error keeps the exact cleanup queued for retry.
-    // Inflight credit covers coordinator work, not all physical allocations:
-    // cleanup retains storage/instance references and remains charged to storage
-    // quota, without a separate quarantine credit state machine.
+    // UNKNOWN is not proof of drain. Submit one ordinary deletion attempt;
+    // PACE must protect any allocation still used by I/O. Released Copy credit
+    // does not imply that the target allocation has been freed.
     return CompleteCopyTaskAsFailed(ctx, fail_reason, record_completion);
 }
 
-bool MigrationManager::CompleteCopyTaskAsFailed(const CopyTaskContext &ctx,
+void MigrationManager::CompleteCopyTaskAsFailed(const CopyTaskContext &ctx,
                                                 const std::string &fail_reason,
                                                 bool record_completion) {
     SubmitTargetLocationDelete(ctx);
+    FinishCopyTaskAsFailed(ctx, fail_reason, record_completion);
+}
+
+void MigrationManager::FinishCopyTaskAsFailed(const CopyTaskContext &ctx,
+                                              const std::string &fail_reason,
+                                              bool record_completion) {
     ReleaseAsyncCopyCredit(ctx);
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
@@ -1814,7 +1721,7 @@ bool MigrationManager::CompleteCopyTaskAsFailed(const CopyTaskContext &ctx,
                       ctx.instance_id.c_str(),
                       static_cast<long long>(ctx.block_key),
                       fail_reason.c_str());
-        return true;
+        return;
     }
     stat_copy_failed_.fetch_add(1, std::memory_order_relaxed);
     // 失败路径也填真实 duration（提交到失败的耗时），而非硬编码 0，
@@ -1842,11 +1749,10 @@ bool MigrationManager::CompleteCopyTaskAsFailed(const CopyTaskContext &ctx,
                   static_cast<long long>(ctx.block_key),
                   ctx.dst_location_id.c_str(),
                   fail_reason.c_str());
-    return true;
 }
 
-bool MigrationManager::CompleteCopyTaskAsSucceeded(const CopyTaskContext &ctx) {
-    bool promoted = ctx.promotion_pending_sync;
+void MigrationManager::CompleteCopyTaskAsSucceeded(const CopyTaskContext &ctx) {
+    bool promoted = false;
     auto indexer = GetIndexer(ctx.instance_id);
     const auto while_registered = [&](const std::function<void()> &action) {
         if (!ctx.storage_backends) {
@@ -1856,7 +1762,7 @@ bool MigrationManager::CompleteCopyTaskAsSucceeded(const CopyTaskContext &ctx) {
         return data_storage_manager_ && data_storage_manager_->WithCurrentStorageBackends(ctx.storage_backends, action);
     };
     if (!while_registered([&]() {
-            if (indexer && !promoted) {
+            if (indexer) {
                 MetaSearcher meta_searcher(indexer);
                 auto rc = std::make_shared<RequestContext>("migration_on_success");
                 MetaSearcher::LocationCASTask task;
@@ -1875,18 +1781,11 @@ bool MigrationManager::CompleteCopyTaskAsSucceeded(const CopyTaskContext &ctx) {
         })) {
         return CompleteCopyTaskAsFailed(ctx, "storage_removed_before_publication");
     }
-    if (promoted && (!indexer || !indexer->Sync({ctx.block_key}))) {
-        // CAS may already be visible. Retain completion ownership and retry only
-        // Sync; never interpret this as Copy failure or delete a published target.
-        std::lock_guard<std::mutex> lock(task_mutex_);
-        auto instance = active_tasks_by_instance_.find(ctx.instance_id);
-        if (instance != active_tasks_by_instance_.end()) {
-            auto task = instance->second.find(ctx.block_key);
-            if (task != instance->second.end()) {
-                task->second.promotion_pending_sync = true;
-            }
-        }
-        return false;
+    if (promoted && !indexer->Sync({ctx.block_key})) {
+        // CAS is already visible. Keep both copies and the mark, release the
+        // operation, and report an unconfirmed publication once. Never clean
+        // the SERVING target or treat this metadata failure as backend UNKNOWN.
+        return FinishCopyTaskAsFailed(ctx, "promotion_sync_unconfirmed");
     }
 
     if (!promoted) {
@@ -1905,7 +1804,7 @@ bool MigrationManager::CompleteCopyTaskAsSucceeded(const CopyTaskContext &ctx) {
                 SubmitSourceLocationDelete(ctx);
             }
         })) {
-        return CompleteCopyTaskAsFailed(ctx, "storage_removed_before_copy_finalization");
+        return FinishCopyTaskAsFailed(ctx, "storage_removed_before_copy_finalization");
     }
     if (!ctx.mark_target.empty()) {
         ClearTieredWriteMarkIfMatchInternal(ctx.instance_id, ctx.block_key, ctx.mark_target, ctx.mark_deadline_ms);
@@ -1939,10 +1838,9 @@ bool MigrationManager::CompleteCopyTaskAsSucceeded(const CopyTaskContext &ctx) {
                   ctx.block_key,
                   ctx.dst_location_id.c_str(),
                   static_cast<int>(ctx.retention));
-    return true;
 }
 
-bool MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t block_key) {
+void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t block_key) {
     CopyTaskContext ctx;
     ClaimResult claim;
     {
@@ -1950,16 +1848,13 @@ bool MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
         claim = ClaimForCompletionLocked(instance_id, block_key, ctx);
     }
     if (claim == ClaimResult::kNotFound || claim == ClaimResult::kBusyCompleting) {
-        return true; // 已处理过 / 完成认领中
+        return; // 已处理过 / 完成认领中
     }
     if (claim == ClaimResult::kBusyPreparing) {
         KVCM_LOG_WARN("ignore premature migration success callback for preparing task: instance %s block_key %ld",
                       instance_id.c_str(),
                       block_key);
-        return true;
-    }
-    if (claim == ClaimResult::kRetryingPromotion) {
-        return CompleteCopyTaskAsSucceeded(ctx);
+        return;
     }
     if (claim == ClaimResult::kWasCancelling) {
         // 用户已取消。copy 虽成功也丢弃：不 promote、不删源，删掉仍为 WRITING 的目标半成品。
@@ -1981,12 +1876,12 @@ bool MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
     return CompleteCopyTaskAsSucceeded(ctx);
 }
 
-bool MigrationManager::OnTaskFailed(const std::string &instance_id, int64_t block_key, ErrorCode reason) {
+void MigrationManager::OnTaskFailed(const std::string &instance_id, int64_t block_key, ErrorCode reason) {
     return OnTaskFailedInternal(
         instance_id, block_key, reason, "copy_failed:" + std::to_string(static_cast<int>(reason)), true);
 }
 
-bool MigrationManager::OnTaskFailedInternal(const std::string &instance_id,
+void MigrationManager::OnTaskFailedInternal(const std::string &instance_id,
                                             int64_t block_key,
                                             ErrorCode reason,
                                             const std::string &fail_reason,
@@ -1999,16 +1894,13 @@ bool MigrationManager::OnTaskFailedInternal(const std::string &instance_id,
         claim = ClaimForCompletionLocked(instance_id, block_key, ctx);
     }
     if (claim == ClaimResult::kNotFound || claim == ClaimResult::kBusyCompleting) {
-        return true;
+        return;
     }
     if (claim == ClaimResult::kBusyPreparing) {
         KVCM_LOG_WARN("ignore premature migration failure callback for preparing task: instance %s block_key %ld",
                       instance_id.c_str(),
                       block_key);
-        return true;
-    }
-    if (claim == ClaimResult::kRetryingPromotion) {
-        return CompleteCopyTaskAsSucceeded(ctx);
+        return;
     }
     if (claim == ClaimResult::kWasCancelling) {
         // 已取消，无论 copy 结果如何一律按取消收尾（清 WRITING 目标，记 cancelled 终态）。
@@ -2023,10 +1915,10 @@ bool MigrationManager::OnTaskFailedInternal(const std::string &instance_id,
     return CompleteCopyTaskAsFailed(ctx, fail_reason, record_completion);
 }
 
-bool MigrationManager::OnTaskUnknown(const std::string &instance_id,
-                                      int64_t block_key,
-                                      const std::string &reason,
-                                      bool record_completion) {
+void MigrationManager::OnTaskUnknown(const std::string &instance_id,
+                                     int64_t block_key,
+                                     const std::string &reason,
+                                     bool record_completion) {
     CopyTaskContext ctx;
     ClaimResult claim;
     {
@@ -2034,16 +1926,13 @@ bool MigrationManager::OnTaskUnknown(const std::string &instance_id,
         claim = ClaimForCompletionLocked(instance_id, block_key, ctx);
     }
     if (claim == ClaimResult::kNotFound || claim == ClaimResult::kBusyCompleting) {
-        return true;
+        return;
     }
     if (claim == ClaimResult::kBusyPreparing) {
         KVCM_LOG_WARN("ignore premature unknown Copy callback for preparing task: instance %s block_key %lld",
                       instance_id.c_str(),
                       static_cast<long long>(block_key));
-        return true;
-    }
-    if (claim == ClaimResult::kRetryingPromotion) {
-        return CompleteCopyTaskAsSucceeded(ctx);
+        return;
     }
     if (claim == ClaimResult::kWasCancelling) {
         return CompleteCancelledTask(ctx, record_completion);
@@ -2070,14 +1959,11 @@ void MigrationManager::SubmitTargetLocationDelete(const CopyTaskContext &ctx) {
     if (!ctx.dst_location_value.empty()) {
         del_req.expected_location_values = {{ctx.dst_location_value}};
     }
-    if (ctx.copy_execution_mode == MigrationCopyExecutionMode::ASYNC_REQUIRED) {
-        TrackLocationCleanup(
-            ctx.instance_id,
-            ctx.dst_storage_name,
-            del_req,
-            std::move(schedule_plan_executor_->SubmitAsync(del_req, ScheduleTaskClass::kMigrationContinuation).future));
-    } else {
-        schedule_plan_executor_->SubmitNonBlocking(del_req, ScheduleTaskClass::kMigrationContinuation);
+    if (!schedule_plan_executor_->SubmitNonBlocking(del_req, ScheduleTaskClass::kMigrationContinuation)) {
+        KVCM_LOG_WARN("migration target cleanup enqueue failed: instance %s block_key %ld location %s",
+                      ctx.instance_id.c_str(),
+                      ctx.block_key,
+                      ctx.dst_location_id.c_str());
     }
 }
 
@@ -2106,21 +1992,17 @@ void MigrationManager::SubmitSourceLocationDelete(const CopyTaskContext &ctx) {
     if (!ctx.src_location_value.empty()) {
         del_req.expected_location_values = {{ctx.src_location_value}};
     }
-    if (ctx.copy_execution_mode == MigrationCopyExecutionMode::ASYNC_REQUIRED) {
-        TrackLocationCleanup(
-            ctx.instance_id,
-            ctx.src_storage_name,
-            del_req,
-            std::move(schedule_plan_executor_->SubmitAsync(del_req, ScheduleTaskClass::kMigrationContinuation).future));
-    } else {
-        schedule_plan_executor_->SubmitNonBlocking(del_req, ScheduleTaskClass::kMigrationContinuation);
+    if (!schedule_plan_executor_->SubmitNonBlocking(del_req, ScheduleTaskClass::kMigrationContinuation)) {
+        KVCM_LOG_WARN("migration source cleanup enqueue failed: instance %s block_key %ld location %s",
+                      ctx.instance_id.c_str(),
+                      ctx.block_key,
+                      ctx.src_location_id.c_str());
     }
 }
 
 void MigrationManager::MonitorLoop() {
     while (running_.load(std::memory_order_relaxed)) {
         ProcessExpiredMarks();
-        ProcessCompletedLocationCleanups();
 
         PendingCopy cell;
         bool has_cell = false;
@@ -2163,51 +2045,31 @@ void MigrationManager::MonitorLoop() {
                 continue; // Drop this observation; no wait for remote completion/drain.
             }
         }
-        if (cell.completed_result.has_value() && std::chrono::steady_clock::now() < cell.completion_retry_after) {
-            {
-                std::lock_guard<std::mutex> lock(pending_mutex_);
-                pending_copies_.push_back(std::move(cell));
-            }
-            // Avoid a tight loop when this is the only pending operation.  No
-            // task lock is held while waiting for persistent metadata.
-            std::this_thread::sleep_for(kPromotionSyncRetryIdleSleep);
-            continue;
-        }
-
-        if (!cell.completed_result.has_value()) {
-            auto status = cell.future.wait_for(kFutureWaitTime);
-            if (status != std::future_status::ready) {
-                // 尚未完成，放回队尾稍后再查。
-                std::lock_guard<std::mutex> lock(pending_mutex_);
-                pending_copies_.push_back(std::move(cell));
-                continue;
-            }
-            try {
-                cell.completed_result = cell.future.get();
-            } catch (const std::exception &e) {
-                cell.completed_result = PlanExecuteResult{
-                    .status = EC_ERROR, .error_message = e.what(), .terminal = false, .safe_to_reuse_dst = false};
-            } catch (...) {
-                cell.completed_result = PlanExecuteResult{.status = EC_ERROR,
-                                                         .error_message = "Copy completion exception",
-                                                         .terminal = false,
-                                                         .safe_to_reuse_dst = false};
-            }
-        }
-
-        const PlanExecuteResult &result = *cell.completed_result;
-        bool completed = true;
-        if (result.status == EC_OK && (!cell.native_async || (result.terminal && result.safe_to_reuse_dst))) {
-            completed = OnTaskSuccess(cell.instance_id, cell.block_key);
-        } else if (cell.native_async && (!result.terminal || !result.safe_to_reuse_dst)) {
-            completed = OnTaskUnknown(cell.instance_id, cell.block_key, result.error_message);
-        } else {
-            completed = OnTaskFailed(cell.instance_id, cell.block_key, result.status);
-        }
-        if (!completed) {
-            cell.completion_retry_after = std::chrono::steady_clock::now() + kPromotionSyncRetryInterval;
+        auto status = cell.future.wait_for(kFutureWaitTime);
+        if (status != std::future_status::ready) {
+            // 尚未完成，放回队尾稍后再查。
             std::lock_guard<std::mutex> lock(pending_mutex_);
             pending_copies_.push_back(std::move(cell));
+            continue;
+        }
+        PlanExecuteResult result;
+        try {
+            result = cell.future.get();
+        } catch (const std::exception &e) {
+            result = PlanExecuteResult{
+                .status = EC_ERROR, .error_message = e.what(), .terminal = false, .safe_to_reuse_dst = false};
+        } catch (...) {
+            result = PlanExecuteResult{.status = EC_ERROR,
+                                       .error_message = "Copy completion exception",
+                                       .terminal = false,
+                                       .safe_to_reuse_dst = false};
+        }
+        if (result.status == EC_OK && (!cell.native_async || (result.terminal && result.safe_to_reuse_dst))) {
+            OnTaskSuccess(cell.instance_id, cell.block_key);
+        } else if (cell.native_async && (!result.terminal || !result.safe_to_reuse_dst)) {
+            OnTaskUnknown(cell.instance_id, cell.block_key, result.error_message);
+        } else {
+            OnTaskFailed(cell.instance_id, cell.block_key, result.status);
         }
     }
 
@@ -2534,7 +2396,7 @@ void MigrationManager::ProcessExpiredMarks() {
     }
 }
 
-bool MigrationManager::CompleteCancelledTask(const CopyTaskContext &ctx, bool record_completion) {
+void MigrationManager::CompleteCancelledTask(const CopyTaskContext &ctx, bool record_completion) {
     // 取消任务的延迟收尾（monitor 线程，认领到 kWasCancelling 时调用）。
     // 目标此时仍为 WRITING（cancelling 任务从未被 promote）；CAS WRITING->DELETING 删半成品，源端不动。
     SubmitTargetLocationDelete(ctx);
@@ -2544,7 +2406,7 @@ bool MigrationManager::CompleteCancelledTask(const CopyTaskContext &ctx, bool re
         RemoveActiveTaskLocked(ctx.instance_id, ctx.block_key);
     }
     if (!record_completion) {
-        return true;
+        return;
     }
     stat_copy_cancelled_.fetch_add(1, std::memory_order_relaxed);
     // cancelled 是与 success/failed 对称的终态：在实际清理时计数，保持 submitted==success+failed+cancelled。
@@ -2571,7 +2433,6 @@ bool MigrationManager::CompleteCancelledTask(const CopyTaskContext &ctx, bool re
                   ctx.instance_id.c_str(),
                   ctx.block_key,
                   ctx.dst_location_id.c_str());
-    return true;
 }
 
 ErrorCode MigrationManager::Cancel(const std::string &instance_id, int64_t block_key) {
@@ -2601,7 +2462,7 @@ ErrorCode MigrationManager::Cancel(const std::string &instance_id, int64_t block
             cancelling_ctx.src_storage_name, cancelling_ctx.async_operation_id, cancelling_ctx.storage_backends);
         if (cancel_ec != EC_OK) {
             // Cancellation is process-local intent, not drain proof. Completion
-            // still discards this target and the deletion path retries backend busy.
+            // still discards this target and attempts cleanup once under backend protection.
             KVCM_LOG_WARN("[cancel] async coordinator did not accept cancellation immediately: "
                           "instance %s block_key %lld operation_id %s ec %d",
                           instance_id.c_str(),
@@ -2755,10 +2616,6 @@ MigrationManager::ClaimResult MigrationManager::ClaimForCompletionLocked(const s
         return ClaimResult::kWasCancelling;
     }
     if (task.state == CopyTaskState::kCompleting) {
-        if (task.promotion_pending_sync) {
-            out_ctx = task;
-            return ClaimResult::kRetryingPromotion;
-        }
         return ClaimResult::kBusyCompleting; // 防御：完成路径仅单一 monitor 线程，正常不会重入
     }
     task.state = CopyTaskState::kCompleting; // 认领：此后并发 Cancel 走 busy 分支
