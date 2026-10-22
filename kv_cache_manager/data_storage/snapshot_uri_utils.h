@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -46,7 +47,9 @@ struct CanonicalSnapshotUriAppendInfo {
 
 class SnapshotUriUtils {
 public:
-    inline static constexpr const char *kSnapshotVersionParam = "s_version";
+    inline static constexpr const char *kSnapshotVersionParam = "s_v";
+    inline static constexpr size_t kSnapshotVersionHexLength = 8;
+    inline static constexpr const char *kLegacySnapshotVersionParam = "s_version";
 
     static bool IsValidLocationIdComponent(const std::string &value) {
         return !value.empty() && value.find('#') == std::string::npos;
@@ -78,7 +81,7 @@ public:
     }
 
     static bool IsValidSnapshotVersionToken(const std::string &version) {
-        if (version.size() != 32) {
+        if (version.size() != kSnapshotVersionHexLength) {
             return false;
         }
         for (const unsigned char ch : version) {
@@ -94,7 +97,7 @@ public:
     // DataStorageUri parse would copy every URI component and allocate one
     // std::map node per query parameter for every (key, spec) visited. Scan the
     // immutable URI in place instead. An empty out_version means legacy
-    // metadata without s_version; malformed or duplicate s_version parameters
+    // metadata without s_v; malformed or duplicate s_v parameters
     // fail closed.
     //
     // The returned view borrows uri_text and must not outlive it.
@@ -153,6 +156,11 @@ public:
             const size_t equals = uri_text.find('=', begin);
             const size_t key_end = equals != std::string_view::npos && equals < end ? equals : end;
             constexpr std::string_view version_key{kSnapshotVersionParam};
+            if (key_end - begin == std::string_view(kLegacySnapshotVersionParam).size() &&
+                uri_text.compare(begin, std::string_view(kLegacySnapshotVersionParam).size(),
+                                 kLegacySnapshotVersionParam) == 0) {
+                return false;
+            }
             if (key_end - begin == version_key.size() &&
                 uri_text.compare(begin, version_key.size(), version_key) == 0) {
                 if (found_version || equals == std::string_view::npos || equals >= end) {
@@ -170,7 +178,7 @@ public:
         if (!found_version) {
             return true;
         }
-        if (out_version.size() != 32) {
+        if (out_version.size() != kSnapshotVersionHexLength) {
             return false;
         }
         for (const unsigned char ch : out_version) {
@@ -182,7 +190,7 @@ public:
     }
 
     static bool HasEventReportInternalUriMetadata(const DataStorageUri &uri) {
-        return uri.HasParam(kSnapshotVersionParam);
+        return uri.HasParam(kSnapshotVersionParam) || uri.HasParam(kLegacySnapshotVersionParam);
     }
 
     // Allocation-free fast parser for an already canonical URI. It accepts
@@ -190,7 +198,7 @@ public:
     // positive canonical port, explicit `key=value` query entries, and unique
     // keys in strict lexical order. Noncanonical-but-valid input returns false
     // so callers can use the full StandardUri fallback without changing wire
-    // compatibility. The returned offset inserts s_version in sorted order.
+    // compatibility. The returned offset inserts s_v in sorted order.
     static bool ParseCanonicalUriForSnapshotAppend(std::string_view uri, CanonicalSnapshotUriAppendInfo &out) noexcept {
         out = {};
         const size_t protocol_end = uri.find("://");
@@ -248,7 +256,8 @@ public:
             }
             const std::string_view key = uri.substr(param_start, equals - param_start);
             const std::string_view value = uri.substr(equals + 1, param_end - equals - 1);
-            if ((has_previous_key && !(previous_key < key)) || key == kSnapshotVersionParam) {
+            if ((has_previous_key && !(previous_key < key)) || key == kSnapshotVersionParam ||
+                key == kLegacySnapshotVersionParam) {
                 return false;
             }
             if (out.insertion_offset == uri.size() && std::string_view(kSnapshotVersionParam) < key) {
@@ -287,7 +296,7 @@ public:
     // ReportEvent obtains one KVCM-generated, already validated generation
     // token and appends it to tens of thousands of independently validated
     // specs. Keep the public checked helper above for general callers; this
-    // variant avoids rescanning the same 32-byte token for every block.
+    // variant avoids rescanning the same 8-character token for every block.
     static bool AddPrevalidatedSnapshotVersionToCanonicalUri(std::string_view uri,
                                                              const CanonicalSnapshotUriAppendInfo &info,
                                                              const std::string &version,
@@ -314,10 +323,13 @@ public:
     // DataStorageUri stores query parameters in a map, so duplicate keys from
     // the original text are no longer observable here. Raw metadata and
     // protocol input must use the string overload below, which enforces that
-    // s_version occurs exactly once.
+    // s_v occurs exactly once.
     static bool ParseSnapshotUriInfo(const DataStorageUri &uri, SnapshotUriInfo &out) {
         out.version.clear();
         if (!uri.Valid()) {
+            return false;
+        }
+        if (uri.HasParam(kLegacySnapshotVersionParam)) {
             return false;
         }
         const std::string version = uri.GetParam(kSnapshotVersionParam);
@@ -330,7 +342,8 @@ public:
 
     static bool ParseSnapshotUriInfo(const std::string &uri_text, SnapshotUriInfo &out) {
         out.version.clear();
-        if (CountUriParam(uri_text, kSnapshotVersionParam) != 1) {
+        if (CountUriParam(uri_text, kSnapshotVersionParam) != 1 ||
+            CountUriParam(uri_text, kLegacySnapshotVersionParam) != 0) {
             return false;
         }
         return ParseSnapshotUriInfo(DataStorageUri(uri_text), out);
@@ -340,7 +353,8 @@ public:
         out_uri.clear();
         DataStorageUri uri(raw_uri);
         if (!uri.Valid() || !IsValidSnapshotVersionToken(version) ||
-            CountUriParam(raw_uri, kSnapshotVersionParam) != 0) {
+            CountUriParam(raw_uri, kSnapshotVersionParam) != 0 ||
+            CountUriParam(raw_uri, kLegacySnapshotVersionParam) != 0) {
             return false;
         }
         return AddSnapshotVersionToUri(std::move(uri), version, out_uri);

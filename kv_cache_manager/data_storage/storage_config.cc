@@ -106,7 +106,8 @@ bool MooncakeStorageSpec::ValidateRequiredFields(std::string &invalid_fields) co
 std::string TairMemPoolStorageSpec::ToString() const {
     std::ostringstream oss;
     oss << "domain: " << domain_ << ", timeout: " << timeout_ << ", health_check_timeout: " << health_check_timeout_
-        << ", service_discovery_url: " << service_discovery_url_ << ", media_type: " << media_type_
+        << ", allocate_concurrency: " << allocate_concurrency_ << ", service_discovery_url: " << service_discovery_url_
+        << ", media_type: " << media_type_
         << ", skip_confirmed_missing_backend_delete: " << skip_confirmed_missing_backend_delete_;
     return oss.str();
 }
@@ -120,6 +121,10 @@ bool TairMemPoolStorageSpec::ValidateRequiredFields(std::string &invalid_fields)
     if (health_check_timeout_ <= 0) {
         valid = false;
         local_invalid_fields += "{health_check_timeout}";
+    }
+    if (allocate_concurrency_ < 0 || allocate_concurrency_ > kMaxAllocateConcurrency) {
+        valid = false;
+        local_invalid_fields += "{allocate_concurrency}";
     }
     if (media_type_ != kTairMemPoolMediaTypeUnspecified && media_type_ != kTairMemPoolMediaTypeDram &&
         media_type_ != kTairMemPoolMediaTypeSsd) {
@@ -276,6 +281,13 @@ bool TairMemPoolStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value)
     KVCM_JSON_GET_MACRO(rapid_value, "domain", domain_);
     KVCM_JSON_GET_MACRO(rapid_value, "timeout", timeout_);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "health_check_timeout", health_check_timeout_, kDefaultHealthCheckTimeout);
+    int64_t allocate_concurrency = kDefaultAllocateConcurrency;
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "allocate_concurrency", allocate_concurrency, static_cast<int64_t>(kDefaultAllocateConcurrency));
+    if (allocate_concurrency < 0 || allocate_concurrency > kMaxAllocateConcurrency) {
+        return false;
+    }
+    allocate_concurrency_ = static_cast<int32_t>(allocate_concurrency);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "service_discovery_url", service_discovery_url_, std::string(""));
     uint32_t media_type = kTairMemPoolMediaTypeUnspecified;
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "media_type", media_type, static_cast<uint32_t>(0));
@@ -307,6 +319,7 @@ void TairMemPoolStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBu
     Put(writer, "domain", domain_);
     Put(writer, "timeout", timeout_);
     Put(writer, "health_check_timeout", health_check_timeout_);
+    Put(writer, "allocate_concurrency", allocate_concurrency_);
     Put(writer, "service_discovery_url", service_discovery_url_);
     Put(writer, "media_type", media_type_);
     Put(writer, "skip_confirmed_missing_backend_delete", skip_confirmed_missing_backend_delete_);

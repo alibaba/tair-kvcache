@@ -137,7 +137,7 @@ Timeout returns retryable `SNAPSHOT_IN_PROGRESS`; a timed-out delta does not
 abort the snapshot or acquire a mutation lease. Different reporters remain
 independent. A second concurrent snapshot also receives `SNAPSHOT_IN_PROGRESS`.
 
-KVCM keeps the location id stable and appends only its reserved `s_version`
+KVCM keeps the location id stable and appends only its reserved `s_v`
 parameter to each event-report URI. After all metadata writes and `Sync`
 succeed, KVCM publishes the in-memory committed token and returns it as
 `committed_snapshot_version`. A successful complete snapshot makes that token
@@ -166,7 +166,7 @@ hard visibility gates, and malformed URI metadata is rejected.
 Snapshots should be rare: event gap, explicit repair, or an optional
 very-low-frequency fallback. The 30-second server-side minimum interval is a
 safety limit, not a recommended reporting period.
-Callers must not set `s_version`. `EVENT_HOST_DOWN` is terminal and must be sent
+Callers must not set `s_v`. `EVENT_HOST_DOWN` is terminal and must be sent
 as the only event in its request.
 
 ```bash
