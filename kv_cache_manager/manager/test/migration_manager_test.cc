@@ -3821,13 +3821,13 @@ TEST_F(MigrationManagerTest, TestAsyncAdmissionBoundsInflightBytes) {
 }
 
 TEST_F(MigrationManagerTest, TestDefaultAsyncConcurrencyLimitAndCompletionRefill) {
-    // 64 * 256 MiB = 16 GiB: concurrency binds while the byte budget still has room.
-    CheckDefaultAsyncCopyAdmission(256ULL * 1024 * 1024, 64);
+    // 1024 * 256 MiB = 256 GiB: concurrency binds while the byte budget still has room.
+    CheckDefaultAsyncCopyAdmission(256ULL * 1024 * 1024, 1024);
 }
 
 TEST_F(MigrationManagerTest, TestDefaultAsyncByteLimitAndCompletionRefill) {
-    // 32 * 1 GiB = 32 GiB: bytes bind while half of the operation slots remain.
-    CheckDefaultAsyncCopyAdmission(1024ULL * 1024 * 1024, 32);
+    // 32 * 32 GiB = 1 TiB: bytes bind while most operation slots remain.
+    CheckDefaultAsyncCopyAdmission(32ULL * 1024 * 1024 * 1024, 32);
 }
 
 TEST_F(MigrationManagerTest, TestBatchByteRejectionDoesNotConsumeRemainingConcurrencySlot) {

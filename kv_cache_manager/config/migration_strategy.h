@@ -127,8 +127,8 @@ private:
 
 class MigrationConfig : public Jsonizable {
 public:
-    static constexpr int64_t kDefaultCopyMaxConcurrency = 64;
-    static constexpr uint64_t kDefaultCopyMaxInflightBytes = 32ULL * 1024 * 1024 * 1024;
+    static constexpr int64_t kDefaultCopyMaxConcurrency = 1024;
+    static constexpr uint64_t kDefaultCopyMaxInflightBytes = 1ULL * 1024 * 1024 * 1024 * 1024;
     static constexpr int64_t kDefaultCopyOperationDeadlineMs = 10 * 60 * 1000;
     static constexpr int64_t kDefaultCopyPollInitialIntervalMs = 20;
     static constexpr int64_t kDefaultCopyPollMaxIntervalMs = 1000;

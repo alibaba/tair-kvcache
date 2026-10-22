@@ -236,7 +236,7 @@ TEST_F(MigrationStrategyTest, TestInCacheConfig) {
     })";
     ASSERT_TRUE(no_migration.FromJsonString(json2));
     ASSERT_EQ(CacheConfig::kDefaultMigrationCopyMaxConcurrency, no_migration.migration_copy_max_concurrency());
-    ASSERT_EQ(34359738368ULL, no_migration.migration_copy_max_inflight_bytes());
+    ASSERT_EQ(1099511627776ULL, no_migration.migration_copy_max_inflight_bytes());
     ASSERT_EQ(MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS, no_migration.migration_mark_clear_policy());
     ASSERT_EQ(MigrationConfig::kDefaultCopyConnectTimeoutMs,
               no_migration.migration_copy_connect_timeout_ms());
@@ -248,8 +248,8 @@ TEST_F(MigrationStrategyTest, TestInCacheConfig) {
 
 TEST_F(MigrationStrategyTest, TestAsyncCopyBudgetDefaultsAndExplicitZero) {
     MigrationConfig config;
-    EXPECT_EQ(64, config.copy_max_concurrency());
-    EXPECT_EQ(34359738368ULL, config.copy_max_inflight_bytes());
+    EXPECT_EQ(1024, config.copy_max_concurrency());
+    EXPECT_EQ(1099511627776ULL, config.copy_max_inflight_bytes());
     config.set_copy_execution_mode(MigrationCopyExecutionMode::ASYNC_REQUIRED);
     std::string invalid_fields;
     EXPECT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
@@ -258,8 +258,8 @@ TEST_F(MigrationStrategyTest, TestAsyncCopyBudgetDefaultsAndExplicitZero) {
     parsed_defaults.set_copy_max_concurrency(2);
     parsed_defaults.set_copy_max_inflight_bytes(128ULL * 1024 * 1024);
     ASSERT_TRUE(parsed_defaults.FromJsonString(R"({"copy_execution_mode":1,"strategies":[]})"));
-    EXPECT_EQ(64, parsed_defaults.copy_max_concurrency());
-    EXPECT_EQ(34359738368ULL, parsed_defaults.copy_max_inflight_bytes());
+    EXPECT_EQ(1024, parsed_defaults.copy_max_concurrency());
+    EXPECT_EQ(1099511627776ULL, parsed_defaults.copy_max_inflight_bytes());
     invalid_fields.clear();
     EXPECT_TRUE(parsed_defaults.ValidateRequiredFields(invalid_fields)) << invalid_fields;
 
