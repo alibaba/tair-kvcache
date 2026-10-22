@@ -16,10 +16,16 @@ process group:
   a hybrid group is the one v2 registers;
 * the Manager registration and the SDK client are created on the first storage
   call (never before the pool set is final) and exactly once;
-* a pool registered after that point is reported once and degraded to misses.
-
-* a pool registered after initialization is not recorded and stays unusable,
-  even when it reuses the name of a pool whose spec is already registered.
+* a pool registered after that point is reported once and degraded to misses:
+  it is not recorded and stays unusable, even when it reuses the name of a pool
+  whose spec is already registered;
+* the module-level ``_POOL_SPECS`` table holds its invariants (unique pools and
+  spec suffixes, exactly one anchor), so "one more row" cannot silently alias
+  two pools onto one location spec;
+* the whole control plane an instance hands to the Manager and the SDK client
+  -- spec names, sizes, groups, iov size, client config -- matches a literal
+  golden table for every pool combination, on MLA and non-MLA models, on every
+  rank.
 
 Prerequisites: a sglang runtime that can import its own backend (``sgl_kernel``
 and friends) and ``kv_cache_manager`` importable from the repository root on
@@ -33,6 +39,7 @@ resolved with ``getattr``; the file itself needs sglang >= v0.5.11, whose
     PYTHONPATH=$PWD python kv_cache_manager/py_connector/sglang/test_pool_registration.py
 """
 
+import dataclasses
 import json
 import sys
 import threading
@@ -353,10 +360,396 @@ class TestRegistrationOrders(unittest.TestCase):
             # what this test is about.
             self.assertEqual(connector.location_spec_name, "tp_0_full")
             self.assertEqual(
-                connector.mamba_location_spec_name,
+                connector._get_extra_pool_spec_name(PoolName.MAMBA),
                 f"tp_{tp_rank}_linear",
                 "each rank reads and writes its own Mamba slice",
             )
+
+
+##################################################
+# The pool spec table
+##################################################
+
+# Bytes of one block of the fake pools below: KV and Indexer are token-granular
+# (times the page size), Mamba is page-granular (one slot per block).
+KV_SPEC_BYTES = KV_BYTES_PER_TOKEN * PAGE_SIZE
+MAMBA_SPEC_BYTES = MAMBA_BYTES_PER_TOKEN
+INDEXER_BYTES_PER_TOKEN = 40
+INDEXER_SPEC_BYTES = INDEXER_BYTES_PER_TOKEN * PAGE_SIZE
+# A DSA indexer cache can hold more bytes per block than the KV cache (its
+# quantized index adds up over layers), which is the case that pins the iov size
+# to the largest pool instead of to the KV pool.
+BIG_INDEXER_BYTES_PER_TOKEN = 4096
+BIG_INDEXER_SPEC_BYTES = BIG_INDEXER_BYTES_PER_TOKEN * PAGE_SIZE
+
+# The negative cases below build their tables from this minimal valid one, not
+# from ``_POOL_SPECS``: a later PR adding a row to the real table must not change
+# which invariant rejects them (that would hide the one under test).
+_BASE_TABLE = (connector_module._KV_SPEC, connector_module._MAMBA_SPEC)
+# A pool name no table can contain -- deliberately not a sglang enum member.
+_FRESH_POOL = "pool-that-is-not-in-the-table"
+
+
+def _check_pool_spec_table(table: tuple) -> None:
+    """Run the table guard that ``connector`` also runs at import time."""
+    connector_module._validate_pool_specs(table)
+
+
+class TestPoolSpecTable(unittest.TestCase):
+    """The spec table is the connector's whole pool knowledge.
+
+    Every later PR adds rows to it, so its invariants are pinned here -- and
+    pinned *negatively* too, on the row shapes that would otherwise pass every
+    other test in this directory while corrupting data.
+    """
+
+    def test_the_table_holds_its_invariants(self) -> None:
+        _check_pool_spec_table(connector_module._POOL_SPECS)
+
+    def test_a_sidecar_reusing_a_suffix_is_rejected(self) -> None:
+        """P4 writing ``suffix="_linear"`` for SWA must fail here, not at runtime."""
+        colliding = connector_module._PoolSpec(
+            pool=_FRESH_POOL,
+            group="Swa",
+            suffix=connector_module._MAMBA_SPEC.suffix,
+        )
+        with self.assertRaisesRegex(ValueError, "same spec suffix"):
+            _check_pool_spec_table((*_BASE_TABLE, colliding))
+
+    def test_a_repeated_pool_row_is_rejected(self) -> None:
+        # The suffix differs, so only the pool-uniqueness check can catch it.
+        duplicate = dataclasses.replace(connector_module._MAMBA_SPEC, suffix="_kda")
+        with self.assertRaisesRegex(ValueError, "more than one row"):
+            _check_pool_spec_table((*_BASE_TABLE, duplicate))
+
+    def test_a_second_anchor_is_rejected(self) -> None:
+        # A pool, suffix and group nobody else uses, so only the anchor count
+        # can reject this table.
+        second_anchor = connector_module._PoolSpec(
+            pool=_FRESH_POOL, group="Swa", suffix="_swa", anchor=True
+        )
+        with self.assertRaisesRegex(ValueError, "exactly one anchor"):
+            _check_pool_spec_table((*_BASE_TABLE, second_anchor))
+
+    def test_a_missing_anchor_is_rejected(self) -> None:
+        without_anchor = tuple(spec for spec in _BASE_TABLE if not spec.anchor)
+        with self.assertRaisesRegex(ValueError, "exactly one anchor"):
+            _check_pool_spec_table(without_anchor)
+
+    def test_an_anchor_that_is_not_the_kv_pool_is_rejected(self) -> None:
+        wrong_anchor = dataclasses.replace(connector_module._KV_SPEC, pool=_FRESH_POOL)
+        with self.assertRaisesRegex(ValueError, "the anchor is the KV pool"):
+            _check_pool_spec_table((wrong_anchor, connector_module._MAMBA_SPEC))
+
+    def test_a_row_without_a_suffix_is_rejected(self) -> None:
+        # Deliberately invalid: the guard must catch what the type checker
+        # already refuses.
+        no_suffix = connector_module._PoolSpec(
+            pool=_FRESH_POOL,
+            group="Swa",
+            suffix=None,  # ty: ignore[invalid-argument-type]
+        )
+        with self.assertRaisesRegex(ValueError, "no suffix"):
+            _check_pool_spec_table((*_BASE_TABLE, no_suffix))
+
+    def test_a_sidecar_sharing_the_anchor_group_is_rejected(self) -> None:
+        same_group = dataclasses.replace(
+            connector_module._MAMBA_SPEC, group=connector_module._KV_SPEC.group
+        )
+        with self.assertRaisesRegex(ValueError, "share a spec group"):
+            _check_pool_spec_table((connector_module._KV_SPEC, same_group))
+
+    def test_two_sidecars_sharing_a_group_is_rejected(self) -> None:
+        """P4 writing ``group="Linear"`` for SWA: the Manager skips its specs."""
+        same_group = connector_module._PoolSpec(
+            pool=_FRESH_POOL, group=connector_module._MAMBA_SPEC.group, suffix="_swa"
+        )
+        with self.assertRaisesRegex(ValueError, "share a spec group"):
+            _check_pool_spec_table((*_BASE_TABLE, same_group))
+
+    def test_a_sidecar_with_an_empty_group_is_rejected(self) -> None:
+        """An empty group name means "no constraint" to the Manager, so the
+        pool would be silently dropped -- it must be rejected at the table."""
+        empty = connector_module._PoolSpec(pool=_FRESH_POOL, group="", suffix="_swa")
+        with self.assertRaisesRegex(ValueError, "empty spec group"):
+            _check_pool_spec_table((*_BASE_TABLE, empty))
+
+    def test_the_anchor_with_an_empty_group_is_rejected(self) -> None:
+        empty = dataclasses.replace(connector_module._KV_SPEC, group="")
+        with self.assertRaisesRegex(ValueError, "empty spec group"):
+            _check_pool_spec_table((empty, connector_module._MAMBA_SPEC))
+
+
+##################################################
+# Control plane golden
+##################################################
+
+# What one instance hands to the Manager and to the SDK client, per pool
+# combination: the register payload's (name, size) pairs in order, its
+# (group, spec_names) pairs in order or None when the field stays absent, and
+# the iov size.  Literal on purpose: P2/P3/P4 add pools and change these
+# fields, and this is the table that makes "only added, nothing changed"
+# checkable without a GPU or a Manager.
+_COMBO_GOLDEN: dict[tuple, tuple] = {
+    (): (
+        [("tp_0", KV_SPEC_BYTES), ("tp_1", KV_SPEC_BYTES)],
+        None,
+        KV_SPEC_BYTES * 1024,
+    ),
+    ((PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),): (
+        [
+            ("tp_0_full", KV_SPEC_BYTES),
+            ("tp_1_full", KV_SPEC_BYTES),
+            ("tp_0_linear", MAMBA_SPEC_BYTES),
+            ("tp_1_linear", MAMBA_SPEC_BYTES),
+        ],
+        [
+            ("Full", ["tp_0_full", "tp_1_full"]),
+            ("Linear", ["tp_0_linear", "tp_1_linear"]),
+        ],
+        KV_SPEC_BYTES * 1024,
+    ),
+    ((PoolName.INDEXER, INDEXER_BYTES_PER_TOKEN),): (
+        [
+            ("tp_0_full", KV_SPEC_BYTES),
+            ("tp_1_full", KV_SPEC_BYTES),
+            ("tp_0_indexer", INDEXER_SPEC_BYTES),
+            ("tp_1_indexer", INDEXER_SPEC_BYTES),
+        ],
+        [
+            ("Full", ["tp_0_full", "tp_1_full"]),
+            ("Indexer", ["tp_0_indexer", "tp_1_indexer"]),
+        ],
+        KV_SPEC_BYTES * 1024,
+    ),
+    (
+        (PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),
+        (PoolName.INDEXER, INDEXER_BYTES_PER_TOKEN),
+    ): (
+        [
+            ("tp_0_full", KV_SPEC_BYTES),
+            ("tp_1_full", KV_SPEC_BYTES),
+            ("tp_0_linear", MAMBA_SPEC_BYTES),
+            ("tp_1_linear", MAMBA_SPEC_BYTES),
+            ("tp_0_indexer", INDEXER_SPEC_BYTES),
+            ("tp_1_indexer", INDEXER_SPEC_BYTES),
+        ],
+        [
+            ("Full", ["tp_0_full", "tp_1_full"]),
+            ("Linear", ["tp_0_linear", "tp_1_linear"]),
+            ("Indexer", ["tp_0_indexer", "tp_1_indexer"]),
+        ],
+        KV_SPEC_BYTES * 1024,
+    ),
+    ((PoolName.INDEXER, BIG_INDEXER_BYTES_PER_TOKEN),): (
+        [
+            ("tp_0_full", KV_SPEC_BYTES),
+            ("tp_1_full", KV_SPEC_BYTES),
+            ("tp_0_indexer", BIG_INDEXER_SPEC_BYTES),
+            ("tp_1_indexer", BIG_INDEXER_SPEC_BYTES),
+        ],
+        [
+            ("Full", ["tp_0_full", "tp_1_full"]),
+            ("Indexer", ["tp_0_indexer", "tp_1_indexer"]),
+        ],
+        BIG_INDEXER_SPEC_BYTES * 1024,
+    ),
+}
+
+# The SDK client's spec map, i.e. the specs this rank reads and writes: the
+# replicated pools (KV, Indexer) are rank 0's on an MLA model, the sharded one
+# (Mamba) is always this rank's.  The KV spec leads the map.
+_OWN_SPECS: dict[tuple, dict[tuple[bool, int], dict[str, int]]] = {
+    (): {
+        (False, 0): {"tp_0": KV_SPEC_BYTES},
+        (False, 1): {"tp_1": KV_SPEC_BYTES},
+        (True, 0): {"tp_0": KV_SPEC_BYTES},
+        (True, 1): {"tp_0": KV_SPEC_BYTES},
+    },
+    ((PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),): {
+        (False, 0): {"tp_0_full": KV_SPEC_BYTES, "tp_0_linear": MAMBA_SPEC_BYTES},
+        (False, 1): {"tp_1_full": KV_SPEC_BYTES, "tp_1_linear": MAMBA_SPEC_BYTES},
+        (True, 0): {"tp_0_full": KV_SPEC_BYTES, "tp_0_linear": MAMBA_SPEC_BYTES},
+        (True, 1): {"tp_0_full": KV_SPEC_BYTES, "tp_1_linear": MAMBA_SPEC_BYTES},
+    },
+    ((PoolName.INDEXER, INDEXER_BYTES_PER_TOKEN),): {
+        (False, 0): {"tp_0_full": KV_SPEC_BYTES, "tp_0_indexer": INDEXER_SPEC_BYTES},
+        (False, 1): {"tp_1_full": KV_SPEC_BYTES, "tp_1_indexer": INDEXER_SPEC_BYTES},
+        (True, 0): {"tp_0_full": KV_SPEC_BYTES, "tp_0_indexer": INDEXER_SPEC_BYTES},
+        (True, 1): {"tp_0_full": KV_SPEC_BYTES, "tp_0_indexer": INDEXER_SPEC_BYTES},
+    },
+    (
+        (PoolName.MAMBA, MAMBA_BYTES_PER_TOKEN),
+        (PoolName.INDEXER, INDEXER_BYTES_PER_TOKEN),
+    ): {
+        (False, 0): {
+            "tp_0_full": KV_SPEC_BYTES,
+            "tp_0_linear": MAMBA_SPEC_BYTES,
+            "tp_0_indexer": INDEXER_SPEC_BYTES,
+        },
+        (False, 1): {
+            "tp_1_full": KV_SPEC_BYTES,
+            "tp_1_linear": MAMBA_SPEC_BYTES,
+            "tp_1_indexer": INDEXER_SPEC_BYTES,
+        },
+        (True, 0): {
+            "tp_0_full": KV_SPEC_BYTES,
+            "tp_0_linear": MAMBA_SPEC_BYTES,
+            "tp_0_indexer": INDEXER_SPEC_BYTES,
+        },
+        (True, 1): {
+            "tp_0_full": KV_SPEC_BYTES,
+            "tp_1_linear": MAMBA_SPEC_BYTES,
+            "tp_0_indexer": INDEXER_SPEC_BYTES,
+        },
+    },
+    ((PoolName.INDEXER, BIG_INDEXER_BYTES_PER_TOKEN),): {
+        (False, 0): {
+            "tp_0_full": KV_SPEC_BYTES,
+            "tp_0_indexer": BIG_INDEXER_SPEC_BYTES,
+        },
+        (False, 1): {
+            "tp_1_full": KV_SPEC_BYTES,
+            "tp_1_indexer": BIG_INDEXER_SPEC_BYTES,
+        },
+        (True, 0): {"tp_0_full": KV_SPEC_BYTES, "tp_0_indexer": BIG_INDEXER_SPEC_BYTES},
+        (True, 1): {"tp_0_full": KV_SPEC_BYTES, "tp_0_indexer": BIG_INDEXER_SPEC_BYTES},
+    },
+}
+
+
+def _expected_client_config(spec_infos: dict) -> str:
+    """The SDK client config string of a control-plane instance.
+
+    Only the spec map varies with the pool combination and the rank; the rest
+    is what ``_connector()`` configures (the SDK defaults of an instance that
+    sets none of the ``sdk_*`` knobs).
+    """
+    return json.dumps(
+        {
+            "instance_group": "default",
+            "instance_id": "registration-test",
+            "block_size": PAGE_SIZE,
+            "sdk_config": {
+                "thread_num": 4,
+                "queue_size": 1000,
+                "sdk_backend_configs": [],
+                "timeout_config": {"get_timeout_ms": 15000, "put_timeout_ms": 15000},
+            },
+            "location_spec_infos": spec_infos,
+        }
+    )
+
+
+class TestControlPlaneGolden(unittest.TestCase):
+    """The control plane of an instance, pinned for every pool combination.
+
+    The register payload and the SDK client config are what a Manager and the
+    data path are built from; P2/P3/P4 all change them, so their exact content
+    is asserted here instead of being compared by hand between branches.
+    """
+
+    def setUp(self) -> None:
+        _mock_kvcm.reset_mock()
+        HiCacheKVCM._reported_pools.clear()
+
+    def _control_plane(
+        self, pools: tuple, *, is_mla: bool, tp_rank: int, tp_size: int = 2
+    ) -> dict:
+        """Drive the real initialization for one rank of one pool combination."""
+        with _patched_parallel_context():
+            connector = _connector(
+                tp_rank=tp_rank, tp_size=tp_size, is_mla_model=is_mla
+            )
+            connector.register_mem_pool_host(
+                FakeHostPool(bytes_per_token=KV_BYTES_PER_TOKEN, dtype=torch.bfloat16)
+            )
+            for name, bytes_per_token in pools:
+                connector.register_mem_host_pool_v2(
+                    FakeHostPool(bytes_per_token=bytes_per_token, dtype=torch.float32),
+                    name,
+                )
+            connector.batch_exists(["block-0"])
+
+        payload = _register_instance_payload(connector)
+        return {
+            "location_spec_infos": payload["location_spec_infos"],
+            "location_spec_groups": payload.get("location_spec_groups"),
+            "iov_size": connector.iov_size,
+            "client_config": _mock_kvcm.TransferClient.Create.call_args.args[0],
+            "self_location_spec_name": connector.init_params.self_location_spec_name,
+            "location_spec_name": connector.location_spec_name,
+            "kv_factor": connector.kv_factor,
+        }
+
+    def test_control_plane_is_unchanged_per_pool_combination(self) -> None:
+        for pools, (infos, groups, iov_size) in _COMBO_GOLDEN.items():
+            for is_mla in (False, True):
+                for tp_rank in (0, 1):
+                    scenario = f"pools={pools} mla={is_mla} tp_rank={tp_rank}"
+                    with self.subTest(scenario=scenario):
+                        control_plane = self._control_plane(
+                            pools, is_mla=is_mla, tp_rank=tp_rank
+                        )
+                        self.assertEqual(
+                            [
+                                (spec["name"], spec["size"])
+                                for spec in control_plane["location_spec_infos"]
+                            ],
+                            infos,
+                            f"{scenario}: register payload specs, in order",
+                        )
+                        if groups is None:
+                            # Older Managers do not know the field: a flat
+                            # stack must not send it at all, not even empty.
+                            self.assertIsNone(
+                                control_plane["location_spec_groups"],
+                                f"{scenario}: a flat stack must not send spec groups",
+                            )
+                        else:
+                            self.assertEqual(
+                                [
+                                    (group["name"], group["spec_names"])
+                                    for group in control_plane["location_spec_groups"]
+                                    or []
+                                ],
+                                groups,
+                                f"{scenario}: register payload spec groups, in order",
+                            )
+                        self.assertEqual(control_plane["iov_size"], iov_size, scenario)
+
+                        own = _OWN_SPECS[pools][(is_mla, tp_rank)]
+                        self.assertEqual(
+                            control_plane["client_config"],
+                            _expected_client_config(own),
+                            f"{scenario}: SDK client config",
+                        )
+                        # The KV spec leads ``own`` and is the instance's own.
+                        self.assertEqual(
+                            control_plane["self_location_spec_name"], next(iter(own))
+                        )
+                        self.assertEqual(
+                            control_plane["location_spec_name"], next(iter(own))
+                        )
+                        self.assertEqual(
+                            control_plane["kv_factor"], 1 if is_mla else 2, scenario
+                        )
+
+    def test_single_rank_flat_model_keeps_the_legacy_spec_name(self) -> None:
+        control_plane = self._control_plane((), is_mla=False, tp_rank=0, tp_size=1)
+
+        self.assertEqual(
+            [
+                (spec["name"], spec["size"])
+                for spec in control_plane["location_spec_infos"]
+            ],
+            [("tp_0", KV_SPEC_BYTES)],
+        )
+        self.assertIsNone(
+            control_plane["location_spec_groups"],
+            "a flat stack must not send the field older Managers reject",
+        )
+        self.assertEqual(control_plane["location_spec_name"], "tp_0")
 
 
 class TestInitializationTiming(unittest.TestCase):
