@@ -47,6 +47,8 @@ void MetaLocalBackendTest::ConstructMetaStorageBackendConfig() {
 
 std::string MetaLocalBackendTest::ExpectedStorageType() const { return META_LOCAL_BACKEND_TYPE_STR; }
 
+static_assert(sizeof(MetaMemCacheItem) <= 64, "per-key mutex must not return to the cache item");
+
 TEST_F(MetaLocalBackendTest, TestSimple) {
     ASSERT_EQ(ExpectedStorageType(), meta_storage_backend_->GetStorageType());
 
@@ -124,6 +126,67 @@ TEST_F(MetaLocalBackendTest, TestTargetedLocationsPreserveKeyStatus) {
     EXPECT_FALSE(selected[1][0]);
     ASSERT_EQ(1u, selected[2].size());
     EXPECT_FALSE(selected[2][0]);
+}
+
+TEST_F(MetaLocalBackendTest, TestStripedItemLocksWithMaintenanceAndChargeUpdates) {
+    meta_storage_backend_config_->SetStorageUri("local://?num_item_mutex_shard_bits=2");
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("striped_item_locks", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    const LocationId id = "shared";
+    KeyType collision = 2;
+    while (GetShardIndex(collision, 3) != GetShardIndex(1, 3)) {
+        ++collision;
+    }
+    const KeyTypeVec keys{1, collision}; // Deliberately share one item-lock stripe.
+    CacheLocationMapVector seed(keys.size());
+    for (auto &locations : seed) {
+        auto location = std::make_shared<CacheLocation>();
+        location->set_id(id);
+        locations.emplace(id, std::move(location));
+    }
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put(nullptr, keys, seed, PropertyMapVector(keys.size())));
+
+    std::atomic<int> errors{0};
+    auto writer = [&](KeyType key) {
+        for (int i = 0; i < 1000; ++i) {
+            auto location = std::make_shared<CacheLocation>();
+            location->set_id(id);
+            location->push_location_spec(LocationSpec("tp0", std::string(i % 2 ? 16 : 128, 'x')));
+            if (meta_storage_backend_->UpsertSingleLocations(nullptr, {key}, {&id}, {location}) !=
+                std::vector<ErrorCode>{EC_OK}) {
+                ++errors;
+            }
+        }
+    };
+    auto maintenance = [&] {
+        for (int i = 0; i < 1000; ++i) {
+            CacheLocationMapVector locations;
+            if (meta_storage_backend_->GetLocationMapsForMaintenance(nullptr, keys, locations) !=
+                std::vector<ErrorCode>({EC_OK, EC_OK})) {
+                ++errors;
+            }
+            for (const auto &per_key : locations) {
+                for (const auto &[location_id, location] : per_key) {
+                    if (!location || location->id() != location_id) {
+                        ++errors;
+                    }
+                }
+            }
+            if (meta_storage_backend_->DeleteLocationsForMaintenance(nullptr, keys, {{id}, {id}}) !=
+                std::vector<ErrorCode>({EC_OK, EC_OK})) {
+                ++errors;
+            }
+        }
+    };
+    std::thread first(writer, keys[0]);
+    std::thread second(writer, keys[1]);
+    std::thread scanner(maintenance);
+    first.join();
+    second.join();
+    scanner.join();
+    EXPECT_EQ(0, errors.load());
 }
 
 TEST_F(MetaLocalBackendTest, TestSingleLocationFastPathPreservesKeyStatusAndMetadata) {
@@ -320,7 +383,7 @@ TEST_F(MetaLocalBackendTest, TestInit) {
 TEST_F(MetaLocalBackendTest, TestParseStorageUri) {
     // URI with all parameters specified
     auto config = std::make_shared<MetaStorageBackendConfig>();
-    config->SetStorageUri("local://?capacity=1024&num_shard_bits=4&sample_times=50");
+    config->SetStorageUri("local://?capacity=1024&num_shard_bits=4&num_item_mutex_shard_bits=5&sample_times=50");
 
     auto backend = std::make_shared<MetaLocalBackend>();
     ASSERT_EQ(EC_OK, backend->Init("test_instance_uri_all", config));
@@ -328,6 +391,7 @@ TEST_F(MetaLocalBackendTest, TestParseStorageUri) {
     ASSERT_EQ(1024 * 1024 * 1024, backend->cache_->GetCapacity());
     uint32_t expected_shard_mask = (1 << 4) - 1;
     ASSERT_EQ(expected_shard_mask, backend->shard_mask_);
+    ASSERT_EQ(31u, backend->item_mutex_shard_mask_);
     ASSERT_EQ(50, backend->sample_times_);
 
     // Verify the backend is functional with custom parameters
@@ -348,6 +412,8 @@ TEST_F(MetaLocalBackendTest, TestParseStorageUriEmpty) {
     ASSERT_EQ(META_LOCAL_BACKEND_DEFAULT_CAPACITY * 1024 * 1024, backend->cache_->GetCapacity());
     uint32_t expected_shard_mask = (1 << META_LOCAL_BACKEND_DEFAULT_NUM_SHARD_BITS) - 1;
     ASSERT_EQ(expected_shard_mask, backend->shard_mask_);
+    ASSERT_EQ((1u << META_LOCAL_BACKEND_DEFAULT_NUM_ITEM_MUTEX_SHARD_BITS) - 1,
+              backend->item_mutex_shard_mask_);
     ASSERT_EQ(META_LOCAL_BACKEND_DEFAULT_SAMPLE_TIMES, backend->sample_times_);
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), PutWithFieldMaps(backend.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
@@ -363,6 +429,24 @@ TEST_F(MetaLocalBackendTest, TestParseStorageUriInvalidFormat) {
 
     auto backend = std::make_shared<MetaLocalBackend>();
     ASSERT_EQ(EC_BADARGS, backend->Init("test_instance_uri_invalid", config));
+}
+
+TEST_F(MetaLocalBackendTest, TestInvalidItemMutexShardBits) {
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    auto backend = std::make_shared<MetaLocalBackend>();
+    config->SetStorageUri("local://?num_item_mutex_shard_bits=-1");
+    EXPECT_EQ(EC_BADARGS, backend->Init("test_item_mutex_bits", config));
+    config->SetStorageUri("local://?num_item_mutex_shard_bits=25");
+    EXPECT_EQ(EC_BADARGS, backend->Init("test_item_mutex_bits", config));
+}
+
+TEST_F(MetaLocalBackendTest, TestItemMutexShardBitsAbovePreviousLimit) {
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    config->SetStorageUri("local://?num_item_mutex_shard_bits=20");
+
+    auto backend = std::make_shared<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("test_item_mutex_bits", config));
+    EXPECT_EQ((1u << 20) - 1, backend->item_mutex_shard_mask_);
 }
 
 TEST_F(MetaLocalBackendTest, TestPut) {
@@ -2396,9 +2480,10 @@ TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
     std::string loc_value_b(512, 'y'); // non-JSON value, stored as-is
     std::string field_name_b_full = PROPERTY_LOCATION_PREFIX + loc_id_b;
     // SplitFieldMaps creates a CacheLocation with id=loc_id_b and no specs.
-    // EstimateMemUsage = sizeof(CacheLocation) + loc_id_b.size(). The inline store
-    // reuses that immutable id instead of owning a second copy.
-    size_t loc_mem_usage = sizeof(CacheLocation) + loc_id_b.size();
+    // The inline store reuses the immutable id rather than owning a second copy.
+    CacheLocation location_charge;
+    location_charge.set_id(loc_id_b);
+    size_t loc_mem_usage = location_charge.EstimateMemUsage();
     ssize_t expected_delta_upsert = static_cast<ssize_t>(loc_mem_usage);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
               UpsertWithFieldMaps(backend.get(), {1}, {{{field_name_b_full, loc_value_b}}}));

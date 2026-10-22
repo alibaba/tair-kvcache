@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <limits>
 #include <map>
@@ -84,6 +85,104 @@ TEST(CacheLocationMoveTest, ValidatedTotalSizeHintFollowsLocationSpecs) {
     moved.push_location_spec(LocationSpec("tp1", "event_report://size-hint:8080/mem?size=29"));
     EXPECT_FALSE(moved.GetValidatedTotalSize(size));
     EXPECT_FALSE(moved.HasValidatedLocationSpecs());
+
+    moved.set_validated_total_size(static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) + 1);
+    ASSERT_TRUE(moved.GetValidatedTotalSize(size));
+    EXPECT_EQ(static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) + 1, size);
+    moved.set_validated_total_size((std::uint64_t{1} << 48) - 2);
+    ASSERT_TRUE(moved.GetValidatedTotalSize(size));
+    EXPECT_EQ((std::uint64_t{1} << 48) - 2, size);
+    moved.set_validated_total_size((std::uint64_t{1} << 48) - 1);
+    EXPECT_FALSE(moved.GetValidatedTotalSize(size));
+}
+
+TEST(CacheLocationMoveTest, RedisIdInterningAndCompactLayout) {
+    EXPECT_LE(sizeof(CacheLocation), 80u);
+    CacheLocation owned;
+    owned.set_id("shared");
+    CacheLocation shared;
+    shared.set_id(std::make_shared<const std::string>("shared"));
+    EXPECT_EQ(sizeof(std::string) + sizeof(void *) * 2,
+              owned.EstimateMemUsage() - shared.EstimateMemUsage());
+    LocationIdInterner interner;
+    CacheLocationMap first;
+    CacheLocationMap second;
+    PropertyMap properties;
+    const FieldMap fields{{PROPERTY_LOCATION_PREFIX + std::string("shared"),
+                           CacheLocation("shared", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, 1, {})
+                               .ToJsonString()}};
+    ASSERT_EQ(EC_OK, DeserializeLocations(fields, first, &interner));
+    ASSERT_EQ(EC_OK, DeserializeFieldMap(fields, second, properties, &interner));
+    ASSERT_EQ(1u, first.size());
+    ASSERT_EQ(1u, second.size());
+    EXPECT_EQ(&first.at("shared")->id(), &second.at("shared")->id());
+    EXPECT_EQ("shared", first.at("shared")->id());
+    EXPECT_EQ(CLS_SERVING, second.at("shared")->status());
+
+    const FieldMap random_fields{{PROPERTY_LOCATION_PREFIX + std::string("random01"),
+                                  CacheLocation("random01", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 1, {})
+                                      .ToJsonString()}};
+    CacheLocationMap random_first;
+    CacheLocationMap random_second;
+    ASSERT_EQ(EC_OK, DeserializeLocations(random_fields, random_first, &interner));
+    ASSERT_EQ(EC_OK, DeserializeLocations(random_fields, random_second, &interner));
+    EXPECT_NE(&random_first.at("random01")->id(), &random_second.at("random01")->id());
+
+    CacheLocation unknown_status;
+    ASSERT_TRUE(unknown_status.FromJsonString("{\"status\":259,\"location_specs\":[]}"));
+    EXPECT_EQ(259, static_cast<int>(unknown_status.status()));
+
+    LocationIdInterner bounded;
+    const auto overflow_shard = std::hash<std::string>{}("overflow") & 15;
+    size_t inserted = 0;
+    for (int i = 0; inserted < 4096 && i < 1000000; ++i) {
+        const std::string candidate = "key" + std::to_string(i);
+        if ((std::hash<std::string>{}(candidate) & 15) == overflow_shard) {
+            bounded.Intern(candidate);
+            ++inserted;
+        }
+    }
+    ASSERT_EQ(4096u, inserted);
+    bool retained = true;
+    auto overflow_id = bounded.Intern("overflow", &retained);
+    EXPECT_FALSE(retained);
+    CacheLocation overflow;
+    overflow.set_id(std::move(overflow_id), retained);
+    EXPECT_EQ(owned.EstimateMemUsage() + 2, overflow.EstimateMemUsage());
+}
+
+TEST(CacheLocationMoveTest, ConcurrentRedisIdInterning) {
+    LocationIdInterner interner;
+    std::vector<InternedLocationId> ids(16);
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        threads.emplace_back([&, i] { ids[i] = interner.Intern("event_location"); });
+    }
+    for (auto &thread : threads) {
+        thread.join();
+    }
+    for (const auto &id : ids) {
+        EXPECT_EQ(ids.front(), id);
+    }
+}
+
+TEST(CacheLocationMoveTest, PackedSpecCountRoundTrip) {
+    CacheLocation location;
+    location.set_spec_size(65535);
+    EXPECT_EQ(65535u, location.spec_size());
+    ASSERT_TRUE(location.FromJsonString(location.ToJsonString()));
+    EXPECT_EQ(65535u, location.spec_size());
+
+    std::vector<LocationSpec> specs(65536);
+    location.set_location_specs(std::move(specs));
+    EXPECT_EQ(65535u, location.spec_size());
+    location.set_spec_size(location.location_specs().size());
+    EXPECT_EQ(65536u, location.spec_size());
+
+    CacheLocation restored;
+    ASSERT_TRUE(restored.FromJsonString(location.ToJsonString()));
+    EXPECT_EQ(65536u, restored.spec_size());
+    EXPECT_FALSE(restored.FromJsonString("{\"spec_size\":65536,\"location_specs\":[]}"));
 }
 
 namespace {

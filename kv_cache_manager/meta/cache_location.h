@@ -1,9 +1,13 @@
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -21,6 +25,23 @@ namespace kv_cache_manager {
 // block keys. CacheLocation can borrow shared ownership of one canonical
 // string so immutable location copies do not allocate/copy that id again.
 using InternedLocationId = std::shared_ptr<const std::string>;
+
+// A bounded per-backend dictionary for locations reconstructed from Redis.
+// Live entries share their id; weak references and the entry limit avoid
+// retaining every distinct id for the backend's lifetime.
+class LocationIdInterner {
+public:
+    InternedLocationId Intern(const std::string &id, bool *retained = nullptr);
+
+private:
+    static constexpr size_t kShardCount = 16;
+    static constexpr size_t kMaxIdsPerShard = 65536 / kShardCount;
+    struct Shard {
+        std::mutex mutex;
+        std::unordered_map<std::string, std::weak_ptr<const std::string>> ids;
+    };
+    std::array<Shard, kShardCount> shards_;
+};
 
 class LocationSpec : public Jsonizable {
 public:
@@ -93,7 +114,7 @@ PutBlockMask(rapidjson::Writer<rapidjson::StringBuffer> &writer, const std::stri
 class CacheLocation : public Jsonizable {
 public:
     CacheLocation();
-    CacheLocation(const CacheLocation &other);
+    CacheLocation(const CacheLocation &other) = default;
     CacheLocation &operator=(const CacheLocation &) = default;
     CacheLocation(CacheLocation &&) noexcept = default;
     CacheLocation &operator=(CacheLocation &&) noexcept = default;
@@ -126,79 +147,82 @@ public:
         Put(writer, "id", id());
         Put(writer, "status", status_);
         Put(writer, "type", type_);
-        Put(writer, "spec_size", spec_size_);
+        Put(writer, "spec_size", spec_size());
         Put(writer, "create_time", create_time_);
         Put(writer, "location_specs", location_specs_);
     }
 
-    bool FromRapidValue(const rapidjson::Value &rapid_value) override {
-        std::string id;
-        validated_total_size_ = kUnknownValidatedTotalSize;
-        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "id", id, std::string(""));
-        id_ = std::move(id);
-        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "status", status_, CacheLocationStatus::CLS_NOT_FOUND);
-        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "type", type_, DataStorageType::DATA_STORAGE_TYPE_UNKNOWN);
-        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "spec_size", spec_size_, size_t{0});
-        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "create_time", create_time_, int64_t{0});
-        KVCM_JSON_GET_MACRO(rapid_value, "location_specs", location_specs_);
-        return true;
-    }
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override { return FromRapidValueImpl(rapid_value, nullptr); }
 
+    bool FromJsonStringInterned(const std::string &json, LocationIdInterner &interner);
     void set_status(CacheLocationStatus status) { status_ = status; }
     void set_type(DataStorageType type) { type_ = type; }
-    void set_id(const std::string &id) { id_ = id; }
-    void set_id(std::string &&id) noexcept { id_ = std::move(id); }
-    void set_id(InternedLocationId id) noexcept {
-        if (id) {
-            id_ = std::move(id);
-        } else {
-            id_ = std::string{};
-        }
+    void set_id(const std::string &id) {
+        id_ = std::make_shared<const std::string>(id);
+        id_is_interned_ = false;
     }
-    void set_spec_size(size_t spec_size) { spec_size_ = spec_size; }
+    void set_id(std::string &&id) {
+        id_ = std::make_shared<const std::string>(std::move(id));
+        id_is_interned_ = false;
+    }
+    void set_id(InternedLocationId id, bool is_interned = true) noexcept {
+        id_ = std::move(id);
+        id_is_interned_ = is_interned;
+    }
+    void set_spec_size(size_t spec_size) {
+        spec_size_overflow_ = spec_size > kMaxStoredSpecSize;
+        const uint64_t stored = std::min(spec_size, static_cast<size_t>(kMaxStoredSpecSize));
+        packed_sizes_ = (packed_sizes_ & kValidatedTotalSizeMask) | (stored << kSpecSizeShift);
+    }
     void set_create_time(int64_t create_time) { create_time_ = create_time; }
     void push_location_spec(LocationSpec &&location_spec) {
-        validated_total_size_ = kUnknownValidatedTotalSize;
+        ClearValidatedTotalSize();
         location_specs_.push_back(std::move(location_spec));
     }
     void set_location_specs(std::vector<LocationSpec> &&location_specs) {
-        validated_total_size_ = kUnknownValidatedTotalSize;
+        ClearValidatedTotalSize();
         location_specs_ = std::move(location_specs);
     }
-    void set_validated_total_size(std::uint64_t size) noexcept { validated_total_size_ = size; }
+    void set_validated_total_size(std::uint64_t size) noexcept {
+        // Large locations are still valid; they simply use the existing URI
+        // parse path instead of a lossy cached 48-bit aggregate.
+        packed_sizes_ = (packed_sizes_ & ~kValidatedTotalSizeMask) |
+                        (size < kUnknownValidatedTotalSize ? size : kUnknownValidatedTotalSize);
+    }
     [[nodiscard]] bool GetValidatedTotalSize(std::uint64_t &size) const noexcept {
-        if (validated_total_size_ == kUnknownValidatedTotalSize) {
+        if ((packed_sizes_ & kValidatedTotalSizeMask) == kUnknownValidatedTotalSize) {
             return false;
         }
-        size = validated_total_size_;
+        size = packed_sizes_ & kValidatedTotalSizeMask;
         return true;
     }
     [[nodiscard]] bool HasValidatedLocationSpecs() const noexcept {
-        return validated_total_size_ != kUnknownValidatedTotalSize;
+        return (packed_sizes_ & kValidatedTotalSizeMask) != kUnknownValidatedTotalSize;
     }
 
     [[nodiscard]] const std::vector<LocationSpec> &location_specs() const { return location_specs_; }
     [[nodiscard]] std::vector<LocationSpec> &mutable_location_specs() {
-        validated_total_size_ = kUnknownValidatedTotalSize;
+        ClearValidatedTotalSize();
         return location_specs_;
     }
     [[nodiscard]] const std::string &id() const {
-        if (const auto *owned = std::get_if<std::string>(&id_)) {
-            return *owned;
-        }
-        const auto &interned = std::get<InternedLocationId>(id_);
-        if (interned) {
-            return *interned;
+        if (id_) {
+            return *id_;
         }
         static const std::string empty;
         return empty;
     }
     [[nodiscard]] CacheLocationStatus status() const { return status_; }
     [[nodiscard]] DataStorageType type() const { return type_; }
-    [[nodiscard]] size_t spec_size() const { return spec_size_; }
+    [[nodiscard]] size_t spec_size() const {
+        return spec_size_overflow_ ? location_specs_.size() : packed_sizes_ >> kSpecSizeShift;
+    }
     [[nodiscard]] int64_t create_time() const { return create_time_; }
     [[nodiscard]] size_t EstimateMemUsage() const {
         size_t usage = sizeof(CacheLocation) + id().size();
+        if (id_ && !id_is_interned_) {
+            usage += sizeof(std::string) + sizeof(void *) * 2;
+        }
         for (const auto &spec : location_specs_) {
             usage += sizeof(LocationSpec) + spec.name().size() + spec.uri().size();
         }
@@ -206,21 +230,46 @@ public:
     }
 
 private:
-    static constexpr std::uint64_t kUnknownValidatedTotalSize = std::numeric_limits<std::uint64_t>::max();
+    bool FromRapidValueImpl(const rapidjson::Value &rapid_value, LocationIdInterner *interner) {
+        std::string id;
+        ClearValidatedTotalSize();
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "id", id, std::string(""));
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "type", type_, DataStorageType::DATA_STORAGE_TYPE_UNKNOWN);
+        id_is_interned_ = false;
+        id_ = interner && IsEventReportStorageType(type_) ? interner->Intern(id, &id_is_interned_)
+                                                         : std::make_shared<const std::string>(std::move(id));
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "status", status_, CacheLocationStatus::CLS_NOT_FOUND);
+        size_t spec_size = 0;
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "spec_size", spec_size, size_t{0});
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "create_time", create_time_, int64_t{0});
+        KVCM_JSON_GET_MACRO(rapid_value, "location_specs", location_specs_);
+        if (spec_size > kMaxStoredSpecSize && spec_size != location_specs_.size()) {
+            return false;
+        }
+        set_spec_size(spec_size);
+        return true;
+    }
 
-    std::variant<std::string, InternedLocationId> id_;
-    CacheLocationStatus status_ = CacheLocationStatus::CLS_NEW;
-    DataStorageType type_ = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-    size_t spec_size_ = 0;
+    static constexpr uint64_t kSpecSizeShift = 48;
+    static constexpr uint64_t kValidatedTotalSizeMask = (uint64_t{1} << kSpecSizeShift) - 1;
+    static constexpr uint64_t kUnknownValidatedTotalSize = kValidatedTotalSizeMask;
+    static constexpr uint64_t kMaxStoredSpecSize = std::numeric_limits<uint16_t>::max();
+    void ClearValidatedTotalSize() { packed_sizes_ |= kValidatedTotalSizeMask; }
+
+    InternedLocationId id_;
     int64_t create_time_ = 0;
     std::vector<LocationSpec> location_specs_;
     // Pure-local ReportEvent has already validated every URI and summed its
-    // sizes. Keep that proof and aggregate beside the immutable specs so the
+    // sizes. Keep that proof and aggregate with the 16-bit spec count so the
     // writer and query paths can skip repeated structural URI parsing. Every
     // specs mutator clears it; merge/delete code may restore it only when all
     // retained specs are also proven valid. It is intentionally not
     // serialized, so recovered values fail closed and validate again.
-    std::uint64_t validated_total_size_ = kUnknownValidatedTotalSize;
+    uint64_t packed_sizes_ = kUnknownValidatedTotalSize;
+    CacheLocationStatus status_ = CacheLocationStatus::CLS_NEW;
+    DataStorageType type_ = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+    bool id_is_interned_ = false;
+    bool spec_size_overflow_ = false;
 };
 
 using CacheLocationConstPtr = std::shared_ptr<const CacheLocation>;

@@ -33,29 +33,49 @@ bool IsBlockMaskValid(const BlockMask &mask, size_t size) {
 
 CacheLocation::CacheLocation() = default;
 
-CacheLocation::CacheLocation(const CacheLocation &other)
-    : status_(other.status_)
-    , type_(other.type_)
-    , spec_size_(other.spec_size_)
-    , create_time_(other.create_time_)
-    , location_specs_(other.location_specs_)
-    , validated_total_size_(other.validated_total_size_) {
-    if (const auto *owned = std::get_if<std::string>(&other.id_)) {
-        id_.emplace<std::string>(*owned);
-    } else {
-        id_.emplace<InternedLocationId>(std::get<InternedLocationId>(other.id_));
+bool CacheLocation::FromJsonStringInterned(const std::string &json, LocationIdInterner &interner) {
+    rapidjson::Document doc;
+    return Parse(doc, json) && FromRapidValueImpl(doc, &interner);
+}
+
+InternedLocationId LocationIdInterner::Intern(const std::string &id, bool *retained) {
+    auto &shard = shards_[std::hash<std::string>{}(id) & (kShardCount - 1)];
+    std::lock_guard lock(shard.mutex);
+    auto it = shard.ids.find(id);
+    if (it != shard.ids.end()) {
+        if (auto live = it->second.lock()) {
+            if (retained) {
+                *retained = true;
+            }
+            return live;
+        }
     }
+    auto shared = std::make_shared<const std::string>(id);
+    const bool keep = it != shard.ids.end() || shard.ids.size() < kMaxIdsPerShard;
+    if (it != shard.ids.end()) {
+        it->second = shared;
+    } else if (keep) {
+        shard.ids.emplace(*shared, shared);
+    }
+    if (retained) {
+        *retained = keep;
+    }
+    return shared;
 }
 
 CacheLocation::CacheLocation(DataStorageType type, size_t spec_size, const std::vector<LocationSpec> &location_specs)
-    : type_(type), spec_size_(spec_size), location_specs_(location_specs) {}
+    : location_specs_(location_specs), type_(type) {
+    set_spec_size(spec_size);
+}
 
 CacheLocation::CacheLocation(const std::string &id,
                              CacheLocationStatus status,
                              DataStorageType type,
                              size_t spec_size,
                              const std::vector<LocationSpec> &location_specs)
-    : id_(id), status_(status), type_(type), spec_size_(spec_size), location_specs_(location_specs) {}
+    : id_(std::make_shared<const std::string>(id)), location_specs_(location_specs), status_(status), type_(type) {
+    set_spec_size(spec_size);
+}
 
 CacheLocation::~CacheLocation() = default;
 

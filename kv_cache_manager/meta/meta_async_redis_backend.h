@@ -144,6 +144,7 @@ private:
     std::string cache_key_prefix_;
     std::string metadata_key_;
     int64_t timeout_ms_ = 2000;
+    LocationIdInterner id_interner_;
 
     // Async config
     int32_t queue_count_ = 8;

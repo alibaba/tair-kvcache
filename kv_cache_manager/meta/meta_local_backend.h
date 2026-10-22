@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <random>
@@ -19,6 +20,7 @@
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_cache_base_backend.h"
+#include "kv_cache_manager/meta/utils.h"
 #include "kv_cache_manager/metrics/revisit_interval_histogram.h"
 
 namespace kv_cache_manager {
@@ -100,7 +102,6 @@ struct MetaMemCacheItem {
     LocalLocationStore &GetMutableLocationStore() { return locations_; }
     const LocalPropertyStore &GetPropertyStore() const { return properties_; }
     LocalPropertyStore &GetMutablePropertyStore() { return properties_; }
-    std::shared_mutex &GetMutex() const { return mutex_; }
 
     int64_t GetLastAccessTime() const { return last_access_time_.load(std::memory_order_relaxed); }
     void TouchAccessTime() { last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed); }
@@ -125,7 +126,6 @@ struct MetaMemCacheItem {
     static void Deleter(void *value, MemoryAllocator * /*allocator*/) { delete static_cast<MetaMemCacheItem *>(value); }
 
 private:
-    mutable std::shared_mutex mutex_;
     LocalLocationStore locations_;
     LocalPropertyStore properties_;
     std::atomic<int64_t> last_access_time_{0};
@@ -360,9 +360,12 @@ private:
     CreateAndInsert(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode
     CreateAndInsertIfAbsent(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
-    ErrorCode
-    UpdateHandleInPlace(Cache::Handle *handle, const CacheLocationMap &locations, const PropertyMap &properties);
-    ErrorCode UpdateHandleInPlaceSingleLocation(Cache::Handle *handle,
+    ErrorCode UpdateHandleInPlace(KeyType key,
+                                  Cache::Handle *handle,
+                                  const CacheLocationMap &locations,
+                                  const PropertyMap &properties);
+    ErrorCode UpdateHandleInPlaceSingleLocation(KeyType key,
+                                                Cache::Handle *handle,
                                                 const LocationId &location_id,
                                                 CacheLocationConstPtr location,
                                                 CacheLocationVector *retired_locations = nullptr);
@@ -400,8 +403,16 @@ private:
                                          CacheLocationMap *out_location_map,
                                          std::vector<LocationId> *out_location_ids);
 
+    // The LRU maintenance callback holds its shard lock before taking this
+    // lock. Normal paths must release it before AdjustCharge/Release/Erase.
+    std::shared_mutex &ItemMutex(KeyType key) const {
+        return item_mutexes_[GetShardIndex(key, item_mutex_shard_mask_)];
+    }
+
     std::shared_ptr<Cache::CacheItemHelper> cache_item_helper_;
     std::shared_ptr<Cache> cache_;
+    std::unique_ptr<std::shared_mutex[]> item_mutexes_;
+    uint32_t item_mutex_shard_mask_ = 0;
     std::unique_ptr<std::atomic<int64_t>[]> shard_oldest_access_time_;
     uint32_t shard_mask_ = 0;
     size_t sample_times_ = 0;

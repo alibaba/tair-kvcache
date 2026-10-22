@@ -101,5 +101,6 @@ private:
     std::string cache_key_prefix_;
     std::string metadata_key_;
     int64_t timeout_ms_ = 1000;
+    LocationIdInterner id_interner_;
 };
 } // namespace kv_cache_manager

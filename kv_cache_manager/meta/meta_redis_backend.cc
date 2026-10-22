@@ -206,7 +206,7 @@ std::vector<ErrorCode> MetaRedisBackend::Get(RequestContext *request_context,
         if (results[i] != EC_OK) {
             continue;
         }
-        ErrorCode ec = DeserializeFieldMap(field_maps[i], out_locations[i], out_properties[i]);
+        ErrorCode ec = DeserializeFieldMap(field_maps[i], out_locations[i], out_properties[i], &id_interner_);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("get deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
             results[i] = ec;
@@ -238,7 +238,7 @@ std::vector<ErrorCode> MetaRedisBackend::GetLocations(RequestContext *request_co
         if (results[i] != EC_OK) {
             continue;
         }
-        ErrorCode ec = DeserializeLocations(field_maps[i], out_locations[i]);
+        ErrorCode ec = DeserializeLocations(field_maps[i], out_locations[i], &id_interner_);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("get locations deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
             results[i] = ec;
@@ -297,7 +297,7 @@ std::vector<std::vector<ErrorCode>> MetaRedisBackend::GetLocations(RequestContex
                 continue;
             }
             auto location = std::make_shared<CacheLocation>();
-            if (!location->FromJsonString(it->second)) {
+            if (!location->FromJsonStringInterned(it->second, id_interner_)) {
                 results[i][j] = EC_CORRUPTION;
                 continue;
             }
