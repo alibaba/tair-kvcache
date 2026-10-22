@@ -8,6 +8,7 @@
 #include "kv_cache_manager/common/client_pool.h"
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
+#include "kv_cache_manager/meta/meta_store_health_tracker.h"
 
 namespace kv_cache_manager {
 
@@ -23,6 +24,13 @@ public:
     ~MetaRedisBackend() override;
 
     std::string GetStorageType() noexcept override;
+
+    // False once the Redis instance behind this backend is detected down, i.e.
+    // writes can no longer be persisted. See MetaStorageBackend. While
+    // degraded this also drives a rate limited probe, because a synchronous
+    // backend that has been gated off no longer issues writes that could
+    // report recovery.
+    bool IsStoreAvailable() noexcept override;
 
     ErrorCode Init(const std::string &instance_id,
                    const std::shared_ptr<MetaStorageBackendConfig> &config) noexcept override;
@@ -95,6 +103,17 @@ private:
     // virtual for test
     virtual std::shared_ptr<RedisClient> CreateRedisClient() const;
 
+    // Feeds the outcome of one synchronous store operation into store_health_.
+    void RecordStoreOpResult(ErrorCode ec) noexcept;
+    // Same for a per key result vector: one unreachable entry is enough.
+    std::vector<ErrorCode> RecordStoreOpResults(std::vector<ErrorCode> results) noexcept;
+
+    // Hands out a pooled client and records the outcome in store_health_. An
+    // unreachable store usually surfaces here first -- AcquireClient times out
+    // before a single command is issued -- so routing every call through this
+    // helper is what lets a synchronous backend notice the outage at all.
+    ClientPool<RedisClient>::ClientHandle AcquireStoreClient() noexcept;
+
 private:
     std::shared_ptr<DynamicClientPool<RedisClient>> client_pool_;
     StandardUri storage_uri_;
@@ -102,5 +121,8 @@ private:
     std::string cache_key_prefix_;
     std::string metadata_key_;
     int64_t timeout_ms_ = 1000;
+
+    // Durability signal for the Redis instance behind this backend.
+    MetaStoreHealthTracker store_health_;
 };
 } // namespace kv_cache_manager

@@ -449,3 +449,67 @@ memory-primary 的主要收益来自消除普通备份入队在 shard lock 内�
 - kvcm_ops 实例组测试 39 个用例通过，含配置默认值、CLI 及 GET→编辑→PUT 保留开关。验证命令：`/usr/bin/python3 -B -m unittest discover -s package/kvcm_ops/test -p 'instance_group*test.py'`。
 - `git diff --check` 通过且无未解决冲突。
 - 尚未进行真实 Redis 停服/限速故障压测、完整系统 ASan/TSan 或生产吞吐对比；单元测试中的满队列非等待断言不能代替生产 QPS/P99 结论。上线前仍按 10.2 灰度验证，默认不开启配置。
+
+## 11. Redis 故障降级与恢复门禁
+
+### 11.1 为什么需要显式门禁
+
+第 5、9 节已经说明：Running 阶段普通写是 local-first，Redis 只做有界异步备份，入队失败或 pipeline 失败都**不改变业务返回码**。这是设计目标（Redis 抖动不阻塞推理），但副作用是 Redis 整体故障对上层完全静默：请求全部 `EC_OK`，只有 `async_dropped_key_count` 在涨。
+
+静默期间有两类操作是**不可事后补齐**的：
+
+| 操作 | 丢备份的后果 |
+|---|---|
+| 分配新 Location（`GenWriteLocation` / 迁移） | KVCM 自己分配的 GA 地址只在 local 内存里；重启后没有第二条记录，物理空间永久泄漏，且泄漏量不计入任何可回收水位 |
+| 删除存量 Location（回收 / GC / `TrimCache`） | local 立即删掉、Redis 保留旧副本；Redis 恢复或从备份重启后旧 Location 复活，继续占 quota，却指向已回收的物理空间 |
+
+两者叠加就是"故障期越久、恢复后 quota 越满且清不掉"：新分配的空间没有元数据可清，被删的 Location 又回来占额度。
+
+### 11.2 判定：MetaStoreHealthTracker
+
+`MetaStorageBackend` 新增 `IsStoreAvailable()`，默认 `true`（local/dummy 等自持存储的后端永远可用）。`MetaRedisBackend` 与 `MetaAsyncRedisBackend` 各自持有一个 `MetaStoreHealthTracker`：
+
+- **状态机刻意不对称**：连续 `store_health_failure_threshold`（默认 3）次**存储操作**失败才降级，**一次成功立即恢复**。降级门槛高是为了让单次超时不打断写路径，恢复门槛低是为了缩短降级窗口。
+- **成功/失败的定义**：`EC_OK` 与 `EC_NOENT` 都算成功——`NOENT` 证明 Redis 应答了；其余错误码算失败。
+- **记账点**：async 后端在 `BatchFlush`（pipeline 整体结果）与同步的 `PutMetaData`/`GetMetaData`/`DeleteMetaData`；sync 后端在 `Put`/`Upsert`/`Delete`/`DeleteLocations` 与 metadata 路径。
+- **取连接失败同样记账**：两个后端的所有 Redis 访问都经 `AcquireStoreClient()` 取连接，池超时（`EC_TIMEOUT`）即记一次失败。这一点很关键——Redis 整体不可达时最先失败的往往就是 `AcquireClient`，命令根本发不出去；若不记账，sync 后端将永远看不到故障、永远不会降级。
+- **pipeline 失败后的二次确认**：`BatchFlush` 失败也可能是命令级错误而非 Redis 宕机，因此失败后立刻发一次限速探测，避免一个坏 key 把后端永久钉在降级态。
+- **探测**：`EXISTS <metadata_key>`，`probe_interval_ms` 限速，用 CAS 保证同周期只有一个线程发起。async 后端在 consumer 空闲分支探测（门禁生效后没有新写入，必须有独立探测源）；sync 后端在 `IsStoreAvailable()` 内部懒探测，因为它没有后台线程。
+- **健康时也要心跳**：`ShouldProbe()` 不看当前结论，只按 `probe_interval_ms` 限速。这是必须的——backend 只能从自己真正发出的操作里学到东西，一个在 Redis 挂掉时恰好空闲的实例没有任何操作可记账，纯失败驱动的 tracker 会一直沿用最后一次成功的结论：门禁保持放行，紧接着的一整批写请求照样分配 GA 地址，备份随后被静默丢弃，正好是 11.1 里那个不可补齐的泄漏。心跳把"故障最多多久被发现"压到一个探测周期，与实例当时忙不忙无关；代价是每实例每秒一次 `EXISTS`。
+- **探测失败一次即降级**：探测是 backend 自己主动发起的可达性检查（`EXISTS` 自己的 metadata key），不存在"命令级错误"这种歧义，因此 `RecordProbeFailure()` 直接把状态打到降级，不再凑 `failure_threshold`。否则发现时间会变成 `failure_threshold × probe_interval_ms`，而门禁的意义恰恰是在**下一次**分配之前就关上，而不是放过几次之后再关。
+- **sync 后端不做心跳**：它不会静默丢写。任何一次 Redis 不可达都会以错误码返回给调用方，`GenWriteLocation` / `StartWriteCache` 随后把刚分配的 location 物理回滚（`data_storage_manager->Delete`），空间不会泄漏；健康时再探一次只是给请求路径加一次阻塞往返。它只在已降级时惰性探测以发现恢复。
+
+`MetaStorageBackendManager::IsStoreAvailable()` 只问 `persistent_backend_`：local cache backend 自持存储、永远可用，在 memory_primary 下真正代表"能否持久化"的是那份远端副本。再经 `MetaIndexer::IsMetaStoreAvailable()` / `MetaIndexerManager::IsMetaStoreAvailable(instance_id)` 上抛；未知 instance 返回 `true`，让调用方走原有的 "indexer not found" 分支而不是被误导成存储故障。
+
+### 11.3 降级期行为
+
+| 路径 | 行为 |
+|---|---|
+| `CacheManager::GenWriteLocation` | 在 instance 校验之后拒绝，返回 `EC_NOENT`，由客户端重试 |
+| `MigrationManager::CheckTargetStorageAdmission` | 同上，返回 `EC_NOENT` |
+| `SchedulePlanExecutor::PrepareDeleteTaskImpl` | 跳过所有非 EventReport Location，保持 `CLS_SERVING`，请求整体仍 `EC_OK` |
+| EventReport（V6D）地址更新与删除 | **照常执行**，不受门禁影响 |
+| `CacheManager::RemoveInstance`（见 #370） | trim 阶段全部被推迟 → 残留 key 非空且无进展 → 判定 `trim made no progress` 返回 `EC_ERROR`。移除意图已持久化，恢复后重试即可完成；这正是期望行为，Redis 不可用时本就无法回收持久化元数据 |
+| 读路径（`GetCacheLocation` / 前缀匹配等） | 完全不受影响，local 仍是权威副本 |
+
+EventReport 豁免的理由：这类 Location 的地址由上报方（推理引擎侧）拥有并周期性重传快照，KVCM 只是索引；即使元数据丢失也能由下一次上报重建，不存在"KVCM 分配的空间泄漏"问题。反之若把 V6D 上报也一起门禁掉，降级期就会直接打断用户要求的 V6D 地址更新能力。
+
+删除门禁放在 admission（构造 CAS 之前）而不是执行期，理由与 #395 的只读降级护栏一致：`DoLocationDelTask` 在物理 `Delete()` 失败后仍会继续 metadata CAD，而 GC 不会重新拾取 `CLS_DELETING`，一旦进入 `DELETING` 就等于把元数据丢了。详见 [GC admission 护栏](cache_garbage_collector.md#44-删除-admission-与执行)。
+
+### 11.4 恢复
+
+不需要重启或人工干预。探测成功一次即 `RecordSuccess()`，`IsStoreAvailable()` 立刻回到 `true`，下一轮 `GenWriteLocation` 与 GC/回收自然恢复；被延迟的 Location 因为一直保持 `CLS_SERVING`，会被后续 round 重新拾取。
+
+### 11.5 边界与未覆盖项
+
+- **启动期故障不在覆盖范围内**：Redis 在 `Open()` / 元数据恢复阶段就不可用时，backend 初始化仍会失败（`AsyncRecoverTask` 连续 `ListKeys` 失败后停在 `kRecover`）。本门禁只处理"进入服务之后"的故障。
+- **不做自动补齐**：恢复后不触发 resync/校准。故障期之前已经丢掉的备份仍按 9.3 的受控校准流程处理；`TrimCache` 等 Admin API 是恢复后对账的手段，不会被自动调用。
+- **降级期的写入仍然丢备份**：门禁只是停止**新增**不可补齐的元数据变更，已经在途的备份丢失语义不变。
+- **发现延迟上界 = 一个探测周期**：心跳是周期性的，所以 Redis 刚挂掉到门禁关上之间仍有一个 `store_health_probe_ms` 级别的窗口，落在窗口里的写请求照常拿到 location。要收窄就调低该参数，代价是等比增加的 `EXISTS` 频率。窗口内分配出去的 location 与其它丢备份的 location 一样，只能靠 9.3 的受控校准或恢复后的 `TrimCache` 对账处理。
+- **quota 在降级期只增不减**：拒绝分配 + 推迟清理意味着用量会停在故障前的水位附近，这是刻意的——比"看起来在回收、实际在泄漏"更安全。
+
+### 11.6 观测
+
+- `cache_manager_instance.meta_store_available`（gauge，1/0）：由 `AsyncWriteStats.store_available` 沿既有 per-instance 指标管道导出，无需新增采集链路。
+- 降级/恢复各打一条 `ERROR`/`INFO` 日志（`meta store[<backend>:<instance>] unavailable after N consecutive failures...` / `recovered...`）。
+- 延迟删除与拒绝分配各有 `KVCM_INTERVAL_LOG_WARN`（10s 限频），带 instance、被延迟 Location 数与准入 block 数。

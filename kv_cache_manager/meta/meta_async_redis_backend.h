@@ -9,6 +9,7 @@
 #include "kv_cache_manager/common/client_pool.h"
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
+#include "kv_cache_manager/meta/meta_store_health_tracker.h"
 #include "kv_cache_manager/meta/mpsc_write_queue.h"
 
 namespace kv_cache_manager {
@@ -19,6 +20,10 @@ public:
     ~MetaAsyncRedisBackend() override;
 
     std::string GetStorageType() noexcept override;
+
+    // False once the Redis instance behind this backend is detected down, i.e.
+    // enqueued writes can no longer be persisted. See MetaStorageBackend.
+    bool IsStoreAvailable() noexcept override;
 
     ErrorCode Init(const std::string &instance_id,
                    const std::shared_ptr<MetaStorageBackendConfig> &config) noexcept override;
@@ -131,6 +136,21 @@ private:
     void CleanupResources() noexcept;
     void BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys);
     void DrainQueue(int queue_id);
+    // Feeds the outcome of one synchronous store operation into store_health_.
+    void RecordStoreOpResult(ErrorCode ec) noexcept;
+    // Confirms reachability with a single EXISTS on the instance metadata key
+    // and feeds the verdict into store_health_. A failed probe degrades on its
+    // own, without waiting for store_health_failure_threshold hits. Called from
+    // a consumer thread only (each consumer owns its client), at most once per
+    // probe interval -- while degraded as the recovery poll and while healthy
+    // as the heartbeat that notices an outage on an otherwise idle instance.
+    void ProbeStoreHealth(RedisClient *client) noexcept;
+
+    // Hands out a pooled client and records the outcome in store_health_. An
+    // unreachable store usually surfaces here first -- AcquireClient times out
+    // before a single command is issued -- so the metadata path, which is the
+    // only synchronous part of this backend, would otherwise stay blind to it.
+    ClientPool<RedisClient>::ClientHandle AcquireStoreClient() noexcept;
     int GetQueueIndexForKey(KeyType key) const noexcept;
 
     using CmdArgs = std::vector<std::string>;
@@ -166,6 +186,9 @@ private:
 
     // Read client pool (for concurrent read operations)
     std::shared_ptr<DynamicClientPool<RedisClient>> read_client_pool_;
+
+    // Durability signal for the Redis instance behind this backend.
+    MetaStoreHealthTracker store_health_;
 
     // Consumer-thread write stats (atomics, reset on read via CAS)
     std::atomic<int64_t> stats_flush_key_count_{0};

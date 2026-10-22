@@ -2239,6 +2239,13 @@ MetaStorageBackend::AsyncWriteStats MetaStorageBackendManager::GetAsyncWriteStat
     return persistent_backend_->GetAsyncWriteStats();
 }
 
+bool MetaStorageBackendManager::IsStoreAvailable() noexcept {
+    if (!persistent_backend_) {
+        return true;
+    }
+    return persistent_backend_->IsStoreAvailable();
+}
+
 size_t MetaStorageBackendManager::GetMemUsage() const noexcept {
     if (cache_backend_) {
         return cache_backend_->GetMemUsage();

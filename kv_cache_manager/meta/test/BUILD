@@ -25,6 +25,15 @@ py_test(
 )
 
 cc_test(
+    name = "meta_store_health_tracker_test",
+    srcs = ["meta_store_health_tracker_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:meta_store_health_tracker",
+    ],
+)
+
+cc_test(
     name = "query_executor_test",
     srcs = ["query_executor_test.cc"],
     deps = [

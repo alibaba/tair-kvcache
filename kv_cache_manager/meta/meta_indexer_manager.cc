@@ -105,6 +105,14 @@ std::shared_ptr<MetaIndexer> MetaIndexerManager::GetMetaIndexer(const std::strin
     return GetMetaIndexerUnsafe(instance_id);
 }
 
+bool MetaIndexerManager::IsMetaStoreAvailable(const std::string &instance_id) {
+    auto indexer = GetMetaIndexer(instance_id);
+    if (!indexer) {
+        return true;
+    }
+    return indexer->IsMetaStoreAvailable();
+}
+
 std::shared_ptr<MetaIndexer> MetaIndexerManager::GetMetaIndexerUnsafe(const std::string &instance_id) const {
     auto iter = meta_indexers_.find(instance_id);
     if (iter != meta_indexers_.end()) {

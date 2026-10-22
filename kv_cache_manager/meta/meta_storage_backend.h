@@ -32,6 +32,24 @@ public:
 
     virtual std::string GetStorageType() noexcept = 0;
 
+    // =====================================================================
+    // Health API
+    // =====================================================================
+
+    // True while the store behind this backend can durably persist writes.
+    //
+    // A backend whose data lives in a remote store (Redis) reports false once
+    // that store is detected down. This matters for memory_primary deployments,
+    // where the local backend stays authoritative and a remote outage is
+    // otherwise invisible: every request keeps returning EC_OK while the
+    // asynchronous backup writes are dropped. Cache-location metadata that
+    // KVCM itself allocated (a GA address) cannot be reconstructed later, and a
+    // deletion that never reaches the remote copy resurrects on the next
+    // recovery, so callers must stop allocating and stop deleting while this
+    // returns false. Backends that own their storage (local/dummy) keep the
+    // default true.
+    virtual bool IsStoreAvailable() noexcept { return true; }
+
     // 初始化后端。必须在 Open() 之前调用。
     // @param instance_id  实例标识，用于 key 前缀隔离
     // @param config       后端配置（含 storage_uri 等）
@@ -572,6 +590,10 @@ public:
         int64_t pipeline_error_count = 0;
         int64_t dropped_key_count = 0;
         int64_t dropped_metadata_count = 0;
+        // Mirror of IsStoreAvailable() so the existing per-instance metrics
+        // pipeline can export the degradation without new plumbing. 1 = the
+        // remote store is reachable, 0 = degraded.
+        int64_t store_available = 1;
     };
     virtual AsyncWriteStats GetAsyncWriteStats() noexcept { return {}; }
 

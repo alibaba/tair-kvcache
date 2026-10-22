@@ -72,6 +72,15 @@ public:
     KeyVector forced_upsert_keys;
 };
 
+// Emulates a persistent backend whose remote store (Redis) has been detected
+// down: the local copy still serves reads and writes, but nothing is durable
+// any more, so KVCM must stop allocating and stop reclaiming.
+class UnavailableStoreBackend : public MetaLocalBackend {
+public:
+    bool IsStoreAvailable() noexcept override { return store_available; }
+    bool store_available{false};
+};
+
 std::atomic<bool> sync_entered{false};
 std::atomic<bool> sync_completed{false};
 std::atomic<bool> release_sync{true};
@@ -500,6 +509,52 @@ TEST_F(BackendGcDeleteTest, ReadOnlyStorageDefersDeleteAndKeepsLocationReadable)
     EXPECT_EQ(EC_OK, Run(Request(102, {"healthy"}, {})).status);
     EXPECT_EQ((std::vector<std::string>{healthy_uri}), DeletedUris(*healthy_backend));
     EXPECT_TRUE(Locations(102).empty());
+}
+
+TEST_F(BackendGcDeleteTest, UnavailableMetaStoreDefersDeleteButKeepsEventReportCleanup) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    auto backend = AddBackend("pace_gc", type);
+    AddBackend("event_gc", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+
+    // Put a degraded backend in the persistent slot, the way a memory_primary
+    // instance looks while its Redis copy is failing over.
+    auto &manager = *indexer->backend_manager_;
+    manager.cache_backend_.reset(static_cast<MetaLocalBackend *>(manager.persistent_backend_.release()));
+    auto degraded = std::make_unique<UnavailableStoreBackend>();
+    ASSERT_EQ(EC_OK, degraded->Init(kTestInstanceName, std::make_shared<MetaStorageBackendConfig>()));
+    ASSERT_EQ(EC_OK, degraded->Open());
+    auto *degraded_ptr = degraded.get();
+    manager.persistent_backend_ = std::move(degraded);
+    ASSERT_FALSE(indexer->IsMetaStoreAvailable());
+
+    // The GA was allocated by KVCM, so dropping its metadata here would lose the
+    // only durable record of it: the deletion could not be persisted and the
+    // location would resurrect from the stale remote copy after a restart, still
+    // charging quota for space that is already gone. Defer and keep it readable.
+    const std::string uri = "pace://pace_gc/1?size=5";
+    SetLocation(100, "ga", type, {uri});
+    EXPECT_EQ(EC_OK, Run(Request(100, {"ga"}, {uri})).status);
+    EXPECT_TRUE(backend->delete_batches.empty());
+    ASSERT_EQ(1u, Locations(100).size());
+    EXPECT_EQ(CLS_SERVING, Locations(100).at("ga")->status());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+
+    // An event report (V6D) location is owned by the reporter, not allocated by
+    // KVCM, so its metadata update keeps flowing while the store is degraded.
+    const std::string event_uri = "event_report://event_gc/cache/block101?s_version=11111111111111111111111111111111";
+    SetLocation(101, "v6d", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, {event_uri});
+    EXPECT_EQ(EC_OK, Run(Request(101, {"v6d"}, {})).status);
+    EXPECT_TRUE(Locations(101).empty());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+
+    // Once the backend reports the store back, the deferred reclaim proceeds on
+    // the next attempt without any manual intervention.
+    degraded_ptr->store_available = true;
+    ASSERT_TRUE(indexer->IsMetaStoreAvailable());
+    EXPECT_EQ(EC_OK, Run(Request(100, {"ga"}, {uri})).status);
+    EXPECT_EQ((std::vector<std::string>{uri}), DeletedUris(*backend));
+    EXPECT_TRUE(Locations(100).empty());
+    EXPECT_EQ(0u, indexer->GetStorageUsage());
 }
 
 TEST_F(BackendGcDeleteTest, MetadataOnlySkipsDeleteForBothSettings) {

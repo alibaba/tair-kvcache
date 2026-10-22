@@ -188,6 +188,12 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |
 | `cache_manager_instance.byte_size` | gauge | 单实例 KVCM 配额字节大小（不含 EventReport） |
+| `cache_manager_instance.meta_store_available` | gauge | 实例元数据是否仍可持久化（1/0）；Redis 降级时为 0 |
+
+`cache_manager_instance.meta_store_available` 为 0 表示存放 cache 地址的 Redis 被判定不可用：
+此时新 location 分配被拒绝（`EC_NOENT`）、非 event-report 的 location 删除被推迟，
+event-report（V6D 上报）地址的更新不受影响；恢复由后台探测自动完成。
+详见[配置说明](configuration.md#redis-故障降级store-health)。
 
 对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开且健康探测状态正常，否则为 0。状态由后台探测更新，单次请求超时不代表指标立即变为 0。超时参数见[配置说明](configuration.md#tairmempool)。
 

@@ -287,6 +287,12 @@ public:
         return listed_keys_before_sync_all_;
     }
 
+    // Emulates a persistent backend whose remote store (Redis) has been detected
+    // down: reads and local writes keep working, but nothing is durable anymore.
+    bool IsStoreAvailable() noexcept override { return store_available_.load(std::memory_order_relaxed); }
+
+    void SetStoreAvailable(bool available) { store_available_.store(available, std::memory_order_relaxed); }
+
     std::vector<ErrorCode> Upsert(RequestContext *request_context,
                                   const KeyTypeVec &keys,
                                   const CacheLocationMapVector &locations,
@@ -424,6 +430,7 @@ private:
     size_t sync_all_call_count_ = 0;
     size_t list_keys_call_count_ = 0;
     bool listed_keys_before_sync_all_ = false;
+    std::atomic<bool> store_available_{true};
 };
 
 class DeleteRecordingBackend : public DataStorageBackend {
@@ -11548,6 +11555,38 @@ TEST_F(CacheManagerTest, TestGenWriteLocationMissingTieredTargetDoesNotFallback)
               cache_manager_->GenWriteLocation(
                   request_context_.get(), "missing_tiered_target", {1}, {}, {"cold_01"}, new_locations));
     ASSERT_TRUE(new_locations.empty());
+}
+
+// meta store（Redis）降级时拒绝分配新 location：分配出去的存储空间只在本地内存里
+// 有记录，恢复/重启后无法重建，会变成永久泄漏且持续占用 quota。
+TEST_F(CacheManagerTest, TestGenWriteLocationRejectedWhenMetaStoreUnavailable) {
+    auto *meta_backend = InstallControllableMetaBackend();
+    ASSERT_NE(nullptr, meta_backend);
+
+    CacheLocationVector new_locations;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->GenWriteLocation(request_context_.get(), "test_instance", {1}, {}, {}, new_locations));
+    ASSERT_EQ(1u, new_locations.size());
+
+    meta_backend->SetStoreAvailable(false);
+    auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, indexer);
+    ASSERT_FALSE(indexer->IsMetaStoreAvailable());
+
+    CacheLocationVector rejected_locations;
+    ASSERT_EQ(EC_NOENT,
+              cache_manager_->GenWriteLocation(
+                  request_context_.get(), "test_instance", {2}, {}, {}, rejected_locations));
+    ASSERT_TRUE(rejected_locations.empty());
+
+    // Recovery is picked up from the backend itself, no restart or manual reset.
+    meta_backend->SetStoreAvailable(true);
+    ASSERT_TRUE(indexer->IsMetaStoreAvailable());
+    CacheLocationVector recovered_locations;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->GenWriteLocation(
+                  request_context_.get(), "test_instance", {3}, {}, {}, recovered_locations));
+    ASSERT_EQ(1u, recovered_locations.size());
 }
 
 // FinishWriteCache 成功把本次 target CacheLocation 置为 SERVING 后清除 tiered-write mark

@@ -246,6 +246,7 @@ cc_library(
     ],
     deps = [
         ":common",
+        ":meta_store_health_tracker",
         ":meta_storage_backend",
         ":utils",
         "//kv_cache_manager/common:client_pool",
@@ -276,6 +277,7 @@ cc_library(
     ],
     deps = [
         ":common",
+        ":meta_store_health_tracker",
         ":meta_storage_backend",
         ":mpsc_write_queue",
         ":utils",
@@ -284,6 +286,21 @@ cc_library(
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:string_util",
+        "//kv_cache_manager/common:timestamp_util",
         "//kv_cache_manager/config",
+    ],
+)
+
+cc_library(
+    name = "meta_store_health_tracker",
+    srcs = [
+        "meta_store_health_tracker.cc",
+    ],
+    hdrs = [
+        "meta_store_health_tracker.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/common:timestamp_util",
     ],
 )

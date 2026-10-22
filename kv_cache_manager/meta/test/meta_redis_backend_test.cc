@@ -758,4 +758,38 @@ TEST_F(MetaRedisBackendTest, TestGet) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
 
+
+// A synchronous backend talks to Redis only after AcquireClient succeeds, so an
+// unreachable store surfaces as an acquire timeout before any command is issued.
+// Those failures have to reach the health tracker as well, otherwise a backend
+// whose every call dies in the pool would keep reporting itself available.
+TEST_F(MetaRedisBackendTest, TestStoreHealthDegradesWhenClientAcquireTimesOut) {
+    meta_storage_backend_config_->SetStorageUri("redis://test_redis_user:test_redis_password@test_redis_host:0/"
+                                                "?client_max_pool_size=1&timeout_ms=10"
+                                                "&store_health_failure_threshold=2&store_health_probe_ms=60000");
+    // The pool can never hand out a client: creating one always fails.
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillRepeatedly(Return(std::shared_ptr<RedisClient>()));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+    ASSERT_TRUE(meta_redis_backend_->IsStoreAvailable());
+
+    CacheLocationMapVector locations(1);
+    PropertyMapVector properties = {{{"f", "v"}}};
+    // One acquire failure is below the threshold, so a single timeout does not
+    // stall the write path.
+    ASSERT_EQ((std::vector<ErrorCode>{EC_TIMEOUT}), meta_redis_backend_->Put(nullptr, {1}, locations, properties));
+    EXPECT_TRUE(meta_redis_backend_->IsStoreAvailable());
+
+    ASSERT_EQ(EC_TIMEOUT, meta_redis_backend_->PutMetaData({{"key_count", "1"}}));
+    EXPECT_FALSE(meta_redis_backend_->IsStoreAvailable());
+
+    // Deleting metadata that cannot be persisted must fail instead of reporting
+    // success, so the caller keeps the GA location and retries after recovery.
+    ASSERT_EQ(EC_TIMEOUT, meta_redis_backend_->DeleteMetaData());
+    EXPECT_FALSE(meta_redis_backend_->IsStoreAvailable());
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
 } // namespace kv_cache_manager

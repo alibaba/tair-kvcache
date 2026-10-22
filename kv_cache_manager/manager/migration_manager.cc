@@ -289,6 +289,16 @@ ErrorCode MigrationManager::CheckTargetStorageAdmission(const std::string &trace
     if (data_storage_manager_ == nullptr || target_storage_name.empty()) {
         return EC_BADARGS;
     }
+    // 迁移会在目标 storage 上分配新空间并写入新 location。meta store 不可用时
+    // 新 location 无法持久化，与 GenWriteLocation 同理：直接拒绝，避免空间泄漏。
+    if (meta_indexer_manager_ != nullptr && !meta_indexer_manager_->IsMetaStoreAvailable(instance_id)) {
+        KVCM_INTERVAL_LOG_WARN(10,
+                               "[%s] reject migration to %s for instance %s, meta store unavailable",
+                               trace_id.c_str(),
+                               target_storage_name.c_str(),
+                               instance_id.c_str());
+        return EC_NOENT;
+    }
     std::string group_name = instance_group_name;
     if (group_name.empty() && registry_manager_ != nullptr) {
         auto request_context = std::make_shared<RequestContext>(

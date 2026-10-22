@@ -2607,6 +2607,19 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "instance not found");
     }
 
+    // 元数据侧的 Writable() 门禁：meta store（Redis）不可用时，新分配的 location
+    // 无法持久化 —— memory_primary 下本地写入仍返回 EC_OK，但异步备份被丢弃，
+    // 重启后这条 location 消失，而它占用的存储空间（如 mempool GA）永久泄漏。
+    // 因此这里直接拒绝分配，等 meta store 恢复后由客户端重试。
+    if (meta_indexer_manager_ && !meta_indexer_manager_->IsMetaStoreAvailable(instance_id)) {
+        request_context->error_tracer()->AddErrorMsg("meta store unavailable, reject write location generation");
+        KVCM_INTERVAL_LOG_WARN(10,
+                               "meta store unavailable, reject gen write location, instance[%s] keys[%zu]",
+                               instance_id.c_str(),
+                               keys.size());
+        return EC_NOENT;
+    }
+
     // 按目标 storage 对 keys 分组：Mark 命中且目标 storage 存在 -> 路由到冷层；未命中 -> 默认 storage。
     // FilterWriteCache 已验证 target；若 backend 在两阶段之间消失，拒绝本次写并由重试重新过滤，
     // 不能 fallback 默认层，否则可能重复写一个原本已满足普通写条件的 block。

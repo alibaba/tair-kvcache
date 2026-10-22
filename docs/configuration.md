@@ -370,6 +370,49 @@ Upsert/部分删除的写前补齐仍可能依赖 Redis；Recover 保持原有 R
 kvcm_ops 的 CLI 参数为 `--meta_storage_backend_config 'cached,redis://redis-backup:6379/?persistent_type=async_redis,true'`，
 旧的一段/两段参数仍可使用，GET→编辑→PUT 会保留该字段。
 
+### Redis 故障降级（store health）
+
+`storage_type` 为 `redis` 或 `cached`（`persistent_type=redis`/`async_redis`）时，KVCM 会跟踪 Redis 的可达性。
+`memory_primary` 下本地 backend 是权威副本，Redis 只是尽力而为的备份，所以 Redis 故障**不会**让请求报错：
+写仍然返回 `EC_OK`，但备份被丢弃。这类丢失无法事后补齐——KVCM 自己分配的 GA 地址在重启后没有第二条记录，
+而一条没能持久化的删除会在恢复后从旧备份里"复活"，既占 quota 又指向已回收的物理空间。
+
+因此 backend 检测到 Redis 不可用后会进入降级：
+
+- **拒绝新分配**：`GenWriteLocation` 与迁移准入返回 `EC_NOENT`，由客户端重试；
+- **推迟存量清理**：删除准入跳过所有非 event-report 的 location，保持 `CLS_SERVING` 让读继续命中，
+  回收/GC 会在下一轮重试；
+- **保留 V6D 上报地址的更新**：event-report 类型的 location 由上报方拥有地址，其元数据更新与删除照常执行；
+- **自动恢复**：backend 按 `store_health_probe_ms` 主动探测 Redis，一次成功即解除降级，无需重启或人工干预。
+
+判定必须是**当前**的可达性，而不是"目前还没见过失败"。backend 只能从自己真正发出的操作里学到东西，
+所以一个在 Redis 挂掉时恰好空闲的实例，会一直沿用最后一次成功得到的结论：门禁保持放行，
+紧接着的一整批写请求照样分配 GA 地址，而这些地址的备份随后被静默丢弃。因此 `async_redis` 的
+consumer 在空闲分支上按 `store_health_probe_ms` **持续心跳探测，健康时也探**，
+并且**一次探测失败即判定不可用**（探测是自己主动发起的 `EXISTS`，不存在命令级歧义，
+不需要凑满 `store_health_failure_threshold`）。于是故障发现时间上界就是一个心跳周期，
+与实例当时忙不忙无关。代价是每实例每秒一次 `EXISTS`。
+
+同步 `redis` backend 不做心跳：它不会静默丢写，任何一次 Redis 不可达都会以错误码返回给调用方，
+`GenWriteLocation` / `StartWriteCache` 随后会把刚分配的 location 物理回滚掉，
+健康时再探一次只是给请求路径增加一次阻塞往返。它只在已降级时惰性探测以发现恢复。
+
+两个参数写在 `storage_uri` 的 query 上：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `store_health_failure_threshold` | `3` | 连续多少次**存储操作**失败才判定不可用；单次超时不会打断写路径。探测失败不受此阈值约束，一次即降级 |
+| `store_health_probe_ms` | `1000` | 主动探测的最小间隔（毫秒）。降级期间是恢复轮询，健康期间是心跳，因此它同时就是"故障最多多久被发现"的上界 |
+
+示例：
+
+```json
+{"storage_type":"cached","storage_uri":"redis://redis-backup:6379/?persistent_type=async_redis&cache_type=local&store_health_failure_threshold=5&store_health_probe_ms=2000","memory_primary":true}
+```
+
+降级状态通过 `cache_manager_instance.meta_store_available` 暴露（`1`=可持久化，`0`=降级）。
+注意：Redis 在**启动阶段**就不可用时 `Open()`/元数据恢复仍会失败，本降级只覆盖进入服务之后的故障。
+
 `instance_reclaim_budget_policy` 选择同一 Group 内如何逐出，Admin API 和 `kvcm_ops` 使用枚举名，Registry JSON 持久化整数：
 
 | 模式 | 值 | 行为 |

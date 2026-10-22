@@ -15,6 +15,66 @@ MetaRedisBackend::~MetaRedisBackend() { [[maybe_unused]] ErrorCode _ = Close(); 
 
 std::string MetaRedisBackend::GetStorageType() noexcept { return META_REDIS_BACKEND_TYPE_STR; }
 
+void MetaRedisBackend::RecordStoreOpResult(const ErrorCode ec) noexcept {
+    // EC_NOENT still proves the store answered, so it counts as reachable.
+    if (ec == EC_OK || ec == EC_NOENT) {
+        store_health_.RecordSuccess();
+        return;
+    }
+    store_health_.RecordFailure();
+}
+
+std::vector<ErrorCode> MetaRedisBackend::RecordStoreOpResults(std::vector<ErrorCode> results) noexcept {
+    for (const ErrorCode ec : results) {
+        if (ec != EC_OK && ec != EC_NOENT) {
+            RecordStoreOpResult(ec);
+            return results;
+        }
+    }
+    if (!results.empty()) {
+        store_health_.RecordSuccess();
+    }
+    return results;
+}
+
+ClientPool<RedisClient>::ClientHandle MetaRedisBackend::AcquireStoreClient() noexcept {
+    if (!client_pool_) {
+        RecordStoreOpResult(EC_ERROR);
+        return ClientPool<RedisClient>::ClientHandle(nullptr, nullptr);
+    }
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        RecordStoreOpResult(EC_TIMEOUT);
+    }
+    return handle;
+}
+
+bool MetaRedisBackend::IsStoreAvailable() noexcept {
+    if (store_health_.IsAvailable()) {
+        // No heartbeat here, unlike the async backend: this backend cannot drop
+        // a write silently. Anything it cannot reach Redis for is returned to
+        // the caller as an error, and GenWriteLocation / StartWriteCache then
+        // roll the freshly allocated location back physically. Probing while
+        // healthy would only add a blocking round trip to the request path.
+        return true;
+    }
+    if (store_health_.ShouldProbe()) {
+        // A failed acquire is already accounted for by AcquireStoreClient.
+        auto handle = AcquireStoreClient();
+        if (handle) {
+            std::vector<bool> exists_vec;
+            const auto error_codes = handle->Exists({metadata_key_}, exists_vec);
+            const auto ec = error_codes.empty() ? EC_ERROR : error_codes[0];
+            if (ec == EC_OK || ec == EC_NOENT) {
+                store_health_.RecordSuccess();
+            } else {
+                store_health_.RecordProbeFailure();
+            }
+        }
+    }
+    return store_health_.IsAvailable();
+}
+
 std::shared_ptr<RedisClient> MetaRedisBackend::CreateRedisClient() const {
     return std::make_shared<RedisClient>(storage_uri_);
 }
@@ -49,11 +109,23 @@ ErrorCode MetaRedisBackend::Init(const std::string &instance_id,
     int64_t db_index = 0;
     storage_uri_.GetParamAs("db", db_index);
 
-    KVCM_LOG_INFO("meta redis backend init successfully, instance[%s], storage uri[%s], timeout ms[%ld], redis db[%ld]",
+    MetaStoreHealthTracker::Config store_health_config;
+    int64_t tmp_store_health_failure_threshold = store_health_config.failure_threshold;
+    storage_uri_.GetParamAs("store_health_failure_threshold", tmp_store_health_failure_threshold);
+    store_health_config.failure_threshold = tmp_store_health_failure_threshold;
+    int64_t tmp_store_health_probe_ms = store_health_config.probe_interval_ms;
+    storage_uri_.GetParamAs("store_health_probe_ms", tmp_store_health_probe_ms);
+    store_health_config.probe_interval_ms = tmp_store_health_probe_ms;
+    store_health_.Configure("redis:" + instance_id_, store_health_config);
+
+    KVCM_LOG_INFO("meta redis backend init successfully, instance[%s], storage uri[%s], timeout ms[%ld], "
+                  "redis db[%ld], store_health_failure_threshold[%ld], store_health_probe_ms[%ld]",
                   instance_id_.c_str(),
                   config->GetStorageUri().c_str(),
                   timeout_ms_,
-                  db_index);
+                  db_index,
+                  store_health_config.failure_threshold,
+                  store_health_config.probe_interval_ms);
     return EC_OK;
 }
 
@@ -118,13 +190,13 @@ std::vector<ErrorCode> MetaRedisBackend::Put(RequestContext *request_context,
         request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, serde_us);
 
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "put fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
-    return handle->Set(full_keys, field_maps);
+    return RecordStoreOpResults(handle->Set(full_keys, field_maps));
 }
 
 std::vector<ErrorCode> MetaRedisBackend::Upsert(RequestContext *request_context,
@@ -141,23 +213,23 @@ std::vector<ErrorCode> MetaRedisBackend::Upsert(RequestContext *request_context,
         request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, serde_us);
 
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "upsert fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
-    return handle->Upsert(full_keys, field_maps);
+    return RecordStoreOpResults(handle->Upsert(full_keys, field_maps));
 }
 
 std::vector<ErrorCode> MetaRedisBackend::Delete(RequestContext * /*request_context*/, const KeyTypeVec &keys) noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "delete fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
-    return handle->Delete(full_keys);
+    return RecordStoreOpResults(handle->Delete(full_keys));
 }
 
 std::vector<ErrorCode> MetaRedisBackend::DeleteLocations(RequestContext * /*request_context*/,
@@ -172,14 +244,14 @@ std::vector<ErrorCode> MetaRedisBackend::DeleteLocations(RequestContext * /*requ
         }
     }
 
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "delete locations fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
-    return handle->DeleteFields(full_keys, field_names_vec);
+    return RecordStoreOpResults(handle->DeleteFields(full_keys, field_names_vec));
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +262,7 @@ std::vector<ErrorCode> MetaRedisBackend::Get(RequestContext *request_context,
                                              const KeyTypeVec &keys,
                                              CacheLocationMapVector &out_locations,
                                              PropertyMapVector &out_properties) noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "get fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
@@ -222,7 +294,7 @@ std::vector<ErrorCode> MetaRedisBackend::Get(RequestContext *request_context,
 std::vector<ErrorCode> MetaRedisBackend::GetLocations(RequestContext *request_context,
                                                       const KeyTypeVec &keys,
                                                       CacheLocationMapVector &out_locations) noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "get locations fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -266,7 +338,7 @@ std::vector<std::vector<ErrorCode>> MetaRedisBackend::GetLocations(RequestContex
         }
     }
 
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "get locations by id fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -315,7 +387,7 @@ std::vector<std::vector<ErrorCode>> MetaRedisBackend::GetLocations(RequestContex
 std::vector<ErrorCode> MetaRedisBackend::GetLocationIds(RequestContext * /*request_context*/,
                                                         const KeyTypeVec &keys,
                                                         LocationIdsPerKey &out_location_ids) noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "get location ids fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -346,7 +418,7 @@ std::vector<ErrorCode> MetaRedisBackend::GetProperties(RequestContext * /*reques
                                                        const KeyTypeVec &keys,
                                                        const std::vector<std::string> &field_names,
                                                        PropertyMapVector &out_properties) noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "get properties fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -374,7 +446,7 @@ std::vector<ErrorCode> MetaRedisBackend::GetProperties(RequestContext * /*reques
 std::vector<ErrorCode> MetaRedisBackend::Exists(RequestContext * /*request_context*/,
                                                 const KeyTypeVec &keys,
                                                 std::vector<bool> &out_is_exist_vec) noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "exists fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
@@ -386,7 +458,7 @@ std::vector<ErrorCode> MetaRedisBackend::Exists(RequestContext * /*request_conte
 std::vector<ErrorCode> MetaRedisBackend::ExistsLocation(RequestContext * /*request_context*/,
                                                         const KeyTypeVec &keys,
                                                         std::vector<bool> &out_exists) noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "exists location fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -402,7 +474,7 @@ ErrorCode MetaRedisBackend::ListKeys(RequestContext * /*request_context*/,
                                      std::string &out_next_cursor,
                                      KeyTypeVec &out_keys) noexcept {
     out_keys.clear();
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "list keys fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return EC_TIMEOUT;
@@ -451,7 +523,7 @@ ErrorCode MetaRedisBackend::RandomSample(RequestContext * /*request_context*/,
                                          const int64_t count,
                                          KeyTypeVec &out_keys) noexcept {
     out_keys.clear();
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "random fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return EC_TIMEOUT;
@@ -545,7 +617,7 @@ ErrorCode MetaRedisBackend::SampleReclaimCandidates(RequestContext *request_cont
 // ---------------------------------------------------------------------------
 
 ErrorCode MetaRedisBackend::PutMetaData(const FieldMap &field_map) noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "put metadata fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -553,11 +625,12 @@ ErrorCode MetaRedisBackend::PutMetaData(const FieldMap &field_map) noexcept {
     }
     auto error_codes = handle->Set({metadata_key_}, {field_map});
     assert(error_codes.size() == 1);
+    RecordStoreOpResult(error_codes[0]);
     return error_codes[0];
 }
 
 ErrorCode MetaRedisBackend::GetMetaData(FieldMap &out_field_map) noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "get fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return EC_TIMEOUT;
@@ -565,6 +638,7 @@ ErrorCode MetaRedisBackend::GetMetaData(FieldMap &out_field_map) noexcept {
     FieldMapVec maps;
     auto error_codes = handle->GetAllFields({metadata_key_}, maps);
     assert(error_codes.size() == 1);
+    RecordStoreOpResult(error_codes[0]);
     if (error_codes[0] == EC_OK) {
         assert(maps.size() == 1);
         out_field_map = std::move(maps[0]);
@@ -573,14 +647,16 @@ ErrorCode MetaRedisBackend::GetMetaData(FieldMap &out_field_map) noexcept {
 }
 
 ErrorCode MetaRedisBackend::DeleteMetaData() noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         return EC_TIMEOUT;
     }
     const auto results = handle->Delete({metadata_key_});
     if (results.size() != 1) {
+        RecordStoreOpResult(EC_ERROR);
         return EC_ERROR;
     }
+    RecordStoreOpResult(results[0]);
     return results[0] == EC_NOENT ? EC_OK : results[0];
 }
 

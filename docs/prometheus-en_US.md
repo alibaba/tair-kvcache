@@ -202,6 +202,12 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |
 | `cache_manager_instance.byte_size` | gauge | Per-instance KVCM quota bytes (excluding EventReport) |
+| `cache_manager_instance.meta_store_available` | gauge | Whether instance metadata is still durable (1/0); 0 while Redis is degraded |
+
+`cache_manager_instance.meta_store_available` = 0 means the Redis holding cache locations was
+detected down: new location allocation is rejected (`EC_NOENT`) and deletion of non-event-report
+locations is deferred, while event-report (V6D) address updates keep flowing. Recovery is detected
+by a background probe. See [configuration](configuration.md#redis-故障降级store-health).
 
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.

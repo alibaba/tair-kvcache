@@ -517,6 +517,11 @@ TEST_F(LocalMetricsReporterTest, TestReportIntervalCacheManagerMetrics) {
         EXPECT_DOUBLE_EQ(0., flush_key_v);
         EXPECT_DOUBLE_EQ(0., flush_time_v);
         EXPECT_DOUBLE_EQ(0., pipeline_err_v);
+
+        // The default backend owns its storage, so the meta store stays available.
+        double meta_store_available_v;
+        GET_METRICS_(p, cache_manager_instance, meta_store_available, meta_store_available_v);
+        EXPECT_DOUBLE_EQ(1., meta_store_available_v);
     }
 }
 

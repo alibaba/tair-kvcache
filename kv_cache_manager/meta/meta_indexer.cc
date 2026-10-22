@@ -2084,6 +2084,15 @@ MetaStorageBackend::AsyncWriteStats MetaIndexer::GetAsyncWriteStats() noexcept {
     return backend_manager_->GetAsyncWriteStats();
 }
 
+bool MetaIndexer::IsMetaStoreAvailable() noexcept {
+    // Init 失败路径会 reset backend_manager_；此时可用性未知，按可用处理，
+    // 让调用方走各自原有的错误码路径而不是被健康门禁静默拦住。
+    if (backend_manager_ == nullptr) {
+        return true;
+    }
+    return backend_manager_->IsStoreAvailable();
+}
+
 int64_t MetaIndexer::GetOldestAccessTime() const noexcept { return backend_manager_->GetOldestAccessTime(); }
 
 std::uint64_t MetaIndexer::GetStorageUsage() const noexcept { return storage_usage_data_.GetStorageUsage(); }

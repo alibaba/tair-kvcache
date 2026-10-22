@@ -1401,4 +1401,138 @@ TEST_F(MetaAsyncRedisBackendTest, TestMemoryPrimaryDrainDropsAreVisibleAndFailBa
     EXPECT_EQ(1, stats.dropped_metadata_count);
 }
 
+// ==================== Store Health Tests ====================
+
+TEST_F(MetaAsyncRedisBackendTest, TestStoreHealthDegradesOnFlushFailureAndRecoversOnProbe) {
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=64&async_wait_us=1000"
+                           "&async_max_size=1000&async_sync_timeout_ms=5000"
+                           "&store_health_failure_threshold=1&store_health_probe_ms=1");
+    ConstructBackend();
+
+    std::atomic<bool> redis_down{false};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
+        StandardUri empty_uri;
+        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
+        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
+        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
+        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+            std::vector<ReplyUPtr> replies;
+            if (redis_down.load(std::memory_order_acquire)) {
+                return replies; // no reply at all: the pipeline never reached Redis
+            }
+            for (size_t i = 0; i < cmds.size(); ++i) {
+                replies.push_back(MakeFakeReplyInteger(1));
+            }
+            return replies;
+        }));
+        return mock;
+    }));
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    ASSERT_EQ(1, backend_->store_health_.config_.failure_threshold);
+    ASSERT_EQ(1, backend_->store_health_.config_.probe_interval_ms);
+    ASSERT_EQ(EC_OK, backend_->Open());
+    ASSERT_TRUE(backend_->IsStoreAvailable());
+
+    CacheLocationMapVector locations(1);
+    PropertyMapVector properties = {{{"f", "v"}}};
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Put(nullptr, {1}, locations, properties));
+    EXPECT_TRUE(backend_->Sync({1}));
+    EXPECT_TRUE(backend_->IsStoreAvailable());
+    EXPECT_EQ(1, backend_->GetAsyncWriteStats().store_available);
+
+    // The dropped backup write is otherwise invisible in memory_primary mode:
+    // Put still returns EC_OK. The backend has to surface the outage instead.
+    redis_down.store(true, std::memory_order_release);
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backend_->Put(nullptr, {2}, locations, properties));
+    for (int i = 0; i < 500 && backend_->IsStoreAvailable(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(backend_->IsStoreAvailable());
+    EXPECT_EQ(0, backend_->GetAsyncWriteStats().store_available);
+
+    // Nothing is being written any more, so only the idle consumer probe can
+    // notice that Redis is back.
+    redis_down.store(false, std::memory_order_release);
+    for (int i = 0; i < 500 && !backend_->IsStoreAvailable(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(backend_->IsStoreAvailable());
+    EXPECT_EQ(1, backend_->GetAsyncWriteStats().store_available);
+
+    ASSERT_EQ(EC_OK, backend_->Close());
+}
+
+
+TEST_F(MetaAsyncRedisBackendTest, TestStoreHealthDegradesWhenClientCannotBeAcquired) {
+    // Init without Open leaves read_client_pool_ null, so every store call fails
+    // while acquiring a client and no command ever reaches Redis. The tracker
+    // still has to notice, because in memory_primary mode these are exactly the
+    // silent failures that would otherwise drop durable metadata.
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=64&async_wait_us=1000"
+                           "&async_max_size=1000&store_health_failure_threshold=2&store_health_probe_ms=60000");
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    ASSERT_TRUE(backend_->IsStoreAvailable());
+
+    ASSERT_EQ(EC_TIMEOUT, backend_->DeleteMetaData());
+    EXPECT_TRUE(backend_->IsStoreAvailable());
+
+    ASSERT_EQ(EC_TIMEOUT, backend_->DeleteMetaData());
+    EXPECT_FALSE(backend_->IsStoreAvailable());
+    EXPECT_EQ(0, backend_->GetAsyncWriteStats().store_available);
+}
+
+// An instance that is idle when Redis goes down issues no operation at all, so a
+// purely failure driven tracker keeps reporting the last known-good verdict and
+// the allocation gate stays wide open: the next burst allocates GA addresses
+// whose backup is dropped, which is space no later reclaim can ever find. Only
+// the consumer heartbeat can notice. failure_threshold is set far above the
+// number of polls this test can produce so the degradation provably comes from
+// the conclusive probe path rather than from accumulated operation failures.
+TEST_F(MetaAsyncRedisBackendTest, TestStoreHealthHeartbeatDetectsOutageWithoutAnyWrite) {
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=64&async_wait_us=1000"
+                           "&async_max_size=1000&async_sync_timeout_ms=5000"
+                           "&store_health_failure_threshold=1000&store_health_probe_ms=10");
+    ConstructBackend();
+
+    std::atomic<bool> redis_down{false};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
+        StandardUri empty_uri;
+        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
+        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
+        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
+        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+            std::vector<ReplyUPtr> replies;
+            if (redis_down.load(std::memory_order_acquire)) {
+                return replies; // the poll never reached Redis
+            }
+            for (size_t i = 0; i < cmds.size(); ++i) {
+                replies.push_back(MakeFakeReplyInteger(1));
+            }
+            return replies;
+        }));
+        return mock;
+    }));
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    ASSERT_EQ(1000, backend_->store_health_.config_.failure_threshold);
+    ASSERT_EQ(EC_OK, backend_->Open());
+    ASSERT_TRUE(backend_->IsStoreAvailable());
+
+    // Not a single Put/Upsert/Delete from here on: the verdict has to come from
+    // the idle consumer poll alone.
+    redis_down.store(true, std::memory_order_release);
+    for (int i = 0; i < 500 && backend_->IsStoreAvailable(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(backend_->IsStoreAvailable());
+    EXPECT_EQ(0, backend_->GetAsyncWriteStats().store_available);
+
+    redis_down.store(false, std::memory_order_release);
+    for (int i = 0; i < 500 && !backend_->IsStoreAvailable(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(backend_->IsStoreAvailable());
+
+    ASSERT_EQ(EC_OK, backend_->Close());
+}
+
 } // namespace kv_cache_manager

@@ -362,6 +362,8 @@ GC 对 WRITING 和 SERVING 两类 target 都设置扫描时的 `CacheLocation::T
 
 只读降级在 admission 阶段还有一道护栏：`PrepareDeleteTaskImpl` 构造 CAS 之前检查 target 的 spec 是否落在 `InReadOnlyMode()` 的 backend 上，命中则整个 Location 被延迟，不进入 `CLS_DELETING`，请求整体仍返回 `EC_OK`。护栏必须在准入期而非执行期：`DoLocationDelTask` 在物理 `Delete()` 失败后仍会继续 metadata CAD，而 GC 不会重新拾取 `CLS_DELETING`，一旦放行就等于丢掉元数据并泄漏空间。EventReport 类型的 Location 不受该护栏影响。
 
+元数据侧（存放 cache 地址的 Redis）不可用时，admission 阶段有对称的一道护栏：`PrepareDeleteTaskImpl` 先取 `MetaIndexer::IsMetaStoreAvailable()`，为 false 时跳过所有非 EventReport 的 Location，同样不进入 `CLS_DELETING`，请求整体仍返回 `EC_OK`。理由与只读降级同构，但方向相反：这次是**元数据**写不下去（`memory_primary` 下本地删除立即生效、异步备份被丢弃），Redis 恢复或重启后旧 Location 会从备份里复活，既继续占 quota，又指向已被回收的物理空间；反之若为了"删掉"而放行，本次删除本身也无法持久化。EventReport（V6D 上报）类型的 Location 地址由上报方拥有、可随时重传，因此豁免，保证上报链路在降级期仍可更新。判定与恢复见 [Redis 故障降级](meta_memory_primary_async_backup.md#11-redis-故障降级与恢复门禁)。
+
 ### 4.5 有界 Future 窗口、pending 去重和结果
 
 GC 同一时刻最多持有 `max_inflight_delete_requests` 个已接受请求的 `std::future<PlanExecuteResult>`：

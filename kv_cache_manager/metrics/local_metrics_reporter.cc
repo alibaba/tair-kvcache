@@ -234,6 +234,10 @@ void LocalMetricsReporter::ReportInterval() {
                                  cache_manager_instance,
                                  async_dropped_metadata_count,
                                  static_cast<double>(instance_metric.async_dropped_metadata_count));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 meta_store_available,
+                                 static_cast<double>(instance_metric.meta_store_available));
                 }
             }
         }

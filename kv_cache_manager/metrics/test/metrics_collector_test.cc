@@ -363,6 +363,11 @@ TEST_F(MetricsCollectorTest, CacheManagerInstanceMetricsCollectorTest) {
     EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_flush_key_count), 1000.);
     EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_batch_flush_time_us), 500.);
     EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_pipeline_error_count), 2.);
+
+    // meta store availability gauge: 1 = durable, 0 = degraded
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, meta_store_available), 0.);
+    SET_METRICS_(p, cache_manager_instance, meta_store_available, 1.);
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, meta_store_available), 1.);
 }
 
 TEST_F(MetricsCollectorTest, ChronoScopeConcurrentTest) {

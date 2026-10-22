@@ -734,6 +734,14 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
             ErrorCode::EC_NOENT, StringUtil::FormatString("MetaIndexer %s not found", instance_id.c_str()));
         return admission_result;
     }
+
+    // Meta store 不可用时，删除动作产生的元数据变更无法持久化：memory_primary
+    // 下本地删除立即生效但异步备份被丢弃，Redis 恢复后旧 location 会复活，
+    // 既占 quota 又指向已回收的物理空间。因此这里把非 event-report 的 location
+    // 全部推迟，保持 CLS_SERVING 让读继续命中，等恢复后由下一轮 GC/回收重试。
+    // event-report（V6D 上报）location 的地址由上报方拥有，不受此限制。
+    const bool meta_store_available = indexer->IsMetaStoreAvailable();
+
     MetaSearcher meta_searcher(indexer);
     std::vector<CacheLocationMap> location_maps;
     BlockMask empty_mask;
@@ -770,6 +778,7 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
     std::vector<int64_t> batch_cas_block_keys;
     std::vector<std::vector<MetaSearcher::LocationCASTask>> batch_cas_tasks;
     size_t read_only_deferred_locations = 0;
+    size_t meta_store_deferred_locations = 0;
     std::unordered_map<std::string, bool> read_only_by_storage;
     // A null target list represents CacheMetaDelRequest and selects every non-deleting location.
     for (size_t block_key_idx = 0; block_key_idx < block_keys.size(); ++block_key_idx) {
@@ -799,6 +808,10 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
             if (target_location_ids != nullptr && target_ids.find(location.id()) == target_ids.end()) {
                 continue;
             }
+            if (!meta_store_available && !IsEventReportStorageType(location.type())) {
+                ++meta_store_deferred_locations;
+                continue;
+            }
             if (IsLocationBlockedByReadOnlyStorage(location, read_only_by_storage)) {
                 // Defer instead of admitting: the location stays CLS_SERVING so
                 // reads keep hitting it and reclaim/GC can retry once the
@@ -824,6 +837,14 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
         }
         batch_cas_block_keys.push_back(block_key);
         batch_cas_tasks.emplace_back(std::move(location_cas_tasks));
+    }
+    if (meta_store_deferred_locations > 0) {
+        KVCM_INTERVAL_LOG_WARN(10,
+                               "location delete deferred by unavailable meta store, instance[%s] "
+                               "deferred_locations[%zu] admitted_blocks[%zu]",
+                               instance_id.c_str(),
+                               meta_store_deferred_locations,
+                               batch_cas_tasks.size());
     }
     if (read_only_deferred_locations > 0) {
         KVCM_INTERVAL_LOG_WARN(10,

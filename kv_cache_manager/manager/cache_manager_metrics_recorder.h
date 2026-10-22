@@ -33,6 +33,9 @@ public:
         int64_t max_lru_age_us = 0;
         int64_t async_dropped_key_count = 0;
         int64_t async_dropped_metadata_count = 0;
+        // 1 = the remote meta store can still durably persist cache locations,
+        // 0 = degraded (new allocation rejected, reclaim deferred).
+        int64_t meta_store_available = 1;
     };
     using GroupUsageRatioMap = std::map<std::string, double>;
     using GroupInstanceIdMetricMap = std::map<std::string, std::unordered_map<std::string, InstanceMetric>>;

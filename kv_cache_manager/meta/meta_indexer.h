@@ -208,6 +208,12 @@ public:
     // Returns async write path stats from async backend.
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
 
+    // True while this instance's cache-location metadata can still be persisted
+    // durably. False means the remote meta store is down: new location
+    // allocation must be rejected and location deletion deferred, otherwise the
+    // change is lost and cannot be reconstructed after a restart.
+    bool IsMetaStoreAvailable() noexcept;
+
     // storage usage interfaces
     [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
     [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;

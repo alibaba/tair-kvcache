@@ -201,6 +201,16 @@ public:
     // Returns async write stats from persistent backend.
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
 
+    // True while cache-location metadata can still be persisted durably.
+    //
+    // Only the persistent backend can answer this: the local cache backend owns
+    // its storage and is always available, so in memory_primary mode this
+    // reports the health of the remote copy that a restart recovers from.
+    // Callers use it to stop allocating new locations and to defer reclaim
+    // while the remote store is down, because both actions are unrecoverable
+    // once their metadata write is dropped.
+    bool IsStoreAvailable() noexcept;
+
     size_t GetMemUsage() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;
 

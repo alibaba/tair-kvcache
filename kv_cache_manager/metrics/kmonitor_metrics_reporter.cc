@@ -225,6 +225,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_manager_instance, async_pipeline_error_count);
     DECLARE_METRICS(cache_manager_instance, async_dropped_key_count);
     DECLARE_METRICS(cache_manager_instance, async_dropped_metadata_count);
+    DECLARE_METRICS(cache_manager_instance, meta_store_available);
     DECLARE_METRICS(cache_manager_instance, max_lru_age_us);
 
     struct MapHashFunc {
@@ -540,6 +541,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_pipeline_error_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_dropped_key_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_dropped_metadata_count);
+    REGISTER_GAUGE_METRIC(cache_manager_instance, meta_store_available);
     REGISTER_GAUGE_METRIC(cache_manager_instance, max_lru_age_us);
 
     return true;
@@ -1146,6 +1148,9 @@ void KmonitorMetricsReporter::ReportInterval() {
                         p, cache_manager_instance, async_dropped_metadata_count, async_dropped_metadata_count_v);
                     REPORT_METRICS(
                         cache_manager_instance, async_dropped_metadata_count, async_dropped_metadata_count_v);
+                    double meta_store_available_v;
+                    GET_METRICS_(p, cache_manager_instance, meta_store_available, meta_store_available_v);
+                    REPORT_METRICS(cache_manager_instance, meta_store_available, meta_store_available_v);
                     GET_METRICS_(p, cache_manager_instance, max_lru_age_us, max_lru_age_us_v);
                     REPORT_METRICS(cache_manager_instance, max_lru_age_us, max_lru_age_us_v);
                 }

@@ -37,6 +37,11 @@ public:
 
     std::shared_ptr<MetaIndexer> GetMetaIndexer(const std::string &instance_id) const;
 
+    // True while \p instance_id can still durably persist cache-location
+    // metadata. Unknown instances report true so that the caller fails on the
+    // existing "indexer not found" path instead of on a misleading store error.
+    bool IsMetaStoreAvailable(const std::string &instance_id);
+
     std::shared_ptr<MetaIndexer> ExtractMetaIndexer(const std::string &instance_id);
     bool RestoreMetaIndexer(const std::string &instance_id, std::shared_ptr<MetaIndexer> indexer);
 

@@ -31,6 +31,46 @@ MetaAsyncRedisBackend::~MetaAsyncRedisBackend() { [[maybe_unused]] ErrorCode _ =
 
 std::string MetaAsyncRedisBackend::GetStorageType() noexcept { return META_ASYNC_REDIS_BACKEND_TYPE_STR; }
 
+bool MetaAsyncRedisBackend::IsStoreAvailable() noexcept { return store_health_.IsAvailable(); }
+
+void MetaAsyncRedisBackend::RecordStoreOpResult(const ErrorCode ec) noexcept {
+    // EC_NOENT still proves the store answered, so it counts as reachable.
+    if (ec == EC_OK || ec == EC_NOENT) {
+        store_health_.RecordSuccess();
+        return;
+    }
+    store_health_.RecordFailure();
+}
+
+void MetaAsyncRedisBackend::ProbeStoreHealth(RedisClient *client) noexcept {
+    if (client == nullptr) {
+        return;
+    }
+    std::vector<bool> exists_vec;
+    const auto error_codes = client->Exists({metadata_key_}, exists_vec);
+    const auto ec = error_codes.empty() ? EC_ERROR : error_codes[0];
+    // EC_NOENT still proves the store answered, so it counts as reachable.
+    if (ec == EC_OK || ec == EC_NOENT) {
+        store_health_.RecordSuccess();
+        return;
+    }
+    // A probe is issued exactly when there is no recent verdict to trust, and it
+    // cannot fail for command level reasons, so this one failure is enough.
+    store_health_.RecordProbeFailure();
+}
+
+ClientPool<RedisClient>::ClientHandle MetaAsyncRedisBackend::AcquireStoreClient() noexcept {
+    if (!read_client_pool_) {
+        RecordStoreOpResult(EC_ERROR);
+        return ClientPool<RedisClient>::ClientHandle(nullptr, nullptr);
+    }
+    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        RecordStoreOpResult(EC_TIMEOUT);
+    }
+    return handle;
+}
+
 // ---------------------------------------------------------------------------
 // Init / Open / Close
 // ---------------------------------------------------------------------------
@@ -76,6 +116,11 @@ ErrorCode MetaAsyncRedisBackend::Init(const std::string &instance_id,
     parse_config_param("async_sync_timeout_ms", sync_timeout_ms_);
     parse_config_param("async_drain_ms", drain_timeout_ms_);
 
+    MetaStoreHealthTracker::Config store_health_config;
+    parse_config_param("store_health_failure_threshold", store_health_config.failure_threshold);
+    parse_config_param("store_health_probe_ms", store_health_config.probe_interval_ms);
+    store_health_.Configure("async_redis:" + instance_id_, store_health_config);
+
     constexpr int32_t kMaxQueueCount = 2048;
     if (queue_count_ <= 0 || queue_count_ > kMaxQueueCount || max_batch_size_ <= 0 || batch_wait_timeout_us_ <= 0 ||
         queue_max_size_ <= 0 || enqueue_timeout_ms_ < 0 || sync_timeout_ms_ <= 0 || drain_timeout_ms_ <= 0) {
@@ -95,7 +140,7 @@ ErrorCode MetaAsyncRedisBackend::Init(const std::string &instance_id,
 
     KVCM_LOG_INFO("meta async redis backend init ok, instance[%s], queue_count[%d], max_batch[%ld], "
                   "wait_timeout_us[%ld], max_size[%ld], enqueue_timeout_ms[%ld], sync_timeout_ms[%ld], "
-                  "drain_timeout_ms[%ld]",
+                  "drain_timeout_ms[%ld], store_health_failure_threshold[%ld], store_health_probe_ms[%ld]",
                   instance_id_.c_str(),
                   queue_count_,
                   max_batch_size_,
@@ -103,7 +148,9 @@ ErrorCode MetaAsyncRedisBackend::Init(const std::string &instance_id,
                   queue_max_size_,
                   enqueue_timeout_ms_,
                   sync_timeout_ms_,
-                  drain_timeout_ms_);
+                  drain_timeout_ms_,
+                  store_health_config.failure_threshold,
+                  store_health_config.probe_interval_ms);
     return EC_OK;
 }
 
@@ -396,7 +443,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Get(RequestContext *request_contex
                                                   const KeyTypeVec &keys,
                                                   CacheLocationMapVector &out_locations,
                                                   PropertyMapVector &out_properties) noexcept {
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "async redis get fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
@@ -429,7 +476,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Get(RequestContext *request_contex
 std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocations(RequestContext *request_context,
                                                            const KeyTypeVec &keys,
                                                            CacheLocationMapVector &out_locations) noexcept {
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "async redis get locations fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
@@ -471,7 +518,7 @@ std::vector<std::vector<ErrorCode>> MetaAsyncRedisBackend::GetLocations(RequestC
         }
     }
 
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10,
                                "async redis get locations by id fail, fail to acquire read client, instance[%s]",
@@ -521,7 +568,7 @@ std::vector<std::vector<ErrorCode>> MetaAsyncRedisBackend::GetLocations(RequestC
 std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocationIds(RequestContext * /*request_context*/,
                                                              const KeyTypeVec &keys,
                                                              LocationIdsPerKey &out_location_ids) noexcept {
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "async redis get location ids fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
@@ -552,7 +599,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetProperties(RequestContext * /*r
                                                             const KeyTypeVec &keys,
                                                             const std::vector<std::string> &field_names,
                                                             PropertyMapVector &out_properties) noexcept {
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "async redis get properties fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
@@ -575,7 +622,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetProperties(RequestContext * /*r
 std::vector<ErrorCode> MetaAsyncRedisBackend::Exists(RequestContext * /*request_context*/,
                                                      const KeyTypeVec &keys,
                                                      std::vector<bool> &out_is_exist_vec) noexcept {
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "async redis exists fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
@@ -588,7 +635,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Exists(RequestContext * /*request_
 std::vector<ErrorCode> MetaAsyncRedisBackend::ExistsLocation(RequestContext * /*request_context*/,
                                                              const KeyTypeVec &keys,
                                                              std::vector<bool> &out_exists) noexcept {
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "async redis exists location fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
@@ -604,7 +651,7 @@ ErrorCode MetaAsyncRedisBackend::ListKeys(RequestContext * /*request_context*/,
                                           std::string &out_next_cursor,
                                           KeyTypeVec &out_keys) noexcept {
     out_keys.clear();
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "async redis list keys fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
@@ -653,7 +700,7 @@ ErrorCode MetaAsyncRedisBackend::RandomSample(RequestContext * /*request_context
                                               const int64_t count,
                                               KeyTypeVec &out_keys) noexcept {
     out_keys.clear();
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "async redis random sample fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
@@ -755,21 +802,20 @@ ErrorCode MetaAsyncRedisBackend::PutMetaData(const FieldMap &field_map) noexcept
         queues_[0]->PushReserved(QueueItem{std::move(op)}, 1);
         return EC_OK;
     }
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "async redis put metadata fail, fail to acquire client, instance[%s]", instance_id_.c_str());
         return EC_TIMEOUT;
     }
     auto error_codes = handle->Set({metadata_key_}, {field_map});
-    if (error_codes.empty()) {
-        return EC_ERROR;
-    }
-    return error_codes[0];
+    const ErrorCode ec = error_codes.empty() ? EC_ERROR : error_codes[0];
+    RecordStoreOpResult(ec);
+    return ec;
 }
 
 ErrorCode MetaAsyncRedisBackend::GetMetaData(FieldMap &out_field_map) noexcept {
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "async redis get metadata fail, fail to acquire client, instance[%s]", instance_id_.c_str());
@@ -778,8 +824,10 @@ ErrorCode MetaAsyncRedisBackend::GetMetaData(FieldMap &out_field_map) noexcept {
     FieldMapVec maps;
     auto error_codes = handle->GetAllFields({metadata_key_}, maps);
     if (error_codes.empty()) {
+        RecordStoreOpResult(EC_ERROR);
         return EC_ERROR;
     }
+    RecordStoreOpResult(error_codes[0]);
     if (error_codes[0] == EC_OK && !maps.empty()) {
         out_field_map = std::move(maps[0]);
     }
@@ -787,14 +835,16 @@ ErrorCode MetaAsyncRedisBackend::GetMetaData(FieldMap &out_field_map) noexcept {
 }
 
 ErrorCode MetaAsyncRedisBackend::DeleteMetaData() noexcept {
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    auto handle = AcquireStoreClient();
     if (!handle) {
         return EC_TIMEOUT;
     }
     const auto results = handle->Delete({metadata_key_});
     if (results.size() != 1) {
+        RecordStoreOpResult(EC_ERROR);
         return EC_ERROR;
     }
+    RecordStoreOpResult(results[0]);
     return results[0] == EC_NOENT ? EC_OK : results[0];
 }
 
@@ -865,6 +915,7 @@ MetaStorageBackend::AsyncWriteStats MetaAsyncRedisBackend::GetAsyncWriteStats() 
     stats.pipeline_error_count = stats_pipeline_error_count_.exchange(0, std::memory_order_relaxed);
     stats.dropped_key_count = stats_dropped_key_count_.exchange(0, std::memory_order_relaxed);
     stats.dropped_metadata_count = stats_dropped_metadata_count_.exchange(0, std::memory_order_relaxed);
+    stats.store_available = store_health_.IsAvailable() ? 1 : 0;
     return stats;
 }
 
@@ -877,6 +928,17 @@ void MetaAsyncRedisBackend::ConsumerLoop(int queue_id) {
         int64_t taken_keys = 0;
         auto items = queues_[queue_id]->PopBatchWait(max_batch_size_, batch_wait_timeout_us_, taken_keys);
         if (items.empty()) {
+            // Heartbeat. Nothing is being written, so the flush path cannot
+            // report health in either direction: while degraded this poll is
+            // what notices that Redis is back, and while healthy it is what
+            // notices that Redis went down. The second half matters just as
+            // much -- an instance that is idle when the outage starts would
+            // otherwise keep reporting the last known-good verdict, let the
+            // allocation gate stay open, and hand out GA addresses for a whole
+            // burst whose backup is then dropped.
+            if (store_health_.ShouldProbe()) {
+                ProbeStoreHealth(consumer_clients_[queue_id].get());
+            }
             continue;
         }
         BatchFlush(queue_id, items, taken_keys);
@@ -963,6 +1025,19 @@ void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &ite
 
     bool all_ok = false;
     auto error_codes = client->BatchWrite(all_cmds, all_ok);
+
+    if (all_ok) {
+        store_health_.RecordSuccess();
+    } else {
+        store_health_.RecordFailure();
+        // A failed pipeline is not proof that Redis is down: a command level
+        // error also lands here. Confirm reachability with a probe (rate
+        // limited by the tracker) so a bad key cannot pin the backend in a
+        // permanent degradation.
+        if (store_health_.ShouldProbe()) {
+            ProbeStoreHealth(client);
+        }
+    }
 
     if (!all_ok) {
         KVCM_LOG_ERROR("async redis consumer[%d] pipeline fail, cmds[%zu], instance[%s]",
