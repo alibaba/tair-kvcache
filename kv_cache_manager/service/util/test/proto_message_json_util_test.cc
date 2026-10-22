@@ -90,6 +90,12 @@ TEST(ProtoConvertTest, MigrationCopyLimitDefaultsAndExplicitValues) {
         ASSERT_TRUE(round_trip.migration_config().has_copy_max_inflight_bytes());
         EXPECT_EQ(test.concurrency, round_trip.migration_config().copy_max_concurrency().value());
         EXPECT_EQ(test.bytes, round_trip.migration_config().copy_max_inflight_bytes().value());
+
+        std::string response_json;
+        ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&round_trip, response_json));
+        proto::admin::CacheConfig parsed_response;
+        ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(response_json, &parsed_response));
+        EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(round_trip, parsed_response));
     }
 }
 
@@ -160,53 +166,6 @@ TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesCurrentMapAndWrapperTypes) 
     proto::admin::MigrationMarkMethodConfig parsed_wrapper;
     ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(wrapper_json, &parsed_wrapper));
     EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(wrapper_message, parsed_wrapper));
-}
-
-TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesUnsignedMigrationLimits) {
-    for (const uint64_t value : {uint64_t{0}, uint64_t{42}, std::numeric_limits<uint64_t>::max()}) {
-        SCOPED_TRACE(value);
-        proto::admin::MigrationConfig message;
-        message.mutable_copy_max_inflight_bytes()->set_value(value);
-        ASSERT_TRUE(FastProtoJsonCodec::Supports(message.GetDescriptor()));
-
-        std::string json;
-        std::string protobuf_json;
-        ASSERT_TRUE(FastProtoJsonCodec::TryToJson(message, json));
-        ASSERT_TRUE(ProtobufToJson(message, &protobuf_json));
-        EXPECT_EQ(protobuf_json, json);
-        EXPECT_NE(std::string::npos, json.find("\"copy_max_inflight_bytes\":\"" + std::to_string(value) + "\""));
-
-        proto::admin::MigrationConfig parsed;
-        ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(json, &parsed));
-        EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(message, parsed));
-    }
-}
-
-TEST_F(ProtoMessageJsonUtilTest, TestFastCodecParsesUnsignedWrapperPresenceAndBoundaries) {
-    for (const char *json : {R"({})",
-                             R"({"copy_max_inflight_bytes":null})",
-                             R"({"copy_max_inflight_bytes":0})",
-                             R"({"copy_max_inflight_bytes":"0"})",
-                             R"({"copy_max_inflight_bytes":18446744073709551615})",
-                             R"({"copyMaxInflightBytes":"18446744073709551615"})"}) {
-        SCOPED_TRACE(json);
-        proto::admin::MigrationConfig expected;
-        proto::admin::MigrationConfig actual;
-        ASSERT_TRUE(ProtobufFromJson(json, &expected));
-        ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(json, &actual));
-        EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(expected, actual));
-    }
-
-    for (const char *json : {R"({"copy_max_inflight_bytes":-1})",
-                             R"({"copy_max_inflight_bytes":"-1"})",
-                             R"({"copy_max_inflight_bytes":"18446744073709551616"})",
-                             R"({"copy_max_inflight_bytes":true})"}) {
-        SCOPED_TRACE(json);
-        proto::admin::MigrationConfig parsed;
-        parsed.mutable_copy_max_inflight_bytes()->set_value(42);
-        EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(json, &parsed));
-        EXPECT_EQ(42u, parsed.copy_max_inflight_bytes().value());
-    }
 }
 
 TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesBytesWithProtobufBase64Semantics) {

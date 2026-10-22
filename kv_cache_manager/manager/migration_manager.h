@@ -10,7 +10,6 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <queue>
 #include <shared_mutex>
 #include <string>
@@ -131,10 +130,9 @@ public:
     ErrorCode Submit(const std::string &trace_id, MigrationRequest request);
 
     // ---- copy 任务完成回调（监控线程驱动，亦可供测试直接调用） ----
-    // false means a successful promote still awaits its metadata Sync barrier.
-    bool OnTaskSuccess(const std::string &instance_id, int64_t block_key);
-    bool OnTaskFailed(const std::string &instance_id, int64_t block_key, ErrorCode reason);
-    bool OnTaskUnknown(const std::string &instance_id,
+    void OnTaskSuccess(const std::string &instance_id, int64_t block_key);
+    void OnTaskFailed(const std::string &instance_id, int64_t block_key, ErrorCode reason);
+    void OnTaskUnknown(const std::string &instance_id,
                        int64_t block_key,
                        const std::string &reason,
                        bool record_completion = true);
@@ -359,8 +357,6 @@ private:
         MigrationCopyExecutionMode copy_execution_mode = MigrationCopyExecutionMode::SYNC;
         std::string async_operation_id;
         bool async_credit_active = false;
-        // Only the durable barrier is retried after a successful atomic promotion.
-        bool promotion_pending_sync = false;
         std::string src_location_value;
         std::string dst_location_value;
         std::chrono::steady_clock::time_point submit_time;
@@ -418,21 +414,8 @@ private:
         size_t expected_items = 0;
         std::future<PlanExecuteResult> future;
         bool native_async = false;
-        std::optional<PlanExecuteResult> completed_result;
-        std::chrono::steady_clock::time_point completion_retry_after{};
         StorageBackendSnapshot storage_backends;
         std::string async_operation_id;
-    };
-
-    // Retain cleanup until it succeeds or its original backend is unregistered.
-    // Administrative retirement ends it as failure, never as physical-delete success.
-    struct PendingLocationCleanup {
-        std::string instance_id;
-        std::string storage_name;
-        CacheLocationDelRequest request;
-        std::future<PlanExecuteResult> future;
-        std::chrono::steady_clock::time_point retry_after{};
-        uint32_t retry_count = 0;
     };
 
     struct ExpiringMark {
@@ -464,24 +447,21 @@ private:
     bool IsSourceLocationServing(const CopyTaskContext &ctx) const;
     void RecordCopySubmission(const CopyTaskContext &ctx, const std::string &trace_id);
     // Pre-submit rollback owns the same cleanup, but is not a submitted task's terminal event.
-    bool CompleteCopyTaskAsFailed(const CopyTaskContext &ctx,
-                                  const std::string &fail_reason,
-                                  bool record_completion = true);
-    bool OnTaskFailedInternal(const std::string &instance_id,
+    void
+    CompleteCopyTaskAsFailed(const CopyTaskContext &ctx, const std::string &fail_reason, bool record_completion = true);
+    void OnTaskFailedInternal(const std::string &instance_id,
                               int64_t block_key,
                               ErrorCode reason,
                               const std::string &fail_reason,
                               bool record_source_failure,
                               bool record_completion = true);
-    bool CompleteCopyTaskAsSucceeded(const CopyTaskContext &ctx);
-    bool CompleteCopyTaskAsUnknown(const CopyTaskContext &ctx,
+    void CompleteCopyTaskAsSucceeded(const CopyTaskContext &ctx);
+    void CompleteCopyTaskAsUnknown(const CopyTaskContext &ctx,
                                    const std::string &fail_reason,
                                    bool record_completion = true);
-    void TrackLocationCleanup(const std::string &instance_id,
-                              const std::string &storage_name,
-                              CacheLocationDelRequest request,
-                              std::future<PlanExecuteResult> future);
-    void ProcessCompletedLocationCleanups();
+    // Release task ownership and record failure without touching either Location.
+    void
+    FinishCopyTaskAsFailed(const CopyTaskContext &ctx, const std::string &fail_reason, bool record_completion = true);
     bool ReserveAsyncCopyCredit(const MigrationRequest &request, uint64_t total_bytes);
     void ReleaseAsyncCopyCredit(const CopyTaskContext &ctx);
     void RecordCopySourceFailure(const CopyTaskContext &ctx, ErrorCode reason);
@@ -550,13 +530,12 @@ private:
     enum class ClaimResult {
         kClaimedRunning,
         kWasCancelling,
-        kRetryingPromotion,
         kBusyPreparing,
         kBusyCompleting,
         kNotFound,
     };
     // monitor 完成路径认领：kRunning→置 kCompleting 并拷 ctx（kClaimedRunning）；
-    // kCancelling→置 kCompleting 返回 kWasCancelling；已 promote 但 Sync 未完成时返回 kRetryingPromotion。
+    // kCancelling→置 kCompleting 返回 kWasCancelling。
     ClaimResult ClaimForCompletionLocked(const std::string &instance_id, int64_t block_key, CopyTaskContext &out_ctx);
     enum class CancelResult { kMarked, kMarkedPreparing, kAlreadyCancelling, kBusyCompleting, kNotFound };
     // 外部 Cancel 认领：kPreparing→kPrepareCancelling（由提交线程清理）；
@@ -564,7 +543,7 @@ private:
     CancelResult MarkCancellingLocked(const std::string &instance_id, int64_t block_key);
     // 取消任务的延迟收尾（monitor 线程，入口不持锁）：删 WRITING 目标（源不动）+ 移除活跃任务
     // + cancelled 终态 metric/event/log。仅由 OnTaskSuccess/OnTaskFailed 在认领到 kWasCancelling 时调用。
-    bool CompleteCancelledTask(const CopyTaskContext &ctx, bool record_completion = true);
+    void CompleteCancelledTask(const CopyTaskContext &ctx, bool record_completion = true);
 
     struct AsyncMigrationPrepareKey {
         std::uint64_t generation = 0;
@@ -636,8 +615,6 @@ private:
     std::mutex pending_mutex_;
     std::condition_variable pending_cv_;
     std::deque<PendingCopy> pending_copies_;
-    mutable std::mutex pending_cleanup_mutex_;
-    std::deque<PendingLocationCleanup> pending_location_cleanups_;
 
     std::mutex mark_expiry_mutex_;
     std::priority_queue<ExpiringMark, std::vector<ExpiringMark>, ExpiringMarkGreater> mark_expiry_queue_;
