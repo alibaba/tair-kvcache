@@ -14,7 +14,7 @@
 3. 支持全量的引擎应把 snapshot 当作低频纠偏手段，不能分页，也不应高频发送。
 4. 一次 snapshot 是一个 reporter 在一个 storage type 下、跨全部 medium 的完整状态。
 5. 客户端不得在 URI 中填写 `s_v`；KVCM 会自动追加。
-6. `committed_snapshot_version` 是 32 位十六进制 opaque generation，不能按大小比较；成功完整
+6. `committed_snapshot_version` 是 8 位十六进制 opaque generation，不能按大小比较；成功完整
    snapshot 后它会成为该 reporter 的严格查询栅栏。
 7. `snapshot_required=true` 表示请求到达时当前进程还没有该 reporter generation；创建 generation
    的首条 ADD/DELETE 自身仍返回 `true`，下一条事件才返回 `false`。该提示不会阻止合法增量。
@@ -573,7 +573,7 @@ Event-report location 只有同时满足以下条件才可参与业务查询：
 3. reporter 当前 available；
 4. location 至少包含一个 spec；
 5. 每个 URI 语法合法；
-6. URI 如果带 `s_v`，只能出现一次且必须是 32 位十六进制文本。
+6. URI 如果带 `s_v`，只能出现一次且必须是 8 位十六进制文本。
 
 version 可见性分为两种状态：
 

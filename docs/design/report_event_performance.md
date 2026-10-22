@@ -452,8 +452,8 @@ limit 主要改善写写公平性，必须用混合写 p99 验证，不能把它
 在 5.7 的 worker=4 版本上继续检查发现两个与 block 数线性相关、且都位于 GetHostCacheState 的热点：
 
 1. `IsEventReportLocationReadable` 对每个 spec 构造 `DataStorageUri`。解析会复制 URI 的多个 substring，并为
-   每个 query param 分配 `std::map` node；随后 `GetParam` 和 `SnapshotUriInfo` 又复制 32-byte token。查询
-   实际只需要确认 URI 有合法 scheme、`s_v` 不重复且为 32 位十六进制，并与 request snapshot 中的
+   每个 query param 分配 `std::map` node；随后 `GetParam` 和 `SnapshotUriInfo` 又复制 token。查询
+   实际只需要确认 URI 有合法 scheme、`s_v` 不重复且为 8 位十六进制，并与 request snapshot 中的
    committed token 比较。因此改为一次 `string_view` 扫描，malformed/重复 token 仍然 fail closed；
 2. `MetaLocalBackend::GetLocationValues` 对每个命中 key 调用 revisit histogram `Observe`。默认 13 个 bucket
    下，一次 10k-key 查询会产生十万级共享 counter 原子 RMW；4 个 query worker 会争抢同一组 cache line。
@@ -675,7 +675,7 @@ before/after 使用相同进程形态，因此 allocator 条件一致。
    map 的 mapped string；`unordered_map` rehash 不会使元素引用失效，且 map 在整个 fold/task 构造阶段都
    存活。后续不能把该指针改为指向临时字符串或可能搬迁元素的 vector；
 3. `DeltaMutationGuard` 缓存并返回 request-owned lease，后续事件只读其 snapshot token/generation，不再为
-   每个 event 复制 32-byte token。lease 仍由 guard 析构时成对结束，generation-pinned lifecycle fence
+   每个 event 复制 token。lease 仍由 guard 析构时成对结束，generation-pinned lifecycle fence
    窗口不变；
 4. 入口完整解析 URI 时同时保存 `size` 和已经验证的 parsed URI；追加 `s_v` 使用
    `ToUriStringWithExtraParam` 直接生成与 `SetParam + ToUriString` 完全相同的 canonical sorted URI，不再

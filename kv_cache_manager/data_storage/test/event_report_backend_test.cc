@@ -342,7 +342,7 @@ TEST_F(EventReportBackendTest, MightExistTracksRegisteredNodeAvailability) {
 
     std::string unknown_token_uri_string;
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
-        "event_report://10.0.0.3:8080/mem", "ffffffffffffffffffffffffffffffff", unknown_token_uri_string));
+        "event_report://10.0.0.3:8080/mem", "ffffffff", unknown_token_uri_string));
     const DataStorageUri unknown_token_uri(unknown_token_uri_string);
     const DataStorageUri invalid_uri;
 
@@ -1254,6 +1254,7 @@ TEST(EventReportBackendSnapshotTest, SnapshotCommitRejectsChangedLifecycleGenera
     uint64_t admitted_generation = 0;
     ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms, &admitted_generation));
     ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(candidate));
+    EXPECT_EQ(SnapshotUriUtils::kSnapshotVersionHexLength, candidate.size());
     ASSERT_NE(0u, admitted_generation);
 
     // An explicit REGISTER is a lifecycle boundary. A snapshot admitted by
@@ -1441,25 +1442,27 @@ TEST(EventReportBackendSnapshotTest, QueryVisibilitySnapshotIsInstanceScopedAndE
     EXPECT_TRUE(snapshot.empty());
 }
 
-TEST(EventReportBackendSnapshotTest, SnapshotTokensAreNeverReusedAcrossAttempts) {
+TEST(EventReportBackendSnapshotTest, SnapshotTokensAreUniqueWhileActive) {
     EventReportBackend backend(nullptr);
     backend.SetSnapshotMinIntervalMsForTest(0);
-    const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0.1:8080"};
     std::set<std::string> observed;
+    std::vector<std::pair<ReporterSnapshotKey, std::string>> active_snapshots;
 
     for (size_t attempt = 0; attempt < 128; ++attempt) {
+        const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0." + std::to_string(attempt + 1) + ":8080"};
         std::string candidate;
         uint64_t retry_after_ms = 0;
         ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_after_ms));
         ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(candidate));
+        EXPECT_EQ(SnapshotUriUtils::kSnapshotVersionHexLength, candidate.size());
+        EXPECT_EQ(std::string::npos, candidate.find_first_not_of("0123456789abcdef"));
         EXPECT_TRUE(observed.insert(candidate).second);
-        if (attempt % 2 == 0) {
-            ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, candidate));
-        } else {
-            backend.AbortSnapshotVersion(reporter_key, candidate);
-        }
+        active_snapshots.emplace_back(reporter_key, std::move(candidate));
     }
     EXPECT_EQ(128u, observed.size());
+    for (const auto &[reporter_key, candidate] : active_snapshots) {
+        backend.AbortSnapshotVersion(reporter_key, candidate);
+    }
 }
 
 TEST(EventReportBackendSnapshotTest, ConcurrentReportersReserveAndReleaseSnapshotTokens) {
@@ -1918,10 +1921,10 @@ TEST(EventReportBackendSnapshotTest, AbortNeverPublishesAndWrongTokenCannotCommi
     std::string candidate;
     uint64_t retry_after_ms = 0;
     ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, scope, candidate, retry_after_ms));
-    EXPECT_FALSE(backend.CommitSnapshotVersion(scope, std::string(32, 'f')));
+    EXPECT_FALSE(backend.CommitSnapshotVersion(scope, std::string(8, 'f')));
     EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
 
-    backend.AbortSnapshotVersion(scope, std::string(32, 'e'));
+    backend.AbortSnapshotVersion(scope, std::string(8, 'e'));
     std::string still_blocked;
     EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS,
               BeginSnapshotForRegisteredReporter(backend, scope, still_blocked, retry_after_ms));
@@ -2160,11 +2163,12 @@ TEST(EventReportBackendSnapshotTest, InvalidInputsDoNotMutateOrReleaseSnapshotSt
 
     ASSERT_EQ(EC_OK, BeginSnapshotForRegisteredReporter(backend, reporter_key, candidate, retry_after_ms));
     ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(candidate));
+    EXPECT_EQ(SnapshotUriUtils::kSnapshotVersionHexLength, candidate.size());
     EXPECT_FALSE(backend.CommitSnapshotVersion(reporter_key, ""));
-    EXPECT_FALSE(backend.CommitSnapshotVersion(reporter_key, std::string(31, 'a')));
-    EXPECT_FALSE(backend.CommitSnapshotVersion(reporter_key, std::string(32, 'g')));
+    EXPECT_FALSE(backend.CommitSnapshotVersion(reporter_key, std::string(7, 'a')));
+    EXPECT_FALSE(backend.CommitSnapshotVersion(reporter_key, std::string(8, 'g')));
 
-    backend.AbortSnapshotVersion(reporter_key, std::string(32, 'f'));
+    backend.AbortSnapshotVersion(reporter_key, std::string(8, 'f'));
     std::string blocked = "stale";
     retry_after_ms = 99;
     EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS,
@@ -2202,7 +2206,7 @@ TEST(EventReportBackendSnapshotTest, LocationIdParserRejectsMalformedAndLegacyId
 }
 
 TEST(EventReportBackendSnapshotTest, UriCarriesOnlyOpaqueSnapshotToken) {
-    const std::string token = "00112233445566778899aabbccddeeff";
+    const std::string token = "00112233";
     const std::string reporter_uri = "vineyard://127.0.0.1:9600/object?size=1024";
     std::string versioned_uri;
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(reporter_uri, token, versioned_uri));
@@ -2218,7 +2222,7 @@ TEST(EventReportBackendSnapshotTest, UriCarriesOnlyOpaqueSnapshotToken) {
     EXPECT_FALSE(SnapshotUriUtils::AddSnapshotVersionToUri(versioned_uri, token, versioned_uri));
     EXPECT_FALSE(SnapshotUriUtils::IsValidSnapshotVersionToken(""));
     EXPECT_FALSE(SnapshotUriUtils::IsValidSnapshotVersionToken("7"));
-    EXPECT_FALSE(SnapshotUriUtils::IsValidSnapshotVersionToken(std::string(32, 'g')));
+    EXPECT_FALSE(SnapshotUriUtils::IsValidSnapshotVersionToken(std::string(8, 'g')));
 }
 
 TEST(EventReportBackendSnapshotTest, MightExistRequiresCurrentTokenAndAvailableReporter) {
@@ -2247,7 +2251,7 @@ TEST(EventReportBackendSnapshotTest, MightExistRequiresCurrentTokenAndAvailableR
     EXPECT_EQ((std::vector<bool>{true}), backend.MightExist({committed_uri}));
 
     std::string unknown_uri;
-    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(raw_uri, "ffffffffffffffffffffffffffffffff", unknown_uri));
+    ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(raw_uri, "ffffffff", unknown_uri));
     EXPECT_EQ((std::vector<bool>{false}), backend.MightExist({DataStorageUri(unknown_uri)}));
 
     backend.SetNodeUnavailable(instance_id, reporter_host);
@@ -2395,7 +2399,7 @@ TEST(EventReportBackendSnapshotTest, MightExistBatchPreservesOrderAcrossTokenAnd
     };
     const DataStorageUri current_a_uri = versioned(current_a);
     const DataStorageUri old_a_uri = versioned(old_a);
-    const DataStorageUri unknown_uri = versioned("ffffffffffffffffffffffffffffffff");
+    const DataStorageUri unknown_uri = versioned("ffffffff");
     const DataStorageUri current_b_uri = versioned(current_b);
     const DataStorageUri malformed_uri("event_report://physical-cache:9600/mem");
     ASSERT_TRUE(current_a_uri.Valid());
@@ -2844,7 +2848,7 @@ TEST_F(EventReportBackendTest, DisableUnblocksSnapshotAndDeltaWaitersAndReopensG
 }
 
 TEST(EventReportBackendSnapshotTest, SnapshotUriUtilitiesHandleExactParameterBoundaries) {
-    const std::string token = "00112233445566778899aabbccddeeff";
+    const std::string token = "00112233";
     const std::string raw_uri = "event_report://10.0.0.1:8080/mem?size=7&user_s_v=kept&s_v_hint=kept";
     EXPECT_EQ(0u, SnapshotUriUtils::CountUriParam(raw_uri, SnapshotUriUtils::kSnapshotVersionParam));
 
@@ -2863,15 +2867,15 @@ TEST(EventReportBackendSnapshotTest, SnapshotUriUtilitiesHandleExactParameterBou
     EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(raw_uri, info));
     EXPECT_TRUE(info.version.empty());
     EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(
-        "event_report://10.0.0.1:8080/mem?s_v=" + std::string(31, 'a'), info));
+        "event_report://10.0.0.1:8080/mem?s_v=" + std::string(7, 'a'), info));
     EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(
-        "event_report://10.0.0.1:8080/mem?s_v=" + std::string(32, 'g'), info));
+        "event_report://10.0.0.1:8080/mem?s_v=" + std::string(8, 'g'), info));
     EXPECT_FALSE(SnapshotUriUtils::ParseSnapshotUriInfo(versioned_uri + "&s_v=" + token, info));
     versioned_uri = "stale";
     EXPECT_FALSE(SnapshotUriUtils::AddSnapshotVersionToUri("", token, versioned_uri));
     EXPECT_TRUE(versioned_uri.empty());
     versioned_uri = "stale";
-    EXPECT_FALSE(SnapshotUriUtils::AddSnapshotVersionToUri(raw_uri, std::string(31, 'a'), versioned_uri));
+    EXPECT_FALSE(SnapshotUriUtils::AddSnapshotVersionToUri(raw_uri, std::string(7, 'a'), versioned_uri));
     EXPECT_TRUE(versioned_uri.empty());
 
     std::string storage_type = "stale";

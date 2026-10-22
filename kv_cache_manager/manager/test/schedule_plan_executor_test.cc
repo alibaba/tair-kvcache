@@ -1355,7 +1355,7 @@ TEST_F(SchedulePlanExecutorTest, TestEventReportLocationDeleteSkipsPhysicalBacke
         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec(
-            "tp0", "event_report://external_cache/cache/block701?s_v=11111111111111111111111111111111")});
+            "tp0", "event_report://external_cache/cache/block701?s_v=11111111")});
     std::vector<std::string> location_ids;
     ASSERT_EQ(EC_OK,
               BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {location}, location_ids));
@@ -1419,7 +1419,7 @@ TEST_F(SchedulePlanExecutorTest, TestEventReportLocationDeleteSkipsPhysicalBacke
         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec(
-            "tp0", "event_report://external_cache/cache/block704?s_v=11111111111111111111111111111111")});
+            "tp0", "event_report://external_cache/cache/block704?s_v=11111111")});
     auto mixed_ordinary_location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
         DataStorageType::DATA_STORAGE_TYPE_DUMMY,
         1,

@@ -1868,8 +1868,8 @@ TEST_F(MetaSearcherTest, TestPrefixMatchByHostParallelPresenceMatrixMatchesRefer
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsPreservesUntouchedSpecsAcrossGenerationChange) {
     const MetaSearcher::KeyVector keys = {10007};
     const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
-    const std::string version_a = "00112233445566778899aabbccddeeff";
-    const std::string version_b = "ffeeddccbbaa99887766554433221100";
+    const std::string version_a = "00112233";
+    const std::string version_b = "ffeeddcc";
     auto uri = [](const std::string &source, const std::string &version) {
         return "event_report://127.0.0.1:8080/mem?source=" + source + "&s_v=" + version;
     };
@@ -1936,8 +1936,8 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsPreservesUntouchedSpecsAcros
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnapshotVersions) {
     const MetaSearcher::KeyVector keys = {10012};
     const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
-    const std::string version_a = "00112233445566778899aabbccddeeff";
-    const std::string version_b = "ffeeddccbbaa99887766554433221100";
+    const std::string version_a = "00112233";
+    const std::string version_b = "ffeeddcc";
     auto uri = [](const std::string &source, const std::string &version) {
         return "event_report://127.0.0.1:8080/mem?source=" + source + "&s_v=" + version;
     };
@@ -2043,7 +2043,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsOverflowAgainstExistingSpecs) {
     const MetaSearcher::KeyVector keys = {10016};
     const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
-    const std::string version = "00112233445566778899aabbccddeeff";
+    const std::string version = "00112233";
     auto uri = [&version](const std::string &source, const std::string &size) {
         return "event_report://127.0.0.1:8080/mem?size=" + size + "&source=" + source + "&s_v=" + version;
     };
@@ -2091,7 +2091,7 @@ TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltas
         replace_futures.push_back(std::async(std::launch::async, [&, i] {
             replace_signal.wait();
             const std::string generation = std::to_string(i);
-            const std::string token = std::string(31, '0') + "0123456789ab"[i];
+            const std::string token = std::string(7, '0') + "0123456789ab"[i];
             const std::string uri_prefix =
                 "event_report://127.0.0.1:8080/mem?generation=" + generation + "&s_v=" + token;
             std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> tasks = {{

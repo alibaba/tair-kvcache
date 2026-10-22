@@ -26,13 +26,11 @@ namespace kv_cache_manager {
 namespace {
 
 std::string GenerateSnapshotVersionToken() {
-    std::array<unsigned char, 16> bytes{};
+    std::array<unsigned char, SnapshotUriUtils::kSnapshotVersionHexLength / 2> bytes{};
     thread_local std::random_device random;
     for (auto &byte : bytes) {
         byte = static_cast<unsigned char>(random());
     }
-    bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0fU) | 0x40U);
-    bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3fU) | 0x80U);
     constexpr char kHex[] = "0123456789abcdef";
     std::string token(bytes.size() * 2, '0');
     for (size_t i = 0; i < bytes.size(); ++i) {

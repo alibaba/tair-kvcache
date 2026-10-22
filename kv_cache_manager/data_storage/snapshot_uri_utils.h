@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -47,6 +48,7 @@ struct CanonicalSnapshotUriAppendInfo {
 class SnapshotUriUtils {
 public:
     inline static constexpr const char *kSnapshotVersionParam = "s_v";
+    inline static constexpr size_t kSnapshotVersionHexLength = 8;
     inline static constexpr const char *kLegacySnapshotVersionParam = "s_version";
 
     static bool IsValidLocationIdComponent(const std::string &value) {
@@ -79,7 +81,7 @@ public:
     }
 
     static bool IsValidSnapshotVersionToken(const std::string &version) {
-        if (version.size() != 32) {
+        if (version.size() != kSnapshotVersionHexLength) {
             return false;
         }
         for (const unsigned char ch : version) {
@@ -176,7 +178,7 @@ public:
         if (!found_version) {
             return true;
         }
-        if (out_version.size() != 32) {
+        if (out_version.size() != kSnapshotVersionHexLength) {
             return false;
         }
         for (const unsigned char ch : out_version) {
@@ -294,7 +296,7 @@ public:
     // ReportEvent obtains one KVCM-generated, already validated generation
     // token and appends it to tens of thousands of independently validated
     // specs. Keep the public checked helper above for general callers; this
-    // variant avoids rescanning the same 32-byte token for every block.
+    // variant avoids rescanning the same 8-character token for every block.
     static bool AddPrevalidatedSnapshotVersionToCanonicalUri(std::string_view uri,
                                                              const CanonicalSnapshotUriAppendInfo &info,
                                                              const std::string &version,

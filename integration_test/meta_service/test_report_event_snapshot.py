@@ -316,7 +316,7 @@ def _assert_reporter_scope(
     versions = [v for k, v in actual_params if k == "s_v"]
     if version is None:
         test_case.assertEqual(len(versions), 1)
-        test_case.assertEqual(len(versions[0]), 32)
+        test_case.assertEqual(len(versions[0]), 8)
         test_case.assertTrue(
             all(c in "0123456789abcdef" for c in versions[0])
         )
@@ -334,7 +334,7 @@ def _snapshot_version_from_uri(test_case, uri):
     ]
     test_case.assertEqual(len(values), 1, "URI must contain one s_v")
     version = values[0]
-    test_case.assertEqual(len(version), 32)
+    test_case.assertEqual(len(version), 8)
     test_case.assertTrue(all(c in "0123456789abcdef" for c in version))
     return version
 
@@ -684,7 +684,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         self.assertEqual(body["header"]["status"]["code"], "OK")
         self.assertEqual(body.get("item_results", []), [])
-        self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+        self.assertEqual(len(body.get("committed_snapshot_version", "")), 8)
         self.assertFalse(body.get("snapshot_required"))
 
     # 4. BLOCK_ADD then query: spec name/uri should match what was sent
@@ -752,7 +752,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         self.assertEqual(body["header"]["status"]["code"], "OK")
         self.assertEqual(body.get("item_results", []), [])
-        self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+        self.assertEqual(len(body.get("committed_snapshot_version", "")), 8)
         self.assertFalse(body.get("snapshot_required"))
 
         resp = self.client.get_cache_location({
@@ -806,7 +806,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         self.assertEqual(body["header"]["status"]["code"], "OK")
         self.assertEqual(body.get("item_results", []), [])
-        self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+        self.assertEqual(len(body.get("committed_snapshot_version", "")), 8)
         self.assertFalse(body.get("snapshot_required"))
 
         resp = self.client.get_cache_location({
@@ -988,7 +988,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.assertEqual(body["header"]["status"]["code"], "OK")
         self.assertEqual(body.get("item_results", []), [])
         version = body["committed_snapshot_version"]
-        self.assertEqual(len(version), 32)
+        self.assertEqual(len(version), 8)
         self.assertTrue(body.get("snapshot_required"))
 
         specs = _wait_for_block_spec_names(
@@ -1750,7 +1750,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         self.assertFalse(response.get("snapshot_required"))
         version = response.get("committed_snapshot_version", "")
-        self.assertEqual(len(version), 32)
+        self.assertEqual(len(version), 8)
         self.assertTrue(all(c in "0123456789abcdef" for c in version))
 
         for block_key, spec_name, reported_uri in (
@@ -1896,7 +1896,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         self.assertEqual(delta["header"]["status"]["code"], "OK")
         delta_version = delta["committed_snapshot_version"]
-        self.assertEqual(len(delta_version), 32)
+        self.assertEqual(len(delta_version), 8)
         self.assertTrue(delta.get("snapshot_required"))
 
         duplicate = self.client.report_event(
@@ -1931,7 +1931,7 @@ class EventReportFunctionalTest(unittest.TestCase):
                 trace_id="t19_empty_snapshot",
             )
         )
-        self.assertEqual(len(committed["committed_snapshot_version"]), 32)
+        self.assertEqual(len(committed["committed_snapshot_version"]), 8)
         self.assertFalse(committed.get("snapshot_required"))
 
         bad_host = "192.168.1.244:8080"
@@ -2063,7 +2063,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
         )
         first_token = first["committed_snapshot_version"]
-        self.assertEqual(len(first_token), 32)
+        self.assertEqual(len(first_token), 8)
 
         self.client.report_event(
             _make_request(
@@ -2101,7 +2101,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         self.assertEqual(first_delta["header"]["status"]["code"], "OK")
         delta_token = first_delta["committed_snapshot_version"]
-        self.assertEqual(len(delta_token), 32)
+        self.assertEqual(len(delta_token), 8)
         self.assertNotEqual(first_token, delta_token)
 
         second = self.client.report_event(
@@ -2113,7 +2113,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
         )
         second_token = second["committed_snapshot_version"]
-        self.assertEqual(len(second_token), 32)
+        self.assertEqual(len(second_token), 8)
         self.assertNotEqual(first_token, second_token)
 
         accepted_delta = self.client.report_event(
@@ -2197,7 +2197,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             accepted_delta["header"]["status"]["code"],
             "OK",
         )
-        self.assertEqual(len(accepted_delta["committed_snapshot_version"]), 32)
+        self.assertEqual(len(accepted_delta["committed_snapshot_version"]), 8)
 
         committed = self.client.report_event(
             _make_request(
@@ -2207,7 +2207,7 @@ class EventReportFunctionalTest(unittest.TestCase):
                 trace_id="t21_valid_snapshot",
             )
         )
-        self.assertEqual(len(committed["committed_snapshot_version"]), 32)
+        self.assertEqual(len(committed["committed_snapshot_version"]), 8)
 
     def test_22_realtime_deltas_converge_with_periodic_snapshot(self):
         host = "192.168.1.246:8080"
@@ -2266,7 +2266,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
         )
         version_1 = baseline["committed_snapshot_version"]
-        self.assertEqual(len(version_1), 32)
+        self.assertEqual(len(version_1), 8)
         baseline_expected = {
             9220: {
                 "linear_0": baseline_uris["linear_0"],
@@ -2452,7 +2452,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
         )
         version_2 = reconciled["committed_snapshot_version"]
-        self.assertEqual(len(version_2), 32)
+        self.assertEqual(len(version_2), 8)
         self.assertNotEqual(version_1, version_2)
 
         expected_after_reconcile = {
@@ -2856,7 +2856,7 @@ class EventReportFunctionalTest(unittest.TestCase):
 
             snapshot_response = committed[0]
             version = snapshot_response["committed_snapshot_version"]
-            self.assertEqual(len(version), 32)
+            self.assertEqual(len(version), 8)
             for future in gated_futures[:3]:
                 response = future.result(timeout=10)
                 self.assertEqual(
@@ -3216,7 +3216,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.assertEqual(first_delta["header"]["status"]["code"], "OK")
         self.assertTrue(first_delta.get("snapshot_required"))
         delta_version = first_delta["committed_snapshot_version"]
-        self.assertEqual(len(delta_version), 32)
+        self.assertEqual(len(delta_version), 8)
         _wait_for_block_spec_names(
             self.client,
             self.instance_id,
@@ -3390,7 +3390,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         }
         self.assertEqual(len(versions), 1, responses)
         version = versions.pop()
-        self.assertEqual(len(version), 32)
+        self.assertEqual(len(version), 8)
         for response in responses:
             self.assertEqual(
                 response["header"]["status"]["code"], "OK", response
@@ -3454,7 +3454,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.assertEqual(response["header"]["status"]["code"], "OK")
         self.assertEqual(response.get("item_results", []), [])
         version = response["committed_snapshot_version"]
-        self.assertEqual(len(version), 32)
+        self.assertEqual(len(version), 8)
         self.assertFalse(response.get("snapshot_required"))
         specs = _wait_for_block_spec_names(
             self.client,
@@ -3497,7 +3497,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         self.assertEqual(response["header"]["status"]["code"], "OK")
         self.assertEqual(response.get("item_results", []), [])
-        self.assertEqual(len(response["committed_snapshot_version"]), 32)
+        self.assertEqual(len(response["committed_snapshot_version"]), 8)
         self.assertTrue(response.get("snapshot_required"))
         _wait_for_block_spec_names(
             self.client,
@@ -3519,7 +3519,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
         )
         version = deleted["committed_snapshot_version"]
-        self.assertEqual(len(version), 32)
+        self.assertEqual(len(version), 8)
         self.assertTrue(deleted.get("snapshot_required"))
         _wait_for_block_spec_names(
             self.client,
@@ -3843,7 +3843,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
         )
         baseline_version = baseline["committed_snapshot_version"]
-        self.assertEqual(len(baseline_version), 32)
+        self.assertEqual(len(baseline_version), 8)
         self.assertEqual(
             {spec.get("name") for spec in _query_block_specs(
                 self.client,
@@ -3897,7 +3897,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         client_version_uri = (
             _build_event_report_uri(host, "mem")
             + "?s_v="
-            + "a" * 32
+            + "a" * 8
         )
         invalid_add = self.client.report_event(
             _make_request(
@@ -4027,7 +4027,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             ],
         )
         generation = partial.get("committed_snapshot_version", "")
-        self.assertEqual(len(generation), 32)
+        self.assertEqual(len(generation), 8)
         self.assertTrue(partial.get("snapshot_required"))
 
         valid_samples = [1, event_count // 2 + 1, event_count - 1]
@@ -4314,7 +4314,7 @@ class EventReportBenchTest(unittest.TestCase):
             )
             snapshot_latencies.append((time.monotonic() - start) * 1000)
             version = snapshot.get("committed_snapshot_version", "")
-            self.assertEqual(len(version), 32)
+            self.assertEqual(len(version), 8)
             self.assertFalse(snapshot.get("snapshot_required"))
 
             # Validate data, not only the ReportEvent status. The first,
@@ -4399,7 +4399,7 @@ class EventReportBenchTest(unittest.TestCase):
             )
             create_elapsed_ms = (time.monotonic() - start) * 1000
             version = response.get("committed_snapshot_version", "")
-            self.assertEqual(len(version), 32)
+            self.assertEqual(len(version), 8)
             self.assertFalse(response.get("snapshot_required"))
 
             # Report the same blocks again to exercise the existing-location

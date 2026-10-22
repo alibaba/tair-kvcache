@@ -3086,7 +3086,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_MissingEventReportBackendF
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     loc.set_location_specs(
-        {LocationSpec("tp0", "event_report://cache-node/mem?s_v=0123456789abcdef0123456789abcdef")});
+        {LocationSpec("tp0", "event_report://cache-node/mem?s_v=01234567")});
 
     EXPECT_FALSE(func(loc));
 }
@@ -5701,7 +5701,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncFencesVersionsAfterSuccessf
     ASSERT_NE(nullptr, event_backend);
     ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
 
-    const std::string unknown_token = "ffffffffffffffffffffffffffffffff";
+    const std::string unknown_token = "ffffffff";
     const std::string legacy_uri = "event_report://physical-cache:9600/mem?source=legacy";
     std::string unknown_uri;
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
@@ -5798,8 +5798,8 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncFencesVersionsAfterSuccessf
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMatrix) {
     const std::string instance_id = "test_instance";
     const std::string host = "192.168.10.37:8080";
-    const std::string token = "0123456789abcdef0123456789abcdef";
-    const std::string upper_token = "ABCDEF0123456789ABCDEF0123456789";
+    const std::string token = "01234567";
+    const std::string upper_token = "ABCDEF01";
     auto event_backend = InstallEventReportBackend();
     ASSERT_NE(nullptr, event_backend);
     ASSERT_EQ(EC_OK, event_backend->RegisterNode(instance_id, host, {"mem"}));
@@ -5824,10 +5824,10 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
         {"near_match_param", {"event_report://physical-cache:9600/mem?xs_v=bad&s_v_suffix=bad"}, true},
         {"empty_version", {"event_report://physical-cache:9600/mem?s_v="}, false},
         {"version_without_equals", {"event_report://physical-cache:9600/mem?s_v"}, false},
-        {"short_version", {"event_report://physical-cache:9600/mem?s_v=" + std::string(31, 'a')}, false},
-        {"long_version", {"event_report://physical-cache:9600/mem?s_v=" + std::string(33, 'a')}, false},
+        {"short_version", {"event_report://physical-cache:9600/mem?s_v=" + std::string(7, 'a')}, false},
+        {"long_version", {"event_report://physical-cache:9600/mem?s_v=" + std::string(9, 'a')}, false},
         {"non_hex_version",
-         {"event_report://physical-cache:9600/mem?s_v=0123456789abcdef0123456789abcdeg"},
+         {"event_report://physical-cache:9600/mem?s_v=0123456g"},
          false},
         {"duplicate_same_version",
          {"event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + token},
@@ -7014,7 +7014,7 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_add(event, key, host)
                  ->mutable_specs(0)
-                 ->set_uri("event_report://" + host + "/mem?s_v=" + std::string(32, 'a'));
+                 ->set_uri("event_report://" + host + "/mem?s_v=" + std::string(8, 'a'));
          }},
         {"delete_non_numeric_key",
          [=](auto *event, int64_t key, const std::string &) {
@@ -7093,7 +7093,7 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_snapshot(event, key, host)
                  ->mutable_specs(0)
-                 ->set_uri("event_report://" + host + "/mem?s_v=" + std::string(32, 'a'));
+                 ->set_uri("event_report://" + host + "/mem?s_v=" + std::string(8, 'a'));
          }},
         {"snapshot_duplicate_block_and_medium",
          [=](auto *event, int64_t key, const std::string &host) {
