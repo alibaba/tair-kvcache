@@ -4905,8 +4905,8 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
     };
 }
 
-MetaSearcher::CheckHostCacheLocationFunc
-CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const {
+CacheManager::HostCacheQueryCallbacks
+CacheManager::GetHostCacheStateQueryCallbacks(const std::string &instance_id) const {
     auto fallback = GetCheckLocDataExistFunc(instance_id);
     struct EventVisibilitySnapshot {
         std::shared_ptr<EventReportBackend> backend;
@@ -4981,10 +4981,10 @@ CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance
         }
     };
 
-    return [fallback = std::move(fallback),
-            event_snapshots = std::move(event_snapshots),
-            initialize_event_snapshots = std::move(initialize_event_snapshots)](
-               const CacheLocation &location, MetaSearcher::HostCacheLocationInfo &out_info) -> bool {
+    HostCacheQueryCallbacks callbacks;
+    callbacks.check_location = [fallback = std::move(fallback), event_snapshots, initialize_event_snapshots](
+                                   const CacheLocation &location,
+                                   MetaSearcher::HostCacheLocationInfo &out_info) -> bool {
         out_info = {};
         if (!IsEventReportStorageType(location.type())) {
             return fallback ? fallback(location) : true;
@@ -5019,6 +5019,26 @@ CacheManager::GetHostCacheStateCheckLocDataExistFunc(const std::string &instance
         }
         return true;
     };
+    callbacks.list_candidate_hosts = [event_snapshots,
+                                      initialize_event_snapshots](const std::vector<std::string> &medium_filter) {
+        std::call_once(event_snapshots->initialize_once, initialize_event_snapshots);
+        std::set<std::string> hosts;
+        for (const auto &[storage_type, snapshot] : event_snapshots->by_storage_type) {
+            (void)storage_type;
+            for (const auto &[reporter, state] : snapshot.reporters) {
+                if (!medium_filter.empty() && std::find_first_of(state.mediums.begin(),
+                                                                 state.mediums.end(),
+                                                                 medium_filter.begin(),
+                                                                 medium_filter.end()) == state.mediums.end()) {
+                    continue;
+                }
+                const auto &logical_hosts = snapshot.logical_hosts_by_reporter.at(reporter);
+                hosts.insert(logical_hosts.begin(), logical_hosts.end());
+            }
+        }
+        return std::vector<std::string>(hosts.begin(), hosts.end());
+    };
+    return callbacks;
 }
 
 SubmitDelReqFunc CacheManager::GetSubmitDelReqFunc(const std::string &instance_id) const {
@@ -5111,7 +5131,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
 
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, block_cache_keys.size());
     auto query_scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerPrefixMatch);
-    const auto request_check_location = GetHostCacheStateCheckLocDataExistFunc(instance_id);
+    const auto query_callbacks = GetHostCacheStateQueryCallbacks(instance_id);
     auto policy = top_k_host_count > 0 && use_tair
                       ? genSelectLocationPolicy(request_context, instance_id, /*allow_unavailable_storages=*/true)
                       : nullptr;
@@ -5127,10 +5147,11 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                               use_eagle_pop,
                                               medium_filter,
                                               host_matches,
-                                              &request_check_location,
+                                              &query_callbacks.check_location,
                                               top_k_host_count,
                                               backend_types,
-                                              policy.get());
+                                              policy.get(),
+                                              &query_callbacks.list_candidate_hosts);
         break;
     }
     case QueryType::QT_PREFIX_MATCH_WITH_MAMBA: {
@@ -5140,10 +5161,11 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                                        medium_filter,
                                                        instance_info->location_spec_groups(),
                                                        host_matches,
-                                                       &request_check_location,
+                                                       &query_callbacks.check_location,
                                                        top_k_host_count,
                                                        backend_types,
-                                                       policy.get());
+                                                       policy.get(),
+                                                       &query_callbacks.list_candidate_hosts);
         break;
     }
     case QueryType::QT_PREFIX_MATCH_WITH_SWA: {
@@ -5154,10 +5176,11 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                                      medium_filter,
                                                      instance_info->location_spec_groups(),
                                                      host_matches,
-                                                     &request_check_location,
+                                                     &query_callbacks.check_location,
                                                      top_k_host_count,
                                                      backend_types,
-                                                     policy.get());
+                                                     policy.get(),
+                                                     &query_callbacks.list_candidate_hosts);
         break;
     }
     default:
