@@ -4,7 +4,6 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -24,10 +23,6 @@ struct DataStorageCreateRequest {
 
 using DataStorageCreateResult = std::vector<std::pair<ErrorCode, DataStorageUri>>;
 using DataStorageBatchCreateResult = std::vector<DataStorageCreateResult>;
-class DataStorageBackend;
-// Process-local registration identities. Keeping an object alive does not keep
-// it registered or prevent Close; users must revalidate before using it.
-using StorageBackendSnapshot = std::shared_ptr<const std::map<std::string, std::shared_ptr<DataStorageBackend>>>;
 
 enum class AsyncCopyOutcome : int32_t {
     kSuccess = 0,

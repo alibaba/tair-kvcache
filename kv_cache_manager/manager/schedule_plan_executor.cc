@@ -31,15 +31,6 @@ namespace kv_cache_manager {
     REGISTER_METRICS_GAUGE_(metrics_registry_, schedule_plan_executor, name)
 
 namespace {
-template <typename Request>
-Request BindStorageBackends(const Request &request, DataStorageManager &manager) {
-    auto bound = request;
-    if (!bound.storage_backends) {
-        bound.storage_backends = manager.CaptureStorageBackends();
-    }
-    return bound;
-}
-
 PlanExecuteResult MakeErrorResult(ErrorCode error_code, std::string error_message) {
     return PlanExecuteResult{
         .status = error_code,
@@ -377,13 +368,7 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
         const std::string &storage_unique_name = storage_uris_pair.first;
         auto &storage_uris = storage_uris_pair.second;
         if (!task.confirmed_missing_uris.empty()) {
-            std::shared_ptr<DataStorageBackend> backend;
-            if (task.storage_backends) {
-                const auto expected = task.storage_backends->find(storage_unique_name);
-                backend = expected == task.storage_backends->end() ? nullptr : expected->second;
-            } else {
-                backend = data_storage_manager_->GetDataStorageBackend(storage_unique_name);
-            }
+            const auto backend = data_storage_manager_->GetDataStorageBackend(storage_unique_name);
             if (!backend || backend->ShouldSkipConfirmedMissingBackendDelete()) {
                 storage_uris.erase(std::remove_if(storage_uris.begin(),
                                                   storage_uris.end(),
@@ -397,19 +382,8 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
             continue;
         }
         KVCM_LOG_DEBUG("Deleting %zu entries from storage: %s", storage_uris.size(), storage_unique_name.c_str());
-        bool storage_removed = false;
-        std::vector<ErrorCode> delete_results = data_storage_manager_->Delete(
-            request_context.get(), storage_unique_name, storage_uris, nullptr, task.storage_backends, &storage_removed);
-        if (storage_removed) {
-            result.status = EC_MISMATCH;
-            all_physical_deletes_succeeded = false;
-            result.error_message =
-                StringUtil::FormatString("storage registration changed before delete, instance[%s] storage[%s]",
-                                         task.instance_id.c_str(),
-                                         storage_unique_name.c_str());
-            KVCM_LOG_WARN("%s", result.error_message.c_str());
-            continue;
-        }
+        std::vector<ErrorCode> delete_results =
+            data_storage_manager_->Delete(request_context.get(), storage_unique_name, storage_uris, nullptr);
         if (delete_results.size() != storage_uris.size()) {
             result.status = ErrorCode::EC_PARTIAL_OK;
             all_physical_deletes_succeeded = false;
@@ -556,10 +530,9 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
     return SubmitMetaDelete(task, ScheduleTaskClass::kSystem, std::move(indexer));
 }
 
-std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const CacheMetaDelRequest &request,
+std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const CacheMetaDelRequest &task,
                                                                       ScheduleTaskClass task_class,
                                                                       std::shared_ptr<MetaIndexer> indexer) {
-    auto task = BindStorageBackends(request, *data_storage_manager_);
     auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
     auto future = promise->get_future();
     auto completion = std::make_shared<PromiseCompletion>(promise);
@@ -573,10 +546,8 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitMetaDelete(const Cach
         [this, &task, &indexer]() {
             // An explicit whole-key delete also accepts existing DELETING
             // locations, but never retries a failed attempt automatically.
-            auto result = PrepareDeleteTaskImpl(
+            return PrepareDeleteTaskImpl(
                 task.instance_id, task.block_keys, nullptr, nullptr, task.delay, false, true, nullptr, indexer);
-            result.actual_task.storage_backends = task.storage_backends;
-            return result;
         },
         task_class);
     return future;
@@ -669,9 +640,7 @@ bool SchedulePlanExecutor::IsLocationBlockedByReadOnlyStorage(
 
 SchedulePlanExecutor::LocationDelAdmissionResult
 SchedulePlanExecutor::PrepareDeleteTask(const CacheMetaDelRequest &task) {
-    auto result = PrepareDeleteTaskImpl(task.instance_id, task.block_keys, nullptr, nullptr, task.delay, false, false);
-    result.actual_task.storage_backends = task.storage_backends;
-    return result;
+    return PrepareDeleteTaskImpl(task.instance_id, task.block_keys, nullptr, nullptr, task.delay, false, false);
 }
 
 SchedulePlanExecutor::LocationDelAdmissionResult
@@ -720,7 +689,6 @@ SchedulePlanExecutor::PrepareDeleteTask(const CacheLocationDelRequest &task) {
                                         task.authoritative_read,
                                         task.resume_deleting,
                                         &task.required_serving_location_values);
-    result.actual_task.storage_backends = task.storage_backends;
     result.actual_task.metadata_only = task.metadata_only;
     result.actual_task.confirmed_missing_uris = task.confirmed_missing_uris;
     return result;
@@ -1013,9 +981,8 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
     return SubmitLocationDelete(task, ScheduleTaskClass::kSystem);
 }
 
-std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitLocationDelete(const CacheLocationDelRequest &request,
+std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitLocationDelete(const CacheLocationDelRequest &task,
                                                                           ScheduleTaskClass task_class) {
-    auto task = BindStorageBackends(request, *data_storage_manager_);
     KVCM_LOG_DEBUG("Submitting location delete task for instance_id: %s, block_keys count: %zu",
                    task.instance_id.c_str(),
                    task.block_keys.size());
@@ -1028,8 +995,7 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::SubmitLocationDelete(const 
     return future;
 }
 
-AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const CacheMetaDelRequest &request) {
-    auto task = BindStorageBackends(request, *data_storage_manager_);
+AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const CacheMetaDelRequest &task) {
     KVCM_LOG_DEBUG("Submitting async meta delete task for instance_id: %s, block_keys count: %zu",
                    task.instance_id.c_str(),
                    task.block_keys.size());
@@ -1040,9 +1006,8 @@ AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const CacheLocationDel
     return SubmitAsync(request, ScheduleTaskClass::kReclaim);
 }
 
-AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const CacheLocationDelRequest &request,
+AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitAsync(const CacheLocationDelRequest &task,
                                                           ScheduleTaskClass task_class) {
-    auto task = BindStorageBackends(request, *data_storage_manager_);
     KVCM_LOG_DEBUG("Submitting async location delete task for instance_id: %s, block_keys count: %zu",
                    task.instance_id.c_str(),
                    task.block_keys.size());
@@ -1295,8 +1260,7 @@ AsyncDeleteSubmitResult SchedulePlanExecutor::SubmitDeleteTaskAsync(std::chrono:
     return AsyncDeleteSubmitResult{true, std::move(future)};
 }
 
-bool SchedulePlanExecutor::SubmitNonBlocking(const CacheMetaDelRequest &request, ScheduleTaskClass task_class) {
-    auto req = BindStorageBackends(request, *data_storage_manager_);
+bool SchedulePlanExecutor::SubmitNonBlocking(const CacheMetaDelRequest &req, ScheduleTaskClass task_class) {
     return SubmitRaw(
         [this, req, task_class]() {
             SubmitMetaDelete(req, task_class, meta_manager_->GetMetaIndexer(req.instance_id));
@@ -1306,8 +1270,7 @@ bool SchedulePlanExecutor::SubmitNonBlocking(const CacheMetaDelRequest &request,
         task_class);
 }
 
-bool SchedulePlanExecutor::SubmitNonBlocking(const CacheLocationDelRequest &request, ScheduleTaskClass task_class) {
-    auto req = BindStorageBackends(request, *data_storage_manager_);
+bool SchedulePlanExecutor::SubmitNonBlocking(const CacheLocationDelRequest &req, ScheduleTaskClass task_class) {
     return SubmitRaw([this, req, task_class]() { SubmitLocationDelete(req, task_class); },
                      std::chrono::microseconds{0},
                      {},
@@ -1347,8 +1310,8 @@ void SchedulePlanExecutor::DoCopyTask(const std::shared_ptr<std::promise<PlanExe
     }
 
     auto request_context = std::make_shared<RequestContext>("location_copy_task_trace");
-    std::vector<ErrorCode> copy_results = data_storage_manager_->Copy(
-        request_context.get(), task.exec_storage_name, task.src_uris, task.dst_uris, task.storage_backends);
+    std::vector<ErrorCode> copy_results =
+        data_storage_manager_->Copy(request_context.get(), task.exec_storage_name, task.src_uris, task.dst_uris);
 
     // 后端必须为每个输入 URI 返回一个结果（接口 postcondition）。短返回意味着部分 spec 的
     // 复制状态不可知——整体判为失败,防止 MigrationManager promote 不完整的目标 location。
@@ -1469,8 +1432,7 @@ AsyncCopyExecuteSubmitResult SchedulePlanExecutor::SubmitAsyncCopy(const CacheLo
                 plan_result.status = EC_ERROR;
             }
             completion->Complete(std::move(plan_result));
-        },
-        task.storage_backends);
+        });
 
     if (!result.submit_result.accepted) {
         PlanExecuteResult rejected;
@@ -1484,12 +1446,11 @@ AsyncCopyExecuteSubmitResult SchedulePlanExecutor::SubmitAsyncCopy(const CacheLo
 }
 
 ErrorCode SchedulePlanExecutor::RequestCancelAsyncCopy(const std::string &storage_name,
-                                                       const std::string &operation_id,
-                                                       const StorageBackendSnapshot &snapshot) {
+                                                       const std::string &operation_id) {
     if (stop_ || !data_storage_manager_) {
         return EC_ERROR;
     }
-    return data_storage_manager_->RequestCancelAsyncCopy(storage_name, operation_id, snapshot);
+    return data_storage_manager_->RequestCancelAsyncCopy(storage_name, operation_id);
 }
 
 } // namespace kv_cache_manager

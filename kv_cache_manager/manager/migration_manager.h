@@ -73,7 +73,6 @@ public:
         std::vector<LocationSpec> src_specs;
         int64_t src_create_time = 0;
         std::string src_location_value;
-        StorageBackendSnapshot storage_backends;
     };
 
     // Copy 提交的 group 级硬上限。BatchSubmit 在短准入锁 + task_mutex_ 内统计 active 并 reserve，
@@ -279,7 +278,6 @@ public:
         AsyncCopyOptions async_copy_options;
         int64_t mark_timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;
         bool dedup_marks = false; // true=跳过已打标的 block（reclaimer 用；Admin 显式指定 block 不需要）
-        StorageBackendSnapshot storage_backends;
     };
     struct DispatchBatchResult {
         int64_t copy_submitted = 0;
@@ -298,7 +296,6 @@ public:
         std::vector<int64_t> block_keys;
         std::vector<std::vector<std::string>> pending_location_ids_by_block;
         std::function<void(const DispatchBatchResult &)> on_dispatched;
-        StorageBackendSnapshot storage_backends;
     };
 
     // 同一路由最多保留一个 queued/running Prepare。返回 true 仅表示 Job 已入队；实际
@@ -364,7 +361,6 @@ private:
         std::string mark_target;      // 提交时 mark 的 target（空=无 mark，用于 match-clear）
         int64_t mark_deadline_ms = 0; // 提交时 mark 的 deadline（用于 match-clear）
         CopyTaskState state = CopyTaskState::kRunning; // 收尾认领状态
-        StorageBackendSnapshot storage_backends;
     };
 
     // Copy 后端当前只向 MigrationManager 返回聚合 ErrorCode，无法可靠区分 source 永久失效、
@@ -414,8 +410,6 @@ private:
         size_t expected_items = 0;
         std::future<PlanExecuteResult> future;
         bool native_async = false;
-        StorageBackendSnapshot storage_backends;
-        std::string async_operation_id;
     };
 
     struct ExpiringMark {

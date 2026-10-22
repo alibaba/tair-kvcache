@@ -795,23 +795,7 @@ TEST_F(BackendGcDeleteTest, OrdinaryDeleteFailureCompletesOnceAndRetainsMetadata
     }
 }
 
-TEST_F(BackendGcDeleteTest, StorageReplacementBeforeDeleteFailsWithoutCallingReplacement) {
-    auto retired = AddBackend("retired", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
-    SetLocation(390, "target", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://retired/390?size=5"});
-    auto request = Request(390, {"target"}, {});
-    request.delay = std::chrono::milliseconds(100);
-    auto future = executor->Submit(request);
-    ASSERT_EQ(EC_OK, data_storage_manager_->UnRegisterStorage("retired"));
-    auto replacement = AddBackend("retired", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
-    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(1)));
-    EXPECT_EQ(EC_MISMATCH, future.get().status);
-    EXPECT_TRUE(replacement->delete_batches.empty());
-    EXPECT_TRUE(retired->delete_batches.empty());
-    EXPECT_EQ(CLS_DELETING, Locations(390).at("target")->status());
-    EXPECT_EQ(5u, indexer->GetStorageUsage());
-}
-
-TEST_F(BackendGcDeleteTest, RetiredStorageMakesMixedDeleteFailAndRetainMetadata) {
+TEST_F(BackendGcDeleteTest, MissingStorageMakesMixedDeleteFailAndRetainMetadata) {
     auto retired = AddBackend("retired", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
     auto healthy = AddBackend("healthy", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
     SetLocation(391, "old", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://retired/391?size=5"});
@@ -825,7 +809,7 @@ TEST_F(BackendGcDeleteTest, RetiredStorageMakesMixedDeleteFailAndRetainMetadata)
     auto future = executor->Submit(request);
     ASSERT_EQ(EC_OK, data_storage_manager_->UnRegisterStorage("retired"));
     ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(1)));
-    EXPECT_EQ(EC_MISMATCH, future.get().status);
+    EXPECT_EQ(EC_PARTIAL_OK, future.get().status);
     EXPECT_EQ(CLS_DELETING, Locations(391).at("old")->status());
     EXPECT_EQ(CLS_DELETING, Locations(392).at("good")->status());
     EXPECT_TRUE(retired->delete_batches.empty());
@@ -833,7 +817,7 @@ TEST_F(BackendGcDeleteTest, RetiredStorageMakesMixedDeleteFailAndRetainMetadata)
     EXPECT_EQ(10u, indexer->GetStorageUsage());
 }
 
-TEST_F(BackendGcDeleteTest, MetadataSyncFailureCompletesWithoutWaitingForStorageRetirement) {
+TEST_F(BackendGcDeleteTest, MetadataSyncFailureCompletesWithoutPhysicalDelete) {
     auto backend = AddBackend("retired_sync", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
     SetLocation(393, "target", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://retired_sync/393?size=5"});
     auto *backup = EnableMemoryPrimary();

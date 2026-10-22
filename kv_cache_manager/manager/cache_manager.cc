@@ -763,12 +763,6 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
                 return EC_TIMEOUT;
             }
         }
-        // An active Copy still owns its preparation or completion state.
-        // Physical deletion is drained through the indexer lifetime below.
-        if (!migration_manager_->GetActiveBlockKeysForInstance(instance_id).empty()) {
-            PREFIX_LOG(WARN, "remove instance rejected: asynchronous Copy reference remains");
-            return EC_EXIST;
-        }
     }
 
     auto ec = registry_manager_->BeginRemoveInstance(request_context, instance_id);
