@@ -124,8 +124,6 @@ ErrorCode DataStorageManager::RegisterStorage(RequestContext *request_context,
 
 ErrorCode DataStorageManager::UnRegisterStorage(const std::string &name) {
     std::unique_lock<std::shared_mutex> lock(rw_lock_);
-    // Serializes with local Copy acceptance/publication and physical Create/Delete,
-    // but never waits for a remote Copy or for a pending cleanup future.
     auto iter = storage_map_.find(name);
     if (iter == storage_map_.end()) {
         KVCM_LOG_WARN("UnRegisterStorage failed, name: %s not exist", name.c_str());
@@ -141,48 +139,6 @@ ErrorCode DataStorageManager::UnRegisterStorage(const std::string &name) {
     }
     storage_map_.erase(iter);
     return ec;
-}
-
-StorageBackendSnapshot DataStorageManager::CaptureStorageBackends(const std::vector<std::string> &names) const {
-    std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    if (names.empty()) {
-        return std::make_shared<const std::map<std::string, std::shared_ptr<DataStorageBackend>>>(storage_map_);
-    }
-    auto snapshot = std::make_shared<std::map<std::string, std::shared_ptr<DataStorageBackend>>>();
-    for (const auto &name : names) {
-        const auto it = storage_map_.find(name);
-        snapshot->emplace(name, it == storage_map_.end() ? nullptr : it->second);
-    }
-    return snapshot;
-}
-
-bool DataStorageManager::StorageBackendCurrentLocked(const StorageBackendSnapshot &snapshot,
-                                                     const std::string &name) const {
-    if (!snapshot) {
-        return true; // Legacy callers do not bind a registration.
-    }
-    const auto expected = snapshot->find(name);
-    const auto current = storage_map_.find(name);
-    return expected != snapshot->end() && expected->second && current != storage_map_.end() &&
-           current->second == expected->second;
-}
-
-bool DataStorageManager::StorageBackendsCurrentLocked(const StorageBackendSnapshot &snapshot) const {
-    return !snapshot || std::all_of(snapshot->begin(), snapshot->end(), [&](const auto &entry) {
-        return StorageBackendCurrentLocked(snapshot, entry.first);
-    });
-}
-
-bool DataStorageManager::WithCurrentStorageBackends(const StorageBackendSnapshot &snapshot,
-                                                    const std::function<void()> &action) const {
-    std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    if (!StorageBackendsCurrentLocked(snapshot)) {
-        return false;
-    }
-    // action must not call back into DataStorageManager. This is a local
-    // admission/publication barrier, never a wait for Copy completion.
-    action();
-    return true;
 }
 
 ErrorCode DataStorageManager::DoCleanup() {
@@ -238,13 +194,9 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
                                                                              const std::string &unique_name,
                                                                              const std::vector<std::string> &keys,
                                                                              size_t size_per_key,
-                                                                             std::function<void()> cb,
-                                                                             const StorageBackendSnapshot &snapshot) {
+                                                                             std::function<void()> cb) {
     SPAN_TRACER(request_context);
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    if (!StorageBackendsCurrentLocked(snapshot)) {
-        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOENT, DataStorageUri{}});
-    }
     const std::string &trace_id = request_context->trace_id();
     auto iter = storage_map_.find(unique_name);
     if (iter == storage_map_.end()) {
@@ -278,23 +230,12 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
 std::vector<ErrorCode> DataStorageManager::Delete(RequestContext *request_context,
                                                   const std::string &unique_name,
                                                   const std::vector<DataStorageUri> &storage_uris,
-                                                  std::function<void()> cb,
-                                                  const StorageBackendSnapshot &snapshot,
-                                                  bool *storage_removed) {
+                                                  std::function<void()> cb) {
     SPAN_TRACER(request_context);
     if (storage_uris.empty()) {
         return {};
     }
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    if (storage_removed) {
-        *storage_removed = false;
-    }
-    if (!StorageBackendCurrentLocked(snapshot, unique_name)) {
-        if (storage_removed) {
-            *storage_removed = true;
-        }
-        return {}; // Retirement is not a successful physical Delete.
-    }
     const std::string &trace_id = request_context->trace_id();
     auto iter = storage_map_.find(unique_name);
     if (iter == storage_map_.end()) {
@@ -308,8 +249,7 @@ std::vector<ErrorCode> DataStorageManager::Delete(RequestContext *request_contex
 std::vector<ErrorCode> DataStorageManager::Copy(RequestContext *request_context,
                                                 const std::string &unique_name,
                                                 const std::vector<DataStorageUri> &src_uris,
-                                                const std::vector<DataStorageUri> &dst_uris,
-                                                const StorageBackendSnapshot &snapshot) {
+                                                const std::vector<DataStorageUri> &dst_uris) {
     SPAN_TRACER(request_context);
     if (src_uris.size() != dst_uris.size()) {
         KVCM_LOG_WARN("Copy src/dst size mismatch, storage: %s, src: %zu, dst: %zu",
@@ -322,9 +262,6 @@ std::vector<ErrorCode> DataStorageManager::Copy(RequestContext *request_context,
         return {};
     }
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    if (!StorageBackendsCurrentLocked(snapshot)) {
-        return std::vector<ErrorCode>(src_uris.size(), EC_NOENT);
-    }
     const std::string &trace_id = request_context->trace_id();
     auto iter = storage_map_.find(unique_name);
     if (iter == storage_map_.end()) {
@@ -354,8 +291,7 @@ AsyncCopySubmitResult DataStorageManager::CopyAsync(RequestContext *request_cont
                                                     const std::vector<DataStorageUri> &dst_uris,
                                                     const std::string &operation_id,
                                                     const AsyncCopyOptions &options,
-                                                    AsyncCopyCompletion completion,
-                                                    const StorageBackendSnapshot &snapshot) {
+                                                    AsyncCopyCompletion completion) {
     SPAN_TRACER(request_context);
     AsyncCopySubmitResult rejected;
     rejected.operation_id = operation_id;
@@ -368,11 +304,6 @@ AsyncCopySubmitResult DataStorageManager::CopyAsync(RequestContext *request_cont
     // CopyAsync only hands work to the local coordinator. Keep this short
     // handoff serialized with Close, without retaining the lock in completion.
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    if (!StorageBackendsCurrentLocked(snapshot)) {
-        rejected.status = EC_NOENT;
-        rejected.detail = "copy storage registration was removed";
-        return rejected;
-    }
     std::shared_ptr<DataStorageBackend> storage_backend;
     {
         const auto iter = storage_map_.find(unique_name);
@@ -411,16 +342,11 @@ AsyncCopySubmitResult DataStorageManager::CopyAsync(RequestContext *request_cont
                                       std::move(completion_with_backend_lease));
 }
 
-ErrorCode DataStorageManager::RequestCancelAsyncCopy(const std::string &unique_name,
-                                                     const std::string &operation_id,
-                                                     const StorageBackendSnapshot &snapshot) {
+ErrorCode DataStorageManager::RequestCancelAsyncCopy(const std::string &unique_name, const std::string &operation_id) {
     if (operation_id.empty()) {
         return EC_BADARGS;
     }
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
-    if (!StorageBackendCurrentLocked(snapshot, unique_name)) {
-        return EC_NOENT;
-    }
     std::shared_ptr<DataStorageBackend> storage_backend;
     {
         const auto iter = storage_map_.find(unique_name);

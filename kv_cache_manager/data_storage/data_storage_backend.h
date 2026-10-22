@@ -4,7 +4,6 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -16,11 +15,6 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
-
-class DataStorageBackend;
-// Process-local registration identities. Keeping an object alive does not keep
-// it registered or prevent Close; users must revalidate before using it.
-using StorageBackendSnapshot = std::shared_ptr<const std::map<std::string, std::shared_ptr<DataStorageBackend>>>;
 
 enum class AsyncCopyOutcome : int32_t {
     kSuccess = 0,

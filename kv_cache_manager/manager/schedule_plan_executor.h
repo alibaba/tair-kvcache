@@ -44,7 +44,6 @@ struct CacheMetaDelRequest {
     std::string instance_id;
     std::vector<int64_t> block_keys;
     std::chrono::microseconds delay{std::chrono::seconds(0)};
-    StorageBackendSnapshot storage_backends;
 };
 
 struct PlanExecuteResult {
@@ -85,7 +84,6 @@ struct CacheLocationDelRequest {
     // An explicit request may also admit this exact location in CLS_DELETING.
     // It still makes only one deletion attempt after a fresh CAS and Sync.
     bool resume_deleting{false};
-    StorageBackendSnapshot storage_backends;
     // Optional sibling SERVING snapshots, keyed by block. Check these in the
     // same RMW that first invalidates a location. An already admitted DELETING
     // location keeps its cleanup responsibility even if the sibling disappears.
@@ -121,7 +119,6 @@ struct CacheLocationCopyRequest {
     std::vector<DataStorageUri> src_uris; // 源端各 spec 的 uri
     std::vector<DataStorageUri> dst_uris; // 目标端各 spec 预分配的 uri（与 src_uris 一一对应）
     std::chrono::microseconds delay{std::chrono::seconds(0)};
-    StorageBackendSnapshot storage_backends;
 };
 
 struct AsyncCopyExecuteSubmitResult {
@@ -172,9 +169,7 @@ public:
     AsyncCopyExecuteSubmitResult SubmitAsyncCopy(const CacheLocationCopyRequest &task,
                                                  const std::string &operation_id,
                                                  const AsyncCopyOptions &options);
-    ErrorCode RequestCancelAsyncCopy(const std::string &storage_name,
-                                     const std::string &operation_id,
-                                     const StorageBackendSnapshot &snapshot = {});
+    ErrorCode RequestCancelAsyncCopy(const std::string &storage_name, const std::string &operation_id);
     AsyncDeleteSubmitResult SubmitAsync(const CacheMetaDelRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheLocationDelRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheLocationDelRequest &task, ScheduleTaskClass task_class);

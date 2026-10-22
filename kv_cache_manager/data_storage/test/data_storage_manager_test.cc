@@ -16,7 +16,6 @@ struct AsyncCopyLifetimeState {
     int close_count = 0;
     int destroy_count = 0;
     int copy_count = 0;
-    int cancel_count = 0;
 };
 
 class LifetimeAsyncBackend : public DummyBackend {
@@ -43,10 +42,6 @@ public:
         result.accepted = true;
         result.operation_id = operation_id;
         return result;
-    }
-    ErrorCode RequestCancelAsyncCopy(const std::string &) override {
-        ++state_->cancel_count;
-        return EC_OK;
     }
 
 private:
@@ -119,35 +114,6 @@ TEST_F(DataStorageManagerTest, TestSimple) {
     ASSERT_EQ(0, data_storage_backends.size());
 }
 
-TEST_F(DataStorageManagerTest, TestUnregisterInvalidatesSnapshotWithoutBlockingOrReusingName) {
-    DataStorageManager manager(metrics_registry_);
-    auto spec = std::make_shared<NfsStorageSpec>();
-    spec->set_root_path("/data/");
-    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_NFS, "retired", spec);
-    RequestContext context("retire-storage");
-    ASSERT_EQ(EC_OK, manager.RegisterStorage(&context, "retired", config));
-    const auto snapshot = manager.CaptureStorageBackends({"retired"});
-    EXPECT_TRUE(manager.WithCurrentStorageBackends(snapshot, [] {}));
-    ASSERT_EQ(EC_OK, manager.UnRegisterStorage("retired"));
-    EXPECT_FALSE(manager.WithCurrentStorageBackends(snapshot, [] {}));
-    ASSERT_EQ(EC_OK, manager.RegisterStorage(&context, "retired", config));
-    EXPECT_NE(snapshot->at("retired"), manager.GetDataStorageBackend("retired"));
-    bool published = false;
-    EXPECT_FALSE(manager.WithCurrentStorageBackends(snapshot, [&] { published = true; }));
-    EXPECT_FALSE(published);
-    const auto created = manager.Create(&context, "retired", {"old-key"}, 128, {}, snapshot);
-    ASSERT_EQ(1u, created.size());
-    EXPECT_EQ(EC_NOENT, created.front().first);
-    bool retired = false;
-    EXPECT_TRUE(
-        manager
-            .Delete(
-                &context, "retired", {DataStorageUri("file://retired/data/old-key?size=128")}, {}, snapshot, &retired)
-            .empty());
-    EXPECT_TRUE(retired);
-    EXPECT_TRUE(manager.WithCurrentStorageBackends(manager.CaptureStorageBackends({"retired"}), [] {}));
-}
-
 TEST_F(DataStorageManagerTest, TestCopyRejectsMismatchedUris) {
     DataStorageManager data_storage_manager(metrics_registry_);
     RequestContext request_context("test");
@@ -182,32 +148,25 @@ TEST_F(DataStorageManagerTest, TestAsyncCopyValidationNeedsOnlyFinalCompletion) 
     EXPECT_FALSE(completed); // Rejection never transfers callback ownership.
 }
 
-TEST_F(DataStorageManagerTest, TestAsyncCompletionKeepsRetiredBackendAliveWithoutReusingRegistration) {
+TEST_F(DataStorageManagerTest, TestAsyncCompletionKeepsBackendAliveAfterUnregister) {
     DataStorageManager manager(metrics_registry_);
     auto state = std::make_shared<AsyncCopyLifetimeState>();
     auto backend = std::make_shared<LifetimeAsyncBackend>(metrics_registry_, state);
     manager.storage_map_["async_source"] = backend;
     const std::weak_ptr<DataStorageBackend> old_backend = backend;
-    auto snapshot = manager.CaptureStorageBackends({"async_source"});
     RequestContext context("async_lifetime");
     const std::vector<DataStorageUri> sources{DataStorageUri("dummy://async_source/source?size=128")};
     const std::vector<DataStorageUri> targets{DataStorageUri("dummy://target/destination?size=128")};
     int completion_count = 0;
     bool alive_during_completion = false;
     const auto submitted = manager.CopyAsync(
-        &context,
-        "async_source",
-        sources,
-        targets,
-        "original-operation",
-        {},
-        [&](AsyncCopyBatchResult result) {
+        &context, "async_source", sources, targets, "original-operation", {}, [&](AsyncCopyBatchResult result) {
             ++completion_count;
             alive_during_completion = !old_backend.expired();
             EXPECT_EQ(EC_UNKNOWN, result.status);
-        },
-        snapshot);
+        });
     ASSERT_TRUE(submitted.accepted);
+    EXPECT_EQ(1, state->copy_count);
     ASSERT_TRUE(state->completion);
     auto completion = std::move(state->completion);
     EXPECT_EQ(0, completion_count);
@@ -226,28 +185,8 @@ TEST_F(DataStorageManagerTest, TestAsyncCompletionKeepsRetiredBackendAliveWithou
     EXPECT_EQ(1, state->close_count);
     EXPECT_EQ(0, completion_count);
 
-    auto replacement_state = std::make_shared<AsyncCopyLifetimeState>();
-    manager.storage_map_["async_source"] = std::make_shared<LifetimeAsyncBackend>(metrics_registry_, replacement_state);
-    bool rejected_completion_called = false;
-    const auto rejected = manager.CopyAsync(
-        &context,
-        "async_source",
-        sources,
-        targets,
-        "stale-operation",
-        {},
-        [&](AsyncCopyBatchResult) { rejected_completion_called = true; },
-        snapshot);
-    EXPECT_FALSE(rejected.accepted);
-    EXPECT_EQ(EC_NOENT, rejected.status);
-    EXPECT_EQ(EC_NOENT, manager.RequestCancelAsyncCopy("async_source", "original-operation", snapshot));
-    EXPECT_FALSE(rejected_completion_called);
-    EXPECT_EQ(0, replacement_state->copy_count);
-    EXPECT_EQ(0, replacement_state->cancel_count);
-
     // Remove every owner except the manager's callback lease. This checks
     // object lifetime, not whether Close proves remote allocation drain.
-    snapshot.reset();
     backend.reset();
     EXPECT_FALSE(old_backend.expired());
     EXPECT_EQ(0, state->destroy_count);

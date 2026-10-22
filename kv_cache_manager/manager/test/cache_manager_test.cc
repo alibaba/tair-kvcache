@@ -1505,48 +1505,6 @@ TEST_F(CacheManagerTest, TestRemoveInstanceDuringMetaRecoveryTransition) {
     EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance"));
 }
 
-TEST_F(CacheManagerTest, TestQueuedDeleteDoesNotVetoStorageRemoval) {
-    const std::string instance_id = "pending_delete_removal_instance";
-    ASSERT_EQ(EC_OK,
-              cache_manager_
-                  ->RegisterInstance(request_context_.get(),
-                                     "default",
-                                     instance_id,
-                                     64,
-                                     createLocationSpecInfos(),
-                                     createModelDeployment(),
-                                     std::vector<LocationSpecGroup>())
-                  .first);
-    auto searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
-    ASSERT_NE(nullptr, searcher);
-    auto location = std::make_shared<CacheLocation>(
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/pending-delete?size=1")});
-    std::vector<std::string> ids;
-    ASSERT_EQ(EC_OK, BatchAddLocationForTest(searcher, request_context_.get(), {123}, {location}, ids));
-    ASSERT_EQ(1u, ids.size());
-
-    auto executor = cache_manager_->schedule_plan_executor_;
-    CacheLocationDelRequest request;
-    request.instance_id = instance_id;
-    request.block_keys = {123};
-    request.location_ids = {ids};
-    // A queued cleanup does not veto Storage removal. Instance removal
-    // separately waits for indexer owners before retiring its metadata.
-    request.delay = std::chrono::hours(1);
-    auto future = executor->Submit(request);
-    EXPECT_EQ(std::future_status::timeout, future.wait_for(std::chrono::milliseconds(0)));
-    auto storage_manager = registry_manager_->data_storage_manager();
-    EXPECT_EQ(EC_OK, storage_manager->UnRegisterStorage("hot_01"));
-    EXPECT_EQ(nullptr, storage_manager->GetDataStorageBackend("hot_01"));
-
-    executor->Stop();
-    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::milliseconds(0)));
-    EXPECT_NE(EC_OK, future.get().status);
-    EXPECT_EQ(EC_NOENT, storage_manager->UnRegisterStorage("hot_01"));
-}
-
 TEST_F(CacheManagerTest, TestRemoveInstanceKeepsRegistrationWhileCopyPrepareIsCancelling) {
     const std::string instance_id = "remove_active_copy";
     ASSERT_EQ(EC_OK,

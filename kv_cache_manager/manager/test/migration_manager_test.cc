@@ -137,8 +137,7 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
                                                               const std::string & /*name*/,
                                                               const std::vector<std::string> &keys,
                                                               size_t size,
-                                                              std::function<void()> /*cb*/,
-                                                              const StorageBackendSnapshot & /*snapshot*/) {
+                                                              std::function<void()> /*cb*/) {
     ++g_create_call_count;
     const bool fail = (g_create_call_count == 1); // 第一个被处理的 group 失败(与迭代序无关地触发泄漏路径)
     std::vector<std::pair<ErrorCode, DataStorageUri>> results;
@@ -158,9 +157,7 @@ std::vector<ErrorCode> Delete_stub(void * /*obj*/,
                                    RequestContext * /*rc*/,
                                    const std::string & /*name*/,
                                    const std::vector<DataStorageUri> &uris,
-                                   std::function<void()> /*cb*/,
-                                   const StorageBackendSnapshot & /*snapshot*/,
-                                   bool * /*storage_removed*/) {
+                                   std::function<void()> /*cb*/) {
     for (const auto &u : uris) {
         g_deleted_uris.push_back(u);
     }
@@ -192,8 +189,7 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
                                                               const std::string &name,
                                                               const std::vector<std::string> &keys,
                                                               size_t size,
-                                                              std::function<void()> /*cb*/,
-                                                              const StorageBackendSnapshot & /*snapshot*/) {
+                                                              std::function<void()> /*cb*/) {
     const std::size_t result_count = g_shape == Shape::kShort ? (keys.empty() ? 0 : keys.size() - 1) : keys.size() + 1;
     std::vector<std::pair<ErrorCode, DataStorageUri>> results;
     results.reserve(result_count);
@@ -210,9 +206,7 @@ std::vector<ErrorCode> Delete_stub(void * /*obj*/,
                                    RequestContext * /*rc*/,
                                    const std::string & /*name*/,
                                    const std::vector<DataStorageUri> &uris,
-                                   std::function<void()> /*cb*/,
-                                   const StorageBackendSnapshot & /*snapshot*/,
-                                   bool * /*storage_removed*/) {
+                                   std::function<void()> /*cb*/) {
     g_deleted_uris.insert(g_deleted_uris.end(), uris.begin(), uris.end());
     return std::vector<ErrorCode>(uris.size(), EC_OK);
 }
@@ -240,8 +234,7 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
                                                               const std::string &name,
                                                               const std::vector<std::string> &keys,
                                                               size_t size,
-                                                              std::function<void()> /*cb*/,
-                                                              const StorageBackendSnapshot & /*snapshot*/) {
+                                                              std::function<void()> /*cb*/) {
     ++g_create_calls;
     g_create_key_counts.push_back(keys.size());
     std::vector<std::pair<ErrorCode, DataStorageUri>> results;
@@ -313,8 +306,7 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
                                                               const std::string & /*name*/,
                                                               const std::vector<std::string> &keys,
                                                               size_t size,
-                                                              std::function<void()> /*cb*/,
-                                                              const StorageBackendSnapshot & /*snapshot*/) {
+                                                              std::function<void()> /*cb*/) {
     ++g_create_calls;
     g_create_key_counts.push_back(keys.size());
     for (const auto &[instance_id, block_key] : g_expected_reservations) {
@@ -344,9 +336,7 @@ std::vector<ErrorCode> Delete_stub(void * /*obj*/,
                                    RequestContext * /*rc*/,
                                    const std::string & /*name*/,
                                    const std::vector<DataStorageUri> &uris,
-                                   std::function<void()> /*cb*/,
-                                   const StorageBackendSnapshot & /*snapshot*/,
-                                   bool * /*storage_removed*/) {
+                                   std::function<void()> /*cb*/) {
     g_deleted_uris.insert(g_deleted_uris.end(), uris.begin(), uris.end());
     return std::vector<ErrorCode>(uris.size(), EC_OK);
 }
@@ -443,8 +433,7 @@ AsyncCopySubmitResult CopyAsync(void *,
                                 const std::vector<DataStorageUri> &,
                                 const std::string &operation_id,
                                 const AsyncCopyOptions &,
-                                AsyncCopyCompletion completion,
-                                const StorageBackendSnapshot &) {
+                                AsyncCopyCompletion completion) {
     ++calls;
     EXPECT_EQ(1u, manager->ActiveTaskCount());
     EXPECT_EQ(1u, manager->GetStats().async_copy_inflight_operations);
@@ -526,8 +515,7 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
                                                               const std::string &name,
                                                               const std::vector<std::string> &keys,
                                                               size_t size,
-                                                              std::function<void()> /*cb*/,
-                                                              const StorageBackendSnapshot & /*snapshot*/) {
+                                                              std::function<void()> /*cb*/) {
     {
         std::unique_lock<std::mutex> lock(g_mutex);
         const int call_index = ++g_create_calls;
@@ -3951,13 +3939,8 @@ TEST_F(MigrationManagerTest, TestDispatchWithoutGroupHardLimitStillHonorsSoftSlo
 
 namespace single_cleanup_stub {
 std::atomic<size_t> delete_calls{0};
-std::vector<ErrorCode> Delete(void *,
-                              RequestContext *,
-                              const std::string &,
-                              const std::vector<DataStorageUri> &uris,
-                              std::function<void()>,
-                              const StorageBackendSnapshot &,
-                              bool *) {
+std::vector<ErrorCode>
+Delete(void *, RequestContext *, const std::string &, const std::vector<DataStorageUri> &uris, std::function<void()>) {
     ++delete_calls;
     return std::vector<ErrorCode>(uris.size(), EC_ERROR);
 }
@@ -3987,7 +3970,6 @@ TEST_F(MigrationManagerTest, TestFailedCleanupAttemptsExistingDeletingOnceInBoth
             ctx.src_storage_name = ctx.dst_storage_name = "cold_01";
             ctx.src_location_id = ctx.dst_location_id = id;
             ctx.src_location_value = ctx.dst_location_value = location->ToJsonString();
-            ctx.storage_backends = data_storage_manager_->CaptureStorageBackends({"cold_01"});
             if (source_cleanup) {
                 ctx.dst_location_id = "copied-target";
                 std::vector<ErrorCode> replaced;
@@ -4023,87 +4005,6 @@ TEST_F(MigrationManagerTest, TestFailedCleanupAttemptsExistingDeletingOnceInBoth
     for (const auto &[key, id] : cleanup_locations) {
         EXPECT_EQ(CLS_DELETING, GetLocationStatus(key, id));
     }
-}
-
-TEST_F(MigrationManagerTest, TestStorageRemovalDiscardsUnfinishedCopyAndItsLateSuccess) {
-    ASSERT_TRUE(CreateMetaIndexer(kInstance));
-    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "retire_copy_hot/"));
-    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "retire_copy_cold/"));
-    constexpr int64_t block_key = 875;
-    const auto source_id = CreateSourceLocation(block_key, "hot_01", false, "payload");
-    const auto source = GetLocation(block_key, source_id);
-    ASSERT_TRUE(source);
-
-    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
-    RequestContext rc("retire_unfinished_copy");
-    auto target = std::make_shared<CacheLocation>(
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/unfinished?size=7")});
-    std::vector<std::string> target_ids;
-    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, &rc, {block_key}, {target}, target_ids));
-
-    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
-    MigrationManager::CopyTaskContext ctx;
-    ctx.instance_group_name = "retire-copy-group";
-    ctx.instance_id = kInstance;
-    ctx.block_key = block_key;
-    ctx.src_storage_name = "hot_01";
-    ctx.src_location_id = source_id;
-    ctx.src_create_time = source->create_time();
-    ctx.src_location_value = source->ToJsonString();
-    ctx.dst_storage_name = "cold_01";
-    ctx.dst_location_id = target_ids[0];
-    ctx.dst_location_value = GetLocation(block_key, target_ids[0])->ToJsonString();
-    ctx.retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
-    ctx.copy_execution_mode = MigrationCopyExecutionMode::ASYNC_REQUIRED;
-    ctx.async_operation_id = "retired-copy";
-    ctx.async_credit_active = true;
-    ctx.total_bytes = 7;
-    ctx.submit_time = std::chrono::steady_clock::now();
-    ctx.storage_backends = data_storage_manager_->CaptureStorageBackends({"hot_01", "cold_01"});
-    {
-        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
-        ASSERT_TRUE(mgr.InsertActiveTaskLocked(ctx));
-    }
-    MigrationManager::MigrationRequest credit;
-    credit.instance_group_name = ctx.instance_group_name;
-    credit.async_operation_id = ctx.async_operation_id;
-    credit.copy_execution_mode = ctx.copy_execution_mode;
-    credit.copy_max_inflight_bytes = ctx.total_bytes;
-    ASSERT_TRUE(mgr.ReserveAsyncCopyCredit(credit, ctx.total_bytes));
-
-    std::promise<PlanExecuteResult> completion;
-    MigrationManager::PendingCopy pending{kInstance, block_key, 1, completion.get_future(), true};
-    pending.storage_backends = ctx.storage_backends;
-    pending.async_operation_id = ctx.async_operation_id;
-    mgr.pending_copies_.push_back(std::move(pending));
-    ASSERT_EQ(EC_OK, data_storage_manager_->UnRegisterStorage("cold_01"));
-    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "replacement_copy_cold/"));
-    mgr.Start();
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    while (mgr.GetStats().copy_failed == 0 && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    EXPECT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
-    EXPECT_EQ(1u, mgr.GetStats().copy_failed);
-    EXPECT_EQ(0u, mgr.GetStats().async_copy_inflight_operations);
-    // No backend completion was needed to finish the retired operation.
-    completion.set_value(PlanExecuteResult{EC_OK, ""});
-    mgr.Stop();
-
-    EXPECT_EQ(0u, mgr.GetStats().copy_completed);
-    EXPECT_EQ(CLS_SERVING, GetLocationStatus(block_key, source_id));
-    // The single cleanup attempt admits the exact target as DELETING. The
-    // retired backend identity then rejects physical deletion, preserving it.
-    ASSERT_TRUE(WaitFor([&]() { return GetLocationStatus(block_key, target_ids[0]) == CLS_DELETING; }));
-    CacheLocation expected_target;
-    ASSERT_TRUE(expected_target.FromJsonString(ctx.dst_location_value));
-    expected_target.set_status(CLS_DELETING);
-    const auto retained_target = GetLocation(block_key, target_ids[0]);
-    ASSERT_NE(nullptr, retained_target);
-    EXPECT_EQ(expected_target.ToJsonString(), retained_target->ToJsonString());
 }
 
 TEST_F(MigrationManagerTest, TestCancelAndCompletionHaveExactlyOneTerminalOwner) {
@@ -4282,56 +4183,6 @@ TEST_F(MigrationManagerTest, TestPromotionSyncFailureEndsMonitorTaskAndPreserves
     EXPECT_EQ(1u, mgr.GetStats().copy_failed);
     EXPECT_EQ(0u, mgr.GetStats().copy_completed);
     EXPECT_EQ(0u, mgr.GetStats().async_copy_unknown);
-}
-
-TEST_F(MigrationManagerTest, TestStorageRemovalDuringPromotionSyncPreservesSource) {
-    ASSERT_TRUE(CreateMetaIndexer(kInstance));
-    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "retire_sync_hot/"));
-    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "retire_sync_cold/"));
-    constexpr int64_t block_key = 876;
-    const auto source_id = CreateSourceLocation(block_key, "hot_01", false, "payload");
-    const auto source = GetLocation(block_key, source_id);
-    ASSERT_TRUE(source);
-    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
-    RequestContext rc("retire_during_promotion_sync");
-    auto target = std::make_shared<CacheLocation>(
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/sync-retirement?size=7")});
-    std::vector<std::string> target_ids;
-    ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, &rc, {block_key}, {target}, target_ids));
-
-    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
-    MigrationManager::CopyTaskContext ctx;
-    ctx.instance_id = kInstance;
-    ctx.block_key = block_key;
-    ctx.src_storage_name = "hot_01";
-    ctx.src_location_id = source_id;
-    ctx.src_create_time = source->create_time();
-    ctx.src_location_value = source->ToJsonString();
-    ctx.dst_storage_name = "cold_01";
-    ctx.dst_location_id = target_ids[0];
-    ctx.dst_location_value = GetLocation(block_key, target_ids[0])->ToJsonString();
-    ctx.retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
-    ctx.copy_execution_mode = MigrationCopyExecutionMode::ASYNC_REQUIRED;
-    ctx.async_operation_id = "retired-sync-copy";
-    ctx.submit_time = std::chrono::steady_clock::now();
-    ctx.storage_backends = data_storage_manager_->CaptureStorageBackends({"hot_01", "cold_01"});
-    ASSERT_TRUE(mgr.InsertActiveTaskLocked(ctx));
-
-    Stub stub;
-    cleanup_submission_stub::Install(stub);
-    mutate_target_during_promotion_sync = [&]() {
-        EXPECT_EQ(EC_OK, data_storage_manager_->UnRegisterStorage("cold_01"));
-    };
-    stub.set(ADDR(MetaIndexer, Sync), MutateTargetDuringSuccessfulPromotionSync);
-    mgr.OnTaskSuccess(kInstance, block_key);
-    EXPECT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
-    EXPECT_EQ(1u, mgr.GetStats().copy_failed);
-    EXPECT_EQ(0u, mgr.GetStats().copy_completed);
-    EXPECT_EQ(CLS_SERVING, GetLocationStatus(block_key, source_id));
-    EXPECT_EQ(CLS_SERVING, GetLocationStatus(block_key, target_ids[0]));
-    EXPECT_TRUE(cleanup_submission_stub::requests.empty());
 }
 
 TEST_F(MigrationManagerTest, TestUnknownSubmitsExactCleanupOnceWithoutDeletingSource) {
@@ -4764,7 +4615,6 @@ TEST_F(MigrationManagerTest, TestSourceRetentionRequiresExactPublishedTargetAfte
         ctx.copy_execution_mode = MigrationCopyExecutionMode::ASYNC_REQUIRED;
         ctx.async_operation_id = "conditional-source-" + std::to_string(i);
         ctx.submit_time = std::chrono::steady_clock::now();
-        ctx.storage_backends = data_storage_manager_->CaptureStorageBackends({"hot_01", "cold_01"});
         ASSERT_TRUE(mgr.InsertActiveTaskLocked(ctx));
         auto change_target = [&] {
             if (change == TargetChange::kMissing) {
@@ -4793,7 +4643,6 @@ TEST_F(MigrationManagerTest, TestSourceRetentionRequiresExactPublishedTargetAfte
         mgr.OnTaskSuccess(kInstance, block_key);
         ASSERT_EQ(1u, cleanup_submission_stub::requests.size());
         const auto &request = cleanup_submission_stub::requests.front();
-        EXPECT_EQ(ctx.storage_backends, request.storage_backends);
         EXPECT_EQ((std::vector<std::vector<std::string>>{{ctx.src_location_value}}), request.expected_location_values);
         // Execute the one captured request and wait for its conditional admission
         // to finish, so an unchanged source cannot pass merely because it is queued.

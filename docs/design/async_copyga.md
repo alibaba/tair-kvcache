@@ -49,7 +49,7 @@ Reclaimer 和 Admin 分发路径先准备源信息，再进入批量准入。`AS
 
 PACE adapter 的本地接收在发送 POST 前完成。本地明确拒绝且没有远端副作用时可直接进入清理；POST 响应丢失或不完整时，不能重发为新的 Copy，而应报告 unknown，再由普通 Delete 请求后端判断是否仍有活跃 I/O。通用接口中的 `acceptance_unknown` 用于表达无法确认接收结果的 backend，不构成安全完成证明。
 
-异步路径的 `DataStorageManager` 在核对 backend 身份和完成本地接收时持 shared lock，使本地提交与 Storage 注销互斥；远端请求、轮询和完成等待不持该锁。任务用 `shared_ptr` 保存源、目标 backend 的进程内身份，保持对象存活不代表它仍注册或尚未关闭。协调器对单个 operation 的 task IDs 批量查询，并按请求大小分片，不跨 operation 合并查询；协调器需保持有界准入、轮询退避、分阶段 HTTP 预算、取消意图和唯一完成回调。
+异步路径的 `DataStorageManager` 在查找 backend 和本地交接时短暂持锁，随后通过完成回调捕获的 `shared_ptr` 保持 backend 存活；远端请求、轮询和完成等待不占用 manager 锁。协调器对单个 operation 的 task IDs 批量查询，并按请求大小分片，不跨 operation 合并查询；协调器需保持有界准入、轮询退避、分阶段 HTTP 预算、取消意图和唯一完成回调。
 
 `ASYNC_REQUIRED` 遇到不支持异步的 backend 直接拒绝，不回退到同步 Copy。完成结果的整批 `status` 必须为 `EC_OK`，item 数量必须与请求一致，且每个 item 都满足 `terminal && safe_to_reuse_dst && outcome == success` 才能报告 Copy 成功；`AsyncCopyItemResult::error` 仅用于诊断。PACE adapter 还需核验 drained 与 server safe，短返回、缺字段、not_found 或 timeout 都不能冒充成功。
 
@@ -61,7 +61,7 @@ PACE adapter 的本地接收在发送 POST 前完成。本地明确拒绝且没�
 
 ### 4.1 成功发布
 
-Copy 准入时绑定源和目标 backend 的进程内身份，并保存本次源和目标的 Location 身份及完整快照。完成处理属于当前 Leader 的任务生命周期，并通过唯一认领与取消仲裁；取消先取得处理权时，即使远端 Copy 成功也不发布目标、不删除源，而是清理本次目标。
+Copy 提交时在内存中保存本次源和目标的 Location 身份及完整快照。完成处理属于当前 Leader 的任务生命周期，并通过唯一认领与取消仲裁；取消先取得处理权时，即使远端 Copy 成功也不发布目标、不删除源，而是清理本次目标。
 
 源和目标必须属于同一个 Instance/block，KVCache 不跨 `instance_id` 复用。发布不能依靠先 Get(source)、再独立 Promote(target)，因为两步之间可能发生源删除。一次 block 级条件 RMW 同时校验：
 
@@ -69,8 +69,6 @@ Copy 准入时绑定源和目标 backend 的进程内身份，并保存本次源
 - 目标仍是本次创建的 `WRITING` Location，身份和完整值未变化。
 
 全部条件满足才把目标改成 `SERVING`；任一条件不符则丢弃结果，并按本次目标快照清理，不触碰替换后的 Location。CAS 已生效但 Sync 未确认时，以发布确认失败结束迁移，保留源和已发布目标，不执行源删除或清标，并释放进程内任务和 Copy 额度。该失败不计为 backend Copy unknown，也不触发失败源退避。
-
-发布时还在 `DataStorageManager` shared lock 内核对源、目标 backend 仍是本次绑定的对象，并执行条件更新，与注销所需的 unique lock 互斥。Sync 在该锁外等待；Sync 完成后，再次核对 backend 身份并在锁内提交源删除任务。任一 Storage 已注销或被同名新 backend 替换时，Copy 按失败收尾，不再发布目标或提交源删除；已发布的目标也不会被本次 `WRITING` 快照清理误删。
 
 Sync 遵循所选元数据后端的语义。memory-primary 模式下，普通 `SERVING` 更新的备份是 best-effort，Sync 不等于每条目标更新都已持久化，也不提供迁移结果跨重启恢复保证。成功收尾后按 retention 决定是否删除源，源删除同样使用精确快照和普通删除链。
 
@@ -85,7 +83,7 @@ Sync 遵循所选元数据后端的语义。memory-primary 模式下，普通 `S
 3. Delete busy、失败、短返回、超时或异常时，以失败结果结束请求，保留已经形成的 `DELETING` 元数据，不继续执行该批次的 metadata CAD。
 4. 物理删除确认后执行精确的 metadata CAD；CAD 失败同样以失败结果结束，不自动重新删除物理数据或重做 CAD。
 
-每个删除请求只执行一轮，失败后完成原 future。Executor 不将其重新放入定时队列，MigrationManager 也不保留失败清理队列或重新提交删除。删除请求入队前绑定 backend 身份，执行时仍校验精确 Location，不扩大到同 key 的新 Location，也不转用同名重建的 backend。Storage 已注销或被替换时返回失败，不能把原对象无法访问当作物理删除成功。
+每个删除请求只执行一轮，失败后完成原 future。Executor 不将其重新放入定时队列，MigrationManager 也不保留失败清理队列或重新提交删除。删除请求执行时校验精确 Location，不扩大到同 key 的新 Location；后端返回错误、短返回或无法确认删除时按失败处理。
 
 future 以失败结束后，上层可释放删除任务的 pending 记录和额度，但这不代表物理空间或元数据中的存储用量已经释放。busy、失败或未知结果可能留下长期存在的 `DELETING` 和空间占用；当前普通 GC、Reclaimer 不负责自动接管所有这类残留，本设计不提供后台持续重试或跨重启恢复保证。
 
@@ -103,7 +101,7 @@ Group 的 `copy_max_concurrency` 限制同步与异步模式的活跃 Copy opera
 
 默认窗口以“待回收数据先完成 Copy，再回收源”作为容量规划目标。Copy 的 operation 与字节额度均按 Group 计账；Reclaimer 的删除批次上限按进程计账，待删除字节额度另按 Group × Storage 类型计账，二者分别准入。该规划目标不改变现有迁移触发和 retention 策略。
 
-Copy inflight credit 表示 KVCM 正在跟踪的 Copy，不等于 PACE 的全部物理占用。unknown 收尾可释放 Copy credit，但清理失败残留及 PACE 未 drain 的 pending 仍可能占用容量。一次清理请求执行期间保存原 backend 身份和 Location 快照，请求结束后不为失败残留持续持有清理任务。本设计没有独立的 quarantine operation/bytes 容量闸门；持续 busy/unknown 时，需要控制新 Copy 压力并检查未清理残留和 PACE 实际容量。
+Copy inflight credit 表示 KVCM 正在跟踪的 Copy，不等于 PACE 的全部物理占用。unknown 收尾可释放 Copy credit，但清理失败残留及 PACE 未 drain 的 pending 仍可能占用容量。一次清理请求执行期间保存 Location 快照，请求结束后不为失败残留持续持有清理任务。本设计没有独立的 quarantine operation/bytes 容量闸门；持续 busy/unknown 时，需要控制新 Copy 压力并检查未清理残留和 PACE 实际容量。
 
 同步与异步 Copy 共用进程内失败源退避，身份键为：
 
@@ -129,15 +127,11 @@ backend 关闭不能逐任务串行等待完整 Copy。唯一完成回调可以�
 
 ### 6.2 在途任务与管理请求
 
-Storage 注销不以 Copy 完成或清理成功为前提。`DataStorageManager` 用现有读写锁串行化本地 Copy 接收、结果发布和注销；普通 Create/Delete 仍在调用 backend 期间持 shared lock。注销可能等待这些正在执行的调用及 backend 的 Close，但不等待远端 Copy completion 或清理 future。backend Close 的实际 I/O 安全仍由第 2 节的契约保证。
+异步 Copy 接入现有的实例生命周期流程。`RemoveInstance` 先关闭该实例的迁移准入并请求取消活跃 Copy，最多等待 5 秒；仍有活跃 Copy 时返回 `EC_TIMEOUT`。排空后，通过 Registry 记录实例移除状态，将 searcher 和 indexer 从运行时查找表中取出，阻止新请求使用旧实例，并等待已取得的引用排空。已准入的删除任务持有同一个 indexer 至本次尝试结束。
 
-Monitor 定期核对活跃 Copy 绑定的 backend 身份，发现源或目标已注销时按失败收尾，无需等待远端结果；迟到结果不能恢复任务。排队或等待宽限时间的删除请求执行时也核对 backend 身份，同名 Storage 重建不会让旧任务获得发布或物理删除权限。Storage 注销不以这些请求完成为前提，也不保证残留数据自动清除。
+`TrimCache` 收集已提交删除批次的结果并执行 `SyncAll`；删除或 Sync 失败时返回错误，全部成功后才清扫残留。实例移除使用取出的 indexer 执行清扫，并在有界的剩余数据检查后调用 `Retire` 清除持久元数据，最后完成 Registry 移除。期间阻止同 ID 重新注册。
 
-`RemoveInstance` 先关闭该实例的迁移准入并请求取消活跃 Copy，最多等待 5 秒；仍有活跃 Copy 时返回 `EC_TIMEOUT`，不进入实例注销。随后通过 Registry 记录实例移除状态，将 searcher 和 indexer 从运行时查找表中取出，阻止新请求使用旧实例；已取得的引用需要排空，searcher 等待上限为 5 秒，清扫后 indexer 等待上限为 30 秒。已准入的删除任务持有同一个 indexer 至本次尝试结束，因此排队删除也可能延迟实例退休；这不是等待后台清理持续重试。
-
-`TrimCache` 收集已提交删除批次的结果并执行 `SyncAll`；删除或 Sync 失败时返回错误，全部成功后才清扫残留。删除失败不会开启后台持续重试。实例移除使用取出的 indexer 执行该流程，并在有界的剩余数据检查后调用 `Retire` 清除持久元数据，最后完成 Registry 移除。期间阻止同 ID 重新注册，并通过管理层的生命周期锁排除 Storage 移除或替换。
-
-已建立的 Registry 移除状态在失败时保留；尚未退休的 indexer 恢复到管理器，供调用方显式再次执行 `RemoveInstance`。若持久元数据已退休而 Registry 收尾失败，再次调用只完成 Registry 收尾。返回非成功后需读取当前状态；该实例生命周期流程不恢复 Copy 任务，也不为失败 Delete 建立自动重试队列。
+已建立的 Registry 移除状态在失败时保留；尚未退休的 indexer 恢复到管理器，供调用方显式再次执行 `RemoveInstance`。若持久元数据已退休而 Registry 收尾失败，再次调用只完成 Registry 收尾。返回非成功后需读取当前状态；实例生命周期管理不恢复 Copy 任务，也不为失败 Delete 建立自动重试队列。
 
 ## 7. 配置与超时
 
