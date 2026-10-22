@@ -148,7 +148,7 @@ jobs:
         env:
           HOME: ${{ runner.temp }}/qoder-home
         with:
-          qodercli_version: '1.0.39'
+          qodercli_version: '1.1.76'
           qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
           prompt: |
             /review ${{ github.repository }} ${{ steps.pr-info.outputs.number }}
