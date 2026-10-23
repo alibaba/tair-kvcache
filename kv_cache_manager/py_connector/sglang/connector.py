@@ -1789,6 +1789,11 @@ class HiCacheKVCM(HiCacheStorage):
         locations = result["locations"]
 
         matched = len(locations)
+        if matched > len_new:
+            raise RuntimeError(
+                f"get_cache_location returned {matched} locations for {len_new} "
+                "queried keys"
+            )
         if matched == 0:
             return [False] * len_new
 
@@ -1817,7 +1822,7 @@ class HiCacheKVCM(HiCacheStorage):
         flag = result == kvcm_py_client.ClientErrorCode.ER_OK
         if not flag:
             logger.error(f"{result}")
-        return [flag] * len_new
+        return [flag] * matched + [False] * (len_new - matched)
 
     def batch_get_v1(
         self,
