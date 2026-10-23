@@ -9816,6 +9816,209 @@ protected:
     }
 };
 
+TEST_F(HostCacheStateWithoutP2PTest, PureTairUsesAvailableReporterHosts) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH, createLocationSpecInfos());
+    AddTair(101, "tp0");
+    AddTair(102, "tp0");
+    ON_CALL(*tair_, MightExist(_)).WillByDefault([](const std::vector<DataStorageUri> &uris) {
+        return std::vector<bool>(uris.size(), true);
+    });
+
+    const auto query = [&](size_t top_k) {
+        return cache_manager_->GetHostCacheState(request_context_.get(),
+                                                 instance_id_,
+                                                 CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                 {101, 102},
+                                                 {"mem"},
+                                                 top_k,
+                                                 {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL});
+    };
+    auto [local_ec, local_matches] = query(0);
+    ASSERT_EQ(EC_OK, local_ec);
+    EXPECT_TRUE(local_matches.empty());
+
+    auto [ec, matches] = query(2);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(2u, matches.size());
+    EXPECT_EQ((std::set<std::string>{worker_, peer_}),
+              (std::set<std::string>{matches[0].host_ip_port, matches[1].host_ip_port}));
+    for (const auto &match : matches) {
+        EXPECT_EQ(0, match.local);
+        EXPECT_EQ(2, match.global);
+    }
+
+    auto backend = std::dynamic_pointer_cast<EventReportBackend>(
+        registry_manager_->data_storage_manager_->GetDataStorageBackend("host_state_subscriber"));
+    ASSERT_NE(nullptr, backend);
+    backend->SetNodeUnavailable(instance_id_, worker_);
+    auto [peer_ec, peer_matches] = query(2);
+    ASSERT_EQ(EC_OK, peer_ec);
+    ASSERT_EQ(1u, peer_matches.size());
+    EXPECT_EQ(peer_, peer_matches[0].host_ip_port);
+    EXPECT_EQ(2, peer_matches[0].global);
+
+    backend = std::dynamic_pointer_cast<EventReportBackend>(
+        registry_manager_->data_storage_manager_->GetDataStorageBackend("host_state_vineyard"));
+    ASSERT_NE(nullptr, backend);
+    backend->SetNodeUnavailable(instance_id_, peer_);
+    auto [empty_ec, empty_matches] = query(2);
+    ASSERT_EQ(EC_OK, empty_ec);
+    EXPECT_TRUE(empty_matches.empty());
+}
+
+TEST_F(HostCacheStateWithoutP2PTest, TairFillsOnlySpareTopKSlot) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH, createLocationSpecInfos());
+    Report(101, {"tp0"});
+    AddTair(101, "tp0");
+    AddTair(102, "tp0");
+    ON_CALL(*tair_, MightExist(_)).WillByDefault([](const std::vector<DataStorageUri> &uris) {
+        return std::vector<bool>(uris.size(), true);
+    });
+
+    const auto query = [&](size_t top_k) {
+        return cache_manager_->GetHostCacheState(request_context_.get(),
+                                                 instance_id_,
+                                                 CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                 {101, 102},
+                                                 {"mem"},
+                                                 top_k,
+                                                 {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL});
+    };
+    auto [one_ec, one_match] = query(1);
+    ASSERT_EQ(EC_OK, one_ec);
+    ASSERT_EQ(1u, one_match.size());
+    EXPECT_EQ(worker_, one_match[0].host_ip_port);
+    EXPECT_EQ(1, one_match[0].local);
+    EXPECT_EQ(2, one_match[0].global);
+
+    auto [two_ec, two_matches] = query(2);
+    ASSERT_EQ(EC_OK, two_ec);
+    ASSERT_EQ(2u, two_matches.size());
+    EXPECT_EQ((std::set<std::string>{worker_, peer_}),
+              (std::set<std::string>{two_matches[0].host_ip_port, two_matches[1].host_ip_port}));
+    for (const auto &match : two_matches) {
+        EXPECT_EQ(match.host_ip_port == worker_ ? 1 : 0, match.local);
+        EXPECT_EQ(2, match.global);
+    }
+
+    auto backend = std::dynamic_pointer_cast<EventReportBackend>(
+        registry_manager_->data_storage_manager_->GetDataStorageBackend("host_state_vineyard"));
+    ASSERT_NE(nullptr, backend);
+    backend->SetNodeUnavailable(instance_id_, peer_);
+    auto [single_ec, single_match] = query(2);
+    ASSERT_EQ(EC_OK, single_ec);
+    ASSERT_EQ(1u, single_match.size());
+    EXPECT_EQ(worker_, single_match[0].host_ip_port);
+}
+
+TEST_F(HostCacheStateWithoutP2PTest, TairCandidateRespectsReporterMediumAndReadability) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH, createLocationSpecInfos());
+    const std::string disk_only = "10.0.9.3:8080";
+    proto::meta::ReportEventRequest register_request;
+    register_request.set_instance_id(instance_id_);
+    register_request.set_host_ip_port(disk_only);
+    register_request.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+    auto *event = register_request.add_events();
+    event->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+    event->mutable_node_register()->add_mediums("disk");
+    proto::meta::ReportEventResponse response;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &register_request, &response));
+
+    AddTair(101, "tp0");
+    ON_CALL(*tair_, MightExist(_)).WillByDefault([](const std::vector<DataStorageUri> &uris) {
+        return std::vector<bool>(uris.size(), true);
+    });
+    const auto query = [&](const std::vector<std::string> &medium_filter) {
+        return cache_manager_->GetHostCacheState(request_context_.get(),
+                                                 instance_id_,
+                                                 CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                 {101},
+                                                 medium_filter,
+                                                 3,
+                                                 {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL});
+    };
+    auto [mem_ec, mem_matches] = query({"mem"});
+    ASSERT_EQ(EC_OK, mem_ec);
+    ASSERT_EQ(2u, mem_matches.size());
+    EXPECT_EQ((std::set<std::string>{worker_, peer_}),
+              (std::set<std::string>{mem_matches[0].host_ip_port, mem_matches[1].host_ip_port}));
+
+    auto [disk_ec, disk_matches] = query({"disk"});
+    ASSERT_EQ(EC_OK, disk_ec);
+    ASSERT_EQ(3u, disk_matches.size());
+    EXPECT_EQ((std::set<std::string>{worker_, peer_, disk_only}),
+              (std::set<std::string>{
+                  disk_matches[0].host_ip_port, disk_matches[1].host_ip_port, disk_matches[2].host_ip_port}));
+
+    ON_CALL(*tair_, MightExist(_)).WillByDefault([](const std::vector<DataStorageUri> &uris) {
+        return std::vector<bool>(uris.size(), false);
+    });
+    auto [unreadable_ec, unreadable_matches] = query({"mem"});
+    ASSERT_EQ(EC_OK, unreadable_ec);
+    EXPECT_TRUE(unreadable_matches.empty());
+}
+
+TEST_F(HostCacheStateWithoutP2PTest, TairProjectsSharedVineyardReporterToRankedHosts) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH, createLocationSpecInfos());
+    const std::string shared_reporter = "10.0.9.4:8080";
+    const std::string rank0 = shared_reporter + "@0";
+    const std::string rank1 = shared_reporter + "@1";
+    InitializeEventReporter(instance_id_, rank0, proto::meta::ST_EVENT_REPORT_L1P5);
+    InitializeEventReporter(instance_id_, rank1, proto::meta::ST_EVENT_REPORT_L1P5);
+    InitializeEventReporter(instance_id_, shared_reporter, proto::meta::ST_EVENT_REPORT_L2);
+    AddTair(101, "tp0");
+    ON_CALL(*tair_, MightExist(_)).WillByDefault([](const std::vector<DataStorageUri> &uris) {
+        return std::vector<bool>(uris.size(), true);
+    });
+
+    auto [ec, matches] = cache_manager_->GetHostCacheState(request_context_.get(),
+                                                           instance_id_,
+                                                           CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                           {101},
+                                                           {"mem"},
+                                                           5,
+                                                           {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL});
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(4u, matches.size());
+    std::set<std::string> hosts;
+    for (const auto &match : matches) {
+        hosts.insert(match.host_ip_port);
+        EXPECT_EQ(0, match.local);
+        EXPECT_EQ(1, match.global);
+    }
+    EXPECT_EQ((std::set<std::string>{worker_, peer_, rank0, rank1}), hosts);
+    EXPECT_EQ(0u, hosts.count(shared_reporter));
+}
+
+TEST_F(HostCacheStateWithoutP2PTest, MambaPureTairUsesReporterHosts) {
+    Prepare(CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+            {LocationSpecInfo("full", 512), LocationSpecInfo("linear", 512)},
+            {LocationSpecGroup("F0", {"full"}), LocationSpecGroup("L0", {"linear"})});
+    for (int64_t key : {101, 102}) {
+        AddTair(key, "full");
+        AddTair(key, "linear");
+    }
+    ON_CALL(*tair_, MightExist(_)).WillByDefault([](const std::vector<DataStorageUri> &uris) {
+        return std::vector<bool>(uris.size(), true);
+    });
+
+    auto [ec, matches] = cache_manager_->GetHostCacheState(request_context_.get(),
+                                                           instance_id_,
+                                                           CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+                                                           {101, 102},
+                                                           {"mem"},
+                                                           2,
+                                                           {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL});
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(2u, matches.size());
+    EXPECT_EQ((std::set<std::string>{worker_, peer_}),
+              (std::set<std::string>{matches[0].host_ip_port, matches[1].host_ip_port}));
+    for (const auto &match : matches) {
+        EXPECT_EQ(0, match.local);
+        EXPECT_EQ(2, match.global);
+    }
+}
+
 TEST_F(HostCacheStateWithoutP2PTest, PrefixMatchUsesTairWithoutP2P) {
     Prepare(CacheManager::QueryType::QT_PREFIX_MATCH, createLocationSpecInfos());
     // 请求 101,102,103,104：本地有 101/103，Tair 补 102，只有远端 V6D 有 104。

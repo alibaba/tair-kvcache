@@ -72,6 +72,8 @@ public:
     };
     using CheckHostCacheLocationFunc =
         std::function<bool(const CacheLocation &location, HostCacheLocationInfo &out_info)>;
+    using ListHostCacheCandidateHostsFunc =
+        std::function<std::vector<std::string>(const std::vector<std::string> &medium_filter)>;
 
     explicit MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_manager);
     MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
@@ -110,7 +112,8 @@ public:
                                 const CheckHostCacheLocationFunc *request_check_location = nullptr,
                                 size_t top_k_host_count = 0,
                                 const std::vector<DataStorageType> &backend_types = {},
-                                SelectLocationPolicy *policy = nullptr) const;
+                                SelectLocationPolicy *policy = nullptr,
+                                const ListHostCacheCandidateHostsFunc *list_candidate_hosts = nullptr) const;
     ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
                                          const KeyVector &keys,
                                          bool use_eagle_pop,
@@ -120,7 +123,8 @@ public:
                                          const CheckHostCacheLocationFunc *request_check_location = nullptr,
                                          size_t top_k_host_count = 0,
                                          const std::vector<DataStorageType> &backend_types = {},
-                                         SelectLocationPolicy *policy = nullptr) const;
+                                         SelectLocationPolicy *policy = nullptr,
+                                         const ListHostCacheCandidateHostsFunc *list_candidate_hosts = nullptr) const;
     ErrorCode PrefixMatchWithSwaByHost(RequestContext *request_context,
                                        const KeyVector &keys,
                                        size_t window_blocks,
@@ -131,7 +135,8 @@ public:
                                        const CheckHostCacheLocationFunc *request_check_location = nullptr,
                                        size_t top_k_host_count = 0,
                                        const std::vector<DataStorageType> &backend_types = {},
-                                       SelectLocationPolicy *policy = nullptr) const;
+                                       SelectLocationPolicy *policy = nullptr,
+                                       const ListHostCacheCandidateHostsFunc *list_candidate_hosts = nullptr) const;
     ErrorCode BatchGetLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const BlockMask &input_mask,
@@ -393,6 +398,7 @@ private:
                                           size_t top_k_host_count,
                                           const std::vector<DataStorageType> &backend_types,
                                           SelectLocationPolicy *policy,
+                                          const ListHostCacheCandidateHostsFunc *list_candidate_hosts,
                                           char state_category,
                                           size_t window_blocks) const;
     class MergeLocationSpecsTaskView;

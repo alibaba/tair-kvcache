@@ -392,8 +392,11 @@ private:
                                                                   const std::string &instance_id,
                                                                   bool allow_unavailable_storages = false) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
-    MetaSearcher::CheckHostCacheLocationFunc
-    GetHostCacheStateCheckLocDataExistFunc(const std::string &instance_id) const;
+    struct HostCacheQueryCallbacks {
+        MetaSearcher::CheckHostCacheLocationFunc check_location;
+        MetaSearcher::ListHostCacheCandidateHostsFunc list_candidate_hosts;
+    };
+    HostCacheQueryCallbacks GetHostCacheStateQueryCallbacks(const std::string &instance_id) const;
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
     void ClearEventCleanupCallbacks();
     void DeactivateEventCleanupCallbacks();
