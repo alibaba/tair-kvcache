@@ -2009,6 +2009,18 @@ ErrorCode MetaIndexer::ScanLocationsForMaintenance(RequestContext *request_conte
     return ec;
 }
 
+ErrorCode MetaIndexer::ScanPersistentLocationsForRecovery(RequestContext *request_context,
+                                                          const std::string &cursor,
+                                                          const size_t limit,
+                                                          MaintenanceScanBatch &out) noexcept {
+    out.Clear();
+    if (limit == 0 || limit > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        return EC_BADARGS;
+    }
+    return backend_manager_->ScanPersistentLocationsForRecovery(
+        request_context, cursor, static_cast<int64_t>(limit), out);
+}
+
 ErrorCode
 MetaIndexer::RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept {
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -2070,6 +2082,18 @@ ErrorCode MetaIndexer::SampleReclaimCandidates(RequestContext *request_context,
     return ec;
 }
 
+ErrorCode MetaIndexer::SamplePersistentReclaimCandidates(RequestContext *request_context,
+                                                         const int64_t count,
+                                                         ReclaimCandidateVector &out_candidates,
+                                                         bool require_read_success) const noexcept {
+    out_candidates.clear();
+    if (count > 0) {
+        out_candidates.reserve(static_cast<size_t>(count));
+    }
+    return backend_manager_->SamplePersistentReclaimCandidates(
+        request_context, count, out_candidates, require_read_success);
+}
+
 size_t MetaIndexer::GetKeyCount() const noexcept { return key_count_.load(); }
 
 size_t MetaIndexer::GetMaxKeyCount() const noexcept { return max_key_count_; }
@@ -2077,6 +2101,12 @@ size_t MetaIndexer::GetMaxKeyCount() const noexcept { return max_key_count_; }
 size_t MetaIndexer::GetMemUsage() const noexcept { return backend_manager_->GetMemUsage(); }
 
 bool MetaIndexer::Sync(const KeyVector &keys) noexcept { return backend_manager_->Sync(keys); }
+
+bool MetaIndexer::SyncDeletedLocations(RequestContext *request_context,
+                                       const KeyVector &keys,
+                                       const LocationIdsPerKey &location_ids) noexcept {
+    return backend_manager_->SyncDeletedLocations(request_context, keys, location_ids);
+}
 
 bool MetaIndexer::SyncAll() noexcept { return backend_manager_->SyncAll(); }
 

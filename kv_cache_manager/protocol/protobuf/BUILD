@@ -51,12 +51,14 @@ cc_library(
     srcs = [
         "admin_service.grpc.pb.cc",
         "debug_service.grpc.pb.cc",
+        "kv_meta_service.grpc.pb.cc",
         "meta_service.grpc.pb.cc",
         "optimizer_service.grpc.pb.cc",
     ],
     hdrs = [
         "admin_service.grpc.pb.h",
         "debug_service.grpc.pb.h",
+        "kv_meta_service.grpc.pb.h",
         "meta_service.grpc.pb.h",
         "optimizer_service.grpc.pb.h",
     ],
@@ -68,6 +70,12 @@ cc_library(
 py_library(
     name = "meta_service_py_proto",
     srcs = [":meta_service_py"],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
+    name = "kv_meta_service_py_proto",
+    srcs = [":kv_meta_service_py"],
     visibility = ["//visibility:public"],
 )
 
