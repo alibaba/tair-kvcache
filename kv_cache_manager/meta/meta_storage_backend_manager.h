@@ -37,6 +37,11 @@ public:
         kRunning,
     };
 
+    struct ReclaimedKeyBirth {
+        KeyType key;
+        uint64_t first_seen_ms;
+    };
+
     MetaStorageBackendManager() = default;
     ~MetaStorageBackendManager();
 
@@ -67,17 +72,22 @@ public:
                                                        const LocationIdRefVector &location_ids,
                                                        CacheLocationVector &locations,
                                                        const std::vector<size_t> &read_indices,
+                                                       uint64_t first_seen_ms,
                                                        std::vector<ErrorCode> &out_results,
                                                        SingleLocationRmwScratch &scratch) noexcept;
-    std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
+    std::vector<ErrorCode> Delete(RequestContext *request_context,
+                                  const KeyVector &keys,
+                                  std::vector<ReclaimedKeyBirth> *out_reclaimed_births = nullptr) noexcept;
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const KeyVector &keys,
                                   const LocationIdsPerKey &location_ids,
-                                  int32_t &out_reclaimed_count) noexcept;
+                                  int32_t &out_reclaimed_count,
+                                  std::vector<ReclaimedKeyBirth> *out_reclaimed_births = nullptr) noexcept;
     std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
                                                          const KeyVector &keys,
                                                          const LocationIdsPerKey &location_ids,
-                                                         int32_t &out_reclaimed_count) noexcept;
+                                                         int32_t &out_reclaimed_count,
+                                                         std::vector<ReclaimedKeyBirth> *out_reclaimed_births = nullptr) noexcept;
     ErrorCode
     TrimPersistentOrphans(RequestContext *request_context, const KeyVector &keys, KeyVector &out_trimmed_keys) noexcept;
 
@@ -147,6 +157,10 @@ public:
                                          const KeyVector &keys,
                                          const std::vector<std::string> &field_names,
                                          PropertyMapVector &out_properties) noexcept;
+    std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *request_context,
+                                                       const KeyVector &keys,
+                                                       const std::vector<std::string> &field_names,
+                                                       PropertyMapVector &out_properties) noexcept;
     std::vector<ErrorCode>
     Exists(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_is_exist_vec) noexcept;
 
@@ -242,7 +256,8 @@ private:
     // Delete keys that have no remaining location fields. Returns reclaimed count.
     int32_t MaybeReclaimEmptyKeys(RequestContext *request_context,
                                   const KeyVector &keys,
-                                  const std::vector<ErrorCode> &delete_results) noexcept;
+                                  const std::vector<ErrorCode> &delete_results,
+                                  std::vector<ReclaimedKeyBirth> *out_reclaimed_births) noexcept;
     std::string instance_id_;
     std::unique_ptr<MetaStorageBackend> persistent_backend_;
     std::unique_ptr<MetaCacheBaseBackend> cache_backend_;

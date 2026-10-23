@@ -96,6 +96,17 @@ TEST_F(ServerConfigTest, TestSimple) {
     }
 }
 
+TEST_F(ServerConfigTest, BlockKeyLifetimeBucketsValidate) {
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {{"kvcm.metrics.block_key_lifetime_buckets", "1,10,60"}}));
+    EXPECT_TRUE(config.Check());
+    EXPECT_EQ("1,10,60", config.GetBlockKeyLifetimeBuckets());
+
+    ServerConfig invalid;
+    ASSERT_TRUE(invalid.Parse("", {{"kvcm.metrics.block_key_lifetime_buckets", "10,1"}}));
+    EXPECT_FALSE(invalid.Check());
+}
+
 TEST_F(ServerConfigTest, MetricsEnvTagsResolveAtStartup) {
     ScopedEnv workspace("KVCM_TEST_METRICS_WORKSPACE", " workspace_a ");
     ScopedEnv deployment("KVCM_TEST_METRICS_DEPLOYMENT", "deployment_a");

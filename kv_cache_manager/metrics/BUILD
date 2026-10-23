@@ -87,6 +87,13 @@ cc_library(
 )
 
 cc_library(
+    name = "block_key_lifetime_histogram",
+    srcs = ["block_key_lifetime_histogram.cc"],
+    hdrs = ["block_key_lifetime_histogram.h"],
+    deps = [":metrics_registry"],
+)
+
+cc_library(
     name = "revisit_interval_histogram",
     srcs = [
         "revisit_interval_histogram.cc",

@@ -226,11 +226,29 @@ PropertyMap &LocalPropertyStore::EnsureExtraProperties() {
     return *extra_properties_;
 }
 
-ssize_t LocalPropertyStore::ErasePrevKeyFallback() {
+uint64_t LocalPropertyStore::GetFirstSeenMs() const noexcept {
+    uint64_t value = 0;
+    for (size_t i = 0; i < first_seen_ms_.size(); ++i) {
+        value |= static_cast<uint64_t>(first_seen_ms_[i]) << (i * 8);
+    }
+    return value;
+}
+
+bool LocalPropertyStore::SetFirstSeenMs(uint64_t value) noexcept {
+    if (GetFirstSeenMs() != 0 || value == 0 || value >= (uint64_t{1} << 48)) {
+        return false;
+    }
+    for (size_t i = 0; i < first_seen_ms_.size(); ++i) {
+        first_seen_ms_[i] = static_cast<uint8_t>(value >> (i * 8));
+    }
+    return true;
+}
+
+ssize_t LocalPropertyStore::EraseFallbackProperty(const std::string &name) {
     if (!extra_properties_) {
         return 0;
     }
-    const auto it = extra_properties_->find(PROPERTY_PREV_BLOCK_KEY);
+    const auto it = extra_properties_->find(name);
     if (it == extra_properties_->end()) {
         return 0;
     }
@@ -262,20 +280,34 @@ ssize_t LocalPropertyStore::UpsertExtraProperty(const std::string &name, const s
 ssize_t LocalPropertyStore::Merge(const PropertyMap &properties) {
     ssize_t delta = 0;
     for (const auto &[name, value] : properties) {
+        if (name == PROPERTY_BLOCK_FIRST_SEEN_MS) {
+            if (GetFirstSeenMs() != 0) {
+                continue;
+            }
+            int64_t parsed = 0;
+            if (StringUtil::StrToInt64(value.c_str(), parsed) && parsed > 0 &&
+                static_cast<uint64_t>(parsed) < (uint64_t{1} << 48) && std::to_string(parsed) == value) {
+                SetFirstSeenMs(static_cast<uint64_t>(parsed));
+                delta += EraseFallbackProperty(name);
+            } else {
+                delta += UpsertExtraProperty(name, value);
+            }
+            continue;
+        }
         if (name != PROPERTY_PREV_BLOCK_KEY) {
             delta += UpsertExtraProperty(name, value);
             continue;
         }
 
         if (value.empty()) {
-            delta += ErasePrevKeyFallback();
+            delta += EraseFallbackProperty(name);
             prev_key_state_ = PrevKeyState::kEmpty;
             continue;
         }
 
         KeyType parsed = 0;
         if (StringUtil::StrToInt64(value.c_str(), parsed) && std::to_string(parsed) == value) {
-            delta += ErasePrevKeyFallback();
+            delta += EraseFallbackProperty(name);
             prev_key_ = parsed;
             prev_key_state_ = PrevKeyState::kCanonical;
             continue;
@@ -289,6 +321,10 @@ ssize_t LocalPropertyStore::Merge(const PropertyMap &properties) {
 
 void LocalPropertyStore::CopySelected(const std::vector<std::string> &field_names, PropertyMap &out) const {
     for (const auto &name : field_names) {
+        if (name == PROPERTY_BLOCK_FIRST_SEEN_MS && GetFirstSeenMs() != 0) {
+            out[name] = std::to_string(GetFirstSeenMs());
+            continue;
+        }
         if (name == PROPERTY_PREV_BLOCK_KEY) {
             if (prev_key_state_ == PrevKeyState::kEmpty) {
                 out[name] = {};
@@ -313,6 +349,9 @@ void LocalPropertyStore::CopyAll(PropertyMap &out) const {
         out = *extra_properties_;
     } else {
         out.clear();
+    }
+    if (GetFirstSeenMs() != 0) {
+        out[PROPERTY_BLOCK_FIRST_SEEN_MS] = std::to_string(GetFirstSeenMs());
     }
     if (prev_key_state_ == PrevKeyState::kEmpty) {
         out[PROPERTY_PREV_BLOCK_KEY] = {};
@@ -533,8 +572,9 @@ ErrorCode MetaLocalBackend::UpdateInPlace(std::string_view key_sv,
 
 ErrorCode MetaLocalBackend::CreateAndInsertSingleLocation(std::string_view key_sv,
                                                           const LocationId &location_id,
-                                                          CacheLocationConstPtr location) {
-    MetaMemCacheItem *item = MetaMemCacheItem::CreateSingleLocation(location_id, std::move(location));
+                                                          CacheLocationConstPtr location,
+                                                          uint64_t first_seen_ms) {
+    MetaMemCacheItem *item = MetaMemCacheItem::CreateSingleLocation(location_id, std::move(location), first_seen_ms);
     item->TouchAccessTime();
     const size_t charge = item->Size();
     Cache::Handle *handle = nullptr;
@@ -817,6 +857,7 @@ void MetaLocalBackend::UpsertSingleLocationsUsingRetainedHandlesInto(RequestCont
                                                                      const LocationIdRefVector &location_ids,
                                                                      CacheLocationVector &locations,
                                                                      const std::vector<size_t> &read_indices,
+                                                                     uint64_t first_seen_ms,
                                                                      std::vector<ErrorCode> &results,
                                                                      SingleLocationRmwScratch &scratch) noexcept {
     auto fail_and_release = [&results, &scratch, &keys](ErrorCode ec) {
@@ -871,7 +912,7 @@ void MetaLocalBackend::UpsertSingleLocationsUsingRetainedHandlesInto(RequestCont
                 handle, *location_ids[i], std::move(locations[i]), &scratch.retired_locations);
         } else {
             results[i] = CreateAndInsertSingleLocation(
-                scratch.key_views[read_indices[i]], *location_ids[i], std::move(locations[i]));
+                scratch.key_views[read_indices[i]], *location_ids[i], std::move(locations[i]), first_seen_ms);
         }
     }
     scratch.ReleaseRetainedHandles();
@@ -1495,6 +1536,34 @@ std::vector<ErrorCode> MetaLocalBackend::GetProperties(RequestContext * /*reques
     out_properties.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         results[i] = GetForOneKey(keys[i], &field_names, nullptr, &out_properties[i], nullptr);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::GetPropertiesForMaintenance(RequestContext * /*request_context*/,
+                                                                     const KeyTypeVec &keys,
+                                                                     const std::vector<std::string> &field_names,
+                                                                     PropertyMapVector &out_properties) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_NOENT);
+    out_properties.clear();
+    out_properties.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool found = cache_->ApplyToEntryNoTouch(
+            KeyToView(keys[i]),
+            [&](Cache::ObjectPtr value, size_t /*charge*/, const Cache::CacheItemHelper * /*helper*/) -> ssize_t {
+                if (value == nullptr) {
+                    results[i] = EC_ERROR;
+                    return 0;
+                }
+                const auto *item = static_cast<const MetaMemCacheItem *>(value);
+                std::shared_lock lock(item->GetMutex());
+                item->GetPropertyStore().CopySelected(field_names, out_properties[i]);
+                results[i] = EC_OK;
+                return 0;
+            });
+        if (!found) {
+            results[i] = EC_NOENT;
+        }
     }
     return results;
 }

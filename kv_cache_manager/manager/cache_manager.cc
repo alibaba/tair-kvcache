@@ -645,6 +645,13 @@ void CacheManager::SetRevisitHistogramConfig(const std::vector<double> &boundari
     }
 }
 
+void CacheManager::SetBlockKeyLifetimeHistogramConfig(const std::vector<double> &boundaries) {
+    if (meta_indexer_manager_ && metrics_registry_ && !boundaries.empty()) {
+        meta_indexer_manager_->SetBlockKeyLifetimeHistogramConfig(metrics_registry_, boundaries);
+        KVCM_LOG_INFO("Set block key lifetime histogram config with %zu boundaries", boundaries.size());
+    }
+}
+
 std::pair<ErrorCode, std::string>
 CacheManager::RegisterInstance(RequestContext *request_context,
                                const std::string &instance_group,
@@ -802,13 +809,16 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
             RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "remove instance failed: cache config unavailable");
         }
         ec = meta_indexer_manager_->CreateMetaIndexer(
-            instance_id, cache_config->meta_indexer_config(), group->revisit_interval_buckets());
+            instance_id, cache_config->meta_indexer_config(), group->revisit_interval_buckets(),
+            pending->instance_group_name());
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed: create meta indexer");
         meta_indexer = meta_indexer_manager_->ExtractMetaIndexer(instance_id);
     }
     if (!meta_indexer) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "remove instance failed: extract meta indexer");
     }
+
+    meta_indexer->DisableBlockKeyLifetimeObservation();
 
     // Storage removal and replacement remain excluded while trim runs.
     lifecycle_guard.unlock();

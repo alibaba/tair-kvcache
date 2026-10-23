@@ -288,6 +288,10 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
         }
         ScopedBatchLock lock(*this, batch.shard_indices, &lock_wait_time_us, &lock_hold_time_us);
         int64_t begin_put_io_time = TimestampUtil::GetCurrentTimeUs();
+        backend_batch.EnsureLocationsAndPropertiesResized();
+        for (auto &property_map : backend_batch.batch_properties) {
+            property_map[PROPERTY_BLOCK_FIRST_SEEN_MS] = std::to_string(begin_put_io_time / 1000);
+        }
         auto error_codes = backend_manager_->Put(request_context, backend_batch);
         put_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_put_io_time;
         int64_t v = 0;
@@ -323,7 +327,12 @@ MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const K
     for (const auto &batch : batches) {
         FillBatchKeys(batch.global_indices, keys, batch_keys);
         ScopedBatchLock lock(*this, batch.shard_indices, &lock_wait_time_us, &lock_hold_time_us);
-        std::vector<ErrorCode> error_codes = backend_manager_->Delete(request_context, batch_keys);
+        std::vector<MetaStorageBackendManager::ReclaimedKeyBirth> reclaimed_births;
+        std::vector<ErrorCode> error_codes = backend_manager_->Delete(
+            request_context, batch_keys, block_key_lifetime_histogram_ && block_key_lifetime_enabled_.load(std::memory_order_relaxed)
+                                      ? &reclaimed_births
+                                      : nullptr);
+        ObserveReclaimedKeyBirths(reclaimed_births);
         int64_t v = 0;
         KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, cache_backend_delete_time_us, v);
         cache_backend_delete_time_us += v;
@@ -477,16 +486,21 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
     const int64_t begin = TimestampUtil::GetCurrentTimeUs();
     std::vector<ErrorCode> delete_ecs;
     int32_t reclaimed_count = 0;
+    std::vector<MetaStorageBackendManager::ReclaimedKeyBirth> reclaimed_births;
+    auto *birth_output = block_key_lifetime_histogram_ && block_key_lifetime_enabled_.load(std::memory_order_relaxed)
+                                      ? &reclaimed_births
+                                      : nullptr;
     if (delete_batch.batch_location_ids.empty()) {
-        delete_ecs = backend_manager_->Delete(request_context, delete_batch.batch_keys);
+        delete_ecs = backend_manager_->Delete(request_context, delete_batch.batch_keys, birth_output);
     } else if (maintenance_no_touch) {
         delete_ecs = backend_manager_->DeleteLocationsForMaintenance(
-            request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count);
+            request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count, birth_output);
     } else {
         delete_ecs = backend_manager_->Delete(
-            request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count);
+            request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count, birth_output);
     }
     stats.delete_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin;
+    ObserveReclaimedKeyBirths(reclaimed_births);
     int64_t v = 0;
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, v);
@@ -505,6 +519,19 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
     const int32_t delete_success_count =
         delete_batch.batch_location_ids.empty() ? delete_batch.batch_keys.size() - error_count : reclaimed_count;
     return {error_count, delete_success_count};
+}
+
+void MetaIndexer::ObserveReclaimedKeyBirths(const std::vector<MetaStorageBackendManager::ReclaimedKeyBirth> &births) const noexcept {
+    if (!block_key_lifetime_histogram_ || !block_key_lifetime_enabled_.load(std::memory_order_relaxed) ||
+        births.empty()) {
+        return;
+    }
+    const uint64_t now_ms = static_cast<uint64_t>(TimestampUtil::GetCurrentTimeUs() / 1000);
+    for (const auto &entry : births) {
+        if (now_ms >= entry.first_seen_ms) {
+            block_key_lifetime_histogram_->ObserveMs(now_ms - entry.first_seen_ms);
+        }
+    }
 }
 
 void MetaIndexer::EmitRmwMetrics(MetricsCollector *metrics_collector,
@@ -633,6 +660,9 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
                 upsert_batch.batch_keys.emplace_back(key);
                 upsert_batch.batch_indexs.emplace_back(global_idx);
                 upsert_batch.batch_locations.emplace_back(std::move(out_new_locations));
+                if (get_ec == EC_NOENT) {
+                    upsert_property_map[PROPERTY_BLOCK_FIRST_SEEN_MS] = std::to_string(begin_get / 1000);
+                }
                 upsert_batch.batch_properties.emplace_back(std::move(upsert_property_map));
                 if (get_ec == EC_NOENT) {
                     put_global_indexs.emplace_back(global_idx);
@@ -931,6 +961,9 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                     upsert_batch.batch_keys.emplace_back(key);
                     upsert_batch.batch_indexs.emplace_back(global_idx);
                     upsert_batch.batch_locations.emplace_back(std::move(upsert_loc_map));
+                    if (track_created_key_count && key_get_ec == EC_NOENT) {
+                        upsert_property_map[PROPERTY_BLOCK_FIRST_SEEN_MS] = std::to_string(begin_get / 1000);
+                    }
                     upsert_batch.batch_properties.emplace_back(std::move(upsert_property_map));
                     if (requires_secondary_admission) {
                         upsert_batch.batch_secondary_admission_indices.push_back(upsert_index);
@@ -1263,6 +1296,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
                                                                             upsert_location_ids,
                                                                             upsert_locations,
                                                                             upsert_read_indices,
+                                                                            static_cast<uint64_t>(begin_get / 1000),
                                                                             batch_get_ecs,
                                                                             backend_scratch);
             stats.upsert_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_upsert;
@@ -1313,6 +1347,7 @@ MetaIndexer::ReadModifyWriteSingleTargetLocations(RequestContext *request_contex
                                                                                 upsert_location_ids,
                                                                                 upsert_locations,
                                                                                 upsert_read_indices,
+                                                                                static_cast<uint64_t>(begin_get / 1000),
                                                                                 batch_get_ecs,
                                                                                 backend_scratch);
                 stats.upsert_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_upsert;

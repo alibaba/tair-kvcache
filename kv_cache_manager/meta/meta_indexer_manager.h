@@ -25,6 +25,8 @@ public:
     // Set histogram configuration for revisit interval tracking.
     // Must be called before CreateMetaIndexer.
     void SetRevisitHistogramConfig(std::shared_ptr<MetricsRegistry> registry, const std::vector<double> &boundaries);
+    void SetBlockKeyLifetimeHistogramConfig(std::shared_ptr<MetricsRegistry> registry,
+                                            const std::vector<double> &boundaries);
 
     // Configures the single process-level executor shared by every indexer.
     // Must be called before CreateMetaIndexer. worker_count == 1 keeps the
@@ -33,7 +35,8 @@ public:
 
     ErrorCode CreateMetaIndexer(const std::string &instance_id,
                                 const std::shared_ptr<MetaIndexerConfig> &config,
-                                const std::vector<double> &boundaries = {});
+                                const std::vector<double> &boundaries = {},
+                                const std::string &instance_group = {});
 
     std::shared_ptr<MetaIndexer> GetMetaIndexer(const std::string &instance_id) const;
 
@@ -57,6 +60,7 @@ private:
     // Histogram configuration (shared across all indexers)
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::vector<double> revisit_boundaries_;
+    std::vector<double> block_key_lifetime_boundaries_;
     std::shared_ptr<QueryExecutor> query_executor_;
 };
 

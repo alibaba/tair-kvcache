@@ -258,6 +258,7 @@ public:
     // Set revisit interval histogram configuration for per-instance tracking.
     // Must be called before any MetaIndexer is created.
     void SetRevisitHistogramConfig(const std::vector<double> &boundaries);
+    void SetBlockKeyLifetimeHistogramConfig(const std::vector<double> &boundaries);
 
 private:
     ErrorCode TrimCacheWithIndexer(RequestContext *request_context,

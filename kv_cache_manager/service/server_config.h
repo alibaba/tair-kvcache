@@ -79,6 +79,7 @@ public:
     const std::string &GetAdvertisedHost() const { return advertised_host_; }
     const std::string &GetCustomInfo() const { return custom_info_; }
     const std::string &GetRevisitIntervalBuckets() const { return revisit_interval_buckets_; }
+    const std::string &GetBlockKeyLifetimeBuckets() const { return block_key_lifetime_buckets_; }
 
     // Parse revisit_interval_buckets config string into sorted vector of doubles.
     // Returns empty vector if config is empty or invalid. Caller is responsible
@@ -88,6 +89,7 @@ public:
     // Default bucket boundaries (seconds) for revisit interval histogram.
     // 13 boundaries → 14 buckets including +Inf.
     static const std::vector<double> &GetDefaultRevisitIntervalBuckets();
+    static const std::vector<double> &GetDefaultBlockKeyLifetimeBuckets();
 
 private:
     void UpdateDefaultConfig();
@@ -148,6 +150,7 @@ private:
     std::string advertised_host_;
     std::string custom_info_;
     std::string revisit_interval_buckets_;
+    std::string block_key_lifetime_buckets_;
 
 private:
     using SettingFunction = std::function<bool(const std::string &, ServerConfig *config)>;

@@ -27,6 +27,7 @@ cc_library(
     deps = [
         ":meta_indexer",
         ":query_executor",
+        "//kv_cache_manager/metrics:block_key_lifetime_histogram",
         "//kv_cache_manager/metrics:revisit_interval_histogram",
     ],
 )
@@ -70,6 +71,7 @@ cc_library(
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:utils",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/metrics:block_key_lifetime_histogram",
         "//kv_cache_manager/metrics:revisit_interval_histogram",
     ],
 )

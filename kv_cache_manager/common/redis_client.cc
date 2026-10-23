@@ -293,11 +293,32 @@ void RedisClient::BuildSetCmds(const std::vector<std::string> &keys,
 
 void RedisClient::BuildHashSetCmds(const std::vector<std::string> &keys,
                                    const std::vector<std::map<std::string, std::string>> &field_maps,
-                                   std::vector<CmdArgs> &out_cmds) {
+                                   std::vector<CmdArgs> &out_cmds,
+                                   const std::string &first_write_field) {
     assert(keys.size() == field_maps.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (field_maps[i].empty())
+        if (field_maps[i].empty()) {
             continue;
+        }
+        const auto first_write = first_write_field.empty() ? field_maps[i].end() : field_maps[i].find(first_write_field);
+        if (first_write != field_maps[i].end()) {
+            // One Redis command keeps birth initialization and the location write ordered
+            // against another process. Existing legacy keys must not acquire a fake birth time.
+            static const std::string kCreateScript =
+                "local fresh=redis.call('EXISTS',KEYS[1])==0 "
+                "if fresh then redis.call('HSET',KEYS[1],ARGV[1],ARGV[2]) end "
+                "if #ARGV>2 then return redis.call('HSET',KEYS[1],unpack(ARGV,3)) end "
+                "return 1";
+            CmdArgs command = {"EVAL", kCreateScript, "1", keys[i], first_write->first, first_write->second};
+            for (const auto &[field_name, field_value] : field_maps[i]) {
+                if (field_name != first_write_field) {
+                    command.push_back(field_name);
+                    command.push_back(field_value);
+                }
+            }
+            out_cmds.emplace_back(std::move(command));
+            continue;
+        }
         CmdArgs hset_cmd;
         hset_cmd.reserve(field_maps[i].size() * 2 + 2);
         hset_cmd.emplace_back("HSET");
@@ -440,7 +461,8 @@ std::vector<ErrorCode> RedisClient::Update(const std::vector<std::string> &keys,
 }
 
 std::vector<ErrorCode> RedisClient::Upsert(const std::vector<std::string> &keys,
-                                           const std::vector<std::map<std::string, std::string>> &field_maps) {
+                                           const std::vector<std::map<std::string, std::string>> &field_maps,
+                                           const std::string &first_write_field) {
     if (keys.size() != field_maps.size()) {
         KVCM_REDIS_LOG_ERROR(
             "redis upsert fail, keys.size[%lu] != field_maps.size[%lu]", keys.size(), field_maps.size());
@@ -449,7 +471,7 @@ std::vector<ErrorCode> RedisClient::Upsert(const std::vector<std::string> &keys,
 
     std::vector<CmdArgs> hset_cmds;
     hset_cmds.reserve(keys.size());
-    BuildHashSetCmds(keys, field_maps, hset_cmds);
+    BuildHashSetCmds(keys, field_maps, hset_cmds, first_write_field);
 
     std::vector<ReplyUPtr> hset_replies = CommandPipeline(hset_cmds);
     if (hset_cmds.size() != hset_replies.size()) {

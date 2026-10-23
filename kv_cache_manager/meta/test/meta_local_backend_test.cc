@@ -47,6 +47,21 @@ void MetaLocalBackendTest::ConstructMetaStorageBackendConfig() {
 
 std::string MetaLocalBackendTest::ExpectedStorageType() const { return META_LOCAL_BACKEND_TYPE_STR; }
 
+TEST(LocalPropertyStoreTest, FirstSeenFitsExistingPaddingAndIsWriteOnce) {
+    if (sizeof(void *) == 8) {
+        EXPECT_EQ(24u, sizeof(LocalPropertyStore));
+    }
+    LocalPropertyStore properties;
+    constexpr uint64_t kFirstSeenMs = 1792660000123ULL;
+    properties.Merge({{PROPERTY_BLOCK_FIRST_SEEN_MS, std::to_string(kFirstSeenMs)}});
+    EXPECT_EQ(kFirstSeenMs, properties.GetFirstSeenMs());
+    properties.Merge({{PROPERTY_BLOCK_FIRST_SEEN_MS, "1792669999999"}});
+    EXPECT_EQ(kFirstSeenMs, properties.GetFirstSeenMs());
+    PropertyMap copied;
+    properties.CopySelected({PROPERTY_BLOCK_FIRST_SEEN_MS}, copied);
+    EXPECT_EQ(std::to_string(kFirstSeenMs), copied.at(PROPERTY_BLOCK_FIRST_SEEN_MS));
+}
+
 TEST_F(MetaLocalBackendTest, TestSimple) {
     ASSERT_EQ(ExpectedStorageType(), meta_storage_backend_->GetStorageType());
 
@@ -225,7 +240,7 @@ TEST_F(MetaLocalBackendTest, TestSingleLocationRmwReusesAndReleasesReadHandles) 
     std::vector<ErrorCode> write_ecs;
     CacheLocationVector replacements{replacement, new_key_location};
     backend->UpsertSingleLocationsUsingRetainedHandlesInto(
-        nullptr, {1, 3}, {&target_id, &target_id}, replacements, {0, 2}, write_ecs, scratch);
+        nullptr, {1, 3}, {&target_id, &target_id}, replacements, {0, 2}, 0, write_ecs, scratch);
     EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), write_ecs);
     EXPECT_FALSE(scratch.HasRetainedHandles());
     ASSERT_EQ(1u, scratch.retired_locations.size());
@@ -255,7 +270,7 @@ TEST_F(MetaLocalBackendTest, TestSingleLocationRmwReusesAndReleasesReadHandles) 
     ASSERT_TRUE(scratch.HasRetainedHandles());
     CacheLocationVector invalid_replacement{replacement};
     backend->UpsertSingleLocationsUsingRetainedHandlesInto(
-        nullptr, {1}, {&target_id}, invalid_replacement, {1}, write_ecs, scratch);
+        nullptr, {1}, {&target_id}, invalid_replacement, {1}, 0, write_ecs, scratch);
     EXPECT_EQ((std::vector<ErrorCode>{EC_BADARGS}), write_ecs);
     EXPECT_FALSE(scratch.HasRetainedHandles());
 }

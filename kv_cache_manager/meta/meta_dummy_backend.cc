@@ -380,6 +380,28 @@ std::vector<ErrorCode> MetaDummyBackend::GetProperties(RequestContext * /*reques
     return results;
 }
 
+std::vector<ErrorCode> MetaDummyBackend::GetPropertiesForMaintenance(RequestContext * /*request_context*/,
+                                                                     const KeyTypeVec &keys,
+                                                                     const std::vector<std::string> &field_names,
+                                                                     PropertyMapVector &out_properties) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_properties.clear();
+    out_properties.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!table_.FindAndApply(keys[i], [&](const DummyItem &item) {
+                for (const auto &field_name : field_names) {
+                    auto it = item.properties.find(field_name);
+                    if (it != item.properties.end()) {
+                        out_properties[i][field_name] = it->second;
+                    }
+                }
+            })) {
+            results[i] = EC_NOENT;
+        }
+    }
+    return results;
+}
+
 // ---------------------------------------------------------------------------
 // Key-level operations
 // ---------------------------------------------------------------------------

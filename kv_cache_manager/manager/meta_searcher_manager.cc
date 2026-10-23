@@ -62,7 +62,7 @@ std::shared_ptr<MetaSearcher> MetaSearcherManager::TryCreateMetaSearcher(Request
             return meta_searcher;
         }
         ec = meta_indexer_manager_->CreateMetaIndexer(
-            instance_id, cache_config->meta_indexer_config(), group_boundaries);
+            instance_id, cache_config->meta_indexer_config(), group_boundaries, instance_group);
         if (ec == ErrorCode::EC_OK) {
             if (auto pair = meta_searcher_map_.emplace(
                     instance_id,

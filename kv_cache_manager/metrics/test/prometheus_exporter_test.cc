@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/metrics/block_key_lifetime_histogram.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
@@ -23,6 +24,21 @@ public:
 TEST_F(PrometheusExporterTest, EmptyRegistry) {
     std::string output = PrometheusExporter::Expose(*registry_);
     ASSERT_TRUE(output.empty());
+}
+
+TEST_F(PrometheusExporterTest, BlockKeyLifetimeHistogramUsesSecondsAndFiniteLabels) {
+    BlockKeyLifetimeHistogram histogram;
+    ASSERT_TRUE(histogram.Init(registry_, {1.0, 5.0}, "group", "instance"));
+    histogram.ObserveMs(2500);
+    const std::string output = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(output.find("# TYPE kvcm_block_key_lifetime_seconds histogram"), std::string::npos);
+    EXPECT_NE(output.find("kvcm_block_key_lifetime_seconds_bucket{instance_group=\"group\",instance_id=\"instance\",le=\"5\"} 1"),
+              std::string::npos);
+    EXPECT_NE(output.find("kvcm_block_key_lifetime_seconds_sum{instance_group=\"group\",instance_id=\"instance\"} 2.5"),
+              std::string::npos);
+    EXPECT_NE(output.find("kvcm_block_key_lifetime_seconds_count{instance_group=\"group\",instance_id=\"instance\"} 1"),
+              std::string::npos);
+    EXPECT_EQ(output.find("block_key=\""), std::string::npos);
 }
 
 TEST_F(PrometheusExporterTest, SingleCounter) {

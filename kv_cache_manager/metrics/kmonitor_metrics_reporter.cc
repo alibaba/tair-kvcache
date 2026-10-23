@@ -198,6 +198,10 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_max_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_avg_us);
 
+    DECLARE_METRICS(block_key_lifetime_seconds, bucket);
+    DECLARE_METRICS(block_key_lifetime_seconds, sum);
+    DECLARE_METRICS(block_key_lifetime_seconds, count);
+
     // cache garbage collector metrics
     DECLARE_METRICS(cache_gc, scan_round_count);
     DECLARE_METRICS(cache_gc, scan_key_count);
@@ -510,6 +514,10 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_min_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_max_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_avg_us);
+
+    REGISTER_GAUGE_METRIC(block_key_lifetime_seconds, bucket);
+    REGISTER_GAUGE_METRIC(block_key_lifetime_seconds, sum);
+    REGISTER_GAUGE_METRIC(block_key_lifetime_seconds, count);
 
     // Cache GC counters are registered as gauges, matching the existing
     // cumulative counter convention used for CacheReclaimer. Tagged series
@@ -1066,11 +1074,19 @@ void KmonitorMetricsReporter::ReportInterval() {
                 } else {
                     sample = std::get<GaugeValue>(value->value).load(std::memory_order_relaxed);
                 }
+                if (name == "block_key_lifetime_seconds_sum") {
+                    sample /= 1e6;
+                }
                 const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(base_tags);
                 metric->Report(&tags, sample);
             }
         };
 
+        report_registry_metric(
+            ctx_->block_key_lifetime_seconds_bucket_metrics.get(), "block_key_lifetime_seconds_bucket");
+        report_registry_metric(ctx_->block_key_lifetime_seconds_sum_metrics.get(), "block_key_lifetime_seconds_sum");
+        report_registry_metric(
+            ctx_->block_key_lifetime_seconds_count_metrics.get(), "block_key_lifetime_seconds_count");
         report_registry_metric(ctx_->cache_gc_scan_round_count_metrics.get(), "cache_gc.scan_round_count");
         report_registry_metric(ctx_->cache_gc_scan_key_count_metrics.get(), "cache_gc.scan_key_count");
         report_registry_metric(ctx_->cache_gc_candidate_count_metrics.get(), "cache_gc.candidate_count");

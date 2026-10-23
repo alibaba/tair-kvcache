@@ -24,6 +24,8 @@ static const std::string PROPERTY_TTL = "BP#ttl";
 static const std::string PROPERTY_HIT_COUNT = "BP#hit_count";
 static const std::string PROPERTY_LRU_TIME = "BP#lru_time";
 static const std::string PROPERTY_PREV_BLOCK_KEY = "BP#prev_key";
+// Unix milliseconds when this block key was first created. Short Redis field to limit per-key cost.
+static const std::string PROPERTY_BLOCK_FIRST_SEEN_MS = "BP#t0";
 
 // Instance-level metadata (under "metadata" key, not per-block hashes).
 static const std::string METADATA_PROPERTY_KEY_COUNT = "__key_count__";

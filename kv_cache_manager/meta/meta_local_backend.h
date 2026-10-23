@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -68,6 +69,8 @@ public:
     void CopySelected(const std::vector<std::string> &field_names, PropertyMap &out) const;
     void CopyAll(PropertyMap &out) const;
     size_t EstimateUsage() const;
+    uint64_t GetFirstSeenMs() const noexcept;
+    bool SetFirstSeenMs(uint64_t value) noexcept;
 
 private:
     enum class PrevKeyState : uint8_t {
@@ -78,11 +81,13 @@ private:
 
     // Both helpers return the usage delta they caused so Merge can accumulate
     // it locally without a full before/after EstimateUsage() rescan.
-    ssize_t ErasePrevKeyFallback();
+    ssize_t EraseFallbackProperty(const std::string &name);
     ssize_t UpsertExtraProperty(const std::string &name, const std::string &value);
     PropertyMap &EnsureExtraProperties();
 
     PrevKeyState prev_key_state_{PrevKeyState::kAbsent};
+    // Six bytes fit in the existing seven-byte gap before the aligned prev_key_.
+    std::array<uint8_t, 6> first_seen_ms_{};
     KeyType prev_key_{0};
     std::unique_ptr<PropertyMap> extra_properties_;
 };
@@ -117,9 +122,12 @@ struct MetaMemCacheItem {
         item->properties_.Merge(properties);
         return item;
     }
-    static MetaMemCacheItem *CreateSingleLocation(const LocationId &location_id, CacheLocationConstPtr location) {
+    static MetaMemCacheItem *CreateSingleLocation(const LocationId &location_id,
+                                                  CacheLocationConstPtr location,
+                                                  uint64_t first_seen_ms = 0) {
         auto *item = new MetaMemCacheItem();
         item->locations_.Upsert(location_id, std::move(location));
+        item->properties_.SetFirstSeenMs(first_seen_ms);
         return item;
     }
     static void Deleter(void *value, MemoryAllocator * /*allocator*/) { delete static_cast<MetaMemCacheItem *>(value); }
@@ -198,6 +206,7 @@ public:
                                                        const LocationIdRefVector &location_ids,
                                                        CacheLocationVector &locations,
                                                        const std::vector<size_t> &read_indices,
+                                                       uint64_t first_seen_ms,
                                                        std::vector<ErrorCode> &out_results,
                                                        SingleLocationRmwScratch &scratch) noexcept;
     std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override;
@@ -298,6 +307,10 @@ public:
                                          const KeyTypeVec &keys,
                                          const std::vector<std::string> &field_names,
                                          PropertyMapVector &out_properties) noexcept override;
+    std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *request_context,
+                                                       const KeyTypeVec &keys,
+                                                       const std::vector<std::string> &field_names,
+                                                       PropertyMapVector &out_properties) noexcept override;
     std::vector<ErrorCode> Exists(RequestContext *request_context,
                                   const KeyTypeVec &keys,
                                   std::vector<bool> &out_is_exist_vec) noexcept override;
@@ -370,7 +383,8 @@ private:
     ErrorCode UpdateInPlace(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode CreateAndInsertSingleLocation(std::string_view key_sv,
                                             const LocationId &location_id,
-                                            CacheLocationConstPtr location);
+                                            CacheLocationConstPtr location,
+                                            uint64_t first_seen_ms = 0);
     ErrorCode
     UpsertSingleLocationForOneKey(KeyType key, const LocationId &location_id, const CacheLocationConstPtr &location);
     void GetSingleLocationsWithKeyStatusIntoImpl(RequestContext *request_context,

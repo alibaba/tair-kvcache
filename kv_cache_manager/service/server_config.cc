@@ -45,6 +45,11 @@ const std::vector<double> &ServerConfig::GetDefaultRevisitIntervalBuckets() {
     return kDefaults;
 }
 
+const std::vector<double> &ServerConfig::GetDefaultBlockKeyLifetimeBuckets() {
+    static const std::vector<double> kDefaults = {1, 5, 30, 60, 300, 900, 3600, 21600, 86400, 604800};
+    return kDefaults;
+}
+
 // clang-format off
 std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSettingsMap = {
     {"kvcm.registry_storage.uri",
@@ -314,6 +319,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->revisit_interval_buckets_ = value;
          return true;
+     }},
+    {"kvcm.metrics.block_key_lifetime_buckets",
+     [](const std::string &value, ServerConfig *config) {
+         config->block_key_lifetime_buckets_ = value;
+         return true;
      }}};
 // clang-format on
 
@@ -526,6 +536,12 @@ bool ServerConfig::Check() {
                 "Unsupported kvcm.metrics.reporter_type [%s], supported types: %s\n",
                 metrics_reporter_type_.c_str(),
                 MetricsReporterFactory::SupportedTypes());
+        return false;
+    }
+
+    if (!block_key_lifetime_buckets_.empty() &&
+        StringUtil::ParseBucketBoundaries(block_key_lifetime_buckets_).empty()) {
+        fprintf(stderr, "Invalid block_key_lifetime_buckets: must be positive numbers in strictly ascending order\n");
         return false;
     }
 
