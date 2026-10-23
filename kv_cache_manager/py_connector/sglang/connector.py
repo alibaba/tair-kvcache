@@ -567,6 +567,9 @@ class HiCacheKVCM(HiCacheStorage):
     # Read by the write paths before the client exists, hence the default; a
     # real backend sets it from the storage config in __init__.
     is_mla_model: bool = False
+    # The deployment's pipeline width, read in __init__; every servable
+    # deployment is one stage (_init_kvcm_client reports it).
+    pp_size: int = 1
     # Whether a round of _ensure_client_for_write() has already seen every
     # rank of the TP group ready (see that method).
     _tp_init_agreed: bool = False
@@ -595,6 +598,20 @@ class HiCacheKVCM(HiCacheStorage):
         # deployment
         self.instance_group = self.extra_config["instance_group"]
         self.instance_id = self.extra_config["instance_id"]
+
+        pp_rank = self.storage_config.pp_rank
+        self.pp_size = self.storage_config.pp_size
+        # Context parallelism arrived after this connector's oldest supported
+        # release (sglang v0.5.11), hence the defaults.
+        attn_cp_rank = getattr(self.storage_config, "attn_cp_rank", 0)
+        attn_cp_size = getattr(self.storage_config, "attn_cp_size", 1)
+        if self.pp_size != 1 or attn_cp_size != 1:
+            raise ValueError(
+                f"pipeline and context parallelism are not supported: location "
+                f"specs are named by TP rank and carry no PP/CP shard; got "
+                f"pp_rank={pp_rank}/{self.pp_size}, "
+                f"attn_cp_rank={attn_cp_rank}/{attn_cp_size}"
+            )
 
         # Also read in _init_kvcm_client, but needed earlier: whether the write
         # paths run TP collectives is decided on the first write call, which is
@@ -646,17 +663,20 @@ class HiCacheKVCM(HiCacheStorage):
     def _init_parallel_context(self) -> None:
         """Resolve the TP group and create the connector's own gloo group.
 
-        COLLECTIVE: ``torch.distributed.new_group`` requires every rank of the
-        default group to call it in the same order, so this stays in the v1
-        hook -- the attach path, where all ranks meet in lockstep. Everything
-        else is deferred to the first storage call (``_ensure_client``).
+        COLLECTIVE: every member of the group has to reach ``new_group``, and
+        the v1 hook -- the attach path -- is where they all do.  With
+        ``use_local_synchronization`` only those members take part, so the
+        groups of the other attention-DP replicas never wait for each other.
+        Everything else is deferred to the first storage call
+        (``_ensure_client``).
         """
-        # parallelism
+        # parallelism.  ``dp_size`` in the deployment record stays 1: the record
+        # describes the specs every attention-DP replica shares, and a
+        # per-replica width would make the frozen identity depend on how many
+        # replicas run.
         self.tp_rank = self.storage_config.tp_rank
         self.tp_size = self.storage_config.tp_size
-        # TODO: pp
         self.dp_size = 1
-        self.pp_size = 1
 
         tp_group = (
             get_attn_tp_group().cpu_group
@@ -667,7 +687,15 @@ class HiCacheKVCM(HiCacheStorage):
         if self.tp_world_size > 1:
             group_ranks = torch.distributed.get_process_group_ranks(tp_group)
             self.storage_tp_group = torch.distributed.new_group(
-                group_ranks, backend="gloo"
+                group_ranks, backend="gloo", use_local_synchronization=True
+            )
+            # The write broadcasts address ``group_src=0``: global rank 0 need
+            # not be a member, while the group's rank 0 is the rank the write
+            # paths call ``tp_rank == 0`` -- asserted here.
+            group_rank = torch.distributed.get_rank(group=self.storage_tp_group)
+            assert group_rank == self.tp_rank, (
+                f"this rank is group rank {group_rank} of {group_ranks} but the "
+                f"storage config reports tp_rank={self.tp_rank}"
             )
 
     def _raise_if_closed(self) -> None:
@@ -2008,7 +2036,7 @@ class HiCacheKVCM(HiCacheStorage):
             if self.tp_world_size > 1 and not self.is_mla_model:
                 torch.distributed.broadcast_object_list(
                     [result, len_prefix, len_new, local_hash],
-                    src=0,
+                    group_src=0,
                     group=self.storage_tp_group,
                 )
         elif self.is_mla_model:
@@ -2020,7 +2048,7 @@ class HiCacheKVCM(HiCacheStorage):
         else:
             recv: List[Any] = [None, None, None, None]
             torch.distributed.broadcast_object_list(
-                recv, src=0, group=self.storage_tp_group
+                recv, group_src=0, group=self.storage_tp_group
             )
             result, len_prefix, len_new, rank0_hash = recv
 
@@ -2372,12 +2400,14 @@ class HiCacheKVCM(HiCacheStorage):
                             write_result = None
                     if shared and self.tp_world_size > 1:
                         torch.distributed.broadcast_object_list(
-                            [write_result], src=0, group=self.storage_tp_group
+                            [write_result],
+                            group_src=0,
+                            group=self.storage_tp_group,
                         )
                 elif shared and self.tp_world_size > 1:
                     recv: List[Any] = [None]
                     torch.distributed.broadcast_object_list(
-                        recv, src=0, group=self.storage_tp_group
+                        recv, group_src=0, group=self.storage_tp_group
                     )
                     write_result = recv[0]
                 else:
