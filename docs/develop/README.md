@@ -66,6 +66,9 @@ bazelisk info --announce_rc repository_cache
 - 依赖Redis的测试：
   - 需要本地启动一个Redis或Valkey。
   - ```bazelisk test //kv_cache_manager/common/test:redis_client_real_service_test //kv_cache_manager/meta/test:meta_redis_backend_real_service_test //kv_cache_manager/meta/test:meta_storage_backend_manager_real_redis_test //kv_cache_manager/meta/test:meta_indexer_redis_test //kv_cache_manager/manager/test:MetaSearcherRedisTest //kv_cache_manager/config/test:registry_manager_redis_backend_test --test_tag_filters=redis```
+  - 选主故障注入集成测试自行启动独立 Valkey/Redis，要求 PATH 中有 `valkey-server` / `redis-server`，或设置 `--test_env=REDIS_SERVER_BIN=/path/to/server`。
+    - 运行：```bazelisk test //integration_test/redis_coordination:redis_leader_recovery_test```。覆盖恢复期间外部删锁、反复删锁后恢复、连接中断、续约响应丢失/迟到和 Redis 重启，验证 Meta/Admin 门禁以及双节点切主。
+    - 只跑外部删锁用例：```bazelisk test //integration_test/redis_coordination:redis_leader_recovery_test --test_arg=-k --test_arg=external_lock_deletion```。确定性恢复窗口由该目标自动编译并启动 C++ 测试驱动，无需单独配置共享 Redis。
 - 启用ASAN：上述命令后添加 ```--config=debug --config=asan --test_env ASAN_OPTIONS=detect_odr_violation=0```
 ### 测试资源清理
 
