@@ -67,6 +67,9 @@ bazelisk info --announce_rc repository_cache
   - 需要本地启动一个Redis或Valkey。
   - ```bazelisk test //kv_cache_manager/common/test:redis_client_real_service_test //kv_cache_manager/meta/test:meta_redis_backend_real_service_test //kv_cache_manager/meta/test:meta_storage_backend_manager_real_redis_test //kv_cache_manager/meta/test:meta_indexer_redis_test //kv_cache_manager/manager/test:MetaSearcherRedisTest //kv_cache_manager/config/test:registry_manager_redis_backend_test --test_tag_filters=redis```
 - 启用ASAN：上述命令后添加 ```--config=debug --config=asan --test_env ASAN_OPTIONS=detect_odr_violation=0```
+- 覆盖率：
+  - ```tools/coverage/run_coverage.sh --base-ref origin/main``` 默认运行单元测试和集成测试。需安装 ```genhtml```；没有时可加 ```--no-html```。
+  - 查看 ```coverage/coverage-summary.md``` 中的全量/增量结果，或打开 ```coverage/html/index.html``` 查看逐文件、逐行和分支覆盖率。CI 会在 PR 中更新摘要并上传完整报告。
 ### 测试资源清理
 
 测试结束后会自动清理资源。测试工作目录位于 bazel runfiles 目录中，不会污染源代码目录。如果测试异常退出，可能需要手动清理：
@@ -180,4 +183,4 @@ githooks中已经添加了C++等语言的格式化脚本，请确保开发环境
 发起和参与 PR 时应遵守 [Pull Request 协作指南](pull_request_guidelines.md)，主动控制评审负担并为其他参与者准备所需的信息。
 
 ## CI
-可参考```.github/workflows```目录下的配置。```test-opensrc``` 在一个 ```normal_test``` job 中运行普通单元测试和集成测试（包含默认配置下的客户端测试目标），ASAN 测试使用独立 job。
+可参考```.github/workflows```目录下的配置。```test-opensrc``` 在一个 ```normal_test``` job 中运行普通单元测试和集成测试（包含默认配置下的客户端测试目标），ASAN 测试使用独立 job。```coverage``` 负责全量 LCOV、增量覆盖率和 HTML 报告。
