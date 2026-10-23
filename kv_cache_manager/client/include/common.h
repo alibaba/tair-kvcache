@@ -63,6 +63,9 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     // Internal parallel task was stopped before it started backend I/O.
     // SdkWrapper consumes this state; client APIs must never return it.
     ER_TASK_CANCELLED = 118,
+    // Failure with proof that the batch no longer accesses caller buffers.
+    ER_SDK_TIMEOUT_BUFFER_SAFE = 119,
+    ER_SDK_ERROR_BUFFER_SAFE = 120,
 };
 
 enum class QueryType : int {
