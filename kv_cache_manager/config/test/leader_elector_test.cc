@@ -333,8 +333,9 @@ TEST_F(LeaderElectorTest, WorkLoopMethod) {
 
 // 测试租约过期检测
 TEST_F(LeaderElectorTest, LeaseExpiration) {
-    // 指定租约时间
-    auto elector = std::make_shared<LeaderElector>(coordination_backend_, lock_key_, lock_value_, 50, 10);
+    // Keep synchronous acquisitions valid even when a busy runner pauses this
+    // thread. Advance the lease check explicitly instead of sleeping past TTL.
+    auto elector = std::make_shared<LeaderElector>(coordination_backend_, lock_key_, lock_value_, 60000, 10);
 
     std::atomic<bool> become_leader_called{false};
     std::atomic<bool> no_longer_leader_called{false};
@@ -348,14 +349,21 @@ TEST_F(LeaderElectorTest, LeaseExpiration) {
     ASSERT_TRUE(elector->IsLeader());
     ASSERT_TRUE(become_leader_called);
 
-    // 模拟WorkLoop长时间阻塞,租约应该正常过期
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    elector->CheckLeaseTimeout();
+    const int64_t expiration = elector->GetLeaseExpirationTime();
+    const int64_t check_deadline = expiration - elector->loop_interval_us_;
+    ASSERT_TRUE(elector->DoCheckLeaseTimeout(check_deadline));
+    ASSERT_FALSE(no_longer_leader_called);
+
+    // The local lease expires after the early-check margin even if the lock
+    // loop has not run again.
+    ASSERT_FALSE(elector->DoCheckLeaseTimeout(check_deadline + 1));
     elector->ProcessStateTransitionsForTest();
     ASSERT_FALSE(elector->IsLeader());
     ASSERT_TRUE(no_longer_leader_called);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // The backend uses the real clock, so model its TTL expiry by releasing
+    // the old key before the next acquisition.
+    ASSERT_EQ(EC_OK, coordination_backend_->Unlock(lock_key_, lock_value_));
     // WorkLoop应该能重新获得领导者身份
     become_leader_called = false;
     elector->WorkLoop();

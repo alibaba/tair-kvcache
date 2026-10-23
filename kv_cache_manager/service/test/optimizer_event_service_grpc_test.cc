@@ -125,7 +125,7 @@ protected:
 
     void SetServingState(RoleState role_state, bool recover_complete) {
         leader_elector_->role_state_ = role_state;
-        leader_elector_->is_transitioning_ = false;
+        leader_elector_->lock_acquired_ = role_state == RoleState::LEADER;
         registry_manager_->recover_complete_ = recover_complete;
         if (role_state == RoleState::LEADER && recover_complete) {
             service_->EnableSubscriptions();
@@ -175,6 +175,31 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsUnavailableWhileLeaderIsRecover
     EXPECT_EQ(proto::optimizer::SERVICE_NOT_READY, configuration_response.header().status().code());
 
     grpc::ClientContext subscription_context;
+    proto::optimizer::OptimizerEventSubscriptionRequest subscription_request;
+    auto reader = stub_->SubscribeEvents(&subscription_context, subscription_request);
+    proto::optimizer::TraceQueryRequest event;
+    EXPECT_FALSE(reader->Read(&event));
+    EXPECT_EQ(grpc::StatusCode::UNAVAILABLE, reader->Finish().error_code());
+    EXPECT_EQ(0u, sink_->SubscriberCount());
+}
+
+TEST_F(OptimizerEventServiceGRpcTest, TestLeaseLossRejectsNewRequestsBeforeCleanupChangesRole) {
+    // The role and subscription flag still describe the old serving state.
+    // Losing the lease must make it unavailable before cleanup starts.
+    leader_elector_->lock_acquired_ = false;
+    ASSERT_EQ(RoleState::LEADER, leader_elector_->GetRoleState());
+    ASSERT_TRUE(sink_->accepting_subscriptions());
+    ASSERT_FALSE(leader_elector_->IsStableState());
+
+    grpc::ClientContext configuration_context;
+    configuration_context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+    proto::optimizer::KvcmConfigurationRequest configuration_request;
+    proto::optimizer::KvcmConfigurationResponse configuration_response;
+    ASSERT_TRUE(stub_->GetConfiguration(&configuration_context, configuration_request, &configuration_response).ok());
+    EXPECT_EQ(proto::optimizer::SERVICE_NOT_READY, configuration_response.header().status().code());
+
+    grpc::ClientContext subscription_context;
+    subscription_context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
     proto::optimizer::OptimizerEventSubscriptionRequest subscription_request;
     auto reader = stub_->SubscribeEvents(&subscription_context, subscription_request);
     proto::optimizer::TraceQueryRequest event;
