@@ -34,6 +34,20 @@ cc_test(
 )
 
 cc_test(
+    name = "DebugServiceImplTest",
+    srcs = ["debug_service_impl_test.cc"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/service:debug_service_impl",
+        "@cpp_stub",
+    ],
+)
+
+cc_test(
     name = "CommandLineTest",
     srcs = [
         "command_line_test.cc",
