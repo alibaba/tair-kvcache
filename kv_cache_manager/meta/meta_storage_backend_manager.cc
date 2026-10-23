@@ -15,6 +15,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/scoped_jemalloc_arena_rotation.h"
 #include "kv_cache_manager/common/standard_uri.h"
+#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
@@ -29,6 +30,19 @@ constexpr int64_t kRecoverScanBatchSize = 1000;
 constexpr int kRecoverMaxConsecutiveFailures = 3;
 constexpr std::string_view kCacheScanCursorPrefix = "c:";
 constexpr std::string_view kPersistentScanCursorPrefix = "p:";
+
+uint64_t ReadFirstSeenMs(const PropertyMap &properties) {
+    const auto it = properties.find(PROPERTY_BLOCK_FIRST_SEEN_MS);
+    if (it == properties.end()) {
+        return 0;
+    }
+    int64_t value = 0;
+    if (!StringUtil::StrToInt64(it->second.c_str(), value) || value <= 0 ||
+        static_cast<uint64_t>(value) >= (uint64_t{1} << 48)) {
+        return 0;
+    }
+    return static_cast<uint64_t>(value);
+}
 
 // Collects keys where results[i] == EC_NOENT. Returns {missing_keys, missing_indices}.
 std::pair<KeyTypeVec, std::vector<size_t>> CollectMissingKeys(const KeyVector &keys,
@@ -707,6 +721,7 @@ void MetaStorageBackendManager::UpsertSingleLocationsUsingRetainedHandlesInto(
     const LocationIdRefVector &location_ids,
     CacheLocationVector &locations,
     const std::vector<size_t> &read_indices,
+    uint64_t first_seen_ms,
     std::vector<ErrorCode> &out_results,
     SingleLocationRmwScratch &scratch) noexcept {
     if (!SupportsSingleLocationRmw()) {
@@ -717,11 +732,22 @@ void MetaStorageBackendManager::UpsertSingleLocationsUsingRetainedHandlesInto(
     }
     static_cast<MetaLocalBackend *>(persistent_backend_.get())
         ->UpsertSingleLocationsUsingRetainedHandlesInto(
-            request_context, keys, location_ids, locations, read_indices, out_results, scratch);
+            request_context, keys, location_ids, locations, read_indices, first_seen_ms, out_results, scratch);
 }
 
-std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request_context,
-                                                         const KeyVector &keys) noexcept {
+std::vector<ErrorCode> MetaStorageBackendManager::Delete(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    std::vector<ReclaimedKeyBirth> *out_reclaimed_births) noexcept {
+    if (out_reclaimed_births) {
+        out_reclaimed_births->clear();
+    }
+    PropertyMapVector birth_properties;
+    std::vector<ErrorCode> birth_ecs;
+    if (out_reclaimed_births) {
+        birth_ecs = GetPropertiesForMaintenance(
+            request_context, keys, {PROPERTY_BLOCK_FIRST_SEEN_MS}, birth_properties);
+    }
     const WriteRoute route =
         GetWriteRoute(memory_primary_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning);
     const int64_t cache_begin = route.local_primary ? TimestampUtil::GetCurrentTimeUs() : 0;
@@ -744,7 +770,22 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
             }
         }
     }
+    const auto record_births = [&](const std::vector<ErrorCode> &results) {
+        if (!out_reclaimed_births || birth_ecs.size() != keys.size() || birth_properties.size() != keys.size()) {
+            return;
+        }
+        std::unordered_set<KeyType> seen;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (results[i] == EC_OK && birth_ecs[i] == EC_OK && seen.insert(keys[i]).second) {
+                const uint64_t birth = ReadFirstSeenMs(birth_properties[i]);
+                if (birth != 0) {
+                    out_reclaimed_births->push_back({keys[i], birth});
+                }
+            }
+        }
+    };
     if (!route.secondary) {
+        record_births(primary_results);
         return primary_results;
     }
     const int64_t secondary_begin = route.local_primary ? 0 : TimestampUtil::GetCurrentTimeUs();
@@ -755,20 +796,26 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
             mc, meta_indexer, cache_backend_delete_time_us, TimestampUtil::GetCurrentTimeUs() - secondary_begin);
     }
     if (route.local_primary) {
+        record_births(primary_results);
         return primary_results;
     }
     if (secondary_results.size() != keys.size()) {
         KVCM_LOG_ERROR("secondary Delete results[%lu] mismatch keys[%lu]", secondary_results.size(), keys.size());
         return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
+    record_births(secondary_results);
     return secondary_results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request_context,
                                                          const KeyVector &keys,
                                                          const LocationIdsPerKey &location_ids,
-                                                         int32_t &out_reclaimed_count) noexcept {
+                                                         int32_t &out_reclaimed_count,
+                                                         std::vector<ReclaimedKeyBirth> *out_reclaimed_births) noexcept {
     out_reclaimed_count = 0;
+    if (out_reclaimed_births) {
+        out_reclaimed_births->clear();
+    }
     if (keys.empty()) {
         return {};
     }
@@ -815,7 +862,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
         return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
 
-    out_reclaimed_count = MaybeReclaimEmptyKeys(request_context, keys, results);
+    out_reclaimed_count = MaybeReclaimEmptyKeys(request_context, keys, results, out_reclaimed_births);
     return route.local_primary || !route.secondary ? std::move(primary_results) : std::move(secondary_results);
 }
 
@@ -868,11 +915,16 @@ ErrorCode MetaStorageBackendManager::TrimPersistentOrphans(RequestContext *reque
     return ec;
 }
 
-std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(RequestContext *request_context,
-                                                                                const KeyVector &keys,
-                                                                                const LocationIdsPerKey &location_ids,
-                                                                                int32_t &out_reclaimed_count) noexcept {
+std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const LocationIdsPerKey &location_ids,
+    int32_t &out_reclaimed_count,
+    std::vector<ReclaimedKeyBirth> *out_reclaimed_births) noexcept {
     out_reclaimed_count = 0;
+    if (out_reclaimed_births) {
+        out_reclaimed_births->clear();
+    }
     if (keys.empty()) {
         return {};
     }
@@ -1008,6 +1060,12 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
             whole_keys.push_back(keys[index]);
         }
 
+        PropertyMapVector birth_properties;
+        std::vector<ErrorCode> birth_ecs;
+        if (out_reclaimed_births) {
+            birth_ecs = GetPropertiesForMaintenance(
+                request_context, whole_keys, {PROPERTY_BLOCK_FIRST_SEEN_MS}, birth_properties);
+        }
         std::vector<ErrorCode> primary_results = route.primary.Delete(request_context, whole_keys);
         if (primary_results.size() != whole_key_indexes.size()) {
             KVCM_LOG_ERROR("primary maintenance whole-key delete results[%lu] mismatch keys[%lu]",
@@ -1051,16 +1109,25 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
             // The preceding expected-value read admitted at least one target.
             // Count a converged whole-key action once even when one layer was
             // already missing due to an earlier partial attempt.
-            reclaimed_keys.insert(keys[original_index]);
+            if (reclaimed_keys.insert(keys[original_index]).second && out_reclaimed_births &&
+                birth_ecs.size() == whole_keys.size() && birth_properties.size() == whole_keys.size() &&
+                birth_ecs[i] == EC_OK) {
+                const uint64_t birth = ReadFirstSeenMs(birth_properties[i]);
+                if (birth != 0) {
+                    out_reclaimed_births->push_back({keys[original_index], birth});
+                }
+            }
         }
         out_reclaimed_count = static_cast<int32_t>(reclaimed_keys.size());
     }
     return results;
 }
 
-int32_t MetaStorageBackendManager::MaybeReclaimEmptyKeys(RequestContext *request_context,
-                                                         const KeyVector &keys,
-                                                         const std::vector<ErrorCode> &delete_results) noexcept {
+int32_t MetaStorageBackendManager::MaybeReclaimEmptyKeys(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const std::vector<ErrorCode> &delete_results,
+    std::vector<ReclaimedKeyBirth> *out_reclaimed_births) noexcept {
     if (delete_results.size() != keys.size()) {
         KVCM_LOG_ERROR(
             "delete results[%lu] mismatch keys[%lu], skip empty-key reclamation", delete_results.size(), keys.size());
@@ -1108,6 +1175,12 @@ int32_t MetaStorageBackendManager::MaybeReclaimEmptyKeys(RequestContext *request
         return 0;
     }
 
+    PropertyMapVector birth_properties;
+    std::vector<ErrorCode> birth_ecs;
+    if (out_reclaimed_births) {
+        birth_ecs = GetPropertiesForMaintenance(
+            request_context, reclaimed_keys, {PROPERTY_BLOCK_FIRST_SEEN_MS}, birth_properties);
+    }
     std::vector<ErrorCode> whole_ecs = Delete(request_context, reclaimed_keys);
     if (whole_ecs.size() != reclaimed_keys.size()) {
         KVCM_LOG_ERROR("whole-key delete results[%lu] mismatch reclaimed keys[%lu], "
@@ -1117,9 +1190,16 @@ int32_t MetaStorageBackendManager::MaybeReclaimEmptyKeys(RequestContext *request
         return 0;
     }
     int32_t reclaimed = 0;
-    for (const ErrorCode ec : whole_ecs) {
-        if (ec == EC_OK || ec == EC_NOENT) {
+    for (size_t i = 0; i < whole_ecs.size(); ++i) {
+        if (whole_ecs[i] == EC_OK || whole_ecs[i] == EC_NOENT) {
             ++reclaimed;
+            if (out_reclaimed_births && birth_ecs.size() == reclaimed_keys.size() &&
+                birth_properties.size() == reclaimed_keys.size() && birth_ecs[i] == EC_OK) {
+                const uint64_t birth = ReadFirstSeenMs(birth_properties[i]);
+                if (birth != 0) {
+                    out_reclaimed_births->push_back({reclaimed_keys[i], birth});
+                }
+            }
         }
     }
     return reclaimed;
@@ -1917,6 +1997,17 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationMapsForMaintenance(
                               [&](const auto &backend, const auto &batch, auto &out) {
                                   return backend->GetLocationMapsForMaintenance(request_context, batch, out);
                               });
+}
+
+std::vector<ErrorCode> MetaStorageBackendManager::GetPropertiesForMaintenance(
+    RequestContext *request_context,
+    const KeyVector &keys,
+    const std::vector<std::string> &field_names,
+    PropertyMapVector &out_properties) noexcept {
+    MetaStorageBackend *source = memory_primary_ && GetRecoverState() == RecoverState::kRunning
+                                     ? cache_backend_.get()
+                                     : persistent_backend_.get();
+    return source->GetPropertiesForMaintenance(request_context, keys, field_names, out_properties);
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::GetProperties(RequestContext *request_context,

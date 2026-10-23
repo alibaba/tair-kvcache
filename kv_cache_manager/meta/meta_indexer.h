@@ -18,6 +18,7 @@
 #include "kv_cache_manager/meta/query_executor.h"
 #include "kv_cache_manager/meta/storage_usage_data.h"
 #include "kv_cache_manager/meta/types.h"
+#include "kv_cache_manager/metrics/block_key_lifetime_histogram.h"
 #include "kv_cache_manager/metrics/revisit_interval_histogram.h"
 
 namespace kv_cache_manager {
@@ -90,6 +91,12 @@ public:
 
     // Set revisit interval histogram for tracking cache access patterns.
     void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram);
+    void SetBlockKeyLifetimeHistogram(std::shared_ptr<BlockKeyLifetimeHistogram> histogram) {
+        block_key_lifetime_histogram_ = std::move(histogram);
+    }
+    void DisableBlockKeyLifetimeObservation() noexcept {
+        block_key_lifetime_enabled_.store(false, std::memory_order_relaxed);
+    }
     // Injected once by MetaIndexerManager before Init/traffic begins.
     void SetQueryExecutor(std::shared_ptr<QueryExecutor> executor) { query_executor_ = std::move(executor); }
 
@@ -284,6 +291,7 @@ private:
                                                  RmwStats &stats,
                                                  Result &result,
                                                  bool maintenance_no_touch = false) noexcept;
+    void ObserveReclaimedKeyBirths(const std::vector<MetaStorageBackendManager::ReclaimedKeyBirth> &births) const noexcept;
     void
     EmitRmwMetrics(MetricsCollector *metrics_collector, const RmwStats &stats, size_t total_key_count) const noexcept;
 
@@ -291,6 +299,8 @@ private:
     std::vector<std::unique_ptr<std::mutex>> mutex_shards_;
     std::unique_ptr<MetaStorageBackendManager> backend_manager_;
     std::shared_ptr<QueryExecutor> query_executor_;
+    std::shared_ptr<BlockKeyLifetimeHistogram> block_key_lifetime_histogram_;
+    std::atomic<bool> block_key_lifetime_enabled_{true};
 
     std::atomic<int64_t> key_count_ = {0};
     int64_t last_persist_metadata_time_ = 0;

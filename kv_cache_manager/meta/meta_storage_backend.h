@@ -424,6 +424,15 @@ public:
                                                  const std::vector<std::string> &field_names,
                                                  PropertyMapVector &out_properties) noexcept = 0;
 
+    // Read properties without updating LRU/revisit state. Redis uses the ordinary read;
+    // local and dummy backends override this to avoid treating deletion as an access.
+    virtual std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *request_context,
+                                                               const KeyTypeVec &keys,
+                                                               const std::vector<std::string> &field_names,
+                                                               PropertyMapVector &out_properties) noexcept {
+        return GetProperties(request_context, keys, field_names, out_properties);
+    }
+
     // Maintenance Location reads must not update timestamps, promote entries, observe
     // revisit intervals, or populate a cache. The default adapter is only for
     // side-effect-free reads (Redis/async Redis). Backends whose ordinary reads

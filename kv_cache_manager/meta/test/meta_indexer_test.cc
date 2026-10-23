@@ -962,6 +962,87 @@ TEST_F(MetaIndexerTest, TestMakeBatchesPreservesOrderWithinEachShard) {
     ASSERT_EQ(expected_indexs, covered_indexs);
 }
 
+TEST_F(MetaIndexerTest, TestBlockKeyLifetimeOnlyAfterFinalLocationRemoval) {
+    const std::string config = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(config));
+    auto registry = std::make_shared<MetricsRegistry>();
+    auto histogram = std::make_shared<BlockKeyLifetimeHistogram>();
+    ASSERT_TRUE(histogram->Init(registry, {1.0, 60.0}, "group", "test"));
+    meta_indexer_->SetBlockKeyLifetimeHistogram(histogram);
+
+    const auto add_location = [](const std::vector<ErrorCode> &get_ecs,
+                                 const LocationIdVector &ids,
+                                 size_t,
+                                 CacheLocationVector &locations,
+                                 PropertyMap &) -> LocationModifierResult {
+        EXPECT_EQ(EC_NOENT, get_ecs[0]);
+        auto location = std::make_shared<CacheLocation>();
+        location->set_id(ids[0]);
+        locations[0] = location;
+        return {MA_OK, {EC_OK}};
+    };
+    ASSERT_EQ(EC_OK, meta_indexer_->ReadModifyWriteTargetLocations(
+                         request_context_.get(), {42}, {{"first"}}, add_location).ec);
+    PropertyMapVector properties;
+    ASSERT_EQ(EC_OK, meta_indexer_->GetProperties(
+                         request_context_.get(), {42}, {PROPERTY_BLOCK_FIRST_SEEN_MS}, properties).ec);
+    const std::string birth = properties.at(0).at(PROPERTY_BLOCK_FIRST_SEEN_MS);
+    ASSERT_EQ(EC_OK, meta_indexer_->ReadModifyWriteTargetLocations(
+                         request_context_.get(), {42}, {{"second"}}, add_location).ec);
+    properties.clear();
+    ASSERT_EQ(EC_OK, meta_indexer_->GetProperties(
+                         request_context_.get(), {42}, {PROPERTY_BLOCK_FIRST_SEEN_MS}, properties).ec);
+    EXPECT_EQ(birth, properties.at(0).at(PROPERTY_BLOCK_FIRST_SEEN_MS));
+
+    const auto delete_location = [](const std::vector<ErrorCode> &,
+                                    const LocationIdVector &,
+                                    size_t,
+                                    CacheLocationVector &,
+                                    PropertyMap &) -> LocationModifierResult {
+        return {MA_DELETE, {EC_OK}};
+    };
+    ASSERT_EQ(EC_OK, meta_indexer_->ReadModifyWriteLocation(
+                         request_context_.get(), {42}, {{"first"}}, delete_location).ec);
+    EXPECT_EQ(0u, histogram->GetCount());
+    ASSERT_EQ(EC_OK, meta_indexer_->ReadModifyWriteLocation(
+                         request_context_.get(), {42}, {{"second"}}, delete_location).ec);
+    EXPECT_EQ(1u, histogram->GetCount());
+
+    const std::string fast_id = "fast";
+    const auto add_single = [](ErrorCode, const LocationId &id, size_t,
+                               const CacheLocation *, CacheLocationConstPtr &out) -> ModifierResult {
+        auto location = std::make_shared<CacheLocation>();
+        location->set_id(id);
+        out = std::move(location);
+        return {MA_OK, EC_OK};
+    };
+    ASSERT_EQ(EC_OK, meta_indexer_->ReadModifyWriteSingleTargetLocations(
+                         request_context_.get(), {43}, {&fast_id}, add_single).ec);
+    ASSERT_EQ(EC_OK, meta_indexer_->Delete(request_context_.get(), {43}).ec);
+    EXPECT_EQ(2u, histogram->GetCount());
+
+    CacheLocationMapVector legacy_locations(1);
+    legacy_locations[0].emplace("legacy", MakeLocation("legacy", "uri"));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              meta_indexer_->backend_manager_->persistent_backend_->Put(
+                  request_context_.get(), {44}, legacy_locations, PropertyMapVector(1)));
+    ASSERT_EQ(EC_OK, meta_indexer_->Delete(request_context_.get(), {44}).ec);
+    EXPECT_EQ(2u, histogram->GetCount());
+
+    CacheLocationMapVector admin_locations(1);
+    admin_locations[0].emplace("admin", MakeLocation("admin", "uri"));
+    PropertyMapVector admin_properties(1);
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), {45}, admin_locations, admin_properties).ec);
+    meta_indexer_->DisableBlockKeyLifetimeObservation();
+    ASSERT_EQ(EC_OK, meta_indexer_->Delete(request_context_.get(), {45}).ec);
+    EXPECT_EQ(2u, histogram->GetCount());
+}
+
 TEST_F(MetaIndexerTest, TestLocalSimple) {
     std::string configStr = R"({
         "max_key_count" : 100,

@@ -900,7 +900,7 @@ void MetaAsyncRedisBackend::CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cm
         RedisClient::BuildSetCmds(full_keys, op.field_maps, cmds);
         break;
     case WriteOpType::kUpsert:
-        RedisClient::BuildHashSetCmds(full_keys, op.field_maps, cmds);
+        RedisClient::BuildHashSetCmds(full_keys, op.field_maps, cmds, PROPERTY_BLOCK_FIRST_SEEN_MS);
         break;
     case WriteOpType::kDelete:
         RedisClient::BuildDeleteCmds(full_keys, cmds);

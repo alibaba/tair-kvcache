@@ -81,6 +81,10 @@ public:
                                          const KeyTypeVec &keys,
                                          const std::vector<std::string> &field_names,
                                          PropertyMapVector &out_properties) noexcept override;
+    std::vector<ErrorCode> GetPropertiesForMaintenance(RequestContext *request_context,
+                                                       const KeyTypeVec &keys,
+                                                       const std::vector<std::string> &field_names,
+                                                       PropertyMapVector &out_properties) noexcept override;
 
     // =====================================================================
     // Key-level APIs

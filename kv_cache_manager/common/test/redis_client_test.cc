@@ -858,6 +858,24 @@ TEST_F(RedisClientTest, TestBuildHashSetCmds) {
     ASSERT_EQ(6, cmds[1].size()); // HSET k3 b 2 c 3
 }
 
+TEST_F(RedisClientTest, TestBuildHashSetCmdsInitializesBirthAtomically) {
+    std::vector<CmdArgs> cmds;
+    RedisClient::BuildHashSetCmds(
+        {"new", "existing"},
+        {{{"BP#t0", "1792660000123"}, {"loc", "value"}}, {{"loc", "replacement"}}},
+        cmds,
+        "BP#t0");
+    ASSERT_EQ(2u, cmds.size());
+    EXPECT_EQ("EVAL", cmds[0][0]);
+    EXPECT_EQ("1", cmds[0][2]);
+    EXPECT_EQ("new", cmds[0][3]);
+    EXPECT_EQ("BP#t0", cmds[0][4]);
+    EXPECT_EQ("1792660000123", cmds[0][5]);
+    EXPECT_EQ("loc", cmds[0][6]);
+    EXPECT_EQ("value", cmds[0][7]);
+    EXPECT_EQ((CmdArgs{"HSET", "existing", "loc", "replacement"}), cmds[1]);
+}
+
 TEST_F(RedisClientTest, TestBuildHashSetCmdsEmpty) {
     std::vector<CmdArgs> cmds;
     RedisClient::BuildHashSetCmds({}, {}, cmds);

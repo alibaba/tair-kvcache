@@ -1,4 +1,5 @@
 #include <memory>
+#include <string>
 
 #include "kmonitor/client/core/MutableMetric.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -15,6 +16,17 @@ using namespace kv_cache_manager;
 
 namespace {
 thread_local double reported_error_qps = 0;
+thread_local double reported_lifetime_count = 0;
+thread_local double reported_lifetime_sum = 0;
+
+void CaptureLifetime(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *, double value) {
+    if (metric->metric_name_.find("block_key_lifetime_seconds.count") != std::string::npos) {
+        reported_lifetime_count = value;
+    } else if (metric->metric_name_.find("block_key_lifetime_seconds.sum") != std::string::npos) {
+        reported_lifetime_sum = value;
+    }
+}
+
 
 void CaptureErrorQps(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *, double value) {
     if (metric->metric_name_.find("service.error_qps") != std::string::npos) {
@@ -152,6 +164,22 @@ TEST_F(KmonitorMetricsReporterTest, TestReportInterval) {
         reporter_->metrics_registry_ = nullptr;
         EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());
     }
+}
+
+TEST_F(KmonitorMetricsReporterTest, BlockKeyLifetimeIsReportedInSeconds) {
+    Stub stub;
+    auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+        &kmonitor::MutableMetric::Report);
+    reported_lifetime_count = 0;
+    reported_lifetime_sum = 0;
+    stub.set(report, CaptureLifetime);
+
+    const MetricsTags tags{{"instance_group", "group"}, {"instance_id", "instance"}};
+    metrics_registry_->GetCounter("block_key_lifetime_seconds_count", tags) += 1;
+    metrics_registry_->GetCounter("block_key_lifetime_seconds_sum", tags) += 2500000;
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(1.0, reported_lifetime_count);
+    EXPECT_DOUBLE_EQ(2.5, reported_lifetime_sum);
 }
 
 TEST_F(KmonitorMetricsReporterTest, TestReportIntervalWriteBytes) {

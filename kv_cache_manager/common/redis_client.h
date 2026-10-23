@@ -28,7 +28,8 @@ public:
     std::vector<ErrorCode> Update(const std::vector<std::string> &keys,
                                   const std::vector<std::map<std::string, std::string>> &field_maps);
     std::vector<ErrorCode> Upsert(const std::vector<std::string> &keys,
-                                  const std::vector<std::map<std::string, std::string>> &field_maps);
+                                  const std::vector<std::map<std::string, std::string>> &field_maps,
+                                  const std::string &first_write_field = {});
     std::vector<ErrorCode> Delete(const std::vector<std::string> &keys);
     std::vector<ErrorCode> DeleteFields(const std::vector<std::string> &keys,
                                         const std::vector<std::vector<std::string>> &field_names_vec);
@@ -75,7 +76,8 @@ public:
     // HSET per key (merge/upsert semantics). Skips keys with empty field_maps.
     static void BuildHashSetCmds(const std::vector<std::string> &keys,
                                  const std::vector<std::map<std::string, std::string>> &field_maps,
-                                 std::vector<CmdArgs> &out_cmds);
+                                 std::vector<CmdArgs> &out_cmds,
+                                 const std::string &first_write_field = {});
 
     // DEL per key.
     static void BuildDeleteCmds(const std::vector<std::string> &keys, std::vector<CmdArgs> &out_cmds);

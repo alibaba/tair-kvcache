@@ -147,7 +147,7 @@ std::vector<ErrorCode> MetaRedisBackend::Upsert(RequestContext *request_context,
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
-    return handle->Upsert(full_keys, field_maps);
+    return handle->Upsert(full_keys, field_maps, PROPERTY_BLOCK_FIRST_SEEN_MS);
 }
 
 std::vector<ErrorCode> MetaRedisBackend::Delete(RequestContext * /*request_context*/, const KeyTypeVec &keys) noexcept {

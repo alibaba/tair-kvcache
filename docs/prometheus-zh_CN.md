@@ -34,6 +34,20 @@ rate(kvcm_manager_get_cache_location_hit_block_counter[5m])
 kvcm_data_storage_storage_usage_ratio
 ```
 
+## Block key 存活时间
+
+`kvcm_block_key_lifetime_seconds` 是直方图：从 block key 首次写入元数据，到最后一个
+location 被删除且整个 key 回收的时间。`_bucket`、`_sum`、`_count` 分别用于查看分布、
+累计秒数和回收数量；例如平均存活时间可用
+`rate(kvcm_block_key_lifetime_seconds_sum[5m]) / rate(kvcm_block_key_lifetime_seconds_count[5m])`。
+标签包含 `instance_group` 和 `instance_id`，不包含 block key。管理员删除整个实例时不计入。
+上线前已存在且没有创建时间的 key 不计入该直方图；异步 Redis 写入按队列接受结果尽力统计。
+
+本地元数据把创建时间作为单个 Unix 毫秒时间戳存入 6 字节固定成员，使用现有结构体对齐空隙；
+Redis 使用 `BP#t0` 字段。直方图桶边界单位为秒，可用
+`kvcm.metrics.block_key_lifetime_buckets` 配置逗号分隔的正数递增列表；默认边界为
+`1,5,30,60,300,900,3600,21600,86400,604800`。
+
 ## 配置
 
 以下两个配置项控制 Prometheus 端点：

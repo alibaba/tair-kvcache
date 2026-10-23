@@ -6,6 +6,7 @@
 #include "kv_cache_manager/common/build_version.h"
 #include "kv_cache_manager/common/loop_thread.h"
 #include "kv_cache_manager/common/net_util.h"
+#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/coordination_backend.h"
 #include "kv_cache_manager/config/coordination_backend_factory.h"
 #include "kv_cache_manager/config/leader_elector.h"
@@ -109,6 +110,11 @@ bool Server::Init(const ServerConfig &config) {
         boundaries = ServerConfig::GetDefaultRevisitIntervalBuckets();
     }
     cache_manager_->SetRevisitHistogramConfig(boundaries);
+    auto lifetime_boundaries = StringUtil::ParseBucketBoundaries(config_.GetBlockKeyLifetimeBuckets());
+    if (lifetime_boundaries.empty()) {
+        lifetime_boundaries = ServerConfig::GetDefaultBlockKeyLifetimeBuckets();
+    }
+    cache_manager_->SetBlockKeyLifetimeHistogramConfig(lifetime_boundaries);
 
     CreateMetricsReporter();
     CreateAndRegisterEventPublisher();

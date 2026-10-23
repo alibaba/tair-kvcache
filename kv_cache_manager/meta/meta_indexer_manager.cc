@@ -7,6 +7,7 @@
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/query_executor.h"
+#include "kv_cache_manager/metrics/block_key_lifetime_histogram.h"
 #include "kv_cache_manager/metrics/revisit_interval_histogram.h"
 
 namespace kv_cache_manager {
@@ -15,6 +16,12 @@ void MetaIndexerManager::SetRevisitHistogramConfig(std::shared_ptr<MetricsRegist
                                                    const std::vector<double> &boundaries) {
     metrics_registry_ = std::move(registry);
     revisit_boundaries_ = boundaries;
+}
+
+void MetaIndexerManager::SetBlockKeyLifetimeHistogramConfig(
+    std::shared_ptr<MetricsRegistry> registry, const std::vector<double> &boundaries) {
+    metrics_registry_ = std::move(registry);
+    block_key_lifetime_boundaries_ = boundaries;
 }
 
 bool MetaIndexerManager::ConfigureQueryExecutor(std::size_t worker_count,
@@ -58,7 +65,8 @@ bool MetaIndexerManager::ConfigureQueryExecutor(std::size_t worker_count,
 
 ErrorCode MetaIndexerManager::CreateMetaIndexer(const std::string &instance_id,
                                                 const std::shared_ptr<MetaIndexerConfig> &config,
-                                                const std::vector<double> &boundaries) {
+                                                const std::vector<double> &boundaries,
+                                                const std::string &instance_group) {
     auto indexer = GetMetaIndexer(instance_id);
     if (indexer) {
         return ErrorCode::EC_EXIST;
@@ -91,6 +99,17 @@ ErrorCode MetaIndexerManager::CreateMetaIndexer(const std::string &instance_id,
                               resolved.size());
             } else {
                 KVCM_LOG_WARN("Failed to create revisit interval histogram for instance_id: %s", instance_id.c_str());
+            }
+        }
+
+        if (metrics_registry_ && !block_key_lifetime_boundaries_.empty()) {
+            auto histogram = std::make_shared<BlockKeyLifetimeHistogram>();
+            if (histogram->Init(
+                    metrics_registry_, block_key_lifetime_boundaries_, instance_group, instance_id)) {
+                indexer->SetBlockKeyLifetimeHistogram(std::move(histogram));
+            } else {
+                KVCM_LOG_WARN("Failed to create block key lifetime histogram for instance_id: %s",
+                              instance_id.c_str());
             }
         }
 
