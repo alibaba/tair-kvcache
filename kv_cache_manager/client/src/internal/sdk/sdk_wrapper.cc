@@ -316,30 +316,32 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
                     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline)
                         .count();
                 KVCM_LOG_WARN("deadline passed (overdue_ms=%lld), skip I/O", static_cast<long long>(overdue_ms));
-                return ER_SDK_TIMEOUT;
+                return ER_SDK_TIMEOUT_BUFFER_SAFE;
             }
             return task();
         };
         futures.push_back(wait_task_thread_pool_->async(wrapped));
     }
 
-    // 有界 drain：置 stop 拦截排队任务 + 等待其余 future 至多到 deadline（绝不越界）。
-    // 返回 true 表示至少一个 peer 的 completion 仍未知：它没有在 deadline 前完成，
-    // 或者它自己报告了 timeout。caller 必须把这种情况统一暴露为 ER_SDK_TIMEOUT，
-    // 不能用最先观察到的普通错误掩盖仍可能访问 caller buffer 的 peer。
+    // Drain only until the existing deadline. SAFE survives only when every
+    // submitted host returned success, explicit SAFE, or cancellation before I/O.
+    bool all_buffer_safe = true;
     auto drain = [&](size_t from) {
         stop->store(true);
-        bool completion_unknown = false;
+        bool timed_out = false;
         for (size_t j = from; j < futures.size(); ++j) {
             if (futures[j].wait_until(deadline) != std::future_status::ready) {
-                completion_unknown = true;
+                all_buffer_safe = false;
+                timed_out = true;
                 continue;
             }
-            if (futures[j].get() == ER_SDK_TIMEOUT) {
-                completion_unknown = true;
-            }
+            const auto ec = futures[j].get();
+            all_buffer_safe = all_buffer_safe &&
+                              (ec == ER_OK || ec == ER_TASK_CANCELLED || ec == ER_SDK_TIMEOUT_BUFFER_SAFE ||
+                               ec == ER_SDK_ERROR_BUFFER_SAFE);
+            timed_out = timed_out || ec == ER_SDK_TIMEOUT || ec == ER_SDK_TIMEOUT_BUFFER_SAFE;
         }
-        return completion_unknown;
+        return timed_out;
     };
 
     for (size_t i = 0; i < futures.size(); ++i) {
@@ -363,7 +365,19 @@ ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
             KVCM_LOG_WARN("run %s parallel failed, error: %d, drain in-flight peers until deadline",
                           getOpTypeString(op_type).c_str(),
                           static_cast<int>(ec));
-            return drain(i + 1) ? ER_SDK_TIMEOUT : ec;
+            all_buffer_safe = ec == ER_TASK_CANCELLED || ec == ER_SDK_TIMEOUT_BUFFER_SAFE ||
+                              ec == ER_SDK_ERROR_BUFFER_SAFE;
+            const bool peer_timed_out = drain(i + 1);
+            if (ec == ER_SDK_TIMEOUT || ec == ER_SDK_TIMEOUT_BUFFER_SAFE || peer_timed_out) {
+                return all_buffer_safe ? ER_SDK_TIMEOUT_BUFFER_SAFE : ER_SDK_TIMEOUT;
+            }
+            if (all_buffer_safe) {
+                return ER_SDK_ERROR_BUFFER_SAFE;
+            }
+            // A SAFE first error cannot conceal an unknown peer failure.
+            return ec == ER_SDK_ERROR_BUFFER_SAFE || ec == ER_TASK_CANCELLED
+                       ? (op_type == OpType::GET ? ER_SDKREAD_ERROR : ER_SDKWRITE_ERROR)
+                       : ec;
         }
     }
 
