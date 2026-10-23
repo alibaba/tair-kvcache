@@ -12,7 +12,7 @@
 
 ```mermaid
 flowchart TD
-    main["main.cpp"] --> service["service（接入层/装配入口）"]
+    main["main.cpp"] --> service["service（接入层/装配入口/请求门禁）"]
     service --> manager["manager（CacheManager）"]
     manager --> meta["meta（索引/CacheLocation）"]
     meta --> config["config（注册表/选主）"]
