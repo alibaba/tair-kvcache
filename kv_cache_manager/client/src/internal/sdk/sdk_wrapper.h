@@ -24,7 +24,8 @@ public:
 public:
     ClientErrorCode Init(const std::unique_ptr<ClientConfig> &client_config,
                          const InitParams &init_params,
-                         const ClientMemoryRegistrations *memory_registrations = nullptr);
+                         const std::vector<SharedMemoryRegistration> &host_registrations = {},
+                         const std::vector<GpuMemorySpan> &gpu_registrations = {});
 
     ClientErrorCode Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
     ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
@@ -63,7 +64,8 @@ private:
     ClientErrorCode PrepareSharedMemoryRegistration(const SharedMemoryRegistration &shared_memory_registration,
                                                     SharedMemoryRegistration &prepared_registration);
     ClientErrorCode UpdateTairMempoolSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
-                                               const ClientMemoryRegistrations *memory_registrations);
+                                               const std::vector<SharedMemoryRegistration> &host_registrations,
+                                               const std::vector<GpuMemorySpan> &gpu_registrations);
 
 private:
     SdkFactory *sdk_factory_;
@@ -72,7 +74,8 @@ private:
     std::unique_ptr<LockFreeThreadPool> wait_task_thread_pool_;
     // storage unique name -> storage_sdk
     std::map<std::string, std::shared_ptr<SdkInterface>> sdk_map_;
-    int owned_shm_fd_{-1};
+    // Duplicated host shm fds, one per registered segment; closed on destruction.
+    std::vector<int> owned_shm_fds_;
 };
 
 } // namespace kv_cache_manager
