@@ -9,6 +9,7 @@
 #include "google/protobuf/arena.h"
 #include "google/protobuf/util/json_util.h"
 #include "google/protobuf/util/message_differencer.h"
+#include "google/protobuf/wrappers.pb.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
@@ -179,6 +180,102 @@ TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesCurrentMapAndWrapperTypes) 
     proto::admin::MigrationMarkMethodConfig parsed_wrapper;
     ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(wrapper_json, &parsed_wrapper));
     EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(wrapper_message, parsed_wrapper));
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecUInt64WrapperPreservesExactNumericAndStringInputs) {
+    ASSERT_TRUE(FastProtoJsonCodec::Supports(google::protobuf::UInt64Value::descriptor()));
+    ASSERT_TRUE(FastProtoJsonCodec::Supports(proto::admin::MigrationConfig::descriptor()));
+    // Protobuf's serializer emits strings; also exercise unquoted integers that
+    // would lose precision if the wrapper parser went through a double.
+    const uint64_t values[] = {9007199254740993ULL, std::numeric_limits<uint64_t>::max()};
+    for (const uint64_t value : values) {
+        const std::string quoted_value = "\"" + std::to_string(value) + "\"";
+        for (bool quoted : {false, true}) {
+            const std::string input = quoted ? quoted_value : std::to_string(value);
+            SCOPED_TRACE(input);
+            google::protobuf::UInt64Value wrapper;
+            google::protobuf::UInt64Value protobuf_wrapper;
+            ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(input, &wrapper));
+            ASSERT_TRUE(ProtobufFromJson(input, &protobuf_wrapper));
+            EXPECT_EQ(value, wrapper.value());
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_wrapper, wrapper));
+            std::string wrapper_json;
+            ASSERT_TRUE(FastProtoJsonCodec::TryToJson(wrapper, wrapper_json));
+            EXPECT_EQ(quoted_value, wrapper_json);
+
+            const std::string config_input = "{\"copy_max_inflight_bytes\":" + input + "}";
+            proto::admin::MigrationConfig config;
+            proto::admin::MigrationConfig protobuf_config;
+            ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(config_input, &config));
+            ASSERT_TRUE(ProtobufFromJson(config_input, &protobuf_config));
+            ASSERT_TRUE(config.has_copy_max_inflight_bytes());
+            EXPECT_EQ(value, config.copy_max_inflight_bytes().value());
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_config, config));
+            std::string config_json;
+            std::string protobuf_json;
+            ASSERT_TRUE(FastProtoJsonCodec::TryToJson(config, config_json));
+            ASSERT_TRUE(ProtobufToJson(protobuf_config, &protobuf_json));
+            EXPECT_EQ(protobuf_json, config_json);
+        }
+    }
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecUInt64WrapperPresence) {
+    struct TestCase {
+        const char *json;
+        bool present;
+    };
+    const TestCase cases[] = {
+        {R"({"copy_max_inflight_bytes":0})", true},
+        {R"({"copy_max_inflight_bytes":"0"})", true},
+        {R"({"copy_max_inflight_bytes":null})", false},
+        {R"({})", false},
+    };
+    ASSERT_TRUE(FastProtoJsonCodec::Supports(proto::admin::MigrationConfig::descriptor()));
+    for (const auto &test : cases) {
+        SCOPED_TRACE(test.json);
+        proto::admin::MigrationConfig config;
+        config.mutable_copy_max_inflight_bytes()->set_value(42);
+        config.mutable_copy_max_concurrency()->set_value(7);
+        proto::admin::MigrationConfig protobuf_config;
+        ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(test.json, &config));
+        ASSERT_TRUE(ProtobufFromJson(test.json, &protobuf_config));
+        EXPECT_EQ(test.present, config.has_copy_max_inflight_bytes());
+        EXPECT_EQ(0u, config.copy_max_inflight_bytes().value());
+        EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_config, config));
+        std::string config_json;
+        std::string protobuf_json;
+        ASSERT_TRUE(FastProtoJsonCodec::TryToJson(config, config_json));
+        ASSERT_TRUE(ProtobufToJson(protobuf_config, &protobuf_json));
+        EXPECT_EQ(protobuf_json, config_json);
+        EXPECT_EQ(test.present, config_json.find("\"copy_max_inflight_bytes\":\"0\"") != std::string::npos);
+    }
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecRejectsInvalidUInt64WrappersTransactionally) {
+    const char *invalid_values[] = {"-1", "\"-1\"", "18446744073709551616", "\"18446744073709551616\""};
+    ASSERT_TRUE(FastProtoJsonCodec::Supports(google::protobuf::UInt64Value::descriptor()));
+    ASSERT_TRUE(FastProtoJsonCodec::Supports(proto::admin::MigrationConfig::descriptor()));
+    for (const char *value : invalid_values) {
+        SCOPED_TRACE(value);
+        google::protobuf::UInt64Value wrapper;
+        wrapper.set_value(42);
+        google::protobuf::UInt64Value protobuf_wrapper;
+        EXPECT_FALSE(ProtobufFromJson(value, &protobuf_wrapper));
+        EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(value, &wrapper));
+        EXPECT_EQ(42u, wrapper.value());
+
+        proto::admin::MigrationConfig config;
+        config.mutable_copy_max_concurrency()->set_value(7);
+        config.mutable_copy_max_inflight_bytes()->set_value(42);
+        const std::string before = config.SerializeAsString();
+        // Parse a valid sibling first: failure must not commit a partial message.
+        const std::string input = std::string("{\"copy_max_concurrency\":9,\"copy_max_inflight_bytes\":") + value + "}";
+        proto::admin::MigrationConfig protobuf_config;
+        EXPECT_FALSE(ProtobufFromJson(input, &protobuf_config));
+        EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(input, &config));
+        EXPECT_EQ(before, config.SerializeAsString());
+    }
 }
 
 TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesBytesWithProtobufBase64Semantics) {
