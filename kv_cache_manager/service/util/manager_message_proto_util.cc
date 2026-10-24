@@ -266,6 +266,8 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
     // 转换migration_config
     auto *migration_config = proto_cache_config->mutable_migration_config();
     migration_config->mutable_copy_max_concurrency()->set_value(cache_config_info.migration_copy_max_concurrency());
+    migration_config->mutable_async_copy_max_concurrency()->set_value(
+        cache_config_info.migration_async_copy_max_concurrency());
     migration_config->set_mark_clear_policy(
         static_cast<proto::admin::MigrationMarkClearPolicy>(cache_config_info.migration_mark_clear_policy()));
     migration_config->set_copy_execution_mode(
@@ -337,6 +339,10 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     } else {
         cache_config_info.set_migration_copy_max_concurrency(CacheConfig::kDefaultMigrationCopyMaxConcurrency);
     }
+    cache_config_info.set_migration_async_copy_max_concurrency(
+        proto_migration_config.has_async_copy_max_concurrency()
+            ? proto_migration_config.async_copy_max_concurrency().value()
+            : MigrationConfig::kDefaultAsyncCopyMaxConcurrency);
     cache_config_info.set_migration_mark_clear_policy(
         static_cast<MigrationMarkClearPolicy>(proto_migration_config.mark_clear_policy()));
     cache_config_info.set_migration_copy_execution_mode(

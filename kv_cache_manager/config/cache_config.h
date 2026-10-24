@@ -64,6 +64,10 @@ public:
     }
     const MigrationConfig &migration_config() const { return migration_config_; }
     int64_t migration_copy_max_concurrency() const { return migration_config_.copy_max_concurrency(); }
+    int64_t migration_async_copy_max_concurrency() const { return migration_config_.async_copy_max_concurrency(); }
+    int64_t effective_migration_copy_max_concurrency() const {
+        return migration_config_.effective_copy_max_concurrency();
+    }
     MigrationMarkClearPolicy migration_mark_clear_policy() const { return migration_config_.mark_clear_policy(); }
     MigrationCopyExecutionMode migration_copy_execution_mode() const {
         return migration_config_.copy_execution_mode();
@@ -96,6 +100,9 @@ public:
     }
     void set_migration_copy_max_concurrency(int64_t migration_copy_max_concurrency) {
         migration_config_.set_copy_max_concurrency(migration_copy_max_concurrency);
+    }
+    void set_migration_async_copy_max_concurrency(int64_t value) {
+        migration_config_.set_async_copy_max_concurrency(value);
     }
     void set_migration_mark_clear_policy(MigrationMarkClearPolicy migration_mark_clear_policy) {
         migration_config_.set_mark_clear_policy(migration_mark_clear_policy);

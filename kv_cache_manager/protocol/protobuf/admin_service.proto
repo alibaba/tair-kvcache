@@ -276,7 +276,7 @@ message MigrationStrategy {
 
 message MigrationConfig {
     repeated MigrationStrategy strategies = 1; // 多层存储迁移规则，per-storage
-    google.protobuf.Int32Value copy_max_concurrency = 2; // instance group 级 Copy 并发上限
+    google.protobuf.Int32Value copy_max_concurrency = 2; // instance group 级同步 Copy 并发上限
     MigrationMarkClearPolicy mark_clear_policy = 3; // instance group 级 Mark 清理策略
     MigrationCopyExecutionMode copy_execution_mode = 4;
     google.protobuf.UInt64Value copy_max_inflight_bytes = 5;
@@ -288,6 +288,7 @@ message MigrationConfig {
     google.protobuf.Int64Value copy_connect_timeout_ms = 11;
     google.protobuf.Int64Value copy_submit_timeout_ms = 12;
     google.protobuf.Int64Value copy_query_timeout_ms = 13;
+    google.protobuf.Int32Value async_copy_max_concurrency = 14; // instance group 级异步 Copy 并发上限
 }
 
 enum CachePreferStrategy {

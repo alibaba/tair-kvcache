@@ -2989,7 +2989,7 @@ void MigrationManager::RunAsyncMigrationPrepare(AsyncMigrationPrepareJob job, st
             }
         }
 
-        const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
+        const auto configured_copy_concurrency = cache_config->effective_migration_copy_max_concurrency();
         const std::size_t max_concurrent_copy =
             configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
         DispatchBatchParams params;
@@ -3090,6 +3090,9 @@ MigrationManager::MigrateResult MigrationManager::MigrateCache(RequestContext *r
     params.mark_timeout_ms = mark_timeout_ms;
     if (registry_manager_) {
         if (const auto cache_config = registry_manager_->GetCacheConfig(instance_group_name); cache_config) {
+            // Read the mode and its limit from the same configuration snapshot.
+            const auto concurrency = cache_config->effective_migration_copy_max_concurrency();
+            params.copy_limit.max_concurrency = concurrency > 0 ? static_cast<std::size_t>(concurrency) : 0;
             params.copy_execution_mode = cache_config->migration_copy_execution_mode();
             params.copy_max_inflight_bytes = cache_config->migration_copy_max_inflight_bytes();
             params.async_copy_options.operation_deadline_ms = cache_config->migration_copy_operation_deadline_ms();

@@ -279,6 +279,9 @@ TEST_F(AdminServiceImplTest, TestExplicitBlockKeysCopyDeduplicatesBeforeConcurre
 
 TEST_F(AdminServiceImplTest, TestAdminCopyRespectsGroupConcurrencyLimit) {
     SetDefaultCopyConcurrency(1);
+    auto config = registry_manager_->instance_group_configs_.at("default")->cache_config_;
+    config->set_migration_async_copy_max_concurrency(17);
+    config->set_migration_copy_execution_mode(MigrationCopyExecutionMode::SYNC);
     SeedServingSource(111);
     SeedServingSource(112);
     SeedServingSource(113);

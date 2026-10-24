@@ -820,7 +820,7 @@ public:
             strategy->mutable_methods().mutable_mark().set_enabled(scenario.both);
             auto config = std::make_shared<CacheConfig>();
             config->set_migration_strategies({strategy});
-            config->set_migration_copy_max_concurrency(max_concurrency);
+            config->set_migration_async_copy_max_concurrency(max_concurrency);
             config->set_migration_copy_execution_mode(MigrationCopyExecutionMode::ASYNC_REQUIRED);
             config->set_migration_copy_max_inflight_bytes(100 * kMiB);
             auto group = std::make_shared<InstanceGroup>();
@@ -921,7 +921,7 @@ public:
         }
     }
 
-    void CheckDefaultAsyncCopyAdmission(uint64_t bytes_per_copy, size_t expected_admitted) {
+    void CheckDefaultAsyncCopyAdmission(uint64_t bytes_per_copy, size_t expected_admitted, bool check_mode_switch = false) {
         ASSERT_TRUE(CreateMetaIndexer(kInstance));
         ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "default_limit_hot/"));
         ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "default_limit_cold/"));
@@ -934,8 +934,8 @@ public:
         auto config = std::make_shared<CacheConfig>();
         config->set_migration_strategies({strategy});
         config->set_migration_copy_execution_mode(MigrationCopyExecutionMode::ASYNC_REQUIRED);
-        // Leave both limits unset: exercise the production config -> prepare ->
-        // dispatch -> BatchSubmit path, including values larger than uint32_t.
+        // Leave async concurrency and bytes unset: exercise the production
+        // config -> prepare -> dispatch -> BatchSubmit path, including >uint32_t values.
         auto group = std::make_shared<InstanceGroup>();
         group->set_name(group_name);
         group->set_cache_config(config);
@@ -957,6 +957,8 @@ public:
         stub.set(ADDR(DataStorageManager, SupportsAsyncCopy), async_admission_stub::SupportsAsyncCopy_stub);
         stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
         stub.set(ADDR(SchedulePlanExecutor, SubmitAsyncCopy), async_admission_stub::SubmitAsyncCopy_stub);
+        stub.set(static_cast<preparing_reservation_stub::CopySubmitLocation>(ADDR(SchedulePlanExecutor, Submit)),
+                 preparing_reservation_stub::CopySubmitPending_stub);
         MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, nullptr, nullptr, registry);
         mgr.DebugEnableCopySubmissionsForTest();
         const auto dispatch = [&](const std::vector<int64_t> &batch) {
@@ -1008,6 +1010,54 @@ public:
         EXPECT_EQ(expected_admitted, mgr.GetStats().async_copy_inflight_operations);
         EXPECT_EQ(expected_admitted * bytes_per_copy, mgr.GetStats().async_copy_inflight_bytes);
         EXPECT_EQ(expected_admitted + 1, async_admission_stub::g_submitted_blocks.size());
+
+        if (!check_mode_switch) {
+            return;
+        }
+        const auto sync_key = keys.back() + 1;
+        const auto async_key = sync_key + 1;
+        const auto refill_key = async_key + 1;
+        for (const auto key : {sync_key, async_key, refill_key}) {
+            MakeSizedAsyncMigrationRequest(key, bytes_per_copy);
+        }
+        config->set_migration_copy_max_concurrency(2);
+        config->set_migration_async_copy_max_concurrency(3);
+        config->set_migration_copy_execution_mode(MigrationCopyExecutionMode::SYNC);
+        EXPECT_EQ(0, dispatch({sync_key}).copy_submitted);
+        EXPECT_EQ(expected_admitted, mgr.ActiveTaskCountForGroup(group_name));
+        EXPECT_EQ(expected_admitted, mgr.GetStats().async_copy_inflight_operations);
+        // Switching mode does not drain/cancel old work. Finish all but one
+        // async task, then let a SYNC task consume the second shared slot.
+        for (size_t i = 1; i < expected_admitted; ++i) {
+            mgr.OnTaskSuccess(kInstance, keys[i]);
+        }
+        EXPECT_EQ(1u, mgr.ActiveTaskCountForGroup(group_name));
+        EXPECT_EQ(1, dispatch({sync_key}).copy_submitted);
+        EXPECT_EQ(2u, mgr.ActiveTaskCountForGroup(group_name));
+        EXPECT_EQ(1u, mgr.GetStats().async_copy_inflight_operations);
+        EXPECT_EQ(bytes_per_copy, mgr.GetStats().async_copy_inflight_bytes);
+        EXPECT_EQ(1u, preparing_reservation_stub::g_pending_copy_promises.size());
+
+        config->set_migration_copy_execution_mode(MigrationCopyExecutionMode::ASYNC_REQUIRED);
+        const auto mixed = dispatch({async_key, refill_key});
+        EXPECT_EQ(1, mixed.copy_submitted);
+        EXPECT_EQ(1, mixed.copy_failed); // Existing SYNC task also consumes an async-mode slot.
+        EXPECT_EQ(3u, mgr.ActiveTaskCountForGroup(group_name));
+        EXPECT_EQ(2u, mgr.GetStats().async_copy_inflight_operations);
+        EXPECT_EQ(2 * bytes_per_copy, mgr.GetStats().async_copy_inflight_bytes);
+        EXPECT_EQ(1u, LocationCount(refill_key));
+
+        config->set_migration_copy_execution_mode(MigrationCopyExecutionMode::SYNC);
+        EXPECT_EQ(0, dispatch({refill_key}).copy_submitted);
+        mgr.OnTaskSuccess(kInstance, keys.back());
+        EXPECT_EQ(0, dispatch({refill_key}).copy_submitted); // Still exactly at the SYNC limit.
+        mgr.OnTaskSuccess(kInstance, sync_key);
+        EXPECT_EQ(1, dispatch({refill_key}).copy_submitted);
+        EXPECT_EQ(2u, mgr.ActiveTaskCountForGroup(group_name));
+        EXPECT_EQ(1u, mgr.GetStats().async_copy_inflight_operations);
+        EXPECT_EQ(bytes_per_copy, mgr.GetStats().async_copy_inflight_bytes);
+        EXPECT_EQ(2, config->migration_copy_max_concurrency());
+        EXPECT_EQ(3, config->migration_async_copy_max_concurrency());
     }
 
     std::shared_ptr<MetaIndexerManager> meta_manager_;
@@ -3841,7 +3891,7 @@ TEST_F(MigrationManagerTest, TestDefaultAsyncConcurrencyLimitAndCompletionRefill
 
 TEST_F(MigrationManagerTest, TestDefaultAsyncByteLimitAndCompletionRefill) {
     // 32 * 32 GiB = 1 TiB: bytes bind while most operation slots remain.
-    CheckDefaultAsyncCopyAdmission(32ULL * 1024 * 1024 * 1024, 32);
+    CheckDefaultAsyncCopyAdmission(32ULL * 1024 * 1024 * 1024, 32, /*check_mode_switch=*/true);
 }
 
 TEST_F(MigrationManagerTest, TestBatchByteRejectionDoesNotConsumeRemainingConcurrencySlot) {

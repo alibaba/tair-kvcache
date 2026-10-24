@@ -132,7 +132,9 @@ Copy 的“目标可读后再删除源副本”只约束迁移任务自身。容
 | `migration_config.strategies` | 默认空，不启用自动迁移；同一 Group 中源/目标组合必须唯一，源和目标不同 |
 | `trigger_threshold` | 自动迁移阈值，必须显式设置，范围为 `0 < 值 < 1` |
 | `method_configs.copy/mark.enabled` | 单条规则至少开启一种方式；同时开启时 Copy 优先 |
-| `copy_max_concurrency` | Group 的活跃 Copy 上限，默认 `1024`，必须大于 `0` |
+| `copy_execution_mode` | 默认 `MIGRATION_COPY_SYNC`；异步模式为 `MIGRATION_COPY_ASYNC_REQUIRED` |
+| `copy_max_concurrency` | SYNC 模式的 Group 活跃 Copy 上限，默认 `1`，必须大于 `0` |
+| `async_copy_max_concurrency` | ASYNC_REQUIRED 模式的 Group 活跃 Copy 上限，默认 `1024`，必须大于 `0` |
 | `copy_max_inflight_bytes` | Group 异步 Copy 的在途字节上限，默认 `1099511627776`（1 TiB）；异步模式下必须大于 `0` |
 | `mark.timeout_ms` | 新 Mark 的有效期，默认 `86400000`（24 小时）；开启 Mark 时必须大于 `0` |
 | `mark_clear_policy` | 默认 `MIGRATION_MARK_CLEAR_ON_NEXT_WRITE_SUCCESS`，控制 FinishWrite 清标 |
@@ -150,6 +152,7 @@ SSD 仅作为迁移目标时可以不在 `storage_candidates` 中，但后端不
 |---|---|
 | 不配置迁移规则 | 不自动迁移，也不在前台消费 Mark；普通读写继续运行，Admin `COPY` 仍可主动提交 |
 | 修改阈值、方式或保留策略 | 后续调度读取新配置；排队中的 Prepare 会复核路由及执行配置，但不重新计算触发水位。配置更新不是所有任务的原子切换点 |
+| 切换 Copy 执行模式 | 后续准入选择对应模式的并发上限；已有任务继续执行并计入 Group 总 active，不取消、不等待排空，也不重置额度 |
 | 删除一条规则 | 后续不再按该规则迁移；尚未执行的 Prepare 发现路由已删除后退出，已提交 Copy 按任务快照继续执行 |
 | 关闭某条规则的 Mark | 停止该规则后续自动打标；只要 Group 仍有迁移规则，前台仍会消费有效的既有 Mark |
 | 清空全部规则 | 停止后续自动迁移和前台 Mark 引导/Finish 清标；不主动删除既有 Mark、在途 Copy 或已迁移副本 |
@@ -164,7 +167,7 @@ SSD 仅作为迁移目标时可以不在 `storage_candidates` 中，但后端不
 
 ### 5.1 并发控制
 
-`copy_max_concurrency` 在 Group 内由自动迁移和 Admin Copy 共享。迁移准备、Copy 和清理共用 SchedulePlanExecutor；进程级 `migration_worker_budget` 必须小于总 worker 数，为回收和系统任务保留执行机会。服务参数见[配置指南](../configuration.md)。
+SYNC 使用 `copy_max_concurrency`（默认 1），ASYNC_REQUIRED 使用 `async_copy_max_concurrency`（默认 1024）；两项分别保存和校验，缺失时各自恢复默认值，异步模式不会回退使用同步值。自动迁移、Admin Copy 以及两种模式共用 Group 的总 active 计数。切换到较小上限不会中断已有任务；总 active 降至上限以下后，后续 Copy 才有准入机会。异步任务还受 `copy_max_inflight_bytes` 限制，同步任务不占该字节额度。迁移准备、Copy 和清理共用 SchedulePlanExecutor；进程级 `migration_worker_budget` 必须小于总 worker 数，为回收和系统任务保留执行机会。服务参数见[配置指南](../configuration.md)。
 
 ### 5.2 异常处理与恢复
 
