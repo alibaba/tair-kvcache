@@ -2130,7 +2130,8 @@ ErrorCode MetaSearcher::BatchGetLocation(RequestContext *request_context,
 ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
                                          const KeyVector &keys,
                                          const CacheLocationVector &locations,
-                                         std::vector<AddLocationResult> &out_results) {
+                                         std::vector<AddLocationResult> &out_results,
+                                         bool capture_location_values) {
     out_results.assign(keys.size(), AddLocationResult{});
     if (keys.size() != locations.size()) {
         for (auto &result : out_results) {
@@ -2141,7 +2142,7 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
-    auto modifier = [&locations, &out_results, &keys, &loc_sz, batch_create_time](
+    auto modifier = [&locations, &out_results, &keys, &loc_sz, batch_create_time, capture_location_values](
                         const LocationIdVector &existing_location_ids,
                         ErrorCode get_ec,
                         size_t index,
@@ -2171,6 +2172,9 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
         new_loc->set_id(location_id);
         new_loc->set_status(CLS_WRITING);
         new_loc->set_create_time(batch_create_time);
+        if (capture_location_values) {
+            out_results[index].location_value = new_loc->ToJsonString();
+        }
         out_new_locations[location_id] = std::move(new_loc);
 
         // compute storage size for usage tracking
@@ -3273,64 +3277,98 @@ ErrorCode MetaSearcher::BatchCASLocationStatus(RequestContext *request_context,
                                                const std::vector<std::vector<LocationCASTask>> &batch_tasks,
                                                std::vector<std::vector<ErrorCode>> &out_batch_results,
                                                bool refresh_cache_from_persistent) {
-
     if (keys.size() != batch_tasks.size()) {
         return EC_BADARGS;
     }
     out_batch_results.clear();
     out_batch_results.resize(keys.size());
 
+    // Targets occupy the prefix; append distinct read-only sources to the
+    // same key's read set so their checks and the target write share a shard
+    // lock. Never implement this as Get(source) followed by CAS(target).
     LocationIdsPerKey location_ids_per_key(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        location_ids_per_key[i].reserve(batch_tasks[i].size());
-        for (const auto &task : batch_tasks[i]) {
-            location_ids_per_key[i].push_back(task.location_id);
+    std::vector<std::vector<size_t>> source_indexes(keys.size());
+    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        const auto &tasks = batch_tasks[key_index];
+        auto &ids = location_ids_per_key[key_index];
+        std::unordered_map<std::string, size_t> indexes;
+        for (const auto &task : tasks) {
+            if (task.location_id.empty() || !indexes.emplace(task.location_id, ids.size()).second) {
+                return EC_BADARGS;
+            }
+            ids.push_back(task.location_id);
+        }
+        source_indexes[key_index].assign(tasks.size(), std::numeric_limits<size_t>::max());
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            const auto &task = tasks[i];
+            if (task.expected_source_location_id.empty()) {
+                continue;
+            }
+            // Legacy locations may have no create time. They require the
+            // full serialized identity instead of weakening the predicate.
+            if (task.expected_source_create_time < 0 ||
+                (task.expected_source_create_time == 0 && task.expected_source_location_value.empty())) {
+                return EC_BADARGS;
+            }
+            auto found = indexes.find(task.expected_source_location_id);
+            // Read-only source conditions cannot also be mutation targets in
+            // this batch: otherwise success would depend on task ordering.
+            if (found != indexes.end() && found->second < tasks.size()) {
+                return EC_BADARGS;
+            }
+            if (found == indexes.end()) {
+                const auto source_index = ids.size();
+                ids.push_back(task.expected_source_location_id);
+                found = indexes.emplace(task.expected_source_location_id, source_index).first;
+            }
+            source_indexes[key_index][i] = found->second;
         }
     }
 
-    // Per-key CAS modifier: OK slot whose status matches old_status flips to
-    // new_status (slot ec EC_OK -> participates in upsert); status mismatch
-    // yields EC_MISMATCH; NOENT is idempotent EC_OK; hard errors surface as-is.
-    auto modifier = [&keys, &batch_tasks](const std::vector<ErrorCode> &get_ecs,
-                                          const LocationIdVector &loc_ids,
-                                          size_t key_index,
-                                          CacheLocationVector &locs,
-                                          PropertyMap &upsert_property_map) -> LocationModifierResult {
-        (void)upsert_property_map;
-        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
+    auto modifier = [&batch_tasks, &source_indexes](const std::vector<ErrorCode> &get_ecs,
+                                                     const LocationIdVector &loc_ids,
+                                                     size_t key_index,
+                                                     CacheLocationVector &locs,
+                                                     PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
+        // A non-OK modifier slot is not included in the upsert. Source-only
+        // slots deliberately stay EC_MISMATCH and are removed from the public
+        // result below; this does not represent an error reading the source.
+        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), EC_MISMATCH);
         bool updated = false;
-        for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
-            const ErrorCode ec = get_ecs[loc_index];
-            const std::string &loc_id = loc_ids[loc_index];
-            if (ec != ErrorCode::EC_OK) {
-                modifier_ecs[loc_index] = ec;
-                if (ec != ErrorCode::EC_NOENT) {
-                    KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
-                                  key_index,
-                                  keys[key_index],
-                                  loc_id.c_str(),
-                                  ec);
-                }
+        const auto &tasks = batch_tasks[key_index];
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            const auto &task = tasks[i];
+            if (get_ecs[i] != EC_OK) {
+                modifier_ecs[i] = get_ecs[i];
                 continue;
             }
-            const auto &task = batch_tasks[key_index][loc_index];
-            if ((!task.expected_location_value.empty() &&
-                 locs[loc_index]->ToJsonString() != task.expected_location_value) ||
-                locs[loc_index]->status() != task.old_status) {
-                modifier_ecs[loc_index] = ErrorCode::EC_MISMATCH;
-            } else {
-                updated = true;
-                // COW: copy the location, modify the copy, replace the pointer
-                auto new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
-                new_loc->set_status(task.new_status);
-                locs[loc_index] = std::move(new_loc);
+            if (locs[i]->status() != task.old_status ||
+                (!task.expected_location_value.empty() && locs[i]->ToJsonString() != task.expected_location_value)) {
+                continue;
             }
+            if (!task.expected_source_location_id.empty()) {
+                const size_t source_index = source_indexes[key_index][i];
+                const auto source_ec = get_ecs[source_index];
+                if (source_ec != EC_OK) {
+                    modifier_ecs[i] = source_ec == EC_NOENT ? EC_MISMATCH : source_ec;
+                    continue;
+                }
+                const auto &source = locs[source_index];
+                if (source->id() != task.expected_source_location_id ||
+                    source->create_time() != task.expected_source_create_time ||
+                    source->status() != task.expected_source_status ||
+                    (!task.expected_source_location_value.empty() &&
+                     source->ToJsonString() != task.expected_source_location_value)) {
+                    continue;
+                }
+            }
+            auto new_loc = std::make_shared<CacheLocation>(*locs[i]);
+            new_loc->set_status(task.new_status);
+            locs[i] = std::move(new_loc);
+            modifier_ecs[i] = EC_OK;
+            updated = true;
         }
-        if (!updated) {
-            // do not need to update status, skip and return ok
-            return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
-        }
-        return {ModifierAction::MA_OK, std::move(modifier_ecs)};
+        return {updated ? ModifierAction::MA_OK : ModifierAction::MA_SKIP, std::move(modifier_ecs)};
     };
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -3338,9 +3376,22 @@ ErrorCode MetaSearcher::BatchCASLocationStatus(RequestContext *request_context,
     auto result = meta_indexer_->ReadModifyWriteLocation(
         request_context, keys, location_ids_per_key, modifier, true, refresh_cache_from_persistent);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    out_batch_results = std::move(result.per_location_error_codes);
-
-    if (result.ec != ErrorCode::EC_OK) {
+    if (result.per_location_error_codes.size() != keys.size()) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            out_batch_results[i].assign(batch_tasks[i].size(), EC_MISMATCH);
+        }
+        return EC_MISMATCH;
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (result.per_location_error_codes[i].size() != location_ids_per_key[i].size()) {
+            out_batch_results[i].assign(batch_tasks[i].size(), EC_MISMATCH);
+            result.ec = EC_MISMATCH;
+            continue;
+        }
+        result.per_location_error_codes[i].resize(batch_tasks[i].size());
+        out_batch_results[i] = std::move(result.per_location_error_codes[i]);
+    }
+    if (result.ec != EC_OK) {
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
     }
     return result.ec;
@@ -3366,7 +3417,7 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
         }
     }
 
-    // Per-key CAD modifier: each slot is gated by a status match. Matching
+    // Per-key CAD modifier: each slot is gated by status and optional exact value. Matching
     // OK slots stay EC_OK (delete will be dispatched, payload size captured
     // for usage replay); mismatches yield EC_MISMATCH; NOENT is EC_OK
     // (idempotent); hard errors surface verbatim.
@@ -3392,7 +3443,10 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
                 }
                 continue;
             }
-            if (!locs[loc_index] || locs[loc_index]->status() != batch_tasks[key_index][loc_index].expect_status) {
+            const auto &task = batch_tasks[key_index][loc_index];
+            if (!locs[loc_index] || locs[loc_index]->status() != task.expect_status ||
+                (!task.expected_location_value.empty() &&
+                 locs[loc_index]->ToJsonString() != task.expected_location_value)) {
                 modifier_ecs[loc_index] = ErrorCode::EC_MISMATCH;
                 continue;
             }

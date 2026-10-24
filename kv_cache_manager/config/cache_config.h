@@ -64,7 +64,27 @@ public:
     }
     const MigrationConfig &migration_config() const { return migration_config_; }
     int64_t migration_copy_max_concurrency() const { return migration_config_.copy_max_concurrency(); }
+    int64_t migration_async_copy_max_concurrency() const { return migration_config_.async_copy_max_concurrency(); }
+    int64_t effective_migration_copy_max_concurrency() const {
+        return migration_config_.effective_copy_max_concurrency();
+    }
     MigrationMarkClearPolicy migration_mark_clear_policy() const { return migration_config_.mark_clear_policy(); }
+    MigrationCopyExecutionMode migration_copy_execution_mode() const {
+        return migration_config_.copy_execution_mode();
+    }
+    uint64_t migration_copy_max_inflight_bytes() const { return migration_config_.copy_max_inflight_bytes(); }
+    int64_t migration_copy_operation_deadline_ms() const {
+        return migration_config_.copy_operation_deadline_ms();
+    }
+    int64_t migration_copy_poll_initial_interval_ms() const {
+        return migration_config_.copy_poll_initial_interval_ms();
+    }
+    int64_t migration_copy_poll_max_interval_ms() const {
+        return migration_config_.copy_poll_max_interval_ms();
+    }
+    int64_t migration_copy_connect_timeout_ms() const { return migration_config_.copy_connect_timeout_ms(); }
+    int64_t migration_copy_submit_timeout_ms() const { return migration_config_.copy_submit_timeout_ms(); }
+    int64_t migration_copy_query_timeout_ms() const { return migration_config_.copy_query_timeout_ms(); }
     // Setters
     void set_reclaim_strategy(const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy) {
         reclaim_strategy_ = reclaim_strategy;
@@ -81,8 +101,35 @@ public:
     void set_migration_copy_max_concurrency(int64_t migration_copy_max_concurrency) {
         migration_config_.set_copy_max_concurrency(migration_copy_max_concurrency);
     }
+    void set_migration_async_copy_max_concurrency(int64_t value) {
+        migration_config_.set_async_copy_max_concurrency(value);
+    }
     void set_migration_mark_clear_policy(MigrationMarkClearPolicy migration_mark_clear_policy) {
         migration_config_.set_mark_clear_policy(migration_mark_clear_policy);
+    }
+    void set_migration_copy_execution_mode(MigrationCopyExecutionMode value) {
+        migration_config_.set_copy_execution_mode(value);
+    }
+    void set_migration_copy_max_inflight_bytes(uint64_t value) {
+        migration_config_.set_copy_max_inflight_bytes(value);
+    }
+    void set_migration_copy_operation_deadline_ms(int64_t value) {
+        migration_config_.set_copy_operation_deadline_ms(value);
+    }
+    void set_migration_copy_poll_initial_interval_ms(int64_t value) {
+        migration_config_.set_copy_poll_initial_interval_ms(value);
+    }
+    void set_migration_copy_poll_max_interval_ms(int64_t value) {
+        migration_config_.set_copy_poll_max_interval_ms(value);
+    }
+    void set_migration_copy_connect_timeout_ms(int64_t value) {
+        migration_config_.set_copy_connect_timeout_ms(value);
+    }
+    void set_migration_copy_submit_timeout_ms(int64_t value) {
+        migration_config_.set_copy_submit_timeout_ms(value);
+    }
+    void set_migration_copy_query_timeout_ms(int64_t value) {
+        migration_config_.set_copy_query_timeout_ms(value);
     }
     void set_migration_config(const MigrationConfig &migration_config) {
         migration_config_ = migration_config;

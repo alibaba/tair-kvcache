@@ -469,6 +469,23 @@ private:
     std::atomic<size_t> deleted_uri_count_{0};
 };
 
+class FailingDeleteBackend : public DeleteRecordingBackend {
+public:
+    using DeleteRecordingBackend::DeleteRecordingBackend;
+
+    std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &uris,
+                                  const std::string & /*trace_id*/,
+                                  std::function<void()> /*cb*/) override {
+        delete_calls_.fetch_add(1, std::memory_order_relaxed);
+        return std::vector<ErrorCode>(uris.size(), EC_ERROR);
+    }
+
+    size_t GetDeleteCallCount() const { return delete_calls_.load(std::memory_order_relaxed); }
+
+private:
+    std::atomic<size_t> delete_calls_{0};
+};
+
 class BlockingDeleteBackend : public DataStorageBackend {
 public:
     explicit BlockingDeleteBackend(std::shared_ptr<DataStorageBackend> delegate)
@@ -1486,6 +1503,42 @@ TEST_F(CacheManagerTest, TestRemoveInstanceDuringMetaRecoveryTransition) {
     EXPECT_TRUE(transitioned);
     EXPECT_EQ(nullptr, registry_manager_->GetRemovingInstanceInfo("test_instance"));
     EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance"));
+}
+
+TEST_F(CacheManagerTest, TestRemoveInstanceKeepsRegistrationWhileCopyPrepareIsCancelling) {
+    const std::string instance_id = "remove_active_copy";
+    ASSERT_EQ(EC_OK,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               {}).first);
+    const auto original = registry_manager_->GetInstanceInfo(request_context_.get(), instance_id);
+    auto manager = cache_manager_->migration_manager_;
+    MigrationManager::CopyTaskContext task;
+    task.instance_id = instance_id;
+    task.block_key = 123;
+    task.copy_execution_mode = MigrationCopyExecutionMode::ASYNC_REQUIRED;
+    task.state = MigrationManager::CopyTaskState::kPreparing;
+    {
+        std::lock_guard<std::mutex> lock(manager->task_mutex_);
+        manager->active_tasks_by_instance_[instance_id][task.block_key] = task;
+    }
+
+    // Cancellation does not release a preparation still owned by its submitter.
+    // The bounded drain must leave the instance registered until that owner exits.
+    EXPECT_EQ(EC_TIMEOUT, cache_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
+    EXPECT_EQ(original, registry_manager_->GetInstanceInfo(request_context_.get(), instance_id));
+    {
+        std::lock_guard<std::mutex> lock(manager->task_mutex_);
+        EXPECT_EQ(MigrationManager::CopyTaskState::kPrepareCancelling,
+                  manager->active_tasks_by_instance_.at(instance_id).at(task.block_key).state);
+        manager->active_tasks_by_instance_.erase(instance_id);
+    }
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), instance_id));
 }
 
 // RemoveInstance 的 per-instance draining 不得读写全局 Reclaimer pause 状态。
@@ -2996,13 +3049,27 @@ TEST_F(CacheManagerTest, TestTrimCacheRunsBoundedConcurrentDeletesBeforeSync) {
 TEST_F(CacheManagerTest, TestTrimCacheContinuesAfterPartialDeleteFailure) {
     auto *meta_backend = InstallControllableMetaBackend();
     ASSERT_NE(nullptr, meta_backend);
-    AddDummyLocationsForTrim(2048, "missing_storage");
+    auto storage_manager = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<FailingDeleteBackend>(storage_manager->storage_map_.at("hot_01"));
+    storage_manager->storage_map_["hot_01"] = backend;
+    AddDummyLocationsForTrim(2048, "hot_01");
 
     EXPECT_EQ(EC_ERROR,
               cache_manager_->TrimCache(
                   request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
     EXPECT_GT(meta_backend->GetListKeysCallCount(), 2 * cache_manager_->schedule_plan_executor_->GetWorkerCount());
     EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
+    EXPECT_EQ(8u, backend->GetDeleteCallCount()); // One attempt for each 256-key page.
+    const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    EXPECT_EQ(2048u, indexer->GetKeyCount());
+    CacheLocationMapVector locations;
+    const auto result = indexer->GetLocationsFromPrimary(request_context_.get(), {0, 2047}, locations);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), result.error_codes);
+    ASSERT_EQ(2u, locations.size());
+    for (const auto &location_map : locations) {
+        ASSERT_EQ(1u, location_map.size());
+        EXPECT_EQ(CLS_DELETING, location_map.begin()->second->status());
+    }
 }
 
 TEST_F(CacheManagerTest, TestTrimCacheStopsSubmittingAfterExecutorFailure) {
@@ -3034,13 +3101,17 @@ TEST_F(CacheManagerTest, TestTrimCacheSkipsPersistentResiduesAfterPartialFailure
     backend_manager.cache_backend_ = std::move(cache);
     backend_manager.memory_primary_ = true;
     backend_manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
-    AddDummyLocationsForTrim(1024, "missing_storage");
+    auto storage_manager = registry_manager_->data_storage_manager();
+    storage_manager->storage_map_["hot_01"] =
+        std::make_shared<FailingDeleteBackend>(storage_manager->storage_map_.at("hot_01"));
+    AddDummyLocationsForTrim(1024, "hot_01");
 
     EXPECT_EQ(EC_ERROR,
               cache_manager_->TrimCache(
                   request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
     EXPECT_EQ(0u, persistent->GetListKeysCallCount());
     EXPECT_EQ(1u, persistent->GetSyncAllCallCount());
+    EXPECT_EQ(1024u, indexer->GetKeyCount());
 }
 
 TEST_F(CacheManagerTest, TestTrimCacheSyncsBeforeCleaningPersistentResidueWithEmptyLocal) {

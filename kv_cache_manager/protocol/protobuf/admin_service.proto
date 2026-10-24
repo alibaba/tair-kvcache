@@ -241,6 +241,11 @@ enum MigrationMarkClearPolicy {
     MIGRATION_MARK_CLEAR_ON_FULL_BLOCK_COVERED = 1; // target CacheLocation 覆盖完整 block 后清标
 }
 
+enum MigrationCopyExecutionMode {
+    MIGRATION_COPY_SYNC = 0;
+    MIGRATION_COPY_ASYNC_REQUIRED = 1;
+}
+
 // 执行方式配置（Config 后缀用于区分 MigrationMethod 请求枚举）。
 
 // Copy 执行方式配置：通过 DataStorageBackend::Copy 把数据复制到目标 storage
@@ -271,8 +276,19 @@ message MigrationStrategy {
 
 message MigrationConfig {
     repeated MigrationStrategy strategies = 1; // 多层存储迁移规则，per-storage
-    google.protobuf.Int32Value copy_max_concurrency = 2; // instance group 级 Copy 并发上限
+    google.protobuf.Int32Value copy_max_concurrency = 2; // instance group 级同步 Copy 并发上限
     MigrationMarkClearPolicy mark_clear_policy = 3; // instance group 级 Mark 清理策略
+    MigrationCopyExecutionMode copy_execution_mode = 4;
+    google.protobuf.UInt64Value copy_max_inflight_bytes = 5;
+    reserved 6, 7;
+    reserved "copy_max_quarantine_operations", "copy_max_quarantine_bytes";
+    google.protobuf.Int64Value copy_operation_deadline_ms = 8;
+    google.protobuf.Int64Value copy_poll_initial_interval_ms = 9;
+    google.protobuf.Int64Value copy_poll_max_interval_ms = 10;
+    google.protobuf.Int64Value copy_connect_timeout_ms = 11;
+    google.protobuf.Int64Value copy_submit_timeout_ms = 12;
+    google.protobuf.Int64Value copy_query_timeout_ms = 13;
+    google.protobuf.Int32Value async_copy_max_concurrency = 14; // instance group 级异步 Copy 并发上限
 }
 
 enum CachePreferStrategy {

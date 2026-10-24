@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
@@ -8,6 +9,7 @@
 #include "google/protobuf/arena.h"
 #include "google/protobuf/util/json_util.h"
 #include "google/protobuf/util/message_differencer.h"
+#include "google/protobuf/wrappers.pb.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/cache_config.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
@@ -47,6 +49,68 @@ TEST(ProtoConvertTest, MemoryPrimaryRoundTrip) {
     ProtoConvert::CacheConfigFromProto(&legacy, config);
     EXPECT_FALSE(config.meta_indexer_config()->GetMetaStorageBackendConfig()->GetMemoryPrimary());
     EXPECT_TRUE(config.meta_indexer_config()->GetMetaStorageBackendConfig()->GetForceDeletingAsyncEnqueue());
+}
+
+TEST(ProtoConvertTest, MigrationCopyLimitDefaultsAndExplicitValues) {
+    struct TestCase {
+        const char *json;
+        int64_t sync_concurrency;
+        int64_t async_concurrency;
+        int64_t effective_concurrency;
+        uint64_t bytes;
+        bool valid;
+    };
+    const TestCase cases[] = {
+        {R"({})", 1, 1024, 1, 1099511627776ULL, true},
+        {R"({"migration_config":{}})", 1, 1024, 1, 1099511627776ULL, true},
+        {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED"}})",
+         1, 1024, 1024, 1099511627776ULL, true},
+        {R"({"migration_config":{"copy_max_concurrency":6,"async_copy_max_concurrency":17,"copy_max_inflight_bytes":"12884901888"}})",
+         6, 17, 6, 12884901888ULL, true},
+        {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED","copy_max_concurrency":6,"async_copy_max_concurrency":17}})",
+         6, 17, 17, 1099511627776ULL, true},
+        // An old async configuration's sync field must not become an async fallback.
+        {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED","copy_max_concurrency":64}})",
+         64, 1024, 1024, 1099511627776ULL, true},
+        {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED","copy_max_inflight_bytes":"0"}})",
+         1, 1024, 1024, 0, false},
+        {R"({"migration_config":{"copy_max_concurrency":0}})", 0, 1024, 0, 1099511627776ULL, false},
+        {R"({"migration_config":{"copy_max_concurrency":-1}})", -1, 1024, -1, 1099511627776ULL, false},
+        {R"({"migration_config":{"async_copy_max_concurrency":0}})", 1, 0, 1, 1099511627776ULL, false},
+        {R"({"migration_config":{"async_copy_max_concurrency":-1}})", 1, -1, 1, 1099511627776ULL, false},
+    };
+    for (const auto &test : cases) {
+        SCOPED_TRACE(test.json);
+        proto::admin::CacheConfig request;
+        ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(test.json, &request));
+        CacheConfig config;
+        config.set_migration_copy_max_concurrency(2);
+        config.set_migration_async_copy_max_concurrency(3);
+        config.set_migration_copy_execution_mode(MigrationCopyExecutionMode::ASYNC_REQUIRED);
+        config.set_migration_copy_max_inflight_bytes(64);
+        ProtoConvert::CacheConfigFromProto(&request, config);
+        EXPECT_EQ(test.sync_concurrency, config.migration_copy_max_concurrency());
+        EXPECT_EQ(test.async_concurrency, config.migration_async_copy_max_concurrency());
+        EXPECT_EQ(test.effective_concurrency, config.effective_migration_copy_max_concurrency());
+        EXPECT_EQ(test.bytes, config.migration_copy_max_inflight_bytes());
+        std::string invalid_fields;
+        EXPECT_EQ(test.valid, config.migration_config().ValidateRequiredFields(invalid_fields)) << invalid_fields;
+
+        proto::admin::CacheConfig round_trip;
+        ProtoConvert::CacheConfigToProto(config, &round_trip);
+        ASSERT_TRUE(round_trip.migration_config().has_copy_max_concurrency());
+        ASSERT_TRUE(round_trip.migration_config().has_async_copy_max_concurrency());
+        ASSERT_TRUE(round_trip.migration_config().has_copy_max_inflight_bytes());
+        EXPECT_EQ(test.sync_concurrency, round_trip.migration_config().copy_max_concurrency().value());
+        EXPECT_EQ(test.async_concurrency, round_trip.migration_config().async_copy_max_concurrency().value());
+        EXPECT_EQ(test.bytes, round_trip.migration_config().copy_max_inflight_bytes().value());
+
+        std::string response_json;
+        ASSERT_TRUE(ProtoMessageJsonUtil::ToJson(&round_trip, response_json));
+        proto::admin::CacheConfig parsed_response;
+        ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(response_json, &parsed_response));
+        EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(round_trip, parsed_response));
+    }
 }
 
 namespace {
@@ -116,6 +180,102 @@ TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesCurrentMapAndWrapperTypes) 
     proto::admin::MigrationMarkMethodConfig parsed_wrapper;
     ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(wrapper_json, &parsed_wrapper));
     EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(wrapper_message, parsed_wrapper));
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecUInt64WrapperPreservesExactNumericAndStringInputs) {
+    ASSERT_TRUE(FastProtoJsonCodec::Supports(google::protobuf::UInt64Value::descriptor()));
+    ASSERT_TRUE(FastProtoJsonCodec::Supports(proto::admin::MigrationConfig::descriptor()));
+    // Protobuf's serializer emits strings; also exercise unquoted integers that
+    // would lose precision if the wrapper parser went through a double.
+    const uint64_t values[] = {9007199254740993ULL, std::numeric_limits<uint64_t>::max()};
+    for (const uint64_t value : values) {
+        const std::string quoted_value = "\"" + std::to_string(value) + "\"";
+        for (bool quoted : {false, true}) {
+            const std::string input = quoted ? quoted_value : std::to_string(value);
+            SCOPED_TRACE(input);
+            google::protobuf::UInt64Value wrapper;
+            google::protobuf::UInt64Value protobuf_wrapper;
+            ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(input, &wrapper));
+            ASSERT_TRUE(ProtobufFromJson(input, &protobuf_wrapper));
+            EXPECT_EQ(value, wrapper.value());
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_wrapper, wrapper));
+            std::string wrapper_json;
+            ASSERT_TRUE(FastProtoJsonCodec::TryToJson(wrapper, wrapper_json));
+            EXPECT_EQ(quoted_value, wrapper_json);
+
+            const std::string config_input = "{\"copy_max_inflight_bytes\":" + input + "}";
+            proto::admin::MigrationConfig config;
+            proto::admin::MigrationConfig protobuf_config;
+            ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(config_input, &config));
+            ASSERT_TRUE(ProtobufFromJson(config_input, &protobuf_config));
+            ASSERT_TRUE(config.has_copy_max_inflight_bytes());
+            EXPECT_EQ(value, config.copy_max_inflight_bytes().value());
+            EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_config, config));
+            std::string config_json;
+            std::string protobuf_json;
+            ASSERT_TRUE(FastProtoJsonCodec::TryToJson(config, config_json));
+            ASSERT_TRUE(ProtobufToJson(protobuf_config, &protobuf_json));
+            EXPECT_EQ(protobuf_json, config_json);
+        }
+    }
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecUInt64WrapperPresence) {
+    struct TestCase {
+        const char *json;
+        bool present;
+    };
+    const TestCase cases[] = {
+        {R"({"copy_max_inflight_bytes":0})", true},
+        {R"({"copy_max_inflight_bytes":"0"})", true},
+        {R"({"copy_max_inflight_bytes":null})", false},
+        {R"({})", false},
+    };
+    ASSERT_TRUE(FastProtoJsonCodec::Supports(proto::admin::MigrationConfig::descriptor()));
+    for (const auto &test : cases) {
+        SCOPED_TRACE(test.json);
+        proto::admin::MigrationConfig config;
+        config.mutable_copy_max_inflight_bytes()->set_value(42);
+        config.mutable_copy_max_concurrency()->set_value(7);
+        proto::admin::MigrationConfig protobuf_config;
+        ASSERT_TRUE(FastProtoJsonCodec::TryFromJson(test.json, &config));
+        ASSERT_TRUE(ProtobufFromJson(test.json, &protobuf_config));
+        EXPECT_EQ(test.present, config.has_copy_max_inflight_bytes());
+        EXPECT_EQ(0u, config.copy_max_inflight_bytes().value());
+        EXPECT_TRUE(google::protobuf::util::MessageDifferencer::Equals(protobuf_config, config));
+        std::string config_json;
+        std::string protobuf_json;
+        ASSERT_TRUE(FastProtoJsonCodec::TryToJson(config, config_json));
+        ASSERT_TRUE(ProtobufToJson(protobuf_config, &protobuf_json));
+        EXPECT_EQ(protobuf_json, config_json);
+        EXPECT_EQ(test.present, config_json.find("\"copy_max_inflight_bytes\":\"0\"") != std::string::npos);
+    }
+}
+
+TEST_F(ProtoMessageJsonUtilTest, TestFastCodecRejectsInvalidUInt64WrappersTransactionally) {
+    const char *invalid_values[] = {"-1", "\"-1\"", "18446744073709551616", "\"18446744073709551616\""};
+    ASSERT_TRUE(FastProtoJsonCodec::Supports(google::protobuf::UInt64Value::descriptor()));
+    ASSERT_TRUE(FastProtoJsonCodec::Supports(proto::admin::MigrationConfig::descriptor()));
+    for (const char *value : invalid_values) {
+        SCOPED_TRACE(value);
+        google::protobuf::UInt64Value wrapper;
+        wrapper.set_value(42);
+        google::protobuf::UInt64Value protobuf_wrapper;
+        EXPECT_FALSE(ProtobufFromJson(value, &protobuf_wrapper));
+        EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(value, &wrapper));
+        EXPECT_EQ(42u, wrapper.value());
+
+        proto::admin::MigrationConfig config;
+        config.mutable_copy_max_concurrency()->set_value(7);
+        config.mutable_copy_max_inflight_bytes()->set_value(42);
+        const std::string before = config.SerializeAsString();
+        // Parse a valid sibling first: failure must not commit a partial message.
+        const std::string input = std::string("{\"copy_max_concurrency\":9,\"copy_max_inflight_bytes\":") + value + "}";
+        proto::admin::MigrationConfig protobuf_config;
+        EXPECT_FALSE(ProtobufFromJson(input, &protobuf_config));
+        EXPECT_FALSE(FastProtoJsonCodec::TryFromJson(input, &config));
+        EXPECT_EQ(before, config.SerializeAsString());
+    }
 }
 
 TEST_F(ProtoMessageJsonUtilTest, TestFastCodecHandlesBytesWithProtobufBase64Semantics) {

@@ -193,6 +193,54 @@ TEST_F(InstanceGroupTest, ProtoRoundTripWithoutBuckets) {
     EXPECT_TRUE(restored.revisit_interval_buckets().empty());
 }
 
+TEST_F(InstanceGroupTest, ProtoRoundTripPreservesAsyncCopyHttpTimeouts) {
+    InstanceGroup original;
+    original.set_name("test_group");
+    original.set_storage_candidates({"local"});
+    original.set_global_quota_group_name("default");
+    original.set_max_instance_count(10);
+    original.set_version(1);
+
+    auto cache_config = std::make_shared<CacheConfig>();
+    cache_config->set_reclaim_strategy(std::make_shared<CacheReclaimStrategy>());
+    cache_config->set_migration_copy_connect_timeout_ms(750);
+    cache_config->set_migration_copy_submit_timeout_ms(2500);
+    cache_config->set_migration_copy_query_timeout_ms(2800);
+    original.set_cache_config(cache_config);
+
+    proto::admin::InstanceGroup proto_msg;
+    ProtoConvert::InstanceGroupToProto(original, &proto_msg);
+    ASSERT_TRUE(proto_msg.has_cache_config());
+    ASSERT_TRUE(proto_msg.cache_config().has_migration_config());
+    const auto &migration_config = proto_msg.cache_config().migration_config();
+    ASSERT_TRUE(migration_config.has_copy_connect_timeout_ms());
+    ASSERT_TRUE(migration_config.has_copy_submit_timeout_ms());
+    ASSERT_TRUE(migration_config.has_copy_query_timeout_ms());
+    EXPECT_EQ(750, migration_config.copy_connect_timeout_ms().value());
+    EXPECT_EQ(2500, migration_config.copy_submit_timeout_ms().value());
+    EXPECT_EQ(2800, migration_config.copy_query_timeout_ms().value());
+
+    InstanceGroup restored;
+    ProtoConvert::InstanceGroupFromProto(&proto_msg, restored);
+    ASSERT_NE(nullptr, restored.cache_config());
+    EXPECT_EQ(750, restored.cache_config()->migration_copy_connect_timeout_ms());
+    EXPECT_EQ(2500, restored.cache_config()->migration_copy_submit_timeout_ms());
+    EXPECT_EQ(2800, restored.cache_config()->migration_copy_query_timeout_ms());
+
+    proto_msg.mutable_cache_config()->mutable_migration_config()->clear_copy_connect_timeout_ms();
+    proto_msg.mutable_cache_config()->mutable_migration_config()->clear_copy_submit_timeout_ms();
+    proto_msg.mutable_cache_config()->mutable_migration_config()->clear_copy_query_timeout_ms();
+    InstanceGroup restored_legacy;
+    ProtoConvert::InstanceGroupFromProto(&proto_msg, restored_legacy);
+    ASSERT_NE(nullptr, restored_legacy.cache_config());
+    EXPECT_EQ(MigrationConfig::kDefaultCopyConnectTimeoutMs,
+              restored_legacy.cache_config()->migration_copy_connect_timeout_ms());
+    EXPECT_EQ(MigrationConfig::kDefaultCopySubmitTimeoutMs,
+              restored_legacy.cache_config()->migration_copy_submit_timeout_ms());
+    EXPECT_EQ(MigrationConfig::kDefaultCopyQueryTimeoutMs,
+              restored_legacy.cache_config()->migration_copy_query_timeout_ms());
+}
+
 TEST_F(InstanceGroupTest, EventReportStorageSpecProtoRoundTripPreservesSnapshotSettings) {
     proto::admin::StorageConfig legacy_proto_config;
     legacy_proto_config.set_global_unique_name("legacy_event_report");

@@ -1515,6 +1515,37 @@ TEST_F(CacheGarbageCollectorTest, ActiveMigrationCopyTargetIsNotCollected) {
     EXPECT_EQ(2, gc->get_cache_gc_candidate_count_metrics());
 }
 
+TEST_F(CacheGarbageCollectorTest, AbandonedCopyTargetAndMissingSourceUseOrdinaryCleanup) {
+    auto config = DefaultConfig();
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
+    const int64_t source_create_time = now_us - 100;
+    const std::string source_uri = "dummy://pace_dram/source?size=1";
+    might_exist_by_uri[source_uri] = false;
+
+    auto source = MakeStoredLocation(
+        "source_location", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {source_uri});
+    source->set_create_time(source_create_time);
+    auto target = MakeLocation(
+        "target_location", CLS_WRITING, now_us - config.orphan_writing_grace_period_ms * 1000 - 1);
+
+    CacheLocationMap locations;
+    locations[source->id()] = source;
+    locations[target->id()] = target;
+    const auto request =
+        gc->BuildDeleteActions("instance_a", MakeBatch(SCAN_BASE_CURSOR, {10}, {locations}), now_us)
+            .executor_request;
+
+    ASSERT_EQ((KeyVector{10}), request.block_keys);
+    ASSERT_EQ(1u, request.location_ids.size());
+    EXPECT_EQ((std::set<std::string>{"source_location", "target_location"}),
+              (std::set<std::string>(request.location_ids[0].begin(), request.location_ids[0].end())));
+    EXPECT_FALSE(might_exist_calls.empty());
+    EXPECT_TRUE(gc->IsOrphanWriting(target->id(), *target, now_us));
+}
+
 TEST_F(CacheGarbageCollectorTest, MissingScannedKeyIsNotCountedAsOperationError) {
     auto gc = MakeGc(DefaultConfig());
     PrepareForSingleStep(*gc);

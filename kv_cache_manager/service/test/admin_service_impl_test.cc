@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -278,6 +279,9 @@ TEST_F(AdminServiceImplTest, TestExplicitBlockKeysCopyDeduplicatesBeforeConcurre
 
 TEST_F(AdminServiceImplTest, TestAdminCopyRespectsGroupConcurrencyLimit) {
     SetDefaultCopyConcurrency(1);
+    auto config = registry_manager_->instance_group_configs_.at("default")->cache_config_;
+    config->set_migration_async_copy_max_concurrency(17);
+    config->set_migration_copy_execution_mode(MigrationCopyExecutionMode::SYNC);
     SeedServingSource(111);
     SeedServingSource(112);
     SeedServingSource(113);
@@ -345,10 +349,21 @@ TEST_F(AdminServiceImplTest, TestAdminAndReclaimerCopyShareGroupConcurrencyLimit
     reclaimer_req.instance_group_name = "default";
     reclaimer_req.instance_id = kInstance;
     reclaimer_req.block_key = 142;
-    reclaimer_req.src_location_id = "reclaimer_src_142";
     reclaimer_req.src_storage_name = "hot_01";
     reclaimer_req.dst_storage_name = "cold_01";
-    reclaimer_req.src_specs = {LocationSpec("tp0", "dummy://hot_01/reclaimer_142?size=16")};
+    // Use the actual sampled location, including its identity snapshot.
+    // Invented IDs/specs are correctly rejected before competing for a slot.
+    MetaSearcher searcher(cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance));
+    RequestContext sample_context("reclaimer_sample");
+    std::vector<CacheLocationMap> sampled;
+    ASSERT_EQ(EC_OK, searcher.BatchGetLocation(&sample_context, {142}, {}, sampled));
+    ASSERT_EQ(1u, sampled.size());
+    ASSERT_EQ(1u, sampled.front().size());
+    const auto &source = *sampled.front().begin()->second;
+    reclaimer_req.src_location_id = source.id();
+    reclaimer_req.src_create_time = source.create_time();
+    reclaimer_req.src_location_value = source.ToJsonString();
+    reclaimer_req.src_specs = source.location_specs();
 
     std::vector<ErrorCode> reclaimer_results;
     std::atomic<int> ready{0};

@@ -37,8 +37,10 @@ public:
                                   const std::vector<ErrorCode> &previous_error_codes) noexcept override {
         std::vector<ErrorCode> results = previous_error_codes;
         for (size_t i = 0; i < results.size(); ++i) {
-            if (results[i] == EC_OK && (!admit_upserts || rejected_upsert_keys.count(keys[i]) != 0)) {
+            if (results[i] == EC_OK &&
+                (!admit_upserts || (enforce_rejected_keys.load() && rejected_upsert_keys.count(keys[i]) != 0))) {
                 results[i] = EC_TIMEOUT;
+                ++rejected_upsert_count;
             }
         }
         return MetaLocalBackend::Upsert(request_context, keys, locations, properties, results);
@@ -51,7 +53,7 @@ public:
         forced_upsert_keys.insert(forced_upsert_keys.end(), keys.begin(), keys.end());
         std::vector<ErrorCode> results(keys.size(), EC_OK);
         for (size_t i = 0; i < keys.size(); ++i) {
-            if (rejected_force_upsert_keys.count(keys[i]) != 0) {
+            if (enforce_rejected_keys.load() && rejected_force_upsert_keys.count(keys[i]) != 0) {
                 results[i] = EC_TIMEOUT;
             }
         }
@@ -68,6 +70,8 @@ public:
     size_t sync_calls = 0;
     std::unordered_set<KeyType> rejected_upsert_keys;
     std::unordered_set<KeyType> rejected_force_upsert_keys;
+    std::atomic<bool> enforce_rejected_keys{true};
+    std::atomic<size_t> rejected_upsert_count{0};
     KeyVector last_sync_keys;
     KeyVector forced_upsert_keys;
 };
@@ -109,6 +113,19 @@ ErrorCode RefreshLocationBeforeCas(void *obj,
     return searcher->BatchCASLocationStatus(context, keys, tasks, results, authoritative_read);
 }
 
+Stub *delete_admission_race_stub = nullptr;
+std::function<void()> before_delete_admission_cas;
+ErrorCode RaceDeleteAdmissionBeforeCas(void *obj,
+                                       RequestContext *context,
+                                       const KeyVector &keys,
+                                       const std::vector<std::vector<MetaSearcher::LocationCASTask>> &tasks,
+                                       std::vector<std::vector<ErrorCode>> &results,
+                                       bool authoritative_read) {
+    delete_admission_race_stub->reset(ADDR(MetaSearcher, BatchCASLocationStatus));
+    before_delete_admission_cas();
+    return static_cast<MetaSearcher *>(obj)->BatchCASLocationStatus(context, keys, tasks, results, authoritative_read);
+}
+
 bool MetaIndexer_Sync_stub(void *obj, const KeyVector &keys) noexcept {
     (void)obj;
     (void)keys;
@@ -120,6 +137,28 @@ bool MetaIndexer_Sync_stub(void *obj, const KeyVector &keys) noexcept {
     std::this_thread::sleep_for(std::chrono::milliseconds(sync_delay_ms.load(std::memory_order_relaxed)));
     sync_completed.store(true, std::memory_order_release);
     return true;
+}
+
+bool MetaIndexer_Sync_fail_stub(void * /*obj*/, const KeyVector & /*keys*/) noexcept { return false; }
+std::atomic<size_t> sync_attempts{0};
+bool MetaIndexer_Sync_fail_once_stub(void *, const KeyVector &) noexcept { return sync_attempts++ > 0; }
+
+Stub *delete_cad_stub = nullptr;
+size_t delete_cad_attempts = 0;
+ErrorCode FailFirstDeleteCad(void *object,
+                             RequestContext *context,
+                             const KeyVector &keys,
+                             const std::vector<std::vector<MetaSearcher::LocationCADTask>> &tasks,
+                             std::vector<std::vector<ErrorCode>> &results) {
+    if (++delete_cad_attempts == 1) {
+        results.clear();
+        for (const auto &batch : tasks) {
+            results.emplace_back(batch.size(), EC_ERROR);
+        }
+        return EC_ERROR;
+    }
+    delete_cad_stub->reset(ADDR(MetaSearcher, BatchCADLocationStatus));
+    return static_cast<MetaSearcher *>(object)->BatchCADLocationStatus(context, keys, tasks, results);
 }
 
 std::shared_ptr<MetaIndexer> MetaIndexerManager_GetMetaIndexer_throw_stub(void *obj, const std::string &instance_id) {
@@ -195,6 +234,30 @@ public:
     std::function<void()> on_delete;
     std::map<std::string, ErrorCode> delete_results_by_uri;
     std::vector<std::vector<DataStorageUri>> delete_batches;
+};
+
+class FailingDeleteBackend : public RecordingDeleteBackend {
+public:
+    enum class Failure { kError, kTimeout, kShort, kException };
+    explicit FailingDeleteBackend(Failure failure = Failure::kError)
+        : RecordingDeleteBackend("retry_delete", DataStorageType::DATA_STORAGE_TYPE_DUMMY, false), failure_(failure) {}
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+        ++calls;
+        switch (failure_) {
+        case Failure::kShort:
+            return {};
+        case Failure::kException:
+            throw std::runtime_error("injected Delete exception");
+        case Failure::kTimeout:
+            return std::vector<ErrorCode>(uris.size(), EC_TIMEOUT);
+        case Failure::kError:
+            return std::vector<ErrorCode>(uris.size(), EC_ERROR);
+        }
+        return {};
+    }
+    const Failure failure_;
+    std::atomic<size_t> calls{0};
 };
 
 class SchedulePlanExecutorTestHelper {
@@ -350,6 +413,19 @@ public:
         return backend;
     }
 
+    SyncResultBackend *EnableMemoryPrimary() {
+        auto &manager = *indexer->backend_manager_;
+        manager.cache_backend_.reset(static_cast<MetaLocalBackend *>(manager.persistent_backend_.release()));
+        auto backup = std::make_unique<SyncResultBackend>();
+        EXPECT_EQ(EC_OK, backup->Init(kTestInstanceName, std::make_shared<MetaStorageBackendConfig>()));
+        EXPECT_EQ(EC_OK, backup->Open());
+        backup->sync_ok = true;
+        auto *result = backup.get();
+        manager.persistent_backend_ = std::move(backup);
+        manager.memory_primary_ = true;
+        return result;
+    }
+
     void SetLocation(int64_t key, const std::string &id, DataStorageType type, const std::vector<std::string> &uris) {
         std::vector<LocationSpec> specs;
         for (size_t i = 0; i < uris.size(); ++i) {
@@ -388,6 +464,15 @@ public:
         auto submitted = executor->SubmitAsync(request);
         EXPECT_TRUE(submitted.accepted);
         return submitted.future.get();
+    }
+
+    // Inspect direct-call diagnostics; public entry points also complete failures as results.
+    PlanExecuteResult RunOnce(const CacheLocationDelRequest &request) {
+        auto admission = executor->PrepareDeleteTask(request);
+        if (admission.result.status != EC_OK || !admission.needs_physical_delete) {
+            return admission.result;
+        }
+        return executor->DoLocationDelTask(admission.actual_task, admission.indexer);
     }
 
     std::vector<std::string> DeletedUris(const RecordingDeleteBackend &backend) {
@@ -432,7 +517,8 @@ TEST_F(BackendGcDeleteTest, BackendPolicyHandlesAllAndPartiallyMissingLocations)
                     !skip ? std::vector<std::string>{first, second}
                           : (all_missing ? std::vector<std::string>{} : std::vector<std::string>{second});
                 EXPECT_EQ(expected, DeletedUris(*backend));
-                EXPECT_EQ(1u, backend->policy_queries);
+                // Admission and retirement checks may consult the policy again.
+                EXPECT_GT(backend->policy_queries, 0u);
                 const auto remaining = Locations(key);
                 ASSERT_EQ(1u, remaining.size());
                 EXPECT_EQ(replica, remaining.at("replica")->ToJsonString());
@@ -518,6 +604,63 @@ TEST_F(BackendGcDeleteTest, MetadataOnlySkipsDeleteForBothSettings) {
     }
 }
 
+TEST_F(BackendGcDeleteTest, ReadOnlyStorageAlsoDefersExplicitDeletingResume) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    auto backend = AddBackend("resume_read_only", type);
+    const std::string uri = "pace://resume_read_only/1?size=5";
+    SetLocation(100, "target", type, {uri});
+    auto request = Request(100, {"target"}, {});
+    backend->delete_result = EC_ERROR;
+    EXPECT_EQ(EC_PARTIAL_OK, Run(request).status);
+    const auto deleting_value = Locations(100).at("target")->ToJsonString();
+    ASSERT_EQ(CLS_DELETING, Locations(100).at("target")->status());
+    ASSERT_EQ(1u, backend->delete_batches.size());
+
+    backend->read_only = true;
+    backend->delete_result = EC_OK;
+    request.resume_deleting = true;
+    EXPECT_EQ(EC_OK, Run(request).status);
+    EXPECT_EQ(1u, backend->delete_batches.size());
+    EXPECT_EQ(deleting_value, Locations(100).at("target")->ToJsonString());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+
+    backend->read_only = false;
+    EXPECT_EQ(EC_OK, Run(request).status);
+    EXPECT_EQ(2u, backend->delete_batches.size());
+    EXPECT_TRUE(Locations(100).empty());
+    EXPECT_EQ(0u, indexer->GetStorageUsage());
+}
+
+TEST_F(BackendGcDeleteTest, DetachedIndexerDeleteFailureCompletesOnceAndAllowsExplicitRetry) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("detached_delete", type);
+    SetLocation(100, "target", type, {"dummy://detached_delete/1?size=5"});
+    backend->delete_result = EC_ERROR;
+    const auto detached_indexer = meta_manager_->ExtractMetaIndexer(kTestInstanceName);
+    ASSERT_EQ(indexer, detached_indexer);
+    ASSERT_EQ(nullptr, meta_manager_->GetMetaIndexer(kTestInstanceName));
+    const CacheMetaDelRequest request{.instance_id = kTestInstanceName, .block_keys = {100}};
+
+    auto future = executor->Submit(request, detached_indexer);
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(EC_PARTIAL_OK, future.get().status);
+    EXPECT_EQ(1u, backend->delete_batches.size());
+    EXPECT_EQ(CLS_DELETING, Locations(100).at("target")->status());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        EXPECT_EQ(0u, executor->WaitingTaskCountLocked());
+    }
+
+    backend->delete_result = EC_OK;
+    auto retry = executor->Submit(request, detached_indexer);
+    ASSERT_EQ(std::future_status::ready, retry.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(EC_OK, retry.get().status);
+    EXPECT_EQ(2u, backend->delete_batches.size());
+    EXPECT_TRUE(Locations(100).empty());
+    EXPECT_EQ(0u, indexer->GetStorageUsage());
+}
+
 TEST_F(BackendGcDeleteTest, RefreshedSnapshotAndCasLoserKeepTheirLocationsAndUsage) {
     const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
     auto backend = AddBackend("pace_gc", type);
@@ -540,12 +683,13 @@ TEST_F(BackendGcDeleteTest, RefreshedSnapshotAndCasLoserKeepTheirLocationsAndUsa
     cas_stub.set(ADDR(MetaSearcher, BatchCASLocationStatus), RefreshLocationBeforeCas);
     const auto result = Run(request);
     cas_refresh_stub = nullptr;
-    EXPECT_EQ(EC_OK, result.status);
-    EXPECT_EQ((std::vector<std::string>{old_uri}), DeletedUris(*backend));
+    EXPECT_EQ(EC_MISMATCH, result.status);
+    EXPECT_TRUE(backend->delete_batches.empty());
     const auto remaining = Locations(101);
-    ASSERT_EQ(1u, remaining.size());
+    ASSERT_EQ(2u, remaining.size());
+    EXPECT_EQ(CLS_DELETING, remaining.at("unchanged")->status());
     EXPECT_EQ(CLS_WRITING, remaining.at("refreshed")->status());
-    EXPECT_EQ(26u, indexer->GetStorageUsage());
+    EXPECT_EQ(31u, indexer->GetStorageUsage());
 }
 
 TEST_F(BackendGcDeleteTest, FinalCadKeepsLocationRefreshedDuringBackendDelete) {
@@ -555,13 +699,13 @@ TEST_F(BackendGcDeleteTest, FinalCadKeepsLocationRefreshedDuringBackendDelete) {
     const std::string fresh_uri = "pace://pace_gc/2?size=13";
     SetLocation(100, "target", type, {old_uri});
     backend->on_delete = [&] { SetLocation(100, "target", type, {fresh_uri}); };
-    EXPECT_EQ(EC_PARTIAL_OK, Run(Request(100, {"target"}, {old_uri})).status);
+    EXPECT_EQ(EC_PARTIAL_OK, RunOnce(Request(100, {"target"}, {old_uri})).status);
     EXPECT_EQ((std::vector<std::string>{old_uri}), DeletedUris(*backend));
     EXPECT_EQ(fresh_uri, Locations(100).at("target")->location_specs().front().uri());
     EXPECT_EQ(13u, indexer->GetStorageUsage());
 }
 
-TEST_F(BackendGcDeleteTest, DeleteResultsPreserveExistingMetadataUsageAndLogContracts) {
+TEST_F(BackendGcDeleteTest, FailedDeleteAttemptRetainsMetadataUsageAndLogsDiagnostics) {
     const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
     Stub log_stub;
     log_stub.set(ADDR(LoggerBroker, Log), CapturePhysicalDeleteWarnings);
@@ -573,12 +717,20 @@ TEST_F(BackendGcDeleteTest, DeleteResultsPreserveExistingMetadataUsageAndLogCont
         const std::string uri = "pace://pace_gc/" + std::to_string(key) + "?size=5";
         SetLocation(key, "target", type, {uri});
         physical_delete_warnings.clear();
-        const auto result = Run(Request(key, {"target"}, {uri}));
+        auto request = Request(key, {"target"}, {uri});
+        const auto result = RunOnce(request);
         const bool failed = ec != EC_OK && ec != EC_NOENT;
         EXPECT_EQ(failed ? EC_PARTIAL_OK : EC_OK, result.status);
         EXPECT_EQ(failed, result.error_logged);
-        EXPECT_EQ(failed ? 1u : 0u, physical_delete_warnings.size());
+        EXPECT_EQ(failed ? 2u : 0u, physical_delete_warnings.size());
         EXPECT_EQ((std::vector<std::string>{uri}), DeletedUris(*backend));
+        if (failed) {
+            EXPECT_EQ(CLS_DELETING, Locations(key).at("target")->status());
+            EXPECT_EQ(5u, indexer->GetStorageUsage());
+            backend->delete_result = EC_OK;
+            request.resume_deleting = true;
+            EXPECT_EQ(EC_OK, Run(request).status);
+        }
         EXPECT_TRUE(Locations(key).empty());
         EXPECT_EQ(0u, indexer->GetStorageUsage());
         ++key;
@@ -588,17 +740,393 @@ TEST_F(BackendGcDeleteTest, DeleteResultsPreserveExistingMetadataUsageAndLogCont
     const std::string uri = "pace://pace_gc/200?size=5";
     SetLocation(200, "target", type, {uri});
     backend->short_result = true;
-    EXPECT_EQ(EC_PARTIAL_OK, Run(Request(200, {"target"}, {uri})).status);
-    EXPECT_TRUE(Locations(200).empty());
+    auto request = Request(200, {"target"}, {uri});
+    EXPECT_EQ(EC_PARTIAL_OK, RunOnce(request).status);
+    EXPECT_EQ(CLS_DELETING, Locations(200).at("target")->status());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+    backend->short_result = false;
+    request.resume_deleting = true;
+    EXPECT_EQ(EC_OK, Run(request).status);
     EXPECT_EQ(0u, indexer->GetStorageUsage());
 
     SetLocation(201, "target", type, {uri});
     backend->throw_on_delete = true;
-    const auto result = Run(Request(201, {"target"}, {uri}));
-    EXPECT_EQ(EC_ERROR, result.status);
-    EXPECT_FALSE(result.error_logged);
+    EXPECT_THROW(RunOnce(Request(201, {"target"}, {uri})), std::runtime_error);
     EXPECT_EQ(CLS_DELETING, Locations(201).at("target")->status());
     EXPECT_EQ(5u, indexer->GetStorageUsage());
+}
+
+TEST_F(BackendGcDeleteTest, OrdinaryDeleteFailureCompletesOnceAndRetainsMetadataUsage) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    const std::array<FailingDeleteBackend::Failure, 4> failures{FailingDeleteBackend::Failure::kError,
+                                                                FailingDeleteBackend::Failure::kTimeout,
+                                                                FailingDeleteBackend::Failure::kShort,
+                                                                FailingDeleteBackend::Failure::kException};
+    for (size_t i = 0; i < failures.size(); ++i) {
+        SCOPED_TRACE(i);
+        const int64_t key = 300 + i;
+        auto backend = std::make_shared<FailingDeleteBackend>(failures[i]);
+        data_storage_manager_->storage_map_["retry_delete"] = backend;
+        SetLocation(key, "target", type, {"dummy://retry_delete/" + std::to_string(key) + "?size=5"});
+        std::future<PlanExecuteResult> future;
+        // Cover the synchronous/asynchronous metadata and location entries
+        // shared by RemoveCache, migration, Reclaimer and GC.
+        if (i == 0) {
+            future = executor->Submit(CacheMetaDelRequest{kTestInstanceName, {key}});
+        } else if (i == 1) {
+            future = executor->Submit(Request(key, {"target"}, {}));
+        } else if (i == 2) {
+            auto submit = executor->SubmitAsync(Request(key, {"target"}, {}));
+            ASSERT_TRUE(submit.accepted);
+            future = std::move(submit.future);
+        } else {
+            auto submit = executor->SubmitAsync(CacheMetaDelRequest{kTestInstanceName, {key}});
+            ASSERT_TRUE(submit.accepted);
+            future = std::move(submit.future);
+        }
+        ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(1)));
+        EXPECT_EQ(failures[i] == FailingDeleteBackend::Failure::kException ? EC_ERROR : EC_PARTIAL_OK,
+                  future.get().status);
+        EXPECT_EQ(1u, backend->calls.load());
+        EXPECT_EQ(CLS_DELETING, Locations(key).at("target")->status());
+        EXPECT_EQ(5u * (i + 1), indexer->GetStorageUsage());
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        EXPECT_EQ(0u, executor->WaitingTaskCountLocked());
+    }
+}
+
+TEST_F(BackendGcDeleteTest, MissingStorageMakesMixedDeleteFailAndRetainMetadata) {
+    auto retired = AddBackend("retired", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+    auto healthy = AddBackend("healthy", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+    SetLocation(391, "old", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://retired/391?size=5"});
+    SetLocation(392, "good", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://healthy/392?size=5"});
+    auto request = Request(391, {"old"}, {});
+    const auto other = Request(392, {"good"}, {});
+    request.block_keys.push_back(392);
+    request.location_ids.push_back(other.location_ids.front());
+    request.expected_location_values.push_back(other.expected_location_values.front());
+    request.delay = std::chrono::milliseconds(100);
+    auto future = executor->Submit(request);
+    ASSERT_EQ(EC_OK, data_storage_manager_->UnRegisterStorage("retired"));
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(EC_PARTIAL_OK, future.get().status);
+    EXPECT_EQ(CLS_DELETING, Locations(391).at("old")->status());
+    EXPECT_EQ(CLS_DELETING, Locations(392).at("good")->status());
+    EXPECT_TRUE(retired->delete_batches.empty());
+    EXPECT_EQ(1u, healthy->delete_batches.size());
+    EXPECT_EQ(10u, indexer->GetStorageUsage());
+}
+
+TEST_F(BackendGcDeleteTest, MetadataSyncFailureCompletesWithoutPhysicalDelete) {
+    auto backend = AddBackend("retired_sync", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+    SetLocation(393, "target", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://retired_sync/393?size=5"});
+    auto *backup = EnableMemoryPrimary();
+    backup->sync_ok = false;
+    auto future = executor->Submit(Request(393, {"target"}, {}));
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::milliseconds(0)));
+    EXPECT_EQ(EC_ERROR, future.get().status);
+    EXPECT_TRUE(backend->delete_batches.empty());
+    EXPECT_EQ(CLS_DELETING, Locations(393).at("target")->status());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+}
+
+TEST_F(BackendGcDeleteTest, StopCompletesQueuedDeleteWithFailure) {
+    auto backend = AddBackend("queued_delete", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+    SetLocation(301, "target", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://queued_delete/301?size=5"});
+    auto request = Request(301, {"target"}, {});
+    request.delay = std::chrono::seconds(30);
+    auto future = executor->Submit(request);
+    EXPECT_EQ(std::future_status::timeout, future.wait_for(std::chrono::milliseconds(0)));
+    const auto start = std::chrono::steady_clock::now();
+    executor->Stop();
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::milliseconds(500));
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::milliseconds(0)));
+    EXPECT_EQ(EC_ERROR, future.get().status);
+    EXPECT_TRUE(backend->delete_batches.empty());
+    EXPECT_EQ(CLS_DELETING, Locations(301).at("target")->status());
+}
+
+TEST_F(BackendGcDeleteTest, PartialPhysicalDeleteCompletesFailureWithoutResubmission) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    auto backend = AddBackend("partial_delete", type, false);
+    const std::string first_uri = "pace://partial_delete/first?size=5";
+    const std::string second_uri = "pace://partial_delete/second?size=7";
+    SetLocation(306, "target", type, {first_uri, second_uri});
+    backend->delete_result = EC_ERROR;
+    backend->delete_results_by_uri[first_uri] = EC_OK;
+    auto submitted = executor->SubmitAsync(Request(306, {"target"}, {}));
+    ASSERT_TRUE(submitted.accepted);
+    ASSERT_EQ(std::future_status::ready, submitted.future.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(EC_PARTIAL_OK, submitted.future.get().status);
+    ASSERT_EQ(1u, backend->delete_batches.size());
+    EXPECT_EQ(2u, backend->delete_batches[0].size());
+    EXPECT_EQ(CLS_DELETING, Locations(306).at("target")->status());
+    EXPECT_EQ(12u, indexer->GetStorageUsage());
+}
+
+TEST_F(BackendGcDeleteTest, CadFailureCompletesWithoutRepeatingPhysicalDelete) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    auto backend = AddBackend("cad_delete", type, false);
+    const std::string uri = "pace://cad_delete/old?size=5";
+    SetLocation(307, "target", type, {uri});
+    Stub stub;
+    delete_cad_stub = &stub;
+    delete_cad_attempts = 0;
+    stub.set(ADDR(MetaSearcher, BatchCADLocationStatus), FailFirstDeleteCad);
+    auto future = executor->Submit(Request(307, {"target"}, {}));
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(EC_PARTIAL_OK, future.get().status);
+    EXPECT_EQ(1u, delete_cad_attempts);
+    EXPECT_EQ((std::vector<std::string>{uri}), DeletedUris(*backend));
+    EXPECT_EQ(CLS_DELETING, Locations(307).at("target")->status());
+    EXPECT_EQ(5u, indexer->GetStorageUsage());
+    delete_cad_stub = nullptr;
+}
+
+TEST_F(BackendGcDeleteTest, QueuedDeleteDoesNotFollowReplacementWithSameIdAndDeletingStatus) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("queued_delete", type);
+    SetLocation(302, "target", type, {"dummy://queued_delete/old?size=5"});
+    auto request = Request(302, {"target"}, {});
+    request.delay = std::chrono::milliseconds(100);
+    auto future = executor->Submit(request);
+    std::vector<ErrorCode> replaced;
+    ASSERT_EQ(EC_OK,
+              searcher->BatchReplaceLocationSpecs(
+                  &context,
+                  {302},
+                  {{{"target", type, CLS_DELETING, {LocationSpec("tp0", "dummy://queued_delete/new?size=7")}}}},
+                  replaced));
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(EC_OK, future.get().status);
+    EXPECT_TRUE(backend->delete_batches.empty());
+    EXPECT_EQ("dummy://queued_delete/new?size=7", Locations(302).at("target")->location_specs().front().uri());
+    EXPECT_EQ(7u, indexer->GetStorageUsage());
+}
+
+TEST_F(BackendGcDeleteTest, InitialSyncFailureCompletesWithoutDeleteOrDelayedRetry) {
+    for (const bool metadata_request : {false, true}) {
+        SCOPED_TRACE(metadata_request);
+        auto backend = AddBackend("sync_delete", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+        const int64_t key = metadata_request ? 304 : 303;
+        SetLocation(key, "target", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://sync_delete/sync?size=5"});
+        Stub stub;
+        sync_attempts.store(0);
+        stub.set(ADDR(MetaIndexer, Sync), MetaIndexer_Sync_fail_once_stub);
+        std::future<PlanExecuteResult> future;
+        if (metadata_request) {
+            future = executor->Submit(CacheMetaDelRequest{kTestInstanceName, {key}, std::chrono::milliseconds(200)});
+        } else {
+            auto request = Request(key, {"target"}, {});
+            request.delay = std::chrono::milliseconds(200);
+            future = executor->Submit(request);
+        }
+        ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::milliseconds(0)));
+        EXPECT_EQ(EC_ERROR, future.get().status);
+        EXPECT_EQ(1u, sync_attempts.load());
+        EXPECT_TRUE(backend->delete_batches.empty());
+        EXPECT_EQ(CLS_DELETING, Locations(key).at("target")->status());
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        EXPECT_EQ(0u, executor->WaitingTaskCountLocked());
+    }
+}
+
+TEST_F(BackendGcDeleteTest, SourceDeleteChecksServingSiblingInsideAdmissionCas) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("conditional_delete", type);
+    constexpr int64_t key = 305;
+    SetLocation(key, "source", type, {"dummy://conditional_delete/source?size=5"});
+    SetLocation(key, "copied", type, {"dummy://conditional_delete/copied?size=5"});
+    auto request = Request(key, {"source"}, {});
+    request.resume_deleting = true;
+    request.required_serving_location_values.emplace(key, Locations(key).at("copied")->ToJsonString());
+    const auto original_source = Locations(key).at("source")->ToJsonString();
+
+    Stub stub;
+    delete_admission_race_stub = &stub;
+    before_delete_admission_cas = [&] {
+        std::vector<std::vector<ErrorCode>> results;
+        ASSERT_EQ(EC_OK, searcher->BatchDeleteLocations(&context, {key}, {{"copied"}}, results));
+    };
+    stub.set(ADDR(MetaSearcher, BatchCASLocationStatus), RaceDeleteAdmissionBeforeCas);
+    auto future = executor->Submit(request);
+    EXPECT_EQ(CLS_SERVING, Locations(key).at("source")->status());
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(3)));
+    EXPECT_EQ(EC_MISMATCH, future.get().status);
+    EXPECT_EQ(original_source, Locations(key).at("source")->ToJsonString());
+    EXPECT_TRUE(backend->delete_batches.empty());
+    before_delete_admission_cas = {};
+    delete_admission_race_stub = nullptr;
+}
+
+TEST_F(BackendGcDeleteTest, ExplicitSourceDeleteCanResumeAfterSyncFailureAndSiblingRemoval) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("conditional_delete", type);
+    constexpr int64_t key = 308;
+    const std::string source_uri = "dummy://conditional_delete/source?size=5";
+    SetLocation(key, "source", type, {source_uri});
+    SetLocation(key, "copied", type, {"dummy://conditional_delete/copied?size=5"});
+    auto request = Request(key, {"source"}, {});
+    request.resume_deleting = true;
+    request.required_serving_location_values.emplace(key, Locations(key).at("copied")->ToJsonString());
+    Stub stub;
+    sync_attempts.store(0);
+    stub.set(ADDR(MetaIndexer, Sync), MetaIndexer_Sync_fail_once_stub);
+    auto future = executor->Submit(request);
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::milliseconds(0)));
+    EXPECT_EQ(EC_ERROR, future.get().status);
+    EXPECT_EQ(1u, sync_attempts.load());
+    EXPECT_EQ(CLS_DELETING, Locations(key).at("source")->status());
+    EXPECT_TRUE(backend->delete_batches.empty());
+
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, searcher->BatchDeleteLocations(&context, {key}, {{"copied"}}, results));
+    // Only this new explicit request makes another attempt. The first attempt
+    // already invalidated the source, so it need not require a surviving sibling.
+    EXPECT_EQ(EC_OK, executor->Submit(request).get().status);
+    EXPECT_EQ(2u, sync_attempts.load());
+    EXPECT_EQ((std::vector<std::string>{source_uri}), DeletedUris(*backend));
+    EXPECT_TRUE(Locations(key).empty());
+}
+
+TEST_F(BackendGcDeleteTest, DeleteCadDoesNotEraseNewDeletingSnapshotCreatedDuringPhysicalDelete) {
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("retry_delete", type);
+    SetLocation(305, "target", type, {"dummy://retry_delete/old?size=5"});
+    backend->on_delete = [&] {
+        std::vector<ErrorCode> replaced;
+        EXPECT_EQ(EC_OK,
+                  searcher->BatchReplaceLocationSpecs(
+                      &context, {305}, {{{"target", type, CLS_DELETING, {LocationSpec("tp0", "dummy://retry_delete/new?size=7")}}}}, replaced));
+    };
+    EXPECT_EQ(EC_PARTIAL_OK, Run(Request(305, {"target"}, {})).status);
+    EXPECT_EQ(1u, backend->delete_batches.size());
+    EXPECT_EQ("dummy://retry_delete/new?size=7", Locations(305).at("target")->location_specs().front().uri());
+    EXPECT_EQ(7u, indexer->GetStorageUsage());
+}
+
+TEST_F(BackendGcDeleteTest, DeleteCasLoserCompletesFailureAndRequiresExplicitResubmission) {
+    auto *backup = EnableMemoryPrimary();
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("admission_race", type);
+    std::atomic<size_t> physical_calls{0};
+    backend->on_delete = [&] { ++physical_calls; };
+    size_t completed_batches = 0;
+    int64_t key = 310;
+    for (const auto status : {CLS_WRITING, CLS_SERVING}) {
+        for (const bool mixed : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "status=" << status << " mixed=" << mixed);
+            backup->enforce_rejected_keys.store(false);
+            const auto loser_key = key++;
+            const auto winner_key = key++;
+            const std::string loser_uri = "dummy://admission_race/" + std::to_string(loser_key) + "?size=5";
+            const std::string winner_uri = "dummy://admission_race/" + std::to_string(winner_key) + "?size=7";
+            SetLocation(loser_key, "target", type, {loser_uri});
+            std::vector<std::vector<ErrorCode>> status_results;
+            ASSERT_EQ(EC_OK, searcher->BatchUpdateLocationStatus(
+                                &context, {loser_key}, {{{"target", status}}}, status_results));
+            const auto loser_request = Request(loser_key, {"target"}, {});
+            auto request = loser_request;
+            request.resume_deleting = true;
+            if (mixed) {
+                SetLocation(winner_key, "target", type, {winner_uri});
+                const auto winner_request = Request(winner_key, {"target"}, {});
+                request.block_keys.push_back(winner_key);
+                request.location_ids.push_back(winner_request.location_ids.front());
+                request.expected_location_values.push_back(winner_request.expected_location_values.front());
+            }
+            backup->rejected_upsert_keys = {loser_key};
+            backup->rejected_force_upsert_keys = {loser_key};
+            backup->rejected_upsert_count.store(0);
+            backup->enforce_rejected_keys.store(true);
+
+            // Inject the other Delete after cleanup's read, before its CAS.
+            // It changes local primary to DELETING but cannot admit backup,
+            // so it cannot proceed to physical deletion.
+            bool raced = false;
+            Stub stub;
+            delete_admission_race_stub = &stub;
+            before_delete_admission_cas = [&] {
+                const auto other = executor->PrepareDeleteTask(loser_request);
+                EXPECT_EQ(EC_ERROR, other.result.status);
+                EXPECT_TRUE(other.actual_task.block_keys.empty());
+                EXPECT_FALSE(other.needs_physical_delete);
+                raced = true;
+            };
+            stub.set(ADDR(MetaSearcher, BatchCASLocationStatus), RaceDeleteAdmissionBeforeCas);
+            auto future = executor->Submit(request);
+            before_delete_admission_cas = {};
+            delete_admission_race_stub = nullptr;
+            ASSERT_TRUE(raced);
+            ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::milliseconds(0)));
+            EXPECT_EQ(EC_MISMATCH, future.get().status);
+            EXPECT_EQ(CLS_DELETING, Locations(loser_key).at("target")->status());
+            if (mixed) {
+                EXPECT_EQ(CLS_DELETING, Locations(winner_key).at("target")->status());
+            }
+
+            EXPECT_EQ(1u, backup->rejected_upsert_count.load());
+            EXPECT_EQ(completed_batches, physical_calls.load());
+            {
+                std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+                EXPECT_EQ(0u, executor->WaitingTaskCountLocked());
+            }
+
+            backup->enforce_rejected_keys.store(false);
+            auto explicit_attempt = executor->Submit(request);
+            ASSERT_EQ(std::future_status::ready, explicit_attempt.wait_for(std::chrono::seconds(1)));
+            EXPECT_EQ(EC_OK, explicit_attempt.get().status);
+            ++completed_batches;
+            EXPECT_EQ(completed_batches, physical_calls.load());
+            ASSERT_EQ(completed_batches, backend->delete_batches.size());
+            std::set<std::string> actual_uris;
+            for (const auto &uri : backend->delete_batches.back()) {
+                actual_uris.insert(uri.ToUriString());
+            }
+            std::set<std::string> expected_uris{loser_uri};
+            if (mixed) {
+                expected_uris.insert(winner_uri);
+                EXPECT_TRUE(Locations(winner_key).empty());
+            }
+            EXPECT_EQ(expected_uris, actual_uris);
+            EXPECT_TRUE(Locations(loser_key).empty());
+        }
+    }
+}
+
+TEST_F(BackendGcDeleteTest, ResumedDeleteCasLoserDoesNotFollowReplacementIdentity) {
+    auto *backup = EnableMemoryPrimary();
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    auto backend = AddBackend("admission_race", type);
+    SetLocation(320, "target", type, {"dummy://admission_race/old?size=5"});
+    const auto other_request = Request(320, {"target"}, {});
+    auto request = other_request;
+    request.resume_deleting = true;
+    backup->rejected_upsert_keys = {320};
+    backup->rejected_force_upsert_keys = {320};
+    Stub stub;
+    delete_admission_race_stub = &stub;
+    before_delete_admission_cas = [&] {
+        const auto other = executor->PrepareDeleteTask(other_request);
+        EXPECT_EQ(EC_ERROR, other.result.status);
+        EXPECT_TRUE(other.actual_task.block_keys.empty());
+        backup->enforce_rejected_keys.store(false);
+        std::vector<ErrorCode> replaced;
+        EXPECT_EQ(EC_OK,
+                  searcher->BatchReplaceLocationSpecs(
+                      &context, {320}, {{{"target", type, CLS_DELETING,
+                                         {LocationSpec("tp0", "dummy://admission_race/new?size=7")}}}}, replaced));
+    };
+    stub.set(ADDR(MetaSearcher, BatchCASLocationStatus), RaceDeleteAdmissionBeforeCas);
+    auto future = executor->Submit(request);
+    before_delete_admission_cas = {};
+    delete_admission_race_stub = nullptr;
+    ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(3)));
+    EXPECT_EQ(EC_MISMATCH, future.get().status);
+    EXPECT_TRUE(backend->delete_batches.empty());
+    EXPECT_EQ("dummy://admission_race/new?size=7", Locations(320).at("target")->location_specs().front().uri());
+    EXPECT_EQ(CLS_DELETING, Locations(320).at("target")->status());
+    EXPECT_EQ(7u, indexer->GetStorageUsage());
 }
 
 TEST_F(SchedulePlanExecutorTest, TestSubmit) {
@@ -675,7 +1203,6 @@ TEST_F(SchedulePlanExecutorTest, TestSubmit) {
         ASSERT_TRUE(location_maps.empty() || location_maps[0].empty());
     }
 }
-
 TEST_F(SchedulePlanExecutorTest, TestNonExistInstance) {
     CreateMetaIndexer(kTestInstanceName, "local");
     CreateDataStorage();
@@ -820,14 +1347,51 @@ TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteRequiresBackupAdmissionA
     std::vector<std::string> disabled_ids;
     ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, &context, {44}, {disabled_location}, disabled_ids));
     ASSERT_EQ(EC_OK, searcher.BatchUpdateLocationStatus(&context, {44}, {{{disabled_ids[0], CLS_SERVING}}}, results));
-    auto disabled = executor.PrepareDeleteTask(
-        CacheLocationDelRequest{kTestInstanceName, {44}, {{disabled_ids[0]}}, std::chrono::milliseconds(100)});
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.GetLocationsFromPrimary(nullptr, {44}, local));
+    const std::string original_location_value = local[0].at(disabled_ids[0])->ToJsonString();
+    CacheLocationDelRequest disabled_request{
+        kTestInstanceName, {44}, {{disabled_ids[0]}}, std::chrono::milliseconds(100)};
+    disabled_request.expected_location_values = {{original_location_value}};
+    auto disabled = executor.PrepareDeleteTask(disabled_request);
     EXPECT_FALSE(disabled.needs_physical_delete);
     EXPECT_EQ(EC_ERROR, disabled.result.status);
     EXPECT_TRUE(disabled.actual_task.block_keys.empty());
     EXPECT_EQ(2, backup_ptr->sync_calls);
     ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.GetLocationsFromPrimary(nullptr, {44}, local));
     EXPECT_EQ(CLS_DELETING, local[0].at(disabled_ids[0])->status());
+
+    // A prior attempt can leave local DELETING without admitting its backup.
+    // Resume must re-admit the exact marker, not treat an empty Sync as proof.
+    disabled_request.resume_deleting = true;
+    auto still_unadmitted = executor.PrepareDeleteTask(disabled_request);
+    EXPECT_FALSE(still_unadmitted.needs_physical_delete);
+    EXPECT_EQ(EC_ERROR, still_unadmitted.result.status);
+    EXPECT_TRUE(still_unadmitted.actual_task.block_keys.empty());
+    EXPECT_EQ(2, backup_ptr->sync_calls);
+
+    backup_ptr->admit_upserts = true;
+    auto resumed = executor.PrepareDeleteTask(disabled_request);
+    EXPECT_TRUE(resumed.needs_physical_delete);
+    EXPECT_EQ(EC_OK, resumed.result.status);
+    EXPECT_EQ(KeyVector{44}, resumed.actual_task.block_keys);
+    EXPECT_EQ((std::vector<std::vector<std::string>>{{disabled_ids[0]}}), resumed.actual_task.location_ids);
+    EXPECT_EQ(3, backup_ptr->sync_calls);
+    EXPECT_EQ(KeyVector{44}, backup_ptr->last_sync_keys);
+    CacheLocationMapVector backed_up;
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, backup_ptr->GetLocations(nullptr, {44}, backed_up));
+    ASSERT_EQ(1u, backed_up.size());
+    EXPECT_EQ(CLS_DELETING, backed_up[0].at(disabled_ids[0])->status());
+    EXPECT_EQ(local[0].at(disabled_ids[0])->ToJsonString(), backed_up[0].at(disabled_ids[0])->ToJsonString());
+
+    // An explicit new attempt cannot delete a different incarnation.
+    CacheLocation stale;
+    ASSERT_TRUE(stale.FromJsonString(original_location_value));
+    stale.set_create_time(stale.create_time() + 1);
+    disabled_request.expected_location_values = {{stale.ToJsonString()}};
+    auto mismatched = executor.PrepareDeleteTask(disabled_request);
+    EXPECT_FALSE(mismatched.needs_physical_delete);
+    EXPECT_TRUE(mismatched.actual_task.block_keys.empty());
+    EXPECT_EQ(3, backup_ptr->sync_calls);
 }
 
 TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteForceEnqueuesOnlyUnadmittedKeys) {
@@ -868,11 +1432,11 @@ TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteForceEnqueuesOnlyUnadmit
     CacheLocationDelRequest request{
         kTestInstanceName, {44, 45, 46}, {{ids[0]}, {ids[1]}, {ids[2]}}, std::chrono::milliseconds(100)};
     auto admission = executor.PrepareDeleteTask(request);
-    EXPECT_TRUE(admission.needs_physical_delete);
-    EXPECT_EQ(EC_OK, admission.result.status);
+    EXPECT_FALSE(admission.needs_physical_delete);
+    EXPECT_NE(EC_OK, admission.result.status);
     EXPECT_EQ((KeyVector{44, 45}), admission.actual_task.block_keys);
-    EXPECT_EQ(1, backup_ptr->sync_calls);
-    EXPECT_EQ((KeyVector{44, 45}), backup_ptr->last_sync_keys);
+    EXPECT_EQ(0, backup_ptr->sync_calls);
+    EXPECT_TRUE(backup_ptr->last_sync_keys.empty());
     EXPECT_THAT(backup_ptr->forced_upsert_keys, UnorderedElementsAre(44, 46));
 
     CacheLocationMapVector local;
@@ -882,7 +1446,6 @@ TEST_F(SchedulePlanExecutorTest, TestMemoryPrimaryDeleteForceEnqueuesOnlyUnadmit
     EXPECT_EQ(CLS_DELETING, local[1].at(ids[1])->status());
     EXPECT_EQ(CLS_DELETING, local[2].at(ids[2])->status());
 }
-
 // 测试一个block_key对应多个location的情况
 TEST_F(SchedulePlanExecutorTest, TestMultipleLocationsPerBlockKey) {
     // 创建 MetaIndexer
@@ -1569,8 +2132,8 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     EXPECT_EQ(orphan_uri, backend->delete_batches.back().front().ToUriString());
     expect_location_deleted(orphan_block_key);
 
-    // Refresh one Location between the worker's read and CAS. Only the unchanged
-    // Location is admitted; its existing spec still needs Delete.
+    // Refresh one Location between the worker's read and CAS. The partial
+    // admission ends this attempt without physical Delete or metadata removal.
     const int64_t partial_block_key = 715;
     const std::string refreshed_uri = "dummy://gc_delete_backend/refreshed?size=1";
     const std::string unchanged_id = add_location(partial_block_key, {missing_uri, existing_uri});
@@ -1594,16 +2157,18 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     cas_stub.set(ADDR(MetaSearcher, BatchCASLocationStatus), RefreshLocationBeforeCas);
     auto partial_submission = executor.SubmitAsync(partial_request);
     ASSERT_TRUE(partial_submission.accepted);
-    EXPECT_EQ(EC_OK, partial_submission.future.get().status);
+    const auto partial_result = partial_submission.future.get();
+    EXPECT_EQ(EC_MISMATCH, partial_result.status);
+    EXPECT_TRUE(partial_result.error_logged);
     cas_refresh_stub = nullptr;
-    ASSERT_EQ(3u, backend->delete_batches.size());
-    ASSERT_EQ(1u, backend->delete_batches.back().size());
-    EXPECT_EQ(existing_uri, backend->delete_batches.back().front().ToUriString());
+    EXPECT_EQ(2u, backend->delete_batches.size());
     CacheLocationMapVector after;
     ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(&context, {partial_block_key}, empty_mask, after));
     ASSERT_EQ(1u, after.size());
-    ASSERT_EQ(1u, after.front().size());
+    ASSERT_EQ(2u, after.front().size());
+    EXPECT_EQ(CLS_DELETING, after.front().at(unchanged_id)->status());
     EXPECT_EQ(CLS_WRITING, after.front().at(refreshed_id)->status());
+    EXPECT_EQ(3u, meta_manager_->GetMetaIndexer(kTestInstanceName)->GetStorageUsage());
     EXPECT_TRUE(physical_delete_warnings.empty());
 
     backend->delete_result = EC_NOENT;
@@ -1632,13 +2197,13 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
     data_storage_manager_->storage_map_["gc_other_backend"] = other_backend;
     const int64_t error_block_key = 712;
     const std::string error_location_id = add_location(error_block_key, {error_uri, timeout_uri, other_uri});
-    const auto error_result = executor
-                                  .Submit(CacheLocationDelRequest{
+    const auto error_admission = executor.PrepareDeleteTask(CacheLocationDelRequest{
                                       .instance_id = kTestInstanceName,
                                       .block_keys = {error_block_key},
                                       .location_ids = {{error_location_id}},
-                                  })
-                                  .get();
+                                  });
+    ASSERT_TRUE(error_admission.needs_physical_delete);
+    const auto error_result = executor.DoLocationDelTask(error_admission.actual_task, error_admission.indexer);
     EXPECT_EQ(EC_PARTIAL_OK, error_result.status);
     EXPECT_TRUE(error_result.error_logged);
     EXPECT_NE(std::string::npos, error_result.error_message.find("failed[2]"));
@@ -1649,25 +2214,29 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
                     "storage delete failed, instance[" + kTestInstanceName + "] storage[gc_delete_backend] uri[" +
                         timeout_uri + "] ec[" + std::to_string(EC_TIMEOUT) + "]",
                     "storage delete failed, instance[" + kTestInstanceName + "] storage[gc_other_backend] uri[" +
-                        other_uri + "] ec[" + std::to_string(EC_ERROR) + "]"));
-    expect_location_deleted(error_block_key);
+                        other_uri + "] ec[" + std::to_string(EC_ERROR) + "]",
+                    "retain 1 CLS_DELETING location(s) after physical delete failure for instance " + kTestInstanceName));
+    // Failed physical deletion must retain metadata instead of reporting reclaimed space.
+    CacheLocationMapVector retained_locations;
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(&context, {error_block_key}, empty_mask, retained_locations));
+    ASSERT_EQ(1u, retained_locations.size());
+    ASSERT_EQ(1u, retained_locations.front().count(error_location_id));
+    EXPECT_EQ(CLS_DELETING, retained_locations.front().at(error_location_id)->status());
 
-    // Worker/admission errors have not been diagnosed by DoLocationDelTask.
-    // They must remain visible to GC even though ordinary Delete errors are logged.
+    // Direct physical-delete exceptions propagate to the caller. Submitted
+    // admission errors complete with failure after the executor logs them.
     backend->throw_on_delete = true;
     const int64_t exception_block_key = 716;
     const std::string exception_location_id = add_location(exception_block_key, {existing_uri});
-    auto exception_submission = executor.SubmitAsync(CacheLocationDelRequest{
+    auto exception_admission = executor.PrepareDeleteTask(CacheLocationDelRequest{
         .instance_id = kTestInstanceName,
         .block_keys = {exception_block_key},
         .location_ids = {{exception_location_id}},
     });
-    ASSERT_TRUE(exception_submission.accepted);
-    const auto exception_result = exception_submission.future.get();
-    EXPECT_EQ(EC_ERROR, exception_result.status);
-    EXPECT_FALSE(exception_result.error_logged);
-    EXPECT_THAT(exception_result.error_message, HasSubstr("injected storage delete exception"));
-    EXPECT_EQ(3u, physical_delete_warnings.size());
+    ASSERT_TRUE(exception_admission.needs_physical_delete);
+    EXPECT_THROW(executor.DoLocationDelTask(exception_admission.actual_task, exception_admission.indexer),
+                 std::runtime_error);
+    EXPECT_EQ(4u, physical_delete_warnings.size());
     const auto admission_error = executor
                                      .Submit(CacheLocationDelRequest{
                                          .instance_id = "missing_instance",
@@ -1676,7 +2245,7 @@ TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteHandlesMissingUrisIdempotentl
                                      })
                                      .get();
     EXPECT_EQ(EC_NOENT, admission_error.status);
-    EXPECT_FALSE(admission_error.error_logged);
+    EXPECT_TRUE(admission_error.error_logged);
 }
 
 TEST_F(SchedulePlanExecutorTest, TestEventReportMetadataDeleteRevalidatesTokenOnWorker) {
@@ -1830,6 +2399,114 @@ TEST_F(SchedulePlanExecutorTest, TestEventReportMetadataDeleteRejectsInvalidRequ
     auto submit_result = executor.SubmitAsync(request);
     EXPECT_FALSE(submit_result.accepted);
     EXPECT_FALSE(submit_result.future.valid());
+}
+
+TEST_F(SchedulePlanExecutorTest, TestPhysicalDeleteFailureRetainsMetadataForResume) {
+    ASSERT_EQ(EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+
+    class FailFirstDeleteBackend : public DataStorageBackend {
+    public:
+        FailFirstDeleteBackend() : DataStorageBackend(nullptr) {
+            config_.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+            config_.set_global_unique_name("retry_delete");
+            SetOpen(true);
+            SetAvailable(true);
+        }
+        DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_DUMMY; }
+        bool Available() override { return true; }
+        double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
+        const StorageConfig &GetStorageConfig() override { return config_; }
+        ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
+        ErrorCode Close() override { return EC_OK; }
+        std::vector<std::pair<ErrorCode, DataStorageUri>>
+        Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override {
+            return {};
+        }
+        std::vector<ErrorCode>
+        Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+            const auto result = delete_calls_++ == 0 ? EC_ERROR : EC_OK;
+            return std::vector<ErrorCode>(uris.size(), result);
+        }
+        std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<bool>(uris.size(), true);
+        }
+        std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+        std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override {
+            return std::vector<ErrorCode>(uris.size(), EC_OK);
+        }
+        std::atomic<size_t> delete_calls_{0};
+
+    private:
+        StorageConfig config_;
+    };
+
+    auto backend = std::make_shared<FailFirstDeleteBackend>();
+    data_storage_manager_->storage_map_["retry_delete"] = backend;
+    auto request_context = std::make_shared<RequestContext>("physical_delete_retry");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    constexpr int64_t block_key = 703;
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("tp0", "dummy://retry_delete/cache/block703?size=1")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {location}, location_ids));
+
+    std::vector<CacheLocationMap> original_maps;
+    BlockMask original_mask;
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, original_mask, original_maps));
+    const std::string original_value = original_maps.front().at(location_ids.front())->ToJsonString();
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {block_key},
+        .location_ids = {{location_ids.front()}},
+        .expected_location_values = {{original_value}},
+    };
+    auto admission = executor.PrepareDeleteTask(request);
+    ASSERT_TRUE(admission.needs_physical_delete);
+    const auto first = executor.DoLocationDelTask(admission.actual_task, admission.indexer);
+    EXPECT_EQ(EC_PARTIAL_OK, first.status);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps.front().size());
+    EXPECT_EQ(CLS_DELETING, location_maps.front().at(location_ids.front())->status());
+
+    request.authoritative_read = true;
+    request.resume_deleting = true;
+
+    // A retry with the same ID but a different allocation snapshot must not Free.
+    CacheLocation wrong_original;
+    ASSERT_TRUE(wrong_original.FromJsonString(original_value));
+    wrong_original.set_create_time(wrong_original.create_time() + 1);
+    request.expected_location_values = {{wrong_original.ToJsonString()}};
+    EXPECT_EQ(EC_OK, executor.SubmitLocationDelete(request, ScheduleTaskClass::kMigrationContinuation).get().status);
+    EXPECT_EQ(1u, backend->delete_calls_.load());
+    request.expected_location_values = {{original_value}};
+
+    // A previous CAS may have succeeded while its Sync barrier timed out.
+    // Even an already-DELETING retry must establish Sync before physical Free.
+    Stub sync_stub;
+    sync_stub.set(ADDR(MetaIndexer, Sync), MetaIndexer_Sync_fail_stub);
+    EXPECT_EQ(EC_ERROR, executor.PrepareDeleteTask(request).result.status);
+    EXPECT_EQ(1u, backend->delete_calls_.load());
+    sync_stub.reset(ADDR(MetaIndexer, Sync));
+
+    const auto retry = executor.SubmitLocationDelete(request, ScheduleTaskClass::kMigrationContinuation).get();
+    EXPECT_EQ(EC_OK, retry.status) << retry.error_message;
+    EXPECT_EQ(2u, backend->delete_calls_.load());
+
+    location_maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    EXPECT_TRUE(location_maps.front().empty());
 }
 
 // 测试CacheLocationDelRequest的Submit方法 - 非存在实例
@@ -2242,7 +2919,7 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncSecondEnqueueFailureCompletesFut
     ASSERT_EQ(std::future_status::ready, submit_result.future.wait_for(std::chrono::seconds(1)));
     const auto result = submit_result.future.get();
     EXPECT_EQ(ErrorCode::EC_ERROR, result.status);
-    EXPECT_NE(std::string::npos, result.error_message.find("physical delete task"));
+    EXPECT_NE(std::string::npos, result.error_message.find("stopped"));
     executor.Stop();
     stub.reset(ADDR(MetaIndexer, Sync));
 }
@@ -2725,4 +3402,142 @@ TEST_F(SchedulePlanExecutorTest, TestAuthoritativeAdmissionRefreshesCachedMetada
     ASSERT_EQ(1u, persistent_results.size());
     ASSERT_EQ(1u, persistent_locations.size());
     EXPECT_TRUE(persistent_results.front() == EC_NOENT || persistent_locations.front().empty());
+}
+
+namespace {
+class MemoryAsyncCopyBackend : public DataStorageBackend {
+public:
+    MemoryAsyncCopyBackend() : DataStorageBackend(nullptr) {}
+    DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_DUMMY; }
+    bool Available() override { return true; }
+    double GetStorageUsageRatio(const std::string &) const override { return 0; }
+    ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
+    ErrorCode Close() override { return EC_OK; }
+    std::vector<std::pair<ErrorCode, DataStorageUri>>
+    Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override {
+        return {};
+    }
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+        return std::vector<ErrorCode>(uris.size(), EC_ERROR);
+    }
+    std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<bool>(uris.size(), true);
+    }
+    std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<ErrorCode>(uris.size(), EC_OK);
+    }
+    std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<ErrorCode>(uris.size(), EC_OK);
+    }
+    bool SupportsAsyncCopy() const override { return true; }
+    AsyncCopySubmitResult CopyAsync(const std::vector<DataStorageUri> &,
+                                     const std::vector<DataStorageUri> &,
+                                     const std::string &operation_id,
+                                     const std::string &,
+                                     const AsyncCopyOptions &,
+                                     AsyncCopyCompletion completion) override {
+        completion_ = std::move(completion);
+        AsyncCopySubmitResult accepted;
+        accepted.status = EC_OK;
+        accepted.accepted = true;
+        accepted.operation_id = operation_id;
+        return accepted;
+    }
+    AsyncCopyCompletion completion_;
+};
+} // namespace
+
+TEST_F(SchedulePlanExecutorTest, TestMemoryAsyncCopyHandoffDoesNotWaitOrRequireAcceptanceChannel) {
+    auto backend = std::make_shared<MemoryAsyncCopyBackend>();
+    data_storage_manager_->storage_map_["memory_async"] = backend;
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationCopyRequest request{
+        .instance_id = kTestInstanceName,
+        .block_key = 1,
+        .exec_storage_name = "memory_async",
+        .src_uris = {DataStorageUri("dummy://memory_async/src?size=128")},
+        .dst_uris = {DataStorageUri("dummy://memory_async/dst?size=128")},
+    };
+    auto submitted = executor.SubmitAsyncCopy(request, "memory-op", AsyncCopyOptions{});
+    ASSERT_TRUE(submitted.submit_result.accepted);
+    ASSERT_TRUE(submitted.future.valid());
+    EXPECT_EQ(std::future_status::timeout, submitted.future.wait_for(std::chrono::milliseconds(0)));
+    std::promise<void> worker_ran;
+    ASSERT_TRUE(executor.SubmitTask([&worker_ran] { worker_ran.set_value(); }));
+    EXPECT_EQ(std::future_status::ready, worker_ran.get_future().wait_for(std::chrono::seconds(1)));
+
+    AsyncCopyBatchResult result;
+    result.status = EC_OK;
+    result.items.resize(1);
+    result.items[0].outcome = AsyncCopyOutcome::kSuccess;
+    result.items[0].terminal = true;
+    result.items[0].safe_to_reuse_dst = true;
+    ASSERT_TRUE(backend->completion_);
+    auto completion = std::move(backend->completion_);
+    completion(result);
+    completion(result); // Executor's promise still resolves once.
+    ASSERT_EQ(std::future_status::ready, submitted.future.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(EC_OK, submitted.future.get().status);
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMemoryAsyncCopyShortOrUnknownCompletionCannotSucceed) {
+    auto backend = std::make_shared<MemoryAsyncCopyBackend>();
+    data_storage_manager_->storage_map_["memory_async"] = backend;
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationCopyRequest request{
+        .instance_id = kTestInstanceName,
+        .block_key = 2,
+        .exec_storage_name = "memory_async",
+        .src_uris = {DataStorageUri("dummy://memory_async/src?size=128")},
+        .dst_uris = {DataStorageUri("dummy://memory_async/dst?size=128")},
+    };
+    for (bool short_response : {true, false}) {
+        auto submitted = executor.SubmitAsyncCopy(request, "unknown-op", AsyncCopyOptions{});
+        ASSERT_TRUE(submitted.submit_result.accepted);
+        AsyncCopyBatchResult unknown;
+        unknown.status = EC_OK;
+        if (!short_response) {
+            unknown.items.resize(1); // Missing terminal/safe remains unknown.
+        }
+        auto completion = std::move(backend->completion_);
+        ASSERT_TRUE(completion);
+        completion(std::move(unknown));
+        ASSERT_EQ(std::future_status::ready, submitted.future.wait_for(std::chrono::seconds(1)));
+        auto result = submitted.future.get();
+        EXPECT_NE(EC_OK, result.status);
+        EXPECT_FALSE(result.terminal);
+        EXPECT_FALSE(result.safe_to_reuse_dst);
+    }
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMemoryAsyncCopyAggregateFailureOverridesSuccessfulItems) {
+    auto backend = std::make_shared<MemoryAsyncCopyBackend>();
+    data_storage_manager_->storage_map_["memory_async"] = backend;
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationCopyRequest request{
+        .instance_id = kTestInstanceName,
+        .block_key = 3,
+        .exec_storage_name = "memory_async",
+        .src_uris = {DataStorageUri("dummy://memory_async/src?size=128")},
+        .dst_uris = {DataStorageUri("dummy://memory_async/dst?size=128")},
+    };
+    for (const auto status : {EC_ERROR, EC_TIMEOUT, EC_PARTIAL_OK, EC_UNKNOWN}) {
+        SCOPED_TRACE(static_cast<int>(status));
+        auto submitted = executor.SubmitAsyncCopy(request, "aggregate-failure", AsyncCopyOptions{});
+        ASSERT_TRUE(submitted.submit_result.accepted);
+        AsyncCopyBatchResult completion_result;
+        completion_result.status = status;
+        completion_result.items.resize(1);
+        auto &item = completion_result.items.front();
+        item.outcome = AsyncCopyOutcome::kSuccess;
+        item.terminal = true;
+        item.safe_to_reuse_dst = true;
+        ASSERT_TRUE(completion_result.AllSucceeded());
+        auto completion = std::move(backend->completion_);
+        ASSERT_TRUE(completion);
+        completion(std::move(completion_result));
+        ASSERT_EQ(std::future_status::ready, submitted.future.wait_for(std::chrono::seconds(1)));
+        EXPECT_EQ(status, submitted.future.get().status);
+    }
 }
