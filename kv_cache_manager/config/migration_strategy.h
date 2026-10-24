@@ -127,7 +127,8 @@ private:
 
 class MigrationConfig : public Jsonizable {
 public:
-    static constexpr int64_t kDefaultCopyMaxConcurrency = 1024;
+    static constexpr int64_t kDefaultCopyMaxConcurrency = 1;
+    static constexpr int64_t kDefaultAsyncCopyMaxConcurrency = 1024;
     static constexpr uint64_t kDefaultCopyMaxInflightBytes = 1ULL * 1024 * 1024 * 1024 * 1024;
     static constexpr int64_t kDefaultCopyOperationDeadlineMs = 10 * 60 * 1000;
     static constexpr int64_t kDefaultCopyPollInitialIntervalMs = 20;
@@ -146,6 +147,11 @@ public:
     // A source/target pair identifies one migration route and must be unique within this config.
     const std::vector<std::shared_ptr<MigrationStrategy>> &strategies() const { return strategies_; }
     int64_t copy_max_concurrency() const { return copy_max_concurrency_; }
+    int64_t async_copy_max_concurrency() const { return async_copy_max_concurrency_; }
+    int64_t effective_copy_max_concurrency() const {
+        return copy_execution_mode_ == MigrationCopyExecutionMode::ASYNC_REQUIRED ? async_copy_max_concurrency_
+                                                                                : copy_max_concurrency_;
+    }
     MigrationMarkClearPolicy mark_clear_policy() const { return mark_clear_policy_; }
     MigrationCopyExecutionMode copy_execution_mode() const { return copy_execution_mode_; }
     uint64_t copy_max_inflight_bytes() const { return copy_max_inflight_bytes_; }
@@ -162,6 +168,7 @@ public:
     void set_copy_max_concurrency(int64_t copy_max_concurrency) {
         copy_max_concurrency_ = copy_max_concurrency;
     }
+    void set_async_copy_max_concurrency(int64_t value) { async_copy_max_concurrency_ = value; }
     void set_mark_clear_policy(MigrationMarkClearPolicy mark_clear_policy) {
         mark_clear_policy_ = mark_clear_policy;
     }
@@ -181,6 +188,7 @@ public:
 private:
     std::vector<std::shared_ptr<MigrationStrategy>> strategies_;
     int64_t copy_max_concurrency_ = kDefaultCopyMaxConcurrency;
+    int64_t async_copy_max_concurrency_ = kDefaultAsyncCopyMaxConcurrency;
     MigrationMarkClearPolicy mark_clear_policy_ = MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS;
     MigrationCopyExecutionMode copy_execution_mode_ = MigrationCopyExecutionMode::SYNC;
     uint64_t copy_max_inflight_bytes_ = kDefaultCopyMaxInflightBytes;

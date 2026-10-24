@@ -97,9 +97,11 @@ KVCM 不因本次清理失败自动重新提交 Delete。后续显式请求或�
 
 ## 5. 并发、容量与失败源退避
 
-Group 的 `copy_max_concurrency` 限制同步与异步模式的活跃 Copy operation，默认 1024；异步模式同时受 `copy_max_inflight_bytes` 限制，默认 1 TiB，显式配置时必须非零。准入先预留额度和进程内任务，再分配目标；源 URI size 缺失、为零、解析失败或求和溢出时拒绝。终态处理唯一认领，重复完成或取消不能重复归还额度。
+Group 在 SYNC 模式使用 `copy_max_concurrency`，默认 1；在 ASYNC_REQUIRED 模式使用 `async_copy_max_concurrency`，默认 1024。两个并发配置分别保存，均必须大于 0，缺失时各自恢复默认值；异步模式不会回退使用同步并发配置。异步模式还受 `copy_max_inflight_bytes` 限制，默认 1 TiB，显式配置时必须非零。准入先预留额度和进程内任务，再分配目标；源 URI size 缺失、为零、解析失败或求和溢出时拒绝。终态处理唯一认领，重复完成或取消不能重复归还额度。
 
-默认窗口以“待回收数据先完成 Copy，再回收源”作为容量规划目标。Copy 的 operation 与字节额度均按 Group 计账；Reclaimer 的删除批次上限按进程计账，待删除字节额度另按 Group × Storage 类型计账，二者分别准入。该规划目标不改变现有迁移触发和 retention 策略。
+切换模式只改变后续准入使用的并发上限，不修改另一模式的配置值，不取消或等待已有任务排空。同步与异步任务共用 Group 的总 active 计数；旧模式任务继续按提交时的模式完成，并占用新模式准入看到的名额。切换到较小上限时，已有任务不被中断，后续 Copy 等待总 active 低于上限后才有准入机会；同步任务不占异步字节额度。配置更新不是所有入口的原子切换点，排队中的 Prepare 会读取当前配置。
+
+异步默认窗口以“待回收数据先完成 Copy，再回收源”作为容量规划目标。Copy 的 operation 与字节额度均按 Group 计账；Reclaimer 的删除批次上限按进程计账，待删除字节额度另按 Group × Storage 类型计账，二者分别准入。该规划目标不改变现有迁移触发和 retention 策略。
 
 Copy inflight credit 表示 KVCM 正在跟踪的 Copy，不等于 PACE 的全部物理占用。unknown 收尾可释放 Copy credit，但清理失败残留及 PACE 未 drain 的 pending 仍可能占用容量。一次清理请求执行期间保存 Location 快照，请求结束后不为失败残留持续持有清理任务。本设计没有独立的 quarantine operation/bytes 容量闸门；持续 busy/unknown 时，需要控制新 Copy 压力并检查未清理残留和 PACE 实际容量。
 
@@ -138,7 +140,8 @@ backend 关闭不能逐任务串行等待完整 Copy。唯一完成回调可以�
 | 配置 | 默认 | 含义 |
 |---|---:|---|
 | copy_execution_mode | SYNC | 同步 / ASYNC_REQUIRED |
-| copy_max_concurrency | 1024 | Group operation 上限 |
+| copy_max_concurrency | 1 | SYNC 模式的 Group operation 上限 |
+| async_copy_max_concurrency | 1024 | ASYNC_REQUIRED 模式的 Group operation 上限 |
 | copy_max_inflight_bytes | 1099511627776（1 TiB） | 异步模式下必须非零 |
 | copy_operation_deadline_ms | 600000 | 操作总跟踪预算 |
 | copy_poll_initial_interval_ms | 20 | 首次查询间隔 |

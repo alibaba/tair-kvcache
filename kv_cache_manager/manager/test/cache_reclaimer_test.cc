@@ -7394,6 +7394,8 @@ TEST_F(CacheReclaimerTest, TestAsyncMigrationPrepareDispatch) {
         config->set_reclaim_strategy(instance_group->cache_config()->reclaim_strategy());
         config->set_meta_indexer_config(instance_group->cache_config()->meta_indexer_config());
         config->set_migration_copy_max_concurrency(static_cast<int64_t>(copy_limit));
+        // Async Prepare does not imply ASYNC_REQUIRED Copy: use the SYNC limit.
+        config->set_migration_async_copy_max_concurrency(static_cast<int64_t>(copy_limit + 16));
         config->set_migration_strategies({std::make_shared<MigrationStrategy>(strategy)});
         instance_group->set_cache_config(config);
         EnableAsyncMigration(instance_group, ins_info);

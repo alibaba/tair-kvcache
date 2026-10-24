@@ -123,6 +123,10 @@ bool MigrationConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
                                 copy_max_concurrency_,
                                 MigrationConfig::kDefaultCopyMaxConcurrency);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "async_copy_max_concurrency",
+                                async_copy_max_concurrency_,
+                                MigrationConfig::kDefaultAsyncCopyMaxConcurrency);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
                                 "mark_clear_policy",
                                 mark_clear_policy_,
                                 MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS);
@@ -162,6 +166,7 @@ bool MigrationConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
 
 void MigrationConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "copy_max_concurrency", copy_max_concurrency_);
+    Put(writer, "async_copy_max_concurrency", async_copy_max_concurrency_);
     Put(writer, "mark_clear_policy", mark_clear_policy_);
     Put(writer, "copy_execution_mode", copy_execution_mode_);
     Put(writer, "copy_max_inflight_bytes", copy_max_inflight_bytes_);
@@ -181,6 +186,10 @@ bool MigrationConfig::ValidateRequiredFields(std::string &invalid_fields) const 
     if (copy_max_concurrency_ <= 0) {
         valid = false;
         local_invalid_fields += "{copy_max_concurrency}";
+    }
+    if (async_copy_max_concurrency_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{async_copy_max_concurrency}";
     }
     if (mark_clear_policy_ != MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS &&
         mark_clear_policy_ != MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED) {

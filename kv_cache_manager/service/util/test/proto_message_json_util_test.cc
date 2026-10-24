@@ -53,23 +53,30 @@ TEST(ProtoConvertTest, MemoryPrimaryRoundTrip) {
 TEST(ProtoConvertTest, MigrationCopyLimitDefaultsAndExplicitValues) {
     struct TestCase {
         const char *json;
-        int64_t concurrency;
+        int64_t sync_concurrency;
+        int64_t async_concurrency;
+        int64_t effective_concurrency;
         uint64_t bytes;
         bool valid;
     };
     const TestCase cases[] = {
-        {R"({})", 1024, 1099511627776ULL, true},
-        {R"({"migration_config":{}})", 1024, 1099511627776ULL, true},
-        {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED"}})", 1024, 1099511627776ULL, true},
-        {R"({"migration_config":{"copy_max_concurrency":6,"copy_max_inflight_bytes":"12884901888"}})",
-         6,
-         12884901888ULL,
-         true},
+        {R"({})", 1, 1024, 1, 1099511627776ULL, true},
+        {R"({"migration_config":{}})", 1, 1024, 1, 1099511627776ULL, true},
+        {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED"}})",
+         1, 1024, 1024, 1099511627776ULL, true},
+        {R"({"migration_config":{"copy_max_concurrency":6,"async_copy_max_concurrency":17,"copy_max_inflight_bytes":"12884901888"}})",
+         6, 17, 6, 12884901888ULL, true},
+        {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED","copy_max_concurrency":6,"async_copy_max_concurrency":17}})",
+         6, 17, 17, 1099511627776ULL, true},
+        // An old async configuration's sync field must not become an async fallback.
+        {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED","copy_max_concurrency":64}})",
+         64, 1024, 1024, 1099511627776ULL, true},
         {R"({"migration_config":{"copy_execution_mode":"MIGRATION_COPY_ASYNC_REQUIRED","copy_max_inflight_bytes":"0"}})",
-         1024,
-         0,
-         false},
-        {R"({"migration_config":{"copy_max_concurrency":0}})", 0, 1099511627776ULL, false},
+         1, 1024, 1024, 0, false},
+        {R"({"migration_config":{"copy_max_concurrency":0}})", 0, 1024, 0, 1099511627776ULL, false},
+        {R"({"migration_config":{"copy_max_concurrency":-1}})", -1, 1024, -1, 1099511627776ULL, false},
+        {R"({"migration_config":{"async_copy_max_concurrency":0}})", 1, 0, 1, 1099511627776ULL, false},
+        {R"({"migration_config":{"async_copy_max_concurrency":-1}})", 1, -1, 1, 1099511627776ULL, false},
     };
     for (const auto &test : cases) {
         SCOPED_TRACE(test.json);
@@ -77,9 +84,13 @@ TEST(ProtoConvertTest, MigrationCopyLimitDefaultsAndExplicitValues) {
         ASSERT_TRUE(ProtoMessageJsonUtil::FromJson(test.json, &request));
         CacheConfig config;
         config.set_migration_copy_max_concurrency(2);
+        config.set_migration_async_copy_max_concurrency(3);
+        config.set_migration_copy_execution_mode(MigrationCopyExecutionMode::ASYNC_REQUIRED);
         config.set_migration_copy_max_inflight_bytes(64);
         ProtoConvert::CacheConfigFromProto(&request, config);
-        EXPECT_EQ(test.concurrency, config.migration_copy_max_concurrency());
+        EXPECT_EQ(test.sync_concurrency, config.migration_copy_max_concurrency());
+        EXPECT_EQ(test.async_concurrency, config.migration_async_copy_max_concurrency());
+        EXPECT_EQ(test.effective_concurrency, config.effective_migration_copy_max_concurrency());
         EXPECT_EQ(test.bytes, config.migration_copy_max_inflight_bytes());
         std::string invalid_fields;
         EXPECT_EQ(test.valid, config.migration_config().ValidateRequiredFields(invalid_fields)) << invalid_fields;
@@ -87,8 +98,10 @@ TEST(ProtoConvertTest, MigrationCopyLimitDefaultsAndExplicitValues) {
         proto::admin::CacheConfig round_trip;
         ProtoConvert::CacheConfigToProto(config, &round_trip);
         ASSERT_TRUE(round_trip.migration_config().has_copy_max_concurrency());
+        ASSERT_TRUE(round_trip.migration_config().has_async_copy_max_concurrency());
         ASSERT_TRUE(round_trip.migration_config().has_copy_max_inflight_bytes());
-        EXPECT_EQ(test.concurrency, round_trip.migration_config().copy_max_concurrency().value());
+        EXPECT_EQ(test.sync_concurrency, round_trip.migration_config().copy_max_concurrency().value());
+        EXPECT_EQ(test.async_concurrency, round_trip.migration_config().async_copy_max_concurrency().value());
         EXPECT_EQ(test.bytes, round_trip.migration_config().copy_max_inflight_bytes().value());
 
         std::string response_json;
