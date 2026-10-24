@@ -6,7 +6,7 @@ KVCM 以进程内异步任务编排 CopyGA，通过条件发布保证迁移结�
 |---|---|
 | 默认模式 | `MIGRATION_COPY_SYNC` |
 | 异步模式 | `MIGRATION_COPY_ASYNC_REQUIRED`，仅接受显式支持异步的 backend |
-| KVCM 职责 | 并发/字节准入、异步提交与完成、源和目标条件发布、失败后的单次清理、失败源退避 |
+| KVCM 职责 | 并发/字节准入、异步提交与完成、源和目标条件发布、失败后的单次清理 |
 | PACE 安全前提 | Copy 与源/目标 Delete 在 allocation 生命周期上互斥；busy、失败或未确认不能报告删除成功 |
 
 ## 1. 目标与设计取舍
@@ -68,7 +68,7 @@ Copy 提交时在内存中保存本次源和目标的 Location 身份及完整�
 - 源 Location ID、`create_time`、完整快照和 `SERVING` 状态仍匹配。
 - 目标仍是本次创建的 `WRITING` Location，身份和完整值未变化。
 
-全部条件满足才把目标改成 `SERVING`；任一条件不符则丢弃结果，并按本次目标快照清理，不触碰替换后的 Location。CAS 已生效但 Sync 未确认时，以发布确认失败结束迁移，保留源和已发布目标，不执行源删除或清标，并释放进程内任务和 Copy 额度。该失败不计为 backend Copy unknown，也不触发失败源退避。
+全部条件满足才把目标改成 `SERVING`；任一条件不符则丢弃结果，并按本次目标快照清理，不触碰替换后的 Location。CAS 已生效但 Sync 未确认时，以发布确认失败结束迁移，保留源和已发布目标，不执行源删除或清标，并释放进程内任务和 Copy 额度。该失败不计为 backend Copy unknown。
 
 Sync 遵循所选元数据后端的语义。memory-primary 模式下，普通 `SERVING` 更新的备份是 best-effort，Sync 不等于每条目标更新都已持久化，也不提供迁移结果跨重启恢复保证。成功收尾后按 retention 决定是否删除源，源删除同样使用精确快照和普通删除链。
 
@@ -95,7 +95,7 @@ future 以失败结束后，上层可释放删除任务的 pending 记录和额�
 
 KVCM 不因本次清理失败自动重新提交 Delete。后续显式请求或独立任务仍可能重复删除同一 URI；模糊删除结果与底层 GA 身份复用依赖后端 Delete 契约，KVCM 不提供额外的 allocation generation 协议。
 
-## 5. 并发、容量与失败源退避
+## 5. 并发、容量与候选准入
 
 Group 在 SYNC 模式使用 `copy_max_concurrency`，默认 1；在 ASYNC_REQUIRED 模式使用 `async_copy_max_concurrency`，默认 1024。两个并发配置分别保存，均必须大于 0，缺失时各自恢复默认值；异步模式不会回退使用同步并发配置。异步模式还受 `copy_max_inflight_bytes` 限制，默认 1 TiB，显式配置时必须非零。准入先预留额度和进程内任务，再分配目标；源 URI size 缺失、为零、解析失败或求和溢出时拒绝。终态处理唯一认领，重复完成或取消不能重复归还额度。
 
@@ -105,15 +105,9 @@ Group 在 SYNC 模式使用 `copy_max_concurrency`，默认 1；在 ASYNC_REQUIR
 
 Copy inflight credit 表示 KVCM 正在跟踪的 Copy，不等于 PACE 的全部物理占用。unknown 收尾可释放 Copy credit，但清理失败残留及 PACE 未 drain 的 pending 仍可能占用容量。一次清理请求执行期间保存 Location 快照，请求结束后不为失败残留持续持有清理任务。本设计没有独立的 quarantine operation/bytes 容量闸门；持续 busy/unknown 时，需要控制新 Copy 压力并检查未清理残留和 PACE 实际容量。
 
-同步与异步 Copy 共用进程内失败源退避，身份键为：
+Copy 根据当前 Location 状态和目标覆盖情况选择源。源必须是指定 Storage 上的 `SERVING` 副本；若目标的 `SERVING/WRITING` Locations 已覆盖某个源的 specs，则继续检查其他仍需迁移的源副本。错误码不被当成源永久失效的证明，也不触发自动删除源。
 
-```text
-(instance_id, block_key, source_location_id, source_create_time, target_storage_name)
-```
-
-重复失败采用有上限的指数退避，优先选择未失败或失败次数较少的合格副本；所有可选源均在退避期时，不分配 Copy 目标、不提交 Copy。`create_time` 防止同 ID 旧副本的失败记录影响换代后的副本。错误码不被当成永久数据失效证明，也不触发自动删除源。
-
-失败源退避只影响 Copy。纯 MARK 以及 BOTH 的 MARK 回退仍按独立的结构准入和去重规则处理：已有任务、源缺失、目标已覆盖、已有 MARK 或去重读取错误等条件仍需检查。
+纯 MARK 与 BOTH 的 MARK 回退仍须通过候选结构校验。已有任务、源缺失或目标已覆盖时不提交 MARK；启用 MARK 去重的路径还会跳过已有标记或去重读取失败的候选。BOTH 在没有 Copy 名额或 Copy 提交被拒时可回退为 MARK，已接受 Copy 的最终失败不会自动转为 MARK。
 
 Reclaimer 的候选数量不等于实际准入数量。有 Group 硬限制时，分发层将候选交给 `BatchSubmit`，由它在锁内结合活跃并发和已占字节完成准入；批内 operation 名额只在两项准入都成功后扣减。大候选因字节额度不足被拒后，后续小候选仍有补位机会，例如剩余 1 个名额和 100 MiB 时，128 MiB 候选被拒后仍可接纳后面的 64 MiB 候选。不带 Group 硬限制的内部调用仍遵守分发层的软上限。
 

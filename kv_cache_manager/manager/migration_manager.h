@@ -92,17 +92,12 @@ public:
         uint64_t copy_completed = 0;
         uint64_t copy_failed = 0;
         uint64_t copy_cancelled = 0;
-        uint64_t source_failures_recorded = 0;
-        uint64_t source_retries_suppressed = 0;
-        uint64_t source_switches = 0;
-        uint64_t no_usable_source = 0;
         uint64_t async_copy_unknown = 0;
         uint64_t async_copy_inflight_operations = 0;
         uint64_t async_copy_inflight_bytes = 0;
         uint64_t marks_added = 0;
         uint64_t marks_cleared = 0;
         size_t active_copy_tasks = 0;
-        size_t source_failure_entries = 0;
         size_t active_marks = 0;
     };
 
@@ -215,7 +210,6 @@ public:
         kTargetServingExists,   // 目标 storage 上已存在 SERVING 副本
         kTargetWritingExists,   // 目标 storage 上存在 WRITING 副本（可能为其他迁移半成品）
         kSourceServingNotFound, // 源 storage 上没有 SERVING 副本，无可复制源
-        kSourceRetrySuppressed, // 尚未被目标覆盖的源均处于失败退避，当前不应再次提交 Copy
     };
 
     struct CopyAdmission {
@@ -223,17 +217,15 @@ public:
         const CacheLocation *src_location = nullptr; // 仅 kAccept 时有效
     };
 
-    // 在某个候选 block 上做迁移准入判断（不修改元数据；Copy 退避可能更新统计）。
+    // 在某个候选 block 上做迁移准入判断（不修改元数据）。
     // - instance_id/block_key：候选 block 的实例作用域与 block id；
     // - loc_map：该 block 当前所有 CacheLocation（来自 MetaSearcher::BatchGetLocation）；
     // - src_storage_name / dst_storage_name：迁移源/目标 storage 的 unique name；
-    // - apply_copy_backoff：MARK 不读取旧源，跳过 Copy 失败退避，但保留全部结构校验。
     CopyAdmission CheckCopyAdmission(const std::string &instance_id,
                                      int64_t block_key,
                                      const CacheLocationMap &loc_map,
                                      const std::string &src_storage_name,
-                                     const std::string &dst_storage_name,
-                                     bool apply_copy_backoff = true) const;
+                                     const std::string &dst_storage_name) const;
 
     // ---- 编排入口（API 触发，供 CacheManager::MigrateCache 薄 facade 调用）----
     // 承载迁移编排本身：候选选择 + location 批查(MetaSearcher) + 逐 block 准入(CheckCopyAdmission)
@@ -363,46 +355,6 @@ private:
         CopyTaskState state = CopyTaskState::kRunning; // 收尾认领状态
     };
 
-    // Copy 后端当前只向 MigrationManager 返回聚合 ErrorCode，无法可靠区分 source 永久失效、
-    // target 故障和瞬态网络错误。因此 V1 不删除源元数据，而是按完整 source identity + target
-    // 记录有界失败退避。target 也进入 key，避免一个冷层故障污染同一源到其它目标的迁移。
-    struct CopySourceFailureKey {
-        std::string instance_id;
-        int64_t block_key = 0;
-        std::string location_id;
-        int64_t location_create_time = 0;
-        std::string target_storage_name;
-
-        bool operator==(const CopySourceFailureKey &other) const {
-            return instance_id == other.instance_id && block_key == other.block_key &&
-                   location_id == other.location_id && location_create_time == other.location_create_time &&
-                   target_storage_name == other.target_storage_name;
-        }
-    };
-
-    struct CopySourceFailureKeyHash {
-        std::size_t operator()(const CopySourceFailureKey &key) const;
-    };
-
-    struct CopySourceFailureState {
-        uint32_t consecutive_failures = 0;
-        ErrorCode last_error = EC_UNKNOWN;
-        std::chrono::steady_clock::time_point last_failure_time;
-        std::chrono::steady_clock::time_point retry_after;
-    };
-
-    struct CopySourceFailureHistoryEntry {
-        CopySourceFailureKey key;
-        std::chrono::steady_clock::time_point failure_time;
-    };
-
-    struct CopySourceFailureSnapshot {
-        bool known = false;
-        bool suppressed = false;
-        uint32_t consecutive_failures = 0;
-        ErrorCode last_error = EC_UNKNOWN;
-    };
-
     // 监控线程待处理的 copy future。
     struct PendingCopy {
         std::string instance_id;
@@ -445,9 +397,7 @@ private:
     CompleteCopyTaskAsFailed(const CopyTaskContext &ctx, const std::string &fail_reason, bool record_completion = true);
     void OnTaskFailedInternal(const std::string &instance_id,
                               int64_t block_key,
-                              ErrorCode reason,
                               const std::string &fail_reason,
-                              bool record_source_failure,
                               bool record_completion = true);
     void CompleteCopyTaskAsSucceeded(const CopyTaskContext &ctx);
     void CompleteCopyTaskAsUnknown(const CopyTaskContext &ctx,
@@ -458,22 +408,6 @@ private:
     FinishCopyTaskAsFailed(const CopyTaskContext &ctx, const std::string &fail_reason, bool record_completion = true);
     bool ReserveAsyncCopyCredit(const MigrationRequest &request, uint64_t total_bytes);
     void ReleaseAsyncCopyCredit(const CopyTaskContext &ctx);
-    void RecordCopySourceFailure(const CopyTaskContext &ctx, ErrorCode reason);
-    void ClearCopySourceFailure(const CopyTaskContext &ctx);
-    CopySourceFailureSnapshot GetCopySourceFailure(const std::string &instance_id,
-                                                   int64_t block_key,
-                                                   const CacheLocation &source,
-                                                   const std::string &target_storage_name,
-                                                   std::chrono::steady_clock::time_point now) const;
-    static CopySourceFailureKey MakeCopySourceFailureKey(const CopyTaskContext &ctx);
-    static CopySourceFailureKey MakeCopySourceFailureKey(const std::string &instance_id,
-                                                         int64_t block_key,
-                                                         const CacheLocation &source,
-                                                         const std::string &target_storage_name);
-    static std::chrono::milliseconds ComputeCopySourceBackoff(const CopySourceFailureKey &key,
-                                                              uint32_t consecutive_failures);
-    void PruneCopySourceFailuresLocked(std::chrono::steady_clock::time_point now);
-    void UpdateCopySourceFailureGaugeLocked();
 
     void MonitorLoop();
 
@@ -583,18 +517,6 @@ private:
     mutable std::mutex task_mutex_;
     std::unordered_map<std::string, std::unordered_map<int64_t, CopyTaskContext>> active_tasks_by_instance_;
 
-    // Source failure suppression is intentionally process-local in V1. It prevents a live Leader from
-    // hot-looping on the same stale GA and lets admission select another source. A Manager process restart
-    // permits one fresh probe; persistent quarantine requires a future authoritative topology epoch/error.
-    static constexpr std::size_t kMaxCopySourceFailureEntries = 100000;
-    static constexpr std::size_t kMaxCopySourceFailureHistoryEntries = 2 * kMaxCopySourceFailureEntries;
-    static constexpr std::chrono::milliseconds kCopySourceInitialBackoff{5000};
-    static constexpr std::chrono::milliseconds kCopySourceMaxBackoff{30 * 60 * 1000};
-    static constexpr std::chrono::hours kCopySourceFailureRetention{24};
-    mutable std::mutex copy_source_failure_mutex_;
-    std::unordered_map<CopySourceFailureKey, CopySourceFailureState, CopySourceFailureKeyHash> copy_source_failures_;
-    std::deque<CopySourceFailureHistoryEntry> copy_source_failure_history_;
-
     struct AsyncCopyGroupUsage {
         uint64_t inflight_operations = 0;
         uint64_t inflight_bytes = 0;
@@ -638,10 +560,6 @@ private:
     std::atomic<uint64_t> stat_copy_completed_{0};
     std::atomic<uint64_t> stat_copy_failed_{0};
     std::atomic<uint64_t> stat_copy_cancelled_{0};
-    std::atomic<uint64_t> stat_source_failures_recorded_{0};
-    mutable std::atomic<uint64_t> stat_source_retries_suppressed_{0};
-    mutable std::atomic<uint64_t> stat_source_switches_{0};
-    mutable std::atomic<uint64_t> stat_no_usable_source_{0};
     std::atomic<uint64_t> stat_async_copy_unknown_{0};
     std::atomic<uint64_t> stat_marks_added_{0};
     std::atomic<uint64_t> stat_marks_cleared_{0};
@@ -654,11 +572,6 @@ private:
     Gauge m_tasks_active_;
     Counter m_copy_bytes_total_;
     Gauge m_copy_duration_ms_;
-    Counter m_source_failures_recorded_total_;
-    mutable Counter m_source_retries_suppressed_total_;
-    mutable Counter m_source_switches_total_;
-    mutable Counter m_no_usable_source_total_;
-    Gauge m_source_failure_entries_;
     Gauge m_marks_active_;
     Counter m_marks_consumed_total_;
     Counter m_marks_expired_total_; // 超时过期清除的 mark（与 consumed 区分：浪费 vs 有效消费）
