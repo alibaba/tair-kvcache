@@ -8,13 +8,11 @@
 #include <functional>
 #include <future>
 #include <limits>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
-#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -165,8 +163,6 @@ public:
 
 private:
     struct PromiseCompletion;
-    using LocationDeleteKey = std::tuple<std::string, int64_t, std::string>;
-    struct LocationDeleteGuard;
     struct LocationDelAdmissionResult {
         PlanExecuteResult result{ErrorCode::EC_OK, ""};
         CacheLocationDelRequest actual_task;
@@ -186,11 +182,6 @@ private:
     std::mutex queue_mutex_;
     std::condition_variable condition_;
     std::atomic<uint64_t> sequence_counter_{0};
-
-    // Only physical-delete workers use these locks. Metadata shard locks are
-    // acquired separately by MetaIndexer and must never span backend I/O.
-    std::mutex location_delete_locks_mutex_;
-    std::map<LocationDeleteKey, std::weak_ptr<std::mutex>> location_delete_locks_;
 
     void WorkerRoutine();
 

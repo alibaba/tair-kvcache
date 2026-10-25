@@ -22,19 +22,10 @@ struct DataStorageCreateRequest {
 
 using DataStorageCreateResult = std::vector<std::pair<ErrorCode, DataStorageUri>>;
 
-struct DataStorageCreateOutcome {
-    DataStorageCreateResult results;
-    // Known allocations that must not be published. A nonempty list fails the
-    // operation; the caller owns rollback of these and all successful results.
-    // Cleanup allocations are unique and disjoint from successful results.
-    std::vector<DataStorageUri> cleanup_uris;
-};
-
 struct DataStorageBatchCreateResult {
     // One result per requested key, grouped in the original request order.
     std::vector<DataStorageCreateResult> results;
-    // Allocations that cannot be adopted, including malformed responses and
-    // invalid allocations whose initial reclaim failed.
+    // Allocations that cannot be associated with a key after a malformed response.
     // These are distinct from successful results above; a nonempty list means
     // the batch failed and the caller must reclaim all successful allocations.
     std::vector<DataStorageUri> cleanup_uris;
@@ -88,28 +79,10 @@ public:
     }
     virtual ErrorCode DoOpen(const StorageConfig &config, const std::string &trace_id) = 0;
     virtual ErrorCode Close() = 0;
-
-protected:
-    // Backends override this compatibility hook or CreateWithCleanup. This hook
-    // is for allocations with no separate cleanup ownership; callers must use
-    // CreateWithCleanup or CreateBatch.
     virtual std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
                                                                      size_t size_per_key,
                                                                      const std::string &trace_id,
-                                                                     std::function<void()> cb) {
-        if (cb) {
-            cb();
-        }
-        return DataStorageCreateResult(keys.size(), {EC_UNIMPLEMENTED, DataStorageUri{}});
-    }
-
-public:
-    virtual DataStorageCreateOutcome CreateWithCleanup(const std::vector<std::string> &keys,
-                                                       size_t size_per_key,
-                                                       const std::string &trace_id,
-                                                       std::function<void()> cb) {
-        return {Create(keys, size_per_key, trace_id, std::move(cb)), {}};
-    }
+                                                                     std::function<void()> cb) = 0;
     // Results match the request/key counts and original order, including failures.
     // If a Create response has an invalid count, fail that request and preserve
     // its successful allocations in cleanup_uris for the caller to reclaim.
@@ -132,12 +105,7 @@ public:
                 result.assign(request.keys.size(), {EC_ERROR, DataStorageUri{}});
                 continue;
             }
-            auto outcome = CreateWithCleanup(request.keys, request.size_per_key, trace_id, nullptr);
-            result = std::move(outcome.results);
-            failed = !outcome.cleanup_uris.empty();
-            for (auto &uri : outcome.cleanup_uris) {
-                batch_result.cleanup_uris.push_back(std::move(uri));
-            }
+            result = Create(request.keys, request.size_per_key, trace_id, nullptr);
             if (result.size() != request.keys.size()) {
                 for (auto &[ec, uri] : result) {
                     if (ec == EC_OK) {
@@ -147,9 +115,8 @@ public:
                 result.assign(request.keys.size(), {EC_ERROR, DataStorageUri{}});
                 failed = true;
             } else {
-                failed = failed || std::any_of(result.begin(), result.end(), [](const auto &item) {
-                             return item.first != EC_OK;
-                         });
+                failed =
+                    std::any_of(result.begin(), result.end(), [](const auto &item) { return item.first != EC_OK; });
             }
         }
         if (cb) {

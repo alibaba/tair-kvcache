@@ -190,11 +190,11 @@ std::shared_ptr<DataStorageBackend> DataStorageManager::CreateStorageBackend(con
     }
 }
 
-DataStorageCreateOutcome DataStorageManager::Create(RequestContext *request_context,
-                                                    const std::string &unique_name,
-                                                    const std::vector<std::string> &keys,
-                                                    size_t size_per_key,
-                                                    std::function<void()> cb) {
+std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(RequestContext *request_context,
+                                                                             const std::string &unique_name,
+                                                                             const std::vector<std::string> &keys,
+                                                                             size_t size_per_key,
+                                                                             std::function<void()> cb) {
     SPAN_TRACER(request_context);
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     const std::string &trace_id = request_context->trace_id();
@@ -208,25 +208,23 @@ DataStorageCreateOutcome DataStorageManager::Create(RequestContext *request_cont
     // target cannot become disabled between admission and backend allocation.
     if (storage_backend == nullptr || !storage_backend->Writable()) {
         KVCM_LOG_WARN("Storage name: %s is not writable, reject create", unique_name.c_str());
-        return {DataStorageCreateResult(keys.size(), {EC_NOENT, DataStorageUri{}}), {}};
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOENT, DataStorageUri{}});
     }
     const auto dsmc = storage_backend->GetMetricsCollector();
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);
-    auto outcome = storage_backend->CreateWithCleanup(keys, size_per_key, trace_id, std::move(cb));
+    std::vector<std::pair<ErrorCode, DataStorageUri>> create_result =
+        storage_backend->Create(keys, size_per_key, trace_id, cb);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(dsmc, DataStorageCreate);
     KVCM_METRICS_COLLECTOR_SET_METRICS(dsmc, data_storage, create_keys_qps, keys.size());
     if (request_context) {
         request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(dsmc);
     }
-    std::for_each(outcome.results.begin(), outcome.results.end(), [&unique_name](auto &pair) {
+    std::for_each(create_result.begin(), create_result.end(), [&unique_name](auto &pair) {
         if (pair.first == EC_OK) {
             pair.second.SetHostName(unique_name);
         }
     });
-    for (auto &uri : outcome.cleanup_uris) {
-        uri.SetHostName(unique_name);
-    }
-    return outcome;
+    return create_result;
 }
 
 DataStorageBatchCreateResult DataStorageManager::CreateBatch(RequestContext *request_context,

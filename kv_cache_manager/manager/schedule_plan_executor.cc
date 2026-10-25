@@ -87,65 +87,6 @@ private:
     std::atomic<bool> completed_{false};
 };
 
-struct SchedulePlanExecutor::LocationDeleteGuard {
-    LocationDeleteGuard(SchedulePlanExecutor &executor, const CacheLocationDelRequest &task) : executor_(executor) {
-        try {
-            // Deduplicate and order the complete batch before acquiring any
-            // location lock, including when callers supply repeated keys/ids.
-            std::set<LocationDeleteKey> keys;
-            for (size_t i = 0; i < task.block_keys.size(); ++i) {
-                for (const auto &id : task.location_ids[i]) {
-                    keys.emplace(task.instance_id, task.block_keys[i], id);
-                }
-            }
-            entries_.reserve(keys.size());
-            locks_.reserve(keys.size());
-            {
-                std::lock_guard<std::mutex> registry_lock(executor_.location_delete_locks_mutex_);
-                for (const auto &key : keys) {
-                    const auto it = executor_.location_delete_locks_.find(key);
-                    auto lock = it == executor_.location_delete_locks_.end() ? nullptr : it->second.lock();
-                    if (!lock) {
-                        lock = std::make_shared<std::mutex>();
-                    }
-                    // Track ownership before publishing it in the registry,
-                    // so constructor failure can clean every published entry.
-                    entries_.emplace_back(key, lock);
-                    executor_.location_delete_locks_[key] = lock;
-                }
-            }
-            // Never retain the registry mutex while waiting or doing I/O.
-            for (const auto &entry : entries_) {
-                locks_.emplace_back(*entry.second);
-            }
-        } catch (...) {
-            Release();
-            throw;
-        }
-    }
-
-    ~LocationDeleteGuard() { Release(); }
-
-    void Release() noexcept {
-        locks_.clear();
-        std::lock_guard<std::mutex> registry_lock(executor_.location_delete_locks_mutex_);
-        for (const auto &entry : entries_) {
-            const auto it = executor_.location_delete_locks_.find(entry.first);
-            if (it != executor_.location_delete_locks_.end() && entry.second.use_count() == 1 &&
-                !it->second.owner_before(entry.second) && !entry.second.owner_before(it->second)) {
-                executor_.location_delete_locks_.erase(it);
-            }
-        }
-        // Drop ownership while still holding the registry mutex: otherwise two
-        // retiring guards can both see use_count > 1 and leave an expired entry.
-        entries_.clear();
-    }
-
-    SchedulePlanExecutor &executor_;
-    std::vector<std::pair<LocationDeleteKey, std::shared_ptr<std::mutex>>> entries_;
-    std::vector<std::unique_lock<std::mutex>> locks_;
-};
-
 DEFINE_METRICS_NAME_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_task_count);
 DEFINE_METRICS_NAME_FOR_SCHEDULE_PLAN_EXECUTOR(executing_task_count);
 DEFINE_METRICS_NAME_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_migration_task_count);
@@ -336,12 +277,6 @@ PlanExecuteResult SchedulePlanExecutor::DoLocationDelTask(const CacheLocationDel
                                                         task.block_keys.size(),
                                                         task.location_ids.size()));
     }
-
-    // An abort and a concurrent trim may both have admitted the same DELETING
-    // location. Re-read only after the prior worker finishes its physical
-    // DELETE and metadata CAD, so a freed allocation is never deleted twice
-    // merely because the first worker has not removed its metadata yet.
-    LocationDeleteGuard delete_guard(*this, task);
 
     std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(task.instance_id);
     if (!indexer) {

@@ -150,11 +150,9 @@ public:
     const StorageConfig &GetStorageConfig() override { return delegate_->GetStorageConfig(); }
     ErrorCode DoOpen(const StorageConfig &c, const std::string &t) override { return delegate_->DoOpen(c, t); }
     ErrorCode Close() override { return delegate_->Close(); }
-    DataStorageCreateOutcome CreateWithCleanup(const std::vector<std::string> &k,
-                                               size_t s,
-                                               const std::string &t,
-                                               std::function<void()> cb) override {
-        return delegate_->CreateWithCleanup(k, s, t, std::move(cb));
+    std::vector<std::pair<ErrorCode, DataStorageUri>>
+    Create(const std::vector<std::string> &k, size_t s, const std::string &t, std::function<void()> cb) override {
+        return delegate_->Create(k, s, t, std::move(cb));
     }
     std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &u, const std::string &t, std::function<void()> cb) override {
@@ -402,11 +400,11 @@ public:
         return delegate_->DoOpen(config, trace_id);
     }
     ErrorCode Close() override { return delegate_->Close(); }
-    DataStorageCreateOutcome CreateWithCleanup(const std::vector<std::string> &keys,
-                                               size_t size_per_key,
-                                               const std::string &trace_id,
-                                               std::function<void()> cb) override {
-        return delegate_->CreateWithCleanup(keys, size_per_key, trace_id, std::move(cb));
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const std::string &trace_id,
+                                                             std::function<void()> cb) override {
+        return delegate_->Create(keys, size_per_key, trace_id, std::move(cb));
     }
     std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &uris, const std::string &trace_id, std::function<void()> cb) override {
@@ -445,11 +443,11 @@ public:
         return delegate_->DoOpen(config, trace_id);
     }
     ErrorCode Close() override { return delegate_->Close(); }
-    DataStorageCreateOutcome CreateWithCleanup(const std::vector<std::string> &keys,
-                                               size_t size_per_key,
-                                               const std::string &trace_id,
-                                               std::function<void()> cb) override {
-        return delegate_->CreateWithCleanup(keys, size_per_key, trace_id, std::move(cb));
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const std::string &trace_id,
+                                                             std::function<void()> cb) override {
+        return delegate_->Create(keys, size_per_key, trace_id, std::move(cb));
     }
     std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
@@ -10978,15 +10976,6 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkChecksSpecGroupOnTarget) 
     }
 }
 
-class MockCleanupBackend : public MockDataStorageBackend {
-public:
-    using MockDataStorageBackend::MockDataStorageBackend;
-    MOCK_METHOD(DataStorageCreateOutcome,
-                CreateWithCleanup,
-                (const std::vector<std::string> &, size_t, const std::string &, std::function<void()>),
-                (override));
-};
-
 class MockBatchBackend : public MockDataStorageBackend {
 public:
     using MockDataStorageBackend::MockDataStorageBackend;
@@ -11181,38 +11170,6 @@ TEST_F(BatchAllocationTest, EqualSizesShortAndLongResultsRollbackEverySuccessful
         EXPECT_EQ(EC_ERROR, Allocate({1, 2}, {}, locations));
         EXPECT_TRUE(locations.empty());
     }
-}
-
-TEST_F(BatchAllocationTest, SingleSizeCleanupOutcomeRejectsAllResultsAndRollsBackEveryUri) {
-    const std::vector<LocationSpecInfo> specs{{"tp0", 128}, {"tp1", 128}};
-    Prepare(specs);
-    auto backend = std::make_shared<testing::NiceMock<MockCleanupBackend>>(metrics_registry_);
-    ON_CALL(*backend, Available()).WillByDefault(Return(true));
-    ON_CALL(*backend, GetType()).WillByDefault(Return(storage_type_));
-    backend->config_.set_type(storage_type_);
-    backend->config_.set_global_unique_name(storage_name_);
-    registry_manager_->data_storage_manager_->storage_map_[storage_name_] = backend;
-    DataStorageCreateOutcome outcome;
-    outcome.results = Succeed({BlockKey(specs[0], 1), BlockKey(specs[1], 1)}, 128);
-    outcome.cleanup_uris = {Uri("unmapped", 128)};
-    EXPECT_CALL(*backend, Create(_, _, _, _)).Times(0);
-    EXPECT_CALL(*backend, CreateWithCleanup(_, 128, _, _)).WillOnce(Return(outcome));
-    EXPECT_CALL(*backend, Delete(_, _, _)).WillOnce([&](const auto &uris, const auto &, auto) {
-        std::vector<std::string> paths;
-        for (const auto &uri : uris) {
-            EXPECT_EQ(uri.GetHostName(), storage_name_);
-            paths.push_back(uri.GetPath());
-        }
-        std::sort(paths.begin(), paths.end());
-        std::vector<std::string> expected{
-            Uri(BlockKey(specs[0], 1), 128).GetPath(), Uri(BlockKey(specs[1], 1), 128).GetPath(), "/unmapped"};
-        std::sort(expected.begin(), expected.end());
-        EXPECT_EQ(paths, expected);
-        return std::vector<ErrorCode>(uris.size(), EC_OK);
-    });
-    CacheLocationVector locations;
-    EXPECT_EQ(EC_ERROR, Allocate({1}, {}, locations));
-    EXPECT_TRUE(locations.empty());
 }
 
 TEST_F(BatchAllocationTest, FiltersSpecGroupsBeforeBatchingAndSkipsEmptyRequests) {

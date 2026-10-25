@@ -37,11 +37,11 @@ public:
     ErrorCode UnRegisterStorage(const std::string &name);
     ErrorCode DoCleanup();
 
-    DataStorageCreateOutcome Create(RequestContext *request_context,
-                                    const std::string &unique_name,
-                                    const std::vector<std::string> &keys,
-                                    size_t size_per_key,
-                                    std::function<void()> cb);
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(RequestContext *request_context,
+                                                             const std::string &unique_name,
+                                                             const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             std::function<void()> cb);
 
     // cb runs once on the calling thread after result processing and releasing
     // the storage lock, so it may reenter this manager.
