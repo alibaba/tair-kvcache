@@ -2148,83 +2148,6 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
     return EC_OK;
 }
 
-ErrorCode
-CacheManager::CreateInSingleBatch(RequestContext *request_context,
-                                  const std::string &instance_id,
-                                  const CacheManager::KeyVector &keys,
-                                  const std::vector<std::string_view> &location_spec_group_names,
-                                  const std::shared_ptr<const InstanceInfo> &instance_info,
-                                  const std::shared_ptr<DataStorageManager> &data_storage_manager,
-                                  const std::string &unique_name,
-                                  std::vector<DataStorageUri> &allocated_uris,
-                                  std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
-                                  bool &is_create_success,
-                                  int64_t common_size) {
-    SPAN_TRACER(request_context);
-    const std::string &trace_id = request_context->trace_id();
-    std::vector<std::string> merged_block_keys;
-    std::vector<size_t> merged_keys_idx;
-    std::vector<const LocationSpecInfo *> spec_info_mapping;
-    merged_block_keys.reserve(instance_info->location_spec_infos().size() * keys.size());
-    merged_keys_idx.reserve(instance_info->location_spec_infos().size() * keys.size());
-    spec_info_mapping.reserve(instance_info->location_spec_infos().size() * keys.size());
-
-    for (const auto &spec_info : instance_info->location_spec_infos()) {
-        if (location_spec_group_names.empty()) {
-            for (size_t i = 0; i < keys.size(); i++) {
-                std::string block_key = instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]);
-                merged_block_keys.push_back(block_key);
-                merged_keys_idx.push_back(i);
-                spec_info_mapping.push_back(&spec_info);
-            }
-        } else {
-            for (size_t i = 0; i < keys.size(); i++) {
-                auto [ec, found] = IsSpecNameInSpecGroup(trace_id,
-                                                         instance_id,
-                                                         spec_info.name(),
-                                                         location_spec_group_names[i],
-                                                         instance_info->location_spec_groups());
-                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "IsSpecNameInSpecGroup failed");
-                if (found) {
-                    std::string block_key =
-                        instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]);
-                    merged_block_keys.push_back(block_key);
-                    merged_keys_idx.push_back(i);
-                    spec_info_mapping.push_back(&spec_info);
-                }
-            }
-        }
-    }
-
-    std::vector<std::pair<ErrorCode, DataStorageUri>> results = data_storage_manager->Create(
-        request_context, unique_name, merged_block_keys, common_size, []() { /* do nothing */ });
-
-    for (size_t i = 0; i < results.size(); i++) {
-        if (results[i].first == ErrorCode::EC_OK) {
-            allocated_uris.push_back(results[i].second);
-            if (i < merged_keys_idx.size()) {
-                key_to_uris[merged_keys_idx[i]].push_back({allocated_uris.size() - 1, spec_info_mapping[i]});
-            }
-        }
-    }
-    // TODO: move check to another function
-    if (results.size() != merged_block_keys.size()) {
-        is_create_success = false;
-        PREFIX_LOG(WARN,
-                   "create data storage fail, results size:%ld, request size: %ld",
-                   results.size(),
-                   merged_block_keys.size());
-    }
-    for (auto &result : results) {
-        if (result.first != ErrorCode::EC_OK) {
-            is_create_success = false;
-            PREFIX_LOG(WARN, "create data storage fail, ec_code: %d", result.first);
-            break;
-        }
-    }
-    return EC_OK;
-}
-
 ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
                                      const std::string &instance_id,
                                      const CacheManager::KeyVector &keys,
@@ -2243,8 +2166,8 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
     std::vector<DataStorageCreateRequest> requests;
     std::vector<std::vector<size_t>> keys_idx;
     std::vector<const LocationSpecInfo *> spec_mapping;
-    // Collect spec requests before allocating; the backend owns batching and
-    // execution policy. Keep request boundaries for backends that share files.
+    // Preserve spec boundaries so file backends do not share files across TP ranks.
+    // The backend alone decides whether to merge requests or allocate in parallel.
     for (const auto &spec_info : instance_info->location_spec_infos()) {
         DataStorageCreateRequest request{{}, static_cast<size_t>(spec_info.size())};
         std::vector<size_t> indices;
@@ -2342,42 +2265,17 @@ ErrorCode CacheManager::GenWriteLocationOnStorage(RequestContext *request_contex
     std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> key_to_uris(keys.size());
     bool is_create_success = true;
 
-    bool merge = instance_info->location_spec_infos().empty() ||
-                 std::all_of(instance_info->location_spec_infos().begin() + 1,
-                             instance_info->location_spec_infos().end(),
-                             [&instance_info](const auto &spec) {
-                                 return spec.size() == instance_info->location_spec_infos().front().size();
-                             });
-    int64_t common_size = merge && !instance_info->location_spec_infos().empty()
-                              ? instance_info->location_spec_infos().front().size()
-                              : 0;
-
-    if (merge) {
-        auto ec = CreateInSingleBatch(request_context,
-                                      instance_id,
-                                      keys,
-                                      location_spec_group_names,
-                                      instance_info,
-                                      data_storage_manager,
-                                      storage_name,
-                                      allocated_uris,
-                                      key_to_uris,
-                                      is_create_success,
-                                      common_size);
-        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "CreateInSingleBatch failed");
-    } else {
-        auto ec = CreateBySpec(request_context,
-                               instance_id,
-                               keys,
-                               location_spec_group_names,
-                               instance_info,
-                               data_storage_manager,
-                               storage_name,
-                               allocated_uris,
-                               key_to_uris,
-                               is_create_success);
-        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "CreateBySpec failed");
-    }
+    auto ec = CreateBySpec(request_context,
+                           instance_id,
+                           keys,
+                           location_spec_group_names,
+                           instance_info,
+                           data_storage_manager,
+                           storage_name,
+                           allocated_uris,
+                           key_to_uris,
+                           is_create_success);
+    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "CreateBySpec failed");
 
     if (!is_create_success) {
         request_context->error_tracer()->AddErrorMsg("some internal error when GenWriteLocation");

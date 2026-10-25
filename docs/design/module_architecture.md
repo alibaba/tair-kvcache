@@ -226,7 +226,7 @@ Recover 保留未回填 key 的回源、写前补齐与 tombstone；并发读允
 2. **写入数据（SaveKvCaches）**：引擎经 `ManagerClient::SaveKvCaches`（数据面 `TransferClient`）把 KVCache 数据写入返回的存储位置。此步**不经过 KVCM**。
 3. **确认（FinishWriteCache）**：引擎经 `ManagerClient::FinishWrite`（元数据面）回调 KVCM，`CacheManager` 依据 `success_block_mask` 将成功的 `CacheLocation` 置为 `serving` 并写入元数据索引；失败的 block 不会转正，保证只有真正写成功的数据可被后续读取命中。
 
-申请地址时，`CacheManager` 将不同大小的 spec 作为一组 `CreateBatch` 请求提交，由 `DataStorageManager` 转发给存储后端；后端决定是否合并和并行分配，`CacheManager` 不含 PACE 专属判断。PACE 后端按大小合并并按配置并行执行，其他后端默认保留原分组边界、串行分配；既有单一大小的 `Create` 接口仍保留。
+申请地址时，`CacheManager` 按 spec 筛选 key，保留每个 spec 的请求边界，统一调用一次 `CreateBatch`，由 `DataStorageManager` 转发给存储后端。无论 spec 大小是否相同，CacheManager 都不决定合并或并发策略。PACE 后端按大小合并并按配置并行执行；其他后端默认按 spec 边界串行分配，使 NFS/Hf3fs 等文件后端不会跨 spec 共用文件。既有 `Create` 接口仍供单组请求使用。
 
 批量结果按请求和 key 的原始顺序返回；响应数量异常、无法映射的已分配 URI 通过独立的 `cleanup_uris` 返回。`CacheManager` 收集正常结果与回收列表中的所有已分配 URI，沿用统一的失败回滚机制。
 
