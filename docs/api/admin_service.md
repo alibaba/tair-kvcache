@@ -56,7 +56,8 @@ TairMempool Storage（`ST_TAIRMEMPOOL` / `ST_TAIRMEMPOOL_SSD`）可以在 `tair_
 TairMempool 的 `tair_mem_pool.allocate_concurrency` 控制单次 `CreateBatch` 的在途分配数，
 默认 `4`、范围 `1..64`。同一 Storage 的多个 `Create` / `CreateBatch` 请求共用固定线程池，
 总线程数为可用 CPU 核数的两倍，与每批并发上限独立。设为 `1` 时每批内部串行执行，
-不同批次仍可并行；每个批次仍先合并相同大小的请求。
+不同批次仍可并行；每个批次仍先合并相同大小的请求。队列满时拒绝新任务，
+已接受的任务完成后统一处理失败与回滚；健康探测使用独立客户端。
 `StartWrite` 通过通用批量接口提交请求，合并和并行由 PACE 后端完成，对 `CacheManager` 透明。
 省略字段或传入 proto3 的 `0` 使用默认值。HTTP 超时及完整配置示例见
 [配置指南](../configuration.md#tairmempool)。

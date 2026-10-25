@@ -49,6 +49,12 @@ public:
             }
         }
 
+        // Track a new client without making it available to other borrowers.
+        void RegisterClient(const std::shared_ptr<ClientType> &client) {
+            std::unique_lock lock(mtx_);
+            client_ref_.push_back(client);
+        }
+
         size_t AllClientSize() const {
             std::shared_lock lock(mtx_);
             return client_ref_.size();
@@ -144,25 +150,29 @@ public:
         if (!this->pool_state_) {
             return typename Base::ClientHandle(nullptr, nullptr);
         }
-        std::shared_ptr<ClientType> client;
-        if (this->pool_state_->FreeClientSize() > 0 || this->pool_state_->AllClientSize() >= max_pool_size_) {
-            client = this->pool_state_->AcquireClient(timeout_ms);
-        }
+        // Checking the free count before acquiring races with other borrowers:
+        // the last idle client may disappear while capacity remains to grow.
+        auto client = this->pool_state_->AcquireClient(0);
         if (client == nullptr) {
             if (static_cast<int32_t>(this->pool_state_->AllClientSize()) < max_pool_size_) {
                 std::unique_lock lock(acq_mux_);
-                // double check
-                if (static_cast<int32_t>(this->pool_state_->AllClientSize()) < max_pool_size_) {
-                    auto temp_client = this->cb_();
-                    if (temp_client != nullptr) {
-                        this->pool_state_->ReleaseClient(temp_client, true);
+                // Reuse clients returned while waiting to grow the pool.
+                client = this->pool_state_->AcquireClient(0);
+                if (client == nullptr && static_cast<int32_t>(this->pool_state_->AllClientSize()) < max_pool_size_) {
+                    client = this->cb_();
+                    if (client != nullptr) {
+                        // Keep ownership; publishing then reacquiring lets another
+                        // borrower steal the new client and makes this caller wait.
+                        this->pool_state_->RegisterClient(client);
                     } else {
                         KVCM_LOG_WARN("DynamicClientPool: failed to create new client, current pool size: %zu",
                                       this->pool_state_->AllClientSize());
                     }
                 }
             }
-            client = this->pool_state_->AcquireClient(timeout_ms);
+            if (client == nullptr) {
+                client = this->pool_state_->AcquireClient(timeout_ms);
+            }
         }
 
         return typename Base::ClientHandle(this->pool_state_, std::move(client));

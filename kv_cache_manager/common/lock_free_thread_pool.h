@@ -39,14 +39,15 @@ public:
     // Reject immediately if no queue capacity is available.
     bool trySchedule(std::function<void()> task);
 
-    // Preserve SDK semantics: wait for queue capacity, then execute on the
-    // caller if admission is closed. Exceptions are delivered by the future.
+    // Preserve SDK semantics: autil admits one extra queued task for async.
+    // Wait for that capacity, then execute on the caller if admission is closed.
+    // Exceptions are delivered by the future.
     template <typename Function>
     auto async(Function &&function) -> std::future<std::invoke_result_t<std::decay_t<Function> &>> {
         using Result = std::invoke_result_t<std::decay_t<Function> &>;
         auto task = std::make_shared<std::packaged_task<Result()>>(std::forward<Function>(function));
         auto future = task->get_future();
-        if (!enqueue([task]() { (*task)(); })) {
+        if (!schedule([task]() { (*task)(); }, true, true)) {
             (*task)();
         }
         return future;
@@ -60,7 +61,7 @@ private:
         Stopped
     };
 
-    bool schedule(std::function<void()> task, bool blocked);
+    bool schedule(std::function<void()> task, bool blocked, bool sdk_compatible_admission = false);
     void completeTask();
 
     std::unique_ptr<autil::LockFreeThreadPool> pool_;

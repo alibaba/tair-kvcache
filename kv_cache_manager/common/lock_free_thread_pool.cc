@@ -7,11 +7,32 @@
 
 namespace kv_cache_manager {
 
+namespace {
+
+struct ThreadCreationFailed {};
+
+class CheckedLockFreeThreadPool : public autil::LockFreeThreadPool {
+public:
+    using autil::LockFreeThreadPool::LockFreeThreadPool;
+
+protected:
+    bool createThreads(const std::string &name) override {
+        if (!autil::LockFreeThreadPool::createThreads(name)) {
+            // autil::start holds _cond and calls stop on false, which locks
+            // _cond again. Unwind that lock before cleaning up partial startup.
+            throw ThreadCreationFailed{};
+        }
+        return true;
+    }
+};
+
+} // namespace
+
 LockFreeThreadPool::LockFreeThreadPool(size_t thread_num,
                                        size_t queue_size,
                                        const std::string &thread_name,
                                        bool stop_if_has_exception)
-    : pool_(std::make_unique<autil::LockFreeThreadPool>(
+    : pool_(std::make_unique<CheckedLockFreeThreadPool>(
           thread_num, queue_size, nullptr, thread_name, stop_if_has_exception))
     , queue_size_(pool_->getQueueSize()) {}
 
@@ -23,12 +44,16 @@ bool LockFreeThreadPool::start(const std::string &name) {
         return false;
     }
     state_ = State::Stopped;
-    if (!pool_->start(name)) {
-        KVCM_LOG_WARN("start lock free thread pool %s failed", name.c_str());
-        return false;
+    try {
+        if (pool_->start(name)) {
+            state_ = State::Running;
+            return true;
+        }
+    } catch (const ThreadCreationFailed &) {
+        pool_->stop();
     }
-    state_ = State::Running;
-    return true;
+    KVCM_LOG_WARN("start lock free thread pool %s failed", name.c_str());
+    return false;
 }
 
 void LockFreeThreadPool::stop() {
@@ -66,22 +91,29 @@ bool LockFreeThreadPool::enqueue(std::function<void()> task) { return schedule(s
 
 bool LockFreeThreadPool::trySchedule(std::function<void()> task) { return schedule(std::move(task), false); }
 
-bool LockFreeThreadPool::schedule(std::function<void()> task, bool blocked) {
+bool LockFreeThreadPool::schedule(std::function<void()> task, bool blocked, bool sdk_compatible_admission) {
     if (!task) {
         return false;
     }
     std::unique_lock<std::mutex> lock(mutex_);
+    const auto has_capacity = [this, sdk_compatible_admission]() {
+        // autil's async submission historically accepts Q + 1 queued tasks.
+        // Keep that SDK boundary without relaxing enqueue/trySchedule admission.
+        return sdk_compatible_admission ? queued_tasks_ <= queue_size_ : queued_tasks_ < queue_size_;
+    };
     if (blocked) {
-        space_available_.wait(lock, [this]() { return state_ != State::Running || queued_tasks_ < queue_size_; });
+        space_available_.wait(lock, [this, &has_capacity]() { return state_ != State::Running || has_capacity(); });
     }
-    if (state_ != State::Running || queued_tasks_ >= queue_size_) {
+    if (state_ != State::Running || !has_capacity()) {
         return false;
     }
     auto tracked_task = [this, task = std::move(task)]() mutable {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             --queued_tasks_;
-            space_available_.notify_one();
+            // Strict and SDK waiters have different capacity predicates: waking
+            // only a strict waiter could leave an eligible SDK waiter asleep.
+            space_available_.notify_all();
         }
         struct Completion {
             LockFreeThreadPool *owner;
@@ -109,13 +141,13 @@ bool LockFreeThreadPool::schedule(std::function<void()> task, bool blocked) {
     } catch (...) {
         --queued_tasks_;
         --pending_tasks_;
-        space_available_.notify_one();
+        space_available_.notify_all();
         finished_.notify_all();
         throw;
     }
     --queued_tasks_;
     --pending_tasks_;
-    space_available_.notify_one();
+    space_available_.notify_all();
     finished_.notify_all();
     return false;
 }

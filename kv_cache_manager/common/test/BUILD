@@ -224,6 +224,16 @@ cc_test(
 )
 
 cc_test(
+    name = "ClientPoolConcurrencyTest",
+    srcs = ["client_pool_concurrency_test.cc"],
+    linkopts = ["-Wl,--wrap=pthread_rwlock_unlock"],
+    deps = [
+        "//kv_cache_manager/common:client_pool",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
     name = "service_discovery_factory_test",
     srcs = [
         "service_discovery_factory_test.cc",
@@ -265,6 +275,16 @@ cc_test(
 cc_test(
     name = "LockFreeThreadPoolTest",
     srcs = ["lock_free_thread_pool_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:lock_free_thread_pool",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
+    name = "LockFreeThreadPoolStartFailureTest",
+    srcs = ["lock_free_thread_pool_start_failure_test.cc"],
+    linkopts = ["-rdynamic", "-ldl"],
     deps = [
         "//kv_cache_manager/common:lock_free_thread_pool",
         "//kv_cache_manager/common:unittest",

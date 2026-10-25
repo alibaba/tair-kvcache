@@ -105,6 +105,60 @@ TEST_F(LockFreeThreadPoolTest, TryScheduleRejectsFullQueueWithoutExecuting) {
     EXPECT_EQ(3, pool.async([]() { return 3; }).get());
 }
 
+TEST_F(LockFreeThreadPoolTest, AsyncPreservesExtraQueueSlotAndStopWakesItsBlockedProducer) {
+    LockFreeThreadPool pool(1, 1, "async_capacity");
+    TaskGate gate;
+    ASSERT_TRUE(pool.start());
+    std::promise<void> running;
+    auto started = running.get_future();
+    auto active = pool.async([&]() {
+        running.set_value();
+        gate.Wait();
+    });
+    ASSERT_EQ(std::future_status::ready, started.wait_for(1s));
+
+    auto submitting = std::async(std::launch::async, [&]() {
+        std::vector<std::future<int>> results;
+        results.push_back(pool.async([]() { return 1; }));
+        results.push_back(pool.async([]() { return 2; }));
+        return results;
+    });
+    const auto submitted = submitting.wait_for(1s);
+    EXPECT_EQ(std::future_status::ready, submitted);
+    if (submitted != std::future_status::ready) {
+        // A capacity regression must fail without stranding the gated worker.
+        gate.Open();
+        submitting.get();
+        pool.stop();
+        return;
+    }
+    auto accepted = submitting.get();
+    EXPECT_TRUE(pool.isFull());
+    EXPECT_FALSE(pool.trySchedule([]() {}));
+
+    std::promise<void> producer_started;
+    auto producing = producer_started.get_future();
+    std::thread::id producer_id;
+    auto blocked = std::async(std::launch::async, [&]() {
+        producer_id = std::this_thread::get_id();
+        producer_started.set_value();
+        return pool.async([]() { return std::this_thread::get_id(); });
+    });
+    EXPECT_EQ(std::future_status::ready, producing.wait_for(1s));
+    EXPECT_EQ(std::future_status::timeout, blocked.wait_for(20ms));
+    auto stopping = std::async(std::launch::async, [&]() { pool.stop(); });
+    EXPECT_EQ(std::future_status::ready, blocked.wait_for(1s));
+    EXPECT_EQ(std::future_status::timeout, stopping.wait_for(20ms));
+    gate.Open();
+    const auto fallback_thread = blocked.get().get();
+    EXPECT_EQ(producer_id, fallback_thread);
+    stopping.get();
+    active.get();
+    ASSERT_EQ(2u, accepted.size());
+    EXPECT_EQ(1, accepted[0].get());
+    EXPECT_EQ(2, accepted[1].get());
+}
+
 TEST_F(LockFreeThreadPoolTest, StopClosesAdmissionAndDrainsQueuedTasks) {
     LockFreeThreadPool pool(1, 8, "drain");
     TaskGate gate;

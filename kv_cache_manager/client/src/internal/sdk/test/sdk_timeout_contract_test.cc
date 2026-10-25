@@ -332,6 +332,43 @@ TEST_F(SdkTimeoutContractTest, TestQueuedTaskNeverStartsIo) {
     ASSERT_EQ(ER_OK, blocker.get());
 }
 
+TEST_F(SdkTimeoutContractTest, TestTwoHostsRetainLegacyAdmissionAtQueueCapacityOne) {
+    auto first = std::make_shared<FakeSlowSdkControl>();
+    auto second = std::make_shared<FakeSlowSdkControl>();
+    RegisterFakeForTest("first_host", first);
+    RegisterFakeForTest("second_host", second);
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, InitWrapper(sdk_wrapper, 1, 1, 2000, 50, MakeDualFileStorageConfigs("first_host", "second_host")));
+    std::vector<DataStorageUri> uris = {
+        MakeUri("first_host", "first/0/0/1", 0, 1024),
+        MakeUri("second_host", "second/0/0/1", 0, 1024),
+    };
+    auto buffers = TestBuffers::Make(2, 1024, 0x00);
+    std::promise<void> running, release;
+    auto started = running.get_future();
+    auto gate = release.get_future().share();
+    auto blocker = sdk_wrapper.wait_task_thread_pool_->async([&running, gate]() -> ClientErrorCode {
+        running.set_value();
+        gate.wait();
+        return ER_OK;
+    });
+    ASSERT_EQ(std::future_status::ready, started.wait_for(std::chrono::seconds(1)));
+
+    auto request = std::async(std::launch::async, [&]() { return sdk_wrapper.Get(uris, buffers.buffers); });
+    // Legacy autil accepts both host tasks at Q=1. They must reach the existing
+    // 50ms deadline while the worker remains gated, rather than block admission.
+    const auto returned = request.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(std::future_status::ready, returned);
+    // Always release before collecting futures so the regression cannot hang UT.
+    release.set_value();
+    EXPECT_EQ(ER_SDK_TIMEOUT, request.get());
+    EXPECT_EQ(ER_OK, blocker.get());
+    sdk_wrapper.wait_task_thread_pool_->waitFinish();
+    EXPECT_EQ(0, first->get_call_count.load());
+    EXPECT_EQ(0, second->get_call_count.load());
+    EXPECT_TRUE(buffers.AllBytesEqual(0x00));
+}
+
 // ============================================================================
 // 3.3 hard 契约：返回后无后台访问（真实 hard 级后端 LocalFileSdk）
 // ============================================================================
