@@ -2202,7 +2202,9 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
     for (size_t i = 0; i < results.size(); i++) {
         if (results[i].first == ErrorCode::EC_OK) {
             allocated_uris.push_back(results[i].second);
-            key_to_uris[merged_keys_idx[i]].push_back({allocated_uris.size() - 1, spec_info_mapping[i]});
+            if (i < merged_keys_idx.size()) {
+                key_to_uris[merged_keys_idx[i]].push_back({allocated_uris.size() - 1, spec_info_mapping[i]});
+            }
         }
     }
     // TODO: move check to another function
@@ -2236,6 +2238,9 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
     // avoid use file across tp ranks
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+    std::vector<DataStorageCreateRequest> requests;
+    std::vector<std::vector<size_t>> request_keys_idx;
+    std::vector<const LocationSpecInfo *> request_specs;
     for (const auto &spec_info : instance_info->location_spec_infos()) {
         std::vector<std::string> block_keys;
         std::vector<size_t> keys_idx;
@@ -2267,35 +2272,48 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
         if (block_keys.empty()) {
             continue;
         }
+        requests.push_back({std::move(block_keys), static_cast<size_t>(spec_info.size())});
+        request_keys_idx.push_back(std::move(keys_idx));
+        request_specs.push_back(&spec_info);
+    }
+    if (requests.empty()) {
+        return EC_OK;
+    }
 
-        std::vector<std::pair<ErrorCode, DataStorageUri>> results = data_storage_manager->Create(
-            request_context, unique_name, block_keys, spec_info.size(), []() { /* do nothing */ });
-
+    const auto batch_results = data_storage_manager->CreateBatch(request_context, unique_name, requests, nullptr);
+    if (batch_results.size() != requests.size()) {
+        is_create_success = false;
+        PREFIX_LOG(WARN,
+                   "create data storage fail, batch results size:%zu, request size: %zu",
+                   batch_results.size(),
+                   requests.size());
+    }
+    // Inspect every response so parallel successes and excess returned URIs are
+    // retained for rollback even when another request failed.
+    for (size_t batch = 0; batch < batch_results.size(); ++batch) {
+        const auto &results = batch_results[batch];
         for (size_t i = 0; i < results.size(); i++) {
             if (results[i].first == ErrorCode::EC_OK) {
                 allocated_uris.push_back(results[i].second);
-                key_to_uris[keys_idx[i]].push_back({allocated_uris.size() - 1, &spec_info});
+                if (batch < request_keys_idx.size() && i < request_keys_idx[batch].size()) {
+                    key_to_uris[request_keys_idx[batch][i]].push_back(
+                        {allocated_uris.size() - 1, request_specs[batch]});
+                }
             }
         }
-
-        // TODO: move check to another function
-        if (results.size() != block_keys.size()) {
+        if (batch < requests.size() && results.size() != requests[batch].keys.size()) {
             is_create_success = false;
             PREFIX_LOG(WARN,
-                       "create data storage fail, results size:%ld, request size: %ld",
+                       "create data storage fail, results size:%zu, request size: %zu",
                        results.size(),
-                       block_keys.size());
+                       requests[batch].keys.size());
         }
-        for (auto &result : results) {
+        for (const auto &result : results) {
             if (result.first != ErrorCode::EC_OK) {
                 is_create_success = false;
                 PREFIX_LOG(WARN, "create data storage fail, ec_code: %d", result.first);
                 break;
             }
-        }
-
-        if (!is_create_success) {
-            break;
         }
     }
     return EC_OK;
@@ -2312,6 +2330,10 @@ ErrorCode CacheManager::GenWriteLocationOnStorage(RequestContext *request_contex
                                                   CacheLocationVector &out_locations) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+
+    if (!location_spec_group_names.empty() && location_spec_group_names.size() != keys.size()) {
+        return EC_BADARGS;
+    }
 
     if (keys.empty()) {
         return EC_OK;

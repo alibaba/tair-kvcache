@@ -25,6 +25,9 @@ def gen_pace_config_data(args):
         storage_spec["skip_confirmed_missing_backend_delete"] = skip_missing
     if args.health_check_timeout is not None:
         storage_spec["health_check_timeout"] = args.health_check_timeout
+    allocate_concurrency = getattr(args, "allocate_concurrency", None)
+    if allocate_concurrency is not None:
+        storage_spec["allocate_concurrency"] = allocate_concurrency
     return storage_spec
 
 
@@ -102,6 +105,10 @@ def add_pace_common_args(parser):
         '--health_check_timeout', type=positive_int, default=None,
         help='health request and connection timeout in seconds (server default: 1; update omission preserves existing)')
     parser.add_argument(
+        '--allocate_concurrency', type=pace_allocate_concurrency_value, default=None,
+        help='maximum parallel allocation requests per batch: 0 (default) automatically uses twice the available CPUs; '
+             'explicit values: 1..64 (1 runs serially; update omission preserves existing; 0 resets to automatic)')
+    parser.add_argument(
         '--skip_confirmed_missing_backend_delete',
         type=pace_gc_skip_delete_value,
         default=None,
@@ -119,6 +126,13 @@ def add_pace_common_args(parser):
             'static://10.0.0.1:8080,10.0.0.2:8080'
         ),
     )
+
+
+def pace_allocate_concurrency_value(value):
+    concurrency = int(value)
+    if not 0 <= concurrency <= 64:
+        raise argparse.ArgumentTypeError("allocate_concurrency must be 0 (automatic) or between 1 and 64")
+    return concurrency
 
 
 def pace_gc_skip_delete_value(value):

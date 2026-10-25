@@ -408,6 +408,22 @@ HTTP 超时参数配置在 `storage_spec` 中（Admin API 对应 `storage.tair_m
 | `timeout` | 分配、删除、同步复制、容量和节点查询 | 必填，示例为 5 秒 |
 | `health_check_timeout` | 健康探测 | 1 秒 |
 
+`allocate_concurrency` 控制 PACE 批量分配的并行度，默认 `0`，表示自动使用可用 CPU 数的两倍，
+通常无需配置。显式正数范围为 `1..64`，自动值不受 `64` 限制；DRAM 和 SSD 均适用。
+后端先合并相同大小的请求，再使用共用线程池分波调用原有 `Create`；例如 20 个 spec 有 3 种大小，
+成功路径只需 3 次 PACE 分配。每波最多提交实际并发度个任务，设为 `1` 即批内串行。
+任一任务失败后不再提交后续波次，仍等待本波所有任务完成，返回已成功的 URI 供原有流程回滚。
+
+分配池大小默认是可用 CPU 数的两倍；Linux 优先读取 affinity/cpuset，否则使用
+`hardware_concurrency()`，无法读取时为 2 个线程。沿用 SDK 的 autil 线程池入队和关闭语义，
+队列容量参数为 64；队列忙时提交可能等待，HTTP `timeout` 不含排队时间。
+原有单次 `Create`、健康检查和非 PACE 后端分配逻辑保持原样。
+
+Registry JSON 的 `storage_spec.allocate_concurrency` 与 Admin API 的
+`storage.tair_mem_pool.allocate_concurrency` 都允许省略或设置为 `0`，表示自动并发。
+配置序列化保留 `0`，不写入当前机器计算出的并发度。`kvcm_ops` 的 `pace` / `pace_ssd`
+子命令支持 `--allocate_concurrency`，更新时省略该参数会保留已有值，显式 `0` 恢复自动并发。
+
 启用独立 SSD 类型时还需遵守以下配置约束：
 
 - 使用 `kvcm_ops add_storage ... pace_ssd` 创建一个新的、全局唯一的 Storage；不要把已有

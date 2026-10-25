@@ -91,7 +91,7 @@ cc_library(
         "//conditions:default": [],
     }),
     deps = [
-        ":lock_free_thread_pool",
+        "//kv_cache_manager/common:lock_free_thread_pool",
         "//kv_cache_manager/client:common",
         "//kv_cache_manager/client/src/internal/config",
         "//kv_cache_manager/client/src/internal/util",
@@ -123,27 +123,6 @@ cc_library(
             "//stub_source/kv_cache_manager/client/src/internal/sdk:tair_mempool_sdk",
         ],
         "//conditions:default": [],
-    }),
-)
-
-cc_library(
-    name = "lock_free_thread_pool",
-    srcs = [
-        "lock_free_thread_pool.cc",
-    ],
-    hdrs = [
-        "lock_free_thread_pool.h",
-    ],
-    deps = [
-        "//kv_cache_manager/client:common",
-        "//kv_cache_manager/common:logger",
-    ] + select({
-        "client_only_header": [
-            "@havenask//aios/autil:kvcm_client_patch_autil_header",
-        ],
-        "//conditions:default": [
-            "@havenask//aios/autil:lock_free",
-        ],
     }),
 )
 

@@ -16,6 +16,7 @@
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/migration_strategy.h"
@@ -10973,6 +10974,303 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkChecksSpecGroupOnTarget) 
         ASSERT_EQ(1u, new_targets.size());
         ASSERT_EQ("cold_01", new_targets[0]);
     }
+}
+
+class MockBatchBackend : public MockDataStorageBackend {
+public:
+    using MockDataStorageBackend::MockDataStorageBackend;
+    MOCK_METHOD(DataStorageBatchCreateResult,
+                CreateBatch,
+                (const std::vector<DataStorageCreateRequest> &, const std::string &, std::function<void()>),
+                (override));
+};
+
+class BatchAllocationTest : public CacheManagerTest {
+protected:
+    const std::string storage_name_ = "batch_allocation";
+    const std::string instance_id_ = "batch_instance";
+    std::shared_ptr<MockDataStorageBackend> backend_;
+    std::shared_ptr<testing::NiceMock<MockBatchBackend>> batch_backend_;
+    std::shared_ptr<InstanceInfo> instance_info_;
+    DataStorageType storage_type_ = DataStorageType::DATA_STORAGE_TYPE_NFS;
+
+    void Prepare(const std::vector<LocationSpecInfo> &specs,
+                 DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_NFS,
+                 const std::vector<LocationSpecGroup> &groups = {},
+                 bool use_default_batch = false) {
+        storage_type_ = type;
+        instance_info_ = std::make_shared<InstanceInfo>(
+            "quota", "default", instance_id_, 64, specs, createModelDeployment(), groups);
+        if (use_default_batch) {
+            batch_backend_.reset();
+            backend_ = std::make_shared<testing::NiceMock<MockDataStorageBackend>>(metrics_registry_);
+        } else {
+            batch_backend_ = std::make_shared<testing::NiceMock<MockBatchBackend>>(metrics_registry_);
+            backend_ = batch_backend_;
+        }
+        ON_CALL(*backend_, Available()).WillByDefault(Return(true));
+        ON_CALL(*backend_, GetType()).WillByDefault(Return(type));
+        backend_->config_.set_type(type);
+        backend_->config_.set_global_unique_name(storage_name_);
+        // Allocation policy and backend-specific configuration are opaque to CacheManager.
+        registry_manager_->data_storage_manager_->storage_map_[storage_name_] = backend_;
+    }
+
+    std::string BlockKey(const LocationSpecInfo &spec, int64_t key) const {
+        return instance_id_ + "/" + spec.name() + "/" + StringUtil::Uint64ToHex(key);
+    }
+
+    DataStorageUri Uri(const std::string &key, size_t size) const {
+        return DataStorageUri("file://" + storage_name_ + "/" + key + "?size=" + std::to_string(size));
+    }
+
+    DataStorageCreateResult Succeed(const std::vector<std::string> &keys, size_t size) const {
+        DataStorageCreateResult results;
+        for (const auto &key : keys) {
+            results.emplace_back(EC_OK, Uri(key, size));
+        }
+        return results;
+    }
+
+    DataStorageBatchCreateResult SucceedBatch(const std::vector<DataStorageCreateRequest> &requests) const {
+        DataStorageBatchCreateResult batch_result;
+        for (const auto &request : requests) {
+            batch_result.push_back(Succeed(request.keys, request.size_per_key));
+        }
+        return batch_result;
+    }
+
+    ErrorCode Allocate(const CacheManager::KeyVector &keys,
+                       const std::vector<std::string_view> &groups,
+                       CacheLocationVector &locations,
+                       RequestContext *context = nullptr) {
+        return cache_manager_->GenWriteLocationOnStorage(context ? context : request_context_.get(),
+                                                         instance_id_,
+                                                         keys,
+                                                         groups,
+                                                         instance_info_,
+                                                         registry_manager_->data_storage_manager_,
+                                                         storage_name_,
+                                                         storage_type_,
+                                                         locations);
+    }
+
+    void CheckLocations(const CacheManager::KeyVector &keys,
+                        const CacheLocationVector &locations,
+                        const std::vector<std::vector<LocationSpecInfo>> &expected_specs) const {
+        ASSERT_EQ(keys.size(), locations.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            ASSERT_NE(nullptr, locations[i]);
+            EXPECT_EQ(storage_type_, locations[i]->type());
+            const auto &specs = locations[i]->location_specs();
+            ASSERT_EQ(expected_specs[i].size(), specs.size());
+            EXPECT_EQ(specs.size(), locations[i]->spec_size());
+            for (size_t j = 0; j < specs.size(); ++j) {
+                EXPECT_EQ(expected_specs[i][j].name(), specs[j].name());
+                EXPECT_EQ(Uri(BlockKey(expected_specs[i][j], keys[i]), expected_specs[i][j].size()).ToUriString(),
+                          specs[j].uri());
+            }
+        }
+    }
+
+    void CheckRequests(const std::vector<DataStorageCreateRequest> &requests,
+                       const std::vector<LocationSpecInfo> &specs,
+                       const std::vector<CacheManager::KeyVector> &keys_by_spec) const {
+        ASSERT_EQ(specs.size(), requests.size());
+        for (size_t i = 0; i < specs.size(); ++i) {
+            EXPECT_EQ(specs[i].size(), requests[i].size_per_key);
+            std::vector<std::string> expected_keys;
+            for (auto key : keys_by_spec[i]) {
+                expected_keys.push_back(BlockKey(specs[i], key));
+            }
+            EXPECT_EQ(expected_keys, requests[i].keys);
+        }
+    }
+
+    void ExpectRollback(const std::vector<std::string> &expected_deleted) {
+        EXPECT_CALL(*backend_, Delete(_, "fake_trace_id", _))
+            .WillOnce([expected_deleted](const std::vector<DataStorageUri> &uris, const auto &, auto) {
+                std::vector<std::string> deleted;
+                for (const auto &uri : uris) {
+                    deleted.push_back(uri.ToUriString());
+                }
+                EXPECT_THAT(deleted, UnorderedElementsAreArray(expected_deleted));
+                return std::vector<ErrorCode>(uris.size(), EC_OK);
+            });
+    }
+};
+
+TEST_F(BatchAllocationTest, MixedSizesForwardTwentySpecRequestsInOneBatchForEveryStorageType) {
+    std::vector<LocationSpecInfo> specs;
+    for (int i = 0; i < 20; ++i) {
+        specs.emplace_back("tp" + std::to_string(i), (i % 3 + 1) * 512);
+    }
+    const CacheManager::KeyVector keys = {1, 0xabcdef};
+    for (auto type : {DataStorageType::DATA_STORAGE_TYPE_NFS,
+                      DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                      DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+        SCOPED_TRACE(ToString(type));
+        Prepare(specs, type);
+        ASSERT_EQ(nullptr, backend_->config_.storage_spec());
+        EXPECT_CALL(*backend_, Create(_, _, _, _)).Times(0);
+        EXPECT_CALL(*batch_backend_, CreateBatch(_, "fake_trace_id", _))
+            .WillOnce([&](const auto &requests, const auto &, auto) {
+                CheckRequests(requests, specs, std::vector<CacheManager::KeyVector>(specs.size(), keys));
+                return SucceedBatch(requests);
+            });
+        EXPECT_CALL(*backend_, Delete(_, _, _)).Times(0);
+        CacheLocationVector locations;
+        ASSERT_EQ(EC_OK, Allocate(keys, {}, locations));
+        CheckLocations(keys, locations, {specs, specs});
+    }
+}
+
+TEST_F(BatchAllocationTest, EqualSizesRetainExistingSingleCreateFastPath) {
+    const std::vector<LocationSpecInfo> specs = {{"tp0", 512}, {"tp1", 512}, {"tp2", 512}};
+    const CacheManager::KeyVector keys = {1, 2};
+    Prepare(specs);
+    std::vector<std::string> expected_keys;
+    for (const auto &spec : specs) {
+        for (auto key : keys) {
+            expected_keys.push_back(BlockKey(spec, key));
+        }
+    }
+    EXPECT_CALL(*batch_backend_, CreateBatch(_, _, _)).Times(0);
+    EXPECT_CALL(*backend_, Create(expected_keys, 512, "fake_trace_id", _))
+        .WillOnce([&](const auto &merged_keys, size_t size, const auto &, auto) { return Succeed(merged_keys, size); });
+    CacheLocationVector locations;
+    ASSERT_EQ(EC_OK, Allocate(keys, {}, locations));
+    CheckLocations(keys, locations, {specs, specs});
+}
+
+TEST_F(BatchAllocationTest, FiltersSpecGroupsBeforeBatchingAndSkipsEmptyRequests) {
+    const std::vector<LocationSpecInfo> specs = {{"tp0", 512}, {"tp1", 1024}, {"tp2", 512}, {"tp3", 1024}};
+    Prepare(
+        specs, DataStorageType::DATA_STORAGE_TYPE_NFS, {{"first", {"tp2", "tp0"}}, {"second", {"tp1"}}, {"empty", {}}});
+    EXPECT_CALL(*backend_, Create(_, _, _, _)).Times(0);
+    EXPECT_CALL(*backend_, Delete(_, _, _)).Times(0);
+    EXPECT_CALL(*batch_backend_, CreateBatch(_, _, _)).WillOnce([&](const auto &requests, const auto &, auto) {
+        CheckRequests(requests, {specs[0], specs[1], specs[2]}, {{1}, {2}, {1}});
+        return SucceedBatch(requests);
+    });
+    CacheLocationVector locations;
+    ASSERT_EQ(EC_OK, Allocate({1, 2, 3}, {"first", "second", "empty"}, locations));
+    CheckLocations({1, 2, 3}, locations, {{specs[0], specs[2]}, {specs[1]}, {}});
+    ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(batch_backend_.get()));
+
+    EXPECT_CALL(*backend_, Create(_, _, _, _)).Times(0);
+    EXPECT_CALL(*batch_backend_, CreateBatch(_, _, _)).Times(0);
+    locations.clear();
+    ASSERT_EQ(EC_OK, Allocate({1, 2}, {"empty", "empty"}, locations));
+    CheckLocations({1, 2}, locations, {{}, {}});
+    locations.clear();
+    ASSERT_EQ(EC_OK, Allocate({}, {}, locations));
+    EXPECT_TRUE(locations.empty());
+}
+TEST_F(BatchAllocationTest, InvalidSpecGroupsAreRejectedBeforeAnyAllocation) {
+    for (int64_t second_size : {512, 1024}) {
+        SCOPED_TRACE(second_size);
+        Prepare({{"tp0", 512}, {"tp1", second_size}}, DataStorageType::DATA_STORAGE_TYPE_NFS, {{"valid", {"tp0"}}});
+        EXPECT_CALL(*backend_, Create(_, _, _, _)).Times(0);
+        EXPECT_CALL(*batch_backend_, CreateBatch(_, _, _)).Times(0);
+        EXPECT_CALL(*backend_, Delete(_, _, _)).Times(0);
+        CacheLocationVector locations;
+        EXPECT_NE(EC_OK, Allocate({1, 2}, {"valid", "missing"}, locations));
+        EXPECT_TRUE(locations.empty());
+        EXPECT_EQ(EC_BADARGS, Allocate({1, 2}, {"valid"}, locations));
+        EXPECT_TRUE(locations.empty());
+        EXPECT_EQ(EC_BADARGS, Allocate({1, 2}, {"valid", "valid", "valid"}, locations));
+        EXPECT_TRUE(locations.empty());
+    }
+}
+
+TEST_F(BatchAllocationTest, FailureAndMalformedBatchResultsRollbackEverySuccessfulUri) {
+    enum class ResultShape {
+        PartialFailure,
+        ShortInner,
+        LongInner,
+        ShortOuter,
+        LongOuter
+    };
+    const std::vector<LocationSpecInfo> specs = {{"tp0", 512}, {"tp1", 1024}};
+    for (auto shape : {ResultShape::PartialFailure,
+                       ResultShape::ShortInner,
+                       ResultShape::LongInner,
+                       ResultShape::ShortOuter,
+                       ResultShape::LongOuter}) {
+        SCOPED_TRACE(static_cast<int>(shape));
+        Prepare(specs);
+        DataStorageBatchCreateResult results;
+        std::vector<std::string> expected_deleted;
+        for (const auto &spec : specs) {
+            results.push_back(Succeed({BlockKey(spec, 1), BlockKey(spec, 2)}, spec.size()));
+            for (int64_t key : {1, 2}) {
+                expected_deleted.push_back(Uri(BlockKey(spec, key), spec.size()).ToUriString());
+            }
+        }
+        switch (shape) {
+        case ResultShape::PartialFailure:
+            results[0][0] = {EC_ERROR, DataStorageUri{}};
+            expected_deleted.erase(expected_deleted.begin());
+            break;
+        case ResultShape::ShortInner:
+            results[0].pop_back();
+            expected_deleted.erase(expected_deleted.begin() + 1);
+            break;
+        case ResultShape::LongInner:
+            results[0].emplace_back(EC_OK, Uri("unexpected_inner", 512));
+            expected_deleted.push_back(Uri("unexpected_inner", 512).ToUriString());
+            break;
+        case ResultShape::ShortOuter:
+            results.pop_back();
+            expected_deleted.resize(2);
+            break;
+        case ResultShape::LongOuter:
+            results.push_back(Succeed({"unexpected_outer_1", "unexpected_outer_2"}, 2048));
+            expected_deleted.push_back(Uri("unexpected_outer_1", 2048).ToUriString());
+            expected_deleted.push_back(Uri("unexpected_outer_2", 2048).ToUriString());
+            break;
+        }
+        EXPECT_CALL(*backend_, Create(_, _, _, _)).Times(0);
+        EXPECT_CALL(*batch_backend_, CreateBatch(_, "fake_trace_id", _)).WillOnce(Return(results));
+        ExpectRollback(expected_deleted);
+        CacheLocationVector locations;
+        EXPECT_EQ(EC_ERROR, Allocate({1, 2}, {}, locations));
+        EXPECT_TRUE(locations.empty());
+    }
+}
+TEST_F(BatchAllocationTest, DefaultBackendPreservesPerSpecCreateOrder) {
+    const std::vector<LocationSpecInfo> specs = {{"tp0", 512}, {"tp1", 1024}, {"tp2", 512}};
+    Prepare(specs, DataStorageType::DATA_STORAGE_TYPE_NFS, {}, true);
+    testing::InSequence sequence;
+    for (const auto &spec : specs) {
+        EXPECT_CALL(*backend_, Create(ElementsAre(BlockKey(spec, 1), BlockKey(spec, 2)), spec.size(), _, _))
+            .WillOnce([&](const auto &keys, size_t size, const auto &, auto) { return Succeed(keys, size); });
+    }
+    CacheLocationVector locations;
+    ASSERT_EQ(EC_OK, Allocate({1, 2}, {}, locations));
+    CheckLocations({1, 2}, locations, {specs, specs});
+}
+
+TEST_F(BatchAllocationTest, DefaultBackendStopsAfterFirstFailureAndRollsBackEarlierSuccesses) {
+    const std::vector<LocationSpecInfo> specs = {{"tp0", 512}, {"tp1", 1024}, {"tp2", 2048}};
+    Prepare(specs, DataStorageType::DATA_STORAGE_TYPE_NFS, {}, true);
+    {
+        testing::InSequence sequence;
+        EXPECT_CALL(*backend_, Create(_, 512, _, _)).WillOnce([&](const auto &keys, size_t size, const auto &, auto) {
+            return Succeed(keys, size);
+        });
+        EXPECT_CALL(*backend_, Create(_, 1024, _, _))
+            .WillOnce(Return(
+                DataStorageCreateResult{{EC_ERROR, DataStorageUri{}}, {EC_OK, Uri(BlockKey(specs[1], 2), 1024)}}));
+    }
+    EXPECT_CALL(*backend_, Create(_, 2048, _, _)).Times(0);
+    ExpectRollback({Uri(BlockKey(specs[0], 1), 512).ToUriString(),
+                    Uri(BlockKey(specs[0], 2), 512).ToUriString(),
+                    Uri(BlockKey(specs[1], 2), 1024).ToUriString()});
+    CacheLocationVector locations;
+    EXPECT_EQ(EC_ERROR, Allocate({1, 2}, {}, locations));
+    EXPECT_TRUE(locations.empty());
 }
 
 // GenWriteLocation 按 block 路由：marked block 的 location 落在目标冷 storage

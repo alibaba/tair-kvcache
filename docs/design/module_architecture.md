@@ -41,7 +41,7 @@ KVCache Manager 采用中心化部署，负责 KVCache 的全局元数据管理�
 
 | 模块 | 目录 | 职责 |
 |---|---|---|
-| **common** | `common/` | 基础设施层：日志、JSON、错误码、Redis 客户端、`RequestContext`（逐请求追踪上下文）、`concurrent_hash_map`、`lru_cache`、`loop_thread`、服务发现、崩溃处理等。几乎所有 C++ 模块都依赖它。 |
+| **common** | `common/` | 基础设施层：日志、JSON、错误码、Redis 客户端、`RequestContext`（逐请求追踪上下文）、`concurrent_hash_map`、`lru_cache`、`loop_thread`、SDK 与存储后端共用的 `LockFreeThreadPool`、服务发现、崩溃处理等。几乎所有 C++ 模块都依赖它。 |
 | **metrics** | `metrics/` | 可观测性。`MetricsRegistry`/`MetricsCollector` 收集指标，多种 reporter（kmonitor/local/logging/dummy）上报，`PrometheusExporter` 通过 HTTP 暴露。 |
 | **event** | `event/` | 轻量事件总线。`EventManager` 将领域事件分发给注册的 `EventPublisher`；除默认日志发布器外，`OptimizerEventPublisher` 会将缓存读取事件转换为 protocol 中的 `TraceQueryRequest`，再经 `SubscriptionEventSink` 交给 service 层的 gRPC 流。 |
 | **protocol** | `protocol/protobuf/` | gRPC/proto 契约。定义 meta/admin/debug/kv_meta 以及 optimizer 事件流服务，生成 C++ 与 Python 桩。 |
@@ -225,6 +225,10 @@ Recover 保留未回填 key 的回源、写前补齐与 tombstone；并发读允
 1. **申请写地址（StartWriteCache）**：引擎经 `ManagerClient::StartWrite`（元数据面）调用 KVCM `CacheManager::StartWriteCache`。KVCM 过滤掉已存在的 block，经 `DataStorageSelector` 选择存储后端，由 `WriteLocationManager` 生成写入地址，返回 `write_session_id` 与写入位置 URI，对应 `CacheLocation` 进入 `writing` 态。
 2. **写入数据（SaveKvCaches）**：引擎经 `ManagerClient::SaveKvCaches`（数据面 `TransferClient`）把 KVCache 数据写入返回的存储位置。此步**不经过 KVCM**。
 3. **确认（FinishWriteCache）**：引擎经 `ManagerClient::FinishWrite`（元数据面）回调 KVCM，`CacheManager` 依据 `success_block_mask` 将成功的 `CacheLocation` 置为 `serving` 并写入元数据索引；失败的 block 不会转正，保证只有真正写成功的数据可被后续读取命中。
+
+原有按 spec 串行分配的路径通过 `CreateBatch` 一次提交给存储后端；默认后端按原请求边界串行调用
+`Create`，PACE 合并同尺寸请求后使用共用线程池并发调用原 `Create`。返回顺序、key/spec 映射和
+上层失败回收流程不变；原有等大 spec 的单次 `Create` 路径保持原样。
 
 ### 4.4.1 端到端时序（读取与写入）
 

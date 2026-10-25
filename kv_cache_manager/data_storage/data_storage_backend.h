@@ -1,10 +1,12 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/common_define.h"
@@ -12,6 +14,14 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
+
+struct DataStorageCreateRequest {
+    std::vector<std::string> keys;
+    size_t size_per_key;
+};
+
+using DataStorageCreateResult = std::vector<std::pair<ErrorCode, DataStorageUri>>;
+using DataStorageBatchCreateResult = std::vector<DataStorageCreateResult>;
 
 class DataStorageBackend {
 public:
@@ -65,6 +75,31 @@ public:
                                                                      size_t size_per_key,
                                                                      const std::string &trace_id,
                                                                      std::function<void()> cb) = 0;
+    // Preserve request/key order. The default keeps spec boundaries and stops
+    // after the first failed Create; unexecuted requests have empty results.
+    // Keep returned allocations, including malformed responses, for caller rollback.
+    // cb runs once on the calling thread after all backend work has completed.
+    virtual DataStorageBatchCreateResult CreateBatch(const std::vector<DataStorageCreateRequest> &requests,
+                                                     const std::string &trace_id,
+                                                     std::function<void()> cb) {
+        DataStorageBatchCreateResult results(requests.size());
+        for (size_t i = 0; i < requests.size(); ++i) {
+            const auto &request = requests[i];
+            if (request.keys.empty()) {
+                continue;
+            }
+            auto &result = results[i];
+            result = Create(request.keys, request.size_per_key, trace_id, nullptr);
+            if (result.size() != request.keys.size() ||
+                std::any_of(result.begin(), result.end(), [](const auto &item) { return item.first != EC_OK; })) {
+                break;
+            }
+        }
+        if (cb) {
+            cb();
+        }
+        return results;
+    }
     virtual std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &trace_id, std::function<void()> cb) = 0;
     virtual std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) = 0;

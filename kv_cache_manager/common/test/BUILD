@@ -261,3 +261,12 @@ cc_test(
         "//kv_cache_manager/common:unittest",
     ],
 )
+
+cc_test(
+    name = "LockFreeThreadPoolTest",
+    srcs = ["lock_free_thread_pool_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:lock_free_thread_pool",
+        "//kv_cache_manager/common:unittest",
+    ],
+)

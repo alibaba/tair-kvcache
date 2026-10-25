@@ -6,7 +6,7 @@
 #include <unistd.h>
 #include <unordered_map>
 
-#include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
+#include "kv_cache_manager/common/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/common/logger.h"

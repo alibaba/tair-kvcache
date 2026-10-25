@@ -53,7 +53,10 @@ TairMempool Storage（`ST_TAIRMEMPOOL` / `ST_TAIRMEMPOOL_SSD`）可以在 `tair_
 对象中设置 `"skip_confirmed_missing_backend_delete": true`。默认 `false`，即 GC 对已判定
 不存在的 URI 仍发送 Backend Delete；设为 `true` 才跳过这些 URI 的后端删除。
 
-TairMempool HTTP timeout parameters are described in the [configuration guide](../configuration.md#tairmempool).
+TairMempool 的 `tair_mem_pool.allocate_concurrency` 控制后端批量分配的并行度，默认 `0`，
+省略或 `0` 自动使用可用 CPU 数的两倍；显式正数范围为 `1..64`，自动值不受此上限限制。
+后端合并同尺寸请求后并发调用原有 `Create`；配置保留 `0`，不写入当前机器计算出的值。
+线程池与 HTTP 超时说明见[配置指南](../configuration.md#tairmempool)。
 
 ## Enable Storage
 ```bash
