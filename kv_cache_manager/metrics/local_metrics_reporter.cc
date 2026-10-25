@@ -88,14 +88,9 @@ void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::opti
         do {
             // data_storage create_keys_counter
 
-            // first get the create_keys_qps value
-            double ds_create_keys_qps_v;
-            GET_METRICS_(p, data_storage, create_keys_qps, ds_create_keys_qps_v);
-
-            // report
             Counter ds_create_keys_counter;
             COPY_METRICS_(p, data_storage, create_keys_counter, ds_create_keys_counter);
-            ds_create_keys_counter += static_cast<std::uint64_t>(ds_create_keys_qps_v);
+            ds_create_keys_counter += p->GetCreateKeyCountSample();
         } while (false);
     }
 }

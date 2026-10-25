@@ -112,7 +112,8 @@ message TairMemPoolStorageSpec {
     // GC 是否跳过已判定不存在的 URI 的后端删除；默认 false，仍发送 Delete/Free。
     bool skip_confirmed_missing_backend_delete = 7;
     int32 health_check_timeout = 8; // /v1/api/healthy 的单次 HTTP 超时，单位秒，默认1s。
-    // PACE 后端单次 CreateBatch 按 size 合并后的分配请求并行度，范围1..64；0/未提供使用默认4。
+    // 同一 PACE Storage 的 Create/CreateBatch 共用的分配并发上限，范围1..64。
+    // 0/未提供使用默认4；Registry JSON 显式0无效。
     int32 allocate_concurrency = 9;
 }
 

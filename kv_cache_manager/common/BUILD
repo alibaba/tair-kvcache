@@ -211,6 +211,20 @@ cc_library(
 )
 
 cc_library(
+    name = "lock_free_thread_pool",
+    srcs = ["lock_free_thread_pool.cc"],
+    hdrs = ["lock_free_thread_pool.h"],
+    deps = [":logger"] + select({
+        ":client_only_header": [
+            "@havenask//aios/autil:kvcm_client_patch_autil_header",
+        ],
+        "//conditions:default": [
+            "@havenask//aios/autil:lock_free",
+        ],
+    }),
+)
+
+cc_library(
     name = "loop_thread",
     srcs = [
         "loop_thread.cc",

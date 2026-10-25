@@ -34,6 +34,7 @@ flowchart TD
     %% 对外分支与 optimizer
     py_connector["py_connector"] --> client["client SDK"]
     client -.-> config
+    client -.-> common
     optimizer["optimizer（仿真与优化）"] -. cache_location .-> meta
     optimizer --> protocol
     optimizer -. SubscribeEvents .-> service

@@ -413,6 +413,28 @@ public:
     // Accumulates dispatched write bytes; see the semantic contract on the
     // write_bytes_dispatched_total definition above.
     void AddWriteBytes(std::uint64_t bytes) { data_storage_write_bytes_dispatched_total_metrics_ += bytes; }
+
+    // A request-local copy shares the registry handles but owns its sample.
+    // Deferred reporters must not read another request's last-written gauges.
+    void SetCreateSample(std::uint64_t key_count, double elapsed_us) noexcept {
+        create_key_count_sample_ = key_count;
+        create_time_us_sample_ = elapsed_us;
+        has_create_sample_ = true;
+        set_data_storage_create_keys_qps_metrics(static_cast<double>(key_count));
+        set_data_storage_create_time_us_metrics(elapsed_us);
+    }
+    [[nodiscard]] std::uint64_t GetCreateKeyCountSample() const noexcept {
+        return has_create_sample_ ? create_key_count_sample_
+                                  : static_cast<std::uint64_t>(get_data_storage_create_keys_qps_metrics());
+    }
+    [[nodiscard]] double GetCreateTimeUsSample() const noexcept {
+        return has_create_sample_ ? create_time_us_sample_ : get_data_storage_create_time_us_metrics();
+    }
+
+private:
+    std::uint64_t create_key_count_sample_ = 0;
+    double create_time_us_sample_ = 0.0;
+    bool has_create_sample_ = false;
 };
 
 /* --------------- DataStorageIntervalMetricsCollector ---------------- */

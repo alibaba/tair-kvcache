@@ -300,6 +300,30 @@ TEST_F(MetricsCollectorTest, DataStorageMetricsCollectorTest) {
     EXPECT_EQ(metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total").Get(), 2048);
 }
 
+TEST_F(MetricsCollectorTest, DataStorageCreateSamplesShareCountersWithoutSharingSamples) {
+    DataStorageMetricsCollector shared(metrics_registry_, {{"type", "dummy"}, {"unique_name", "storage"}});
+    ASSERT_TRUE(shared.Init());
+    const auto registry_size = metrics_registry_->GetSize();
+    DataStorageMetricsCollector large(shared), small(shared);
+    large.SetCreateSample(100, 123.);
+    small.SetCreateSample(2, 456.);
+
+    EXPECT_EQ(100u, large.GetCreateKeyCountSample());
+    EXPECT_DOUBLE_EQ(123., large.GetCreateTimeUsSample());
+    EXPECT_EQ(2u, small.GetCreateKeyCountSample());
+    EXPECT_DOUBLE_EQ(456., small.GetCreateTimeUsSample());
+    EXPECT_EQ(shared.GetMetricsTags(), large.GetMetricsTags());
+    EXPECT_EQ(registry_size, metrics_registry_->GetSize());
+    // Shared registry gauges remain the last operation's diagnostic values.
+    EXPECT_DOUBLE_EQ(2., shared.get_data_storage_create_keys_qps_metrics());
+    EXPECT_DOUBLE_EQ(456., shared.get_data_storage_create_time_us_metrics());
+    EXPECT_EQ(2u, shared.GetCreateKeyCountSample());
+    EXPECT_DOUBLE_EQ(456., shared.GetCreateTimeUsSample());
+    large.AddWriteBytes(1024);
+    EXPECT_EQ(1024u, shared.get_data_storage_write_bytes_dispatched_total_metrics());
+    EXPECT_EQ(1024u, small.get_data_storage_write_bytes_dispatched_total_metrics());
+}
+
 TEST_F(MetricsCollectorTest, DataStorageHealthMetricsCollectorTest) {
     metrics_collector_ = std::make_shared<DataStorageIntervalMetricsCollector>(metrics_registry_);
     metrics_collector_->Init();

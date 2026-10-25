@@ -420,12 +420,17 @@ HTTP 超时参数配置在 `storage_spec` 中（Admin API 对应 `storage.tair_m
 }
 ```
 
-`allocate_concurrency` 默认 `4`，范围为 `1..64`。PACE 后端在单次 `CreateBatch` 调用中，
-先将相同大小的请求合并成一次分配，再并行执行不同大小的批次；这个值限制本次调用的最大
-分配并行数，包含调用线程，不是跨请求或进程级的总并发限制。`StartWrite` 通过通用批量接口
-提交 spec 分配请求，合并和并行对 `CacheManager` 透明。例如 20 个 spec 只有 3 种大小时，
-最多调用 3 次 PACE 分配接口。设为 `1` 仍会合并相同大小，但各批次串行执行；其他 Storage
-后端默认按原分组边界串行分配。既有单一大小的 `Create` 接口仍保留。
+`allocate_concurrency` 默认 `4`，范围为 `1..64`，限制一个 PACE Storage 后端的在途分配总数。
+同一 Storage 的 `Create` 和 `CreateBatch` 共用固定大小的线程池，多个请求也共用这个上限；
+不同 Storage 各有自己的线程池。任务队列最多容纳 64 个待执行任务，满时提交方等待容量，
+不会临时创建线程或在提交线程上执行分配。
+
+PACE 后端在每次 `CreateBatch` 中先合并相同大小的请求，再由线程池执行不同大小的分配。
+`StartWrite` 通过通用批量接口提交 spec 请求，合并和并行对 `CacheManager` 透明。例如
+20 个 spec 只有 3 种大小时，成功路径只调用 3 次 PACE 分配接口。设为 `1` 时，同一 Storage
+的分配串行执行，仍保留同大小合并。发现任一分组失败后停止领取后续分组，等待已开始的
+分配结束，再收集全部已知成功 URI 供调用方回滚；不会把部分成功结果作为完整分配返回。
+其他 Storage 后端默认按原分组边界串行分配。
 SSD 使用同样配置，并将 `media_type` 设为 `5`。
 
 Admin API 对应字段为 `storage.tair_mem_pool.allocate_concurrency`，省略字段（或 proto3 的
