@@ -227,6 +227,56 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
     return create_result;
 }
 
+DataStorageBatchCreateResult DataStorageManager::CreateBatch(RequestContext *request_context,
+                                                             const std::string &unique_name,
+                                                             const std::vector<DataStorageCreateRequest> &requests,
+                                                             std::function<void()> cb) {
+    SPAN_TRACER(request_context);
+    size_t key_count = 0;
+    for (const auto &request : requests) {
+        key_count += request.keys.size();
+    }
+    DataStorageBatchCreateResult batch_result;
+    if (key_count == 0) {
+        batch_result.results.resize(requests.size());
+    } else {
+        // Keep storage disable/unregister serialized with allocation and result
+        // processing, including any work dispatched to backend workers.
+        std::shared_lock<std::shared_mutex> lock(rw_lock_);
+        auto iter = storage_map_.find(unique_name);
+        if (iter == storage_map_.end() || iter->second == nullptr || !iter->second->Writable()) {
+            KVCM_LOG_WARN("Storage name: %s is not writable, reject create batch", unique_name.c_str());
+            batch_result.results.resize(requests.size());
+            for (size_t i = 0; i < requests.size(); ++i) {
+                batch_result.results[i].assign(requests[i].keys.size(), {EC_NOENT, DataStorageUri{}});
+            }
+        } else {
+            const auto &storage_backend = iter->second;
+            const auto dsmc = storage_backend->GetMetricsCollector();
+            KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);
+            batch_result = storage_backend->CreateBatch(requests, request_context->trace_id(), nullptr);
+            KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(dsmc, DataStorageCreate);
+            KVCM_METRICS_COLLECTOR_SET_METRICS(dsmc, data_storage, create_keys_qps, key_count);
+            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(dsmc);
+            for (auto &result : batch_result.results) {
+                for (auto &[ec, uri] : result) {
+                    if (ec == EC_OK) {
+                        uri.SetHostName(unique_name);
+                    }
+                }
+            }
+            for (auto &uri : batch_result.cleanup_uris) {
+                uri.SetHostName(unique_name);
+            }
+        }
+    }
+    // Callers may reenter the manager, including operations taking an exclusive lock.
+    if (cb) {
+        cb();
+    }
+    return batch_result;
+}
+
 std::vector<ErrorCode> DataStorageManager::Delete(RequestContext *request_context,
                                                   const std::string &unique_name,
                                                   const std::vector<DataStorageUri> &storage_uris,

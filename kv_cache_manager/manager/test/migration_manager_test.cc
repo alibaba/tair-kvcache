@@ -117,16 +117,21 @@ namespace create_result_shape_stub {
 enum class Shape {
     kShort,
     kLong,
+    kMixedFailure,
 };
 
 Shape g_shape = Shape::kShort;
 std::vector<DataStorageUri> g_created_uris;
 std::vector<DataStorageUri> g_deleted_uris;
+size_t g_create_call_count = 0;
+size_t g_successful_calls_before_shape = 0;
 
-void Reset(Shape shape) {
+void Reset(Shape shape, size_t successful_calls_before_shape = 0) {
     g_shape = shape;
     g_created_uris.clear();
     g_deleted_uris.clear();
+    g_create_call_count = 0;
+    g_successful_calls_before_shape = successful_calls_before_shape;
 }
 
 std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
@@ -135,10 +140,17 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
                                                               const std::vector<std::string> &keys,
                                                               size_t size,
                                                               std::function<void()> /*cb*/) {
-    const std::size_t result_count = g_shape == Shape::kShort ? (keys.empty() ? 0 : keys.size() - 1) : keys.size() + 1;
+    const bool valid_response = ++g_create_call_count <= g_successful_calls_before_shape;
+    const std::size_t result_count = valid_response             ? keys.size()
+                                     : g_shape == Shape::kShort ? (keys.empty() ? 0 : keys.size() - 1)
+                                                                : keys.size() + 1;
     std::vector<std::pair<ErrorCode, DataStorageUri>> results;
     results.reserve(result_count);
     for (std::size_t i = 0; i < result_count; ++i) {
+        if (!valid_response && g_shape == Shape::kMixedFailure && i == result_count - 1) {
+            results.emplace_back(EC_ERROR, DataStorageUri{});
+            continue;
+        }
         const std::string key = i < keys.size() ? keys[i] : "unexpected_extra_" + std::to_string(i);
         DataStorageUri uri("dummy://" + name + "/" + key + "?size=" + std::to_string(size));
         g_created_uris.push_back(uri);
@@ -1033,6 +1045,57 @@ TEST_F(MigrationManagerTest, TestDestinationLocationSpecsReusePreparedCapacity) 
     const size_t reserved_capacity = reserved_specs.capacity();
     EXPECT_EQ((std::vector<std::pair<size_t, size_t>>{{3, reserved_capacity}, {3, reserved_capacity}}),
               destination_specs_capture_stub::g_sizes_and_capacities);
+}
+
+TEST_F(MigrationManagerTest, TestSubmitMalformedCreateRollsBackCurrentAndPreviousSpecs) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "single_shape_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "single_shape_cold/"));
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    int64_t block_key = 20;
+    for (const auto shape : {create_result_shape_stub::Shape::kShort,
+                             create_result_shape_stub::Shape::kLong,
+                             create_result_shape_stub::Shape::kMixedFailure}) {
+        SCOPED_TRACE(static_cast<int>(shape));
+        MigrationManager::MigrationRequest request;
+        request.instance_id = kInstance;
+        request.block_key = block_key++;
+        request.src_location_id = "source_location";
+        request.src_storage_name = "hot_01";
+        request.dst_storage_name = "cold_01";
+        request.src_specs = {{"TP0", "dummy://hot_01/source0?size=128"},
+                             {"TP1", "dummy://hot_01/source1?size=256"},
+                             {"TP2", "dummy://hot_01/source2?size=512"}};
+        create_result_shape_stub::Reset(shape, 1);
+        destination_specs_capture_stub::Reset();
+        Stub stub;
+        stub.set(ADDR(DataStorageManager, Create), create_result_shape_stub::Create_stub);
+        stub.set(ADDR(DataStorageManager, Delete), create_result_shape_stub::Delete_stub);
+        stub.set(ADDR(MetaSearcher, BatchAddLocation), destination_specs_capture_stub::BatchAddLocation_stub);
+
+        EXPECT_EQ(EC_ERROR, mgr.Submit("malformed_single_create", request));
+
+        EXPECT_EQ(2u, create_result_shape_stub::g_create_call_count);
+        const size_t expected_created = shape == create_result_shape_stub::Shape::kShort  ? 1
+                                        : shape == create_result_shape_stub::Shape::kLong ? 3
+                                                                                          : 2;
+        ASSERT_EQ(expected_created, create_result_shape_stub::g_created_uris.size());
+        ASSERT_EQ(expected_created, create_result_shape_stub::g_deleted_uris.size());
+        for (const auto &created : create_result_shape_stub::g_created_uris) {
+            EXPECT_EQ(1,
+                      std::count_if(create_result_shape_stub::g_deleted_uris.begin(),
+                                    create_result_shape_stub::g_deleted_uris.end(),
+                                    [&](const DataStorageUri &deleted) {
+                                        return deleted.ToUriString() == created.ToUriString();
+                                    }));
+        }
+        EXPECT_TRUE(destination_specs_capture_stub::g_sizes_and_capacities.empty());
+        EXPECT_EQ(0u, LocationCount(request.block_key));
+        EXPECT_FALSE(mgr.HasMigrationTask(kInstance, request.block_key));
+        EXPECT_EQ(0u, mgr.ActiveTaskCount());
+    }
 }
 
 TEST_F(MigrationManagerTest, TestSubmitSourceNotFound) {

@@ -493,6 +493,13 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
             request.instance_id + "/" + src_spec.name() + "/" + StringUtil::Uint64ToHex(request.block_key);
         auto create_results = data_storage_manager_->Create(
             ctx.get(), request.dst_storage_name, {dst_key}, static_cast<size_t>(spec_size), nullptr);
+        // Preserve every successful allocation before validating the response shape;
+        // malformed results cannot be adopted but still need to be reclaimed.
+        for (const auto &[ec, uri] : create_results) {
+            if (ec == EC_OK) {
+                allocated_for_rollback.push_back(uri);
+            }
+        }
         if (create_results.size() != 1 || create_results[0].first != EC_OK) {
             KVCM_LOG_WARN("[%s] allocate dst space failed on %s for spec %s",
                           trace_id.c_str(),
@@ -502,7 +509,6 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
             return EC_ERROR;
         }
         DataStorageUri dst_uri = create_results[0].second;
-        allocated_for_rollback.push_back(dst_uri);
         out_src_uris.push_back(src_uri);
         out_dst_uris.push_back(dst_uri);
         dst_specs.emplace_back(src_spec.name(), dst_uri.ToUriString());

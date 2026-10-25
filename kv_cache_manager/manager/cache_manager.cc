@@ -2202,7 +2202,9 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
     for (size_t i = 0; i < results.size(); i++) {
         if (results[i].first == ErrorCode::EC_OK) {
             allocated_uris.push_back(results[i].second);
-            key_to_uris[merged_keys_idx[i]].push_back({allocated_uris.size() - 1, spec_info_mapping[i]});
+            if (i < merged_keys_idx.size()) {
+                key_to_uris[merged_keys_idx[i]].push_back({allocated_uris.size() - 1, spec_info_mapping[i]});
+            }
         }
     }
     // TODO: move check to another function
@@ -2233,69 +2235,87 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
                                      std::vector<DataStorageUri> &allocated_uris,
                                      std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
                                      bool &is_create_success) {
-    // avoid use file across tp ranks
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+    if (!location_spec_group_names.empty() && location_spec_group_names.size() != keys.size()) {
+        return EC_BADARGS;
+    }
+    std::vector<DataStorageCreateRequest> requests;
+    std::vector<std::vector<size_t>> keys_idx;
+    std::vector<const LocationSpecInfo *> spec_mapping;
+    // Collect spec requests before allocating; the backend owns batching and
+    // execution policy. Keep request boundaries for backends that share files.
     for (const auto &spec_info : instance_info->location_spec_infos()) {
-        std::vector<std::string> block_keys;
-        std::vector<size_t> keys_idx;
-        block_keys.reserve(keys.size());
-        keys_idx.reserve(keys.size());
-        if (location_spec_group_names.empty()) {
-            for (size_t i = 0; i < keys.size(); i++) {
-                std::string block_key = instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]);
-                block_keys.push_back(block_key);
-                keys_idx.push_back(i);
-            }
-        } else {
-            for (size_t i = 0; i < keys.size(); i++) {
+        DataStorageCreateRequest request{{}, static_cast<size_t>(spec_info.size())};
+        std::vector<size_t> indices;
+        request.keys.reserve(keys.size());
+        indices.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (!location_spec_group_names.empty()) {
                 auto [ec, found] = IsSpecNameInSpecGroup(trace_id,
                                                          instance_id,
                                                          spec_info.name(),
                                                          location_spec_group_names[i],
                                                          instance_info->location_spec_groups());
                 RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "IsSpecNameInSpecGroup failed");
-                if (found) {
-                    std::string block_key =
-                        instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]);
-                    block_keys.push_back(block_key);
-                    keys_idx.push_back(i);
+                if (!found) {
+                    continue;
                 }
             }
+            request.keys.push_back(instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]));
+            indices.push_back(i);
         }
-
-        if (block_keys.empty()) {
-            continue;
+        if (!request.keys.empty()) {
+            requests.push_back(std::move(request));
+            keys_idx.push_back(std::move(indices));
+            spec_mapping.push_back(&spec_info);
         }
+    }
+    if (requests.empty()) {
+        return EC_OK;
+    }
 
-        std::vector<std::pair<ErrorCode, DataStorageUri>> results = data_storage_manager->Create(
-            request_context, unique_name, block_keys, spec_info.size(), []() { /* do nothing */ });
-
-        for (size_t i = 0; i < results.size(); i++) {
-            if (results[i].first == ErrorCode::EC_OK) {
-                allocated_uris.push_back(results[i].second);
-                key_to_uris[keys_idx[i]].push_back({allocated_uris.size() - 1, &spec_info});
-            }
+    auto batch_result = data_storage_manager->CreateBatch(request_context, unique_name, requests, nullptr);
+    if (!batch_result.cleanup_uris.empty()) {
+        is_create_success = false;
+        for (auto &uri : batch_result.cleanup_uris) {
+            allocated_uris.push_back(std::move(uri));
         }
-
-        // TODO: move check to another function
-        if (results.size() != block_keys.size()) {
+    }
+    auto &batch_results = batch_result.results;
+    if (batch_results.size() != requests.size()) {
+        is_create_success = false;
+        PREFIX_LOG(WARN,
+                   "create data storage fail, batch results size: %zu, request size: %zu",
+                   batch_results.size(),
+                   requests.size());
+    }
+    // Inspect every completed request before rollback, including results after a
+    // failure and any excess successful URIs from a malformed backend response.
+    for (size_t batch = 0; batch < batch_results.size(); ++batch) {
+        auto &results = batch_results[batch];
+        bool logged_error = false;
+        if (batch < requests.size() && results.size() != requests[batch].keys.size()) {
             is_create_success = false;
             PREFIX_LOG(WARN,
-                       "create data storage fail, results size:%ld, request size: %ld",
+                       "create data storage fail, results size: %zu, request size: %zu",
                        results.size(),
-                       block_keys.size());
+                       requests[batch].keys.size());
         }
-        for (auto &result : results) {
-            if (result.first != ErrorCode::EC_OK) {
+        for (size_t i = 0; i < results.size(); ++i) {
+            auto &[ec, uri] = results[i];
+            if (ec != EC_OK) {
                 is_create_success = false;
-                PREFIX_LOG(WARN, "create data storage fail, ec_code: %d", result.first);
-                break;
+                if (!logged_error) {
+                    PREFIX_LOG(WARN, "create data storage fail, ec_code: %d", ec);
+                    logged_error = true;
+                }
+                continue;
             }
-        }
-
-        if (!is_create_success) {
-            break;
+            allocated_uris.push_back(std::move(uri));
+            if (batch < keys_idx.size() && i < keys_idx[batch].size()) {
+                key_to_uris[keys_idx[batch][i]].emplace_back(allocated_uris.size() - 1, spec_mapping[batch]);
+            }
         }
     }
     return EC_OK;

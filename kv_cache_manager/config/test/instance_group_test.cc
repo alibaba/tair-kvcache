@@ -450,4 +450,42 @@ TEST_F(InstanceGroupTest, TairMempoolHealthTimeoutProtoDefaultsAndRoundTrip) {
     EXPECT_FALSE(restored.ValidateRequiredFields(invalid_fields));
     EXPECT_NE(std::string::npos, invalid_fields.find("health_check_timeout"));
 }
+
+TEST_F(InstanceGroupTest, TairMempoolAllocateConcurrencyProtoDefaultsAndRoundTrip) {
+    for (auto storage_type : {proto::admin::ST_TAIRMEMPOOL, proto::admin::ST_TAIRMEMPOOL_SSD}) {
+        proto::admin::StorageConfig config;
+        config.set_global_unique_name("pace_allocation");
+        config.set_storage_type(storage_type);
+        auto *proto_spec = config.mutable_tair_mem_pool();
+        proto_spec->set_domain("pace.meta");
+        proto_spec->set_timeout(5);
+        proto_spec->set_media_type(storage_type == proto::admin::ST_TAIRMEMPOOL_SSD ? 5 : 2);
+
+        // A proto3 implicit zero preserves the default for older Admin clients.
+        for (int32_t concurrency : {0, 1, 8, 64}) {
+            proto_spec->set_allocate_concurrency(concurrency);
+            StorageConfig restored;
+            ProtoConvert::StorageFromProto(&config, restored);
+            const auto spec = std::dynamic_pointer_cast<TairMemPoolStorageSpec>(restored.storage_spec());
+            ASSERT_NE(nullptr, spec);
+            EXPECT_EQ(concurrency == 0 ? 4 : concurrency, spec->allocate_concurrency());
+            std::string invalid_fields;
+            EXPECT_TRUE(restored.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+
+            proto::admin::StorageConfig round_trip;
+            ProtoConvert::StorageConfigToProto(restored, &round_trip);
+            EXPECT_EQ(storage_type, round_trip.storage_type());
+            EXPECT_EQ(concurrency == 0 ? 4 : concurrency, round_trip.tair_mem_pool().allocate_concurrency());
+        }
+
+        for (int32_t concurrency : {-1, 65}) {
+            proto_spec->set_allocate_concurrency(concurrency);
+            StorageConfig restored;
+            ProtoConvert::StorageFromProto(&config, restored);
+            std::string invalid_fields;
+            EXPECT_FALSE(restored.ValidateRequiredFields(invalid_fields));
+            EXPECT_NE(std::string::npos, invalid_fields.find("allocate_concurrency"));
+        }
+    }
+}
 } // namespace kv_cache_manager

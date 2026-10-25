@@ -173,7 +173,13 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `meta_searcher.host_projection_time_us` | gauge | GetHostCacheState location 可见性及 host/spec projection 回调区间的墙钟并集（微秒） |
 | `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState 普通/Mamba host 前缀归约时间（微秒） |
 | `meta_indexer.search_cache_hit_ratio` | gauge | 搜索缓存命中率 |
-| `data_storage.create_keys_counter` | counter | 已创建 key 总数 |
+| `data_storage.create_counter` | counter | 提交到后端的逻辑分配调用次数 |
+| `data_storage.create_keys_counter` | counter | 分配调用提交的 key 总数，包含失败请求 |
+| `data_storage.create_time_us` | gauge | 最近一次逻辑分配调用的墙钟耗时（微秒） |
+
+一次 `CreateBatch` 记作一次逻辑分配调用，key 数为本批次所有 spec 请求的总和，
+包含失败后未执行的请求。后端内部的合并、并行和串行调用次数不计入
+`create_counter`；该指标不能用作 PACE RPC 次数或成功分配数。
 
 ### 周期性指标
 

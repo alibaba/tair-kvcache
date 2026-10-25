@@ -1,10 +1,12 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/common_define.h"
@@ -12,6 +14,22 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
+
+struct DataStorageCreateRequest {
+    std::vector<std::string> keys;
+    size_t size_per_key;
+};
+
+using DataStorageCreateResult = std::vector<std::pair<ErrorCode, DataStorageUri>>;
+
+struct DataStorageBatchCreateResult {
+    // One result per requested key, grouped in the original request order.
+    std::vector<DataStorageCreateResult> results;
+    // Allocations that cannot be associated with a key after a malformed response.
+    // These are distinct from successful results above; a nonempty list means
+    // the batch failed and the caller must reclaim all successful allocations.
+    std::vector<DataStorageUri> cleanup_uris;
+};
 
 class DataStorageBackend {
 public:
@@ -65,6 +83,47 @@ public:
                                                                      size_t size_per_key,
                                                                      const std::string &trace_id,
                                                                      std::function<void()> cb) = 0;
+    // Results match the request/key counts and original order, including failures.
+    // If a Create response has an invalid count, fail that request and preserve
+    // its successful allocations in cleanup_uris for the caller to reclaim.
+    // Backends may override the allocation strategy without exposing it to callers.
+    // The default preserves request boundaries and stops after the first failure.
+    // cb runs once on the calling thread after the entire batch completes.
+    virtual DataStorageBatchCreateResult CreateBatch(const std::vector<DataStorageCreateRequest> &requests,
+                                                     const std::string &trace_id,
+                                                     std::function<void()> cb) {
+        DataStorageBatchCreateResult batch_result;
+        batch_result.results.resize(requests.size());
+        bool failed = false;
+        for (size_t i = 0; i < requests.size(); ++i) {
+            const auto &request = requests[i];
+            auto &result = batch_result.results[i];
+            if (request.keys.empty()) {
+                continue;
+            }
+            if (failed) {
+                result.assign(request.keys.size(), {EC_ERROR, DataStorageUri{}});
+                continue;
+            }
+            result = Create(request.keys, request.size_per_key, trace_id, nullptr);
+            if (result.size() != request.keys.size()) {
+                for (auto &[ec, uri] : result) {
+                    if (ec == EC_OK) {
+                        batch_result.cleanup_uris.push_back(std::move(uri));
+                    }
+                }
+                result.assign(request.keys.size(), {EC_ERROR, DataStorageUri{}});
+                failed = true;
+            } else {
+                failed =
+                    std::any_of(result.begin(), result.end(), [](const auto &item) { return item.first != EC_OK; });
+            }
+        }
+        if (cb) {
+            cb();
+        }
+        return batch_result;
+    }
     virtual std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &trace_id, std::function<void()> cb) = 0;
     virtual std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) = 0;

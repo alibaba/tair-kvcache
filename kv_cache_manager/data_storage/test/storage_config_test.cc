@@ -300,3 +300,42 @@ TEST_F(StorageConfigTest, TestTairMempoolRejectsNonPositiveHealthTimeout) {
         EXPECT_NE(std::string::npos, invalid_fields.find("health_check_timeout"));
     }
 }
+
+TEST_F(StorageConfigTest, TestTairMempoolAllocateConcurrencyDefaultsAndRoundTrip) {
+    TairMemPoolStorageSpec spec;
+    ASSERT_TRUE(spec.FromJsonString(R"({"domain":"pace.meta","timeout":5})"));
+    EXPECT_EQ(4, spec.allocate_concurrency());
+
+    for (int32_t concurrency : {1, 8, 64}) {
+        spec.set_allocate_concurrency(concurrency);
+        TairMemPoolStorageSpec restored;
+        ASSERT_TRUE(restored.FromJsonString(spec.ToJsonString()));
+        EXPECT_EQ(concurrency, restored.allocate_concurrency());
+        EXPECT_NE(std::string::npos, restored.ToString().find("allocate_concurrency: " + std::to_string(concurrency)));
+        std::string invalid_fields;
+        EXPECT_TRUE(restored.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+    }
+
+    // Reusing the object to load legacy registry data restores the default.
+    ASSERT_TRUE(spec.FromJsonString(R"({"domain":"pace.meta","timeout":5})"));
+    EXPECT_EQ(4, spec.allocate_concurrency());
+}
+
+TEST_F(StorageConfigTest, TestTairMempoolRejectsInvalidAllocateConcurrency) {
+    for (int32_t concurrency : {-1, 0, 65}) {
+        TairMemPoolStorageSpec spec;
+        EXPECT_FALSE(spec.FromJsonString(
+            "{\"domain\":\"pace.meta\",\"timeout\":5,\"allocate_concurrency\":" + std::to_string(concurrency) + "}"));
+        // Callers using setters must also fail validation without relying on JSON parsing.
+        ASSERT_TRUE(spec.FromJsonString(R"({"domain":"pace.meta","timeout":5})"));
+        spec.set_allocate_concurrency(concurrency);
+        std::string invalid_fields;
+        EXPECT_FALSE(spec.ValidateRequiredFields(invalid_fields));
+        EXPECT_NE(std::string::npos, invalid_fields.find("allocate_concurrency"));
+    }
+    for (const char *value : {"true", "\"4\"", "1.5", "2147483648", "4294967300"}) {
+        TairMemPoolStorageSpec spec;
+        EXPECT_FALSE(spec.FromJsonString(std::string("{\"domain\":\"pace.meta\",\"timeout\":5,") +
+                                         "\"allocate_concurrency\":" + value + "}"));
+    }
+}

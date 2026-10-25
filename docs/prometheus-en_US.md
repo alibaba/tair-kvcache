@@ -187,7 +187,14 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `meta_searcher.host_projection_time_us` | gauge | Wall-time union of GetHostCacheState visibility and host/spec projection callback intervals (us) |
 | `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState normal/Mamba host-prefix reduction time (us) |
 | `meta_indexer.search_cache_hit_ratio` | gauge | Search cache hit ratio |
-| `data_storage.create_keys_counter` | counter | Total created keys |
+| `data_storage.create_counter` | counter | Logical allocation calls submitted to a backend |
+| `data_storage.create_keys_counter` | counter | Keys submitted for allocation, including failed requests |
+| `data_storage.create_time_us` | gauge | Wall time of the last logical allocation call (us) |
+
+Each `CreateBatch` counts as one logical allocation call. Its key count includes
+all spec requests in the batch, including requests skipped after a failure.
+Internal merging, parallelism, and sequential calls do not add to
+`create_counter`; it does not count PACE RPCs or successful allocations.
 
 ### Interval Metrics
 
