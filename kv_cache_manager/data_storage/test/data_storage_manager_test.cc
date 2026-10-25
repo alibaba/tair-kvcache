@@ -44,6 +44,18 @@ public:
     std::vector<DataStorageCreateResult> scripted_results;
 };
 
+class RecordingCleanupBackend : public RecordingCreateBackend {
+public:
+    using RecordingCreateBackend::RecordingCreateBackend;
+
+    DataStorageCreateOutcome CreateWithCleanup(const std::vector<std::string> &keys,
+                                               size_t size,
+                                               const std::string &trace,
+                                               std::function<void()> cb) override {
+        return {Create(keys, size, trace, std::move(cb)), {DataStorageUri("file://backend/unmapped?size=128")}};
+    }
+};
+
 class RecordingBatchBackend : public RecordingCreateBackend {
 public:
     using RecordingCreateBackend::RecordingCreateBackend;
@@ -129,8 +141,9 @@ TEST_F(DataStorageManagerTest, TestSimple) {
     EXPECT_FALSE(data_storage_backend->Available());
     ASSERT_EQ(EC_NOENT, data_storage_manager.DisableStorage("storage2"));
     auto disabled_create = data_storage_manager.Create(&request_context, "storage1", {"disabled_key"}, 128, []() {});
-    ASSERT_EQ(1u, disabled_create.size());
-    EXPECT_EQ(EC_NOENT, disabled_create[0].first);
+    ASSERT_EQ(1u, disabled_create.results.size());
+    EXPECT_EQ(EC_NOENT, disabled_create.results[0].first);
+    EXPECT_TRUE(disabled_create.cleanup_uris.empty());
 
     // enable storage
     ASSERT_EQ(EC_OK, data_storage_manager.EnableStorage("storage1"));
@@ -142,12 +155,13 @@ TEST_F(DataStorageManagerTest, TestSimple) {
     // ASSERT_FALSE(data_storage_manager.Exist("storage1", {storage_uri1})[0]);
     RequestContext requesst_context("test");
     auto uris = data_storage_manager.Create(&requesst_context, "storage1", {"key1"}, 128, []() {});
-    ASSERT_EQ(1, uris.size());
-    ASSERT_EQ(EC_OK, uris[0].first);
-    ASSERT_EQ(storage_uri1.ToUriString(), uris[0].second.ToUriString());
+    ASSERT_EQ(1, uris.results.size());
+    ASSERT_EQ(EC_OK, uris.results[0].first);
+    ASSERT_EQ(storage_uri1.ToUriString(), uris.results[0].second.ToUriString());
+    EXPECT_TRUE(uris.cleanup_uris.empty());
     // unique name not exist
     uris = data_storage_manager.Create(&requesst_context, "storage2", {"key1"}, 128, []() {});
-    ASSERT_EQ(0, uris.size());
+    ASSERT_EQ(0, uris.results.size());
 
     // unregister storage
     ASSERT_EQ(EC_OK, data_storage_manager.UnRegisterStorage("storage1"));
@@ -335,6 +349,38 @@ TEST_F(DataStorageManagerTest, TestDefaultCreateBatchEmptyRequestsAvoidCreate) {
     EXPECT_TRUE(backend.requests.empty());
     EXPECT_EQ(2u, callback_count);
     EXPECT_TRUE(backend.CreateBatch({}, "batch_trace", nullptr).results.empty());
+}
+
+TEST_F(DataStorageManagerTest, TestCreateOutcomeRetainsCleanupAndDefaultBatchStops) {
+    DataStorageManager manager(metrics_registry_);
+    auto backend = std::make_shared<RecordingCleanupBackend>(metrics_registry_);
+    auto spec = std::make_shared<DummyStorageSpec>();
+    spec->set_root_path("memory://");
+    ASSERT_EQ(EC_OK,
+              backend->Open(StorageConfig(DataStorageType::DATA_STORAGE_TYPE_DUMMY, "storage1", spec), "open_trace"));
+    manager.storage_map_["storage1"] = backend;
+    RequestContext context("cleanup_outcome");
+    size_t callbacks = 0;
+    const auto outcome = manager.Create(&context, "storage1", {"first"}, 128, [&]() { ++callbacks; });
+    EXPECT_EQ(callbacks, 1u);
+    ASSERT_EQ(outcome.results.size(), 1u);
+    EXPECT_EQ(outcome.results[0].first, EC_OK);
+    EXPECT_EQ(outcome.results[0].second.GetHostName(), "storage1");
+    ASSERT_EQ(outcome.cleanup_uris.size(), 1u);
+    EXPECT_EQ(outcome.cleanup_uris[0].ToUriString(), "file://storage1/unmapped?size=128");
+
+    backend->requests.clear();
+    const auto batch =
+        manager.CreateBatch(&context, "storage1", {{{"first"}, 128}, {{"second"}, 256}}, [&]() { ++callbacks; });
+    EXPECT_EQ(callbacks, 2u);
+    ASSERT_EQ(backend->requests.size(), 1u);
+    ASSERT_EQ(batch.results.size(), 2u);
+    ASSERT_EQ(batch.results[0].size(), 1u);
+    EXPECT_EQ(batch.results[0][0].first, EC_OK);
+    ASSERT_EQ(batch.results[1].size(), 1u);
+    EXPECT_EQ(batch.results[1][0].first, EC_ERROR);
+    ASSERT_EQ(batch.cleanup_uris.size(), 1u);
+    EXPECT_EQ(batch.cleanup_uris[0].ToUriString(), "file://storage1/unmapped?size=128");
 }
 
 TEST_F(DataStorageManagerTest, TestCreateBatchDelegatesToBackendAndRetainsRequestObservability) {

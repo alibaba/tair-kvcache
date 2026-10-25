@@ -491,8 +491,11 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
 
         std::string dst_key =
             request.instance_id + "/" + src_spec.name() + "/" + StringUtil::Uint64ToHex(request.block_key);
-        auto create_results = data_storage_manager_->Create(
+        auto outcome = data_storage_manager_->Create(
             ctx.get(), request.dst_storage_name, {dst_key}, static_cast<size_t>(spec_size), nullptr);
+        allocated_for_rollback.insert(
+            allocated_for_rollback.end(), outcome.cleanup_uris.begin(), outcome.cleanup_uris.end());
+        auto &create_results = outcome.results;
         // Preserve every successful allocation before validating the response shape;
         // malformed results cannot be adopted but still need to be reclaimed.
         for (const auto &[ec, uri] : create_results) {
@@ -500,7 +503,7 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
                 allocated_for_rollback.push_back(uri);
             }
         }
-        if (create_results.size() != 1 || create_results[0].first != EC_OK) {
+        if (!outcome.cleanup_uris.empty() || create_results.size() != 1 || create_results[0].first != EC_OK) {
             KVCM_LOG_WARN("[%s] allocate dst space failed on %s for spec %s",
                           trace_id.c_str(),
                           request.dst_storage_name.c_str(),
@@ -933,17 +936,20 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         for (const auto &e : entries) {
             keys.push_back(e.dst_key);
         }
-        auto create_results =
-            data_storage_manager_->Create(batch_ctx.get(), first_req.dst_storage_name, keys, size, nullptr);
-        if (create_results.size() != entries.size()) {
+        auto outcome = data_storage_manager_->Create(batch_ctx.get(), first_req.dst_storage_name, keys, size, nullptr);
+        unowned_created_uris.insert(
+            unowned_created_uris.end(), outcome.cleanup_uris.begin(), outcome.cleanup_uris.end());
+        auto &create_results = outcome.results;
+        if (!outcome.cleanup_uris.empty() || create_results.size() != entries.size()) {
             KVCM_LOG_WARN(
-                "[%s] batch Create returned unexpected result count on storage %s for size %llu: expected %zu, got "
-                "%zu; rolling back the entire group",
+                "[%s] batch allocation cannot be adopted on storage %s for size %llu: expected %zu results, got "
+                "%zu results and %zu cleanup allocations; rolling back the entire group",
                 trace_id.c_str(),
                 first_req.dst_storage_name.c_str(),
                 static_cast<unsigned long long>(size),
                 entries.size(),
-                create_results.size());
+                create_results.size(),
+                outcome.cleanup_uris.size());
             // 位置映射以 vector 下标为契约；shape 一旦异常，连前 min(N, M) 项也不能再可信地
             // 绑定到 request。删除本组实际返回的全部成功 URI，并将本组 request 整体置失败。
             for (const auto &[ec, uri] : create_results) {

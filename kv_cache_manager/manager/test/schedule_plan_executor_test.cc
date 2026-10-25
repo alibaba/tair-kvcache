@@ -197,6 +197,50 @@ public:
     std::vector<std::vector<DataStorageUri>> delete_batches;
 };
 
+class BlockingFirstDeleteBackend : public RecordingDeleteBackend {
+public:
+    explicit BlockingFirstDeleteBackend(const std::string &name) : RecordingDeleteBackend(name) {}
+
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++calls_;
+        const bool first_call = calls_ == 1;
+        std::vector<ErrorCode> results;
+        for (const auto &uri : uris) {
+            // Repeating DELETE after this allocation was freed is unsafe if its
+            // address is reused. Match the real PACE harness ownership guard.
+            results.push_back(deleted_.insert(uri.ToUriString()).second ? EC_OK : EC_ERROR);
+        }
+        changed_.notify_all();
+        if (first_call) {
+            changed_.wait(lock, [&] { return release_first_; });
+        }
+        return results;
+    }
+
+    bool WaitForCalls(size_t count, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return changed_.wait_for(lock, timeout, [&] { return calls_ >= count; });
+    }
+    void ReleaseFirst() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        release_first_ = true;
+        changed_.notify_all();
+    }
+    size_t Calls() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return calls_;
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    size_t calls_{0};
+    bool release_first_{false};
+    std::set<std::string> deleted_;
+};
+
 class SchedulePlanExecutorTestHelper {
 public:
     static LocationSpec CreateLocationSpec(const std::string &name = "", const std::string &uri = "") {
@@ -405,6 +449,112 @@ public:
     std::unique_ptr<MetaSearcher> searcher;
     std::unique_ptr<SchedulePlanExecutor> executor;
 };
+
+TEST_F(BackendGcDeleteTest, ConcurrentMetaDeleteDoesNotRepeatPhysicalDelete) {
+    executor = std::make_unique<SchedulePlanExecutor>(2, meta_manager_, data_storage_manager_, metrics_registry_);
+    auto backend = std::make_shared<BlockingFirstDeleteBackend>("delete_race");
+    data_storage_manager_->storage_map_["delete_race"] = backend;
+    // Release even when an ASSERT below returns early, before executor teardown.
+    const auto release = std::shared_ptr<void>(nullptr, [backend](void *) { backend->ReleaseFirst(); });
+    SetLocation(301, "target", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://delete_race/301?size=1"});
+
+    auto abort = executor->Submit(Request(301, {"target"}, {}));
+    ASSERT_TRUE(backend->WaitForCalls(1, std::chrono::seconds(5)));
+    // The first worker has physically freed the URI but has not run metadata
+    // CAD. Trim/removeInstance can still observe this CLS_DELETING location.
+    auto trim = executor->Submit(CacheMetaDelRequest{kTestInstanceName, {301}});
+    const bool repeated_before_cad = backend->WaitForCalls(2, std::chrono::seconds(1));
+    backend->ReleaseFirst();
+
+    EXPECT_EQ(EC_OK, abort.get().status);
+    EXPECT_EQ(EC_OK, trim.get().status);
+    EXPECT_FALSE(repeated_before_cad);
+    EXPECT_EQ(1u, backend->Calls());
+    EXPECT_TRUE(Locations(301).empty());
+}
+
+TEST_F(BackendGcDeleteTest, ConcurrentDeletesOfDistinctLocationsRemainIndependent) {
+    executor = std::make_unique<SchedulePlanExecutor>(2, meta_manager_, data_storage_manager_, metrics_registry_);
+    auto backend = std::make_shared<BlockingFirstDeleteBackend>("delete_race");
+    data_storage_manager_->storage_map_["delete_race"] = backend;
+    const auto release = std::shared_ptr<void>(nullptr, [backend](void *) { backend->ReleaseFirst(); });
+    SetLocation(302, "first", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://delete_race/first?size=1"});
+    SetLocation(302, "second", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://delete_race/second?size=1"});
+
+    auto first = executor->Submit(Request(302, {"first"}, {}));
+    ASSERT_TRUE(backend->WaitForCalls(1, std::chrono::seconds(5)));
+    auto second = executor->Submit(Request(302, {"second"}, {}));
+    const bool independent_delete = backend->WaitForCalls(2, std::chrono::seconds(2));
+    backend->ReleaseFirst();
+
+    EXPECT_TRUE(independent_delete);
+    EXPECT_EQ(EC_OK, first.get().status);
+    EXPECT_EQ(EC_OK, second.get().status);
+    EXPECT_EQ(2u, backend->Calls());
+    EXPECT_TRUE(Locations(302).empty());
+}
+
+TEST_F(BackendGcDeleteTest, MetaDeleteStillReclaimsUnownedDeletingLocation) {
+    auto backend = AddBackend("delete_orphan", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+    SetLocation(303, "orphan", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://delete_orphan/303?size=1"});
+    std::vector<std::vector<ErrorCode>> updates;
+    ASSERT_EQ(EC_OK, searcher->BatchUpdateLocationStatus(&context, {303}, {{{"orphan", CLS_DELETING}}}, updates));
+    ASSERT_EQ(CLS_DELETING, Locations(303).at("orphan")->status());
+
+    const auto result = executor->Submit(CacheMetaDelRequest{kTestInstanceName, {303}}).get();
+    EXPECT_EQ(EC_OK, result.status);
+    EXPECT_EQ((std::vector<std::string>{"dummy://delete_orphan/303?size=1"}), DeletedUris(*backend));
+    EXPECT_TRUE(Locations(303).empty());
+}
+
+TEST_F(BackendGcDeleteTest, OverlappingDeleteBatchesAcceptReverseKeyOrder) {
+    executor = std::make_unique<SchedulePlanExecutor>(2, meta_manager_, data_storage_manager_, metrics_registry_);
+    auto backend = std::make_shared<BlockingFirstDeleteBackend>("delete_race");
+    data_storage_manager_->storage_map_["delete_race"] = backend;
+    const auto release = std::shared_ptr<void>(nullptr, [backend](void *) { backend->ReleaseFirst(); });
+    SetLocation(304, "target", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://delete_race/304?size=1"});
+    SetLocation(305, "target", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://delete_race/305?size=1"});
+
+    auto first = executor->Submit(CacheMetaDelRequest{kTestInstanceName, {304, 305}});
+    ASSERT_TRUE(backend->WaitForCalls(1, std::chrono::seconds(5)));
+    auto second = executor->Submit(CacheMetaDelRequest{kTestInstanceName, {305, 304}});
+    const bool repeated = backend->WaitForCalls(2, std::chrono::seconds(1));
+    backend->ReleaseFirst();
+
+    EXPECT_EQ(EC_OK, first.get().status);
+    EXPECT_EQ(EC_OK, second.get().status);
+    EXPECT_FALSE(repeated);
+    EXPECT_EQ(1u, backend->Calls());
+    EXPECT_TRUE(Locations(304).empty());
+    EXPECT_TRUE(Locations(305).empty());
+    EXPECT_TRUE(executor->location_delete_locks_.empty());
+}
+
+TEST_F(BackendGcDeleteTest, DeleteExceptionReleasesLocationOwnershipForRetry) {
+    auto backend = AddBackend("delete_retry", DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+    SetLocation(306, "target", DataStorageType::DATA_STORAGE_TYPE_DUMMY, {"dummy://delete_retry/306?size=1"});
+    backend->throw_on_delete = true;
+    const auto failed = executor->Submit(CacheMetaDelRequest{kTestInstanceName, {306}}).get();
+    EXPECT_EQ(EC_ERROR, failed.status);
+    EXPECT_TRUE(executor->location_delete_locks_.empty());
+    ASSERT_EQ(CLS_DELETING, Locations(306).at("target")->status());
+
+    backend->throw_on_delete = false;
+    const auto retried = executor->Submit(CacheMetaDelRequest{kTestInstanceName, {306}}).get();
+    EXPECT_EQ(EC_OK, retried.status);
+    EXPECT_TRUE(Locations(306).empty());
+    EXPECT_TRUE(executor->location_delete_locks_.empty());
+}
+
+TEST_F(BackendGcDeleteTest, DuplicateTaskEntriesDoNotSelfDeadlockOrRetainLocks) {
+    const CacheLocationDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {307, 307},
+        .location_ids = {{"absent", "absent"}, {"absent"}},
+    };
+    EXPECT_EQ(EC_OK, executor->DoLocationDelTask(request).status);
+    EXPECT_TRUE(executor->location_delete_locks_.empty());
+}
 
 TEST_F(BackendGcDeleteTest, BackendPolicyHandlesAllAndPartiallyMissingLocations) {
     int64_t key = 100;

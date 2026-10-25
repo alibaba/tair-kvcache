@@ -2196,8 +2196,15 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
         }
     }
 
-    std::vector<std::pair<ErrorCode, DataStorageUri>> results = data_storage_manager->Create(
+    auto outcome = data_storage_manager->Create(
         request_context, unique_name, merged_block_keys, common_size, []() { /* do nothing */ });
+    if (!outcome.cleanup_uris.empty()) {
+        is_create_success = false;
+        for (auto &uri : outcome.cleanup_uris) {
+            allocated_uris.push_back(std::move(uri));
+        }
+    }
+    auto &results = outcome.results;
 
     for (size_t i = 0; i < results.size(); i++) {
         if (results[i].first == ErrorCode::EC_OK) {
