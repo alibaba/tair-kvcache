@@ -99,6 +99,20 @@ class PaceStorageArgsTest(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     self._parse_args("--health_check_timeout", value)
 
+    def test_allocate_concurrency_is_optional_and_serialized_for_both_media(self):
+        for parse in (self._parse_args, self._parse_ssd_args):
+            self.assertNotIn("allocate_concurrency", gen_pace_config_data(parse()))
+            for value in (1, 4, 64):
+                spec = gen_pace_config_data(parse("--allocate_concurrency", str(value)))
+                self.assertEqual(value, spec["allocate_concurrency"])
+
+    def test_allocate_concurrency_rejects_invalid_values(self):
+        for parse in (self._parse_args, self._parse_ssd_args):
+            for value in ("0", "-1", "65", "1.5", "true"):
+                with self.subTest(value=value):
+                    with self.assertRaises(SystemExit):
+                        parse("--allocate_concurrency", value)
+
     def test_ssd_subcommand_sets_distinct_storage_type(self):
         args = self._parse_ssd_args()
         self.assertEqual(5, gen_pace_config_data(args)["media_type"])
@@ -199,6 +213,25 @@ class PaceStorageUpdateTest(unittest.TestCase):
         spec = mock_post_and_print.call_args.args[1]["storage"]["tair_mem_pool"]
         self.assertEqual(1, spec["health_check_timeout"])
         self.assertTrue(spec["skip_confirmed_missing_backend_delete"])
+
+    @patch.object(update_storage, "http_post_and_print")
+    @patch.object(update_storage, "http_post")
+    def test_update_preserves_and_overrides_allocate_concurrency(self, mock_http_post, mock_post_and_print):
+        for storage_type, media_type, subcommand in (
+                ("ST_TAIRMEMPOOL", 2, "pace"), ("ST_TAIRMEMPOOL_SSD", 5, "pace_ssd")):
+            with self.subTest(storage_type=storage_type):
+                response = self._list_response(storage_type, media_type)
+                response["storage"][0]["tair_mem_pool"]["allocate_concurrency"] = 8
+                mock_http_post.return_value = response
+                args = self._args(storage_type=subcommand)
+                update_storage.handle_pace(args)
+                spec = mock_post_and_print.call_args.args[1]["storage"]["tair_mem_pool"]
+                self.assertEqual(8, spec["allocate_concurrency"])
+
+                args.allocate_concurrency = 1
+                update_storage.handle_pace(args)
+                spec = mock_post_and_print.call_args.args[1]["storage"]["tair_mem_pool"]
+                self.assertEqual(1, spec["allocate_concurrency"])
 
     @patch.object(update_storage, "http_post_and_print")
     @patch.object(update_storage, "http_post")

@@ -408,6 +408,31 @@ HTTP 超时参数配置在 `storage_spec` 中（Admin API 对应 `storage.tair_m
 | `timeout` | 分配、删除、同步复制、容量和节点查询 | 必填，示例为 5 秒 |
 | `health_check_timeout` | 健康探测 | 1 秒 |
 
+分配并行度同样配置在 `storage_spec` 中，DRAM 和 SSD 均适用：
+
+```json
+{
+  "domain": "http://pace.meta:8080",
+  "timeout": 5,
+  "health_check_timeout": 1,
+  "allocate_concurrency": 4,
+  "media_type": 2
+}
+```
+
+`allocate_concurrency` 默认 `4`，范围为 `1..64`。PACE 后端在单次 `CreateBatch` 调用中，
+先将相同大小的请求合并成一次分配，再并行执行不同大小的批次；这个值限制本次调用的最大
+分配并行数，包含调用线程，不是跨请求或进程级的总并发限制。`StartWrite` 通过通用批量接口
+提交 spec 分配请求，合并和并行对 `CacheManager` 透明。例如 20 个 spec 只有 3 种大小时，
+最多调用 3 次 PACE 分配接口。设为 `1` 仍会合并相同大小，但各批次串行执行；其他 Storage
+后端默认按原分组边界串行分配。既有单一大小的 `Create` 接口仍保留。
+SSD 使用同样配置，并将 `media_type` 设为 `5`。
+
+Admin API 对应字段为 `storage.tair_mem_pool.allocate_concurrency`，省略字段（或 proto3 的
+隐式 `0`）使用默认值 `4`；Registry JSON 中显式配置 `0` 无效。`kvcm_ops add_storage` 和
+`update_storage` 的 `pace` / `pace_ssd` 子命令均支持 `--allocate_concurrency`，更新时省略该参数
+会保留已有值。
+
 启用独立 SSD 类型时还需遵守以下配置约束：
 
 - 使用 `kvcm_ops add_storage ... pace_ssd` 创建一个新的、全局唯一的 Storage；不要把已有

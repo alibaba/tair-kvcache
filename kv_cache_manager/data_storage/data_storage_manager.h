@@ -43,6 +43,11 @@ public:
                                                              size_t size_per_key,
                                                              std::function<void()> cb);
 
+    DataStorageBatchCreateResult CreateBatch(RequestContext *request_context,
+                                             const std::string &unique_name,
+                                             const std::vector<DataStorageCreateRequest> &requests,
+                                             std::function<void()> cb);
+
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const std::string &unique_name,
                                   const std::vector<DataStorageUri> &storage_uris,

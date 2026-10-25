@@ -166,6 +166,8 @@ private:
 class TairMemPoolStorageSpec : public StorageSpec {
 public:
     static constexpr int64_t kDefaultHealthCheckTimeout = 1;
+    static constexpr int32_t kDefaultAllocateConcurrency = 4;
+    static constexpr int32_t kMaxAllocateConcurrency = 64;
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
     bool ValidateRequiredFields(std::string &invalid_fields) const override;
@@ -174,6 +176,7 @@ public:
     const std::string &domain() const { return domain_; }
     int64_t timeout() const { return timeout_; }
     int64_t health_check_timeout() const { return health_check_timeout_; }
+    int32_t allocate_concurrency() const { return allocate_concurrency_; }
     const std::string &service_discovery_url() const { return service_discovery_url_; }
     uint16_t media_type() const { return media_type_; }
     bool skip_confirmed_missing_backend_delete() const { return skip_confirmed_missing_backend_delete_; }
@@ -182,6 +185,7 @@ public:
     void set_cluster_name(const std::string &cluster_name) { cluster_name_ = cluster_name; }
     void set_timeout(int64_t timeout) { timeout_ = timeout; }
     void set_health_check_timeout(int64_t timeout) { health_check_timeout_ = timeout; }
+    void set_allocate_concurrency(int32_t concurrency) { allocate_concurrency_ = concurrency; }
     void set_service_discovery_url(const std::string &url) { service_discovery_url_ = url; }
     void set_media_type(uint16_t media_type) { media_type_ = media_type; }
     void set_skip_confirmed_missing_backend_delete(bool value) { skip_confirmed_missing_backend_delete_ = value; }
@@ -192,6 +196,8 @@ private:
     // 连接和请求整体使用同一值，整体耗时包含连接时间。
     int64_t timeout_{0};
     int64_t health_check_timeout_{kDefaultHealthCheckTimeout};
+    // PACE 后端单次 CreateBatch 按 size 合并后的分配请求并行度，含调用线程。
+    int32_t allocate_concurrency_{kDefaultAllocateConcurrency};
     std::string service_discovery_url_; // 见类注释
     std::string cluster_name_;          // TODO proto中没有这个字段并且未使用，考虑删除
     uint16_t media_type_{kTairMemPoolMediaTypeUnspecified};
