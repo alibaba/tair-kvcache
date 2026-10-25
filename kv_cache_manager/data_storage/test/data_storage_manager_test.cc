@@ -393,7 +393,11 @@ TEST_F(DataStorageManagerTest, TestCreateBatchDelegatesToBackendAndRetainsReques
     EXPECT_GE(collector->get_data_storage_create_time_us_metrics(), 0);
     const auto collectors = request_context.GetMetricsCollectorsVehicle().GetMetricsCollectors();
     ASSERT_EQ(1u, collectors.size());
-    EXPECT_EQ(collector, collectors[0]);
+    const auto sample = std::dynamic_pointer_cast<DataStorageMetricsCollector>(collectors[0]);
+    ASSERT_NE(nullptr, sample);
+    EXPECT_NE(collector, sample);
+    EXPECT_EQ(collector->GetMetricsTags(), sample->GetMetricsTags());
+    EXPECT_EQ(4u, sample->GetCreateKeyCountSample());
     EXPECT_EQ(parent_span, request_context.parent_span_tracer());
     const auto span_text = request_context.EndAndGetSpanTracerDebugStr();
     const auto batch_span = span_text.find("CreateBatch");

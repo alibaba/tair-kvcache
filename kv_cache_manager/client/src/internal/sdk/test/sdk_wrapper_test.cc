@@ -13,10 +13,10 @@
 
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
 #include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
-#include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
+#include "kv_cache_manager/common/lock_free_thread_pool.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 

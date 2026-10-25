@@ -1,9 +1,11 @@
 #include <memory>
+#include <vector>
 
 #include "kmonitor/client/core/MutableMetric.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/dummy_backend.h"
 #include "kv_cache_manager/data_storage/nfs_backend.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
@@ -15,10 +17,23 @@ using namespace kv_cache_manager;
 
 namespace {
 thread_local double reported_error_qps = 0;
+thread_local double reported_create_qps = 0;
+thread_local std::vector<double> reported_create_keys;
+thread_local std::vector<double> reported_create_times;
 
 void CaptureErrorQps(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *, double value) {
     if (metric->metric_name_.find("service.error_qps") != std::string::npos) {
         reported_error_qps += value;
+    }
+}
+
+void CaptureCreateMetrics(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *, double value) {
+    if (metric->metric_name_.find("data_storage.create_qps") != std::string::npos) {
+        reported_create_qps += value;
+    } else if (metric->metric_name_.find("data_storage.create_keys_qps") != std::string::npos) {
+        reported_create_keys.push_back(value);
+    } else if (metric->metric_name_.find("data_storage.create_time_us") != std::string::npos) {
+        reported_create_times.push_back(value);
     }
 }
 } // namespace
@@ -204,4 +219,63 @@ TEST_F(KmonitorMetricsReporterTest, RequestOutcomeControlsKmonitorAndLocalErrorC
     EXPECT_DOUBLE_EQ(2., reported_error_qps);
     EXPECT_EQ(2u, collector.get_service_error_counter_metrics());
     EXPECT_EQ(4u, collector.get_service_query_counter_metrics());
+}
+
+TEST_F(KmonitorMetricsReporterTest, DataStorageCreateSamplesSurviveReorderedReports) {
+    Stub stub;
+    auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+        &kmonitor::MutableMetric::Report);
+    stub.set(report, CaptureCreateMetrics);
+
+    for (const bool batch_first : {false, true}) {
+        SCOPED_TRACE(batch_first);
+        DataStorageManager manager(metrics_registry_);
+        auto backend = std::make_shared<DummyBackend>(metrics_registry_);
+        auto spec = std::make_shared<DummyStorageSpec>();
+        spec->set_root_path("memory://");
+        const auto storage = "samples_" + std::to_string(batch_first);
+        ASSERT_EQ(EC_OK, backend->Open(StorageConfig(DataStorageType::DATA_STORAGE_TYPE_DUMMY, storage, spec), "open"));
+        manager.storage_map_[storage] = backend;
+        const auto shared = backend->GetMetricsCollector();
+        const auto registry_size = metrics_registry_->GetSize();
+        RequestContext first("first"), second("second");
+        if (batch_first) {
+            manager.CreateBatch(&first, storage, {{{"a", "b"}, 128}, {{"c"}, 256}}, nullptr);
+            manager.Create(&second, storage, {"d", "e", "f", "g"}, 128, nullptr);
+        } else {
+            manager.Create(&first, storage, {"a", "b", "c"}, 128, nullptr);
+            manager.CreateBatch(&second, storage, {{{"d"}, 128}, {{"e", "f", "g"}, 256}}, nullptr);
+        }
+        manager.Create(&first, storage, {"h", "i"}, 128, nullptr);
+        const auto first_samples = first.GetMetricsCollectorsVehicle().GetMetricsCollectors();
+        const auto second_samples = second.GetMetricsCollectorsVehicle().GetMetricsCollectors();
+        ASSERT_EQ(2u, first_samples.size());
+        ASSERT_EQ(1u, second_samples.size());
+        const std::vector<std::shared_ptr<MetricsCollector>> report_order = {
+            second_samples[0], first_samples[0], first_samples[1]};
+        std::vector<double> expected_times;
+        for (const auto &sample : report_order) {
+            const auto create = std::dynamic_pointer_cast<DataStorageMetricsCollector>(sample);
+            ASSERT_NE(nullptr, create);
+            EXPECT_NE(shared, create);
+            EXPECT_GE(create->GetCreateTimeUsSample(), 0.);
+            expected_times.push_back(create->GetCreateTimeUsSample());
+        }
+        // Later allocations may replace both gauges before either request reports.
+        shared->set_data_storage_create_keys_qps_metrics(999.);
+        shared->set_data_storage_create_time_us_metrics(-123.);
+        reported_create_qps = 0;
+        reported_create_keys.clear();
+        reported_create_times.clear();
+        for (const auto &sample : report_order) {
+            reporter_->ReportPerQuery(sample.get());
+        }
+
+        EXPECT_DOUBLE_EQ(3., reported_create_qps);
+        EXPECT_EQ((std::vector<double>{4., 3., 2.}), reported_create_keys);
+        EXPECT_EQ(expected_times, reported_create_times);
+        EXPECT_EQ(3u, shared->get_data_storage_create_counter_metrics());
+        EXPECT_EQ(9u, shared->get_data_storage_create_keys_counter_metrics());
+        EXPECT_EQ(registry_size, metrics_registry_->GetSize());
+    }
 }

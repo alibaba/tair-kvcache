@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/data_storage/dummy_backend.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/data_storage/hf3fs_backend.h"
@@ -21,6 +22,26 @@
 #endif
 
 namespace kv_cache_manager {
+
+namespace {
+
+void RecordCreateMetrics(RequestContext *request_context,
+                         const std::shared_ptr<DataStorageMetricsCollector> &collector,
+                         size_t key_count,
+                         int64_t begin_us) {
+    if (!collector) {
+        return;
+    }
+    const auto elapsed_us = TimestampUtil::GetCurrentTimeUs() - begin_us;
+    // Reuse registered metric handles; do not register a new series per request.
+    auto sample = std::make_shared<DataStorageMetricsCollector>(*collector);
+    sample->SetCreateSample(key_count, static_cast<double>(elapsed_us));
+    if (request_context) {
+        request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(std::move(sample));
+    }
+}
+
+} // namespace
 
 DataStorageManager::DataStorageManager(std::shared_ptr<MetricsRegistry> metrics_registry)
     : metrics_registry_(std::move(metrics_registry)) {}
@@ -211,14 +232,10 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
         return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_NOENT, DataStorageUri{}});
     }
     const auto dsmc = storage_backend->GetMetricsCollector();
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);
+    const auto begin_us = dsmc ? TimestampUtil::GetCurrentTimeUs() : 0;
     std::vector<std::pair<ErrorCode, DataStorageUri>> create_result =
         storage_backend->Create(keys, size_per_key, trace_id, cb);
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(dsmc, DataStorageCreate);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(dsmc, data_storage, create_keys_qps, keys.size());
-    if (request_context) {
-        request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(dsmc);
-    }
+    RecordCreateMetrics(request_context, dsmc, keys.size(), begin_us);
     std::for_each(create_result.begin(), create_result.end(), [&unique_name](auto &pair) {
         if (pair.first == EC_OK) {
             pair.second.SetHostName(unique_name);
@@ -253,11 +270,9 @@ DataStorageBatchCreateResult DataStorageManager::CreateBatch(RequestContext *req
         } else {
             const auto &storage_backend = iter->second;
             const auto dsmc = storage_backend->GetMetricsCollector();
-            KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);
+            const auto begin_us = dsmc ? TimestampUtil::GetCurrentTimeUs() : 0;
             batch_result = storage_backend->CreateBatch(requests, request_context->trace_id(), nullptr);
-            KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(dsmc, DataStorageCreate);
-            KVCM_METRICS_COLLECTOR_SET_METRICS(dsmc, data_storage, create_keys_qps, key_count);
-            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(dsmc);
+            RecordCreateMetrics(request_context, dsmc, key_count, begin_us);
             for (auto &result : batch_result.results) {
                 for (auto &[ec, uri] : result) {
                     if (ec == EC_OK) {

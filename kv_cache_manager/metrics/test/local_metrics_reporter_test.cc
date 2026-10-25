@@ -12,6 +12,7 @@
 #include "kv_cache_manager/config/registry_local_backend.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/dummy_backend.h"
 #include "kv_cache_manager/data_storage/nfs_backend.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
@@ -167,6 +168,61 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery01) {
 
         GET_METRICS_(&collector, data_storage, create_keys_counter, v);
         EXPECT_EQ(8, v);
+    }
+}
+
+TEST_F(LocalMetricsReporterTest, DataStorageKeysCountSurvivesInterleavedRequests) {
+    for (const bool batched : {false, true}) {
+        for (const bool reverse_report_order : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "batched=" << batched << ", reverse=" << reverse_report_order);
+            DataStorageManager manager(metrics_registry_);
+            auto backend = std::make_shared<DummyBackend>(metrics_registry_);
+            auto spec = std::make_shared<DummyStorageSpec>();
+            spec->set_root_path("memory://");
+            const auto storage = "metrics_" + std::to_string(batched) + "_" + std::to_string(reverse_report_order);
+            ASSERT_EQ(EC_OK,
+                      backend->Open(StorageConfig(DataStorageType::DATA_STORAGE_TYPE_DUMMY, storage, spec), "open"));
+            manager.storage_map_[storage] = backend;
+            const auto collector = backend->GetMetricsCollector();
+            const auto registry_size = metrics_registry_->GetSize();
+            RequestContext large("large"), small("small");
+
+            if (batched) {
+                manager.CreateBatch(
+                    &large, storage, {{{"a", "b", "c", "d", "e", "f"}, 128}, {{"g", "h", "i", "j"}, 256}}, nullptr);
+                manager.CreateBatch(&small, storage, {{{"k", "l"}, 128}}, nullptr);
+            } else {
+                manager.Create(&large, storage, {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}, 128, nullptr);
+                manager.Create(&small, storage, {"k", "l"}, 128, nullptr);
+            }
+            // One request may allocate more than once; all samples remain valid
+            // after another request overwrites the storage's diagnostic gauge.
+            manager.Create(&large, storage, {"m"}, 128, nullptr);
+            EXPECT_EQ(registry_size, metrics_registry_->GetSize());
+            EXPECT_DOUBLE_EQ(1., collector->get_data_storage_create_keys_qps_metrics());
+
+            const auto large_samples = large.GetMetricsCollectorsVehicle().GetMetricsCollectors();
+            const auto small_samples = small.GetMetricsCollectorsVehicle().GetMetricsCollectors();
+            ASSERT_EQ(2u, large_samples.size());
+            ASSERT_EQ(1u, small_samples.size());
+            const auto report = [&](const auto &samples) {
+                for (const auto &sample : samples) {
+                    reporter_->ReportPerQuery(sample.get());
+                }
+            };
+            if (reverse_report_order) {
+                report(small_samples);
+                EXPECT_EQ(2u, collector->get_data_storage_create_keys_counter_metrics());
+                report(large_samples);
+            } else {
+                report(large_samples);
+                EXPECT_EQ(11u, collector->get_data_storage_create_keys_counter_metrics());
+                report(small_samples);
+            }
+            EXPECT_EQ(3u, collector->get_data_storage_create_counter_metrics());
+            EXPECT_EQ(13u, collector->get_data_storage_create_keys_counter_metrics());
+            EXPECT_EQ(registry_size, metrics_registry_->GetSize());
+        }
     }
 }
 

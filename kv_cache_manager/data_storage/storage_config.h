@@ -196,7 +196,7 @@ private:
     // 连接和请求整体使用同一值，整体耗时包含连接时间。
     int64_t timeout_{0};
     int64_t health_check_timeout_{kDefaultHealthCheckTimeout};
-    // PACE 后端单次 CreateBatch 按 size 合并后的分配请求并行度，含调用线程。
+    // 单次 CreateBatch 的分配并发上限，与 Storage 共用线程池的总线程数独立。
     int32_t allocate_concurrency_{kDefaultAllocateConcurrency};
     std::string service_discovery_url_; // 见类注释
     std::string cluster_name_;          // TODO proto中没有这个字段并且未使用，考虑删除

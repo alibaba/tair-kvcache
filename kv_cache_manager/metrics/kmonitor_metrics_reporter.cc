@@ -672,8 +672,8 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::o
         const auto *p = dynamic_cast<DataStorageMetricsCollector *>(collector);
         const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
         REPORT_METRICS(data_storage, create_qps, 1.0);
-        REPORT_COLLECTED_METRICS(data_storage, create_keys_qps);
-        REPORT_COLLECTED_METRICS(data_storage, create_time_us);
+        REPORT_METRICS(data_storage, create_keys_qps, static_cast<double>(p->GetCreateKeyCountSample()));
+        REPORT_METRICS(data_storage, create_time_us, p->GetCreateTimeUsSample());
     }
 }
 

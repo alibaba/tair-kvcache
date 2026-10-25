@@ -106,7 +106,7 @@ def add_pace_common_args(parser):
         help='health request and connection timeout in seconds (server default: 1; update omission preserves existing)')
     parser.add_argument(
         '--allocate_concurrency', type=pace_allocate_concurrency_value, default=None,
-        help='maximum parallel allocation requests per batch and storage, 1..64 '
+        help='maximum parallel allocation requests per batch, 1..64 '
              '(server default: 4; 1 merges equal sizes but runs serially; update omission preserves existing)')
     parser.add_argument(
         '--skip_confirmed_missing_backend_delete',
