@@ -269,24 +269,32 @@ TEST_F(MetaAsyncRedisReclaimLoggingTest, MalformedLruWarningsAreBatchedAndThrott
     const std::string first_logs = testing::internal::GetCapturedStdout();
     EXPECT_EQ(1, std::count(first_logs.begin(), first_logs.end(), '\n')) << first_logs;
     EXPECT_THAT(first_logs, HasSubstr("instance[reclaim_lru_first], sampled[1000], missing[1], malformed[998]"));
+    EXPECT_THAT(first_logs, HasSubstr("warn_interval_s[30]"));
     ASSERT_EQ(1000, candidates.size());
     for (size_t i = 0; i < candidates.size(); ++i) {
         EXPECT_EQ(i + 1, candidates[i].key);
         EXPECT_EQ(i == 0 ? 101 : 0, candidates[i].last_access_time_us);
     }
 
-    const int64_t next_warning_us = backend.next_reclaim_lru_warning_time_us_.load();
+    const int64_t next_warning_us = backend.next_reclaim_lru_warning_time_us_;
     EXPECT_GE(next_warning_us, sample_start_us + 30 * 1000 * 1000);
     EXPECT_LE(next_warning_us, TimestampUtil::GetSteadyTimeUs() + 30 * 1000 * 1000);
     // Advance the warning deadline without sleeping for a full period.
-    backend.next_reclaim_lru_warning_time_us_.store(TimestampUtil::GetSteadyTimeUs() - 1);
+    backend.next_reclaim_lru_warning_time_us_ = TimestampUtil::GetSteadyTimeUs() - 1;
     testing::internal::CaptureStdout();
     EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 1000, candidates));
     EXPECT_EQ(EC_OK, other.SampleReclaimCandidates(nullptr, 1, candidates));
     const std::string later_logs = testing::internal::GetCapturedStdout();
-    EXPECT_EQ(2, std::count(later_logs.begin(), later_logs.end(), '\n')) << later_logs;
-    EXPECT_THAT(later_logs, HasSubstr("instance[reclaim_lru_first]"));
-    EXPECT_THAT(later_logs, HasSubstr("instance[reclaim_lru_second]"));
+    EXPECT_EQ(3, std::count(later_logs.begin(), later_logs.end(), '\n')) << later_logs;
+    EXPECT_THAT(later_logs,
+                HasSubstr("instance[reclaim_lru_first], warn_interval_s[30], suppressed_warnings[19], "
+                          "suppressed_sampled[19000], suppressed_missing[19], suppressed_malformed[18962]"));
+    EXPECT_THAT(later_logs,
+                HasSubstr("instance[reclaim_lru_first], sampled[1000], missing[1], malformed[998], "
+                          "warn_interval_s[30]"));
+    EXPECT_THAT(later_logs,
+                HasSubstr("instance[reclaim_lru_second], sampled[1], missing[0], malformed[1], "
+                          "warn_interval_s[30]"));
 }
 
 TEST_F(MetaAsyncRedisReclaimLoggingTest, ReadFailureWarningsAreThrottledAndKeepFallback) {
@@ -303,18 +311,95 @@ TEST_F(MetaAsyncRedisReclaimLoggingTest, ReadFailureWarningsAreThrottledAndKeepF
     const std::string logs = testing::internal::GetCapturedStdout();
     EXPECT_EQ(1, std::count(logs.begin(), logs.end(), '\n')) << logs;
     EXPECT_THAT(logs, HasSubstr("properties unavailable"));
+    EXPECT_THAT(logs, HasSubstr("warn_interval_s[30]"));
     ASSERT_EQ(2, candidates.size());
     EXPECT_EQ(0, candidates[0].last_access_time_us);
     EXPECT_EQ(0, candidates[1].last_access_time_us);
     EXPECT_EQ(EC_TIMEOUT, backend.SampleReclaimCandidates(nullptr, 2, candidates, true));
     EXPECT_TRUE(candidates.empty());
+
+    backend.next_reclaim_lru_warning_time_us_ = TimestampUtil::GetSteadyTimeUs() - 1;
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 2, candidates));
+    const std::string later_logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(2, std::count(later_logs.begin(), later_logs.end(), '\n')) << later_logs;
+    EXPECT_THAT(later_logs, HasSubstr("properties unavailable"));
+    EXPECT_THAT(later_logs,
+                HasSubstr("warn_interval_s[30], suppressed_warnings[19], suppressed_sampled[38], "
+                          "suppressed_missing[0], suppressed_malformed[0]"));
+}
+
+TEST_F(MetaAsyncRedisReclaimLoggingTest, WarningKindsShareSuppressedCount) {
+    ScriptedReclaimMetaAsyncRedisBackend backend;
+    backend.sampled_keys = {1, 2, 3};
+    backend.property_results.assign(3, EC_TIMEOUT);
+    backend.properties.resize(3);
+    ReclaimCandidateVector candidates;
+
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    backend.property_results.assign(3, EC_OK);
+    backend.properties = {{}, {{PROPERTY_LRU_TIME, "malformed"}}, {{PROPERTY_LRU_TIME, "malformed"}}};
+    for (const bool strict : {false, true}) {
+        EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates, strict));
+    }
+    // Count the actual sample size across warning kinds, not the requested count.
+    backend.sampled_keys = {4, 5};
+    backend.property_results.assign(2, EC_TIMEOUT);
+    backend.properties.assign(2, {});
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 10, candidates));
+    EXPECT_EQ(2, candidates.size());
+    backend.sampled_keys = {1, 2, 3};
+    backend.property_results.assign(3, EC_NOENT);
+    backend.properties.assign(3, {});
+    for (const bool strict : {false, true}) {
+        EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates, strict));
+    }
+    std::string logs = testing::internal::GetCapturedStdout();
+    LoggerBroker::SetLogLevel(Logger::LEVEL_ERROR);
+    testing::internal::CaptureStdout();
+    backend.property_results.assign(3, EC_TIMEOUT);
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    logs += testing::internal::GetCapturedStdout();
+    LoggerBroker::SetLogLevel(Logger::LEVEL_WARN);
+
+    backend.next_reclaim_lru_warning_time_us_ = TimestampUtil::GetSteadyTimeUs() - 1;
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    logs += testing::internal::GetCapturedStdout();
+    EXPECT_EQ(3, std::count(logs.begin(), logs.end(), '\n')) << logs;
+    EXPECT_THAT(logs, HasSubstr("properties unavailable"));
+    EXPECT_THAT(logs,
+                HasSubstr("warn_interval_s[30], suppressed_warnings[3], suppressed_sampled[8], "
+                          "suppressed_missing[2], suppressed_malformed[4]"));
+
+    backend.next_reclaim_lru_warning_time_us_ = TimestampUtil::GetSteadyTimeUs() - 1;
+    backend.property_results.assign(3, EC_OK);
+    backend.properties = {{}, {{PROPERTY_LRU_TIME, "malformed"}}, {{PROPERTY_LRU_TIME, "malformed"}}};
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    const std::string later_logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(1, std::count(later_logs.begin(), later_logs.end(), '\n')) << later_logs;
+    EXPECT_THAT(later_logs, HasSubstr("malformed lru time"));
+    EXPECT_THAT(later_logs, HasSubstr("sampled[3], missing[1], malformed[2], warn_interval_s[30]"));
+    EXPECT_EQ(std::string::npos, later_logs.find("suppressed_warnings"));
+
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    backend.next_reclaim_lru_warning_time_us_ = TimestampUtil::GetSteadyTimeUs() - 1;
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    const std::string reset_logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(2, std::count(reset_logs.begin(), reset_logs.end(), '\n')) << reset_logs;
+    EXPECT_THAT(reset_logs,
+                HasSubstr("suppressed_warnings[1], suppressed_sampled[3], suppressed_missing[1], "
+                          "suppressed_malformed[2]"));
 }
 
 TEST_F(MetaAsyncRedisReclaimLoggingTest, ConcurrentSamplingSharesWarningBudget) {
     ScriptedReclaimMetaAsyncRedisBackend backend;
-    backend.sampled_keys = {1};
-    backend.property_results = {EC_OK};
-    backend.properties = {{{PROPERTY_LRU_TIME, "malformed"}}};
+    backend.sampled_keys = {1, 2, 3};
+    backend.property_results.assign(3, EC_OK);
+    backend.properties = {{}, {{PROPERTY_LRU_TIME, "malformed"}}, {{PROPERTY_LRU_TIME, "malformed"}}};
     std::atomic<int> successful_samples{0};
     std::vector<std::thread> workers;
 
@@ -323,8 +408,11 @@ TEST_F(MetaAsyncRedisReclaimLoggingTest, ConcurrentSamplingSharesWarningBudget) 
         workers.emplace_back([&]() {
             for (int j = 0; j < 100; ++j) {
                 ReclaimCandidateVector candidates;
-                if (backend.SampleReclaimCandidates(nullptr, 1, candidates) == EC_OK && candidates.size() == 1 &&
-                    candidates[0].key == 1 && candidates[0].last_access_time_us == 0) {
+                if (backend.SampleReclaimCandidates(nullptr, 3, candidates) == EC_OK && candidates.size() == 3 &&
+                    candidates[0].key == 1 && candidates[2].key == 3 &&
+                    std::all_of(candidates.begin(), candidates.end(), [](const auto &candidate) {
+                        return candidate.last_access_time_us == 0;
+                    })) {
                     ++successful_samples;
                 }
             }
@@ -336,6 +424,16 @@ TEST_F(MetaAsyncRedisReclaimLoggingTest, ConcurrentSamplingSharesWarningBudget) 
     const std::string logs = testing::internal::GetCapturedStdout();
     EXPECT_EQ(1600, successful_samples.load());
     EXPECT_EQ(1, std::count(logs.begin(), logs.end(), '\n')) << logs;
+
+    backend.next_reclaim_lru_warning_time_us_ = TimestampUtil::GetSteadyTimeUs() - 1;
+    testing::internal::CaptureStdout();
+    ReclaimCandidateVector candidates;
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 3, candidates));
+    const std::string later_logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(2, std::count(later_logs.begin(), later_logs.end(), '\n')) << later_logs;
+    EXPECT_THAT(later_logs,
+                HasSubstr("suppressed_warnings[1599], suppressed_sampled[4797], suppressed_missing[1599], "
+                          "suppressed_malformed[3198]"));
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestInitInvalidAsyncConfig) {
