@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -131,7 +132,9 @@ private:
     void BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys);
     void DrainQueue(int queue_id);
     int GetQueueIndexForKey(KeyType key) const noexcept;
-    bool ShouldLogReclaimLruWarning() noexcept;
+    bool ShouldLogReclaimLruWarning(size_t sampled_count,
+                                    size_t missing_lru_count = 0,
+                                    size_t malformed_lru_count = 0) noexcept;
 
     using CmdArgs = std::vector<std::string>;
     void CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cmds);
@@ -168,7 +171,12 @@ private:
     std::shared_ptr<DynamicClientPool<RedisClient>> read_client_pool_;
 
     // Shared by sampling threads for this instance; missing LRU fields do not consume the warning budget.
-    std::atomic<int64_t> next_reclaim_lru_warning_time_us_{0};
+    std::mutex reclaim_lru_warning_mutex_;
+    int64_t next_reclaim_lru_warning_time_us_ = 0;
+    size_t suppressed_reclaim_lru_warning_count_ = 0;
+    size_t suppressed_reclaim_lru_sampled_count_ = 0;
+    size_t suppressed_reclaim_lru_missing_count_ = 0;
+    size_t suppressed_reclaim_lru_malformed_count_ = 0;
 
     // Consumer-thread write stats (atomics, reset on read via CAS)
     std::atomic<int64_t> stats_flush_key_count_{0};
