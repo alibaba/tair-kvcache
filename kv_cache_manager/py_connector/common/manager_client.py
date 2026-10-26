@@ -5,6 +5,7 @@ from typing import Any, Dict, Mapping, Optional
 
 import requests
 
+from kv_cache_manager.py_connector.common.caller_node import with_caller_node
 from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.common.service_discovery import (
     ServiceDiscovery,
@@ -377,6 +378,10 @@ class KvCacheManagerClient:
     ) -> Dict[str, Any]:
         """Helper method to make POST requests to API endpoints and optionally validate response"""
         retries_left = self._leader_retry_count if self._auto_discover_leader else 0
+        # Resolve the caller identity once per API call, outside the retry loop:
+        # it is process-wide state, and a leader retry must resend the very same
+        # payload rather than re-probe the local sidecar.
+        data = with_caller_node(endpoint, data)
 
         while True:
             try:

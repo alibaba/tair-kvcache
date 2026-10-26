@@ -19,6 +19,7 @@ class WheelContentsTest(unittest.TestCase):
         expected_files = {
             "kv_cache_manager/manager_client/__init__.py",
             "kv_cache_manager/py_connector/common/_version_info.py",
+            "kv_cache_manager/py_connector/common/caller_node.py",
             "kv_cache_manager/py_connector/common/logger.py",
             "kv_cache_manager/py_connector/common/manager_client.py",
             "kv_cache_manager/py_connector/common/service_discovery.py",

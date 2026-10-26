@@ -11,7 +11,12 @@ pybind_extension(
     srcs = ["py_client_binding.cc"],
     deps = [
         "//kv_cache_manager/client:client",
-    ],
+    ] + select({
+        "//kv_cache_manager/client/src/internal/sdk:enable_tair_mempool": [
+            "//3rdparty/tair_mempool",
+        ],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
 )
 

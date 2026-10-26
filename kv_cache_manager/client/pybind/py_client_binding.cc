@@ -5,6 +5,10 @@
 
 #include "kv_cache_manager/client/include/transfer_client.h"
 
+#ifdef ENABLE_TAIR_MEMPOOL
+#include "pace_mp.h"
+#endif
+
 namespace py = pybind11;
 namespace kvcm = kv_cache_manager;
 
@@ -194,5 +198,28 @@ PYBIND11_MODULE(kvcm_py_client, module) {
              py::arg("block_buffers"),
              py::arg("trace_info") = nullptr,
              py::call_guard<py::gil_scoped_release>());
+
+#ifdef ENABLE_TAIR_MEMPOOL
+    // KVCM 亲和：导出本机（同机）pace provider 的 node id，供纯 Python 控制面
+    // 客户端（如 vineyard tair_kvcm store）填写 StartWriteCache 等请求的
+    // caller 字段。语义对齐 C++ TairMempoolCallerNodeProvider::GetCallerNode：
+    // 查询失败 / 结果歧义（非恰好一个 provider）/ node_id 未知，一律返回空串；
+    // 调用方据此不带 caller，行为与老客户端完全一致（空 caller = 亲和不参与）。
+    module.def(
+        "local_node_id",
+        []() -> std::string {
+            std::vector<LocalProviderInfo> providers;
+            const int ret = pace_local_providers(providers);
+            if (ret != 0 || providers.size() != 1 || providers.front().node_id == 0) {
+                return std::string();
+            }
+            return std::to_string(providers.front().node_id);
+        },
+        py::doc("Return the node id (decimal string) of the single pace storage "
+                "provider co-located with this process. Returns an empty string "
+                "when the local provider is unknown, unavailable, or ambiguous; "
+                "callers must then omit the KVCM caller field, which keeps the "
+                "request affinity-neutral."));
+#endif
 
 } // namespace kv_cache_manager
