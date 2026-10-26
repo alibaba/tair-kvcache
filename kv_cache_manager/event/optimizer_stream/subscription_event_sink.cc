@@ -28,16 +28,20 @@ SubscriptionEventSink::Subscription::WaitNext(proto::optimizer::TraceQueryReques
     return WaitResult::kEvent;
 }
 
-bool SubscriptionEventSink::Subscription::Enqueue(const proto::optimizer::TraceQueryRequest &event) {
+SubscriptionEventSink::Subscription::EnqueueResult
+SubscriptionEventSink::Subscription::Enqueue(const proto::optimizer::TraceQueryRequest &event) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (closed_ || queue_.size() >= queue_size_) {
-            return false;
+        if (closed_) {
+            return EnqueueResult::CLOSED;
+        }
+        if (queue_.size() >= queue_size_) {
+            return EnqueueResult::FULL;
         }
         queue_.push_back(event);
     }
     cv_.notify_one();
-    return true;
+    return EnqueueResult::ACCEPTED;
 }
 
 void SubscriptionEventSink::Subscription::Close() {
@@ -107,29 +111,39 @@ void SubscriptionEventSink::DisableSubscriptions() {
 }
 
 bool SubscriptionEventSink::Send(const proto::optimizer::TraceQueryRequest &event) {
+    return TrySend(event).accepted != 0;
+}
+
+SubscriptionEventSink::DeliveryResult SubscriptionEventSink::TrySend(const proto::optimizer::TraceQueryRequest &event) {
+    DeliveryResult result;
     std::vector<std::shared_ptr<Subscription>> subscriptions;
     {
         std::lock_guard<std::mutex> lock(subscriptions_mutex_);
         if (stopped_ || !accepting_subscriptions_) {
             dropped_.fetch_add(1);
-            return false;
+            result.failures.push_back({DropReason::UNAVAILABLE, {}});
+            return result;
         }
         subscriptions = subscriptions_;
     }
     if (subscriptions.empty()) {
         dropped_.fetch_add(1);
-        return false;
+        result.failures.push_back({DropReason::NO_SUBSCRIBER, {}});
+        return result;
     }
 
-    bool delivered = false;
     for (const auto &subscription : subscriptions) {
-        if (subscription->Enqueue(event)) {
-            delivered = true;
+        const auto outcome = subscription->Enqueue(event);
+        if (outcome == Subscription::EnqueueResult::ACCEPTED) {
+            ++result.accepted;
         } else {
             dropped_.fetch_add(1);
+            result.failures.push_back({outcome == Subscription::EnqueueResult::FULL ? DropReason::QUEUE_FULL
+                                                                                    : DropReason::SUBSCRIPTION_CLOSED,
+                                       subscription->consumer_id()});
         }
     }
-    return delivered;
+    return result;
 }
 
 void SubscriptionEventSink::Stop() {

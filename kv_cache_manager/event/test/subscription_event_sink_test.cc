@@ -112,4 +112,36 @@ TEST_F(SubscriptionEventSinkTest, TestStopWakesSubscriberAndIsIdempotent) {
     EXPECT_FALSE(sink.Send(MakeRequest("late")));
 }
 
+TEST_F(SubscriptionEventSinkTest, ReportsNoSubscriberAndPartialFanoutWithoutRetrying) {
+    SubscriptionEventSink sink(MakeSinkConfig(2, 1));
+    auto result = sink.TrySend(MakeRequest("no-subscriber"));
+    EXPECT_EQ(0u, result.accepted);
+    ASSERT_EQ(1u, result.failures.size());
+    EXPECT_EQ(SubscriptionEventSink::DropReason::NO_SUBSCRIBER, result.failures[0].reason);
+    auto slow = sink.Subscribe("slow");
+    auto fast = sink.Subscribe("fast");
+    ASSERT_TRUE(sink.Send(MakeRequest("first")));
+    proto::optimizer::TraceQueryRequest event;
+    ASSERT_EQ(SubscriptionEventSink::Subscription::WaitResult::kEvent,
+              fast->WaitNext(&event, std::chrono::milliseconds(0)));
+    result = sink.TrySend(MakeRequest("second"));
+    EXPECT_EQ(1u, result.accepted);
+    ASSERT_EQ(1u, result.failures.size());
+    EXPECT_EQ(SubscriptionEventSink::DropReason::QUEUE_FULL, result.failures[0].reason);
+    EXPECT_EQ("slow", result.failures[0].consumer_id);
+    ASSERT_EQ(SubscriptionEventSink::Subscription::WaitResult::kEvent,
+              slow->WaitNext(&event, std::chrono::milliseconds(0)));
+    EXPECT_EQ("first", event.trace_id());
+    ASSERT_EQ(SubscriptionEventSink::Subscription::WaitResult::kEvent,
+              fast->WaitNext(&event, std::chrono::milliseconds(0)));
+    EXPECT_EQ("second", event.trace_id());
+    EXPECT_EQ(SubscriptionEventSink::Subscription::WaitResult::kTimeout,
+              fast->WaitNext(&event, std::chrono::milliseconds(0)));
+    sink.Stop();
+    result = sink.TrySend(MakeRequest("stopped"));
+    EXPECT_EQ(0u, result.accepted);
+    ASSERT_EQ(1u, result.failures.size());
+    EXPECT_EQ(SubscriptionEventSink::DropReason::UNAVAILABLE, result.failures[0].reason);
+}
+
 } // namespace kv_cache_manager

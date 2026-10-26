@@ -21,6 +21,23 @@ namespace kv_cache_manager {
 // blocks the publisher or another consumer.
 class SubscriptionEventSink final : public EventSink {
 public:
+    enum class DropReason {
+        NO_SUBSCRIBER,
+        QUEUE_FULL,
+        SUBSCRIPTION_CLOSED,
+        UNAVAILABLE
+    };
+
+    struct DeliveryFailure {
+        DropReason reason;
+        std::string consumer_id;
+    };
+
+    struct DeliveryResult {
+        std::size_t accepted = 0;
+        std::vector<DeliveryFailure> failures;
+    };
+
     class Subscription {
     public:
         enum class WaitResult {
@@ -36,7 +53,12 @@ public:
         friend class SubscriptionEventSink;
 
         Subscription(std::string consumer_id, std::size_t queue_size);
-        bool Enqueue(const proto::optimizer::TraceQueryRequest &event);
+        enum class EnqueueResult {
+            ACCEPTED,
+            FULL,
+            CLOSED
+        };
+        EnqueueResult Enqueue(const proto::optimizer::TraceQueryRequest &event);
         void Close();
 
         const std::string consumer_id_;
@@ -61,6 +83,10 @@ public:
     bool accepting_subscriptions() const { return accepting_subscriptions_.load(); }
 
     bool Send(const proto::optimizer::TraceQueryRequest &event) override;
+    // Reports each local queue outcome, including partial fan-out. Never waits
+    // for capacity and never retries. The caller can log its ingress sequence
+    // without adding that runtime-local field to the remote protocol.
+    DeliveryResult TrySend(const proto::optimizer::TraceQueryRequest &event);
     void Stop() override;
     std::size_t DroppedCount() const;
 
