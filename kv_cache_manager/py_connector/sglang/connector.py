@@ -1834,7 +1834,7 @@ class HiCacheKVCM(HiCacheStorage):
         logger.debug(f"get_cache_location {result=}")
         locations = result["locations"]
 
-        matched = len(locations)
+        matched = self._kv_hit_pages(locations)
         if matched > len_new:
             raise RuntimeError(
                 f"get_cache_location returned {matched} locations for {len_new} "
@@ -1852,7 +1852,7 @@ class HiCacheKVCM(HiCacheStorage):
         buffer_sizes = buffer_sizes[:buffer_matched]
 
         # Extract URIs and prepare buffers
-        uris = self._extract_uris(locations)
+        uris = self._extract_uris(locations[:matched])
         buffers = self._prepare_buffers(buffer_ptrs, buffer_sizes)
         _require_one_uri_per_buffer(uris, buffers, self.location_spec_name)
         # Perform data transfer
@@ -2576,7 +2576,11 @@ class HiCacheKVCM(HiCacheStorage):
                             }
                         )
                     except Exception as e:
-                        logger.error(f"finish_write_cache failed: {e}")
+                        logger.error(
+                            f"finish_write_cache failed: {trace_id=} "
+                            f"pool={transfer.name} {e=}"
+                        )
+                        flag = False
 
                 per_key = [True] * len(keys)
                 for idx in save_indices:
@@ -2608,7 +2612,7 @@ class HiCacheKVCM(HiCacheStorage):
         }
         result = self._manager_client.get_cache_location(get_request)
         logger.debug(f"get_cache_location {result=}")
-        return len(result["locations"])
+        return self._kv_hit_pages(result["locations"])
 
     def batch_exists(
         self,
@@ -2652,19 +2656,7 @@ class HiCacheKVCM(HiCacheStorage):
             result = self._manager_client.get_cache_location(get_request)
             locations = result["locations"]
 
-            # Count KV hit pages: prefix-match only locations that carry
-            # the KV ("Full") spec.  get_cache_location returns any block
-            # registered via start_write_cache regardless of spec group,
-            # so we must filter by checking each location's specs.
-            kv_hit_pages = 0
-            for loc in locations:
-                if any(
-                    spec["name"] == self.location_spec_name
-                    for spec in loc.get("location_specs", [])
-                ):
-                    kv_hit_pages += 1
-                else:
-                    break  # prefix match: stop at first gap
+            kv_hit_pages = self._kv_hit_pages(locations)
             pool_hit_pages = {PoolName.KV: kv_hit_pages} if kv_hit_pages else {}
             final_pages = kv_hit_pages
 
@@ -2778,6 +2770,25 @@ class HiCacheKVCM(HiCacheStorage):
                 if location_spec["name"] == self.location_spec_name:
                     uris.append(location_spec["uri"])
         return uris
+
+    @staticmethod
+    def _has_spec(location: dict, spec_name: str) -> bool:
+        """Whether the Manager registered ``spec_name`` for this location."""
+        return any(
+            spec["name"] == spec_name for spec in location.get("location_specs", [])
+        )
+
+    def _kv_hit_pages(self, locations: List[dict]) -> int:
+        """How many leading locations carry this rank's KV spec.
+
+        A prefix match counts a block once *any* spec group registered it, so the
+        readable run ends at the first location that does not carry this rank's
+        spec -- the one ``_extract_uris`` would have no slot for.
+        """
+        for i, location in enumerate(locations):
+            if not self._has_spec(location, self.location_spec_name):
+                return i
+        return len(locations)
 
     def _prepare_buffers(
         self, buffer_ptrs: List[int], buffer_sizes: List[int]
@@ -3001,23 +3012,18 @@ class HiCacheKVCM(HiCacheStorage):
             self._report_unknown_pool(transfer.name)
             return 0
 
-        def has_spec(loc: dict) -> bool:
-            return any(
-                spec["name"] == spec_name for spec in loc.get("location_specs", [])
-            )
-
         if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
             # First gap in the prefix is the boundary.
-            return next(
-                (i for i in range(kv_hit_pages) if not has_spec(locations[i])),
-                kv_hit_pages,
-            )
+            for i in range(kv_hit_pages):
+                if not self._has_spec(locations[i], spec_name):
+                    return i
+            return kv_hit_pages
 
         if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
             trailing = max(1, len(transfer.keys) if transfer.keys else 1)
             for prefix_len in range(kv_hit_pages, 0, -1):
                 if all(
-                    has_spec(locations[i])
+                    self._has_spec(locations[i], spec_name)
                     for i in range(max(0, prefix_len - trailing), prefix_len)
                 ):
                     return prefix_len
