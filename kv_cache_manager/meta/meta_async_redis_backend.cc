@@ -6,6 +6,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -716,32 +717,91 @@ ErrorCode MetaAsyncRedisBackend::SampleReclaimCandidates(RequestContext *request
 
     out_candidates.reserve(keys.size());
     if (!require_read_success && !all_properties_available) {
-        KVCM_INTERVAL_LOG_WARN(10,
-                               "async redis sample reclaim candidate properties unavailable, use zero lru time, "
-                               "instance[%s]",
-                               instance_id_.c_str());
+        // EC_NOENT also means that the optional LRU field is absent. Preserve
+        // the batch-wide fallback without treating that expected case as a read failure.
+        const bool read_failed = property_results.size() != keys.size() || properties.size() != keys.size() ||
+                                 std::any_of(property_results.begin(), property_results.end(), [](ErrorCode ec) {
+                                     return ec != EC_OK && ec != EC_NOENT;
+                                 });
+        if (read_failed && ShouldLogReclaimLruWarning(keys.size())) {
+            KVCM_LOG_WARN("async redis sample reclaim candidate properties unavailable, use zero lru time, "
+                          "instance[%s], sampled[%zu], warn_interval_s[30]",
+                          instance_id_.c_str(),
+                          keys.size());
+        }
         for (const KeyType key : keys) {
             out_candidates.push_back({key, 0});
         }
         return EC_OK;
     }
 
+    size_t missing_lru_count = 0;
+    size_t malformed_lru_count = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
         // A missing LRU field maps to EC_NOENT, just like a missing key.
         // Keep the candidate at time zero; later Location reads exclude keys
         // that actually disappeared, without an additional existence query.
         int64_t last_access_time_us = 0;
         const auto it = properties[i].find(PROPERTY_LRU_TIME);
-        if (it == properties[i].end() || !StringUtil::StrToInt64(it->second.c_str(), last_access_time_us)) {
-            KVCM_INTERVAL_LOG_WARN(10,
-                                   "async redis sample reclaim candidate has missing or malformed lru time, "
-                                   "instance[%s]",
-                                   instance_id_.c_str());
+        if (it == properties[i].end()) {
+            // Redis need not persist the in-memory LRU timestamp.
+            ++missing_lru_count;
+        } else if (!StringUtil::StrToInt64(it->second.c_str(), last_access_time_us)) {
+            ++malformed_lru_count;
             last_access_time_us = 0;
         }
         out_candidates.push_back({keys[i], last_access_time_us});
     }
+    if (malformed_lru_count > 0 && ShouldLogReclaimLruWarning(keys.size(), missing_lru_count, malformed_lru_count)) {
+        KVCM_LOG_WARN("async redis sample reclaim candidates have malformed lru time, use zero for invalid timestamps, "
+                      "instance[%s], sampled[%zu], missing[%zu], malformed[%zu], warn_interval_s[30]",
+                      instance_id_.c_str(),
+                      keys.size(),
+                      missing_lru_count,
+                      malformed_lru_count);
+    }
     return EC_OK;
+}
+
+// KVCM_PERIOD_LOG_WARN shares its warning budget across all instances.
+bool MetaAsyncRedisBackend::ShouldLogReclaimLruWarning(size_t sampled_count,
+                                                       size_t missing_lru_count,
+                                                       size_t malformed_lru_count) noexcept {
+    if (!LoggerBroker::IsLevelEnable(Logger::LEVEL_WARN)) {
+        return false;
+    }
+    constexpr int64_t kWarningPeriodUs = 30 * 1000 * 1000;
+    size_t suppressed_warnings = 0;
+    size_t suppressed_sampled = 0;
+    size_t suppressed_missing = 0;
+    size_t suppressed_malformed = 0;
+    {
+        std::lock_guard<std::mutex> lock(reclaim_lru_warning_mutex_);
+        const int64_t now_us = TimestampUtil::GetSteadyTimeUs();
+        if (now_us < next_reclaim_lru_warning_time_us_) {
+            ++suppressed_reclaim_lru_warning_count_;
+            suppressed_reclaim_lru_sampled_count_ += sampled_count;
+            suppressed_reclaim_lru_missing_count_ += missing_lru_count;
+            suppressed_reclaim_lru_malformed_count_ += malformed_lru_count;
+            return false;
+        }
+        next_reclaim_lru_warning_time_us_ = now_us + kWarningPeriodUs;
+        suppressed_warnings = std::exchange(suppressed_reclaim_lru_warning_count_, 0);
+        suppressed_sampled = std::exchange(suppressed_reclaim_lru_sampled_count_, 0);
+        suppressed_missing = std::exchange(suppressed_reclaim_lru_missing_count_, 0);
+        suppressed_malformed = std::exchange(suppressed_reclaim_lru_malformed_count_, 0);
+    }
+    if (suppressed_warnings > 0) {
+        KVCM_LOG_WARN("async redis reclaim LRU warnings suppressed, instance[%s], warn_interval_s[30], "
+                      "suppressed_warnings[%zu], suppressed_sampled[%zu], suppressed_missing[%zu], "
+                      "suppressed_malformed[%zu]",
+                      instance_id_.c_str(),
+                      suppressed_warnings,
+                      suppressed_sampled,
+                      suppressed_missing,
+                      suppressed_malformed);
+    }
+    return true;
 }
 
 ErrorCode MetaAsyncRedisBackend::PutMetaData(const FieldMap &field_map) noexcept {

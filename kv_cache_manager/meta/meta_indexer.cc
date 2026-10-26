@@ -138,6 +138,10 @@ MetaIndexer::~MetaIndexer() {
     }
 }
 
+bool MetaIndexer::IsRecovering() const noexcept {
+    return backend_manager_ && backend_manager_->GetRecoverState() == MetaStorageBackendManager::RecoverState::kRecover;
+}
+
 ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept {
     if (!config || !config->GetMetaStorageBackendConfig()) {
         KVCM_LOG_ERROR("instance[%s] meta indexer init failed, config is invalid", instance_id.c_str());
