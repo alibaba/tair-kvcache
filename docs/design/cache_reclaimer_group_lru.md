@@ -249,6 +249,8 @@ struct GroupLruCandidate {
 
 候选采样复用公共 `SampleReclaimCandidates` 接口，一次返回 key 和访问时间；local 在分片锁内读取，不晋升 LRU 或修改业务时间。cached 在恢复期间从完整的持久层采样，再以 no-touch 精确读取的热缓存时间覆盖命中项；恢复完成后使用完整缓存。Group LRU 启用 `require_read_success=true`：批量读取失败时丢弃该 Instance，时间缺失 / 非法仍按 0 保留候选。Redis / async Redis 查询 LRU 字段时，`EC_NOENT` 既可能表示字段缺失，也可能表示 key 已消失，因此不能在采样阶段据此直接丢弃 key；恢复时仍有机会使用内存时间，真正已消失或不可删除的 key 由后续 Location 检查排除，不增加额外的存在性查询。容量比例 / 固定策略保持公共接口默认的 best-effort 读取降级语义。
 
+async Redis 采样时，LRU 字段缺失是允许的，不单独打印 WARN。字段存在但解析失败时，按批汇总采样数、缺失数和解析失败数；该提示与 best-effort 读取失败的回退提示共享每个 Instance 每 30 秒最多一条 WARN 的额度，并发采样也遵守该限制。计数只表示当前输出的这一批，不是整个限频周期的累计值；候选保留、时间回退和错误返回语义不变。
+
 Group LRU 的候选资格检查和最终准入另通过 `GetLocationMapsForMaintenance` 无副作用读取 Location；cached 恢复期间优先读热缓存，仅对缺 key 回查持久层且不回填。独立测试覆盖重复采样和 Location 读取后业务时间与物理 LRU 顺序不变，避免维护操作把冷数据读热。
 
 完整 Local 回收源在同一轮内使用单个采样任务请求该 Instance 的完整候选预算，不按 `sampling_size_per_task` 拆分，避免多个任务从相同冷前缀重复取样；完整预算是请求量，不保证一定采足。cached 恢复期间仍从持久层采样，允许按任务预算拆分。重复的纯采样调用可以返回相同冷 key，后续覆盖推进依赖业务访问、实际删除以及第 5.5 节的显式维护 touch。

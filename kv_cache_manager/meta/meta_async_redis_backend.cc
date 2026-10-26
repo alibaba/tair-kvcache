@@ -716,32 +716,64 @@ ErrorCode MetaAsyncRedisBackend::SampleReclaimCandidates(RequestContext *request
 
     out_candidates.reserve(keys.size());
     if (!require_read_success && !all_properties_available) {
-        KVCM_INTERVAL_LOG_WARN(10,
-                               "async redis sample reclaim candidate properties unavailable, use zero lru time, "
-                               "instance[%s]",
-                               instance_id_.c_str());
+        // EC_NOENT also means that the optional LRU field is absent. Preserve
+        // the batch-wide fallback without treating that expected case as a read failure.
+        const bool read_failed = property_results.size() != keys.size() || properties.size() != keys.size() ||
+                                 std::any_of(property_results.begin(), property_results.end(), [](ErrorCode ec) {
+                                     return ec != EC_OK && ec != EC_NOENT;
+                                 });
+        if (read_failed && ShouldLogReclaimLruWarning()) {
+            KVCM_LOG_WARN("async redis sample reclaim candidate properties unavailable, use zero lru time, "
+                          "instance[%s], sampled[%zu]",
+                          instance_id_.c_str(),
+                          keys.size());
+        }
         for (const KeyType key : keys) {
             out_candidates.push_back({key, 0});
         }
         return EC_OK;
     }
 
+    size_t missing_lru_count = 0;
+    size_t malformed_lru_count = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
         // A missing LRU field maps to EC_NOENT, just like a missing key.
         // Keep the candidate at time zero; later Location reads exclude keys
         // that actually disappeared, without an additional existence query.
         int64_t last_access_time_us = 0;
         const auto it = properties[i].find(PROPERTY_LRU_TIME);
-        if (it == properties[i].end() || !StringUtil::StrToInt64(it->second.c_str(), last_access_time_us)) {
-            KVCM_INTERVAL_LOG_WARN(10,
-                                   "async redis sample reclaim candidate has missing or malformed lru time, "
-                                   "instance[%s]",
-                                   instance_id_.c_str());
+        if (it == properties[i].end()) {
+            // Redis need not persist the in-memory LRU timestamp.
+            ++missing_lru_count;
+        } else if (!StringUtil::StrToInt64(it->second.c_str(), last_access_time_us)) {
+            ++malformed_lru_count;
             last_access_time_us = 0;
         }
         out_candidates.push_back({keys[i], last_access_time_us});
     }
+    if (malformed_lru_count > 0 && ShouldLogReclaimLruWarning()) {
+        KVCM_LOG_WARN("async redis sample reclaim candidates have malformed lru time, use zero for invalid timestamps, "
+                      "instance[%s], sampled[%zu], missing[%zu], malformed[%zu]",
+                      instance_id_.c_str(),
+                      keys.size(),
+                      missing_lru_count,
+                      malformed_lru_count);
+    }
     return EC_OK;
+}
+
+bool MetaAsyncRedisBackend::ShouldLogReclaimLruWarning() noexcept {
+    if (!LoggerBroker::IsLevelEnable(Logger::LEVEL_WARN)) {
+        return false;
+    }
+    constexpr int64_t kWarningPeriodUs = 30 * 1000 * 1000;
+    const int64_t now_us = TimestampUtil::GetSteadyTimeUs();
+    int64_t next_warning_us = next_reclaim_lru_warning_time_us_.load(std::memory_order_relaxed);
+    if (now_us < next_warning_us) {
+        return false;
+    }
+    return next_reclaim_lru_warning_time_us_.compare_exchange_strong(
+        next_warning_us, now_us + kWarningPeriodUs, std::memory_order_relaxed);
 }
 
 ErrorCode MetaAsyncRedisBackend::PutMetaData(const FieldMap &field_map) noexcept {

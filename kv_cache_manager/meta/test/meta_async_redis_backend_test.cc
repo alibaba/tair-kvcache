@@ -49,6 +49,7 @@ public:
                                          const KeyTypeVec &,
                                          const std::vector<std::string> &field_names,
                                          PropertyMapVector &out_properties) noexcept override {
+        std::lock_guard<std::mutex> lock(properties_mutex);
         requested_fields = field_names;
         out_properties = properties;
         return property_results;
@@ -59,6 +60,7 @@ public:
     std::vector<ErrorCode> property_results;
     PropertyMapVector properties;
     std::vector<std::string> requested_fields;
+    std::mutex properties_mutex;
 };
 
 class MetaAsyncRedisBackendTest : public MetaStorageBackendTestBase, public RedisTestBase, public TESTBASE {
@@ -191,6 +193,149 @@ TEST_F(MetaAsyncRedisBackendTest, TestSampleReclaimCandidatesPropertyFailureDegr
 
 TEST_F(MetaAsyncRedisBackendTest, TestGroupLruStrictCandidateReadsPreserveLegacyFallback) {
     AssertReclaimCandidateReadModes<MetaAsyncRedisBackend>();
+}
+
+class MetaAsyncRedisReclaimLoggingTest : public MetaAsyncRedisBackendTest {
+public:
+    void SetUp() override {
+        MetaAsyncRedisBackendTest::SetUp();
+        previous_log_level_ = LoggerBroker::base_log_level_;
+        console_env_ = std::make_unique<ScopedEnv>("KVCM_LOG_TO_CONSOLE", "1");
+        LoggerBroker::DestroyLogger();
+        ASSERT_TRUE(LoggerBroker::InitLogger(""));
+        LoggerBroker::SetLogLevel(Logger::LEVEL_WARN);
+    }
+
+    void TearDown() override {
+        MetaAsyncRedisBackendTest::TearDown();
+        LoggerBroker::DestroyLogger();
+        console_env_.reset();
+        LoggerBroker::InitLogger("");
+        LoggerBroker::SetLogLevel(previous_log_level_);
+    }
+
+private:
+    uint32_t previous_log_level_ = Logger::LEVEL_DEBUG;
+    std::unique_ptr<ScopedEnv> console_env_;
+};
+
+TEST_F(MetaAsyncRedisReclaimLoggingTest, MissingLruFieldsAreExpectedInBothReadModes) {
+    ScriptedReclaimMetaAsyncRedisBackend backend;
+    backend.sampled_keys = {1, 2};
+    backend.properties = {{{PROPERTY_LRU_TIME, "101"}}, {}};
+
+    testing::internal::CaptureStdout();
+    for (const bool strict : {false, true}) {
+        for (const ErrorCode missing_ec : {EC_OK, EC_NOENT}) {
+            backend.property_results = {EC_OK, missing_ec};
+            ReclaimCandidateVector candidates;
+            EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 2, candidates, strict));
+            EXPECT_EQ(2, candidates.size());
+            if (candidates.size() == 2) {
+                EXPECT_EQ(1, candidates[0].key);
+                EXPECT_EQ(strict || missing_ec == EC_OK ? 101 : 0, candidates[0].last_access_time_us);
+                EXPECT_EQ(2, candidates[1].key);
+                EXPECT_EQ(0, candidates[1].last_access_time_us);
+            }
+        }
+    }
+    const std::string logs = testing::internal::GetCapturedStdout();
+    EXPECT_TRUE(logs.empty()) << logs;
+}
+
+TEST_F(MetaAsyncRedisReclaimLoggingTest, MalformedLruWarningsAreBatchedAndThrottledPerInstance) {
+    ScriptedReclaimMetaAsyncRedisBackend backend;
+    ASSERT_EQ(EC_OK, backend.Init("reclaim_lru_first", config_));
+    for (KeyType key = 1; key <= 1000; ++key) {
+        backend.sampled_keys.push_back(key);
+    }
+    backend.property_results.assign(1000, EC_OK);
+    backend.properties.assign(1000, {{PROPERTY_LRU_TIME, "malformed"}});
+    backend.properties[0] = {{PROPERTY_LRU_TIME, "101"}};
+    backend.properties[1].clear();
+
+    ScriptedReclaimMetaAsyncRedisBackend other;
+    ASSERT_EQ(EC_OK, other.Init("reclaim_lru_second", config_));
+    other.sampled_keys = {1};
+    other.property_results = {EC_OK};
+    other.properties = {{{PROPERTY_LRU_TIME, "malformed"}}};
+
+    ReclaimCandidateVector candidates;
+    const int64_t sample_start_us = TimestampUtil::GetSteadyTimeUs();
+    testing::internal::CaptureStdout();
+    for (int i = 0; i < 20; ++i) {
+        EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 1000, candidates, i % 2 == 0));
+    }
+    const std::string first_logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(1, std::count(first_logs.begin(), first_logs.end(), '\n')) << first_logs;
+    EXPECT_THAT(first_logs, HasSubstr("instance[reclaim_lru_first], sampled[1000], missing[1], malformed[998]"));
+    ASSERT_EQ(1000, candidates.size());
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        EXPECT_EQ(i + 1, candidates[i].key);
+        EXPECT_EQ(i == 0 ? 101 : 0, candidates[i].last_access_time_us);
+    }
+
+    const int64_t next_warning_us = backend.next_reclaim_lru_warning_time_us_.load();
+    EXPECT_GE(next_warning_us, sample_start_us + 30 * 1000 * 1000);
+    EXPECT_LE(next_warning_us, TimestampUtil::GetSteadyTimeUs() + 30 * 1000 * 1000);
+    // Advance the warning deadline without sleeping for a full period.
+    backend.next_reclaim_lru_warning_time_us_.store(TimestampUtil::GetSteadyTimeUs() - 1);
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 1000, candidates));
+    EXPECT_EQ(EC_OK, other.SampleReclaimCandidates(nullptr, 1, candidates));
+    const std::string later_logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(2, std::count(later_logs.begin(), later_logs.end(), '\n')) << later_logs;
+    EXPECT_THAT(later_logs, HasSubstr("instance[reclaim_lru_first]"));
+    EXPECT_THAT(later_logs, HasSubstr("instance[reclaim_lru_second]"));
+}
+
+TEST_F(MetaAsyncRedisReclaimLoggingTest, ReadFailureWarningsAreThrottledAndKeepFallback) {
+    ScriptedReclaimMetaAsyncRedisBackend backend;
+    backend.sampled_keys = {1, 2};
+    backend.property_results = {EC_NOENT, EC_TIMEOUT};
+    backend.properties = {{}, {{PROPERTY_LRU_TIME, "202"}}};
+    ReclaimCandidateVector candidates;
+
+    testing::internal::CaptureStdout();
+    for (int i = 0; i < 20; ++i) {
+        EXPECT_EQ(EC_OK, backend.SampleReclaimCandidates(nullptr, 2, candidates));
+    }
+    const std::string logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(1, std::count(logs.begin(), logs.end(), '\n')) << logs;
+    EXPECT_THAT(logs, HasSubstr("properties unavailable"));
+    ASSERT_EQ(2, candidates.size());
+    EXPECT_EQ(0, candidates[0].last_access_time_us);
+    EXPECT_EQ(0, candidates[1].last_access_time_us);
+    EXPECT_EQ(EC_TIMEOUT, backend.SampleReclaimCandidates(nullptr, 2, candidates, true));
+    EXPECT_TRUE(candidates.empty());
+}
+
+TEST_F(MetaAsyncRedisReclaimLoggingTest, ConcurrentSamplingSharesWarningBudget) {
+    ScriptedReclaimMetaAsyncRedisBackend backend;
+    backend.sampled_keys = {1};
+    backend.property_results = {EC_OK};
+    backend.properties = {{{PROPERTY_LRU_TIME, "malformed"}}};
+    std::atomic<int> successful_samples{0};
+    std::vector<std::thread> workers;
+
+    testing::internal::CaptureStdout();
+    for (int i = 0; i < 16; ++i) {
+        workers.emplace_back([&]() {
+            for (int j = 0; j < 100; ++j) {
+                ReclaimCandidateVector candidates;
+                if (backend.SampleReclaimCandidates(nullptr, 1, candidates) == EC_OK && candidates.size() == 1 &&
+                    candidates[0].key == 1 && candidates[0].last_access_time_us == 0) {
+                    ++successful_samples;
+                }
+            }
+        });
+    }
+    for (auto &worker : workers) {
+        worker.join();
+    }
+    const std::string logs = testing::internal::GetCapturedStdout();
+    EXPECT_EQ(1600, successful_samples.load());
+    EXPECT_EQ(1, std::count(logs.begin(), logs.end(), '\n')) << logs;
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestInitInvalidAsyncConfig) {
