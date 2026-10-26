@@ -120,6 +120,7 @@ std::map<std::string, std::vector<ScanResponse>> scan_responses;
 std::map<std::string, size_t> scan_positions;
 std::vector<std::pair<std::string, std::string>> scan_calls;
 std::set<std::string> missing_indexers;
+std::set<std::string> recovering_instances;
 std::string active_instance_id;
 std::shared_ptr<MetaIndexer> dummy_indexer;
 std::vector<CacheLocationDelRequest> submitted_requests;
@@ -165,6 +166,8 @@ std::shared_ptr<MetaIndexer> GetMetaIndexerStub(void *, const std::string &insta
     }
     return dummy_indexer;
 }
+
+bool IsRecoveringStub(const void *) noexcept { return recovering_instances.count(active_instance_id) > 0; }
 
 std::shared_ptr<DataStorageBackend> GetDataStorageBackendStub(void *, const std::string &storage_name) {
     if (const auto backend_it = storage_backends.find(storage_name); backend_it != storage_backends.end()) {
@@ -343,6 +346,7 @@ public:
         stub_.set(ADDR(RegistryManager, ListInstanceInfo), ListInstanceInfoStub);
         stub_.set(ADDR(MetaIndexerManager, GetMetaIndexer), GetMetaIndexerStub);
         stub_.set(ADDR(MetaIndexer, ScanLocationsForMaintenance), ScanLocationsForMaintenanceStub);
+        stub_.set(ADDR(MetaIndexer, IsRecovering), IsRecoveringStub);
         stub_.set(ADDR(DataStorageManager, GetDataStorageBackend), GetDataStorageBackendStub);
         stub_.set(ADDR(DataStorageManager, Exist), DataStorageExistStub);
         stub_.set(ADDR(RegistryManager, GetInstanceGroupConfig), GetInstanceGroupConfigStub);
@@ -368,6 +372,7 @@ public:
         scan_positions.clear();
         scan_calls.clear();
         missing_indexers.clear();
+        recovering_instances.clear();
         active_instance_id.clear();
         submitted_requests.clear();
         submitted_event_report_requests.clear();
@@ -1156,6 +1161,128 @@ TEST_F(CacheGarbageCollectorTest, BackendRecoveryGraceDoesNotPauseOrdinaryGcCand
               metrics_registry_
                   ->GetCounter("cache_gc.event_report_probe_unknown_count", {{"cause", "recovery_grace"}})
                   .Get());
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, MetadataRecoverySkipsEventReportAndResumesAfterRecovery) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    config.scan_batch_size = 8;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::string host = "10.0.0.1:9000";
+    ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", host, {"hbm"}));
+    uint64_t generation = 0;
+    ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", host, generation));
+    const std::string location_id = backend->BuildLocationId("hbm", host);
+    const std::string missing_uri = "dummy://dummy_storage/missing?size=1";
+    CacheLocationMap locations{
+        {location_id,
+         MakeStoredLocation(
+             location_id, CLS_SERVING, backend->GetStorageType(), {"event_report://event_report_l1p5/object"})},
+        {"orphan", MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1))},
+        {"missing",
+         MakeStoredLocation("missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_uri})}};
+    might_exist_by_uri[missing_uri] = false;
+    const auto batch = MakeBatch(SCAN_BASE_CURSOR, {101}, {locations});
+    scan_responses["instance_a"] = {{EC_OK, batch}, {EC_OK, batch}, {EC_OK, batch}};
+    recovering_instances.insert("instance_a");
+
+    for (size_t round = 0; round < 2; ++round) {
+        gc->next_round_at_.reset();
+        gc->RunOneTick();
+        ASSERT_EQ(round + 1, submitted_requests.size());
+        ASSERT_EQ(1u, submitted_requests.back().location_ids.size());
+        EXPECT_THAT(submitted_requests.back().location_ids.front(), UnorderedElementsAre("missing", "orphan"));
+        EXPECT_TRUE(submitted_event_report_requests.empty());
+        for (const std::string result : {"keep", "delete", "unknown", "error"}) {
+            EXPECT_EQ(0,
+                      metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", result}}).Get());
+        }
+        EXPECT_FALSE(gc->round_active_);
+    }
+    EXPECT_EQ(2u, might_exist_calls.size());
+
+    recovering_instances.erase("instance_a");
+    gc->next_round_at_.reset();
+    gc->RunOneTick();
+
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{101}), submitted_event_report_requests.front().block_keys);
+    ASSERT_EQ(1u, submitted_event_report_requests.front().targets.size());
+    ASSERT_EQ(1u, submitted_event_report_requests.front().targets.front().size());
+    EXPECT_EQ(location_id, submitted_event_report_requests.front().targets.front().front().location_id);
+    EXPECT_EQ(1, metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}).Get());
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, MetadataRecoveryDoesNotPauseOtherInstancesEventReportCleanup) {
+    AddInstance("group_a", "instance_b");
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::string host = "10.0.0.1:9000";
+    for (const std::string instance_id : {"instance_a", "instance_b"}) {
+        ASSERT_EQ(EC_OK, backend->RegisterNode(instance_id, host, {"hbm"}));
+        uint64_t generation = 0;
+        ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown(instance_id, host, generation));
+        const std::string location_id = backend->BuildLocationId("hbm", host);
+        CacheLocationMap locations{
+            {location_id,
+             MakeStoredLocation(
+                 location_id, CLS_SERVING, backend->GetStorageType(), {"event_report://event_report_l1p5/object"})}};
+        scan_responses[instance_id] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {101}, {locations})}};
+    }
+    recovering_instances.insert("instance_a");
+
+    gc->RunOneTick();
+    EXPECT_TRUE(submitted_event_report_requests.empty());
+    gc->RunOneTick();
+
+    ASSERT_EQ(2u, scan_calls.size());
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ("instance_b", submitted_event_report_requests.front().instance_id);
+    EXPECT_EQ(1, metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}).Get());
+    backend->Close();
+}
+
+TEST_F(CacheGarbageCollectorTest, BufferedEventReportBatchRechecksMetadataRecovery) {
+    auto config = DefaultConfig();
+    config.event_report_cleanup_enabled = true;
+    config.scan_batch_size = 4;
+    config.event_report_action_batch_size = 1;
+    auto gc = MakeGc(config);
+    PrepareForSingleStep(*gc);
+
+    auto backend = AddEventReportBackend("event_report_l1p5");
+    const std::string host = "10.0.0.1:9000";
+    ASSERT_EQ(EC_OK, backend->RegisterNode("instance_a", host, {"hbm"}));
+    uint64_t generation = 0;
+    ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", host, generation));
+    const std::string location_id = backend->BuildLocationId("hbm", host);
+    CacheLocationMap locations{
+        {location_id,
+         MakeStoredLocation(
+             location_id, CLS_SERVING, backend->GetStorageType(), {"event_report://event_report_l1p5/object"})}};
+    scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {101, 202}, {locations, locations})}};
+    recovering_instances.insert("instance_a");
+
+    gc->RunOneTick();
+    EXPECT_TRUE(submitted_event_report_requests.empty());
+    ASSERT_TRUE(gc->round_active_);
+
+    recovering_instances.erase("instance_a");
+    gc->RunOneTick();
+
+    EXPECT_EQ(1u, scan_calls.size());
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{202}), submitted_event_report_requests.front().block_keys);
+    EXPECT_FALSE(gc->round_active_);
     backend->Close();
 }
 
