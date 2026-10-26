@@ -131,6 +131,7 @@ private:
     void BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys);
     void DrainQueue(int queue_id);
     int GetQueueIndexForKey(KeyType key) const noexcept;
+    bool ShouldLogReclaimLruWarning() noexcept;
 
     using CmdArgs = std::vector<std::string>;
     void CompileWriteOp(WriteOp &op, std::vector<CmdArgs> &cmds);
@@ -165,6 +166,9 @@ private:
 
     // Read client pool (for concurrent read operations)
     std::shared_ptr<DynamicClientPool<RedisClient>> read_client_pool_;
+
+    // Shared by sampling threads for this instance; missing LRU fields do not consume the warning budget.
+    std::atomic<int64_t> next_reclaim_lru_warning_time_us_{0};
 
     // Consumer-thread write stats (atomics, reset on read via CAS)
     std::atomic<int64_t> stats_flush_key_count_{0};
