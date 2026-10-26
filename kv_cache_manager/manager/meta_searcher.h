@@ -350,10 +350,16 @@ public:
         std::string location_id;
         CacheLocationStatus expect_status;
     };
+    // Duplicate non-empty (key, location_id) targets with identical conditions
+    // execute and account once; results retain the input shape. Conflicting
+    // conditions reject the whole batch with EC_BADARGS before any mutation.
     ErrorCode BatchCADLocationStatus(RequestContext *request_context,
                                      const KeyVector &keys,
                                      const std::vector<std::vector<LocationCADTask>> &batch_tasks,
                                      std::vector<std::vector<ErrorCode>> &out_batch_results);
+    // Duplicate non-empty (key, location_id) targets with identical conditions
+    // execute and account once; results retain the input shape. Conflicting
+    // conditions reject the whole batch with EC_BADARGS before any mutation.
     ErrorCode BatchDeleteLocations(RequestContext *request_context,
                                    const KeyVector &keys,
                                    const LocationIdsPerKey &location_ids_per_key,

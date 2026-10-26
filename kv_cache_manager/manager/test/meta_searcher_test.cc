@@ -222,6 +222,7 @@ public:
     }
 
     void FailSyncCall(size_t call_index) { fail_sync_call_ = call_index; }
+    void SetFailLocationDelete(bool fail) { fail_location_delete_ = fail; }
 
     const std::vector<std::string> &Events() const { return events_; }
 
@@ -247,6 +248,15 @@ public:
         return MetaLocalBackend::GetLocationsForMaintenance(request_context, keys, location_ids, out_locations);
     }
 
+    std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
+                                           const KeyTypeVec &keys,
+                                           const LocationIdsPerKey &location_ids) noexcept override {
+        if (fail_location_delete_) {
+            return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+        }
+        return MetaLocalBackend::DeleteLocations(request_context, keys, location_ids);
+    }
+
     std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
                                                          const KeyTypeVec &keys,
                                                          const LocationIdsPerKey &location_ids) noexcept override {
@@ -265,6 +275,7 @@ private:
     std::vector<std::string> events_;
     size_t sync_call_count_{0};
     size_t fail_sync_call_{0};
+    bool fail_location_delete_{false};
 };
 
 class RecordingGetLocationsBackend : public MetaLocalBackend {
@@ -3611,6 +3622,336 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationsTracksStorageUsage) {
     EXPECT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
     EXPECT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     EXPECT_EQ(10, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+}
+
+class DuplicateLocationDeletesTest : public MetaSearcherTest {
+public:
+    static constexpr DataStorageType kStorageType = DataStorageType::DATA_STORAGE_TYPE_NFS;
+
+    void SeedLocation(KeyType key,
+                      const std::string &location_id,
+                      uint64_t size,
+                      CacheLocationStatus status = CLS_DELETING) {
+        CacheLocationMapVector existing_locations;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, {}, existing_locations));
+        ASSERT_EQ(1u, existing_locations.size());
+        const auto initial_key_count = meta_indexer_->GetKeyCount();
+        const bool creates_key = existing_locations[0].empty();
+        std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+            {location_id,
+             kStorageType,
+             status,
+             {LocationSpec("tp0", "file:///tmp/duplicate-location-delete?size=" + std::to_string(size))}},
+        }};
+        std::vector<ErrorCode> results;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, tasks, results));
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), results);
+        ASSERT_EQ(initial_key_count + (creates_key ? 1 : 0), meta_indexer_->GetKeyCount());
+    }
+
+    ErrorCode Delete(bool use_cad,
+                     const KeyVector &keys,
+                     const LocationIdsPerKey &ids,
+                     std::vector<std::vector<ErrorCode>> &results) {
+        if (!use_cad) {
+            return meta_searcher_->BatchDeleteLocations(request_context_.get(), keys, ids, results);
+        }
+        std::vector<std::vector<MetaSearcher::LocationCADTask>> tasks(ids.size());
+        for (size_t i = 0; i < ids.size(); ++i) {
+            for (const auto &id : ids[i]) {
+                tasks[i].push_back({id, CLS_DELETING});
+            }
+        }
+        return meta_searcher_->BatchCADLocationStatus(request_context_.get(), keys, tasks, results);
+    }
+};
+
+TEST_F(DuplicateLocationDeletesTest, RepeatedTargetsAccountOnceAndPreserveResultShape) {
+    KeyType next_key = 91000;
+    for (const bool use_cad : {false, true}) {
+        for (size_t shape = 0; shape < 3; ++shape) {
+            SCOPED_TRACE(::testing::Message() << "cad=" << use_cad << " shape=" << shape);
+            const KeyType deleted_key = next_key++;
+            const KeyType retained_key = next_key++;
+            const uint64_t initial_usage = meta_indexer_->GetStorageUsageByType(kStorageType);
+            const auto initial_key_count = meta_indexer_->GetKeyCount();
+            SeedLocation(deleted_key, "deleted", 17);
+            SeedLocation(retained_key, "retained", 101, CLS_SERVING);
+            ASSERT_EQ(initial_usage + 118, meta_indexer_->GetStorageUsageByType(kStorageType));
+
+            const std::vector<KeyVector> keys = {
+                {deleted_key, deleted_key, deleted_key}, {deleted_key}, {deleted_key, deleted_key}};
+            const std::vector<LocationIdsPerKey> ids = {
+                {{"deleted"}, {"deleted"}, {"deleted"}},
+                {{"deleted", "deleted", "deleted"}},
+                {{"deleted", "deleted"}, {"deleted"}},
+            };
+            std::vector<std::vector<ErrorCode>> expected;
+            for (const auto &row : ids[shape]) {
+                expected.emplace_back(row.size(), EC_OK);
+            }
+            std::vector<std::vector<ErrorCode>> results;
+            ASSERT_EQ(EC_OK, Delete(use_cad, keys[shape], ids[shape], results));
+            EXPECT_EQ(expected, results);
+            // A surviving location of the same type prevents saturating subtraction
+            // from hiding repeated charges: 118 - 17 is 101, not 118 - 3 * 17.
+            EXPECT_EQ(initial_usage + 101, meta_indexer_->GetStorageUsageByType(kStorageType));
+            EXPECT_EQ(initial_key_count + 1, meta_indexer_->GetKeyCount());
+
+            CacheLocationMapVector maps;
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->BatchGetLocation(request_context_.get(), {deleted_key, retained_key}, {}, maps));
+            ASSERT_EQ(2u, maps.size());
+            EXPECT_TRUE(maps[0].empty());
+            EXPECT_EQ(1u, maps[1].count("retained"));
+
+            for (auto &row : expected) {
+                std::fill(row.begin(), row.end(), EC_NOENT);
+            }
+            ASSERT_EQ(EC_OK, Delete(use_cad, keys[shape], ids[shape], results));
+            EXPECT_EQ(expected, results);
+            EXPECT_EQ(initial_usage + 101, meta_indexer_->GetStorageUsageByType(kStorageType));
+            EXPECT_EQ(initial_key_count + 1, meta_indexer_->GetKeyCount());
+        }
+    }
+}
+
+TEST_F(DuplicateLocationDeletesTest, DistinguishesKeysAndPreservesPerLocationMismatches) {
+    KeyType next_key = 92000;
+    for (const bool use_cad : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "cad=" << use_cad);
+        const KeyType first_key = next_key++;
+        const KeyType second_key = next_key++;
+        const KeyType healthy_key = next_key++;
+        const uint64_t initial_usage = meta_indexer_->GetStorageUsageByType(kStorageType);
+        const auto initial_key_count = meta_indexer_->GetKeyCount();
+        SeedLocation(first_key, "shared_id", 17);
+        SeedLocation(second_key, "shared_id", 23);
+        SeedLocation(first_key, "mismatch", 5, CLS_SERVING);
+        SeedLocation(healthy_key, "healthy", 101, CLS_SERVING);
+
+        CacheLocationMapVector before;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {first_key, second_key}, {}, before));
+        ASSERT_EQ(2u, before.size());
+        const std::string first_value = before[0].at("shared_id")->ToJsonString();
+        const std::string second_value = before[1].at("shared_id")->ToJsonString();
+        const KeyVector keys{first_key, second_key, first_key, first_key};
+        const LocationIdsPerKey ids{{"shared_id"}, {"shared_id"}, {"mismatch", "shared_id"}, {"mismatch"}};
+        std::vector<std::vector<ErrorCode>> results;
+        if (use_cad) {
+            ASSERT_EQ(EC_OK, Delete(true, keys, ids, results));
+        } else {
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->BatchDeleteLocations(
+                          request_context_.get(),
+                          keys,
+                          ids,
+                          results,
+                          {{first_value}, {second_value}, {"stale", first_value}, {"stale"}}));
+        }
+        EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}, {EC_OK}, {EC_MISMATCH, EC_OK}, {EC_MISMATCH}}),
+                  results);
+        EXPECT_EQ(initial_usage + 106, meta_indexer_->GetStorageUsageByType(kStorageType));
+        EXPECT_EQ(initial_key_count + 2, meta_indexer_->GetKeyCount());
+
+        CacheLocationMapVector after;
+        ASSERT_EQ(
+            EC_OK,
+            meta_searcher_->BatchGetLocation(request_context_.get(), {first_key, second_key, healthy_key}, {}, after));
+        ASSERT_EQ(3u, after.size());
+        ASSERT_EQ(1u, after[0].size());
+        EXPECT_EQ(1u, after[0].count("mismatch"));
+        EXPECT_TRUE(after[1].empty());
+        EXPECT_EQ(1u, after[2].count("healthy"));
+    }
+}
+
+TEST_F(DuplicateLocationDeletesTest, ConflictingConditionsRejectTheEntireBatchBeforeWriting) {
+    KeyType next_key = 93000;
+    for (const bool use_cad : {false, true}) {
+        for (const bool across_rows : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "cad=" << use_cad << " across_rows=" << across_rows);
+            const KeyType duplicate_key = next_key++;
+            const KeyType other_key = next_key++;
+            const uint64_t initial_usage = meta_indexer_->GetStorageUsageByType(kStorageType);
+            const auto initial_key_count = meta_indexer_->GetKeyCount();
+            SeedLocation(duplicate_key, "duplicate", 17);
+            SeedLocation(other_key, "other", 101);
+            CacheLocationMapVector before;
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->BatchGetLocation(request_context_.get(), {duplicate_key, other_key}, {}, before));
+            ASSERT_EQ(2u, before.size());
+            const std::string duplicate_value = before[0].at("duplicate")->ToJsonString();
+            const std::string other_value = before[1].at("other")->ToJsonString();
+
+            const KeyVector keys =
+                across_rows ? KeyVector{duplicate_key, duplicate_key, other_key} : KeyVector{duplicate_key, other_key};
+            const LocationIdsPerKey ids = across_rows ? LocationIdsPerKey{{"duplicate"}, {"duplicate"}, {"other"}}
+                                                      : LocationIdsPerKey{{"duplicate", "duplicate"}, {"other"}};
+            std::vector<std::vector<MetaSearcher::LocationCADTask>> tasks(ids.size());
+            std::vector<std::vector<std::string>> expected_values(ids.size());
+            std::vector<std::vector<ErrorCode>> expected_results;
+            for (size_t i = 0; i < ids.size(); ++i) {
+                expected_results.emplace_back(ids[i].size(), EC_BADARGS);
+                for (size_t j = 0; j < ids[i].size(); ++j) {
+                    const bool conflicting_slot = across_rows ? i == 1 : i == 0 && j == 1;
+                    tasks[i].push_back({ids[i][j], conflicting_slot ? CLS_SERVING : CLS_DELETING});
+                    expected_values[i].push_back(conflicting_slot
+                                                     ? (across_rows ? "" : "different-generation")
+                                                     : (keys[i] == duplicate_key ? duplicate_value : other_value));
+                }
+            }
+            std::vector<std::vector<ErrorCode>> results;
+            if (use_cad) {
+                EXPECT_EQ(EC_BADARGS,
+                          meta_searcher_->BatchCADLocationStatus(request_context_.get(), keys, tasks, results));
+            } else {
+                EXPECT_EQ(
+                    EC_BADARGS,
+                    meta_searcher_->BatchDeleteLocations(request_context_.get(), keys, ids, results, expected_values));
+            }
+            EXPECT_EQ(expected_results, results);
+            EXPECT_EQ(initial_usage + 118, meta_indexer_->GetStorageUsageByType(kStorageType));
+            EXPECT_EQ(initial_key_count + 2, meta_indexer_->GetKeyCount());
+            CacheLocationMapVector after;
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->BatchGetLocation(request_context_.get(), {duplicate_key, other_key}, {}, after));
+            ASSERT_EQ(2u, after.size());
+            ASSERT_EQ(1u, after[0].count("duplicate"));
+            ASSERT_EQ(1u, after[1].count("other"));
+            EXPECT_EQ(duplicate_value, after[0].at("duplicate")->ToJsonString());
+            EXPECT_EQ(other_value, after[1].at("other")->ToJsonString());
+        }
+    }
+}
+
+TEST_F(DuplicateLocationDeletesTest, DeleteFlagsAndMaintenanceReclaimFinalLocationsOnce) {
+    KeyType next_key = 94000;
+    for (const bool maintenance : {false, true}) {
+        for (const bool adjust_usage : {false, true}) {
+            for (const bool adjust_key_count : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << "maintenance=" << maintenance << " usage=" << adjust_usage
+                                                  << " key_count=" << adjust_key_count);
+                const KeyType deleted_key = next_key++;
+                const KeyType healthy_key = next_key++;
+                const uint64_t initial_usage = meta_indexer_->GetStorageUsageByType(kStorageType);
+                const auto initial_key_count = meta_indexer_->GetKeyCount();
+                SeedLocation(deleted_key, "first", 17);
+                SeedLocation(deleted_key, "second", 19);
+                SeedLocation(healthy_key, "healthy", 101, CLS_SERVING);
+                CacheLocationMapVector before;
+                ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {deleted_key}, {}, before));
+                ASSERT_EQ(1u, before.size());
+                const std::string first_value = before[0].at("first")->ToJsonString();
+                const std::string second_value = before[0].at("second")->ToJsonString();
+
+                std::vector<std::vector<ErrorCode>> results;
+                ASSERT_EQ(
+                    EC_OK,
+                    meta_searcher_->BatchDeleteLocations(request_context_.get(),
+                                                         {deleted_key, deleted_key, deleted_key},
+                                                         {{"first", "second"}, {"first"}, {"second"}},
+                                                         results,
+                                                         {{first_value, second_value}, {first_value}, {second_value}},
+                                                         adjust_usage,
+                                                         adjust_key_count,
+                                                         maintenance));
+                EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK, EC_OK}, {EC_OK}, {EC_OK}}), results);
+                EXPECT_EQ(initial_usage + (adjust_usage ? 101 : 137),
+                          meta_indexer_->GetStorageUsageByType(kStorageType));
+                EXPECT_EQ(initial_key_count + (adjust_key_count ? 1 : 2), meta_indexer_->GetKeyCount());
+                CacheLocationMapVector after;
+                ASSERT_EQ(
+                    EC_OK,
+                    meta_searcher_->BatchGetLocation(request_context_.get(), {deleted_key, healthy_key}, {}, after));
+                ASSERT_EQ(2u, after.size());
+                EXPECT_TRUE(after[0].empty());
+                EXPECT_EQ(1u, after[1].count("healthy"));
+            }
+        }
+    }
+}
+
+TEST_F(DuplicateLocationDeletesTest, FailedBackendDeleteKeepsUsageUntilSuccessfulRetry) {
+    auto *backend = ReplaceWithMaintenanceBarrierBackend();
+    ASSERT_NE(nullptr, backend);
+    KeyType next_key = 94500;
+    for (const bool use_cad : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "cad=" << use_cad);
+        const KeyType deleted_key = next_key++;
+        const KeyType healthy_key = next_key++;
+        const uint64_t initial_usage = meta_indexer_->GetStorageUsageByType(kStorageType);
+        const auto initial_key_count = meta_indexer_->GetKeyCount();
+        SeedLocation(deleted_key, "deleted", 17);
+        SeedLocation(healthy_key, "healthy", 101, CLS_SERVING);
+        const KeyVector keys{deleted_key, deleted_key};
+        const LocationIdsPerKey ids{{"deleted", "deleted"}, {"deleted"}};
+
+        backend->SetFailLocationDelete(true);
+        std::vector<std::vector<ErrorCode>> results;
+        EXPECT_EQ(EC_ERROR, Delete(use_cad, keys, ids, results));
+        EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_ERROR, EC_ERROR}, {EC_ERROR}}), results);
+        EXPECT_EQ(initial_usage + 118, meta_indexer_->GetStorageUsageByType(kStorageType));
+        EXPECT_EQ(initial_key_count + 2, meta_indexer_->GetKeyCount());
+        CacheLocationMapVector maps;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->BatchGetLocation(request_context_.get(), {deleted_key, healthy_key}, {}, maps));
+        ASSERT_EQ(2u, maps.size());
+        EXPECT_EQ(1u, maps[0].count("deleted"));
+        EXPECT_EQ(1u, maps[1].count("healthy"));
+
+        backend->SetFailLocationDelete(false);
+        ASSERT_EQ(EC_OK, Delete(use_cad, keys, ids, results));
+        EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK, EC_OK}, {EC_OK}}), results);
+        EXPECT_EQ(initial_usage + 101, meta_indexer_->GetStorageUsageByType(kStorageType));
+        EXPECT_EQ(initial_key_count + 1, meta_indexer_->GetKeyCount());
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->BatchGetLocation(request_context_.get(), {deleted_key, healthy_key}, {}, maps));
+        ASSERT_EQ(2u, maps.size());
+        EXPECT_TRUE(maps[0].empty());
+        EXPECT_EQ(1u, maps[1].count("healthy"));
+    }
+}
+
+TEST_F(DuplicateLocationDeletesTest, EmptyIdsAndRowsKeepTheirExistingResults) {
+    KeyType next_key = 95000;
+    for (const bool use_cad : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "cad=" << use_cad);
+        const KeyType deleted_key = next_key++;
+        const KeyType healthy_key = next_key++;
+        const uint64_t initial_usage = meta_indexer_->GetStorageUsageByType(kStorageType);
+        const auto initial_key_count = meta_indexer_->GetKeyCount();
+        SeedLocation(deleted_key, "deleted", 17);
+        SeedLocation(healthy_key, "healthy", 101, CLS_SERVING);
+        CacheLocationMapVector before;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {deleted_key}, {}, before));
+        ASSERT_EQ(1u, before.size());
+        const std::string expected_value = before[0].at("deleted")->ToJsonString();
+        const KeyVector keys{deleted_key, deleted_key, deleted_key};
+        const LocationIdsPerKey ids{{}, {"", "deleted"}, {""}};
+        std::vector<std::vector<ErrorCode>> results;
+        if (use_cad) {
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->BatchCADLocationStatus(
+                          request_context_.get(),
+                          keys,
+                          {{}, {{"", CLS_SERVING}, {"deleted", CLS_DELETING}}, {{"", CLS_WRITING}}},
+                          results));
+        } else {
+            ASSERT_EQ(EC_OK,
+                      meta_searcher_->BatchDeleteLocations(
+                          request_context_.get(), keys, ids, results, {{}, {"first", expected_value}, {"second"}}));
+        }
+        EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{}, {EC_NOENT, EC_OK}, {EC_NOENT}}), results);
+        EXPECT_EQ(initial_usage + 101, meta_indexer_->GetStorageUsageByType(kStorageType));
+        EXPECT_EQ(initial_key_count + 1, meta_indexer_->GetKeyCount());
+
+        results = {{EC_ERROR}};
+        EXPECT_EQ(EC_OK, Delete(use_cad, {}, {}, results));
+        EXPECT_TRUE(results.empty());
+        EXPECT_EQ(initial_usage + 101, meta_indexer_->GetStorageUsageByType(kStorageType));
+        EXPECT_EQ(initial_key_count + 1, meta_indexer_->GetKeyCount());
+    }
 }
 
 TEST_F(MetaSearcherTest, TestBatchDeleteLocationsCanPreserveKeyCountForUncertainAddRollback) {
