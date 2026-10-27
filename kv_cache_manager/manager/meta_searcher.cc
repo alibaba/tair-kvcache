@@ -2462,7 +2462,10 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
             new_location->set_type(task.type);
             new_location->set_status(task.status);
             new_location->set_spec_size(new_location->location_specs().size());
-            new_location->set_create_time(batch_create_time);
+            // A snapshot refreshes the same reporter-owned location, not its lifetime.
+            new_location->set_create_time(IsEventReportStorageType(task.type) && usage.has_old
+                                              ? locations[location_index]->create_time()
+                                              : batch_create_time);
             new_location->set_validated_total_size(usage.new_size);
             locations[location_index] = std::move(new_location);
             updated = true;
@@ -2844,7 +2847,10 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecsImpl(RequestContext *request_cont
         }
         new_location->set_type(task.type);
         new_location->set_status(task.status);
-        new_location->set_create_time(batch_create_time);
+        // Repeated ADDs and spec updates keep the first observation time.
+        new_location->set_create_time(IsEventReportStorageType(task.type) && usage.has_old
+                                          ? existing_location->create_time()
+                                          : batch_create_time);
         new_location->set_spec_size(new_location->location_specs().size());
         if (final_specs_validated) {
             new_location->set_validated_total_size(usage.new_size);
@@ -2998,7 +3004,11 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
                                                  const std::vector<std::vector<DeleteLocationSpecsTask>> &tasks_per_key,
                                                  std::vector<std::vector<ErrorCode>> &out_batch_results,
                                                  std::vector<std::vector<bool>> *out_missing_targets,
-                                                 AcquireMetadataWriteLeaseFunc acquire_write_lease) {
+                                                 AcquireMetadataWriteLeaseFunc acquire_write_lease,
+                                                 DeletedLocationAgeStats *out_create_age_stats) {
+    if (out_create_age_stats) {
+        *out_create_age_stats = {};
+    }
     if (keys.size() != tasks_per_key.size()) {
         return EC_BADARGS;
     }
@@ -3057,6 +3067,10 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
         return EC_OK;
     }
 
+    // Age candidates are captured under the existing RMW shard lock, then
+    // admitted only after the corresponding metadata delete succeeds.
+    std::vector<int64_t> deleted_location_ages(out_create_age_stats ? flat_keys.size() : 0, -1);
+
     // 每条 flat task 独立处理：NOENT 视为幂等成功；spec_names 为空返回 BADARGS；
     // 删除后无剩余 specs 则删除整个 location，否则 COW 更新 location_specs。
     bool write_lease_attempted = false;
@@ -3067,6 +3081,7 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
                      &flat_to_original_task_indices,
                      &flat_deleted_specs_size,
                      &flat_missing_targets,
+                     &deleted_location_ages,
                      &acquire_write_lease,
                      &write_lease_attempted,
                      &write_lease_ec,
@@ -3142,6 +3157,12 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
         const std::uint64_t deleted_specs_size = GetLocationSpecsSize(deleted_specs);
         flat_deleted_specs_size[key_index] = std::make_pair(locs[0]->type(), deleted_specs_size);
         if (kept_specs.empty()) {
+            if (!deleted_location_ages.empty() && locs[0]->create_time() > 0) {
+                const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
+                if (now_us >= locs[0]->create_time()) {
+                    deleted_location_ages[key_index] = now_us - locs[0]->create_time();
+                }
+            }
             return {ModifierAction::MA_DELETE, std::move(modifier_ecs)};
         }
 
@@ -3185,12 +3206,24 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
     }
 
     // 只有实际删除了 specs 且 RMW 成功时，才扣减 storage usage。
+    __int128 create_age_sum = 0;
     for (size_t i = 0; i < flat_to_original_task_indices.size(); ++i) {
         const auto [original_key_index, original_task_index] = flat_to_original_task_indices[i];
         if (out_batch_results[original_key_index][original_task_index] == ErrorCode::EC_OK &&
             flat_deleted_specs_size[i].first != DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
             meta_indexer_->SubStorageUsageByType(flat_deleted_specs_size[i].first, flat_deleted_specs_size[i].second);
+            if (out_create_age_stats && deleted_location_ages[i] >= 0) {
+                const int64_t age_us = deleted_location_ages[i];
+                auto &stats = *out_create_age_stats;
+                stats.min_us = stats.count == 0 ? age_us : std::min(stats.min_us, age_us);
+                stats.max_us = std::max(stats.max_us, age_us);
+                ++stats.count;
+                create_age_sum += age_us;
+            }
         }
+    }
+    if (out_create_age_stats && out_create_age_stats->count > 0) {
+        out_create_age_stats->avg_us = static_cast<int64_t>(create_age_sum / out_create_age_stats->count);
     }
 
     if (result.ec != ErrorCode::EC_OK) {

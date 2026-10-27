@@ -17,6 +17,7 @@
 #include <type_traits>
 
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
@@ -207,6 +208,30 @@ private:
     bool fail_upsert_ = false;
     bool fail_sync_ = false;
     std::optional<KeyType> get_locations_failed_key_;
+};
+
+class LifetimeDeleteBackend : public MetaLocalBackend {
+public:
+    std::optional<KeyType> failed_key;
+    size_t target_reads = 0;
+
+    std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *ctx,
+                                                     const KeyTypeVec &keys,
+                                                     const LocationIdsPerKey &ids,
+                                                     LocationsPerKey &locations) noexcept override {
+        target_reads += keys.size();
+        return MetaLocalBackend::GetLocations(ctx, keys, ids, locations);
+    }
+
+    std::vector<ErrorCode>
+    DeleteLocations(RequestContext *ctx, const KeyTypeVec &keys, const LocationIdsPerKey &ids) noexcept override {
+        std::vector<ErrorCode> results(keys.size(), EC_OK);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i] =
+                failed_key == keys[i] ? EC_ERROR : MetaLocalBackend::DeleteLocations(ctx, {keys[i]}, {ids[i]}).front();
+        }
+        return results;
+    }
 };
 
 class MaintenanceBarrierBackend : public MetaLocalBackend {
@@ -5716,4 +5741,165 @@ TEST_F(HostCacheRemoteTest, BaseSelectionIsSharedAcrossHostsAndHonorsPolicy) {
     ASSERT_EQ(2u, matches.size());
     EXPECT_EQ(1, matches[0].global);
     EXPECT_EQ(1, matches[1].global);
+}
+
+class LocationLifetimeTest : public MetaSearcherTest {
+public:
+    void SetUp() override {
+        MetaSearcherTest::SetUp();
+        auto backend = std::make_unique<LifetimeDeleteBackend>();
+        ASSERT_EQ(EC_OK, backend->Init("test", ConstructMetaStorageBackendConfig()));
+        ASSERT_EQ(EC_OK, backend->Open());
+        backend_ = backend.get();
+        meta_indexer_->backend_manager_->persistent_backend_->Close();
+        meta_indexer_->backend_manager_->persistent_backend_ = std::move(backend);
+        meta_indexer_->backend_manager_->cache_backend_.reset();
+    }
+
+    void Seed(const KeyVector &keys,
+              const std::vector<int64_t> &times,
+              DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2) {
+        std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            tasks.push_back({{id_, type, CLS_SERVING, {LocationSpec("tp0", uri_), LocationSpec("tp1", uri_)}}});
+        }
+        std::vector<ErrorCode> results;
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, tasks, results));
+        auto result = meta_indexer_->ReadModifyWriteLocation(
+            request_context_.get(),
+            keys,
+            LocationIdsPerKey(keys.size(), {id_}),
+            [&times](const auto &ecs, const auto &, size_t index, CacheLocationVector &locations, auto &) {
+                auto location = std::make_shared<CacheLocation>(*locations.front());
+                location->set_create_time(times[index]);
+                locations.front() = std::move(location);
+                return LocationModifierResult{MA_OK, ecs};
+            });
+        ASSERT_EQ(EC_OK, result.ec);
+    }
+
+    CacheLocationConstPtr Read(int64_t key) {
+        std::vector<CacheLocationMap> maps;
+        EXPECT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, BlockMask{}, maps));
+        return maps.at(0).at(id_);
+    }
+
+    ErrorCode Delete(const KeyVector &keys,
+                     const std::vector<std::string> &specs,
+                     MetaSearcher::DeletedLocationAgeStats &stats,
+                     MetaSearcher::AcquireMetadataWriteLeaseFunc lease = nullptr) {
+        std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> tasks(keys.size(), {{id_, specs}});
+        std::vector<std::vector<ErrorCode>> results;
+        return meta_searcher_->BatchDeleteLocationSpecs(
+            request_context_.get(), keys, tasks, results, nullptr, lease, &stats);
+    }
+
+    const std::string id_ = "kvs#event_report_l2#mem#lifetime-host:8080";
+    const std::string uri_ = "event_report://lifetime-host:8080/mem?size=1";
+    LifetimeDeleteBackend *backend_ = nullptr;
+};
+
+TEST_F(LocationLifetimeTest, PreservesEventReportCreationOnMergeAndSnapshot) {
+    for (const auto type : {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
+                            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                            DataStorageType::DATA_STORAGE_TYPE_NFS}) {
+        const int64_t key = static_cast<int64_t>(type);
+        Seed({key}, {123}, type);
+        std::vector<ErrorCode> results;
+        std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge = {
+            {{id_, type, CLS_SERVING, {LocationSpec("tp0", uri_)}}}};
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {key}, merge, results));
+        EXPECT_EQ(IsEventReportStorageType(type), Read(key)->create_time() == 123);
+
+        std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> snapshot = {
+            {{id_, type, CLS_SERVING, {LocationSpec("tp0", uri_)}}}};
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), {key}, snapshot, results));
+        EXPECT_EQ(IsEventReportStorageType(type), Read(key)->create_time() == 123);
+
+        // The single-spec replacement constructs a fresh CacheLocation rather than copying it.
+        std::vector<MetaSearcher::MergeLocationSpecsTask> flat = merge.front();
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->BatchMergeLocationSpecsFlat(request_context_.get(), {key}, {0, 1}, flat, results));
+        EXPECT_EQ(IsEventReportStorageType(type), Read(key)->create_time() == 123);
+    }
+}
+
+TEST_F(LocationLifetimeTest, CountsOnlyWholeSuccessfulDeletesAndUsesOneRead) {
+    const int64_t now = TimestampUtil::GetCurrentTimeUs();
+    Seed({101, 102}, {now - 1000000, now - 3000000});
+    MetaSearcher::DeletedLocationAgeStats stats;
+    ASSERT_EQ(EC_OK, Delete({101, 102}, {"tp0"}, stats));
+    EXPECT_EQ(0u, stats.count);
+    EXPECT_EQ(now - 1000000, Read(101)->create_time());
+    ASSERT_EQ(EC_OK, Delete({101, 102}, {"missing"}, stats));
+    EXPECT_EQ(0u, stats.count);
+
+    backend_->target_reads = 0;
+    ASSERT_EQ(EC_OK, Delete({101, 102}, {"tp1"}, stats));
+    const int64_t elapsed = TimestampUtil::GetCurrentTimeUs() - now;
+    EXPECT_EQ(2u, backend_->target_reads);
+    ASSERT_EQ(2u, stats.count);
+    EXPECT_GE(stats.min_us, 1000000);
+    EXPECT_LE(stats.min_us, 1000000 + elapsed);
+    EXPECT_GE(stats.max_us, 3000000);
+    EXPECT_LE(stats.max_us, 3000000 + elapsed);
+    EXPECT_GE(stats.avg_us, 2000000);
+    EXPECT_LE(stats.avg_us, 2000000 + elapsed);
+
+    ASSERT_EQ(EC_OK, Delete({101, 102, 999}, {"tp0", "tp1"}, stats));
+    EXPECT_EQ(0u, stats.count);
+    std::vector<CacheLocationMap> maps;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {101, 102}, BlockMask{}, maps));
+    EXPECT_TRUE(maps[0].empty());
+    EXPECT_TRUE(maps[1].empty());
+
+    const int64_t before_recreate = TimestampUtil::GetCurrentTimeUs();
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge = {
+        {{id_, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, CLS_SERVING, {LocationSpec("tp0", uri_)}}}};
+    std::vector<ErrorCode> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), {101}, merge, results));
+    EXPECT_GE(Read(101)->create_time(), before_recreate);
+}
+
+TEST_F(LocationLifetimeTest, ExcludesFailedDeletesAndCountsRetryOnce) {
+    Seed({201, 202}, {123, 456});
+    backend_->failed_key = 202;
+    MetaSearcher::DeletedLocationAgeStats stats;
+    EXPECT_NE(EC_OK, Delete({201, 202}, {"tp0", "tp1"}, stats));
+    EXPECT_EQ(1u, stats.count);
+    EXPECT_EQ(stats.min_us, stats.max_us);
+    EXPECT_EQ(stats.min_us, stats.avg_us);
+    EXPECT_EQ(456, Read(202)->create_time());
+
+    backend_->failed_key.reset();
+    ASSERT_EQ(EC_OK, Delete({201, 202}, {"tp0", "tp1"}, stats));
+    EXPECT_EQ(1u, stats.count);
+    ASSERT_EQ(EC_OK, Delete({201, 202}, {"tp0", "tp1"}, stats));
+    EXPECT_EQ(0u, stats.count);
+}
+
+TEST_F(LocationLifetimeTest, IgnoresInvalidTimestampsAndFencedDeletes) {
+    Seed({301, 302, 303}, {0, std::numeric_limits<int64_t>::max(), 123});
+    MetaSearcher::DeletedLocationAgeStats stats;
+    auto reject = [] { return std::make_pair(EC_NODE_NOT_REGISTERED, MetaSearcher::MetadataWriteLease{}); };
+    EXPECT_NE(EC_OK, Delete({301, 302, 303}, {"tp0", "tp1"}, stats, reject));
+    EXPECT_EQ(0u, stats.count);
+    ASSERT_EQ(EC_OK, Delete({301, 302, 303}, {"tp0", "tp1"}, stats));
+    EXPECT_EQ(1u, stats.count);
+}
+
+TEST_F(LocationLifetimeTest, ConcurrentDeletesObserveOneLifetime) {
+    Seed({401}, {123});
+    auto remove = [this] {
+        RequestContext context("concurrent_lifetime_delete");
+        std::vector<std::vector<MetaSearcher::DeleteLocationSpecsTask>> tasks = {{{id_, {"tp0", "tp1"}}}};
+        std::vector<std::vector<ErrorCode>> results;
+        MetaSearcher::DeletedLocationAgeStats stats;
+        EXPECT_EQ(EC_OK,
+                  meta_searcher_->BatchDeleteLocationSpecs(&context, {401}, tasks, results, nullptr, nullptr, &stats));
+        return stats.count;
+    };
+    auto first = std::async(std::launch::async, remove);
+    auto second = std::async(std::launch::async, remove);
+    EXPECT_EQ(1u, first.get() + second.get());
 }

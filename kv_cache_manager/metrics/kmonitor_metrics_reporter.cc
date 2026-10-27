@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <limits>
+#include <shared_mutex>
 #include <unordered_map>
 
 #include "kmonitor/client/KMonitorFactory.h"
@@ -226,6 +227,9 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_manager_instance, async_dropped_key_count);
     DECLARE_METRICS(cache_manager_instance, async_dropped_metadata_count);
     DECLARE_METRICS(cache_manager_instance, max_lru_age_us);
+    DECLARE_METRICS(cache_manager_instance, event_report_location_lifetime_min_us);
+    DECLARE_METRICS(cache_manager_instance, event_report_location_lifetime_max_us);
+    DECLARE_METRICS(cache_manager_instance, event_report_location_lifetime_avg_us);
 
     struct MapHashFunc {
         size_t operator()(const std::map<std::string, std::string> &m) const noexcept {
@@ -541,6 +545,9 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_dropped_key_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_dropped_metadata_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, max_lru_age_us);
+    REGISTER_GAUGE_METRIC(cache_manager_instance, event_report_location_lifetime_min_us);
+    REGISTER_GAUGE_METRIC(cache_manager_instance, event_report_location_lifetime_max_us);
+    REGISTER_GAUGE_METRIC(cache_manager_instance, event_report_location_lifetime_avg_us);
 
     return true;
 }
@@ -667,6 +674,15 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::o
         REPORT_METRICS_WHEN(service, error_qps, 1.0, !CommonUtil::IsZeroDouble(error_code));
         if (p->HasRequestKeyCountSample()) {
             REPORT_METRICS(manager, request_key_count, p->GetRequestKeyCountSample());
+        }
+        if (const auto &lifetime = p->GetLocationLifetimeSample()) {
+            const auto lifetime_tags = ctx_->GetKmonitorTags(p->GetLocationLifetimeMetricsTags());
+            ctx_->cache_manager_instance_event_report_location_lifetime_min_us_metrics->Report(
+                &lifetime_tags, static_cast<double>(lifetime->min_us));
+            ctx_->cache_manager_instance_event_report_location_lifetime_max_us_metrics->Report(
+                &lifetime_tags, static_cast<double>(lifetime->max_us));
+            ctx_->cache_manager_instance_event_report_location_lifetime_avg_us_metrics->Report(
+                &lifetime_tags, static_cast<double>(lifetime->avg_us));
         }
     } else if (dynamic_cast<DataStorageMetricsCollector *>(collector)) {
         const auto *p = dynamic_cast<DataStorageMetricsCollector *>(collector);
@@ -1044,10 +1060,8 @@ void KmonitorMetricsReporter::ReportInterval() {
     } while (false);
 
     do {
-        // Cache GC owns both untagged metrics and bounded tagged families
-        // (candidate reason, delete status and error stage). Read the registry
-        // snapshot so KMonitor preserves the same labels as Prometheus/local
-        // reporting instead of maintaining a second hard-coded tag list.
+        // Read registry-owned GC metrics with their native
+        // tags, preserving the same labels as Prometheus/local reporting.
         if (!metrics_registry_) {
             break;
         }

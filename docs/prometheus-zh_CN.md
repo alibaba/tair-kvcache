@@ -174,6 +174,9 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState 普通/Mamba host 前缀归约时间（微秒） |
 | `meta_indexer.search_cache_hit_ratio` | gauge | 搜索缓存命中率 |
 | `data_storage.create_keys_counter` | counter | 已创建 key 总数 |
+| `cache_manager_instance.event_report_location_lifetime_min_us` | gauge | 最近有效 BLOCK_DELETE 批次中，成功删除的 Location 的最短存活时间（微秒） |
+| `cache_manager_instance.event_report_location_lifetime_max_us` | gauge | 同一批次的最长存活时间（微秒） |
+| `cache_manager_instance.event_report_location_lifetime_avg_us` | gauge | 同一批次的平均存活时间（微秒） |
 
 ### 周期性指标
 

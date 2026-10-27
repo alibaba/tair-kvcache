@@ -113,10 +113,10 @@ public:
     std::shared_ptr<RegistryManager> GetRegistryManager() { return registry_manager_; }
     [[nodiscard]] std::shared_ptr<MetricsLifecycle> metrics_lifecycle() const { return metrics_lifecycle_; }
 
-    // register a callback invoked after an instance is fully removed;
-    // must be set before serving traffic (not thread-safe for writes)
-    // the callback runs on the RemoveInstance call stack — callees
-    // must not re-enter CacheManager methods
+    // register a callback to invalidate cached per-instance metric collectors;
+    // invoked during RemoveInstance and leader cleanup under the lifecycle lock.
+    // must be set before serving traffic (not thread-safe for writes);
+    // callees must not re-enter CacheManager methods.
     using OnInstanceRemovedFn = std::function<void(const std::string &instance_id)>;
     void SetOnInstanceRemoved(OnInstanceRemovedFn fn) { on_instance_removed_ = std::move(fn); }
 
@@ -420,7 +420,7 @@ private:
     std::shared_ptr<MetaSearcherManager> meta_searcher_manager_;
     // 需要清理
     std::shared_ptr<DataStorageSelector> data_storage_selector_;
-    // 无需清理 - CacheManager当前没有给MetricsRegistry动态添加新的监控指标
+    // Shared registry for periodic instance metrics and per-request event samples.
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     // 无需清理 - RegistryManager单独进行了清理，不由CacheManager负责
     std::shared_ptr<RegistryManager> registry_manager_;

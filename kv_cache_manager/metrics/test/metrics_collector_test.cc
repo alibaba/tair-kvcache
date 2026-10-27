@@ -41,6 +41,21 @@ TEST_F(MetricsCollectorTest, EventReportMetricsTest) {
     EXPECT_DOUBLE_EQ(10., GET(collector, service, error_code));
 }
 
+TEST_F(MetricsCollectorTest, EventReportLifetimeRequiresDeleteEventAndInstanceTags) {
+    for (const MetricsTags tags :
+         {MetricsTags{{"event_type", "block_delete"}},
+          MetricsTags{{"instance_group", "group_a"}, {"instance_id", "instance_a"}, {"event_type", "block_add"}}}) {
+        EventReportMetricsCollector collector(metrics_registry_, tags);
+        ASSERT_TRUE(collector.Init());
+        collector.SetLocationLifetimeSample({10, 30, 20});
+        EXPECT_FALSE(collector.GetLocationLifetimeSample());
+        EXPECT_TRUE(collector.GetLocationLifetimeMetricsTags().empty());
+        EXPECT_NO_THROW(collector.UpdateLocationLifetimeMetrics());
+    }
+    EXPECT_EQ(nullptr,
+              metrics_registry_->GetMetricsData("cache_manager_instance.event_report_location_lifetime_avg_us"));
+}
+
 // Test MetaIndexer metrics functionality
 TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
     metrics_collector_ = std::make_shared<ServiceMetricsCollector>(metrics_registry_);

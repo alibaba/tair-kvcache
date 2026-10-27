@@ -220,6 +220,10 @@ EventReportMetricsCollector::EventReportMetricsCollector(const EventReportMetric
     service_error_code_metrics_ = shared_collector.service_error_code_metrics_;
     service_error_counter_metrics_ = shared_collector.service_error_counter_metrics_;
     manager_request_key_count_metrics_ = shared_collector.manager_request_key_count_metrics_;
+    location_lifetime_metrics_tags_ = shared_collector.location_lifetime_metrics_tags_;
+    location_lifetime_min_us_metrics_ = shared_collector.location_lifetime_min_us_metrics_;
+    location_lifetime_max_us_metrics_ = shared_collector.location_lifetime_max_us_metrics_;
+    location_lifetime_avg_us_metrics_ = shared_collector.location_lifetime_avg_us_metrics_;
 }
 
 bool EventReportMetricsCollector::Init() {
@@ -231,7 +235,36 @@ bool EventReportMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT_SERVICE(error_code);
     REGISTER_COUNTER_METRICS_FOR_EVENT_REPORT_SERVICE(error_counter);
     REGISTER_GAUGE_METRICS_FOR_EVENT_REPORT_MANAGER(request_key_count);
+    const auto event_type = metrics_tags_.find("event_type");
+    const auto instance_group = metrics_tags_.find("instance_group");
+    const auto instance_id = metrics_tags_.find("instance_id");
+    if (event_type != metrics_tags_.end() && event_type->second == "block_delete" &&
+        instance_group != metrics_tags_.end() && !instance_group->second.empty() &&
+        instance_id != metrics_tags_.end() && !instance_id->second.empty()) {
+        location_lifetime_metrics_tags_ = {{"instance_group", instance_group->second},
+                                           {"instance_id", instance_id->second}};
+        location_lifetime_min_us_metrics_ = metrics_registry_->GetGauge(
+            SCOPED_METRICS_NAME_(
+                CacheManagerInstanceMetricsCollector, cache_manager_instance, event_report_location_lifetime_min_us),
+            location_lifetime_metrics_tags_);
+        location_lifetime_max_us_metrics_ = metrics_registry_->GetGauge(
+            SCOPED_METRICS_NAME_(
+                CacheManagerInstanceMetricsCollector, cache_manager_instance, event_report_location_lifetime_max_us),
+            location_lifetime_metrics_tags_);
+        location_lifetime_avg_us_metrics_ = metrics_registry_->GetGauge(
+            SCOPED_METRICS_NAME_(
+                CacheManagerInstanceMetricsCollector, cache_manager_instance, event_report_location_lifetime_avg_us),
+            location_lifetime_metrics_tags_);
+    }
     return true;
+}
+
+void EventReportMetricsCollector::UpdateLocationLifetimeMetrics() {
+    if (location_lifetime_sample_) {
+        location_lifetime_min_us_metrics_ = static_cast<double>(location_lifetime_sample_->min_us);
+        location_lifetime_max_us_metrics_ = static_cast<double>(location_lifetime_sample_->max_us);
+        location_lifetime_avg_us_metrics_ = static_cast<double>(location_lifetime_sample_->avg_us);
+    }
 }
 
 /* ------------------ DataStorageMetricsCollector ------------------- */
@@ -400,6 +433,15 @@ DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
                                       cache_manager_instance,
                                       async_dropped_metadata_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, max_lru_age_us);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      event_report_location_lifetime_min_us);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      event_report_location_lifetime_max_us);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      event_report_location_lifetime_avg_us);
 
 CacheManagerInstanceMetricsCollector::CacheManagerInstanceMetricsCollector(
     std::shared_ptr<MetricsRegistry> metrics_registry) noexcept
@@ -424,6 +466,9 @@ bool CacheManagerInstanceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_pipeline_error_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_dropped_key_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_dropped_metadata_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, event_report_location_lifetime_min_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, event_report_location_lifetime_max_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, event_report_location_lifetime_avg_us);
 
     return true;
 }
