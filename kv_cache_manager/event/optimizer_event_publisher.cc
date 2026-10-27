@@ -106,8 +106,13 @@ bool OptimizerEventPublisher::Convert(const std::shared_ptr<BaseEvent> &event,
     for (const auto &location_spec_name : get_event->location_spec_names()) {
         out->add_location_spec_names(location_spec_name);
     }
-    // Preserve the producer timestamp, including sub-microsecond precision.
-    out->set_timestamp_ns(get_event->event_trigger_time_ns());
+    // Explicit reports carry producer nanoseconds; ordinary cache reads retain
+    // their existing microsecond-to-nanosecond wire conversion.
+    if (const auto *reported_event = dynamic_cast<const ReportedCacheGetEvent *>(get_event)) {
+        out->set_timestamp_ns(reported_event->reported_timestamp_ns());
+    } else {
+        out->set_timestamp_ns(get_event->event_trigger_time_us() * 1000);
+    }
 
     // Only the token count is needed, never the ids. An empty tokens vector
     // means the caller passed pre-computed keys instead, and then the exact

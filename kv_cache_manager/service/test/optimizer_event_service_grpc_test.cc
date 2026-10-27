@@ -218,7 +218,7 @@ TEST_F(OptimizerEventServiceGRpcTest, TestPublishesCacheReadOverServerStream) {
     ASSERT_TRUE(WaitUntil([this] { return sink_->SubscriberCount() == 1; }));
 
     auto source = MakeGetEvent();
-    const auto event_time_ns = source->event_trigger_time_ns();
+    const auto event_time_ns = source->event_trigger_time_us() * 1000;
     ASSERT_TRUE(publisher_->Publish(source));
 
     proto::optimizer::TraceQueryRequest received;
@@ -314,6 +314,8 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
     auto raw_broadcast_event = std::dynamic_pointer_cast<CacheGetEvent>(capture_publisher_->events.back());
     ASSERT_NE(nullptr, raw_broadcast_event);
     EXPECT_EQ("reported-raw-trace", raw_broadcast_event->trace_id());
+    EXPECT_GT(raw_received.timestamp_ns(), 0);
+    EXPECT_EQ(raw_broadcast_event->event_trigger_time_us() * 1000, raw_received.timestamp_ns());
 
     subscription_context.TryCancel();
     EXPECT_FALSE(reader->Read(&received));

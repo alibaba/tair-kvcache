@@ -1136,11 +1136,12 @@ ErrorCode CacheManager::ReportOptimizerEvent(RequestContext *request_context,
         return EC_ERROR;
     }
 
-    auto event = std::make_shared<CacheGetEvent>(instance_id);
+    std::shared_ptr<CacheGetEvent> event;
     if (timestamp_ns == 0) {
+        event = std::make_shared<CacheGetEvent>(instance_id);
         event->SetEventTriggerTime();
     } else {
-        event->SetEventTriggerTimeNs(timestamp_ns);
+        event = std::make_shared<ReportedCacheGetEvent>(instance_id, timestamp_ns);
     }
     event->set_trace_id(request_context->trace_id());
     event->set_input_token_len(tokens.empty() ? input_token_len : static_cast<int64_t>(tokens.size()));

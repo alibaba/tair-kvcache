@@ -73,6 +73,21 @@ private:
     int64_t input_token_len_{0};
 };
 
+// Explicit optimizer reports retain the producer's nanoseconds. Ordinary cache
+// events keep BaseEvent's microsecond clock and the existing JSON log schema.
+class ReportedCacheGetEvent final : public CacheGetEvent {
+public:
+    ReportedCacheGetEvent(const std::string &source, int64_t timestamp_ns)
+        : CacheGetEvent(source), reported_timestamp_ns_(timestamp_ns) {
+        SetEventTriggerTimeUs(timestamp_ns / 1000);
+    }
+
+    int64_t reported_timestamp_ns() const { return reported_timestamp_ns_; }
+
+private:
+    const int64_t reported_timestamp_ns_;
+};
+
 class StartWriteCacheEvent : public BaseEvent {
 public:
     StartWriteCacheEvent(const std::string &source) : BaseEvent(source, "cache_manager", "StartWriteCache") {}

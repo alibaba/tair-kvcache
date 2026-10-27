@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <memory>
 #include <mutex>
+#include <rapidjson/document.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -157,17 +158,44 @@ TEST_F(OptimizerEventPublisherTest, TestForwardsExplicitInputTokenLen) {
     EXPECT_EQ(5, request.input_token_len());
 }
 
-// Producer nanoseconds are preserved on the wire.
-TEST_F(OptimizerEventPublisherTest, TestTimestampPreservesNanos) {
+// Ordinary cache reads retain their original microsecond precision.
+TEST_F(OptimizerEventPublisherTest, TestOrdinaryTimestampConvertedFromMicros) {
     ASSERT_TRUE(publisher_->Init(""));
     auto event = MakeGetEvent("instance-a", {1}, {1, 2});
-    event->SetEventTriggerTimeNs(123456789123);
-    const std::int64_t trigger_ns = event->event_trigger_time_ns();
+    event->SetEventTriggerTimeUs(123456789);
     ASSERT_TRUE(publisher_->Publish(event));
     ASSERT_TRUE(WaitForEvents(*sink_, 1));
+    EXPECT_EQ(123456789000, sink_->Events()[0].timestamp_ns());
+}
 
-    const auto request = sink_->Events()[0];
-    EXPECT_EQ(trigger_ns, request.timestamp_ns());
+TEST_F(OptimizerEventPublisherTest, TestReportedNanosecondsDoNotChangeOrdinaryEventsOrLogSchema) {
+    ASSERT_TRUE(publisher_->Init(""));
+    auto reported = std::make_shared<ReportedCacheGetEvent>("instance-a", 123456789123);
+    reported->SetAddtionalArgs("prefix_match", {1}, {}, BlockMask(), 0, {});
+    reported->set_input_token_len(2);
+    ASSERT_TRUE(publisher_->Publish(reported));
+
+    auto ordinary = MakeGetEvent("instance-a", {2}, {1, 2});
+    ordinary->SetEventTriggerTimeUs(123456790);
+    ASSERT_TRUE(publisher_->Publish(ordinary));
+    ASSERT_TRUE(WaitForEvents(*sink_, 2));
+    const auto requests = sink_->Events();
+    EXPECT_EQ(123456789123, requests[0].timestamp_ns());
+    EXPECT_EQ(123456790000, requests[1].timestamp_ns());
+
+    // The log publisher serializes this same JSON, including for reported input.
+    rapidjson::Document reported_log;
+    reported_log.Parse(reported->ToJsonString().c_str());
+    ASSERT_FALSE(reported_log.HasParseError());
+    EXPECT_EQ(123456789, reported_log["trigger_time_us"].GetInt64());
+    EXPECT_FALSE(reported_log.HasMember("trigger_time_ns"));
+    EXPECT_STREQ("GetCacheLocation", reported_log["type"].GetString());
+    EXPECT_EQ(2, reported_log["input_token_len"].GetInt64());
+    rapidjson::Document ordinary_log;
+    ordinary_log.Parse(ordinary->ToJsonString().c_str());
+    ASSERT_FALSE(ordinary_log.HasParseError());
+    EXPECT_EQ(123456790, ordinary_log["trigger_time_us"].GetInt64());
+    EXPECT_FALSE(ordinary_log.HasMember("trigger_time_ns"));
 }
 
 // Every publisher on EventManager sees every event, so non-read events must be
