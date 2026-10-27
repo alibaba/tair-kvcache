@@ -1107,13 +1107,19 @@ ErrorCode CacheManager::ReportOptimizerEvent(RequestContext *request_context,
                                              const std::vector<std::string> &location_spec_names) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
-    if (instance_id.empty() || (keys.empty() && tokens.empty()) || input_token_len < 0 || timestamp_ns < 0) {
+    if (instance_id.empty() || (keys.empty() && tokens.empty() && input_token_len == 0) || input_token_len < 0 ||
+        timestamp_ns < 0) {
         request_context->error_tracer()->AddErrorMsg("invalid optimizer event");
         return EC_BADARGS;
     }
 
     auto [ec, block_size] = GetBlockSize(request_context, instance_id);
     RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "get block_size failed");
+
+    if (keys.empty() && tokens.empty() && input_token_len >= block_size) {
+        request_context->error_tracer()->AddErrorMsg("missing complete block keys");
+        return EC_BADARGS;
+    }
 
     KeyVector query_keys = keys;
     if (query_keys.empty()) {
@@ -1134,7 +1140,7 @@ ErrorCode CacheManager::ReportOptimizerEvent(RequestContext *request_context,
     if (timestamp_ns == 0) {
         event->SetEventTriggerTime();
     } else {
-        event->SetEventTriggerTimeUs(timestamp_ns / 1000);
+        event->SetEventTriggerTimeNs(timestamp_ns);
     }
     event->set_trace_id(request_context->trace_id());
     event->set_input_token_len(tokens.empty() ? input_token_len : static_cast<int64_t>(tokens.size()));

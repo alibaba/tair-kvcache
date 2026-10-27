@@ -23,6 +23,11 @@ public:
     void EnableSubscriptions();
     void DisableSubscriptions();
 
+    // Synchronous in-process entry with the same readiness checks and status as RPC.
+    // Callers own submission ordering and must drain calls before server shutdown.
+    void SubmitOptimizerEvent(const proto::optimizer::TraceQueryRequest &request,
+                              proto::optimizer::CommonResponse &response);
+
     grpc::Status GetConfiguration(grpc::ServerContext *context,
                                   const proto::optimizer::KvcmConfigurationRequest *request,
                                   proto::optimizer::KvcmConfigurationResponse *response) override;

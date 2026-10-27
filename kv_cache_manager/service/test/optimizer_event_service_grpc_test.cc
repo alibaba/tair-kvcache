@@ -218,7 +218,7 @@ TEST_F(OptimizerEventServiceGRpcTest, TestPublishesCacheReadOverServerStream) {
     ASSERT_TRUE(WaitUntil([this] { return sink_->SubscriberCount() == 1; }));
 
     auto source = MakeGetEvent();
-    const auto event_time_us = source->event_trigger_time_us();
+    const auto event_time_ns = source->event_trigger_time_ns();
     ASSERT_TRUE(publisher_->Publish(source));
 
     proto::optimizer::TraceQueryRequest received;
@@ -228,7 +228,7 @@ TEST_F(OptimizerEventServiceGRpcTest, TestPublishesCacheReadOverServerStream) {
     EXPECT_EQ((std::vector<std::int64_t>{11, 22, 33}),
               std::vector<std::int64_t>(received.block_keys().begin(), received.block_keys().end()));
     EXPECT_EQ(700, received.input_token_len());
-    EXPECT_EQ(event_time_us * 1000, received.timestamp_ns());
+    EXPECT_EQ(event_time_ns, received.timestamp_ns());
     EXPECT_EQ(0, received.token_ids_size());
     EXPECT_EQ((std::vector<std::string>{"tp0", "tp1"}),
               std::vector<std::string>(received.location_spec_names().begin(), received.location_spec_names().end()));
@@ -318,6 +318,137 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsOptimizerEventWithoutCacheLocat
     subscription_context.TryCancel();
     EXPECT_FALSE(reader->Read(&received));
     EXPECT_EQ(grpc::StatusCode::CANCELLED, reader->Finish().error_code());
+}
+
+TEST_F(OptimizerEventServiceGRpcTest, TestInProcessSubmissionReachesSubscriptionInOrder) {
+    RequestContext seed("seed-in-process");
+    InstanceGroup group;
+    group.set_name("in-process-group");
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&seed, group));
+    ASSERT_EQ(EC_OK,
+              registry_manager_->RegisterInstance(&seed,
+                                                  "in-process-group",
+                                                  "in-process-instance",
+                                                  2,
+                                                  {LocationSpecInfo("tp0", 128)},
+                                                  ModelDeployment(),
+                                                  {LocationSpecGroup("full_cache", {"tp0"})}));
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+    proto::optimizer::OptimizerEventSubscriptionRequest subscription;
+    subscription.set_consumer_id("in-process-consumer");
+    auto reader = stub_->SubscribeEvents(&context, subscription);
+    ASSERT_TRUE(WaitUntil([this] { return sink_->SubscriberCount() == 1; }));
+
+    // Reuse the response as an embedded caller can; stale errors must not survive.
+    proto::optimizer::CommonResponse response;
+    response.mutable_header()->mutable_status()->set_message("previous error");
+    for (int index = 0; index < 3; ++index) {
+        proto::optimizer::TraceQueryRequest request;
+        request.set_trace_id("direct-" + std::to_string(index));
+        request.set_instance_id("in-process-instance");
+        request.add_block_keys(11 + index);
+        request.add_block_keys(22 + index);
+        request.set_input_token_len(5);
+        request.set_timestamp_ns(123456789123 + index);
+        request.add_location_spec_names("tp0");
+        service_->SubmitOptimizerEvent(request, response);
+        ASSERT_EQ(proto::optimizer::OK, response.header().status().code());
+        EXPECT_TRUE(response.header().status().message().empty());
+    }
+    for (int index = 0; index < 3; ++index) {
+        proto::optimizer::TraceQueryRequest received;
+        ASSERT_TRUE(reader->Read(&received));
+        EXPECT_EQ("direct-" + std::to_string(index), received.trace_id());
+        EXPECT_EQ("in-process-instance", received.instance_id());
+        EXPECT_EQ((std::vector<int64_t>{11 + index, 22 + index}),
+                  std::vector<int64_t>(received.block_keys().begin(), received.block_keys().end()));
+        EXPECT_EQ(5, received.input_token_len());
+        EXPECT_EQ(123456789123 + index, received.timestamp_ns());
+        ASSERT_EQ(1, received.location_spec_names_size());
+        EXPECT_EQ("tp0", received.location_spec_names(0));
+    }
+    context.TryCancel();
+    proto::optimizer::TraceQueryRequest received;
+    EXPECT_FALSE(reader->Read(&received));
+    EXPECT_EQ(grpc::StatusCode::CANCELLED, reader->Finish().error_code());
+}
+
+TEST_F(OptimizerEventServiceGRpcTest, TestShortPromptWithoutKeysRetainsLengthAndNanoseconds) {
+    RequestContext seed("short-prompt");
+    InstanceGroup group;
+    group.set_name("short-group");
+    ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&seed, group));
+    ASSERT_EQ(EC_OK,
+              registry_manager_->RegisterInstance(&seed,
+                                                  "short-group",
+                                                  "short-instance",
+                                                  64,
+                                                  {LocationSpecInfo("full", 1024)},
+                                                  ModelDeployment(),
+                                                  {LocationSpecGroup("default", {"full"})}));
+    auto subscriber = sink_->Subscribe("short-subscriber");
+    ASSERT_NE(nullptr, subscriber);
+    for (bool through_rpc : {false, true}) {
+        proto::optimizer::TraceQueryRequest request;
+        request.set_trace_id(through_rpc ? "short-rpc" : "short-direct");
+        request.set_instance_id("short-instance");
+        request.set_input_token_len(63);
+        request.set_timestamp_ns(123456789123);
+        request.add_location_spec_names("full");
+        proto::optimizer::CommonResponse response;
+        if (through_rpc) {
+            grpc::ClientContext context;
+            ASSERT_TRUE(stub_->ReportOptimizerEvent(&context, request, &response).ok());
+        } else {
+            service_->SubmitOptimizerEvent(request, response);
+        }
+        ASSERT_EQ(proto::optimizer::OK, response.header().status().code());
+        proto::optimizer::TraceQueryRequest received;
+        ASSERT_EQ(SubscriptionEventSink::Subscription::WaitResult::kEvent,
+                  subscriber->WaitNext(&received, std::chrono::seconds(2)));
+        EXPECT_EQ(0, received.block_keys_size());
+        EXPECT_EQ(63, received.input_token_len());
+        EXPECT_EQ(123456789123, received.timestamp_ns());
+        request.set_input_token_len(64);
+        service_->SubmitOptimizerEvent(request, response);
+        EXPECT_EQ(proto::optimizer::INVALID_ARGUMENT, response.header().status().code());
+    }
+    sink_->Unsubscribe(subscriber);
+}
+
+TEST_F(OptimizerEventServiceGRpcTest, TestInProcessSubmissionUsesRpcValidationAndReadiness) {
+    proto::optimizer::TraceQueryRequest request;
+    request.set_trace_id("direct-rejection");
+    request.set_instance_id("missing-instance");
+    auto expect_status = [&](int expected) {
+        proto::optimizer::CommonResponse direct_response;
+        service_->SubmitOptimizerEvent(request, direct_response);
+        EXPECT_EQ(expected, direct_response.header().status().code());
+        grpc::ClientContext context;
+        proto::optimizer::CommonResponse rpc_response;
+        ASSERT_TRUE(stub_->ReportOptimizerEvent(&context, request, &rpc_response).ok());
+        EXPECT_EQ(expected, rpc_response.header().status().code());
+        EXPECT_TRUE(capture_publisher_->events.empty());
+    };
+    expect_status(proto::optimizer::INVALID_ARGUMENT);
+    request.add_block_keys(11);
+    request.set_input_token_len(2);
+    request.set_timestamp_ns(123456789000);
+    expect_status(proto::optimizer::INSTANCE_NOT_EXIST);
+    SetServingState(RoleState::FOLLOWER, false);
+    expect_status(proto::optimizer::SERVICE_NOT_READY);
+    SetServingState(RoleState::LEADER, false);
+    expect_status(proto::optimizer::SERVICE_NOT_READY);
+    SetServingState(RoleState::LEADER, true);
+    leader_elector_->is_transitioning_ = true;
+    expect_status(proto::optimizer::SERVICE_NOT_READY);
+    leader_elector_->is_transitioning_ = false;
+    service_->DisableSubscriptions();
+    expect_status(proto::optimizer::SERVICE_NOT_READY);
+    sink_->Stop();
+    expect_status(proto::optimizer::SERVICE_NOT_READY);
 }
 
 TEST_F(OptimizerEventServiceGRpcTest, TestRejectsInvalidOrUnknownOptimizerEvent) {

@@ -132,28 +132,34 @@ grpc::Status OptimizerEventServiceGRpc::GetConfiguration(grpc::ServerContext *,
 grpc::Status OptimizerEventServiceGRpc::ReportOptimizerEvent(grpc::ServerContext *,
                                                              const proto::optimizer::TraceQueryRequest *request,
                                                              proto::optimizer::CommonResponse *response) {
-    auto *status = response->mutable_header()->mutable_status();
+    SubmitOptimizerEvent(*request, *response);
+    return grpc::Status::OK;
+}
+
+void OptimizerEventServiceGRpc::SubmitOptimizerEvent(const proto::optimizer::TraceQueryRequest &request,
+                                                     proto::optimizer::CommonResponse &response) {
+    response.Clear();
+    auto *status = response.mutable_header()->mutable_status();
     if (!IsAvailable() || !cache_manager_) {
         status->set_code(proto::optimizer::SERVICE_NOT_READY);
         status->set_message("KVCM is unavailable");
-        return grpc::Status::OK;
+        return;
     }
 
-    RequestContext request_context(request->trace_id());
+    RequestContext request_context(request.trace_id());
     std::vector<int64_t> tokens;
-    auto ec = DecodeOptimizerEventTokens(*request, &request_context, &tokens);
+    auto ec = DecodeOptimizerEventTokens(request, &request_context, &tokens);
     if (ec == EC_OK) {
         ec = cache_manager_->ReportOptimizerEvent(
             &request_context,
-            request->instance_id(),
-            {request->block_keys().begin(), request->block_keys().end()},
+            request.instance_id(),
+            {request.block_keys().begin(), request.block_keys().end()},
             tokens,
-            request->input_token_len(),
-            request->timestamp_ns(),
-            {request->location_spec_names().begin(), request->location_spec_names().end()});
+            request.input_token_len(),
+            request.timestamp_ns(),
+            {request.location_spec_names().begin(), request.location_spec_names().end()});
     }
     SetOptimizerEventStatus(ec, request_context, status);
-    return grpc::Status::OK;
 }
 
 grpc::Status

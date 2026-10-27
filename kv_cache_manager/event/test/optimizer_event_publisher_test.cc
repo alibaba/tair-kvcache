@@ -157,16 +157,17 @@ TEST_F(OptimizerEventPublisherTest, TestForwardsExplicitInputTokenLen) {
     EXPECT_EQ(5, request.input_token_len());
 }
 
-// Microseconds on the event, nanoseconds on the wire.
-TEST_F(OptimizerEventPublisherTest, TestTimestampConvertedToNanos) {
+// Producer nanoseconds are preserved on the wire.
+TEST_F(OptimizerEventPublisherTest, TestTimestampPreservesNanos) {
     ASSERT_TRUE(publisher_->Init(""));
     auto event = MakeGetEvent("instance-a", {1}, {1, 2});
-    const std::int64_t trigger_us = event->event_trigger_time_us();
+    event->SetEventTriggerTimeNs(123456789123);
+    const std::int64_t trigger_ns = event->event_trigger_time_ns();
     ASSERT_TRUE(publisher_->Publish(event));
     ASSERT_TRUE(WaitForEvents(*sink_, 1));
 
     const auto request = sink_->Events()[0];
-    EXPECT_EQ(trigger_us * 1000, request.timestamp_ns());
+    EXPECT_EQ(trigger_ns, request.timestamp_ns());
 }
 
 // Every publisher on EventManager sees every event, so non-read events must be

@@ -106,8 +106,8 @@ bool OptimizerEventPublisher::Convert(const std::shared_ptr<BaseEvent> &event,
     for (const auto &location_spec_name : get_event->location_spec_names()) {
         out->add_location_spec_names(location_spec_name);
     }
-    // The event carries microseconds; the replay works in nanoseconds.
-    out->set_timestamp_ns(get_event->event_trigger_time_us() * 1000);
+    // Preserve the producer timestamp, including sub-microsecond precision.
+    out->set_timestamp_ns(get_event->event_trigger_time_ns());
 
     // Only the token count is needed, never the ids. An empty tokens vector
     // means the caller passed pre-computed keys instead, and then the exact

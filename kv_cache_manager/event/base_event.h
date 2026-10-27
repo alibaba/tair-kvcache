@@ -23,7 +23,8 @@ public:
     const std::string &event_source() const { return source_; }
     const std::string &event_component() const { return component_; }
     const std::string &event_type() const { return type_; }
-    int64_t event_trigger_time_us() const { return trigger_time_us_; }
+    int64_t event_trigger_time_us() const { return trigger_time_ns_ / 1000; }
+    int64_t event_trigger_time_ns() const { return trigger_time_ns_; }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override { return false; }
 
@@ -32,23 +33,24 @@ public:
         Put(writer, "source", source_);
         Put(writer, "component", component_);
         Put(writer, "type", type_);
-        Put(writer, "trigger_time_us", trigger_time_us_);
+        Put(writer, "trigger_time_us", event_trigger_time_us());
     }
 
     void SetEventTriggerTime() {
-        trigger_time_us_ =
-            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch())
+        trigger_time_ns_ =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
                 .count();
     }
 
-    void SetEventTriggerTimeUs(int64_t trigger_time_us) { trigger_time_us_ = trigger_time_us; }
+    void SetEventTriggerTimeUs(int64_t trigger_time_us) { trigger_time_ns_ = trigger_time_us * 1000; }
+    void SetEventTriggerTimeNs(int64_t trigger_time_ns) { trigger_time_ns_ = trigger_time_ns; }
 
 protected:
     std::string id_;             // 事件唯一ID
     std::string source_;         // 事件来源实例
     std::string component_;      // 事件所属组件
     std::string type_;           // 事件类型
-    int64_t trigger_time_us_{0}; // 微秒
+    int64_t trigger_time_ns_{0}; // Canonical timestamp; microsecond views are derived.
 };
 
 } // namespace kv_cache_manager

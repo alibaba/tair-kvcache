@@ -38,7 +38,7 @@ TEST_F(ServerEventPublisherTest, TestOptimizerPublisherIsAbsentByDefault) {
 
     EXPECT_TRUE(event_manager->HasPublisher("log_event_publisher"));
     EXPECT_FALSE(event_manager->HasPublisher("optimizer_event_publisher"));
-    EXPECT_EQ(nullptr, server.optimizer_event_service_);
+    EXPECT_EQ(nullptr, server.GetOptimizerEventService());
     event_manager->Stop();
 }
 
@@ -57,7 +57,7 @@ TEST_F(ServerEventPublisherTest, TestConfiguredOptimizerPublisherIsRegistered) {
     ASSERT_NE(nullptr, sink);
     EXPECT_EQ(2u, sink->config_.max_subscribers());
     EXPECT_EQ(4096u, sink->config_.subscriber_queue_size());
-    EXPECT_NE(nullptr, server.optimizer_event_service_);
+    EXPECT_NE(nullptr, server.GetOptimizerEventService());
     event_manager->Stop();
 }
 
@@ -84,7 +84,7 @@ TEST_F(ServerEventPublisherTest, TestLogRegistrationFailureDoesNotBlockOptimizer
 
     EXPECT_EQ(existing_log_publisher, event_manager->GetPublisher("log_event_publisher"));
     EXPECT_TRUE(event_manager->HasPublisher("optimizer_event_publisher"));
-    EXPECT_NE(nullptr, server.optimizer_event_service_);
+    EXPECT_NE(nullptr, server.GetOptimizerEventService());
     event_manager->Stop();
 }
 
@@ -99,7 +99,7 @@ TEST_F(ServerEventPublisherTest, TestStopClosesOptimizerSubscriptions) {
     ASSERT_NE(nullptr, publisher);
     auto sink = std::dynamic_pointer_cast<SubscriptionEventSink>(publisher->sink_);
     ASSERT_NE(nullptr, sink);
-    server.optimizer_event_service_->EnableSubscriptions();
+    server.GetOptimizerEventService()->EnableSubscriptions();
     auto subscription = sink->Subscribe("optimizer");
     ASSERT_NE(nullptr, subscription);
 

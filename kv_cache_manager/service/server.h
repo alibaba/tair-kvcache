@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -40,6 +41,10 @@ public:
     bool Start();
     bool Wait();
     void Stop();
+
+    // Obtain after initialization. A null handle means the event service is disabled.
+    // The caller must drain in-process submissions before stopping the server.
+    std::shared_ptr<OptimizerEventServiceGRpc> GetOptimizerEventService() const { return optimizer_event_service_; }
 
 private:
     bool StartRpcServer();
