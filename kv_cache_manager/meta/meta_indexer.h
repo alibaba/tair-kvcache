@@ -88,6 +88,9 @@ public:
 
     ErrorCode Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept;
 
+    // Read-only snapshot of the backend recovery state; deletion still revalidates it.
+    bool IsRecovering() const noexcept;
+
     // Set revisit interval histogram for tracking cache access patterns.
     void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram);
     // Injected once by MetaIndexerManager before Init/traffic begins.

@@ -48,6 +48,8 @@ GC regular round
 
 多个事件天然合并为扫描时看到的最新 Backend 状态。GC 不再维护 cleanup intent map、revision、EventReport 专用 cursor/pass、recovery discovery 或独立 retry lane。
 
+每批构造候选前，GC 通过 `MetaIndexer::IsRecovering()` 读取该 Instance 已有的 metadata recover 状态。恢复中只跳过该批 EventReport 的 Backend 判定和删除任务构造，普通 orphan WRITING、storage-missing GC 及其他 Instance 继续处理，不把预期的暂缓清理当成失败打印日志。状态不跨批缓存：恢复完成后，后续扫描自动恢复 EventReport 清理，已经扫过的记录由下一轮重新发现。底层 `DeleteLocationsForMaintenance` 的 recover 拒绝保护继续保留。
+
 ## 2. 设计范围
 
 ### 2.1 V1 目标
@@ -377,7 +379,7 @@ EventReport 事件不向 GC 写 intent，因此 `RequestStop` 之后仍可完成
 | Backend disable/remove/recreate | unique name + object identity + type 校验；Backend availability lease 持有到 metadata RMW 完成 |
 | GC 重复扫描同一 target | GC pending |
 | GC 与 Reclaimer 同时处理同一 Location | expected-value/CAS 最终仲裁 |
-| cached metadata recovery | maintenance RMW recover guard |
+| cached metadata recovery | GC 每批跳过该 Instance 的 EventReport 判定和提交；maintenance RMW recover guard 保留 |
 | 同 block 多 Reporter | lease 稳定排序；一个 per-key RMW |
 
 ## 7. 异常与可观测性

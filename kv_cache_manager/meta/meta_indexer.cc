@@ -138,6 +138,10 @@ MetaIndexer::~MetaIndexer() {
     }
 }
 
+bool MetaIndexer::IsRecovering() const noexcept {
+    return backend_manager_ && backend_manager_->GetRecoverState() == MetaStorageBackendManager::RecoverState::kRecover;
+}
+
 ErrorCode MetaIndexer::Retire() noexcept {
     if (!backend_manager_->SyncAll()) {
         return EC_ERROR;

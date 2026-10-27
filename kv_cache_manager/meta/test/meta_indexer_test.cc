@@ -212,6 +212,23 @@ TEST_F(MetaIndexerTest, TestInit) {
     ASSERT_EQ(EC_CONFIG_ERROR, InitIndexer(configStr));
 }
 
+TEST_F(MetaIndexerTest, TestIsRecoveringReflectsBackendState) {
+    EXPECT_FALSE(meta_indexer_->IsRecovering());
+    ASSERT_EQ(EC_OK, InitIndexer(R"({
+        "max_key_count": 100,
+        "mutex_shard_num": 8,
+        "meta_storage_backend_config": {"storage_type": "local"},
+        "meta_cache_policy_config": {}
+    })"));
+    EXPECT_FALSE(meta_indexer_->IsRecovering());
+
+    auto &state = meta_indexer_->backend_manager_->recover_state_;
+    state.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
+    EXPECT_TRUE(meta_indexer_->IsRecovering());
+    state.store(MetaStorageBackendManager::RecoverState::kRunning, std::memory_order_release);
+    EXPECT_FALSE(meta_indexer_->IsRecovering());
+}
+
 TEST_F(MetaIndexerTest, TestProcessErrorCodesRejectsAbnormalResultCount) {
     const KeyVector keys = {11, 22, 33};
 
