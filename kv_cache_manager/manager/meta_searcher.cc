@@ -1619,7 +1619,10 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                                                       SelectLocationPolicy *policy,
                                                       const std::vector<BackendSelector> &selectors,
                                                       const std::vector<std::string> &requested_spec_names,
-                                                      const BlockMask &input_mask) const {
+                                                      const BlockMask &input_mask,
+                                                      CacheAffinityManager *affinity_manager,
+                                                      const AffinityResolveContext *resolve_ctx,
+                                                      std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects) const {
     assert(policy != nullptr);
     SPAN_TRACER(request_context);
     out_locations.clear();
@@ -1782,37 +1785,22 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                     continue;
                 }
 
+                // Same select-and-merge as BatchGetBestLocation: with affinity it
+                // runs ResolveRead (local spec preference + replication hints);
+                // without it, a caller-local spec replaces a remote one.
                 std::vector<std::string> unused_prune_ids;
-                auto winner = policy->SelectForMatch(filtered, nullptr, unused_prune_ids);
-                if (!winner || winner->id().empty() || winner->location_specs().empty()) {
+                CacheLocationConstPtr merged = SelectAndMergeForMatch(policy,
+                                                                      filtered,
+                                                                      /*check_loc_data_exist=*/nullptr,
+                                                                      request_context->caller_node(),
+                                                                      affinity_manager,
+                                                                      query_keys[i],
+                                                                      resolve_ctx,
+                                                                      unused_prune_ids,
+                                                                      out_side_effects);
+                if (!merged || merged->location_specs().empty()) {
                     continue;
                 }
-
-                // Merge specs from same data storage (same logic as SelectAndMergeForMatch)
-                std::map<std::string, LocationSpec> merged_specs;
-                for (const auto &[id, loc] : filtered) {
-                    if (!policy->IsSameDataStorage(*loc, *winner)) {
-                        continue;
-                    }
-                    for (const auto &spec : loc->location_specs()) {
-                        merged_specs.try_emplace(spec.name(), spec);
-                    }
-                }
-                if (merged_specs.empty()) {
-                    continue;
-                }
-
-                auto merged = std::make_shared<CacheLocation>();
-                merged->set_id(winner->id() + "_merged");
-                merged->set_status(CacheLocationStatus::CLS_SERVING);
-                merged->set_type(winner->type());
-                std::vector<LocationSpec> specs;
-                specs.reserve(merged_specs.size());
-                for (auto &[name, spec] : merged_specs) {
-                    specs.push_back(std::move(spec));
-                }
-                merged->set_spec_size(specs.size());
-                merged->set_location_specs(std::move(specs));
                 out_locations[query_to_output_index[i]].push_back(std::move(merged));
                 base_hits[i] = true;
             }

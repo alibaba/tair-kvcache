@@ -395,11 +395,18 @@ message GetCacheLocationsByBackendRequest {
     int32 sw_size = 7;
     repeated string location_spec_names = 8;
     repeated BackendLocationSelector backend_selectors = 9;
+    // The caller's self-reported node for local-preference and replication hints.
+    // Empty / unset preserves the existing backend-selector behavior.
+    CallerNode caller = 10;
 }
 
 message GetCacheLocationsByBackendResponse {
     CommonResponseHeader header = 1;
     repeated CacheLocationVector key_locations = 2;
+    // Same hint format as GetCacheLocationResponse. Old clients ignore new fields.
+    repeated ReplicationHint hints = 3;
+    // Intersection of server support and the caller capability bitmap.
+    uint32 replication_capabilities = 4;
 }
 
 message GetCacheLocationLenRequest {

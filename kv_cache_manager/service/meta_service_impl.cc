@@ -309,6 +309,32 @@ BuildGetHostCacheStateResponseAccessLogSummary(const proto::meta::GetHostCacheSt
     return {std::string(sb.GetString(), sb.GetSize()), true};
 }
 
+CallerNode CallerNodeFromProto(const proto::meta::CallerNode &caller) {
+    return CallerNode{caller.node_id(), caller.supernode_id(), caller.replication_capabilities()};
+}
+
+// Negotiates replication capabilities and copies hints. Multi-spec hints are
+// dropped unless the caller declared named-spec support.
+template <typename Response>
+void FillReplicationHints(uint32_t caller_capabilities, const std::vector<ReplicationHint> &hints, Response *response) {
+    response->set_replication_capabilities(caller_capabilities & kReplicationNamedSpecs);
+    const bool named_specs = (response->replication_capabilities() & kReplicationNamedSpecs) != 0;
+    for (const auto &h : hints) {
+        if (h.source_specs.size() > 1 && !named_specs) {
+            continue;
+        }
+        auto *pb_hint = response->add_hints();
+        pb_hint->set_block_key(h.block_key);
+        pb_hint->set_source_uri(h.source_uri);
+        pb_hint->set_target_node_id(h.target_node_id);
+        for (const auto &source : h.source_specs) {
+            auto *pb_source = pb_hint->add_source_specs();
+            pb_source->set_spec_name(source.spec_name);
+            pb_source->set_uri(source.uri);
+        }
+    }
+}
+
 } // namespace
 
 MetaServiceImpl::MetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
@@ -488,8 +514,7 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
     for (const auto &name : request->location_spec_names()) {
         location_spec_names.push_back(name);
     }
-    request_context->set_caller_node(CallerNode{request->caller().node_id(), request->caller().supernode_id(),
-                                               request->caller().replication_capabilities()});
+    request_context->set_caller_node(CallerNodeFromProto(request->caller()));
 
     std::vector<ReplicationHint> hints;
     CacheLocationViewVecWrapper cache_location_view_vec_wrapper;
@@ -515,19 +540,7 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
             auto *location_meta = response->add_locations();
             ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
         }
-        response->set_replication_capabilities(request->caller().replication_capabilities() & kReplicationNamedSpecs);
-        for (const auto &h : hints) {
-            if (h.source_specs.size() > 1 && !(response->replication_capabilities() & kReplicationNamedSpecs)) continue;
-            auto *pb_hint = response->add_hints();
-            pb_hint->set_block_key(h.block_key);
-            pb_hint->set_source_uri(h.source_uri);
-            pb_hint->set_target_node_id(h.target_node_id);
-            for (const auto &source : h.source_specs) {
-                auto *pb_source = pb_hint->add_source_specs();
-                pb_source->set_spec_name(source.spec_name);
-                pb_source->set_uri(source.uri);
-            }
-        }
+        FillReplicationHints(request->caller().replication_capabilities(), hints, response);
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
         status->set_message("Cache locations retrieved successfully");
@@ -578,6 +591,9 @@ void MetaServiceImpl::GetCacheLocationsByBackend(RequestContext *request_context
         });
     }
 
+    request_context->set_caller_node(CallerNodeFromProto(request->caller()));
+
+    std::vector<ReplicationHint> hints;
     auto [ec_info, batch_result] = cache_manager_->GetCacheLocationsByBackend(
         request_context,
         request->instance_id(),
@@ -587,7 +603,8 @@ void MetaServiceImpl::GetCacheLocationsByBackend(RequestContext *request_context
         block_mask_req,
         request->sw_size(),
         location_spec_names,
-        backend_selectors);
+        backend_selectors,
+        &hints);
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));
         request_context->set_status_code(status->code());
@@ -600,12 +617,14 @@ void MetaServiceImpl::GetCacheLocationsByBackend(RequestContext *request_context
                 ProtoConvert::CacheLocationViewToProto(view, key_locs_proto->add_locations());
             }
         }
+        FillReplicationHints(request->caller().replication_capabilities(), hints, response);
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
         status->set_message("Batch cache locations retrieved successfully");
-        KVCM_LOG_DEBUG("[traceId: %s] GetCacheLocationsByBackend succeeded, returned %zu keys",
+        KVCM_LOG_DEBUG("[traceId: %s] GetCacheLocationsByBackend succeeded, returned %zu keys, %d hints",
                        request->trace_id().c_str(),
-                       batch_result.size());
+                       batch_result.size(),
+                       response->hints_size());
     }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }

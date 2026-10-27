@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -200,6 +201,48 @@ public:
 private:
     std::shared_ptr<DataStorageBackend> delegate_;
     MightExistFunc fn_;
+};
+
+// Real NFS allocation and metadata paths, with deterministic Copy outcomes.
+// This records the exact server-side copy scope; it is not a data-plane test.
+class ReplicationRecordingBackend : public MightExistInterceptor {
+public:
+    explicit ReplicationRecordingBackend(std::shared_ptr<DataStorageBackend> delegate)
+        : MightExistInterceptor(delegate, [](const std::vector<DataStorageUri> &uris) {
+              return std::vector<bool>(uris.size(), true);
+          }),
+          delegate_(std::move(delegate)) {}
+
+    bool SupportsAffinity() const override { return delegate_->SupportsAffinity(); }
+    std::vector<LocationDescriptor> CreateWithHints(const std::vector<std::string> &keys,
+                                                    size_t size,
+                                                    const WriteHints &hints,
+                                                    bool strict,
+                                                    const std::string &trace_id,
+                                                    std::function<void()> cb) override {
+        created_keys.insert(created_keys.end(), keys.begin(), keys.end());
+        created_sizes.insert(created_sizes.end(), keys.size(), size);
+        EXPECT_TRUE(strict);
+        EXPECT_EQ(std::vector<std::string>{NetUtil::GetLocalIp()}, hints.preferred_node_ids);
+        return delegate_->CreateWithHints(keys, size, hints, strict, trace_id, std::move(cb));
+    }
+    std::vector<ErrorCode> Copy(const std::vector<DataStorageUri> &sources,
+                                const std::vector<DataStorageUri> &destinations,
+                                const std::string &) override {
+        copied_sources.insert(copied_sources.end(), sources.begin(), sources.end());
+        copied_destinations.insert(copied_destinations.end(), destinations.begin(), destinations.end());
+        EXPECT_EQ(sources.size(), destinations.size());
+        return std::vector<ErrorCode>(sources.size(), copy_ec);
+    }
+
+    ErrorCode copy_ec = EC_OK;
+    std::vector<std::string> created_keys;
+    std::vector<size_t> created_sizes;
+    std::vector<DataStorageUri> copied_sources;
+    std::vector<DataStorageUri> copied_destinations;
+
+private:
+    std::shared_ptr<DataStorageBackend> delegate_;
 };
 
 // A deterministic write gate for ReportEvent ordering tests.  Sleeping in a
@@ -11080,6 +11123,90 @@ TEST_F(CacheManagerAffinityTest, ReplicationHintEmittedAfterFrequencyThreshold) 
     EXPECT_TRUE(found_hints) << "ReplicationHint should be emitted after reaching threshold=3";
 }
 
+// GetCacheLocationsByBackend runs the same read affinity as GetCacheLocation:
+// per-key selectors feed ResolveRead and surface its replication hints.
+TEST_F(CacheManagerAffinityTest, ByBackendReplicationHintEmittedAfterFrequencyThreshold) {
+    std::vector<int64_t> keys{110, 111, 112};
+    registerAndWriteKeys(keys);
+
+    request_context_->set_caller_node_id("node_a");
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+
+    bool found_hints = false;
+    for (int read_num = 1; read_num <= 4; ++read_num) {
+        std::vector<ReplicationHint> hints;
+        auto [ec, locs] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                                     "test_instance",
+                                                                     CacheManager::QueryType::QT_BATCH_GET,
+                                                                     keys,
+                                                                     {},
+                                                                     BlockMaskVector{},
+                                                                     0,
+                                                                     {},
+                                                                     selectors,
+                                                                     &hints);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(keys.size(), locs.size());
+        for (const auto &key_locs : locs) {
+            ASSERT_EQ(1u, key_locs.cache_locations_view().size());
+        }
+        if (!hints.empty()) {
+            found_hints = true;
+            EXPECT_EQ(keys.size(), hints.size());
+            for (const auto &h : hints) {
+                EXPECT_EQ("node_a", h.target_node_id);
+                EXPECT_NE(keys.end(), std::find(keys.begin(), keys.end(), h.block_key));
+                EXPECT_EQ(4u, h.source_specs.size());
+            }
+            break;
+        }
+    }
+    EXPECT_TRUE(found_hints) << "GetCacheLocationsByBackend should emit hints after reaching threshold=3";
+}
+
+// Old clients send no caller: results are unchanged and no hint is produced,
+// and a null out_hints keeps the original call shape working.
+TEST_F(CacheManagerAffinityTest, ByBackendWithoutCallerEmitsNoHints) {
+    std::vector<int64_t> keys{120, 121};
+    registerAndWriteKeys(keys);
+
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+    for (int read_num = 1; read_num <= 4; ++read_num) {
+        std::vector<ReplicationHint> hints;
+        auto [ec, locs] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                                     "test_instance",
+                                                                     CacheManager::QueryType::QT_BATCH_GET,
+                                                                     keys,
+                                                                     {},
+                                                                     BlockMaskVector{},
+                                                                     0,
+                                                                     {},
+                                                                     selectors,
+                                                                     &hints);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(keys.size(), locs.size());
+        for (const auto &key_locs : locs) {
+            ASSERT_EQ(1u, key_locs.cache_locations_view().size());
+        }
+        EXPECT_TRUE(hints.empty()) << "read " << read_num;
+    }
+    auto [ec, locs] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
+                                                                 "test_instance",
+                                                                 CacheManager::QueryType::QT_BATCH_GET,
+                                                                 keys,
+                                                                 {},
+                                                                 BlockMaskVector{},
+                                                                 0,
+                                                                 {},
+                                                                 selectors);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(keys.size(), locs.size());
+}
+
 // Test 2: is_replication=true bypasses global dedup
 TEST_F(CacheManagerAffinityTest, ReplicationWriteBypassesGlobalDedup) {
     std::vector<int64_t> keys{200, 201, 202};
@@ -11195,6 +11322,249 @@ TEST_F(CacheManagerAffinityTest, StrictReplicationCannotUseSameSupernodeFallback
     request_context_->set_replication_target_node_id("missing_caller");
     auto result = cache_manager_->StartWriteCache(request_context_.get(), "test_instance", {9981}, {}, {}, 60);
     EXPECT_NE(EC_OK, result.first);
+}
+
+TEST_F(CacheManagerAffinityTest, ServerSideReplicationUsesExactNamedSourceScope) {
+    registerAndWriteKeys({9900});
+    auto dsm = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<ReplicationRecordingBackend>(dsm->storage_map_["nfs_01"]);
+    dsm->storage_map_["nfs_01"] = backend;
+    const std::vector<std::vector<std::string>> scopes{{"tp0"}, {"tp3", "tp1"}, {"tp0", "tp1", "tp2", "tp3"}};
+    std::vector<ReplicationHint> hints;
+    for (size_t i = 0; i < scopes.size(); ++i) {
+        ReplicationHint hint;
+        hint.block_key = 9901 + i;
+        hint.target_node_id = NetUtil::GetLocalIp();
+        for (const auto &name : scopes[i]) {
+            hint.source_specs.push_back({name, "file://nfs_01/source/" + name + "?size=512"});
+        }
+        hints.push_back(std::move(hint));
+    }
+    const auto results = cache_manager_->ReplicateCaches(request_context_.get(), "test_instance", hints, 60);
+    ASSERT_EQ(scopes.size(), results.size());
+    EXPECT_EQ(7u, backend->created_keys.size());
+    ASSERT_EQ(7u, backend->copied_sources.size());
+    ASSERT_EQ(7u, backend->copied_destinations.size());
+    size_t uri_index = 0;
+    for (size_t i = 0; i < scopes.size(); ++i) {
+        EXPECT_EQ(EC_OK, results[i].first);
+        EXPECT_FALSE(results[i].second);
+        std::vector<CacheLocationMap> maps;
+        BlockMask empty_mask = BlockMaskOffset(0);
+        auto *searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+        ASSERT_EQ(EC_OK, searcher->BatchGetLocation(request_context_.get(), {hints[i].block_key}, empty_mask, maps));
+        ASSERT_EQ(1u, maps.size());
+        ASSERT_EQ(1u, maps.front().size());
+        const auto &location = *maps.front().begin()->second;
+        EXPECT_EQ(CacheLocationStatus::CLS_SERVING, location.status());
+        std::set<std::string> names;
+        for (const auto &spec : location.location_specs()) {
+            names.insert(spec.name());
+            EXPECT_EQ(hints[i].target_node_id, spec.node_id());
+            EXPECT_EQ("file://nfs_01/source/" + spec.name() + "?size=512",
+                      backend->copied_sources[uri_index].ToUriString());
+            EXPECT_EQ(spec.uri(), backend->copied_destinations[uri_index++].ToUriString());
+        }
+        EXPECT_EQ(std::set<std::string>(scopes[i].begin(), scopes[i].end()), names);
+    }
+    EXPECT_FALSE(request_context_->is_replication());
+    EXPECT_TRUE(request_context_->replication_target_node_id().empty());
+    EXPECT_TRUE(request_context_->replication_spec_names().empty());
+
+    // A single-spec replica is complete for that copy, even though the
+    // instance has four registered specs and no same-named spec group.
+    const auto repeated = cache_manager_->ReplicateCache(request_context_.get(), "test_instance", hints[0], 60);
+    EXPECT_EQ(EC_OK, repeated.first);
+    EXPECT_TRUE(repeated.second);
+    EXPECT_EQ(7u, backend->created_keys.size());
+    EXPECT_EQ(7u, backend->copied_sources.size());
+}
+
+TEST_F(CacheManagerAffinityTest, ServerSideReplicationUsesExactScopeForUnequalSpecSizes) {
+    auto specs = createLocationSpecInfos();
+    specs[1].set_size(1024);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->RegisterInstance(request_context_.get(), "default", "replication_sizes", 64,
+                                                specs, createModelDeployment(), {}).first);
+    auto dsm = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<ReplicationRecordingBackend>(dsm->storage_map_["nfs_01"]);
+    dsm->storage_map_["nfs_01"] = backend;
+    ReplicationHint hint;
+    hint.block_key = 9910;
+    hint.target_node_id = NetUtil::GetLocalIp();
+    hint.source_specs = {{"tp1", "file://nfs_01/source/tp1?size=1024"}};
+    const auto result = cache_manager_->ReplicateCache(request_context_.get(), "replication_sizes", hint, 60);
+    EXPECT_EQ(EC_OK, result.first);
+    EXPECT_FALSE(result.second);
+    EXPECT_EQ(1u, backend->created_keys.size());
+    EXPECT_EQ(std::vector<size_t>{1024}, backend->created_sizes);
+    EXPECT_EQ(1u, backend->copied_sources.size());
+}
+
+TEST_F(CacheManagerAffinityTest, ServerSideReplicationRejectsInvalidSourcesBeforeAllocation) {
+    registerAndWriteKeys({9920});
+    auto dsm = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<ReplicationRecordingBackend>(dsm->storage_map_["nfs_01"]);
+    dsm->storage_map_["nfs_01"] = backend;
+    ReplicationHint valid;
+    valid.block_key = 9921;
+    valid.target_node_id = NetUtil::GetLocalIp();
+    valid.source_specs = {{"tp0", "file://nfs_01/source/tp0?size=512"}};
+    std::vector<ReplicationHint> hints;
+    auto append = [&](const std::vector<ReplicationSourceSpec> &sources) {
+        auto hint = valid;
+        hint.block_key += hints.size();
+        hint.source_specs = sources;
+        hints.push_back(std::move(hint));
+    };
+    append({valid.source_specs[0], valid.source_specs[0]});
+    append({{"unknown", valid.source_specs[0].uri}});
+    append({{"", valid.source_specs[0].uri}});
+    append({{"tp0", ""}});
+    append({{"tp0", "not-a-uri"}});
+    append({});
+    hints.push_back(valid);
+    hints.back().block_key = 9927;
+    hints.back().target_node_id.clear();
+    hints.push_back(valid);
+    hints.back().block_key = 9928;
+    const auto results = cache_manager_->ReplicateCaches(request_context_.get(), "test_instance", hints, 60);
+    ASSERT_EQ(hints.size(), results.size());
+    for (size_t i = 0; i + 1 < results.size(); ++i) EXPECT_EQ(EC_BADARGS, results[i].first);
+    EXPECT_EQ(EC_OK, results.back().first);
+    EXPECT_EQ(1u, backend->created_keys.size());
+    EXPECT_EQ(1u, backend->copied_sources.size());
+}
+
+TEST_F(CacheManagerAffinityTest, ServerSideReplicationRetainsAnonymousSingleSpecCompatibility) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_->RegisterInstance(request_context_.get(), "default", "replication_single", 64,
+                                                {LocationSpecInfo("only_spec", 512)}, createModelDeployment(), {}).first);
+    auto dsm = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<ReplicationRecordingBackend>(dsm->storage_map_["nfs_01"]);
+    dsm->storage_map_["nfs_01"] = backend;
+    ReplicationHint hint;
+    hint.block_key = 9930;
+    hint.target_node_id = NetUtil::GetLocalIp();
+    hint.source_specs = {{"", "file://nfs_01/source/legacy?size=512"}};
+    EXPECT_EQ(EC_OK, cache_manager_->ReplicateCache(request_context_.get(), "replication_single", hint, 60).first);
+    EXPECT_EQ(1u, backend->copied_sources.size());
+    EXPECT_FALSE(request_context_->is_replication());
+}
+
+TEST_F(CacheManagerAffinityTest, ServerSideReplicationPartialTargetDoesNotSkipMissingSpecs) {
+    registerAndWriteKeys({9940});
+    auto dsm = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<ReplicationRecordingBackend>(dsm->storage_map_["nfs_01"]);
+    dsm->storage_map_["nfs_01"] = backend;
+    ReplicationHint hint;
+    hint.block_key = 9941;
+    hint.target_node_id = NetUtil::GetLocalIp();
+    hint.source_specs = {{"tp0", "file://nfs_01/source/tp0?size=512"}};
+    ASSERT_EQ(EC_OK, cache_manager_->ReplicateCache(request_context_.get(), "test_instance", hint, 60).first);
+    hint.source_specs.push_back({"tp2", "file://nfs_01/source/tp2?size=512"});
+    const auto result = cache_manager_->ReplicateCache(request_context_.get(), "test_instance", hint, 60);
+    EXPECT_EQ(EC_OK, result.first);
+    EXPECT_FALSE(result.second);
+    EXPECT_EQ(3u, backend->created_keys.size());
+    EXPECT_EQ(3u, backend->copied_sources.size());
+}
+
+TEST_F(CacheManagerAffinityTest, ServerSideReplicationSingleSpecCopyFailureDoesNotPublish) {
+    registerAndWriteKeys({9950});
+    auto dsm = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<ReplicationRecordingBackend>(dsm->storage_map_["nfs_01"]);
+    backend->copy_ec = EC_ERROR;
+    dsm->storage_map_["nfs_01"] = backend;
+    request_context_->set_replication_target_node_id("previous_target");
+    request_context_->set_replication_spec_names({"previous_spec"});
+    ReplicationHint hint;
+    hint.block_key = 9951;
+    hint.target_node_id = NetUtil::GetLocalIp();
+    hint.source_specs = {{"tp0", "file://nfs_01/source/tp0?size=512"}};
+    const auto result = cache_manager_->ReplicateCache(request_context_.get(), "test_instance", hint, 60);
+    EXPECT_EQ(EC_ERROR, result.first);
+    EXPECT_FALSE(result.second);
+    EXPECT_EQ(1u, backend->created_keys.size());
+    EXPECT_EQ(1u, backend->copied_sources.size());
+    EXPECT_FALSE(request_context_->is_replication());
+    EXPECT_EQ("previous_target", request_context_->replication_target_node_id());
+    EXPECT_EQ(std::set<std::string>{"previous_spec"}, request_context_->replication_spec_names());
+    std::vector<CacheLocationMap> maps;
+    BlockMask empty_mask = BlockMaskOffset(0);
+    auto *searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_EQ(EC_OK, searcher->BatchGetLocation(request_context_.get(), {hint.block_key}, empty_mask, maps));
+    for (const auto &map : maps) {
+        for (const auto &[id, location] : map) {
+            ASSERT_TRUE(location);
+            EXPECT_NE(CacheLocationStatus::CLS_SERVING, location->status());
+        }
+    }
+}
+
+TEST_F(CacheManagerTest, ServerSideReplicationDoesNotTreatColdCoverageAsTargetReplica) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_->RegisterInstance(request_context_.get(), "default", "replication_marks", 64,
+                                                createLocationSpecInfos(), createModelDeployment(), {}).first);
+    EnableTieredMigrationStrategy("default", "nfs_01", "cold_01");
+    cache_manager_->StartMigrationManager();
+    auto dsm = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<ReplicationRecordingBackend>(dsm->storage_map_["nfs_01"]);
+    dsm->storage_map_["nfs_01"] = backend;
+    auto *searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("replication_marks");
+    ASSERT_TRUE(searcher);
+    for (const auto status : {CacheLocationStatus::CLS_SERVING, CacheLocationStatus::CLS_WRITING}) {
+        const int64_t key = status == CacheLocationStatus::CLS_SERVING ? 9960 : 9961;
+        std::vector<LocationSpec> cold_specs;
+        for (const auto &spec : createLocationSpecInfos()) {
+            LocationSpec location_spec(spec.name(), "dummy://cold_01/" + spec.name() + "?size=512");
+            location_spec.set_node_id("other_node");
+            cold_specs.push_back(std::move(location_spec));
+        }
+        auto location = std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY, 4, cold_specs);
+        std::vector<std::string> ids;
+        ASSERT_EQ(EC_OK, BatchAddLocationForTest(searcher, request_context_.get(), {key}, {location}, ids));
+        ASSERT_EQ(1u, ids.size());
+        std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks{{{ids[0], status}}};
+        std::vector<std::vector<ErrorCode>> updates;
+        ASSERT_EQ(EC_OK, searcher->BatchUpdateLocationStatus(request_context_.get(), {key}, tasks, updates));
+        ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->MarkForTieredWrite(
+                             "replication_marks", {key}, "cold_01"));
+        ReplicationHint hint;
+        hint.block_key = key;
+        hint.target_node_id = NetUtil::GetLocalIp();
+        hint.source_specs = {{"tp0", "file://nfs_01/source/tp0?size=512"}};
+        const auto result = cache_manager_->ReplicateCache(request_context_.get(), "replication_marks", hint, 60);
+        EXPECT_EQ(EC_OK, result.first);
+        EXPECT_FALSE(result.second);
+        EXPECT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("replication_marks", key));
+    }
+    EXPECT_EQ(2u, backend->created_keys.size());
+    EXPECT_EQ(2u, backend->copied_sources.size());
+}
+
+TEST_F(CacheManagerTest, ServerSideReplicationExistingSubsetIgnoresPendingColdMark) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_->RegisterInstance(request_context_.get(), "default", "replication_existing_mark", 64,
+                                                createLocationSpecInfos(), createModelDeployment(), {}).first);
+    auto dsm = registry_manager_->data_storage_manager();
+    auto backend = std::make_shared<ReplicationRecordingBackend>(dsm->storage_map_["nfs_01"]);
+    dsm->storage_map_["nfs_01"] = backend;
+    ReplicationHint hint;
+    hint.block_key = 9962;
+    hint.target_node_id = NetUtil::GetLocalIp();
+    hint.source_specs = {{"tp0", "file://nfs_01/source/tp0?size=512"}};
+    ASSERT_EQ(EC_OK, cache_manager_->ReplicateCache(request_context_.get(), "replication_existing_mark", hint, 60).first);
+    EnableTieredMigrationStrategy("default", "nfs_01", "cold_01");
+    cache_manager_->StartMigrationManager();
+    ASSERT_EQ(EC_OK, cache_manager_->migration_manager()->MarkForTieredWrite(
+                         "replication_existing_mark", {hint.block_key}, "cold_01"));
+    const auto result = cache_manager_->ReplicateCache(request_context_.get(), "replication_existing_mark", hint, 60);
+    EXPECT_EQ(EC_OK, result.first);
+    EXPECT_TRUE(result.second);
+    EXPECT_EQ(1u, backend->created_keys.size());
+    EXPECT_EQ(1u, backend->copied_sources.size());
+    EXPECT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("replication_existing_mark", hint.block_key));
 }
 
 TEST_F(CacheManagerAffinityTest, ServerSideReplicationFailureRollsBackWriteSession) {

@@ -101,13 +101,19 @@ public:
                                    const std::shared_ptr<CacheAffinityManager> &affinity_manager,
                                    const AffinityResolveContext *resolve_ctx,
                                    std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
+    // Per-key selectors use the same affinity-aware merge as BatchGetBestLocation
+    // when affinity_manager and resolve_ctx are set. Event-report peer selection
+    // (LSS_V6D_PREFIX / LSS_V6D_COVERAGE) is unaffected.
     ErrorCode BatchGetBestLocationByBackend(RequestContext *request_context,
                                             const KeyVector &keys,
                                             LocationsPerKey &out_locations,
                                             SelectLocationPolicy *policy,
                                             const std::vector<BackendSelector> &selectors,
                                             const std::vector<std::string> &requested_spec_names = {},
-                                            const BlockMask &input_mask = BlockMask{}) const;
+                                            const BlockMask &input_mask = BlockMask{},
+                                            CacheAffinityManager *affinity_manager = nullptr,
+                                            const AffinityResolveContext *resolve_ctx = nullptr,
+                                            std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr) const;
     ErrorCode ReverseRollSlideWindowMatch(RequestContext *request_context,
                                           const KeyVector &keys,
                                           int32_t sw_size,

@@ -97,7 +97,7 @@ instance_id → block_key → 多个 CacheLocation（各自有 id / status / cre
 | 批量 `ReplicateCacheResponse` | 顶层 OK 表示请求已处理，必须检查每项 `results.code`；`already_exists` 表示目标已具备所需 SERVING 组件 |
 | 旧客户端 | 不带 caller 仍能读写；未声明具名 spec 能力时只会收到单 spec 复制提示 |
 
-多 spec 提示要求 caller 的 `replication_capabilities` 包含具名 spec 能力位（值 `1`）。能力检查在热度观察和抑制之前，旧客户端的多 spec 读不会消耗新协议的热度或抑制窗口。`GetCacheLocationLen`、`GetCacheLocationsByBackend` 没有这一套 caller/hint 接口，不能概括成所有查询都触发复制。
+多 spec 提示要求 caller 的 `replication_capabilities` 包含具名 spec 能力位（值 `1`）。能力检查在热度观察和抑制之前，旧客户端的多 spec 读不会消耗新协议的热度或抑制窗口。`GetCacheLocationLen` 没有这一套 caller/hint 接口。`GetCacheLocationsByBackend` 带 `caller`、`hints` 和 `replication_capabilities` 字段，按 key 选择的 backend 与 `GetCacheLocation` 共用读亲和合并和提示生成；EventReport backend 的 peer 选择不受 caller 影响，也不产生提示。不能概括成所有查询都触发复制。
 
 <a id="configuration"></a>
 

@@ -359,6 +359,9 @@ MigrationMarkClearPolicy GetMigrationMarkClearPolicy(RequestContext *request_con
 bool IsTieredMigrationEnabled(RequestContext *request_context,
                               const std::shared_ptr<RegistryManager> &registry_manager,
                               const std::shared_ptr<const InstanceInfo> &instance_info) {
+    // Migration marks belong to ordinary writes. A strict replica copy must
+    // neither substitute cold-storage coverage for its target nor consume a mark.
+    if (request_context && request_context->is_replication()) return false;
     if (registry_manager == nullptr || instance_info == nullptr) {
         return false;
     }
@@ -463,6 +466,39 @@ void ResolveUsableTieredWriteTargets(RequestContext *request_context,
 inline std::string MakeStorageKey(const std::string &instance_id, const std::string &spec_name, int64_t block_key) {
     return instance_id + "/" + spec_name + "/" + StringUtil::Uint64ToHex(block_key) + "/" +
            StringUtil::GenerateRandomString(8);
+}
+
+// A hit is local when any of its specs lives on the caller's node.
+void CountReadLocality(const CacheLocationVector &locations,
+                       const std::string &caller_node_id,
+                       uint64_t &local_hit,
+                       uint64_t &remote_hit) {
+    for (const auto &loc_ptr : locations) {
+        if (!loc_ptr) {
+            continue;
+        }
+        bool has_uri = false, has_local = false;
+        for (const auto &spec : loc_ptr->location_specs()) {
+            if (!spec.uri().empty()) {
+                has_uri = true;
+                if (spec.node_id() == caller_node_id) {
+                    has_local = true;
+                }
+            }
+        }
+        if (has_uri) {
+            ++(has_local ? local_hit : remote_hit);
+        }
+    }
+}
+
+void CollectReplicationHints(std::vector<std::unique_ptr<ReadSideEffect>> &side_effects,
+                             std::vector<ReplicationHint> &out_hints) {
+    for (auto &se : side_effects) {
+        if (auto *hint = dynamic_cast<ReplicationHintSideEffect *>(se.get())) {
+            out_hints.push_back(std::move(static_cast<ReplicationHint &>(*hint)));
+        }
+    }
 }
 
 } // namespace
@@ -976,39 +1012,12 @@ ErrorCode CacheManager::GetCacheLocation(RequestContext *request_context,
     if (event_manager_) {
         event_manager_->Publish(cache_get_event);
     }
-    for (auto &se : side_effects) {
-        if (auto *hint = dynamic_cast<ReplicationHintSideEffect *>(se.get())) {
-            out_hints.push_back(std::move(static_cast<ReplicationHint &>(*hint)));
-        }
-    }
+    CollectReplicationHints(side_effects, out_hints);
     if (service_metrics_collector && !request_context->caller_node().node_id.empty()) {
-        const auto &caller_node_id = request_context->caller_node().node_id;
-        double local_hit = 0, remote_hit = 0;
-        for (const auto &loc_ptr : cache_locations) {
-            if (!loc_ptr) {
-                continue;
-            }
-            bool has_uri = false, has_local = false;
-            for (const auto &spec : loc_ptr->location_specs()) {
-                if (!spec.uri().empty()) {
-                    has_uri = true;
-                    if (spec.node_id() == caller_node_id) {
-                        has_local = true;
-                    }
-                }
-            }
-            if (has_uri) {
-                if (has_local) {
-                    ++local_hit;
-                } else {
-                    ++remote_hit;
-                }
-            }
-        }
-        KVCM_METRICS_COLLECTOR_ADD_METRICS(
-            service_metrics_collector, affinity, read_local_hit, static_cast<uint64_t>(local_hit));
-        KVCM_METRICS_COLLECTOR_ADD_METRICS(
-            service_metrics_collector, affinity, read_remote_hit, static_cast<uint64_t>(remote_hit));
+        uint64_t local_hit = 0, remote_hit = 0;
+        CountReadLocality(cache_locations, request_context->caller_node().node_id, local_hit, remote_hit);
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(service_metrics_collector, affinity, read_local_hit, local_hit);
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(service_metrics_collector, affinity, read_remote_hit, remote_hit);
         KVCM_METRICS_COLLECTOR_ADD_METRICS(
             service_metrics_collector, affinity, hint_emitted, static_cast<uint64_t>(out_hints.size()));
     }
@@ -1089,7 +1098,8 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
                                          const BlockMask &block_mask,
                                          int32_t sw_size,
                                          const std::vector<std::string> &location_spec_names,
-                                         const std::vector<BackendSelector> &backend_selectors) {
+                                         const std::vector<BackendSelector> &backend_selectors,
+                                         std::vector<ReplicationHint> *out_hints) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -1171,6 +1181,10 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
         }
     }
 
+    AffinityResolveContext resolve_ctx;
+    FillReadResolveContext(request_context, instance_id, resolve_ctx);
+    const AffinityResolveContext *resolve_ctx_ptr = affinity_manager_ ? &resolve_ctx : nullptr;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
     LocationsPerKey locations_per_key;
     ec = meta_searcher->BatchGetBestLocationByBackend(request_context,
                                                       query_keys,
@@ -1178,7 +1192,10 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
                                                       policy.get(),
                                                       backend_selectors,
                                                       location_spec_names,
-                                                      block_mask);
+                                                      block_mask,
+                                                      affinity_manager_.get(),
+                                                      resolve_ctx_ptr,
+                                                      &side_effects);
     query_scope = ChronoScopeGuard{};
     // prefix_match_len: count keys with at least one hit (non-empty id).
     // Miss keys have empty CacheLocation objects with no id.
@@ -1217,6 +1234,23 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
         QueryTypeToString(query_type), query_keys, tokens, block_mask, sw_size, location_spec_names);
     if (event_manager_) {
         event_manager_->Publish(cache_get_event);
+    }
+
+    std::vector<ReplicationHint> hints;
+    CollectReplicationHints(side_effects, hints);
+    if (service_metrics_collector && !request_context->caller_node().node_id.empty()) {
+        uint64_t local_hit = 0, remote_hit = 0;
+        for (const auto &key_locs : locations_per_key) {
+            CountReadLocality(key_locs, request_context->caller_node().node_id, local_hit, remote_hit);
+        }
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(service_metrics_collector, affinity, read_local_hit, local_hit);
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(service_metrics_collector, affinity, read_remote_hit, remote_hit);
+        KVCM_METRICS_COLLECTOR_ADD_METRICS(
+            service_metrics_collector, affinity, hint_emitted, static_cast<uint64_t>(hints.size()));
+    }
+    if (out_hints != nullptr) {
+        out_hints->insert(
+            out_hints->end(), std::make_move_iterator(hints.begin()), std::make_move_iterator(hints.end()));
     }
 
     BatchLocationsView result;
@@ -1477,6 +1511,27 @@ CacheManager::ReplicateCaches(RequestContext *request_context,
         std::vector<size_t> state_indices;
     };
 
+    // Scope is item-local, including on early returns or exceptions. A caller
+    // reusing its context must not turn subsequent ordinary writes into copies.
+    struct ReplicationContextGuard {
+        RequestContext *context;
+        bool is_replication;
+        std::string target_node_id;
+        std::set<std::string> spec_names;
+        ~ReplicationContextGuard() {
+            context->set_is_replication(is_replication);
+            context->set_replication_target_node_id(std::move(target_node_id));
+            context->set_replication_spec_names(std::move(spec_names));
+        }
+    } context_guard{request_context,
+                    request_context->is_replication(),
+                    request_context->replication_target_node_id(),
+                    request_context->replication_spec_names()};
+    std::set<std::string> registered_specs;
+    const auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (instance_info) {
+        for (const auto &spec : instance_info->location_spec_infos()) registered_specs.insert(spec.name());
+    }
     std::vector<State> states(hints.size());
     request_context->set_is_replication(true);
     auto finish = [&](State &state, bool success) {
@@ -1497,6 +1552,32 @@ CacheManager::ReplicateCaches(RequestContext *request_context,
             state.failure_stage = State::FailureStage::Allocation;
             continue;
         }
+        if (!instance_info) {
+            state.ec = EC_INSTANCE_NOT_EXIST;
+            state.failure_stage = State::FailureStage::Allocation;
+            continue;
+        }
+        std::unordered_map<std::string, std::string> sources;
+        std::set<std::string> source_spec_names;
+        for (const auto &source : hint.source_specs) {
+            auto name = source.spec_name;
+            // Legacy anonymous sources are unambiguous only for a single-spec
+            // instance. Never guess a spec from a multi-spec registration.
+            if (name.empty() && hint.source_specs.size() == 1 && registered_specs.size() == 1) {
+                name = *registered_specs.begin();
+            }
+            DataStorageUri source_uri(source.uri);
+            if (name.empty() || registered_specs.count(name) == 0 || source.uri.empty() ||
+                !source_uri.Valid() || source_uri.GetHostName().empty() ||
+                !sources.emplace(name, source.uri).second) {
+                state.ec = EC_BADARGS;
+                state.failure_stage = State::FailureStage::Copy;
+                break;
+            }
+            source_spec_names.insert(std::move(name));
+        }
+        if (state.ec != EC_OK) continue;
+        request_context->set_replication_spec_names(std::move(source_spec_names));
         request_context->set_replication_target_node_id(hint.target_node_id);
         auto [start_ec, write_info] = StartWriteCache(request_context,
                                                       instance_id,
@@ -1525,21 +1606,8 @@ CacheManager::ReplicateCaches(RequestContext *request_context,
             continue;
         }
 
-        std::unordered_map<std::string, std::string> sources;
-        for (const auto &source : hint.source_specs) {
-            if (source.uri.empty() || !sources.emplace(source.spec_name, source.uri).second) {
-                state.ec = EC_BADARGS;
-                state.failure_stage = State::FailureStage::Copy;
-                break;
-            }
-        }
         const auto &dest_specs = locations.front().location_specs();
-        if (state.ec == EC_OK && sources.size() == 1 && sources.begin()->first.empty() && dest_specs.size() == 1) {
-            auto uri = std::move(sources.begin()->second);
-            sources.clear();
-            sources.emplace(dest_specs.front().name(), std::move(uri));
-        }
-        if (state.ec == EC_OK && sources.size() != dest_specs.size()) {
+        if (sources.size() != dest_specs.size()) {
             state.ec = EC_BADARGS;
             state.failure_stage = State::FailureStage::Copy;
         }
@@ -2207,17 +2275,19 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
 
     const bool is_replication = request_context->is_replication();
     const std::string &replication_target_node_id = request_context->replication_target_node_id();
+    const auto &replication_spec_names = request_context->replication_spec_names();
     auto existsOnReplicationTarget =
-        [&replication_target_node_id, &check_loc_data_exist, &instance_info, &location_spec_group_names](
+        [&replication_target_node_id, &replication_spec_names, &check_loc_data_exist, &instance_info, &location_spec_group_names](
             size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
         out_prune_loc_ids.clear();
         if (replication_target_node_id.empty()) {
             return false;
         }
 
-        // Determine the set of spec names required for this block.
-        std::set<std::string> required_specs;
-        if (instance_info) {
+        // Server copies require exactly their named source scope. Direct
+        // replication writes retain the existing group/all-spec behavior.
+        std::set<std::string> required_specs = replication_spec_names;
+        if (required_specs.empty() && instance_info) {
             if (i < location_spec_group_names.size() && !location_spec_group_names[i].empty()) {
                 for (const auto &g : instance_info->location_spec_groups()) {
                     if (g.name() == location_spec_group_names[i]) {
@@ -2560,6 +2630,10 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
     spec_info_mapping.reserve(instance_info->location_spec_infos().size() * keys.size());
 
     for (const auto &spec_info : instance_info->location_spec_infos()) {
+        const auto &copy_specs = request_context->replication_spec_names();
+        if (request_context->is_replication() && !copy_specs.empty() && copy_specs.count(spec_info.name()) == 0) {
+            continue;
+        }
         if (location_spec_group_names.empty()) {
             for (size_t i = 0; i < keys.size(); i++) {
                 std::string block_key = MakeStorageKey(instance_id, spec_info.name(), keys[i]);
@@ -2642,6 +2716,10 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     for (const auto &spec_info : instance_info->location_spec_infos()) {
+        const auto &copy_specs = request_context->replication_spec_names();
+        if (request_context->is_replication() && !copy_specs.empty() && copy_specs.count(spec_info.name()) == 0) {
+            continue;
+        }
         std::vector<std::string> block_keys;
         std::vector<size_t> keys_idx;
         block_keys.reserve(keys.size());
@@ -2881,7 +2959,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
     // 按目标 storage 对 keys 分组：Mark 命中且目标 storage 存在 -> 路由到冷层；未命中 -> 默认 storage。
     // FilterWriteCache 已验证 target；若 backend 在两阶段之间消失，拒绝本次写并由重试重新过滤，
     // 不能 fallback 默认层，否则可能重复写一个原本已满足普通写条件的 block。
-    const bool has_tiered = tiered_targets.size() == keys.size();
+    const bool has_tiered = !request_context->is_replication() && tiered_targets.size() == keys.size();
     std::map<std::string, std::vector<size_t>> indices_by_storage;
     std::map<std::string, DataStorageType> type_by_storage;
     std::vector<size_t> default_indices;
@@ -4844,6 +4922,28 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
     return Jsonizable::ToJsonString(result);
 }
 
+void CacheManager::FillReadResolveContext(RequestContext *request_context,
+                                          const std::string &instance_id,
+                                          AffinityResolveContext &resolve_ctx) const {
+    resolve_ctx.instance_id = instance_id;
+    if (request_context) {
+        resolve_ctx.trace_id = request_context->trace_id();
+    }
+    if (!affinity_manager_) {
+        return;
+    }
+    auto info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (info) {
+        resolve_ctx.instance_strategy_json = info->affinity_strategy_json();
+        resolve_ctx.instance_group_name = info->instance_group_name();
+        resolve_ctx.group_strategy_json =
+            registry_manager_->GetGroupAffinityStrategyJson(request_context, info->instance_group_name());
+    }
+    if (request_context) {
+        resolve_ctx.caller_node = request_context->caller_node();
+    }
+}
+
 ErrorCode
 CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
@@ -4861,20 +4961,7 @@ CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
         return EC_ERROR;
     }
     AffinityResolveContext resolve_ctx;
-    resolve_ctx.instance_id = instance_id;
-    resolve_ctx.trace_id = trace_id;
-    if (affinity_manager_) {
-        auto info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-        if (info) {
-            resolve_ctx.instance_strategy_json = info->affinity_strategy_json();
-            resolve_ctx.instance_group_name = info->instance_group_name();
-            resolve_ctx.group_strategy_json =
-                registry_manager_->GetGroupAffinityStrategyJson(request_context, info->instance_group_name());
-        }
-        if (request_context) {
-            resolve_ctx.caller_node = request_context->caller_node();
-        }
-    }
+    FillReadResolveContext(request_context, instance_id, resolve_ctx);
     const AffinityResolveContext *resolve_ctx_ptr = affinity_manager_ ? &resolve_ctx : nullptr;
     ErrorCode ec = EC_ERROR;
     switch (query_type) {

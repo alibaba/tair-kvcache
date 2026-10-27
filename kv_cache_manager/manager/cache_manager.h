@@ -166,6 +166,8 @@ public:
                                    int64_t timestamp_ns,
                                    const std::vector<std::string> &location_spec_names);
 
+    // Uses request_context->caller_node() for read affinity like GetCacheLocation.
+    // Replication hints are appended to out_hints when it is non-null.
     std::pair<ErrorCode, BatchLocationsView>
     GetCacheLocationsByBackend(RequestContext *request_context,
                                const std::string &instance_id,
@@ -175,7 +177,8 @@ public:
                                const BlockMask &block_mask,
                                int32_t sw_size,
                                const std::vector<std::string> &location_spec_names,
-                               const std::vector<BackendSelector> &backend_selectors = {});
+                               const std::vector<BackendSelector> &backend_selectors = {},
+                               std::vector<ReplicationHint> *out_hints = nullptr);
 
     std::pair<ErrorCode, int64_t> GetCacheLocationLen(RequestContext *request_context,
                                                       const std::string &instance_id,
@@ -394,6 +397,11 @@ private:
                                           // Read side effects accumulated by meta_searcher;
                                           // caller downcasts to concrete types (e.g. ReplicationHint).
                                           std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
+    // Fills instance/group strategy JSON and the request caller for read-side
+    // affinity resolution. Only meaningful when affinity_manager_ is set.
+    void FillReadResolveContext(RequestContext *request_context,
+                                const std::string &instance_id,
+                                AffinityResolveContext &resolve_ctx) const;
     ErrorCode PerformCacheLocationQuery(RequestContext *request_context,
                                         ServiceMetricsCollector *service_metrics_collector,
                                         MetaSearcher *meta_searcher,

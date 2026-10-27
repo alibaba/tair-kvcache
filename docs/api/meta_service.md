@@ -258,6 +258,15 @@ node id/GA 的原始 `uri`。调用方应使用 `replica_locations` 做副本诊
 
 `GetCacheLocationRequest.caller.replication_capabilities` 为位图，bit 0（值 1）表示客户端支持按名称复制完整的多 spec 源。响应 `replication_capabilities` 返回双方支持能力的交集。未携带能力的旧客户端仍可读取全部位置，只接收单 spec 提示。新 SDK 默认声明值 1，仅在响应确认后使用多 spec 提示。未知位忽略；升级 SDK 与服务端可分批进行。HTTP/Python 调用方只有实现全部 spec 的原子发布后才应声明该位。
 
+### GetCacheLocationsByBackend 的亲和字段
+
+`GetCacheLocationsByBackendRequest.caller`（字段 10）、`GetCacheLocationsByBackendResponse.hints`（字段 3）
+和 `replication_capabilities`（字段 4）与 `GetCacheLocation` 同名字段格式和语义相同：
+按 key 选择位置的 backend（如 `LSS_WEIGHTED_RANDOM`）走与 `GetCacheLocation` 相同的读亲和合并，
+caller 节点有本地副本时优先返回本地 spec，热度达到阈值后在 `hints` 中返回复制提示，多 spec 提示同样要求
+具名 spec 能力位。EventReport backend 的 peer 选择（`LSS_V6D_PREFIX`、`LSS_V6D_COVERAGE`）不受 caller
+影响，也不产生提示。不带 caller 的旧客户端行为不变。
+
 ### 服务端复制
 
 新 SDK 对没有现成推理侧 buffer 的提示调用 `ReplicateCache`。服务端按 `target_node_id`

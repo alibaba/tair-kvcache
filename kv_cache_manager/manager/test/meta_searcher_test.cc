@@ -5277,6 +5277,60 @@ TEST_F(MetaSearcherTest, ReadSelectionWithNoopStrategyDegradesToFirstSeen) {
     EXPECT_TRUE(nid == "node_local" || nid == "node_remote");
 }
 
+// Per-key backend selectors share the affinity-aware merge with PrefixMatch.
+TEST_F(MetaSearcherTest, BatchGetBestLocationByBackendViaStrategyPicksLocal) {
+    MetaSearcher::KeyVector keys = {70030};
+
+    LocationSpec local("tp0", "uri_a", "node_local");
+    LocationSpec remote("tp0", "uri_b", "node_remote");
+    CacheLocationConstPtr loc_local =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {local});
+    CacheLocationConstPtr loc_remote =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {remote});
+
+    std::vector<MetaSearcher::AddLocationResult> ids_remote;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_remote}, ids_remote));
+    std::vector<MetaSearcher::AddLocationResult> ids_local;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_local}, ids_local));
+
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks = {{
+        {ids_remote[0].location_id, CLS_SERVING},
+        {ids_local[0].location_id, CLS_SERVING},
+    }};
+    std::vector<std::vector<ErrorCode>> upd;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, upd));
+
+    request_context_->set_caller_node_id("node_local");
+
+    auto mgr = std::make_shared<CacheAffinityManager>();
+    ASSERT_TRUE(mgr->LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})"));
+    AffinityResolveContext resolve_ctx;
+    resolve_ctx.caller_node.node_id = "node_local";
+
+    const std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+    for (int round = 0; round < 8; ++round) {
+        LocationsPerKey out;
+        std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+        ASSERT_EQ(EC_OK,
+                  meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(),
+                                                                keys,
+                                                                out,
+                                                                &policy_,
+                                                                selectors,
+                                                                {},
+                                                                BlockMask{},
+                                                                mgr.get(),
+                                                                &resolve_ctx,
+                                                                &side_effects));
+        ASSERT_EQ(1u, out.size());
+        ASSERT_EQ(1u, out[0].size());
+        ASSERT_EQ(1u, out[0][0]->location_specs().size());
+        EXPECT_EQ("node_local", out[0][0]->location_specs()[0].node_id()) << "round " << round;
+    }
+}
+
 TEST_F(MetaSearcherTest, ReplicaAdmissionSerializesCapacityAndCountsWritingReservations) {
     auto location = MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
         1, {LocationSpec("tp0", "tair_mempool://store/x?size=64", "a")});
