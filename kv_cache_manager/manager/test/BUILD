@@ -11,6 +11,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_reclaimer",
+        "//kv_cache_manager/manager:kv_meta_instance",
         "//kv_cache_manager/manager:migration_manager",
         "//kv_cache_manager/meta:meta_local_backend",
         "//kv_cache_manager/meta:meta_storage_backend_manager",
@@ -29,6 +30,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_garbage_collector",
+        "//kv_cache_manager/manager:kv_meta_instance",
         "//kv_cache_manager/manager:migration_manager",
         "@cpp_stub",
     ],
@@ -152,6 +154,39 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_manager",
         "@cpp_stub",
+    ],
+)
+
+cc_test(
+    name = "KvMetaManagerTest",
+    srcs = ["kv_meta_manager_test.cc"],
+    copts = ["-fno-access-control"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/manager:kv_meta_instance",
+        "//kv_cache_manager/manager:kv_meta_manager",
+        "//kv_cache_manager/manager:startup_config_loader",
+    ],
+)
+
+cc_test(
+    name = "KvMetaManagerRedisTest",
+    srcs = ["kv_meta_manager_test.cc"],
+    copts = ["-fno-access-control"],
+    local_defines = ["KVCM_REAL_REDIS_TEST"],
+    tags = ["manual", "redis"],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta",
+        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/manager:kv_meta_instance",
+        "//kv_cache_manager/manager:kv_meta_manager",
+        "//kv_cache_manager/manager:startup_config_loader",
     ],
 )
 

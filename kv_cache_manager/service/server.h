@@ -13,6 +13,7 @@ class Server;
 
 namespace kv_cache_manager {
 class DebugServiceImpl;
+class KvMetaServiceImpl;
 class AdminServiceImpl;
 class MetaServiceImpl;
 class CoordinationBackend;
@@ -21,10 +22,14 @@ class RegistryManager;
 class CacheManager;
 class EventManager;
 
+class KvMetaManager;
+
 class MetaServiceGRpc;
 class AdminServiceGRpc;
 class DebugServiceGRpc;
 class OptimizerEventServiceGRpc;
+
+class KvMetaServiceGRpc;
 class MetaServiceHttp;
 class AdminServiceHttp;
 class DebugServiceHttp;
@@ -63,10 +68,13 @@ private:
     std::shared_ptr<MetaServiceImpl> meta_impl_;
     std::shared_ptr<AdminServiceImpl> admin_impl_;
     std::shared_ptr<DebugServiceImpl> debug_impl_;
+    std::shared_ptr<KvMetaServiceImpl> kv_meta_impl_;
     std::shared_ptr<MetaServiceGRpc> meta_service_;
     std::shared_ptr<AdminServiceGRpc> admin_service_;
     std::shared_ptr<DebugServiceGRpc> debug_service_;
     std::shared_ptr<OptimizerEventServiceGRpc> optimizer_event_service_;
+
+    std::shared_ptr<KvMetaServiceGRpc> kv_meta_service_;
     std::shared_ptr<grpc::Server> rpc_server_;
     std::shared_ptr<grpc::Server> admin_rpc_server_;
     std::shared_ptr<MetaServiceHttp> meta_http_service_;
@@ -81,6 +89,7 @@ private:
     std::shared_ptr<LeaderElector> leader_elector_;
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<CacheManager> cache_manager_;
+    std::shared_ptr<KvMetaManager> kv_meta_manager_;
 
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<MetricsLifecycle> metrics_lifecycle_;
