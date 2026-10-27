@@ -1,5 +1,8 @@
+#include <array>
 #include <memory>
+#include <vector>
 
+#include "kmonitor/client/core/MetricsTags.h"
 #include "kmonitor/client/core/MutableMetric.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/registry_manager.h"
@@ -15,6 +18,34 @@ using namespace kv_cache_manager;
 
 namespace {
 thread_local double reported_error_qps = 0;
+struct ReportedLifetime {
+    std::string name;
+    MetricsTags tags;
+    double value;
+};
+thread_local std::vector<ReportedLifetime> reported_lifetimes;
+
+void CaptureEventAges(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
+    const auto pos = metric->metric_name_.find("cache_manager_instance.event_report_location_lifetime_");
+    if (pos != std::string::npos) {
+        reported_lifetimes.push_back({metric->metric_name_.substr(pos), tags->GetTagsMap(), value});
+    }
+}
+
+void ExpectLifetime(const std::vector<ReportedLifetime> &reported,
+                    size_t offset,
+                    const MetricsTags &tags,
+                    const EventReportMetricsCollector::LocationLifetimeSample &sample) {
+    ASSERT_GE(reported.size(), offset + 3);
+    const std::array<const char *, 3> suffixes{"min", "max", "avg"};
+    const std::array<int64_t, 3> values{sample.min_us, sample.max_us, sample.avg_us};
+    for (size_t i = 0; i < suffixes.size(); ++i) {
+        EXPECT_EQ(std::string("cache_manager_instance.event_report_location_lifetime_") + suffixes[i] + "_us",
+                  reported[offset + i].name);
+        EXPECT_EQ(tags, reported[offset + i].tags);
+        EXPECT_DOUBLE_EQ(values[i], reported[offset + i].value);
+    }
+}
 
 void CaptureErrorQps(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *, double value) {
     if (metric->metric_name_.find("service.error_qps") != std::string::npos) {
@@ -204,4 +235,47 @@ TEST_F(KmonitorMetricsReporterTest, RequestOutcomeControlsKmonitorAndLocalErrorC
     EXPECT_DOUBLE_EQ(2., reported_error_qps);
     EXPECT_EQ(2u, collector.get_service_error_counter_metrics());
     EXPECT_EQ(4u, collector.get_service_query_counter_metrics());
+}
+
+TEST_F(KmonitorMetricsReporterTest, LifetimeSamplesAreReportedPerRequestWithInstanceTags) {
+    Stub stub;
+    auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+        &kmonitor::MutableMetric::Report);
+    stub.set(report, CaptureEventAges);
+    reported_lifetimes.clear();
+    const MetricsTags tags{{"api_name", "ReportEvent"},
+                           {"instance_group", "group_a"},
+                           {"instance_id", "instance_a"},
+                           {"type", "event_report_l2"},
+                           {"event_type", "block_delete"}};
+    const MetricsTags lifetime_tags{{"instance_group", "group_a"}, {"instance_id", "instance_a"}};
+    EventReportMetricsCollector cached(metrics_registry_, tags);
+    ASSERT_TRUE(cached.Init());
+    EventReportMetricsCollector first(cached);
+    EventReportMetricsCollector second(cached);
+    first.SetLocationLifetimeSample({10, 30, 20});
+    second.SetLocationLifetimeSample({100, 300, 200});
+    // The shared gauge can hold another request's value; KMonitor must read
+    // the private sample, without stealing or clearing the other request.
+    second.UpdateLocationLifetimeMetrics();
+    reporter_->ReportPerQuery(&first);
+    reporter_->ReportPerQuery(&second);
+    ASSERT_EQ(6u, reported_lifetimes.size());
+    ExpectLifetime(reported_lifetimes, 0, lifetime_tags, {10, 30, 20});
+    ExpectLifetime(reported_lifetimes, 3, lifetime_tags, {100, 300, 200});
+
+    EventReportMetricsCollector empty(first);
+    reporter_->ReportPerQuery(&empty);
+    EXPECT_EQ(6u, reported_lifetimes.size());
+    reporter_->ReportInterval();
+    reporter_->ReportInterval();
+    EXPECT_EQ(6u, reported_lifetimes.size());
+
+    EventReportMetricsCollector zero(cached);
+    zero.SetLocationLifetimeSample({0, 0, 0});
+    // Completed requests still report their private sample after instance removal.
+    metrics_registry_->RemoveByTagFilter({{"instance_id", "instance_a"}});
+    reporter_->ReportPerQuery(&zero);
+    ASSERT_EQ(9u, reported_lifetimes.size());
+    ExpectLifetime(reported_lifetimes, 6, lifetime_tags, {0, 0, 0});
 }

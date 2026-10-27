@@ -3993,12 +3993,25 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         for (const auto &tasks : delete_tasks) {
             delete_target_count += tasks.size();
         }
+        MetaSearcher::DeletedLocationAgeStats create_age_stats;
         meta_searcher->BatchDeleteLocationSpecs(request_context,
                                                 del_keys_aggr,
                                                 delete_tasks,
                                                 per_location_ec,
                                                 &missing_delete_targets,
-                                                acquire_write_lease);
+                                                acquire_write_lease,
+                                                &create_age_stats);
+
+        if (create_age_stats.count > 0) {
+            for (const auto &collector : request_context->GetMetricsCollectorsVehicle().GetMetricsCollectors()) {
+                auto *event_collector = dynamic_cast<EventReportMetricsCollector *>(collector.get());
+                if (event_collector && !event_collector->GetLocationLifetimeMetricsTags().empty()) {
+                    event_collector->SetLocationLifetimeSample(
+                        {create_age_stats.min_us, create_age_stats.max_us, create_age_stats.avg_us});
+                    break;
+                }
+            }
+        }
 
         for (size_t k = 0; k < del_keys_aggr.size(); ++k) {
             ErrorCode key_ec = EC_OK;
@@ -4763,8 +4776,33 @@ ErrorCode CacheManager::DoCleanup() {
     if (write_location_manager_) {
         write_location_manager_->DoCleanup();
     }
-    if (meta_searcher_manager_) {
-        meta_searcher_manager_->DoCleanup();
+    {
+        std::unique_lock lifecycle_guard(metrics_lifecycle_->mut_);
+        // New requests must bind fresh lifetime handles after recovery. Late
+        // requests retain detached handles and cannot recreate purged series.
+        if (meta_indexer_manager_ && on_instance_removed_) {
+            for (const auto &[instance_id, indexer] : meta_indexer_manager_->GetIndexers()) {
+                on_instance_removed_(instance_id);
+            }
+        }
+        if (meta_searcher_manager_) {
+            meta_searcher_manager_->DoCleanup();
+        }
+        if (metrics_registry_) {
+            for (const auto &name : {SCOPED_METRICS_NAME_(CacheManagerInstanceMetricsCollector,
+                                                          cache_manager_instance,
+                                                          event_report_location_lifetime_min_us),
+                                     SCOPED_METRICS_NAME_(CacheManagerInstanceMetricsCollector,
+                                                          cache_manager_instance,
+                                                          event_report_location_lifetime_max_us),
+                                     SCOPED_METRICS_NAME_(CacheManagerInstanceMetricsCollector,
+                                                          cache_manager_instance,
+                                                          event_report_location_lifetime_avg_us)}) {
+                if (auto data = metrics_registry_->GetMetricsData(name)) {
+                    data->RemoveByTagFilter({});
+                }
+            }
+        }
     }
     if (meta_indexer_manager_) {
         meta_indexer_manager_->DoCleanup();

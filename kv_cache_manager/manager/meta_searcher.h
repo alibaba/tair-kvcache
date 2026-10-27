@@ -293,6 +293,14 @@ public:
                                           std::vector<MergeLocationSpecsTask> &flat_tasks,
                                           std::vector<ErrorCode> &out_per_key_ec,
                                           AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
+    // Per-call statistics of successfully removed whole locations. count is
+    // used for the batch average/empty check; it is not a cumulative metric.
+    struct DeletedLocationAgeStats {
+        size_t count = 0;
+        int64_t min_us = 0;
+        int64_t max_us = 0;
+        int64_t avg_us = 0;
+    };
     struct DeleteLocationSpecsTask {
         std::string location_id;
         std::vector<std::string> spec_names;
@@ -317,13 +325,15 @@ public:
     // tasks_per_key and marks missing block/location no-ops; an existing
     // location with only missing spec_names is not marked. The optional write
     // lease is acquired once after the metadata read and before the first
-    // mutation.
+    // mutation. Optional age statistics include only successful whole-location
+    // deletions with a valid creation timestamp, never partial-spec/no-op deletes.
     ErrorCode BatchDeleteLocationSpecs(RequestContext *request_context,
                                        const KeyVector &keys,
                                        const std::vector<std::vector<DeleteLocationSpecsTask>> &tasks_per_key,
                                        std::vector<std::vector<ErrorCode>> &out_batch_results,
                                        std::vector<std::vector<bool>> *out_missing_targets = nullptr,
-                                       AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
+                                       AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr,
+                                       DeletedLocationAgeStats *out_create_age_stats = nullptr);
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;

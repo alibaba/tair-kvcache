@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -324,8 +325,8 @@ public:
 
 // Lightweight per-event observability for ReportEvent. It reuses service.*
 // metrics for request outcome and carries only request_key_count from the
-// manager metric family, rather than registering every manager/meta metric
-// from ServiceMetricsCollector.
+// manager metric family. Block-delete collectors also own the instance-tagged
+// lifetime gauges, without registering every manager/meta metric.
 class EventReportMetricsCollector final : public MetricsCollector {
     KVCM_COUNTER_METRICS(service, query_counter)
     KVCM_GAUGE_METRICS(service, query_rt_us)
@@ -334,6 +335,13 @@ class EventReportMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(manager, request_key_count)
 
 public:
+    // One successful deletion batch, reported once with its owning request.
+    struct LocationLifetimeSample {
+        int64_t min_us = 0;
+        int64_t max_us = 0;
+        int64_t avg_us = 0;
+    };
+
     EventReportMetricsCollector() = delete;
     EventReportMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry, MetricsTags metrics_tags) noexcept;
     EventReportMetricsCollector(const EventReportMetricsCollector &shared_collector) noexcept;
@@ -364,8 +372,27 @@ public:
     [[nodiscard]] double GetRequestKeyCountSample() const noexcept {
         return has_request_key_count_sample_ ? request_key_count_sample_ : get_manager_request_key_count_metrics();
     }
+    void SetLocationLifetimeSample(const LocationLifetimeSample &sample) noexcept {
+        if (!location_lifetime_metrics_tags_.empty()) {
+            location_lifetime_sample_ = sample;
+        }
+    }
+    [[nodiscard]] const std::optional<LocationLifetimeSample> &GetLocationLifetimeSample() const noexcept {
+        return location_lifetime_sample_;
+    }
+    [[nodiscard]] const MetricsTags &GetLocationLifetimeMetricsTags() const noexcept {
+        return location_lifetime_metrics_tags_;
+    }
+    // Write only the handles bound during Init, so a late request cannot
+    // recreate a series removed from the registry.
+    void UpdateLocationLifetimeMetrics();
 
 private:
+    MetricsTags location_lifetime_metrics_tags_;
+    Gauge location_lifetime_min_us_metrics_;
+    Gauge location_lifetime_max_us_metrics_;
+    Gauge location_lifetime_avg_us_metrics_;
+    std::optional<LocationLifetimeSample> location_lifetime_sample_;
     double request_rt_us_sample_ = 0.0;
     double error_code_sample_ = 0.0;
     double request_key_count_sample_ = 0.0;
@@ -501,6 +528,10 @@ class CacheManagerInstanceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(cache_manager_instance, async_pipeline_error_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, async_dropped_key_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, async_dropped_metadata_count)
+
+    KVCM_GAUGE_METRICS(cache_manager_instance, event_report_location_lifetime_min_us)
+    KVCM_GAUGE_METRICS(cache_manager_instance, event_report_location_lifetime_max_us)
+    KVCM_GAUGE_METRICS(cache_manager_instance, event_report_location_lifetime_avg_us)
 
 public:
     CacheManagerInstanceMetricsCollector() = delete;

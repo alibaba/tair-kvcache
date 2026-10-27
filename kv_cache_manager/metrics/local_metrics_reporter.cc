@@ -65,6 +65,7 @@ void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::opti
         } while (false);
     } else if (dynamic_cast<EventReportMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<EventReportMetricsCollector *>(collector);
+        p->UpdateLocationLifetimeMetrics();
         Counter service_query_counter;
         COPY_METRICS_(p, service, query_counter, service_query_counter);
         ++service_query_counter;

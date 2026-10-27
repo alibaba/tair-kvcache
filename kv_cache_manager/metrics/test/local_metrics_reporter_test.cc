@@ -288,6 +288,33 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQueryEventReport) {
     EXPECT_EQ(1, value);
 }
 
+TEST_F(LocalMetricsReporterTest, LifetimeSamplesReachPrometheusAtRequestCompletion) {
+    const MetricsTags tags{{"api_name", "ReportEvent"},
+                           {"instance_group", "group_a"},
+                           {"instance_id", "instance_a"},
+                           {"type", "event_report_l2"},
+                           {"event_type", "block_delete"}};
+    auto service_collector = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    ASSERT_TRUE(service_collector->Init());
+    EventReportMetricsCollector cached(metrics_registry_, tags);
+    ASSERT_TRUE(cached.Init());
+    auto request_collector = std::make_shared<EventReportMetricsCollector>(cached);
+    request_collector->SetLocationLifetimeSample({0, 0, 0});
+    EXPECT_EQ(std::string::npos,
+              PrometheusExporter::Expose(*metrics_registry_).find("event_report_location_lifetime_"));
+    RequestContext context("lifetime_sample", service_collector);
+    context.set_status_code(RequestContext::kOkStatusCode);
+    context.GetMetricsCollectorsVehicle().AddMetricsCollector(request_collector);
+    { ServiceCallGuard guard(cache_manager_.get(), &context, reporter_.get()); }
+
+    const auto output = PrometheusExporter::Expose(*metrics_registry_);
+    for (const auto *suffix : {"min", "max", "avg"}) {
+        const auto series = std::string("kvcm_cache_manager_instance_event_report_location_lifetime_") + suffix +
+                            "_us{instance_group=\"group_a\",instance_id=\"instance_a\"} 0\n";
+        EXPECT_NE(std::string::npos, output.find(series));
+    }
+}
+
 TEST_F(LocalMetricsReporterTest, ConcurrentEventCollectorsDoNotShareErrorSamples) {
     const MetricsTags tags{{"event_type", "block_snapshot"}};
     EventReportMetricsCollector success(metrics_registry_, tags);

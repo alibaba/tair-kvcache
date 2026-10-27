@@ -16,6 +16,7 @@
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/migration_strategy.h"
@@ -41,9 +42,12 @@
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/utils.h"
+#include "kv_cache_manager/metrics/local_metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "kv_cache_manager/metrics/prometheus_exporter.h"
+#include "kv_cache_manager/service/meta_service_metrics_base.h"
 #include "stub.h"
 
 namespace {
@@ -4128,6 +4132,269 @@ TEST_F(CacheManagerTest, TestReportEventSameRequestDeltaOrderUsesLastOperationPe
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=final_add"));
     EXPECT_NE(std::string::npos, visible.front().find("s_version=" + token));
+}
+
+class ReportEventLifetimeTest : public CacheManagerTest {
+public:
+    void SetUp() override {
+        CacheManagerTest::SetUp();
+        backend_ = InstallEventReportBackend();
+        ASSERT_NE(nullptr, backend_);
+        InitializeEventReporter("test_instance", host_, proto::meta::ST_EVENT_REPORT_L2);
+        event_metrics_ = std::make_unique<MetaServiceMetricsBase>(
+            metrics_registry_, cache_manager_->GetRegistryManager(), cache_manager_->metrics_lifecycle());
+        cache_manager_->SetOnInstanceRemoved(
+            [this](const std::string &id) { event_metrics_->InvalidateCollectorCache(id); });
+        auto manager = std::shared_ptr<CacheManager>(cache_manager_.get(), [](CacheManager *) {});
+        ASSERT_TRUE(reporter_.Init(manager, metrics_registry_, ""));
+    }
+
+    void TearDown() override {
+        cache_manager_->SetOnInstanceRemoved(nullptr);
+        CacheManagerTest::TearDown();
+    }
+
+    std::pair<ErrorCode, proto::meta::ReportEventResponse>
+    CallReportEvent(const proto::meta::ReportEventRequest &request, const std::string &trace_id) {
+        RequestContext context(trace_id);
+        event_metrics_->AttachReportEventTypeMetricsCollectors(request, "event_report_l2", &context);
+        proto::meta::ReportEventResponse response;
+        const auto ec = cache_manager_->ReportEvent(&context, &request, &response);
+        for (const auto &collector : context.GetMetricsCollectorsVehicle().GetMetricsCollectors()) {
+            reporter_.ReportPerQuery(collector.get());
+        }
+        return {ec, std::move(response)};
+    }
+
+    proto::meta::ReportEventRequest MakeDelete(const KeyVector &keys,
+                                               const std::vector<std::string> &specs,
+                                               const std::string &instance_id = "test_instance") {
+        proto::meta::ReportEventRequest request;
+        request.set_instance_id(instance_id);
+        request.set_host_ip_port(host_);
+        request.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
+        for (const auto key : keys) {
+            auto *event = request.add_events();
+            event->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
+            auto *params = event->mutable_block_delete();
+            params->set_block_key(std::to_string(key));
+            params->set_medium("mem");
+            for (const auto &spec : specs) {
+                params->add_spec_names(spec);
+            }
+        }
+        return request;
+    }
+
+    void SetCreationTimes(const KeyVector &keys, const std::vector<int64_t> &times) {
+        auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+        const auto result = indexer->ReadModifyWriteLocation(
+            request_context_.get(),
+            keys,
+            LocationIdsPerKey(keys.size(), {backend_->BuildLocationId("mem", host_)}),
+            [&times](const auto &ecs, const auto &, size_t index, CacheLocationVector &locations, auto &) {
+                auto location = std::make_shared<CacheLocation>(*locations.front());
+                location->set_create_time(times[index]);
+                locations.front() = std::move(location);
+                return LocationModifierResult{MA_OK, ecs};
+            });
+        ASSERT_EQ(EC_OK, result.ec);
+    }
+
+    std::optional<double> Metric(const std::string &suffix, const std::string &instance_id = "test_instance") {
+        auto data = metrics_registry_->GetMetricsData("cache_manager_instance.event_report_location_lifetime_" +
+                                                      suffix + "_us");
+        if (!data) {
+            return std::nullopt;
+        }
+        auto gauge = data->GetGauge({{"instance_group", "default"}, {"instance_id", instance_id}});
+        return gauge && gauge->GetRaw()->touched.load() ? std::optional<double>(gauge->Get()) : std::nullopt;
+    }
+
+    std::unique_ptr<MetaServiceMetricsBase> event_metrics_;
+    LocalMetricsReporter reporter_;
+    std::shared_ptr<EventReportBackend> backend_;
+    const std::string host_ = "192.168.10.91:8080";
+};
+
+TEST_F(ReportEventLifetimeTest, PublishesOnlyFinalDeletesAndReplacesLastBatch) {
+    const int64_t now = TimestampUtil::GetCurrentTimeUs();
+    for (const auto key : {101, 102}) {
+        auto add = MakeAddRequest(host_, key, "initial");
+        auto *spec = add.mutable_events(0)->mutable_block_add()->add_specs();
+        spec->set_name("tp1");
+        spec->set_uri("event_report://" + host_ + "/mem?source=tp1");
+        ASSERT_EQ(EC_OK, CallReportEvent(add, "lifetime_add").first);
+    }
+    SetCreationTimes({101, 102}, {now - 1000000, now - 3000000});
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeDelete({101, 102}, {"tp0"}), "lifetime_partial_delete").first);
+    EXPECT_FALSE(Metric("avg").has_value());
+
+    const auto remove = MakeDelete({101, 102}, {"tp1"});
+    ASSERT_EQ(EC_OK, CallReportEvent(remove, "lifetime_final_delete").first);
+    const int64_t elapsed = TimestampUtil::GetCurrentTimeUs() - now;
+    ASSERT_TRUE(Metric("min").has_value());
+    ASSERT_TRUE(Metric("max").has_value());
+    ASSERT_TRUE(Metric("avg").has_value());
+    EXPECT_GE(*Metric("min"), 1000000);
+    EXPECT_LE(*Metric("min"), 1000000 + elapsed);
+    EXPECT_GE(*Metric("max"), 3000000);
+    EXPECT_LE(*Metric("max"), 3000000 + elapsed);
+    EXPECT_GE(*Metric("avg"), 2000000);
+    EXPECT_LE(*Metric("avg"), 2000000 + elapsed);
+
+    const auto previous = Metric("avg");
+    ASSERT_EQ(EC_OK, CallReportEvent(remove, "lifetime_repeat_delete").first);
+    EXPECT_EQ(previous, Metric("avg"));
+
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeAddRequest(host_, 103, "next_batch"), "lifetime_next_add").first);
+    SetCreationTimes({103}, {TimestampUtil::GetCurrentTimeUs() - 10000000});
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeDelete({103}, {"tp0"}), "lifetime_next_delete").first);
+    EXPECT_GE(*Metric("min"), 10000000);
+    EXPECT_EQ(Metric("min"), Metric("max"));
+    EXPECT_EQ(Metric("min"), Metric("avg"));
+}
+
+TEST_F(ReportEventLifetimeTest, IsolatesInstancesAndRemovesOnlyRetiredSeries) {
+    const std::string other = "other_instance";
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     other,
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>())
+                  .first);
+    InitializeEventReporter(other, host_, proto::meta::ST_EVENT_REPORT_L2);
+
+    for (const std::string instance_id : {"test_instance", "other_instance"}) {
+        auto add = MakeAddRequest(host_, 101, "isolated");
+        add.set_instance_id(instance_id);
+        ASSERT_EQ(EC_OK, CallReportEvent(add, "lifetime_instance_add").first);
+        ASSERT_EQ(EC_OK, CallReportEvent(MakeDelete({101}, {"tp0"}, instance_id), "lifetime_instance_delete").first);
+        ASSERT_TRUE(Metric("avg", instance_id).has_value());
+    }
+    const auto other_value = Metric("avg", other);
+    for (const auto *suffix : {"min", "max", "avg"}) {
+        auto data = metrics_registry_->GetMetricsData(
+            std::string("cache_manager_instance.event_report_location_lifetime_") + suffix + "_us");
+        ASSERT_NE(nullptr, data);
+        EXPECT_EQ(2u, data->GetSize());
+        for (const auto &[tags, value] : data->GetMetricsValues()) {
+            EXPECT_EQ(2u, tags.size());
+            EXPECT_EQ("default", tags.at("instance_group"));
+        }
+    }
+    ASSERT_EQ(EC_OK, cache_manager_->RemoveInstance(request_context_.get(), "default", "test_instance"));
+    EXPECT_FALSE(Metric("avg").has_value());
+    EXPECT_EQ(other_value, Metric("avg", other));
+}
+
+TEST_F(ReportEventLifetimeTest, ReportsSuccessfulDeletesWhenAnotherEventFails) {
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeAddRequest(host_, 101, "partial_failure"), "lifetime_add").first);
+    SetCreationTimes({101}, {TimestampUtil::GetCurrentTimeUs() - 1000000});
+    auto request = MakeDelete({101, 102}, {"tp0"});
+    request.mutable_events(1)->mutable_block_delete()->set_block_key("invalid");
+    EXPECT_NE(EC_OK, CallReportEvent(request, "lifetime_partial_failure").first);
+    ASSERT_TRUE(Metric("avg"));
+    EXPECT_GE(*Metric("avg"), 1000000);
+    EXPECT_EQ(Metric("min"), Metric("max"));
+    EXPECT_EQ(Metric("min"), Metric("avg"));
+    const auto previous = Metric("avg");
+    EXPECT_NE(EC_OK, CallReportEvent(request, "lifetime_partial_failure_retry").first);
+    EXPECT_EQ(previous, Metric("avg"));
+}
+
+namespace lifetime_test_stub {
+std::function<void()> on_drain;
+
+std::vector<int64_t> GetActiveKeys(void *, const std::string &instance_id) {
+    if (instance_id == "retiring_instance" && on_drain) {
+        on_drain();
+    }
+    return {};
+}
+
+} // namespace lifetime_test_stub
+
+TEST_F(ReportEventLifetimeTest, OtherInstanceRemovalDoesNotBlockDeletionForMetrics) {
+    ASSERT_EQ(EC_OK,
+              cache_manager_
+                  ->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "retiring_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     {})
+                  .first);
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeAddRequest(host_, 101, "before_removal"), "lifetime_add").first);
+    ASSERT_NE(
+        nullptr,
+        event_metrics_->GetTypedMetricsCollectorForReportEventType("test_instance", "event_report_l2", "block_delete"));
+    std::promise<void> drain_entered;
+    std::promise<void> release_drain;
+    auto entered = drain_entered.get_future();
+    auto released = release_drain.get_future().share();
+    lifetime_test_stub::on_drain = [&] {
+        drain_entered.set_value();
+        released.wait();
+    };
+    Stub stub;
+    stub.set(ADDR(MigrationManager, GetActiveBlockKeysForInstance), lifetime_test_stub::GetActiveKeys);
+    auto removal = std::async(std::launch::async, [&] {
+        RequestContext context("remove_other_instance");
+        return cache_manager_->RemoveInstance(&context, "default", "retiring_instance");
+    });
+    const auto drain_status = entered.wait_for(std::chrono::seconds(5));
+    if (drain_status != std::future_status::ready) {
+        release_drain.set_value();
+        removal.get();
+        lifetime_test_stub::on_drain = {};
+        EXPECT_EQ(std::future_status::ready, drain_status);
+        return;
+    }
+    auto deletion = std::async(
+        std::launch::async, [&] { return CallReportEvent(MakeDelete({101}, {"tp0"}), "delete_during_other_removal"); });
+    const auto deletion_status = deletion.wait_for(std::chrono::seconds(5));
+    // Release before assertions/join, so a regression fails without hanging.
+    release_drain.set_value();
+    EXPECT_EQ(std::future_status::ready, deletion_status);
+    EXPECT_EQ(EC_OK, deletion.get().first);
+    EXPECT_EQ(EC_OK, removal.get());
+    lifetime_test_stub::on_drain = {};
+    EXPECT_TRUE(Metric("avg"));
+}
+
+TEST_F(ReportEventLifetimeTest, CleanupInvalidatesHandlesAndRecoveryBindsNewSeries) {
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeAddRequest(host_, 101, "cleanup"), "lifetime_add").first);
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeDelete({101}, {"tp0"}), "lifetime_delete").first);
+    ASSERT_TRUE(Metric("avg"));
+    auto cached = std::dynamic_pointer_cast<EventReportMetricsCollector>(
+        event_metrics_->GetTypedMetricsCollectorForReportEventType("test_instance", "event_report_l2", "block_delete"));
+    ASSERT_NE(nullptr, cached);
+    EventReportMetricsCollector late_request(*cached);
+    late_request.SetLocationLifetimeSample({10, 30, 20});
+
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    reporter_.ReportPerQuery(&late_request);
+    EXPECT_FALSE(Metric("avg"));
+    EXPECT_EQ(std::string::npos,
+              PrometheusExporter::Expose(*metrics_registry_)
+                  .find("kvcm_cache_manager_instance_event_report_location_lifetime_"));
+
+    ASSERT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeAddRequest(host_, 102, "recovered"), "lifetime_recovered_add").first);
+    ASSERT_EQ(EC_OK, CallReportEvent(MakeDelete({102}, {"tp0"}), "lifetime_recovered_delete").first);
+    ASSERT_TRUE(Metric("avg"));
+    const auto recovered_value = Metric("avg");
+    auto current =
+        event_metrics_->GetTypedMetricsCollectorForReportEventType("test_instance", "event_report_l2", "block_delete");
+    EXPECT_NE(cached, current);
+    reporter_.ReportPerQuery(&late_request);
+    EXPECT_EQ(recovered_value, Metric("avg"));
 }
 
 TEST_F(CacheManagerTest, TestReportEventFlatFoldMatchesReferenceAcrossBlocksMediaAndSpecs) {
