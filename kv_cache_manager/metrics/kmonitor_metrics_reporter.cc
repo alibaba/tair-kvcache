@@ -158,6 +158,8 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_reclaimer, group_lru_skipped_instance_count);
     DECLARE_METRICS(cache_reclaimer, group_lru_failed_instance_count);
     DECLARE_METRICS(cache_reclaimer, group_lru_sampled_key_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_eligibility_read_key_count);
+    DECLARE_METRICS(cache_reclaimer, group_lru_eligibility_read_batch_count);
     DECLARE_METRICS(cache_reclaimer, group_lru_candidate_count);
     DECLARE_METRICS(cache_reclaimer, group_lru_selected_block_count);
     DECLARE_METRICS(cache_reclaimer, group_lru_submitted_block_count);
@@ -471,6 +473,8 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_skipped_instance_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_failed_instance_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_sampled_key_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_eligibility_read_key_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_eligibility_read_batch_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_candidate_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_selected_block_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, group_lru_submitted_block_count);
@@ -822,6 +826,8 @@ void KmonitorMetricsReporter::ReportInterval() {
         std::uint64_t group_lru_skipped_instance_count_v;
         std::uint64_t group_lru_failed_instance_count_v;
         std::uint64_t group_lru_sampled_key_count_v;
+        std::uint64_t group_lru_eligibility_read_key_count_v;
+        std::uint64_t group_lru_eligibility_read_batch_count_v;
         std::uint64_t group_lru_candidate_count_v;
         std::uint64_t group_lru_selected_block_count_v;
         std::uint64_t group_lru_submitted_block_count_v;
@@ -897,6 +903,9 @@ void KmonitorMetricsReporter::ReportInterval() {
         GET_METRICS_(cr, cache_reclaimer, group_lru_skipped_instance_count, group_lru_skipped_instance_count_v);
         GET_METRICS_(cr, cache_reclaimer, group_lru_failed_instance_count, group_lru_failed_instance_count_v);
         GET_METRICS_(cr, cache_reclaimer, group_lru_sampled_key_count, group_lru_sampled_key_count_v);
+        GET_METRICS_(cr, cache_reclaimer, group_lru_eligibility_read_key_count, group_lru_eligibility_read_key_count_v);
+        GET_METRICS_(
+            cr, cache_reclaimer, group_lru_eligibility_read_batch_count, group_lru_eligibility_read_batch_count_v);
         GET_METRICS_(cr, cache_reclaimer, group_lru_candidate_count, group_lru_candidate_count_v);
         GET_METRICS_(cr, cache_reclaimer, group_lru_selected_block_count, group_lru_selected_block_count_v);
         GET_METRICS_(cr, cache_reclaimer, group_lru_submitted_block_count, group_lru_submitted_block_count_v);
@@ -990,6 +999,12 @@ void KmonitorMetricsReporter::ReportInterval() {
             cache_reclaimer, group_lru_failed_instance_count, static_cast<double>(group_lru_failed_instance_count_v));
         REPORT_METRICS(
             cache_reclaimer, group_lru_sampled_key_count, static_cast<double>(group_lru_sampled_key_count_v));
+        REPORT_METRICS(cache_reclaimer,
+                       group_lru_eligibility_read_key_count,
+                       static_cast<double>(group_lru_eligibility_read_key_count_v));
+        REPORT_METRICS(cache_reclaimer,
+                       group_lru_eligibility_read_batch_count,
+                       static_cast<double>(group_lru_eligibility_read_batch_count_v));
         REPORT_METRICS(cache_reclaimer, group_lru_candidate_count, static_cast<double>(group_lru_candidate_count_v));
         REPORT_METRICS(
             cache_reclaimer, group_lru_selected_block_count, static_cast<double>(group_lru_selected_block_count_v));

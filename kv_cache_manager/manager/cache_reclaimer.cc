@@ -139,6 +139,8 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_collected_instance_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_skipped_instance_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_failed_instance_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_sampled_key_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_eligibility_read_key_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_eligibility_read_batch_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_candidate_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_selected_block_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(group_lru_submitted_block_count);
@@ -603,6 +605,15 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
         workers_.emplace_back([this] { WorkerRoutine(); });
     }
     KVCM_LOG_INFO("cache reclaimer initialized with [%u] worker(s)", worker_size);
+    KVCM_LOG_INFO(
+        "Group LRU discovery: lazy_eligibility_enabled[%d] parallel_eligibility_enabled[%d] "
+        "eligibility_read_concurrency[%zu] effective_eligibility_read_concurrency[%zu]",
+        group_lru_config_.lazy_eligibility_enabled,
+        group_lru_config_.parallel_eligibility_enabled,
+        group_lru_config_.eligibility_read_concurrency,
+        group_lru_config_.parallel_eligibility_enabled
+            ? std::max(std::size_t{1}, std::min(group_lru_config_.eligibility_read_concurrency, workers_.size()))
+            : std::size_t{1});
 }
 
 CacheReclaimer::~CacheReclaimer() {
@@ -621,8 +632,8 @@ CacheReclaimer::~CacheReclaimer() {
 
 ErrorCode CacheReclaimer::Start() noexcept {
     if (group_lru_config_.max_sampling_size == 0 || group_lru_config_.max_delete_requests_per_round == 0 ||
-        group_lru_config_.min_sampling_ratio == 0) {
-        KVCM_LOG_ERROR("Group LRU resource limits and sampling ratio must be positive");
+        group_lru_config_.min_sampling_ratio == 0 || group_lru_config_.eligibility_read_concurrency == 0) {
+        KVCM_LOG_ERROR("Group LRU resource limits, sampling ratio and eligibility read concurrency must be positive");
         return ErrorCode::EC_BADARGS;
     }
     if (registry_manager_ == nullptr) {
@@ -687,6 +698,8 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_skipped_instance_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_failed_instance_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_sampled_key_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_eligibility_read_key_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_eligibility_read_batch_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_candidate_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_selected_block_count);
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_submitted_block_count);
@@ -1518,7 +1531,8 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
                                      std::uint64_t &out_predicted_deleted_keys,
                                      AgeStats &out_create_age_stats,
                                      bool eligibility_only,
-                                     bool maintenance_read) noexcept {
+                                     bool maintenance_read,
+                                     const std::vector<CacheLocationMap> *prefetched_maps) noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
@@ -1527,6 +1541,12 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
     out_location_counts_by_type.fill(0);
     out_predicted_deleted_keys = 0;
     out_create_age_stats = AgeStats{};
+
+    // Prefetch is discovery-only. In particular, deletion admission must not
+    // reuse a map read before the current pending/quota checks.
+    if (prefetched_maps != nullptr && (!eligibility_only || !maintenance_read)) {
+        return false;
+    }
 
     if (!eligibility_only && (pending_delete_handler_count_ >= async_delete_config_.pending_delete_handler_limit ||
                               pending_delete_bytes_ >= async_delete_config_.pending_bytes_limit)) {
@@ -1544,13 +1564,17 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
     }
 
     // get the location map of each block in the batch
-    std::vector<CacheLocationMap> loc_maps;
-    if (maintenance_read) {
+    std::vector<CacheLocationMap> fetched_maps;
+    const auto &loc_maps = prefetched_maps != nullptr ? *prefetched_maps : fetched_maps;
+    if (prefetched_maps != nullptr) {
+        // Size is checked below; read error codes were validated by the owner
+        // of the prefetched result before passing it to this collector thread.
+    } else if (maintenance_read) {
         const auto indexer = meta_indexer_manager_->GetMetaIndexer(ins_id);
         if (!indexer) {
             return false;
         }
-        const auto result = indexer->GetLocationMapsForMaintenance(request_context, batch, loc_maps);
+        const auto result = indexer->GetLocationMapsForMaintenance(request_context, batch, fetched_maps);
         if (result.error_codes.size() != batch.size() ||
             std::any_of(result.error_codes.begin(), result.error_codes.end(), [](const auto ec) {
                 return ec != ErrorCode::EC_OK && ec != ErrorCode::EC_NOENT;
@@ -1566,7 +1590,7 @@ bool CacheReclaimer::FilterLocIDImpl(RequestContext *request_context,
         }
         const BlockMask blk_mask(std::in_place_type<BlockMaskVector>, batch.size(), false);
         assert(std::holds_alternative<BlockMaskVector>(blk_mask));
-        if (const auto ec = meta_searcher->BatchGetLocation(request_context, batch, blk_mask, loc_maps);
+        if (const auto ec = meta_searcher->BatchGetLocation(request_context, batch, blk_mask, fetched_maps);
             ec != ErrorCode::EC_OK) {
             LOG_WITH_ID(WARN, "get cache location maps failed, error code: [%d]", static_cast<std::int32_t>(ec));
             return false;

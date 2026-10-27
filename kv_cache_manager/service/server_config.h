@@ -60,6 +60,15 @@ public:
     uint64_t GetCacheReclaimerGroupLruMaxDeleteRequestsPerRound() const {
         return cache_reclaimer_group_lru_max_delete_requests_per_round_;
     }
+    bool IsCacheReclaimerGroupLruLazyEligibilityEnabled() const {
+        return cache_reclaimer_group_lru_lazy_eligibility_enabled_;
+    }
+    bool IsCacheReclaimerGroupLruParallelEligibilityEnabled() const {
+        return cache_reclaimer_group_lru_parallel_eligibility_enabled_;
+    }
+    uint64_t GetCacheReclaimerGroupLruEligibilityReadConcurrency() const {
+        return cache_reclaimer_group_lru_eligibility_read_concurrency_;
+    }
     bool IsCacheGcEnabled() const { return cache_gc_enabled_; }
     int64_t GetCacheGcScanIntervalMs() const { return cache_gc_scan_interval_ms_; }
     int64_t GetCacheGcRoundPauseMs() const { return cache_gc_round_pause_ms_; }
@@ -128,6 +137,9 @@ private:
     uint64_t cache_reclaimer_group_lru_max_sampling_size_ = 0;
     uint64_t cache_reclaimer_group_lru_min_sampling_ratio_ = 0;
     uint64_t cache_reclaimer_group_lru_max_delete_requests_per_round_ = 0;
+    bool cache_reclaimer_group_lru_lazy_eligibility_enabled_ = false;
+    bool cache_reclaimer_group_lru_parallel_eligibility_enabled_ = false;
+    uint64_t cache_reclaimer_group_lru_eligibility_read_concurrency_ = 4;
     bool cache_gc_enabled_ = true;
     int64_t cache_gc_scan_interval_ms_ = 0;
     int64_t cache_gc_round_pause_ms_ = 0;

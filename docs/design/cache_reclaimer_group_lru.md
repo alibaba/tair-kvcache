@@ -110,7 +110,15 @@ Group LRU 不负责判断部署是否永久下线。业务明确废弃某个 Ins
 - 升级前检查历史 `reclaim_policy`：若为 LFU / TTL 且缺少预算策略字段，需先明确选择旧模式，或改为 LRU 后启用 Group LRU，避免新默认值与非法组合校验冲突。
 - 回退策略时显式设为 `USAGE_PROPORTIONAL` 或 `FIXED_PER_INSTANCE`。回退旧二进制前，应把所有 `GROUP_LRU` 以及仍依赖缺省值的 Group 显式设为旧版支持的值，并回读验证后再降级。
 
+### 3.4 可独立启用的资格检查优化
+
+服务启动参数 `kvcm.cache_reclaimer.group_lru_lazy_eligibility_enabled` 和 `kvcm.cache_reclaimer.group_lru_parallel_eligibility_enabled` 均默认 `false`，可以分别启用或叠加；`group_lru_eligibility_read_concurrency` 默认 `4`，必须为正整数，只有并行开关开启时生效，实际并发不超过现有 Reclaimer worker 数。配置入口和示例见 [配置指南](../configuration.md)。
+
+这三个参数作用于当前进程中所有 `GROUP_LRU` 的 Recover 和 Running 阶段，不改变容量比例、固定预算策略，也不是 per-Group 动态配置。必须在进程启动前配置；同进程 `leaderDemote` 只重新初始化后端，不会重读这些启动参数。两个开关均关闭时沿用下文的默认流程，第 5.6 节说明开启后的差异。
+
 ## 4. 整体执行流程
+
+默认流程（按需资格检查关闭）：
 
 ```text
 读取 Group 配置、Instance 列表、正式 usage 和最新 credit
@@ -177,7 +185,7 @@ S_plan = min(S_theory, group_lru_max_sampling_size)
 
 key count 只是可取得的采样规模估计，不代表这些 key 都含本轮可删除的 Location；资格仍在候选阶段检查。“一半基础、一半按 key 数”的固定 V1 折中缓解覆盖偏差，但不是严格的全局随机采样承诺，后端本身也可能使用冷候选采样。基础份额保留对小 Instance 冷数据的覆盖，后续可依据冷候选产出调整补采样。均不引入“每个 Instance 至少删除一个”的约束。
 
-采样总量被裁剪时，同步缩小 Group batch。收集完成后，还要按去重及 Location 过滤后的实际候选数 `C` 再次收缩，避免计划采样很多、实际候选很少时仍把全部候选删除：
+默认关闭按需检查时，采样总量被裁剪会同步缩小 Group batch。收集完成后，还要按去重及 Location 过滤后的实际候选数 `C` 再次收缩，避免计划采样很多、实际候选很少时仍把全部候选删除：
 
 ```text
 E = min(S_effective, C)
@@ -228,6 +236,26 @@ Local 的 `SampleReclaimCandidates` 复用 `SampleReclaimKeys` 选择 key，再�
 
 维护 touch 复用 `Lookup/Release`，不经过普通属性读取、不增加 revisit 观测样本，是采样读取之外的显式维护操作。三种逐出策略共用该 Local 采样与维护入口，最终只对实际取得且可删除的候选按访问时间排序；后台 GC 的扫描逻辑不受此变更影响。
 
+### 5.6 可选的按需检查与并行读取
+
+**按需检查**先合并完整采样成功的 Instance 候选，在 Instance 内去重，再按 `(LRU 时间, instance_id, block key)` 做全局排序。设该采样池大小为 `U`，本轮删除目标为：
+
+```text
+B_lazy = U == 0 ? 0 : min(B_theory, max(1, floor(uint128(U) * B_cfg / S)))
+```
+
+从排序结果的最冷处开始，按有界批次读取 Location 并使用原资格规则检查，跳过不合格 key，继续读取后面的候选；找到 `B_lazy` 个合格候选、样本耗尽、暂停、停止或 deadline 到达后停止。不同 Instance 的相同 key 分别读取和检查，不跨 Instance 合并身份。后续删除准入仍重新读取最新 Location，不复用预读结果；pending、活跃写入、迁移保护、keep_both、水位和 credit 规则不变。
+
+这是明确的预算变化：默认模式按整个池的合格候选数收缩批量，按需模式按未做资格检查的成功采样池计算目标，再补齐合格项。无法在不检查整个池的前提下精确知道默认模式的合格数量。不合格率较高时，按需模式可能选择更多 key，甚至选完采样池中全部合格 key；不能声称与默认模式逐项等价，也不会把筛出的 `B_lazy` 候选再按采样比缩减一次。采样或去重减少仍会收缩目标，实际提交量仍受第 7 节的全部限制。
+
+按需模式将本轮 `future_timeout_ms` 的前半作为采样软截止，为资格检查预留后半；采样全部完成时立即开始资格检查，不等待半程结束。未在软截止前完整采样成功的 Instance 被丢弃并标记 partial，不占用后续删除预算；已有慢采样 I/O 仍受原有在途限制约束。资格检查继续受同一个总 deadline 约束，必需前缀的读取结果发生错误，或检查过程超时、暂停、停止时，本轮按需选择整体作废，不跳过读取失败的冷候选去删除更热候选。正常的缺失或不合格 key 则继续补读；已满足目标后，未消费的更热预读结果发生错误不影响已选前缀，但仍须完成退出清理并通过总 deadline 和运行状态检查。按需检查只减少读过的候选数量，没有改为轻量或 fake metadata，也没有省略完整反序列化。
+
+**并行读取**复用既有 worker pool，每个任务使用自己的 `RequestContext` 完成一批最多 256 key 的维护性 Location 读取及完整解码。收集线程按计划顺序消费结果，串行执行资格规则，消费后再补充任务；不会让先返回的较热候选先入选。并发队列有上限，任务只拥有自己的 key、上下文和结果，不并发访问收集线程的 pending / credit 状态。读取需要 Redis 时，由既有 Redis 客户端连接池管理各任务的连接，不使用同一连接同时执行多个任务。
+
+只开并行开关时，仍检查整个采样池并使用默认的合格数量缩批规则；与按需检查叠加时，只对需要检查的冷候选范围做有界并行预读。达到目标后停止补读，可能已经开始的预读批次会被取消或等待完成，因此实际读取量可能略多于最终检查量。暂停、停止或失败后的退出同样处理已有任务，不让任务访问已销毁的局部状态。
+
+增加并行度会增加同时借用的 Redis 连接和完整 Location map 内存；最大批次数还受 worker 数限制，连接池不足或服务端瓶颈下不保证加速。资格任务和采样任务共用同一个 worker pool，没有为资格检查保留专用 worker；仍在执行的慢采样可能推迟资格任务开始。底层同步 I/O 不能强制取消，退出清理也可能等待前面的采样和在途资格读取，deadline 不代表整轮墙钟时间的硬上限。
+
 ## 6. 候选表示、过滤与排序
 
 ### 6.1 候选身份与访问时间
@@ -270,7 +298,7 @@ Group LRU 的候选资格检查和最终准入另通过 `GetLocationMapsForMaint
 
 ### 6.3 Top B 的含义
 
-过滤后对候选统一排序，最多选择 `B_group` 个不同的 `(instance_id, block_key)`。它是 block 数上限，不是 bytes，也不是 Location 数：一个 block 可以对应多个待删除 Location，部分 Location 删除后 key 也可能继续存在。
+默认模式过滤后对候选统一排序，最多选择 `B_group` 个不同的 `(instance_id, block_key)`；按需模式先排序再补读资格，使用第 5.6 节的 `B_lazy`。它们都是 block 数上限，不是 bytes，也不是 Location 数：一个 block 可以对应多个待删除 Location，部分 Location 删除后 key 也可能继续存在。
 
 例如 A 提供 200 个很冷的候选，B 提供 200 个较热候选，`B_group=100`，允许 100 个 victim 全来自 A。反过来，如果 A 本轮只采到了 20 个冷候选，就不能假装知道 A 中其余未采到的数据也更冷；本轮可能继续选中 B。采样覆盖限制是近似算法的一部分，可通过后续自适应补采样优化，不属于本轮全量扫描承诺。
 
@@ -350,9 +378,14 @@ B_request = min(B_cfg, kSizeLimit - 1)
 | 采样失败 / LRU 属性缺失或非法计数 | 识别近似排序质量退化；批量 I/O 失败不能伪装成属性缺失 |
 | 提前停止原因计数 | 区分水位恢复、范围变化、request 上限、deadline 和全局反压 |
 | 候选收集 / 排序 / 准入耗时 | 定位前置 I/O 和小请求交错带来的成本 |
+| `group_lru_eligibility_read_key_count` / `group_lru_eligibility_read_batch_count` | 资格阶段实际尝试读取的 key / 批次数，包含已开始的有界预读；不含取消后未开始的任务或最终删除准入的重新读取 |
 | `maintenance_touch_key_count` | 跨策略累计实际完成的维护 touch 次数，观察被过滤候选让出位置的频率 |
 
 `cache_reclaimer.maintenance_touch_key_count` 是不带 Instance 标签的进程级 counter，直接累加 `TouchKeysForMaintenance` 返回的实际 touch 数，不把名单中的缺失 key 或不支持该操作的后端算作成功。同一 key 多次成功 touch 会重复计数；它不是去重 key 数、删除量或业务命中数。
+
+开启按需检查后，全局预排序计入 `group_lru_collect_duration_us`，后续排序仍记录到 `group_lru_sort_duration_us`。对照优化效果应比较同阶段的 `collect + sort`，并同时看实际资格读取量、采样量、选中量和删除提交量，避免把工作量减少或计时边界变化解释为等量操作加速。按需模式的候选计数只包含实际检查后保留的合格候选，不能用它推算整个采样池的合格率。这些 duration 为最近一次 Gauge；没有新轮次时会保留旧值，轮询快照不能当作独立轮次计算 P95 或慢轮比例。
+
+`group_lru_collected_instance_count` 在默认模式表示整份采样已完成资格检查的 Instance 数；按需模式在全局资格阶段成功后计入完整采样成功的 Instance，包括没有进入冷前缀、因而未读取 Location 的热 Instance。不能将按需模式的该指标解释为“完成资格读取的 Instance 数”，实际读量应查看上述资格读取 key / 批次计数。
 
 复用现有删除 bytes、Location、Future、credit 和反压指标。Group LRU 的 DEBUG 汇总包含 Group、有效与预算覆盖的 Instance 数、是否 partial、计划与成功收集的采样预算、Top B 数量和请求尝试数；单请求沿用现有提交日志。暂停和停止由运行状态检查保护，未增加独立的暂停计数。上述信息不能被表述为全量 keyspace 的冷热分布。
 

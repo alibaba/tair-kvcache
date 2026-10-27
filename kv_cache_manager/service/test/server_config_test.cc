@@ -214,6 +214,75 @@ TEST_F(ServerConfigTest, TestGroupLruLimits) {
     }
 }
 
+TEST_F(ServerConfigTest, GroupLruEligibilityDefaultsAndIndependentSwitches) {
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {}));
+    ASSERT_TRUE(config.Check());
+    EXPECT_FALSE(config.IsCacheReclaimerGroupLruLazyEligibilityEnabled());
+    EXPECT_FALSE(config.IsCacheReclaimerGroupLruParallelEligibilityEnabled());
+    EXPECT_EQ(4u, config.GetCacheReclaimerGroupLruEligibilityReadConcurrency());
+
+    for (const bool lazy : {false, true}) {
+        for (const bool parallel : {false, true}) {
+            ASSERT_TRUE(config.Parse(
+                "",
+                {{"kvcm.cache_reclaimer.group_lru_lazy_eligibility_enabled", lazy ? "true" : "false"},
+                 {"kvcm.cache_reclaimer.group_lru_parallel_eligibility_enabled", parallel ? "true" : "false"},
+                 {"kvcm.cache_reclaimer.group_lru_eligibility_read_concurrency", "2"}}));
+            ASSERT_TRUE(config.Check());
+            EXPECT_EQ(lazy, config.IsCacheReclaimerGroupLruLazyEligibilityEnabled());
+            EXPECT_EQ(parallel, config.IsCacheReclaimerGroupLruParallelEligibilityEnabled());
+            EXPECT_EQ(2u, config.GetCacheReclaimerGroupLruEligibilityReadConcurrency());
+        }
+    }
+
+    // A new parse must not retain the preceding deployment's opt-in switches.
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_FALSE(config.IsCacheReclaimerGroupLruLazyEligibilityEnabled());
+    EXPECT_FALSE(config.IsCacheReclaimerGroupLruParallelEligibilityEnabled());
+    EXPECT_EQ(4u, config.GetCacheReclaimerGroupLruEligibilityReadConcurrency());
+}
+
+TEST_F(ServerConfigTest, GroupLruEligibilityRejectsInvalidSettings) {
+    for (const auto &key : {"kvcm.cache_reclaimer.group_lru_lazy_eligibility_enabled",
+                            "kvcm.cache_reclaimer.group_lru_parallel_eligibility_enabled"}) {
+        for (const auto &value : {"", "1", "0", "True", "yes", "falsex"}) {
+            ServerConfig config;
+            EXPECT_FALSE(config.Parse("", {{key, value}})) << key << "=" << value;
+        }
+    }
+    // The limit is validated even when parallel reads are disabled.
+    for (const auto &value : {"0", "-1", "", "+1", "1.5", "4x", "18446744073709551616"}) {
+        ServerConfig config;
+        EXPECT_FALSE(config.Parse("", {{"kvcm.cache_reclaimer.group_lru_eligibility_read_concurrency", value}}))
+            << value;
+    }
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("",
+                             {{"kvcm.cache_reclaimer.worker_size", "2"},
+                              {"kvcm.cache_reclaimer.group_lru_eligibility_read_concurrency", "8"}}));
+    // The reclaimer caps actual concurrency at the existing worker count.
+    EXPECT_TRUE(config.Check());
+    EXPECT_EQ(8u, config.GetCacheReclaimerGroupLruEligibilityReadConcurrency());
+}
+
+TEST_F(ServerConfigTest, GroupLruEligibilityUsesStartupEnvironment) {
+    ScopedEnv lazy("kvcm_cache_reclaimer_group_lru_lazy_eligibility_enabled", "true");
+    ScopedEnv parallel("kvcm_cache_reclaimer_group_lru_parallel_eligibility_enabled", "true");
+    ScopedEnv concurrency("kvcm_cache_reclaimer_group_lru_eligibility_read_concurrency", "3");
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {}));
+    ASSERT_TRUE(config.Check());
+    EXPECT_TRUE(config.IsCacheReclaimerGroupLruLazyEligibilityEnabled());
+    EXPECT_TRUE(config.IsCacheReclaimerGroupLruParallelEligibilityEnabled());
+    EXPECT_EQ(3u, config.GetCacheReclaimerGroupLruEligibilityReadConcurrency());
+
+    ScopedEnv dotted("kvcm.cache_reclaimer.group_lru_parallel_eligibility_enabled", "false");
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_FALSE(config.IsCacheReclaimerGroupLruParallelEligibilityEnabled());
+    EXPECT_TRUE(config.IsCacheReclaimerGroupLruLazyEligibilityEnabled());
+}
+
 TEST_F(ServerConfigTest, TestMetricsReporterType) {
     {
         ServerConfig config;

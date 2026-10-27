@@ -79,6 +79,10 @@ struct CacheReclaimerGroupLruConfig {
     // Group LRU needs more candidates than victims, even when the shared
     // per-Instance sampling and deletion baselines are configured equally.
     std::size_t min_sampling_ratio{10};
+    // Opt-in discovery optimizations. Admission always re-reads fresh metadata.
+    bool lazy_eligibility_enabled{false};
+    bool parallel_eligibility_enabled{false};
+    std::size_t eligibility_read_concurrency{4};
 };
 
 /**
@@ -720,6 +724,13 @@ private:
                                   const std::map<std::int64_t, std::int64_t> &times,
                                   std::chrono::steady_clock::time_point deadline,
                                   std::vector<GroupLruCandidate> &out_candidates) noexcept;
+    bool FilterGroupLruCandidatePool(const std::shared_ptr<RequestContext> &request_context,
+                                     const WaterLevelExceed &scope,
+                                     const GroupLruPlan &plan,
+                                     const std::vector<GroupLruCandidate> &candidates,
+                                     std::size_t target_count,
+                                     std::chrono::steady_clock::time_point deadline,
+                                     std::vector<GroupLruCandidate> &out_candidates) noexcept;
 
     // The sole task-submission primitive for bounded sampling. Each task owns
     // its results/cancellation token and keeps its in-flight slot until it exits.
@@ -794,7 +805,8 @@ private:
                          std::uint64_t &out_predicted_deleted_keys,
                          AgeStats &out_create_age_stats,
                          bool eligibility_only,
-                         bool maintenance_read) noexcept;
+                         bool maintenance_read,
+                         const std::vector<CacheLocationMap> *prefetched_maps = nullptr) noexcept;
 
     /**
      * @brief 评估并执行一个 instance group 的多层存储迁移（水位触发）。
@@ -862,6 +874,8 @@ private:
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_skipped_instance_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_failed_instance_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_sampled_key_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_eligibility_read_key_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_eligibility_read_batch_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_candidate_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_selected_block_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(group_lru_submitted_block_count)

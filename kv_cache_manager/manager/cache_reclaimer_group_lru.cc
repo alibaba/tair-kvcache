@@ -179,6 +179,168 @@ std::size_t CacheReclaimer::GroupLruBatchSize(const GroupLruPlan &plan, std::siz
     return std::min(plan.theoretical_batch_size, std::max(std::size_t{1}, static_cast<std::size_t>(scaled)));
 }
 
+bool CacheReclaimer::FilterGroupLruCandidatePool(const std::shared_ptr<RequestContext> &request_context,
+                                                 const WaterLevelExceed &scope,
+                                                 const GroupLruPlan &plan,
+                                                 const std::vector<GroupLruCandidate> &candidates,
+                                                 std::size_t target_count,
+                                                 std::chrono::steady_clock::time_point deadline,
+                                                 std::vector<GroupLruCandidate> &out_candidates) noexcept {
+    constexpr std::size_t kLocationReadBatch = 256;
+    struct ReadBatch {
+        std::size_t instance_index;
+        std::vector<std::size_t> positions;
+        std::vector<std::int64_t> keys;
+    };
+    struct ReadResult {
+        bool attempted{false};
+        bool ok{false};
+        std::vector<CacheLocationMap> maps;
+    };
+    struct PendingRead {
+        std::size_t batch_index;
+        std::future<ReadResult> future;
+    };
+    // Group each small prefix by Instance, rather than issuing single-key
+    // reads when two Instances interleave in the global LRU order. These are
+    // only descriptors; at most `concurrency` decoded results exist at once.
+    std::vector<ReadBatch> batches;
+    for (std::size_t begin = 0; begin < candidates.size(); begin += kLocationReadBatch) {
+        std::map<std::size_t, std::size_t> by_instance;
+        const auto end = std::min(candidates.size(), begin + kLocationReadBatch);
+        for (auto position = begin; position < end; ++position) {
+            const auto index = candidates[position].instance_index;
+            const auto [it, inserted] = by_instance.emplace(index, batches.size());
+            if (inserted) {
+                batches.push_back({index, {}, {}});
+            }
+            auto &batch = batches[it->second];
+            batch.positions.push_back(position);
+            batch.keys.push_back(candidates[position].block_key);
+        }
+    }
+    const auto concurrency =
+        group_lru_config_.parallel_eligibility_enabled
+            ? std::max(std::size_t{1}, std::min(group_lru_config_.eligibility_read_concurrency, workers_.size()))
+            : std::size_t{1};
+    const auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    const auto active = [&]() { return IsRunning() && !IsPaused() && std::chrono::steady_clock::now() < deadline; };
+    std::deque<PendingRead> pending;
+    std::size_t next_batch = 0, pending_keys = 0, next_candidate = 0;
+    // 0 = unread, 1 = rejected, 2 = eligible. Consume only a resolved prefix,
+    // so out-of-order Instance reads never select a hotter key first.
+    std::vector<unsigned char> eligibility(candidates.size(), 0);
+    std::vector<GroupLruCandidate> selected;
+    selected.reserve(std::min(target_count, candidates.size()));
+    bool success = true;
+    const auto record_read = [&](const ReadBatch &batch, const ReadResult &read) {
+        if (read.attempted) {
+            METRICS_(cache_reclaimer, group_lru_eligibility_read_batch_count) += 1;
+            METRICS_(cache_reclaimer, group_lru_eligibility_read_key_count) += batch.keys.size();
+        }
+    };
+    while (next_candidate < candidates.size() && selected.size() < target_count && active()) {
+        // Limit both tasks and speculative keys. In lazy mode, do not keep
+        // refilling a pipeline that already covers the remaining victim goal.
+        while (next_batch < batches.size() && pending.size() < concurrency &&
+               pending_keys < std::max(kLocationReadBatch, target_count - selected.size()) && active()) {
+            const auto &batch = batches[next_batch];
+            const auto indexer =
+                meta_indexer_manager_->GetMetaIndexer(plan.items[batch.instance_index].instance_info->instance_id());
+            auto context = std::make_shared<RequestContext>(request_context->trace_id());
+            auto read = [this, indexer, context, cancelled, deadline, keys = batch.keys]() {
+                ReadResult result;
+                if (!indexer || cancelled->load(std::memory_order_relaxed) || !IsRunning() || IsPaused() ||
+                    std::chrono::steady_clock::now() >= deadline) {
+                    return result;
+                }
+                result.attempted = true;
+                try {
+                    const auto status = indexer->GetLocationMapsForMaintenance(context.get(), keys, result.maps);
+                    result.ok = status.error_codes.size() == keys.size() && result.maps.size() == keys.size() &&
+                                std::all_of(status.error_codes.begin(), status.error_codes.end(), [](const auto ec) {
+                                    return ec == ErrorCode::EC_OK || ec == ErrorCode::EC_NOENT;
+                                });
+                } catch (...) { KVCM_LOG_WARN("Group LRU eligibility read threw an exception"); }
+                return result;
+            };
+            auto promise = std::make_shared<std::promise<ReadResult>>();
+            pending.push_back({next_batch, promise->get_future()});
+            pending_keys += batch.keys.size();
+            ++next_batch;
+            if (group_lru_config_.parallel_eligibility_enabled) {
+                // Stop joins the cron thread before the destructor stops the
+                // worker pool. Every submitted read is drained below.
+                SubmitTask([read = std::move(read), promise]() mutable { promise->set_value(read()); });
+            } else {
+                promise->set_value(read());
+            }
+        }
+        if (pending.empty()) {
+            break;
+        }
+        auto &pending_read = pending.front();
+        if (pending_read.future.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) {
+            continue;
+        }
+        auto read = pending_read.future.get();
+        const auto &batch = batches[pending_read.batch_index];
+        record_read(batch, read);
+        pending_keys -= batch.keys.size();
+        pending.pop_front();
+        if (!read.ok || !active()) {
+            success = false;
+            break;
+        }
+        std::vector<std::vector<std::string>> location_ids;
+        BytesByStorageType bytes{};
+        CountsByStorageType counts{};
+        std::uint64_t predicted_keys = 0;
+        AgeStats ages;
+        // Only metadata reads and decoding run on workers. All eligibility,
+        // migration/pending checks, metrics and maintenance touches stay here.
+        if (!FilterLocIDImpl(request_context.get(),
+                             plan.items[batch.instance_index].instance_info,
+                             batch.keys,
+                             scope,
+                             location_ids,
+                             bytes,
+                             counts,
+                             predicted_keys,
+                             ages,
+                             true,
+                             true,
+                             &read.maps) ||
+            !active()) {
+            success = false;
+            break;
+        }
+        for (std::size_t i = 0; i < batch.positions.size(); ++i) {
+            eligibility[batch.positions[i]] = location_ids[i].empty() ? 1 : 2;
+        }
+        while (next_candidate < candidates.size() && eligibility[next_candidate] != 0 &&
+               selected.size() < target_count) {
+            if (eligibility[next_candidate] == 2) {
+                selected.push_back(candidates[next_candidate]);
+            }
+            ++next_candidate;
+        }
+    }
+    cancelled->store(true, std::memory_order_relaxed);
+    // Redis reads already executing cannot be interrupted. Cancel queued reads
+    // and drain the bounded in-flight set before returning or publishing keys.
+    // A speculative result beyond the selected prefix is never used for rules.
+    for (auto &pending_read : pending) {
+        const auto read = pending_read.future.get();
+        record_read(batches[pending_read.batch_index], read);
+    }
+    if (!success || !active()) {
+        return false;
+    }
+    out_candidates.insert(out_candidates.end(), selected.begin(), selected.end());
+    return true;
+}
+
 bool CacheReclaimer::FilterGroupLruCandidates(const std::shared_ptr<RequestContext> &request_context,
                                               const WaterLevelExceed &scope,
                                               const GroupLruPlan &plan,
@@ -186,6 +348,15 @@ bool CacheReclaimer::FilterGroupLruCandidates(const std::shared_ptr<RequestConte
                                               const std::map<std::int64_t, std::int64_t> &times,
                                               std::chrono::steady_clock::time_point deadline,
                                               std::vector<GroupLruCandidate> &out_candidates) noexcept {
+    if (group_lru_config_.parallel_eligibility_enabled) {
+        std::vector<GroupLruCandidate> candidates;
+        candidates.reserve(times.size());
+        for (const auto &[key, time] : times) {
+            candidates.push_back({instance_index, key, time});
+        }
+        return FilterGroupLruCandidatePool(
+            request_context, scope, plan, candidates, candidates.size(), deadline, out_candidates);
+    }
     // Do not retain Location maps for the whole sample pool. Publish this
     // Instance only if every bounded eligibility read completed successfully.
     constexpr std::size_t kLocationReadBatch = 256;
@@ -205,6 +376,8 @@ bool CacheReclaimer::FilterGroupLruCandidates(const std::shared_ptr<RequestConte
         CountsByStorageType counts{};
         std::uint64_t predicted_keys = 0;
         AgeStats ages;
+        METRICS_(cache_reclaimer, group_lru_eligibility_read_batch_count) += 1;
+        METRICS_(cache_reclaimer, group_lru_eligibility_read_key_count) += keys.size();
         if (!FilterLocIDImpl(request_context.get(),
                              plan.items[instance_index].instance_info,
                              keys,
@@ -242,7 +415,14 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
     if (plan.items.empty()) {
         return false;
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(future_timeout_ms_.load());
+    const bool lazy = group_lru_config_.lazy_eligibility_enabled;
+    const auto begin = std::chrono::steady_clock::now();
+    const auto deadline = begin + std::chrono::milliseconds(future_timeout_ms_.load());
+    // Lazy discovery needs a global sample pool before it can inspect the
+    // coldest keys. Reserve half the existing deadline for eligibility, so a
+    // slow sampler cannot consume the whole window on behalf of healthy peers.
+    // Fast samplers proceed immediately; this is a ceiling, not a delay.
+    const auto sampling_deadline = lazy ? begin + (deadline - begin) / 2 : deadline;
     // As in the existing sampler, zero disables per-Instance task splitting.
     const auto per_task = sampling_size_per_task_.load();
     const auto available_at_start = workers_.size() - std::min(workers_.size(), in_flight_sampling_tasks_.load());
@@ -269,7 +449,7 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
     }
     auto &rotation = group_lru_rotation_by_group_[plan.items.front().instance_info->instance_group_name()];
     auto &queue = rotation.instance_ids;
-    const auto priority_index = rotation.prioritize_location_waiter ? std::size_t{0} : states.size();
+    const auto priority_index = !lazy && rotation.prioritize_location_waiter ? std::size_t{0} : states.size();
     const auto collect_ready_instance = [&](std::size_t index) {
         auto &state = states[index];
         if (!state.started || state.failed || state.location_attempted || state.remaining != 0 ||
@@ -279,23 +459,32 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
         // An attempted read consumes this turn even if it fails or exceeds the
         // deadline. Unattempted peers must retain their next-round priority.
         state.location_attempted = true;
-        state.collected =
-            FilterGroupLruCandidates(request_context, scope, plan, index, state.times, deadline, out_candidates);
-        state.failed = !state.collected;
-        state.times.clear();
-        if (state.collected) {
-            out_successful_sampling_size += plan.items[index].sampling_size;
+        if (lazy) {
+            // Publish only complete, successful per-Instance samples. Metadata
+            // for these candidates is checked later in global LRU order.
+            for (const auto &[key, time] : state.times) {
+                out_candidates.push_back({index, key, time});
+            }
+            state.collected = true;
+        } else {
+            state.collected =
+                FilterGroupLruCandidates(request_context, scope, plan, index, state.times, deadline, out_candidates);
         }
+        state.failed = !state.collected;
+        if (state.collected) {
+            out_successful_sampling_size += lazy ? state.times.size() : plan.items[index].sampling_size;
+        }
+        state.times.clear();
     };
     std::vector<Task> tasks;
     tasks.reserve(workers_.size());
     while ((!ready.empty() || !tasks.empty()) && IsRunning() && !IsPaused() &&
-           std::chrono::steady_clock::now() < deadline) {
+           std::chrono::steady_clock::now() < sampling_deadline) {
         // A completed task releases a slot independently of other Instances.
         // Bound each Instance to its share of initially available workers, so
         // a slow backend cannot consume the workers released by healthy peers.
         while (tasks.size() < workers_.size() && in_flight_sampling_tasks_.load() < workers_.size() && !ready.empty() &&
-               IsRunning() && !IsPaused() && std::chrono::steady_clock::now() < deadline) {
+               IsRunning() && !IsPaused() && std::chrono::steady_clock::now() < sampling_deadline) {
             const auto index = ready.front();
             ready.pop_front();
             auto &state = states[index];
@@ -328,25 +517,25 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
             // A request-local collector must not be shared by parallel workers.
             auto task_context = std::make_shared<RequestContext>(request_context->trace_id());
             auto cancelled = state.cancelled;
-            tasks.push_back({index, SubmitSamplingTask([this, indexer, task_context, cancelled, count, deadline]() {
-                                 SamplingResult result;
-                                 const auto active = [&]() {
-                                     return !cancelled->load(std::memory_order_relaxed) && IsRunning() && !IsPaused() &&
-                                            std::chrono::steady_clock::now() < deadline;
-                                 };
-                                 if (!active()) {
-                                     return result;
-                                 }
-                                 result.ec = indexer->SampleReclaimCandidates(
-                                     task_context.get(), count, result.candidates, true);
-                                 if (result.ec != ErrorCode::EC_OK) {
-                                     return result;
-                                 }
-                                 if (result.candidates.size() > count || !active()) {
-                                     return SamplingResult{};
-                                 }
-                                 return result;
-                             })});
+            tasks.push_back(
+                {index, SubmitSamplingTask([this, indexer, task_context, cancelled, count, sampling_deadline]() {
+                     SamplingResult result;
+                     const auto active = [&]() {
+                         return !cancelled->load(std::memory_order_relaxed) && IsRunning() && !IsPaused() &&
+                                std::chrono::steady_clock::now() < sampling_deadline;
+                     };
+                     if (!active()) {
+                         return result;
+                     }
+                     result.ec = indexer->SampleReclaimCandidates(task_context.get(), count, result.candidates, true);
+                     if (result.ec != ErrorCode::EC_OK) {
+                         return result;
+                     }
+                     if (result.candidates.size() > count || !active()) {
+                         return SamplingResult{};
+                     }
+                     return result;
+                 })});
         }
         bool received = false;
         for (auto &task : tasks) {
@@ -409,7 +598,7 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
         }
         if (!received && !tasks.empty()) {
             // Only a short wait before polling/refilling, never a whole-wave barrier.
-            const auto remaining = deadline - std::chrono::steady_clock::now();
+            const auto remaining = sampling_deadline - std::chrono::steady_clock::now();
             if (remaining > std::chrono::steady_clock::duration::zero()) {
                 tasks.front().future.wait_for(std::min(
                     remaining,
@@ -443,13 +632,34 @@ bool CacheReclaimer::CollectGroupLruCandidates(const std::shared_ptr<RequestCont
                            std::make_move_iterator(yielded_ids.begin()),
                            std::make_move_iterator(yielded_ids.end()));
         queue.swap(waiting_ids);
-        rotation.prioritize_location_waiter = plan.partial;
+        rotation.prioritize_location_waiter = !lazy && plan.partial;
+    }
+    if (lazy && collected > 0) {
+        // Sorting here is part of collection in lazy mode: eligibility follows
+        // the global order, including stable Instance/key tie-breaking.
+        std::sort(out_candidates.begin(), out_candidates.end(), [&](const auto &a, const auto &b) {
+            return std::tie(a.lru_time_us, plan.items[a.instance_index].instance_info->instance_id(), a.block_key) <
+                   std::tie(b.lru_time_us, plan.items[b.instance_index].instance_info->instance_id(), b.block_key);
+        });
+        const auto target = GroupLruBatchSize(plan, out_successful_sampling_size);
+        std::vector<GroupLruCandidate> eligible;
+        if (!FilterGroupLruCandidatePool(request_context, scope, plan, out_candidates, target, deadline, eligible)) {
+            // A failed necessary read cannot be treated as an ineligible cold
+            // key and permit deleting hotter keys instead. Fail this round.
+            failed += collected;
+            collected = 0;
+            plan.partial = true;
+            out_successful_sampling_size = 0;
+        }
+        out_candidates.swap(eligible);
     }
     METRICS_(cache_reclaimer, group_lru_started_instance_count) += started;
     METRICS_(cache_reclaimer, group_lru_collected_instance_count) += collected;
     METRICS_(cache_reclaimer, group_lru_failed_instance_count) += failed;
     METRICS_(cache_reclaimer, group_lru_skipped_instance_count) += plan.eligible_instance_count - started;
-    if (std::chrono::steady_clock::now() >= deadline && collected < plan.items.size()) {
+    if ((std::chrono::steady_clock::now() >= deadline ||
+         (lazy && std::chrono::steady_clock::now() >= sampling_deadline && plan.partial)) &&
+        collected < plan.items.size()) {
         METRICS_(cache_reclaimer, group_lru_deadline_count) += 1;
     }
     return collected > 0 && IsRunning() && !IsPaused();
@@ -521,8 +731,10 @@ CacheReclaimer::TryReclaimOnGroupLru(const std::shared_ptr<RequestContext> &requ
     // Requested samples can include duplicates or non-deletable keys. Keep
     // selection headroom in the actual, unique eligible candidate set too.
     // GroupLruBatchSize retains one-key progress for a nonempty tiny tail.
-    candidates.resize(
-        std::min(candidates.size(), GroupLruBatchSize(plan, std::min(successful_sampling_size, candidates.size()))));
+    if (!group_lru_config_.lazy_eligibility_enabled) {
+        candidates.resize(std::min(candidates.size(),
+                                   GroupLruBatchSize(plan, std::min(successful_sampling_size, candidates.size()))));
+    }
     METRICS_(cache_reclaimer, group_lru_sort_duration_us) = TimestampUtil::GetSteadyTimeUs() - sort_begin;
     METRICS_(cache_reclaimer, group_lru_selected_block_count) += candidates.size();
 

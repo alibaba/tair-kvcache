@@ -382,15 +382,30 @@ kvcm_ops 的 CLI 参数为 `--meta_storage_backend_config 'cached,redis://redis-
 
 容量比例模式中，服务级 `key_sampling_size_total` 和 `del_batch_size` 仍限制每个 Instance 的单次采样 / 删除预算，倾斜产生的超额份额留给后续轮次。Group LRU 则将两者作为单 Instance 基准，按有效 Instance 数 `N` 计算理论总量 `S*N`、`B*N`，在 Group 内统一选择 victim；一次请求仍不超过 `B`，同一 Instance 一轮可以收到多次请求。它不承诺每轮必须删满理论预算。
 
-Group LRU 使用以下进程级参数，均须为正整数，仅影响该模式：
+Group LRU 使用以下进程级参数，仅影响该模式；布尔开关只接受 `true` / `false`，其余参数须为正整数：
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
 | `kvcm.cache_reclaimer.group_lru_max_sampling_size` | `65536` | 单个 Group 一轮的总采样名额上限；不足以覆盖全部 Instance 时按队列轮转采样子集 |
 | `kvcm.cache_reclaimer.group_lru_min_sampling_ratio` | `10` | 采样 / 删除基准的最小倍数；新模式使用 `S=max(S_cfg, B_cfg*ratio)`，不改变旧模式的共享预算。显式设为 `1` 可用于低采样比例对照，但可能提前选中其他 Instance 的较新数据 |
 | `kvcm.cache_reclaimer.group_lru_max_delete_requests_per_round` | `128` | 单个 Group 一轮尝试提交的非空删除请求数上限；Executor 拒绝的请求也计数 |
+| `kvcm.cache_reclaimer.group_lru_lazy_eligibility_enabled` | `false` | 先把采样候选按全局 LRU 排序，再从最冷处按需读取和检查 Location；不合格则继续补读，达到删除上限即停止 |
+| `kvcm.cache_reclaimer.group_lru_parallel_eligibility_enabled` | `false` | 使用既有 Reclaimer worker pool 并行读取和完整解码资格 metadata；资格规则仍由收集线程串行执行 |
+| `kvcm.cache_reclaimer.group_lru_eligibility_read_concurrency` | `4` | 开启并行读取后的在途批次上限，实际不超过 Reclaimer worker 数；每批最多 256 key，关闭并行开关时此值不生效 |
 
-采样总量受限、部分 Instance 收集失败，或去重及 Location 过滤后有效候选不足时，Group batch 同步缩小以保持采样 / 删除比例；非空候选至少保留一个删除名额，避免小尾部因取整无法清空。单次 Instance 采样仍小于 `65536`。纯 Local 或 cached 恢复完成且实际采样后端为 Local 时，同一 Instance 使用一个采样任务，不因提高采样预算而并行拆分；纯 Redis、恢复中的 cached 保留有界任务拆分，不同 Instance 仍可并行。采样按“一半基础份额、一半按 key 数分配”扩大冷候选覆盖，不是严格全量 LRU。详见 [Group LRU 设计](design/cache_reclaimer_group_lru.md)。
+默认关闭按需检查时，采样总量受限、部分 Instance 收集失败，或去重及 Location 过滤后有效候选不足时，Group batch 同步缩小以保持采样 / 删除比例；非空候选至少保留一个删除名额，避免小尾部因取整无法清空。开启按需检查后，删除上限改按成功采样、去重后的候选池计算，不再要求先检查整个池再按合格数量缩批。因此不合格候选较多时，一轮可能比默认模式选择更多可删除 key；水位、pending、credit、单轮请求上限和提交前最新状态复核仍生效。
+
+两个开关可以单独开启或叠加，同时作用于 Recover 与 Running 阶段，不影响另外两种逐出策略。它们是服务启动配置，不是 InstanceGroup 配置；修改后须重新启动进程，`leaderDemote` 不会重新读取进程环境或启动配置文件。用于独立部署对照的配置文件片段如下，选择所需组合后再启动服务：
+
+```properties
+kvcm.cache_reclaimer.group_lru_lazy_eligibility_enabled=false
+kvcm.cache_reclaimer.group_lru_parallel_eligibility_enabled=true
+kvcm.cache_reclaimer.group_lru_eligibility_read_concurrency=4
+```
+
+上例仅开启并行读取；仅开启按需检查时将前两项设为 `true` / `false`，叠加时均设为 `true`，均设为 `false` 恢复默认路径。环境变量支持将 `.` 替换为 `_`，例如 `kvcm_cache_reclaimer_group_lru_lazy_eligibility_enabled=true`。并发度提高会增加同时占用的 Redis 连接和完整 Location map 内存，应结合读连接池容量和 Redis 负载评估。
+
+单次 Instance 采样仍小于 `65536`。纯 Local 或 cached 恢复完成且实际采样后端为 Local 时，同一 Instance 使用一个采样任务，不因提高采样预算而并行拆分；纯 Redis、恢复中的 cached 保留有界任务拆分，不同 Instance 仍可并行。采样按“一半基础份额、一半按 key 数分配”扩大冷候选覆盖，不是严格全量 LRU。详见 [Group LRU 设计](design/cache_reclaimer_group_lru.md)。
 
 升级和回滚需注意：缺字段的旧 Registry 数据会采用新默认值；希望保持旧模式的 Group 应提前明确配置 `0` 或 `1`。旧 proto3 客户端会省略隐式零值，若需显式选择 `USAGE_PROPORTIONAL`，应升级到支持该字段 oneof 存在性的客户端，或使用明确携带字段的 Admin JSON。旧二进制不保证识别 `2`，回滚前应把新模式切回旧模式并回读确认。历史 LFU / TTL 配置若缺少模式字段，也应先明确选择旧模式或切为 LRU。
 

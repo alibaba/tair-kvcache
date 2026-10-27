@@ -75,6 +75,9 @@ bool Server::Init(const ServerConfig &config) {
     group_lru_config.min_sampling_ratio = config_.GetCacheReclaimerGroupLruMinSamplingRatio();
     group_lru_config.max_sampling_size = config_.GetCacheReclaimerGroupLruMaxSamplingSize();
     group_lru_config.max_delete_requests_per_round = config_.GetCacheReclaimerGroupLruMaxDeleteRequestsPerRound();
+    group_lru_config.lazy_eligibility_enabled = config_.IsCacheReclaimerGroupLruLazyEligibilityEnabled();
+    group_lru_config.parallel_eligibility_enabled = config_.IsCacheReclaimerGroupLruParallelEligibilityEnabled();
+    group_lru_config.eligibility_read_concurrency = config_.GetCacheReclaimerGroupLruEligibilityReadConcurrency();
     CacheGarbageCollector::Config cache_gc_config;
     cache_gc_config.enabled = config_.IsCacheGcEnabled();
     cache_gc_config.scan_interval_ms = config_.GetCacheGcScanIntervalMs();

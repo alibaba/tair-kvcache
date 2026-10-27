@@ -226,6 +226,24 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->cache_reclaimer_group_lru_max_delete_requests_per_round_ = std::stoull(value);
          return config->cache_reclaimer_group_lru_max_delete_requests_per_round_ > 0;
      }},
+    {"kvcm.cache_reclaimer.group_lru_lazy_eligibility_enabled",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_group_lru_lazy_eligibility_enabled_ = value == "true";
+         return value == "true" || value == "false";
+     }},
+    {"kvcm.cache_reclaimer.group_lru_parallel_eligibility_enabled",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_group_lru_parallel_eligibility_enabled_ = value == "true";
+         return value == "true" || value == "false";
+     }},
+    {"kvcm.cache_reclaimer.group_lru_eligibility_read_concurrency",
+     [](const std::string &value, ServerConfig *config) {
+         if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+             return false;
+         }
+         config->cache_reclaimer_group_lru_eligibility_read_concurrency_ = std::stoull(value);
+         return config->cache_reclaimer_group_lru_eligibility_read_concurrency_ > 0;
+     }},
     {"kvcm.cache_gc.enabled",
      [](const std::string &value, ServerConfig *config) {
          config->cache_gc_enabled_ = value == "true";
@@ -407,6 +425,9 @@ void ServerConfig::UpdateDefaultConfig() {
     cache_reclaimer_group_lru_max_sampling_size_ = 65536;
     cache_reclaimer_group_lru_min_sampling_ratio_ = 10;
     cache_reclaimer_group_lru_max_delete_requests_per_round_ = 128;
+    cache_reclaimer_group_lru_lazy_eligibility_enabled_ = false;
+    cache_reclaimer_group_lru_parallel_eligibility_enabled_ = false;
+    cache_reclaimer_group_lru_eligibility_read_concurrency_ = 4;
     cache_gc_enabled_ = true;
     cache_gc_scan_interval_ms_ = 100;
     cache_gc_round_pause_ms_ = 5LL * 60 * 1000;
@@ -548,7 +569,9 @@ bool ServerConfig::Check() {
     if (cache_reclaimer_group_lru_max_sampling_size_ == 0 || cache_reclaimer_group_lru_min_sampling_ratio_ == 0 ||
         cache_reclaimer_group_lru_min_sampling_ratio_ > std::numeric_limits<std::size_t>::max() ||
         cache_reclaimer_group_lru_max_delete_requests_per_round_ == 0 ||
+        cache_reclaimer_group_lru_eligibility_read_concurrency_ == 0 ||
         cache_reclaimer_group_lru_max_sampling_size_ > std::numeric_limits<std::size_t>::max() ||
+        cache_reclaimer_group_lru_eligibility_read_concurrency_ > std::numeric_limits<std::size_t>::max() ||
         cache_reclaimer_group_lru_max_delete_requests_per_round_ > std::numeric_limits<std::size_t>::max()) {
         fprintf(stderr, "CacheReclaimer Group LRU limits must be positive and fit size_t\n");
         return false;

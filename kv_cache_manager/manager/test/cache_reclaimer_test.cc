@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -505,6 +506,16 @@ std::mutex group_lru_test_mutex;
 std::map<std::string, GroupLruTestBackend> group_lru_test_backends;
 std::function<void()> group_lru_location_read_hook;
 std::vector<std::string> group_lru_location_reads;
+struct GroupLruLocationRead {
+    std::string instance_id;
+    KeyVector keys;
+    RequestContext *context;
+    std::thread::id thread;
+};
+std::vector<GroupLruLocationRead> group_lru_location_read_details;
+std::function<void(const GroupLruLocationRead &)> group_lru_location_detail_hook;
+std::size_t group_lru_active_location_reads = 0;
+std::size_t group_lru_max_active_location_reads = 0;
 
 ErrorCode GroupLruSample_stub(void *obj,
                               RequestContext *request_context,
@@ -561,16 +572,28 @@ ErrorCode GroupLruSample_stub(void *obj,
     return ec;
 }
 
-MetaIndexer::Result
-GroupLruLocations_stub(void *obj, RequestContext *, const KeyVector &keys, CacheLocationMapVector &maps) noexcept {
+MetaIndexer::Result GroupLruLocations_stub(void *obj,
+                                           RequestContext *context,
+                                           const KeyVector &keys,
+                                           CacheLocationMapVector &maps) noexcept {
     MetaIndexer::Result result(keys.size());
     std::chrono::milliseconds delay{0};
+    std::function<void()> hook;
+    std::function<void(const GroupLruLocationRead &)> detail_hook;
+    GroupLruLocationRead read;
     {
         std::lock_guard<std::mutex> lock(group_lru_test_mutex);
         const auto &id = instance_id_by_meta_indexer.at(obj);
         auto &backend = group_lru_test_backends.at(id);
         delay = backend.location_delay;
         group_lru_location_reads.push_back(id);
+        read = {id, keys, context, std::this_thread::get_id()};
+        group_lru_location_read_details.push_back(read);
+        hook = group_lru_location_read_hook;
+        detail_hook = group_lru_location_detail_hook;
+        ++group_lru_active_location_reads;
+        group_lru_max_active_location_reads =
+            std::max(group_lru_max_active_location_reads, group_lru_active_location_reads);
         maps.assign(keys.size(), CacheLocationMap{});
         for (std::size_t i = 0; i < keys.size(); ++i) {
             result.error_codes[i] = backend.location_error;
@@ -580,10 +603,17 @@ GroupLruLocations_stub(void *obj, RequestContext *, const KeyVector &keys, Cache
         }
         result.ec = backend.location_error;
     }
-    if (group_lru_location_read_hook) {
-        group_lru_location_read_hook();
+    if (hook) {
+        hook();
+    }
+    if (detail_hook) {
+        detail_hook(read);
     }
     std::this_thread::sleep_for(delay);
+    {
+        std::lock_guard<std::mutex> lock(group_lru_test_mutex);
+        --group_lru_active_location_reads;
+    }
     return result;
 }
 
@@ -619,6 +649,10 @@ public:
         group_lru_test_backends.clear();
         group_lru_location_read_hook = {};
         group_lru_location_reads.clear();
+        group_lru_location_read_details.clear();
+        group_lru_location_detail_hook = {};
+        group_lru_active_location_reads = 0;
+        group_lru_max_active_location_reads = 0;
         {
             std::lock_guard<std::mutex> lock(sample_reclaim_requests_mutex);
             sample_reclaim_requests.clear();
@@ -745,6 +779,10 @@ public:
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_failed_instance_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_sampled_key_count) =
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_sampled_key_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_eligibility_read_key_count) = mr_->GetCounter(
+            SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_eligibility_read_key_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_eligibility_read_batch_count) = mr_->GetCounter(
+            SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_eligibility_read_batch_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_candidate_count) =
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, group_lru_candidate_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, group_lru_selected_block_count) =
@@ -4551,6 +4589,312 @@ TEST_F(CacheReclaimerTest, TestMaintenanceTouchCounterCountsOnlyExistingRejected
     ASSERT_TRUE(filter({1}));
     EXPECT_EQ(2, cache_reclaimer_->get_cache_reclaimer_maintenance_touch_key_count_metrics());
 }
+
+// Exercise the production switches independently and together. Bit 0 is lazy
+// checking; bit 1 is parallel read/decode. No test-only production hooks are used.
+class CacheReclaimerOptimizationTest : public CacheReclaimerTest, public WithParamInterface<int> {
+public:
+    bool Lazy() const { return (GetParam() & 1) != 0; }
+    bool Parallel() const { return (GetParam() & 2) != 0; }
+
+    std::shared_ptr<InstanceGroup>
+    Configure(const std::vector<std::string> &ids, std::size_t samples, std::size_t batch) {
+        auto group = SetUpGroupLruScenario(ids);
+        cache_reclaimer_->group_lru_config_.lazy_eligibility_enabled = Lazy();
+        cache_reclaimer_->group_lru_config_.parallel_eligibility_enabled = Parallel();
+        cache_reclaimer_->group_lru_config_.eligibility_read_concurrency = 4;
+        cache_reclaimer_->group_lru_config_.min_sampling_ratio = 10;
+        cache_reclaimer_->group_lru_config_.max_delete_requests_per_round = 4096;
+        cache_reclaimer_->sampling_size_per_task_ = 0;
+        cache_reclaimer_->future_timeout_ms_ = 5000;
+        EXPECT_EQ(EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), samples));
+        EXPECT_EQ(EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), batch));
+        for (const auto &id : ids) {
+            auto &backend = group_lru_test_backends.at(id);
+            backend = GroupLruTestBackend{};
+            key_count_by_meta_indexer[meta_indexers_by_instance.at(id).get()] = samples;
+            for (std::size_t key = 1; key <= samples; ++key) {
+                backend.keys.push_back(key);
+                backend.times[key] = std::to_string(key);
+                backend.locations[key] = {{"loc",
+                                           MakeCacheLocation("loc",
+                                                             CacheLocationStatus::CLS_SERVING,
+                                                             DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                             "nfs://store/key?size=1")}};
+            }
+        }
+        return group;
+    }
+
+    CacheReclaimer::ReclaimResult Reclaim(const std::shared_ptr<InstanceGroup> &group) {
+        return cache_reclaimer_->TryReclaimOnGroupLru(
+            request_context_, group, group->cache_config()->reclaim_strategy(), instance_infos);
+    }
+};
+
+TEST_P(CacheReclaimerOptimizationTest, GlobalColdOrderAndInstanceIsolation) {
+    const auto group = Configure({"a", "b"}, 1280, 128);
+    // The globally cold order alternates 32-key runs across Instances. The
+    // same numeric keys in the other Instance must remain independent.
+    for (const auto &id : {"a", "b"}) {
+        for (auto &[key, time] : group_lru_test_backends.at(id).times) {
+            time = std::to_string((key - 1) / 32 * 64 + (id == std::string("a") ? 32 : 0) + (key - 1) % 32 + 1);
+        }
+    }
+    ASSERT_TRUE(Reclaim(group).made_progress);
+    std::vector<std::pair<std::string, std::int64_t>> expected;
+    for (std::int64_t run = 0; run < 4; ++run) {
+        for (const auto &id : {"b", "a"}) {
+            for (std::int64_t key = run * 32 + 1; key <= (run + 1) * 32; ++key) {
+                expected.emplace_back(id, key);
+            }
+        }
+    }
+    EXPECT_EQ(expected, GroupLruSubmittedBlocks());
+    EXPECT_EQ(256, cache_reclaimer_->GetPredictedDeletedKeys(group->name()));
+    EXPECT_EQ(0, group_lru_active_location_reads);
+}
+
+TEST_P(CacheReclaimerOptimizationTest, ReadsAreBoundedAndLazyAvoidsFullSampleRead) {
+    const auto group = Configure({"a"}, 10000, 1000);
+    ASSERT_TRUE(Reclaim(group).made_progress);
+    const auto selected = GroupLruSubmittedBlocks();
+    ASSERT_EQ(1000, selected.size());
+    for (std::size_t i = 0; i < selected.size(); ++i) {
+        EXPECT_EQ(i + 1, selected[i].second);
+    }
+    const auto read_keys = cache_reclaimer_->get_cache_reclaimer_group_lru_eligibility_read_key_count_metrics();
+    if (Lazy()) {
+        EXPECT_GE(read_keys, 1000);
+        // One bounded lookahead window may already be in flight when the
+        // target is reached; it must not degenerate into reading all 10k.
+        EXPECT_LE(read_keys, 1000 + 4 * 256);
+    } else {
+        EXPECT_EQ(10000, read_keys);
+    }
+    for (const auto &read : group_lru_location_read_details) {
+        if (read.keys.size() <= 256) {
+            if (Parallel()) {
+                EXPECT_NE(request_context_.get(), read.context);
+                EXPECT_NE(std::this_thread::get_id(), read.thread);
+            } else {
+                EXPECT_EQ(std::this_thread::get_id(), read.thread);
+            }
+        }
+    }
+    EXPECT_LE(group_lru_max_active_location_reads, Parallel() ? 4 : 1);
+    EXPECT_EQ(0, group_lru_active_location_reads);
+}
+
+TEST_P(CacheReclaimerOptimizationTest, RejectedColdPrefixRefillsWithEligibleKeys) {
+    const auto group = Configure({"a"}, 2048, 200);
+    auto &data = group_lru_test_backends.at("a");
+    for (std::int64_t key = 1; key <= 512; ++key) {
+        data.locations[key].clear();
+    }
+    for (std::int64_t key = 513; key <= 768; ++key) {
+        data.locations[key] = {{"loc",
+                                MakeCacheLocation("loc",
+                                                  CacheLocationStatus::CLS_DELETING,
+                                                  DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                  "nfs://store/key?size=1")}};
+    }
+    data.locations[769] = {{"copy",
+                            MakeCacheLocation("copy",
+                                              CacheLocationStatus::CLS_WRITING,
+                                              DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                              "nfs://store/key?size=1")}};
+    mm_->DebugInsertActiveCopyTask("a", 769, "copy");
+    cache_reclaimer_->pending_locations_.insert({"a", 770, "loc"});
+    data.locations[771] = {{"reporter",
+                            MakeCacheLocation("reporter",
+                                              CacheLocationStatus::CLS_SERVING,
+                                              DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
+                                              "nfs://store/key?size=1")}};
+    ASSERT_TRUE(Reclaim(group).made_progress);
+    const auto selected = GroupLruSubmittedBlocks();
+    // Legacy scales by all eligible candidates. Lazy deliberately fills the
+    // sample-based cap, without applying the sampling ratio a second time.
+    const std::size_t expected_count = Lazy() ? 200 : (2048 - 771) * 200 / 2048;
+    ASSERT_EQ(expected_count, selected.size());
+    for (std::size_t i = 0; i < selected.size(); ++i) {
+        EXPECT_EQ(772 + i, selected[i].second);
+    }
+}
+
+TEST_P(CacheReclaimerOptimizationTest, DuplicateSamplesDoNotInflateDeleteBudget) {
+    const auto group = Configure({"a"}, 1000, 100);
+    auto &data = group_lru_test_backends.at("a");
+    for (std::size_t i = 0; i < data.keys.size(); ++i) {
+        data.keys[i] = i % 100 + 1;
+    }
+    ASSERT_TRUE(Reclaim(group).made_progress);
+    const auto selected = GroupLruSubmittedBlocks();
+    ASSERT_EQ(10, selected.size());
+    EXPECT_EQ(1, selected.front().second);
+    EXPECT_EQ(10, selected.back().second);
+}
+
+TEST_P(CacheReclaimerOptimizationTest, FinalAdmissionReadsFreshMapsAndDoesNotRefillOutsideSelection) {
+    const auto group = Configure({"a"}, 10000, 1000);
+    auto changed = std::make_shared<std::atomic<bool>>(false);
+    group_lru_location_detail_hook = [changed](const GroupLruLocationRead &read) {
+        if (std::find(read.keys.begin(), read.keys.end(), 1) != read.keys.end() && !changed->exchange(true)) {
+            // The first read has already taken its snapshot. The later
+            // admission read must observe this removal instead of reusing it.
+            std::lock_guard<std::mutex> lock(group_lru_test_mutex);
+            group_lru_test_backends.at("a").locations[1].clear();
+        }
+    };
+    ASSERT_TRUE(Reclaim(group).made_progress);
+    const auto selected = GroupLruSubmittedBlocks();
+    ASSERT_EQ(999, selected.size());
+    EXPECT_EQ(2, selected.front().second);
+    EXPECT_EQ(1000, selected.back().second);
+    EXPECT_EQ(999, cache_reclaimer_->GetPredictedDeletedKeys(group->name()));
+}
+
+TEST_P(CacheReclaimerOptimizationTest, EligibilityReadFailureDoesNotDeleteUnverifiedCandidates) {
+    const auto group = Configure({"a", "b"}, 1024, 100);
+    group_lru_test_backends.at("a").location_error = EC_ERROR;
+    for (auto &[key, time] : group_lru_test_backends.at("b").times) {
+        time = std::to_string(10000 + key);
+    }
+    const auto result = Reclaim(group);
+    if (Lazy()) {
+        // A failed cold read cannot be treated as ordinary ineligibility and
+        // skipped in favor of the warmer Instance.
+        EXPECT_FALSE(result.made_progress);
+        EXPECT_TRUE(HasNoSubmittedDelRequests());
+    } else {
+        EXPECT_TRUE(result.made_progress);
+        const auto selected = GroupLruSubmittedBlocks();
+        ASSERT_EQ(100, selected.size());
+        for (const auto &[id, key] : selected) {
+            EXPECT_EQ("b", id);
+        }
+    }
+    EXPECT_EQ(0, group_lru_active_location_reads);
+}
+
+TEST_P(CacheReclaimerOptimizationTest, PauseDuringEligibilityNeverPublishesPartialSelection) {
+    const auto group = Configure({"a"}, 10000, 1000);
+    group_lru_location_detail_hook = [this](const auto &) { cache_reclaimer_->Pause(); };
+    EXPECT_FALSE(Reclaim(group).made_progress);
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+    EXPECT_EQ(0, group_lru_active_location_reads);
+}
+
+TEST_P(CacheReclaimerOptimizationTest, PendingQuotaStillCapsFinalAdmission) {
+    const auto group = Configure({"a"}, 1000, 100);
+    auto &quota =
+        cache_reclaimer_->pending_quota_by_group_type_[{group->name(), DataStorageType::DATA_STORAGE_TYPE_NFS}];
+    quota.location_count = cache_reclaimer_->async_delete_config_.pending_location_limit_per_group_type - 2;
+    ASSERT_TRUE(Reclaim(group).made_progress);
+    EXPECT_EQ((std::vector<std::pair<std::string, std::int64_t>>{{"a", 1}, {"a", 2}}), GroupLruSubmittedBlocks());
+    EXPECT_EQ(2, cache_reclaimer_->GetPredictedDeletedKeys(group->name()));
+}
+
+class CacheReclaimerParallelEligibilityTest : public CacheReclaimerOptimizationTest {};
+
+TEST_P(CacheReclaimerParallelEligibilityTest, BoundedWorkersOwnIndependentContexts) {
+    const auto group = Configure({"a"}, 10000, 1000);
+    cache_reclaimer_->group_lru_config_.eligibility_read_concurrency = 2;
+    std::mutex gate_mutex;
+    std::condition_variable gate;
+    std::set<RequestContext *> contexts;
+    std::set<std::thread::id> threads;
+    std::size_t entered = 0;
+    bool released = false;
+    group_lru_location_detail_hook = [&](const GroupLruLocationRead &read) {
+        if (read.context == request_context_.get()) {
+            return;
+        }
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        if (released) {
+            return;
+        }
+        ++entered;
+        contexts.insert(read.context);
+        threads.insert(read.thread);
+        if (entered == 2) {
+            released = true;
+            gate.notify_all();
+        } else {
+            gate.wait_for(lock, std::chrono::seconds(2), [&] { return released; });
+        }
+    };
+    ASSERT_TRUE(Reclaim(group).made_progress);
+    EXPECT_EQ(2, entered);
+    EXPECT_EQ(2, contexts.size());
+    EXPECT_EQ(2, threads.size());
+    EXPECT_EQ(2, group_lru_max_active_location_reads);
+    EXPECT_EQ(0, group_lru_active_location_reads);
+    EXPECT_EQ(1000, GroupLruSubmittedBlocks().size());
+    group_lru_location_detail_hook = {};
+}
+
+TEST_P(CacheReclaimerParallelEligibilityTest, StopJoinsCollectorAndDrainsStartedReads) {
+    const auto group = Configure({"a"}, 10000, 1000);
+    cache_reclaimer_->group_lru_config_.eligibility_read_concurrency = 2;
+    auto entered = std::make_shared<std::promise<void>>();
+    auto ready = entered->get_future();
+    auto release = std::make_shared<std::promise<void>>();
+    auto released = release->get_future().share();
+    auto active = std::make_shared<std::atomic<int>>(0);
+    group_lru_location_detail_hook = [entered, active, released](const auto &) {
+        if (active->fetch_add(1) == 1) {
+            entered->set_value();
+        }
+        released.wait();
+    };
+    // Use the real Stop() join path, with one controlled reclaim round as
+    // its cron-thread body. A blocked backend read cannot outlive Stop().
+    cache_reclaimer_->reclaimer_ = std::thread([this, group] { Reclaim(group); });
+    const auto status = ready.wait_for(std::chrono::seconds(2));
+    EXPECT_EQ(std::future_status::ready, status);
+    auto stopped = std::async(std::launch::async, [this] { cache_reclaimer_->Stop(); });
+    EXPECT_TRUE(WaitUntil([this] { return !cache_reclaimer_->IsRunning(); }));
+    if (status == std::future_status::ready) {
+        EXPECT_EQ(std::future_status::timeout, stopped.wait_for(std::chrono::milliseconds(0)));
+    }
+    release->set_value();
+    stopped.get();
+    EXPECT_EQ(0, group_lru_active_location_reads);
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+    group_lru_location_detail_hook = {};
+}
+
+TEST_P(CacheReclaimerParallelEligibilityTest, DeadlineDiscardsSelectionAndDrainsReads) {
+    const auto group = Configure({"a"}, 10000, 1000);
+    cache_reclaimer_->future_timeout_ms_ = 200;
+    group_lru_test_backends.at("a").location_delay = std::chrono::milliseconds(350);
+    EXPECT_FALSE(Reclaim(group).made_progress);
+    EXPECT_GT(group_lru_location_read_details.size(), 0);
+    EXPECT_EQ(0, group_lru_active_location_reads);
+    EXPECT_TRUE(HasNoSubmittedDelRequests());
+}
+
+class CacheReclaimerLazyEligibilityTest : public CacheReclaimerOptimizationTest {};
+
+TEST_P(CacheReclaimerLazyEligibilityTest, SlowSamplerLeavesEligibilityTimeForHealthyInstance) {
+    const auto group = Configure({"a", "b"}, 1024, 100);
+    cache_reclaimer_->future_timeout_ms_ = 200;
+    group_lru_test_backends.at("a").sampling_delay = std::chrono::milliseconds(350);
+    EXPECT_TRUE(Reclaim(group).made_progress);
+    // Finish the intentionally lingering sampler before fixture teardown.
+    EXPECT_TRUE(WaitUntil([this] { return cache_reclaimer_->in_flight_sampling_tasks_.load() == 0; }));
+    const auto selected = GroupLruSubmittedBlocks();
+    ASSERT_EQ(100, selected.size());
+    for (const auto &[id, key] : selected) {
+        EXPECT_EQ("b", id);
+    }
+    EXPECT_EQ(0, group_lru_active_location_reads);
+}
+
+INSTANTIATE_TEST_SUITE_P(SwitchCombinations, CacheReclaimerOptimizationTest, Values(0, 1, 2, 3));
+INSTANTIATE_TEST_SUITE_P(ParallelModes, CacheReclaimerParallelEligibilityTest, Values(2, 3));
+INSTANTIATE_TEST_SUITE_P(LazyModes, CacheReclaimerLazyEligibilityTest, Values(1, 3));
 
 TEST_F(CacheReclaimerTest, TestGroupLruDefaultRatioExpandsSamplesWithoutChangingBatch) {
     const auto group = SetUpGroupLruScenario();
