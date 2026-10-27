@@ -5041,6 +5041,41 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotReplacesCompleteSpecSetPerBlock)
     EXPECT_TRUE(found_tp1);
     EXPECT_TRUE(found_tp2);
     EXPECT_EQ(2u, QueryRawEventReportUris(key).size());
+
+    auto ambiguous_snapshot = make_snapshot({{"tp0", "ambiguous"}, {"tp1", "normal"}});
+    auto *ambiguous_block = ambiguous_snapshot.mutable_events(0)->mutable_block_snapshot()->mutable_blocks(0);
+    ambiguous_block->set_block_key(std::to_string(key + 1));
+    ambiguous_block->mutable_specs(0)->set_uri("p?q://" + host + "/mem?size=1");
+    const auto [ambiguous_ec, ambiguous_response] = CallReportEvent(ambiguous_snapshot, "ambiguous_snapshot_uri");
+    EXPECT_EQ(EC_PARTIAL_OK, ambiguous_ec);
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, ambiguous_response.header().status().code());
+    EXPECT_EQ(replacement_token, ambiguous_response.committed_snapshot_version());
+    EXPECT_EQ(visible, QueryEventReportUris({key}));
+    EXPECT_TRUE(QueryRawEventReportUris(key + 1).empty());
+}
+
+TEST_F(CacheManagerTest, TestReportEventRateLimitedSnapshotDoesNotApplyPreparedTasks) {
+    const std::string host = "192.168.10.88:8080";
+    constexpr int64_t key = 9440;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+    event_backend->SetSnapshotMinIntervalMsForTest(3'600'000);
+    const auto [baseline_ec, baseline] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "rate_limit_prepared_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const auto [limited_ec, limited] = CallReportEvent(
+        MakeSnapshotRequest(host, {{key + 1, "new"}, {key, "replacement"}}), "rate_limit_prepared_tasks");
+    EXPECT_EQ(EC_PARTIAL_OK, limited_ec);
+    EXPECT_GT(limited.retry_after_ms(), 0u);
+    EXPECT_EQ(baseline.committed_snapshot_version(), limited.committed_snapshot_version());
+    EXPECT_TRUE(QueryRawEventReportUris(key + 1).empty());
+    const auto raw = QueryRawEventReportUris(key);
+    ASSERT_EQ(1u, raw.size());
+    EXPECT_NE(std::string::npos, raw.front().find("source=baseline"));
+    EXPECT_NE(std::string::npos,
+              raw.front().find(std::string(SnapshotUriUtils::kSnapshotVersionParam) + "=" +
+                               baseline.committed_snapshot_version()));
 }
 
 TEST_F(CacheManagerTest, TestReportEventRejectsDuplicatePhysicalSnapshotItemsWithoutStateChange) {

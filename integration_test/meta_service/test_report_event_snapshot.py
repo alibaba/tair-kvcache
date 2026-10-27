@@ -538,8 +538,24 @@ class EventReportFunctionalTest(unittest.TestCase):
                     "dp_size": 1,
                     "pp_size": 1,
                 },
+                # Declare the components exercised by the functional cases,
+                # including URI-invalid cases that must reach URI validation.
                 "location_spec_infos": [
-                    {"name": "tp0", "size": 1024},
+                    {"name": name, "size": 1024}
+                    for name in (
+                        "tp0", "tp1", "default", "mem_spec", "disk_spec",
+                        "spec_4096", "spec_8192", "linear_0", "mamba_0",
+                        "mamba_1", "full_3", "gpu_0", "before_cleanup",
+                        "omitted_after_recovery", "after_cleanup", "after_timeout",
+                        "probe", "other_host", "peer_instance", "delta_without_snapshot",
+                        "valid_after_bad_register", "baseline", "client_version",
+                    )
+                ] + [
+                    {"name": f"concurrent_{index}", "size": 1024}
+                    for index in range(16)
+                ] + [
+                    {"name": f"writer_{index}", "size": 1024}
+                    for index in range(24)
                 ],
             })
         except Exception as e:

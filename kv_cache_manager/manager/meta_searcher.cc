@@ -2347,13 +2347,97 @@ ErrorCode MetaSearcher::ReconcileAddLocationRollback(RequestContext *request_con
     return EC_OK;
 }
 
+template <typename Task>
+class MetaSearcher::LocationSpecsTaskView {
+public:
+    explicit LocationSpecsTaskView(const std::vector<std::vector<Task>> &nested_tasks) : nested_tasks_(&nested_tasks) {}
+
+    LocationSpecsTaskView(const std::vector<size_t> &offsets, std::vector<Task> &flat_tasks)
+        : offsets_(&offsets), flat_tasks_(&flat_tasks) {}
+
+    [[nodiscard]] bool Valid(size_t key_count) const noexcept {
+        if (nested_tasks_) {
+            return nested_tasks_->size() == key_count;
+        }
+        if (!offsets_ || !flat_tasks_ || offsets_->size() != key_count + 1 || offsets_->front() != 0 ||
+            offsets_->back() != flat_tasks_->size()) {
+            return false;
+        }
+        return std::is_sorted(offsets_->begin(), offsets_->end());
+    }
+
+    [[nodiscard]] size_t Size(size_t key_index) const noexcept {
+        if (nested_tasks_) {
+            return (*nested_tasks_)[key_index].size();
+        }
+        return (*offsets_)[key_index + 1] - (*offsets_)[key_index];
+    }
+
+    [[nodiscard]] const Task &At(size_t key_index, size_t task_index) const noexcept {
+        if (nested_tasks_) {
+            return (*nested_tasks_)[key_index][task_index];
+        }
+        return (*flat_tasks_)[(*offsets_)[key_index] + task_index];
+    }
+
+    // The ReportEvent-only flat representation owns its input strings and is
+    // dead after this call except for spec names used to map failures back to
+    // request items. Transfer the potentially large URI into the immutable
+    // CacheLocation while restoring the usually-SSO name in the task. Generic
+    // nested callers retain their historical copy semantics.
+    [[nodiscard]] LocationSpec CopyOrConsumeSpec(size_t key_index, size_t task_index, size_t spec_index) {
+        if (!flat_tasks_) {
+            return At(key_index, task_index).SpecAt(spec_index);
+        }
+        auto &task = (*flat_tasks_)[(*offsets_)[key_index] + task_index];
+        if (!task.prevalidated_total_size.has_value()) {
+            return task.SpecAt(spec_index);
+        }
+        auto &source = task.MutableSpecAt(spec_index);
+        std::string retained_name = source.name();
+        LocationSpec result = std::move(source);
+        source.set_name(std::move(retained_name));
+        return result;
+    }
+
+private:
+    const std::vector<std::vector<Task>> *nested_tasks_ = nullptr;
+    const std::vector<size_t> *offsets_ = nullptr;
+    std::vector<Task> *flat_tasks_ = nullptr;
+};
+
 ErrorCode
 MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
                                         const KeyVector &keys,
                                         const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
                                         std::vector<ErrorCode> &out_per_key_ec,
                                         AcquireMetadataWriteLeaseFunc acquire_write_lease) {
-    if (keys.size() != tasks_per_key.size()) {
+    return BatchReplaceLocationSpecsImpl(request_context,
+                                         keys,
+                                         LocationSpecsTaskView<ReplaceLocationSpecsTask>(tasks_per_key),
+                                         out_per_key_ec,
+                                         std::move(acquire_write_lease));
+}
+
+ErrorCode MetaSearcher::BatchReplaceLocationSpecsFlat(RequestContext *request_context,
+                                                      const KeyVector &keys,
+                                                      const std::vector<size_t> &task_offsets,
+                                                      std::vector<ReplaceLocationSpecsTask> &flat_tasks,
+                                                      std::vector<ErrorCode> &out_per_key_ec,
+                                                      AcquireMetadataWriteLeaseFunc acquire_write_lease) {
+    return BatchReplaceLocationSpecsImpl(request_context,
+                                         keys,
+                                         LocationSpecsTaskView<ReplaceLocationSpecsTask>(task_offsets, flat_tasks),
+                                         out_per_key_ec,
+                                         std::move(acquire_write_lease));
+}
+
+ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_context,
+                                                      const KeyVector &keys,
+                                                      LocationSpecsTaskView<ReplaceLocationSpecsTask> tasks,
+                                                      std::vector<ErrorCode> &out_per_key_ec,
+                                                      AcquireMetadataWriteLeaseFunc acquire_write_lease) {
+    if (!tasks.Valid(keys.size())) {
         return EC_BADARGS;
     }
     out_per_key_ec.assign(keys.size(), ErrorCode::EC_OK);
@@ -2361,30 +2445,53 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
         return EC_OK;
     }
 
-    LocationIdsPerKey location_ids_per_key(keys.size());
-    std::vector<std::vector<StorageUsageChange>> usage_changes(keys.size());
-    std::unordered_set<int64_t> seen_keys;
-    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
-        if (!seen_keys.insert(keys[key_index]).second) {
-            std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
-            return EC_BADARGS;
+    bool has_duplicate_keys = false;
+    if (std::is_sorted(keys.begin(), keys.end())) {
+        has_duplicate_keys = std::adjacent_find(keys.begin(), keys.end()) != keys.end();
+    } else {
+        std::unordered_set<int64_t> seen_keys;
+        seen_keys.reserve(keys.size());
+        for (const int64_t key : keys) {
+            if (!seen_keys.insert(key).second) {
+                has_duplicate_keys = true;
+                break;
+            }
         }
+    }
+    if (has_duplicate_keys) {
+        std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
+        return EC_BADARGS;
+    }
+
+    LocationIdsPerKey location_ids_per_key(keys.size());
+    std::vector<size_t> usage_offsets(keys.size() + 1, 0);
+    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
+        usage_offsets[key_index + 1] = usage_offsets[key_index] + tasks.Size(key_index);
+    }
+    std::vector<StorageUsageChange> usage_changes(usage_offsets.back());
+    for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
         auto &location_ids = location_ids_per_key[key_index];
-        auto &key_usage_changes = usage_changes[key_index];
-        location_ids.reserve(tasks_per_key[key_index].size());
-        key_usage_changes.resize(tasks_per_key[key_index].size());
-        std::unordered_set<std::string> seen_location_ids;
-        for (size_t task_index = 0; task_index < tasks_per_key[key_index].size(); ++task_index) {
-            const auto &task = tasks_per_key[key_index][task_index];
+        location_ids.reserve(tasks.Size(key_index));
+        std::unordered_set<std::string_view> seen_location_ids;
+        if (tasks.Size(key_index) > 1) {
+            seen_location_ids.reserve(tasks.Size(key_index));
+        }
+        for (size_t task_index = 0; task_index < tasks.Size(key_index); ++task_index) {
+            const auto &task = tasks.At(key_index, task_index);
             const auto &location_id = task.ResolvedLocationId();
             std::uint64_t incoming_size = 0;
-            if (location_id.empty() || !seen_location_ids.insert(location_id).second ||
-                ValidateConsistentSnapshotVersion(task.specs, &incoming_size) != EC_OK) {
+            if (location_id.empty() || task.SpecCount() == 0 ||
+                (tasks.Size(key_index) > 1 && !seen_location_ids.insert(location_id).second) ||
+                (!task.prevalidated_total_size.has_value() &&
+                 ValidateConsistentSnapshotVersion(task.specs, &incoming_size) != EC_OK)) {
                 std::fill(out_per_key_ec.begin(), out_per_key_ec.end(), EC_BADARGS);
                 return EC_BADARGS;
             }
+            if (task.prevalidated_total_size.has_value()) {
+                incoming_size = task.prevalidated_total_size->value();
+            }
             location_ids.push_back(location_id);
-            key_usage_changes[task_index].new_size = incoming_size;
+            usage_changes[usage_offsets[key_index] + task_index].new_size = incoming_size;
         }
     }
 
@@ -2393,7 +2500,8 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
     ErrorCode write_lease_ec = EC_OK;
     MetadataWriteLease write_lease;
     auto modifier = [&keys,
-                     &tasks_per_key,
+                     &tasks,
+                     &usage_offsets,
                      &usage_changes,
                      &acquire_write_lease,
                      &write_lease_attempted,
@@ -2411,11 +2519,10 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
         if (write_lease_ec != EC_OK) {
             return {ModifierAction::MA_FAIL, std::vector<ErrorCode>(location_ids.size(), write_lease_ec)};
         }
-        const auto &tasks = tasks_per_key[key_index];
         std::vector<ErrorCode> modifier_ecs(location_ids.size(), ErrorCode::EC_OK);
         bool updated = false;
         for (size_t location_index = 0; location_index < location_ids.size(); ++location_index) {
-            if (location_index >= tasks.size() || location_index >= get_ecs.size() ||
+            if (location_index >= tasks.Size(key_index) || location_index >= get_ecs.size() ||
                 location_index >= locations.size()) {
                 modifier_ecs[location_index] = ErrorCode::EC_ERROR;
                 continue;
@@ -2431,32 +2538,33 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
                 continue;
             }
 
-            const auto &task = tasks[location_index];
-            auto &usage = usage_changes[key_index][location_index];
-            std::shared_ptr<CacheLocation> new_location;
+            const auto &task = tasks.At(key_index, location_index);
+            auto &usage = usage_changes[usage_offsets[key_index] + location_index];
+            auto new_location = std::make_shared<CacheLocation>();
             if (get_ec == ErrorCode::EC_OK && locations[location_index]) {
                 if (locations[location_index]->type() != task.type) {
                     modifier_ecs[location_index] = ErrorCode::EC_BADARGS;
                     continue;
                 }
-                usage.old_size = GetLocationSpecsSize(locations[location_index]->location_specs());
+                if (!locations[location_index]->GetValidatedTotalSize(usage.old_size)) {
+                    usage.old_size = GetLocationSpecsSize(locations[location_index]->location_specs());
+                }
                 usage.has_old = true;
-                new_location = std::make_shared<CacheLocation>(*locations[location_index]);
-            } else {
-                new_location = std::make_shared<CacheLocation>();
             }
             if (const auto *interned_location_id = task.ResolvedInternedLocationId()) {
                 // New locations and legacy owned-id locations converge to the
                 // request's canonical reporter/medium id on the next write.
                 new_location->set_id(*interned_location_id);
-            } else if (get_ec != ErrorCode::EC_OK || !locations[location_index]) {
-                new_location->set_id(task.location_id);
+            } else {
+                new_location->set_id(get_ec == ErrorCode::EC_OK && locations[location_index]
+                                         ? locations[location_index]->id()
+                                         : task.location_id);
             }
 
             std::vector<LocationSpec> specs;
-            specs.reserve(task.specs.size());
-            for (const auto &spec : task.specs) {
-                specs.emplace_back(spec.name(), spec.uri());
+            specs.reserve(task.SpecCount());
+            for (size_t spec_index = 0; spec_index < task.SpecCount(); ++spec_index) {
+                specs.push_back(tasks.CopyOrConsumeSpec(key_index, location_index, spec_index));
             }
             new_location->set_location_specs(std::move(specs));
             new_location->set_type(task.type);
@@ -2487,7 +2595,7 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
     }
     for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
         ErrorCode key_ec = ErrorCode::EC_OK;
-        const size_t expected_location_count = tasks_per_key[key_index].size();
+        const size_t expected_location_count = tasks.Size(key_index);
         if (key_index >= result.per_location_error_codes.size() ||
             result.per_location_error_codes[key_index].size() != expected_location_count) {
             key_ec = ErrorCode::EC_MISMATCH;
@@ -2502,14 +2610,12 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
                     }
                     continue;
                 }
-                const auto &usage = usage_changes[key_index][location_index];
+                const auto &usage = usage_changes[usage_offsets[key_index] + location_index];
                 if (usage.has_old) {
-                    ApplyStorageUsageChange(meta_indexer_.get(),
-                                            tasks_per_key[key_index][location_index].type,
-                                            usage.old_size,
-                                            usage.new_size);
+                    ApplyStorageUsageChange(
+                        meta_indexer_.get(), tasks.At(key_index, location_index).type, usage.old_size, usage.new_size);
                 } else {
-                    meta_indexer_->AddStorageUsageByType(tasks_per_key[key_index][location_index].type, usage.new_size);
+                    meta_indexer_->AddStorageUsageByType(tasks.At(key_index, location_index).type, usage.new_size);
                 }
             }
         }
@@ -2521,65 +2627,6 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
     return malformed_result ? ErrorCode::EC_MISMATCH : result.ec;
 }
 
-class MetaSearcher::MergeLocationSpecsTaskView {
-public:
-    explicit MergeLocationSpecsTaskView(const std::vector<std::vector<MergeLocationSpecsTask>> &nested_tasks)
-        : nested_tasks_(&nested_tasks) {}
-
-    MergeLocationSpecsTaskView(const std::vector<size_t> &offsets, std::vector<MergeLocationSpecsTask> &flat_tasks)
-        : offsets_(&offsets), flat_tasks_(&flat_tasks) {}
-
-    [[nodiscard]] bool Valid(size_t key_count) const noexcept {
-        if (nested_tasks_) {
-            return nested_tasks_->size() == key_count;
-        }
-        if (!offsets_ || !flat_tasks_ || offsets_->size() != key_count + 1 || offsets_->front() != 0 ||
-            offsets_->back() != flat_tasks_->size()) {
-            return false;
-        }
-        return std::is_sorted(offsets_->begin(), offsets_->end());
-    }
-
-    [[nodiscard]] size_t Size(size_t key_index) const noexcept {
-        if (nested_tasks_) {
-            return (*nested_tasks_)[key_index].size();
-        }
-        return (*offsets_)[key_index + 1] - (*offsets_)[key_index];
-    }
-
-    [[nodiscard]] const MergeLocationSpecsTask &At(size_t key_index, size_t task_index) const noexcept {
-        if (nested_tasks_) {
-            return (*nested_tasks_)[key_index][task_index];
-        }
-        return (*flat_tasks_)[(*offsets_)[key_index] + task_index];
-    }
-
-    // The ReportEvent-only flat representation owns its input strings and is
-    // dead after this call except for spec names used to map failures back to
-    // request items. Transfer the potentially large URI into the immutable
-    // CacheLocation while restoring the usually-SSO name in the task. Generic
-    // nested callers retain their historical copy semantics.
-    [[nodiscard]] LocationSpec CopyOrConsumeSpec(size_t key_index, size_t task_index, size_t spec_index) {
-        if (!flat_tasks_) {
-            return At(key_index, task_index).SpecAt(spec_index);
-        }
-        auto &task = (*flat_tasks_)[(*offsets_)[key_index] + task_index];
-        if (!task.prevalidated_total_size.has_value()) {
-            return task.SpecAt(spec_index);
-        }
-        auto &source = task.MutableSpecAt(spec_index);
-        std::string retained_name = source.name();
-        LocationSpec result = std::move(source);
-        source.set_name(std::move(retained_name));
-        return result;
-    }
-
-private:
-    const std::vector<std::vector<MergeLocationSpecsTask>> *nested_tasks_ = nullptr;
-    const std::vector<size_t> *offsets_ = nullptr;
-    std::vector<MergeLocationSpecsTask> *flat_tasks_ = nullptr;
-};
-
 ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
                                                 const KeyVector &keys,
                                                 const std::vector<std::vector<MergeLocationSpecsTask>> &tasks_per_key,
@@ -2587,7 +2634,7 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecs(RequestContext *request_context,
                                                 AcquireMetadataWriteLeaseFunc acquire_write_lease) {
     return BatchMergeLocationSpecsImpl(request_context,
                                        keys,
-                                       MergeLocationSpecsTaskView(tasks_per_key),
+                                       LocationSpecsTaskView<MergeLocationSpecsTask>(tasks_per_key),
                                        out_per_key_ec,
                                        std::move(acquire_write_lease));
 }
@@ -2600,14 +2647,14 @@ ErrorCode MetaSearcher::BatchMergeLocationSpecsFlat(RequestContext *request_cont
                                                     AcquireMetadataWriteLeaseFunc acquire_write_lease) {
     return BatchMergeLocationSpecsImpl(request_context,
                                        keys,
-                                       MergeLocationSpecsTaskView(task_offsets, flat_tasks),
+                                       LocationSpecsTaskView<MergeLocationSpecsTask>(task_offsets, flat_tasks),
                                        out_per_key_ec,
                                        std::move(acquire_write_lease));
 }
 
 ErrorCode MetaSearcher::BatchMergeLocationSpecsImpl(RequestContext *request_context,
                                                     const KeyVector &keys,
-                                                    MergeLocationSpecsTaskView tasks,
+                                                    LocationSpecsTaskView<MergeLocationSpecsTask> tasks,
                                                     std::vector<ErrorCode> &out_per_key_ec,
                                                     AcquireMetadataWriteLeaseFunc acquire_write_lease) {
     if (!tasks.Valid(keys.size())) {

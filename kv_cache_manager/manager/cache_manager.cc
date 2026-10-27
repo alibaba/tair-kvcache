@@ -3076,11 +3076,6 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         return ec;
     };
 
-    struct SnapshotReplaceEntry {
-        const InternedLocationId *location_id = nullptr;
-        std::vector<LocationSpec> specs;
-        int event_index;
-    };
     struct SnapshotCommitTask {
         ReporterSnapshotKey reporter_key;
         std::string version;
@@ -3251,8 +3246,10 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             location.last_spec = mutation_index;
             ++location.spec_count;
         };
-    std::map<int64_t, std::vector<SnapshotReplaceEntry>> snapshot_to_replace;
-    std::vector<SnapshotCommitTask> snapshot_commit_tasks;
+    KeyVector snapshot_keys;
+    std::vector<size_t> snapshot_task_offsets;
+    std::vector<MetaSearcher::ReplaceLocationSpecsTask> snapshot_replace_tasks;
+    std::optional<SnapshotCommitTask> snapshot_commit_task;
     std::string request_snapshot_version;
 
     for (int i = 0; i < events_size; ++i) {
@@ -3461,12 +3458,12 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             const auto &params = item.block_snapshot();
             struct ValidatedBlock {
                 int64_t block_key;
-                std::string medium;
+                const std::string *medium;
                 ValidatedEventLocationSpecs specs;
+                std::uint64_t total_size;
             };
             std::vector<ValidatedBlock> validated_blocks;
             validated_blocks.reserve(params.blocks_size());
-            std::unordered_set<std::string> seen_blocks;
             std::uint64_t snapshot_total_size = 0;
             for (const auto &block : params.blocks()) {
                 int64_t block_key = 0;
@@ -3476,12 +3473,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     per_item_ec[i] = EC_BADARGS;
                     break;
                 }
-                const std::string duplicate_key = block_medium + "\n" + std::to_string(block_key);
-                if (!seen_blocks.insert(duplicate_key).second) {
-                    per_item_ec[i] = EC_BADARGS;
-                    break;
-                }
                 ValidatedEventLocationSpecs specs;
+                std::uint64_t block_total_size = 0;
                 std::unordered_set<std::string_view> seen_spec_names;
                 if (block.specs_size() > 1) {
                     seen_spec_names.reserve(block.specs_size());
@@ -3499,22 +3492,55 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                         break;
                     }
                     snapshot_total_size += validated_spec.size;
+                    block_total_size += validated_spec.size;
                     specs.Push(std::move(validated_spec), block.specs_size());
                 }
                 if (per_item_ec[i] != EC_OK) {
                     break;
                 }
-                validated_blocks.push_back(ValidatedBlock{block_key, block_medium, std::move(specs)});
+                validated_blocks.push_back(
+                    ValidatedBlock{block_key, &block_medium, std::move(specs), block_total_size});
             }
             if (per_item_ec[i] != EC_OK) {
                 break;
             }
+            // Preserve the previous map's key order and each key's input
+            // medium order, including which location error is returned first.
+            const auto key_less = [](const auto &left, const auto &right) { return left.block_key < right.block_key; };
+            if (!std::is_sorted(validated_blocks.begin(), validated_blocks.end(), key_less)) {
+                std::stable_sort(validated_blocks.begin(), validated_blocks.end(), key_less);
+            }
+            std::unordered_set<std::string_view> seen_mediums;
+            for (size_t group_begin = 0; group_begin < validated_blocks.size();) {
+                size_t group_end = group_begin + 1;
+                while (group_end < validated_blocks.size() &&
+                       validated_blocks[group_end].block_key == validated_blocks[group_begin].block_key) {
+                    ++group_end;
+                }
+                if (group_end - group_begin > 1) {
+                    seen_mediums.clear();
+                    seen_mediums.reserve(group_end - group_begin);
+                    for (size_t block_index = group_begin; block_index < group_end; ++block_index) {
+                        if (!seen_mediums.insert(*validated_blocks[block_index].medium).second) {
+                            per_item_ec[i] = EC_BADARGS;
+                            break;
+                        }
+                    }
+                }
+                if (per_item_ec[i] != EC_OK) {
+                    break;
+                }
+                group_begin = group_end;
+            }
+            if (per_item_ec[i] != EC_OK) {
+                break;
+            }
+
             std::vector<std::string> snapshot_mediums;
-            snapshot_mediums.reserve(validated_blocks.size());
             for (const auto &block : validated_blocks) {
-                if (std::find(snapshot_mediums.begin(), snapshot_mediums.end(), block.medium) ==
+                if (std::find(snapshot_mediums.begin(), snapshot_mediums.end(), *block.medium) ==
                     snapshot_mediums.end()) {
-                    snapshot_mediums.push_back(block.medium);
+                    snapshot_mediums.push_back(*block.medium);
                 }
             }
             const ErrorCode ensure_node_ec = ensure_node_mediums(snapshot_mediums);
@@ -3523,8 +3549,39 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 break;
             }
 
-            // Keep the reporter write gate short: all request parsing and
-            // validation above is complete before BeginSnapshot closes it.
+            // Group and allocate the flat replacement tasks before closing
+            // the reporter write gate. Only generation-dependent URI appends
+            // and metadata mutation remain after BeginSnapshot.
+            snapshot_keys.reserve(validated_blocks.size());
+            snapshot_task_offsets.reserve(validated_blocks.size() + 1);
+            snapshot_task_offsets.push_back(0);
+            snapshot_replace_tasks.reserve(validated_blocks.size());
+            for (auto &block : validated_blocks) {
+                if (snapshot_keys.empty() || snapshot_keys.back() != block.block_key) {
+                    if (!snapshot_keys.empty()) {
+                        snapshot_task_offsets.push_back(snapshot_replace_tasks.size());
+                    }
+                    snapshot_keys.push_back(block.block_key);
+                }
+                MetaSearcher::ReplaceLocationSpecsTask task{{}, requested_type, CacheLocationStatus::CLS_SERVING, {}};
+                task.borrowed_interned_location_id = &get_location_id(*block.medium);
+                task.prevalidated_total_size = MetaSearcher::PrevalidatedTotalSize(block.total_size);
+                task.specs.resize(block.specs.Size());
+                for (size_t spec_index = 0; spec_index < block.specs.Size(); ++spec_index) {
+                    const auto &spec = block.specs.At(spec_index);
+                    task.specs[spec_index].set_name_view(spec.name);
+                    // The original version check scans from the first '?'.
+                    // Retain it for legacy or ambiguous URI spellings.
+                    if (!spec.is_canonical_uri || spec.raw_uri.find('?') < spec.raw_uri.find("://") + 3) {
+                        task.prevalidated_total_size.reset();
+                    }
+                }
+                snapshot_replace_tasks.push_back(std::move(task));
+            }
+            if (!snapshot_keys.empty()) {
+                snapshot_task_offsets.push_back(snapshot_replace_tasks.size());
+            }
+
             uint64_t retry_after_ms = 0;
             const ErrorCode begin_ec = event_backend->BeginSnapshot(
                 reporter_key, request_snapshot_version, retry_after_ms, &mutation_lifecycle_generation);
@@ -3542,34 +3599,28 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 break;
             }
 
-            for (auto &block : validated_blocks) {
-                std::vector<LocationSpec> versioned_specs;
-                versioned_specs.reserve(block.specs.Size());
+            for (size_t block_index = 0; block_index < validated_blocks.size(); ++block_index) {
+                auto &block = validated_blocks[block_index];
+                auto &task = snapshot_replace_tasks[block_index];
                 for (size_t spec_index = 0; spec_index < block.specs.Size(); ++spec_index) {
                     auto &spec = block.specs.At(spec_index);
                     if (!spec.AddPrevalidatedSnapshotVersion(request_snapshot_version)) {
                         per_item_ec[i] = EC_BADARGS;
                         break;
                     }
-                    LocationSpec versioned_spec;
-                    versioned_spec.set_name_view(spec.name);
-                    versioned_spec.set_uri(std::move(spec.versioned_uri));
-                    versioned_specs.push_back(std::move(versioned_spec));
+                    task.specs[spec_index].set_uri(std::move(spec.versioned_uri));
                 }
                 if (per_item_ec[i] != EC_OK) {
                     break;
                 }
-                snapshot_to_replace[block.block_key].push_back(
-                    SnapshotReplaceEntry{&get_location_id(block.medium), std::move(versioned_specs), i});
             }
             if (per_item_ec[i] != EC_OK) {
                 event_backend->AbortSnapshotVersion(reporter_key, request_snapshot_version);
-                snapshot_to_replace.clear();
                 request_snapshot_version.clear();
                 break;
             }
-            snapshot_commit_tasks.push_back(SnapshotCommitTask{
-                reporter_key, request_snapshot_version, event_backend->GetSnapshotAttemptEpoch(reporter_key), i});
+            snapshot_commit_task = SnapshotCommitTask{
+                reporter_key, request_snapshot_version, event_backend->GetSnapshotAttemptEpoch(reporter_key), i};
             break;
         }
         default:
@@ -3886,50 +3937,25 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         }
     }
 
-    if (!snapshot_to_replace.empty()) {
-        KeyVector snapshot_keys;
-        std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> replace_tasks;
-        std::vector<std::vector<int>> event_indices;
-        snapshot_keys.reserve(snapshot_to_replace.size());
-        replace_tasks.reserve(snapshot_to_replace.size());
-        event_indices.reserve(snapshot_to_replace.size());
-        for (auto &[block_key, entries] : snapshot_to_replace) {
-            snapshot_keys.push_back(block_key);
-            auto &tasks = replace_tasks.emplace_back();
-            auto &indices = event_indices.emplace_back();
-            tasks.reserve(entries.size());
-            indices.reserve(entries.size());
-            for (auto &entry : entries) {
-                MetaSearcher::ReplaceLocationSpecsTask task{
-                    {},
-                    requested_type,
-                    CacheLocationStatus::CLS_SERVING,
-                    std::move(entry.specs),
-                };
-                task.borrowed_interned_location_id = entry.location_id;
-                tasks.push_back(std::move(task));
-                indices.push_back(entry.event_index);
-            }
-        }
-
+    if (snapshot_commit_task && !snapshot_replace_tasks.empty()) {
         std::vector<ErrorCode> per_key_ec;
-        meta_searcher->BatchReplaceLocationSpecs(
-            request_context, snapshot_keys, replace_tasks, per_key_ec, acquire_write_lease);
+        meta_searcher->BatchReplaceLocationSpecsFlat(request_context,
+                                                     snapshot_keys,
+                                                     snapshot_task_offsets,
+                                                     snapshot_replace_tasks,
+                                                     per_key_ec,
+                                                     acquire_write_lease);
+        const int event_index = snapshot_commit_task->event_index;
         for (size_t key_index = 0; key_index < snapshot_keys.size(); ++key_index) {
             const ErrorCode key_ec = key_index < per_key_ec.size() ? per_key_ec[key_index] : EC_ERROR;
-            if (key_ec == EC_OK) {
-                continue;
-            }
-            for (int event_index : event_indices[key_index]) {
-                if (per_item_ec[event_index] == EC_OK) {
-                    per_item_ec[event_index] = key_ec;
-                }
+            if (key_ec != EC_OK && per_item_ec[event_index] == EC_OK) {
+                per_item_ec[event_index] = key_ec;
             }
         }
     }
 
-    if (!snapshot_commit_tasks.empty()) {
-        const auto &task = snapshot_commit_tasks.front();
+    if (snapshot_commit_task) {
+        const auto &task = *snapshot_commit_task;
         bool snapshot_failed = per_item_ec[task.event_index] != EC_OK;
         // Event-report metadata is a soft cache index. Like delta mutations,
         // a snapshot commits after every persistent write has been accepted

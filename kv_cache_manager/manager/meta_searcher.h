@@ -172,6 +172,16 @@ public:
     static size_t ClassifyAddLocationRollback(const KeyVector &keys,
                                               const std::vector<AddLocationResult> &add_results,
                                               AddLocationRollbackPlan &out_plan);
+    class PrevalidatedTotalSize {
+    public:
+        [[nodiscard]] std::uint64_t value() const noexcept { return value_; }
+
+    private:
+        friend class CacheManager;
+        explicit PrevalidatedTotalSize(std::uint64_t value) noexcept : value_(value) {}
+
+        std::uint64_t value_ = 0;
+    };
     struct ReplaceLocationSpecsTask {
         std::string location_id;
         DataStorageType type;
@@ -179,6 +189,11 @@ public:
         std::vector<LocationSpec> specs;
         InternedLocationId interned_location_id;
         const InternedLocationId *borrowed_interned_location_id = nullptr;
+        std::optional<PrevalidatedTotalSize> prevalidated_total_size;
+
+        [[nodiscard]] size_t SpecCount() const noexcept { return specs.size(); }
+        [[nodiscard]] const LocationSpec &SpecAt(size_t index) const noexcept { return specs[index]; }
+        [[nodiscard]] LocationSpec &MutableSpecAt(size_t index) noexcept { return specs[index]; }
 
         [[nodiscard]] const std::string &ResolvedLocationId() const noexcept {
             const auto *interned = ResolvedInternedLocationId();
@@ -204,16 +219,15 @@ public:
                                         const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
                                         std::vector<ErrorCode> &out_per_key_ec,
                                         AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
-    class PrevalidatedTotalSize {
-    public:
-        [[nodiscard]] std::uint64_t value() const noexcept { return value_; }
-
-    private:
-        friend class CacheManager;
-        explicit PrevalidatedTotalSize(std::uint64_t value) noexcept : value_(value) {}
-
-        std::uint64_t value_ = 0;
-    };
+    // The flat form reuses ReportEvent's validated sizes and can consume its
+    // task URIs. Generic tasks keep strict validation and copy/retry semantics,
+    // as in BatchMergeLocationSpecsFlat. Metadata RMW/counting is unchanged.
+    ErrorCode BatchReplaceLocationSpecsFlat(RequestContext *request_context,
+                                            const KeyVector &keys,
+                                            const std::vector<size_t> &task_offsets,
+                                            std::vector<ReplaceLocationSpecsTask> &flat_tasks,
+                                            std::vector<ErrorCode> &out_per_key_ec,
+                                            AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
     struct MergeLocationSpecsTask {
         std::string location_id;
         DataStorageType type;
@@ -395,11 +409,18 @@ private:
                                           SelectLocationPolicy *policy,
                                           char state_category,
                                           size_t window_blocks) const;
-    class MergeLocationSpecsTaskView;
+    template <typename Task>
+    class LocationSpecsTaskView;
+
+    ErrorCode BatchReplaceLocationSpecsImpl(RequestContext *request_context,
+                                            const KeyVector &keys,
+                                            LocationSpecsTaskView<ReplaceLocationSpecsTask> tasks,
+                                            std::vector<ErrorCode> &out_per_key_ec,
+                                            AcquireMetadataWriteLeaseFunc acquire_write_lease);
 
     ErrorCode BatchMergeLocationSpecsImpl(RequestContext *request_context,
                                           const KeyVector &keys,
-                                          MergeLocationSpecsTaskView tasks,
+                                          LocationSpecsTaskView<MergeLocationSpecsTask> tasks,
                                           std::vector<ErrorCode> &out_per_key_ec,
                                           AcquireMetadataWriteLeaseFunc acquire_write_lease);
 

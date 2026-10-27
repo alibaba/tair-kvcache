@@ -2237,6 +2237,21 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
               meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
     EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 
+    // Generic flat input remains retryable; the validated snapshot path can
+    // consume its URI while preserving replacement and usage semantics.
+    std::vector<MetaSearcher::ReplaceLocationSpecsTask> flat_tasks{replace_tasks[0][0]};
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecsFlat(
+                  request_context_.get(), keys, {0, 1}, flat_tasks, per_key_ec));
+    EXPECT_EQ(replace_tasks[0][0].specs[0].uri(), flat_tasks[0].specs[0].uri());
+    flat_tasks[0].prevalidated_total_size = MetaSearcher::PrevalidatedTotalSize(7);
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecsFlat(
+                  request_context_.get(), keys, {0, 1}, flat_tasks, per_key_ec));
+    EXPECT_TRUE(flat_tasks[0].specs[0].uri().empty());
+    EXPECT_EQ("linear_0", flat_tasks[0].specs[0].name());
+    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+
     // A location id has stable storage ownership.  Rejecting a type mutation
     // must leave both the stored location and per-type accounting unchanged.
     replace_tasks[0][0].type = DataStorageType::DATA_STORAGE_TYPE_NFS;
