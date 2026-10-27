@@ -48,7 +48,7 @@ bool OnlineOptimizerServer::Init(const std::string &config_file, const EnvironMa
         return false;
     }
 
-    manager_ = std::make_shared<OnlineOptimizerManager>(registry_manager_);
+    manager_ = std::make_shared<OnlineOptimizerManager>(registry_manager_, config_.event_time_only());
 
     ErrorCode recover_ec = manager_->Recover();
     if (recover_ec != EC_OK) {

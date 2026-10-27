@@ -221,4 +221,13 @@ TEST_F(OnlineOptimizerServerConfigTest, UnderscoreEnvKeyFallback) {
     EXPECT_EQ(8888, config.http_port());
 }
 
+TEST_F(OnlineOptimizerServerConfigTest, EventTimeOnlyIsExplicitAndRoundTrips) {
+    OnlineOptimizerServerConfig config;
+    ASSERT_TRUE(config.FromJsonString(R"({"registry_storage_uri":"local://", "event_time_only":true})"));
+    EXPECT_TRUE(config.event_time_only());
+    OnlineOptimizerServerConfig decoded;
+    ASSERT_TRUE(decoded.FromJsonString(config.ToJsonString()));
+    EXPECT_TRUE(decoded.event_time_only());
+}
+
 } // namespace kv_cache_manager

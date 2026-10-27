@@ -93,6 +93,7 @@ std::unordered_map<std::string, OnlineOptimizerServerConfig::SettingFunction>
 // clang-format on
 
 bool OnlineOptimizerServerConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "event_time_only", event_time_only_, false);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "rpc_port", rpc_port_, int32_t(50052));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "http_port", http_port_, int32_t(8082));
     KVCM_JSON_GET_MACRO(rapid_value, "registry_storage_uri", registry_storage_uri_);
@@ -106,6 +107,7 @@ bool OnlineOptimizerServerConfig::FromRapidValue(const rapidjson::Value &rapid_v
 }
 
 void OnlineOptimizerServerConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "event_time_only", event_time_only_);
     Put(writer, "rpc_port", rpc_port_);
     Put(writer, "http_port", http_port_);
     Put(writer, "registry_storage_uri", registry_storage_uri_);

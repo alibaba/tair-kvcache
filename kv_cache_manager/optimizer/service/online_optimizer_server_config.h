@@ -44,6 +44,7 @@ public:
 
     bool OverrideFromEnviron(const EnvironMap &environ);
 
+    bool event_time_only() const { return event_time_only_; }
     int32_t rpc_port() const { return rpc_port_; }
     int32_t http_port() const { return http_port_; }
     const std::string &registry_storage_uri() const { return registry_storage_uri_; }
@@ -60,6 +61,7 @@ private:
     void UpdateEnviron(EnvironMap &environ);
     bool ValidateKvcmEventSubscriptions() const;
 
+    bool event_time_only_ = false;
     int32_t rpc_port_ = 50052;
     int32_t http_port_ = 8082;
     std::string registry_storage_uri_;

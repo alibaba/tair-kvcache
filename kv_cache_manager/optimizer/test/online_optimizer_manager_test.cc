@@ -488,6 +488,25 @@ TEST_F(OnlineOptimizerManagerTest, FullAttentionLayersGroupTtlOntoLiteHit) {
     EXPECT_EQ(EC_BADARGS, RegisterInstance(bad_info, bad_group, reg_result));
 }
 
+TEST_F(OnlineOptimizerManagerTest, DelayedEventsKeepTheirClockWhenMetricsAreRead) {
+    mgr_ = std::make_shared<OnlineOptimizerManager>(registry_, true);
+    auto info = MakeInfo("i1", "g1", 4, 0);
+    auto group = MakeGroup("g1", {FullCapacityGb(2)}, "lru", true, 10);
+    RegisterInstanceResult registered;
+    ASSERT_EQ(EC_OK, RegisterInstance(info, group, registered));
+    TraceQueryResult result;
+    EXPECT_EQ(EC_BADARGS, mgr_->TraceQuery("i1", {1, 2}, 8, 0, result));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, 1000LL * 1000000000, result));
+    std::vector<InstanceSummary> summaries;
+    ASSERT_EQ(EC_OK, mgr_->ListInstances("g1", summaries));
+    ASSERT_EQ(1u, summaries.size());
+    EXPECT_EQ(0, summaries[0].ttl_eviction_count);
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, 1005LL * 1000000000, result));
+    EXPECT_EQ(2, result.hit_count_per_capacity.at(0));
+    ASSERT_EQ(EC_OK, mgr_->TraceQuery("i1", {1, 2}, 8, 1016LL * 1000000000, result));
+    EXPECT_EQ(0, result.hit_count_per_capacity.at(0));
+}
+
 TEST_F(OnlineOptimizerManagerTest, TraceQueryUsesProducerTimeForTtl) {
     for (int32_t linear_step : {0, 1}) {
         const std::string instance_id = "i" + std::to_string(linear_step);

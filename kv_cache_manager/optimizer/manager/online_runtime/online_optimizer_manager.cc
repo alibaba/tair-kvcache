@@ -15,8 +15,9 @@
 
 namespace kv_cache_manager {
 
-OnlineOptimizerManager::OnlineOptimizerManager(std::shared_ptr<OptimizerRegistryManager> registry_manager)
-    : registry_manager_(std::move(registry_manager)) {}
+OnlineOptimizerManager::OnlineOptimizerManager(std::shared_ptr<OptimizerRegistryManager> registry_manager,
+                                               bool event_time_only)
+    : event_time_only_(event_time_only), registry_manager_(std::move(registry_manager)) {}
 
 namespace {
 
@@ -444,7 +445,7 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
                                              int64_t input_token_len,
                                              int64_t timestamp_ns,
                                              TraceQueryResult &result) {
-    if (input_token_len < 0 || timestamp_ns < 0) {
+    if (input_token_len < 0 || timestamp_ns < 0 || (event_time_only_ && timestamp_ns == 0)) {
         return EC_BADARGS;
     }
     const int64_t replay_timestamp_ns =
@@ -615,7 +616,9 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             // Summaries arrive without traffic; advance the TTL watermark so
             // idle instances report the alive set as of now, not as of the
             // last request.
-            state->lite_hit->AdvanceTime(static_cast<int64_t>(TimestampUtil::GetCurrentTimeUs()) * 1000);
+            if (!event_time_only_) {
+                state->lite_hit->AdvanceTime(static_cast<int64_t>(TimestampUtil::GetCurrentTimeUs()) * 1000);
+            }
             s.unique_keys = ClampToInt64(state->lite_hit->current_unique_blocks());
             s.ttl_eviction_count = ClampToInt64(state->lite_hit->ttl_expired_blocks());
             // Total-eviction contract: LiteHit has no capacity evictions, so

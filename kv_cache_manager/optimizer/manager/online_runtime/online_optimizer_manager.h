@@ -121,7 +121,8 @@ struct InstanceSummary {
 
 class OnlineOptimizerManager {
 public:
-    explicit OnlineOptimizerManager(std::shared_ptr<OptimizerRegistryManager> registry_manager);
+    explicit OnlineOptimizerManager(std::shared_ptr<OptimizerRegistryManager> registry_manager,
+                                    bool event_time_only = false);
     ~OnlineOptimizerManager() = default;
 
     OnlineOptimizerManager(const OnlineOptimizerManager &) = delete;
@@ -138,7 +139,7 @@ public:
     ErrorCode RemoveInstance(const std::string &instance_id);
 
     // input_token_len == 0 infers a full-block request. timestamp_ns == 0
-    // falls back to the local arrival time.
+    // uses local arrival time in realtime mode; event-time mode rejects zero.
     ErrorCode TraceQuery(const std::string &instance_id,
                          const std::vector<int64_t> &block_keys,
                          int64_t input_token_len,
@@ -177,6 +178,7 @@ private:
 
     bool HasPersistedInstanceInGroup(const std::string &instance_group_name) const;
 
+    const bool event_time_only_;
     std::shared_ptr<OptimizerRegistryManager> registry_manager_;
     mutable std::mutex admin_ops_mutex_;
     mutable std::shared_mutex instances_mutex_;
