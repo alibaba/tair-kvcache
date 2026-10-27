@@ -502,10 +502,6 @@ void Server::Stop() {
     }
     stop_ = true;
     KVCM_LOG_INFO("server stopping...");
-    // Join role callbacks while all Server-owned components are still alive.
-    if (leader_elector_) {
-        leader_elector_->Stop();
-    }
     if (optimizer_event_service_) {
         optimizer_event_service_->DisableSubscriptions();
     }
