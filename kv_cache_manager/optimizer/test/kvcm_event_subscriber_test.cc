@@ -307,7 +307,7 @@ TEST_F(KvcmEventSubscriberTest, AppliesConfiguredCapacityTiers) {
     subscriber.Stop();
 }
 
-TEST_F(KvcmEventSubscriberTest, UnknownInstanceTriggersImmediateConfigurationRefresh) {
+TEST_F(KvcmEventSubscriberTest, NewInstanceIsRegisteredBeforeItsFirstEvent) {
     TestKvcmServer leader;
     leader.event_service_.SetConfiguration(MakeConfiguration({"known"}));
     KvcmEventSubscriber subscriber(
@@ -325,16 +325,17 @@ TEST_F(KvcmEventSubscriberTest, UnknownInstanceTriggersImmediateConfigurationRef
     }));
     ASSERT_TRUE(WaitUntil([this] { return IsRegistered("new-instance"); }));
 
-    leader.event_service_.Publish(MakeEvent("new-instance", "accepted", 2));
     ASSERT_TRUE(WaitUntil([this] { return TotalQueries("new-instance") == 1; }));
+    leader.event_service_.Publish(MakeEvent("new-instance", "accepted", 2));
+    ASSERT_TRUE(WaitUntil([this] { return TotalQueries("new-instance") == 2; }));
     const MetricsTags unknown_instance_tags = {{"instance_group", ""}, {"instance_id", "new-instance"}};
     const MetricsTags known_instance_tags = {{"instance_group", "g1"}, {"instance_id", "new-instance"}};
     ASSERT_TRUE(WaitUntil([this, &unknown_instance_tags, &known_instance_tags] {
         return metrics_registry_->GetCounter("service.query_counter").Get() == 2u &&
-               metrics_registry_->GetCounter("service.error_counter").Get() == 1u &&
-               metrics_registry_->GetCounter("service.query_counter", unknown_instance_tags).Get() == 1u &&
-               metrics_registry_->GetCounter("service.error_counter", unknown_instance_tags).Get() == 1u &&
-               metrics_registry_->GetCounter("service.query_counter", known_instance_tags).Get() == 1u &&
+               metrics_registry_->GetCounter("service.error_counter").Get() == 0u &&
+               metrics_registry_->GetCounter("service.query_counter", unknown_instance_tags).Get() == 0u &&
+               metrics_registry_->GetCounter("service.error_counter", unknown_instance_tags).Get() == 0u &&
+               metrics_registry_->GetCounter("service.query_counter", known_instance_tags).Get() == 2u &&
                metrics_registry_->GetCounter("service.error_counter", known_instance_tags).Get() == 0u;
     }));
     subscriber.Stop();

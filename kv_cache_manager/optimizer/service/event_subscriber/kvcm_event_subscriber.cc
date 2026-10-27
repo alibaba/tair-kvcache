@@ -169,6 +169,7 @@ std::string KvcmEventSubscriber::FormatEndpoint(const std::string &host, int por
 }
 
 bool KvcmEventSubscriber::SyncConfiguration(const std::string &leader_endpoint) {
+    std::lock_guard<std::mutex> sync_lock(configuration_sync_mutex_);
     auto channel = grpc::CreateChannel(leader_endpoint, grpc::InsecureChannelCredentials());
     auto stub = proto::optimizer::OptimizerEventStreamService::NewStub(channel);
     grpc::ClientContext context;
@@ -196,6 +197,10 @@ bool KvcmEventSubscriber::SyncConfiguration(const std::string &leader_endpoint) 
     {
         std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);
         unsupported_instance_ids_ = std::move(unsupported_instance_ids);
+        configured_instance_ids_.clear();
+        for (const auto &instance : response.instances()) {
+            configured_instance_ids_.insert(instance.instance_id());
+        }
     }
     KVCM_LOG_INFO("KvcmEventSubscriber: configuration synchronized from leader[%s], groups=%d instances=%d",
                   leader_endpoint.c_str(),
@@ -263,6 +268,20 @@ void KvcmEventSubscriber::EndpointLoop(EndpointWorker *worker) {
             received_event = true;
             if (kvcm_ip.empty()) {
                 kvcm_ip = ExtractIpFromPeer(context.peer());
+            }
+            bool configured;
+            {
+                std::lock_guard<std::mutex> lock(unsupported_instances_mutex_);
+                configured = configured_instance_ids_.count(event.instance_id()) != 0;
+            }
+            // Register newly attributed deployments before their first query.
+            // This is a control-plane prerequisite, not an event replay.
+            if (!configured && !SyncConfiguration(worker->endpoint)) {
+                KVCM_LOG_WARN(
+                    "KvcmEventSubscriber: drop event after configuration sync failed, trace_id=%s instance_id=%s",
+                    event.trace_id().c_str(),
+                    event.instance_id().c_str());
+                continue;
             }
             ProcessEvent(event, kvcm_ip);
         }
