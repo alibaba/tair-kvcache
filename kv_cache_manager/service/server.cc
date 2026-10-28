@@ -17,6 +17,7 @@
 #include "kv_cache_manager/event/optimizer_event_publisher.h"
 #include "kv_cache_manager/event/optimizer_stream/subscription_event_sink.h"
 #include "kv_cache_manager/manager/cache_manager.h"
+#include "kv_cache_manager/manager/kv_meta_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -27,11 +28,13 @@
 #include "kv_cache_manager/service/debug_service_impl.h"
 #include "kv_cache_manager/service/grpc_service/admin_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/debug_service_grpc.h"
+#include "kv_cache_manager/service/grpc_service/kv_meta_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
 #include "kv_cache_manager/service/http_service/admin_service_http.h"
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
+#include "kv_cache_manager/service/kv_meta_service_impl.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
 
 namespace kv_cache_manager {
@@ -118,6 +121,17 @@ bool Server::Init(const ServerConfig &config) {
         cache_manager_, metrics_reporter_, metrics_registry_, registry_manager_, leader_elector_);
     debug_impl_ = std::make_shared<DebugServiceImpl>(cache_manager_);
 
+    if (config_.IsKvMetaEnabled()) {
+        kv_meta_manager_ = std::make_shared<KvMetaManager>(cache_manager_, registry_manager_);
+        if (!kv_meta_manager_->Init()) {
+            KVCM_LOG_ERROR("KVMeta manager init failed");
+            return false;
+        }
+        kv_meta_impl_ = std::make_shared<KvMetaServiceImpl>(cache_manager_, kv_meta_manager_, metrics_reporter_);
+        kv_meta_impl_->DisableLeaderOnlyRequests();
+        KVCM_LOG_INFO("KVMeta service enabled on the primary RPC port %d", config_.GetServiceRpcPort());
+    }
+
     meta_impl_->DisableLeaderOnlyRequests();
     admin_impl_->DisableLeaderOnlyRequests();
 
@@ -161,6 +175,16 @@ void Server::OnBecomeLeader() {
         optimizer_event_service_->EnableSubscriptions();
     }
     KVCM_LOG_INFO("recover end");
+
+    if (kv_meta_manager_) {
+        if (kv_meta_manager_->ResumeMaintenance()) {
+            // The KVMeta reclaimer performs recovery before its first GC
+            // round. Requests return SERVICE_NOT_READY until that completes.
+            kv_meta_impl_->EnableLeaderOnlyRequests();
+        } else {
+            KVCM_LOG_ERROR("KVMeta maintenance start failed; service remains disabled");
+        }
+    }
 }
 
 void Server::OnNoLongerLeader() {
@@ -173,6 +197,10 @@ void Server::OnNoLongerLeader() {
 
     meta_impl_->DisableLeaderOnlyRequests();
     admin_impl_->DisableLeaderOnlyRequests();
+    if (kv_meta_manager_) {
+        kv_meta_impl_->DisableLeaderOnlyRequests();
+        kv_meta_manager_->CancelMaintenance();
+    }
 
     meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
     admin_impl_->WaitForAllLeaderOnlyRequestsToComplete();
@@ -181,6 +209,11 @@ void Server::OnNoLongerLeader() {
     // Stop migration after leader-only requests drain and after GC has stopped consulting
     // active Copy reservations.
     cache_manager_->StopMigrationManager();
+
+    if (kv_meta_manager_) {
+        kv_meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+        kv_meta_manager_->DoCleanup();
+    }
 
     ErrorCode ec = cache_manager_->DoCleanup();
     if (ec != EC_OK) {
@@ -264,16 +297,32 @@ bool Server::StartRpcServer() {
     meta_service_.reset(new MetaServiceGRpc(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_));
     admin_service_.reset(new AdminServiceGRpc(metrics_registry_, admin_impl_));
     debug_service_.reset(new DebugServiceGRpc(metrics_registry_, debug_impl_));
+    if (config_.IsKvMetaEnabled()) {
+        if (!kv_meta_impl_ || !kv_meta_manager_) {
+            KVCM_LOG_ERROR("KVMeta is enabled but its manager is unavailable");
+            return false;
+        }
+        kv_meta_service_ = std::make_shared<KvMetaServiceGRpc>(metrics_registry_, kv_meta_impl_);
+    }
 
     meta_service_->Init();
     admin_service_->Init();
     debug_service_->Init();
+    if (kv_meta_service_) {
+        kv_meta_service_->Init();
+    }
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(meta_service_.get());
     if (optimizer_event_service_) {
         builder.RegisterService(optimizer_event_service_.get());
+    }
+    if (kv_meta_service_) {
+        // The protobuf packages are distinct, so KVMeta and the fixed-block
+        // MetaService have different fully qualified RPC method names even
+        // though both proto services are named MetaService.
+        builder.RegisterService(kv_meta_service_.get());
     }
     if (!use_separate_admin_server) {
         builder.RegisterService(admin_service_.get());
@@ -288,8 +337,11 @@ bool Server::StartRpcServer() {
     }
     rpc_server_.reset(server.release());
     KVCM_LOG_INFO("Server listening on %s success", server_address.c_str());
-    if (use_separate_admin_server) {
-        return StartSeparateAdminRpcServer();
+    if (kv_meta_service_) {
+        KVCM_LOG_INFO("KVMeta service registered on primary RPC port %d", rpc_port);
+    }
+    if (use_separate_admin_server && !StartSeparateAdminRpcServer()) {
+        return false;
     }
     return true;
 }
@@ -505,6 +557,14 @@ void Server::Stop() {
     if (optimizer_event_service_) {
         optimizer_event_service_->DisableSubscriptions();
     }
+    if (kv_meta_manager_) {
+        kv_meta_impl_->DisableLeaderOnlyRequests();
+        kv_meta_manager_->CancelMaintenance();
+    }
+
+    // Close KVMeta admission before shutting down the shared primary listener.
+    // In-flight KVMeta and fixed-block calls then follow the same existing
+    // graceful gRPC shutdown semantics.
     if (rpc_server_) {
         rpc_server_->Shutdown();
     }
@@ -528,6 +588,11 @@ void Server::Stop() {
         KVCM_LOG_INFO("metrics reporter stopped.");
     }
     KVCM_LOG_INFO("admin http server stopped.");
+
+    if (kv_meta_manager_) {
+        kv_meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+        kv_meta_manager_->DoCleanup();
+    }
     KVCM_LOG_INFO("kvcm server stopped, goodbye!");
 }
 
