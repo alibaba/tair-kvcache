@@ -9,7 +9,7 @@ here may import them.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
@@ -40,7 +40,9 @@ def spec_name(tp_rank: int, group_idx: int) -> str:
     return f"tp{tp_rank}_g{group_idx}"
 
 
-def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict]:
+def spec_group_plan(
+    *, state_names: Sequence[str], attn_names: Sequence[str]
+) -> List[dict]:
     """LocationSpecGroups describing which specs a block may carry.
 
     Hybrid (mamba "align") models write a *sparse* set of recurrent states:
@@ -59,25 +61,38 @@ def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict
     Full-attention models have nothing to be sparse about: they declare no
     groups at all, which keeps their requests byte-identical to before (and
     compatible with managers that predate spec groups).
+
+    The names are the *caller's*: an engine that shards KV on another axis
+    names its specs differently (``build_spec_groups`` below is the TP-rank
+    form), while which specs a block may carry -- and in which order the two
+    groups travel -- is the same everywhere.
     """
-    state_groups = [m for m in group_metas if isinstance(m, StateGroupMeta)]
-    if not state_groups:
+    if not state_names:
         return []
-    attn_specs = sorted(
-        spec_name(rank, meta.group_idx)
-        for rank in range(tp_size)
-        for meta in group_metas
-        if isinstance(meta, AttentionGroupMeta)
-    )
-    all_specs = sorted(
-        spec_name(rank, meta.group_idx)
-        for rank in range(tp_size)
-        for meta in group_metas
-    )
     return [
-        {"name": ATTN_ONLY_SPEC_GROUP, "spec_names": attn_specs},
-        {"name": ALL_SPEC_GROUP, "spec_names": all_specs},
+        {"name": ATTN_ONLY_SPEC_GROUP, "spec_names": sorted(attn_names)},
+        {
+            "name": ALL_SPEC_GROUP,
+            "spec_names": sorted(set(state_names) | set(attn_names)),
+        },
     ]
+
+
+def build_spec_groups(group_metas: List["GroupMeta"], tp_size: int) -> List[dict]:
+    """``spec_group_plan`` for this connector's (tp rank, group) spec names."""
+    ranks_and_metas = [(rank, meta) for rank in range(tp_size) for meta in group_metas]
+    return spec_group_plan(
+        state_names=[
+            spec_name(rank, meta.group_idx)
+            for rank, meta in ranks_and_metas
+            if isinstance(meta, StateGroupMeta)
+        ],
+        attn_names=[
+            spec_name(rank, meta.group_idx)
+            for rank, meta in ranks_and_metas
+            if isinstance(meta, AttentionGroupMeta)
+        ],
+    )
 
 
 @dataclass(frozen=True)

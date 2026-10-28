@@ -19,12 +19,11 @@ from unittest.mock import MagicMock
 from kv_cache_manager.py_connector.test import vllm_stubs  # noqa: F401 (stubs)
 
 import torch
-from kv_cache_manager.py_connector.vllm.data_transfer import (
-    DataTransferManager,
-    MultiResult,
-)
+from kv_cache_manager.py_connector.vllm.data_transfer import DataTransferManager
+from kv_cache_manager.py_connector.vllm.transfer_backend import MultiResult
 from kv_cache_manager.py_connector.vllm.transfer_types import KVLayout
 from kv_cache_manager.py_connector.common.tp_coordinator import CoordinateMsgSerializer
+from kv_cache_manager.py_connector.common.logger import logger as kvcm_logger
 
 
 class TestMultiResult(unittest.TestCase):
@@ -299,7 +298,7 @@ class TestNullStateBlocks(unittest.TestCase):
 class TestTaskCrashReporting(unittest.TestCase):
     """A task that dies mid-transfer must still report, all-failed.
 
-    submit_task drops the future, so an escaping exception is silently
+    submit drops the future, so an escaping exception is silently
     swallowed: the MultiResult callback never fires, the save session hangs
     (SendBlockFinishedEvent never sent) and -- worse -- a load leaves vLLM
     believing KV it never received under the connector's synchronous-load
@@ -384,6 +383,43 @@ class TestAbstainedVerdicts(unittest.TestCase):
         )
         cb([None])
         self.assertEqual(_sent_event(dtm).failed_block_idxs, [11])
+
+    def test_a_withheld_failure_is_logged_with_the_message_operators_grep(self):
+        """A hybrid model cannot report invalid ids, so the log is the signal.
+
+        ``docs/kvcm_connector.md`` tells operators to grep this line; pin its
+        text so a rewording does not silently break that instruction.
+        """
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req",
+            0,
+            epoch=0,
+            block_ids=[11, 12],
+            num_blocks=2,
+            report_failures=False,
+        )
+
+        with self.assertLogs(kvcm_logger.name, level="WARNING") as logs:
+            cb([False, True])
+
+        self.assertEqual(_sent_event(dtm).failed_block_idxs, [])
+        self.assertIn(
+            "load failed for 1/2 blocks of req req "
+            "(multi-group: not reporting invalid block ids)",
+            logs.output[0],
+        )
+
+    def test_a_reported_failure_sends_the_ids_and_logs_nothing(self):
+        dtm = _make_dtm()
+        cb = dtm.create_load_done_callback(
+            "req", 0, epoch=0, block_ids=[11, 12], num_blocks=2
+        )
+
+        with self.assertNoLogs(kvcm_logger.name, level="WARNING"):
+            cb([True, False])
+
+        self.assertEqual(_sent_event(dtm).failed_block_idxs, [12])
 
 
 if __name__ == "__main__":

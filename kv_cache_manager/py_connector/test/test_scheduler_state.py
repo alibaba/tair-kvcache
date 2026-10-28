@@ -330,6 +330,24 @@ class TestSpecGroups(unittest.TestCase):
             groups["full"], ["tp0_g0", "tp0_g1", "tp0_g2", "tp1_g0", "tp1_g1", "tp1_g2"]
         )
 
+    def test_state_without_attention_still_declares_both_groups(self):
+        """The declaration says what a block *may* carry, so it does not shrink.
+
+        A model with recurrent state but no attention spec (a stage projection
+        can produce one) still announces the attention-only group, empty: the
+        group set is a property of the sparse-announcement protocol, not of the
+        specs that happen to exist.
+        """
+        conn = make_connector_scheduler(num_groups=0, num_state_groups=1, tp_size=1)
+
+        self.assertEqual(
+            conn._spec_groups(),
+            [
+                {"name": "attn", "spec_names": []},
+                {"name": "full", "spec_names": ["tp0_g0"]},
+            ],
+        )
+
 
 class TestStateCompleteMask(unittest.TestCase):
     """Which manager blocks have a materialized recurrent state is read from
@@ -764,7 +782,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         conn._extra_config = (  # ty: ignore[invalid-assignment]
             SimpleNamespace(block_per_load_task=8)
         )
-        conn._data_transfer = MagicMock()
+        conn._backend = MagicMock()
         conn._plan_group_transfers = MagicMock(return_value=None)
         meta = TairKvCacheConnectorMetadata(epoch=0)
         meta.add_load_request(
@@ -776,7 +794,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
             )
         )
         conn.start_load_kv(MagicMock(), meta)
-        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        args, kwargs = conn._backend.create_load_done_callback.call_args
         self.assertEqual(args[3], [10, 11])  # report_ids from group 0's table
         self.assertTrue(kwargs["report_failures"])
 
@@ -795,7 +813,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         conn._extra_config = (  # ty: ignore[invalid-assignment]
             SimpleNamespace(block_per_load_task=8)
         )
-        conn._data_transfer = MagicMock()
+        conn._backend = MagicMock()
         conn._plan_group_transfers = MagicMock(return_value=None)
         meta = TairKvCacheConnectorMetadata(epoch=0)
         meta.add_load_request(
@@ -808,7 +826,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
             )
         )
         conn.start_load_kv(MagicMock(), meta)
-        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        args, kwargs = conn._backend.create_load_done_callback.call_args
         self.assertEqual(args[3], [])  # no report ids when not reporting
         self.assertFalse(kwargs["report_failures"])
 
@@ -820,7 +838,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         conn._extra_config = (  # ty: ignore[invalid-assignment]
             SimpleNamespace(block_per_load_task=8)
         )
-        conn._data_transfer = MagicMock()
+        conn._backend = MagicMock()
         conn._plan_group_transfers = MagicMock(return_value=None)
         meta = TairKvCacheConnectorMetadata(epoch=0)
         meta.add_load_request(
@@ -832,7 +850,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
             )
         )
         conn.start_load_kv(MagicMock(), meta)
-        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        args, kwargs = conn._backend.create_load_done_callback.call_args
         self.assertEqual(args[3], [])
         self.assertFalse(kwargs["report_failures"])
 
@@ -844,7 +862,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         conn._extra_config = (  # ty: ignore[invalid-assignment]
             SimpleNamespace(block_per_load_task=8)
         )
-        conn._data_transfer = MagicMock()
+        conn._backend = MagicMock()
         conn._plan_group_transfers = MagicMock(return_value=None)
         meta = TairKvCacheConnectorMetadata(epoch=0)
         meta.add_load_request(
@@ -856,7 +874,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
             )
         )
         conn.start_load_kv(MagicMock(), meta)
-        args, kwargs = conn._data_transfer.create_load_done_callback.call_args
+        args, kwargs = conn._backend.create_load_done_callback.call_args
         self.assertEqual(args[3], [])
         self.assertFalse(kwargs["report_failures"])
 
@@ -878,7 +896,7 @@ class TestSkippedGroupIndexing(unittest.TestCase):
         conn._extra_config = (  # ty: ignore[invalid-assignment]
             SimpleNamespace(block_per_load_task=8)
         )
-        conn._data_transfer = MagicMock()
+        conn._backend = MagicMock()
         conn._plan_group_transfers = MagicMock(return_value=None)
         meta = TairKvCacheConnectorMetadata(epoch=0)
         meta.add_load_request(
