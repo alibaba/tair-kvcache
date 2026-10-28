@@ -193,9 +193,8 @@ TEST_F(PrometheusExporterTest, EventReportSnapshotMetricsReuseServiceTagsAndValu
     SET_METRICS_(&collector, service, query_rt_us, 321.);
 
     const std::string output = PrometheusExporter::Expose(*registry_);
-    const std::string labels =
-        "{api_name=\"ReportEvent\",event_type=\"block_snapshot\",instance_group=\"group_a\","
-        "instance_id=\"instance_a\",type=\"event_report_l2\"}";
+    const std::string labels = "{api_name=\"ReportEvent\",event_type=\"block_snapshot\",instance_group=\"group_a\","
+                               "instance_id=\"instance_a\",type=\"event_report_l2\"}";
     EXPECT_NE(output.find("kvcm_service_query_counter" + labels + " 1"), std::string::npos) << output;
     EXPECT_NE(output.find("kvcm_service_query_rt_us" + labels + " 321"), std::string::npos) << output;
     EXPECT_EQ(output.find("kvcm_event_report_request_counter"), std::string::npos) << output;
@@ -517,4 +516,15 @@ TEST_F(PrometheusExporterTest, MapMetricToFamilyIdempotent) {
     registry_->MapMetricToFamily("metric_a", "family_y"); // different family — first wins (emplace semantics)
 
     EXPECT_EQ(registry_->GetMetricFamily("metric_a"), "family_x");
+}
+
+TEST_F(PrometheusExporterTest, GaugeValuesRoundTripWithoutLosingTimestampOrCountPrecision) {
+    for (double value : {1793192460789.0, 513204771.0, 4.0 / 9.0, 0.12345678901234567}) {
+        registry_->GetGauge("test.precision") = value;
+        const auto output = PrometheusExporter::Expose(*registry_);
+        const std::string prefix = "kvcm_test_precision ";
+        const auto position = output.rfind(prefix);
+        ASSERT_NE(std::string::npos, position);
+        EXPECT_EQ(value, std::stod(output.substr(position + prefix.size())));
+    }
 }

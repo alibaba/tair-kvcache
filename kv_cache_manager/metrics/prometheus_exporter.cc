@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <string>
@@ -179,6 +180,8 @@ PrometheusExporter::Expose(MetricsRegistry &registry, const std::string &prefix,
     // registered by RevisitIntervalHistogram::Init(). The exporter queries
     // the registry — no suffix-based guessing.
     std::ostringstream ss;
+    // Preserve double values across text export (including integer timestamps).
+    ss.precision(std::numeric_limits<double>::max_digits10);
 
     std::string prev_name;
     std::string current_family;             // histogram family for current metric (empty if regular)
