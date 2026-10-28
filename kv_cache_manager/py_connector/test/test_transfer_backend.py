@@ -162,6 +162,8 @@ class TestExtraConfig(unittest.TestCase):
     def test_defaults_keep_the_single_stage_gpu_path(self):
         cfg = _extra_config()
         self.assertIsNone(cfg.transfer_backend_module_path)
+        self.assertIsNone(cfg.coordinator_host)
+        self.assertFalse(cfg.allow_pipeline_parallel)
 
     def test_unknown_keys_are_still_rejected(self):
         with self.assertRaises(ValidationError):
@@ -336,3 +338,209 @@ class TestWorkerShutdown(unittest.TestCase):
         conn = _bare_worker()
         conn.shutdown()
         conn._backend.shutdown.assert_called_once_with()
+
+
+class TestRankHooks(unittest.TestCase):
+    """The rank space is the connector's, not vLLM's: a backend that shards
+    KV on another axis must be able to put its own ranks in the spec names,
+    the coordinator world and the save verdicts."""
+
+    def _build(self, cls, host_ip="10.0.0.1"):
+        """Run ConnectorWorker.__init__ with the SDK and the coordinator host
+        replaced by doubles."""
+        with (
+            patch.object(connector_worker, "kvcm_py_client", MagicMock()),
+            patch.object(connector_worker, "TpCoordinatorServer") as server,
+        ):
+            worker = cls(
+                _extra_config(),
+                [
+                    AttentionGroupMeta(
+                        group_idx=0,
+                        layer_names=["l0"],
+                        block_size=16,
+                        per_block_bytes=1024,
+                    )
+                ],
+                manager_block_size=16,
+                tp_size=1,
+                host_ip=host_ip,
+                manager_client=MagicMock(),
+                coordinator_client=MagicMock(),
+                register_response={"storage_configs": "[]"},
+            )
+        return worker, server
+
+    def test_defaults_are_the_tensor_parallel_rank_and_size(self):
+        conn = make_connector(tp_size=4)
+        with patch.object(
+            connector_worker, "get_tensor_model_parallel_rank", return_value=3
+        ):
+            self.assertEqual(conn.worker_rank(), 3)
+        self.assertEqual(conn.world_size(), 4)
+
+    def test_rank_zero_binds_the_coordinator_with_the_connector_world(self):
+        class PipelinedWorker(connector_worker.ConnectorWorker):
+            def world_size(self) -> int:
+                return 8
+
+        worker, server = self._build(PipelinedWorker)
+        self.assertEqual(worker._tp_rank, 0)
+        server.assert_called_once_with("10.0.0.1", 19000, 8, worker.on_save_finished)
+
+    def test_a_non_zero_rank_hosts_no_coordinator_and_names_its_specs(self):
+        class PipelinedWorker(connector_worker.ConnectorWorker):
+            def worker_rank(self) -> int:
+                return 5
+
+            def world_size(self) -> int:
+                return 8
+
+        worker, server = self._build(PipelinedWorker)
+        self.assertEqual(worker._tp_rank, 5)
+        self.assertEqual(worker._self_spec_names, {0: "tp5_g0"})
+        server.assert_not_called()
+
+    @unittest.skipIf("torch" in STUBBED, "needs a real KV cache tensor (stubbed in CI)")
+    def test_register_kv_caches_hands_the_rank_space_to_the_backend(self):
+        class RankedWorker(connector_worker.ConnectorWorker):
+            def worker_rank(self) -> int:
+                return 3
+
+            def world_size(self) -> int:
+                return 5
+
+        worker, _ = self._build(RankedWorker)
+        worker._extra_config = _extra_config(
+            transfer_backend_module_path=BACKEND_MODULE
+        )
+        worker._transfer_client = MagicMock()
+        worker._coordinator_client = MagicMock()
+
+        with _fake_backend_module(lambda **_: FakeBackend()):
+            worker.register_kv_caches({"l0": _attn_kv_cache()})
+
+        # KVCacheInfo is the only view of the rank space a backend gets.
+        self.assertEqual(worker._kvcache_info.tp_rank, 3)
+        self.assertEqual(worker._kvcache_info.world_size, 5)
+
+    def test_save_verdict_ands_over_the_connector_world(self):
+        class PipelinedWorker(connector_worker.ConnectorWorker):
+            def world_size(self) -> int:
+                return 3
+
+        conn = PipelinedWorker.__new__(PipelinedWorker)
+        conn._extra_config = SimpleNamespace(instance_id="instance")
+        conn._manager_client = MagicMock()
+        save_context = SaveContext(
+            locations=[{}, {}],
+            result_per_rank={0: [True, True], 1: [True, False], 2: [True, True]},
+        )
+
+        conn.on_save_finished("sess", save_context)
+
+        self.assertEqual(save_context.success_mask, [True, False])
+        reported = conn._manager_client.finish_write_cache.call_args.args[0]
+        self.assertEqual(
+            reported["success_blocks"]["bool_masks"]["values"], [True, False]
+        )
+
+
+def _stage(extra_config, pp_size=1):
+    """A vLLM-shaped (config, kv_cache_config) pair for one pipeline stage."""
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config=extra_config.model_dump()
+        ),
+        model_config=SimpleNamespace(
+            use_mla=False, served_model_name="model", dtype=torch.float16
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pp_size,
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+        ),
+        cache_config=SimpleNamespace(block_size=16, cache_dtype="auto"),
+    )
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(
+                is_eagle_group=False,
+                layer_names=["l0"],
+                kv_cache_spec=FullAttentionSpec(  # ty: ignore[missing-argument]
+                    16,
+                    4096,  # ty: ignore[too-many-positional-arguments]
+                ),
+            )
+        ]
+    )
+    return vllm_config, kv_cache_config
+
+
+class TestPipelineParallelGate(unittest.TestCase):
+    """A pipeline stage is refused unless it opts in, and the coordinator
+    rendezvous then comes from the configuration instead of the local IP."""
+
+    def _build(self, extra_config, role, pp_size=1):
+        vllm_config, kv_cache_config = _stage(extra_config, pp_size)
+        with (
+            patch.object(v1_connector, "KvCacheManagerClient") as manager_cls,
+            patch.object(v1_connector, "ConnectorWorker") as worker_cls,
+            patch.object(v1_connector, "TpCoordinatorClient") as coordinator_cls,
+        ):
+            manager_cls.from_connector_config.return_value.register_instance.return_value = {
+                "storage_configs": "[]"
+            }
+            connector = TairKvCacheConnector(vllm_config, role, kv_cache_config)
+        return connector, worker_cls, coordinator_cls
+
+    def test_pipeline_size_above_one_is_refused_by_default(self):
+        extra_config = _extra_config()
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._build(extra_config, KVConnectorRole.WORKER, pp_size=2)
+        for knob in (
+            "allow_pipeline_parallel",
+            "coordinator_host",
+            "transfer_backend_module_path",
+        ):
+            self.assertIn(knob, str(ctx.exception))
+
+    def test_the_flag_alone_is_refused(self):
+        # Without a per-stage data plane the stock worker would hand every
+        # stage the same spec names; the flag must not be enough.
+        extra_config = _extra_config(allow_pipeline_parallel=True)
+        with self.assertRaises(NotImplementedError):
+            self._build(extra_config, KVConnectorRole.WORKER, pp_size=2)
+
+    def _pipelined(self):
+        return _extra_config(
+            allow_pipeline_parallel=True,
+            coordinator_host="10.1.2.3",
+            transfer_backend_module_path=BACKEND_MODULE,
+        )
+
+    def test_opted_in_worker_uses_the_pinned_coordinator_host(self):
+        connector, worker_cls, coordinator_cls = self._build(
+            self._pipelined(), KVConnectorRole.WORKER, pp_size=2
+        )
+        self.assertIsNotNone(connector.connector_worker)
+        self.assertIsNone(connector.connector_scheduler)
+        # (extra_config, group_metas, block_size, tp_size, host_ip, ...)
+        self.assertEqual(worker_cls.call_args.args[4], "10.1.2.3")
+        coordinator_cls.assert_called_once_with("10.1.2.3", 19000)
+        connector.shutdown()
+        worker_cls.return_value.shutdown.assert_called_once_with()
+
+    def test_opted_in_scheduler_connects_to_the_pinned_coordinator_host(self):
+        connector, worker_cls, coordinator_cls = self._build(
+            self._pipelined(), KVConnectorRole.SCHEDULER, pp_size=2
+        )
+        self.assertIsNotNone(connector.connector_scheduler)
+        self.assertIsNone(connector.connector_worker)
+        worker_cls.assert_not_called()
+        coordinator_cls.assert_called_once_with("10.1.2.3", 19000)
+        connector.shutdown()
+
+
+if __name__ == "__main__":
+    unittest.main()
