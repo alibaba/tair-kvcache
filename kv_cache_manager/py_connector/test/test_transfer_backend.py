@@ -568,8 +568,6 @@ class TestPipelineParallelGate(unittest.TestCase):
         connector.shutdown()
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestHostSpans(unittest.TestCase):
@@ -688,3 +686,7 @@ class TestHostSpans(unittest.TestCase):
             conn.register_kv_caches({"l0": _attn_kv_cache()})
 
         self.assertEqual(order, ["backend", "client"])
+
+
+if __name__ == "__main__":
+    unittest.main()
