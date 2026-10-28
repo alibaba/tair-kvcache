@@ -59,7 +59,8 @@ if typing.TYPE_CHECKING:
 
 
 class ConnectorWorker:
-    """State and hooks for the worker-role connector instance (one per TP rank)."""
+    """State and hooks for the worker-role connector instance (one per worker
+    rank; see worker_rank)."""
 
     def __init__(
         self,
@@ -86,7 +87,7 @@ class ConnectorWorker:
         self._pending_saves: dict = {}
         self._finish_pending: set = set()
 
-        self._tp_rank = get_tensor_model_parallel_rank()
+        self._tp_rank = self.worker_rank()
         # torch device module (torch.cuda / torch.musa / ...), set in
         # register_kv_caches; Any because the module surface is dynamic.
         self._device_mod: Any = None
@@ -95,7 +96,7 @@ class ConnectorWorker:
         port = extra_config.coordinator_base_port
         if self._tp_rank == 0:
             self._coordinator_server = TpCoordinatorServer(
-                host_ip, port, tp_size, self.on_save_finished
+                host_ip, port, self.world_size(), self.on_save_finished
             )
 
         self._self_spec_names = {
@@ -140,13 +141,38 @@ class ConnectorWorker:
             "kvcm_py_client.TransferClient.Create failed"
         )
         logger.warning(
-            "TairKvCacheConnector worker inited, tp rank: %d/%d, host: %s:%d, groups: %d",
+            "TairKvCacheConnector worker inited, rank: %d/%d, host: %s:%d, groups: %d",
             self._tp_rank,
-            self._tp_size,
+            self.world_size(),
             host_ip,
             port,
             self._num_groups,
         )
+
+    # ------------------------------------------------------------------ #
+    # Rank space (overridable)
+    # ------------------------------------------------------------------ #
+    def worker_rank(self) -> int:
+        """This worker's rank in the connector's world.
+
+        Default: the tensor-parallel rank, i.e. one worker per TP rank. The
+        rank keys the location spec names and the coordinator's per-rank
+        verdicts. Called from ``__init__``, so an override may only read what
+        is already assigned there (``extra_config`` / ``group_metas``).
+
+        Overriding it is not sufficient on its own: the spec names registered
+        with the manager and the scheduler's coverage check still count in TP
+        ranks, so a deployment that shards KV on another axis must also
+        register names for its own rank space. See also
+        ``allow_pipeline_parallel``."""
+        return get_tensor_model_parallel_rank()
+
+    def world_size(self) -> int:
+        """Number of workers whose verdicts one save/load is ANDed over.
+
+        Same override contract as ``worker_rank``: the coordinator's world
+        follows it, everything TP-shaped in the scheduler does not."""
+        return self._tp_size
 
     def shutdown(self) -> None:
         """Release the data plane.
@@ -208,7 +234,7 @@ class ConnectorWorker:
 
         self._kvcache_info = KVCacheInfo(
             tp_rank=self._tp_rank,
-            world_size=self._tp_size,
+            world_size=self.world_size(),
             groups=groups,
             device=self._device,
             dtype=self._dtype,
@@ -636,7 +662,7 @@ class ConnectorWorker:
         for block_idx in range(len(save_context.locations)):
             fully_saved = all(
                 save_context.result_per_rank[rank][block_idx]
-                for rank in range(self._tp_size)
+                for rank in range(self.world_size())
             )
             save_context.success_mask.append(fully_saved)
         logger.debug(
