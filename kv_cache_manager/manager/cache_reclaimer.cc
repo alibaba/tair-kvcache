@@ -2213,7 +2213,9 @@ std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageDat
             continue;
         }
 
-        meta_indexer->PersistMetaData();
+        // Usage counters are maintained in memory and read atomically. Do not call PersistMetaData
+        // here: persistence does not refresh these values, and durability is already covered by
+        // CacheManagerMetricsRecorder::RecorderLoop, which persists every instance every 5 seconds.
         const std::size_t ins_used_key_cnt = meta_indexer->GetKeyCount();
         const std::size_t ins_max_key_cnt = meta_indexer->GetMaxKeyCount();
 
