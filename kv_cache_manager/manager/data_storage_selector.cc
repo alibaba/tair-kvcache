@@ -496,7 +496,8 @@ std::size_t DataStorageSelector::CalcGroupUsedSize(
             continue;
         }
 
-        meta_indexer->PersistMetaData();
+        // Usage counters are maintained in memory and read atomically. Do not call PersistMetaData
+        // from this admission path: persistence does not refresh these values and may add backend I/O.
         group_used_byte_size += meta_indexer->GetStorageUsage();
     }
 
@@ -525,7 +526,8 @@ void DataStorageSelector::GenStorageQuotaAvailTable(
                 PREFIX_LOG(WARN, "meta indexer is nullptr");
                 continue;
             }
-            meta_indexer->PersistMetaData();
+            // Usage counters are maintained in memory and read atomically. Do not call PersistMetaData
+            // from this admission path: persistence does not refresh these values and may add backend I/O.
             const std::uint64_t sz = meta_indexer->GetStorageUsageByType(type);
             total_sz += sz;
         }
