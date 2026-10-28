@@ -137,7 +137,24 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         configure_log_level(extra_config.log_level)
 
         model_config = vllm_config.model_config
-        assert vllm_config.parallel_config.pipeline_parallel_size == 1
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        if pp_size != 1 and not (
+            extra_config.allow_pipeline_parallel
+            and extra_config.transfer_backend_module_path
+        ):
+            raise NotImplementedError(
+                f"TairKvCacheConnector: pipeline_parallel_size={pp_size} is not "
+                "supported here: the write session, the coordinator world and the "
+                "location spec names this class registers all assume a single "
+                "pipeline stage, so the stock worker would hand several stages the "
+                "same spec names and the same coordinator rank. This check is only "
+                "waived for a deployment that brings its own rank space and data "
+                "plane: set kv_connector_extra_config "
+                '{"allow_pipeline_parallel": true, "transfer_backend_module_path": '
+                '"<module with make_backend>"}, pin the coordinator address with '
+                '"coordinator_host", and make every stage rank/spec-unique in its '
+                "own connector."
+            )
         if getattr(model_config, "use_mla", False):
             raise NotImplementedError(
                 "MLA models are not supported by TairKvCacheConnector"
@@ -187,7 +204,9 @@ class TairKvCacheConnector(KVConnectorBase_V1, SupportsHMA):
         self._manager_client = KvCacheManagerClient.from_connector_config(
             extra_config.model_dump()
         )
-        host_ip = get_ip()
+        # One address for both roles: only rank 0 binds the coordinator, and
+        # in a multi-host pipeline that rank runs where the override points.
+        host_ip = extra_config.coordinator_host or get_ip()
 
         register_request = {
             "trace_id": "register_%s" % extra_config.instance_id,

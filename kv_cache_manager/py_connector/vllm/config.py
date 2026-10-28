@@ -20,6 +20,20 @@ class TairKvCacheConnectorExtraConfig(BaseModel):
     preferred_block_size: int = 0
     storage_configs: Dict[str, Any] = Field(default_factory=dict)
 
+    # --- Deployment topology ---
+    # Rendezvous address of the rank-0 coordinator. Empty means this host's
+    # IP, which only holds for a single-stage deployment: when pipeline
+    # stages run on separate hosts, every stage must be told stage 0's
+    # address (one value, used to bind on stage 0 and to connect elsewhere).
+    coordinator_host: Optional[str] = None
+    # Waive the single-stage check for a deployment that composes its own
+    # connector -- an explicit permission (unlike force_hybrid_support, which
+    # bypasses a capability probe). See v1_connector.py: the stock worker,
+    # write session and spec names stay TP-shaped, so this flag alone does not
+    # make a pipeline work; transfer_backend_module_path must be set too, so
+    # that flipping the flag without a per-stage data plane fails at start.
+    allow_pipeline_parallel: bool = False
+
     # --- Write sessions ---
     write_timeout_seconds: int = 30
 
