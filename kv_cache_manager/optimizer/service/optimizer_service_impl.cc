@@ -473,6 +473,17 @@ void OptimizerServiceImpl::TraceQuery(RequestContext *request_context,
 
 ErrorCode OptimizerServiceImpl::ExecuteTraceQuery(const proto::optimizer::TraceQueryRequest &request,
                                                   proto::optimizer::TraceQueryResponse *response) {
+    std::unique_lock<std::mutex> observer_lock(trace_query_observer_mutex_, std::defer_lock);
+    if (trace_query_observer_) {
+        if (!response) {
+            return EC_BADARGS;
+        }
+        observer_lock.lock();
+        const auto ec = trace_query_observer_->BeforeQuery(request);
+        if (ec != EC_OK) {
+            return ec;
+        }
+    }
     std::vector<int64_t> block_keys(request.block_keys().begin(), request.block_keys().end());
     int64_t input_token_len = request.input_token_len();
     if (input_token_len == 0 && request.token_ids_size() > 0) {
@@ -502,6 +513,10 @@ ErrorCode OptimizerServiceImpl::ExecuteTraceQuery(const proto::optimizer::TraceQ
     response->mutable_theoretical_result()->set_max_hit_count(result.max_hit_count);
     response->mutable_theoretical_result()->set_current_unique_keys(result.theoretical_unique_keys);
     response->mutable_theoretical_result()->set_hit_rate(result.max_hit_rate);
+
+    if (trace_query_observer_) {
+        trace_query_observer_->AfterQuery(request, *response);
+    }
 
     if (event_manager_) {
         auto event = std::make_shared<OptimizerQueryHitEvent>(request.instance_id());

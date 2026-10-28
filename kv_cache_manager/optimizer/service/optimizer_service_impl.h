@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -16,6 +17,16 @@ class OptimizerMetricsReporter;
 class OptimizerRegistryManager;
 class RequestContext;
 
+// Installed before serving begins. A registered observer serializes the full
+// before/query/after transaction; callers without one retain their concurrency.
+class TraceQueryObserver {
+public:
+    virtual ~TraceQueryObserver() = default;
+    virtual ErrorCode BeforeQuery(const proto::optimizer::TraceQueryRequest &request) = 0;
+    virtual void AfterQuery(const proto::optimizer::TraceQueryRequest &request,
+                            const proto::optimizer::TraceQueryResponse &response) = 0;
+};
+
 class OptimizerServiceImpl {
 public:
     OptimizerServiceImpl(std::shared_ptr<OnlineOptimizerManager> manager,
@@ -25,6 +36,10 @@ public:
 
     OptimizerServiceImpl(const OptimizerServiceImpl &) = delete;
     OptimizerServiceImpl &operator=(const OptimizerServiceImpl &) = delete;
+
+    void SetTraceQueryObserver(std::shared_ptr<TraceQueryObserver> observer) {
+        trace_query_observer_ = std::move(observer);
+    }
 
     // InstanceGroup CRUD
     void CreateInstanceGroup(RequestContext *request_context,
@@ -82,6 +97,8 @@ public:
                     proto::optimizer::OptimizerResetStatsResponse *response);
 
 private:
+    std::shared_ptr<TraceQueryObserver> trace_query_observer_;
+    std::mutex trace_query_observer_mutex_;
     std::shared_ptr<OnlineOptimizerManager> manager_;
     std::shared_ptr<OptimizerMetricsReporter> metrics_reporter_;
     std::shared_ptr<EventManager> event_manager_;

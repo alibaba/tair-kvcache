@@ -41,6 +41,11 @@ public:
     void RequestShutdown();
     void WaitForShutdown();
 
+    // Assembly access after Init and before Start; component lifetime is server-owned.
+    std::shared_ptr<OptimizerServiceImpl> service_impl() const { return service_impl_; }
+    std::shared_ptr<OnlineOptimizerManager> manager() const { return manager_; }
+    std::shared_ptr<MetricsRegistry> metrics_registry() const { return metrics_registry_; }
+
 private:
     bool InitRpcServer();
     bool InitHttpServer();

@@ -952,4 +952,56 @@ TEST_F(OptimizerServiceImplTest, RegisterInstanceUnsupportedIndexerType) {
     EXPECT_EQ(EC_BADARGS, ec);
 }
 
+namespace {
+class QueryBoundaryObserver : public TraceQueryObserver {
+public:
+    ErrorCode BeforeQuery(const proto::optimizer::TraceQueryRequest &) override {
+        ++before;
+        return result;
+    }
+    void AfterQuery(const proto::optimizer::TraceQueryRequest &,
+                    const proto::optimizer::TraceQueryResponse &response) override {
+        ++after;
+        tokens = response.input_token_len();
+    }
+    ErrorCode result = EC_OK;
+    int before = 0;
+    int after = 0;
+    int64_t tokens = 0;
+};
+} // namespace
+
+TEST_F(OptimizerServiceImplTest, QueryObserverSeesSuccessfulResultAndCanRejectBeforeMutation) {
+    CreateTestGroup("grp");
+    auto registration = MakeRegisterRequest("grp", "inst", 4, 0);
+    proto::optimizer::OptimizerRegisterInstanceResponse registered;
+    RequestContext context("setup", nullptr);
+    service_->RegisterInstance(&context, &registration, &registered);
+    ASSERT_EQ(proto::optimizer::OK, registered.header().status().code());
+    auto observer = std::make_shared<QueryBoundaryObserver>();
+    service_->SetTraceQueryObserver(observer);
+    proto::optimizer::TraceQueryRequest request;
+    request.set_instance_id("inst");
+    request.set_input_token_len(4);
+    request.add_block_keys(1);
+    proto::optimizer::TraceQueryResponse response;
+    ASSERT_EQ(EC_OK, service_->ExecuteTraceQuery(request, &response));
+    EXPECT_EQ(1, observer->before);
+    EXPECT_EQ(1, observer->after);
+    EXPECT_EQ(4, observer->tokens);
+    observer->result = EC_BADARGS;
+    EXPECT_EQ(EC_BADARGS, service_->ExecuteTraceQuery(request, &response));
+    EXPECT_EQ(2, observer->before);
+    EXPECT_EQ(1, observer->after);
+    std::vector<InstanceSummary> summaries;
+    ASSERT_EQ(EC_OK, manager_->ListInstances("grp", summaries));
+    ASSERT_EQ(1, summaries.size());
+    EXPECT_EQ(1, summaries.front().total_queries);
+    observer->result = EC_OK;
+    request.set_instance_id("missing");
+    EXPECT_NE(EC_OK, service_->ExecuteTraceQuery(request, &response));
+    EXPECT_EQ(3, observer->before);
+    EXPECT_EQ(1, observer->after);
+}
+
 } // namespace kv_cache_manager
