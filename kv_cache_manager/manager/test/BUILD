@@ -273,8 +273,14 @@ cc_test(
     data = [],
     linkstatic = True,
     deps = [
+        "//kv_cache_manager/common:request_context",
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
         "//kv_cache_manager/manager:cache_manager_metrics_recorder",
+        "//kv_cache_manager/meta:meta_indexer",
+        "//kv_cache_manager/meta:meta_indexer_manager",
+        "//kv_cache_manager/meta:meta_local_backend",
+        "//kv_cache_manager/meta:meta_storage_backend_manager",
         "//kv_cache_manager/metrics:metrics_lifecycle",
     ],
 )
