@@ -29,6 +29,7 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
 from kv_cache_manager.py_connector.vllm.metadata import TairKvCacheConnectorMetadata
 from kv_cache_manager.py_connector.vllm.transfer_backend import (
+    HostSpan,
     MultiResult,
     TransferBackend,
     get_device_module,
@@ -56,6 +57,14 @@ if typing.TYPE_CHECKING:
     # vllm.attention no longer exists in vLLM >= 0.26; kept for the older
     # eras this connector supports.
     from vllm.attention import AttentionMetadata  # ty: ignore[unresolved-import]
+
+
+def _client_span(kvcm_py_client: Any, span: "HostSpan") -> Any:
+    """Convert a backend segment into the binding's span object."""
+    client_span = kvcm_py_client.RegistSpan()
+    client_span.base = span.base
+    client_span.size = span.size
+    return client_span
 
 
 class ConnectorWorker:
@@ -126,20 +135,14 @@ class ConnectorWorker:
                 for meta in self._group_metas
             },
         }
-        init_params = kvcm_py_client.InitParams()
-        init_params.role_type = kvcm_py_client.RoleType.WORKER
-        init_params.self_location_spec_name = self._self_spec_names[
+        self._self_location_spec_name = self._self_spec_names[
             self._group_metas[0].group_idx
         ]
-        init_params.storage_configs = f"{self._storage_configs}"
-        transfer_client_config = json.dumps(transfer_client_json)
-        logger.info("transfer_client_config: %s", transfer_client_config)
-        self._transfer_client = kvcm_py_client.TransferClient.Create(
-            transfer_client_config, init_params
-        )
-        assert self._transfer_client is not None, (
-            "kvcm_py_client.TransferClient.Create failed"
-        )
+        self._transfer_client_config = json.dumps(transfer_client_json)
+        # The client is created in register_kv_caches: the backend is built
+        # first so it can state its host segments, and Create is the only place
+        # they can be handed over.
+        self._transfer_client = None
         logger.warning(
             "TairKvCacheConnector worker inited, rank: %d/%d, host: %s:%d, groups: %d",
             self._tp_rank,
@@ -239,14 +242,18 @@ class ConnectorWorker:
             device=self._device,
             dtype=self._dtype,
         )
+        # Backend first: it owns the host buffers, and the client must be told
+        # about them at Create time (one registration call, before any byte
+        # moves). The GPU backend states none, which keeps its path unchanged.
         self._backend = make_transfer_backend(
             extra_config=self._extra_config,
             kvcache_info=self._kvcache_info,
             manager_block_size=self._manager_block_size,
-            transfer_client=self._transfer_client,
+            transfer_client=None,
             coordinator_client=self._coordinator_client,
             device=self._device,
         )
+        self._backend.attach_transfer_client(self._create_transfer_client())
 
         logger.warning(
             "register_kv_caches done: %s",
@@ -255,6 +262,36 @@ class ConnectorWorker:
                 for g in groups
             ],
         )
+
+    def _create_transfer_client(self) -> Any:
+        """Create the KVCM client, carrying the backend's host segments.
+
+        A client that knows ``regist_spans`` takes the whole set; an older one
+        takes none, and the backend falls back to per-task I/O buffers. The
+        probe is on the binding, not on a version string."""
+        spans = self._backend.host_spans()
+        init_params = kvcm_py_client.InitParams()
+        init_params.role_type = kvcm_py_client.RoleType.WORKER
+        init_params.self_location_spec_name = self._self_location_spec_name
+        init_params.storage_configs = f"{self._storage_configs}"
+        if spans:
+            if hasattr(init_params, "regist_spans"):
+                init_params.regist_spans = [
+                    _client_span(kvcm_py_client, span) for span in spans
+                ]
+            else:
+                logger.warning(
+                    "the transfer client cannot register host spans; %d segment(s) "
+                    "of %d bytes stay unregistered",
+                    len(spans),
+                    sum(span.size for span in spans),
+                )
+        logger.info("transfer_client_config: %s", self._transfer_client_config)
+        client = kvcm_py_client.TransferClient.Create(
+            self._transfer_client_config, init_params
+        )
+        assert client is not None, "kvcm_py_client.TransferClient.Create failed"
+        return client
 
     def _build_attention_group(
         self, meta: AttentionGroupMeta, kv_caches: Dict[str, Any]

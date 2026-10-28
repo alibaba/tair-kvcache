@@ -38,6 +38,7 @@ from kv_cache_manager.py_connector.vllm.metadata import (
     TairKvCacheConnectorMetadata,
 )
 from kv_cache_manager.py_connector.vllm.transfer_backend import (
+    HostSpan,
     MultiResult,
     TransferBackend,
     make_transfer_backend,
@@ -77,7 +78,13 @@ def _fake_backend_module(make_backend):
 
 
 class FakeBackend:
-    """A backend with the six-method shape and no data movement."""
+    """A backend with the protocol shape and no data movement."""
+
+    def host_spans(self):
+        return ()
+
+    def attach_transfer_client(self, transfer_client):
+        self.transfer_client = transfer_client
 
     def submit(self, fn, *args, **kwargs):
         return MagicMock()
@@ -134,7 +141,8 @@ def _factory_kwargs(extra_config):
             dtype=torch.uint8,
         ),
         manager_block_size=16,
-        transfer_client=MagicMock(),
+        # The worker builds the backend before the client exists.
+        transfer_client=None,
         coordinator_client=MagicMock(),
         device=torch.device("cpu"),
     )
@@ -302,7 +310,15 @@ class TestWorkerUsesBackend(unittest.TestCase):
         conn._backend = None  # built by the call under test
         conn._transfer_client = MagicMock()
         conn._coordinator_client = MagicMock()
-        conn.register_kv_caches({"l0": _attn_kv_cache()})
+        conn._self_location_spec_name = "tp0_g0"
+        conn._transfer_client_config = "{}"
+        conn._storage_configs = "[]"
+        with patch.object(
+            connector_worker.kvcm_py_client.TransferClient,
+            "Create",
+            return_value=MagicMock(),
+        ):
+            conn.register_kv_caches({"l0": _attn_kv_cache()})
         return conn._backend
 
     @unittest.skipIf("torch" in STUBBED, "needs a real KV cache tensor (stubbed in CI)")
@@ -417,7 +433,17 @@ class TestRankHooks(unittest.TestCase):
         worker._transfer_client = MagicMock()
         worker._coordinator_client = MagicMock()
 
-        with _fake_backend_module(lambda **_: FakeBackend()):
+        worker._self_location_spec_name = "tp0_g0"
+        worker._transfer_client_config = "{}"
+        worker._storage_configs = "[]"
+        with (
+            _fake_backend_module(lambda **_: FakeBackend()),
+            patch.object(
+                connector_worker.kvcm_py_client.TransferClient,
+                "Create",
+                return_value=MagicMock(),
+            ),
+        ):
             worker.register_kv_caches({"l0": _attn_kv_cache()})
 
         # KVCacheInfo is the only view of the rank space a backend gets.
@@ -540,6 +566,126 @@ class TestPipelineParallelGate(unittest.TestCase):
         worker_cls.assert_not_called()
         coordinator_cls.assert_called_once_with("10.1.2.3", 19000)
         connector.shutdown()
+
+
+
+
+class TestHostSpans(unittest.TestCase):
+    """The backend states its host segments before the client exists."""
+
+    def _spanned_backend(self, spans):
+        class SpannedBackend(FakeBackend):
+            def host_spans(self):
+                return spans
+
+        return SpannedBackend()
+
+    def _register(self, spans, *, binding_supports_spans):
+        conn = _bare_worker()
+        conn._extra_config = _extra_config(transfer_backend_module_path=BACKEND_MODULE)
+        conn._self_location_spec_name = "tp0_g0"
+        conn._transfer_client_config = "{}"
+        conn._storage_configs = "[]"
+        conn._coordinator_client = MagicMock()
+
+        init_params = MagicMock()
+        if not binding_supports_spans:
+            del init_params.regist_spans
+        created = {}
+
+        def create(config, params):
+            created["config"] = config
+            created["params"] = params
+            created["client"] = MagicMock(name="client")
+            return created["client"]
+
+        binding = SimpleNamespace(
+            InitParams=lambda: init_params,
+            RoleType=SimpleNamespace(WORKER="worker"),
+            RegistSpan=lambda: SimpleNamespace(base=0, size=0),
+            TransferClient=SimpleNamespace(Create=create),
+        )
+        with (
+            _fake_backend_module(lambda **_: self._spanned_backend(spans)),
+            patch.object(connector_worker, "kvcm_py_client", binding),
+        ):
+            conn.register_kv_caches({"l0": _attn_kv_cache()})
+        return conn, created, init_params
+
+    @unittest.skipIf("torch" in STUBBED, "needs a real KV cache tensor (stubbed in CI)")
+    def test_spans_reach_the_client_when_the_binding_takes_them(self):
+        spans = [HostSpan(base=4096, size=8192), HostSpan(base=16384, size=4096)]
+        conn, created, init_params = self._register(spans, binding_supports_spans=True)
+
+        registered = init_params.regist_spans
+        self.assertEqual([(s.base, s.size) for s in registered], [(4096, 8192), (16384, 4096)])
+        # The backend attached the client it did not receive at construction.
+        self.assertIs(conn._backend.transfer_client, created["client"])
+
+    @unittest.skipIf("torch" in STUBBED, "needs a real KV cache tensor (stubbed in CI)")
+    def test_a_client_without_the_channel_registers_nothing(self):
+        spans = [HostSpan(base=4096, size=8192)]
+        conn, created, init_params = self._register(spans, binding_supports_spans=False)
+
+        self.assertFalse(hasattr(init_params, "regist_spans"))
+        self.assertIs(conn._backend.transfer_client, created["client"])
+
+    @unittest.skipIf("torch" in STUBBED, "needs a real KV cache tensor (stubbed in CI)")
+    def test_the_default_backend_states_no_spans(self):
+        conn = _bare_worker()
+        conn._extra_config = _extra_config()
+        conn._self_location_spec_name = "tp0_g0"
+        conn._transfer_client_config = "{}"
+        conn._storage_configs = "[]"
+        conn._coordinator_client = MagicMock()
+
+        init_params = MagicMock()
+        del init_params.regist_spans
+        seen = {}
+
+        def create(config, params):
+            seen["params"] = params
+            return MagicMock()
+
+        binding = SimpleNamespace(
+            InitParams=lambda: init_params,
+            RoleType=SimpleNamespace(WORKER="worker"),
+            TransferClient=SimpleNamespace(Create=create),
+        )
+        with patch.object(connector_worker, "kvcm_py_client", binding):
+            conn.register_kv_caches({"l0": _attn_kv_cache()})
+        self.assertEqual(conn._backend.host_spans(), ())
+
+    @unittest.skipIf("torch" in STUBBED, "needs a real KV cache tensor (stubbed in CI)")
+    def test_the_backend_is_built_before_the_client_is_created(self):
+        order = []
+
+        class OrderedBackend(FakeBackend):
+            def __init__(self):
+                order.append("backend")
+
+        def create(config, params):
+            order.append("client")
+            return MagicMock()
+
+        conn = _bare_worker()
+        conn._extra_config = _extra_config(transfer_backend_module_path=BACKEND_MODULE)
+        conn._self_location_spec_name = "tp0_g0"
+        conn._transfer_client_config = "{}"
+        conn._storage_configs = "[]"
+        conn._coordinator_client = MagicMock()
+        binding = SimpleNamespace(
+            InitParams=lambda: MagicMock(),
+            RoleType=SimpleNamespace(WORKER="worker"),
+            TransferClient=SimpleNamespace(Create=create),
+        )
+        with (
+            _fake_backend_module(lambda **_: OrderedBackend()),
+            patch.object(connector_worker, "kvcm_py_client", binding),
+        ):
+            conn.register_kv_caches({"l0": _attn_kv_cache()})
+
+        self.assertEqual(order, ["backend", "client"])
 
 
 if __name__ == "__main__":
