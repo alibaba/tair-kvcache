@@ -26,6 +26,7 @@ dependency of the default data plane rather than of the connector.
 import importlib
 import threading
 import time
+from dataclasses import dataclass
 from collections.abc import Callable
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, List, Optional, Protocol, Sequence, Set, Tuple
@@ -94,6 +95,18 @@ class MultiResult:
                 self._callback(flat)
 
 
+@dataclass(frozen=True)
+class HostSpan:
+    """One host-memory segment a backend moves bytes through.
+
+    The connector only states which segments exist; whether and how they are
+    registered for a zero-copy channel is the backend's and the client's
+    business."""
+
+    base: int
+    size: int
+
+
 class TransferBackend(Protocol):
     """The swap in/out hop: host buffer <-> device, and host buffer <-> KVCM.
 
@@ -104,6 +117,18 @@ class TransferBackend(Protocol):
     A ``None`` verdict means "this group holds no data for that block by
     design" and neither passes nor fails the block.
     """
+
+    def host_spans(self) -> Sequence[HostSpan]:
+        """Host segments the transfer client should know about at Create time.
+
+        Read before the client exists, so nothing may depend on it. The
+        built-in GPU backend returns none: its staging pools reach the SDK
+        through per-task I/O buffers, not through client-side registration."""
+        ...
+
+    def attach_transfer_client(self, transfer_client: Any) -> None:
+        """Take the client created after :meth:`host_spans` was read."""
+        ...
 
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
         """Run a transfer task asynchronously and return its future."""
@@ -435,7 +460,7 @@ def make_transfer_backend(
     extra_config: "TairKvCacheConnectorExtraConfig",
     kvcache_info: "KVCacheInfo",
     manager_block_size: int,
-    transfer_client: Any,
+    transfer_client: Any = None,
     coordinator_client: "TpCoordinatorClient",
     device: torch.device,
 ) -> TransferBackend:
@@ -445,6 +470,10 @@ def make_transfer_backend(
     GPU backend (``DataTransferManager``). Otherwise the named module must
     expose ``make_backend(**kwargs)``, called with this function's own
     keyword arguments.
+
+    ``transfer_client`` may be None: the worker builds the backend first so it
+    can read :meth:`TransferBackend.host_spans`, then creates the client and
+    attaches it.
     """
     module_path = extra_config.transfer_backend_module_path
     if not module_path:
