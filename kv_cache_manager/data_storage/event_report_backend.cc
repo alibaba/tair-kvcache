@@ -1655,6 +1655,7 @@ void EventReportBackend::GetQueryVisibilitySnapshot(const std::string &instance_
         }
         const auto &lifecycle_fence = *node->lifecycle_fence;
         QueryVisibilityState state;
+        state.mediums = node->mediums;
         {
             std::lock_guard<std::mutex> state_lock(lifecycle_fence.state_mutex);
             state.strict = lifecycle_fence.snapshot_state.strict_query_visibility;

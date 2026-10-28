@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string_view>
@@ -1047,6 +1048,7 @@ ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
                                       size_t top_k_host_count,
                                       const std::vector<DataStorageType> &backend_types,
                                       SelectLocationPolicy *policy,
+                                      const MetaSearcher::ListHostCacheCandidateHostsFunc *list_candidate_hosts,
                                       size_t window_blocks = 1) {
     const bool use_tair =
         std::find(backend_types.begin(), backend_types.end(), DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL) !=
@@ -1116,12 +1118,13 @@ ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
         return EC_ERROR;
     }
     const auto selected = SelectTopHostIndicesByLocal(matches, top_k_host_count);
+    const bool needs_tair_candidates = use_tair && list_candidate_hosts && matches.size() < top_k_host_count;
+    const auto base_specs =
+        use_tair && (!selected.empty() || needs_tair_candidates)
+            ? SelectBaseSpecs(
+                  locations, key_count, check_location, request_check_location, full_groups, state_groups, policy)
+            : SpecsByKey(key_count);
     if (!selected.empty()) {
-        const auto base_specs =
-            use_tair
-                ? SelectBaseSpecs(
-                      locations, key_count, check_location, request_check_location, full_groups, state_groups, policy)
-                : SpecsByKey(key_count);
         const bool evaluated = meta_indexer->ParallelForQuery(selected.size(), [&](size_t begin, size_t end) {
             for (size_t i = begin; i < end; ++i) {
                 auto &match = matches[selected[i]];
@@ -1139,6 +1142,34 @@ ErrorCode PrefixMatchByHostWithRemote(MetaIndexer *meta_indexer,
             request_context->error_tracer()->AddErrorMsg("parallel remote host evaluation failed");
             return EC_ERROR;
         }
+    }
+    if (needs_tair_candidates && !base_specs.front().empty()) {
+        auto candidates = (*list_candidate_hosts)(medium_filter);
+        candidates.erase(std::remove_if(candidates.begin(),
+                                        candidates.end(),
+                                        [&projection](const std::string &host) {
+                                            return projection.front().hosts.find(host) !=
+                                                   projection.front().hosts.end();
+                                        }),
+                         candidates.end());
+        std::mt19937_64 random(std::hash<std::string>{}(request_context->trace_id()));
+        std::shuffle(candidates.begin(), candidates.end(), random);
+        const size_t available_slots = top_k_host_count - matches.size();
+        size_t added = 0;
+        for (const auto &host : candidates) {
+            if (added == available_slots) {
+                break;
+            }
+            const auto global = ComputeRemoteHostMatch(
+                host, projection, base_specs, enable_p2p, use_eagle_pop, full_groups, state_groups, window_blocks);
+            if (global > 0) {
+                matches.push_back({host, 0, global});
+                ++added;
+            }
+        }
+        std::sort(matches.begin(), matches.end(), [](const auto &lhs, const auto &rhs) {
+            return lhs.host_ip_port < rhs.host_ip_port;
+        });
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherHostPrefixReduce);
     for (auto &match : matches) {
@@ -1963,7 +1994,8 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
                                           const CheckHostCacheLocationFunc *request_check_location,
                                           size_t top_k_host_count,
                                           const std::vector<DataStorageType> &backend_types,
-                                          SelectLocationPolicy *policy) const {
+                                          SelectLocationPolicy *policy,
+                                          const ListHostCacheCandidateHostsFunc *list_candidate_hosts) const {
     SPAN_TRACER(request_context);
     out_matches.clear();
     if (keys.empty()) {
@@ -1992,7 +2024,8 @@ ErrorCode MetaSearcher::PrefixMatchByHost(RequestContext *request_context,
                                        request_check_location,
                                        top_k_host_count,
                                        backend_types,
-                                       policy);
+                                       policy,
+                                       list_candidate_hosts);
 }
 
 ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_context,
@@ -2004,7 +2037,8 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
                                                    const CheckHostCacheLocationFunc *request_check_location,
                                                    size_t top_k_host_count,
                                                    const std::vector<DataStorageType> &backend_types,
-                                                   SelectLocationPolicy *policy) const {
+                                                   SelectLocationPolicy *policy,
+                                                   const ListHostCacheCandidateHostsFunc *list_candidate_hosts) const {
     return PrefixMatchWithGroupsByHost(request_context,
                                        keys,
                                        use_eagle_pop,
@@ -2015,6 +2049,7 @@ ErrorCode MetaSearcher::PrefixMatchWithMambaByHost(RequestContext *request_conte
                                        top_k_host_count,
                                        backend_types,
                                        policy,
+                                       list_candidate_hosts,
                                        'L',
                                        1);
 }
@@ -2029,7 +2064,8 @@ ErrorCode MetaSearcher::PrefixMatchWithSwaByHost(RequestContext *request_context
                                                  const CheckHostCacheLocationFunc *request_check_location,
                                                  size_t top_k_host_count,
                                                  const std::vector<DataStorageType> &backend_types,
-                                                 SelectLocationPolicy *policy) const {
+                                                 SelectLocationPolicy *policy,
+                                                 const ListHostCacheCandidateHostsFunc *list_candidate_hosts) const {
     return PrefixMatchWithGroupsByHost(request_context,
                                        keys,
                                        use_eagle_pop,
@@ -2040,6 +2076,7 @@ ErrorCode MetaSearcher::PrefixMatchWithSwaByHost(RequestContext *request_context
                                        top_k_host_count,
                                        backend_types,
                                        policy,
+                                       list_candidate_hosts,
                                        'W',
                                        window_blocks);
 }
@@ -2054,6 +2091,7 @@ ErrorCode MetaSearcher::PrefixMatchWithGroupsByHost(RequestContext *request_cont
                                                     size_t top_k_host_count,
                                                     const std::vector<DataStorageType> &backend_types,
                                                     SelectLocationPolicy *policy,
+                                                    const ListHostCacheCandidateHostsFunc *list_candidate_hosts,
                                                     char state_category,
                                                     size_t window_blocks) const {
     SPAN_TRACER(request_context);
@@ -2094,6 +2132,7 @@ ErrorCode MetaSearcher::PrefixMatchWithGroupsByHost(RequestContext *request_cont
                                        top_k_host_count,
                                        backend_types,
                                        policy,
+                                       list_candidate_hosts,
                                        window_blocks);
 }
 
