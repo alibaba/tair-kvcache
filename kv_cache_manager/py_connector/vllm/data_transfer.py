@@ -21,7 +21,7 @@ data path, so the connector competes with the engine for exactly zero HBM.
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Sequence
 
 import torch
 
@@ -32,6 +32,7 @@ from kv_cache_manager.py_connector.common.tp_coordinator import TpCoordinatorCli
 from kv_cache_manager.py_connector.common.logger import logger
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
 from kv_cache_manager.py_connector.vllm.transfer_backend import (
+    HostSpan,
     BlockVerdicts,
     MultiResult,
     get_device_module,
@@ -224,6 +225,16 @@ class DataTransferManager(BlockVerdicts):
         self._io_executor = ThreadPoolExecutor(
             max_workers=32, thread_name_prefix="kvcm_io_", initializer=_init_worker
         )
+
+    def host_spans(self) -> "Sequence[HostSpan]":
+        """The GPU data plane registers no client-side spans.
+
+        Its staging pools reach the SDK through per-task I/O buffers, so the
+        client is created without any host-memory registration."""
+        return ()
+
+    def attach_transfer_client(self, transfer_client: Any) -> None:
+        self._transfer_client = transfer_client
 
     def submit(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
         return self._io_executor.submit(func, *args, **kwargs)
