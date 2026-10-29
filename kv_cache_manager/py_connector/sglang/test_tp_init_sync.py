@@ -296,6 +296,7 @@ class _CollectiveScript:
         # the group agreed that it is not ready to write.
         self.broadcasts: list = []
         self.write_reduces: list = []
+        self.gathers: list = []
 
 
 @contextmanager
@@ -310,6 +311,14 @@ def _patched_tp_collectives(script: _CollectiveScript) -> Iterator[_CollectiveSc
     would receive it; the four-element one is the v1 session and stays empty,
     which is what the v1 tests want to observe.
     """
+
+    def fake_all_gather_object(
+        object_list: Any = None, obj: Any = None, group: Any = None
+    ) -> None:
+        """Every rank of the group was handed the same transfers."""
+        script.gathers.append(group)
+        if object_list is not None:
+            object_list[:] = [list(obj or [])] * len(object_list)
 
     def fake_all_reduce(tensor: Any, op: Any = None, group: Any = None) -> None:
         record = (op, tuple(tensor.shape), tensor.dtype, group)
@@ -334,6 +343,10 @@ def _patched_tp_collectives(script: _CollectiveScript) -> Iterator[_CollectiveSc
     with (
         mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce),
         mock.patch.object(torch.distributed, "broadcast_object_list", fake_broadcast),
+        # The write path agrees on the transfer schedule before opening sessions.
+        mock.patch.object(
+            torch.distributed, "all_gather_object", fake_all_gather_object
+        ),
     ):
         yield script
 
