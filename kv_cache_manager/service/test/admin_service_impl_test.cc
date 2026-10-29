@@ -362,7 +362,6 @@ TEST_F(AdminServiceImplTest, TestAdminAndReclaimerCopyShareGroupConcurrencyLimit
     const auto &source = *sampled.front().begin()->second;
     reclaimer_req.src_location_id = source.id();
     reclaimer_req.src_create_time = source.create_time();
-    reclaimer_req.src_location_value = source.ToJsonString();
     reclaimer_req.src_specs = source.location_specs();
 
     std::vector<ErrorCode> reclaimer_results;

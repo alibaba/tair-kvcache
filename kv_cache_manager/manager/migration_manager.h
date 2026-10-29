@@ -46,7 +46,7 @@ class RequestContext;
  *     crash 后自动可见（继续按持久化的 Mark 迁移）。
  *
  * Copy 任务只保留在当前 Leader 内存；切主后不恢复任务，遗留 WRITING 走普通清理。
- * PACE 必须保证 Copy 与 Delete 并发安全（busy 时保留 GA，完成后再重试删除）。
+ * PACE 必须保证 Copy 与 Delete 并发安全，busy 时保留 GA。
  * MigrationManager 维护一个活跃任务集合（instance_id + block_key）用于防重复迁移与并发预算统计。
  *
  * 线程模型：Reclaimer 的 Prepare 与所有 Copy/迁移 cleanup 在共享 SchedulePlanExecutor 中执行，
@@ -72,7 +72,6 @@ public:
         // 可留空，由 PrepareCopyTask 兼容性地重读 meta。
         std::vector<LocationSpec> src_specs;
         int64_t src_create_time = 0;
-        std::string src_location_value;
     };
 
     // Copy 提交的 group 级硬上限。BatchSubmit 在短准入锁 + task_mutex_ 内统计 active 并 reserve，
@@ -346,8 +345,6 @@ private:
         MigrationCopyExecutionMode copy_execution_mode = MigrationCopyExecutionMode::SYNC;
         std::string async_operation_id;
         bool async_credit_active = false;
-        std::string src_location_value;
-        std::string dst_location_value;
         std::chrono::steady_clock::time_point submit_time;
         uint64_t total_bytes = 0;     // 源端各 spec 字节数之和（取自 uri size 参数）
         std::string mark_target;      // 提交时 mark 的 target（空=无 mark，用于 match-clear）
@@ -385,7 +382,7 @@ private:
                               std::vector<DataStorageUri> &out_src_uris,
                               std::vector<DataStorageUri> &out_dst_uris);
 
-    // 非阻塞提交目标 location 的精确删除任务（失败 / 取消时清理半成品）。返回不代表删除已完成。
+    // 按目标 Location ID 非阻塞提交删除任务（失败 / 取消时清理半成品）。返回不代表删除已完成。
     void SubmitTargetLocationDelete(const CopyTaskContext &ctx);
     // 提交源 location 的删除任务（delete_source retention）。
     void SubmitSourceLocationDelete(const CopyTaskContext &ctx);

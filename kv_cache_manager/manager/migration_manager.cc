@@ -488,7 +488,7 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
     // public 单条 Submit 仍允许不带快照，此时在这里重读源 location。private BatchSubmit 不走本函数。
     const std::vector<LocationSpec> *src_specs_ptr = nullptr;
     int64_t src_create_time = 0;
-    if (!request.src_specs.empty() && !request.src_location_value.empty()) {
+    if (!request.src_specs.empty()) {
         src_specs_ptr = &request.src_specs;
         src_create_time = request.src_create_time;
     } else {
@@ -526,14 +526,8 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
             KVCM_LOG_WARN("[%s] source location %s has no specs", trace_id.c_str(), request.src_location_id.c_str());
             return EC_ERROR;
         }
-        if (!request.src_specs.empty() &&
-            (request.src_create_time != src_location.create_time() ||
-             Jsonizable::ToJsonString(request.src_specs) != Jsonizable::ToJsonString(src_location.location_specs()))) {
-            return EC_MISMATCH;
-        }
         request.src_specs = src_location.location_specs();
         request.src_create_time = src_location.create_time();
-        request.src_location_value = src_location.ToJsonString();
         src_specs_ptr = &request.src_specs;
         src_create_time = request.src_create_time;
     }
@@ -610,7 +604,7 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
     dst_location->set_spec_size(dst_specs.size());
     dst_location->set_location_specs(std::move(dst_specs));
     std::vector<MetaSearcher::AddLocationResult> add_results;
-    ErrorCode ec = meta_searcher.BatchAddLocation(ctx.get(), {request.block_key}, {dst_location}, add_results, true);
+    ErrorCode ec = meta_searcher.BatchAddLocation(ctx.get(), {request.block_key}, {dst_location}, add_results);
     if (add_results.size() != 1) {
         KVCM_LOG_WARN("[%s] BatchAddLocation returned unexpected result count for block_key %ld: expected 1, got %zu; "
                       "retaining allocated URIs",
@@ -647,8 +641,6 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
     out_ctx.src_storage_name = request.src_storage_name;
     out_ctx.dst_storage_name = request.dst_storage_name;
     out_ctx.dst_location_id = add_result.location_id;
-    out_ctx.src_location_value = request.src_location_value;
-    out_ctx.dst_location_value = add_result.location_value;
     out_ctx.retention = request.retention;
     out_ctx.copy_execution_mode = request.copy_execution_mode;
     out_ctx.async_operation_id = request.async_operation_id;
@@ -760,7 +752,7 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
         }
     }
 
-    // future 对 monitor 可见前，先把完整快照写回并进入可认领的 kRunning。
+    // future 对 monitor 可见前，先把任务上下文写回并进入可认领的 kRunning。
     // Cancel 若在 executor Submit 前命中 kRunning，采用 deferred-cancel 语义：copy 完成后丢弃目标。
     bool task_running = false;
     {
@@ -951,38 +943,6 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
                 return collect_results();
             }
         }
-    }
-
-    // Dispatch already owns the full source snapshot. Low-level/test requests
-    // may only supply id/create_time/specs; fetch and validate that exact identity
-    // before allocation so later cleanup/promotion can use expected-value CAS.
-    for (auto &item : items) {
-        auto &request = item.request;
-        if (!item.eligible || !request.src_location_value.empty()) {
-            continue;
-        }
-        auto indexer = GetIndexer(request.instance_id);
-        if (!indexer) {
-            item.MarkFailed(EC_INSTANCE_NOT_EXIST);
-            continue;
-        }
-        MetaSearcher searcher(indexer);
-        auto rc = std::make_shared<RequestContext>("migration_source_snapshot");
-        CacheLocationMapVector locations;
-        BlockMask mask;
-        if (searcher.BatchGetLocation(rc.get(), {request.block_key}, mask, locations) != EC_OK ||
-            locations.size() != 1) {
-            item.MarkFailed(EC_ERROR);
-            continue;
-        }
-        const auto source = locations[0].find(request.src_location_id);
-        if (source == locations[0].end() || !source->second || source->second->status() != CLS_SERVING ||
-            source->second->create_time() != request.src_create_time ||
-            Jsonizable::ToJsonString(source->second->location_specs()) != Jsonizable::ToJsonString(request.src_specs)) {
-            item.MarkFailed(EC_MISMATCH);
-            continue;
-        }
-        request.src_location_value = source->second->ToJsonString();
     }
 
     // ---- phase 0: group 级 Copy 硬限流 + per-block dedup + draining gate + preparing reservation ----
@@ -1236,7 +1196,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
     if (!add_block_keys.empty()) {
         MetaSearcher meta_searcher(indexer);
         std::vector<MetaSearcher::AddLocationResult> add_results;
-        ErrorCode add_ec = meta_searcher.BatchAddLocation(batch_ctx.get(), add_block_keys, add_locations, add_results, true);
+        ErrorCode add_ec = meta_searcher.BatchAddLocation(batch_ctx.get(), add_block_keys, add_locations, add_results);
         if (add_results.size() != add_items.size()) {
             KVCM_LOG_WARN("[%s] BatchAddLocation returned unexpected result count for migration batch: expected %zu, "
                           "got %zu, aggregate ec %d; retaining allocated URIs",
@@ -1287,8 +1247,6 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             ctx.src_storage_name = req.src_storage_name;
             ctx.dst_storage_name = req.dst_storage_name;
             ctx.dst_location_id = add_result.location_id;
-            ctx.src_location_value = req.src_location_value;
-            ctx.dst_location_value = add_result.location_value;
             ctx.retention = req.retention;
             ctx.copy_execution_mode = req.copy_execution_mode;
             ctx.async_operation_id = req.async_operation_id;
@@ -1344,16 +1302,6 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
                     ctx.mark_target = mark_snap[0].target;
                     ctx.mark_deadline_ms = mark_snap[0].deadline_ms;
                 }
-            }
-
-            // Source can be reclaimed concurrently; revalidate before submission and
-            // atomically check it again when publishing the completed destination.
-            if (!IsSourceLocationServing(ctx)) {
-                item->reservation_active = false;
-                item->async_credit_active = false;
-                CompleteCopyTaskAsFailed(ctx, "source_changed_before_submit", false);
-                item->MarkFailed(EC_MISMATCH);
-                continue;
             }
 
             bool task_running = false;
@@ -1455,26 +1403,20 @@ bool MigrationManager::IsSourceLocationServing(const CopyTaskContext &ctx) const
         return false;
     }
 
-    const auto matches_snapshot = [&ctx](const std::vector<CacheLocationMap> &location_maps) {
-        if (location_maps.size() != 1) {
-            return false;
-        }
-        const auto iter = location_maps[0].find(ctx.src_location_id);
-        // id + status + create_time 三者同时匹配，防止 id 复用导致误判新 location 为原始源。
-        return iter != location_maps[0].end() && iter->second != nullptr && iter->second->status() == CLS_SERVING &&
-               iter->second->create_time() == ctx.src_create_time &&
-               (ctx.src_location_value.empty() || iter->second->ToJsonString() == ctx.src_location_value);
-    };
-
-    auto rc = std::make_shared<RequestContext>("migration_check_source");
     MetaSearcher meta_searcher(indexer);
-    std::vector<CacheLocationMap> hot_locations;
+    auto rc = std::make_shared<RequestContext>("migration_check_source");
+    std::vector<CacheLocationMap> location_maps;
     BlockMask empty_mask;
-    if (meta_searcher.BatchGetLocation(rc.get(), {ctx.block_key}, empty_mask, hot_locations) != EC_OK ||
-        !matches_snapshot(hot_locations)) {
+    ErrorCode ec = meta_searcher.BatchGetLocation(rc.get(), {ctx.block_key}, empty_mask, location_maps);
+    if (ec != EC_OK || location_maps.empty()) {
         return false;
     }
-    return true;
+    auto iter = location_maps[0].find(ctx.src_location_id);
+    if (iter == location_maps[0].end() || iter->second == nullptr) {
+        return false;
+    }
+    // id + status + create_time 三者同时匹配，防止 id 复用导致误判新 location 为原始源。
+    return iter->second->status() == CLS_SERVING && iter->second->create_time() == ctx.src_create_time;
 }
 
 void MigrationManager::RecordCopySubmission(const CopyTaskContext &ctx, const std::string &trace_id) {
@@ -1562,11 +1504,6 @@ void MigrationManager::CompleteCopyTaskAsSucceeded(const CopyTaskContext &ctx) {
         task.location_id = ctx.dst_location_id;
         task.old_status = CLS_WRITING;
         task.new_status = CLS_SERVING;
-        task.expected_location_value = ctx.dst_location_value;
-        task.expected_source_location_id = ctx.src_location_id;
-        task.expected_source_create_time = ctx.src_create_time;
-        task.expected_source_status = CLS_SERVING;
-        task.expected_source_location_value = ctx.src_location_value;
         std::vector<std::vector<ErrorCode>> results;
         const auto ec = meta_searcher.BatchCASLocationStatus(rc.get(), {ctx.block_key}, {{task}}, results);
         promoted = ec == EC_OK && results.size() == 1 && results[0].size() == 1 && results[0][0] == EC_OK;
@@ -1723,10 +1660,6 @@ void MigrationManager::SubmitTargetLocationDelete(const CopyTaskContext &ctx) {
     del_req.block_keys = {ctx.block_key};
     del_req.location_ids = {{ctx.dst_location_id}};
     del_req.resume_deleting = true;
-    del_req.authoritative_read = true;
-    if (!ctx.dst_location_value.empty()) {
-        del_req.expected_location_values = {{ctx.dst_location_value}};
-    }
     if (!schedule_plan_executor_->SubmitNonBlocking(del_req, ScheduleTaskClass::kMigrationContinuation)) {
         KVCM_LOG_WARN("migration target cleanup enqueue failed: instance %s block_key %ld location %s",
                       ctx.instance_id.c_str(),
@@ -1739,24 +1672,11 @@ void MigrationManager::SubmitSourceLocationDelete(const CopyTaskContext &ctx) {
     if (!schedule_plan_executor_ || ctx.src_location_id.empty()) {
         return;
     }
-    CacheLocation published_target;
-    if (!published_target.FromJsonString(ctx.dst_location_value) || published_target.id() != ctx.dst_location_id) {
-        KVCM_LOG_WARN("retain migration source without an exact published target snapshot, instance %s block_key %ld",
-                      ctx.instance_id.c_str(),
-                      ctx.block_key);
-        return;
-    }
-    published_target.set_status(CLS_SERVING);
     CacheLocationDelRequest del_req;
-    del_req.required_serving_location_values.emplace(ctx.block_key, published_target.ToJsonString());
     del_req.instance_id = ctx.instance_id;
     del_req.block_keys = {ctx.block_key};
     del_req.location_ids = {{ctx.src_location_id}};
     del_req.resume_deleting = true;
-    del_req.authoritative_read = true;
-    if (!ctx.src_location_value.empty()) {
-        del_req.expected_location_values = {{ctx.src_location_value}};
-    }
     if (!schedule_plan_executor_->SubmitNonBlocking(del_req, ScheduleTaskClass::kMigrationContinuation)) {
         KVCM_LOG_WARN("migration source cleanup enqueue failed: instance %s block_key %ld location %s",
                       ctx.instance_id.c_str(),
@@ -2980,7 +2900,6 @@ MigrationManager::DispatchMigrationBatchWithLifecycleLockHeld(const std::string 
             req.async_copy_options = params.async_copy_options;
             req.src_specs = admission.src_location->location_specs();
             req.src_create_time = admission.src_location->create_time();
-            req.src_location_value = admission.src_location->ToJsonString();
             copy_block_keys.push_back(block_key);
             copy_reqs.push_back(std::move(req));
             continue; // Copy 优先：已进入 copy 的 block 不再重复 mark。
