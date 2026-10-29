@@ -45,7 +45,7 @@ The changes span three layers:
 │  hf3fs_usrbio_client.h  ·  hf3fs_sdk.cc            │
 ├─────────────────────────────────────────────────────┤
 │             Python Connector Layer                  │
-│  data_transfer.py (_device_mod helper)              │
+│  transfer_backend.py (get_device_module helper)     │
 │  v1_connector.py (device-agnostic stream/event)     │
 │  batch_gather_scatter_helper.py (float8 compat)     │
 └─────────────────────────────────────────────────────┘
@@ -99,7 +99,9 @@ to work with either backend through a single type alias. CUDA builds resolve
 
 ### 5.3 Python Connector Layer
 
-- `data_transfer.py` — Added `_get_device_module(device)` helper and select device module from runtime device (`torch.get_device_module(device)` when available). Replaced hard-coded `torch.cuda.*` stream/event calls with device-module equivalents.
+- `transfer_backend.py` — Holds the `get_device_module(device)` helper: select the device module from the runtime
+  device (`torch.get_device_module(device)` when available).
+- `data_transfer.py` — Uses that helper for device-agnostic stream/event calls instead of hard-coded `torch.cuda.*`.
 - `v1_connector.py` — Select device module from actual KV cache tensor device in `register_kv_caches`, then initialize stream/event on that module. This keeps connector device choice aligned with inference engine runtime.
 - `batch_gather_scatter_helper.py` — Made `tl.float8e4nv` conditional: `tl.float8e4nv if hasattr(tl, 'float8e4nv') else tl.float8e4b8` to support non-NVIDIA Triton backends.
 
@@ -127,6 +129,7 @@ to work with either backend through a single type alias. CUDA builds resolve
 | `transfer_client_impl.h` | Modify | Widen guard to `USING_CUDA || USING_MUSA` |
 | `transfer_client_impl.cc` | Modify | Widen guard to `USING_CUDA || USING_MUSA` |
 | `test/sdk_buffer_check_util_test.cc` | Modify | Use `gpu_stream` field name |
+| `transfer_backend.py` | New | `get_device_module` helper (device-agnostic stream/event) |
 | `data_transfer.py` | Modify | Device-agnostic stream/event |
 | `v1_connector.py` | Modify | Device-agnostic stream/event |
 | `batch_gather_scatter_helper.py` | Modify | Conditional float8 dtype |

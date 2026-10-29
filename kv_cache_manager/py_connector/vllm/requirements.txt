@@ -3,6 +3,8 @@ attrs>=25.3.0
 typing_extensions>=4.13.2
 pyzmq>=26.4.0
 pydantic>=2.11.4
+# Needed by the built-in GPU data plane only: the connector imports and runs
+# with a custom transfer backend on a host without Triton.
 triton>=3.3.0
 orjson>=3.10.18
 cattrs>=25.1.1

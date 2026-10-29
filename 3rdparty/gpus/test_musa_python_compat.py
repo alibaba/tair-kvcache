@@ -122,6 +122,7 @@ import re
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 files_to_check = [
     "kv_cache_manager/py_connector/vllm/data_transfer.py",
+    "kv_cache_manager/py_connector/vllm/transfer_backend.py",
     "kv_cache_manager/py_connector/vllm/v1_connector.py",
 ]
 
