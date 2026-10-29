@@ -155,12 +155,17 @@ void Server::OnBecomeLeader() {
     cache_manager_->ResumeReclaimer();
     cache_manager_->StartMigrationManager();
 
-    meta_impl_->EnableLeaderOnlyRequests();
-    admin_impl_->EnableLeaderOnlyRequests();
-    if (optimizer_event_service_) {
-        optimizer_event_service_->EnableSubscriptions();
+    if (leader_elector_->RunIfCurrentPromotionValid([this]() {
+            meta_impl_->EnableLeaderOnlyRequests();
+            admin_impl_->EnableLeaderOnlyRequests();
+            if (optimizer_event_service_) {
+                optimizer_event_service_->EnableSubscriptions();
+            }
+        })) {
+        KVCM_LOG_INFO("recover end");
+    } else {
+        KVCM_LOG_INFO("recover finished after leadership was revoked, cleanup required");
     }
-    KVCM_LOG_INFO("recover end");
 }
 
 void Server::OnNoLongerLeader() {
@@ -463,6 +468,10 @@ bool Server::CreateLeaderElector() {
                                                       config_.GetLeaderElectorLoopIntervalMs());
     leader_elector_->SetBecomeLeaderHandler([this]() { OnBecomeLeader(); });
     leader_elector_->SetNoLongerLeaderHandler([this]() { OnNoLongerLeader(); });
+    leader_elector_->SetLeadershipLostHandler([this]() {
+        meta_impl_->DisableLeaderOnlyRequests();
+        admin_impl_->DisableLeaderOnlyRequests();
+    });
 
     // 写入本节点的连接信息到协调后端
     {
@@ -502,6 +511,10 @@ void Server::Stop() {
     }
     stop_ = true;
     KVCM_LOG_INFO("server stopping...");
+    // Lifecycle callbacks need the service gates and managers to remain alive.
+    if (leader_elector_) {
+        leader_elector_->Stop();
+    }
     if (optimizer_event_service_) {
         optimizer_event_service_->DisableSubscriptions();
     }

@@ -173,7 +173,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
            (keys 0-7) without ever calling finish_write_cache.  The keys
            are now in CLS_WRITING state and their write sessions exist
            only in server memory.
-        2. Restart the server immediately.  The meta indexer recovers
+        2. Crash and restart the server.  The meta indexer recovers
            keys 0-7 from the local-file backend (CLS_WRITING status
            preserved), but the in-memory write session table is gone.
         3. Re-register test_instance_01 (loads recovered indexer) and
@@ -212,11 +212,31 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         for i in range(8):
             self._start_write(i)
 
-        # restart the server immediately before any finish_write_cache
-        # is called; the write session table is lost, but the meta
-        # indexer is flushed to disk (local-file backend) so keys 0-7
-        # survive the restart with CLS_WRITING status
-        self.worker_manager.stop_worker(0)
+        # Wait for the periodic recorder to persist accounting before crashing;
+        # SIGKILL cannot rely on destructor-time metadata persistence. Dummy
+        # backend writes have already persisted the WRITING locations.
+        path = os.path.join(
+            self.get_workdir(),
+            f"meta_storage_{self._instance_group_name}_{self._instance_id}",
+        )
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                with open(path, "r", encoding="utf-8") as source:
+                    persisted = json.load(source)
+                metadata = json.loads(persisted.get("__metadata__", "{}"))
+                if int(metadata.get("__key_count__", -1)) == 8:
+                    break
+            except (OSError, ValueError):
+                # The dummy backend rewrites this file in place.
+                pass
+            time.sleep(0.05)
+        else:
+            self.fail("key count was not persisted before the crash")
+
+        # Graceful shutdown aborts pending writes. Crash instead so keys 0-7
+        # survive in CLS_WRITING without their in-memory write sessions.
+        self.worker_manager.stop_worker(0, force=True)
         self.assertTrue(
             self.worker_manager.start_worker(
                 # configure batching_size=8 so the reclaimer always
