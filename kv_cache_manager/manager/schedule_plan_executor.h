@@ -8,7 +8,6 @@
 #include <functional>
 #include <future>
 #include <limits>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -84,10 +83,6 @@ struct CacheLocationDelRequest {
     // An explicit request may also admit this exact location in CLS_DELETING.
     // It still makes only one deletion attempt after a fresh CAS and Sync.
     bool resume_deleting{false};
-    // Optional sibling SERVING snapshots, keyed by block. Check these in the
-    // same RMW that first invalidates a location. An already admitted DELETING
-    // location keeps its cleanup responsibility even if the sibling disappears.
-    std::map<int64_t, std::string> required_serving_location_values;
 };
 
 struct EventReportMetadataDeleteTarget {
@@ -246,7 +241,6 @@ private:
                           std::chrono::microseconds delay,
                           bool authoritative_read = false,
                           bool resume_deleting = false,
-                          const std::map<int64_t, std::string> *required_serving_location_values = nullptr,
                           std::shared_ptr<MetaIndexer> indexer = nullptr);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,

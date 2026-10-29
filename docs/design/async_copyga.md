@@ -1,21 +1,21 @@
 # KVCM × PACE CopyGA 异步化设计
 
-KVCM 以进程内异步任务编排 CopyGA，通过条件发布保证迁移结果只关联到有效的源和目标，物理 allocation 的生命周期安全依赖 PACE 的 Copy/Delete 互斥契约。Copy 任务不持久化，不在切主或重启后恢复；普通 Location 元数据仍按所选元数据后端的语义存储。
+KVCM 以进程内异步任务编排 CopyGA，完成后检查源状态并更新目标 Location，物理 allocation 的生命周期安全依赖 PACE 的 Copy/Delete 互斥契约。Copy 任务不持久化，不在切主或重启后恢复；普通 Location 元数据仍按所选元数据后端的语义存储。
 
 | 项目 | 内容 |
 |---|---|
 | 默认模式 | `MIGRATION_COPY_SYNC` |
 | 异步模式 | `MIGRATION_COPY_ASYNC_REQUIRED`，仅接受显式支持异步的 backend |
-| KVCM 职责 | 并发/字节准入、异步提交与完成、源和目标条件发布、失败后的单次清理 |
+| KVCM 职责 | 并发/字节准入、异步提交与完成、源状态检查与目标发布、失败后的单次清理 |
 | PACE 安全前提 | Copy 与源/目标 Delete 在 allocation 生命周期上互斥；busy、失败或未确认不能报告删除成功 |
 
 ## 1. 目标与设计取舍
 
 KVCache 存在 68/136 MiB 等较大 block；当 Copy RT 达到 200–300 ms 时，同步等待会长时间占用共享 Executor worker 和 DataStorageManager 锁。异步化的目标是释放这些编排资源，为提高 Copy 并发提供条件，物理搬运耗时仍由存储后端决定。
 
-KVCM 不持久化 Copy Guard、operation 阶段、源身份快照或远端 task IDs，也不通过持久化 pin 阻止源逐出。源可进入普通回收流程，PACE 在真实 I/O 仍访问 allocation 时拒绝物理删除；Copy 完成时，KVCM 再通过源和目标的条件更新拒绝过期结果。这一分工允许切主或重启时放弃在途迁移，代价是可能丢失已完成但尚未发布的结果，且不提供远端失联任务的自动恢复。
+KVCM 不持久化 Copy Guard、operation 阶段、源信息或远端 task IDs，也不通过持久化 pin 阻止源逐出。源可进入普通回收流程，PACE 在真实 I/O 仍访问 allocation 时拒绝物理删除；Copy 完成时，KVCM 检查源的 ID、创建时间和可读状态，再单独更新目标。源检查与目标发布之间的并发变化仍遵循第 4 节的边界。这一分工允许切主或重启时放弃在途迁移，代价是可能丢失已完成但尚未发布的结果，且不提供远端失联任务的自动恢复。
 
-普通 write/read、Provider 执行队列重构、全局 allocation epoch、跨进程任务 exactly-once 和所有 backend 的统一保护改造不属于本设计。同步 Copy 使用同步后端接口及 Storage timeout，MARK 继续引导后续写入；同步与异步 Copy 共用源/目标条件发布和元数据 Sync 收尾，因此收尾延迟包含元数据操作。
+普通 write/read、Provider 执行队列重构、全局 allocation epoch、跨进程任务 exactly-once 和所有 backend 的统一保护改造不属于本设计。同步 Copy 使用同步后端接口及 Storage timeout，MARK 继续引导后续写入；同步与异步 Copy 共用源状态检查、目标发布和元数据 Sync 收尾，因此收尾延迟包含元数据操作。
 
 ## 2. 必需的后端安全契约
 
@@ -27,7 +27,7 @@ KVCM 不持久化 Copy Guard、operation 阶段、源身份快照或远端 task 
 4. 明确 GA 列表中存在 busy、失败或未确认项时，删除链必须向 KVCM 返回真实失败，不能因路由缺失或后台清理已提交就报告整体 success。
 5. PACE 在 Delete 失败后保留未释放 allocation 的业务引用和定位信息；只有确认对象不存在时，才能以不存在为由返回幂等成功。
 
-该契约的源保护范围从 Provider 绑定 allocation 开始。Meta 接受请求到 Provider 绑定之前，在途请求仍可能遇到源 GA 同址复用；KVCM 依赖第 4 节的条件发布拒绝过期结果。这个边界不保证 PACE 从未读到复用后的数据，也不覆盖绕过 KVCM 元数据直接 Free 的端到端身份安全。
+该契约的源保护范围从 Provider 绑定 allocation 开始。Meta 接受请求到 Provider 绑定之前，在途请求仍可能遇到源 GA 同址复用；KVCM 发布前的源检查不构成 allocation generation 协议。这个边界不保证 PACE 从未读到复用后的数据，也不覆盖绕过 KVCM 元数据直接 Free 的端到端身份安全。
 
 无响应且无法证明 drain 时，PACE 可能长期保留 pending 与 allocation。这是安全契约允许的异常容量代价，不能用固定超时强制释放；KVCM 不持久化 Copy 任务也不意味着底层可以无条件 Free。
 
@@ -39,8 +39,8 @@ Group 并发/字节准入，登记进程内任务
   → CopyAsync 本地接收，返回提交结果
   → backend 协调器 POST → 内存保存 task IDs → 批量 query / cancel
   → 唯一完成回调 → Executor future → MigrationManager
-      成功：同一 block 条件更新核验 source + target，再发布 SERVING
-      失败/取消/未知：按精确快照尝试一次目标清理；busy/失败保留 DELETING 并结束请求
+      成功：检查源 ID、create_time 和 SERVING 状态，再单独 CAS 目标为 SERVING
+      失败/取消/未知：按目标 Location ID 尝试一次清理；Delete 返回失败仍尝试 CAD，以失败结束请求
 ```
 
 `CopyAsync` 分为本地接收结果和最终 completion 两个阶段。本地接收不等待远端 Copy 完成；接收成功后，backend 负责恰好一次完成回调。operation 和 task IDs 仅用于进程内跟踪，不写入 CacheLocation，也没有远端提交持久化回调或 `ResumeAsyncCopy` 接口。
@@ -61,37 +61,34 @@ PACE adapter 的本地接收在发送 POST 前完成。本地明确拒绝且没�
 
 ### 4.1 成功发布
 
-Copy 提交时在内存中保存本次源和目标的 Location 身份及完整快照。完成处理属于当前 Leader 的任务生命周期，并通过唯一认领与取消仲裁；取消先取得处理权时，即使远端 Copy 成功也不发布目标、不删除源，而是清理本次目标。
+Copy 提交时在内存中保存源 Location ID、`create_time`、目标 Location ID 及迁移参数。完成处理属于当前 Leader 的任务生命周期，并通过唯一认领与取消仲裁；取消先取得处理权时，即使远端 Copy 成功也不发布目标、不删除源，而是按目标 Location ID 提交清理。
 
-源和目标必须属于同一个 Instance/block，KVCache 不跨 `instance_id` 复用。发布不能依靠先 Get(source)、再独立 Promote(target)，因为两步之间可能发生源删除。一次 block 级条件 RMW 同时校验：
+源和目标必须属于同一个 Instance/block，KVCache 不跨 `instance_id` 复用。完成时先读取源，检查其 ID、`create_time` 和 `SERVING` 状态，再按目标 ID 执行独立的 `WRITING → SERVING` CAS。源检查或目标 CAS 失败时，丢弃结果并按目标 ID 提交清理。源检查与目标更新不是同一次原子操作，目标 CAS 也不比较完整快照；两步之间的源变化以及同 ID 对象换代的竞态不由该流程消除。
 
-- 源 Location ID、`create_time`、完整快照和 `SERVING` 状态仍匹配。
-- 目标仍是本次创建的 `WRITING` Location，身份和完整值未变化。
+CAS 已生效但 Sync 未确认时，以发布确认失败结束迁移，保留源和已发布目标，不执行源删除或清标，并释放进程内任务和 Copy 额度。该失败不计为 backend Copy unknown。
 
-全部条件满足才把目标改成 `SERVING`；任一条件不符则丢弃结果，并按本次目标快照清理，不触碰替换后的 Location。CAS 已生效但 Sync 未确认时，以发布确认失败结束迁移，保留源和已发布目标，不执行源删除或清标，并释放进程内任务和 Copy 额度。该失败不计为 backend Copy unknown。
+Sync 遵循所选元数据后端的语义。memory-primary 模式下，普通 `SERVING` 更新的备份是 best-effort，Sync 不等于每条目标更新都已持久化，也不提供迁移结果跨重启恢复保证。成功收尾后按 retention 决定是否删除源，源删除按源 Location ID 提交普通删除链。
 
-Sync 遵循所选元数据后端的语义。memory-primary 模式下，普通 `SERVING` 更新的备份是 best-effort，Sync 不等于每条目标更新都已持久化，也不提供迁移结果跨重启恢复保证。成功收尾后按 retention 决定是否删除源，源删除同样使用精确快照和普通删除链。
-
-`DELETE_SOURCE` 在源首次转为 `DELETING` 的同一次 block 条件 RMW 中，校验本次已发布目标的完整 `SERVING` 快照。目标已被删除、进入删除状态或被替换时，保留源；这也覆盖目标发布后等待 Sync 的期间。源已成功进入 `DELETING` 后，本次物理清理继续遵守精确身份和 Sync 屏障，不再要求目标持续存在。该条件保证的是源开始失效时目标仍有效，不阻止之后对目标的独立删除。
+`DELETE_SOURCE` 不在源删除准入时重新检查目标。目标发布后可以被独立删除，因此不保证删除源时目标仍然存在。
 
 ### 4.2 删除准入与失败处理
 
 失败、取消和 unknown 均通过普通删除链尝试一次清理。GC、Reclaimer 和普通删除不依赖 Copy Guard 或反向源 pin，只保留进程内 active target 检查；`WRITING`、`DELETING` 是普通 Location 状态，不是持久化迁移任务。
 
-1. 按精确 Location 快照将 `WRITING/SERVING` 改为 `DELETING`。
+1. 按 Location ID 读取当前状态，再 CAS 为 `DELETING`；调用方显式提供快照时，沿用普通删除准入的快照比较。
 2. 确认元数据变更的 Sync 屏障后，遵守调用方原有的删除宽限时间，再调用物理 Delete，使元数据中的源失效先于源空间释放。Sync 失败时不调用物理 Delete。
-3. Delete busy、失败、短返回、超时或异常时，以失败结果结束请求，保留已经形成的 `DELETING` 元数据，不继续执行该批次的 metadata CAD。
-4. 物理删除确认后执行精确的 metadata CAD；CAD 失败同样以失败结果结束，不自动重新删除物理数据或重做 CAD。
+3. Delete 返回 busy、超时等失败码或结果数量不符时，记录失败并继续执行该批次的 metadata CAD，最终返回失败。Delete 抛出异常时由 Executor 捕获并以失败结束，不继续执行后续步骤。
+4. metadata CAD 按 Location ID 和 `DELETING` 状态删除记录，并按成功删除的元数据扣减账面用量；CAD 失败同样以失败结果结束，不自动重新删除物理数据或重做 CAD。
 
-每个删除请求只执行一轮，失败后完成原 future。Executor 不将其重新放入定时队列，MigrationManager 也不保留失败清理队列或重新提交删除。删除请求执行时校验精确 Location，不扩大到同 key 的新 Location；后端返回错误、短返回或无法确认删除时按失败处理。
+每个删除请求只执行一轮，失败后完成原 future。Executor 不将其重新放入定时队列，MigrationManager 也不保留失败清理队列或重新提交删除。物理删除阶段处理本次准入的 Location ID，不扩大到同 key 的其他 ID；后端返回错误、短返回或无法确认删除时按失败处理。
 
-future 以失败结束后，上层可释放删除任务的 pending 记录和额度，但这不代表物理空间或元数据中的存储用量已经释放。busy、失败或未知结果可能留下长期存在的 `DELETING` 和空间占用；当前普通 GC、Reclaimer 不负责自动接管所有这类残留，本设计不提供后台持续重试或跨重启恢复保证。
+future 以失败结束后，上层可释放删除任务的 pending 记录和额度。物理删除失败但 CAD 成功时，Location 元数据和账面用量仍会移除，后端可能留下没有 Location 记录的物理残留；Sync、执行异常或 CAD 失败也可能留下 `DELETING`。账面用量扣减不证明物理空间已经释放，当前普通 GC、Reclaimer 不负责自动接管所有这类残留，本设计不提供后台持续重试或跨重启恢复保证。
 
 ### 4.3 CAS 竞争与重复删除边界
 
-精确清理允许本次显式请求处理同一身份已经处于 `DELETING` 的对象，但仍须执行精确的 `DELETING → DELETING` CAS 并确认 Sync，不能只凭本地状态授权物理删除。CAS 竞争或备份准入失败需要返回失败，不能因另一路删除开始了就宣告本次清理完成。
+显式清理请求可以处理已经处于 `DELETING` 的 Location，但仍须执行 `DELETING → DELETING` CAS 并确认 Sync，不能只凭本地状态授权物理删除。CAS 竞争或备份准入失败需要返回失败，不能因另一路删除开始了就宣告本次清理完成。
 
-读取确认原对象已不存在或已被不同身份替换时，可以跳过本次旧对象；同 ID 的换代对象不能误删。物理删除后的 metadata CAD 也使用完整快照，避免覆盖或删除后续替换的 Location。
+普通删除准入保留调用方显式提供 `expected_location_values` 时的完整值条件 CAS；迁移清理不携带 Copy 创建时的完整快照。物理删除阶段和最终 CAD 不比较准入时的完整快照，因此不提供同 ID 换代对象的端到端隔离保证。
 
 KVCM 不因本次清理失败自动重新提交 Delete。后续显式请求或独立任务仍可能重复删除同一 URI；模糊删除结果与底层 GA 身份复用依赖后端 Delete 契约，KVCM 不提供额外的 allocation generation 协议。
 
@@ -103,7 +100,7 @@ Group 在 SYNC 模式使用 `copy_max_concurrency`，默认 1；在 ASYNC_REQUIR
 
 异步默认窗口以“待回收数据先完成 Copy，再回收源”作为容量规划目标。Copy 的 operation 与字节额度均按 Group 计账；Reclaimer 的删除批次上限按进程计账，待删除字节额度另按 Group × Storage 类型计账，二者分别准入。该规划目标不改变现有迁移触发和 retention 策略。
 
-Copy inflight credit 表示 KVCM 正在跟踪的 Copy，不等于 PACE 的全部物理占用。unknown 收尾可释放 Copy credit，但清理失败残留及 PACE 未 drain 的 pending 仍可能占用容量。一次清理请求执行期间保存 Location 快照，请求结束后不为失败残留持续持有清理任务。本设计没有独立的 quarantine operation/bytes 容量闸门；持续 busy/unknown 时，需要控制新 Copy 压力并检查未清理残留和 PACE 实际容量。
+Copy inflight credit 表示 KVCM 正在跟踪的 Copy，不等于 PACE 的全部物理占用。unknown 收尾可释放 Copy credit，但清理失败残留及 PACE 未 drain 的 pending 仍可能占用容量。清理请求结束后不为失败残留持续持有清理任务。本设计没有独立的 quarantine operation/bytes 容量闸门；持续 busy/unknown 时，需要控制新 Copy 压力并检查未清理残留和 PACE 实际容量。
 
 Copy 根据当前 Location 状态和目标覆盖情况选择源。源必须是指定 Storage 上的 `SERVING` 副本；若目标的 `SERVING/WRITING` Locations 已覆盖某个源的 specs，则继续检查其他仍需迁移的源副本。错误码不被当成源永久失效的证明，也不触发自动删除源。
 

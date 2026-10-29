@@ -3046,7 +3046,7 @@ TEST_F(CacheManagerTest, TestTrimCacheRunsBoundedConcurrentDeletesBeforeSync) {
     EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
 }
 
-TEST_F(CacheManagerTest, TestTrimCacheContinuesAfterPartialDeleteFailure) {
+TEST_F(CacheManagerTest, TestTrimCacheContinuesAndRemovesMetadataAfterPartialDeleteFailure) {
     auto *meta_backend = InstallControllableMetaBackend();
     ASSERT_NE(nullptr, meta_backend);
     auto storage_manager = registry_manager_->data_storage_manager();
@@ -3061,14 +3061,13 @@ TEST_F(CacheManagerTest, TestTrimCacheContinuesAfterPartialDeleteFailure) {
     EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
     EXPECT_EQ(8u, backend->GetDeleteCallCount()); // One attempt for each 256-key page.
     const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
-    EXPECT_EQ(2048u, indexer->GetKeyCount());
+    EXPECT_EQ(0u, indexer->GetKeyCount());
     CacheLocationMapVector locations;
     const auto result = indexer->GetLocationsFromPrimary(request_context_.get(), {0, 2047}, locations);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), result.error_codes);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_NOENT}), result.error_codes);
     ASSERT_EQ(2u, locations.size());
     for (const auto &location_map : locations) {
-        ASSERT_EQ(1u, location_map.size());
-        EXPECT_EQ(CLS_DELETING, location_map.begin()->second->status());
+        EXPECT_TRUE(location_map.empty());
     }
 }
 
@@ -3111,7 +3110,7 @@ TEST_F(CacheManagerTest, TestTrimCacheSkipsPersistentResiduesAfterPartialFailure
                   request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
     EXPECT_EQ(0u, persistent->GetListKeysCallCount());
     EXPECT_EQ(1u, persistent->GetSyncAllCallCount());
-    EXPECT_EQ(1024u, indexer->GetKeyCount());
+    EXPECT_EQ(0u, indexer->GetKeyCount());
 }
 
 TEST_F(CacheManagerTest, TestTrimCacheSyncsBeforeCleaningPersistentResidueWithEmptyLocal) {
