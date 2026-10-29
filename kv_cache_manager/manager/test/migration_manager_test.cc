@@ -3653,61 +3653,6 @@ TEST_F(MigrationManagerTest, TestDispatchWithoutGroupHardLimitStillHonorsSoftSlo
     EXPECT_EQ("cold_01", GetRawTieredWriteTarget(second.block_key));
 }
 
-namespace single_cleanup_stub {
-std::atomic<size_t> delete_calls{0};
-std::vector<ErrorCode>
-Delete(void *, RequestContext *, const std::string &, const std::vector<DataStorageUri> &uris, std::function<void()>) {
-    ++delete_calls;
-    return std::vector<ErrorCode>(uris.size(), EC_ERROR);
-}
-} // namespace single_cleanup_stub
-
-TEST_F(MigrationManagerTest, TestFailedCleanupOfExistingDeletingRunsCADOnceInBothCopyModes) {
-    ASSERT_TRUE(CreateMetaIndexer(kInstance));
-    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "single_cleanup/"));
-    Stub stub;
-    single_cleanup_stub::delete_calls.store(0);
-    stub.set(ADDR(DataStorageManager, Delete), single_cleanup_stub::Delete);
-    MetaSearcher searcher(meta_manager_->GetMetaIndexer(kInstance));
-    RequestContext rc("single_cleanup");
-    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
-    mgr.Start();
-    std::vector<std::pair<int64_t, std::string>> cleanup_locations;
-    for (const auto mode : {MigrationCopyExecutionMode::SYNC, MigrationCopyExecutionMode::ASYNC_REQUIRED}) {
-        for (const bool source_cleanup : {false, true}) {
-            const int64_t key = 877 + cleanup_locations.size();
-            const auto id = CreateSourceLocation(key, "cold_01", false, "data");
-            const auto location = GetLocation(key, id);
-            ASSERT_NE(nullptr, location);
-            MigrationManager::CopyTaskContext ctx;
-            ctx.instance_id = kInstance;
-            ctx.block_key = key;
-            ctx.copy_execution_mode = mode;
-            ctx.src_storage_name = ctx.dst_storage_name = "cold_01";
-            ctx.src_location_id = ctx.dst_location_id = id;
-            std::vector<std::vector<ErrorCode>> results;
-            ASSERT_EQ(EC_OK,
-                      searcher.BatchCASLocationStatus(
-                          &rc, {key}, {{{id, location->status(), CLS_DELETING}}}, results));
-            cleanup_locations.emplace_back(key, id);
-            if (source_cleanup) {
-                mgr.SubmitSourceLocationDelete(ctx);
-            } else {
-                mgr.SubmitTargetLocationDelete(ctx);
-            }
-        }
-    }
-    ASSERT_TRUE(WaitFor([]() { return single_cleanup_stub::delete_calls.load() == 4; }));
-    // Keep the monitor running past the former one-second cleanup retry delay.
-    // Busy/error must end this attempt, not silently start another deletion.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
-    mgr.Stop();
-    EXPECT_EQ(4u, single_cleanup_stub::delete_calls.load());
-    for (const auto &[key, id] : cleanup_locations) {
-        EXPECT_EQ(CLS_NOT_FOUND, GetLocationStatus(key, id));
-    }
-}
-
 TEST_F(MigrationManagerTest, TestCancelAndCompletionHaveExactlyOneTerminalOwner) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "async_race_cold/"));
@@ -3914,7 +3859,6 @@ TEST_F(MigrationManagerTest, TestUnknownSubmitsTargetCleanupOnceWithoutDeletingS
     EXPECT_EQ((KeyVector{block_key}), cleanup_submission_stub::requests.front().block_keys);
     EXPECT_EQ((std::vector<std::vector<std::string>>{{target_id}}),
               cleanup_submission_stub::requests.front().location_ids);
-    EXPECT_TRUE(cleanup_submission_stub::requests.front().resume_deleting);
     EXPECT_EQ(CLS_SERVING, GetLocationStatus(block_key, source_id));
 }
 

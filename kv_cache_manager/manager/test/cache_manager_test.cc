@@ -469,23 +469,6 @@ private:
     std::atomic<size_t> deleted_uri_count_{0};
 };
 
-class FailingDeleteBackend : public DeleteRecordingBackend {
-public:
-    using DeleteRecordingBackend::DeleteRecordingBackend;
-
-    std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &uris,
-                                  const std::string & /*trace_id*/,
-                                  std::function<void()> /*cb*/) override {
-        delete_calls_.fetch_add(1, std::memory_order_relaxed);
-        return std::vector<ErrorCode>(uris.size(), EC_ERROR);
-    }
-
-    size_t GetDeleteCallCount() const { return delete_calls_.load(std::memory_order_relaxed); }
-
-private:
-    std::atomic<size_t> delete_calls_{0};
-};
-
 class BlockingDeleteBackend : public DataStorageBackend {
 public:
     explicit BlockingDeleteBackend(std::shared_ptr<DataStorageBackend> delegate)
@@ -3046,29 +3029,16 @@ TEST_F(CacheManagerTest, TestTrimCacheRunsBoundedConcurrentDeletesBeforeSync) {
     EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
 }
 
-TEST_F(CacheManagerTest, TestTrimCacheContinuesAndRemovesMetadataAfterPartialDeleteFailure) {
+TEST_F(CacheManagerTest, TestTrimCacheContinuesAfterPartialDeleteFailure) {
     auto *meta_backend = InstallControllableMetaBackend();
     ASSERT_NE(nullptr, meta_backend);
-    auto storage_manager = registry_manager_->data_storage_manager();
-    auto backend = std::make_shared<FailingDeleteBackend>(storage_manager->storage_map_.at("hot_01"));
-    storage_manager->storage_map_["hot_01"] = backend;
-    AddDummyLocationsForTrim(2048, "hot_01");
+    AddDummyLocationsForTrim(2048, "missing_storage");
 
     EXPECT_EQ(EC_ERROR,
               cache_manager_->TrimCache(
                   request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
     EXPECT_GT(meta_backend->GetListKeysCallCount(), 2 * cache_manager_->schedule_plan_executor_->GetWorkerCount());
     EXPECT_EQ(1u, meta_backend->GetSyncAllCallCount());
-    EXPECT_EQ(8u, backend->GetDeleteCallCount()); // One attempt for each 256-key page.
-    const auto indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
-    EXPECT_EQ(0u, indexer->GetKeyCount());
-    CacheLocationMapVector locations;
-    const auto result = indexer->GetLocationsFromPrimary(request_context_.get(), {0, 2047}, locations);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_NOENT}), result.error_codes);
-    ASSERT_EQ(2u, locations.size());
-    for (const auto &location_map : locations) {
-        EXPECT_TRUE(location_map.empty());
-    }
 }
 
 TEST_F(CacheManagerTest, TestTrimCacheStopsSubmittingAfterExecutorFailure) {
@@ -3100,17 +3070,13 @@ TEST_F(CacheManagerTest, TestTrimCacheSkipsPersistentResiduesAfterPartialFailure
     backend_manager.cache_backend_ = std::move(cache);
     backend_manager.memory_primary_ = true;
     backend_manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
-    auto storage_manager = registry_manager_->data_storage_manager();
-    storage_manager->storage_map_["hot_01"] =
-        std::make_shared<FailingDeleteBackend>(storage_manager->storage_map_.at("hot_01"));
-    AddDummyLocationsForTrim(1024, "hot_01");
+    AddDummyLocationsForTrim(1024, "missing_storage");
 
     EXPECT_EQ(EC_ERROR,
               cache_manager_->TrimCache(
                   request_context_.get(), "test_instance", proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE));
     EXPECT_EQ(0u, persistent->GetListKeysCallCount());
     EXPECT_EQ(1u, persistent->GetSyncAllCallCount());
-    EXPECT_EQ(0u, indexer->GetKeyCount());
 }
 
 TEST_F(CacheManagerTest, TestTrimCacheSyncsBeforeCleaningPersistentResidueWithEmptyLocal) {

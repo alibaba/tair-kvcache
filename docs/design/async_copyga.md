@@ -75,8 +75,8 @@ Sync 遵循所选元数据后端的语义。memory-primary 模式下，普通 `S
 
 失败、取消和 unknown 均通过普通删除链尝试一次清理。GC、Reclaimer 和普通删除不依赖 Copy Guard 或反向源 pin，只保留进程内 active target 检查；`WRITING`、`DELETING` 是普通 Location 状态，不是持久化迁移任务。
 
-1. 按 Location ID 读取当前状态，再 CAS 为 `DELETING`；调用方显式提供快照时，沿用普通删除准入的快照比较。
-2. 确认元数据变更的 Sync 屏障后，遵守调用方原有的删除宽限时间，再调用物理 Delete，使元数据中的源失效先于源空间释放。Sync 失败时不调用物理 Delete。
+1. 按 Location ID 读取当前状态，跳过已处于 `DELETING` 的对象，对其余符合条件的对象 CAS 为 `DELETING`；调用方显式提供快照时，沿用普通删除准入的快照比较。
+2. 对 CAS 成功的子集确认元数据 Sync 屏障后，遵守调用方原有的删除宽限时间，再调用物理 Delete，使元数据中的源失效先于源空间释放。Sync 失败时不调用物理 Delete。
 3. Delete 返回 busy、超时等失败码或结果数量不符时，记录失败并继续执行该批次的 metadata CAD，最终返回失败。Delete 抛出异常时由 Executor 捕获并以失败结束，不继续执行后续步骤。
 4. metadata CAD 按 Location ID 和 `DELETING` 状态删除记录，并按成功删除的元数据扣减账面用量；CAD 失败同样以失败结果结束，不自动重新删除物理数据或重做 CAD。
 
@@ -86,7 +86,9 @@ future 以失败结束后，上层可释放删除任务的 pending 记录和额�
 
 ### 4.3 CAS 竞争与重复删除边界
 
-显式清理请求可以处理已经处于 `DELETING` 的 Location，但仍须执行 `DELETING → DELETING` CAS 并确认 Sync，不能只凭本地状态授权物理删除。CAS 竞争或备份准入失败需要返回失败，不能因另一路删除开始了就宣告本次清理完成。
+迁移清理使用 Location 删除请求，跳过已经处于 `DELETING` 的对象，不接管另一次请求留下的物理清理。请求没有待处理对象时可以返回成功，这不证明对应物理数据已经删除。同步整 key 删除入口会处理已有 `DELETING`，重新执行 CAS 和 Sync 后再尝试物理删除；异步整 key 删除入口则跳过已有 `DELETING`。
+
+批量 CAS 按逐项结果选出成功子集，竞争失败项不会阻止成功项继续 Sync 和物理删除。有成功项时，最终结果反映该子集的执行结果；不能据此认定原请求中的每个 Location 都已完成删除。
 
 普通删除准入保留调用方显式提供 `expected_location_values` 时的完整值条件 CAS；迁移清理不携带 Copy 创建时的完整快照。物理删除阶段和最终 CAD 不比较准入时的完整快照，因此不提供同 ID 换代对象的端到端隔离保证。
 
