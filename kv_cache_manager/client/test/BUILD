@@ -28,6 +28,18 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "ClientAbiTest",
+    srcs = [
+        "client_abi_test.cc",
+    ],
+    data = [],
+    deps = [
+        "//kv_cache_manager/client:common",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
 py_binary(
     name = "asan_runner",
     srcs = ["asan_runner.py"],
