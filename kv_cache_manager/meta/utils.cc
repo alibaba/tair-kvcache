@@ -17,14 +17,19 @@ FieldMap SerializeToFieldMap(const CacheLocationMap &locations, PropertyMap prop
     return properties;
 }
 
-ErrorCode DeserializeFieldMap(const FieldMap &field_map, CacheLocationMap &out_locations, PropertyMap &out_properties) {
+ErrorCode DeserializeFieldMap(const FieldMap &field_map,
+                              CacheLocationMap &out_locations,
+                              PropertyMap &out_properties,
+                              LocationIdInterner *id_interner,
+                              LocationSpecNameInterner *name_interner) {
     for (const auto &[field_name, field_value] : field_map) {
         if (field_name.rfind(PROPERTY_LOCATION_PREFIX, 0) == 0) {
             std::string loc_id = field_name.substr(PROPERTY_LOCATION_PREFIX.size());
             auto location = std::make_shared<CacheLocation>();
             if (field_value.empty()) {
                 location->set_id(loc_id);
-            } else if (!location->FromJsonString(field_value)) {
+            } else if (!(id_interner ? location->FromJsonStringInterned(field_value, *id_interner, name_interner)
+                                    : location->FromJsonString(field_value))) {
                 return EC_CORRUPTION;
             }
             out_locations[loc_id] = std::move(location);
@@ -35,7 +40,10 @@ ErrorCode DeserializeFieldMap(const FieldMap &field_map, CacheLocationMap &out_l
     return EC_OK;
 }
 
-ErrorCode DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_locations) {
+ErrorCode DeserializeLocations(const FieldMap &field_map,
+                               CacheLocationMap &out_locations,
+                               LocationIdInterner *id_interner,
+                               LocationSpecNameInterner *name_interner) {
     for (const auto &[field_name, field_value] : field_map) {
         if (field_name.rfind(PROPERTY_LOCATION_PREFIX, 0) != 0) {
             continue;
@@ -44,7 +52,8 @@ ErrorCode DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_
         auto location = std::make_shared<CacheLocation>();
         if (field_value.empty()) {
             location->set_id(loc_id);
-        } else if (!location->FromJsonString(field_value)) {
+        } else if (!(id_interner ? location->FromJsonStringInterned(field_value, *id_interner, name_interner)
+                                : location->FromJsonString(field_value))) {
             return EC_CORRUPTION;
         }
         out_locations[loc_id] = std::move(location);

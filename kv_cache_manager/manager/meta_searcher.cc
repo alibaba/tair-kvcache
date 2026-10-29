@@ -2495,7 +2495,7 @@ MetaSearcher::BatchReplaceLocationSpecs(RequestContext *request_context,
             std::vector<LocationSpec> specs;
             specs.reserve(task.specs.size());
             for (const auto &spec : task.specs) {
-                specs.emplace_back(spec.name(), spec.uri());
+                specs.push_back(spec);
             }
             new_location->set_location_specs(std::move(specs));
             new_location->set_type(task.type);
@@ -2599,7 +2599,7 @@ public:
     // The ReportEvent-only flat representation owns its input strings and is
     // dead after this call except for spec names used to map failures back to
     // request items. Transfer the potentially large URI into the immutable
-    // CacheLocation while restoring the usually-SSO name in the task. Generic
+    // CacheLocation while retaining the shared name in the task. Generic
     // nested callers retain their historical copy semantics.
     [[nodiscard]] LocationSpec CopyOrConsumeSpec(size_t key_index, size_t task_index, size_t spec_index) {
         if (!flat_tasks_) {
@@ -2610,7 +2610,7 @@ public:
             return task.SpecAt(spec_index);
         }
         auto &source = task.MutableSpecAt(spec_index);
-        std::string retained_name = source.name();
+        SharedLocationSpecName retained_name = source.name_handle();
         LocationSpec result = std::move(source);
         source.set_name(std::move(retained_name));
         return result;
@@ -3184,9 +3184,9 @@ ErrorCode MetaSearcher::BatchDeleteLocationSpecs(RequestContext *request_context
         deleted_specs.reserve(task.spec_names.size());
         for (const auto &spec : locs[0]->location_specs()) {
             if (delete_spec_names.count(spec.name()) == 0) {
-                kept_specs.emplace_back(spec.name(), spec.uri());
+                kept_specs.push_back(spec);
             } else {
-                deleted_specs.emplace_back(spec.name(), spec.uri());
+                deleted_specs.push_back(spec);
             }
         }
         if (kept_specs.size() == locs[0]->location_specs().size()) {

@@ -47,6 +47,9 @@ void MetaLocalBackendTest::ConstructMetaStorageBackendConfig() {
 
 std::string MetaLocalBackendTest::ExpectedStorageType() const { return META_LOCAL_BACKEND_TYPE_STR; }
 
+static_assert(sizeof(MetaMemCacheItem) <= 48, "cold item state must not enlarge the common cache item");
+static_assert(sizeof(LocalItemExtra) <= 16, "cold state must use one compact side allocation");
+
 TEST_F(MetaLocalBackendTest, TestSimple) {
     ASSERT_EQ(ExpectedStorageType(), meta_storage_backend_->GetStorageType());
 
@@ -124,6 +127,67 @@ TEST_F(MetaLocalBackendTest, TestTargetedLocationsPreserveKeyStatus) {
     EXPECT_FALSE(selected[1][0]);
     ASSERT_EQ(1u, selected[2].size());
     EXPECT_FALSE(selected[2][0]);
+}
+
+TEST_F(MetaLocalBackendTest, TestStripedItemLocksWithMaintenanceAndChargeUpdates) {
+    meta_storage_backend_config_->SetStorageUri("local://?num_item_mutex_shard_bits=2");
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("striped_item_locks", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    const LocationId id = "shared";
+    KeyType collision = 2;
+    while (GetShardIndex(collision, 3) != GetShardIndex(1, 3)) {
+        ++collision;
+    }
+    const KeyTypeVec keys{1, collision}; // Deliberately share one item-lock stripe.
+    CacheLocationMapVector seed(keys.size());
+    for (auto &locations : seed) {
+        auto location = std::make_shared<CacheLocation>();
+        location->set_id(id);
+        locations.emplace(id, std::move(location));
+    }
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put(nullptr, keys, seed, PropertyMapVector(keys.size())));
+
+    std::atomic<int> errors{0};
+    auto writer = [&](KeyType key) {
+        for (int i = 0; i < 1000; ++i) {
+            auto location = std::make_shared<CacheLocation>();
+            location->set_id(id);
+            location->push_location_spec(LocationSpec("tp0", std::string(i % 2 ? 16 : 128, 'x')));
+            if (meta_storage_backend_->UpsertSingleLocations(nullptr, {key}, {&id}, {location}) !=
+                std::vector<ErrorCode>{EC_OK}) {
+                ++errors;
+            }
+        }
+    };
+    auto maintenance = [&] {
+        for (int i = 0; i < 1000; ++i) {
+            CacheLocationMapVector locations;
+            if (meta_storage_backend_->GetLocationMapsForMaintenance(nullptr, keys, locations) !=
+                std::vector<ErrorCode>({EC_OK, EC_OK})) {
+                ++errors;
+            }
+            for (const auto &per_key : locations) {
+                for (const auto &[location_id, location] : per_key) {
+                    if (!location || location->id() != location_id) {
+                        ++errors;
+                    }
+                }
+            }
+            if (meta_storage_backend_->DeleteLocationsForMaintenance(nullptr, keys, {{id}, {id}}) !=
+                std::vector<ErrorCode>({EC_OK, EC_OK})) {
+                ++errors;
+            }
+        }
+    };
+    std::thread first(writer, keys[0]);
+    std::thread second(writer, keys[1]);
+    std::thread scanner(maintenance);
+    first.join();
+    second.join();
+    scanner.join();
+    EXPECT_EQ(0, errors.load());
 }
 
 TEST_F(MetaLocalBackendTest, TestSingleLocationFastPathPreservesKeyStatusAndMetadata) {
@@ -320,7 +384,7 @@ TEST_F(MetaLocalBackendTest, TestInit) {
 TEST_F(MetaLocalBackendTest, TestParseStorageUri) {
     // URI with all parameters specified
     auto config = std::make_shared<MetaStorageBackendConfig>();
-    config->SetStorageUri("local://?capacity=1024&num_shard_bits=4&sample_times=50");
+    config->SetStorageUri("local://?capacity=1024&num_shard_bits=4&num_item_mutex_shard_bits=5&sample_times=50");
 
     auto backend = std::make_shared<MetaLocalBackend>();
     ASSERT_EQ(EC_OK, backend->Init("test_instance_uri_all", config));
@@ -328,6 +392,7 @@ TEST_F(MetaLocalBackendTest, TestParseStorageUri) {
     ASSERT_EQ(1024 * 1024 * 1024, backend->cache_->GetCapacity());
     uint32_t expected_shard_mask = (1 << 4) - 1;
     ASSERT_EQ(expected_shard_mask, backend->shard_mask_);
+    ASSERT_EQ(31u, backend->item_mutex_shard_mask_);
     ASSERT_EQ(50, backend->sample_times_);
 
     // Verify the backend is functional with custom parameters
@@ -348,6 +413,8 @@ TEST_F(MetaLocalBackendTest, TestParseStorageUriEmpty) {
     ASSERT_EQ(META_LOCAL_BACKEND_DEFAULT_CAPACITY * 1024 * 1024, backend->cache_->GetCapacity());
     uint32_t expected_shard_mask = (1 << META_LOCAL_BACKEND_DEFAULT_NUM_SHARD_BITS) - 1;
     ASSERT_EQ(expected_shard_mask, backend->shard_mask_);
+    ASSERT_EQ((1u << META_LOCAL_BACKEND_DEFAULT_NUM_ITEM_MUTEX_SHARD_BITS) - 1,
+              backend->item_mutex_shard_mask_);
     ASSERT_EQ(META_LOCAL_BACKEND_DEFAULT_SAMPLE_TIMES, backend->sample_times_);
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), PutWithFieldMaps(backend.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
@@ -363,6 +430,24 @@ TEST_F(MetaLocalBackendTest, TestParseStorageUriInvalidFormat) {
 
     auto backend = std::make_shared<MetaLocalBackend>();
     ASSERT_EQ(EC_BADARGS, backend->Init("test_instance_uri_invalid", config));
+}
+
+TEST_F(MetaLocalBackendTest, TestInvalidItemMutexShardBits) {
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    auto backend = std::make_shared<MetaLocalBackend>();
+    config->SetStorageUri("local://?num_item_mutex_shard_bits=-1");
+    EXPECT_EQ(EC_BADARGS, backend->Init("test_item_mutex_bits", config));
+    config->SetStorageUri("local://?num_item_mutex_shard_bits=25");
+    EXPECT_EQ(EC_BADARGS, backend->Init("test_item_mutex_bits", config));
+}
+
+TEST_F(MetaLocalBackendTest, TestItemMutexShardBitsAbovePreviousLimit) {
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    config->SetStorageUri("local://?num_item_mutex_shard_bits=20");
+
+    auto backend = std::make_shared<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("test_item_mutex_bits", config));
+    EXPECT_EQ((1u << 20) - 1, backend->item_mutex_shard_mask_);
 }
 
 TEST_F(MetaLocalBackendTest, TestPut) {
@@ -742,17 +827,17 @@ TEST_F(MetaLocalBackendTest, TestMaintenanceTargetReadAndDeleteDoNotTouchAccessT
     };
     const int64_t access_before = get_last_access_time();
     const size_t usage_before = backend->GetMemUsage();
-    auto get_location_usage = [backend]() {
-        size_t location_usage = 0;
+    auto get_item_usage = [backend]() {
+        size_t item_usage = 0;
         backend->cache_->ApplyToEntryNoTouch(
             MetaLocalBackend::KeyToView(1),
-            [&location_usage](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
-                location_usage = static_cast<MetaMemCacheItem *>(value)->GetLocationStore().EstimateUsage();
+            [&item_usage](Cache::ObjectPtr value, size_t, const Cache::CacheItemHelper *) -> ssize_t {
+                item_usage = static_cast<MetaMemCacheItem *>(value)->Size();
                 return 0;
             });
-        return location_usage;
+        return item_usage;
     };
-    const size_t location_usage_before = get_location_usage();
+    const size_t item_usage_before = get_item_usage();
 
     LocationsPerKey selected;
     ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}),
@@ -771,9 +856,9 @@ TEST_F(MetaLocalBackendTest, TestMaintenanceTargetReadAndDeleteDoNotTouchAccessT
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->DeleteLocationsForMaintenance(nullptr, {1}, {{"loc_first"}}));
     EXPECT_EQ(access_before, get_last_access_time());
-    const size_t location_usage_after = get_location_usage();
-    EXPECT_EQ(static_cast<ssize_t>(usage_before) + static_cast<ssize_t>(location_usage_after) -
-                  static_cast<ssize_t>(location_usage_before),
+    const size_t item_usage_after = get_item_usage();
+    EXPECT_EQ(static_cast<ssize_t>(usage_before) + static_cast<ssize_t>(item_usage_after) -
+                  static_cast<ssize_t>(item_usage_before),
               static_cast<ssize_t>(backend->GetMemUsage()));
     LocationsPerKey remaining;
     ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_NOENT, EC_OK}}),
@@ -1280,11 +1365,11 @@ TEST_F(MetaLocalBackendTest, TestMetaMemCacheItemFieldMap) {
     MetaMemCacheItem *item = MetaMemCacheItem::Create(locations, properties);
     ASSERT_NE(nullptr, item);
     PropertyMap projected_properties;
-    item->GetPropertyStore().CopyAll(projected_properties);
+    item->CopyAllProperties(projected_properties);
     ASSERT_EQ("test://some/long/uri/path/for/testing", projected_properties.at(PROPERTY_URI));
     ASSERT_EQ("1234567890", projected_properties.at(PROPERTY_HIT_COUNT));
     ASSERT_EQ(2u, projected_properties.size());
-    ASSERT_TRUE(item->GetLocationStore().Empty());
+    ASSERT_TRUE(item->LocationsEmpty());
     // Size should be at least sizeof(MetaMemCacheItem) plus string heap overhead
     ASSERT_GE(item->Size(), sizeof(MetaMemCacheItem));
 
@@ -1294,9 +1379,9 @@ TEST_F(MetaLocalBackendTest, TestMetaMemCacheItemFieldMap) {
     MetaMemCacheItem *empty_item = MetaMemCacheItem::Create({}, {});
     ASSERT_NE(nullptr, empty_item);
     projected_properties.clear();
-    empty_item->GetPropertyStore().CopyAll(projected_properties);
+    empty_item->CopyAllProperties(projected_properties);
     ASSERT_TRUE(projected_properties.empty());
-    ASSERT_TRUE(empty_item->GetLocationStore().Empty());
+    ASSERT_TRUE(empty_item->LocationsEmpty());
     ASSERT_EQ(sizeof(MetaMemCacheItem), empty_item->Size());
 
     MetaMemCacheItem::Deleter(empty_item, nullptr);
@@ -1306,7 +1391,7 @@ TEST_F(MetaLocalBackendTest, TestMetaMemCacheItemFieldMap) {
     MetaMemCacheItem *custom_item = MetaMemCacheItem::Create({}, custom_props);
     ASSERT_NE(nullptr, custom_item);
     projected_properties.clear();
-    custom_item->GetPropertyStore().CopyAll(projected_properties);
+    custom_item->CopyAllProperties(projected_properties);
     ASSERT_EQ(3u, projected_properties.size());
     ASSERT_EQ("custom_value", projected_properties.at("custom_key"));
 
@@ -1323,29 +1408,62 @@ TEST_F(MetaLocalBackendTest, TestMetaMemCacheItemNormalizesLocationBuckets) {
     MetaMemCacheItem *copied_single = MetaMemCacheItem::Create(one_location, {});
     ASSERT_NE(nullptr, copied_single);
     EXPECT_EQ(first, copied_single->locations_.inline_location_);
-    EXPECT_EQ(nullptr, copied_single->locations_.multiple_locations_);
+    EXPECT_EQ(nullptr, copied_single->extra_);
     MetaMemCacheItem::Deleter(copied_single, nullptr);
 
     CacheLocationMap locations{{first->id(), first}, {second->id(), second}};
     MetaMemCacheItem *copied = MetaMemCacheItem::Create(locations, {});
     ASSERT_NE(nullptr, copied);
-    ASSERT_NE(nullptr, copied->locations_.multiple_locations_);
-    EXPECT_LE(copied->locations_.multiple_locations_->bucket_count(), 2u);
+    ASSERT_NE(nullptr, copied->extra_);
+    EXPECT_LE(copied->extra_->multiple_locations->bucket_count(), 2u);
     MetaMemCacheItem::Deleter(copied, nullptr);
 
     MetaMemCacheItem *single = MetaMemCacheItem::CreateSingleLocation(first->id(), first);
     ASSERT_NE(nullptr, single);
     EXPECT_EQ(first, single->locations_.inline_location_);
-    EXPECT_EQ(nullptr, single->locations_.multiple_locations_);
+    EXPECT_EQ(nullptr, single->extra_);
     MetaMemCacheItem::Deleter(single, nullptr);
+}
+
+TEST_F(MetaLocalBackendTest, TestItemExtraChargeAndReleaseAcrossBothColdStates) {
+    auto first = std::make_shared<CacheLocation>();
+    first->set_id("first");
+    auto second = std::make_shared<CacheLocation>();
+    second->set_id("second");
+    auto *item = MetaMemCacheItem::CreateSingleLocation(first->id(), first);
+    const size_t base_size = item->Size();
+    EXPECT_EQ(nullptr, item->extra_);
+
+    ssize_t delta = item->UpsertLocation(second->id(), second);
+    EXPECT_EQ(static_cast<ssize_t>(item->Size()) - static_cast<ssize_t>(base_size), delta);
+    ASSERT_NE(nullptr, item->extra_);
+    ASSERT_NE(nullptr, item->extra_->multiple_locations);
+
+    const size_t with_locations = item->Size();
+    delta = item->MergeProperties({{PROPERTY_PREV_BLOCK_KEY, "001"}});
+    EXPECT_EQ(static_cast<ssize_t>(item->Size()) - static_cast<ssize_t>(with_locations), delta);
+    ASSERT_NE(nullptr, item->extra_->extra_properties);
+
+    const size_t with_property = item->Size();
+    delta = item->EraseLocations({second->id()});
+    EXPECT_EQ(static_cast<ssize_t>(item->Size()) - static_cast<ssize_t>(with_property), delta);
+    ASSERT_NE(nullptr, item->extra_);
+    EXPECT_EQ(nullptr, item->extra_->multiple_locations);
+
+    const size_t with_fallback = item->Size();
+    delta = item->MergeProperties({{PROPERTY_PREV_BLOCK_KEY, "1"}});
+    EXPECT_EQ(static_cast<ssize_t>(item->Size()) - static_cast<ssize_t>(with_fallback), delta);
+    EXPECT_EQ(nullptr, item->extra_);
+    EXPECT_EQ(base_size, item->Size());
+    MetaMemCacheItem::Deleter(item, nullptr);
 }
 
 TEST_F(MetaLocalBackendTest, TestLocalPropertyStoreCompactsCanonicalPrevKeyValues) {
     LocalPropertyStore absent;
     PropertyMap absent_projection;
-    absent.CopySelected({PROPERTY_PREV_BLOCK_KEY}, absent_projection);
+    absent.CopySelected({PROPERTY_PREV_BLOCK_KEY}, absent_projection, nullptr);
     EXPECT_TRUE(absent_projection.empty());
-    absent.CopyAll(absent_projection);
+    absent.CopyAll(absent_projection, nullptr);
     EXPECT_TRUE(absent_projection.empty());
 
     const std::vector<std::string> values = {"",
@@ -1355,15 +1473,16 @@ TEST_F(MetaLocalBackendTest, TestLocalPropertyStoreCompactsCanonicalPrevKeyValue
                                              std::to_string(std::numeric_limits<KeyType>::max())};
     for (const auto &value : values) {
         LocalPropertyStore store;
-        EXPECT_EQ(0, store.Merge({{PROPERTY_PREV_BLOCK_KEY, value}}));
-        EXPECT_EQ(nullptr, store.extra_properties_);
+        std::unique_ptr<LocalItemExtra> extra;
+        EXPECT_EQ(0, store.Merge({{PROPERTY_PREV_BLOCK_KEY, value}}, extra));
+        EXPECT_EQ(nullptr, extra);
 
         PropertyMap selected;
-        store.CopySelected({PROPERTY_PREV_BLOCK_KEY}, selected);
+        store.CopySelected({PROPERTY_PREV_BLOCK_KEY}, selected, extra.get());
         EXPECT_EQ(PropertyMap({{PROPERTY_PREV_BLOCK_KEY, value}}), selected);
 
         PropertyMap all;
-        store.CopyAll(all);
+        store.CopyAll(all, extra.get());
         EXPECT_EQ(PropertyMap({{PROPERTY_PREV_BLOCK_KEY, value}}), all);
     }
 }
@@ -1372,64 +1491,67 @@ TEST_F(MetaLocalBackendTest, TestLocalPropertyStorePreservesFallbackAndMergeSema
     const std::vector<std::string> fallback_values = {"001", "+1", "-0", "9223372036854775808", "not-a-key"};
     for (const auto &value : fallback_values) {
         LocalPropertyStore store;
-        const ssize_t delta = store.Merge({{PROPERTY_PREV_BLOCK_KEY, value}});
+        std::unique_ptr<LocalItemExtra> extra;
+        const ssize_t delta = store.Merge({{PROPERTY_PREV_BLOCK_KEY, value}}, extra);
         EXPECT_GT(delta, 0);
-        ASSERT_NE(nullptr, store.extra_properties_);
+        ASSERT_NE(nullptr, extra->extra_properties);
 
         PropertyMap all;
-        store.CopyAll(all);
+        store.CopyAll(all, extra.get());
         EXPECT_EQ(PropertyMap({{PROPERTY_PREV_BLOCK_KEY, value}}), all);
     }
 
     LocalPropertyStore store;
-    size_t old_usage = store.EstimateUsage();
-    ssize_t delta = store.Merge({{PROPERTY_PREV_BLOCK_KEY, "001"}});
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
-    ASSERT_NE(nullptr, store.extra_properties_);
+    std::unique_ptr<LocalItemExtra> extra;
+    size_t old_usage = store.EstimateUsage(extra.get());
+    ssize_t delta = store.Merge({{PROPERTY_PREV_BLOCK_KEY, "001"}}, extra);
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
+    ASSERT_NE(nullptr, extra->extra_properties);
 
-    old_usage = store.EstimateUsage();
-    delta = store.Merge({{PROPERTY_PREV_BLOCK_KEY, "42"}});
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
-    EXPECT_EQ(nullptr, store.extra_properties_);
+    old_usage = store.EstimateUsage(extra.get());
+    delta = store.Merge({{PROPERTY_PREV_BLOCK_KEY, "42"}}, extra);
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
+    EXPECT_EQ(nullptr, extra->extra_properties);
 
-    store.Merge({{"other", "preserved"}});
-    store.Merge({{PROPERTY_PREV_BLOCK_KEY, "+42"}});
-    store.Merge({{PROPERTY_PREV_BLOCK_KEY, "43"}});
+    store.Merge({{"other", "preserved"}}, extra);
+    store.Merge({{PROPERTY_PREV_BLOCK_KEY, "+42"}}, extra);
+    store.Merge({{PROPERTY_PREV_BLOCK_KEY, "43"}}, extra);
     PropertyMap all;
-    store.CopyAll(all);
+    store.CopyAll(all, extra.get());
     EXPECT_EQ((PropertyMap{{PROPERTY_PREV_BLOCK_KEY, "43"}, {"other", "preserved"}}), all);
-    ASSERT_NE(nullptr, store.extra_properties_);
-    EXPECT_EQ(0u, store.extra_properties_->count(PROPERTY_PREV_BLOCK_KEY));
+    ASSERT_NE(nullptr, extra->extra_properties);
+    EXPECT_EQ(0u, extra->extra_properties->count(PROPERTY_PREV_BLOCK_KEY));
 }
 
 TEST_F(MetaLocalBackendTest, TestLocalPropertyStoreChargesRetainedValueCapacity) {
     LocalPropertyStore store;
+    std::unique_ptr<LocalItemExtra> extra;
     const std::string long_value(1024, 'x');
-    ASSERT_GT(store.Merge({{"other", long_value}}), 0);
-    ASSERT_NE(nullptr, store.extra_properties_);
+    ASSERT_GT(store.Merge({{"other", long_value}}, extra), 0);
+    ASSERT_NE(nullptr, extra->extra_properties);
 
-    const auto &entry = *store.extra_properties_->begin();
+    const auto &entry = *extra->extra_properties->begin();
     const size_t retained_capacity = entry.second.capacity();
     ASSERT_GE(retained_capacity, long_value.size());
     EXPECT_EQ(sizeof(PropertyMap) + sizeof(void *) * 4 + entry.first.capacity() + retained_capacity,
-              store.EstimateUsage());
-    const size_t old_usage = store.EstimateUsage();
+              store.EstimateUsage(extra.get()));
+    const size_t old_usage = store.EstimateUsage(extra.get());
 
-    const ssize_t delta = store.Merge({{"other", "x"}});
+    const ssize_t delta = store.Merge({{"other", "x"}}, extra);
 
-    EXPECT_EQ("x", store.extra_properties_->at("other"));
-    EXPECT_EQ(retained_capacity, store.extra_properties_->at("other").capacity());
+    EXPECT_EQ("x", extra->extra_properties->at("other"));
+    EXPECT_EQ(retained_capacity, extra->extra_properties->at("other").capacity());
     EXPECT_EQ(0, delta);
-    EXPECT_EQ(old_usage, store.EstimateUsage());
+    EXPECT_EQ(old_usage, store.EstimateUsage(extra.get()));
 
     const std::string larger_value(2048, 'y');
-    const ssize_t growth_delta = store.Merge({{"other", larger_value}});
-    const size_t grown_capacity = store.extra_properties_->at("other").capacity();
+    const ssize_t growth_delta = store.Merge({{"other", larger_value}}, extra);
+    const size_t grown_capacity = extra->extra_properties->at("other").capacity();
 
-    EXPECT_EQ(larger_value, store.extra_properties_->at("other"));
+    EXPECT_EQ(larger_value, extra->extra_properties->at("other"));
     EXPECT_GE(grown_capacity, larger_value.size());
     EXPECT_EQ(static_cast<ssize_t>(grown_capacity - retained_capacity), growth_delta);
-    EXPECT_EQ(old_usage + grown_capacity - retained_capacity, store.EstimateUsage());
+    EXPECT_EQ(old_usage + grown_capacity - retained_capacity, store.EstimateUsage(extra.get()));
 }
 
 TEST_F(MetaLocalBackendTest, TestCompactPrevKeyRoundTripsThroughBackend) {
@@ -1465,51 +1587,52 @@ TEST_F(MetaLocalBackendTest, TestLocalLocationStoreTransitionsBetweenInlineAndMa
     replacement->set_status(CLS_SERVING);
 
     LocalLocationStore store;
-    EXPECT_TRUE(store.Empty());
-    EXPECT_EQ(0u, store.Size());
+    std::unique_ptr<LocalItemExtra> extra;
+    EXPECT_TRUE(store.Empty(extra.get()));
+    EXPECT_EQ(0u, store.Size(extra.get()));
 
-    size_t old_usage = store.EstimateUsage();
-    ssize_t delta = store.Upsert(first->id(), first);
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
+    size_t old_usage = store.EstimateUsage(extra.get());
+    ssize_t delta = store.Upsert(first->id(), first, extra);
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
     EXPECT_EQ(first, store.inline_location_);
-    EXPECT_EQ(nullptr, store.multiple_locations_);
-    ASSERT_NE(nullptr, store.Find(first->id()));
-    EXPECT_EQ(first, *store.Find(first->id()));
+    EXPECT_EQ(nullptr, extra);
+    ASSERT_NE(nullptr, store.Find(first->id(), extra.get()));
+    EXPECT_EQ(first, *store.Find(first->id(), extra.get()));
 
-    old_usage = store.EstimateUsage();
-    delta = store.Upsert(second->id(), second);
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
+    old_usage = store.EstimateUsage(extra.get());
+    delta = store.Upsert(second->id(), second, extra);
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
     EXPECT_EQ(nullptr, store.inline_location_);
-    ASSERT_NE(nullptr, store.multiple_locations_);
-    EXPECT_LE(store.multiple_locations_->bucket_count(), 2u);
-    EXPECT_EQ(2u, store.Size());
+    ASSERT_NE(nullptr, extra->multiple_locations);
+    EXPECT_LE(extra->multiple_locations->bucket_count(), 2u);
+    EXPECT_EQ(2u, store.Size(extra.get()));
 
     CacheLocationVector retired;
     retired.reserve(1);
-    old_usage = store.EstimateUsage();
-    delta = store.Upsert(first->id(), replacement, &retired);
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
+    old_usage = store.EstimateUsage(extra.get());
+    delta = store.Upsert(first->id(), replacement, extra, &retired);
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
     ASSERT_EQ(1u, retired.size());
     EXPECT_EQ(first, retired.front());
-    ASSERT_NE(nullptr, store.Find(first->id()));
-    EXPECT_EQ(replacement, *store.Find(first->id()));
+    ASSERT_NE(nullptr, store.Find(first->id(), extra.get()));
+    EXPECT_EQ(replacement, *store.Find(first->id(), extra.get()));
 
-    old_usage = store.EstimateUsage();
-    delta = store.Erase({second->id()});
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
+    old_usage = store.EstimateUsage(extra.get());
+    delta = store.Erase({second->id()}, extra.get());
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
     EXPECT_EQ(replacement, store.inline_location_);
-    EXPECT_EQ(nullptr, store.multiple_locations_);
-    EXPECT_EQ(1u, store.Size());
+    EXPECT_EQ(nullptr, extra->multiple_locations);
+    EXPECT_EQ(1u, store.Size(extra.get()));
 
     CacheLocationMap projected;
-    store.CopyTo(projected);
+    store.CopyTo(projected, extra.get());
     EXPECT_EQ(CacheLocationMap({{first->id(), replacement}}), projected);
 
-    old_usage = store.EstimateUsage();
-    delta = store.Erase({first->id()});
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
-    EXPECT_TRUE(store.Empty());
-    EXPECT_EQ(0u, store.Size());
+    old_usage = store.EstimateUsage(extra.get());
+    delta = store.Erase({first->id()}, extra.get());
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
+    EXPECT_TRUE(store.Empty(extra.get()));
+    EXPECT_EQ(0u, store.Size(extra.get()));
 }
 
 TEST_F(MetaLocalBackendTest, TestLocalLocationStoreInlineUsageDoesNotDuplicateLocationId) {
@@ -1518,18 +1641,19 @@ TEST_F(MetaLocalBackendTest, TestLocalLocationStoreInlineUsageDoesNotDuplicateLo
     location->set_id(location_id);
 
     LocalLocationStore store;
-    const ssize_t delta = store.Upsert(location_id, location);
+    std::unique_ptr<LocalItemExtra> extra;
+    const ssize_t delta = store.Upsert(location_id, location, extra);
 
     const size_t expected_usage = location->EstimateMemUsage();
-    EXPECT_EQ(expected_usage, store.EstimateUsage());
+    EXPECT_EQ(expected_usage, store.EstimateUsage(extra.get()));
     EXPECT_EQ(static_cast<ssize_t>(expected_usage), delta);
 
     auto second = std::make_shared<CacheLocation>();
     second->set_id("second");
-    store.Upsert(second->id(), second);
-    store.Erase({second->id()});
+    store.Upsert(second->id(), second, extra);
+    store.Erase({second->id()}, extra.get());
     EXPECT_EQ(location, store.inline_location_);
-    EXPECT_EQ(expected_usage, store.EstimateUsage());
+    EXPECT_EQ(expected_usage, store.EstimateUsage(extra.get()));
 }
 
 TEST_F(MetaLocalBackendTest, TestLocalLocationStorePreservesEmptyId) {
@@ -1539,27 +1663,28 @@ TEST_F(MetaLocalBackendTest, TestLocalLocationStorePreservesEmptyId) {
     second->set_id("second");
 
     LocalLocationStore store;
-    size_t old_usage = store.EstimateUsage();
-    ssize_t delta = store.Upsert(empty_id_location->id(), empty_id_location);
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
-    EXPECT_EQ(1u, store.Size());
-    ASSERT_NE(nullptr, store.Find(""));
-    EXPECT_EQ(empty_id_location, *store.Find(""));
+    std::unique_ptr<LocalItemExtra> extra;
+    size_t old_usage = store.EstimateUsage(extra.get());
+    ssize_t delta = store.Upsert(empty_id_location->id(), empty_id_location, extra);
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
+    EXPECT_EQ(1u, store.Size(extra.get()));
+    ASSERT_NE(nullptr, store.Find("", extra.get()));
+    EXPECT_EQ(empty_id_location, *store.Find("", extra.get()));
 
-    old_usage = store.EstimateUsage();
-    delta = store.Upsert(second->id(), second);
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
-    EXPECT_EQ(2u, store.Size());
+    old_usage = store.EstimateUsage(extra.get());
+    delta = store.Upsert(second->id(), second, extra);
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
+    EXPECT_EQ(2u, store.Size(extra.get()));
 
-    old_usage = store.EstimateUsage();
-    delta = store.Erase({second->id()});
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
-    EXPECT_EQ(1u, store.Size());
-    ASSERT_NE(nullptr, store.Find(""));
-    EXPECT_EQ(empty_id_location, *store.Find(""));
+    old_usage = store.EstimateUsage(extra.get());
+    delta = store.Erase({second->id()}, extra.get());
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
+    EXPECT_EQ(1u, store.Size(extra.get()));
+    ASSERT_NE(nullptr, store.Find("", extra.get()));
+    EXPECT_EQ(empty_id_location, *store.Find("", extra.get()));
 
     CacheLocationMap projected;
-    store.CopyTo(projected);
+    store.CopyTo(projected, extra.get());
     EXPECT_EQ(CacheLocationMap({{"", empty_id_location}}), projected);
 }
 
@@ -1572,46 +1697,48 @@ TEST_F(MetaLocalBackendTest, TestLocalLocationStoreIncrementalChargeForBulkAndEr
     }
 
     LocalLocationStore store;
-    size_t old_usage = store.EstimateUsage();
-    ssize_t delta = store.Merge(locations);
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
-    EXPECT_EQ(3u, store.Size());
+    std::unique_ptr<LocalItemExtra> extra;
+    size_t old_usage = store.EstimateUsage(extra.get());
+    ssize_t delta = store.Merge(locations, extra);
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
+    EXPECT_EQ(3u, store.Size(extra.get()));
 
     auto fourth = std::make_shared<CacheLocation>();
     fourth->set_id("fourth");
-    old_usage = store.EstimateUsage();
-    delta = store.Upsert(fourth->id(), fourth);
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
-    EXPECT_EQ(4u, store.Size());
+    old_usage = store.EstimateUsage(extra.get());
+    delta = store.Upsert(fourth->id(), fourth, extra);
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
+    EXPECT_EQ(4u, store.Size(extra.get()));
 
-    old_usage = store.EstimateUsage();
-    delta = store.Erase({"fourth", "fourth", "missing"});
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
-    EXPECT_EQ(3u, store.Size());
+    old_usage = store.EstimateUsage(extra.get());
+    delta = store.Erase({"fourth", "fourth", "missing"}, extra.get());
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
+    EXPECT_EQ(3u, store.Size(extra.get()));
 
-    old_usage = store.EstimateUsage();
-    delta = store.Erase({"first", "second", "third"});
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
-    EXPECT_TRUE(store.Empty());
+    old_usage = store.EstimateUsage(extra.get());
+    delta = store.Erase({"first", "second", "third"}, extra.get());
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
+    EXPECT_TRUE(store.Empty(extra.get()));
 }
 
 TEST_F(MetaLocalBackendTest, TestLocalPropertyStoreIncrementalChargeForExtraProperties) {
     LocalPropertyStore store;
+    std::unique_ptr<LocalItemExtra> extra;
 
-    size_t old_usage = store.EstimateUsage();
-    ssize_t delta = store.Merge({{"property", "long-value"}});
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
+    size_t old_usage = store.EstimateUsage(extra.get());
+    ssize_t delta = store.Merge({{"property", "long-value"}}, extra);
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
 
-    old_usage = store.EstimateUsage();
-    delta = store.Merge({{"property", "v"}, {PROPERTY_PREV_BLOCK_KEY, "not-a-key"}});
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
+    old_usage = store.EstimateUsage(extra.get());
+    delta = store.Merge({{"property", "v"}, {PROPERTY_PREV_BLOCK_KEY, "not-a-key"}}, extra);
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
 
-    old_usage = store.EstimateUsage();
-    delta = store.Merge({{PROPERTY_PREV_BLOCK_KEY, "42"}});
-    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage()) - static_cast<ssize_t>(old_usage), delta);
+    old_usage = store.EstimateUsage(extra.get());
+    delta = store.Merge({{PROPERTY_PREV_BLOCK_KEY, "42"}}, extra);
+    EXPECT_EQ(static_cast<ssize_t>(store.EstimateUsage(extra.get())) - static_cast<ssize_t>(old_usage), delta);
 
     PropertyMap projected;
-    store.CopyAll(projected);
+    store.CopyAll(projected, extra.get());
     EXPECT_EQ((PropertyMap{{"property", "v"}, {PROPERTY_PREV_BLOCK_KEY, "42"}}), projected);
 }
 
@@ -2396,9 +2523,10 @@ TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
     std::string loc_value_b(512, 'y'); // non-JSON value, stored as-is
     std::string field_name_b_full = PROPERTY_LOCATION_PREFIX + loc_id_b;
     // SplitFieldMaps creates a CacheLocation with id=loc_id_b and no specs.
-    // EstimateMemUsage = sizeof(CacheLocation) + loc_id_b.size(). The inline store
-    // reuses that immutable id instead of owning a second copy.
-    size_t loc_mem_usage = sizeof(CacheLocation) + loc_id_b.size();
+    // The inline store reuses the immutable id rather than owning a second copy.
+    CacheLocation location_charge;
+    location_charge.set_id(loc_id_b);
+    size_t loc_mem_usage = location_charge.EstimateMemUsage();
     ssize_t expected_delta_upsert = static_cast<ssize_t>(loc_mem_usage);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
               UpsertWithFieldMaps(backend.get(), {1}, {{{field_name_b_full, loc_value_b}}}));

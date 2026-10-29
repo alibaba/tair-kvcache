@@ -1147,15 +1147,18 @@ ErrorCode CacheManager::ReportOptimizerEvent(RequestContext *request_context,
     return EC_OK;
 }
 
-void CacheManager::FillEmptyLocationSpecs(const std::vector<LocationSpecInfo> &location_spec_infos,
+void CacheManager::FillEmptyLocationSpecs(const InstanceInfoConstPtr &instance_info,
                                           CacheLocationVector &locations) {
+    const auto &spec_infos = instance_info->location_spec_infos();
     for (auto &location : locations) {
         if (!location || location->spec_size() == 0) {
             auto mutable_loc =
                 location ? std::make_shared<CacheLocation>(*location) : std::make_shared<CacheLocation>();
-            mutable_loc->set_spec_size(location_spec_infos.size());
-            for (auto &spec_info : location_spec_infos) {
-                mutable_loc->push_location_spec(LocationSpec(spec_info.name(), ""));
+            mutable_loc->set_spec_size(spec_infos.size());
+            for (const auto &spec_info : spec_infos) {
+                LocationSpec spec;
+                spec.set_name(SharedLocationSpecName(instance_info, &spec_info.name()));
+                mutable_loc->push_location_spec(std::move(spec));
             }
             location = std::move(mutable_loc);
         }
@@ -1284,7 +1287,7 @@ CacheManager::GetCacheLocationsByBackend(RequestContext *request_context,
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_INSTANCE_NOT_EXIST, BatchLocationsView, "instance not found");
     }
     for (auto &key_locs : locations_per_key) {
-        FillEmptyLocationSpecs(instance_info->location_spec_infos(), key_locs);
+        FillEmptyLocationSpecs(instance_info, key_locs);
     }
     if (!location_spec_names.empty()) {
         for (size_t i = 0; i < locations_per_key.size(); ++i) {
@@ -2571,7 +2574,7 @@ ErrorCode CacheManager::GenWriteLocationOnStorage(RequestContext *request_contex
         cache_location->mutable_location_specs().reserve(uris.size());
         for (const auto &[data_storage_uri_idx, location_spec_info] : uris) {
             LocationSpec location_spec;
-            location_spec.set_name(location_spec_info->name());
+            location_spec.set_name(SharedLocationSpecName(instance_info, &location_spec_info->name()));
             location_spec.set_uri(allocated_uris[data_storage_uri_idx].ToUriString());
             cache_location->push_location_spec(std::move(location_spec));
         }
@@ -2852,7 +2855,7 @@ bool ParseInt64(const std::string &s, int64_t &out) {
 }
 
 struct ValidatedEventLocationSpec {
-    std::string_view name;
+    SharedLocationSpecName name;
     std::string_view raw_uri;
     // Canonical ReportEvent URIs never need the heavyweight StandardUri
     // object. Allocate it only for the compatibility fallback so the common
@@ -2881,7 +2884,6 @@ bool ValidateEventLocationSpec(const proto::meta::LocationSpec &spec, ValidatedE
     if (spec.name().empty()) {
         return false;
     }
-    out.name = spec.name();
     out.raw_uri = spec.uri();
     if (SnapshotUriUtils::ParseCanonicalUriForSnapshotAppend(out.raw_uri, out.canonical_uri)) {
         out.is_canonical_uri = true;
@@ -3125,10 +3127,10 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         response_status->set_message("instance info not found for instance: " + instance_id);
         return EC_INSTANCE_NOT_EXIST;
     }
-    std::unordered_set<std::string_view> registered_spec_names;
+    std::unordered_map<std::string_view, SharedLocationSpecName> registered_spec_names;
     registered_spec_names.reserve(instance_info->location_spec_infos().size());
     for (const auto &spec_info : instance_info->location_spec_infos()) {
-        registered_spec_names.insert(spec_info.name());
+        registered_spec_names.emplace(spec_info.name(), SharedLocationSpecName(instance_info, &spec_info.name()));
     }
 
     const int events_size = request->events_size();
@@ -3484,7 +3486,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
             std::uint64_t event_total_size = 0;
             for (const auto &spec : params.specs()) {
-                if (registered_spec_names.find(spec.name()) == registered_spec_names.end() ||
+                const auto name_it = registered_spec_names.find(spec.name());
+                if (name_it == registered_spec_names.end() ||
                     (params.specs_size() > 1 && !seen_spec_names.insert(std::string_view(spec.name())).second)) {
                     per_item_ec[i] = EC_BADARGS;
                     break;
@@ -3495,6 +3498,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     per_item_ec[i] = EC_BADARGS;
                     break;
                 }
+                validated_spec.name = name_it->second;
                 event_total_size += validated_spec.size;
                 specs.Push(std::move(validated_spec), params.specs_size());
             }
@@ -3547,7 +3551,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             for (size_t spec_index = 0; spec_index < specs.Size(); ++spec_index) {
                 auto &spec = specs.At(spec_index);
                 LocationSpec versioned_spec;
-                versioned_spec.set_name_view(spec.name);
+                versioned_spec.set_name(std::move(spec.name));
                 versioned_spec.set_uri(std::move(spec.versioned_uri));
                 apply_delta_spec(location_mutation, true, std::move(versioned_spec), spec.size);
             }
@@ -3606,7 +3610,9 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 request_created_generation = true;
             }
             for (const auto &spec_name : params.spec_names()) {
-                apply_delta_spec(location_mutation, false, LocationSpec(spec_name, ""));
+                LocationSpec spec;
+                spec.set_name(registered_spec_names.find(spec_name)->second);
+                apply_delta_spec(location_mutation, false, std::move(spec));
             }
             if (event_mutation_index == kInvalidDeltaIndex) {
                 location_mutation.first_event_materialized = true;
@@ -3649,7 +3655,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                     seen_spec_names.reserve(block.specs_size());
                 }
                 for (const auto &spec : block.specs()) {
-                    if (registered_spec_names.find(spec.name()) == registered_spec_names.end() ||
+                    const auto name_it = registered_spec_names.find(spec.name());
+                    if (name_it == registered_spec_names.end() ||
                         (block.specs_size() > 1 && !seen_spec_names.insert(std::string_view(spec.name())).second)) {
                         per_item_ec[i] = EC_BADARGS;
                         break;
@@ -3660,6 +3667,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                         per_item_ec[i] = EC_BADARGS;
                         break;
                     }
+                    validated_spec.name = name_it->second;
                     snapshot_total_size += validated_spec.size;
                     specs.Push(std::move(validated_spec), block.specs_size());
                 }
@@ -3714,7 +3722,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                         break;
                     }
                     LocationSpec versioned_spec;
-                    versioned_spec.set_name_view(spec.name);
+                    versioned_spec.set_name(std::move(spec.name));
                     versioned_spec.set_uri(std::move(spec.versioned_uri));
                     versioned_specs.push_back(std::move(versioned_spec));
                 }
@@ -4628,7 +4636,7 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
             request_context->error_tracer()->AddErrorMsg("instance not found");
             RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "instance not found");
         }
-        FillEmptyLocationSpecs(instance_info->location_spec_infos(), cache_locations);
+        FillEmptyLocationSpecs(instance_info, cache_locations);
     }
     return ec;
 }
