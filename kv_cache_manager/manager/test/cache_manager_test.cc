@@ -1492,6 +1492,42 @@ TEST_F(CacheManagerTest, TestRemoveInstanceDuringMetaRecoveryTransition) {
     EXPECT_EQ(nullptr, cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance"));
 }
 
+TEST_F(CacheManagerTest, TestRemoveInstanceKeepsRegistrationWhileCopyPrepareIsCancelling) {
+    const std::string instance_id = "remove_active_copy";
+    ASSERT_EQ(EC_OK,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               {}).first);
+    const auto original = registry_manager_->GetInstanceInfo(request_context_.get(), instance_id);
+    auto manager = cache_manager_->migration_manager_;
+    MigrationManager::CopyTaskContext task;
+    task.instance_id = instance_id;
+    task.block_key = 123;
+    task.copy_execution_mode = MigrationCopyExecutionMode::ASYNC_REQUIRED;
+    task.state = MigrationManager::CopyTaskState::kPreparing;
+    {
+        std::lock_guard<std::mutex> lock(manager->task_mutex_);
+        manager->active_tasks_by_instance_[instance_id][task.block_key] = task;
+    }
+
+    // Cancellation does not release a preparation still owned by its submitter.
+    // The bounded drain must leave the instance registered until that owner exits.
+    EXPECT_EQ(EC_TIMEOUT, cache_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
+    EXPECT_EQ(original, registry_manager_->GetInstanceInfo(request_context_.get(), instance_id));
+    {
+        std::lock_guard<std::mutex> lock(manager->task_mutex_);
+        EXPECT_EQ(MigrationManager::CopyTaskState::kPrepareCancelling,
+                  manager->active_tasks_by_instance_.at(instance_id).at(task.block_key).state);
+        manager->active_tasks_by_instance_.erase(instance_id);
+    }
+    EXPECT_EQ(EC_OK, cache_manager_->RemoveInstance(request_context_.get(), "default", instance_id));
+    EXPECT_EQ(nullptr, registry_manager_->GetInstanceInfo(request_context_.get(), instance_id));
+}
+
 // RemoveInstance 的 per-instance draining 不得读写全局 Reclaimer pause 状态。
 // Registry stub 在 drain 与删除的边界观察中间状态：false 场景验证删除 A 不会暂停
 // 其他 instance；true 场景验证错误返回不会 Resume 掉 Server 生命周期的既有暂停。

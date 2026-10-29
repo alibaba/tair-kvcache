@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
@@ -50,6 +51,10 @@ struct PlanExecuteResult {
     // True only when every failure in this result has already been logged.
     // Callers can retain result metrics without repeating the diagnostics.
     bool error_logged{false};
+    // Sync operations use the safe defaults below.  Native async Copy overrides
+    // them from the backend result.  ErrorCode never authorizes target reuse.
+    bool terminal{true};
+    bool safe_to_reuse_dst{true};
 };
 
 struct AsyncDeleteSubmitResult {
@@ -108,6 +113,11 @@ struct CacheLocationCopyRequest {
     std::chrono::microseconds delay{std::chrono::seconds(0)};
 };
 
+struct AsyncCopyExecuteSubmitResult {
+    AsyncCopySubmitResult submit_result;
+    std::future<PlanExecuteResult> future;
+};
+
 // 任务类别同时定义 ready task 的调度优先级。Migration continuation 已经持有活跃
 // reservation/WRITING 目标，必须先于新的 Prepare 收敛；所有 migration 类别共同受
 // 进程级 worker budget 约束。
@@ -148,6 +158,10 @@ public:
     std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task, std::shared_ptr<MetaIndexer> indexer);
     std::future<PlanExecuteResult> Submit(const CacheLocationDelRequest &task);
     std::future<PlanExecuteResult> Submit(const CacheLocationCopyRequest &task);
+    AsyncCopyExecuteSubmitResult SubmitAsyncCopy(const CacheLocationCopyRequest &task,
+                                                 const std::string &operation_id,
+                                                 const AsyncCopyOptions &options);
+    ErrorCode RequestCancelAsyncCopy(const std::string &storage_name, const std::string &operation_id);
     AsyncDeleteSubmitResult SubmitAsync(const CacheMetaDelRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheLocationDelRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const EventReportMetadataDelRequest &task);

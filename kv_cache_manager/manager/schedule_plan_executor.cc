@@ -1299,4 +1299,85 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationC
     return future;
 }
 
+AsyncCopyExecuteSubmitResult SchedulePlanExecutor::SubmitAsyncCopy(const CacheLocationCopyRequest &task,
+                                                                   const std::string &operation_id,
+                                                                   const AsyncCopyOptions &options) {
+    AsyncCopyExecuteSubmitResult result;
+    auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
+    result.future = promise->get_future();
+    auto completion = std::make_shared<PromiseCompletion>(promise);
+    if (stop_) {
+        result.submit_result.status = EC_ERROR;
+        result.submit_result.operation_id = operation_id;
+        result.submit_result.detail = "SchedulePlanExecutor stopped";
+        completion->Complete(EC_ERROR, result.submit_result.detail);
+        return result;
+    }
+    if (task.src_uris.empty() || task.src_uris.size() != task.dst_uris.size() || operation_id.empty()) {
+        result.submit_result.status = EC_BADARGS;
+        result.submit_result.operation_id = operation_id;
+        result.submit_result.detail = "invalid asynchronous copy request";
+        completion->Complete(EC_BADARGS, result.submit_result.detail);
+        return result;
+    }
+
+    auto request_context = std::make_shared<RequestContext>("location_async_copy_submit");
+    result.submit_result = data_storage_manager_->CopyAsync(
+        request_context.get(),
+        task.exec_storage_name,
+        task.src_uris,
+        task.dst_uris,
+        operation_id,
+        options,
+        [completion, expected_items = task.src_uris.size()](AsyncCopyBatchResult batch_result) mutable {
+            PlanExecuteResult plan_result;
+            plan_result.status = batch_result.status;
+            plan_result.error_message = std::move(batch_result.detail);
+            plan_result.terminal = batch_result.items.size() == expected_items &&
+                                   std::all_of(batch_result.items.begin(), batch_result.items.end(), [](const auto &x) {
+                                       return x.terminal;
+                                   });
+            plan_result.safe_to_reuse_dst = batch_result.items.size() == expected_items &&
+                                            std::all_of(batch_result.items.begin(),
+                                                        batch_result.items.end(),
+                                                        [](const auto &x) { return x.safe_to_reuse_dst; });
+            if (batch_result.items.size() != expected_items) {
+                plan_result.status = EC_MISMATCH;
+                plan_result.terminal = false;
+                plan_result.safe_to_reuse_dst = false;
+                plan_result.error_message = StringUtil::FormatString(
+                    "async Copy returned %zu items, expected %zu", batch_result.items.size(), expected_items);
+            } else if (batch_result.status != EC_OK) {
+                // Item-level success cannot override an aggregate backend
+                // failure, including an unknown overall completion result.
+                plan_result.status = batch_result.status;
+            } else if (batch_result.AllSucceeded()) {
+                plan_result.status = EC_OK;
+            } else if (plan_result.terminal && plan_result.safe_to_reuse_dst) {
+                plan_result.status = EC_PARTIAL_OK;
+            } else {
+                plan_result.status = EC_ERROR;
+            }
+            completion->Complete(std::move(plan_result));
+        });
+
+    if (!result.submit_result.accepted) {
+        PlanExecuteResult rejected;
+        rejected.status = result.submit_result.status;
+        rejected.error_message = result.submit_result.detail;
+        rejected.terminal = !result.submit_result.acceptance_unknown;
+        rejected.safe_to_reuse_dst = !result.submit_result.acceptance_unknown;
+        completion->Complete(std::move(rejected));
+    }
+    return result;
+}
+
+ErrorCode SchedulePlanExecutor::RequestCancelAsyncCopy(const std::string &storage_name,
+                                                       const std::string &operation_id) {
+    if (stop_ || !data_storage_manager_) {
+        return EC_ERROR;
+    }
+    return data_storage_manager_->RequestCancelAsyncCopy(storage_name, operation_id);
+}
+
 } // namespace kv_cache_manager

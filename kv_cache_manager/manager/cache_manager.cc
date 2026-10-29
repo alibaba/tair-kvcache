@@ -1905,7 +1905,7 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
         return result;
     }
     const auto cache_config = instance_group->cache_config();
-    const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
+    const auto configured_copy_concurrency = cache_config->effective_migration_copy_max_concurrency();
     const std::size_t copy_max_concurrency =
         configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
     int64_t mark_timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;

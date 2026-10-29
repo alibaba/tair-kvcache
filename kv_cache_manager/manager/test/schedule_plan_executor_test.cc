@@ -2726,3 +2726,141 @@ TEST_F(SchedulePlanExecutorTest, TestAuthoritativeAdmissionRefreshesCachedMetada
     ASSERT_EQ(1u, persistent_locations.size());
     EXPECT_TRUE(persistent_results.front() == EC_NOENT || persistent_locations.front().empty());
 }
+
+namespace {
+class MemoryAsyncCopyBackend : public DataStorageBackend {
+public:
+    MemoryAsyncCopyBackend() : DataStorageBackend(nullptr) {}
+    DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_DUMMY; }
+    bool Available() override { return true; }
+    double GetStorageUsageRatio(const std::string &) const override { return 0; }
+    ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
+    ErrorCode Close() override { return EC_OK; }
+    std::vector<std::pair<ErrorCode, DataStorageUri>>
+    Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override {
+        return {};
+    }
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &uris, const std::string &, std::function<void()>) override {
+        return std::vector<ErrorCode>(uris.size(), EC_ERROR);
+    }
+    std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<bool>(uris.size(), true);
+    }
+    std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<ErrorCode>(uris.size(), EC_OK);
+    }
+    std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override {
+        return std::vector<ErrorCode>(uris.size(), EC_OK);
+    }
+    bool SupportsAsyncCopy() const override { return true; }
+    AsyncCopySubmitResult CopyAsync(const std::vector<DataStorageUri> &,
+                                     const std::vector<DataStorageUri> &,
+                                     const std::string &operation_id,
+                                     const std::string &,
+                                     const AsyncCopyOptions &,
+                                     AsyncCopyCompletion completion) override {
+        completion_ = std::move(completion);
+        AsyncCopySubmitResult accepted;
+        accepted.status = EC_OK;
+        accepted.accepted = true;
+        accepted.operation_id = operation_id;
+        return accepted;
+    }
+    AsyncCopyCompletion completion_;
+};
+} // namespace
+
+TEST_F(SchedulePlanExecutorTest, TestMemoryAsyncCopyHandoffDoesNotWaitOrRequireAcceptanceChannel) {
+    auto backend = std::make_shared<MemoryAsyncCopyBackend>();
+    data_storage_manager_->storage_map_["memory_async"] = backend;
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationCopyRequest request{
+        .instance_id = kTestInstanceName,
+        .block_key = 1,
+        .exec_storage_name = "memory_async",
+        .src_uris = {DataStorageUri("dummy://memory_async/src?size=128")},
+        .dst_uris = {DataStorageUri("dummy://memory_async/dst?size=128")},
+    };
+    auto submitted = executor.SubmitAsyncCopy(request, "memory-op", AsyncCopyOptions{});
+    ASSERT_TRUE(submitted.submit_result.accepted);
+    ASSERT_TRUE(submitted.future.valid());
+    EXPECT_EQ(std::future_status::timeout, submitted.future.wait_for(std::chrono::milliseconds(0)));
+    std::promise<void> worker_ran;
+    ASSERT_TRUE(executor.SubmitTask([&worker_ran] { worker_ran.set_value(); }));
+    EXPECT_EQ(std::future_status::ready, worker_ran.get_future().wait_for(std::chrono::seconds(1)));
+
+    AsyncCopyBatchResult result;
+    result.status = EC_OK;
+    result.items.resize(1);
+    result.items[0].outcome = AsyncCopyOutcome::kSuccess;
+    result.items[0].terminal = true;
+    result.items[0].safe_to_reuse_dst = true;
+    ASSERT_TRUE(backend->completion_);
+    auto completion = std::move(backend->completion_);
+    completion(result);
+    completion(result); // Executor's promise still resolves once.
+    ASSERT_EQ(std::future_status::ready, submitted.future.wait_for(std::chrono::seconds(1)));
+    EXPECT_EQ(EC_OK, submitted.future.get().status);
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMemoryAsyncCopyShortOrUnknownCompletionCannotSucceed) {
+    auto backend = std::make_shared<MemoryAsyncCopyBackend>();
+    data_storage_manager_->storage_map_["memory_async"] = backend;
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationCopyRequest request{
+        .instance_id = kTestInstanceName,
+        .block_key = 2,
+        .exec_storage_name = "memory_async",
+        .src_uris = {DataStorageUri("dummy://memory_async/src?size=128")},
+        .dst_uris = {DataStorageUri("dummy://memory_async/dst?size=128")},
+    };
+    for (bool short_response : {true, false}) {
+        auto submitted = executor.SubmitAsyncCopy(request, "unknown-op", AsyncCopyOptions{});
+        ASSERT_TRUE(submitted.submit_result.accepted);
+        AsyncCopyBatchResult unknown;
+        unknown.status = EC_OK;
+        if (!short_response) {
+            unknown.items.resize(1); // Missing terminal/safe remains unknown.
+        }
+        auto completion = std::move(backend->completion_);
+        ASSERT_TRUE(completion);
+        completion(std::move(unknown));
+        ASSERT_EQ(std::future_status::ready, submitted.future.wait_for(std::chrono::seconds(1)));
+        auto result = submitted.future.get();
+        EXPECT_NE(EC_OK, result.status);
+        EXPECT_FALSE(result.terminal);
+        EXPECT_FALSE(result.safe_to_reuse_dst);
+    }
+}
+
+TEST_F(SchedulePlanExecutorTest, TestMemoryAsyncCopyAggregateFailureOverridesSuccessfulItems) {
+    auto backend = std::make_shared<MemoryAsyncCopyBackend>();
+    data_storage_manager_->storage_map_["memory_async"] = backend;
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationCopyRequest request{
+        .instance_id = kTestInstanceName,
+        .block_key = 3,
+        .exec_storage_name = "memory_async",
+        .src_uris = {DataStorageUri("dummy://memory_async/src?size=128")},
+        .dst_uris = {DataStorageUri("dummy://memory_async/dst?size=128")},
+    };
+    for (const auto status : {EC_ERROR, EC_TIMEOUT, EC_PARTIAL_OK, EC_UNKNOWN}) {
+        SCOPED_TRACE(static_cast<int>(status));
+        auto submitted = executor.SubmitAsyncCopy(request, "aggregate-failure", AsyncCopyOptions{});
+        ASSERT_TRUE(submitted.submit_result.accepted);
+        AsyncCopyBatchResult completion_result;
+        completion_result.status = status;
+        completion_result.items.resize(1);
+        auto &item = completion_result.items.front();
+        item.outcome = AsyncCopyOutcome::kSuccess;
+        item.terminal = true;
+        item.safe_to_reuse_dst = true;
+        ASSERT_TRUE(completion_result.AllSucceeded());
+        auto completion = std::move(backend->completion_);
+        ASSERT_TRUE(completion);
+        completion(std::move(completion_result));
+        ASSERT_EQ(std::future_status::ready, submitted.future.wait_for(std::chrono::seconds(1)));
+        EXPECT_EQ(status, submitted.future.get().status);
+    }
+}
