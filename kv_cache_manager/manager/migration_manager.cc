@@ -1659,7 +1659,6 @@ void MigrationManager::SubmitTargetLocationDelete(const CopyTaskContext &ctx) {
     del_req.instance_id = ctx.instance_id;
     del_req.block_keys = {ctx.block_key};
     del_req.location_ids = {{ctx.dst_location_id}};
-    del_req.resume_deleting = true;
     if (!schedule_plan_executor_->SubmitNonBlocking(del_req, ScheduleTaskClass::kMigrationContinuation)) {
         KVCM_LOG_WARN("migration target cleanup enqueue failed: instance %s block_key %ld location %s",
                       ctx.instance_id.c_str(),
@@ -1676,7 +1675,6 @@ void MigrationManager::SubmitSourceLocationDelete(const CopyTaskContext &ctx) {
     del_req.instance_id = ctx.instance_id;
     del_req.block_keys = {ctx.block_key};
     del_req.location_ids = {{ctx.src_location_id}};
-    del_req.resume_deleting = true;
     if (!schedule_plan_executor_->SubmitNonBlocking(del_req, ScheduleTaskClass::kMigrationContinuation)) {
         KVCM_LOG_WARN("migration source cleanup enqueue failed: instance %s block_key %ld location %s",
                       ctx.instance_id.c_str(),
