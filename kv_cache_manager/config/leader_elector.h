@@ -5,7 +5,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <queue>
 #include <string>
 #include <thread>
 
@@ -23,13 +22,6 @@ enum class RoleState {
     PROMOTING, // 正在晋升为主的过渡状态
     LEADER,    // 稳定的主节点状态
     DEMOTING,  // 正在降级为备的过渡状态
-};
-
-// 状态转换任务
-struct RoleTransitionTask {
-    uint64_t version;
-    RoleState target_state;
-    std::function<void()> action;
 };
 
 class LeaderElector {
@@ -65,6 +57,13 @@ public:
     // 设置回调（必须在 Start 之前调用）
     void SetNoLongerLeaderHandler(const HandlerFuncType &handler);
     void SetBecomeLeaderHandler(const HandlerFuncType &handler);
+    // 快速关闭业务入口，在失锁线程持有 transition_mutex_ 时执行；不得阻塞或重入 LeaderElector。
+    // 尤其不能调用 IsStableState、WaitForStableState、Demote、Stop 或 RunIfCurrentPromotionValid：
+    // 它们会再次获取同一把非递归锁，即使是查询也会自锁。
+    void SetLeadershipLostHandler(const HandlerFuncType &handler);
+    // 仅在恢复回调的成功路径调用。与失锁处理串行，避免旧恢复重新开放业务。
+    // handler 同样持有 transition_mutex_，遵守上述快速回调的限制；不改变恢复失败的处理方式。
+    bool RunIfCurrentPromotionValid(const HandlerFuncType &handler);
 
     // Leader 信息
     std::string GetLeaderNodeID() const;
@@ -94,17 +93,20 @@ private:
 
     // 状态机相关
     void StateTransitionWorker();
-    void ExecuteTransitionTask(const RoleTransitionTask &task);
+    bool ReconcileState();
     bool TransitionToState(RoleState target_state);
-    void RequestPromoteToLeader();
-    void RequestDemoteToFollower();
+    bool HasPendingTransitionLocked() const;
+    bool IsStableStateLocked() const;
+    bool CanCampaignLocked(int64_t current_time) const;
+    bool AcceptLease(int64_t current_time, int64_t expiration, uint64_t request_epoch);
+    bool CheckLeaseLocked(int64_t current_time);
+    void LoseLeaseLocked(int64_t current_time);
+    void ReleaseLock();
+    void InvokeHandler(const HandlerFuncType &handler);
     void ProcessStateTransitionsForTest();
 
     // 节点信息存储（内部实现）
     ErrorCode SetNodeInfo(const std::string &node_id, const NodeEndpointInfo &node_info);
-
-    // 锁状态更新
-    void UpdateLockStatus(int64_t current_time, bool acquired, int64_t lease_expiration_time);
 
 private:
     // === 分布式锁相关 ===
@@ -114,7 +116,7 @@ private:
     int64_t lease_timeout_us_;
     int64_t loop_interval_us_;
 
-    // 锁持有状态（由选主线程维护）
+    // 锁状态的修改由 transition_mutex_ 串行，原子变量供查询接口读取。
     std::atomic<bool> lock_acquired_{false}; // 是否持有锁
     std::atomic<int64_t> lease_expiration_time_us_{-1};
 
@@ -123,11 +125,10 @@ private:
 
     // === 角色状态机相关 ===
     std::atomic<RoleState> role_state_{RoleState::FOLLOWER};
-    std::atomic<uint64_t> state_version_{0};
-    std::atomic<bool> is_transitioning_{false};
-
-    // 状态转换任务队列
-    std::queue<RoleTransitionTask> transition_queue_;
+    // 只保存当前事实，不保存历史任务。失锁及释放收尾推进轮次，旧轮次不能提交。
+    uint64_t lock_epoch_ = 0;
+    uint64_t promotion_epoch_ = 0;
+    bool release_in_progress_ = false;
     mutable std::mutex transition_mutex_;
     std::condition_variable transition_cv_;
 
@@ -137,16 +138,16 @@ private:
     std::unique_ptr<std::thread> state_transition_thread_; // 状态转换线程
 
     std::atomic<bool> stop_flag_{false};
-    int64_t last_loop_time_ = -1;
+    std::atomic<int64_t> last_loop_time_{-1};
 
     // === 回调函数 ===
     HandlerFuncType become_leader_handler_;
     HandlerFuncType no_longer_leader_handler_;
-    mutable std::mutex callback_mutex_;
+    HandlerFuncType leadership_lost_handler_;
 
     // === 其他配置 ===
     std::atomic<int64_t> next_can_campaign_time_us_{0};
-    int64_t forbid_campaign_time_ms_ = 0;
+    std::atomic<int64_t> forbid_campaign_time_ms_{0};
 
     // === 自身节点信息缓存 ===
     std::unique_ptr<NodeEndpointInfo> self_node_info_cache_;

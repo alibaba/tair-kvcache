@@ -40,13 +40,16 @@ class RedisServer(object):
                 "",
             ]))
 
-        self.port_socket.close()
-        self.port_socket = None
-        self.stdout = open(os.path.join(redis_dir, "stdout"), "w")
-        self.stderr = open(os.path.join(redis_dir, "stderr"), "w")
+        first_start = self.port_socket is not None
+        if first_start:
+            self.port_socket.close()
+            self.port_socket = None
+        self.stdout = open(os.path.join(redis_dir, "stdout"), "a")
+        self.stderr = open(os.path.join(redis_dir, "stderr"), "a")
         self.process = subprocess.Popen([redis_server, conf_path], stdout=self.stdout, stderr=self.stderr)
         self._wait_until_ready()
-        self.command("FLUSHALL")
+        if first_start:
+            self.command("FLUSHALL")
 
     def stop(self):
         if self.process is not None:

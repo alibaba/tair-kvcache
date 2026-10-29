@@ -1,6 +1,18 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "ServiceImplBaseTest",
+    srcs = ["service_impl_base_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config:coordination_backend",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/service:service_impl_base",
+    ],
+)
+
+cc_test(
     name = "MetaServiceMetricsBaseTest",
     srcs = [
         "meta_service_metrics_base_test.cc",

@@ -44,9 +44,10 @@ class CacheGarbageCollectorTest(TestBase, unittest.TestCase):
             response = self._start_write(instance_id, self._block_key)
             self.assertTrue(response.get("locations"))
 
-        # Restart loses both in-memory write sessions. Backdate only instance A
-        # in the authoritative dummy file so instance B remains inside grace.
-        self.worker_manager.stop_worker(0)
+        # A crash loses write sessions without aborting persisted WRITING.
+        # Graceful shutdown now waits for cleanup and removes those locations.
+        # Backdate only instance A so instance B remains inside grace.
+        self.worker_manager.stop_worker(0, force=True)
         self._backdate_persisted_writing(instance_ids[0], self._block_key)
         self.assertTrue(
             self.worker_manager.start_worker(
@@ -124,7 +125,8 @@ class CacheGarbageCollectorTest(TestBase, unittest.TestCase):
         response = self._start_write(instance_id, self._block_key)
         self.assertTrue(response.get("locations"))
 
-        self.worker_manager.stop_worker(0)
+        # Preserve the orphan WRITING location by crashing before cleanup.
+        self.worker_manager.stop_worker(0, force=True)
         self._backdate_persisted_writing(instance_id, self._block_key)
         self.assertTrue(
             self.worker_manager.start_worker(
@@ -156,6 +158,27 @@ class CacheGarbageCollectorTest(TestBase, unittest.TestCase):
         self.assertTrue(
             rewritten.get("locations"),
             "orphan restored into cached metadata should be collected",
+        )
+
+    def test_graceful_stop_aborts_pending_writes(self):
+        """A graceful stop finishes cleanup before the process exits."""
+        self._create_topology()
+        instance_id = "cache_gc_graceful_stop_instance"
+        self._register_instance(instance_id)
+        response = self._start_write(instance_id, self._block_key)
+        self.assertTrue(response.get("locations"))
+
+        path = os.path.join(self.get_workdir(), f"cache_gc_metadata_{instance_id}")
+        with open(path, "r", encoding="utf-8") as source:
+            persisted = json.load(source)
+        self.assertIn(str(self._block_key), persisted)
+
+        self.worker_manager.stop_worker(0)
+        with open(path, "r", encoding="utf-8") as source:
+            persisted = json.load(source)
+        self.assertNotIn(
+            str(self._block_key), persisted,
+            "graceful shutdown must abort the pending write before exit",
         )
 
     def test_missing_serving_data_is_collected_without_query(self):

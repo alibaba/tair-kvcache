@@ -428,6 +428,35 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         self.assertEqual(resp["header"]["status"]["code"], "OK")
         self.assertIn("campaign_delay_time_ms", resp)
 
+    def test_single_node_leader_demote_recovers_business_gate(self):
+        """A single node closes its gate on demotion and serves again after recovery."""
+        req = {"trace_id": self._trace_id}
+        original_delay = self._client.get_leader_elector_config(req)["campaign_delay_time_ms"]
+        self._client.list_storage(req)
+        self._client.update_leader_elector_config({
+            **req, "campaign_delay_time_ms": 2000,
+        })
+        self._client.leader_demote(req)
+        rejected = self._client.list_storage(req, check_response=False)
+        self.assertEqual(rejected["header"]["status"]["code"], "SERVER_NOT_LEADER")
+        # Discovery/config remain available while the business gate is closed.
+        self._client.get_manager_cluster_info(req)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            response = self._client.list_storage(req, check_response=False)
+            code = response["header"]["status"]["code"]
+            if code == "OK":
+                break
+            self.assertEqual(code, "SERVER_NOT_LEADER")
+            time.sleep(0.05)
+        else:
+            self.fail("single node did not reopen its business gate after demotion")
+        info = self._client.get_manager_cluster_info(req)
+        self.assertEqual(info["leader_node_id"], info["self_node_id"])
+        self._client.update_leader_elector_config({
+            **req, "campaign_delay_time_ms": original_delay,
+        })
+
     def test_update_leader_elector_config(self):
         """测试 UpdateLeaderElectorConfig 接口"""
         # 首先获取当前配置

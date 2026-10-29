@@ -200,3 +200,14 @@ cc_test(
         "//kv_cache_manager/config:leader_elector_base",
     ],
 )
+
+cc_test(
+    name = "leader_elector_reconcile_test",
+    srcs = ["leader_elector_reconcile_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config:coordination_backend",
+        "//kv_cache_manager/config:leader_elector_base",
+    ],
+)
