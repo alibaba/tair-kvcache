@@ -10,6 +10,7 @@ from typing import AbstractSet, Any, Dict, List, Mapping, Optional
 import time
 import json
 
+import requests
 import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
@@ -358,13 +359,91 @@ def _sidecars_are_written_by_every_rank() -> bool:
 
 
 class _UnsupportedBackendError(RuntimeError):
-    """The connector cannot serve this backend, and retrying cannot change it.
+    """The connector cannot serve the pools and configuration it has.
 
-    Raised by ``_ensure_client`` for permanent shape mismatches -- e.g. a KV
-    anchor that is not a host pool (sglang's DeepSeek-V4 compressed pool).
-    The problem is reported once when it is detected, so the data-path
-    entries answer conservatively on every call without logging once per call.
+    Raised by ``_ensure_client`` for a shape or configuration this connector
+    cannot serve: a KV anchor that is not a host pool (sglang's DeepSeek-V4
+    compressed pool) or an SDK client this configuration cannot create.  A
+    request cannot fix either -- the pool set and the registration are frozen --
+    so the data-path entries answer conservatively instead of failing the
+    request, and the failure is reported once when it is detected
+    (``_report_unsupported_kv_pool`` / ``_report_unusable_sdk_client``) so they
+    need no log of their own.
+
+    Only a later one-shot attempt can still succeed, and ``_ensure_client`` does
+    re-attempt it on its next call: that is how a transfer runtime which failed
+    to start for an environmental reason recovers.  ``finalize_registration``
+    gets no second attempt -- the engine detaches the backend when it raises.
+
+    ``reason`` is the operator-facing classification reported at startup, one
+    phrase per cause, so "the transfer runtime could not be created" never reads
+    as "the pool shape is not supported".
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+# Report key of the instance-wide failure "this instance has no SDK client".
+# An opaque object, so it can neither be suppressed by nor suppress a pool's
+# report in ``_reported_pools``.
+_SDK_CLIENT_REPORT_KEY: Any = object()
+
+
+def _register_failure_cause(error: BaseException) -> str:
+    """Which of ``rejected`` / ``refused`` / ``unjudged`` a failure is.
+
+    ``_report_register_failure`` explains why the exception *types* decide this
+    and ``AssertionError`` cannot be the predicate; both the data-path report and
+    the finalize label read this one classification, so one failure is never
+    labelled two ways.
+    """
+    if isinstance(error, KvCacheManagerProtocolError):
+        return "unjudged"
+    if isinstance(error, KvCacheManagerHTTPError):
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        return "refused" if status is not None and 400 <= status < 500 else "unjudged"
+    if isinstance(error, AssertionError):
+        message = str(error).lower()
+        if any(hint in message for hint in _REGISTER_REJECTED_HINTS):
+            return "rejected"
+        # Not identifiable: the Manager refused for a reason this connector
+        # cannot name, and retrying may still succeed.
+        return "unjudged"
+    return "unjudged"
+
+
+def _describe_registration_failure(error: BaseException) -> str:
+    """Label a failed one-shot registration for the operator's log line.
+
+    The label reuses ``_register_failure_cause``, so a failure that the
+    data-path report already called ``unjudged`` is not called ``permanent`` one
+    line later.  Nothing here decides anything: the exception is raised
+    unchanged, and whether a later attempt can succeed depends on the caller --
+    the data path retries per call, the finalize hook does not.
+    """
+    if isinstance(error, _UnsupportedBackendError):
+        return f"rejected: {error.reason}"
+    if isinstance(error, KvCacheManagerProtocolError):
+        return "unjudged: the Manager did not decide on the registration"
+    if isinstance(error, KvCacheManagerHTTPError):
+        status = getattr(getattr(error, "response", None), "status_code", None) or 0
+        if 400 <= status < 500:
+            return f"refused: the Manager rejected the request (HTTP {status})"
+        return f"unjudged: the Manager failed with HTTP {status}"
+    if isinstance(error, requests.RequestException):
+        return "unjudged: the Manager is unreachable"
+    if _register_failure_cause(error) == "rejected":
+        return "rejected: the Manager refused the registration"
+    # Not a Manager decision: the instance itself cannot serve (closed backend,
+    # no KV pool registered yet).  A retry with the same setup cannot fix it.
+    return f"local: {type(error).__name__}: this instance cannot be served"
 
 
 class HiCacheKVCM(HiCacheStorage):
@@ -388,15 +467,23 @@ class HiCacheKVCM(HiCacheStorage):
       only source of sidecar pools (Mamba/Indexer/...). sglang calls it for
       every entry of the group, KV included.
 
-    No storage call can happen before the attach returns, so the pool set is
-    final at the first data-path call -- and that is exactly when the Manager
-    registration and the SDK client are created (``_ensure_client``):
-    ``registerInstance`` only accepts a repeat when every field matches and
-    there is no spec update API, so the location specs must be frozen once.
-    A pool registered after that point is reported once, not recorded, and
-    marked unusable: even if it reuses the name of an already-registered
-    pool, its transfers are answered with misses instead of being paired with
-    that pool's spec.  It is never silently assumed to work.
+    The location specs are frozen when the Manager registration and the SDK
+    client are created (``_ensure_client``): ``registerInstance`` only accepts a
+    repeat when every field matches and there is no spec update API.  sglang
+    that knows the duck-typed ``finalize_registration`` hook says when the
+    attach (draft pools included) is over -- before any request is served --
+    and the hook is then the freeze point; a failure there fails the attach
+    instead of degrading every storage call to a miss in a background thread.
+    Upstream sglang has no such callback, so there the pool set is only final at
+    the first data-path call -- the behavior of every release without the hook
+    is unchanged.  Either way a pool that the v2 hook registers after the
+    freeze is reported once, not recorded, and marked unusable: even if it
+    reuses the name of an already-registered pool, its transfers are answered
+    with misses instead of being paired with that pool's spec.  It is never
+    silently assumed to work.  (The v1 hook runs once per attach -- it carries
+    the KV anchor, or up to v0.5.18 the whole host pool group -- and has no
+    late-pool bookkeeping of its own, so a re-attach has to build a new backend
+    instance, which sglang does.)
 
     That also makes the pool set part of the deployment identity: a pool this
     connector backs after an upgrade but did not back before changes the
@@ -404,13 +491,14 @@ class HiCacheKVCM(HiCacheStorage):
     ``instance_id``.  Changing the pool set is therefore an operator action --
     a new ``instance_id`` -- not something this connector can repair at runtime.
 
-    If the KV anchor itself cannot be served -- sglang's DeepSeek-V4
-    compressed KV pool anchors on a tensorless ``LogicalHostPool`` that is not
-    a host pool -- initialization reports it once and every storage call for
-    that instance degrades to a miss.  A sidecar registered under such a name,
-    or one whose derived spec name would share another pool's spec, is simply
-    not backed: its transfers are answered with a miss, never with someone
-    else's data.
+    If the instance cannot be served at all, initialization reports it once and
+    then fails: an anchor that is not a host pool (sglang's DeepSeek-V4
+    compressed KV pool anchors on a tensorless ``LogicalHostPool``) or an SDK
+    client the frozen configuration cannot create.  A data-path call then
+    degrades to a miss, while ``finalize_registration`` fails the attach.  A
+    sidecar registered under such a name, or one whose derived spec name would
+    share another pool's spec, is simply not backed: its transfers are answered
+    with a miss, never with someone else's data.
 
     The write paths are the only callers of the connector's TP collectives,
     and those need every rank of the group.  They therefore agree with the
@@ -426,11 +514,12 @@ class HiCacheKVCM(HiCacheStorage):
     that spans the group is committed only for the blocks every rank wrote.
     """
 
-    # Pools already reported as unusable -- unknown to this connector, registered
-    # after the specs were frozen, or named so that their spec would alias
-    # another pool's -- and therefore answered with misses. Process-wide so each
-    # pool is reported once instead of once per block batch, and so the report
-    # survives a backend re-creation.
+    # Report keys already reported -- the pools that cannot be served (unknown to
+    # this connector, registered after the specs were frozen, or named so that
+    # their spec would alias another pool's) and the instance-wide failures
+    # (``_SDK_CLIENT_REPORT_KEY``).  Process-wide so each key is reported once
+    # instead of once per block batch, and so the report survives a backend
+    # re-creation.
     _reported_pools: set = set()
 
     # Legacy entry points (batch_get/batch_set) already reported as not
@@ -554,17 +643,27 @@ class HiCacheKVCM(HiCacheStorage):
     def _ensure_client(self) -> None:
         """Register with the Manager and create the SDK client, once.
 
-        Deliberately deferred to the first storage call: sglang's registration
-        burst (v1 anchor, then one v2 call per pool) has to be over before the
-        location specs are frozen into ``registerInstance`` -- a repeat with a
-        different configuration is rejected and there is no spec update API.
-        Pools registered later are degraded, see ``register_mem_host_pool_v2``.
+        Two entry points, one implementation: the data path (the lazy path of
+        every sglang release without the ``finalize_registration`` hook) and
+        that hook, where sglang says its registration burst is over.  Either
+        way the burst (v1 anchor, then one v2 call per pool) has to be over
+        before the location specs are frozen into ``registerInstance`` -- a
+        repeat with a different configuration is rejected and there is no spec
+        update API.  Pools registered later are degraded, see
+        ``register_mem_host_pool_v2``.
 
         No collective happens here, so ranks may initialize at different times
         and the read paths call this directly.  The write paths must agree on
         the outcome first, see ``_ensure_client_for_write``.
-        Raises on failure: the ``batch_*`` callers turn that into a
-        conservative result and retry on their next call.
+
+        Reporting is split by cause.  An ``_UnsupportedBackendError`` (a pool
+        shape or a configuration this connector cannot serve) is reported once
+        here, before it is raised, so the ``batch_*`` callers stay quiet on every
+        later attempt.  Everything else -- a closed backend, no KV pool
+        registered yet, a Manager error, an exception out of the SDK --
+        propagates unreported and those callers log it on *every* attempt.  Both
+        kinds answer conservatively and re-attempt initialization on their next
+        call.
         """
         # Checked before the ready flag: close() tears the client down, so a
         # late storage call must fail with a clear message instead of using it.
@@ -583,15 +682,16 @@ class HiCacheKVCM(HiCacheStorage):
                     "sglang's register_mem_pool_host/register_mem_host_pool_v2"
                 )
             if not isinstance(kv_pool, HostKVCache):
-                # Permanent, so it is reported once here instead of failing
-                # with an ERROR per storage call: sglang's DeepSeek-V4
-                # compressed pool anchors its KV entry on a LogicalHostPool,
-                # which has no get_size_per_token() to build specs from.
+                # Reported once here instead of once per storage call: sglang's
+                # DeepSeek-V4 compressed pool anchors its KV entry on a
+                # LogicalHostPool, which has no get_size_per_token() to build
+                # specs from.
                 self._report_unsupported_kv_pool(kv_pool)
                 raise _UnsupportedBackendError(
                     f"the KV anchor of this instance is a "
                     f"{type(kv_pool).__name__}, not a host pool; this pool "
-                    f"shape is not supported by this connector"
+                    f"shape is not supported by this connector",
+                    reason="this instance's pool or spec shape is not supported",
                 )
             self._init_kvcm_client()
             self._client_ready = True
@@ -1025,9 +1125,19 @@ class HiCacheKVCM(HiCacheStorage):
         self.transfer_client = kvcm_py_client.TransferClient.Create(
             self.transfer_client_config, self.init_params
         )
-        assert self.transfer_client is not None, (
-            "kvcm_py_client.TransferClient.Create failed"
-        )
+        if self.transfer_client is None:
+            self._report_unusable_sdk_client()
+            # This attempt cannot succeed -- the client is built from the
+            # configuration frozen above -- but a later one-shot initialization
+            # may, if the runtime failed for an environmental reason: the data
+            # path re-attempts it, the finalize hook does not (the engine
+            # detaches on the way out).  An ``assert`` would also vanish under
+            # ``python -O`` and leave a backend without a client.
+            raise _UnsupportedBackendError(
+                "kvcm_py_client.TransferClient.Create returned no client for "
+                "this instance's storage configuration and location specs",
+                reason="the KVCM transfer runtime could not be created",
+            )
 
     def _resolve_pool_specs(self) -> Mapping[Any, _RegisteredPool]:
         """Resolve the spec rows against the pools this instance registered.
@@ -1215,10 +1325,11 @@ class HiCacheKVCM(HiCacheStorage):
         """v2 hook: one host pool per call, sidecars included.
 
         sglang calls this for every entry of its host pool group, the KV
-        anchor included, right after the v1 hook. There is no "registration
-        finished" callback, so the pool set is only known to be final at the
-        first data-path call -- pools showing up after that cannot be added to
-        the Manager registration and are degraded (see the class docstring).
+        anchor included, right after the v1 hook. The pool set is final when
+        the location specs are frozen -- at ``finalize_registration`` where
+        sglang offers that hook, otherwise at the first data-path call. A pool
+        showing up after that cannot be added to the Manager registration and
+        is degraded (see the class docstring).
 
         The initialization lock is taken: a pool arriving while the specs are
         being frozen would otherwise be recorded but missing from the
@@ -1255,12 +1366,13 @@ class HiCacheKVCM(HiCacheStorage):
         )
 
     def _mark_pool_reported(self, key: Any) -> bool:
-        """Record that something has been reported, returning False if it was.
+        """Record that a report key has been reported, False if it already was.
 
         The key is usually a pool name, but a report that is not about a pool
-        (a failed registration, for instance) passes a tuple of its own, and the
-        tuple carries the instance id because two instances in one process are
-        two deployments.
+        (a failed registration, for instance) passes a tuple of its own, or one
+        of the module-level sentinels for an instance-wide failure; a tuple
+        carries the instance id because two instances in one process are two
+        deployments.
         """
         if key in self._reported_pools:
             return False
@@ -1300,7 +1412,7 @@ class HiCacheKVCM(HiCacheStorage):
         ``instance_id`` at runtime), while a re-created backend of the *same*
         instance stays quiet because the diagnosis has not changed.
         """
-        cause = self._register_failure_cause(error)
+        cause = _register_failure_cause(error)
         key = ("registerInstance", self.instance_id, cause)
         if not self._mark_pool_reported(key):
             logger.debug("registerInstance failed again (%s): %s", cause, error)
@@ -1309,8 +1421,8 @@ class HiCacheKVCM(HiCacheStorage):
             logger.warning(
                 "registerInstance could not be judged by the Manager (transport, "
                 "protocol, server or leader-election failure), so nothing is "
-                "concluded about the layout of instance_id %s; the next storage "
-                "call retries. Error: %s",
+                "concluded about the layout of instance_id %s; a later attempt "
+                "may still succeed. Error: %s",
                 self.instance_id,
                 error,
             )
@@ -1344,29 +1456,6 @@ class HiCacheKVCM(HiCacheStorage):
             [group["name"] for group in self.location_spec_groups],
             error,
         )
-
-    @staticmethod
-    def _register_failure_cause(error: BaseException) -> str:
-        """Which of ``rejected`` / ``refused`` / ``unjudged`` a failure is.
-
-        See ``_report_register_failure`` for why the exception *types* decide
-        this and ``AssertionError`` cannot be the predicate.
-        """
-        if isinstance(error, KvCacheManagerProtocolError):
-            return "unjudged"
-        if isinstance(error, KvCacheManagerHTTPError):
-            status = getattr(getattr(error, "response", None), "status_code", None)
-            return (
-                "refused" if status is not None and 400 <= status < 500 else "unjudged"
-            )
-        if isinstance(error, AssertionError):
-            message = str(error).lower()
-            if any(hint in message for hint in _REGISTER_REJECTED_HINTS):
-                return "rejected"
-            # Not identifiable: the Manager refused for a reason this connector
-            # cannot name, and retrying may still succeed.
-            return "unjudged"
-        return "unjudged"
 
     def _report_unusable_pool_spec(self, pool_name: Any, size: int) -> None:
         """Report once that a pool's block size cannot become a location spec."""
@@ -1440,10 +1529,78 @@ class HiCacheKVCM(HiCacheStorage):
         logger.error(
             "the KV anchor of this instance is a %s, not a host pool: this "
             "pool shape (e.g. sglang's DeepSeek-V4 compressed KV pool) is not "
-            "supported by this connector, so every storage call degrades to a "
-            "miss for this instance.",
+            "supported by this connector, so no location spec can be built for "
+            "this instance.",
             type(pool).__name__,
         )
+
+    def _report_unusable_sdk_client(self) -> None:
+        """Report that this process has no SDK client for the instance, once.
+
+        ``TransferClient.Create`` takes the frozen storage configuration and
+        returns no client, i.e. nothing can be moved with the configuration this
+        instance just registered.  The data-path entries answer
+        ``_UnsupportedBackendError`` with a conservative result and no log of
+        their own, so this is the one place an operator learns *why* nothing is
+        cached -- the C++ side logs an error code without the instance or the
+        specs.  Deduplicated like every other report, under a key that carries
+        the instance id: a re-created backend of the same instance stays quiet,
+        another instance in the same process is reported on its own.
+        """
+        # Per instance: two instances in one process are two deployments, and
+        # the report names this instance's specs.
+        if not self._mark_pool_reported((self.instance_id, _SDK_CLIENT_REPORT_KEY)):
+            return
+        logger.error(
+            "instance %s has no KVCM transfer client: TransferClient.Create "
+            "returned no client for this storage configuration, so none of its "
+            "location specs can be served and its storage calls are answered "
+            "with misses until a client can be created. specs: %s; "
+            "storage_configs: %s",
+            self.instance_id,
+            ", ".join(
+                f"{info['name']}={info['size']}B" for info in self.location_spec_infos
+            ),
+            self.storage_configs,
+        )
+
+    def finalize_registration(self) -> None:
+        """Freeze the location specs once sglang reports every pool registered.
+
+        Duck-typed hook, called by sglang that knows it after the last pool of
+        the attach (draft pools included), i.e. exactly when the pool set
+        becomes final, before any request is served, and propagated into
+        scheduler construction.  Upstream sglang has no such callback, never
+        calls this, and keeps freezing at the first data-path call -- unchanged.
+
+        The work is ``_ensure_client``: ``_client_ready`` becomes the freeze
+        point, so every pool registered before this call is in the spec set and
+        one registered after it is late, i.e. reported once and answered with
+        misses (there is no spec update API).  Idempotent, and safe to race the
+        data path: both take the same lock and register once.  No collective
+        runs here, so a rank that cannot register fails alone.
+
+        Failures are raised unchanged; see ``_describe_registration_failure``
+        for the transient/permanent split.  This is the one-shot attempt that
+        does *not* get retried: the engine detaches the backend on the way out,
+        so ``close()`` makes every later entry fail fast.  (A failed freeze
+        leaves nothing frozen -- ``_client_ready`` stays False -- so without
+        that detach a later data-path call would re-attempt initialization
+        against the pool set of that moment; the Manager accepts a repeat of an
+        identical registration and rejects a changed one.)
+        """
+        try:
+            self._ensure_client()
+        except Exception as e:
+            logger.error(
+                "finalize_registration: the one-shot Manager/SDK registration "
+                "did not complete (%s); failing the attach instead of leaving "
+                "every storage call to degrade to a miss in a background "
+                "thread: %s",
+                _describe_registration_failure(e),
+                e,
+            )
+            raise
 
     def _batch_get(
         self,
