@@ -902,12 +902,12 @@ CacheGarbageCollector::ScanDeleteActions CacheGarbageCollector::BuildDeleteActio
         return actions;
     }
 
-    // Recovery can still publish old metadata. Defer only EventReport cleanup
-    // for this batch; ordinary GC continues, and later scans recheck the state.
+    // Maintenance RMW protects deletion against recovery backfill, so eligible
+    // EventReport candidates can be submitted while metadata recovery runs.
     const auto indexer = config_.event_report_cleanup_enabled && meta_indexer_manager_
                              ? meta_indexer_manager_->GetMetaIndexer(instance_id)
                              : nullptr;
-    const bool event_report_cleanup_enabled = indexer && !indexer->IsRecovering();
+    const bool event_report_cleanup_enabled = indexer != nullptr;
 
     std::map<CandidateKey, DeleteCandidate> candidates;
     std::vector<ServingProbe> serving_probes;

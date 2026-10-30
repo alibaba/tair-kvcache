@@ -2673,56 +2673,90 @@ TEST_F(SchedulePlanExecutorTest, TestLocationRefreshWinsBeforeConditionalAsyncAd
     EXPECT_EQ(CacheLocationStatus::CLS_SERVING, location_maps.front().at(location_ids.front())->status());
 }
 
-TEST_F(SchedulePlanExecutorTest, TestAuthoritativeAdmissionRefreshesCachedMetadataBeforeConditionalDelete) {
-    const std::string instance_id = "cached_authoritative_delete";
-    const std::string persistent_path = GetPrivateTestRuntimeDataPath() + "schedule_plan_executor_cached_authoritative";
-    ASSERT_EQ(EC_OK, CreateCachedMetaIndexer(instance_id, persistent_path));
-    const auto indexer = meta_manager_->GetMetaIndexer(instance_id);
-    WaitForCachedMetaIndexerRunning(indexer);
+TEST_F(SchedulePlanExecutorTest, TestGcAdmissionOnlyHydratesRecoverMissingKeysAndNeverDeletesSkippedTargets) {
+    for (const std::string scenario : {"recover_missing", "recover_deleted", "running_missing",
+                                        "recover_target_missing", "recover_target_changed"}) {
+        SCOPED_TRACE(scenario);
+        const std::string instance_id = "cached_gc_" + scenario;
+        const std::string persistent_path = GetPrivateTestRuntimeDataPath() + instance_id;
+        ASSERT_EQ(EC_OK, CreateCachedMetaIndexer(instance_id, persistent_path));
+        const auto indexer = meta_manager_->GetMetaIndexer(instance_id);
+        WaitForCachedMetaIndexerRunning(indexer);
+        auto &manager = *indexer->backend_manager_;
 
-    auto request_context = std::make_shared<RequestContext>("cached_authoritative_delete_test");
-    MetaSearcher meta_searcher(indexer);
-    const int64_t block_key = 913;
-    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
-        DataStorageType::DATA_STORAGE_TYPE_NFS,
-        1,
-        {SchedulePlanExecutorTestHelper::CreateLocationSpec("default",
-                                                            "nfs://nfs_01/cached_authoritative_delete?size=1")});
-    std::vector<std::string> location_ids;
-    ASSERT_EQ(EC_OK,
-              BatchAddLocationForTest(&meta_searcher, request_context.get(), {block_key}, {location}, location_ids));
-    ASSERT_EQ(1u, location_ids.size());
+        auto physical_backend = std::make_shared<RecordingDeleteBackend>(
+            "nfs_01", DataStorageType::DATA_STORAGE_TYPE_NFS, false);
+        data_storage_manager_->storage_map_["nfs_01"] = physical_backend;
+        RequestContext context("cached_gc_admission_test");
+        MetaSearcher searcher(indexer);
+        const int64_t key = 913;
+        auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+            DataStorageType::DATA_STORAGE_TYPE_NFS,
+            1,
+            {LocationSpec("default", "nfs://nfs_01/cached_gc?size=1")});
+        std::vector<std::string> ids;
+        ASSERT_EQ(EC_OK, BatchAddLocationForTest(&searcher, &context, {key}, {location}, ids));
+        ASSERT_EQ(1u, ids.size());
+        std::vector<std::vector<ErrorCode>> status_results;
+        ASSERT_EQ(EC_OK, searcher.BatchUpdateLocationStatus(&context, {key}, {{{ids.front(), CLS_SERVING}}}, status_results));
+        ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), status_results);
+        CacheLocationMapVector original;
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), manager.cache_backend_->GetLocations(nullptr, {key}, original));
+        const auto expected = original.front().at(ids.front())->ToJsonString();
 
-    std::vector<CacheLocationMap> location_maps;
-    BlockMask empty_mask;
-    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
-    ASSERT_EQ(1u, location_maps.size());
-    const std::string expected_value = location_maps.front().at(location_ids.front())->ToJsonString();
+        if (scenario == "recover_target_missing") {
+            // Emulate a pending persistent deletion: the hot key remains,
+            // while its target is already absent. Never bring it back.
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+                      manager.cache_backend_->DeleteLocationsForMaintenance(nullptr, {key}, {{ids.front()}}));
+        } else if (scenario == "recover_target_changed") {
+            auto updated = std::make_shared<CacheLocation>(*original.front().at(ids.front()));
+            updated->set_status(CLS_WRITING);
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+                      manager.cache_backend_->Upsert(nullptr, {key}, {{{ids.front(), updated}}}, PropertyMapVector(1)));
+        } else {
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), manager.cache_backend_->Delete(nullptr, {key}));
+        }
+        manager.recover_state_.store(scenario == "running_missing"
+                                        ? MetaStorageBackendManager::RecoverState::kRunning
+                                        : MetaStorageBackendManager::RecoverState::kRecover);
+        if (scenario == "recover_deleted") {
+            manager.deleted_keys_.insert(key);
+        }
 
-    // Simulate a Running dual-backend instance whose authoritative metadata
-    // still contains the key after the local hot-cache entry was evicted.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), indexer->backend_manager_->cache_backend_->Delete(nullptr, {block_key}));
-    location_maps.clear();
-    ASSERT_EQ(EC_OK, meta_searcher.BatchGetLocation(request_context.get(), {block_key}, empty_mask, location_maps));
-    ASSERT_EQ(1u, location_maps.size());
-    ASSERT_TRUE(location_maps.front().empty());
+        SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+        CacheLocationDelRequest request{
+            .instance_id = instance_id,
+            .block_keys = {key},
+            .location_ids = {{ids.front()}},
+            .expected_location_values = {{expected}},
+            .authoritative_read = true,
+        };
+        auto submitted = executor.SubmitAsync(request);
+        ASSERT_TRUE(submitted.accepted);
+        const auto result = submitted.future.get();
+        ASSERT_EQ(EC_OK, result.status) << result.error_message;
 
-    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
-    CacheLocationDelRequest request{
-        .instance_id = instance_id,
-        .block_keys = {block_key},
-        .location_ids = {{location_ids.front()}},
-        .expected_location_values = {{expected_value}},
-        .metadata_only = true,
-        .authoritative_read = true,
-    };
-    const PlanExecuteResult result = executor.Submit(request).get();
-    ASSERT_EQ(EC_OK, result.status) << result.error_message;
-
-    CacheLocationMapVector persistent_locations;
-    const auto persistent_results =
-        indexer->backend_manager_->GetLocationsFromPrimary(request_context.get(), {block_key}, persistent_locations);
-    ASSERT_EQ(1u, persistent_results.size());
-    ASSERT_EQ(1u, persistent_locations.size());
-    EXPECT_TRUE(persistent_results.front() == EC_NOENT || persistent_locations.front().empty());
+        CacheLocationMapVector persisted;
+        const auto persisted_ec = manager.persistent_backend_->GetLocations(nullptr, {key}, persisted);
+        if (scenario == "recover_missing") {
+            ASSERT_EQ(1u, physical_backend->delete_batches.size());
+            EXPECT_TRUE(persisted_ec.front() == EC_NOENT || persisted.front().empty());
+        } else {
+            EXPECT_TRUE(physical_backend->delete_batches.empty());
+            ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), persisted_ec);
+            EXPECT_EQ(expected, persisted.front().at(ids.front())->ToJsonString());
+            CacheLocationMapVector hot;
+            const auto hot_ec = manager.cache_backend_->GetLocations(nullptr, {key}, hot);
+            if (scenario == "recover_target_changed") {
+                ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), hot_ec);
+                EXPECT_EQ(CLS_WRITING, hot.front().at(ids.front())->status());
+            } else if (scenario == "recover_target_missing") {
+                ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), hot_ec);
+                EXPECT_TRUE(hot.front().empty());
+            } else {
+                EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT}), hot_ec);
+            }
+        }
+    }
 }

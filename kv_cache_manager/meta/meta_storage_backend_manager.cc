@@ -415,7 +415,51 @@ void MetaStorageBackendManager::AsyncRecoverTask() noexcept {
     }
 }
 
-bool MetaStorageBackendManager::EnsureKeyInCache(RequestContext *request_context, const KeyTypeVec &keys) noexcept {
+void MetaStorageBackendManager::FilterRecoverFallbackKeys(KeyTypeVec &keys,
+                                                           std::vector<size_t> &indices) const noexcept {
+    if (keys.empty()) {
+        return;
+    }
+    assert(keys.size() == indices.size());
+    std::lock_guard<std::mutex> lock(deleted_keys_mutex_);
+    size_t count = 0;
+    // Read the phase under the same lock as tombstone cleanup. A caller that
+    // saw Recover before cleanup must not fall back after the set is cleared.
+    if (GetRecoverState() == RecoverState::kRecover) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (deleted_keys_.count(keys[i]) == 0) {
+                keys[count] = keys[i];
+                indices[count++] = indices[i];
+            }
+        }
+    }
+    keys.resize(count);
+    indices.resize(count);
+}
+
+void MetaStorageBackendManager::RecordRecoverDeletedKeys(const KeyVector &keys,
+                                                          const std::vector<ErrorCode> &results) noexcept {
+    if (!cache_backend_ || GetRecoverState() != RecoverState::kRecover) {
+        return;
+    }
+    assert(keys.size() == results.size());
+    std::lock_guard<std::mutex> lock(deleted_keys_mutex_);
+    if (GetRecoverState() != RecoverState::kRecover) {
+        return;
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] == EC_OK || results[i] == EC_NOENT) {
+            deleted_keys_.insert(keys[i]);
+        }
+    }
+}
+
+bool MetaStorageBackendManager::EnsureKeyInCache(RequestContext *request_context,
+                                                const KeyTypeVec &keys,
+                                                std::vector<ErrorCode> *out_results) noexcept {
+    if (out_results) {
+        out_results->assign(keys.size(), EC_OK);
+    }
     if (keys.empty()) {
         return true;
     }
@@ -426,16 +470,33 @@ bool MetaStorageBackendManager::EnsureKeyInCache(RequestContext *request_context
                        exists_results.size(),
                        exists_vec.size(),
                        keys.size());
+        if (out_results) {
+            out_results->assign(keys.size(), EC_ERROR);
+        }
         return false;
     }
+    bool hydrated = true;
     KeyTypeVec missing_keys;
+    std::vector<size_t> missing_indices;
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (exists_results[i] != EC_OK || !exists_vec[i]) {
+        if (exists_results[i] != EC_OK && exists_results[i] != EC_NOENT) {
+            if (!out_results) {
+                return false;
+            }
+            (*out_results)[i] = exists_results[i];
+            hydrated = false;
+            continue;
+        }
+        if (exists_results[i] == EC_NOENT || !exists_vec[i]) {
             missing_keys.emplace_back(keys[i]);
+            missing_indices.push_back(i);
         }
     }
+    // A deleted key may still exist in async Redis until its queued DEL runs.
+    // Treat it as new instead of hydrating old fields or waiting on the queue.
+    FilterRecoverFallbackKeys(missing_keys, missing_indices);
     if (missing_keys.empty()) {
-        return true;
+        return hydrated;
     }
 
     CacheLocationMapVector locations;
@@ -448,6 +509,11 @@ bool MetaStorageBackendManager::EnsureKeyInCache(RequestContext *request_context
                        locations.size(),
                        properties.size(),
                        missing_keys.size());
+        if (out_results) {
+            for (const size_t index : missing_indices) {
+                (*out_results)[index] = EC_ERROR;
+            }
+        }
         return false;
     }
     // PutIfAbsent prevents a stale persistent read from overwriting a newer
@@ -457,9 +523,13 @@ bool MetaStorageBackendManager::EnsureKeyInCache(RequestContext *request_context
     if (put_results.size() != missing_keys.size()) {
         KVCM_LOG_ERROR(
             "ensure cache PutIfAbsent results[%lu] mismatch keys[%lu]", put_results.size(), missing_keys.size());
+        if (out_results) {
+            for (const size_t index : missing_indices) {
+                (*out_results)[index] = EC_ERROR;
+            }
+        }
         return false;
     }
-    bool hydrated = true;
     for (size_t i = 0; i < missing_keys.size(); ++i) {
         if (get_results[i] == EC_NOENT) {
             // The key is genuinely new. The following Upsert can safely
@@ -471,6 +541,9 @@ bool MetaStorageBackendManager::EnsureKeyInCache(RequestContext *request_context
                           missing_keys[i],
                           get_results[i],
                           put_results[i]);
+            if (out_results) {
+                (*out_results)[missing_indices[i]] = get_results[i] == EC_OK ? put_results[i] : get_results[i];
+            }
             hydrated = false;
         }
     }
@@ -735,15 +808,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
         KVCM_LOG_ERROR("primary Delete results[%lu] mismatch keys[%lu]", primary_results.size(), keys.size());
         return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
-    if (cache_backend_ && GetRecoverState() == RecoverState::kRecover) {
-        // Tombstone to prevent Recover backfill from resurrecting deleted keys.
-        std::lock_guard<std::mutex> lock(deleted_keys_mutex_);
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (primary_results[i] == EC_OK || primary_results[i] == EC_NOENT) {
-                deleted_keys_.insert(keys[i]);
-            }
-        }
-    }
+    RecordRecoverDeletedKeys(keys, primary_results);
     if (!route.secondary) {
         return primary_results;
     }
@@ -871,7 +936,8 @@ ErrorCode MetaStorageBackendManager::TrimPersistentOrphans(RequestContext *reque
 std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(RequestContext *request_context,
                                                                                 const KeyVector &keys,
                                                                                 const LocationIdsPerKey &location_ids,
-                                                                                int32_t &out_reclaimed_count) noexcept {
+                                                                                int32_t &out_reclaimed_count,
+                                                                                bool local_primary) noexcept {
     out_reclaimed_count = 0;
     if (keys.empty()) {
         return {};
@@ -879,76 +945,72 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
     if (keys.size() != location_ids.size()) {
         return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
     }
-    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
-        // A recover task can still publish an older persistent snapshot into
-        // the hot cache. Retry this best-effort action after recovery rather
-        // than backfilling or touching cache state from maintenance.
-        return std::vector<ErrorCode>(keys.size(), EC_OUT_OF_LIMIT);
-    }
+    const bool recovering = cache_backend_ && GetRecoverState() == RecoverState::kRecover;
 
-    // Decide target-only versus whole-key deletion from both layers before
-    // mutating either one. Looking only at the hot cache can erase a newer
-    // persistent sibling; deleting targets first and reclaiming the key later
-    // can also hide a failed whole-key delete from subsequent GC rounds.
-    const WriteRoute route = GetWriteRoute(memory_primary_);
-    const bool compare_cache = cache_backend_ && !route.local_primary;
-    LocationIdsPerKey primary_location_ids;
-    const std::vector<ErrorCode> primary_id_ecs =
-        route.primary.GetLocationIdsForMaintenance(request_context, keys, primary_location_ids);
-    LocationIdsPerKey hot_location_ids;
-    std::vector<ErrorCode> hot_id_ecs;
-    if (compare_cache) {
-        hot_id_ecs = cache_backend_->GetLocationIdsForMaintenance(request_context, keys, hot_location_ids);
+    // Cached maintenance validates the complete hot key under the caller's
+    // shard lock. Redis can still contain siblings whose removal is queued;
+    // consulting those stale IDs would leave an empty hot key unreclaimed.
+    // The read source is independent of the captured deletion write route.
+    const WriteRoute route = GetWriteRoute(local_primary);
+    auto &read_backend = cache_backend_ ? *cache_backend_ : route.primary;
+    LocationIdsPerKey existing_location_ids;
+    const auto id_ecs = read_backend.GetLocationIdsForMaintenance(request_context, keys, existing_location_ids);
+
+    const char *read_layer = cache_backend_ ? "cache" : "primary";
+    if (id_ecs.size() != keys.size() || existing_location_ids.size() != keys.size()) {
+        KVCM_LOG_ERROR("%s maintenance location-id results[%lu] values[%lu] mismatch keys[%lu]",
+                       read_layer,
+                       id_ecs.size(),
+                       existing_location_ids.size(),
+                       keys.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
     }
 
     std::vector<ErrorCode> results(keys.size(), EC_OK);
-    std::vector<bool> id_reads_valid(keys.size(), true);
-    const auto validate_id_reads =
-        [&](const char *layer, const std::vector<ErrorCode> &id_ecs, const LocationIdsPerKey &ids) {
-            if (id_ecs.size() != keys.size() || ids.size() != keys.size()) {
-                KVCM_LOG_ERROR("%s maintenance location-id results[%lu] values[%lu] mismatch keys[%lu]",
-                               layer,
-                               id_ecs.size(),
-                               ids.size(),
-                               keys.size());
-                std::fill(results.begin(), results.end(), EC_ERROR);
-                std::fill(id_reads_valid.begin(), id_reads_valid.end(), false);
-                return;
-            }
-            for (size_t i = 0; i < keys.size(); ++i) {
-                if (id_ecs[i] != EC_OK && id_ecs[i] != EC_NOENT) {
-                    results[i] = id_ecs[i];
-                    id_reads_valid[i] = false;
-                } else if (id_ecs[i] == EC_NOENT && !ids[i].empty()) {
-                    KVCM_LOG_ERROR(
-                        "%s maintenance location-id read returned NOENT with values for key[%ld]", layer, keys[i]);
-                    results[i] = EC_ERROR;
-                    id_reads_valid[i] = false;
-                }
-            }
-        };
-    validate_id_reads("primary", primary_id_ecs, primary_location_ids);
-    if (compare_cache) {
-        validate_id_reads("cache", hot_id_ecs, hot_location_ids);
-    }
-
     std::vector<size_t> whole_key_indexes;
     std::vector<size_t> target_only_indexes;
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (!id_reads_valid[i] || location_ids[i].empty()) {
+        if (id_ecs[i] != EC_OK && id_ecs[i] != EC_NOENT) {
+            results[i] = id_ecs[i];
             continue;
         }
-        const auto layer_has_only_targets = [&](ErrorCode id_ec, const LocationIdVector &existing_ids) {
-            if (id_ec == EC_NOENT) {
-                return true;
-            }
-            return std::all_of(existing_ids.begin(), existing_ids.end(), [&](const LocationId &existing_id) {
+        if (id_ecs[i] == EC_NOENT && !existing_location_ids[i].empty()) {
+            KVCM_LOG_ERROR("%s maintenance location-id read returned NOENT with values for key[%ld]",
+                           read_layer,
+                           keys[i]);
+            results[i] = EC_ERROR;
+            continue;
+        }
+        if (location_ids[i].empty()) {
+            continue;
+        }
+        if (cache_backend_ && id_ecs[i] == EC_NOENT) {
+            // Normal RMW skips missing hot targets at its initial read. Keep
+            // a defensive admission gate for direct callers during Recover.
+            results[i] = recovering ? EC_OUT_OF_LIMIT : EC_NOENT;
+            continue;
+        }
+        if (cache_backend_ &&
+            std::none_of(existing_location_ids[i].begin(),
+                         existing_location_ids[i].end(),
+                         [&](const LocationId &existing_id) {
+                             return std::find(location_ids[i].begin(), location_ids[i].end(), existing_id) !=
+                                    location_ids[i].end();
+                         })) {
+            // An empty hot key or a stale target list is not a whole-key
+            // deletion candidate. At least one current target must remain.
+            results[i] = EC_NOENT;
+            continue;
+        }
+        const bool only_targets =
+            std::all_of(existing_location_ids[i].begin(), existing_location_ids[i].end(), [&](const LocationId &existing_id) {
                 return std::find(location_ids[i].begin(), location_ids[i].end(), existing_id) != location_ids[i].end();
             });
-        };
-        const bool primary_safe = layer_has_only_targets(primary_id_ecs[i], primary_location_ids[i]);
-        const bool hot_safe = !compare_cache || layer_has_only_targets(hot_id_ecs[i], hot_location_ids[i]);
-        (primary_safe && hot_safe ? whole_key_indexes : target_only_indexes).push_back(i);
+        if (only_targets) {
+            whole_key_indexes.push_back(i);
+        } else {
+            target_only_indexes.push_back(i);
+        }
     }
 
     if (!target_only_indexes.empty()) {
@@ -1015,6 +1077,9 @@ std::vector<ErrorCode> MetaStorageBackendManager::DeleteLocationsForMaintenance(
                            whole_key_indexes.size());
             primary_results.assign(whole_key_indexes.size(), EC_ERROR);
         }
+        // Register before removing the hot key. Backfill either precedes the
+        // hot delete, or observes this marker under deleted_keys_mutex_.
+        RecordRecoverDeletedKeys(whole_keys, primary_results);
         std::vector<ErrorCode> whole_results = primary_results;
         if (route.secondary) {
             // A key already absent from persistent still needs its hot copy
@@ -1149,6 +1214,11 @@ std::vector<ErrorCode> MetaStorageBackendManager::Get(RequestContext *request_co
     }
 
     auto [missing_keys, missing_indices] = CollectMissingKeys(keys, results);
+    for (const size_t index : missing_indices) {
+        out_locations[index].clear();
+        out_properties[index].clear();
+    }
+    FilterRecoverFallbackKeys(missing_keys, missing_indices);
     if (missing_keys.empty()) {
         return results;
     }
@@ -1204,6 +1274,10 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocations(RequestContext *r
     }
 
     auto [missing_keys, missing_indices] = CollectMissingKeys(keys, results);
+    for (const size_t index : missing_indices) {
+        out_location_maps[index].clear();
+    }
+    FilterRecoverFallbackKeys(missing_keys, missing_indices);
     if (missing_keys.empty()) {
         return results;
     }
@@ -1257,6 +1331,10 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationValues(RequestConte
     }
 
     auto [missing_keys, missing_indices] = CollectMissingKeys(keys, results);
+    for (const size_t index : missing_indices) {
+        out_locations[index].clear();
+    }
+    FilterRecoverFallbackKeys(missing_keys, missing_indices);
     if (missing_keys.empty()) {
         return results;
     }
@@ -1310,54 +1388,18 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationsFromPrimary(
     return results;
 }
 
-std::vector<ErrorCode> MetaStorageBackendManager::RefreshCacheFromPersistent(RequestContext *request_context,
-                                                                             const KeyVector &keys) noexcept {
-    if (keys.empty()) {
-        return {};
+std::vector<ErrorCode>
+MetaStorageBackendManager::EnsureCacheForGc(RequestContext *request_context, const KeyVector &keys) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    if (!cache_backend_ || GetRecoverState() != RecoverState::kRecover) {
+        return results;
     }
-    if (!cache_backend_) {
-        return std::vector<ErrorCode>(keys.size(), EC_OK);
-    }
-
-    CacheLocationMapVector locations;
-    PropertyMapVector properties;
-    std::vector<ErrorCode> persistent_results = persistent_backend_->Get(request_context, keys, locations, properties);
-    if (persistent_results.size() != keys.size() || locations.size() != keys.size() ||
-        properties.size() != keys.size()) {
-        KVCM_LOG_ERROR("persistent refresh shape mismatch, instance[%s] keys[%zu] results[%zu] locations[%zu] "
-                       "properties[%zu]",
-                       instance_id_.c_str(),
-                       keys.size(),
-                       persistent_results.size(),
-                       locations.size(),
-                       properties.size());
-        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
-    }
-
-    std::vector<ErrorCode> results = persistent_results;
-    const std::vector<ErrorCode> put_results =
-        cache_backend_->Put(request_context, keys, locations, properties, persistent_results);
-    if (put_results.size() != keys.size()) {
-        KVCM_LOG_ERROR("cache refresh Put shape mismatch, instance[%s] keys[%zu] results[%zu]",
-                       instance_id_.c_str(),
-                       keys.size(),
-                       put_results.size());
-        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
-    }
-
-    KeyVector missing_keys;
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (persistent_results[i] == EC_OK) {
-            results[i] = put_results[i];
-        } else if (persistent_results[i] == EC_NOENT) {
-            // Do not let a stale hot-cache entry resurrect metadata that has
-            // already disappeared from the source of truth.
-            missing_keys.push_back(keys[i]);
-        }
-    }
-    if (!missing_keys.empty()) {
-        (void)cache_backend_->Delete(request_context, missing_keys);
-    }
+    // Ordinary GC only fills a genuinely missing key during recovery. Existing
+    // hot keys may already reflect accepted async writes, so a full overwrite
+    // could resurrect removed Locations or discard newer business writes.
+    // EnsureKeyInCache rechecks the phase and tombstone before Redis fallback.
+    // Its caller holds the shard lock and must reread hot for the target CAS.
+    EnsureKeyInCache(request_context, keys, &results);
     return results;
 }
 
@@ -1457,7 +1499,6 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
 
     KeyTypeVec missing_keys;
     std::vector<size_t> missing_indices;
-    LocationIdsPerKey missing_location_ids;
     if (!ambiguous_keys.empty()) {
         std::vector<bool> cache_key_exists;
         const std::vector<ErrorCode> exists_results =
@@ -1483,12 +1524,17 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
             if (!cache_key_exists[i]) {
                 missing_keys.push_back(keys[original_idx]);
                 missing_indices.push_back(original_idx);
-                missing_location_ids.push_back(location_ids[original_idx]);
             }
         }
     }
+    FilterRecoverFallbackKeys(missing_keys, missing_indices);
     if (missing_keys.empty()) {
         return results;
+    }
+    LocationIdsPerKey missing_location_ids;
+    missing_location_ids.reserve(missing_indices.size());
+    for (const size_t index : missing_indices) {
+        missing_location_ids.push_back(location_ids[index]);
     }
 
     LocationsPerKey persistent_locations;
@@ -1532,91 +1578,48 @@ MetaStorageBackendManager::GetLocationsForMaintenance(RequestContext *request_co
         out_locations.assign(keys.size(), CacheLocationVector{});
         return std::vector<std::vector<ErrorCode>>(keys.size(), std::vector<ErrorCode>{EC_BADARGS});
     }
-    const WriteRoute route = GetWriteRoute(memory_primary_);
-    if (!cache_backend_ || route.local_primary) {
-        return route.primary.GetLocationsForMaintenance(request_context, keys, location_ids, out_locations);
+    if (!cache_backend_) {
+        return persistent_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, out_locations);
     }
 
-    // A unified GC round scans the hot cache, but a stale hot value must not
-    // authorize deletion of a newer persistent value left by a partial mirror
-    // failure. Revalidate both layers without touching/backfilling the cache;
-    // one missing copy is safe to converge, while two different present copies
-    // fail closed as a compare mismatch.
-    LocationsPerKey hot_locations;
-    const auto hot_results =
-        cache_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, hot_locations);
-    LocationsPerKey persistent_locations;
-    const auto persistent_results =
-        persistent_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, persistent_locations);
-
-    std::vector<std::vector<ErrorCode>> results(keys.size());
-    out_locations.resize(keys.size());
-    const bool outer_shape_valid = hot_results.size() == keys.size() && hot_locations.size() == keys.size() &&
-                                   persistent_results.size() == keys.size() &&
-                                   persistent_locations.size() == keys.size();
-    if (!outer_shape_valid) {
-        KVCM_LOG_ERROR("maintenance target read shape mismatch, keys[%lu] hot_ecs[%lu] hot_values[%lu] "
-                       "persistent_ecs[%lu] persistent_values[%lu]",
+    // The caller's shard lock serializes ordinary writes and target validation.
+    // A hot key was restored or hydrated as a complete key; neither missing
+    // keys nor missing targets may fall back to queued Redis snapshots here.
+    auto results = cache_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, out_locations);
+    if (results.size() != keys.size() || out_locations.size() != keys.size()) {
+        KVCM_LOG_ERROR("maintenance target read shape mismatch, keys[%lu] hot_ecs[%lu] hot_values[%lu]",
                        keys.size(),
-                       hot_results.size(),
-                       hot_locations.size(),
-                       persistent_results.size(),
-                       persistent_locations.size());
+                       results.size(),
+                       out_locations.size());
+        results.resize(keys.size());
+        out_locations.resize(keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
             results[i].assign(location_ids[i].size(), EC_ERROR);
             out_locations[i].assign(location_ids[i].size(), CacheLocationConstPtr{});
         }
         return results;
     }
-
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i].assign(location_ids[i].size(), EC_ERROR);
-        out_locations[i].assign(location_ids[i].size(), CacheLocationConstPtr{});
-        if (hot_results[i].size() != location_ids[i].size() || hot_locations[i].size() != location_ids[i].size() ||
-            persistent_results[i].size() != location_ids[i].size() ||
-            persistent_locations[i].size() != location_ids[i].size()) {
-            KVCM_LOG_ERROR("maintenance target read key[%ld] shape mismatch, ids[%lu] hot_ecs[%lu] hot_values[%lu] "
-                           "persistent_ecs[%lu] persistent_values[%lu]",
+        if (results[i].size() != location_ids[i].size() || out_locations[i].size() != location_ids[i].size()) {
+            KVCM_LOG_ERROR("maintenance target read key[%ld] shape mismatch, ids[%lu] hot_ecs[%lu] hot_values[%lu]",
                            keys[i],
                            location_ids[i].size(),
-                           hot_results[i].size(),
-                           hot_locations[i].size(),
-                           persistent_results[i].size(),
-                           persistent_locations[i].size());
+                           results[i].size(),
+                           out_locations[i].size());
+            results[i].assign(location_ids[i].size(), EC_ERROR);
+            out_locations[i].assign(location_ids[i].size(), CacheLocationConstPtr{});
             continue;
         }
-
         for (size_t j = 0; j < location_ids[i].size(); ++j) {
-            const auto validate_layer = [&](ErrorCode ec, const CacheLocationConstPtr &location) {
-                if (ec == EC_NOENT) {
-                    return location ? EC_ERROR : EC_NOENT;
-                }
-                if (ec != EC_OK) {
-                    return ec;
-                }
-                return location && location->id() == location_ids[i][j] ? EC_OK : EC_ERROR;
-            };
-            const ErrorCode hot_ec = validate_layer(hot_results[i][j], hot_locations[i][j]);
-            const ErrorCode persistent_ec = validate_layer(persistent_results[i][j], persistent_locations[i][j]);
-            if (hot_ec != EC_OK && hot_ec != EC_NOENT) {
-                results[i][j] = hot_ec;
-                continue;
+            auto &ec = results[i][j];
+            auto &location = out_locations[i][j];
+            if ((ec == EC_OK && (!location || location->id() != location_ids[i][j])) ||
+                (ec == EC_NOENT && location)) {
+                ec = EC_ERROR;
             }
-            if (persistent_ec != EC_OK && persistent_ec != EC_NOENT) {
-                results[i][j] = persistent_ec;
-                continue;
+            if (ec != EC_OK) {
+                location.reset();
             }
-            if (hot_ec == EC_NOENT && persistent_ec == EC_NOENT) {
-                results[i][j] = EC_NOENT;
-                continue;
-            }
-            if (hot_ec == EC_OK && persistent_ec == EC_OK &&
-                hot_locations[i][j]->ToJsonString() != persistent_locations[i][j]->ToJsonString()) {
-                results[i][j] = EC_MISMATCH;
-                continue;
-            }
-            results[i][j] = EC_OK;
-            out_locations[i][j] = hot_ec == EC_OK ? hot_locations[i][j] : persistent_locations[i][j];
         }
     }
     return results;
@@ -1671,16 +1674,20 @@ MetaStorageBackendManager::GetLocationsWithKeyStatus(RequestContext *request_con
 
     KeyVector missing_keys;
     std::vector<size_t> missing_indices;
-    LocationIdsPerKey missing_location_ids;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (out_key_error_codes[i] == EC_NOENT) {
             missing_keys.push_back(keys[i]);
             missing_indices.push_back(i);
-            missing_location_ids.push_back(location_ids[i]);
         }
     }
+    FilterRecoverFallbackKeys(missing_keys, missing_indices);
     if (missing_keys.empty()) {
         return results;
+    }
+    LocationIdsPerKey missing_location_ids;
+    missing_location_ids.reserve(missing_indices.size());
+    for (const size_t index : missing_indices) {
+        missing_location_ids.push_back(location_ids[index]);
     }
 
     LocationsPerKey persistent_locations;
@@ -1825,6 +1832,10 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationIds(RequestContext 
     }
 
     auto [missing_keys, missing_indices] = CollectMissingKeys(keys, results);
+    for (const size_t index : missing_indices) {
+        out_location_ids[index].clear();
+    }
+    FilterRecoverFallbackKeys(missing_keys, missing_indices);
     if (missing_keys.empty()) {
         return results;
     }
@@ -1856,13 +1867,14 @@ namespace {
 
 // Same cache-first/fallback read view as online reads, without backfilling or
 // promoting either layer. A malformed result is a failure, never an empty value.
-template <typename Values, typename Read>
+template <typename Values, typename Read, typename Filter>
 std::vector<ErrorCode> ReadForMaintenance(const KeyVector &keys,
                                           MetaStorageBackend *cache,
                                           MetaStorageBackend *persistent,
                                           bool cache_complete,
                                           Values &out,
-                                          Read read) {
+                                          Read read,
+                                          Filter filter) {
     out.clear();
     if (keys.empty()) {
         return {};
@@ -1888,6 +1900,7 @@ std::vector<ErrorCode> ReadForMaintenance(const KeyVector &keys,
             positions.push_back(i);
         }
     }
+    filter(missing, positions);
     if (missing.empty()) {
         return results;
     }
@@ -1916,6 +1929,9 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationMapsForMaintenance(
                               out_locations,
                               [&](const auto &backend, const auto &batch, auto &out) {
                                   return backend->GetLocationMapsForMaintenance(request_context, batch, out);
+                              },
+                              [&](auto &missing, auto &indices) {
+                                  FilterRecoverFallbackKeys(missing, indices);
                               });
 }
 
@@ -1941,6 +1957,10 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetProperties(RequestContext *
     }
 
     auto [missing_keys, missing_indices] = CollectMissingKeys(keys, results);
+    for (const size_t index : missing_indices) {
+        out_properties[index].clear();
+    }
+    FilterRecoverFallbackKeys(missing_keys, missing_indices);
     if (missing_keys.empty()) {
         return results;
     }
@@ -1997,6 +2017,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Exists(RequestContext *request
             missing_indices.push_back(i);
         }
     }
+    FilterRecoverFallbackKeys(missing_keys, missing_indices);
     if (missing_keys.empty()) {
         return results;
     }

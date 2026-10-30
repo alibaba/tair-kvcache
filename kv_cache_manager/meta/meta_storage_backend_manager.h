@@ -77,7 +77,8 @@ public:
     std::vector<ErrorCode> DeleteLocationsForMaintenance(RequestContext *request_context,
                                                          const KeyVector &keys,
                                                          const LocationIdsPerKey &location_ids,
-                                                         int32_t &out_reclaimed_count) noexcept;
+                                                         int32_t &out_reclaimed_count,
+                                                         bool local_primary) noexcept;
     ErrorCode
     TrimPersistentOrphans(RequestContext *request_context, const KeyVector &keys, KeyVector &out_trimmed_keys) noexcept;
 
@@ -103,10 +104,11 @@ public:
     std::vector<ErrorCode> GetLocationsFromPrimary(RequestContext *request_context,
                                                    const KeyVector &keys,
                                                    CacheLocationMapVector &out_location_maps) noexcept;
-    // Refresh complete keys from persistent storage into the hot cache before
-    // a maintenance RMW. The caller must hold the corresponding shard locks.
-    // Caller skips this in running memory-primary mode, under its shard lock.
-    std::vector<ErrorCode> RefreshCacheFromPersistent(RequestContext *request_context, const KeyVector &keys) noexcept;
+    // Hydrate missing complete keys during Recover before an ordinary GC RMW.
+    // Existing hot keys are never overwritten; Running never falls back.
+    // The caller must hold the corresponding shard locks and reread hot after
+    // this call before authorizing a conditional mutation.
+    std::vector<ErrorCode> EnsureCacheForGc(RequestContext *request_context, const KeyVector &keys) noexcept;
     std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
                                                      const KeyVector &keys,
                                                      const LocationIdsPerKey &location_ids,
@@ -188,8 +190,16 @@ public:
     // Returns true on success, false on failure/timeout.
     bool Sync(const KeyVector &keys) noexcept;
     bool SyncAll() noexcept;
-    bool SyncBeforeMaintenanceRead(const KeyVector &keys) noexcept { return memory_primary_ || Sync(keys); }
+    // Capture once under the RMW shard fence for the deletion write order.
+    // Cached maintenance reads always use hot, independently of this route.
+    bool UseLocalPrimaryForMaintenance() const noexcept {
+        return memory_primary_ && GetRecoverState() == RecoverState::kRunning;
+    }
+    bool SyncBeforeMaintenanceRead(const KeyVector &keys) noexcept {
+        return cache_backend_ || Sync(keys);
+    }
     bool IsMemoryPrimary() const noexcept { return memory_primary_; }
+    bool HasCacheBackend() const noexcept { return cache_backend_ != nullptr; }
 
     // A persistent-only backend has no synchronous hot view that can expose an
     // accepted maintenance delete to the next same-key RMW. Conservatively
@@ -238,7 +248,13 @@ private:
     // Hydrate missing keys from persistent into cache during Recover. Returns
     // false when a backend violates the positional response contract or the
     // full pre-update value cannot be made available safely.
-    bool EnsureKeyInCache(RequestContext *request_context, const KeyTypeVec &keys) noexcept;
+    bool EnsureKeyInCache(RequestContext *request_context,
+                          const KeyTypeVec &keys,
+                          std::vector<ErrorCode> *out_results = nullptr) noexcept;
+    // Input contains only whole-key cache misses. Deleted keys remain logical
+    // misses during Recover; after Running no cache miss may fall back at all.
+    void FilterRecoverFallbackKeys(KeyTypeVec &keys, std::vector<size_t> &indices) const noexcept;
+    void RecordRecoverDeletedKeys(const KeyVector &keys, const std::vector<ErrorCode> &results) noexcept;
     // Delete keys that have no remaining location fields. Returns reclaimed count.
     int32_t MaybeReclaimEmptyKeys(RequestContext *request_context,
                                   const KeyVector &keys,

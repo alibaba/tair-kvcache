@@ -68,8 +68,9 @@ struct CacheLocationDelRequest {
     // Event-report metadata describes externally owned cache. Its reconciliation
     // cleanup must remove only KVCM metadata and never call the URI backend.
     bool metadata_only{false};
-    // GC physical deletion revalidates against the persistent source of truth
-    // and refreshes candidate keys into the hot cache before CAS.
+    // GC prefilters candidates against the configured primary outside the
+    // shard lock. Cached CAS then validates hot, hydrating only missing
+    // Recover keys; it never overwrites an existing hot key.
     bool authoritative_read{false};
     // URIs that the submitter has already confirmed absent. Each Backend's
     // ShouldSkipConfirmedMissingBackendDelete policy determines whether to

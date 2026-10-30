@@ -1164,7 +1164,7 @@ TEST_F(CacheGarbageCollectorTest, BackendRecoveryGraceDoesNotPauseOrdinaryGcCand
     backend->Close();
 }
 
-TEST_F(CacheGarbageCollectorTest, MetadataRecoverySkipsEventReportAndResumesAfterRecovery) {
+TEST_F(CacheGarbageCollectorTest, MetadataRecoveryAllowsEventReportAndOrdinaryGcCleanup) {
     auto config = DefaultConfig();
     config.event_report_cleanup_enabled = true;
     config.scan_batch_size = 8;
@@ -1189,6 +1189,8 @@ TEST_F(CacheGarbageCollectorTest, MetadataRecoverySkipsEventReportAndResumesAfte
     const auto batch = MakeBatch(SCAN_BASE_CURSOR, {101}, {locations});
     scan_responses["instance_a"] = {{EC_OK, batch}, {EC_OK, batch}, {EC_OK, batch}};
     recovering_instances.insert("instance_a");
+    active_instance_id = "instance_a";
+    ASSERT_TRUE(dummy_indexer->IsRecovering());
 
     for (size_t round = 0; round < 2; ++round) {
         gc->next_round_at_.reset();
@@ -1196,8 +1198,14 @@ TEST_F(CacheGarbageCollectorTest, MetadataRecoverySkipsEventReportAndResumesAfte
         ASSERT_EQ(round + 1, submitted_requests.size());
         ASSERT_EQ(1u, submitted_requests.back().location_ids.size());
         EXPECT_THAT(submitted_requests.back().location_ids.front(), UnorderedElementsAre("missing", "orphan"));
-        EXPECT_TRUE(submitted_event_report_requests.empty());
-        for (const std::string result : {"keep", "delete", "unknown", "error"}) {
+        ASSERT_EQ(round + 1, submitted_event_report_requests.size());
+        EXPECT_EQ((KeyVector{101}), submitted_event_report_requests.back().block_keys);
+        ASSERT_EQ(1u, submitted_event_report_requests.back().targets.size());
+        ASSERT_EQ(1u, submitted_event_report_requests.back().targets.front().size());
+        EXPECT_EQ(location_id, submitted_event_report_requests.back().targets.front().front().location_id);
+        EXPECT_EQ(round + 1,
+                  metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}).Get());
+        for (const std::string result : {"keep", "unknown", "error"}) {
             EXPECT_EQ(0,
                       metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", result}}).Get());
         }
@@ -1206,19 +1214,21 @@ TEST_F(CacheGarbageCollectorTest, MetadataRecoverySkipsEventReportAndResumesAfte
     EXPECT_EQ(2u, might_exist_calls.size());
 
     recovering_instances.erase("instance_a");
+    ASSERT_FALSE(dummy_indexer->IsRecovering());
     gc->next_round_at_.reset();
     gc->RunOneTick();
 
-    ASSERT_EQ(1u, submitted_event_report_requests.size());
-    EXPECT_EQ((KeyVector{101}), submitted_event_report_requests.front().block_keys);
-    ASSERT_EQ(1u, submitted_event_report_requests.front().targets.size());
-    ASSERT_EQ(1u, submitted_event_report_requests.front().targets.front().size());
-    EXPECT_EQ(location_id, submitted_event_report_requests.front().targets.front().front().location_id);
-    EXPECT_EQ(1, metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}).Get());
+    ASSERT_EQ(3u, submitted_requests.size());
+    ASSERT_EQ(3u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{101}), submitted_event_report_requests.back().block_keys);
+    ASSERT_EQ(1u, submitted_event_report_requests.back().targets.size());
+    ASSERT_EQ(1u, submitted_event_report_requests.back().targets.front().size());
+    EXPECT_EQ(location_id, submitted_event_report_requests.back().targets.front().front().location_id);
+    EXPECT_EQ(3, metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}).Get());
     backend->Close();
 }
 
-TEST_F(CacheGarbageCollectorTest, MetadataRecoveryDoesNotPauseOtherInstancesEventReportCleanup) {
+TEST_F(CacheGarbageCollectorTest, MetadataRecoveryAllowsCleanupAcrossInstances) {
     AddInstance("group_a", "instance_b");
     auto config = DefaultConfig();
     config.event_report_cleanup_enabled = true;
@@ -1239,19 +1249,23 @@ TEST_F(CacheGarbageCollectorTest, MetadataRecoveryDoesNotPauseOtherInstancesEven
         scan_responses[instance_id] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {101}, {locations})}};
     }
     recovering_instances.insert("instance_a");
+    active_instance_id = "instance_a";
+    ASSERT_TRUE(dummy_indexer->IsRecovering());
 
     gc->RunOneTick();
-    EXPECT_TRUE(submitted_event_report_requests.empty());
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ("instance_a", submitted_event_report_requests.front().instance_id);
     gc->RunOneTick();
 
     ASSERT_EQ(2u, scan_calls.size());
-    ASSERT_EQ(1u, submitted_event_report_requests.size());
-    EXPECT_EQ("instance_b", submitted_event_report_requests.front().instance_id);
-    EXPECT_EQ(1, metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}).Get());
+    ASSERT_EQ(2u, submitted_event_report_requests.size());
+    EXPECT_EQ("instance_b", submitted_event_report_requests.back().instance_id);
+    EXPECT_FALSE(dummy_indexer->IsRecovering());
+    EXPECT_EQ(2, metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}).Get());
     backend->Close();
 }
 
-TEST_F(CacheGarbageCollectorTest, BufferedEventReportBatchRechecksMetadataRecovery) {
+TEST_F(CacheGarbageCollectorTest, BufferedEventReportBatchContinuesAcrossMetadataRecovery) {
     auto config = DefaultConfig();
     config.event_report_cleanup_enabled = true;
     config.scan_batch_size = 4;
@@ -1271,17 +1285,21 @@ TEST_F(CacheGarbageCollectorTest, BufferedEventReportBatchRechecksMetadataRecove
              location_id, CLS_SERVING, backend->GetStorageType(), {"event_report://event_report_l1p5/object"})}};
     scan_responses["instance_a"] = {{EC_OK, MakeBatch(SCAN_BASE_CURSOR, {101, 202}, {locations, locations})}};
     recovering_instances.insert("instance_a");
+    active_instance_id = "instance_a";
+    ASSERT_TRUE(dummy_indexer->IsRecovering());
 
     gc->RunOneTick();
-    EXPECT_TRUE(submitted_event_report_requests.empty());
+    ASSERT_EQ(1u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{101}), submitted_event_report_requests.front().block_keys);
     ASSERT_TRUE(gc->round_active_);
 
     recovering_instances.erase("instance_a");
+    ASSERT_FALSE(dummy_indexer->IsRecovering());
     gc->RunOneTick();
 
     EXPECT_EQ(1u, scan_calls.size());
-    ASSERT_EQ(1u, submitted_event_report_requests.size());
-    EXPECT_EQ((KeyVector{202}), submitted_event_report_requests.front().block_keys);
+    ASSERT_EQ(2u, submitted_event_report_requests.size());
+    EXPECT_EQ((KeyVector{202}), submitted_event_report_requests.back().block_keys);
     EXPECT_FALSE(gc->round_active_);
     backend->Close();
 }
