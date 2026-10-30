@@ -115,7 +115,7 @@ GC 的 `LoopThread` 回调会同步调用 Registry、maintenance scan 和 DataSt
 
 GC 新增的风险暴露点是：demotion 必须在 cleanup 前 `Join()`，因此慢或失联的 metadata/DataStorage 探测可能延长降级时间。GC 默认关闭，生产上线时应灰度开启并监控扫描错误、共享 Executor/存储后端负载与降级时延；若确认底层调用缺少有限返回上界，应作为公共基础设施问题独立治理。GC V1 不自行重构 Redis 建连、认证、重连、timeout/cancel、连接池或 data storage I/O 语义。
 
-当前基线已包含 #234 的异步删除能力和 #233 的 `expected_location_values` 精确值条件删除。GC 直接复用二者：首次入队 accepted、端到端 Future、Get/CAS/Sync、delay、二次入队、物理删除和 promise 收敛均沿用现有实现。GC 请求额外声明 `authoritative_read`：`PrepareDeleteTaskImpl` 从 persistent source of truth 重新读取扫描目标，条件 CAS 在 shard lock 内先用完整 persistent key 刷新可能缺失或陈旧的 hot cache，再按 expected value 原子复核。普通删除请求不启用该选项，现有同步/异步兼容语义不变。
+当前基线已包含 #234 的异步删除能力和 #233 的 `expected_location_values` 精确值条件删除。GC 直接复用二者：首次入队 accepted、端到端 Future、Get/CAS/Sync、delay、二次入队、物理删除和 promise 收敛均沿用现有实现。GC 请求额外声明 `authoritative_read`：`PrepareDeleteTaskImpl` 按现有主存储选择重新读取扫描目标作为前置筛选；cached 模式的设计要求是条件 CAS 在 shard lock 内校验实际 hot 目标，不全量覆盖已有 K，Recover 缺 K 时才按需完整补齐，Running 缺失则跳过，详见[恢复期 GC 设计 4.4](event_report_gc_during_recover.md#44-普通-gc目标校验与按需补齐)。普通删除请求不启用该选项，现有同步/异步兼容语义不变。
 
 当前基线也已包含 #209 的分层存储迁移。Migration Copy 会创建合法的 `CLS_WRITING` 目标，并用 `MigrationManager` 活跃任务 reservation 覆盖 Prepare、Copy 和收尾窗口。GC 复用 `HasActiveCopyTargetLocation(instance_id, block_key, location_id)` 排除这些目标；任务结束后若仍留下 WRITING，后续 round 才按普通 orphan 收敛。GC 删除沿用 `kReclaim` 任务类别，不占 migration worker budget，也不修改迁移的队列优先级和并发限制。
 
@@ -147,7 +147,7 @@ flowchart LR
 | `MetaIndexer` | 从 maintenance scan backend 返回一个无副作用的 metadata batch；dual-backend 优先内存层 |
 | `MigrationManager` | 识别仍属于活跃 Copy 的 WRITING 目标，防止被当作 orphan |
 | `DataStorageManager` | 按 storage 合并普通 SERVING 的 URI，并通过 `MightExist()` 做低成本保守探测；EventReport 扩展按 Instance/type 路由到专用 Backend 判定 |
-| `SchedulePlanExecutor` | accepted 准入和端到端 Future；普通候选在 worker 内执行条件 CAS、Sync、物理删除和最终 CAD，EventReport 扩展在 worker 内执行 token/expected-value 复核与 metadata-only RMW |
+| `SchedulePlanExecutor` | accepted 准入和端到端 Future；普通候选在 worker 内执行条件 CAS、Sync、物理删除和最终 CAD；cached EventReport 扩展在 worker 内执行 token/hot expected-value 复核与 metadata-only RMW，不读取 Redis 做双层比较或执行读前 Sync |
 | `Server/CacheManager` | 在 leader recovery/demotion 和进程析构时管理 GC 生命周期 |
 
 GC 只访问 data storage 的低成本 `MightExist()` 探测接口，不执行物理删除，也不自行实现 Location 删除状态机。
@@ -279,7 +279,7 @@ ErrorCode MetaIndexer::ScanLocationsForMaintenance(
 4. Scan 级错误时不推进 cursor，并先轮转其他 Instance；同一 Instance 本轮连续 3 次失败后跳过本轮，下一 round 从 base cursor 重试。单 key 已不存在或读取失败时跳过该 key，cursor 正常推进，由下一轮再覆盖。
 5. `limit` 只作为 backend hint；调用方不能假设实际数量一定不超过该值。
 
-实现上，该契约下沉到 backend 的合并扫描接口。Local cache 在底层容器中直接复制 Location，不调用在线 `Lookup/Touch`；Redis/AsyncRedis 的 `SCAN` 只用于没有 cache backend 的 single-backend 部署。backend manager 在 dual-backend 模式下选择 cache backend 扫描，不因 miss 回填 persistent；在线读取接口保持不变。普通物理删除仍执行 authoritative revalidation；EventReport metadata action 在执行时 no-touch 对比 hot 与 persistent target，两侧值冲突则 fail-closed，也不会把 persistent 结果回填 hot cache。
+实现上，该契约下沉到 backend 的合并扫描接口。Local cache 在底层容器中直接复制 Location，不调用在线 `Lookup/Touch`；Redis/AsyncRedis 的 `SCAN` 只用于没有 cache backend 的 single-backend 部署。backend manager 在 dual-backend 模式下选择 cache backend 扫描，不因 miss 回填 persistent；在线读取接口保持不变。普通物理删除仍执行前置筛选和条件校验；cached EventReport metadata action 只 no-touch 读取实际 hot，与扫描快照比较完整 expected value，不读取 Redis 校验或补齐，缺失目标直接跳过。single-backend 则校验唯一后端并保留原 Sync。
 
 正常配置与 recovery 完成后，内存层应覆盖 GC 需要巡检的 metadata；但该完整性是运行期预期，不作为删除框架的强契约。这一选择降低了周期扫描 Redis 的常态成本，同时接受 dual-backend 下对 persistent keyspace 覆盖不完整：内存层未加载或已淘汰的冷 key 本轮不可见。GC 对这类对象只提供 best-effort 清理；后续业务访问、恢复或其他机制使其重新进入内存后，后续 round 才可能发现。
 
@@ -348,15 +348,15 @@ struct CacheLocationDelRequest {
 
 GC 对 WRITING 和 SERVING 两类 target 都设置扫描时的 `CacheLocation::ToJsonString()`，普通 storage 删除保持 `metadata_only=false`，并设置 `authoritative_read=true`。Executor 对每个 target：
 
-1. 从 persistent backend 重新读取当前 Location，不以 dual-backend 的 hot-cache 命中为删除前提；
+1. 沿用 `GetLocationsFromPrimary` 的主存储选择，在 shard lock 外重新读取当前 Location，作为候选筛选，不拿该结果覆盖 hot cache；
 2. Location 不存在，或完整序列化值与扫描快照不一致时跳过；
-3. 条件 CAS 持有 MetaIndexer shard lock 后，从 persistent backend 重新读取完整 key 并刷新 hot cache，避免 cache miss/stale 令 target 永久 no-op，也避免只回填单个 Location 隐藏同 Block 的其他字段；
+3. 条件 CAS 持有 MetaIndexer shard lock 后，cached 模式已有 hot K 只读取目标；Recover 缺 K 时经 `deleted_keys_` 过滤后完整 `PutIfAbsent`，再读取实际 hot 值；Running 缺 K 或目标则跳过，不回源、不新增锁内 Sync。不能只回填单个 Location 创建不完整 K；single-backend 沿用唯一后端的读取与校验；
 4. 构造“当前状态和完整 expected value -> `CLS_DELETING`”的条件 CAS；
 5. 只把 CAS 成功的精确子集交给现有 Sync、物理删除和 metadata CAD。
 
 如果并发 `FinishWriteCache` 已把 WRITING 改为 SERVING，或 SERVING 的 URI、create time 等字段被刷新，完整值比较会失败；如果 Reclaimer 同时提交同一 target，也只有一个 CAS winner。精确值条件比单独的 `expected_status` 更强，并允许一个请求同时包含 WRITING 与 SERVING 候选。
 
-未设置 `expected_location_values`、未启用 `authoritative_read` 的现有调用方保持当前行为。authoritative read 只在候选 admission/CAS 阶段触碰被选中的完整 key；maintenance scan 本身不从 persistent 回填 hot cache。V1 不新增 GC 专用删除状态机，也不改变物理删除和最终 CAD 的顺序。
+未设置 `expected_location_values`、未启用 `authoritative_read` 的现有调用方保持当前行为。上述 cached 补齐仅发生在 Recover 且整个 hot K 缺失时；maintenance scan 本身不从 persistent 回填 hot cache。普通 GC 不承担 Running 阶段 Redis-only 数据的补齐修复，不新增 GC 专用删除状态机，也不改变物理删除和最终 CAD 的顺序或原有锁外 Sync。
 
 #234 的 `SubmitAsync()` 首次入队成功后立即返回；Get/CAS/Sync、delay 和物理删除都在 Executor 中完成。精确值筛选和 CAS 已由 #233 落在共享 `PrepareDeleteTaskImpl`/MetaSearcher RMW 中，同步与异步入口复用同一 admission 语义。
 
@@ -493,7 +493,7 @@ GC 将 `MightExist` 已确认缺失的 URI 传给 Executor，由对应 Backend �
 2. 每个 tick 最多调用一次 Scan；缓存未耗尽时不重新 Scan、不轮转 Instance，cursor 到 base 后仍须消费完缓存才结束；cursor、Instance 推进和 round cooldown 正确。
 3. Registry/Scan 失败按普通间隔重试，不推进错误 cursor，也不零间隔空转；单 Instance 重试耗尽不会阻塞 round 完成和后续 Registry 快照。
 4. maintenance scan 在 dual-backend 下只读取 cache backend，不回退 persistent；persistent-only key 不会被本轮发现，single-backend 则扫描唯一 backend。
-5. Local/Dummy maintenance scan 不改变 LRU/access/revisit；扫描不会触发 persistent-to-cache 回填。普通物理删除候选仍由 Executor authoritative re-read 后条件删除；EventReport 候选在 worker 中执行 no-touch expected-value RMW。
+5. Local/Dummy maintenance scan 不改变 LRU/access/revisit；扫描不会触发 persistent-to-cache 回填。普通物理删除候选仍由 Executor 前置筛选后条件删除；cached EventReport 候选在 worker 中只对实际 hot 执行 no-touch expected-value RMW，缺 K/目标跳过，整 key 分组也只读 hot ID；single-backend 沿用唯一后端校验与原 Sync。
 6. 只有状态为 WRITING、字段有效且年龄达到 grace 的 Location 成为 orphan 候选；未来时间、解析失败和边界值 fail-closed。
 7. grace 配置不得小于 1 小时，默认值为 24 小时。
 8. 普通 SERVING 按 storage 批量探测，任一 spec 明确 missing 时选择整个 Location；全 true、无可探测 URI、storage 缺失/type 不符、shape 错误和异常均 fail-closed，EventReport 不进入该布尔规则；单次探测不超过 512 URI。扩展测试另验证 EventReport 与普通候选共享同一次 scan。

@@ -238,6 +238,24 @@ cc_test(
 )
 
 cc_test(
+    name = "gc_recover_real_redis_test",
+    srcs = ["gc_recover_real_redis_test.cc"],
+    copts = ["-fno-access-control"],
+    tags = [
+        "manual",
+        "redis",
+    ],
+    deps = [
+        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/common/test:redis_test_environment",
+        "//kv_cache_manager/meta:meta_async_redis_backend",
+        "//kv_cache_manager/meta:meta_indexer",
+        "//kv_cache_manager/meta:meta_redis_backend",
+    ],
+)
+
+cc_test(
     name = "meta_storage_backend_manager_real_redis_test",
     srcs = [
         "meta_storage_backend_manager_real_redis_test.cc",

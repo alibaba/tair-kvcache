@@ -323,14 +323,14 @@ Executor worker 对每个 Block key：
 
 该 action 不调用 DataStorage `Delete()`，不修改 Location status，不进入 `CLS_DELETING`。
 
-maintenance RMW 与现有 metadata 写路径使用相同的 per-key mutation fence 和一致性级别：
+maintenance RMW 与业务 metadata 写路径共用原 per-key mutation fence，cached 模式按以下规则以 hot 校验目标：
 
-- 对可能异步持久化的 metadata backend，在 shard fence 内执行读前 `Sync(key)`，确保此前 accepted 的同 key 写入对 expected-value 比较可见。cached metadata 的 hot view 在同一 shard fence 内同步删除，且 persistent queue 保持同 key 顺序，因此删除后直接释放锁；persistent-only backend 没有该 hot fence，仍在释放锁前执行第二个 `Sync(key)`。读前 barrier 失败时不执行 mutation；删后 barrier 失败保留 accepted 的 per-target 结果和一次性 accounting，同时以 aggregate hard error 交由后续 round 重试；
-- dual-backend 同时 no-touch 读取 hot 与 persistent target：一侧缺失允许幂等收敛，两侧均存在但值不同则返回 mismatch；
-- 整 key 回收必须在删除前确认 hot 与 persistent 均不存在非目标 sibling；无法证明时只删目标 Location；
-- 删除仍按 persistent -> hot 的现有镜像顺序执行，整 key 删除失败时保留可被后续 round 重新发现的 Location；
-- single-backend 直接复核唯一 backend；
-- metadata cached recovery 尚未完成时 fail-closed，等待后续 round；
+- cached Recover 和 Running 均只 no-touch 读取实际 hot 目标及 Location ID，不读取 Redis 做双层比较，不执行读前或删后 Sync；hot K 或目标缺失按 `EC_NOENT` 跳过，不回源；
+- 完整 expected-value、Reporter token/lease 与 Backend identity/availability 校验保留。已有 K 由完整恢复或完整补齐建立，正常业务更新 hot 与 GC 共用 shard 锁，普通 GC 不得用 Redis 全值覆盖已有 hot；
+- 整 key 分组只看 hot：仍有本次通过校验的删除目标之外的 Location，就只删目标；hot 仅剩已通过校验的目标时直接 DEL K，不因 Redis 尚未消费的旧 sibling 留下空 key；
+- 写路由独立于读取来源，每个 RMW batch 固定一次：Recover 与 Running 非 memory-primary 保持 persistent-first，Running memory-primary 沿用 local-primary。原失败返回、成功门控和同 key 队列顺序保留；
+- cached Recover 整 key 删除复用 `deleted_keys_`，按“persistent 接受删除 → 登记标记 → 删除 hot”阻止旧回填；部分删除保留含其他 Location 的 hot K。正常 RMW 在读取阶段按 `EC_NOENT` 跳过缺失目标，不逐 key 报错；底层仍保留 Recover hot K 缺失时拒绝修改的防御分支，意外触发时沿用普通错误日志；
+- single-backend 直接复核唯一后端；single async Redis 保留 shard 锁内读前与删后 Sync。读前失败不修改，删后失败保留 accepted 的 per-target 结果和一次性 accounting，并返回原 aggregate 错误；
 - 不增加逐层 mutation receipt、maintenance-pending 栅栏或精确跨进程补偿；
 - async persistent write 的最终持久化与 accounting 风险沿用普通 RMW 语义，失败由持续扫描 best effort 重试。
 
@@ -346,6 +346,10 @@ maintenance RMW 与现有 metadata 写路径使用相同的 per-key mutation fen
 - Join 丢弃本地 Future/pending handle，不等待已接受 action；Executor 继续 best effort，执行时仍需重新校验依赖和 token。
 
 如果 action 在 persistent/hot 之间部分失败，处理级别与普通 metadata RMW 一致，不为 GC 单独建立更强事务。持续异常通过 Future 结果、pending age 和下轮候选观测暴露。
+
+恢复期并发细节见 [Recover 期间允许 EventReport GC 清理](event_report_gc_during_recover.md)。在线 RMW 和写前补齐优先使用 hot；hot 整 key 缺失且命中 tombstone 时按逻辑不存在处理，不回源旧 Redis 值，也不新增业务侧 Sync。
+
+普通 GC 的协同设计要求：已有 hot K 不做覆盖式刷新，只在原 shard 锁内校验目标；Recover 缺 K 时经 tombstone 过滤后完整 `PutIfAbsent`，Running 缺 K 或目标时直接跳过，不回源、不新增锁内 Sync。两类 GC 可以继续清理各自满足条件的目标，不新增强刷保护集合。具体规则见[设计文档 4.4](event_report_gc_during_recover.md#44-普通-gc目标校验与按需补齐)；该规则是 cached EventReport 只依据 hot 校验的配套条件，普通 GC 物理删除前原有的锁外 Sync 仍保留。
 
 ## 6. 生命周期与并发
 
@@ -377,7 +381,7 @@ EventReport 事件不向 GC 写 intent，因此 `RequestStop` 之后仍可完成
 | Backend disable/remove/recreate | unique name + object identity + type 校验；Backend availability lease 持有到 metadata RMW 完成 |
 | GC 重复扫描同一 target | GC pending |
 | GC 与 Reclaimer 同时处理同一 Location | expected-value/CAS 最终仲裁 |
-| cached metadata recovery | maintenance RMW recover guard |
+| cached metadata recovery | 整 key tombstone、部分删除 hot-key 准入、在线回源过滤；普通 GC 按[目标校验与补齐规则](event_report_gc_during_recover.md#44-普通-gc目标校验与按需补齐)处理，仅 Recover 缺 K 时完整补齐，Running 缺失跳过 |
 | 同 block 多 Reporter | lease 稳定排序；一个 per-key RMW |
 
 ## 7. 异常与可观测性
@@ -433,11 +437,11 @@ EventReport 事件不向 GC 写 intent，因此 `RequestStop` 之后仍可完成
 8. Executor 入队后再改变 lifecycle/Backend incarnation，worker 必须重新校验并跳过。
 9. expected Location 已更新时返回 mismatch；EventReport 不调用物理 Delete、不进入 `CLS_DELETING`。
 10. no-touch maintenance RMW 不改变 LRU/access/revisit，并正确调整内存 charge、storage usage 和 reclaimed key count。
-11. cached metadata recovery 时拒绝 action；persistent 已 noent 时仍可幂等清理 hot copy。
-12. stale hot 与 newer persistent 不授权删除；跨层存在 sibling 时不执行整 key 回收；整 key 删除失败可重试。
+11. cached Recover 中整 key 删除阻止迟到回填；读取阶段 hot K 或目标缺失直接跳过；persistent 删除返回 NOENT 时仍可幂等清理 hot copy。删除后的在线 RMW 可在 Redis DEL 消费前重建 key，内容与 key count 正确，且不增加业务 Sync。
+12. hot 中仍有非目标 sibling 时不回收整 key；hot 仅剩本次已通过校验的目标时直接回收，不读取 Redis ID、不留下新的空 key；整 key 删除失败保留原失败语义。
 13. Snapshot abort 与已取得的 cleanup lease 串行，不跨 soft visibility 边界删除。
 14. Join 不等待已接受 EventReport Future，不发生 UAF。
-15. async metadata 的 pending 新写在 maintenance expected-value 读取前完成 barrier，不会被随后入队的删除覆盖；cached mode 依靠同步 hot mutation 作为删后 fence，persistent-only mode 的删后 barrier 在 shard fence 释放前完成。
+15. cached mode 下业务新值已写 hot、Redis 更新仍排队时，旧候选被 hot expected-value 比较拒绝，无读前或删后 Sync；先前 Location 删除尚未落 Redis 时，后续整 key 分组仍按 hot 正确收敛。single async Redis 的读前与删后 barrier 继续在 shard fence 内执行。
 16. Backend 提前 Open 但 Leader recovery 超过 grace 时，GC Start 仍重新提供完整恢复窗口。
 
 ### 8.3 E2E 与性能
@@ -474,7 +478,7 @@ EventReport 事件不向 GC 写 intent，因此 `RequestStop` 之后仍可完成
 | `schedule_plan_executor.*` | EventReport metadata-only `SubmitAsync`，worker 内 Backend/token/expected-value 复核 |
 | `event_report_backend.*` | batch 三态 probe、recovery deadline、maintenance token/lease |
 | `meta_searcher.*`、`meta_indexer.*` | expected-value ordinary RMW 的 no-touch maintenance 入口 |
-| `meta_local_backend.*`、`meta_storage_backend_manager.*` | 内存 scan/no-touch read-delete、dual-backend 镜像和 recover guard |
+| `meta_local_backend.*`、`meta_storage_backend_manager.*` | 内存 scan/no-touch read-delete、dual-backend 镜像、Recover tombstone 与回源保护 |
 | `admin_service_impl.cc` | 已知配置下拒绝同 Group/type 多 EventReport owner |
 | metrics、配置和测试 | 新语义对应的指标、默认值和确定性覆盖 |
 
@@ -485,9 +489,9 @@ V1 不新增线程、intent store、EventReport cursor、receipt、全局 Execut
 1. **best-effort 内存 scan**：dual-backend 下冷 key 可能长期残留；如需完整覆盖，再评估 persistent scan、反向索引或增量 Candidate Source。
 2. **周期收敛而非事件即时收敛**：默认 cooldown 5 分钟。若数据证明仍过慢，再增加独立但状态驱动的 cadence，不恢复 intent。
 3. **共享 inflight 的优先级取舍**：物理垃圾优先，极端持续压力下 EventReport 可能多等一轮；通过 dropped 和 candidate 指标观察。
-4. **无跨层事务**：V1 通过双层 expected-value 复核和删除前整 key 判定避免误删，但不引入逐层 receipt 或分布式事务；persistent/hot 部分失败由保留下来的候选和后续 round best effort 收敛。
+4. **正常写入与内存校验边界**：cached 路径通过 hot expected-value、token/lease 和原 shard 锁保护正常业务并发，不查询 Redis 弥补双写失败后的跨层差异；保留失败返回和成功门控，不提供 Redis-only 修复、逐层 receipt 或分布式事务。
 5. **Backend retirement fail-closed**：owner 被永久移除时缺少 lifecycle 授权，metadata 可能残留；Storage retirement reconciliation 是独立需求。
 6. **重启重置 recovery grace**：频繁切主可能延迟 recovery-absent 清理；跨进程 deadline 需要持久化 Reporter lifecycle。
 7. **Executor 全局容量**：GC 本地窗口不会限制其他调用方。若共享队列容量成为问题，应单独设计进程级 admission、任务类别配额和可观测性。
 8. **动态 pacing/热配置**：V1 固定启动配置。后续若要运行时缩短周期，需要补原子配置快照和 LoopThread 主动唤醒。
-9. **async metadata barrier 延迟**：maintenance action 按单个 Block key 持有 shard fence，cached mode 只保留读前 `Sync(key)`，persistent-only mode 保留读前和删除后两个 barrier，等待上界受 metadata sync timeout 约束。它不会同时锁住整个 action batch，但慢 Redis 会增加同 shard 在线请求延迟，需要结合 RMW lock-wait 指标灰度观察。
+9. **metadata 等待边界**：maintenance action 按单个 Block key 持有 shard fence，cached mode 无读前或删后 barrier，但同步 Redis 删除和异步入队背压仍可能等待；single async Redis 保留读前和删除后两个 barrier。它不会同时锁住整个 action batch，既有 Redis 等待仍可能增加同 shard 在线请求延迟。

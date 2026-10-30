@@ -468,7 +468,8 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
                                                           const KeyVector &all_keys,
                                                           RmwStats &stats,
                                                           Result &result,
-                                                          bool maintenance_no_touch) noexcept {
+                                                          bool maintenance_no_touch,
+                                                          bool maintenance_write_local_primary) noexcept {
     if (delete_batch.batch_keys.empty()) {
         return {0, 0};
     }
@@ -481,7 +482,11 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
         delete_ecs = backend_manager_->Delete(request_context, delete_batch.batch_keys);
     } else if (maintenance_no_touch) {
         delete_ecs = backend_manager_->DeleteLocationsForMaintenance(
-            request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count);
+            request_context,
+            delete_batch.batch_keys,
+            delete_batch.batch_location_ids,
+            reclaimed_count,
+            maintenance_write_local_primary);
     } else {
         delete_ecs = backend_manager_->Delete(
             request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count);
@@ -498,8 +503,8 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
     KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, cache_backend_delete_time_us, v);
     stats.cache_backend_delete_time_us += v;
 
-    const int32_t error_count =
-        ProcessErrorCodes(trace_id, delete_ecs, delete_batch.batch_indexs, all_keys, kRmwDeleteMetaOperation, result);
+    const int32_t error_count = ProcessErrorCodes(
+        trace_id, delete_ecs, delete_batch.batch_indexs, all_keys, kRmwDeleteMetaOperation, result);
     // For whole-key deletes, success count = keys - errors.
     // For location deletes, reclaimed_count reflects empty blocks auto-removed.
     const int32_t delete_success_count =
@@ -668,14 +673,14 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                                                                  const LocationIdsPerKey &location_ids,
                                                                  const LocationModifierFunc &modifier,
                                                                  bool adjust_reclaimed_key_count,
-                                                                 bool refresh_cache_from_persistent) noexcept {
+                                                                 bool hydrate_missing_cache) noexcept {
     return ReadModifyWriteLocationImpl(request_context,
                                        keys,
                                        location_ids,
                                        modifier,
                                        adjust_reclaimed_key_count,
                                        false,
-                                       refresh_cache_from_persistent,
+                                       hydrate_missing_cache,
                                        false);
 }
 
@@ -702,7 +707,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                                                      const LocationModifierFunc &modifier,
                                                                      bool adjust_reclaimed_key_count,
                                                                      bool track_created_key_count,
-                                                                     bool refresh_cache_from_persistent,
+                                                                     bool hydrate_missing_cache,
                                                                      bool maintenance_no_touch) noexcept {
     const auto &trace_id = request_context->trace_id();
     if (keys.empty()) {
@@ -751,6 +756,10 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         ScopedBatchLock lock(*this, batch.shard_indices, &stats.lock_wait_time_us, &stats.lock_hold_time_us);
 
         // 1. One batched read for every (key, location_id) return deserialised CacheLocation
+        // Cached maintenance always validates hot data. Only its write route
+        // is fixed for this batch, even if recovery completes before deletion.
+        const bool maintenance_write_local_primary =
+            maintenance_no_touch && backend_manager_->UseLocalPrimaryForMaintenance();
         if (maintenance_no_touch && !backend_manager_->SyncBeforeMaintenanceRead(batch_keys)) {
             // A single async metadata backend may still have an accepted
             // same-key mutation queued. Reading before that mutation reaches
@@ -770,13 +779,12 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         LocationsPerKey batch_locations_per_key;
         std::vector<ErrorCode> batch_key_get_ecs;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
-        std::vector<ErrorCode> refresh_results;
-        const bool refresh_cache = refresh_cache_from_persistent && !backend_manager_->IsMemoryPrimary();
-        if (refresh_cache) {
-            // Maintenance candidates originate from the persistent scan. Under
-            // the same shard lock as the CAS, replace a missing or stale hot
-            // cache entry with the complete source-of-truth key first.
-            refresh_results = backend_manager_->RefreshCacheFromPersistent(ephemeral_request_context.get(), batch_keys);
+        std::vector<ErrorCode> hydrate_results;
+        if (hydrate_missing_cache) {
+            // Ordinary GC may hydrate a missing Recover key under the same
+            // shard lock as its CAS. Existing hot keys are never overwritten;
+            // Running and tombstoned keys do not fall back to Redis.
+            hydrate_results = backend_manager_->EnsureCacheForGc(ephemeral_request_context.get(), batch_keys);
         }
         std::vector<std::vector<ErrorCode>> get_ecs_per_key;
         if (track_created_key_count) {
@@ -786,12 +794,15 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                                                           batch_locations_per_key,
                                                                           batch_key_get_ecs);
         } else {
-            get_ecs_per_key =
-                maintenance_no_touch
-                    ? backend_manager_->GetLocationsForMaintenance(
-                          ephemeral_request_context.get(), batch_keys, batch_location_ids, batch_locations_per_key)
-                    : backend_manager_->GetLocations(
-                          ephemeral_request_context.get(), batch_keys, batch_location_ids, batch_locations_per_key);
+            get_ecs_per_key = (maintenance_no_touch || (hydrate_missing_cache && backend_manager_->HasCacheBackend()))
+                                 ? backend_manager_->GetLocationsForMaintenance(ephemeral_request_context.get(),
+                                                                               batch_keys,
+                                                                               batch_location_ids,
+                                                                               batch_locations_per_key)
+                                 : backend_manager_->GetLocations(ephemeral_request_context.get(),
+                                                                  batch_keys,
+                                                                  batch_location_ids,
+                                                                  batch_locations_per_key);
         }
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
         int64_t v = 0;
@@ -804,7 +815,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
 
         if (get_ecs_per_key.size() != batch_keys.size() || batch_locations_per_key.size() != batch_keys.size() ||
             (track_created_key_count && batch_key_get_ecs.size() != batch_keys.size()) ||
-            (refresh_cache && refresh_results.size() != batch_keys.size())) {
+            (hydrate_missing_cache && hydrate_results.size() != batch_keys.size())) {
             PREFIX_INDEXER_LOG(ERROR,
                                "ReadModifyWriteLocation result size mismatch, keys[%lu], ecs[%lu], locations[%lu], "
                                "key_ecs[%lu]",
@@ -820,12 +831,12 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             continue;
         }
 
-        if (refresh_cache) {
+        if (hydrate_missing_cache) {
             for (size_t i = 0; i < batch_keys.size(); ++i) {
-                if (refresh_results[i] == EC_OK) {
+                if (hydrate_results[i] == EC_OK) {
                     continue;
                 }
-                get_ecs_per_key[i].assign(batch_location_ids[i].size(), refresh_results[i]);
+                get_ecs_per_key[i].assign(batch_location_ids[i].size(), hydrate_results[i]);
                 batch_locations_per_key[i].assign(batch_location_ids[i].size(), nullptr);
             }
         }
@@ -986,7 +997,14 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             }
         }
         const auto [delete_errs, delete_success_count] = ExecuteRmwDelete(
-            trace_id, ephemeral_request_context.get(), delete_batch, keys, stats, rmw_result, maintenance_no_touch);
+            trace_id,
+            ephemeral_request_context.get(),
+            delete_batch,
+            keys,
+            stats,
+            rmw_result,
+            maintenance_no_touch,
+            maintenance_write_local_primary);
         (void)delete_errs;
         const bool maintenance_delete_synced = !maintenance_no_touch || delete_batch.batch_keys.empty() ||
                                                !backend_manager_->RequiresMaintenancePostDeleteSync() ||

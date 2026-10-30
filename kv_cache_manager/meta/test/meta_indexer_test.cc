@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -140,6 +141,89 @@ public:
     bool sync_result = true;
     KeyTypeVec force_deleted_keys;
     KeyTypeVec synced_keys;
+};
+
+// A deterministic async persistent view: accepted writes remain invisible
+// until Drain(), while reads keep returning the pre-delete value.
+class DeferredRecoveryRmwBackend : public MetaLocalBackend {
+public:
+    using MetaLocalBackend::GetLocations;
+
+    std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *context,
+                                                     const KeyTypeVec &keys,
+                                                     const LocationIdsPerKey &ids,
+                                                     LocationsPerKey &locations) noexcept override {
+        ++target_read_calls;
+        return MetaLocalBackend::GetLocations(context, keys, ids, locations);
+    }
+
+    std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *context,
+                                                                  const KeyTypeVec &keys,
+                                                                  const LocationIdsPerKey &ids,
+                                                                  LocationsPerKey &locations) noexcept override {
+        ++maintenance_read_calls;
+        return MetaLocalBackend::GetLocationsForMaintenance(context, keys, ids, locations);
+    }
+
+    std::vector<ErrorCode> Delete(RequestContext *, const KeyTypeVec &keys) noexcept override {
+        if (on_delete) {
+            on_delete();
+        }
+        pending.emplace_back([this, keys] { (void)MetaLocalBackend::Delete(nullptr, keys); });
+        return std::vector<ErrorCode>(keys.size(), EC_OK);
+    }
+
+    std::vector<ErrorCode> Upsert(RequestContext *,
+                                const KeyTypeVec &keys,
+                                const CacheLocationMapVector &locations,
+                                const PropertyMapVector &properties) noexcept override {
+        pending.emplace_back([this, keys, locations, properties] {
+            (void)MetaLocalBackend::Upsert(nullptr, keys, locations, properties);
+        });
+        return std::vector<ErrorCode>(keys.size(), EC_OK);
+    }
+
+    std::vector<ErrorCode> Upsert(RequestContext *context,
+                                 const KeyTypeVec &keys,
+                                 const CacheLocationMapVector &locations,
+                                 const PropertyMapVector &properties,
+                                 const std::vector<ErrorCode> &previous_error_codes) noexcept override {
+        if (previous_error_codes.size() != keys.size()) {
+            return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+        }
+        auto results = previous_error_codes;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (results[i] == EC_OK) {
+                results[i] = Upsert(context, {keys[i]}, {locations[i]}, {properties[i]}).front();
+            }
+        }
+        return results;
+    }
+
+    bool Sync(const KeyTypeVec &) noexcept override {
+        ++sync_calls;
+        if (on_sync) {
+            on_sync();
+        }
+        // A newly introduced business-side barrier would fail until the
+        // test explicitly permits consumption, instead of hanging the test.
+        return pending.empty();
+    }
+
+    void Drain() {
+        auto writes = std::move(pending);
+        pending.clear();
+        for (auto &write : writes) {
+            write();
+        }
+    }
+
+    int sync_calls = 0;
+    int target_read_calls = 0;
+    int maintenance_read_calls = 0;
+    std::function<void()> on_sync;
+    std::function<void()> on_delete;
+    std::vector<std::function<void()>> pending;
 };
 } // namespace
 
@@ -745,6 +829,312 @@ TEST_F(MetaIndexerTest, TestReadModifyWriteLocationPreservesPartialModifierResul
     ASSERT_TRUE(stored_locations[0][0]);
     EXPECT_EQ("good", stored_locations[0][0]->id());
     EXPECT_FALSE(stored_locations[0][1]);
+}
+
+TEST_F(MetaIndexerTest, TestRecoverGcAllowsOnlineRmwRecreationBeforeDeleteConsumption) {
+    for (const bool memory_primary : {false, true}) {
+        for (const bool block_rmw : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "memory_primary=" << memory_primary << " block_rmw=" << block_rmw);
+            meta_indexer_ = std::make_shared<MetaIndexer>();
+            ASSERT_EQ(EC_OK, InitIndexer(R"({
+                "max_key_count":100, "mutex_shard_num":8,
+                "meta_storage_backend_config":{"storage_type":"local"},
+                "meta_cache_policy_config":{}
+            })"));
+            auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
+            auto persistent = std::make_unique<DeferredRecoveryRmwBackend>();
+            auto *queued = persistent.get();
+            auto hot = std::make_unique<MetaLocalBackend>();
+            ASSERT_EQ(EC_OK, persistent->Init("test", config));
+            ASSERT_EQ(EC_OK, persistent->Open());
+            ASSERT_EQ(EC_OK, hot->Init("test", config));
+            ASSERT_EQ(EC_OK, hot->Open());
+            const KeyVector keys{42};
+            const CacheLocationMapVector old_locations{{{"L1", MakeLocation("L1", "old_uri")}}};
+            const PropertyMapVector properties(1);
+            ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, persistent->Put(nullptr, keys, old_locations, properties));
+            ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, hot->Put(nullptr, keys, old_locations, properties));
+            auto &manager = *meta_indexer_->backend_manager_;
+            manager.persistent_backend_ = std::move(persistent);
+            manager.cache_backend_ = std::move(hot);
+            manager.memory_primary_ = memory_primary;
+            manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+            meta_indexer_->key_count_.store(1);
+
+            const auto remove = [](const std::vector<ErrorCode> &ecs,
+                                   const LocationIdVector &,
+                                   size_t,
+                                   CacheLocationVector &,
+                                   PropertyMap &) -> LocationModifierResult {
+                EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, ecs);
+                return {MA_DELETE, {EC_OK}};
+            };
+            ASSERT_EQ(EC_OK,
+                      meta_indexer_->ReadModifyWriteLocationsForMaintenance(
+                                       request_context_.get(), keys, {{"L1"}}, remove)
+                          .ec);
+            ASSERT_EQ(0u, meta_indexer_->GetKeyCount());
+            ASSERT_EQ(1u, queued->pending.size());
+            ASSERT_EQ(0, queued->sync_calls);
+
+            if (block_rmw) {
+                const auto add = [](const LocationIdVector &existing,
+                                    ErrorCode ec,
+                                    size_t,
+                                    PropertyMap &,
+                                    CacheLocationMap &locations) -> ModifierResult {
+                    EXPECT_EQ(EC_NOENT, ec);
+                    EXPECT_TRUE(existing.empty());
+                    locations.emplace("L2", MakeLocation("L2", "new_uri"));
+                    return {MA_OK, EC_OK};
+                };
+                ASSERT_EQ(EC_OK, meta_indexer_->ReadModifyWriteBlock(request_context_.get(), keys, add).ec);
+            } else {
+                const auto add = [](const std::vector<ErrorCode> &ecs,
+                                    const LocationIdVector &,
+                                    size_t,
+                                    CacheLocationVector &locations,
+                                    PropertyMap &) -> LocationModifierResult {
+                    EXPECT_EQ(std::vector<ErrorCode>{EC_NOENT}, ecs);
+                    EXPECT_EQ(nullptr, locations[0]);
+                    locations[0] = MakeLocation("L2", "new_uri");
+                    return {MA_OK, {EC_OK}};
+                };
+                ASSERT_EQ(EC_OK,
+                          meta_indexer_->ReadModifyWriteTargetLocations(
+                                           request_context_.get(), keys, {{"L2"}}, add)
+                              .ec);
+            }
+            EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
+            EXPECT_EQ(0, queued->sync_calls);
+            ASSERT_EQ(2u, queued->pending.size());
+            CacheLocationMapVector current;
+            ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, queued->GetLocations(nullptr, keys, current));
+            EXPECT_EQ(1u, current[0].count("L1")); // DEL is still unconsumed.
+            ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.cache_backend_->GetLocations(nullptr, keys, current));
+            EXPECT_EQ(1u, current[0].size());
+            EXPECT_EQ(1u, current[0].count("L2"));
+
+            queued->Drain();
+            ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, queued->GetLocations(nullptr, keys, current));
+            EXPECT_EQ(1u, current[0].size());
+            EXPECT_EQ(1u, current[0].count("L2"));
+            EXPECT_EQ(0, manager.BackfillKeysToCache(keys, old_locations, properties, {EC_OK}));
+            ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.GetLocations(nullptr, keys, current));
+            EXPECT_EQ(1u, current[0].size());
+            EXPECT_EQ(1u, current[0].count("L2"));
+        }
+    }
+}
+
+TEST_F(MetaIndexerTest, TestMaintenanceKeepsRecoverWriteRouteWhenModifierFinishesRecovery) {
+    ASSERT_EQ(EC_OK, InitIndexer(R"({
+        "max_key_count":100, "mutex_shard_num":8,
+        "meta_storage_backend_config":{"storage_type":"local"}, "meta_cache_policy_config":{}
+    })"));
+    auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
+    auto persistent = std::make_unique<DeferredRecoveryRmwBackend>();
+    auto *backend = persistent.get();
+    auto hot = std::make_unique<MetaLocalBackend>();
+    auto *hot_backend = hot.get();
+    ASSERT_EQ(EC_OK, persistent->Init("test", config));
+    ASSERT_EQ(EC_OK, persistent->Open());
+    ASSERT_EQ(EC_OK, hot->Init("test", config));
+    ASSERT_EQ(EC_OK, hot->Open());
+    const auto target = MakeLocation("L1", "target_uri");
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+              persistent->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, hot->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
+    auto &manager = *meta_indexer_->backend_manager_;
+    manager.persistent_backend_ = std::move(persistent);
+    manager.cache_backend_ = std::move(hot);
+    manager.memory_primary_ = true;
+    manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover);
+    meta_indexer_->key_count_.store(1);
+    bool persistent_called_before_hot = false;
+    backend->on_delete = [hot_backend, &persistent_called_before_hot] {
+        std::vector<bool> exists;
+        EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, hot_backend->Exists(nullptr, {42}, exists));
+        persistent_called_before_hot = exists.size() == 1 && exists[0];
+    };
+    const auto remove = [&manager](const std::vector<ErrorCode> &ecs,
+                                  const LocationIdVector &,
+                                  size_t,
+                                  CacheLocationVector &,
+                                  PropertyMap &) -> LocationModifierResult {
+        manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
+        return {MA_DELETE, ecs};
+    };
+    ASSERT_EQ(EC_OK,
+              meta_indexer_->ReadModifyWriteLocationsForMaintenance(request_context_.get(), {42}, {{"L1"}}, remove)
+                  .ec);
+    EXPECT_TRUE(persistent_called_before_hot);
+    EXPECT_EQ(0, backend->sync_calls);
+    EXPECT_EQ(0u, meta_indexer_->GetKeyCount());
+    EXPECT_TRUE(manager.deleted_keys_.empty());
+    backend->Drain();
+    CacheLocationMapVector remaining;
+    EXPECT_EQ(std::vector<ErrorCode>{EC_NOENT}, backend->GetLocations(nullptr, {42}, remaining));
+    EXPECT_EQ(std::vector<ErrorCode>{EC_NOENT}, hot_backend->GetLocations(nullptr, {42}, remaining));
+}
+
+TEST_F(MetaIndexerTest, TestCachedMaintenanceSeesOnlineUpdateWithoutDrainingRedis) {
+    for (const bool memory_primary : {false, true}) {
+        for (const bool recovering : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "memory_primary=" << memory_primary
+                                             << " recovering=" << recovering);
+            meta_indexer_ = std::make_shared<MetaIndexer>();
+            ASSERT_EQ(EC_OK, InitIndexer(R"({
+                "max_key_count":100, "mutex_shard_num":8,
+                "meta_storage_backend_config":{"storage_type":"local"},
+                "meta_cache_policy_config":{}
+            })"));
+            auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
+            auto persistent = std::make_unique<DeferredRecoveryRmwBackend>();
+            auto *queued = persistent.get();
+            auto hot = std::make_unique<MetaLocalBackend>();
+            ASSERT_EQ(EC_OK, persistent->Init("test", config));
+            ASSERT_EQ(EC_OK, persistent->Open());
+            ASSERT_EQ(EC_OK, hot->Init("test", config));
+            ASSERT_EQ(EC_OK, hot->Open());
+            const KeyVector keys{42};
+            const auto old_location = MakeLocation("L1", "old_uri");
+            const auto replacement = MakeLocation("L1", "new_uri");
+            const CacheLocationMapVector old_locations{{{"L1", old_location}}};
+            const PropertyMapVector properties(1);
+            ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, persistent->Put(nullptr, keys, old_locations, properties));
+            ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, hot->Put(nullptr, keys, old_locations, properties));
+            auto &manager = *meta_indexer_->backend_manager_;
+            manager.persistent_backend_ = std::move(persistent);
+            manager.cache_backend_ = std::move(hot);
+            manager.memory_primary_ = memory_primary;
+            manager.recover_state_.store(recovering ? MetaStorageBackendManager::RecoverState::kRecover
+                                                   : MetaStorageBackendManager::RecoverState::kRunning);
+            meta_indexer_->key_count_.store(1);
+
+            // A successful business RMW updates hot while its Redis write is
+            // still queued. GC must reject the old expected value immediately.
+            BatchMetaData update;
+            update.batch_keys = keys;
+            update.batch_locations = {{{"L1", replacement}}};
+            update.batch_properties = properties;
+            ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.Upsert(nullptr, update));
+            ASSERT_EQ(1u, queued->pending.size());
+            int modifier_calls = 0;
+            const auto remove = [&modifier_calls, &old_location, &replacement](const std::vector<ErrorCode> &ecs,
+                                                                             const LocationIdVector &,
+                                                                             size_t,
+                                                                             CacheLocationVector &locations,
+                                                                             PropertyMap &) -> LocationModifierResult {
+                ++modifier_calls;
+                EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, ecs);
+                EXPECT_EQ(replacement->ToJsonString(), locations[0]->ToJsonString());
+                return {MA_DELETE,
+                        {locations[0]->ToJsonString() == old_location->ToJsonString() ? EC_OK : EC_MISMATCH}};
+            };
+            const auto result = meta_indexer_->ReadModifyWriteLocationsForMaintenance(
+                request_context_.get(), keys, {{"L1"}}, remove);
+            EXPECT_EQ(EC_OK, result.ec);
+            ASSERT_EQ(1u, result.per_location_error_codes.size());
+            EXPECT_EQ(std::vector<ErrorCode>{EC_MISMATCH}, result.per_location_error_codes[0]);
+            EXPECT_EQ(1, modifier_calls);
+            EXPECT_EQ(0, queued->sync_calls);
+            EXPECT_EQ(1u, queued->pending.size());
+            EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
+            EXPECT_TRUE(manager.deleted_keys_.empty());
+
+            CacheLocationMapVector current;
+            ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.cache_backend_->GetLocations(nullptr, keys, current));
+            EXPECT_EQ(replacement->ToJsonString(), current[0].at("L1")->ToJsonString());
+            ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, queued->GetLocations(nullptr, keys, current));
+            EXPECT_EQ(old_location->ToJsonString(), current[0].at("L1")->ToJsonString());
+            queued->Drain();
+        }
+    }
+}
+
+TEST_F(MetaIndexerTest, TestSingleBackendOrdinaryGcRetainsOrdinaryTargetRead) {
+    ASSERT_EQ(EC_OK, InitIndexer(R"({
+        "max_key_count":100, "mutex_shard_num":8,
+        "meta_storage_backend_config":{"storage_type":"local"}, "meta_cache_policy_config":{}
+    })"));
+    auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
+    auto persistent = std::make_unique<DeferredRecoveryRmwBackend>();
+    auto *backend = persistent.get();
+    ASSERT_EQ(EC_OK, persistent->Init("test", config));
+    ASSERT_EQ(EC_OK, persistent->Open());
+    const auto target = MakeLocation("L1", "target_uri");
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+              persistent->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
+    auto &manager = *meta_indexer_->backend_manager_;
+    manager.persistent_backend_ = std::move(persistent);
+    manager.cache_backend_.reset();
+
+    // Ordinary GC's hydration request is a no-op without a hot mirror. Keep
+    // its original target read, including local access/LRU updates.
+    const auto result = meta_indexer_->ReadModifyWriteLocation(
+        request_context_.get(), {42}, {{"L1"}}, [target](const std::vector<ErrorCode> &ecs,
+                                                        const LocationIdVector &,
+                                                        size_t,
+                                                        CacheLocationVector &locations,
+                                                        PropertyMap &) -> LocationModifierResult {
+            EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, ecs);
+            EXPECT_EQ(target->ToJsonString(), locations[0]->ToJsonString());
+            return {MA_SKIP, ecs};
+        }, true, true);
+    EXPECT_EQ(EC_OK, result.ec);
+    EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, result.per_location_error_codes[0]);
+    EXPECT_EQ(1, backend->target_read_calls);
+    EXPECT_EQ(0, backend->maintenance_read_calls);
+    EXPECT_EQ(0, backend->sync_calls);
+}
+
+TEST_F(MetaIndexerTest, TestSingleBackendMaintenancePreservesQueueBarriers) {
+    for (const bool drain_writes : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "drain_writes=" << drain_writes);
+        meta_indexer_ = std::make_shared<MetaIndexer>();
+        ASSERT_EQ(EC_OK, InitIndexer(R"({
+            "max_key_count":100, "mutex_shard_num":8,
+            "meta_storage_backend_config":{"storage_type":"local"}, "meta_cache_policy_config":{}
+        })"));
+        auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
+        auto persistent = std::make_unique<DeferredRecoveryRmwBackend>();
+        auto *queued = persistent.get();
+        ASSERT_EQ(EC_OK, persistent->Init("test", config));
+        ASSERT_EQ(EC_OK, persistent->Open());
+        const auto target = MakeLocation("L1", "target_uri");
+        ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+                  persistent->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
+        auto &manager = *meta_indexer_->backend_manager_;
+        manager.persistent_backend_ = std::move(persistent);
+        manager.cache_backend_.reset();
+        meta_indexer_->key_count_.store(1);
+        if (drain_writes) {
+            queued->on_sync = [queued] { queued->Drain(); };
+        } else {
+            // A pending write makes the single backend's pre-read barrier
+            // fail. It must not reach the modifier or enqueue a deletion.
+            ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+                      queued->Upsert(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
+        }
+        int modifier_calls = 0;
+        const auto removed = meta_indexer_->ReadModifyWriteLocationsForMaintenance(
+            request_context_.get(), {42}, {{"L1"}}, [&modifier_calls](const std::vector<ErrorCode> &ecs,
+                                                                     const LocationIdVector &,
+                                                                     size_t,
+                                                                     CacheLocationVector &,
+                                                                     PropertyMap &) -> LocationModifierResult {
+                ++modifier_calls;
+                return {MA_DELETE, ecs};
+            });
+        EXPECT_EQ(drain_writes ? EC_OK : EC_ERROR, removed.ec);
+        EXPECT_EQ(std::vector<ErrorCode>{drain_writes ? EC_OK : EC_TIMEOUT}, removed.per_location_error_codes[0]);
+        EXPECT_EQ(drain_writes ? 1 : 0, modifier_calls);
+        EXPECT_EQ(drain_writes ? 2 : 1, queued->sync_calls);
+        EXPECT_EQ(drain_writes ? 0u : 1u, queued->pending.size());
+        EXPECT_EQ(drain_writes ? 0u : 1u, meta_indexer_->GetKeyCount());
+        queued->Drain();
+    }
 }
 
 TEST_F(MetaIndexerTest, TestSingleTargetRmwPreservesCapacityAndExistingKeySemantics) {

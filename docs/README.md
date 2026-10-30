@@ -16,6 +16,7 @@
 - [CacheReclaimer 按用量逐出的跨轮轮转](design/cache_reclaimer_cross_round_rotation.md) - 保留比例预算和水位停止保护，避免有预算的小 Instance 长期轮不到
 - [CacheReclaimer Group 级 LRU](design/cache_reclaimer_group_lru.md) - 跨 Instance 统一比较采样候选，默认 Group LRU，也可按配置选择容量比例或固定预算策略
 - [EventReport 主动回收纳入后台扫描 GC](design/event_report_background_gc.md) - 由 EventReportBackend 提供状态驱动的批量判定，复用统一 GC round 回收 stale snapshot 与 down host metadata
+- [Recover 期间允许 EventReport GC 清理](design/event_report_gc_during_recover.md) - 复用删除标记保护整 key 回收与在线重建，逐 key 处理恢复期清理边界
 - [Meta 内存主存储与 Redis 异步备份](design/meta_memory_primary_async_backup.md) - Recover 保持持久化优先，Running 切换内存优先异步备份并复用原锁外 Sync
 
 ### 开发文档

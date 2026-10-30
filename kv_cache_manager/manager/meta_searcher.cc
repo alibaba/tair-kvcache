@@ -3272,7 +3272,7 @@ ErrorCode MetaSearcher::BatchCASLocationStatus(RequestContext *request_context,
                                                const KeyVector &keys,
                                                const std::vector<std::vector<LocationCASTask>> &batch_tasks,
                                                std::vector<std::vector<ErrorCode>> &out_batch_results,
-                                               bool refresh_cache_from_persistent) {
+                                               bool hydrate_missing_cache) {
 
     if (keys.size() != batch_tasks.size()) {
         return EC_BADARGS;
@@ -3336,7 +3336,7 @@ ErrorCode MetaSearcher::BatchCASLocationStatus(RequestContext *request_context,
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     auto result = meta_indexer_->ReadModifyWriteLocation(
-        request_context, keys, location_ids_per_key, modifier, true, refresh_cache_from_persistent);
+        request_context, keys, location_ids_per_key, modifier, true, hydrate_missing_cache);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     out_batch_results = std::move(result.per_location_error_codes);
 

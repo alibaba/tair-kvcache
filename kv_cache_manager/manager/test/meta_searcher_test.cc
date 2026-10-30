@@ -2371,7 +2371,7 @@ TEST_F(MetaSearcherTest, TestCachedMaintenanceDeleteUsesHotMutationInsteadOfPost
                                                    false,
                                                    true));
     EXPECT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), delete_results);
-    EXPECT_EQ((std::vector<std::string>{"sync", "read", "delete_key"}), backend->Events());
+    EXPECT_EQ((std::vector<std::string>{"delete_key"}), backend->Events());
 }
 
 TEST_F(MetaSearcherTest, TestMaintenanceDeleteAccountsAcceptedMutationWhenPostSyncFails) {
