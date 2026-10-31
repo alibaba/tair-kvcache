@@ -59,6 +59,8 @@ void OptimizerEventServiceGRpc::DisableSubscriptions() {
     }
 }
 
+std::size_t OptimizerEventServiceGRpc::MaxSubscribers() const { return sink_ ? sink_->MaxSubscribers() : 0; }
+
 bool OptimizerEventServiceGRpc::IsAvailable() const {
     return leader_elector_ && leader_elector_->GetRoleState() == RoleState::LEADER &&
            leader_elector_->IsStableState() && registry_manager_ && registry_manager_->IsRecoverComplete() && sink_ &&

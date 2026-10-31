@@ -2,6 +2,11 @@
 
 本文档记录需要调用方、部署配置或持久化状态协同升级的不兼容变更。升级前必须按对应条目的前置条件处理，不能仅替换 KVCM 二进制。
 
+## gRPC 默认线程上限
+
+gRPC 默认改为自动限制同步线程数：`kvcm.service.grpc_max_threads=0` 取 `max(2, 硬件并行数)`（开启 optimizer 事件发布时，主 Meta Server 额外加上 `max_subscribers`），配额耗尽可能返回 `RESOURCE_EXHAUSTED`。
+升级时如需保留原有 gRPC 框架线程行为，设置为 `-1`；配置修改后需重启。
+
 ## TairMempool SSD 独立 Storage Type
 
 Introduced by: PR #293

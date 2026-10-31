@@ -22,8 +22,10 @@
 #include "kv_cache_manager/event/spec_events/optimizer_event.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
+#include "kv_cache_manager/metrics/local_metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.grpc.pb.h"
+#include "kv_cache_manager/service/grpc_service/grpc_server_options.h"
 #include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
 
 using namespace ::testing;
@@ -163,6 +165,47 @@ TEST_F(OptimizerEventServiceGRpcTest, TestReportsUnavailableOnFollower) {
     EXPECT_FALSE(reader->Read(&event));
     EXPECT_EQ(grpc::StatusCode::UNAVAILABLE, reader->Finish().error_code());
     EXPECT_EQ(0u, sink_->SubscriberCount());
+}
+
+TEST_F(OptimizerEventServiceGRpcTest, TestAutomaticQuotaPreservesUnaryCapacityWithAllSubscriptionsActive) {
+    // Rebuild with the automatic quota for a two-thread host, independent of
+    // the machine running this test. The one allowed subscription fills its budget.
+    server_->Shutdown();
+    server_.reset();
+    service_ = std::make_unique<OptimizerEventServiceGRpc>(sink_, registry_manager_, leader_elector_, cache_manager_);
+    SetServingState(RoleState::LEADER, true);
+    auto reporter = std::make_shared<LocalMetricsReporter>();
+    ASSERT_TRUE(reporter->Init(cache_manager_, metrics_registry_, ""));
+    const auto thread_limit = ResolveGrpcMaxThreads(0, 2, service_->MaxSubscribers());
+    ASSERT_EQ(3, thread_limit);
+    grpc::ServerBuilder builder;
+    ConfigureGrpcServer(builder, thread_limit, 0, "meta", metrics_registry_, reporter, service_->MaxSubscribers());
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port_);
+    builder.RegisterService(service_.get());
+    server_ = builder.BuildAndStart();
+    ASSERT_NE(nullptr, server_);
+    stub_ = proto::optimizer::OptimizerEventStreamService::NewStub(
+        grpc::CreateChannel("127.0.0.1:" + std::to_string(port_), grpc::InsecureChannelCredentials()));
+
+    grpc::ClientContext subscription_context;
+    subscription_context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+    proto::optimizer::OptimizerEventSubscriptionRequest subscription_request;
+    subscription_request.set_consumer_id("optimizer");
+    auto reader = stub_->SubscribeEvents(&subscription_context, subscription_request);
+    ASSERT_TRUE(WaitUntil([this] { return sink_->SubscriberCount() == service_->MaxSubscribers(); }));
+
+    grpc::ClientContext configuration_context;
+    configuration_context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+    proto::optimizer::KvcmConfigurationRequest configuration_request;
+    proto::optimizer::KvcmConfigurationResponse configuration_response;
+    EXPECT_TRUE(stub_->GetConfiguration(&configuration_context, configuration_request, &configuration_response).ok());
+    EXPECT_EQ(proto::optimizer::OK, configuration_response.header().status().code());
+    EXPECT_EQ(service_->MaxSubscribers(), sink_->SubscriberCount());
+
+    subscription_context.TryCancel();
+    proto::optimizer::TraceQueryRequest event;
+    EXPECT_FALSE(reader->Read(&event));
+    EXPECT_EQ(grpc::StatusCode::CANCELLED, reader->Finish().error_code());
 }
 
 TEST_F(OptimizerEventServiceGRpcTest, TestReportsUnavailableWhileLeaderIsRecovering) {

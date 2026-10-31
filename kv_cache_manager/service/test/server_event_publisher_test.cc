@@ -57,7 +57,8 @@ TEST_F(ServerEventPublisherTest, TestConfiguredOptimizerPublisherIsRegistered) {
     ASSERT_NE(nullptr, sink);
     EXPECT_EQ(2u, sink->config_.max_subscribers());
     EXPECT_EQ(4096u, sink->config_.subscriber_queue_size());
-    EXPECT_NE(nullptr, server.optimizer_event_service_);
+    ASSERT_NE(nullptr, server.optimizer_event_service_);
+    EXPECT_EQ(2u, server.optimizer_event_service_->MaxSubscribers());
     event_manager->Stop();
 }
 
