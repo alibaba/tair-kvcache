@@ -1,6 +1,19 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "grpc_server_options",
+    srcs = ["grpc_server_options.cc"],
+    hdrs = ["grpc_server_options.h"],
+    deps = [
+        "//kv_cache_manager/metrics:metrics_collector",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/service:grpc_wrapper",
+        "@com_google_protobuf//:protobuf",
+    ],
+)
+
+cc_library(
     name = "grpc_service",
     srcs = [
         "admin_service_grpc.cc",

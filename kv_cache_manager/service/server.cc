@@ -1,5 +1,6 @@
 #include "kv_cache_manager/service/server.h"
 
+#include <cinttypes>
 #include <cstdio>
 #include <grpcpp/grpcpp.h>
 
@@ -27,6 +28,7 @@
 #include "kv_cache_manager/service/debug_service_impl.h"
 #include "kv_cache_manager/service/grpc_service/admin_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/debug_service_grpc.h"
+#include "kv_cache_manager/service/grpc_service/grpc_server_options.h"
 #include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/optimizer_event_service_grpc.h"
 #include "kv_cache_manager/service/http_service/admin_service_http.h"
@@ -275,6 +277,12 @@ bool Server::StartRpcServer() {
     debug_service_->Init();
 
     grpc::ServerBuilder builder;
+    const int max_threads = ConfigureGrpcServer(builder,
+                                                config_.GetServiceGrpcMaxThreads(),
+                                                config_.GetServiceGrpcMemoryQuotaBytes(),
+                                                "meta",
+                                                metrics_registry_,
+                                                metrics_reporter_);
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(meta_service_.get());
     if (optimizer_event_service_) {
@@ -292,7 +300,13 @@ bool Server::StartRpcServer() {
         return false;
     }
     rpc_server_.reset(server.release());
-    KVCM_LOG_INFO("Server listening on %s success", server_address.c_str());
+    const std::string thread_limit = max_threads == -1 ? "framework_default" : std::to_string(max_threads);
+    KVCM_LOG_INFO(
+        "Server listening on %s success, grpc_max_threads=%s (configured=%d), grpc_memory_quota_bytes=%" PRIu64,
+        server_address.c_str(),
+        thread_limit.c_str(),
+        config_.GetServiceGrpcMaxThreads(),
+        config_.GetServiceGrpcMemoryQuotaBytes());
     if (use_separate_admin_server) {
         return StartSeparateAdminRpcServer();
     }
@@ -303,6 +317,12 @@ bool Server::StartSeparateAdminRpcServer() {
     int32_t rpc_port = config_.GetServiceAdminRpcPort();
     std::string server_address = "0.0.0.0:" + std::to_string(rpc_port);
     grpc::ServerBuilder builder;
+    const int max_threads = ConfigureGrpcServer(builder,
+                                                config_.GetServiceGrpcMaxThreads(),
+                                                config_.GetServiceGrpcMemoryQuotaBytes(),
+                                                "admin",
+                                                metrics_registry_,
+                                                metrics_reporter_);
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
     builder.RegisterService(admin_service_.get());
     if (config_.IsEnableDebugService()) {
@@ -314,7 +334,13 @@ bool Server::StartSeparateAdminRpcServer() {
         return false;
     }
     admin_rpc_server_.reset(server.release());
-    KVCM_LOG_INFO("Admin Server listening on %s success", server_address.c_str());
+    const std::string thread_limit = max_threads == -1 ? "framework_default" : std::to_string(max_threads);
+    KVCM_LOG_INFO(
+        "Admin Server listening on %s success, grpc_max_threads=%s (configured=%d), grpc_memory_quota_bytes=%" PRIu64,
+        server_address.c_str(),
+        thread_limit.c_str(),
+        config_.GetServiceGrpcMaxThreads(),
+        config_.GetServiceGrpcMemoryQuotaBytes());
     return true;
 }
 

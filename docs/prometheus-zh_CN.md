@@ -162,7 +162,8 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `service.query_counter` | counter | 总查询次数 |
 | `service.error_counter` | counter | 总错误次数 |
 | `service.query_rt_us` | gauge | 最近一次查询响应时间（微秒） |
-| `service.request_queue_size` | gauge | 请求队列大小 |
+| `service.request_queue_size` | gauge | 预留指标，当前未采集队列深度 |
+| `grpc.response_counter` | counter | gRPC 响应总数，按 `server`（`meta`/`admin`）、`method`（`Service/Method`）和 `grpc_code`（标准状态码名称）区分，每个 RPC 计一次 |
 | `manager.request_key_count` | gauge | 每次请求的 key 数量 |
 | `manager.prefix_match_len` | gauge | 前缀匹配长度 |
 | `manager.get_cache_location_query_block_counter` | counter | GetCacheLocation 查询的 Block 总数（累计） |
@@ -177,6 +178,11 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `cache_manager_instance.event_report_location_lifetime_min_us` | gauge | 最近有效 BLOCK_DELETE 批次中，成功删除的 Location 的最短存活时间（微秒） |
 | `cache_manager_instance.event_report_location_lifetime_max_us` | gauge | 同一批次的最长存活时间（微秒） |
 | `cache_manager_instance.event_report_location_lifetime_avg_us` | gauge | 同一批次的平均存活时间（微秒） |
+
+`grpc.response_counter` 统计服务端准备发送的最终 gRPC 状态，包含线程配额耗尽时框架返回的
+`RESOURCE_EXHAUSTED`；该状态也可能来自其他资源不足。主服务与 Admin 共用 gRPC 端口时统一记为
+`server=meta`，业务响应体中的错误仍由 `service.error_counter` 统计。
+`method` 省略 protobuf 包名前缀，例如 `MetaService/GetCacheLocation`；无法在 protobuf 描述中识别的方法统一记为 `unknown`。
 
 ### 周期性指标
 
@@ -216,6 +222,7 @@ KMonitor agent 在上报时计算。Prometheus 侧请用 PromQL
 |---|---|
 | `service.qps` | `rate(kvcm_service_query_counter[1m])` |
 | `service.error_qps` | `rate(kvcm_service_error_counter[1m])` |
+| `grpc.response_qps` | `rate(kvcm_grpc_response_counter[1m])`，保留 `server`、`method`、`grpc_code` 维度 |
 | `event_report.qps` | `rate(kvcm_event_report_request_counter[1m])` |
 | `event_report.error_qps` | `rate(kvcm_event_report_error_counter[1m])` |
 | `data_storage.create_qps` | `rate(kvcm_data_storage_create_counter[1m])` |
