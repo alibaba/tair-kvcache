@@ -18,6 +18,9 @@ using namespace kv_cache_manager;
 
 namespace {
 thread_local double reported_error_qps = 0;
+thread_local double reported_grpc_qps = 0;
+thread_local MetricsTags reported_grpc_tags;
+
 struct ReportedLifetime {
     std::string name;
     MetricsTags tags;
@@ -47,9 +50,13 @@ void ExpectLifetime(const std::vector<ReportedLifetime> &reported,
     }
 }
 
-void CaptureErrorQps(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *, double value) {
+void CaptureErrorQps(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
     if (metric->metric_name_.find("service.error_qps") != std::string::npos) {
         reported_error_qps += value;
+    }
+    if (metric->metric_name_.find("grpc.response_qps") != std::string::npos) {
+        reported_grpc_qps += value;
+        reported_grpc_tags = tags->GetTagsMap();
     }
 }
 } // namespace
@@ -73,6 +80,31 @@ protected:
 };
 
 TEST_F(KmonitorMetricsReporterTest, TestConstructorAndDestructor) { EXPECT_NE(reporter_, nullptr); }
+
+TEST_F(KmonitorMetricsReporterTest, GrpcStatusQpsPreservesTagsAndUpdatesLocalCounter) {
+    const MetricsTags rejected_tags{
+        {"server", "meta"}, {"method", "MetaService/GetClusterInfo"}, {"grpc_code", "RESOURCE_EXHAUSTED"}};
+    const MetricsTags accepted_tags{{"server", "admin"}, {"method", "AdminService/CheckHealth"}, {"grpc_code", "OK"}};
+    GrpcMetricsCollector rejected(metrics_registry_, rejected_tags);
+    GrpcMetricsCollector accepted(metrics_registry_, accepted_tags);
+    ASSERT_TRUE(rejected.Init());
+    ASSERT_TRUE(accepted.Init());
+    Stub stub;
+    auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+        &kmonitor::MutableMetric::Report);
+    reported_grpc_qps = 0;
+    reported_grpc_tags.clear();
+    stub.set(report, CaptureErrorQps);
+
+    reporter_->ReportPerQuery(&rejected);
+    EXPECT_DOUBLE_EQ(1., reported_grpc_qps);
+    EXPECT_EQ(rejected_tags, reported_grpc_tags);
+    reporter_->ReportPerQuery(&accepted);
+    EXPECT_DOUBLE_EQ(2., reported_grpc_qps);
+    EXPECT_EQ(accepted_tags, reported_grpc_tags);
+    EXPECT_EQ(1u, rejected.get_grpc_response_counter_metrics());
+    EXPECT_EQ(1u, accepted.get_grpc_response_counter_metrics());
+}
 
 TEST_F(KmonitorMetricsReporterTest, TestInitWithNull) {
     EXPECT_FALSE(reporter_->Init(nullptr, nullptr, ""));

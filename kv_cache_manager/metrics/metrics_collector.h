@@ -243,6 +243,16 @@ public:                                                                         
     }
 #endif
 
+// Transport status metrics are separate from business response status metrics.
+// One immutable collector is shared by responses with the same server/method/status tags.
+class GrpcMetricsCollector final : public MetricsCollector {
+    KVCM_COUNTER_METRICS(grpc, response_counter)
+
+public:
+    GrpcMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry, MetricsTags metrics_tags) noexcept;
+    bool Init() override;
+};
+
 /* ------------------- ServiceMetricsCollector ---------------------- */
 
 #ifndef KVCM_SERVICE_METRICS_COLLECTOR_PTR

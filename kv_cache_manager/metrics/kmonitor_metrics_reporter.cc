@@ -46,6 +46,8 @@ struct KmonitorMetricsReporter::Context {
 
     /* ===================== per query metrics ====================== */
 
+    DECLARE_METRICS(grpc, response_qps);
+
     // service metrics
     DECLARE_METRICS(service, qps);
     DECLARE_METRICS(service, query_rt_us);
@@ -361,6 +363,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
     // service metrics
     REGISTER_QPS_METRIC(service, qps);
+    REGISTER_QPS_METRIC(grpc, response_qps);
     REGISTER_GAUGE_METRIC(service, query_rt_us);
     REGISTER_QPS_METRIC(service, error_qps);
     REGISTER_GAUGE_METRIC(service, request_queue_size);
@@ -597,7 +600,10 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::o
         return;
     }
 
-    if (dynamic_cast<ServiceMetricsCollector *>(collector)) {
+    if (auto *p = dynamic_cast<GrpcMetricsCollector *>(collector)) {
+        const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
+        REPORT_METRICS(grpc, response_qps, 1.0);
+    } else if (dynamic_cast<ServiceMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<ServiceMetricsCollector *>(collector);
 
         // TODO 所有Query维度指标使用相同大tag，kmon扛得住吗？

@@ -1,6 +1,7 @@
 #include "kv_cache_manager/service/server_config.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -83,6 +84,29 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
     {"kvcm.service.io_thread_num",
      [](const std::string &value, ServerConfig *config) {
          config->service_io_thread_num_ = std::stoi(value);
+         return true;
+     }},
+    {"kvcm.service.grpc_max_threads",
+     [](const std::string &value, ServerConfig *config) {
+         std::size_t parsed_length = 0;
+         const auto parsed = std::stoll(value, &parsed_length);
+         if (parsed_length != value.size() || parsed < -1 || parsed > std::numeric_limits<int32_t>::max()) {
+             return false;
+         }
+         config->service_grpc_max_threads_ = static_cast<int32_t>(parsed);
+         return true;
+     }},
+    {"kvcm.service.grpc_memory_quota_bytes",
+     [](const std::string &value, ServerConfig *config) {
+         if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) {
+             return false;
+         }
+         const auto parsed = std::stoull(value);
+         // gRPC accepts size_t but stores the quota size as int64_t internally.
+         if (parsed > std::numeric_limits<int64_t>::max() || parsed > std::numeric_limits<std::size_t>::max()) {
+             return false;
+         }
+         config->service_grpc_memory_quota_bytes_ = parsed;
          return true;
      }},
     {"kvcm.service.rpc_port",
@@ -382,6 +406,8 @@ bool ServerConfig::ResolveMetricsEnvTags() {
 }
 
 void ServerConfig::UpdateDefaultConfig() {
+    service_grpc_max_threads_ = 0;
+    service_grpc_memory_quota_bytes_ = 0;
     metrics_reporter_type_ = "local";
     metrics_env_tag_mappings_.clear();
     metrics_common_tags_.clear();
@@ -520,6 +546,13 @@ void ServerConfig::UpdateEnviron(EnvironMap &environ) {
 bool ServerConfig::Check() {
     // registry_storage_uri is optional: when empty, RegistryStorageBackendFactory
     // falls back to local backend. No validation needed for empty value.
+
+    // A synchronous server needs a polling thread in addition to a handler.
+    // Zero derives the quota from hardware concurrency; -1 keeps the framework default.
+    if (service_grpc_max_threads_ < -1 || service_grpc_max_threads_ == 1) {
+        fprintf(stderr, "kvcm.service.grpc_max_threads must be -1 (framework default), 0 (auto), or at least 2\n");
+        return false;
+    }
 
     if (!MetricsReporterFactory::IsSupportedType(metrics_reporter_type_)) {
         fprintf(stderr,

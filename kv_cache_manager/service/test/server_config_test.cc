@@ -21,6 +21,8 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_TRUE(config.Parse("", environ));
         ASSERT_TRUE(config.Check());
         ASSERT_EQ(2, config.GetSchedulePlanExecutorThreadCount());
+        ASSERT_EQ(0, config.GetServiceGrpcMaxThreads());
+        ASSERT_EQ(0u, config.GetServiceGrpcMemoryQuotaBytes());
         ASSERT_EQ(1u, config.GetSchedulePlanMigrationWorkerBudget());
         ASSERT_EQ(4u, config.GetMetaQueryWorkerCount());
         ASSERT_EQ(256u, config.GetMetaQueryParallelThreshold());
@@ -57,6 +59,8 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(6381, config.GetServiceRpcPort());
         ASSERT_EQ(6382, config.GetServiceHttpPort());
         ASSERT_EQ(2, config.GetServiceIoThreadNum());
+        ASSERT_EQ(16, config.GetServiceGrpcMaxThreads());
+        ASSERT_EQ(134217728u, config.GetServiceGrpcMemoryQuotaBytes());
         ASSERT_TRUE(config.IsEnableDebugService());
     }
     // from environ
@@ -84,6 +88,8 @@ TEST_F(ServerConfigTest, TestSimple) {
         environ.insert({"kvcm.service.rpc_port", "7381"});
         ScopedEnv env("kvcm.service.http_port", "7382");
         environ.insert({"kvcm.service.io_thread_num", "4"});
+        environ.insert({"kvcm.service.grpc_max_threads", "32"});
+        environ.insert({"kvcm.service.grpc_memory_quota_bytes", "268435456"});
         environ.insert({"kvcm.logger.log_level", "3"});
         ASSERT_TRUE(config.Parse(config_file, environ));
         ASSERT_TRUE(config.Check());
@@ -91,9 +97,81 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(7381, config.GetServiceRpcPort());
         ASSERT_EQ(7382, config.GetServiceHttpPort());
         ASSERT_EQ(4, config.GetServiceIoThreadNum());
+        ASSERT_EQ(32, config.GetServiceGrpcMaxThreads());
+        ASSERT_EQ(268435456u, config.GetServiceGrpcMemoryQuotaBytes());
         ASSERT_TRUE(config.IsEnableDebugService());
         ASSERT_EQ(3, config.GetLogLevel());
     }
+}
+
+TEST_F(ServerConfigTest, GrpcMaxThreadsValidation) {
+    for (const std::string value : {"-1", "0", "2", "64", "2147483647"}) {
+        SCOPED_TRACE(value);
+        ServerConfig config;
+        ASSERT_TRUE(config.Parse("", {{"kvcm.service.grpc_max_threads", value}}));
+        EXPECT_TRUE(config.Check());
+        EXPECT_EQ(std::stoi(value), config.GetServiceGrpcMaxThreads());
+    }
+    for (const std::string value :
+         {"", "-2", "-2147483649", "2junk", "abc", "2147483648", "4294967296", "18446744073709551616"}) {
+        SCOPED_TRACE(value);
+        ServerConfig config;
+        EXPECT_FALSE(config.Parse("", {{"kvcm.service.grpc_max_threads", value}}));
+    }
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {{"kvcm.service.grpc_max_threads", "1"}}));
+    EXPECT_FALSE(config.Check());
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(0, config.GetServiceGrpcMaxThreads());
+    EXPECT_TRUE(config.Check());
+}
+
+TEST_F(ServerConfigTest, GrpcMaxThreadsEnvironmentOverride) {
+    ScopedEnv env("kvcm_service_grpc_max_threads", "8");
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse(GetPrivateTestDataPath() + "server_config_simple.conf",
+                             {{"kvcm.service.grpc_max_threads", "32"}}));
+    EXPECT_EQ(8, config.GetServiceGrpcMaxThreads());
+    EXPECT_TRUE(config.Check());
+}
+
+TEST_F(ServerConfigTest, GrpcMemoryQuotaValidation) {
+    for (const std::string value : {"0", "1", "134217728", "4294967296", "9223372036854775807"}) {
+        SCOPED_TRACE(value);
+        ServerConfig config;
+        ASSERT_TRUE(config.Parse("", {{"kvcm.service.grpc_memory_quota_bytes", value}}));
+        EXPECT_TRUE(config.Check());
+        EXPECT_EQ(std::stoull(value), config.GetServiceGrpcMemoryQuotaBytes());
+    }
+    for (const std::string value : {"",
+                                    "-1",
+                                    "-18446744073709551615",
+                                    "+1",
+                                    "1junk",
+                                    "128MiB",
+                                    "1.5",
+                                    "abc",
+                                    "9223372036854775808",
+                                    "18446744073709551615",
+                                    "18446744073709551616"}) {
+        SCOPED_TRACE(value);
+        ServerConfig config;
+        EXPECT_FALSE(config.Parse("", {{"kvcm.service.grpc_memory_quota_bytes", value}}));
+    }
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {{"kvcm.service.grpc_memory_quota_bytes", "134217728"}}));
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(0u, config.GetServiceGrpcMemoryQuotaBytes());
+    EXPECT_TRUE(config.Check());
+}
+
+TEST_F(ServerConfigTest, GrpcMemoryQuotaEnvironmentOverride) {
+    ScopedEnv env("kvcm_service_grpc_memory_quota_bytes", "67108864");
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse(GetPrivateTestDataPath() + "server_config_simple.conf",
+                             {{"kvcm.service.grpc_memory_quota_bytes", "268435456"}}));
+    EXPECT_EQ(67108864u, config.GetServiceGrpcMemoryQuotaBytes());
+    EXPECT_TRUE(config.Check());
 }
 
 TEST_F(ServerConfigTest, MetricsEnvTagsResolveAtStartup) {

@@ -35,6 +35,20 @@ MetricsCollectors::mc_vec_t MetricsCollectors::GetMetricsCollectors() const noex
     return *metrics_collectors_;
 }
 
+DEFINE_METRICS_NAME_(GrpcMetricsCollector, grpc, response_counter);
+
+GrpcMetricsCollector::GrpcMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry,
+                                           MetricsTags metrics_tags) noexcept
+    : MetricsCollector(std::move(metrics_registry), std::move(metrics_tags)) {}
+
+bool GrpcMetricsCollector::Init() {
+    if (!metrics_registry_) {
+        return false;
+    }
+    REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, grpc, response_counter, metrics_tags_);
+    return true;
+}
+
 /* ------------------- ServiceMetricsCollector ---------------------- */
 
 // service metrics

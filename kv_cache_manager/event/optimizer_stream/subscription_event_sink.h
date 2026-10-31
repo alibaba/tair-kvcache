@@ -65,6 +65,7 @@ public:
     std::size_t DroppedCount() const;
 
     std::size_t SubscriberCount() const;
+    std::size_t MaxSubscribers() const { return config_.max_subscribers(); }
     bool stopped() const { return stopped_.load(); }
 
 private:
