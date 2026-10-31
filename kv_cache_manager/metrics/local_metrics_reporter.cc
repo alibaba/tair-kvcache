@@ -39,7 +39,11 @@ bool LocalMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
 }
 
 void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed) {
-    if (dynamic_cast<ServiceMetricsCollector *>(collector)) {
+    if (auto *p = dynamic_cast<GrpcMetricsCollector *>(collector)) {
+        Counter response_counter;
+        COPY_METRICS_(p, grpc, response_counter, response_counter);
+        ++response_counter;
+    } else if (dynamic_cast<ServiceMetricsCollector *>(collector)) {
         auto *p = dynamic_cast<ServiceMetricsCollector *>(collector);
 
         do {

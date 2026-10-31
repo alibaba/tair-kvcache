@@ -85,8 +85,21 @@ kvcm.service.admin_rpc_port=6491
 # 指定管控接口的RPC监听端口，如果不指定则和主服务一致
 kvcm.service.admin_http_port=6492
 
-# 指定对外服务IO服务线程数，默认为机器核数
+# 指定 HTTP 服务 IO 线程数，默认为机器核数；不控制 gRPC 线程
 kvcm.service.io_thread_num=2
+
+# 每个 gRPC Server 的同步线程上限（含 poller）。默认 0，自动取 max(2, 硬件并行数)，计算方式参照 HTTP。
+# -1 沿用 gRPC 框架默认，不额外设限；显式上限必须 >= 2。
+# Meta/Admin 分端口时各有独立配额，都使用这个值；共用端口时只有一套配额。
+# 不限制 HTTP、后台任务及 gRPC 其他内部线程。同步流式 RPC 也会占用工作线程。
+# 配额耗尽时新 RPC 可能返回 RESOURCE_EXHAUSTED；修改后需要重启。
+# 环境变量形式：kvcm_service_grpc_max_threads。
+kvcm.service.grpc_max_threads=0
+
+# 每个 gRPC Server 的内存配额（字节）。0 表示不设置，沿用框架默认。
+# 仅约束 gRPC 纳入配额管理的内存，不是进程 RSS 上限；Meta/Admin 分端口时配额各自独立。
+# 与线程上限独立配置，修改后需要重启。环境变量形式：kvcm_service_grpc_memory_quota_bytes。
+kvcm.service.grpc_memory_quota_bytes=0
 
 # 是否开启DebugService服务，可以通过DebugService直接操作集群内部状态
 kvcm.service.enable_debug_service=false

@@ -27,6 +27,8 @@ public:
     int64_t GetLeaderElectorLeaseMs() const { return leader_elector_lease_ms_; }
     int64_t GetLeaderElectorLoopIntervalMs() const { return leader_elector_loop_interval_ms_; }
     int32_t GetServiceIoThreadNum() const { return service_io_thread_num_; }
+    int32_t GetServiceGrpcMaxThreads() const { return service_grpc_max_threads_; }
+    uint64_t GetServiceGrpcMemoryQuotaBytes() const { return service_grpc_memory_quota_bytes_; }
     int32_t GetServiceRpcPort() const { return service_rpc_port_; }
     int32_t GetServiceHttpPort() const { return service_http_port_; }
     int32_t GetServiceAdminRpcPort() const { return service_admin_rpc_port_; }
@@ -103,6 +105,8 @@ private:
     int64_t leader_elector_lease_ms_ = 0;
     int64_t leader_elector_loop_interval_ms_ = 0;
     int32_t service_io_thread_num_ = 0;
+    int32_t service_grpc_max_threads_ = 0;
+    uint64_t service_grpc_memory_quota_bytes_ = 0;
     int32_t service_rpc_port_ = 0;
     int32_t service_http_port_ = 0;
     int32_t service_admin_rpc_port_ = 0;

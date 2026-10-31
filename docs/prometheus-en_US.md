@@ -176,7 +176,8 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `service.query_counter` | counter | Total query count |
 | `service.error_counter` | counter | Total error count |
 | `service.query_rt_us` | gauge | Last query response time (us) |
-| `service.request_queue_size` | gauge | Request queue size |
+| `service.request_queue_size` | gauge | Reserved; queue depth is not currently collected |
+| `grpc.response_counter` | counter | Total gRPC responses, labeled by `server` (`meta`/`admin`), `method` (`Service/Method`), and `grpc_code` (standard status name); counted once per RPC |
 | `manager.request_key_count` | gauge | Keys per request |
 | `manager.prefix_match_len` | gauge | Prefix match length |
 | `manager.get_cache_location_query_block_counter` | counter | Total blocks queried via GetCacheLocation (cumulative) |
@@ -188,6 +189,12 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `meta_searcher.host_prefix_reduce_time_us` | gauge | GetHostCacheState normal/Mamba host-prefix reduction time (us) |
 | `meta_indexer.search_cache_hit_ratio` | gauge | Search cache hit ratio |
 | `data_storage.create_keys_counter` | counter | Total created keys |
+
+`grpc.response_counter` counts the final gRPC status the server prepares to send, including framework
+`RESOURCE_EXHAUSTED` rejections when the thread quota is exhausted; this status can also indicate other
+resource limits. When the main and Admin services share a gRPC port, both use `server=meta`. Business
+errors in response bodies remain in `service.error_counter`.
+`method` omits the protobuf package prefix, e.g. `MetaService/GetCacheLocation`; methods absent from the protobuf descriptors use `unknown`.
 
 ### Interval Metrics
 
@@ -228,6 +235,7 @@ reducer. Use `rate(<counter>[Xm])` in PromQL instead.
 |---|---|
 | `service.qps` | `rate(kvcm_service_query_counter[1m])` |
 | `service.error_qps` | `rate(kvcm_service_error_counter[1m])` |
+| `grpc.response_qps` | `rate(kvcm_grpc_response_counter[1m])`, preserving `server`, `method`, and `grpc_code` labels |
 | `data_storage.create_qps` | `rate(kvcm_data_storage_create_counter[1m])` |
 | `data_storage.create_keys_qps` | `rate(kvcm_data_storage_create_keys_counter[1m])` |
 

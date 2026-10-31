@@ -51,6 +51,32 @@ public:
 
 TEST_F(LocalMetricsReporterTest, TestConstructor) { EXPECT_NE(reporter_, nullptr); }
 
+TEST_F(LocalMetricsReporterTest, GrpcResponseCountsAreSeparateFromBusinessMetrics) {
+    ServiceMetricsCollector business(metrics_registry_);
+    ASSERT_TRUE(business.Init());
+    const std::string method = "MetaService/GetClusterInfo";
+    GrpcMetricsCollector rejected(metrics_registry_,
+                                  {{"server", "meta"}, {"method", method}, {"grpc_code", "RESOURCE_EXHAUSTED"}});
+    GrpcMetricsCollector accepted(metrics_registry_,
+                                  {{"server", "admin"}, {"method", "AdminService/CheckHealth"}, {"grpc_code", "OK"}});
+    ASSERT_TRUE(rejected.Init());
+    ASSERT_TRUE(accepted.Init());
+
+    reporter_->ReportPerQuery(&rejected);
+    reporter_->ReportPerQuery(&rejected);
+    reporter_->ReportPerQuery(&accepted);
+    EXPECT_EQ(2u, rejected.get_grpc_response_counter_metrics());
+    EXPECT_EQ(1u, accepted.get_grpc_response_counter_metrics());
+    EXPECT_EQ(0u, business.get_service_query_counter_metrics());
+    EXPECT_EQ(0u, business.get_service_error_counter_metrics());
+
+    const auto output = PrometheusExporter::Expose(*metrics_registry_);
+    EXPECT_NE(output.find("kvcm_grpc_response_counter{grpc_code=\"RESOURCE_EXHAUSTED\",method=\"" + method +
+                          "\",server=\"meta\"} 2\n"),
+              std::string::npos)
+        << output;
+}
+
 TEST_F(LocalMetricsReporterTest, TestInitWithNull) {
     EXPECT_FALSE(reporter_->Init(nullptr, nullptr, ""));
 
