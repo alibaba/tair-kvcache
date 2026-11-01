@@ -1,0 +1,21 @@
+{
+  "instance_group": "local_tair_mempool",
+  "instance_id": "kvcm_stress",
+  "address": ["127.0.0.1:6380"],
+  "block_size": 16,
+  "location_spec_infos": {"tp0": 65536},
+  "meta_channel_config": {
+    "retry_time": 1,
+    "connection_timeout": 3000,
+    "call_timeout": 5000
+  },
+  "sdk_config": {
+    "thread_num": 32,
+    "queue_size": 8192,
+    "sdk_backend_configs": [
+      {"type": "pace", "sdk_log_file_path": "logs/pace_stress.log", "sdk_log_level": "WARN"}
+    ],
+    "timeout_config": {"put_timeout_ms": 10000, "get_timeout_ms": 10000}
+  },
+  "model_deployment": {"model_name": "kvcm_stress", "dtype": "fp16", "tp_size": 1, "dp_size": 1, "pp_size": 1}
+}
