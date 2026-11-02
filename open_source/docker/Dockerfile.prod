@@ -11,16 +11,17 @@ USER root
 RUN sed -i.bak 's|http://mirrors\.cloud\.aliyuncs\.com|http://mirrors.aliyun.com|g' /etc/yum.repos.d/*.repo && \
     yum install -y --setopt=timeout=3 libibverbs-devel librdmacm-devel numactl-devel libaio-devel \
     wget procps-ng iproute tar vim python3.11 python3.11-pip && \
+    ln -sf /usr/bin/python3.11 /usr/local/bin/python3 && \
     yum clean all && \
     rm -rf /var/cache/yum
 
-RUN mkdir -p /home/admin/kv_cache_manager
+# ADD extracts the local tarball without retaining a second copy in an image layer.
+ADD $BINARY_PACKAGE_TAR /home/admin/kv_cache_manager/
 
-# 复制二进制包到容器中
-COPY $BINARY_PACKAGE_TAR /home/admin/kv_cache_manager/$BINARY_PACKAGE_TAR
-
-# 解压二进制包
-RUN cd /home/admin/kv_cache_manager && tar -zxvf $BINARY_PACKAGE_TAR
+# Install the wheel and its requests dependency at build time, without pip caches.
+RUN python3 -m pip install --no-cache-dir --no-compile \
+    /home/admin/kv_cache_manager/kvcm_ops-*.whl requests && \
+    PYTHONDONTWRITEBYTECODE=1 python3 -m kvcm_ops list_instance --help > /dev/null
 
 # 设置启动脚本
 ENTRYPOINT ["/home/admin/kv_cache_manager/bin/start_server.sh"]
