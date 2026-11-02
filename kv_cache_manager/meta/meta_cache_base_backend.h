@@ -22,7 +22,6 @@ public:
                                                               const KeyTypeVec &keys,
                                                               CacheLocationMapVector &out_locations) noexcept = 0;
 
-    virtual size_t GetMemUsage() const noexcept = 0;
     virtual int64_t GetOldestAccessTime() const noexcept = 0;
 
     // Reads current access timestamps from the hot cache without marking the

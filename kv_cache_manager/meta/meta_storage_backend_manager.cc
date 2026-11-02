@@ -2240,10 +2240,14 @@ MetaStorageBackend::AsyncWriteStats MetaStorageBackendManager::GetAsyncWriteStat
 }
 
 size_t MetaStorageBackendManager::GetMemUsage() const noexcept {
-    if (cache_backend_) {
-        return cache_backend_->GetMemUsage();
+    size_t usage = 0;
+    if (persistent_backend_) {
+        usage += persistent_backend_->GetMemUsage();
     }
-    return 0;
+    if (cache_backend_) {
+        usage += cache_backend_->GetMemUsage();
+    }
+    return usage;
 }
 
 int64_t MetaStorageBackendManager::GetOldestAccessTime() const noexcept {
