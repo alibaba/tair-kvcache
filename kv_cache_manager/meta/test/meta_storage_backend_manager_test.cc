@@ -587,7 +587,7 @@ protected:
     std::shared_ptr<RequestContext> request_context_;
 };
 
-TEST_F(MetaStorageBackendManagerTest, TestGetMemUsage) {
+TEST_F(MetaStorageBackendManagerTest, TestBackendMetrics) {
     {
         SCOPED_TRACE("single local backend");
         std::shared_ptr<MetaStorageBackendConfig> config =
@@ -596,11 +596,14 @@ TEST_F(MetaStorageBackendManagerTest, TestGetMemUsage) {
         ASSERT_EQ(EC_OK, mgr.Init("test", config));
         ASSERT_EQ(EC_OK, mgr.Open());
         EXPECT_EQ(0u, mgr.GetMemUsage());
+        EXPECT_EQ(INT64_MAX, mgr.GetOldestAccessTime());
 
         BatchMetaData batch = MakeBatch({11});
         ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.Put(request_context_.get(), batch));
         const size_t usage_after_put = mgr.GetMemUsage();
         EXPECT_GT(usage_after_put, 0u);
+        EXPECT_LT(mgr.GetOldestAccessTime(), INT64_MAX);
+        EXPECT_EQ(mgr.persistent_backend_->GetOldestAccessTime(), mgr.GetOldestAccessTime());
 
         batch.batch_locations[0]["loc_11"] = MakeLocation("loc_11", std::string(1024, 'x'));
         ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.Upsert(request_context_.get(), batch));
@@ -608,7 +611,10 @@ TEST_F(MetaStorageBackendManagerTest, TestGetMemUsage) {
 
         ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.Delete(request_context_.get(), {11}));
         EXPECT_EQ(0u, mgr.GetMemUsage());
+        EXPECT_EQ(INT64_MAX, mgr.GetOldestAccessTime());
         EXPECT_EQ(EC_OK, mgr.Close());
+        EXPECT_EQ(0u, mgr.GetMemUsage());
+        EXPECT_EQ(INT64_MAX, mgr.GetOldestAccessTime());
     }
     {
         SCOPED_TRACE("cached backend");
@@ -624,7 +630,11 @@ TEST_F(MetaStorageBackendManagerTest, TestGetMemUsage) {
         const size_t cache_usage = mgr.cache_backend_->GetMemUsage();
         EXPECT_GT(cache_usage, 0u);
         EXPECT_EQ(cache_usage, mgr.GetMemUsage());
+        EXPECT_LT(mgr.GetOldestAccessTime(), INT64_MAX);
+        EXPECT_EQ(mgr.cache_backend_->GetOldestAccessTime(), mgr.GetOldestAccessTime());
         EXPECT_EQ(EC_OK, mgr.Close());
+        EXPECT_EQ(0u, mgr.GetMemUsage());
+        EXPECT_EQ(INT64_MAX, mgr.GetOldestAccessTime());
     }
     {
         SCOPED_TRACE("sum both backends");
@@ -647,21 +657,38 @@ TEST_F(MetaStorageBackendManagerTest, TestGetMemUsage) {
         ASSERT_GT(persistent_usage, 0u);
         ASSERT_GT(cache_usage, 0u);
         EXPECT_EQ(persistent_usage + cache_usage, mgr.GetMemUsage());
+        const int64_t persistent_oldest = mgr.persistent_backend_->GetOldestAccessTime();
+        const int64_t cache_oldest = mgr.cache_backend_->GetOldestAccessTime();
+        ASSERT_LT(persistent_oldest, INT64_MAX);
+        ASSERT_LT(cache_oldest, INT64_MAX);
+        EXPECT_EQ(std::min(persistent_oldest, cache_oldest), mgr.GetOldestAccessTime());
+        EXPECT_EQ(1u, backup.TouchKeysForMaintenance({11}));
+        EXPECT_EQ(std::min(backup.GetOldestAccessTime(), cache_oldest), mgr.GetOldestAccessTime());
 
         ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.cache_backend_->Delete(request_context_.get(), {12}));
         EXPECT_EQ(persistent_usage, mgr.GetMemUsage());
+        EXPECT_EQ(backup.GetOldestAccessTime(), mgr.GetOldestAccessTime());
         EXPECT_EQ(EC_OK, mgr.Close());
+        EXPECT_EQ(0u, mgr.GetMemUsage());
+        EXPECT_EQ(INT64_MAX, mgr.GetOldestAccessTime());
     }
     {
-        SCOPED_TRACE("zero usage backends");
+        SCOPED_TRACE("empty metrics backends");
         MetaStorageBackendManager mgr;
+        MetaLocalBackend local;
         MetaRedisBackend redis;
         MetaAsyncRedisBackend async_redis;
         MetaDummyBackend dummy;
         EXPECT_EQ(0u, mgr.GetMemUsage());
+        EXPECT_EQ(0u, local.GetMemUsage());
         EXPECT_EQ(0u, redis.GetMemUsage());
         EXPECT_EQ(0u, async_redis.GetMemUsage());
         EXPECT_EQ(0u, dummy.GetMemUsage());
+        EXPECT_EQ(INT64_MAX, mgr.GetOldestAccessTime());
+        EXPECT_EQ(INT64_MAX, local.GetOldestAccessTime());
+        EXPECT_EQ(INT64_MAX, redis.GetOldestAccessTime());
+        EXPECT_EQ(INT64_MAX, async_redis.GetOldestAccessTime());
+        EXPECT_EQ(INT64_MAX, dummy.GetOldestAccessTime());
     }
 }
 
