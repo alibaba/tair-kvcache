@@ -239,7 +239,8 @@ void DataStorageSelector::DoCleanup() {}
 
 DataStorageSelectResult
 DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_context,
-                                                        const std::string &instance_group) const noexcept {
+                                                        const std::string &instance_group,
+                                                        std::optional<DataStorageType> target_type) const noexcept {
     SPAN_TRACER(request_context);
     DataStorageSelectResult result{ErrorCode::EC_UNKNOWN, DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, ""};
     if (!request_context) {
@@ -336,7 +337,8 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
     GetCandidates(request_context, avail_backends, configured_candidates, storage_quota_avail_table, candidates);
 
     // 1. select backend according to the specified preference
-    const auto chosen_backend = Select(request_context, candidates, preference);
+    const auto chosen_backend = target_type ? SelectByType(request_context, candidates, *target_type, false)
+                                            : Select(request_context, candidates, preference);
 
     if (chosen_backend == nullptr) {
         PREFIX_LOG(WARN, "unable to select a data storage backend, instance group: %s", instance_group.c_str());

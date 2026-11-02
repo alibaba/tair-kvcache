@@ -417,6 +417,12 @@ message GetCacheMetaResponse {
     repeated string metas = 3;            // 与请求key一一对应
 }
 
+message StorageReplicaRequirement {
+    StorageType storage_type = 1;
+    // Location 写入门槛，必须为正数；不保证跨后端分布或可读副本数量。
+    int32 min_location_count = 2;
+}
+
 // 在每次写入 cache 前, 需要调用这个接口获得CacheLocation信息
 message StartWriteCacheRequest {
     string trace_id = 1;
@@ -432,6 +438,9 @@ message StartWriteCacheRequest {
     int32 write_timeout_seconds = 6; // seconds, 要在指定timeout内调用FinishWriteCacheRequest，否则服务端会将本次 Request 相关的 Meta 全释放掉
     // 看情况添加一个已匹配block数量，提升metaservice性能，针对流式存储场景
     int32 min_replica_count = 7; // 可用副本数 >= min_replica_count 才跳过写入，0 或未设置视为 1
+    // 指定存储类型上的 Location 数量门槛，与非 0 的 min_replica_count 互斥。
+    // 每次每个待写 key 至多分配一份，不跨类型回退；显式目标优先于分层 Mark。
+    StorageReplicaRequirement storage_replica_requirement = 8;
 }
 
 message StartWriteCacheResponse {

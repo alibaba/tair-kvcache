@@ -79,6 +79,23 @@ curl -g -vvv -X POST http://localhost:6382/api/startWriteCache \
 }'
 ```
 
+若希望在指定存储类型保留副本，可在 Start Write Cache 请求中增加：
+
+```json
+{
+  "storage_replica_requirement": {
+    "storage_type": "ST_TAIRMEMPOOL",
+    "min_location_count": 1
+  }
+}
+```
+
+此时顶层 `min_replica_count` 必须不传或为 0。新字段不传或为 `null` 时保持旧行为；空对象、未知类型、`ST_UNSPECIFIED`、EventReport 类型以及非正数量均返回 `INVALID_ARGUMENT`。
+
+服务端仅统计目标类型的有效 Location，不足时每个 key 本次最多分配一份；客户端仍须写入返回的 URI 并调用 Finish Write Cache。数量是补写门槛，不保证并发上限、不同后端分布或可读副本数下限。显式类型覆盖 Group 的 PREFER/ALWAYS 偏好和本次 StartWrite 的 Mark 引导，但仍受 `storage_candidates`、可写性及配额限制。
+
+在前置检查通过且需要分配时，目标类型无可写候选或类型配额已满，沿用既有映射返回 `INSTANCE_NOT_EXIST`；Group 总配额已满或分配失败返回 `INTERNAL_ERROR`。若全部候选不可用，可能在计数前就返回 `INTERNAL_ERROR`。不会跨类型回退或把分配失败当作跳过成功。详细计数、Mark 和失败语义见[设计说明](../design/start_write_storage_replica.md)。
+
 ## Finish Write Cache
 ```bash
 curl -g -vvv -X POST http://localhost:6382/api/finishWriteCache \

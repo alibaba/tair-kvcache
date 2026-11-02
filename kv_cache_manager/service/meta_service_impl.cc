@@ -728,6 +728,14 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
         location_spec_group_names.push_back(name);
     }
 
+    std::optional<CacheManager::StorageReplicaRequirement> storage_replica_requirement;
+    if (request->has_storage_replica_requirement()) {
+        storage_replica_requirement.emplace(CacheManager::StorageReplicaRequirement{});
+        const auto &requirement = request->storage_replica_requirement();
+        ProtoConvert::DataStorageTypeFromProto(requirement.storage_type(), storage_replica_requirement->storage_type);
+        storage_replica_requirement->min_location_count = requirement.min_location_count();
+    }
+
     std::pair<ErrorCode, StartWriteCacheInfo> start_write_cache = cache_manager_->StartWriteCache(
         request_context,
         request->instance_id(),
@@ -735,7 +743,8 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
         std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
         location_spec_group_names,
         request->write_timeout_seconds(),
-        request->min_replica_count());
+        request->min_replica_count(),
+        storage_replica_requirement);
     ErrorCode ec_info = start_write_cache.first;
     std::string write_session_id_res = start_write_cache.second.write_session_id();
     BlockMask block_mask_res = start_write_cache.second.block_mask();
