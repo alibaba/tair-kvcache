@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -147,7 +148,8 @@ public:
      */
     [[nodiscard]] DataStorageSelectResult
     SelectCacheWriteDataStorageBackend(RequestContext *request_context,
-                                       const std::string &instance_group) const noexcept;
+                                       const std::string &instance_group,
+                                       std::optional<DataStorageType> target_type = std::nullopt) const noexcept;
 
     /**
      * @brief Check whether explicitly named write targets may accept new

@@ -1,3 +1,6 @@
+from pathlib import Path
+from urllib.parse import urlsplit
+
 import requests
 import integration_test.meta_service.meta_interface_cases as cases
 
@@ -186,6 +189,115 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
             },
         } for block_key in block_keys)
         return events
+
+    def test_storage_replica_requirement_with_event_report_locations(self):
+        storage_name = "event_report_storage_replica"
+        nfs_name = "nfs_storage_replica"
+        group_name = "storage_replica_group"
+        instance_id = "storage_replica_instance"
+        self._client.add_storage({
+            "storage": self._event_report_storage(storage_name),
+        })
+        self._client.add_storage({
+            "storage": {
+                "global_unique_name": nfs_name,
+                "storage_type": "ST_NFS",
+                "nfs": {"root_path": f"{self.get_workdir()}/replica_data/", "key_count_per_file": 1},
+            },
+        })
+        group = self._event_report_instance_group(group_name, storage_name)
+        group["storage_candidates"] = [nfs_name]
+        group["cache_config"]["reclaim_strategy"]["storage_unique_name"] = nfs_name
+        self._client.create_instance_group({
+            "instance_group": group,
+        })
+        self._client.register_instance({
+            "instance_group": group_name,
+            "instance_id": instance_id,
+            "block_size": 128,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [{"name": "tp0", "size": 1024}],
+        })
+        for index in range(100):
+            host = f"10.11.0.{index + 1}:9600"
+            self._client.report_event(self._report_events(
+                instance_id, host, self._node_and_block_events(host, "tp0", [83002]),
+                f"storage_replica_report_{index}",
+            ))
+        request = {
+            "instance_id": instance_id,
+            "block_keys": [83002],
+            "write_timeout_seconds": 30,
+        }
+        legacy = self._client.start_write_cache({**request, "min_replica_count": 2})
+        self.assertEqual([], legacy.get("locations", []), legacy)
+        response = self._client.start_write_cache({
+            **request,
+            "storage_replica_requirement": {"storage_type": "ST_NFS", "min_location_count": 1},
+        })
+        self.assertEqual(1, len(response.get("locations", [])), response)
+        payload = bytes(range(256)) * 4
+        for spec in response["locations"][0]["location_specs"]:
+            uri = urlsplit(spec["uri"])
+            self.assertEqual(nfs_name, uri.hostname)
+            path = Path(uri.path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        self._client.finish_write_cache({
+            "instance_id": instance_id,
+            "write_session_id": response["write_session_id"],
+            "success_blocks": {"bool_masks": {"values": [True]}},
+        })
+        read = self._client.get_cache_locations_by_backend({
+            "instance_id": instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [83002],
+            "block_mask": {"offset": 0},
+            "backend_selectors": [{"backend_type": "ST_NFS", "strategy": "LSS_WEIGHTED_RANDOM"}],
+        })
+        self.assertEqual(response["locations"], read["key_locations"][0]["locations"])
+        for spec in read["key_locations"][0]["locations"][0]["location_specs"]:
+            self.assertEqual(payload, Path(urlsplit(spec["uri"]).path).read_bytes())
+        skipped = self._client.start_write_cache({
+            **request,
+            "storage_replica_requirement": {"storage_type": "ST_NFS", "min_location_count": 1},
+        })
+        self.assertEqual([], skipped.get("locations", []), skipped)
+
+        # The HTTP codec ignores an unknown enum name; message presence must
+        # still select validation rather than silently falling back to legacy.
+        invalid = self._client.start_write_cache({
+            **request,
+            "storage_replica_requirement": {"storage_type": "ST_NFS_TYPO", "min_location_count": 1},
+        }, check_response=False)
+        self.assertEqual("INVALID_ARGUMENT", invalid["header"]["status"]["code"])
+
+    def test_storage_replica_requirement_quota_error_codes(self):
+        for name, total_quota, type_quota, expected in (
+            ("replica_total_quota", 0, 1024, "INTERNAL_ERROR"),
+            ("replica_type_quota", 1024, 0, "INSTANCE_NOT_EXIST"),
+        ):
+            with self.subTest(name=name):
+                group = self._event_report_instance_group(name, "")
+                group.pop("event_report_storage_candidates")
+                group["quota"]["capacity"] = total_quota
+                group["quota"]["quota_config"][0]["capacity"] = type_quota
+                self._client.create_instance_group({"instance_group": group})
+                self._client.register_instance({
+                    "instance_group": name,
+                    "instance_id": name,
+                    "block_size": 128,
+                    "model_deployment": self._get_test_model_deployment(),
+                    "location_spec_infos": [{"name": "tp0", "size": 1024}],
+                })
+                response = self._client.start_write_cache({
+                    "instance_id": name,
+                    "block_keys": [83003],
+                    "write_timeout_seconds": 30,
+                    "storage_replica_requirement": {"storage_type": "ST_NFS", "min_location_count": 1},
+                }, check_response=False)
+                self.assertEqual(expected, response["header"]["status"]["code"])
+                self.assertEqual([], response.get("locations", []), response)
 
     def test_event_report_requested_spec_filters_before_peer_selection(self):
         """Exercise ReportEvent -> HTTP query with the adversarial peer layout.

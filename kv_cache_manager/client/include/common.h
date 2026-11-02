@@ -2,6 +2,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -103,6 +104,11 @@ enum class BackendSelectStrategy : int32_t {
     LSS_V6D_PREFIX = 1,
     LSS_V6D_COVERAGE = 2,
     LSS_WEIGHTED_RANDOM = 3,
+};
+
+struct StorageReplicaRequirement {
+    StorageType storage_type{StorageType::ST_UNSPECIFIED};
+    int32_t min_location_count{0};
 };
 
 struct BackendLocation {

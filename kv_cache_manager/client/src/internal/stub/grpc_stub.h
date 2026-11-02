@@ -53,13 +53,15 @@ public:
                                                             const TokenIdsVector &tokens,
                                                             int32_t sw_size) override;
 
-    std::pair<ClientErrorCode, WriteLocation> StartWriteCache(const std::string &trace_id,
-                                                              const std::string &instance_id,
-                                                              const KeyVector &keys,
-                                                              const TokenIdsVector &tokens,
-                                                              const std::vector<std::string> &location_spec_group_names,
-                                                              int64_t write_timeout_seconds,
-                                                              int32_t min_replica_count = 0) override;
+    std::pair<ClientErrorCode, WriteLocation>
+    StartWriteCache(const std::string &trace_id,
+                    const std::string &instance_id,
+                    const KeyVector &keys,
+                    const TokenIdsVector &tokens,
+                    const std::vector<std::string> &location_spec_group_names,
+                    int64_t write_timeout_seconds,
+                    int32_t min_replica_count = 0,
+                    std::optional<StorageReplicaRequirement> storage_replica_requirement = std::nullopt) override;
 
     ClientErrorCode FinishWriteCache(const std::string &trace_id,
                                      const std::string &instance_id,
