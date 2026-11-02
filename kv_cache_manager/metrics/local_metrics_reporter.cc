@@ -153,8 +153,17 @@ void LocalMetricsReporter::ReportInterval() {
                     MetricsTags{{"type", ToString(storage_backend->GetType())}, {"unique_name", unique_name}});
             SET_METRICS_(p, data_storage, healthy_status, storage_backend->Available() ? 1.0 : 0.0);
             SET_METRICS_(p, data_storage, writable_status, storage_backend->Writable() ? 1.0 : 0.0);
-            SET_METRICS_(
-                p, data_storage, storage_usage_ratio, storage_backend->GetStorageUsageRatio("trace_report_interval"));
+            // A negative ratio means "usage unknown": the backend could not
+            // query its capacity source (e.g. pace meta-service unreachable
+            // on this node). Skip the write so the gauge keeps its last known
+            // value instead of publishing a misleading reading. An unknown
+            // usage must never surface as a real ratio -- a 1.0 error
+            // sentinel used to trigger false storage-full alerts on follower
+            // nodes.
+            const double usage_ratio = storage_backend->GetStorageUsageRatio("trace_report_interval");
+            if (usage_ratio >= 0.0) {
+                SET_METRICS_(p, data_storage, storage_usage_ratio, usage_ratio);
+            }
         }
     } while (false);
 

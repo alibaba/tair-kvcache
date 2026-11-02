@@ -451,6 +451,73 @@ TEST_F(LocalMetricsReporterTest, TestReportInterval01) {
     }
 }
 
+namespace {
+// NfsBackend with a controllable usage ratio, used to verify how
+// ReportInterval handles the "unknown usage" (negative) sentinel that
+// backends return when they cannot query their capacity source.
+class FakeRatioNfsBackend : public NfsBackend {
+public:
+    explicit FakeRatioNfsBackend(std::shared_ptr<MetricsRegistry> registry) : NfsBackend(std::move(registry)) {}
+    double GetStorageUsageRatio(const std::string & /*trace_id*/) const override { return ratio_; }
+    void SetUsageRatio(double ratio) { ratio_ = ratio; }
+
+private:
+    double ratio_ = -1.0;
+};
+} // namespace
+
+TEST_F(LocalMetricsReporterTest, StorageUsageRatioSkipsUnknownValues) {
+    auto be = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    be->SetOpen(true);
+    be->SetAvailable(true);
+    registry_manager_->data_storage_manager_ = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_->storage_map_.emplace("ratio_store", be);
+
+    auto published_ratio = [this]() {
+        const auto mc_vec = reporter_->data_storage_interval_metrics_collectors_.GetMetricsCollectors();
+        EXPECT_GE(mc_vec.size(), 1u);
+        auto p = std::dynamic_pointer_cast<DataStorageIntervalMetricsCollector>(mc_vec.front());
+        EXPECT_TRUE(p);
+        double v = -12345.0;
+        GET_METRICS_(p, data_storage, storage_usage_ratio, v);
+        return v;
+    };
+
+    // A valid ratio gets published.
+    be->SetUsageRatio(0.75);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.75, published_ratio());
+
+    // Unknown usage (negative sentinel): the gauge keeps its last known
+    // value and the sentinel itself is never written. Regression test for
+    // followers exporting kvcm_data_storage_storage_usage_ratio == 1 when
+    // the pace meta-service query failed.
+    be->SetUsageRatio(-1.0);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.75, published_ratio());
+
+    // A backend that never had a valid ratio leaves its gauge at the
+    // registry default, and the exported text never shows a bogus full
+    // reading (or the raw sentinel) for it.
+    auto never_ok = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    never_ok->SetOpen(true);
+    never_ok->SetAvailable(false);
+    registry_manager_->data_storage_manager_->storage_map_.emplace("never_ok_store", never_ok);
+    reporter_->ReportInterval();
+    const auto mc_vec = reporter_->data_storage_interval_metrics_collectors_.GetMetricsCollectors();
+    ASSERT_EQ(2u, mc_vec.size());
+    for (const auto &mc : mc_vec) {
+        auto p = std::dynamic_pointer_cast<DataStorageIntervalMetricsCollector>(mc);
+        ASSERT_TRUE(p);
+        double v = -12345.0;
+        GET_METRICS_(p, data_storage, storage_usage_ratio, v);
+        EXPECT_TRUE(v == 0.75 || v == 0.0) << "unexpected published usage ratio: " << v;
+    }
+    const std::string exported_text = PrometheusExporter::Expose(*metrics_registry_);
+    EXPECT_EQ(std::string::npos, exported_text.find("unique_name=\"never_ok_store\"} 1"));
+    EXPECT_EQ(std::string::npos, exported_text.find("unique_name=\"never_ok_store\"} -"));
+}
+
 TEST_F(LocalMetricsReporterTest, TestReportInterval02) {
     {
         cache_manager_->meta_indexer_manager_ = nullptr;

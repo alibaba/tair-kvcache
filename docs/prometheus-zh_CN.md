@@ -186,7 +186,7 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `meta_indexer.total_cache_usage` | gauge | 缓存使用总量（字节） |
 | `data_storage.healthy_status` | gauge | 存储后端读取可用状态（1/0） |
 | `data_storage.writable_status` | gauge | 存储后端写入可用状态（1/0）；只读降级时为 0 |
-| `data_storage.storage_usage_ratio` | gauge | 存储使用率 |
+| `data_storage.storage_usage_ratio` | gauge | 存储使用率。后端无法获取用量时（如容量查询失败）不更新该 gauge，保留上一次已知值；未知用量不会以真实比率导出 |
 | `is_leader` | gauge | 本节点是否持有 leader 租约（1/0），导出为 `kvcm_is_leader` |
 | `access_mode` | gauge | 本节点当前可提供的读写能力（0/1/2），导出为 `kvcm_access_mode` |
 | `cache_manager.write_location_expire_size` | gauge | 已过期的写入位置数量 |

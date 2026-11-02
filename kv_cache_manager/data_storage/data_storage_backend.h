@@ -36,6 +36,14 @@ public:
     // This policy does not affect metadata-only cleanup.
     virtual bool ShouldSkipConfirmedMissingBackendDelete() const { return false; }
     virtual bool Available() = 0;
+    // Capacity usage of this backend, normally within [0, 1] (slightly larger
+    // values are tolerated for overcommitted stores). Implementations MUST
+    // return a negative value when the usage cannot be determined (e.g. the
+    // capacity query failed): the metrics reporter skips publishing negative
+    // values, so an unknown usage never surfaces as a bogus ratio. Never
+    // return an in-range value such as 1.0 as an error sentinel -- it is
+    // indistinguishable from a genuinely full store and triggers false
+    // storage-full alerts.
     virtual double GetStorageUsageRatio(const std::string &trace_id) const = 0;
     inline bool IsOpen() const { return is_open_.load(std::memory_order_relaxed); }
     inline void SetOpen(bool open) { is_open_.store(open, std::memory_order_relaxed); }
