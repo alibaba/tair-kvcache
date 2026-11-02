@@ -2,6 +2,7 @@
 
 ### 设计文档
 
+- [Checksum 元数据存储](design/checksum_metadata.md) - 接收调用方计算的 checksum，按 block/spec 持久化与查询，支持 v6d 自有 CRC
 - [模块架构与关联关系](design/module_architecture.md) - 各模块职责、依赖方向、控制流与数据流，附 Mermaid 图
 - [基本概念](design/basic_concepts.md) - Storage、Instance Group、Instance、Block、CacheLocation 等核心概念
 - [分层存储设计](design/tiered_storage.md) - 多层缓存读写、Copy / Mark 迁移、回收协同，以及完整配置与 Admin 操作示例
