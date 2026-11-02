@@ -36,7 +36,10 @@ double MooncakeBackend::GetStorageUsageRatio(const std::string &trace_id) const 
     auto ec = mooncake_client_get_store_status(client_, &status);
     if (ec != MOONCAKE_ERROR_OK) {
         KVCM_LOG_WARN("get store status failed, error: [%d]", ec);
-        return 0.0;
+        // -1.0 marks "usage unknown"; the metrics reporter skips publishing
+        // negative ratios so the gauge keeps its last known value instead of
+        // reporting a failed query as an empty store.
+        return -1.0;
     }
     return status.used_ratio;
 }

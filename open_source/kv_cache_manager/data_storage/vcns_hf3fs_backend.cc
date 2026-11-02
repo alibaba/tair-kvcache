@@ -14,7 +14,9 @@ bool VcnsHf3fsBackend::Available() { return IsOpen() && IsAvailable(); }
 
 double VcnsHf3fsBackend::GetStorageUsageRatio(const std::string &trace_id) const {
     KVCM_LOG_ERROR("no implementation for VcnsHf3fsBackend");
-    return 0.0;
+    // No implementation means the usage is unknown, not zero. The metrics
+    // reporter skips negative ratios, so nothing misleading gets published.
+    return -1.0;
 }
 
 ErrorCode VcnsHf3fsBackend::DoOpen(const StorageConfig &storage_config, const std::string &trace_id) {

@@ -37,7 +37,9 @@ bool TairMempoolBackend::Available() {
 
 double TairMempoolBackend::GetStorageUsageRatio(const std::string &trace_id) const {
     KVCM_LOG_ERROR("no implementation for TairMempoolBackend");
-    return 0.0;
+    // No implementation means the usage is unknown, not zero. The metrics
+    // reporter skips negative ratios, so nothing misleading gets published.
+    return -1.0;
 }
 
 ErrorCode TairMempoolBackend::DoOpen(const StorageConfig &storage_config, const std::string &trace_id) {
