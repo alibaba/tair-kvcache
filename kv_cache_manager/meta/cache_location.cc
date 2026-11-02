@@ -26,13 +26,15 @@ LocationSpec &LocationSpec::operator=(const LocationSpec &other) {
 LocationSpec::~LocationSpec() = default;
 
 void LocationSpec::set_checksum(std::string_view checksum) {
+    if (checksum.empty()) {
+        clear_checksum();
+        return;
+    }
     if (checksum.size() == std::numeric_limits<size_t>::max()) {
         throw std::length_error("checksum is too large");
     }
     auto buffer = std::make_unique<char[]>(checksum.size() + 1);
-    if (!checksum.empty()) {
-        std::memcpy(buffer.get(), checksum.data(), checksum.size());
-    }
+    std::memcpy(buffer.get(), checksum.data(), checksum.size());
     buffer[checksum.size()] = '\0';
     // Allocate and copy first: checksum may refer to our existing buffer.
     checksum_ = std::move(buffer);

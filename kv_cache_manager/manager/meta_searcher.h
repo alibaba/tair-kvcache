@@ -347,7 +347,7 @@ public:
             std::string checksum;
         };
         // Optional independently stored spec payload checksums. Unnamed specs
-        // are untouched; an empty string is a valid value.
+        // and empty values leave existing checksums untouched.
         std::vector<SpecChecksum> spec_checksums;
     };
     ErrorCode BatchUpdateLocationStatus(RequestContext *request_context,

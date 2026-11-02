@@ -254,8 +254,7 @@ InstanceGroup 必须把对应 EventReport storage 配置在
       {
         "name": "F0",
         "uri": "event_report://10.0.0.8:9600/gpu/123?size=4096",
-        "checksum": "",
-        "checksum_present": true
+        "checksum": "crc64:0000deadbeef"
       },
       {
         "name": "L1",
@@ -274,8 +273,8 @@ InstanceGroup 必须把对应 EventReport storage 配置在
 - 每个 `spec.name` 非空、已在 `RegisterInstance.location_spec_infos` 中注册，且同一事件内不能重复；
 - 每个 URI 必须合法；
 - 客户端 URI 不能带 `s_version`；
-- `checksum` 可选，是该 spec payload 的 opaque `string`；非空字符串表示提供了值，合法空字符串
-  必须同时设置 `checksum_present=true`，Manager 不解析数值或算法；
+- `checksum` 可选，是该 spec payload 的 opaque `string`；非空字符串表示提供了值，空字符串等同未提供，
+  Manager 不解析数值或算法；
 - 旧字段 `block_add.uri` 已废弃，只有 `specs` 生效。
 
 行为：
@@ -283,7 +282,7 @@ InstanceGroup 必须把对应 EventReport storage 配置在
 - 按 spec name merge；
 - 本次未涉及的其他 spec 会保留；
 - 同一逻辑 spec 再次 ADD 会覆盖旧 URI；
-- 本次提供 checksum 时原样覆盖；未提供时保留同名 spec 已有 checksum；
+- 本次提供非空 checksum 时原样覆盖；空字符串或未提供时保留同名 spec 已有 checksum；
 - 同一请求内多个 ADD 被折叠时也遵守上述 patch 语义：后一个仅刷新 URI、未提供 checksum 时，保留本批次
   较早 ADD 已提供的 checksum；
 - 因此实际覆盖 payload 的 ADD 必须同时提交新 checksum，避免调用方读取后使用过期值校验；
@@ -335,8 +334,7 @@ InstanceGroup 必须把对应 EventReport storage 配置在
           {
             "name": "F0",
             "uri": "event_report://10.0.0.8:9600/gpu/123?size=4096",
-            "checksum": "crc64:0000deadbeef",
-            "checksum_present": true
+            "checksum": "crc64:0000deadbeef"
           },
           {
             "name": "L1",
@@ -369,7 +367,7 @@ Snapshot 的完整性规则：
 - `medium` 不能包含 location id 分隔符 `#`；
 - 每个 block 的 specs 必须非空，且 spec name 必须已在
   `RegisterInstance.location_spec_infos` 中注册并且不能重复；
-- 每个 spec 的 `checksum`/presence 规则与 BLOCK_ADD 相同；snapshot 是完整替换，未提供 checksum 的
+- 每个 spec 的 `checksum` 规则与 BLOCK_ADD 相同；snapshot 是完整替换，未提供 checksum 的
   spec 会明确变为“无 checksum”，不会继承旧 snapshot 的值；
 - `blocks=[]` 表示该 reporter 当前没有任何 cache；旧 location 会立即从 strict 查询结果隐藏，并由后台 GC 周期回收 metadata。
 
@@ -855,7 +853,7 @@ heartbeat/grace 短时序测试使用独立 storage/instance group，不得缩�
 | D-13 | 第一条 delta 已创建 generation、metadata 写失败时准确报错，重试复用 generation | `TestReportEventFirstDeltaMetadataFailureReportsFailureAndReusesGeneration` |
 | D-14 | 同一 spec 的折叠事件共享最终 metadata 写入失败结果 | `TestReportEventFoldedDeltaEventsShareFinalWriteFailure` |
 | D-15 | 大于 32 KiB 的部分失败批次保持逐项结果与输入索引严格对齐，只重试失败项后复用 generation 并最终收敛 | snapshot 集成 `test_34_large_partial_batch_preserves_item_alignment_and_retry` |
-| D-16 | ADD 保留调用方 checksum（含合法空字符串），同请求折叠仍遵守 checksum patch 语义，HTTP 快速解析与查询 opt-in 不丢字段 | `TestReportEventPreservesCallerProvidedChecksum`；`ProtoMessageJsonUtilTest.TestReportEventFastJsonParserMatchesGenericParser`；`ManagerMessageProtoUtilTest` |
+| D-16 | ADD 保留调用方非空 checksum，空字符串等同未提供；同请求折叠仍遵守 checksum patch 语义，HTTP 快速解析与查询 opt-in 不丢字段 | `TestReportEventPreservesCallerProvidedChecksum`；`ProtoMessageJsonUtilTest.TestReportEventFastJsonParserMatchesGenericParser`；`ManagerMessageProtoUtilTest` |
 | S-01 | snapshot 跨 medium 完整上报、响应返回 generation | `TestReportEventSnapshotReplacesCompleteSpecSetPerBlock`；snapshot 集成 `test_17/22` |
 | S-02 | 同 block 跨 medium 合法，同 block+medium 重复非法 | `TestReportEventRejectsCanonicalDuplicateSnapshotKeysButAllowsDifferentMedia`；snapshot 集成 `test_27_*` |
 | S-03 | snapshot block 内重复 spec name 被拒绝 | `TestReportEventRejectsDuplicateSpecNamesWithinSnapshotBlock` |

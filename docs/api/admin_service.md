@@ -335,8 +335,7 @@ curl -g -vvv -X POST http://localhost:6492/api/getCacheMeta \
 ```
 
 `include_checksums` 默认为 `false`。显式开启后，返回的每个 `location_specs[]` 可携带该 spec 独立的
-`checksum` 与 `checksum_present`；仅当 `checksum_present=true` 时值有效。checksum 为不透明字符串，
-空字符串也是合法值。
+`checksum`；非空表示返回了校验值。checksum 为不透明字符串，空字符串或字段省略表示未返回校验值。
 
 ## Remove Cache
 ```bash

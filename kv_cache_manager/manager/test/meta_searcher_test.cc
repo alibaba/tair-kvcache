@@ -3527,6 +3527,18 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusWithoutChecksumPreservesEx
     const auto &stored_spec = out_location_maps[0].at(out_location_ids[0])->location_specs()[0];
     EXPECT_EQ(stored_spec.checksum(), kInitial);
     EXPECT_TRUE(stored_spec.has_checksum());
+
+    // Empty batch placeholders are omitted updates, even for existing values.
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+    second_tasks[0][0].spec_checksums = {{"tp0", ""}};
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, second_tasks, second_results));
+    ASSERT_TRUE(meta_indexer_->Sync(keys));
+    out_location_maps.clear();
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps));
+    const auto &after_empty = out_location_maps[0].at(out_location_ids[0])->location_specs()[0];
+    EXPECT_TRUE(after_empty.has_checksum());
+    EXPECT_EQ(kInitial, after_empty.checksum());
 }
 
 TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusPersistsZeroChecksum) {

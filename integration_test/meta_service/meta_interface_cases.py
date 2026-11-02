@@ -308,7 +308,6 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         self.assertEqual(len(block_keys), len(default_result["locations"]))
         for location in default_result["locations"]:
             for spec in location["location_specs"]:
-                self.assertFalse(spec.get("checksum_present", False))
                 self.assertEqual("", spec.get("checksum", ""))
 
         query["trace_id"] = "checksum-query-opt-in"
@@ -382,11 +381,11 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
 
     def _assert_spec_checksums(self, locations, spec_name, expected):
         actual = []
+        self.assertEqual(len(expected), len(locations))
         for location in locations:
             specs = {spec["name"]: spec for spec in location["location_specs"]}
             self.assertIn(spec_name, specs)
-            self.assertTrue(specs[spec_name]["checksum_present"])
-            actual.append(specs[spec_name]["checksum"])
+            actual.append(specs[spec_name].get("checksum", ""))
         self.assertEqual(expected, actual)
 
     def test_register_instance(self):

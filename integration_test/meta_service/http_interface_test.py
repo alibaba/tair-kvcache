@@ -230,16 +230,13 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
         full_events = self._node_and_block_events(full_host, "full_0", block_keys)
         full_events[1]["block_add"]["specs"][0].update({
             "checksum": "",
-            "checksum_present": True,
         })
         full_events[2]["block_add"]["specs"][0].update({
             "checksum": "base64:AbCd+/==",
-            "checksum_present": True,
         })
         linear_events = self._node_and_block_events(linear_host, "linear_1", block_keys[:1])
         linear_events[1]["block_add"]["specs"][0].update({
             "checksum": "crc64:0000deadbeef",
-            "checksumPresent": True,
         })
         self._client.report_event(self._report_events(
             instance_id,
@@ -275,7 +272,6 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
             first_specs = first_locations[0].get("location_specs", [])
             self.assertEqual(["linear_1"], [spec.get("name") for spec in first_specs], response)
             self.assertIn(linear_host, first_specs[0].get("uri", ""), response)
-            self.assertTrue(first_specs[0].get("checksum_present"), response)
             self.assertEqual("crc64:0000deadbeef", first_specs[0].get("checksum"), response)
             self.assertEqual([], key_locations[1].get("locations", []), response)
 
@@ -293,8 +289,7 @@ class MetaServiceHttpTest(cases.MetaServiceTestBase):
             }],
         })
         empty_spec = empty_checksum["key_locations"][0]["locations"][0]["location_specs"][0]
-        self.assertTrue(empty_spec.get("checksum_present"), empty_checksum)
-        self.assertEqual("", empty_spec.get("checksum"), empty_checksum)
+        self.assertEqual("", empty_spec.get("checksum", ""), empty_checksum)
 
         unknown_response = self._client.get_cache_locations_by_backend({
             "trace_id": "event_report_query_unknown_spec",

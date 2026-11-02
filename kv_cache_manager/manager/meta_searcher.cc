@@ -3327,7 +3327,10 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
             auto new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
             new_loc->set_status(batch_tasks[key_index][loc_index].new_status);
             for (const auto &spec_checksum : batch_tasks[key_index][loc_index].spec_checksums) {
-                new_loc->set_location_spec_checksum(spec_checksum.location_spec_name, spec_checksum.checksum);
+                // Empty batch entries are placeholders, not checksum updates.
+                if (!spec_checksum.checksum.empty()) {
+                    new_loc->set_location_spec_checksum(spec_checksum.location_spec_name, spec_checksum.checksum);
+                }
             }
             locs[loc_index] = std::move(new_loc);
         }

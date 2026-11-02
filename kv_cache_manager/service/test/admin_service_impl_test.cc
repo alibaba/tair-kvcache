@@ -204,9 +204,9 @@ public:
     const std::string kInstance = "test_instance";
 };
 
-TEST_F(AdminServiceImplTest, TestGetCacheMetaChecksumIsOptInAndEmptyRemainsPresent) {
+TEST_F(AdminServiceImplTest, TestGetCacheMetaChecksumIsOptIn) {
     constexpr int64_t kBlockKey = 901;
-    SeedServingSource(kBlockKey, "");
+    SeedServingSource(kBlockKey, "0");
 
     proto::admin::GetCacheMetaRequest request;
     request.set_trace_id("checksum-opt-in");
@@ -227,14 +227,12 @@ TEST_F(AdminServiceImplTest, TestGetCacheMetaChecksumIsOptInAndEmptyRemainsPrese
     const auto hidden = call(false);
     ASSERT_EQ(1, hidden.locations_size());
     ASSERT_EQ(1, hidden.locations(0).location_specs_size());
-    EXPECT_FALSE(hidden.locations(0).location_specs(0).checksum_present());
     EXPECT_EQ("", hidden.locations(0).location_specs(0).checksum());
 
     const auto included = call(true);
     ASSERT_EQ(1, included.locations_size());
     ASSERT_EQ(1, included.locations(0).location_specs_size());
-    EXPECT_TRUE(included.locations(0).location_specs(0).checksum_present());
-    EXPECT_EQ("", included.locations(0).location_specs(0).checksum());
+    EXPECT_EQ("0", included.locations(0).location_specs(0).checksum());
 }
 
 TEST_F(AdminServiceImplTest, TestInvalidArgs) {

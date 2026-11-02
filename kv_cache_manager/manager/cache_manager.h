@@ -195,8 +195,8 @@ public:
             std::vector<std::string> checksums;
         };
         // Each batch is parallel to the compact keys captured by StartWrite.
-        // An empty batch list means no checksum update; an individual checksum
-        // may be an empty string. Failed positions and positions whose location
+        // An empty batch list or individual checksum means no checksum update.
+        // Failed positions and positions whose location
         // omits that spec are ignored.
         std::vector<ChecksumBatch> checksum_batches;
 

@@ -1134,7 +1134,7 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessDeleteSource) {
     ASSERT_EQ(1u, stats.copy_completed);
 }
 
-TEST_F(MigrationManagerTest, TestMigrationPreservesEmptyChecksumPresence) {
+TEST_F(MigrationManagerTest, TestMigrationKeepsEmptyChecksumAbsent) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "checksum_hot/"));
     ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "checksum_cold/"));
@@ -1144,7 +1144,7 @@ TEST_F(MigrationManagerTest, TestMigrationPreservesEmptyChecksumPresence) {
     const auto source = GetLocation(block_key, src_loc);
     ASSERT_NE(nullptr, source);
     ASSERT_EQ(1u, source->location_specs().size());
-    ASSERT_TRUE(source->location_specs()[0].has_checksum());
+    ASSERT_FALSE(source->location_specs()[0].has_checksum());
     ASSERT_EQ("", source->location_specs()[0].checksum());
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
@@ -1164,7 +1164,7 @@ TEST_F(MigrationManagerTest, TestMigrationPreservesEmptyChecksumPresence) {
     const auto writing_destination = GetLocation(block_key, dst_loc);
     ASSERT_NE(nullptr, writing_destination);
     ASSERT_EQ(1u, writing_destination->location_specs().size());
-    EXPECT_TRUE(writing_destination->location_specs()[0].has_checksum());
+    EXPECT_FALSE(writing_destination->location_specs()[0].has_checksum());
     EXPECT_EQ("", writing_destination->location_specs()[0].checksum());
 
     mgr.OnTaskSuccess(kInstance, block_key);
@@ -1172,7 +1172,7 @@ TEST_F(MigrationManagerTest, TestMigrationPreservesEmptyChecksumPresence) {
     ASSERT_NE(nullptr, serving_destination);
     EXPECT_EQ(CLS_SERVING, serving_destination->status());
     ASSERT_EQ(1u, serving_destination->location_specs().size());
-    EXPECT_TRUE(serving_destination->location_specs()[0].has_checksum());
+    EXPECT_FALSE(serving_destination->location_specs()[0].has_checksum());
     EXPECT_EQ("", serving_destination->location_specs()[0].checksum());
 }
 

@@ -173,10 +173,8 @@ message LocationSpec {
     string name = 1; // 对应LocationSpecInfo中的name
     string uri = 2;
     // Caller-computed opaque checksum of this spec's independently stored
-    // payload. The Manager stores and echoes it unchanged.
+    // payload. Non-empty values are stored unchanged; empty means omitted.
     string checksum = 3;
-    // Explicit presence keeps an empty checksum distinct from legacy metadata.
-    bool checksum_present = 4;
 }
 
 message CacheLocation {
@@ -447,6 +445,7 @@ message LocationSpecChecksumBatch {
     string location_spec_name = 1;
     // Parallel to the compact keys captured by this StartWrite session. Failed
     // positions retain a placeholder; positions without this spec are ignored.
+    // Empty strings mean no checksum update, including successful positions.
     repeated string checksums = 2;
 }
 

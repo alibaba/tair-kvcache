@@ -84,7 +84,7 @@ private:
     std::string uri_;  // URI
     // A spec is an independently stored TP/PP/attention payload, so its
     // checksum cannot be shared by the enclosing CacheLocation.
-    // Null means absent; even an explicitly empty checksum owns a buffer.
+    // Empty input is normalized to absent and never allocates a buffer.
     // Keep the length so embedded NUL bytes survive copies and serialization.
     std::unique_ptr<char[]> checksum_;
     size_t checksum_size_ = 0;

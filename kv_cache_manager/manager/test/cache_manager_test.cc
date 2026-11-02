@@ -2616,7 +2616,7 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
                                                        block_mask,
                                                        CacheManager::FinishWriteCacheOptions::WithChecksumBatches({
                                                            {"tp0", {"0x111", "0", "0x333"}},
-                                                           {"tp1", {"0xAAA", "0xBBB", "0xCCC"}},
+                                                           {"tp1", {"0xAAA", "", ""}},
                                                        }));
             ASSERT_EQ(EC_OK, ec);
         }
@@ -2642,8 +2642,8 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
             ASSERT_GE(cache_locations_view[1].location_specs().size(), 2u);
             ASSERT_TRUE(cache_locations_view[1].location_specs()[0].has_checksum());
             EXPECT_EQ("0", cache_locations_view[1].location_specs()[0].checksum());
-            ASSERT_TRUE(cache_locations_view[1].location_specs()[1].has_checksum());
-            EXPECT_EQ("0xBBB", cache_locations_view[1].location_specs()[1].checksum());
+            ASSERT_FALSE(cache_locations_view[1].location_specs()[1].has_checksum());
+            EXPECT_EQ("", cache_locations_view[1].location_specs()[1].checksum());
         }
 
         {
@@ -2662,8 +2662,8 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
             ASSERT_GE(cache_locations_view[1].location_specs().size(), 2u);
             ASSERT_TRUE(cache_locations_view[1].location_specs()[0].has_checksum());
             EXPECT_EQ("0", cache_locations_view[1].location_specs()[0].checksum());
-            ASSERT_TRUE(cache_locations_view[1].location_specs()[1].has_checksum());
-            EXPECT_EQ("0xBBB", cache_locations_view[1].location_specs()[1].checksum());
+            ASSERT_FALSE(cache_locations_view[1].location_specs()[1].has_checksum());
+            EXPECT_EQ("", cache_locations_view[1].location_specs()[1].checksum());
             std::map<std::string, std::string> meta;
             ASSERT_TRUE(Jsonizable::FromJsonString(metas[2], meta));
             ASSERT_TRUE(
@@ -5874,19 +5874,24 @@ TEST_F(CacheManagerTest, TestReportEventPreservesCallerProvidedChecksum) {
     auto add = MakeAddRequest(host, key, "checksum_delta");
     auto *add_spec = add.mutable_events(0)->mutable_block_add()->mutable_specs(0);
     add_spec->set_checksum("");
-    add_spec->set_checksum_present(true);
     ASSERT_EQ(EC_OK, CallReportEvent(add, "caller_checksum_delta").first);
-    const auto delta_checksum = get_tp0_checksum();
-    ASSERT_TRUE(delta_checksum.has_value());
-    EXPECT_EQ("", *delta_checksum);
+    EXPECT_FALSE(get_tp0_checksum().has_value());
+
+    add_spec->set_checksum("0");
+    ASSERT_EQ(EC_OK, CallReportEvent(add, "caller_checksum_nonempty").first);
+    ASSERT_EQ(std::optional<std::string>("0"), get_tp0_checksum());
 
     // BLOCK_ADD is a patch. Omitting checksum while refreshing the same spec
-    // must keep the existing empty string and its explicit presence bit.
+    // must keep the existing checksum.
     auto add_without_checksum = MakeAddRequest(host, key, "checksum_delta_refresh");
     ASSERT_EQ(EC_OK, CallReportEvent(add_without_checksum, "caller_checksum_delta_refresh").first);
     const auto preserved_checksum = get_tp0_checksum();
     ASSERT_TRUE(preserved_checksum.has_value());
-    EXPECT_EQ("", *preserved_checksum);
+    EXPECT_EQ("0", *preserved_checksum);
+
+    add_spec->set_checksum("");
+    ASSERT_EQ(EC_OK, CallReportEvent(add, "caller_checksum_empty_patch").first);
+    EXPECT_EQ(std::optional<std::string>("0"), get_tp0_checksum());
 
     // The same patch rule also applies while repeated events are folded inside
     // one RPC.  The second ADD updates the URI but must not discard the value
@@ -5894,8 +5899,9 @@ TEST_F(CacheManagerTest, TestReportEventPreservesCallerProvidedChecksum) {
     auto batched_add = MakeAddRequest(host, key, "checksum_batch_first");
     auto *batched_first_spec = batched_add.mutable_events(0)->mutable_block_add()->mutable_specs(0);
     batched_first_spec->set_checksum("crc64:0000deadbeef");
-    batched_first_spec->set_checksum_present(true);
     *batched_add.add_events() = MakeAddRequest(host, key, "checksum_batch_last").events(0);
+    auto *batched_last_spec = batched_add.mutable_events(1)->mutable_block_add()->mutable_specs(0);
+    batched_last_spec->set_checksum("");
     ASSERT_EQ(EC_OK, CallReportEvent(batched_add, "caller_checksum_batched_patch").first);
     const auto batched_checksum = get_tp0_checksum();
     ASSERT_TRUE(batched_checksum.has_value());
@@ -5907,15 +5913,17 @@ TEST_F(CacheManagerTest, TestReportEventPreservesCallerProvidedChecksum) {
     auto snapshot = MakeSnapshotRequest(host, {{key, "checksum_snapshot"}});
     auto *snapshot_spec = snapshot.mutable_events(0)->mutable_block_snapshot()->mutable_blocks(0)->mutable_specs(0);
     snapshot_spec->set_checksum("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
-    snapshot_spec->set_checksum_present(true);
     ASSERT_EQ(EC_OK, CallReportEvent(snapshot, "caller_checksum_snapshot").first);
     const auto snapshot_checksum = get_tp0_checksum();
     ASSERT_TRUE(snapshot_checksum.has_value());
     EXPECT_EQ("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", *snapshot_checksum);
 
-    // A full snapshot replaces the complete spec state. Omitting checksum here
+    // A full snapshot replaces the complete spec state. Empty checksum here
     // is the explicit clearing mechanism, unlike the patch-style ADD above.
     auto clearing_snapshot = MakeSnapshotRequest(host, {{key, "checksum_snapshot_clear"}});
+    auto *empty_spec =
+        clearing_snapshot.mutable_events(0)->mutable_block_snapshot()->mutable_blocks(0)->mutable_specs(0);
+    empty_spec->set_checksum("");
     ASSERT_EQ(EC_OK, CallReportEvent(clearing_snapshot, "caller_checksum_snapshot_clear").first);
     const auto visible_after_clear = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible_after_clear.size());
