@@ -587,6 +587,84 @@ protected:
     std::shared_ptr<RequestContext> request_context_;
 };
 
+TEST_F(MetaStorageBackendManagerTest, TestGetMemUsage) {
+    {
+        SCOPED_TRACE("single local backend");
+        std::shared_ptr<MetaStorageBackendConfig> config =
+            std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
+        MetaStorageBackendManager mgr;
+        ASSERT_EQ(EC_OK, mgr.Init("test", config));
+        ASSERT_EQ(EC_OK, mgr.Open());
+        EXPECT_EQ(0u, mgr.GetMemUsage());
+
+        BatchMetaData batch = MakeBatch({11});
+        ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.Put(request_context_.get(), batch));
+        const size_t usage_after_put = mgr.GetMemUsage();
+        EXPECT_GT(usage_after_put, 0u);
+
+        batch.batch_locations[0]["loc_11"] = MakeLocation("loc_11", std::string(1024, 'x'));
+        ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.Upsert(request_context_.get(), batch));
+        EXPECT_GT(mgr.GetMemUsage(), usage_after_put);
+
+        ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.Delete(request_context_.get(), {11}));
+        EXPECT_EQ(0u, mgr.GetMemUsage());
+        EXPECT_EQ(EC_OK, mgr.Close());
+    }
+    {
+        SCOPED_TRACE("cached backend");
+        std::shared_ptr<MetaStorageBackendConfig> config = MakeDualConfig(GetPrivateTestRuntimeDataPath());
+        MetaStorageBackendManager mgr;
+        ASSERT_EQ(EC_OK, mgr.Init("test", config));
+        ASSERT_EQ(EC_OK, mgr.Open());
+        WaitRunning(mgr);
+
+        BatchMetaData batch = MakeBatch({11});
+        ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.Put(request_context_.get(), batch));
+        EXPECT_EQ(0u, mgr.persistent_backend_->GetMemUsage());
+        const size_t cache_usage = mgr.cache_backend_->GetMemUsage();
+        EXPECT_GT(cache_usage, 0u);
+        EXPECT_EQ(cache_usage, mgr.GetMemUsage());
+        EXPECT_EQ(EC_OK, mgr.Close());
+    }
+    {
+        SCOPED_TRACE("sum both backends");
+        MetaStorageBackendManager mgr;
+        MemoryPrimaryBackup &backup = *InitMemoryPrimary(mgr);
+        BatchMetaData persistent_batch = MakeBatch({11});
+        ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+                  backup.MetaLocalBackend::Put(request_context_.get(),
+                                               persistent_batch.batch_keys,
+                                               persistent_batch.batch_locations,
+                                               persistent_batch.batch_properties));
+        BatchMetaData cache_batch = MakeBatch({12});
+        ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
+                  mgr.cache_backend_->Put(request_context_.get(),
+                                           cache_batch.batch_keys,
+                                           cache_batch.batch_locations,
+                                           cache_batch.batch_properties));
+        const size_t persistent_usage = mgr.persistent_backend_->GetMemUsage();
+        const size_t cache_usage = mgr.cache_backend_->GetMemUsage();
+        ASSERT_GT(persistent_usage, 0u);
+        ASSERT_GT(cache_usage, 0u);
+        EXPECT_EQ(persistent_usage + cache_usage, mgr.GetMemUsage());
+
+        ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, mgr.cache_backend_->Delete(request_context_.get(), {12}));
+        EXPECT_EQ(persistent_usage, mgr.GetMemUsage());
+        EXPECT_EQ(EC_OK, mgr.Close());
+    }
+    {
+        SCOPED_TRACE("zero usage backends");
+        MetaStorageBackendManager mgr;
+        MetaRedisBackend redis;
+        MetaAsyncRedisBackend async_redis;
+        MetaDummyBackend dummy;
+        EXPECT_EQ(0u, mgr.GetMemUsage());
+        EXPECT_EQ(0u, redis.GetMemUsage());
+        EXPECT_EQ(0u, async_redis.GetMemUsage());
+        EXPECT_EQ(0u, dummy.GetMemUsage());
+    }
+}
+
 TEST_F(MetaStorageBackendManagerTest, TestMemoryPrimaryConfigValidationAndForwarding) {
     auto config = std::make_shared<MetaStorageBackendConfig>(META_LOCAL_BACKEND_TYPE_STR);
     config->SetMemoryPrimary(true);
