@@ -351,6 +351,9 @@ arena 数量自动读取；未使用 jemalloc、只有一个 arena 或启用 per
 
 `meta_storage_backend_config.memory_primary` 默认 `false`，保持原双写顺序。开启示例：
 
+`local` 元数据后端可在 `storage_uri` 中单独设置 `num_item_mutex_shard_bits`（默认 16，最大 24）；
+它不改变 LRU 的 `num_shard_bits`。锁数量为 `2^num_item_mutex_shard_bits`，每个 local backend 默认约需 3.5 MiB 的固定内存；提高位数会相应增加内存占用。
+
 ```json
 {"storage_type":"cached","storage_uri":"redis://redis-backup:6379/?persistent_type=async_redis&cache_type=local&capacity=4096&async_max_size=102400","memory_primary":true}
 ```

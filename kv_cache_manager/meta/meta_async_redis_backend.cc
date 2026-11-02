@@ -414,7 +414,8 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Get(RequestContext *request_contex
         if (results[i] != EC_OK) {
             continue;
         }
-        ErrorCode ec = DeserializeFieldMap(field_maps[i], out_locations[i], out_properties[i]);
+        ErrorCode ec =
+            DeserializeFieldMap(field_maps[i], out_locations[i], out_properties[i], &id_interner_, &name_interner_);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("async redis get deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
             results[i] = ec;
@@ -446,7 +447,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocations(RequestContext *reque
         if (results[i] != EC_OK) {
             continue;
         }
-        ErrorCode ec = DeserializeLocations(field_maps[i], out_locations[i]);
+        ErrorCode ec = DeserializeLocations(field_maps[i], out_locations[i], &id_interner_, &name_interner_);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR(
                 "async redis get locations deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
@@ -504,7 +505,7 @@ std::vector<std::vector<ErrorCode>> MetaAsyncRedisBackend::GetLocations(RequestC
                 continue;
             }
             auto location = std::make_shared<CacheLocation>();
-            if (!location->FromJsonString(it->second)) {
+            if (!location->FromJsonStringInterned(it->second, id_interner_, &name_interner_)) {
                 results[i][j] = EC_CORRUPTION;
                 continue;
             }

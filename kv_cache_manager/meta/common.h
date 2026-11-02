@@ -39,6 +39,7 @@ inline bool IsInternalPropertyName(const std::string &name) noexcept {
 // MetaLocalBackend default constants
 static const size_t META_LOCAL_BACKEND_DEFAULT_CAPACITY = 32ULL * 1024;
 static const int32_t META_LOCAL_BACKEND_DEFAULT_NUM_SHARD_BITS = 10;
+static const int32_t META_LOCAL_BACKEND_DEFAULT_NUM_ITEM_MUTEX_SHARD_BITS = 16;
 static const int32_t META_LOCAL_BACKEND_DEFAULT_SAMPLE_TIMES = 10;
 
 } // namespace kv_cache_manager

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <random>
@@ -19,28 +20,37 @@
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_cache_base_backend.h"
+#include "kv_cache_manager/meta/utils.h"
 #include "kv_cache_manager/metrics/revisit_interval_histogram.h"
 
 namespace kv_cache_manager {
 
+struct LocalItemExtra {
+    std::unique_ptr<CacheLocationMap> multiple_locations;
+    std::unique_ptr<PropertyMap> extra_properties;
+
+    bool Empty() const { return !multiple_locations && !extra_properties; }
+};
+
 class LocalLocationStore {
 public:
-    ssize_t Merge(const CacheLocationMap &locations);
+    ssize_t Merge(const CacheLocationMap &locations, std::unique_ptr<LocalItemExtra> &extra);
     ssize_t Upsert(const LocationId &location_id,
                    CacheLocationConstPtr location,
+                   std::unique_ptr<LocalItemExtra> &extra,
                    CacheLocationVector *retired_locations = nullptr);
-    ssize_t Erase(const LocationIdVector &location_ids);
+    ssize_t Erase(const LocationIdVector &location_ids, LocalItemExtra *extra);
 
-    const CacheLocationConstPtr *Find(const LocationId &location_id) const;
-    void CopyTo(CacheLocationMap &out) const;
-    size_t Size() const;
-    bool Empty() const { return Size() == 0; }
-    size_t EstimateUsage() const;
+    const CacheLocationConstPtr *Find(const LocationId &location_id, const LocalItemExtra *extra) const;
+    void CopyTo(CacheLocationMap &out, const LocalItemExtra *extra) const;
+    size_t Size(const LocalItemExtra *extra) const;
+    bool Empty(const LocalItemExtra *extra) const { return Size(extra) == 0; }
+    size_t EstimateUsage(const LocalItemExtra *extra) const;
 
     template <typename Visitor>
-    void ForEach(Visitor &&visitor) const {
-        if (multiple_locations_) {
-            for (const auto &[location_id, location] : *multiple_locations_) {
+    void ForEach(const LocalItemExtra *extra, Visitor &&visitor) const {
+        if (extra && extra->multiple_locations) {
+            for (const auto &[location_id, location] : *extra->multiple_locations) {
                 visitor(location_id, location);
             }
         } else if (inline_location_) {
@@ -53,21 +63,22 @@ private:
     // map key. The compact representation therefore reuses CacheLocation::id().
     // Returns the usage delta caused by the mutation instead of relying on a
     // full before/after EstimateUsage() rescan of the container.
-    ssize_t
-    UpsertImpl(const LocationId &location_id, CacheLocationConstPtr location, CacheLocationVector *retired_locations);
-    ssize_t NormalizeAfterErase();
+    ssize_t UpsertImpl(const LocationId &location_id,
+                       CacheLocationConstPtr location,
+                       std::unique_ptr<LocalItemExtra> &extra,
+                       CacheLocationVector *retired_locations);
+    ssize_t NormalizeAfterErase(LocalItemExtra *extra);
     static size_t EstimateMapEntryUsage(const LocationId &location_id, const CacheLocationConstPtr &location);
 
     CacheLocationConstPtr inline_location_;
-    std::unique_ptr<CacheLocationMap> multiple_locations_;
 };
 
 class LocalPropertyStore {
 public:
-    ssize_t Merge(const PropertyMap &properties);
-    void CopySelected(const std::vector<std::string> &field_names, PropertyMap &out) const;
-    void CopyAll(PropertyMap &out) const;
-    size_t EstimateUsage() const;
+    ssize_t Merge(const PropertyMap &properties, std::unique_ptr<LocalItemExtra> &extra);
+    void CopySelected(const std::vector<std::string> &field_names, PropertyMap &out, const LocalItemExtra *extra) const;
+    void CopyAll(PropertyMap &out, const LocalItemExtra *extra) const;
+    size_t EstimateUsage(const LocalItemExtra *extra) const;
 
 private:
     enum class PrevKeyState : uint8_t {
@@ -78,29 +89,54 @@ private:
 
     // Both helpers return the usage delta they caused so Merge can accumulate
     // it locally without a full before/after EstimateUsage() rescan.
-    ssize_t ErasePrevKeyFallback();
-    ssize_t UpsertExtraProperty(const std::string &name, const std::string &value);
-    PropertyMap &EnsureExtraProperties();
+    ssize_t ErasePrevKeyFallback(LocalItemExtra *extra);
+    ssize_t UpsertExtraProperty(const std::string &name,
+                                const std::string &value,
+                                std::unique_ptr<LocalItemExtra> &extra);
+    PropertyMap &EnsureExtraProperties(std::unique_ptr<LocalItemExtra> &extra);
 
     PrevKeyState prev_key_state_{PrevKeyState::kAbsent};
     KeyType prev_key_{0};
-    std::unique_ptr<PropertyMap> extra_properties_;
 };
 
 struct MetaMemCacheItem {
-    // Estimates total memory footprint including the heap memory owned by
-    // CacheLocationMap and PropertyMap entries, used as the "charge" for LRU cache eviction accounting.
+    // Stable LRU charge estimate for this item and its location/property allocations;
+    // allocator-wide overhead and shared objects are not exact per-item costs.
     size_t Size() const {
-        size_t total = sizeof(MetaMemCacheItem) + locations_.EstimateUsage();
-        total += properties_.EstimateUsage();
+        size_t total = sizeof(MetaMemCacheItem) + locations_.EstimateUsage(extra_.get());
+        total += properties_.EstimateUsage(extra_.get());
+        if (extra_) {
+            total += sizeof(LocalItemExtra);
+        }
         return total;
     }
 
-    const LocalLocationStore &GetLocationStore() const { return locations_; }
-    LocalLocationStore &GetMutableLocationStore() { return locations_; }
-    const LocalPropertyStore &GetPropertyStore() const { return properties_; }
-    LocalPropertyStore &GetMutablePropertyStore() { return properties_; }
-    std::shared_mutex &GetMutex() const { return mutex_; }
+    ssize_t MergeLocations(const CacheLocationMap &locations) {
+        return MutateExtra([&] { return locations_.Merge(locations, extra_); });
+    }
+    ssize_t UpsertLocation(const LocationId &id,
+                           CacheLocationConstPtr location,
+                           CacheLocationVector *retired_locations = nullptr) {
+        return MutateExtra([&] { return locations_.Upsert(id, std::move(location), extra_, retired_locations); });
+    }
+    ssize_t EraseLocations(const LocationIdVector &ids) {
+        return MutateExtra([&] { return locations_.Erase(ids, extra_.get()); });
+    }
+    const CacheLocationConstPtr *FindLocation(const LocationId &id) const { return locations_.Find(id, extra_.get()); }
+    void CopyLocations(CacheLocationMap &out) const { locations_.CopyTo(out, extra_.get()); }
+    size_t LocationCount() const { return locations_.Size(extra_.get()); }
+    bool LocationsEmpty() const { return locations_.Empty(extra_.get()); }
+    template <typename Visitor>
+    void ForEachLocation(Visitor &&visitor) const {
+        locations_.ForEach(extra_.get(), std::forward<Visitor>(visitor));
+    }
+    ssize_t MergeProperties(const PropertyMap &properties) {
+        return MutateExtra([&] { return properties_.Merge(properties, extra_); });
+    }
+    void CopySelectedProperties(const std::vector<std::string> &names, PropertyMap &out) const {
+        properties_.CopySelected(names, out, extra_.get());
+    }
+    void CopyAllProperties(PropertyMap &out) const { properties_.CopyAll(out, extra_.get()); }
 
     int64_t GetLastAccessTime() const { return last_access_time_.load(std::memory_order_relaxed); }
     void TouchAccessTime() { last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed); }
@@ -113,22 +149,33 @@ struct MetaMemCacheItem {
 
     static MetaMemCacheItem *Create(const CacheLocationMap &locations, const PropertyMap &properties) {
         auto *item = new MetaMemCacheItem();
-        item->locations_.Merge(locations);
-        item->properties_.Merge(properties);
+        item->MergeLocations(locations);
+        item->MergeProperties(properties);
         return item;
     }
     static MetaMemCacheItem *CreateSingleLocation(const LocationId &location_id, CacheLocationConstPtr location) {
         auto *item = new MetaMemCacheItem();
-        item->locations_.Upsert(location_id, std::move(location));
+        item->UpsertLocation(location_id, std::move(location));
         return item;
     }
     static void Deleter(void *value, MemoryAllocator * /*allocator*/) { delete static_cast<MetaMemCacheItem *>(value); }
 
 private:
-    mutable std::shared_mutex mutex_;
+    template <typename Mutation>
+    ssize_t MutateExtra(Mutation &&mutation) {
+        const bool had_extra = bool(extra_);
+        const ssize_t delta = mutation();
+        if (extra_ && extra_->Empty()) {
+            extra_.reset();
+        }
+        return delta + (static_cast<ssize_t>(bool(extra_)) - static_cast<ssize_t>(had_extra)) *
+                           static_cast<ssize_t>(sizeof(LocalItemExtra));
+    }
+
     LocalLocationStore locations_;
     LocalPropertyStore properties_;
     std::atomic<int64_t> last_access_time_{0};
+    std::unique_ptr<LocalItemExtra> extra_;
 };
 
 // Caller-owned workspace for the pure-local one-location RMW path. It is
@@ -342,6 +389,7 @@ public:
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
     ErrorCode DeleteMetaData() noexcept override;
 
+    // LRU capacity charge, not process RSS or allocator allocated bytes.
     size_t GetMemUsage() const noexcept override;
     int64_t GetOldestAccessTime() const noexcept override;
     bool GetCacheHashSeed(uint32_t &out_hash_seed) const noexcept;
@@ -361,9 +409,12 @@ private:
     CreateAndInsert(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode
     CreateAndInsertIfAbsent(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
-    ErrorCode
-    UpdateHandleInPlace(Cache::Handle *handle, const CacheLocationMap &locations, const PropertyMap &properties);
-    ErrorCode UpdateHandleInPlaceSingleLocation(Cache::Handle *handle,
+    ErrorCode UpdateHandleInPlace(KeyType key,
+                                  Cache::Handle *handle,
+                                  const CacheLocationMap &locations,
+                                  const PropertyMap &properties);
+    ErrorCode UpdateHandleInPlaceSingleLocation(KeyType key,
+                                                Cache::Handle *handle,
                                                 const LocationId &location_id,
                                                 CacheLocationConstPtr location,
                                                 CacheLocationVector *retired_locations = nullptr);
@@ -401,8 +452,16 @@ private:
                                          CacheLocationMap *out_location_map,
                                          std::vector<LocationId> *out_location_ids);
 
+    // The LRU maintenance callback holds its shard lock before taking this
+    // lock. Normal paths must release it before AdjustCharge/Release/Erase.
+    std::shared_mutex &ItemMutex(KeyType key) const {
+        return item_mutexes_[GetShardIndex(key, item_mutex_shard_mask_)];
+    }
+
     std::shared_ptr<Cache::CacheItemHelper> cache_item_helper_;
     std::shared_ptr<Cache> cache_;
+    std::unique_ptr<std::shared_mutex[]> item_mutexes_;
+    uint32_t item_mutex_shard_mask_ = 0;
     std::unique_ptr<std::atomic<int64_t>[]> shard_oldest_access_time_;
     uint32_t shard_mask_ = 0;
     size_t sample_times_ = 0;

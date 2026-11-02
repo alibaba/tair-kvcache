@@ -229,6 +229,7 @@ cc_library(
         ":common",
         ":meta_cache_base_backend",
         ":meta_search_cache",
+        ":utils",
         "//kv_cache_manager/common:lru_cache",
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:string_util",

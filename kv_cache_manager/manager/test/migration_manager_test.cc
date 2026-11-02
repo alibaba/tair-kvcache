@@ -48,8 +48,12 @@ ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
 
 namespace destination_specs_capture_stub {
 std::vector<std::pair<size_t, size_t>> g_sizes_and_capacities;
+std::vector<std::vector<SharedLocationSpecName>> g_name_handles;
 
-void Reset() { g_sizes_and_capacities.clear(); }
+void Reset() {
+    g_sizes_and_capacities.clear();
+    g_name_handles.clear();
+}
 
 ErrorCode BatchAddLocation_stub(void * /*obj*/,
                                 RequestContext * /*request_context*/,
@@ -59,6 +63,10 @@ ErrorCode BatchAddLocation_stub(void * /*obj*/,
     g_sizes_and_capacities.reserve(g_sizes_and_capacities.size() + locations.size());
     for (const auto &location : locations) {
         g_sizes_and_capacities.emplace_back(location->location_specs().size(), location->location_specs().capacity());
+        auto &names = g_name_handles.emplace_back();
+        for (const auto &spec : location->location_specs()) {
+            names.push_back(spec.name_handle());
+        }
     }
     out_results.assign(keys.size(), {});
     for (size_t i = 0; i < out_results.size(); ++i) {
@@ -998,12 +1006,16 @@ TEST_F(MigrationManagerTest, TestSubmitBadArgs) {
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
 }
 
-TEST_F(MigrationManagerTest, TestDestinationLocationSpecsReusePreparedCapacity) {
+TEST_F(MigrationManagerTest, TestDestinationLocationSpecsReusePreparedCapacityAndNames) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "spec_move_hot/"));
     ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "spec_move_cold/"));
 
-    auto make_request = [this](int64_t block_key) {
+    std::vector<SharedLocationSpecName> spec_names;
+    for (size_t i = 0; i < 3; ++i) {
+        spec_names.push_back(std::make_shared<const std::string>("TP" + std::to_string(i)));
+    }
+    auto make_request = [this, &spec_names](int64_t block_key) {
         MigrationManager::MigrationRequest request;
         request.instance_id = kInstance;
         request.block_key = block_key;
@@ -1012,7 +1024,7 @@ TEST_F(MigrationManagerTest, TestDestinationLocationSpecsReusePreparedCapacity) 
         request.dst_storage_name = "cold_01";
         request.src_specs.reserve(3);
         for (size_t i = 0; i < 3; ++i) {
-            request.src_specs.emplace_back("TP" + std::to_string(i),
+            request.src_specs.emplace_back(spec_names[i],
                                            "dummy://hot_01/source_" + std::to_string(i) + "?size=1");
         }
         return request;
@@ -1033,6 +1045,13 @@ TEST_F(MigrationManagerTest, TestDestinationLocationSpecsReusePreparedCapacity) 
     const size_t reserved_capacity = reserved_specs.capacity();
     EXPECT_EQ((std::vector<std::pair<size_t, size_t>>{{3, reserved_capacity}, {3, reserved_capacity}}),
               destination_specs_capture_stub::g_sizes_and_capacities);
+    ASSERT_EQ(2u, destination_specs_capture_stub::g_name_handles.size());
+    for (const auto &names : destination_specs_capture_stub::g_name_handles) {
+        ASSERT_EQ(spec_names.size(), names.size());
+        for (size_t i = 0; i < names.size(); ++i) {
+            EXPECT_EQ(spec_names[i].get(), names[i].get());
+        }
+    }
 }
 
 TEST_F(MigrationManagerTest, TestSubmitSourceNotFound) {

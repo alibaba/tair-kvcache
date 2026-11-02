@@ -33,9 +33,16 @@ inline int32_t GetShardIndex(KeyType key, size_t shard_mask) noexcept {
 
 FieldMap SerializeToFieldMap(const CacheLocationMap &locations, PropertyMap properties);
 
-ErrorCode DeserializeFieldMap(const FieldMap &field_map, CacheLocationMap &out_locations, PropertyMap &out_properties);
+ErrorCode DeserializeFieldMap(const FieldMap &field_map,
+                              CacheLocationMap &out_locations,
+                              PropertyMap &out_properties,
+                              LocationIdInterner *id_interner = nullptr,
+                              LocationSpecNameInterner *name_interner = nullptr);
 
-ErrorCode DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_locations);
+ErrorCode DeserializeLocations(const FieldMap &field_map,
+                               CacheLocationMap &out_locations,
+                               LocationIdInterner *id_interner = nullptr,
+                               LocationSpecNameInterner *name_interner = nullptr);
 
 void ExtractLocationIds(const FieldMap &field_map, std::vector<LocationId> &out_location_ids);
 

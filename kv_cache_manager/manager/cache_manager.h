@@ -354,7 +354,7 @@ private:
                                           const std::string &instance_id,
                                           size_t key_count,
                                           const std::vector<std::string> &location_spec_group_names);
-    static void FillEmptyLocationSpecs(const std::vector<LocationSpecInfo> &location_spec_infos,
+    static void FillEmptyLocationSpecs(const InstanceInfoConstPtr &instance_info,
                                        CacheLocationVector &locations);
     std::string GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const;
 

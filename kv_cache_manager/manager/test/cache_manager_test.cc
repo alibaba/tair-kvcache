@@ -4487,6 +4487,7 @@ TEST_F(CacheManagerTest, TestReportEventFlatFoldMatchesReferenceAcrossBlocksMedi
     ASSERT_EQ(keys.size(), location_maps.size());
 
     std::uint64_t expected_total_size = 0;
+    std::map<std::string, const std::string *> canonical_names;
     for (size_t key_index = 0; key_index < keys.size(); ++key_index) {
         using FlattenedSpecs = std::map<std::pair<std::string, std::string>, std::string>;
         FlattenedSpecs expected_specs;
@@ -4517,6 +4518,10 @@ TEST_F(CacheManagerTest, TestReportEventFlatFoldMatchesReferenceAcrossBlocksMedi
                                        [](const auto &lhs, const auto &rhs) { return lhs.name() < rhs.name(); }));
             for (const auto &spec : location_it->second->location_specs()) {
                 actual_specs[{medium, spec.name()}] = spec.uri();
+                const auto [it, inserted] = canonical_names.emplace(spec.name(), &spec.name());
+                if (!inserted) {
+                    EXPECT_EQ(it->second, &spec.name());
+                }
             }
         }
         EXPECT_EQ(expected_location_count, location_maps[key_index].size()) << "block key " << keys[key_index];
