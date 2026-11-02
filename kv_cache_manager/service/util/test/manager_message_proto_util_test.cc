@@ -7,6 +7,42 @@ using namespace kv_cache_manager;
 
 class ManagerMessageProtoUtilTest : public TESTBASE {};
 
+TEST_F(ManagerMessageProtoUtilTest, EmbeddedNulChecksumSurvivesProtoAndQueryView) {
+    CacheLocation loc;
+    std::vector<LocationSpec> specs;
+    specs.emplace_back("tp0", "file://x");
+    const std::string checksum("crc\0tail", 8);
+    specs.back().set_checksum(checksum);
+    loc.set_location_specs(std::move(specs));
+
+    proto::meta::LocationSpec meta_spec;
+    ProtoConvert::LocationSpecToProto(loc.location_specs()[0], &meta_spec);
+    EXPECT_EQ(checksum, meta_spec.checksum());
+    LocationSpec parsed;
+    ProtoConvert::LocationSpecFromProto(&meta_spec, parsed);
+    EXPECT_TRUE(parsed.has_checksum());
+    EXPECT_EQ(checksum, parsed.checksum());
+
+    proto::admin::LocationSpec admin_spec;
+    ProtoConvert::LocationSpecToProto(parsed, &admin_spec);
+    EXPECT_EQ(checksum, admin_spec.checksum());
+    ProtoConvert::LocationSpecFromProto(&admin_spec, parsed);
+    EXPECT_EQ(checksum, parsed.checksum());
+
+    CacheLocationView view(loc);
+    proto::meta::CacheLocation meta_loc;
+    ProtoConvert::CacheLocationViewToProto(view, &meta_loc, true);
+    ASSERT_EQ(1, meta_loc.location_specs_size());
+    EXPECT_TRUE(meta_loc.location_specs(0).checksum_present());
+    EXPECT_EQ(checksum, meta_loc.location_specs(0).checksum());
+
+    proto::admin::CacheLocation admin_loc;
+    ProtoConvert::CacheLocationViewToProto(view, &admin_loc, true);
+    ASSERT_EQ(1, admin_loc.location_specs_size());
+    EXPECT_TRUE(admin_loc.location_specs(0).checksum_present());
+    EXPECT_EQ(checksum, admin_loc.location_specs(0).checksum());
+}
+
 TEST_F(ManagerMessageProtoUtilTest, LocationSpecChecksumsRoundTripThroughMetaProto) {
     CacheLocation loc;
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);

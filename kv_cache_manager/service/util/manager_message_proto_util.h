@@ -225,7 +225,8 @@ void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_locat
         // queries. Explicit presence keeps an empty checksum representable.
         if (include_checksum && location_spec.has_checksum()) {
             proto_spec->set_checksum_present(true);
-            proto_spec->set_checksum(location_spec.checksum());
+            const auto checksum = location_spec.checksum();
+            proto_spec->set_checksum(checksum.data(), checksum.size());
         }
     }
 }
@@ -524,7 +525,8 @@ ProtoConvert::LocationSpecToProto(const LocationSpec &location_spec_info, T *pro
     proto_location_spec->set_name(location_spec_info.name());
     proto_location_spec->set_uri(location_spec_info.uri());
     proto_location_spec->set_checksum_present(location_spec_info.has_checksum());
-    proto_location_spec->set_checksum(location_spec_info.checksum());
+    const auto checksum = location_spec_info.checksum();
+    proto_location_spec->set_checksum(checksum.data(), checksum.size());
 }
 template <typename T>
 std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<T, proto::admin::LocationSpec>>

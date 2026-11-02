@@ -29,8 +29,8 @@ public:
 
     LocationSpec(const std::string &name, const std::string &uri) : name_(name), uri_(uri) {}
 
-    LocationSpec(const LocationSpec &) = default;
-    LocationSpec &operator=(const LocationSpec &) = default;
+    LocationSpec(const LocationSpec &other);
+    LocationSpec &operator=(const LocationSpec &other);
     LocationSpec(LocationSpec &&) noexcept = default;
     LocationSpec &operator=(LocationSpec &&) noexcept = default;
 
@@ -39,18 +39,23 @@ public:
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
         Put(writer, "name", name_);
         Put(writer, "uri", uri_);
-        if (checksum_present_) {
-            Put(writer, "checksum", checksum_);
+        if (has_checksum()) {
+            const auto value = checksum();
+            writer.Key("checksum");
+            writer.String(value.data(), value.size());
         }
     }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "name", name_, std::string(""));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "uri", uri_, std::string(""));
-        checksum_.clear();
-        checksum_present_ = rapid_value.HasMember("checksum");
-        if (checksum_present_) {
-            KVCM_JSON_GET_MACRO(rapid_value, "checksum", checksum_);
+        clear_checksum();
+        const auto it = rapid_value.FindMember("checksum");
+        if (it != rapid_value.MemberEnd()) {
+            if (!it->value.IsString()) {
+                return false;
+            }
+            set_checksum(std::string_view(it->value.GetString(), it->value.GetStringLength()));
         }
         return true;
     }
@@ -60,27 +65,29 @@ public:
     void set_name_view(std::string_view name) { name_.assign(name.data(), name.size()); }
     void set_uri(const std::string &uri) { uri_ = uri; }
     void set_uri(std::string &&uri) noexcept { uri_ = std::move(uri); }
-    void set_checksum(std::string_view checksum) {
-        checksum_.assign(checksum);
-        checksum_present_ = true;
-    }
-    void clear_checksum() {
-        checksum_.clear();
-        checksum_present_ = false;
+    void set_checksum(std::string_view checksum);
+    void clear_checksum() noexcept {
+        checksum_.reset();
+        checksum_size_ = 0;
     }
 
     inline const std::string &name() const { return name_; }
     inline const std::string &uri() const { return uri_; }
-    [[nodiscard]] const std::string &checksum() const { return checksum_; }
-    [[nodiscard]] bool has_checksum() const { return checksum_present_; }
+    // The view remains valid until this spec is modified or destroyed.
+    [[nodiscard]] std::string_view checksum() const noexcept {
+        return checksum_ ? std::string_view(checksum_.get(), checksum_size_) : std::string_view("");
+    }
+    [[nodiscard]] bool has_checksum() const noexcept { return checksum_ != nullptr; }
 
 private:
     std::string name_; // 对应LocationSpecInfo中的name
     std::string uri_;  // URI
     // A spec is an independently stored TP/PP/attention payload, so its
     // checksum cannot be shared by the enclosing CacheLocation.
-    std::string checksum_;
-    bool checksum_present_ = false;
+    // Null means absent; even an explicitly empty checksum owns a buffer.
+    // Keep the length so embedded NUL bytes survive copies and serialization.
+    std::unique_ptr<char[]> checksum_;
+    size_t checksum_size_ = 0;
 };
 
 enum CacheLocationStatus : int32_t {
@@ -234,6 +241,9 @@ public:
         size_t usage = sizeof(CacheLocation) + id().size();
         for (const auto &spec : location_specs_) {
             usage += sizeof(LocationSpec) + spec.name().size() + spec.uri().size();
+            if (spec.has_checksum()) {
+                usage += spec.checksum().size() + 1;
+            }
         }
         return usage;
     }

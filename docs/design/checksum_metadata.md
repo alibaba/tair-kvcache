@@ -11,7 +11,9 @@ Checksum 属于 `(instance_id, block_key, location, location_spec_name)`。
 不做数值转换、不改变大小写或前导零，也不限制为 64 位。空字符串与字符串 `"0"` 都是合法值。
 协议 string 使用 UTF-8；二进制摘要由调用方编码为十六进制或 Base64。
 
-`LocationSpec` 将值与 presence 分开保存；持久化 JSON 中存在 `checksum` 字段即表示有值。
+`LocationSpec` 使用 `unique_ptr<char[]>` 持有独立字段的内容，并记录长度；空指针表示未设置，
+非空指针表示有值，包括空字符串。读取返回 `string_view`，复制 spec 时深拷贝，移动时转移所有权。
+序列化使用显式长度，保留内容中的 `\0`。持久化 JSON 中存在 `checksum` 字段即表示有值。
 旧记录不含该字段，读取后保持无值。协议使用 `checksum` 和 `checksum_present` 两个字段，
 ReportEvent 中的空字符串必须设置 `checksum_present=true` 才表示显式提供；非空 checksum 也会被认定为有值。
 FinishWriteCache 的 checksums 数组中，每个元素本身就表示提供了值，包括空字符串，无需额外 presence 字段。
@@ -65,12 +67,14 @@ GetCacheLocation、GetCacheLocationsByBackend，以及 Meta/Admin 的 GetCacheMe
 因此 FinishWriteCache 成功不足以证明 checksum 已保存，接入时应通过查询验证 presence 和值。
 本功能不扩展 C++ TransferClient、GPU kernel 或推理框架连接器；v6d 可通过 HTTP/gRPC 协议接入。
 
-LocationSpec 新增 string 和 presence，会增加每个 spec 的内存占用，长字符串还会有额外分配。
-启用前应按目标 spec 数量评估 Manager 常驻内存和 COW 峰值；不传 checksum 也有结构体占用。
+LocationSpec 新增一个指针和一个 `size_t`，在当前 64 位构建中固定增加 16 字节，未设置时不分配堆内存。
+设置值时分配 `checksum.size() + 1` 字节，包含末尾终止符；显式空字符串分配 1 字节。
+`EstimateMemUsage` 包含此分配大小，不包含分配器额外开销。启用前应按目标 spec 数量评估常驻内存和 COW 峰值。
 模块职责与依赖方向不变。
 
 ## 验证范围
 
-单元测试覆盖 JSON/proto 往返、空字符串与旧数据、非数值文本与前导零、查询 opt-in、COW 合并与替换、部分删除、迁移和
+单元测试覆盖 JSON/proto 往返（含内嵌 `\0`）、空字符串与旧数据、独立深拷贝、移动、内存估算、
+非数值文本与前导零、查询 opt-in、COW 合并与替换、部分删除、迁移和
 session 校验。HTTP/gRPC 集成测试覆盖自有 checksum 写入、紧凑 batch 对齐、非法请求重试、
 跨 instance 拒绝、查询返回以及 ReportEvent 的空字符串与自定义格式。

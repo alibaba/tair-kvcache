@@ -55,7 +55,8 @@ TEST_F(CacheLocationTest, LegacyJsonWithoutChecksumKeepsPresenceFalse) {
 
 TEST_F(CacheLocationTest, OpaqueChecksumIsPreserved) {
     LocationSpec spec("tp0", "file://x");
-    const std::string checksum = "校验:00FF/+=\"\\\n";
+    std::string checksum = "校验:00FF/+=\"\\\n";
+    checksum.append("\0tail", 5);
     spec.set_checksum(checksum);
     const std::string json = spec.ToJsonString();
     LocationSpec parsed;
@@ -90,6 +91,102 @@ TEST_F(CacheLocationTest, CopyConstructorPreservesChecksumPresence) {
     ASSERT_EQ(copied.location_specs().size(), 1u);
     EXPECT_TRUE(copied.location_specs()[0].has_checksum());
     EXPECT_EQ(copied.location_specs()[0].checksum(), "");
+
+    original.mutable_location_specs()[0].clear_checksum();
+    EXPECT_TRUE(copied.location_specs()[0].has_checksum());
+}
+
+TEST_F(CacheLocationTest, ChecksumCopiesOwnTheirStorage) {
+    LocationSpec original("tp0", "file://x");
+    const std::string checksum("crc\0tail", 8);
+    original.set_checksum(checksum);
+
+    LocationSpec copied(original);
+    LocationSpec assigned("tp1", "file://y");
+    assigned.set_checksum("old");
+    assigned = original;
+    EXPECT_NE(original.checksum().data(), copied.checksum().data());
+    EXPECT_NE(original.checksum().data(), assigned.checksum().data());
+
+    original.set_checksum("changed");
+    EXPECT_EQ(checksum, copied.checksum());
+    EXPECT_EQ(checksum, assigned.checksum());
+    EXPECT_EQ("tp0", assigned.name());
+    EXPECT_EQ("file://x", assigned.uri());
+
+    const auto &self = assigned;
+    assigned = self;
+    EXPECT_EQ(checksum, assigned.checksum());
+
+    original.clear_checksum();
+    assigned = original;
+    EXPECT_FALSE(assigned.has_checksum());
+    EXPECT_TRUE(assigned.checksum().empty());
+
+    original.set_checksum("");
+    assigned = original;
+    EXPECT_TRUE(assigned.has_checksum());
+    EXPECT_TRUE(assigned.checksum().empty());
+}
+
+TEST_F(CacheLocationTest, ChecksumSetterCanBorrowExistingBuffer) {
+    LocationSpec spec("tp0", "file://x");
+    spec.set_checksum("crc64:00001234");
+    spec.set_checksum(spec.checksum());
+    EXPECT_EQ("crc64:00001234", spec.checksum());
+
+    spec.set_checksum(spec.checksum().substr(6));
+    EXPECT_EQ("00001234", spec.checksum());
+
+    spec.set_checksum(std::string_view{});
+    EXPECT_TRUE(spec.has_checksum());
+    EXPECT_TRUE(spec.checksum().empty());
+}
+
+TEST_F(CacheLocationTest, ChecksumMovePreservesValueAndPresence) {
+    for (const std::string &checksum : {std::string{}, std::string("crc\0tail", 8)}) {
+        LocationSpec original("tp0", "file://x");
+        original.set_checksum(checksum);
+        const auto *buffer = original.checksum().data();
+
+        LocationSpec moved(std::move(original));
+        EXPECT_TRUE(moved.has_checksum());
+        EXPECT_EQ(checksum, moved.checksum());
+        EXPECT_EQ(buffer, moved.checksum().data());
+        EXPECT_FALSE(original.has_checksum());
+        EXPECT_TRUE(original.checksum().empty());
+
+        LocationSpec assigned("tp1", "file://y");
+        assigned.set_checksum("old");
+        assigned = std::move(moved);
+        EXPECT_TRUE(assigned.has_checksum());
+        EXPECT_EQ(checksum, assigned.checksum());
+        EXPECT_EQ(buffer, assigned.checksum().data());
+        EXPECT_FALSE(moved.has_checksum());
+        EXPECT_TRUE(moved.checksum().empty());
+
+        original.set_checksum("reused");
+        EXPECT_EQ("reused", original.checksum());
+        assigned = LocationSpec("tp0", "file://x");
+        EXPECT_FALSE(assigned.has_checksum());
+        EXPECT_TRUE(assigned.checksum().empty());
+    }
+}
+
+TEST_F(CacheLocationTest, MemoryEstimateIncludesChecksumAllocation) {
+    CacheLocation location;
+    std::vector<LocationSpec> specs;
+    specs.emplace_back("tp0", "file://x");
+    location.set_location_specs(std::move(specs));
+    const auto without_checksum = location.EstimateMemUsage();
+
+    const std::string_view checksum = "crc64:00001234";
+    ASSERT_TRUE(location.set_location_spec_checksum("tp0", checksum));
+    EXPECT_EQ(without_checksum + checksum.size() + 1, location.EstimateMemUsage());
+    ASSERT_TRUE(location.set_location_spec_checksum("tp0", ""));
+    EXPECT_EQ(without_checksum + 1, location.EstimateMemUsage());
+    location.mutable_location_specs()[0].clear_checksum();
+    EXPECT_EQ(without_checksum, location.EstimateMemUsage());
 }
 
 TEST_F(CacheLocationTest, EmptyChecksumIsDistinctFromAbsentAndReuseClearsPresence) {

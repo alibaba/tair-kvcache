@@ -5865,7 +5865,7 @@ TEST_F(CacheManagerTest, TestReportEventPreservesCallerProvidedChecksum) {
                                          location->location_specs().end(),
                                          [](const auto &spec) { return spec.name() == "tp0"; });
             if (it != location->location_specs().end() && it->has_checksum()) {
-                return it->checksum();
+                return std::string(it->checksum());
             }
         }
         return std::nullopt;

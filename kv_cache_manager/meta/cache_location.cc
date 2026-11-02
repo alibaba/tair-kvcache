@@ -1,11 +1,43 @@
 #include "kv_cache_manager/meta/cache_location.h"
 
+#include <cstring>
+#include <stdexcept>
+
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/meta/common.h"
 namespace kv_cache_manager {
 
 LocationSpec::LocationSpec() = default;
+
+LocationSpec::LocationSpec(const LocationSpec &other) : name_(other.name_), uri_(other.uri_) {
+    if (other.has_checksum()) {
+        set_checksum(other.checksum());
+    }
+}
+
+LocationSpec &LocationSpec::operator=(const LocationSpec &other) {
+    if (this != &other) {
+        LocationSpec copy(other);
+        *this = std::move(copy);
+    }
+    return *this;
+}
+
 LocationSpec::~LocationSpec() = default;
+
+void LocationSpec::set_checksum(std::string_view checksum) {
+    if (checksum.size() == std::numeric_limits<size_t>::max()) {
+        throw std::length_error("checksum is too large");
+    }
+    auto buffer = std::make_unique<char[]>(checksum.size() + 1);
+    if (!checksum.empty()) {
+        std::memcpy(buffer.get(), checksum.data(), checksum.size());
+    }
+    buffer[checksum.size()] = '\0';
+    // Allocate and copy first: checksum may refer to our existing buffer.
+    checksum_ = std::move(buffer);
+    checksum_size_ = checksum.size();
+}
 
 bool IsIndexInMaskRange(const BlockMask &mask, size_t index) {
     if (std::holds_alternative<BlockMaskVector>(mask)) {
