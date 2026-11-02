@@ -32,11 +32,14 @@ flowchart TD
     metrics -. metrics_reporter .-> manager
 
     %% 对外分支与 optimizer
-    py_connector["py_connector"] --> client["client SDK"]
+    py_connector["py_connector（vLLM/SGLang/TRT-LLM）"] --> client["client SDK（C++/pybind）"]
     client -.-> config
+    client_java["client_java（gRPC/HTTP）"] -. 元数据面 .-> service
+    manager_client["manager_client（Python HTTP）"] -. 元数据面 .-> service
     optimizer["optimizer（仿真与优化）"] -. cache_location .-> meta
     optimizer --> protocol
     optimizer -. SubscribeEvents .-> service
+    ops["kvcm_ops / Admin CLI"] -. AdminService .-> service
 ```
 
 > 若模块职责、依赖方向或调用关系变动，或新增/删除模块，请同步更新本图与 [docs/design/module_architecture.md](docs/design/module_architecture.md)。

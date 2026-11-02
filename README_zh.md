@@ -11,43 +11,81 @@
 目前，其中的全局 KVCache 管理系统 Tair KVCache Manager 和 LLM 推理仿真系统 Tair KVCache HiSim 已经开源。
 
 ## Tair KVCache Manager
-Tair KVCache Manager 是 Tair KVCache 的核心组件之一，旨在为大语言模型（LLM）推理场景提供统一的KVCache元数据管理服务。
+
+Tair KVCache Manager（KVCM）是面向大语言模型（LLM）推理的全局 KVCache 元数据管理服务。它把 KVCache 的位置、状态和容量从单个推理实例中抽离出来统一管理，使推理引擎可以在同一 Instance 内跨请求、跨节点复用 KVCache，减少重复计算，降低推理成本，并改善首 token 时延（TTFT）与吞吐表现。
+
+### 核心能力
+
+- **LLM 语义感知匹配**：支持前缀匹配、反向滚动滑动窗口匹配、混合注意力（Mamba/SWA）和按 block key 批量查询，以及混合注意力场景下的多 LocationSpec 组织。
+- **两阶段写入**：先申请写地址，数据写完后确认，只有确认成功的 Block 才会进入可读状态，保证缓存可信。
+- **多租户配额与公平回收**：以 Instance Group 为配额单位，结合后端水位、Group LRU、按用量比例等策略异步逐出，前台请求不被删除阻塞。
+- **分层存储**：DRAM/SSD 等冷热分层，按水位触发后台 Copy 或 Mark 补写，在控制热层容量的同时扩大有效缓存。
+- **推理侧缓存状态纳管**：推理服务通过 ReportEvent 增量上报 + 可选 Snapshot 对账，把 L1.5/L2 缓存状态纳入全局索引；GetHostCacheState 支持主机级本地/全局命中评估。
+- **企业级高可用**：一主多备部署，基于 Redis/File/Memory 的分布式选主，故障自动切换，客户端自动发现 Leader。
+- **可观测与可运维**：Prometheus/KMonitor 指标、访问日志、RequestContext 全链路追踪、崩溃栈解析、kvcm_ops 运维 CLI。
+- **优化闭环**：离线 Trace 回放评估驱逐策略与容量配置，LiteHit 快速计算多容量命中率，在线 Optimizer 可通过 KVCM 事件流实时回放。
+
 ### 系统架构
-![kvcm-architecture](docs/image/kvcm-architecture0.png)
 
-- Tair KVCache Manager 以中心化模式部署，负责KVCache的全局元数据管理，提供KVCache查询，存储容量管理等等服务。
-- Tair KVCache Manager Client/Connector 负责对接推理引擎，实现元数据查询和KVCache数据传输。
+KVCM 采用“中心化元数据管理 + 去中心化数据搬运”的设计：
 
-![kvcm-architecture](docs/image/kvcm-architecture1.jpg)
+- **元数据面**：推理引擎通过 Client/Connector 查询或申请 KVCache 的存储位置。KVCM 只回答“数据在哪、是否可读写”，不传输 KVCache 数据本身。
+- **数据面**：引擎拿到存储位置 URI 后，通过传输层直接读写存储后端，避免元数据服务成为带宽瓶颈。
+- **管控面**：运维工具通过 AdminService 管理 Storage、Instance Group、Instance、配额、迁移、配置快照和集群状态。
 
-**Tair KVCache Manager**主要由以下组件构成：
+#### 部署视图
 
-- 接入层（Server）：提供HTTP和gRPC服务
-- 缓存逻辑（CacheManager）：负责实现对外接口和核心业务逻辑
-  - 提供多种匹配逻辑：前缀匹配、滑动窗口匹配，KV匹配等。
-  - 实现两阶段写入机制：获取写入地址+完成写入后通知。保障数据可靠性。
-  - 存储后端选择：根据存储后端可用性等指标，动态选择存储后端。
-- 存储管理（DataStorage）：负责管理多种存储后端
-  - 兼容多种存储系统：为异构存储封装统一接口和数据位置描述，支持HF3FS、Mooncake、NFS等系统。
-  - 存储系统状态管理：实时探测存储后端可用性和存储水位等状态，供CacheManager使用。
-- 索引管理（MetaIndex）
-  - 基于外部KV存储系统实现元数据持久化，保证KVCM故障时的元数据可靠性。
-  - 统一控制元数据的查询更新操作，支持批处理以提升性能，同时通过分片锁等机制保障更新原子性，
-- 容量管理（Reclaimer & Executor）
-  - 灵活控制存储容量使用：支持Instance Group等多维度容量控制
-  - 控制后端存储水位：避免存储后端容量超限
-  - KVCache逐出：根据Quota和水位逐出KVCache数据，控制存储容量水位。
-  - 后台线程池实现异步删除：删除不阻塞前台请求，删除性能可扩展。
-- 缓存仿真和优化（Optimizer）：
-  - 重放KVCache访问Trace，高效模拟KVCache访问行为，分析KVCache命中率和容量消耗等关键指标。
-  - 基于仿真结果，指导容量等参数的优化，提高整体ROI。
-  - 更多信息可参考 [KVCacheManager Optimizer 使用指南](docs/optimizer.md)
+![KVCM 部署架构](docs/image/kvcm-deployment-zh.png)
 
-如果想要了解更多Manager详细设计，可参考：[阿里云Tair KVCache Manager：企业级全局 KVCache 管理服务的架构设计与实现](https://mp.weixin.qq.com/s/apZIaiI5zazumEYNQHTdHg)
+#### 模块视图
+
+![KVCM 系统架构与模块关系](docs/image/kvcm-architecture-overview-zh.png)
+
+> 这是面向展示的简化模块图；包含完整依赖方向、反向边和运行时流程的工程版见 [模块架构与关联关系](docs/design/module_architecture.md)。
+
+#### 服务端组件协作
+
+下图展开服务端内部的主要组件，展示前台查询与写入、元数据索引、存储后端，以及回收、GC、迁移和共享执行器之间的协作。推理服务通过 Client/Connector 调用 ReportEvent 上报 L1.5/L2 缓存状态；该接口更新元数据及 Reporter 状态，不搬运 KVCache 数据。
+
+![KVCM 服务端组件关系](docs/image/kvcm-server-components-zh.png)
+
+### 模块介绍
+
+按服务端组件协作图，主要组件可以这样理解：
+
+**接入与编排**
+- **service**：接收推理引擎的 gRPC/HTTP 请求，检查当前节点是不是 Leader，再把请求交给 `CacheManager`。
+- **CacheManager**：系统总调度，把请求分给匹配、写入、回收、迁移等组件，并协调后台任务。
+
+**前台请求**
+- **MetaSearcher**：找缓存——根据请求的 token/block，在索引中匹配出可复用的 KVCache 位置。
+- **WriteLocationManager**：写会话管理——记录本次写入分配到的位置和超时，写完确认时用它找回写入位置。
+- **DataStorageSelector**：选存储——根据配额、水位和健康状态，决定这次写入放到哪个存储后端。
+- **ReportEvent / GetHostCacheState**：推理侧缓存状态——接收 L1.5/L2 缓存上报，并提供主机级命中查询；只操作元数据。
+
+**元数据与存储**
+- **MetaIndexer**：缓存目录——记录每个 block 的 CacheLocation，支持查询、写入、条件更新和采样。
+- **DataStorageManager**：存储后端管理——管理 TairMemPool、HF3FS、Mooncake、NFS 等后端的连接、健康和容量。
+
+**后台维护**
+- **CacheReclaimer / CacheGarbageCollector / MigrationManager**：后台维护——分别负责容量回收、失效元数据清理和冷热分层迁移，均异步执行，不阻塞前台。
+
+**配置、通用支撑与生态**
+- **RegistryManager / LeaderElector**：配置与 HA——保存实例、配额、存储等配置，并负责一主多备的选主与故障切换。
+- **event / metrics / protocol / common**：通用支撑——事件总线、指标上报、协议定义，以及日志、Redis、上下文等基础设施。
+- **client / py_connector / client_java / manager_client**：推理引擎接入层——负责元数据查询和 KVCache 数据搬运，不同语言/框架按需选用。
+- **optimizer / HiSim / kvcm_ops**：优化、仿真与运维——optimizer 用 trace 回放评估策略和容量，HiSim 用 CPU 仿真推理性能，kvcm_ops 管理 Storage、Instance Group 和集群状态。
+
+### 一次读写如何工作
+
+1. **读**：引擎向 KVCM 查询命中的 KVCache 位置，拿到 URI 后由数据面 `TransferClient` 直接加载数据；KVCM 不搬运数据。
+2. **写**：引擎先申请写地址，数据写完后回调确认；只有确认成功的 Block 才会被后续读取命中。
+
+如果想要了解更多 Manager 详细设计，可参考：[阿里云Tair KVCache Manager：企业级全局 KVCache 管理服务的架构设计与实现](https://mp.weixin.qq.com/s/apZIaiI5zazumEYNQHTdHg)
 
 **Tair KVCache Manager Client/Connector**
 
-使用统一的传输库支持多推理引擎和存储后端的KVCache传输。当前支持vLLM、SGLang、RTP-LLM、TRT-LLM等引擎。
+使用统一的传输库支持多推理引擎和存储后端的 KVCache 传输。当前支持 vLLM、SGLang、RTP-LLM、TRT-LLM 等引擎，并提供 C++、Python、Java 多种客户端形态。
 
 ## Tair KVCache HiSim
 
