@@ -22,8 +22,6 @@ public:
                                                               const KeyTypeVec &keys,
                                                               CacheLocationMapVector &out_locations) noexcept = 0;
 
-    virtual int64_t GetOldestAccessTime() const noexcept = 0;
-
     // Reads current access timestamps from the hot cache without marking the
     // keys as hits, updating revisit metrics, or changing LRU positions.
     // EC_NOENT means the caller may fall back to the persistent layer.

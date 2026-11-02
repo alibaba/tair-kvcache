@@ -2251,10 +2251,14 @@ size_t MetaStorageBackendManager::GetMemUsage() const noexcept {
 }
 
 int64_t MetaStorageBackendManager::GetOldestAccessTime() const noexcept {
-    if (cache_backend_) {
-        return cache_backend_->GetOldestAccessTime();
+    int64_t oldest = INT64_MAX;
+    if (persistent_backend_) {
+        oldest = std::min(oldest, persistent_backend_->GetOldestAccessTime());
     }
-    return INT64_MAX;
+    if (cache_backend_) {
+        oldest = std::min(oldest, cache_backend_->GetOldestAccessTime());
+    }
+    return oldest;
 }
 
 void MetaStorageBackendManager::SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram) {

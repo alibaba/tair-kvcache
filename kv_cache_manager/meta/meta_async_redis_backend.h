@@ -21,6 +21,7 @@ public:
 
     std::string GetStorageType() noexcept override;
     size_t GetMemUsage() const noexcept override { return 0; }
+    int64_t GetOldestAccessTime() const noexcept override { return INT64_MAX; }
 
     ErrorCode Init(const std::string &instance_id,
                    const std::shared_ptr<MetaStorageBackendConfig> &config) noexcept override;

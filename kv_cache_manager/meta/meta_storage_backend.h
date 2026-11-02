@@ -35,6 +35,9 @@ public:
     // Metadata memory accounted for in this process; remote storage contributes zero.
     virtual size_t GetMemUsage() const noexcept = 0;
 
+    // Oldest access timestamp in microseconds; INT64_MAX if unavailable or empty.
+    virtual int64_t GetOldestAccessTime() const noexcept = 0;
+
     // 初始化后端。必须在 Open() 之前调用。
     // @param instance_id  实例标识，用于 key 前缀隔离
     // @param config       后端配置（含 storage_uri 等）

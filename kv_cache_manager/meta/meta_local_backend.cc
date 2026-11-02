@@ -1806,7 +1806,7 @@ ErrorCode MetaLocalBackend::GetMetaData(FieldMap & /*field_maps*/) noexcept { re
 
 ErrorCode MetaLocalBackend::DeleteMetaData() noexcept { return EC_OK; }
 
-size_t MetaLocalBackend::GetMemUsage() const noexcept { return cache_->GetUsage(); }
+size_t MetaLocalBackend::GetMemUsage() const noexcept { return cache_ ? cache_->GetUsage() : 0; }
 
 bool MetaLocalBackend::GetCacheHashSeed(uint32_t &out_hash_seed) const noexcept {
     if (!cache_) {
@@ -1817,6 +1817,9 @@ bool MetaLocalBackend::GetCacheHashSeed(uint32_t &out_hash_seed) const noexcept 
 }
 
 int64_t MetaLocalBackend::GetOldestAccessTime() const noexcept {
+    if (!cache_) {
+        return INT64_MAX;
+    }
     int64_t oldest = INT64_MAX;
     size_t num_shards = shard_mask_ + 1;
     for (size_t s = 0; s < num_shards; ++s) {
