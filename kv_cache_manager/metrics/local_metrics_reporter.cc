@@ -17,6 +17,7 @@
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "kv_cache_manager/metrics/node_status_metrics.h"
 
 namespace kv_cache_manager {
 
@@ -36,6 +37,20 @@ bool LocalMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
     KVCM_MAKE_METRICS_COLLECTOR_(metrics_registry_, CacheManager, CacheManager, MetricsTags{});
 
     return true;
+}
+
+void LocalMetricsReporter::PublishNodeStatus() {
+    const auto &leader_state_provider = GetLeaderStateProvider();
+    if (!leader_state_provider) {
+        return;
+    }
+
+    std::shared_ptr<DataStorageManager> data_storage_manager;
+    const auto registry_manager = cache_manager_->GetRegistryManager();
+    if (registry_manager) {
+        data_storage_manager = registry_manager->data_storage_manager();
+    }
+    NodeStatusMetrics::Publish(metrics_registry_, leader_state_provider(), data_storage_manager);
 }
 
 void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed) {
@@ -111,6 +126,8 @@ void LocalMetricsReporter::ReportInterval() {
     // (which hold the lock as a writer) cannot interleave a tag-filter
     // purge with EmplaceMetricsCollector calls below
     std::shared_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
+
+    PublishNodeStatus();
 
     do {
         // for data storage metrics

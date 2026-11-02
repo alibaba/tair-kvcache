@@ -393,6 +393,15 @@ void Server::CreateMetricsReporter() {
     auto reporter_config = config_.metrics_reporter_config();
     metrics_reporter_ =
         metrics_reporter_factory_->Create(reporter_type, reporter_config, config_.metrics_common_tags());
+    if (metrics_reporter_ && leader_elector_) {
+        // Hold the elector weakly: the metrics loop thread can still run one
+        // last ReportInterval() while the server tears its members down.
+        std::weak_ptr<LeaderElector> weak_leader_elector = leader_elector_;
+        metrics_reporter_->SetLeaderStateProvider([weak_leader_elector]() {
+            auto leader_elector = weak_leader_elector.lock();
+            return leader_elector != nullptr && leader_elector->IsLeader();
+        });
+    }
     KVCM_LOG_INFO("create metrics reporter OK");
 }
 

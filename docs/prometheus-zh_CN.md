@@ -187,12 +187,20 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `data_storage.healthy_status` | gauge | 存储后端读取可用状态（1/0） |
 | `data_storage.writable_status` | gauge | 存储后端写入可用状态（1/0）；只读降级时为 0 |
 | `data_storage.storage_usage_ratio` | gauge | 存储使用率 |
+| `is_leader` | gauge | 本节点是否持有 leader 租约（1/0），导出为 `kvcm_is_leader` |
+| `access_mode` | gauge | 本节点当前可提供的读写能力（0/1/2），导出为 `kvcm_access_mode` |
 | `cache_manager.write_location_expire_size` | gauge | 已过期的写入位置数量 |
 | `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |
 | `cache_manager_instance.byte_size` | gauge | 单实例 KVCM 配额字节大小（不含 EventReport） |
 
 对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开且健康探测状态正常，否则为 0。状态由后台探测更新，单次请求超时不代表指标立即变为 0。超时参数见[配置说明](configuration.md#tairmempool)。
+
+`is_leader` 与 `access_mode` 是节点级指标，不带 `type` / `unique_name` 标签。所有数据面 API 都是 leader-only，
+因此 follower 的 `access_mode` 恒为 0。leader 的取值取决于已注册存储后端的聚合能力：只要有一个后端
+`Available()` 就具备读能力，此时 `access_mode` 至少为 1；还要有一个后端 `Writable()` 才具备写能力，此时为 2；
+没有任何可用后端时为 0。存储进入只读降级（`data_storage.writable_status` 为 0 而 `healthy_status` 为 1）时，
+leader 的 `access_mode` 为 1。这两个指标由周期性上报线程发布，未安装 leader 状态回调的离线工具不会导出它们。
 
 完整指标列表取决于当前使用的 `MetricsReporter` 类型。`kmonitor`
 类型的 reporter 会填充最完整的指标集。

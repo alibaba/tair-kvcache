@@ -198,10 +198,24 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |
 | `data_storage.writable_status` | gauge | Storage backend write availability (1/0); 0 in read-only mode |
 | `data_storage.storage_usage_ratio` | gauge | Storage usage ratio |
+| `is_leader` | gauge | Whether this node holds the leader lease (1/0), exported as `kvcm_is_leader` |
+| `access_mode` | gauge | Read/write capability this node can currently offer (0/1/2), exported as `kvcm_access_mode` |
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |
 | `cache_manager_instance.byte_size` | gauge | Per-instance KVCM quota bytes (excluding EventReport) |
+
+`is_leader` and `access_mode` are node-level metrics and carry no `type` /
+`unique_name` labels. Every data-plane API is leader-only, so `access_mode` is
+always 0 on a follower. On the leader the value reflects the aggregated
+capability of the registered storage backends: at least one backend reporting
+`Available()` gives read capability, so `access_mode` is at least 1, and at least
+one backend reporting `Writable()` also gives write capability, making it 2. It
+is 0 when no backend is available. When storage degrades to read-only
+(`data_storage.writable_status` is 0 while `healthy_status` is 1), the leader
+reports `access_mode` 1. Both metrics are published by the periodic reporting
+thread, so offline tools that never install a leader state callback do not
+export them.
 
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.
