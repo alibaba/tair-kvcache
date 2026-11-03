@@ -2,7 +2,7 @@
 
 --------------------------------------------------------------------------------
 <p align="center"> 
-    |<a href="README.md"><b>English Version</b></a>|
+    |<a href="https://github.com/alibaba/tair-kvcache/blob/main/README.md"><b>English Version</b></a>|
 </p>
 
 --------------------------------------------------------------------------------
