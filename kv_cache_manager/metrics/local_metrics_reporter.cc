@@ -162,8 +162,8 @@ void LocalMetricsReporter::ReportInterval() {
             if (is_leader.has_value() && !*is_leader) {
                 SET_METRICS_(p, data_storage, storage_usage_ratio, 0.0);
             } else {
-                // For leaders (or callers without a role provider), an unknown
-                // capacity must not overwrite the last successful measurement.
+                // Preserve backend return semantics, including a default zero.
+                // Defensively ignore negative values if a backend returns one.
                 const double usage_ratio = storage_backend->GetStorageUsageRatio("trace_report_interval");
                 if (usage_ratio >= 0.0) {
                     SET_METRICS_(p, data_storage, storage_usage_ratio, usage_ratio);

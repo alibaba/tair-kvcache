@@ -453,8 +453,7 @@ TEST_F(LocalMetricsReporterTest, TestReportInterval01) {
 
 namespace {
 // NfsBackend with a controllable usage ratio, used to verify how
-// ReportInterval handles the "unknown usage" (negative) sentinel that
-// backends return when they cannot query their capacity source.
+// ReportInterval handles valid readings, default zero and negative values.
 class FakeRatioNfsBackend : public NfsBackend {
 public:
     explicit FakeRatioNfsBackend(std::shared_ptr<MetricsRegistry> registry) : NfsBackend(std::move(registry)) {}
@@ -469,7 +468,7 @@ private:
 };
 } // namespace
 
-TEST_F(LocalMetricsReporterTest, StorageUsageRatioSkipsUnknownValues) {
+TEST_F(LocalMetricsReporterTest, StorageUsageRatioPreservesZeroAndSkipsNegativeValues) {
     auto be = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
     be->SetOpen(true);
     be->SetAvailable(true);
@@ -491,11 +490,23 @@ TEST_F(LocalMetricsReporterTest, StorageUsageRatioSkipsUnknownValues) {
     reporter_->ReportInterval();
     EXPECT_DOUBLE_EQ(0.75, published_ratio());
 
-    // Unknown usage (negative sentinel): the gauge keeps its last known
-    // value and the sentinel itself is never written. Regression test for
-    // followers exporting kvcm_data_storage_storage_usage_ratio == 1 when
-    // the pace meta-service query failed.
+    // Negative values are not valid readings and must not be exported.
+    // Backends are not required to return a negative value on query failure.
     be->SetUsageRatio(-1.0);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.75, published_ratio());
+
+    // Preserve the existing default-zero behavior, including after an error:
+    // zero replaces a previous reading while health still reflects failure.
+    be->SetUsageRatio(0.0);
+    be->SetAvailable(false);
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(0.0, published_ratio());
+    EXPECT_DOUBLE_EQ(0.0,
+                     metrics_registry_->GetGauge("data_storage.healthy_status",
+                                                 MetricsTags{{"type", "file"}, {"unique_name", "ratio_store"}}).Get());
+    be->SetUsageRatio(0.75);
+    be->SetAvailable(true);
     reporter_->ReportInterval();
     EXPECT_DOUBLE_EQ(0.75, published_ratio());
 
@@ -520,11 +531,9 @@ TEST_F(LocalMetricsReporterTest, StorageUsageRatioSkipsUnknownValues) {
     EXPECT_EQ(std::string::npos, exported_text.find("unique_name=\"never_ok_store\"} 1"));
     EXPECT_EQ(std::string::npos, exported_text.find("unique_name=\"never_ok_store\"} -"));
 
-    // Suppressing an unknown ratio must not suppress the reachability signal.
-    // A follower cut off from the pace meta-service still exports
-    // healthy_status 0 -- that is the series alerting should key on, and the
-    // reason dropping the bogus ratio is safe. A store whose capacity query
-    // succeeds keeps reporting healthy_status 1.
+    // Filtering a negative ratio must not suppress the backend health signal.
+    // An unavailable backend still exports healthy_status 0; a healthy one
+    // continues to export healthy_status 1.
     auto exported_value = [&exported_text](const std::string &metric, const std::string &unique_name) {
         const std::string tag = "unique_name=\"" + unique_name + "\"} ";
         size_t pos = 0;
