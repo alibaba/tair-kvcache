@@ -22,6 +22,7 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_reporter_factory.h"
+#include "kv_cache_manager/metrics/redis_health_metrics.h"
 #include "kv_cache_manager/service/admin_service_impl.h"
 #include "kv_cache_manager/service/command_line.h"
 #include "kv_cache_manager/service/debug_service_impl.h"
@@ -510,6 +511,38 @@ bool Server::StartMetricsReportThread() {
     }
     metrics_report_thread_ = LoopThread::CreateLoopThread(
         std::bind(&MetricsReporter::ReportInterval, metrics_reporter_), config_.metrics_report_interval_ms() * 1000);
+    std::weak_ptr<LeaderElector> weak_elector = leader_elector_;
+    auto targets = [registry = registry_manager_, weak_elector]() {
+        RedisHealthMetrics::Targets result;
+        const auto elector = weak_elector.lock();
+        if (!elector || !elector->IsLeader()) {
+            return result;
+        }
+        const auto [ec, groups] = registry->ListInstanceGroup(nullptr);
+        if (ec != EC_OK) {
+            return result;
+        }
+        for (const auto &group : groups) {
+            const auto cache = group->cache_config();
+            if (!cache || !cache->meta_indexer_config()) {
+                continue;
+            }
+            const auto config = cache->meta_indexer_config()->GetMetaStorageBackendConfig();
+            if (config) {
+                const auto uri = RedisHealthMetrics::RedisUri(config->GetStorageType(), config->GetStorageUri());
+                if (uri) {
+                    result.emplace(group->name(), *uri);
+                }
+            }
+        }
+        return result;
+    };
+    redis_health_metrics_ = std::make_shared<RedisHealthMetrics>(metrics_registry_, metrics_lifecycle_, std::move(targets));
+    redis_health_thread_ = LoopThread::CreateLoopThread(
+        [metrics = redis_health_metrics_]() { metrics->Report(); },
+        config_.metrics_report_interval_ms() * 1000,
+        "redis_health",
+        true);
     KVCM_LOG_INFO("start metrics reporter success.");
     return true;
 }
@@ -520,6 +553,9 @@ void Server::Stop() {
     }
     stop_ = true;
     KVCM_LOG_INFO("server stopping...");
+    if (redis_health_thread_) {
+        redis_health_thread_->Stop();
+    }
     // Lifecycle callbacks need the service gates and managers to remain alive.
     if (leader_elector_) {
         leader_elector_->Stop();

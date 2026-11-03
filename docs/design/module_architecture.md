@@ -339,3 +339,11 @@ Optimizer 作为客户端通过 `ServiceDiscoveryFactory` 获取 KVCM seed endpo
 ## 5. 修改功能前的提示
 
 修改某个模块前，先对照第 3 节的依赖关系图与第 4 节的运行时流程，确认它的上游（谁依赖它、会被它影响）和下游（它依赖谁、受谁约束），不要遗漏被依赖方带来的约束。尤其注意 3.2 的两条反向边、`CacheLocation` 的生命周期与状态流转约束，以及改动 `protocol` proto 时需遵循 [proto 修改指南](../develop/proto_modification_guide.md)。
+
+### 元数据 Redis 健康指标
+
+`service::Server` 将 leader 已加载的 InstanceGroup 元数据 Redis 配置提供给
+`metrics::RedisHealthMetrics`。独立循环线程使用有连接和 socket 超时的探测，按组发布
+`meta_storage.redis_healthy_status`，每轮对相同 URI 去重。探测不使用元数据业务连接，
+不改变请求准入。网络 I/O 在指标生命周期锁外执行；发布前在锁内重新核对组配置和节点角色，
+防止组删除或角色切换后重新发布过期探测结果。

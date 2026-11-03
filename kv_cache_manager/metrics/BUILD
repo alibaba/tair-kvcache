@@ -128,3 +128,15 @@ cc_library(
         "//kv_cache_manager/common:logger",
     ],
 )
+
+cc_library(
+    name = "redis_health_metrics",
+    srcs = ["redis_health_metrics.cc"],
+    hdrs = ["redis_health_metrics.h"],
+    deps = [
+        ":metrics_lifecycle",
+        ":metrics_registry",
+        "//kv_cache_manager/common:standard_uri",
+        "@hiredis",
+    ],
+)

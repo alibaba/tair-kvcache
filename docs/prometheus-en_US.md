@@ -281,3 +281,31 @@ Prometheus  --GET /metrics-->  AdminServiceHttp
 The endpoint is orthogonal to the `MetricsReporter` pipeline. Any
 reporter type (`kmonitor`, `local`, `logging`, `dummy`) populates
 the same `MetricsRegistry`, and the Prometheus endpoint reads from it.
+
+### Active metadata Redis health checks
+
+`kvcm_meta_storage_redis_healthy_status{instance_group="...",host="redis.example",port="6379"}` reports the latest metadata Redis probe:
+`1` means connection, required authentication, PING and configured database selection succeeded;
+`0` means any step failed or timed out. It covers `redis`, `async_redis`, and the Redis persistent layer
+of `cached` (including memory-primary async backups). Loaded Redis groups are probed even without
+business requests or registered instances.
+
+A dedicated thread and connection probe every `kvcm.metrics.report_interval_ms` (20 seconds by default,
+plus probe duration). Connect and each socket operation have a 1-second timeout, without retries or data writes.
+Groups sharing the same URI share a probe per cycle. Probing does not block `/metrics`, capacity collection,
+or use the business connection pool. Targets are checked sequentially, so failures can lengthen a cycle.
+Labels are `instance_group`, `host` and `port`, using the configured Redis endpoint without resolving
+hostnames to IP addresses. Full URIs, credentials and query parameters are not exposed. Endpoint changes
+remove the old endpoint series.
+
+Only the leader publishes probes for loaded groups. No series is published before the first probe, for
+non-Redis groups, or on followers. Deleted groups, replaced Redis configurations and demotion remove old
+series at the next probe-thread check. Absence does not imply health. This metric does not change
+`kvcm_access_mode`, verify business read/write permissions, capacity, data integrity or all Redis shards, or cover
+Registry / Coordination Redis.
+
+Example alert (for expected leader series; alert on absence separately):
+
+```promql
+kvcm_meta_storage_redis_healthy_status == 0
+```

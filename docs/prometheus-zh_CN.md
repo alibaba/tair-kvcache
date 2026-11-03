@@ -270,3 +270,27 @@ Prometheus  --GET /metrics-->  AdminServiceHttp
 该端点与 `MetricsReporter` 管线正交。任何 reporter 类型（`kmonitor`、
 `local`、`logging`、`dummy`）都向同一个 `MetricsRegistry` 写入数据，
 Prometheus 端点从中读取。
+
+### 元数据 Redis 主动健康探测
+
+`kvcm_meta_storage_redis_healthy_status{instance_group="...",host="redis.example",port="6379"}` 表示 KVCM 到该组元数据 Redis 的最近一次探测结果：
+`1` 为连接、必要的认证、PING 和配置的 DB 选择均成功；`0` 为其中任一步失败或超时。
+该指标覆盖 `redis`、`async_redis`，以及 `cached` 的 Redis 持久层（包括 memory-primary 异步备份），
+即使没有业务请求或 Instance，也会对已加载的 Redis InstanceGroup 发起探测。
+
+探测使用独立线程和连接，按 `kvcm.metrics.report_interval_ms` 周期运行（默认 20 秒，另加探测耗时），
+连接及每次 socket I/O 超时均为 1 秒，不重试、不写入业务数据。相同 URI 的组每轮共享一次探测结果。
+它不会阻塞 `/metrics`、容量采集或占用业务连接池；多 Redis 目标按顺序探测，故障时一轮可能超过配置周期。
+标签包含 `instance_group`、`host` 和 `port`；地址取自配置中的 Redis URI，域名不解析成 IP。
+不暴露完整 URI、认证信息或 query 参数。地址变更时移除旧地址的序列。
+
+仅 leader 对已加载的组发布该指标。首次探测完成前、非 Redis 组、follower 均不发布；组被删除、
+更换 Redis 配置或节点降为 follower 后，旧序列在探测线程下一次检查时移除，不能把缺失解释为健康。
+本指标不改变 `kvcm_access_mode`，也不代表 Redis 业务读写权限、容量、数据完整性或所有分片均正常，
+不覆盖 Registry / Coordination Redis。
+
+告警示例（仅适用于预期由 leader 发布的序列；缺失应另设告警）：
+
+```promql
+kvcm_meta_storage_redis_healthy_status == 0
+```
