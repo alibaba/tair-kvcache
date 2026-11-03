@@ -107,7 +107,7 @@ public:
                                 const KeyVector &keys,
                                 const BlockIdsOnlyModifierFunc &modifier) noexcept;
     // Location-level RMW: modifier sees per-key CacheLocation vector.
-    // hydrate_missing_cache requests complete-key hydration only for
+    // fill_missing_cache requests complete-key filling only for
     // missing Recover keys; existing hot data is never overwritten. The
     // modifier then sees actual hot values (or the sole backend without cache).
     LocationResult ReadModifyWriteLocation(RequestContext *request_context,
@@ -115,7 +115,7 @@ public:
                                            const LocationIdsPerKey &location_ids,
                                            const LocationModifierFunc &modifier,
                                            bool adjust_reclaimed_key_count = true,
-                                           bool hydrate_missing_cache = false) noexcept;
+                                           bool fill_missing_cache = false) noexcept;
     LocationResult ReadModifyWriteLocationsForMaintenance(RequestContext *request_context,
                                                           const KeyVector &keys,
                                                           const LocationIdsPerKey &location_ids,
@@ -230,7 +230,7 @@ private:
                                                const LocationModifierFunc &modifier,
                                                bool adjust_reclaimed_key_count,
                                                bool track_created_key_count,
-                                               bool hydrate_missing_cache,
+                                               bool fill_missing_cache,
                                                bool maintenance_no_touch) noexcept;
 
 private:

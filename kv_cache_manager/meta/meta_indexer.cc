@@ -677,14 +677,14 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                                                                  const LocationIdsPerKey &location_ids,
                                                                  const LocationModifierFunc &modifier,
                                                                  bool adjust_reclaimed_key_count,
-                                                                 bool hydrate_missing_cache) noexcept {
+                                                                 bool fill_missing_cache) noexcept {
     return ReadModifyWriteLocationImpl(request_context,
                                        keys,
                                        location_ids,
                                        modifier,
                                        adjust_reclaimed_key_count,
                                        false,
-                                       hydrate_missing_cache,
+                                       fill_missing_cache,
                                        false);
 }
 
@@ -711,7 +711,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                                                      const LocationModifierFunc &modifier,
                                                                      bool adjust_reclaimed_key_count,
                                                                      bool track_created_key_count,
-                                                                     bool hydrate_missing_cache,
+                                                                     bool fill_missing_cache,
                                                                      bool maintenance_no_touch) noexcept {
     const auto &trace_id = request_context->trace_id();
     if (keys.empty()) {
@@ -783,12 +783,12 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
         LocationsPerKey batch_locations_per_key;
         std::vector<ErrorCode> batch_key_get_ecs;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
-        std::vector<ErrorCode> hydrate_results;
-        if (hydrate_missing_cache) {
-            // Ordinary GC may hydrate a missing Recover key under the same
+        std::vector<ErrorCode> fill_results;
+        if (fill_missing_cache) {
+            // Ordinary GC may fill a missing Recover key under the same
             // shard lock as its CAS. Existing hot keys are never overwritten;
             // Running and tombstoned keys do not fall back to Redis.
-            hydrate_results = backend_manager_->EnsureCacheForGc(ephemeral_request_context.get(), batch_keys);
+            fill_results = backend_manager_->EnsureCacheForGc(ephemeral_request_context.get(), batch_keys);
         }
         std::vector<std::vector<ErrorCode>> get_ecs_per_key;
         if (track_created_key_count) {
@@ -798,7 +798,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
                                                                           batch_locations_per_key,
                                                                           batch_key_get_ecs);
         } else {
-            get_ecs_per_key = (maintenance_no_touch || (hydrate_missing_cache && backend_manager_->HasCacheBackend()))
+            get_ecs_per_key = (maintenance_no_touch || (fill_missing_cache && backend_manager_->HasCacheBackend()))
                                  ? backend_manager_->GetLocationsForMaintenance(ephemeral_request_context.get(),
                                                                                batch_keys,
                                                                                batch_location_ids,
@@ -819,7 +819,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
 
         if (get_ecs_per_key.size() != batch_keys.size() || batch_locations_per_key.size() != batch_keys.size() ||
             (track_created_key_count && batch_key_get_ecs.size() != batch_keys.size()) ||
-            (hydrate_missing_cache && hydrate_results.size() != batch_keys.size())) {
+            (fill_missing_cache && fill_results.size() != batch_keys.size())) {
             PREFIX_INDEXER_LOG(ERROR,
                                "ReadModifyWriteLocation result size mismatch, keys[%lu], ecs[%lu], locations[%lu], "
                                "key_ecs[%lu]",
@@ -835,12 +835,12 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocationImpl(RequestCont
             continue;
         }
 
-        if (hydrate_missing_cache) {
+        if (fill_missing_cache) {
             for (size_t i = 0; i < batch_keys.size(); ++i) {
-                if (hydrate_results[i] == EC_OK) {
+                if (fill_results[i] == EC_OK) {
                     continue;
                 }
-                get_ecs_per_key[i].assign(batch_location_ids[i].size(), hydrate_results[i]);
+                get_ecs_per_key[i].assign(batch_location_ids[i].size(), fill_results[i]);
                 batch_locations_per_key[i].assign(batch_location_ids[i].size(), nullptr);
             }
         }

@@ -360,7 +360,7 @@ public:
                                      const KeyVector &keys,
                                      const std::vector<std::vector<LocationCASTask>> &batch_tasks,
                                      std::vector<std::vector<ErrorCode>> &out_batch_results,
-                                     bool hydrate_missing_cache = false);
+                                     bool fill_missing_cache = false);
     struct LocationCADTask {
         std::string location_id;
         CacheLocationStatus expect_status;

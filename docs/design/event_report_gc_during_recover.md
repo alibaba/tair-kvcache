@@ -14,6 +14,8 @@
 
 本次只处理 GC 删除与本轮 recover 回填、在线回源补齐、普通 GC 强刷的竞争。两类 GC 的内存校验依赖正常业务成功更新 hot、恢复与补齐以完整 key 建立 hot、各元数据修改共用原 shard 锁，并要求 4.4 的普通 GC 不再覆盖已有 hot K。沿用 Reporter recovery grace、cleanup token/lease、完整 expected-value 校验和周期扫描；保留写入失败的返回及成功门控，不扩展为双写失败后的跨层补偿、Redis-only 数据修复、冷 key 扫描或跨重启删除持久性保证。模块职责和依赖关系不变。
 
+**已接受的边界：** GC 以内存元数据为准。若 Redis 已接受写入，但内存更新失败、业务已返回失败，仅留在 Redis 的更新可能被后续 GC 清除，不保证保留。
+
 ## 2. 当前问题
 
 改动前，GC 在每批构造候选时通过 `MetaIndexer::IsRecovering()` 跳过恢复中 Instance 的 EventReport 判定与任务提交；底层 [`DeleteLocationsForMaintenance()`](../../kv_cache_manager/meta/meta_storage_backend_manager.cc) 也在 cached Recover 期间返回 `EC_OUT_OF_LIMIT`。扫描与普通 GC 仍可继续，EventReport 清理要等恢复完成。本次同步移除这两处恢复期整体限制，保留清理开关、Indexer 存在检查及逐目标校验。
@@ -180,7 +182,22 @@ write_local_primary = memory_primary_ && 本批次开始时状态为 Running
 
 恢复失败仍停留在 Recover，沿用现有保留 tombstone 的行为。正常业务可以重新创建 K，标记阻止旧 Redis 内容参与恢复回填和在线补齐，不拒绝业务新写；新写不清除标记，已有内存新值始终正常使用。集合属于单个 Instance 的 backend manager，不跨 Instance 共享。
 
-新增空间为本轮恢复期间 GC 整 key 删除的唯一 key 数量；不保存 Location 内容。长时间停留 Recover 时集合会积累，不能通过 TTL 或容量淘汰提前移除标记。本次沿用现有生命周期，不另建回收协议。
+集合不保存 Location 内容，但占用不止 key 的 8 字节。原有普通 `Delete()` 已在 Recover 中对 `EC_OK / EC_NOENT` 登记标记，普通 GC 回收空 key 也走该路径；本次增加的是 EventReport maintenance 整 key 删除的登记，部分 Location 删除不登记。记原有路径覆盖的不同 key 为 B、EventReport 覆盖的为 E，集合大小为 `|B ∪ E|`，EventReport 额外覆盖的条目为 `|E \ B|`。重复删除、同名重建后再删除只占一条；重建不清标记。
+
+**容量测量（2026-11-03）：** 在远端 Linux 隔离容器，用 GCC 10.2.1、libstdc++ 6.0.28、默认负载因子 1、未 reserve 的 `std::unordered_set<int64_t>` 独立探针测量。每个规模使用独立进程，依次插入不同 key、重复插入、`clear()`、交换为空集合；default allocator 的进程统计为主，另用计数 allocator 拆解节点和桶。共 36 次运行，未运行完整服务负载。
+
+| 唯一标记数 | jemalloc 当前分配增量 | jemalloc `clear()` 后仍分配 | glibc 当前分配增量 |
+|---:|---:|---:|---:|
+| 100 万 | 27.2 MiB | 12.0 MiB | 41.6 MiB |
+| 1000 万 | 248.6 MiB | 96.0 MiB | 397.6 MiB |
+
+单位为 MiB（1024² 字节），分配增量相对该进程的空集合基线。测量环境为 jemalloc 5.2.1 默认配置、glibc 2.32；不是生产 RSS 承诺。该 libstdc++ 节点请求 16B（8B key 加链表指针），桶每个 8B；jemalloc 的节点实际分配 16B，glibc 的 chunk 占用约 32B。1000 万条的 jemalloc 节点约 152.6 MiB、桶取整后 96 MiB。扩容可能短暂同时持有新旧桶，不能把新增条目乘固定单价当作精确增量。1000 万条的 jemalloc RSS 增量约 262.7 MiB；交换为空集合后分配回到基线附近，RSS 未立即全部回落，容器释放与 allocator 归还物理页需要区分。
+
+4 个 Instance 各 100 万条时，jemalloc 集合合计约 109 MiB，`clear()` 后桶合计仍约 48 MiB。相同 key 跨 Instance 分别计数，进程级 allocator 基线不能重复叠加。假设持续新增不同标记 1000/s，1 小时为 360 万条、实测约 102.9 MiB；4 小时为 1440 万条、约 411.7 MiB。这是容量敏感性场景，不是生产典型负载；计算本 PR 增量还要排除普通 Delete 的重合。GC 释放 hot metadata，集合增长也不等于整个进程的净内存增加。
+
+恢复连续失败可能退出回填线程但保留 Recover 状态，标记仍可随后续删除增长。当前 key 数上限不能限制累计不同删除 key，cache 的 `GetMemUsage()` 也不包含此集合。恢复成功执行的 `clear()` 释放节点但保留桶容量，manager 销毁才释放容器所有分配；当前没有集合硬上限。
+
+本次用 4.5 的启动开关控制恢复期 EventReport 清理准入，不提前移除已有标记。TTL、容量淘汰或重建后清标记会重新允许旧内容回填。恢复成功后交换为空集合可以释放桶，但不能降低 Recover 峰值；紧凑的精确集合可能降低单条成本，需另测收益；按容量延后 GC 则会保留原本可释放的 hot metadata，未必更省总内存。此次不更换容器、不增加淘汰协议，也不承诺通过开关限制普通 Delete 的标记增长。
 
 ### 4.3 在线重建：跳过旧数据，不等待删除完成
 
@@ -245,3 +262,16 @@ Redis 操作与 Sync 的范围保持明确：
 - 普通 GC 物理删除前已有的锁外 Sync、在线写入流程和 single-backend 行为均保留；cached EventReport 采用 4.1 的 hot-only 校验，不执行读前或删后 Sync。
 
 普通 GC 在 Running 阶段只处理内存中的目标，不主动补齐 Redis-only key。GC 只扫描内存；执行时目标已经缺失，可以结束本次处理，后续进入内存的有效候选仍可被重新扫描。不为部分写失败造成的 Redis-only 残留增加修复流程，也不承诺清完所有 Redis metadata。
+
+### 4.5 恢复期 EventReport 清理开关
+
+增加启动配置 `kvcm.cache_gc.event_report_cleanup_during_recover_enabled`，默认 `true`，保持本方案行为。配置修改后重启生效，不提供热更新。以下规则以 GC 总开关和 EventReport 清理子开关均开启为前提：
+
+| 新开关 | 当前 Instance 为 Recover | 当前 Instance 为 Running |
+|---|---|---|
+| `true` | 正常构造 EventReport 清理候选 | 正常清理 |
+| `false` | 跳过该 Instance 本批次的 EventReport 清理候选 | 正常清理 |
+
+判断只放在 `BuildDeleteActions()` 的 EventReport 候选入口，复用 `MetaIndexer::IsRecovering()`，不改 `IsEventReportCleanupEnabled()` 对新旧清理模式的选择。因此关闭本开关不会转入 legacy 事件清理，Reporter 事件仍更新 Backend 状态；恢复结束后由后续周期扫描重新发现目标，不保留待删任务、不立即重扫，也不对每个跳过目标报错。
+
+普通 GC、业务 Delete 和其他已 Running 的 Instance 不受此开关限制；例如普通 orphan WRITING 规则仍按原逻辑处理，即使该 Location 属于 EventReport storage。底层删除和 tombstone 保护保持不变。该开关控制恢复期 EventReport maintenance 的新增工作，不清空已有标记，不限制整个 `deleted_keys_` 的累计规模，也不充当运行时紧急暂停接口。
