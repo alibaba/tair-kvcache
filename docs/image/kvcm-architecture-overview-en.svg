@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-labelledby="title description">
+<title id="title">Tair KVCache Manager — system architecture</title>
+<desc id="description">Inference clients send metadata requests to the HA-capable KVCM server. TransferClient moves KVCache directly between engine memory and supported storage systems. Inference services report their L1.5/L2 cache state through Client/Connector ReportEvent calls on the metadata plane. Service and CacheManager update indexes and EventReportBackend state. ReportEvent carries metadata only. Admin tools manage configuration; Optimizer subscribes to cache events. HiSim runs independently. Cache reuse is isolated by instance_id.</desc>
+<defs>
+<marker id="blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#2865D6"/></marker>
+<marker id="teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#058475"/></marker>
+<marker id="orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#C96A20"/></marker>
+<marker id="purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#8060B4"/></marker>
+<marker id="gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9 Z" fill="#97A9BE"/></marker>
+<linearGradient id="manager" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#EDF4FF"/><stop offset="1" stop-color="#F7FAFF"/></linearGradient>
+</defs>
+<g font-family="'Alibaba PuHuiTi 2.0', 'Noto Sans CJK SC', 'Microsoft YaHei', Arial, sans-serif">
+<rect x="0" y="0" width="1920" height="1080" rx="0" fill="#F7F9FC" stroke="none" stroke-width="1.5"/>
+<rect x="56" y="57" width="7" height="78" rx="3" fill="#F18536" stroke="none" stroke-width="1.5"/>
+<text x="83" y="93" font-size="44" font-weight="700" fill="#152B48" text-anchor="start">Tair KVCache Manager</text>
+<text x="84" y="138" font-size="25" font-weight="400" fill="#566B83" text-anchor="start">Centralized metadata management · Decentralized data transfer</text>
+<text x="1864" y="88" font-size="18" font-weight="500" fill="#566B83" text-anchor="end">SYSTEM ARCHITECTURE</text>
+<text x="1864" y="120" font-size="16" font-weight="400" fill="#8595A9" text-anchor="end">KVCM  /  MODULE OVERVIEW</text>
+<rect x="56" y="202" width="384" height="128" rx="16" fill="white" stroke="#DCE4EE" stroke-width="1.5"/>
+<text x="80" y="235" font-size="28" font-weight="600" fill="#152B48" text-anchor="start">Inference services</text>
+<text x="80" y="267" font-size="22" font-weight="400" fill="#566B83" text-anchor="start">vLLM · SGLang · TensorRT-LLM</text>
+<text x="80" y="293" font-size="22" font-weight="400" fill="#566B83" text-anchor="start">RTP-LLM</text>
+<text x="80" y="318" font-size="16" font-weight="400" fill="#2865D6" text-anchor="start">L1.5 / L2 cache state reporting</text>
+<path d="M 248 330 V 363" fill="none" stroke="#97A9BE" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)"/>
+<rect x="56" y="364" width="384" height="498" rx="16" fill="white" stroke="#DCE4EE" stroke-width="1.5"/>
+<text x="80" y="407" font-size="29" font-weight="600" fill="#152B48" text-anchor="start">Client / Connector</text>
+<text x="80" y="445" font-size="23" font-weight="500" fill="#2865D6" text-anchor="start">py_connector + client</text>
+<text x="80" y="475" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">Python integration · C++ / pybind</text>
+<rect x="76" y="488" width="344" height="96" rx="12" fill="#F0F5FF" stroke="#D2E0FA" stroke-width="1.5"/>
+<text x="94" y="518" font-size="23" font-weight="600" fill="#2865D6" text-anchor="start">MetaClient · gRPC</text>
+<text x="94" y="548" font-size="22" font-weight="400" fill="#2865D6" text-anchor="start">+ Python HTTP</text>
+<text x="94" y="575" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Match / reserve · confirm writes</text>
+<rect x="76" y="600" width="344" height="78" rx="12" fill="#F0F5FF" stroke="#B7CDF4" stroke-width="1.5"/>
+<text x="94" y="630" font-size="22" font-weight="600" fill="#2865D6" text-anchor="start">ReportEvent · cache state</text>
+<text x="94" y="660" font-size="17" font-weight="400" fill="#566B83" text-anchor="start">L1.5/L2 · delta · snapshot · heartbeat</text>
+<rect x="76" y="694" width="344" height="66" rx="12" fill="#F7F9FD" stroke="#DCE4EE" stroke-width="1.5"/>
+<text x="94" y="720" font-size="22" font-weight="500" fill="#152B48" text-anchor="start">client_java / manager_client</text>
+<text x="94" y="748" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Metadata only · Java / Python</text>
+<rect x="76" y="776" width="344" height="68" rx="12" fill="#EAF8F3" stroke="#BBE2D7" stroke-width="1.5"/>
+<text x="94" y="803" font-size="25" font-weight="600" fill="#058475" text-anchor="start">TransferClient</text>
+<text x="94" y="832" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">GPU / host memory ↔ storage</text>
+<rect x="560" y="202" width="824" height="660" rx="20" fill="#FFFFFF" stroke="#B9CFEA" stroke-width="2"/>
+<text x="584" y="243" font-size="31" font-weight="600" fill="#152B48" text-anchor="start">KVCM Server</text>
+<rect x="1138" y="218" width="222" height="32" rx="16" fill="#EAF0FB" stroke="none" stroke-width="1.5"/>
+<text x="1249.0" y="241" font-size="19" font-weight="500" fill="#2865D6" text-anchor="middle">Leader + Followers</text>
+<text x="584" y="274" font-size="21" font-weight="400" fill="#566B83" text-anchor="start">Global KVCache locations, state and capacity</text>
+<rect x="584" y="294" width="776" height="92" rx="12" fill="#F5F8FD" stroke="#D4E0F0" stroke-width="1.5"/>
+<text x="606" y="328" font-size="27" font-weight="600" fill="#152B48" text-anchor="start">service</text>
+<text x="606" y="363" font-size="21" font-weight="400" fill="#566B83" text-anchor="start">gRPC / HTTP · Meta / Admin / Debug · Leader gate</text>
+<path d="M 972 386 V 410" fill="none" stroke="#97A9BE" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)"/>
+<rect x="584" y="410" width="776" height="160" rx="12" fill="url(#manager)" stroke="#B7CDF4" stroke-width="1.5"/>
+<rect x="584" y="426" width="5" height="128" rx="2" fill="#2865D6" stroke="none" stroke-width="1.5"/>
+<text x="606" y="446" font-size="29" font-weight="600" fill="#2865D6" text-anchor="start">manager</text>
+<text x="1336" y="445" font-size="21" font-weight="500" fill="#2865D6" text-anchor="end">CacheManager</text>
+<text x="606" y="482" font-size="23" font-weight="400" fill="#152B48" text-anchor="start">Location matching · two-phase writes · backend selection</text>
+<text x="606" y="515" font-size="23" font-weight="400" fill="#152B48" text-anchor="start">Quota &amp; reclaim · background GC · tiered migration</text>
+<text x="606" y="548" font-size="20" font-weight="400" fill="#566B83" text-anchor="start">Inference-side cache state · ReportEvent / GetHostCacheState</text>
+<path d="M 972 570 V 586 H 706 V 602" fill="none" stroke="#97A9BE" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)"/>
+<path d="M 972 586 V 602" fill="none" stroke="#97A9BE" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)"/>
+<path d="M 972 586 H 1238 V 602" fill="none" stroke="#97A9BE" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)"/>
+<rect x="584" y="602" width="244" height="150" rx="12" fill="#FAFBFE" stroke="#D8E2EF" stroke-width="1.5"/>
+<text x="602" y="637" font-size="26" font-weight="600" fill="#152B48" text-anchor="start">meta</text>
+<text x="602" y="675" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">Block → CacheLocation</text>
+<text x="602" y="704" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">Index · query cache</text>
+<text x="602" y="733" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">local / Redis</text>
+<rect x="850" y="602" width="244" height="150" rx="12" fill="#FAFBFE" stroke="#D8E2EF" stroke-width="1.5"/>
+<text x="868" y="637" font-size="26" font-weight="600" fill="#152B48" text-anchor="start">config</text>
+<text x="868" y="675" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">Instances · quotas</text>
+<text x="868" y="704" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">Registry · HA election</text>
+<text x="868" y="733" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">LeaderElector</text>
+<rect x="1116" y="602" width="244" height="150" rx="12" fill="#FAFBFE" stroke="#D8E2EF" stroke-width="1.5"/>
+<text x="1134" y="637" font-size="24" font-weight="600" fill="#152B48" text-anchor="start">data_storage</text>
+<text x="1134" y="675" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">Backend abstraction</text>
+<text x="1134" y="704" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">Health · watermarks</text>
+<text x="1134" y="733" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">EventReportBackend</text>
+<rect x="584" y="778" width="776" height="66" rx="10" fill="#F0F4F9" stroke="none" stroke-width="1.5"/>
+<text x="604" y="804" font-size="22" font-weight="600" fill="#152B48" text-anchor="start">event</text>
+<text x="604" y="830" font-size="16" font-weight="400" fill="#566B83" text-anchor="start">Event bus</text>
+<text x="794" y="804" font-size="22" font-weight="600" fill="#152B48" text-anchor="start">metrics</text>
+<text x="794" y="830" font-size="16" font-weight="400" fill="#566B83" text-anchor="start">Observability</text>
+<text x="984" y="804" font-size="22" font-weight="600" fill="#152B48" text-anchor="start">protocol</text>
+<text x="984" y="830" font-size="16" font-weight="400" fill="#566B83" text-anchor="start">proto / gRPC</text>
+<text x="1174" y="804" font-size="22" font-weight="600" fill="#152B48" text-anchor="start">common</text>
+<text x="1174" y="830" font-size="16" font-weight="400" fill="#566B83" text-anchor="start">Logs · Redis · discovery</text>
+<rect x="1472" y="202" width="392" height="184" rx="16" fill="#FFFBF5" stroke="#EAD8C4" stroke-width="1.5"/>
+<text x="1496" y="241" font-size="28" font-weight="600" fill="#C96A20" text-anchor="start">Operations</text>
+<text x="1496" y="280" font-size="22" font-weight="400" fill="#152B48" text-anchor="start">kvcm_ops · Admin CLI</text>
+<text x="1496" y="313" font-size="21" font-weight="400" fill="#566B83" text-anchor="start">Storage / Instance / Group</text>
+<text x="1496" y="346" font-size="21" font-weight="400" fill="#566B83" text-anchor="start">Quota · config · cluster state</text>
+<rect x="1472" y="432" width="392" height="230" rx="16" fill="#FCFAFF" stroke="#DFD5EF" stroke-width="1.5"/>
+<text x="1496" y="472" font-size="29" font-weight="600" fill="#8060B4" text-anchor="start">optimizer</text>
+<text x="1496" y="508" font-size="21" font-weight="400" fill="#566B83" text-anchor="start">Cache simulation &amp; optimization</text>
+<path d="M 1496 528 H 1840" fill="none" stroke="#E4DCF0" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="1496" y="562" font-size="21" font-weight="400" fill="#152B48" text-anchor="start">Trace replay · policy &amp; capacity</text>
+<text x="1496" y="595" font-size="21" font-weight="400" fill="#152B48" text-anchor="start">LiteHit · multi-capacity hit rate</text>
+<text x="1496" y="628" font-size="21" font-weight="400" fill="#152B48" text-anchor="start">Online TraceQuery</text>
+<rect x="1472" y="702" width="392" height="160" rx="16" fill="white" stroke="#DCE4EE" stroke-width="1.5"/>
+<text x="1496" y="742" font-size="29" font-weight="600" fill="#152B48" text-anchor="start">HiSim</text>
+<rect x="1728" y="720" width="112" height="32" rx="16" fill="#EEF2F7" stroke="none" stroke-width="1.5"/>
+<text x="1784.0" y="743" font-size="17" font-weight="500" fill="#566B83" text-anchor="middle">Standalone</text>
+<text x="1496" y="777" font-size="22" font-weight="400" fill="#566B83" text-anchor="start">LLM inference simulation</text>
+<text x="1496" y="811" font-size="19" font-weight="400" fill="#152B48" text-anchor="start">CPU replay · no Manager runtime</text>
+<text x="1496" y="840" font-size="19" font-weight="400" fill="#152B48" text-anchor="start">Predict TTFT / TPOT / throughput</text>
+<rect x="560" y="914" width="1304" height="110" rx="16" fill="#F0FAF6" stroke="#B9DDD0" stroke-width="1.5"/>
+<text x="584" y="951" font-size="26" font-weight="600" fill="#058475" text-anchor="start">Pluggable KVCache storage</text>
+<text x="584" y="987" font-size="25" font-weight="400" fill="#152B48" text-anchor="start">TairMemPool (DRAM / SSD) · HF3FS · NFS · Mooncake* · VCNS HF3FS*</text>
+<text x="584" y="1012" font-size="16" font-weight="400" fill="#566B83" text-anchor="start">* Mooncake / VCNS HF3FS are optional build-time backends</text>
+<path d="M 420 536 H 488 V 340 H 582" fill="none" stroke="#2865D6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#blue)"/>
+<path d="M 420 639 H 488 V 536" fill="none" stroke="#2865D6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 420 727 H 488 V 639" fill="none" stroke="#2865D6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="500" y="282" font-size="19" font-weight="600" fill="#2865D6" text-anchor="middle">Metadata</text>
+<text x="500" y="310" font-size="16" font-weight="400" fill="#2865D6" text-anchor="middle">gRPC / HTTP</text>
+<path d="M 1470 340 H 1362" fill="none" stroke="#C96A20" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#orange)"/>
+<text x="1416" y="307" font-size="19" font-weight="600" fill="#C96A20" text-anchor="middle">Control</text>
+<path d="M 1362 367 H 1416 V 546 H 1470" fill="none" stroke="#8060B4" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#purple)" stroke-dasharray="7 6"/>
+<rect x="1388" y="442" width="56" height="58" rx="0" fill="#F7F9FC" stroke="none" stroke-width="1.5"/>
+<text x="1416" y="464" font-size="18" font-weight="500" fill="#8060B4" text-anchor="middle">Events</text>
+<text x="1416" y="492" font-size="16" font-weight="400" fill="#8060B4" text-anchor="middle">gRPC</text>
+<path d="M 420 810 H 488 V 968 H 558" fill="none" stroke="#058475" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#teal)" marker-start="url(#teal)"/>
+<text x="80" y="914" font-size="23" font-weight="600" fill="#058475" text-anchor="start">Data</text>
+<text x="80" y="949" font-size="21" font-weight="400" fill="#058475" text-anchor="start">Direct KVCache I/O · bypasses KVCM</text>
+<path d="M 1362 680 H 1416 V 912" fill="none" stroke="#97A9BE" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)"/>
+<rect x="1368" y="872" width="96" height="29" rx="0" fill="#F7F9FC" stroke="none" stroke-width="1.5"/>
+<text x="1416" y="894" font-size="17" font-weight="500" fill="#566B83" text-anchor="middle">Backend ops</text>
+<path d="M 56 1058 h 32" fill="none" stroke="#2865D6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="100" y="1065" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">Metadata</text>
+<path d="M 246 1058 h 32" fill="none" stroke="#058475" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="290" y="1065" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">Data</text>
+<path d="M 402 1058 h 32" fill="none" stroke="#C96A20" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="446" y="1065" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">Control</text>
+<path d="M 576 1058 h 32" fill="none" stroke="#8060B4" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="7 6"/>
+<text x="620" y="1065" font-size="19" font-weight="400" fill="#566B83" text-anchor="start">Events</text>
+<text x="1864" y="1065" font-size="20" font-weight="500" fill="#152B48" text-anchor="end">Reuse scope: same instance_id, across requests / nodes</text>
+</g>
+</svg>

@@ -11,44 +11,83 @@
 Currently, the global KVCache management system Tair KVCache Manager and the LLM inference simulation system Tair KVCache HiSim have been open-sourced.
 
 ## Tair KVCache Manager
-Tair KVCache Manager is one of the core components of Tair KVCache, designed to provide unified KVCache metadata management services for Large Language Model (LLM) inference scenarios.
+
+Tair KVCache Manager (KVCM) is a global KVCache metadata management service for LLM inference. It separates KVCache location, state, and capacity management from individual inference instances, enabling engines to reuse KVCache across requests and nodes within the same instance—reducing recomputation, lowering inference cost, and improving time-to-first-token (TTFT) and throughput.
+
+### Key capabilities
+
+- **LLM-aware matching**: prefix matching, reverse rolling sliding-window matching, hybrid attention (Mamba/SWA), and batch queries by block key, with multi-LocationSpec organization for hybrid attention.
+- **Two-phase writes**: reserve a write location, write the data, then confirm; only confirmed blocks become readable.
+- **Multi-tenant quotas and fair reclaim**: Instance Group quotas, backend watermarks, Group LRU / usage-proportional policies, asynchronous eviction that does not block foreground requests.
+- **Tiered storage**: DRAM/SSD hot-cold tiers, watermark-triggered background Copy or Mark writes, expanding effective cache capacity while controlling the hot tier.
+- **Inference-side cache state reporting**: inference services use ReportEvent incremental updates + optional snapshots to bring L1.5/L2 cache state into the global index; GetHostCacheState evaluates host-local and global hits.
+- **Enterprise HA**: active-standby deployment, Redis/File/Memory-based leader election, automatic failover, and client-side leader discovery.
+- **Observability and operations**: Prometheus/KMonitor metrics, access logs, RequestContext tracing, crash stack decoding, and the kvcm_ops CLI.
+- **Optimization loop**: offline trace replay for eviction and capacity planning, LiteHit for fast multi-capacity hit-rate projection, and an online optimizer that replays KVCM events in real time.
 
 ### System Architecture
-![kvcm-architecture](docs/image/kvcm-architecture0-en.png)
 
-- Tair KVCache Manager is deployed in a centralized mode, responsible for global metadata management of KVCache, providing services such as KVCache queries and storage capacity management.
-- Tair KVCache Manager Client/Connector is responsible for interfacing with inference engines, implementing metadata queries and KVCache data transmission.
+KVCM follows a "centralized metadata management + decentralized data transfer" design:
 
-![kvcm-architecture](docs/image/kvcm-architecture1-en.jpg)
+- **Metadata plane**: inference engines query or reserve KVCache locations through the Client/Connector. KVCM answers "where the data is and whether it is readable"; it does not carry KVCache payloads.
+- **Data plane**: engines use the returned storage URIs to read/write KVCache directly through the transfer layer, so the metadata service does not become a bandwidth bottleneck.
+- **Control plane**: operators use AdminService to manage storages, instance groups, instances, quotas, migration, configuration snapshots, and cluster state.
 
-**Tair KVCache Manager** mainly consists of the following components:
+#### Deployment view
 
-- Access Layer (Server): Provides HTTP and gRPC services
-- Cache Logic (CacheManager): Responsible for implementing external interfaces and core business logic
-  - Provides multiple matching logics: prefix matching, sliding window matching, KV matching, etc.
-  - Implements two-phase write mechanism: obtaining write addresses + notifying after write completion. Ensures data reliability.
-  - Storage backend selection: Dynamically selects storage backends based on metrics such as storage backend availability.
-- Storage Management (DataStorage): Responsible for managing multiple storage backends
-  - Compatible with multiple storage systems: Encapsulates unified interfaces and data location descriptions for heterogeneous storage, supporting systems like HF3FS, Mooncake, NFS, etc.
-  - Storage system status management: Real-time monitoring of storage backend availability and storage water levels for use by CacheManager.
-- Index Management (MetaIndex)
-  - Implements metadata persistence based on external KV storage systems, ensuring metadata reliability during KVCM failures.
-  - Unified control of metadata query and update operations, supports batch processing to improve performance, while ensuring update atomicity through mechanisms like sharded locks.
-- Capacity Management (Reclaimer & Executor)
-  - Flexible control of storage capacity usage: Supports multi-dimensional capacity control such as Instance Group
-  - Controls backend storage water levels: Prevents storage backend capacity from exceeding limits
-  - KVCache eviction: Evicts KVCache data based on Quota and water levels to control storage capacity water levels.
-  - Background thread pool implements asynchronous deletion: Deletion does not block foreground requests, deletion performance is scalable.
-- Cache Simulation and Optimization (Optimizer):
-  - Replays KVCache access traces, efficiently simulates KVCache access behavior, analyzes key metrics such as KVCache hit rate and capacity consumption.
-  - Based on simulation results, guides optimization of parameters like capacity to improve overall ROI.
-  - For more information, refer to [KVCacheManager Optimizer Usage Guide](docs/optimizer.md)
+![KVCM deployment architecture](docs/image/kvcm-deployment-en.png)
+
+#### Module view
+
+![KVCM system architecture](docs/image/kvcm-architecture-overview-en.png)
+
+> This is a simplified, presentation-oriented module view. The engineering version with full dependency directions, intentional reverse edges, and runtime flows is in [Module Architecture](docs/design/module_architecture.md).
+
+#### Server component relationships
+
+The following view expands the main server components: foreground queries and writes, metadata indexes, storage backends, and the reclaim, GC, migration, and shared executor paths. Inference services call ReportEvent through the Client/Connector to report L1.5/L2 cache state. This API updates metadata and reporter state without transferring KVCache payloads.
+
+![KVCM server component relationships](docs/image/kvcm-server-components-en.png)
+
+### Modules
+
+The main components, in one sentence each:
+
+**Access and orchestration**
+- **service**: receives gRPC/HTTP requests from inference engines, checks whether this node is the leader, then hands off to `CacheManager`.
+- **CacheManager**: the system orchestrator; dispatches requests to matching, write, reclaim, and migration components and coordinates background tasks.
+
+**Foreground requests**
+- **MetaSearcher**: finds cache—matches reusable KVCache locations from the index based on the request's tokens/blocks.
+- **WriteLocationManager**: write-session management—records the locations and timeout for a two-phase write so the confirmation step can find them.
+- **DataStorageSelector**: picks storage—chooses the storage backend for a write based on quota, backend availability, and preference strategy.
+- **ReportEvent / GetHostCacheState**: inference-side cache state—accepts L1.5/L2 cache reports and answers host-level hit queries; metadata only.
+
+**Metadata and storage**
+- **MetaIndexer**: the cache directory—maps each block to its `CacheLocation` and supports query, write, conditional update, and sampling.
+- **DataStorageManager**: manages storage backends—connections, health, and capacity for TairMemPool, HF3FS, Mooncake, NFS, etc.
+
+**Background maintenance**
+- **CacheReclaimer / CacheGarbageCollector / MigrationManager**: handle capacity reclaim, stale-metadata cleanup, and hot/cold tier migration in the background, all asynchronously and off the foreground path.
+
+**Configuration, infrastructure, and ecosystem**
+- **RegistryManager / LeaderElector**: store instance, quota, and storage configs and handle active-standby election and failover.
+- **event / metrics / protocol / common**: provide the event bus, metrics, protocol contracts, logging, Redis, request context, and other shared infrastructure.
+- **client / py_connector / client_java / manager_client**: connect inference engines to KVCM for metadata queries; `client` and `py_connector` also handle KVCache data transfer, so choose the client that fits the engine and language.
+- **optimizer / HiSim / kvcm_ops**: optimizer replays traces for policy and capacity planning, HiSim simulates inference on CPU, and kvcm_ops manages storage, instance groups, and cluster state.
+
+### How a read/write works
+
+1. **Read**: the engine asks KVCM for the locations of matching KVCache, then loads the data directly through the data-plane `TransferClient`; KVCM never carries the payload.
+2. **Write**: the engine reserves a write location, writes the data, and confirms completion; only confirmed blocks become visible to later reads.
+
+For more details, see the [documentation index](docs/README.md).
 
 If you want to learn more about the detailed design of Manager, refer to: [Alibaba Cloud Tair KVCache Manager: Architecture Design and Implementation of Enterprise-level Global KVCache Management Service](https://mp.weixin.qq.com/s/apZIaiI5zazumEYNQHTdHg)
 
 **Tair KVCache Manager Client/Connector**
 
-Uses a unified transmission library to support KVCache transmission for multiple inference engines and storage backends. Currently supports engines such as vLLM, SGLang, RTP-LLM, TRT-LLM, etc.
+A unified transfer library supports KVCache transfer for multiple inference engines and storage backends. It currently supports vLLM, SGLang, RTP-LLM, and TRT-LLM, with C++, Python, and Java client options.
 
 ## Tair KVCache HiSim
 
