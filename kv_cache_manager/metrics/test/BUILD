@@ -74,6 +74,7 @@ cc_test(
     linkstatic = True,
     deps = [
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config:leader_elector_base",
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:node_status_metrics",
         "//kv_cache_manager/metrics:prometheus_exporter",

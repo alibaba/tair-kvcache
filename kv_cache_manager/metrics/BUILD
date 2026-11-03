@@ -84,6 +84,7 @@ cc_library(
     ],
     deps = [
         ":metrics_registry",
+        "//kv_cache_manager/config:leader_elector_base",
     ],
 )
 

@@ -348,3 +348,10 @@ Optimizer 作为客户端通过 `ServiceDiscoveryFactory` 获取 KVCM seed endpo
 不改变请求准入、业务连接或存储状态。发布前重新检查目标和节点角色。
 相同 URI 每轮只探测一次；相同组/host/port 的多个 DB/认证配置全部通过才汇报健康。
 停机先取消后续探测，原有停服与释放 leader 流程完成后再等待探测线程退出。
+
+### 选主阶段指标
+
+`service::Server` 使用独立轻量循环读取 `config::LeaderElector::GetRoleState()` 的原子状态，
+交由 `metrics::NodeStatusMetrics` 发布 `role_state{state="..."}` 的四条固定序列。
+采集不进入业务调用链、不持指标生命周期锁、不访问网络，因此普通指标采集或恢复/清理阻塞时
+仍可观察阶段；服务关闭时停止该采集线程。原有 `is_leader` 采集与业务门禁不变。

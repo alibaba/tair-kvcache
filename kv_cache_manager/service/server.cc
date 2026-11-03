@@ -22,6 +22,7 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_reporter_factory.h"
+#include "kv_cache_manager/metrics/node_status_metrics.h"
 #include "kv_cache_manager/metrics/redis_health_metrics.h"
 #include "kv_cache_manager/service/admin_service_impl.h"
 #include "kv_cache_manager/service/command_line.h"
@@ -512,6 +513,17 @@ bool Server::StartMetricsReportThread() {
     metrics_report_thread_ = LoopThread::CreateLoopThread(
         std::bind(&MetricsReporter::ReportInterval, metrics_reporter_), config_.metrics_report_interval_ms() * 1000);
     std::weak_ptr<LeaderElector> weak_elector = leader_elector_;
+    // Phase reporting must remain live while recovery, cleanup or capacity
+    // collection is waiting. GetRoleState only loads an existing atomic.
+    role_state_metrics_thread_ = LoopThread::CreateLoopThread(
+        [registry = metrics_registry_, weak_elector]() {
+            if (const auto elector = weak_elector.lock()) {
+                NodeStatusMetrics::PublishRoleState(registry, elector->GetRoleState());
+            }
+        },
+        config_.metrics_report_interval_ms() * 1000,
+        "role_state",
+        true);
     auto active = [weak_elector]() {
         const auto elector = weak_elector.lock();
         return elector && elector->IsLeader();
@@ -579,6 +591,9 @@ void Server::Stop() {
     }
     if (redis_health_thread_) {
         redis_health_thread_->Stop();
+    }
+    if (role_state_metrics_thread_) {
+        role_state_metrics_thread_->Stop();
     }
     KVCM_LOG_INFO("admin http server stopped.");
     KVCM_LOG_INFO("kvcm server stopped, goodbye!");

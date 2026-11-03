@@ -42,6 +42,7 @@ cc_library(
         "//kv_cache_manager/metrics:metrics_reporter",
         "//kv_cache_manager/metrics:metrics_reporter_factory",
         "//kv_cache_manager/metrics:redis_health_metrics",
+        "//kv_cache_manager/metrics:node_status_metrics",
         "//kv_cache_manager/metrics:prometheus_exporter",
         "//kv_cache_manager/service/grpc_service",
         "//kv_cache_manager/service/grpc_service:optimizer_event_service_grpc",

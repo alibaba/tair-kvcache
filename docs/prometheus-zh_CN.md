@@ -188,15 +188,48 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `data_storage.writable_status` | gauge | 存储后端写入可用状态（1/0）；只读降级时为 0 |
 | `data_storage.storage_usage_ratio` | gauge | 存储使用率。follower 固定上报 0，切为 follower 时覆盖之前的值；这不代表实际存储为空。leader（或未配置角色信息的调用方）沿用后端返回值，包括默认值 0；若后端返回负值则跳过更新。健康状态及可写状态独立上报，连接异常仍可告警 |
 | `is_leader` | gauge | 本节点是否持有 leader 租约（1/0），导出为 `kvcm_is_leader` |
+| `role_state` | gauge | 选主生命周期阶段，导出为 `kvcm_role_state`；`state` 标签为 `follower`、`promoting`、`leader`、`demoting`，当前采样阶段为 1，其余为 0 |
 | `cache_manager.write_location_expire_size` | gauge | 已过期的写入位置数量 |
 | `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |
 | `cache_manager_instance.byte_size` | gauge | 单实例 KVCM 配额字节大小（不含 EventReport） |
 
-对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开、可提供读取；meta-service 连接异常由 `data_storage.writable_status=0` 表示，此时后端可进入只读模式。可写状态由后台健康探测更新，单次请求超时不代表指标立即变化。超时参数见[配置说明](configuration.md#tairmempool)。
-
 `is_leader` 是无存储标签的节点级指标，表示是否持有 leader 租约（1/0），包含晋升恢复阶段，
 不代表业务 API 已就绪。采集只观察角色状态，不改变请求准入；未安装 leader 状态回调的离线工具不导出该指标。
+
+`role_state` 由独立轻量线程读取 `LeaderElector::GetRoleState()`，周期为
+`kvcm.metrics.report_interval_ms`（默认 20 秒）。不访问网络、不持业务或生命周期锁，
+恢复、清理或普通指标采集阻塞时仍可采样。每轮刷新固定的四条序列，旧阶段归零。
+短于上报/抓取周期的阶段可能采不到；这是当前状态的周期采样，不是状态切换事件记录。
+`is_leader` 保留原有采集路径，两者是独立采样，不是事务性的服务就绪快照。
+`role_state` 直接写入指标注册表，使用 dummy reporter 时也会发布。
+
+晋升期间的输出示例：
+
+```text
+kvcm_role_state{state="follower"} 0
+kvcm_role_state{state="promoting"} 1
+kvcm_role_state{state="leader"} 0
+kvcm_role_state{state="demoting"} 0
+```
+
+检测晋升或降级耗时过长，可使用以下表达式，并设置例如 `for: 5m`，按预期恢复/清理耗时调整：
+
+```promql
+kvcm_role_state{state=~"promoting|demoting"} == 1
+```
+
+筛选同时报告持有租约且处于稳定主节点阶段的节点：
+
+```promql
+(kvcm_is_leader == 1)
+and ignoring(state) (kvcm_role_state{state="leader"} == 1)
+```
+
+该组合不保证请求入口已就绪、所有实例恢复完成或依赖均健康；指标只暴露现有状态机，
+不改变请求准入及选主、恢复、降级行为。
+
+对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开、可提供读取；meta-service 连接异常由 `data_storage.writable_status=0` 表示，此时后端可进入只读模式。可写状态由后台健康探测更新，单次请求超时不代表指标立即变化。超时参数见[配置说明](configuration.md#tairmempool)。
 
 冷启动的 follower 尚未加载存储后端时，不生成存储级指标。节点从 leader 降为 follower 后，已发布的容量指标清零；若存储后端已关闭并移除，其健康及可写指标也清零，避免残留上一次 leader 任期的值。
 

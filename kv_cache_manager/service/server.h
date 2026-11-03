@@ -88,6 +88,7 @@ private:
     std::shared_ptr<MetricsReporterFactory> metrics_reporter_factory_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<LoopThread> metrics_report_thread_;
+    std::shared_ptr<LoopThread> role_state_metrics_thread_;
     std::shared_ptr<RedisHealthMetrics> redis_health_metrics_;
     std::shared_ptr<LoopThread> redis_health_thread_;
 };

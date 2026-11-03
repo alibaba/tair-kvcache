@@ -199,6 +199,7 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `data_storage.writable_status` | gauge | Storage backend write availability (1/0); 0 in read-only mode |
 | `data_storage.storage_usage_ratio` | gauge | Storage usage ratio. Followers publish 0, clearing any previous value on demotion; this does not mean the store is empty. Leaders (or callers without a role provider) preserve backend return values, including a default 0; negative values are skipped. Health and writability are reported independently, preserving connectivity alerts |
 | `is_leader` | gauge | Whether this node holds the leader lease (1/0), exported as `kvcm_is_leader` |
+| `role_state` | gauge | Current leader lifecycle phase, exported as `kvcm_role_state{state="..."}`. The sampled phase is 1 and the other three are 0 |
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |
@@ -208,6 +209,42 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 of the leader lease (1/0), including promotion/recovery, and does not imply that
 business APIs are ready. Reporting only observes role state and does not alter
 request admission. Offline tools without a leader-state provider do not export it.
+
+`role_state` observes `LeaderElector::GetRoleState()` on a separate lightweight thread at
+`kvcm.metrics.report_interval_ms` (20 seconds by default). It performs no network I/O and
+holds no business/lifecycle lock, so a blocked recovery, cleanup or ordinary metrics report
+cannot prevent phase sampling. All four fixed series are refreshed each interval; old
+phases are reset to 0. A phase shorter than the reporting/scraping interval may not be observed.
+This is sampled state, not a transition-event history. `is_leader` keeps its existing reporting
+path; the two metrics are independent observations, not a transactional readiness snapshot.
+`role_state` also works with the dummy reporter because it is published directly into the registry.
+
+Example during promotion:
+
+```text
+kvcm_role_state{state="follower"} 0
+kvcm_role_state{state="promoting"} 1
+kvcm_role_state{state="leader"} 0
+kvcm_role_state{state="demoting"} 0
+```
+
+To detect a prolonged transition, use this alert expression with a `for` duration such as
+`5m`, adjusted to the expected recovery/cleanup time:
+
+```promql
+kvcm_role_state{state=~"promoting|demoting"} == 1
+```
+
+To select nodes reporting both lease ownership and the stable leader phase:
+
+```promql
+(kvcm_is_leader == 1)
+and ignoring(state) (kvcm_role_state{state="leader"} == 1)
+```
+
+This combination does not guarantee request readiness, complete instance recovery or healthy
+dependencies. The metric only exposes the existing state machine; it changes neither admission
+nor election/recovery behavior.
 
 For TairMempool, `healthy_status=1` means the backend is open for reads. A meta-service connectivity failure is reflected by `writable_status=0`, allowing read-only degradation. Writability follows the background health probe rather than changing immediately on a single request timeout.
 
