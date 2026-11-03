@@ -208,6 +208,10 @@ void LocalMetricsReporter::ReportInterval() {
                                 metrics_registry_,
                                 MetricsTags{{"instance_group", instance_group_name}, {"instance_id", instance_id}});
                     SET_METRICS_(p, cache_manager_instance, key_count, static_cast<double>(instance_metric.key_count));
+                    SET_METRICS_(p,
+                                 cache_manager_instance,
+                                 local_key_count,
+                                 static_cast<double>(instance_metric.local_key_count));
                     SET_METRICS_(p, cache_manager_instance, byte_size, static_cast<double>(instance_metric.byte_size));
                     SET_METRICS_(p,
                                  cache_manager_instance,

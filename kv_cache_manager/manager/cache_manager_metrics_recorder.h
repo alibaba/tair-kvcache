@@ -35,6 +35,7 @@ public:
         int64_t async_dropped_metadata_count = 0;
         // Local metadata LRU charge in bytes, using MetaIndexer::GetMemUsage().
         size_t meta_cache_usage = 0;
+        size_t local_key_count = 0;
     };
     using GroupUsageRatioMap = std::map<std::string, double>;
     using GroupInstanceIdMetricMap = std::map<std::string, std::unordered_map<std::string, InstanceMetric>>;

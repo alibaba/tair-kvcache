@@ -203,6 +203,8 @@ public:
     // On success the backend is released so destruction cannot recreate them.
     ErrorCode Retire() noexcept;
     size_t GetKeyCount() const noexcept;
+    // Local container occupancy for monitoring, independent of the persisted logical count.
+    size_t GetLocalKeyCount() const noexcept;
     size_t GetMaxKeyCount() const noexcept;
     size_t GetMemUsage() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;

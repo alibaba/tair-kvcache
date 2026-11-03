@@ -391,6 +391,7 @@ public:
 
     // LRU capacity charge, not process RSS or allocator allocated bytes.
     size_t GetMemUsage() const noexcept override;
+    size_t GetLocalKeyCount() const noexcept override;
     int64_t GetOldestAccessTime() const noexcept override;
     bool GetCacheHashSeed(uint32_t &out_hash_seed) const noexcept;
 

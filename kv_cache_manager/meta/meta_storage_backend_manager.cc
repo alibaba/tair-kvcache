@@ -2271,6 +2271,13 @@ size_t MetaStorageBackendManager::GetMemUsage() const noexcept {
     return usage;
 }
 
+size_t MetaStorageBackendManager::GetLocalKeyCount() const noexcept {
+    if (cache_backend_) {
+        return cache_backend_->GetLocalKeyCount();
+    }
+    return persistent_backend_ ? persistent_backend_->GetLocalKeyCount() : 0;
+}
+
 int64_t MetaStorageBackendManager::GetOldestAccessTime() const noexcept {
     int64_t oldest = INT64_MAX;
     if (persistent_backend_) {

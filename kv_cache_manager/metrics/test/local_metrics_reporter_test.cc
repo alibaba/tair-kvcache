@@ -574,7 +574,7 @@ TEST_F(LocalMetricsReporterTest, TestReportIntervalCacheManagerMetrics) {
     }
 }
 
-TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLifecycle) {
+TEST_F(LocalMetricsReporterTest, InstanceLocalMetadataMetricsTrackEntriesAndLifecycle) {
     // Exercise real local accounting, including the recorder and Prometheus export.
     stub_.reset(ADDR(MetaIndexer, GetMemUsage));
     cache_manager_->meta_indexer_manager_ = std::make_shared<MetaIndexerManager>();
@@ -601,9 +601,12 @@ TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLife
     auto large = cache_manager_->meta_indexer_manager_->GetMetaIndexer("large");
     CacheLocationMapVector locations(1);
     PropertyMapVector small_properties{{{"payload", std::string(128, 'a')}}};
-    PropertyMapVector large_properties{{{"payload", std::string(4096, 'b')}}};
+    PropertyMapVector large_properties(2, {{"payload", std::string(4096, 'b')}});
     ASSERT_EQ(EC_OK, small->Put(&context, {7}, locations, small_properties).ec);
-    ASSERT_EQ(EC_OK, large->Put(&context, {7}, locations, large_properties).ec);
+    locations.resize(2);
+    ASSERT_EQ(EC_OK, large->Put(&context, {7, 8}, locations, large_properties).ec);
+    // Deliberately diverge the persisted logical count from local occupancy.
+    small->key_count_.store(99);
     const auto small_usage = small->GetMemUsage();
     const auto large_usage = large->GetMemUsage();
     ASSERT_GT(small_usage, 0u);
@@ -637,10 +640,25 @@ TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLife
                             "\",instance_id=\"" + id + "\"} " + std::to_string(expected) + "\n";
         EXPECT_NE(output.find(series), std::string::npos) << output;
     };
+    const auto expect_counts = [&](const std::string &id, size_t local_count, size_t logical_count) {
+        const auto output = PrometheusExporter::Expose(*metrics_registry_);
+        const auto series = "kvcm_cache_manager_instance_local_key_count{instance_group=\"" + instance_groups.at(id) +
+                            "\",instance_id=\"" + id + "\"} " + std::to_string(local_count) + "\n";
+        EXPECT_NE(output.find(series), std::string::npos) << output;
+        EXPECT_DOUBLE_EQ(logical_count,
+                         metrics_registry_
+                             ->GetGauge("cache_manager_instance.key_count",
+                                        {{"instance_group", instance_groups.at(id)}, {"instance_id", id}})
+                             .Get());
+    };
     ASSERT_TRUE(sample());
     expect_usage("small", small_usage);
     expect_usage("large", large_usage);
     expect_usage("empty", 0);
+    expect_counts("small", 1, 99);
+    expect_counts("large", 2, 2);
+    expect_counts("empty", 0, 0);
+    EXPECT_DOUBLE_EQ(101, metrics_registry_->GetGauge("meta_indexer.total_key_count").Get());
     EXPECT_DOUBLE_EQ(small_usage + large_usage, metrics_registry_->GetGauge("meta_indexer.total_cache_usage").Get());
     // Metadata-only entries consume local memory without consuming data-storage quota.
     EXPECT_DOUBLE_EQ(
@@ -654,6 +672,10 @@ TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLife
     expect_usage("small", 0);
     expect_usage("large", large_usage);
     expect_usage("empty", 0);
+    expect_counts("small", 0, 98);
+    expect_counts("large", 2, 2);
+    expect_counts("empty", 0, 0);
+    EXPECT_DOUBLE_EQ(100, metrics_registry_->GetGauge("meta_indexer.total_key_count").Get());
 
     cache_manager_->InvalidateInstanceMetrics("small");
     reporter_->ReportInterval();
@@ -665,6 +687,14 @@ TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLife
     }
     expect_usage("large", large_usage);
     expect_usage("empty", 0);
+    const auto local_counts = metrics_registry_->GetMetricsData("cache_manager_instance.local_key_count");
+    ASSERT_NE(nullptr, local_counts);
+    EXPECT_EQ(2u, local_counts->GetSize());
+    for (const auto &[tags, value] : local_counts->GetMetricsValues()) {
+        EXPECT_NE("small", tags.at("instance_id"));
+    }
+    expect_counts("large", 2, 2);
+    expect_counts("empty", 0, 0);
 }
 
 TEST_F(LocalMetricsReporterTest, TestStorageHealthFailureRecoveryAndClose) {

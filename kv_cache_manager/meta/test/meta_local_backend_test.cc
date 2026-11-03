@@ -52,6 +52,7 @@ static_assert(sizeof(LocalItemExtra) <= 16, "cold state must use one compact sid
 
 TEST_F(MetaLocalBackendTest, TestSimple) {
     ASSERT_EQ(ExpectedStorageType(), meta_storage_backend_->GetStorageType());
+    EXPECT_EQ(0u, meta_storage_backend_->GetLocalKeyCount());
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
@@ -60,10 +61,15 @@ TEST_F(MetaLocalBackendTest, TestSimple) {
     ASSERT_EQ(
         (std::vector<ErrorCode>{EC_OK, EC_OK}),
         PutWithFieldMaps(meta_storage_backend_.get(), {1, 2}, {{{PROPERTY_URI, "uri1"}}, {{PROPERTY_URI, "uri2"}}}));
+    EXPECT_EQ(2u, meta_storage_backend_->GetLocalKeyCount());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
+    EXPECT_EQ(2u, meta_storage_backend_->GetLocalKeyCount());
     // Upsert to add hit_count
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
               UpsertWithFieldMaps(
                   meta_storage_backend_.get(), {1, 2}, {{{PROPERTY_HIT_COUNT, "100"}}, {{PROPERTY_HIT_COUNT, "200"}}}));
+    EXPECT_EQ(2u, meta_storage_backend_->GetLocalKeyCount());
 
     AssertExists(meta_storage_backend_.get(), {1, 2, 3}, {EC_OK, EC_OK, EC_OK}, /*is_exist*/ {true, true, false});
     AssertGetProperties(
@@ -76,7 +82,9 @@ TEST_F(MetaLocalBackendTest, TestSimple) {
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, EC_OK, {1, 2});
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete(nullptr, {1}));
+    EXPECT_EQ(1u, meta_storage_backend_->GetLocalKeyCount());
     ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT}), meta_storage_backend_->Delete(nullptr, {1}));
+    EXPECT_EQ(1u, meta_storage_backend_->GetLocalKeyCount());
     ASSERT_EQ(
         (std::vector<ErrorCode>{EC_OK}),
         PutWithFieldMaps(meta_storage_backend_.get(), {3}, {{{PROPERTY_URI, "uri3"}, {PROPERTY_HIT_COUNT, "300"}}}));
@@ -93,8 +101,10 @@ TEST_F(MetaLocalBackendTest, TestSimple) {
                          {{PROPERTY_URI, "uri3"}, {PROPERTY_HIT_COUNT, "300"}}});
     AssertListKeys(meta_storage_backend_.get(), SCAN_BASE_CURSOR, /*limit*/ 3, EC_OK, SCAN_BASE_CURSOR, {2, 3});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, EC_OK, {2, 3});
+    EXPECT_EQ(2u, meta_storage_backend_->GetLocalKeyCount());
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+    EXPECT_EQ(0u, meta_storage_backend_->GetLocalKeyCount());
 }
 
 TEST_F(MetaLocalBackendTest, TestTargetedLocationsPreserveKeyStatus) {

@@ -2094,6 +2094,8 @@ ErrorCode MetaIndexer::SampleReclaimCandidates(RequestContext *request_context,
 
 size_t MetaIndexer::GetKeyCount() const noexcept { return key_count_.load(); }
 
+size_t MetaIndexer::GetLocalKeyCount() const noexcept { return backend_manager_->GetLocalKeyCount(); }
+
 size_t MetaIndexer::GetMaxKeyCount() const noexcept { return max_key_count_; }
 
 size_t MetaIndexer::GetMemUsage() const noexcept { return backend_manager_->GetMemUsage(); }
