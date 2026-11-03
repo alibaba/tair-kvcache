@@ -579,8 +579,7 @@ TEST_F(LocalMetricsReporterTest, FollowerUsageIsZeroAcrossRolesAndStorageStates)
         EXPECT_DOUBLE_EQ(backend->Writable() ? 1.0 : 0.0,
                          metrics_registry_->GetGauge("data_storage.writable_status", tags).Get());
         EXPECT_DOUBLE_EQ(leader ? 1.0 : 0.0, metrics_registry_->GetGauge("is_leader").Get());
-        const double expected_access = !leader || !backend->Available() ? 0.0 : (backend->Writable() ? 2.0 : 1.0);
-        EXPECT_DOUBLE_EQ(expected_access, metrics_registry_->GetGauge("access_mode").Get());
+        EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("access_mode"));
 
         // Check the text exposed by /metrics, including connectivity signals.
         const auto output = PrometheusExporter::Expose(*metrics_registry_);
@@ -657,7 +656,7 @@ TEST_F(LocalMetricsReporterTest, DemotionCleanupClearsPreviouslyPublishedStorage
         reporter_->ReportInterval();
         const auto output = PrometheusExporter::Expose(*metrics_registry_);
         EXPECT_NE(std::string::npos, output.find("kvcm_is_leader 0\n"));
-        EXPECT_NE(std::string::npos, output.find("kvcm_access_mode 0\n"));
+        EXPECT_EQ(std::string::npos, output.find("kvcm_access_mode"));
         for (const auto &name : {"storage_usage_ratio", "healthy_status", "writable_status"}) {
             const auto line = std::string("kvcm_data_storage_") + name +
                               "{type=\"file\",unique_name=\"demoted_store\"} 0\n";
@@ -673,7 +672,7 @@ TEST_F(LocalMetricsReporterTest, DemotionCleanupClearsPreviouslyPublishedStorage
     leader = true;
     reporter_->ReportInterval();
     EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("is_leader").Get());
-    EXPECT_DOUBLE_EQ(2.0, metrics_registry_->GetGauge("access_mode").Get());
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("access_mode"));
     EXPECT_DOUBLE_EQ(0.25, metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
     EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.healthy_status", tags).Get());
     EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.writable_status", tags).Get());
@@ -809,14 +808,10 @@ TEST_F(LocalMetricsReporterTest, TestReportIntervalNodeStatus) {
     registry_manager_->data_storage_manager_->storage_map_.emplace("node_status", backend);
 
     const auto is_leader_gauge = [&]() { return metrics_registry_->GetGauge(NodeStatusMetrics::kIsLeaderName).Get(); };
-    const auto access_mode_gauge = [&]() {
-        return metrics_registry_->GetGauge(NodeStatusMetrics::kAccessModeName).Get();
-    };
-
     // no provider installed: the node-level gauges stay unregistered
     reporter_->ReportInterval();
     EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData(NodeStatusMetrics::kIsLeaderName));
-    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData(NodeStatusMetrics::kAccessModeName));
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("access_mode"));
 
     bool leader = false;
     reporter_->SetLeaderStateProvider([&leader]() { return leader; });
@@ -824,25 +819,25 @@ TEST_F(LocalMetricsReporterTest, TestReportIntervalNodeStatus) {
     // a follower serves no data plane request even with a healthy backend
     reporter_->ReportInterval();
     EXPECT_DOUBLE_EQ(0.0, is_leader_gauge());
-    EXPECT_DOUBLE_EQ(0.0, access_mode_gauge());
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("access_mode"));
 
     leader = true;
     reporter_->ReportInterval();
     EXPECT_DOUBLE_EQ(1.0, is_leader_gauge());
-    EXPECT_DOUBLE_EQ(2.0, access_mode_gauge());
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("access_mode"));
 
     backend->SetAvailable(false);
     reporter_->ReportInterval();
     EXPECT_DOUBLE_EQ(1.0, is_leader_gauge());
-    EXPECT_DOUBLE_EQ(0.0, access_mode_gauge());
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("access_mode"));
 
     leader = false;
     backend->SetAvailable(true);
     reporter_->ReportInterval();
     EXPECT_DOUBLE_EQ(0.0, is_leader_gauge());
-    EXPECT_DOUBLE_EQ(0.0, access_mode_gauge());
+    EXPECT_EQ(nullptr, metrics_registry_->GetMetricsData("access_mode"));
 
     const auto output = PrometheusExporter::Expose(*metrics_registry_);
     EXPECT_NE(std::string::npos, output.find("kvcm_is_leader 0"));
-    EXPECT_NE(std::string::npos, output.find("kvcm_access_mode 0"));
+    EXPECT_EQ(std::string::npos, output.find("kvcm_access_mode"));
 }

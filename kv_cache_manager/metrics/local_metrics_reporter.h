@@ -17,7 +17,7 @@ public:
     std::shared_ptr<MetricsRegistry> GetMetricsRegistry() override;
 
 protected:
-    // Publishes kvcm_is_leader and kvcm_access_mode. Does nothing until
+    // Publishes kvcm_is_leader. Does nothing until
     // a role snapshot is provided; callers must hold the metrics lifecycle
     // lock and guarantee cache_manager_ is non-null.
     void PublishNodeStatus(std::optional<bool> is_leader);

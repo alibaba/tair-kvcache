@@ -342,8 +342,9 @@ Optimizer 作为客户端通过 `ServiceDiscoveryFactory` 获取 KVCM seed endpo
 
 ### 元数据 Redis 健康指标
 
-`service::Server` 将 leader 已加载的 InstanceGroup 元数据 Redis 配置提供给
-`metrics::RedisHealthMetrics`。独立循环线程使用有连接和 socket 超时的探测，按组发布
-`meta_storage.redis_healthy_status`，每轮对相同 URI 去重。探测不使用元数据业务连接，
-不改变请求准入。网络 I/O 在指标生命周期锁外执行；发布前在锁内重新核对组配置和节点角色，
-防止组删除或角色切换后重新发布过期探测结果。
+`service::Server` 将 leader 已加载组配置与现存 `MetaIndexer` 的实际初始化配置提供给
+`metrics::RedisHealthMetrics`，避免组配置更新后漏掉业务仍在使用的 Redis。
+只读快照使用 try-lock，锁忙时跳过；网络探测使用独立线程和连接，不持有业务或指标生命周期锁，
+不改变请求准入、业务连接或存储状态。发布前重新检查目标和节点角色。
+相同 URI 每轮只探测一次；相同组/host/port 的多个 DB/认证配置全部通过才汇报健康。
+停机先取消后续探测，原有停服与释放 leader 流程完成后再等待探测线程退出。

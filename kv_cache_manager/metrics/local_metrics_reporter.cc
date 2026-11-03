@@ -45,12 +45,7 @@ void LocalMetricsReporter::PublishNodeStatus(std::optional<bool> is_leader) {
         return;
     }
 
-    std::shared_ptr<DataStorageManager> data_storage_manager;
-    const auto registry_manager = cache_manager_->GetRegistryManager();
-    if (registry_manager) {
-        data_storage_manager = registry_manager->data_storage_manager();
-    }
-    NodeStatusMetrics::Publish(metrics_registry_, *is_leader, data_storage_manager);
+    NodeStatusMetrics::Publish(metrics_registry_, *is_leader);
 }
 
 void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed) {

@@ -28,7 +28,7 @@ public:
 
     // Answers "does this node currently hold the leader lease". The server
     // installs it once at startup; reporters that publish the node-level
-    // is_leader / access_mode gauges stay silent while it is unset, which
+    // is_leader gauge stays silent while it is unset, which
     // keeps the optimizer and existing unit tests free of extra series.
     using LeaderStateProvider = std::function<bool()>;
     void SetLeaderStateProvider(LeaderStateProvider provider) { leader_state_provider_ = std::move(provider); }

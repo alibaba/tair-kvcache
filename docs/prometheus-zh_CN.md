@@ -188,7 +188,6 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `data_storage.writable_status` | gauge | 存储后端写入可用状态（1/0）；只读降级时为 0 |
 | `data_storage.storage_usage_ratio` | gauge | 存储使用率。follower 固定上报 0，切为 follower 时覆盖之前的值；这不代表实际存储为空。leader（或未配置角色信息的调用方）沿用后端返回值，包括默认值 0；若后端返回负值则跳过更新。健康状态及可写状态独立上报，连接异常仍可告警 |
 | `is_leader` | gauge | 本节点是否持有 leader 租约（1/0），导出为 `kvcm_is_leader` |
-| `access_mode` | gauge | 本节点当前可提供的读写能力（0/1/2），导出为 `kvcm_access_mode` |
 | `cache_manager.write_location_expire_size` | gauge | 已过期的写入位置数量 |
 | `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |
@@ -196,11 +195,8 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 
 对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开、可提供读取；meta-service 连接异常由 `data_storage.writable_status=0` 表示，此时后端可进入只读模式。可写状态由后台健康探测更新，单次请求超时不代表指标立即变化。超时参数见[配置说明](configuration.md#tairmempool)。
 
-`is_leader` 与 `access_mode` 是节点级指标，不带 `type` / `unique_name` 标签。所有数据面 API 都是 leader-only，
-因此 follower 的 `access_mode` 恒为 0。leader 的取值取决于已注册存储后端的聚合能力：只要有一个后端
-`Available()` 就具备读能力，此时 `access_mode` 至少为 1；还要有一个后端 `Writable()` 才具备写能力，此时为 2；
-没有任何可用后端时为 0。存储进入只读降级（`data_storage.writable_status` 为 0 而 `healthy_status` 为 1）时，
-leader 的 `access_mode` 为 1。这两个指标由周期性上报线程发布，未安装 leader 状态回调的离线工具不会导出它们。
+`is_leader` 是无存储标签的节点级指标，表示是否持有 leader 租约（1/0），包含晋升恢复阶段，
+不代表业务 API 已就绪。采集只观察角色状态，不改变请求准入；未安装 leader 状态回调的离线工具不导出该指标。
 
 冷启动的 follower 尚未加载存储后端时，不生成存储级指标。节点从 leader 降为 follower 后，已发布的容量指标清零；若存储后端已关闭并移除，其健康及可写指标也清零，避免残留上一次 leader 任期的值。
 
@@ -282,11 +278,15 @@ Prometheus 端点从中读取。
 连接及每次 socket I/O 超时均为 1 秒，不重试、不写入业务数据。相同 URI 的组每轮共享一次探测结果。
 它不会阻塞 `/metrics`、容量采集或占用业务连接池；多 Redis 目标按顺序探测，故障时一轮可能超过配置周期。
 标签包含 `instance_group`、`host` 和 `port`；地址取自配置中的 Redis URI，域名不解析成 IP。
-不暴露完整 URI、认证信息或 query 参数。地址变更时移除旧地址的序列。
+不暴露完整 URI、认证信息或 query 参数。探测目标包含组的当前配置和已有实例实际初始化时的配置：
+更新组配置不会重连已有实例，因此仍被使用的旧地址和新地址会同时受到监控。
+同一组/host/port 对应多个 DB 或认证配置时，全部探测成功才汇报 1；不再使用的旧地址序列才会移除。
 
-仅 leader 对已加载的组发布该指标。首次探测完成前、非 Redis 组、follower 均不发布；组被删除、
-更换 Redis 配置或节点降为 follower 后，旧序列在探测线程下一次检查时移除，不能把缺失解释为健康。
-本指标不改变 `kvcm_access_mode`，也不代表 Redis 业务读写权限、容量、数据完整性或所有分片均正常，
+仅 leader 发布该指标。首次探测完成前、既无配置也无运行时 Redis 依赖的组、follower 均不发布；
+最后一个依赖被移除或节点降为 follower 后，旧序列在探测线程下一次检查时移除，不能把缺失解释为健康。
+注册表、索引器或生命周期锁忙时跳过采集/发布，不等待、不将忙误报为故障；网络 I/O 不持有这些锁。
+停机先取消后续探测，原有停服和释放 leader 流程完成后再等待正在进行的探测线程退出。
+本指标不改变请求准入，也不代表 Redis 业务读写权限、容量、数据完整性或所有分片均正常，
 不覆盖 Registry / Coordination Redis。
 
 告警示例（仅适用于预期由 leader 发布的序列；缺失应另设告警）：

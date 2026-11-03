@@ -84,7 +84,6 @@ cc_library(
     ],
     deps = [
         ":metrics_registry",
-        "//kv_cache_manager/data_storage:data_storage",
     ],
 )
 
@@ -137,6 +136,8 @@ cc_library(
         ":metrics_lifecycle",
         ":metrics_registry",
         "//kv_cache_manager/common:standard_uri",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/meta:meta_indexer_manager",
         "@hiredis",
     ],
 )

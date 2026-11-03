@@ -5,6 +5,9 @@
 #include <utility>
 
 #include "kv_cache_manager/common/standard_uri.h"
+#include "kv_cache_manager/config/instance_group.h"
+#include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -18,13 +21,15 @@ MetricsTags RedisMetricTags(const std::string &group, const std::string &uri) {
 } // namespace
 
 RedisHealthMetrics::RedisHealthMetrics(std::shared_ptr<MetricsRegistry> registry,
-                                     std::shared_ptr<MetricsLifecycle> lifecycle,
-                                     TargetProvider targets,
-                                     Probe probe)
+                                       std::shared_ptr<MetricsLifecycle> lifecycle,
+                                       TargetProvider targets,
+                                       Probe probe,
+                                       std::function<bool()> active)
     : registry_(std::move(registry))
     , lifecycle_(std::move(lifecycle))
     , targets_(std::move(targets))
-    , probe_(std::move(probe)) {}
+    , probe_(std::move(probe))
+    , active_(std::move(active)) {}
 
 std::optional<std::string> RedisHealthMetrics::RedisUri(const std::string &storage_type,
                                                       const std::string &storage_uri) {
@@ -94,11 +99,50 @@ bool RedisHealthMetrics::ProbeRedis(const std::string &uri, int timeout_ms) {
     return true;
 }
 
-void RedisHealthMetrics::RemoveStale(const Targets &targets) {
+std::optional<RedisHealthMetrics::Targets> RedisHealthMetrics::CollectTargets(const RegistryManager &registry,
+                                                                              const MetaIndexerManager &indexers) {
+    const auto config = registry.TryGetMetricsSnapshot();
+    const auto runtime = indexers.TryGetStorageBackendConfigs();
+    if (!config || !runtime) {
+        return std::nullopt;
+    }
+    Targets targets;
+    for (const auto &group : config->groups) {
+        const auto cache = group->cache_config();
+        if (!cache || !cache->meta_indexer_config()) {
+            continue;
+        }
+        const auto backend = cache->meta_indexer_config()->GetMetaStorageBackendConfig();
+        if (backend) {
+            if (const auto uri = RedisUri(backend->GetStorageType(), backend->GetStorageUri())) {
+                targets.emplace(group->name(), *uri);
+            }
+        }
+    }
+    for (const auto &[id, backend] : *runtime) {
+        const auto group = config->instance_groups.find(id);
+        if (group != config->instance_groups.end()) {
+            if (const auto uri = RedisUri(backend.first, backend.second)) {
+                targets.emplace(group->second, *uri);
+            }
+        }
+    }
+    return targets;
+}
+
+RedisHealthMetrics::Series RedisHealthMetrics::GroupByLabels(const Targets &targets) {
+    Series series;
+    for (const auto &[group, uri] : targets) {
+        series[RedisMetricTags(group, uri)].insert(uri);
+    }
+    return series;
+}
+
+void RedisHealthMetrics::RemoveStale(const Series &targets) {
     for (auto it = published_.begin(); it != published_.end();) {
         const auto target = targets.find(it->first);
         if (target == targets.end() || target->second != it->second) {
-            registry_->Remove(kMetricName, RedisMetricTags(it->first, it->second));
+            registry_->Remove(kMetricName, it->first);
             it = published_.erase(it);
         } else {
             ++it;
@@ -107,31 +151,73 @@ void RedisHealthMetrics::RemoveStale(const Targets &targets) {
 }
 
 void RedisHealthMetrics::Report() {
-    Targets snapshot;
+    if (stopped_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    Series snapshot;
     {
-        std::shared_lock lock(lifecycle_->mut_);
-        snapshot = targets_();
+        std::shared_lock lock(lifecycle_->mut_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            return;
+        }
+        const auto targets = targets_();
+        if (!targets) {
+            return;
+        }
+        snapshot = GroupByLabels(*targets);
         RemoveStale(snapshot);
     }
-    // Deduplicate groups sharing the same endpoint/auth/DB configuration in this cycle.
+    // All network work uses private connections outside business/lifecycle locks.
+    // Snapshot the indexer/registry maps only twice per cycle, not per endpoint.
     std::map<std::string, bool> results;
-    for (const auto &[group, uri] : snapshot) {
-        if (results.find(uri) == results.end()) {
-            results.emplace(uri, probe_(uri));
-        }
-        // Do not hold the lifecycle lock during network I/O. Revalidate before
-        // publication so removal, config replacement or demotion cannot revive
-        // a series using an obsolete probe result.
-        std::shared_lock lock(lifecycle_->mut_);
-        const auto current = targets_();
-        RemoveStale(current);
-        const auto target = current.find(group);
-        if (target != current.end() && target->second == uri) {
-            registry_->GetGauge(kMetricName, RedisMetricTags(group, uri)) = results.at(uri) ? 1.0 : 0.0;
-            published_[group] = uri;
-        }
-        if (current.empty()) {
+    for (const auto &[tags, uris] : snapshot) {
+        if (!active_()) {
             break;
+        }
+        for (const auto &uri : uris) {
+            if (stopped_.load(std::memory_order_relaxed)) {
+                return;
+            }
+            if (!active_()) {
+                break;
+            }
+            if (results.find(uri) == results.end()) {
+                results.emplace(uri, probe_(uri));
+            }
+        }
+    }
+    if (stopped_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::shared_lock lock(lifecycle_->mut_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return;
+    }
+    const auto targets = targets_();
+    if (!targets) {
+        return;
+    }
+    const auto current = GroupByLabels(*targets);
+    RemoveStale(current);
+    for (const auto &[tags, uris] : snapshot) {
+        const auto target = current.find(tags);
+        if (target == current.end() || target->second != uris) {
+            continue;
+        }
+        bool complete = true;
+        bool healthy = true;
+        for (const auto &uri : uris) {
+            const auto result = results.find(uri);
+            if (result == results.end()) {
+                complete = false;
+                break;
+            }
+            // A shared host/port is healthy only if every live DB/auth setting is.
+            healthy = healthy && result->second;
+        }
+        if (complete) {
+            registry_->GetGauge(kMetricName, tags) = healthy ? 1.0 : 0.0;
+            published_[tags] = uris;
         }
     }
 }

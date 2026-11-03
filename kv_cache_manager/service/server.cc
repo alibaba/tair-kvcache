@@ -512,32 +512,24 @@ bool Server::StartMetricsReportThread() {
     metrics_report_thread_ = LoopThread::CreateLoopThread(
         std::bind(&MetricsReporter::ReportInterval, metrics_reporter_), config_.metrics_report_interval_ms() * 1000);
     std::weak_ptr<LeaderElector> weak_elector = leader_elector_;
-    auto targets = [registry = registry_manager_, weak_elector]() {
-        RedisHealthMetrics::Targets result;
+    auto active = [weak_elector]() {
         const auto elector = weak_elector.lock();
-        if (!elector || !elector->IsLeader()) {
-            return result;
-        }
-        const auto [ec, groups] = registry->ListInstanceGroup(nullptr);
-        if (ec != EC_OK) {
-            return result;
-        }
-        for (const auto &group : groups) {
-            const auto cache = group->cache_config();
-            if (!cache || !cache->meta_indexer_config()) {
-                continue;
-            }
-            const auto config = cache->meta_indexer_config()->GetMetaStorageBackendConfig();
-            if (config) {
-                const auto uri = RedisHealthMetrics::RedisUri(config->GetStorageType(), config->GetStorageUri());
-                if (uri) {
-                    result.emplace(group->name(), *uri);
-                }
-            }
-        }
-        return result;
+        return elector && elector->IsLeader();
     };
-    redis_health_metrics_ = std::make_shared<RedisHealthMetrics>(metrics_registry_, metrics_lifecycle_, std::move(targets));
+    auto targets = [registry = registry_manager_,
+                    indexers = cache_manager_->meta_indexer_manager(),
+                    active]() -> std::optional<RedisHealthMetrics::Targets> {
+        if (!active()) {
+            return RedisHealthMetrics::Targets{};
+        }
+        return RedisHealthMetrics::CollectTargets(*registry, *indexers);
+    };
+    redis_health_metrics_ = std::make_shared<RedisHealthMetrics>(
+        metrics_registry_,
+        metrics_lifecycle_,
+        std::move(targets),
+        [](const std::string &uri) { return RedisHealthMetrics::ProbeRedis(uri); },
+        std::move(active));
     redis_health_thread_ = LoopThread::CreateLoopThread(
         [metrics = redis_health_metrics_]() { metrics->Report(); },
         config_.metrics_report_interval_ms() * 1000,
@@ -554,7 +546,7 @@ void Server::Stop() {
     stop_ = true;
     KVCM_LOG_INFO("server stopping...");
     if (redis_health_thread_) {
-        redis_health_thread_->Stop();
+        redis_health_metrics_->RequestStop();
     }
     // Lifecycle callbacks need the service gates and managers to remain alive.
     if (leader_elector_) {
@@ -584,6 +576,9 @@ void Server::Stop() {
     if (metrics_report_thread_) {
         metrics_report_thread_->Stop();
         KVCM_LOG_INFO("metrics reporter stopped.");
+    }
+    if (redis_health_thread_) {
+        redis_health_thread_->Stop();
     }
     KVCM_LOG_INFO("admin http server stopped.");
     KVCM_LOG_INFO("kvcm server stopped, goodbye!");

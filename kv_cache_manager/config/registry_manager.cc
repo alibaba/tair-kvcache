@@ -840,4 +840,19 @@ std::string RegistryManager::GetInstanceGroupName(const std::string &instance_id
     return "";
 }
 
+std::optional<RegistryManager::MetricsSnapshot> RegistryManager::TryGetMetricsSnapshot() const {
+    std::shared_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return std::nullopt;
+    }
+    MetricsSnapshot snapshot;
+    for (const auto &[name, group] : instance_group_configs_) {
+        snapshot.groups.push_back(group);
+    }
+    for (const auto &[id, info] : instance_infos_) {
+        snapshot.instance_groups.emplace(id, info->instance_group_name());
+    }
+    return snapshot;
+}
+
 } // namespace kv_cache_manager

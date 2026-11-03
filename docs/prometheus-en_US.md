@@ -199,23 +199,15 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `data_storage.writable_status` | gauge | Storage backend write availability (1/0); 0 in read-only mode |
 | `data_storage.storage_usage_ratio` | gauge | Storage usage ratio. Followers publish 0, clearing any previous value on demotion; this does not mean the store is empty. Leaders (or callers without a role provider) preserve backend return values, including a default 0; negative values are skipped. Health and writability are reported independently, preserving connectivity alerts |
 | `is_leader` | gauge | Whether this node holds the leader lease (1/0), exported as `kvcm_is_leader` |
-| `access_mode` | gauge | Read/write capability this node can currently offer (0/1/2), exported as `kvcm_access_mode` |
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |
 | `cache_manager_instance.byte_size` | gauge | Per-instance KVCM quota bytes (excluding EventReport) |
 
-`is_leader` and `access_mode` are node-level metrics and carry no `type` /
-`unique_name` labels. Every data-plane API is leader-only, so `access_mode` is
-always 0 on a follower. On the leader the value reflects the aggregated
-capability of the registered storage backends: at least one backend reporting
-`Available()` gives read capability, so `access_mode` is at least 1, and at least
-one backend reporting `Writable()` also gives write capability, making it 2. It
-is 0 when no backend is available. When storage degrades to read-only
-(`data_storage.writable_status` is 0 while `healthy_status` is 1), the leader
-reports `access_mode` 1. Both metrics are published by the periodic reporting
-thread, so offline tools that never install a leader state callback do not
-export them.
+`is_leader` is a node-level metric without storage labels. It reports ownership
+of the leader lease (1/0), including promotion/recovery, and does not imply that
+business APIs are ready. Reporting only observes role state and does not alter
+request admission. Offline tools without a leader-state provider do not export it.
 
 For TairMempool, `healthy_status=1` means the backend is open for reads. A meta-service connectivity failure is reflected by `writable_status=0`, allowing read-only degradation. Writability follows the background health probe rather than changing immediately on a single request timeout.
 
@@ -295,13 +287,19 @@ plus probe duration). Connect and each socket operation have a 1-second timeout,
 Groups sharing the same URI share a probe per cycle. Probing does not block `/metrics`, capacity collection,
 or use the business connection pool. Targets are checked sequentially, so failures can lengthen a cycle.
 Labels are `instance_group`, `host` and `port`, using the configured Redis endpoint without resolving
-hostnames to IP addresses. Full URIs, credentials and query parameters are not exposed. Endpoint changes
-remove the old endpoint series.
+hostnames to IP addresses. Full URIs, credentials and query parameters are not exposed.
+Targets include both loaded group configurations and the immutable configuration of existing
+instances. Updating a group does not reconnect existing instances, so both old and new endpoints
+remain monitored while needed. When a group/host/port has multiple live database or authentication
+settings, its gauge is 1 only if all of them pass. Unused old endpoint series are removed.
 
 Only the leader publishes probes for loaded groups. No series is published before the first probe, for
-non-Redis groups, or on followers. Deleted groups, replaced Redis configurations and demotion remove old
-series at the next probe-thread check. Absence does not imply health. This metric does not change
-`kvcm_access_mode`, verify business read/write permissions, capacity, data integrity or all Redis shards, or cover
+groups with no configured or runtime Redis dependency, or on followers. Removing the last dependency
+or demotion removes its series at the next probe-thread check. Busy registry, indexer or lifecycle
+locks skip collection/publication without waiting or inventing a failure. Network I/O holds none
+of those locks. Shutdown cancels further probes and stops serving/releases leadership before
+joining the outstanding probe thread. Absence does not imply health. This metric does not change request admission or verify business read/write permissions,
+capacity, data integrity or all Redis shards, or cover
 Registry / Coordination Redis.
 
 Example alert (for expected leader series; alert on absence separately):
