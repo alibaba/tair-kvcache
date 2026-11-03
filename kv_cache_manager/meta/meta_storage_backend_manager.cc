@@ -475,7 +475,7 @@ bool MetaStorageBackendManager::EnsureKeyInCache(RequestContext *request_context
         }
         return false;
     }
-    bool hydrated = true;
+    bool fill_succeeded = true;
     KeyTypeVec missing_keys;
     std::vector<size_t> missing_indices;
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -484,7 +484,7 @@ bool MetaStorageBackendManager::EnsureKeyInCache(RequestContext *request_context
                 return false;
             }
             (*out_results)[i] = exists_results[i];
-            hydrated = false;
+            fill_succeeded = false;
             continue;
         }
         if (exists_results[i] == EC_NOENT || !exists_vec[i]) {
@@ -493,10 +493,10 @@ bool MetaStorageBackendManager::EnsureKeyInCache(RequestContext *request_context
         }
     }
     // A deleted key may still exist in async Redis until its queued DEL runs.
-    // Treat it as new instead of hydrating old fields or waiting on the queue.
+    // Treat it as new instead of filling the cache with old fields or waiting on the queue.
     FilterRecoverFallbackKeys(missing_keys, missing_indices);
     if (missing_keys.empty()) {
-        return hydrated;
+        return fill_succeeded;
     }
 
     CacheLocationMapVector locations;
@@ -544,10 +544,10 @@ bool MetaStorageBackendManager::EnsureKeyInCache(RequestContext *request_context
             if (out_results) {
                 (*out_results)[missing_indices[i]] = get_results[i] == EC_OK ? put_results[i] : get_results[i];
             }
-            hydrated = false;
+            fill_succeeded = false;
         }
     }
-    return hydrated;
+    return fill_succeeded;
 }
 
 int64_t MetaStorageBackendManager::BackfillKeysToCache(const KeyTypeVec &keys,
@@ -669,8 +669,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
 
     const WriteRoute route =
         GetWriteRoute(memory_primary_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning);
-    // Upsert may touch only a subset of fields, so Recover-time hydration
-    // is needed to avoid overwriting unmentioned fields with empty values.
+    // Upsert may touch only a subset of fields, so missing Recover keys must
+    // be filled first to avoid overwriting unmentioned fields with empty values.
     if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
         if (!EnsureKeyInCache(request_context, keys)) {
             return std::vector<ErrorCode>(keys.size(), EC_ERROR);
@@ -843,7 +843,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
 
     const WriteRoute route =
         GetWriteRoute(memory_primary_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning);
-    // Partial-delete during Recover: hydrate cache from persistent first so
+    // Partial-delete during Recover: fill cache from persistent first so
     // the conditional mirror write below has the full pre-restart field set
     // to delete against (and async backfill cannot later overwrite us).
     if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
@@ -1583,7 +1583,7 @@ MetaStorageBackendManager::GetLocationsForMaintenance(RequestContext *request_co
     }
 
     // The caller's shard lock serializes ordinary writes and target validation.
-    // A hot key was restored or hydrated as a complete key; neither missing
+    // A hot key was restored or filled as a complete key; neither missing
     // keys nor missing targets may fall back to queued Redis snapshots here.
     auto results = cache_backend_->GetLocationsForMaintenance(request_context, keys, location_ids, out_locations);
     if (results.size() != keys.size() || out_locations.size() != keys.size()) {

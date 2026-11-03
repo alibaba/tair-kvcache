@@ -69,7 +69,7 @@ struct CacheLocationDelRequest {
     // cleanup must remove only KVCM metadata and never call the URI backend.
     bool metadata_only{false};
     // GC prefilters candidates against the configured primary outside the
-    // shard lock. Cached CAS then validates hot, hydrating only missing
+    // shard lock. Cached CAS then validates hot, filling only missing
     // Recover keys; it never overwrites an existing hot key.
     bool authoritative_read{false};
     // URIs that the submitter has already confirmed absent. Each Backend's

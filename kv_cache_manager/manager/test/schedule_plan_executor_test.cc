@@ -2673,7 +2673,7 @@ TEST_F(SchedulePlanExecutorTest, TestLocationRefreshWinsBeforeConditionalAsyncAd
     EXPECT_EQ(CacheLocationStatus::CLS_SERVING, location_maps.front().at(location_ids.front())->status());
 }
 
-TEST_F(SchedulePlanExecutorTest, TestGcAdmissionOnlyHydratesRecoverMissingKeysAndNeverDeletesSkippedTargets) {
+TEST_F(SchedulePlanExecutorTest, TestGcAdmissionOnlyFillsRecoverMissingKeysAndNeverDeletesSkippedTargets) {
     for (const std::string scenario : {"recover_missing", "recover_deleted", "running_missing",
                                         "recover_target_missing", "recover_target_changed"}) {
         SCOPED_TRACE(scenario);

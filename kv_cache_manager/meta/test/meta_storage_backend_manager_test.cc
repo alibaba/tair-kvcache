@@ -524,7 +524,7 @@ public:
     bool fail_reads = false;
 };
 
-class PartialHydrationFailureBackend : public DeferredRecoverPersistentBackend {
+class PartialFillFailureBackend : public DeferredRecoverPersistentBackend {
 public:
     std::vector<ErrorCode> Get(RequestContext *ctx,
                                const KeyTypeVec &keys,
@@ -1440,7 +1440,7 @@ TEST_F(MetaStorageBackendManagerTest, TestMalformedCacheReadShapesFailClosed) {
     EXPECT_EQ((std::vector<bool>{false, false}), exists);
 }
 
-TEST_F(MetaStorageBackendManagerTest, TestRecoverHydrationMalformedShapesFailClosed) {
+TEST_F(MetaStorageBackendManagerTest, TestRecoverFillMalformedShapesFailClosed) {
     const KeyVector keys{1, 2};
 
     MetaStorageBackendManager malformed_exists;
@@ -2008,7 +2008,7 @@ TEST_F(MetaStorageBackendManagerTest, TestMaintenanceScanUsesCacheWithoutPersist
     ASSERT_TRUE(authoritative_locations.front().count("loc_777") > 0);
 
     // An authoritative read remains side-effect free. Ordinary GC also leaves
-    // Running cache misses alone instead of hydrating Redis-only metadata.
+    // Running cache misses alone instead of filling the cache from Redis-only metadata.
     cache_exists.clear();
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, {777}, cache_exists));
     EXPECT_EQ((std::vector<bool>{false}), cache_exists);
@@ -2305,7 +2305,7 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverTombstoneDoesNotHideHotReadFail
     EXPECT_FALSE(mgr.EnsureKeyInCache(nullptr, {895}));
 }
 
-TEST_F(MetaStorageBackendManagerTest, TestGcHydrationNeverOverwritesExistingHotKey) {
+TEST_F(MetaStorageBackendManagerTest, TestGcFillNeverOverwritesExistingHotKey) {
     for (const bool memory_primary : {false, true}) {
         SCOPED_TRACE(memory_primary);
         MetaStorageBackendManager mgr;
@@ -2348,7 +2348,7 @@ TEST_F(MetaStorageBackendManagerTest, TestGcHydrationNeverOverwritesExistingHotK
     }
 }
 
-TEST_F(MetaStorageBackendManagerTest, TestGcHydrationOnlyFillsUnmarkedMissingKeysDuringRecover) {
+TEST_F(MetaStorageBackendManagerTest, TestGcFillsOnlyUnmarkedMissingKeysDuringRecover) {
     for (const bool memory_primary : {false, true}) {
         SCOPED_TRACE(memory_primary);
         MetaStorageBackendManager mgr;
@@ -2387,9 +2387,9 @@ TEST_F(MetaStorageBackendManagerTest, TestGcHydrationOnlyFillsUnmarkedMissingKey
     }
 }
 
-TEST_F(MetaStorageBackendManagerTest, TestGcHydrationFailureDoesNotBlockOtherKeys) {
+TEST_F(MetaStorageBackendManagerTest, TestGcFillFailureDoesNotBlockOtherKeys) {
     MetaStorageBackendManager mgr;
-    auto persistent = std::make_unique<PartialHydrationFailureBackend>();
+    auto persistent = std::make_unique<PartialFillFailureBackend>();
     auto *backup = persistent.get();
     backup->failed_key = 905;
     InitRecoveringPair(mgr, std::move(persistent), false);
@@ -2408,7 +2408,7 @@ TEST_F(MetaStorageBackendManagerTest, TestGcHydrationFailureDoesNotBlockOtherKey
     EXPECT_EQ(1u, maps[2].count("loc_906"));
 }
 
-TEST_F(MetaStorageBackendManagerTest, TestGcHydrationRechecksRunningAfterTombstoneClear) {
+TEST_F(MetaStorageBackendManagerTest, TestGcFillRechecksRunningAfterTombstoneClear) {
     MetaStorageBackendManager mgr;
     auto persistent = std::make_unique<DeferredRecoverPersistentBackend>();
     auto *backup = persistent.get();
@@ -2738,7 +2738,7 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverWriteDualWriteAndDeleteTombston
     ASSERT_EQ(EC_OK, mgr.Open());
     WaitRunning(mgr);
 
-    // Force Recover so Upsert hits EnsureKeyInLocal and Delete
+    // Force Recover so Upsert hits EnsureKeyInCache and Delete
     // inserts into deleted_keys_.
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
 
@@ -2763,7 +2763,7 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverWriteDualWriteAndDeleteTombston
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, keys, exists_vec));
     ASSERT_FALSE(exists_vec[0]);
 
-    // Upsert under Recover hydrates missing keys via EnsureKeyInLocal
+    // Upsert under Recover fills missing keys via EnsureKeyInCache
     // before the conditional write. Seed key 7 into persistent only and
     // verify the upsert is observable afterwards.
     KeyVector k7 = {7};

@@ -104,7 +104,7 @@ public:
     std::vector<ErrorCode> GetLocationsFromPrimary(RequestContext *request_context,
                                                    const KeyVector &keys,
                                                    CacheLocationMapVector &out_location_maps) noexcept;
-    // Hydrate missing complete keys during Recover before an ordinary GC RMW.
+    // Fill missing keys completely during Recover before an ordinary GC RMW.
     // Existing hot keys are never overwritten; Running never falls back.
     // The caller must hold the corresponding shard locks and reread hot after
     // this call before authorizing a conditional mutation.
@@ -245,7 +245,7 @@ private:
                                 // Reports whether every source entry and
                                 // conditional cache write completed safely.
                                 bool *out_success = nullptr) noexcept;
-    // Hydrate missing keys from persistent into cache during Recover. Returns
+    // Fill missing keys from persistent into cache during Recover. Returns
     // false when a backend violates the positional response contract or the
     // full pre-update value cannot be made available safely.
     bool EnsureKeyInCache(RequestContext *request_context,

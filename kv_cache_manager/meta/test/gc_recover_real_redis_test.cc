@@ -343,7 +343,7 @@ protected:
             EXPECT_EQ(0, schedule_->sync_calls); // Neither maintenance nor business adds a barrier.
         }
 
-        // Normal cold-key hydration must still work: only the deleted key is
+        // Filling a normal cold key must still work: only the deleted key is
         // suppressed. This independent Redis key has no recovery tombstone.
         ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
                   redis_->Put(nullptr, {43}, {{{"L1", old}}}, PropertyMapVector(1)));
@@ -585,7 +585,7 @@ TEST_P(GcRecoverRealRedisTest, OrdinaryGcDoesNotRestoreEventReportDeletedSibling
     EXPECT_EQ(1u, indexer_->GetKeyCount());
 }
 
-TEST_P(GcRecoverRealRedisTest, OrdinaryGcHydratesCompleteColdRecoverKeyBeforeCheckingTarget) {
+TEST_P(GcRecoverRealRedisTest, OrdinaryGcFillsCompleteColdRecoverKeyBeforeCheckingTarget) {
     const auto first = Location("L1");
     const auto second = Location("L2", "second_uri");
     const CacheLocationMap both{{"L1", first}, {"L2", second}};

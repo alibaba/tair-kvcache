@@ -1087,7 +1087,7 @@ TEST_F(MetaIndexerTest, TestSingleBackendOrdinaryGcRetainsOrdinaryTargetRead) {
     manager.persistent_backend_ = std::move(persistent);
     manager.cache_backend_.reset();
 
-    // Ordinary GC's hydration request is a no-op without a hot mirror. Keep
+    // Ordinary GC does not fill missing keys without a hot mirror. Keep
     // its original target read, including local access/LRU updates.
     const auto result = meta_indexer_->ReadModifyWriteLocation(
         request_context_.get(), {42}, {{"L1"}}, [target](const std::vector<ErrorCode> &ecs,
