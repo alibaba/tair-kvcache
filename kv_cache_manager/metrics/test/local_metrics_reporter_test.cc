@@ -516,6 +516,31 @@ TEST_F(LocalMetricsReporterTest, StorageUsageRatioSkipsUnknownValues) {
     const std::string exported_text = PrometheusExporter::Expose(*metrics_registry_);
     EXPECT_EQ(std::string::npos, exported_text.find("unique_name=\"never_ok_store\"} 1"));
     EXPECT_EQ(std::string::npos, exported_text.find("unique_name=\"never_ok_store\"} -"));
+
+    // Suppressing an unknown ratio must not suppress the reachability signal.
+    // A follower cut off from the pace meta-service still exports
+    // healthy_status 0 -- that is the series alerting should key on, and the
+    // reason dropping the bogus ratio is safe. A store whose capacity query
+    // succeeds keeps reporting healthy_status 1.
+    auto exported_value = [&exported_text](const std::string &metric, const std::string &unique_name) {
+        const std::string tag = "unique_name=\"" + unique_name + "\"} ";
+        size_t pos = 0;
+        while ((pos = exported_text.find(metric + "{", pos)) != std::string::npos) {
+            auto line_end = exported_text.find('\n', pos);
+            if (line_end == std::string::npos) {
+                line_end = exported_text.size();
+            }
+            const auto tag_pos = exported_text.find(tag, pos);
+            if (tag_pos != std::string::npos && tag_pos < line_end) {
+                const auto value_begin = tag_pos + tag.size();
+                return exported_text.substr(value_begin, line_end - value_begin);
+            }
+            pos = line_end + 1;
+        }
+        return std::string{};
+    };
+    EXPECT_EQ("0", exported_value("kvcm_data_storage_healthy_status", "never_ok_store"));
+    EXPECT_EQ("1", exported_value("kvcm_data_storage_healthy_status", "ratio_store"));
 }
 
 TEST_F(LocalMetricsReporterTest, TestReportInterval02) {
