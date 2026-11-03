@@ -460,9 +460,12 @@ public:
     explicit FakeRatioNfsBackend(std::shared_ptr<MetricsRegistry> registry) : NfsBackend(std::move(registry)) {}
     double GetStorageUsageRatio(const std::string & /*trace_id*/) const override { return ratio_; }
     void SetUsageRatio(double ratio) { ratio_ = ratio; }
+    bool Writable() override { return Available() && writable_; }
+    void SetWritable(bool writable) { writable_ = writable; }
 
 private:
     double ratio_ = -1.0;
+    bool writable_ = true;
 };
 } // namespace
 
@@ -541,6 +544,79 @@ TEST_F(LocalMetricsReporterTest, StorageUsageRatioSkipsUnknownValues) {
     };
     EXPECT_EQ("0", exported_value("kvcm_data_storage_healthy_status", "never_ok_store"));
     EXPECT_EQ("1", exported_value("kvcm_data_storage_healthy_status", "ratio_store"));
+}
+
+TEST_F(LocalMetricsReporterTest, FollowerUsageIsZeroAcrossRolesAndStorageStates) {
+    auto backend = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    backend->SetOpen(true);
+    registry_manager_->data_storage_manager_ = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_->storage_map_.emplace("role_store", backend);
+
+    bool leader = false;
+    int role_samples = 0;
+    reporter_->SetLeaderStateProvider([&]() {
+        ++role_samples;
+        return leader;
+    });
+    const MetricsTags tags{{"type", "file"}, {"unique_name", "role_store"}};
+    const auto verify = [&](double expected_ratio) {
+        role_samples = 0;
+        reporter_->ReportInterval();
+        EXPECT_EQ(1, role_samples);
+        EXPECT_DOUBLE_EQ(expected_ratio,
+                         metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
+        EXPECT_DOUBLE_EQ(backend->Available() ? 1.0 : 0.0,
+                         metrics_registry_->GetGauge("data_storage.healthy_status", tags).Get());
+        EXPECT_DOUBLE_EQ(backend->Writable() ? 1.0 : 0.0,
+                         metrics_registry_->GetGauge("data_storage.writable_status", tags).Get());
+        EXPECT_DOUBLE_EQ(leader ? 1.0 : 0.0, metrics_registry_->GetGauge("is_leader").Get());
+        const double expected_access = !leader || !backend->Available() ? 0.0 : (backend->Writable() ? 2.0 : 1.0);
+        EXPECT_DOUBLE_EQ(expected_access, metrics_registry_->GetGauge("access_mode").Get());
+
+        // Check the text exposed by /metrics, including connectivity signals.
+        const auto output = PrometheusExporter::Expose(*metrics_registry_);
+        const std::string labels = "{type=\"file\",unique_name=\"role_store\"} ";
+        const auto expect_export = [&](const std::string &metric, const std::string &value) {
+            EXPECT_NE(std::string::npos, output.find("kvcm_data_storage_" + metric + labels + value + "\n"));
+        };
+        if (!leader) {
+            expect_export("storage_usage_ratio", "0");
+        }
+        expect_export("healthy_status", backend->Available() ? "1" : "0");
+        expect_export("writable_status", backend->Writable() ? "1" : "0");
+    };
+
+    // Cold follower, including a failed capacity query and failed health check.
+    verify(0.0);
+    for (bool available : {false, true}) {
+        for (bool writable : {false, true}) {
+            backend->SetAvailable(available);
+            backend->SetWritable(writable);
+            for (double ratio : {-1.0, 0.0, 0.75, 1.0}) {
+                SCOPED_TRACE(::testing::Message() << "available=" << available << " writable=" << writable
+                                                 << " ratio=" << ratio);
+                // A real full reading must remain visible on the leader.
+                leader = true;
+                backend->SetUsageRatio(1.0);
+                verify(1.0);
+                backend->SetUsageRatio(ratio);
+                verify(ratio < 0.0 ? 1.0 : ratio);
+
+                // Demotion clears even a retained 100% reading. Repeated
+                // follower reports stay zero independently of backend state.
+                leader = false;
+                verify(0.0);
+                verify(0.0);
+
+                // Promotion resumes normal sampling; unknown usage retains
+                // the last published value until a valid reading arrives.
+                leader = true;
+                verify(ratio < 0.0 ? 0.0 : ratio);
+                backend->SetUsageRatio(0.75);
+                verify(0.75);
+            }
+        }
+    }
 }
 
 TEST_F(LocalMetricsReporterTest, TestReportInterval02) {

@@ -39,9 +39,8 @@ bool LocalMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
     return true;
 }
 
-void LocalMetricsReporter::PublishNodeStatus() {
-    const auto &leader_state_provider = GetLeaderStateProvider();
-    if (!leader_state_provider) {
+void LocalMetricsReporter::PublishNodeStatus(std::optional<bool> is_leader) {
+    if (!is_leader.has_value()) {
         return;
     }
 
@@ -50,7 +49,7 @@ void LocalMetricsReporter::PublishNodeStatus() {
     if (registry_manager) {
         data_storage_manager = registry_manager->data_storage_manager();
     }
-    NodeStatusMetrics::Publish(metrics_registry_, leader_state_provider(), data_storage_manager);
+    NodeStatusMetrics::Publish(metrics_registry_, *is_leader, data_storage_manager);
 }
 
 void LocalMetricsReporter::ReportPerQuery(MetricsCollector *collector, std::optional<bool> request_failed) {
@@ -127,7 +126,11 @@ void LocalMetricsReporter::ReportInterval() {
     // purge with EmplaceMetricsCollector calls below
     std::shared_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
 
-    PublishNodeStatus();
+    // Sample the role once so node status and storage usage agree in this report.
+    const auto &leader_state_provider = GetLeaderStateProvider();
+    const std::optional<bool> is_leader =
+        leader_state_provider ? std::optional<bool>(leader_state_provider()) : std::nullopt;
+    PublishNodeStatus(is_leader);
 
     do {
         // for data storage metrics
@@ -153,16 +156,18 @@ void LocalMetricsReporter::ReportInterval() {
                     MetricsTags{{"type", ToString(storage_backend->GetType())}, {"unique_name", unique_name}});
             SET_METRICS_(p, data_storage, healthy_status, storage_backend->Available() ? 1.0 : 0.0);
             SET_METRICS_(p, data_storage, writable_status, storage_backend->Writable() ? 1.0 : 0.0);
-            // A negative ratio means "usage unknown": the backend could not
-            // query its capacity source (e.g. pace meta-service unreachable
-            // on this node). Skip the write so the gauge keeps its last known
-            // value instead of publishing a misleading reading. An unknown
-            // usage must never surface as a real ratio -- a 1.0 error
-            // sentinel used to trigger false storage-full alerts on follower
-            // nodes.
-            const double usage_ratio = storage_backend->GetStorageUsageRatio("trace_report_interval");
-            if (usage_ratio >= 0.0) {
-                SET_METRICS_(p, data_storage, storage_usage_ratio, usage_ratio);
+            // Followers publish zero every interval, clearing any ratio retained
+            // from their previous leader tenure. Health and writability above
+            // still reflect the backend, including meta-service failures.
+            if (is_leader.has_value() && !*is_leader) {
+                SET_METRICS_(p, data_storage, storage_usage_ratio, 0.0);
+            } else {
+                // For leaders (or callers without a role provider), an unknown
+                // capacity must not overwrite the last successful measurement.
+                const double usage_ratio = storage_backend->GetStorageUsageRatio("trace_report_interval");
+                if (usage_ratio >= 0.0) {
+                    SET_METRICS_(p, data_storage, storage_usage_ratio, usage_ratio);
+                }
             }
         }
     } while (false);

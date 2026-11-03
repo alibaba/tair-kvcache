@@ -197,7 +197,7 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `meta_indexer.total_cache_usage` | gauge | Total cache usage bytes |
 | `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |
 | `data_storage.writable_status` | gauge | Storage backend write availability (1/0); 0 in read-only mode |
-| `data_storage.storage_usage_ratio` | gauge | Storage usage ratio. When the backend cannot determine usage (e.g. the capacity query fails), the gauge is not updated and keeps its last known value; unknown usage is never exported as a real ratio |
+| `data_storage.storage_usage_ratio` | gauge | Storage usage ratio. Followers publish 0, clearing any previous value on demotion; this does not mean the store is empty. Leaders (or callers without a role provider) retain the last known value when capacity is unknown. Health and writability are reported independently, preserving connectivity alerts |
 | `is_leader` | gauge | Whether this node holds the leader lease (1/0), exported as `kvcm_is_leader` |
 | `access_mode` | gauge | Read/write capability this node can currently offer (0/1/2), exported as `kvcm_access_mode` |
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
