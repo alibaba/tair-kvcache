@@ -221,6 +221,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_manager_group, usage_ratio);
     DECLARE_METRICS(cache_manager_instance, key_count);
     DECLARE_METRICS(cache_manager_instance, byte_size);
+    DECLARE_METRICS(cache_manager_instance, meta_cache_usage);
     DECLARE_METRICS(cache_manager_instance, async_queue_max_size);
     DECLARE_METRICS(cache_manager_instance, async_queue_avg_size);
     DECLARE_METRICS(cache_manager_instance, async_flush_key_count);
@@ -540,6 +541,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_manager_group, usage_ratio);
     REGISTER_GAUGE_METRIC(cache_manager_instance, key_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, byte_size);
+    REGISTER_GAUGE_METRIC(cache_manager_instance, meta_cache_usage);
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_queue_max_size);
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_queue_avg_size);
     REGISTER_GAUGE_METRIC(cache_manager_instance, async_flush_key_count);
@@ -1145,6 +1147,9 @@ void KmonitorMetricsReporter::ReportInterval() {
                     REPORT_METRICS(cache_manager_instance, key_count, key_count_v);
                     GET_METRICS_(p, cache_manager_instance, byte_size, byte_size_v);
                     REPORT_METRICS(cache_manager_instance, byte_size, byte_size_v);
+                    double meta_cache_usage_v;
+                    GET_METRICS_(p, cache_manager_instance, meta_cache_usage, meta_cache_usage_v);
+                    REPORT_METRICS(cache_manager_instance, meta_cache_usage, meta_cache_usage_v);
                     double async_queue_max_size_v, async_queue_avg_size_v;
                     GET_METRICS_(p, cache_manager_instance, async_queue_max_size, async_queue_max_size_v);
                     REPORT_METRICS(cache_manager_instance, async_queue_max_size, async_queue_max_size_v);

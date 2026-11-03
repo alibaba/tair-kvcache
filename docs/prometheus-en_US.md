@@ -201,7 +201,7 @@ errors in response bodies remain in `service.error_counter`.
 | Metric | Type | Description |
 |---|---|---|
 | `meta_indexer.total_key_count` | gauge | Total keys across all indexers |
-| `meta_indexer.total_cache_usage` | gauge | Total cache usage bytes |
+| `meta_indexer.total_cache_usage` | gauge | Estimated local metadata memory across all indexers (LRU charge, bytes) |
 | `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |
 | `data_storage.writable_status` | gauge | Storage backend write availability (1/0); 0 in read-only mode |
 | `data_storage.storage_usage_ratio` | gauge | Storage usage ratio |
@@ -209,6 +209,14 @@ errors in response bodies remain in `service.error_counter`.
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |
 | `cache_manager_instance.byte_size` | gauge | Per-instance KVCM quota bytes (excluding EventReport) |
+| `cache_manager_instance.meta_cache_usage` | gauge | Estimated per-instance local metadata memory (LRU charge, bytes), labeled by `instance_group` and `instance_id` |
+
+`cache_manager_instance.meta_cache_usage` reuses `MetaIndexer::GetMemUsage()` and is sampled by the existing
+recorder approximately every 5 seconds. Its Prometheus name is `kvcm_cache_manager_instance_meta_cache_usage`.
+Local mode reports the instance's LRU charge, cached mode reports the local portion, and Redis-only mode reports 0.
+It uses the same accounting as `meta_indexer.total_cache_usage`, but sampling times differ, so concurrent writes
+can prevent an exact instantaneous sum. Charge is not RSS or actual container memory and does not fully account
+for fixed lock arrays, allocator overhead, and similar costs. `byte_size` measures KVCache data quota usage.
 
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.
