@@ -1,4 +1,5 @@
 #include <array>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -9,6 +10,7 @@
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/nfs_backend.h"
 #include "kv_cache_manager/manager/cache_manager.h"
+#include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/metrics/kmonitor_metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
@@ -20,6 +22,13 @@ namespace {
 thread_local double reported_error_qps = 0;
 thread_local double reported_grpc_qps = 0;
 thread_local MetricsTags reported_grpc_tags;
+thread_local std::map<MetricsTags, double> reported_meta_cache_usage;
+
+void CaptureMetaCacheUsage(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
+    if (metric->metric_name_.find("cache_manager_instance.meta_cache_usage") != std::string::npos) {
+        reported_meta_cache_usage[tags->GetTagsMap()] = value;
+    }
+}
 
 struct ReportedLifetime {
     std::string name;
@@ -80,6 +89,38 @@ protected:
 };
 
 TEST_F(KmonitorMetricsReporterTest, TestConstructorAndDestructor) { EXPECT_NE(reporter_, nullptr); }
+
+TEST_F(KmonitorMetricsReporterTest, InstanceMetaCacheUsagePreservesTagsAndReportsZero) {
+    auto recorder = std::make_shared<CacheManagerMetricsRecorder>(
+        nullptr, std::make_shared<WriteLocationManager>(), registry_manager_, cache_manager_->metrics_lifecycle());
+    cache_manager_->metrics_recorder_ = recorder;
+    recorder->group_instance_id_metric_map_["group_a"]["instance_a"].meta_cache_usage = 2048;
+    recorder->group_instance_id_metric_map_["group_b"]["instance_b"].meta_cache_usage = 4096;
+    const MetricsTags tags_a{{"instance_group", "group_a"}, {"instance_id", "instance_a"}};
+    const MetricsTags tags_b{{"instance_group", "group_b"}, {"instance_id", "instance_b"}};
+    Stub stub;
+    auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+        &kmonitor::MutableMetric::Report);
+    stub.set(report, CaptureMetaCacheUsage);
+    reported_meta_cache_usage.clear();
+    reporter_->ReportInterval();
+    ASSERT_EQ(2u, reported_meta_cache_usage.size());
+    EXPECT_DOUBLE_EQ(2048, reported_meta_cache_usage.at(tags_a));
+    EXPECT_DOUBLE_EQ(4096, reported_meta_cache_usage.at(tags_b));
+
+    recorder->group_instance_id_metric_map_["group_a"]["instance_a"].meta_cache_usage = 0;
+    reported_meta_cache_usage.clear();
+    reporter_->ReportInterval();
+    ASSERT_EQ(2u, reported_meta_cache_usage.size());
+    EXPECT_DOUBLE_EQ(0, reported_meta_cache_usage.at(tags_a));
+    EXPECT_DOUBLE_EQ(4096, reported_meta_cache_usage.at(tags_b));
+
+    cache_manager_->InvalidateInstanceMetrics("instance_a");
+    reported_meta_cache_usage.clear();
+    reporter_->ReportInterval();
+    ASSERT_EQ(1u, reported_meta_cache_usage.size());
+    EXPECT_DOUBLE_EQ(4096, reported_meta_cache_usage.at(tags_b));
+}
 
 TEST_F(KmonitorMetricsReporterTest, GrpcStatusQpsPreservesTagsAndUpdatesLocalCounter) {
     const MetricsTags rejected_tags{

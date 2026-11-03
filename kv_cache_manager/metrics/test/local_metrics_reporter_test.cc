@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -571,6 +572,99 @@ TEST_F(LocalMetricsReporterTest, TestReportIntervalCacheManagerMetrics) {
         EXPECT_DOUBLE_EQ(0., flush_time_v);
         EXPECT_DOUBLE_EQ(0., pipeline_err_v);
     }
+}
+
+TEST_F(LocalMetricsReporterTest, InstanceMetaCacheUsageTracksLocalEntriesAndLifecycle) {
+    // Exercise real local accounting, including the recorder and Prometheus export.
+    stub_.reset(ADDR(MetaIndexer, GetMemUsage));
+    cache_manager_->meta_indexer_manager_ = std::make_shared<MetaIndexerManager>();
+    cache_manager_->write_location_manager_ = std::make_shared<WriteLocationManager>();
+    registry_manager_->storage_ = std::make_unique<RegistryLocalBackend>();
+    ASSERT_EQ(EC_OK, registry_manager_->storage_->Init({}));
+    RequestContext context("instance_meta_cache_usage");
+    for (const auto *group_name : {"group_a", "group_b"}) {
+        InstanceGroup group;
+        group.name_ = group_name;
+        ASSERT_EQ(EC_OK, registry_manager_->CreateInstanceGroup(&context, group));
+    }
+    const std::map<std::string, std::string> instance_groups{
+        {"small", "group_a"}, {"large", "group_b"}, {"empty", "group_a"}};
+    for (const auto &[instance_id, group] : instance_groups) {
+        ASSERT_EQ(
+            EC_OK,
+            registry_manager_->RegisterInstance(&context, group, instance_id, 8, {LocationSpecInfo("tp0", 1024)}, {}));
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->meta_indexer_manager_->CreateMetaIndexer(instance_id,
+                                                                           std::make_shared<MetaIndexerConfig>()));
+    }
+    auto small = cache_manager_->meta_indexer_manager_->GetMetaIndexer("small");
+    auto large = cache_manager_->meta_indexer_manager_->GetMetaIndexer("large");
+    CacheLocationMapVector locations(1);
+    PropertyMapVector small_properties{{{"payload", std::string(128, 'a')}}};
+    PropertyMapVector large_properties{{{"payload", std::string(4096, 'b')}}};
+    ASSERT_EQ(EC_OK, small->Put(&context, {7}, locations, small_properties).ec);
+    ASSERT_EQ(EC_OK, large->Put(&context, {7}, locations, large_properties).ec);
+    const auto small_usage = small->GetMemUsage();
+    const auto large_usage = large->GetMemUsage();
+    ASSERT_GT(small_usage, 0u);
+    ASSERT_GT(large_usage, small_usage);
+
+    const auto sample = [&] {
+        auto recorder = std::make_shared<CacheManagerMetricsRecorder>(cache_manager_->meta_indexer_manager_,
+                                                                      cache_manager_->write_location_manager_,
+                                                                      registry_manager_,
+                                                                      cache_manager_->metrics_lifecycle());
+        cache_manager_->metrics_recorder_ = recorder;
+        recorder->Start();
+        bool ready = false;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto snapshot = recorder->group_instance_id_metric_map();
+            if (snapshot.count("group_a") && snapshot.at("group_a").size() == 2 && snapshot.count("group_b") &&
+                snapshot.at("group_b").size() == 1) {
+                ready = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        recorder->Stop();
+        reporter_->ReportInterval();
+        return ready;
+    };
+    const auto expect_usage = [&](const std::string &id, size_t expected) {
+        const auto output = PrometheusExporter::Expose(*metrics_registry_);
+        const auto series = "kvcm_cache_manager_instance_meta_cache_usage{instance_group=\"" + instance_groups.at(id) +
+                            "\",instance_id=\"" + id + "\"} " + std::to_string(expected) + "\n";
+        EXPECT_NE(output.find(series), std::string::npos) << output;
+    };
+    ASSERT_TRUE(sample());
+    expect_usage("small", small_usage);
+    expect_usage("large", large_usage);
+    expect_usage("empty", 0);
+    EXPECT_DOUBLE_EQ(small_usage + large_usage, metrics_registry_->GetGauge("meta_indexer.total_cache_usage").Get());
+    // Metadata-only entries consume local memory without consuming data-storage quota.
+    EXPECT_DOUBLE_EQ(
+        0,
+        metrics_registry_
+            ->GetGauge("cache_manager_instance.byte_size", {{"instance_group", "group_a"}, {"instance_id", "small"}})
+            .Get());
+
+    ASSERT_EQ(EC_OK, small->Delete(&context, {7}).ec);
+    ASSERT_TRUE(sample());
+    expect_usage("small", 0);
+    expect_usage("large", large_usage);
+    expect_usage("empty", 0);
+
+    cache_manager_->InvalidateInstanceMetrics("small");
+    reporter_->ReportInterval();
+    const auto data = metrics_registry_->GetMetricsData("cache_manager_instance.meta_cache_usage");
+    ASSERT_NE(nullptr, data);
+    EXPECT_EQ(2u, data->GetSize());
+    for (const auto &[tags, value] : data->GetMetricsValues()) {
+        EXPECT_NE("small", tags.at("instance_id"));
+    }
+    expect_usage("large", large_usage);
+    expect_usage("empty", 0);
 }
 
 TEST_F(LocalMetricsReporterTest, TestStorageHealthFailureRecoveryAndClose) {

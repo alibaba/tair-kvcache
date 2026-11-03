@@ -530,6 +530,7 @@ public:
 class CacheManagerInstanceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(cache_manager_instance, key_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, byte_size)
+    KVCM_GAUGE_METRICS(cache_manager_instance, meta_cache_usage)
     KVCM_GAUGE_METRICS(cache_manager_instance, max_lru_age_us)
     KVCM_GAUGE_METRICS(cache_manager_instance, async_queue_max_size)
     KVCM_GAUGE_METRICS(cache_manager_instance, async_queue_avg_size)

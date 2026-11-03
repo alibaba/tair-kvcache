@@ -189,7 +189,7 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | 指标 | 类型 | 说明 |
 |---|---|---|
 | `meta_indexer.total_key_count` | gauge | 所有索引器的 key 总数 |
-| `meta_indexer.total_cache_usage` | gauge | 缓存使用总量（字节） |
+| `meta_indexer.total_cache_usage` | gauge | 所有索引器的本地元数据估算内存总量（LRU charge，字节） |
 | `data_storage.healthy_status` | gauge | 存储后端读取可用状态（1/0） |
 | `data_storage.writable_status` | gauge | 存储后端写入可用状态（1/0）；只读降级时为 0 |
 | `data_storage.storage_usage_ratio` | gauge | 存储使用率 |
@@ -197,6 +197,13 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `cache_manager_group.usage_ratio` | gauge | 实例组 KVCM 配额容量使用率（不含 EventReport） |
 | `cache_manager_instance.key_count` | gauge | 单实例 key 数量 |
 | `cache_manager_instance.byte_size` | gauge | 单实例 KVCM 配额字节大小（不含 EventReport） |
+| `cache_manager_instance.meta_cache_usage` | gauge | 单实例本地元数据估算内存（LRU charge，字节），标签为 `instance_group`、`instance_id` |
+
+`cache_manager_instance.meta_cache_usage` 复用 `MetaIndexer::GetMemUsage()`，由现有 Recorder 约每 5 秒采集一次。
+Prometheus 名称为 `kvcm_cache_manager_instance_meta_cache_usage`。local 模式统计该实例的 LRU charge，
+cached 模式统计本地部分，纯 Redis 模式为 0。该口径与 `meta_indexer.total_cache_usage` 一致，
+但两者采样时刻不同，并发写入时不保证瞬时加总相等。charge 不代表 RSS 或容器实际内存，
+不包含完整的固定锁数组、分配器等开销；`byte_size` 则是 KVCache 数据的配额用量。
 
 对于 TairMempool，`data_storage.healthy_status` 为 1 表示后端已打开且健康探测状态正常，否则为 0。状态由后台探测更新，单次请求超时不代表指标立即变为 0。超时参数见[配置说明](configuration.md#tairmempool)。
 
