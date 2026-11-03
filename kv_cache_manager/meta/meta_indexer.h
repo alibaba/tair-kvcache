@@ -107,12 +107,15 @@ public:
                                 const KeyVector &keys,
                                 const BlockIdsOnlyModifierFunc &modifier) noexcept;
     // Location-level RMW: modifier sees per-key CacheLocation vector.
+    // fill_missing_cache requests complete-key filling only for
+    // missing Recover keys; existing hot data is never overwritten. The
+    // modifier then sees actual hot values (or the sole backend without cache).
     LocationResult ReadModifyWriteLocation(RequestContext *request_context,
                                            const KeyVector &keys,
                                            const LocationIdsPerKey &location_ids,
                                            const LocationModifierFunc &modifier,
                                            bool adjust_reclaimed_key_count = true,
-                                           bool refresh_cache_from_persistent = false) noexcept;
+                                           bool fill_missing_cache = false) noexcept;
     LocationResult ReadModifyWriteLocationsForMaintenance(RequestContext *request_context,
                                                           const KeyVector &keys,
                                                           const LocationIdsPerKey &location_ids,
@@ -227,7 +230,7 @@ private:
                                                const LocationModifierFunc &modifier,
                                                bool adjust_reclaimed_key_count,
                                                bool track_created_key_count,
-                                               bool refresh_cache_from_persistent,
+                                               bool fill_missing_cache,
                                                bool maintenance_no_touch) noexcept;
 
 private:
@@ -286,7 +289,8 @@ private:
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,
                                                  Result &result,
-                                                 bool maintenance_no_touch = false) noexcept;
+                                                 bool maintenance_no_touch = false,
+                                                 bool maintenance_write_local_primary = false) noexcept;
     void
     EmitRmwMetrics(MetricsCollector *metrics_collector, const RmwStats &stats, size_t total_key_count) const noexcept;
 

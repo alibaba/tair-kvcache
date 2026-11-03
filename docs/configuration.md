@@ -159,6 +159,9 @@ kvcm.cache_gc.max_inflight_delete_requests=64
 # 迁移期开关：由常规 GC round 基于 EventReportBackend 当前状态统一回收 metadata；
 # 默认开启，但仍受 kvcm.cache_gc.enabled 总开关控制；总开关关闭时保留 legacy 路径。
 kvcm.cache_gc.event_report_cleanup_enabled=true
+# 是否允许 metadata Recover 期间提交 EventReport 清理；false 时等待该 Instance 恢复完成。
+# 只控制统一 GC 的恢复期准入，不切回 legacy、不影响普通 GC；修改后重启生效。
+kvcm.cache_gc.event_report_cleanup_during_recover_enabled=true
 # 每个 GC tick 最多提交的 EventReport metadata Block key 数；Location 总数仍受 scan_batch_size 限制。
 kvcm.cache_gc.event_report_action_batch_size=256
 

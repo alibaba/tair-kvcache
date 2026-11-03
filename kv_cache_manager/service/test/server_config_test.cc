@@ -40,6 +40,7 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(86400000, config.GetCacheGcOrphanWritingGracePeriodMs());
         ASSERT_EQ(64, config.GetCacheGcMaxInflightDeleteRequests());
         ASSERT_TRUE(config.IsCacheGcEventReportCleanupEnabled());
+        ASSERT_TRUE(config.IsCacheGcEventReportCleanupDuringRecoverEnabled());
         ASSERT_EQ(256, config.GetCacheGcEventReportActionBatchSize());
     }
     // config_file not exist
@@ -510,6 +511,28 @@ TEST_F(ServerConfigTest, TestMalformedNumericEnvironmentValueReturnsParseError) 
     };
 
     EXPECT_FALSE(config.Parse("", environ));
+}
+
+TEST_F(ServerConfigTest, TestEventReportCleanupDuringRecoverConfig) {
+    ServerConfig config;
+    const std::string setting = "kvcm.cache_gc.event_report_cleanup_during_recover_enabled";
+    ASSERT_TRUE(config.Parse("", {{setting, "false"}}));
+    ASSERT_TRUE(config.Check());
+    EXPECT_FALSE(config.IsCacheGcEventReportCleanupDuringRecoverEnabled());
+    EXPECT_TRUE(config.IsCacheGcEnabled());
+    EXPECT_TRUE(config.IsCacheGcEventReportCleanupEnabled());
+
+    ASSERT_TRUE(config.Parse("", {{setting, "true"}}));
+    EXPECT_TRUE(config.IsCacheGcEventReportCleanupDuringRecoverEnabled());
+    EXPECT_FALSE(config.Parse("", {{setting, "invalid"}}));
+
+    {
+        ScopedEnv env("kvcm_cache_gc_event_report_cleanup_during_recover_enabled", "false");
+        ASSERT_TRUE(config.Parse("", {}));
+        EXPECT_FALSE(config.IsCacheGcEventReportCleanupDuringRecoverEnabled());
+    }
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_TRUE(config.IsCacheGcEventReportCleanupDuringRecoverEnabled());
 }
 
 TEST_F(ServerConfigTest, TestUnderscoreEnvFallback) {

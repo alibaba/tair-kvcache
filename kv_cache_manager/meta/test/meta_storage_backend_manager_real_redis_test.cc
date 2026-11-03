@@ -372,7 +372,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverWriteDualWriteAndDelet
     WaitRunning(mgr);
 
     // Force Recover so Delete writes a tombstone and Upsert runs
-    // EnsureKeyInLocal before the conditional write.
+    // EnsureKeyInCache before the conditional write.
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
 
     KeyVector keys = {40042};
@@ -398,8 +398,8 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverWriteDualWriteAndDelet
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, keys, exists_vec));
     ASSERT_FALSE(exists_vec[0]);
 
-    // Key 40007 lives only in redis: Upsert under Recover must hydrate
-    // it into local via EnsureKeyInLocal before the conditional write, so the
+    // Key 40007 lives only in Redis: Upsert under Recover must fill the cache
+    // via EnsureKeyInCache before the conditional write, so the
     // subsequent Get observes the upsert.
     KeyVector k7 = {40007};
     Cleanup(mgr, k7);

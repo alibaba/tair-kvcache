@@ -5208,6 +5208,8 @@ TEST_F(CacheManagerTest, TestReportEventHeartbeatRecoveryCarriesSameRequestMutat
     CacheGarbageCollector::Config gc_config;
     gc_config.enabled = true;
     gc_config.event_report_cleanup_enabled = true;
+    // Disabling Recover cleanup must not route snapshot handling to legacy cleanup.
+    gc_config.event_report_cleanup_during_recover_enabled = false;
     auto collector = std::make_shared<CacheGarbageCollector>(gc_config,
                                                              registry_manager_,
                                                              cache_manager_->meta_indexer_manager_,
