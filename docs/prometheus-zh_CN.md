@@ -327,3 +327,30 @@ Prometheus 端点从中读取。
 ```promql
 kvcm_meta_storage_redis_healthy_status == 0
 ```
+
+### 选主协调 Redis 健康指标
+
+`kvcm_coordination_redis_healthy_status{host="redis.example",port="6379"}` 表示本节点对
+`kvcm.coordination.uri` 指定 Redis 的最近一次独立探测结果：`1` 为连接、必要的认证、
+PING 和配置的 DB 选择成功，`0` 为失败或超时。旧配置 `kvcm.distributed_lock.uri` 仍按原有规则生效。
+标签仅包含配置的 host 和 port，不暴露凭据、DB 或完整 URI。
+
+该指标在 follower、promoting、leader、demoting 阶段都采集，不依赖是否持锁。
+它复用元数据 Redis 的只读探测实现，但拥有独立线程和连接，不占用选主或业务连接池，
+不调用抢锁、续约、解锁或写入接口，不持业务/生命周期锁；元数据探测阻塞也不会阻塞它。
+原有选主、请求准入、故障处理、元数据指标的名称及标签均不变。
+
+每轮完成后等待 `max(kvcm.metrics.report_interval_ms, 1000)` 毫秒，默认 20 秒。
+每轮新建一个连接并执行 PING，必要时增加 AUTH、再次 PING 和 SELECT；无重试。
+连接和每次 socket I/O 超时为 1 秒，DNS 解析仍受系统 resolver 控制，这不是整轮探测的总超时。
+开销为每个 Redis 协调节点一个线程及每轮一个短连接；不配置 Redis 协调后端时不创建探测线程。
+停机先取消后续探测，完成原有停服/释放 leader 流程后再等待探测退出。
+
+首轮探测完成前、使用 memory/file/默认协调后端时无此序列；进程若因协调后端初始化失败
+而未启动 HTTP 服务，也无法暴露该指标。缺失不能当作健康，应另设进程/采集缺失告警。
+`1` 不证明 Lua 脚本/写权限、租约或服务就绪状态正常；结合 `kvcm_is_leader` 和
+`kvcm_role_state` 判断选主状态。与元数据指标不同，此告警不要限定 leader：
+
+```promql
+kvcm_coordination_redis_healthy_status == 0
+```

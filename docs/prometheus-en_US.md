@@ -344,3 +344,35 @@ Example alert (for expected leader series; alert on absence separately):
 ```promql
 kvcm_meta_storage_redis_healthy_status == 0
 ```
+
+### Coordination Redis health checks
+
+`kvcm_coordination_redis_healthy_status{host="redis.example",port="6379"}` reports this node's
+latest independent probe of `kvcm.coordination.uri`: `1` for successful connection, required
+authentication, PING and configured database selection; `0` for failure or timeout.
+The legacy `kvcm.distributed_lock.uri` option follows the existing configuration rules.
+Labels expose only the configured host and port, never credentials, database or full URIs.
+
+All four phases (follower, promoting, leader, demoting) publish this metric regardless of lease ownership.
+It reuses the metadata Redis read-only probe on a separate thread and connection. It does not use
+election/business connection pools, acquire business/lifecycle locks, write keys, or invoke lock
+acquisition, renewal or release. A blocked metadata probe cannot block this probe. Election, request
+admission, failure handling and existing metric names/labels are unchanged.
+
+After each probe, the thread waits `max(kvcm.metrics.report_interval_ms, 1000)` milliseconds
+(default 20 seconds). Each cycle opens one connection, sends PING, and optionally AUTH, another PING
+and SELECT, without retries. Connect and each socket operation have a 1-second timeout; DNS resolution
+uses the system resolver and is not bounded by this timeout. This is not a total probe deadline.
+The cost is one extra thread and one short connection per cycle per Redis-coordinated node.
+Non-Redis coordination backends create no probe thread. Shutdown cancels further probes before
+the existing stop/lease-release flow, and joins the outstanding probe afterward.
+
+There is no series before the first result or for memory/file/default coordination backends.
+If coordination initialization prevents HTTP startup, the process cannot expose this metric either.
+Absence does not mean healthy; monitor process/scrape absence separately. A value of 1 does not verify
+Lua/write permissions, lease ownership or service readiness; combine it with `kvcm_is_leader` and
+`kvcm_role_state` to observe election state. Unlike metadata Redis health, do not restrict this alert to leaders:
+
+```promql
+kvcm_coordination_redis_healthy_status == 0
+```

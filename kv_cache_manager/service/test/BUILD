@@ -179,6 +179,7 @@ cc_test(
         "//kv_cache_manager/metrics:metrics_lifecycle",
         "//kv_cache_manager/metrics:metrics_reporter",
         "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/metrics:redis_health_metrics",
         "//kv_cache_manager/service",
     ],
 )

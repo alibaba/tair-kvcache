@@ -13,6 +13,7 @@
 #include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
+#include "kv_cache_manager/metrics/redis_health_metrics.h"
 #include "kv_cache_manager/service/server.h"
 
 using namespace kv_cache_manager;
@@ -62,8 +63,10 @@ public:
         server_.Stop();
     }
     bool WaitForPhase(const char *phase) {
+        return WaitForLine(std::string("kvcm_role_state{state=\"") + phase + "\"} 1\n");
+    }
+    bool WaitForLine(const std::string &line) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        const auto line = std::string("kvcm_role_state{state=\"") + phase + "\"} 1\n";
         while (std::chrono::steady_clock::now() < deadline) {
             if (PrometheusExporter::Expose(*server_.metrics_registry_).find(line) != std::string::npos) {
                 return true;
@@ -81,6 +84,7 @@ TEST_F(ServerNodeStatusMetricsTest, PhaseCollectionContinuesWhileReporterAndLife
     // stalled. The phase observer must not depend on either one.
     std::unique_lock writer(server_.metrics_lifecycle_->mut_);
     ASSERT_TRUE(server_.StartMetricsReportThread());
+    EXPECT_FALSE(server_.coordination_redis_health_thread_); // default memory backend creates no probe thread
     ASSERT_EQ(std::future_status::ready, reporter_->started.get_future().wait_for(std::chrono::seconds(2)));
     EXPECT_TRUE(WaitForPhase("follower"));
     server_.leader_elector_->role_state_.store(RoleState::PROMOTING);
@@ -93,4 +97,25 @@ TEST_F(ServerNodeStatusMetricsTest, PhaseCollectionContinuesWhileReporterAndLife
     EXPECT_TRUE(WaitForPhase("follower"));
     EXPECT_FALSE(server_.leader_elector_->IsLeader()); // observing phases never acquires a lease
     EXPECT_EQ(std::string::npos, PrometheusExporter::Expose(*server_.metrics_registry_).find("kvcm_access_mode"));
+}
+
+TEST_F(ServerNodeStatusMetricsTest, CoordinationFailureReportsInEveryPhaseDespiteBlockedReporterAndLifecycle) {
+    // Exercise the legacy URI option as well. Port 0 is deliberately invalid:
+    // this test must not connect to any existing Redis on the developer machine.
+    ASSERT_TRUE(server_.config_.Parse(
+        "", {{"kvcm.distributed_lock.uri", "redis://127.0.0.1:0"}, {"kvcm.metrics.report_interval_ms", "10"}}));
+    std::unique_lock writer(server_.metrics_lifecycle_->mut_);
+    ASSERT_TRUE(server_.StartMetricsReportThread());
+    ASSERT_TRUE(server_.coordination_redis_health_thread_);
+    ASSERT_EQ(std::future_status::ready, reporter_->started.get_future().wait_for(std::chrono::seconds(2)));
+    for (const auto phase : {RoleState::FOLLOWER, RoleState::PROMOTING, RoleState::LEADER, RoleState::DEMOTING}) {
+        server_.leader_elector_->role_state_.store(phase);
+        // Clear the previous result so each phase requires a new observation.
+        server_.metrics_registry_->GetGauge(CoordinationRedisHealthMetrics::kMetricName,
+                                            {{"host", "127.0.0.1"}, {"port", "0"}}) = 1;
+        EXPECT_TRUE(WaitForLine("kvcm_coordination_redis_healthy_status{host=\"127.0.0.1\",port=\"0\"} 0\n"));
+        EXPECT_FALSE(server_.leader_elector_->IsLeader()); // the probe cannot acquire/revoke a lease
+    }
+    // The ordinary reporter is still blocked, yet all four samples were published.
+    EXPECT_FALSE(server_.stop_.load());
 }

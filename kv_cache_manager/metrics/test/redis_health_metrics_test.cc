@@ -102,6 +102,116 @@ private:
 
 class RedisHealthMetricsTest : public TESTBASE {};
 
+TEST_F(RedisHealthMetricsTest, CoordinationReportsFailureRecoveryWithoutExposingCredentials) {
+    auto registry = std::make_shared<MetricsRegistry>();
+    const std::string uri = "redis://private-token@coord.example:6380/?db=2&cluster_name=private-cluster";
+    bool healthy = true;
+    int calls = 0;
+    CoordinationRedisHealthMetrics metrics(registry, uri, [&](const std::string &target) {
+        EXPECT_EQ(uri, target);
+        ++calls;
+        return healthy;
+    });
+    ASSERT_TRUE(metrics.IsEnabled());
+    EXPECT_TRUE(PrometheusExporter::Expose(*registry).empty()); // no invented initial result
+    for (const bool result : {true, false, true}) {
+        healthy = result;
+        metrics.Report();
+        const auto output = PrometheusExporter::Expose(*registry);
+        const std::string line = "kvcm_coordination_redis_healthy_status{host=\"coord.example\",port=\"6380\"} ";
+        EXPECT_NE(std::string::npos, output.find(line + (result ? "1\n" : "0\n")));
+        for (const auto *secret : {"private-token", "private-cluster", "db=", "instance_group", "meta_storage"}) {
+            EXPECT_EQ(std::string::npos, output.find(secret));
+        }
+    }
+    metrics.RequestStop();
+    metrics.Report();
+    EXPECT_EQ(3, calls);
+}
+
+TEST_F(RedisHealthMetricsTest, CoordinationSkipsNonRedisBackends) {
+    auto registry = std::make_shared<MetricsRegistry>();
+    int calls = 0;
+    for (const auto *uri : {"", "memory://", "file:///tmp/coordination", "unsupported://host:6379"}) {
+        CoordinationRedisHealthMetrics metrics(registry, uri, [&](const std::string &) {
+            ++calls;
+            return false;
+        });
+        EXPECT_FALSE(metrics.IsEnabled());
+        metrics.Report();
+    }
+    EXPECT_EQ(0, calls);
+    EXPECT_TRUE(PrometheusExporter::Expose(*registry).empty());
+}
+
+TEST_F(RedisHealthMetricsTest, CoordinationUsesReadOnlyProbeAndReportsTimeout) {
+    for (const bool stall : {false, true}) {
+        ScriptedRedis server({"-NOAUTH required\r\n", "+OK\r\n", "+PONG\r\n", "+OK\r\n"}, stall);
+        auto registry = std::make_shared<MetricsRegistry>();
+        CoordinationRedisHealthMetrics metrics(registry, server.Uri("test-token", "db=3"), [](const std::string &uri) {
+            return RedisHealthMetrics::ProbeRedis(uri, 50);
+        });
+        metrics.Report();
+        const auto output = PrometheusExporter::Expose(*registry);
+        EXPECT_NE(std::string::npos, output.find(stall ? "} 0\n" : "} 1\n"));
+        server.Finish();
+        if (!stall) {
+            EXPECT_EQ(
+                (std::vector<std::vector<std::string>>{{"PING"}, {"AUTH", "test-token"}, {"PING"}, {"SELECT", "3"}}),
+                server.commands);
+        }
+    }
+}
+
+TEST_F(RedisHealthMetricsTest, CoordinationIsIndependentOfBlockedMetadataProbe) {
+    auto registry = std::make_shared<MetricsRegistry>();
+    auto lifecycle = std::make_shared<MetricsLifecycle>();
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    RedisHealthMetrics metadata(
+        registry,
+        lifecycle,
+        [] { return RedisHealthMetrics::Targets{{"group", "redis://meta.example:6379"}}; },
+        [&](const std::string &) {
+            entered.set_value();
+            released.wait();
+            return false;
+        });
+    auto pending = std::async(std::launch::async, [&] { metadata.Report(); });
+    EXPECT_EQ(std::future_status::ready, entered.get_future().wait_for(std::chrono::seconds(2)));
+    // A recovery/cleanup lock and a stalled metadata connection cannot suppress
+    // coordination observations, nor can a coordination failure affect metadata health.
+    {
+        std::unique_lock writer(lifecycle->mut_);
+        CoordinationRedisHealthMetrics coordination(
+            registry, "redis://coord.example:6379", [](const std::string &) { return false; });
+        coordination.Report();
+        EXPECT_NE(std::string::npos,
+                  PrometheusExporter::Expose(*registry).find(
+                      "kvcm_coordination_redis_healthy_status{host=\"coord.example\",port=\"6379\"} 0\n"));
+    }
+    release.set_value();
+    pending.get();
+}
+
+TEST_F(RedisHealthMetricsTest, CoordinationStopDiscardsInFlightResult) {
+    auto registry = std::make_shared<MetricsRegistry>();
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    CoordinationRedisHealthMetrics metrics(registry, "redis://coord.example:6379", [&](const std::string &) {
+        entered.set_value();
+        released.wait();
+        return true;
+    });
+    auto pending = std::async(std::launch::async, [&] { metrics.Report(); });
+    EXPECT_EQ(std::future_status::ready, entered.get_future().wait_for(std::chrono::seconds(2)));
+    metrics.RequestStop(); // must not wait for network I/O
+    release.set_value();
+    pending.get();
+    metrics.Report();
+    EXPECT_TRUE(PrometheusExporter::Expose(*registry).empty());
+}
+
 TEST_F(RedisHealthMetricsTest, SelectRedisDependencies) {
     EXPECT_EQ("uri", RedisHealthMetrics::RedisUri("redis", "uri"));
     EXPECT_EQ("uri", RedisHealthMetrics::RedisUri("async_redis", "uri"));

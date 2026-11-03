@@ -52,4 +52,26 @@ private:
     Series published_;
     std::atomic<bool> stopped_{false};
 };
+
+// Observes the immutable coordination endpoint on every node, including followers.
+// Has no dependency on the elector, its connection pool, or the metadata lifecycle.
+class CoordinationRedisHealthMetrics {
+public:
+    static constexpr const char *kMetricName = "coordination.redis_healthy_status";
+    CoordinationRedisHealthMetrics(
+        std::shared_ptr<MetricsRegistry> registry,
+        std::string uri,
+        RedisHealthMetrics::Probe probe = [](const std::string &uri) { return RedisHealthMetrics::ProbeRedis(uri); });
+    bool IsEnabled() const { return enabled_; }
+    void Report();
+    void RequestStop() { stopped_.store(true, std::memory_order_relaxed); }
+
+private:
+    std::shared_ptr<MetricsRegistry> registry_;
+    const std::string uri_;
+    RedisHealthMetrics::Probe probe_;
+    MetricsTags tags_;
+    bool enabled_ = false;
+    std::atomic<bool> stopped_{false};
+};
 } // namespace kv_cache_manager

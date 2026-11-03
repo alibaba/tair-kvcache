@@ -222,4 +222,23 @@ void RedisHealthMetrics::Report() {
     }
 }
 
+CoordinationRedisHealthMetrics::CoordinationRedisHealthMetrics(std::shared_ptr<MetricsRegistry> registry,
+                                                               std::string uri,
+                                                               RedisHealthMetrics::Probe probe)
+    : registry_(std::move(registry)), uri_(std::move(uri)), probe_(std::move(probe)) {
+    const auto parsed = StandardUri::FromUri(uri_);
+    enabled_ = parsed.GetProtocol() == "redis";
+    tags_ = {{"host", parsed.GetHostName()}, {"port", std::to_string(parsed.GetPort())}};
+}
+
+void CoordinationRedisHealthMetrics::Report() {
+    if (!enabled_ || stopped_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const bool healthy = probe_(uri_);
+    if (!stopped_.load(std::memory_order_relaxed)) {
+        registry_->GetGauge(kMetricName, tags_) = healthy ? 1.0 : 0.0;
+    }
+}
+
 } // namespace kv_cache_manager

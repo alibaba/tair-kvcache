@@ -32,6 +32,7 @@ class MetricsRegistry;
 class MetricsReporter;
 class MetricsReporterFactory;
 class RedisHealthMetrics;
+class CoordinationRedisHealthMetrics;
 struct MetricsLifecycle;
 class LoopThread;
 
@@ -91,5 +92,7 @@ private:
     std::shared_ptr<LoopThread> role_state_metrics_thread_;
     std::shared_ptr<RedisHealthMetrics> redis_health_metrics_;
     std::shared_ptr<LoopThread> redis_health_thread_;
+    std::shared_ptr<CoordinationRedisHealthMetrics> coordination_redis_health_metrics_;
+    std::shared_ptr<LoopThread> coordination_redis_health_thread_;
 };
 } // namespace kv_cache_manager

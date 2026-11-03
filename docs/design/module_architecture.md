@@ -355,3 +355,15 @@ Optimizer 作为客户端通过 `ServiceDiscoveryFactory` 获取 KVCM seed endpo
 交由 `metrics::NodeStatusMetrics` 发布 `role_state{state="..."}` 的四条固定序列。
 采集不进入业务调用链、不持指标生命周期锁、不访问网络，因此普通指标采集或恢复/清理阻塞时
 仍可观察阶段；服务关闭时停止该采集线程。原有 `is_leader` 采集与业务门禁不变。
+
+### 选主 Redis 健康指标
+
+`service::Server` 将实际生效的 `GetCoordinationUri()` 提供给
+`metrics::CoordinationRedisHealthMetrics`；仅 Redis 协调后端启动独立探测线程。
+复用 `RedisHealthMetrics::ProbeRedis` 的短连接只读探测，发布
+`coordination.redis_healthy_status{host,port}`。目标在进程启动后不变，采集不读取注册表、
+Indexer 或选主器，也不依赖生命周期锁；各阶段均上报，失去租约不会隐藏协调连接故障。
+与元数据探测分开调度，周期下限为 1 秒，默认 20 秒，另加探测耗时。
+不修改 CoordinationBackend 的连接池、选主/续约/解锁操作或服务门禁；停机先取消探测，
+原有停服/释放 leader 完成后再 join。指标仅验证连接、认证、PING 和 DB 选择，
+不验证协调写入/Lua 权限，不替代租约或就绪检查。
