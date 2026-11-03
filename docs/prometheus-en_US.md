@@ -217,6 +217,10 @@ reports `access_mode` 1. Both metrics are published by the periodic reporting
 thread, so offline tools that never install a leader state callback do not
 export them.
 
+For TairMempool, `healthy_status=1` means the backend is open for reads. A meta-service connectivity failure is reflected by `writable_status=0`, allowing read-only degradation. Writability follows the background health probe rather than changing immediately on a single request timeout.
+
+A cold-start follower has no storage-level series until storage backends are loaded. On demotion, previously published usage ratios are reset to zero even if cleanup has removed the backends. Health and writability also become zero for closed and removed backends, clearing readings retained from the previous leader tenure.
+
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.
 

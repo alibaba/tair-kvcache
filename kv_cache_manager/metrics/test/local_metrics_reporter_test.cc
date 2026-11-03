@@ -628,6 +628,57 @@ TEST_F(LocalMetricsReporterTest, FollowerUsageIsZeroAcrossRolesAndStorageStates)
     }
 }
 
+TEST_F(LocalMetricsReporterTest, DemotionCleanupClearsPreviouslyPublishedStorageMetrics) {
+    auto backend = std::make_shared<FakeRatioNfsBackend>(metrics_registry_);
+    backend->SetOpen(true);
+    backend->SetAvailable(true);
+    backend->SetUsageRatio(1.0);
+    auto manager = std::make_shared<DataStorageManager>(metrics_registry_);
+    registry_manager_->data_storage_manager_ = manager;
+    manager->storage_map_.emplace("demoted_store", backend);
+    bool leader = true;
+    reporter_->SetLeaderStateProvider([&]() { return leader; });
+    reporter_->ReportInterval();
+
+    const MetricsTags tags{{"type", "file"}, {"unique_name", "demoted_store"}};
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.healthy_status", tags).Get());
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.writable_status", tags).Get());
+
+    // Server::OnNoLongerLeader closes and removes storage before the next
+    // metrics tick. Exercise that real cleanup path, not just a role toggle.
+    ASSERT_EQ(EC_OK, manager->DoCleanup());
+    ASSERT_TRUE(manager->GetAllStorageNames().empty());
+    // Model an in-flight interval that sampled leader=true before cleanup.
+    // It sees an empty map and drops its collectors, but registry gauges live on.
+    reporter_->ReportInterval();
+    leader = false;
+    for (int i = 0; i < 2; ++i) {
+        reporter_->ReportInterval();
+        const auto output = PrometheusExporter::Expose(*metrics_registry_);
+        EXPECT_NE(std::string::npos, output.find("kvcm_is_leader 0\n"));
+        EXPECT_NE(std::string::npos, output.find("kvcm_access_mode 0\n"));
+        for (const auto &name : {"storage_usage_ratio", "healthy_status", "writable_status"}) {
+            const auto line = std::string("kvcm_data_storage_") + name +
+                              "{type=\"file\",unique_name=\"demoted_store\"} 0\n";
+            EXPECT_NE(std::string::npos, output.find(line));
+        }
+    }
+
+    // Recovering the same storage on promotion resumes real measurements.
+    backend->SetOpen(true);
+    backend->SetAvailable(true);
+    backend->SetUsageRatio(0.25);
+    manager->storage_map_.emplace("demoted_store", backend);
+    leader = true;
+    reporter_->ReportInterval();
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("is_leader").Get());
+    EXPECT_DOUBLE_EQ(2.0, metrics_registry_->GetGauge("access_mode").Get());
+    EXPECT_DOUBLE_EQ(0.25, metrics_registry_->GetGauge("data_storage.storage_usage_ratio", tags).Get());
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.healthy_status", tags).Get());
+    EXPECT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("data_storage.writable_status", tags).Get());
+}
+
 TEST_F(LocalMetricsReporterTest, TestReportInterval02) {
     {
         cache_manager_->meta_indexer_manager_ = nullptr;

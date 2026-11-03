@@ -1,5 +1,6 @@
 #include "kv_cache_manager/metrics/local_metrics_reporter.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -132,6 +133,20 @@ void LocalMetricsReporter::ReportInterval() {
         leader_state_provider ? std::optional<bool>(leader_state_provider()) : std::nullopt;
     PublishNodeStatus(is_leader);
 
+    // Demotion cleanup can remove every backend before this interval runs.
+    // Clear previously published ratios before consulting the storage manager,
+    // otherwise its empty map would leave the old leader's readings exported.
+    const bool is_follower = is_leader.has_value() && !*is_leader;
+    if (is_follower) {
+        const auto ratios = metrics_registry_->GetMetricsData("data_storage.storage_usage_ratio");
+        if (ratios) {
+            for (const auto &[tags, value] : ratios->GetMetricsValues()) {
+                Gauge gauge(value);
+                gauge = 0.0;
+            }
+        }
+    }
+
     do {
         // for data storage metrics
         const auto registry_manager = cache_manager_->GetRegistryManager();
@@ -143,8 +158,26 @@ void LocalMetricsReporter::ReportInterval() {
             break;
         }
 
-        data_storage_interval_metrics_collectors_.Reset();
         const auto storage_names = data_storage_manager->GetAllStorageNames();
+        if (is_follower) {
+            for (const auto &metric : {"data_storage.healthy_status", "data_storage.writable_status"}) {
+                const auto data = metrics_registry_->GetMetricsData(metric);
+                if (!data) {
+                    continue;
+                }
+                for (const auto &[tags, value] : data->GetMetricsValues()) {
+                    const auto name = tags.find("unique_name");
+                    if (name != tags.end() &&
+                        std::find(storage_names.begin(), storage_names.end(), name->second) == storage_names.end()) {
+                        // Closed and removed backends must not retain health
+                        // readings, even after the collector cache was reset.
+                        Gauge gauge(value);
+                        gauge = 0.0;
+                    }
+                }
+            }
+        }
+        data_storage_interval_metrics_collectors_.Reset();
         for (const auto &unique_name : storage_names) {
             const auto storage_backend = data_storage_manager->GetDataStorageBackend(unique_name);
             if (storage_backend == nullptr) {
@@ -159,7 +192,7 @@ void LocalMetricsReporter::ReportInterval() {
             // Followers publish zero every interval, clearing any ratio retained
             // from their previous leader tenure. Health and writability above
             // still reflect the backend, including meta-service failures.
-            if (is_leader.has_value() && !*is_leader) {
+            if (is_follower) {
                 SET_METRICS_(p, data_storage, storage_usage_ratio, 0.0);
             } else {
                 // Preserve backend return semantics, including a default zero.
