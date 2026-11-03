@@ -2,7 +2,7 @@
 
 --------------------------------------------------------------------------------
 <p align="center"> 
-    |<a href="https://github.com/alibaba/tair-kvcache/README.md"><b>English Version</b></a>|
+    |<a href="README.md"><b>English Version</b></a>|
 </p>
 
 --------------------------------------------------------------------------------
@@ -60,7 +60,7 @@ KVCM 采用“中心化元数据管理 + 去中心化数据搬运”的设计：
 **前台请求**
 - **MetaSearcher**：找缓存——根据请求的 token/block，在索引中匹配出可复用的 KVCache 位置。
 - **WriteLocationManager**：写会话管理——记录本次写入分配到的位置和超时，写完确认时用它找回写入位置。
-- **DataStorageSelector**：选存储——根据配额、水位和健康状态，决定这次写入放到哪个存储后端。
+- **DataStorageSelector**：选存储——根据配额、后端可用性和偏好策略，决定这次写入放到哪个存储后端。
 - **ReportEvent / GetHostCacheState**：推理侧缓存状态——接收 L1.5/L2 缓存上报，并提供主机级命中查询；只操作元数据。
 
 **元数据与存储**
@@ -73,7 +73,7 @@ KVCM 采用“中心化元数据管理 + 去中心化数据搬运”的设计：
 **配置、通用支撑与生态**
 - **RegistryManager / LeaderElector**：配置与 HA——保存实例、配额、存储等配置，并负责一主多备的选主与故障切换。
 - **event / metrics / protocol / common**：通用支撑——事件总线、指标上报、协议定义，以及日志、Redis、上下文等基础设施。
-- **client / py_connector / client_java / manager_client**：推理引擎接入层——负责元数据查询和 KVCache 数据搬运，不同语言/框架按需选用。
+- **client / py_connector / client_java / manager_client**：推理引擎接入层——负责元数据查询；其中 `client` / `py_connector` 还负责 KVCache 数据搬运，不同语言/框架按需选用。
 - **optimizer / HiSim / kvcm_ops**：优化、仿真与运维——optimizer 用 trace 回放评估策略和容量，HiSim 用 CPU 仿真推理性能，kvcm_ops 管理 Storage、Instance Group 和集群状态。
 
 ### 一次读写如何工作

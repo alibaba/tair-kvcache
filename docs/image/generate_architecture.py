@@ -17,6 +17,7 @@ from html import escape
 from pathlib import Path
 import shutil
 import subprocess
+import unicodedata
 
 
 INK = "#152B48"
@@ -27,6 +28,18 @@ ORANGE = "#C96A20"
 PURPLE = "#8060B4"
 BORDER = "#DCE4EE"
 FONT = "'Alibaba PuHuiTi 2.0', 'Noto Sans CJK SC', 'Microsoft YaHei', Arial, sans-serif"
+
+
+def estimate_text_width(value, size):
+    width = 0.0
+    for ch in value:
+        if unicodedata.east_asian_width(ch) in ("W", "F"):
+            width += size
+        elif ch == " ":
+            width += size * 0.26
+        else:
+            width += size * 0.50
+    return width
 
 COPY = {
     "zh": {
@@ -147,10 +160,15 @@ class Diagram:
         )
 
     def text(self, x, y, value, size=22, color=INK, weight=400, anchor="start", max_width=None):
-        width_attr = f' data-max-width="{max_width}"' if max_width else ""
+        if max_width is not None:
+            estimated = estimate_text_width(value, size)
+            if estimated > max_width * 1.02:
+                raise ValueError(
+                    f"text is wider than max_width ({estimated:.0f} > {max_width}): {value!r}"
+                )
         self.parts.append(
             f'<text x="{x}" y="{y}" font-size="{size}" font-weight="{weight}" '
-            f'fill="{color}" text-anchor="{anchor}"{width_attr}>{escape(value)}</text>'
+            f'fill="{color}" text-anchor="{anchor}">{escape(value)}</text>'
         )
 
     def line(self, points, color="#97A9BE", width=2, marker=None, dashed=False, both=False):
@@ -315,7 +333,7 @@ COMPONENT_COPY = {
         "searcher_manager": "按 Instance 创建 / 获取 Searcher",
         "searcher": "前缀 / 滑窗 / 混合匹配 · 元数据更新",
         "write": "两阶段写入会话 · 写地址 · 超时清理",
-        "selector": "依据配额 / 水位 / 健康选择存储后端",
+        "selector": "按配额 / 后端可用性 / 偏好策略选择",
         "report": "索引更新 / 查询 · Reporter 生命周期与可见性",
         "meta": "meta · 元数据索引",
         "indexer_manager": "按 instance_id 隔离 · 共享 QueryExecutor",
@@ -356,7 +374,7 @@ COMPONENT_COPY = {
         "searcher_manager": "Create / acquire a Searcher per Instance",
         "searcher": "Prefix / sliding-window / hybrid; updates",
         "write": "Two-phase sessions · locations · expiry",
-        "selector": "Select by quota / watermarks / health",
+        "selector": "Quota / availability / preference",
         "report": "Index updates / queries · reporter visibility",
         "meta": "meta · Metadata indexes",
         "indexer_manager": "Isolated by instance_id · shared QueryExecutor",

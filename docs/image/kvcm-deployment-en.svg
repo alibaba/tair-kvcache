@@ -13,73 +13,73 @@
 <rect x="0" y="0" width="1920" height="1080" rx="0" fill="#F7F9FC" stroke="none" stroke-width="1.5"/>
 <rect x="56" y="57" width="7" height="78" rx="3" fill="#F18536" stroke="none" stroke-width="1.5"/>
 <text x="83" y="93" font-size="44" font-weight="700" fill="#152B48" text-anchor="start">Tair KVCache Manager</text>
-<text x="84" y="138" font-size="25" font-weight="400" fill="#566B83" text-anchor="start" data-max-width="1640">Deployment: inference services · KVCM active-standby · shared KVCache storage</text>
+<text x="84" y="138" font-size="25" font-weight="400" fill="#566B83" text-anchor="start">Deployment: inference services · KVCM active-standby · shared KVCache storage</text>
 <text x="1864" y="88" font-size="18" font-weight="500" fill="#566B83" text-anchor="end">DEPLOYMENT ARCHITECTURE</text>
 <rect x="360" y="192" width="1200" height="280" rx="20" fill="white" stroke="#C9D9F0" stroke-width="1.5"/>
-<text x="384" y="235" font-size="32" font-weight="600" fill="#2865D6" text-anchor="start" data-max-width="860">Inference services</text>
+<text x="384" y="235" font-size="32" font-weight="600" fill="#2865D6" text-anchor="start">Inference services</text>
 <rect x="1376" y="210" width="160" height="32" rx="16" fill="#EAF0FB" stroke="none" stroke-width="1.5"/>
-<text x="1456.0" y="233" font-size="18" font-weight="500" fill="#2865D6" text-anchor="middle" data-max-width="144">Same Instance</text>
-<text x="384" y="274" font-size="24" font-weight="400" fill="#566B83" text-anchor="start" data-max-width="1152">vLLM · SGLang · RTP-LLM · TRT-LLM</text>
+<text x="1456.0" y="233" font-size="18" font-weight="500" fill="#2865D6" text-anchor="middle">Same Instance</text>
+<text x="384" y="274" font-size="24" font-weight="400" fill="#566B83" text-anchor="start">vLLM · SGLang · RTP-LLM · TRT-LLM</text>
 <rect x="384" y="300" width="560" height="148" rx="14" fill="#FAFBFE" stroke="#D8E2EF" stroke-width="1.5"/>
-<text x="404" y="335" font-size="25" font-weight="600" fill="#152B48" text-anchor="start" data-max-width="520">Inference node A · GPU / host memory</text>
-<text x="404" y="370" font-size="21" font-weight="400" fill="#566B83" text-anchor="start" data-max-width="520">Client / Connector (in each inference process)</text>
+<text x="404" y="335" font-size="25" font-weight="600" fill="#152B48" text-anchor="start">Inference node A · GPU / host memory</text>
+<text x="404" y="370" font-size="21" font-weight="400" fill="#566B83" text-anchor="start">Client / Connector (in each inference process)</text>
 <rect x="404" y="388" width="242" height="42" rx="10" fill="#F0F5FF" stroke="#B7CDF4" stroke-width="1.5"/>
-<text x="525" y="416" font-size="21" font-weight="600" fill="#2865D6" text-anchor="middle" data-max-width="210">Meta / ReportEvent</text>
+<text x="525" y="416" font-size="21" font-weight="600" fill="#2865D6" text-anchor="middle">Meta / ReportEvent</text>
 <rect x="662" y="388" width="262" height="42" rx="10" fill="#EAF8F3" stroke="#BBE2D7" stroke-width="1.5"/>
-<text x="793" y="416" font-size="23" font-weight="600" fill="#058475" text-anchor="middle" data-max-width="230">TransferClient</text>
+<text x="793" y="416" font-size="23" font-weight="600" fill="#058475" text-anchor="middle">TransferClient</text>
 <rect x="976" y="300" width="560" height="148" rx="14" fill="#FAFBFE" stroke="#D8E2EF" stroke-width="1.5"/>
-<text x="996" y="335" font-size="25" font-weight="600" fill="#152B48" text-anchor="start" data-max-width="520">Inference node B · GPU / host memory</text>
-<text x="996" y="370" font-size="21" font-weight="400" fill="#566B83" text-anchor="start" data-max-width="520">Client / Connector (in each inference process)</text>
+<text x="996" y="335" font-size="25" font-weight="600" fill="#152B48" text-anchor="start">Inference node B · GPU / host memory</text>
+<text x="996" y="370" font-size="21" font-weight="400" fill="#566B83" text-anchor="start">Client / Connector (in each inference process)</text>
 <rect x="996" y="388" width="242" height="42" rx="10" fill="#F0F5FF" stroke="#B7CDF4" stroke-width="1.5"/>
-<text x="1117" y="416" font-size="21" font-weight="600" fill="#2865D6" text-anchor="middle" data-max-width="210">Meta / ReportEvent</text>
+<text x="1117" y="416" font-size="21" font-weight="600" fill="#2865D6" text-anchor="middle">Meta / ReportEvent</text>
 <rect x="1254" y="388" width="262" height="42" rx="10" fill="#EAF8F3" stroke="#BBE2D7" stroke-width="1.5"/>
-<text x="1385" y="416" font-size="23" font-weight="600" fill="#058475" text-anchor="middle" data-max-width="230">TransferClient</text>
+<text x="1385" y="416" font-size="23" font-weight="600" fill="#058475" text-anchor="middle">TransferClient</text>
 <rect x="56" y="588" width="864" height="352" rx="20" fill="white" stroke="#B9CFEA" stroke-width="2"/>
-<text x="80" y="632" font-size="32" font-weight="600" fill="#2865D6" text-anchor="start" data-max-width="816">Tair KVCache Manager service</text>
-<text x="80" y="666" font-size="21" font-weight="400" fill="#566B83" text-anchor="start" data-max-width="816">Active-standby · leader discovery &amp; failover routing</text>
+<text x="80" y="632" font-size="32" font-weight="600" fill="#2865D6" text-anchor="start">Tair KVCache Manager service</text>
+<text x="80" y="666" font-size="21" font-weight="400" fill="#566B83" text-anchor="start">Active-standby · leader discovery &amp; failover routing</text>
 <rect x="128" y="722" width="768" height="166" rx="14" fill="#EDF1F6" stroke="#D9E1EC" stroke-width="1.5"/>
 <rect x="104" y="704" width="768" height="166" rx="14" fill="#F4F6FA" stroke="#D9E1EC" stroke-width="1.5"/>
 <rect x="80" y="686" width="768" height="166" rx="14" fill="url(#manager)" stroke="#B7CDF4" stroke-width="1.5"/>
-<text x="104" y="727" font-size="31" font-weight="600" fill="#2865D6" text-anchor="start" data-max-width="720">KVCM · Leader</text>
-<text x="104" y="771" font-size="23" font-weight="500" fill="#152B48" text-anchor="start" data-max-width="720">Metadata / control requests</text>
-<text x="104" y="817" font-size="18" font-weight="400" fill="#566B83" text-anchor="start" data-max-width="336">Match · confirm writes · ReportEvent</text>
+<text x="104" y="727" font-size="31" font-weight="600" fill="#2865D6" text-anchor="start">KVCM · Leader</text>
+<text x="104" y="771" font-size="23" font-weight="500" fill="#152B48" text-anchor="start">Metadata / control requests</text>
+<text x="104" y="817" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Match · confirm writes · ReportEvent</text>
 <path d="M 456 797 V 828" fill="none" stroke="#D4E0F3" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-<text x="472" y="817" font-size="18" font-weight="400" fill="#566B83" text-anchor="start" data-max-width="352">Quota &amp; reclaim · GC · tiered migration</text>
-<text x="872" y="879" font-size="17" font-weight="400" fill="#8190A6" text-anchor="end" data-max-width="220">Follower × N</text>
-<text x="80" y="917" font-size="22" font-weight="500" fill="#2865D6" text-anchor="start" data-max-width="816">Global KVCache locations, state and capacity</text>
+<text x="472" y="817" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Quota &amp; reclaim · GC · tiered migration</text>
+<text x="872" y="879" font-size="17" font-weight="400" fill="#8190A6" text-anchor="end">Follower × N</text>
+<text x="80" y="917" font-size="22" font-weight="500" fill="#2865D6" text-anchor="start">Global KVCache locations, state and capacity</text>
 <rect x="1136" y="588" width="728" height="440" rx="20" fill="white" stroke="#B9DDD0" stroke-width="2"/>
-<text x="1160" y="632" font-size="32" font-weight="600" fill="#058475" text-anchor="start" data-max-width="680">Storage cluster</text>
-<text x="1160" y="666" font-size="21" font-weight="400" fill="#566B83" text-anchor="start" data-max-width="680">Pluggable backends · scale capacity as needed</text>
+<text x="1160" y="632" font-size="32" font-weight="600" fill="#058475" text-anchor="start">Storage cluster</text>
+<text x="1160" y="666" font-size="21" font-weight="400" fill="#566B83" text-anchor="start">Pluggable backends · scale capacity as needed</text>
 <rect x="1160" y="694" width="680" height="86" rx="12" fill="#F1FAF5" stroke="#D0E6DD" stroke-width="1.5"/>
-<text x="1184" y="729" font-size="28" font-weight="600" fill="#152B48" text-anchor="start" data-max-width="632">TairMemPool</text>
-<text x="1184" y="761" font-size="21" font-weight="400" fill="#566B83" text-anchor="start" data-max-width="632">DRAM / SSD</text>
+<text x="1184" y="729" font-size="28" font-weight="600" fill="#152B48" text-anchor="start">TairMemPool</text>
+<text x="1184" y="761" font-size="21" font-weight="400" fill="#566B83" text-anchor="start">DRAM / SSD</text>
 <rect x="1160" y="804" width="680" height="86" rx="12" fill="#F1FAF5" stroke="#D0E6DD" stroke-width="1.5"/>
-<text x="1184" y="839" font-size="28" font-weight="600" fill="#152B48" text-anchor="start" data-max-width="632">HF3FS · NFS</text>
-<text x="1184" y="871" font-size="21" font-weight="400" fill="#566B83" text-anchor="start" data-max-width="632">File storage backends</text>
+<text x="1184" y="839" font-size="28" font-weight="600" fill="#152B48" text-anchor="start">HF3FS · NFS</text>
+<text x="1184" y="871" font-size="21" font-weight="400" fill="#566B83" text-anchor="start">File storage backends</text>
 <rect x="1160" y="914" width="680" height="86" rx="12" fill="#F1FAF5" stroke="#D0E6DD" stroke-width="1.5"/>
-<text x="1184" y="949" font-size="28" font-weight="600" fill="#152B48" text-anchor="start" data-max-width="632">Mooncake* · VCNS HF3FS*</text>
-<text x="1184" y="981" font-size="21" font-weight="400" fill="#566B83" text-anchor="start" data-max-width="632">* Optional build-time backends</text>
+<text x="1184" y="949" font-size="28" font-weight="600" fill="#152B48" text-anchor="start">Mooncake* · VCNS HF3FS*</text>
+<text x="1184" y="981" font-size="21" font-weight="400" fill="#566B83" text-anchor="start">* Optional build-time backends</text>
 <rect x="224" y="966" width="528" height="62" rx="12" fill="#EFF3F8" stroke="#DFE5EF" stroke-width="1"/>
-<text x="488" y="991" font-size="22" font-weight="500" fill="#566B83" text-anchor="middle" data-max-width="480">Persistent storage</text>
-<text x="488" y="1017" font-size="17" font-weight="400" fill="#566B83" text-anchor="middle" data-max-width="480">Configuration / metadata · e.g. Redis (optional)</text>
+<text x="488" y="991" font-size="22" font-weight="500" fill="#566B83" text-anchor="middle">Persistent storage</text>
+<text x="488" y="1017" font-size="17" font-weight="400" fill="#566B83" text-anchor="middle">Configuration / metadata · e.g. Redis (optional)</text>
 <path d="M 488 942 V 964" fill="none" stroke="#97A9BE" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)" stroke-dasharray="7 6"/>
 <path d="M 600 474 V 520 H 488 V 586" fill="none" stroke="#2865D6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#blue)"/>
-<text x="80" y="505" font-size="25" font-weight="600" fill="#2865D6" text-anchor="start" data-max-width="360">Metadata plane</text>
-<text x="80" y="538" font-size="18" font-weight="400" fill="#2865D6" text-anchor="start" data-max-width="360">Query / two-phase writes / ReportEvent</text>
-<text x="80" y="567" font-size="17" font-weight="400" fill="#566B83" text-anchor="start" data-max-width="360">Discover the Leader via GetClusterInfo</text>
+<text x="80" y="505" font-size="25" font-weight="600" fill="#2865D6" text-anchor="start">Metadata plane</text>
+<text x="80" y="538" font-size="18" font-weight="400" fill="#2865D6" text-anchor="start">Query / two-phase writes / ReportEvent</text>
+<text x="80" y="567" font-size="17" font-weight="400" fill="#566B83" text-anchor="start">Discover the Leader via GetClusterInfo</text>
 <path d="M 1320 474 V 520 H 1500 V 586" fill="none" stroke="#058475" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#teal)" marker-start="url(#teal)"/>
-<text x="1580" y="505" font-size="24" font-weight="600" fill="#058475" text-anchor="start" data-max-width="284">Direct KVCache I/O</text>
-<text x="1580" y="540" font-size="19" font-weight="400" fill="#058475" text-anchor="start" data-max-width="284">High-bandwidth payload I/O</text>
+<text x="1580" y="505" font-size="24" font-weight="600" fill="#058475" text-anchor="start">Direct KVCache I/O</text>
+<text x="1580" y="540" font-size="19" font-weight="400" fill="#058475" text-anchor="start">High-bandwidth payload I/O</text>
 <path d="M 922 790 H 1134" fill="none" stroke="#97A9BE" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#gray)" marker-start="url(#gray)"/>
-<text x="1028" y="739" font-size="21" font-weight="500" fill="#566B83" text-anchor="middle" data-max-width="204">Leader backend ops</text>
-<text x="1028" y="772" font-size="17" font-weight="400" fill="#566B83" text-anchor="middle" data-max-width="204">Create / delete / migrate</text>
-<text x="1028" y="825" font-size="17" font-weight="400" fill="#566B83" text-anchor="middle" data-max-width="204">Health / watermarks</text>
+<text x="1028" y="739" font-size="21" font-weight="500" fill="#566B83" text-anchor="middle">Leader backend ops</text>
+<text x="1028" y="772" font-size="17" font-weight="400" fill="#566B83" text-anchor="middle">Create / delete / migrate</text>
+<text x="1028" y="825" font-size="17" font-weight="400" fill="#566B83" text-anchor="middle">Health / watermarks</text>
 <path d="M 56 1058 h 28" fill="none" stroke="#2865D6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="96" y="1065" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Metadata</text>
 <path d="M 266 1058 h 28" fill="none" stroke="#058475" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="306" y="1065" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Direct I/O</text>
 <path d="M 464 1058 h 28" fill="none" stroke="#97A9BE" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
 <text x="504" y="1065" font-size="18" font-weight="400" fill="#566B83" text-anchor="start">Backend ops / persistence</text>
-<text x="1864" y="1065" font-size="19" font-weight="500" fill="#152B48" text-anchor="end" data-max-width="800">Reuse scope: same instance_id, across requests / nodes</text>
+<text x="1864" y="1065" font-size="19" font-weight="500" fill="#152B48" text-anchor="end">Reuse scope: same instance_id, across requests / nodes</text>
 </g>
 </svg>

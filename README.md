@@ -2,7 +2,7 @@
 
 --------------------------------------------------------------------------------
 <p align="center"> 
-    |<a href="https://github.com/alibaba/tair-kvcache/blob/main/README_zh.md"><b>中文版本</b></a>|
+    |<a href="README_zh.md"><b>中文版本</b></a>|
 </p>
 
 --------------------------------------------------------------------------------
@@ -60,7 +60,7 @@ The main components, in one sentence each:
 **Foreground requests**
 - **MetaSearcher**: finds cache—matches reusable KVCache locations from the index based on the request's tokens/blocks.
 - **WriteLocationManager**: write-session management—records the locations and timeout for a two-phase write so the confirmation step can find them.
-- **DataStorageSelector**: picks storage—chooses the storage backend for a write based on quota, watermarks, and health.
+- **DataStorageSelector**: picks storage—chooses the storage backend for a write based on quota, backend availability, and preference strategy.
 - **ReportEvent / GetHostCacheState**: inference-side cache state—accepts L1.5/L2 cache reports and answers host-level hit queries; metadata only.
 
 **Metadata and storage**
@@ -73,7 +73,7 @@ The main components, in one sentence each:
 **Configuration, infrastructure, and ecosystem**
 - **RegistryManager / LeaderElector**: store instance, quota, and storage configs and handle active-standby election and failover.
 - **event / metrics / protocol / common**: provide the event bus, metrics, protocol contracts, logging, Redis, request context, and other shared infrastructure.
-- **client / py_connector / client_java / manager_client**: connect inference engines to KVCM for metadata queries and KVCache data transfer; choose the client that fits the engine and language.
+- **client / py_connector / client_java / manager_client**: connect inference engines to KVCM for metadata queries; `client` and `py_connector` also handle KVCache data transfer, so choose the client that fits the engine and language.
 - **optimizer / HiSim / kvcm_ops**: optimizer replays traces for policy and capacity planning, HiSim simulates inference on CPU, and kvcm_ops manages storage, instance groups, and cluster state.
 
 ### How a read/write works
