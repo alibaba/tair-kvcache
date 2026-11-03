@@ -197,11 +197,29 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `meta_indexer.total_cache_usage` | gauge | Total cache usage bytes |
 | `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |
 | `data_storage.writable_status` | gauge | Storage backend write availability (1/0); 0 in read-only mode |
-| `data_storage.storage_usage_ratio` | gauge | Storage usage ratio |
+| `data_storage.storage_usage_ratio` | gauge | Storage usage ratio. Followers publish 0, clearing any previous value on demotion; this does not mean the store is empty. Leaders (or callers without a role provider) preserve backend return values, including a default 0; negative values are skipped. Health and writability are reported independently, preserving connectivity alerts |
+| `is_leader` | gauge | Whether this node holds the leader lease (1/0), exported as `kvcm_is_leader` |
+| `access_mode` | gauge | Read/write capability this node can currently offer (0/1/2), exported as `kvcm_access_mode` |
 | `cache_manager.write_location_expire_size` | gauge | Expired write locations |
 | `cache_manager_group.usage_ratio` | gauge | Group KVCM quota usage ratio (excluding EventReport) |
 | `cache_manager_instance.key_count` | gauge | Per-instance key count |
 | `cache_manager_instance.byte_size` | gauge | Per-instance KVCM quota bytes (excluding EventReport) |
+
+`is_leader` and `access_mode` are node-level metrics and carry no `type` /
+`unique_name` labels. Every data-plane API is leader-only, so `access_mode` is
+always 0 on a follower. On the leader the value reflects the aggregated
+capability of the registered storage backends: at least one backend reporting
+`Available()` gives read capability, so `access_mode` is at least 1, and at least
+one backend reporting `Writable()` also gives write capability, making it 2. It
+is 0 when no backend is available. When storage degrades to read-only
+(`data_storage.writable_status` is 0 while `healthy_status` is 1), the leader
+reports `access_mode` 1. Both metrics are published by the periodic reporting
+thread, so offline tools that never install a leader state callback do not
+export them.
+
+For TairMempool, `healthy_status=1` means the backend is open for reads. A meta-service connectivity failure is reflected by `writable_status=0`, allowing read-only degradation. Writability follows the background health probe rather than changing immediately on a single request timeout.
+
+A cold-start follower has no storage-level series until storage backends are loaded. On demotion, previously published usage ratios are reset to zero even if cleanup has removed the backends. Health and writability also become zero for closed and removed backends, clearing readings retained from the previous leader tenure.
 
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.

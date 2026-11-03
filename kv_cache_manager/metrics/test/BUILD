@@ -65,6 +65,23 @@ cc_test(
 )
 
 cc_test(
+    name = "NodeStatusMetricsTest",
+    srcs = [
+        "node_status_metrics_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:data_storage",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/metrics:node_status_metrics",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+    ],
+)
+
+cc_test(
     name = "LoggingMetricsReporterTest",
     srcs = [
         "logging_metrics_reporter_test.cc",
