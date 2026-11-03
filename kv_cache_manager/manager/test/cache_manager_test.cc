@@ -16,6 +16,7 @@
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_group.h"
@@ -3593,7 +3594,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_MissingEventReportBackendF
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     loc.set_location_specs(
-        {LocationSpec("tp0", "event_report://cache-node/mem?s_version=0123456789abcdef0123456789abcdef")});
+        {LocationSpec("tp0", "event_report://cache-node/mem?s_v=01234567")});
 
     EXPECT_FALSE(func(loc));
 }
@@ -3644,7 +3645,7 @@ TEST_F(CacheManagerTest, TestReportEventDeltaAlreadyAdmittedThenSnapshotWins) {
     const auto uris = QueryEventReportUris({key});
     ASSERT_EQ(1u, uris.size());
     EXPECT_NE(std::string::npos, uris[0].find("source=snapshot_after_delta"));
-    EXPECT_NE(std::string::npos, uris[0].find("s_version=" + snapshot_token));
+    EXPECT_NE(std::string::npos, uris[0].find("s_v=" + snapshot_token));
 }
 
 TEST_F(CacheManagerTest, TestReportEventSnapshotGateThenDeltaInheritsNewTokenAndWins) {
@@ -3692,7 +3693,7 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotGateThenDeltaInheritsNewTokenAnd
     const auto uris = QueryEventReportUris({key});
     ASSERT_EQ(1u, uris.size());
     EXPECT_NE(std::string::npos, uris[0].find("source=delta_after_snapshot_gate"));
-    EXPECT_NE(std::string::npos, uris[0].find("s_version=" + new_token));
+    EXPECT_NE(std::string::npos, uris[0].find("s_v=" + new_token));
 }
 
 TEST_F(CacheManagerTest, TestReportEventDeltaGateTimeoutReturnsSnapshotInProgressAndCanRetry) {
@@ -3746,7 +3747,7 @@ TEST_F(CacheManagerTest, TestReportEventDeltaGateTimeoutReturnsSnapshotInProgres
     const auto uris = QueryEventReportUris({delta_key});
     ASSERT_EQ(1u, uris.size());
     EXPECT_NE(std::string::npos, uris.front().find("source=retried_delta"));
-    EXPECT_NE(std::string::npos, uris.front().find("s_version=" + snapshot_token));
+    EXPECT_NE(std::string::npos, uris.front().find("s_v=" + snapshot_token));
 }
 
 TEST_F(CacheManagerTest, TestHostDownCancelsSnapshotAlreadyWritingMetadata) {
@@ -4044,7 +4045,7 @@ TEST_F(CacheManagerTest, TestReportEventPartialSnapshotFailureKeepsCacheReadable
     ASSERT_EQ(2u, visible_after_retry.size());
     std::set<std::string> retry_sources;
     for (const auto &uri : visible_after_retry) {
-        EXPECT_NE(std::string::npos, uri.find("s_version=" + retry_token));
+        EXPECT_NE(std::string::npos, uri.find("s_v=" + retry_token));
         if (uri.find("source=retry_a") != std::string::npos) {
             retry_sources.insert("retry_a");
         }
@@ -4079,7 +4080,7 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotCommitsWithoutWaitingForPersiste
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=async_snapshot"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + committed));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + committed));
 }
 
 TEST_F(CacheManagerTest, TestReportEventSameRequestDeltaOrderUsesLastOperationPerSpec) {
@@ -4131,7 +4132,7 @@ TEST_F(CacheManagerTest, TestReportEventSameRequestDeltaOrderUsesLastOperationPe
     visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=final_add"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + token));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + token));
 }
 
 class ReportEventLifetimeTest : public CacheManagerTest {
@@ -5006,7 +5007,7 @@ TEST_F(CacheManagerTest, TestReportEventLazilyRestoresReporterWithoutRegisterOrS
     auto visible = QueryEventReportUris({9427});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=first_delta"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + first_delta.committed_snapshot_version()));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + first_delta.committed_snapshot_version()));
 
     const auto [first_snapshot_ec, first_snapshot] =
         CallReportEvent(MakeSnapshotRequest(snapshot_host, {}), "snapshot_without_register");
@@ -5156,7 +5157,7 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotWhileUnavailableCommitsButStaysH
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=snapshot_while_unavailable"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + snapshot_generation));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + snapshot_generation));
 }
 
 TEST_F(CacheManagerTest, TestReportEventHeartbeatRecoveryCarriesSameRequestMutationsIntoNewLifecycle) {
@@ -5264,7 +5265,7 @@ TEST_F(CacheManagerTest, TestReportEventRegisterThenFirstDeltaInSameRequest) {
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=same_request_first_delta"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + response.committed_snapshot_version()));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + response.committed_snapshot_version()));
 }
 
 TEST_F(CacheManagerTest, TestReportEventDeltaBeforeExplicitRegisterSucceedsInSameRequest) {
@@ -5292,7 +5293,7 @@ TEST_F(CacheManagerTest, TestReportEventDeltaBeforeExplicitRegisterSucceedsInSam
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=delta_before_register"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + response.committed_snapshot_version()));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + response.committed_snapshot_version()));
 }
 
 TEST_F(CacheManagerTest, TestReportEventAdmissionFailurePropagatesToLaterRelatedMutation) {
@@ -5546,7 +5547,7 @@ TEST_F(CacheManagerTest, TestReportEventInvalidFirstDeltaDoesNotCreateVersionBut
     const auto visible = QueryEventReportUris({valid_key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=valid_in_partial_first_delta"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + partial_response.committed_snapshot_version()));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + partial_response.committed_snapshot_version()));
 }
 
 TEST_F(CacheManagerTest, TestReportEventFirstDeleteWithoutSnapshotCreatesReusableVersion) {
@@ -5578,7 +5579,7 @@ TEST_F(CacheManagerTest, TestReportEventFirstDeleteWithoutSnapshotCreatesReusabl
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=after_first_delete"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + version));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + version));
 }
 
 TEST_F(CacheManagerTest, TestReportEventMissingBlockDeletesRemainSuccessfulAsOneBatch) {
@@ -5657,8 +5658,8 @@ TEST_F(CacheManagerTest, TestReportEventRestartKeepsHistoricalCacheAndAcceptsDel
     const auto [before_ec, before] =
         CallReportEvent(MakeAddRequest(host, historical_key, "before_restart"), "delta_before_restart");
     ASSERT_EQ(EC_OK, before_ec);
-    const std::string previous_version = before.committed_snapshot_version();
-    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(previous_version));
+    const std::string previous_v = before.committed_snapshot_version();
+    ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(previous_v));
     ASSERT_EQ(1u, QueryEventReportUris({historical_key}).size());
 
     const StorageConfig storage_config = event_backend->GetStorageConfig();
@@ -5679,7 +5680,7 @@ TEST_F(CacheManagerTest, TestReportEventRestartKeepsHistoricalCacheAndAcceptsDel
     EXPECT_EQ(proto::meta::OK, delta.header().status().code());
     EXPECT_TRUE(delta.snapshot_required());
     ASSERT_TRUE(SnapshotUriUtils::IsValidSnapshotVersionToken(delta.committed_snapshot_version()));
-    EXPECT_NE(previous_version, delta.committed_snapshot_version());
+    EXPECT_NE(previous_v, delta.committed_snapshot_version());
     EXPECT_TRUE(event_backend->IsNodeRegistered("test_instance", host));
     EXPECT_TRUE(event_backend->IsNodeAvailable("test_instance", host));
 
@@ -5759,7 +5760,7 @@ TEST_F(CacheManagerTest, TestReportEventRejectsCanonicalDuplicateSnapshotKeysBut
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(2u, visible.size());
     for (const auto &uri : visible) {
-        EXPECT_NE(std::string::npos, uri.find("s_version=" + token));
+        EXPECT_NE(std::string::npos, uri.find("s_v=" + token));
     }
 }
 
@@ -5808,13 +5809,64 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotReplacesCompleteSpecSetPerBlock)
     for (const auto &uri : visible) {
         EXPECT_EQ(std::string::npos, uri.find("source=old_tp0"));
         EXPECT_EQ(std::string::npos, uri.find("source=old_tp1"));
-        EXPECT_NE(std::string::npos, uri.find("s_version=" + replacement_token));
+        EXPECT_NE(std::string::npos, uri.find("s_v=" + replacement_token));
         found_tp1 = found_tp1 || uri.find("source=new_tp1") != std::string::npos;
         found_tp2 = found_tp2 || uri.find("source=new_tp2") != std::string::npos;
     }
     EXPECT_TRUE(found_tp1);
     EXPECT_TRUE(found_tp2);
     EXPECT_EQ(2u, QueryRawEventReportUris(key).size());
+
+    const auto instance_info = registry_manager_->GetInstanceInfo(request_context_.get(), "test_instance");
+    ASSERT_NE(nullptr, instance_info);
+    const auto [query_ec, snapshot_locations] = cache_manager_->GetCacheLocation(
+        request_context_.get(), "test_instance", CacheManager::QueryType::QT_BATCH_GET, {key}, {}, BlockMask{}, 0, {});
+    ASSERT_EQ(EC_OK, query_ec);
+    for (const auto &location : snapshot_locations.cache_locations_view()) {
+        for (const auto &spec : location.location_specs()) {
+            const auto &spec_infos = instance_info->location_spec_infos();
+            const auto it = std::find_if(spec_infos.begin(), spec_infos.end(), [&](const auto &info) {
+                return info.name() == spec.name();
+            });
+            ASSERT_NE(spec_infos.end(), it);
+            EXPECT_EQ(&it->name(), &spec.name());
+        }
+    }
+
+    auto ambiguous_snapshot = make_snapshot({{"tp0", "ambiguous"}, {"tp1", "normal"}});
+    auto *ambiguous_block = ambiguous_snapshot.mutable_events(0)->mutable_block_snapshot()->mutable_blocks(0);
+    ambiguous_block->set_block_key(std::to_string(key + 1));
+    ambiguous_block->mutable_specs(0)->set_uri("p?q://" + host + "/mem?size=1");
+    const auto [ambiguous_ec, ambiguous_response] = CallReportEvent(ambiguous_snapshot, "ambiguous_snapshot_uri");
+    EXPECT_EQ(EC_PARTIAL_OK, ambiguous_ec);
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, ambiguous_response.header().status().code());
+    EXPECT_EQ(replacement_token, ambiguous_response.committed_snapshot_version());
+    EXPECT_EQ(visible, QueryEventReportUris({key}));
+    EXPECT_TRUE(QueryRawEventReportUris(key + 1).empty());
+}
+
+TEST_F(CacheManagerTest, TestReportEventRateLimitedSnapshotDoesNotApplyPreparedTasks) {
+    const std::string host = "192.168.10.88:8080";
+    constexpr int64_t key = 9440;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
+    event_backend->SetSnapshotMinIntervalMsForTest(3'600'000);
+    const auto [baseline_ec, baseline] =
+        CallReportEvent(MakeSnapshotRequest(host, {{key, "baseline"}}), "rate_limit_prepared_baseline");
+    ASSERT_EQ(EC_OK, baseline_ec);
+    const auto [limited_ec, limited] = CallReportEvent(
+        MakeSnapshotRequest(host, {{key + 1, "new"}, {key, "replacement"}}), "rate_limit_prepared_tasks");
+    EXPECT_EQ(EC_PARTIAL_OK, limited_ec);
+    EXPECT_GT(limited.retry_after_ms(), 0u);
+    EXPECT_EQ(baseline.committed_snapshot_version(), limited.committed_snapshot_version());
+    EXPECT_TRUE(QueryRawEventReportUris(key + 1).empty());
+    const auto raw = QueryRawEventReportUris(key);
+    ASSERT_EQ(1u, raw.size());
+    EXPECT_NE(std::string::npos, raw.front().find("source=baseline"));
+    EXPECT_NE(std::string::npos,
+              raw.front().find(std::string(SnapshotUriUtils::kSnapshotVersionParam) + "=" +
+                               baseline.committed_snapshot_version()));
 }
 
 TEST_F(CacheManagerTest, TestReportEventRejectsDuplicatePhysicalSnapshotItemsWithoutStateChange) {
@@ -5852,7 +5904,7 @@ TEST_F(CacheManagerTest, TestReportEventRejectsDuplicatePhysicalSnapshotItemsWit
     const auto visible_after_rejection = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible_after_rejection.size());
     EXPECT_NE(std::string::npos, visible_after_rejection.front().find("source=baseline"));
-    EXPECT_NE(std::string::npos, visible_after_rejection.front().find("s_version=" + baseline_token));
+    EXPECT_NE(std::string::npos, visible_after_rejection.front().find("s_v=" + baseline_token));
     EXPECT_EQ(1u, QueryRawEventReportUris(key).size());
 
     const auto [retry_ec, retry] =
@@ -5902,7 +5954,7 @@ TEST_F(CacheManagerTest, TestReportEventRejectsDuplicateSpecNamesWithinSnapshotB
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=baseline"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + baseline_token));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + baseline_token));
 }
 
 TEST_F(CacheManagerTest, TestReportEventStoresSameSpecAcrossMediaAndDeduplicatesQueryByName) {
@@ -5933,7 +5985,7 @@ TEST_F(CacheManagerTest, TestReportEventStoresSameSpecAcrossMediaAndDeduplicates
     bool stored_mem = false;
     bool stored_disk = false;
     for (const auto &uri : raw) {
-        EXPECT_NE(std::string::npos, uri.find("s_version=" + token));
+        EXPECT_NE(std::string::npos, uri.find("s_v=" + token));
         stored_mem = stored_mem || uri.find("/mem?") != std::string::npos;
         stored_disk = stored_disk || uri.find("/disk?") != std::string::npos;
     }
@@ -5945,7 +5997,7 @@ TEST_F(CacheManagerTest, TestReportEventStoresSameSpecAcrossMediaAndDeduplicates
     // two logical tp0 components.
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + token));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + token));
     EXPECT_TRUE(visible.front().find("/mem?") != std::string::npos ||
                 visible.front().find("/disk?") != std::string::npos);
 }
@@ -6034,11 +6086,11 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotCommitReclaimsOnlyStaleReporterL
     const auto current_uris = QueryRawEventReportUris(current_key);
     ASSERT_EQ(1u, current_uris.size());
     EXPECT_NE(std::string::npos, current_uris.front().find("source=host_a_new_current"));
-    EXPECT_NE(std::string::npos, current_uris.front().find("s_version=" + host_a_new_token));
+    EXPECT_NE(std::string::npos, current_uris.front().find("s_v=" + host_a_new_token));
     const auto other_host_uris = QueryRawEventReportUris(other_host_key);
     ASSERT_EQ(1u, other_host_uris.size());
     EXPECT_NE(std::string::npos, other_host_uris.front().find("source=host_b_current"));
-    EXPECT_NE(std::string::npos, other_host_uris.front().find("s_version=" + host_b_token));
+    EXPECT_NE(std::string::npos, other_host_uris.front().find("s_v=" + host_b_token));
 
     // Re-scanning after the stale location has already gone is idempotent.
     EXPECT_EQ(EC_OK,
@@ -6363,7 +6415,7 @@ TEST_F(CacheManagerTest, TestSnapshotCleanupCASPreservesLocationRefreshedAfterSc
     const auto raw_uris = QueryRawEventReportUris(key);
     ASSERT_EQ(1u, raw_uris.size());
     EXPECT_NE(std::string::npos, raw_uris.front().find("source=refreshed"));
-    EXPECT_NE(std::string::npos, raw_uris.front().find("s_version=" + refreshed_token));
+    EXPECT_NE(std::string::npos, raw_uris.front().find("s_v=" + refreshed_token));
     ASSERT_EQ(1u, QueryEventReportUris({key}).size());
 }
 
@@ -6476,7 +6528,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncFencesVersionsAfterSuccessf
     ASSERT_NE(nullptr, event_backend);
     ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host, {"mem"}));
 
-    const std::string unknown_token = "ffffffffffffffffffffffffffffffff";
+    const std::string unknown_token = "ffffffff";
     const std::string legacy_uri = "event_report://physical-cache:9600/mem?source=legacy";
     std::string unknown_uri;
     ASSERT_TRUE(SnapshotUriUtils::AddSnapshotVersionToUri(
@@ -6514,7 +6566,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncFencesVersionsAfterSuccessf
     location.set_location_specs({LocationSpec("tp0", unknown_uri)});
     EXPECT_FALSE(check(location));
     location.set_location_specs(
-        {LocationSpec("tp0", current_uri), LocationSpec("tp1", "event_report://raw/mem?s_version=bad")});
+        {LocationSpec("tp0", current_uri), LocationSpec("tp1", "event_report://raw/mem?s_v=bad")});
     EXPECT_FALSE(check(location));
     location.set_location_specs({});
     EXPECT_FALSE(check(location));
@@ -6573,8 +6625,8 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncFencesVersionsAfterSuccessf
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMatrix) {
     const std::string instance_id = "test_instance";
     const std::string host = "192.168.10.37:8080";
-    const std::string token = "0123456789abcdef0123456789abcdef";
-    const std::string upper_token = "ABCDEF0123456789ABCDEF0123456789";
+    const std::string token = "01234567";
+    const std::string upper_token = "ABCDEF01";
     auto event_backend = InstallEventReportBackend();
     ASSERT_NE(nullptr, event_backend);
     ASSERT_EQ(EC_OK, event_backend->RegisterNode(instance_id, host, {"mem"}));
@@ -6594,21 +6646,21 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
         {"empty_specs", {}, false},
         {"legacy_without_query", {"event_report://physical-cache:9600/mem"}, true},
         {"legacy_with_other_params", {"event_report://physical-cache:9600/mem?size=4096&offset=0"}, true},
-        {"valid_lowercase_version", {"event_report://physical-cache:9600/mem?s_version=" + token}, true},
-        {"valid_uppercase_version", {"event_report://physical-cache:9600/mem?s_version=" + upper_token}, true},
-        {"near_match_param", {"event_report://physical-cache:9600/mem?xs_version=bad&s_version_suffix=bad"}, true},
-        {"empty_version", {"event_report://physical-cache:9600/mem?s_version="}, false},
-        {"version_without_equals", {"event_report://physical-cache:9600/mem?s_version"}, false},
-        {"short_version", {"event_report://physical-cache:9600/mem?s_version=" + std::string(31, 'a')}, false},
-        {"long_version", {"event_report://physical-cache:9600/mem?s_version=" + std::string(33, 'a')}, false},
+        {"valid_lowercase_version", {"event_report://physical-cache:9600/mem?s_v=" + token}, true},
+        {"valid_uppercase_version", {"event_report://physical-cache:9600/mem?s_v=" + upper_token}, true},
+        {"near_match_param", {"event_report://physical-cache:9600/mem?xs_v=bad&s_v_suffix=bad"}, true},
+        {"empty_version", {"event_report://physical-cache:9600/mem?s_v="}, false},
+        {"version_without_equals", {"event_report://physical-cache:9600/mem?s_v"}, false},
+        {"short_version", {"event_report://physical-cache:9600/mem?s_v=" + std::string(7, 'a')}, false},
+        {"long_version", {"event_report://physical-cache:9600/mem?s_v=" + std::string(9, 'a')}, false},
         {"non_hex_version",
-         {"event_report://physical-cache:9600/mem?s_version=0123456789abcdef0123456789abcdeg"},
+         {"event_report://physical-cache:9600/mem?s_v=0123456g"},
          false},
         {"duplicate_same_version",
-         {"event_report://physical-cache:9600/mem?s_version=" + token + "&s_version=" + token},
+         {"event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + token},
          false},
         {"duplicate_different_version",
-         {"event_report://physical-cache:9600/mem?s_version=" + token + "&s_version=" + upper_token},
+         {"event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + upper_token},
          false},
         {"invalid_uri", {"not-a-uri"}, false},
         {"invalid_empty_port", {"event_report://physical-cache:/mem"}, false},
@@ -6617,16 +6669,16 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
         {"invalid_overflow_port", {"event_report://physical-cache:9223372036854775808/mem"}, false},
         {"invalid_userinfo_port", {"event_report://user:secret@physical-cache:not-a-port/mem"}, false},
         {"mixed_versioned_and_legacy",
-         {"event_report://physical-cache:9600/mem?s_version=" + token,
+         {"event_report://physical-cache:9600/mem?s_v=" + token,
           "event_report://physical-cache:9600/mem?source=legacy"},
          true},
         {"mixed_valid_and_malformed",
-         {"event_report://physical-cache:9600/mem?s_version=" + token,
-          "event_report://physical-cache:9600/mem?s_version=bad"},
+         {"event_report://physical-cache:9600/mem?s_v=" + token,
+          "event_report://physical-cache:9600/mem?s_v=bad"},
          false},
         {"mixed_valid_and_duplicate",
-         {"event_report://physical-cache:9600/mem?s_version=" + token,
-          "event_report://physical-cache:9600/mem?s_version=" + token + "&s_version=" + token},
+         {"event_report://physical-cache:9600/mem?s_v=" + token,
+          "event_report://physical-cache:9600/mem?s_v=" + token + "&s_v=" + token},
          false},
     };
 
@@ -6641,7 +6693,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFuncEventReportUriValidationMat
         EXPECT_EQ(test_case.readable, check(location));
     }
 
-    location.set_location_specs({LocationSpec("tp0", "event_report://physical-cache:9600/mem?s_version=" + token)});
+    location.set_location_specs({LocationSpec("tp0", "event_report://physical-cache:9600/mem?s_v=" + token)});
     location.set_id("kvs#event_report_l2#mem");
     EXPECT_FALSE(check(location));
     location.set_id("kvs#event_report_l1p5#mem#" + host);
@@ -6696,8 +6748,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationEnforcesReporterLifecycleAndBatchOr
     ASSERT_EQ(1u, visible[1].size());
     ASSERT_EQ(1u, visible[2].size());
     EXPECT_TRUE(visible[3].empty());
-    EXPECT_NE(std::string::npos, visible[0][0].find("s_version=" + first_a_token));
-    EXPECT_NE(std::string::npos, visible[2][0].find("s_version=" + first_b_token));
+    EXPECT_NE(std::string::npos, visible[0][0].find("s_v=" + first_a_token));
+    EXPECT_NE(std::string::npos, visible[2][0].find("s_v=" + first_b_token));
 
     // A successful snapshot immediately fences omitted old versions; metadata
     // reclamation remains asynchronous and does not affect query correctness.
@@ -6723,7 +6775,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationEnforcesReporterLifecycleAndBatchOr
     EXPECT_TRUE(visible[1].empty());
     ASSERT_EQ(1u, visible[2].size());
     EXPECT_TRUE(visible[3].empty());
-    EXPECT_NE(std::string::npos, visible[0][0].find("s_version=" + second_a_token));
+    EXPECT_NE(std::string::npos, visible[0][0].find("s_v=" + second_a_token));
 
     // Only host B is hidden; host A and the batch result ordering are
     // unaffected. Heartbeat recovery restores B's original committed token.
@@ -6737,7 +6789,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationEnforcesReporterLifecycleAndBatchOr
     ASSERT_EQ(EC_OK, event_backend->OnHeartbeat("test_instance", host_b, {}));
     visible = query_visibility({current_key, old_key, down_key, missing_key});
     ASSERT_EQ(1u, visible[2].size());
-    EXPECT_NE(std::string::npos, visible[2][0].find("s_version=" + first_b_token));
+    EXPECT_NE(std::string::npos, visible[2][0].find("s_v=" + first_b_token));
 
     // Same-process unregister creates a tombstone: late events cannot revive
     // the reporter until an explicit REGISTER clears it.
@@ -7789,7 +7841,7 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_add(event, key, host)
                  ->mutable_specs(0)
-                 ->set_uri("event_report://" + host + "/mem?s_version=" + std::string(32, 'a'));
+                 ->set_uri("event_report://" + host + "/mem?s_v=" + std::string(8, 'a'));
          }},
         {"delete_non_numeric_key",
          [=](auto *event, int64_t key, const std::string &) {
@@ -7868,7 +7920,7 @@ TEST_F(CacheManagerTest, TestReportEventMutationValidationMatrixHasNoSideEffects
          [=](auto *event, int64_t key, const std::string &host) {
              configure_valid_snapshot(event, key, host)
                  ->mutable_specs(0)
-                 ->set_uri("event_report://" + host + "/mem?s_version=" + std::string(32, 'a'));
+                 ->set_uri("event_report://" + host + "/mem?s_v=" + std::string(8, 'a'));
          }},
         {"snapshot_duplicate_block_and_medium",
          [=](auto *event, int64_t key, const std::string &host) {
@@ -8113,7 +8165,7 @@ TEST_F(CacheManagerTest, TestReportEventFirstDeltaMetadataFailureReportsFailureA
     const auto visible = QueryEventReportUris({key});
     ASSERT_EQ(1u, visible.size());
     EXPECT_NE(std::string::npos, visible.front().find("source=first_write_retry"));
-    EXPECT_NE(std::string::npos, visible.front().find("s_version=" + generation));
+    EXPECT_NE(std::string::npos, visible.front().find("s_v=" + generation));
 }
 
 TEST_F(CacheManagerTest, TestReportEventRejectsInvalidRequestsAndMapsItemErrors) {
@@ -11949,6 +12001,303 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkChecksSpecGroupOnTarget) 
         ASSERT_EQ(1u, new_targets.size());
         ASSERT_EQ("cold_01", new_targets[0]);
     }
+}
+
+class MockBatchBackend : public MockDataStorageBackend {
+public:
+    using MockDataStorageBackend::MockDataStorageBackend;
+    MOCK_METHOD(DataStorageBatchCreateResult,
+                CreateBatch,
+                (const std::vector<DataStorageCreateRequest> &, const std::string &, std::function<void()>),
+                (override));
+};
+
+class BatchAllocationTest : public CacheManagerTest {
+protected:
+    const std::string storage_name_ = "batch_allocation";
+    const std::string instance_id_ = "batch_instance";
+    std::shared_ptr<MockDataStorageBackend> backend_;
+    std::shared_ptr<testing::NiceMock<MockBatchBackend>> batch_backend_;
+    std::shared_ptr<InstanceInfo> instance_info_;
+    DataStorageType storage_type_ = DataStorageType::DATA_STORAGE_TYPE_NFS;
+
+    void Prepare(const std::vector<LocationSpecInfo> &specs,
+                 DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_NFS,
+                 const std::vector<LocationSpecGroup> &groups = {},
+                 bool use_default_batch = false) {
+        storage_type_ = type;
+        instance_info_ = std::make_shared<InstanceInfo>(
+            "quota", "default", instance_id_, 64, specs, createModelDeployment(), groups);
+        if (use_default_batch) {
+            batch_backend_.reset();
+            backend_ = std::make_shared<testing::NiceMock<MockDataStorageBackend>>(metrics_registry_);
+        } else {
+            batch_backend_ = std::make_shared<testing::NiceMock<MockBatchBackend>>(metrics_registry_);
+            backend_ = batch_backend_;
+        }
+        ON_CALL(*backend_, Available()).WillByDefault(Return(true));
+        ON_CALL(*backend_, GetType()).WillByDefault(Return(type));
+        backend_->config_.set_type(type);
+        backend_->config_.set_global_unique_name(storage_name_);
+        // Allocation policy and backend-specific configuration are opaque to CacheManager.
+        registry_manager_->data_storage_manager_->storage_map_[storage_name_] = backend_;
+    }
+
+    std::string BlockKey(const LocationSpecInfo &spec, int64_t key) const {
+        return instance_id_ + "/" + spec.name() + "/" + StringUtil::Uint64ToHex(key);
+    }
+
+    DataStorageUri Uri(const std::string &key, size_t size) const {
+        return DataStorageUri("file://" + storage_name_ + "/" + key + "?size=" + std::to_string(size));
+    }
+
+    DataStorageCreateResult Succeed(const std::vector<std::string> &keys, size_t size) const {
+        DataStorageCreateResult results;
+        for (const auto &key : keys) {
+            results.emplace_back(EC_OK, Uri(key, size));
+        }
+        return results;
+    }
+
+    DataStorageBatchCreateResult SucceedBatch(const std::vector<DataStorageCreateRequest> &requests) const {
+        DataStorageBatchCreateResult batch_result;
+        for (const auto &request : requests) {
+            batch_result.push_back(Succeed(request.keys, request.size_per_key));
+        }
+        return batch_result;
+    }
+
+    ErrorCode Allocate(const CacheManager::KeyVector &keys,
+                       const std::vector<std::string_view> &groups,
+                       CacheLocationVector &locations,
+                       RequestContext *context = nullptr) {
+        return cache_manager_->GenWriteLocationOnStorage(context ? context : request_context_.get(),
+                                                         instance_id_,
+                                                         keys,
+                                                         groups,
+                                                         instance_info_,
+                                                         registry_manager_->data_storage_manager_,
+                                                         storage_name_,
+                                                         storage_type_,
+                                                         locations);
+    }
+
+    void CheckLocations(const CacheManager::KeyVector &keys,
+                        const CacheLocationVector &locations,
+                        const std::vector<std::vector<LocationSpecInfo>> &expected_specs) const {
+        ASSERT_EQ(keys.size(), locations.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            ASSERT_NE(nullptr, locations[i]);
+            EXPECT_EQ(storage_type_, locations[i]->type());
+            const auto &specs = locations[i]->location_specs();
+            ASSERT_EQ(expected_specs[i].size(), specs.size());
+            EXPECT_EQ(specs.size(), locations[i]->spec_size());
+            for (size_t j = 0; j < specs.size(); ++j) {
+                EXPECT_EQ(expected_specs[i][j].name(), specs[j].name());
+                EXPECT_EQ(Uri(BlockKey(expected_specs[i][j], keys[i]), expected_specs[i][j].size()).ToUriString(),
+                          specs[j].uri());
+            }
+        }
+    }
+
+    void CheckRequests(const std::vector<DataStorageCreateRequest> &requests,
+                       const std::vector<LocationSpecInfo> &specs,
+                       const std::vector<CacheManager::KeyVector> &keys_by_spec) const {
+        ASSERT_EQ(specs.size(), requests.size());
+        for (size_t i = 0; i < specs.size(); ++i) {
+            EXPECT_EQ(specs[i].size(), requests[i].size_per_key);
+            std::vector<std::string> expected_keys;
+            for (auto key : keys_by_spec[i]) {
+                expected_keys.push_back(BlockKey(specs[i], key));
+            }
+            EXPECT_EQ(expected_keys, requests[i].keys);
+        }
+    }
+
+    void ExpectRollback(const std::vector<std::string> &expected_deleted) {
+        EXPECT_CALL(*backend_, Delete(_, "fake_trace_id", _))
+            .WillOnce([expected_deleted](const std::vector<DataStorageUri> &uris, const auto &, auto) {
+                std::vector<std::string> deleted;
+                for (const auto &uri : uris) {
+                    deleted.push_back(uri.ToUriString());
+                }
+                EXPECT_THAT(deleted, UnorderedElementsAreArray(expected_deleted));
+                return std::vector<ErrorCode>(uris.size(), EC_OK);
+            });
+    }
+};
+
+TEST_F(BatchAllocationTest, MixedSizesForwardTwentySpecRequestsInOneBatchForEveryStorageType) {
+    std::vector<LocationSpecInfo> specs;
+    for (int i = 0; i < 20; ++i) {
+        specs.emplace_back("tp" + std::to_string(i), (i % 3 + 1) * 512);
+    }
+    const CacheManager::KeyVector keys = {1, 0xabcdef};
+    for (auto type : {DataStorageType::DATA_STORAGE_TYPE_NFS,
+                      DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                      DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+        SCOPED_TRACE(ToString(type));
+        Prepare(specs, type);
+        ASSERT_EQ(nullptr, backend_->config_.storage_spec());
+        EXPECT_CALL(*backend_, Create(_, _, _, _)).Times(0);
+        EXPECT_CALL(*batch_backend_, CreateBatch(_, "fake_trace_id", _))
+            .WillOnce([&](const auto &requests, const auto &, auto) {
+                CheckRequests(requests, specs, std::vector<CacheManager::KeyVector>(specs.size(), keys));
+                return SucceedBatch(requests);
+            });
+        EXPECT_CALL(*backend_, Delete(_, _, _)).Times(0);
+        CacheLocationVector locations;
+        ASSERT_EQ(EC_OK, Allocate(keys, {}, locations));
+        CheckLocations(keys, locations, {specs, specs});
+    }
+}
+
+TEST_F(BatchAllocationTest, EqualSizesRetainExistingSingleCreateFastPath) {
+    const std::vector<LocationSpecInfo> specs = {{"tp0", 512}, {"tp1", 512}, {"tp2", 512}};
+    const CacheManager::KeyVector keys = {1, 2};
+    Prepare(specs);
+    std::vector<std::string> expected_keys;
+    for (const auto &spec : specs) {
+        for (auto key : keys) {
+            expected_keys.push_back(BlockKey(spec, key));
+        }
+    }
+    EXPECT_CALL(*batch_backend_, CreateBatch(_, _, _)).Times(0);
+    EXPECT_CALL(*backend_, Create(expected_keys, 512, "fake_trace_id", _))
+        .WillOnce([&](const auto &merged_keys, size_t size, const auto &, auto) { return Succeed(merged_keys, size); });
+    CacheLocationVector locations;
+    ASSERT_EQ(EC_OK, Allocate(keys, {}, locations));
+    CheckLocations(keys, locations, {specs, specs});
+}
+
+TEST_F(BatchAllocationTest, FiltersSpecGroupsBeforeBatchingAndSkipsEmptyRequests) {
+    const std::vector<LocationSpecInfo> specs = {{"tp0", 512}, {"tp1", 1024}, {"tp2", 512}, {"tp3", 1024}};
+    Prepare(
+        specs, DataStorageType::DATA_STORAGE_TYPE_NFS, {{"first", {"tp2", "tp0"}}, {"second", {"tp1"}}, {"empty", {}}});
+    EXPECT_CALL(*backend_, Create(_, _, _, _)).Times(0);
+    EXPECT_CALL(*backend_, Delete(_, _, _)).Times(0);
+    EXPECT_CALL(*batch_backend_, CreateBatch(_, _, _)).WillOnce([&](const auto &requests, const auto &, auto) {
+        CheckRequests(requests, {specs[0], specs[1], specs[2]}, {{1}, {2}, {1}});
+        return SucceedBatch(requests);
+    });
+    CacheLocationVector locations;
+    ASSERT_EQ(EC_OK, Allocate({1, 2, 3}, {"first", "second", "empty"}, locations));
+    CheckLocations({1, 2, 3}, locations, {{specs[0], specs[2]}, {specs[1]}, {}});
+    ASSERT_TRUE(testing::Mock::VerifyAndClearExpectations(batch_backend_.get()));
+
+    EXPECT_CALL(*backend_, Create(_, _, _, _)).Times(0);
+    EXPECT_CALL(*batch_backend_, CreateBatch(_, _, _)).Times(0);
+    locations.clear();
+    ASSERT_EQ(EC_OK, Allocate({1, 2}, {"empty", "empty"}, locations));
+    CheckLocations({1, 2}, locations, {{}, {}});
+    locations.clear();
+    ASSERT_EQ(EC_OK, Allocate({}, {}, locations));
+    EXPECT_TRUE(locations.empty());
+}
+TEST_F(BatchAllocationTest, InvalidSpecGroupsAreRejectedBeforeAnyAllocation) {
+    for (int64_t second_size : {512, 1024}) {
+        SCOPED_TRACE(second_size);
+        Prepare({{"tp0", 512}, {"tp1", second_size}}, DataStorageType::DATA_STORAGE_TYPE_NFS, {{"valid", {"tp0"}}});
+        EXPECT_CALL(*backend_, Create(_, _, _, _)).Times(0);
+        EXPECT_CALL(*batch_backend_, CreateBatch(_, _, _)).Times(0);
+        EXPECT_CALL(*backend_, Delete(_, _, _)).Times(0);
+        CacheLocationVector locations;
+        EXPECT_NE(EC_OK, Allocate({1, 2}, {"valid", "missing"}, locations));
+        EXPECT_TRUE(locations.empty());
+        EXPECT_EQ(EC_BADARGS, Allocate({1, 2}, {"valid"}, locations));
+        EXPECT_TRUE(locations.empty());
+        EXPECT_EQ(EC_BADARGS, Allocate({1, 2}, {"valid", "valid", "valid"}, locations));
+        EXPECT_TRUE(locations.empty());
+    }
+}
+
+TEST_F(BatchAllocationTest, FailureAndMalformedBatchResultsRollbackEverySuccessfulUri) {
+    enum class ResultShape {
+        PartialFailure,
+        ShortInner,
+        LongInner,
+        ShortOuter,
+        LongOuter
+    };
+    const std::vector<LocationSpecInfo> specs = {{"tp0", 512}, {"tp1", 1024}};
+    for (auto shape : {ResultShape::PartialFailure,
+                       ResultShape::ShortInner,
+                       ResultShape::LongInner,
+                       ResultShape::ShortOuter,
+                       ResultShape::LongOuter}) {
+        SCOPED_TRACE(static_cast<int>(shape));
+        Prepare(specs);
+        DataStorageBatchCreateResult results;
+        std::vector<std::string> expected_deleted;
+        for (const auto &spec : specs) {
+            results.push_back(Succeed({BlockKey(spec, 1), BlockKey(spec, 2)}, spec.size()));
+            for (int64_t key : {1, 2}) {
+                expected_deleted.push_back(Uri(BlockKey(spec, key), spec.size()).ToUriString());
+            }
+        }
+        switch (shape) {
+        case ResultShape::PartialFailure:
+            results[0][0] = {EC_ERROR, DataStorageUri{}};
+            expected_deleted.erase(expected_deleted.begin());
+            break;
+        case ResultShape::ShortInner:
+            results[0].pop_back();
+            expected_deleted.erase(expected_deleted.begin() + 1);
+            break;
+        case ResultShape::LongInner:
+            results[0].emplace_back(EC_OK, Uri("unexpected_inner", 512));
+            expected_deleted.push_back(Uri("unexpected_inner", 512).ToUriString());
+            break;
+        case ResultShape::ShortOuter:
+            results.pop_back();
+            expected_deleted.resize(2);
+            break;
+        case ResultShape::LongOuter:
+            results.push_back(Succeed({"unexpected_outer_1", "unexpected_outer_2"}, 2048));
+            expected_deleted.push_back(Uri("unexpected_outer_1", 2048).ToUriString());
+            expected_deleted.push_back(Uri("unexpected_outer_2", 2048).ToUriString());
+            break;
+        }
+        EXPECT_CALL(*backend_, Create(_, _, _, _)).Times(0);
+        EXPECT_CALL(*batch_backend_, CreateBatch(_, "fake_trace_id", _)).WillOnce(Return(results));
+        ExpectRollback(expected_deleted);
+        CacheLocationVector locations;
+        EXPECT_EQ(EC_ERROR, Allocate({1, 2}, {}, locations));
+        EXPECT_TRUE(locations.empty());
+    }
+}
+TEST_F(BatchAllocationTest, DefaultBackendPreservesPerSpecCreateOrder) {
+    const std::vector<LocationSpecInfo> specs = {{"tp0", 512}, {"tp1", 1024}, {"tp2", 512}};
+    Prepare(specs, DataStorageType::DATA_STORAGE_TYPE_NFS, {}, true);
+    testing::InSequence sequence;
+    for (const auto &spec : specs) {
+        EXPECT_CALL(*backend_, Create(ElementsAre(BlockKey(spec, 1), BlockKey(spec, 2)), spec.size(), _, _))
+            .WillOnce([&](const auto &keys, size_t size, const auto &, auto) { return Succeed(keys, size); });
+    }
+    CacheLocationVector locations;
+    ASSERT_EQ(EC_OK, Allocate({1, 2}, {}, locations));
+    CheckLocations({1, 2}, locations, {specs, specs});
+}
+
+TEST_F(BatchAllocationTest, DefaultBackendStopsAfterFirstFailureAndRollsBackEarlierSuccesses) {
+    const std::vector<LocationSpecInfo> specs = {{"tp0", 512}, {"tp1", 1024}, {"tp2", 2048}};
+    Prepare(specs, DataStorageType::DATA_STORAGE_TYPE_NFS, {}, true);
+    {
+        testing::InSequence sequence;
+        EXPECT_CALL(*backend_, Create(_, 512, _, _)).WillOnce([&](const auto &keys, size_t size, const auto &, auto) {
+            return Succeed(keys, size);
+        });
+        EXPECT_CALL(*backend_, Create(_, 1024, _, _))
+            .WillOnce(Return(
+                DataStorageCreateResult{{EC_ERROR, DataStorageUri{}}, {EC_OK, Uri(BlockKey(specs[1], 2), 1024)}}));
+    }
+    EXPECT_CALL(*backend_, Create(_, 2048, _, _)).Times(0);
+    ExpectRollback({Uri(BlockKey(specs[0], 1), 512).ToUriString(),
+                    Uri(BlockKey(specs[0], 2), 512).ToUriString(),
+                    Uri(BlockKey(specs[1], 2), 1024).ToUriString()});
+    CacheLocationVector locations;
+    EXPECT_EQ(EC_ERROR, Allocate({1, 2}, {}, locations));
+    EXPECT_TRUE(locations.empty());
 }
 
 // GenWriteLocation 按 block 路由：marked block 的 location 落在目标冷 storage

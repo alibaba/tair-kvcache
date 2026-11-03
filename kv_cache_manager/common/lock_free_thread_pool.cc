@@ -1,6 +1,4 @@
-#include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
-
-#include <autil/LockFreeThreadPool.h>
+#include "kv_cache_manager/common/lock_free_thread_pool.h"
 
 #include "kv_cache_manager/common/logger.h"
 
@@ -23,8 +21,5 @@ bool LockFreeThreadPool::start(const std::string &name) {
 void LockFreeThreadPool::stop() { pool_->stop(); }
 void LockFreeThreadPool::waitFinish() { pool_->waitFinish(); }
 bool LockFreeThreadPool::isFull() const { return pool_->isFull(); }
-std::future<ClientErrorCode> LockFreeThreadPool::async(std::function<ClientErrorCode()> &&func) {
-    return pool_->async(func);
-}
 
 } // namespace kv_cache_manager

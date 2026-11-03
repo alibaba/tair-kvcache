@@ -97,6 +97,8 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .value("ER_CUDA_STREAM_DESTROY_ERROR", kvcm::ClientErrorCode::ER_CUDA_STREAM_DESTROY_ERROR)
         .value("ER_CUDA_HOST_REGISTER_ERROR", kvcm::ClientErrorCode::ER_CUDA_HOST_REGISTER_ERROR)
         .value("ER_TASK_CANCELLED", kvcm::ClientErrorCode::ER_TASK_CANCELLED)
+        .value("ER_SDK_TIMEOUT_BUFFER_SAFE", kvcm::ClientErrorCode::ER_SDK_TIMEOUT_BUFFER_SAFE)
+        .value("ER_SDK_ERROR_BUFFER_SAFE", kvcm::ClientErrorCode::ER_SDK_ERROR_BUFFER_SAFE)
         .finalize();
 
     py::native_enum<kvcm::MemoryType>(module, "MemoryType", "enum.Enum")

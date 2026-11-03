@@ -1,13 +1,9 @@
 #pragma once
 
-#include <future>
+#include <autil/LockFreeThreadPool.h>
 #include <memory>
-
-#include "kv_cache_manager/client/include/common.h"
-
-namespace autil {
-class LockFreeThreadPool;
-}
+#include <string>
+#include <utility>
 
 namespace kv_cache_manager {
 
@@ -23,7 +19,11 @@ public:
     void stop();
     void waitFinish();
     bool isFull() const;
-    std::future<ClientErrorCode> async(std::function<ClientErrorCode()> &&func);
+
+    template <typename Function>
+    auto async(Function &&function) {
+        return pool_->async(std::forward<Function>(function));
+    }
 
 private:
     std::unique_ptr<autil::LockFreeThreadPool> pool_;

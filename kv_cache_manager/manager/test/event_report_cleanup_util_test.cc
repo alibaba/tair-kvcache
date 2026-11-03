@@ -47,7 +47,7 @@ TEST_F(EventReportCleanupUtilTest, MalformedSpecNeverAuthorizesLocationDeletion)
     ASSERT_TRUE(backend.CommitSnapshotVersion(reporter, committed_version));
 
     const std::string committed_uri = VersionedUri(committed_version);
-    const std::string malformed_uri = committed_uri + "&s_version=" + committed_version;
+    const std::string malformed_uri = committed_uri + "&s_v=" + committed_version;
     const std::string location_id = backend.BuildLocationId("mem", reporter.host_ip_port);
 
     CacheLocation committed_then_malformed(

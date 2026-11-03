@@ -15,6 +15,21 @@ import unittest
 import weakref
 from kv_cache_manager.client.pybind import kvcm_py_client
 
+
+class ClientErrorCodePyTest(unittest.TestCase):
+    def test_buffer_safe_error_codes(self):
+        error_codes = kvcm_py_client.ClientErrorCode
+        for name, value in (
+            ("ER_SDK_TIMEOUT_BUFFER_SAFE", 119),
+            ("ER_SDK_ERROR_BUFFER_SAFE", 120),
+        ):
+            with self.subTest(name=name):
+                member = getattr(error_codes, name)
+                self.assertEqual(member.value, value)
+                self.assertIs(error_codes(value), member)
+                self.assertIs(error_codes[name], member)
+
+
 class TransferClientPyTest(unittest.TestCase):
     """TransferClient Python测试类"""
 

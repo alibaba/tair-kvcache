@@ -2133,10 +2133,10 @@ TEST_F(MetaSearcherTest, TestPrefixMatchByHostParallelPresenceMatrixMatchesRefer
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsPreservesUntouchedSpecsAcrossGenerationChange) {
     const MetaSearcher::KeyVector keys = {10007};
     const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
-    const std::string version_a = "00112233445566778899aabbccddeeff";
-    const std::string version_b = "ffeeddccbbaa99887766554433221100";
+    const std::string version_a = "00112233";
+    const std::string version_b = "ffeeddcc";
     auto uri = [](const std::string &source, const std::string &version) {
-        return "event_report://127.0.0.1:8080/mem?source=" + source + "&s_version=" + version;
+        return "event_report://127.0.0.1:8080/mem?source=" + source + "&s_v=" + version;
     };
 
     std::vector<ErrorCode> per_key_ec;
@@ -2201,10 +2201,10 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsPreservesUntouchedSpecsAcros
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnapshotVersions) {
     const MetaSearcher::KeyVector keys = {10012};
     const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
-    const std::string version_a = "00112233445566778899aabbccddeeff";
-    const std::string version_b = "ffeeddccbbaa99887766554433221100";
+    const std::string version_a = "00112233";
+    const std::string version_b = "ffeeddcc";
     auto uri = [](const std::string &source, const std::string &version) {
-        return "event_report://127.0.0.1:8080/mem?source=" + source + "&s_version=" + version;
+        return "event_report://127.0.0.1:8080/mem?source=" + source + "&s_v=" + version;
     };
 
     std::vector<ErrorCode> per_key_ec;
@@ -2235,7 +2235,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
         },
         {
             LocationSpec("valid", uri("valid", version_b)),
-            LocationSpec("malformed", "event_report://127.0.0.1:8080/mem?source=malformed&s_version=not-a-token"),
+            LocationSpec("malformed", "event_report://127.0.0.1:8080/mem?source=malformed&s_v=not-a-token"),
         },
         {
             LocationSpec("version_a", uri("version_a", version_a)),
@@ -2243,13 +2243,13 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
         },
         {
             LocationSpec("duplicate",
-                         "event_report://127.0.0.1:8080/mem?source=duplicate&s_version=" + version_b +
-                             "&s_version=" + version_b),
+                         "event_report://127.0.0.1:8080/mem?source=duplicate&s_v=" + version_b +
+                             "&s_v=" + version_b),
         },
         {
             LocationSpec("max_size",
-                         "event_report://127.0.0.1:8080/mem?size=18446744073709551615&s_version=" + version_b),
-            LocationSpec("overflow_size", "event_report://127.0.0.1:8080/mem?size=1&s_version=" + version_b),
+                         "event_report://127.0.0.1:8080/mem?size=18446744073709551615&s_v=" + version_b),
+            LocationSpec("overflow_size", "event_report://127.0.0.1:8080/mem?size=1&s_v=" + version_b),
         },
     };
 
@@ -2308,9 +2308,9 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsMixedOrMalformedSnaps
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsRejectsOverflowAgainstExistingSpecs) {
     const MetaSearcher::KeyVector keys = {10016};
     const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
-    const std::string version = "00112233445566778899aabbccddeeff";
+    const std::string version = "00112233";
     auto uri = [&version](const std::string &source, const std::string &size) {
-        return "event_report://127.0.0.1:8080/mem?size=" + size + "&source=" + source + "&s_version=" + version;
+        return "event_report://127.0.0.1:8080/mem?size=" + size + "&source=" + source + "&s_v=" + version;
     };
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
         {location_id,
@@ -2356,9 +2356,9 @@ TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltas
         replace_futures.push_back(std::async(std::launch::async, [&, i] {
             replace_signal.wait();
             const std::string generation = std::to_string(i);
-            const std::string token = std::string(31, '0') + "0123456789ab"[i];
+            const std::string token = std::string(7, '0') + "0123456789ab"[i];
             const std::string uri_prefix =
-                "event_report://127.0.0.1:8080/mem?generation=" + generation + "&s_version=" + token;
+                "event_report://127.0.0.1:8080/mem?generation=" + generation + "&s_v=" + token;
             std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> tasks = {{
                 {location_id,
                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
@@ -2405,7 +2405,7 @@ TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltas
             merge_signal.wait();
             const std::string index = std::to_string(i);
             const std::string uri =
-                "event_report://127.0.0.1:8080/mem?delta=" + index + "&s_version=" + first_info.version;
+                "event_report://127.0.0.1:8080/mem?delta=" + index + "&s_v=" + first_info.version;
             std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
                 {location_id,
                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
@@ -2500,6 +2500,23 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
     EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
+    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+
+    // Generic flat input remains retryable; the validated snapshot path can
+    // consume its URI while preserving replacement and usage semantics.
+    std::vector<MetaSearcher::ReplaceLocationSpecsTask> flat_tasks{replace_tasks[0][0]};
+    const auto shared_name = flat_tasks[0].specs[0].name_handle();
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecsFlat(
+                  request_context_.get(), keys, {0, 1}, flat_tasks, per_key_ec));
+    EXPECT_EQ(replace_tasks[0][0].specs[0].uri(), flat_tasks[0].specs[0].uri());
+    flat_tasks[0].prevalidated_total_size = MetaSearcher::PrevalidatedTotalSize(7);
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecsFlat(
+                  request_context_.get(), keys, {0, 1}, flat_tasks, per_key_ec));
+    EXPECT_TRUE(flat_tasks[0].specs[0].uri().empty());
+    EXPECT_EQ("linear_0", flat_tasks[0].specs[0].name());
+    EXPECT_EQ(shared_name.get(), flat_tasks[0].specs[0].name_handle().get());
     EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 
     // A location id has stable storage ownership.  Rejecting a type mutation

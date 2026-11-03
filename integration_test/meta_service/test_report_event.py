@@ -501,19 +501,19 @@ class EventReportFunctionalTest(unittest.TestCase):
             actual_params = parse_qsl(actual.query, keep_blank_values=True)
             expected_params = parse_qsl(expected.query, keep_blank_values=True)
             versions = [
-                value for key, value in actual_params if key == "s_version"
+                value for key, value in actual_params if key == "s_v"
             ]
             self.assertEqual(
                 len(versions),
                 1,
-                f"Expected exactly one s_version in URI: {actual_uri}",
+                f"Expected exactly one s_v in URI: {actual_uri}",
             )
-            self.assertRegex(versions[0], re.compile(r"^[0-9a-fA-F]{32}$"))
+            self.assertRegex(versions[0], re.compile(r"^[0-9a-f]{8}$"))
             self.assertEqual(
                 sorted(
                     (key, value)
                     for key, value in actual_params
-                    if key != "s_version"
+                    if key != "s_v"
                 ),
                 sorted(expected_params),
                 f"KVCM changed caller URI parameters: {actual_uri}",
@@ -677,7 +677,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
             self.assertEqual(body["header"]["status"]["code"], "OK")
             self.assertEqual(body.get("item_results", []), [])
-            self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+            self.assertEqual(len(body.get("committed_snapshot_version", "")), 8)
             self.assertTrue(body.get("snapshot_required"))
             self._assert_profile_specs(
                 block_key,
@@ -708,7 +708,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
             self.assertEqual(body["header"]["status"]["code"], "OK")
             self.assertEqual(body.get("item_results", []), [])
-            self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+            self.assertEqual(len(body.get("committed_snapshot_version", "")), 8)
             self.assertTrue(body.get("snapshot_required"))
             self._assert_profile_specs(
                 block_key,
@@ -747,7 +747,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             )
             self.assertEqual(body["header"]["status"]["code"], "OK")
             self.assertEqual(body.get("item_results", []), [])
-            self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+            self.assertEqual(len(body.get("committed_snapshot_version", "")), 8)
             self.assertFalse(body.get("snapshot_required"))
             self._assert_profile_specs(block_key, profile_name, {"keep_spec": keep_uri}, f"t06_query_{profile_name}")
             self._assert_profile_spec_absent(block_key, profile_name, "drop_spec", f"t06_absent_{profile_name}")
@@ -846,7 +846,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             body = self._report_event(profile_name, host, events, f"t11_{profile_name}")
             self.assertEqual(body["header"]["status"]["code"], "OK")
             self.assertEqual(body.get("item_results", []), [])
-            self.assertEqual(len(body.get("committed_snapshot_version", "")), 32)
+            self.assertEqual(len(body.get("committed_snapshot_version", "")), 8)
             self.assertTrue(body.get("snapshot_required"))
         self._for_each_profile(run)
 
