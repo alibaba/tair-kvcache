@@ -67,6 +67,9 @@ public:
     int64_t GetCacheGcOrphanWritingGracePeriodMs() const { return cache_gc_orphan_writing_grace_period_ms_; }
     uint64_t GetCacheGcMaxInflightDeleteRequests() const { return cache_gc_max_inflight_delete_requests_; }
     bool IsCacheGcEventReportCleanupEnabled() const { return cache_gc_event_report_cleanup_enabled_; }
+    bool IsCacheGcEventReportCleanupDuringRecoverEnabled() const {
+        return cache_gc_event_report_cleanup_during_recover_enabled_;
+    }
     uint64_t GetCacheGcEventReportActionBatchSize() const { return cache_gc_event_report_action_batch_size_; }
     const std::string &metrics_reporter_type() { return metrics_reporter_type_; }
     const std::string &metrics_reporter_config() { return metrics_reporter_config_; }
@@ -135,6 +138,7 @@ private:
     int64_t cache_gc_orphan_writing_grace_period_ms_ = 0;
     uint64_t cache_gc_max_inflight_delete_requests_ = 0;
     bool cache_gc_event_report_cleanup_enabled_ = true;
+    bool cache_gc_event_report_cleanup_during_recover_enabled_ = true;
     uint64_t cache_gc_event_report_action_batch_size_ = 0;
     std::string metrics_reporter_type_ = "local";
     std::string metrics_reporter_config_;

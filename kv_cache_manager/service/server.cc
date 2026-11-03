@@ -83,6 +83,8 @@ bool Server::Init(const ServerConfig &config) {
     cache_gc_config.orphan_writing_grace_period_ms = config_.GetCacheGcOrphanWritingGracePeriodMs();
     cache_gc_config.max_inflight_delete_requests = static_cast<size_t>(config_.GetCacheGcMaxInflightDeleteRequests());
     cache_gc_config.event_report_cleanup_enabled = config_.IsCacheGcEventReportCleanupEnabled();
+    cache_gc_config.event_report_cleanup_during_recover_enabled =
+        config_.IsCacheGcEventReportCleanupDuringRecoverEnabled();
     cache_gc_config.event_report_action_batch_size =
         static_cast<size_t>(config_.GetCacheGcEventReportActionBatchSize());
     if (!cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),

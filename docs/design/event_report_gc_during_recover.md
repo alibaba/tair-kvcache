@@ -4,7 +4,7 @@
 
 ## 1. 目标与方案
 
-取消 cached metadata 在 Recover 期间对 EventReport 候选构造和 maintenance 删除的整体限制，让已经进入内存的失效 metadata 可以及时清理。
+默认放开 cached metadata 在 Recover 期间的 EventReport 候选构造和 maintenance 删除，让已经进入内存的失效 metadata 可以及时清理。需要延后恢复期 EventReport 清理时，使用 4.5 的启动开关。
 
 **cached EventReport GC 只在原 shard 锁内校验实际内存目标，不读取 Redis 做双层比较，也不执行读前 Sync。** 内存 key 或目标缺失就跳过，不回源；整 key 与部分删除均根据内存 Location ID 决定。
 
@@ -18,7 +18,7 @@
 
 ## 2. 当前问题
 
-改动前，GC 在每批构造候选时通过 `MetaIndexer::IsRecovering()` 跳过恢复中 Instance 的 EventReport 判定与任务提交；底层 [`DeleteLocationsForMaintenance()`](../../kv_cache_manager/meta/meta_storage_backend_manager.cc) 也在 cached Recover 期间返回 `EC_OUT_OF_LIMIT`。扫描与普通 GC 仍可继续，EventReport 清理要等恢复完成。本次同步移除这两处恢复期整体限制，保留清理开关、Indexer 存在检查及逐目标校验。
+改动前，GC 在每批构造候选时通过 `MetaIndexer::IsRecovering()` 跳过恢复中 Instance 的 EventReport 判定与任务提交；底层 [`DeleteLocationsForMaintenance()`](../../kv_cache_manager/meta/meta_storage_backend_manager.cc) 也在 cached Recover 期间返回 `EC_OUT_OF_LIMIT`。扫描与普通 GC 仍可继续，EventReport 清理要等恢复完成。本次默认放开这两处恢复期整体限制，保留清理开关、Indexer 存在检查及逐目标校验；可通过 4.5 的启动配置仅在候选入口恢复 EventReport 的恢复期延后。
 
 若直接放开这两处限制，会出现：
 

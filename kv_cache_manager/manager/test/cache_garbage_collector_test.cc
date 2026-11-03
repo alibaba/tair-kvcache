@@ -1164,11 +1164,16 @@ TEST_F(CacheGarbageCollectorTest, BackendRecoveryGraceDoesNotPauseOrdinaryGcCand
     backend->Close();
 }
 
-TEST_F(CacheGarbageCollectorTest, MetadataRecoveryAllowsEventReportAndOrdinaryGcCleanup) {
+class CacheGarbageCollectorRecoverTest : public CacheGarbageCollectorTest,
+                                         public ::testing::WithParamInterface<bool> {};
+
+TEST_P(CacheGarbageCollectorRecoverTest, MetadataRecoveryPolicyOnlyControlsEventReportCleanup) {
     auto config = DefaultConfig();
     config.event_report_cleanup_enabled = true;
+    config.event_report_cleanup_during_recover_enabled = GetParam();
     config.scan_batch_size = 8;
     auto gc = MakeGc(config);
+    EXPECT_TRUE(gc->IsEventReportCleanupEnabled()); // Do not select legacy cleanup.
     PrepareForSingleStep(*gc);
 
     auto backend = AddEventReportBackend("event_report_l1p5");
@@ -1178,11 +1183,14 @@ TEST_F(CacheGarbageCollectorTest, MetadataRecoveryAllowsEventReportAndOrdinaryGc
     ASSERT_EQ(EC_OK, backend->UnregisterNodeForHostDown("instance_a", host, generation));
     const std::string location_id = backend->BuildLocationId("hbm", host);
     const std::string missing_uri = "dummy://dummy_storage/missing?size=1";
+    // The ordinary WRITING rule remains eligible even for EventReport storage.
+    auto orphan = MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1));
+    orphan->set_type(backend->GetStorageType());
     CacheLocationMap locations{
         {location_id,
          MakeStoredLocation(
              location_id, CLS_SERVING, backend->GetStorageType(), {"event_report://event_report_l1p5/object"})},
-        {"orphan", MakeLocation("orphan", CLS_WRITING, OldCreateTimeUs(config, 1))},
+        {"orphan", orphan},
         {"missing",
          MakeStoredLocation("missing", CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_DUMMY, {missing_uri})}};
     might_exist_by_uri[missing_uri] = false;
@@ -1198,12 +1206,15 @@ TEST_F(CacheGarbageCollectorTest, MetadataRecoveryAllowsEventReportAndOrdinaryGc
         ASSERT_EQ(round + 1, submitted_requests.size());
         ASSERT_EQ(1u, submitted_requests.back().location_ids.size());
         EXPECT_THAT(submitted_requests.back().location_ids.front(), UnorderedElementsAre("missing", "orphan"));
-        ASSERT_EQ(round + 1, submitted_event_report_requests.size());
-        EXPECT_EQ((KeyVector{101}), submitted_event_report_requests.back().block_keys);
-        ASSERT_EQ(1u, submitted_event_report_requests.back().targets.size());
-        ASSERT_EQ(1u, submitted_event_report_requests.back().targets.front().size());
-        EXPECT_EQ(location_id, submitted_event_report_requests.back().targets.front().front().location_id);
-        EXPECT_EQ(round + 1,
+        const size_t expected_event_report_count = GetParam() ? round + 1 : 0;
+        ASSERT_EQ(expected_event_report_count, submitted_event_report_requests.size());
+        if (GetParam()) {
+            EXPECT_EQ((KeyVector{101}), submitted_event_report_requests.back().block_keys);
+            ASSERT_EQ(1u, submitted_event_report_requests.back().targets.size());
+            ASSERT_EQ(1u, submitted_event_report_requests.back().targets.front().size());
+            EXPECT_EQ(location_id, submitted_event_report_requests.back().targets.front().front().location_id);
+        }
+        EXPECT_EQ(expected_event_report_count,
                   metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}).Get());
         for (const std::string result : {"keep", "unknown", "error"}) {
             EXPECT_EQ(0,
@@ -1219,19 +1230,22 @@ TEST_F(CacheGarbageCollectorTest, MetadataRecoveryAllowsEventReportAndOrdinaryGc
     gc->RunOneTick();
 
     ASSERT_EQ(3u, submitted_requests.size());
-    ASSERT_EQ(3u, submitted_event_report_requests.size());
+    const size_t expected_event_report_count = GetParam() ? 3 : 1;
+    ASSERT_EQ(expected_event_report_count, submitted_event_report_requests.size());
     EXPECT_EQ((KeyVector{101}), submitted_event_report_requests.back().block_keys);
     ASSERT_EQ(1u, submitted_event_report_requests.back().targets.size());
     ASSERT_EQ(1u, submitted_event_report_requests.back().targets.front().size());
     EXPECT_EQ(location_id, submitted_event_report_requests.back().targets.front().front().location_id);
-    EXPECT_EQ(3, metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}).Get());
+    EXPECT_EQ(expected_event_report_count,
+              metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}).Get());
     backend->Close();
 }
 
-TEST_F(CacheGarbageCollectorTest, MetadataRecoveryAllowsCleanupAcrossInstances) {
+TEST_P(CacheGarbageCollectorRecoverTest, MetadataRecoveryGateIsPerInstance) {
     AddInstance("group_a", "instance_b");
     auto config = DefaultConfig();
     config.event_report_cleanup_enabled = true;
+    config.event_report_cleanup_during_recover_enabled = GetParam();
     auto gc = MakeGc(config);
     PrepareForSingleStep(*gc);
 
@@ -1253,21 +1267,26 @@ TEST_F(CacheGarbageCollectorTest, MetadataRecoveryAllowsCleanupAcrossInstances) 
     ASSERT_TRUE(dummy_indexer->IsRecovering());
 
     gc->RunOneTick();
-    ASSERT_EQ(1u, submitted_event_report_requests.size());
-    EXPECT_EQ("instance_a", submitted_event_report_requests.front().instance_id);
+    ASSERT_EQ(GetParam() ? 1u : 0u, submitted_event_report_requests.size());
+    if (GetParam()) {
+        EXPECT_EQ("instance_a", submitted_event_report_requests.front().instance_id);
+    }
     gc->RunOneTick();
 
     ASSERT_EQ(2u, scan_calls.size());
-    ASSERT_EQ(2u, submitted_event_report_requests.size());
+    const size_t expected_event_report_count = GetParam() ? 2 : 1;
+    ASSERT_EQ(expected_event_report_count, submitted_event_report_requests.size());
     EXPECT_EQ("instance_b", submitted_event_report_requests.back().instance_id);
     EXPECT_FALSE(dummy_indexer->IsRecovering());
-    EXPECT_EQ(2, metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}).Get());
+    EXPECT_EQ(expected_event_report_count,
+              metrics_registry_->GetCounter("cache_gc.event_report_probe_count", {{"result", "delete"}}).Get());
     backend->Close();
 }
 
-TEST_F(CacheGarbageCollectorTest, BufferedEventReportBatchContinuesAcrossMetadataRecovery) {
+TEST_P(CacheGarbageCollectorRecoverTest, BufferedEventReportBatchRechecksMetadataRecovery) {
     auto config = DefaultConfig();
     config.event_report_cleanup_enabled = true;
+    config.event_report_cleanup_during_recover_enabled = GetParam();
     config.scan_batch_size = 4;
     config.event_report_action_batch_size = 1;
     auto gc = MakeGc(config);
@@ -1289,8 +1308,10 @@ TEST_F(CacheGarbageCollectorTest, BufferedEventReportBatchContinuesAcrossMetadat
     ASSERT_TRUE(dummy_indexer->IsRecovering());
 
     gc->RunOneTick();
-    ASSERT_EQ(1u, submitted_event_report_requests.size());
-    EXPECT_EQ((KeyVector{101}), submitted_event_report_requests.front().block_keys);
+    ASSERT_EQ(GetParam() ? 1u : 0u, submitted_event_report_requests.size());
+    if (GetParam()) {
+        EXPECT_EQ((KeyVector{101}), submitted_event_report_requests.front().block_keys);
+    }
     ASSERT_TRUE(gc->round_active_);
 
     recovering_instances.erase("instance_a");
@@ -1298,11 +1319,13 @@ TEST_F(CacheGarbageCollectorTest, BufferedEventReportBatchContinuesAcrossMetadat
     gc->RunOneTick();
 
     EXPECT_EQ(1u, scan_calls.size());
-    ASSERT_EQ(2u, submitted_event_report_requests.size());
+    ASSERT_EQ(GetParam() ? 2u : 1u, submitted_event_report_requests.size());
     EXPECT_EQ((KeyVector{202}), submitted_event_report_requests.back().block_keys);
     EXPECT_FALSE(gc->round_active_);
     backend->Close();
 }
+
+INSTANTIATE_TEST_SUITE_P(RecoveryPolicy, CacheGarbageCollectorRecoverTest, ::testing::Bool());
 
 TEST_F(CacheGarbageCollectorTest, RestartBeginsScanningFromBaseCursor) {
     auto config = DefaultConfig();

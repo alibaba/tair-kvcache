@@ -48,7 +48,7 @@ GC regular round
 
 多个事件天然合并为扫描时看到的最新 Backend 状态。GC 不再维护 cleanup intent map、revision、EventReport 专用 cursor/pass、recovery discovery 或独立 retry lane。
 
-每批构造候选前，GC 检查 EventReport 清理开关及对应 Instance 的 Indexer 是否存在；metadata Recover 不阻止 Backend 判定和删除任务构造，普通 orphan WRITING、storage-missing GC 及其他 Instance 继续处理。恢复期并发保护由后续 maintenance RMW 的 hot 校验、整 key tombstone 和回源过滤保证；正常缺失按 `EC_NOENT` 跳过，不作为清理失败打印日志。具体规则见[恢复期 GC 设计](event_report_gc_during_recover.md)。
+每批构造候选前，GC 检查 EventReport 清理开关及对应 Instance 的 Indexer 是否存在；默认允许 metadata Recover 期间的 Backend 判定和删除任务构造。若 `event_report_cleanup_during_recover_enabled=false`，只跳过 Recover Instance 的 EventReport 候选，普通 orphan WRITING、storage-missing GC 及其他已 Running 的 Instance 继续处理。恢复期并发保护由后续 maintenance RMW 的 hot 校验、整 key tombstone 和回源过滤保证；正常缺失按 `EC_NOENT` 跳过，不作为清理失败打印日志。具体规则见[恢复期 GC 设计](event_report_gc_during_recover.md)。
 
 ## 2. 设计范围
 
@@ -85,6 +85,8 @@ GC regular round
 - GC 总开关关闭时，子开关不单独启动线程，EventReport 继续使用 legacy per-event cleanup，配置仍然有效。
 
 开关和其他 GC 参数均不支持热切换，修改后重启生效。新路径稳定后，可在独立清理提交中删除 legacy 路径和临时开关。
+
+`kvcm.cache_gc.event_report_cleanup_during_recover_enabled` 默认 `true`。设为 `false` 只延后 Recover Instance 的 EventReport GC 候选，Running 后由后续扫描清理；它不改变上述新旧清理模式选择，不触发 legacy fallback，也不清空已有删除标记。详见[恢复期清理开关](event_report_gc_during_recover.md#45-恢复期-eventreport-清理开关)。
 
 回滚不是对称重放：`true -> false` 后，legacy 只能处理之后发生的新事件，不能重放 GC 开启期间已经发生的 Snapshot/HOST_DOWN。紧急回滚允许 stale metadata 暂时残留；查询可见性不依赖其立即物理清理。
 
@@ -468,6 +470,7 @@ EventReport 事件不向 GC 写 intent，因此 `RequestStop` 之后仍可完成
 | `kvcm.cache_gc.scan_batch_size` | 256 | scan key hint，也是单 tick Location 总预算 |
 | `kvcm.cache_gc.max_inflight_delete_requests` | 64 | 普通与 EventReport action 共用的 GC 在途上限 |
 | `kvcm.cache_gc.event_report_cleanup_enabled` | `true` | EventReport shared-round 子开关；仍受 GC 总开关控制，总开关关闭时保留 legacy 路径 |
+| `kvcm.cache_gc.event_report_cleanup_during_recover_enabled` | `true` | 是否允许 Recover Instance 的 EventReport 清理候选；false 不切换 legacy，重启生效 |
 | `kvcm.cache_gc.event_report_action_batch_size` | 256 | 单 tick EventReport action 的唯一 Block key 上限 |
 
 所有配置启动时读取；V1 不实现运行时热更新。`round_pause_ms` 可以为 0，其他 interval/budget/inflight 必须大于 0。EventReport key budget 与 Scan key hint 是独立上限：前者约束 metadata action 涉及的唯一 Block key 数，后者约束单 tick Location 总预算；key budget 大于 Scan hint 时只是当批通常无法用满，不构成非法配置。

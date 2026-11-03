@@ -579,6 +579,7 @@ V1 不修改 `write_location_manager.*`、`cache_reclaimer.*` 或 `migration_man
 | `kvcm.cache_gc.orphan_writing_grace_period_ms` | 86400000 | WRITING 自动清理 grace，必须不小于 3600000 ms |
 | `kvcm.cache_gc.max_inflight_delete_requests` | 64 | 普通删除与 EventReport action 共用的 GC 在途硬上限，必须大于 0 |
 | `kvcm.cache_gc.event_report_cleanup_enabled` | `true` | EventReport shared-round 子开关；仍受 GC 总开关控制，总开关关闭时保留 legacy 路径 |
+| `kvcm.cache_gc.event_report_cleanup_during_recover_enabled` | `true` | 是否允许 Recover Instance 的 EventReport 清理候选；false 不影响普通 GC 或切换 legacy，重启生效 |
 | `kvcm.cache_gc.event_report_action_batch_size` | 256 | 单 tick EventReport metadata action 的唯一 Block key 上限；Location 总数仍受 `scan_batch_size` 限制 |
 
 配置通过一个内聚的 `CacheGarbageCollector::Config` 传入。`round_pause_ms` 可以为 0，其他 interval、batch 和在途请求上限必须为正；毫秒到内部 duration 的转换需要检查溢出。EventReport 扩展的收敛、优先级、recovery grace 和 metadata action 边界见其独立设计文档。1 小时 grace 下限基于当前 1800 秒 write session 上限；若后续修改该协议上限，必须同步重新评估 GC grace 下限。
