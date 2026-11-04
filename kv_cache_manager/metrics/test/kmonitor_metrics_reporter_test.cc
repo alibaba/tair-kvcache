@@ -1,8 +1,10 @@
 #include <array>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
+#include "kmonitor/client/MetricType.h"
 #include "kmonitor/client/core/MetricsTags.h"
 #include "kmonitor/client/core/MutableMetric.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -23,6 +25,8 @@ thread_local double reported_error_qps = 0;
 thread_local double reported_grpc_qps = 0;
 thread_local MetricsTags reported_grpc_tags;
 thread_local std::map<MetricsTags, double> reported_meta_cache_usage;
+thread_local std::map<std::string, std::vector<double>> reported_dispatch_samples;
+thread_local std::map<std::string, kmonitor::MetricType> reported_dispatch_types;
 
 void CaptureMetaCacheUsage(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *tags, double value) {
     if (metric->metric_name_.find("cache_manager_instance.meta_cache_usage") != std::string::npos) {
@@ -66,6 +70,15 @@ void CaptureErrorQps(kmonitor::MutableMetric *metric, const kmonitor::MetricsTag
     if (metric->metric_name_.find("grpc.response_qps") != std::string::npos) {
         reported_grpc_qps += value;
         reported_grpc_tags = tags->GetTagsMap();
+    }
+}
+
+void CaptureDispatchMetrics(kmonitor::MutableMetric *metric, const kmonitor::MetricsTags *, double value) {
+    const auto offset = metric->metric_name_.find("service.request_");
+    if (offset != std::string::npos) {
+        const auto name = metric->metric_name_.substr(offset);
+        reported_dispatch_samples[name].push_back(value);
+        reported_dispatch_types[name] = metric->GetMetricType();
     }
 }
 } // namespace
@@ -277,6 +290,52 @@ TEST_F(KmonitorMetricsReporterTest, TestReportIntervalWriteBytes) {
     // that ReportInterval reads from instead
     const auto &tags = be->GetMetricsCollector()->GetMetricsTags();
     EXPECT_EQ(2048u, metrics_registry_->GetCounter("data_storage.write_bytes_dispatched_total", tags).Get());
+}
+
+TEST_F(KmonitorMetricsReporterTest, DispatchMetricsReportCurrentGaugesAndCumulativeCounters) {
+    auto queued = metrics_registry_->GetGauge("service.request_queue_length");
+    auto running = metrics_registry_->GetGauge("service.request_running");
+    auto rejected = metrics_registry_->GetCounter("service.request_rejected");
+    auto discarded = metrics_registry_->GetCounter("service.request_discarded");
+    Stub stub;
+    auto report = static_cast<void (kmonitor::MutableMetric::*)(const kmonitor::MetricsTags *, double)>(
+        &kmonitor::MutableMetric::Report);
+    reported_dispatch_samples.clear();
+    reported_dispatch_types.clear();
+    stub.set(report, CaptureDispatchMetrics);
+
+    // Registering a local metric alone must not publish an unwritten series.
+    reporter_->ReportInterval();
+    EXPECT_TRUE(reported_dispatch_samples.empty());
+
+    queued = 4;
+    running = 2;
+    rejected += 3;
+    discarded += 0; // A deliberately sampled zero is observable too.
+    reporter_->ReportInterval();
+
+    queued = 0;
+    running = 1;
+    rejected += 2;
+    discarded += 7;
+    reporter_->ReportInterval();
+    // Repeated reports must keep the cumulative values, without resetting or
+    // reporting a delta. Capture the KMonitor boundary, not only the registry.
+    reporter_->ReportInterval();
+
+    const std::map<std::string, std::vector<double>> expected = {
+        {"service.request_queue_length", {4, 0, 0}},
+        {"service.request_running", {2, 1, 1}},
+        {"service.request_rejected", {3, 5, 5}},
+        {"service.request_discarded", {0, 7, 7}},
+    };
+    EXPECT_EQ(expected, reported_dispatch_samples);
+    ASSERT_EQ(expected.size(), reported_dispatch_types.size());
+    for (const auto &[name, type] : reported_dispatch_types) {
+        EXPECT_EQ(kmonitor::GAUGE, type) << name;
+    }
+    EXPECT_EQ(5u, rejected.Get());
+    EXPECT_EQ(7u, discarded.Get());
 }
 
 TEST_F(KmonitorMetricsReporterTest, RequestOutcomeControlsKmonitorAndLocalErrorCounts) {

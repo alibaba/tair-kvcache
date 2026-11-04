@@ -1,5 +1,6 @@
 #include "kv_cache_manager/service/server.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <grpcpp/grpcpp.h>
@@ -35,6 +36,7 @@
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
+#include "kv_cache_manager/service/service_request_executor.h"
 
 namespace kv_cache_manager {
 
@@ -202,8 +204,22 @@ void Server::OnNoLongerLeader() {
     KVCM_LOG_INFO("Server cleanup completed");
 }
 
-bool Server::Start() {
+bool Server::Start() try {
     KVCM_LOG_INFO("server starting...");
+    const size_t worker_count = config_.GetServiceWorkerThreadNum() > 0
+                                    ? config_.GetServiceWorkerThreadNum()
+                                    : 2 * static_cast<size_t>(std::max(1u, std::thread::hardware_concurrency()));
+    try {
+        request_executor_ =
+            std::make_shared<ServiceRequestExecutor>(worker_count, config_.GetServiceWorkerQueueCapacity());
+    } catch (const std::exception &e) {
+        KVCM_LOG_ERROR("Failed to start service request workers: %s", e.what());
+        return false;
+    }
+    KVCM_LOG_INFO("Meta request workers=%zu, queue_capacity=%u, shutdown_mode=%s",
+                  worker_count,
+                  config_.GetServiceWorkerQueueCapacity(),
+                  config_.GetServiceWorkerShutdownMode().c_str());
     if (!StartMetricsReportThread()) {
         KVCM_LOG_ERROR("init metrics reporter failed");
         return false;
@@ -244,6 +260,9 @@ bool Server::Start() {
                   kKvcmGitCommit,
                   kKvcmBuildTime);
     return true;
+} catch (const std::exception &e) {
+    KVCM_LOG_ERROR("Server start failed: %s", e.what());
+    return false;
 }
 
 bool Server::Wait() {
@@ -270,7 +289,8 @@ bool Server::StartRpcServer() {
     // grpc::EnableDefaultHealthCheckService(true);
     // grpc::reflection::InitProtoReflectionServerBuilderPlugin();
 
-    meta_service_.reset(new MetaServiceGRpc(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_));
+    meta_service_ = std::make_shared<MetaServiceGRpc>(
+        metrics_registry_, meta_impl_, registry_manager_, request_executor_, metrics_lifecycle_);
     admin_service_.reset(new AdminServiceGRpc(metrics_registry_, admin_impl_));
     debug_service_.reset(new DebugServiceGRpc(metrics_registry_, debug_impl_));
 
@@ -298,12 +318,17 @@ bool Server::StartRpcServer() {
     if (!use_separate_admin_server && config_.IsEnableDebugService()) {
         builder.RegisterService(debug_service_.get());
     }
+    if (!meta_service_->PrepareCompletionQueue(builder)) {
+        KVCM_LOG_ERROR("Failed to start Meta RPC completion queue");
+        return false;
+    }
     auto server = builder.BuildAndStart();
     if (!server) {
         KVCM_LOG_ERROR("Failed to start rpc server");
         return false;
     }
     rpc_server_.reset(server.release());
+    meta_service_->StartAccepting();
     const std::string thread_limit = max_threads == -1 ? "framework_default" : std::to_string(max_threads);
     KVCM_LOG_INFO(
         "Server listening on %s success, grpc_max_threads=%s (configured=%d), grpc_memory_quota_bytes=%" PRIu64,
@@ -357,8 +382,8 @@ bool Server::StartHttpServer() {
                                                               : std::thread::hardware_concurrency();
     KVCM_LOG_INFO("HTTP server io_thread_num=%zu (configured=%d)", io_thread_num, configured_io_thread_num);
 
-    meta_http_service_ =
-        std::make_shared<MetaServiceHttp>(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_);
+    meta_http_service_ = std::make_shared<MetaServiceHttp>(
+        metrics_registry_, meta_impl_, registry_manager_, request_executor_, metrics_lifecycle_);
     admin_http_service_ = std::make_shared<AdminServiceHttp>(metrics_registry_,
                                                              admin_impl_,
                                                              config_.enable_prometheus(),
@@ -529,18 +554,49 @@ bool Server::StartMetricsReportThread() {
         KVCM_LOG_ERROR("do not have metrics reporter, start report thread failed.");
         return false;
     }
-    metrics_report_thread_ = LoopThread::CreateLoopThread(
-        std::bind(&MetricsReporter::ReportInterval, metrics_reporter_), config_.metrics_report_interval_ms() * 1000);
+    metrics_report_thread_ =
+        LoopThread::CreateLoopThread([this]() { ReportMetrics(); }, config_.metrics_report_interval_ms() * 1000);
     KVCM_LOG_INFO("start metrics reporter success.");
     return true;
 }
 
+void Server::ReportMetrics(bool final_snapshot) {
+    if (request_executor_) {
+        const auto state = request_executor_->GetSnapshot();
+        if (metrics_registry_) {
+            metrics_registry_->GetGauge("service.request_queue_length") = state.queued;
+            metrics_registry_->GetGauge("service.request_running") = state.running;
+            metrics_registry_->GetCounter("service.request_rejected") += state.rejected - last_request_rejected_;
+            metrics_registry_->GetCounter("service.request_discarded") += state.discarded - last_request_discarded_;
+            last_request_rejected_ = state.rejected;
+            last_request_discarded_ = state.discarded;
+        }
+        if (final_snapshot) {
+            KVCM_LOG_INFO("service request executor stopped: queued=%zu, running=%zu, rejected=%zu, discarded=%zu",
+                          state.queued,
+                          state.running,
+                          state.rejected,
+                          state.discarded);
+        }
+    }
+    if (metrics_reporter_) {
+        metrics_reporter_->ReportInterval();
+    }
+}
+
 void Server::Stop() {
-    if (stop_) {
+    if (stop_.exchange(true)) {
         return;
     }
-    stop_ = true;
     KVCM_LOG_INFO("server stopping...");
+    if (request_executor_) {
+        request_executor_->CloseAdmission(config_.GetServiceWorkerShutdownMode() == "drain"
+                                              ? ServiceRequestExecutor::ShutdownMode::kDrain
+                                              : ServiceRequestExecutor::ShutdownMode::kDiscardPending);
+    }
+    if (meta_service_) {
+        meta_service_->StopAccepting();
+    }
     // Lifecycle callbacks need the service gates and managers to remain alive.
     if (leader_elector_) {
         leader_elector_->Stop();
@@ -555,6 +611,15 @@ void Server::Stop() {
         admin_rpc_server_->Shutdown();
     }
     KVCM_LOG_INFO("rpc server stopped.");
+    // Workers and both network executors must stay alive until accepted requests
+    // have finished handing their results back to the transport.
+    if (request_executor_) {
+        request_executor_->Drain();
+    }
+    if (meta_service_) {
+        meta_service_->WaitForCalls();
+        meta_service_->ShutdownCompletionQueueAndJoin();
+    }
     if (meta_http_service_) {
         meta_http_service_->Stop();
     }
@@ -566,10 +631,16 @@ void Server::Stop() {
         debug_http_service_->Stop();
         KVCM_LOG_INFO("debug http server stopped.");
     }
+    if (request_executor_) {
+        request_executor_->Join();
+    }
     if (metrics_report_thread_) {
         metrics_report_thread_->Stop();
         KVCM_LOG_INFO("metrics reporter stopped.");
     }
+    // Discard/rejection counts can change after the last periodic sample.
+    // Join the report thread before sampling once more to avoid double counting.
+    ReportMetrics(true);
     KVCM_LOG_INFO("admin http server stopped.");
     KVCM_LOG_INFO("kvcm server stopped, goodbye!");
 }

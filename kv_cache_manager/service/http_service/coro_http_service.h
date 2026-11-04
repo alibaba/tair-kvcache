@@ -1,5 +1,6 @@
 #pragma once
 
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -12,6 +13,7 @@
 
 #include "google/protobuf/arena.h"
 #include "google/protobuf/message.h"
+#include "kv_cache_manager/service/service_request_executor.h"
 #include "kv_cache_manager/service/util/proto_message_json_util.h"
 #include "ylt/coro_http/coro_http_server.hpp"
 
@@ -25,6 +27,12 @@ public:
     using HandlerType =
         std::function<async_simple::coro::Lazy<void>(coro_http::coro_http_request &, coro_http::coro_http_response &)>;
     using CachedJsonResponse = std::optional<std::string>;
+
+    struct HttpDispatchResult {
+        CachedJsonResponse cached_response;
+        std::exception_ptr error;
+        ServiceRequestExecutor::CompletionToken completion;
+    };
 
     CoroHttpService() = default;
     virtual ~CoroHttpService() = default;
@@ -43,6 +51,10 @@ protected:
     void RegisterGetHandler(const std::string &api, HandlerType handler);
     void RegisterPostHandler(const std::string &api, HandlerType handler);
     HandlerType WrapWithLogger(const std::string &api, HandlerType handler);
+
+    static async_simple::coro::Lazy<HttpDispatchResult> DispatchHttpRequest(ServiceRequestExecutor &executor,
+                                                                            std::function<CachedJsonResponse()> run,
+                                                                            std::function<void(const char *)> reject);
 
     template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage, typename Callback>
     HandlerType GetHandler(Callback callback);
@@ -64,8 +76,9 @@ CoroHttpService::HandlerType CoroHttpService::GetHandler(Callback callback) {
                                                 coro_http::coro_http_connection *,
                                                 PbRequestMessage *,
                                                 PbResponseMessage *>;
-    static_assert(std::is_void_v<CallbackResult> || std::is_same_v<std::decay_t<CallbackResult>, CachedJsonResponse>,
-                  "HTTP callbacks must return void or CachedJsonResponse");
+    static_assert(std::is_void_v<CallbackResult> || std::is_same_v<std::decay_t<CallbackResult>, CachedJsonResponse> ||
+                      std::is_same_v<CallbackResult, async_simple::coro::Lazy<HttpDispatchResult>>,
+                  "Unsupported HTTP callback result");
     return [this,
             callback = std::move(callback)](coro_http::coro_http_request &req,
                                             coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
@@ -81,8 +94,18 @@ CoroHttpService::HandlerType CoroHttpService::GetHandler(Callback callback) {
         }
 
         CachedJsonResponse cached_response;
+        // Keep the accepted-request token until this outer handler has also
+        // finished response serialization, including exception unwinding.
+        HttpDispatchResult dispatched;
         if constexpr (std::is_void_v<CallbackResult>) {
             std::invoke(callback, static_cast<ServiceType *>(this), req.get_conn(), &pb_req, &pb_res);
+        } else if constexpr (std::is_same_v<CallbackResult, async_simple::coro::Lazy<HttpDispatchResult>>) {
+            dispatched =
+                co_await std::invoke(callback, static_cast<ServiceType *>(this), req.get_conn(), &pb_req, &pb_res);
+            if (dispatched.error) {
+                std::rethrow_exception(dispatched.error);
+            }
+            cached_response = std::move(dispatched.cached_response);
         } else {
             cached_response = std::invoke(callback, static_cast<ServiceType *>(this), req.get_conn(), &pb_req, &pb_res);
         }
@@ -113,16 +136,17 @@ CoroHttpService::GetArenaHandler(Callback callback, bool (*request_parser)(char 
                                                 coro_http::coro_http_connection *,
                                                 PbRequestMessage *,
                                                 PbResponseMessage *>;
-    static_assert(std::is_void_v<CallbackResult> || std::is_same_v<std::decay_t<CallbackResult>, CachedJsonResponse>,
-                  "HTTP callbacks must return void or CachedJsonResponse");
+    static_assert(std::is_void_v<CallbackResult> || std::is_same_v<std::decay_t<CallbackResult>, CachedJsonResponse> ||
+                      std::is_same_v<CallbackResult, async_simple::coro::Lazy<HttpDispatchResult>>,
+                  "Unsupported HTTP callback result");
     return [this, callback = std::move(callback), request_parser](
                coro_http::coro_http_request &req,
                coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
         // Large ReportEvent requests contain tens of thousands of nested
         // protobuf messages. Keeping them on a request-scoped arena avoids a
         // separate malloc/free for every EventItem/spec and releases all
-        // parser-owned objects in one pass when the synchronous handler
-        // returns. Neither message escapes this coroutine.
+        // parser-owned objects in one pass after the handler and any dispatched
+        // business task finish. Neither message outlives this coroutine.
         const std::string_view body = req.get_body();
         google::protobuf::ArenaOptions arena_options;
         if (body.size() >= 32 * 1024) {
@@ -139,9 +163,9 @@ CoroHttpService::GetArenaHandler(Callback callback, bool (*request_parser)(char 
         std::string json_res;
 
         // cinatra 0.5.5 backs get_body() with the connection's mutable
-        // std::string. The handler is synchronous with respect to that body,
-        // and neither the request nor a DOM view escapes this coroutine, so a
-        // specialized parser may safely decode it in place. Generic handlers
+        // std::string. Parsing completes on the IO thread before dispatch;
+        // neither a DOM view nor the body is passed to a worker. A specialized
+        // parser can therefore safely decode it in place. Generic handlers
         // continue to receive the immutable length-aware view.
         const bool parsed =
             request_parser
@@ -154,8 +178,16 @@ CoroHttpService::GetArenaHandler(Callback callback, bool (*request_parser)(char 
         }
 
         CachedJsonResponse cached_response;
+        HttpDispatchResult dispatched;
         if constexpr (std::is_void_v<CallbackResult>) {
             std::invoke(callback, static_cast<ServiceType *>(this), req.get_conn(), pb_req, pb_res);
+        } else if constexpr (std::is_same_v<CallbackResult, async_simple::coro::Lazy<HttpDispatchResult>>) {
+            dispatched =
+                co_await std::invoke(callback, static_cast<ServiceType *>(this), req.get_conn(), pb_req, pb_res);
+            if (dispatched.error) {
+                std::rethrow_exception(dispatched.error);
+            }
+            cached_response = std::move(dispatched.cached_response);
         } else {
             cached_response = std::invoke(callback, static_cast<ServiceType *>(this), req.get_conn(), pb_req, pb_res);
         }

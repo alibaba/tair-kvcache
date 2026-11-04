@@ -1,3 +1,5 @@
+#include <thread>
+
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/service/command_line.h"
 
@@ -51,4 +53,15 @@ TEST_F(CommandLineTest, TestParseCmdLine) {
     ASSERT_EQ("value2", environ["key_b"]);
     ASSERT_EQ("6381", environ["kvcm.service.rpc_port"]);
     ASSERT_EQ("6382", environ["kvcm.service.http_port"]);
+}
+
+TEST_F(CommandLineTest, TerminationSignalOnWorkerOnlyNotifiesMainThread) {
+    CommandLine command;
+    auto previous = std::signal(SIGTERM, SIG_DFL);
+    command.RegisterSignal();
+    // No Server is installed: invoking Stop from the signal handler would fail.
+    std::thread worker([] { std::raise(SIGTERM); });
+    command.WaitForTerminationSignal();
+    worker.join();
+    std::signal(SIGTERM, previous);
 }

@@ -4,6 +4,8 @@
 #include <string>
 #include <utility>
 
+#include "async_simple/Promise.h"
+#include "async_simple/coro/FutureAwaiter.h"
 #include "kv_cache_manager/common/logger.h"
 #include "ylt/coro_http/coro_http_server.hpp"
 
@@ -27,6 +29,45 @@ void LogDebugHttpResponse(coro_http::coro_http_response &res) {
 }
 
 } // namespace
+
+async_simple::coro::Lazy<CoroHttpService::HttpDispatchResult>
+CoroHttpService::DispatchHttpRequest(ServiceRequestExecutor &executor,
+                                     std::function<CachedJsonResponse()> run,
+                                     std::function<void(const char *)> reject) {
+    async_simple::Promise<HttpDispatchResult> promise;
+    auto future = promise.getFuture();
+    ServiceRequestExecutor::Task task;
+    task.run = [promise, run = std::move(run)](ServiceRequestExecutor::CompletionToken completion) mutable {
+        HttpDispatchResult result;
+        result.completion = std::move(completion);
+        try {
+            result.cached_response = run();
+        } catch (...) {
+            result.error = std::current_exception();
+        }
+        promise.setValue(std::move(result));
+    };
+    task.on_discard = [promise, reject](ServiceRequestExecutor::CompletionToken completion) mutable {
+        HttpDispatchResult result;
+        result.completion = std::move(completion);
+        try {
+            reject("service is stopping");
+        } catch (...) {
+            result.error = std::current_exception();
+        }
+        promise.setValue(std::move(result));
+    };
+    const auto submitted = executor.TrySubmit(std::move(task));
+    if (submitted != ServiceRequestExecutor::SubmitResult::kAccepted) {
+        reject(submitted == ServiceRequestExecutor::SubmitResult::kFull ? "service request queue is full"
+                                                                        : "service is stopping");
+        co_return HttpDispatchResult{};
+    }
+    // FutureAwaiter checks this Lazy back into its original IO executor.
+    // The result (including errors) retains its token until the HTTP handler
+    // has resumed; Promise::setException would release that token too early.
+    co_return co_await std::move(future);
+}
 
 // Implementation is now in the header file
 void CoroHttpService::RegisterGetHandler(const std::string &api, HandlerType handler) {
