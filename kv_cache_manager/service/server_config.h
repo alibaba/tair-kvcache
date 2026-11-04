@@ -29,6 +29,9 @@ public:
     int32_t GetServiceIoThreadNum() const { return service_io_thread_num_; }
     int32_t GetServiceGrpcMaxThreads() const { return service_grpc_max_threads_; }
     uint64_t GetServiceGrpcMemoryQuotaBytes() const { return service_grpc_memory_quota_bytes_; }
+    uint32_t GetServiceWorkerThreadNum() const { return service_worker_thread_num_; }
+    uint32_t GetServiceWorkerQueueCapacity() const { return service_worker_queue_capacity_; }
+    const std::string &GetServiceWorkerShutdownMode() const { return service_worker_shutdown_mode_; }
     int32_t GetServiceRpcPort() const { return service_rpc_port_; }
     int32_t GetServiceHttpPort() const { return service_http_port_; }
     int32_t GetServiceAdminRpcPort() const { return service_admin_rpc_port_; }
@@ -110,6 +113,9 @@ private:
     int32_t service_io_thread_num_ = 0;
     int32_t service_grpc_max_threads_ = 0;
     uint64_t service_grpc_memory_quota_bytes_ = 0;
+    uint32_t service_worker_thread_num_ = 0;
+    uint32_t service_worker_queue_capacity_ = 0;
+    std::string service_worker_shutdown_mode_ = "discard_pending";
     int32_t service_rpc_port_ = 0;
     int32_t service_http_port_ = 0;
     int32_t service_admin_rpc_port_ = 0;

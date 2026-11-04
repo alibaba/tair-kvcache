@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include <thread>
 
@@ -33,6 +34,7 @@ class MetricsReporter;
 class MetricsReporterFactory;
 struct MetricsLifecycle;
 class LoopThread;
+class ServiceRequestExecutor;
 
 class Server {
 public:
@@ -47,6 +49,7 @@ private:
     bool StartHttpServer();
     void CreateMetricsReporter();
     bool StartMetricsReportThread();
+    void ReportMetrics(bool final_snapshot = false);
     void CreateAndRegisterEventPublisher();
     void RegisterEventPublishers(const std::shared_ptr<EventManager> &event_manager);
     bool CreateLeaderElector();
@@ -60,6 +63,7 @@ private:
     std::atomic<bool> stop_{false};
     bool is_startup_loaded_ = false;
     ServerConfig config_;
+    std::shared_ptr<ServiceRequestExecutor> request_executor_;
     std::shared_ptr<MetaServiceImpl> meta_impl_;
     std::shared_ptr<AdminServiceImpl> admin_impl_;
     std::shared_ptr<DebugServiceImpl> debug_impl_;
@@ -87,5 +91,8 @@ private:
     std::shared_ptr<MetricsReporterFactory> metrics_reporter_factory_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<LoopThread> metrics_report_thread_;
+    // Accessed by the report thread, then by Stop after that thread is joined.
+    uint64_t last_request_rejected_ = 0;
+    uint64_t last_request_discarded_ = 0;
 };
 } // namespace kv_cache_manager

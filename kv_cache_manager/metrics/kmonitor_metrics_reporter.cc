@@ -113,6 +113,12 @@ struct KmonitorMetricsReporter::Context {
 
     /* ==================== intervallic metrics ===================== */
 
+    // Meta request executor metrics
+    DECLARE_METRICS(service, request_queue_length);
+    DECLARE_METRICS(service, request_running);
+    DECLARE_METRICS(service, request_rejected);
+    DECLARE_METRICS(service, request_discarded);
+
     // meta indexer metrics
     DECLARE_METRICS(meta_indexer, total_key_count);
     DECLARE_METRICS(meta_indexer, total_cache_usage);
@@ -430,6 +436,12 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(data_storage, create_time_us);
 
     /* ==================== intervallic metrics ===================== */
+
+    // KMonitor represents cumulative counters as GAUGE, not QPS increments.
+    REGISTER_GAUGE_METRIC(service, request_queue_length);
+    REGISTER_GAUGE_METRIC(service, request_running);
+    REGISTER_GAUGE_METRIC(service, request_rejected);
+    REGISTER_GAUGE_METRIC(service, request_discarded);
 
     // meta indexer metrics
     REGISTER_GAUGE_METRIC(meta_indexer, total_key_count);
@@ -1068,8 +1080,8 @@ void KmonitorMetricsReporter::ReportInterval() {
     } while (false);
 
     do {
-        // Read registry-owned GC metrics with their native
-        // tags, preserving the same labels as Prometheus/local reporting.
+        // Read current gauges and cumulative counters from the registry.
+        // Preserve native tags, matching Prometheus/local reporting.
         if (!metrics_registry_) {
             break;
         }
@@ -1092,6 +1104,11 @@ void KmonitorMetricsReporter::ReportInterval() {
                 metric->Report(&tags, sample);
             }
         };
+
+        report_registry_metric(ctx_->service_request_queue_length_metrics.get(), "service.request_queue_length");
+        report_registry_metric(ctx_->service_request_running_metrics.get(), "service.request_running");
+        report_registry_metric(ctx_->service_request_rejected_metrics.get(), "service.request_rejected");
+        report_registry_metric(ctx_->service_request_discarded_metrics.get(), "service.request_discarded");
 
         report_registry_metric(ctx_->cache_gc_scan_round_count_metrics.get(), "cache_gc.scan_round_count");
         report_registry_metric(ctx_->cache_gc_scan_key_count_metrics.get(), "cache_gc.scan_key_count");

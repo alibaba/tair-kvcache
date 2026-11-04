@@ -93,7 +93,8 @@ kvcm.service.io_thread_num=2
 # 为长期订阅预留线程；独立 Admin Server 不增加。显式设置正数时仍作为总上限，不额外增加。
 # -1 沿用 gRPC 框架默认，不额外设限；显式上限必须 >= 2。
 # Meta/Admin 分端口时各有独立配额，都使用这个值；共用端口时只有一套配额。
-# 不限制 HTTP、后台任务及 gRPC 其他内部线程。同步流式 RPC 也会占用工作线程。
+# 不限制 HTTP、Meta 共享业务 worker、独立 CQ 轮询线程、后台任务及 gRPC 其他内部线程。
+# Admin/Debug 等同步 RPC 和 Optimizer 同步流式 RPC 仍占用该配额。
 # 配额耗尽时新 RPC 可能返回 RESOURCE_EXHAUSTED；修改后需要重启。
 # 环境变量形式：kvcm_service_grpc_max_threads。
 kvcm.service.grpc_max_threads=0
@@ -102,6 +103,17 @@ kvcm.service.grpc_max_threads=0
 # 仅约束 gRPC 纳入配额管理的内存，不是进程 RSS 上限；Meta/Admin 分端口时配额各自独立。
 # 与线程上限独立配置，修改后需要重启。环境变量形式：kvcm_service_grpc_memory_quota_bytes。
 kvcm.service.grpc_memory_quota_bytes=0
+
+# Meta HTTP/gRPC 共享业务池。Admin、健康检查、Debug、Optimizer 保留原执行路径。
+# 0 = 2 * max(1, hardware_concurrency())；正数为显式 worker 数。
+kvcm.service.worker_thread_num=0
+
+# 只限制等待队列，不包括正在执行的任务。0 不限制，正数满时快速返回 SERVICE_NOT_READY。
+kvcm.service.worker_queue_capacity=0
+
+# discard_pending（默认）：停止提交，丢弃尚未被 worker 取出的任务并返回 SERVICE_NOT_READY。
+# drain：停止提交，执行完已接收任务。两者都等待正在执行的任务及协议交接收尾。
+kvcm.service.worker_shutdown_mode=discard_pending
 
 # 是否开启DebugService服务，可以通过DebugService直接操作集群内部状态
 kvcm.service.enable_debug_service=false

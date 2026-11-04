@@ -175,6 +175,32 @@ TEST_F(ServerConfigTest, GrpcMemoryQuotaEnvironmentOverride) {
     EXPECT_TRUE(config.Check());
 }
 
+TEST_F(ServerConfigTest, ServiceRequestExecutorConfig) {
+    ServerConfig config;
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(0u, config.GetServiceWorkerThreadNum());
+    EXPECT_EQ(0u, config.GetServiceWorkerQueueCapacity());
+    EXPECT_EQ("discard_pending", config.GetServiceWorkerShutdownMode());
+    ASSERT_TRUE(config.Parse("",
+                             {{"kvcm.service.worker_thread_num", "32"},
+                              {"kvcm.service.worker_queue_capacity", "1000"},
+                              {"kvcm.service.worker_shutdown_mode", "drain"}}));
+    EXPECT_TRUE(config.Check());
+    EXPECT_EQ(32u, config.GetServiceWorkerThreadNum());
+    EXPECT_EQ(1000u, config.GetServiceWorkerQueueCapacity());
+    EXPECT_EQ("drain", config.GetServiceWorkerShutdownMode());
+    ASSERT_TRUE(config.Parse("", {}));
+    EXPECT_EQ(0u, config.GetServiceWorkerThreadNum());
+    EXPECT_EQ(0u, config.GetServiceWorkerQueueCapacity());
+    EXPECT_EQ("discard_pending", config.GetServiceWorkerShutdownMode());
+    for (const auto *key : {"kvcm.service.worker_thread_num", "kvcm.service.worker_queue_capacity"}) {
+        for (const auto *value : {"-1", "12x", "", "4294967296"}) {
+            EXPECT_FALSE(config.Parse("", {{key, value}})) << key << "=" << value;
+        }
+    }
+    EXPECT_FALSE(config.Parse("", {{"kvcm.service.worker_shutdown_mode", "unknown"}}));
+}
+
 TEST_F(ServerConfigTest, MetricsEnvTagsResolveAtStartup) {
     ScopedEnv workspace("KVCM_TEST_METRICS_WORKSPACE", " workspace_a ");
     ScopedEnv deployment("KVCM_TEST_METRICS_DEPLOYMENT", "deployment_a");
