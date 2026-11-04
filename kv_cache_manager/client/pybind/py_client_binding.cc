@@ -49,6 +49,8 @@ struct PyKvMetaObjectClientConfig {
     PyInitParams transfer_init_params;
     std::uint64_t max_object_bytes{1024ULL * 1024ULL * 1024ULL};
     std::int32_t write_timeout_seconds{30};
+    std::vector<std::tuple<std::uint64_t, std::size_t, int>> gpu_memory_spans;
+    py::object gpu_memory_owner = py::none();
 
     kvcm::KvMetaObjectClientConfig ToCpp() const {
         kvcm::KvMetaObjectClientConfig config;
@@ -76,6 +78,7 @@ PYBIND11_MODULE(kvcm_py_client, module) {
     });
 
     module.doc() = "kvcm_py_client pybind11 extension";
+    module.attr("KV_META_GPU_REGISTRATION") = true;
     module.attr("KV_META_OBJECT_API_VERSION") = kvcm::GetKvMetaObjectClientApiVersion();
 
     // 绑定枚举
@@ -184,7 +187,9 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .def_readwrite("transfer_client_config", &PyKvMetaObjectClientConfig::transfer_client_config)
         .def_readwrite("transfer_init_params", &PyKvMetaObjectClientConfig::transfer_init_params)
         .def_readwrite("max_object_bytes", &PyKvMetaObjectClientConfig::max_object_bytes)
-        .def_readwrite("write_timeout_seconds", &PyKvMetaObjectClientConfig::write_timeout_seconds);
+        .def_readwrite("write_timeout_seconds", &PyKvMetaObjectClientConfig::write_timeout_seconds)
+        .def_readwrite("gpu_memory_spans", &PyKvMetaObjectClientConfig::gpu_memory_spans)
+        .def_readwrite("gpu_memory_owner", &PyKvMetaObjectClientConfig::gpu_memory_owner);
 
     py::class_<kvcm::ForwardContext, py::smart_holder>(module, "ForwardContext")
         .def(py::init<>())
@@ -251,10 +256,21 @@ PYBIND11_MODULE(kvcm_py_client, module) {
                 auto config = py_config.ToCpp();
                 auto captured_span = py_config.transfer_init_params.regist_span;
                 py::object captured_owner = captured_span == nullptr ? py::none() : captured_span->owner;
+                auto gpu_owner = py_config.gpu_memory_owner;
+                kvcm::ClientMemoryRegistrations registrations;
+                for (const auto &[base, size, device] : py_config.gpu_memory_spans) {
+                    registrations.gpu.push_back({reinterpret_cast<void *>(base), size, device});
+                }
+                if (captured_span != nullptr && captured_span->fd != -1) {
+                    registrations.host = {captured_span->span.base, captured_span->span.size, captured_span->fd};
+                }
                 std::pair<kvcm::ClientErrorCode, std::unique_ptr<kvcm::KvMetaObjectClient>> result;
                 {
                     py::gil_scoped_release release;
-                    if (captured_span != nullptr && captured_span->fd != -1) {
+                    if (!registrations.gpu.empty()) {
+                        result =
+                            kvcm::KvMetaObjectClient::CreateWithMemoryRegistrations(trace_id, config, registrations);
+                    } else if (captured_span != nullptr && captured_span->fd != -1) {
                         kvcm::SharedMemoryRegistration registration;
                         registration.base = captured_span->span.base;
                         registration.size = captured_span->span.size;
@@ -267,9 +283,32 @@ PYBIND11_MODULE(kvcm_py_client, module) {
                 if (result.second == nullptr) {
                     return py::make_tuple(result.first, py::none());
                 }
-                auto py_client = py::cast(std::move(result.second));
+                // Python instance attributes may be cleared before the C++
+                // holder. Tie GPU ownership to the native deleter, not just
+                // dynamic attributes, so GC cannot free registered VRAM first.
+                py::object py_client;
+                if (!registrations.gpu.empty()) {
+                    auto owned_client = std::shared_ptr<kvcm::KvMetaObjectClient>(
+                        result.second.release(),
+                        [owner = gpu_owner, host_owner = captured_owner, span = captured_span](
+                            kvcm::KvMetaObjectClient *client) mutable {
+                            py::gil_scoped_acquire acquire;
+                            {
+                                py::gil_scoped_release release;
+                                client->Close();
+                                delete client;
+                            }
+                            owner = py::object();
+                            host_owner = py::object();
+                            span.reset();
+                        });
+                    py_client = py::cast(std::move(owned_client));
+                } else {
+                    py_client = py::cast(std::move(result.second));
+                }
                 py_client.attr("_regist_span") = py::cast(captured_span);
                 py_client.attr("_regist_span_owner") = captured_owner;
+                py_client.attr("_gpu_memory_owner") = gpu_owner;
                 return py::make_tuple(result.first, py_client);
             },
             py::arg("trace_id"),

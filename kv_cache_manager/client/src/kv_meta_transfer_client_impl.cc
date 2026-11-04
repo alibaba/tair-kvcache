@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <map>
+#include <sys/stat.h>
 #include <utility>
 
 #include "kv_cache_manager/client/src/internal/config/client_config.h"
@@ -12,6 +13,66 @@
 #include "kv_cache_manager/data_storage/kv_meta_uri.h"
 
 namespace kv_cache_manager {
+namespace {
+bool AddressRangeIsRepresentable(const void *base, std::size_t size) {
+    if (base == nullptr) {
+        return size == 0;
+    }
+    const auto address = reinterpret_cast<std::uintptr_t>(base);
+    return size <= std::numeric_limits<std::uintptr_t>::max() - address;
+}
+
+} // namespace
+
+ClientErrorCode ValidateKvMetaMemoryRegistrations(const InitParams &init_params,
+                                                  const ClientMemoryRegistrations *memory_registrations) {
+    if (init_params.regist_span != nullptr) {
+        const auto &span = *init_params.regist_span;
+        if ((span.base == nullptr) != (span.size == 0) || !AddressRangeIsRepresentable(span.base, span.size)) {
+            KVCM_LOG_WARN("KVMeta registered span is incomplete or its address range overflows");
+            return ER_INVALID_PARAMS;
+        }
+    }
+    if (memory_registrations == nullptr) {
+        return ER_OK;
+    }
+    if (memory_registrations->gpu.size() > 64) {
+        return ER_INVALID_PARAMS;
+    }
+    const auto &gpu = memory_registrations->gpu;
+    for (std::size_t i = 0; i < gpu.size(); ++i) {
+        const auto &span = gpu[i];
+        if (span.base == nullptr || span.size == 0 || span.device_id < 0 ||
+            !AddressRangeIsRepresentable(span.base, span.size)) {
+            return ER_INVALID_PARAMS;
+        }
+        const auto begin = reinterpret_cast<std::uintptr_t>(span.base);
+        for (std::size_t j = 0; j < i; ++j) {
+            const auto other = reinterpret_cast<std::uintptr_t>(gpu[j].base);
+            if (begin < other + gpu[j].size && other < begin + span.size) {
+                return ER_INVALID_PARAMS;
+            }
+        }
+    }
+    const auto *shared_memory_registration = &memory_registrations->host;
+    const auto &registration = *shared_memory_registration;
+    const bool disabled = registration.fd == -1 && registration.base == nullptr && registration.size == 0;
+    if (disabled) {
+        return ER_OK;
+    }
+    if (registration.fd < 0 || registration.base == nullptr || registration.size == 0 ||
+        !AddressRangeIsRepresentable(registration.base, registration.size)) {
+        KVCM_LOG_WARN("KVMeta shared-memory registration is incomplete or its address range overflows");
+        return ER_INVALID_PARAMS;
+    }
+    struct stat file_stat {};
+    if (fstat(registration.fd, &file_stat) != 0 || file_stat.st_size < 0 ||
+        static_cast<std::uintmax_t>(file_stat.st_size) < registration.size) {
+        KVCM_LOG_WARN("KVMeta shared-memory fd is invalid or smaller than the registered range");
+        return ER_INVALID_PARAMS;
+    }
+    return ER_OK;
+}
 
 ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_config,
                                                    const InitParams &init_params,
@@ -49,10 +110,14 @@ ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_con
 ClientErrorCode KvMetaTransferClientImpl::Init(const std::string &client_config,
                                                const InitParams &init_params,
                                                std::uint64_t max_object_bytes,
-                                               const SharedMemoryRegistration *shared_memory_registration) {
+                                               const ClientMemoryRegistrations *memory_registrations) {
     if (!(init_params.role_type & RoleType::WORKER) || init_params.self_location_spec_name.empty() ||
         init_params.storage_configs.empty() || max_object_bytes == 0 || max_object_bytes > kKvMetaMaxValueBytes) {
         return ER_INVALID_PARAMS;
+    }
+    const auto registration_ec = ValidateKvMetaMemoryRegistrations(init_params, memory_registrations);
+    if (registration_ec != ER_OK) {
+        return registration_ec;
     }
     const auto validation_ec = ValidateKvMetaTransferClientConfig(client_config, init_params);
     if (validation_ec != ER_OK) {
@@ -64,12 +129,7 @@ ClientErrorCode KvMetaTransferClientImpl::Init(const std::string &client_config,
         return ER_INVALID_CLIENT_CONFIG;
     }
     sdk_wrapper_ = std::make_unique<SdkWrapper>();
-    ClientMemoryRegistrations registrations;
-    if (shared_memory_registration) {
-        registrations.host = *shared_memory_registration;
-    }
-    const auto ec =
-        sdk_wrapper_->Init(client_config_, init_params, shared_memory_registration ? &registrations : nullptr);
+    const auto ec = sdk_wrapper_->Init(client_config_, init_params, memory_registrations);
     if (ec != ER_OK) {
         sdk_wrapper_.reset();
         client_config_.reset();
@@ -233,7 +293,22 @@ KvMetaTransferClient::Create(const std::string &client_config,
                              const SharedMemoryRegistration &shared_memory_registration) {
     LoggerBroker::InitLoggerForClientOnce();
     auto client = std::make_unique<KvMetaTransferClientImpl>();
-    if (client->Init(client_config, init_params, max_object_bytes, &shared_memory_registration) != ER_OK) {
+    ClientMemoryRegistrations registrations;
+    registrations.host = shared_memory_registration;
+    if (client->Init(client_config, init_params, max_object_bytes, &registrations) != ER_OK) {
+        return nullptr;
+    }
+    return client;
+}
+
+std::unique_ptr<KvMetaTransferClient>
+KvMetaTransferClient::CreateWithMemoryRegistrations(const std::string &client_config,
+                                                    const InitParams &init_params,
+                                                    std::uint64_t max_object_bytes,
+                                                    const ClientMemoryRegistrations &registrations) {
+    LoggerBroker::InitLoggerForClientOnce();
+    auto client = std::make_unique<KvMetaTransferClientImpl>();
+    if (client->Init(client_config, init_params, max_object_bytes, &registrations) != ER_OK) {
         return nullptr;
     }
     return client;

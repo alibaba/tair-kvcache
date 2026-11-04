@@ -52,6 +52,17 @@ protected:
     std::string config_;
 };
 
+TEST_F(KvMetaTransferConfigTest, RejectsBadGpuRegistrationInStandaloneTransferClient) {
+    init_params_.role_type = RoleType::WORKER;
+    init_params_.storage_configs = "[]";
+    ClientMemoryRegistrations registrations;
+    registrations.gpu = {{nullptr, 4096, 0}};
+    KvMetaTransferClientImpl client;
+    EXPECT_EQ(ER_INVALID_PARAMS, client.Init(config_, init_params_, 4096, &registrations));
+    registrations.gpu = {{reinterpret_cast<void *>(0x1000), 4096, 0}, {reinterpret_cast<void *>(0x1800), 4096, 0}};
+    EXPECT_EQ(ER_INVALID_PARAMS, client.Init(config_, init_params_, 4096, &registrations));
+}
+
 TEST_F(KvMetaTransferConfigTest, AcceptsExistingSmallSdkQueue) {
     const std::string group = "group";
     const std::string instance = "instance";

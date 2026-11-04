@@ -67,6 +67,14 @@ public:
                                         const BlockBuffers &object_buffers) = 0;
 
     // All keys must exist and match expected_value_sizes before any data I/O.
+    // Register immutable GPU arenas before PACE initialization. The caller must
+    // retain every allocation until Close completes; registration is not proof
+    // that the selected transport actually performed GPUDirect RDMA.
+    static std::pair<ClientErrorCode, std::unique_ptr<KvMetaObjectClient>>
+    CreateWithMemoryRegistrations(const std::string &trace_id,
+                                  const KvMetaObjectClientConfig &config,
+                                  const ClientMemoryRegistrations &registrations);
+
     virtual ClientErrorCode LoadObjects(const std::string &trace_id,
                                         const std::vector<std::string> &keys,
                                         const std::vector<std::uint64_t> &expected_value_sizes,

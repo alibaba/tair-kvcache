@@ -19,6 +19,9 @@ ClientErrorCode ValidateKvMetaTransferClientConfig(const std::string &client_con
                                                    const std::string *expected_instance_group = nullptr,
                                                    const std::string *expected_instance_id = nullptr);
 
+ClientErrorCode ValidateKvMetaMemoryRegistrations(const InitParams &init_params,
+                                                  const ClientMemoryRegistrations *registrations);
+
 class KvMetaTransferClientImpl final : public KvMetaTransferClient {
 public:
     KvMetaTransferClientImpl() = default;
@@ -37,7 +40,7 @@ private:
     ClientErrorCode Init(const std::string &client_config,
                          const InitParams &init_params,
                          std::uint64_t max_object_bytes,
-                         const SharedMemoryRegistration *shared_memory_registration);
+                         const ClientMemoryRegistrations *memory_registrations);
     ClientErrorCode ValidateObjects(const UriStrVec &uri_str_vec,
                                     const std::vector<std::uint64_t> &value_sizes,
                                     const BlockBuffers &object_buffers) const;

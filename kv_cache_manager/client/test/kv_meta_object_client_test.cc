@@ -1047,5 +1047,35 @@ TEST(KvMetaObjectClientCreateTest, RejectsMissingSdkConfigBeforeMetadataRegistra
     EXPECT_EQ(nullptr, client);
 }
 
+TEST(KvMetaObjectClientCreateTest, ValidatesGpuRegistrationsBeforeMetadata) {
+    const auto config = MakeStaticallyValidCreateConfig();
+    ClientMemoryRegistrations registrations;
+    const auto check = [&](ClientErrorCode expected) {
+        auto result = KvMetaObjectClient::CreateWithMemoryRegistrations("trace", config, registrations);
+        EXPECT_EQ(expected, result.first);
+        EXPECT_EQ(nullptr, result.second);
+    };
+    // Empty metadata addresses fail only after valid local registrations.
+    check(ER_METACLIENT_INIT_ERROR);
+    registrations.gpu = {{reinterpret_cast<void *>(0x1000), 4096, 0}};
+    check(ER_METACLIENT_INIT_ERROR);
+    registrations.gpu.push_back({reinterpret_cast<void *>(0x2000), 4096, 0});
+    check(ER_METACLIENT_INIT_ERROR);
+    registrations.gpu[1].base = reinterpret_cast<void *>(0x1fff);
+    check(ER_INVALID_PARAMS);
+    registrations.gpu.resize(1);
+    registrations.gpu[0].device_id = -1;
+    check(ER_INVALID_PARAMS);
+    registrations.gpu[0].device_id = 0;
+    registrations.gpu[0].size = 0;
+    check(ER_INVALID_PARAMS);
+    registrations.gpu[0] = {nullptr, 4096, 0};
+    check(ER_INVALID_PARAMS);
+    registrations.gpu[0] = {reinterpret_cast<void *>(std::numeric_limits<std::uintptr_t>::max() - 3), 4, 0};
+    check(ER_INVALID_PARAMS);
+    registrations.gpu.assign(65, {reinterpret_cast<void *>(0x1000), 4096, 0});
+    check(ER_INVALID_PARAMS);
+}
+
 } // namespace
 } // namespace kv_cache_manager

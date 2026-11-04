@@ -26,6 +26,12 @@ public:
                                                         std::uint64_t max_object_bytes,
                                                         const SharedMemoryRegistration &shared_memory_registration);
 
+    static std::unique_ptr<KvMetaTransferClient>
+    CreateWithMemoryRegistrations(const std::string &client_config,
+                                  const InitParams &init_params,
+                                  std::uint64_t max_object_bytes,
+                                  const ClientMemoryRegistrations &registrations);
+
     virtual ClientErrorCode LoadObjects(const UriStrVec &uri_str_vec,
                                         const std::vector<std::uint64_t> &value_sizes,
                                         const BlockBuffers &object_buffers) = 0;

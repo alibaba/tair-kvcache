@@ -105,7 +105,9 @@ class _FakePybind:
         self.client = client or _FakeClient()
         self.create_code = create_code
         self.create_calls = []
-        self.KvMetaObjectClient = SimpleNamespace(Create=self._create, Close=_FakeClient.Close)
+        self.KvMetaObjectClient = SimpleNamespace(
+            Create=self._create, Close=_FakeClient.Close
+        )
 
     def _create(self, trace_id, config):
         self.create_calls.append((trace_id, config))
@@ -170,6 +172,98 @@ def _client(
         native,
         pybind,
     )
+
+
+class KvMetaGpuRegistrationTest(unittest.TestCase):
+    def tensor(self, **kwargs):
+        tensor = _Tensor(device="cuda", **kwargs)
+        tensor.device.index = 0
+        return tensor
+
+    def test_gpu_spans_and_owner_reach_native_creation(self):
+        tensor = self.tensor()
+        pybind = _FakePybind()
+        pybind.KV_META_GPU_REGISTRATION = True
+        client = KvMetaObjectClient(
+            _config(), gpu_tensors=(tensor,), _pybind_module=pybind
+        )
+        config = pybind.create_calls[0][1]
+        self.assertEqual(config.gpu_memory_spans, [(0x4000, 24, 0)])
+        self.assertIs(config.gpu_memory_owner[0], tensor)
+        client.close()
+
+    def test_registration_arena_can_exceed_single_object_limit(self):
+        tensor = self.tensor(count=KV_META_MAX_OBJECT_BYTES, width=2)
+        pybind = _FakePybind()
+        pybind.KV_META_GPU_REGISTRATION = True
+        client = KvMetaObjectClient(
+            _config(), gpu_tensors=(tensor,), _pybind_module=pybind
+        )
+        self.assertEqual(
+            pybind.create_calls[0][1].gpu_memory_spans,
+            [(0x4000, 2 * KV_META_MAX_OBJECT_BYTES, 0)],
+        )
+        with self.assertRaises(ValueError):
+            KvMetaObjectBuffer.from_tensor("too-large-object", tensor)
+        client.close()
+
+    def test_old_wheel_rejected_before_registration(self):
+        pybind = _FakePybind()
+        with self.assertRaisesRegex(ImportError, "GPU registration"):
+            KvMetaObjectClient(
+                _config(), gpu_tensors=(self.tensor(),), _pybind_module=pybind
+            )
+        self.assertEqual(pybind.create_calls, [])
+
+    def test_invalid_gpu_spans_rejected_before_native_calls(self):
+        invalid = [
+            (_Tensor(),),
+            (self.tensor(contiguous=False),),
+            (self.tensor(count=0),),
+            (self.tensor(pointer=(1 << 64) - 1),),
+            (self.tensor(), self.tensor()),
+            tuple(self.tensor(pointer=4096 * i) for i in range(1, 66)),
+        ]
+        missing_device = self.tensor()
+        missing_device.device.index = None
+        invalid.append((missing_device,))
+        view = self.tensor()
+        view.storage_offset = lambda: 1
+        invalid.append((view,))
+        partial_storage = self.tensor()
+        partial_storage.untyped_storage = lambda: SimpleNamespace(nbytes=lambda: 1024)
+        invalid.append((partial_storage,))
+        for tensors in invalid:
+            with self.subTest(tensors=tensors):
+                pybind = _FakePybind()
+                pybind.KV_META_GPU_REGISTRATION = True
+                with self.assertRaises((ValueError, TypeError)):
+                    KvMetaObjectClient(
+                        _config(), gpu_tensors=tensors, _pybind_module=pybind
+                    )
+                self.assertEqual(pybind.create_calls, [])
+
+    def test_owner_remains_alive_until_native_close_finishes(self):
+        tensor = self.tensor()
+        reference = weakref.ref(tensor)
+        native = _FakeClient()
+        observed = []
+        native.Close = lambda: observed.append(reference() is not None)
+        pybind = _FakePybind(native)
+        pybind.KV_META_GPU_REGISTRATION = True
+        client = KvMetaObjectClient(
+            _config(),
+            gpu_tensors=(tensor,),
+            _object_client=native,
+            _pybind_module=pybind,
+        )
+        del tensor
+        gc.collect()
+        self.assertIsNotNone(reference())
+        client.close()
+        gc.collect()
+        self.assertEqual(observed, [True])
+        self.assertIsNone(reference())
 
 
 class KvMetaObjectClientConfigTest(unittest.TestCase):
@@ -1033,7 +1127,9 @@ class KvMetaObjectNativeBindingContractTest(unittest.TestCase):
             kvcm_py_client.KV_META_OBJECT_API_VERSION,
             KV_META_OBJECT_API_VERSION,
         )
-        self.assertTrue(callable(getattr(kvcm_py_client.KvMetaObjectClient, "Close", None)))
+        self.assertTrue(
+            callable(getattr(kvcm_py_client.KvMetaObjectClient, "Close", None))
+        )
 
         iov = kvcm_py_client.Iov()
         iov.type = kvcm_py_client.MemoryType.CPU
@@ -1046,6 +1142,30 @@ class KvMetaObjectNativeBindingContractTest(unittest.TestCase):
         self.assertEqual(block.iovs[0].base, (1 << 64) - 1)
         self.assertEqual(block.iovs[0].size, KV_META_MAX_OBJECT_BYTES)
         self.assertEqual(block.iovs[0].type, kvcm_py_client.MemoryType.CPU)
+
+    def test_real_binding_forwards_gpu_spans_before_rpc(self):
+        from kv_cache_manager.client.pybind import kvcm_py_client
+
+        self.assertIs(kvcm_py_client.KV_META_GPU_REGISTRATION, True)
+        config = kvcm_py_client.KvMetaObjectClientConfig()
+        config.instance_group = "group"
+        config.transfer_client_config = "{}"
+        params = kvcm_py_client.InitParams()
+        params.role_type = kvcm_py_client.RoleType.WORKER
+        params.self_location_spec_name = "value"
+        config.transfer_init_params = params
+        config.gpu_memory_spans = [(0, 4096, 0)]
+        code, client = kvcm_py_client.KvMetaObjectClient.Create(
+            "gpu-validation", config
+        )
+        self.assertEqual(code, kvcm_py_client.ClientErrorCode.ER_INVALID_PARAMS)
+        self.assertIsNone(client)
+        config.gpu_memory_spans = []
+        code, client = kvcm_py_client.KvMetaObjectClient.Create(
+            "empty-validation", config
+        )
+        self.assertEqual(code, kvcm_py_client.ClientErrorCode.ER_INVALID_CLIENT_CONFIG)
+        self.assertIsNone(client)
 
     def test_high_level_client_reaches_real_native_create_and_maps_error(self):
         from kv_cache_manager.client.pybind import kvcm_py_client

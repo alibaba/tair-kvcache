@@ -63,6 +63,35 @@ class KvMetaObjectMemory(str, Enum):
     GPU = "gpu"
 
 
+def _tensor_layout(tensor: Any) -> tuple:
+    is_contiguous = getattr(tensor, "is_contiguous", None)
+    data_ptr = getattr(tensor, "data_ptr", None)
+    numel = getattr(tensor, "numel", None)
+    element_size = getattr(tensor, "element_size", None)
+    if not callable(is_contiguous) or not is_contiguous():
+        raise ValueError("KVMeta tensor must be contiguous")
+    if not callable(data_ptr) or not callable(numel) or not callable(element_size):
+        raise TypeError("KVMeta tensor lacks the required tensor interface")
+
+    device_type = getattr(getattr(tensor, "device", None), "type", None)
+    if device_type == "cpu":
+        memory = KvMetaObjectMemory.CPU
+    elif device_type in ("cuda", "musa"):
+        memory = KvMetaObjectMemory.GPU
+    else:
+        raise ValueError(f"KVMeta tensor device is unsupported: {device_type!r}")
+
+    count = numel()
+    width = element_size()
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError("KVMeta tensor numel must be a non-negative integer")
+    if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+        raise ValueError("KVMeta tensor element size must be a positive integer")
+    if count > _MAX_UINT64 // width:
+        raise ValueError("KVMeta tensor byte size exceeds uint64")
+    return data_ptr(), count * width, memory
+
+
 @dataclass(frozen=True)
 class KvMetaObjectBuffer:
     """One caller-owned contiguous object buffer."""
@@ -89,32 +118,7 @@ class KvMetaObjectBuffer:
     def from_tensor(cls, key: str, tensor: Any) -> "KvMetaObjectBuffer":
         """Describe a contiguous CPU/CUDA/MUSA tensor without importing torch."""
 
-        is_contiguous = getattr(tensor, "is_contiguous", None)
-        data_ptr = getattr(tensor, "data_ptr", None)
-        numel = getattr(tensor, "numel", None)
-        element_size = getattr(tensor, "element_size", None)
-        if not callable(is_contiguous) or not is_contiguous():
-            raise ValueError("KVMeta tensor must be contiguous")
-        if not callable(data_ptr) or not callable(numel) or not callable(element_size):
-            raise TypeError("KVMeta tensor lacks the required tensor interface")
-
-        device_type = getattr(getattr(tensor, "device", None), "type", None)
-        if device_type == "cpu":
-            memory = KvMetaObjectMemory.CPU
-        elif device_type in ("cuda", "musa"):
-            memory = KvMetaObjectMemory.GPU
-        else:
-            raise ValueError(f"KVMeta tensor device is unsupported: {device_type!r}")
-
-        count = numel()
-        width = element_size()
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            raise ValueError("KVMeta tensor numel must be a non-negative integer")
-        if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
-            raise ValueError("KVMeta tensor element size must be a positive integer")
-        if count > _MAX_UINT64 // width:
-            raise ValueError("KVMeta tensor byte size exceeds uint64")
-        return cls(key, data_ptr(), count * width, memory, tensor)
+        return cls(key, *_tensor_layout(tensor), tensor)
 
 
 @dataclass(frozen=True)
@@ -137,7 +141,9 @@ class KvMetaObjectClientConfig:
         try:
             addresses = tuple(islice(iter(self.addresses), KV_META_MAX_ADDRESSES + 1))
         except TypeError as error:
-            raise TypeError("KVMeta addresses must be a sequence of endpoints") from error
+            raise TypeError(
+                "KVMeta addresses must be a sequence of endpoints"
+            ) from error
         if not addresses or len(addresses) > KV_META_MAX_ADDRESSES:
             raise ValueError(
                 f"KVMeta addresses must contain 1 to {KV_META_MAX_ADDRESSES} endpoints"
@@ -162,7 +168,10 @@ class KvMetaObjectClientConfig:
             raise ValueError(
                 f"KVMeta user_data exceeds {KV_META_MAX_USER_DATA_BYTES} UTF-8 bytes"
             )
-        if not isinstance(self.transfer_client_config, str) or not self.transfer_client_config:
+        if (
+            not isinstance(self.transfer_client_config, str)
+            or not self.transfer_client_config
+        ):
             raise ValueError("KVMeta transfer_client_config must be a non-empty string")
         _utf8_size(self.transfer_client_config, "KVMeta transfer_client_config")
 
@@ -338,20 +347,62 @@ def _best_effort_close(client: Any, phase: str) -> None:
             return
 
 
+def _gpu_registration_spans(tensors: Any) -> tuple:
+    if isinstance(tensors, (str, bytes)) or not isinstance(tensors, Sequence):
+        raise TypeError("GPU registration tensors must be a sequence")
+    if len(tensors) > 64:
+        raise ValueError("at most 64 GPU registration tensors are allowed")
+    owners = tuple(tensors)
+    spans = []
+    for tensor in owners:
+        pointer, nbytes, _ = _tensor_layout(tensor)
+        _positive_int(pointer, "GPU registration pointer", _MAX_UINT64)
+        _positive_int(nbytes, "GPU registration size", _MAX_UINT64)
+        if nbytes > _MAX_UINT64 - pointer:
+            raise ValueError("GPU registration address range exceeds uint64")
+        storage_offset = getattr(tensor, "storage_offset", None)
+        if callable(storage_offset) and storage_offset() != 0:
+            raise ValueError("GPU registration requires an allocation-root tensor")
+        storage = getattr(tensor, "untyped_storage", None)
+        if callable(storage) and storage().nbytes() != nbytes:
+            raise ValueError("GPU registration tensor must cover its complete storage")
+        device = tensor.device
+        index = getattr(device, "index", None)
+        if device.type != "cuda" or type(index) is not int or index < 0:
+            raise ValueError("GPU registration requires an indexed CUDA device")
+        for base, size, _ in spans:
+            if pointer < base + size and base < pointer + nbytes:
+                raise ValueError("GPU registration tensors must not overlap")
+        spans.append((pointer, nbytes, index))
+    return owners, tuple(spans)
+
+
 class KvMetaObjectClient:
-    """Thread-safe synchronous client for variable-size opaque objects."""
+    """Thread-safe synchronous client for variable-size opaque objects.
+
+    Optional gpu_tensors register immutable CUDA arenas before PACE starts.
+    Keep their storage unchanged (no resize/rebind) until close. The client holds
+    strong references until native Close has drained operations. Synchronize the
+    CUDA producer stream before save, and keep concurrent operations disjoint.
+    Registration requests GPUDirect eligibility; PACE may use staging when the
+    hardware or transport cannot support it. It does not certify a GDR transfer.
+    """
 
     def __init__(
         self,
         config: KvMetaObjectClientConfig,
         *,
         registration_owner: Any = None,
+        gpu_tensors: Sequence[Any] = (),
         _object_client: Any = None,
         _pybind_module: Any = None,
     ) -> None:
         if not isinstance(config, KvMetaObjectClientConfig):
             raise TypeError("config must be a KvMetaObjectClientConfig")
+        gpu_owners, gpu_spans = _gpu_registration_spans(gpu_tensors)
         self.config = config
+        self._gpu_registration_owners = gpu_owners
+        self._gpu_registration_spans = gpu_spans
         # Python only serializes close itself. The native client owns operation
         # lifetime and drains calls already in flight from Close().
         self._close_condition = threading.Condition()
@@ -364,6 +415,13 @@ class KvMetaObjectClient:
             if self._pybind is None:
                 self._pybind = _load_kvcm_pybind()
             _validate_pybind_module(self._pybind)
+            if (
+                gpu_spans
+                and getattr(self._pybind, "KV_META_GPU_REGISTRATION", False) is not True
+            ):
+                raise ImportError(
+                    "installed kvcm_py_client lacks GPU registration support"
+                )
             if self._client is None:
                 self._client = self._create_client()
             if not all(
@@ -375,6 +433,7 @@ class KvMetaObjectClient:
             client, self._client = self._client, None
             _best_effort_close(client, "initialization rollback")
             self._registration_owner = None
+            self._gpu_registration_owners = ()
             raise
 
     @staticmethod
@@ -423,6 +482,9 @@ class KvMetaObjectClient:
         native_config.transfer_init_params = init_params
         native_config.max_object_bytes = self.config.max_object_bytes
         native_config.write_timeout_seconds = self.config.write_timeout_seconds
+        if self._gpu_registration_spans:
+            native_config.gpu_memory_spans = list(self._gpu_registration_spans)
+            native_config.gpu_memory_owner = self._gpu_registration_owners
 
         try:
             code, client = self._pybind.KvMetaObjectClient.Create(
@@ -450,7 +512,9 @@ class KvMetaObjectClient:
             if not isinstance(obj, KvMetaObjectBuffer):
                 raise TypeError(f"objects[{index}] must be a KvMetaObjectBuffer")
             if obj.nbytes > self.config.max_object_bytes:
-                raise ValueError(f"objects[{index}] exceeds configured max_object_bytes")
+                raise ValueError(
+                    f"objects[{index}] exceeds configured max_object_bytes"
+                )
             if obj.key in keys:
                 raise ValueError("KVMeta object keys must be unique")
             keys.add(obj.key)
@@ -476,7 +540,9 @@ class KvMetaObjectClient:
             begin = end
         return batches
 
-    def _native_buffers(self, objects: Tuple[KvMetaObjectBuffer, ...]) -> Tuple[Any, ...]:
+    def _native_buffers(
+        self, objects: Tuple[KvMetaObjectBuffer, ...]
+    ) -> Tuple[Any, ...]:
         buffers = []
         for obj in objects:
             iov = self._pybind.Iov()
@@ -549,7 +615,9 @@ class KvMetaObjectClient:
                 )
 
     @staticmethod
-    def _buffers_from_tensors(keys: Any, tensors: Any) -> Tuple[KvMetaObjectBuffer, ...]:
+    def _buffers_from_tensors(
+        keys: Any, tensors: Any
+    ) -> Tuple[KvMetaObjectBuffer, ...]:
         materialized_keys = _snapshot_sequence(keys, "KVMeta keys")
         materialized_tensors = _snapshot_sequence(tensors, "KVMeta tensors")
         if len(materialized_keys) != len(materialized_tensors):
@@ -658,6 +726,7 @@ class KvMetaObjectClient:
             # Native state must be released before the registered-memory owner.
             client = None
             self._registration_owner = None
+            self._gpu_registration_owners = ()
             with self._close_condition:
                 self._closed = True
                 self._closing = False

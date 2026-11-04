@@ -113,3 +113,23 @@ if (start_ec == kv_cache_manager::ER_OK && !write.locations.empty()) {
 
 `KvMetaClient` 只提供 metadata/allocation API。自行编排时，应配套使用 `KvMetaTransferClient`，按返回 URI 和
 `KvMetaValueLocation.value_size` 搬运；不要复用根据普通 KV cache 定长 spec 校验 buffer 的 `TransferClient`。
+
+### Exact-object CUDA arena registration
+
+The isolated KvMetaObjectClient and KvMetaTransferClient expose
+CreateWithMemoryRegistrations with ClientMemoryRegistrations, so variable-size
+EMB objects can reuse the transport's pre-initialization GPU registrations.
+The Python equivalent is KvMetaObjectClient(config, gpu_tensors=(arena,)).
+The native capability flag KV_META_GPU_REGISTRATION must be True; existing
+API-v2 CPU callers remain compatible.
+
+Register only complete contiguous CUDA arena tensors rooted at native CUDA
+allocation bases. Transfer views within an arena are permitted. Keep allocations
+unchanged through Close and synchronize producer streams before saving. Python
+owners survive native teardown, including GC; C++ callers retain their own
+allocation ownership. Invalid or overlapping registrations fail before RPC.
+
+This requests GDR eligibility, not a mandatory transport. PACE may stage when
+registration or hardware capability is unavailable. Confirm actual direct
+transfer and error counters on an RDMA consumer/provider pair before reporting
+GDR success. Tensor-tree serialization is owned by the application.

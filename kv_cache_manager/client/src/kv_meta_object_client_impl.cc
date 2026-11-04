@@ -12,14 +12,6 @@
 namespace kv_cache_manager {
 namespace {
 
-bool AddressRangeIsRepresentable(const void *base, std::size_t size) {
-    if (base == nullptr) {
-        return size == 0;
-    }
-    const auto address = reinterpret_cast<std::uintptr_t>(base);
-    return size <= std::numeric_limits<std::uintptr_t>::max() - address;
-}
-
 bool IsKnownStorageType(KvMetaStorageType type) {
     return type == KvMetaStorageType::TAIR_MEMPOOL || type == KvMetaStorageType::TAIR_MEMPOOL_SSD;
 }
@@ -44,42 +36,10 @@ bool SameStorageUris(const UriStrVec &expected, const UriStrVec &actual) {
     return true;
 }
 
-ClientErrorCode ValidateLocalRegistration(const InitParams &init_params,
-                                          const SharedMemoryRegistration *shared_memory_registration) {
-    if (init_params.regist_span != nullptr) {
-        const auto &span = *init_params.regist_span;
-        if ((span.base == nullptr) != (span.size == 0) || !AddressRangeIsRepresentable(span.base, span.size)) {
-            KVCM_LOG_WARN("KVMeta registered span is incomplete or its address range overflows");
-            return ER_INVALID_PARAMS;
-        }
-    }
-    if (shared_memory_registration == nullptr) {
-        return ER_OK;
-    }
-
-    const auto &registration = *shared_memory_registration;
-    const bool disabled = registration.fd == -1 && registration.base == nullptr && registration.size == 0;
-    if (disabled) {
-        return ER_OK;
-    }
-    if (registration.fd < 0 || registration.base == nullptr || registration.size == 0 ||
-        !AddressRangeIsRepresentable(registration.base, registration.size)) {
-        KVCM_LOG_WARN("KVMeta shared-memory registration is incomplete or its address range overflows");
-        return ER_INVALID_PARAMS;
-    }
-    struct stat file_stat {};
-    if (fstat(registration.fd, &file_stat) != 0 || file_stat.st_size < 0 ||
-        static_cast<std::uintmax_t>(file_stat.st_size) < registration.size) {
-        KVCM_LOG_WARN("KVMeta shared-memory fd is invalid or smaller than the registered range");
-        return ER_INVALID_PARAMS;
-    }
-    return ER_OK;
-}
-
 std::pair<ClientErrorCode, std::unique_ptr<KvMetaObjectClient>>
 CreateObjectClient(const std::string &trace_id,
                    const KvMetaObjectClientConfig &config,
-                   const SharedMemoryRegistration *shared_memory_registration) {
+                   const ClientMemoryRegistrations *memory_registrations) {
     if (config.instance_group.empty() || config.transfer_client_config.empty() || config.max_object_bytes == 0 ||
         config.max_object_bytes > kKvMetaMaxValueBytes || config.write_timeout_seconds <= 0 ||
         config.write_timeout_seconds > kKvMetaMaxWriteTimeoutSeconds ||
@@ -87,7 +47,7 @@ CreateObjectClient(const std::string &trace_id,
         config.transfer_init_params.self_location_spec_name != kKvMetaValueSpecName) {
         return {ER_INVALID_PARAMS, nullptr};
     }
-    const auto registration_ec = ValidateLocalRegistration(config.transfer_init_params, shared_memory_registration);
+    const auto registration_ec = ValidateKvMetaMemoryRegistrations(config.transfer_init_params, memory_registrations);
     if (registration_ec != ER_OK) {
         return {registration_ec, nullptr};
     }
@@ -110,12 +70,12 @@ CreateObjectClient(const std::string &trace_id,
     InitParams transfer_init_params = config.transfer_init_params;
     transfer_init_params.storage_configs = std::move(storage_configs);
     std::unique_ptr<KvMetaTransferClient> transfer_client;
-    if (shared_memory_registration == nullptr) {
+    if (memory_registrations == nullptr) {
         transfer_client =
             KvMetaTransferClient::Create(config.transfer_client_config, transfer_init_params, config.max_object_bytes);
     } else {
-        transfer_client = KvMetaTransferClient::Create(
-            config.transfer_client_config, transfer_init_params, config.max_object_bytes, *shared_memory_registration);
+        transfer_client = KvMetaTransferClient::CreateWithMemoryRegistrations(
+            config.transfer_client_config, transfer_init_params, config.max_object_bytes, *memory_registrations);
     }
     if (!transfer_client) {
         return {ER_TRANSFERCLIENT_INIT_ERROR, nullptr};
@@ -443,7 +403,17 @@ KvMetaObjectClient::Create(const std::string &trace_id,
                            const KvMetaObjectClientConfig &config,
                            const SharedMemoryRegistration &shared_memory_registration) {
     LoggerBroker::InitLoggerForClientOnce();
-    return CreateObjectClient(trace_id, config, &shared_memory_registration);
+    ClientMemoryRegistrations registrations;
+    registrations.host = shared_memory_registration;
+    return CreateObjectClient(trace_id, config, &registrations);
+}
+
+std::pair<ClientErrorCode, std::unique_ptr<KvMetaObjectClient>>
+KvMetaObjectClient::CreateWithMemoryRegistrations(const std::string &trace_id,
+                                                  const KvMetaObjectClientConfig &config,
+                                                  const ClientMemoryRegistrations &registrations) {
+    LoggerBroker::InitLoggerForClientOnce();
+    return CreateObjectClient(trace_id, config, &registrations);
 }
 
 } // namespace kv_cache_manager
