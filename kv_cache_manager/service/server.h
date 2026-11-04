@@ -84,6 +84,7 @@ private:
 
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<MetricsLifecycle> metrics_lifecycle_;
+    std::shared_ptr<LoopThread> role_state_metrics_thread_;
     std::shared_ptr<MetricsReporterFactory> metrics_reporter_factory_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<LoopThread> metrics_report_thread_;

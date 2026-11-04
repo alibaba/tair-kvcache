@@ -200,6 +200,8 @@ errors in response bodies remain in `service.error_counter`.
 
 | Metric | Type | Description |
 |---|---|---|
+| `is_leader` | gauge | Whether this node holds the leader lease (1/0), exported as `kvcm_is_leader` |
+| `role_state` | gauge | Current leader lifecycle phase, exported as `kvcm_role_state{state="..."}`. The sampled phase is 1 and the other three are 0 |
 | `meta_indexer.total_key_count` | gauge | Total keys across all indexers |
 | `meta_indexer.total_cache_usage` | gauge | Estimated local metadata memory across all indexers (LRU charge, bytes) |
 | `data_storage.healthy_status` | gauge | Storage backend read availability (1/0) |
@@ -217,6 +219,47 @@ Local mode reports the instance's LRU charge, cached mode reports the local port
 It uses the same accounting as `meta_indexer.total_cache_usage`, but sampling times differ, so concurrent writes
 can prevent an exact instantaneous sum. Charge is not RSS or actual container memory and does not fully account
 for fixed lock arrays, allocator overhead, and similar costs. `byte_size` measures KVCache data quota usage.
+
+`is_leader` is a node-level metric without storage labels. It reports ownership
+of the leader lease (1/0), including promotion/recovery, and does not imply that
+business APIs are ready. Reporting only observes role state and does not alter
+request admission. Offline tools without a leader-state provider do not export it.
+
+`role_state` observes `LeaderElector::GetRoleState()` on a separate lightweight thread at
+`kvcm.metrics.report_interval_ms` (20 seconds by default). It performs no network I/O and
+holds no business/lifecycle lock, so a blocked recovery, cleanup or ordinary metrics report
+cannot prevent phase sampling. All four fixed series are refreshed each interval; old
+phases are reset to 0. A phase shorter than the reporting/scraping interval may not be observed.
+This is sampled state, not a transition-event history. `is_leader` keeps its existing reporting
+path; the two metrics are independent observations, not a transactional readiness snapshot.
+`role_state` also works with the dummy reporter because it is published directly into the registry.
+
+Example during promotion:
+
+```text
+kvcm_role_state{state="follower"} 0
+kvcm_role_state{state="promoting"} 1
+kvcm_role_state{state="leader"} 0
+kvcm_role_state{state="demoting"} 0
+```
+
+To detect a prolonged transition, use this alert expression with a `for` duration such as
+`5m`, adjusted to the expected recovery/cleanup time:
+
+```promql
+kvcm_role_state{state=~"promoting|demoting"} == 1
+```
+
+To select nodes reporting both lease ownership and the stable leader phase:
+
+```promql
+(kvcm_is_leader == 1)
+and ignoring(state) (kvcm_role_state{state="leader"} == 1)
+```
+
+This combination does not guarantee request readiness, complete instance recovery or healthy
+dependencies. The metric only exposes the existing state machine; it changes neither admission
+nor election/recovery behavior.
 
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.
