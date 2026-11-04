@@ -188,16 +188,21 @@ apt-get remove -y libjsoncpp-dev # sglang容器内jsoncpp的和KVCM自带的有�
 
 生产镜像用于部署 Tair KVCache Manager 服务。
 
+内外源生产镜像在构建时预装安装包中的 `kvcm_ops` wheel 和 `requests`（版本约束由 wheel 声明），
+可直接运行 `python3 -m kvcm_ops`。外源镜像的 `python3` 使用已安装的 Python 3.11。
+构建时禁用 pip 下载缓存和字节码预编译，并通过 `ADD` 直接解包本地 tar.gz，避免镜像层保留一份重复的压缩包。
+构建会运行 `list_instance --help`，检查 CLI 及 HTTP 依赖能否正常加载。
+
 ### 构建命令
 
 ```bash
 # 需要先构建二进制包。建议使用上述开发镜像作为构建环境。
 sh open_source/package/build_for_image.sh
-cp bazel-bin/package/kv_cache_manager_server.tar.gz open_source/package/
+cp bazel-bin/package/kv_cache_manager_server.tar.gz open_source/docker/
 cd open_source/docker/
 # 然后构建生产镜像
 docker build -f Dockerfile.prod \
-  --build-arg BINARY_PACKAGE_TAR=../package/kv_cache_manager.tar.gz \
+  --build-arg BINARY_PACKAGE_TAR=kv_cache_manager_server.tar.gz \
   -t kv_cache_manager_prod:latest .
 ```
 
