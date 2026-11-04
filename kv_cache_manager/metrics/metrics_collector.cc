@@ -337,14 +337,18 @@ DataStorageIntervalMetricsCollector::DataStorageIntervalMetricsCollector(
     std::shared_ptr<MetricsRegistry> metrics_registry, MetricsTags metrics_tags) noexcept
     : MetricsCollector(std::move(metrics_registry), std::move(metrics_tags)) {}
 
-bool DataStorageIntervalMetricsCollector::Init() {
+bool DataStorageIntervalMetricsCollector::Init() { return Init(true); }
+
+bool DataStorageIntervalMetricsCollector::Init(bool report_storage_usage) {
     if (metrics_registry_ == nullptr) {
         return false;
     }
 
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(healthy_status);
     REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(writable_status);
-    REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(storage_usage_ratio);
+    if (report_storage_usage) {
+        REGISTER_GAUGE_METRICS_FOR_DATA_STORAGE(storage_usage_ratio);
+    }
 
     return true;
 }

@@ -472,6 +472,8 @@ public:
     ~DataStorageIntervalMetricsCollector() override = default;
 
     bool Init() override;
+    // Followers retain health/writability without registering a capacity series.
+    bool Init(bool report_storage_usage);
 };
 
 /* ------------ MetaIndexerAccumulativeMetricsCollector ------------- */

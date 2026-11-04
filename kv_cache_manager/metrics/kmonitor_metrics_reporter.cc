@@ -735,23 +735,46 @@ void KmonitorMetricsReporter::ReportInterval() {
     } while (false);
 
     do {
-        // for data storage metrics
-        // these metrics are already updated by local metrics reporter
-        // so report them directly to kmonitor
-        const auto &vec = data_storage_interval_metrics_collectors_.GetMetricsCollectors();
-        for (const auto &mc : vec) {
-            if (const auto p = std::dynamic_pointer_cast<DataStorageIntervalMetricsCollector>(mc); p != nullptr) {
-                const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
+        // Local sampling may have completed just before storage cleanup.
+        // Fence queue publication against unload and reject detached collectors,
+        // including when a different backend has reused the same storage name.
+        const auto registry_manager = cache_manager_->GetRegistryManager();
+        if (!registry_manager || !registry_manager->data_storage_manager()) {
+            break;
+        }
+        const auto manager = registry_manager->data_storage_manager();
+        for (const auto &mc : data_storage_interval_metrics_collectors_.GetMetricsCollectors()) {
+            const auto p = std::dynamic_pointer_cast<DataStorageIntervalMetricsCollector>(mc);
+            if (!p) {
+                continue;
+            }
+            const auto &metric_tags = p->GetMetricsTags();
+            const auto name = metric_tags.find("unique_name");
+            if (name == metric_tags.end()) {
+                continue;
+            }
+            const auto backend = manager->GetDataStorageBackend(name->second);
+            manager->PublishMetricsIfCurrent(name->second, backend, [&]() {
+                const auto data = metrics_registry_->GetMetricsData("data_storage.healthy_status");
+                const auto current = data ? data->GetGauge(metric_tags) : std::nullopt;
+                Gauge sampled;
+                COPY_METRICS_(p, data_storage, healthy_status, sampled);
+                if (!current || current->GetRaw() != sampled.GetRaw()) {
+                    return;
+                }
+                const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(metric_tags);
                 double healthy_status_v;
                 double writable_status_v;
-                double storage_usage_ratio_v;
                 GET_METRICS_(p, data_storage, healthy_status, healthy_status_v);
                 REPORT_METRICS(data_storage, healthy_status, healthy_status_v);
                 GET_METRICS_(p, data_storage, writable_status, writable_status_v);
                 REPORT_METRICS(data_storage, writable_status, writable_status_v);
-                GET_METRICS_(p, data_storage, storage_usage_ratio, storage_usage_ratio_v);
-                REPORT_METRICS(data_storage, storage_usage_ratio, storage_usage_ratio_v);
-            }
+                if (report_storage_usage_) {
+                    double storage_usage_ratio_v;
+                    GET_METRICS_(p, data_storage, storage_usage_ratio, storage_usage_ratio_v);
+                    REPORT_METRICS(data_storage, storage_usage_ratio, storage_usage_ratio_v);
+                }
+            });
         }
     } while (false);
 
