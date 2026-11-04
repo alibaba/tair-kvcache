@@ -212,6 +212,8 @@ public:
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
 
     size_t GetMemUsage() const noexcept;
+    // Current local view, including partial recovery; never queries persistent key counts.
+    size_t GetLocalKeyCount() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;
 
     // Set revisit interval histogram for cache backend (optional, for metrics tracking).
