@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -56,6 +58,12 @@ public:
                                                                                 const std::string &name);
     std::pair<ErrorCode, std::vector<std::shared_ptr<const InstanceGroup>>>
     ListInstanceGroup(RequestContext *request_context) const; // list all the instance_groups
+    struct MetricsSnapshot {
+        std::vector<std::shared_ptr<const InstanceGroup>> groups;
+        std::map<std::string, std::string> instance_groups;
+    };
+    // Best-effort, in-memory observation only. Never wait for registry I/O.
+    std::optional<MetricsSnapshot> TryGetMetricsSnapshot() const;
     ErrorCode RegisterInstance(RequestContext *request_context,
                                const std::string &instance_group,
                                const std::string &instance_id,

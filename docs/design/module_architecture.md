@@ -389,6 +389,28 @@ Optimizer 作为客户端通过 `ServiceDiscoveryFactory` 获取 KVCM seed endpo
 
 ---
 
+### 元数据 Redis 健康指标
+
+`service::Server` 将 leader 已加载组配置与现存 `MetaIndexer` 的实际初始化配置提供给
+`metrics::RedisHealthMetrics`，避免组配置更新后漏掉业务仍在使用的 Redis。
+只读快照使用 try-lock，锁忙时跳过；网络探测使用独立线程和连接，不持有业务或指标生命周期锁，
+不改变请求准入、业务连接或存储状态。发布前重新检查目标和节点角色。
+相同 URI 每轮只探测一次；相同组/host/port 的多个 DB/认证配置全部通过才汇报健康。
+停机先取消后续探测，原有停服与释放 leader 流程完成后再等待探测线程退出。
+
+### 选主 Redis 健康指标
+
+`service::Server` 将实际生效的 `GetCoordinationUri()` 提供给
+`metrics::CoordinationRedisHealthMetrics`；仅 Redis 协调后端启动独立探测线程。
+复用 `RedisHealthMetrics::ProbeRedis` 的短连接只读探测，发布
+`coordination.redis_healthy_status{host,port}`。目标在进程启动后不变，采集不读取注册表、
+Indexer 或选主器，也不依赖生命周期锁；各阶段均上报，失去租约不会隐藏协调连接故障。
+与元数据探测分开调度，周期下限为 1 秒，默认 20 秒，另加探测耗时。
+不修改 CoordinationBackend 的连接池、选主/续约/解锁操作或服务门禁；停机先取消探测，
+原有停服/释放 leader 完成后再 join。指标仅验证连接、认证、PING 和 DB 选择，
+不验证协调写入/Lua 权限，不替代租约或就绪检查。
+
+
 ## 5. 修改功能前的提示
 
 修改某个模块前，先对照第 3 节的依赖关系图与第 4 节的运行时流程，确认它的上游（谁依赖它、会被它影响）和下游（它依赖谁、受谁约束），不要遗漏被依赖方带来的约束。尤其注意 3.2 的两条反向边、`CacheLocation` 的生命周期与状态流转约束，以及改动 `protocol` proto 时需遵循 [proto 修改指南](../develop/proto_modification_guide.md)。涉及元数据面行为时，同时检查 C++ `MetaClient`、Python `KvCacheManagerClient`/`manager_client` 与 Java `client_java` 的语义一致性；涉及 EventReport 时，先确认 reporter lifecycle、snapshot generation 与 Leader-only 约束。

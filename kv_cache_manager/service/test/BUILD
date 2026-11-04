@@ -1,6 +1,24 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "ServerRedisHealthMetricsTest",
+    srcs = ["server_redis_health_metrics_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+        "//kv_cache_manager/metrics:metrics_reporter",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+        "//kv_cache_manager/metrics:redis_health_metrics",
+        "//kv_cache_manager/service",
+    ],
+)
+
+
+cc_test(
     name = "ServiceImplBaseTest",
     srcs = ["service_impl_base_test.cc"],
     copts = ["-fno-access-control"],

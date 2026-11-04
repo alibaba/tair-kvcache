@@ -178,6 +178,7 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
 
     instance_id_ = instance_id;
     auto storage_backend_config = config->GetMetaStorageBackendConfig();
+    storage_backend_config_ = {storage_backend_config->GetStorageType(), storage_backend_config->GetStorageUri()};
 
     backend_manager_ = std::make_unique<MetaStorageBackendManager>();
     auto ec = backend_manager_->Init(instance_id_, storage_backend_config);

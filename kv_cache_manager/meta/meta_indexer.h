@@ -30,6 +30,9 @@ class MetricsRegistry;
 
 class MetaIndexer {
 public:
+    // Immutable after Init; observation must use the runtime configuration,
+    // not a subsequently replaced InstanceGroup configuration.
+    const std::pair<std::string, std::string> &GetStorageBackendConfig() const { return storage_backend_config_; }
     // Per-key result.
     struct Result {
         ErrorCode ec = EC_OK;
@@ -307,6 +310,7 @@ private:
     uint64_t mutex_shard_hash_seed_ = 0;
     size_t batch_key_size_ = MetaIndexerConfig::kDefaultBatchKeySize;
     std::string instance_id_;
+    std::pair<std::string, std::string> storage_backend_config_;
     StorageUsageData storage_usage_data_;
 };
 

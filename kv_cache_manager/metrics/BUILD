@@ -73,6 +73,7 @@ cc_library(
     ],
 )
 
+
 cc_library(
     name = "prometheus_exporter",
     srcs = [
@@ -111,5 +112,19 @@ cc_library(
         ":metrics_registry",
         ":metrics_reporter",
         "//kv_cache_manager/common:logger",
+    ],
+)
+
+cc_library(
+    name = "redis_health_metrics",
+    srcs = ["redis_health_metrics.cc"],
+    hdrs = ["redis_health_metrics.h"],
+    deps = [
+        ":metrics_lifecycle",
+        ":metrics_registry",
+        "//kv_cache_manager/common:standard_uri",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/meta:meta_indexer_manager",
+        "@hiredis",
     ],
 )
