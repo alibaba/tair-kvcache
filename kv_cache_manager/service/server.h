@@ -31,6 +31,8 @@ class DebugServiceHttp;
 class MetricsRegistry;
 class MetricsReporter;
 class MetricsReporterFactory;
+class RedisHealthMetrics;
+class CoordinationRedisHealthMetrics;
 struct MetricsLifecycle;
 class LoopThread;
 
@@ -88,5 +90,9 @@ private:
     std::shared_ptr<MetricsReporterFactory> metrics_reporter_factory_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<LoopThread> metrics_report_thread_;
+    std::shared_ptr<RedisHealthMetrics> redis_health_metrics_;
+    std::shared_ptr<LoopThread> redis_health_thread_;
+    std::shared_ptr<CoordinationRedisHealthMetrics> coordination_redis_health_metrics_;
+    std::shared_ptr<LoopThread> coordination_redis_health_thread_;
 };
 } // namespace kv_cache_manager

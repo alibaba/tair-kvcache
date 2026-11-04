@@ -323,3 +323,57 @@ Prometheus  --GET /metrics-->  AdminServiceHttp
 该端点与 `MetricsReporter` 管线正交。任何 reporter 类型（`kmonitor`、
 `local`、`logging`、`dummy`）都向同一个 `MetricsRegistry` 写入数据，
 Prometheus 端点从中读取。
+
+### 元数据 Redis 主动健康探测
+
+`kvcm_meta_storage_redis_healthy_status{instance_group="...",host="redis.example",port="6379"}` 表示 KVCM 到该组元数据 Redis 的最近一次探测结果：
+`1` 为连接、必要的认证、PING 和配置的 DB 选择均成功；`0` 为其中任一步失败或超时。
+该指标覆盖 `redis`、`async_redis`，以及 `cached` 的 Redis 持久层（包括 memory-primary 异步备份），
+即使没有业务请求或 Instance，也会对已加载的 Redis InstanceGroup 发起探测。
+
+探测使用独立线程和连接，按 `kvcm.metrics.report_interval_ms` 周期运行（默认 20 秒，另加探测耗时），
+连接及每次 socket I/O 超时均为 1 秒，不重试、不写入业务数据。相同 URI 的组每轮共享一次探测结果。
+它不会阻塞 `/metrics`、容量采集或占用业务连接池；多 Redis 目标按顺序探测，故障时一轮可能超过配置周期。
+标签包含 `instance_group`、`host` 和 `port`；地址取自配置中的 Redis URI，域名不解析成 IP。
+不暴露完整 URI、认证信息或 query 参数。探测目标包含组的当前配置和已有实例实际初始化时的配置：
+更新组配置不会重连已有实例，因此仍被使用的旧地址和新地址会同时受到监控。
+同一组/host/port 对应多个 DB 或认证配置时，全部探测成功才汇报 1；不再使用的旧地址序列才会移除。
+
+仅 leader 发布该指标。首次探测完成前、既无配置也无运行时 Redis 依赖的组、follower 均不发布；
+最后一个依赖被移除或节点降为 follower 后，旧序列在探测线程下一次检查时移除，不能把缺失解释为健康。
+注册表、索引器或生命周期锁忙时跳过采集/发布，不等待、不将忙误报为故障；网络 I/O 不持有这些锁。
+停机先取消后续探测，原有停服和释放 leader 流程完成后再等待正在进行的探测线程退出。
+本指标不改变请求准入，也不代表 Redis 业务读写权限、容量、数据完整性或所有分片均正常，
+不覆盖 Registry / Coordination Redis。
+
+告警示例（仅适用于预期由 leader 发布的序列；缺失应另设告警）：
+
+```promql
+kvcm_meta_storage_redis_healthy_status == 0
+```
+
+### 选主协调 Redis 健康指标
+
+`kvcm_coordination_redis_healthy_status{host="redis.example",port="6379"}` 表示本节点对
+`kvcm.coordination.uri` 指定 Redis 的最近一次独立探测结果：`1` 为连接、必要的认证、
+PING 和配置的 DB 选择成功，`0` 为失败或超时。旧配置 `kvcm.distributed_lock.uri` 仍按原有规则生效。
+标签仅包含配置的 host 和 port，不暴露凭据、DB 或完整 URI。
+
+该指标在 follower、promoting、leader、demoting 阶段都采集，不依赖是否持锁。
+它复用元数据 Redis 的只读探测实现，但拥有独立线程和连接，不占用选主或业务连接池，
+不调用抢锁、续约、解锁或写入接口，不持业务/生命周期锁；元数据探测阻塞也不会阻塞它。
+原有选主、请求准入、故障处理、元数据指标的名称及标签均不变。
+
+每轮完成后等待 `max(kvcm.metrics.report_interval_ms, 1000)` 毫秒，默认 20 秒。
+每轮新建一个连接并执行 PING，必要时增加 AUTH、再次 PING 和 SELECT；无重试。
+连接和每次 socket I/O 超时为 1 秒，DNS 解析仍受系统 resolver 控制，这不是整轮探测的总超时。
+开销为每个 Redis 协调节点一个线程及每轮一个短连接；不配置 Redis 协调后端时不创建探测线程。
+停机先取消后续探测，完成原有停服/释放 leader 流程后再等待探测退出。
+
+首轮探测完成前、使用 memory/file/默认协调后端时无此序列；进程若因协调后端初始化失败
+而未启动 HTTP 服务，也无法暴露该指标。缺失不能当作健康，应另设进程/采集缺失告警。
+`1` 不证明 Lua 脚本/写权限、租约或服务就绪状态正常；选主状态和服务就绪状态需要独立监控。与元数据指标不同，此告警不要限定 leader：
+
+```promql
+kvcm_coordination_redis_healthy_status == 0
+```

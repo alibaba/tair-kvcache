@@ -131,6 +131,18 @@ std::map<std::string, std::shared_ptr<MetaIndexer>> MetaIndexerManager::GetIndex
     std::shared_lock read_guard(mutex_);
     return meta_indexers_;
 }
+
+std::optional<MetaIndexerManager::StorageBackendConfigs> MetaIndexerManager::TryGetStorageBackendConfigs() const {
+    std::shared_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return std::nullopt;
+    }
+    StorageBackendConfigs configs;
+    for (const auto &[id, indexer] : meta_indexers_) {
+        configs.emplace(id, indexer->GetStorageBackendConfig());
+    }
+    return configs;
+}
 void MetaIndexerManager::DoCleanup() {
     std::scoped_lock write_guard(mutex_);
     meta_indexers_.clear();
