@@ -44,8 +44,14 @@ py_test(
     name = "wheel_install_test",
     size = "medium",
     srcs = ["test/wheel_install_test.py"],
-    args = ["$(location :kvcm_ops_wheel)"],
-    data = [":kvcm_ops_wheel"],
+    args = [
+        "$(location :kvcm_ops_wheel)",
+        "$(location //package/script:start_server_script)",
+    ],
+    data = [
+        ":kvcm_ops_wheel",
+        "//package/script:start_server_script",
+    ],
     main = "test/wheel_install_test.py",
 )
 

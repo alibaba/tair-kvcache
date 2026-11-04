@@ -75,6 +75,10 @@ function configure_jemalloc() {
 }
 
 function install_kvcm_ops() {
+    if python3 -c 'import kvcm_ops, requests' > /dev/null 2>&1; then
+        echo "kvcm_ops and its dependencies are already installed"
+        return 0
+    fi
     python3 -m pip install "$KVCM_OPS_WHEEL_PATH"
 }
 
