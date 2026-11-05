@@ -179,6 +179,10 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `cache_manager_instance.event_report_location_lifetime_max_us` | gauge | 同一批次的最长存活时间（微秒） |
 | `cache_manager_instance.event_report_location_lifetime_avg_us` | gauge | 同一批次的平均存活时间（微秒） |
 
+`event_report_location_lifetime_*` 使用 location 的 `create_time` 计时。完整 snapshot 覆盖会
+重新设置该时间（即使内容未变），因此收到 snapshot 后统计的是最近一次覆盖写入到 DELETE
+的时长；纯增量 ADD 更新仍保留已有时间。该指标不等同于 RTP 中实际缓存数据的完整驻留时长。
+
 `grpc.response_counter` 统计服务端准备发送的最终 gRPC 状态，包含线程配额耗尽时框架返回的
 `RESOURCE_EXHAUSTED`；该状态也可能来自其他资源不足。主服务与 Admin 共用 gRPC 端口时统一记为
 `server=meta`，业务响应体中的错误仍由 `service.error_counter` 统计。

@@ -190,6 +190,11 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `meta_indexer.search_cache_hit_ratio` | gauge | Search cache hit ratio |
 | `data_storage.create_keys_counter` | counter | Total created keys |
 
+The `cache_manager_instance.event_report_location_lifetime_*` gauges measure successful
+whole-location BLOCK_DELETE ages from `create_time`. A complete snapshot resets that timestamp,
+even for unchanged content; subsequent ADDs preserve it. The gauges therefore measure time since
+the latest snapshot overwrite (or first ADD before any snapshot), not total residency in RTP.
+
 `grpc.response_counter` counts the final gRPC status the server prepares to send, including framework
 `RESOURCE_EXHAUSTED` rejections when the thread quota is exhausted; this status can also indicate other
 resource limits. When the main and Admin services share a gRPC port, both use `server=meta`. Business

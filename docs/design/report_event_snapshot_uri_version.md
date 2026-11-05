@@ -58,6 +58,18 @@ instance_id + storage_type + host_ip_port
 一次 snapshot 是该 reporter 在当前 storage type 下、跨全部 medium 的完整 cache 状态。
 `medium` 是 block 级属性；空 `blocks` 表示该 reporter 当前没有任何 cache。
 
+每个上报的 `block_key + medium` 都完整替换对应 location，不做内容相同检测，也不继承旧
+location 的字段。specs 来自 snapshot，身份和类型来自请求，状态为 `SERVING`，`s_v` 由
+KVCM 生成。协议没有创建时间，因此新 location 的 `create_time` 统一使用本次批量写入时间，
+包括内容完全相同的条目。后续增量 ADD 继续保留该时间；location lifetime 指标因此表示
+最近一次 snapshot 覆盖写入（或尚未被 snapshot 覆盖时的首次 ADD）至 DELETE 的时间。
+
+已校验且单次使用的 flat snapshot task 将整个 specs vector 移交给新 location，避免每个
+location 再分配一个 vector 并逐个搬运 spec。普通调用方的 task 仍复制输入，保持重试能力。
+写入继续使用原有批量 RMW 和 lifecycle fence；读取旧 location 仅用于 storage ownership
+校验及精确用量统计，不为新 location 提供字段。这不是无读取的后端接口，也不改变原地写入、
+commit/abort、查询版本过滤或后台清理语义；其他 reporter 的 location 保持不变。
+
 ### 2.3 s_v 同时用于查询栅栏与清理
 
 KVCM 在 reporter 提供的 URI 上只追加：

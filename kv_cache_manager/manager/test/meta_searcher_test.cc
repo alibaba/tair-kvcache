@@ -2502,8 +2502,8 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
               meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
     EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 
-    // Generic flat input remains retryable; the validated snapshot path can
-    // consume its URI while preserving replacement and usage semantics.
+    // Generic flat input remains retryable; a validated snapshot transfers
+    // its complete specs buffer into the replacement location.
     std::vector<MetaSearcher::ReplaceLocationSpecsTask> flat_tasks{replace_tasks[0][0]};
     const auto shared_name = flat_tasks[0].specs[0].name_handle();
     ASSERT_EQ(EC_OK,
@@ -2511,12 +2511,16 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
                   request_context_.get(), keys, {0, 1}, flat_tasks, per_key_ec));
     EXPECT_EQ(replace_tasks[0][0].specs[0].uri(), flat_tasks[0].specs[0].uri());
     flat_tasks[0].prevalidated_total_size = MetaSearcher::PrevalidatedTotalSize(7);
+    const auto *snapshot_specs = flat_tasks[0].specs.data();
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchReplaceLocationSpecsFlat(
                   request_context_.get(), keys, {0, 1}, flat_tasks, per_key_ec));
-    EXPECT_TRUE(flat_tasks[0].specs[0].uri().empty());
-    EXPECT_EQ("linear_0", flat_tasks[0].specs[0].name());
-    EXPECT_EQ(shared_name.get(), flat_tasks[0].specs[0].name_handle().get());
+    EXPECT_TRUE(flat_tasks[0].specs.empty());
+    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    // Consumed tasks cannot accidentally overwrite a location with empty specs.
+    EXPECT_EQ(EC_BADARGS,
+              meta_searcher_->BatchReplaceLocationSpecsFlat(
+                  request_context_.get(), keys, {0, 1}, flat_tasks, per_key_ec));
     EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 
     // A location id has stable storage ownership.  Rejecting a type mutation
@@ -2536,6 +2540,8 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
     const auto &replaced_location = location_maps.front().at(location_id);
     EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, replaced_location->type());
     ASSERT_EQ(1u, replaced_location->location_specs().size());
+    EXPECT_EQ(snapshot_specs, replaced_location->location_specs().data());
+    EXPECT_EQ(shared_name.get(), replaced_location->location_specs()[0].name_handle().get());
     EXPECT_EQ(replace_tasks[0][0].specs[0].name_handle().get(),
               replaced_location->location_specs()[0].name_handle().get());
     std::uint64_t validated_size = 0;
@@ -6062,7 +6068,7 @@ public:
     LifetimeDeleteBackend *backend_ = nullptr;
 };
 
-TEST_F(LocationLifetimeTest, PreservesEventReportCreationOnMergeAndSnapshot) {
+TEST_F(LocationLifetimeTest, SnapshotResetsCreationAndFollowingDeltaPreservesSnapshotTime) {
     for (const auto type : {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5,
                             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                             DataStorageType::DATA_STORAGE_TYPE_NFS}) {
@@ -6076,15 +6082,67 @@ TEST_F(LocationLifetimeTest, PreservesEventReportCreationOnMergeAndSnapshot) {
 
         std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> snapshot = {
             {{id_, type, CLS_SERVING, {LocationSpec("tp0", uri_)}}}};
+        const int64_t before_snapshot = TimestampUtil::GetCurrentTimeUs();
         ASSERT_EQ(EC_OK, meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), {key}, snapshot, results));
-        EXPECT_EQ(IsEventReportStorageType(type), Read(key)->create_time() == 123);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), results);
+        const auto replaced = Read(key);
+        const int64_t snapshot_time = replaced->create_time();
+        EXPECT_GE(snapshot_time, before_snapshot);
+        EXPECT_LE(snapshot_time, TimestampUtil::GetCurrentTimeUs());
+        ASSERT_EQ(1u, replaced->location_specs().size());
+        EXPECT_EQ("tp0", replaced->location_specs()[0].name());
+
+        // An unchanged complete snapshot is still a new authoritative
+        // observation. The generic input also remains reusable.
+        const int64_t before_repeat = TimestampUtil::GetCurrentTimeUs();
+        ASSERT_EQ(EC_OK, meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), {key}, snapshot, results));
+        const int64_t repeated_snapshot_time = Read(key)->create_time();
+        EXPECT_GE(repeated_snapshot_time, before_repeat);
+        ASSERT_EQ(1u, snapshot[0][0].specs.size());
+        EXPECT_EQ(uri_, snapshot[0][0].specs[0].uri());
 
         // The single-spec replacement constructs a fresh CacheLocation rather than copying it.
         std::vector<MetaSearcher::MergeLocationSpecsTask> flat = merge.front();
         ASSERT_EQ(EC_OK,
                   meta_searcher_->BatchMergeLocationSpecsFlat(request_context_.get(), {key}, {0, 1}, flat, results));
-        EXPECT_EQ(IsEventReportStorageType(type), Read(key)->create_time() == 123);
+        if (IsEventReportStorageType(type)) {
+            EXPECT_EQ(repeated_snapshot_time, Read(key)->create_time());
+        }
     }
+}
+
+TEST_F(LocationLifetimeTest, FlatSnapshotFullyReplacesSpecsAndRestartsLifetime) {
+    Seed({101}, {123});
+    const auto old_location = Read(101);
+    const auto type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+    std::vector<MetaSearcher::ReplaceLocationSpecsTask> snapshot = {
+        {id_, type, CLS_SERVING, {LocationSpec("tp2", "event_report://lifetime-host:8080/mem?size=7")}}};
+    snapshot[0].prevalidated_total_size = MetaSearcher::PrevalidatedTotalSize(7);
+    std::vector<ErrorCode> results;
+    const int64_t before_snapshot = TimestampUtil::GetCurrentTimeUs();
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecsFlat(
+                  request_context_.get(), {101}, {0, 1}, snapshot, results));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), results);
+    const auto current = Read(101);
+    EXPECT_GE(current->create_time(), before_snapshot);
+    EXPECT_EQ(CLS_SERVING, current->status());
+    EXPECT_EQ(type, current->type());
+    EXPECT_EQ(id_, current->id());
+    ASSERT_EQ(1u, current->location_specs().size());
+    EXPECT_EQ(1u, current->spec_size());
+    EXPECT_EQ("tp2", current->location_specs()[0].name());
+    EXPECT_EQ("event_report://lifetime-host:8080/mem?size=7", current->location_specs()[0].uri());
+    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(type));
+    // Readers retaining the previous immutable location must see no mutation.
+    EXPECT_EQ(123, old_location->create_time());
+    EXPECT_EQ(2u, old_location->location_specs().size());
+
+    MetaSearcher::DeletedLocationAgeStats stats;
+    ASSERT_EQ(EC_OK, Delete({101}, {"tp2"}, stats));
+    EXPECT_EQ(1u, stats.count);
+    EXPECT_LE(stats.max_us, TimestampUtil::GetCurrentTimeUs() - before_snapshot);
+    EXPECT_EQ(0u, meta_indexer_->GetStorageUsageByType(type));
 }
 
 TEST_F(LocationLifetimeTest, CountsOnlyWholeSuccessfulDeletesAndUsesOneRead) {

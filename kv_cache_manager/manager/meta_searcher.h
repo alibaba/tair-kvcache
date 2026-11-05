@@ -212,10 +212,13 @@ public:
                                                                                    : nullptr;
         }
     };
-    // Replaces existing specs or creates the stable location in one metadata
-    // read-modify-write operation per batch. Keys and location ids within a
-    // key must be unique. Every task requires non-empty, uniquely named specs
-    // with valid URIs and cannot mix versioned/unversioned specs or multiple
+    // Fully replaces or creates the stable location from the supplied task;
+    // no old fields are inherited, including create_time. Since tasks carry
+    // no timestamp, each replacement uses the current batch's creation time.
+    // Existing values are read only for ownership checks and usage accounting.
+    // Uses one metadata read-modify-write operation per batch. Keys and
+    // location ids within a key must be unique. Every task requires non-empty,
+    // uniquely named specs with valid URIs and cannot mix versioned/unversioned specs or multiple
     // snapshot versions. When supplied, the write-lease callback is invoked
     // once after the metadata read and before the first mutation; the returned
     // lease is retained until the operation returns.
@@ -224,9 +227,11 @@ public:
                                         const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
                                         std::vector<ErrorCode> &out_per_key_ec,
                                         AcquireMetadataWriteLeaseFunc acquire_write_lease = nullptr);
-    // The flat form reuses ReportEvent's validated sizes and can consume its
-    // task URIs. Generic tasks keep strict validation and copy/retry semantics,
-    // as in BatchMergeLocationSpecsFlat. Metadata RMW/counting is unchanged.
+    // The flat form reuses ReportEvent's validated sizes and consumes the
+    // entire specs vector of each admitted prevalidated replacement. Such
+    // tasks are single-use, including when a later backend write fails.
+    // Generic tasks keep strict validation and copy/retry semantics.
+    // Metadata RMW/counting is unchanged.
     ErrorCode BatchReplaceLocationSpecsFlat(RequestContext *request_context,
                                             const KeyVector &keys,
                                             const std::vector<size_t> &task_offsets,

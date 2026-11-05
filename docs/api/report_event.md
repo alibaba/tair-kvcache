@@ -362,11 +362,17 @@ Snapshot 的完整性规则：
 
 Snapshot 的更新语义：
 
-- snapshot 中出现的 `block_key + medium` 会原地替换完整 spec 集合；
+- snapshot 中出现的 `block_key + medium` 会完整覆盖本 reporter 的 location，内容未变化也执行覆盖；
+- spec 名称、URI 和大小以 snapshot 为准，location 身份由请求 reporter、storage type 和 medium
+  生成，状态设为 `SERVING`，不继承旧 location 字段；KVCM 仍为 URI 追加候选版本 `s_v`；
+- 协议不携带创建时间，因此 `create_time` 使用本次 snapshot 批量写入时间，不保留旧时间。
+  后续 ADD 保留这个新时间，DELETE 的 location lifetime 指标从最近一次 snapshot 覆盖写入起算；
 - 已存在 block 中被本次省略的 spec 会被替换掉；
 - 整个 snapshot 中被省略的旧 block 由后台 GC 周期 cleanup 最终删除；
 - 成功后返回新的 generation；
 - 失败时不回滚已经完成的部分 metadata 写入，应完整重试。
+
+覆盖范围只包括请求 reporter 的 location；同一 key 上其他 reporter 的 location 保留。
 
 ### 5.6 EVENT_HOST_DOWN
 

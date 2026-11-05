@@ -2439,6 +2439,20 @@ public:
         return result;
     }
 
+    // Snapshot replacement needs no spec-name dependency mapping after the
+    // write. Adopt the validated task's whole buffer instead of allocating a
+    // second vector and moving each spec separately. Generic inputs remain
+    // reusable, including retries after a failed write.
+    [[nodiscard]] std::vector<LocationSpec> CopyOrConsumeReplacementSpecs(size_t key_index, size_t task_index) {
+        if (flat_tasks_) {
+            auto &task = (*flat_tasks_)[(*offsets_)[key_index] + task_index];
+            if (task.prevalidated_total_size.has_value()) {
+                return std::move(task.specs);
+            }
+        }
+        return At(key_index, task_index).specs;
+    }
+
 private:
     const std::vector<std::vector<Task>> *nested_tasks_ = nullptr;
     const std::vector<size_t> *offsets_ = nullptr;
@@ -2591,28 +2605,20 @@ ErrorCode MetaSearcher::BatchReplaceLocationSpecsImpl(RequestContext *request_co
                 usage.has_old = true;
             }
             if (const auto *interned_location_id = task.ResolvedInternedLocationId()) {
-                // New locations and legacy owned-id locations converge to the
-                // request's canonical reporter/medium id on the next write.
                 new_location->set_id(*interned_location_id);
             } else {
-                new_location->set_id(get_ec == ErrorCode::EC_OK && locations[location_index]
-                                         ? locations[location_index]->id()
-                                         : task.location_id);
+                new_location->set_id(task.location_id);
             }
 
-            std::vector<LocationSpec> specs;
-            specs.reserve(task.SpecCount());
-            for (size_t spec_index = 0; spec_index < task.SpecCount(); ++spec_index) {
-                specs.push_back(tasks.CopyOrConsumeSpec(key_index, location_index, spec_index));
-            }
-            new_location->set_location_specs(std::move(specs));
+            new_location->set_location_specs(tasks.CopyOrConsumeReplacementSpecs(key_index, location_index));
             new_location->set_type(task.type);
             new_location->set_status(task.status);
             new_location->set_spec_size(new_location->location_specs().size());
-            // A snapshot refreshes the same reporter-owned location, not its lifetime.
-            new_location->set_create_time(IsEventReportStorageType(task.type) && usage.has_old
-                                              ? locations[location_index]->create_time()
-                                              : batch_create_time);
+            // A complete snapshot is authoritative for every replacement
+            // field. The wire format has no creation timestamp, so start a
+            // new observation at this snapshot, including unchanged entries.
+            // Old locations are consulted only for ownership and accounting.
+            new_location->set_create_time(batch_create_time);
             new_location->set_validated_total_size(usage.new_size);
             locations[location_index] = std::move(new_location);
             updated = true;
