@@ -1,8 +1,11 @@
 #include <atomic>
 #include <chrono>
+#include <exception>
+#include <future>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <memory>
+#include <system_error>
 #include <thread>
 
 #include "kv_cache_manager/common/loop_thread.h"
@@ -123,4 +126,52 @@ TEST_F(LoopThreadTest, TestRepeatedStop) {
     loop_thread->Stop();
     loop_thread->Stop();
     loop_thread->Stop();
+}
+
+TEST_F(LoopThreadTest, TestStopFromOtherThreadDoesNotDetectSelfJoin) {
+    std::atomic<int> count(0);
+    auto loop_thread = LoopThread::CreateLoopThread([&count]() { count++; }, 1000, "normal");
+    ASSERT_NE(loop_thread, nullptr);
+
+    loop_thread->Stop();
+    EXPECT_FALSE(loop_thread->SelfJoinDetected());
+}
+
+// AC-4: 在自己的 loop 回调里调用 Stop() 属于自连接。检测标志置真、错误日志打出，
+// 但 join 照常执行并抛出 std::system_error —— 不跳过 join、不 detach，问题被暴露而不是被掩盖。
+TEST_F(LoopThreadTest, TestStopFromOwnLoopThreadDetectsSelfJoin) {
+    std::promise<std::shared_ptr<LoopThread>> owner_promise;
+    auto owner_future = owner_promise.get_future().share();
+    std::promise<void> callback_done;
+    auto callback_done_future = callback_done.get_future();
+    std::exception_ptr self_join_error;
+
+    auto loop_thread = LoopThread::CreateLoopThread(
+        [&]() {
+            // 回调可能早于 CreateLoopThread 返回就跑起来，先等实例发布完成。
+            auto owner = owner_future.get();
+            try {
+                owner->Stop();
+            } catch (const std::system_error &) {
+                self_join_error = std::current_exception();
+            }
+            callback_done.set_value();
+        },
+        1000,
+        "self-join");
+    ASSERT_NE(loop_thread, nullptr);
+    owner_promise.set_value(loop_thread);
+
+    ASSERT_EQ(std::future_status::ready, callback_done_future.wait_for(std::chrono::seconds(5)));
+
+    EXPECT_TRUE(loop_thread->SelfJoinDetected());
+    ASSERT_NE(self_join_error, nullptr);
+    EXPECT_THROW(std::rethrow_exception(self_join_error), std::system_error);
+
+    // 回调返回后循环线程自行退出；由测试线程完成回收，避免 joinable 线程未被 join。
+    if (loop_thread->thread_.joinable()) {
+        loop_thread->thread_.join();
+    }
+    loop_thread->Stop();
+    EXPECT_TRUE(loop_thread->SelfJoinDetected());
 }

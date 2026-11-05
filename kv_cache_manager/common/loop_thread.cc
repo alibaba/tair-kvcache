@@ -2,6 +2,8 @@
 
 #include <chrono>
 
+#include "kv_cache_manager/common/logger.h"
+
 namespace kv_cache_manager {
 
 LoopThread::LoopThread() {}
@@ -39,6 +41,13 @@ void LoopThread::Stop() {
     }
 
     if (thread_.joinable()) {
+        if (thread_.get_id() == std::this_thread::get_id()) {
+            // 自连接：调用者就是本 LoopThread 的循环线程，下面的 join() 必然抛 std::system_error。
+            // 这里只记录并暴露问题，不跳过 join、不 detach —— 否则未完成的清理会被静默掩盖。
+            self_join_detected_ = true;
+            KVCM_LOG_ERROR("LoopThread[%s] Stop() called from its own loop thread, self-join detected",
+                           name_.c_str());
+        }
         thread_.join();
     }
 }

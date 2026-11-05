@@ -114,6 +114,19 @@ cc_test(
 )
 
 cc_test(
+    name = "ShutdownControllerTest",
+    srcs = [
+        "shutdown_controller_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:shutdown_controller",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
     name = "StandardUriTest",
     srcs = [
         "standard_uri_test.cc",
