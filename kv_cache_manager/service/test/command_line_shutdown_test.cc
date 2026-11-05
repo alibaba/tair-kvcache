@@ -165,6 +165,16 @@ protected:
         }
         argv.push_back(nullptr);
 
+        // unittest.h 的 main() 在 debug 构建（NDEBUG 未定义）下会设置 KVCM_LOG_TO_CONSOLE=1，
+        // fork 出的 server 子进程继承后日志只打到 console，本用例就读不到日志文件了。
+        std::vector<char *> envp;
+        for (char **e = environ; *e != nullptr; ++e) {
+            if (strncmp(*e, "KVCM_LOG_TO_CONSOLE=", strlen("KVCM_LOG_TO_CONSOLE=")) != 0) {
+                envp.push_back(*e);
+            }
+        }
+        envp.push_back(nullptr);
+
         pid_t pid = fork();
         if (pid == 0) {
             // 信号屏蔽字会跨 exec 继承：清空它，否则被测进程可能收不到父进程发来的 SIGTERM。
@@ -175,7 +185,7 @@ protected:
             if (chdir(work_dir_.c_str()) != 0) {
                 _exit(127);
             }
-            execv(binary_path_.c_str(), argv.data());
+            execve(binary_path_.c_str(), argv.data(), envp.data());
             _exit(127);
         }
         for (char *p : argv) {
